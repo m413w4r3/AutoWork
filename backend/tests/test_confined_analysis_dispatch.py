@@ -5,7 +5,7 @@ import hashlib
 import json
 import os
 import struct
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -279,10 +279,8 @@ async def test_strings_range_scans_only_the_requested_bounded_blob_slice(
     scanned_payloads: list[bytes] = []
 
     async def run(argv, **_kwargs):
-        scanned_payloads.append(Path(argv[-1]).read_bytes())
-        return AnalysisSubprocessResult(
-            AnalysisSubprocessStatus.SUCCEEDED, 0, b"MARKER\n", b""
-        )
+        scanned_payloads.append(Path(argv[-1]).read_bytes())  # noqa: ASYNC240
+        return AnalysisSubprocessResult(AnalysisSubprocessStatus.SUCCEEDED, 0, b"MARKER\n", b"")
 
     monkeypatch.setattr(
         "cti_app.workers.confined_analysis.shutil.which", lambda _name: "/usr/bin/strings"
@@ -312,9 +310,8 @@ async def test_strings_range_scans_only_the_requested_bounded_blob_slice(
     assert result["status"] == "SUCCEEDED"
     assert scanned_payloads == [b"A" * 55_808]
 
-    out_of_bounds = replace(
-        parameters,
-        analysis_parameters={**parameters.analysis_parameters, "offset": "13"},
+    out_of_bounds = parameters.model_copy(
+        update={"analysis_parameters": {**parameters.analysis_parameters, "offset": "13"}}
     )
     denied = await _run_local_command(out_of_bounds, payload, settings)
     assert denied["status"] == "POLICY_DENIED"

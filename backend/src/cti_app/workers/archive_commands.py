@@ -513,9 +513,7 @@ async def run_7z_archive_command(
                                     sample_path=bsdtar_archive_path,
                                     member_path=member_name,
                                 )
-                                record["status"] = _bsdtar_failure_status(
-                                    fallback, entry
-                                )
+                                record["status"] = _bsdtar_failure_status(fallback, entry)
                                 record.update(fallback_diagnostics)
                     else:
                         total_read += len(data)
@@ -825,9 +823,7 @@ def _safe_archive_member_path(value: str) -> bool:
 
 def _safe_bsdtar_member_path(value: str) -> bool:
     """Reject names bsdtar could interpret as a pattern rather than one path."""
-    return _safe_archive_member_path(value) and not any(
-        character in value for character in "*?[]"
-    )
+    return _safe_archive_member_path(value) and not any(character in value for character in "*?[]")
 
 
 def _rar_archive_offset(payload: bytes) -> int | None:
@@ -840,9 +836,7 @@ def _rar_archive_offset(payload: bytes) -> int | None:
     return min(offsets) if offsets else None
 
 
-def _prepare_bsdtar_archive(
-    sample_path: Path, payload: bytes, *, archive_type: str
-) -> Path:
+def _prepare_bsdtar_archive(sample_path: Path, payload: bytes, *, archive_type: str) -> Path:
     """Strip an SFX prefix for RAR readers whose PE scan is deliberately bounded."""
     offset = _rar_archive_offset(payload) if archive_type.casefold().startswith("rar") else None
     if offset is None or offset == 0:
@@ -882,9 +876,7 @@ async def _run_bsdtar_member_extract(
     )
 
 
-def _bsdtar_failure_status(
-    result: AnalysisSubprocessResult, entry: _ArchiveEntry
-) -> str:
+def _bsdtar_failure_status(result: AnalysisSubprocessResult, entry: _ArchiveEntry) -> str:
     if result.status is AnalysisSubprocessStatus.TIMED_OUT:
         return "timeout"
     if result.status in {

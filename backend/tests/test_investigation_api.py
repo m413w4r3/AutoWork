@@ -867,9 +867,7 @@ def test_advisor_observation_payload_is_not_truncated_by_configured_size_cap() -
     assert "complete result " * 20 in payload["payload"]
 
 
-def _read_operator_observation(
-    payload: dict[str, Any], *, offset: int = 0, length: int = 32_000
-):
+def _read_operator_observation(payload: dict[str, Any], *, offset: int = 0, length: int = 32_000):
     canonical = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     blob_id = uuid4()
     observation_id = uuid4()

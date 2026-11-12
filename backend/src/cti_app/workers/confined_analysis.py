@@ -1564,10 +1564,12 @@ def _validate_local_command_arguments(
         if set(parameters) != {"mime_type"} or parameters["mime_type"] not in {"true", "false"}:
             raise ValueError("file command parameters are invalid")
     elif command_id == "strings":
-        if (
-            not {"min_length", "max_strings"} <= set(parameters)
-            or set(parameters) - {"min_length", "max_strings", "offset", "length"}
-        ):
+        if not {"min_length", "max_strings"} <= set(parameters) or set(parameters) - {
+            "min_length",
+            "max_strings",
+            "offset",
+            "length",
+        }:
             raise ValueError("strings command parameters are invalid")
         if not _bounded_decimal(parameters["min_length"], 1, 256):
             raise ValueError("strings minimum length is invalid")

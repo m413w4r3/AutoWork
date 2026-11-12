@@ -233,7 +233,7 @@ async def test_dotnet_tools_use_canonical_blob_and_report_the_actual_engine() ->
     empty_page = await adapter.execute(
         {"sample_sha256": SAMPLE_SHA256, "offset": 0, "limit": 200}, context
     )
-    assert empty_page.output["result"]["records"] == []
+    assert list(empty_page.output["result"]["records"]) == []
     assert empty_page.output["result"]["next_offset"] is None
     assert empty_page.output["result"]["detail_code"] == "dotnet_methods_empty"
 

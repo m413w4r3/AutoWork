@@ -485,7 +485,7 @@ async def test_unknown_command_and_non_catalogued_options_are_refused() -> None:
     denied = await _dispatch(harness.registry, context, LOCAL_RUN_COMMAND, invalid_options)
     assert denied.status is ToolInvocationStatus.POLICY_DENIED
     assert denied.output["detail_code"] == "option_not_allowed"
-    assert denied.output["valid_options"] == ["mime_type"]
+    assert list(denied.output["valid_options"]) == ["mime_type"]
     assert "mime_type" in denied.message
     assert denied.error_code == "option_not_allowed"
     assert harness.runner.calls == []

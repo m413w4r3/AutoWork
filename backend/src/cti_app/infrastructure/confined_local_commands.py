@@ -198,8 +198,7 @@ class ConfinedLocalCommands:
             )
         range_end = _command_range_end(normalized_options)
         if (
-            normalized_id
-            in {LocalCommandId.STRINGS, LocalCommandId.XXD, LocalCommandId.SHA256SUM}
+            normalized_id in {LocalCommandId.STRINGS, LocalCommandId.XXD, LocalCommandId.SHA256SUM}
             and range_end is not None
             and range_end > blob_size
         ):

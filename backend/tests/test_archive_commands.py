@@ -994,9 +994,7 @@ async def test_bsdtar_fallback_enforces_member_output_limit(
                 b"ERROR: Unsupported Method\n",
             )
         bsdtar_calls.append(kwargs)
-        return AnalysisSubprocessResult(
-            AnalysisSubprocessStatus.OUTPUT_LIMIT, 0, b"data", b""
-        )
+        return AnalysisSubprocessResult(AnalysisSubprocessStatus.OUTPUT_LIMIT, 0, b"data", b"")
 
     monkeypatch.setattr(archive_commands, "run_analysis_subprocess", fake_run)
     _redirect_archive_tempdir(monkeypatch, tmp_path)
@@ -1042,9 +1040,7 @@ async def test_bsdtar_failure_reports_clear_code_and_redacted_stderr(
                 b"ERROR: Unsupported Method\n",
             )
         stderr = f"bsdtar: Could not decompress {argv[2]} {argv[-1]}\n".encode()
-        return AnalysisSubprocessResult(
-            AnalysisSubprocessStatus.NON_ZERO_EXIT, 2, b"", stderr
-        )
+        return AnalysisSubprocessResult(AnalysisSubprocessStatus.NON_ZERO_EXIT, 2, b"", stderr)
 
     monkeypatch.setattr(archive_commands, "run_analysis_subprocess", fake_run)
     _redirect_archive_tempdir(monkeypatch, tmp_path)
