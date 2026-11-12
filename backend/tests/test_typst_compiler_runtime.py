@@ -450,7 +450,7 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
     a footnote. The opinion reference row prints its date, ordinal identifier,
     reference text, and URL. The article frise prints its date and event text; the opinion
     chronology retains its source ordinals. Opinion heading,
-    qualification, text, and visible citations are checked separately.
+    qualification, text, and short finding/evidence citations are checked separately.
 
     The test sees selectable text through ``pdftotext``. It cannot verify source or
     opinion target IDs, source document UUIDs, or link destination bytes because
@@ -577,26 +577,66 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
     )
     base = replace(base, document=document, references=references, semantic_text=semantic_text)
     opinion, context = _approved_opinion(base)
+    citation_count = 12
+    observations = tuple(
+        replace(context.observations[0], id=UUID(int=2000 + index))
+        for index in range(citation_count)
+    )
+    findings = tuple(
+        replace(
+            context.findings[0],
+            id=UUID(int=3000 + index),
+            observation_refs=(observations[index].id,),
+        )
+        for index in range(citation_count)
+    )
     opinion = replace(
         opinion,
-        blocks=(replace(opinion.blocks[0], text=opinion_marker),),
+        blocks=(
+            replace(
+                opinion.blocks[0],
+                text=opinion_marker,
+                finding_refs=tuple(finding.id for finding in findings),
+                evidence_refs=tuple(observation.id for observation in observations),
+            ),
+        ),
         content_sha256="",
     )
+    context = replace(context, findings=findings, observations=observations)
     augmented = augment_publication_with_opinion(base, opinion, context)
     template_bundle = load_template_bundle(_REPOSITORY_ROOT / "chpTypst")
     font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
 
-    async def compile_and_extract(document, name: str) -> str:
+    async def compile_and_extract(
+        document,
+        name: str,
+        *,
+        omit_note_numbers: bool = False,
+    ) -> str:
         source = TypstRenderer().render(
             document,
             template_bundle,
             document_label=f"Publication de test — {name}",
         )
         workspace = tmp_path / f"{name}-workspace"
+        render_data = json.loads(source.render_data_bytes)
+        def without_note_numbers(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {
+                    key: without_note_numbers(item)
+                    for key, item in value.items()
+                    if key != "note_number"
+                }
+            if isinstance(value, list):
+                return [without_note_numbers(item) for item in value]
+            return value
+
+        if omit_note_numbers:
+            render_data = without_note_numbers(render_data)
         _build_runtime_workspace(
             _REPOSITORY_ROOT,
             workspace,
-            render_data=json.loads(source.render_data_bytes),
+            render_data=render_data,
         )
         pdf_path = tmp_path / f"{name}.pdf"
         argv = [typst_binary, "compile", "--root", str(workspace)]
@@ -625,6 +665,11 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
 
     base_text = await compile_and_extract(base, "mission04-base")
     augmented_text = await compile_and_extract(augmented, "mission04-augmented")
+    augmented_without_note_numbers_text = await compile_and_extract(
+        augmented,
+        "mission04-augmented-without-note-numbers",
+        omit_note_numbers=True,
+    )
 
     def normalize_pdf_text(value: str) -> str:
         return value.replace("\u2018", "'").replace("\u2019", "'")
@@ -739,13 +784,13 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
         "Fait étayé": 1,
         "Confiance : 90%": 0,
         opinion_marker: 1,
-        # Short IDs remain in the traceability annex; body references use note numbers.
-        "[F1]": 1,
-        "[E1]": 1,
+        # Each short label appears once in the body and once in the traceability annex.
+        **{f"[F{index}]": 2 for index in range(1, citation_count + 1)},
+        **{f"[E{index}]": 2 for index in range(1, citation_count + 1)},
         finding_id: 0,
         evidence_id: 0,
-        "Constat technique": 1,
-        "Observation technique": 1,
+        "Constat technique": citation_count,
+        "Observation technique": citation_count,
         "ANNEXE DE TRAÇABILITÉ": 1,
     }
     for marker, expected_count in base_expected_counts.items():
@@ -758,8 +803,36 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
             f"augmented PDF marker {marker!r}: expected {expected_count}, "
             f"found {augmented_text.count(marker)}"
         )
-    compact_augmented_text = re.sub(r"\s+", "", augmented_text)
-    assert re.search(re.escape(opinion_marker) + r".{0,8}1,2", compact_augmented_text)
+    expected_citations = (
+        "Références:"
+        + "·".join(f"[F{index}]" for index in range(1, citation_count + 1))
+        + "·"
+        + "·".join(f"[E{index}]" for index in range(1, citation_count + 1))
+    )
+
+    def assert_body_citations(text: str, label: str) -> None:
+        body_text = text.split("ANNEXE DE TRAÇABILITÉ", maxsplit=1)[0]
+        compact_body_text = re.sub(r"\s+", "", body_text)
+        assert re.search(
+            re.escape(opinion_marker) + re.escape(expected_citations),
+            compact_body_text,
+        ), f"{label} PDF opinion body does not render the projected short reference labels"
+        citation_lines = [
+            line
+            for line in body_text.splitlines()
+            if "Références" in line or re.search(r"\[[FE]\d+\]", line)
+        ]
+        assert len(citation_lines) > 1, (
+            f"{label} PDF long opinion-reference line did not wrap: {citation_lines!r}"
+        )
+
+    assert_body_citations(augmented_text, "projected")
+    assert_body_citations(augmented_without_note_numbers_text, "synthetic no-note-number")
+    for reference_id in (
+        *(str(finding.id) for finding in findings),
+        *(str(observation.id) for observation in observations),
+    ):
+        assert reference_id not in augmented_text
     assert re.search(r"CONFIANCE\s*:\s*\d+\s*%", base_text, flags=re.IGNORECASE) is None
     assert re.search(r"CONFIANCE\s*:\s*\d+\s*%", augmented_text, flags=re.IGNORECASE) is None
     assert base_text.count("Références") == 1
