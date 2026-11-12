@@ -37,6 +37,7 @@ from cti_app.application.local_analysis import (
     LocalCommandService,
     SampleBytesForAnalysisPort,
     SampleBytesUnavailableError,
+    normalize_command_options_detailed,
 )
 from cti_app.application.rule_workbench import (
     RuleCorpusBytesPort,
@@ -90,6 +91,19 @@ _LOCAL_OUTPUT_CHUNK_CHARS = 4_000
 _LOCAL_RESPONSE_PREVIEW_CHARS = 4_000
 _MAX_GHIDRA_DATA_BYTES = 48 * 1024
 _MAX_GHIDRA_TEXT_CHARS = 8_000
+_LOCAL_OPTION_VALUE_ERROR_CODES = frozenset(
+    {
+        "invalid_boolean_option",
+        "invalid_integer_option",
+        "integer_option_below_minimum",
+        "integer_option_above_maximum",
+        "enum_option_not_allowed",
+        "string_option_invalid",
+        "invalid_string_list_option",
+        "string_list_size_out_of_range",
+        "string_list_item_invalid",
+    }
+)
 _LOCAL_OPTION_ERROR_CODES = frozenset(
     {
         "options_must_be_object",
@@ -104,9 +118,11 @@ _LOCAL_OPTION_ERROR_CODES = frozenset(
         "invalid_string_list_option",
         "string_list_size_out_of_range",
         "string_list_item_invalid",
+        "option_value_invalid",
         "range_options_must_be_paired",
         "invalid_bounded_range",
         "range_exceeds_limit",
+        "range_out_of_bounds",
         "bounded_range_required",
         "method_selector_required",
         "method_selector_invalid",
@@ -499,10 +515,13 @@ class _LocalAdapterBase:
         reason: str,
         message: str,
         sample_sha256: str | None = None,
+        option_name: str | None = None,
     ) -> ToolResult:
         output: dict[str, Any] = {"reason": reason, "detail_code": reason}
         if sample_sha256 is not None:
             output["sample_sha256"] = sample_sha256
+        if option_name is not None:
+            output["option_name"] = option_name
         return self._result(
             context,
             status,
@@ -599,6 +618,22 @@ class _LocalRunCommandAdapter(_LocalAdapterBase):
                     f"{', '.join(option.name for option in capability.spec.allowed_options)}."
                 ),
                 sample_sha256=sample_sha256,
+            )
+        _normalized_options, option_error, option_name = normalize_command_options_detailed(
+            capability.spec, raw_options
+        )
+        if option_error in _LOCAL_OPTION_VALUE_ERROR_CODES:
+            return self._error(
+                context,
+                ToolInvocationStatus.POLICY_DENIED,
+                started=started,
+                reason="option_value_invalid",
+                message=(
+                    f"Invalid value for option '{option_name or 'unknown'}' "
+                    f"in {command_id.value}."
+                ),
+                sample_sha256=sample_sha256,
+                option_name=option_name,
             )
         confined_run = getattr(self.command_service, "run_for_investigation", None)
         if callable(confined_run):
@@ -751,10 +786,16 @@ class _LocalRunCommandAdapter(_LocalAdapterBase):
                 else []
             )
             output["valid_options"] = valid_options
-            message = (
-                f"Invalid options for {command_id.value if command_id is not None else 'command'}; "
-                f"valid options: {', '.join(valid_options)}."
-            )
+            if result.detail_code == "range_options_must_be_paired":
+                message = "Options 'offset' and 'length' must be provided together."
+            elif result.detail_code == "range_out_of_bounds":
+                message = "Options 'offset' and 'length' extend beyond the sample."
+            else:
+                command_name = command_id.value if command_id is not None else "command"
+                message = (
+                    f"Invalid options for {command_name}; "
+                    f"valid options: {', '.join(valid_options)}."
+                )
         else:
             message = (
                 "Local analysis output is untrusted data."

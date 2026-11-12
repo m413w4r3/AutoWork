@@ -13,6 +13,7 @@ import pytest
 from cti_app.application.confined_analysis import (
     ConfinedAnalysisFamilyStatus,
     ConfinedAnalysisJobParameters,
+    ConfinedAnalysisResult,
     ConfinedAnalysisTool,
 )
 from cti_app.application.investigation_acquisition import HitAcquisitionService
@@ -24,7 +25,7 @@ from cti_app.application.local_analysis import (
     normalize_command_options,
 )
 from cti_app.config import Settings
-from cti_app.domain.investigation import SampleOrigin
+from cti_app.domain.investigation import SampleOrigin, ToolInvocationStatus
 from cti_app.domain.local_analysis import LocalCommandId, LocalCommandStatus
 from cti_app.infrastructure.confined_local_commands import (
     ConfinedLocalCommands,
@@ -402,6 +403,94 @@ async def test_real_catalogue_binaries_run_through_confined_dispatcher_worker(
 
 
 @pytest.mark.asyncio
+async def test_strings_options_reach_confined_execution_as_validated_parameters() -> None:
+    sample_payload = b"MZ" + bytes(1_253_886)
+    service, investigation_id, sha256, _artifact_store, _harness, _marker = (
+        await _local_worker_fixture(sample_payload)
+    )
+
+    class _RecordingExecution:
+        available = True
+        available_reason = None
+        isolation_profile = "test-in-process"
+        attestation = None
+
+        def __init__(self) -> None:
+            self.family_statuses = {
+                "local_command": ConfinedAnalysisFamilyStatus("local_command", True, "v1")
+            }
+            self.requests = []
+
+        async def execute(self, request):
+            self.requests.append(request)
+            return ConfinedAnalysisResult(
+                status=ToolInvocationStatus.SUCCEEDED,
+                operation_key="confined-analysis:" + "a" * 64,
+                artifact_id=request.artifact_id,
+                input_sha256=request.sha256,
+                payload={
+                    "result": {
+                        "status": "SUCCEEDED",
+                        "stdout": "fixture string output",
+                        "normalized_command": ["strings", "<sample>"],
+                        "version": "strings fixture",
+                    }
+                },
+            )
+
+    execution = _RecordingExecution()
+    service.execution = execution  # type: ignore[assignment]
+    cases = (
+        ({}, {"min_length": "4", "max_strings": "1000"}),
+        (
+            {"offset": 1_080_320, "length": 2048, "min_length": 6},
+            {
+                "min_length": "6",
+                "max_strings": "1000",
+                "offset": "1080320",
+                "length": "2048",
+            },
+        ),
+        (
+            {"offset": 0, "length": 16},
+            {"min_length": "4", "max_strings": "1000", "offset": "0", "length": "16"},
+        ),
+        ({"min_length": 6}, {"min_length": "6", "max_strings": "1000"}),
+        ({"max_strings": 12}, {"min_length": "4", "max_strings": "12"}),
+        (
+            {"offset": 0, "length": 16, "min_length": 6},
+            {"min_length": "6", "max_strings": "1000", "offset": "0", "length": "16"},
+        ),
+        (
+            {"offset": 0, "length": 16, "max_strings": 12},
+            {"min_length": "4", "max_strings": "12", "offset": "0", "length": "16"},
+        ),
+        (
+            {"offset": 0, "length": 16, "min_length": 6, "max_strings": 12},
+            {"min_length": "6", "max_strings": "12", "offset": "0", "length": "16"},
+        ),
+    )
+
+    for options, expected_parameters in cases:
+        result = await service.run_for_investigation(
+            investigation_id, LocalCommandId.STRINGS, sha256, options
+        )
+
+        assert result.status is LocalCommandStatus.SUCCEEDED
+        assert execution.requests[-1].analysis_parameters == expected_parameters
+
+    submitted = len(execution.requests)
+    for options in ({"offset": 0}, {"length": 16}):
+        result = await service.run_for_investigation(
+            investigation_id, LocalCommandId.STRINGS, sha256, options
+        )
+
+        assert result.status is LocalCommandStatus.POLICY_DENIED
+        assert result.detail_code == "range_options_must_be_paired"
+    assert len(execution.requests) == submitted
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("operation", "selector"),
     (
@@ -452,6 +541,7 @@ async def test_hex_and_hash_ranges_cannot_extend_past_the_quarantined_blob() -> 
     ) = await _local_worker_fixture()
     payload = next(iter(artifact_store.payloads.values()))
     invalid_ranges = (
+        ("strings", {"offset": len(payload) - 1, "length": 2}),
         ("xxd", {"offset": len(payload) - 1, "length": 2}),
         ("sha256sum", {"offset": len(payload) - 1, "length": 2}),
     )
