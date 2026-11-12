@@ -164,9 +164,7 @@ def _assert_pdf_has_no_internal_identity_data(
 
 
 def _assert_pdf_identity_payload_is_clean(payload: bytes, location: str) -> None:
-    assert _PDF_AUTOWORK_URI.search(payload) is None, (
-        f"{location} contains an autowork URI target"
-    )
+    assert _PDF_AUTOWORK_URI.search(payload) is None, f"{location} contains an autowork URI target"
     assert _PDF_INTERNAL_UUID.search(payload) is None, (
         f"{location} contains an internal UUID; standard PDF /ID values are undashed hex"
     )
@@ -689,10 +687,11 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
             replace(
                 opinion.blocks[0],
                 text=opinion_marker,
-                finding_refs=tuple(finding.id for finding in findings)
-                + (findings[0].id,),
-                evidence_refs=tuple(observation.id for observation in observations)
-                + (observations[0].id,),
+                finding_refs=(*(finding.id for finding in findings), findings[0].id),
+                evidence_refs=(
+                    *(observation.id for observation in observations),
+                    observations[0].id,
+                ),
             ),
         ),
         content_sha256="",

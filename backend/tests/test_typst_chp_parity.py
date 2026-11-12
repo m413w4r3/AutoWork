@@ -837,6 +837,18 @@ def _embedded_visual_xobject_count(reader: PdfReader) -> int:
     return count
 
 
+def _legacy_href_compatible(value: Any) -> Any:
+    """Add the inert href key that historical templates read for technical-annex rows."""
+    if isinstance(value, dict):
+        patched = {key: _legacy_href_compatible(item) for key, item in value.items()}
+        if "reference_id_spans" in patched and "href" not in patched:
+            patched["href"] = "https://example.invalid/"
+        return patched
+    if isinstance(value, list):
+        return [_legacy_href_compatible(item) for item in value]
+    return value
+
+
 def _build_workspace(
     workspace_root: Path,
     *,
@@ -1337,7 +1349,8 @@ async def test_real_typst_and_poppler_render_v6_opinion_without_changing_v5(
     assert "FAIT ÉTAYÉ" in normalized_extracted
     assert "LE CONSTAT SUPPLÉMENTAIRE EST CORROBORÉ" in normalized_extracted
     assert re.search(r"CONFIANCE\s*:\s*\d+\s*%", normalized_extracted) is None
-    assert "1,2" in normalized_extracted
+    assert "[F1]" in normalized_extracted
+    assert "[E1]" in normalized_extracted
 
     uris = []
     for page in reader.pages:
@@ -1345,8 +1358,9 @@ async def test_real_typst_and_poppler_render_v6_opinion_without_changing_v5(
             action = annotation_ref.get_object().get("/A")
             if action is not None and action.get("/URI") is not None:
                 uris.append(str(action["/URI"]))
-    assert any(uri.endswith(f"/findings/{opinion.blocks[0].finding_refs[0]}") for uri in uris)
-    assert any(uri.endswith(f"/evidence/{opinion.blocks[0].evidence_refs[0]}") for uri in uris)
+    # Reader PDFs carry no internal citation targets (no autowork:// URI, no UUID).
+    assert not any("autowork://" in uri for uri in uris)
+    assert not any(str(opinion.blocks[0].finding_refs[0]) in uri for uri in uris)
     page_prefix = tmp_path / "publication-v6-page"
     _run_blocking(
         (
@@ -1436,6 +1450,11 @@ async def test_opinion_paragraph_spacing_matches_b421f486_pdf_baseline(
         )
         if helper_source is not None:
             (workspace_root / "RENDERER" / "publication_helpers.typ").write_bytes(helper_source)
+            # The historical template still links technical-annex rows through item.href,
+            # which current projections intentionally no longer provide.
+            render_data_path = workspace_root / "RENDERER" / "render-data.json"
+            legacy_data = _legacy_href_compatible(json.loads(render_data_path.read_bytes()))
+            render_data_path.write_text(json.dumps(legacy_data), encoding="utf-8")
         font_root = root / "font-snapshot"
         font_root.mkdir()
         pdf_path = root / "opinion-spacing.pdf"
@@ -2148,7 +2167,9 @@ def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_navigabl
     )
     for marker in forbidden_narrative_markers:
         assert re.search(marker, narrative_text, re.IGNORECASE) is None, marker
-    assert "1,2" in re.sub(r"\s+", "", narrative_text)
+    compact_narrative = re.sub(r"\s+", "", narrative_text)
+    assert "[F1]" in compact_narrative
+    assert "[E1]" in compact_narrative
     assert re.search(r"\b[0-9a-f]{64}\b", narrative_text, re.IGNORECASE) is None
     compact_annex = re.sub(r"\s+", "", annex_text)
     for reference in annex["opinion_refs"]:
@@ -2196,7 +2217,7 @@ def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_navigabl
     assert internal_destination_pages
     assert all(0 <= page_number < len(reader.pages) for page_number in internal_destination_pages)
     assert any("https://" in uri for uri in external_uris)
-    assert any("autowork://investigations/" in uri for uri in external_uris)
+    assert not any("autowork://" in uri for uri in external_uris)
 
 
 @pytest.mark.asyncio
