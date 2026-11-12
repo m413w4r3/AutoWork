@@ -515,6 +515,68 @@ async def test_invalid_strings_options_report_detail_code_and_catalog_options() 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("options", "option_name"),
+    (
+        ({"offset": "0x107c00", "length": 2048}, "offset"),
+        ({"min_length": 0}, "min_length"),
+        ({"max_strings": 10_001}, "max_strings"),
+    ),
+)
+async def test_invalid_strings_option_values_return_named_detail_code(
+    options: dict[str, object], option_name: str
+) -> None:
+    harness = _Harness(strings_available=True)
+    result = await _dispatch(
+        harness.registry,
+        harness.context(key=f"invalid-strings-{option_name}"),
+        LOCAL_RUN_COMMAND,
+        _local_arguments(command_id="strings", options=options),
+    )
+
+    assert result.status is ToolInvocationStatus.POLICY_DENIED
+    assert result.output["detail_code"] == "option_value_invalid"
+    assert result.output["option_name"] == option_name
+    assert option_name in result.message
+    assert result.error_code == "option_value_invalid"
+    assert harness.runner.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("options", "detail_code", "message_parts"),
+    (
+        (
+            {"offset": 0},
+            "range_options_must_be_paired",
+            ("offset", "length", "together"),
+        ),
+        (
+            {"offset": len(_SAMPLE_BYTES) - 1, "length": 2},
+            "range_out_of_bounds",
+            ("offset", "length", "beyond"),
+        ),
+    ),
+)
+async def test_strings_range_errors_return_specific_messages(
+    options: dict[str, object], detail_code: str, message_parts: tuple[str, ...]
+) -> None:
+    harness = _Harness(strings_available=True)
+    result = await _dispatch(
+        harness.registry,
+        harness.context(key=f"invalid-strings-range-{detail_code}"),
+        LOCAL_RUN_COMMAND,
+        _local_arguments(command_id="strings", options=options),
+    )
+
+    assert result.status is ToolInvocationStatus.POLICY_DENIED
+    assert result.output["detail_code"] == detail_code
+    assert result.error_code == detail_code
+    assert all(part in result.message for part in message_parts)
+    assert harness.runner.calls == []
+
+
+@pytest.mark.asyncio
 async def test_metacharacters_remain_yara_data_and_never_select_a_command() -> None:
     harness = _Harness()
     context = harness.context(key="yara-metacharacters")

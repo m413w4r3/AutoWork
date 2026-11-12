@@ -707,18 +707,27 @@ def extraction_command_specs(
 def normalize_command_options(
     spec: LocalCommandSpec, options: Mapping[str, object]
 ) -> tuple[dict[str, object], str | None]:
+    normalized, error, _option_name = normalize_command_options_detailed(spec, options)
+    return normalized, error
+
+
+def normalize_command_options_detailed(
+    spec: LocalCommandSpec, options: Mapping[str, object]
+) -> tuple[dict[str, object], str | None, str | None]:
     if not isinstance(options, Mapping):
-        return {}, "options_must_be_object"
+        return {}, "options_must_be_object", None
     allowed = {option.name: option for option in spec.allowed_options}
-    if any(not isinstance(name, str) or name not in allowed for name in options):
-        return {}, "option_not_allowed"
+    invalid_names = [name for name in options if not isinstance(name, str) or name not in allowed]
+    if invalid_names:
+        option_name = invalid_names[0] if isinstance(invalid_names[0], str) else None
+        return {}, "option_not_allowed", option_name
     normalized: dict[str, object] = {}
     for name, option_spec in allowed.items():
         supplied = name in options
         if not supplied:
             if option_spec.default is None:
                 if not option_spec.optional:
-                    return {}, "required_option_missing"
+                    return {}, "required_option_missing", name
             value = option_spec.default
         else:
             value = options[name]
@@ -727,17 +736,17 @@ def normalize_command_options(
             continue
         if option_spec.kind is LocalOptionKind.BOOLEAN:
             if type(value) is not bool:
-                return {}, "invalid_boolean_option"
+                return {}, "invalid_boolean_option", name
         elif option_spec.kind is LocalOptionKind.INTEGER:
             if type(value) is not int:
-                return {}, "invalid_integer_option"
+                return {}, "invalid_integer_option", name
             if option_spec.minimum is not None and value < option_spec.minimum:
-                return {}, "integer_option_below_minimum"
+                return {}, "integer_option_below_minimum", name
             if option_spec.maximum is not None and value > option_spec.maximum:
-                return {}, "integer_option_above_maximum"
+                return {}, "integer_option_above_maximum", name
         elif option_spec.kind is LocalOptionKind.ENUM:
             if not isinstance(value, str) or value not in option_spec.allowed_values:
-                return {}, "enum_option_not_allowed"
+                return {}, "enum_option_not_allowed", name
         elif option_spec.kind is LocalOptionKind.STRING:
             if (
                 not isinstance(value, str)
@@ -748,14 +757,14 @@ def normalize_command_options(
                     and len(value) > option_spec.max_item_length
                 )
             ):
-                return {}, "string_option_invalid"
+                return {}, "string_option_invalid", name
         elif option_spec.kind is LocalOptionKind.STRING_LIST:
             if not isinstance(value, (list, tuple)):
-                return {}, "invalid_string_list_option"
+                return {}, "invalid_string_list_option", name
             if not value or (
                 option_spec.max_items is not None and len(value) > option_spec.max_items
             ):
-                return {}, "string_list_size_out_of_range"
+                return {}, "string_list_size_out_of_range", name
             if any(
                 not isinstance(item, str)
                 or not item
@@ -766,10 +775,10 @@ def normalize_command_options(
                 )
                 for item in value
             ):
-                return {}, "string_list_item_invalid"
+                return {}, "string_list_item_invalid", name
             value = tuple(value)
         normalized[name] = value
-    return normalized, None
+    return normalized, None, None
 
 
 def _validate_local_command_range_options(

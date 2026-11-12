@@ -324,12 +324,30 @@ class ConfinedAnalysisRequest:
                 }:
                     raise ValueError("file command parameters are invalid")
             elif command_id == "strings":
-                if set(parameters) != {"min_length", "max_strings"}:
+                required = {"min_length", "max_strings"}
+                allowed = required | {"offset", "length"}
+                if not required <= set(parameters) or set(parameters) - allowed:
                     raise ValueError("strings command parameters are invalid")
                 if not _bounded_decimal(parameters["min_length"], 1, 256):
-                    raise ValueError("strings minimum length is invalid")
+                    raise ValueError("strings option min_length is invalid")
                 if not _bounded_decimal(parameters["max_strings"], 1, 10_000):
-                    raise ValueError("strings output limit is invalid")
+                    raise ValueError("strings option max_strings is invalid")
+                has_offset = "offset" in parameters
+                has_length = "length" in parameters
+                if has_offset != has_length:
+                    raise ValueError("strings options offset and length must be paired")
+                if has_offset:
+                    if not _bounded_decimal(parameters["offset"], 0, 0xFFFFFFFFFFFFFFFF):
+                        raise ValueError("strings option offset is invalid")
+                    if not _bounded_decimal(
+                        parameters["length"], 1, LOCAL_COMMAND_MAX_RANGE_BYTES
+                    ):
+                        raise ValueError("strings option length is invalid")
+                    if (
+                        int(parameters["offset"]) + int(parameters["length"])
+                        > 0xFFFFFFFFFFFFFFFF
+                    ):
+                        raise ValueError("strings offset and length exceed the address limit")
             elif command_id == "readelf":
                 if set(parameters) != {"mode"} or parameters["mode"] not in {
                     "header",
