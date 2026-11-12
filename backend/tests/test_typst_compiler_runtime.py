@@ -14,6 +14,7 @@ from io import BytesIO
 from itertools import pairwise
 from pathlib import Path
 from typing import Any, NoReturn
+from uuid import UUID
 
 import anyio
 import pytest
@@ -620,6 +621,7 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
         )
         workspace = tmp_path / f"{name}-workspace"
         render_data = json.loads(source.render_data_bytes)
+
         def without_note_numbers(value: Any) -> Any:
             if isinstance(value, dict):
                 return {

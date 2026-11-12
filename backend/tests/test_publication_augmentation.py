@@ -87,8 +87,7 @@ def test_opinion_reference_projection_assigns_short_labels_and_preserves_referen
     assert block["finding_refs"][0]["reference_id"] == str(context.findings[0].id)
     assert block["evidence_refs"][0]["reference_id"] == str(context.observations[0].id)
     assert [
-        reference["note_number"]
-        for reference in block["finding_refs"] + block["evidence_refs"]
+        reference["note_number"] for reference in block["finding_refs"] + block["evidence_refs"]
     ] == [1, 2]
 
 
