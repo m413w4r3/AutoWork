@@ -180,7 +180,7 @@ def test_m19_renderer_manifest_versions_are_explicitly_pinned() -> None:
         _TEMPLATE_ROOT,
         manifest_name="edition-renderer-manifest.json",
     )
-    assert article.template_version == "chp-article-v45-m21-opinion-refs"
+    assert article.template_version == "chp-article-v46-m21-opinion-ioc-note"
     assert edition.template_version == "chp-edition-v36-m21-opinion-render"
 
 

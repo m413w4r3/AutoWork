@@ -823,9 +823,11 @@
   if candidates.len() > 0 [
     #v(8pt)
     #let description = if omitted-url-count > 0 {
-      "Éléments à examiner, sans promotion au statut d'IOC confirmé. "
-        + str(omitted-url-count)
-        + " URL non valide(s) omise(s) des listes."
+      (
+        "Éléments à examiner, sans promotion au statut d'IOC confirmé. "
+          + str(omitted-url-count)
+          + " URL non valide(s) omise(s) des listes."
+      )
     } else {
       "Éléments à examiner, sans promotion au statut d'IOC confirmé."
     }
