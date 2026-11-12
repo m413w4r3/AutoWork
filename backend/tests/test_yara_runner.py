@@ -43,6 +43,31 @@ def test_isolated_worker_compiles_and_matches_synthetic_fixture() -> None:
     assert result.matches_sha256 == (match.sample_sha256,)
 
 
+def test_hash_module_is_supported_or_reports_a_module_specific_compile_error() -> None:
+    data = b"synthetic hash module marker"
+    sample = _sample(data)
+    expected_sha256 = hashlib.sha256(data).hexdigest()
+    source = f'''import "hash"
+rule synthetic_hash_module {{
+    strings:
+        $marker = "synthetic hash module marker" ascii
+    condition:
+        $marker and hash.sha256(0, filesize) == "{expected_sha256}"
+}}
+'''
+    runner = IsolatedYaraRunner()
+
+    compiled = runner.compile(source)
+
+    if compiled.status is YaraExecutionStatus.OK:
+        result = runner.match(source, (sample,))
+        assert result.status is YaraExecutionStatus.OK
+        assert result.matches_sha256 == (sample.sample_sha256,)
+    else:
+        assert compiled.status is YaraExecutionStatus.COMPILE_ERROR
+        assert "hash" in compiled.message.casefold()
+
+
 def test_available_runs_and_caches_a_match_probe_through_the_worker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
