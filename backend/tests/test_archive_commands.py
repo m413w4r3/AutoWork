@@ -828,9 +828,7 @@ async def test_7z_extract_hash_reports_codec_failure_method_and_redacted_stderr(
                 AnalysisSubprocessStatus.SUCCEEDED, 0, listing.encode(), b""
             )
         stderr = f"ERROR: Unsupported Method : {argv[-2]} {argv[-1]}\n".encode()
-        return AnalysisSubprocessResult(
-            AnalysisSubprocessStatus.NON_ZERO_EXIT, 2, b"", stderr
-        )
+        return AnalysisSubprocessResult(AnalysisSubprocessStatus.NON_ZERO_EXIT, 2, b"", stderr)
 
     monkeypatch.setattr(archive_commands, "run_analysis_subprocess", fake_run)
     _redirect_archive_tempdir(monkeypatch, tmp_path)
@@ -899,9 +897,7 @@ async def test_7z_extract_member_reports_clear_not_found_and_codec_diagnostics(
                 AnalysisSubprocessStatus.SUCCEEDED, 0, missing_listing.encode(), b""
             )
         stderr = f"ERROR: Unsupported Method : {argv[-2]} {argv[-1]}\n".encode()
-        return AnalysisSubprocessResult(
-            AnalysisSubprocessStatus.NON_ZERO_EXIT, 2, b"", stderr
-        )
+        return AnalysisSubprocessResult(AnalysisSubprocessStatus.NON_ZERO_EXIT, 2, b"", stderr)
 
     monkeypatch.setattr(archive_commands, "run_analysis_subprocess", unsupported)
     failed = await run_7z_archive_command(

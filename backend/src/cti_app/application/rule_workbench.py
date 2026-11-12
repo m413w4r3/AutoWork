@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import hashlib
 import json
 import math
@@ -19,6 +18,7 @@ from cti_app.application.confined_analysis import (
     ConfinedAnalysisTool,
 )
 from cti_app.application.investigation_persistence import DetectionCandidateRepository
+from cti_app.application.yara_measurements import _decode_yara_string_literal
 from cti_app.domain.analysis import SampleFeatureSetV1
 from cti_app.domain.code_features import CodeFeatureSet, CodeFeatureStatus
 from cti_app.domain.goodware import (
@@ -2081,15 +2081,16 @@ def _extract_yara_string_hits(
         flags = re.IGNORECASE if "nocase" in modifiers else 0
         try:
             if raw_pattern.startswith('"'):
-                value = ast.literal_eval(raw_pattern)
-                if not isinstance(value, str) or not value:
+                decoded_literal = _decode_yara_string_literal(raw_pattern)
+                if decoded_literal is None or not decoded_literal[1]:
                     unavailable.append(identifier)
                     continue
+                literal_bytes = decoded_literal[1]
                 encodings: list[bytes] = []
                 if "ascii" in modifiers or "wide" not in modifiers:
-                    encodings.append(value.encode("utf-8"))
+                    encodings.append(literal_bytes)
                 if "wide" in modifiers:
-                    encodings.append(value.encode("utf-16le"))
+                    encodings.append(b"".join(bytes((item, 0)) for item in literal_bytes))
                 patterns = [
                     re.compile(b"(?=(" + re.escape(item) + b"))", flags) for item in encodings
                 ]

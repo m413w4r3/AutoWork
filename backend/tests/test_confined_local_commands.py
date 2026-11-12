@@ -95,9 +95,7 @@ def test_confined_local_command_preserves_worker_detail_code() -> None:
     assert _worker_detail_code({"detail_code": "archive_codec_unsupported"}) == (
         "archive_codec_unsupported"
     )
-    assert _worker_detail_code({"available_reason": "worker_unavailable"}) == (
-        "worker_unavailable"
-    )
+    assert _worker_detail_code({"available_reason": "worker_unavailable"}) == ("worker_unavailable")
     assert _worker_detail_code({"detail_code": "/tmp/private/sample.rar"}) is None
 
 

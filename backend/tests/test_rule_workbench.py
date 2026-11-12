@@ -548,14 +548,14 @@ async def test_confined_pe_rule_skips_bytes_missing_and_measures_available_membe
         non_discriminant_patterns=NonDiscriminantPatternRegistry(()),
         legitimate_services=LegitimateServiceRegistry(()),
     )
-    source = '''import "pe"
+    source = """import "pe"
 rule synthetic_pe {
     strings:
         $marker = "Project1.dll" ascii
     condition:
         pe.is_pe and $marker
 }
-'''
+"""
 
     report = await workbench.compile_and_test(
         source,
@@ -576,9 +576,7 @@ rule synthetic_pe {
         coverage_statement="The unavailable member is not measurable; PE bytes are measured.",
     )
 
-    missing = next(
-        role for role in report.roles if role.role is RuleTestCorpusRole.BYTES_MISSING
-    )
+    missing = next(role for role in report.roles if role.role is RuleTestCorpusRole.BYTES_MISSING)
     positive = next(
         role for role in report.roles if role.role is RuleTestCorpusRole.HUMAN_CONFIRMED
     )
@@ -632,14 +630,14 @@ async def test_confined_compile_error_is_recorded_for_every_corpus_member() -> N
     )
 
     report = await workbench.compile_and_test(
-        '''import "hash"
+        """import "hash"
 rule synthetic_hash {
     strings:
         $marker = "SyntheticHashMarker" ascii
     condition:
         $marker
 }
-''',
+""",
         (
             RuleTestCase(
                 sample_sha256=first_sha256,
@@ -653,9 +651,7 @@ rule synthetic_hash {
     )
 
     candidate = next(
-        role
-        for role in report.roles
-        if role.role is RuleTestCorpusRole.NEW_CANDIDATE_UNCONFIRMED
+        role for role in report.roles if role.role is RuleTestCorpusRole.NEW_CANDIDATE_UNCONFIRMED
     )
     goodware = next(role for role in report.roles if role.role is RuleTestCorpusRole.GOODWARE)
     assert report.execution_status is YaraExecutionStatus.COMPILE_ERROR
@@ -979,15 +975,15 @@ async def test_generated_string_and_wide_motifs_match_synthetic_pe_bytes() -> No
 
 
 def test_yara_string_hit_extraction_preserves_escaped_utf8_bytes() -> None:
-    source = r'''rule escaped_utf8_marker {
+    source = r"""rule escaped_utf8_marker {
     strings:
         $marker = "\xC3\xA9Project1" ascii
     condition:
         $marker
 }
-'''
+"""
 
-    hits, unavailable = _extract_yara_string_hits(source, "éProject1".encode("utf-8"))
+    hits, unavailable = _extract_yara_string_hits(source, "éProject1".encode())
 
     assert unavailable == ()
     assert len(hits) == 1
@@ -1126,7 +1122,9 @@ rule exact_identity {{
         "measured_string_or_byte_pattern_required",
         "hash_equality_condition_forbidden",
     )
-    positive = next(role for role in report.roles if role.role is RuleTestCorpusRole.HUMAN_CONFIRMED)
+    positive = next(
+        role for role in report.roles if role.role is RuleTestCorpusRole.HUMAN_CONFIRMED
+    )
     assert positive.errors[0].message == (
         "single-rule source guard: measured_string_or_byte_pattern_required"
     )

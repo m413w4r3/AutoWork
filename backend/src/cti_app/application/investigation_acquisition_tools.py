@@ -848,9 +848,7 @@ class ArchiveExtractMemberAdapter:
                 else "extract_failed"
             )
             raw_detail_code = (
-                worker_result.get("detail_code")
-                if isinstance(worker_result, Mapping)
-                else None
+                worker_result.get("detail_code") if isinstance(worker_result, Mapping) else None
             )
             detail_code = (
                 raw_detail_code

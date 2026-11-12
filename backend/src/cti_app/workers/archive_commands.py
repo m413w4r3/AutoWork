@@ -473,11 +473,7 @@ async def run_7z_archive_command(
     result = _worker_result(text, truncated, tool.value, tool_version)
     if tool is ConfinedAnalysisTool.ARCHIVE_EXTRACT_HASH:
         detail_code = next(
-            (
-                item["detail_code"]
-                for item in records
-                if isinstance(item.get("detail_code"), str)
-            ),
+            (item["detail_code"] for item in records if isinstance(item.get("detail_code"), str)),
             None,
         )
         if isinstance(detail_code, str):
@@ -645,9 +641,7 @@ async def _extract_7z_archive_member(
             detail_code="archive_tool_start_failed",
         )
     if extracted.status is AnalysisSubprocessStatus.OUTPUT_LIMIT:
-        return refusal(
-            "actual_size_or_member_limit", detail_code="archive_member_output_limit"
-        )
+        return refusal("actual_size_or_member_limit", detail_code="archive_member_output_limit")
     if extracted.status is not AnalysisSubprocessStatus.SUCCEEDED:
         diagnostics = _member_failure_diagnostics(
             extracted.stderr,
