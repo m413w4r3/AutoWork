@@ -42,6 +42,9 @@ from cti_app.application.investigation_contracts import (
     parse_investigation_context,
     validate_decision_hypothesis_references,
 )
+from cti_app.application.investigation_acquisition_tools import (
+    is_trusted_vt_download_sample_adapter,
+)
 from cti_app.application.investigation_findings import (
     constrain_supported_assessment,
 )
@@ -62,6 +65,7 @@ from cti_app.application.investigation_state import (
     InvestigationStateVersionConflict,
 )
 from cti_app.application.investigation_tools import (
+    FrameworkTerminalExternalEffectFailure,
     ToolDispatcher,
     ToolEffect,
     ToolExecutionContext,
@@ -196,6 +200,12 @@ _VT_COORDINATED_READ_TOOLS = frozenset(
     }
 )
 _VT_PASSIVE_READ_TOOLS = _VT_COORDINATED_READ_TOOLS - {"vt.download_sample"}
+_VT_DOWNLOAD_NOT_FOUND_ERROR_CODES = frozenset(
+    {
+        "virustotal_download_route_not_found",
+        "virustotal_download_file_not_found",
+    }
+)
 _VT_RECONCILIATION_OUTCOMES = frozenset(
     {
         InvocationReconciliationOutcome.EXECUTED_EMPTY_RESPONSE,
@@ -411,6 +421,7 @@ class ProductionArtifactObservationWriter:
         download_refusal_object_type = (
             {
                 "provider_download_route_not_found": PROVIDER_DOWNLOAD_ROUTE_REFUSAL_OBJECT_TYPE,
+                "proxy_route_not_found": PROVIDER_DOWNLOAD_ROUTE_REFUSAL_OBJECT_TYPE,
                 "provider_download_authorization_refused": (
                     PROVIDER_DOWNLOAD_AUTH_REFUSAL_OBJECT_TYPE
                 ),
@@ -2293,6 +2304,16 @@ class InvestigationService:
         framework_proves_non_execution = (
             _confirmed_external_non_execution(result) and not advisor_admission_recheck
         )
+        terminal_vt_download_failure = (
+            tool_name == "vt.download_sample"
+            and result.status is ToolInvocationStatus.FAILED
+            and result.error_code in _VT_DOWNLOAD_NOT_FOUND_ERROR_CODES
+            and result.output.get("error_code") == result.error_code
+            and result.framework_terminal_external_effect_failure
+            is FrameworkTerminalExternalEffectFailure.VT_DOWNLOAD_NOT_FOUND
+            and registered is not None
+            and is_trusted_vt_download_sample_adapter(tool_name, registered[1])
+        )
         unproven_external_failure = (
             external_effect
             and result.status
@@ -2303,6 +2324,7 @@ class InvestigationService:
                 ToolInvocationStatus.NEEDS_REVIEW,
             }
             and not framework_proves_non_execution
+            and not terminal_vt_download_failure
         )
         ambiguous_adapter_response = (
             unproven_external_failure and result.framework_pre_submission_proof is None
@@ -2450,6 +2472,7 @@ class InvestigationService:
             uncertain=uncertain_external,
             external_effect=external_effect,
             retryable_external_read=retryable_vt_read_uncertainty,
+            terminal_external_failure=terminal_vt_download_failure,
         )
         await self._commit_current_uow()
         _log_terminal_tool_failure(invocation, result)
@@ -4961,6 +4984,7 @@ class InvestigationService:
         uncertain: bool,
         external_effect: bool = False,
         retryable_external_read: bool = False,
+        terminal_external_failure: bool = False,
     ) -> None:
         for _ in range(3):
             current_envelope = await self._envelopes.get(investigation_id)
@@ -5015,9 +5039,17 @@ class InvestigationService:
                     ToolInvocationStatus.NEEDS_REVIEW,
                 }
                 and not _confirmed_external_non_execution(result)
+                and not terminal_external_failure
             ):
                 return
-            if _confirmed_external_non_execution(result):
+            if terminal_external_failure:
+                envelope.budget.commit(operation_key, dict(result.budget_consumed))
+                try:
+                    await self._save_envelope_version(envelope)
+                    return
+                except VersionConflictError:
+                    continue
+            elif _confirmed_external_non_execution(result):
                 envelope.budget.release_confirmed_non_submission(operation_key)
                 try:
                     await self._save_envelope_version(envelope)

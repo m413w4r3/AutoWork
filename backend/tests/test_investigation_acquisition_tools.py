@@ -1141,10 +1141,12 @@ async def test_download_tool_does_not_cache_a_404_with_unknown_response_origin()
         ),
     )
 
-    assert first.status is ToolInvocationStatus.UNAVAILABLE
-    assert first.output["error_code"] == "virustotal_download_404_origin_unknown"
-    assert first.output["reason"] == "provider_download_404_origin_unknown"
-    assert first.output["confirmed_non_execution"] is True
+    assert first.status is ToolInvocationStatus.FAILED
+    assert first.output["error_code"] == "virustotal_download_route_not_found"
+    assert first.output["reason"] == "provider_download_route_not_found"
+    assert first.framework_terminal_external_effect_failure is not None
+    assert first.framework_terminal_external_effect_failure.value == "vt_download_not_found"
+    assert "confirmed_non_execution" not in first.output
     assert "synthetic route absent" not in first.message
     assert second.output.get("cached", False) is False
     assert port.download_calls == [arguments["sha256"], arguments["sha256"]]

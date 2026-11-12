@@ -52,6 +52,12 @@ class ToolEffect(StrEnum):
     EXTERNAL_SUBMIT = "external_submit"
 
 
+class FrameworkTerminalExternalEffectFailure(StrEnum):
+    """Typed provider outcomes that are conclusive after external handoff."""
+
+    VT_DOWNLOAD_NOT_FOUND = "vt_download_not_found"
+
+
 _EXTERNAL_PROVIDER_EFFECTS = frozenset(
     {
         ToolEffect.EXTERNAL_READ,
@@ -265,6 +271,9 @@ class ToolResult:
     error_code: str | None = None
     framework_pre_submission_proof: FrameworkPreSubmissionProof | None = None
     idempotent_replay: bool = False
+    framework_terminal_external_effect_failure: (
+        FrameworkTerminalExternalEffectFailure | None
+    ) = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.status, ToolInvocationStatus):
@@ -273,6 +282,14 @@ class ToolResult:
             self.framework_pre_submission_proof, FrameworkPreSubmissionProof
         ):
             raise TypeError("framework_pre_submission_proof must use FrameworkPreSubmissionProof")
+        if self.framework_terminal_external_effect_failure is not None and not isinstance(
+            self.framework_terminal_external_effect_failure,
+            FrameworkTerminalExternalEffectFailure,
+        ):
+            raise TypeError(
+                "framework_terminal_external_effect_failure must use "
+                "FrameworkTerminalExternalEffectFailure"
+            )
         if not isinstance(self.idempotent_replay, bool):
             raise TypeError("idempotent_replay must be a bool")
         if not isinstance(self.output, Mapping):

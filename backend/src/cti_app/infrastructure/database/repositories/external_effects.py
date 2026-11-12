@@ -790,6 +790,7 @@ class SqlAlchemyExternalEffectClaimStore:
             not in {
                 "bridge_rate_limited",
                 "bridge_rejected",
+                "vt_download_not_found",
                 *VT_PASSIVE_READ_ARCHIVE_FAILURE_OUTCOME_CODES,
             }
         ):
@@ -798,6 +799,10 @@ class SqlAlchemyExternalEffectClaimStore:
             async with session.begin():
                 row = await self._claim_for_transition(session, claim_id)
                 if row is None:
+                    return False
+                if outcome_code == "vt_download_not_found" and (
+                    row.provider != "vt" or row.family != "vt.download_sample"
+                ):
                     return False
                 if outcome_code in VT_PASSIVE_READ_ARCHIVE_FAILURE_OUTCOME_CODES and (
                     row.provider != "vt" or row.family not in VT_PASSIVE_READ_FAMILIES
