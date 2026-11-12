@@ -409,15 +409,30 @@ class _DotnetToolAdapter(ToolAdapter):
         )
         if unknown_field_completeness and raw_result.get("truncated") is True:
             raw_result = {**raw_result, "truncated": False}
-        sanitizer_truncated = _result_exceeds_sanitizer_limits(raw_result)
-        safe_result = _sanitize_json_value(dict(raw_result))
-        chunked_result, long_text_key = _preserve_long_text_fields(safe_result)
-        normalized_result, normalized_truncated = normalize_native_data(
-            chunked_result,
-            max_output_bytes=_PERSISTED_RESULT_BYTES,
-            max_items=MAX_NATIVE_RESULT_ITEMS,
-        )
-        persisted_result = _restore_long_text_fields(normalized_result, long_text_key)
+        if self._operation == "methods":
+            persisted_result, normalized_truncated = _normalize_methods_page(
+                raw_result, max_output_bytes=_OPERATOR_RESULT_BYTES
+            )
+            sanitizer_truncated = False
+            operator_result = persisted_result
+            response_truncated = False
+        else:
+            sanitizer_truncated = _result_exceeds_sanitizer_limits(raw_result)
+            safe_result = _sanitize_json_value(dict(raw_result))
+            chunked_result, long_text_key = _preserve_long_text_fields(safe_result)
+            normalized_result, normalized_truncated = normalize_native_data(
+                chunked_result,
+                max_output_bytes=_PERSISTED_RESULT_BYTES,
+                max_items=MAX_NATIVE_RESULT_ITEMS,
+            )
+            persisted_result = _restore_long_text_fields(normalized_result, long_text_key)
+            operator_result, response_truncated = normalize_native_data(
+                persisted_result,
+                max_output_bytes=(
+                    16 * 1024 if self._operation == "field_data" else _OPERATOR_RESULT_BYTES
+                ),
+                max_items=MAX_NATIVE_RESULT_ITEMS,
+            )
         result_truncated_by_tool = (
             sanitizer_truncated
             or normalized_truncated
@@ -433,13 +448,6 @@ class _DotnetToolAdapter(ToolAdapter):
         result_json_bytes = result_json.encode("utf-8")
         result_json_sha256 = hashlib.sha256(result_json_bytes).hexdigest()
         result_json_chunks = _text_chunks(result_json, _RESULT_JSON_CHUNK_CHARS)
-        operator_result, response_truncated = normalize_native_data(
-            persisted_result,
-            max_output_bytes=(
-                16 * 1024 if self._operation == "field_data" else _OPERATOR_RESULT_BYTES
-            ),
-            max_items=MAX_NATIVE_RESULT_ITEMS,
-        )
         worker_status = str(raw_result.get("status", "FAILED")).upper()
         analysis_status = (
             "obfusqué"
@@ -659,6 +667,139 @@ def _result_exceeds_sanitizer_limits(value: Any) -> bool:
             _result_exceeds_sanitizer_limits(item) for item in value[:MAX_NATIVE_RESULT_ITEMS]
         )
     return False
+
+
+_METHOD_RECORD_TEXT_LIMITS = {
+    "type_name": 512,
+    "method_name": 512,
+    "signature": 2048,
+}
+
+
+def _escape_non_printable_text(value: str) -> str:
+    return "".join(
+        char
+        if char.isprintable()
+        else f"\\u{ord(char):04x}"
+        if ord(char) <= 0xFFFF
+        else f"\\U{ord(char):08x}"
+        for char in value
+    )
+
+
+def _safe_method_record(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping) or not isinstance(value.get("method_name"), str):
+        return None
+    record: dict[str, Any] = {}
+    rid = value.get("rid")
+    if type(rid) is int and rid >= 0:
+        record["rid"] = rid
+    token = value.get("token")
+    if isinstance(token, str):
+        record["token"] = sanitize_evidence_text(token, max_chars=32)
+    for key, maximum in _METHOD_RECORD_TEXT_LIMITS.items():
+        field = value.get(key)
+        if not isinstance(field, str):
+            continue
+        escaped = _escape_non_printable_text(field)
+        safe = sanitize_evidence_text(escaped, max_chars=maximum)
+        record[key] = safe
+        if len(escaped) > maximum:
+            record[f"{key}_truncated"] = True
+    return record
+
+
+def _normalize_methods_page(
+    value: Mapping[str, Any], *, max_output_bytes: int
+) -> tuple[dict[str, Any], bool]:
+    """Keep a visible, ordered method page and make its cursor match that page."""
+    raw_records = value.get("records")
+    source_records = list(raw_records) if isinstance(raw_records, list | tuple) else []
+    records = [
+        record
+        for item in source_records[:MAX_NATIVE_RESULT_ITEMS]
+        if (record := _safe_method_record(item)) is not None
+    ]
+    safe_fields = _sanitize_json_value(
+        {str(key): item for key, item in value.items() if key != "records"}
+    )
+    offset_value = safe_fields.get("offset", 0)
+    offset = offset_value if type(offset_value) is int and offset_value >= 0 else 0
+    total_value = safe_fields.get("total_items")
+    total = total_value if type(total_value) is int and total_value >= 0 else None
+    original_next = safe_fields.get("next_offset")
+    raw_truncated = safe_fields.get("truncated") is True
+
+    def next_offset(record_count: int) -> int | None:
+        if total is not None:
+            return offset + record_count if offset + record_count < total else None
+        if record_count < len(source_records) or original_next is not None:
+            return offset + record_count
+        return None
+
+    def empty_page() -> tuple[dict[str, Any], bool]:
+        if total == 0:
+            detail_code = "dotnet_methods_empty"
+        elif total is not None and offset >= total:
+            detail_code = "dotnet_methods_offset_out_of_range"
+        else:
+            detail_code = "dotnet_methods_records_missing"
+        candidate = {
+            **safe_fields,
+            "records": [],
+            "next_offset": None,
+            "detail_code": detail_code,
+        }
+        normalized, was_truncated = normalize_native_data(
+            candidate,
+            max_output_bytes=max_output_bytes,
+            max_items=MAX_NATIVE_RESULT_ITEMS,
+            preserve_list_order=True,
+        )
+        normalized["records"] = []
+        normalized["next_offset"] = None
+        normalized["detail_code"] = detail_code
+        return normalized, was_truncated
+
+    if not records:
+        return empty_page()
+
+    for count in range(len(records), 0, -1):
+        candidate = {
+            **safe_fields,
+            "records": records[:count],
+            "next_offset": next_offset(count),
+            "truncated": raw_truncated or count < len(source_records),
+        }
+        normalized, was_truncated = normalize_native_data(
+            candidate,
+            max_output_bytes=max_output_bytes,
+            max_items=MAX_NATIVE_RESULT_ITEMS,
+            preserve_list_order=True,
+        )
+        normalized_records = normalized.get("records")
+        if isinstance(normalized_records, list) and normalized_records:
+            visible_count = len(normalized_records)
+            normalized["next_offset"] = next_offset(visible_count)
+            if visible_count < len(source_records):
+                normalized["truncated"] = True
+            return normalized, (
+                was_truncated or visible_count < len(source_records) or raw_truncated
+            )
+
+    # The bounded first record is guaranteed to fit, even when unrelated metadata is large.
+    compact = {
+        "status": safe_fields.get("status", "PARTIAL"),
+        "operation": "methods",
+        "records": [records[0]],
+        "total_items": total if total is not None else len(source_records),
+        "offset": offset,
+        "limit": safe_fields.get("limit", 1),
+        "next_offset": next_offset(1),
+        "truncated": True,
+        "detail_code": "dotnet_methods_page_compacted",
+    }
+    return compact, True
 
 
 def _preserve_long_text_fields(value: Any) -> tuple[Any, str]:

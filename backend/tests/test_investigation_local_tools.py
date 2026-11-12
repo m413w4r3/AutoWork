@@ -484,6 +484,33 @@ async def test_unknown_command_and_non_catalogued_options_are_refused() -> None:
     invalid_options = _local_arguments(options={"free_argument": "--help; touch /tmp/nope"})
     denied = await _dispatch(harness.registry, context, LOCAL_RUN_COMMAND, invalid_options)
     assert denied.status is ToolInvocationStatus.POLICY_DENIED
+    assert denied.output["detail_code"] == "option_not_allowed"
+    assert denied.output["valid_options"] == ["mime_type"]
+    assert "mime_type" in denied.message
+    assert denied.error_code == "option_not_allowed"
+    assert harness.runner.calls == []
+
+
+@pytest.mark.asyncio
+async def test_invalid_strings_options_report_detail_code_and_catalog_options() -> None:
+    harness = _Harness(strings_available=True)
+    result = await _dispatch(
+        harness.registry,
+        harness.context(key="invalid-strings-option"),
+        LOCAL_RUN_COMMAND,
+        _local_arguments(command_id="strings", options={"unknown": 1}),
+    )
+
+    assert result.status is ToolInvocationStatus.POLICY_DENIED
+    assert result.output["detail_code"] == "option_not_allowed"
+    assert set(result.output["valid_options"]) == {
+        "offset",
+        "length",
+        "min_length",
+        "max_strings",
+    }
+    assert "offset" in result.message
+    assert result.error_code == "option_not_allowed"
     assert harness.runner.calls == []
 
 

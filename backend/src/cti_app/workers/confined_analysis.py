@@ -1154,7 +1154,7 @@ async def _run_local_command(
         return await _run_monodis(parameters, payload, settings)
 
     values = parameters.analysis_parameters
-    if command_id in {"xxd", "sha256sum"} and "offset" in values:
+    if command_id in {"strings", "xxd", "sha256sum"} and "offset" in values:
         range_start = int(values["offset"])
         range_length = int(values["length"])
         if range_start + range_length > len(payload):
@@ -1202,7 +1202,7 @@ async def _run_local_command(
     with tempfile.TemporaryDirectory(prefix="cti-local-command-", dir="/tmp") as directory:
         sample_path = Path(directory) / "sample.bin"
         command_payload = payload
-        if command_id == "sha256sum" and "offset" in values:
+        if command_id in {"strings", "sha256sum"} and "offset" in values:
             start = int(values["offset"])
             command_payload = payload[start : start + int(values["length"])]
         sample_path.write_bytes(command_payload)
@@ -1564,12 +1564,30 @@ def _validate_local_command_arguments(
         if set(parameters) != {"mime_type"} or parameters["mime_type"] not in {"true", "false"}:
             raise ValueError("file command parameters are invalid")
     elif command_id == "strings":
-        if set(parameters) != {"min_length", "max_strings"}:
+        if (
+            not {"min_length", "max_strings"} <= set(parameters)
+            or set(parameters) - {"min_length", "max_strings", "offset", "length"}
+        ):
             raise ValueError("strings command parameters are invalid")
         if not _bounded_decimal(parameters["min_length"], 1, 256):
             raise ValueError("strings minimum length is invalid")
         if not _bounded_decimal(parameters["max_strings"], 1, 10_000):
             raise ValueError("strings output limit is invalid")
+        has_offset = "offset" in parameters
+        has_length = "length" in parameters
+        if has_offset != has_length:
+            raise ValueError("strings range options must be paired")
+        if has_offset:
+            if not _bounded_decimal(parameters["offset"], 0, 0xFFFFFFFFFFFFFFFF):
+                raise ValueError("strings range offset is invalid")
+            if not _bounded_decimal(
+                parameters["length"],
+                1,
+                min(max_range_bytes, LOCAL_COMMAND_MAX_RANGE_BYTES),
+            ):
+                raise ValueError("strings range length is invalid")
+            if int(parameters["offset"]) + int(parameters["length"]) > 0xFFFFFFFFFFFFFFFF:
+                raise ValueError("strings range exceeds the address limit")
     elif command_id == "readelf":
         if set(parameters) != {"mode"} or parameters["mode"] not in {
             "header",

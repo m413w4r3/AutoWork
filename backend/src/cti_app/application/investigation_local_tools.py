@@ -90,6 +90,29 @@ _LOCAL_OUTPUT_CHUNK_CHARS = 4_000
 _LOCAL_RESPONSE_PREVIEW_CHARS = 4_000
 _MAX_GHIDRA_DATA_BYTES = 48 * 1024
 _MAX_GHIDRA_TEXT_CHARS = 8_000
+_LOCAL_OPTION_ERROR_CODES = frozenset(
+    {
+        "options_must_be_object",
+        "option_not_allowed",
+        "required_option_missing",
+        "invalid_boolean_option",
+        "invalid_integer_option",
+        "integer_option_below_minimum",
+        "integer_option_above_maximum",
+        "enum_option_not_allowed",
+        "string_option_invalid",
+        "invalid_string_list_option",
+        "string_list_size_out_of_range",
+        "string_list_item_invalid",
+        "range_options_must_be_paired",
+        "invalid_bounded_range",
+        "range_exceeds_limit",
+        "bounded_range_required",
+        "method_selector_required",
+        "method_selector_invalid",
+        "method_selector_not_allowed",
+    }
+)
 
 
 class SampleBytesReader(SampleBytesForAnalysisPort, RuleCorpusBytesPort, Protocol):
@@ -189,7 +212,9 @@ def _local_command_schema(catalog: LocalCommandCatalog) -> dict[str, Any]:
                     "le worker confiné et ne lancent pas le contenu. monodis accepte "
                     "operation=userstrings|typedef|methods|cil; cil requiert un seul "
                     "method_name ou method_rid et une plage offset/length bornée en octets. "
-                    "xxd lit au plus 4096 octets; sha256sum accepte une sous-plage bornée. "
+                    "strings accepte min_length, max_strings et offset/length appariés jusqu'à "
+                    "la limite de plage du worker; xxd lit au plus 4096 octets et sha256sum "
+                    "accepte une sous-plage bornée. "
                     "Aucun chemin n'est fourni par l'appelant: l'échantillon est adressé "
                     "par sample_sha256. La preuve conserve jusqu'à 48 KiB de sortie "
                     "assainie dans output_chunks base64 UTF-8, avec output_byte_length et SHA-256; "
@@ -207,7 +232,8 @@ def _local_command_schema(catalog: LocalCommandCatalog) -> dict[str, Any]:
                         "minimum": 0,
                         "maximum": 18446744073709551615,
                         "description": (
-                            "Offset en octets dans le blob, ou dans la sortie texte monodis. "
+                            "Offset en octets dans le blob pour strings, xxd et sha256sum, "
+                            "ou dans la sortie texte monodis. "
                             "Pour CIL, défaut: offset=0 et length=8192; une plage explicite "
                             "doit fournir les deux valeurs."
                         ),
@@ -217,7 +243,8 @@ def _local_command_schema(catalog: LocalCommandCatalog) -> dict[str, Any]:
                         "minimum": 1,
                         "maximum": 1048576,
                         "description": (
-                            "Longueur en octets; xxd impose 4096 maximum et monodis 8192. "
+                            "Longueur en octets; strings est borné à 1 MiB par défaut, "
+                            "xxd impose 4096 maximum et monodis 8192. "
                             "Pour CIL, la plage par défaut couvre 8192 octets; une plage "
                             "explicite doit fournir offset et length ensemble."
                         ),
@@ -428,6 +455,7 @@ class _LocalAdapterBase:
         output: Mapping[str, Any],
         message: str,
         consumed_seconds: int | None = None,
+        error_code: str | None = None,
     ) -> ToolResult:
         consumed = (
             min(
@@ -459,6 +487,7 @@ class _LocalAdapterBase:
             suggested_alternatives=alternatives,
             output=result_output,
             message=message,
+            error_code=error_code,
         )
 
     def _error(
@@ -471,7 +500,7 @@ class _LocalAdapterBase:
         message: str,
         sample_sha256: str | None = None,
     ) -> ToolResult:
-        output: dict[str, Any] = {"reason": reason}
+        output: dict[str, Any] = {"reason": reason, "detail_code": reason}
         if sample_sha256 is not None:
             output["sample_sha256"] = sample_sha256
         return self._result(
@@ -480,6 +509,7 @@ class _LocalAdapterBase:
             started=started,
             output=output,
             message=message,
+            error_code=reason if reason in _LOCAL_OPTION_ERROR_CODES else None,
         )
 
 
@@ -565,7 +595,8 @@ class _LocalRunCommandAdapter(_LocalAdapterBase):
                 started=started,
                 reason="options_must_be_object",
                 message=(
-                    "Local command options must be an object from the selected command whitelist."
+                    f"Options for {command_id.value} must be an object. Valid options: "
+                    f"{', '.join(option.name for option in capability.spec.allowed_options)}."
                 ),
                 sample_sha256=sample_sha256,
             )
@@ -696,6 +727,7 @@ class _LocalRunCommandAdapter(_LocalAdapterBase):
             "output_truncated": tool_output_truncated,
             "output_truncated_by_response": response_truncated,
             "reason": result.detail_code,
+            "detail_code": result.detail_code,
             "untrusted_data": True,
             "observation_ref": str(observation.id),
             "observation_sha256": observation.sha256,
@@ -708,6 +740,27 @@ class _LocalRunCommandAdapter(_LocalAdapterBase):
             output["range"] = dict(range_info)
         if partial_reason is not None:
             output["partial_reason"] = partial_reason
+        option_error = (
+            result.status is LocalCommandStatus.POLICY_DENIED
+            and result.detail_code in _LOCAL_OPTION_ERROR_CODES
+        )
+        if option_error:
+            valid_options = (
+                [option.name for option in capability.spec.allowed_options]
+                if capability is not None
+                else []
+            )
+            output["valid_options"] = valid_options
+            message = (
+                f"Invalid options for {command_id.value if command_id is not None else 'command'}; "
+                f"valid options: {', '.join(valid_options)}."
+            )
+        else:
+            message = (
+                "Local analysis output is untrusted data."
+                if output_text
+                else "The local command returned no output."
+            )
         return ToolResult(
             status=status,
             observation_refs=(observation.id,),
@@ -734,11 +787,8 @@ class _LocalRunCommandAdapter(_LocalAdapterBase):
                 else ()
             ),
             output={"status": status.value, **output},
-            message=(
-                "Local analysis output is untrusted data."
-                if output_text
-                else "The local command returned no output."
-            ),
+            message=message,
+            error_code=result.detail_code if option_error else None,
         )
 
 

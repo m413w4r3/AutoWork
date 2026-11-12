@@ -5,7 +5,7 @@ import hashlib
 import json
 import os
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -270,6 +270,56 @@ async def test_monodis_cil_uses_fixed_commands_and_returns_bounded_method_range(
     assert calls[1][1] == "--show-method-tokens"
     assert all(call[-1].endswith("/sample.bin") for call in calls)
     assert all("/etc/passwd" not in " ".join(call) for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_strings_range_scans_only_the_requested_bounded_blob_slice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scanned_payloads: list[bytes] = []
+
+    async def run(argv, **_kwargs):
+        scanned_payloads.append(Path(argv[-1]).read_bytes())
+        return AnalysisSubprocessResult(
+            AnalysisSubprocessStatus.SUCCEEDED, 0, b"MARKER\n", b""
+        )
+
+    monkeypatch.setattr(
+        "cti_app.workers.confined_analysis.shutil.which", lambda _name: "/usr/bin/strings"
+    )
+    monkeypatch.setattr("cti_app.workers.confined_analysis.run_analysis_subprocess", run)
+    parameters = ConfinedAnalysisJobParameters(
+        investigation_id=uuid4(),
+        artifact_id=uuid4(),
+        artifact_sha256="a" * 64,
+        operation_key="confined-analysis:" + "e" * 64,
+        tool=ConfinedAnalysisTool.LOCAL_COMMAND,
+        arguments=("strings",),
+        timeout_seconds=30,
+        max_output_bytes=16 * 1024,
+        analysis_parameters={
+            "min_length": "4",
+            "max_strings": "1000",
+            "offset": "6",
+            "length": "55808",
+        },
+    )
+
+    settings = Settings(_env_file=None)
+    payload = b"prefix" + b"A" * 55_808 + b"suffix"
+    result = await _run_local_command(parameters, payload, settings)
+
+    assert result["status"] == "SUCCEEDED"
+    assert scanned_payloads == [b"A" * 55_808]
+
+    out_of_bounds = replace(
+        parameters,
+        analysis_parameters={**parameters.analysis_parameters, "offset": "13"},
+    )
+    denied = await _run_local_command(out_of_bounds, payload, settings)
+    assert denied["status"] == "POLICY_DENIED"
+    assert denied["available_reason"] == "range_out_of_bounds"
+    assert scanned_payloads == [b"A" * 55_808]
 
 
 class _RecordingCapabilitiesService:

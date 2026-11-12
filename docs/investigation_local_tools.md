@@ -84,6 +84,13 @@ coût fixe par définition d’outil, donc cette réservation est conservatrice
 pour les commandes plus rapides. Le résultat engage le temps réel arrondi à la
 seconde et borné par la réservation.
 
+`strings` accepte `offset` et `length` ensemble pour lire une plage bornée du
+blob (1 MiB maximum par défaut, avec une limite de worker éventuellement plus
+basse). Le worker applique la plage avant l’extraction. Sa sortie est du texte
+UTF-8 dans `output_chunks`; la lecture de l’observation vérifie les octets, le
+SHA-256, le décodage UTF-8 et les contrôles de texte sensible, puis permet de
+parcourir le payload avec `offset` et `length`.
+
 ## Outils Ghidra en lecture seule
 
 | Outil | Entrées principales | Opération du port |

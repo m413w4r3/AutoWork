@@ -241,6 +241,7 @@ def normalize_native_data(
     *,
     max_output_bytes: int = MAX_NATIVE_OUTPUT_BYTES,
     max_items: int = MAX_NATIVE_RESULT_ITEMS,
+    preserve_list_order: bool = False,
 ) -> tuple[dict[str, Any], bool]:
     """Normalize provider output into a bounded, stable JSON object."""
     if not isinstance(value, Mapping):
@@ -279,7 +280,8 @@ def normalize_native_data(
             return result
         if isinstance(item, (list, tuple)):
             items = [normalize(child, depth + 1) for child in item]
-            items.sort(key=_canonical_json)
+            if not preserve_list_order:
+                items.sort(key=_canonical_json)
             if len(items) > max_items:
                 items = items[:max_items]
                 truncated = True
