@@ -1266,9 +1266,7 @@ async def test_real_typst_opinion_renders_candidate_url_omission_note(
     )
 
     reader = PdfReader(BytesIO(compiled.content), strict=True)
-    extracted = " ".join(
-        "\n".join(page.extract_text() or "" for page in reader.pages).split()
-    )
+    extracted = " ".join("\n".join(page.extract_text() or "" for page in reader.pages).split())
     assert "Pistes non confirmées" in extracted
     if expected_note is None:
         assert "URL non valide(s) omise(s) des listes." not in extracted
