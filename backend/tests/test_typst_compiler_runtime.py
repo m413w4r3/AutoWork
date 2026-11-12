@@ -1217,6 +1217,66 @@ async def test_real_typst_hides_candidate_indicators_and_annex_from_legacy_rende
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("omitted_invalid_url_count", "expected_note"),
+    (
+        (2, "2 URL non valide(s) omise(s) des listes."),
+        (0, None),
+    ),
+)
+async def test_real_typst_opinion_renders_candidate_url_omission_note(
+    tmp_path: Path,
+    typst_binary: str,
+    font_bundle_root: Path,
+    omitted_invalid_url_count: int,
+    expected_note: str | None,
+) -> None:
+    render_data = {
+        "schema_version": "typst-publication-model-opinion-ioc-note-fixture",
+        "document_label": _PUBLICATION_RENDER_LABEL,
+        "language": "fr",
+        "title": "Opinion IOC note fixture",
+        "opinion_document": True,
+        "content_sections": [
+            {
+                "type": "ioc",
+                "source_indicators": [],
+                "original_indicators": [],
+                "candidate_indicators": [
+                    {
+                        "heading": "Valeurs à vérifier",
+                        "items": [{"value": "candidate-001.example"}],
+                    }
+                ],
+                "omitted_invalid_url_count": omitted_invalid_url_count,
+            }
+        ],
+    }
+    workspace_root = tmp_path / f"opinion-ioc-note-{omitted_invalid_url_count}-workspace"
+    _build_runtime_workspace(_REPOSITORY_ROOT, workspace_root, render_data=render_data)
+    font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
+    font_root = tmp_path / f"opinion-ioc-note-{omitted_invalid_url_count}-fonts"
+    font_root.mkdir()
+    compiled = await TypstSubprocessCompiler(binary=typst_binary).compile(
+        TypstCompileRequest(
+            workspace_root=workspace_root,
+            entrypoint_relative_path="RENDERER/publication.typ",
+            font_paths=materialize_font_bundle(font_snapshot, font_root),
+        )
+    )
+
+    reader = PdfReader(BytesIO(compiled.content), strict=True)
+    extracted = " ".join(
+        "\n".join(page.extract_text() or "" for page in reader.pages).split()
+    )
+    assert "Pistes non confirmées" in extracted
+    if expected_note is None:
+        assert "URL non valide(s) omise(s) des listes." not in extracted
+    else:
+        assert expected_note in extracted
+
+
+@pytest.mark.asyncio
 async def test_real_typst_article_renders_cited_technical_context_reference(
     tmp_path: Path,
     typst_binary: str,
