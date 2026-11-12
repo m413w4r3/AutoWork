@@ -1394,6 +1394,179 @@ async def test_page_ceiling_returns_partial_with_cursor_and_provider_route() -> 
 
 
 @pytest.mark.asyncio
+async def test_url_relationship_descriptors_preserve_hash_and_safe_readable_urls() -> None:
+    context_url = "https://context.example.test/path?token=synthetic-secret"
+    attributes_url = "http://attributes.example.test/lookup?q=sample"
+    context_sha256 = hashlib.sha256(context_url.encode()).hexdigest()
+    attributes_sha256 = hashlib.sha256(attributes_url.encode()).hexdigest()
+    tools = _tool_set()
+    tools.vt.relationship_pages = [
+        _page(
+            (
+                {
+                    "id": context_sha256,
+                    "type": "url",
+                    "context_attributes": {"url": context_url},
+                },
+            ),
+            next_cursor="urls-page-2",
+            exhaustive=False,
+        ),
+        _page(
+            (
+                {
+                    "id": attributes_sha256,
+                    "type": "url",
+                    "attributes": {"url": attributes_url},
+                },
+                {"id": "c" * 64, "type": "url"},
+            )
+        ),
+    ]
+
+    result = await _dispatch(
+        tools,
+        "vt.relationships",
+        {"object_type": "domain", "object_id": "example.test", "relation": "urls"},
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert result.output["observed_count"] == 3
+    assert result.output["pages"] == 2
+    assert result.output["pagination_complete"] is True
+    assert "detail_code" not in result.output
+    assert result.output["descriptors"] == [
+        {
+            "type": "url",
+            "identifier": f"url-sha256:{context_sha256}",
+            "id": context_sha256,
+            "url": "https://context.example.test/path",
+        },
+        {
+            "type": "url",
+            "identifier": f"url-sha256:{attributes_sha256}",
+            "id": attributes_sha256,
+            "url": attributes_url,
+        },
+    ]
+    assert "synthetic-secret" not in json.dumps(result.output)
+    assert all(len(item["url"]) <= 512 for item in result.output["descriptors"])
+    evidence = await tools.evidence.list_for_investigation(tools.context.investigation_id)
+    summaries = []
+    for observation in evidence:
+        if observation.kind is not EvidenceKind.VT_RELATIONSHIP:
+            continue
+        payload = tools.blob_store.payloads.get(observation.blob_id)
+        if (
+            payload is not None
+            and payload.get("schema") == "virustotal-investigation-summary.v1"
+        ):
+            summaries.append(payload)
+    assert len(summaries) == 2
+    persisted_descriptors = [
+        descriptor for summary in summaries for descriptor in summary["descriptors"]
+    ]
+    assert sorted(persisted_descriptors, key=lambda item: item["id"]) == sorted(
+        result.output["descriptors"], key=lambda item: item["id"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_long_safe_url_query_is_omitted_as_a_whole() -> None:
+    long_url = "https://long.example.test/path?q=" + "x" * 600
+    tools = _tool_set()
+    tools.vt.relationship_pages = [
+        _page(
+            (
+                {
+                    "id": hashlib.sha256(long_url.encode()).hexdigest(),
+                    "type": "url",
+                    "attributes": {"url": long_url},
+                },
+            )
+        )
+    ]
+
+    result = await _dispatch(
+        tools,
+        "vt.relationships",
+        {"object_type": "domain", "object_id": "example.test", "relation": "urls"},
+    )
+
+    assert result.output["descriptors"][0]["url"] == "https://long.example.test/path"
+    assert len(result.output["descriptors"][0]["url"]) <= 512
+    assert "x" * 100 not in json.dumps(result.output)
+
+
+@pytest.mark.asyncio
+async def test_url_relationship_without_serializable_descriptors_is_marked_incomplete() -> None:
+    tools = _tool_set()
+    tools.vt.relationship_pages = [_page(({"id": "d" * 64, "type": "url"},))]
+
+    result = await _dispatch(
+        tools,
+        "vt.relationships",
+        {"object_type": "ip_address", "object_id": "192.0.2.1", "relation": "urls"},
+    )
+
+    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.output["observed_count"] == 1
+    assert result.output["descriptors"] == []
+    assert result.output["pagination_complete"] is False
+    assert result.output["detail_code"] == "descriptors_unavailable"
+    evidence = await tools.evidence.list_for_investigation(tools.context.investigation_id)
+    summaries = []
+    for observation in evidence:
+        if observation.kind is not EvidenceKind.VT_RELATIONSHIP:
+            continue
+        payload = tools.blob_store.payloads.get(observation.blob_id)
+        if (
+            payload is not None
+            and payload.get("schema") == "virustotal-investigation-summary.v1"
+        ):
+            summaries.append(payload)
+    assert len(summaries) == 1
+    assert summaries[0]["observed_count"] == 1
+    assert summaries[0]["descriptors"] == []
+    assert summaries[0]["pagination_complete"] is False
+    assert summaries[0]["detail_code"] == "descriptors_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_file_relationship_descriptor_envelope_remains_unchanged() -> None:
+    tools = _tool_set()
+    tools.vt.relationship_pages = [
+        _page(
+            (
+                {
+                    "id": _CANDIDATE_HASH,
+                    "type": "file",
+                    "attributes": {"meaningful_name": "payload.exe"},
+                },
+            )
+        )
+    ]
+
+    result = await _dispatch(
+        tools,
+        "vt.relationships",
+        {"object_type": "file", "object_id": _SEED_HASH, "relation": "dropped_files"},
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert result.output["observed_count"] == 1
+    assert result.output["descriptors"] == [
+        {
+            "type": "file",
+            "identifier": _CANDIDATE_HASH,
+            "meaningful_name": "payload.exe",
+        }
+    ]
+    assert result.output["pagination_complete"] is True
+    assert "detail_code" not in result.output
+
+
+@pytest.mark.asyncio
 async def test_relationship_page_archive_is_untyped_and_summary_remains_typed() -> None:
     body = json.dumps(
         {

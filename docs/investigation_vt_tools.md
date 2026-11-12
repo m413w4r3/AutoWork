@@ -47,7 +47,11 @@ supplémentaires refusées.
 Les relations sont contrôlées par la table `VIRUSTOTAL_RELATIONSHIPS_BY_OBJECT_TYPE`
 de D1 avant l'appel au port. Une URL d'objet est validée puis ancrée par
 `url-sha256:<digest>` dans les métadonnées de preuve ; les URL signées, les
-identifiants avec credentials et les paramètres de signature sont refusés.
+identifiants avec credentials et les paramètres de signature sont refusés. Les
+descripteurs de relation `url` conservent le SHA-256 VT dans `id` et exposent
+l'URL lisible depuis `context_attributes.url` ou `attributes.url`, limitée à
+512 caractères. Les paramètres de requête sensibles sont omis ; une URL trop
+longue perd sa requête entière ou son chemin plutôt que d'être coupée au milieu.
 
 La dork reste une expression native VirusTotal : la validation normalise
 notamment les variantes d'espacement de `content :`, vérifie UTF-8, caractères
@@ -71,7 +75,10 @@ avec `record_existing_blob`, plus un résumé borné via `record_json`. Les
 sorties d'outil ne contiennent ni corps brut, ni octets, ni clé, ni URL signée.
 Les erreurs ne sont pas enregistrées comme pages brutes. Une page terminale
 `data=[]` crée également une observation négative ; un 404 ne l'est que si le
-code API identifie explicitement un objet absent.
+code API identifie explicitement un objet absent. Si une page non vide ne
+produit aucun descripteur sérialisable, l'observation résumée et la sortie
+portent `detail_code=descriptors_unavailable`, le statut devient `partial` et
+`pagination_complete` reste faux.
 
 Les rapports fichier exposent les dates VT disponibles et portent une
 limitation sur leur ancienneté. Les relations sont des snapshots datés. Les
