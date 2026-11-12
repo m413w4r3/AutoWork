@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import struct
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -1435,7 +1436,7 @@ async def test_url_relationship_descriptors_preserve_hash_and_safe_readable_urls
     assert result.output["pages"] == 2
     assert result.output["pagination_complete"] is True
     assert "detail_code" not in result.output
-    assert result.output["descriptors"] == [
+    assert _plain(result.output["descriptors"]) == [
         {
             "type": "url",
             "identifier": f"url-sha256:{context_sha256}",
@@ -1449,7 +1450,7 @@ async def test_url_relationship_descriptors_preserve_hash_and_safe_readable_urls
             "url": attributes_url,
         },
     ]
-    assert "synthetic-secret" not in json.dumps(result.output)
+    assert "synthetic-secret" not in json.dumps(_plain(result.output))
     assert all(len(item["url"]) <= 512 for item in result.output["descriptors"])
     evidence = await tools.evidence.list_for_investigation(tools.context.investigation_id)
     summaries = []
@@ -1457,10 +1458,7 @@ async def test_url_relationship_descriptors_preserve_hash_and_safe_readable_urls
         if observation.kind is not EvidenceKind.VT_RELATIONSHIP:
             continue
         payload = tools.blob_store.payloads.get(observation.blob_id)
-        if (
-            payload is not None
-            and payload.get("schema") == "virustotal-investigation-summary.v1"
-        ):
+        if payload is not None and payload.get("schema") == "virustotal-investigation-summary.v1":
             summaries.append(payload)
     assert len(summaries) == 2
     persisted_descriptors = [
@@ -1495,7 +1493,7 @@ async def test_long_safe_url_query_is_omitted_as_a_whole() -> None:
 
     assert result.output["descriptors"][0]["url"] == "https://long.example.test/path"
     assert len(result.output["descriptors"][0]["url"]) <= 512
-    assert "x" * 100 not in json.dumps(result.output)
+    assert "x" * 100 not in json.dumps(_plain(result.output))
 
 
 @pytest.mark.asyncio
@@ -1511,7 +1509,7 @@ async def test_url_relationship_without_serializable_descriptors_is_marked_incom
 
     assert result.status is ToolInvocationStatus.PARTIAL
     assert result.output["observed_count"] == 1
-    assert result.output["descriptors"] == []
+    assert list(result.output["descriptors"]) == []
     assert result.output["pagination_complete"] is False
     assert result.output["detail_code"] == "descriptors_unavailable"
     evidence = await tools.evidence.list_for_investigation(tools.context.investigation_id)
@@ -1520,10 +1518,7 @@ async def test_url_relationship_without_serializable_descriptors_is_marked_incom
         if observation.kind is not EvidenceKind.VT_RELATIONSHIP:
             continue
         payload = tools.blob_store.payloads.get(observation.blob_id)
-        if (
-            payload is not None
-            and payload.get("schema") == "virustotal-investigation-summary.v1"
-        ):
+        if payload is not None and payload.get("schema") == "virustotal-investigation-summary.v1":
             summaries.append(payload)
     assert len(summaries) == 1
     assert summaries[0]["observed_count"] == 1
@@ -1555,7 +1550,7 @@ async def test_file_relationship_descriptor_envelope_remains_unchanged() -> None
 
     assert result.status is ToolInvocationStatus.SUCCEEDED
     assert result.output["observed_count"] == 1
-    assert result.output["descriptors"] == [
+    assert _plain(result.output["descriptors"]) == [
         {
             "type": "file",
             "identifier": _CANDIDATE_HASH,
@@ -2139,3 +2134,12 @@ async def test_vertical_opinion_is_still_drafted_when_intelligence_search_is_una
     assert opinion is not None
     assert opinion.blocks[0].finding_refs == (finding.id,)
     assert "file report" in opinion.blocks[0].text.lower()
+
+
+def _plain(value: Any) -> Any:
+    """Thaw frozen tool outputs (mappingproxy/tuple) into JSON-comparable values."""
+    if isinstance(value, Mapping):
+        return {key: _plain(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(item) for item in value]
+    return value

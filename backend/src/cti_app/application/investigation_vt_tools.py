@@ -124,8 +124,7 @@ _SENSITIVE_URL_QUERY_KEYS = frozenset(
 _URL_SHA256 = re.compile(r"^[a-fA-F0-9]{64}$")
 _URL_DESCRIPTOR_MAX_CHARS = 512
 _RELATIONSHIP_DESCRIPTORS_UNAVAILABLE_LIMITATION = (
-    "Des objets relationnels observés n'ont pas pu être représentés par des "
-    "descripteurs."
+    "Des objets relationnels observés n'ont pas pu être représentés par des descripteurs."
 )
 _DOMAIN_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", re.I)
 _SANDBOX_ID = re.compile(r"^[A-Za-z0-9._:-]{1,256}$")
@@ -1130,7 +1129,7 @@ class _RelationshipsAdapter(_VirusTotalAdapter):
                 descriptors = _descriptors(page.items, self.max_results)
                 page_descriptors_unavailable = bool(page.items) and not descriptors
                 descriptors_unavailable = descriptors_unavailable or page_descriptors_unavailable
-                page_limitations = limitations
+                page_limitations: tuple[str, ...] = limitations
                 if page_descriptors_unavailable:
                     page_limitations += (_RELATIONSHIP_DESCRIPTORS_UNAVAILABLE_LIMITATION,)
                 page_summary = {
@@ -2325,8 +2324,10 @@ def _url_descriptor_fields(
 
 def _safe_url_descriptor(value: str) -> str | None:
     candidate = value.strip()
-    if not candidate or len(candidate) > 8_192 or any(
-        unicodedata.category(char) == "Cc" for char in candidate
+    if (
+        not candidate
+        or len(candidate) > 8_192
+        or any(unicodedata.category(char) == "Cc" for char in candidate)
     ):
         return None
     try:
