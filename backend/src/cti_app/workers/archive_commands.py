@@ -36,10 +36,14 @@ _MAX_REPORTED_NAME_CHARS = 512
 _MAX_ARCHIVE_STDERR_CHARS = 512
 _CHUNK_BYTES = 64 * 1024
 _MAX_ZIP_METADATA_BYTES = 32 * 1024 * 1024
+_BSDTAR_EXECUTABLE = "/usr/bin/bsdtar"
+_RAR_SIGNATURE_SCAN_BYTES = 1024 * 1024
+_RAR_SIGNATURES = (b"Rar!\x1a\x07\x00", b"Rar!\x1a\x07\x01\x00")
 _CRC_ERROR = re.compile(r"crc", re.I)
 _PASSWORD_ERROR = re.compile(r"password|encrypted", re.I)
 _UNSUPPORTED_CODEC_ERROR = re.compile(
-    r"unsupported method|unsupported compression|cannot find codec|codec not available",
+    r"unsupported (?:compression )?method|(?:compression )?method(?: [a-z0-9_-]+)* not supported|"
+    r"unsupported compression|cannot find codec|codec not available|no decoder for",
     re.I,
 )
 _SAFE_ARCHIVE_METHOD = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._+ -]{0,63}")
@@ -310,6 +314,7 @@ async def run_7z_archive_command(
             output_limit=max(1, min(max_output_bytes, 1024 * 1024)),
             memory_limit_bytes=memory_limit_bytes,
             environment={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+            deny_network=True,
         )
         archive_type, entries = _parse_7z_listing(listing.stdout, sample_path.name)
         listing_error = _7z_status(listing, listing.stderr)
@@ -351,7 +356,9 @@ async def run_7z_archive_command(
             return await _extract_7z_archive_member(
                 executable=executable,
                 sample_path=sample_path,
+                payload=payload,
                 entries=entries,
+                archive_type=archive_type,
                 member_path=member_path,
                 expected_sha256=expected_sha256,
                 archive_preset=archive_preset,
@@ -371,16 +378,24 @@ async def run_7z_archive_command(
         selected = matched[:member_limit]
         records: list[dict[str, object]] = []
         total_read = 0
+        bsdtar_archive_path: Path | None = None
         name_counts = Counter(str(entry["name"]) for entry in matched)
         for entry in selected:
             record = _archive_entry_record(entry)
             size = entry["size"]
+            member_name = str(entry["name"])
             if entry.get("is_dir"):
                 record["status"] = "directory"
             elif tool is ConfinedAnalysisTool.ARCHIVE_LIST:
                 record["status"] = "encrypted" if entry.get("encrypted") else "listed"
-            elif name_counts[str(entry["name"])] > 1:
+            elif name_counts[member_name] > 1:
                 record["status"] = "duplicate_name_ambiguous"
+            elif not _safe_archive_member_path(member_name):
+                record["status"] = "invalid_member_name"
+                record["detail_code"] = "archive_member_path_invalid"
+            elif entry.get("is_link"):
+                record["status"] = "link_not_allowed"
+                record["detail_code"] = "archive_member_link_not_allowed"
             elif entry.get("encrypted") and archive_preset == "none":
                 record["status"] = "encrypted_password_required"
             elif size is None or size < 0:
@@ -396,8 +411,6 @@ async def run_7z_archive_command(
                 LOCAL_ARCHIVE_MAX_COMPRESSION_RATIO
             ):
                 record["status"] = "compression_ratio_limit"
-            elif "\x00" in str(entry["name"]):
-                record["status"] = "invalid_member_name"
             else:
                 remaining_timeout = deadline - time.monotonic()
                 if remaining_timeout <= 0:
@@ -416,38 +429,98 @@ async def run_7z_archive_command(
                         password_arg,
                         "--",
                         str(sample_path),
-                        str(entry["name"]),
+                        member_name,
                     ],
                     timeout_seconds=min(remaining_timeout, 30),
                     output_limit=max(1, size),
                     memory_limit_bytes=memory_limit_bytes,
                     environment={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+                    deny_network=True,
                 )
                 data = extract.stdout
-                total_read += len(data)
                 if extract.status is AnalysisSubprocessStatus.SUCCEEDED:
+                    total_read += len(data)
                     if len(data) != size:
                         record["status"] = "actual_size_mismatch"
                     else:
                         record["sha256"] = hashlib.sha256(data).hexdigest()
                         record["status"] = "hashed"
                 elif extract.status is AnalysisSubprocessStatus.OUTPUT_LIMIT:
+                    total_read += len(data)
                     record["status"] = "actual_size_or_member_limit"
                 elif extract.status is AnalysisSubprocessStatus.TIMED_OUT:
+                    total_read += len(data)
                     record["status"] = "timeout"
                 elif extract.status is AnalysisSubprocessStatus.FAILED_TO_START:
+                    total_read += len(data)
                     record["status"] = "7z_start_failed"
                     record["archive_error_code"] = _7z_start_error_code(extract)
                 else:
-                    record["status"] = _member_failure_status(extract.stderr, entry)
-                    record.update(
-                        _member_failure_diagnostics(
-                            extract.stderr,
-                            entry,
-                            sample_path=sample_path,
-                            member_path=str(entry["name"]),
-                        )
+                    diagnostics = _member_failure_diagnostics(
+                        extract.stderr,
+                        entry,
+                        sample_path=sample_path,
+                        member_path=member_name,
                     )
+                    rar_codec_failure = (
+                        archive_type is not None
+                        and archive_type.casefold().startswith("rar")
+                        and diagnostics["detail_code"] == "archive_codec_unsupported"
+                    )
+                    if rar_codec_failure and not _safe_bsdtar_member_path(member_name):
+                        total_read += len(data)
+                        record["status"] = "invalid_member_name"
+                        record["detail_code"] = (
+                            "archive_member_pattern_unsupported"
+                            if _safe_archive_member_path(member_name)
+                            else "archive_member_path_invalid"
+                        )
+                    elif rar_codec_failure:
+                        if bsdtar_archive_path is None:
+                            bsdtar_archive_path = _prepare_bsdtar_archive(
+                                sample_path,
+                                payload,
+                                archive_type=archive_type or "Rar",
+                            )
+                        remaining_timeout = deadline - time.monotonic()
+                        if remaining_timeout <= 0:
+                            total_read += len(data)
+                            record["status"] = "timeout"
+                            record["detail_code"] = "archive_member_timeout"
+                        else:
+                            fallback = await _run_bsdtar_member_extract(
+                                archive_path=bsdtar_archive_path,
+                                member_path=member_name,
+                                size=size,
+                                remaining_timeout=remaining_timeout,
+                                timeout_seconds=timeout_seconds,
+                                memory_limit_bytes=memory_limit_bytes,
+                            )
+                            data = fallback.stdout
+                            total_read += len(data)
+                            if fallback.status is AnalysisSubprocessStatus.SUCCEEDED:
+                                if len(data) != size:
+                                    record["status"] = "actual_size_mismatch"
+                                    record["detail_code"] = "archive_member_size_mismatch"
+                                else:
+                                    record["sha256"] = hashlib.sha256(data).hexdigest()
+                                    record["status"] = "hashed"
+                                    record["archive_decoder"] = "bsdtar"
+                            else:
+                                fallback_diagnostics = _bsdtar_failure_diagnostics(
+                                    fallback,
+                                    entry,
+                                    sample_path=bsdtar_archive_path,
+                                    member_path=member_name,
+                                )
+                                record["status"] = _bsdtar_failure_status(
+                                    fallback, entry
+                                )
+                                record.update(fallback_diagnostics)
+                    else:
+                        total_read += len(data)
+                        record["status"] = _member_failure_status(extract.stderr, entry)
+                        record.update(diagnostics)
             records.append(record)
 
     truncation_reasons = []
@@ -539,7 +612,9 @@ async def _extract_7z_archive_member(
     *,
     executable: str,
     sample_path: Path,
+    payload: bytes,
     entries: list[_ArchiveEntry],
+    archive_type: str | None,
     member_path: str,
     expected_sha256: str | None,
     archive_preset: str,
@@ -630,8 +705,10 @@ async def _extract_7z_archive_member(
         output_limit=max(1, size),
         memory_limit_bytes=memory_limit_bytes,
         environment={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+        deny_network=True,
     )
     data = extracted.stdout
+    used_bsdtar = False
     if extracted.status is AnalysisSubprocessStatus.TIMED_OUT:
         return refusal("timeout", detail_code="archive_member_timeout")
     if extracted.status is AnalysisSubprocessStatus.FAILED_TO_START:
@@ -649,36 +726,75 @@ async def _extract_7z_archive_member(
             sample_path=sample_path,
             member_path=member_path,
         )
-        return refusal(
-            _member_failure_status(extracted.stderr, entry),
-            detail_code=str(diagnostics["detail_code"]),
-            archive_method=(
-                str(diagnostics["archive_method"])
-                if diagnostics.get("archive_method") is not None
-                else None
-            ),
-            stderr_excerpt=(
-                str(diagnostics["stderr_excerpt"])
-                if diagnostics.get("stderr_excerpt") is not None
-                else None
-            ),
-        )
+        if (
+            archive_type is not None
+            and archive_type.casefold().startswith("rar")
+            and diagnostics["detail_code"] == "archive_codec_unsupported"
+        ):
+            if not _safe_bsdtar_member_path(member_path):
+                return refusal(
+                    "invalid_member_name",
+                    detail_code=(
+                        "archive_member_pattern_unsupported"
+                        if _safe_archive_member_path(member_path)
+                        else "archive_member_path_invalid"
+                    ),
+                )
+            bsdtar_archive_path = _prepare_bsdtar_archive(
+                sample_path,
+                payload,
+                archive_type=archive_type,
+            )
+            remaining_timeout = deadline - time.monotonic()
+            if remaining_timeout <= 0:
+                return refusal("timeout", detail_code="archive_member_timeout")
+            fallback = await _run_bsdtar_member_extract(
+                archive_path=bsdtar_archive_path,
+                member_path=member_path,
+                size=size,
+                remaining_timeout=remaining_timeout,
+                timeout_seconds=timeout_seconds,
+                memory_limit_bytes=memory_limit_bytes,
+            )
+            if fallback.status is not AnalysisSubprocessStatus.SUCCEEDED:
+                fallback_diagnostics = _bsdtar_failure_diagnostics(
+                    fallback,
+                    entry,
+                    sample_path=bsdtar_archive_path,
+                    member_path=member_path,
+                )
+                return refusal(
+                    _bsdtar_failure_status(fallback, entry),
+                    error_code=fallback_diagnostics.get("archive_error_code"),
+                    detail_code=fallback_diagnostics.get("detail_code"),
+                    archive_method=fallback_diagnostics.get("archive_method"),
+                    stderr_excerpt=fallback_diagnostics.get("stderr_excerpt"),
+                )
+            data = fallback.stdout
+            used_bsdtar = True
+        else:
+            return refusal(
+                _member_failure_status(extracted.stderr, entry),
+                detail_code=str(diagnostics["detail_code"]),
+                archive_method=diagnostics.get("archive_method"),
+                stderr_excerpt=diagnostics.get("stderr_excerpt"),
+            )
     if len(data) != size or len(data) > LOCAL_ARCHIVE_MAX_MEMBER_BYTES:
         return refusal("actual_size_mismatch", detail_code="archive_member_size_mismatch")
     digest = hashlib.sha256(data).hexdigest()
     if expected_sha256 is not None and digest != expected_sha256:
         return refusal("expected_sha256_mismatch", detail_code="archive_member_sha256_mismatch")
+    member_report: dict[str, object] = {
+        "schema_version": _ARCHIVE_OUTPUT_SCHEMA,
+        "member_path": member_path,
+        "member_size": len(data),
+        "member_sha256": digest,
+        "status": "extracted",
+    }
+    if used_bsdtar:
+        member_report["archive_decoder"] = "bsdtar"
     result = _worker_result(
-        json.dumps(
-            {
-                "schema_version": _ARCHIVE_OUTPUT_SCHEMA,
-                "member_path": member_path,
-                "member_size": len(data),
-                "member_sha256": digest,
-                "status": "extracted",
-            },
-            separators=(",", ":"),
-        ),
+        json.dumps(member_report, separators=(",", ":")),
         False,
         ConfinedAnalysisTool.ARCHIVE_EXTRACT_MEMBER.value,
         tool_version,
@@ -687,6 +803,8 @@ async def _extract_7z_archive_member(
     result["member_path"] = member_path
     result["member_size"] = len(data)
     result["member_sha256"] = digest
+    if used_bsdtar:
+        result["archive_decoder"] = "bsdtar"
     result["_member_bytes"] = data
     return result
 
@@ -696,12 +814,120 @@ def _safe_archive_member_path(value: str) -> bool:
         not value
         or len(value) > 1024
         or value.startswith("/")
+        or value.startswith("-")
         or "\\" in value
         or ":" in value
         or any(ord(character) < 32 or ord(character) == 127 for character in value)
     ):
         return False
     return all(part not in {"", ".", ".."} for part in value.split("/"))
+
+
+def _safe_bsdtar_member_path(value: str) -> bool:
+    """Reject names bsdtar could interpret as a pattern rather than one path."""
+    return _safe_archive_member_path(value) and not any(
+        character in value for character in "*?[]"
+    )
+
+
+def _rar_archive_offset(payload: bytes) -> int | None:
+    scan_end = min(len(payload), _RAR_SIGNATURE_SCAN_BYTES)
+    offsets = [
+        offset
+        for signature in _RAR_SIGNATURES
+        if (offset := payload.find(signature, 0, scan_end)) >= 0
+    ]
+    return min(offsets) if offsets else None
+
+
+def _prepare_bsdtar_archive(
+    sample_path: Path, payload: bytes, *, archive_type: str
+) -> Path:
+    """Strip an SFX prefix for RAR readers whose PE scan is deliberately bounded."""
+    offset = _rar_archive_offset(payload) if archive_type.casefold().startswith("rar") else None
+    if offset is None or offset == 0:
+        return sample_path
+
+    shifted_path = sample_path.with_name("sample-bsdtar.bin")
+    view = memoryview(payload)
+    with shifted_path.open("wb") as shifted:
+        for start in range(offset, len(view), _CHUNK_BYTES):
+            shifted.write(view[start : start + _CHUNK_BYTES])
+    shifted_path.chmod(0o400)
+    return shifted_path
+
+
+async def _run_bsdtar_member_extract(
+    *,
+    archive_path: Path,
+    member_path: str,
+    size: int,
+    remaining_timeout: float,
+    timeout_seconds: float,
+    memory_limit_bytes: int,
+) -> AnalysisSubprocessResult:
+    return await run_analysis_subprocess(
+        [
+            _BSDTAR_EXECUTABLE,
+            "-xOf",
+            str(archive_path),
+            "--",
+            member_path,
+        ],
+        timeout_seconds=min(remaining_timeout, timeout_seconds, 30),
+        output_limit=max(1, size),
+        memory_limit_bytes=memory_limit_bytes,
+        environment={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+        deny_network=True,
+    )
+
+
+def _bsdtar_failure_status(
+    result: AnalysisSubprocessResult, entry: _ArchiveEntry
+) -> str:
+    if result.status is AnalysisSubprocessStatus.TIMED_OUT:
+        return "timeout"
+    if result.status in {
+        AnalysisSubprocessStatus.OUTPUT_LIMIT,
+        AnalysisSubprocessStatus.DIRECTORY_LIMIT,
+    }:
+        return "actual_size_or_member_limit"
+    if result.status is AnalysisSubprocessStatus.FAILED_TO_START:
+        return "bsdtar_start_failed"
+    return _member_failure_status(result.stderr, entry)
+
+
+def _bsdtar_failure_diagnostics(
+    result: AnalysisSubprocessResult,
+    entry: _ArchiveEntry,
+    *,
+    sample_path: Path,
+    member_path: str,
+) -> dict[str, str]:
+    if result.status is AnalysisSubprocessStatus.TIMED_OUT:
+        return {"detail_code": "archive_member_timeout"}
+    if result.status in {
+        AnalysisSubprocessStatus.OUTPUT_LIMIT,
+        AnalysisSubprocessStatus.DIRECTORY_LIMIT,
+    }:
+        return {"detail_code": "archive_member_output_limit"}
+    if result.status is AnalysisSubprocessStatus.FAILED_TO_START:
+        return {
+            "detail_code": "archive_bsdtar_start_failed",
+            "archive_error_code": _7z_start_error_code(result),
+        }
+    diagnostics = _member_failure_diagnostics(
+        result.stderr,
+        entry,
+        sample_path=sample_path,
+        member_path=member_path,
+    )
+    if diagnostics["detail_code"] in {
+        "archive_codec_unsupported",
+        "archive_member_decompress_failed",
+    }:
+        diagnostics["detail_code"] = "archive_bsdtar_extract_failed"
+    return diagnostics
 
 
 def _archive_entry_record(entry: _ArchiveEntry) -> dict[str, object]:

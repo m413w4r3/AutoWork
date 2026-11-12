@@ -41,7 +41,7 @@ signale une méthode ou un codec indisponible, et
 `archive_member_decompress_failed` lorsque stderr ne permet pas une
 classification plus précise.
 
-## Option recommandée pour activer RAR 2.9 / RAR4
+## Décodeur RAR et compatibilité attendue
 
 Évaluer `bsdtar` fourni par `libarchive-tools` (libarchive sous licence BSD) dans
 l'image `analysis-worker`. La documentation de libarchive annonce la lecture
@@ -51,12 +51,32 @@ membres compressés RAR 2.9/RAR4 utilisant les méthodes réellement observées
 (`m3:20` et `m3:21`). Ne pas considérer la seule réussite d'un listage comme
 preuve de décompression.
 
-Si l'essai est concluant, épingler la version Debian exacte de
-`libarchive-tools` dans le Dockerfile et attester `bsdtar` ainsi que la
-décompression des fixtures dans le test d'image. Le chemin d'extraction doit
-continuer à écrire le membre ciblé sur stdout, avec les limites et les
-timeouts existants ; il ne doit pas extraire des chemins de l'archive sur le
-système de fichiers.
+`libarchive-tools` est maintenant installé dans l'image à la version Debian
+épinglée `3.6.2-1+deb12u5`. Le test d'image atteste le paquet, la présence de
+`bsdtar` et une bannière `bsdtar --version` qui mentionne libarchive. La
+décompression réelle d'une archive RAR reste à démontrer avec les échantillons
+existants.
+
+Le code amont libarchive v3.6.2 confirme la lecture des SFX RAR4 PE, mais son
+lecteur cherche le marqueur dans une zone maximale de 128 Kio. Le worker
+repère les signatures RAR4 et RAR5 dans le premier Mio du payload et, si un
+préfixe les précède, crée sous `/tmp` une copie qui commence au marqueur avant
+de lancer `bsdtar`. Le stub n'est jamais exécuté. Cette copie reste dans le
+répertoire temporaire qui contient déjà l'archive et est supprimée à la fin de
+l'opération.
+
+Le recours à `bsdtar` est limité aux extractions dont le type indiqué par 7z
+commence par `Rar` et dont l'échec 7z signale une méthode ou un codec non pris
+en charge. Le membre ciblé est fourni comme argument après `--` à
+`bsdtar -xOf`; le nom est validé et les motifs d'archive ambigus pour bsdtar
+sont refusés. La sortie reste bornée par la taille déclarée du membre. Les
+limites de taille membre/totale et de ratio, le délai maximal, RLIMIT_AS,
+l'environnement réduit et le filtre seccomp réseau sont appliqués. Aucun
+membre n'est extrait sur le système de fichiers.
+
+Références du comportement SFX et du paquet épinglé : [lecteur RAR4 libarchive
+v3.6.2](https://github.com/libarchive/libarchive/blob/v3.6.2/libarchive/archive_read_support_format_rar.c#L749-L829),
+[paquet Debian Bookworm `libarchive-tools`](https://packages.debian.org/bookworm/amd64/libarchive-tools).
 
 Après modification du Dockerfile, reconstruire et vérifier l'image avec :
 
@@ -78,8 +98,22 @@ est un module distinct classé `non-free`.
 
 ## État de ce correctif
 
-Ce changement rend les échecs observables et documente une voie de résolution ;
-il n'ajoute aucun décodeur RAR à l'image. Les membres compressés resteront donc
-indisponibles tant qu'une option n'aura pas été ajoutée au worker et validée
-avec les fixtures RAR bénignes dans l'image construite. Aucun conteneur n'a été
-lancé pour ce diagnostic.
+Le fallback bsdtar est implémenté pour `archive_extract_hash` et
+`archive.extract_member`, avec les garde-fous décrits ci-dessus. Des tests
+unitaires mockent le sous-processus pour vérifier le succès 7z sans fallback,
+le succès ou l'échec du fallback, le membre absent, l'option injection et la
+limite stdout. Aucun RAR factice n'est créé : l'environnement ne contient pas
+d'outil `rar` pour produire des fixtures.
+
+L'orchestrateur exécutera la vérification de l'image après :
+
+```sh
+docker compose build analysis-worker
+ANALYSIS_WORKER_IMAGE_TEST=1 make test-backend \
+  PYTEST_ARGS="tests/test_confined_analysis_image.py -q --tb=short"
+```
+
+Cette attestation ne prouve pas encore la décompression des méthodes RAR4
+observées `m3:20` et `m3:21`. Il reste à la vérifier en live sur les
+échantillons existants après le build et le test d'image. Aucun échantillon n'a
+été ouvert et aucune décompression réelle n'a été lancée pendant ce correctif.
