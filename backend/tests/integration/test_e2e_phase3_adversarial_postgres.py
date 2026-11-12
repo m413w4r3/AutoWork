@@ -1027,8 +1027,10 @@ async def test_operator_context_cas_and_advisor_egress_guard_postgres(
                 canonical_ref = str(first.id)
                 normalized_pdf_text = "".join(pdf_text.split())
                 assert "ANNEXE DE TRAÇABILITÉ" in pdf_text
-                assert normalized_pdf_text.count(canonical_ref) == 1
-                assert "supportedbyitscitedobservation.1,2" in normalized_pdf_text
+                # Reader PDFs carry no internal identifiers; citations are short [F]/[E] labels.
+                assert normalized_pdf_text.count(canonical_ref) == 0
+                assert "supportedbyitscitedobservation." in normalized_pdf_text
+                assert "[F1]" in normalized_pdf_text
                 chronology_alpha = "M05D-CHRONOLOGY-ALPHA"
                 chronology_beta = "M05D-CHRONOLOGY-BETA"
                 assert pdf_text.count(chronology_alpha) == 1

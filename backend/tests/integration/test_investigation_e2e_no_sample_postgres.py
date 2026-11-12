@@ -1080,7 +1080,8 @@ async def test_investigation_no_sample_postgres_continuous_journey(
             assert "approver:m05b-human" not in text
             if label == "v6":
                 assert "ANNEXE DE TRAÇABILITÉ" in text
-                assert "".join(text.split()).count(str(observation.id)) == 1
+                # Reader PDFs carry no internal identifiers.
+                assert "".join(text.split()).count(str(observation.id)) == 0
 
         # A fresh composition replays the uncertain operation key without another submission.
         uncertain_state = await _read_state(uow_factory, investigation_id)

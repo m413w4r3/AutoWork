@@ -776,7 +776,8 @@ async def test_postgres_opinion_approval_publishes_new_v6_and_preserves_v5(
         )
         preview_text = " ".join(extracted.stdout.decode("utf-8", errors="replace").split())
         assert preview_text.count("Niveau de preuve") >= 3
-        assert preview_text.count("ARTICLE_DOCUMENTED") >= 3
+        # Reader PDFs show localized evidence levels, never the internal enumeration.
+        assert "ARTICLE_DOCUMENTED" not in preview_text
         assert preview_text.count("documenté, non observé") >= 3
         assert all(
             title in preview_text.casefold()
