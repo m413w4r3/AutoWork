@@ -20,7 +20,7 @@ from collections.abc import Awaitable, Buffer, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any, Literal, Protocol, cast
-from urllib.parse import urlsplit
+from urllib.parse import unquote, unquote_plus, urlsplit
 from uuid import UUID
 
 from cti_app.application.evidence_recorder import EvidenceRecorder, sanitize_evidence_text
@@ -96,6 +96,36 @@ _NO_EXTERNAL_SECRET = re.compile(r"(?i)(?:https?://|" + _CREDENTIAL_PATTERN + ")
 _SIGNED_QUERY_KEYS = re.compile(
     r"(?i)(?:^|[&;])(?:x-amz-signature|x-goog-signature|signature|sig|token|"
     r"access_token|api_key|key|expires|credential)="
+)
+_SENSITIVE_URL_QUERY_KEYS = frozenset(
+    {
+        "access_token",
+        "api_key",
+        "api_token",
+        "auth",
+        "authorization",
+        "client_secret",
+        "credential",
+        "expires",
+        "googleaccessid",
+        "key",
+        "password",
+        "policy",
+        "sig",
+        "signature",
+        "token",
+        "x-amz-credential",
+        "x-amz-security-token",
+        "x-amz-signature",
+        "x-goog-credential",
+        "x-goog-signature",
+    }
+)
+_URL_SHA256 = re.compile(r"^[a-fA-F0-9]{64}$")
+_URL_DESCRIPTOR_MAX_CHARS = 512
+_RELATIONSHIP_DESCRIPTORS_UNAVAILABLE_LIMITATION = (
+    "Des objets relationnels observés n'ont pas pu être représentés par des "
+    "descripteurs."
 )
 _DOMAIN_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", re.I)
 _SANDBOX_ID = re.compile(r"^[A-Za-z0-9._:-]{1,256}$")
@@ -1075,6 +1105,7 @@ class _RelationshipsAdapter(_VirusTotalAdapter):
             )
             next_cursor: str | None = None
             exhaustive = False
+            descriptors_unavailable = False
             seen_cursors: set[str] = set()
             for page_index in range(self.max_pages):
                 state.api_requests += 1
@@ -1097,6 +1128,11 @@ class _RelationshipsAdapter(_VirusTotalAdapter):
                     observed_at=datetime.now(UTC),
                 )
                 descriptors = _descriptors(page.items, self.max_results)
+                page_descriptors_unavailable = bool(page.items) and not descriptors
+                descriptors_unavailable = descriptors_unavailable or page_descriptors_unavailable
+                page_limitations = limitations
+                if page_descriptors_unavailable:
+                    page_limitations += (_RELATIONSHIP_DESCRIPTORS_UNAVAILABLE_LIMITATION,)
                 page_summary = {
                     "object_type": object_type.value,
                     "object_id": object_anchor_id,
@@ -1108,8 +1144,14 @@ class _RelationshipsAdapter(_VirusTotalAdapter):
                     "next_cursor": _safe_cursor(page.next_cursor)
                     if page.next_cursor is not None
                     else None,
-                    "pagination_complete": page.exhaustive and page.next_cursor is None,
+                    "pagination_complete": (
+                        page.exhaustive
+                        and page.next_cursor is None
+                        and not page_descriptors_unavailable
+                    ),
                 }
+                if page_descriptors_unavailable:
+                    page_summary["detail_code"] = "descriptors_unavailable"
                 for raw_index, raw_observation in enumerate(raw_observations):
                     state.observation_refs.extend(
                         await self._record_raw_and_summary(
@@ -1120,7 +1162,7 @@ class _RelationshipsAdapter(_VirusTotalAdapter):
                             object_type=object_anchor_type,
                             object_id=object_anchor_id,
                             summary=page_summary,
-                            limitations=limitations,
+                            limitations=page_limitations,
                             page_index=page_index + raw_index,
                         )
                     )
@@ -1133,7 +1175,7 @@ class _RelationshipsAdapter(_VirusTotalAdapter):
                     break
                 seen_cursors.add(next_cursor)
                 cursor = next_cursor
-            partial = not exhaustive
+            partial = not exhaustive or descriptors_unavailable
             terminal_empty = not items and exhaustive
             if terminal_empty:
                 negative = await self._record_negative(
@@ -1144,16 +1186,21 @@ class _RelationshipsAdapter(_VirusTotalAdapter):
                 )
                 state.output["negative_observation_ref"] = str(negative.id)
             output_descriptors = _descriptors(items, self.max_results)
+            output_limitations = list(limitations)
+            if descriptors_unavailable:
+                output_limitations.append(_RELATIONSHIP_DESCRIPTORS_UNAVAILABLE_LIMITATION)
             state.output.update(
                 {
                     "pages": state.pages,
                     "observed_count": len(items),
                     "descriptors": output_descriptors,
-                    "pagination_complete": exhaustive,
+                    "pagination_complete": exhaustive and not descriptors_unavailable,
                     "provider_routes": sorted(state.routes),
-                    "limitations": list(limitations),
+                    "limitations": output_limitations,
                 }
             )
+            if descriptors_unavailable:
+                state.output["detail_code"] = "descriptors_unavailable"
             if next_cursor is not None and not exhaustive:
                 state.output["next_cursor"] = _safe_cursor(next_cursor)
             status = (
@@ -1163,7 +1210,17 @@ class _RelationshipsAdapter(_VirusTotalAdapter):
                 if terminal_empty
                 else ToolInvocationStatus.SUCCEEDED
             )
-            return self._result(state, status, reason="page_limit" if partial else None)
+            return self._result(
+                state,
+                status,
+                reason=(
+                    "descriptors_unavailable"
+                    if descriptors_unavailable
+                    else "page_limit"
+                    if partial
+                    else None
+                ),
+            )
 
         return await self._run(arguments, context, operation)
 
@@ -2183,6 +2240,11 @@ def _descriptors(
         attributes = item.get("attributes")
         attributes = attributes if isinstance(attributes, Mapping) else {}
         descriptor: dict[str, Any] = {"type": item_type, "identifier": safe_identifier}
+        if item_type.lower() in {"url", "urls"}:
+            url_fields = _url_descriptor_fields(item, identifier, safe_identifier)
+            if url_fields is None:
+                continue
+            descriptor.update(url_fields)
         for name in ("meaningful_name", "name", "type_description"):
             value = attributes.get(name)
             if isinstance(value, str) and value.strip():
@@ -2213,6 +2275,8 @@ def _safe_identifier(item_type: str, value: str) -> str | None:
         if normalized_type in {"domain", "domains"}:
             return _normalize_domain(value)
         if normalized_type in {"url", "urls"}:
+            if _URL_SHA256.fullmatch(value):
+                return "url-sha256:" + value.lower()
             url = _decode_url_id(value)
             if url is None:
                 return None
@@ -2228,6 +2292,94 @@ def _safe_identifier(item_type: str, value: str) -> str | None:
     ):
         return None
     return sanitize_evidence_text(value, max_chars=256)
+
+
+def _url_descriptor_fields(
+    item: Mapping[str, Any], identifier: str, safe_identifier: str
+) -> dict[str, str] | None:
+    attributes = item.get("attributes")
+    attributes = attributes if isinstance(attributes, Mapping) else {}
+    context_attributes = item.get("context_attributes")
+    context_attributes = context_attributes if isinstance(context_attributes, Mapping) else {}
+    candidates = (
+        context_attributes.get("url"),
+        attributes.get("url"),
+        _decode_url_id(identifier),
+    )
+    readable_url = next(
+        (
+            safe_url
+            for candidate in candidates
+            if isinstance(candidate, str)
+            and (safe_url := _safe_url_descriptor(candidate)) is not None
+        ),
+        None,
+    )
+    if readable_url is None:
+        return None
+    url_sha256 = safe_identifier.removeprefix("url-sha256:")
+    if not _URL_SHA256.fullmatch(url_sha256):
+        return None
+    return {"id": url_sha256, "url": readable_url}
+
+
+def _safe_url_descriptor(value: str) -> str | None:
+    candidate = value.strip()
+    if not candidate or len(candidate) > 8_192 or any(
+        unicodedata.category(char) == "Cc" for char in candidate
+    ):
+        return None
+    try:
+        parsed = urlsplit(candidate)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if parsed.scheme.lower() not in {"http", "https"} or not hostname or len(hostname) > 253:
+        return None
+    if any(unicodedata.category(char) == "Cc" for char in hostname):
+        return None
+    try:
+        normalized_host = ipaddress.ip_address(hostname).compressed
+    except ValueError:
+        try:
+            normalized_host = _normalize_domain(hostname)
+        except VirusTotalInvalidInputError:
+            return None
+    authority = f"[{normalized_host}]" if ":" in normalized_host else normalized_host
+    if port is not None:
+        authority += f":{port}"
+
+    path = parsed.path
+    decoded_path = unquote(path)
+    if _CREDENTIAL_CONTENT.search(decoded_path):
+        path = "/[path omitted]"
+
+    query = parsed.query
+    decoded_query = unquote_plus(query)
+    query_names = {
+        unquote_plus(component.partition("=")[0]).casefold()
+        for component in re.split(r"[&;]", query)
+        if component
+    }
+    if (
+        _SIGNED_QUERY_KEYS.search(query)
+        or query_names & _SENSITIVE_URL_QUERY_KEYS
+        or _CREDENTIAL_CONTENT.search(decoded_query)
+    ):
+        query = ""
+
+    scheme = parsed.scheme.lower()
+    readable = f"{scheme}://{authority}{path}"
+    if query:
+        readable += f"?{query}"
+    if len(readable) > _URL_DESCRIPTOR_MAX_CHARS:
+        readable = f"{scheme}://{authority}{path}"
+    if len(readable) > _URL_DESCRIPTOR_MAX_CHARS:
+        readable = f"{scheme}://{authority}/[path omitted]"
+    if len(readable) > _URL_DESCRIPTOR_MAX_CHARS:
+        return None
+    return readable
 
 
 def _decode_url_id(value: str) -> str | None:
