@@ -1487,6 +1487,7 @@ def _is_safe_outcome_code(value: str) -> bool:
     return isinstance(value, str) and value in {
         "bridge_rate_limited",
         "bridge_rejected",
+        "vt_download_not_found",
         *VT_PASSIVE_READ_ARCHIVE_FAILURE_OUTCOME_CODES,
     }
 

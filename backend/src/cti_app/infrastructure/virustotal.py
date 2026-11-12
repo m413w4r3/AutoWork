@@ -411,6 +411,10 @@ class _VirusTotalDownloadPermitAwareTransport(PermitAwareTransport):
         spool = tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
         try:
             status = response.status_code
+            if status >= 500:
+                # A server failure can follow a handoff whose result is still
+                # uncertain. Let the coordinator retain its no-resend barrier.
+                raise RuntimeError("VirusTotal download returned an uncertain server error")
             limit = (
                 self.__max_bytes + 1
                 if 200 <= status < 300
@@ -449,7 +453,10 @@ class _VirusTotalDownloadPermitAwareTransport(PermitAwareTransport):
             }
             token = uuid4().hex
             self.__pending[token] = (cast(BinaryIO, spool), status, safe_headers)
-            return TransportResponse(payload=token.encode("ascii"))
+            return TransportResponse(
+                outcome_code="vt_download_not_found" if status == 404 else None,
+                payload=token.encode("ascii"),
+            )
         except BaseException:
             spool.close()
             raise
@@ -914,10 +921,11 @@ class VirusTotalHttpAdapter(VirusTotalPort):
         that separate hop, and UNKNOWN is not cacheable as a durable refusal.
         The issuer heuristic is diagnostic and does not prove authorship. Error
         metadata also carries a correlation id, the historical route label, and
-        a normalized ``route_path`` without query parameters. A 404
-        is diagnostic metadata, never evidence
-        that the file is absent; v2 is considered only after explicit proxy
-        route-missing evidence for both v3 endpoints and the opt-in flag.
+        a normalized ``route_path`` without query parameters. A completed 404
+        closes that request claim as a definite response; acquisition may still
+        continue through its documented fallback route. v2 is considered only
+        after explicit proxy route-missing evidence for both v3 endpoints and
+        the opt-in flag.
         """
         correlation_id = uuid4().hex
         authority = current_virustotal_external_effect_authority()

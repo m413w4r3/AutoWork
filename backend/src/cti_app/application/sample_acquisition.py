@@ -560,9 +560,15 @@ class VirusTotalSampleAcquisitionService:
                         code = "virustotal_download_route_not_found"
                         refusal_reason = "proxy_route_not_found"
                         failure_kind = SampleAcquisitionFailureKind.PROXY_ROUTE_NOT_FOUND
-                    else:
+                    elif response_origin is SampleAcquisitionResponseOrigin.SIGNED_CDN:
                         code = "virustotal_download_404_origin_unknown"
                         refusal_reason = "provider_download_404_origin_unknown"
+                        failure_kind = SampleAcquisitionFailureKind.RESPONSE_ORIGIN_UNKNOWN
+                    else:
+                        # A completed HTTP 404 has no sample bytes to deliver,
+                        # even when the response issuer cannot be attributed.
+                        code = "virustotal_download_route_not_found"
+                        refusal_reason = "provider_download_route_not_found"
                         failure_kind = SampleAcquisitionFailureKind.RESPONSE_ORIGIN_UNKNOWN
                     ambiguous = False
                 elif isinstance(exc, VirusTotalHttpError) and exc.status_code in {401, 403}:

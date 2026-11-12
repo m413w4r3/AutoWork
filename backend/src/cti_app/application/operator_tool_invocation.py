@@ -54,6 +54,7 @@ from cti_app.application.investigation_state import (
     InvestigationStateVersionConflict,
 )
 from cti_app.application.investigation_tools import (
+    FrameworkTerminalExternalEffectFailure,
     ToolEffect,
     ToolExecutionContext,
     ToolRegistry,
@@ -2060,6 +2061,16 @@ class OperatorToolInvocationService:
         }:
             if safe_nested_error_code is not None:
                 result_data = {"error_code": safe_nested_error_code}
+                if (
+                    invocation.tool_name == "vt.download_sample"
+                    and tool_result is not None
+                    and tool_result.framework_terminal_external_effect_failure
+                    is FrameworkTerminalExternalEffectFailure.VT_DOWNLOAD_NOT_FOUND
+                ):
+                    result_data["detail_code"] = safe_nested_error_code
+                    reason = tool_result.output.get("reason")
+                    if isinstance(reason, str):
+                        result_data["reason"] = reason
                 if invocation.tool_name == "archive.extract_member" and tool_result is not None:
                     result_data.update(
                         _archive_extract_member_failure_details(

@@ -625,8 +625,8 @@ async def test_budget_is_not_refunded_when_the_vt_call_fails_after_being_consume
     assert db.investigations[investigation.id].budget.consumed_vt_read_units == 1
     assert len(db.samples) == 0
     error_attempt = next(a for a in db.attempts if a.outcome is SampleAcquisitionOutcome.ERROR)
-    assert error_attempt.error_code == "virustotal_download_404_origin_unknown"
-    assert caught.value.code == "virustotal_download_404_origin_unknown"
+    assert error_attempt.error_code == "virustotal_download_route_not_found"
+    assert caught.value.code == "virustotal_download_route_not_found"
     assert caught.value.ambiguous is False
     failure_events = [e for e in db.provenance if e.aggregate_id == investigation.id]
     assert len(failure_events) == 1

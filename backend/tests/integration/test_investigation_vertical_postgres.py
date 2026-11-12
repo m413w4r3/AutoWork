@@ -2049,8 +2049,20 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
 
 
 @pytest.mark.asyncio
-async def test_real_postgres_tool_path_classifies_vt_download_route_404_as_needs_review(
-    uow_factory, migrated_postgres_url: str, tmp_path: Path
+@pytest.mark.parametrize(
+    ("response_status", "expected_status"),
+    [
+        (404, ToolInvocationStatus.FAILED),
+        (500, ToolInvocationStatus.NEEDS_REVIEW),
+    ],
+    ids=["404-terminal", "server-error-needs-review"],
+)
+async def test_real_postgres_download_404_is_terminal_and_server_error_needs_review(
+    uow_factory,
+    migrated_postgres_url: str,
+    tmp_path: Path,
+    response_status: int,
+    expected_status: ToolInvocationStatus,
 ) -> None:
     blob_store = FilesystemBlobStore(tmp_path / "download-refusal-blobs")
     blob_catalog = BlobCatalogService(blob_store, uow_factory)
@@ -2063,7 +2075,11 @@ async def test_real_postgres_tool_path_classifies_vt_download_route_404_as_needs
 
     def not_found(request: httpx.Request) -> httpx.Response:
         request_paths.append(request.url.path)
-        return httpx.Response(404, json={"error": "NotFoundError"}, request=request)
+        return httpx.Response(
+            response_status,
+            json={"error": "NotFoundError"},
+            request=request,
+        )
 
     vt_client = httpx.AsyncClient(transport=httpx.MockTransport(not_found))
     vt = VirusTotalHttpAdapter(
@@ -2084,6 +2100,7 @@ async def test_real_postgres_tool_path_classifies_vt_download_route_404_as_needs
         virustotal=vt,
         capabilities=VirusTotalCapabilities(file_download=True),
     )
+    effect_sessions = create_session_factory(runtime_engine)
     transport = _VerticalScriptedTransport(
         [
             _decision(
@@ -2111,7 +2128,7 @@ async def test_real_postgres_tool_path_classifies_vt_download_route_404_as_needs
         settings=settings,
         transport=transport,
         virustotal=cast(Any, vt),
-        external_effect_session_factory=create_session_factory(runtime_engine),
+        external_effect_session_factory=effect_sessions,
         additional_ports=replace(runtime_ports, acquisition=None),
     )
     app, registry, dispatcher = _build_app(
@@ -2163,33 +2180,47 @@ async def test_real_postgres_tool_path_classifies_vt_download_route_404_as_needs
                 seeded.investigation.id, material.sample_hash
             )
         invocation = next(item for item in invocations if item.tool_name == "vt.download_sample")
-        assert request_paths == [
-            f"/api/v3/files/{material.sample_hash}/download",
-            f"/api/v3/files/{material.sample_hash}/download_url",
-        ], (
-            "unexpected VT transport path; persisted acquisition "
-            f"code={getattr(failed_attempt, 'error_code', None)!r}"
-        )
-        # The 404 body cannot be attributed to VT or its proxy, so the external
-        # outcome is ambiguous and must be reconciled before any retry. Only a
-        # framework diagnostic is persisted; the adapter output is not.
-        assert invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+        async with effect_sessions() as session:
+            claims = tuple(
+                (
+                    await session.scalars(
+                        select(ExternalEffectClaimRow).where(
+                            ExternalEffectClaimRow.invocation_id == invocation.id
+                        )
+                    )
+                ).all()
+            )
+        assert invocation.status is expected_status
         assert len(invocation.response_refs) == 1
-        diagnostic_observation = next(
+        observation = next(
             item for item in observations if item.id == invocation.response_refs[0]
         )
-        diagnostic = await artifact_store.read_json(diagnostic_observation.blob_id)
-        assert diagnostic["result"]["outcome"] == "external_effect_unconfirmed"
-        assert diagnostic["result"]["adapter_output_archived"] is False
-        assert invocation.consumed_budget == {}
-        # Its plain ledger code (rather than an opaque refusal-cache marker)
-        # keeps this 404 diagnostic and retryable after the route/config changes.
         assert failed_attempt is not None
-        assert failed_attempt.error_code == "virustotal_download_404_origin_unknown"
         assert envelope is not None
-        # The ambiguous reservation is retained until reconciliation so a retry
-        # cannot consume the same budget a second time.
-        assert any(item.status.value == "reserved" for item in envelope.budget.reservations)
+        if response_status == 404:
+            assert request_paths == [
+                f"/api/v3/files/{material.sample_hash}/download",
+                f"/api/v3/files/{material.sample_hash}/download_url",
+            ]
+            refusal = await artifact_store.read_json(observation.blob_id)
+            assert refusal["result"]["error_code"] == "virustotal_download_route_not_found"
+            assert refusal["result"]["reason"] == "provider_download_route_not_found"
+            assert len(claims) == 2
+            assert all(claim.state == "COMPLETED" for claim in claims)
+            assert all(claim.last_error_code == "vt_download_not_found" for claim in claims)
+            assert invocation.consumed_budget
+            assert failed_attempt.error_code == "virustotal_download_route_not_found"
+            assert any(item.status.value == "committed" for item in envelope.budget.reservations)
+        else:
+            assert request_paths == [f"/api/v3/files/{material.sample_hash}/download"]
+            diagnostic = await artifact_store.read_json(observation.blob_id)
+            assert diagnostic["result"]["outcome"] == "external_effect_unconfirmed"
+            assert diagnostic["result"]["adapter_output_archived"] is False
+            assert len(claims) == 1
+            assert claims[0].state == "NEEDS_REVIEW"
+            assert invocation.consumed_budget == {}
+            assert failed_attempt.error_code == "virustotal_external_effect_needs_review"
+            assert any(item.status.value == "reserved" for item in envelope.budget.reservations)
     finally:
         await vt_client.aclose()
         await runtime_engine.dispose()

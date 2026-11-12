@@ -18,6 +18,7 @@ from cti_app.application.investigation_acquisition_tools import (
     SAMPLE_ANALYZE_SCHEMA,
     VT_DOWNLOAD_SAMPLE_SCHEMA,
     VT_FILE_DOWNLOAD_CAPABILITY,
+    _DownloadSampleAdapter,
 )
 from cti_app.application.investigation_advisor_tools import (
     ADVISOR_REPARSE_SCHEMA_VERSION,
@@ -79,6 +80,7 @@ from cti_app.domain.investigation import (
     InvestigationFinding,
     SampleAssociation,
     SampleOrigin,
+    SampleQualification,
     ToolInvocation,
     ToolInvocationStatus,
     tool_operation_key,
@@ -1065,6 +1067,202 @@ async def test_document_backed_hash_read_and_download_are_available_executable()
     assert "canonical VT relationship payload" in result_data["correction"]
     assert refused.output["error"]["reason"] == result_data["correction"]
     assert len(tools["vt.download_sample"].calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first_status", "error_code", "reason", "expected_status", "second_is_success"),
+    [
+        (
+            ToolInvocationStatus.UNAVAILABLE,
+            "virustotal_download_route_not_found",
+            "proxy_route_not_found",
+            ToolInvocationStatus.FAILED,
+            True,
+        ),
+        (
+            ToolInvocationStatus.NEEDS_REVIEW,
+            "virustotal_download_timeout",
+            "provider_download_outcome_ambiguous",
+            ToolInvocationStatus.NEEDS_REVIEW,
+            False,
+        ),
+    ],
+    ids=["404-is-terminal-and-next-hash-can-proceed", "transport-timeout-remains-ambiguous"],
+)
+async def test_trusted_download_failure_terminality_is_limited_to_vt_404(
+    first_status: ToolInvocationStatus,
+    error_code: str,
+    reason: str,
+    expected_status: ToolInvocationStatus,
+    second_is_success: bool,
+) -> None:
+    fixture, state, registry, _summaries, operator_service, _tools, _identifiers = (
+        await _seeded_fixture()
+    )
+    capabilities = frozenset((*fixture.available_capabilities, VT_FILE_DOWNLOAD_CAPABILITY))
+    fixture.available_capabilities = capabilities
+    fixture.service._available_capabilities = capabilities
+    operator_service._available_capabilities = capabilities
+
+    envelope = await fixture.envelopes.get(fixture.investigation_id)
+    assert envelope is not None
+    envelope = replace(envelope, acquire_hits_allowed=True)
+    fixture.envelope = envelope
+    fixture.envelopes._items[fixture.investigation_id] = envelope
+
+    sample_hashes = ("f" * 64, "e" * 64)
+    document_id = uuid4()
+    fixture.snapshot = replace(
+        fixture.snapshot,
+        confirmed_iocs=(
+            *fixture.snapshot.confirmed_iocs,
+            *(
+                ConfirmedIOCContextV1(
+                    indicator_type="sha256",
+                    value=sample_hash,
+                    extraction_artifact_id=uuid4(),
+                    extraction_artifact_version=1,
+                    source_document_ids=(document_id,),
+                )
+                for sample_hash in sample_hashes
+            ),
+        ),
+    )
+    fixture.context_builder.article_snapshots.snapshot = fixture.snapshot
+
+    source_document = SourceDocument(
+        id=document_id,
+        subject_id=fixture.subject_id,
+        blob_id=uuid4(),
+        original_name="synthetic-download-source.html",
+        origin="synthetic-test",
+        acquired_at=datetime.now(UTC),
+        license_restriction=None,
+        tlp=TLP.CLEAR,
+        do_not_submit=False,
+        external_llm_allowed=True,
+    )
+
+    class _SourceDocuments:
+        async def get(self, requested_id: UUID):
+            return source_document if requested_id == document_id else None
+
+    fixture.service._source_documents = _SourceDocuments()
+
+    class _Hits:
+        def __init__(self) -> None:
+            self.associations: dict[UUID, Any] = {}
+            self.calls: list[str] = []
+
+        async def register_hit(self, _investigation_id: UUID, sample_sha256: str, **_kwargs):
+            association = SimpleNamespace(
+                id=uuid4(),
+                sample_sha256=sample_sha256,
+                qualification=SampleQualification.CANDIDATE,
+            )
+            self.associations[association.id] = association
+            return association
+
+        async def acquire_hit(self, association_id: UUID, **_kwargs):
+            association = self.associations[association_id]
+            self.calls.append(association.sample_sha256)
+            if association.sample_sha256 == sample_hashes[0]:
+                return SimpleNamespace(
+                    status=first_status,
+                    association=association,
+                    sample_id=None,
+                    reused_existing_sample=False,
+                    observation_refs=(),
+                    novelty=None,
+                    request_permission=False,
+                    suggested_alternatives=(),
+                    message="Synthetic VT download failure.",
+                    budget_consumed=(
+                        {BudgetDimension.VT_UNITS: 1, BudgetDimension.DOWNLOADS: 0}
+                        if first_status is ToolInvocationStatus.UNAVAILABLE
+                        else {}
+                    ),
+                    error_code=error_code,
+                    reason=reason,
+                    confirmed_non_execution=False,
+                    cached=False,
+                    exception_class="SampleAcquisitionDownloadError",
+                )
+            return SimpleNamespace(
+                status=ToolInvocationStatus.SUCCEEDED,
+                association=association,
+                sample_id=uuid4(),
+                reused_existing_sample=False,
+                observation_refs=(),
+                novelty=None,
+                request_permission=False,
+                suggested_alternatives=(),
+                message="Synthetic sample acquired.",
+                budget_consumed={BudgetDimension.VT_UNITS: 1, BudgetDimension.DOWNLOADS: 1},
+                error_code=None,
+                reason=None,
+                confirmed_non_execution=False,
+                cached=False,
+                exception_class=None,
+            )
+
+    hits = _Hits()
+    registry.register(
+        ToolDefinition(
+            name="vt.download_sample",
+            schema_version="1",
+            input_schema=VT_DOWNLOAD_SAMPLE_SCHEMA,
+            effect=ToolEffect.ACQUIRE,
+            cost_model={BudgetDimension.VT_UNITS: 1, BudgetDimension.DOWNLOADS: 1},
+            confidentiality=ToolConfidentiality.RESTRICTED,
+            limitations=("Offline terminality regression.",),
+            capability_key=VT_FILE_DOWNLOAD_CAPABILITY,
+        ),
+        _DownloadSampleAdapter(cast(Any, hits)),
+    )
+
+    first = await operator_service.invoke(
+        tool_name="vt.download_sample",
+        schema_version="1",
+        arguments={
+            "sha256": sample_hashes[0],
+            "purpose": "Review first synthetic hash.",
+            "evidence_refs": [],
+        },
+        purpose="Review first synthetic hash.",
+        expected_version=state.version,
+        idempotency_key="terminal-vt-download-first",
+    )
+    assert first.invocation.status is expected_status
+    if second_is_success:
+        assert first.error_code == "virustotal_download_route_not_found"
+        assert first.output["data"]["result"]["detail_code"] == (
+            "virustotal_download_route_not_found"
+        )
+        assert first.output["next_action"]["code"] == "continue_with_current_context"
+        assert first.output["next_action"]["resubmission_allowed"] is None
+        assert first.invocation.response_refs
+        second = await operator_service.invoke(
+            tool_name="vt.download_sample",
+            schema_version="1",
+            arguments={
+                "sha256": sample_hashes[1],
+                "purpose": "Review second synthetic hash.",
+                "evidence_refs": [],
+            },
+            purpose="Review second synthetic hash.",
+            expected_version=first.working_state_version,
+            idempotency_key="terminal-vt-download-second",
+        )
+        assert second.invocation.status is ToolInvocationStatus.SUCCEEDED
+        assert hits.calls == list(sample_hashes)
+    else:
+        assert first.invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+        assert first.error_code == "virustotal_download_timeout"
+        assert first.output["next_action"]["code"] == "reconcile_before_retry"
+        assert first.output["next_action"]["resubmission_allowed"] is False
+        assert hits.calls == [sample_hashes[0]]
 
 
 @pytest.mark.asyncio

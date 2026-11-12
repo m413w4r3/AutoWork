@@ -37,6 +37,7 @@ from cti_app.application.investigation_governance import (
     SampleQualificationService,
 )
 from cti_app.application.investigation_tools import (
+    FrameworkTerminalExternalEffectFailure,
     ToolConfidentiality,
     ToolDefinition,
     ToolEffect,
@@ -66,6 +67,12 @@ _ACQUISITION_COST = {
     BudgetDimension.VT_UNITS: 1,
     BudgetDimension.DOWNLOADS: 1,
 }
+_VT_DOWNLOAD_NOT_FOUND_ERROR_CODES = frozenset(
+    {
+        "virustotal_download_route_not_found",
+        "virustotal_download_file_not_found",
+    }
+)
 VT_FILE_DOWNLOAD_CAPABILITY = "vt.file_download"
 LOCAL_QUALIFICATION_CAPABILITY = "investigation.local_read"
 SAMPLE_ANALYSIS_CAPABILITY = "investigation.sample_analysis"
@@ -583,6 +590,11 @@ class _DownloadSampleAdapter:
                         output[key] = value
                 tool_result = replace(tool_result, output=output)
         return tool_result
+
+
+def is_trusted_vt_download_sample_adapter(tool_name: str, adapter: object) -> bool:
+    """Identify the built-in acquisition adapter allowed to attest a VT 404."""
+    return tool_name == "vt.download_sample" and type(adapter) is _DownloadSampleAdapter
 
 
 class _SampleAnalyzeAdapter:
@@ -1241,6 +1253,11 @@ def register_acquisition_tools(
 
 
 def _acquisition_tool_result(result: HitAcquisitionResult) -> ToolResult:
+    terminal_not_found = (
+        result.status is ToolInvocationStatus.UNAVAILABLE
+        and result.error_code in _VT_DOWNLOAD_NOT_FOUND_ERROR_CODES
+    )
+    status = ToolInvocationStatus.FAILED if terminal_not_found else result.status
     output: dict[str, Any] = {
         "association_id": str(result.association.id),
         "sample_sha256": result.association.sample_sha256,
@@ -1259,12 +1276,12 @@ def _acquisition_tool_result(result: HitAcquisitionResult) -> ToolResult:
         output["error_code"] = result.error_code
     if result.reason is not None:
         output["reason"] = result.reason
-    if result.confirmed_non_execution:
+    if result.confirmed_non_execution and not terminal_not_found:
         output["confirmed_non_execution"] = True
     if result.cached:
         output["cached"] = True
     return ToolResult(
-        status=result.status,
+        status=status,
         observation_refs=result.observation_refs,
         budget_consumed=result.budget_consumed
         or {BudgetDimension.VT_UNITS: 0, BudgetDimension.DOWNLOADS: 0},
@@ -1273,6 +1290,11 @@ def _acquisition_tool_result(result: HitAcquisitionResult) -> ToolResult:
         message=result.message,
         exception_class=result.exception_class,
         error_code=result.error_code,
+        framework_terminal_external_effect_failure=(
+            FrameworkTerminalExternalEffectFailure.VT_DOWNLOAD_NOT_FOUND
+            if terminal_not_found
+            else None
+        ),
     )
 
 
