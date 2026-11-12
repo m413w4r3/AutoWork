@@ -555,18 +555,18 @@
   ]
 }
 
-#let render-opinion-note-markers(references, reference-scope: "") = {
+#let render-opinion-citations(references, reference-scope: "") = {
   if references.len() > 0 [
-    #super[
-      #for (index, reference) in references.enumerate() [
-        #if index > 0 [,]
-        #render-opinion-reference(
-          reference.target_id,
-          [#str(reference.at("note_number", default: reference.label))],
-          reference-scope: reference-scope,
-          fallback-url: reference.at("href", default: none),
-        )
-      ]
+    #v(3pt)
+    #text(size: 7pt, fill: grey)[Références : ]
+    #for (index, reference) in references.enumerate() [
+      #if index > 0 [ · ]
+      #render-opinion-reference(
+        reference.target_id,
+        [#reference.label],
+        reference-scope: reference-scope,
+        fallback-url: reference.at("href", default: none),
+      )
     ]
   ]
 }
@@ -1255,7 +1255,7 @@
       analyst-opinion-style: analyst-opinion-style,
     )
     #if analyst-opinion-style [
-      #render-opinion-note-markers(
+      #render-opinion-citations(
         finding-refs + evidence-refs,
         reference-scope: reference-scope,
       )
@@ -1567,7 +1567,7 @@
               pipe-table: pipe-table,
               analyst-opinion-style: true,
             )
-            #render-opinion-note-markers(
+            #render-opinion-citations(
               item.finding_refs + item.evidence_refs,
               reference-scope: reference-scope,
             )
@@ -1597,7 +1597,7 @@
                 pipe-table,
                 footer-note: pipe-table.at("suffix", default: none),
               )
-              #render-opinion-note-markers(
+              #render-opinion-citations(
                 item.finding_refs + item.evidence_refs,
                 reference-scope: reference-scope,
               )
@@ -1615,7 +1615,7 @@
                 pipe-table: pipe-table,
                 analyst-opinion-style: true,
               )
-              #render-opinion-note-markers(
+              #render-opinion-citations(
                 item.finding_refs + item.evidence_refs,
                 reference-scope: reference-scope,
               )

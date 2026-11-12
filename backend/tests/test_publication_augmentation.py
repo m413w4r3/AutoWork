@@ -71,6 +71,27 @@ def test_augmentation_projects_ordered_blocks_and_keeps_v5_bytes_unchanged() -> 
     assert base_bytes_after == base_bytes
 
 
+def test_opinion_reference_projection_assigns_short_labels_and_preserves_reference_ids() -> None:
+    base = _base_v5()
+    opinion, context = _approved_opinion(base)
+
+    augmented = augment_publication_with_opinion(base, opinion, context)
+    model = project_publication_to_typst_model(augmented)
+    opinion_section = next(
+        section for section in model.content_sections if section["type"] == "analyst_opinion"
+    )
+    block = opinion_section["blocks"][0]
+
+    assert [reference["label"] for reference in block["finding_refs"]] == ["[F1]"]
+    assert [reference["label"] for reference in block["evidence_refs"]] == ["[E1]"]
+    assert block["finding_refs"][0]["reference_id"] == str(context.findings[0].id)
+    assert block["evidence_refs"][0]["reference_id"] == str(context.observations[0].id)
+    assert [
+        reference["note_number"]
+        for reference in block["finding_refs"] + block["evidence_refs"]
+    ] == [1, 2]
+
+
 def test_augmentation_rejects_an_unverifiable_citation() -> None:
     base = _base_v5()
     opinion, context = _approved_opinion(base)
