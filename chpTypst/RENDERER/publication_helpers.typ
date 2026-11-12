@@ -543,13 +543,10 @@
   target-id,
   display,
   reference-scope: "",
-  fallback-url: none,
 ) = context {
   let target = label(reference-scope + target-id)
   if query(target).len() > 0 [
     #link(target)[#display]
-  ] else if fallback-url != none [
-    #link(fallback-url)[#display]
   ] else [
     #display
   ]
@@ -565,7 +562,6 @@
         reference.target_id,
         [#reference.label],
         reference-scope: reference-scope,
-        fallback-url: reference.at("href", default: none),
       )
     ]
   ]
@@ -705,7 +701,6 @@
       reference.target_id,
       [#reference.label],
       reference-scope: reference-scope,
-      fallback-url: reference.at("href", default: none),
     )
   ]
 }
@@ -928,7 +923,7 @@
           #text(size: 8pt, weight: "bold")[#group-title]
           #for item in refs [
             #block(above: 1pt, below: 1pt, breakable: true)[
-              #link(item.href)[#text(size: 7.5pt, weight: "bold")[#item.label]]
+              #text(size: 7.5pt, weight: "bold")[#item.label]
               #label(reference-scope + item.target_id)
               #h(0.35em)
               #text(size: 7.5pt)[#item.display_label]
@@ -1669,7 +1664,6 @@
             item.evidence_ref.target_id,
             [#text(item.evidence_ref.label)],
             reference-scope: reference-scope,
-            fallback-url: item.evidence_ref.at("href", default: none),
           )
         ]
       ]

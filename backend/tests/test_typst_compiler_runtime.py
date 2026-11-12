@@ -19,6 +19,7 @@ from uuid import UUID
 import anyio
 import pytest
 from pypdf import PdfReader
+from pypdf.generic import ArrayObject, DictionaryObject, IndirectObject, StreamObject
 
 from cti_app.application.production_normalization import normalize_indicator_value
 from cti_app.application.publication_augmentation import augment_publication_with_opinion
@@ -80,6 +81,97 @@ _COPYABLE_WINDOWS_PATH = (
 )
 _COPYABLE_REGISTRY_PATH = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
 _COPYABLE_TABLE_URL = "https://example.test/" + "u" * 99
+_PDF_INTERNAL_UUID = re.compile(
+    rb"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.IGNORECASE,
+)
+_PDF_AUTOWORK_URI = re.compile(rb"autowork://", re.IGNORECASE)
+
+
+def _assert_pdf_has_no_internal_identity_data(
+    pdf_bytes: bytes,
+    *,
+    internal_ids: tuple[str, ...] = (),
+) -> PdfReader:
+    """Check raw bytes, decoded streams, metadata, destinations, and annotations."""
+    reader = PdfReader(BytesIO(pdf_bytes), strict=True)
+    payloads = [pdf_bytes]
+    pending: list[Any] = [reader.trailer]
+    visited_references: set[tuple[int, int]] = set()
+    visited_direct_objects: set[int] = set()
+
+    while pending:
+        value = pending.pop()
+        if isinstance(value, IndirectObject):
+            identity = (value.idnum, value.generation)
+            if identity in visited_references:
+                continue
+            visited_references.add(identity)
+            value = value.get_object()
+        if isinstance(value, (ArrayObject, DictionaryObject, StreamObject)):
+            identity = id(value)
+            if identity in visited_direct_objects:
+                continue
+            visited_direct_objects.add(identity)
+
+        payloads.append(str(value).encode("utf-8", errors="replace"))
+        if isinstance(value, StreamObject):
+            payloads.append(value.get_data())
+            pending.extend(value.values())
+        elif isinstance(value, DictionaryObject):
+            pending.extend(value.values())
+        elif isinstance(value, ArrayObject):
+            pending.extend(value)
+
+    metadata_views = (
+        ("PDF document metadata", reader.metadata),
+        ("PDF XMP metadata", reader.xmp_metadata),
+        ("PDF named destinations", reader.named_destinations),
+    )
+    for name, view in metadata_views:
+        if view is not None:
+            payloads.append(str(view).encode("utf-8", errors="replace"))
+            _assert_pdf_identity_payload_is_clean(payloads[-1], name)
+
+    for page_index, page in enumerate(reader.pages, start=1):
+        payloads.append((page.extract_text() or "").encode("utf-8"))
+        contents = page.get_contents()
+        if contents is not None:
+            payloads.append(contents.get_data())
+        annotations = page.get("/Annots", ())
+        if isinstance(annotations, IndirectObject):
+            annotations = annotations.get_object()
+        for annotation_reference in annotations:
+            annotation = (
+                annotation_reference.get_object()
+                if isinstance(annotation_reference, IndirectObject)
+                else annotation_reference
+            )
+            annotation_payload = str(annotation).encode("utf-8", errors="replace")
+            _assert_pdf_identity_payload_is_clean(
+                annotation_payload,
+                f"PDF page {page_index} annotation",
+            )
+
+    for index, payload in enumerate(payloads):
+        _assert_pdf_identity_payload_is_clean(payload, f"PDF bytes/object/stream {index}")
+    for identifier in internal_ids:
+        identifier_bytes = identifier.encode("ascii").lower()
+        assert all(identifier_bytes not in payload.lower() for payload in payloads), (
+            "PDF contains a source, finding, or observation identifier"
+        )
+    return reader
+
+
+def _assert_pdf_identity_payload_is_clean(payload: bytes, location: str) -> None:
+    assert _PDF_AUTOWORK_URI.search(payload) is None, (
+        f"{location} contains an autowork URI target"
+    )
+    assert _PDF_INTERNAL_UUID.search(payload) is None, (
+        f"{location} contains an internal UUID; standard PDF /ID values are undashed hex"
+    )
+
+
 _COPYABLE_DEFANGED_URL = "hxxps://a[.]b[.]c"
 _COPYABLE_VALUES = (
     _COPYABLE_HASH,
@@ -454,12 +546,11 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
     chronology retains its source ordinals. Opinion heading,
     qualification, text, and short finding/evidence citations are checked separately.
 
-    The test sees selectable text through ``pdftotext``. It cannot verify source or
-    opinion target IDs, source document UUIDs, or link destination bytes because
-    those are PDF metadata/annotations rather than printed text. It also does not
-    claim text coverage for any figure content rasterized as an image. The existing
-    references and opinion traceability sections are retained; no editorial
-    appendix is added.
+    The test checks selectable text and scans the compiled opinion PDF's raw
+    bytes, decoded streams, metadata, named destinations, and annotations for
+    internal UUIDs and AutoWork URI targets. It also does not claim text coverage
+    for any figure content rasterized as an image. The existing references and
+    opinion traceability sections are retained; no editorial appendix is added.
     """
 
     pdftotext = shutil.which("pdftotext")
@@ -598,8 +689,10 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
             replace(
                 opinion.blocks[0],
                 text=opinion_marker,
-                finding_refs=tuple(finding.id for finding in findings),
-                evidence_refs=tuple(observation.id for observation in observations),
+                finding_refs=tuple(finding.id for finding in findings)
+                + (findings[0].id,),
+                evidence_refs=tuple(observation.id for observation in observations)
+                + (observations[0].id,),
             ),
         ),
         content_sha256="",
@@ -614,7 +707,7 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
         name: str,
         *,
         omit_note_numbers: bool = False,
-    ) -> str:
+    ) -> tuple[str, bytes]:
         source = TypstRenderer().render(
             document,
             template_bundle,
@@ -664,14 +757,27 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
             check=True,
             timeout=30,
         )
-        return extracted.stdout.decode("utf-8", errors="replace")
+        return extracted.stdout.decode("utf-8", errors="replace"), pdf_path.read_bytes()
 
-    base_text = await compile_and_extract(base, "mission04-base")
-    augmented_text = await compile_and_extract(augmented, "mission04-augmented")
-    augmented_without_note_numbers_text = await compile_and_extract(
+    base_text, _ = await compile_and_extract(base, "mission04-base")
+    augmented_text, augmented_pdf = await compile_and_extract(augmented, "mission04-augmented")
+    augmented_without_note_numbers_text, _ = await compile_and_extract(
         augmented,
         "mission04-augmented-without-note-numbers",
         omit_note_numbers=True,
+    )
+    internal_reference_ids = (
+        tuple(finding.id for finding in findings)
+        + tuple(observation.id for observation in observations)
+        + tuple(source.source_document_id for source in sources)
+    )
+    _assert_pdf_has_no_internal_identity_data(
+        augmented_pdf,
+        internal_ids=tuple(
+            value
+            for reference_id in internal_reference_ids
+            for value in (str(reference_id), reference_id.hex)
+        ),
     )
 
     def normalize_pdf_text(value: str) -> str:
@@ -794,6 +900,8 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
         evidence_id: 0,
         "Constat technique": citation_count,
         "Observation technique": citation_count,
+        "Constats logiques cités": 1,
+        "Observations": 1,
         "ANNEXE DE TRAÇABILITÉ": 1,
     }
     for marker, expected_count in base_expected_counts.items():
