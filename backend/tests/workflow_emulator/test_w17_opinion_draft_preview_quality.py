@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -466,9 +467,30 @@ async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
         "La source ne permet pas d'établir l'attribution opérationnelle",
         "Inférence de l'analyste",
         "ne démontre ni contrôle opérationnel ni attribution",
-        "203.0.113.24",
+        "Les indicateurs de compromission de cet avis (fichiers et réseau) sont repris dans le "
+        "tableau récapitulatif des IOC du bulletin et dans les annexes CSV du dossier de "
+        "livraison.",
     ):
         assert required.casefold() in normalized_text, f"W17 PDF text is missing {required!r}"
+
+    for removed_reader_label in (
+        "ANNEXE TECHNIQUE",
+        "IOC de l'article",
+        "IOC originaux",
+        "Pistes non confirmées",
+        "Empreinte de fichier",
+        "Statut indicateur",
+        "Statut relation",
+        "Contexte et provenance",
+        "IDENTIFIANT C2 DE L'IMPLANT",
+        "PROVENANCE DE PUBLICATION",
+        "Identité de base",
+        "203.0.113.24",
+    ):
+        assert removed_reader_label.casefold() not in normalized_text, (
+            f"W17 opinion PDF still exposes {removed_reader_label!r}"
+        )
+    assert re.search(r"\bhash(?:es)?\b", normalized_text) is None
 
     reference_text = normalized_text.split("références", 1)[1].split("synthèse", 1)[0]
     # C8 renders navigable numbered references and a single ordered chronology.
@@ -478,17 +500,11 @@ async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
     chronology_text = normalized_text.split("chronologie", 1)[1].split("limites des preuves", 1)[0]
     assert "1." in chronology_text, "W17 chronology must render as a numbered list"
     assert "rapport. 1" in chronology_text
-    annex_text = normalized_text.split("annexe technique", 1)[1]
-    for table_heading in (
-        "type",
-        "valeur refangée",
-        "statut indicateur",
-        "statut relation",
-        "contexte et provenance",
-    ):
-        assert table_heading in annex_text, f"W17 IOC annex table is missing {table_heading!r}"
-    assert "sources :" in annex_text
-    assert "src 1" not in annex_text
+    assert "annexe de traçabilité" in normalized_text
+    traceability_text = normalized_text.split("annexe de traçabilité", 1)[1]
+    assert "[f1]" in traceability_text and "[e1]" in traceability_text
+    assert re.search(r"\b[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\b", traceability_text) is None
+    assert "trace-f-" not in traceability_text and "trace-e-" not in traceability_text
 
     assert rendered_pages
     final_page_label = f"{len(rendered_pages)}/{len(rendered_pages)}"
@@ -514,4 +530,4 @@ async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
     assert "avis de l'analyste" not in normalized_empty_text
     assert "aucun avis publié" not in normalized_empty_text
     assert "chronologie" in normalized_empty_text
-    assert "annexe technique" in normalized_empty_text
+    assert "annexe technique" not in normalized_empty_text

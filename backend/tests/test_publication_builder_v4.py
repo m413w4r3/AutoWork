@@ -2209,7 +2209,7 @@ def test_assembly_preserves_ssdeep_identity_and_canonicalizes_tlsh_case() -> Non
     rendered_hashes = {
         item["value"]["text"]
         for group in ioc_section["source_indicators"]
-        if group["heading"] == "Hashes"
+        if group["heading"] == "Fichiers"
         for item in group["items"]
     }
     assert rendered_hashes == {ssdeep, ssdeep_case_variant, tlsh.upper()}

@@ -2018,8 +2018,8 @@ def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_navigabl
     original_iocs = values(ioc_section["original_indicators"])
     candidate_iocs = values(ioc_section["candidate_indicators"])
     assert "D" * 64 not in graph_figure["d2_source"]
-    assert "Empreinte de fichier" in graph_figure["d2_source"]
-    assert graph_figure["edges"][0]["source_value"] == "Empreinte de fichier"
+    assert "Fichier" in graph_figure["d2_source"]
+    assert graph_figure["edges"][0]["source_value"] == "Fichier"
     structural_snapshot = {
         "schema_version": render_data["schema_version"],
         "section_types": [section["type"] for section in sections],
@@ -2136,16 +2136,27 @@ def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_navigabl
     assert "BROUILLON NON APPROUVÉ" in normalized_text
     assert re.search(r"(?m)^\s*Chronologie\s*$", pdf_text) is not None
     assert "IOC" in normalized_text
-    assert "IOC DE L'ARTICLE" in normalized_text
-    assert "IOC ORIGINAUX" in normalized_text
-    assert "PISTES NON CONFIRMÉES" in normalized_text
-    assert "ANNEXE TECHNIQUE — INVENTAIRE EXHAUSTIF DES IOC" in normalized_text
+    assert "LES INDICATEURS DE COMPROMISSION DE CET AVIS" in normalized_text
+    assert "ORIGINAL.EXAMPLE" not in normalized_text
+    assert "CONTEXTUAL.EXAMPLE" not in normalized_text
+    for removed_label in (
+        "IOC DE L'ARTICLE",
+        "IOC ORIGINAUX",
+        "PISTES NON CONFIRMÉES",
+        "ANNEXE TECHNIQUE",
+        "IDENTIFIANT C2 DE L'IMPLANT",
+        "PROVENANCE DE PUBLICATION",
+        "IDENTITÉ DE BASE",
+        "STATUT INDICATEUR",
+        "STATUT RELATION",
+        "EMPREINTE DE FICHIER",
+    ):
+        assert removed_label not in normalized_text
+    assert re.search(r"\bHASHES?\b", normalized_text) is None
     assert "CORE.EXAMPLE" in normalized_text
-    assert "ORIGINAL.EXAMPLE" in normalized_text
-    assert "CONTEXTUAL.EXAMPLE" in normalized_text
-    assert "DOCUMENTÉ, NON OBSERVÉ" in normalized_text
+    assert "DOCUMENTÉ, NON OBSERVÉ" not in normalized_text
     assert "FAIT OBSERVÉ" in normalized_text
-    assert "EMPREINTE DE FICHIER" in normalized_text
+    assert "FICHIER" in normalized_text
     assert "D" * 64 not in normalized_text
     assert "OBSERVED_CONTACT" not in normalized_text
     assert "CONTACT OBSERVÉ" in normalized_text
