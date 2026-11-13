@@ -204,16 +204,16 @@ def protocol_diagram_caption(spec: ProtocolDiagramSpecV1) -> str:
     )
     if _is_documented_view(spec):
         limit_line = "Aucun flux ni trame observés; offsets et valeurs d'octets inconnus."
-        documented_limit_prefix = {
-            ProtocolDiagramKind.SEQUENCE: "messages sans sens établi",
-            ProtocolDiagramKind.STATE_MACHINE: "états documentés sans transition",
+        documented_limit_prefixes = {
+            ProtocolDiagramKind.SEQUENCE: ("messages sans sens établi",),
+            ProtocolDiagramKind.STATE_MACHINE: ("l'état ", "les états "),
         }.get(spec.kind)
-        if documented_limit_prefix is not None:
+        if documented_limit_prefixes is not None:
             documented_limit = next(
                 (
                     item
                     for item in limitations
-                    if item.casefold().startswith(documented_limit_prefix)
+                    if item.casefold().startswith(documented_limit_prefixes)
                 ),
                 None,
             )
