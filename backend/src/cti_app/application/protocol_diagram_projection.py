@@ -48,7 +48,7 @@ from cti_app.domain.protocol_model import (
     ProtocolValidationStatus,
 )
 
-PROTOCOL_DIAGRAM_PROJECTION_VERSION = "protocol-diagram-projection-v9-m21-documented-states"
+PROTOCOL_DIAGRAM_PROJECTION_VERSION = "protocol-diagram-projection-v10-m21-state-notes"
 PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION = (
     f"{DIAGRAM_COMPILATION_POLICY_VERSION}+{PROTOCOL_DIAGRAM_PROJECTION_VERSION}"
 )

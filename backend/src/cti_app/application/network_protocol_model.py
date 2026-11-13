@@ -1679,11 +1679,16 @@ def _render_documented_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
         "États et transitions tirés des sources; aucun changement n'est observé dans une capture."
     ]
     if state_edges and isolated_state_names:
-        state_limitations.append(
-            "États documentés sans transition spécifiée, non reliés par une flèche : "
-            + ", ".join(isolated_state_names)
-            + "."
-        )
+        if len(isolated_state_names) == 1:
+            state_limitations.append(
+                f"L'état {isolated_state_names[0]} est documenté sans transition spécifiée "
+                "et n'est relié par aucune flèche."
+            )
+        else:
+            state_limitations.append(
+                f"Les états {', '.join(isolated_state_names)} sont documentés sans transition "
+                "spécifiée et ne sont reliés par aucune flèche."
+            )
     state_diagram = ProtocolDiagramSpecV1(
         schema_version="ProtocolDiagramSpecV1",
         kind=ProtocolDiagramKind.STATE_MACHINE,

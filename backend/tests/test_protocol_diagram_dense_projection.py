@@ -249,7 +249,4 @@ def test_dense_message_format_compacts_twenty_two_fields_for_a_two_column_grid()
 
 
 def test_dense_projection_version_is_pinned_to_the_new_layout() -> None:
-    assert (
-        PROTOCOL_DIAGRAM_PROJECTION_VERSION
-        == "protocol-diagram-projection-v9-m21-documented-states"
-    )
+    assert PROTOCOL_DIAGRAM_PROJECTION_VERSION == "protocol-diagram-projection-v10-m21-state-notes"

@@ -1184,7 +1184,7 @@ async def test_documented_protocol_tool_cites_and_renders_without_capture() -> N
     isolated = [node["label"] for node in state_view["nodes"] if node["node_id"] not in connected]
     if state_view["edges"] and isolated:
         assert any(
-            "États documentés sans transition spécifiée" in item and isolated[0] in item
+            "sans transition spécifiée" in item and isolated[0] in item
             for item in state_view["limitations"]
         )
     else:
