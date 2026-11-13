@@ -67,6 +67,7 @@ from cti_app.domain.media_assets import MediaAssetKind
 from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
 from cti_app.domain.production_synthesis import ProductionSynthesisV1
 from cti_app.domain.publication_document import (
+    CanonicalPublicationDocument,
     PublicationDocumentV5,
     PublicationDocumentV6,
     PublicationDocumentV7,
@@ -136,8 +137,11 @@ def with_publication_lineage(
     payload = json.loads(render_source.render_data_bytes)
     if not isinstance(payload, dict):
         raise ValueError("Publication render-data must be a JSON object")
-    payload[PUBLICATION_IDENTITY_LABEL_FIELD] = identity_label
-    payload[PDF_LINEAGE_RENDER_DATA_FIELD] = lineage
+    payload = with_publication_lineage_data(
+        payload,
+        identity_label=identity_label,
+        lineage=lineage,
+    )
     encoded = json.dumps(
         payload,
         ensure_ascii=False,
@@ -150,6 +154,19 @@ def with_publication_lineage(
         render_data_bytes=encoded,
         render_data_sha256=hashlib.sha256(encoded).hexdigest(),
     )
+
+
+def with_publication_lineage_data(
+    render_data: dict[str, Any],
+    *,
+    identity_label: str,
+    lineage: dict[str, Any],
+) -> dict[str, Any]:
+    """Return render data with the exact lineage fields used by compiled PDFs."""
+    payload = dict(render_data)
+    payload[PUBLICATION_IDENTITY_LABEL_FIELD] = identity_label
+    payload[PDF_LINEAGE_RENDER_DATA_FIELD] = lineage
+    return payload
 
 
 def _version_identity_sha256(name: str, version: str) -> str:
@@ -244,6 +261,15 @@ class _PreparedPublicationRender:
     build_source: Callable[[], TypstRenderSource]
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedDraftPreview:
+    projection: TypstDraftPreviewDocument
+    template_bundle: TypstTemplateBundle
+    font_bundle: FontBundleSnapshot
+    identity_label: str
+    lineage: dict[str, Any]
+
+
 class PublicationRenderService:
     def __init__(
         self,
@@ -306,6 +332,101 @@ class PublicationRenderService:
         evidence_observations: tuple[EvidenceObservation, ...] = (),
     ) -> DraftPublicationRender:
         """Compile an ephemeral, watermarked draft without creating render state."""
+        prepared = self._prepare_draft_preview(
+            document,
+            opinion,
+            synthesis,
+            base_publication_body_sha256=base_publication_body_sha256,
+            base_publication_identity=base_publication_identity,
+            infrastructure_graph=infrastructure_graph,
+            findings=findings,
+            evidence_observations=evidence_observations,
+        )
+        try:
+            render_source = self._renderer.render(
+                prepared.projection,
+                prepared.template_bundle,
+                document_label=prepared.identity_label,
+            )
+            render_source = with_publication_lineage(
+                render_source,
+                identity_label=prepared.identity_label,
+                lineage=prepared.lineage,
+            )
+            executed = await self._preview_executor.execute(
+                render_source=render_source,
+                template_bundle=prepared.template_bundle,
+                font_bundle=prepared.font_bundle,
+            )
+        except TypstRenderExecutionError as exc:
+            raise translate_execution_error(exc, _PUBLICATION_RENDER_ERRORS.execution) from exc
+        except TemplateBundleInvalidError as exc:
+            raise PublicationRenderTemplateInvalidError(str(exc)) from exc
+        except ValueError as exc:
+            raise PublicationRenderDocumentInvalidError(str(exc)) from exc
+        except TypstCompilationError:
+            raise
+        except Exception as exc:
+            raise PublicationRenderFailedError("Unable to compile the draft preview") from exc
+        return DraftPublicationRender(
+            compiled_document=executed.compiled_document,
+            render_data_sha256=render_source.render_data_sha256,
+            lineage=prepared.lineage,
+        )
+
+    async def build_draft_preview_inputs(
+        self,
+        document: PublicationDocumentV5,
+        opinion: AnalystOpinionV1,
+        synthesis: ProductionSynthesisV1 | None = None,
+        *,
+        base_publication_body_sha256: str | None = None,
+        base_publication_identity: dict[str, Any] | None = None,
+        infrastructure_graph: InvestigationGraph | None = None,
+        findings: tuple[InvestigationFinding, ...] = (),
+        evidence_observations: tuple[EvidenceObservation, ...] = (),
+    ) -> tuple[CanonicalPublicationDocument, dict[str, Any]]:
+        """Build canonical publication and preview inputs without compiling a PDF."""
+        prepared = self._prepare_draft_preview(
+            document,
+            opinion,
+            synthesis,
+            base_publication_body_sha256=base_publication_body_sha256,
+            base_publication_identity=base_publication_identity,
+            infrastructure_graph=infrastructure_graph,
+            findings=findings,
+            evidence_observations=evidence_observations,
+        )
+        try:
+            publication_document, render_data = self._renderer.build_draft_preview_inputs(
+                prepared.projection,
+                prepared.template_bundle,
+                document_label=prepared.identity_label,
+            )
+            return publication_document, with_publication_lineage_data(
+                render_data,
+                identity_label=prepared.identity_label,
+                lineage=prepared.lineage,
+            )
+        except TemplateBundleInvalidError as exc:
+            raise PublicationRenderTemplateInvalidError(str(exc)) from exc
+        except ValueError as exc:
+            raise PublicationRenderDocumentInvalidError(str(exc)) from exc
+        except Exception as exc:
+            raise PublicationRenderFailedError("Unable to build the draft preview inputs") from exc
+
+    def _prepare_draft_preview(
+        self,
+        document: PublicationDocumentV5,
+        opinion: AnalystOpinionV1,
+        synthesis: ProductionSynthesisV1 | None,
+        *,
+        base_publication_body_sha256: str | None,
+        base_publication_identity: dict[str, Any] | None,
+        infrastructure_graph: InvestigationGraph | None,
+        findings: tuple[InvestigationFinding, ...],
+        evidence_observations: tuple[EvidenceObservation, ...],
+    ) -> _PreparedDraftPreview:
         try:
             projection = TypstDraftPreviewDocument(
                 document,
@@ -385,36 +506,19 @@ class PublicationRenderService:
                 opinion_version=opinion.version,
                 opinion_status=opinion.status.value,
             )
-            render_source = self._renderer.render(
-                projection,
-                template_bundle,
-                document_label=label,
-            )
-            render_source = with_publication_lineage(
-                render_source,
+            return _PreparedDraftPreview(
+                projection=projection,
+                template_bundle=template_bundle,
+                font_bundle=font_bundle,
                 identity_label=label,
                 lineage=lineage,
             )
-            executed = await self._preview_executor.execute(
-                render_source=render_source,
-                template_bundle=template_bundle,
-                font_bundle=font_bundle,
-            )
-        except TypstRenderExecutionError as exc:
-            raise translate_execution_error(exc, _PUBLICATION_RENDER_ERRORS.execution) from exc
         except TemplateBundleInvalidError as exc:
             raise PublicationRenderTemplateInvalidError(str(exc)) from exc
         except ValueError as exc:
             raise PublicationRenderDocumentInvalidError(str(exc)) from exc
-        except TypstCompilationError:
-            raise
         except Exception as exc:
-            raise PublicationRenderFailedError("Unable to compile the draft preview") from exc
-        return DraftPublicationRender(
-            compiled_document=executed.compiled_document,
-            render_data_sha256=render_source.render_data_sha256,
-            lineage=lineage,
-        )
+            raise PublicationRenderFailedError("Unable to prepare the draft preview") from exc
 
     async def render_pdf(self, publication_artifact_id: UUID) -> PublicationRender:
         async with self._uow_factory() as uow:

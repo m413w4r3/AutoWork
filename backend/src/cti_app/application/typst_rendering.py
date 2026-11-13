@@ -2114,6 +2114,40 @@ class TypstRenderer:
         infrastructure_graph_media_ref: TypstMediaRef | None = None,
         brief_timeline_policy_version: str | None = None,
     ) -> TypstRenderSource:
+        return self._render_with_data(
+            document,
+            template_bundle,
+            document_label=document_label,
+            target_artifact_identities=target_artifact_identities,
+            infrastructure_graph_media_ref=infrastructure_graph_media_ref,
+            brief_timeline_policy_version=brief_timeline_policy_version,
+        )[0]
+
+    def build_draft_preview_inputs(
+        self,
+        document: TypstDraftPreviewDocument,
+        template_bundle: TypstTemplateBundle,
+        *,
+        document_label: str,
+    ) -> tuple[PublicationDocumentV5, dict[str, Any]]:
+        """Return the canonical base document and Typst render data without compiling."""
+        _render_source, render_data = self._render_with_data(
+            document,
+            template_bundle,
+            document_label=document_label,
+        )
+        return document.base_publication, render_data
+
+    def _render_with_data(
+        self,
+        document: CanonicalPublicationDocument | TypstDraftPreviewDocument,
+        template_bundle: TypstTemplateBundle,
+        *,
+        document_label: str | None = None,
+        target_artifact_identities: Mapping[str, Mapping[str, Any]] | None = None,
+        infrastructure_graph_media_ref: TypstMediaRef | None = None,
+        brief_timeline_policy_version: str | None = None,
+    ) -> tuple[TypstRenderSource, dict[str, Any]]:
         """Project a publication using its exact service-supplied nature and identity label."""
         if not isinstance(document_label, str) or not document_label.strip():
             raise TemplateBundleInvalidError("Publication render requires document_label")
@@ -2199,15 +2233,18 @@ class TypstRenderer:
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
-        return TypstRenderSource(
-            source_bytes=source_bytes,
-            source_sha256=hashlib.sha256(source_bytes).hexdigest(),
-            render_data_bytes=render_data_bytes,
-            render_data_sha256=hashlib.sha256(render_data_bytes).hexdigest(),
-            media_refs=model.media_refs,
-            mapping_targets=target_descriptors,
-            mapping_unmapped=unmapped,
-            media_refang_iocs=model.media_refang_iocs,
+        return (
+            TypstRenderSource(
+                source_bytes=source_bytes,
+                source_sha256=hashlib.sha256(source_bytes).hexdigest(),
+                render_data_bytes=render_data_bytes,
+                render_data_sha256=hashlib.sha256(render_data_bytes).hexdigest(),
+                media_refs=model.media_refs,
+                mapping_targets=target_descriptors,
+                mapping_unmapped=unmapped,
+                media_refang_iocs=model.media_refang_iocs,
+            ),
+            render_data,
         )
 
 
