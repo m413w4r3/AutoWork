@@ -441,7 +441,9 @@ def test_d2_tool_lock_matches_compiler_version() -> None:
 
 
 def test_diagram_compilation_policy_version_was_incremented() -> None:
-    assert DIAGRAM_COMPILATION_POLICY_VERSION == "diagram-d2-svg-v13-m21-state-label-spacing"
+    assert DIAGRAM_COMPILATION_POLICY_VERSION == (
+        "diagram-d2-svg-v14-m21-protocol-state-self-loops"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -631,49 +633,122 @@ async def test_dense_protocol_state_machine_uses_compact_elk_spacing() -> None:
     )
 
 
-def test_dense_protocol_state_machine_bundles_parallel_trigger_labels() -> None:
-    nodes = tuple(
-        _node(
-            f"state-{index:02d}",
-            f"State {index:02d}",
-            role=DiagramNodeRole.PROTOCOL_STATE,
-        )
-        for index in range(1, 10)
+def test_protocol_state_machine_places_compact_auto_transition_in_node() -> None:
+    diagram = _diagram(
+        profile=DiagramProfile.PROTOCOL_STATE_MACHINE,
+        nodes=(
+            _node("ready", "Ready", role=DiagramNodeRole.PROTOCOL_STATE),
+            _node("done", "Done", role=DiagramNodeRole.PROTOCOL_STATE),
+        ),
+        edges=(
+            _edge("ready", "ready", "[PING]", direction=DiagramRelationDirection.DIRECTED),
+            _edge("ready", "done", "[STOP]", direction=DiagramRelationDirection.DIRECTED),
+        ),
     )
-    self_triggers = ("[PING]", "[PONG]", "[HB]", "[HB_OK]", "[CONFIRMED]", "[CON]")
+
+    source = encode_d2_source(diagram).decode()
+
+    assert len(diagram.edges) == 2
+    assert diagram.edges[0].source_node_id == diagram.edges[0].target_node_id
+    assert "n001 -> n001" not in source
+    assert 'n001: "Ready\\n↻ [PING]"' in source
+    assert 'n001 -> n002: "[STOP]"' in source
+
+
+def test_dense_protocol_state_machine_bundles_parallel_trigger_labels() -> None:
+    states = (
+        ("disconnected", "Déconnecté"),
+        ("connecting", "Connexion en cours"),
+        ("established", "Établi"),
+        ("idle", "Session au repos"),
+        ("preparation", "Préparation"),
+        ("transfer", "Transfert"),
+        ("suspended", "Suspendu"),
+        ("closing", "Fermeture demandée"),
+        ("closed", "Fermée"),
+    )
+    nodes = tuple(
+        _node(node_id, label, role=DiagramNodeRole.PROTOCOL_STATE) for node_id, label in states
+    )
+    self_triggers = ("[PING]", "[PONG]", "[HB]", "[HB_OK]")
     edges = [
-        _edge("state-04", "state-04", label, direction=DiagramRelationDirection.DIRECTED)
+        _edge("idle", "idle", label, direction=DiagramRelationDirection.DIRECTED)
         for label in self_triggers
     ]
     edges.append(
         _edge(
-            "state-06",
-            "state-06",
+            "preparation",
+            "preparation",
             "[PREPARE_PROGRESS]",
             direction=DiagramRelationDirection.DIRECTED,
         )
     )
     edges.extend(
-        _edge(
-            f"state-{index:02d}",
-            f"state-{index + 1:02d}",
-            "[CAL]" if index == 8 else f"[STATE_{index:02d}]",
-            direction=DiagramRelationDirection.DIRECTED,
-        )
-        for index in range(1, 9)
-    )
-    edges.extend(
         (
             _edge(
-                "state-09",
-                "state-08",
+                "disconnected",
+                "connecting",
+                "[WS/TLS]",
+                direction=DiagramRelationDirection.DIRECTED,
+            ),
+            _edge(
+                "connecting",
+                "established",
+                "[WS/TLS]",
+                direction=DiagramRelationDirection.DIRECTED,
+            ),
+            _edge(
+                "established",
+                "idle",
+                "[LAL_P]",
+                direction=DiagramRelationDirection.DIRECTED,
+            ),
+            _edge(
+                "idle",
+                "preparation",
+                "[PREPARE_PROGRESS]",
+                direction=DiagramRelationDirection.DIRECTED,
+            ),
+            _edge(
+                "preparation",
+                "idle",
+                "[PPPP]",
+                direction=DiagramRelationDirection.DIRECTED,
+            ),
+            _edge(
+                "idle",
+                "transfer",
+                "[Binaire]",
+                direction=DiagramRelationDirection.DIRECTED,
+            ),
+            _edge(
+                "transfer",
+                "idle",
+                "[END] [CONFIRMED]",
+                direction=DiagramRelationDirection.DIRECTED,
+            ),
+            _edge(
+                "transfer",
+                "suspended",
                 "[RESUME_OFFSET]",
                 direction=DiagramRelationDirection.DIRECTED,
             ),
             _edge(
-                "state-09",
-                "state-01",
-                "[CLOSE]",
+                "suspended",
+                "transfer",
+                "[CAL]",
+                direction=DiagramRelationDirection.DIRECTED,
+            ),
+            _edge(
+                "idle",
+                "closing",
+                "[DIS]",
+                direction=DiagramRelationDirection.DIRECTED,
+            ),
+            _edge(
+                "closing",
+                "closed",
+                "[DIS_ACK]",
                 direction=DiagramRelationDirection.DIRECTED,
             ),
         )
@@ -686,15 +761,20 @@ def test_dense_protocol_state_machine_bundles_parallel_trigger_labels() -> None:
 
     source = encode_d2_source(diagram).decode()
 
-    assert len(diagram.edges) == 17
-    assert source.count(" -> ") == 10
-    assert source.count(" <-> ") == 1
-    assert source.count("n004 -> n004") == 1
-    assert source.count("n006 -> n006") == 1
-    assert all(label in source for label in (*self_triggers, "[PREPARE_PROGRESS]"))
-    assert "→ [CAL]" in source
-    assert "← [RESUME_OFFSET]" in source
-    assert "[STATE_01]" in source
+    assert len(diagram.edges) == 16
+    assert sum(edge.source_node_id == edge.target_node_id for edge in diagram.edges) == 5
+    assert source.count(" -> ") == 5
+    assert source.count(" <-> ") == 3
+    assert "n004 -> n004" not in source
+    assert "n005 -> n005" not in source
+    assert 'n004: "Session au repos\\n↻ [PING] [PONG] [HB] [HB_OK]"' in source
+    assert 'n005: "Préparation\\n↻ [PREPARE_PROGRESS]"' in source
+    assert all(label in source for label in (*self_triggers, "[PREPARE_PROGRESS]", "[PPPP]"))
+    assert "Session → Prépar.:\\n[PREPARE_PROGRESS]" in source
+    assert "Prépar. → Session: [PPPP]" in source
+    assert "Transf. → Suspendu:\\n[RESUME_OFFSET]" in source
+    assert "Suspendu → Transf.: [CAL]" in source
+    assert "[DIS_ACK]" in source
 
 
 async def test_compile_is_deterministic_for_identical_diagrams() -> None:
