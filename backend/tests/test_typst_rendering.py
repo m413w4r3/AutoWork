@@ -203,6 +203,16 @@ def test_opinion_text_spans_projects_only_balanced_fences_and_preserves_literals
     assert "```" in "".join(span["text"] for span in observation_spans)
 
 
+def test_opinion_inline_code_keeps_neighboring_prose_spaces_outside_technical_span() -> None:
+    spans = _opinion_text_spans("Before `--safe` after")
+
+    assert [(span["text"], span["technical"]) for span in spans] == [
+        ("Before ", False),
+        ("--safe", True),
+        (" after", False),
+    ]
+
+
 def test_opinion_text_spans_refang_known_iocs_outside_fenced_code() -> None:
     known_iocs = (
         (ArtifactType.IP, "203.0.113[.]94", "203.0.113.94"),
