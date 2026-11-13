@@ -1862,7 +1862,8 @@ async def test_real_typst_lot6_a4_composition_fixture(
         value
         for value in (*expected_iocs, *original_iocs)
         # The fixture's observed-artifact table legitimately carries this value in the body.
-        if value != "host-001.long-indicator.example.test" and "".join(value.split()) in compact_text
+        if value != "host-001.long-indicator.example.test"
+        and "".join(value.split()) in compact_text
     )
     assert not visible_iocs, f"Opinion PDF exposes IOC values: {visible_iocs[:8]!r}"
     assert len(png_pages) == len(reader.pages)
