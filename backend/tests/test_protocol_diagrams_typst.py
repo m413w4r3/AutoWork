@@ -1126,8 +1126,8 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
         )
         is None
     )
-    assert "vérification d'affirmation — étayé" in preview_text.casefold()
-    assert "source d'affirmation" in preview_text.casefold()
+    assert "vérification d'affirmation — étayé" not in preview_text.casefold()
+    assert "constats logiques cités" not in preview_text.casefold()
     sha256_field = re.search(r"\b[a-z][a-z0-9_]*_sha256\b", preview_text, re.IGNORECASE)
     assert sha256_field is None
     text_without_content_hex = re.sub(re.escape(long_hex), "", preview_text, flags=re.IGNORECASE)

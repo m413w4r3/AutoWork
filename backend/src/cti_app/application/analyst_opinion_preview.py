@@ -139,7 +139,7 @@ class AnalystOpinionPreviewService:
         )
         if not isinstance(result, tuple):
             raise RuntimeError("Render input preview returned a PDF")
-        return cast(tuple[CanonicalPublicationDocument, dict[str, Any]], result)
+        return result
 
     async def _preview(
         self,

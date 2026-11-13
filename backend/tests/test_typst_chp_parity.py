@@ -2134,7 +2134,8 @@ def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_navigabl
     assert "model_blob_id" not in pdf_text
     assert "rule.test" not in pdf_text
     compact_pdf_text = re.sub(r"\s+", " ", pdf_text).casefold()
-    assert "détection — étayé" in compact_pdf_text
+    assert "détection — étayé" not in compact_pdf_text
+    assert not re.search(r"\[[fe][0-9]+\]", compact_pdf_text)
     assert render_data["document_label"] == (
         f"Aperçu de l'avis v{preview.analyst_opinion.version} — BROUILLON non approuvé"
     )
