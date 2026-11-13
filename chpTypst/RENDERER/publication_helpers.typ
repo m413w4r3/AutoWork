@@ -1279,31 +1279,21 @@
       #let unanchored-observations = content_section.at("unanchored_observations", default: ())
       #let unresolved-points = content_section.at("unresolved_points", default: ())
       #let protocol-figures = content_section.at("protocol_figures", default: ())
+      // The derived reference chain and infrastructure relation tables are internal
+      // traceability material: they stay in the render data but are not shown to readers.
       #let has-opinion-content = (
         opinion-blocks.len() > 0
         or content_section.at("has_anchored_observations", default: false)
         or unanchored-observations.len() > 0
         or unresolved-points.len() > 0
         or protocol-figures.len() > 0
-        or content_section.at("investigation_chain_figure", default: none) != none
-        or content_section.at("infrastructure_graph_figure", default: none) != none
       )
       #if has-opinion-content [
       #let has-opinion-extras = (
         unresolved-points.len() > 0
         or unanchored-observations.len() > 0
-        or content_section.at("investigation_chain_figure", default: none) != none
-        or content_section.at("infrastructure_graph_figure", default: none) != none
       )
       #let opinion-extras = [
-          #if content_section.at("investigation_chain_figure", default: none) != none [
-            #v(8pt)
-            #render-investigation-chain-figure(content_section.investigation_chain_figure, reference-scope: reference-scope)
-          ]
-          #if content_section.at("infrastructure_graph_figure", default: none) != none [
-            #v(8pt)
-            #render-infrastructure-graph-figure(content_section.infrastructure_graph_figure, reference-scope: reference-scope)
-          ]
           #if unresolved-points.len() > 0 [
             #heading(level: 3)[Points non résolus]
         #let unresolved-point-render-data = content_section.at(

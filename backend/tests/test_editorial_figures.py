@@ -8,7 +8,6 @@ import subprocess
 import xml.etree.ElementTree as ET
 from dataclasses import replace
 from datetime import UTC, date, datetime
-from itertools import pairwise
 from pathlib import Path
 from uuid import UUID
 
@@ -671,7 +670,9 @@ async def test_real_typst_renders_native_timeline_and_anchored_chain(
         for character in approved_opinion_text.replace("\u00ad", "")
         if not character.isspace()
     )
-    assert "Référencesdel'avis" in normalized_approved_opinion
+    # The derived reference-chain and infrastructure-relation figures are internal traceability:
+    # they stay in the render data but are never shown in reader PDFs.
+    assert "Référencesdel'avis" not in normalized_approved_opinion
     assert "Chronologie" in normalized
     timeline_start = extracted.index("Chronologie")
     timeline_end = extracted.index("Synthèse", timeline_start)
@@ -688,19 +689,19 @@ async def test_real_typst_renders_native_timeline_and_anchored_chain(
     assert "lead:0001" not in preview_text
     assert "SourceSHA-256" not in normalized
     assert "SourceSHA-256" not in normalized_preview
-    assert "Graphed'infrastructureetdepivots" in normalized_preview
-    assert "domainescontactés" in normalized_preview
-    assert "VirusTotal" in normalized_preview
-    assert "Shodan" in normalized_preview
-    assert "Article" in normalized_preview
-    assert "affirmationfournisseur" in normalized_preview
-    assert "confiancerestenonévaluée" in normalized_preview
+    assert "Graphed'infrastructureetdepivots" not in normalized_preview
+    assert "domainescontactés" not in normalized_preview
+    assert "VirusTotal" not in normalized_preview
+    assert "Shodan" not in normalized_preview
+    assert "Article" not in normalized_preview
+    assert "affirmationfournisseur" not in normalized_preview
+    assert "confiancerestenonévaluée" not in normalized_preview
     assert re.search(r"confiance\s*:\s*\d+\s*%", preview_text, flags=re.IGNORECASE) is None
-    assert "nonévaluée" in normalized_preview
-    assert "pivotverscible" in normalized_preview
-    assert "dns:A" in preview_text
-    assert "mentions IOC" in preview_text
-    assert "pivot.example" in normalized_preview
+    assert "nonévaluée" not in normalized_preview
+    assert "pivotverscible" not in normalized_preview
+    assert "dns:A" not in preview_text
+    assert "mentions IOC" not in preview_text
+    assert "pivot.example" not in normalized_preview
     assert infrastructure_graph.sha256 not in normalized_preview
     assert "PreuveSHA-256" not in normalized
     assert "PreuveSHA-256" not in normalized_preview
@@ -744,44 +745,13 @@ async def test_real_typst_renders_native_timeline_and_anchored_chain(
         ]
 
     def assert_figure_caption_spacing(pages: list[list[tuple[float, float, str]]]) -> int:
-        page_index = next(
-            index
-            for index, lines in enumerate(pages)
-            if any("Graphe d'infrastructure et de pivots" in text for _, _, text in lines)
-        )
-        image_page = pages[page_index]
-        assert all(
-            not text.startswith(("Source :", "Attribution :"))
-            for _y_min, _y_max, text in image_page
-        )
-
-        graph_caption = next(
-            line for line in image_page if "Graphe d'infrastructure et de pivots" in line[2]
-        )
-        graph_description = next(
-            line for line in image_page if line[2].startswith("Les flèches représentent")
-        )
-        assert graph_caption[1] <= graph_description[0], (
-            "infrastructure graph caption overlaps its description: "
-            f"{graph_caption} / {graph_description}"
-        )
-
-        legend_page = next(
-            lines for lines in pages if any(text.startswith("Légende :") for _, _, text in lines)
-        )
-        legend_start = next(
-            i for i, (_, _, text) in enumerate(legend_page) if text.startswith("Légende :")
-        )
-        # Keep the footer out of the body spacing check.
-        legend_lines = [
-            line
-            for line in legend_page[legend_start:]
-            if line[2] != "BROUILLON NON APPROUVÉ"
-            and re.fullmatch(r"\d+\s*/\s*\d+", line[2]) is None
-        ]
-        for previous, current in pairwise(legend_lines):
-            assert previous[1] <= current[0], f"graph legend lines overlap: {previous} / {current}"
-        return page_index
+        # The infrastructure graph and its relation tables are internal traceability material:
+        # reader PDFs must not show their caption, description or legend.
+        for lines in pages:
+            for _y_min, _y_max, text in lines:
+                assert "Graphe d'infrastructure et de pivots" not in text
+                assert not text.startswith(("Les flèches représentent", "Légende :"))
+        return 0
 
     for label, pdf_path in (("v5-preview", preview_pdf), ("v6-opinion", opinion_pdf)):
         bbox_pages = await read_bbox_pages(pdf_path)
