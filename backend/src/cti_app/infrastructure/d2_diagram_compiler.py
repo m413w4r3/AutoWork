@@ -28,6 +28,7 @@ from cti_app.application.diagram_compilation import (
     DiagramCompilerVersionError,
 )
 from cti_app.domain.production_editorial_enrichment import (
+    DiagramEdgeV1,
     DiagramNodeRole,
     DiagramProfile,
     DiagramRelationDirection,
@@ -41,6 +42,11 @@ D2_SOURCE_ENCODING = "utf-8"
 D2_MEDIA_TYPE = "image/svg+xml"
 D2_LAYOUT = "elk"
 D2_LAYOUT_OPTIONS = ("--pad=8", "--elk-nodeNodeBetweenLayers=15")
+D2_DENSE_STATE_LAYOUT_OPTIONS = (
+    "--pad=8",
+    "--elk-nodeNodeBetweenLayers=20",
+    "--elk-edgeNodeBetweenLayers=10",
+)
 D2_COMPILER_VERSION = "0.9.0"
 # These are rendering constraints. Keep them separate from enrichment's
 # normalization policy, whose thresholds are part of the stored artifact contract.
@@ -127,6 +133,15 @@ _LABEL_ESCAPES = {
 }
 
 
+@dataclass(frozen=True, slots=True)
+class _D2EdgeRendering:
+    source_node_id: str
+    target_node_id: str
+    label: str | None
+    relation_type: DiagramRelationType
+    connector: str
+
+
 def _ref_projection(ref: Any) -> dict[str, str]:
     return {
         "source_document_id": str(ref.source_document_id),
@@ -206,6 +221,8 @@ def _node_references(diagram: DiagramSpecV1) -> dict[str, str]:
 
 def _layout_font_sizes(diagram: DiagramSpecV1, *, force_vertical: bool) -> tuple[int, int, int]:
     """Keep small graphs close to body size and scale denser horizontal graphs up."""
+    if _is_dense_protocol_state_machine(diagram):
+        return 20, 13, 40
     if diagram.profile in {
         DiagramProfile.PROTOCOL_SEQUENCE,
         DiagramProfile.PROTOCOL_STATE_MACHINE,
@@ -230,8 +247,110 @@ def _d2_requires_vertical_layout(node_count: int, labels: Sequence[str]) -> bool
     )
 
 
+def _is_dense_protocol_state_machine(diagram: DiagramSpecV1) -> bool:
+    return (
+        diagram.profile is DiagramProfile.PROTOCOL_STATE_MACHINE
+        and (len(diagram.nodes) > 8 or len(diagram.edges) > 8)
+        and len(diagram.nodes) <= 16
+        and len(diagram.edges) <= 24
+    )
+
+
+def _edge_renderings(diagram: DiagramSpecV1) -> tuple[_D2EdgeRendering, ...]:
+    """Bundle dense parallel transitions without changing the validated graph.
+
+    One loop arrow lists every trigger for that same-state transition. Opposite
+    transitions share a bidirectional connector with an explicit direction on
+    each trigger label, avoiding D2's overlapping parallel-edge labels.
+    """
+    if not _is_dense_protocol_state_machine(diagram):
+        return tuple(
+            _D2EdgeRendering(
+                edge.source_node_id,
+                edge.target_node_id,
+                edge.label,
+                edge.relation_type,
+                "->"
+                if edge.direction is DiagramRelationDirection.DIRECTED
+                and edge.relation_type is not DiagramRelationType.COMPARISON
+                else "--",
+            )
+            for edge in diagram.edges
+        )
+
+    edge_groups: dict[
+        tuple[str, str, DiagramRelationType, int | None], list[DiagramEdgeV1]
+    ] = {}
+    for index, edge in enumerate(diagram.edges):
+        if (
+            edge.direction is DiagramRelationDirection.DIRECTED
+            and edge.relation_type is not DiagramRelationType.COMPARISON
+        ):
+            left, right = sorted((edge.source_node_id, edge.target_node_id))
+            key = (left, right, edge.relation_type, None)
+        else:
+            key = (edge.source_node_id, edge.target_node_id, edge.relation_type, index)
+        edge_groups.setdefault(key, []).append(edge)
+
+    rendered: list[_D2EdgeRendering] = []
+    for (left, right, relation_type, unique_index), edges in edge_groups.items():
+        can_bundle = (
+            unique_index is None
+            and len(edges) > 1
+            and all(edge.label for edge in edges)
+        )
+        if not can_bundle:
+            rendered.extend(
+                _D2EdgeRendering(
+                    edge.source_node_id,
+                    edge.target_node_id,
+                    edge.label,
+                    edge.relation_type,
+                    "->"
+                    if edge.direction is DiagramRelationDirection.DIRECTED
+                    and edge.relation_type is not DiagramRelationType.COMPARISON
+                    else "--",
+                )
+                for edge in edges
+            )
+            continue
+
+        forward = tuple(edge for edge in edges if edge.source_node_id == left)
+        reverse = tuple(edge for edge in edges if edge.source_node_id == right)
+        if left != right and forward and reverse:
+            forward_labels = _wrap_d2_label(
+                " ".join(edge.label or "" for edge in forward), width=24
+            )
+            reverse_labels = _wrap_d2_label(
+                " ".join(edge.label or "" for edge in reverse), width=24
+            )
+            label = f"→ {forward_labels}\n← {reverse_labels}"
+            source_node_id, target_node_id, connector = left, right, "<->"
+        else:
+            labels = _wrap_d2_label(" ".join(edge.label or "" for edge in edges), width=24)
+            source_node_id, target_node_id, connector = (
+                edges[0].source_node_id,
+                edges[0].target_node_id,
+                "->",
+            )
+            label = labels
+        rendered.append(
+            _D2EdgeRendering(
+                source_node_id,
+                target_node_id,
+                label,
+                relation_type,
+                connector,
+            )
+        )
+    return tuple(rendered)
+
+
 def encode_d2_source(diagram: DiagramSpecV1) -> bytes:
     """Encode the canonical graph using only synthetic D2 identifiers."""
+    if _uses_dense_protocol_sequence_shape(diagram):
+        return _encode_dense_protocol_sequence(diagram)
+
     node_references = _node_references(diagram)
     stack_unconnected_protocol_view = (
         diagram.profile
@@ -306,18 +425,17 @@ def encode_d2_source(diagram: DiagramSpecV1) -> bytes:
             )
         )
 
-    for edge in diagram.edges:
-        connector = (
-            "->"
-            if edge.direction is DiagramRelationDirection.DIRECTED
-            and edge.relation_type is not DiagramRelationType.COMPARISON
-            else "--"
-        )
+    dense_state_machine = _is_dense_protocol_state_machine(diagram)
+    for edge in _edge_renderings(diagram):
         line = (
-            f"{node_references[edge.source_node_id]} {connector} "
+            f"{node_references[edge.source_node_id]} {edge.connector} "
             f"{node_references[edge.target_node_id]}"
         )
-        edge_wrap_width = 12 if edge_font_size > _EDGE_FONT_SIZE else 24
+        edge_wrap_width = (
+            24
+            if dense_state_machine or edge_font_size <= _EDGE_FONT_SIZE
+            else 12
+        )
         label = _wrap_d2_label(edge.label or "", width=edge_wrap_width)
         if label:
             line += f": {_escape_d2_label(label)}"
@@ -385,6 +503,92 @@ def _is_protocol_profile(diagram: DiagramSpecV1) -> bool:
         DiagramProfile.PROTOCOL_STATE_MACHINE,
         DiagramProfile.PROTOCOL_MESSAGE_FORMAT,
     }
+
+
+def _uses_dense_protocol_sequence_shape(diagram: DiagramSpecV1) -> bool:
+    return (
+        diagram.profile is DiagramProfile.PROTOCOL_SEQUENCE
+        and len(diagram.edges) > 8
+        and not diagram.groups
+        and all(node.role is DiagramNodeRole.PROTOCOL_PARTICIPANT for node in diagram.nodes)
+        and all(
+            edge.direction is DiagramRelationDirection.DIRECTED
+            and edge.relation_type is not DiagramRelationType.COMPARISON
+            for edge in diagram.edges
+        )
+    )
+
+
+def _encode_dense_protocol_sequence(diagram: DiagramSpecV1) -> bytes:
+    """Encode ordered dense protocol messages with D2's native lifeline shape."""
+    node_references = _node_references(diagram)
+    panel_size = (len(diagram.edges) + 1) // 2
+    lines = [
+        "protocol_view: {",
+        '  label: ""',
+        "  grid-columns: 2",
+        "  style: {",
+        '    fill: "#FFFFFF"',
+        '    stroke: "#FFFFFF"',
+        '    font-color: "#FFFFFF"',
+        "    stroke-width: 0",
+        "  }",
+    ]
+    for panel_index, start in enumerate(range(0, len(diagram.edges), panel_size), 1):
+        panel_edges = diagram.edges[start : start + panel_size]
+        first_number = start + 1
+        last_number = start + len(panel_edges)
+        lines.extend(
+            (
+                f"  panel{panel_index:02d}: {{",
+                f'    label: "Messages {first_number:02d}\u2013{last_number:02d}"',
+                "    shape: sequence_diagram",
+            )
+        )
+        for node in diagram.nodes:
+            reference = node_references[node.node_id]
+            label = _wrap_d2_label(node.label, width=28, wrap_long_tokens=True)
+            lines.append(f"    {reference}: {_escape_d2_label(label)}")
+        for edge in panel_edges:
+            line = (
+                f"    {node_references[edge.source_node_id]} -> "
+                f"{node_references[edge.target_node_id]}: "
+                f"{_escape_d2_label(_wrap_d2_label(edge.label or '', width=32))}"
+            )
+            color = (
+                _PROTOCOL_STATUS_COLORS["INFERRED"][0]
+                if edge.relation_type is DiagramRelationType.PROTOCOL_INFERENCE
+                else _EDGE_COLOR
+            )
+            lines.extend(
+                (
+                    line + " {",
+                    "      style: {",
+                    f'        stroke: "{color}"',
+                    f'        font-color: "{_EDGE_COLOR}"',
+                    "        font-size: 16",
+                    "        italic: false",
+                    "        stroke-width: 1",
+                    *(
+                        ("        stroke-dash: 5",)
+                        if edge.relation_type is DiagramRelationType.PROTOCOL_INFERENCE
+                        else ()
+                    ),
+                    "      }",
+                    "    }",
+                )
+            )
+        lines.append("  }")
+    lines.append("}")
+    return ("\n".join(lines) + "\n").encode(D2_SOURCE_ENCODING)
+
+
+def _layout_options_for_diagram(diagram: DiagramSpecV1) -> tuple[str, ...]:
+    return (
+        D2_DENSE_STATE_LAYOUT_OPTIONS
+        if _is_dense_protocol_state_machine(diagram)
+        else D2_LAYOUT_OPTIONS
+    )
 
 
 def _protocol_status(label: str) -> str | None:
@@ -793,7 +997,11 @@ class D2DiagramCompiler:
 
     async def compile(self, diagram: DiagramSpecV1) -> CompiledDiagram:
         source_bytes = encode_d2_source(diagram)
-        compiled = await self.compile_source(diagram_key=diagram.key, source_bytes=source_bytes)
+        compiled = await self.compile_source(
+            diagram_key=diagram.key,
+            source_bytes=source_bytes,
+            layout_options=_layout_options_for_diagram(diagram),
+        )
         rendered_svg = _add_group_label_tabs(compiled.media_bytes, diagram)
         validate_d2_svg(rendered_svg)
         return CompiledDiagram(
@@ -809,7 +1017,13 @@ class D2DiagramCompiler:
             compiler_policy_version=DIAGRAM_COMPILATION_POLICY_VERSION,
         )
 
-    async def compile_source(self, *, diagram_key: str, source_bytes: bytes) -> CompiledDiagram:
+    async def compile_source(
+        self,
+        *,
+        diagram_key: str,
+        source_bytes: bytes,
+        layout_options: Sequence[str] = D2_LAYOUT_OPTIONS,
+    ) -> CompiledDiagram:
         """Compile deterministic application-generated D2 source without model adaptation."""
         if not diagram_key.strip() or not source_bytes or len(source_bytes) > D2_MAX_STDIN_BYTES:
             raise ValueError("D2 source identity and bounded source bytes are required")
@@ -823,7 +1037,7 @@ class D2DiagramCompiler:
             (
                 self._binary,
                 f"--layout={D2_LAYOUT}",
-                *D2_LAYOUT_OPTIONS,
+                *layout_options,
                 f"--timeout={D2_COMPILATION_TIMEOUT_SECONDS}",
                 "--omit-version",
                 f"--salt={source_sha256}",
@@ -860,7 +1074,7 @@ class D2DiagramCompiler:
             (
                 self._binary,
                 f"--layout={D2_LAYOUT}",
-                *D2_LAYOUT_OPTIONS,
+                *_layout_options_for_diagram(diagram),
                 f"--timeout={D2_COMPILATION_TIMEOUT_SECONDS}",
                 "--omit-version",
                 f"--salt={source_sha256}",

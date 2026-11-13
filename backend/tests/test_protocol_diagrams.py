@@ -348,6 +348,12 @@ def test_protocol_pin_hash_covers_semantics_and_compiler_identity() -> None:
 
     assert pin == protocol_diagram_pin_sha256(spec, compiler="d2", compiler_version="0.9.0")
     assert pin != protocol_diagram_pin_sha256(spec, compiler="d2", compiler_version="0.9.1")
+    assert pin != protocol_diagram_pin_sha256(
+        spec,
+        compiler="d2",
+        compiler_version="0.9.0",
+        compiler_policy_version="previous-policy",
+    )
     changed = _spec(
         ProtocolDiagramKind.SEQUENCE,
         nodes=spec.nodes,
