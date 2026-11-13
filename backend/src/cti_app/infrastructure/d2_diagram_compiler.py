@@ -608,6 +608,11 @@ def _wrap_d2_label(
     wrap_long_tokens: bool = False,
 ) -> str:
     """Wrap between words, optionally wrapping long protocol tokens intact."""
+    if "\n" in value:
+        return "\n".join(
+            _wrap_d2_label(line, width, wrap_long_tokens=wrap_long_tokens)
+            for line in value.split("\n")
+        )
     words = value.split()
     if not words:
         return value
