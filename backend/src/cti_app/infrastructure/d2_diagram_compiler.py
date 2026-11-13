@@ -223,7 +223,7 @@ def _node_references(diagram: DiagramSpecV1) -> dict[str, str]:
 def _layout_font_sizes(diagram: DiagramSpecV1, *, force_vertical: bool) -> tuple[int, int, int]:
     """Keep small graphs close to body size and scale denser horizontal graphs up."""
     if _is_dense_protocol_state_machine(diagram):
-        return 20, 13, 40
+        return 20, 12, 40
     if diagram.profile in {
         DiagramProfile.PROTOCOL_SEQUENCE,
         DiagramProfile.PROTOCOL_STATE_MACHINE,
@@ -257,12 +257,101 @@ def _is_dense_protocol_state_machine(diagram: DiagramSpecV1) -> bool:
     )
 
 
+def _protocol_state_machine_auto_transition_labels(
+    diagram: DiagramSpecV1,
+) -> dict[str, tuple[str, ...]]:
+    """Show state-machine auto-transitions in their state node labels."""
+    if diagram.profile is not DiagramProfile.PROTOCOL_STATE_MACHINE:
+        return {}
+
+    groups: dict[tuple[str, DiagramRelationType, int | None], list[DiagramEdgeV1]] = {}
+    for index, edge in enumerate(diagram.edges):
+        if edge.source_node_id != edge.target_node_id:
+            continue
+        if (
+            edge.direction is DiagramRelationDirection.DIRECTED
+            and edge.relation_type is not DiagramRelationType.COMPARISON
+        ):
+            key = (edge.source_node_id, edge.relation_type, None)
+        else:
+            key = (edge.source_node_id, edge.relation_type, index)
+        groups.setdefault(key, []).append(edge)
+
+    labels_by_node: dict[str, list[str]] = {}
+    for (node_id, _relation_type, _unique_index), edges in groups.items():
+        triggers = " ".join(edge.label for edge in edges if edge.label)
+        label = f"↻ {triggers}" if triggers else "↻"
+        labels_by_node.setdefault(node_id, []).append(label)
+    return {node_id: tuple(labels) for node_id, labels in labels_by_node.items()}
+
+
+def _is_protocol_state_machine_auto_transition(
+    diagram: DiagramSpecV1,
+    edge: DiagramEdgeV1,
+) -> bool:
+    return (
+        diagram.profile is DiagramProfile.PROTOCOL_STATE_MACHINE
+        and edge.source_node_id == edge.target_node_id
+    )
+
+
+def _directed_transition_group_label(
+    edges: Sequence[DiagramEdgeV1],
+    node_labels: Mapping[str, str],
+) -> str:
+    edge = edges[0]
+    source_label = node_labels[edge.source_node_id]
+    target_label = node_labels[edge.target_node_id]
+    triggers = " ".join(item.label for item in edges if item.label)
+    transition = f"{source_label} → {target_label}"
+    return f"{transition}: {triggers}" if triggers else transition
+
+
+def _state_transition_node_labels(diagram: DiagramSpecV1) -> dict[str, str]:
+    """Use short, unique state names in reciprocal edge labels when possible."""
+    labels = {node.node_id: " ".join(node.label.split()) for node in diagram.nodes}
+    words = {node_id: label.split() for node_id, label in labels.items()}
+    label_word_counts = {
+        node_id: (1 if len(parts) > 1 else len(parts)) for node_id, parts in words.items()
+    }
+
+    def shorten(label: str, word_count: int) -> str:
+        prefix = " ".join(label.split()[:word_count])
+        return f"{prefix[:6].rstrip()}." if word_count == 1 and len(prefix) > 8 else prefix
+
+    abbreviations = {
+        node_id: shorten(labels[node_id], label_word_counts[node_id]) for node_id in labels
+    }
+
+    while True:
+        duplicate_labels = {
+            label
+            for label in abbreviations.values()
+            if sum(candidate == label for candidate in abbreviations.values()) > 1
+        }
+        if not duplicate_labels:
+            break
+        changed = False
+        for node_id, abbreviation in abbreviations.items():
+            if abbreviation not in duplicate_labels:
+                continue
+            if label_word_counts[node_id] < len(words[node_id]):
+                label_word_counts[node_id] += 1
+                abbreviations[node_id] = shorten(labels[node_id], label_word_counts[node_id])
+                changed = True
+            else:
+                abbreviations[node_id] = labels[node_id]
+        if not changed:
+            break
+    return abbreviations
+
+
 def _edge_renderings(diagram: DiagramSpecV1) -> tuple[_D2EdgeRendering, ...]:
     """Bundle dense parallel transitions without changing the validated graph.
 
-    One loop arrow lists every trigger for that same-state transition. Opposite
-    transitions share a bidirectional connector with an explicit direction on
-    each trigger label, avoiding D2's overlapping parallel-edge labels.
+    State-machine auto-transitions are projected into their node labels.
+    Opposite transitions share a bidirectional connector with the source and
+    target named in each trigger label, avoiding ambiguous direction prefixes.
     """
     if not _is_dense_protocol_state_machine(diagram):
         return tuple(
@@ -277,22 +366,29 @@ def _edge_renderings(diagram: DiagramSpecV1) -> tuple[_D2EdgeRendering, ...]:
                 else "--",
             )
             for edge in diagram.edges
+            if not _is_protocol_state_machine_auto_transition(diagram, edge)
         )
 
     edge_groups: dict[tuple[str, str, DiagramRelationType, int | None], list[DiagramEdgeV1]] = {}
+    node_order = {node.node_id: index for index, node in enumerate(diagram.nodes)}
     for index, edge in enumerate(diagram.edges):
+        if _is_protocol_state_machine_auto_transition(diagram, edge):
+            continue
         key: tuple[str, str, DiagramRelationType, int | None]
         if (
             edge.direction is DiagramRelationDirection.DIRECTED
             and edge.relation_type is not DiagramRelationType.COMPARISON
         ):
-            left, right = sorted((edge.source_node_id, edge.target_node_id))
+            left, right = edge.source_node_id, edge.target_node_id
+            if node_order[left] > node_order[right]:
+                left, right = right, left
             key = (left, right, edge.relation_type, None)
         else:
             key = (edge.source_node_id, edge.target_node_id, edge.relation_type, index)
         edge_groups.setdefault(key, []).append(edge)
 
     rendered: list[_D2EdgeRendering] = []
+    node_labels = _state_transition_node_labels(diagram)
     for (left, right, relation_type, unique_index), edges in edge_groups.items():
         can_bundle = unique_index is None and len(edges) > 1 and all(edge.label for edge in edges)
         if not can_bundle:
@@ -314,13 +410,9 @@ def _edge_renderings(diagram: DiagramSpecV1) -> tuple[_D2EdgeRendering, ...]:
         forward = tuple(edge for edge in edges if edge.source_node_id == left)
         reverse = tuple(edge for edge in edges if edge.source_node_id == right)
         if left != right and forward and reverse:
-            forward_labels = _wrap_d2_label(
-                " ".join(edge.label or "" for edge in forward), width=24
-            )
-            reverse_labels = _wrap_d2_label(
-                " ".join(edge.label or "" for edge in reverse), width=24
-            )
-            label = f"→ {forward_labels}\n← {reverse_labels}"
+            forward_label = _directed_transition_group_label(forward, node_labels)
+            reverse_label = _directed_transition_group_label(reverse, node_labels)
+            label = f"{forward_label}\n{reverse_label}"
             source_node_id, target_node_id, connector = left, right, "<->"
         else:
             labels = _wrap_d2_label(" ".join(edge.label or "" for edge in edges), width=24)
@@ -361,6 +453,8 @@ def encode_d2_source(diagram: DiagramSpecV1) -> bytes:
     # Treat stored vertical directions from older enrichment versions as derived
     # layout choices. Compact graphs now use the print-safe horizontal default.
     graph_labels = [node.label for node in diagram.nodes]
+    auto_transition_labels = _protocol_state_machine_auto_transition_labels(diagram)
+    graph_labels.extend(label for labels in auto_transition_labels.values() for label in labels)
     graph_labels.extend(edge.label or "" for edge in diagram.edges)
     graph_labels.extend(group.label for group in diagram.groups)
     # Sequence views use a top-to-bottom graph for the print column. D2's native
@@ -399,8 +493,9 @@ def encode_d2_source(diagram: DiagramSpecV1) -> bytes:
             if protocol_status is not None
             else (_NODE_STROKE_BY_ROLE[node.role], _NODE_FILL)
         )
+        node_label = "\n".join((node.label, *auto_transition_labels.get(node.node_id, ())))
         label = _wrap_d2_label(
-            node.label,
+            node_label,
             width=node_wrap_width,
             wrap_long_tokens=diagram.profile is DiagramProfile.PROTOCOL_SEQUENCE,
         )
@@ -427,7 +522,9 @@ def encode_d2_source(diagram: DiagramSpecV1) -> bytes:
             f"{node_references[edge.source_node_id]} {edge.connector} "
             f"{node_references[edge.target_node_id]}"
         )
-        edge_wrap_width = 24 if dense_state_machine or edge_font_size <= _EDGE_FONT_SIZE else 12
+        edge_wrap_width = (
+            28 if dense_state_machine else 24 if edge_font_size <= _EDGE_FONT_SIZE else 12
+        )
         label = _wrap_d2_label(edge.label or "", width=edge_wrap_width)
         if label:
             line += f": {_escape_d2_label(label)}"
