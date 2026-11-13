@@ -552,21 +552,6 @@
   ]
 }
 
-#let render-opinion-citations(references, reference-scope: "") = {
-  if references.len() > 0 [
-    #v(3pt)
-    #text(size: 7pt, fill: grey)[Références : ]
-    #for (index, reference) in references.enumerate() [
-      #if index > 0 [ · ]
-      #render-opinion-reference(
-        reference.target_id,
-        [#reference.label],
-        reference-scope: reference-scope,
-      )
-    ]
-  ]
-}
-
 #let render-opinion-text(
   spans,
   fallback,
@@ -694,17 +679,6 @@
   ]
 }
 
-#let render-opinion-references(references, reference-scope: "") = {
-  for (index, reference) in references.enumerate() [
-    #if index > 0 [ · ]
-    #render-opinion-reference(
-      reference.target_id,
-      [#reference.label],
-      reference-scope: reference-scope,
-    )
-  ]
-}
-
 #let render-source-references(references, reference-scope: "") = {
   for (index, source-ref) in references.enumerate() [
     #if index > 0 [, ]
@@ -719,36 +693,22 @@
   ]
 }
 
+#let render-opinion-references(references, reference-scope: "") = {
+  for (index, reference) in references.enumerate() [
+    #if index > 0 [ · ]
+    #render-opinion-reference(
+      reference.target_id,
+      [#reference.label],
+      reference-scope: reference-scope,
+    )
+  ]
+}
+
 #let render-opinion-ioc-reference() = {
   v(16pt)
   text(size: 9pt, fill: grey)[
     Les indicateurs de compromission de cet avis (fichiers et réseau) sont repris dans le
     tableau récapitulatif des IOC du bulletin et dans les annexes CSV du dossier de livraison.
-  ]
-}
-
-#let render-opinion-traceability(section, reference-scope: "") = {
-  let opinion-refs = section.at("opinion_refs", default: ())
-  if opinion-refs.len() > 0 [
-    #v(10pt)
-    #render-section-heading[ANNEXE DE TRAÇABILITÉ]
-    #text(size: 8pt, fill: grey)[Les renvois du corps identifient les constats et observations cités.]
-    #let finding-refs = opinion-refs.filter(item => item.at("kind", default: "") == "finding")
-    #let evidence-refs = opinion-refs.filter(item => item.at("kind", default: "") == "evidence")
-    #for (group-title, refs) in (("Constats logiques cités", finding-refs), ("Observations", evidence-refs)) [
-      #if refs.len() > 0 [
-        #v(4pt)
-        #text(size: 8pt, weight: "bold")[#group-title]
-        #for item in refs [
-          #block(above: 1pt, below: 1pt, breakable: true)[
-            #text(size: 7.5pt, weight: "bold")[#item.label]
-            #label(reference-scope + item.target_id)
-            #h(0.35em)
-            #text(size: 7.5pt)[#item.display_label]
-          ]
-        ]
-      ]
-    ]
   ]
 }
 
@@ -788,13 +748,6 @@
         radius: 3pt,
         breakable: true,
       )[
-        #let finding-refs = row.at("finding_refs", default: ())
-        #let evidence-refs = row.at("evidence_refs", default: ())
-        #if finding-refs.len() > 0 or evidence-refs.len() > 0 [
-          #render-opinion-references(finding-refs, reference-scope: reference-scope)
-          #if finding-refs.len() > 0 and evidence-refs.len() > 0 [ · ]
-          #render-opinion-references(evidence-refs, reference-scope: reference-scope)
-        ]
       ]
     ]
   ]
@@ -828,14 +781,6 @@
     #if edge.at("observed_at", default: none) != none [
       #linebreak()
       #text(size: 7pt, fill: grey)[Observé le #edge.observed_at]
-    ]
-    #let finding-refs = edge.at("finding_refs", default: ())
-    #let evidence-refs = edge.at("evidence_refs", default: ())
-    #if finding-refs.len() > 0 or evidence-refs.len() > 0 [
-      #linebreak()
-      #render-opinion-references(finding-refs, reference-scope: reference-scope)
-      #if finding-refs.len() > 0 and evidence-refs.len() > 0 [ · ]
-      #render-opinion-references(evidence-refs, reference-scope: reference-scope)
     ]
   ])
 
@@ -1058,21 +1003,22 @@
   reference-scope: "",
   panel: true,
   analyst-opinion-style: false,
+  show-internal-references: true,
 ) = {
   let finding-refs = item.at("finding_refs", default: ())
   let evidence-refs = item.at("evidence_refs", default: ())
+  let should-show-internal-references = (
+    show-internal-references
+    and not analyst-opinion-style
+    and (finding-refs.len() > 0 or evidence-refs.len() > 0)
+  )
   let content = [
     #render-opinion-text(
       item.at("text_spans", default: none),
       item.text,
       analyst-opinion-style: analyst-opinion-style,
     )
-    #if analyst-opinion-style [
-      #render-opinion-citations(
-        finding-refs + evidence-refs,
-        reference-scope: reference-scope,
-      )
-    ] else if finding-refs.len() > 0 or evidence-refs.len() > 0 [
+    #if should-show-internal-references [
       #v(3pt)
       #text(size: 7pt, fill: grey)[Références : ]
       #render-opinion-references(finding-refs, reference-scope: reference-scope)
@@ -1089,6 +1035,7 @@
   paragraph-gap: 0pt,
   legacy-paragraph-spacing: false,
   article-style: false,
+  opinion-publication: false,
 ) = {
   let body = if item.type == "section_heading" {
     heading(level: 2)[#item.text]
@@ -1107,7 +1054,11 @@
     ]
   } else if item.type == "analyst_observation" {
     block(above: 10pt, below: 8pt)[
-      #render-analyst-observation(item, reference-scope: reference-scope)
+      #render-analyst-observation(
+        item,
+        reference-scope: reference-scope,
+        show-internal-references: not opinion-publication,
+      )
     ]
   } else if item.type == "table" {
     render-table(item, article-style: article-style)
@@ -1160,7 +1111,11 @@
   let blocks = content-section.at("blocks", default: ())
   if brief-publication and not opinion-publication {
     for item in blocks {
-      render-body-block(item, reference-scope: reference-scope)
+      render-body-block(
+        item,
+        reference-scope: reference-scope,
+        opinion-publication: opinion-publication,
+      )
     }
   } else if entries.len() > 0 or blocks.len() > 0 [
     #if content-section.at("show_heading", default: true) [
@@ -1175,7 +1130,11 @@
       )
     ]
     #for item in blocks {
-      render-body-block(item, reference-scope: reference-scope)
+      render-body-block(
+        item,
+        reference-scope: reference-scope,
+        opinion-publication: opinion-publication,
+      )
     }
   ]
 }
@@ -1239,6 +1198,7 @@
             item,
             reference-scope: reference-scope,
             paragraph-gap: if has-next-paragraph { 9pt } else { 0pt },
+            opinion-publication: opinion-publication,
           )
         }
       ] else if article-publication [
@@ -1258,6 +1218,7 @@
             reference-scope: reference-scope,
             paragraph-gap: if has-next-paragraph { 9pt } else { 0pt },
             article-style: true,
+            opinion-publication: opinion-publication,
           )
         }
       ] else [
@@ -1268,6 +1229,7 @@
             reference-scope: reference-scope,
             paragraph-gap: 5pt,
             legacy-paragraph-spacing: true,
+            opinion-publication: opinion-publication,
           )
         }
       ]
@@ -1380,10 +1342,6 @@
               pipe-table: pipe-table,
               analyst-opinion-style: true,
             )
-            #render-opinion-citations(
-              item.finding_refs + item.evidence_refs,
-              reference-scope: reference-scope,
-            )
             #parbreak()
           ]
           #opinion-extras
@@ -1410,10 +1368,6 @@
                 pipe-table,
                 footer-note: pipe-table.at("suffix", default: none),
               )
-              #render-opinion-citations(
-                item.finding_refs + item.evidence_refs,
-                reference-scope: reference-scope,
-              )
             ]
             #set page(flipped: false)
             #parbreak()
@@ -1427,10 +1381,6 @@
                 item.text,
                 pipe-table: pipe-table,
                 analyst-opinion-style: true,
-              )
-              #render-opinion-citations(
-                item.finding_refs + item.evidence_refs,
-                reference-scope: reference-scope,
               )
             ]
             #parbreak()
@@ -1474,13 +1424,15 @@
             #text(size: 7pt)[SHA-256 de l’échantillon : ]
             #text(font: code-font-families, size: 7pt, hyphenate: false)[#text(sample-sha256)]
           ]
-          #linebreak()
-          #text(size: 7pt)[Observation de preuve : ]
-          #render-opinion-reference(
-            item.evidence_ref.target_id,
-            [#text(item.evidence_ref.label)],
-            reference-scope: reference-scope,
-          )
+          #if not opinion-publication [
+            #linebreak()
+            #text(size: 7pt)[Observation de preuve : ]
+            #render-opinion-reference(
+              item.evidence_ref.target_id,
+              [#text(item.evidence_ref.label)],
+              reference-scope: reference-scope,
+            )
+          ]
         ]
       ]
       #text(size: 7pt, fill: grey)[#text(content_section.attacker_identifier_note)]
@@ -1550,9 +1502,7 @@
         #render-opinion-ioc-reference()
       ]
     ] else if content_section.type == "technical_annex" [
-      #if opinion-publication [
-        #render-opinion-traceability(content_section, reference-scope: reference-scope)
-      ]
+      #none
     ] else if content_section.type == "provenance" or content_section.type == "publication_provenance" [
       #none
     ] else {

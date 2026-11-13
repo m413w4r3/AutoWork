@@ -7,6 +7,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -1026,11 +1027,12 @@ async def test_operator_context_cas_and_advisor_egress_guard_postgres(
             if label == "v6":
                 canonical_ref = str(first.id)
                 normalized_pdf_text = "".join(pdf_text.split())
-                assert "ANNEXE DE TRAÇABILITÉ" in pdf_text
-                # Reader PDFs carry no internal identifiers; citations are short [F]/[E] labels.
+                assert "ANNEXE DE TRAÇABILITÉ" not in pdf_text
+                # Internal finding identifiers remain absent from the reader PDF.
                 assert normalized_pdf_text.count(canonical_ref) == 0
                 assert "supportedbyitscitedobservation." in normalized_pdf_text
-                assert "[F1]" in normalized_pdf_text
+                assert re.search(r"\[[FE]\d+\]", pdf_text) is None
+                assert re.search(r"Références\s*:", pdf_text, flags=re.IGNORECASE) is None
                 chronology_alpha = "M05D-CHRONOLOGY-ALPHA"
                 chronology_beta = "M05D-CHRONOLOGY-BETA"
                 assert pdf_text.count(chronology_alpha) == 1
