@@ -1183,9 +1183,7 @@ async def test_documented_protocol_tool_cites_and_renders_without_capture() -> N
             replace(item, directions=(StreamDirection.UNRESOLVED,)) for item in store.model.messages
         ),
     )
-    unresolved_sequence = protocol_tools_module.render_protocol_model(
-        unresolved_model
-    ).diagrams[0]
+    unresolved_sequence = protocol_tools_module.render_protocol_model(unresolved_model).diagrams[0]
     assert unresolved_sequence.status is ProtocolDiagramStatus.INSUFFICIENT_EVIDENCE
     assert unresolved_sequence.nodes == ()
     assert unresolved_sequence.edges == ()

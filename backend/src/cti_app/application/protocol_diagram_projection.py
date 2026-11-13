@@ -165,9 +165,7 @@ def project_protocol_diagram(spec: ProtocolDiagramSpecV1) -> DiagramSpecV1:
             )
         else:
             dense_state_machine = len(spec.nodes) > 8 or len(spec.edges) > 8
-            nodes.extend(
-                _project_state(node, dense=dense_state_machine) for node in spec.nodes
-            )
+            nodes.extend(_project_state(node, dense=dense_state_machine) for node in spec.nodes)
             edges.extend(
                 _project_transition(edge, dense=dense_state_machine) for edge in spec.edges
             )
@@ -592,11 +590,7 @@ def _project_transition(edge: ProtocolDiagramEdgeV1, *, dense: bool = False) -> 
     label = " · ".join(item for item in details if item)
     if dense:
         trigger = _BRACKETED_TOKEN.search(label)
-        label = (
-            trigger.group(0)
-            if trigger is not None
-            else _compact_dense_label(label, limit=24)
-        )
+        label = trigger.group(0) if trigger is not None else _compact_dense_label(label, limit=24)
     return DiagramEdgeV1(
         source_node_id=edge.source_id,
         target_node_id=edge.target_id,

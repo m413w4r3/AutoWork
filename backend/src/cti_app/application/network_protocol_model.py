@@ -1555,9 +1555,7 @@ def _render_documented_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
     )
     resolved_message_ids = {item.message_id for item, _direction in resolved_messages}
     unresolved_messages = tuple(
-        item
-        for item in ordered_messages
-        if item.message_id not in resolved_message_ids
+        item for item in ordered_messages if item.message_id not in resolved_message_ids
     )
     use_c2_participant_names = bool(
         model.protocol and re.search(r"\bc2\b", model.protocol, flags=re.IGNORECASE)
@@ -1620,8 +1618,7 @@ def _render_documented_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
     ]
     if unresolved_messages:
         message_names = ", ".join(
-            f"{item.ordinal} {_documented_message_label(item.name)}"
-            for item in unresolved_messages
+            f"{item.ordinal} {_documented_message_label(item.name)}" for item in unresolved_messages
         )
         sequence_limitations.append(
             "Messages sans sens établi, non représentés par une flèche : " + message_names + "."

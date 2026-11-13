@@ -279,10 +279,9 @@ def _edge_renderings(diagram: DiagramSpecV1) -> tuple[_D2EdgeRendering, ...]:
             for edge in diagram.edges
         )
 
-    edge_groups: dict[
-        tuple[str, str, DiagramRelationType, int | None], list[DiagramEdgeV1]
-    ] = {}
+    edge_groups: dict[tuple[str, str, DiagramRelationType, int | None], list[DiagramEdgeV1]] = {}
     for index, edge in enumerate(diagram.edges):
+        key: tuple[str, str, DiagramRelationType, int | None]
         if (
             edge.direction is DiagramRelationDirection.DIRECTED
             and edge.relation_type is not DiagramRelationType.COMPARISON
@@ -295,11 +294,7 @@ def _edge_renderings(diagram: DiagramSpecV1) -> tuple[_D2EdgeRendering, ...]:
 
     rendered: list[_D2EdgeRendering] = []
     for (left, right, relation_type, unique_index), edges in edge_groups.items():
-        can_bundle = (
-            unique_index is None
-            and len(edges) > 1
-            and all(edge.label for edge in edges)
-        )
+        can_bundle = unique_index is None and len(edges) > 1 and all(edge.label for edge in edges)
         if not can_bundle:
             rendered.extend(
                 _D2EdgeRendering(
@@ -432,11 +427,7 @@ def encode_d2_source(diagram: DiagramSpecV1) -> bytes:
             f"{node_references[edge.source_node_id]} {edge.connector} "
             f"{node_references[edge.target_node_id]}"
         )
-        edge_wrap_width = (
-            24
-            if dense_state_machine or edge_font_size <= _EDGE_FONT_SIZE
-            else 12
-        )
+        edge_wrap_width = 24 if dense_state_machine or edge_font_size <= _EDGE_FONT_SIZE else 12
         label = _wrap_d2_label(edge.label or "", width=edge_wrap_width)
         if label:
             line += f": {_escape_d2_label(label)}"
