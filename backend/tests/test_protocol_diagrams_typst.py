@@ -46,6 +46,8 @@ from cti_app.domain.protocol_model import (
     FieldStability,
     MessageDefinitionV1,
     ProtocolDiagramKind,
+    ProtocolDiagramStatus,
+    ProtocolEvidenceLevelV1,
     ProtocolEvidenceRefV1,
     ProtocolModelV1,
     ProtocolRenderResultV1,
@@ -699,9 +701,27 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     messages = tuple(
         MessageDefinitionV1(
             message_id=message_id,
-            name=long_sequence_label if index == 1 else f"Message {index:02d}",
+            name=(
+                "01 WS/TLS (sans jeton)"
+                if index == 1
+                else "02 [LAL_P] Profil"
+                if index == 2
+                else "03 [PING] Sonde"
+                if index == 3
+                else long_sequence_label
+                if index == 4
+                else f"Message {index:02d}"
+            ),
             ordinal=index,
-            directions=(StreamDirection.UNRESOLVED,),
+            directions=(
+                (StreamDirection.UNRESOLVED,)
+                if index == len(message_ids)
+                else (
+                    StreamDirection.ORIGINATOR_TO_RESPONDER
+                    if index % 2
+                    else StreamDirection.RESPONDER_TO_ORIGINATOR,
+                )
+            ),
             min_length=None,
             max_length=None,
             field_ids=field_ids_by_message[message_id],
@@ -743,7 +763,21 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
             from_state=state_ids[(index - 1) % len(state_ids)],
             to_state=state_ids[index % len(state_ids)],
             message_id=message_ids[index - 1],
-            trigger=(long_transition_label if index == 1 else f"Message {index:02d}"),
+            trigger=(
+                "(sans jeton)"
+                if index == 1
+                else "[LAL_P] Profile negotiation"
+                if index == 2
+                else "[PING] Heartbeat"
+                if index == 3
+                else "Message 04"
+                if index == 4
+                else " "
+                if index == 5
+                else long_transition_label
+                if index == 6
+                else f"Message {index:02d}"
+            ),
             hypotheses=(),
             validation_status=ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED,
             evidence=(evidence,),
@@ -753,7 +787,91 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     model = replace(model, messages=messages, fields=fields, states=states, transitions=transitions)
     result = render_protocol_model(model)
     assert len(result.diagrams) == 3
-    assert len(result.diagrams[0].nodes) == 17
+    sequence = result.diagrams[0]
+    assert sequence.status is ProtocolDiagramStatus.READY
+    assert len(sequence.nodes) == 2
+    assert tuple(node.label for node in sequence.nodes) == ("Initiateur", "Répondeur")
+    assert all(node.role == "documented_participant" for node in sequence.nodes)
+    assert all(
+        node.validation_status is ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED
+        and node.evidence_level is ProtocolEvidenceLevelV1.ARTICLE_DOCUMENTED
+        for node in sequence.nodes
+    )
+    assert len(sequence.edges) == 16
+    assert tuple(edge.order for edge in sequence.edges) == tuple(range(1, 17))
+    assert sequence.edges[0].label == "WS/TLS"
+    assert sequence.edges[1].label == "[LAL_P] Profil"
+    assert sequence.edges[2].label == "[PING] Sonde"
+    assert all(
+        edge.validation_status is ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED
+        and edge.evidence_level is ProtocolEvidenceLevelV1.ARTICLE_DOCUMENTED
+        and edge.evidence == (evidence,)
+        and edge.frame_numbers == ()
+        for edge in sequence.edges
+    )
+    assert (sequence.edges[0].source_id, sequence.edges[0].target_id) == (
+        "documented-originator",
+        "documented-responder",
+    )
+    assert (sequence.edges[1].source_id, sequence.edges[1].target_id) == (
+        "documented-responder",
+        "documented-originator",
+    )
+    assert any(
+        "Messages sans sens établi, non représentés par une flèche" in item
+        and "17 Message 17" in item
+        for item in sequence.limitations
+    )
+    state_labels = tuple(edge.label for edge in result.diagrams[1].edges)
+    assert state_labels[:6] == (
+        "WS/TLS",
+        "[LAL_P]",
+        "[PING]",
+        "Message 04",
+        "Message 05",
+        "Message 06",
+    )
+    assert all(":" not in label and "(sans jeton)" not in label for label in state_labels)
+
+    projected_sequence = project_protocol_diagram(sequence)
+    sequence_source = encode_d2_source(projected_sequence).decode("utf-8")
+    assert len(projected_sequence.nodes) == 2
+    assert len(projected_sequence.edges) == 16
+    assert sequence_source.count(" -> ") == 16
+    assert "#1 WS/TLS" in sequence_source
+    assert "#2 [LAL_P] Profil" in sequence_source
+    assert "#3 [PING] Sonde" in sequence_source
+    assert "(sans jeton) 01" not in sequence_source
+    assert "documented-message" not in sequence_source
+
+    ambiguous_messages = tuple(
+        replace(
+            item,
+            directions=(
+                StreamDirection.ORIGINATOR_TO_RESPONDER,
+                StreamDirection.RESPONDER_TO_ORIGINATOR,
+            ),
+        )
+        if item.ordinal == 16
+        else item
+        for item in model.messages
+    )
+    ambiguous_sequence = render_protocol_model(
+        replace(model, messages=ambiguous_messages)
+    ).diagrams[0]
+    assert len(ambiguous_sequence.edges) == 15
+    assert all(edge.order != 16 for edge in ambiguous_sequence.edges)
+    assert any(
+        "16 Message 16" in item
+        and "Messages sans sens établi, non représentés par une flèche" in item
+        for item in ambiguous_sequence.limitations
+    )
+
+    c2_sequence = render_protocol_model(replace(model, protocol="Art01 C2")).diagrams[0]
+    assert tuple(node.label for node in c2_sequence.nodes) == (
+        "Implant (client)",
+        "Serveur C2",
+    )
     assert len(result.diagrams[1].nodes) == 9
     assert len(result.diagrams[1].edges) == 15
     assert len(result.diagrams[2].fields) == 22
@@ -773,6 +891,7 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     figures = opinion_protocol_figures(rendered)
     assert {item.kind for item in figures} == set(ProtocolDiagramKind)
     sequence_figure = next(item for item in figures if item.kind is ProtocolDiagramKind.SEQUENCE)
+    assert "Messages sans sens établi, non représentés par une flèche" in sequence_figure.caption
     sequence_svg = await media_store.read(sequence_figure.asset_id)
     view_box = re.search(rb'viewBox="[-0-9.]+ [-0-9.]+ ([0-9.]+) ([0-9.]+)"', sequence_svg)
     assert view_box is not None

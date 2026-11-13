@@ -12,6 +12,7 @@ register_protocol_tools(
 from __future__ import annotations
 
 import hashlib
+import re
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
@@ -64,6 +65,10 @@ _MAX_OBSERVED_MESSAGES = 512
 _MAX_MODEL_FIELDS = 256
 _MAX_BYTE_RUNS_PER_MESSAGE = 64
 _MAX_FINDING_TEXT = 64
+_DOCUMENTED_ORDINAL_PREFIX = re.compile(r"^\s*\d{1,4}[.)]?\s+")
+_DOCUMENTED_NO_TOKEN_SUFFIX = re.compile(r"\s*\(\s*sans jeton\s*\)\s*$", re.IGNORECASE)
+_DOCUMENTED_BRACKETED_TOKEN = re.compile(r"\[[^\]\r\n]{1,20}\]")
+_DOCUMENTED_SHORT_TRIGGER_LIMIT = 32
 
 
 class ProtocolTraceError(ValueError):
@@ -1535,32 +1540,109 @@ def _render_documented_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
     """Render documented semantics without inventing capture coordinates."""
     label_status = ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED
     source_message = {item.message_id: item.name for item in model.messages}
-    sequence_nodes = tuple(
-        ProtocolDiagramNodeV1(
-            node_id=f"documented-message-{item.message_id}",
-            label=f"{item.ordinal}. {item.name}",
-            role="documented_message",
+    ordered_messages = tuple(
+        sorted(model.messages, key=lambda entry: (entry.ordinal, entry.message_id))
+    )
+    resolved_messages = tuple(
+        (item, item.directions[0])
+        for item in ordered_messages
+        if len(set(item.directions)) == 1
+        and item.directions[0]
+        in {
+            StreamDirection.ORIGINATOR_TO_RESPONDER,
+            StreamDirection.RESPONDER_TO_ORIGINATOR,
+        }
+    )
+    resolved_message_ids = {item.message_id for item, _direction in resolved_messages}
+    unresolved_messages = tuple(
+        item
+        for item in ordered_messages
+        if item.message_id not in resolved_message_ids
+    )
+    use_c2_participant_names = bool(
+        model.protocol and re.search(r"\bc2\b", model.protocol, flags=re.IGNORECASE)
+    )
+    participant_labels = (
+        ("Implant (client)", "Serveur C2")
+        if use_c2_participant_names
+        else ("Initiateur", "Répondeur")
+    )
+    participant_evidence = model.documentary_evidence or tuple(
+        dict.fromkeys(reference for item in ordered_messages for reference in item.evidence)
+    )
+    sequence_edges = tuple(
+        ProtocolDiagramEdgeV1(
+            source_id=(
+                "documented-originator"
+                if direction is StreamDirection.ORIGINATOR_TO_RESPONDER
+                else "documented-responder"
+            ),
+            target_id=(
+                "documented-responder"
+                if direction is StreamDirection.ORIGINATOR_TO_RESPONDER
+                else "documented-originator"
+            ),
+            label=_documented_message_label(item.name),
+            order=item.ordinal,
+            frame_numbers=(),
+            timing_ms=None,
             validation_status=label_status,
             evidence=item.evidence,
             evidence_level=ProtocolEvidenceLevelV1.ARTICLE_DOCUMENTED,
         )
-        for item in sorted(model.messages, key=lambda entry: (entry.ordinal, entry.message_id))
+        for item, direction in resolved_messages
     )
+    sequence_ready = bool(sequence_edges)
+    sequence_nodes = (
+        tuple(
+            ProtocolDiagramNodeV1(
+                node_id=node_id,
+                label=label,
+                role="documented_participant",
+                validation_status=label_status,
+                evidence=participant_evidence,
+                evidence_level=ProtocolEvidenceLevelV1.ARTICLE_DOCUMENTED,
+            )
+            for node_id, label in zip(
+                ("documented-originator", "documented-responder"),
+                participant_labels,
+                strict=True,
+            )
+        )
+        if sequence_ready
+        else ()
+    )
+    sequence_limitations = [
+        "ARTICLE_DOCUMENTED : modèle documentaire; les sens des flèches viennent des directions "
+        "décrites et ne sont pas observés dans une capture.",
+        "Règle des participants : « Implant (client) » et « Serveur C2 » si le champ protocol "
+        "nomme explicitement C2; sinon « Initiateur » et « Répondeur ».",
+    ]
+    if unresolved_messages:
+        message_names = ", ".join(
+            f"{item.ordinal} {_documented_message_label(item.name)}"
+            for item in unresolved_messages
+        )
+        sequence_limitations.append(
+            "Messages sans sens établi, non représentés par une flèche : " + message_names + "."
+        )
+    elif not sequence_ready:
+        sequence_limitations.append(
+            "Aucun message ne porte une direction résolue; aucune flèche n'est représentée."
+        )
     sequence = ProtocolDiagramSpecV1(
         schema_version="ProtocolDiagramSpecV1",
         kind=ProtocolDiagramKind.SEQUENCE,
         status=(
             ProtocolDiagramStatus.READY
-            if sequence_nodes
+            if sequence_ready
             else ProtocolDiagramStatus.INSUFFICIENT_EVIDENCE
         ),
         title="Séquence du protocole",
         nodes=sequence_nodes,
-        edges=(),
+        edges=sequence_edges if sequence_ready else (),
         fields=(),
-        limitations=(
-            "Modèle documentaire; aucune capture réseau ni direction de flux n'est observée.",
-        ),
+        limitations=tuple(sequence_limitations),
     )
 
     states_by_id = {item.state_id: item for item in model.states}
@@ -1579,7 +1661,7 @@ def _render_documented_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
         ProtocolDiagramEdgeV1(
             source_id=item.from_state,
             target_id=item.to_state,
-            label=f"{item.trigger}: {source_message[item.message_id]}",
+            label=_documented_transition_label(item.trigger, source_message[item.message_id]),
             order=None,
             frame_numbers=(),
             timing_ms=None,
@@ -1671,6 +1753,27 @@ def _render_documented_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
         diagrams=(sequence, state_diagram, format_diagram),
         factual_statements=statements,
     )
+
+
+def _documented_message_label(value: str) -> str:
+    """Drop ordinal and no-token annotation from a documentary message name."""
+    label = _DOCUMENTED_ORDINAL_PREFIX.sub("", value, count=1).strip()
+    label = _DOCUMENTED_NO_TOKEN_SUFFIX.sub("", label).strip()
+    return label or value.strip()
+
+
+def _documented_transition_label(trigger: str, message_name: str) -> str:
+    """Use the documented token or a short trigger without duplicating its message."""
+    trigger_text = trigger.strip()
+    token = _DOCUMENTED_BRACKETED_TOKEN.search(trigger_text)
+    if token is not None:
+        return token.group(0)
+    message_label = _documented_message_label(message_name)
+    if not trigger_text or trigger_text.casefold() in {"(sans jeton)", "sans jeton"}:
+        return message_label
+    if len(trigger_text) <= _DOCUMENTED_SHORT_TRIGGER_LIMIT:
+        return _documented_message_label(trigger_text)
+    return message_label
 
 
 def _documentary_source_labels(evidence: Sequence[ProtocolEvidenceRefV1]) -> str:

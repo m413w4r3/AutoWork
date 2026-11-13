@@ -48,7 +48,7 @@ from cti_app.domain.protocol_model import (
     ProtocolValidationStatus,
 )
 
-PROTOCOL_DIAGRAM_PROJECTION_VERSION = "protocol-diagram-projection-v7-m21-opinion-render"
+PROTOCOL_DIAGRAM_PROJECTION_VERSION = "protocol-diagram-projection-v8-m21-documented-sequence"
 PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION = (
     f"{DIAGRAM_COMPILATION_POLICY_VERSION}+{PROTOCOL_DIAGRAM_PROJECTION_VERSION}"
 )
@@ -206,6 +206,17 @@ def protocol_diagram_caption(spec: ProtocolDiagramSpecV1) -> str:
     )
     if _is_documented_view(spec):
         limit_line = "Aucun flux ni trame observés; offsets et valeurs d'octets inconnus."
+        if spec.kind is ProtocolDiagramKind.SEQUENCE:
+            direction_limit = next(
+                (
+                    item
+                    for item in limitations
+                    if item.casefold().startswith("messages sans sens établi")
+                ),
+                None,
+            )
+            if direction_limit:
+                limit_line += " " + direction_limit
     elif spec.status is ProtocolDiagramStatus.INSUFFICIENT_EVIDENCE:
         limit_line = "Trames, offsets et valeurs d'octets inconnus; aucune séquence n'est établie."
     else:

@@ -1054,7 +1054,14 @@ async def test_documented_protocol_tool_cites_and_renders_without_capture() -> N
                     "ordinal": 1,
                     "direction": "unresolved",
                     "evidence_refs": [citation],
-                }
+                },
+                {
+                    "message_id": "server-hello",
+                    "name": "ServerHello",
+                    "ordinal": 2,
+                    "direction": "originator_to_responder",
+                    "evidence_refs": [citation],
+                },
             ],
             "states": [
                 {"state_id": "new", "name": "New", "evidence_refs": [citation]},
@@ -1156,6 +1163,32 @@ async def test_documented_protocol_tool_cites_and_renders_without_capture() -> N
     assert rendered.output["protocol_model_blob_id"] == str(blob_id)
     views = rendered.output["diagrams"]
     assert {item["kind"] for item in views} == {item.value for item in ProtocolDiagramKind}
+    sequence_view = next(item for item in views if item["kind"] == "sequence")
+    assert sequence_view["status"] == "ready"
+    assert [node["label"] for node in sequence_view["nodes"]] == ["Initiateur", "Répondeur"]
+    assert len(sequence_view["edges"]) == 1
+    assert sequence_view["edges"][0]["source_id"] == "documented-originator"
+    assert sequence_view["edges"][0]["target_id"] == "documented-responder"
+    assert sequence_view["edges"][0]["label"] == "ServerHello"
+    assert sequence_view["edges"][0]["validation_status"] == "documented_not_observed"
+    assert sequence_view["edges"][0]["evidence_level"] == "article_documented"
+    assert any(
+        "Messages sans sens établi, non représentés par une flèche" in item
+        and "ClientHello" in item
+        for item in sequence_view["limitations"]
+    )
+    unresolved_model = replace(
+        store.model,
+        messages=tuple(
+            replace(item, directions=(StreamDirection.UNRESOLVED,)) for item in store.model.messages
+        ),
+    )
+    unresolved_sequence = protocol_tools_module.render_protocol_model(
+        unresolved_model
+    ).diagrams[0]
+    assert unresolved_sequence.status is ProtocolDiagramStatus.INSUFFICIENT_EVIDENCE
+    assert unresolved_sequence.nodes == ()
+    assert unresolved_sequence.edges == ()
     assert all("documenté, non observé" not in item["title"].casefold() for item in views)
     assert all(len(item["title"]) <= 72 for item in views)
     diagram_labels = [node["label"] for item in views for node in item["nodes"]]

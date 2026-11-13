@@ -6,6 +6,8 @@ import shutil
 import pytest
 
 from cti_app.application.protocol_diagram_projection import (
+    PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION,
+    PROTOCOL_DIAGRAM_PROJECTION_VERSION,
     project_protocol_diagram,
     protocol_diagram_caption,
     protocol_diagram_pin_sha256,
@@ -346,6 +348,14 @@ def test_protocol_pin_hash_covers_semantics_and_compiler_identity() -> None:
     spec = _three_views()[0]
     pin = protocol_diagram_pin_sha256(spec, compiler="d2", compiler_version="0.9.0")
 
+    assert (
+        PROTOCOL_DIAGRAM_PROJECTION_VERSION
+        == "protocol-diagram-projection-v8-m21-documented-sequence"
+    )
+    assert PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION == (
+        "diagram-d2-svg-v13-m21-state-label-spacing+"
+        "protocol-diagram-projection-v8-m21-documented-sequence"
+    )
     assert pin == protocol_diagram_pin_sha256(spec, compiler="d2", compiler_version="0.9.0")
     assert pin != protocol_diagram_pin_sha256(spec, compiler="d2", compiler_version="0.9.1")
     assert pin != protocol_diagram_pin_sha256(
