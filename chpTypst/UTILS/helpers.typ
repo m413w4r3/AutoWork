@@ -234,11 +234,13 @@
       bottom: 8pt
     )[
       #if title != none [
-        #text(
-          size: 14pt,
-          weight: "extrabold",
-          fill: purple-dark,
-        )[#title]
+        #block(sticky: true, below: 0.6em)[
+          #text(
+            size: 14pt,
+            weight: "extrabold",
+            fill: purple-dark,
+          )[#title]
+        ]
       ]
       
       #content

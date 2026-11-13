@@ -708,7 +708,7 @@
   v(16pt)
   text(size: 9pt, fill: grey)[
     Les indicateurs de compromission de cet avis (fichiers et réseau) sont repris dans le
-    tableau récapitulatif des IOC du bulletin et dans les annexes CSV du dossier de livraison.
+    tableau récapitulatif des IOC du bulletin.
   ]
 }
 
@@ -1334,7 +1334,7 @@
           #for item in opinion-blocks [
             #let pipe-table = item.at("pipe_table", default: none)
             #heading(level: 3)[#item.number #text(item.heading)]
-            #text(size: 8pt, weight: "bold")[#text(item.qualification_label)]
+            #block(sticky: true, above: 0pt, below: 0.4em)[#text(size: 8pt, weight: "bold")[#text(item.qualification_label)]]
             #parbreak()
             #render-opinion-text(
               item.at("text_spans", default: none),
@@ -1353,7 +1353,7 @@
           #if pipe-table != none and pipe-table.wide [
             #noteAnalyste(title: opinion-title, breakable: true)[
               #heading(level: 3)[#item.number #text(item.heading)]
-              #text(size: 8pt, weight: "bold")[#text(item.qualification_label)]
+              #block(sticky: true, above: 0pt, below: 0.4em)[#text(size: 8pt, weight: "bold")[#text(item.qualification_label)]]
               #let prefix = pipe-table.at("prefix", default: "")
               #if prefix != "" [
                 #block(sticky: true, below: 4pt)[
@@ -1374,7 +1374,7 @@
           ] else [
             #noteAnalyste(title: opinion-title, breakable: true)[
               #heading(level: 3)[#item.number #text(item.heading)]
-              #text(size: 8pt, weight: "bold")[#text(item.qualification_label)]
+              #block(sticky: true, above: 0pt, below: 0.4em)[#text(size: 8pt, weight: "bold")[#text(item.qualification_label)]]
               #parbreak()
               #render-opinion-text(
                 item.at("text_spans", default: none),
