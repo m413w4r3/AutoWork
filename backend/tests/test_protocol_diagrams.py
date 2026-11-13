@@ -350,11 +350,11 @@ def test_protocol_pin_hash_covers_semantics_and_compiler_identity() -> None:
 
     assert (
         PROTOCOL_DIAGRAM_PROJECTION_VERSION
-        == "protocol-diagram-projection-v8-m21-documented-sequence"
+        == "protocol-diagram-projection-v9-m21-documented-states"
     )
     assert PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION == (
         "diagram-d2-svg-v15-m21-protocol-state-self-loops+"
-        "protocol-diagram-projection-v8-m21-documented-sequence"
+        "protocol-diagram-projection-v9-m21-documented-states"
     )
     assert pin == protocol_diagram_pin_sha256(spec, compiler="d2", compiler_version="0.9.0")
     assert pin != protocol_diagram_pin_sha256(spec, compiler="d2", compiler_version="0.9.1")
