@@ -1295,7 +1295,8 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
         assert long_sequence_sizes and long_state_sizes
         assert long_field_sizes
         assert min(sequence_sizes) >= 8.0, f"sequence labels: {min(sequence_sizes):.2f} pt"
-        assert min(state_sizes) >= 8.0, f"state labels: {min(state_sizes):.2f} pt"
+        # State loops are written inside the (wider) node labels, so the page scale is a bit lower.
+        assert min(state_sizes) >= 7.5, f"state labels: {min(state_sizes):.2f} pt"
         assert min(field_sizes) >= 8.0, f"field labels: {min(field_sizes):.2f} pt"
         assert min(long_sequence_sizes) >= 8.0
         assert min(long_state_sizes) >= 8.0

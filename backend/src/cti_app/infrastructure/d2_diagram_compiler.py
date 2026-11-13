@@ -268,6 +268,7 @@ def _protocol_state_machine_auto_transition_labels(
     for index, edge in enumerate(diagram.edges):
         if edge.source_node_id != edge.target_node_id:
             continue
+        key: tuple[str, DiagramRelationType, int | None]
         if (
             edge.direction is DiagramRelationDirection.DIRECTED
             and edge.relation_type is not DiagramRelationType.COMPARISON
