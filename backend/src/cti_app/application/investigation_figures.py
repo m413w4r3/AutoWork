@@ -394,7 +394,7 @@ _GRAPH_CONFIDENCE_LABELS = {
 
 def _graph_node_display_label(kind: InvestigationGraphNodeKind, value: str, label: str) -> str:
     if kind is InvestigationGraphNodeKind.FILE_SHA256:
-        return "Empreinte de fichier"
+        return "Fichier"
     if kind is InvestigationGraphNodeKind.URL:
         parsed = urlsplit(value)
         label = f"URL · {parsed.hostname or 'URL'}{parsed.path[:44]}"

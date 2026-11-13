@@ -1325,18 +1325,14 @@ async def test_real_typst_hides_candidate_indicators_and_annex_from_legacy_rende
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("omitted_invalid_url_count", "expected_note"),
-    (
-        (2, "2 URL non valide(s) omise(s) des listes."),
-        (0, None),
-    ),
+    "omitted_invalid_url_count",
+    (2, 0),
 )
-async def test_real_typst_opinion_renders_candidate_url_omission_note(
+async def test_real_typst_opinion_hides_candidate_url_omission_details(
     tmp_path: Path,
     typst_binary: str,
     font_bundle_root: Path,
     omitted_invalid_url_count: int,
-    expected_note: str | None,
 ) -> None:
     render_data = {
         "schema_version": "typst-publication-model-opinion-ioc-note-fixture",
@@ -1374,11 +1370,13 @@ async def test_real_typst_opinion_renders_candidate_url_omission_note(
 
     reader = PdfReader(BytesIO(compiled.content), strict=True)
     extracted = " ".join("\n".join(page.extract_text() or "" for page in reader.pages).split())
-    assert "Pistes non confirmées" in extracted
-    if expected_note is None:
-        assert "URL non valide(s) omise(s) des listes." not in extracted
-    else:
-        assert expected_note in extracted
+    assert (
+        "Les indicateurs de compromission de cet avis (fichiers et réseau) sont repris dans le "
+        "tableau" in extracted
+    )
+    assert "Pistes non confirmées" not in extracted
+    assert "candidate-001.example" not in extracted
+    assert "URL non valide(s) omise(s) des listes." not in extracted
 
 
 @pytest.mark.asyncio
@@ -1553,7 +1551,7 @@ def _lot6_composition_render_data() -> tuple[dict[str, Any], tuple[str, ...], tu
         "domains": ("Noms de domaine", "Domaine"),
         "urls": ("URL", "URL"),
         "emails": ("Courriels", "Adresse e-mail"),
-        "hashes": ("Empreintes de fichier", "Hash"),
+        "hashes": ("Fichiers", "Fichiers"),
     }
 
     def ioc_row(value: dict[str, Any], *, original: bool = False) -> dict[str, Any]:
@@ -1603,7 +1601,7 @@ def _lot6_composition_render_data() -> tuple[dict[str, Any], tuple[str, ...], tu
         for value in values_for_category
     ]
     original_group = {
-        "heading": "IOC originaux à lien non démontré",
+        "heading": "Observables sources à lien non démontré",
         "rows": original_rows,
     }
 
@@ -1824,7 +1822,7 @@ async def test_real_typst_lot6_a4_composition_fixture(
     page_text = [page.extract_text() or "" for page in reader.pages]
     text = " ".join(" ".join(value.split()) for value in page_text)
     compact_text = "".join(text.split())
-    assert len(reader.pages) >= 3
+    assert len(reader.pages) >= 2
     assert all(
         (
             abs(float(page.mediabox.width) - 595.28) < 0.2
@@ -1855,45 +1853,18 @@ async def test_real_typst_lot6_a4_composition_fixture(
     ):
         assert hidden_title not in text
     assert "Tableau des artefacts observés" in text
-    # V17 keeps the retained and unconfirmed original lists in its annex shape.
-    assert text.count("IOC") == 2
-    reserve_heading = "IOC originaux à lien non démontré"
-    assert reserve_heading in text
-    compact_reserve_heading = "".join(reserve_heading.split())
-    reserve_position = compact_text.index(compact_reserve_heading)
-    assert "Le lien avec le sujet" in text and "pas démontré" in text
-    assert all(
-        "".join(value.split()) not in compact_text[:reserve_position] for value in original_iocs
+    assert "Les indicateurs de compromission de cet avis" in text
+    assert "ANNEXE TECHNIQUE" not in text.upper()
+    assert "ANNEXE DE TRAÇABILITÉ" not in text.upper()
+    assert "IOC ORIGINAUX" not in text.upper()
+    assert "PISTES NON CONFIRMÉES" not in text.upper()
+    assert re.search(r"\bHASHES?\b", text, re.IGNORECASE) is None
+    visible_iocs = tuple(
+        value
+        for value in (*expected_iocs, *original_iocs)
+        if "".join(value.split()) in compact_text
     )
-    assert all("".join(value.split()) in compact_text[reserve_position:] for value in original_iocs)
-    missing_iocs = tuple(value for value in expected_iocs if value not in compact_text)
-    assert not missing_iocs, f"IOC values missing from extracted PDF text: {missing_iocs[:8]!r}"
-    ioc_annex_start = next(
-        index for index, page in enumerate(page_text) if "ANNEXE TECHNIQUE" in page.upper()
-    )
-    ioc_annex_pages = tuple(page_text[ioc_annex_start:])
-    compact_pages = tuple("".join(page.split()) for page in ioc_annex_pages)
-    hash_values = set(expected_iocs[-20:])
-    for value in expected_iocs:
-        row_marker = hashlib.sha256(value.encode()).hexdigest()[:10]
-        page_indices = [
-            index
-            for index, compact_page in enumerate(compact_pages)
-            if "".join(value.split()) in compact_page
-        ]
-        assert len(page_indices) == 1, f"IOC row value {value!r} appears on pages {page_indices!r}"
-        page_index = page_indices[0]
-        assert row_marker in compact_pages[page_index], (
-            f"IOC row {value!r} was separated from its provenance marker"
-        )
-        expected_header = (
-            "Empreinte de fichier — une valeur par ligne"
-            if value in hash_values
-            else "Valeur refangée"
-        )
-        assert "".join(expected_header.split()) in compact_pages[page_index], (
-            f"IOC table continuation page omitted {expected_header!r}"
-        )
+    assert not visible_iocs, f"Opinion PDF exposes IOC values: {visible_iocs[:8]!r}"
     assert len(png_pages) == len(reader.pages)
     png_sizes = [path.stat().st_size for path in png_pages]
     assert all(size > 0 for size in png_sizes)

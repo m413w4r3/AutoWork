@@ -3258,7 +3258,7 @@ def project_publication_to_typst_model(
         return {
             ArtifactType.DOMAIN: "Domaines",
             ArtifactType.URL: "URLs",
-            ArtifactType.HASH: "Hashes",
+            ArtifactType.HASH: "Fichiers",
             ArtifactType.EMAIL: "Adresses e-mail",
             ArtifactType.FILENAME: "Noms de fichiers",
             ArtifactType.FILEPATH: "Chemins de fichiers",
@@ -3664,7 +3664,9 @@ def project_publication_to_typst_model(
             if artifact_type in {ArtifactType.FILENAME, ArtifactType.FILEPATH}
             else "other"
         )
-        projected_ioc_row["type_label"] = artifact_type.value
+        projected_ioc_row["type_label"] = (
+            "Fichiers" if artifact_type is ArtifactType.HASH else artifact_type.value
+        )
         projected_ioc_row["group_label"] = ioc_group_titles[group_key]
         projected_ioc_row["source_numbers"] = ", ".join(
             f"[{ref['number']}]" for ref in projected_ioc_row["source_refs"]
@@ -3798,7 +3800,7 @@ def project_publication_to_typst_model(
                     node is not None
                     and node.get("kind") == InvestigationGraphNodeKind.FILE_SHA256.value
                 ):
-                    edge[f"{side}_value"] = "Empreinte de fichier"
+                    edge[f"{side}_value"] = "Fichier"
             edge["source_value_spans"] = _breakable_typst_display_text(
                 edge["source_value"], interval=32, break_at_technical_separators=True
             )
