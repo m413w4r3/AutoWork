@@ -1,5 +1,5 @@
 {
-  "template_version": "chp-article-v47-m21-opinion-safe-links",
+  "template_version": "chp-article-v47-m21-opinion-safe-links-m21-pdffix",
   "files": [
     "RENDERER/publication.typ",
     "RENDERER/publication_helpers.typ",

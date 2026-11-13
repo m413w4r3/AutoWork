@@ -43,13 +43,7 @@
 #let semantic-product(body) = text(weight: "bold", fill: dark)[#body]
 #let semantic-proper-name(body) = emph(body)
 #let semantic-english-term(body) = emph(body)
-#let semantic-inline-technical(body) = highlight(fill: luma(190), radius: 2pt)[
-  #text(
-    font: code-font-families,
-    size: 10pt,
-    hyphenate: false,
-  )[#body]
-]
+#let semantic-inline-technical(body) = highlight(fill: luma(190), radius: 2pt)[#text(font: code-font-families, size: 10pt, hyphenate: false)[#body]]
 #let semantic-technical-code-block(lines) = block(
   width: 100%,
   breakable: true,
