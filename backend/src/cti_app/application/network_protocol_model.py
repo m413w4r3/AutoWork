@@ -1669,6 +1669,21 @@ def _render_documented_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
         for item in model.transitions
         if item.from_state in states_by_id and item.to_state in states_by_id
     )
+    connected_states = {edge.source_id for edge in state_edges} | {
+        edge.target_id for edge in state_edges
+    }
+    isolated_state_names = [
+        item.name for item in model.states if item.state_id not in connected_states
+    ]
+    state_limitations = [
+        "États et transitions tirés des sources; aucun changement n'est observé dans une capture."
+    ]
+    if state_edges and isolated_state_names:
+        state_limitations.append(
+            "États documentés sans transition spécifiée, non reliés par une flèche : "
+            + ", ".join(isolated_state_names)
+            + "."
+        )
     state_diagram = ProtocolDiagramSpecV1(
         schema_version="ProtocolDiagramSpecV1",
         kind=ProtocolDiagramKind.STATE_MACHINE,
@@ -1681,10 +1696,7 @@ def _render_documented_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
         nodes=tuple(state_nodes.values()),
         edges=state_edges,
         fields=(),
-        limitations=(
-            "États et transitions tirés des sources; aucun changement n'est observé "
-            "dans une capture.",
-        ),
+        limitations=tuple(state_limitations),
     )
 
     format_fields = tuple(
