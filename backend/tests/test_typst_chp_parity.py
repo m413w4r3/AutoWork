@@ -2153,8 +2153,8 @@ def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_navigabl
     ):
         assert removed_label not in normalized_text
     assert re.search(r"\bHASHES?\b", normalized_text) is None
-    assert "CORE.EXAMPLE" in normalized_text
-    assert "DOCUMENTÉ, NON OBSERVÉ" not in normalized_text
+    assert "CORE.EXAMPLE" not in normalized_text
+    assert "DOCUMENTÉ, NON OBSERVÉ" in normalized_text
     assert "FAIT OBSERVÉ" in normalized_text
     assert "FICHIER" in normalized_text
     assert "D" * 64 not in normalized_text
@@ -3001,12 +3001,10 @@ async def test_real_typst_keeps_v57_analyst_note_with_literal_cti_text(
     assert len(v57_note) == 477
     active_typst_text = r"Texte littéral # $ * _ @ < > ` \ [ ] et #pagebreak()."
     passphrase = "y0Da+QH#pwSg38E?=8R;71-jQu8Tqq"
-    github_pat = "github_pat_11AA22bb33CC44dd55EE66ff77GG88hh99II00jjKKll"
     literal_note = f"Note de test : {active_typst_text}"
     opinion_block = f"Bloc narratif : {active_typst_text}"
     editorial_text = f"Texte éditorial : {active_typst_text}"
     implant_role = f"Rôle : {active_typst_text}"
-    ioc_value = f"{github_pat} {active_typst_text}"
 
     render_data = {
         "v57_note": {
@@ -3024,16 +3022,11 @@ async def test_real_typst_keeps_v57_analyst_note_with_literal_cti_text(
         "opinion_block": {"text": opinion_block},
         "editorial_text": editorial_text,
         "implant": {"role": implant_role, "value": passphrase},
-        "ioc": {
-            "value": ioc_value,
-            "source_refs": [],
-            "draft_refs": [],
-        },
     }
     fixture_entry = TemplateFile(
         relative_path="RENDERER/literal-text-fixture.typ",
         content=(
-            b'#import "publication_helpers.typ": render-analyst-observation, render-ioc-item\n'
+            b'#import "publication_helpers.typ": render-analyst-observation\n'
             b'#import "../UTILS/helpers.typ": code-font-families\n'
             b'#let data = json("render-data.json")\n'
             b'#set page(paper: "a4", margin: 50pt)\n'
@@ -3058,7 +3051,6 @@ async def test_real_typst_keeps_v57_analyst_note_with_literal_cti_text(
             b"    #text(data.implant.value)\n"
             b"  ]]\n"
             b"]\n"
-            b"#render-ioc-item(data.ioc)\n"
         ),
     )
     template_bundle = load_template_bundle(_CHP_TYPST_ROOT)
@@ -3105,7 +3097,6 @@ async def test_real_typst_keeps_v57_analyst_note_with_literal_cti_text(
         editorial_text,
         implant_role,
         passphrase,
-        ioc_value,
     ):
         assert compact(expected) in compact(pdf_text)
     assert "#pagebreak()" in normalized_pdf

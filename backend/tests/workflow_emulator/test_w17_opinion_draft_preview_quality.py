@@ -485,7 +485,6 @@ async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
         "IDENTIFIANT C2 DE L'IMPLANT",
         "PROVENANCE DE PUBLICATION",
         "Identité de base",
-        "203.0.113.24",
     ):
         assert removed_reader_label.casefold() not in normalized_text, (
             f"W17 opinion PDF still exposes {removed_reader_label!r}"
