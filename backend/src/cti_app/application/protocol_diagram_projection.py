@@ -48,17 +48,22 @@ from cti_app.domain.protocol_model import (
     ProtocolValidationStatus,
 )
 
-PROTOCOL_DIAGRAM_PROJECTION_VERSION = "protocol-diagram-projection-v6-m21-opinion-render"
+PROTOCOL_DIAGRAM_PROJECTION_VERSION = "protocol-diagram-projection-v7-m21-opinion-render"
 PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION = (
     f"{DIAGRAM_COMPILATION_POLICY_VERSION}+{PROTOCOL_DIAGRAM_PROJECTION_VERSION}"
 )
 _MAX_FIELD_EVIDENCE_REFS = 8
 _MAX_FIELD_EVIDENCE_FRAMES = 12
+_DENSE_LABEL_LIMIT = 44
+_STATE_GRAPH_MAX_NODES = 16
+_STATE_GRAPH_MAX_EDGES = 24
 _UUID_TEXT = re.compile(
     r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
     re.IGNORECASE,
 )
 _HASH_TEXT = re.compile(r"\b[0-9a-f]{32,64}\b", re.IGNORECASE)
+_BRACKETED_TOKEN = re.compile(r"\[[^\]\r\n]{1,20}\]")
+_LABEL_SEGMENT = re.compile(r"(?:[;,]|[.!?](?=\s|$))")
 _REFERENCE_TAIL = re.compile(
     r"\s*[·;,:—-]?\s*(?:sources?|observations?|findings?|evidence)\b.*$",
     re.IGNORECASE,
@@ -136,18 +141,16 @@ def project_protocol_diagram(spec: ProtocolDiagramSpecV1) -> DiagramSpecV1:
         )
     elif spec.kind is ProtocolDiagramKind.SEQUENCE:
         if len(spec.edges) > 8:
-            participants = {
-                node.node_id: _clean_display_text(node.label, limit=None) for node in spec.nodes
-            }
-            nodes.extend(
-                _project_ordered_message(edge, index, participants)
+            nodes.extend(_project_participant(node, dense=True) for node in spec.nodes)
+            edges.extend(
+                _project_dense_message(edge, index)
                 for index, edge in enumerate(_ordered_edges(spec.edges), 1)
             )
         else:
             nodes.extend(_project_participant(node) for node in spec.nodes)
             edges.extend(_project_message(edge) for edge in _ordered_edges(spec.edges))
     elif spec.kind is ProtocolDiagramKind.STATE_MACHINE:
-        if len(spec.nodes) > 8 or len(spec.edges) > 8:
+        if len(spec.nodes) > _STATE_GRAPH_MAX_NODES or len(spec.edges) > _STATE_GRAPH_MAX_EDGES:
             state_labels = {
                 node.node_id: _clean_display_text(node.label, limit=None) for node in spec.nodes
             }
@@ -161,8 +164,13 @@ def project_protocol_diagram(spec: ProtocolDiagramSpecV1) -> DiagramSpecV1:
                 if node.node_id not in represented_states
             )
         else:
-            nodes.extend(_project_state(node) for node in spec.nodes)
-            edges.extend(_project_transition(edge) for edge in spec.edges)
+            dense_state_machine = len(spec.nodes) > 8 or len(spec.edges) > 8
+            nodes.extend(
+                _project_state(node, dense=dense_state_machine) for node in spec.nodes
+            )
+            edges.extend(
+                _project_transition(edge, dense=dense_state_machine) for edge in spec.edges
+            )
     else:
         if not spec.fields:
             raise ProtocolDiagramProjectionError(
@@ -170,7 +178,7 @@ def project_protocol_diagram(spec: ProtocolDiagramSpecV1) -> DiagramSpecV1:
             )
         dense_format = len(spec.fields) > 8
         nodes.extend(
-            _project_field(field, index, include_index=dense_format)
+            _project_field(field, index, include_index=dense_format, dense=dense_format)
             for index, field in enumerate(spec.fields, 1)
         )
         if not dense_format:
@@ -490,19 +498,25 @@ def _resolved_evidence_level(
     return ProtocolEvidenceLevelV1.STATIC_INFERENCE
 
 
-def _project_participant(node: ProtocolDiagramNodeV1) -> DiagramNodeV1:
+def _project_participant(node: ProtocolDiagramNodeV1, *, dense: bool = False) -> DiagramNodeV1:
+    label = _clean_display_text(node.label, limit=None)
+    if dense:
+        label = _compact_dense_label(label, limit=24)
     return DiagramNodeV1(
         node_id=node.node_id,
-        label=_clean_display_text(node.label, limit=None),
+        label=label,
         evidence_refs=(),
         role=DiagramNodeRole.PROTOCOL_PARTICIPANT,
     )
 
 
-def _project_state(node: ProtocolDiagramNodeV1) -> DiagramNodeV1:
+def _project_state(node: ProtocolDiagramNodeV1, *, dense: bool = False) -> DiagramNodeV1:
+    label = _clean_display_text(node.label, limit=None)
+    if dense:
+        label = _compact_dense_label(label, limit=24)
     return DiagramNodeV1(
         node_id=node.node_id,
-        label=_clean_display_text(node.label, limit=None),
+        label=label,
         evidence_refs=(),
         role=DiagramNodeRole.PROTOCOL_STATE,
     )
@@ -530,20 +544,16 @@ def _project_message(edge: ProtocolDiagramEdgeV1) -> DiagramEdgeV1:
     )
 
 
-def _project_ordered_message(
-    edge: ProtocolDiagramEdgeV1,
-    index: int,
-    participants: dict[str, str],
-) -> DiagramNodeV1:
+def _project_dense_message(edge: ProtocolDiagramEdgeV1, index: int) -> DiagramEdgeV1:
     order = edge.order if edge.order is not None else index
-    source = participants.get(edge.source_id, _clean_display_text(edge.source_id, limit=None))
-    target = participants.get(edge.target_id, _clean_display_text(edge.target_id, limit=None))
-    message = _clean_display_text(edge.label, limit=None)
-    return DiagramNodeV1(
-        node_id=f"protocol-message-{index:04d}",
-        label=f"#{order:02d} {source} → {target}: {message}",
+    label = _compact_dense_label(f"#{order} {_clean_display_text(edge.label, limit=None)}")
+    return DiagramEdgeV1(
+        source_node_id=edge.source_id,
+        target_node_id=edge.target_id,
+        label=label,
         evidence_refs=(),
-        role=DiagramNodeRole.PROTOCOL_PARTICIPANT,
+        direction=DiagramRelationDirection.DIRECTED,
+        relation_type=_protocol_edge_relation(edge),
     )
 
 
@@ -564,25 +574,37 @@ def _ordered_edges(
     )
 
 
-def _project_transition(edge: ProtocolDiagramEdgeV1) -> DiagramEdgeV1:
+def _project_transition(edge: ProtocolDiagramEdgeV1, *, dense: bool = False) -> DiagramEdgeV1:
     details = [_clean_display_text(edge.label, limit=None)]
     if edge.order is not None:
         details.insert(0, f"#{edge.order}")
+    label = " · ".join(item for item in details if item)
+    if dense:
+        trigger = _BRACKETED_TOKEN.search(label)
+        label = (
+            trigger.group(0)
+            if trigger is not None
+            else _compact_dense_label(label, limit=24)
+        )
     return DiagramEdgeV1(
         source_node_id=edge.source_id,
         target_node_id=edge.target_id,
-        label=" · ".join(item for item in details if item),
+        label=label,
         evidence_refs=(),
         direction=DiagramRelationDirection.DIRECTED,
-        relation_type=(
-            DiagramRelationType.PROTOCOL_FACTUAL
-            if edge.validation_status
-            in {
-                ProtocolValidationStatus.OBSERVED,
-                ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED,
-            }
-            else DiagramRelationType.PROTOCOL_INFERENCE
-        ),
+        relation_type=_protocol_edge_relation(edge),
+    )
+
+
+def _protocol_edge_relation(edge: ProtocolDiagramEdgeV1) -> DiagramRelationType:
+    return (
+        DiagramRelationType.PROTOCOL_FACTUAL
+        if edge.validation_status
+        in {
+            ProtocolValidationStatus.OBSERVED,
+            ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED,
+        }
+        else DiagramRelationType.PROTOCOL_INFERENCE
     )
 
 
@@ -611,6 +633,7 @@ def _project_field(
     index: int,
     *,
     include_index: bool = False,
+    dense: bool = False,
 ) -> DiagramNodeV1:
     if field.encrypted_opaque:
         field_name = "Opaque encrypted payload · bytes omitted"
@@ -620,12 +643,37 @@ def _project_field(
     if include_index:
         location = f"offset {field.offset} · " if field.offset is not None else ""
         label = f"#{index:02d} {location}{label}"
+    if dense:
+        label = _compact_dense_label(label)
     return DiagramNodeV1(
         node_id=f"protocol-field-{index:04d}",
         label=label,
         evidence_refs=(),
         role=DiagramNodeRole.PROTOCOL_FIELD,
     )
+
+
+def _compact_dense_label(value: str, *, limit: int = _DENSE_LABEL_LIMIT) -> str:
+    """Shorten dense labels while retaining their first clause and any protocol token."""
+    cleaned = _clean_display_text(value, limit=None)
+    if len(cleaned) <= limit:
+        return cleaned
+
+    first_segment = _LABEL_SEGMENT.split(value, maxsplit=1)[0]
+    segment = _clean_display_text(first_segment, limit=None)
+    token_match = _BRACKETED_TOKEN.search(cleaned)
+    if token_match is not None:
+        token = token_match.group(0)
+        token_end = segment.find(token) + len(token) if token in segment else limit
+        if token_end <= limit - 1:
+            return segment[: limit - 1].rstrip(" .,:;—-") + "…"
+        prefix_budget = limit - len(token) - 2
+        first_clause = segment.replace(token, "", 1) if token in segment else segment
+        prefix = first_clause[:prefix_budget].rstrip(" .,:;—-")
+        return f"{prefix} {token}…".strip()
+    if len(segment) < limit:
+        return segment.rstrip(" .,:;—-") + "…"
+    return segment[: limit - 1].rstrip(" .,:;—-") + "…"
 
 
 def _bounded_field_evidence(

@@ -441,7 +441,7 @@ def test_d2_tool_lock_matches_compiler_version() -> None:
 
 
 def test_diagram_compilation_policy_version_was_incremented() -> None:
-    assert DIAGRAM_COMPILATION_POLICY_VERSION == "diagram-d2-svg-v11-m21-opinion-render"
+    assert DIAGRAM_COMPILATION_POLICY_VERSION == "diagram-d2-svg-v12-m21-protocol-dense-figures"
 
 
 @dataclass(frozen=True, slots=True)
@@ -590,6 +590,110 @@ async def test_compile_pins_version_render_argv_environment_and_limits() -> None
     assert compiled.compiler == "d2"
     assert compiled.compiler_version == "0.9.0"
     assert compiled.compiler_policy_version == DIAGRAM_COMPILATION_POLICY_VERSION
+
+
+async def test_dense_protocol_state_machine_uses_compact_elk_spacing() -> None:
+    nodes = tuple(
+        _node(
+            f"state-{index:02d}",
+            f"State {index:02d}",
+            role=DiagramNodeRole.PROTOCOL_STATE,
+        )
+        for index in range(1, 10)
+    )
+    edges = tuple(
+        _edge(
+            f"state-{((index - 1) % len(nodes)) + 1:02d}",
+            f"state-{(index % len(nodes)) + 1:02d}",
+            f"#{index} [MSG{index:02d}]",
+            relation_type=DiagramRelationType.PROTOCOL_FACTUAL,
+            direction=DiagramRelationDirection.DIRECTED,
+        )
+        for index in range(1, 18)
+    )
+    diagram = _diagram(
+        kind=EnrichmentDiagramKind.EXECUTION_SEQUENCE,
+        profile=DiagramProfile.PROTOCOL_STATE_MACHINE,
+        nodes=nodes,
+        edges=edges,
+    )
+    runner = _ControlledRunner(_version_result(), _svg_result())
+
+    await D2DiagramCompiler(runner=runner).compile(diagram)
+
+    assert runner.calls[1].argv[1:6] == (
+        "--layout=elk",
+        "--pad=8",
+        "--elk-nodeNodeBetweenLayers=20",
+        "--elk-edgeNodeBetweenLayers=10",
+        "--timeout=10",
+    )
+
+
+def test_dense_protocol_state_machine_bundles_parallel_trigger_labels() -> None:
+    nodes = tuple(
+        _node(
+            f"state-{index:02d}",
+            f"State {index:02d}",
+            role=DiagramNodeRole.PROTOCOL_STATE,
+        )
+        for index in range(1, 10)
+    )
+    self_triggers = ("[PING]", "[PONG]", "[HB]", "[HB_OK]", "[CONFIRMED]", "[CON]")
+    edges = [
+        _edge("state-04", "state-04", label, direction=DiagramRelationDirection.DIRECTED)
+        for label in self_triggers
+    ]
+    edges.append(
+        _edge(
+            "state-06",
+            "state-06",
+            "[PREPARE_PROGRESS]",
+            direction=DiagramRelationDirection.DIRECTED,
+        )
+    )
+    edges.extend(
+        _edge(
+            f"state-{index:02d}",
+            f"state-{index + 1:02d}",
+            "[CAL]" if index == 8 else f"[STATE_{index:02d}]",
+            direction=DiagramRelationDirection.DIRECTED,
+        )
+        for index in range(1, 9)
+    )
+    edges.extend(
+        (
+            _edge(
+                "state-09",
+                "state-08",
+                "[RESUME_OFFSET]",
+                direction=DiagramRelationDirection.DIRECTED,
+            ),
+            _edge(
+                "state-09",
+                "state-01",
+                "[CLOSE]",
+                direction=DiagramRelationDirection.DIRECTED,
+            ),
+        )
+    )
+    diagram = _diagram(
+        profile=DiagramProfile.PROTOCOL_STATE_MACHINE,
+        nodes=nodes,
+        edges=tuple(edges),
+    )
+
+    source = encode_d2_source(diagram).decode()
+
+    assert len(diagram.edges) == 17
+    assert source.count(" -> ") == 10
+    assert source.count(" <-> ") == 1
+    assert source.count("n004 -> n004") == 1
+    assert source.count("n006 -> n006") == 1
+    assert all(label in source for label in (*self_triggers, "[PREPARE_PROGRESS]"))
+    assert "→ [CAL]" in source
+    assert "← [RESUME_OFFSET]" in source
+    assert "[STATE_01]" in source
 
 
 async def test_compile_is_deterministic_for_identical_diagrams() -> None:

@@ -65,7 +65,7 @@ from cti_app.domain.semantic_annotation import (
     SemanticTextSpanV1,
     SemanticTextV1,
 )
-from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
+from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler, encode_d2_source
 from cti_app.infrastructure.database.repositories.investigation import _opinion_from_row
 from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 from tests.test_edition_typst_rendering import _edition_document
@@ -86,22 +86,31 @@ _GENERIC_SVG = (
 )
 
 
-def test_protocol_sequence_projection_keeps_complete_card_labels() -> None:
+def test_dense_protocol_sequence_projection_keeps_compact_numbered_arrows() -> None:
     base = _three_views()[0]
     participant = "CLIENT_ESTABLISHED_" * 6
-    message = "handshake (lws, tls) " + "payload_field_" * 7
+    message = "[PING] handshake (lws, tls) " + "payload_field_" * 7
     spec = replace(
         base,
         nodes=(replace(base.nodes[0], label=participant), *base.nodes[1:]),
         edges=tuple(replace(base.edges[0], label=message, order=index) for index in range(1, 10)),
     )
     projected = project_protocol_diagram(spec)
-    labels = tuple(node.label for node in projected.nodes)
+    labels = tuple(edge.label or "" for edge in projected.edges)
+    source = encode_d2_source(projected).decode()
 
-    assert len(labels) == 9
-    assert all(participant in label for label in labels)
-    assert all(message in label for label in labels)
-    assert all("…" not in label for label in labels)
+    assert len(projected.edges) == 9
+    assert len(projected.nodes) == 2
+    assert "shape: sequence_diagram" in source
+    assert source.count(" -> ") == 9
+    assert all(label.startswith("#") for label in labels)
+    assert all("→" in label for label in labels)
+    assert all("[PING]" in label for label in labels)
+    assert all(len(label) <= 44 for label in labels)
+    assert all(len(node.label) <= 44 for node in projected.nodes)
+    assert all(participant not in label for label in labels)
+    assert all(message not in label for label in labels)
+    assert all("…" in label for label in labels)
 
 
 def test_sparse_protocol_projection_keeps_full_node_detail_and_field_labels() -> None:
@@ -768,9 +777,9 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     sequence_svg = await media_store.read(sequence_figure.asset_id)
     view_box = re.search(rb'viewBox="[-0-9.]+ [-0-9.]+ ([0-9.]+) ([0-9.]+)"', sequence_svg)
     assert view_box is not None
-    # The 17-message, two-column sequence view is intentionally portrait-shaped
-    # so its labels remain readable at full-page height.
+    # The dense sequence is split into two native D2 lifeline panels to fit the page.
     assert float(view_box.group(1)) / float(view_box.group(2)) >= 0.45
+    assert b"Messages 01" in sequence_svg
     for figure in figures:
         svg = await media_store.read(figure.asset_id)
         view_box = re.search(rb'viewBox="[-0-9.]+ [-0-9.]+ ([0-9.]+) ([0-9.]+)"', svg)
@@ -1123,7 +1132,7 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
             size
             for lines in figure_lines.values()
             for text, size in lines
-            if re.match(r"^\d+\. Message \d{2}$", text)
+            if re.match(r"^#\d+ Message \d{2}$", text)
         ]
         state_sizes = [
             size
