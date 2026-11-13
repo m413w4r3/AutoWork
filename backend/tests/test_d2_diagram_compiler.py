@@ -442,7 +442,7 @@ def test_d2_tool_lock_matches_compiler_version() -> None:
 
 def test_diagram_compilation_policy_version_was_incremented() -> None:
     assert DIAGRAM_COMPILATION_POLICY_VERSION == (
-        "diagram-d2-svg-v14-m21-protocol-state-self-loops"
+        "diagram-d2-svg-v15-m21-protocol-state-self-loops"
     )
 
 
@@ -651,8 +651,13 @@ def test_protocol_state_machine_places_compact_auto_transition_in_node() -> None
     assert len(diagram.edges) == 2
     assert diagram.edges[0].source_node_id == diagram.edges[0].target_node_id
     assert "n001 -> n001" not in source
-    assert 'n001: "Ready\\n↻ [PING]"' in source
+    assert 'n001: "Ready\\nboucle : [PING]"' in source
     assert 'n001 -> n002: "[STOP]"' in source
+    ready_definition = source[source.index('n001: "Ready') : source.index("\nn002:")]
+    assert ready_definition.count("font-size:") == 1
+    assert ready_definition.count("bold: true") == 1
+    assert not re.search(r"(?m)^\s+font(?:-family)?:\s", ready_definition)
+    assert "↻" not in ready_definition
 
 
 def test_dense_protocol_state_machine_bundles_parallel_trigger_labels() -> None:
@@ -675,14 +680,6 @@ def test_dense_protocol_state_machine_bundles_parallel_trigger_labels() -> None:
         _edge("idle", "idle", label, direction=DiagramRelationDirection.DIRECTED)
         for label in self_triggers
     ]
-    edges.append(
-        _edge(
-            "preparation",
-            "preparation",
-            "[PREPARE_PROGRESS]",
-            direction=DiagramRelationDirection.DIRECTED,
-        )
-    )
     edges.extend(
         (
             _edge(
@@ -761,19 +758,22 @@ def test_dense_protocol_state_machine_bundles_parallel_trigger_labels() -> None:
 
     source = encode_d2_source(diagram).decode()
 
-    assert len(diagram.edges) == 16
-    assert sum(edge.source_node_id == edge.target_node_id for edge in diagram.edges) == 5
+    assert len(diagram.edges) == 15
+    assert sum(edge.source_node_id == edge.target_node_id for edge in diagram.edges) == 4
     assert source.count(" -> ") == 5
     assert source.count(" <-> ") == 3
     assert "n004 -> n004" not in source
     assert "n005 -> n005" not in source
-    assert 'n004: "Session au repos\\n↻ [PING] [PONG] [HB] [HB_OK]"' in source
-    assert 'n005: "Préparation\\n↻ [PREPARE_PROGRESS]"' in source
+    assert 'n004: "Session au repos\\nboucle : [PING] [PONG] [HB] [HB_OK]"' in source
+    assert 'n005: "Préparation"' in source
     assert all(label in source for label in (*self_triggers, "[PREPARE_PROGRESS]", "[PPPP]"))
-    assert "Session → Prépar.:\\n[PREPARE_PROGRESS]" in source
-    assert "Prépar. → Session: [PPPP]" in source
-    assert "Transf. → Suspendu:\\n[RESUME_OFFSET]" in source
-    assert "Suspendu → Transf.: [CAL]" in source
+    assert 'n004 <-> n005: "→ [PREPARE_PROGRESS]\\n← [PPPP]" {' in source
+    assert 'n004 <-> n006: "→ [Binaire]\\n← [END] [CONFIRMED]" {' in source
+    assert 'n006 <-> n007: "→ [RESUME_OFFSET]\\n← [CAL]" {' in source
+    assert "Session →" not in source
+    assert "Prépar. →" not in source
+    assert "Transf. →" not in source
+    assert "Suspendu →" not in source
     assert "[DIS_ACK]" in source
 
 

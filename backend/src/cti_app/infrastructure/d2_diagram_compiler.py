@@ -281,7 +281,7 @@ def _protocol_state_machine_auto_transition_labels(
     labels_by_node: dict[str, list[str]] = {}
     for (node_id, _relation_type, _unique_index), edges in groups.items():
         triggers = " ".join(edge.label for edge in edges if edge.label)
-        label = f"↻ {triggers}" if triggers else "↻"
+        label = f"boucle : {triggers}" if triggers else "boucle :"
         labels_by_node.setdefault(node_id, []).append(label)
     return {node_id: tuple(labels) for node_id, labels in labels_by_node.items()}
 
@@ -296,63 +296,12 @@ def _is_protocol_state_machine_auto_transition(
     )
 
 
-def _directed_transition_group_label(
-    edges: Sequence[DiagramEdgeV1],
-    node_labels: Mapping[str, str],
-) -> str:
-    edge = edges[0]
-    source_label = node_labels[edge.source_node_id]
-    target_label = node_labels[edge.target_node_id]
-    triggers = " ".join(item.label for item in edges if item.label)
-    transition = f"{source_label} → {target_label}"
-    return f"{transition}: {triggers}" if triggers else transition
-
-
-def _state_transition_node_labels(diagram: DiagramSpecV1) -> dict[str, str]:
-    """Use short, unique state names in reciprocal edge labels when possible."""
-    labels = {node.node_id: " ".join(node.label.split()) for node in diagram.nodes}
-    words = {node_id: label.split() for node_id, label in labels.items()}
-    label_word_counts = {
-        node_id: (1 if len(parts) > 1 else len(parts)) for node_id, parts in words.items()
-    }
-
-    def shorten(label: str, word_count: int) -> str:
-        prefix = " ".join(label.split()[:word_count])
-        return f"{prefix[:6].rstrip()}." if word_count == 1 and len(prefix) > 8 else prefix
-
-    abbreviations = {
-        node_id: shorten(labels[node_id], label_word_counts[node_id]) for node_id in labels
-    }
-
-    while True:
-        duplicate_labels = {
-            label
-            for label in abbreviations.values()
-            if sum(candidate == label for candidate in abbreviations.values()) > 1
-        }
-        if not duplicate_labels:
-            break
-        changed = False
-        for node_id, abbreviation in abbreviations.items():
-            if abbreviation not in duplicate_labels:
-                continue
-            if label_word_counts[node_id] < len(words[node_id]):
-                label_word_counts[node_id] += 1
-                abbreviations[node_id] = shorten(labels[node_id], label_word_counts[node_id])
-                changed = True
-            else:
-                abbreviations[node_id] = labels[node_id]
-        if not changed:
-            break
-    return abbreviations
-
-
 def _edge_renderings(diagram: DiagramSpecV1) -> tuple[_D2EdgeRendering, ...]:
     """Bundle dense parallel transitions without changing the validated graph.
 
     State-machine auto-transitions are projected into their node labels.
-    Opposite transitions share a bidirectional connector with the source and
-    target named in each trigger label, avoiding ambiguous direction prefixes.
+    Opposite transitions share a bidirectional connector. Compact label arrows
+    show whether each trigger follows the connector's source-to-target direction.
     """
     if not _is_dense_protocol_state_machine(diagram):
         return tuple(
@@ -389,7 +338,6 @@ def _edge_renderings(diagram: DiagramSpecV1) -> tuple[_D2EdgeRendering, ...]:
         edge_groups.setdefault(key, []).append(edge)
 
     rendered: list[_D2EdgeRendering] = []
-    node_labels = _state_transition_node_labels(diagram)
     for (left, right, relation_type, unique_index), edges in edge_groups.items():
         can_bundle = unique_index is None and len(edges) > 1 and all(edge.label for edge in edges)
         if not can_bundle:
@@ -411,8 +359,10 @@ def _edge_renderings(diagram: DiagramSpecV1) -> tuple[_D2EdgeRendering, ...]:
         forward = tuple(edge for edge in edges if edge.source_node_id == left)
         reverse = tuple(edge for edge in edges if edge.source_node_id == right)
         if left != right and forward and reverse:
-            forward_label = _directed_transition_group_label(forward, node_labels)
-            reverse_label = _directed_transition_group_label(reverse, node_labels)
+            forward_triggers = " ".join(edge.label or "" for edge in forward)
+            reverse_triggers = " ".join(edge.label or "" for edge in reverse)
+            forward_label = f"→ {forward_triggers}"
+            reverse_label = f"← {reverse_triggers}"
             label = f"{forward_label}\n{reverse_label}"
             source_node_id, target_node_id, connector = left, right, "<->"
         else:
