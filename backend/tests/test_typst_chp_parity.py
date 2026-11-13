@@ -1348,9 +1348,12 @@ async def test_real_typst_and_poppler_render_v6_opinion_without_changing_v5(
     assert "APPORTS DE L'ANALYSE" in normalized_extracted
     assert "FAIT ÉTAYÉ" in normalized_extracted
     assert "LE CONSTAT SUPPLÉMENTAIRE EST CORROBORÉ" in normalized_extracted
+    assert "RÉFÉRENCES" in normalized_extracted
+    assert re.search(r"RÉFÉRENCES\s*:", normalized_extracted) is None
+    assert re.search(r"\[[FE]\d+\]", normalized_extracted) is None
+    assert "ANNEXE DE TRAÇABILITÉ" not in normalized_extracted
+    assert "CONSTATS LOGIQUES CITÉS" not in normalized_extracted
     assert re.search(r"CONFIANCE\s*:\s*\d+\s*%", normalized_extracted) is None
-    assert "[F1]" in normalized_extracted
-    assert "[E1]" in normalized_extracted
 
     uris = []
     for page in reader.pages:
@@ -1735,7 +1738,10 @@ async def test_real_typst_renders_safe_opinion_pipe_tables_and_typed_materials(
     assert "Clé AES" in extracted
     assert "Synthetic fixture decryption key" in extracted
     assert "config/key.bin:0x20-0x2f" in extracted
-    assert "Observation de preuve : [E1]" in extracted
+    assert "Observation de preuve" not in extracted
+    assert re.search(r"\[[FE]\d+\]", extracted) is None
+    assert re.search(r"Références\s*:", extracted, flags=re.IGNORECASE) is None
+    assert "ANNEXE DE TRAÇABILITÉ" not in extracted
     assert sum(f"fixture-ioc-{index:02d}.example" in extracted for index in range(25)) == 25
     typed_material_page = next(
         index
@@ -2163,10 +2169,11 @@ def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_navigabl
     assert normalized_text.count("NOTE DE L'ANALYSTE") == 3
     assert "SHA-256 DU PASSAGE" not in normalized_text
 
-    annex_start = normalized_text.index("ANNEXE DE TRAÇABILITÉ")
-    narrative_text = normalized_text[:annex_start]
-    annex_text = normalized_text[annex_start:]
-    assert "CONSTATS LOGIQUES CITÉS" in annex_text
+    assert "RÉFÉRENCES" in normalized_text
+    assert re.search(r"RÉFÉRENCES\s*:", normalized_text) is None
+    assert re.search(r"\[[FE]\d+\]", normalized_text) is None
+    assert "ANNEXE DE TRAÇABILITÉ" not in normalized_text
+    assert "CONSTATS LOGIQUES CITÉS" not in normalized_text
     forbidden_narrative_markers = (
         r"\bFinding\s+[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
         r"\bÉvidence\s+[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
@@ -2177,21 +2184,17 @@ def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_navigabl
         r"(?:ancre|passage)\s+SHA-256",
     )
     for marker in forbidden_narrative_markers:
-        assert re.search(marker, narrative_text, re.IGNORECASE) is None, marker
-    compact_narrative = re.sub(r"\s+", "", narrative_text)
-    assert "[F1]" in compact_narrative
-    assert "[E1]" in compact_narrative
-    assert re.search(r"\b[0-9a-f]{64}\b", narrative_text, re.IGNORECASE) is None
-    compact_annex = re.sub(r"\s+", "", annex_text)
+        assert re.search(marker, normalized_text, re.IGNORECASE) is None, marker
+    assert re.search(r"\b[0-9a-f]{64}\b", normalized_text, re.IGNORECASE) is None
     for reference in annex["opinion_refs"]:
-        assert reference["label"] in compact_annex
-        assert re.sub(r"\s+", "", reference["display_label"]).upper() in compact_annex
-        assert reference["reference_id"].upper() not in compact_annex
-        assert reference["reference_id"] not in re.sub(r"\s+", "", narrative_text)
+        assert "note_number" in reference
+        assert re.fullmatch(r"\[[FE]\d+\]", reference["label"])
+        assert reference["display_label"]
+        assert reference["reference_id"].upper() not in re.sub(r"\s+", "", normalized_text)
     assert (
         re.search(
             r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
-            annex_text,
+            normalized_text,
             re.IGNORECASE,
         )
         is None

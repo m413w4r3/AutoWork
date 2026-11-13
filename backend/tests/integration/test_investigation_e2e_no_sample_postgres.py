@@ -16,6 +16,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import replace
@@ -1079,7 +1080,9 @@ async def test_investigation_no_sample_postgres_continuous_journey(
             assert "reviewer:m05b-human" not in text
             assert "approver:m05b-human" not in text
             if label == "v6":
-                assert "ANNEXE DE TRAÇABILITÉ" in text
+                assert "ANNEXE DE TRAÇABILITÉ" not in text
+                assert re.search(r"\[[FE]\d+\]", text) is None
+                assert re.search(r"Références\s*:", text, flags=re.IGNORECASE) is None
                 # Reader PDFs carry no internal identifiers.
                 assert "".join(text.split()).count(str(observation.id)) == 0
 

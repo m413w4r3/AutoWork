@@ -499,11 +499,12 @@ async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
     chronology_text = normalized_text.split("chronologie", 1)[1].split("limites des preuves", 1)[0]
     assert "1." in chronology_text, "W17 chronology must render as a numbered list"
     assert "rapport. 1" in chronology_text
-    assert "annexe de traçabilité" in normalized_text
-    traceability_text = normalized_text.split("annexe de traçabilité", 1)[1]
-    assert "[f1]" in traceability_text and "[e1]" in traceability_text
-    assert re.search(r"\b[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\b", traceability_text) is None
-    assert "trace-f-" not in traceability_text and "trace-e-" not in traceability_text
+    assert "annexe de traçabilité" not in normalized_text
+    assert "constats logiques cités" not in normalized_text
+    assert re.search(r"\[[fe]\d+\]", normalized_text) is None
+    assert re.search(r"références\s*:", normalized_text) is None
+    assert re.search(r"\b[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\b", normalized_text) is None
+    assert "trace-f-" not in normalized_text and "trace-e-" not in normalized_text
 
     assert rendered_pages
     final_page_label = f"{len(rendered_pages)}/{len(rendered_pages)}"

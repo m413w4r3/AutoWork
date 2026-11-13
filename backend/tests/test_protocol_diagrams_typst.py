@@ -1112,8 +1112,10 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     ]
     preview_text_result = _run_blocking_process(("pdftotext", str(preview_pdf_path), "-"), 30)
     preview_text = " ".join(preview_text_result.stdout.decode("utf-8", errors="replace").split())
-    assert "[F1]" in preview_text
-    assert "[E1]" in preview_text
+    assert re.search(r"\[[FE]\d+\]", preview_text) is None
+    assert re.search(r"Références\s*:", preview_text, flags=re.IGNORECASE) is None
+    assert "ANNEXE DE TRAÇABILITÉ" not in preview_text
+    assert "Références" in preview_text
     assert "provenance des figures d'avis" not in preview_text.casefold()
     assert "A" * 64 in preview_text
     assert (

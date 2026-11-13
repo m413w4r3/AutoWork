@@ -531,7 +531,7 @@ async def test_real_typst_article_preserves_copyable_technical_literals(
 
 
 @pytest.mark.asyncio
-async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_once(
+async def test_real_typst_opinion_pdf_hides_internal_refs_and_keeps_public_sources(
     tmp_path: Path,
     typst_binary: str,
     font_bundle_root: Path,
@@ -892,16 +892,16 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
         "Fait étayé": 1,
         "Confiance : 90%": 0,
         opinion_marker: 1,
-        # Each short label appears once in the body and once in the traceability annex.
-        **{f"[F{index}]": 2 for index in range(1, citation_count + 1)},
-        **{f"[E{index}]": 2 for index in range(1, citation_count + 1)},
+        **{f"[F{index}]": 0 for index in range(1, citation_count + 1)},
+        **{f"[E{index}]": 0 for index in range(1, citation_count + 1)},
         finding_id: 0,
         evidence_id: 0,
-        "Constat technique": citation_count,
-        "Observation technique": citation_count,
-        "Constats logiques cités": 1,
-        "Observations": 1,
-        "ANNEXE DE TRAÇABILITÉ": 1,
+        "Constat technique": 0,
+        "Observation technique": 0,
+        "Constats logiques cités": 0,
+        "Observations": 0,
+        "ANNEXE DE TRAÇABILITÉ": 0,
+        "Références:": 0,
     }
     for marker, expected_count in base_expected_counts.items():
         assert base_text.count(marker) == expected_count, (
@@ -913,31 +913,16 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
             f"augmented PDF marker {marker!r}: expected {expected_count}, "
             f"found {augmented_text.count(marker)}"
         )
-    expected_citations = (
-        "Références:"
-        + "·".join(f"[F{index}]" for index in range(1, citation_count + 1))
-        + "·"
-        + "·".join(f"[E{index}]" for index in range(1, citation_count + 1))
+    assert re.search(r"\[[FE]\d+\]", augmented_text) is None
+    assert re.search(r"Références\s*:", augmented_text, flags=re.IGNORECASE) is None
+    assert "ANNEXE DE TRAÇABILITÉ" not in augmented_text
+    assert "Constats logiques cités" not in augmented_text
+    assert "Observations" not in augmented_text
+    assert re.search(r"\[[FE]\d+\]", augmented_without_note_numbers_text) is None
+    assert (
+        re.search(r"Références\s*:", augmented_without_note_numbers_text, flags=re.IGNORECASE)
+        is None
     )
-
-    def assert_body_citations(text: str, label: str) -> None:
-        body_text = text.split("ANNEXE DE TRAÇABILITÉ", maxsplit=1)[0]
-        compact_body_text = re.sub(r"\s+", "", body_text)
-        assert re.search(
-            re.escape(opinion_marker) + re.escape(expected_citations),
-            compact_body_text,
-        ), f"{label} PDF opinion body does not render the projected short reference labels"
-        citation_lines = [
-            line
-            for line in body_text.splitlines()
-            if "Références" in line or re.search(r"\[[FE]\d+\]", line)
-        ]
-        assert len(citation_lines) > 1, (
-            f"{label} PDF long opinion-reference line did not wrap: {citation_lines!r}"
-        )
-
-    assert_body_citations(augmented_text, "projected")
-    assert_body_citations(augmented_without_note_numbers_text, "synthetic no-note-number")
     for reference_id in (
         *(str(finding.id) for finding in findings),
         *(str(observation.id) for observation in observations),
@@ -946,6 +931,7 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
     assert re.search(r"CONFIANCE\s*:\s*\d+\s*%", base_text, flags=re.IGNORECASE) is None
     assert re.search(r"CONFIANCE\s*:\s*\d+\s*%", augmented_text, flags=re.IGNORECASE) is None
     assert base_text.count("Références") == 1
+    assert augmented_text.count("Références") == 1
     assert_reference_rows(base_text, "base", article=True)
     assert_reference_rows(augmented_text, "augmented", article=False)
     assert_timeline_citations(augmented_text, "augmented")
