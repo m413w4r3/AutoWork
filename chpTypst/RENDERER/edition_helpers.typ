@@ -109,11 +109,11 @@
     (1fr, 4fr),
     cell-align: (center, left),
     [Fichier intégré], [Description],
-    [Article CSV], [Un fichier `article.csv` par publication, avec les IOC publiés et les IOC originaux.],
+    [Article CSV], [Un fichier `article.csv` par publication, avec les IOC publiés et ceux identifiés lors de l'analyse.],
     [Export IOC], [Archive #raw("iocs_" + edition.edition.bulletin_identifier + ".zip") : CSV, manifeste JSON et #raw("legacy_iocs_" + edition.edition.bulletin_identifier + ".txt").],
     [STIX], [Génération déléguée en aval ; aucun fichier STIX n'est intégré à cette édition.],
     [Excel], [Génération déléguée en aval ; aucun tableur Excel n'est intégré à cette édition.],
-    [ZIP des annexes], [Non généré par AutoWork dans ce rendu.],
+    [ZIP des annexes], [Fournis séparément avec le bulletin : règles YARA et Suricata, notices et CSV d'IOC.],
   )
 
   for publication in articles {
