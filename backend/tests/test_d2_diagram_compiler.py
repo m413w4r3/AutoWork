@@ -441,7 +441,7 @@ def test_d2_tool_lock_matches_compiler_version() -> None:
 
 
 def test_diagram_compilation_policy_version_was_incremented() -> None:
-    assert DIAGRAM_COMPILATION_POLICY_VERSION == "diagram-d2-svg-v12-m21-protocol-dense-figures"
+    assert DIAGRAM_COMPILATION_POLICY_VERSION == "diagram-d2-svg-v13-m21-state-label-spacing"
 
 
 @dataclass(frozen=True, slots=True)
@@ -621,11 +621,12 @@ async def test_dense_protocol_state_machine_uses_compact_elk_spacing() -> None:
 
     await D2DiagramCompiler(runner=runner).compile(diagram)
 
-    assert runner.calls[1].argv[1:6] == (
+    assert runner.calls[1].argv[1:7] == (
         "--layout=elk",
         "--pad=8",
-        "--elk-nodeNodeBetweenLayers=20",
-        "--elk-edgeNodeBetweenLayers=10",
+        "--elk-nodeNodeBetweenLayers=4",
+        "--elk-edgeNodeBetweenLayers=20",
+        "--elk-nodeSelfLoop=140",
         "--timeout=10",
     )
 

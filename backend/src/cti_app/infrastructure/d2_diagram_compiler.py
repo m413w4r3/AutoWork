@@ -44,8 +44,9 @@ D2_LAYOUT = "elk"
 D2_LAYOUT_OPTIONS = ("--pad=8", "--elk-nodeNodeBetweenLayers=15")
 D2_DENSE_STATE_LAYOUT_OPTIONS = (
     "--pad=8",
-    "--elk-nodeNodeBetweenLayers=20",
-    "--elk-edgeNodeBetweenLayers=10",
+    "--elk-nodeNodeBetweenLayers=4",
+    "--elk-edgeNodeBetweenLayers=20",
+    "--elk-nodeSelfLoop=140",
 )
 D2_COMPILER_VERSION = "0.9.0"
 # These are rendering constraints. Keep them separate from enrichment's

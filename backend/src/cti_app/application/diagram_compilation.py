@@ -9,7 +9,7 @@ from typing import Protocol
 
 from cti_app.domain.production_editorial_enrichment import DiagramSpecV1
 
-DIAGRAM_COMPILATION_POLICY_VERSION = "diagram-d2-svg-v12-m21-protocol-dense-figures"
+DIAGRAM_COMPILATION_POLICY_VERSION = "diagram-d2-svg-v13-m21-state-label-spacing"
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
