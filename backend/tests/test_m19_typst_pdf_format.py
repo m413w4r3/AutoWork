@@ -181,8 +181,8 @@ def test_m19_renderer_manifest_versions_are_explicitly_pinned() -> None:
         _TEMPLATE_ROOT,
         manifest_name="edition-renderer-manifest.json",
     )
-    assert article.template_version == "chp-article-v47-m21-opinion-safe-links-m21-pdffix3"
-    assert edition.template_version == "chp-edition-v36-m21-opinion-render-m21-pdffix"
+    assert article.template_version == "chp-article-v47-m21-opinion-safe-links-m21-pdffix4"
+    assert edition.template_version == "chp-edition-v36-m21-opinion-render-m21-pdffix4"
 
 
 def test_semantic_inline_technical_highlight_has_no_content_padding() -> None:
@@ -651,3 +651,14 @@ async def test_edition_resets_footnote_numbers_per_publication_without_timeline_
         )
         assert reference_line.rstrip().endswith("1"), reference_line
         assert event_line.rstrip().endswith("2"), event_line
+
+
+def test_detection_section_is_not_rendered_in_reader_pdfs() -> None:
+    helpers = (_TEMPLATE_ROOT / "RENDERER" / "publication_helpers.typ").read_text(encoding="utf-8")
+    branch = helpers.split('content_section.type == "detection" [', 1)[1].split(
+        'content_section.type == "ioc" [', 1
+    )[0]
+
+    assert "#none" in branch
+    for internal_label in ("Code source", "Règle YARA candidate", "Couverture", "Limite :"):
+        assert internal_label not in branch

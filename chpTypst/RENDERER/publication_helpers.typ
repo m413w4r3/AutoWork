@@ -1437,66 +1437,8 @@
       ]
       #text(size: 7pt, fill: grey)[#text(content_section.attacker_identifier_note)]
     ] else if content_section.type == "detection" [
-      #render-section-heading[Détection]
-      #block(
-        width: 100%,
-        fill: rgb("#fff8e8"),
-        stroke: 0.5pt + rgb("#d6a84f"),
-        inset: 8pt,
-        radius: 4pt,
-      )[
-        #text(size: 9pt, weight: "bold")[#content_section.validation_banner]
-        #if content_section.validation_reason != none [
-          #parbreak()
-          #text(size: 8pt)[Motif : #content_section.validation_reason]
-        ]
-      ]
-      #parbreak()
-      #text(size: 8pt, weight: "bold")[Règle YARA candidate · #content_section.version]
-      #parbreak()
-      #text(size: 7pt)[Tests : #content_section.positive_real_count positifs réels · #content_section.positive_synthetic_count positifs synthétiques · #content_section.goodware_tested_count fichiers bénins testés · #content_section.false_positive_count faux positifs]
-      #parbreak()
-      #if content_section.engine_version != none [
-        #text(size: 7pt)[Moteur YARA : #content_section.engine_version]
-        #parbreak()
-      ]
-      #text(size: 7pt)[Règle créée le #content_section.created_date]
-      #if content_section.tested_date != none [
-        #text(size: 7pt)[ · dernier test le #content_section.tested_date]
-      ] else [
-        #text(size: 7pt)[ · aucun test réalisé]
-      ]
-      #parbreak()
-      #if content_section.coverage_statement != none [
-        #text(size: 7pt, weight: "bold")[Couverture : ]#text(size: 7pt)[#content_section.coverage_statement]
-        #parbreak()
-      ]
-      #for limitation in content_section.limitations [
-        #text(size: 7pt, fill: grey)[Limite : #limitation]
-        #parbreak()
-      ]
-      #if content_section.retrohunt_submitted == false [
-        #text(size: 7pt)[Aucun Retrohunt soumis.]
-        #parbreak()
-      ] else if content_section.retrohunt_submitted == true [
-        #text(size: 7pt)[Retrohunt soumis.]
-        #parbreak()
-      ]
-      #heading(level: 3)[Code source]
-      #block(
-        width: 100%,
-        fill: rgb("#f5f6f8"),
-        stroke: 0.4pt + rgb("#d7dbe0"),
-        inset: 7pt,
-        radius: 3pt,
-        breakable: true,
-      )[
-        #set text(font: code-font-families, size: 5.5pt)
-        #set par(leading: 0.82em, spacing: 0pt)
-        #for line in content_section.code_lines {
-          publication-detection-code-line(line)
-        }
-      ]
+      // Rule code, coverage and internal limits are delivered as annex files, not in the bulletin PDF.
+      #none
     ] else if content_section.type == "ioc" [
       #if opinion-publication [
         #render-opinion-ioc-reference()

@@ -551,7 +551,7 @@ async def test_real_typst_detection_band_reasons_and_rule_source_are_not_truncat
         ),
     )
 
-    for name, rule, expected_banner, expected_reason in cases:
+    for name, rule, expected_banner, _expected_reason in cases:
         publication = augment_publication_with_opinion(
             base,
             opinion,
@@ -603,19 +603,6 @@ async def test_real_typst_detection_band_reasons_and_rule_source_are_not_truncat
         reader = PdfReader(BytesIO(compiled.content), strict=True)
         assert reader.pages
         with anyio.fail_after(10):
-            font_result = await anyio.run_process(
-                (pdffonts, str(pdf_path)),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=True,
-            )
-        font_rows = font_result.stdout.decode("utf-8", errors="replace").splitlines()
-        assert any(
-            re.search(r"Cascadia\s*Mono", row, re.IGNORECASE)
-            and re.search(r"\byes\s+yes\s+yes\b", row, re.IGNORECASE)
-            for row in font_rows
-        ), font_result.stdout.decode("utf-8", errors="replace")
-        with anyio.fail_after(10):
             text_result = await anyio.run_process(
                 (pdftotext, str(pdf_path), "-"),
                 stdout=subprocess.PIPE,
@@ -624,47 +611,12 @@ async def test_real_typst_detection_band_reasons_and_rule_source_are_not_truncat
             )
         extracted = text_result.stdout.decode("utf-8", errors="replace")
         normalized = re.sub(r"\s+", " ", extracted).upper()
-        assert "Détection" in extracted
-        assert "DÉTECTION" in normalized
-        assert expected_banner.upper() in normalized
-        if expected_reason is not None:
-            assert expected_reason.upper() in normalized
-        assert "AUCUN RETROHUNT SOUMIS" in normalized
-        source_normalized = re.sub(r"\s+", "", rule.source)
-        page_text_without_footers = "".join(
-            "\n".join(
-                line
-                for line in page.splitlines()
-                if re.fullmatch(r"\s*\d+\s*/\s*\d+\s*", line) is None
-                and line.strip() != "Avis — publication approuvée v2"
-            )
-            for page in extracted.split("\f")
-        )
-        assert source_normalized in re.sub(r"\s+", "", page_text_without_footers)
-        detection_page = next(
-            index + 1
-            for index, page in enumerate(reader.pages)
-            if "DÉTECTION" in (page.extract_text() or "").upper()
-        )
-        image_prefix = tmp_path / f"detection-{name}-page"
-        with anyio.fail_after(15):
-            await anyio.run_process(
-                (
-                    pdftoppm,
-                    "-f",
-                    str(detection_page),
-                    "-l",
-                    str(detection_page),
-                    "-singlefile",
-                    "-png",
-                    str(pdf_path),
-                    str(image_prefix),
-                ),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=True,
-            )
-        assert image_prefix.with_suffix(".png").is_file()
+        # Reader PDFs no longer render the detection section: rule code, coverage and internal
+        # limits ship as annex files. The canonical publication data still carries them.
+        assert expected_banner.upper() not in normalized
+        assert "CODE SOURCE" not in normalized
+        assert "AUCUN RETROHUNT SOUMIS" not in normalized
+        assert re.sub(r"\s+", "", rule.source) not in re.sub(r"\s+", "", extracted)
 
     raw_source = 'rule raw_probe { condition: "' + "x" * 180 + '" }'
     raw_workspace = tmp_path / "raw-code-workspace"
