@@ -6,7 +6,7 @@ import hashlib
 import json
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from uuid import UUID
 
 from cti_app.application.analyst_opinion_service import OpinionError, OpinionErrorCode
@@ -30,6 +30,7 @@ from cti_app.domain.production_synthesis import (
     production_synthesis_from_json,
 )
 from cti_app.domain.publication_document import (
+    CanonicalPublicationDocument,
     PublicationDocumentV5,
     publication_document_article_v5_body,
     publication_document_from_json,
@@ -51,6 +52,21 @@ class DraftOpinionPdfRenderer(Protocol):
         evidence_observations: tuple[EvidenceObservation, ...] = (),
         base_publication_identity: dict[str, Any],
     ) -> DraftPublicationRender | CompiledTypstDocument: ...
+
+
+class DraftOpinionRenderInputBuilder(Protocol):
+    async def build_draft_preview_inputs(
+        self,
+        document: PublicationDocumentV5,
+        opinion: AnalystOpinionV1,
+        synthesis: ProductionSynthesisV1,
+        *,
+        base_publication_body_sha256: str | None = None,
+        infrastructure_graph: InvestigationGraph | None = None,
+        findings: tuple[InvestigationFinding, ...] = (),
+        evidence_observations: tuple[EvidenceObservation, ...] = (),
+        base_publication_identity: dict[str, Any],
+    ) -> tuple[CanonicalPublicationDocument, dict[str, Any]]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +107,50 @@ class AnalystOpinionPreviewService:
         expected_base_publication_sha256: str,
         protocol_figures: tuple[OpinionProtocolFigureV1, ...] | None = None,
     ) -> AnalystOpinionDraftPdf:
+        result = await self._preview(
+            opinion_id,
+            version=version,
+            expected_opinion_sha256=expected_opinion_sha256,
+            expected_base_publication_sha256=expected_base_publication_sha256,
+            protocol_figures=protocol_figures,
+            build_render_inputs=False,
+        )
+        if not isinstance(result, AnalystOpinionDraftPdf):
+            raise RuntimeError("PDF preview returned render inputs")
+        return result
+
+    async def preview_render_inputs(
+        self,
+        opinion_id: UUID,
+        *,
+        version: int,
+        expected_opinion_sha256: str,
+        expected_base_publication_sha256: str,
+        protocol_figures: tuple[OpinionProtocolFigureV1, ...] | None = None,
+    ) -> tuple[CanonicalPublicationDocument, dict[str, Any]]:
+        """Validate an exact draft opinion and return canonical publication/render inputs."""
+        result = await self._preview(
+            opinion_id,
+            version=version,
+            expected_opinion_sha256=expected_opinion_sha256,
+            expected_base_publication_sha256=expected_base_publication_sha256,
+            protocol_figures=protocol_figures,
+            build_render_inputs=True,
+        )
+        if not isinstance(result, tuple):
+            raise RuntimeError("Render input preview returned a PDF")
+        return cast(tuple[CanonicalPublicationDocument, dict[str, Any]], result)
+
+    async def _preview(
+        self,
+        opinion_id: UUID,
+        *,
+        version: int,
+        expected_opinion_sha256: str,
+        expected_base_publication_sha256: str,
+        protocol_figures: tuple[OpinionProtocolFigureV1, ...] | None,
+        build_render_inputs: bool,
+    ) -> AnalystOpinionDraftPdf | tuple[CanonicalPublicationDocument, dict[str, Any]]:
         async with self._uow_factory() as uow:
             opinion = await uow.analyst_opinions.get(opinion_id, version=version)
             current = await uow.analyst_opinions.get(opinion_id)
@@ -212,44 +272,45 @@ class AnalystOpinionPreviewService:
             observations=observations,
             findings=findings,
         )
+        base_publication_identity = {
+            "artifact": {
+                "id": str(base.id),
+                "version": base.version,
+                "sha256": base_sha256,
+                "document_schema": "PublicationDocumentV5",
+            },
+            "investigation_id": str(investigation.id),
+            "production_run_id": str(investigation.production_run_id),
+        }
+        preview_kwargs: dict[str, Any] = {
+            **renderer_kwargs,
+            "findings": findings,
+            "evidence_observations": observations,
+            "base_publication_identity": base_publication_identity,
+        }
+        if infrastructure_graph is not None:
+            preview_kwargs["infrastructure_graph"] = infrastructure_graph
+        if build_render_inputs:
+            builder = cast(DraftOpinionRenderInputBuilder, self._renderer)
+            return await builder.build_draft_preview_inputs(
+                base_document_v5,
+                render_opinion,
+                parsed_synthesis,
+                **preview_kwargs,
+            )
         if infrastructure_graph is None:
             compiled = await self._renderer.render_draft_preview(
                 base_document_v5,
                 render_opinion,
                 parsed_synthesis,
-                **renderer_kwargs,
-                findings=findings,
-                evidence_observations=observations,
-                base_publication_identity={
-                    "artifact": {
-                        "id": str(base.id),
-                        "version": base.version,
-                        "sha256": base_sha256,
-                        "document_schema": "PublicationDocumentV5",
-                    },
-                    "investigation_id": str(investigation.id),
-                    "production_run_id": str(investigation.production_run_id),
-                },
+                **preview_kwargs,
             )
         else:
             compiled = await self._renderer.render_draft_preview(
                 base_document_v5,
                 render_opinion,
                 parsed_synthesis,
-                **renderer_kwargs,
-                infrastructure_graph=infrastructure_graph,
-                findings=findings,
-                evidence_observations=observations,
-                base_publication_identity={
-                    "artifact": {
-                        "id": str(base.id),
-                        "version": base.version,
-                        "sha256": base_sha256,
-                        "document_schema": "PublicationDocumentV5",
-                    },
-                    "investigation_id": str(investigation.id),
-                    "production_run_id": str(investigation.production_run_id),
-                },
+                **preview_kwargs,
             )
         rendered = (
             compiled.compiled_document if isinstance(compiled, DraftPublicationRender) else compiled
