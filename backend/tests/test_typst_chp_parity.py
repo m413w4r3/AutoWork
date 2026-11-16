@@ -992,10 +992,10 @@ def test_brief_synthesis_uses_explicit_paragraph_gap_and_article_default() -> No
     synthesis_start = helpers.index('} else if content_section.type == "synthesis" [')
     chronology_start = helpers.index('] else if content_section.type == "chronology" [')
     synthesis = helpers[synthesis_start:chronology_start]
-    assert "paragraph-gap: if has-next-paragraph { 9pt } else { 0pt }" in synthesis
+    assert "paragraph-gap: if has-next-paragraph { 0.9em } else { 0pt }" in synthesis
     assert synthesis.count("render-body-block(") == 3
-    assert synthesis.count("paragraph-gap: if has-next-paragraph { 9pt } else { 0pt }") == 2
-    assert "paragraph-gap: 5pt" in synthesis
+    assert synthesis.count("paragraph-gap: if has-next-paragraph { 0.9em } else { 0pt }") == 2
+    assert "paragraph-gap: 0.9em" in synthesis
     assert "legacy-paragraph-spacing: true" in synthesis
     assert "#set par(spacing: 1em)" not in synthesis
 
@@ -1511,7 +1511,8 @@ async def test_opinion_paragraph_spacing_matches_b421f486_pdf_baseline(
 
     baseline_gap = paragraph_gap(baseline_pdf)
     current_gap = paragraph_gap(current_pdf)
-    assert abs(current_gap - baseline_gap) <= 0.5
+    # M21-FORMAT: paragraphs are deliberately more spaced than the historical baseline.
+    assert current_gap > baseline_gap + 2.0
 
 
 @pytest.mark.asyncio

@@ -819,15 +819,15 @@ async def test_real_typst_opinion_pdf_hides_internal_refs_and_keeps_public_sourc
                     f"expected 1, found {compact_text.count(expected_row)}"
                 )
                 continue
-            date_row = re.compile(rf"(?m)^\s*{number}\.\s*{re.escape(display_date)}\s*$")
-            url_row = re.compile(rf"(?m)^\s*{number}\s+{re.escape(source_url)}\s*$")
-            assert len(date_row.findall(reference_text)) == 1, (
-                f"{label} PDF reference {number} date/identifier row: expected 1, "
-                f"found {len(date_row.findall(reference_text))}"
+            # M21-FORMAT: bulleted "date : text" rows with the printed URL, no numbering.
+            flat = " ".join(reference_text.split())
+            row = f"• {display_date} :"
+            assert flat.count(row) == 1, (
+                f"{label} PDF reference {number} bullet date row: expected 1, "
+                f"found {flat.count(row)}"
             )
-            assert len(url_row.findall(reference_text)) == 1, (
-                f"{label} PDF reference {number} URL/identifier row: expected 1, "
-                f"found {len(url_row.findall(reference_text))}"
+            assert flat.count(source_url) == 1, (
+                f"{label} PDF reference {number} URL: expected 1, found {flat.count(source_url)}"
             )
 
     def assert_timeline_citations(text: str, label: str) -> None:
@@ -908,6 +908,8 @@ async def test_real_typst_opinion_pdf_hides_internal_refs_and_keeps_public_sourc
             f"base PDF marker {marker!r}: expected {expected_count}, "
             f"found {base_text.count(marker)}"
         )
+    # Bulleted references wrap inside the list indent: compare on normalized whitespace.
+    augmented_text = " ".join(augmented_text.split())
     for marker, expected_count in augmented_expected_counts.items():
         assert augmented_text.count(marker) == expected_count, (
             f"augmented PDF marker {marker!r}: expected {expected_count}, "
@@ -1820,7 +1822,7 @@ async def test_real_typst_lot6_a4_composition_fixture(
         )
         for page in reader.pages
     )
-    assert "5 octobre 2026 : La source décrit l'activité après sa publication." in text
+    assert "5 octobre 2026 La source décrit l'activité après sa publication." in " ".join(text.split())
     for number, caption in enumerate(
         (
             "Figure source wide, repère A.",

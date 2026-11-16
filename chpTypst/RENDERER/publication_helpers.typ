@@ -1085,7 +1085,7 @@
   let blocks = content-section.at("blocks", default: ())
   if visible-entries.len() > 0 or blocks.len() > 0 [
     #render-section-heading[Références]
-    #set list(spacing: 4pt, indent: 12pt)
+    #set list(spacing: 9pt, indent: 12pt)
     #for entry in visible-entries [#render-m19-publication-reference(entry)]
     #for item in blocks {render-body-block(item)}
   ]
@@ -1123,7 +1123,7 @@
     #if content-section.at("show_heading", default: true) [
       #render-section-heading[Références]
     ]
-    #set list(spacing: 4pt, indent: 12pt)
+    #set list(spacing: 9pt, indent: 12pt)
     #for entry in entries [
       #render-publication-reference(
         entry,
