@@ -1227,20 +1227,35 @@ def test_hidden_timeline_figure_does_not_consume_reader_figure_number(
 ) -> None:
     publication, *_ = _frontmatter_v6_case()
     opinion, _citation_context = _approved_opinion(publication)
-    protocol_figure = OpinionProtocolFigureV1(
-        kind=ProtocolDiagramKind.SEQUENCE,
-        model_sha256="a" * 64,
-        spec_sha256="b" * 64,
-        asset_id=UUID(int=4243),
-        asset_sha256="c" * 64,
-        preview_sha256="d" * 64,
-        pin_sha256="e" * 64,
-        compiler_name="d2",
-        compiler_version="0.6.9",
-        compiler_policy_version=PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION,
-        caption="Reader-visible protocol diagram.",
+    protocol_figures = tuple(
+        OpinionProtocolFigureV1(
+            kind=kind,
+            model_sha256="a" * 64,
+            spec_sha256="b" * 64,
+            asset_id=UUID(int=4243 + index),
+            asset_sha256="c" * 64,
+            preview_sha256="d" * 64,
+            pin_sha256="e" * 64,
+            compiler_name="d2",
+            compiler_version="0.6.9",
+            compiler_policy_version=PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION,
+            caption="Reader-visible protocol diagram.",
+        )
+        for index, kind in enumerate(
+            (
+                ProtocolDiagramKind.SEQUENCE,
+                ProtocolDiagramKind.STATE_MACHINE,
+                ProtocolDiagramKind.MESSAGE_FORMAT,
+            )
+        )
     )
-    opinion = replace(opinion, protocol_figures=(protocol_figure,), content_sha256="")
+    opinion = replace(
+        opinion,
+        status=AnalystOpinionStatus.DRAFT,
+        reviewer_id=None,
+        protocol_figures=protocol_figures,
+        content_sha256="",
+    )
     monkeypatch.setattr(
         typst_rendering_module,
         "build_publication_timeline_figure",
@@ -1258,7 +1273,7 @@ def test_hidden_timeline_figure_does_not_consume_reader_figure_number(
         section for section in model.content_sections if section["type"] == "analyst_opinion"
     )
 
-    assert opinion_section["protocol_figures"][0]["figure_number"] == 1
+    assert [f["figure_number"] for f in opinion_section["protocol_figures"]] == [1, 2, 3]
 
 
 def test_french_publication_dates_use_first_day_typography() -> None:

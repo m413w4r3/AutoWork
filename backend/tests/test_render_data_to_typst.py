@@ -241,9 +241,9 @@ def test_both_ioc_references_point_to_delivery_csv_annexes() -> None:
     publication_helpers = (
         repository_root / "chpTypst" / "RENDERER" / "publication_helpers.typ"
     ).read_text(encoding="utf-8")
-    official_reference = publication_helpers.split(
-        "#let render-opinion-ioc-reference() = {", 1
-    )[1].split("#let render-figure-caption(", 1)[0]
+    official_reference = publication_helpers.split("#let render-opinion-ioc-reference() = {", 1)[
+        1
+    ].split("#let render-figure-caption(", 1)[0]
     manual_reference = renderer.MANUEL_TYP.split("#let ioc-renvoi() = {", 1)[1].split(
         "// ---- Figures", 1
     )[0]

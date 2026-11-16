@@ -1359,8 +1359,8 @@ async def test_real_typst_opinion_hides_candidate_url_omission_details(
     reader = PdfReader(BytesIO(compiled.content), strict=True)
     extracted = " ".join("\n".join(page.extract_text() or "" for page in reader.pages).split())
     assert (
-        "Les indicateurs de compromission de cet avis (fichiers et réseau) sont repris dans le "
-        "tableau" in extracted
+        "Les indicateurs de compromission de cet avis (fichiers et réseau) figurent dans les "
+        "annexes CSV du dossier de livraison" in extracted
     )
     assert "Pistes non confirmées" not in extracted
     assert "candidate-001.example" not in extracted
