@@ -97,8 +97,32 @@ class _Uow:
         return None
 
 
-def _fixture():
-    document = _base_v5()
+def _fixture(*, augmented_current: bool = False):
+    payload = serialize_publication_document(_base_v5())
+    final_before = " ; la correspondance de ces valeurs reste à examiner."
+    final_after = (
+        " Leur correspondance précise avec chacun des composants nommés n\u2019est pas établie "
+        "dans les éléments techniques décrits ; il ne faut donc pas leur attribuer "
+        "arbitrairement un nom de fichier."
+    )
+    spans = [
+        {"role": "text", "text": "Les résultats extraits par "},
+        {"role": "proper_name", "text": "dmpdump"},
+        {"role": "text", "text": " portent le condensat "},
+        {"role": "technical_literal", "text": "SHA-256"},
+        {"role": "text", "text": " et les deux empreintes "},
+        {"role": "ioc", "text": "a" * 64},
+        {"role": "text", "text": " ainsi que "},
+        {"role": "ioc", "text": "b" * 64},
+        {"role": "text", "text": final_before},
+    ]
+    target_text = "".join(span["text"] for span in spans)
+    payload["lead"][0]["text"] = target_text
+    rich_paragraph = next(
+        item for item in payload["rich_text"]["paragraphs"] if item["anchor"] == "lead:0001"
+    )
+    rich_paragraph["spans"] = spans
+    document = publication_document_v5_from_json(payload)
     payload = serialize_publication_document(document)
     canonical = ProductionArtifactStore.canonical_json_bytes(payload)
     blob_id = uuid4()
@@ -108,15 +132,60 @@ def _fixture():
         production_run_id=run_id,
         subject_id=document.subject_id,
         stage=ProductionArtifactStage.PUBLICATION,
-        version=1,
+        version=8 if augmented_current else 1,
         input_hash=hashlib.sha256(b"publication inputs").hexdigest(),
         status=ProductionArtifactStatus.VERIFIED,
         canonical_blob_id=blob_id,
     )
-    artifacts = _ArtifactRepository((artifact,))
     store = _MemoryStore({blob_id: canonical})
+    artifact_items = [artifact]
+    if augmented_current:
+        v6 = {"schema_version": "6", "base_publication": payload}
+        v7 = {
+            "schema_version": "7",
+            "publication_kind": "article",
+            "base_publication": v6,
+        }
+        v8 = {
+            "schema_version": "8",
+            "article_format": {},
+            "base_publication": v7,
+        }
+        current_blob_id = uuid4()
+        store.blobs[current_blob_id] = ProductionArtifactStore.canonical_json_bytes(v8)
+        current = ProductionArtifact(
+            id=uuid4(),
+            production_run_id=run_id,
+            subject_id=document.subject_id,
+            stage=ProductionArtifactStage.PUBLICATION,
+            version=9,
+            input_hash=hashlib.sha256(b"augmented publication").hexdigest(),
+            status=ProductionArtifactStatus.VERIFIED,
+            canonical_blob_id=current_blob_id,
+            metadata={"previous_publication_artifact_id": str(artifact.id)},
+        )
+        artifact_items.append(current)
+    artifacts = _ArtifactRepository(tuple(artifact_items))
     run = SimpleNamespace(id=run_id, subject_id=document.subject_id)
     runs = _RunRepository(run)
+    qa_calls = 0
+
+    async def qa_runner(_uow, _artifact, _publication):
+        nonlocal qa_calls
+        qa_calls += 1
+        if qa_calls == 1:
+            return {
+                "passed": True,
+                "checks": {"exact_projection": True, "semantic_annotation_coverage": True},
+                "errors": [],
+                "warnings": [],
+            }
+        return {
+            "passed": False,
+            "checks": {"exact_projection": False, "semantic_annotation_coverage": True},
+            "errors": ["Publication differs from canonical Assembly projection"],
+            "warnings": [],
+        }
 
     def uow_factory():
         return _Uow(artifacts, runs)
@@ -124,6 +193,7 @@ def _fixture():
     service = PublicationTextCorrectionService(
         uow_factory=uow_factory,  # type: ignore[arg-type]
         artifact_store=store,  # type: ignore[arg-type]
+        qa_runner=qa_runner,
     )
     section_text = document.lead[0].text
     command = PublicationTextCorrectionCommand(
@@ -134,7 +204,7 @@ def _fixture():
         artifact_sha256=hashlib.sha256(canonical).hexdigest(),
         field_path="lead[0].text",
         expected_text=section_text,
-        replacement_text=f"{section_text} Correction éditoriale.",
+        replacement_text=section_text.replace(final_before, final_after),
         actor_id="human:editor-1",
         reason="Correction exacte demandée par l'éditeur.",
         idempotency_key="publication-text-correction-1",
@@ -189,7 +259,17 @@ async def test_exact_v5_field_replacement_preserves_every_other_canonical_field(
         item for item in after_payload["rich_text"]["paragraphs"] if item["anchor"] == anchor
     )
     assert after_rich["anchor"] == before_rich["anchor"]
-    assert after_rich["spans"] == [{"role": "text", "text": command.replacement_text}]
+    assert [span["role"] for span in after_rich["spans"]] == [
+        span["role"] for span in before_rich["spans"]
+    ]
+    assert "".join(span["text"] for span in after_rich["spans"]) == command.replacement_text
+    assert after_rich["spans"][:-1] == before_rich["spans"][:-1]
+    assert (
+        after_rich["spans"][-1]["text"]
+        == command.replacement_text[
+            len(command.expected_text) - len(before_rich["spans"][-1]["text"]) :
+        ]
+    )
     masked_before = _masked_document(before_payload, path=command.field_path, anchor=anchor)
     masked_after = _masked_document(after_payload, path=command.field_path, anchor=anchor)
     assert masked_before == masked_after
@@ -205,7 +285,37 @@ async def test_exact_v5_field_replacement_preserves_every_other_canonical_field(
     assert provenance["after_sha256"] == result.canonical_sha256
     assert provenance["actor_id"] == command.actor_id
     assert provenance["reason"] == command.reason
+    assert provenance["validation"]["method"] == (
+        "canonical_publication_qa_v5_with_declared_text_edit"
+    )
+    assert result.artifact.status is ProductionArtifactStatus.VERIFIED
     assert not hasattr(service, "model_gateway")
+
+
+@pytest.mark.asyncio
+async def test_correction_can_derive_a_new_base_from_the_current_augmented_envelope() -> None:
+    _, _, artifacts, store, service, command = _fixture(augmented_current=True)
+
+    result = await service.correct(command)
+
+    assert result.artifact.version == 10
+    correction = result.artifact.metadata["manual_publication_text_correction"]
+    assert correction["parent_artifact_id"] == str(artifacts.items[0].id)
+    assert correction["superseded_head_artifact_id"] == str(artifacts.items[1].id)
+    corrected_bytes = store.blobs[result.artifact.canonical_blob_id]
+    assert json.loads(corrected_bytes)["schema_version"] == "5"
+
+
+@pytest.mark.asyncio
+async def test_correction_refuses_to_change_an_ioc_span() -> None:
+    _, _, artifacts, _, service, command = _fixture()
+    replacement = command.expected_text.replace("a" * 64, "c" * 64, 1)
+
+    with pytest.raises(PublicationTextCorrectionError) as conflict:
+        await service.correct(replace(command, replacement_text=replacement))
+
+    assert conflict.value.code is PublicationTextCorrectionErrorCode.SEMANTIC_SPAN_CONFLICT
+    assert artifacts.appended == []
 
 
 @pytest.mark.asyncio

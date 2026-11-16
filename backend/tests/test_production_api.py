@@ -438,6 +438,9 @@ class _Artifacts:
     def __init__(self) -> None:
         self.items: list[ProductionArtifact] = []
 
+    async def get(self, artifact_id: UUID) -> ProductionArtifact | None:
+        return next((artifact for artifact in self.items if artifact.id == artifact_id), None)
+
     async def append(self, artifact: ProductionArtifact) -> None:
         self.items.append(artifact)
 
@@ -2244,6 +2247,44 @@ async def test_publication_artifact_by_run_does_not_follow_subject_current_run(
     assert by_subject.status_code == 200, by_subject.text
     assert by_run.json()["artifact_id"] == str(first_artifact.id)
     assert by_subject.json()["artifact_id"] == str(second_artifact.id)
+
+
+async def test_publication_artifact_version_by_id_reads_prior_base_in_current_run(
+    api: AsyncClient,
+    uow: _Uow,
+    production_app: FastAPI,
+) -> None:
+    subject_id = uuid4()
+    run = _terminal_run(uuid4(), subject_id, status=ProductionRunStatus.FAILED)
+    await uow.production_runs.add(run)
+    base = _artifact(run, ProductionArtifactStage.PUBLICATION)
+    base.version = 8
+    base.canonical_blob_id = uuid4()
+    canonical = {"schema_version": "5", "subject_id": str(subject_id)}
+    canonical_bytes = json.dumps(
+        canonical,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    production_app.state.production_artifact_store.payloads[base.canonical_blob_id] = canonical
+    current = _artifact(run, ProductionArtifactStage.PUBLICATION)
+    current.version = 9
+    current.metadata["previous_publication_artifact_id"] = str(base.id)
+    await uow.production_artifacts.append(base)
+    await uow.production_artifacts.append(current)
+
+    response = await api.get(
+        f"/api/subjects/{subject_id}/production/artifacts/publication/{base.id}"
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["artifact_id"] == str(base.id)
+    assert response.json()["version"] == 8
+    assert response.json()["input_hash"] == base.input_hash
+    assert response.json()["canonical_content"] == canonical
+    assert response.json()["canonical_sha256"] == hashlib.sha256(canonical_bytes).hexdigest()
 
 
 async def test_publication_artifact_response_has_no_rendered_content(

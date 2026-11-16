@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
@@ -17,11 +17,18 @@ from cti_app.application.production_artifact_store import (
     ProductionArtifactStore,
     ProductionReuseStorageUnavailableError,
 )
+from cti_app.application.production_editorial_enrichment import validate_editorial_enrichment
+from cti_app.application.production_references import production_reference_corpus_from_json
+from cti_app.application.publication_qa import qa_publication_v5
 from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
 )
+from cti_app.domain.production_editorial_enrichment import editorial_enrichment_from_json
+from cti_app.domain.production_extraction import production_extraction_from_json
+from cti_app.domain.production_relevance import relevance_projection_from_json
+from cti_app.domain.production_synthesis import production_synthesis_from_json
 from cti_app.domain.publication_document import (
     PublicationDocumentV5,
     publication_document_text_anchors,
@@ -45,6 +52,9 @@ class PublicationTextCorrectionErrorCode(StrEnum):
     EXPECTED_TEXT_MISMATCH = "publication_text_correction_expected_text_mismatch"
     FIELD_NOT_TEXT = "publication_text_correction_field_not_text"
     DOCUMENT_INVALID = "publication_text_correction_document_invalid"
+    SEMANTIC_SPAN_CONFLICT = "publication_text_correction_semantic_span_conflict"
+    PUBLICATION_QA_UNAVAILABLE = "publication_text_correction_publication_qa_unavailable"
+    PUBLICATION_QA_FAILED = "publication_text_correction_publication_qa_failed"
     NO_CHANGE = "publication_text_correction_no_change"
     IDEMPOTENCY_CONFLICT = "publication_text_correction_idempotency_conflict"
 
@@ -105,9 +115,14 @@ class PublicationTextCorrectionService:
         *,
         uow_factory: UnitOfWorkFactory,
         artifact_store: ProductionArtifactStore,
+        qa_runner: Callable[
+            [Any, ProductionArtifact, PublicationDocumentV5], Awaitable[dict[str, Any]]
+        ]
+        | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._artifact_store = artifact_store
+        self._qa_runner = qa_runner
 
     async def correct(
         self, command: PublicationTextCorrectionCommand
@@ -174,16 +189,27 @@ class PublicationTextCorrectionService:
                 default=0,
             )
             current_run = await uow.production_runs.get_current_for_subject(command.subject_id)
+            is_current_base = current is not None and current.id == requested.id
+            is_direct_augmented_base = (
+                current is not None
+                and current.id != requested.id
+                and current.version > requested.version
+                and isinstance(current.metadata, Mapping)
+                and current.metadata.get("previous_publication_artifact_id") == str(requested.id)
+            )
             if (
                 current is None
-                or current.id != requested.id
+                or latest_version != current.version
                 or current_run is None
                 or current_run.id != requested.production_run_id
-                or latest_version != requested.version
                 or requested.version != command.artifact_version
                 or requested.input_hash != command.artifact_input_hash
                 or requested.status is not ProductionArtifactStatus.VERIFIED
                 or requested.canonical_blob_id is None
+                or current.status is not ProductionArtifactStatus.VERIFIED
+                or current.canonical_blob_id is None
+                or not (is_current_base or is_direct_augmented_base)
+                or (is_current_base and latest_version != requested.version)
             ):
                 raise PublicationTextCorrectionError(
                     PublicationTextCorrectionErrorCode.STALE_ARTIFACT
@@ -198,6 +224,18 @@ class PublicationTextCorrectionService:
                 raise PublicationTextCorrectionError(
                     PublicationTextCorrectionErrorCode.CANONICAL_SHA_MISMATCH
                 )
+            head_sha256 = before_sha256
+            if not is_current_base:
+                assert current is not None and current.canonical_blob_id is not None
+                try:
+                    head_bytes = await self._artifact_store.read_bytes(current.canonical_blob_id)
+                except ProductionReuseStorageUnavailableError:
+                    raise
+                head_sha256 = _sha256(head_bytes)
+                if _embedded_v5_bytes(head_bytes) != before_bytes:
+                    raise PublicationTextCorrectionError(
+                        PublicationTextCorrectionErrorCode.STALE_ARTIFACT
+                    )
             original_payload, document = _load_canonical_v5(
                 before_bytes, subject_id=command.subject_id
             )
@@ -238,6 +276,11 @@ class PublicationTextCorrectionService:
                     PublicationTextCorrectionErrorCode.DOCUMENT_INVALID
                 )
 
+            correction_spans = matching[0].get("spans")
+            if not isinstance(correction_spans, list):
+                raise PublicationTextCorrectionError(
+                    PublicationTextCorrectionErrorCode.DOCUMENT_INVALID
+                )
             if isinstance(target_parent, dict) and isinstance(target_key, str):
                 target_parent[target_key] = command.replacement_text
             elif isinstance(target_parent, list) and isinstance(target_key, int):
@@ -246,11 +289,12 @@ class PublicationTextCorrectionService:
                 raise PublicationTextCorrectionError(
                     PublicationTextCorrectionErrorCode.FIELD_NOT_TEXT
                 )
-            # Rich text is a projection of the paragraph's exact text. Keep its
-            # stable anchor and replace only that paragraph's semantic spans.
-            matching[0]["spans"] = [
-                {"role": SemanticRole.TEXT.value, "text": command.replacement_text}
-            ]
+            _replace_within_one_text_span(
+                correction_spans,
+                before_text=before_text,
+                replacement_text=command.replacement_text,
+            )
+            before_qa = await self._run_canonical_qa(uow, requested, document)
             try:
                 corrected_document = publication_document_v5_from_json(original_payload)
                 corrected_payload = serialize_publication_document(corrected_document)
@@ -262,6 +306,10 @@ class PublicationTextCorrectionService:
                 raise PublicationTextCorrectionError(
                     PublicationTextCorrectionErrorCode.DOCUMENT_INVALID
                 )
+            after_qa = await self._run_canonical_qa(uow, requested, corrected_document)
+            qa_validation = _validate_qa_transition(
+                before_qa, after_qa, field_path=command.field_path
+            )
             after_bytes = ProductionArtifactStore.canonical_json_bytes(corrected_payload)
             if len(after_bytes) > MAX_ARTIFACT_BYTES:
                 raise PublicationTextCorrectionError(
@@ -274,6 +322,9 @@ class PublicationTextCorrectionService:
                 "parent_version": requested.version,
                 "parent_input_hash": requested.input_hash,
                 "before_sha256": before_sha256,
+                "superseded_head_artifact_id": str(current.id) if current else None,
+                "superseded_head_version": current.version if current else None,
+                "superseded_head_sha256": head_sha256,
                 "target_path": command.field_path,
                 "before_text_sha256": _sha256(before_text.encode("utf-8")),
                 "after_text_sha256": _sha256(command.replacement_text.encode("utf-8")),
@@ -292,7 +343,7 @@ class PublicationTextCorrectionService:
                 "reason": command.reason,
                 "idempotency_key_sha256": idempotency_key_sha256,
                 "request_sha256": request_sha256,
-                "validation": "publication_document_v5_round_trip",
+                "validation": qa_validation,
             }
             artifact = ProductionArtifact(
                 production_run_id=requested.production_run_id,
@@ -318,6 +369,96 @@ class PublicationTextCorrectionService:
                 raise
             return PublicationTextCorrectionResult(artifact, after_sha256)
 
+    async def _run_canonical_qa(
+        self,
+        uow: Any,
+        source_artifact: ProductionArtifact,
+        publication: PublicationDocumentV5,
+    ) -> dict[str, Any]:
+        if self._qa_runner is not None:
+            return await self._qa_runner(uow, source_artifact, publication)
+
+        try:
+            snapshot = await uow.production_input_snapshots.get_by_run(
+                source_artifact.production_run_id
+            )
+            input_artifacts = source_artifact.metadata.get("input_artifacts")
+            if snapshot is None or not isinstance(input_artifacts, Mapping):
+                raise ValueError("Canonical publication QA inputs are unavailable")
+
+            loaded: dict[str, ProductionArtifact] = {}
+            for name, stage in (
+                ("references_artifact_id", "references"),
+                ("extraction_artifact_id", "extraction"),
+                ("relevance_projection_artifact_id", "relevance_projection"),
+                ("synthesis_artifact_id", "synthesis"),
+                ("editorial_enrichment_artifact_id", "editorial_enrichment"),
+            ):
+                raw_id = input_artifacts.get(name)
+                artifact_id = UUID(str(raw_id)) if raw_id is not None else None
+                artifact = await uow.production_artifacts.get(artifact_id) if artifact_id else None
+                if (
+                    artifact is None
+                    or artifact.stage.value != stage
+                    or artifact.production_run_id != source_artifact.production_run_id
+                    or artifact.subject_id != source_artifact.subject_id
+                    or artifact.status is not ProductionArtifactStatus.VERIFIED
+                    or artifact.canonical_blob_id is None
+                ):
+                    raise ValueError("Canonical publication QA input artifact is invalid")
+                loaded[name] = artifact
+
+            if (
+                snapshot.production_run_id != source_artifact.production_run_id
+                or snapshot.subject_id != source_artifact.subject_id
+            ):
+                raise ValueError("Canonical publication QA snapshot lineage is invalid")
+            references = production_reference_corpus_from_json(
+                await self._artifact_store.read_json(
+                    loaded["references_artifact_id"].canonical_blob_id  # type: ignore[arg-type]
+                )
+            )
+            extraction = production_extraction_from_json(
+                await self._artifact_store.read_json(
+                    loaded["extraction_artifact_id"].canonical_blob_id  # type: ignore[arg-type]
+                )
+            )
+            relevance_projection = relevance_projection_from_json(
+                await self._artifact_store.read_json(
+                    loaded["relevance_projection_artifact_id"].canonical_blob_id  # type: ignore[arg-type]
+                )
+            )
+            synthesis = production_synthesis_from_json(
+                await self._artifact_store.read_json(
+                    loaded["synthesis_artifact_id"].canonical_blob_id  # type: ignore[arg-type]
+                )
+            )
+            editorial_enrichment = editorial_enrichment_from_json(
+                await self._artifact_store.read_json(
+                    loaded["editorial_enrichment_artifact_id"].canonical_blob_id  # type: ignore[arg-type]
+                )
+            )
+            validate_editorial_enrichment(
+                editorial_enrichment,
+                extraction=extraction,
+                synthesis=synthesis,
+            )
+            return qa_publication_v5(
+                snapshot=snapshot,
+                references=references,
+                extraction=extraction,
+                relevance_projection=relevance_projection,
+                synthesis=synthesis,
+                editorial_enrichment=editorial_enrichment,
+                publication=publication,
+            )
+        except ProductionReuseStorageUnavailableError:
+            raise
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PublicationTextCorrectionError(
+                PublicationTextCorrectionErrorCode.PUBLICATION_QA_UNAVAILABLE
+            ) from exc
+
     @staticmethod
     def _validate_command(command: PublicationTextCorrectionCommand) -> None:
         for value, name in (
@@ -336,6 +477,162 @@ class PublicationTextCorrectionService:
             command.replacement_text, str
         ):
             raise TypeError("Publication correction values must be text")
+
+
+def _replace_within_one_text_span(
+    spans: list[Any], *, before_text: str, replacement_text: str
+) -> None:
+    span_texts: list[str] = []
+    roles: list[SemanticRole] = []
+    positions: list[tuple[int, int]] = []
+    cursor = 0
+    for span in spans:
+        if not isinstance(span, dict) or not isinstance(span.get("text"), str):
+            raise PublicationTextCorrectionError(
+                PublicationTextCorrectionErrorCode.DOCUMENT_INVALID
+            )
+        raw_role = span.get("role")
+        if not isinstance(raw_role, str):
+            raise PublicationTextCorrectionError(
+                PublicationTextCorrectionErrorCode.DOCUMENT_INVALID
+            )
+        try:
+            role = SemanticRole(raw_role)
+        except (TypeError, ValueError) as exc:
+            raise PublicationTextCorrectionError(
+                PublicationTextCorrectionErrorCode.DOCUMENT_INVALID
+            ) from exc
+        value = span["text"]
+        span_texts.append(value)
+        roles.append(role)
+        positions.append((cursor, cursor + len(value)))
+        cursor += len(value)
+
+    if "".join(span_texts) != before_text:
+        raise PublicationTextCorrectionError(PublicationTextCorrectionErrorCode.DOCUMENT_INVALID)
+
+    prefix_length = 0
+    shared_limit = min(len(before_text), len(replacement_text))
+    while (
+        prefix_length < shared_limit
+        and before_text[prefix_length] == replacement_text[prefix_length]
+    ):
+        prefix_length += 1
+
+    suffix_length = 0
+    while (
+        suffix_length < len(before_text) - prefix_length
+        and suffix_length < len(replacement_text) - prefix_length
+        and before_text[len(before_text) - suffix_length - 1]
+        == replacement_text[len(replacement_text) - suffix_length - 1]
+    ):
+        suffix_length += 1
+
+    old_end = len(before_text) - suffix_length
+    new_end = len(replacement_text) - suffix_length
+    if prefix_length == old_end:
+        candidates = [
+            index for index, (start, end) in enumerate(positions) if start <= prefix_length <= end
+        ]
+    else:
+        candidates = [
+            index
+            for index, (start, end) in enumerate(positions)
+            if max(start, prefix_length) < min(end, old_end)
+        ]
+
+    if len(candidates) != 1:
+        raise PublicationTextCorrectionError(
+            PublicationTextCorrectionErrorCode.SEMANTIC_SPAN_CONFLICT
+        )
+    span_index = candidates[0]
+    span_start, span_end = positions[span_index]
+    if (
+        roles[span_index] is not SemanticRole.TEXT
+        or span_start > prefix_length
+        or span_end < old_end
+    ):
+        raise PublicationTextCorrectionError(
+            PublicationTextCorrectionErrorCode.SEMANTIC_SPAN_CONFLICT
+        )
+
+    local_start = prefix_length - span_start
+    local_end = old_end - span_start
+    replacement_middle = replacement_text[prefix_length:new_end]
+    spans[span_index]["text"] = (
+        span_texts[span_index][:local_start]
+        + replacement_middle
+        + span_texts[span_index][local_end:]
+    )
+    if [SemanticRole(span["role"]) for span in spans] != roles or "".join(
+        span["text"] for span in spans
+    ) != replacement_text:
+        raise PublicationTextCorrectionError(PublicationTextCorrectionErrorCode.DOCUMENT_INVALID)
+
+
+def _validate_qa_transition(
+    before: Mapping[str, Any], after: Mapping[str, Any], *, field_path: str
+) -> dict[str, Any]:
+    before_checks = before.get("checks")
+    after_checks = after.get("checks")
+    before_errors = before.get("errors")
+    after_errors = after.get("errors")
+    before_warnings = before.get("warnings")
+    after_warnings = after.get("warnings")
+    if (
+        before.get("passed") is not True
+        or not isinstance(before_checks, Mapping)
+        or not before_checks
+        or any(value is not True for value in before_checks.values())
+        or before_errors != []
+        or not isinstance(after_checks, Mapping)
+        or set(before_checks) != set(after_checks)
+        or before_checks.get("exact_projection") is not True
+        or after_checks.get("exact_projection") is not False
+        or any(
+            value is not True for name, value in after_checks.items() if name != "exact_projection"
+        )
+        or after.get("passed") is not False
+        or after_errors != ["Publication differs from canonical Assembly projection"]
+        or before_warnings != after_warnings
+    ):
+        raise PublicationTextCorrectionError(
+            PublicationTextCorrectionErrorCode.PUBLICATION_QA_FAILED
+        )
+    return {
+        "method": "canonical_publication_qa_v5_with_declared_text_edit",
+        "passed": True,
+        "field_path": field_path,
+        "checks_before": dict(before_checks),
+        "checks_after": dict(after_checks),
+        "accepted_exception": "exact_projection",
+        "warnings": list(after_warnings or ()),
+    }
+
+
+def _embedded_v5_bytes(content: bytes) -> bytes | None:
+    try:
+        payload = json.loads(content)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if (
+        not isinstance(payload, dict)
+        or ProductionArtifactStore.canonical_json_bytes(payload) != content
+    ):
+        return None
+    wrapped = False
+    while isinstance(payload, dict):
+        schema_version = payload.get("schema_version")
+        if schema_version == "5":
+            return ProductionArtifactStore.canonical_json_bytes(payload) if wrapped else None
+        if schema_version not in {"6", "7", "8"}:
+            return None
+        base = payload.get("base_publication")
+        if not isinstance(base, dict):
+            return None
+        wrapped = True
+        payload = base
+    return None
 
 
 def _load_canonical_v5(

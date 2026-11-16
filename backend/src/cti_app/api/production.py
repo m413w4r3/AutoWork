@@ -3697,6 +3697,54 @@ async def get_publication_artifact(subject_id: UUID, request: Request) -> dict[s
     return await _artifact_view(request, subject_id, ProductionArtifactStage.PUBLICATION.value)
 
 
+@router.get("/subjects/{subject_id}/production/artifacts/publication/{artifact_id}")
+async def get_publication_artifact_version(
+    subject_id: UUID,
+    artifact_id: UUID,
+    request: Request,
+) -> dict[str, Any]:
+    async with request.app.state.uow_factory() as uow:
+        run = await uow.production_runs.get_current_for_subject(subject_id)
+        artifact = await uow.production_artifacts.get(artifact_id)
+        if (
+            run is None
+            or artifact is None
+            or artifact.stage is not ProductionArtifactStage.PUBLICATION
+            or artifact.subject_id != subject_id
+            or artifact.production_run_id != run.id
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "publication_artifact_not_found"},
+            )
+
+    canonical = None
+    canonical_sha256 = None
+    store = getattr(request.app.state, "production_artifact_store", None)
+    if store is not None and artifact.canonical_blob_id is not None:
+        canonical_bytes = await store.read_bytes(artifact.canonical_blob_id)
+        canonical_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
+        canonical = await store.read_json(artifact.canonical_blob_id)
+    return {
+        "artifact_id": str(artifact.id),
+        "production_run_id": str(artifact.production_run_id),
+        "subject_id": str(artifact.subject_id),
+        "stage": artifact.stage.value,
+        "version": artifact.version,
+        "input_hash": artifact.input_hash,
+        "canonical_sha256": canonical_sha256,
+        "status": artifact.status.value,
+        "reused": artifact.reused_from_artifact_id is not None,
+        "reused_from_artifact_id": (
+            str(artifact.reused_from_artifact_id)
+            if artifact.reused_from_artifact_id is not None
+            else None
+        ),
+        "metadata": artifact.metadata,
+        "canonical_content": canonical,
+    }
+
+
 @router.post("/subjects/{subject_id}/production/artifacts/publication/text-correction")
 async def correct_publication_text(
     subject_id: UUID,
@@ -3738,7 +3786,16 @@ async def correct_publication_text(
             PublicationTextCorrectionErrorCode.FIELD_NOT_TEXT: (
                 status.HTTP_422_UNPROCESSABLE_CONTENT
             ),
+            PublicationTextCorrectionErrorCode.SEMANTIC_SPAN_CONFLICT: (
+                status.HTTP_422_UNPROCESSABLE_CONTENT
+            ),
             PublicationTextCorrectionErrorCode.DOCUMENT_INVALID: (
+                status.HTTP_422_UNPROCESSABLE_CONTENT
+            ),
+            PublicationTextCorrectionErrorCode.PUBLICATION_QA_UNAVAILABLE: (
+                status.HTTP_409_CONFLICT
+            ),
+            PublicationTextCorrectionErrorCode.PUBLICATION_QA_FAILED: (
                 status.HTTP_422_UNPROCESSABLE_CONTENT
             ),
             PublicationTextCorrectionErrorCode.NO_CHANGE: status.HTTP_422_UNPROCESSABLE_CONTENT,
