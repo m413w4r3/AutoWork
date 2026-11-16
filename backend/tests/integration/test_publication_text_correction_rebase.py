@@ -399,22 +399,50 @@ async def test_postgres_correction_and_rebase_are_append_only(
         SemanticTextSpanV1(SemanticRole.PROPER_NAME, "Region X"),
     )
     replacement_title = "".join(span.text for span in replacement_spans)
-    result = await PublicationTextCorrectionService(
+    correction_service = PublicationTextCorrectionService(
         uow_factory=uow_factory,
         artifact_store=artifact_store,
-    ).correct(
+    )
+    before_lead = document.lead[0].text
+    old_lead_phrase = "attributed to"
+    new_lead_phrase = "associated with"
+    assert old_lead_phrase in before_lead
+    replacement_lead = before_lead.replace(old_lead_phrase, new_lead_phrase, 1)
+    first_correction = await correction_service.correct(
         PublicationTextCorrectionCommand(
             subject_id=subject.id,
             artifact_id=correction_base.id,
             artifact_version=correction_base.version,
             artifact_input_hash=correction_base.input_hash,
             artifact_sha256=hashlib.sha256(correction_base_bytes).hexdigest(),
+            field_path="lead[0].text",
+            expected_text=before_lead,
+            replacement_text=replacement_lead,
+            actor_id="human:integration-editor",
+            reason="Correction de formulation avant le titre.",
+            idempotency_key=f"publication-correction-lead-{uuid4().hex}",
+        )
+    )
+    assert first_correction.artifact.canonical_blob_id is not None
+    first_correction_bytes = await artifact_store.read_bytes(
+        first_correction.artifact.canonical_blob_id
+    )
+    first_correction_payload = await artifact_store.read_json(
+        first_correction.artifact.canonical_blob_id
+    )
+    result = await correction_service.correct(
+        PublicationTextCorrectionCommand(
+            subject_id=subject.id,
+            artifact_id=first_correction.artifact.id,
+            artifact_version=first_correction.artifact.version,
+            artifact_input_hash=first_correction.artifact.input_hash,
+            artifact_sha256=first_correction.canonical_sha256,
             field_path="title",
             expected_text=before_title,
             replacement_text=replacement_title,
             actor_id="human:integration-editor",
-            reason="Correction exacte pour le test d'intégration.",
-            idempotency_key=f"publication-correction-{uuid4().hex}",
+            reason="Correction exacte du titre après la phrase.",
+            idempotency_key=f"publication-correction-title-{uuid4().hex}",
             replacement_spans=replacement_spans,
         )
     )
@@ -449,18 +477,33 @@ async def test_postgres_correction_and_rebase_are_append_only(
         result.canonical_sha256,
     )
 
-    assert result.artifact.version == 10
-    assert result.artifact.metadata["previous_publication_artifact_id"] == str(correction_base.id)
+    assert first_correction.artifact.version == 10
+    first_provenance = first_correction.artifact.metadata["manual_publication_text_correction"]
+    assert first_provenance["parent_artifact_id"] == str(correction_base.id)
+    assert first_provenance["validation"]["method"] == (
+        "canonical_publication_qa_v5_with_declared_text_edit"
+    )
+    assert result.artifact.version == 11
+    assert result.artifact.metadata["previous_publication_artifact_id"] == str(
+        first_correction.artifact.id
+    )
     assert result.artifact.metadata["manual_publication_text_correction"][
         "parent_artifact_id"
-    ] == str(correction_base.id)
+    ] == str(first_correction.artifact.id)
+    assert result.artifact.metadata["manual_publication_text_correction"][
+        "parent_correction_artifact_id"
+    ] == str(first_correction.artifact.id)
+    assert (
+        result.artifact.metadata["manual_publication_text_correction"]["origin_v5_sha256"]
+        == hashlib.sha256(canonical_bytes).hexdigest()
+    )
     assert (
         result.artifact.metadata["manual_publication_text_correction"]["before_sha256"]
-        == hashlib.sha256(correction_base_bytes).hexdigest()
+        == hashlib.sha256(first_correction_bytes).hexdigest()
     )
     assert (
         result.artifact.metadata["manual_publication_text_correction"]["before_v5_sha256"]
-        == hashlib.sha256(canonical_bytes).hexdigest()
+        == hashlib.sha256(first_correction_bytes).hexdigest()
     )
     assert (
         result.artifact.metadata["manual_publication_text_correction"]["after_sha256"]
@@ -468,7 +511,14 @@ async def test_postgres_correction_and_rebase_are_append_only(
     )
     assert result.artifact.metadata["manual_publication_text_correction"][
         "superseded_head_artifact_id"
-    ] == str(head.id)
+    ] == str(first_correction.artifact.id)
+    chained_validation = result.artifact.metadata["manual_publication_text_correction"][
+        "validation"
+    ]
+    assert chained_validation["method"] == (
+        "canonical_publication_qa_v5_with_declared_text_edit_chained"
+    )
+    assert chained_validation["checks_before"] == chained_validation["checks_after"]
     assert rebased.opinion.version == opinion.version + 1
     assert rebased.opinion.status is AnalystOpinionStatus.DRAFT
     assert rebased.opinion.blocks == opinion.blocks
@@ -476,17 +526,17 @@ async def test_postgres_correction_and_rebase_are_append_only(
     assert approved.version == rebased.opinion.version + 1
     assert approved.status is AnalystOpinionStatus.APPROVED
     assert approved.bridge_drafting_gap_acknowledged is True
-    assert published.version == result.artifact.version + 1
+    assert published.version == result.artifact.version + 1 == 12
     assert published.metadata["previous_publication_artifact_id"] == str(result.artifact.id)
 
     assert result.artifact.canonical_blob_id is not None
     corrected_payload = await artifact_store.read_json(result.artifact.canonical_blob_id)
     assert corrected_payload["schema_version"] == "5"
     expected_corrected_payload = {
-        **publication_payload,
+        **first_correction_payload,
         "title": replacement_title,
     }
-    expected_rich_text = dict(publication_payload["rich_text"])
+    expected_rich_text = dict(first_correction_payload["rich_text"])
     expected_paragraphs = [
         (
             {
@@ -498,19 +548,22 @@ async def test_postgres_correction_and_rebase_are_append_only(
             if item["anchor"] == "title"
             else item
         )
-        for item in publication_payload["rich_text"]["paragraphs"]
+        for item in first_correction_payload["rich_text"]["paragraphs"]
     ]
     expected_rich_text["paragraphs"] = expected_paragraphs
     expected_corrected_payload["rich_text"] = expected_rich_text
     assert corrected_payload == expected_corrected_payload
     before_title_paragraph = next(
-        item for item in publication_payload["rich_text"]["paragraphs"] if item["anchor"] == "title"
+        item
+        for item in first_correction_payload["rich_text"]["paragraphs"]
+        if item["anchor"] == "title"
     )
     after_title_paragraph = next(
         item for item in corrected_payload["rich_text"]["paragraphs"] if item["anchor"] == "title"
     )
     assert corrected_payload["title"] == replacement_title
-    assert corrected_payload["lead"] == publication_payload["lead"]
+    assert corrected_payload["lead"] == first_correction_payload["lead"]
+    assert corrected_payload["lead"][0]["text"] == replacement_lead
     assert after_title_paragraph["anchor"] == before_title_paragraph["anchor"] == "title"
     assert after_title_paragraph["spans"] == [
         {"role": span.role.value, "text": span.text} for span in replacement_spans

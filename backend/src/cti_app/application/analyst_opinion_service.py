@@ -93,6 +93,40 @@ _OPERATOR_BLOCK_TYPES = tuple(
 )
 
 
+def _is_projection_drift_check_profile(checks: Mapping[str, Any]) -> bool:
+    return (
+        bool(checks)
+        and checks.get("exact_projection") is False
+        and all(value is True for name, value in checks.items() if name != "exact_projection")
+    )
+
+
+def _accepted_text_correction_validation(validation: Any) -> bool:
+    if not isinstance(validation, Mapping) or validation.get("passed") is not True:
+        return False
+    if validation.get("accepted_exception") != "exact_projection":
+        return False
+    method = validation.get("method")
+    checks_before = validation.get("checks_before")
+    checks_after = validation.get("checks_after")
+    if (
+        not isinstance(checks_before, Mapping)
+        or not isinstance(checks_after, Mapping)
+        or set(checks_before) != set(checks_after)
+        or not isinstance(validation.get("warnings"), list)
+    ):
+        return False
+    if not _is_projection_drift_check_profile(checks_after):
+        return False
+    if method == "canonical_publication_qa_v5_with_declared_text_edit":
+        return checks_before.get("exact_projection") is True and all(
+            value is True for value in checks_before.values()
+        )
+    if method == "canonical_publication_qa_v5_with_declared_text_edit_chained":
+        return checks_before == checks_after and _is_projection_drift_check_profile(checks_before)
+    return False
+
+
 _CONFIRMED_VERDICTS = frozenset({"confirmed", "confirmé"})
 
 
@@ -540,7 +574,7 @@ class AnalystOpinionService:
         expected_base_publication_sha256: str,
         actor: str,
     ) -> OpinionRebaseResult:
-        """Append a draft version pinned to the direct child corrected publication."""
+        """Append a draft version pinned to a verified correction of the current base."""
         actor_id = self._require_actor(actor)
         async with self._uow_factory() as uow:
             current = await self._require_current(uow, opinion_id)
@@ -608,14 +642,77 @@ class AnalystOpinionService:
             if hashlib.sha256(corrected_bytes).hexdigest() != expected_base_publication_sha256:
                 raise OpinionError(OpinionErrorCode.REBASE_BASE_INVALID)
 
-            correction = base.metadata.get("manual_publication_text_correction")
-            if (
-                not isinstance(correction, Mapping)
-                or correction.get("parent_artifact_id") != str(current.base_publication_artifact_id)
-                or correction.get("before_sha256") != current.base_publication_sha256
-                or correction.get("after_sha256") != expected_base_publication_sha256
-                or not isinstance(correction.get("target_anchor"), str)
-            ):
+            correction_chain: list[Mapping[str, Any]] = []
+            cursor = base
+            cursor_bytes = corrected_bytes
+            visited: set[UUID] = set()
+            while cursor.id != previous_base.id:
+                if cursor.id in visited:
+                    raise OpinionError(OpinionErrorCode.REBASE_BASE_INVALID)
+                visited.add(cursor.id)
+                correction = cursor.metadata.get("manual_publication_text_correction")
+                if (
+                    not isinstance(correction, Mapping)
+                    or not isinstance(correction.get("target_anchor"), str)
+                    or not correction.get("target_anchor")
+                    or not _accepted_text_correction_validation(correction.get("validation"))
+                ):
+                    raise OpinionError(OpinionErrorCode.REBASE_BASE_INVALID)
+
+                parent_id_value = correction.get("parent_artifact_id")
+                if not isinstance(parent_id_value, str):
+                    raise OpinionError(OpinionErrorCode.REBASE_BASE_INVALID)
+                try:
+                    parent_id = UUID(parent_id_value)
+                except ValueError as exc:
+                    raise OpinionError(OpinionErrorCode.REBASE_BASE_INVALID) from exc
+                if str(parent_id) != parent_id_value:
+                    raise OpinionError(OpinionErrorCode.REBASE_BASE_INVALID)
+                parent = await uow.production_artifacts.get(parent_id)
+                if (
+                    parent is None
+                    or parent.id in visited
+                    or parent.version >= cursor.version
+                    or parent.stage is not ProductionArtifactStage.PUBLICATION
+                    or parent.status is not ProductionArtifactStatus.VERIFIED
+                    or parent.production_run_id != investigation.production_run_id
+                    or parent.subject_id != investigation.subject_id
+                    or parent.canonical_blob_id is None
+                ):
+                    raise OpinionError(OpinionErrorCode.REBASE_BASE_INVALID)
+
+                validation = correction["validation"]
+                chained = (
+                    validation.get("method")
+                    == "canonical_publication_qa_v5_with_declared_text_edit_chained"
+                )
+                parent_is_correction = isinstance(
+                    parent.metadata.get("manual_publication_text_correction"), Mapping
+                )
+                if chained != parent_is_correction or (
+                    chained and correction.get("parent_correction_artifact_id") != str(parent.id)
+                ):
+                    raise OpinionError(OpinionErrorCode.REBASE_BASE_INVALID)
+
+                try:
+                    parent_bytes = (
+                        previous_bytes
+                        if parent.id == previous_base.id
+                        else await self._artifact_store.read_bytes(parent.canonical_blob_id)
+                    )
+                except ProductionReuseStorageUnavailableError:
+                    raise
+                if (
+                    correction.get("before_sha256") != hashlib.sha256(parent_bytes).hexdigest()
+                    or correction.get("after_sha256") != hashlib.sha256(cursor_bytes).hexdigest()
+                ):
+                    raise OpinionError(OpinionErrorCode.REBASE_BASE_INVALID)
+                correction_chain.append(correction)
+                cursor = parent
+                cursor_bytes = parent_bytes
+                if len(correction_chain) > latest_version:
+                    raise OpinionError(OpinionErrorCode.REBASE_BASE_INVALID)
+            if not correction_chain:
                 raise OpinionError(OpinionErrorCode.REBASE_BASE_INVALID)
             try:
                 corrected_payload = json.loads(corrected_bytes)
@@ -662,9 +759,10 @@ class AnalystOpinionService:
                     raise OpinionError(OpinionErrorCode.STALE_VERSION) from exc
                 raise
             await uow.commit()
-            target_anchor = correction["target_anchor"]
+            target_anchor = correction_chain[0]["target_anchor"]
+            changed_anchors = {item["target_anchor"] for item in correction_chain}
             affected_notes = tuple(
-                note.id for note in current.observations if note.anchor == target_anchor
+                note.id for note in current.observations if note.anchor in changed_anchors
             )
             return OpinionRebaseResult(appended, target_anchor, affected_notes)
 

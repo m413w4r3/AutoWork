@@ -509,6 +509,14 @@ async def test_rebase_appends_draft_and_rehashes_without_changing_citations() ->
                 "before_sha256": hashlib.sha256(harness.base_bytes).hexdigest(),
                 "after_sha256": corrected_sha256,
                 "target_anchor": "section:0:paragraph:0001",
+                "validation": {
+                    "method": "canonical_publication_qa_v5_with_declared_text_edit",
+                    "passed": True,
+                    "checks_before": {"exact_projection": True},
+                    "checks_after": {"exact_projection": False},
+                    "accepted_exception": "exact_projection",
+                    "warnings": [],
+                },
             }
         },
     )

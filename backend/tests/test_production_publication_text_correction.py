@@ -218,6 +218,65 @@ def _fixture(*, augmented_current: bool = False):
     return document, canonical, artifacts, store, service, command
 
 
+def _install_chain_qa_runner(
+    service: PublicationTextCorrectionService, *, fail_other_chained_check: bool = False
+) -> None:
+    qa_calls = 0
+
+    async def qa_runner(_uow, artifact, _publication):
+        nonlocal qa_calls
+        chained = bool(artifact.metadata.get("manual_publication_text_correction"))
+        is_before = qa_calls % 2 == 0
+        qa_calls += 1
+        warnings = ["Stable publication QA warning"]
+        checks = {"exact_projection": False, "semantic_annotation_coverage": True}
+        errors = ["Publication differs from canonical Assembly projection"]
+        if chained:
+            if fail_other_chained_check and not is_before:
+                checks["semantic_annotation_coverage"] = False
+                errors.append("A semantic annotation check failed")
+            return {
+                "passed": False,
+                "checks": checks,
+                "errors": errors,
+                "warnings": warnings,
+            }
+        if is_before:
+            return {
+                "passed": True,
+                "checks": {"exact_projection": True, "semantic_annotation_coverage": True},
+                "errors": [],
+                "warnings": warnings,
+            }
+        return {"passed": False, "checks": checks, "errors": errors, "warnings": warnings}
+
+    service._qa_runner = qa_runner
+
+
+def _second_lead_command(
+    command: PublicationTextCorrectionCommand,
+    first: ProductionArtifact,
+    first_sha256: str,
+    store: _MemoryStore,
+) -> PublicationTextCorrectionCommand:
+    assert first.canonical_blob_id is not None
+    payload = json.loads(store.blobs[first.canonical_blob_id])
+    expected_text = payload["lead"][0]["text"]
+    old_text = "arbitrairement un nom de fichier."
+    new_text = "un nom de fichier sans vérification complémentaire."
+    assert old_text in expected_text
+    return replace(
+        command,
+        artifact_id=first.id,
+        artifact_version=first.version,
+        artifact_input_hash=first.input_hash,
+        artifact_sha256=first_sha256,
+        expected_text=expected_text,
+        replacement_text=expected_text.replace(old_text, new_text, 1),
+        idempotency_key="publication-text-correction-2",
+    )
+
+
 def _semantic_rebase_fixture():
     document, _canonical, artifacts, store, service, command = _fixture()
     payload = serialize_publication_document(document)
@@ -691,6 +750,66 @@ async def test_exact_request_is_idempotent_and_returns_the_appended_artifact() -
     assert first.artifact.id == replay.artifact.id
     assert replay.replayed is True
     assert len(artifacts.appended) == 1
+
+
+@pytest.mark.asyncio
+async def test_correction_chains_from_accepted_correction_and_is_idempotent() -> None:
+    _, _, artifacts, store, service, command = _fixture()
+    _install_chain_qa_runner(service)
+
+    first = await service.correct(command)
+    second_command = _second_lead_command(command, first.artifact, first.canonical_sha256, store)
+    second = await service.correct(second_command)
+    replay = await service.correct(second_command)
+
+    first_provenance = first.artifact.metadata["manual_publication_text_correction"]
+    second_provenance = second.artifact.metadata["manual_publication_text_correction"]
+    validation = second_provenance["validation"]
+    assert second.artifact.version == first.artifact.version + 1
+    assert second_provenance["parent_artifact_id"] == str(first.artifact.id)
+    assert second_provenance["parent_correction_artifact_id"] == str(first.artifact.id)
+    assert second_provenance["origin_v5_sha256"] == first_provenance["before_v5_sha256"]
+    assert second_provenance["before_sha256"] == first.canonical_sha256
+    assert validation["method"] == ("canonical_publication_qa_v5_with_declared_text_edit_chained")
+    assert validation["checks_before"] == validation["checks_after"]
+    assert validation["warnings"] == ["Stable publication QA warning"]
+    assert second.artifact.id == replay.artifact.id
+    assert replay.replayed is True
+    assert len(artifacts.appended) == 2
+
+
+@pytest.mark.asyncio
+async def test_chained_correction_rejects_another_failed_qa_check() -> None:
+    _, _, artifacts, store, service, command = _fixture()
+    _install_chain_qa_runner(service, fail_other_chained_check=True)
+
+    first = await service.correct(command)
+    second_command = _second_lead_command(command, first.artifact, first.canonical_sha256, store)
+    with pytest.raises(PublicationTextCorrectionError) as rejected:
+        await service.correct(second_command)
+
+    assert rejected.value.code is PublicationTextCorrectionErrorCode.PUBLICATION_QA_FAILED
+    assert len(artifacts.appended) == 1
+
+
+@pytest.mark.asyncio
+async def test_non_correction_artifact_still_requires_exact_projection_before_edit() -> None:
+    _, _, artifacts, _, service, command = _fixture()
+
+    async def noncanonical_qa_runner(_uow, _artifact, _publication):
+        return {
+            "passed": False,
+            "checks": {"exact_projection": False, "semantic_annotation_coverage": True},
+            "errors": ["Publication differs from canonical Assembly projection"],
+            "warnings": [],
+        }
+
+    service._qa_runner = noncanonical_qa_runner
+    with pytest.raises(PublicationTextCorrectionError) as rejected:
+        await service.correct(command)
+
+    assert rejected.value.code is PublicationTextCorrectionErrorCode.PUBLICATION_QA_FAILED
+    assert artifacts.appended == []
 
 
 @pytest.mark.asyncio

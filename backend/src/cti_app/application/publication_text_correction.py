@@ -232,6 +232,9 @@ class PublicationTextCorrectionService:
                 raise PublicationTextCorrectionError(
                     PublicationTextCorrectionErrorCode.CANONICAL_SHA_MISMATCH
                 )
+            chained_source_validation = _accepted_correction_qa_validation(
+                requested, artifact_sha256=before_sha256
+            )
             head_sha256 = before_sha256
             if not is_current_base:
                 assert current is not None and current.canonical_blob_id is not None
@@ -338,7 +341,10 @@ class PublicationTextCorrectionService:
                 ) from exc
             after_qa = await self._run_canonical_qa(uow, requested, corrected_document)
             qa_validation = _validate_qa_transition(
-                before_qa, after_qa, field_path=command.field_path
+                before_qa,
+                after_qa,
+                field_path=command.field_path,
+                chained_source_validation=chained_source_validation,
             )
             after_bytes = ProductionArtifactStore.canonical_json_bytes(corrected_payload)
             if len(after_bytes) > MAX_ARTIFACT_BYTES:
@@ -360,6 +366,14 @@ class PublicationTextCorrectionService:
                 "before_text_sha256": _sha256(before_text.encode("utf-8")),
                 "after_text_sha256": _sha256(command.replacement_text.encode("utf-8")),
             }
+            if chained_source_validation is not None:
+                correction_input["parent_correction_artifact_id"] = str(requested.id)
+                source_correction = _correction_metadata(requested)
+                origin_v5_sha256 = source_correction.get("origin_v5_sha256")
+                if not _is_sha256(origin_v5_sha256):
+                    origin_v5_sha256 = source_correction.get("before_v5_sha256")
+                if _is_sha256(origin_v5_sha256):
+                    correction_input["origin_v5_sha256"] = origin_v5_sha256
             if before_spans is not None and after_spans is not None:
                 correction_input["semantic_spans_before"] = before_spans
                 correction_input["semantic_spans_after"] = after_spans
@@ -738,8 +752,56 @@ def _validate_semantic_span_rebase(
             )
 
 
+def _accepted_correction_qa_validation(
+    artifact: ProductionArtifact, *, artifact_sha256: str
+) -> Mapping[str, Any] | None:
+    correction = _correction_metadata(artifact)
+    validation = correction.get("validation")
+    if (
+        correction.get("after_sha256") != artifact_sha256
+        or not isinstance(validation, Mapping)
+        or validation.get("method")
+        not in {
+            "canonical_publication_qa_v5_with_declared_text_edit",
+            "canonical_publication_qa_v5_with_declared_text_edit_chained",
+        }
+        or validation.get("passed") is not True
+        or validation.get("accepted_exception") != "exact_projection"
+    ):
+        return None
+
+    checks_before = validation.get("checks_before")
+    checks_after = validation.get("checks_after")
+    warnings = validation.get("warnings")
+    method = validation.get("method")
+    if (
+        not isinstance(checks_before, Mapping)
+        or not checks_before
+        or not isinstance(checks_after, Mapping)
+        or set(checks_before) != set(checks_after)
+        or not isinstance(warnings, list)
+    ):
+        return None
+    checks_after_are_valid = _is_projection_drift_check_profile(checks_after)
+    if method == "canonical_publication_qa_v5_with_declared_text_edit":
+        checks_before_are_valid = checks_before.get("exact_projection") is True and all(
+            value is True for value in checks_before.values()
+        )
+    else:
+        checks_before_are_valid = (
+            _is_projection_drift_check_profile(checks_before) and checks_before == checks_after
+        )
+    if not checks_before_are_valid or not checks_after_are_valid:
+        return None
+    return validation
+
+
 def _validate_qa_transition(
-    before: Mapping[str, Any], after: Mapping[str, Any], *, field_path: str
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    *,
+    field_path: str,
+    chained_source_validation: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     before_checks = before.get("checks")
     after_checks = after.get("checks")
@@ -747,15 +809,31 @@ def _validate_qa_transition(
     after_errors = after.get("errors")
     before_warnings = before.get("warnings")
     after_warnings = after.get("warnings")
+    chained = chained_source_validation is not None
+    if chained:
+        assert chained_source_validation is not None
+        before_checks_are_valid = (
+            before.get("passed") is False
+            and isinstance(before_checks, Mapping)
+            and _is_projection_drift_check_profile(before_checks)
+            and before_errors == ["Publication differs from canonical Assembly projection"]
+            and before_checks == chained_source_validation.get("checks_after")
+            and before_warnings == chained_source_validation.get("warnings")
+        )
+    else:
+        before_checks_are_valid = (
+            before.get("passed") is True
+            and isinstance(before_checks, Mapping)
+            and bool(before_checks)
+            and all(value is True for value in before_checks.values())
+            and before_errors == []
+            and before_checks.get("exact_projection") is True
+        )
     if (
-        before.get("passed") is not True
-        or not isinstance(before_checks, Mapping)
-        or not before_checks
-        or any(value is not True for value in before_checks.values())
-        or before_errors != []
+        not before_checks_are_valid
         or not isinstance(after_checks, Mapping)
+        or not isinstance(before_checks, Mapping)
         or set(before_checks) != set(after_checks)
-        or before_checks.get("exact_projection") is not True
         or after_checks.get("exact_projection") is not False
         or any(
             value is not True for name, value in after_checks.items() if name != "exact_projection"
@@ -780,7 +858,11 @@ def _validate_qa_transition(
             PublicationTextCorrectionErrorCode.PUBLICATION_QA_FAILED
         )
     return {
-        "method": "canonical_publication_qa_v5_with_declared_text_edit",
+        "method": (
+            "canonical_publication_qa_v5_with_declared_text_edit_chained"
+            if chained
+            else "canonical_publication_qa_v5_with_declared_text_edit"
+        ),
         "passed": True,
         "field_path": field_path,
         "checks_before": dict(before_checks),
@@ -788,6 +870,14 @@ def _validate_qa_transition(
         "accepted_exception": "exact_projection",
         "warnings": list(after_warnings or ()),
     }
+
+
+def _is_projection_drift_check_profile(checks: Mapping[str, Any]) -> bool:
+    return (
+        bool(checks)
+        and checks.get("exact_projection") is False
+        and all(value is True for name, value in checks.items() if name != "exact_projection")
+    )
 
 
 def _embedded_v5_payload(payload: Any) -> dict[str, Any] | None:
@@ -1027,3 +1117,11 @@ def _request_sha256(command: PublicationTextCorrectionCommand) -> str:
 
 def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+    )
