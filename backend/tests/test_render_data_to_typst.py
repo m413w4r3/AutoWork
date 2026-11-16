@@ -70,7 +70,7 @@ def test_references_and_article_chronology_use_bullets_and_rail(tmp_path: Path) 
     assert '#rail-event("3 janvier 2026"' in output
     assert "#rf(1)" in output
     assert "#ev(" not in output
-    assert "#set par(spacing: 0.9em)" in output
+    assert "#set par(spacing: 1.4em)" in output
 
 
 def test_structured_article_format_renders_overview_and_key_events(tmp_path: Path) -> None:
@@ -116,7 +116,7 @@ def test_brief_body_uses_readable_paragraph_spacing(tmp_path: Path) -> None:
 
     _, output = builder.publication(pub)
 
-    assert "#set par(spacing: 1.2em)" in output
+    assert "#set par(spacing: 1.4em)" in output
 
 
 def test_legacy_overview_groups_fields_across_an_analyst_observation(tmp_path: Path) -> None:
