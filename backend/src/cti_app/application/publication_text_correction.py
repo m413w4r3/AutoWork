@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -43,6 +44,7 @@ _PATH_PATTERN = re.compile(
     r"^(?P<root>[A-Za-z_][A-Za-z0-9_]*)(?P<tail>(?:\[[0-9]+\]|\.[A-Za-z_][A-Za-z0-9_]*)*)$"
 )
 _PATH_PART_PATTERN = re.compile(r"\[([0-9]+)\]|\.([A-Za-z_][A-Za-z0-9_]*)")
+_logger = logging.getLogger(__name__)
 _CORRECTION_METADATA_KEY = "manual_publication_text_correction"
 MAX_PUBLICATION_TEXT_CORRECTION_TEXT_LENGTH = 4_194_304
 MAX_PUBLICATION_TEXT_CORRECTION_SPANS = 256
@@ -697,6 +699,18 @@ def _validate_qa_transition(
         or after_errors != ["Publication differs from canonical Assembly projection"]
         or before_warnings != after_warnings
     ):
+        _logger.warning(
+            "publication_text_correction_qa_rejected before_passed=%s before_checks=%s "
+            "before_errors=%s after_passed=%s after_checks=%s after_errors=%s "
+            "warnings_equal=%s",
+            before.get("passed"),
+            before_checks,
+            before_errors,
+            after.get("passed"),
+            after_checks,
+            after_errors,
+            before_warnings == after_warnings,
+        )
         raise PublicationTextCorrectionError(
             PublicationTextCorrectionErrorCode.PUBLICATION_QA_FAILED
         )
