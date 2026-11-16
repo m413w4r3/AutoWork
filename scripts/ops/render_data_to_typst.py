@@ -31,11 +31,11 @@ from typing import Any
 
 MANUEL_TYP = r'''// Layout helpers called by the hand-editable markup (main.typ, articles/, breves/).
 // They only compose the styles of helpers.typ / colors.typ / document_style.typ.
-#import "helpers.typ": tag, publication-url-footnote, noteAnalyste, code-font-families
-#import "colors.typ": accent, grey, purple, purple-light
+#import "helpers.typ": tag, better-link, noteAnalyste, code-font-families
+#import "colors.typ": accent, dark, grey, purple, purple-dark, purple-light
 
 // Footnote with a clickable URL (grey highlighted number, URL in the footer).
-#let fn(url) = publication-url-footnote(url)
+#let fn(url) = footnote[#better-link(url)[source]]
 
 // Inline `code`: grey highlight, code font, with invisible break opportunities in long literals.
 #let breakable-text(s) = {
@@ -53,6 +53,11 @@ MANUEL_TYP = r'''// Layout helpers called by the hand-editable markup (main.typ,
   out.join()
 }
 #let inline-literal(it) = highlight(fill: luma(190), radius: 2pt)[#text(font: code-font-families, size: 10pt, hyphenate: false)[#breakable-text(it.text)]]
+#let semantic-malware(body) = text(weight: "bold", fill: purple-dark)[#body]
+#let semantic-tool(body) = text(weight: "bold", fill: accent)[#body]
+#let semantic-product(body) = text(weight: "bold", fill: dark)[#body]
+#let semantic-source(body) = text(size: 9pt, fill: accent)[#body]
+#let semantic-proof(body) = text(size: 9pt, fill: purple-dark)[#body]
 
 // ---- Article / brief header -------------------------------------------------------------
 #let doc-head(title, number, kind: "Article", anchor: "") = [
@@ -69,31 +74,25 @@ MANUEL_TYP = r'''// Layout helpers called by the hand-editable markup (main.typ,
 ]
 
 // ---- References -------------------------------------------------------------------------
-// Brief: "date : text" + one footnote per URL.
-#let ref-brief(date, urls: (), body) = block(above: 2pt, below: 13pt, breakable: false)[
+// One bullet per source; URLs remain clickable footnotes and article citations keep anchors.
+#let ref-entry(date, urls: (), role: none, body) = block(
+  above: 3pt,
+  below: 6pt,
+  breakable: false,
+)[
   #set par(justify: false)
-  #if date != none [#text(date + " : ")]
-  #body
-  #for u in urls [#h(0.2em)#fn(u)]
-]
-
-// Article: numbered entry, internal link target "<scope>-ref<n>".
-#let ref-article(scope, n, date, urls, role: none, body) = block(above: 4pt, below: 5pt)[
-  #set par(justify: false)
-  #text(size: 8pt, fill: grey)[#n. #date]
-  #if role != none [
-    #h(0.5em)
-    #text(size: 7pt, weight: "bold", fill: grey)[#role]
-  ]
-  #linebreak()
-  #v(2pt)
-  #link(urls.first())[#body]
-  #for u in urls [
-    #linebreak()
-    #text(size: 7pt, fill: grey)[#n ]
-    #link(u)[#text(size: 7pt, fill: grey)[#u]]
-  ]
-  #label(scope + "-ref" + str(n))
+  #grid(
+    columns: (10pt, 1fr),
+    column-gutter: 4pt,
+    align: (left, left),
+    [#text(fill: purple)[•]],
+    [
+      #if date != none [#text(weight: "bold", fill: purple)[#date]#text(fill: purple)[ : ]]
+      #body
+      #if role != none [#h(0.25em)#text(size: 7pt, fill: grey)[(#role)]]
+      #for u in urls [#h(0.15em)#fn(u)]
+    ],
+  )
 ]
 
 // Superscript link(s) to numbered references of the same article.
@@ -105,10 +104,7 @@ MANUEL_TYP = r'''// Layout helpers called by the hand-editable markup (main.typ,
 }
 
 // ---- Chronology -------------------------------------------------------------------------
-// Article: enumerated item, bold coloured date.
-#let ev(date, body) = [#text(weight: "bold", fill: purple)[#(date + " : ")]#body]
-
-// Brief: left rail with dots.
+// Briefs, articles and opinions share the same left-rail chronology.
 #let rail(body) = block(
   width: 100%,
   inset: (left: 0pt, right: 0pt, top: 3pt, bottom: 3pt),
@@ -134,15 +130,42 @@ MANUEL_TYP = r'''// Layout helpers called by the hand-editable markup (main.typ,
   #if not last [#v(8pt)]
 ]
 
+// Compact overview box with colored bullets and the three standard labels.
+#let overview-box(body) = block(
+  width: 100%,
+  above: 10pt,
+  below: 15pt,
+  fill: purple-light,
+  inset: 12pt,
+  radius: 4pt,
+  breakable: false,
+)[
+  #text(size: 14pt, weight: "extrabold", fill: purple)[Vue d'ensemble]
+  #v(4pt)
+  #set par(leading: 0.65em, spacing: 0pt)
+  #body
+]
+#let overview-item(label, body) = block(below: 6pt)[
+  #grid(
+    columns: (10pt, 1fr),
+    align: (left, left),
+    [#text(size: 10pt, fill: purple)[•]],
+    [
+      #if label != "" [#text(size: 10pt, weight: "bold", fill: purple)[#label: ]]
+      #text(size: 10pt)[#body]
+    ],
+  )
+]
+
 // ---- Analyst note -----------------------------------------------------------------------
 #let note(body) = noteAnalyste(title: [Note de l'analyste], breakable: true)[
-  #set par(justify: false)
+  #set par(justify: false, spacing: 0.9em)
   #body
 ]
 // Short observation inside the synthesis (grey frame, technical terms in small code font).
 #let obs(body) = block(above: 10pt, below: 8pt)[
   #noteAnalyste[
-    #set par(justify: false)
+    #set par(justify: false, spacing: 0.9em)
     #show raw.where(block: false): it => text(font: code-font-families, size: 8pt, hyphenate: false)[#breakable-text(it.text)]
     #body
   ]
@@ -210,25 +233,44 @@ MANUEL_TYP = r'''// Layout helpers called by the hand-editable markup (main.typ,
   if caption != none [#block(above: 2pt, below: 4pt)[#text(size: 9pt, fill: grey)[#caption]]]
 }
 
-// Two columns: coloured header, light grid. #tbl(title, (2.25, 2.4), header-cells, ..cells)
+// Publication table; match the typography, inset, header and grid of styled-table.
 #let tbl(title, weights, header, caption: none, ..cells) = {
   let n = weights.len()
   let header-cells = header.map(c => [#set text(weight: "bold", fill: white); #c])
-  let body-cells = cells.pos().map(c => [#block(breakable: false, above: 0pt, below: 0pt)[#c]])
-  block(breakable: true, above: 10pt, below: 8pt)[
-    #if title != none [#tbl-title(title)#v(4pt)]
-    #set text(size: 8pt)
-    #align(center, table(
-      columns: weights.map(w => w * 1fr),
-      inset: (x: 4pt, y: 3pt),
-      align: left,
-      fill: (_, y) => if y == 0 { rgb("#5D7374") } else { none },
-      stroke: 0.4pt + rgb("#AEB7C0"),
-      table.header(repeat: true, ..header-cells),
-      ..body-cells,
-    ))
+  let body-cells = cells.pos().enumerate().map(((index, cell)) => {
+    let row = calc.floor(index / n)
+    if calc.rem(row, 2) == 0 {
+      [#block(sticky: true, breakable: false, above: 0pt, below: 0pt)[#cell]]
+    } else {
+      [#block(breakable: false, above: 0pt, below: 0pt)[#cell]]
+    }
+  })
+  let body-row-count = calc.floor(cells.pos().len() / n)
+  set text(size: 9pt)
+  let rendered-table = align(center, table(
+    columns: weights.map(w => w * 1fr),
+    inset: (x: 5pt, y: 4pt),
+    align: left,
+    fill: (_, y) => if y == 0 { purple } else { none },
+    stroke: 0.6pt + gray,
+    table.header(repeat: true, ..header-cells),
+    ..body-cells,
+  ))
+  let table-content = if body-row-count <= 12 {
+    block(breakable: false, above: if title == none { 0pt } else { 6pt })[
+      #if title != none [#tbl-title(title)#v(4pt)]
+      #rendered-table
+    ]
+  } else {
+    [
+      #if title != none [#block(sticky: true, above: 6pt)[#tbl-title(title)#v(4pt)]]
+      #rendered-table
+    ]
+  }
+  [
+    #table-content
+    #tbl-caption(caption)
   ]
-  tbl-caption(caption)
 }
 
 // 3+ columns: one card per row (first cell in bold code, then "column: value" lines).
@@ -256,7 +298,13 @@ MANUEL_TYP = r'''// Layout helpers called by the hand-editable markup (main.typ,
 }
 '''
 
-STYLE_BOLD = {"semantic-malware", "semantic-tool", "semantic-product"}
+STYLE_COLOURED = {
+    "semantic-malware": "malware",
+    "semantic-tool": "tool",
+    "semantic-product": "product",
+    "semantic-source": "source",
+    "semantic-proof": "proof",
+}
 STYLE_EMPH = {
     "semantic-actor", "semantic-campaign", "semantic-proper-name", "semantic-english-term",
 }
@@ -268,6 +316,12 @@ STYLE_RAW = {
 SPECIAL = set("\\#$*_`@<[]~'\"")
 OPEN_OK = set(" \t\n([{«“‘—–-:;,.!?/'\"")
 CLOSE_OK = set(" \t\n)]}»”’—–-:;,.!?/'\"")
+OVERVIEW_PREFIX = re.compile(r"^\s*(Victimologie|Arsenal|Objectif principal)\s*:\s*", re.IGNORECASE)
+OVERVIEW_LABELS = {
+    "victimologie": "Victimologie",
+    "arsenal": "Arsenal",
+    "objectif principal": "Objectif principal",
+}
 
 
 def esc(text: str) -> str:
@@ -315,8 +369,8 @@ def tstr(value: str) -> str:
 def span_class(style: str) -> str:
     if style == "semantic-plain":
         return "plain"
-    if style in STYLE_BOLD:
-        return "strong"
+    if style in STYLE_COLOURED:
+        return STYLE_COLOURED[style]
     if style in STYLE_EMPH:
         return "emph"
     if style in STYLE_RAW:
@@ -387,9 +441,12 @@ def spans_markup(spans: list[dict[str, Any]] | None, fallback: str = "", *, tech
         if kind == "raw":
             out.append(raw_markup(text))
             continue
-        delim = "_" if kind == "emph" else "*"
         before, after = plain_edge(index, -1), plain_edge(index, +1)
         body = esc(text)
+        if kind in STYLE_COLOURED.values():
+            out.append(f"#semantic-{kind}[{body}]")
+            continue
+        delim = "_" if kind == "emph" else "*"
         if before in OPEN_OK and after in CLOSE_OK and "\n" not in text:
             out.append(f"{delim}{body}{delim}")
         else:
@@ -456,11 +513,6 @@ class Builder:
             "none" if not caption else "[" + spans_markup(block.get("semantic_caption"), caption) + "]"
         )
         rows = [[cell(r * len(columns) + c) for c in range(len(columns))] for r in range(len(block["rows"]))]
-        if len(columns) > 2:
-            lines = [f"#cards({title_markup}, ({', '.join(header)},), ("]
-            lines += ["  (" + ", ".join(row) + ",)," for row in rows]
-            lines.append(f"), caption: {caption_markup})")
-            return "\n".join(lines)
         weights = block.get("column_weights") or [1.0] * len(columns)
         lines = [f"#tbl({title_markup}, ({', '.join(str(w) for w in weights)},), ({', '.join(header)},), caption: {caption_markup},"]
         lines += ["  " + ", ".join(row) + "," for row in rows]
@@ -493,6 +545,109 @@ class Builder:
             return f"#diag({', '.join(args)})[{caption_markup}]"
         raise ValueError(f"unsupported figure type {block['type']}")
 
+    def overview_item(self, block: dict[str, Any]) -> tuple[str, str] | None:
+        text = block.get("text", "")
+        match = OVERVIEW_PREFIX.match(text)
+        if match is None:
+            return None
+        label = OVERVIEW_LABELS[match.group(1).casefold()]
+        spans = block.get("semantic_spans")
+        if spans is None:
+            body = spans_markup(None, text[match.end() :])
+        else:
+            if "".join(span["text"] for span in spans) != text:
+                raise ValueError("overview semantic spans do not match paragraph text")
+            remaining = match.end()
+            body_spans: list[dict[str, Any]] = []
+            for span in spans:
+                span_text = span["text"]
+                if remaining >= len(span_text):
+                    remaining -= len(span_text)
+                    continue
+                body_spans.append({**span, "text": span_text[remaining:]})
+                remaining = 0
+            if remaining:
+                raise ValueError("overview semantic spans do not contain the label prefix")
+            body = spans_markup(body_spans)
+        return label, body
+
+    def legacy_overview(
+        self, blocks: list[dict[str, Any]]
+    ) -> tuple[int | None, list[tuple[str, str]], set[int]]:
+        for index, block in enumerate(blocks):
+            if block.get("type") != "section_heading" or block.get("text", "").strip().casefold() != "vue d'ensemble":
+                continue
+            skip = {index}
+            items: list[tuple[str, str]] = []
+            for item_index in range(index + 1, len(blocks)):
+                item = blocks[item_index]
+                if item.get("type") == "section_heading":
+                    break
+                if item.get("type") == "paragraph":
+                    overview_item = self.overview_item(item)
+                    if overview_item is not None:
+                        items.append(overview_item)
+                        skip.add(item_index)
+            return index, items, skip
+        return None, [], set()
+
+    @staticmethod
+    def append_overview(items: list[tuple[str, str]], lines: list[str]) -> bool:
+        if not items:
+            return False
+        lines.append("#overview-box[")
+        for label, body in items:
+            lines.append(f"  #overview-item({tstr(label)})[{body}]")
+        lines += ["]", ""]
+        return True
+
+    def structured_overview(self, overview: dict[str, Any], lines: list[str]) -> bool:
+        fields = (
+            ("Victimologie", overview.get("victimology")),
+            ("Arsenal", overview.get("arsenal")),
+            ("Objectif principal", overview.get("main_objective")),
+        )
+        items: list[tuple[str, str]] = []
+        for label, field in fields:
+            if field is None:
+                continue
+            if isinstance(field, str):
+                body = spans_markup(None, field)
+            else:
+                body = spans_markup(field.get("semantic_spans"), field.get("text", ""))
+            items.append((label, body))
+        return self.append_overview(items, lines)
+
+    def synthesis(
+        self,
+        section: dict[str, Any],
+        folder: str,
+        stem: str,
+        lines: list[str],
+        *,
+        structured_overview_rendered: bool,
+        paragraph_spacing: str = "0.9em",
+    ) -> None:
+        blocks = section["blocks"]
+        overview_index, legacy_items, skip = self.legacy_overview(blocks)
+        if structured_overview_rendered:
+            # The structured article_format is canonical when present; avoid duplicating legacy fields.
+            skip.update(
+                index
+                for index, block in enumerate(blocks)
+                if block.get("type") == "paragraph" and self.overview_item(block)
+            )
+        lines += ["= Synthèse", f"#set par(spacing: {paragraph_spacing})", ""]
+        for index, block in enumerate(blocks):
+            if index == overview_index:
+                if not structured_overview_rendered and not self.append_overview(legacy_items, lines):
+                    lines.append("== Vue d'ensemble")
+                continue
+            if index in skip:
+                continue
+            lines.append(self.body_block(block, folder, stem))
+            lines.append("")
+
     def body_block(self, block: dict[str, Any], folder: str, prefix: str) -> str:
         kind = block["type"]
         if kind == "paragraph":
@@ -509,8 +664,11 @@ class Builder:
 
     # -- publications --------------------------------------------------------------------
     def publication(self, pub: dict[str, Any]) -> tuple[Path, str]:
-        if pub.get("article_format") is not None:
-            raise ValueError("article_format (overview/timeline_key_events) is not supported")
+        article_format = pub.get("article_format") or {}
+        if not isinstance(article_format, dict):
+            raise ValueError("article_format must be an object")
+        article_events = article_format.get("timeline_key_events") or []
+        article_overview = article_format.get("overview")
         brief = pub["kind"] == "brief"
         number = pub["number"]
         stem = ("breve" if brief else "article") + number
@@ -522,7 +680,7 @@ class Builder:
         add = lines.append
         add('#import "../../UTILS/manuel.typ": *')
         add("")
-        if opinion:
+        if not brief:
             add(f'#let rf = source-ref.with("{scope}")')
             add("")
         add(
@@ -532,19 +690,32 @@ class Builder:
         if brief:
             add("#set text(size: 10pt)")
         add("")
+        chronology_rendered = False
+        overview_rendered = False
         for section in pub["content_sections"]:
             kind = section["type"]
             if kind == "references":
-                self.references(section, opinion, scope, lines)
+                self.references(section, opinion, "" if brief else scope, lines)
             elif kind == "chronology":
-                self.chronology(section, brief, opinion, lines)
+                events = article_events or section.get("timeline") or []
+                self.chronology({"timeline": events}, brief, scope, lines)
+                chronology_rendered = True
+                if article_overview is not None:
+                    overview_rendered = self.structured_overview(article_overview, lines)
             elif kind == "synthesis":
-                add("= Synthèse")
-                add("#set par(spacing: 0.9em)" if opinion else "#set par(spacing: 1.2em + 9pt)")
-                add("")
-                for block in section["blocks"]:
-                    add(self.body_block(block, folder, stem))
-                    add("")
+                if article_events and not chronology_rendered:
+                    self.chronology({"timeline": article_events}, brief, scope, lines)
+                    chronology_rendered = True
+                if article_overview is not None and not overview_rendered:
+                    overview_rendered = self.structured_overview(article_overview, lines)
+                self.synthesis(
+                    section,
+                    folder,
+                    stem,
+                    lines,
+                    structured_overview_rendered=overview_rendered,
+                    paragraph_spacing="1.2em" if brief else "0.9em",
+                )
             elif kind == "analyst_opinion":
                 self.opinion(section, stem, folder, lines)
             elif kind == "ioc":
@@ -563,59 +734,48 @@ class Builder:
     def references(self, section: dict[str, Any], opinion: bool, scope: str, lines: list[str]) -> None:
         if section.get("blocks"):
             raise ValueError("reference blocks are not supported")
-        if opinion:
-            entries = section["entries"]
-            if not entries:
-                return
-            lines += ["= Références", ""]
-            for entry in entries:
-                urls = unique(entry.get("source_urls") or ([entry["url"]] if entry.get("url") else []))
-                if not urls:
-                    raise ValueError("numbered reference without URL")
-                role = tstr(entry["role_label"]) if entry.get("role_label") else "none"
-                date = entry.get("display_date") or "Date de publication non précisée"
-                body = spans_markup(entry.get("semantic_spans"), entry.get("text", ""))
-                lines += [
-                    f'#ref-article("{scope}", {entry["number"]}, {tstr(date)}, {tuple_literal(urls)}, role: {role})[{body}]',
-                    "",
-                ]
-            return
-        entries = [e for e in section["entries"] if e.get("text") or e.get("title")]
+        entries = [entry for entry in section["entries"] if entry.get("text") or entry.get("title")]
         if not entries:
             return
         lines += ["= Références", ""]
-        for entry in entries:
+        for index, entry in enumerate(entries, 1):
             text = entry.get("text")
             body = spans_markup(entry.get("semantic_spans"), text) if text else spans_markup(None, entry["title"])
             urls = unique(([entry["url"]] if entry.get("url") else []) + list(entry.get("source_urls") or []))
-            date = tstr(entry["display_date"]) if entry.get("display_date") else "none"
-            lines += [f"#ref-brief({date}, urls: {tuple_literal(urls)})[{body}]", ""]
+            if opinion and not urls:
+                raise ValueError("numbered reference without URL")
+            date = entry.get("display_date") or "Date de publication non précisée"
+            number = entry.get("number", index)
+            role = tstr(entry["role_label"]) if entry.get("role_label") else "none"
+            reference_label = f" <{scope}-ref{number}>" if scope else ""
+            lines += [
+                f"#ref-entry({tstr(date)}, urls: {tuple_literal(urls)}, role: {role})[{body}]{reference_label}",
+                "",
+            ]
 
-    def chronology(self, section: dict[str, Any], brief: bool, opinion: bool, lines: list[str]) -> None:
+    def chronology(self, section: dict[str, Any], brief: bool, scope: str, lines: list[str]) -> None:
         events = section.get("timeline") or []
-        if not events or (not brief and not opinion):
+        if not events:
             return
         lines += ["= Chronologie", ""]
-        if opinion:
-            for event in events:
-                if event.get("role_label"):
-                    raise ValueError("chronology role_label is not supported")
-                refs = [str(r["number"]) for r in event.get("source_refs") or []]
-                if not refs:
-                    raise ValueError("opinion chronology event without internal references")
-                body = spans_markup(event.get("semantic_spans"), event["text"])
-                lines.append(f'+ #ev({tstr(event.get("display_date", ""))})[{body} #rf({", ".join(refs)})]')
-            lines.append("")
-            return
         lines.append("#rail[")
         for index, event in enumerate(events):
             urls = unique(event.get("source_urls") or [])
-            if not urls:
+            refs = event.get("source_refs") or []
+            if brief and not urls:
                 raise ValueError("brief chronology event without URL footnote")
             body = spans_markup(event.get("semantic_spans"), event["text"])
-            notes = "".join(f" #fn({tstr(u)})" for u in urls)
+            if refs and not brief:
+                numbers = [
+                    str(ref.get("number", ref_index + 1) if isinstance(ref, dict) else ref)
+                    for ref_index, ref in enumerate(refs)
+                ]
+                notes = f' #rf({", ".join(numbers)})'
+            else:
+                notes = "".join(f" #fn({tstr(url)})" for url in urls)
             last = ", last: true" if index == len(events) - 1 else ""
-            lines.append(f'  #rail-event({tstr(event.get("display_date", ""))}{last})[{body}{notes}]')
+            date = event.get("display_date_fr") or event.get("display_date", "")
+            lines.append(f'  #rail-event({tstr(date)}{last})[{body}{notes}]')
         lines += ["]", ""]
 
     def opinion(self, section: dict[str, Any], stem: str, folder: str, lines: list[str]) -> None:
@@ -776,17 +936,18 @@ Les avertissements « label … is not attached to anything » sont normaux.
 - **Titres** : `=` (section), `==` (sous-section), `===` (dans la note de l'analyste).
 - **Note de l'analyste** : bloc `#note[ … ]` en fin d'avis ; observations courtes : `#obs[ … ]`.
 - **Figures** : `#fig(path("../../media/…"), N)[légende]`, `#diag(…)` pour les diagrammes.
-- **Tableaux** : `#tbl(…)` (2 colonnes) et `#cards(…)` (3 colonnes ou plus, une fiche par ligne).
+- **Tableaux** : `#tbl(…)` reproduit la grille publiée ; `#cards(…)` reste disponible pour une
+  fiche compacte rédigée manuellement.
 - **Mise en page** : `UTILS/*.typ` (styles généraux) et `UTILS/manuel.typ` (macros de cette arborescence).
 
 ## Écarts connus par rapport à `IR2610_bulletin.pdf`
 - Pas d'identité pixel à pixel : coupures de ligne/de page et nombre de pages peuvent différer
-  (97 pages obtenues comme l'original, mêmes pages de début de publication à la génération ;
-  le texte extrait est le même, hors positions des notes de bas de page et coupures).
+  (le nombre de pages peut varier légèrement avec les coupures et les notes de bas de page).
 - Sommaire : liens bleus vers les publications, sans numéros de page (comme dans l'original).
-- Surlignages sémantiques simplifiés : malwares/outils/produits sont en gras simple (l'original
-  ajoute une couleur), acteurs/campagnes/noms propres en italique ; les termes techniques gardent
-  le surlignage gris.
+- Les références, frises chronologiques, encadrés « Vue d'ensemble », couleurs sémantiques,
+  tableaux et notes de l'analyste suivent les styles du PDF de référence.
+- Les termes techniques et IOC gardent leur surlignage gris serré ; les paragraphes sont séparés
+  par un espacement de 0,9 à 1,2 em.
 - Les points d'ancrage invisibles de césure des littéraux longs sont recalculés par une règle
   générique (`breakable-text`), pas repris de l'original.
 - Non reproduits (volontairement, comme dans le PDF lecteur) : règles de détection, graphes dérivés,

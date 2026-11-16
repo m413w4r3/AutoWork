@@ -1,0 +1,212 @@
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from typing import Any
+
+OPS_DIR = Path(__file__).resolve().parents[2] / "scripts" / "ops"
+sys.path.insert(0, str(OPS_DIR))
+
+import render_data_to_typst as renderer  # noqa: E402
+
+
+def article(*, article_format: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {
+        "kind": "article",
+        "number": "01",
+        "title": "Example article",
+        "anchor": "example-article",
+        "subject_id": "9f9dfdd6-273c-4eef-b7ad-59bbde44b5b4",
+        "article_format": article_format,
+        "content_sections": [
+            {
+                "type": "references",
+                "entries": [
+                    {
+                        "number": 1,
+                        "display_date": "2 janvier 2026",
+                        "text": "Source explanation",
+                        "semantic_spans": [{"style": "semantic-plain", "text": "Source explanation"}],
+                        "source_urls": ["https://example.test/source"],
+                    }
+                ],
+            },
+            {
+                "type": "chronology",
+                "timeline": [
+                    {
+                        "display_date": "3 janvier 2026",
+                        "text": "Observed event",
+                        "semantic_spans": [{"style": "semantic-plain", "text": "Observed event"}],
+                        "source_refs": [{"number": 1}],
+                        "source_urls": [],
+                    }
+                ],
+            },
+            {"type": "synthesis", "blocks": [{"type": "paragraph", "text": "Summary."}]},
+        ],
+    }
+
+
+def test_references_and_article_chronology_use_bullets_and_rail(tmp_path: Path) -> None:
+    builder = renderer.Builder({}, tmp_path, tmp_path)
+
+    _, output = builder.publication(article())
+
+    assert '#ref-entry("2 janvier 2026"' in output
+    assert "<a01-ref1>" in output
+    assert "#rail[" in output
+    assert '#rail-event("3 janvier 2026"' in output
+    assert "#rf(1)" in output
+    assert "#ev(" not in output
+    assert "#set par(spacing: 0.9em)" in output
+
+
+def test_structured_article_format_renders_overview_and_key_events(tmp_path: Path) -> None:
+    article_format = {
+        "overview": {
+            "victimology": {"text": "Victims in several sectors.", "semantic_spans": None},
+            "arsenal": "A compact toolset.",
+            "main_objective": "Credential collection.",
+        },
+        "timeline_key_events": [
+            {
+                "display_date": "1 janvier 2026",
+                "text": "First event",
+                "semantic_spans": [{"style": "semantic-plain", "text": "First event"}],
+                "source_urls": ["https://example.test/event"],
+            }
+        ],
+    }
+    builder = renderer.Builder({}, tmp_path, tmp_path)
+
+    _, output = builder.publication(article(article_format=article_format))
+
+    assert '#overview-item("Victimologie")[Victims in several sectors.]' in output
+    assert '#overview-item("Arsenal")[A compact toolset.]' in output
+    assert '#overview-item("Objectif principal")[Credential collection.]' in output
+    assert '#rail-event("1 janvier 2026"' in output
+    assert "#fn(\"https://example.test/event\")" in output
+
+
+def test_brief_body_uses_readable_paragraph_spacing(tmp_path: Path) -> None:
+    pub = {
+        "kind": "brief",
+        "number": "04",
+        "title": "Example brief",
+        "anchor": "example-brief",
+        "article_format": None,
+        "content_sections": [
+            {"type": "references", "entries": []},
+            {"type": "synthesis", "blocks": [{"type": "paragraph", "text": "First paragraph."}]},
+        ],
+    }
+    builder = renderer.Builder({}, tmp_path, tmp_path)
+
+    _, output = builder.publication(pub)
+
+    assert "#set par(spacing: 1.2em)" in output
+
+
+def test_legacy_overview_groups_fields_across_an_analyst_observation(tmp_path: Path) -> None:
+    blocks = [
+        {"type": "section_heading", "text": "Vue d'ensemble"},
+        {
+            "type": "paragraph",
+            "text": "Victimologie : Victims.",
+            "semantic_spans": [{"style": "semantic-plain", "text": "Victimologie : Victims."}],
+        },
+        {
+            "type": "paragraph",
+            "text": "Arsenal : Tools.",
+            "semantic_spans": [{"style": "semantic-plain", "text": "Arsenal : Tools."}],
+        },
+        {
+            "type": "analyst_observation",
+            "text": "Analyst note.",
+            "text_spans": [{"text": "Analyst note.", "technical": False}],
+        },
+        {
+            "type": "paragraph",
+            "text": "Objectif principal : Collection.",
+            "semantic_spans": [{"style": "semantic-plain", "text": "Objectif principal : Collection."}],
+        },
+        {"type": "section_heading", "text": "Context"},
+    ]
+    builder = renderer.Builder({}, tmp_path, tmp_path)
+    lines: list[str] = []
+
+    builder.synthesis(
+        {"blocks": blocks},
+        "articles/article01",
+        "article01",
+        lines,
+        structured_overview_rendered=False,
+    )
+    output = "\n".join(lines)
+
+    assert output.count("#overview-box[") == 1
+    assert output.count("#overview-item(") == 3
+    assert '== Vue d\'ensemble' not in output
+    assert "#obs[" in output
+    assert output.index('#overview-item("Objectif principal")') < output.index("#obs[")
+
+
+def test_semantic_colors_short_source_links_and_tight_code_style() -> None:
+    markup = renderer.spans_markup(
+        [
+            {"style": "semantic-malware", "text": "Malware"},
+            {"style": "semantic-tool", "text": " Tool"},
+            {"style": "semantic-product", "text": " Product"},
+        ]
+    )
+
+    assert "#semantic-malware[Malware]" in markup
+    assert "#semantic-tool[Tool]" in markup
+    assert "#semantic-product[Product]" in markup
+    assert "#let fn(url) = footnote[#better-link(url)[source]]" in renderer.MANUEL_TYP
+    assert "highlight(fill: luma(190), radius: 2pt)" in renderer.MANUEL_TYP
+    assert "#overview-box(" in renderer.MANUEL_TYP or "#let overview-box(" in renderer.MANUEL_TYP
+    assert "#tbl-caption(caption)" in renderer.MANUEL_TYP
+
+
+def test_cover_keeps_the_centered_brand_logo(tmp_path: Path) -> None:
+    data = {
+        "edition": {
+            "country": "Test",
+            "bulletin_period": "janvier 2026",
+            "bulletin_number": "1",
+            "bulletin_identifier": "IR0001",
+            "bulletin_title": "Bulletin de veille CTI",
+            "country_code": "TT",
+            "tlp": "CLEAR",
+        },
+        "file_ioc_count": 0,
+    }
+
+    main = renderer.Builder(data, tmp_path, tmp_path).main_typ([], [])
+
+    assert '#image("UTILS/chap.png", width: 18%)' in main
+
+
+def test_article_output_omits_internal_ids_and_ioc_tables(tmp_path: Path) -> None:
+    pub = article()
+    pub["content_sections"].append(
+        {
+            "type": "ioc",
+            "source_indicators": [{"items": [{"value": "hidden-ioc-sentinel"}]}],
+        }
+    )
+    pub["content_sections"].append(
+        {"type": "analyst_opinion", "blocks": [], "unanchored_observations": []}
+    )
+    builder = renderer.Builder({}, tmp_path, tmp_path)
+
+    _, output = builder.publication(pub)
+
+    assert pub["subject_id"] not in output
+    assert "[F]" not in output
+    assert "[E]" not in output
+    assert "hidden-ioc-sentinel" not in output
+    assert "#ioc-list" not in output
+    assert "#ioc-renvoi()" in output
