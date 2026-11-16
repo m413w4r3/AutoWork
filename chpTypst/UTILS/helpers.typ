@@ -204,21 +204,30 @@
 )
 
 
-#let vueEnsemble(items) = box(
+#let vueEnsemble(items) = block(
   width: 100%,
   fill: purple-light,
   inset: 12pt,
   radius: 4pt,
+  breakable: true,
 )[
-  #for item in items {
-    pad(left: 1em)[
-       • #text(
-        weight: "semibold",
-        fill: purple,
-      )[ #item.first() ]: #item.last()
+  #block(sticky: true, below: 4pt)[
+    #text(size: 14pt, weight: "extrabold", fill: purple)[Vue d'ensemble]
+  ]
+  #set par(leading: 0.65em, spacing: 0pt)
+  #for (index, item) in items.enumerate() [
+    #block(below: if index < items.len() - 1 { 6pt } else { 0pt })[
+      #grid(
+        columns: (10pt, 1fr),
+        align: (left, left),
+        [#text(size: 10pt, fill: purple)[•]],
+        [
+          #text(size: 10pt, weight: "bold", fill: purple)[#item.first() : ]
+          #text(size: 10pt)[#item.last()]
+        ],
+      )
     ]
-
-  }
+  ]
 ]
 
 #let noteAnalyste(content, title: [Note de l'analyste], breakable: false) = {
@@ -342,12 +351,7 @@
   ]
 
   if overview != () [
-    #block(
-      sticky: true, 
-      [
-      #section-title[Vue d'ensemble]
-      #vueEnsemble(overview)
-      ])
+    #vueEnsemble(overview)
     #v(10pt)
   ]
   
@@ -355,7 +359,7 @@
   if events != none [
     // Synthèse
     #section-title[Synthèse]
-    #set par(spacing: 2em)
+    #set par(spacing: 0.9em)
   ]
   body
 }

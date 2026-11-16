@@ -175,14 +175,91 @@ def _publication_fixture(
     return result
 
 
+def _opinion_fixture() -> dict[str, Any]:
+    source_url = "https://source.example.test/advisory"
+    return {
+        "schema_version": "typst-publication-model-v40-m21-opinion-render",
+        "document_label": "m21-opinion-format-fixture",
+        "kind": "article",
+        "opinion_document": True,
+        "title": "Synthetic analyst opinion",
+        "number": "01",
+        "article_format": None,
+        "article_overview": {
+            "victimology": {"text": "A fictional audience."},
+            "arsenal": {"text": "Neutral example components."},
+            "main_objective": {"text": "Exercise the opinion overview card."},
+        },
+        "content_sections": [
+            {
+                "type": "references",
+                "show_heading": True,
+                "entries": [
+                    {
+                        "number": 1,
+                        "display_date": "14 octobre 2026",
+                        "text": "Synthetic advisory source detail.",
+                        "source_urls": [source_url],
+                        "target_id": "publication-source-0001",
+                    }
+                ],
+                "blocks": [],
+            },
+            {
+                "type": "chronology",
+                "timeline": [
+                    {
+                        "display_date": "14 octobre 2026",
+                        "text": "Synthetic first advisory event.",
+                        "source_refs": [
+                            {"number": 1, "target_id": "publication-source-0001"}
+                        ],
+                    },
+                    {
+                        "display_date": "16 octobre 2026",
+                        "text": "Synthetic second event is documented.",
+                    },
+                ],
+            },
+            {
+                "type": "synthesis",
+                "blocks": [
+                    {"type": "section_heading", "text": "Contexte"},
+                    {"type": "paragraph", "text": "Synthetic context paragraph one."},
+                    {"type": "paragraph", "text": "Synthetic context paragraph two."},
+                ],
+            },
+            {
+                "type": "analyst_opinion",
+                "blocks": [
+                    {
+                        "number": "1.",
+                        "heading": "Conclusion",
+                        "qualification_label": "Étayé par les sources",
+                        "text": "Synthetic opinion conclusion.",
+                        "pipe_table": None,
+                    }
+                ],
+                "unanchored_observations": [],
+                "unresolved_points": [],
+                "protocol_figures": [],
+            },
+        ],
+    }
+
+
 def test_m19_renderer_manifest_versions_are_explicitly_pinned() -> None:
     article = load_template_bundle(_TEMPLATE_ROOT)
     edition = load_template_bundle(
         _TEMPLATE_ROOT,
         manifest_name="edition-renderer-manifest.json",
     )
-    assert article.template_version == "chp-article-v47-m21-opinion-safe-links-m21-pdffix7"
-    assert edition.template_version == "chp-edition-v36-m21-opinion-render-m21-pdffix7"
+    assert article.template_version == (
+        "chp-article-v47-m21-opinion-safe-links-m21-pdffix7-m21-format1"
+    )
+    assert edition.template_version == (
+        "chp-edition-v36-m21-opinion-render-m21-pdffix7-m21-format1"
+    )
 
 
 def test_semantic_inline_technical_highlight_has_no_content_padding() -> None:
@@ -424,6 +501,82 @@ def _assert_timeline_rail(
     assert longest_run >= 20, longest_run
 
 
+def _assert_overview_box(path: Path, pages: list[dict[str, Any]], tmp_path: Path) -> None:
+    page_index = next(
+        index
+        for index, page in enumerate(pages)
+        if any(line["text"].replace("\u2019", "'") == "Vue d'ensemble" for line in page["lines"])
+    )
+    heading = next(
+        line
+        for line in pages[page_index]["lines"]
+        if line["text"].replace("\u2019", "'") == "Vue d'ensemble"
+    )
+    image_prefix = tmp_path / "overview-page"
+    subprocess.run(
+        (
+            "pdftoppm",
+            "-r",
+            "72",
+            "-f",
+            str(page_index + 1),
+            "-l",
+            str(page_index + 1),
+            "-singlefile",
+            str(path),
+            str(image_prefix),
+        ),
+        capture_output=True,
+        check=True,
+        timeout=20,
+    )
+    width, height, pixels = _read_ppm(image_prefix.with_suffix(".ppm"))
+    x = int(heading["left"]) - 5
+    y = int((heading["top"] + heading["bottom"]) / 2)
+    assert 0 <= x < width and 0 <= y < height
+    offset = (y * width + x) * 3
+    assert pixels[offset : offset + 3] == bytes((232, 240, 240))
+
+
+def _assert_reference_date_is_purple(
+    path: Path,
+    line: dict[str, Any],
+    page_index: int,
+    tmp_path: Path,
+) -> None:
+    image_prefix = tmp_path / "reference-page"
+    subprocess.run(
+        (
+            "pdftoppm",
+            "-r",
+            "72",
+            "-f",
+            str(page_index + 1),
+            "-l",
+            str(page_index + 1),
+            "-singlefile",
+            str(path),
+            str(image_prefix),
+        ),
+        capture_output=True,
+        check=True,
+        timeout=20,
+    )
+    width, height, pixels = _read_ppm(image_prefix.with_suffix(".ppm"))
+    x_start = max(0, int(line["left"]))
+    x_end = min(width, int(line["left"]) + 140)
+    y_start = max(0, int(line["top"]))
+    y_end = min(height, int(line["bottom"]) + 1)
+    purple_pixels = 0
+    for y in range(y_start, y_end):
+        for x in range(x_start, x_end):
+            offset = (y * width + x) * 3
+            red, green, blue = pixels[offset : offset + 3]
+            if green - red >= 10 and blue - red >= 10:
+                purple_pixels += 1
+    assert purple_pixels > 0, "reference date was not rendered in the configured purple color"
+
+
 def _pdf_font_list(path: Path) -> str:
     result = subprocess.run(
         ("pdffonts", str(path)),
@@ -442,21 +595,25 @@ async def test_m19_article_and_brief_render_v2_format_to_real_pdf(
     kind: str,
 ) -> None:
     render_data = _publication_fixture(kind)
+    if kind == "brief":
+        render_data["article_overview"] = {
+            "victimology": {"text": "A fictional brief audience."},
+            "arsenal": {"text": "Neutral brief components."},
+            "main_objective": {"text": "Exercise the brief overview card."},
+        }
     path = await _compile_pdf(tmp_path, render_data)
     text, pages = _extract_layout(path)
 
     assert text.index("Références") < text.index("Chronologie") < text.index("Synthèse")
-    if kind == "article":
-        assert (
-            text.index("Chronologie") < text.index("Vue d\u2019ensemble") < text.index("Synthèse")
-        )
+    assert text.index("Chronologie") < text.index("Vue d\u2019ensemble") < text.index("Synthèse")
+    assert all(label in text for label in ("Victimologie", "Arsenal", "Objectif principal"))
     reference_line = next(
         line["text"]
         for page in pages
         for line in page["lines"]
         if "Synthetic source summary sentence." in line["text"]
     )
-    assert reference_line.startswith("14 octobre 2026 : Synthetic source summary sentence.")
+    assert reference_line.startswith("• 14 octobre 2026 : Synthetic source summary sentence.")
     assert _REFERENCE_URL not in reference_line
     assert "This title must not override the source summary." not in text
     assert "Synthetic Publisher" not in text
@@ -488,9 +645,8 @@ async def test_m19_article_and_brief_render_v2_format_to_real_pdf(
         assert abs(caption_center - page["width"] / 2) <= 2.0, (caption, caption_center)
 
     # Spec §1.5 uses adjacent pdftotext blocks at y≈100-730 pt, >=2 lines,
-    # >=250 pt wide, >=75% horizontal overlap, and 8-22 pt ink gaps. CN/RU
-    # measure 15.33 pt (±2 pt); these fixtures measure 15.534 pt (n=2) for
-    # both ARTICLE and BRIEF using the same filters.
+    # >=250 pt wide, >=75% horizontal overlap, and an ink gap close to the
+    # 15.33 pt CN/RU reference measurement.
     gaps = _paragraph_gap_measurements(pages)
     assert len(gaps) >= 2, "too few paragraph block pairs met the §1.5 filter"
     median = statistics_median(gaps)
@@ -507,6 +663,7 @@ async def test_m19_article_and_brief_render_v2_format_to_real_pdf(
     }
     assert {_REFERENCE_URL, _TIMELINE_URL} <= linked_urls
     _assert_timeline_rail(path, pages, tmp_path)
+    _assert_overview_box(path, pages, tmp_path)
 
 
 @pytest.mark.parametrize("kind", ("article", "brief"))
@@ -541,12 +698,12 @@ async def test_m19_reference_entries_have_separation_and_preserve_other_layout(
     first_start = next(
         index
         for index, (_page_index, line) in enumerate(reference_lines)
-        if line["text"].startswith("14 octobre 2026 :")
+        if line["text"].startswith("• 14 octobre 2026 :")
     )
     second_start = next(
         index
         for index, (_page_index, line) in enumerate(reference_lines)
-        if line["text"].startswith("15 octobre 2026 :")
+        if line["text"].startswith("• 15 octobre 2026 :")
     )
     first_entry = reference_lines[first_start:second_start]
     second_entry = reference_lines[second_start]
@@ -568,6 +725,47 @@ async def test_m19_reference_entries_have_separation_and_preserve_other_layout(
     caption_line, caption_page = caption
     caption_center = (caption_line["left"] + caption_line["right"]) / 2
     assert abs(caption_center - caption_page["width"] / 2) <= 2.0
+
+
+@pytest.mark.asyncio
+async def test_opinion_references_timeline_and_overview_use_reader_format(tmp_path: Path) -> None:
+    path = await _compile_pdf(tmp_path, _opinion_fixture())
+    text, pages = _extract_layout(path)
+
+    reference_line = next(
+        (page_index, line)
+        for page_index, page in enumerate(pages)
+        for line in page["lines"]
+        if "Synthetic advisory source detail." in line["text"]
+    )
+    page_index, line = reference_line
+    assert line["text"].startswith("• 14 octobre 2026 : Synthetic advisory source detail.")
+    assert "1. 14 octobre 2026" not in text
+    _assert_reference_date_is_purple(path, line, page_index, tmp_path)
+
+    assert "Chronologie" in text
+    assert "Synthetic first advisory event." in text
+    assert "Synthetic second event is documented." in text
+    first_event_line = next(
+        line["text"]
+        for page in pages
+        for line in page["lines"]
+        if "Synthetic first advisory event." in line["text"]
+    )
+    assert first_event_line.endswith("1"), first_event_line
+    assert "Vue d'ensemble" in text.replace("\u2019", "'")
+    assert all(label in text for label in ("Victimologie", "Arsenal", "Objectif principal"))
+    assert "Contexte" in text and "Synthetic opinion conclusion." in text
+    _assert_timeline_rail(path, pages, tmp_path)
+    _assert_overview_box(path, pages, tmp_path)
+
+    reader = PdfReader(path, strict=True)
+    linked_urls = {
+        str(annotation.get_object().get("/A", {}).get("/URI", ""))
+        for page in reader.pages
+        for annotation in page.get("/Annots", ())
+    }
+    assert "https://source.example.test/advisory" in linked_urls
 
 
 @pytest.mark.parametrize("kind", ("article", "brief"))

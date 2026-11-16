@@ -51,10 +51,11 @@
       fill: purple-light,
       inset: 12pt,
       radius: 4pt,
-      breakable: false,
+      breakable: true,
     )[
-      #text(size: 14pt, weight: "extrabold", fill: purple)[Vue d'ensemble]
-      #v(4pt)
+      #block(sticky: true, below: 4pt)[
+        #text(size: 14pt, weight: "extrabold", fill: purple)[Vue d'ensemble]
+      ]
       #set par(leading: 0.65em, spacing: 0pt)
       #for (index, (label, field)) in visible-fields.enumerate() [
         #let value = if type(field) == str { field } else { field.at("text", default: "") }
@@ -63,7 +64,7 @@
           #grid(
             columns: (10pt, 1fr),
             align: (left, left),
-            [#text(size: 10pt)[•]],
+            [#text(size: 10pt, fill: purple)[•]],
             [
               #text(size: 10pt, weight: "bold", fill: purple)[#label : ]
               #text(size: 10pt)[#semantic-or-plain(value, semantic-spans)]
@@ -341,26 +342,23 @@
     let source-urls = entry.at("source_urls", default: ())
     let target-id = entry.at("target_id", default: "publication-source-legacy-" + str(number))
     let entry-text = entry.at("text", default: "")
-    block(above: 4pt, below: 5pt)[
+    list.item[
       #set par(justify: false)
-      #text(size: 8pt, fill: grey)[#number. #display-date]
+      #text(size: 8pt, weight: "bold", fill: purple)[#display-date]
+      #text(size: 8pt, weight: "bold", fill: purple)[: ]
       #if entry.at("role_label", default: none) != none [
-        #h(0.5em)
         #text(size: 7pt, weight: "bold", fill: grey)[#entry.role_label]
+        #h(0.35em)
       ]
-      #linebreak()
-      #v(2pt)
       #if source-urls.len() > 0 [
         #let primary-url = source-urls.first()
         #link(primary-url)[#semantic-or-plain(entry-text, entry.at("semantic_spans", default: none))]
         #if entry-text != primary-url [
           #linebreak()
-          #text(size: 7pt, fill: grey)[#number ]
           #link(primary-url)[#text(size: 7pt, fill: grey)[#primary-url]]
         ]
         #for url in source-urls.slice(1) [
           #linebreak()
-          #text(size: 7pt, fill: grey)[#number ]
           #link(url)[#text(size: 7pt, fill: grey)[#url]]
         ]
       ] else [
@@ -427,9 +425,12 @@
     none
   }
   if has-text(display-text) [
-    #block(above: 2pt, below: 13pt, breakable: false)[
+    #list.item[
       #set par(justify: false)
-      #if has-text(display-date) [#text(str(display-date) + " : ")]
+      #if has-text(display-date) [
+        #text(weight: "bold", fill: purple)[#str(display-date)]
+        #text(weight: "bold", fill: purple)[: ]
+      ]
       #semantic-or-plain(display-text, semantic-spans)
       #for source-url in urls [#h(0.2em)#publication-url-footnote(source-url)]
     ]
@@ -1084,6 +1085,7 @@
   let blocks = content-section.at("blocks", default: ())
   if visible-entries.len() > 0 or blocks.len() > 0 [
     #render-section-heading[Références]
+    #set list(spacing: 4pt, indent: 12pt)
     #for entry in visible-entries [#render-m19-publication-reference(entry)]
     #for item in blocks {render-body-block(item)}
   ]
@@ -1162,7 +1164,7 @@
     ()
   }
   let article-overview = if article-format == none {
-    none
+    publication.at("article_overview", default: none)
   } else {
     article-format.at("overview", default: none)
   }
@@ -1186,6 +1188,7 @@
       }
     } else if content_section.type == "synthesis" [
       #if brief-publication [
+        #if article-overview != none [#render-article-overview(article-overview)]
         #render-section-heading[Synthèse]
         #let synthesis-blocks = content_section.at("blocks", default: ())
         #for (index, item) in synthesis-blocks.enumerate() {
@@ -1197,7 +1200,7 @@
           render-body-block(
             item,
             reference-scope: reference-scope,
-            paragraph-gap: if has-next-paragraph { 9pt } else { 0pt },
+            paragraph-gap: if has-next-paragraph { 0.9em } else { 0pt },
             opinion-publication: opinion-publication,
           )
         }
@@ -1216,18 +1219,19 @@
           render-body-block(
             item,
             reference-scope: reference-scope,
-            paragraph-gap: if has-next-paragraph { 9pt } else { 0pt },
+            paragraph-gap: if has-next-paragraph { 0.9em } else { 0pt },
             article-style: true,
             opinion-publication: opinion-publication,
           )
         }
       ] else [
+        #if article-overview != none [#render-article-overview(article-overview)]
         #render-section-heading[Synthèse]
         #for item in content_section.at("blocks", default: ()) {
           render-body-block(
             item,
             reference-scope: reference-scope,
-            paragraph-gap: 5pt,
+            paragraph-gap: 0.9em,
             legacy-paragraph-spacing: true,
             opinion-publication: opinion-publication,
           )
@@ -1242,12 +1246,9 @@
           footnotes: brief-chronology,
         )
       ] else if opinion-publication [
-        #render-section-heading[Chronologie]
-        #render-publication-timeline(
+        #render-publication-timeline-rail(
           content_section.timeline,
-          ordered: true,
           reference-scope: reference-scope,
-          date-fill: purple,
         )
       ]
     ] else if content_section.type == "limitations" [
@@ -1321,6 +1322,7 @@
       ).len() > 0
       #if not has-wide-opinion-table and opinion-blocks.len() > 0 [
         #noteAnalyste(title: [Note de l'analyste], breakable: true)[
+          #set par(spacing: 0.9em)
           #for item in opinion-blocks [
             #let pipe-table = item.at("pipe_table", default: none)
             #heading(level: 3)[#item.number #text(item.heading)]
@@ -1342,6 +1344,7 @@
           #let pipe-table = item.at("pipe_table", default: none)
           #if pipe-table != none and pipe-table.wide [
             #noteAnalyste(title: opinion-title, breakable: true)[
+              #set par(spacing: 0.9em)
               #heading(level: 3)[#item.number #text(item.heading)]
               #block(sticky: true, above: 0pt, below: 0.4em)[#text(size: 8pt, weight: "bold")[#text(item.qualification_label)]]
               #let prefix = pipe-table.at("prefix", default: "")
@@ -1363,6 +1366,7 @@
             #parbreak()
           ] else [
             #noteAnalyste(title: opinion-title, breakable: true)[
+              #set par(spacing: 0.9em)
               #heading(level: 3)[#item.number #text(item.heading)]
               #block(sticky: true, above: 0pt, below: 0.4em)[#text(size: 8pt, weight: "bold")[#text(item.qualification_label)]]
               #parbreak()
