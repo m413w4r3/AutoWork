@@ -840,6 +840,33 @@ class AnalystOpinionV1:
         return {**self.content_payload(), "content_sha256": self.content_sha256}
 
 
+def validate_analyst_opinion_rebase(
+    previous: AnalystOpinionV1, rebased: AnalystOpinionV1
+) -> None:
+    """Require a rebase version to change only its publication identity/review state."""
+    if (
+        previous.id != rebased.id
+        or previous.investigation_id != rebased.investigation_id
+        or previous.synthesis_artifact_id != rebased.synthesis_artifact_id
+        or previous.synthesis_sha256 != rebased.synthesis_sha256
+    ):
+        raise ValueError(
+            "Opinion rebase must retain opinion, investigation, and synthesis identity"
+        )
+    if previous.base_publication_artifact_id == rebased.base_publication_artifact_id:
+        raise ValueError("Opinion rebase requires a new base publication artifact")
+    if (
+        rebased.status is not AnalystOpinionStatus.DRAFT
+        or rebased.reviewer_id is not None
+        or previous.blocks != rebased.blocks
+        or previous.unresolved_points != rebased.unresolved_points
+        or previous.protocol_figures != rebased.protocol_figures
+        or previous.bridge_drafting_gap_acknowledged
+        != rebased.bridge_drafting_gap_acknowledged
+    ):
+        raise ValueError("Opinion rebase must preserve content and reset review state")
+
+
 def _validate_sha256(value: str, name: str) -> None:
     if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
         raise ValueError(f"{name} must be lowercase SHA-256")

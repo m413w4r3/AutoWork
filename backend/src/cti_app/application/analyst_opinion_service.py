@@ -79,6 +79,7 @@ from cti_app.domain.publication_document import (
     publication_document_article_v5_body,
     publication_document_from_json,
     publication_document_text_anchors,
+    publication_document_v5_from_json,
     serialize_publication_document,
 )
 
@@ -116,6 +117,7 @@ class OpinionErrorCode(StrEnum):
     REVIEW_TEXT_STALE = "review_text_stale"
     INVALID_OBSERVATION_ANCHOR = "invalid_observation_anchor"
     INVALID_STATE = "invalid_opinion_state"
+    REBASE_BASE_INVALID = "opinion_rebase_base_invalid"
     IDEMPOTENCY_CONFLICT = "idempotency_conflict"
     PROTOCOL_FIGURES_INVALID = "invalid_protocol_figures"
     PROTOCOL_FIGURES_NOT_IN_INVESTIGATION = "protocol_figures_not_in_investigation"
@@ -264,6 +266,13 @@ class AnalystOpinionDraftView:
     opinion: AnalystOpinionV1 | None
     history: tuple[AnalystOpinionV1, ...]
     citation_violations: tuple[CitationViolation, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class OpinionRebaseResult:
+    opinion: AnalystOpinionV1
+    corrected_anchor: str | None
+    analyst_observation_ids_requiring_review: tuple[UUID, ...]
 
 
 class AnalystOpinionService:
@@ -522,6 +531,143 @@ class AnalystOpinionService:
                 raise
             await uow.commit()
             return result
+
+    async def rebase(
+        self,
+        opinion_id: UUID,
+        expected_version: int,
+        expected_sha256: str,
+        base_publication_artifact_id: UUID,
+        expected_base_publication_sha256: str,
+        actor: str,
+    ) -> OpinionRebaseResult:
+        """Append a draft version pinned to the direct child corrected publication."""
+        actor_id = self._require_actor(actor)
+        async with self._uow_factory() as uow:
+            current = await self._require_current(uow, opinion_id)
+            self._require_expected_sha(current, expected_sha256)
+            if current.version != expected_version:
+                raise OpinionError(OpinionErrorCode.STALE_VERSION)
+            if current.status not in {
+                AnalystOpinionStatus.DRAFT,
+                AnalystOpinionStatus.APPROVED,
+            }:
+                raise OpinionError(OpinionErrorCode.INVALID_STATE)
+
+            investigation = await uow.analyst_investigations.get(current.investigation_id)
+            if investigation is None:
+                raise OpinionError(OpinionErrorCode.INVESTIGATION_NOT_FOUND)
+            # Keep the selected base current until this append commits. Run
+            # creation uses the same subject lock before allocating a new run.
+            await uow.production_runs.lock_creation_for_subject(investigation.subject_id)
+            base = await uow.production_artifacts.get(base_publication_artifact_id)
+            latest = await uow.production_artifacts.get_current_for_revision(
+                investigation.production_run_id,
+                ProductionArtifactStage.PUBLICATION.value,
+            )
+            history = tuple(
+                await uow.production_artifacts.list_for_run(investigation.production_run_id)
+            )
+            latest_version = max(
+                (
+                    item.version
+                    for item in history
+                    if item.stage is ProductionArtifactStage.PUBLICATION
+                ),
+                default=0,
+            )
+            current_run = await uow.production_runs.get_current_for_subject(
+                investigation.subject_id
+            )
+            if (
+                base is None
+                or base.stage is not ProductionArtifactStage.PUBLICATION
+                or base.status is not ProductionArtifactStatus.VERIFIED
+                or base.production_run_id != investigation.production_run_id
+                or base.subject_id != investigation.subject_id
+                or base.canonical_blob_id is None
+                or latest is None
+                or latest.id != base.id
+                or latest_version != base.version
+                or current_run is None
+                or current_run.id != base.production_run_id
+            ):
+                raise OpinionError(OpinionErrorCode.REBASE_BASE_INVALID)
+
+            previous_base = await uow.production_artifacts.get(
+                current.base_publication_artifact_id
+            )
+            if previous_base is None or previous_base.canonical_blob_id is None:
+                raise OpinionError(OpinionErrorCode.STALE_BASE)
+            try:
+                previous_bytes = await self._artifact_store.read_bytes(
+                    previous_base.canonical_blob_id
+                )
+                corrected_bytes = await self._artifact_store.read_bytes(base.canonical_blob_id)
+            except ProductionReuseStorageUnavailableError:
+                raise
+            if hashlib.sha256(previous_bytes).hexdigest() != current.base_publication_sha256:
+                raise OpinionError(OpinionErrorCode.STALE_BASE)
+            if hashlib.sha256(corrected_bytes).hexdigest() != expected_base_publication_sha256:
+                raise OpinionError(OpinionErrorCode.REBASE_BASE_INVALID)
+
+            correction = base.metadata.get("manual_publication_text_correction")
+            if (
+                not isinstance(correction, Mapping)
+                or correction.get("parent_artifact_id")
+                != str(current.base_publication_artifact_id)
+                or correction.get("before_sha256") != current.base_publication_sha256
+                or correction.get("after_sha256") != expected_base_publication_sha256
+                or not isinstance(correction.get("target_anchor"), str)
+            ):
+                raise OpinionError(OpinionErrorCode.REBASE_BASE_INVALID)
+            try:
+                corrected_document = publication_document_v5_from_json(
+                    json.loads(corrected_bytes)
+                )
+                if (
+                    ProductionArtifactStore.canonical_json_bytes(
+                        serialize_publication_document(corrected_document)
+                    )
+                    != corrected_bytes
+                    or corrected_document.subject_id != investigation.subject_id
+                ):
+                    raise ValueError("Corrected publication identity is invalid")
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise OpinionError(OpinionErrorCode.REBASE_BASE_INVALID) from exc
+
+            rebased = AnalystOpinionV1(
+                id=current.id,
+                version=current.version + 1,
+                investigation_id=current.investigation_id,
+                synthesis_artifact_id=current.synthesis_artifact_id,
+                synthesis_sha256=current.synthesis_sha256,
+                base_publication_artifact_id=base.id,
+                base_publication_sha256=expected_base_publication_sha256,
+                blocks=current.blocks,
+                unresolved_points=current.unresolved_points,
+                protocol_figures=current.protocol_figures,
+                author_id=actor_id,
+                status=AnalystOpinionStatus.DRAFT,
+                reviewer_id=None,
+                bridge_drafting_gap_acknowledged=current.bridge_drafting_gap_acknowledged,
+            )
+            await self._validate_bridge_provenance(uow, rebased)
+            await self._validate_citations(uow, rebased)
+            try:
+                appended = await uow.analyst_opinions.append_rebased_version(
+                    rebased, expected_version=expected_version
+                )
+            except Exception as exc:
+                if type(exc).__name__ in {"VersionConflictError", "IntegrityError"}:
+                    raise OpinionError(OpinionErrorCode.STALE_VERSION) from exc
+                raise
+            await uow.commit()
+            target_anchor = correction["target_anchor"]
+            affected_notes = tuple(
+                note.id for note in current.observations if note.anchor == target_anchor
+            )
+            return OpinionRebaseResult(appended, target_anchor, affected_notes)
 
     async def approve(
         self,

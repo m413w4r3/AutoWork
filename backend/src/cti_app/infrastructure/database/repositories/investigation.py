@@ -34,6 +34,7 @@ from cti_app.domain.analyst_opinion import (
     OpinionBlockType,
     OpinionClaimQualification,
     OpinionProtocolFigureV1,
+    validate_analyst_opinion_rebase,
 )
 from cti_app.domain.investigation import (
     AgendaItem,
@@ -1448,6 +1449,44 @@ class SqlAlchemyAnalystOpinionRepository:
             or current.base_publication_sha256 != opinion.base_publication_sha256
         ):
             raise ValueError("Opinion versions must retain their article and synthesis identity")
+        self._session.add(
+            AnalystOpinionVersionRow(
+                opinion_id=opinion.id,
+                version=opinion.version,
+                investigation_id=opinion.investigation_id,
+                content=opinion.to_payload(),
+                content_sha256=opinion.content_sha256,
+                status=opinion.status.value,
+                created_at=opinion.created_at,
+            )
+        )
+        await self._session.flush()
+        return opinion
+
+    async def append_rebased_version(
+        self, opinion: AnalystOpinionV1, *, expected_version: int
+    ) -> AnalystOpinionV1:
+        existing = await self.get(opinion.id, version=opinion.version)
+        if existing is not None:
+            if existing == opinion:
+                return existing
+            raise ValueError("Opinion version is append-only")
+        current_row = await self._session.scalar(
+            select(AnalystOpinionVersionRow)
+            .where(AnalystOpinionVersionRow.opinion_id == opinion.id)
+            .order_by(AnalystOpinionVersionRow.version.desc())
+            .limit(1)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        current = _opinion_from_row(current_row) if current_row is not None else None
+        if (
+            current is None
+            or current.version != expected_version
+            or opinion.version != expected_version + 1
+        ):
+            raise VersionConflictError("Analyst opinion version changed")
+        validate_analyst_opinion_rebase(current, opinion)
         self._session.add(
             AnalystOpinionVersionRow(
                 opinion_id=opinion.id,

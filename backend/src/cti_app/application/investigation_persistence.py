@@ -22,7 +22,7 @@ from cti_app.application.context_pagination import (
     make_keyset_page,
     order_keyset_items,
 )
-from cti_app.domain.analyst_opinion import AnalystOpinionV1
+from cti_app.domain.analyst_opinion import AnalystOpinionV1, validate_analyst_opinion_rebase
 from cti_app.domain.investigation import (
     DetectionCandidateVersion,
     EvidenceObservation,
@@ -184,6 +184,10 @@ class AnalystOpinionRepository(Protocol):
     ) -> AnalystOpinionV1 | None: ...
 
     async def append_version(
+        self, opinion: AnalystOpinionV1, *, expected_version: int
+    ) -> AnalystOpinionV1: ...
+
+    async def append_rebased_version(
         self, opinion: AnalystOpinionV1, *, expected_version: int
     ) -> AnalystOpinionV1: ...
 
@@ -655,6 +659,28 @@ class InMemoryAnalystOpinionRepository:
                 raise ValueError(
                     "Opinion versions must retain their article and synthesis identity"
                 )
+            self._items[key] = opinion
+            return opinion
+
+    async def append_rebased_version(
+        self, opinion: AnalystOpinionV1, *, expected_version: int
+    ) -> AnalystOpinionV1:
+        async with self._lock:
+            key = (opinion.id, opinion.version)
+            existing = self._items.get(key)
+            if existing is not None:
+                if existing == opinion:
+                    return existing
+                raise ValueError("Opinion version is append-only")
+            current = await self.get(opinion.id)
+            current_version = current.version if current else 0
+            if (
+                current is None
+                or current_version != expected_version
+                or opinion.version != expected_version + 1
+            ):
+                raise VersionConflictError("Analyst opinion version changed")
+            validate_analyst_opinion_rebase(current, opinion)
             self._items[key] = opinion
             return opinion
 

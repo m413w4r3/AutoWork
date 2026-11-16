@@ -103,6 +103,13 @@ from cti_app.application.production_synthesis_revision import (
     TargetedSynthesisRevisionValidationError,
     build_targeted_revision_target_catalog,
 )
+from cti_app.application.publication_text_correction import (
+    PublicationTextCorrectionCommand,
+    PublicationTextCorrectionError,
+    PublicationTextCorrectionErrorCode,
+    PublicationTextCorrectionService,
+)
+from cti_app.application.production_artifact_store import ProductionReuseStorageUnavailableError
 from cti_app.application.subject_content import analyst_opinion_view
 from cti_app.application.subject_production import (
     EditionProductionBatchNotFoundError,
@@ -187,6 +194,19 @@ class EditorialEnrichmentRevisionRequest(BaseModel):
     element_key: str = Field(min_length=1, max_length=128)
     action: EditorialEnrichmentRevisionAction
     instruction: str = Field(min_length=1, max_length=2000)
+
+
+class PublicationTextCorrectionPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    artifact_id: UUID
+    artifact_version: int = Field(ge=1)
+    artifact_input_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    field_path: StrictStr = Field(min_length=1, max_length=512)
+    expected_text: StrictStr = Field(max_length=4_194_304)
+    replacement_text: StrictStr = Field(max_length=4_194_304)
+    reason: StrictStr = Field(min_length=1, max_length=4000)
 
 
 class EditorialEnrichmentRevisionResponse(BaseModel):
@@ -3675,6 +3695,65 @@ async def get_targeted_synthesis_revision_lineage(
 @router.get("/subjects/{subject_id}/production/artifacts/publication")
 async def get_publication_artifact(subject_id: UUID, request: Request) -> dict[str, Any]:
     return await _artifact_view(request, subject_id, ProductionArtifactStage.PUBLICATION.value)
+
+
+@router.post("/subjects/{subject_id}/production/artifacts/publication/text-correction")
+async def correct_publication_text(
+    subject_id: UUID,
+    request: Request,
+    payload: PublicationTextCorrectionPayload,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict[str, Any]:
+    if idempotency_key is None or not idempotency_key.strip() or len(idempotency_key) > 128:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"code": "production_idempotency_key_required"},
+        )
+    service = PublicationTextCorrectionService(
+        uow_factory=request.app.state.uow_factory,
+        artifact_store=request.app.state.production_artifact_store,
+    )
+    command = PublicationTextCorrectionCommand(
+        subject_id=subject_id,
+        artifact_id=payload.artifact_id,
+        artifact_version=payload.artifact_version,
+        artifact_input_hash=payload.artifact_input_hash,
+        artifact_sha256=payload.artifact_sha256,
+        field_path=payload.field_path,
+        expected_text=payload.expected_text,
+        replacement_text=payload.replacement_text,
+        actor_id=await _actor_id(request),
+        reason=payload.reason,
+        idempotency_key=idempotency_key.strip(),
+    )
+    try:
+        result = await service.correct(command)
+    except PublicationTextCorrectionError as exc:
+        status_code = {
+            PublicationTextCorrectionErrorCode.ARTIFACT_NOT_FOUND: status.HTTP_404_NOT_FOUND,
+            PublicationTextCorrectionErrorCode.INVALID_ARTIFACT: status.HTTP_409_CONFLICT,
+            PublicationTextCorrectionErrorCode.STALE_ARTIFACT: status.HTTP_409_CONFLICT,
+            PublicationTextCorrectionErrorCode.CANONICAL_SHA_MISMATCH: status.HTTP_409_CONFLICT,
+            PublicationTextCorrectionErrorCode.EXPECTED_TEXT_MISMATCH: status.HTTP_409_CONFLICT,
+            PublicationTextCorrectionErrorCode.FIELD_NOT_TEXT: (
+                status.HTTP_422_UNPROCESSABLE_CONTENT
+            ),
+            PublicationTextCorrectionErrorCode.DOCUMENT_INVALID: (
+                status.HTTP_422_UNPROCESSABLE_CONTENT
+            ),
+            PublicationTextCorrectionErrorCode.NO_CHANGE: status.HTTP_422_UNPROCESSABLE_CONTENT,
+            PublicationTextCorrectionErrorCode.IDEMPOTENCY_CONFLICT: status.HTTP_409_CONFLICT,
+        }[exc.code]
+        raise HTTPException(
+            status_code=status_code,
+            detail={"code": exc.code.value},
+        ) from exc
+    except ProductionReuseStorageUnavailableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": exc.code},
+        ) from exc
+    return result.to_payload()
 
 
 @router.get("/production/runs/{run_id}/artifacts/publication")

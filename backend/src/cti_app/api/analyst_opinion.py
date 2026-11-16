@@ -243,6 +243,15 @@ class ReviseOpinionPayload(BaseModel):
     protocol_views: tuple[ProtocolDiagramKind, ...] | None = Field(default=None, max_length=3)
 
 
+class RebaseOpinionPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: int = Field(ge=1)
+    expected_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    base_publication_artifact_id: UUID
+    expected_base_publication_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class OpinionReviewPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -353,6 +362,7 @@ def _raise_opinion_error(exc: OpinionError) -> None:
         OpinionErrorCode.STALE_VERSION: status.HTTP_409_CONFLICT,
         OpinionErrorCode.VERSION_HASH_MISMATCH: status.HTTP_409_CONFLICT,
         OpinionErrorCode.STALE_BASE: status.HTTP_409_CONFLICT,
+        OpinionErrorCode.REBASE_BASE_INVALID: status.HTTP_409_CONFLICT,
         OpinionErrorCode.BASE_INVALID: status.HTTP_409_CONFLICT,
         OpinionErrorCode.BASE_IDENTITY_MISMATCH: status.HTTP_409_CONFLICT,
         OpinionErrorCode.SYNTHESIS_IDENTITY_MISMATCH: status.HTTP_409_CONFLICT,
@@ -645,6 +655,37 @@ async def revise_opinion(
     except OpinionError as exc:
         _raise_opinion_error(exc)
     return {"draft": _opinion_payload(opinion)}
+
+
+@router.post("/opinions/{opinion_id}/rebase")
+async def rebase_opinion(
+    opinion_id: UUID,
+    request: Request,
+    payload: RebaseOpinionPayload,
+) -> dict[str, Any]:
+    try:
+        result = await _opinion_service(request).rebase(
+            opinion_id,
+            payload.expected_version,
+            payload.expected_sha256,
+            payload.base_publication_artifact_id,
+            payload.expected_base_publication_sha256,
+            await _actor_id(request),
+        )
+    except ProductionReuseStorageUnavailableError as exc:
+        _raise_opinion_storage_unavailable(exc)
+    except OpinionError as exc:
+        _raise_opinion_error(exc)
+    return {
+        "draft": _opinion_payload(result.opinion),
+        "rebase": {
+            "corrected_anchor": result.corrected_anchor,
+            "analyst_observation_ids_requiring_review": [
+                str(item) for item in result.analyst_observation_ids_requiring_review
+            ],
+            "human_review_required": True,
+        },
+    }
 
 
 @router.get("/opinions/{opinion_id}/preview.pdf")

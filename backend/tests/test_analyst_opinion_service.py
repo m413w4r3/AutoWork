@@ -89,6 +89,7 @@ from cti_app.domain.protocol_model import (
     ProtocolValidationStatus,
 )
 from cti_app.domain.publication_document import (
+    publication_document_v5_from_json,
     serialize_publication_document,
 )
 from tests.test_publication_builder_v4 import _canonical_inputs
@@ -172,6 +173,21 @@ class _OpinionRepository:
         versions.append(opinion)
         return opinion
 
+    async def append_rebased_version(self, opinion: AnalystOpinionV1, *, expected_version: int):
+        from cti_app.domain.analyst_opinion import validate_analyst_opinion_rebase
+
+        versions = self.items.setdefault(opinion.id, [])
+        current = versions[-1] if versions else None
+        if (
+            current is None
+            or current.version != expected_version
+            or opinion.version != expected_version + 1
+        ):
+            raise VersionConflictError("Analyst opinion version changed")
+        validate_analyst_opinion_rebase(current, opinion)
+        versions.append(opinion)
+        return opinion
+
 
 class _FindingRepository:
     def __init__(self, items: tuple[InvestigationFinding, ...]) -> None:
@@ -242,6 +258,18 @@ class _ArtifactRepository:
         self.appended.append(artifact)
 
 
+class _ProductionRunRepository:
+    def __init__(self, artifacts: _ArtifactRepository) -> None:
+        self.artifacts = artifacts
+
+    async def lock_creation_for_subject(self, _subject_id: UUID) -> None:
+        return None
+
+    async def get_current_for_subject(self, subject_id: UUID):
+        artifact = next(item for item in self.artifacts.items if item.subject_id == subject_id)
+        return SimpleNamespace(id=artifact.production_run_id, subject_id=subject_id)
+
+
 class _MemoryStore:
     def __init__(self, blobs: dict[UUID, bytes]) -> None:
         self.blobs = blobs
@@ -284,6 +312,7 @@ class _MemoryUow:
         self.investigation_envelopes = state.envelopes
         self.analyst_decisions = state.decisions
         self.production_artifacts = state.artifacts
+        self.production_runs = _ProductionRunRepository(state.artifacts)
         self.edition_compositions = _WriteProbe(state, "composition_writes")
         self.publication_manifests = _WriteProbe(state, "manifest_writes")
 
@@ -435,6 +464,83 @@ def make_opinion_harness(*, tlp: TLPLevel = TLPLevel.CLEAR) -> OpinionHarness:
         service=service,
     )
     return harness
+
+
+@pytest.mark.asyncio
+async def test_rebase_appends_draft_and_rehashes_without_changing_citations() -> None:
+    harness = make_opinion_harness()
+    draft = await harness.service.compose_from_findings(harness.investigation.id)
+    approved = await harness.service.approve(
+        draft.id,
+        draft.version,
+        draft.content_sha256,
+        "editor:reviewer",
+        "Reviewed before base correction.",
+    )
+    base_document = publication_document_v5_from_json(json.loads(harness.base_bytes))
+    same_text_document = replace(
+        base_document,
+        semantic_text=replace(
+            base_document.semantic_text,
+            policy_version=(
+                "semantic-annotation-policy-v5-technical-literal-globs-"
+                "exact-occurrence-coverage"
+            ),
+        ),
+    )
+    corrected_bytes = ProductionArtifactStore.canonical_json_bytes(
+        serialize_publication_document(same_text_document)
+    )
+    corrected_sha256 = hashlib.sha256(corrected_bytes).hexdigest()
+    corrected_blob_id = uuid4()
+    harness.store.blobs[corrected_blob_id] = corrected_bytes
+    corrected = ProductionArtifact(
+        id=uuid4(),
+        production_run_id=harness.base_artifact.production_run_id,
+        subject_id=harness.base_artifact.subject_id,
+        stage=ProductionArtifactStage.PUBLICATION,
+        version=2,
+        input_hash=hashlib.sha256(b"manual correction input").hexdigest(),
+        canonical_blob_id=corrected_blob_id,
+        status=ProductionArtifactStatus.VERIFIED,
+        metadata={
+            "manual_publication_text_correction": {
+                "parent_artifact_id": str(harness.base_artifact.id),
+                "before_sha256": hashlib.sha256(harness.base_bytes).hexdigest(),
+                "after_sha256": corrected_sha256,
+                "target_anchor": "section:0:paragraph:0001",
+            }
+        },
+    )
+    harness.artifacts.items.append(corrected)
+
+    result = await harness.service.rebase(
+        approved.id,
+        approved.version,
+        approved.content_sha256,
+        corrected.id,
+        corrected_sha256,
+        "editor:rebaser",
+    )
+
+    rebased = result.opinion
+    assert rebased.version == approved.version + 1
+    assert rebased.status is AnalystOpinionStatus.DRAFT
+    assert rebased.reviewer_id is None
+    assert rebased.author_id == "editor:rebaser"
+    assert rebased.base_publication_artifact_id == corrected.id
+    assert rebased.base_publication_sha256 == corrected_sha256
+    assert rebased.content_sha256 != approved.content_sha256
+    assert rebased.blocks == approved.blocks
+    assert tuple(block.finding_refs for block in rebased.blocks) == tuple(
+        block.finding_refs for block in approved.blocks
+    )
+    assert tuple(block.evidence_refs for block in rebased.blocks) == tuple(
+        block.evidence_refs for block in approved.blocks
+    )
+    assert result.corrected_anchor == "section:0:paragraph:0001"
+    assert result.analyst_observation_ids_requiring_review == ()
+    assert await harness.uow.analyst_opinions.get(approved.id, version=approved.version) == approved
 
 
 @pytest.mark.asyncio
