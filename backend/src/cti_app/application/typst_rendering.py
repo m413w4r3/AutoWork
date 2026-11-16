@@ -3796,7 +3796,6 @@ def project_publication_to_typst_model(
     if timeline_figure is not None:
         timeline_figure = {
             "figure_id": timeline_figure["figure_id"],
-            "figure_number": figure_number + 1,
             "title": "Événements datés",
             "caption": "Dates reprises des événements cités dans les sources.",
             "publication_sha256": timeline_figure["publication_sha256"],
@@ -4010,7 +4009,8 @@ def project_publication_to_typst_model(
             }
             for item in opinion_figures
         )
-        next_figure_number = figure_number + (1 if timeline_figure is not None else 0)
+        # The reader templates render this dated timeline as a rail, not a figure caption.
+        next_figure_number = figure_number
         if investigation_chain_figure is not None:
             investigation_chain_figure["figure_number"] = (
                 next_figure_number + len(visible_opinion_figures) + 1

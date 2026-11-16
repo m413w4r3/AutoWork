@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from cti_app.application import typst_rendering as typst_rendering_module
 from cti_app.application.protocol_diagram_projection import PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION
 from cti_app.application.publication_augmentation import augment_publication_with_opinion
 from cti_app.application.semantic_annotation import EnglishTermDetector, SemanticAnnotator
@@ -68,6 +69,7 @@ from cti_app.domain.production_editorial_enrichment import (
 from cti_app.domain.production_references import ProductionEditorialRole
 from cti_app.domain.production_relevance import RelevanceClassification, RelevanceReasonCode
 from cti_app.domain.production_synthesis import EvidenceKind, ExtractionEvidenceRefV1
+from cti_app.domain.protocol_model import ProtocolDiagramKind
 from cti_app.domain.publication import (
     ArtifactType,
     PublicationEvidenceKind,
@@ -1218,6 +1220,45 @@ def test_chart_projection_uses_svg_media_and_shared_figure_numbering() -> None:
     assert figure_block["figure_number"] == 3
     chart_media = next(media for media in model.media_refs if media.asset_id == asset_id)
     assert chart_media.expected_kind is MediaAssetKind.CHART_SVG
+
+
+def test_hidden_timeline_figure_does_not_consume_reader_figure_number(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publication, *_ = _frontmatter_v6_case()
+    opinion, _citation_context = _approved_opinion(publication)
+    protocol_figure = OpinionProtocolFigureV1(
+        kind=ProtocolDiagramKind.SEQUENCE,
+        model_sha256="a" * 64,
+        spec_sha256="b" * 64,
+        asset_id=UUID(int=4243),
+        asset_sha256="c" * 64,
+        preview_sha256="d" * 64,
+        pin_sha256="e" * 64,
+        compiler_name="d2",
+        compiler_version="0.6.9",
+        compiler_policy_version=PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION,
+        caption="Reader-visible protocol diagram.",
+    )
+    opinion = replace(opinion, protocol_figures=(protocol_figure,), content_sha256="")
+    monkeypatch.setattr(
+        typst_rendering_module,
+        "build_publication_timeline_figure",
+        lambda _publication: {
+            "figure_id": "hidden-timeline-figure",
+            "publication_sha256": "f" * 64,
+            "events": [],
+        },
+    )
+
+    model = project_publication_to_typst_model(
+        TypstDraftPreviewDocument(base_publication=publication, analyst_opinion=opinion)
+    )
+    opinion_section = next(
+        section for section in model.content_sections if section["type"] == "analyst_opinion"
+    )
+
+    assert opinion_section["protocol_figures"][0]["figure_number"] == 1
 
 
 def test_french_publication_dates_use_first_day_typography() -> None:

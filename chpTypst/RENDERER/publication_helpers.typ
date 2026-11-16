@@ -708,8 +708,8 @@
 #let render-opinion-ioc-reference() = {
   v(16pt)
   text(size: 9pt, fill: grey)[
-    Les indicateurs de compromission de cet avis (fichiers et réseau) sont repris dans le
-    tableau récapitulatif des IOC du bulletin.
+    Les indicateurs de compromission de cet avis (fichiers et réseau) figurent dans les
+    annexes CSV du dossier de livraison.
   ]
 }
 

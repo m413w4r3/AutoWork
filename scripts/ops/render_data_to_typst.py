@@ -174,8 +174,8 @@ MANUEL_TYP = r"""// Layout helpers called by the hand-editable markup (main.typ,
 #let ioc-renvoi() = {
   v(16pt)
   text(size: 9pt, fill: grey)[
-    Les indicateurs de compromission de cet avis (fichiers et réseau) sont repris dans le
-    tableau récapitulatif des IOC du bulletin.
+    Les indicateurs de compromission de cet avis (fichiers et réseau) figurent dans les
+    annexes CSV du dossier de livraison.
   ]
 }
 
@@ -488,6 +488,7 @@ class Builder:
         self.media_dir = media_dir
         self.out = out
         self.warnings: list[str] = []
+        self.figure_number = 0
 
     # -- media ---------------------------------------------------------------------------
     def copy_media(self, block: dict[str, Any], folder: str, prefix: str) -> tuple[str, bool]:
@@ -569,6 +570,13 @@ class Builder:
             args.append(f"max-height: {height}")
             return f"#diag({', '.join(args)})[{caption_markup}]"
         raise ValueError(f"unsupported figure type {block['type']}")
+
+    def numbered_figure_like(
+        self, block: dict[str, Any], folder: str, prefix: str, *, protocol: bool = False
+    ) -> str:
+        self.figure_number += 1
+        rendered_block = {**block, "figure_number": self.figure_number}
+        return self.figure_like(rendered_block, folder, prefix, protocol=protocol)
 
     def overview_item(self, block: dict[str, Any]) -> tuple[str, str] | None:
         text = block.get("text", "")
@@ -687,7 +695,7 @@ class Builder:
         if kind == "table":
             return self.table(block)
         if kind in {"figure", "diagram"}:
-            return self.figure_like(block, folder, prefix)
+            return self.numbered_figure_like(block, folder, prefix)
         if kind == "analyst_observation":
             return (
                 "#obs[\n"
@@ -707,6 +715,7 @@ class Builder:
         number = pub["number"]
         stem = ("breve" if brief else "article") + number
         folder = ("breves" if brief else "articles") + f"/{stem}"
+        self.figure_number = 0
         sections = {s["type"]: s for s in pub["content_sections"]}
         opinion = "analyst_opinion" in sections
         scope = f"a{number}"
@@ -863,7 +872,7 @@ class Builder:
             lines += [
                 "#pagebreak(weak: true)",
                 "#v(8pt)",
-                self.figure_like(figure, folder, stem, protocol=True),
+                self.numbered_figure_like(figure, folder, stem, protocol=True),
                 "",
             ]
 

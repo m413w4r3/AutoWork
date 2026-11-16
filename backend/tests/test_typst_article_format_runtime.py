@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import xml.etree.ElementTree as ET
@@ -181,6 +182,25 @@ def _save_example(pdf_bytes: bytes, filename: str) -> None:
         artifact.write_bytes(pdf_bytes)
 
 
+def _assert_reader_figure_references_resolve(text: str) -> None:
+    caption_matches = list(re.finditer(r"\bfigure\s+(\d+)\s*:", text, re.IGNORECASE))
+    caption_numbers = [int(match.group(1)) for match in caption_matches]
+    assert caption_numbers == list(range(1, len(caption_numbers) + 1))
+
+    text_without_captions = re.sub(
+        r"\bfigure\s+\d+\s*:", "", text, flags=re.IGNORECASE
+    )
+    referenced_numbers = {
+        int(match.group(1))
+        for match in re.finditer(r"\bfigure\s+(\d+)\b", text_without_captions, re.IGNORECASE)
+    }
+    missing_targets = referenced_numbers.difference(caption_numbers)
+    assert not missing_targets, (
+        f"figure references have no rendered caption: {sorted(missing_targets)}"
+    )
+    assert "tableau récapitulatif des ioc du bulletin" not in text.casefold()
+
+
 @pytest.mark.asyncio
 async def test_article_v33_renders_overview_timeline_references_figure_table_and_iocs(
     tmp_path: Path,
@@ -201,6 +221,7 @@ async def test_article_v33_renders_overview_timeline_references_figure_table_and
     text, reader = _extract_text(pdf_bytes, pdf_path)
     lowered_text = text.casefold()
     compact_text = "".join(text.split())
+    _assert_reader_figure_references_resolve(text)
 
     for expected in (
         "ARTICLE",

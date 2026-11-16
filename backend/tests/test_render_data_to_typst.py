@@ -234,3 +234,72 @@ def test_article_output_omits_internal_ids_and_ioc_tables(tmp_path: Path) -> Non
     assert "hidden-ioc-sentinel" not in output
     assert "#ioc-list" not in output
     assert "#ioc-renvoi()" in output
+
+
+def test_both_ioc_references_point_to_delivery_csv_annexes() -> None:
+    repository_root = _SCRIPT.resolve().parents[2]
+    publication_helpers = (
+        repository_root / "chpTypst" / "RENDERER" / "publication_helpers.typ"
+    ).read_text(encoding="utf-8")
+    official_reference = publication_helpers.split(
+        "#let render-opinion-ioc-reference() = {", 1
+    )[1].split("#let render-figure-caption(", 1)[0]
+    manual_reference = renderer.MANUEL_TYP.split("#let ioc-renvoi() = {", 1)[1].split(
+        "// ---- Figures", 1
+    )[0]
+
+    for reference in (official_reference, manual_reference):
+        assert "annexes CSV du dossier de livraison" in reference
+        assert "tableau récapitulatif des IOC du bulletin" not in reference
+
+
+def test_manual_renderer_numbers_only_figures_it_emits(tmp_path: Path) -> None:
+    media_dir = tmp_path / "source-media"
+    media_dir.mkdir()
+    for name in ("first.svg", "second.png", "protocol.svg"):
+        (media_dir / name).write_bytes(b"fixture media")
+
+    pub = article()
+    pub["content_sections"][1]["derived_timeline_figure"] = {"figure_number": 3}
+    pub["content_sections"][2]["blocks"] = [
+        {
+            "type": "figure",
+            "figure_number": 4,
+            "media_path": "media/first.svg",
+            "caption": "First visible figure",
+        },
+        {
+            "type": "figure",
+            "figure_number": 6,
+            "media_path": "media/second.png",
+            "caption": "Second visible figure",
+        },
+    ]
+    pub["content_sections"].append(
+        {
+            "type": "analyst_opinion",
+            "blocks": [],
+            "unanchored_observations": [],
+            "unresolved_points": [],
+            "protocol_figures": [
+                {
+                    "type": "diagram",
+                    "figure_number": 8,
+                    "media_path": "media/protocol.svg",
+                    "caption": "Protocol figure",
+                }
+            ],
+        }
+    )
+    builder = renderer.Builder({}, media_dir, tmp_path / "manual-output")
+
+    _relative_path, output = builder.publication(pub)
+
+    assert "article01_figure1.svg" in output
+    assert "article01_figure2.png" in output
+    assert "article01_figure3.svg" in output
+    assert "article01_figure4." not in output
+    assert "article01_figure6." not in output
+    assert "article01_figure8." not in output
+    assert output.count("#fig(") == 2
+    assert output.count("#diag(") == 1
