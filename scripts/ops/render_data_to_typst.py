@@ -702,7 +702,7 @@ class Builder:
         if not isinstance(article_format, dict):
             raise ValueError("article_format must be an object")
         article_events = article_format.get("timeline_key_events") or []
-        article_overview = article_format.get("overview")
+        article_overview = article_format.get("overview") or pub.get("article_overview")
         brief = pub["kind"] == "brief"
         number = pub["number"]
         stem = ("breve" if brief else "article") + number
@@ -748,7 +748,7 @@ class Builder:
                     stem,
                     lines,
                     structured_overview_rendered=overview_rendered,
-                    paragraph_spacing="1.4em" if brief else "1.4em",
+                    paragraph_spacing="1.4em",
                 )
             elif kind == "analyst_opinion":
                 self.opinion(section, stem, folder, lines)

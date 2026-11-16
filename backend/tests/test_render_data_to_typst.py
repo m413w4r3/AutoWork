@@ -100,6 +100,17 @@ def test_structured_article_format_renders_overview_and_key_events(tmp_path: Pat
     assert '#fn("https://example.test/event")' in output
 
 
+def test_publication_level_article_overview_is_boxed(tmp_path: Path) -> None:
+    pub = article()
+    pub["article_overview"] = {"victimology": "Victims in several sectors.", "arsenal": None}
+    builder = renderer.Builder({}, tmp_path, tmp_path)
+
+    _, output = builder.publication(pub)
+
+    assert "#overview-box[" in output
+    assert '#overview-item("Victimologie")[Victims in several sectors.]' in output
+
+
 def test_brief_body_uses_readable_paragraph_spacing(tmp_path: Path) -> None:
     pub = {
         "kind": "brief",
