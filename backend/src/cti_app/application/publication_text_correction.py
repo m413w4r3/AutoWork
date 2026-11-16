@@ -35,13 +35,15 @@ from cti_app.domain.publication_document import (
     publication_document_v5_from_json,
     serialize_publication_document,
 )
-from cti_app.domain.semantic_annotation import SemanticRole
+from cti_app.domain.semantic_annotation import SemanticRole, SemanticTextSpanV1
 
 _PATH_PATTERN = re.compile(
     r"^(?P<root>[A-Za-z_][A-Za-z0-9_]*)(?P<tail>(?:\[[0-9]+\]|\.[A-Za-z_][A-Za-z0-9_]*)*)$"
 )
 _PATH_PART_PATTERN = re.compile(r"\[([0-9]+)\]|\.([A-Za-z_][A-Za-z0-9_]*)")
 _CORRECTION_METADATA_KEY = "manual_publication_text_correction"
+MAX_PUBLICATION_TEXT_CORRECTION_TEXT_LENGTH = 4_194_304
+MAX_PUBLICATION_TEXT_CORRECTION_SPANS = 256
 
 
 class PublicationTextCorrectionErrorCode(StrEnum):
@@ -53,6 +55,7 @@ class PublicationTextCorrectionErrorCode(StrEnum):
     FIELD_NOT_TEXT = "publication_text_correction_field_not_text"
     DOCUMENT_INVALID = "publication_text_correction_document_invalid"
     SEMANTIC_SPAN_CONFLICT = "publication_text_correction_semantic_span_conflict"
+    REPLACEMENT_SPANS_INVALID = "publication_text_correction_replacement_spans_invalid"
     PUBLICATION_QA_UNAVAILABLE = "publication_text_correction_publication_qa_unavailable"
     PUBLICATION_QA_FAILED = "publication_text_correction_publication_qa_failed"
     NO_CHANGE = "publication_text_correction_no_change"
@@ -78,6 +81,7 @@ class PublicationTextCorrectionCommand:
     actor_id: str
     reason: str
     idempotency_key: str
+    replacement_spans: tuple[SemanticTextSpanV1, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,6 +285,20 @@ class PublicationTextCorrectionService:
                 raise PublicationTextCorrectionError(
                     PublicationTextCorrectionErrorCode.DOCUMENT_INVALID
                 )
+            before_spans: list[dict[str, str]] | None = None
+            after_spans: list[dict[str, str]] | None = None
+            if command.replacement_spans is not None:
+                if tokens != ("title",):
+                    raise PublicationTextCorrectionError(
+                        PublicationTextCorrectionErrorCode.REPLACEMENT_SPANS_INVALID
+                    )
+                before_spans = _existing_semantic_span_records(
+                    correction_spans, expected_text=before_text
+                )
+                after_spans = _replacement_semantic_span_records(
+                    command.replacement_spans,
+                    replacement_text=command.replacement_text,
+                )
             if isinstance(target_parent, dict) and isinstance(target_key, str):
                 target_parent[target_key] = command.replacement_text
             elif isinstance(target_parent, list) and isinstance(target_key, int):
@@ -289,11 +307,16 @@ class PublicationTextCorrectionService:
                 raise PublicationTextCorrectionError(
                     PublicationTextCorrectionErrorCode.FIELD_NOT_TEXT
                 )
-            _replace_within_one_text_span(
-                correction_spans,
-                before_text=before_text,
-                replacement_text=command.replacement_text,
-            )
+            if after_spans is None:
+                _replace_within_one_text_span(
+                    correction_spans,
+                    before_text=before_text,
+                    replacement_text=command.replacement_text,
+                )
+            else:
+                # V5 stores title text in both the root field and the rich-text
+                # title anchor. Update both representations in one operation.
+                matching[0]["spans"] = after_spans
             before_qa = await self._run_canonical_qa(uow, requested, document)
             try:
                 corrected_document = publication_document_v5_from_json(original_payload)
@@ -329,6 +352,9 @@ class PublicationTextCorrectionService:
                 "before_text_sha256": _sha256(before_text.encode("utf-8")),
                 "after_text_sha256": _sha256(command.replacement_text.encode("utf-8")),
             }
+            if before_spans is not None and after_spans is not None:
+                correction_input["semantic_spans_before"] = before_spans
+                correction_input["semantic_spans_after"] = after_spans
             input_hash = _sha256(ProductionArtifactStore.canonical_json_bytes(correction_input))
             _, canonical_blob_id, _ = await self._artifact_store.store_stage_payloads(
                 canonical=corrected_payload
@@ -477,6 +503,76 @@ class PublicationTextCorrectionService:
             command.replacement_text, str
         ):
             raise TypeError("Publication correction values must be text")
+        if command.replacement_spans is not None:
+            try:
+                is_title_path = _parse_field_path(command.field_path) == ("title",)
+            except PublicationTextCorrectionError:
+                is_title_path = False
+            if not is_title_path:
+                raise PublicationTextCorrectionError(
+                    PublicationTextCorrectionErrorCode.REPLACEMENT_SPANS_INVALID
+                )
+            _replacement_semantic_span_records(
+                command.replacement_spans,
+                replacement_text=command.replacement_text,
+            )
+
+
+def _existing_semantic_span_records(
+    spans: list[Any], *, expected_text: str
+) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    for span in spans:
+        if not isinstance(span, dict) or not isinstance(span.get("text"), str):
+            raise PublicationTextCorrectionError(
+                PublicationTextCorrectionErrorCode.DOCUMENT_INVALID
+            )
+        raw_role = span.get("role")
+        if not isinstance(raw_role, str):
+            raise PublicationTextCorrectionError(
+                PublicationTextCorrectionErrorCode.DOCUMENT_INVALID
+            )
+        try:
+            role = SemanticRole(raw_role)
+        except ValueError as exc:
+            raise PublicationTextCorrectionError(
+                PublicationTextCorrectionErrorCode.DOCUMENT_INVALID
+            ) from exc
+        records.append({"role": role.value, "text": span["text"]})
+    if "".join(item["text"] for item in records) != expected_text:
+        raise PublicationTextCorrectionError(PublicationTextCorrectionErrorCode.DOCUMENT_INVALID)
+    return records
+
+
+def _replacement_semantic_span_records(
+    spans: tuple[SemanticTextSpanV1, ...], *, replacement_text: str
+) -> list[dict[str, str]]:
+    if (
+        not isinstance(spans, tuple)
+        or not spans
+        or len(spans) > MAX_PUBLICATION_TEXT_CORRECTION_SPANS
+        or len(replacement_text) > MAX_PUBLICATION_TEXT_CORRECTION_TEXT_LENGTH
+    ):
+        raise PublicationTextCorrectionError(
+            PublicationTextCorrectionErrorCode.REPLACEMENT_SPANS_INVALID
+        )
+    records: list[dict[str, str]] = []
+    for span in spans:
+        if (
+            not isinstance(span, SemanticTextSpanV1)
+            or not isinstance(span.role, SemanticRole)
+            or not isinstance(span.text, str)
+            or not span.text
+        ):
+            raise PublicationTextCorrectionError(
+                PublicationTextCorrectionErrorCode.REPLACEMENT_SPANS_INVALID
+            )
+        records.append({"role": span.role.value, "text": span.text})
+    if "".join(item["text"] for item in records) != replacement_text:
+        raise PublicationTextCorrectionError(
+            PublicationTextCorrectionErrorCode.REPLACEMENT_SPANS_INVALID
+        )
+    return records
 
 
 def _replace_within_one_text_span(
@@ -799,7 +895,7 @@ def _correction_metadata(artifact: ProductionArtifact) -> Mapping[str, Any]:
 
 
 def _request_sha256(command: PublicationTextCorrectionCommand) -> str:
-    payload = {
+    payload: dict[str, Any] = {
         "subject_id": str(command.subject_id),
         "artifact_id": str(command.artifact_id),
         "artifact_version": command.artifact_version,
@@ -811,6 +907,10 @@ def _request_sha256(command: PublicationTextCorrectionCommand) -> str:
         "actor_id": command.actor_id,
         "reason": command.reason,
     }
+    if command.replacement_spans is not None:
+        payload["replacement_spans"] = [
+            {"role": span.role.value, "text": span.text} for span in command.replacement_spans
+        ]
     return _sha256(ProductionArtifactStore.canonical_json_bytes(payload))
 
 

@@ -8,9 +8,12 @@ from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
+from pydantic import ValidationError
 
+from cti_app.api.production import PublicationTextCorrectionPayload
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.publication_text_correction import (
+    MAX_PUBLICATION_TEXT_CORRECTION_TEXT_LENGTH,
     PublicationTextCorrectionCommand,
     PublicationTextCorrectionError,
     PublicationTextCorrectionErrorCode,
@@ -26,6 +29,7 @@ from cti_app.domain.publication_document import (
     publication_document_v5_from_json,
     serialize_publication_document,
 )
+from cti_app.domain.semantic_annotation import SemanticRole, SemanticTextSpanV1
 from tests.test_publication_document_v6 import _base_v5
 
 
@@ -212,6 +216,46 @@ def _fixture(*, augmented_current: bool = False):
     return document, canonical, artifacts, store, service, command
 
 
+def _title_fixture():
+    document, _, artifacts, store, service, command = _fixture()
+    base_payload = serialize_publication_document(document)
+    before_title = "[Example publisher] WebSockets activity for Region X"
+    title_spans = [
+        {"role": "text", "text": "[Example publisher] "},
+        {"role": "technical", "text": "WebSockets"},
+        {"role": "text", "text": " activity for "},
+        {"role": "proper_name", "text": "Region X"},
+    ]
+    base_payload["title"] = before_title
+    title_paragraph = next(
+        item for item in base_payload["rich_text"]["paragraphs"] if item["anchor"] == "title"
+    )
+    title_paragraph["spans"] = title_spans
+    title_document = publication_document_v5_from_json(base_payload)
+    canonical = ProductionArtifactStore.canonical_json_bytes(
+        serialize_publication_document(title_document)
+    )
+    base_artifact = artifacts.items[0]
+    assert base_artifact.canonical_blob_id is not None
+    store.blobs[base_artifact.canonical_blob_id] = canonical
+    replacement_spans = (
+        SemanticTextSpanV1(SemanticRole.TEXT, "[Example publisher] "),
+        SemanticTextSpanV1(SemanticRole.TECHNICAL, "WebSockets"),
+        SemanticTextSpanV1(SemanticRole.TEXT, " campaign in "),
+        SemanticTextSpanV1(SemanticRole.PROPER_NAME, "Region X"),
+    )
+    replacement_text = "".join(span.text for span in replacement_spans)
+    command = replace(
+        command,
+        artifact_sha256=hashlib.sha256(canonical).hexdigest(),
+        field_path="title",
+        expected_text=before_title,
+        replacement_text=replacement_text,
+        replacement_spans=replacement_spans,
+    )
+    return title_document, canonical, artifacts, store, service, command
+
+
 def _at_path(payload: dict[str, object], path: str) -> object:
     value: object = payload
     for part in path.replace("[", ".").replace("]", "").split("."):
@@ -290,6 +334,125 @@ async def test_exact_v5_field_replacement_preserves_every_other_canonical_field(
     )
     assert result.artifact.status is ProductionArtifactStatus.VERIFIED
     assert not hasattr(service, "model_gateway")
+
+
+@pytest.mark.asyncio
+async def test_title_replacement_accepts_explicit_spans_and_records_them_for_provenance() -> None:
+    _document, before_bytes, artifacts, store, service, command = _title_fixture()
+    before_payload = json.loads(before_bytes)
+
+    result = await service.correct(command)
+    replay = await service.correct(command)
+
+    assert result.artifact.id == replay.artifact.id
+    assert replay.replayed is True
+    assert len(artifacts.appended) == 1
+    assert artifacts.appended[0].version == 2
+    original_blob_id = artifacts.items[0].canonical_blob_id
+    assert original_blob_id is not None
+    assert store.blobs[original_blob_id] == before_bytes
+    after_bytes = store.blobs[result.artifact.canonical_blob_id]
+    after_payload = json.loads(after_bytes)
+    assert after_payload["title"] == command.replacement_text
+    title_paragraph = next(
+        item for item in after_payload["rich_text"]["paragraphs"] if item["anchor"] == "title"
+    )
+    assert title_paragraph["anchor"] == "title"
+    assert title_paragraph["spans"] == [
+        {"role": span.role.value, "text": span.text} for span in command.replacement_spans or ()
+    ]
+    assert "".join(span["text"] for span in title_paragraph["spans"]) == command.replacement_text
+    masked_before = _masked_document(before_payload, path="title", anchor="title")
+    masked_after = _masked_document(after_payload, path="title", anchor="title")
+    assert masked_before == masked_after
+    assert ProductionArtifactStore.canonical_json_bytes(masked_before) == (
+        ProductionArtifactStore.canonical_json_bytes(masked_after)
+    )
+    corrected = publication_document_v5_from_json(after_payload)
+    assert corrected.title == command.replacement_text
+    provenance = result.artifact.metadata["manual_publication_text_correction"]
+    before_title_paragraph = next(
+        item for item in before_payload["rich_text"]["paragraphs"] if item["anchor"] == "title"
+    )
+    assert provenance["semantic_spans_before"] == before_title_paragraph["spans"]
+    assert provenance["semantic_spans_after"] == title_paragraph["spans"]
+
+
+def test_title_span_api_contract_is_explicit_and_restricted_to_title() -> None:
+    common = {
+        "artifact_id": uuid4(),
+        "artifact_version": 1,
+        "artifact_input_hash": "a" * 64,
+        "artifact_sha256": "b" * 64,
+        "field_path": "title",
+        "expected_text": "old",
+        "replacement_text": "new title",
+        "reason": "Editorial correction",
+    }
+    accepted = PublicationTextCorrectionPayload(
+        **common,
+        replacement_spans=[
+            {"role": "text", "text": "new "},
+            {"role": "proper_name", "text": "title"},
+        ],
+    )
+    assert accepted.replacement_spans is not None
+    assert [span.role for span in accepted.replacement_spans] == [
+        SemanticRole.TEXT,
+        SemanticRole.PROPER_NAME,
+    ]
+
+    with pytest.raises(ValidationError):
+        PublicationTextCorrectionPayload(
+            **{**common, "field_path": "lead[0].text"},
+            replacement_spans=[{"role": "technical", "text": "new title"}],
+        )
+    with pytest.raises(ValidationError):
+        PublicationTextCorrectionPayload(
+            **common,
+            replacement_spans=[{"role": "unknown", "text": "new title"}],
+        )
+    with pytest.raises(ValidationError):
+        PublicationTextCorrectionPayload(
+            **common,
+            replacement_spans=[{"role": "text", "text": "different"}],
+        )
+
+
+@pytest.mark.asyncio
+async def test_replacement_spans_reject_non_title_empty_and_oversized_requests() -> None:
+    _, _, artifacts, _, service, command = _fixture()
+    oversized_text = "x" * (MAX_PUBLICATION_TEXT_CORRECTION_TEXT_LENGTH + 1)
+    invalid_commands = (
+        replace(
+            command,
+            replacement_spans=(SemanticTextSpanV1(SemanticRole.TEXT, command.replacement_text),),
+        ),
+        replace(
+            command,
+            field_path="title",
+            replacement_text="",
+            replacement_spans=(SemanticTextSpanV1(SemanticRole.TEXT, ""),),
+        ),
+        replace(
+            command,
+            field_path="title",
+            replacement_text="x" * 257,
+            replacement_spans=tuple(SemanticTextSpanV1(SemanticRole.TEXT, "x") for _ in range(257)),
+        ),
+        replace(
+            command,
+            field_path="title",
+            replacement_text=oversized_text,
+            replacement_spans=(SemanticTextSpanV1(SemanticRole.TEXT, oversized_text),),
+        ),
+    )
+
+    for invalid_command in invalid_commands:
+        with pytest.raises(PublicationTextCorrectionError) as invalid:
+            await service.correct(invalid_command)
+        assert invalid.value.code is PublicationTextCorrectionErrorCode.REPLACEMENT_SPANS_INVALID
+    assert artifacts.appended == []
 
 
 @pytest.mark.asyncio

@@ -9,7 +9,15 @@ from typing import Annotated, Any, Literal, NoReturn, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request, status
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+    model_validator,
+)
 
 from cti_app.application.bridge_identity import bridge_request_fingerprint
 from cti_app.application.identity import IdentityProvider
@@ -105,6 +113,8 @@ from cti_app.application.production_synthesis_revision import (
     build_targeted_revision_target_catalog,
 )
 from cti_app.application.publication_text_correction import (
+    MAX_PUBLICATION_TEXT_CORRECTION_SPANS,
+    MAX_PUBLICATION_TEXT_CORRECTION_TEXT_LENGTH,
     PublicationTextCorrectionCommand,
     PublicationTextCorrectionError,
     PublicationTextCorrectionErrorCode,
@@ -173,6 +183,7 @@ from cti_app.domain.publication_document import (
 )
 from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.selection import SubjectDiscoveryOrigin
+from cti_app.domain.semantic_annotation import SemanticRole, SemanticTextSpanV1
 from cti_app.infrastructure.analytic_chart_renderer import AnalyticChartRenderer
 from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
 from cti_app.logging import get_correlation_id
@@ -196,6 +207,16 @@ class EditorialEnrichmentRevisionRequest(BaseModel):
     instruction: str = Field(min_length=1, max_length=2000)
 
 
+class PublicationTextCorrectionSpanPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: SemanticRole
+    text: StrictStr = Field(
+        min_length=1,
+        max_length=MAX_PUBLICATION_TEXT_CORRECTION_TEXT_LENGTH,
+    )
+
+
 class PublicationTextCorrectionPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -204,9 +225,24 @@ class PublicationTextCorrectionPayload(BaseModel):
     artifact_input_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     field_path: StrictStr = Field(min_length=1, max_length=512)
-    expected_text: StrictStr = Field(max_length=4_194_304)
-    replacement_text: StrictStr = Field(max_length=4_194_304)
+    expected_text: StrictStr = Field(max_length=MAX_PUBLICATION_TEXT_CORRECTION_TEXT_LENGTH)
+    replacement_text: StrictStr = Field(max_length=MAX_PUBLICATION_TEXT_CORRECTION_TEXT_LENGTH)
+    replacement_spans: list[PublicationTextCorrectionSpanPayload] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=MAX_PUBLICATION_TEXT_CORRECTION_SPANS,
+    )
     reason: StrictStr = Field(min_length=1, max_length=4000)
+
+    @model_validator(mode="after")
+    def _validate_replacement_spans(self) -> PublicationTextCorrectionPayload:
+        if self.replacement_spans is None:
+            return self
+        if self.field_path != "title":
+            raise ValueError("replacement_spans is only supported for field_path='title'")
+        if "".join(span.text for span in self.replacement_spans) != self.replacement_text:
+            raise ValueError("replacement_spans must concatenate to replacement_text")
+        return self
 
 
 class EditorialEnrichmentRevisionResponse(BaseModel):
@@ -3770,6 +3806,11 @@ async def correct_publication_text(
         field_path=payload.field_path,
         expected_text=payload.expected_text,
         replacement_text=payload.replacement_text,
+        replacement_spans=(
+            tuple(SemanticTextSpanV1(span.role, span.text) for span in payload.replacement_spans)
+            if payload.replacement_spans is not None
+            else None
+        ),
         actor_id=await _actor_id(request),
         reason=payload.reason,
         idempotency_key=idempotency_key.strip(),
@@ -3787,6 +3828,9 @@ async def correct_publication_text(
                 status.HTTP_422_UNPROCESSABLE_CONTENT
             ),
             PublicationTextCorrectionErrorCode.SEMANTIC_SPAN_CONFLICT: (
+                status.HTTP_422_UNPROCESSABLE_CONTENT
+            ),
+            PublicationTextCorrectionErrorCode.REPLACEMENT_SPANS_INVALID: (
                 status.HTTP_422_UNPROCESSABLE_CONTENT
             ),
             PublicationTextCorrectionErrorCode.DOCUMENT_INVALID: (

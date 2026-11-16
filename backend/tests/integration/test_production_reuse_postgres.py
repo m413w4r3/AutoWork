@@ -160,6 +160,7 @@ from cti_app.domain.selection import (
     SelectionDecision,
     SubjectDiscoveryOrigin,
 )
+from cti_app.domain.semantic_annotation import SemanticAnnotationProposalV1
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from cti_app.integrations.models import BlobModelOutputStore
 from tests.discovery_support import make_discovery_run_for_edition
@@ -945,11 +946,14 @@ async def _store_empty_enrichment(
     extraction: ProductionExtractionV1,
     synthesis: ProductionSynthesisV1,
     projection: RelevanceProjectionV1,
+    annotations: tuple[SemanticAnnotationProposalV1, ...] = (),
 ) -> ProductionArtifact:
     enrichment = build_empty_editorial_enrichment(
         extraction=extraction,
         synthesis=synthesis,
     )
+    if annotations:
+        enrichment = replace(enrichment, annotations=annotations)
     validate_editorial_enrichment(enrichment, extraction=extraction, synthesis=synthesis)
     async with uow_factory() as uow:
         access_policy = await build_synthesis_access_policy(

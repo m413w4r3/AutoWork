@@ -37,6 +37,11 @@ from cti_app.domain.production import (
 from cti_app.domain.production_editorial_enrichment import editorial_enrichment_from_json
 from cti_app.domain.production_synthesis import production_synthesis_to_json
 from cti_app.domain.publication_document import serialize_publication_document
+from cti_app.domain.semantic_annotation import (
+    SemanticAnnotationProposalV1,
+    SemanticRole,
+    SemanticTextSpanV1,
+)
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from tests.integration.edition_codes import reserve_edition_code
 from tests.integration.test_production_reuse_postgres import (
@@ -66,7 +71,7 @@ async def test_postgres_correction_and_rebase_are_append_only(uow_factory, tmp_p
     await _persist_edition(uow_factory, edition)
     subject = Subject(
         edition_id=edition.id,
-        title="Publication text correction fixture",
+        title="WebSockets Region X",
         slug=f"publication-correction-{suffix}",
         tlp=TLP.AMBER,
     )
@@ -104,7 +109,10 @@ async def test_postgres_correction_and_rebase_are_append_only(uow_factory, tmp_p
         snapshot = await uow.production_input_snapshots.get_by_run(run.id)
     assert snapshot is not None
 
-    event_text = f"{subject.slug}.security-lab.io was reported."
+    event_text = (
+        f"{subject.slug}.security-lab.io was reported with WebSockets activity "
+        "attributed to Region X."
+    )
     first_pass = await _store_canonical_first_pass(
         uow_factory,
         artifact_store,
@@ -172,6 +180,18 @@ async def test_postgres_correction_and_rebase_are_append_only(uow_factory, tmp_p
         extraction=first_pass.extraction,
         synthesis=synthesis_value,
         projection=first_pass.projection,
+        annotations=(
+            SemanticAnnotationProposalV1(
+                paragraph_anchor="lead:0001",
+                role=SemanticRole.TECHNICAL,
+                text="WebSockets",
+            ),
+            SemanticAnnotationProposalV1(
+                paragraph_anchor="lead:0001",
+                role=SemanticRole.PROPER_NAME,
+                text="Region X",
+            ),
+        ),
     )
     source_artifacts[ProductionArtifactStage.EDITORIAL_ENRICHMENT] = enrichment_artifact
     enrichment = editorial_enrichment_from_json(
@@ -242,7 +262,21 @@ async def test_postgres_correction_and_rebase_are_append_only(uow_factory, tmp_p
         await uow.analyst_opinions.append_version(opinion, expected_version=0)
         await uow.commit()
 
-    first_text = document.lead[0].text
+    before_title = document.title
+    before_title_spans = next(
+        item["spans"]
+        for item in publication_payload["rich_text"]["paragraphs"]
+        if item["anchor"] == "title"
+    )
+    assert any(span["role"] == "technical" for span in before_title_spans)
+    assert any(span["role"] == "proper_name" for span in before_title_spans)
+    replacement_spans = (
+        SemanticTextSpanV1(SemanticRole.TEXT, "[Example publisher] "),
+        SemanticTextSpanV1(SemanticRole.TECHNICAL, "WebSockets"),
+        SemanticTextSpanV1(SemanticRole.TEXT, " campaign in "),
+        SemanticTextSpanV1(SemanticRole.PROPER_NAME, "Region X"),
+    )
+    replacement_title = "".join(span.text for span in replacement_spans)
     result = await PublicationTextCorrectionService(
         uow_factory=uow_factory,
         artifact_store=artifact_store,
@@ -253,12 +287,13 @@ async def test_postgres_correction_and_rebase_are_append_only(uow_factory, tmp_p
             artifact_version=base.version,
             artifact_input_hash=base.input_hash,
             artifact_sha256=hashlib.sha256(canonical_bytes).hexdigest(),
-            field_path="lead[0].text",
-            expected_text=first_text,
-            replacement_text=f"{first_text} Correction de test.",
+            field_path="title",
+            expected_text=before_title,
+            replacement_text=replacement_title,
             actor_id="human:integration-editor",
             reason="Correction exacte pour le test d'intégration.",
             idempotency_key=f"publication-correction-{uuid4().hex}",
+            replacement_spans=replacement_spans,
         )
     )
     rebased = await AnalystOpinionService(
@@ -280,25 +315,22 @@ async def test_postgres_correction_and_rebase_are_append_only(uow_factory, tmp_p
     assert rebased.opinion.base_publication_artifact_id == result.artifact.id
     assert result.artifact.canonical_blob_id is not None
     corrected_payload = await artifact_store.read_json(result.artifact.canonical_blob_id)
-    before_lead = next(
-        item
-        for item in publication_payload["rich_text"]["paragraphs"]
-        if item["anchor"] == "lead:0001"
+    before_title_paragraph = next(
+        item for item in publication_payload["rich_text"]["paragraphs"] if item["anchor"] == "title"
     )
-    after_lead = next(
-        item
-        for item in corrected_payload["rich_text"]["paragraphs"]
-        if item["anchor"] == "lead:0001"
+    after_title_paragraph = next(
+        item for item in corrected_payload["rich_text"]["paragraphs"] if item["anchor"] == "title"
     )
-    before_semantic_spans = [span for span in before_lead["spans"] if span["role"] != "text"]
-    after_semantic_spans = [span for span in after_lead["spans"] if span["role"] != "text"]
-    assert before_semantic_spans
-    assert any(span["role"] == "ioc" for span in before_semantic_spans)
-    assert after_semantic_spans == before_semantic_spans
-    before_text_spans = [span for span in before_lead["spans"] if span["role"] == "text"]
-    after_text_spans = [span for span in after_lead["spans"] if span["role"] == "text"]
-    assert len(before_text_spans) == len(after_text_spans) == 1
-    assert after_text_spans[0]["text"] == f"{before_text_spans[0]['text']} Correction de test."
+    assert corrected_payload["title"] == replacement_title
+    assert corrected_payload["lead"] == publication_payload["lead"]
+    assert after_title_paragraph["anchor"] == before_title_paragraph["anchor"] == "title"
+    assert after_title_paragraph["spans"] == [
+        {"role": span.role.value, "text": span.text} for span in replacement_spans
+    ]
+    assert "".join(span["text"] for span in after_title_paragraph["spans"]) == replacement_title
+    provenance = result.artifact.metadata["manual_publication_text_correction"]
+    assert provenance["semantic_spans_before"] == before_title_spans
+    assert provenance["semantic_spans_after"] == after_title_paragraph["spans"]
     async with uow_factory() as uow:
         old_artifact = await uow.production_artifacts.get(base.id)
         new_opinion = await uow.analyst_opinions.get(opinion.id)
