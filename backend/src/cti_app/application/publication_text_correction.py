@@ -31,6 +31,8 @@ from cti_app.domain.production_relevance import relevance_projection_from_json
 from cti_app.domain.production_synthesis import production_synthesis_from_json
 from cti_app.domain.publication_document import (
     PublicationDocumentV5,
+    publication_document_article_v5_body,
+    publication_document_from_json,
     publication_document_text_anchors,
     publication_document_v5_from_json,
     serialize_publication_document,
@@ -236,15 +238,18 @@ class PublicationTextCorrectionService:
                 except ProductionReuseStorageUnavailableError:
                     raise
                 head_sha256 = _sha256(head_bytes)
-                if _embedded_v5_bytes(head_bytes) != before_bytes:
+                if _embedded_v5_bytes(head_bytes) != _embedded_v5_bytes(before_bytes):
                     raise PublicationTextCorrectionError(
                         PublicationTextCorrectionErrorCode.STALE_ARTIFACT
                     )
-            original_payload, document = _load_canonical_v5(
+            original_v5_payload, document = _load_canonical_v5(
                 before_bytes, subject_id=command.subject_id
             )
+            before_v5_sha256 = _sha256(
+                ProductionArtifactStore.canonical_json_bytes(original_v5_payload)
+            )
             tokens = _parse_field_path(command.field_path)
-            target_parent, target_key = _resolve_parent(original_payload, tokens)
+            target_parent, target_key = _resolve_parent(original_v5_payload, tokens)
             if isinstance(target_parent, dict) and isinstance(target_key, str):
                 before_text = target_parent.get(target_key)
             elif isinstance(target_parent, list) and isinstance(target_key, int):
@@ -269,7 +274,7 @@ class PublicationTextCorrectionService:
                 raise PublicationTextCorrectionError(
                     PublicationTextCorrectionErrorCode.FIELD_NOT_TEXT
                 )
-            rich_paragraphs = original_payload.get("rich_text", {}).get("paragraphs")
+            rich_paragraphs = original_v5_payload.get("rich_text", {}).get("paragraphs")
             matching = [
                 item
                 for item in rich_paragraphs or ()
@@ -319,16 +324,14 @@ class PublicationTextCorrectionService:
                 matching[0]["spans"] = after_spans
             before_qa = await self._run_canonical_qa(uow, requested, document)
             try:
-                corrected_document = publication_document_v5_from_json(original_payload)
+                corrected_document = publication_document_v5_from_json(original_v5_payload)
                 corrected_payload = serialize_publication_document(corrected_document)
+                if corrected_payload != original_v5_payload:
+                    raise ValueError("Corrected V5 payload is not canonical")
             except (TypeError, ValueError, KeyError) as exc:
                 raise PublicationTextCorrectionError(
                     PublicationTextCorrectionErrorCode.DOCUMENT_INVALID
                 ) from exc
-            if corrected_payload != original_payload:
-                raise PublicationTextCorrectionError(
-                    PublicationTextCorrectionErrorCode.DOCUMENT_INVALID
-                )
             after_qa = await self._run_canonical_qa(uow, requested, corrected_document)
             qa_validation = _validate_qa_transition(
                 before_qa, after_qa, field_path=command.field_path
@@ -345,6 +348,7 @@ class PublicationTextCorrectionService:
                 "parent_version": requested.version,
                 "parent_input_hash": requested.input_hash,
                 "before_sha256": before_sha256,
+                "before_v5_sha256": before_v5_sha256,
                 "superseded_head_artifact_id": str(current.id) if current else None,
                 "superseded_head_version": current.version if current else None,
                 "superseded_head_sha256": head_sha256,
@@ -381,6 +385,7 @@ class PublicationTextCorrectionService:
                 canonical_blob_id=canonical_blob_id,
                 metadata={
                     **requested.metadata,
+                    "previous_publication_artifact_id": str(requested.id),
                     _CORRECTION_METADATA_KEY: correction_metadata,
                 },
             )
@@ -706,29 +711,45 @@ def _validate_qa_transition(
     }
 
 
-def _embedded_v5_bytes(content: bytes) -> bytes | None:
-    try:
-        payload = json.loads(content)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return None
-    if (
-        not isinstance(payload, dict)
-        or ProductionArtifactStore.canonical_json_bytes(payload) != content
-    ):
-        return None
-    wrapped = False
+def _embedded_v5_payload(payload: Any) -> dict[str, Any] | None:
     while isinstance(payload, dict):
         schema_version = payload.get("schema_version")
         if schema_version == "5":
-            return ProductionArtifactStore.canonical_json_bytes(payload) if wrapped else None
+            return payload
         if schema_version not in {"6", "7", "8"}:
             return None
         base = payload.get("base_publication")
         if not isinstance(base, dict):
             return None
-        wrapped = True
         payload = base
     return None
+
+
+def _embedded_v5_bytes(content: bytes) -> bytes | None:
+    try:
+        payload = json.loads(content)
+        if not isinstance(payload, dict):
+            return None
+        envelope = publication_document_from_json(payload)
+        v5_payload = _embedded_v5_payload(payload)
+        if v5_payload is None or serialize_publication_document(envelope) != payload:
+            return None
+        if payload.get("schema_version") in {"7", "8"} and (
+            publication_document_article_v5_body(envelope) is None
+        ):
+            return None
+        v5_document = publication_document_v5_from_json(v5_payload)
+        if (
+            serialize_publication_document(v5_document) != v5_payload
+            or ProductionArtifactStore.canonical_json_bytes(
+                serialize_publication_document(envelope)
+            )
+            != content
+        ):
+            return None
+        return ProductionArtifactStore.canonical_json_bytes(v5_payload)
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError, KeyError):
+        return None
 
 
 def _load_canonical_v5(
@@ -736,22 +757,33 @@ def _load_canonical_v5(
 ) -> tuple[dict[str, Any], PublicationDocumentV5]:
     try:
         payload = json.loads(content)
-        if not isinstance(payload, dict) or payload.get("schema_version") != "5":
-            raise ValueError("Publication correction requires a V5 document")
-        document = publication_document_v5_from_json(payload)
+        if not isinstance(payload, dict):
+            raise ValueError("Publication document must be an object")
+        envelope = publication_document_from_json(payload)
+        v5_payload = _embedded_v5_payload(payload)
+        if v5_payload is None:
+            raise ValueError("Publication correction requires a V5 body")
+        if payload.get("schema_version") in {"7", "8"} and (
+            publication_document_article_v5_body(envelope) is None
+        ):
+            raise ValueError("Publication correction requires an article V5 body")
+        document = publication_document_v5_from_json(v5_payload)
         if document.subject_id != subject_id:
             raise ValueError("Publication document subject identity mismatch")
-        canonical = ProductionArtifactStore.canonical_json_bytes(
-            serialize_publication_document(document)
-        )
-        if canonical != content:
+        canonical_payload = serialize_publication_document(envelope)
+        if (
+            canonical_payload != payload
+            or ProductionArtifactStore.canonical_json_bytes(canonical_payload) != content
+        ):
             raise ValueError("Publication document bytes are not canonical")
+        if serialize_publication_document(document) != v5_payload:
+            raise ValueError("Publication envelope V5 body is not canonical")
         anchors = publication_document_text_anchors(
             document.document, references=document.references
         )
         if {item.anchor: item.text for item in document.semantic_text.paragraphs} != anchors:
             raise ValueError("Publication semantic text is invalid")
-        return payload, document
+        return v5_payload, document
     except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
         raise PublicationTextCorrectionError(
             PublicationTextCorrectionErrorCode.DOCUMENT_INVALID

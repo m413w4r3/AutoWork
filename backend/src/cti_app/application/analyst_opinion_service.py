@@ -79,7 +79,6 @@ from cti_app.domain.publication_document import (
     publication_document_article_v5_body,
     publication_document_from_json,
     publication_document_text_anchors,
-    publication_document_v5_from_json,
     serialize_publication_document,
 )
 
@@ -619,12 +618,17 @@ class AnalystOpinionService:
             ):
                 raise OpinionError(OpinionErrorCode.REBASE_BASE_INVALID)
             try:
-                corrected_document = publication_document_v5_from_json(json.loads(corrected_bytes))
+                corrected_payload = json.loads(corrected_bytes)
+                if not isinstance(corrected_payload, dict):
+                    raise ValueError("Corrected publication must be an object")
+                corrected_envelope = publication_document_from_json(corrected_payload)
+                corrected_document = publication_document_article_v5_body(corrected_envelope)
                 if (
                     ProductionArtifactStore.canonical_json_bytes(
-                        serialize_publication_document(corrected_document)
+                        serialize_publication_document(corrected_envelope)
                     )
                     != corrected_bytes
+                    or corrected_document is None
                     or corrected_document.subject_id != investigation.subject_id
                 ):
                     raise ValueError("Corrected publication identity is invalid")

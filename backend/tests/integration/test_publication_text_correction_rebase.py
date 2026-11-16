@@ -1,16 +1,29 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from datetime import date
 from uuid import uuid4
 
 import pytest
 
 from cti_app.application.analyst_opinion_service import AnalystOpinionService
+from cti_app.application.analyst_publication_service import AnalystPublicationService
 from cti_app.application.blobs import BlobCatalogService
+from cti_app.application.investigation_governance import (
+    InvestigationEnvelopeProposal,
+    InvestigationEnvelopeService,
+)
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_references import production_reference_corpus_from_json
-from cti_app.application.publication_builder import build_publication_document_v5
+from cti_app.application.publication_augmentation import (
+    OpinionCitationContext,
+    augment_publication_with_opinion,
+)
+from cti_app.application.publication_builder import (
+    build_article_format_v1,
+    build_publication_document_v5,
+)
 from cti_app.application.publication_text_correction import (
     PublicationTextCorrectionCommand,
     PublicationTextCorrectionService,
@@ -26,6 +39,7 @@ from cti_app.domain.analyst_opinion import (
 from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition
 from cti_app.domain.entities import Subject
+from cti_app.domain.investigation import DisclosureBounds, InvestigationBudget, TLPLevel
 from cti_app.domain.production import (
     AnalystInvestigation,
     LoopBudget,
@@ -36,7 +50,14 @@ from cti_app.domain.production import (
 )
 from cti_app.domain.production_editorial_enrichment import editorial_enrichment_from_json
 from cti_app.domain.production_synthesis import production_synthesis_to_json
-from cti_app.domain.publication_document import serialize_publication_document
+from cti_app.domain.publication_document import (
+    PublicationDocumentV6,
+    PublicationDocumentV7,
+    PublicationDocumentV8,
+    PublicationKind,
+    publication_document_from_json,
+    serialize_publication_document,
+)
 from cti_app.domain.semantic_annotation import (
     SemanticAnnotationProposalV1,
     SemanticRole,
@@ -58,7 +79,10 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.mark.asyncio
-async def test_postgres_correction_and_rebase_are_append_only(uow_factory, tmp_path) -> None:
+@pytest.mark.parametrize("request_head", [False, True])
+async def test_postgres_correction_and_rebase_are_append_only(
+    uow_factory, tmp_path, request_head: bool
+) -> None:
     suffix = uuid4().hex
     edition = Edition(
         country=f"Publication correction {suffix}",
@@ -224,7 +248,7 @@ async def test_postgres_correction_and_rebase_are_append_only(uow_factory, tmp_p
         production_run_id=run.id,
         subject_id=subject.id,
         stage=ProductionArtifactStage.PUBLICATION,
-        version=1,
+        version=7,
         input_hash=hashlib.sha256(canonical_bytes).hexdigest(),
         status=ProductionArtifactStatus.VERIFIED,
         canonical_blob_id=canonical_blob_id,
@@ -234,33 +258,131 @@ async def test_postgres_correction_and_rebase_are_append_only(uow_factory, tmp_p
         synthesis=synthesis,
         budget=LoopBudget(),
     )
+    synthesis_sha256 = hashlib.sha256(
+        ProductionArtifactStore.canonical_json_bytes(production_synthesis_to_json(synthesis_value))
+    ).hexdigest()
+    opinion_block = OpinionBlock(
+        block_type=OpinionBlockType.KEY_FINDINGS,
+        text="Un point à relire après la correction de la publication.",
+        qualification=OpinionClaimQualification.INFERENCE,
+        certainty=0.6,
+    )
+    base_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
+    embedded_opinion = AnalystOpinionV1(
+        id=uuid4(),
+        investigation_id=investigation.id,
+        synthesis_artifact_id=synthesis.id,
+        synthesis_sha256=synthesis_sha256,
+        base_publication_artifact_id=base.id,
+        base_publication_sha256=base_sha256,
+        blocks=(opinion_block,),
+        author_id="analyst:previous-publication",
+        reviewer_id="editor:previous-publication",
+        status=AnalystOpinionStatus.APPROVED,
+    )
+    previous_v6 = augment_publication_with_opinion(
+        document,
+        embedded_opinion,
+        OpinionCitationContext(
+            base_publication_artifact_id=base.id,
+            base_publication_sha256=base_sha256,
+            investigation_id=investigation.id,
+            approver_id="human:previous-publication",
+            findings=(),
+            observations=(),
+            tlp_violation=False,
+            do_not_submit=False,
+        ),
+    )
+    assert isinstance(previous_v6, PublicationDocumentV6)
+    article_format = build_article_format_v1(document, first_pass.extraction)
+    requested_document = PublicationDocumentV8(
+        base_publication=PublicationDocumentV7(
+            base_publication=previous_v6,
+            publication_kind=PublicationKind.ARTICLE,
+            routing_decision_hash="a" * 64,
+            routing_policy_version="routing-policy-v1",
+        ),
+        article_format=article_format,
+    )
+    requested_payload = serialize_publication_document(requested_document)
+    requested_bytes = ProductionArtifactStore.canonical_json_bytes(requested_payload)
+    _, requested_blob_id, _ = await artifact_store.store_stage_payloads(canonical=requested_payload)
+    assert requested_blob_id is not None
+    requested = ProductionArtifact(
+        production_run_id=run.id,
+        subject_id=subject.id,
+        stage=ProductionArtifactStage.PUBLICATION,
+        version=8,
+        input_hash=hashlib.sha256(requested_bytes).hexdigest(),
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=requested_blob_id,
+        metadata={
+            **base.metadata,
+            "previous_publication_artifact_id": str(base.id),
+        },
+    )
+    head_document = PublicationDocumentV8(
+        base_publication=replace(
+            requested_document.base_publication,
+            routing_decision_hash="b" * 64,
+        ),
+        article_format=requested_document.article_format,
+    )
+    head_payload = serialize_publication_document(head_document)
+    head_bytes = ProductionArtifactStore.canonical_json_bytes(head_payload)
+    _, head_blob_id, _ = await artifact_store.store_stage_payloads(canonical=head_payload)
+    assert head_blob_id is not None
+    head = ProductionArtifact(
+        production_run_id=run.id,
+        subject_id=subject.id,
+        stage=ProductionArtifactStage.PUBLICATION,
+        version=9,
+        input_hash=hashlib.sha256(head_bytes).hexdigest(),
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=head_blob_id,
+        metadata={
+            **base.metadata,
+            "previous_publication_artifact_id": str(requested.id),
+        },
+    )
+    correction_base = head if request_head else requested
+    correction_base_bytes = head_bytes if request_head else requested_bytes
     opinion = AnalystOpinionV1(
         investigation_id=investigation.id,
         synthesis_artifact_id=synthesis.id,
-        synthesis_sha256=hashlib.sha256(
-            ProductionArtifactStore.canonical_json_bytes(
-                production_synthesis_to_json(synthesis_value)
-            )
-        ).hexdigest(),
-        base_publication_artifact_id=base.id,
-        base_publication_sha256=hashlib.sha256(canonical_bytes).hexdigest(),
-        blocks=(
-            OpinionBlock(
-                block_type=OpinionBlockType.KEY_FINDINGS,
-                text="Un point à relire après la correction de la publication.",
-                qualification=OpinionClaimQualification.INFERENCE,
-                certainty=0.6,
-            ),
-        ),
+        synthesis_sha256=synthesis_sha256,
+        base_publication_artifact_id=correction_base.id,
+        base_publication_sha256=hashlib.sha256(correction_base_bytes).hexdigest(),
+        blocks=(opinion_block,),
         author_id="analyst:integration",
         reviewer_id="editor:integration",
         status=AnalystOpinionStatus.APPROVED,
     )
     async with uow_factory() as uow:
         await uow.production_artifacts.append(base)
+        await uow.production_artifacts.append(requested)
+        await uow.production_artifacts.append(head)
         await uow.analyst_investigations.add(investigation)
         await uow.analyst_opinions.append_version(opinion, expected_version=0)
         await uow.commit()
+
+    await InvestigationEnvelopeService(uow_factory).approve(
+        InvestigationEnvelopeProposal(
+            investigation_id=investigation.id,
+            allowed_providers=(),
+            budget=InvestigationBudget(),
+            acquire_hits_allowed=False,
+            disclosure=DisclosureBounds(
+                tlp=TLPLevel.AMBER,
+                do_not_submit=False,
+                external_llm_allowed=False,
+            ),
+        ),
+        actor_id="human:integration-g2-reviewer",
+        reason="Local integration fixture for the approved opinion workflow.",
+        correlation_id=f"publication-correction-envelope-{suffix}",
+    )
 
     before_title = document.title
     before_title_spans = next(
@@ -283,10 +405,10 @@ async def test_postgres_correction_and_rebase_are_append_only(uow_factory, tmp_p
     ).correct(
         PublicationTextCorrectionCommand(
             subject_id=subject.id,
-            artifact_id=base.id,
-            artifact_version=base.version,
-            artifact_input_hash=base.input_hash,
-            artifact_sha256=hashlib.sha256(canonical_bytes).hexdigest(),
+            artifact_id=correction_base.id,
+            artifact_version=correction_base.version,
+            artifact_input_hash=correction_base.input_hash,
+            artifact_sha256=hashlib.sha256(correction_base_bytes).hexdigest(),
             field_path="title",
             expected_text=before_title,
             replacement_text=replacement_title,
@@ -296,10 +418,11 @@ async def test_postgres_correction_and_rebase_are_append_only(uow_factory, tmp_p
             replacement_spans=replacement_spans,
         )
     )
-    rebased = await AnalystOpinionService(
+    opinion_service = AnalystOpinionService(
         uow_factory=uow_factory,
         artifact_store=artifact_store,
-    ).rebase(
+    )
+    rebased = await opinion_service.rebase(
         opinion.id,
         opinion.version,
         opinion.content_sha256,
@@ -307,14 +430,79 @@ async def test_postgres_correction_and_rebase_are_append_only(uow_factory, tmp_p
         result.canonical_sha256,
         "human:integration-reviewer",
     )
+    approved = await opinion_service.approve(
+        rebased.opinion.id,
+        rebased.opinion.version,
+        rebased.opinion.content_sha256,
+        "human:integration-approver",
+        "Review completed after the publication correction.",
+        correlation_id=f"publication-correction-approval-{suffix}",
+        bridge_drafting_gap_acknowledged=True,
+    )
+    published = await AnalystPublicationService(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+    ).publish_augmented_article(
+        approved.id,
+        approved.version,
+        "human:integration-publisher",
+        result.canonical_sha256,
+    )
 
-    assert result.artifact.version == 2
+    assert result.artifact.version == 10
+    assert result.artifact.metadata["previous_publication_artifact_id"] == str(correction_base.id)
+    assert result.artifact.metadata["manual_publication_text_correction"][
+        "parent_artifact_id"
+    ] == str(correction_base.id)
+    assert (
+        result.artifact.metadata["manual_publication_text_correction"]["before_sha256"]
+        == hashlib.sha256(correction_base_bytes).hexdigest()
+    )
+    assert (
+        result.artifact.metadata["manual_publication_text_correction"]["before_v5_sha256"]
+        == hashlib.sha256(canonical_bytes).hexdigest()
+    )
+    assert (
+        result.artifact.metadata["manual_publication_text_correction"]["after_sha256"]
+        == result.canonical_sha256
+    )
+    assert result.artifact.metadata["manual_publication_text_correction"][
+        "superseded_head_artifact_id"
+    ] == str(head.id)
     assert rebased.opinion.version == opinion.version + 1
     assert rebased.opinion.status is AnalystOpinionStatus.DRAFT
     assert rebased.opinion.blocks == opinion.blocks
     assert rebased.opinion.base_publication_artifact_id == result.artifact.id
+    assert approved.version == rebased.opinion.version + 1
+    assert approved.status is AnalystOpinionStatus.APPROVED
+    assert approved.bridge_drafting_gap_acknowledged is True
+    assert published.version == result.artifact.version + 1
+    assert published.metadata["previous_publication_artifact_id"] == str(result.artifact.id)
+
     assert result.artifact.canonical_blob_id is not None
     corrected_payload = await artifact_store.read_json(result.artifact.canonical_blob_id)
+    assert corrected_payload["schema_version"] == "5"
+    expected_corrected_payload = {
+        **publication_payload,
+        "title": replacement_title,
+    }
+    expected_rich_text = dict(publication_payload["rich_text"])
+    expected_paragraphs = [
+        (
+            {
+                **item,
+                "spans": [
+                    {"role": span.role.value, "text": span.text} for span in replacement_spans
+                ],
+            }
+            if item["anchor"] == "title"
+            else item
+        )
+        for item in publication_payload["rich_text"]["paragraphs"]
+    ]
+    expected_rich_text["paragraphs"] = expected_paragraphs
+    expected_corrected_payload["rich_text"] = expected_rich_text
+    assert corrected_payload == expected_corrected_payload
     before_title_paragraph = next(
         item for item in publication_payload["rich_text"]["paragraphs"] if item["anchor"] == "title"
     )
@@ -331,10 +519,28 @@ async def test_postgres_correction_and_rebase_are_append_only(uow_factory, tmp_p
     provenance = result.artifact.metadata["manual_publication_text_correction"]
     assert provenance["semantic_spans_before"] == before_title_spans
     assert provenance["semantic_spans_after"] == after_title_paragraph["spans"]
+
+    assert published.canonical_blob_id is not None
+    published_payload = await artifact_store.read_json(published.canonical_blob_id)
+    published_document = publication_document_from_json(published_payload)
+    assert published_document.schema_version == "6"
+    assert published_payload["base_publication"] == corrected_payload
+
     async with uow_factory() as uow:
         old_artifact = await uow.production_artifacts.get(base.id)
+        old_requested = await uow.production_artifacts.get(requested.id)
+        old_head = await uow.production_artifacts.get(head.id)
         new_opinion = await uow.analyst_opinions.get(opinion.id)
         original_opinion = await uow.analyst_opinions.get(opinion.id, version=opinion.version)
         assert old_artifact == base
-        assert new_opinion == rebased.opinion
+        assert old_requested == requested
+        assert old_head == head
+        assert new_opinion == approved
         assert original_opinion == opinion
+
+    assert base.canonical_blob_id is not None
+    assert requested.canonical_blob_id is not None
+    assert head.canonical_blob_id is not None
+    assert await artifact_store.read_bytes(base.canonical_blob_id) == canonical_bytes
+    assert await artifact_store.read_bytes(requested.canonical_blob_id) == requested_bytes
+    assert await artifact_store.read_bytes(head.canonical_blob_id) == head_bytes

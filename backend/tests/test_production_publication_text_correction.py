@@ -26,7 +26,10 @@ from cti_app.domain.production import (
 )
 from cti_app.domain.publication_document import (
     PublicationDocumentV5,
+    PublicationDocumentV6,
+    PublicationDocumentV6ProvenanceV1,
     publication_document_v5_from_json,
+    publication_document_v5_sha256,
     serialize_publication_document,
 )
 from cti_app.domain.semantic_annotation import SemanticRole, SemanticTextSpanV1
@@ -144,19 +147,17 @@ def _fixture(*, augmented_current: bool = False):
     store = _MemoryStore({blob_id: canonical})
     artifact_items = [artifact]
     if augmented_current:
-        v6 = {"schema_version": "6", "base_publication": payload}
-        v7 = {
-            "schema_version": "7",
-            "publication_kind": "article",
-            "base_publication": v6,
-        }
-        v8 = {
-            "schema_version": "8",
-            "article_format": {},
-            "base_publication": v7,
-        }
+        v6 = PublicationDocumentV6(
+            base_publication=document,
+            provenance=PublicationDocumentV6ProvenanceV1(
+                base_publication_artifact_id=artifact.id,
+                base_publication_sha256=publication_document_v5_sha256(document),
+            ),
+        )
         current_blob_id = uuid4()
-        store.blobs[current_blob_id] = ProductionArtifactStore.canonical_json_bytes(v8)
+        store.blobs[current_blob_id] = ProductionArtifactStore.canonical_json_bytes(
+            serialize_publication_document(v6)
+        )
         current = ProductionArtifact(
             id=uuid4(),
             production_run_id=run_id,
