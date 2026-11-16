@@ -159,13 +159,13 @@ MANUEL_TYP = r"""// Layout helpers called by the hand-editable markup (main.typ,
 
 // ---- Analyst note -----------------------------------------------------------------------
 #let note(body) = noteAnalyste(title: [Note de l'analyste], breakable: true)[
-  #set par(justify: false, spacing: 0.9em)
+  #set par(justify: false, spacing: 1.4em)
   #body
 ]
 // Short observation inside the synthesis (grey frame, technical terms in small code font).
 #let obs(body) = block(above: 10pt, below: 8pt)[
   #noteAnalyste[
-    #set par(justify: false, spacing: 0.9em)
+    #set par(justify: false, spacing: 1.4em)
     #show raw.where(block: false): it => text(font: code-font-families, size: 8pt, hyphenate: false)[#breakable-text(it.text)]
     #body
   ]
@@ -654,7 +654,7 @@ class Builder:
         lines: list[str],
         *,
         structured_overview_rendered: bool,
-        paragraph_spacing: str = "0.9em",
+        paragraph_spacing: str = "1.4em",
     ) -> None:
         blocks = section["blocks"]
         overview_index, legacy_items, skip = self.legacy_overview(blocks)
@@ -748,7 +748,7 @@ class Builder:
                     stem,
                     lines,
                     structured_overview_rendered=overview_rendered,
-                    paragraph_spacing="1.2em" if brief else "0.9em",
+                    paragraph_spacing="1.4em" if brief else "1.4em",
                 )
             elif kind == "analyst_opinion":
                 self.opinion(section, stem, folder, lines)

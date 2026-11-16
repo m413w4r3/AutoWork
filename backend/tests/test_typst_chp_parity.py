@@ -992,10 +992,10 @@ def test_brief_synthesis_uses_explicit_paragraph_gap_and_article_default() -> No
     synthesis_start = helpers.index('} else if content_section.type == "synthesis" [')
     chronology_start = helpers.index('] else if content_section.type == "chronology" [')
     synthesis = helpers[synthesis_start:chronology_start]
-    assert "paragraph-gap: if has-next-paragraph { 0.9em } else { 0pt }" in synthesis
+    assert "paragraph-gap: if has-next-paragraph { 1.4em } else { 0pt }" in synthesis
     assert synthesis.count("render-body-block(") == 3
-    assert synthesis.count("paragraph-gap: if has-next-paragraph { 0.9em } else { 0pt }") == 2
-    assert "paragraph-gap: 0.9em" in synthesis
+    assert synthesis.count("paragraph-gap: if has-next-paragraph { 1.4em } else { 0pt }") == 2
+    assert "paragraph-gap: 1.4em" in synthesis
     assert "legacy-paragraph-spacing: true" in synthesis
     assert "#set par(spacing: 1em)" not in synthesis
 

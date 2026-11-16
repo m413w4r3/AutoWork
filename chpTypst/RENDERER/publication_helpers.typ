@@ -1200,7 +1200,7 @@
           render-body-block(
             item,
             reference-scope: reference-scope,
-            paragraph-gap: if has-next-paragraph { 0.9em } else { 0pt },
+            paragraph-gap: if has-next-paragraph { 1.4em } else { 0pt },
             opinion-publication: opinion-publication,
           )
         }
@@ -1219,7 +1219,7 @@
           render-body-block(
             item,
             reference-scope: reference-scope,
-            paragraph-gap: if has-next-paragraph { 0.9em } else { 0pt },
+            paragraph-gap: if has-next-paragraph { 1.4em } else { 0pt },
             article-style: true,
             opinion-publication: opinion-publication,
           )
@@ -1231,7 +1231,7 @@
           render-body-block(
             item,
             reference-scope: reference-scope,
-            paragraph-gap: 0.9em,
+            paragraph-gap: 1.4em,
             legacy-paragraph-spacing: true,
             opinion-publication: opinion-publication,
           )
@@ -1322,7 +1322,7 @@
       ).len() > 0
       #if not has-wide-opinion-table and opinion-blocks.len() > 0 [
         #noteAnalyste(title: [Note de l'analyste], breakable: true)[
-          #set par(spacing: 0.9em)
+          #set par(spacing: 1.4em)
           #for item in opinion-blocks [
             #let pipe-table = item.at("pipe_table", default: none)
             #heading(level: 3)[#item.number #text(item.heading)]
@@ -1344,7 +1344,7 @@
           #let pipe-table = item.at("pipe_table", default: none)
           #if pipe-table != none and pipe-table.wide [
             #noteAnalyste(title: opinion-title, breakable: true)[
-              #set par(spacing: 0.9em)
+              #set par(spacing: 1.4em)
               #heading(level: 3)[#item.number #text(item.heading)]
               #block(sticky: true, above: 0pt, below: 0.4em)[#text(size: 8pt, weight: "bold")[#text(item.qualification_label)]]
               #let prefix = pipe-table.at("prefix", default: "")
@@ -1366,7 +1366,7 @@
             #parbreak()
           ] else [
             #noteAnalyste(title: opinion-title, breakable: true)[
-              #set par(spacing: 0.9em)
+              #set par(spacing: 1.4em)
               #heading(level: 3)[#item.number #text(item.heading)]
               #block(sticky: true, above: 0pt, below: 0.4em)[#text(size: 8pt, weight: "bold")[#text(item.qualification_label)]]
               #parbreak()

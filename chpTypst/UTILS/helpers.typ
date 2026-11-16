@@ -359,7 +359,7 @@
   if events != none [
     // Synthèse
     #section-title[Synthèse]
-    #set par(spacing: 0.9em)
+    #set par(spacing: 1.4em)
   ]
   body
 }

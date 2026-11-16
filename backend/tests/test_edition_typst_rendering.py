@@ -1013,7 +1013,7 @@ def test_shared_publication_projection_is_pure_and_complete(tmp_path: Path) -> N
 def test_repository_edition_manifest_snapshots_expected_assets() -> None:
     bundle = load_template_bundle(_CHP_TYPST_ROOT, manifest_name=_EDITION_MANIFEST)
 
-    assert bundle.template_version == ("chp-edition-v36-m21-opinion-render-m21-pdffix7-m21-format2")
+    assert bundle.template_version == ("chp-edition-v36-m21-opinion-render-m21-pdffix7-m21-format3")
     assert {file.relative_path for file in bundle.files} == {
         "RENDERER/edition.typ",
         "RENDERER/edition_helpers.typ",
