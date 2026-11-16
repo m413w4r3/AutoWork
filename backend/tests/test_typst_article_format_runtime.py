@@ -254,7 +254,7 @@ async def test_article_v33_renders_overview_timeline_references_figure_table_and
         if "Legacy reference text must not replace" in line
     ]
     assert len(reference_lines) == 1
-    assert reference_lines[0].startswith("9 septembre 2026 : ")
+    assert reference_lines[0].startswith("• 9 septembre 2026 : ")
     assert "https://example.test/report" not in reference_lines[0]
     assert "https://example.test/report" in compact_text
     assert "Threat Desk" not in text

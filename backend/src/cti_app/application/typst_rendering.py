@@ -965,6 +965,58 @@ def _publication_timeline_from_synthesis(entries: Any) -> tuple[PublicationTimel
     )
 
 
+def _project_article_overview_render_data(
+    *,
+    document: PublicationDocumentV4,
+    overview: Any,
+    refang_replacements: tuple[tuple[ArtifactType, str, str], ...],
+    project_text: Callable[[str, str], tuple[str, list[dict[str, Any]] | None]],
+) -> dict[str, Any] | None:
+    if overview is None:
+        return None
+
+    def overview_field(value: Any, label: str) -> dict[str, Any]:
+        text, _offsets = _refang_known_iocs(value.text, refang_replacements)
+        if not document.sections:
+            return {"text": text}
+        for paragraph_index, paragraph in enumerate(document.sections[0].paragraphs, start=1):
+            source_label, separator, source_value = paragraph.text.partition(":")
+            if (
+                not separator
+                or source_label.strip().casefold() != label.casefold()
+                or source_value.strip() != value.text
+            ):
+                continue
+            anchor = section_paragraph_anchor(0, paragraph_index)
+            display_source, spans = project_text(anchor, paragraph.text)
+            _display_source, offsets = _refang_known_iocs(paragraph.text, refang_replacements)
+            source_start = paragraph.text.index(":") + 1
+            while source_start < len(paragraph.text) and paragraph.text[source_start].isspace():
+                source_start += 1
+            source_end = source_start + len(value.text)
+            display_start = offsets[source_start]
+            display_end = offsets[source_end]
+            text = display_source[display_start:display_end]
+            semantic_spans = _clip_semantic_spans(display_source, spans, display_start, display_end)
+            return {
+                "text": text,
+                **({"semantic_spans": semantic_spans} if semantic_spans is not None else {}),
+            }
+        return {"text": text}
+
+    return {
+        "victimology": overview_field(overview.victimology, "Victimologie")
+        if overview.victimology is not None
+        else None,
+        "arsenal": overview_field(overview.arsenal, "Arsenal")
+        if overview.arsenal is not None
+        else None,
+        "main_objective": overview_field(overview.main_objective, "Objectif principal")
+        if overview.main_objective is not None
+        else None,
+    }
+
+
 def _project_article_format_render_data(
     *,
     document: PublicationDocumentV4,
@@ -1061,51 +1113,12 @@ def _project_article_format_render_data(
         for values in category_values.values():
             values.sort(key=lambda item: (item[1].casefold(), item[0].casefold(), item[0]))
 
-    overview_render: dict[str, Any] | None = None
-    if overview is not None:
-
-        def overview_field(value: Any, label: str) -> dict[str, Any]:
-            text, _offsets = _refang_known_iocs(value.text, refang_replacements)
-            if not document.sections:
-                return {"text": text}
-            for paragraph_index, paragraph in enumerate(document.sections[0].paragraphs, start=1):
-                source_label, separator, source_value = paragraph.text.partition(":")
-                if (
-                    not separator
-                    or source_label.strip().casefold() != label.casefold()
-                    or source_value.strip() != value.text
-                ):
-                    continue
-                anchor = section_paragraph_anchor(0, paragraph_index)
-                display_source, spans = project_text(anchor, paragraph.text)
-                _display_source, offsets = _refang_known_iocs(paragraph.text, refang_replacements)
-                source_start = paragraph.text.index(":") + 1
-                while source_start < len(paragraph.text) and paragraph.text[source_start].isspace():
-                    source_start += 1
-                source_end = source_start + len(value.text)
-                display_start = offsets[source_start]
-                display_end = offsets[source_end]
-                text = display_source[display_start:display_end]
-                semantic_spans = _clip_semantic_spans(
-                    display_source, spans, display_start, display_end
-                )
-                return {
-                    "text": text,
-                    **({"semantic_spans": semantic_spans} if semantic_spans is not None else {}),
-                }
-            return {"text": text}
-
-        overview_render = {
-            "victimology": overview_field(overview.victimology, "Victimologie")
-            if overview.victimology is not None
-            else None,
-            "arsenal": overview_field(overview.arsenal, "Arsenal")
-            if overview.arsenal is not None
-            else None,
-            "main_objective": overview_field(overview.main_objective, "Objectif principal")
-            if overview.main_objective is not None
-            else None,
-        }
+    overview_render = _project_article_overview_render_data(
+        document=document,
+        overview=overview,
+        refang_replacements=refang_replacements,
+        project_text=project_text,
+    )
 
     source_timeline = (
         publication_v5.document.timeline if publication_v5 is not None else document.timeline
@@ -1618,6 +1631,7 @@ class TypstPublicationModelV2:
     content_sections: list[dict[str, Any]]
     media_refs: tuple[TypstMediaRef, ...]
     article_format: dict[str, Any] | None = None
+    article_overview: dict[str, Any] | None = None
     draft_watermark: str | None = None
     media_refang_iocs: tuple[tuple[ArtifactType, str, str], ...] = ()
 
@@ -2219,6 +2233,7 @@ class TypstRenderer:
             ),
             "content_sections": model.content_sections,
             "article_format": model.article_format,
+            "article_overview": model.article_overview,
         }
         if article_title_target_id is not None:
             render_data["article_title_target_id"] = article_title_target_id
@@ -2776,11 +2791,26 @@ def project_publication_to_typst_model(
     for index, lead_paragraph in enumerate(document.lead, start=1):
         append_paragraph(lead_paragraph.text, lead_paragraph_anchor(index))
     body_blocks.extend(rich_by_placement.get((EnrichmentPlacementKind.AFTER_LEAD, None), ()))
-    overview_render = (
+    article_overview_render = (
         article_format_render.get("overview") if article_format_render is not None else None
     )
-    has_projected_overview = isinstance(overview_render, dict) and any(
-        value is not None for value in overview_render.values()
+    if article_overview_render is None:
+        canonical_article_format = (
+            publication_v8.article_format if publication_v8 is not None else None
+        )
+        overview = (
+            canonical_article_format.overview
+            if canonical_article_format is not None
+            else extract_article_overview(document.sections)
+        )
+        article_overview_render = _project_article_overview_render_data(
+            document=document,
+            overview=overview,
+            refang_replacements=refang_replacements,
+            project_text=project_text,
+        )
+    has_projected_overview = isinstance(article_overview_render, dict) and any(
+        value is not None for value in article_overview_render.values()
     )
     for section_index, publication_section in enumerate(document.sections):
         if (
@@ -4200,6 +4230,9 @@ def project_publication_to_typst_model(
         content_sections=reader_sections,
         media_refs=tuple(media_refs_by_id.values()),
         article_format=article_format_render,
+        article_overview=(
+            article_overview_render if article_format_render is None else None
+        ),
         draft_watermark=("BROUILLON NON APPROUVÉ" if draft_preview is not None else None),
         media_refang_iocs=refang_replacements,
     )

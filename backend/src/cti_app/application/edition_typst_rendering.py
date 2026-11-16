@@ -173,6 +173,7 @@ class EditionTypstRenderer:
                 "file_ioc_count": project_publication_iocs(publication.document).counts["file"],
                 "content_sections": model.content_sections,
                 "article_format": model.article_format,
+                "article_overview": model.article_overview,
             }
             if article_title_target_id is not None:
                 item["article_title_target_id"] = article_title_target_id
