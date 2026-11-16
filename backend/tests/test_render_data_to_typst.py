@@ -188,7 +188,7 @@ def test_semantic_colors_short_source_links_and_tight_code_style() -> None:
     assert "#semantic-malware[Malware]" in markup
     assert "#semantic-tool[Tool]" in markup
     assert "#semantic-product[Product]" in markup
-    assert "#let fn(url) = footnote[#better-link(url)[source]]" in renderer.MANUEL_TYP
+    assert "#let fn(url) = footnote[#better-link(url)[#url]]" in renderer.MANUEL_TYP
     assert "highlight(fill: luma(190), radius: 2pt)" in renderer.MANUEL_TYP
     assert "#overview-box(" in renderer.MANUEL_TYP or "#let overview-box(" in renderer.MANUEL_TYP
     assert "#tbl-caption(caption)" in renderer.MANUEL_TYP

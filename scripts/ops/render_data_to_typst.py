@@ -35,7 +35,7 @@ MANUEL_TYP = r"""// Layout helpers called by the hand-editable markup (main.typ,
 #import "colors.typ": accent, dark, grey, purple, purple-dark, purple-light
 
 // Footnote with a clickable URL (grey highlighted number, URL in the footer).
-#let fn(url) = footnote[#better-link(url)[source]]
+#let fn(url) = footnote[#better-link(url)[#url]]
 
 // Inline `code`: grey highlight, code font, with invisible break opportunities in long literals.
 #let breakable-text(s) = {
