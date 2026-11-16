@@ -6,13 +6,13 @@ from uuid import uuid4
 
 import pytest
 
+from cti_app.application.analyst_opinion_service import AnalystOpinionService
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.publication_text_correction import (
     PublicationTextCorrectionCommand,
     PublicationTextCorrectionService,
 )
-from cti_app.application.analyst_opinion_service import AnalystOpinionService
 from cti_app.domain.analyst_opinion import (
     AnalystOpinionStatus,
     AnalystOpinionV1,
@@ -119,7 +119,7 @@ async def test_postgres_correction_and_rebase_are_append_only(uow_factory, tmp_p
         await uow.analyst_opinions.append_version(opinion, expected_version=0)
         await uow.commit()
 
-    first_text = document.sections[0].paragraphs[0].text
+    first_text = document.lead[0].text
     result = await PublicationTextCorrectionService(
         uow_factory=uow_factory,
         artifact_store=artifact_store,
@@ -130,11 +130,11 @@ async def test_postgres_correction_and_rebase_are_append_only(uow_factory, tmp_p
             artifact_version=base.version,
             artifact_input_hash=base.input_hash,
             artifact_sha256=hashlib.sha256(canonical_bytes).hexdigest(),
-            field_path="sections[0].paragraphs[0].text",
+            field_path="lead[0].text",
             expected_text=first_text,
             replacement_text=f"{first_text} Correction de test.",
             actor_id="human:integration-editor",
-            reason="Correction exacte pour le test d’intégration.",
+            reason="Correction exacte pour le test d'intégration.",
             idempotency_key=f"publication-correction-{uuid4().hex}",
         )
     )

@@ -32,9 +32,7 @@ def test_rebase_preserves_notes_materials_figures_citations_and_bridge_hashes() 
     base_text = "Bridge-authored finding."
     base_text_sha = hashlib.sha256(base_text.encode("utf-8")).hexdigest()
     source_text_sha = hashlib.sha256(b"original Bridge source").hexdigest()
-    block_draft_ref = BridgeDraftReferenceV1(
-        str(uuid4()), base_text_sha, source_text_sha
-    )
+    block_draft_ref = BridgeDraftReferenceV1(str(uuid4()), base_text_sha, source_text_sha)
     block_review_ref = BridgeReviewReferenceV1(
         str(uuid4()), hashlib.sha256(b"review response").hexdigest(), base_text_sha
     )
@@ -92,9 +90,7 @@ def test_rebase_preserves_notes_materials_figures_citations_and_bridge_hashes() 
         ),
     )
     blocks = opinion_blocks_with_observations((body, materials_section), (note,))
-    blocks = opinion_blocks_with_implant_materials(
-        blocks, materials, section=materials_section
-    )
+    blocks = opinion_blocks_with_implant_materials(blocks, materials, section=materials_section)
     figures = tuple(
         OpinionProtocolFigureV1(
             kind=kind,

@@ -203,11 +203,14 @@ class PublicationTextCorrectionService:
             )
             tokens = _parse_field_path(command.field_path)
             target_parent, target_key = _resolve_parent(original_payload, tokens)
-            before_text = (
-                target_parent.get(target_key)
-                if isinstance(target_parent, dict)
-                else target_parent[target_key]
-            )
+            if isinstance(target_parent, dict) and isinstance(target_key, str):
+                before_text = target_parent.get(target_key)
+            elif isinstance(target_parent, list) and isinstance(target_key, int):
+                before_text = target_parent[target_key]
+            else:
+                raise PublicationTextCorrectionError(
+                    PublicationTextCorrectionErrorCode.FIELD_NOT_TEXT
+                )
             if not isinstance(before_text, str):
                 raise PublicationTextCorrectionError(
                     PublicationTextCorrectionErrorCode.FIELD_NOT_TEXT
@@ -235,7 +238,14 @@ class PublicationTextCorrectionService:
                     PublicationTextCorrectionErrorCode.DOCUMENT_INVALID
                 )
 
-            target_parent[target_key] = command.replacement_text
+            if isinstance(target_parent, dict) and isinstance(target_key, str):
+                target_parent[target_key] = command.replacement_text
+            elif isinstance(target_parent, list) and isinstance(target_key, int):
+                target_parent[target_key] = command.replacement_text
+            else:
+                raise PublicationTextCorrectionError(
+                    PublicationTextCorrectionErrorCode.FIELD_NOT_TEXT
+                )
             # Rich text is a projection of the paragraph's exact text. Keep its
             # stable anchor and replace only that paragraph's semantic spans.
             matching[0]["spans"] = [
@@ -386,13 +396,9 @@ def _resolve_parent(
         elif isinstance(token, int) and isinstance(current, list) and token < len(current):
             current = current[token]
         else:
-            raise PublicationTextCorrectionError(
-                PublicationTextCorrectionErrorCode.FIELD_NOT_TEXT
-            )
+            raise PublicationTextCorrectionError(PublicationTextCorrectionErrorCode.FIELD_NOT_TEXT)
         if current is None:
-            raise PublicationTextCorrectionError(
-                PublicationTextCorrectionErrorCode.FIELD_NOT_TEXT
-            )
+            raise PublicationTextCorrectionError(PublicationTextCorrectionErrorCode.FIELD_NOT_TEXT)
     target = tokens[-1]
     if isinstance(target, str) and isinstance(current, dict):
         return current, target
@@ -447,7 +453,7 @@ def _semantic_anchor_for_path(
     doc = document.document
     if len(tokens) == 3 and tokens[0] in {"tables", "diagrams", "charts", "figures"}:
         collection, index, field = tokens
-        values = getattr(doc, collection)
+        values = getattr(doc, str(collection))
         if not isinstance(index, int) or index >= len(values) or not isinstance(field, str):
             return None
         item = values[index]
@@ -473,12 +479,7 @@ def _semantic_anchor_for_path(
             and column_index < len(doc.tables[table_index].columns)
         ):
             return f"table:{doc.tables[table_index].key}:column:{column_index + 1:04d}"
-    if (
-        len(tokens) == 6
-        and tokens[0] == "tables"
-        and tokens[2] == "rows"
-        and tokens[4] == "cells"
-    ):
+    if len(tokens) == 6 and tokens[0] == "tables" and tokens[2] == "rows" and tokens[4] == "cells":
         table_index, row_index, cell_index = tokens[1], tokens[3], tokens[5]
         if (
             isinstance(table_index, int)

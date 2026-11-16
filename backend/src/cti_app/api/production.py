@@ -21,6 +21,7 @@ from cti_app.application.jobs import (
 )
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_resolver import current_publication_artifact
+from cti_app.application.production_artifact_store import ProductionReuseStorageUnavailableError
 from cti_app.application.production_editorial_enrichment import (
     EditorialEnrichmentRevisionConflictError,
     ProductionEditorialEnrichmentService,
@@ -109,7 +110,6 @@ from cti_app.application.publication_text_correction import (
     PublicationTextCorrectionErrorCode,
     PublicationTextCorrectionService,
 )
-from cti_app.application.production_artifact_store import ProductionReuseStorageUnavailableError
 from cti_app.application.subject_content import analyst_opinion_view
 from cti_app.application.subject_production import (
     EditionProductionBatchNotFoundError,

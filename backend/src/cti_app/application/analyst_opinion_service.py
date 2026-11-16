@@ -594,9 +594,7 @@ class AnalystOpinionService:
             ):
                 raise OpinionError(OpinionErrorCode.REBASE_BASE_INVALID)
 
-            previous_base = await uow.production_artifacts.get(
-                current.base_publication_artifact_id
-            )
+            previous_base = await uow.production_artifacts.get(current.base_publication_artifact_id)
             if previous_base is None or previous_base.canonical_blob_id is None:
                 raise OpinionError(OpinionErrorCode.STALE_BASE)
             try:
@@ -614,17 +612,14 @@ class AnalystOpinionService:
             correction = base.metadata.get("manual_publication_text_correction")
             if (
                 not isinstance(correction, Mapping)
-                or correction.get("parent_artifact_id")
-                != str(current.base_publication_artifact_id)
+                or correction.get("parent_artifact_id") != str(current.base_publication_artifact_id)
                 or correction.get("before_sha256") != current.base_publication_sha256
                 or correction.get("after_sha256") != expected_base_publication_sha256
                 or not isinstance(correction.get("target_anchor"), str)
             ):
                 raise OpinionError(OpinionErrorCode.REBASE_BASE_INVALID)
             try:
-                corrected_document = publication_document_v5_from_json(
-                    json.loads(corrected_bytes)
-                )
+                corrected_document = publication_document_v5_from_json(json.loads(corrected_bytes))
                 if (
                     ProductionArtifactStore.canonical_json_bytes(
                         serialize_publication_document(corrected_document)

@@ -476,6 +476,7 @@ async def test_rebase_appends_draft_and_rehashes_without_changing_citations() ->
         draft.content_sha256,
         "editor:reviewer",
         "Reviewed before base correction.",
+        bridge_drafting_gap_acknowledged=True,
     )
     base_document = publication_document_v5_from_json(json.loads(harness.base_bytes))
     same_text_document = replace(
@@ -483,8 +484,7 @@ async def test_rebase_appends_draft_and_rehashes_without_changing_citations() ->
         semantic_text=replace(
             base_document.semantic_text,
             policy_version=(
-                "semantic-annotation-policy-v5-technical-literal-globs-"
-                "exact-occurrence-coverage"
+                "semantic-annotation-policy-v5-technical-literal-globs-exact-occurrence-coverage"
             ),
         ),
     )

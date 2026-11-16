@@ -125,18 +125,18 @@ def _fixture():
         uow_factory=uow_factory,  # type: ignore[arg-type]
         artifact_store=store,  # type: ignore[arg-type]
     )
-    section_text = document.sections[0].paragraphs[0].text
+    section_text = document.lead[0].text
     command = PublicationTextCorrectionCommand(
         subject_id=document.subject_id,
         artifact_id=artifact.id,
         artifact_version=artifact.version,
         artifact_input_hash=artifact.input_hash,
         artifact_sha256=hashlib.sha256(canonical).hexdigest(),
-        field_path="sections[0].paragraphs[0].text",
+        field_path="lead[0].text",
         expected_text=section_text,
         replacement_text=f"{section_text} Correction éditoriale.",
         actor_id="human:editor-1",
-        reason="Correction exacte demandée par l’éditeur.",
+        reason="Correction exacte demandée par l'éditeur.",
         idempotency_key="publication-text-correction-1",
     )
     return document, canonical, artifacts, store, service, command
@@ -158,7 +158,9 @@ def _masked_document(payload: dict[str, object], *, path: str, anchor: str) -> d
     field[parts[-1]] = "<target>"  # type: ignore[index]
     rich_text = result["rich_text"]
     paragraph = next(
-        item for item in rich_text["paragraphs"] if item["anchor"] == anchor  # type: ignore[index]
+        item
+        for item in rich_text["paragraphs"]
+        if item["anchor"] == anchor  # type: ignore[index]
     )
     paragraph["spans"] = "<target-spans>"
     return result
@@ -166,7 +168,7 @@ def _masked_document(payload: dict[str, object], *, path: str, anchor: str) -> d
 
 @pytest.mark.asyncio
 async def test_exact_v5_field_replacement_preserves_every_other_canonical_field() -> None:
-    document, before_bytes, artifacts, store, service, command = _fixture()
+    _document, before_bytes, artifacts, store, service, command = _fixture()
 
     result = await service.correct(command)
 
@@ -178,7 +180,7 @@ async def test_exact_v5_field_replacement_preserves_every_other_canonical_field(
     after_bytes = store.blobs[result.artifact.canonical_blob_id]
     before_payload = json.loads(before_bytes)
     after_payload = json.loads(after_bytes)
-    anchor = "section:0:paragraph:0001"
+    anchor = "lead:0001"
     assert _at_path(after_payload, command.field_path) == command.replacement_text
     before_rich = next(
         item for item in before_payload["rich_text"]["paragraphs"] if item["anchor"] == anchor
@@ -223,15 +225,11 @@ async def test_correction_refuses_expected_text_mismatch_and_non_text_fields() -
     _, _, artifacts, _, service, command = _fixture()
 
     with pytest.raises(PublicationTextCorrectionError) as mismatch:
-        await service.correct(
-            replace(command, expected_text="not the current text")
-        )
+        await service.correct(replace(command, expected_text="not the current text"))
     assert mismatch.value.code is PublicationTextCorrectionErrorCode.EXPECTED_TEXT_MISMATCH
 
     with pytest.raises(PublicationTextCorrectionError) as non_text:
-        await service.correct(
-            replace(command, field_path="sections[0].paragraphs[0].finding_refs")
-        )
+        await service.correct(replace(command, field_path="lead[0].evidence_refs"))
     assert non_text.value.code is PublicationTextCorrectionErrorCode.FIELD_NOT_TEXT
     assert artifacts.appended == []
 

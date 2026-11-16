@@ -840,9 +840,7 @@ class AnalystOpinionV1:
         return {**self.content_payload(), "content_sha256": self.content_sha256}
 
 
-def validate_analyst_opinion_rebase(
-    previous: AnalystOpinionV1, rebased: AnalystOpinionV1
-) -> None:
+def validate_analyst_opinion_rebase(previous: AnalystOpinionV1, rebased: AnalystOpinionV1) -> None:
     """Require a rebase version to change only its publication identity/review state."""
     if (
         previous.id != rebased.id
@@ -861,8 +859,7 @@ def validate_analyst_opinion_rebase(
         or previous.blocks != rebased.blocks
         or previous.unresolved_points != rebased.unresolved_points
         or previous.protocol_figures != rebased.protocol_figures
-        or previous.bridge_drafting_gap_acknowledged
-        != rebased.bridge_drafting_gap_acknowledged
+        or previous.bridge_drafting_gap_acknowledged != rebased.bridge_drafting_gap_acknowledged
     ):
         raise ValueError("Opinion rebase must preserve content and reset review state")
 
