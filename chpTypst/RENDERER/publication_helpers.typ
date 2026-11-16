@@ -344,8 +344,8 @@
     let entry-text = entry.at("text", default: "")
     list.item[
       #set par(justify: false)
-      #text(size: 8pt, weight: "bold", fill: purple)[#display-date]
-      #text(size: 8pt, weight: "bold", fill: purple)[: ]
+      #text(weight: "bold", fill: purple)[#display-date]
+      #text(weight: "bold", fill: purple)[: ]
       #if entry.at("role_label", default: none) != none [
         #text(size: 7pt, weight: "bold", fill: grey)[#entry.role_label]
         #h(0.35em)
