@@ -1,13 +1,22 @@
 from __future__ import annotations
 
-import sys
+import importlib.util
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
-OPS_DIR = Path(__file__).resolve().parents[2] / "scripts" / "ops"
-sys.path.insert(0, str(OPS_DIR))
+_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "ops" / "render_data_to_typst.py"
 
-import render_data_to_typst as renderer  # noqa: E402
+
+def _load_renderer() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("render_data_to_typst", _SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+renderer: Any = _load_renderer()
 
 
 def article(*, article_format: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -26,7 +35,9 @@ def article(*, article_format: dict[str, Any] | None = None) -> dict[str, Any]:
                         "number": 1,
                         "display_date": "2 janvier 2026",
                         "text": "Source explanation",
-                        "semantic_spans": [{"style": "semantic-plain", "text": "Source explanation"}],
+                        "semantic_spans": [
+                            {"style": "semantic-plain", "text": "Source explanation"}
+                        ],
                         "source_urls": ["https://example.test/source"],
                     }
                 ],
@@ -86,7 +97,7 @@ def test_structured_article_format_renders_overview_and_key_events(tmp_path: Pat
     assert '#overview-item("Arsenal")[A compact toolset.]' in output
     assert '#overview-item("Objectif principal")[Credential collection.]' in output
     assert '#rail-event("1 janvier 2026"' in output
-    assert "#fn(\"https://example.test/event\")" in output
+    assert '#fn("https://example.test/event")' in output
 
 
 def test_brief_body_uses_readable_paragraph_spacing(tmp_path: Path) -> None:
@@ -129,7 +140,9 @@ def test_legacy_overview_groups_fields_across_an_analyst_observation(tmp_path: P
         {
             "type": "paragraph",
             "text": "Objectif principal : Collection.",
-            "semantic_spans": [{"style": "semantic-plain", "text": "Objectif principal : Collection."}],
+            "semantic_spans": [
+                {"style": "semantic-plain", "text": "Objectif principal : Collection."}
+            ],
         },
         {"type": "section_heading", "text": "Context"},
     ]
@@ -147,7 +160,7 @@ def test_legacy_overview_groups_fields_across_an_analyst_observation(tmp_path: P
 
     assert output.count("#overview-box[") == 1
     assert output.count("#overview-item(") == 3
-    assert '== Vue d\'ensemble' not in output
+    assert "== Vue d'ensemble" not in output
     assert "#obs[" in output
     assert output.index('#overview-item("Objectif principal")') < output.index("#obs[")
 

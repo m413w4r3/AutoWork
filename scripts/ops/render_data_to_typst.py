@@ -29,7 +29,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any
 
-MANUEL_TYP = r'''// Layout helpers called by the hand-editable markup (main.typ, articles/, breves/).
+MANUEL_TYP = r"""// Layout helpers called by the hand-editable markup (main.typ, articles/, breves/).
 // They only compose the styles of helpers.typ / colors.typ / document_style.typ.
 #import "helpers.typ": tag, better-link, noteAnalyste, code-font-families
 #import "colors.typ": accent, dark, grey, purple, purple-dark, purple-light
@@ -296,7 +296,7 @@ MANUEL_TYP = r'''// Layout helpers called by the hand-editable markup (main.typ,
   ]
   tbl-caption(caption)
 }
-'''
+"""
 
 STYLE_COLOURED = {
     "semantic-malware": "malware",
@@ -306,12 +306,22 @@ STYLE_COLOURED = {
     "semantic-proof": "proof",
 }
 STYLE_EMPH = {
-    "semantic-actor", "semantic-campaign", "semantic-proper-name", "semantic-english-term",
+    "semantic-actor",
+    "semantic-campaign",
+    "semantic-proper-name",
+    "semantic-english-term",
 }
 STYLE_RAW = {
-    "semantic-technical", "semantic-technical-literal", "semantic-table-technical",
-    "semantic-ioc", "semantic-table-ioc", "semantic-path", "semantic-table-path",
-    "semantic-command", "semantic-table-command", "semantic-protocol-field",
+    "semantic-technical",
+    "semantic-technical-literal",
+    "semantic-table-technical",
+    "semantic-ioc",
+    "semantic-table-ioc",
+    "semantic-path",
+    "semantic-table-path",
+    "semantic-command",
+    "semantic-table-command",
+    "semantic-protocol-field",
 }
 SPECIAL = set("\\#$*_`@<[]~'\"")
 OPEN_OK = set(" \t\n([{«“‘—–-:;,.!?/'\"")
@@ -384,7 +394,9 @@ def raw_markup(text: str) -> str:
     return f"`{text}`"
 
 
-def spans_markup(spans: list[dict[str, Any]] | None, fallback: str = "", *, technical_flag: bool = False) -> str:
+def spans_markup(
+    spans: list[dict[str, Any]] | None, fallback: str = "", *, technical_flag: bool = False
+) -> str:
     """Markup for a list of semantic spans (or a plain fallback string)."""
     if spans is None:
         items: list[tuple[str, str]] = [("plain", fallback)]
@@ -507,24 +519,37 @@ class Builder:
             for i in range(len(columns))
         ]
         title = block.get("title")
-        title_markup = "none" if not title else "[" + spans_markup(block.get("semantic_title"), title) + "]"
+        title_markup = (
+            "none" if not title else "[" + spans_markup(block.get("semantic_title"), title) + "]"
+        )
         caption = block.get("caption")
         caption_markup = (
-            "none" if not caption else "[" + spans_markup(block.get("semantic_caption"), caption) + "]"
+            "none"
+            if not caption
+            else "[" + spans_markup(block.get("semantic_caption"), caption) + "]"
         )
-        rows = [[cell(r * len(columns) + c) for c in range(len(columns))] for r in range(len(block["rows"]))]
+        rows = [
+            [cell(r * len(columns) + c) for c in range(len(columns))]
+            for r in range(len(block["rows"]))
+        ]
         weights = block.get("column_weights") or [1.0] * len(columns)
-        lines = [f"#tbl({title_markup}, ({', '.join(str(w) for w in weights)},), ({', '.join(header)},), caption: {caption_markup},"]
+        lines = [
+            f"#tbl({title_markup}, ({', '.join(str(w) for w in weights)},), ({', '.join(header)},), caption: {caption_markup},"
+        ]
         lines += ["  " + ", ".join(row) + "," for row in rows]
         lines.append(")")
         return "\n".join(lines)
 
-    def figure_like(self, block: dict[str, Any], folder: str, prefix: str, *, protocol: bool = False) -> str:
+    def figure_like(
+        self, block: dict[str, Any], folder: str, prefix: str, *, protocol: bool = False
+    ) -> str:
         media, vector = self.copy_media(block, folder, prefix)
         caption = block.get("caption") or block.get("title") or ""
         if not caption:
             raise ValueError("figure without caption")
-        semantic = block.get("semantic_caption") if block.get("caption") else block.get("semantic_title")
+        semantic = (
+            block.get("semantic_caption") if block.get("caption") else block.get("semantic_title")
+        )
         caption_markup = spans_markup(semantic, caption)
         number = block["figure_number"]
         if block["type"] == "figure":
@@ -575,7 +600,10 @@ class Builder:
         self, blocks: list[dict[str, Any]]
     ) -> tuple[int | None, list[tuple[str, str]], set[int]]:
         for index, block in enumerate(blocks):
-            if block.get("type") != "section_heading" or block.get("text", "").strip().casefold() != "vue d'ensemble":
+            if (
+                block.get("type") != "section_heading"
+                or block.get("text", "").strip().casefold() != "vue d'ensemble"
+            ):
                 continue
             skip = {index}
             items: list[tuple[str, str]] = []
@@ -640,7 +668,9 @@ class Builder:
         lines += ["= Synthèse", f"#set par(spacing: {paragraph_spacing})", ""]
         for index, block in enumerate(blocks):
             if index == overview_index:
-                if not structured_overview_rendered and not self.append_overview(legacy_items, lines):
+                if not structured_overview_rendered and not self.append_overview(
+                    legacy_items, lines
+                ):
                     lines.append("== Vue d'ensemble")
                 continue
             if index in skip:
@@ -659,7 +689,11 @@ class Builder:
         if kind in {"figure", "diagram"}:
             return self.figure_like(block, folder, prefix)
         if kind == "analyst_observation":
-            return "#obs[\n" + spans_markup(block.get("text_spans"), block["text"], technical_flag=True) + "\n]"
+            return (
+                "#obs[\n"
+                + spans_markup(block.get("text_spans"), block["text"], technical_flag=True)
+                + "\n]"
+            )
         raise ValueError(f"unsupported block type {kind}")
 
     # -- publications --------------------------------------------------------------------
@@ -685,7 +719,7 @@ class Builder:
             add("")
         add(
             f'#doc-head([{spans_markup(None, pub["title"])}], "{number}", '
-            f'kind: {tstr("Brève" if brief else "Article")}, anchor: {tstr(pub["anchor"])})'
+            f"kind: {tstr('Brève' if brief else 'Article')}, anchor: {tstr(pub['anchor'])})"
         )
         if brief:
             add("#set text(size: 10pt)")
@@ -719,7 +753,9 @@ class Builder:
             elif kind == "analyst_opinion":
                 self.opinion(section, stem, folder, lines)
             elif kind == "ioc":
-                if section.get("source_indicators") and any(g.get("items") for g in section["source_indicators"]):
+                if section.get("source_indicators") and any(
+                    g.get("items") for g in section["source_indicators"]
+                ):
                     if brief:
                         raise ValueError("brief IOC groups are not supported")
                 if opinion:
@@ -731,7 +767,9 @@ class Builder:
                 raise ValueError(f"unsupported content section {kind}")
         return Path(folder) / f"{stem}.typ", "\n".join(lines).rstrip() + "\n"
 
-    def references(self, section: dict[str, Any], opinion: bool, scope: str, lines: list[str]) -> None:
+    def references(
+        self, section: dict[str, Any], opinion: bool, scope: str, lines: list[str]
+    ) -> None:
         if section.get("blocks"):
             raise ValueError("reference blocks are not supported")
         entries = [entry for entry in section["entries"] if entry.get("text") or entry.get("title")]
@@ -740,8 +778,14 @@ class Builder:
         lines += ["= Références", ""]
         for index, entry in enumerate(entries, 1):
             text = entry.get("text")
-            body = spans_markup(entry.get("semantic_spans"), text) if text else spans_markup(None, entry["title"])
-            urls = unique(([entry["url"]] if entry.get("url") else []) + list(entry.get("source_urls") or []))
+            body = (
+                spans_markup(entry.get("semantic_spans"), text)
+                if text
+                else spans_markup(None, entry["title"])
+            )
+            urls = unique(
+                ([entry["url"]] if entry.get("url") else []) + list(entry.get("source_urls") or [])
+            )
             if opinion and not urls:
                 raise ValueError("numbered reference without URL")
             date = entry.get("display_date") or "Date de publication non précisée"
@@ -753,7 +797,9 @@ class Builder:
                 "",
             ]
 
-    def chronology(self, section: dict[str, Any], brief: bool, scope: str, lines: list[str]) -> None:
+    def chronology(
+        self, section: dict[str, Any], brief: bool, scope: str, lines: list[str]
+    ) -> None:
         events = section.get("timeline") or []
         if not events:
             return
@@ -770,18 +816,20 @@ class Builder:
                     str(ref.get("number", ref_index + 1) if isinstance(ref, dict) else ref)
                     for ref_index, ref in enumerate(refs)
                 ]
-                notes = f' #rf({", ".join(numbers)})'
+                notes = f" #rf({', '.join(numbers)})"
             else:
                 notes = "".join(f" #fn({tstr(url)})" for url in urls)
             last = ", last: true" if index == len(events) - 1 else ""
             date = event.get("display_date_fr") or event.get("display_date", "")
-            lines.append(f'  #rail-event({tstr(date)}{last})[{body}{notes}]')
+            lines.append(f"  #rail-event({tstr(date)}{last})[{body}{notes}]")
         lines += ["]", ""]
 
     def opinion(self, section: dict[str, Any], stem: str, folder: str, lines: list[str]) -> None:
         blocks = section.get("blocks") or []
         unanchored = section.get("unanchored_observations") or []
-        points = section.get("unresolved_point_render_data") or section.get("unresolved_points") or []
+        points = (
+            section.get("unresolved_point_render_data") or section.get("unresolved_points") or []
+        )
         if unanchored:
             raise ValueError("unanchored observations are not supported")
         if any(b.get("pipe_table") for b in blocks):
@@ -789,10 +837,10 @@ class Builder:
         if blocks or points:
             lines.append("#note[")
             for block in blocks:
-                heading = f'{block["number"]} {block["heading"]}'
+                heading = f"{block['number']} {block['heading']}"
                 lines += [
                     f"=== {spans_markup(None, heading)}",
-                    f'#qualif[{spans_markup(None, block["qualification_label"])}]',
+                    f"#qualif[{spans_markup(None, block['qualification_label'])}]",
                     "",
                     spans_markup(block.get("text_spans"), block["text"], technical_flag=True),
                     "",
@@ -803,7 +851,12 @@ class Builder:
                     if isinstance(point, str):
                         lines.append("- " + spans_markup(None, point))
                     else:
-                        lines.append("- " + spans_markup(point.get("text_spans"), point["text"], technical_flag=True))
+                        lines.append(
+                            "- "
+                            + spans_markup(
+                                point.get("text_spans"), point["text"], technical_flag=True
+                            )
+                        )
                 lines.append("")
             lines += ["]", ""]
         for figure in section.get("protocol_figures") or []:
@@ -824,8 +877,8 @@ class Builder:
             '#import "UTILS/manuel.typ": inline-literal',
             "",
             "#show: apply-document-style.with(",
-            f'  country: {tstr(e["country"])}, period: {tstr(e["bulletin_period"])},',
-            f'  bulletin-number: {tstr(e["bulletin_number"])}, bulletin-identifier: {tstr(e["bulletin_identifier"])},',
+            f"  country: {tstr(e['country'])}, period: {tstr(e['bulletin_period'])},",
+            f"  bulletin-number: {tstr(e['bulletin_number'])}, bulletin-identifier: {tstr(e['bulletin_identifier'])},",
             ")",
             "#show raw.where(block: false): inline-literal",
             "",
@@ -837,30 +890,34 @@ class Builder:
             "  #v(10pt)",
             f'  #text(size: 14pt, weight: "bold")[{esc(e["country"])}]',
             "  #linebreak()",
-            f'  #text(size: 10pt)[{esc(e["country_code"])}]',
+            f"  #text(size: 10pt)[{esc(e['country_code'])}]",
             "  #v(8pt)",
-            f'  #text(size: 12pt)[{esc(e["bulletin_period"])}]',
+            f"  #text(size: 12pt)[{esc(e['bulletin_period'])}]",
             "  #v(5pt)",
             f'  #text(size: 9pt, weight: "bold", fill: purple)[{esc(self.data.get("document_header", "Bulletin de veille CTI"))}]',
             "  #v(6pt)",
-            f'  #text(size: 11pt)[Bulletin n° {esc(e["bulletin_number"])}]',
+            f"  #text(size: 11pt)[Bulletin n° {esc(e['bulletin_number'])}]",
             "  #linebreak()",
-            f'  #text(size: 10pt)[Identifiant : {esc(e["bulletin_identifier"])}]',
+            f"  #text(size: 10pt)[Identifiant : {esc(e['bulletin_identifier'])}]",
             "  #v(6pt)",
-            f'  #text(size: 10pt)[Classification : {esc(e["tlp"])}]',
+            f"  #text(size: 10pt)[Classification : {esc(e['tlp'])}]",
             "]",
             "",
             "#v(16pt)",
-            "= Résumé de l'actualité #tag(\"ARTICLES\")",
+            '= Résumé de l\'actualité #tag("ARTICLES")',
             "#article-indexing((",
         ]
         for pub in articles:
-            lines.append(f'  ("{pub["number"]}", better-link(<{pub["anchor"]}>)[{spans_markup(None, pub["title"])}]),')
+            lines.append(
+                f'  ("{pub["number"]}", better-link(<{pub["anchor"]}>)[{spans_markup(None, pub["title"])}]),'
+            )
         lines += ["))", "", "#v(16pt)", '= Autres brèves relevées #tag("BRÈVES")']
         if briefs:
             lines.append("#article-indexing((")
             for pub in briefs:
-                lines.append(f'  ("{pub["number"]}", better-link(<{pub["anchor"]}>)[{spans_markup(None, pub["title"])}]),')
+                lines.append(
+                    f'  ("{pub["number"]}", better-link(<{pub["anchor"]}>)[{spans_markup(None, pub["title"])}]),'
+                )
             lines.append("))")
         else:
             lines.append("Aucune brève relevée dans cette édition.")
@@ -957,11 +1014,19 @@ Les avertissements « label … is not attached to anything » sont normaux.
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--data", required=True, type=Path, help="edition-render-data.json")
-    parser.add_argument("--media-dir", required=True, type=Path, help="directory holding the media files")
-    parser.add_argument("--utils-dir", required=True, type=Path, help="existing UTILS (styles, logo)")
-    parser.add_argument("--fonts-dir", required=True, type=Path, help="fonts to copy next to the sources")
+    parser.add_argument(
+        "--media-dir", required=True, type=Path, help="directory holding the media files"
+    )
+    parser.add_argument(
+        "--utils-dir", required=True, type=Path, help="existing UTILS (styles, logo)"
+    )
+    parser.add_argument(
+        "--fonts-dir", required=True, type=Path, help="fonts to copy next to the sources"
+    )
     parser.add_argument("--output-dir", required=True, type=Path)
     args = parser.parse_args()
 

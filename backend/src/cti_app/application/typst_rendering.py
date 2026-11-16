@@ -4230,9 +4230,7 @@ def project_publication_to_typst_model(
         content_sections=reader_sections,
         media_refs=tuple(media_refs_by_id.values()),
         article_format=article_format_render,
-        article_overview=(
-            article_overview_render if article_format_render is None else None
-        ),
+        article_overview=(article_overview_render if article_format_render is None else None),
         draft_watermark=("BROUILLON NON APPROUVÉ" if draft_preview is not None else None),
         media_refang_iocs=refang_replacements,
     )

@@ -1822,7 +1822,8 @@ async def test_real_typst_lot6_a4_composition_fixture(
         )
         for page in reader.pages
     )
-    assert "5 octobre 2026 La source décrit l'activité après sa publication." in " ".join(text.split())
+    flat_text = " ".join(text.split())
+    assert "5 octobre 2026 La source décrit l'activité après sa publication." in flat_text
     for number, caption in enumerate(
         (
             "Figure source wide, repère A.",

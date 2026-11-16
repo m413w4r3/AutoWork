@@ -211,9 +211,7 @@ def _opinion_fixture() -> dict[str, Any]:
                     {
                         "display_date": "14 octobre 2026",
                         "text": "Synthetic first advisory event.",
-                        "source_refs": [
-                            {"number": 1, "target_id": "publication-source-0001"}
-                        ],
+                        "source_refs": [{"number": 1, "target_id": "publication-source-0001"}],
                     },
                     {
                         "display_date": "16 octobre 2026",
