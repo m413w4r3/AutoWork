@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from cti_app.api.production import PublicationTextCorrectionPayload
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.publication_qa import _semantic_annotation_has_full_occurrence_coverage
 from cti_app.application.publication_text_correction import (
     MAX_PUBLICATION_TEXT_CORRECTION_TEXT_LENGTH,
     PublicationTextCorrectionCommand,
@@ -217,6 +218,138 @@ def _fixture(*, augmented_current: bool = False):
     return document, canonical, artifacts, store, service, command
 
 
+def _semantic_rebase_fixture():
+    document, _canonical, artifacts, store, service, command = _fixture()
+    payload = serialize_publication_document(document)
+    hash_one = "7bdd" + "c" * 54 + "628f27"
+    hash_two = "b6c4" + "d" * 56 + "0f36"
+    old_final = (
+        ". Ces valeurs peuvent servir à conserver une trace des échantillons hachés. "
+        "Leur correspondance précise avec chacun des composants nommés n\u2019est pas établie "
+        "dans les éléments techniques décrits ; il ne faut donc pas leur attribuer "
+        "arbitrairement un nom de fichier."
+    )
+    before_spans = [
+        {
+            "role": "text",
+            "text": "Pour l\u2019analyse statique et le rapprochement d\u2019échantillons,",
+        },
+        {"role": "proper_name", "text": "dmpdump"},
+        {"role": "text", "text": " rapporte les empreintes "},
+        {"role": "technical_literal", "text": "SHA-256"},
+        {"role": "text", "text": " "},
+        {"role": "text", "text": ""},
+        {"role": "ioc", "text": hash_one},
+        {"role": "text", "text": " et "},
+        {"role": "ioc", "text": hash_two},
+        {"role": "text", "text": old_final},
+    ]
+    before_text = "".join(span["text"] for span in before_spans)
+    payload["lead"][0]["text"] = before_text
+    target_paragraph = next(
+        item for item in payload["rich_text"]["paragraphs"] if item["anchor"] == "lead:0001"
+    )
+    target_paragraph["spans"] = before_spans
+
+    title_text = "[Example publisher] VirusTotal nvcontainer.exe document.exe Irak"
+    payload["title"] = title_text
+    title_paragraph = next(
+        item for item in payload["rich_text"]["paragraphs"] if item["anchor"] == "title"
+    )
+    title_paragraph["spans"] = [
+        {"role": "text", "text": "[Example publisher] "},
+        {"role": "product", "text": "VirusTotal"},
+        {"role": "text", "text": " "},
+        {"role": "path", "text": "nvcontainer.exe"},
+        {"role": "text", "text": " "},
+        {"role": "path", "text": "document.exe"},
+        {"role": "text", "text": " "},
+        {"role": "proper_name", "text": "Irak"},
+    ]
+
+    new_final = (
+        f". Ces valeurs peuvent servir à conserver une trace des échantillons hachés. "
+        f"Les rapports VirusTotal associent l\u2019empreinte {hash_one} à « nvcontainer.exe » "
+        f"et mentionnent « document.exe » parmi les noms de soumission de l\u2019empreinte "
+        f"{hash_two} ; ces désignations rapportées ne permettent pas d\u2019établir "
+        f"indépendamment que l\u2019un de ces échantillons correspond au fichier initialement "
+        f"signalé depuis l\u2019Irak."
+    )
+    replacement_text = before_text.replace(old_final, new_final)
+    replacement_spans = (
+        SemanticTextSpanV1(
+            SemanticRole.TEXT,
+            "Pour l\u2019analyse statique et le rapprochement d\u2019échantillons,",
+        ),
+        SemanticTextSpanV1(SemanticRole.PROPER_NAME, "dmpdump"),
+        SemanticTextSpanV1(SemanticRole.TEXT, " rapporte les empreintes "),
+        SemanticTextSpanV1(SemanticRole.TECHNICAL_LITERAL, "SHA-256"),
+        SemanticTextSpanV1(SemanticRole.TEXT, " "),
+        SemanticTextSpanV1(SemanticRole.IOC, hash_one),
+        SemanticTextSpanV1(SemanticRole.TEXT, " et "),
+        SemanticTextSpanV1(SemanticRole.IOC, hash_two),
+        SemanticTextSpanV1(
+            SemanticRole.TEXT,
+            ". Ces valeurs peuvent servir à conserver une trace des échantillons hachés. ",
+        ),
+        SemanticTextSpanV1(SemanticRole.TEXT, "Les rapports "),
+        SemanticTextSpanV1(SemanticRole.PRODUCT, "VirusTotal"),
+        SemanticTextSpanV1(SemanticRole.TEXT, " associent l\u2019empreinte "),
+        SemanticTextSpanV1(SemanticRole.IOC, hash_one),
+        SemanticTextSpanV1(SemanticRole.TEXT, " à « "),
+        SemanticTextSpanV1(SemanticRole.PATH, "nvcontainer.exe"),
+        SemanticTextSpanV1(SemanticRole.TEXT, " » et mentionnent « "),
+        SemanticTextSpanV1(SemanticRole.PATH, "document.exe"),
+        SemanticTextSpanV1(
+            SemanticRole.TEXT,
+            " » parmi les noms de soumission de l\u2019empreinte ",
+        ),
+        SemanticTextSpanV1(SemanticRole.IOC, hash_two),
+        SemanticTextSpanV1(
+            SemanticRole.TEXT,
+            " ; ces désignations rapportées ne permettent pas d\u2019établir indépendamment "
+            "que l\u2019un de ces échantillons correspond au fichier initialement signalé "
+            "depuis l\u2019",
+        ),
+        SemanticTextSpanV1(SemanticRole.PROPER_NAME, "Irak"),
+        SemanticTextSpanV1(SemanticRole.TEXT, "."),
+    )
+    document = publication_document_v5_from_json(payload)
+    canonical = ProductionArtifactStore.canonical_json_bytes(
+        serialize_publication_document(document)
+    )
+    artifact = artifacts.items[0]
+    assert artifact.canonical_blob_id is not None
+    store.blobs[artifact.canonical_blob_id] = canonical
+    qa_results: list[dict[str, object]] = []
+
+    async def qa_runner(_uow, _artifact, publication):
+        coverage = _semantic_annotation_has_full_occurrence_coverage(publication)
+        is_before = not qa_results
+        checks = {"exact_projection": is_before, "semantic_annotation_coverage": coverage}
+        errors = [] if is_before else ["Publication differs from canonical Assembly projection"]
+        if not coverage:
+            errors.append("A semantic annotation is missing from another exact occurrence")
+        result: dict[str, object] = {
+            "passed": is_before and coverage,
+            "checks": checks,
+            "errors": errors,
+            "warnings": [],
+        }
+        qa_results.append(result)
+        return result
+
+    service._qa_runner = qa_runner
+    command = replace(
+        command,
+        artifact_sha256=hashlib.sha256(canonical).hexdigest(),
+        expected_text=before_text,
+        replacement_text=replacement_text,
+        replacement_spans=replacement_spans,
+    )
+    return document, canonical, artifacts, store, service, command, qa_results
+
+
 def _title_fixture():
     document, _, artifacts, store, service, command = _fixture()
     base_payload = serialize_publication_document(document)
@@ -379,7 +512,7 @@ async def test_title_replacement_accepts_explicit_spans_and_records_them_for_pro
     assert provenance["semantic_spans_after"] == title_paragraph["spans"]
 
 
-def test_title_span_api_contract_is_explicit_and_restricted_to_title() -> None:
+def test_replacement_spans_api_contract_accepts_any_field_path() -> None:
     common = {
         "artifact_id": uuid4(),
         "artifact_version": 1,
@@ -403,11 +536,11 @@ def test_title_span_api_contract_is_explicit_and_restricted_to_title() -> None:
         SemanticRole.PROPER_NAME,
     ]
 
-    with pytest.raises(ValidationError):
-        PublicationTextCorrectionPayload(
-            **{**common, "field_path": "lead[0].text"},
-            replacement_spans=[{"role": "technical", "text": "new title"}],
-        )
+    non_title = PublicationTextCorrectionPayload(
+        **{**common, "field_path": "sections[5].paragraphs[6].text"},
+        replacement_spans=[{"role": "technical", "text": "new title"}],
+    )
+    assert non_title.field_path == "sections[5].paragraphs[6].text"
     with pytest.raises(ValidationError):
         PublicationTextCorrectionPayload(
             **common,
@@ -421,13 +554,19 @@ def test_title_span_api_contract_is_explicit_and_restricted_to_title() -> None:
 
 
 @pytest.mark.asyncio
-async def test_replacement_spans_reject_non_title_empty_and_oversized_requests() -> None:
+async def test_replacement_spans_reject_empty_and_oversized_requests() -> None:
     _, _, artifacts, _, service, command = _fixture()
     oversized_text = "x" * (MAX_PUBLICATION_TEXT_CORRECTION_TEXT_LENGTH + 1)
     invalid_commands = (
         replace(
             command,
-            replacement_spans=(SemanticTextSpanV1(SemanticRole.TEXT, command.replacement_text),),
+            replacement_spans=(SemanticTextSpanV1(SemanticRole.TEXT, ""),),
+        ),
+        replace(
+            command,
+            replacement_spans=(
+                SemanticTextSpanV1(SemanticRole.TEXT, command.replacement_text + " extra"),
+            ),
         ),
         replace(
             command,
@@ -453,6 +592,66 @@ async def test_replacement_spans_reject_non_title_empty_and_oversized_requests()
         with pytest.raises(PublicationTextCorrectionError) as invalid:
             await service.correct(invalid_command)
         assert invalid.value.code is PublicationTextCorrectionErrorCode.REPLACEMENT_SPANS_INVALID
+    assert artifacts.appended == []
+
+
+@pytest.mark.asyncio
+async def test_replacement_spans_rebase_semantics_and_pass_occurrence_coverage() -> None:
+    document, _, artifacts, store, service, command, qa_results = _semantic_rebase_fixture()
+    assert _semantic_annotation_has_full_occurrence_coverage(document)
+
+    result = await service.correct(command)
+
+    correction = result.artifact.metadata["manual_publication_text_correction"]
+    assert correction["validation"]["checks_after"]["semantic_annotation_coverage"] is True
+    assert qa_results[-1]["checks"]["exact_projection"] is False
+    assert qa_results[-1]["checks"]["semantic_annotation_coverage"] is True
+    corrected = json.loads(store.blobs[result.artifact.canonical_blob_id])
+    target = next(
+        item for item in corrected["rich_text"]["paragraphs"] if item["anchor"] == "lead:0001"
+    )
+    assert target["spans"] == [
+        {"role": span.role.value, "text": span.text} for span in command.replacement_spans or ()
+    ]
+    assert artifacts.appended == [result.artifact]
+
+
+@pytest.mark.asyncio
+async def test_replacement_spans_reject_an_unannotated_repeated_term() -> None:
+    _document, _, artifacts, _, service, command, qa_results = _semantic_rebase_fixture()
+    replacement_spans = list(command.replacement_spans or ())
+    product_index = next(
+        index for index, span in enumerate(replacement_spans) if span.role is SemanticRole.PRODUCT
+    )
+    product = replacement_spans[product_index]
+    replacement_spans[product_index] = SemanticTextSpanV1(SemanticRole.TEXT, product.text)
+
+    with pytest.raises(PublicationTextCorrectionError) as rejected:
+        await service.correct(replace(command, replacement_spans=tuple(replacement_spans)))
+
+    assert rejected.value.code is PublicationTextCorrectionErrorCode.PUBLICATION_QA_FAILED
+    assert qa_results[-1]["checks"]["semantic_annotation_coverage"] is False
+    assert artifacts.appended == []
+
+
+@pytest.mark.asyncio
+async def test_replacement_spans_cannot_rewrite_an_original_ioc() -> None:
+    _document, _, artifacts, _, service, command, _qa_results = _semantic_rebase_fixture()
+    spans = list(command.replacement_spans or ())
+    original_ioc = next(
+        span for span in spans if span.role is SemanticRole.IOC and span.text.startswith("7bdd")
+    )
+    changed_ioc = "9" * 64
+    ioc_index = spans.index(original_ioc)
+    spans[ioc_index] = SemanticTextSpanV1(SemanticRole.IOC, changed_ioc)
+    changed_text = command.replacement_text.replace(original_ioc.text, changed_ioc, 1)
+
+    with pytest.raises(PublicationTextCorrectionError) as rejected:
+        await service.correct(
+            replace(command, replacement_text=changed_text, replacement_spans=tuple(spans))
+        )
+
+    assert rejected.value.code is PublicationTextCorrectionErrorCode.SEMANTIC_SPAN_CONFLICT
     assert artifacts.appended == []
 
 

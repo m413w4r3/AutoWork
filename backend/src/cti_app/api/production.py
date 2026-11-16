@@ -238,8 +238,6 @@ class PublicationTextCorrectionPayload(BaseModel):
     def _validate_replacement_spans(self) -> PublicationTextCorrectionPayload:
         if self.replacement_spans is None:
             return self
-        if self.field_path != "title":
-            raise ValueError("replacement_spans is only supported for field_path='title'")
         if "".join(span.text for span in self.replacement_spans) != self.replacement_text:
             raise ValueError("replacement_spans must concatenate to replacement_text")
         return self

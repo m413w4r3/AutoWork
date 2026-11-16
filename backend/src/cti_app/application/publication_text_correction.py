@@ -295,10 +295,6 @@ class PublicationTextCorrectionService:
             before_spans: list[dict[str, str]] | None = None
             after_spans: list[dict[str, str]] | None = None
             if command.replacement_spans is not None:
-                if tokens != ("title",):
-                    raise PublicationTextCorrectionError(
-                        PublicationTextCorrectionErrorCode.REPLACEMENT_SPANS_INVALID
-                    )
                 before_spans = _existing_semantic_span_records(
                     correction_spans, expected_text=before_text
                 )
@@ -306,6 +302,13 @@ class PublicationTextCorrectionService:
                     command.replacement_spans,
                     replacement_text=command.replacement_text,
                 )
+                if tokens != ("title",):
+                    _validate_semantic_span_rebase(
+                        before_spans,
+                        after_spans,
+                        before_text=before_text,
+                        replacement_text=command.replacement_text,
+                    )
             if isinstance(target_parent, dict) and isinstance(target_key, str):
                 target_parent[target_key] = command.replacement_text
             elif isinstance(target_parent, list) and isinstance(target_key, int):
@@ -321,8 +324,7 @@ class PublicationTextCorrectionService:
                     replacement_text=command.replacement_text,
                 )
             else:
-                # V5 stores title text in both the root field and the rich-text
-                # title anchor. Update both representations in one operation.
+                # Apply the complete validated spans to the matching rich-text anchor.
                 matching[0]["spans"] = after_spans
             before_qa = await self._run_canonical_qa(uow, requested, document)
             try:
@@ -511,14 +513,6 @@ class PublicationTextCorrectionService:
         ):
             raise TypeError("Publication correction values must be text")
         if command.replacement_spans is not None:
-            try:
-                is_title_path = _parse_field_path(command.field_path) == ("title",)
-            except PublicationTextCorrectionError:
-                is_title_path = False
-            if not is_title_path:
-                raise PublicationTextCorrectionError(
-                    PublicationTextCorrectionErrorCode.REPLACEMENT_SPANS_INVALID
-                )
             _replacement_semantic_span_records(
                 command.replacement_spans,
                 replacement_text=command.replacement_text,
@@ -614,25 +608,7 @@ def _replace_within_one_text_span(
     if "".join(span_texts) != before_text:
         raise PublicationTextCorrectionError(PublicationTextCorrectionErrorCode.DOCUMENT_INVALID)
 
-    prefix_length = 0
-    shared_limit = min(len(before_text), len(replacement_text))
-    while (
-        prefix_length < shared_limit
-        and before_text[prefix_length] == replacement_text[prefix_length]
-    ):
-        prefix_length += 1
-
-    suffix_length = 0
-    while (
-        suffix_length < len(before_text) - prefix_length
-        and suffix_length < len(replacement_text) - prefix_length
-        and before_text[len(before_text) - suffix_length - 1]
-        == replacement_text[len(replacement_text) - suffix_length - 1]
-    ):
-        suffix_length += 1
-
-    old_end = len(before_text) - suffix_length
-    new_end = len(replacement_text) - suffix_length
+    prefix_length, old_end, new_end = _common_edit_bounds(before_text, replacement_text)
     if prefix_length == old_end:
         candidates = [
             index for index, (start, end) in enumerate(positions) if start <= prefix_length <= end
@@ -671,6 +647,95 @@ def _replace_within_one_text_span(
         span["text"] for span in spans
     ) != replacement_text:
         raise PublicationTextCorrectionError(PublicationTextCorrectionErrorCode.DOCUMENT_INVALID)
+
+
+def _common_edit_bounds(before_text: str, replacement_text: str) -> tuple[int, int, int]:
+    prefix_length = 0
+    shared_limit = min(len(before_text), len(replacement_text))
+    while (
+        prefix_length < shared_limit
+        and before_text[prefix_length] == replacement_text[prefix_length]
+    ):
+        prefix_length += 1
+
+    suffix_length = 0
+    while (
+        suffix_length < len(before_text) - prefix_length
+        and suffix_length < len(replacement_text) - prefix_length
+        and before_text[len(before_text) - suffix_length - 1]
+        == replacement_text[len(replacement_text) - suffix_length - 1]
+    ):
+        suffix_length += 1
+
+    return (
+        prefix_length,
+        len(before_text) - suffix_length,
+        len(replacement_text) - suffix_length,
+    )
+
+
+def _validate_semantic_span_rebase(
+    before_spans: list[dict[str, str]],
+    after_spans: list[dict[str, str]],
+    *,
+    before_text: str,
+    replacement_text: str,
+) -> None:
+    """Keep every span outside the declared edit and confine new semantics to it."""
+    prefix_length, old_end, new_end = _common_edit_bounds(before_text, replacement_text)
+    shift = new_end - old_end
+
+    def positioned(records: list[dict[str, str]]) -> list[tuple[dict[str, str], int, int]]:
+        result: list[tuple[dict[str, str], int, int]] = []
+        cursor = 0
+        for record in records:
+            end = cursor + len(record["text"])
+            result.append((record, cursor, end))
+            cursor = end
+        return result
+
+    old_positioned = positioned(before_spans)
+    new_positioned = positioned(after_spans)
+    preserved_after_indexes: set[int] = set()
+
+    for old_record, start, end in old_positioned:
+        role = SemanticRole(old_record["role"])
+        if start == end and role is SemanticRole.TEXT:
+            # Empty TEXT spans carry no characters and have no stable edit side.
+            continue
+        if end <= prefix_length:
+            mapped_start, mapped_end = start, end
+        elif start >= old_end:
+            mapped_start, mapped_end = start + shift, end + shift
+        else:
+            if role is not SemanticRole.TEXT:
+                raise PublicationTextCorrectionError(
+                    PublicationTextCorrectionErrorCode.SEMANTIC_SPAN_CONFLICT
+                )
+            continue
+
+        matching_indexes = [
+            index
+            for index, (record, new_start, new_span_end) in enumerate(new_positioned)
+            if index not in preserved_after_indexes
+            and record == old_record
+            and (new_start, new_span_end) == (mapped_start, mapped_end)
+        ]
+        if not matching_indexes:
+            raise PublicationTextCorrectionError(
+                PublicationTextCorrectionErrorCode.SEMANTIC_SPAN_CONFLICT
+            )
+        preserved_after_indexes.add(matching_indexes[0])
+
+    for index, (record, start, end) in enumerate(new_positioned):
+        if (
+            SemanticRole(record["role"]) is not SemanticRole.TEXT
+            and index not in preserved_after_indexes
+            and not (start >= prefix_length and end <= new_end)
+        ):
+            raise PublicationTextCorrectionError(
+                PublicationTextCorrectionErrorCode.SEMANTIC_SPAN_CONFLICT
+            )
 
 
 def _validate_qa_transition(
