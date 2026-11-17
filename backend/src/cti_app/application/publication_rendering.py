@@ -64,7 +64,11 @@ from cti_app.domain.editorial import AnalystDecisionTargetType, AnalystDecisionT
 from cti_app.domain.investigation import EvidenceObservation, InvestigationFinding
 from cti_app.domain.investigation_graph import InvestigationGraph
 from cti_app.domain.media_assets import MediaAssetKind
-from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
+from cti_app.domain.production import (
+    ProductionArtifact,
+    ProductionArtifactStage,
+    ProductionArtifactStatus,
+)
 from cti_app.domain.production_synthesis import ProductionSynthesisV1
 from cti_app.domain.publication_document import (
     CanonicalPublicationDocument,
@@ -327,6 +331,7 @@ class PublicationRenderService:
         *,
         base_publication_body_sha256: str | None = None,
         base_publication_identity: dict[str, Any] | None = None,
+        base_publication_artifact: ProductionArtifact | None = None,
         infrastructure_graph: InvestigationGraph | None = None,
         findings: tuple[InvestigationFinding, ...] = (),
         evidence_observations: tuple[EvidenceObservation, ...] = (),
@@ -338,6 +343,7 @@ class PublicationRenderService:
             synthesis,
             base_publication_body_sha256=base_publication_body_sha256,
             base_publication_identity=base_publication_identity,
+            base_publication_artifact=base_publication_artifact,
             infrastructure_graph=infrastructure_graph,
             findings=findings,
             evidence_observations=evidence_observations,
@@ -382,6 +388,7 @@ class PublicationRenderService:
         *,
         base_publication_body_sha256: str | None = None,
         base_publication_identity: dict[str, Any] | None = None,
+        base_publication_artifact: ProductionArtifact | None = None,
         infrastructure_graph: InvestigationGraph | None = None,
         findings: tuple[InvestigationFinding, ...] = (),
         evidence_observations: tuple[EvidenceObservation, ...] = (),
@@ -393,6 +400,7 @@ class PublicationRenderService:
             synthesis,
             base_publication_body_sha256=base_publication_body_sha256,
             base_publication_identity=base_publication_identity,
+            base_publication_artifact=base_publication_artifact,
             infrastructure_graph=infrastructure_graph,
             findings=findings,
             evidence_observations=evidence_observations,
@@ -423,6 +431,7 @@ class PublicationRenderService:
         *,
         base_publication_body_sha256: str | None,
         base_publication_identity: dict[str, Any] | None,
+        base_publication_artifact: ProductionArtifact | None,
         infrastructure_graph: InvestigationGraph | None,
         findings: tuple[InvestigationFinding, ...],
         evidence_observations: tuple[EvidenceObservation, ...],
@@ -437,6 +446,7 @@ class PublicationRenderService:
                 findings,
                 evidence_observations,
                 base_publication_body_sha256,
+                base_publication_artifact,
             )
         except ValueError as exc:
             raise PublicationRenderDocumentInvalidError(str(exc)) from exc

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import replace
 from datetime import date
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
 
+from cti_app.application.analyst_opinion_preview import AnalystOpinionPreviewService
 from cti_app.application.analyst_opinion_service import AnalystOpinionService
 from cti_app.application.analyst_publication_service import AnalystPublicationService
 from cti_app.application.blobs import BlobCatalogService
@@ -14,6 +17,7 @@ from cti_app.application.investigation_governance import (
     InvestigationEnvelopeProposal,
     InvestigationEnvelopeService,
 )
+from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_references import production_reference_corpus_from_json
 from cti_app.application.publication_augmentation import (
@@ -24,11 +28,13 @@ from cti_app.application.publication_builder import (
     build_article_format_v1,
     build_publication_document_v5,
 )
+from cti_app.application.publication_rendering import PublicationRenderService
 from cti_app.application.publication_text_correction import (
     PublicationTextCorrectionCommand,
     PublicationTextCorrectionService,
 )
 from cti_app.application.subject_production import SubjectProductionService
+from cti_app.application.typst_rendering import TypstRenderer
 from cti_app.domain.analyst_opinion import (
     AnalystOpinionStatus,
     AnalystOpinionV1,
@@ -64,6 +70,8 @@ from cti_app.domain.semantic_annotation import (
     SemanticTextSpanV1,
 )
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
+from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
+from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 from tests.integration.edition_codes import reserve_edition_code
 from tests.integration.test_production_reuse_postgres import (
     _canonical_synthesis,
@@ -74,12 +82,22 @@ from tests.integration.test_production_reuse_postgres import (
     _store_canonical_first_pass,
     _store_empty_enrichment,
 )
+from tests.test_protocol_diagrams_typst import (
+    _D2_BINARY,
+    _REPOSITORY_ROOT,
+    _TYPST_BINARY,
+    _typst_binary,
+)
 
 pytestmark = pytest.mark.integration
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("request_head", [False, True])
+@pytest.mark.skipif(
+    _TYPST_BINARY is None or _D2_BINARY is None,
+    reason="Title correction preview/render requires the pinned Typst and D2 binaries",
+)
 async def test_postgres_correction_and_rebase_are_append_only(
     uow_factory, tmp_path, request_head: bool
 ) -> None:
@@ -118,6 +136,17 @@ async def test_postgres_correction_and_rebase_are_append_only(
         BlobCatalogService(
             FilesystemBlobStore(tmp_path / "publication-correction-blobs"), uow_factory
         )
+    )
+    render_service = PublicationRenderService(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        media_asset_store=MediaAssetStore(artifact_store, uow_factory),
+        renderer=TypstRenderer(),
+        compiler=TypstSubprocessCompiler(binary=_typst_binary()),
+        chp_typst_root=_REPOSITORY_ROOT / "chpTypst",
+        font_bundle_root=Path(os.environ.get("FONT_BUNDLE_ROOT") or _REPOSITORY_ROOT / "chpTypst"),
+        typst_fonts_lock_path=_REPOSITORY_ROOT / "infra" / "typst-fonts.lock",
+        graph_diagram_compiler=D2DiagramCompiler(binary=str(_D2_BINARY)),
     )
     production = SubjectProductionService(uow_factory)
     run, created = await production.create_run(subject.id, edition.id)
@@ -385,6 +414,7 @@ async def test_postgres_correction_and_rebase_are_append_only(
     )
 
     before_title = document.title
+    assert before_title == synthesis_value.title
     before_title_spans = next(
         item["spans"]
         for item in publication_payload["rich_text"]["paragraphs"]
@@ -458,6 +488,19 @@ async def test_postgres_correction_and_rebase_are_append_only(
         result.canonical_sha256,
         "human:integration-reviewer",
     )
+    preview_service = AnalystOpinionPreviewService(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        renderer=render_service,
+    )
+    preview = await preview_service.preview_pdf(
+        rebased.opinion.id,
+        version=rebased.opinion.version,
+        expected_opinion_sha256=rebased.opinion.content_sha256,
+        expected_base_publication_sha256=result.canonical_sha256,
+    )
+    assert preview.content.startswith(b"%PDF-")
+    assert preview.sha256 == hashlib.sha256(preview.content).hexdigest()
     approved = await opinion_service.approve(
         rebased.opinion.id,
         rebased.opinion.version,
@@ -476,6 +519,10 @@ async def test_postgres_correction_and_rebase_are_append_only(
         "human:integration-publisher",
         result.canonical_sha256,
     )
+    augmented_render = await render_service.render_pdf(published.id)
+    assert augmented_render.output_blob_id is not None
+    augmented_pdf = await artifact_store.read_bytes(augmented_render.output_blob_id)
+    assert augmented_pdf.startswith(b"%PDF-")
 
     assert first_correction.artifact.version == 10
     first_provenance = first_correction.artifact.metadata["manual_publication_text_correction"]
