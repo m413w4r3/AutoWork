@@ -49,7 +49,7 @@ from cti_app.domain.protocol_model import (
 )
 
 PROTOCOL_DIAGRAM_PROJECTION_VERSION = (
-    "protocol-diagram-projection-v11-m21-independent-sequence-groups"
+    "protocol-diagram-projection-v12-m21-grouped-sequence-captions"
 )
 PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION = (
     f"{DIAGRAM_COMPILATION_POLICY_VERSION}+{PROTOCOL_DIAGRAM_PROJECTION_VERSION}"
@@ -203,8 +203,13 @@ def project_protocol_diagram(spec: ProtocolDiagramSpecV1) -> DiagramSpecV1:
 
 def protocol_diagram_caption(spec: ProtocolDiagramSpecV1) -> str:
     """Keep proof origin and the important uncertainty in one short caption."""
+    grouped_sequence = spec.kind is ProtocolDiagramKind.SEQUENCE and _has_sequence_group_prefix(
+        spec
+    )
     limitations = tuple(
-        _clean_display_text(item, limit=160) for item in spec.limitations if item.strip()
+        _caption_limitation(item, grouped_sequence=grouped_sequence)
+        for item in spec.limitations
+        if item.strip()
     )
     if _is_documented_view(spec):
         limit_line = "Aucun flux ni trame observés; offsets et valeurs d'octets inconnus."
@@ -229,7 +234,7 @@ def protocol_diagram_caption(spec: ProtocolDiagramSpecV1) -> str:
         limit_line = "Trames et offsets omis du dessin; les éléments non établis restent inconnus."
         if limitations:
             limit_line += " " + " ".join(limitations[:1])
-    if spec.kind is ProtocolDiagramKind.SEQUENCE and _has_sequence_group_prefix(spec):
+    if grouped_sequence:
         limit_line += (
             " Messages déduits des handlers ; ordre non observé ; les groupes sont indépendants."
         )
@@ -251,6 +256,16 @@ def protocol_diagram_caption(spec: ProtocolDiagramSpecV1) -> str:
     else:
         proof_summary = "Niveau de preuve : INSUFFICIENT_EVIDENCE."
     return f"{proof_summary} {limit_line}"
+
+
+def _caption_limitation(value: str, *, grouped_sequence: bool) -> str:
+    limitation = _clean_display_text(value, limit=160)
+    prefix = "Messages sans sens établi, non représentés par une flèche"
+    if grouped_sequence and limitation.casefold().startswith(prefix.casefold()):
+        message_names = limitation[len(prefix) :]
+        message_names = re.sub(r"(^\s*|[,;]\s*)\d+(?=\s)", r"\1", message_names)
+        limitation = prefix + " " + " ".join(message_names.split())
+    return limitation
 
 
 def _display_title(value: str) -> str:

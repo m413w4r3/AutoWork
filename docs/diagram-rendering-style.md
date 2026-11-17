@@ -41,7 +41,7 @@ unchanged.
 - `D2_COMPILER_VERSION` remains pinned to the installed D2 executable. Visual
   source or SVG changes increment `DIAGRAM_COMPILATION_POLICY_VERSION`, now
   `diagram-d2-svg-v16-m21-grouped-protocol-sequences`. Protocol diagram
-  projections also pin `protocol-diagram-projection-v11-m21-independent-sequence-groups`.
+  projections also pin `protocol-diagram-projection-v12-m21-grouped-sequence-captions`.
 - Publication Typst changes increment both `PUBLICATION_RENDERER_VERSION` and
   `PUBLICATION_RENDER_POLICY_VERSION`. The template bundle SHA is also part of
   the publication render input hash.

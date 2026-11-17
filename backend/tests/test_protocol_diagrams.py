@@ -111,6 +111,7 @@ def _spec(
     nodes: tuple[ProtocolDiagramNodeV1, ...] = (),
     edges: tuple[ProtocolDiagramEdgeV1, ...] = (),
     fields: tuple[ProtocolDiagramFieldV1, ...] = (),
+    limitations: tuple[str, ...] = ("Synthetic test evidence only",),
 ) -> ProtocolDiagramSpecV1:
     return ProtocolDiagramSpecV1(
         schema_version="ProtocolDiagramSpecV1",
@@ -120,7 +121,7 @@ def _spec(
         nodes=nodes,
         edges=edges,
         fields=fields,
-        limitations=("Synthetic test evidence only",),
+        limitations=limitations,
     )
 
 
@@ -344,17 +345,45 @@ def test_derived_field_order_is_not_labeled_observed_across_proof_levels() -> No
     assert order_edge.relation_type is DiagramRelationType.PROTOCOL_INFERENCE
 
 
+def test_grouped_sequence_caption_omits_message_ordinals() -> None:
+    limitation = (
+        "Messages sans sens établi, non représentés par une flèche : "
+        "8 [c] [PREPARE_PROGRESS] État, 17 [?] [RRRRRR] [VVVVVV] [FFFFFF] [LS] [LD]."
+    )
+    grouped = _spec(
+        ProtocolDiagramKind.SEQUENCE,
+        edges=(_edge("client", "server", "[c] [PREPARE_PROGRESS] État", 1, ()),),
+        limitations=(limitation,),
+    )
+
+    grouped_caption = protocol_diagram_caption(grouped)
+
+    assert (
+        "Messages sans sens établi, non représentés par une flèche "
+        "[c] [PREPARE_PROGRESS] État, [?] [RRRRRR] [VVVVVV] [FFFFFF] [LS] [LD]" in grouped_caption
+    )
+    assert "8 [c]" not in grouped_caption
+    assert "17 [?]" not in grouped_caption
+
+    ungrouped = _spec(
+        ProtocolDiagramKind.SEQUENCE,
+        edges=(_edge("client", "server", "PREPARE_PROGRESS", 1, ()),),
+        limitations=(limitation,),
+    )
+    assert "8 [c]" in protocol_diagram_caption(ungrouped)
+
+
 def test_protocol_pin_hash_covers_semantics_and_compiler_identity() -> None:
     spec = _three_views()[0]
     pin = protocol_diagram_pin_sha256(spec, compiler="d2", compiler_version="0.9.0")
 
     assert (
         PROTOCOL_DIAGRAM_PROJECTION_VERSION
-        == "protocol-diagram-projection-v11-m21-independent-sequence-groups"
+        == "protocol-diagram-projection-v12-m21-grouped-sequence-captions"
     )
     assert PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION == (
         "diagram-d2-svg-v16-m21-grouped-protocol-sequences+"
-        "protocol-diagram-projection-v11-m21-independent-sequence-groups"
+        "protocol-diagram-projection-v12-m21-grouped-sequence-captions"
     )
     assert pin == protocol_diagram_pin_sha256(spec, compiler="d2", compiler_version="0.9.0")
     assert pin != protocol_diagram_pin_sha256(spec, compiler="d2", compiler_version="0.9.1")
