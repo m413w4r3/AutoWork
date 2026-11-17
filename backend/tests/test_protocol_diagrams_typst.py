@@ -1084,7 +1084,8 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
         "messages déduits des handlers ; ordre non observé ; les groupes sont indépendants"
         in extracted_text
     )
-    assert "17 message 17" in extracted_text
+    assert "message 17" in extracted_text
+    assert "17 message 17" not in extracted_text
     assert "note de l'analyste" in extracted_text
     assert "1.1 apports de l'analyse" in extracted_text
     assert extracted_text.count("article_documented") == 0
