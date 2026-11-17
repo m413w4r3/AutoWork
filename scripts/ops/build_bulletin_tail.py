@@ -27,7 +27,8 @@ Usage:
 
 ``--ioc-csv-root`` is the annexes directory (``ArticleNN/ioc_csv/ioc_pipeline_article.csv``) or a
 directory of ``artNN/ioc_pipeline_article.csv``.
-Needs: requests, PyYAML, tqdm (e.g. ``uv run --with requests --with pyyaml --with tqdm ...``) and
+Needs: requests, PyYAML, tqdm, httpx (e.g. ``uv run --with requests --with pyyaml --with tqdm
+--with httpx ...``) and
 the ``typst`` binary (variable TYPST to override).
 """
 
@@ -75,7 +76,7 @@ def load_env(path: Path) -> dict[str, str]:
             continue
         key, _, value = line.partition("=")
         key = key.strip()
-        if key in SECRET_VARS:
+        if key in SECRET_VARS or key == "VIRUSTOTAL_PROXY_INSECURE":
             values[key] = value.strip().strip("'\"")
     return values
 
@@ -128,6 +129,10 @@ def write_config(work: Path, live: bool, vt_delay: float) -> Path:
         # The proxy is a plain-HTTP forward proxy: only http:// URLs go through it.
         text = text.replace("https://www.virustotal.com/api/v3", "http://www.virustotal.com/api/v3")
         text = text.replace("rate_delay_seconds: 15.0", f"rate_delay_seconds: {vt_delay}")
+        # Cloudflare in front of some APIs challenges browser-like user agents.
+        text = re.sub(
+            r"user_agent: \"Mozilla[^\"]*\"", 'user_agent: "IOC-Article-Reporter/1.0"', text
+        )
     else:
         text = text.replace("whois.cymru.com", "127.0.0.1").replace("port: 43", "port: 9")
         text = re.sub(r"https?://[^\s\"']+", "http://127.0.0.1:9", text)

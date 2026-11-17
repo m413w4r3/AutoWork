@@ -4,7 +4,8 @@
 The AutoWork VirusTotal proxy (VIRUSTOTAL_PROXY_URL, plain-HTTP forward proxy) holds the API key
 and appends ``&apikey=<key>`` to the raw URL, so every request must carry a query string
 (sentinel ``x=1``) and no key is sent from here. VirusTotal is used ONLY to check that a file
-hash is present (``/files/<hash>``); domain lookups are skipped unless ``--vt-domains`` is given.
+hash is present (``/files/<hash>``; needs httpx); domain lookups are skipped unless
+``--vt-domains`` is given.
 All other arguments are forwarded to the reporter. Reads VIRUSTOTAL_PROXY_URL from the environment.
 """
 
@@ -33,26 +34,61 @@ def load_reporter():
 
 
 def patch_virustotal(module, proxy_url: str, vt_domains: bool) -> None:
-    original_init = module.HttpClient.__init__
+    """Replace the VirusTotal transport by an httpx client bound to the AutoWork proxy.
 
-    def init_with_proxy(self, cfg, cache):  # type: ignore[no-untyped-def]
-        original_init(self, cfg, cache)
-        # Only plain-HTTP URLs use the proxy: that is the VirusTotal base URL, nothing else.
-        self.session.proxies.update({"http": proxy_url})
+    requests/urllib3 cannot skip certificate checks of an HTTPS proxy with a self-signed
+    certificate, httpx can (VIRUSTOTAL_PROXY_INSECURE=true, same as the backend).
+    """
+    import re
+    import ssl
 
-    module.HttpClient.__init__ = init_with_proxy
+    import httpx
+
+    insecure = os.environ.get("VIRUSTOTAL_PROXY_INSECURE", "").lower() in {"1", "true", "yes"}
+    proxy: str | httpx.Proxy = proxy_url
+    if insecure and proxy_url.startswith("https://"):
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        proxy = httpx.Proxy(url=proxy_url, ssl_context=context)
+    client = httpx.Client(proxy=proxy, timeout=30.0)
     provider = module.VirusTotalProvider
 
     def get(self, endpoint, cache_key, allow_404=True):  # type: ignore[no-untyped-def]
-        return self.http.request_json(
-            self.name,
-            "GET",
-            f"{self.base_url.rstrip('/')}/{endpoint.lstrip('/')}",
-            params={"x": "1"},
-            cache_key=cache_key,
-            rate_delay=self.delay,
-            allow_404=allow_404,
-        )
+        cache = self.http.cache
+        cached = cache.get(self.name, cache_key) if cache_key else None
+        if cached is not None:
+            if isinstance(cached, dict) and cached.get("_ioc_http_status") == 404:
+                return None, 404, None
+            return cached, 200, None
+        url = f"{self.base_url.rstrip('/')}/{endpoint.lstrip('/')}"
+        last_error = "unknown error"
+        for attempt in range(self.http.retries + 1):
+            self.http.limiter.wait(self.name, self.delay)
+            try:
+                response = client.get(url, params={"x": "1"})
+            except httpx.HTTPError as exc:
+                last_error = type(exc).__name__
+                continue
+            if response.status_code == 404 and allow_404:
+                if cache_key:
+                    cache.set(self.name, cache_key, {"_ioc_http_status": 404})
+                return None, 404, None
+            if response.status_code == 200:
+                try:
+                    payload = response.json()
+                except ValueError:
+                    payload = {"_raw": ""}
+                if cache_key:
+                    cache.set(self.name, cache_key, payload)
+                return payload, 200, None
+            # The proxy can echo the API key in error bodies: report the status only.
+            last_error = f"HTTP {response.status_code}"
+            if response.status_code == 429 and attempt < self.http.retries:
+                import time
+
+                time.sleep(self.http.backoff * (2**attempt) + 30)
+        return None, None, re.sub(r"apikey=[^&\s]+", "apikey=***", last_error)
 
     provider._get = get
     if not vt_domains:
