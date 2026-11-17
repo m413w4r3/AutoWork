@@ -844,9 +844,7 @@ def test_pdf_caption_check_rejects_shuffled_or_separated_lines() -> None:
         )
 
 
-def _verify_pdf(
-    pdf_path: Path, *, captions: Sequence[str], require_status_legend: bool = True
-) -> str:
+def _verify_pdf(pdf_path: Path, *, captions: Sequence[str]) -> str:
     info = subprocess.run(
         ("pdfinfo", str(pdf_path)), capture_output=True, check=True, timeout=30
     ).stdout.decode("utf-8", errors="replace")
@@ -855,9 +853,14 @@ def _verify_pdf(
     text = _extract_pdf_text(pdf_path)
     normalized = _normalized_pdf_text(text)
     _assert_pdf_captions_in_order(text, captions)
-    if require_status_legend:
-        for status in ("observation étayée", "inférence", "non résolu", "contredit"):
-            assert status in normalized, (status, text[-2_000:])
+    for removed_color_label in (
+        "observation étayée : vert",
+        "inférence : orange",
+        "non résolu : gris",
+        "contredit : rouge",
+        "documenté, non observé : bleu",
+    ):
+        assert removed_color_label not in normalized, (removed_color_label, text[-2_000:])
     raster_prefix = pdf_path.with_name(f"{pdf_path.stem}-page")
     subprocess.run(
         (
@@ -1477,7 +1480,7 @@ async def test_w15_protocol_pcap_to_opinion_with_real_d2_typst_and_multibatch_pd
                 rendered_v1, edition_v1_bytes, edition_v1_sha = await render_edition(release_v1)
                 v1_pdf_path = output_root / "edition-v1.pdf"
                 v1_pdf_path.write_bytes(edition_v1_bytes)
-                _verify_pdf(v1_pdf_path, captions=(), require_status_legend=False)
+                _verify_pdf(v1_pdf_path, captions=())
                 v1_snapshot = await read_release_snapshot(
                     release_v1.id, accepted_v1.manifest.id, rendered_v1.id
                 )

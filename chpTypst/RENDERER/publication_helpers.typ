@@ -220,6 +220,36 @@
   ]
 }
 
+#let render-opinion-ioc-list(title, groups) = {
+  let has-values = groups.any(
+    group => group.at("items", default: ()).len() > 0,
+  )
+  if has-values [
+    #render-section-heading(title)
+    #for group in groups {
+      let items = group.at("items", default: ())
+      if items.len() > 0 [
+        #block(above: 5pt, below: 3pt, sticky: true)[
+          #text(size: 10pt, weight: "bold", fill: purple)[#(group.heading + " :")]
+        ]
+        #set text(hyphenate: false)
+        #for item in items [
+          #block(above: 0pt, below: 2pt)[
+            #text(font: code-font-families, size: 8.75pt, hyphenate: false)[
+              #publication-display-text(item.value)
+            ]
+          ]
+        ]
+      ]
+    }
+  ]
+}
+
+#let render-opinion-iocs(section) = {
+  render-opinion-ioc-list("IOC", section.at("source_indicators", default: ()))
+  render-opinion-ioc-list("IOC originaux", section.at("original_indicators", default: ()))
+}
+
 #let publication-detection-code-line(item) = {
   let chunks = item.at("break_chunks", default: ())
   let break-after = item.at("break_after", default: ())
@@ -705,14 +735,6 @@
   ]
 }
 
-#let render-opinion-ioc-reference() = {
-  v(16pt)
-  text(size: 9pt, fill: grey)[
-    Les indicateurs de compromission de cet avis (fichiers et réseau) figurent dans les
-    annexes CSV du dossier de livraison.
-  ]
-}
-
 #let render-figure-caption(
   number,
   caption,
@@ -922,34 +944,18 @@
         below-space: if article-style { 0pt } else { 4pt },
       )
     ]
-    #if has-text(item.at("status_legend", default: none)) [
-      #block(above: 3pt, below: 2pt)[
-        #text(size: 8pt, fill: grey)[#item.status_legend]
-      ]
-    ]
   ]
   let image-height-fraction = if max-height-fraction != none {
     max-height-fraction
-  } else if has-text(item.at("status_legend", default: none)) {
-    0.52
   } else {
     0.35
   }
-  if has-text(item.at("status_legend", default: none)) {
-    render-publication-image(
-      item.media_path,
-      caption-content,
-      max-height-fraction: image-height-fraction,
-      article-style: article-style,
-    )
-  } else {
-    render-publication-image(
-      item.media_path,
-      caption-content,
-      max-height-fraction: image-height-fraction,
-      article-style: article-style,
-    )
-  }
+  render-publication-image(
+    item.media_path,
+    caption-content,
+    max-height-fraction: image-height-fraction,
+    article-style: article-style,
+  )
   }
 }
 
@@ -1435,7 +1441,7 @@
       #none
     ] else if content_section.type == "ioc" [
       #if opinion-publication [
-        #render-opinion-ioc-reference()
+        #render-opinion-iocs(content_section)
       ]
     ] else if content_section.type == "technical_annex" [
       #none

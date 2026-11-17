@@ -385,10 +385,15 @@ def _persist_and_verify_pdf_outputs(
         for spec in _three_views():
             assert spec.title in pdf_text
             assert spec.kind.value in pdf_text
-        assert "Observation étayée : vert" in pdf_text
-        assert "inférence : orange" in pdf_text
-        assert "non résolu : gris" in pdf_text
-        assert "contredit : rouge" in pdf_text
+        lowered_pdf_text = pdf_text.casefold()
+        for removed_color_label in (
+            "observation étayée : vert",
+            "inférence : orange",
+            "non résolu : gris",
+            "contredit : rouge",
+            "documenté, non observé : bleu",
+        ):
+            assert removed_color_label not in lowered_pdf_text
         raster_prefix = output_root / f"synthetic-{name}-page"
         subprocess.run(
             (
@@ -1090,8 +1095,16 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     assert "1.1 apports de l'analyse" in extracted_text
     assert extracted_text.count("article_documented") == 0
     assert extracted_text.count("niveau de preuve") == 3
-    # One occurrence in each figure caption (evidence caveat) plus one in each colour legend.
-    assert extracted_text.count("documenté, non observé") == 6
+    # The phrase remains in each figure caption; color legends are not rendered.
+    assert extracted_text.count("documenté, non observé") == 3
+    for removed_color_label in (
+        "observation étayée : vert",
+        "inférence : orange",
+        "non résolu : gris",
+        "contredit : rouge",
+        "documenté, non observé : bleu",
+    ):
+        assert removed_color_label not in extracted_text
     assert "voir les niveaux indiqués sur les nœuds et relations" not in extracted_text
     assert all(
         title in extracted_text
@@ -1235,8 +1248,16 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
         lowered = pdf_text.casefold()
         expected_proof_levels = 3
         assert pdf_text.count("Niveau de preuve") == expected_proof_levels
-        # Evidence caveat in each figure caption plus the colour legend of each figure.
-        assert pdf_text.casefold().count("documenté, non observé") == 2 * expected_proof_levels
+        # Each phrase comes from a figure caption; the color legend is absent.
+        assert pdf_text.casefold().count("documenté, non observé") == expected_proof_levels
+        for removed_color_label in (
+            "observation étayée : vert",
+            "inférence : orange",
+            "non résolu : gris",
+            "contredit : rouge",
+            "documenté, non observé : bleu",
+        ):
+            assert removed_color_label not in lowered
         assert "ARTICLE_DOCUMENTED" not in pdf_text
         assert "offsets et valeurs d'octets inconnus" in lowered
         assert all(
@@ -1274,7 +1295,6 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
         figure_page = next(page for page in publication_pages if title in page)
         assert f"Figure {figure_number} :" in figure_page
         assert "documenté, non observé" in figure_page.casefold()
-        assert "observation étayée" in figure_page.casefold()
         preview_figure_page = next(page for page in preview_pages if title in page)
         if figure_number == 1:
             assert all(
@@ -1298,8 +1318,6 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
         assert f"Figure {figure_number} :" in preview_figure_page
         assert "documenté, non observé" in preview_figure_page.casefold()
         assert "offsets et valeurs d'octets inconnus" in preview_figure_page.casefold()
-        assert "observation étayée" in preview_figure_page.casefold()
-        assert "documenté, non observé : bleu" in preview_figure_page.casefold()
 
     mutool_binary = shutil.which("mutool")
     if mutool_binary is not None:

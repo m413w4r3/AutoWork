@@ -467,15 +467,12 @@ async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
         "La source ne permet pas d'établir l'attribution opérationnelle",
         "Inférence de l'analyste",
         "ne démontre ni contrôle opérationnel ni attribution",
-        "Les indicateurs de compromission de cet avis (fichiers et réseau) figurent dans les "
-        "annexes CSV du dossier de livraison.",
     ):
         assert required.casefold() in normalized_text, f"W17 PDF text is missing {required!r}"
 
     for removed_reader_label in (
         "ANNEXE TECHNIQUE",
         "IOC de l'article",
-        "IOC originaux",
         "Pistes non confirmées",
         "Empreinte de fichier",
         "Statut indicateur",

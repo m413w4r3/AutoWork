@@ -213,12 +213,44 @@ def test_cover_keeps_the_centered_brand_logo(tmp_path: Path) -> None:
     assert '#image("UTILS/chap.png", width: 18%)' in main
 
 
-def test_article_output_omits_internal_ids_and_ioc_tables(tmp_path: Path) -> None:
+def test_manual_opinion_renders_ioc_sections_and_hides_candidates(tmp_path: Path) -> None:
     pub = article()
     pub["content_sections"].append(
         {
             "type": "ioc",
-            "source_indicators": [{"items": [{"value": "hidden-ioc-sentinel"}]}],
+            "source_indicators": [
+                {
+                    "heading": "Fichiers",
+                    "items": [
+                        {
+                            "artifact_type": "hash",
+                            "type_label": "Fichiers",
+                            "value": {
+                                "text": "source-hash-sentinel",
+                                "break_chunks": [],
+                            },
+                        }
+                    ],
+                }
+            ],
+            "original_indicators": [
+                {
+                    "heading": "Domaines",
+                    "items": [
+                        {
+                            "artifact_type": "domain",
+                            "type_label": "Domaines",
+                            "value": {"text": "original.example", "break_chunks": []},
+                        }
+                    ],
+                }
+            ],
+            "candidate_indicators": [
+                {
+                    "heading": "Pistes non confirmées",
+                    "items": [{"value": {"text": "candidate.example"}}],
+                }
+            ],
         }
     )
     pub["content_sections"].append(
@@ -231,26 +263,51 @@ def test_article_output_omits_internal_ids_and_ioc_tables(tmp_path: Path) -> Non
     assert pub["subject_id"] not in output
     assert "[F]" not in output
     assert "[E]" not in output
-    assert "hidden-ioc-sentinel" not in output
+    assert "source-hash-sentinel" in output
+    assert "original.example" in output
+    assert "candidate.example" not in output
     assert "#ioc-list" not in output
-    assert "#ioc-renvoi()" in output
+    assert "annexes CSV du dossier de livraison" not in output
+    assert output.index('#render-section-heading("IOC")') < output.index(
+        '#render-section-heading("IOC originaux")'
+    )
+    assert "code-font-families" in output
 
 
-def test_both_ioc_references_point_to_delivery_csv_annexes() -> None:
+def test_manual_opinion_without_iocs_has_no_ioc_sections(tmp_path: Path) -> None:
+    pub = article()
+    pub["content_sections"].append(
+        {
+            "type": "ioc",
+            "source_indicators": [],
+            "original_indicators": [],
+            "candidate_indicators": [
+                {"heading": "Pistes non confirmées", "items": [{"value": "hidden-candidate"}]}
+            ],
+        }
+    )
+    pub["content_sections"].append(
+        {"type": "analyst_opinion", "blocks": [], "unanchored_observations": []}
+    )
+
+    _, output = renderer.Builder({}, tmp_path, tmp_path).publication(pub)
+
+    assert '#render-section-heading("IOC")' not in output
+    assert '#render-section-heading("IOC originaux")' not in output
+    assert "hidden-candidate" not in output
+
+
+def test_ioc_reference_helpers_are_removed_from_both_renderers() -> None:
     repository_root = _SCRIPT.resolve().parents[2]
     publication_helpers = (
         repository_root / "chpTypst" / "RENDERER" / "publication_helpers.typ"
     ).read_text(encoding="utf-8")
-    official_reference = publication_helpers.split("#let render-opinion-ioc-reference() = {", 1)[
-        1
-    ].split("#let render-figure-caption(", 1)[0]
-    manual_reference = renderer.MANUEL_TYP.split("#let ioc-renvoi() = {", 1)[1].split(
-        "// ---- Figures", 1
-    )[0]
-
-    for reference in (official_reference, manual_reference):
-        assert "annexes CSV du dossier de livraison" in reference
-        assert "tableau récapitulatif des IOC du bulletin" not in reference
+    for renderer_text in (publication_helpers, renderer.MANUEL_TYP):
+        assert "annexes CSV du dossier de livraison" not in renderer_text
+        assert "render-opinion-ioc-reference" not in renderer_text
+        assert "ioc-renvoi" not in renderer_text
+    assert "render-opinion-iocs(content_section)" in publication_helpers
+    assert "#let render-section-heading(title)" in renderer.MANUEL_TYP
 
 
 def test_manual_renderer_numbers_only_figures_it_emits(tmp_path: Path) -> None:

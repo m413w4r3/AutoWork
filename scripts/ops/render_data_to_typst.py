@@ -171,13 +171,7 @@ MANUEL_TYP = r"""// Layout helpers called by the hand-editable markup (main.typ,
   ]
 ]
 #let qualif(label) = block(sticky: true, above: 0pt, below: 0.4em)[#text(size: 8pt, weight: "bold")[#label]]
-#let ioc-renvoi() = {
-  v(16pt)
-  text(size: 9pt, fill: grey)[
-    Les indicateurs de compromission de cet avis (fichiers et réseau) figurent dans les
-    annexes CSV du dossier de livraison.
-  ]
-}
+#let render-section-heading(title) = heading(level: 1)[#title]
 
 // ---- Figures ----------------------------------------------------------------------------
 #let fig-caption(number, body) = block(width: 100%, above: 0pt, below: 4pt)[
@@ -214,14 +208,13 @@ MANUEL_TYP = r"""// Layout helpers called by the hand-editable markup (main.typ,
 #let fig(media, number, vector: false, max-height: 0.36, caption) = fig-image(
   media, vector, fig-caption(number, caption), max-height,
 )
-// Diagram (protocol, chain...): optional bold title and status legend.
-#let diag(media, number, title: none, legend: none, max-height: 0.35, caption) = fig-image(
+// Diagram (protocol, chain...): optional bold title.
+#let diag(media, number, title: none, max-height: 0.35, caption) = fig-image(
   media,
   true,
   [
     #if title != none [#block(above: 2pt, below: 2pt)[#text(size: 9pt, weight: "bold")[#title]]]
     #fig-caption(number, caption)
-    #if legend != none [#block(above: 3pt, below: 2pt)[#text(size: 8pt, fill: grey)[#legend]]]
   ],
   max-height,
 )
@@ -563,10 +556,7 @@ class Builder:
                 args.append(f"title: [{spans_markup(None, block['title'])}]")
             if block.get("status_label"):
                 raise ValueError("diagram status_label is not supported")
-            legend = block.get("status_legend")
-            if legend:
-                args.append(f"legend: {tstr(legend)}")
-            height = 0.82 if protocol else (0.52 if legend else 0.35)
+            height = 0.82 if protocol else 0.35
             args.append(f"max-height: {height}")
             return f"#diag({', '.join(args)})[{caption_markup}]"
         raise ValueError(f"unsupported figure type {block['type']}")
@@ -705,6 +695,40 @@ class Builder:
         raise ValueError(f"unsupported block type {kind}")
 
     # -- publications --------------------------------------------------------------------
+    def opinion_iocs(self, section: dict[str, Any], lines: list[str]) -> None:
+        for key, title in (
+            ("source_indicators", "IOC"),
+            ("original_indicators", "IOC originaux"),
+        ):
+            groups = section.get(key) or []
+            if not any(group.get("items") for group in groups):
+                continue
+            lines.append(f"#render-section-heading({tstr(title)})")
+            for group in groups:
+                items = group.get("items") or []
+                if not items:
+                    continue
+                heading = group.get("heading")
+                if not isinstance(heading, str) or not heading.strip():
+                    raise ValueError("IOC group heading must be non-empty text")
+                lines.append("#block(above: 5pt, below: 3pt, sticky: true)[")
+                lines.append(
+                    f'#text(size: 10pt, weight: "bold", fill: purple)[{esc(heading + " :")}]'
+                )
+                lines.append("]")
+                for item in items:
+                    value = item.get("value")
+                    display_value = value.get("text") if isinstance(value, dict) else value
+                    if not isinstance(display_value, str):
+                        raise ValueError("IOC value must be text")
+                    lines.append("#block(above: 0pt, below: 2pt)[")
+                    lines.append(
+                        "#text(font: code-font-families, size: 8.75pt, hyphenate: false)"
+                        f"[#breakable-text({tstr(display_value)})]"
+                    )
+                    lines.append("]")
+            lines.append("")
+
     def publication(self, pub: dict[str, Any]) -> tuple[Path, str]:
         article_format = pub.get("article_format") or {}
         if not isinstance(article_format, dict):
@@ -768,8 +792,7 @@ class Builder:
                     if brief:
                         raise ValueError("brief IOC groups are not supported")
                 if opinion:
-                    add("#ioc-renvoi()")
-                    add("")
+                    self.opinion_iocs(section, lines)
             elif kind in {"detection", "technical_annex", "provenance", "publication_provenance"}:
                 continue  # delivered as annex files / hidden from readers
             else:

@@ -24,7 +24,6 @@ from cti_app.application.typst_rendering import (
     _IOC_RELEVANCE_REASON_LABELS,
     _IOC_SOURCE_ROLE_LABELS,
     _NOVELTY_CLASS_LABELS,
-    _PROTOCOL_FIGURE_STATUS_LEGEND,
     TemplateBundleInvalidError,
     TypstDraftPreviewDocument,
     TypstRenderer,
@@ -1097,7 +1096,6 @@ def test_stale_protocol_preview_caption_keeps_only_localized_proof_reservation()
     )
     assert status_label is None
     assert "Niveau de preuve non précisé" not in caption
-    assert "documenté, non observé : bleu" in _PROTOCOL_FIGURE_STATUS_LEGEND
 
 
 def test_current_protocol_figure_caption_keeps_proof_without_repeating_title() -> None:

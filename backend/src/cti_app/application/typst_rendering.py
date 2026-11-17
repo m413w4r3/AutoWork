@@ -4111,7 +4111,6 @@ def project_publication_to_typst_model(
                         != PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION
                         and draft_preview is None
                     ),
-                    "status_legend": _PROTOCOL_FIGURE_STATUS_LEGEND,
                     "media_path": media_ref(
                         asset_id=protocol_figure.asset_id,
                         expected_kind=MediaAssetKind.DIAGRAM_SVG,
@@ -4452,10 +4451,6 @@ _PROTOCOL_FIGURE_EVIDENCE_LABELS = {
     "HYPOTHETICAL": "hypothèse",
     "VERIFIED_ON_HOLDOUT": "validé sur un jeu de contrôle",
 }
-_PROTOCOL_FIGURE_STATUS_LEGEND = (
-    "Observation étayée : vert · inférence : orange · non résolu : gris · "
-    "contredit : rouge · documenté, non observé : bleu."
-)
 
 
 def _protocol_figure_brief(

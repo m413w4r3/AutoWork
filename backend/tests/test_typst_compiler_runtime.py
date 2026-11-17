@@ -1312,27 +1312,64 @@ async def test_real_typst_hides_candidate_indicators_and_annex_from_legacy_rende
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "omitted_invalid_url_count",
-    (2, 0),
-)
-async def test_real_typst_opinion_hides_candidate_url_omission_details(
+@pytest.mark.parametrize("omitted_invalid_url_count", (2, 0))
+@pytest.mark.parametrize("include_iocs", (True, False))
+async def test_real_typst_opinion_renders_only_source_and_original_iocs(
     tmp_path: Path,
     typst_binary: str,
     font_bundle_root: Path,
     omitted_invalid_url_count: int,
+    include_iocs: bool,
 ) -> None:
+    digest = "d172138487a2e66398c7474e24849dbf19157bb30823de7df98556943de7f74f"
     render_data = {
-        "schema_version": "typst-publication-model-opinion-ioc-note-fixture",
+        "schema_version": "typst-publication-model-opinion-ioc-fixture",
         "document_label": _PUBLICATION_RENDER_LABEL,
         "language": "fr",
-        "title": "Opinion IOC note fixture",
+        "title": "Opinion rendering fixture",
         "opinion_document": True,
         "content_sections": [
             {
                 "type": "ioc",
-                "source_indicators": [],
-                "original_indicators": [],
+                "source_indicators": (
+                    [
+                        {
+                            "heading": "Fichiers",
+                            "items": [
+                                {
+                                    "artifact_type": "hash",
+                                    "type_label": "Fichiers",
+                                    "value": {
+                                        "text": digest,
+                                        "break_chunks": [
+                                            digest[index : index + 8]
+                                            for index in range(0, len(digest), 8)
+                                        ],
+                                        "break_after": [True] * 7,
+                                    },
+                                }
+                            ],
+                        }
+                    ]
+                    if include_iocs
+                    else []
+                ),
+                "original_indicators": (
+                    [
+                        {
+                            "heading": "Domaines",
+                            "items": [
+                                {
+                                    "artifact_type": "domain",
+                                    "type_label": "Domaines",
+                                    "value": {"text": "original-ioc.example"},
+                                }
+                            ],
+                        }
+                    ]
+                    if include_iocs
+                    else []
+                ),
                 "candidate_indicators": [
                     {
                         "heading": "Valeurs à vérifier",
@@ -1343,10 +1380,10 @@ async def test_real_typst_opinion_hides_candidate_url_omission_details(
             }
         ],
     }
-    workspace_root = tmp_path / f"opinion-ioc-note-{omitted_invalid_url_count}-workspace"
+    workspace_root = tmp_path / f"opinion-ioc-{omitted_invalid_url_count}-{include_iocs}-workspace"
     _build_runtime_workspace(_REPOSITORY_ROOT, workspace_root, render_data=render_data)
     font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
-    font_root = tmp_path / f"opinion-ioc-note-{omitted_invalid_url_count}-fonts"
+    font_root = tmp_path / f"opinion-ioc-{omitted_invalid_url_count}-{include_iocs}-fonts"
     font_root.mkdir()
     compiled = await TypstSubprocessCompiler(binary=typst_binary).compile(
         TypstCompileRequest(
@@ -1358,13 +1395,38 @@ async def test_real_typst_opinion_hides_candidate_url_omission_details(
 
     reader = PdfReader(BytesIO(compiled.content), strict=True)
     extracted = " ".join("\n".join(page.extract_text() or "" for page in reader.pages).split())
-    assert (
-        "Les indicateurs de compromission de cet avis (fichiers et réseau) figurent dans les "
-        "annexes CSV du dossier de livraison" in extracted
-    )
-    assert "Pistes non confirmées" not in extracted
-    assert "candidate-001.example" not in extracted
-    assert "URL non valide(s) omise(s) des listes." not in extracted
+    normalized = extracted.casefold()
+    assert "annexes csv du dossier de livraison" not in normalized
+    assert "pistes non confirmées" not in normalized
+    assert "candidate-001.example" not in normalized
+    assert "url non valide(s) omise(s) des listes." not in normalized
+    for removed_color_label in (
+        "observation étayée : vert",
+        "inférence : orange",
+        "non résolu : gris",
+        "contredit : rouge",
+        "documenté, non observé : bleu",
+    ):
+        assert removed_color_label not in normalized
+    compact = normalized.replace(" ", "")
+    if include_iocs:
+        title_position = compact.index("opinionrenderingfixture")
+        title_end = title_position + len("opinionrenderingfixture")
+        source_heading_position = compact.index("ioc", title_end)
+        source_position = compact.index(digest)
+        original_heading_position = compact.index("iocoriginaux")
+        original_value_position = compact.index("original-ioc.example")
+        assert (
+            title_position
+            < source_heading_position
+            < source_position
+            < original_heading_position
+            < original_value_position
+        )
+    else:
+        assert "iocoriginaux" not in compact
+        assert digest not in compact
+        assert "original-ioc.example" not in compact
 
 
 @pytest.mark.asyncio
