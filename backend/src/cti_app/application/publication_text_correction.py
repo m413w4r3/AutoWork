@@ -722,7 +722,9 @@ def _validate_semantic_span_rebase(
         elif start >= old_end:
             mapped_start, mapped_end = start + shift, end + shift
         else:
-            if role is not SemanticRole.TEXT:
+            if role is SemanticRole.IOC:
+                # Indicators are never rewritten; other roles inside the declared
+                # edit may be replaced as long as QA annotation coverage holds.
                 raise PublicationTextCorrectionError(
                     PublicationTextCorrectionErrorCode.SEMANTIC_SPAN_CONFLICT
                 )

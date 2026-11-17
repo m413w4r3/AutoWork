@@ -845,3 +845,37 @@ async def test_correction_refuses_a_newer_publication_version() -> None:
 
     assert stale.value.code is PublicationTextCorrectionErrorCode.STALE_ARTIFACT
     assert artifacts.appended == []
+
+
+def test_edit_may_replace_non_ioc_semantic_spans_inside_the_declared_region() -> None:
+    from cti_app.application.publication_text_correction import _validate_semantic_span_rebase
+
+    before = [
+        {"role": "text", "text": "Pour au moins "},
+        {"role": "technical_literal", "text": "64 MB"},
+        {"role": "text", "text": ", transmet."},
+    ]
+    after = [
+        {"role": "text", "text": "Selon le code, pour au moins "},
+        {"role": "technical_literal", "text": "64 Mio"},
+        {"role": "text", "text": ", prévoit."},
+    ]
+    _validate_semantic_span_rebase(
+        before,
+        after,
+        before_text="".join(item["text"] for item in before),
+        replacement_text="".join(item["text"] for item in after),
+    )
+    ioc_before = [
+        {"role": "text", "text": "a "},
+        {"role": "ioc", "text": "x" * 64},
+        {"role": "text", "text": " b"},
+    ]
+    ioc_after = [{"role": "text", "text": "a changed b"}]
+    with pytest.raises(PublicationTextCorrectionError):
+        _validate_semantic_span_rebase(
+            ioc_before,
+            ioc_after,
+            before_text="".join(item["text"] for item in ioc_before),
+            replacement_text="a changed b",
+        )
