@@ -190,9 +190,7 @@ def _display_value(value: str) -> dict[str, Any]:
     return {"text": value}
 
 
-def _new_item(
-    template: dict[str, Any], *, ioc_type: str, value: str
-) -> dict[str, Any]:
+def _new_item(template: dict[str, Any], *, ioc_type: str, value: str) -> dict[str, Any]:
     heading, artifact_type = _TYPE_LABELS[ioc_type]
     item = {key: _empty_like(template_value) for key, template_value in template.items()}
     item.update(
@@ -248,6 +246,8 @@ def inject_discovered_iocs(data: object, ioc_csv_root: Path) -> dict[str, Any]:
         if not isinstance(sections, list) or any(not isinstance(item, dict) for item in sections):
             raise InjectionError(f"publication {number} must contain content_sections objects")
 
+        if publication.get("kind") == "brief":
+            continue  # briefs have no analyst opinion and no discovered IOC export
         csv_path = ioc_csv_root / f"art{number}" / "ioc_pipeline_article.csv"
         if not csv_path.is_file():
             raise InjectionError(f"missing IOC CSV for publication {number}: {csv_path}")
@@ -288,9 +288,7 @@ def inject_discovered_iocs(data: object, ioc_csv_root: Path) -> dict[str, Any]:
                 group = {"heading": heading, "items": []}
                 original_groups.append(group)
             for value in values:
-                group["items"].append(
-                    _new_item(template, ioc_type=ioc_type, value=value)
-                )
+                group["items"].append(_new_item(template, ioc_type=ioc_type, value=value))
             original_keys.update(_ioc_identity(ioc_type, value) for value in values)
 
     return data
