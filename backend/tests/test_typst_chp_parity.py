@@ -2145,7 +2145,8 @@ def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_navigabl
     assert re.search(r"(?m)^\s*Chronologie\s*$", pdf_text) is not None
     assert "ANNEXES CSV DU DOSSIER DE LIVRAISON" not in normalized_text
     assert "LES INDICATEURS DE COMPROMISSION DE CET AVIS" not in normalized_text
-    assert "ORIGINAL.EXAMPLE" not in normalized_text
+    assert "IOC ORIGINAUX" in normalized_text
+    assert "ORIGINAL.EXAMPLE" in normalized_text
     assert "CONTEXTUAL.EXAMPLE" not in normalized_text
     for removed_label in (
         "IOC DE L'ARTICLE",
