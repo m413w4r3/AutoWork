@@ -2,9 +2,9 @@
 """Append the closing pages of a bulletin (non-processed articles + enriched IOC tables).
 
 Reproduces what the reference bulletin (docs/references/CN2609_typ) ends with:
-  1. "Articles retenus et non traités"  (optional, from a TSV file)
-  2. one landscape page set with the enriched IOC tables, produced by
-     docs/references/typstPipeline/ioc_reporter_typst.py from one ``article.csv`` per article.
+  one landscape page set with the enriched IOC tables, produced by
+  docs/references/typstPipeline/ioc_reporter_typst.py from one ``article.csv`` per article.
+  (No "articles retenus et non traités" page: AutoWork has none.)
 
 The source tree (``typst_manuel``) is never modified: it is copied to ``<manuel-dir>_complet``,
 the extra Typst files are added there, and ``bulletin_manuel_complet.pdf`` is compiled so page
@@ -12,18 +12,21 @@ numbering stays coherent.
 
 Safe by default: WITHOUT ``--live`` every provider is pointed at 127.0.0.1 (no external traffic),
 so the tables only contain "-" and the layout can be checked. ``--live`` sends the IOC (hashes,
-IPs, domains: lookups only, no upload) to Team Cymru, Shodan, VirusTotal, MalwareBazaar, Tria.ge,
-Hybrid Analysis and Joe Sandbox. Only use it when that external consultation is authorised.
+IPs, domains: lookups only, no upload) to Team Cymru, Shodan, MalwareBazaar, Tria.ge, Hybrid
+Analysis and Joe Sandbox, and checks sample presence on VirusTotal THROUGH THE AUTOWORK PROXY
+(scripts/ops/run_ioc_reporter.py; VIRUSTOTAL_PROXY_URL, no VT key needed here). Only use it when
+that external consultation is authorised.
 
 Secrets are read from the environment or from ``--env-file`` (default ``.env``; values are never
-printed): VIRUSTOTAL_API_KEY, SHODAN_API_KEY, MALWAREBAZAAR_AUTH_KEY, HYBRID_ANALYSIS_API_KEY,
+printed): VIRUSTOTAL_PROXY_URL, SHODAN_API_KEY, MALWAREBAZAAR_AUTH_KEY, HYBRID_ANALYSIS_API_KEY,
 JBX_API_KEY. Team Cymru (whois) and Tria.ge (public search) need no key.
 
 Usage:
   scripts/ops/build_bulletin_tail.py --manuel-dir ~/Downloads/tmp/FINAL_BULLETIN/typst_manuel \
-      --ioc-csv-root .autowork-runs/m21/ioc_final [--non-traites non_traites.tsv] [--live]
+      --ioc-csv-root ~/Downloads/tmp/FINAL_BULLETIN/annexes [--live]
 
-``--non-traites`` is a TSV: ``date<TAB>titre<TAB>url<TAB>Article|Brève`` per line (no header).
+``--ioc-csv-root`` is the annexes directory (``ArticleNN/ioc_csv/ioc_pipeline_article.csv``) or a
+directory of ``artNN/ioc_pipeline_article.csv``.
 Needs: requests, PyYAML, tqdm (e.g. ``uv run --with requests --with pyyaml --with tqdm ...``) and
 the ``typst`` binary (variable TYPST to override).
 """
@@ -31,7 +34,6 @@ the ``typst`` binary (variable TYPST to override).
 from __future__ import annotations
 
 import argparse
-import csv
 import os
 import re
 import shutil
@@ -42,7 +44,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 PIPELINE = ROOT / "docs" / "references" / "typstPipeline"
 SECRET_VARS = {
-    "VIRUSTOTAL_API_KEY": "VirusTotal",
+    "VIRUSTOTAL_PROXY_URL": "VirusTotal (proxy)",
     "SHODAN_API_KEY": "Shodan",
     "MALWAREBAZAAR_AUTH_KEY": "MalwareBazaar",
     "HYBRID_ANALYSIS_API_KEY": "Hybrid Analysis",
@@ -94,9 +96,12 @@ def article_title(manuel_dir: Path, number: str) -> tuple[str, str] | None:
 
 def write_article_csvs(work: Path, manuel_dir: Path, csv_root: Path) -> list[str]:
     numbers: list[str] = []
-    for source_dir in sorted(csv_root.glob("art[0-9][0-9]")):
-        number = source_dir.name[3:]
-        source = source_dir / "ioc_pipeline_article.csv"
+    layouts = [(p.name[3:], p / "ioc_pipeline_article.csv") for p in csv_root.glob("art[0-9][0-9]")]
+    layouts += [
+        (p.name[7:], p / "ioc_csv" / "ioc_pipeline_article.csv")
+        for p in csv_root.glob("Article[0-9][0-9]")
+    ]
+    for number, source in sorted(layouts):
         if not source.is_file():
             continue
         lines = source.read_text(encoding="utf-8").splitlines()
@@ -113,13 +118,17 @@ def write_article_csvs(work: Path, manuel_dir: Path, csv_root: Path) -> list[str
         )
         numbers.append(number)
     if not numbers:
-        raise SystemExit(f"no artNN/ioc_pipeline_article.csv under {csv_root}")
+        raise SystemExit(f"no ioc_pipeline_article.csv under {csv_root}")
     return numbers
 
 
-def write_config(work: Path, live: bool) -> Path:
+def write_config(work: Path, live: bool, vt_delay: float) -> Path:
     text = (PIPELINE / "config.example.yaml").read_text(encoding="utf-8")
-    if not live:
+    if live:
+        # The proxy is a plain-HTTP forward proxy: only http:// URLs go through it.
+        text = text.replace("https://www.virustotal.com/api/v3", "http://www.virustotal.com/api/v3")
+        text = text.replace("rate_delay_seconds: 15.0", f"rate_delay_seconds: {vt_delay}")
+    else:
         text = text.replace("whois.cymru.com", "127.0.0.1").replace("port: 43", "port: 9")
         text = re.sub(r"https?://[^\s\"']+", "http://127.0.0.1:9", text)
         text = re.sub(r"(rate_delay_seconds:\s*)[0-9.]+", r"\g<1>0", text)
@@ -129,36 +138,15 @@ def write_config(work: Path, live: bool) -> Path:
     return config
 
 
-def write_non_traites(work: Path, tsv: Path) -> None:
-    rows = [row for row in csv.reader(tsv.open(encoding="utf-8"), delimiter="\t") if row]
-    lines = [
-        '#import "UTILS/manuel.typ": fn',
-        '#import "UTILS/helpers.typ": tag',
-        '#import "UTILS/colors.typ": *',
-        "#set par(leading: 1em)",
-        "",
-        "== Articles retenus et non traités",
-        "#v(8pt)",
-    ]
-    for row in rows:
-        if len(row) != 4 or row[3] not in {"Article", "Brève"}:
-            raise SystemExit(f"{tsv}: expected date<TAB>titre<TAB>url<TAB>Article|Brève, got {row}")
-        date, title, url, kind = row
-        title = title.replace("\\", "\\\\").replace('"', '\\"')
-        lines.append(
-            f'- #text(fill: purple, weight: "bold")[*{date}*] : _"{title}"_ '
-            f'#fn("{url}") #h(8pt) #tag("{kind}")'
-        )
-    (work / "articles_non_traites.typ").write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--manuel-dir", required=True, type=Path)
     parser.add_argument("--ioc-csv-root", required=True, type=Path)
-    parser.add_argument("--non-traites", type=Path)
     parser.add_argument("--env-file", type=Path, default=ROOT / ".env")
     parser.add_argument("--live", action="store_true", help="really query the IOC providers")
+    parser.add_argument(
+        "--vt-delay", type=float, default=15.0, help="seconds between VirusTotal requests"
+    )
     parser.add_argument("--out-dir", type=Path)
     parser.add_argument("--tail-title", default="Actualité des codes et infrastructures iraniennes")
     args = parser.parse_args()
@@ -184,11 +172,11 @@ def main() -> int:
             print("WARNING keys missing, these providers stay empty: " + ", ".join(missing))
     else:
         print("Offline stub: no external request, tables will be empty. Use --live to enrich.")
-    config = write_config(work, args.live)
+    config = write_config(work, args.live, args.vt_delay)
 
     reporter = [
         sys.executable,
-        str(PIPELINE / "ioc_reporter_typst.py"),
+        str(Path(__file__).with_name("run_ioc_reporter.py")),
         "--config",
         str(config),
         "--input",
@@ -204,9 +192,6 @@ def main() -> int:
     subprocess.run(reporter, check=True, env=env, cwd=work)
 
     main_typ = (work / "main.typ").read_text(encoding="utf-8").rstrip() + "\n\n#pagebreak()\n"
-    if args.non_traites:
-        write_non_traites(work, args.non_traites)
-        main_typ += '#include "articles_non_traites.typ"\n'
     main_typ += TAIL_PAGE.replace("{title}", args.tail_title)
     (work / "main_complet.typ").write_text(main_typ, encoding="utf-8")
 
