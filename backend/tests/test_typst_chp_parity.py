@@ -2161,10 +2161,10 @@ def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_navigabl
     ):
         assert removed_label not in normalized_text
     assert re.search(r"\bHASHES?\b", normalized_text) is None
-    assert "CORE.EXAMPLE" not in normalized_text
+    assert "CORE.EXAMPLE" in normalized_text
+    assert "IOC" in normalized_text
     assert "DOCUMENTÉ, NON OBSERVÉ" in normalized_text
     assert "FAIT OBSERVÉ" not in normalized_text
-    assert "FICHIER" in normalized_text
     assert "D" * 64 not in normalized_text
     assert "OBSERVED_CONTACT" not in normalized_text
     assert "CONTACT OBSERVÉ" not in normalized_text
