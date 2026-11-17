@@ -14,7 +14,11 @@ from cti_app.application.investigation_graph_source import InvestigationGraphSou
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.publication_rendering import DraftPublicationRender
-from cti_app.application.publication_title import publication_title_matches_synthesis
+from cti_app.application.publication_title import (
+    TitleCorrectionProof,
+    publication_title_matches_synthesis,
+    resolve_title_correction_proof,
+)
 from cti_app.application.typst_compilation import CompiledTypstDocument
 from cti_app.domain.analyst_opinion import (
     AnalystOpinionStatus,
@@ -57,6 +61,7 @@ class DraftOpinionPdfRenderer(Protocol):
         evidence_observations: tuple[EvidenceObservation, ...] = (),
         base_publication_identity: dict[str, Any],
         base_publication_artifact: ProductionArtifact | None = None,
+        title_proof: TitleCorrectionProof | None = None,
     ) -> DraftPublicationRender | CompiledTypstDocument: ...
 
 
@@ -73,6 +78,7 @@ class DraftOpinionRenderInputBuilder(Protocol):
         evidence_observations: tuple[EvidenceObservation, ...] = (),
         base_publication_identity: dict[str, Any],
         base_publication_artifact: ProductionArtifact | None = None,
+        title_proof: TitleCorrectionProof | None = None,
     ) -> tuple[CanonicalPublicationDocument, dict[str, Any]]: ...
 
 
@@ -196,6 +202,9 @@ class AnalystOpinionPreviewService:
                 ProductionArtifactStage.PUBLICATION.value,
             )
             base = await uow.production_artifacts.get(opinion.base_publication_artifact_id)
+            title_proof = (
+                await resolve_title_correction_proof(uow, base) if base is not None else None
+            )
             synthesis_artifact = await uow.production_artifacts.get(opinion.synthesis_artifact_id)
             if (
                 base is None
@@ -248,7 +257,18 @@ class AnalystOpinionPreviewService:
             or base_sha256 != expected_base_publication_sha256
             or synthesis_sha256 != opinion.synthesis_sha256
             or parsed_synthesis.subject_id != base_document_v5.subject_id
-            or not publication_title_matches_synthesis(base, base_document_v5, parsed_synthesis)
+            or (
+                parsed_synthesis.title != base_document_v5.title
+                and (
+                    title_proof is None
+                    or not publication_title_matches_synthesis(
+                        base,
+                        base_document_v5,
+                        parsed_synthesis,
+                        title_proof=title_proof,
+                    )
+                )
+            )
             or parsed_synthesis.publication_language != base_document_v5.publication_language
         ):
             raise OpinionError(OpinionErrorCode.STALE_BASE)
@@ -297,6 +317,7 @@ class AnalystOpinionPreviewService:
         }
         if parsed_synthesis.title != base_document_v5.title:
             preview_kwargs["base_publication_artifact"] = base
+            preview_kwargs["title_proof"] = title_proof
         if infrastructure_graph is not None:
             preview_kwargs["infrastructure_graph"] = infrastructure_graph
         if build_render_inputs:

@@ -18,6 +18,7 @@ from cti_app.application.persistence import PublicationRenderUnitOfWorkFactory
 from cti_app.application.production_artifact_store import (
     ProductionArtifactStore,
 )
+from cti_app.application.publication_title import TitleCorrectionProof
 from cti_app.application.render_target_identities import (
     publication_target_artifact_identities,
 )
@@ -332,6 +333,7 @@ class PublicationRenderService:
         base_publication_body_sha256: str | None = None,
         base_publication_identity: dict[str, Any] | None = None,
         base_publication_artifact: ProductionArtifact | None = None,
+        title_proof: TitleCorrectionProof | None = None,
         infrastructure_graph: InvestigationGraph | None = None,
         findings: tuple[InvestigationFinding, ...] = (),
         evidence_observations: tuple[EvidenceObservation, ...] = (),
@@ -344,6 +346,7 @@ class PublicationRenderService:
             base_publication_body_sha256=base_publication_body_sha256,
             base_publication_identity=base_publication_identity,
             base_publication_artifact=base_publication_artifact,
+            title_proof=title_proof,
             infrastructure_graph=infrastructure_graph,
             findings=findings,
             evidence_observations=evidence_observations,
@@ -389,6 +392,7 @@ class PublicationRenderService:
         base_publication_body_sha256: str | None = None,
         base_publication_identity: dict[str, Any] | None = None,
         base_publication_artifact: ProductionArtifact | None = None,
+        title_proof: TitleCorrectionProof | None = None,
         infrastructure_graph: InvestigationGraph | None = None,
         findings: tuple[InvestigationFinding, ...] = (),
         evidence_observations: tuple[EvidenceObservation, ...] = (),
@@ -401,6 +405,7 @@ class PublicationRenderService:
             base_publication_body_sha256=base_publication_body_sha256,
             base_publication_identity=base_publication_identity,
             base_publication_artifact=base_publication_artifact,
+            title_proof=title_proof,
             infrastructure_graph=infrastructure_graph,
             findings=findings,
             evidence_observations=evidence_observations,
@@ -432,6 +437,7 @@ class PublicationRenderService:
         base_publication_body_sha256: str | None,
         base_publication_identity: dict[str, Any] | None,
         base_publication_artifact: ProductionArtifact | None,
+        title_proof: TitleCorrectionProof | None,
         infrastructure_graph: InvestigationGraph | None,
         findings: tuple[InvestigationFinding, ...],
         evidence_observations: tuple[EvidenceObservation, ...],
@@ -447,6 +453,7 @@ class PublicationRenderService:
                 evidence_observations,
                 base_publication_body_sha256,
                 base_publication_artifact,
+                title_proof,
             )
         except ValueError as exc:
             raise PublicationRenderDocumentInvalidError(str(exc)) from exc

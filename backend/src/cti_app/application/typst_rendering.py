@@ -38,7 +38,10 @@ from cti_app.application.publication_builder import (
     select_article_timeline_key_events,
 )
 from cti_app.application.publication_secret_guard import guard_publication_render_data
-from cti_app.application.publication_title import publication_title_matches_synthesis
+from cti_app.application.publication_title import (
+    TitleCorrectionProof,
+    publication_title_matches_synthesis,
+)
 from cti_app.application.typst_bundle import hash_bundle_contents, resolve_bundle_files
 from cti_app.domain.analyst_opinion import (
     AnalystObservationRelation,
@@ -1650,6 +1653,7 @@ class TypstDraftPreviewDocument:
     evidence_observations: tuple[EvidenceObservation, ...] = ()
     base_publication_body_sha256: str | None = None
     base_publication_artifact: ProductionArtifact | None = None
+    title_proof: TitleCorrectionProof | None = None
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.base_publication, name)
@@ -1676,6 +1680,7 @@ class TypstDraftPreviewDocument:
                 self.base_publication_artifact,
                 self.base_publication,
                 self.synthesis,
+                title_proof=self.title_proof,
             )
             or self.synthesis.publication_language != self.base_publication.publication_language
         ):

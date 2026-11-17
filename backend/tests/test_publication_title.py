@@ -10,7 +10,11 @@ import pytest
 from cti_app.application.analyst_opinion_preview import AnalystOpinionPreviewService
 from cti_app.application.analyst_opinion_service import OpinionError, OpinionErrorCode
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.application.publication_title import publication_title_matches_synthesis
+from cti_app.application.publication_title import (
+    TitleCorrectionProof,
+    publication_title_matches_synthesis,
+    resolve_title_correction_proof,
+)
 from cti_app.application.typst_compilation import CompiledTypstDocument
 from cti_app.application.typst_rendering import TypstDraftPreviewDocument
 from cti_app.domain.production import (
@@ -99,6 +103,54 @@ def _correction_artifact(
     return corrected_document, artifact, canonical_bytes
 
 
+def _chained_correction_artifact(
+    parent: ProductionArtifact,
+    *,
+    target_path: str,
+    before_text: str,
+    after_text: str,
+    after_sha256: str,
+    index: int,
+) -> ProductionArtifact:
+    parent_correction = parent.metadata["manual_publication_text_correction"]
+    origin_v5_sha256 = parent_correction.get(
+        "origin_v5_sha256", parent_correction.get("before_v5_sha256")
+    )
+    correction = {
+        "schema": "publication-text-correction.v1",
+        "parent_artifact_id": str(parent.id),
+        "parent_version": parent.version,
+        "parent_input_hash": parent.input_hash,
+        "parent_correction_artifact_id": str(parent.id),
+        "origin_v5_sha256": origin_v5_sha256,
+        "before_sha256": parent_correction["after_sha256"],
+        "before_v5_sha256": parent_correction["after_sha256"],
+        "target_path": target_path,
+        "before_text_sha256": hashlib.sha256(before_text.encode()).hexdigest(),
+        "after_text_sha256": hashlib.sha256(after_text.encode()).hexdigest(),
+        "after_sha256": after_sha256,
+        "validation": {
+            "method": "canonical_publication_qa_v5_with_declared_text_edit_chained",
+            "passed": True,
+            "field_path": target_path,
+            "checks_before": {"exact_projection": False, "title_format": True},
+            "checks_after": {"exact_projection": False, "title_format": True},
+            "accepted_exception": "exact_projection",
+            "warnings": [],
+        },
+    }
+    return ProductionArtifact(
+        production_run_id=parent.production_run_id,
+        subject_id=parent.subject_id,
+        stage=ProductionArtifactStage.PUBLICATION,
+        version=parent.version + 1,
+        input_hash=hashlib.sha256(f"input {index}".encode()).hexdigest(),
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=uuid4(),
+        metadata={"manual_publication_text_correction": correction},
+    )
+
+
 class _PreviewRenderer:
     def __init__(self) -> None:
         self.base_artifact: ProductionArtifact | None = None
@@ -111,6 +163,7 @@ class _PreviewRenderer:
         *,
         base_publication_identity=None,
         base_publication_artifact=None,
+        title_proof=None,
         infrastructure_graph=None,
         findings=(),
         evidence_observations=(),
@@ -123,6 +176,7 @@ class _PreviewRenderer:
             infrastructure_graph,
             findings,
             evidence_observations,
+            title_proof,
         )
         self.base_artifact = base_publication_artifact
         content = b"%PDF-1.4\nverified corrected title\n"
@@ -195,6 +249,307 @@ async def test_opinion_preview_accepts_only_an_exact_accepted_title_correction()
             expected_base_publication_sha256=hashlib.sha256(corrected_bytes).hexdigest(),
         )
     assert rejected.value.code is OpinionErrorCode.STALE_BASE
+
+
+@pytest.mark.asyncio
+async def test_title_correction_proof_resolves_through_two_paragraph_corrections() -> None:
+    harness = make_opinion_harness()
+    original_document = publication_document_from_json(json.loads(harness.base_bytes))
+    assert isinstance(original_document, PublicationDocumentV5)
+    synthesis_artifact = next(
+        item for item in harness.artifacts.items if item.stage is ProductionArtifactStage.SYNTHESIS
+    )
+    assert synthesis_artifact.canonical_blob_id is not None
+    synthesis = production_synthesis_from_json(
+        json.loads(harness.store.blobs[synthesis_artifact.canonical_blob_id])
+    )
+    corrected_document, title_artifact, _ = _correction_artifact(
+        harness,
+        original_document,
+        synthesis.title,
+        "[Example publisher] WebSockets campaign in Region X",
+    )
+    title_metadata = title_artifact.metadata["manual_publication_text_correction"]
+    first_paragraph = _chained_correction_artifact(
+        title_artifact,
+        target_path="sections[3].paragraphs[2].text",
+        before_text="first paragraph before",
+        after_text="first paragraph after",
+        after_sha256=hashlib.sha256(b"first paragraph body").hexdigest(),
+        index=3,
+    )
+    second_paragraph = _chained_correction_artifact(
+        first_paragraph,
+        target_path="sections[4].paragraphs[3].text",
+        before_text="second paragraph before",
+        after_text="second paragraph after",
+        after_sha256=publication_document_v5_sha256(corrected_document),
+        index=4,
+    )
+    harness.artifacts.items.extend((first_paragraph, second_paragraph))
+    async with harness.uow_factory() as uow:
+        proof = await resolve_title_correction_proof(uow, second_paragraph)
+
+    assert proof is not None
+    assert proof.correction_artifact_id == title_artifact.id
+    assert proof.before_text_sha256 == title_metadata["before_text_sha256"]
+    assert proof.after_text_sha256 == title_metadata["after_text_sha256"]
+    assert not publication_title_matches_synthesis(second_paragraph, corrected_document, synthesis)
+    assert publication_title_matches_synthesis(
+        second_paragraph, corrected_document, synthesis, title_proof=proof
+    )
+
+
+@pytest.mark.asyncio
+async def test_synthetic_title_proof_cannot_bypass_chain_resolution() -> None:
+    harness = make_opinion_harness()
+    original_document = publication_document_from_json(json.loads(harness.base_bytes))
+    assert isinstance(original_document, PublicationDocumentV5)
+    synthesis_artifact = next(
+        item for item in harness.artifacts.items if item.stage is ProductionArtifactStage.SYNTHESIS
+    )
+    assert synthesis_artifact.canonical_blob_id is not None
+    synthesis = production_synthesis_from_json(
+        json.loads(harness.store.blobs[synthesis_artifact.canonical_blob_id])
+    )
+    corrected_document, title_artifact, _ = _correction_artifact(
+        harness,
+        original_document,
+        synthesis.title,
+        "[Example publisher] WebSockets campaign in Region X",
+    )
+    current_artifact = _chained_correction_artifact(
+        title_artifact,
+        target_path="sections[3].paragraphs[2].text",
+        before_text="first paragraph before",
+        after_text="first paragraph after",
+        after_sha256=publication_document_v5_sha256(corrected_document),
+        index=3,
+    )
+    forged_proof = TitleCorrectionProof(
+        base_artifact_id=current_artifact.id,
+        correction_artifact_id=uuid4(),
+        correction_artifact_version=1,
+        before_text_sha256=hashlib.sha256(synthesis.title.encode()).hexdigest(),
+        after_text_sha256=hashlib.sha256(corrected_document.title.encode()).hexdigest(),
+    )
+
+    assert not publication_title_matches_synthesis(
+        current_artifact,
+        corrected_document,
+        synthesis,
+        title_proof=forged_proof,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_link",
+    [
+        "qa",
+        "hash",
+        "missing_parent_input_hash",
+        "missing_before_sha256",
+        "missing_before_v5_sha256",
+    ],
+)
+async def test_title_correction_proof_refuses_an_invalid_chain_link(invalid_link: str) -> None:
+    harness = make_opinion_harness()
+    original_document = publication_document_from_json(json.loads(harness.base_bytes))
+    assert isinstance(original_document, PublicationDocumentV5)
+    synthesis_artifact = next(
+        item for item in harness.artifacts.items if item.stage is ProductionArtifactStage.SYNTHESIS
+    )
+    assert synthesis_artifact.canonical_blob_id is not None
+    synthesis = production_synthesis_from_json(
+        json.loads(harness.store.blobs[synthesis_artifact.canonical_blob_id])
+    )
+    corrected_document, title_artifact, _ = _correction_artifact(
+        harness,
+        original_document,
+        synthesis.title,
+        "[Example publisher] WebSockets campaign in Region X",
+    )
+    first_paragraph = _chained_correction_artifact(
+        title_artifact,
+        target_path="sections[3].paragraphs[2].text",
+        before_text="first paragraph before",
+        after_text="first paragraph after",
+        after_sha256=hashlib.sha256(b"first paragraph body").hexdigest(),
+        index=3,
+    )
+    second_paragraph = _chained_correction_artifact(
+        first_paragraph,
+        target_path="sections[4].paragraphs[3].text",
+        before_text="second paragraph before",
+        after_text="second paragraph after",
+        after_sha256=publication_document_v5_sha256(corrected_document),
+        index=4,
+    )
+    metadata = dict(first_paragraph.metadata)
+    correction = dict(metadata["manual_publication_text_correction"])
+    if invalid_link == "qa":
+        validation = dict(correction["validation"])
+        validation["passed"] = False
+        correction["validation"] = validation
+    elif invalid_link.startswith("missing_"):
+        correction.pop(invalid_link.removeprefix("missing_"))
+    else:
+        correction["before_sha256"] = "f" * 64
+    metadata["manual_publication_text_correction"] = correction
+    invalid_intermediate = replace(first_paragraph, metadata=metadata)
+    harness.artifacts.items.extend((invalid_intermediate, second_paragraph))
+
+    async with harness.uow_factory() as uow:
+        proof = await resolve_title_correction_proof(uow, second_paragraph)
+
+    assert proof is None
+    assert not publication_title_matches_synthesis(
+        second_paragraph,
+        corrected_document,
+        synthesis,
+    )
+
+
+@pytest.mark.asyncio
+async def test_later_title_correction_does_not_reuse_an_older_title_proof() -> None:
+    harness = make_opinion_harness()
+    original_document = publication_document_from_json(json.loads(harness.base_bytes))
+    assert isinstance(original_document, PublicationDocumentV5)
+    synthesis_artifact = next(
+        item for item in harness.artifacts.items if item.stage is ProductionArtifactStage.SYNTHESIS
+    )
+    assert synthesis_artifact.canonical_blob_id is not None
+    synthesis = production_synthesis_from_json(
+        json.loads(harness.store.blobs[synthesis_artifact.canonical_blob_id])
+    )
+    corrected_document, title_artifact, _ = _correction_artifact(
+        harness,
+        original_document,
+        synthesis.title,
+        "[Example publisher] WebSockets campaign in Region X",
+    )
+    first_paragraph = _chained_correction_artifact(
+        title_artifact,
+        target_path="sections[3].paragraphs[2].text",
+        before_text="first paragraph before",
+        after_text="first paragraph after",
+        after_sha256=hashlib.sha256(b"first paragraph body").hexdigest(),
+        index=3,
+    )
+    later_title = "[Example publisher] Updated WebSockets campaign in Region X"
+    later_document = replace(
+        corrected_document,
+        document=replace(corrected_document.document, title=later_title),
+        semantic_text=replace(
+            corrected_document.semantic_text,
+            paragraphs=tuple(
+                SemanticParagraphV1(
+                    paragraph.anchor,
+                    (SemanticTextSpanV1(SemanticRole.TEXT, later_title),),
+                )
+                if paragraph.anchor == "title"
+                else paragraph
+                for paragraph in corrected_document.semantic_text.paragraphs
+            ),
+        ),
+    )
+    later_title_artifact = _chained_correction_artifact(
+        first_paragraph,
+        target_path="title",
+        before_text=corrected_document.title,
+        after_text=later_title,
+        after_sha256=publication_document_v5_sha256(later_document),
+        index=5,
+    )
+    current_artifact = _chained_correction_artifact(
+        later_title_artifact,
+        target_path="sections[5].paragraphs[1].text",
+        before_text="third paragraph before",
+        after_text="third paragraph after",
+        after_sha256=publication_document_v5_sha256(later_document),
+        index=6,
+    )
+    harness.artifacts.items.extend((first_paragraph, later_title_artifact, current_artifact))
+
+    async with harness.uow_factory() as uow:
+        proof = await resolve_title_correction_proof(uow, current_artifact)
+
+    assert proof is not None
+    assert proof.correction_artifact_id == later_title_artifact.id
+    assert not publication_title_matches_synthesis(
+        current_artifact,
+        later_document,
+        synthesis,
+        title_proof=proof,
+    )
+
+
+@pytest.mark.asyncio
+async def test_title_correction_proof_is_bounded_to_sixteen_artifacts() -> None:
+    harness = make_opinion_harness()
+    original_document = publication_document_from_json(json.loads(harness.base_bytes))
+    assert isinstance(original_document, PublicationDocumentV5)
+    synthesis_artifact = next(
+        item for item in harness.artifacts.items if item.stage is ProductionArtifactStage.SYNTHESIS
+    )
+    assert synthesis_artifact.canonical_blob_id is not None
+    synthesis = production_synthesis_from_json(
+        json.loads(harness.store.blobs[synthesis_artifact.canonical_blob_id])
+    )
+    _, title_artifact, _ = _correction_artifact(
+        harness,
+        original_document,
+        synthesis.title,
+        "[Example publisher] WebSockets campaign in Region X",
+    )
+    current = title_artifact
+    chain: list[ProductionArtifact] = []
+    for index in range(15):
+        current = _chained_correction_artifact(
+            current,
+            target_path=f"sections[{index}].paragraphs[0].text",
+            before_text=f"before {index}",
+            after_text=f"after {index}",
+            after_sha256=hashlib.sha256(f"body {index}".encode()).hexdigest(),
+            index=index,
+        )
+        chain.append(current)
+    harness.artifacts.items.extend(chain)
+
+    async with harness.uow_factory() as uow:
+        proof_at_limit = await resolve_title_correction_proof(uow, current)
+
+    assert proof_at_limit is not None
+    overflow = _chained_correction_artifact(
+        current,
+        target_path="sections[15].paragraphs[0].text",
+        before_text="before overflow",
+        after_text="after overflow",
+        after_sha256=hashlib.sha256(b"overflow body").hexdigest(),
+        index=15,
+    )
+    harness.artifacts.items.append(overflow)
+    async with harness.uow_factory() as uow:
+        proof_over_limit = await resolve_title_correction_proof(uow, overflow)
+
+    assert proof_over_limit is None
+
+
+def test_unchanged_title_keeps_the_existing_match_behavior() -> None:
+    harness = make_opinion_harness()
+    document = publication_document_from_json(json.loads(harness.base_bytes))
+    assert isinstance(document, PublicationDocumentV5)
+    synthesis_artifact = next(
+        item for item in harness.artifacts.items if item.stage is ProductionArtifactStage.SYNTHESIS
+    )
+    assert synthesis_artifact.canonical_blob_id is not None
+    synthesis = production_synthesis_from_json(
+        json.loads(harness.store.blobs[synthesis_artifact.canonical_blob_id])
+    )
+
+    assert synthesis.title == document.title
+    assert publication_title_matches_synthesis(None, document, synthesis)
 
 
 @pytest.mark.asyncio
