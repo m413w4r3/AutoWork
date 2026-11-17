@@ -50,7 +50,10 @@ SECRET_VARS = {
 }
 DOC_HEAD = re.compile(r'#doc-head\(\[(?P<title>.*?)\],\s*"(?P<number>\d+)"', re.DOTALL)
 TAIL_PAGE = """
-#set page(margin: (top: 2.3cm, bottom: 2.3cm, left: 2.2cm, right: 2.2cm), flipped: true, width: 8.27in, height: 23.39in)
+#set page(
+  margin: (top: 2.3cm, bottom: 2.3cm, left: 2.2cm, right: 2.2cm),
+  flipped: true, width: 8.27in, height: 23.39in,
+)
 
 #align(center)[
   #text(size: 20pt, weight: "extrabold", fill: purple)[{title}]
