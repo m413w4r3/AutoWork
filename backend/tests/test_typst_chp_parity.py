@@ -2143,8 +2143,8 @@ def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_navigabl
     assert render_data["title"] in pdf_text
     assert "BROUILLON NON APPROUVÉ" in normalized_text
     assert re.search(r"(?m)^\s*Chronologie\s*$", pdf_text) is not None
-    assert "ANNEXES CSV DU DOSSIER DE LIVRAISON" in normalized_text
-    assert "LES INDICATEURS DE COMPROMISSION DE CET AVIS" in normalized_text
+    assert "ANNEXES CSV DU DOSSIER DE LIVRAISON" not in normalized_text
+    assert "LES INDICATEURS DE COMPROMISSION DE CET AVIS" not in normalized_text
     assert "ORIGINAL.EXAMPLE" not in normalized_text
     assert "CONTEXTUAL.EXAMPLE" not in normalized_text
     for removed_label in (
