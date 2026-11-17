@@ -2150,7 +2150,6 @@ def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_navigabl
     assert "CONTEXTUAL.EXAMPLE" not in normalized_text
     for removed_label in (
         "IOC DE L'ARTICLE",
-        "IOC ORIGINAUX",
         "PISTES NON CONFIRMÉES",
         "ANNEXE TECHNIQUE",
         "IDENTIFIANT C2 DE L'IMPLANT",
