@@ -60,6 +60,7 @@ D2_MAX_STDIN_BYTES = 256 * 1024
 D2_PROCESS_LOCALE = "C.UTF-8"
 D2_EXIT_POLL_SECONDS = 0.01
 D2_EXIT_REAP_TIMEOUT_SECONDS = 5.0
+_SEQUENCE_GROUP_PREFIX = re.compile(r"^\[([a-z])\](?:\s+|$)")
 _VERSION_CACHE_LOCK = threading.Lock()
 _VERSION_CACHE_BINARY: str | None = None
 _VERSION_CACHE_RUNNER: D2ProcessRunner | None = None
@@ -387,7 +388,9 @@ def _edge_renderings(diagram: DiagramSpecV1) -> tuple[_D2EdgeRendering, ...]:
 
 def encode_d2_source(diagram: DiagramSpecV1) -> bytes:
     """Encode the canonical graph using only synthetic D2 identifiers."""
-    if _uses_dense_protocol_sequence_shape(diagram):
+    if _uses_grouped_protocol_sequence_shape(diagram) or _uses_dense_protocol_sequence_shape(
+        diagram
+    ):
         return _encode_dense_protocol_sequence(diagram)
 
     node_references = _node_references(diagram)
@@ -559,14 +562,54 @@ def _uses_dense_protocol_sequence_shape(diagram: DiagramSpecV1) -> bool:
     )
 
 
+def _uses_grouped_protocol_sequence_shape(diagram: DiagramSpecV1) -> bool:
+    return (
+        diagram.profile is DiagramProfile.PROTOCOL_SEQUENCE
+        and bool(diagram.edges)
+        and all(node.role is DiagramNodeRole.PROTOCOL_PARTICIPANT for node in diagram.nodes)
+        and all(
+            edge.direction is DiagramRelationDirection.DIRECTED
+            and edge.relation_type is not DiagramRelationType.COMPARISON
+            for edge in diagram.edges
+        )
+        and any(
+            _SEQUENCE_GROUP_PREFIX.match(edge.label or "") is not None for edge in diagram.edges
+        )
+    )
+
+
 def _encode_dense_protocol_sequence(diagram: DiagramSpecV1) -> bytes:
     """Encode ordered dense protocol messages with D2's native lifeline shape."""
     node_references = _node_references(diagram)
-    panel_size = (len(diagram.edges) + 1) // 2
+    grouped = _uses_grouped_protocol_sequence_shape(diagram)
+    if grouped:
+        grouped_edges: dict[str, list[DiagramEdgeV1]] = {}
+        ungrouped_edges: list[DiagramEdgeV1] = []
+        for edge in diagram.edges:
+            match = _SEQUENCE_GROUP_PREFIX.match(edge.label or "")
+            if match is None:
+                ungrouped_edges.append(edge)
+            else:
+                grouped_edges.setdefault(match.group(1), []).append(edge)
+        panels = [
+            (f"Groupe [{group}]", tuple(grouped_edges[group])) for group in sorted(grouped_edges)
+        ]
+        if ungrouped_edges:
+            panels.append(("Hors groupes", tuple(ungrouped_edges)))
+    else:
+        panel_size = (len(diagram.edges) + 1) // 2
+        panels = [
+            (
+                f"Messages {start + 1:02d}\u2013{start + len(panel_edges):02d}",
+                tuple(panel_edges),
+            )
+            for start in range(0, len(diagram.edges), panel_size)
+            if (panel_edges := diagram.edges[start : start + panel_size])
+        ]
     lines = [
         "protocol_view: {",
         '  label: ""',
-        "  grid-columns: 2",
+        f"  grid-columns: {3 if grouped and len(panels) > 4 else min(2, len(panels))}",
         "  style: {",
         '    fill: "#FFFFFF"',
         '    stroke: "#FFFFFF"',
@@ -574,14 +617,11 @@ def _encode_dense_protocol_sequence(diagram: DiagramSpecV1) -> bytes:
         "    stroke-width: 0",
         "  }",
     ]
-    for panel_index, start in enumerate(range(0, len(diagram.edges), panel_size), 1):
-        panel_edges = diagram.edges[start : start + panel_size]
-        first_number = start + 1
-        last_number = start + len(panel_edges)
+    for panel_index, (panel_title, panel_edges) in enumerate(panels, 1):
         lines.extend(
             (
                 f"  panel{panel_index:02d}: {{",
-                f'    label: "Messages {first_number:02d}\u2013{last_number:02d}"',
+                f"    label: {_escape_d2_label(panel_title)}",
                 "    shape: sequence_diagram",
             )
         )
@@ -590,10 +630,13 @@ def _encode_dense_protocol_sequence(diagram: DiagramSpecV1) -> bytes:
             label = _wrap_d2_label(node.label, width=28, wrap_long_tokens=True)
             lines.append(f"    {reference}: {_escape_d2_label(label)}")
         for edge in panel_edges:
+            edge_label = edge.label or ""
+            if grouped:
+                edge_label = _SEQUENCE_GROUP_PREFIX.sub("", edge_label, count=1)
             line = (
                 f"    {node_references[edge.source_node_id]} -> "
                 f"{node_references[edge.target_node_id]}: "
-                f"{_escape_d2_label(_wrap_d2_label(edge.label or '', width=32))}"
+                f"{_escape_d2_label(_wrap_d2_label(edge_label, width=32))}"
             )
             color = (
                 _PROTOCOL_STATUS_COLORS["INFERRED"][0]
@@ -606,7 +649,7 @@ def _encode_dense_protocol_sequence(diagram: DiagramSpecV1) -> bytes:
                     "      style: {",
                     f'        stroke: "{color}"',
                     f'        font-color: "{_EDGE_COLOR}"',
-                    "        font-size: 16",
+                    f"        font-size: {20 if grouped else 16}",
                     "        italic: false",
                     "        stroke-width: 1",
                     *(

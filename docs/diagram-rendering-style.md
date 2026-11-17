@@ -21,6 +21,15 @@ wrapped more tightly as graphs grow. The corpus layout check measures at least
 8 pt node text and 7 pt relation labels after fitting. Captions are centered
 and italic below the diagram.
 
+Sequence views whose message labels start with a lowercase group tag such as
+`[a]` render one independent lifeline panel per group. Messages retain their
+model order inside each panel and have no global sequence numbers; the caption
+states that messages are handler-derived and their order was not observed.
+Untagged messages share a `Hors groupes` panel. When no message has a group tag,
+the existing numbered sequence panels remain in use. Typst keeps a grouped
+sequence and its caption together on one page, fitting the SVG within the
+82%-height limit.
+
 Publication tables use an 8 pt sans-serif face, a muted blue-grey header
 (`#5D7374`) with white bold labels, fine grey borders, white body rows, and no
 row striping. This matches the IOC tables in the reference bulletin. The style
@@ -31,7 +40,8 @@ unchanged.
 
 - `D2_COMPILER_VERSION` remains pinned to the installed D2 executable. Visual
   source or SVG changes increment `DIAGRAM_COMPILATION_POLICY_VERSION`, now
-  `diagram-d2-svg-v11-m21-opinion-render`.
+  `diagram-d2-svg-v16-m21-grouped-protocol-sequences`. Protocol diagram
+  projections also pin `protocol-diagram-projection-v11-m21-independent-sequence-groups`.
 - Publication Typst changes increment both `PUBLICATION_RENDERER_VERSION` and
   `PUBLICATION_RENDER_POLICY_VERSION`. The template bundle SHA is also part of
   the publication render input hash.

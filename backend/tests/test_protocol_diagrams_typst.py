@@ -786,6 +786,24 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     )
     model = replace(model, messages=messages, fields=fields, states=states, transitions=transitions)
     result = render_protocol_model(model)
+    original_model_sha256 = result.model_sha256
+    sequence_group_by_order = {
+        **dict.fromkeys((1, 2, 3, 4), "a"),
+        **dict.fromkeys((5, 6, 7, 8), "b"),
+        **dict.fromkeys((9, 10, 11, 12), "c"),
+        **dict.fromkeys((13, 14, 15, 16), "d"),
+    }
+    sequence_with_groups = replace(
+        result.diagrams[0],
+        edges=tuple(
+            replace(edge, label=f"[{sequence_group_by_order[edge.order]}] {edge.label}")
+            if edge.order in sequence_group_by_order
+            else edge
+            for edge in result.diagrams[0].edges
+        ),
+    )
+    result = replace(result, diagrams=(sequence_with_groups, *result.diagrams[1:]))
+    assert result.model_sha256 == original_model_sha256 == model.canonical_sha256
     assert len(result.diagrams) == 3
     sequence = result.diagrams[0]
     assert sequence.status is ProtocolDiagramStatus.READY
@@ -799,9 +817,9 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     )
     assert len(sequence.edges) == 16
     assert tuple(edge.order for edge in sequence.edges) == tuple(range(1, 17))
-    assert sequence.edges[0].label == "WS/TLS"
-    assert sequence.edges[1].label == "[LAL_P] Profil"
-    assert sequence.edges[2].label == "[PING] Sonde"
+    assert sequence.edges[0].label == "[a] WS/TLS"
+    assert sequence.edges[1].label == "[a] [LAL_P] Profil"
+    assert sequence.edges[2].label == "[a] [PING] Sonde"
     assert all(
         edge.validation_status is ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED
         and edge.evidence_level is ProtocolEvidenceLevelV1.ARTICLE_DOCUMENTED
@@ -838,9 +856,21 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     assert len(projected_sequence.nodes) == 2
     assert len(projected_sequence.edges) == 16
     assert sequence_source.count(" -> ") == 16
-    assert "#1 WS/TLS" in sequence_source
-    assert "#2 [LAL_P] Profil" in sequence_source
-    assert "#3 [PING] Sonde" in sequence_source
+    assert sequence_source.count("shape: sequence_diagram") == 4
+    assert all(
+        title in sequence_source
+        for title in (
+            'label: "Groupe [a]"',
+            'label: "Groupe [b]"',
+            'label: "Groupe [c]"',
+            'label: "Groupe [d]"',
+        )
+    )
+    assert re.search(r'(?m)^\s+n\d+ -> n\d+: "#\d+', sequence_source) is None
+    assert "#1 WS/TLS" not in sequence_source
+    assert "[a] WS/TLS" not in sequence_source
+    assert "WS/TLS" in sequence_source
+    assert "[LAL_P] Profil" in sequence_source
     assert "(sans jeton) 01" not in sequence_source
     assert "documented-message" not in sequence_source
 
@@ -892,10 +922,16 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     assert {item.kind for item in figures} == set(ProtocolDiagramKind)
     sequence_figure = next(item for item in figures if item.kind is ProtocolDiagramKind.SEQUENCE)
     assert "Messages sans sens établi, non représentés par une flèche" in sequence_figure.caption
+    assert (
+        "Messages déduits des handlers ; ordre non observé ; les groupes sont indépendants."
+        in sequence_figure.caption
+    )
     sequence_svg = await media_store.read(sequence_figure.asset_id)
+    sequence_svg_text = " ".join(ET.fromstring(sequence_svg).itertext())
+    assert all(f"Groupe [{group}]" in sequence_svg_text for group in ("a", "b", "c", "d"))
     view_box = re.search(rb'viewBox="[-0-9.]+ [-0-9.]+ ([0-9.]+) ([0-9.]+)"', sequence_svg)
     assert view_box is not None
-    # The dense sequence is split into two native D2 lifeline panels to fit the page.
+    # Four independent groups use four native D2 lifeline panels.
     assert float(view_box.group(1)) / float(view_box.group(2)) >= 0.45
     assert sequence_svg.count(b"<text") >= 17
     for figure in figures:
@@ -1040,6 +1076,15 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     process_result = _run_blocking_process(("pdftotext", str(pdf_path), "-"), 30)
     extracted_text = process_result.stdout.decode("utf-8", errors="replace")
     extracted_text = " ".join(extracted_text.split()).casefold().replace("\u2019", "'")
+    assert all(
+        title.casefold() in extracted_text
+        for title in ("Groupe [a]", "Groupe [b]", "Groupe [c]", "Groupe [d]")
+    )
+    assert (
+        "messages déduits des handlers ; ordre non observé ; les groupes sont indépendants"
+        in extracted_text
+    )
+    assert "17 message 17" in extracted_text
     assert "note de l'analyste" in extracted_text
     assert "1.1 apports de l'analyse" in extracted_text
     assert extracted_text.count("article_documented") == 0
@@ -1065,7 +1110,8 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
         caption=(
             "Séquence du protocole\n"
             "Niveau de preuve : ARTICLE_DOCUMENTED — documenté, non observé. "
-            "Aucun flux ni trame observés; offsets et valeurs d'octets inconnus."
+            "Aucun flux ni trame observés; offsets et valeurs d'octets inconnus. "
+            "Messages déduits des handlers ; ordre non observé ; les groupes sont indépendants."
         ),
         compiler_policy_version=(
             "diagram-d2-svg-v9-m21-opinion-render+protocol-diagram-projection-v4-m21-opinion-render"
@@ -1229,6 +1275,25 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
         assert "documenté, non observé" in figure_page.casefold()
         assert "observation étayée" in figure_page.casefold()
         preview_figure_page = next(page for page in preview_pages if title in page)
+        if figure_number == 1:
+            assert all(
+                panel.casefold() in figure_page.casefold()
+                for panel in (
+                    "Groupe [a]",
+                    "Groupe [b]",
+                    "Groupe [c]",
+                    "Groupe [d]",
+                )
+            )
+            assert all(
+                panel.casefold() in preview_figure_page.casefold()
+                for panel in (
+                    "Groupe [a]",
+                    "Groupe [b]",
+                    "Groupe [c]",
+                    "Groupe [d]",
+                )
+            )
         assert f"Figure {figure_number} :" in preview_figure_page
         assert "documenté, non observé" in preview_figure_page.casefold()
         assert "offsets et valeurs d'octets inconnus" in preview_figure_page.casefold()
@@ -1254,11 +1319,16 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
                 )
             )
         }
+        sequence_page_lines = [
+            lines
+            for lines in figure_lines.values()
+            if any("Séquence réseau du protocole" in text for text, _size in lines)
+        ]
         sequence_sizes = [
             size
-            for lines in figure_lines.values()
+            for lines in sequence_page_lines
             for text, size in lines
-            if re.match(r"^#\d+ Message \d{2}$", text)
+            if re.fullmatch(r"Message \d{2}", text)
         ]
         state_sizes = [
             size

@@ -442,7 +442,7 @@ def test_d2_tool_lock_matches_compiler_version() -> None:
 
 def test_diagram_compilation_policy_version_was_incremented() -> None:
     assert DIAGRAM_COMPILATION_POLICY_VERSION == (
-        "diagram-d2-svg-v15-m21-protocol-state-self-loops"
+        "diagram-d2-svg-v16-m21-grouped-protocol-sequences"
     )
 
 

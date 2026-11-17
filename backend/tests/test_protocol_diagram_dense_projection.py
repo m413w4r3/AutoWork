@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 
 from cti_app.application.protocol_diagram_projection import (
     PROTOCOL_DIAGRAM_PROJECTION_VERSION,
@@ -189,6 +190,72 @@ def test_dense_sequence_keeps_all_messages_as_short_numbered_arrows() -> None:
     short_source = encode_d2_source(short_diagram).decode()
     assert "shape: sequence_diagram" in short_source
     assert short_source.count(" -> ") == 17
+    assert 'label: "Messages 01\u201309"' in short_source
+    assert 'label: "Messages 10\u201317"' in short_source
+    assert 'label: "Groupe [' not in short_source
+    assert "#1 [PING] keepalive" in short_source
+
+
+def test_sequence_grouping_sorts_panels_and_preserves_model_order_without_numbers() -> None:
+    spec = _sequence_spec(long_labels=False)
+    labels = (
+        "[b] B-2",
+        "[a] A-2",
+        "[b] B-1",
+        "[a] A-1",
+        "[c] C-1",
+        "[d] D-1",
+        "Outside",
+    )
+    spec = replace(
+        spec,
+        edges=tuple(
+            replace(edge, label=label)
+            for edge, label in zip(spec.edges[: len(labels)], labels, strict=True)
+        ),
+    )
+
+    diagram = project_protocol_diagram(spec)
+    source = encode_d2_source(diagram).decode()
+    panel_titles = (
+        'label: "Groupe [a]"',
+        'label: "Groupe [b]"',
+        'label: "Groupe [c]"',
+        'label: "Groupe [d]"',
+        'label: "Hors groupes"',
+    )
+    assert source.count("shape: sequence_diagram") == 5
+    assert "grid-columns: 3" in source
+    assert all(title in source for title in panel_titles)
+    assert tuple(source.index(title) for title in panel_titles) == tuple(
+        sorted(source.index(title) for title in panel_titles)
+    )
+    group_a = source.split(panel_titles[0], 1)[1].split("panel02:", 1)[0]
+    group_b = source.split(panel_titles[1], 1)[1].split("panel03:", 1)[0]
+    hors_group = source.split(panel_titles[4], 1)[1]
+    assert group_a.index('"A 2"') < group_a.index('"A 1"')
+    assert group_b.index('"B 2"') < group_b.index('"B 1"')
+    assert '"Outside"' in hors_group
+    assert "[a] A-2" not in source
+    assert "[b] B-2" not in source
+    assert re.search(r'(?m)^\s+n\d+ -> n\d+: "#\d+', source) is None
+    assert 'label: "Messages ' not in source
+    assert source.count("font-size: 20") == len(labels)
+    assert "Messages déduits des handlers ; ordre non observé ; les groupes sont indépendants." in (
+        diagram.caption or ""
+    )
+
+
+def test_sequence_without_group_prefix_keeps_legacy_numbered_layout() -> None:
+    spec = _sequence_spec(long_labels=False)
+    diagram = project_protocol_diagram(spec)
+    source = encode_d2_source(diagram).decode()
+
+    assert 'label: "Messages 01\u201309"' in source
+    assert 'label: "Messages 10\u201317"' in source
+    assert 'label: "Groupe [' not in source
+    assert "#1 [PING] keepalive" in source
+    assert "Messages déduits des handlers" not in (diagram.caption or "")
 
 
 def test_dense_state_machine_keeps_seventeen_transitions_between_nine_states() -> None:
@@ -249,4 +316,7 @@ def test_dense_message_format_compacts_twenty_two_fields_for_a_two_column_grid()
 
 
 def test_dense_projection_version_is_pinned_to_the_new_layout() -> None:
-    assert PROTOCOL_DIAGRAM_PROJECTION_VERSION == "protocol-diagram-projection-v10-m21-state-notes"
+    assert (
+        PROTOCOL_DIAGRAM_PROJECTION_VERSION
+        == "protocol-diagram-projection-v11-m21-independent-sequence-groups"
+    )

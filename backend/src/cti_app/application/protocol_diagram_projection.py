@@ -48,7 +48,9 @@ from cti_app.domain.protocol_model import (
     ProtocolValidationStatus,
 )
 
-PROTOCOL_DIAGRAM_PROJECTION_VERSION = "protocol-diagram-projection-v10-m21-state-notes"
+PROTOCOL_DIAGRAM_PROJECTION_VERSION = (
+    "protocol-diagram-projection-v11-m21-independent-sequence-groups"
+)
 PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION = (
     f"{DIAGRAM_COMPILATION_POLICY_VERSION}+{PROTOCOL_DIAGRAM_PROJECTION_VERSION}"
 )
@@ -68,6 +70,7 @@ _REFERENCE_TAIL = re.compile(
     r"\s*[·;,:—-]?\s*(?:sources?|observations?|findings?|evidence)\b.*$",
     re.IGNORECASE,
 )
+_SEQUENCE_GROUP_PREFIX = re.compile(r"^\[([a-z])\](?:\s+|$)")
 _DOCUMENTED_MARKERS = (
     "documented, not observed",
     "documenté, non observé",
@@ -140,10 +143,11 @@ def project_protocol_diagram(spec: ProtocolDiagramSpecV1) -> DiagramSpecV1:
             )
         )
     elif spec.kind is ProtocolDiagramKind.SEQUENCE:
-        if len(spec.edges) > 8:
+        grouped_sequence = _has_sequence_group_prefix(spec)
+        if len(spec.edges) > 8 or grouped_sequence:
             nodes.extend(_project_participant(node, dense=True) for node in spec.nodes)
             edges.extend(
-                _project_dense_message(edge, index)
+                _project_dense_message(edge, index, include_order=not grouped_sequence)
                 for index, edge in enumerate(_ordered_edges(spec.edges), 1)
             )
         else:
@@ -225,6 +229,10 @@ def protocol_diagram_caption(spec: ProtocolDiagramSpecV1) -> str:
         limit_line = "Trames et offsets omis du dessin; les éléments non établis restent inconnus."
         if limitations:
             limit_line += " " + " ".join(limitations[:1])
+    if spec.kind is ProtocolDiagramKind.SEQUENCE and _has_sequence_group_prefix(spec):
+        limit_line += (
+            " Messages déduits des handlers ; ordre non observé ; les groupes sont indépendants."
+        )
     proof_levels = _protocol_spec_evidence_levels(spec)
     if ProtocolEvidenceLevelV1.ARTICLE_DOCUMENTED in proof_levels:
         other_levels = tuple(
@@ -557,9 +565,17 @@ def _project_message(edge: ProtocolDiagramEdgeV1) -> DiagramEdgeV1:
     )
 
 
-def _project_dense_message(edge: ProtocolDiagramEdgeV1, index: int) -> DiagramEdgeV1:
-    order = edge.order if edge.order is not None else index
-    label = _compact_dense_label(f"#{order} {_clean_display_text(edge.label, limit=None)}")
+def _project_dense_message(
+    edge: ProtocolDiagramEdgeV1,
+    index: int,
+    *,
+    include_order: bool = True,
+) -> DiagramEdgeV1:
+    text = _clean_display_text(edge.label, limit=None)
+    if include_order:
+        order = edge.order if edge.order is not None else index
+        text = f"#{order} {text}"
+    label = _compact_dense_label(text)
     return DiagramEdgeV1(
         source_node_id=edge.source_id,
         target_node_id=edge.target_id,
@@ -567,6 +583,12 @@ def _project_dense_message(edge: ProtocolDiagramEdgeV1, index: int) -> DiagramEd
         evidence_refs=(),
         direction=DiagramRelationDirection.DIRECTED,
         relation_type=_protocol_edge_relation(edge),
+    )
+
+
+def _has_sequence_group_prefix(spec: ProtocolDiagramSpecV1) -> bool:
+    return spec.kind is ProtocolDiagramKind.SEQUENCE and any(
+        _SEQUENCE_GROUP_PREFIX.match(edge.label) is not None for edge in spec.edges
     )
 
 
