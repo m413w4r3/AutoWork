@@ -141,6 +141,7 @@ if TYPE_CHECKING:
         EditionCompositionRepository,
     )
     from cti_app.application.edition_review import EditionReviewReadRepository
+    from cti_app.application.editorial_workspace.registry import WorkspaceSnapshotRecord
 
 
 class BlobRepository(Protocol):
@@ -155,6 +156,20 @@ class BlobRepository(Protocol):
     async def count_references(self, blob_id: UUID) -> int: ...
 
     async def delete(self, blob_id: UUID) -> None: ...
+
+
+class EditorialWorkspaceSnapshotRepository(Protocol):
+    async def get_by_pin(
+        self, production_run_id: UUID, workspace_pin_hash: str
+    ) -> WorkspaceSnapshotRecord | None: ...
+
+    async def get_by_id(self, snapshot_id: UUID) -> WorkspaceSnapshotRecord | None: ...
+
+    async def latest_for_run(self, production_run_id: UUID) -> WorkspaceSnapshotRecord | None: ...
+
+    async def append_if_absent(
+        self, record: WorkspaceSnapshotRecord
+    ) -> WorkspaceSnapshotRecord: ...
 
 
 class MediaAssetRepository(Protocol):
@@ -948,6 +963,7 @@ class UnitOfWork(Protocol):
     # Defined further down in this module.
     production_runs: ProductionRunRepository
     production_routing_decisions: ProductionRoutingDecisionRepository
+    editorial_workspace_snapshots: EditorialWorkspaceSnapshotRepository
     production_input_snapshots: ProductionInputSnapshotRepository
     production_artifacts: ProductionArtifactRepository
     production_source_additions: ProductionSourceAdditionRepository

@@ -42,6 +42,7 @@ from cti_app.application.persistence import (
     EditionReleaseRepository,
     EditionRenderRepository,
     EditionRepository,
+    EditorialWorkspaceSnapshotRepository,
     GoodwareBaselineRepository,
     HumanDecisionRepository,
     IndicatorRepository,
@@ -146,6 +147,9 @@ from cti_app.infrastructure.database.repositories.editions import (
     SqlAlchemyEditionRepository,
 )
 from cti_app.infrastructure.database.repositories.editorial import SqlAlchemyHumanDecisionRepository
+from cti_app.infrastructure.database.repositories.editorial_workspace import (
+    SqlAlchemyEditorialWorkspaceSnapshotRepository,
+)
 from cti_app.infrastructure.database.repositories.invariants import (
     SqlAlchemyInvariantRepository,
 )
@@ -282,6 +286,7 @@ class SqlAlchemyUnitOfWork:
     investigation_states: InvestigationStateRepository
     production_runs: ProductionRunRepository
     production_routing_decisions: ProductionRoutingDecisionRepository
+    editorial_workspace_snapshots: EditorialWorkspaceSnapshotRepository
     production_input_snapshots: ProductionInputSnapshotRepository
     production_artifacts: ProductionArtifactRepository
     production_source_additions: ProductionSourceAdditionRepository
@@ -380,6 +385,9 @@ class SqlAlchemyUnitOfWork:
         self.investigation_states = SqlAlchemyInvestigationStateRepository(self._session)
         self.production_runs = SqlAlchemyProductionRunRepository(self._session)
         self.production_routing_decisions = SqlAlchemyProductionRoutingDecisionRepository(
+            self._session
+        )
+        self.editorial_workspace_snapshots = SqlAlchemyEditorialWorkspaceSnapshotRepository(
             self._session
         )
         self.production_input_snapshots = SqlAlchemyProductionInputSnapshotRepository(self._session)

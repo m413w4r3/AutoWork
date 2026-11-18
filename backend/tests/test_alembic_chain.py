@@ -18,6 +18,7 @@ EXPECTED_CHAIN = (
     "0008b_version_length",
     "0009_acquisition_strategy_attempts",
     "0010_acquisition_provenance",
+    "0011_editorial_workspace_snapshots",
 )
 
 
@@ -28,10 +29,11 @@ def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
     revision_ids = [script.revision for script in revisions]
 
     assert scripts.get_heads() == [scripts.get_current_head()]
-    assert scripts.get_current_head() == "0010_acquisition_provenance"
+    assert scripts.get_current_head() == "0011_editorial_workspace_snapshots"
     assert all(revision_id for revision_id in revision_ids)
     assert {revision_id for revision_id in revision_ids if len(revision_id) > 32} == {
-        "0009_acquisition_strategy_attempts"
+        "0009_acquisition_strategy_attempts",
+        "0011_editorial_workspace_snapshots",
     }
     assert len(revision_ids) == len(set(revision_ids)), "duplicate Alembic revision IDs"
     assert set(revision_ids) == set(EXPECTED_CHAIN)
@@ -47,4 +49,5 @@ def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
         "0008b_version_length": "0008_production_routing",
         "0009_acquisition_strategy_attempts": "0008b_version_length",
         "0010_acquisition_provenance": "0009_acquisition_strategy_attempts",
+        "0011_editorial_workspace_snapshots": "0010_acquisition_provenance",
     }

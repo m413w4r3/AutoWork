@@ -104,6 +104,7 @@ def test_schema_uses_a_frozen_baseline_and_additive_c2_revision() -> None:
         "0008b_alembic_version_length.py",
         "0009_acquisition_strategy_attempts.py",
         "0010_acquisition_provenance.py",
+        "0011_editorial_workspace.py",
     ]
 
 

@@ -65,6 +65,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     edition_publication,
     editions,
     editorial,
+    editorial_workspace,
     external_effects,
     invariants,
     investigation,
@@ -87,8 +88,8 @@ def _head_revision() -> str:
 
     The rest of this module compares the full migrated schema against
     ``Base.metadata`` plus explicitly migration-owned additive constraints.
-    The current head includes acquisition provenance through
-    ``0010_acquisition_provenance``.
+    The current head adds editorial workspace snapshots after acquisition
+    provenance at ``0010_acquisition_provenance``.
     """
     from alembic.script import ScriptDirectory
 
@@ -240,6 +241,14 @@ EXPECTED_TRIGGERS: dict[tuple[str, str], str] = {
         "production_routing_decisions",
         "trg_production_routing_decisions_append_only",
     ): "reject_evidence_mutation",
+    (
+        "editorial_workspace_snapshots",
+        "trg_editorial_workspace_snapshots_append_only",
+    ): "reject_editorial_workspace_snapshot_mutation",
+    (
+        "editorial_workspace_snapshots",
+        "trg_editorial_workspace_snapshots_no_truncate",
+    ): "reject_editorial_workspace_snapshot_mutation",
     ("subjects", "trg_subjects_prevent_tlp_downgrade"): "prevent_tlp_downgrade",
     ("source_documents", "trg_source_documents_prevent_tlp_downgrade"): "prevent_tlp_downgrade",
     ("samples", "trg_samples_prevent_tlp_downgrade"): "prevent_tlp_downgrade",
@@ -1126,7 +1135,7 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     command.upgrade(config, "head")
     command.current(config)
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert _head_revision() == "0010_acquisition_provenance"
+    assert _head_revision() == "0011_editorial_workspace_snapshots"
     assert asyncio.run(_alembic_version_column_length(temporary_postgres_url)) == 64
 
     collection_attempt_columns = asyncio.run(
@@ -1237,7 +1246,7 @@ def test_frozen_collection_attempt_baseline_precedes_acquisition_additions(
 
     command.upgrade(config, "head")
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert _head_revision() == "0010_acquisition_provenance"
+    assert _head_revision() == "0011_editorial_workspace_snapshots"
     final_schema = asyncio.run(_database_snapshot(temporary_postgres_url))["collection_attempts"]
     table = Base.metadata.tables["collection_attempts"]
     assert final_schema["columns"] == _expected_columns(table)
@@ -1453,6 +1462,7 @@ def test_migration_up_and_down_on_temporary_postgres(temporary_postgres_url: str
             "sample_acquisition_dispatch_attempts",
             "effect_acquisition_dispatch_links",
             "production_routing_decisions",
+            "editorial_workspace_snapshots",
         }
     )
     at_0004 = asyncio.run(_database_snapshot(temporary_postgres_url))

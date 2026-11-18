@@ -14,6 +14,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     edition_render,
     editions,
     editorial,
+    editorial_workspace,
     external_effects,
     invariants,
     investigation,
@@ -62,6 +63,7 @@ _OSINT_ENVELOPE_COLUMNS = frozenset(
 )
 _SAMPLE_ACQUISITION_DISPATCH_COLUMNS = frozenset({"dispatch_attempt_id"})
 _ROUTING_DECISION_TABLES = frozenset({"production_routing_decisions"})
+_EDITORIAL_WORKSPACE_TABLES = frozenset({"editorial_workspace_snapshots"})
 _ROUTING_RUN_COLUMNS = frozenset({"routing_decision_id"})
 _COLLECTION_ATTEMPT_ADDITIONS = frozenset(
     {
@@ -103,6 +105,7 @@ def _metadata_for_frozen_baseline() -> MetaData:
             source_table.name in _OSINT_POLICY_TABLES
             or source_table.name in _EXTERNAL_EFFECT_TABLES
             or source_table.name in _ROUTING_DECISION_TABLES
+            or source_table.name in _EDITORIAL_WORKSPACE_TABLES
         ):
             continue
         table = source_table.to_metadata(metadata)

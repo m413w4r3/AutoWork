@@ -18,6 +18,7 @@ from cti_app.api.discovery import router as discovery_router
 from cti_app.api.discovery_merge import merge_runs_router
 from cti_app.api.discovery_recovery import router as discovery_recovery_router
 from cti_app.api.editions import router as editions_router
+from cti_app.api.editorial_workspace import router as editorial_workspace_router
 from cti_app.api.fusion import fusion_router
 from cti_app.api.health import router as health_router
 from cti_app.api.investigation import router as investigation_router
@@ -782,6 +783,7 @@ def create_app() -> FastAPI:
     application.include_router(typst_input_inspection_router)
     application.include_router(selection_router)
     application.include_router(subjects_router)
+    application.include_router(editorial_workspace_router)
     application.include_router(subject_content_router)
     application.include_router(detection_router)
     application.include_router(analyst_opinion_router)
