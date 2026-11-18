@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Diagnostic d’architecture — atelier éditorial AutoWork</title>
+<style>
+:root{color-scheme:light;--ink:#17211f;--muted:#52615c;--paper:#f6f5ef;--card:#fff;--line:#d5ddd7;--green:#176b54;--green-pale:#e7f2ec;--amber:#925a11;--amber-pale:#fbf0dc;--red:#a13d37;--red-pale:#f9eae7;--blue:#315b79;--blue-pale:#eaf1f6}
+*{box-sizing:border-box}
+body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.56 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:1180px;margin:auto;padding:36px 28px 70px}
+h1,h2,h3,h4{line-height:1.18;margin:0 0 12px}
+h1{font:clamp(2rem,4vw,3.4rem)/1.05 Georgia,serif;max-width:900px}
+h2{font:2rem Georgia,serif;margin-top:8px}
+h3{font-size:1.15rem}
+h4{font-size:.97rem}
+p{margin:7px 0}
+a{color:inherit}
+code,.mono{font: .88em/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}
+header{padding:28px 0 30px;border-bottom:1px solid var(--line)}
+.kicker,.eyebrow{color:var(--green);font-size:.75rem;font-weight:800;letter-spacing:.13em;text-transform:uppercase}
+.deck{max-width:850px;color:var(--muted);font-size:1.08rem}
+.meta,.tags{display:flex;gap:9px;flex-wrap:wrap;margin:18px 0}
+.pill,.tag{display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:999px;padding:4px 10px;background:#fff;font-size:.77rem;font-weight:700}
+.pill.green,.tag.direct{color:#155c48;background:var(--green-pale);border-color:#b9d5c8}
+.tag.deferred{color:#82500d;background:var(--amber-pale);border-color:#e8d2a9}
+.tag.optional{color:#4e5c68;background:#edf0f2;border-color:#d4dbe0}
+section{margin:38px 0}
+.intro{max-width:950px;color:var(--muted)}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+.card,.file-card,.candidate,.question{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px}
+.card h3{margin-bottom:7px}
+.card p,.file-card p,.candidate p{color:#33433e}
+.vocab{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:16px}
+.vocab div{padding:13px;border-left:3px solid var(--green);background:#fff}
+.vocab b{display:block}
+.small{font-size:.88rem;color:var(--muted)}
+.table-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:12px;background:#fff}
+table{border-collapse:collapse;width:100%;min-width:760px;font-size:.88rem}
+th,td{padding:9px 11px;text-align:left;vertical-align:top;border-bottom:1px solid #e8ece8}
+th{background:#edf2ee;font-size:.75rem;text-transform:uppercase;letter-spacing:.06em}
+tbody tr:last-child td{border-bottom:0}
+.file-card{margin:13px 0}
+.file-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}
+.file-head .measure{font-weight:750;color:var(--green);white-space:nowrap}
+.file-path{font-size:.88rem;color:var(--muted);margin:0 0 8px}
+.facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.fact{background:#f8f9f7;border-radius:9px;padding:10px 12px}
+.fact strong{display:block;font-size:.78rem;text-transform:uppercase;letter-spacing:.045em;color:#42534c}
+.fact p{margin:5px 0 0;font-size:.9rem}
+.fact.delete{background:#f3f4f1}
+.evidence{color:var(--blue);font-size:.86rem}
+.candidate{margin:13px 0;border-left:5px solid var(--green)}
+.candidate.deferred-card{border-left-color:#bf8a32}
+.candidate h3{display:flex;gap:9px;align-items:center;flex-wrap:wrap}
+.rank{color:var(--green);font-size:.75rem;text-transform:uppercase;letter-spacing:.08em;font-weight:800}
+.diagram-pair{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:16px 0}
+.diagram{padding:10px;background:#fbfcfa;border:1px solid var(--line);border-radius:12px}
+.diagram h4{margin:5px 8px 10px}
+svg{display:block;width:100%;height:auto}
+svg text{font-family:system-ui,sans-serif;fill:#20302a}
+svg .node{fill:#fff;stroke:#8ea49a;stroke-width:1.5}
+svg .deep-node{fill:#17352e;stroke:#17352e;stroke-width:2}
+svg .deep-label{fill:#fff}
+svg .soft-node{fill:#f1f5f1;stroke:#9eb2a7;stroke-width:1.4}
+svg .legacy-node{fill:#fff7e8;stroke:#bd914c;stroke-width:1.4}
+svg .edge{stroke:#547366;stroke-width:2;fill:none;marker-end:url(#arrow-head)}
+svg .leak-edge{stroke:#ae5146;stroke-width:2;fill:none;stroke-dasharray:5 4;marker-end:url(#arrow-red-head)}
+svg .flowline{stroke:#176b54;stroke-width:2.4;fill:none;marker-end:url(#arrow-head)}
+svg .label{font-size:11px}
+svg .tiny{font-size:9px;fill:#52615c}
+svg .title{font-size:12px;font-weight:750}
+.flow-note{border-left:3px solid var(--green);padding:10px 13px;background:#eef5f0;color:#31443b}
+.criteria{counter-reset:item;list-style:none;padding:0}
+.criteria li{counter-increment:item;margin:9px 0;padding:11px 12px 11px 44px;position:relative;background:#fff;border:1px solid var(--line);border-radius:9px}
+.criteria li:before{content:counter(item);position:absolute;left:12px;top:10px;color:#fff;background:var(--green);border-radius:50%;width:23px;height:23px;text-align:center;font-size:.8rem;font-weight:800}
+.questions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
+.question{padding:12px 14px;font-weight:650}
+footer{border-top:1px solid var(--line);padding-top:18px;color:var(--muted);font-size:.86rem}
+@media(max-width:760px){main{padding:22px 15px 50px}.grid,.vocab,.facts,.diagram-pair,.questions{grid-template-columns:1fr}.file-head .measure{white-space:normal}}
+@media print{body{background:#fff}main{max-width:none;padding:10mm}.card,.file-card,.candidate,.diagram{break-inside:avoid}}
+svg.svg-defs{position:absolute;width:0;height:0;overflow:hidden}
+</style>
+</head>
+<body>
+<svg class="svg-defs" aria-hidden="true"><defs><marker id="arrow-head" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#547366"/></marker><marker id="arrow-red-head" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#ae5146"/></marker></defs></svg>
+<main>
+<header>
+<p class="kicker">AutoWork · atelier éditorial · M0-DIAG</p>
+<h1>Identité éditoriale, proposition et projection</h1>
+<p class="deck">Diagnostic statique et cible d’architecture. Le code et les décisions M0 sont examinés sans refactor. La cible ci-dessous reprend D1–D4; elle recommande des coutures et des critères de vérification, sans arbitrer le comportement produit.</p>
+<div class="meta">
+<span class="pill green">Base 067f1d9c33084cc370c59e6b51e885e668dfdfab</span>
+<span class="pill">18 novembre 2026</span>
+<span class="pill">8 fichiers · 16 966 lignes mesurées</span>
+<span class="pill">lecture seule · aucun test lancé</span>
+</div>
+<p class="small">État de départ observé : <code>paseo.json</code> était déjà supprimé dans le worktree; ce diagnostic ne l’a pas touché. Aucun réseau, fournisseur, répertoire secret ou état runtime n’a été consulté.</p>
+</header>
+
+<section id="method">
+<p class="eyebrow">Méthode et vocabulaire</p>
+<h2>Mesurer les coutures, pas noter les lignes</h2>
+<p class="intro">CodeGraph était présent et a servi avant les recherches textuelles. Les audits M0-A/B/C, les AGENTS.md, docs/README.md, ADR-0006/0008/0009 et DECISIONS.md ont cadré la lecture. Le nombre de lignes et le motif grep sont des mesures de surface; ils ne mesurent pas la profondeur.</p>
+<div class="vocab">
+<div><b>Module</b><span class="small">Tout ensemble avec une interface et une implémentation.</span></div>
+<div><b>Interface</b><span class="small">Tout ce que l’appelant doit connaître : types, invariants, ordre, erreurs, configuration et coût.</span></div>
+<div><b>Seam</b><span class="small">Emplacement de l’interface où le comportement peut changer sans modifier l’appelant.</span></div>
+<div><b>Depth</b><span class="small">Capacité exercée par unité d’interface. Le module profond cache beaucoup de comportement derrière une interface étroite.</span></div>
+<div><b>Leverage</b><span class="small">Gain des appelants : une implémentation utile à plusieurs usages et tests.</span></div>
+<div><b>Locality</b><span class="small">Gain des mainteneurs : changement, diagnostic et vérification concentrés au même endroit.</span></div>
+</div>
+<p class="flow-note"><strong>Test de suppression.</strong> Pour chaque module, le rapport imagine sa suppression et demande si la complexité disparaît ou réapparaît chez les appelants. Ces résultats sont des contrefactuels raisonnés, pas des suppressions réellement exécutées. « Shallow » décrit une interface presque aussi complexe que l’implémentation; un gros fichier n’est pas automatiquement shallow.</p>
+</section>
+
+<section id="measurements">
+<p class="eyebrow">Avant · mesures</p>
+<h2>Surface observée</h2>
+<p class="intro">Commandes exécutées : <code>wc -l</code> et <code>grep -Ec '^(async )?def |^class |^    (async )?def |^export function |^function |^const [A-Za-z_$][A-Za-z0-9_$]* ?='</code>. La dernière colonne est le nombre de lignes correspondant à ce motif, pas un décompte de fonctions métier.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Module examiné</th><th>Lignes wc -l</th><th>grep -Ec</th><th>Classe de dépendance dominante</th></tr></thead>
+<tbody>
+<tr><td><code>frontend/src/components/ProductionArtifactView.tsx</code></td><td>2 361</td><td>48</td><td>React + TanStack Query + lecture de production</td></tr>
+<tr><td><code>frontend/src/components/TargetedEditorialRevisionPanel.tsx</code></td><td>624</td><td>5</td><td>React/Query + appels de révision et d’acquisition source</td></tr>
+<tr><td><code>backend/src/cti_app/application/production_synthesis_revision.py</code></td><td>3 961</td><td>72</td><td>calcul pur + UoW + ModelGateway + persistance</td></tr>
+<tr><td><code>backend/src/cti_app/application/production_enrichment_revision.py</code></td><td>3 092</td><td>46</td><td>fences/UoW + EvidencePolicy + ModelGateway + rendu</td></tr>
+<tr><td><code>backend/src/cti_app/application/publication_builder.py</code></td><td>1 432</td><td>33</td><td>projection canonique en processus</td></tr>
+<tr><td><code>backend/src/cti_app/application/publication_assembly.py</code></td><td>594</td><td>8</td><td>BlobStore + repository/UoW + assemblage</td></tr>
+<tr><td><code>backend/src/cti_app/application/typst_rendering.py</code></td><td>4 618</td><td>107</td><td>projection en processus + média/rendu Typst</td></tr>
+<tr><td><code>backend/src/cti_app/application/subject_content.py</code></td><td>284</td><td>16</td><td>read model + artifact reader + dépôts</td></tr>
+</tbody>
+</table>
+</div>
+<p class="small">Le seuil de revue pour les fichiers est un signal de localisation et de charge cognitive, pas une formule de profondeur. Les déclarations sont comptées par le motif ci-dessus, reproductible sur la base indiquée.</p>
+</section>
+
+<section id="before">
+<p class="eyebrow">Avant · diagnostic par élément du périmètre</p>
+<h2>Responsabilités, dépendances et test de suppression</h2>
+
+<article class="file-card">
+<div class="file-head"><div><h3>Vue de lecture multi-stage</h3><p class="file-path"><code>frontend/src/components/ProductionArtifactView.tsx</code></p></div><span class="measure">2 361 lignes · 48 correspondances grep</span></div>
+<div class="facts">
+<div class="fact"><strong>Responsabilités mêlées</strong><p>Garde de schémas et unwrap V6/V7; affichage references/extraction/relevance/synthesis; document HTML avec provenance, tables, diagrammes et figures; requêtes, polling PDF et choix du stage. Repères : <span class="evidence">126–186, 294–368, 425–1018, 1141–1262, 1264–2034, 2052–2361.</span></p></div>
+<div class="fact"><strong>Shallow / dépendances</strong><p>Le module n’est pas shallow par manque de comportement; sa seam réunit beaucoup de vues. Imports React et TanStack plus fetchers et DTO de production : <span class="evidence">1–36</span>. Petit passe-plat local <code>EditorialEnrichmentPreview</code> : <span class="evidence">2036–2050</span>.</p></div>
+<div class="fact"><strong>Zone difficile à tester</strong><p>Le même module combine gardes privées et hooks de requête. Tester la sélection d’un stage ou les états de polling traverse React/Query; les tests connus sont au niveau du rendu appelant, pas d’une projection injectable. Entrée et hooks : <span class="evidence">2052–2197</span>.</p></div>
+<div class="fact delete"><strong>Test de suppression</strong><p>Supprimer ce module casse les six vues et le PDF; la logique se répandrait dans App ou les appelants. Garder la lecture, déplacer l’affichage par intention dans les modules de feature D4. Le petit passe-plat peut être absorbé sans perte de règle.</p></div>
+</div>
+</article>
+
+<article class="file-card">
+<div class="file-head"><div><h3>Révision ciblée existante</h3><p class="file-path"><code>frontend/src/components/TargetedEditorialRevisionPanel.tsx</code></p></div><span class="measure">624 lignes · 5 correspondances grep</span></div>
+<div class="facts">
+<div class="fact"><strong>Responsabilités mêlées</strong><p>État du formulaire et choix de cible; lecture lineage; soumission preview; acquisition et sélection d’une source; transfert des fences du preview vers apply; invalidation des queries et messages d’erreur. Repères : <span class="evidence">209–253, 254–314, 332–415.</span></p></div>
+<div class="fact"><strong>Shallow / dépendances</strong><p>Props courtes, comportement dense : le module n’est pas shallow au sens de la taille de son interface. Il prend cependant tout <code>ArtifactResponse</code> et orchestre plusieurs appels production depuis le rendu. Le catalogue de cibles vient du serveur; le client ne refait pas la recherche du paragraphe.</p></div>
+<div class="fact"><strong>Zone difficile à tester</strong><p>Les mutations ferment sur state React et QueryClient; tester le protocole preview→apply demande React Testing Library et un QueryClientProvider. Acquisition source chaîne record→select→acquire : <span class="evidence">259–278</span>; apply et invalidations : <span class="evidence">280–314</span>.</p></div>
+<div class="fact delete"><strong>Test de suppression</strong><p>Supprimer l’écran retire l’UX de révision actuellement utilisée; les séquences d’appel doivent être remplacées, pas recopiées dans la vue de document. D4 recommande une feature frontend typée; cette vue peut rester transitoire.</p></div>
+</div>
+</article>
+
+<article class="file-card">
+<div class="file-head"><div><h3>Révision de la synthèse</h3><p class="file-path"><code>backend/src/cti_app/application/production_synthesis_revision.py</code></p></div><span class="measure">3 961 lignes · 72 correspondances grep</span></div>
+<div class="facts">
+<div class="fact"><strong>Responsabilités mêlées</strong><p>Hash et catalogue de cibles; résolution; parsing du patch et support des affirmations; contexte/ModelRun; fences et CAS; lineage/provenance; rebase d’enrichissement; assemblage et rendu. Repères : <span class="evidence">278–745, 767–1898, 1901–2409, 2996–3597, 3598–3883.</span></p></div>
+<div class="fact"><strong>Shallow / dépendances</strong><p>La profondeur existe, mais la locality est faible : fonctions pures et orchestration persistante partagent le même module. L’interface de construction prend plusieurs modules et un adaptateur optionnel : <span class="evidence">1904–1921</span>; le flux accède aussi à l’UoW via l’objet synthèse.</p></div>
+<div class="fact"><strong>Zone difficile à tester</strong><p>Le parseur/resolveur est testable sans modèle; preview/revise mélange lecture canonique, ModelGateway, fencing, store et UoW. La seam utile est aujourd’hui traversée par une grande orchestration. La délégation vers la révision enrichment est visible : <span class="evidence">1923–1937, 2183–2195.</span></p></div>
+<div class="fact delete"><strong>Test de suppression</strong><p>Le comportement ne disparaît pas : catalogage, validation, adoption directe et invalidation se disperseraient chez les appelants. Garder une façade de compatibilité et transférer les règles aux modules D1/D2, sans changer les versions canoniques en place.</p></div>
+</div>
+</article>
+
+<article class="file-card">
+<div class="file-head"><div><h3>Révision de l’enrichissement</h3><p class="file-path"><code>backend/src/cti_app/application/production_enrichment_revision.py</code></p></div><span class="measure">3 092 lignes · 46 correspondances grep</span></div>
+<div class="facts">
+<div class="fact"><strong>Responsabilités mêlées</strong><p>Fences sur evidence et inventaire; restauration des blocs stale; appel et validation de révision; patch d’un élément, provenance et CAS; lineage; assemblage et rendu. Repères : <span class="evidence">211–497, 636–1243, 1321–2090, 2117–2825, 2972–3064.</span></p></div>
+<div class="fact"><strong>Shallow / dépendances</strong><p>Le module n’est pas un passe-plat : il porte des invariants de preuve et d’archives. La règle de placement section est répétée ici et projetée en Typst. Un petit wrapper <code>_render_stable_synthesis</code> ne fait qu’appeler l’autre module : <span class="evidence">2744–2747</span>; la suppression de ce wrapper déplace un appel, pas une règle.</p></div>
+<div class="fact"><strong>Zone difficile à tester</strong><p>Validation liée aux repositories, EvidencePack, inventaire archivé et ModelGateway; le helper de placement recalcule un hash de section via le module synthesis : <span class="evidence">2750–2789</span>. Test d’acceptation à travers une interface mémoire encore absent du modèle courant.</p></div>
+<div class="fact delete"><strong>Test de suppression</strong><p>Supprimer le module perd fences, refus de révision et validation des figures; la complexité reviendrait chez les appelants. Conserver ces règles; retirer les passes-plat pendant l’extraction des coutures, pas comme lot autonome.</p></div>
+</div>
+</article>
+
+<article class="file-card">
+<div class="file-head"><div><h3>Projection vers le document de publication</h3><p class="file-path"><code>backend/src/cti_app/application/publication_builder.py</code></p></div><span class="measure">1 432 lignes · 33 correspondances grep</span></div>
+<div class="facts">
+<div class="fact"><strong>Responsabilités mêlées</strong><p>Validation lineage/enrichment; projection narrative et références de preuve; IOC; tables, diagrammes, figures, références; annotation sémantique; enveloppes V4/V5. Projection pure visible : <span class="evidence">136–220</span>; constructeurs : <span class="evidence">1279–1432</span>.</p></div>
+<div class="fact"><strong>Shallow / dépendances</strong><p>Module profond en processus : il transforme plusieurs entrées canoniques en document typé sans fournisseur. L’interface de construction reste large; garder la projection de contenu distincte de l’adoption et de l’assemblage persistant.</p></div>
+<div class="fact"><strong>Zone difficile à tester</strong><p>La projection de contenu est le seam de test le plus net de cette chaîne; les invariants d’évidence/lineage demandent des fixtures de domaine, pas React ou ModelGateway. La validation et la construction partagent encore un même gros fichier.</p></div>
+<div class="fact delete"><strong>Test de suppression</strong><p>Non : le contenu canonique ne serait plus construit. Son calcul migrerait vers l’assemblage ou ses appelants. Préserver ce module et isoler l’ajout de nouveaux champs de placement à un point de projection explicite.</p></div>
+</div>
+</article>
+
+<article class="file-card">
+<div class="file-head"><div><h3>Assemblage et persistance</h3><p class="file-path"><code>backend/src/cti_app/application/publication_assembly.py</code></p></div><span class="measure">594 lignes · 8 correspondances grep</span></div>
+<div class="facts">
+<div class="fact"><strong>Responsabilités mêlées</strong><p>Vérification des entrées; hash/idempotence et réemploi; rafraîchissement média; enveloppes V6/V7/V8; écriture artifact. Entrée : <span class="evidence">79–154</span>; hash et écriture : <span class="evidence">296–350, 461–594</span>.</p></div>
+<div class="fact"><strong>Shallow / dépendances</strong><p>Un point d’entrée public ne suffit pas à le qualifier de shallow : il cache une opération de persistance substantielle. Il combine artifact store, repository et UoW, ce qui est un seam local-substitutable si les adaptateurs de test sont conservés.</p></div>
+<div class="fact"><strong>Zone difficile à tester</strong><p>Les cas de réemploi et d’identité V8 traversent persistence et projection. La règle d’adoption D2 ne doit pas être cachée ici : l’assemblage est un effet ultérieur après commit, tandis que l’acceptation doit écrire une outbox atomiquement.</p></div>
+<div class="fact delete"><strong>Test de suppression</strong><p>Non : l’idempotence, les wrappers et l’écriture se déplaceraient dans les deux modules de révision et le générateur. Garder ce module comme propriétaire de l’assemblage, sans en faire un second écrivain d’adoption.</p></div>
+</div>
+</article>
+
+<article class="file-card">
+<div class="file-head"><div><h3>Projection document → Typst</h3><p class="file-path"><code>backend/src/cti_app/application/typst_rendering.py</code></p></div><span class="measure">4 618 lignes · 107 correspondances grep</span></div>
+<div class="facts">
+<div class="fact"><strong>Responsabilités mêlées</strong><p>Unwrap de documents; projection texte/IOC/opinion; cibles de rendu et médias; placement des blocs enrichis; assemblage du modèle Typst. Place actuelle indexée par kind + section : <span class="evidence">2540–2653, 2785–2850</span>; projection document : <span class="evidence">2133–2240, 2382–2460, 3826–3838.</span></p></div>
+<div class="fact"><strong>Shallow / dépendances</strong><p>La projection porte une logique réelle mais partage un fichier avec des outils d’affichage, de normalisation et de préparation Typst. L’instrumentation de cibles est mutable et enregistre les blocs non mappés : <span class="evidence">2292–2379</span>.</p></div>
+<div class="fact"><strong>Zone difficile à tester</strong><p>Les règles de placement peuvent être vérifiées sur le modèle rendu sans compiler; le rendu PDF réel exige Typst et fonts. Les tests existants séparent projection et compilation, mais une modification de layout ne doit pas forcer à déplacer les invariants de placement.</p></div>
+<div class="fact delete"><strong>Test de suppression</strong><p>Non : la production du modèle de rendu/PDF serait perdue, puis recopiée dans les renderers d’article et d’édition. Extraire la projection éditoriale si elle gagne une interface stable; garder Typst comme adaptateur de rendu.</p></div>
+</div>
+</article>
+
+<article class="file-card">
+<div class="file-head"><div><h3>Lecture sujet et unwrap canonique</h3><p class="file-path"><code>backend/src/cti_app/application/subject_content.py</code></p></div><span class="measure">284 lignes · 16 correspondances grep</span></div>
+<div class="facts">
+<div class="fact"><strong>Responsabilités mêlées</strong><p>Projection contenu, publication courante, indicateurs et métadonnées d’assets; unwrap d’enveloppes de publication pour le read model. Les opérations sont distinctes mais liées au même contrat de lecture : <span class="evidence">35–85, 123–235</span>.</p></div>
+<div class="fact"><strong>Shallow / dépendances</strong><p>Le <code>ArtifactPayloadReader</code> donne une seam injectée : <span class="evidence">35–37</span>. Le module est assez petit et n’appelle pas de fournisseur; ne pas le scinder par taille seule. L’audit M0-A signale que le chemin /content perd le kind au cours de l’unwrap.</p></div>
+<div class="fact"><strong>Zone difficile à tester</strong><p>Un adaptateur mémoire du lecteur et des dépôts suffit à tester le read model. La difficulté est la cohérence : l’unwrap du sujet et celui du renderer ne doivent pas diverger sur V6/V7/V8 et <code>publication_kind</code>.</p></div>
+<div class="fact delete"><strong>Test de suppression</strong><p>Non : les routes et clients devraient connaître les versions canoniques et refaire l’unwrap. Garder le read model, mais recommander une projection typée commune qui préserve explicitement kind et compatibilité legacy.</p></div>
+</div>
+</article>
+</section>
+
+<section id="current-flow">
+<p class="eyebrow">Avant · dépendances et flux de données</p>
+<h2>La cible existe, mais son identité et ses projections sont réparties</h2>
+<div class="diagram-pair">
+<div class="diagram">
+<h4>Dépendances observées</h4>
+<svg viewBox="0 0 540 325" role="img" aria-label="Graphe des dépendances actuelles de l’atelier">
+<rect class="node" x="15" y="18" width="175" height="49" rx="7"/><text class="title" x="102" y="38" text-anchor="middle">ProductionArtifactView</text><text class="tiny" x="102" y="54" text-anchor="middle">6 stages + lecture + polling</text>
+<rect class="node" x="345" y="18" width="175" height="49" rx="7"/><text class="title" x="432" y="38" text-anchor="middle">RevisionPanel</text><text class="tiny" x="432" y="54" text-anchor="middle">form + mutations + fences</text>
+<path class="edge" d="M190 43 H341"/><text class="tiny" x="265" y="35" text-anchor="middle">monte le panneau</text>
+<rect class="soft-node" x="15" y="103" width="190" height="54" rx="7"/><text class="title" x="110" y="124" text-anchor="middle">synthesis_revision</text><text class="tiny" x="110" y="142" text-anchor="middle">cibles + patch + ModelRun</text>
+<rect class="soft-node" x="270" y="103" width="205" height="54" rx="7"/><text class="title" x="372" y="124" text-anchor="middle">enrichment_revision</text><text class="tiny" x="372" y="142" text-anchor="middle">fences + patch + archives</text>
+<path class="edge" d="M432 68 C432 88 150 82 110 99"/><path class="edge" d="M432 68 C432 84 390 85 374 99"/>
+<path class="leak-edge" d="M205 130 H266"/><text class="tiny" x="235" y="121" text-anchor="middle">délégation + helpers partagés</text>
+<rect class="soft-node" x="15" y="198" width="180" height="52" rx="7"/><text class="title" x="105" y="219" text-anchor="middle">publication_builder</text><text class="tiny" x="105" y="236" text-anchor="middle">contenu canonique</text>
+<rect class="soft-node" x="250" y="198" width="190" height="52" rx="7"/><text class="title" x="345" y="219" text-anchor="middle">publication_assembly</text><text class="tiny" x="345" y="236" text-anchor="middle">wrappers + idempotence + écriture</text>
+<path class="edge" d="M270 225 H200"/><path class="edge" d="M110 160 C110 178 235 178 300 194"/><path class="edge" d="M372 160 C372 176 350 180 347 194"/>
+<rect class="legacy-node" x="15" y="270" width="180" height="45" rx="7"/><text class="title" x="105" y="290" text-anchor="middle">subject_content</text><text class="tiny" x="105" y="305" text-anchor="middle">unwrap du read model</text>
+<rect class="legacy-node" x="250" y="270" width="190" height="45" rx="7"/><text class="title" x="345" y="290" text-anchor="middle">typst_rendering</text><text class="tiny" x="345" y="305" text-anchor="middle">unwrap + placement + render data</text>
+<path class="leak-edge" d="M345 252 V266"/><path class="leak-edge" d="M195 292 H246"/>
+<text class="tiny" x="460" y="214">rouge pointillé :</text><text class="tiny" x="460" y="229">règle qui fuit</text>
+</svg>
+</div>
+<div class="diagram">
+<h4>Flux de données actuel</h4>
+<svg viewBox="0 0 540 325" role="img" aria-label="Flux actuel des données de révision et de publication">
+<rect class="node" x="12" y="23" width="118" height="48" rx="7"/><text class="label" x="71" y="43" text-anchor="middle">artifact exact</text><text class="tiny" x="71" y="58" text-anchor="middle">+ revision_targets</text>
+<rect class="node" x="151" y="23" width="114" height="48" rx="7"/><text class="label" x="208" y="43" text-anchor="middle">target JSON</text><text class="tiny" x="208" y="58" text-anchor="middle">id = SHA cible</text>
+<rect class="node" x="286" y="23" width="105" height="48" rx="7"/><text class="label" x="338" y="43" text-anchor="middle">preview</text><text class="tiny" x="338" y="58" text-anchor="middle">fences/hash</text>
+<rect class="node" x="412" y="23" width="115" height="48" rx="7"/><text class="label" x="469" y="43" text-anchor="middle">revise direct</text><text class="tiny" x="469" y="58" text-anchor="middle">ModelRun + CAS</text>
+<path class="flowline" d="M130 47 H147"/><path class="flowline" d="M265 47 H282"/><path class="flowline" d="M391 47 H408"/>
+<rect class="soft-node" x="29" y="126" width="125" height="51" rx="7"/><text class="label" x="91" y="146" text-anchor="middle">canonical synthesis</text><text class="tiny" x="91" y="163" text-anchor="middle">blob versionné</text>
+<rect class="soft-node" x="206" y="126" width="135" height="51" rx="7"/><text class="label" x="273" y="146" text-anchor="middle">publication V5</text><text class="tiny" x="273" y="163" text-anchor="middle">builder</text>
+<rect class="soft-node" x="393" y="126" width="130" height="51" rx="7"/><text class="label" x="458" y="146" text-anchor="middle">V6/V7/V8</text><text class="tiny" x="458" y="163" text-anchor="middle">assembly wrappers</text>
+<path class="flowline" d="M469 73 C469 105 92 91 92 122"/><path class="flowline" d="M154 151 H202"/><path class="flowline" d="M341 151 H389"/>
+<rect class="legacy-node" x="29" y="229" width="145" height="50" rx="7"/><text class="label" x="101" y="249" text-anchor="middle">/content unwrap</text><text class="tiny" x="101" y="266" text-anchor="middle">kind doit survivre</text>
+<rect class="legacy-node" x="204" y="229" width="145" height="50" rx="7"/><text class="label" x="276" y="249" text-anchor="middle">Typst projection</text><text class="tiny" x="276" y="266" text-anchor="middle">placement (kind,index)</text>
+<rect class="node" x="379" y="229" width="145" height="50" rx="7"/><text class="label" x="451" y="249" text-anchor="middle">HTML / PDF</text><text class="tiny" x="451" y="266" text-anchor="middle">deux lectures dérivées</text>
+<path class="flowline" d="M458 179 C458 208 101 198 101 225"/><path class="flowline" d="M458 179 C458 207 276 200 276 225"/><path class="flowline" d="M174 254 H200"/><path class="flowline" d="M349 254 H375"/>
+<text class="tiny" x="18" y="307">Preview et révision sont actuellement suivies d’une écriture de version; la proposition humaine distincte de D2 n’existe pas encore.</text>
+</svg>
+</div>
+</div>
+<p class="small">Dépendance = flèche vers le module appelé. Flux = transformation des données. Les deux vues montrent les coutures actuelles; elles ne prétendent pas couvrir chaque chemin secondaire du dépôt.</p>
+</section>
+
+<section id="candidates">
+<p class="eyebrow">Classement · recommandations, pas décision produit</p>
+<h2>Candidats de deepening</h2>
+
+<article class="candidate">
+<h3><span class="rank">01 · priorité forte</span> Registre d’atelier et résolution unique des cibles <span class="tag direct">nécessaire M1 · D1</span></h3>
+<p><strong>Modules visés :</strong> <code>editorial_workspace</code> (registre append-only), puis <code>editorial_target_resolution</code>. Le snapshot épingle les IDs/versions/hash canoniques; la résolution prend l’intention et rend un bloc ou une ambiguïté. Garder l’ID legacy pour l’ancien chemin et son refus d’ambiguïté. Le nouveau chemin emploie un UUID serveur et <code>before_hash</code> comme fence; le registre ne stocke ni texte ni preuves.</p>
+<p><strong>Pourquoi :</strong> aujourd’hui les cibles synthesis proviennent du SHA du JSON cible et la résolution/hashes cohabitent avec la révision (<code>production_synthesis_revision.py:270–319, 550–745</code>); la révision enrichment recalcul la section (<code>production_enrichment_revision.py:2750–2789</code>); l’UI reçoit la cible déjà calculée. <strong>Gain :</strong> locality des IDs, leverage pour UI, threads et propositions; tests de résolution en processus, sans React ni fournisseur.</p>
+<p><strong>Test de suppression :</strong> supprimer le registre ne fait pas disparaître le besoin d’identité; le mapping se duplique dans API, révision et rendu. Le registre profond vaut son interface parce qu’il concentre bootstrap déterministe, ambiguïté et avance atomique.</p>
+</article>
+
+<article class="candidate">
+<h3><span class="rank">02 · priorité forte</span> Agrégat de proposition et écrivain unique d’adoption <span class="tag direct">nécessaire M2–M4 · D2</span></h3>
+<p><strong>Modules visés :</strong> <code>editorial_patch_validation</code>, <code>editorial_proposal_preparation</code>, <code>editorial_proposal_adoption</code>. Les façades de révision actuelles préparent puis écrivent directement; elles n’ont pas de cycle proposé/accepté et un seul écrivain d’adoption (<code>production_synthesis_revision.py:1923–2163, 2183–2233, 2881–2959</code>; <code>production_enrichment_revision.py:1321–2090</code>).</p>
+<p><strong>Recommandation :</strong> accepter un patch typé et immuable; validation reprend les fences, la politique et les preuves; adoption relit et re-hashe le blob exact, fait le CAS, écrit artifact + lineage + avance du registre + outbox d’impact dans une transaction, sans nouvel appel modèle. Les adaptateurs de repos/UoW et BlobStore ont une voie mémoire pour tester prepare→accept. Le choix de patch métier reste celui de DECISIONS.md.</p>
+<p><strong>Test de suppression :</strong> sans agrégat, les transitions et règles d’acceptation se répandent dans les routes et révisions; les anciens mécanismes de replay ne sont pas une proposition humaine persistante.</p>
+</article>
+
+<article class="candidate">
+<h3><span class="rank">03 · priorité forte</span> Séparer lineage, impact et projection <span class="tag direct">nécessaire M3–M7 · D2/D4</span></h3>
+<p><strong>Modules visés :</strong> <code>editorial_revision_lineage</code>, <code>editorial_revision_impact</code>, <code>editorial_proposal_projection</code> et une projection publication partagée. Après commit, l’outbox déclenche le rebase/invalidation puis assemble/rend; lecture d’état de proposition et read model publication restent des projections reconstructibles.</p>
+<p><strong>Pourquoi :</strong> lineage, rebase et render sont dans les deux fichiers de révision; builder, assembly, Typst et /content interprètent l’enrichissement ou les enveloppes à des endroits distincts (<code>publication_builder.py:156–220, 1279–1432</code>; <code>publication_assembly.py:95–154, 296–350</code>; <code>typst_rendering.py:2292–2379, 2382–2460, 2540–2653, 2827–2850</code>; <code>subject_content.py:123–170</code>).</p>
+<p><strong>Gain :</strong> un point de vérité pour les versions et le kind; un change layout ne redéfinit pas l’invariant canonique. <strong>Test de suppression :</strong> ces projections et invalidations ne disparaissent pas; sans module propriétaire, les appelants recréent chacun leur lecture.</p>
+</article>
+
+<article class="candidate deferred-card">
+<h3><span class="rank">04 · à planifier au lot dédié</span> Politique de placement par identité de bloc <span class="tag deferred">M5 différé · D1/D6</span></h3>
+<p><strong>Module visé :</strong> même résolution serveur contre le registre épinglé, puis projection de placement déterministe; ne pas ajouter un second mapping dans Typst ou le frontend. L’assemblage doit échouer stale avec diagnostic si l’ancre manque, sans repli fin de section. Ordre par position canonique puis <code>element_key</code>.</p>
+<p><strong>Pourquoi différer :</strong> le contrat actuel emploie after_lead/after_section/after_timeline/end et Typst place par section index (<code>production_enrichment_revision.py:2750–2789</code>; <code>typst_rendering.py:2540–2578, 2827–2850</code>). D1 prévoit <code>after_paragraph + anchor_block_id</code>; D6 place la montée de version et le placement M5 avant l’UI.</p>
+<p><strong>Test de suppression :</strong> retirer la politique retire l’ordre éditorial; la règle réapparaît dans builder, Typst et HTML. Garder l’exécution de rendu comme adapter de la projection.</p>
+</article>
+
+<article class="candidate deferred-card">
+<h3><span class="rank">05 · lot visuel ultérieur</span> Validation des figures archivées et galerie <span class="tag deferred">M6 différé · D5</span><span class="tag optional">hors socle M1–M4</span></h3>
+<p><strong>Modules visés :</strong> lecture de l’inventaire archivé, validation d’identité du blob et projection sécurisée de candidats; insertion multiple par patch typé, sans URL distante fournie au renderer. Le flux actuel a déjà SHA/MIME/taille et vérifie les archives; la galerie, les miniatures et l’API candidates ne sont pas l’interface de publication courante (<code>source_figure_inventory.py:946–1057</code>; M0-C §§1–2).</p>
+<p><strong>Recommandation :</strong> réutiliser ces validations et le store de médias; ne pas faire porter à <code>editorial_workspace</code> les octets d’image. Le plafond BRIEF de trois figures est une règle D5 déjà décidée; ne pas le déduire d’un cap d’inventaire. Les vérifications d’archive sont exigées par D5, mais le deepening de la galerie est différé par D6.</p>
+<p><strong>Test de suppression :</strong> retirer l’inventaire ne supprime pas le besoin de vérifier les bytes; la vérification se disperserait entre API et rendu. Ce candidat n’est pas bloquant pour les coutures M1–M4.</p>
+</article>
+</section>
+
+<section id="after">
+<p class="eyebrow">Après · cible alignée sur D1–D4</p>
+<h2>Un registre, une validation, une adoption; des projections en lecture</h2>
+<p class="intro">Carte de modules recommandée, conforme aux noms de DECISIONS.md. <code>application/editorial_workspace/</code> expose snapshot/resolve/advance et délègue la résolution unique à <code>editorial_target_resolution</code>. Le registre garde uniquement identité, pins, kind et transitions; les blobs canoniques restent la source du texte et des preuves.</p>
+<p class="small"><strong>Module map :</strong> <code>editorial_workspace</code> registry → <code>editorial_target_resolution</code> → <code>editorial_patch_validation</code> → <code>editorial_proposal_preparation</code> → <code>editorial_proposal_adoption</code> → <code>editorial_revision_lineage</code> + <code>editorial_revision_impact</code> → <code>editorial_proposal_projection</code> et <code>publication_projection</code>. Frontend : <code>features/editorial-workspace/</code> + <code>api/editorialWorkspace.ts</code>.</p>
+<div class="diagram-pair">
+<div class="diagram">
+<h4>Dépendances après deepening</h4>
+<svg viewBox="0 0 600 390" role="img" aria-label="Architecture cible de l’atelier éditorial, alignée sur D1 à D4">
+<rect class="node" x="8" y="20" width="150" height="45" rx="7"/><text class="title" x="83" y="39" text-anchor="middle">feature éditoriale</text><text class="tiny" x="83" y="54" text-anchor="middle">snapshot / blocs / brouillons</text>
+<rect class="node" x="185" y="20" width="135" height="45" rx="7"/><text class="title" x="252" y="39" text-anchor="middle">API typée dédiée</text><text class="tiny" x="252" y="54" text-anchor="middle">erreurs code → FR</text>
+<path class="edge" d="M158 42 H181"/>
+<rect class="deep-node" x="360" y="16" width="220" height="54" rx="8"/><text class="title deep-label" x="470" y="37" text-anchor="middle">EditorialWorkspace</text><text class="tiny deep-label" x="470" y="55" text-anchor="middle">snapshot · registry · resolve · advance</text>
+<path class="edge" d="M320 42 H356"/>
+<rect class="deep-node" x="12" y="113" width="172" height="57" rx="8"/><text class="title deep-label" x="98" y="136" text-anchor="middle">editorial_target_resolution</text><text class="tiny deep-label" x="98" y="153" text-anchor="middle">intent + snapshot → block_id</text>
+<rect class="deep-node" x="214" y="113" width="165" height="57" rx="8"/><text class="title deep-label" x="296" y="136" text-anchor="middle">editorial_patch_validation</text><text class="tiny deep-label" x="296" y="153" text-anchor="middle">fences + policy + preuves</text>
+<rect class="soft-node" x="410" y="113" width="170" height="57" rx="8"/><text class="title" x="495" y="136" text-anchor="middle">proposal_preparation</text><text class="tiny" x="495" y="153" text-anchor="middle">patch immuable + proposal</text>
+<path class="edge" d="M470 72 C470 93 98 88 98 109"/><path class="edge" d="M184 141 H210"/><path class="edge" d="M379 141 H406"/>
+<text class="tiny" x="16" y="96">BridgeDraft / ManualPatch</text>
+<path class="edge" d="M166 100 C230 91 380 91 445 109"/>
+<rect class="deep-node" x="183" y="212" width="224" height="62" rx="9"/><text class="title deep-label" x="295" y="237" text-anchor="middle">editorial_proposal_adoption</text><text class="tiny deep-label" x="295" y="256" text-anchor="middle">unique writer · UoW · CAS · no ModelGateway</text>
+<path class="edge" d="M495 171 C495 194 384 192 360 208"/>
+<rect class="soft-node" x="16" y="313" width="154" height="54" rx="7"/><text class="title" x="93" y="335" text-anchor="middle">revision_lineage</text><text class="tiny" x="93" y="352" text-anchor="middle">événements append-only</text>
+<rect class="soft-node" x="204" y="313" width="154" height="54" rx="7"/><text class="title" x="281" y="335" text-anchor="middle">revision_impact</text><text class="tiny" x="281" y="352" text-anchor="middle">worker idempotent post-commit</text>
+<rect class="soft-node" x="392" y="313" width="188" height="54" rx="7"/><text class="title" x="486" y="335" text-anchor="middle">proposal_projection</text><text class="tiny" x="486" y="352" text-anchor="middle">publication_projection → Typst</text>
+<path class="edge" d="M253 276 C220 292 120 291 98 309"/><path class="edge" d="M295 276 V309"/><path class="edge" d="M338 276 C372 291 456 293 482 309"/>
+<text class="tiny" x="394" y="291">impact seulement après commit</text>
+</svg>
+</div>
+<div class="diagram">
+<h4>Flux de données après deepening</h4>
+<svg viewBox="0 0 600 390" role="img" aria-label="Flux cible, de l’intention de bloc à l’impact de publication">
+<rect class="node" x="15" y="19" width="132" height="49" rx="7"/><text class="label" x="81" y="39" text-anchor="middle">snapshot exact</text><text class="tiny" x="81" y="55" text-anchor="middle">pins + publication_kind</text>
+<rect class="node" x="171" y="19" width="132" height="49" rx="7"/><text class="label" x="237" y="39" text-anchor="middle">block_id UUID</text><text class="tiny" x="237" y="55" text-anchor="middle">résolution serveur</text>
+<rect class="node" x="327" y="19" width="126" height="49" rx="7"/><text class="label" x="390" y="39" text-anchor="middle">typed patch</text><text class="tiny" x="390" y="55" text-anchor="middle">SHA + before_hash</text>
+<rect class="node" x="477" y="19" width="108" height="49" rx="7"/><text class="label" x="531" y="39" text-anchor="middle">proposed</text><text class="tiny" x="531" y="55" text-anchor="middle">immutable blob</text>
+<path class="flowline" d="M147 43 H167"/><path class="flowline" d="M303 43 H323"/><path class="flowline" d="M453 43 H473"/>
+<rect class="deep-node" x="154" y="113" width="284" height="67" rx="9"/><text class="title deep-label" x="296" y="140" text-anchor="middle">Décision humaine + fence recheck</text><text class="tiny deep-label" x="296" y="160" text-anchor="middle">lock proposal/run · rehash exact · CAS · idempotency</text>
+<path class="flowline" d="M531 69 C531 95 387 94 380 109"/>
+<rect class="soft-node" x="15" y="229" width="167" height="60" rx="7"/><text class="label" x="98" y="251" text-anchor="middle">une transaction</text><text class="tiny" x="98" y="270" text-anchor="middle">artifact + lineage + advance</text>
+<rect class="soft-node" x="213" y="229" width="167" height="60" rx="7"/><text class="label" x="296" y="251" text-anchor="middle">outbox impact</text><text class="tiny" x="296" y="270" text-anchor="middle">replayable, post-commit</text>
+<rect class="soft-node" x="411" y="229" width="174" height="60" rx="7"/><text class="label" x="498" y="251" text-anchor="middle">projection + preview</text><text class="tiny" x="498" y="270" text-anchor="middle">status stale/ready explicite</text>
+<path class="flowline" d="M243 181 C209 201 127 204 100 225"/><path class="flowline" d="M296 181 V225"/><path class="flowline" d="M349 181 C384 202 469 204 495 225"/>
+<rect class="legacy-node" x="48" y="329" width="498" height="40" rx="7"/><text class="label" x="297" y="354" text-anchor="middle">HTML, /content et Typst projettent les mêmes IDs/kind; aucune mutation du blob source</text>
+<path class="flowline" d="M98 291 C98 315 170 316 207 329"/><path class="flowline" d="M296 291 V325"/><path class="flowline" d="M498 291 C498 315 424 316 386 329"/>
+</svg>
+</div>
+</div>
+<p class="flow-note"><strong>Ordre transactionnel D2 :</strong> verrouiller la proposition et le run; recharger/re-hasher le patch; revalider fence, politique, preuves et révocations; CAS et écrire artifact + lineage + avance registre + outbox dans une transaction. Après commit, l’impact reconstruit/invalide enrichissement, publication et PDF. Aucun rappel du modèle et aucun repin implicite d’édition.</p>
+<p class="small">Le flux de publication conserve les artefacts versionnés et leur provenance. Le registre éditorial est une projection append-only d’identités et de transitions; il n’est pas promu en preuve canonique.</p>
+</section>
+
+<section id="m8">
+<p class="eyebrow">Rédiagnostic M8</p>
+<h2>Critères vérifiables</h2>
+<p class="intro">Les plafonds de lignes sont des seuils d’alerte proposés pour forcer une nouvelle lecture; ils ne remplacent pas le test de profondeur ni les contrats versionnés.</p>
+<ol class="criteria">
+<li><strong>Plafonds proposés :</strong> ProductionArtifactView ≤700 lignes; TargetedEditorialRevisionPanel ≤400; chaque ancienne façade de révision ≤900; typst_rendering ≤1 800 après extraction de la projection de publication.</li>
+<li><strong>Un propriétaire du mapping :</strong> exactement un module nouveau, <code>editorial_target_resolution</code> via le snapshot EditorialWorkspace; zéro recalcul de block_id dans UI, Typst ou assemblage. L’adaptateur legacy conserve son contrat et refuse les ambiguïtés.</li>
+<li><strong>Un écrivain :</strong> une seule implémentation d’adoption modifie la version canonique; acceptation sans ModelGateway; aucune transition terminale mutable; retries idempotents.</li>
+<li><strong>Fences :</strong> chaque adoption vérifie base artifact/version/input hash/canonical SHA/before_hash; cible manquante ou ambiguë produit stale/needs_review, jamais un fallback ordinal.</li>
+<li><strong>Test sans React ni fournisseur :</strong> prepare→accept/reject passe par l’interface applicative avec adaptateurs mémoire; le test d’acceptation ne monte aucun provider React/Query et ne contacte aucun ModelGateway.</li>
+<li><strong>Placement reproductible :</strong> un test passe sur ordre, missing-anchor stale, et coexistence d’éléments même ancre; aucune projection ne réimplémente le mapping.</li>
+<li><strong>Kind et archives :</strong> les lectures V4–V8 préservent publication_kind; aucun défaut ARTICLE silencieux. Pour D5, figure acceptée seulement si l’identité archive SHA/MIME/taille correspond au candidat et au sujet/run.</li>
+<li><strong>Layout sans invariants :</strong> un changement de layout frontend touche feature/views et tests de rendu, sans modifier migrations, règles d’identité, fences, hash canonique, politique de preuve ou tests de contrat backend.</li>
+<li><strong>Erreur localisée :</strong> chaque code stable exposé par l’application a une traduction française testée dans l’API typée de la feature; la vue ne recompose pas les erreurs.</li>
+</ol>
+</section>
+
+<section id="questions">
+<p class="eyebrow">Grille des reviewers</p>
+<h2>Huit questions à trancher en revue</h2>
+<div class="questions">
+<div class="question">1. Quelle interface est l’autorité finale de résolution du bloc : EditorialWorkspace, editorial_target_resolution, ou une responsabilité partagée avec règle explicite ?</div>
+<div class="question">2. Où vit la validation du patch typé, et comment garantit-elle les mêmes fences, preuves et révocations en préparation et en adoption ?</div>
+<div class="question">3. Quel module est l’unique écrivain d’adoption, et comment le verrou proposal/run, le CAS et l’idempotence couvrent-ils les courses ?</div>
+<div class="question">4. Quelle est l’unique politique de placement, et comment HTML et Typst consomment-ils le même résultat résolu ?</div>
+<div class="question">5. Quelles validations d’une figure archivée sont nécessaires avant affichage et adoption, et lesquelles restent propres au lot galerie D5 ?</div>
+<div class="question">6. À quelle seam les codes d’erreur stables deviennent-ils des messages français, avec quelles réponses sur refus, stale et needs_review ?</div>
+<div class="question">7. Peut-on tester une révision complète sans React/Query Provider ni fournisseur, avec uniquement adaptateurs mémoire ?</div>
+<div class="question">8. Peut-on changer la mise en page d’un bloc sans toucher aux IDs, hashes, fences, preuves, règles de placement et invariants d’adoption ?</div>
+</div>
+</section>
+
+<section id="top">
+<p class="eyebrow">Recommandation principale</p>
+<div class="card">
+<h3>Commencer par EditorialWorkspace et editorial_target_resolution</h3>
+<p>L’identité stable est la dépendance de D2 proposals, des fils D3, des brouillons D4 et du placement D1; D6 la place avant le reste. Cette couture réduit la logique de ciblage distribuée et donne une base testable au cycle d’adoption. Elle ne change ni les octets canoniques ni les règles produits déjà fixées par DECISIONS.md.</p>
+</div>
+</section>
+
+<footer>
+<p><strong>Limites et traçabilité.</strong> Faits marqués par les chemins et lignes du checkout à la base indiquée; recommandations dérivées de D1–D6 et ADR actifs. Aucun test n’a été lancé, aucun code n’a été refactoré, et aucun comportement en production n’est inféré d’un replay ou d’un audit statique.</p>
+<p>Rapport autonome : CSS et SVG inline, sans CDN, sans ressource externe et sans JavaScript.</p>
+</footer>
+</main>
+</body>
+</html>
+
