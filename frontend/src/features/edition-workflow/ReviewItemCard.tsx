@@ -328,6 +328,9 @@ export function ReviewItemCard({
 
       <div className="review-item-card__actions">
         <Link to={`/subjects/${item.subject_id}`}>Ouvrir</Link>
+        <Link to={`/subjects/${item.subject_id}/editor`}>
+          Ouvrir l’atelier éditorial
+        </Link>
         {!readOnly && isActive ? (
           <button
             className="button button--danger"

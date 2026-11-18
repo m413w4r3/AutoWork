@@ -1,7 +1,10 @@
+// Editorial E2E uses a port derived from its worktree path; EDITORIAL_E2E_PORT overrides it.
+// The server always starts with --strictPort and is never reused across runs.
+// Playwright baseURL and the Vite readiness URL share this computed origin.
 import { defineConfig, devices } from "@playwright/test";
 import { isIP } from "node:net";
 
-import { EDITORIAL_APP_ORIGIN } from "./e2e/editorial/fixtures/editorialApi";
+import { editorialPortForWorktree } from "./e2e/editorial/editorialOrigin";
 
 // real-backend-lite expects an operator-started PostgreSQL test backend with a fake provider.
 // The operator must attest no live provider keys are available to that backend.
@@ -9,10 +12,8 @@ import { EDITORIAL_APP_ORIGIN } from "./e2e/editorial/fixtures/editorialApi";
 // This config starts Vite only; backend bootstrapping belongs to a later ticket.
 const realBackendLite =
   process.env.EDITORIAL_PLAYWRIGHT_MODE === "real-backend-lite";
-const port = realBackendLite ? 4174 : 4173;
-const appOrigin = realBackendLite
-  ? `http://127.0.0.1:${port}`
-  : EDITORIAL_APP_ORIGIN;
+const port = editorialPortForWorktree(process.cwd());
+const appOrigin = `http://127.0.0.1:${port}`;
 const apiTarget =
   process.env.VITE_API_PROXY_TARGET ??
   `http://127.0.0.1:${process.env.WORKFLOW_BROWSER_API_PORT ?? "18765"}`;
@@ -49,7 +50,7 @@ export default defineConfig({
   webServer: {
     command: `corepack pnpm exec vite --host 127.0.0.1 --port ${port} --strictPort`,
     url: `${appOrigin}/editions`,
-    reuseExistingServer: !process.env.CI,
+    reuseExistingServer: false,
     ...(realBackendLite ? { env: { VITE_API_PROXY_TARGET: apiTarget } } : {}),
   },
 });

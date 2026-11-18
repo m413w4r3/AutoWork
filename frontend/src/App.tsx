@@ -1,6 +1,7 @@
 import { ProductionArtifactView } from "./components/ProductionArtifactView";
 import { SubjectWorkbench } from "./components/SubjectWorkbench";
 import type { EditionTool } from "./features/edition-tools/EditionWorkspace";
+import { EditorialWorkspacePage } from "./features/editorial-workspace/EditorialWorkspacePage";
 import { EditionCreatePage } from "./pages/EditionCreatePage";
 import { EditionDetailPage } from "./pages/EditionDetailPage";
 import { EditionListPage } from "./pages/EditionListPage";
@@ -12,6 +13,8 @@ export function App() {
   const detail = pathname.match(
     /^\/editions\/([^/]+)(?:\/(discovery|fusion|selection|production|composition|review|publication))?$/,
   );
+  const editorialWorkspace = pathname.match(/^\/subjects\/([^/]+)\/editor$/);
+  const editorialSubjectId = editorialWorkspace?.[1];
   const subject = pathname.match(/^\/subjects\/([^/]+)$/);
   const artifact = pathname.match(
     /^\/subjects\/([^/]+)\/production\/artifacts\/(references|extraction|relevance_projection|synthesis|publication)$/,
@@ -22,7 +25,12 @@ export function App() {
         <Link to="/editions">CTI Bulletin</Link>
         <span>Utilisateur local : dev-analyst</span>
       </header>
-      {artifact ? (
+      {editorialSubjectId !== undefined ? (
+        <EditorialWorkspacePage
+          key={editorialSubjectId}
+          subjectId={editorialSubjectId}
+        />
+      ) : artifact ? (
         <ProductionArtifactView
           subjectId={artifact[1]!}
           stage={

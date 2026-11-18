@@ -162,6 +162,9 @@ describe("SubjectWorkbench", () => {
         name: "Sujet canonique ExampleRAT",
       }),
     ).toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: "Ouvrir l’atelier éditorial" }),
+    ).toHaveAttribute("href", `/subjects/${subjectId}/editor`);
     expect(screen.getByText("TLP:AMBER")).toBeInTheDocument();
     expect(
       screen.getByRole("link", { name: "← Retour à l’édition" }),

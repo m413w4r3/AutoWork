@@ -57,6 +57,11 @@ export function SubjectWorkbench({ subjectId }: { subjectId: string }) {
           <p className="eyebrow">Sujet</p>
           <h1>{subject.title}</h1>
           <TlpBadge tlp={subject.tlp} />
+          <p>
+            <Link to={`/subjects/${subjectId}/editor`}>
+              Ouvrir l’atelier éditorial
+            </Link>
+          </p>
         </div>
       </div>
 

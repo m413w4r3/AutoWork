@@ -1,8 +1,9 @@
 import type { Page } from "@playwright/test";
 
 import type { Subject } from "../../../src/api/editions";
+import { editorialAppOrigin } from "../editorialOrigin";
 
-export const EDITORIAL_APP_ORIGIN = "http://127.0.0.1:4173";
+export const EDITORIAL_APP_ORIGIN = editorialAppOrigin();
 
 export const EDITORIAL_FIXTURES = {
   subject: {

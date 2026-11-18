@@ -190,8 +190,20 @@ it("uses backend groups, numbers, and anchors for mixed editions", async () => {
     within(articleGroup).getByRole("heading", { name: "Article 02" }),
   ).toBeInTheDocument();
   expect(
+    within(document.getElementById("article01") as HTMLElement).getByRole(
+      "link",
+      { name: "Ouvrir l’atelier éditorial" },
+    ),
+  ).toHaveAttribute("href", "/subjects/subject-article-1/editor");
+  expect(
     within(briefGroup).getByRole("heading", { name: "Brève 03" }),
   ).toBeInTheDocument();
+  expect(
+    within(document.getElementById("breve03") as HTMLElement).getByRole(
+      "link",
+      { name: "Ouvrir l’atelier éditorial" },
+    ),
+  ).toHaveAttribute("href", "/subjects/subject-brief/editor");
   expect(document.getElementById("article01")).toBeInTheDocument();
   expect(document.getElementById("article02")).toBeInTheDocument();
   expect(document.getElementById("breve03")).toBeInTheDocument();

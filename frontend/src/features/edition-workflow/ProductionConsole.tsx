@@ -271,6 +271,9 @@ function ProductionItem({
           {item.position}/{total}
         </span>
         <Link to={`/subjects/${item.subject_id}`}>{item.title}</Link>
+        <Link to={`/subjects/${item.subject_id}/editor`}>
+          Ouvrir l’atelier éditorial
+        </Link>
         <span
           className={`production-item__status is-${item.status}${
             isWaitingForDispatch ? " is-dispatch-pending" : ""

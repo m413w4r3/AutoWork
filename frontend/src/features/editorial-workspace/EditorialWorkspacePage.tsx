@@ -1,37 +1,111 @@
 import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 
+import { ApiError } from "../../api/editions";
 import { getEditorialWorkspaceSnapshot } from "../../api/editorialWorkspace";
-import { EditorialDocument } from "./EditorialDocument";
+import { Link } from "../../routing";
+import { EditorialWorkspaceLayout } from "./EditorialWorkspaceLayout";
+import "./editorialWorkspace.css";
 
 interface EditorialWorkspacePageProps {
   subjectId: string;
 }
+
+const editorialWorkspaceQueryKey = (subjectId: string) =>
+  ["editorial-workspace", subjectId] as const;
 
 export function EditorialWorkspacePage({
   subjectId,
 }: EditorialWorkspacePageProps) {
   const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null);
   const snapshotQuery = useQuery({
-    queryKey: ["editorial-workspace", subjectId],
+    queryKey: editorialWorkspaceQueryKey(subjectId),
     queryFn: () => getEditorialWorkspaceSnapshot(subjectId),
+    retry: false,
   });
 
   if (snapshotQuery.isPending) {
-    return <p role="status">Chargement de l’atelier éditorial…</p>;
+    return (
+      <section className="editorial-route-state" aria-busy="true">
+        <p role="status">Chargement de l’atelier éditorial…</p>
+      </section>
+    );
   }
+
   if (snapshotQuery.isError) {
-    return <p role="alert">{snapshotQuery.error.message}</p>;
+    const error = snapshotQuery.error;
+    const accessUnavailable =
+      error instanceof ApiError &&
+      (error.status === 403 || error.status === 404);
+    const staleSnapshot =
+      error instanceof ApiError && error.code === "editorial_snapshot_stale";
+
+    if (accessUnavailable) {
+      return (
+        <section
+          className="editorial-route-state"
+          aria-labelledby="editorial-route-error"
+        >
+          <h1 id="editorial-route-error">Atelier éditorial indisponible</h1>
+          <p role="alert" aria-label="Atelier éditorial indisponible">
+            Cet atelier n’est pas disponible.
+          </p>
+          <Link to="/editions">Retour aux éditions</Link>
+        </section>
+      );
+    }
+
+    return (
+      <section
+        className="editorial-route-state"
+        aria-labelledby="editorial-route-error"
+      >
+        <h1 id="editorial-route-error">Lecture de l’atelier impossible</h1>
+        <p role="alert">
+          {staleSnapshot
+            ? "Le document a changé. Rechargez l’atelier."
+            : "L’atelier éditorial n’a pas pu être chargé."}
+        </p>
+        <button
+          className="button button--secondary"
+          type="button"
+          onClick={() => void snapshotQuery.refetch()}
+        >
+          Actualiser
+        </button>
+        <Link to="/editions">Retour aux éditions</Link>
+      </section>
+    );
+  }
+
+  const snapshot = snapshotQuery.data;
+  if (snapshot.blocks.length === 0 && snapshot.enrichments.length === 0) {
+    return (
+      <section
+        className="editorial-route-state"
+        aria-labelledby="editorial-empty-heading"
+      >
+        <Link to={`/subjects/${subjectId}`}>← Retour au sujet</Link>
+        <h1 id="editorial-empty-heading">Atelier éditorial</h1>
+        <h2>Aucun contenu produit</h2>
+        <p>Aucun contenu n’est disponible pour cette version.</p>
+        {snapshot.publication_kind === null ? (
+          <p role="note">
+            Le type de publication est indéterminé. L’atelier reste en lecture
+            seule.
+          </p>
+        ) : null}
+      </section>
+    );
   }
 
   return (
-    <main>
-      <h1>Atelier éditorial</h1>
-      <EditorialDocument
-        snapshot={snapshotQuery.data}
-        selectedBlockId={selectedBlockId}
-        onSelectBlock={setSelectedBlockId}
-      />
-    </main>
+    <EditorialWorkspaceLayout
+      subjectId={subjectId}
+      snapshot={snapshot}
+      selectedBlockId={selectedBlockId}
+      onSelectBlock={setSelectedBlockId}
+      onRefresh={() => void snapshotQuery.refetch()}
+    />
   );
 }

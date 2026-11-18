@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -124,6 +124,36 @@ function status(
 afterEach(() => vi.unstubAllGlobals());
 
 describe("SubjectProduction retry from stage", () => {
+  it("place le lien de l’atelier près de l’aperçu publié", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url;
+      return Promise.resolve(
+        url.endsWith("/production/runs")
+          ? Response.json([])
+          : Response.json(status("ready", "assembly")),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderProduction();
+
+    const links = await screen.findByRole("navigation", {
+      name: "Détail des étapes",
+    });
+    expect(
+      within(links).getByRole("link", { name: "Aperçu" }),
+    ).toBeInTheDocument();
+    expect(
+      within(links).getByRole("link", {
+        name: "Ouvrir l’atelier éditorial",
+      }),
+    ).toHaveAttribute("href", `/subjects/${SUBJECT_ID}/editor`);
+  });
+
   it("explique le rejet de toutes les propositions d’enrichissement", async () => {
     vi.stubGlobal(
       "fetch",

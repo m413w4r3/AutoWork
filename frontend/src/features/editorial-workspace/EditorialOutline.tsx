@@ -1,0 +1,165 @@
+import { useMemo, useRef, useState } from "react";
+import type { KeyboardEvent } from "react";
+
+import type {
+  EditorialDocumentOutlineNode,
+  EditorialWorkspaceBlock,
+} from "../../api/editorialWorkspace";
+import { OUTLINE_BLOCK_KIND_LABELS } from "./blockKindLabels";
+
+interface EditorialOutlineProps {
+  blocks: EditorialWorkspaceBlock[];
+  outline: EditorialDocumentOutlineNode[];
+  selectedBlockId: string | null;
+  activeSectionId: string | null;
+  onSelectBlock: (blockId: string) => void;
+}
+
+interface OutlineItem {
+  block: EditorialWorkspaceBlock;
+  label: string;
+  depth: number;
+}
+
+function matchingItems(
+  blocks: EditorialWorkspaceBlock[],
+  outline: EditorialDocumentOutlineNode[],
+  search: string,
+): OutlineItem[] {
+  const blockById = new Map(blocks.map((block) => [block.block_id, block]));
+  const outlineById = new Map(outline.map((node) => [node.block_id, node]));
+  const referencedIds = new Set(outline.flatMap((node) => node.children));
+  const childrenByParent = new Map<string, EditorialWorkspaceBlock[]>();
+  for (const block of blocks) {
+    if (block.parent_block_id === null) continue;
+    const children = childrenByParent.get(block.parent_block_id) ?? [];
+    children.push(block);
+    childrenByParent.set(block.parent_block_id, children);
+  }
+
+  const normalizedSearch = search.trim().toLocaleLowerCase();
+  const visited = new Set<string>();
+  const visit = (blockId: string, depth: number): OutlineItem[] => {
+    if (visited.has(blockId)) return [];
+    visited.add(blockId);
+    const block = blockById.get(blockId);
+    if (!block) return [];
+
+    const node = outlineById.get(blockId);
+    const childIds = node?.children.length
+      ? node.children
+      : (childrenByParent.get(blockId) ?? []).map((child) => child.block_id);
+    const descendants = childIds.flatMap((childId) =>
+      visit(childId, depth + 1),
+    );
+    const label =
+      node?.label.trim() ||
+      block.text?.trim() ||
+      OUTLINE_BLOCK_KIND_LABELS[block.kind];
+    const matches =
+      normalizedSearch.length === 0 ||
+      label.toLocaleLowerCase().includes(normalizedSearch) ||
+      (block.text?.toLocaleLowerCase().includes(normalizedSearch) ?? false);
+
+    if (!matches && descendants.length === 0) return [];
+    return [{ block, label, depth }, ...descendants];
+  };
+
+  const preamble = blocks.filter(
+    (block) => block.kind === "title" || block.kind === "lead_paragraph",
+  );
+  const roots = outline.filter((node) => !referencedIds.has(node.block_id));
+  const result = [
+    ...preamble.flatMap((block) => visit(block.block_id, 0)),
+    ...(roots.length ? roots : outline).flatMap((node) =>
+      visit(node.block_id, 0),
+    ),
+  ];
+  for (const block of blocks) {
+    if (!visited.has(block.block_id)) result.push(...visit(block.block_id, 0));
+  }
+  return result;
+}
+
+export function EditorialOutline({
+  blocks,
+  outline,
+  selectedBlockId,
+  activeSectionId,
+  onSelectBlock,
+}: EditorialOutlineProps) {
+  const [search, setSearch] = useState("");
+  const itemRefs = useRef(new Map<string, HTMLButtonElement>());
+  const items = useMemo(
+    () => matchingItems(blocks, outline, search),
+    [blocks, outline, search],
+  );
+
+  const handleArrow = (
+    event: KeyboardEvent<HTMLButtonElement>,
+    index: number,
+  ) => {
+    const nextIndex =
+      event.key === "ArrowDown"
+        ? Math.min(index + 1, items.length - 1)
+        : Math.max(index - 1, 0);
+    if (nextIndex === index) return;
+    event.preventDefault();
+    const next = items[nextIndex];
+    if (!next) return;
+    itemRefs.current.get(next.block.block_id)?.focus();
+    onSelectBlock(next.block.block_id);
+  };
+
+  return (
+    <nav className="editorial-outline" aria-label="Plan éditorial">
+      <h2>Plan</h2>
+      <label className="editorial-outline__search">
+        Rechercher dans le plan
+        <input
+          type="search"
+          value={search}
+          onChange={(event) => setSearch(event.currentTarget.value)}
+        />
+      </label>
+      <div className="editorial-outline__tree" role="tree">
+        {items.map((item, index) => {
+          const selected = item.block.block_id === selectedBlockId;
+          return (
+            <button
+              key={item.block.block_id}
+              ref={(element) => {
+                if (element) itemRefs.current.set(item.block.block_id, element);
+                else itemRefs.current.delete(item.block.block_id);
+              }}
+              type="button"
+              role="treeitem"
+              aria-level={item.depth + 1}
+              aria-selected={selected}
+              aria-current={
+                item.block.block_id === activeSectionId ? "location" : undefined
+              }
+              tabIndex={selected || (!selectedBlockId && index === 0) ? 0 : -1}
+              className="editorial-outline__item"
+              data-selected={selected}
+              data-active-section={item.block.block_id === activeSectionId}
+              data-depth={item.depth}
+              onClick={() => onSelectBlock(item.block.block_id)}
+              onKeyDown={(event) => {
+                if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                  handleArrow(event, index);
+                }
+              }}
+            >
+              <span className="editorial-outline__kind">
+                {OUTLINE_BLOCK_KIND_LABELS[item.block.kind]}
+              </span>
+              <span>{item.label}</span>
+            </button>
+          );
+        })}
+        {items.length === 0 ? <p>Aucun résultat dans le plan.</p> : null}
+      </div>
+    </nav>
+  );
+}

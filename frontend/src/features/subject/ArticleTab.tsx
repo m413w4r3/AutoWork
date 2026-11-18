@@ -9,6 +9,7 @@ import {
 import { collectedSourceDownloadUrl } from "../../api/collection";
 import { PublicationDocumentView } from "../publication/PublicationDocumentView";
 import { publicationDocumentBody } from "../publication/publicationArtifactDisplay";
+import { Link } from "../../routing";
 
 interface ArticleTabProps {
   subjectId: string;
@@ -177,6 +178,9 @@ function PublicationContent({ content }: { content: SubjectContentResponse }) {
             Télécharger le PDF
           </a>
         ) : null}
+        <Link to={`/subjects/${content.subject_id}/editor`}>
+          Ouvrir l’atelier éditorial
+        </Link>
       </div>
       <PublicationDocumentView
         document={document}

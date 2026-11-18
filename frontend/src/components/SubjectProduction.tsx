@@ -30,6 +30,7 @@ import {
   retryTransientProductionFailure,
 } from "../features/production/productionLabels";
 import { RETRYABLE_PRODUCTION_STAGES } from "../features/production/productionStages";
+import { Link } from "../routing";
 
 interface SubjectProductionProps {
   subjectId: string;
@@ -454,9 +455,14 @@ export function SubjectProduction({
           Voir la synthèse
         </a>
         {status.status === "ready" ? (
-          <a href={`/subjects/${subjectId}/production/artifacts/publication`}>
-            Aperçu
-          </a>
+          <>
+            <a href={`/subjects/${subjectId}/production/artifacts/publication`}>
+              Aperçu
+            </a>
+            <Link to={`/subjects/${subjectId}/editor`}>
+              Ouvrir l’atelier éditorial
+            </Link>
+          </>
         ) : null}
       </nav>
 

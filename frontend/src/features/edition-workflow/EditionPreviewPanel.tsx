@@ -9,6 +9,7 @@ import {
   pdfInspectionUrl,
   renderInputInspectionUrl,
 } from "../../api/publication";
+import { Link } from "../../routing";
 import type {
   PublicationDocument,
   PublicationDocumentArtifact,
@@ -185,6 +186,9 @@ export function EditionPreviewPanel({
               return (
                 <section key={classification.anchor} id={classification.anchor}>
                   <h4>Article {classification.number}</h4>
+                  <Link to={`/subjects/${publication.subject_id}/editor`}>
+                    Ouvrir l’atelier éditorial
+                  </Link>
                   <PublicationDocumentView
                     document={publicationContent(publication.document)}
                     publicationKind={classification.kind}
@@ -201,6 +205,9 @@ export function EditionPreviewPanel({
               return (
                 <section key={classification.anchor} id={classification.anchor}>
                   <h4>Brève {classification.number}</h4>
+                  <Link to={`/subjects/${publication.subject_id}/editor`}>
+                    Ouvrir l’atelier éditorial
+                  </Link>
                   <PublicationDocumentView
                     document={publicationContent(publication.document)}
                     publicationKind={classification.kind}
