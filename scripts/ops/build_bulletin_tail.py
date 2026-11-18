@@ -155,6 +155,11 @@ def main() -> int:
     parser.add_argument("--env-file", type=Path, default=ROOT / ".env")
     parser.add_argument("--live", action="store_true", help="really query the IOC providers")
     parser.add_argument(
+        "--vt-domains",
+        action="store_true",
+        help="also fetch domain data (A/NS/MX, registrar, contacts) from VirusTotal",
+    )
+    parser.add_argument(
         "--vt-delay", type=float, default=15.0, help="seconds between VirusTotal requests"
     )
     parser.add_argument("--out-dir", type=Path)
@@ -199,6 +204,8 @@ def main() -> int:
         str(work / "out" / "iocs_normalized.csv"),
         "--no-cache" if not args.live else "--fail-fast",
     ]
+    if args.vt_domains:
+        reporter.append("--vt-domains")
     subprocess.run(reporter, check=True, env=env, cwd=work)
 
     main_typ = (work / "main.typ").read_text(encoding="utf-8").rstrip() + "\n\n#pagebreak()\n"
