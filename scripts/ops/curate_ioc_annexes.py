@@ -113,6 +113,8 @@ def classify(details: list[dict], legit) -> tuple[dict, list, list]:
             )
             (aliases if artifact_type == "hash" else excluded).append((label, raw, reason))
             continue
+        if kind == "ip" and value.count(":") == 1 and "." in value:
+            value = value.rsplit(":", 1)[0]  # "1.2.3.4:443" -> the address only
         if kind == "ip" and non_routable(value):
             excluded.append((label, value, "Adresse non routable ou réservée"))
             continue

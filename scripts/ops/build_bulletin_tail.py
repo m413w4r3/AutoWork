@@ -129,6 +129,11 @@ def write_config(work: Path, live: bool, vt_delay: float) -> Path:
         # The proxy is a plain-HTTP forward proxy: only http:// URLs go through it.
         text = text.replace("https://www.virustotal.com/api/v3", "http://www.virustotal.com/api/v3")
         text = text.replace("rate_delay_seconds: 15.0", f"rate_delay_seconds: {vt_delay}")
+        # Shodan pages sit behind Cloudflare: go slower, and keep the cache between runs.
+        text = re.sub(
+            r"(shodan:.*?rate_delay_seconds: )1\.0", r"\g<1>4.0", text, count=1, flags=re.S
+        )
+        text = text.replace("directory: ./.ioc-cache", f"directory: {work.parent / '.ioc-cache'}")
         # Cloudflare in front of some APIs challenges browser-like user agents.
         text = re.sub(
             r"user_agent: \"Mozilla[^\"]*\"", 'user_agent: "IOC-Article-Reporter/1.0"', text

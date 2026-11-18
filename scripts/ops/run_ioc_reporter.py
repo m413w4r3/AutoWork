@@ -95,12 +95,37 @@ def patch_virustotal(module, proxy_url: str, vt_domains: bool) -> None:
         provider.domain = lambda self, domain: {"found": False}
 
 
+def patch_presentation(module) -> None:
+    """Fix the Triage result parser and keep Shodan lists short enough for one table row."""
+    import re
+
+    module.TriageProvider.SAMPLE_ID_RE = re.compile(r'data-sample-id="([^"]+)"', re.I)
+    shodan = module.ShodanProvider
+    format_cves = shodan._format_cves
+
+    def capped_cves(vulns):  # type: ignore[no-untyped-def]
+        cves = list(format_cves(vulns))
+        if len(cves) > 5:
+            return [*cves[:5], f"(+{len(cves) - 5} autres CVE)"]
+        return cves
+
+    shodan._format_cves = staticmethod(capped_cves)
+    dedup = shodan._dedup
+
+    def capped_dedup(values):  # type: ignore[no-untyped-def]
+        items = list(dedup(values))
+        return [*items[:8], f"(+{len(items) - 8})"] if len(items) > 8 else items
+
+    shodan._dedup = staticmethod(capped_dedup)
+
+
 def main() -> int:
     argv = sys.argv[1:]
     vt_domains = "--vt-domains" in argv
     argv = [item for item in argv if item != "--vt-domains"]
     proxy_url = os.environ.get("VIRUSTOTAL_PROXY_URL", "").strip()
     module = load_reporter()
+    patch_presentation(module)
     if proxy_url:
         patch_virustotal(module, proxy_url, vt_domains)
     else:
