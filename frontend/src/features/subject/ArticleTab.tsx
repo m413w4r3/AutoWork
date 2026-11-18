@@ -7,7 +7,8 @@ import {
   type SubjectContentResponse,
 } from "../../api/subjectContent";
 import { collectedSourceDownloadUrl } from "../../api/collection";
-import { PublicationDocumentView } from "../../components/ProductionArtifactView";
+import { PublicationDocumentView } from "../publication/PublicationDocumentView";
+import { publicationDocumentBody } from "../publication/publicationArtifactDisplay";
 
 interface ArticleTabProps {
   subjectId: string;
@@ -152,25 +153,24 @@ function LegacyWorkbenchFallback({
 }
 
 function PublicationContent({ content }: { content: SubjectContentResponse }) {
-  const publicationKind =
-    content.canonical_content.schema_version === "7"
-      ? content.canonical_content.publication_kind
-      : "article";
+  const publicationKind = content.publication_kind;
   const document =
-    content.canonical_content.schema_version === "7"
-      ? content.canonical_content.base_publication.base_publication
-      : content.canonical_content.schema_version === "6"
-        ? content.canonical_content.base_publication
-        : content.canonical_content;
+    content.canonical_content.schema_version === "8"
+      ? publicationDocumentBody(content.canonical_content.base_publication)
+      : publicationDocumentBody(content.canonical_content);
   return (
     <section
       className="subject-article"
       aria-labelledby="subject-article-heading"
     >
       <div className="subject-article__meta">
-        <p className="eyebrow">
-          {publicationKind === "brief" ? "Brève" : "Article"}
-        </p>
+        {publicationKind ? (
+          <p className="eyebrow">
+            {publicationKind === "brief" ? "Brève" : "Article"}
+          </p>
+        ) : (
+          <p role="note">Type de publication indéterminé. Lecture seule.</p>
+        )}
         <p id="subject-article-heading">Version {content.artifact_version}</p>
         {content.status === "verified" ? (
           <a href={subjectPublicationPdfUrl(content.subject_id)}>

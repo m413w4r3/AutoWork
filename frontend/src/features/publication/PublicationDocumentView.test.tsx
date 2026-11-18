@@ -255,12 +255,12 @@ const documentV7: PublicationDocumentV7 = {
 function renderDocumentView(
   document: PublicationDocumentV4 | PublicationDocumentV5,
 ) {
-  return render(<PublicationDocumentView document={document} />);
+  return render(
+    <PublicationDocumentView document={document} publicationKind={null} />,
+  );
 }
 
-function renderArtifactView(
-  canonicalContent: PublicationDocumentV6 | PublicationDocumentV7,
-) {
+function renderArtifactView(canonicalContent: unknown) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -294,6 +294,18 @@ function renderArtifactView(
     </QueryClientProvider>,
   );
 }
+
+it("test_v8_brief_read_fixture_renders_in_the_historical_view", async () => {
+  renderArtifactView({
+    schema_version: "8",
+    base_publication: documentV7,
+    article_format: null,
+  });
+
+  expect(await screen.findByText("Dossier Sample Orchard")).toBeInTheDocument();
+  expect(screen.getByText("Format : Brève")).toBeInTheDocument();
+  expect(screen.queryByText(/ANNEXE TECHNIQUE/)).not.toBeInTheDocument();
+});
 
 function publicationLayout(container: HTMLElement): HTMLElement {
   const layout = container.querySelector<HTMLElement>(

@@ -20,7 +20,7 @@ export function PublicationDocumentView({
   publicationKind,
 }: {
   document: PublicationDocument;
-  publicationKind?: "article" | "brief";
+  publicationKind: "article" | "brief" | null;
 }) {
   const [selectedPassage, setSelectedPassage] =
     useState<PublicationPassage | null>(null);
@@ -59,7 +59,7 @@ export function PublicationDocumentView({
         />
         <PublicationIndicatorsSection
           document={document}
-          publicationKind={publicationKind}
+          publicationKind={publicationKind ?? undefined}
           sources={sources}
         />
       </article>

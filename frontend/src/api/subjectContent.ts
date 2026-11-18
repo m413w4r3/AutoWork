@@ -1,5 +1,5 @@
 import { ApiError } from "./editions";
-import type { PublicationDocumentArtifact } from "./production";
+import type { PublicationDocumentArtifactWithV8 } from "./production";
 
 export interface SubjectContentResponse {
   subject_id: string;
@@ -10,7 +10,8 @@ export interface SubjectContentResponse {
   artifact_input_hash: string;
   status: string;
   schema_version: string;
-  canonical_content: PublicationDocumentArtifact;
+  publication_kind: "article" | "brief" | null;
+  canonical_content: PublicationDocumentArtifactWithV8;
 }
 
 export interface SubjectIndicatorResponse {

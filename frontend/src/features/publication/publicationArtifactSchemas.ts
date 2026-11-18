@@ -1,6 +1,6 @@
 import type {
   ExtractionDocumentV2,
-  PublicationDocumentArtifact,
+  PublicationDocumentArtifactWithV8,
   PublicationSemanticRoleV1,
   ProductionExtractionTierV1,
   ProductionSourceExtractionV1,
@@ -94,10 +94,109 @@ function isSemanticText(value: unknown): boolean {
   );
 }
 
+function isPublicationEvidenceRef(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    typeof value.source_document_id === "string" &&
+    (value.kind === "fact" ||
+      value.kind === "event" ||
+      value.kind === "indicator" ||
+      value.kind === "rule") &&
+    typeof value.evidence_key === "string"
+  );
+}
+
+function isPublicationEvidenceRefArray(value: unknown): boolean {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every(isPublicationEvidenceRef)
+  );
+}
+
+function isArticleOverviewField(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    typeof value.text === "string" &&
+    isPublicationEvidenceRefArray(value.evidence_refs)
+  );
+}
+
+function isArticleOverview(value: unknown): boolean {
+  return (
+    value === null ||
+    (isRecord(value) &&
+      ["victimology", "arsenal", "main_objective"].every(
+        (field) =>
+          field in value &&
+          (value[field] === null || isArticleOverviewField(value[field])),
+      ))
+  );
+}
+
+function isArticleTimelineKeyEvent(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    typeof value.event_date === "string" &&
+    typeof value.text === "string" &&
+    isPublicationEvidenceRefArray(value.evidence_refs)
+  );
+}
+
+function isArticleIocValue(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    typeof value.value === "string" &&
+    typeof value.normalized_value === "string" &&
+    Array.isArray(value.source_document_ids) &&
+    value.source_document_ids.length > 0 &&
+    value.source_document_ids.every(
+      (sourceId) => typeof sourceId === "string",
+    ) &&
+    isPublicationEvidenceRefArray(value.evidence_refs)
+  );
+}
+
+function isArticleFormat(
+  value: unknown,
+  publicationKind: "article" | "brief",
+): boolean {
+  if (publicationKind === "brief") return value === null;
+  if (!isRecord(value) || !isArticleOverview(value.overview)) return false;
+  if (
+    !Array.isArray(value.timeline_key_events) ||
+    value.timeline_key_events.length === 1 ||
+    value.timeline_key_events.length > 8 ||
+    !value.timeline_key_events.every(isArticleTimelineKeyEvent) ||
+    !isRecord(value.ioc_categories)
+  ) {
+    return false;
+  }
+  const iocCategories = value.ioc_categories;
+  return ["ips", "urls", "domains", "files"].every((category) => {
+    const categoryValues = iocCategories[category];
+    return (
+      Array.isArray(categoryValues) &&
+      categoryValues.every((item: unknown) => isArticleIocValue(item))
+    );
+  });
+}
+
 export function isPublicationDocument(
   value: unknown,
-): value is PublicationDocumentArtifact {
+): value is PublicationDocumentArtifactWithV8 {
   if (!isRecord(value)) return false;
+  if (value.schema_version === "8") {
+    const base = value.base_publication;
+    return (
+      isRecord(base) &&
+      base.schema_version === "7" &&
+      isPublicationDocument(base) &&
+      (base.publication_kind === "article" ||
+        base.publication_kind === "brief") &&
+      isArticleFormat(value.article_format, base.publication_kind)
+    );
+  }
   if (value.schema_version === "7") {
     return (
       (value.publication_kind === "article" ||

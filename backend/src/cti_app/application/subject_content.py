@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 from uuid import UUID
 
+from cti_app.application.edition_classification import (
+    explicit_publication_kind,
+    is_legacy_historical_brief,
+)
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_resolver import current_publication_artifact
 from cti_app.application.production_extraction import legacy_technical_extraction_from_payload
@@ -14,6 +19,7 @@ from cti_app.application.production_normalization import (
     normalize_indicator_value,
 )
 from cti_app.application.production_parsers import DisplayPolicy, IndicatorStatus
+from cti_app.application.production_routing import get_adopted_production_routing_decision
 from cti_app.domain.classification import TLP
 from cti_app.domain.entities import Sample, SourceDocument
 from cti_app.domain.production import (
@@ -22,14 +28,17 @@ from cti_app.domain.production import (
     ProductionArtifactStatus,
     ProductionRun,
 )
+from cti_app.domain.production_routing import ProductionRoutingDecisionV1
 from cti_app.domain.publication import ArtifactType
 from cti_app.domain.publication_document import (
+    CanonicalPublicationDocument,
     PublicationDocumentV6,
     PublicationDocumentV7,
     PublicationDocumentV8,
     parse_publication_document,
     serialize_publication_document,
 )
+from cti_app.domain.publication_kind import PublicationKind
 
 
 class ArtifactPayloadReader(Protocol):
@@ -47,6 +56,7 @@ class SubjectContentView:
     status: ProductionArtifactStatus
     schema_version: str
     document_version: str
+    publication_kind: PublicationKind | None
     canonical_content: dict[str, Any]
     analyst_opinion: dict[str, Any] | None
 
@@ -55,6 +65,7 @@ class SubjectContentView:
 class CurrentSubjectPublication:
     run: ProductionRun
     artifact: ProductionArtifact
+    routing_decision: ProductionRoutingDecisionV1 | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +96,47 @@ class SubjectAssetView:
 class SubjectAssetsView:
     sources: tuple[SubjectAssetView, ...]
     samples: tuple[SubjectAssetView, ...]
+
+
+def resolve_publication_kind(
+    routing_decision: ProductionRoutingDecisionV1 | None,
+    publication_content: Mapping[str, Any] | CanonicalPublicationDocument | None,
+) -> tuple[PublicationKind | None, str | None]:
+    """Resolve the explicit route, falling back only for legacy V4-V6 documents."""
+    routing_kind = routing_decision.publication_kind if routing_decision else None
+    routing_hash = routing_decision.decision_hash if routing_decision else None
+    if publication_content is None:
+        return routing_kind, routing_hash
+
+    try:
+        document = (
+            parse_publication_document(publication_content)
+            if isinstance(publication_content, Mapping)
+            else publication_content
+        )
+    except (TypeError, ValueError):
+        return None, routing_hash
+
+    envelope_kind = explicit_publication_kind(document)
+    envelope_hash = getattr(document, "routing_decision_hash", None)
+    if not isinstance(envelope_hash, str):
+        envelope_hash = None
+    if routing_kind is not None and envelope_kind is not None and routing_kind is not envelope_kind:
+        return None, routing_hash
+    if routing_hash is not None and envelope_hash is not None and routing_hash != envelope_hash:
+        return None, routing_hash
+    if routing_kind is not None:
+        return routing_kind, routing_hash
+    if envelope_kind is not None:
+        return envelope_kind, envelope_hash
+    if document.schema_version in {"4", "5", "6"}:
+        legacy_kind = (
+            PublicationKind.BRIEF
+            if is_legacy_historical_brief(document)
+            else PublicationKind.ARTICLE
+        )
+        return legacy_kind, routing_hash
+    return None, routing_hash
 
 
 def analyst_opinion_view(document: PublicationDocumentV6) -> dict[str, Any] | None:
@@ -138,6 +190,9 @@ class SubjectContentService:
         assert artifact.canonical_blob_id is not None
         canonical = await self._artifact_store.read_json(artifact.canonical_blob_id)
         document = parse_publication_document(canonical)
+        publication_kind, _routing_hash = resolve_publication_kind(
+            publication.routing_decision, document
+        )
         document_version = document.schema_version
         analyst_opinion: dict[str, Any] | None = None
         if isinstance(document, PublicationDocumentV8):
@@ -165,6 +220,7 @@ class SubjectContentService:
             status=artifact.status,
             schema_version=document.schema_version,
             document_version=document_version,
+            publication_kind=publication_kind,
             canonical_content=canonical,
             analyst_opinion=analyst_opinion,
         )
@@ -177,7 +233,12 @@ class SubjectContentService:
             artifact = await current_publication_artifact(uow.production_artifacts, run.id)
             if artifact is None or artifact.canonical_blob_id is None:
                 return None
-            return CurrentSubjectPublication(run=run, artifact=artifact)
+            routing_decision = await get_adopted_production_routing_decision(uow=uow, run=run)
+            return CurrentSubjectPublication(
+                run=run,
+                artifact=artifact,
+                routing_decision=routing_decision,
+            )
 
     async def indicators(self, subject_id: UUID) -> list[SubjectIndicatorView]:
         async with self._uow_factory() as uow:

@@ -36,6 +36,7 @@ from cti_app.domain.production import (
 )
 from cti_app.domain.publication import ArtifactType
 from cti_app.domain.publication_document import publication_document_from_json
+from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.publication_render import (
     PublicationPreviewDisposition,
     PublicationPreviewStatus,
@@ -86,6 +87,7 @@ class ContentResponse(BaseModel):
     status: ProductionArtifactStatus
     schema_version: str
     document_version: str
+    publication_kind: PublicationKind | None
     canonical_content: dict[str, Any]
     analyst_opinion: AnalystOpinionContentResponse | None
 

@@ -377,10 +377,7 @@ export interface ArtifactResponse {
   /** Legacy rendered text; never present for the PUBLICATION stage. */
   rendered_content?: string | null;
   canonical_content:
-    | PublicationDocumentV4
-    | PublicationDocumentV5
-    | PublicationDocumentV6
-    | PublicationDocumentV7
+    | PublicationDocumentArtifactWithV8
     | ProductionExtractionV1
     | ProductionSynthesisV1
     | ExtractionDocumentV2
@@ -1294,9 +1291,54 @@ export interface PublicationDocumentV7 {
   routing_policy_version: string;
 }
 
+export interface PublicationArticleOverviewFieldV1 {
+  text: string;
+  evidence_refs: PublicationEvidenceRefV1[];
+}
+
+export interface PublicationArticleOverviewV1 {
+  victimology: PublicationArticleOverviewFieldV1 | null;
+  arsenal: PublicationArticleOverviewFieldV1 | null;
+  main_objective: PublicationArticleOverviewFieldV1 | null;
+}
+
+export interface PublicationTimelineKeyEventV1 {
+  event_date: string;
+  text: string;
+  evidence_refs: PublicationEvidenceRefV1[];
+}
+
+export interface PublicationArticleIocValueV1 {
+  value: string;
+  normalized_value: string;
+  source_document_ids: string[];
+  evidence_refs: PublicationEvidenceRefV1[];
+}
+
+export interface PublicationArticleIocCategoriesV1 {
+  ips: PublicationArticleIocValueV1[];
+  urls: PublicationArticleIocValueV1[];
+  domains: PublicationArticleIocValueV1[];
+  files: PublicationArticleIocValueV1[];
+}
+
+export interface PublicationArticleFormatV1 {
+  overview: PublicationArticleOverviewV1 | null;
+  timeline_key_events: PublicationTimelineKeyEventV1[];
+  ioc_categories: PublicationArticleIocCategoriesV1;
+}
+
+export interface PublicationDocumentV8 {
+  schema_version: "8";
+  base_publication: PublicationDocumentV7;
+  article_format: PublicationArticleFormatV1 | null;
+}
+
 export type PublicationDocument = PublicationDocumentV4 | PublicationDocumentV5;
 export type PublicationDocumentArtifact =
   PublicationDocument | PublicationDocumentV6 | PublicationDocumentV7;
+export type PublicationDocumentArtifactWithV8 =
+  PublicationDocumentArtifact | PublicationDocumentV8;
 
 export type PublicationPreviewStatus =
   "IN_PROGRESS" | "READY" | "FAILED" | "STALE";

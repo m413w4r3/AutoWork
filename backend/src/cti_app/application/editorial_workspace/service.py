@@ -18,6 +18,7 @@ from cti_app.application.editorial_workspace.registry import (
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_routing import get_adopted_production_routing_decision
+from cti_app.application.subject_content import resolve_publication_kind
 from cti_app.domain.editorial_workspace import (
     AdvancedBlockRegistry,
     BlockRegistryEntry,
@@ -30,9 +31,6 @@ from cti_app.domain.editorial_workspace import (
     workspace_pin_hash,
 )
 from cti_app.domain.production import ProductionArtifact, ProductionArtifactStage
-from cti_app.domain.production_routing import ProductionRoutingDecisionV1
-from cti_app.domain.publication_document import parse_publication_document
-from cti_app.domain.publication_kind import PublicationKind
 
 
 def advance_workspace_registry(
@@ -158,7 +156,7 @@ class EditorialWorkspaceService:
                 )
 
             routing_decision = await get_adopted_production_routing_decision(uow=uow, run=run)
-            kind, routing_hash = self._publication_kind(routing_decision, publication_content)
+            kind, routing_hash = resolve_publication_kind(routing_decision, publication_content)
             pins: dict[str, object] = {
                 "subject_id": subject.id,
                 "production_run_id": run.id,
@@ -439,38 +437,6 @@ class EditorialWorkspaceService:
         if not isinstance(payload, dict):
             raise EditorialWorkspaceError("editorial_snapshot_stale")
         return payload, canonical_sha
-
-    @staticmethod
-    def _publication_kind(
-        routing_decision: ProductionRoutingDecisionV1 | None,
-        publication_content: Mapping[str, Any] | None,
-    ) -> tuple[PublicationKind | None, str | None]:
-        routing_kind = routing_decision.publication_kind if routing_decision else None
-        routing_hash = routing_decision.decision_hash if routing_decision else None
-        envelope_kind: PublicationKind | None = None
-        envelope_hash: str | None = None
-        if publication_content is not None:
-            try:
-                publication = parse_publication_document(publication_content)
-            except ValueError:
-                publication = None
-            raw_kind = getattr(publication, "publication_kind", None)
-            if isinstance(raw_kind, PublicationKind):
-                envelope_kind = raw_kind
-                raw_hash = getattr(publication, "routing_decision_hash", None)
-                if isinstance(raw_hash, str):
-                    envelope_hash = raw_hash
-        if (
-            routing_kind is not None
-            and envelope_kind is not None
-            and routing_kind is not envelope_kind
-        ):
-            return None, routing_hash
-        if routing_hash is not None and envelope_hash is not None and routing_hash != envelope_hash:
-            return None, routing_hash
-        if routing_kind is not None:
-            return routing_kind, routing_hash
-        return envelope_kind, envelope_hash
 
     @staticmethod
     def _assert_record_matches_current(

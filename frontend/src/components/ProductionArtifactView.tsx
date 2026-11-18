@@ -108,12 +108,16 @@ export function ProductionArtifactView({
       ? artifact.canonical_content
       : null;
   const publicationDocument = publicationEnvelope
-    ? publicationDocumentBody(publicationEnvelope)
+    ? publicationEnvelope.schema_version === "8"
+      ? publicationDocumentBody(publicationEnvelope.base_publication)
+      : publicationDocumentBody(publicationEnvelope)
     : null;
   const publicationKind =
     publicationEnvelope?.schema_version === "7"
       ? publicationEnvelope.publication_kind
-      : undefined;
+      : publicationEnvelope?.schema_version === "8"
+        ? publicationEnvelope.base_publication.publication_kind
+        : null;
   const publicationInputArtifacts = recordValue(
     artifact?.metadata.input_artifacts,
   );
