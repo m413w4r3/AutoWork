@@ -237,10 +237,17 @@ export interface EditorialProposalRead {
   base_artifact_id: string;
   base_artifact_version: number;
   base_canonical_sha256: string;
+  base_text: string | null;
   patch_sha256: string | null;
   patch: EditorialProposalPatch | null;
   diagnostics: Record<string, unknown>;
   created_at: string;
+}
+
+export interface EditorialProposalDecisionResult {
+  id: string;
+  state: "rejected";
+  state_version: number;
 }
 
 const EDITORIAL_THREAD_TRANSPORT_UNCERTAIN_MESSAGE =
@@ -271,6 +278,14 @@ const ERROR_MESSAGES: Record<string, string> = {
     "Le contenu de cette proposition est temporairement indisponible.",
   proposal_patch_hash_mismatch:
     "Le contenu vérifié de cette proposition ne correspond plus.",
+  proposal_base_unavailable:
+    "Le texte de référence de cette proposition est indisponible.",
+  proposal_base_hash_mismatch:
+    "Le texte de référence ne correspond plus à son empreinte.",
+  proposal_state_conflict:
+    "La proposition a changé. Actualisez-la avant de décider.",
+  proposal_idempotency_conflict:
+    "Cette clé est déjà associée à une autre décision.",
   propose_not_enabled: "La proposition n’est pas encore activée.",
   editorial_thread_busy: "Une réponse est déjà en cours pour ce paragraphe.",
   external_llm_blocked: "La politique interdit l’envoi externe de ce contenu.",
@@ -335,6 +350,25 @@ export function getEditorialProposal(
 ): Promise<EditorialProposalRead> {
   return request<EditorialProposalRead>(
     `/api/subjects/${encodeURIComponent(subjectId)}/editor/threads/${encodeURIComponent(occurrenceId)}/proposals/${encodeURIComponent(proposalId)}`,
+  );
+}
+
+export function rejectEditorialProposal(
+  subjectId: string,
+  occurrenceId: string,
+  proposalId: string,
+  decision: { expected_state_version: number; patch_sha256: string },
+): Promise<EditorialProposalDecisionResult> {
+  return request<EditorialProposalDecisionResult>(
+    `/api/subjects/${encodeURIComponent(subjectId)}/editor/threads/${encodeURIComponent(occurrenceId)}/proposals/${encodeURIComponent(proposalId)}/reject`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Idempotency-Key": crypto.randomUUID(),
+      },
+      body: JSON.stringify(decision),
+    },
   );
 }
 

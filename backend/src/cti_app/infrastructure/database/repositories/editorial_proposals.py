@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cti_app.domain.editorial_proposal import (
     EditorialProposal,
     EditorialProposalEvent,
+    EditorialProposalEventKind,
     EditorialProposalModelRun,
     EditorialProposalOrigin,
     EditorialProposalState,
@@ -65,6 +66,52 @@ class SqlAlchemyEditorialProposalRepository:
         result = await self._session.execute(statement)
         row, link = result.one_or_none() or (None, None)
         return _proposal_from_rows(row, link) if row is not None else None
+
+    async def get_event_by_idempotency(
+        self, proposal_id: UUID, idempotency_key: str
+    ) -> EditorialProposalEvent | None:
+        row = await self._session.scalar(
+            select(EditorialProposalEventRow).where(
+                EditorialProposalEventRow.proposal_id == proposal_id,
+                EditorialProposalEventRow.idempotency_key == idempotency_key,
+            )
+        )
+        return _event_from_row(row) if row is not None else None
+
+    async def transition_if_current(
+        self,
+        *,
+        subject_id: UUID,
+        occurrence_id: UUID,
+        proposal_id: UUID,
+        expected_state: EditorialProposalState,
+        expected_state_version: int,
+        state: EditorialProposalState,
+        event: EditorialProposalEvent,
+    ) -> tuple[EditorialProposal | None, bool]:
+        """CAS one proposal state and append its event in the same transaction."""
+        transitioned_id = await self._session.scalar(
+            update(EditorialProposalRow)
+            .where(
+                EditorialProposalRow.id == proposal_id,
+                EditorialProposalRow.subject_id == subject_id,
+                EditorialProposalRow.occurrence_id == occurrence_id,
+                EditorialProposalRow.state == expected_state.value,
+                EditorialProposalRow.state_version == expected_state_version,
+            )
+            .values(
+                state=state.value,
+                state_version=expected_state_version + 1,
+                updated_at=event.created_at,
+            )
+            .returning(EditorialProposalRow.id)
+        )
+        if transitioned_id is not None:
+            self._session.add(EditorialProposalEventRow(**_event_values(event)))
+            await self._session.flush()
+
+        proposal = await self.get_for_occurrence(subject_id, occurrence_id, proposal_id)
+        return proposal, transitioned_id is not None
 
     async def add_if_absent(
         self,
@@ -156,6 +203,25 @@ def _event_values(event: EditorialProposalEvent) -> dict[str, object]:
         "diagnostics": event.diagnostics,
         "created_at": event.created_at,
     }
+
+
+def _event_from_row(row: EditorialProposalEventRow) -> EditorialProposalEvent:
+    if not isinstance(row.diagnostics, dict):
+        raise RuntimeError("editorial_proposal_event_diagnostics_shape_invalid")
+    return EditorialProposalEvent(
+        id=row.id,
+        proposal_id=row.proposal_id,
+        sequence=row.sequence,
+        kind=EditorialProposalEventKind(row.kind),
+        state=EditorialProposalState(row.state),
+        state_version=row.state_version,
+        actor_id=row.actor_id,
+        idempotency_key=row.idempotency_key,
+        request_sha256=row.request_sha256,
+        patch_sha256=row.patch_sha256,
+        diagnostics=dict(row.diagnostics),
+        created_at=row.created_at,
+    )
 
 
 def _model_run_values(link: EditorialProposalModelRun) -> dict[str, object]:

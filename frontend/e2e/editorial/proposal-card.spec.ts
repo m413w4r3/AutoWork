@@ -69,6 +69,7 @@ const proposal: EditorialProposalRead = {
   base_artifact_id: artifactId,
   base_artifact_version: 4,
   base_canonical_sha256: canonicalSha256,
+  base_text: "Synthetic current paragraph for visual verification.",
   patch_sha256: "b".repeat(64),
   patch: {
     schema_version: "editorial-patch-v1",
@@ -84,10 +85,13 @@ const proposal: EditorialProposalRead = {
   created_at: "2026-11-19T12:00:00Z",
 };
 
-test("renders a persisted proposal with stubbed API data", async ({ page }) => {
+test("compares and rejects a persisted proposal with stubbed API data", async ({
+  page,
+}) => {
   const unexpectedRequests: string[] = [];
   let currentProposal = proposal;
   const proposalPath = `/api/subjects/${subjectId}/editor/threads/${occurrenceId}/proposals/${proposalId}`;
+  const rejectPath = `${proposalPath}/reject`;
   const threadPath = `/api/subjects/${subjectId}/editor/threads/${occurrenceId}`;
   const snapshotPath = `/api/subjects/${subjectId}/editor/snapshot`;
   await page.route("**/*", async (route) => {
@@ -152,10 +156,37 @@ test("renders a persisted proposal with stubbed API data", async ({ page }) => {
       await route.fulfill({ json: currentProposal });
       return;
     }
+    if (method === "POST" && url.pathname === rejectPath) {
+      expect(route.request().headers()["idempotency-key"]).toMatch(
+        /^[A-Za-z0-9_-]{16,128}$/,
+      );
+      expect(route.request().postDataJSON()).toEqual({
+        expected_state_version: currentProposal.state_version,
+        patch_sha256: currentProposal.patch_sha256,
+      });
+      currentProposal = {
+        ...currentProposal,
+        state: "rejected",
+        state_version: currentProposal.state_version + 1,
+      };
+      await route.fulfill({
+        json: {
+          id: proposalId,
+          state: "rejected",
+          state_version: currentProposal.state_version,
+        },
+      });
+      return;
+    }
     unexpectedRequests.push(`${method} ${url.pathname}`);
     await route.abort("blockedbyclient");
   });
 
+  const screenshotDirectory = resolve(
+    process.cwd(),
+    "../.autowork-runs/shots-m3-13",
+  );
+  await mkdir(screenshotDirectory, { recursive: true });
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto(`/subjects/${subjectId}/editor`);
   await page.locator(`[data-block-id="${occurrenceId}"]`).click();
@@ -165,45 +196,39 @@ test("renders a persisted proposal with stubbed API data", async ({ page }) => {
     card.getByText("Synthetic proposed paragraph for visual verification."),
   ).toBeVisible();
   await expect(card.getByText("Proposition à consulter")).toBeVisible();
-  await expect(
-    page.getByRole("button", { name: /Proposer|Accepter|Rejeter/ }),
-  ).toHaveCount(0);
-
-  const screenshotDirectory = resolve(
-    process.cwd(),
-    "../.autowork-runs/shots-m3-12",
-  );
-  await mkdir(screenshotDirectory, { recursive: true });
+  await expect(card.getByRole("button", { name: "Rejeter" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Accepter" })).toHaveCount(0);
   await page.screenshot({
-    path: resolve(screenshotDirectory, "proposal-card-1440x900.png"),
+    path: resolve(screenshotDirectory, "comparison-side-by-side-1440x900.png"),
     fullPage: true,
   });
 
-  currentProposal = {
-    ...proposal,
-    state: "refused",
-    patch_sha256: null,
-    patch: null,
-    diagnostics: { code: "revision_not_applicable" },
-  };
-  await page.reload();
-  await page.locator(`[data-block-id="${occurrenceId}"]`).click();
-  const refusedCard = page.getByRole("article", {
-    name: "Proposition éditoriale",
-  });
-  await expect(refusedCard.getByText("Refus Bridge")).toBeVisible();
+  await card.getByRole("button", { name: "Différences" }).click();
   await expect(
-    refusedCard.getByText(
-      "Les données disponibles ne permettent pas de proposer cette révision.",
-    ),
+    card.getByRole("group", { name: "Différences du paragraphe" }),
   ).toBeVisible();
-  const refusalScreenshotDirectory = resolve(
-    process.cwd(),
-    "../.autowork-runs/shots-T-M3-12",
-  );
-  await mkdir(refusalScreenshotDirectory, { recursive: true });
   await page.screenshot({
-    path: resolve(refusalScreenshotDirectory, "proposal-refused-1440x900.png"),
+    path: resolve(screenshotDirectory, "paragraph-diff-1440x900.png"),
+    fullPage: true,
+  });
+
+  await card.getByRole("button", { name: "Comparaison" }).click();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.getByRole("button", { name: "Inspecteur" }).click();
+  const panels = card.locator(".editorial-diff-view__panels");
+  await expect(panels).toBeVisible();
+  await card.scrollIntoViewIfNeeded();
+  await page.screenshot({
+    path: resolve(screenshotDirectory, "comparison-stacked-390x844.png"),
+  });
+
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await card.getByRole("button", { name: "Rejeter" }).click();
+  await expect(card.getByText("Rejetée")).toBeVisible();
+  await expect(card.getByRole("button", { name: "Rejeter" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Accepter" })).toHaveCount(0);
+  await page.screenshot({
+    path: resolve(screenshotDirectory, "proposal-rejected-1440x900.png"),
     fullPage: true,
   });
   expect(unexpectedRequests).toEqual([]);

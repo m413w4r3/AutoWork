@@ -729,6 +729,129 @@ main:has(> .editorial-route-state) > .app-header {
   white-space: pre-wrap;
 }
 
+.editorial-proposal-card__rationale {
+  margin: 0.65rem 0 0;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.editorial-proposal-card__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.55rem;
+  margin-top: 0.75rem;
+}
+
+.editorial-proposal-card__actions button,
+.editorial-diff-view__toolbar button {
+  min-height: 44px;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--editorial-control-border);
+  border-radius: 0.4rem;
+  color: var(--editorial-link);
+  background: var(--editorial-white);
+  font: inherit;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.editorial-proposal-card__actions button:focus-visible,
+.editorial-diff-view__toolbar button:focus-visible {
+  outline: 3px solid var(--editorial-focus-ring);
+  outline-offset: 2px;
+}
+
+.editorial-proposal-card__actions button:disabled {
+  color: var(--editorial-muted);
+  background: var(--editorial-disabled-surface);
+  cursor: not-allowed;
+}
+
+.editorial-proposal-card__actions p {
+  flex-basis: 100%;
+  margin: 0;
+  color: var(--editorial-danger);
+}
+
+.editorial-diff-view {
+  min-width: 0;
+  margin-top: 0.6rem;
+}
+
+.editorial-diff-view__toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin-bottom: 0.55rem;
+}
+
+.editorial-diff-view__toolbar button[aria-pressed="true"] {
+  border-color: var(--editorial-brand);
+  color: var(--editorial-ink);
+  background: var(--editorial-outline-selected);
+}
+
+.editorial-diff-view__panels {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.65rem;
+}
+
+.editorial-diff-view__panels section,
+.editorial-diff-view__changes {
+  min-width: 0;
+  padding: 0.7rem;
+  border: 1px solid var(--editorial-divider);
+  border-radius: 0.35rem;
+  background: var(--editorial-white);
+}
+
+.editorial-diff-view__panels h5 {
+  margin: 0 0 0.45rem;
+  font-size: 0.85rem;
+}
+
+.editorial-diff-view__panels p,
+.editorial-diff-view__changes p {
+  margin: 0 0 0.65rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+.editorial-diff-view__panels p:last-child,
+.editorial-diff-view__changes p:last-child {
+  margin-bottom: 0;
+}
+
+.editorial-diff-view__changes del,
+.editorial-diff-view__changes ins {
+  display: block;
+  padding: 0.25rem 0.35rem;
+  text-decoration-thickness: 2px;
+  text-underline-offset: 0.2em;
+}
+
+.editorial-diff-view__changes del {
+  color: var(--editorial-danger);
+  background: var(--editorial-disabled-surface);
+}
+
+.editorial-diff-view__changes ins {
+  color: var(--editorial-ink);
+  background: var(--editorial-outline-selected);
+  text-decoration: underline;
+  text-decoration-color: var(--editorial-brand);
+}
+
+.editorial-diff-view__marker {
+  display: block;
+  margin-bottom: 0.15rem;
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-decoration: none;
+}
+
 .editorial-proposal-card__status {
   margin: 0.45rem 0 0;
 }
@@ -1256,6 +1379,12 @@ main:has(> .editorial-route-state) > .app-header {
     width: calc(100% - 1.25rem);
     margin: 1.5rem auto;
     padding: 1.25rem;
+  }
+}
+
+@media (max-width: 767px) {
+  .editorial-diff-view__panels {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 

@@ -13,12 +13,15 @@ from cti_app.application.editorial_synthesis.targets import (
     build_targeted_revision_target_catalog,
     resolve_target,
 )
+from cti_app.application.editorial_workspace.registry import resolve_workspace_target
+from cti_app.application.editorial_workspace.service import EditorialWorkspaceService
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.domain.blobs import BlobDescriptor
 from cti_app.domain.editorial_workspace import (
     EditorialBlockKind,
     EditorialRevisionStatus,
     EditorialSourceStage,
+    bootstrap_block_registry,
 )
 from cti_app.domain.model_conversations import ConversationTurnStatus
 from cti_app.domain.model_runs import ModelRunStatus
@@ -121,6 +124,39 @@ def _setup(
                 ),
                 None,
             )
+
+        async def get_event_by_idempotency(self, proposal_id, idempotency_key):
+            return next(
+                (
+                    event
+                    for event in self.events
+                    if event.proposal_id == proposal_id and event.idempotency_key == idempotency_key
+                ),
+                None,
+            )
+
+        async def transition_if_current(
+            self,
+            *,
+            subject_id,
+            occurrence_id,
+            proposal_id,
+            expected_state,
+            expected_state_version,
+            state,
+            event,
+        ):
+            record = await self.get_for_occurrence(subject_id, occurrence_id, proposal_id)
+            if (
+                record is None
+                or record.state is not expected_state
+                or record.state_version != expected_state_version
+            ):
+                return record, False
+            transitioned = record.transition(state, now=event.created_at)
+            self.records[self.records.index(record)] = transitioned
+            self.events.append(event)
+            return transitioned, True
 
     repository = MemoryRepository()
     blob_records: dict[str, object] = {}
@@ -444,9 +480,57 @@ def _setup(
         workspace_service=workspace_service,
         subject_id=subject_id,
         occurrence_id=occurrence_id,
+        actor_id=actor_id,
         model_run_id=model_run_id,
         model_turn_id=model_turn_id,
         current_snapshot=proposal_snapshot,
+    )
+
+
+def _install_real_workspace_resolver(setup):
+    preparation = setup.preparation()
+    content = dict(preparation.base_content)
+    content["sections"] = [
+        {
+            "heading": "Section synthétique",
+            "paragraphs": [
+                {"text": "Premier paragraphe synthétique"},
+                {"text": "Deuxième paragraphe synthétique"},
+            ],
+        }
+    ]
+    canonical_sha256 = hashlib.sha256(
+        ProductionArtifactStore.canonical_json_bytes(content)
+    ).hexdigest()
+    entries = list(
+        bootstrap_block_registry(
+            artifact_id=preparation.base_artifact_id,
+            canonical_sha256=canonical_sha256,
+            source_stage="synthesis",
+            canonical_content=content,
+        )
+    )
+    entries[0] = replace(entries[0], block_id=setup.occurrence_id)
+    setup.current_snapshot.block_registry = tuple(entries)
+    setup.current_snapshot.synthesis_canonical_sha256 = canonical_sha256
+    setup.current_snapshot.publication_kind = "article"
+
+    class StaticWorkspaceService(EditorialWorkspaceService):
+        async def _load_current(self, subject_id):
+            return {}, setup.current_snapshot, content
+
+    setup.service._workspace_service = StaticWorkspaceService(
+        uow_factory=None,
+        artifact_store=None,
+    )
+    return (
+        replace(
+            setup.preparation(),
+            base_content=content,
+            base_canonical_sha256=canonical_sha256,
+        ),
+        tuple(entries),
+        content,
     )
 
 
@@ -461,6 +545,52 @@ async def test_preparation_rejects_a_supplied_target_that_differs_from_current_o
         await setup.service.prepare_bridge_result(preparation)
 
     assert error.value.code == "proposal_target_mismatch"
+    assert setup.blob_bytes == {}
+    assert "uow_open" not in setup.calls
+
+
+@pytest.mark.asyncio
+async def test_preparation_rejects_target_from_another_real_block_without_writing() -> None:
+    from cti_app.application.editorial_proposals import EditorialProposalApplicationError
+
+    setup = _setup()
+    preparation, entries, content = _install_real_workspace_resolver(setup)
+    paragraphs = [entry for entry in entries if entry.kind is EditorialBlockKind.PARAGRAPH]
+    assert len(paragraphs) == 2
+    other_target = resolve_workspace_target(
+        entry=paragraphs[1],
+        canonical_content=content,
+        operation="rewrite_paragraph",
+    )
+    assert other_target.legacy_target_id is not None
+    forged = replace(
+        preparation,
+        occurrence_id=paragraphs[0].block_id,
+        operation=TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH,
+        target=other_target.target,
+        target_id=other_target.legacy_target_id,
+        before_hash=other_target.before_hash,
+    )
+
+    with pytest.raises(EditorialProposalApplicationError) as error:
+        await setup.service.prepare_bridge_result(forged)
+
+    assert error.value.code == "proposal_target_mismatch"
+    assert setup.blob_bytes == {}
+    assert "uow_open" not in setup.calls
+
+
+@pytest.mark.asyncio
+async def test_preparation_rejects_occurrence_from_another_subject_without_writing() -> None:
+    from cti_app.application.editorial_proposals import EditorialProposalApplicationError
+
+    setup = _setup()
+    preparation, _entries, _content = _install_real_workspace_resolver(setup)
+
+    with pytest.raises(EditorialProposalApplicationError) as error:
+        await setup.service.prepare_bridge_result(replace(preparation, subject_id=uuid4()))
+
+    assert error.value.code == "proposal_base_stale"
     assert setup.blob_bytes == {}
     assert "uow_open" not in setup.calls
 
@@ -591,7 +721,9 @@ async def test_proposal_get_projects_persisted_state_and_base_version() -> None:
 
 
 @pytest.mark.asyncio
-async def test_proposal_get_projects_stale_when_current_pins_advance() -> None:
+async def test_changed_pins_project_proposal_stale_and_persist_before_any_decision() -> None:
+    from cti_app.application.editorial_proposals import EditorialProposalApplicationError
+
     setup = _setup()
     proposal = await setup.service.prepare_bridge_result(setup.preparation())
     setup.current_snapshot.workspace_pin_hash = "8" * 64
@@ -609,7 +741,87 @@ async def test_proposal_get_projects_stale_when_current_pins_advance() -> None:
 
     assert view.state == "stale"
     assert view.patch is not None
-    assert setup.repository.records[0].state.value == "proposed"
+    assert setup.repository.records[0].state.value == "stale"
+    assert setup.repository.records[0].state_version == proposal.state_version + 1
+    assert setup.repository.events[-1].state.value == "stale"
+    assert setup.repository.events[-1].state_version == proposal.state_version + 1
+    with pytest.raises(EditorialProposalApplicationError) as error:
+        await setup.service.reject(
+            setup.subject_id,
+            setup.occurrence_id,
+            proposal.id,
+            actor_id=setup.actor_id,
+            expected_state_version=proposal.state_version,
+            patch_sha256=proposal.patch_sha256,
+            idempotency_key=f"reject_{uuid4().hex}",
+            workspace_service=setup.workspace_service,
+        )
+    assert error.value.code == "proposal_state_conflict"
+    assert setup.repository.records[0].state.value == "stale"
+    assert len(setup.repository.events) == 2
+
+
+@pytest.mark.asyncio
+async def test_reject_is_terminal_and_keeps_artifact_pins() -> None:
+    from cti_app.application.editorial_proposals import EditorialProposalApplicationError
+
+    setup = _setup()
+    proposal = await setup.service.prepare_bridge_result(setup.preparation())
+    original_pins = (
+        setup.current_snapshot.workspace_pin_hash,
+        setup.current_snapshot.synthesis_artifact_id,
+        setup.current_snapshot.synthesis_version,
+        setup.current_snapshot.synthesis_canonical_sha256,
+    )
+    idempotency_key = f"reject_{uuid4().hex}"
+
+    rejected = await setup.service.reject(
+        setup.subject_id,
+        setup.occurrence_id,
+        proposal.id,
+        actor_id=setup.actor_id,
+        expected_state_version=proposal.state_version,
+        patch_sha256=proposal.patch_sha256,
+        idempotency_key=idempotency_key,
+        workspace_service=setup.workspace_service,
+    )
+    replay = await setup.service.reject(
+        setup.subject_id,
+        setup.occurrence_id,
+        proposal.id,
+        actor_id=setup.actor_id,
+        expected_state_version=proposal.state_version,
+        patch_sha256=proposal.patch_sha256,
+        idempotency_key=idempotency_key,
+        workspace_service=setup.workspace_service,
+    )
+
+    assert rejected.state.value == "rejected"
+    assert rejected.state_version == proposal.state_version + 1
+    assert replay == rejected
+    assert setup.repository.records[0].state.value == "rejected"
+    assert setup.repository.events[-1].state.value == "rejected"
+    assert len(setup.repository.events) == 2
+    assert len(setup.repository.model_runs) == 1
+    assert setup.canonical_writes == []
+    with pytest.raises(EditorialProposalApplicationError) as error:
+        await setup.service.reject(
+            setup.subject_id,
+            setup.occurrence_id,
+            proposal.id,
+            actor_id=setup.actor_id,
+            expected_state_version=rejected.state_version,
+            patch_sha256=proposal.patch_sha256,
+            idempotency_key=f"reject_{uuid4().hex}",
+            workspace_service=setup.workspace_service,
+        )
+    assert getattr(error.value, "code", None) == "proposal_state_conflict"
+    assert original_pins == (
+        setup.current_snapshot.workspace_pin_hash,
+        setup.current_snapshot.synthesis_artifact_id,
+        setup.current_snapshot.synthesis_version,
+        setup.current_snapshot.synthesis_canonical_sha256,
+    )
 
 
 @pytest.mark.asyncio

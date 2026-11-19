@@ -4,6 +4,7 @@ import {
   fireEvent,
   render,
   screen,
+  within,
   waitFor,
 } from "@testing-library/react";
 import { useState } from "react";
@@ -206,14 +207,111 @@ describe("EditorialConversation", () => {
     );
 
     expect(await screen.findByText("Titre proposé dans le fil")).toBeVisible();
-    expect(
-      screen.queryByRole("button", { name: /proposer|accepter|rejeter/i }),
-    ).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Accepter" })).toBeNull();
     expect(
       fetchMock.mock.calls.some(([input]) =>
         requestUrl(input).includes(
           `/threads/${binding.occurrence_id}/proposals/${proposalId}`,
         ),
+      ),
+    ).toBe(true);
+  });
+
+  it("resolves the second variant reference to its proposal UUID", async () => {
+    const proposalIds = ["proposal-first", "proposal-second"];
+    const proposalPayload = (proposalId: string, text: string) => ({
+      id: proposalId,
+      subject_id: binding.subject_id,
+      production_run_id: binding.production_run_id,
+      occurrence_id: binding.occurrence_id,
+      thread_id: "thread-1",
+      state: "proposed",
+      state_version: 1,
+      operation: "rewrite_paragraph",
+      base_artifact_id: binding.artifact_id,
+      base_artifact_version: binding.artifact_version,
+      base_canonical_sha256: binding.canonical_sha256,
+      patch_sha256: "b".repeat(64),
+      patch: {
+        schema_version: "editorial-patch-v1",
+        operation: "rewrite_paragraph",
+        target: { kind: "paragraph" },
+        target_id: "target-1",
+        occurrence_id: binding.occurrence_id,
+        before_hash: "c".repeat(64),
+        after: text,
+        rationale: "Raison synthétique",
+      },
+      diagnostics: {},
+      created_at: "2026-11-19T12:00:00Z",
+    });
+    const thread: EditorialThreadRead = {
+      kind: "open",
+      thread_id: "thread-1",
+      origin: binding,
+      current: binding,
+      binding_state: "valid",
+      bridge_status: "ready",
+      event_sequence: 2,
+      timeline: proposalIds.map((proposalId, index) => ({
+        id: `event-${index + 1}`,
+        sequence: index + 1,
+        kind: "proposal" as const,
+        actor_id: null,
+        proposal_id: proposalId,
+        created_at: "2026-11-19T12:00:00Z",
+        body: null,
+      })),
+      etag: '"thread-variants"',
+      previous_sessions: [],
+    };
+    const fetchMock = vi.fn<typeof fetch>((input) => {
+      const url = requestUrl(input);
+      const proposalId = proposalIds.find((id) =>
+        url.includes(`/proposals/${id}`),
+      );
+      if (proposalId) {
+        const index = proposalIds.indexOf(proposalId);
+        return Promise.resolve(
+          new Response(
+            JSON.stringify(
+              proposalPayload(proposalId, `Texte variante ${index + 1}`),
+            ),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          ),
+        );
+      }
+      return Promise.resolve(threadResponse(thread));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, refetchInterval: false } },
+    });
+
+    render(
+      <QueryClientProvider client={client}>
+        <EditorialConversation
+          subjectId={binding.subject_id}
+          occurrenceId={binding.occurrence_id}
+          snapshotId="snapshot-1"
+          targetLabel="Paragraphe synthétique"
+          onChangeTarget={() => undefined}
+        />
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByText("Texte variante 2")).toBeVisible();
+    const proposalCards = screen.getAllByRole("article", {
+      name: "Proposition éditoriale",
+    });
+    const secondCard = proposalCards[1];
+    if (!secondCard) throw new Error("second proposal card is missing");
+    expect(
+      within(secondCard).getByRole("heading", { name: "Proposition 2" }),
+    ).toBeVisible();
+    expect(
+      fetchMock.mock.calls.some(([input]) =>
+        requestUrl(input).includes(`/proposals/${proposalIds[1]}`),
       ),
     ).toBe(true);
   });

@@ -1,16 +1,19 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import {
   getEditorialProposal,
+  rejectEditorialProposal,
   type EditorialProposalRefusalCode,
   type EditorialProposalState,
 } from "../../api/editorialWorkspace";
 import { editorialWorkspaceQueryKeys } from "./editorialWorkspaceQueries";
+import { EditorialDiffView } from "./EditorialDiffView";
 
 interface EditorialProposalCardProps {
   subjectId: string;
   occurrenceId: string;
   proposalId: string;
+  referenceOrdinal?: number;
 }
 
 const stateLabels: Record<EditorialProposalState, string> = {
@@ -39,7 +42,9 @@ export function EditorialProposalCard({
   subjectId,
   occurrenceId,
   proposalId,
+  referenceOrdinal,
 }: EditorialProposalCardProps) {
+  const queryClient = useQueryClient();
   const proposalQuery = useQuery({
     queryKey: editorialWorkspaceQueryKeys.proposal(
       subjectId,
@@ -47,6 +52,27 @@ export function EditorialProposalCard({
       proposalId,
     ),
     queryFn: () => getEditorialProposal(subjectId, occurrenceId, proposalId),
+  });
+  const rejectMutation = useMutation({
+    mutationFn: () => {
+      const proposal = proposalQuery.data;
+      if (!proposal?.patch_sha256) {
+        throw new Error("L’empreinte du patch est indisponible.");
+      }
+      return rejectEditorialProposal(subjectId, occurrenceId, proposalId, {
+        expected_state_version: proposal.state_version,
+        patch_sha256: proposal.patch_sha256,
+      });
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({
+        queryKey: editorialWorkspaceQueryKeys.proposal(
+          subjectId,
+          occurrenceId,
+          proposalId,
+        ),
+      });
+    },
   });
 
   if (proposalQuery.isPending) {
@@ -75,17 +101,33 @@ export function EditorialProposalCard({
       aria-busy={proposalQuery.isFetching}
     >
       <header className="editorial-proposal-card__header">
-        <h4>Proposition</h4>
+        <h4>
+          {referenceOrdinal === undefined
+            ? "Proposition"
+            : `Proposition ${referenceOrdinal}`}
+        </h4>
         <span>{stateLabels[proposal.state]}</span>
       </header>
       <p className="editorial-proposal-card__base">
         Base canonique · version {proposal.base_artifact_version}
       </p>
       {typeof proposedText === "string" ? (
-        <div className="editorial-proposal-card__content">
-          <h5>Texte proposé</h5>
-          <p>{proposedText}</p>
-        </div>
+        typeof proposal.base_text === "string" ? (
+          <EditorialDiffView
+            baseText={proposal.base_text}
+            proposedText={proposedText}
+            baseLabel={
+              proposal.state === "stale"
+                ? "Version de base"
+                : "Version actuelle"
+            }
+          />
+        ) : (
+          <div className="editorial-proposal-card__content">
+            <h5>Texte proposé</h5>
+            <p>{proposedText}</p>
+          </div>
+        )
       ) : proposal.state === "refused" ? (
         <p className="editorial-proposal-card__status" role="status">
           {refusalLabel(proposal.diagnostics.code)}
@@ -99,6 +141,26 @@ export function EditorialProposalCard({
           Patch éditorial typé disponible.
         </p>
       )}
+      {typeof proposal.patch?.rationale === "string" ? (
+        <p className="editorial-proposal-card__rationale">
+          <strong>Justification · </strong>
+          {proposal.patch.rationale}
+        </p>
+      ) : null}
+      {proposal.state === "proposed" ? (
+        <div className="editorial-proposal-card__actions">
+          <button
+            type="button"
+            onClick={() => rejectMutation.mutate()}
+            disabled={rejectMutation.isPending || !proposal.patch_sha256}
+          >
+            Rejeter
+          </button>
+          {rejectMutation.isError ? (
+            <p role="alert">{rejectMutation.error.message}</p>
+          ) : null}
+        </div>
+      ) : null}
       <details className="editorial-proposal-card__details">
         <summary>Détails de la proposition</summary>
         {proposal.patch?.enrichment_patch ? (

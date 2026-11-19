@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from uuid import uuid4
 
@@ -20,6 +21,7 @@ from cti_app.domain.editorial_proposal import (
     EditorialProposalState,
     variant_group_identity,
 )
+from cti_app.domain.editorial_thread import EditorialThreadEventKind
 from cti_app.domain.entities import Subject
 from cti_app.domain.production import ProductionArtifact, ProductionArtifactStage, ProductionRun
 from cti_app.infrastructure.database.models.editorial_proposals import (
@@ -27,7 +29,10 @@ from cti_app.infrastructure.database.models.editorial_proposals import (
     EditorialProposalModelRunRow,
     EditorialProposalRow,
 )
-from cti_app.infrastructure.database.models.editorial_threads import EditorialThreadRow
+from cti_app.infrastructure.database.models.editorial_threads import (
+    EditorialThreadEventRow,
+    EditorialThreadRow,
+)
 from cti_app.infrastructure.database.models.editorial_workspace import (
     EditorialWorkspaceSnapshotRow,
 )
@@ -306,6 +311,143 @@ async def test_proposal_persistence_is_exact_idempotent_and_append_only(
             assert not replayed
             assert replay.id == proposal.id
 
+        reject_key = f"synthetic-reject-{uuid4().hex}"
+        reject_request_sha256 = hashlib.sha256(reject_key.encode("ascii")).hexdigest()
+        reject_event = EditorialProposalEvent(
+            id=uuid4(),
+            proposal_id=proposal.id,
+            sequence=2,
+            kind=EditorialProposalEventKind.STATE_CHANGED,
+            state=EditorialProposalState.REJECTED,
+            state_version=2,
+            actor_id=actor_id,
+            idempotency_key=reject_key,
+            request_sha256=reject_request_sha256,
+            patch_sha256=patch_sha256,
+        )
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            rejected, changed = await uow.editorial_proposals.transition_if_current(
+                subject_id=subject.id,
+                occurrence_id=occurrence_id,
+                proposal_id=proposal.id,
+                expected_state=EditorialProposalState.PROPOSED,
+                expected_state_version=1,
+                state=EditorialProposalState.REJECTED,
+                event=reject_event,
+            )
+            assert changed
+            assert rejected is not None
+            assert rejected.state is EditorialProposalState.REJECTED
+            assert rejected.state_version == 2
+            (
+                replayed_rejection,
+                rejection_replayed,
+            ) = await uow.editorial_proposals.transition_if_current(
+                subject_id=subject.id,
+                occurrence_id=occurrence_id,
+                proposal_id=proposal.id,
+                expected_state=EditorialProposalState.PROPOSED,
+                expected_state_version=1,
+                state=EditorialProposalState.REJECTED,
+                event=reject_event,
+            )
+            assert not rejection_replayed
+            assert replayed_rejection is not None
+            assert replayed_rejection.state is EditorialProposalState.REJECTED
+            assert replayed_rejection.state_version == 2
+            await uow.editorial_threads.append_event(
+                thread_id=thread_id,
+                kind=EditorialThreadEventKind.REJECTED,
+                actor_id=actor_id,
+                idempotency_key=f"proposal-rejection:{reject_key}",
+                request_sha256=reject_request_sha256,
+                proposal_id=proposal.id,
+            )
+            await uow.commit()
+
+        stale_proposal = replace(
+            proposal,
+            id=uuid4(),
+            origin=EditorialProposalOrigin.MANUAL_PATCH,
+            thread_id=None,
+            model_run_id=None,
+            model_turn_id=None,
+            state=EditorialProposalState.PROPOSED,
+            state_version=1,
+            idempotency_key=f"synthetic-stale-{uuid4().hex}",
+            request_sha256="b" * 64,
+        )
+        stale_prepared_event = EditorialProposalEvent(
+            id=uuid4(),
+            proposal_id=stale_proposal.id,
+            sequence=1,
+            kind=EditorialProposalEventKind.PREPARED,
+            state=EditorialProposalState.PROPOSED,
+            state_version=1,
+            actor_id=actor_id,
+            idempotency_key=stale_proposal.idempotency_key,
+            request_sha256=stale_proposal.request_sha256,
+            patch_sha256=patch_sha256,
+        )
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            stored_stale, inserted_stale = await uow.editorial_proposals.add_if_absent(
+                stale_proposal,
+                event=stale_prepared_event,
+                model_run=None,
+            )
+            assert inserted_stale
+            assert stored_stale.state is EditorialProposalState.PROPOSED
+            await uow.commit()
+
+        stale_key = f"stale-{stale_proposal.id.hex}-1"
+        stale_event = EditorialProposalEvent(
+            id=uuid4(),
+            proposal_id=stale_proposal.id,
+            sequence=2,
+            kind=EditorialProposalEventKind.STATE_CHANGED,
+            state=EditorialProposalState.STALE,
+            state_version=2,
+            actor_id=actor_id,
+            idempotency_key=stale_key,
+            request_sha256="c" * 64,
+            patch_sha256=patch_sha256,
+            diagnostics={"code": "proposal_base_stale"},
+        )
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            stale, stale_changed = await uow.editorial_proposals.transition_if_current(
+                subject_id=subject.id,
+                occurrence_id=occurrence_id,
+                proposal_id=stale_proposal.id,
+                expected_state=EditorialProposalState.PROPOSED,
+                expected_state_version=1,
+                state=EditorialProposalState.STALE,
+                event=stale_event,
+            )
+            assert stale_changed
+            assert stale is not None
+            assert stale.state is EditorialProposalState.STALE
+            assert stale.state_version == 2
+            replayed_stale, stale_replayed = await uow.editorial_proposals.transition_if_current(
+                subject_id=subject.id,
+                occurrence_id=occurrence_id,
+                proposal_id=stale_proposal.id,
+                expected_state=EditorialProposalState.PROPOSED,
+                expected_state_version=1,
+                state=EditorialProposalState.STALE,
+                event=stale_event,
+            )
+            assert not stale_replayed
+            assert replayed_stale is not None
+            assert replayed_stale.state is EditorialProposalState.STALE
+            stored_stale_event = await uow.editorial_proposals.get_event_by_idempotency(
+                stale_proposal.id, stale_key
+            )
+            assert stored_stale_event is not None
+            assert stored_stale_event.state is EditorialProposalState.STALE
+            assert stored_stale_event.state_version == 2
+            assert stored_stale_event.idempotency_key == stale_key
+            await uow.commit()
+
         async with session_factory() as session:
             link = await session.get(EditorialProposalModelRunRow, proposal.id)
             event_count = await session.scalar(
@@ -321,8 +463,39 @@ async def test_proposal_persistence_is_exact_idempotent_and_append_only(
         assert link is not None
         assert link.model_run_id == model_run_id
         assert link.model_turn_id == model_turn_id
-        assert event_count == 1
+        assert event_count == 2
         assert artifact_count == 1
+
+        async with session_factory() as session:
+            rejected_row = await session.get(EditorialProposalRow, proposal.id)
+            stale_row = await session.get(EditorialProposalRow, stale_proposal.id)
+            snapshot_row = await session.get(EditorialWorkspaceSnapshotRow, snapshot_id)
+            canonical_artifact_row = await session.get(ProductionArtifactRow, artifact.id)
+            rejection_thread_events = await session.scalar(
+                select(func.count())
+                .select_from(EditorialThreadEventRow)
+                .where(
+                    EditorialThreadEventRow.thread_id == thread_id,
+                    EditorialThreadEventRow.event_kind == "rejected",
+                )
+            )
+        assert rejected_row is not None
+        assert rejected_row.state == "rejected"
+        assert rejected_row.state_version == 2
+        assert stale_row is not None
+        assert stale_row.state == "stale"
+        assert stale_row.state_version == 2
+        assert snapshot_row is not None
+        assert snapshot_row.workspace_pin_hash == "7" * 64
+        assert snapshot_row.synthesis_artifact_id == artifact.id
+        assert snapshot_row.synthesis_version == 1
+        assert snapshot_row.synthesis_canonical_sha256 == "6" * 64
+        assert canonical_artifact_row is not None
+        assert canonical_artifact_row.id == artifact.id
+        assert canonical_artifact_row.version == 1
+        assert canonical_artifact_row.input_hash == "1" * 64
+        assert canonical_artifact_row.canonical_blob_id is None
+        assert rejection_thread_events == 1
 
         with pytest.raises(DBAPIError):
             async with session_factory() as session, session.begin():

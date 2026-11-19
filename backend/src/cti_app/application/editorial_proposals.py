@@ -27,7 +27,11 @@ from cti_app.application.editorial_synthesis.patch_validation import (
 from cti_app.application.editorial_synthesis.targets import (
     resolve_target,
 )
-from cti_app.application.editorial_workspace.registry import resolve_occurrence
+from cti_app.application.editorial_workspace.registry import (
+    WorkspaceOccurrenceResolution,
+    read_pointer,
+    resolve_occurrence,
+)
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
@@ -56,6 +60,7 @@ from cti_app.domain.production_editorial_revision import (
 
 _PATCH_BUCKET = "editorial-proposal-patches"
 _IDEMPOTENCY_KEY = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MAX_PATCH_BYTES = 256 * 1024
 
 
@@ -114,6 +119,7 @@ class EditorialProposalRead:
     base_artifact_id: UUID
     base_artifact_version: int
     base_canonical_sha256: str
+    base_text: str | None
     patch_sha256: str | None
     patch: dict[str, object] | None
     diagnostics: dict[str, object]
@@ -430,6 +436,8 @@ class EditorialProposalService:
         ):
             raise EditorialProposalApplicationError("proposal_not_found")
 
+        base_artifact = None
+        base_snapshot = None
         async with self._uow_factory() as uow:
             proposal = await uow.editorial_proposals.get_for_occurrence(
                 subject_id, occurrence_id, proposal_id
@@ -446,6 +454,12 @@ class EditorialProposalService:
             )
             if proposal.patch_blob_ref is not None and blob is None:
                 raise EditorialProposalApplicationError("proposal_patch_unavailable")
+            if self._artifact_store is not None:
+                artifact_repository = getattr(uow, "production_artifacts", None)
+                snapshot_repository = getattr(uow, "editorial_workspace_snapshots", None)
+                if artifact_repository is not None and snapshot_repository is not None:
+                    base_artifact = await artifact_repository.get(proposal.base_artifact_id)
+                    base_snapshot = await snapshot_repository.get_by_id(proposal.snapshot_id)
 
         patch = None
         if blob is not None:
@@ -487,37 +501,224 @@ class EditorialProposalService:
             ):
                 raise EditorialProposalApplicationError("proposal_patch_unavailable")
             patch = decoded
-        projected_state = proposal.state.value
-        if proposal.state is EditorialProposalState.PROPOSED and (
-            resolution.record.workspace_pin_hash != proposal.base_pin_hash
-            or resolution.record.routing_decision_hash != proposal.base_routing_hash
-            or resolution.record.synthesis_artifact_id != proposal.base_artifact_id
-            or resolution.record.synthesis_version != proposal.base_artifact_version
-            or resolution.record.synthesis_input_hash != proposal.base_input_hash
-            or resolution.record.synthesis_canonical_sha256 != proposal.base_canonical_sha256
-            or resolution.artifact_id != proposal.base_artifact_id
-            or resolution.artifact_version != proposal.base_artifact_version
-            or resolution.canonical_sha256 != proposal.base_canonical_sha256
+        base_text = await self._read_base_text(proposal, base_artifact, base_snapshot)
+        if proposal.state is EditorialProposalState.PROPOSED and not _proposal_pins_match(
+            proposal, resolution
         ):
-            # T-M3-13 persists this read-time stale projection before decisions are offered.
-            projected_state = EditorialProposalState.STALE.value
+            proposal = await self._persist_stale_transition(proposal)
         return EditorialProposalRead(
             id=proposal.id,
             subject_id=proposal.subject_id,
             production_run_id=proposal.production_run_id,
             occurrence_id=proposal.occurrence_id,
             thread_id=proposal.thread_id,
-            state=projected_state,
+            state=proposal.state.value,
             state_version=proposal.state_version,
             operation=proposal.operation,
             base_artifact_id=proposal.base_artifact_id,
             base_artifact_version=proposal.base_artifact_version,
             base_canonical_sha256=proposal.base_canonical_sha256,
+            base_text=base_text,
             patch_sha256=proposal.patch_sha256,
             patch=patch,
             diagnostics=dict(proposal.diagnostics),
             created_at=proposal.created_at.isoformat(),
         )
+
+    async def _read_base_text(
+        self,
+        proposal: EditorialProposal,
+        artifact: Any | None,
+        snapshot: Any | None,
+    ) -> str | None:
+        if self._artifact_store is None:
+            return None
+        if artifact is None or artifact.canonical_blob_id is None or snapshot is None:
+            raise EditorialProposalApplicationError("proposal_base_unavailable")
+        try:
+            canonical_content = await self._artifact_store.read_json(artifact.canonical_blob_id)
+        except Exception:
+            raise EditorialProposalApplicationError("proposal_base_unavailable") from None
+        digest = hashlib.sha256(
+            ProductionArtifactStore.canonical_json_bytes(canonical_content)
+        ).hexdigest()
+        if digest != proposal.base_canonical_sha256:
+            raise EditorialProposalApplicationError("proposal_base_hash_mismatch")
+        occurrence = resolve_occurrence(snapshot, proposal.occurrence_id)
+        if (
+            occurrence.entry is None
+            or occurrence.binding_state != "valid"
+            or occurrence.artifact_id != proposal.base_artifact_id
+            or occurrence.artifact_version != proposal.base_artifact_version
+            or occurrence.canonical_sha256 != proposal.base_canonical_sha256
+        ):
+            raise EditorialProposalApplicationError("proposal_base_unavailable")
+        try:
+            value = read_pointer(canonical_content, occurrence.entry.structural_pointer)
+        except (KeyError, IndexError, TypeError, ValueError):
+            raise EditorialProposalApplicationError("proposal_base_unavailable") from None
+        if isinstance(value, str):
+            return value
+        if isinstance(value, Mapping):
+            for key in ("text", "heading", "title"):
+                text_value = value.get(key)
+                if isinstance(text_value, str):
+                    return text_value
+        return None
+
+    async def _persist_stale_transition(self, proposal: EditorialProposal) -> EditorialProposal:
+        request_sha256 = _state_request_sha256(
+            action="stale",
+            proposal_id=proposal.id,
+            state_version=proposal.state_version,
+            patch_sha256=proposal.patch_sha256,
+        )
+        event = EditorialProposalEvent(
+            id=uuid4(),
+            proposal_id=proposal.id,
+            sequence=proposal.state_version + 1,
+            kind=EditorialProposalEventKind.STATE_CHANGED,
+            state=EditorialProposalState.STALE,
+            state_version=proposal.state_version + 1,
+            actor_id=proposal.actor_id,
+            idempotency_key=f"stale-{proposal.id.hex}-{proposal.state_version}",
+            request_sha256=request_sha256,
+            patch_sha256=proposal.patch_sha256,
+            diagnostics={"code": "proposal_base_stale"},
+        )
+        async with self._uow_factory() as uow:
+            transitioned, changed = await uow.editorial_proposals.transition_if_current(
+                subject_id=proposal.subject_id,
+                occurrence_id=proposal.occurrence_id,
+                proposal_id=proposal.id,
+                expected_state=EditorialProposalState.PROPOSED,
+                expected_state_version=proposal.state_version,
+                state=EditorialProposalState.STALE,
+                event=event,
+            )
+            if transitioned is None:
+                raise EditorialProposalApplicationError("proposal_not_found")
+            if changed:
+                await uow.commit()
+            return transitioned
+
+    async def reject(
+        self,
+        subject_id: UUID,
+        occurrence_id: UUID,
+        proposal_id: UUID,
+        *,
+        actor_id: UUID,
+        expected_state_version: int,
+        patch_sha256: str | None,
+        idempotency_key: str,
+        workspace_service: Any,
+    ) -> EditorialProposal:
+        if not _IDEMPOTENCY_KEY.fullmatch(idempotency_key):
+            raise EditorialProposalApplicationError("idempotency_key_invalid")
+        if patch_sha256 is None or not _SHA256.fullmatch(patch_sha256):
+            raise EditorialProposalApplicationError("proposal_patch_hash_mismatch")
+        if expected_state_version < 1:
+            raise EditorialProposalApplicationError("proposal_state_conflict")
+
+        request_sha256 = _decision_request_sha256(
+            proposal_id=proposal_id,
+            subject_id=subject_id,
+            occurrence_id=occurrence_id,
+            actor_id=actor_id,
+            expected_state_version=expected_state_version,
+            patch_sha256=patch_sha256,
+        )
+        async with self._uow_factory() as uow:
+            proposal = await uow.editorial_proposals.get_for_occurrence(
+                subject_id, occurrence_id, proposal_id
+            )
+            if proposal is None:
+                raise EditorialProposalApplicationError("proposal_not_found")
+            existing_event = await uow.editorial_proposals.get_event_by_idempotency(
+                proposal_id, idempotency_key
+            )
+            if existing_event is not None:
+                if _decision_event_matches(existing_event, actor_id, request_sha256):
+                    return proposal
+                raise EditorialProposalApplicationError("proposal_idempotency_conflict")
+
+        inspected = await self.inspect(
+            subject_id,
+            occurrence_id,
+            proposal_id,
+            workspace_service=workspace_service,
+        )
+        if inspected.state != EditorialProposalState.PROPOSED.value:
+            raise EditorialProposalApplicationError("proposal_state_conflict")
+        if inspected.state_version != expected_state_version:
+            raise EditorialProposalApplicationError("proposal_state_conflict")
+        if inspected.patch_sha256 != patch_sha256:
+            raise EditorialProposalApplicationError("proposal_patch_hash_mismatch")
+
+        async with self._uow_factory() as uow:
+            proposal = await uow.editorial_proposals.get_for_occurrence(
+                subject_id, occurrence_id, proposal_id
+            )
+            if proposal is None:
+                raise EditorialProposalApplicationError("proposal_not_found")
+            existing_event = await uow.editorial_proposals.get_event_by_idempotency(
+                proposal_id, idempotency_key
+            )
+            if existing_event is not None:
+                if _decision_event_matches(existing_event, actor_id, request_sha256):
+                    return proposal
+                raise EditorialProposalApplicationError("proposal_idempotency_conflict")
+            if proposal.patch_sha256 != patch_sha256:
+                raise EditorialProposalApplicationError("proposal_patch_hash_mismatch")
+            if (
+                proposal.state is not EditorialProposalState.PROPOSED
+                or proposal.state_version != expected_state_version
+            ):
+                raise EditorialProposalApplicationError("proposal_state_conflict")
+
+            rejected = proposal.transition(EditorialProposalState.REJECTED)
+            event = EditorialProposalEvent(
+                id=uuid4(),
+                proposal_id=proposal.id,
+                sequence=rejected.state_version,
+                kind=EditorialProposalEventKind.STATE_CHANGED,
+                state=EditorialProposalState.REJECTED,
+                state_version=rejected.state_version,
+                actor_id=actor_id,
+                idempotency_key=idempotency_key,
+                request_sha256=request_sha256,
+                patch_sha256=patch_sha256,
+            )
+            stored, changed = await uow.editorial_proposals.transition_if_current(
+                subject_id=subject_id,
+                occurrence_id=occurrence_id,
+                proposal_id=proposal_id,
+                expected_state=EditorialProposalState.PROPOSED,
+                expected_state_version=expected_state_version,
+                state=EditorialProposalState.REJECTED,
+                event=event,
+            )
+            if stored is None:
+                raise EditorialProposalApplicationError("proposal_not_found")
+            if not changed:
+                replay = await uow.editorial_proposals.get_event_by_idempotency(
+                    proposal_id, idempotency_key
+                )
+                if replay is not None and _decision_event_matches(replay, actor_id, request_sha256):
+                    return stored
+                raise EditorialProposalApplicationError("proposal_state_conflict")
+            if stored.thread_id is not None:
+                await uow.editorial_threads.append_event(
+                    thread_id=stored.thread_id,
+                    kind=EditorialThreadEventKind.REJECTED,
+                    actor_id=actor_id,
+                    idempotency_key=f"proposal-rejection:{idempotency_key}",
+                    request_sha256=request_sha256,
+                    proposal_id=stored.id,
+                )
+            await uow.commit()
+            return stored
 
     async def cleanup_orphan_blob(self, descriptor: BlobDescriptor) -> bool:
         """Delete only when neither a proposal nor any other row references the blob."""
@@ -772,4 +973,69 @@ def _replay_matches(
         and existing.evidence_refs == preparation.evidence_refs
         and existing.model_run_id == preparation.model_run_id
         and existing.model_turn_id == preparation.model_turn_id
+    )
+
+
+def _proposal_pins_match(
+    proposal: EditorialProposal, resolution: WorkspaceOccurrenceResolution
+) -> bool:
+    record = resolution.record
+    return (
+        record.workspace_pin_hash == proposal.base_pin_hash
+        and record.routing_decision_hash == proposal.base_routing_hash
+        and record.synthesis_artifact_id == proposal.base_artifact_id
+        and record.synthesis_version == proposal.base_artifact_version
+        and record.synthesis_input_hash == proposal.base_input_hash
+        and record.synthesis_canonical_sha256 == proposal.base_canonical_sha256
+        and resolution.artifact_id == proposal.base_artifact_id
+        and resolution.artifact_version == proposal.base_artifact_version
+        and resolution.canonical_sha256 == proposal.base_canonical_sha256
+    )
+
+
+def _state_request_sha256(
+    *,
+    action: str,
+    proposal_id: UUID,
+    state_version: int,
+    patch_sha256: str | None,
+) -> str:
+    request = {
+        "action": action,
+        "proposal_id": str(proposal_id),
+        "state_version": state_version,
+        "patch_sha256": patch_sha256,
+    }
+    return hashlib.sha256(ProductionArtifactStore.canonical_json_bytes(request)).hexdigest()
+
+
+def _decision_request_sha256(
+    *,
+    proposal_id: UUID,
+    subject_id: UUID,
+    occurrence_id: UUID,
+    actor_id: UUID,
+    expected_state_version: int,
+    patch_sha256: str,
+) -> str:
+    request = {
+        "action": "reject",
+        "proposal_id": str(proposal_id),
+        "subject_id": str(subject_id),
+        "occurrence_id": str(occurrence_id),
+        "actor_id": str(actor_id),
+        "expected_state_version": expected_state_version,
+        "patch_sha256": patch_sha256,
+    }
+    return hashlib.sha256(ProductionArtifactStore.canonical_json_bytes(request)).hexdigest()
+
+
+def _decision_event_matches(
+    event: EditorialProposalEvent, actor_id: UUID, request_sha256: str
+) -> bool:
+    return (
+        event.kind is EditorialProposalEventKind.STATE_CHANGED
+        and event.state is EditorialProposalState.REJECTED
+        and event.actor_id == actor_id
+        and event.request_sha256 == request_sha256
     )

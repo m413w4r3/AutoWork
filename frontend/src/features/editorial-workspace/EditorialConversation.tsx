@@ -124,12 +124,13 @@ export function EditorialConversation({
       ) : null}
       {proposalIds.length > 0 ? (
         <div className="editorial-conversation__proposals">
-          {proposalIds.map((proposalId) => (
+          {proposalIds.map((proposalId, index) => (
             <EditorialProposalCard
               key={proposalId}
               subjectId={subjectId}
               occurrenceId={occurrenceId}
               proposalId={proposalId}
+              referenceOrdinal={index + 1}
             />
           ))}
         </div>

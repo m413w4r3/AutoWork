@@ -268,10 +268,26 @@ class EditorialProposalView(BaseModel):
     base_artifact_id: UUID
     base_artifact_version: int
     base_canonical_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    base_text: str | None
     patch_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     patch: dict[str, object] | None
     diagnostics: dict[str, object]
     created_at: str
+
+
+class EditorialProposalRejectRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_state_version: int = Field(ge=1)
+    patch_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class EditorialProposalDecisionView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID
+    state: Literal["rejected"]
+    state_version: int
 
 
 EditorialThreadEntryResultView = Annotated[
@@ -333,6 +349,10 @@ _ERROR_MESSAGES = {
         "Le contenu de cette proposition est temporairement indisponible."
     ),
     "proposal_patch_hash_mismatch": ("Le contenu vérifié de cette proposition ne correspond plus."),
+    "proposal_base_unavailable": "Le texte de référence de cette proposition est indisponible.",
+    "proposal_base_hash_mismatch": "Le texte de référence ne correspond plus à son empreinte.",
+    "proposal_state_conflict": "La proposition a changé. Actualisez-la avant de décider.",
+    "proposal_idempotency_conflict": "Cette clé est déjà associée à une autre décision.",
     "editorial_thread_conversation_missing": "La conversation de ce fil est indisponible.",
     "editorial_thread_job_missing": "La génération de ce message est indisponible.",
     "editorial_thread_session_not_lost": (
@@ -533,6 +553,80 @@ async def get_editorial_proposal(
             detail={"code": code, "message": _ERROR_MESSAGES[code]},
         ) from None
     return EditorialProposalView.model_validate(view, from_attributes=True)
+
+
+@router.post(
+    "/subjects/{subject_id}/editor/threads/{occurrence_id}/proposals/{proposal_id}/reject",
+    response_model=EditorialProposalDecisionView,
+)
+async def reject_editorial_proposal(
+    subject_id: UUID,
+    occurrence_id: UUID,
+    proposal_id: UUID,
+    request: Request,
+    payload: EditorialProposalRejectRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> EditorialProposalDecisionView:
+    if idempotency_key is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "idempotency_key_required",
+                "message": _ERROR_MESSAGES["idempotency_key_required"],
+            },
+        )
+    if not is_valid_editorial_idempotency_key(idempotency_key):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "idempotency_key_invalid",
+                "message": _ERROR_MESSAGES["idempotency_key_invalid"],
+            },
+        )
+    service = EditorialProposalService(
+        uow_factory=request.app.state.uow_factory,
+        artifact_store=request.app.state.production_artifact_store,
+    )
+    try:
+        rejected = await service.reject(
+            subject_id,
+            occurrence_id,
+            proposal_id,
+            actor_id=await _thread_actor_id(request),
+            expected_state_version=payload.expected_state_version,
+            patch_sha256=payload.patch_sha256,
+            idempotency_key=idempotency_key,
+            workspace_service=_service(request),
+        )
+    except EditorialProposalApplicationError as error:
+        code = error.code
+        response_status = (
+            status.HTTP_404_NOT_FOUND
+            if code == "proposal_not_found"
+            else status.HTTP_400_BAD_REQUEST
+            if code == "idempotency_key_invalid"
+            else status.HTTP_503_SERVICE_UNAVAILABLE
+            if code
+            in {
+                "proposal_patch_unavailable",
+                "proposal_patch_hash_mismatch",
+                "proposal_base_unavailable",
+                "proposal_base_hash_mismatch",
+            }
+            else status.HTTP_409_CONFLICT
+        )
+        raise HTTPException(
+            status_code=response_status,
+            detail={
+                "code": code,
+                "message": _ERROR_MESSAGES.get(code, "La décision est indisponible."),
+            },
+        ) from None
+    return EditorialProposalDecisionView(
+        id=rejected.id,
+        state="rejected",
+        state_version=rejected.state_version,
+    )
 
 
 @router.post(

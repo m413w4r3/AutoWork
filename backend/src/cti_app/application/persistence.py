@@ -66,6 +66,7 @@ from cti_app.domain.editorial_proposal import (
     EditorialProposal,
     EditorialProposalEvent,
     EditorialProposalModelRun,
+    EditorialProposalState,
 )
 from cti_app.domain.editorial_thread import (
     EditorialBridgeStatus,
@@ -286,6 +287,22 @@ class EditorialProposalRepository(Protocol):
     async def get_for_occurrence(
         self, subject_id: UUID, occurrence_id: UUID, proposal_id: UUID
     ) -> EditorialProposal | None: ...
+
+    async def get_event_by_idempotency(
+        self, proposal_id: UUID, idempotency_key: str
+    ) -> EditorialProposalEvent | None: ...
+
+    async def transition_if_current(
+        self,
+        *,
+        subject_id: UUID,
+        occurrence_id: UUID,
+        proposal_id: UUID,
+        expected_state: EditorialProposalState,
+        expected_state_version: int,
+        state: EditorialProposalState,
+        event: EditorialProposalEvent,
+    ) -> tuple[EditorialProposal | None, bool]: ...
 
     async def count_patch_references(self, blob_id: UUID) -> int: ...
 
