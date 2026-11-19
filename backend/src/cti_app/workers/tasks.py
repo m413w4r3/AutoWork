@@ -95,6 +95,7 @@ from cti_app.workers.broker import broker as broker
 # Une recherche ChatGPT durable dépasse largement la limite Dramatiq par
 # défaut de 600 000 ms, qui tuait le worker en pleine attente du bridge.
 EXECUTE_JOB_TIME_LIMIT_MS = int(get_settings().job_actor_time_limit_seconds * 1000)
+EDITORIAL_THREAD_JOB_KIND = "editorial_thread_message"
 
 
 def _configure_worker_logging() -> None:
@@ -162,6 +163,14 @@ def execute_job(job_id: str) -> None:
         execute_job.send_with_options(args=(job_id,), delay=delay_ms)
 
 
+@dramatiq.actor(max_retries=0, time_limit=EXECUTE_JOB_TIME_LIMIT_MS)
+def execute_editorial_thread_job(job_id: str) -> None:
+    """Execute one durable message-only editorial Bridge job."""
+    delay_ms = asyncio.run(_execute_editorial_thread_job(UUID(job_id)))
+    if delay_ms is not None:
+        execute_editorial_thread_job.send_with_options(args=(job_id,), delay=delay_ms)
+
+
 @dramatiq.actor(max_retries=0)
 def recover_abandoned_jobs() -> None:
     """Requeue jobs whose running worker stopped updating its heartbeat."""
@@ -170,8 +179,54 @@ def recover_abandoned_jobs() -> None:
             from cti_app.workers.analysis_tasks import execute_analysis_job
 
             execute_analysis_job.send(str(job_id))
+        elif kind == EDITORIAL_THREAD_JOB_KIND:
+            execute_editorial_thread_job.send(str(job_id))
         else:
             execute_job.send(str(job_id))
+
+
+async def _execute_editorial_thread_job(job_id: UUID) -> int | None:
+    from cti_app.application.editorial_workspace import EditorialWorkspaceService
+    from cti_app.workers.editorial_threads import EditorialThreadWorker
+
+    settings = get_settings()
+    engine = create_postgres_engine(settings.postgres_dsn)
+    session_factory = create_session_factory(engine)
+
+    def uow_factory() -> UnitOfWork:
+        return SqlAlchemyUnitOfWork(session_factory)
+
+    try:
+        blob_store = MinioBlobStore(
+            Minio(
+                settings.s3_endpoint,
+                access_key=settings.s3_access_key,
+                secret_key=settings.s3_secret_key,
+                secure=settings.s3_secure,
+            ),
+            physical_bucket=settings.s3_bucket,
+        )
+        blob_catalog = BlobCatalogService(blob_store, uow_factory)
+        artifact_store = ProductionArtifactStore(blob_catalog)
+        bridge_provider = create_bridge_capabilities_provider(settings)
+        model_conversations = ModelConversationService(
+            uow_factory,
+            create_model_gateway(settings, uow_factory),
+            blob_store,
+            retention_days=settings.model_conversation_retention_days,
+            conversation_session_closer=bridge_provider,
+        )
+        worker = EditorialThreadWorker(
+            uow_factory=uow_factory,
+            workspace_service=EditorialWorkspaceService(
+                uow_factory=uow_factory, artifact_store=artifact_store
+            ),
+            artifact_store=artifact_store,
+            model_conversations=model_conversations,
+        )
+        return await worker.process(job_id)
+    finally:
+        await engine.dispose()
 
 
 async def _execute_job(job_id: UUID) -> int | None:
@@ -448,6 +503,12 @@ async def _recover_abandoned_jobs() -> list[tuple[UUID, str]]:
             timedelta(seconds=settings.job_heartbeat_timeout_seconds),
             resume_current_attempt_kinds=DURABLE_RESUME_JOB_KINDS,
         )
-        return [(job.id, job.kind) for job in jobs if job.status is JobStatus.QUEUED]
+        recovered = [(job.id, job.kind) for job in jobs if job.status is JobStatus.QUEUED]
+        async with SqlAlchemyUnitOfWork(session_factory) as editorial_uow:
+            editorial_jobs = await editorial_uow.editorial_threads.list_dispatchable_jobs(
+                now=datetime.now(UTC)
+            )
+        recovered.extend((job_id, EDITORIAL_THREAD_JOB_KIND) for job_id in editorial_jobs)
+        return recovered
     finally:
         await engine.dispose()

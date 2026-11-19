@@ -19,6 +19,14 @@ class EditorialThreadConflict(EditorialThreadError):
     code = "idempotency_conflict"
 
 
+class EditorialThreadActiveJobConflict(EditorialThreadError):
+    code = "editorial_thread_active_job_conflict"
+
+
+class EditorialThreadLockTimeout(EditorialThreadError):
+    code = "editorial_thread_lock_timeout"
+
+
 class EditorialThreadEventAppendOnlyError(EditorialThreadError):
     code = "editorial_thread_event_append_only"
 
@@ -52,11 +60,23 @@ class EditorialThreadEventKind(StrEnum):
 
 class EditorialThreadJobState(StrEnum):
     QUEUED = "queued"
+    WAITING_FOR_CAPACITY = "waiting_for_capacity"
     RUNNING = "running"
     RECONCILIATION_REQUIRED = "reconciliation_required"
     COMPLETE = "complete"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+@dataclass(frozen=True, slots=True)
+class EditorialThreadJob:
+    id: UUID
+    thread_id: UUID
+    send_event_id: UUID
+    state: EditorialThreadJobState
+    lease_until: datetime | None = None
+    lease_token: UUID | None = None
+    attempt_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)

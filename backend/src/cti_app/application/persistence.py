@@ -58,9 +58,12 @@ from cti_app.domain.edition_render import EditionRender
 from cti_app.domain.editions import Edition, EditionAuditEvent, EditionStatus
 from cti_app.domain.editorial import AnalystDecision, HumanDecision
 from cti_app.domain.editorial_thread import (
+    EditorialBridgeStatus,
     EditorialThread,
     EditorialThreadEvent,
     EditorialThreadEventKind,
+    EditorialThreadJob,
+    EditorialThreadJobState,
     EditorialThreadRecord,
 )
 from cti_app.domain.entities import ProvenanceEvent, Sample, SourceDocument, Subject
@@ -200,6 +203,43 @@ class EditorialThreadRepository(Protocol):
         proposal_id: UUID | None = None,
         model_turn_id: UUID | None = None,
     ) -> EditorialThreadEvent: ...
+
+    async def enqueue_message(
+        self,
+        *,
+        job_id: UUID,
+        thread_id: UUID,
+        actor_id: UUID,
+        idempotency_key: str,
+        request_sha256: str,
+        payload_blob_ref: UUID,
+        payload_sha256: str,
+    ) -> tuple[EditorialThreadEvent, EditorialThreadJob, bool]: ...
+
+    async def get_job(self, job_id: UUID) -> EditorialThreadJob | None: ...
+
+    async def get_job_for_event(self, event_id: UUID) -> EditorialThreadJob | None: ...
+
+    async def latest_job_for_thread(self, thread_id: UUID) -> EditorialThreadJob | None: ...
+
+    async def claim_job(
+        self, job_id: UUID, *, lease_token: UUID, lease_until: datetime, now: datetime
+    ) -> EditorialThreadJob | None: ...
+
+    async def set_job_state(
+        self,
+        job_id: UUID,
+        state: EditorialThreadJobState,
+        *,
+        lease_token: UUID | None = None,
+        lease_until: datetime | None = None,
+    ) -> None: ...
+
+    async def set_bridge_status(self, thread_id: UUID, status: EditorialBridgeStatus) -> None: ...
+
+    async def list_dispatchable_jobs(
+        self, *, now: datetime, limit: int = 100
+    ) -> Sequence[UUID]: ...
 
 
 class MediaAssetRepository(Protocol):

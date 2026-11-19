@@ -137,6 +137,27 @@ export function EditorialWorkspaceLayout({
     window.requestAnimationFrame(() => opener?.focus());
   };
 
+  const returnToTargetChoice = () => {
+    const mobileViewport =
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(max-width: 767px)").matches;
+    setOpenPanel(null);
+    setMenuOpen(false);
+    overlayOpenerRef.current = null;
+    window.requestAnimationFrame(() => {
+      const selectedDocumentBlock = document.querySelector<HTMLElement>(
+        ".editorial-document__block[data-selected='true']",
+      );
+      const selectedOutlineItem = document.querySelector<HTMLElement>(
+        ".editorial-outline__item[data-selected='true']",
+      );
+      const focusTarget = mobileViewport
+        ? selectedDocumentBlock
+        : (selectedOutlineItem ?? selectedDocumentBlock);
+      focusTarget?.focus({ preventScroll: true });
+    });
+  };
+
   const toggleMenu = (button: HTMLButtonElement) => {
     if (menuOpen) {
       overlayOpenerRef.current = null;
@@ -290,6 +311,7 @@ export function EditorialWorkspaceLayout({
             readOnly={readOnly}
             onOpenSources={showSources}
             onBackToDocument={closeActiveOverlay}
+            onChangeTarget={returnToTargetChoice}
           />
         </div>
       </div>

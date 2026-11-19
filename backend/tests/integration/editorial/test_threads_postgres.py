@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from datetime import date
+import asyncio
+import hashlib
+from datetime import UTC, date, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -9,7 +11,12 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition
-from cti_app.domain.editorial_thread import EditorialThreadEventKind
+from cti_app.domain.editorial_thread import (
+    EditorialBridgeStatus,
+    EditorialThreadError,
+    EditorialThreadEventKind,
+    EditorialThreadJobState,
+)
 from cti_app.domain.entities import Subject
 from cti_app.domain.production import ProductionArtifact, ProductionArtifactStage, ProductionRun
 from cti_app.infrastructure.database.models.editorial_threads import (
@@ -307,5 +314,123 @@ async def test_thread_event_transaction_rolls_back_as_one_unit(
             )
         assert count == 0
         assert sequence == 1
+    finally:
+        await engine.dispose()
+
+
+async def test_post_races_claim_and_completion_with_thread_then_job_lock_order(
+    migrated_postgres_url: str,
+) -> None:
+    engine = create_postgres_engine(migrated_postgres_url)
+    session_factory = create_session_factory(engine)
+    try:
+        thread = await _create_thread_context(session_factory)
+        send_event = await _event(thread.id, 1, "race-initial-message")
+        job_id = uuid4()
+        async with session_factory() as session, session.begin():
+            session.add(send_event)
+            session.add(
+                EditorialThreadJobRow(
+                    id=job_id,
+                    thread_id=thread.id,
+                    send_event_id=send_event.id,
+                    state=EditorialThreadJobState.QUEUED.value,
+                    lease_until=None,
+                    lease_token=None,
+                    attempt_count=0,
+                )
+            )
+            row = await session.get(EditorialThreadRow, thread.id)
+            assert row is not None
+            row.next_sequence = 2
+            row.version = 2
+            row.generation_state = EditorialBridgeStatus.GENERATING.value
+
+        async def post(key: str) -> str:
+            async with SqlAlchemyUnitOfWork(session_factory) as uow:
+                try:
+                    await uow.editorial_threads.enqueue_message(
+                        job_id=uuid4(),
+                        thread_id=thread.id,
+                        actor_id=uuid4(),
+                        idempotency_key=key,
+                        request_sha256=hashlib.sha256(key.encode()).hexdigest(),
+                        payload_blob_ref=None,  # type: ignore[arg-type]
+                        payload_sha256=None,  # type: ignore[arg-type]
+                    )
+                except EditorialThreadError as error:
+                    await uow.rollback()
+                    return error.code if error.code != "editorial_thread_error" else str(error)
+                await uow.commit()
+                return "accepted"
+
+        now = datetime.now(UTC)
+        claim_token = uuid4()
+        lease_until = now + timedelta(minutes=1)
+
+        async def claim():
+            async with SqlAlchemyUnitOfWork(session_factory) as uow:
+                claimed = await uow.editorial_threads.claim_job(
+                    job_id,
+                    lease_token=claim_token,
+                    lease_until=lease_until,
+                    now=now,
+                )
+                await uow.commit()
+                return claimed
+
+        claim_barrier = asyncio.Barrier(2)
+
+        async def simultaneous_claim_post():
+            async def run_post() -> str:
+                await claim_barrier.wait()
+                return await post("post-vs-claim")
+
+            async def run_claim():
+                await claim_barrier.wait()
+                return await claim()
+
+            return await asyncio.wait_for(asyncio.gather(run_post(), run_claim()), timeout=10)
+
+        post_claim_result, claimed = await simultaneous_claim_post()
+        assert post_claim_result == "editorial_thread_busy"
+        assert claimed is not None
+
+        async def complete() -> None:
+            async with SqlAlchemyUnitOfWork(session_factory) as uow:
+                await uow.editorial_threads.append_event(
+                    thread_id=thread.id,
+                    kind=EditorialThreadEventKind.BRIDGE_REPLY,
+                    actor_id=None,
+                    idempotency_key="race-completion-reply",
+                    request_sha256="c" * 64,
+                    payload_blob_ref=None,
+                    payload_sha256=None,
+                )
+                await uow.editorial_threads.set_job_state(
+                    job_id,
+                    EditorialThreadJobState.COMPLETE,
+                    lease_token=claim_token,
+                )
+                await uow.editorial_threads.set_bridge_status(
+                    thread.id, EditorialBridgeStatus.REPLY_AVAILABLE
+                )
+                await uow.commit()
+
+        completion_barrier = asyncio.Barrier(2)
+
+        async def simultaneous_completion_post():
+            async def run_post() -> str:
+                await completion_barrier.wait()
+                return await post("post-vs-completion")
+
+            async def run_complete() -> None:
+                await completion_barrier.wait()
+                await complete()
+
+            return await asyncio.wait_for(asyncio.gather(run_post(), run_complete()), timeout=10)
+
+        post_completion_result, _ = await simultaneous_completion_post()
+        assert post_completion_result in {"editorial_thread_busy", "accepted"}
     finally:
         await engine.dispose()

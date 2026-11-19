@@ -137,6 +137,9 @@ class _MemoryThreadRepository:
         self.created = 0
         self.commit_count = 0
 
+    async def latest_job_for_thread(self, _thread_id: UUID):
+        return None
+
     async def get_current_by_occurrence(
         self, subject_id: UUID, production_run_id: UUID, occurrence_id: UUID
     ) -> EditorialThreadRecord | None:
@@ -743,7 +746,7 @@ async def test_generic_add_turn_rejects_editorial_discussion_replay() -> None:
             correlation_id="synthetic-correlation",
             context_subject_id=subject_id,
         )
-    assert reserved.value.code == "purpose_reserved_for_editorial_threads"
+    assert reserved.value.code == "conversation_not_found"
 
 
 @pytest.mark.asyncio

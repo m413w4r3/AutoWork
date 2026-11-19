@@ -27,6 +27,8 @@ from cti_app.application.external_effects import Reused
 from cti_app.domain.external_effects import EvidenceReference, ExternalEffectAuthority
 from cti_app.domain.model_conversations import ConversationTurnStatus
 from cti_app.domain.model_runs import (
+    EDITORIAL_BRIDGE_TURN_ID_PARAMETER,
+    EDITORIAL_DISCUSSION_PROMPT_ID,
     ModelBackend,
     ModelOutputRejection,
     ModelProvider,
@@ -36,6 +38,9 @@ from cti_app.domain.model_runs import (
     ModelSubmissionState,
     ModelTransport,
     ModelUsage,
+    editorial_model_run_error_code,
+    editorial_model_run_error_details,
+    editorial_model_run_error_message,
 )
 from cti_app.logging import get_correlation_id
 
@@ -1043,33 +1048,44 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                         else {}
                     )
                     now = self._clock()
-                    last_progress_at = _record_background_wait_state(
-                        run, progress=progress, bridge_status=background_status, now=now
+                    editorial = _is_editorial_run(run)
+                    last_progress_at = (
+                        now
+                        if editorial
+                        else _record_background_wait_state(
+                            run, progress=progress, bridge_status=background_status, now=now
+                        )
                     )
                     run.wait_for_background(
                         response_id=result.response_id or run.response_id,
                         actual_model_version=result.actual_model_version,
                         usage=result.usage,
                     )
+                    if editorial:
+                        run.error_details = None
                     elapsed_seconds = max(0.0, (now - run.started_at).total_seconds())
                     idle_seconds = max(0.0, (now - last_progress_at).total_seconds())
                     diagnostic_code: str | None = None
                     if elapsed_seconds >= wait_budget:
                         diagnostic_code = "model_background_safety_ceiling_exceeded"
-                    elif progress and idle_seconds >= idle_budget:
+                    elif not editorial and progress and idle_seconds >= idle_budget:
                         diagnostic_code = "model_background_progress_stalled"
                     if diagnostic_code is not None:
-                        details = {
-                            "diagnostic_code": diagnostic_code,
-                            "bridge_status": background_status,
-                            "bridge_response_id": result.response_id or run.response_id,
-                            "bridge_progress": _sanitize_mapping(progress),
-                            "elapsed_seconds": int(elapsed_seconds),
-                            "idle_seconds": int(idle_seconds),
-                            "idle_timeout_seconds": idle_budget,
-                            "wait_safety_ceiling_seconds": wait_budget,
-                            "last_progress_at": last_progress_at.isoformat(),
-                        }
+                        details = (
+                            editorial_model_run_error_details(diagnostic_code, run.submission_state)
+                            if _is_editorial_run(run)
+                            else {
+                                "diagnostic_code": diagnostic_code,
+                                "bridge_status": background_status,
+                                "bridge_response_id": result.response_id or run.response_id,
+                                "bridge_progress": _sanitize_mapping(progress),
+                                "elapsed_seconds": int(elapsed_seconds),
+                                "idle_seconds": int(idle_seconds),
+                                "idle_timeout_seconds": idle_budget,
+                                "wait_safety_ceiling_seconds": wait_budget,
+                                "last_progress_at": last_progress_at.isoformat(),
+                            }
+                        )
                         run.mark_external_state_unknown()
                         run.require_review(
                             diagnostic_code,
@@ -1082,7 +1098,7 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                         )
                         await uow.model_runs.save(run)
                         await uow.commit()
-                        return ModelExecution(run, metadata=details)
+                        return ModelExecution(run, metadata=details or {})
                     await uow.model_runs.save(run)
                     await uow.commit()
                     raise BackgroundResponsePendingError(
@@ -1093,10 +1109,20 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                     )
                 if result.status is AdapterResultStatus.NEEDS_REVIEW:
                     run.mark_external_state_unknown()
+                    code = (
+                        ModelSubmissionReconciliationRequiredError.code
+                        if _is_editorial_run(run)
+                        else str(result.metadata.get("reason", "no_final_answer"))
+                    )
+                    details = (
+                        editorial_model_run_error_details(code, run.submission_state)
+                        if _is_editorial_run(run)
+                        else result.metadata
+                    )
                     run.require_review(
-                        str(result.metadata.get("reason", "no_final_answer")),
+                        code,
                         "ChatGPT s'est arrêté sans produire de réponse finale.",
-                        details=result.metadata,
+                        details=details,
                         response_id=result.response_id or run.response_id,
                     )
                     await uow.model_runs.save(run)
@@ -1105,7 +1131,11 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                         run=run,
                         output_text=None,
                         conversation=result.conversation,
-                        metadata={**result.metadata, "bridge_status": "needs_review"},
+                        metadata=(
+                            {"reason": "no_final_answer", "bridge_status": "needs_review"}
+                            if _is_editorial_run(run)
+                            else {**result.metadata, "bridge_status": "needs_review"}
+                        ),
                     )
                 execution = await self._complete_run(run, result, duration_ms=elapsed_ms)
                 await uow.model_runs.save(run)
@@ -1114,7 +1144,11 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
             except BackgroundResponsePendingError:
                 raise
             except Exception as exc:
-                details = _error_details(exc)
+                editorial = _is_editorial_run(run)
+                failure_code, failure_message, editorial_details = (
+                    _editorial_failure_fields(run, exc) if editorial else ("", "", None)
+                )
+                details = editorial_details if editorial else _error_details(exc)
                 verified_terminal_failure = _is_verified_terminal_background_failure(exc, run)
                 requires_reconciliation = (
                     _submission_may_have_started(exc) and not verified_terminal_failure
@@ -1128,6 +1162,7 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                             run,
                             exc=exc,
                             request_id=run.bridge_request_id,
+                            editorial=editorial,
                         ),
                         response_id=getattr(exc, "bridge_run_id", None) or run.response_id,
                     )
@@ -1137,8 +1172,10 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                             response_id=getattr(exc, "bridge_run_id", None) or run.response_id
                         )
                     run.fail(
-                        str(getattr(exc, "code", "model_resume_failed")),
-                        _public_error(exc),
+                        failure_code
+                        if editorial
+                        else str(getattr(exc, "code", "model_resume_failed")),
+                        failure_message if editorial else _public_error(exc),
                         details=details,
                     )
                 await uow.model_runs.save(run)
@@ -1154,6 +1191,7 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
         *,
         output_schema: type[BaseModel] | None = None,
     ) -> ModelExecution:
+        editorial_discussion = _is_editorial_request(request)
         # Le choix de l'adapter et sa validation portent sur la même exigence :
         # un draft avec schéma doit atteindre un adapter structured.
         requires_structured_output = (
@@ -1220,7 +1258,9 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                     #   Nothing has been sent to a provider yet, so this is a first
                     #   submission, not a replay, and is allowed exactly once.
                     if run.submission_state is not ModelSubmissionState.NOT_SUBMITTED:
-                        details = _reconciliation_details(run)
+                        details = _reconciliation_details(
+                            run, editorial=_is_editorial_request(request)
+                        )
                         self._diagnostics.record(
                             event="model.reconciliation_required",
                             run_id=run.id,
@@ -1367,21 +1407,36 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                             actual_model_version=result.actual_model_version,
                             usage=result.usage,
                         )
-                        _record_background_wait_state(
-                            persisted,
-                            progress=progress,
-                            bridge_status=background_status,
-                            now=self._clock(),
-                        )
+                        if editorial_discussion:
+                            persisted.error_details = None
+                        else:
+                            _record_background_wait_state(
+                                persisted,
+                                progress=progress,
+                                bridge_status=background_status,
+                                now=self._clock(),
+                            )
                         await uow.model_runs.save(persisted)
                         await uow.commit()
                         return ModelExecution(persisted)
                     if result.status is AdapterResultStatus.NEEDS_REVIEW:
                         persisted.mark_external_state_unknown()
+                        review_code = (
+                            ModelSubmissionReconciliationRequiredError.code
+                            if editorial_discussion
+                            else str(result.metadata.get("reason", "no_final_answer"))
+                        )
+                        review_details = (
+                            editorial_model_run_error_details(
+                                review_code, persisted.submission_state
+                            )
+                            if editorial_discussion
+                            else result.metadata
+                        )
                         persisted.require_review(
-                            str(result.metadata.get("reason", "no_final_answer")),
+                            review_code,
                             "ChatGPT s'est arrêté sans produire de réponse finale.",
-                            details=result.metadata,
+                            details=review_details,
                             response_id=result.response_id or persisted.response_id,
                         )
                         await uow.model_runs.save(persisted)
@@ -1390,7 +1445,11 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                             run=persisted,
                             output_text=None,
                             conversation=result.conversation,
-                            metadata=dict(result.metadata),
+                            metadata=(
+                                {"reason": "no_final_answer", "bridge_status": "needs_review"}
+                                if editorial_discussion
+                                else dict(result.metadata)
+                            ),
                         )
                     execution = await self._complete_run(
                         persisted,
@@ -1421,13 +1480,20 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                             await uow.commit()
                 raise
             except Exception as exc:
+                editorial_discussion = _is_editorial_request(request)
+                error_code = str(getattr(exc, "code", "model_call_failed"))
+                if editorial_discussion:
+                    error_code = editorial_model_run_error_code(error_code)
+                failure_fields = (
+                    {"error_type": type(exc).__name__} if editorial_discussion else {"error": exc}
+                )
                 self._diagnostics.record_failure(
                     event="model.call_failed",
                     run_id=run.id,
                     stage=request.prompt_template_id,
                     correlation_id=get_correlation_id(),
-                    error=exc,
-                    error_code=str(getattr(exc, "code", "model_call_failed")),
+                    error_code=error_code,
+                    **failure_fields,
                     provider=run.provider.value if run.provider else None,
                     model_role=role.value,
                     routing_hint=request.routing_hint.value,
@@ -1450,29 +1516,43 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                         ModelRunStatus.RUNNING,
                         ModelRunStatus.WAITING_BACKGROUND,
                     }:
+                        safe_code, safe_message, safe_details = (
+                            _editorial_failure_fields(persisted, exc)
+                            if editorial_discussion
+                            else ("", "", None)
+                        )
                         if _is_confirmed_terminal_bridge_failure(exc, request):
                             persisted.mark_verified_terminal_failure(
                                 response_id=getattr(exc, "bridge_run_id", None)
                             )
                             persisted.fail(
-                                str(getattr(exc, "code", "model_call_failed")),
-                                _public_error(exc),
-                                details=_error_details(exc),
+                                safe_code
+                                if editorial_discussion
+                                else str(getattr(exc, "code", "model_call_failed")),
+                                safe_message if editorial_discussion else _public_error(exc),
+                                details=safe_details
+                                if editorial_discussion
+                                else _error_details(exc),
                             )
                         elif _is_certain_pre_submission_failure(exc):
                             # Only an explicit proof that the provider was not
                             # reached permits the FAILED/NOT_SUBMITTED state.
                             persisted.submission_state = ModelSubmissionState.NOT_SUBMITTED
                             persisted.fail(
-                                str(getattr(exc, "code", "model_call_failed")),
-                                _public_error(exc),
-                                details=_error_details(exc),
+                                safe_code
+                                if editorial_discussion
+                                else str(getattr(exc, "code", "model_call_failed")),
+                                safe_message if editorial_discussion else _public_error(exc),
+                                details=safe_details
+                                if editorial_discussion
+                                else _error_details(exc),
                             )
                         elif _submission_may_have_started(exc):
                             details = _reconciliation_details(
                                 persisted,
                                 exc=exc,
                                 request_id=safe_request.request_id,
+                                editorial=editorial_discussion,
                             )
                             persisted.require_review(
                                 ModelSubmissionReconciliationRequiredError.code,
@@ -1484,10 +1564,19 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                                 details=details, model_run_id=persisted.id
                             )
                         else:
+                            safe_code, safe_message, safe_details = (
+                                _editorial_failure_fields(persisted, exc)
+                                if editorial_discussion
+                                else ("", "", None)
+                            )
                             persisted.fail(
-                                str(getattr(exc, "code", "model_call_failed")),
-                                _public_error(exc),
-                                details=_error_details(exc),
+                                safe_code
+                                if editorial_discussion
+                                else str(getattr(exc, "code", "model_call_failed")),
+                                safe_message if editorial_discussion else _public_error(exc),
+                                details=safe_details
+                                if editorial_discussion
+                                else _error_details(exc),
                             )
                         await uow.model_runs.save(persisted)
                         await uow.commit()
@@ -1513,11 +1602,20 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
             )
             await uow.model_runs.save(persisted)
             await uow.commit()
+        editorial = _is_editorial_run(persisted)
+        diagnostic_fields: dict[str, Any] = {
+            "error_code": (
+                editorial_model_run_error_code(getattr(exc, "code", "model_call_failed"))
+                if editorial
+                else str(getattr(exc, "code", "model_call_failed"))
+            ),
+        }
+        if not editorial:
+            diagnostic_fields["failed_bridge_run_id"] = getattr(exc, "bridge_run_id", None)
         self._diagnostics.record(
             event="model.bridge_attempt_retried",
             run_id=run_id,
-            failed_bridge_run_id=getattr(exc, "bridge_run_id", None),
-            error_code=str(getattr(exc, "code", "model_call_failed")),
+            **diagnostic_fields,
             next_attempt=attempt,
             correlation_id=get_correlation_id(),
         )
@@ -1567,6 +1665,17 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
             if isinstance(citations, list)
             else ()
         )
+        if (
+            _is_editorial_run(run)
+            and result.conversation is not None
+            and result.conversation.verified
+            and result.conversation.turn_id
+            and len(result.conversation.turn_id) <= 255
+        ):
+            run.parameters = {
+                **run.parameters,
+                EDITORIAL_BRIDGE_TURN_ID_PARAMETER: result.conversation.turn_id,
+            }
         run.citation_count = len(citations) if isinstance(citations, list) else 0
         run.extracted_url_count = (
             len(
@@ -1743,6 +1852,28 @@ def _public_error(exc: Exception) -> str:
     return "L'appel au modèle a échoué."
 
 
+def _is_editorial_request(request: ModelRequest) -> bool:
+    return (
+        request.metadata.get("editorial_discussion") is True
+        or request.prompt_template_id == EDITORIAL_DISCUSSION_PROMPT_ID
+    )
+
+
+def _is_editorial_run(run: ModelRun) -> bool:
+    return run.prompt_template_id == EDITORIAL_DISCUSSION_PROMPT_ID
+
+
+def _editorial_failure_fields(
+    run: ModelRun, exc: BaseException
+) -> tuple[str, str, dict[str, Any] | None]:
+    code = editorial_model_run_error_code(getattr(exc, "code", "editorial_model_call_failed"))
+    return (
+        code,
+        editorial_model_run_error_message(code),
+        editorial_model_run_error_details(code, run.submission_state),
+    )
+
+
 def _is_certain_pre_submission_failure(exc: Exception) -> bool:
     submission_state = getattr(exc, "submission_state", None)
     if submission_state == "pre_submission":
@@ -1873,7 +2004,17 @@ def _reconciliation_details(
     *,
     exc: Exception | None = None,
     request_id: str | None = None,
+    editorial: bool | None = None,
 ) -> dict[str, Any]:
+    is_editorial = _is_editorial_run(run) if editorial is None else editorial
+    if is_editorial:
+        return (
+            editorial_model_run_error_details(
+                ModelSubmissionReconciliationRequiredError.code,
+                run.submission_state,
+            )
+            or {}
+        )
     effective_request_id = request_id or _bridge_request_id(run)
     if exc is None:
         details: dict[str, Any] = {

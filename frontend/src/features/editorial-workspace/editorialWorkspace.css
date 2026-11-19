@@ -5,6 +5,7 @@
   --editorial-link: #294137;
   --editorial-brand: #1f6042;
   --editorial-warning: #7a3c25;
+  --editorial-danger: #7a1f1a;
   --editorial-technical: #405249;
   --editorial-attention-indicator: #b65d37;
   --editorial-page: #eef2ed;
@@ -624,6 +625,32 @@ main:has(> .editorial-route-state) > .app-header {
   overflow-wrap: anywhere;
 }
 
+.editorial-conversation__target {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.editorial-conversation__target-label {
+  min-width: 0;
+  margin: 0;
+}
+
+.editorial-conversation__change-target {
+  min-height: 44px;
+  flex: 0 0 auto;
+  margin: -0.55rem -0.35rem 0 0;
+  padding: 0 0.35rem;
+  border: 0;
+  color: var(--editorial-link);
+  background: transparent;
+  font: inherit;
+  font-size: 0.75rem;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
 .editorial-conversation__timeline {
   display: grid;
   gap: 0.65rem;
@@ -654,6 +681,111 @@ main:has(> .editorial-route-state) > .app-header {
   margin: 0;
   white-space: pre-wrap;
   line-height: 1.5;
+}
+
+.editorial-conversation__composer {
+  display: grid;
+  gap: 0.55rem;
+  margin-top: 1rem;
+}
+
+.editorial-conversation__composer label {
+  font-size: 0.85rem;
+  font-weight: 650;
+}
+
+.editorial-conversation__composer textarea {
+  width: 100%;
+  min-height: 6.5rem;
+  padding: 0.7rem;
+  border: 1px solid var(--editorial-divider);
+  border-radius: 0.4rem;
+  color: var(--editorial-ink);
+  background: var(--editorial-white);
+  font: inherit;
+  line-height: 1.45;
+  resize: vertical;
+}
+
+.editorial-conversation__composer textarea:focus-visible,
+.editorial-conversation__suggestions button:focus-visible,
+.editorial-conversation__send:focus-visible {
+  outline: 3px solid var(--editorial-brand);
+  outline-offset: 2px;
+}
+
+.editorial-conversation__suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.editorial-conversation__suggestions button {
+  min-height: 40px;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--editorial-divider);
+  border-radius: 999px;
+  color: var(--editorial-ink);
+  background: var(--editorial-white);
+  font: inherit;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+
+.editorial-conversation__send {
+  min-height: 44px;
+  justify-self: start;
+  padding: 0.55rem 0.85rem;
+  border: 0;
+  border-radius: 0.4rem;
+  color: var(--editorial-white);
+  background: var(--editorial-brand);
+  font: inherit;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.editorial-conversation__send:disabled,
+.editorial-conversation__suggestions button:disabled {
+  border-color: var(--editorial-control-border);
+  color: var(--editorial-muted);
+  background: var(--editorial-disabled-surface);
+  cursor: not-allowed;
+  opacity: 1;
+}
+
+.editorial-conversation__send:disabled {
+  border: 1px solid var(--editorial-control-border);
+}
+
+.editorial-conversation__announcement,
+.editorial-conversation__error {
+  margin: 0;
+  font-size: 0.82rem;
+}
+
+.editorial-conversation__error {
+  color: var(--editorial-danger);
+}
+
+@media (max-width: 520px) {
+  .editorial-conversation__composer textarea {
+    font-size: 16px;
+  }
+
+  .editorial-conversation__suggestions {
+    display: grid;
+  }
+
+  .editorial-conversation__suggestions button {
+    width: 100%;
+    min-height: 44px;
+    text-align: left;
+  }
+
+  .editorial-conversation__send {
+    width: 100%;
+  }
 }
 
 .editorial-evidence h3 {
@@ -961,22 +1093,31 @@ main:has(> .editorial-route-state) > .app-header {
     height: 100dvh;
     padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom);
     border: 0;
+    overflow: hidden;
     transform: none;
   }
 
   .editorial-inspector {
-    min-height: 100%;
-    padding: 0.75rem 1rem 2rem;
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
+    height: 100%;
+    min-height: 0;
+    padding: 0;
+    overflow: hidden;
   }
 
   .editorial-inspector__back {
-    position: sticky;
-    z-index: 2;
-    top: 0;
     width: 100%;
-    margin-bottom: 0.8rem;
+    margin: 0;
     background: var(--editorial-panel);
     text-align: left;
+  }
+
+  .editorial-inspector__content {
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 0.75rem 1rem 2rem;
   }
 
   .editorial-document {

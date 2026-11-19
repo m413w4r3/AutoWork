@@ -1,24 +1,31 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from io import BytesIO
 from typing import Any, Protocol
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from cti_app.application.blob_storage import BlobStore
 from cti_app.application.blobs import BlobCatalogService
+from cti_app.application.editorial_conversation_turns import (
+    EDITORIAL_DISCUSSION_PROMPT_VERSION as EDITORIAL_DISCUSSION_PROMPT_VERSION,
+)
+from cti_app.application.editorial_conversation_turns import (
+    EditorialConversationTurns,
+    EditorialDiscussionContext,
+    EditorialDiscussionObjective,
+    EditorialThreadPathResult,
+)
+from cti_app.application.editorial_conversation_turns import (
+    _editorial_discussion_prompt as _editorial_discussion_prompt,
+)
 from cti_app.application.model_gateway import (
-    BRIDGE_SOURCE_PROVENANCE_KEY,
     BridgeExternalEffectBinding,
-    ConversationContext,
     ModelExecution,
     ModelGateway,
     ModelGatewayError,
-    ModelRequest,
     ModelRoutingHint,
     ModelSubmissionReconciliationRequiredError,
 )
@@ -301,6 +308,7 @@ class ModelConversationService:
         self.retention_days = retention_days
         self._conversation_session_closer = conversation_session_closer
         self._visible_recovery_transport = visible_recovery_transport
+        self._editorial_turns = EditorialConversationTurns()
 
     async def create(
         self,
@@ -385,6 +393,12 @@ class ModelConversationService:
             existing = await uow.model_conversations.get(conversation_id)
             if existing is not None:
                 self._ensure_visible(existing, subject_id)
+                if existing.purpose is ConversationPurpose.EDITORIAL_DISCUSSION:
+                    if _editorial_thread_id is None:
+                        raise ConversationNotFoundError("Conversation introuvable")
+                    await self._require_editorial_thread_path(uow, existing, _editorial_thread_id)
+                elif _editorial_thread_id is not None:
+                    raise EditorialPurposeReservedError()
                 return existing
             conversation = ModelConversation(
                 id=conversation_id,
@@ -414,28 +428,68 @@ class ModelConversationService:
         status: ConversationStatus | None = None,
         provider: ModelProvider | None = None,
     ) -> Sequence[ModelConversation]:
+        if purpose is ConversationPurpose.EDITORIAL_DISCUSSION:
+            return ()
         async with self._uow_factory() as uow:
-            return await uow.model_conversations.list(
+            conversations = await uow.model_conversations.list(
                 edition_id=edition_id,
                 subject_id=subject_id,
                 purpose=purpose,
                 status=status,
                 provider=provider,
             )
+        return tuple(
+            item
+            for item in conversations
+            if item.purpose is not ConversationPurpose.EDITORIAL_DISCUSSION
+        )
 
     async def get(
         self, conversation_id: UUID, *, context_subject_id: UUID | None = None
     ) -> ModelConversation:
         async with self._uow_factory() as uow:
             conversation = await uow.model_conversations.get(conversation_id)
-        self._ensure_visible(conversation, context_subject_id)
+        self._ensure_generic_visible(conversation, context_subject_id)
         assert conversation is not None
+        return conversation
+
+    async def get_editorial_thread_conversation(
+        self,
+        conversation_id: UUID,
+        *,
+        thread_id: UUID,
+        context_subject_id: UUID | None = None,
+    ) -> ModelConversation:
+        """Read a private discussion only through its owning editorial thread."""
+        async with self._uow_factory() as uow:
+            conversation = await uow.model_conversations.get(conversation_id)
+            self._ensure_visible(conversation, context_subject_id)
+            if conversation is None:
+                raise ConversationNotFoundError("Conversation introuvable")
+            await self._require_editorial_thread_path(uow, conversation, thread_id)
         return conversation
 
     async def turns(
         self, conversation_id: UUID, *, context_subject_id: UUID | None = None
     ) -> Sequence[ConversationTurnContent]:
         await self.get(conversation_id, context_subject_id=context_subject_id)
+        return await self._read_turns(conversation_id)
+
+    async def turns_for_editorial_thread(
+        self,
+        conversation_id: UUID,
+        *,
+        thread_id: UUID,
+        context_subject_id: UUID | None = None,
+    ) -> Sequence[ConversationTurnContent]:
+        await self.get_editorial_thread_conversation(
+            conversation_id,
+            thread_id=thread_id,
+            context_subject_id=context_subject_id,
+        )
+        return await self._read_turns(conversation_id)
+
+    async def _read_turns(self, conversation_id: UUID) -> Sequence[ConversationTurnContent]:
         async with self._uow_factory() as uow:
             turns = await uow.model_conversation_turns.list_for_conversation(conversation_id)
             blobs = {}
@@ -686,7 +740,7 @@ class ModelConversationService:
             )
         async with self._uow_factory() as uow:
             conversation = await uow.model_conversations.get_for_update(conversation_id)
-            self._ensure_visible(conversation, context_subject_id)
+            self._ensure_generic_visible(conversation, context_subject_id)
             if conversation is None:
                 raise ConversationNotFoundError("Conversation introuvable dans ce sujet")
             turn = await uow.model_conversation_turns.get(turn_id)
@@ -785,7 +839,7 @@ class ModelConversationService:
             )
         async with self._uow_factory() as uow:
             conversation = await uow.model_conversations.get(conversation_id)
-            self._ensure_visible(conversation, context_subject_id)
+            self._ensure_generic_visible(conversation, context_subject_id)
             turn = await uow.model_conversation_turns.get(turn_id)
             if turn is None or turn.conversation_id != conversation_id:
                 raise ConversationNotFoundError("Tour introuvable dans cette conversation")
@@ -940,7 +994,7 @@ class ModelConversationService:
                 raise ConversationNotFoundError("Tour introuvable dans cette conversation")
             run = await uow.model_runs.get_for_update(turn.model_run_id)
             conversation = await uow.model_conversations.get_for_update(conversation_id)
-            self._ensure_visible(conversation, context_subject_id)
+            self._ensure_generic_visible(conversation, context_subject_id)
             locked_turn = await uow.model_conversation_turns.get(turn_id)
             if run is None or conversation is None or locked_turn is None:
                 raise ModelConversationReconciliationError(
@@ -1029,438 +1083,27 @@ class ModelConversationService:
         lifecycle_policy: ConversationPolicy = ConversationPolicy.KEEP,
         bridge_external_effect_binding: BridgeExternalEffectBinding | None = None,
         _editorial_thread_id: UUID | None = None,
+        editorial_objective: EditorialDiscussionObjective | None = None,
+        editorial_context: EditorialDiscussionContext | None = None,
     ) -> ModelConversationTurn:
-        message = message.strip()
-        if not message:
-            raise ConversationPolicyError("Le message est vide")
-        duplicate_success: ModelConversationTurn | None = None
-        duplicate_conversation: ModelConversation | None = None
-        async with self._uow_factory() as uow:
-            duplicate = await uow.model_conversation_turns.get_by_idempotency_key(idempotency_key)
-            if duplicate is not None:
-                conversation = await uow.model_conversations.get(duplicate.conversation_id)
-                self._ensure_visible(conversation, context_subject_id)
-                assert conversation is not None
-                await self._require_editorial_thread_path(uow, conversation, _editorial_thread_id)
-                if duplicate.conversation_id != conversation_id:
-                    raise ConversationPolicyError(
-                        "La clé d'idempotence appartient à une autre conversation"
-                    )
-                if duplicate.input_sha256 != hashlib.sha256(message.encode()).hexdigest():
-                    raise ConversationPolicyError(
-                        "La clé d'idempotence appartient à un autre message"
-                    )
-                # The caller must be able to tell a completed turn from one that
-                # ended badly: returning a failed turn as if it succeeded would
-                # have the caller look for an output that will never exist.
-                if duplicate.status is ConversationTurnStatus.SUCCEEDED:
-                    duplicate_success = duplicate
-                    duplicate_conversation = conversation
-                elif duplicate.status is ConversationTurnStatus.RUNNING:
-                    # Resume the existing turn rather than re-sending the prompt.
-                    return duplicate
-                else:
-                    failed_run = (
-                        await uow.model_runs.get(duplicate.model_run_id)
-                        if duplicate.status is ConversationTurnStatus.FAILED
-                        else None
-                    )
-                    failed_details = failed_run.error_details if failed_run is not None else None
-                    completed_response = (
-                        isinstance(failed_details, dict)
-                        and failed_details.get("completed_response") is True
-                    )
-                    raw_phase = (
-                        failed_details.get("phase") if isinstance(failed_details, dict) else None
-                    )
-                    phase = raw_phase[:64] if isinstance(raw_phase, str) else None
-                    if completed_response:
-                        submission_state = "post_submission"
-                    elif (
-                        failed_run is not None
-                        and failed_run.submission_state is ModelSubmissionState.NOT_SUBMITTED
-                    ):
-                        submission_state = "pre_submission"
-                    else:
-                        submission_state = None
-                    raise ConversationTurnFailedError(
-                        duplicate.error_message or "Le tour précédent n'a pas abouti",
-                        code=duplicate.error_code or "conversation_turn_failed",
-                        status=duplicate.status,
-                        submission_state=submission_state,
-                        phase=phase,
-                        completed_response=completed_response,
-                        retryable=(
-                            isinstance(failed_details, dict)
-                            and failed_details.get("retryable") is True
-                        ),
-                        retry_after_seconds=(
-                            float(failed_details["retry_after"])
-                            if isinstance(failed_details, dict)
-                            and isinstance(failed_details.get("retry_after"), int | float)
-                            and not isinstance(failed_details.get("retry_after"), bool)
-                            else None
-                        ),
-                    )
-            else:
-                conversation = await uow.model_conversations.get(conversation_id)
-                self._ensure_visible(conversation, context_subject_id)
-                assert conversation is not None
-                await self._require_editorial_thread_path(uow, conversation, _editorial_thread_id)
-
-        if duplicate_success is not None:
-            # The durable result may have committed while the process crashed
-            # before closing the exact live tab. Replay must never submit again,
-            # but it must retry that idempotent external close for archived
-            # DELETE_ON_SUCCESS conversations.
-            if (
-                lifecycle_policy is ConversationPolicy.DELETE_ON_SUCCESS
-                and duplicate_conversation is not None
-                and duplicate_conversation.status is ConversationStatus.ARCHIVED
-                and duplicate_conversation.transport is ConversationTransport.CHATGPT_BRIDGE
-                and self._conversation_session_closer is not None
-            ):
-                try:
-                    await self._conversation_session_closer.archive_conversation(conversation_id)
-                except Exception as exc:
-                    failure = conversation_close_failure_fields(exc)
-                    logger.warning(
-                        "conversation_session_close_failed conversation_id=%s error_code=%s "
-                        "cause_code=%s retryable=%s phase=%s reason=%s details=%s",
-                        conversation_id,
-                        failure["error_code"],
-                        failure["cause_code"],
-                        failure.get("retryable"),
-                        failure.get("phase"),
-                        failure["reason"],
-                        failure["details"],
-                        exc_info=True,
-                    )
-            return duplicate_success
-
-        input_bytes = message.encode()
-        input_blob = await self._catalog.ingest(
-            BytesIO(input_bytes),
-            logical_bucket="model-conversation-inputs",
-            mime_type="text/plain; charset=utf-8",
+        return await self._editorial_turns.add_turn(
+            self,
+            conversation_id,
+            message=message,
+            mode=mode,
+            external_llm_allowed=external_llm_allowed,
+            web_search=web_search,
+            stateless_external=stateless_external,
+            timeout_seconds=timeout_seconds,
+            idempotency_key=idempotency_key,
+            correlation_id=correlation_id,
+            context_subject_id=context_subject_id,
+            lifecycle_policy=lifecycle_policy,
+            bridge_external_effect_binding=bridge_external_effect_binding,
+            _editorial_thread_id=_editorial_thread_id,
+            editorial_objective=editorial_objective,
+            editorial_context=editorial_context,
         )
-        input_reference = f"blob://{input_blob.id}"
-        run_id = uuid4()
-
-        async with self._uow_factory() as uow:
-            conversation = await uow.model_conversations.get_for_update(conversation_id)
-            self._ensure_visible(conversation, context_subject_id)
-            assert conversation is not None
-            await self._require_editorial_thread_path(uow, conversation, _editorial_thread_id)
-            if conversation.status is ConversationStatus.BUSY:
-                raise ConversationBusyError("Une question est déjà en cours")
-            if conversation.transport is ConversationTransport.OPENAI_RESPONSES:
-                raise ConversationPolicyError(
-                    "Le transport Conversation API OpenAI natif n'est pas encore configuré"
-                )
-            if stateless_external and (
-                conversation.transport is not ConversationTransport.CHATGPT_BRIDGE
-                or conversation.purpose is not ConversationPurpose.PIVOT_RESEARCH
-            ):
-                raise ConversationPolicyError(
-                    "Le transport stateless est réservé aux tours Bridge d'investigation"
-                )
-            if mode is ConversationMode.CONTINUE and conversation.transport not in {
-                ConversationTransport.CHATGPT_BRIDGE,
-                ConversationTransport.OPENAI_RESPONSES,
-            }:
-                raise ConversationPolicyError("Ce transport ne permet pas encore continue")
-            if stateless_external:
-                previous_turns = await uow.model_conversation_turns.list_for_conversation(
-                    conversation_id
-                )
-                parent = max(previous_turns, key=lambda item: item.sequence, default=None)
-            else:
-                parent = (
-                    await uow.model_conversation_turns.get(conversation.head_turn_id)
-                    if conversation.head_turn_id
-                    else None
-                )
-            if mode is ConversationMode.CONTINUE and (
-                parent is None or (not parent.external_turn_id and not stateless_external)
-            ):
-                raise ConversationPolicyError(
-                    "Aucun tour externe vérifié à poursuivre pour cette conversation"
-                )
-            try:
-                conversation.start_turn(mode=mode)
-            except ValueError as exc:
-                if str(exc) == "conversation_busy":
-                    raise ConversationBusyError("Une question est déjà en cours") from exc
-                raise ConversationPolicyError(str(exc)) from exc
-            context = (
-                None
-                if stateless_external
-                else ConversationContext(
-                    mode=mode.value,
-                    id=conversation.id,
-                    expected_turn_id=(
-                        parent.external_turn_id
-                        if mode is ConversationMode.CONTINUE and parent
-                        else None
-                    ),
-                    parent_turn_id=(
-                        conversation.head_turn_id if mode is ConversationMode.CONTINUE else None
-                    ),
-                    previous_head_hash=(
-                        parent.output_sha256
-                        if mode is ConversationMode.CONTINUE and parent
-                        else None
-                    ),
-                    expected_profile=conversation.expected_profile,
-                    ui_model=conversation.requested_model,
-                    external_id=conversation.external_id,
-                )
-            )
-            request = ModelRequest(
-                text=message,
-                prompt_template_id=CONVERSATION_PROMPT_ID,
-                prompt_template_version=CONVERSATION_PROMPT_VERSION,
-                evidence_pack_hash=NO_EVIDENCE_PACK_HASH,
-                external_llm_allowed=external_llm_allowed,
-                routing_hint=_routing_hint(conversation.purpose),
-                sensitivity="conversation",
-                metadata={"conversation_output": True, "primary_evidence": False},
-                web_search=web_search,
-                provider=conversation.provider,
-                conversation=context,
-                run_id=run_id,
-                timeout_seconds=timeout_seconds,
-            )
-            run = self._gateway.build_run(request, _role(conversation.purpose))
-            turn = ModelConversationTurn(
-                conversation_id=conversation.id,
-                sequence=conversation.turn_count,
-                parent_turn_id=(
-                    parent.id
-                    if stateless_external and parent is not None
-                    else conversation.head_turn_id
-                    if mode is ConversationMode.CONTINUE
-                    else None
-                ),
-                model_run_id=run.id,
-                input_blob_reference=input_reference,
-                input_sha256=input_blob.descriptor.sha256,
-                idempotency_key=idempotency_key,
-                correlation_id=correlation_id,
-            )
-            if bridge_external_effect_binding is not None:
-                if (
-                    not stateless_external
-                    or conversation.transport is not ConversationTransport.CHATGPT_BRIDGE
-                ):
-                    raise ConversationPolicyError(
-                        "External effect bindings are reserved for stateless Bridge turns"
-                    )
-                if bridge_external_effect_binding.authority.bridge_turn_id not in (
-                    None,
-                    turn.id,
-                ) or bridge_external_effect_binding.authority.model_run_id not in (None, run.id):
-                    raise ConversationPolicyError(
-                        "Bridge external effect binding belongs to another persisted attempt"
-                    )
-                authority = replace(
-                    bridge_external_effect_binding.authority,
-                    bridge_turn_id=turn.id,
-                    model_run_id=run.id,
-                )
-                bridge_external_effect_binding = replace(
-                    bridge_external_effect_binding,
-                    authority=authority,
-                    bridge_turn_id=turn.id,
-                    model_run_id=run.id,
-                    model_input_sha256=turn.input_sha256,
-                    authorized_input_hash=run.authorized_input_hash,
-                )
-                run.parameters = {
-                    **run.parameters,
-                    BRIDGE_SOURCE_PROVENANCE_KEY: {
-                        "family": bridge_external_effect_binding.family,
-                        "turn_input_sha256": turn.input_sha256,
-                        "authorized_input_hash": run.authorized_input_hash,
-                        "evidence_refs": [
-                            reference.to_json()
-                            for reference in bridge_external_effect_binding.evidence_refs
-                        ],
-                    },
-                }
-                request = replace(
-                    request,
-                    bridge_external_effect_binding=bridge_external_effect_binding,
-                )
-            await uow.model_runs.add(run)
-            await uow.model_conversation_turns.add(turn)
-            await uow.model_conversations.save(conversation)
-            await uow.commit()
-
-        try:
-            execution = await self._gateway.execute(request, _role(conversation.purpose))
-            if execution.run.status is ModelRunStatus.NEEDS_REVIEW:
-                # A native provider needs_review is already a reviewable,
-                # non-replayable outcome with its own reason. Keep it typed.
-                raise _needs_review_error(execution)
-            if execution.run.status is not ModelRunStatus.SUCCEEDED or not execution.output_text:
-                raise ModelConversationError("Le modèle n'a pas produit de réponse finale")
-            metadata = execution.conversation
-            if (
-                not stateless_external
-                and conversation.transport is ConversationTransport.CHATGPT_BRIDGE
-                and (
-                    metadata is None
-                    or metadata.id != str(conversation.id)
-                    or not metadata.verified
-                    or not metadata.turn_id
-                )
-            ):
-                raise ModelConversationError("Le bridge n'a pas vérifié la conversation cible")
-            output_reference = execution.run.output_references[0]
-            output_sha256 = hashlib.sha256(execution.output_text.encode()).hexdigest()
-            should_close_session = (
-                lifecycle_policy is ConversationPolicy.DELETE_ON_SUCCESS
-                and conversation.transport is ConversationTransport.CHATGPT_BRIDGE
-            )
-            async with self._uow_factory() as uow:
-                persisted_conversation = await uow.model_conversations.get_for_update(
-                    conversation.id
-                )
-                persisted_turn = await uow.model_conversation_turns.get(turn.id)
-                if persisted_conversation is None or persisted_turn is None:
-                    raise ModelConversationError("Le tour conversationnel a disparu")
-                persisted_turn.succeed(
-                    output_blob_reference=output_reference,
-                    output_sha256=output_sha256,
-                    # No verified bridge metadata means no verified external
-                    # identity: leave it unset rather than passing off the
-                    # ModelRun response id as a continuation handle.
-                    external_turn_id=(
-                        metadata.turn_id
-                        if metadata is not None and not stateless_external
-                        else None
-                    ),
-                )
-                persisted_conversation.finish_turn(
-                    persisted_turn.id,
-                    external_locator=(
-                        metadata.external_locator
-                        if metadata is not None and not stateless_external
-                        else None
-                    ),
-                )
-                # KEEP: durable output first, conversation stays READY, browser
-                # session stays alive for a future CONTINUE. DELETE_ON_SUCCESS:
-                # durable output first, then archive the application conversation
-                # — the browser session itself is only closed after this commit,
-                # never while holding the row lock.
-                if should_close_session:
-                    persisted_conversation.archive()
-                await uow.model_conversation_turns.save(persisted_turn)
-                await uow.model_conversations.save(persisted_conversation)
-                await uow.commit()
-
-            if should_close_session and self._conversation_session_closer is not None:
-                try:
-                    await self._conversation_session_closer.archive_conversation(conversation.id)
-                except Exception as exc:
-                    # A close failure never rewrites the already-successful model
-                    # output as failed — it is only logged.
-                    failure = conversation_close_failure_fields(exc)
-                    logger.warning(
-                        "conversation_session_close_failed conversation_id=%s error_code=%s "
-                        "cause_code=%s retryable=%s phase=%s reason=%s details=%s",
-                        conversation.id,
-                        failure["error_code"],
-                        failure["cause_code"],
-                        failure.get("retryable"),
-                        failure.get("phase"),
-                        failure["reason"],
-                        failure["details"],
-                        exc_info=True,
-                    )
-            return persisted_turn
-        except asyncio.CancelledError:
-            try:
-                await asyncio.shield(
-                    self._seal_interrupted_turn(
-                        conversation_id=conversation.id,
-                        turn_id=turn.id,
-                        run_id=run.id,
-                    )
-                )
-            except Exception:
-                logger.exception(
-                    "conversation_turn_interruption_finalization_failed turn_id=%s",
-                    turn.id,
-                )
-            raise
-        except Exception as exc:
-            pre_submission = getattr(exc, "submission_state", None) == "pre_submission"
-            completed_response = getattr(exc, "completed_response", False) is True
-            uncertain = (
-                not pre_submission
-                and not completed_response
-                and (
-                    bool(getattr(exc, "retryable", False))
-                    or getattr(exc, "code", "")
-                    in {
-                        "bridge_server_error",
-                        "bridge_timeout",
-                        "bridge_ui_timeout",
-                        "model_submission_reconciliation_required",
-                    }
-                )
-            )
-            blocked = getattr(exc, "code", "") == "external_llm_blocked"
-            async with self._uow_factory() as uow:
-                persisted_conversation = await uow.model_conversations.get_for_update(
-                    conversation.id
-                )
-                persisted_turn = await uow.model_conversation_turns.get(turn.id)
-                if persisted_conversation and persisted_turn:
-                    persisted_turn.fail(
-                        code=str(getattr(exc, "code", "conversation_turn_failed")),
-                        message=str(exc),
-                        uncertain=uncertain,
-                        blocked=blocked,
-                    )
-                    persisted_conversation.mark_problem(uncertain=uncertain)
-                    await uow.model_conversation_turns.save(persisted_turn)
-                    await uow.model_conversations.save(persisted_conversation)
-                # The gateway is the primary authority over the ModelRun's provider
-                # lifecycle. This only guards a narrow, locally-certain case: the
-                # ModelRun this turn pre-persisted (for the turn's FK) never left
-                # RUNNING/NOT_SUBMITTED, meaning the gateway failed before ever
-                # claiming it for submission. Left alone that run would stay RUNNING
-                # forever. Any run the gateway did touch (SUCCEEDED, NEEDS_REVIEW,
-                # FAILED, or EXTERNAL_STATE_UNKNOWN) is left untouched.
-                persisted_run = await uow.model_runs.get_for_update(run.id)
-                if (
-                    persisted_run is not None
-                    and persisted_run.status is ModelRunStatus.RUNNING
-                    and persisted_run.submission_state is ModelSubmissionState.NOT_SUBMITTED
-                ):
-                    persisted_run.fail(
-                        str(getattr(exc, "code", "conversation_turn_failed")),
-                        "Le tour conversationnel a échoué avant toute soumission au fournisseur.",
-                    )
-                    await uow.model_runs.save(persisted_run)
-                await uow.commit()
-            # Le résultat d'un POST bridge est inconnu : ce tour est scellé en
-            # NEEDS_REVIEW et ne doit pas consommer les retries du job avec la
-            # même clé d'idempotence.
-            if uncertain:
-                if getattr(exc, "code", "") == "model_submission_reconciliation_required":
-                    raise exc
-                raise ConversationTurnFailedError(
-                    str(exc),
-                    code=str(getattr(exc, "code", "conversation_turn_failed")),
-                    status=ConversationTurnStatus.NEEDS_REVIEW,
-                ) from exc
-            raise
 
     async def _seal_interrupted_turn(
         self, *, conversation_id: UUID, turn_id: UUID, run_id: UUID
@@ -1513,7 +1156,7 @@ class ModelConversationService:
         """
         async with self._uow_factory() as uow:
             conversation = await uow.model_conversations.get_for_update(conversation_id)
-            self._ensure_visible(conversation, context_subject_id)
+            self._ensure_generic_visible(conversation, context_subject_id)
             assert conversation is not None
             if conversation.status is not ConversationStatus.ARCHIVED:
                 try:
@@ -1568,7 +1211,7 @@ class ModelConversationService:
     ) -> ModelConversation:
         async with self._uow_factory() as uow:
             conversation = await uow.model_conversations.get_for_update(conversation_id)
-            self._ensure_visible(conversation, context_subject_id)
+            self._ensure_generic_visible(conversation, context_subject_id)
             assert conversation is not None
             if conversation.status is ConversationStatus.ARCHIVED:
                 raise ConversationPolicyError(
@@ -1607,24 +1250,34 @@ class ModelConversationService:
         ):
             raise ConversationNotFoundError("Conversation introuvable dans ce sujet")
 
-    @staticmethod
+    def _ensure_generic_visible(
+        self, conversation: ModelConversation | None, context_subject_id: UUID | None
+    ) -> None:
+        self._ensure_visible(conversation, context_subject_id)
+        if not self._editorial_turns.generic_visible(conversation):
+            raise ConversationNotFoundError("Conversation introuvable")
+
     async def _require_editorial_thread_path(
+        self,
         uow: UnitOfWork,
         conversation: ModelConversation,
         editorial_thread_id: UUID | None,
     ) -> None:
-        if conversation.purpose is not ConversationPurpose.EDITORIAL_DISCUSSION:
-            if editorial_thread_id is not None:
-                raise EditorialPurposeReservedError()
-            return
-        if editorial_thread_id is None:
+        result = await self._editorial_turns.check_thread_path(
+            uow, conversation, editorial_thread_id
+        )
+        if result is EditorialThreadPathResult.PRIVATE_NOT_FOUND:
+            raise ConversationNotFoundError("Conversation introuvable")
+        if result is EditorialThreadPathResult.RESERVED:
             raise EditorialPurposeReservedError()
-        record = await uow.editorial_threads.get(editorial_thread_id)
-        if (
-            record is None
-            or record.thread.model_conversation_id != conversation.id
-            or record.thread.origin.subject_id != conversation.subject_id
-        ):
+
+    def _validate_editorial_objective(
+        self,
+        purpose: ConversationPurpose,
+        objective: EditorialDiscussionObjective | None,
+        context: EditorialDiscussionContext | None,
+    ) -> None:
+        if not self._editorial_turns.valid_objective(purpose, objective, context):
             raise EditorialPurposeReservedError()
 
     async def _read_reference(self, reference: str, blobs: dict[UUID, BlobRecord | None]) -> str:

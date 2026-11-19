@@ -54,6 +54,61 @@ class ModelSubmissionState(StrEnum):
     VERIFIED_TERMINAL_FAILURE = "verified_terminal_failure"
 
 
+EDITORIAL_DISCUSSION_PROMPT_ID = "editorial-discussion-message"
+EDITORIAL_BRIDGE_TURN_ID_PARAMETER = "editorial_bridge_turn_id"
+EDITORIAL_MODEL_RUN_SAFE_ERROR_CODES = frozenset(
+    {
+        "external_llm_blocked",
+        "bridge_auth_failed",
+        "bridge_rate_limited",
+        "bridge_unreachable",
+        "bridge_server_error",
+        "bridge_timeout",
+        "bridge_ui_timeout",
+        "bridge_payload_conflict",
+        "bridge_protocol_error",
+        "model_submission_reconciliation_required",
+        "model_background_progress_stalled",
+        "model_background_safety_ceiling_exceeded",
+        "model_provider_not_configured",
+        "model_capability_unsupported",
+        "editorial_model_call_failed",
+    }
+)
+_EDITORIAL_MODEL_RUN_SAFE_MESSAGES = {
+    "external_llm_blocked": "La politique de diffusion interdit cet appel externe.",
+    "model_submission_reconciliation_required": (
+        "La soumission du modèle doit être réconciliée avant toute nouvelle tentative."
+    ),
+    "bridge_rate_limited": "Bridge a limité la fréquence de cette demande.",
+}
+_EDITORIAL_MODEL_RUN_SAFE_FALLBACK = "Le tour éditorial a échoué."
+
+
+def editorial_model_run_error_code(code: object) -> str:
+    return (
+        code
+        if isinstance(code, str) and code in EDITORIAL_MODEL_RUN_SAFE_ERROR_CODES
+        else "editorial_model_call_failed"
+    )
+
+
+def editorial_model_run_error_message(code: object) -> str:
+    safe_code = editorial_model_run_error_code(code)
+    return _EDITORIAL_MODEL_RUN_SAFE_MESSAGES.get(safe_code, _EDITORIAL_MODEL_RUN_SAFE_FALLBACK)
+
+
+def editorial_model_run_error_details(
+    code: object, submission_state: ModelSubmissionState
+) -> dict[str, Any] | None:
+    safe_code = editorial_model_run_error_code(code)
+    if safe_code == "model_submission_reconciliation_required":
+        return {"submission_state": submission_state.value}
+    if safe_code == "bridge_rate_limited":
+        return {"phase": "submission", "retryable": True, "completed_response": True}
+    return None
+
+
 class BridgeSubmissionState(StrEnum):
     """What the Bridge contract confirms about one submission attempt."""
 
@@ -237,6 +292,10 @@ class ModelRun:
     ) -> None:
         self._require_active()
         timestamp = now or datetime.now(UTC)
+        if self.prompt_template_id == EDITORIAL_DISCUSSION_PROMPT_ID:
+            code = editorial_model_run_error_code(code)
+            public_message = editorial_model_run_error_message(code)
+            details = editorial_model_run_error_details(code, self.submission_state)
         self.status = ModelRunStatus.BLOCKED if blocked else ModelRunStatus.FAILED
         self.error_code = code[:64]
         self.error_message = " ".join(public_message.replace("\x00", "").split())[:500]
@@ -255,6 +314,10 @@ class ModelRun:
     ) -> None:
         self._require_active()
         timestamp = now or datetime.now(UTC)
+        if self.prompt_template_id == EDITORIAL_DISCUSSION_PROMPT_ID:
+            code = editorial_model_run_error_code(code)
+            public_message = editorial_model_run_error_message(code)
+            details = editorial_model_run_error_details(code, self.submission_state)
         self.status = ModelRunStatus.NEEDS_REVIEW
         self.error_code = code[:64]
         self.error_message = " ".join(public_message.replace("\x00", "").split())[:500]

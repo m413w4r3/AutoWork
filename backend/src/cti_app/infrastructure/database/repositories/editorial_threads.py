@@ -1,24 +1,31 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import cast
 from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cti_app.domain.editorial_thread import (
     EditorialBridgeStatus,
     EditorialThread,
+    EditorialThreadActiveJobConflict,
     EditorialThreadBinding,
     EditorialThreadError,
     EditorialThreadEvent,
     EditorialThreadEventKind,
+    EditorialThreadJob,
+    EditorialThreadJobState,
+    EditorialThreadLockTimeout,
     EditorialThreadRecord,
 )
 from cti_app.infrastructure.database.models.core import SubjectRow
 from cti_app.infrastructure.database.models.editorial_threads import (
     EditorialThreadEventRow,
+    EditorialThreadJobRow,
     EditorialThreadRow,
 )
 from cti_app.infrastructure.database.models.model_execution import (
@@ -26,10 +33,29 @@ from cti_app.infrastructure.database.models.model_execution import (
     ModelConversationTurnRow,
 )
 
+_ACTIVE_THREAD_JOB_INDEX = "uq_editorial_thread_jobs_active_thread"
+_POSTGRES_BUSY_SQLSTATES = frozenset({"55P03", "40P01"})
+
 
 class SqlAlchemyEditorialThreadRepository:
+    # Every operation that locks both rows takes the thread row before the job row.
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
+
+    async def _lock_thread_for_job(self, job_id: UUID) -> EditorialThreadRow | None:
+        thread_id = await self._session.scalar(
+            select(EditorialThreadJobRow.thread_id).where(EditorialThreadJobRow.id == job_id)
+        )
+        if thread_id is None:
+            return None
+        return cast(
+            EditorialThreadRow | None,
+            await self._session.scalar(
+                select(EditorialThreadRow)
+                .where(EditorialThreadRow.id == thread_id)
+                .with_for_update()
+            ),
+        )
 
     async def get_current_by_occurrence(
         self, subject_id: UUID, production_run_id: UUID, occurrence_id: UUID
@@ -210,6 +236,238 @@ class SqlAlchemyEditorialThreadRepository:
         await self._session.flush()
         return event
 
+    async def enqueue_message(
+        self,
+        *,
+        job_id: UUID,
+        thread_id: UUID,
+        actor_id: UUID,
+        idempotency_key: str,
+        request_sha256: str,
+        payload_blob_ref: UUID,
+        payload_sha256: str,
+    ) -> tuple[EditorialThreadEvent, EditorialThreadJob, bool]:
+        try:
+            return await self._enqueue_message(
+                job_id=job_id,
+                thread_id=thread_id,
+                actor_id=actor_id,
+                idempotency_key=idempotency_key,
+                request_sha256=request_sha256,
+                payload_blob_ref=payload_blob_ref,
+                payload_sha256=payload_sha256,
+            )
+        except (IntegrityError, DBAPIError) as error:
+            translated = translate_enqueue_database_error(error)
+            if translated is not None:
+                raise translated from error
+            raise
+
+    async def _enqueue_message(
+        self,
+        *,
+        job_id: UUID,
+        thread_id: UUID,
+        actor_id: UUID,
+        idempotency_key: str,
+        request_sha256: str,
+        payload_blob_ref: UUID,
+        payload_sha256: str,
+    ) -> tuple[EditorialThreadEvent, EditorialThreadJob, bool]:
+        row = await self._session.scalar(
+            select(EditorialThreadRow).where(EditorialThreadRow.id == thread_id).with_for_update()
+        )
+        if row is None:
+            raise EditorialThreadError("thread_not_found")
+        existing_row = await self._session.scalar(
+            select(EditorialThreadEventRow).where(
+                EditorialThreadEventRow.thread_id == thread_id,
+                EditorialThreadEventRow.idempotency_key == idempotency_key,
+            )
+        )
+        if existing_row is not None:
+            event = _event_from_row(existing_row)
+            if event.request_sha256 != request_sha256:
+                raise EditorialThreadError("idempotency_conflict")
+            job_row = await self._session.scalar(
+                select(EditorialThreadJobRow).where(EditorialThreadJobRow.send_event_id == event.id)
+            )
+            if job_row is None:
+                raise EditorialThreadError("editorial_thread_job_missing")
+            return event, _job_from_row(job_row), True
+
+        active = await self._session.scalar(
+            select(EditorialThreadJobRow)
+            .where(
+                EditorialThreadJobRow.thread_id == thread_id,
+                EditorialThreadJobRow.state.in_(
+                    (
+                        EditorialThreadJobState.QUEUED.value,
+                        EditorialThreadJobState.WAITING_FOR_CAPACITY.value,
+                        EditorialThreadJobState.RUNNING.value,
+                        EditorialThreadJobState.RECONCILIATION_REQUIRED.value,
+                    )
+                ),
+            )
+            .with_for_update()
+        )
+        if active is not None:
+            if active.state == EditorialThreadJobState.RECONCILIATION_REQUIRED.value:
+                raise EditorialThreadError("reconciliation_required")
+            raise EditorialThreadError("editorial_thread_busy")
+
+        thread = _thread_from_row(row)
+        updated, event = thread.append_event(
+            kind=EditorialThreadEventKind.USER_MESSAGE,
+            actor_id=actor_id,
+            idempotency_key=idempotency_key,
+            request_sha256=request_sha256,
+            payload_blob_ref=payload_blob_ref,
+            payload_sha256=payload_sha256,
+        )
+        event_row = EditorialThreadEventRow(
+            id=event.id,
+            thread_id=event.thread_id,
+            sequence=event.sequence,
+            event_kind=event.kind.value,
+            actor_id=event.actor_id,
+            idempotency_key=event.idempotency_key,
+            request_sha256=event.request_sha256,
+            payload_blob_ref=event.payload_blob_ref,
+            payload_sha256=event.payload_sha256,
+            created_at=event.created_at,
+        )
+        job_row = EditorialThreadJobRow(
+            id=job_id,
+            thread_id=thread_id,
+            send_event_id=event.id,
+            state=EditorialThreadJobState.QUEUED.value,
+            attempt_count=0,
+        )
+        self._session.add_all((event_row, job_row))
+        row.next_sequence = updated.next_sequence
+        row.version = updated.version
+        row.generation_state = EditorialBridgeStatus.GENERATING.value
+        row.updated_at = updated.updated_at
+        await self._session.flush()
+        return event, _job_from_row(job_row), False
+
+    async def get_job(self, job_id: UUID) -> EditorialThreadJob | None:
+        row = await self._session.get(EditorialThreadJobRow, job_id)
+        return _job_from_row(row) if row is not None else None
+
+    async def get_job_for_event(self, event_id: UUID) -> EditorialThreadJob | None:
+        row = await self._session.scalar(
+            select(EditorialThreadJobRow).where(EditorialThreadJobRow.send_event_id == event_id)
+        )
+        return _job_from_row(row) if row is not None else None
+
+    async def latest_job_for_thread(self, thread_id: UUID) -> EditorialThreadJob | None:
+        row = await self._session.scalar(
+            select(EditorialThreadJobRow)
+            .where(EditorialThreadJobRow.thread_id == thread_id)
+            .order_by(EditorialThreadJobRow.created_at.desc())
+            .limit(1)
+        )
+        return _job_from_row(row) if row is not None else None
+
+    async def claim_job(
+        self, job_id: UUID, *, lease_token: UUID, lease_until: datetime, now: datetime
+    ) -> EditorialThreadJob | None:
+        if await self._lock_thread_for_job(job_id) is None:
+            return None
+        row = await self._session.scalar(
+            select(EditorialThreadJobRow)
+            .where(EditorialThreadJobRow.id == job_id)
+            .with_for_update(skip_locked=True)
+        )
+        if row is None:
+            return None
+        state = EditorialThreadJobState(row.state)
+        runnable = state in {
+            EditorialThreadJobState.QUEUED,
+        } or (
+            state
+            in {
+                EditorialThreadJobState.WAITING_FOR_CAPACITY,
+                EditorialThreadJobState.RUNNING,
+            }
+            and row.lease_until is not None
+            and row.lease_until <= now
+        )
+        if state is EditorialThreadJobState.WAITING_FOR_CAPACITY and row.lease_until is None:
+            runnable = True
+        if not runnable:
+            return None
+        row.state = EditorialThreadJobState.RUNNING.value
+        row.lease_token = lease_token
+        row.lease_until = lease_until
+        row.attempt_count += 1
+        row.updated_at = now
+        await self._session.flush()
+        return _job_from_row(row)
+
+    async def set_job_state(
+        self,
+        job_id: UUID,
+        state: EditorialThreadJobState,
+        *,
+        lease_token: UUID | None = None,
+        lease_until: datetime | None = None,
+    ) -> None:
+        if await self._lock_thread_for_job(job_id) is None:
+            raise EditorialThreadError("editorial_thread_job_not_found")
+        row = await self._session.scalar(
+            select(EditorialThreadJobRow)
+            .where(EditorialThreadJobRow.id == job_id)
+            .with_for_update()
+        )
+        if row is None:
+            raise EditorialThreadError("editorial_thread_job_not_found")
+        if lease_token is not None and row.lease_token != lease_token:
+            raise EditorialThreadError("editorial_thread_job_lease_lost")
+        row.state = state.value
+        row.lease_token = None
+        row.lease_until = lease_until
+        row.updated_at = datetime.now(UTC)
+        await self._session.flush()
+
+    async def set_bridge_status(self, thread_id: UUID, status: EditorialBridgeStatus) -> None:
+        row = await self._session.scalar(
+            select(EditorialThreadRow).where(EditorialThreadRow.id == thread_id).with_for_update()
+        )
+        if row is None:
+            raise EditorialThreadError("thread_not_found")
+        row.generation_state = status.value
+        row.version += 1
+        row.updated_at = datetime.now(UTC)
+        await self._session.flush()
+
+    async def list_dispatchable_jobs(self, *, now: datetime, limit: int = 100) -> list[UUID]:
+        rows = await self._session.scalars(
+            select(EditorialThreadJobRow.id)
+            .where(
+                (EditorialThreadJobRow.state.in_((EditorialThreadJobState.QUEUED.value,)))
+                | (
+                    (
+                        EditorialThreadJobRow.state
+                        == EditorialThreadJobState.WAITING_FOR_CAPACITY.value
+                    )
+                    & (
+                        EditorialThreadJobRow.lease_until.is_(None)
+                        | (EditorialThreadJobRow.lease_until <= now)
+                    )
+                )
+                | (
+                    (EditorialThreadJobRow.state == EditorialThreadJobState.RUNNING.value)
+                    & (EditorialThreadJobRow.lease_until <= now)
+                )
+            )
+            .order_by(EditorialThreadJobRow.created_at)
+            .limit(limit)
+        )
+        return list(rows)
+
     async def _record(self, row: EditorialThreadRow) -> EditorialThreadRecord:
         events = await self._session.scalars(
             select(EditorialThreadEventRow)
@@ -258,3 +516,33 @@ def _event_from_row(row: EditorialThreadEventRow) -> EditorialThreadEvent:
         model_turn_id=row.model_turn_id,
         created_at=row.created_at or datetime.now(UTC),
     )
+
+
+def _job_from_row(row: EditorialThreadJobRow) -> EditorialThreadJob:
+    return EditorialThreadJob(
+        id=row.id,
+        thread_id=row.thread_id,
+        send_event_id=row.send_event_id,
+        state=EditorialThreadJobState(row.state),
+        lease_until=row.lease_until,
+        lease_token=row.lease_token,
+        attempt_count=row.attempt_count,
+    )
+
+
+def translate_enqueue_database_error(error: Exception) -> EditorialThreadError | None:
+    """Translate only known active-job races and postgres lock failures."""
+    if isinstance(error, IntegrityError):
+        original = error.orig
+        diagnostic = getattr(original, "diag", None)
+        constraint_name = getattr(original, "constraint_name", None) or getattr(
+            diagnostic, "constraint_name", None
+        )
+        if constraint_name == _ACTIVE_THREAD_JOB_INDEX:
+            return EditorialThreadActiveJobConflict()
+    if isinstance(error, DBAPIError):
+        original = error.orig
+        sqlstate = getattr(original, "sqlstate", None) or getattr(original, "pgcode", None)
+        if sqlstate in _POSTGRES_BUSY_SQLSTATES:
+            return EditorialThreadLockTimeout()
+    return None

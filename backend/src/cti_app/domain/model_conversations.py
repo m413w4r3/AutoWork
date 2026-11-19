@@ -143,6 +143,14 @@ class ModelConversation:
         self.updated_at = now or datetime.now(UTC)
         self.version += 1
 
+    def resume_known_pre_submission_retry(self, *, now: datetime | None = None) -> None:
+        """Resume one conversation turn after its run proved no provider handoff."""
+        if self.status is not ConversationStatus.UNAVAILABLE:
+            raise ValueError("conversation_pre_submission_retry_unavailable")
+        self.status = ConversationStatus.BUSY
+        self.updated_at = now or datetime.now(UTC)
+        self.version += 1
+
     def archive(self, now: datetime | None = None) -> None:
         if self.status is ConversationStatus.BUSY:
             raise ValueError("conversation_busy")
@@ -160,6 +168,7 @@ class ModelConversationTurn:
     input_sha256: str
     idempotency_key: str
     parent_turn_id: UUID | None = None
+    objective: str | None = None
     output_blob_reference: str | None = None
     output_sha256: str | None = None
     status: ConversationTurnStatus = ConversationTurnStatus.RUNNING
@@ -176,6 +185,8 @@ class ModelConversationTurn:
     def __post_init__(self) -> None:
         if self.sequence < 1 or not self.idempotency_key or not self.correlation_id:
             raise ValueError("Turn sequence and idempotency key are required")
+        if self.objective not in {None, "editorial_message", "editorial_proposal"}:
+            raise ValueError("Conversation turn objective is invalid")
         for value in (self.input_sha256, self.output_sha256):
             if value is not None and (
                 len(value) != 64 or any(character not in "0123456789abcdef" for character in value)
@@ -304,6 +315,17 @@ class ModelConversationTurn:
             }
         }
         self.finished_at = now or datetime.now(UTC)
+
+    def resume_known_pre_submission_retry(self, *, now: datetime | None = None) -> None:
+        """Reopen this exact failed turn after its ModelRun proves no handoff."""
+        if self.status is not ConversationTurnStatus.FAILED or self.output_blob_reference:
+            raise ValueError("conversation_turn_pre_submission_retry_unavailable")
+        self.status = ConversationTurnStatus.RUNNING
+        self.error_code = None
+        self.error_message = None
+        self.error_details = None
+        self.finished_at = None
+        self.started_at = now or datetime.now(UTC)
 
     def seal_verified_no_handoff(
         self, *, model_run_id: UUID, claim_id: UUID, now: datetime | None = None

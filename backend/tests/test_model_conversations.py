@@ -21,6 +21,7 @@ from cti_app.application.bridge_investigator import (
 from cti_app.application.identity import Identity
 from cti_app.application.model_conversations import (
     ConversationNeedsReviewError,
+    ConversationNotFoundError,
     ConversationPolicyError,
     ConversationSessionCloseError,
     ModelConversationReconciliationError,
@@ -2239,3 +2240,104 @@ async def test_visible_turn_reconciliation_routes_use_local_preview_and_actor(
     assert adopted["recovery"]["sha256"] == preview["sha256"]
     assert state.turns[turn.id].status is ConversationTurnStatus.SUCCEEDED
     assert len(adapter.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_generic_model_conversation_routes_hide_editorial_discussions(
+    tmp_path: Path,
+) -> None:
+    class _SessionCloser:
+        async def archive_conversation(self, _conversation_id) -> None:
+            return None
+
+    service, state = _build_service(
+        _ScriptedBridgeAdapter("unused"),
+        tmp_path,
+        conversation_session_closer=_SessionCloser(),
+    )
+    subject_id = uuid4()
+    editorial = ModelConversation(
+        provider=ModelProvider.OPENAI,
+        transport=ConversationTransport.CHATGPT_BRIDGE,
+        purpose=ConversationPurpose.EDITORIAL_DISCUSSION,
+        title="Private editorial discussion",
+        subject_id=subject_id,
+    )
+    ordinary = ModelConversation(
+        provider=ModelProvider.OPENAI,
+        transport=ConversationTransport.APPLICATION_MANAGED,
+        purpose=ConversationPurpose.DRAFTING,
+        title="Ordinary drafting conversation",
+    )
+    state.conversations[editorial.id] = editorial
+    state.conversations[ordinary.id] = ordinary
+
+    class _IdentityProvider:
+        async def current(self) -> Identity:
+            return Identity("operator:generic-conversation-test")
+
+    app = FastAPI()
+    app.include_router(model_conversation_router)
+    app.state.model_conversation_service = service
+    app.state.identity_provider = _IdentityProvider()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        listed = await client.get("/api/model-conversations")
+        editorial_only = await client.get(
+            "/api/model-conversations", params={"purpose": "editorial_discussion"}
+        )
+        ordinary_get = await client.get(f"/api/model-conversations/{ordinary.id}")
+        ordinary_turns = await client.get(f"/api/model-conversations/{ordinary.id}/turns")
+        hidden_routes = [
+            await client.get(f"/api/model-conversations/{editorial.id}"),
+            await client.get(f"/api/model-conversations/{editorial.id}/turns"),
+            await client.post(
+                f"/api/model-conversations/{editorial.id}/turns",
+                json={
+                    "message": "Synthetic generic turn",
+                    "mode": "fresh",
+                    "external_llm_allowed": True,
+                    "idempotency_key": "generic-private-turn",
+                },
+            ),
+            await client.post(
+                f"/api/model-conversations/{editorial.id}/archive?subject_id={subject_id}"
+            ),
+            await client.post(
+                f"/api/model-conversations/{editorial.id}/reconcile?subject_id={subject_id}",
+                json={"available": True},
+            ),
+            await client.post(
+                f"/api/model-conversations/{editorial.id}/turns/{uuid4()}"
+                f"/reconciliation/visible/preview?subject_id={subject_id}"
+            ),
+            await client.post(
+                f"/api/model-conversations/{editorial.id}/turns/{uuid4()}"
+                f"/reconciliation/visible/adopt?subject_id={subject_id}",
+                json={"expected_sha256": "a" * 64},
+            ),
+            await client.post(
+                f"/api/model-conversations/{editorial.id}/turns/{uuid4()}"
+                f"/reconciliation/abandon?subject_id={subject_id}",
+                json={"reason": "Synthetic reason"},
+            ),
+        ]
+
+    assert listed.status_code == 200
+    listed_ids = {item["id"] for item in listed.json()}
+    assert str(ordinary.id) in listed_ids
+    assert str(editorial.id) not in listed_ids
+    assert editorial_only.status_code == 200
+    assert editorial_only.json() == []
+    assert ordinary_get.status_code == 200
+    assert ordinary_get.json()["purpose"] == ConversationPurpose.DRAFTING.value
+    assert ordinary_turns.status_code == 200
+    assert ordinary_turns.json() == []
+    for response in hidden_routes:
+        assert response.status_code == 404, response.text
+        assert response.json()["detail"]["code"] == "conversation_not_found"
+        assert "Private editorial discussion" not in response.text
+
+    with pytest.raises(ConversationNotFoundError):
+        await service.turn_content_by_idempotency_key(
+            editorial.id, "private-editorial-read", context_subject_id=subject_id
+        )

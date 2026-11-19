@@ -1,9 +1,20 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { EditorialConversation } from "./EditorialConversation";
-import type { EditorialThreadRead } from "../../api/editorialWorkspace";
+import {
+  sendEditorialThreadMessage,
+  type EditorialThreadRead,
+} from "../../api/editorialWorkspace";
+import { editorialWorkspaceQueryKeys } from "./editorialWorkspaceQueries";
 
 const binding = {
   subject_id: "subject-1",
@@ -14,7 +25,10 @@ const binding = {
   canonical_sha256: "a".repeat(64),
 };
 
-function renderConversation(response: EditorialThreadRead) {
+function renderConversation(
+  response: EditorialThreadRead,
+  onChangeTarget = vi.fn(),
+) {
   vi.stubGlobal(
     "fetch",
     vi.fn(() =>
@@ -36,6 +50,7 @@ function renderConversation(response: EditorialThreadRead) {
         occurrenceId={binding.occurrence_id}
         snapshotId="snapshot-1"
         targetLabel="Paragraphe synthétique"
+        onChangeTarget={onChangeTarget}
       />
     </QueryClientProvider>,
   );
@@ -50,6 +65,7 @@ function threadResponse(read: EditorialThreadRead) {
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
@@ -73,7 +89,149 @@ describe("EditorialConversation", () => {
     expect(
       screen.getByText("Discussion sur : Paragraphe synthétique"),
     ).toBeVisible();
-    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Envoyer un message" }),
+    ).toBeDisabled();
+    expect(
+      screen.queryByRole("button", { name: /proposition/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("offers a target-change action from the discussion header", async () => {
+    const onChangeTarget = vi.fn();
+    renderConversation(
+      {
+        kind: "unopened",
+        binding,
+        current: binding,
+        bridge_status: "ready",
+        event_sequence: 0,
+        timeline: [],
+        etag: '"thread-empty"',
+      },
+      onChangeTarget,
+    );
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Changer de cible" }),
+    );
+
+    expect(onChangeTarget).toHaveBeenCalledOnce();
+  });
+
+  it("keeps message drafts with their occurrence when switching before send", async () => {
+    const postedMessages: Array<{
+      url: string;
+      occurrenceId: string;
+      text: string;
+    }> = [];
+    const fetchMock = vi.fn<typeof fetch>((input, init) => {
+      const requestUrl =
+        input instanceof Request
+          ? input.url
+          : input instanceof URL
+            ? input.href
+            : input;
+      const url = new URL(requestUrl, "http://localhost");
+      const occurrenceId = url.pathname.match(/\/threads\/([^/]+)/)?.[1];
+      if (!occurrenceId) throw new Error("thread request lacks occurrence id");
+
+      if (init?.method === "POST") {
+        if (typeof init.body !== "string") {
+          throw new Error("message POST body must be a string");
+        }
+        const payload = JSON.parse(init.body) as { text: string };
+        postedMessages.push({
+          url: url.pathname,
+          occurrenceId,
+          text: payload.text,
+        });
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              kind: "accepted",
+              thread_id: `thread-${occurrenceId}`,
+              entry_id: `entry-${occurrenceId}`,
+              generation: "queued",
+            }),
+            { status: 202, headers: { "Content-Type": "application/json" } },
+          ),
+        );
+      }
+
+      const targetBinding = { ...binding, occurrence_id: occurrenceId };
+      return Promise.resolve(
+        threadResponse({
+          kind: "unopened",
+          binding: targetBinding,
+          current: targetBinding,
+          bridge_status: "ready",
+          event_sequence: 0,
+          timeline: [],
+          etag: `"${occurrenceId}-empty"`,
+        }),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, refetchInterval: false } },
+    });
+
+    function SwitchableConversation() {
+      const [occurrenceId, setOccurrenceId] = useState("occurrence-a");
+      return (
+        <>
+          <button type="button" onClick={() => setOccurrenceId("occurrence-a")}>
+            Sélectionner le bloc A
+          </button>
+          <button type="button" onClick={() => setOccurrenceId("occurrence-b")}>
+            Sélectionner le bloc B
+          </button>
+          <EditorialConversation
+            subjectId={binding.subject_id}
+            occurrenceId={occurrenceId}
+            snapshotId="snapshot-1"
+            targetLabel={occurrenceId === "occurrence-a" ? "Bloc A" : "Bloc B"}
+            onChangeTarget={() => undefined}
+          />
+        </>
+      );
+    }
+
+    render(
+      <QueryClientProvider client={client}>
+        <SwitchableConversation />
+      </QueryClientProvider>,
+    );
+
+    const textareaA = await screen.findByRole("textbox", {
+      name: "Votre message à Bridge",
+    });
+    fireEvent.change(textareaA, { target: { value: "Brouillon du bloc A" } });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Sélectionner le bloc B" }),
+    );
+
+    const textareaB = await screen.findByRole("textbox", {
+      name: "Votre message à Bridge",
+    });
+    expect(textareaB).toHaveValue("");
+    fireEvent.change(textareaB, { target: { value: "Message du bloc B" } });
+    fireEvent.click(screen.getByRole("button", { name: "Envoyer un message" }));
+
+    await waitFor(() => expect(postedMessages).toHaveLength(1));
+    expect(postedMessages[0]).toMatchObject({
+      occurrenceId: "occurrence-b",
+      text: "Message du bloc B",
+    });
+    expect(postedMessages[0]?.url).toContain("/threads/occurrence-b/entries");
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Sélectionner le bloc A" }),
+    );
+    expect(
+      await screen.findByRole("textbox", { name: "Votre message à Bridge" }),
+    ).toHaveValue("Brouillon du bloc A");
   });
 
   it("renders the append-only event timeline and origin version read-only", async () => {
@@ -108,7 +266,12 @@ describe("EditorialConversation", () => {
     expect(
       screen.getByRole("heading", { name: /Réponse Bridge/ }),
     ).toBeVisible();
-    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("log", { name: "Historique de la discussion" }),
+    ).toHaveAttribute("aria-live", "polite");
+    expect(
+      screen.getByRole("button", { name: "Envoyer un message" }),
+    ).toBeInTheDocument();
   });
 
   it("polls while waiting for capacity and stops when the thread settles", async () => {
@@ -144,6 +307,7 @@ describe("EditorialConversation", () => {
           occurrenceId={binding.occurrence_id}
           snapshotId="snapshot-1"
           targetLabel="Paragraphe synthétique"
+          onChangeTarget={() => undefined}
         />
       </QueryClientProvider>,
     );
@@ -176,5 +340,238 @@ describe("EditorialConversation", () => {
     });
     expect(fetchMock).toHaveBeenCalledTimes(2);
     vi.useRealTimers();
+  });
+
+  it("inserts suggestions for editing and sends on Enter but not Shift+Enter", async () => {
+    const unopened: EditorialThreadRead = {
+      kind: "unopened",
+      binding,
+      current: binding,
+      bridge_status: "ready",
+      event_sequence: 0,
+      timeline: [],
+      etag: '"thread-empty"',
+    };
+    const open: EditorialThreadRead = {
+      kind: "open",
+      thread_id: "thread-1",
+      origin: binding,
+      current: binding,
+      binding_state: "valid",
+      bridge_status: "generating",
+      event_sequence: 1,
+      timeline: [
+        {
+          id: "entry-1",
+          sequence: 1,
+          kind: "user_message",
+          actor_id: null,
+          proposal_id: null,
+          created_at: "2026-11-19T10:00:00Z",
+          body: "Clarifier le contexte de ce passage",
+        },
+      ],
+      etag: '"thread-generating"',
+    };
+    let threadReadCount = 0;
+    const fetchMock = vi.fn<typeof fetch>((_input, init) => {
+      if (init?.method === "POST") {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              kind: "accepted",
+              thread_id: "thread-1",
+              entry_id: "entry-1",
+              generation: "queued",
+            }),
+            { status: 202, headers: { "Content-Type": "application/json" } },
+          ),
+        );
+      }
+      threadReadCount += 1;
+      return Promise.resolve(
+        threadResponse(threadReadCount > 1 ? open : unopened),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const key = vi
+      .spyOn(crypto, "randomUUID")
+      .mockReturnValue("00000000-0000-4000-8000-000000000001");
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, refetchInterval: false } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <EditorialConversation
+          subjectId={binding.subject_id}
+          occurrenceId={binding.occurrence_id}
+          snapshotId="snapshot-1"
+          targetLabel="Paragraphe synthétique"
+          onChangeTarget={() => undefined}
+        />
+      </QueryClientProvider>,
+    );
+
+    const textarea = await screen.findByRole("textbox", {
+      name: "Votre message à Bridge",
+    });
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Clarifier le contexte de ce passage",
+      }),
+    );
+    expect(textarea).toHaveValue("Clarifier le contexte de ce passage");
+    expect(threadReadCount).toBe(1);
+
+    fireEvent.change(textarea, { target: { value: "Instruction\ncomplétée" } });
+    fireEvent.keyDown(textarea, { key: "Enter", shiftKey: true });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    fireEvent.keyDown(textarea, { key: "Enter", shiftKey: false });
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    const postCall = fetchMock.mock.calls.find(
+      ([, init]) => init?.method === "POST",
+    );
+    if (!postCall) throw new Error("message POST was not sent");
+    const postInit = postCall[1];
+    expect(new Headers(postInit?.headers).get("Idempotency-Key")).toBe(
+      "00000000-0000-4000-8000-000000000001",
+    );
+    expect(postInit?.body).toBe(
+      JSON.stringify({ kind: "message", text: "Instruction\ncomplétée" }),
+    );
+    expect(key).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText("Message envoyé.")).toBeVisible();
+    const sendAnnouncement = screen.getByText("Message envoyé.");
+    expect(sendAnnouncement).toHaveFocus();
+
+    const queryKey = editorialWorkspaceQueryKeys.thread(
+      binding.subject_id,
+      binding.occurrence_id,
+      "snapshot-1",
+    );
+    const replyAvailable: EditorialThreadRead = {
+      ...open,
+      bridge_status: "reply_available",
+      event_sequence: 2,
+      timeline: [
+        ...open.timeline,
+        {
+          id: "reply-1",
+          sequence: 2,
+          kind: "bridge_reply",
+          actor_id: null,
+          proposal_id: null,
+          created_at: "2026-11-19T10:00:02Z",
+          body: "Réponse arrivée après l’envoi.",
+        },
+      ],
+    };
+    act(() => {
+      client.setQueryData(queryKey, replyAvailable);
+    });
+    expect(
+      await screen.findByText("Réponse arrivée après l’envoi."),
+    ).toBeVisible();
+    await waitFor(() => expect(textarea).toHaveFocus());
+  });
+
+  it("reuses one Idempotency-Key for transport retries", async () => {
+    const key = vi
+      .spyOn(crypto, "randomUUID")
+      .mockReturnValue("00000000-0000-4000-8000-000000000002");
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockRejectedValueOnce(new TypeError("network lost"))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            kind: "accepted",
+            thread_id: "thread-1",
+            entry_id: "entry-1",
+            generation: "queued",
+          }),
+          { status: 202, headers: { "Content-Type": "application/json" } },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await sendEditorialThreadMessage("subject-1", "occurrence-1", "Clarifier.");
+
+    expect(key).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(
+      fetchMock.mock.calls.map(([, init]) =>
+        new Headers(init?.headers).get("Idempotency-Key"),
+      ),
+    ).toEqual([
+      "00000000-0000-4000-8000-000000000002",
+      "00000000-0000-4000-8000-000000000002",
+    ]);
+  });
+
+  it("shows stable French errors and offers no retry after an uncertain send", async () => {
+    const unopened: EditorialThreadRead = {
+      kind: "unopened",
+      binding,
+      current: binding,
+      bridge_status: "ready",
+      event_sequence: 0,
+      timeline: [],
+      etag: '"thread-empty"',
+    };
+    const fetchMock = vi.fn<typeof fetch>((_input, init) => {
+      if (init?.method === "POST") {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              detail: {
+                code: "reconciliation_required",
+                message: "unsafe raw text",
+              },
+            }),
+            { status: 409, headers: { "Content-Type": "application/json" } },
+          ),
+        );
+      }
+      return Promise.resolve(threadResponse(unopened));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, refetchInterval: false } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <EditorialConversation
+          subjectId={binding.subject_id}
+          occurrenceId={binding.occurrence_id}
+          snapshotId="snapshot-1"
+          targetLabel="Paragraphe synthétique"
+          onChangeTarget={() => undefined}
+        />
+      </QueryClientProvider>,
+    );
+    fireEvent.change(
+      await screen.findByRole("textbox", { name: "Votre message à Bridge" }),
+      { target: { value: "Clarifier." } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Envoyer un message" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "L’état de votre envoi est incertain. Consultez le fil avant de continuer.",
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    expect(
+      screen.getByRole("textbox", { name: "Votre message à Bridge" }),
+    ).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "Envoyer un message" }),
+    ).toBeDisabled();
+    expect(
+      screen.queryByRole("button", { name: /réessayer/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.filter(([, init]) => init?.method === "POST"),
+    ).toHaveLength(1);
   });
 });

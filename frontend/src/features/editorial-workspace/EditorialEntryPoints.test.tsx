@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -245,6 +245,57 @@ describe("atelier éditorial", () => {
     expect(
       document.querySelector(`[data-block-id="${paragraphId}"]`),
     ).toHaveAttribute("data-selected", "true");
+  });
+
+  it("returns to the document for another target and closes the mobile inspector", async () => {
+    vi.stubGlobal(
+      "matchMedia",
+      vi.fn((media: string) => ({
+        matches: media === "(max-width: 767px)",
+        media,
+        onchange: null,
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        dispatchEvent: vi.fn(),
+      })),
+    );
+    renderApp(editorResponse());
+    const user = userEvent.setup();
+    await screen.findAllByText("Le paragraphe exact reste sélectionné.");
+
+    const paragraph = document.querySelector(
+      `.editorial-document__block[data-block-id="${paragraphId}"] .editorial-document__text`,
+    );
+    if (!(paragraph instanceof HTMLElement)) {
+      throw new Error("Le paragraphe synthétique est absent du document.");
+    }
+    await user.click(paragraph);
+    const inspectorToggle = document.querySelector(
+      ".editorial-workspace__inspector-toggle",
+    );
+    if (!(inspectorToggle instanceof HTMLButtonElement)) {
+      throw new Error("Le bouton inspecteur mobile est absent.");
+    }
+    fireEvent.click(inspectorToggle);
+    const inspectorColumn = document.querySelector(
+      ".editorial-workspace__inspector-column",
+    );
+    expect(inspectorColumn).toHaveAttribute("data-panel-open", "true");
+
+    await user.click(
+      await screen.findByRole("button", { name: "Changer de cible" }),
+    );
+
+    await waitFor(() =>
+      expect(inspectorColumn).toHaveAttribute("data-panel-open", "false"),
+    );
+    const selectedBlock = document.querySelector(
+      `.editorial-document__block[data-block-id="${paragraphId}"]`,
+    );
+    await waitFor(() => expect(selectedBlock).toHaveFocus());
+    expect(screen.queryByRole("combobox")).not.toBeInTheDocument();
   });
 
   it("uses server order for enrichments without duplicating projected blocks", async () => {

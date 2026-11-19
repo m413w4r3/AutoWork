@@ -13,6 +13,7 @@ interface EditorialInspectorProps {
   readOnly: boolean;
   onOpenSources: () => void;
   onBackToDocument: () => void;
+  onChangeTarget: () => void;
 }
 
 function firstText(
@@ -154,6 +155,7 @@ export function EditorialInspector({
   readOnly,
   onOpenSources,
   onBackToDocument,
+  onChangeTarget,
 }: EditorialInspectorProps) {
   return (
     <aside className="editorial-inspector" aria-label="Inspecteur éditorial">
@@ -164,57 +166,60 @@ export function EditorialInspector({
       >
         ‹ Retour au document
       </button>
-      <h2>Contexte du bloc</h2>
-      {readOnly ? (
-        <p className="editorial-readonly-note" role="note">
-          Le type de publication est indéterminé. L’atelier reste en lecture
-          seule.
-        </p>
-      ) : null}
-      {block ? (
-        <>
-          <p className="editorial-inspector__target-kind">
-            {BLOCK_KIND_LABELS[block.kind]}
+      <div className="editorial-inspector__content">
+        <h2>Contexte du bloc</h2>
+        {readOnly ? (
+          <p className="editorial-readonly-note" role="note">
+            Le type de publication est indéterminé. L’atelier reste en lecture
+            seule.
           </p>
-          <p className="editorial-inspector__section">
-            Section : {sectionTitle ?? "Document"}
-          </p>
-          <p className="editorial-inspector__selected-text">{block.text}</p>
-          <BlockActionToolbar
-            snapshot={snapshot}
-            block={block}
-            readOnly={readOnly}
-            onOpenSources={onOpenSources}
-          />
-          <EditorialConversation
-            subjectId={subjectId}
-            occurrenceId={block.block_id}
-            snapshotId={snapshot.snapshot_id}
-            targetLabel={block.text ?? BLOCK_KIND_LABELS[block.kind]}
-          />
-          <section
-            className="editorial-evidence"
-            aria-labelledby="editorial-evidence-heading"
-          >
-            <h3 id="editorial-evidence-heading">Sources et preuves</h3>
-            {block.evidence_refs.length > 0 ? (
-              <ul>
-                {block.evidence_refs.map((reference, index) => (
-                  <EvidenceReference
-                    key={`${block.block_id}-evidence-${index}`}
-                    reference={reference}
-                    index={index}
-                  />
-                ))}
-              </ul>
-            ) : (
-              <p>Aucune source associée à ce bloc.</p>
-            )}
-          </section>
-        </>
-      ) : (
-        <p>Sélectionnez un paragraphe pour afficher son contexte exact.</p>
-      )}
+        ) : null}
+        {block ? (
+          <>
+            <p className="editorial-inspector__target-kind">
+              {BLOCK_KIND_LABELS[block.kind]}
+            </p>
+            <p className="editorial-inspector__section">
+              Section : {sectionTitle ?? "Document"}
+            </p>
+            <p className="editorial-inspector__selected-text">{block.text}</p>
+            <BlockActionToolbar
+              snapshot={snapshot}
+              block={block}
+              readOnly={readOnly}
+              onOpenSources={onOpenSources}
+            />
+            <EditorialConversation
+              subjectId={subjectId}
+              occurrenceId={block.block_id}
+              snapshotId={snapshot.snapshot_id}
+              targetLabel={block.text ?? BLOCK_KIND_LABELS[block.kind]}
+              onChangeTarget={onChangeTarget}
+            />
+            <section
+              className="editorial-evidence"
+              aria-labelledby="editorial-evidence-heading"
+            >
+              <h3 id="editorial-evidence-heading">Sources et preuves</h3>
+              {block.evidence_refs.length > 0 ? (
+                <ul>
+                  {block.evidence_refs.map((reference, index) => (
+                    <EvidenceReference
+                      key={`${block.block_id}-evidence-${index}`}
+                      reference={reference}
+                      index={index}
+                    />
+                  ))}
+                </ul>
+              ) : (
+                <p>Aucune source associée à ce bloc.</p>
+              )}
+            </section>
+          </>
+        ) : (
+          <p>Sélectionnez un paragraphe pour afficher son contexte exact.</p>
+        )}
+      </div>
     </aside>
   );
 }

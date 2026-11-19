@@ -3,7 +3,15 @@ import { describe, expect, it } from "vitest";
 import css from "./editorialWorkspace.css?raw";
 
 const contrastTokenMap = {
-  foregrounds: ["ink", "muted", "link", "brand", "warning", "technical"],
+  foregrounds: [
+    "ink",
+    "muted",
+    "link",
+    "brand",
+    "warning",
+    "danger",
+    "technical",
+  ],
   surfaces: [
     "page",
     "panel",

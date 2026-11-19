@@ -92,6 +92,22 @@ export type EditorialThreadEventKind =
   | "reconciliation"
   | "generation";
 
+export type EditorialThreadSendGeneration =
+  | "queued"
+  | "waiting_for_capacity"
+  | "running"
+  | "reconciliation_required"
+  | "complete"
+  | "failed"
+  | "cancelled";
+
+export interface EditorialThreadSendResult {
+  kind: "accepted" | "already_known";
+  thread_id: string;
+  entry_id: string;
+  generation: EditorialThreadSendGeneration;
+}
+
 export interface EditorialThreadBinding {
   subject_id: string;
   production_run_id: string;
@@ -143,6 +159,9 @@ export type EditorialThreadRead =
   | EditorialThreadOpenRead
   | EditorialThreadStaleRead;
 
+const EDITORIAL_THREAD_TRANSPORT_UNCERTAIN_MESSAGE =
+  "L’état de votre envoi est incertain. Consultez le fil avant de continuer.";
+
 const ERROR_MESSAGES: Record<string, string> = {
   publication_kind_unresolved:
     "Le type de publication est indéterminé. L’atelier reste en lecture seule.",
@@ -163,6 +182,20 @@ const ERROR_MESSAGES: Record<string, string> = {
     "Le contenu de cette discussion est temporairement indisponible.",
   thread_body_hash_mismatch:
     "Le contenu de cette discussion ne correspond plus à son empreinte.",
+  propose_not_enabled: "La proposition n’est pas encore activée.",
+  editorial_thread_busy: "Une réponse est déjà en cours pour ce paragraphe.",
+  external_llm_blocked: "La politique interdit l’envoi externe de ce contenu.",
+  bridge_unavailable:
+    "Le Bridge est indisponible. Actualisez avant de continuer.",
+  reconciliation_required:
+    "L’état de votre envoi est incertain. Consultez le fil avant de continuer.",
+  idempotency_conflict: "Cette clé est déjà associée à une autre demande.",
+  idempotency_key_required:
+    "Une clé d’idempotence est requise pour envoyer ce message.",
+  idempotency_key_invalid: "La clé d’idempotence est invalide.",
+  editorial_message_invalid: "Saisissez un message avant de l’envoyer.",
+  editorial_thread_transport_uncertain:
+    EDITORIAL_THREAD_TRANSPORT_UNCERTAIN_MESSAGE,
 };
 
 interface ErrorDetail {
@@ -239,4 +272,41 @@ export async function getEditorialThread(
   if (!response.ok) throw await adaptApiError(response);
   const payload = (await response.json()) as EditorialThreadRead;
   return { ...payload, etag: response.headers.get("ETag") ?? payload.etag };
+}
+
+export async function sendEditorialThreadMessage(
+  subjectId: string,
+  occurrenceId: string,
+  text: string,
+): Promise<EditorialThreadSendResult> {
+  const idempotencyKey = crypto.randomUUID();
+  const url = `/api/subjects/${encodeURIComponent(subjectId)}/editor/threads/${encodeURIComponent(occurrenceId)}/entries`;
+  let transportAttempt = 0;
+  while (true) {
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": idempotencyKey,
+        },
+        body: JSON.stringify({ kind: "message", text }),
+      });
+      if (!response.ok) throw await adaptApiError(response);
+      return (await response.json()) as EditorialThreadSendResult;
+    } catch (error) {
+      if (!(error instanceof TypeError)) throw error;
+      if (transportAttempt >= 2) {
+        throw new ApiError(
+          EDITORIAL_THREAD_TRANSPORT_UNCERTAIN_MESSAGE,
+          "editorial_thread_transport_uncertain",
+          0,
+        );
+      }
+      transportAttempt += 1;
+      await new Promise((resolve) =>
+        setTimeout(resolve, 100 * transportAttempt),
+      );
+    }
+  }
 }
