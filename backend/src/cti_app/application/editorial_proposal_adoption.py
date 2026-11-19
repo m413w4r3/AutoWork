@@ -12,12 +12,12 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from io import BytesIO
-from typing import Any, Protocol, cast
+from typing import Any, Protocol
 from uuid import UUID, uuid4
 
 from cti_app.application.blob_storage import BlobStore
 from cti_app.application.editorial_enrichment_candidate import (
+    DiagramMaterializer,
     EditorialEnrichmentCandidate,
     EnrichmentCandidateBlobReference,
     materialize_candidate_diagrams,
@@ -35,7 +35,12 @@ from cti_app.application.editorial_enrichment_revision import (
     validate_targeted_action,
     validate_targeted_request,
 )
+from cti_app.application.editorial_proposal_blobs import (
+    EditorialProposalBlobError,
+    EditorialProposalBlobManager,
+)
 from cti_app.application.editorial_synthesis.candidate import (
+    PatchApplicator,
     SynthesisCandidate,
     SynthesisCandidateBlobReference,
     SynthesisCandidatePersistence,
@@ -77,13 +82,20 @@ from cti_app.domain.editorial_proposal import (
 from cti_app.domain.editorial_proposal_impact import EditorialProposalImpact
 from cti_app.domain.editorial_thread import EditorialThreadEventKind
 from cti_app.domain.editorial_workspace import (
+    AdvancedBlockRegistry,
+    BlockRegistryEntry,
     EditorialSourceStage,
     workspace_pin_hash,
 )
-from cti_app.domain.production import ProductionArtifact, ProductionArtifactStage
+from cti_app.domain.production import (
+    ProductionArtifact,
+    ProductionArtifactStage,
+    ProductionInputSnapshot,
+)
 from cti_app.domain.production_editorial_enrichment import (
     EditorialEnrichmentElementKind,
     EditorialEnrichmentV1,
+    ResolvedSourceFigureV1,
 )
 from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionOperation,
@@ -95,11 +107,6 @@ from cti_app.domain.production_extraction import ProductionExtractionV1
 from cti_app.domain.production_synthesis import ProductionSynthesisV1
 from cti_app.domain.publication_kind import PublicationKind
 
-_PATCH_BUCKET = "editorial-proposal-patches"
-_PATCH_MIME = "application/vnd.autowork.editorial-patch+json"
-_CANONICAL_BUCKET = "production-artifacts-canonical"
-_CANONICAL_MIME = "application/json"
-_MAX_PATCH_BYTES = 256 * 1024
 _IDEMPOTENCY_KEY = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -108,10 +115,6 @@ class EditorialProposalAdoptionError(ValueError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
-
-
-class _CandidateBlobMissing(Exception):
-    """The preuploaded object was collected before its relational reference."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,8 +126,8 @@ class SynthesisCandidateInputs:
     target: TargetedEditorialRevisionTarget
     evidence_pack: SynthesisEvidencePackV1
     extraction: ProductionExtractionV1
-    snapshot: Any
-    apply_patch: Any
+    snapshot: ProductionInputSnapshot
+    apply_patch: PatchApplicator
     persistence: SynthesisCandidatePersistence
     registry_lineage: tuple[Mapping[str, object], ...]
     retired_block_ids: tuple[UUID, ...] = ()
@@ -147,7 +150,7 @@ class EnrichmentCandidateInputs:
     element_key: str
     input_hash: str
     artifact_id: UUID
-    figure_catalog: tuple[Any, ...] = ()
+    figure_catalog: tuple[ResolvedSourceFigureV1, ...] = ()
     registry_lineage: tuple[Mapping[str, object], ...] = ()
     retired_block_ids: tuple[UUID, ...] = ()
     is_create: bool = False
@@ -161,7 +164,7 @@ class EnrichmentCandidateInputs:
     source_figure_inventory_hash: str | None = None
     metadata_extra: Mapping[str, Any] | None = None
     resource_search_enabled: bool = False
-    diagram_materializer: Any | None = None
+    diagram_materializer: DiagramMaterializer | None = None
 
 
 class EditorialProposalAdoptionInputs(Protocol):
@@ -213,8 +216,29 @@ class EditorialProposalAdoptionResult:
     replayed: bool = False
 
 
-type _Candidate = SynthesisCandidate | EditorialEnrichmentCandidate
 type _Stage = ProductionArtifactStage
+
+
+class EditorialProposalWorkspace(Protocol):
+    async def resolve_occurrence(
+        self, subject_id: UUID, occurrence_id: UUID
+    ) -> WorkspaceOccurrenceResolution: ...
+
+    async def resolve_occurrence_in_uow(
+        self, uow: UnitOfWork, subject_id: UUID, occurrence_id: UUID
+    ) -> WorkspaceOccurrenceResolution: ...
+
+    def advance(
+        self,
+        *,
+        base_registry: tuple[BlockRegistryEntry, ...],
+        canonical_sha256: str,
+        artifact_id: UUID,
+        source_stage: str,
+        canonical_content: dict[str, Any],
+        lineage: tuple[Mapping[str, object], ...],
+        retired_block_ids: tuple[UUID, ...],
+    ) -> AdvancedBlockRegistry: ...
 
 
 class EditorialProposalAdoptionService:
@@ -224,20 +248,20 @@ class EditorialProposalAdoptionService:
         uow_factory: UnitOfWorkFactory,
         blob_store: BlobStore,
         artifact_store: ProductionArtifactStore,
-        workspace_service: Any,
+        workspace_service: EditorialProposalWorkspace,
         inputs: EditorialProposalAdoptionInputs,
         synthesis_writer: SynthesisService,
         enrichment_writer: EditorialEnrichmentService,
     ) -> None:
         self._uow_factory = uow_factory
-        self._blob_store = blob_store
+        self._blobs = EditorialProposalBlobManager(uow_factory, blob_store)
         self._artifact_store = artifact_store
         self._workspace_service = workspace_service
         self._inputs = inputs
         self._synthesis_writer = synthesis_writer
         self._enrichment_writer = enrichment_writer
 
-    async def accept(
+    async def adopt(
         self,
         subject_id: UUID,
         occurrence_id: UUID,
@@ -279,7 +303,10 @@ class EditorialProposalAdoptionService:
             raise EditorialProposalAdoptionError("proposal_state_conflict")
         if proposal.patch_sha256 != patch_sha256 or proposal.patch_blob_ref is None:
             raise EditorialProposalAdoptionError("proposal_patch_hash_mismatch")
-        patch_payload = await self._read_verified_patch(proposal, patch_record)
+        try:
+            patch_payload = await self._blobs.read_verified_patch(proposal, patch_record)
+        except EditorialProposalBlobError as error:
+            raise EditorialProposalAdoptionError(error.code) from None
 
         resolution = await self._resolve_current(subject_id, occurrence_id)
         if not _proposal_pins_match(proposal, resolution):
@@ -318,31 +345,28 @@ class EditorialProposalAdoptionService:
             base_bytes=base_bytes,
             resolution=resolution,
         )
-        descriptor = await self._upload_and_verify_candidate(plan.candidate)
         try:
-            while True:
-                try:
-                    return await self._persist_acceptance(
-                        subject_id=subject_id,
-                        occurrence_id=occurrence_id,
-                        proposal=proposal,
-                        patch_payload=patch_payload,
-                        actor_id=actor_id,
-                        expected_state_version=expected_state_version,
-                        patch_sha256=patch_sha256,
-                        idempotency_key=idempotency_key,
-                        request_sha256=request_sha256,
-                        stage=stage,
-                        plan=plan,
-                        descriptor=descriptor,
-                    )
-                except _CandidateBlobMissing:
-                    # A collector won the address lock after our first read-back.
-                    # Restore and verify the same content outside the UOW, then retry.
-                    descriptor = await self._upload_and_verify_candidate(plan.candidate)
+            descriptor = await self._blobs.upload_and_verify_candidate(plan.candidate)
+        except EditorialProposalBlobError as error:
+            raise EditorialProposalAdoptionError(error.code) from None
+        try:
+            return await self._persist_acceptance(
+                subject_id=subject_id,
+                occurrence_id=occurrence_id,
+                proposal=proposal,
+                patch_payload=patch_payload,
+                actor_id=actor_id,
+                expected_state_version=expected_state_version,
+                patch_sha256=patch_sha256,
+                idempotency_key=idempotency_key,
+                request_sha256=request_sha256,
+                stage=stage,
+                plan=plan,
+                descriptor=descriptor,
+            )
         except Exception:
             try:
-                await self.cleanup_orphan_blob(descriptor)
+                await self._blobs.cleanup_orphan_blob(descriptor)
             except Exception:
                 pass
             raise
@@ -354,7 +378,12 @@ class EditorialProposalAdoptionService:
         proposal_id: UUID,
         *,
         idempotency_key: str,
-    ) -> tuple[EditorialProposal, BlobRecord | None, ProductionArtifact | None, Any | None]:
+    ) -> tuple[
+        EditorialProposal,
+        BlobRecord | None,
+        ProductionArtifact | None,
+        EditorialProposalEvent | None,
+    ]:
         async with self._uow_factory() as uow:
             proposal = await uow.editorial_proposals.get_for_occurrence(
                 subject_id, occurrence_id, proposal_id
@@ -372,51 +401,12 @@ class EditorialProposalAdoptionService:
             artifact = await uow.production_artifacts.get(proposal.base_artifact_id)
             return proposal, patch_record, artifact, event
 
-    async def _read_verified_patch(
-        self, proposal: EditorialProposal, blob: BlobRecord | None
-    ) -> dict[str, Any]:
-        if (
-            blob is None
-            or blob.descriptor.logical_bucket != _PATCH_BUCKET
-            or blob.descriptor.mime_type != _PATCH_MIME
-            or blob.descriptor.size > _MAX_PATCH_BYTES
-            or proposal.patch_sha256 is None
-        ):
-            raise EditorialProposalAdoptionError("proposal_patch_unavailable")
-        try:
-            raw = await self._blob_store.read(blob.descriptor, max_bytes=_MAX_PATCH_BYTES)
-        except Exception:
-            raise EditorialProposalAdoptionError("proposal_patch_unavailable") from None
-        digest = hashlib.sha256(raw).hexdigest()
-        if (
-            len(raw) != blob.descriptor.size
-            or digest != blob.descriptor.sha256
-            or digest != proposal.patch_sha256
-        ):
-            raise EditorialProposalAdoptionError("proposal_patch_hash_mismatch")
-        try:
-            patch = json.loads(raw)
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            raise EditorialProposalAdoptionError("proposal_patch_unavailable") from None
-        if (
-            not isinstance(patch, dict)
-            or patch.get("schema_version") != "editorial-patch-v1"
-            or patch.get("operation") != proposal.operation
-            or patch.get("occurrence_id") != str(proposal.occurrence_id)
-            or patch.get("target_id") != proposal.target_id
-            or patch.get("before_hash") != proposal.before_hash
-            or not isinstance(patch.get("rationale"), str)
-            or not patch["rationale"].strip()
-        ):
-            raise EditorialProposalAdoptionError("proposal_patch_unavailable")
-        return patch
-
     async def _resolve_current(
         self, subject_id: UUID, occurrence_id: UUID
     ) -> WorkspaceOccurrenceResolution:
         try:
             resolution = await self._workspace_service.resolve_occurrence(subject_id, occurrence_id)
-            return cast(WorkspaceOccurrenceResolution, resolution)
+            return resolution
         except Exception:
             raise EditorialProposalAdoptionError("proposal_base_stale") from None
 
@@ -532,6 +522,8 @@ class EditorialProposalAdoptionService:
                 expected_current_artifact_id=proposal.base_artifact_id,
                 expected_current_input_hash=proposal.base_input_hash,
                 expected_current_canonical_sha256=proposal.base_canonical_sha256,
+                expected_current_canonical_blob_id=base_artifact.canonical_blob_id,
+                base_canonical_bytes_verified=True,
                 expected_routing_decision_id=resolution.record.routing_decision_id,
                 expected_routing_decision_hash=resolution.record.routing_decision_hash,
                 stale_stages=frozenset(),
@@ -633,42 +625,6 @@ class EditorialProposalAdoptionService:
             retired_block_ids=enrichment_inputs.retired_block_ids,
         )
 
-    async def _upload_and_verify_candidate(self, candidate: _Candidate) -> BlobDescriptor:
-        if len(candidate.canonical_bytes) > MAX_ARTIFACT_BYTES:
-            raise EditorialProposalAdoptionError("proposal_candidate_too_large")
-        descriptor: BlobDescriptor | None = None
-        try:
-            descriptor = await self._blob_store.put(
-                BytesIO(candidate.canonical_bytes),
-                logical_bucket=_CANONICAL_BUCKET,
-                mime_type=_CANONICAL_MIME,
-            )
-            expected_sha = hashlib.sha256(candidate.canonical_bytes).hexdigest()
-            if (
-                candidate.canonical_sha256 != expected_sha
-                or descriptor.sha256 != expected_sha
-                or descriptor.size != len(candidate.canonical_bytes)
-            ):
-                raise EditorialProposalAdoptionError("proposal_candidate_blob_hash_mismatch")
-            observed = await self._blob_store.read(descriptor, max_bytes=MAX_ARTIFACT_BYTES)
-            if (
-                len(observed) != descriptor.size
-                or hashlib.sha256(observed).hexdigest() != expected_sha
-                or observed != candidate.canonical_bytes
-            ):
-                raise EditorialProposalAdoptionError("proposal_candidate_blob_hash_mismatch")
-        except Exception as error:
-            if descriptor is not None:
-                try:
-                    await self.cleanup_orphan_blob(descriptor)
-                except Exception:
-                    pass
-            if isinstance(error, EditorialProposalAdoptionError):
-                raise
-            raise EditorialProposalAdoptionError("proposal_candidate_blob_unavailable") from None
-        assert descriptor is not None
-        return descriptor
-
     async def _persist_acceptance(
         self,
         *,
@@ -748,8 +704,6 @@ class EditorialProposalAdoptionService:
                 uow, locked, patch_payload, resolution=resolution
             )
             await uow.blobs.lock_address(descriptor.logical_bucket, descriptor.sha256)
-            if not await self._blob_store.exists(descriptor):
-                raise _CandidateBlobMissing
             existing_blob = await uow.blobs.get_by_address(
                 descriptor.logical_bucket, descriptor.sha256
             )
@@ -1162,26 +1116,7 @@ class EditorialProposalAdoptionService:
         )
 
     async def cleanup_orphan_blob(self, descriptor: BlobDescriptor) -> bool:
-        """Idempotently remove an unreferenced object while holding its address lock."""
-        async with self._uow_factory() as uow:
-            await uow.blobs.lock_address(descriptor.logical_bucket, descriptor.sha256)
-            blob = await uow.blobs.get_by_address(descriptor.logical_bucket, descriptor.sha256)
-            if blob is None:
-                if not await self._blob_store.exists(descriptor):
-                    return False
-            else:
-                if blob.descriptor.size != descriptor.size or blob.descriptor.mime_type != (
-                    descriptor.mime_type
-                ):
-                    return False
-                if await uow.blobs.count_references(blob.id):
-                    return False
-                await uow.blobs.delete(blob.id)
-            # Keep the address lock through object deletion and row commit. Adoption
-            # rechecks object presence under the same lock before registering a ref.
-            await self._blob_store.delete(descriptor)
-            await uow.commit()
-        return True
+        return await self._blobs.cleanup_orphan_blob(descriptor)
 
 
 @dataclass(frozen=True, slots=True)

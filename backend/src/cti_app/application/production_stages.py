@@ -591,6 +591,8 @@ class SynthesisService(_ArtifactPayloadMixin):
         expected_current_artifact_id: UUID | None = None,
         expected_current_input_hash: str | None = None,
         expected_current_canonical_sha256: str | None = None,
+        expected_current_canonical_blob_id: UUID | None = None,
+        base_canonical_bytes_verified: bool = False,
         expected_routing_decision_id: UUID | None = None,
         expected_routing_decision_hash: str | None = None,
         stale_stages: set[str] | None = None,
@@ -604,6 +606,10 @@ class SynthesisService(_ArtifactPayloadMixin):
             raise ValueError("Synthesis subject does not match artifact subject")
         if not is_production_extraction_hash(extraction, synthesis.extraction_hash):
             raise ValueError("Synthesis extraction hash does not match canonical extraction")
+        if base_canonical_bytes_verified and (
+            expected_current_canonical_blob_id is None or expected_current_canonical_sha256 is None
+        ):
+            raise ValueError("Prevalidated synthesis base requires its blob ID and SHA-256")
         cited_refs = synthesis_evidence_refs(synthesis)
         metadata_refs = {ref for ref in cited_refs if ref.kind is EvidenceKind.SOURCE_METADATA}
         extraction_source_ids = {source.source_document_id for source in extraction.sources}
@@ -736,14 +742,23 @@ class SynthesisService(_ArtifactPayloadMixin):
                         raise TargetedEditorialRevisionConflictError(
                             "The synthesis revision base has no canonical body"
                         )
-                    current_bytes = await self._artifact_store.read_bytes(current.canonical_blob_id)
                     if (
-                        hashlib.sha256(current_bytes).hexdigest()
-                        != expected_current_canonical_sha256
+                        expected_current_canonical_blob_id is not None
+                        and current.canonical_blob_id != expected_current_canonical_blob_id
                     ):
                         raise TargetedEditorialRevisionConflictError(
-                            "The synthesis revision base content hash changed"
+                            "The synthesis revision base blob changed"
                         )
+                    if not base_canonical_bytes_verified:
+                        current_bytes = await self._artifact_store.read_bytes(
+                            current.canonical_blob_id
+                        )
+                        if hashlib.sha256(current_bytes).hexdigest() != (
+                            expected_current_canonical_sha256
+                        ):
+                            raise TargetedEditorialRevisionConflictError(
+                                "The synthesis revision base content hash changed"
+                            )
             prior_versions = [
                 artifact.version
                 for artifact in existing

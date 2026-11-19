@@ -2,16 +2,43 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from dataclasses import replace
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from datetime import date
+from io import BytesIO
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
 
-from cti_app.application.editorial_workspace.registry import WorkspaceSnapshotRecord, registry_hash
+from cti_app.application.blob_storage import BlobStore
+from cti_app.application.editorial_proposal_adoption import (
+    EditorialProposalAdoptionError,
+    EditorialProposalAdoptionInputs,
+    EditorialProposalAdoptionService,
+    EnrichmentCandidateInputs,
+    SynthesisCandidateInputs,
+)
+from cti_app.application.editorial_synthesis import targets
+from cti_app.application.editorial_synthesis.candidate import (
+    SynthesisCandidatePersistence,
+)
+from cti_app.application.editorial_workspace.registry import (
+    WorkspaceOccurrenceResolution,
+    WorkspaceSnapshotRecord,
+    registry_hash,
+)
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
+from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_stages import SynthesisService
+from cti_app.application.production_synthesis import (
+    build_synthesis_evidence_pack,
+    canonical_extraction_hash,
+)
+from cti_app.application.production_synthesis_revision import _apply_wire_patch
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
 from cti_app.domain.classification import TLP
+from cti_app.domain.discovery import SourceRole
 from cti_app.domain.editions import Edition
 from cti_app.domain.editorial_proposal import (
     EditorialProposal,
@@ -20,15 +47,262 @@ from cti_app.domain.editorial_proposal import (
     EditorialProposalOrigin,
     EditorialProposalState,
 )
-from cti_app.domain.editorial_proposal_impact import EditorialProposalImpact
+from cti_app.domain.editorial_workspace import (
+    AdvancedBlockRegistry,
+    BlockRegistryEntry,
+    EditorialBlockKind,
+    EditorialRevisionStatus,
+    EditorialSourceStage,
+    EditorialTransition,
+)
 from cti_app.domain.entities import Subject
-from cti_app.domain.production import ProductionArtifact, ProductionArtifactStage, ProductionRun
+from cti_app.domain.production import (
+    EXTRACTION_PROFILE_POLICY_VERSION,
+    ExtractionProfile,
+    ProductionArtifact,
+    ProductionArtifactStage,
+    ProductionArtifactStatus,
+    ProductionEvidenceBasis,
+    ProductionInputSnapshot,
+    ProductionRun,
+    SynthesisMode,
+)
+from cti_app.domain.production_editorial_revision import (
+    TargetedEditorialRevisionOperation,
+    TargetedEditorialRevisionTarget,
+    TargetedEditorialRevisionTargetKind,
+)
+from cti_app.domain.production_extraction import (
+    ExtractionFactV1,
+    ExtractionReuseState,
+    ProductionExtractionV1,
+    ProductionSourceExtractionV1,
+)
+from cti_app.domain.production_references import ProductionReferenceKind, ProductionReferenceTier
+from cti_app.domain.production_synthesis import (
+    PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
+    SYNTHESIS_POLICY_VERSION,
+    ProductionSynthesisV1,
+    SynthesisParagraphV1,
+    SynthesisSectionKind,
+    SynthesisSectionV1,
+    extraction_evidence_refs_v1,
+    production_synthesis_to_json,
+)
 from cti_app.domain.publication_kind import PublicationKind
 
 pytestmark = pytest.mark.integration
 
+_PATCH_BUCKET = "editorial-proposal-patches"
+_PATCH_MIME = "application/vnd.autowork.editorial-patch+json"
+_CANONICAL_BUCKET = "production-artifacts-canonical"
 
-async def _seed(uow_factory: UnitOfWorkFactory, *, proposal_count: int = 2) -> dict[str, object]:
+
+class _MemoryBlobStore:
+    def __init__(self) -> None:
+        self.objects: dict[tuple[str, str], bytes] = {}
+        self.put_calls = 0
+        self.delete_calls = 0
+        self.put_barrier_target: int | None = None
+        self._put_barrier = asyncio.Event()
+
+    def seed(self, descriptor: BlobDescriptor, content: bytes) -> None:
+        self.objects[(descriptor.logical_bucket, descriptor.sha256)] = content
+
+    def synchronize_next_puts(self, count: int) -> None:
+        self.put_barrier_target = self.put_calls + count
+
+    async def put(self, source: BytesIO, *, logical_bucket: str, mime_type: str) -> BlobDescriptor:
+        self.put_calls += 1
+        content = source.read()
+        digest = hashlib.sha256(content).hexdigest()
+        self.objects.setdefault((logical_bucket, digest), content)
+        if self.put_barrier_target is not None and self.put_calls <= self.put_barrier_target:
+            if self.put_calls == self.put_barrier_target:
+                self._put_barrier.set()
+            await self._put_barrier.wait()
+        return BlobDescriptor(digest, len(content), mime_type, logical_bucket)
+
+    async def read(self, descriptor: BlobDescriptor, *, max_bytes: int) -> bytes:
+        content = self.objects[(descriptor.logical_bucket, descriptor.sha256)]
+        if len(content) > max_bytes:
+            raise ValueError("synthetic_read_limit")
+        return content
+
+    async def exists(self, descriptor: BlobDescriptor) -> bool:
+        return (descriptor.logical_bucket, descriptor.sha256) in self.objects
+
+    async def delete(self, descriptor: BlobDescriptor) -> None:
+        self.delete_calls += 1
+        self.objects.pop((descriptor.logical_bucket, descriptor.sha256), None)
+
+
+class _MemoryArtifactStore:
+    def __init__(self, blobs: Mapping[UUID, bytes]) -> None:
+        self.blobs = dict(blobs)
+
+    async def read_bytes(self, blob_id: UUID, *, max_bytes: int | None = None) -> bytes:
+        content = self.blobs[blob_id]
+        if max_bytes is not None and len(content) > max_bytes:
+            raise ValueError("synthetic_read_limit")
+        return content
+
+
+class _Workspace:
+    def __init__(self, resolution: WorkspaceOccurrenceResolution) -> None:
+        self.resolution = resolution
+
+    async def resolve_occurrence(
+        self, _subject_id: UUID, _occurrence_id: UUID
+    ) -> WorkspaceOccurrenceResolution:
+        return self.resolution
+
+    async def resolve_occurrence_in_uow(
+        self, _uow: UnitOfWork, _subject_id: UUID, _occurrence_id: UUID
+    ) -> WorkspaceOccurrenceResolution:
+        return self.resolution
+
+    def advance(
+        self,
+        *,
+        base_registry: tuple[BlockRegistryEntry, ...],
+        canonical_sha256: str,
+        retired_block_ids: tuple[UUID, ...] = (),
+        **_kwargs: Any,
+    ) -> AdvancedBlockRegistry:
+        active = tuple(
+            replace(
+                entry,
+                content_sha256=canonical_sha256,
+                transition=EditorialTransition.REWRITE,
+            )
+            for entry in base_registry
+        )
+        return AdvancedBlockRegistry(active=active, retired_block_ids=frozenset(retired_block_ids))
+
+
+@dataclass
+class _SyntheticFences:
+    tlp: TLP = TLP.AMBER
+    revoked: bool = False
+    external_llm_allowed: bool = True
+    thread_binding_valid: bool = True
+    admitted_evidence_refs: frozenset[str] = frozenset()
+
+
+class _Inputs(EditorialProposalAdoptionInputs):
+    def __init__(self, synthesis: SynthesisCandidateInputs) -> None:
+        self.synthesis = synthesis
+        self.fences = _SyntheticFences()
+        self.revalidated = 0
+
+    async def synthesis_inputs(
+        self,
+        _proposal: EditorialProposal,
+        _patch: Mapping[str, Any],
+        *,
+        base_artifact: ProductionArtifact,
+        base_payload: dict[str, Any],
+        base_bytes: bytes,
+        resolution: WorkspaceOccurrenceResolution,
+    ) -> SynthesisCandidateInputs:
+        assert base_artifact.id == resolution.artifact_id
+        assert self.synthesis.base_payload == base_payload
+        assert base_bytes
+        return self.synthesis
+
+    async def enrichment_inputs(
+        self,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> EnrichmentCandidateInputs:
+        raise AssertionError("synthetic integration fixture only adopts synthesis proposals")
+
+    async def revalidate_evidence_policy_and_thread(
+        self,
+        _uow: UnitOfWork,
+        proposal: EditorialProposal,
+        _patch: Mapping[str, Any],
+        *,
+        resolution: WorkspaceOccurrenceResolution,
+    ) -> None:
+        self.revalidated += 1
+        if resolution.record.subject_id != proposal.subject_id:
+            raise EditorialProposalAdoptionError("proposal_base_stale")
+        if self.fences.tlp is TLP.RED:
+            raise EditorialProposalAdoptionError("external_llm_tlp_blocked")
+        if self.fences.revoked:
+            raise EditorialProposalAdoptionError("proposal_evidence_revoked")
+        if not self.fences.external_llm_allowed:
+            raise EditorialProposalAdoptionError("external_llm_blocked")
+        if not self.fences.thread_binding_valid:
+            raise EditorialProposalAdoptionError("thread_binding_stale")
+        if not set(proposal.evidence_refs) <= self.fences.admitted_evidence_refs:
+            raise EditorialProposalAdoptionError("proposal_evidence_not_admissible")
+
+
+@dataclass(frozen=True)
+class _Seeded:
+    subject: Subject
+    run: ProductionRun
+    base_artifact: ProductionArtifact
+    snapshot: WorkspaceSnapshotRecord
+    production_input: ProductionInputSnapshot
+    extraction: ProductionExtractionV1
+    synthesis: ProductionSynthesisV1
+    proposals: tuple[EditorialProposal, ...]
+    actor_id: UUID
+    patch_sha256: str
+    blob_store: _MemoryBlobStore
+    artifact_store: _MemoryArtifactStore
+    workspace: _Workspace
+    inputs: _Inputs
+
+
+def _synthetic_candidate_context(
+    *,
+    run_id: UUID,
+    artifact: ProductionArtifact,
+    production_input: ProductionInputSnapshot,
+    extraction: ProductionExtractionV1,
+    synthesis: ProductionSynthesisV1,
+    base_payload: dict[str, Any],
+    base_sha256: str,
+) -> SynthesisCandidateInputs:
+    persistence = SynthesisCandidatePersistence(
+        run_id=run_id,
+        subject_id=artifact.subject_id,
+        input_hash=artifact.input_hash,
+        extraction=extraction,
+        snapshot=production_input,
+        raw_result=None,
+        model_run_id=None,
+        publication_kind=PublicationKind.BRIEF,
+        mode=SynthesisMode.FRESH,
+        expected_current_artifact_id=artifact.id,
+        expected_current_input_hash=artifact.input_hash,
+        expected_current_canonical_sha256=base_sha256,
+    )
+    target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind.TITLE,
+        stable_ids=(),
+    )
+    return SynthesisCandidateInputs(
+        base_payload=base_payload,
+        base_synthesis=synthesis,
+        target=target,
+        evidence_pack=build_synthesis_evidence_pack(production_input, extraction),
+        extraction=extraction,
+        snapshot=production_input,
+        apply_patch=_apply_wire_patch,
+        persistence=persistence,
+        registry_lineage=(),
+        publication_kind=PublicationKind.BRIEF,
+    )
+
+
+async def _seed(uow_factory: UnitOfWorkFactory, *, proposal_count: int = 2) -> _Seeded:
+    blob_store = _MemoryBlobStore()
     edition = Edition(
         country="France",
         country_code="FR",
@@ -37,68 +311,175 @@ async def _seed(uow_factory: UnitOfWorkFactory, *, proposal_count: int = 2) -> d
         tlp=TLP.AMBER,
         languages=("fr",),
     )
-    patch_bytes = b'{"schema_version":"editorial-patch-v1","synthetic":true}'
+    subject = Subject(
+        edition_id=edition.id,
+        title="Synthetic adoption subject",
+        slug=f"proposal-adoption-{uuid4().hex[:12]}",
+        tlp=TLP.AMBER,
+    )
+    run = ProductionRun(subject_id=subject.id, edition_id=edition.id)
+    operation = TargetedEditorialRevisionOperation.REWRITE_TITLE
+    target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind.TITLE,
+        stable_ids=(),
+    )
+    source_document_id = uuid4()
+    production_input = ProductionInputSnapshot(
+        production_run_id=run.id,
+        edition_id=edition.id,
+        subject_id=subject.id,
+        subject_version=1,
+        subject_title=subject.title,
+        subject_tlp=TLP.AMBER,
+        selection_decision_id=uuid4(),
+        origin_discovery_subject_id=uuid4(),
+        canonical_discovery_subject_id=uuid4(),
+        discovery_snapshot_id=uuid4(),
+        discovery_snapshot_version=1,
+        member_candidate_ids=(),
+        discovery_summary="Synthetic summary.",
+        actor_or_campaign="Synthetic actor",
+        period_start=date(2026, 11, 1),
+        period_end=date(2026, 11, 30),
+        publication_language="fr",
+        research_date=date(2026, 11, 19),
+    )
+    extraction = ProductionExtractionV1(
+        schema_version=1,
+        subject_id=subject.id,
+        production_input_hash=production_input.input_hash,
+        references_corpus_hash="c" * 64,
+        profile_policy_version=EXTRACTION_PROFILE_POLICY_VERSION,
+        sources=(
+            ProductionSourceExtractionV1(
+                source_document_id=source_document_id,
+                canonical_url="https://example.test/synthetic-report",
+                content_sha256="d" * 64,
+                tier=ProductionReferenceTier.CORE,
+                kind=ProductionReferenceKind.PUBLICATION,
+                role=SourceRole.PRIMARY,
+                profile=ExtractionProfile.FULL,
+                checkpoint_id=None,
+                reuse_state=ExtractionReuseState.FRESH,
+                facts=(
+                    ExtractionFactV1(
+                        category="other_technical",
+                        value="Synthetic finding",
+                        attack_id=None,
+                        context="Synthetic test context.",
+                        evidence_quote="The synthetic report records this finding.",
+                        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+                        source_document_ids=(source_document_id,),
+                    ),
+                ),
+                events=(),
+                indicators=(),
+                rules=(),
+                uncertainties=(),
+            ),
+        ),
+        omitted_sources=(),
+        warnings=(),
+    )
+    evidence_ref = extraction_evidence_refs_v1(extraction)[0]
+    base_synthesis = ProductionSynthesisV1(
+        schema_version=PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
+        subject_id=subject.id,
+        production_input_hash=production_input.input_hash,
+        extraction_hash=canonical_extraction_hash(extraction),
+        publication_language="fr",
+        synthesis_policy_version=SYNTHESIS_POLICY_VERSION,
+        title="[Synthetic actor] Synthetic report",
+        lead=(SynthesisParagraphV1("A synthetic lead claim.", (evidence_ref,)),),
+        sections=(
+            SynthesisSectionV1(
+                SynthesisSectionKind.OVERVIEW,
+                "Synthetic observations",
+                (SynthesisParagraphV1("A synthetic section claim.", (evidence_ref,)),),
+            ),
+        ),
+        timeline=(),
+        uncertainties=(),
+        warnings=(),
+    )
+    base_payload = production_synthesis_to_json(base_synthesis)
+    base_bytes = ProductionArtifactStore.canonical_json_bytes(base_payload)
+    base_sha256 = hashlib.sha256(base_bytes).hexdigest()
+    base_artifact = ProductionArtifact(
+        production_run_id=run.id,
+        subject_id=subject.id,
+        stage=ProductionArtifactStage.SYNTHESIS,
+        version=1,
+        input_hash=production_input.input_hash,
+        status=ProductionArtifactStatus.VERIFIED,
+    )
+    resolved_target = targets.resolve_target(base_payload, target, operation)
+    entry = BlockRegistryEntry(
+        block_id=uuid4(),
+        kind=EditorialBlockKind.TITLE,
+        parent_block_id=None,
+        position=0,
+        content_sha256=resolved_target.before_hash,
+        source_stage=EditorialSourceStage.SYNTHESIS,
+        structural_pointer="/title",
+        revision_status=EditorialRevisionStatus.READY,
+    )
+    snapshot = WorkspaceSnapshotRecord(
+        snapshot_id=uuid4(),
+        subject_id=subject.id,
+        production_run_id=run.id,
+        synthesis_artifact_id=base_artifact.id,
+        synthesis_version=base_artifact.version,
+        synthesis_input_hash=base_artifact.input_hash,
+        synthesis_canonical_sha256=base_sha256,
+        enrichment_artifact_id=None,
+        enrichment_version=None,
+        enrichment_input_hash=None,
+        enrichment_canonical_sha256=None,
+        publication_artifact_id=None,
+        publication_version=None,
+        publication_input_hash=None,
+        publication_canonical_sha256=None,
+        pipeline_generation=0,
+        routing_decision_id=None,
+        routing_decision_hash=None,
+        publication_kind=PublicationKind.BRIEF,
+        workspace_pin_hash="3" * 64,
+        registry_hash=registry_hash((entry,)),
+        block_registry=(entry,),
+    )
+    patch_payload = {
+        "schema_version": "editorial-patch-v1",
+        "operation": operation.value,
+        "target": target.to_json(),
+        "target_id": "synthetic-title",
+        "occurrence_id": str(entry.block_id),
+        "before_hash": resolved_target.before_hash,
+        "after": "[Synthetic actor] Revised report",
+        "rationale": "Synthetic test rationale.",
+    }
+    patch_bytes = ProductionArtifactStore.canonical_json_bytes(patch_payload)
     patch_sha256 = hashlib.sha256(patch_bytes).hexdigest()
-    actor_id = uuid4()
-    variant_group_id = uuid4()
-    occurrence_id = uuid4()
+    patch_descriptor = BlobDescriptor(patch_sha256, len(patch_bytes), _PATCH_MIME, _PATCH_BUCKET)
+    base_descriptor = BlobDescriptor(
+        base_sha256, len(base_bytes), "application/json", _CANONICAL_BUCKET
+    )
+    blob_store.seed(patch_descriptor, patch_bytes)
+    blob_store.seed(base_descriptor, base_bytes)
+    base_blob = BlobRecord(descriptor=base_descriptor)
+    patch_blob = BlobRecord(descriptor=patch_descriptor)
+    actor_id, variant_group_id = uuid4(), uuid4()
     proposals: list[EditorialProposal] = []
 
     async with uow_factory() as uow:
-        # Resolve logical-key conflicts before capturing parent IDs in children.
         await uow.editions.add_if_absent(edition)
-        subject = Subject(
-            edition_id=edition.id,
-            title="Synthetic adoption subject",
-            slug=f"proposal-adoption-{uuid4().hex[:12]}",
-            tlp=TLP.AMBER,
-        )
         await uow.subjects.add(subject)
-        run = ProductionRun(subject_id=subject.id, edition_id=edition.id)
         await uow.production_runs.add(run)
-        base_artifact = ProductionArtifact(
-            production_run_id=run.id,
-            subject_id=subject.id,
-            stage=ProductionArtifactStage.SYNTHESIS,
-            version=1,
-            input_hash="1" * 64,
-        )
+        await uow.blobs.add_if_absent(base_blob)
+        await uow.blobs.add_if_absent(patch_blob)
+        base_artifact = replace(base_artifact, canonical_blob_id=base_blob.id)
         await uow.production_artifacts.append(base_artifact)
-        snapshot = WorkspaceSnapshotRecord(
-            snapshot_id=uuid4(),
-            subject_id=subject.id,
-            production_run_id=run.id,
-            synthesis_artifact_id=base_artifact.id,
-            synthesis_version=1,
-            synthesis_input_hash=base_artifact.input_hash,
-            synthesis_canonical_sha256="2" * 64,
-            enrichment_artifact_id=None,
-            enrichment_version=None,
-            enrichment_input_hash=None,
-            enrichment_canonical_sha256=None,
-            publication_artifact_id=None,
-            publication_version=None,
-            publication_input_hash=None,
-            publication_canonical_sha256=None,
-            pipeline_generation=0,
-            routing_decision_id=None,
-            routing_decision_hash=None,
-            publication_kind=PublicationKind.ARTICLE,
-            workspace_pin_hash="3" * 64,
-            registry_hash=registry_hash(()),
-            block_registry=(),
-        )
         await uow.editorial_workspace_snapshots.append_if_absent(snapshot)
-        patch_blob = await uow.blobs.add_if_absent(
-            BlobRecord(
-                descriptor=BlobDescriptor(
-                    sha256=patch_sha256,
-                    size=len(patch_bytes),
-                    mime_type="application/vnd.autowork.editorial-patch+json",
-                    logical_bucket="editorial-proposal-patches",
-                )
-            )
-        )
         for index in range(proposal_count):
             proposal = EditorialProposal(
                 id=uuid4(),
@@ -106,16 +487,16 @@ async def _seed(uow_factory: UnitOfWorkFactory, *, proposal_count: int = 2) -> d
                 production_run_id=run.id,
                 origin=EditorialProposalOrigin.MANUAL_PATCH,
                 snapshot_id=snapshot.snapshot_id,
-                occurrence_id=occurrence_id,
+                occurrence_id=entry.block_id,
                 base_artifact_id=base_artifact.id,
-                base_artifact_version=1,
+                base_artifact_version=base_artifact.version,
                 base_input_hash=base_artifact.input_hash,
-                base_canonical_sha256=snapshot.synthesis_canonical_sha256,
+                base_canonical_sha256=base_sha256,
                 base_routing_hash=None,
                 base_pin_hash=snapshot.workspace_pin_hash,
-                target_id=f"synthetic-target-{index}",
-                operation="rewrite_title",
-                before_hash="4" * 64,
+                target_id="synthetic-title",
+                operation=operation.value,
+                before_hash=resolved_target.before_hash,
                 patch_blob_ref=patch_blob.id,
                 patch_sha256=patch_sha256,
                 evidence_refs=(),
@@ -127,10 +508,9 @@ async def _seed(uow_factory: UnitOfWorkFactory, *, proposal_count: int = 2) -> d
                 state=EditorialProposalState.PROPOSED,
                 state_version=1,
                 actor_id=actor_id,
-                idempotency_key=f"synthetic-adoption-{index}-{uuid4().hex}",
+                idempotency_key=f"synthetic-prepared-{index}-{uuid4().hex}",
                 request_sha256=hashlib.sha256(f"prepared-{index}".encode()).hexdigest(),
             )
-            proposals.append(proposal)
             event = EditorialProposalEvent(
                 id=uuid4(),
                 proposal_id=proposal.id,
@@ -147,327 +527,232 @@ async def _seed(uow_factory: UnitOfWorkFactory, *, proposal_count: int = 2) -> d
                 proposal, event=event, model_run=None
             )
             assert inserted and stored.id == proposal.id
+            proposals.append(proposal)
         await uow.commit()
+
+    resolution = WorkspaceOccurrenceResolution(
+        record=snapshot,
+        entry=entry,
+        binding_state="valid",
+        artifact_id=base_artifact.id,
+        artifact_version=base_artifact.version,
+        canonical_sha256=base_sha256,
+    )
+    synthesis_inputs = _synthetic_candidate_context(
+        run_id=run.id,
+        artifact=base_artifact,
+        production_input=production_input,
+        extraction=extraction,
+        synthesis=base_synthesis,
+        base_payload=base_payload,
+        base_sha256=base_sha256,
+    )
+    inputs = _Inputs(synthesis_inputs)
+    return _Seeded(
+        subject=subject,
+        run=run,
+        base_artifact=base_artifact,
+        snapshot=snapshot,
+        production_input=production_input,
+        extraction=extraction,
+        synthesis=base_synthesis,
+        proposals=tuple(proposals),
+        actor_id=actor_id,
+        patch_sha256=patch_sha256,
+        blob_store=blob_store,
+        artifact_store=_MemoryArtifactStore({base_blob.id: base_bytes}),
+        workspace=_Workspace(resolution),
+        inputs=inputs,
+    )
+
+
+def _service(seeded: _Seeded, uow_factory: UnitOfWorkFactory) -> EditorialProposalAdoptionService:
+    artifact_store = cast(ProductionArtifactStore, seeded.artifact_store)
+    return EditorialProposalAdoptionService(
+        uow_factory=uow_factory,
+        blob_store=cast(BlobStore, seeded.blob_store),
+        artifact_store=artifact_store,
+        workspace_service=seeded.workspace,
+        inputs=seeded.inputs,
+        synthesis_writer=SynthesisService(uow_factory, artifact_store),
+        enrichment_writer=cast(Any, None),
+    )
+
+
+class _FailingImpactRepository:
+    def __init__(self, repository: Any) -> None:
+        self.repository = repository
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.repository, name)
+
+    async def add(self, _impact: Any) -> None:
+        raise RuntimeError("synthetic impact insert failure")
+
+
+class _FaultingUow:
+    def __init__(self, inner: UnitOfWork, state: _FaultState) -> None:
+        self.inner = inner
+        self.state = state
+
+    async def __aenter__(self) -> _FaultingUow:
+        await self.inner.__aenter__()
+        if self.state.fail_impact:
+            self.inner.editorial_proposal_impacts = _FailingImpactRepository(
+                self.inner.editorial_proposal_impacts
+            )  # type: ignore[assignment]
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        await self.inner.__aexit__(exc_type, exc_value, traceback)
+
+    async def commit(self) -> None:
+        await self.inner.commit()
+        if self.state.fail_commit_once:
+            self.state.fail_commit_once = False
+            raise RuntimeError("synthetic post-commit response loss")
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
+
+
+@dataclass
+class _FaultState:
+    fail_impact: bool = False
+    fail_commit_once: bool = False
+
+
+class _FaultingUowFactory:
+    def __init__(self, inner: UnitOfWorkFactory, state: _FaultState) -> None:
+        self.inner = inner
+        self.state = state
+
+    def __call__(self) -> _FaultingUow:
+        return _FaultingUow(self.inner(), self.state)
+
+
+def _adopt_kwargs(seeded: _Seeded, proposal: EditorialProposal, key: str) -> dict[str, Any]:
     return {
-        "subject": subject,
-        "run": run,
-        "base_artifact": base_artifact,
-        "snapshot": snapshot,
-        "proposals": tuple(proposals),
-        "actor_id": actor_id,
-        "patch_sha256": patch_sha256,
+        "subject_id": proposal.subject_id,
+        "occurrence_id": proposal.occurrence_id,
+        "proposal_id": proposal.id,
+        "actor_id": seeded.actor_id,
+        "expected_state_version": 1,
+        "patch_sha256": seeded.patch_sha256,
+        "idempotency_key": key,
     }
 
 
-async def _adopt_in_uow(
-    uow: UnitOfWork,
-    *,
-    subject_id: UUID,
-    run_id: UUID,
-    proposal_id: UUID,
-    occurrence_id: UUID,
-    actor_id: UUID,
-    fail_before_commit: bool = False,
-) -> str:
-    proposal = await uow.editorial_proposals.get_for_occurrence(
-        subject_id, occurrence_id, proposal_id
-    )
-    if proposal is None:
-        raise AssertionError("seeded proposal not found")
-    key = f"accept-{proposal.id.hex}"
-    request_sha256 = hashlib.sha256(f"accept-request-{proposal.id.hex}".encode()).hexdigest()
-
-    await uow.editorial_proposals.lock_adoption_for_run(run_id)
-    proposal = await uow.editorial_proposals.get_for_occurrence_for_update(
-        subject_id, proposal.occurrence_id, proposal_id
-    )
-    if proposal is None:
-        raise AssertionError("seeded proposal not found")
-    replay = await uow.editorial_proposals.get_event_by_idempotency(proposal_id, key)
-    if replay is not None:
-        return "replayed" if replay.request_sha256 == request_sha256 else "conflict"
-    if proposal.state is not EditorialProposalState.PROPOSED:
-        return "stale"
-
-    run = await uow.production_runs.get_for_update(run_id)
-    if run is None:
-        raise AssertionError("seeded run not found")
-    base_snapshot = await uow.editorial_workspace_snapshots.get_by_id(proposal.snapshot_id)
-    if base_snapshot is None:
-        raise AssertionError("seeded snapshot not found")
-
-    canonical_bytes = f'{{"adopted_proposal":"{proposal.id}"}}'.encode()
-    canonical_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
-    canonical_blob = await uow.blobs.add_if_absent(
-        BlobRecord(
-            descriptor=BlobDescriptor(
-                sha256=canonical_sha256,
-                size=len(canonical_bytes),
-                mime_type="application/json",
-                logical_bucket="production-artifacts-canonical",
-            )
-        )
-    )
-    artifact = ProductionArtifact(
-        production_run_id=run_id,
-        subject_id=subject_id,
-        stage=ProductionArtifactStage.SYNTHESIS,
-        version=2,
-        input_hash=proposal.base_input_hash,
-        canonical_blob_id=canonical_blob.id,
-        metadata={"synthetic_adoption": True},
-    )
-    await uow.production_artifacts.append(artifact)
-    accepted_snapshot = replace(
-        base_snapshot,
-        snapshot_id=uuid4(),
-        synthesis_artifact_id=artifact.id,
-        synthesis_version=artifact.version,
-        synthesis_canonical_sha256=canonical_sha256,
-        workspace_pin_hash=hashlib.sha256(f"pins-{artifact.id}".encode()).hexdigest(),
-        parent_snapshot_id=base_snapshot.snapshot_id,
-    )
-    accepted_snapshot = await uow.editorial_workspace_snapshots.append_if_absent(accepted_snapshot)
-    decision_id = uuid4()
-    accepted_event = EditorialProposalEvent(
-        id=uuid4(),
-        proposal_id=proposal.id,
-        sequence=proposal.state_version + 1,
-        kind=EditorialProposalEventKind.STATE_CHANGED,
-        state=EditorialProposalState.ACCEPTED,
-        state_version=proposal.state_version + 1,
-        actor_id=actor_id,
-        idempotency_key=key,
-        request_sha256=request_sha256,
-        patch_sha256=proposal.patch_sha256,
-    )
-    accepted, changed = await uow.editorial_proposals.transition_if_current(
-        subject_id=subject_id,
-        occurrence_id=proposal.occurrence_id,
-        proposal_id=proposal.id,
-        expected_state=EditorialProposalState.PROPOSED,
-        expected_state_version=proposal.state_version,
-        state=EditorialProposalState.ACCEPTED,
-        event=accepted_event,
-        decision_id=decision_id,
-        accepted_artifact_id=artifact.id,
-    )
-    if accepted is None or not changed:
-        return "stale"
-
-    for sibling in await uow.editorial_proposals.list_proposed_for_run_for_update(run_id):
-        if sibling.id == proposal.id:
-            continue
-        stale_event = EditorialProposalEvent(
-            id=uuid4(),
-            proposal_id=sibling.id,
-            sequence=sibling.state_version + 1,
-            kind=EditorialProposalEventKind.STATE_CHANGED,
-            state=EditorialProposalState.STALE,
-            state_version=sibling.state_version + 1,
-            actor_id=actor_id,
-            idempotency_key=f"stale-{sibling.id.hex}-{sibling.state_version}",
-            request_sha256=hashlib.sha256(f"stale-{sibling.id}".encode()).hexdigest(),
-            patch_sha256=sibling.patch_sha256,
-        )
-        await uow.editorial_proposals.transition_if_current(
-            subject_id=sibling.subject_id,
-            occurrence_id=sibling.occurrence_id,
-            proposal_id=sibling.id,
-            expected_state=EditorialProposalState.PROPOSED,
-            expected_state_version=sibling.state_version,
-            state=EditorialProposalState.STALE,
-            event=stale_event,
-        )
-
-    impact = EditorialProposalImpact(
-        impact_id=uuid4(),
-        subject_id=subject_id,
-        production_run_id=run_id,
-        proposal_id=proposal.id,
-        accepted_artifact_id=artifact.id,
-        accepted_snapshot_id=accepted_snapshot.snapshot_id,
-        base_pin_hash=proposal.base_pin_hash,
-        accepted_pin_hash=accepted_snapshot.workspace_pin_hash,
-        sequence=await uow.editorial_proposal_impacts.next_sequence_for_run(run_id),
-    )
-    await uow.editorial_proposal_impacts.add(impact)
-    if fail_before_commit:
-        raise RuntimeError("synthetic adoption transaction crash")
-    await uow.commit()
-    return "accepted"
-
-
 @pytest.mark.asyncio
-async def test_two_concurrent_adoptions_have_one_cas_winner_and_stale_sibling(
-    uow_factory: UnitOfWorkFactory,
-) -> None:
-    seeded = await _seed(uow_factory)
-    subject = seeded["subject"]
-    run = seeded["run"]
-    proposals = seeded["proposals"]
-    actor_id = seeded["actor_id"]
-    assert isinstance(subject, Subject) and isinstance(run, ProductionRun)
-    assert isinstance(proposals, tuple) and len(proposals) == 2 and isinstance(actor_id, UUID)
-    first, second = proposals
-
-    async def adopt(proposal: EditorialProposal) -> str:
-        async with uow_factory() as uow:
-            return await _adopt_in_uow(
-                uow,
-                subject_id=subject.id,
-                run_id=run.id,
-                proposal_id=proposal.id,
-                occurrence_id=proposal.occurrence_id,
-                actor_id=actor_id,
-            )
-
-    results = await asyncio.gather(adopt(first), adopt(second))
-
-    assert sorted(results) == ["accepted", "stale"]
-    async with uow_factory() as uow:
-        persisted = [
-            await uow.editorial_proposals.get_for_occurrence(
-                proposal.subject_id, proposal.occurrence_id, proposal.id
-            )
-            for proposal in proposals
-        ]
-        assert (
-            sum(
-                item is not None and item.state is EditorialProposalState.ACCEPTED
-                for item in persisted
-            )
-            == 1
-        )
-        assert (
-            sum(
-                item is not None and item.state is EditorialProposalState.STALE
-                for item in persisted
-            )
-            == 1
-        )
-        impacts = [
-            await uow.editorial_proposal_impacts.get_by_proposal(proposal.id)
-            for proposal in proposals
-        ]
-        assert sum(item is not None for item in impacts) == 1
-        assert next(item for item in impacts if item is not None).sequence == 1
-
-
-@pytest.mark.asyncio
-async def test_adoption_relational_changes_roll_back_atomically(
+async def test_two_concurrent_adoptions_of_same_blob_have_one_winner_and_keep_object(
     uow_factory: UnitOfWorkFactory,
 ) -> None:
     seeded = await _seed(uow_factory, proposal_count=1)
-    subject, run = seeded["subject"], seeded["run"]
-    proposal = seeded["proposals"][0]
-    actor_id = seeded["actor_id"]
-    assert isinstance(subject, Subject) and isinstance(run, ProductionRun)
-    assert isinstance(proposal, EditorialProposal) and isinstance(actor_id, UUID)
+    proposal = seeded.proposals[0]
+    seeded.blob_store.synchronize_next_puts(2)
+    service = _service(seeded, uow_factory)
 
-    with pytest.raises(RuntimeError, match="transaction crash"):
-        async with uow_factory() as uow:
-            await _adopt_in_uow(
-                uow,
-                subject_id=subject.id,
-                run_id=run.id,
-                proposal_id=proposal.id,
-                occurrence_id=proposal.occurrence_id,
-                actor_id=actor_id,
-                fail_before_commit=True,
-            )
+    results = await asyncio.gather(
+        service.adopt(**_adopt_kwargs(seeded, proposal, f"adopt-a-{uuid4().hex}")),
+        service.adopt(**_adopt_kwargs(seeded, proposal, f"adopt-b-{uuid4().hex}")),
+        return_exceptions=True,
+    )
 
+    successes = [item for item in results if not isinstance(item, BaseException)]
+    failures = [item for item in results if isinstance(item, BaseException)]
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert isinstance(failures[0], EditorialProposalAdoptionError)
+    assert failures[0].code == "proposal_state_conflict"
     async with uow_factory() as uow:
-        persisted = await uow.editorial_proposals.get_for_occurrence(
-            subject.id, proposal.occurrence_id, proposal.id
+        accepted = await uow.editorial_proposals.get_for_occurrence(
+            proposal.subject_id, proposal.occurrence_id, proposal.id
         )
-        assert persisted is not None and persisted.state is EditorialProposalState.PROPOSED
-        assert await uow.editorial_proposal_impacts.get_by_proposal(proposal.id) is None
-        assert len(await uow.production_artifacts.list_for_run(run.id)) == 1
-        assert (
-            await uow.editorial_proposals.get_event_by_idempotency(
-                proposal.id, f"accept-{proposal.id.hex}"
-            )
-            is None
-        )
+        assert accepted is not None and accepted.state is EditorialProposalState.ACCEPTED
+        artifact = await uow.production_artifacts.get(cast(UUID, accepted.accepted_artifact_id))
+        assert artifact is not None and artifact.canonical_blob_id is not None
+        blob = await uow.blobs.get(artifact.canonical_blob_id)
+        assert blob is not None
+        assert await uow.blobs.count_references(blob.id) > 0
+        assert await uow.editorial_proposal_impacts.get_by_proposal(proposal.id) is not None
+    assert await seeded.blob_store.exists(blob.descriptor)
+    assert seeded.blob_store.delete_calls == 0
 
 
 @pytest.mark.asyncio
-async def test_accepting_variant_marks_sibling_stale_in_same_transaction(
+async def test_adopting_variant_stales_sibling_in_same_transaction(
     uow_factory: UnitOfWorkFactory,
 ) -> None:
     seeded = await _seed(uow_factory)
-    subject, run = seeded["subject"], seeded["run"]
-    proposals = seeded["proposals"]
-    actor_id = seeded["actor_id"]
-    assert isinstance(subject, Subject) and isinstance(run, ProductionRun)
-    assert isinstance(proposals, tuple) and len(proposals) == 2 and isinstance(actor_id, UUID)
-    accepted, sibling = proposals
-
-    async with uow_factory() as uow:
-        result = await _adopt_in_uow(
-            uow,
-            subject_id=subject.id,
-            run_id=run.id,
-            proposal_id=accepted.id,
-            occurrence_id=accepted.occurrence_id,
-            actor_id=actor_id,
-        )
-    assert result == "accepted"
+    accepted, sibling = seeded.proposals
+    result = await _service(seeded, uow_factory).adopt(
+        **_adopt_kwargs(seeded, accepted, f"adopt-variant-{uuid4().hex}")
+    )
+    assert result.proposal.state is EditorialProposalState.ACCEPTED
 
     async with uow_factory() as uow:
         accepted_row = await uow.editorial_proposals.get_for_occurrence(
-            subject.id, accepted.occurrence_id, accepted.id
+            accepted.subject_id, accepted.occurrence_id, accepted.id
         )
         stale_row = await uow.editorial_proposals.get_for_occurrence(
-            subject.id, sibling.occurrence_id, sibling.id
+            sibling.subject_id, sibling.occurrence_id, sibling.id
         )
-        impact = await uow.editorial_proposal_impacts.get_by_proposal(accepted.id)
         assert accepted_row is not None and accepted_row.state is EditorialProposalState.ACCEPTED
         assert stale_row is not None and stale_row.state is EditorialProposalState.STALE
-        assert (
-            impact is not None and impact.accepted_artifact_id == accepted_row.accepted_artifact_id
+        assert stale_row.state_version == 2
+        event = await uow.editorial_proposals.get_event_by_idempotency(
+            sibling.id, f"accept-stale-{accepted.id.hex}-{sibling.id.hex}"
         )
+        assert event is not None and event.state is EditorialProposalState.STALE
 
 
 @pytest.mark.asyncio
-async def test_adoption_crash_after_commit_before_impact_is_replayable(
+async def test_adoption_relation_changes_roll_back_if_a_late_step_fails(
+    uow_factory: UnitOfWorkFactory,
+) -> None:
+    seeded = await _seed(uow_factory)
+    proposal, sibling = seeded.proposals
+    key = f"adopt-rollback-{uuid4().hex}"
+    faulting_factory = _FaultingUowFactory(uow_factory, _FaultState(fail_impact=True))
+
+    with pytest.raises(RuntimeError, match="impact insert failure"):
+        await _service(seeded, cast(UnitOfWorkFactory, faulting_factory)).adopt(
+            **_adopt_kwargs(seeded, proposal, key)
+        )
+
+    async with uow_factory() as uow:
+        stored = await uow.editorial_proposals.get_for_occurrence(
+            proposal.subject_id, proposal.occurrence_id, proposal.id
+        )
+        assert stored is not None and stored.state is EditorialProposalState.PROPOSED
+        sibling_row = await uow.editorial_proposals.get_for_occurrence(
+            sibling.subject_id, sibling.occurrence_id, sibling.id
+        )
+        assert sibling_row is not None and sibling_row.state is EditorialProposalState.PROPOSED
+        assert await uow.editorial_proposal_impacts.get_by_proposal(proposal.id) is None
+        assert len(await uow.production_artifacts.list_for_run(proposal.production_run_id)) == 1
+        assert await uow.editorial_proposals.get_event_by_idempotency(proposal.id, key) is None
+
+
+@pytest.mark.asyncio
+async def test_replay_after_post_commit_response_loss_returns_same_adoption(
     uow_factory: UnitOfWorkFactory,
 ) -> None:
     seeded = await _seed(uow_factory, proposal_count=1)
-    subject, run = seeded["subject"], seeded["run"]
-    proposal = seeded["proposals"][0]
-    actor_id = seeded["actor_id"]
-    assert isinstance(subject, Subject) and isinstance(run, ProductionRun)
-    assert isinstance(proposal, EditorialProposal) and isinstance(actor_id, UUID)
+    proposal = seeded.proposals[0]
+    key = f"adopt-replay-{uuid4().hex}"
+    faulting_factory = _FaultingUowFactory(uow_factory, _FaultState(fail_commit_once=True))
+    service = _service(seeded, cast(UnitOfWorkFactory, faulting_factory))
 
-    async with uow_factory() as uow:
-        assert (
-            await _adopt_in_uow(
-                uow,
-                subject_id=subject.id,
-                run_id=run.id,
-                proposal_id=proposal.id,
-                occurrence_id=proposal.occurrence_id,
-                actor_id=actor_id,
-            )
-            == "accepted"
-        )
-    async with uow_factory() as uow:
-        persisted = await uow.editorial_proposals.get_for_occurrence(
-            subject.id, proposal.occurrence_id, proposal.id
-        )
-        impact = await uow.editorial_proposal_impacts.get_by_proposal(proposal.id)
-        assert persisted is not None and persisted.state is EditorialProposalState.ACCEPTED
-        assert impact is not None and impact.state.value == "pending"
-        assert (
-            await _adopt_in_uow(
-                uow,
-                subject_id=subject.id,
-                run_id=run.id,
-                proposal_id=proposal.id,
-                occurrence_id=proposal.occurrence_id,
-                actor_id=actor_id,
-            )
-            == "replayed"
-        )
+    with pytest.raises(RuntimeError, match="post-commit response loss"):
+        await service.adopt(**_adopt_kwargs(seeded, proposal, key))
+    first_put_count = seeded.blob_store.put_calls
+
+    replay = await service.adopt(**_adopt_kwargs(seeded, proposal, key))
+
+    assert replay.replayed
+    assert replay.proposal.state is EditorialProposalState.ACCEPTED
+    assert replay.artifact.id == replay.proposal.accepted_artifact_id
+    assert replay.impact.state.value == "pending"
+    assert seeded.blob_store.put_calls == first_put_count
+    assert seeded.inputs.revalidated == 1

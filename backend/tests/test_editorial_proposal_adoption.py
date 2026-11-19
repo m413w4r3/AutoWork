@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import copy
 import hashlib
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from datetime import date
 from io import BytesIO
 from typing import Any, cast
 from uuid import UUID, uuid4
@@ -13,12 +15,12 @@ from cti_app.application.editorial_proposal_adoption import (
     EditorialProposalAdoptionError,
     EditorialProposalAdoptionInputs,
     EditorialProposalAdoptionService,
-    _Candidate,
+    SynthesisCandidateInputs,
     _CandidatePlan,
     _SynthesisCandidatePlan,
 )
+from cti_app.application.editorial_synthesis import targets
 from cti_app.application.editorial_synthesis.candidate import (
-    SynthesisCandidate,
     SynthesisCandidatePersistence,
 )
 from cti_app.application.editorial_workspace.registry import (
@@ -26,9 +28,17 @@ from cti_app.application.editorial_workspace.registry import (
     WorkspaceSnapshotRecord,
     registry_hash,
 )
-from cti_app.application.persistence import UnitOfWork
+from cti_app.application.persistence import ProductionUnitOfWorkFactory, UnitOfWork
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_stages import SynthesisService
+from cti_app.application.production_synthesis import (
+    build_synthesis_evidence_pack,
+    canonical_extraction_hash,
+)
+from cti_app.application.production_synthesis_revision import _apply_wire_patch
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
+from cti_app.domain.classification import TLP
+from cti_app.domain.discovery import SourceRole
 from cti_app.domain.editorial_proposal import (
     EditorialProposal,
     EditorialProposalEvent,
@@ -45,12 +55,40 @@ from cti_app.domain.editorial_workspace import (
     EditorialSourceStage,
     EditorialTransition,
 )
-from cti_app.domain.production import ProductionArtifact, ProductionArtifactStage, ProductionRun
+from cti_app.domain.production import (
+    EXTRACTION_PROFILE_POLICY_VERSION,
+    ExtractionProfile,
+    ProductionArtifact,
+    ProductionArtifactStage,
+    ProductionEvidenceBasis,
+    ProductionInputSnapshot,
+    ProductionRun,
+    SynthesisMode,
+)
 from cti_app.domain.production_editorial_revision import (
+    TargetedEditorialRevisionOperation,
     TargetedEditorialRevisionTarget,
     TargetedEditorialRevisionTargetKind,
 )
+from cti_app.domain.production_extraction import (
+    ExtractionFactV1,
+    ExtractionReuseState,
+    ProductionExtractionV1,
+    ProductionSourceExtractionV1,
+)
+from cti_app.domain.production_references import ProductionReferenceKind, ProductionReferenceTier
+from cti_app.domain.production_synthesis import (
+    PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
+    SYNTHESIS_POLICY_VERSION,
+    ProductionSynthesisV1,
+    SynthesisParagraphV1,
+    SynthesisSectionKind,
+    SynthesisSectionV1,
+    extraction_evidence_refs_v1,
+    production_synthesis_to_json,
+)
 from cti_app.domain.publication_kind import PublicationKind
+from cti_app.infrastructure.database.repositories.core import SqlAlchemyBlobRepository
 
 _PATCH_BUCKET = "editorial-proposal-patches"
 _PATCH_MIME = "application/vnd.autowork.editorial-patch+json"
@@ -73,6 +111,8 @@ class _MemoryUowFactory:
     def __init__(self, state: _MemoryState) -> None:
         self.state = state
         self.commits = 0
+        self.open_uows = 0
+        self.fail_commit_once = False
 
     def __call__(self) -> _MemoryUow:
         return _MemoryUow(self)
@@ -91,12 +131,17 @@ class _MemoryUow:
         self.editorial_proposal_impacts = _MemoryImpactRepository(self)
 
     async def __aenter__(self) -> _MemoryUow:
+        self.factory.open_uows += 1
         return self
 
     async def __aexit__(self, *_args: object) -> None:
+        self.factory.open_uows -= 1
         return None
 
     async def commit(self) -> None:
+        if self.factory.fail_commit_once:
+            self.factory.fail_commit_once = False
+            raise RuntimeError("synthetic database commit failure")
         self.factory.state = copy.deepcopy(self.state)
         self.factory.commits += 1
 
@@ -235,6 +280,23 @@ class _MemoryArtifactRepository:
     async def append(self, artifact: ProductionArtifact) -> None:
         self.uow.state.artifacts[artifact.id] = artifact
 
+    async def list_for_run(self, run_id: UUID) -> tuple[ProductionArtifact, ...]:
+        return tuple(
+            artifact
+            for artifact in self.uow.state.artifacts.values()
+            if artifact.production_run_id == run_id
+        )
+
+    async def get_current(self, run_id: UUID, stage: str) -> ProductionArtifact | None:
+        candidates = [
+            artifact
+            for artifact in self.uow.state.artifacts.values()
+            if artifact.production_run_id == run_id
+            and artifact.stage.value == stage
+            and artifact.status.value == "verified"
+        ]
+        return max(candidates, key=lambda artifact: artifact.version, default=None)
+
 
 class _MemoryRunRepository:
     def __init__(self, uow: _MemoryUow) -> None:
@@ -295,8 +357,24 @@ class _MemoryBlobStore:
         self.put_calls = 0
         self.new_objects = 0
         self.delete_calls = 0
+        self.calls_while_uow_open = 0
+        self.forbid_calls_while_uow_open = False
+        self._uow_open: Callable[[], bool] = lambda: False
+        self._commit_count: Callable[[], int] = lambda: 0
+        self.commit_counts_at_delete: list[int] = []
+
+    def set_uow_probe(self, probe: Callable[[], bool], commit_count: Callable[[], int]) -> None:
+        self._uow_open = probe
+        self._commit_count = commit_count
+
+    def _check_uow(self) -> None:
+        if self._uow_open():
+            self.calls_while_uow_open += 1
+            if self.forbid_calls_while_uow_open:
+                raise AssertionError("BlobStore called while relational UOW is open")
 
     async def put(self, source: BytesIO, *, logical_bucket: str, mime_type: str) -> BlobDescriptor:
+        self._check_uow()
         self.put_calls += 1
         payload = source.read()
         digest = hashlib.sha256(payload).hexdigest()
@@ -307,6 +385,7 @@ class _MemoryBlobStore:
         return BlobDescriptor(digest, len(payload), mime_type, logical_bucket)
 
     async def read(self, descriptor: BlobDescriptor, *, max_bytes: int) -> bytes:
+        self._check_uow()
         key = (descriptor.logical_bucket, descriptor.sha256)
         value = self.read_overrides.get(key, self.objects[key])
         if len(value) > max_bytes:
@@ -314,19 +393,32 @@ class _MemoryBlobStore:
         return value
 
     async def exists(self, descriptor: BlobDescriptor) -> bool:
+        self._check_uow()
         return (descriptor.logical_bucket, descriptor.sha256) in self.objects
 
     async def delete(self, descriptor: BlobDescriptor) -> None:
+        self._check_uow()
         self.delete_calls += 1
+        self.commit_counts_at_delete.append(self._commit_count())
         self.objects.pop((descriptor.logical_bucket, descriptor.sha256), None)
 
 
 class _MemoryArtifactStore:
     def __init__(self, canonical_bytes: bytes) -> None:
         self.canonical_bytes = canonical_bytes
+        self._uow_open: Callable[[], bool] = lambda: False
+        self.calls_while_uow_open = 0
+        self.forbid_calls_while_uow_open = False
 
-    async def read_bytes(self, _blob_id: UUID, *, max_bytes: int) -> bytes:
-        if len(self.canonical_bytes) > max_bytes:
+    def set_uow_probe(self, probe: Callable[[], bool]) -> None:
+        self._uow_open = probe
+
+    async def read_bytes(self, _blob_id: UUID, *, max_bytes: int | None = None) -> bytes:
+        if self._uow_open():
+            self.calls_while_uow_open += 1
+            if self.forbid_calls_while_uow_open:
+                raise AssertionError("ArtifactStore called while relational UOW is open")
+        if max_bytes is not None and len(self.canonical_bytes) > max_bytes:
             raise ValueError("synthetic_read_limit")
         return self.canonical_bytes
 
@@ -365,18 +457,31 @@ class _MemoryWorkspace:
 
 
 class _Inputs:
-    def __init__(self) -> None:
+    def __init__(self, synthesis: SynthesisCandidateInputs) -> None:
+        self.synthesis = synthesis
         self.revalidated = 0
         self.gateway_calls = 0
+        self.source_tlp = TLP.AMBER
+        self.source_revoked = False
+        self.external_llm_allowed = True
+        self.thread_binding_valid = True
 
-    async def synthesis_inputs(self, *_args: Any, **_kwargs: Any) -> Any:
-        raise AssertionError("test candidate plan bypasses generation and gateway inputs")
+    async def synthesis_inputs(self, *_args: Any, **_kwargs: Any) -> SynthesisCandidateInputs:
+        return self.synthesis
 
     async def enrichment_inputs(self, *_args: Any, **_kwargs: Any) -> Any:
         raise AssertionError("test candidate plan bypasses generation and gateway inputs")
 
     async def revalidate_evidence_policy_and_thread(self, *_args: Any, **_kwargs: Any) -> None:
         self.revalidated += 1
+        if self.source_tlp is TLP.RED:
+            raise EditorialProposalAdoptionError("external_llm_tlp_blocked")
+        if self.source_revoked:
+            raise EditorialProposalAdoptionError("proposal_evidence_revoked")
+        if not self.external_llm_allowed:
+            raise EditorialProposalAdoptionError("external_llm_blocked")
+        if not self.thread_binding_valid:
+            raise EditorialProposalAdoptionError("thread_binding_stale")
 
 
 class _AdoptionHarness(EditorialProposalAdoptionService):
@@ -420,7 +525,7 @@ class _AdoptionHarness(EditorialProposalAdoptionService):
 
 
 class _FailBeforeUpload(_AdoptionHarness):
-    async def _upload_and_verify_candidate(self, _candidate: _Candidate) -> BlobDescriptor:
+    async def _build_candidate(self, *_args: Any, **_kwargs: Any) -> _SynthesisCandidatePlan:
         raise RuntimeError("synthetic crash before upload")
 
 
@@ -433,18 +538,6 @@ class _FailBeforeUowOnce(_AdoptionHarness):
         if self.fail_once:
             self.fail_once = False
             raise RuntimeError("synthetic crash after upload before UOW")
-        return await super()._persist_acceptance(**kwargs)
-
-
-class _CollectedBeforeUowOnce(_AdoptionHarness):
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self.collect_once = True
-
-    async def _persist_acceptance(self, **kwargs: Any) -> Any:
-        if self.collect_once:
-            self.collect_once = False
-            await self._blob_store.delete(kwargs["descriptor"])
         return await super()._persist_acceptance(**kwargs)
 
 
@@ -463,7 +556,7 @@ class _CrashAfterCommitOnce(_AdoptionHarness):
 
 @dataclass
 class _Fixture:
-    service: _AdoptionHarness
+    service: EditorialProposalAdoptionService
     factory: _MemoryUowFactory
     blob_store: _MemoryBlobStore
     inputs: _Inputs
@@ -473,26 +566,110 @@ class _Fixture:
     patch_sha256: str
     idempotency_key: str
 
-    async def accept(self, proposal: EditorialProposal | None = None) -> Any:
+    async def adopt(
+        self,
+        proposal: EditorialProposal | None = None,
+        *,
+        idempotency_key: str | None = None,
+    ) -> Any:
         target = proposal or self.proposal
-        return await self.service.accept(
+        return await self.service.adopt(
             target.subject_id,
             target.occurrence_id,
             target.id,
             actor_id=self.actor_id,
             expected_state_version=1,
             patch_sha256=self.patch_sha256,
-            idempotency_key=self.idempotency_key,
+            idempotency_key=idempotency_key or self.idempotency_key,
         )
 
 
 def _fixture(
     *,
-    service_type: type[_AdoptionHarness] = _AdoptionHarness,
+    service_type: type[EditorialProposalAdoptionService] = _AdoptionHarness,
     with_sibling: bool = False,
 ) -> _Fixture:
     subject_id, run_id, occurrence_id = uuid4(), uuid4(), uuid4()
-    base_payload = {"title": "Synthetic original"}
+    production_input = ProductionInputSnapshot(
+        production_run_id=run_id,
+        edition_id=uuid4(),
+        subject_id=subject_id,
+        subject_version=1,
+        subject_title="Synthetic subject",
+        subject_tlp=TLP.CLEAR,
+        selection_decision_id=uuid4(),
+        origin_discovery_subject_id=uuid4(),
+        canonical_discovery_subject_id=uuid4(),
+        discovery_snapshot_id=uuid4(),
+        discovery_snapshot_version=1,
+        member_candidate_ids=(),
+        discovery_summary="Synthetic summary.",
+        actor_or_campaign="Synthetic actor",
+        period_start=date(2026, 1, 1),
+        period_end=date(2026, 1, 31),
+        publication_language="fr",
+        research_date=date(2026, 2, 1),
+    )
+    source_document_id = uuid4()
+    extraction = ProductionExtractionV1(
+        schema_version=1,
+        subject_id=subject_id,
+        production_input_hash=production_input.input_hash,
+        references_corpus_hash="c" * 64,
+        profile_policy_version=EXTRACTION_PROFILE_POLICY_VERSION,
+        sources=(
+            ProductionSourceExtractionV1(
+                source_document_id=source_document_id,
+                canonical_url="https://example.test/synthetic-report",
+                content_sha256="d" * 64,
+                tier=ProductionReferenceTier.CORE,
+                kind=ProductionReferenceKind.PUBLICATION,
+                role=SourceRole.PRIMARY,
+                profile=ExtractionProfile.FULL,
+                checkpoint_id=None,
+                reuse_state=ExtractionReuseState.FRESH,
+                facts=(
+                    ExtractionFactV1(
+                        category="other_technical",
+                        value="Synthetic finding",
+                        attack_id=None,
+                        context="Synthetic test context.",
+                        evidence_quote="The synthetic report records this finding.",
+                        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+                        source_document_ids=(source_document_id,),
+                    ),
+                ),
+                events=(),
+                indicators=(),
+                rules=(),
+                uncertainties=(),
+            ),
+        ),
+        omitted_sources=(),
+        warnings=(),
+    )
+    evidence_ref = extraction_evidence_refs_v1(extraction)[0]
+    synthesis = ProductionSynthesisV1(
+        schema_version=PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
+        subject_id=subject_id,
+        production_input_hash=production_input.input_hash,
+        extraction_hash=canonical_extraction_hash(extraction),
+        publication_language=production_input.publication_language,
+        synthesis_policy_version=SYNTHESIS_POLICY_VERSION,
+        title="[Synthetic actor] Synthetic report",
+        lead=(SynthesisParagraphV1("A synthetic lead claim.", (evidence_ref,)),),
+        sections=(
+            SynthesisSectionV1(
+                SynthesisSectionKind.OVERVIEW,
+                "Synthetic observations",
+                (SynthesisParagraphV1("A synthetic section claim.", (evidence_ref,)),),
+            ),
+        ),
+        timeline=(),
+        uncertainties=(),
+        warnings=(),
+    )
+    base_payload = production_synthesis_to_json(synthesis)
     base_bytes = ProductionArtifactStore.canonical_json_bytes(base_payload)
     base_sha256 = hashlib.sha256(base_bytes).hexdigest()
     base_artifact_id, base_blob_id = uuid4(), uuid4()
@@ -502,15 +679,22 @@ def _fixture(
         subject_id=subject_id,
         stage=ProductionArtifactStage.SYNTHESIS,
         version=1,
-        input_hash="1" * 64,
+        input_hash=production_input.input_hash,
         canonical_blob_id=base_blob_id,
     )
+    operation = TargetedEditorialRevisionOperation.REWRITE_TITLE
+    target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind.TITLE,
+        stable_ids=(),
+    )
+    resolved_target = targets.resolve_target(base_payload, target, operation)
+    before_hash = resolved_target.before_hash
     entry = BlockRegistryEntry(
         block_id=occurrence_id,
         kind=EditorialBlockKind.TITLE,
         parent_block_id=None,
         position=0,
-        content_sha256="2" * 64,
+        content_sha256=before_hash,
         source_stage=EditorialSourceStage.SYNTHESIS,
         structural_pointer="/title",
         revision_status=EditorialRevisionStatus.READY,
@@ -535,7 +719,7 @@ def _fixture(
         pipeline_generation=0,
         routing_decision_id=None,
         routing_decision_hash=None,
-        publication_kind=PublicationKind.ARTICLE,
+        publication_kind=PublicationKind.BRIEF,
         workspace_pin_hash=base_pin,
         registry_hash=registry_hash((entry,)),
         block_registry=(entry,),
@@ -548,19 +732,14 @@ def _fixture(
         artifact_version=1,
         canonical_sha256=base_sha256,
     )
-    operation = "rewrite_title"
-    target = TargetedEditorialRevisionTarget(
-        kind=TargetedEditorialRevisionTargetKind.TITLE,
-        stable_ids=(),
-    )
     patch_payload = {
         "schema_version": "editorial-patch-v1",
-        "operation": operation,
+        "operation": operation.value,
         "target": target.to_json(),
         "target_id": "synthetic-title",
         "occurrence_id": str(occurrence_id),
-        "before_hash": "3" * 64,
-        "after": "Synthetic accepted title",
+        "before_hash": before_hash,
+        "after": "[Synthetic actor] Revised report",
         "rationale": "Synthetic test rationale.",
     }
     patch_bytes = ProductionArtifactStore.canonical_json_bytes(patch_payload)
@@ -582,8 +761,8 @@ def _fixture(
         base_routing_hash=None,
         base_pin_hash=base_pin,
         target_id="synthetic-title",
-        operation=operation,
-        before_hash="3" * 64,
+        operation=operation.value,
+        before_hash=before_hash,
         patch_blob_ref=patch_blob.id,
         patch_sha256=patch_sha256,
         evidence_refs=(),
@@ -609,26 +788,46 @@ def _fixture(
         sibling = replace(proposal, id=uuid4(), idempotency_key=f"proposal-{uuid4().hex}")
         state.proposals[sibling.id] = sibling
 
-    candidate_payload = {"title": "Synthetic accepted title"}
-    candidate_bytes = ProductionArtifactStore.canonical_json_bytes(candidate_payload)
-    candidate_sha256 = hashlib.sha256(candidate_bytes).hexdigest()
-    candidate = SynthesisCandidate(
+    evidence_pack = build_synthesis_evidence_pack(production_input, extraction)
+    apply_patch = _apply_wire_patch
+    from cti_app.application.editorial_synthesis.patch_validation import WirePatch
+
+    wire_patch = WirePatch(
+        target=resolved_target.path,
+        action=operation,
+        base_artifact_hash=base_sha256,
+        before_hash=before_hash,
+        after=patch_payload["after"],
+        rationale=patch_payload["rationale"],
+    )
+    from cti_app.application.editorial_synthesis.candidate import (
+        build_candidate_from_validated_patch,
+    )
+
+    candidate = build_candidate_from_validated_patch(
         base_artifact=base_artifact,
+        base_payload=base_payload,
+        base_synthesis=synthesis,
         base_canonical_sha256=base_sha256,
-        synthesis=cast(Any, None),
-        payload=candidate_payload,
-        canonical_bytes=candidate_bytes,
-        canonical_sha256=candidate_sha256,
-        before_hash=proposal.before_hash,
+        patch=wire_patch,
+        target=target,
+        operation=operation,
+        evidence_pack=evidence_pack,
+        extraction=extraction,
+        snapshot=production_input,
+        apply_patch=apply_patch,
+        publication_kind=PublicationKind.BRIEF,
     )
     persistence = SynthesisCandidatePersistence(
         run_id=run_id,
         subject_id=subject_id,
         input_hash=base_artifact.input_hash,
-        extraction=cast(Any, None),
-        snapshot=cast(Any, None),
+        extraction=extraction,
+        snapshot=production_input,
         raw_result=None,
         model_run_id=None,
+        publication_kind=PublicationKind.BRIEF,
+        mode=SynthesisMode.FRESH,
         artifact_id=uuid4(),
         expected_current_artifact_id=base_artifact.id,
         expected_current_input_hash=base_artifact.input_hash,
@@ -640,19 +839,41 @@ def _fixture(
         registry_lineage=(),
         retired_block_ids=(),
     )
+    synthesis_inputs = SynthesisCandidateInputs(
+        base_payload=base_payload,
+        base_synthesis=synthesis,
+        target=target,
+        evidence_pack=evidence_pack,
+        extraction=extraction,
+        snapshot=production_input,
+        apply_patch=apply_patch,
+        persistence=persistence,
+        registry_lineage=(),
+        publication_kind=PublicationKind.BRIEF,
+    )
     factory = _MemoryUowFactory(state)
     blob_store = _MemoryBlobStore(patch_descriptor, patch_bytes)
-    inputs = _Inputs()
-    service = service_type(
-        plan=plan,
-        uow_factory=factory,
-        blob_store=blob_store,
-        artifact_store=_MemoryArtifactStore(base_bytes),
-        workspace_service=_MemoryWorkspace(resolution),
-        inputs=cast(EditorialProposalAdoptionInputs, inputs),
-        synthesis_writer=cast(Any, None),
-        enrichment_writer=cast(Any, None),
+    blob_store.set_uow_probe(lambda: factory.open_uows > 0, lambda: factory.commits)
+    inputs = _Inputs(synthesis_inputs)
+    artifact_store = _MemoryArtifactStore(base_bytes)
+    artifact_store.set_uow_probe(lambda: factory.open_uows > 0)
+    synthesis_writer = SynthesisService(
+        cast(ProductionUnitOfWorkFactory, factory),
+        cast(ProductionArtifactStore, artifact_store),
     )
+    common = {
+        "uow_factory": factory,
+        "blob_store": blob_store,
+        "artifact_store": cast(ProductionArtifactStore, artifact_store),
+        "workspace_service": _MemoryWorkspace(resolution),
+        "inputs": cast(EditorialProposalAdoptionInputs, inputs),
+        "synthesis_writer": synthesis_writer,
+        "enrichment_writer": cast(Any, None),
+    }
+    if service_type is EditorialProposalAdoptionService:
+        service = service_type(**common)
+    else:
+        service = cast(Any, service_type)(plan=plan, **common)
     return _Fixture(
         service=service,
         factory=factory,
@@ -662,22 +883,22 @@ def _fixture(
         actor_id=actor_id,
         occurrence_id=occurrence_id,
         patch_sha256=patch_sha256,
-        idempotency_key=f"accept-{uuid4().hex}",
+        idempotency_key=f"adopt-{uuid4().hex}",
     )
 
 
 @pytest.mark.asyncio
-async def test_accept_rehashes_patch_revalidates_fences_and_never_calls_gateway() -> None:
+async def test_adopt_rehashes_patch_revalidates_fences_and_never_calls_gateway() -> None:
     fixture = _fixture()
     patch_key = (_PATCH_BUCKET, fixture.patch_sha256)
     fixture.blob_store.read_overrides[patch_key] = b"tampered synthetic patch"
 
     with pytest.raises(EditorialProposalAdoptionError, match="proposal_patch_hash_mismatch"):
-        await fixture.accept()
+        await fixture.adopt()
 
     assert fixture.blob_store.put_calls == 0
     fixture.blob_store.read_overrides.clear()
-    result = await fixture.accept()
+    result = await fixture.adopt()
 
     assert result.proposal.state is EditorialProposalState.ACCEPTED
     assert fixture.inputs.revalidated == 1
@@ -687,12 +908,12 @@ async def test_accept_rehashes_patch_revalidates_fences_and_never_calls_gateway(
 @pytest.mark.asyncio
 async def test_same_idempotency_key_with_different_body_conflicts() -> None:
     fixture = _fixture()
-    accepted = await fixture.accept()
+    accepted = await fixture.adopt()
     different_patch_hash = "0" * 64
     assert different_patch_hash != fixture.patch_sha256
 
     with pytest.raises(EditorialProposalAdoptionError, match="proposal_idempotency_conflict"):
-        await fixture.service.accept(
+        await fixture.service.adopt(
             fixture.proposal.subject_id,
             fixture.proposal.occurrence_id,
             fixture.proposal.id,
@@ -708,10 +929,10 @@ async def test_same_idempotency_key_with_different_body_conflicts() -> None:
 
 
 @pytest.mark.asyncio
-async def test_accept_cas_appends_artifact_lineage_registry_and_outbox_atomically() -> None:
-    fixture = _fixture()
+async def test_adopt_cas_appends_artifact_lineage_registry_and_outbox_atomically() -> None:
+    fixture = _fixture(service_type=EditorialProposalAdoptionService)
 
-    result = await fixture.accept()
+    result = await fixture.adopt()
 
     stored = fixture.factory.state
     assert result.artifact.id == result.proposal.accepted_artifact_id
@@ -730,13 +951,13 @@ async def test_accept_cas_appends_artifact_lineage_registry_and_outbox_atomicall
 
 
 @pytest.mark.asyncio
-async def test_accepting_variant_stales_siblings_atomically() -> None:
+async def test_adopting_variant_stales_siblings_atomically() -> None:
     fixture = _fixture(with_sibling=True)
     sibling_id = next(
         item for item in fixture.factory.state.proposals if item != fixture.proposal.id
     )
 
-    result = await fixture.accept()
+    result = await fixture.adopt()
 
     assert result.proposal.state is EditorialProposalState.ACCEPTED
     assert fixture.factory.state.proposals[sibling_id].state is EditorialProposalState.STALE
@@ -752,10 +973,9 @@ async def test_adoption_crash_before_upload() -> None:
     fixture = _fixture(service_type=_FailBeforeUpload)
 
     with pytest.raises(RuntimeError, match="synthetic crash before upload"):
-        await fixture.accept()
+        await fixture.adopt()
 
     assert fixture.blob_store.put_calls == 0
-    assert fixture.factory.commits == 0
     assert (
         fixture.factory.state.proposals[fixture.proposal.id].state
         is EditorialProposalState.PROPOSED
@@ -767,7 +987,7 @@ async def test_adoption_crash_after_upload_before_uow() -> None:
     fixture = _fixture(service_type=_FailBeforeUowOnce)
 
     with pytest.raises(RuntimeError, match="after upload before UOW"):
-        await fixture.accept()
+        await fixture.adopt()
     assert (
         fixture.factory.state.proposals[fixture.proposal.id].state
         is EditorialProposalState.PROPOSED
@@ -776,7 +996,7 @@ async def test_adoption_crash_after_upload_before_uow() -> None:
     assert fixture.blob_store.new_objects == 1
     assert fixture.blob_store.delete_calls == 1
 
-    result = await fixture.accept()
+    result = await fixture.adopt()
 
     assert result.proposal.state is EditorialProposalState.ACCEPTED
     assert fixture.blob_store.new_objects == 2
@@ -784,15 +1004,60 @@ async def test_adoption_crash_after_upload_before_uow() -> None:
 
 
 @pytest.mark.asyncio
-async def test_collected_candidate_is_reuploaded_before_acceptance_uow() -> None:
-    fixture = _fixture(service_type=_CollectedBeforeUowOnce)
+async def test_blob_store_is_not_called_while_adoption_uow_is_open() -> None:
+    fixture = _fixture(service_type=EditorialProposalAdoptionService)
+    fixture.blob_store.forbid_calls_while_uow_open = True
+    artifact_store = cast(_MemoryArtifactStore, fixture.service._artifact_store)
+    artifact_store.forbid_calls_while_uow_open = True
 
-    result = await fixture.accept()
+    result = await fixture.adopt()
 
     assert result.proposal.state is EditorialProposalState.ACCEPTED
-    assert fixture.blob_store.put_calls == 2
-    assert fixture.blob_store.delete_calls == 1
-    assert fixture.factory.state.impacts[fixture.proposal.id].state.value == "pending"
+    assert fixture.blob_store.calls_while_uow_open == 0
+    assert artifact_store.calls_while_uow_open == 0
+
+
+@pytest.mark.asyncio
+async def test_losing_same_blob_adoption_preserves_the_winning_artifact_object() -> None:
+    fixture = _fixture()
+    loser_key = f"adopt-loser-{uuid4().hex}"
+    winner_key = f"adopt-winner-{uuid4().hex}"
+    persist = fixture.service._persist_acceptance
+
+    async def interleave_winner(**kwargs: Any) -> Any:
+        if kwargs["idempotency_key"] == loser_key:
+            result = await fixture.adopt(idempotency_key=winner_key)
+            assert result.proposal.state is EditorialProposalState.ACCEPTED
+        return await persist(**kwargs)
+
+    fixture.service._persist_acceptance = interleave_winner  # type: ignore[method-assign]
+    with pytest.raises(EditorialProposalAdoptionError, match="proposal_state_conflict"):
+        await fixture.adopt(idempotency_key=loser_key)
+
+    accepted = fixture.factory.state.proposals[fixture.proposal.id]
+    assert accepted.state is EditorialProposalState.ACCEPTED
+    blob_id = accepted.accepted_artifact_id
+    assert blob_id is not None
+    artifact = fixture.factory.state.artifacts[blob_id]
+    candidate_blob = fixture.factory.state.blobs[artifact.canonical_blob_id]
+    address = (candidate_blob.descriptor.logical_bucket, candidate_blob.descriptor.sha256)
+    assert address in fixture.blob_store.objects
+    assert fixture.blob_store.delete_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_adoption_revalidates_synthetic_policy_fences() -> None:
+    fixture = _fixture()
+    fixture.inputs.external_llm_allowed = False
+
+    with pytest.raises(EditorialProposalAdoptionError, match="external_llm_blocked"):
+        await fixture.adopt()
+
+    assert fixture.factory.state.impacts == {}
+    assert (
+        fixture.factory.state.proposals[fixture.proposal.id].state
+        is EditorialProposalState.PROPOSED
+    )
 
 
 @pytest.mark.asyncio
@@ -800,14 +1065,14 @@ async def test_adoption_crash_after_commit_before_impact() -> None:
     fixture = _fixture(service_type=_CrashAfterCommitOnce)
 
     with pytest.raises(RuntimeError, match="after commit before impact worker"):
-        await fixture.accept()
+        await fixture.adopt()
     committed = fixture.factory.state
     accepted = committed.proposals[fixture.proposal.id]
     impact = committed.impacts[fixture.proposal.id]
     assert accepted.state is EditorialProposalState.ACCEPTED
     assert impact.state.value == "pending"
 
-    replay = await fixture.accept()
+    replay = await fixture.adopt()
 
     assert replay.replayed
     assert replay.proposal.decision_id == accepted.decision_id
@@ -833,11 +1098,55 @@ async def test_cleanup_orphan_blob_is_idempotent_and_preserves_referenced_blobs(
     assert not await fixture.service.cleanup_orphan_blob(orphan_descriptor)
     assert (_CANONICAL_BUCKET, orphan_sha256) not in fixture.blob_store.objects
     assert fixture.blob_store.delete_calls == 1
+    assert fixture.blob_store.commit_counts_at_delete == [fixture.factory.commits]
 
-    accepted = await fixture.accept()
+    accepted = await fixture.adopt()
     candidate_blob = fixture.factory.state.blobs[accepted.artifact.canonical_blob_id]
     assert not await fixture.service.cleanup_orphan_blob(candidate_blob.descriptor)
     assert (
         candidate_blob.descriptor.logical_bucket,
         candidate_blob.descriptor.sha256,
     ) in fixture.blob_store.objects
+
+
+@pytest.mark.asyncio
+async def test_orphan_object_is_retained_when_blob_row_commit_fails() -> None:
+    fixture = _fixture()
+    orphan_bytes = b"synthetic commit-failure orphan"
+    orphan_sha256 = hashlib.sha256(orphan_bytes).hexdigest()
+    descriptor = BlobDescriptor(
+        orphan_sha256,
+        len(orphan_bytes),
+        "application/json",
+        _CANONICAL_BUCKET,
+    )
+    address = (descriptor.logical_bucket, descriptor.sha256)
+    fixture.blob_store.objects[address] = orphan_bytes
+    fixture.factory.fail_commit_once = True
+
+    with pytest.raises(RuntimeError, match="database commit failure"):
+        await fixture.service.cleanup_orphan_blob(descriptor)
+
+    assert address in fixture.blob_store.objects
+    assert fixture.blob_store.delete_calls == 0
+    assert fixture.factory.commits == 0
+
+
+@pytest.mark.asyncio
+async def test_blob_reference_query_includes_every_orm_blob_foreign_key() -> None:
+    class _CaptureSession:
+        statement: Any | None = None
+
+        async def scalar(self, statement: Any) -> int:
+            self.statement = statement
+            return 2
+
+    session = _CaptureSession()
+    references = await SqlAlchemyBlobRepository(cast(Any, session)).count_references(uuid4())
+
+    from sqlalchemy.dialects import postgresql
+
+    sql = str(session.statement.compile(dialect=postgresql.dialect()))
+    assert references == 2
+    assert "production_artifacts.canonical_blob_id" in sql
+    assert "production_artifacts.raw_blob_id" in sql

@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, select, text, update
+from sqlalchemy import func, select, text, union_all, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.selectable import FromClause, TableClause
@@ -45,10 +45,37 @@ from cti_app.domain.virustotal import (
     VirusTotalObservation,
     VirusTotalOperation,
 )
-from cti_app.infrastructure.database.models.collection import (
-    DerivedArtifactRow,
-    SourceCollectionRow,
+from cti_app.infrastructure.database.models import (
+    collection as _collection_models,  # noqa: F401
 )
+from cti_app.infrastructure.database.models import (
+    edition_publication as _edition_publication_models,  # noqa: F401
+)
+from cti_app.infrastructure.database.models import (
+    edition_render as _edition_render_models,  # noqa: F401
+)
+from cti_app.infrastructure.database.models import (
+    editorial_proposals as _editorial_proposal_models,  # noqa: F401
+)
+from cti_app.infrastructure.database.models import (
+    editorial_threads as _editorial_thread_models,  # noqa: F401
+)
+from cti_app.infrastructure.database.models import (
+    investigation as _investigation_models,  # noqa: F401
+)
+from cti_app.infrastructure.database.models import (
+    media_assets as _media_asset_models,  # noqa: F401
+)
+from cti_app.infrastructure.database.models import (
+    production as _production_models,  # noqa: F401
+)
+from cti_app.infrastructure.database.models import (
+    publication_render as _publication_render_models,  # noqa: F401
+)
+from cti_app.infrastructure.database.models import (
+    source_media as _source_media_models,  # noqa: F401
+)
+from cti_app.infrastructure.database.models.base import Base
 from cti_app.infrastructure.database.models.core import (
     BlobRow,
     CapabilitySetRow,
@@ -68,17 +95,10 @@ from cti_app.infrastructure.database.models.core import (
     VirusTotalFileViewRow,
     VirusTotalObservationRow,
 )
-from cti_app.infrastructure.database.models.edition_publication import (
-    EditionReleaseRow,
-    PublicationManifestRow,
-)
-from cti_app.infrastructure.database.models.edition_render import EditionRenderRow
 from cti_app.infrastructure.database.models.model_execution import (
     ModelConversationTurnRow,
     ModelRunRow,
 )
-from cti_app.infrastructure.database.models.production import ProductionRepairCorrectionRow
-from cti_app.infrastructure.database.models.publication_render import PublicationRenderRow
 
 
 def _insert_succeeded(result: object) -> bool:
@@ -165,162 +185,34 @@ class SqlAlchemyBlobRepository:
         return _blob_from_row(row) if row else None
 
     async def count_references(self, blob_id: UUID) -> int:
-        document_count = await self._session.scalar(
-            select(func.count())
-            .select_from(SourceDocumentRow)
-            .where(SourceDocumentRow.blob_id == blob_id)
-        )
-        decoded_document_count = await self._session.scalar(
-            select(func.count())
-            .select_from(SourceDocumentRow)
-            .where(SourceDocumentRow.decoded_blob_id == blob_id)
-        )
-        sample_count = await self._session.scalar(
-            select(func.count()).select_from(SampleRow).where(SampleRow.blob_id == blob_id)
-        )
-        model_output_count = await self._session.scalar(
-            select(func.count())
+        fk_counts = [
+            select(func.count().label("reference_count"))
+            .select_from(table)
+            .where(column == blob_id)
+            for table in Base.metadata.tables.values()
+            for column in table.columns
+            if any(fk.target_fullname == "blobs.id" for fk in column.foreign_keys)
+        ]
+        # A few historical blob references are URI values rather than foreign keys.
+        fk_counts.append(
+            select(func.count().label("reference_count"))
             .select_from(ModelRunRow)
             .where(ModelRunRow.output_references.contains([f"blob://{blob_id}"]))
         )
-        artifact_count = await self._session.scalar(
-            select(func.count())
-            .select_from(DerivedArtifactRow)
-            .where(DerivedArtifactRow.text_blob_id == blob_id)
-        )
-        decoded_source_count = await self._session.scalar(
-            select(func.count())
-            .select_from(SourceCollectionRow)
-            .where(SourceCollectionRow.decoded_blob_id == blob_id)
-        )
-        conversation_input_count = await self._session.scalar(
-            select(func.count())
+        fk_counts.extend(
+            select(func.count().label("reference_count"))
             .select_from(ModelConversationTurnRow)
-            .where(ModelConversationTurnRow.input_blob_reference == f"blob://{blob_id}")
+            .where(column == f"blob://{blob_id}")
+            for column in (
+                ModelConversationTurnRow.input_blob_reference,
+                ModelConversationTurnRow.output_blob_reference,
+            )
         )
-        conversation_output_count = await self._session.scalar(
-            select(func.count())
-            .select_from(ModelConversationTurnRow)
-            .where(ModelConversationTurnRow.output_blob_reference == f"blob://{blob_id}")
+        counts = union_all(*fk_counts).subquery()
+        total = await self._session.scalar(
+            select(func.coalesce(func.sum(counts.c.reference_count), 0))
         )
-        virustotal_observation_count = await self._session.scalar(
-            select(func.count())
-            .select_from(VirusTotalObservationRow)
-            .where(VirusTotalObservationRow.blob_id == blob_id)
-        )
-        feature_set_count = await self._session.scalar(
-            select(func.count())
-            .select_from(SampleFeatureSetRow)
-            .where(SampleFeatureSetRow.blob_id == blob_id)
-        )
-        feature_payload_count = await self._session.scalar(
-            select(func.count())
-            .select_from(SampleFeatureSetRow)
-            .where(SampleFeatureSetRow.feature_blob_id == blob_id)
-        )
-        goodware_source_count = await self._session.scalar(
-            select(func.count())
-            .select_from(GoodwareBaselineSourceRow)
-            .where(GoodwareBaselineSourceRow.blob_id == blob_id)
-        )
-        goodware_index_blob_count = await self._session.scalar(
-            select(func.count())
-            .select_from(GoodwareBaselineIndexRow)
-            .where(GoodwareBaselineIndexRow.index_blob_id == blob_id)
-        )
-        goodware_manifest_blob_count = await self._session.scalar(
-            select(func.count())
-            .select_from(GoodwareBaselineIndexRow)
-            .where(GoodwareBaselineIndexRow.manifest_blob_id == blob_id)
-        )
-        capability_set_count = await self._session.scalar(
-            select(func.count())
-            .select_from(CapabilitySetRow)
-            .where(CapabilitySetRow.blob_id == blob_id)
-        )
-        code_feature_set_count = await self._session.scalar(
-            select(func.count())
-            .select_from(CodeFeatureSetRow)
-            .where(CodeFeatureSetRow.blob_id == blob_id)
-        )
-        code_feature_payload_count = await self._session.scalar(
-            select(func.count())
-            .select_from(CodeFeatureSetRow)
-            .where(CodeFeatureSetRow.feature_blob_id == blob_id)
-        )
-        manifest_count = await self._session.scalar(
-            select(func.count())
-            .select_from(PublicationManifestRow)
-            .where(PublicationManifestRow.manifest_blob_id == blob_id)
-        )
-        release_json_count = await self._session.scalar(
-            select(func.count())
-            .select_from(EditionReleaseRow)
-            .where(EditionReleaseRow.edition_document_blob_id == blob_id)
-        )
-        edition_render_source_count = await self._session.scalar(
-            select(func.count())
-            .select_from(EditionRenderRow)
-            .where(EditionRenderRow.source_blob_id == blob_id)
-        )
-        edition_render_data_count = await self._session.scalar(
-            select(func.count())
-            .select_from(EditionRenderRow)
-            .where(EditionRenderRow.render_data_blob_id == blob_id)
-        )
-        edition_render_output_count = await self._session.scalar(
-            select(func.count())
-            .select_from(EditionRenderRow)
-            .where(EditionRenderRow.output_blob_id == blob_id)
-        )
-        publication_render_source_count = await self._session.scalar(
-            select(func.count())
-            .select_from(PublicationRenderRow)
-            .where(PublicationRenderRow.source_blob_id == blob_id)
-        )
-        publication_render_data_count = await self._session.scalar(
-            select(func.count())
-            .select_from(PublicationRenderRow)
-            .where(PublicationRenderRow.render_data_blob_id == blob_id)
-        )
-        publication_render_output_count = await self._session.scalar(
-            select(func.count())
-            .select_from(PublicationRenderRow)
-            .where(PublicationRenderRow.output_blob_id == blob_id)
-        )
-        repair_correction_count = await self._session.scalar(
-            select(func.count())
-            .select_from(ProductionRepairCorrectionRow)
-            .where(ProductionRepairCorrectionRow.replacement_payload_blob_id == blob_id)
-        )
-        return (
-            int(document_count or 0)
-            + int(decoded_document_count or 0)
-            + int(sample_count or 0)
-            + int(model_output_count or 0)
-            + int(artifact_count or 0)
-            + int(decoded_source_count or 0)
-            + int(conversation_input_count or 0)
-            + int(conversation_output_count or 0)
-            + int(virustotal_observation_count or 0)
-            + int(feature_set_count or 0)
-            + int(feature_payload_count or 0)
-            + int(goodware_source_count or 0)
-            + int(goodware_index_blob_count or 0)
-            + int(goodware_manifest_blob_count or 0)
-            + int(capability_set_count or 0)
-            + int(code_feature_set_count or 0)
-            + int(code_feature_payload_count or 0)
-            + int(manifest_count or 0)
-            + int(release_json_count or 0)
-            + int(edition_render_source_count or 0)
-            + int(edition_render_data_count or 0)
-            + int(edition_render_output_count or 0)
-            + int(publication_render_source_count or 0)
-            + int(publication_render_data_count or 0)
-            + int(publication_render_output_count or 0)
-            + int(repair_correction_count or 0)
-        )
+        return int(total or 0)
 
     async def delete(self, blob_id: UUID) -> None:
         row = await self._session.get(BlobRow, blob_id)

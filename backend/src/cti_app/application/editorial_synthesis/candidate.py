@@ -101,6 +101,8 @@ class SynthesisCandidatePersistence:
     expected_routing_decision_hash: str | None = None
     stale_stages: frozenset[str] | None = None
     candidate_blob: SynthesisCandidateBlobReference | None = None
+    expected_current_canonical_blob_id: UUID | None = None
+    base_canonical_bytes_verified: bool = False
 
 
 def build_candidate_from_validated_patch(
@@ -201,6 +203,8 @@ async def persist_candidate(
         "expected_current_artifact_id": persistence.expected_current_artifact_id,
         "expected_current_input_hash": persistence.expected_current_input_hash,
         "expected_current_canonical_sha256": persistence.expected_current_canonical_sha256,
+        "expected_current_canonical_blob_id": persistence.expected_current_canonical_blob_id,
+        "base_canonical_bytes_verified": persistence.base_canonical_bytes_verified,
         "expected_routing_decision_id": persistence.expected_routing_decision_id,
         "expected_routing_decision_hash": persistence.expected_routing_decision_hash,
         "stale_stages": (
@@ -230,6 +234,11 @@ async def persist_candidate(
         )
         if has_verified_metadata:
             store_kwargs["preuploaded_payload_sha256"] = persistence.candidate_blob.sha256
+    if persistence.base_canonical_bytes_verified and (
+        persistence.expected_current_canonical_blob_id is None
+        or persistence.expected_current_canonical_sha256 is None
+    ):
+        raise ValueError("synthesis_candidate_prevalidated_base_identity_required")
 
     return await writer.store_synthesis_result(
         **store_kwargs,
