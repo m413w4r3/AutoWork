@@ -69,7 +69,6 @@ export function EditorialWorkspaceLayout({
   const [openPanel, setOpenPanel] = useState<OpenPanel>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [technicalOpen, setTechnicalOpen] = useState(false);
-  const blockRefs = useRef(new Map<string, HTMLElement>());
   const overlayOpenerRef = useRef<HTMLElement | null>(null);
   // The snapshot's `blocks` array is already the server-resolved document
   // order. `enrichments` is a companion projection of those same block IDs.
@@ -108,14 +107,6 @@ export function EditorialWorkspaceLayout({
     setOpenPanel(null);
     setMenuOpen(false);
     overlayOpenerRef.current = null;
-    window.requestAnimationFrame(() => {
-      const block = blockRefs.current.get(blockId);
-      if (!block) return;
-      block.focus();
-      if (typeof block.scrollIntoView === "function") {
-        block.scrollIntoView({ block: "center" });
-      }
-    });
   };
 
   const showSources = () => {
@@ -258,10 +249,6 @@ export function EditorialWorkspaceLayout({
               return (
                 <div
                   key={block.block_id}
-                  ref={(element) => {
-                    if (element) blockRefs.current.set(block.block_id, element);
-                    else blockRefs.current.delete(block.block_id);
-                  }}
                   className="editorial-document__block"
                   tabIndex={-1}
                   data-block-id={block.block_id}
@@ -296,6 +283,7 @@ export function EditorialWorkspaceLayout({
           data-panel-open={openPanel === "inspector"}
         >
           <EditorialInspector
+            subjectId={snapshot.subject_id}
             snapshot={snapshot}
             block={selectedBlock}
             sectionTitle={sectionTitle}

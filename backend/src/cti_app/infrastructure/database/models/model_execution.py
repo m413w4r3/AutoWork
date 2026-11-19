@@ -28,7 +28,8 @@ MODEL_RUN_STATUS_VALUES_SQL = (
 )
 CONVERSATION_TRANSPORT_VALUES_SQL = "'chatgpt_bridge', 'openai_responses', 'application_managed'"
 CONVERSATION_PURPOSE_VALUES_SQL = (
-    "'discovery', 'analyst_assistance', 'pivot_research', 'drafting', 'critic', 'subject_research'"
+    "'discovery', 'analyst_assistance', 'pivot_research', 'drafting', 'critic', "
+    "'subject_research', 'editorial_discussion'"
 )
 CONVERSATION_STATUS_VALUES_SQL = (
     "'pending', 'ready', 'busy', 'needs_review', 'unavailable', 'archived'"
@@ -209,6 +210,10 @@ class ModelConversationTurnRow(Base):
             "AND (output_sha256 IS NULL OR output_sha256 ~ '^[0-9a-f]{64}$')",
             name="ck_model_conversation_turns_hashes",
         ),
+        CheckConstraint(
+            "objective IS NULL OR objective IN ('editorial_message', 'editorial_proposal')",
+            name="ck_model_conversation_turns_objective",
+        ),
         Index("ix_model_conversation_turns_conversation", "conversation_id", "sequence"),
         Index(
             "uq_model_conversation_turn_running",
@@ -242,6 +247,7 @@ class ModelConversationTurnRow(Base):
     error_code: Mapped[str | None] = mapped_column(String(64))
     error_message: Mapped[str | None] = mapped_column(Text)
     error_details: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    objective: Mapped[str | None] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

@@ -73,6 +73,76 @@ export interface ResolvedEditorialWorkspaceBlock {
   operation: string;
 }
 
+export type EditorialThreadBridgeStatus =
+  | "ready"
+  | "waiting_for_capacity"
+  | "generating"
+  | "reply_available"
+  | "refused"
+  | "session_lost"
+  | "reconciliation_required";
+
+export type EditorialThreadEventKind =
+  | "user_message"
+  | "bridge_reply"
+  | "proposal"
+  | "accepted"
+  | "rejected"
+  | "refused"
+  | "reconciliation"
+  | "generation";
+
+export interface EditorialThreadBinding {
+  subject_id: string;
+  production_run_id: string;
+  occurrence_id: string;
+  artifact_id: string;
+  artifact_version: number;
+  canonical_sha256: string;
+}
+
+export interface EditorialThreadTimelineEvent {
+  id: string;
+  sequence: number;
+  kind: EditorialThreadEventKind;
+  actor_id: string | null;
+  proposal_id: string | null;
+  created_at: string;
+  body: string | null;
+}
+
+interface EditorialThreadReadBase {
+  current: EditorialThreadBinding;
+  bridge_status: EditorialThreadBridgeStatus;
+  event_sequence: number;
+  timeline: EditorialThreadTimelineEvent[];
+  etag: string;
+}
+
+export interface EditorialThreadUnopenedRead extends EditorialThreadReadBase {
+  kind: "unopened";
+  binding: EditorialThreadBinding;
+}
+
+export interface EditorialThreadOpenRead extends EditorialThreadReadBase {
+  kind: "open";
+  thread_id: string;
+  origin: EditorialThreadBinding;
+  binding_state: "valid";
+}
+
+export interface EditorialThreadStaleRead extends EditorialThreadReadBase {
+  kind: "stale";
+  thread_id: string | null;
+  origin: EditorialThreadBinding | null;
+  binding_state: "stale" | "ambiguous";
+}
+
+export type EditorialThreadRead =
+  | EditorialThreadUnopenedRead
+  | EditorialThreadOpenRead
+  | EditorialThreadStaleRead;
+
 const ERROR_MESSAGES: Record<string, string> = {
   publication_kind_unresolved:
     "Le type de publication est indéterminé. L’atelier reste en lecture seule.",
@@ -86,6 +156,13 @@ const ERROR_MESSAGES: Record<string, string> = {
     "Le paragraphe d’ancrage a changé ou a été supprimé. Repositionnez l’élément.",
   editorial_registry_conflict:
     "La continuité de ce bloc ne peut pas être prouvée. Une revue est nécessaire.",
+  thread_not_found: "Discussion introuvable.",
+  thread_binding_stale: "Ce paragraphe a changé. Rechargez l’atelier.",
+  occurrence_ambiguous: "L’identité de ce paragraphe historique est ambiguë.",
+  thread_body_unavailable:
+    "Le contenu de cette discussion est temporairement indisponible.",
+  thread_body_hash_mismatch:
+    "Le contenu de cette discussion ne correspond plus à son empreinte.",
 };
 
 interface ErrorDetail {
@@ -140,4 +217,26 @@ export function resolveEditorialWorkspaceBlock(
       }),
     },
   );
+}
+
+export async function getEditorialThread(
+  subjectId: string,
+  occurrenceId: string,
+  options: { after_sequence?: number; etag?: string } = {},
+): Promise<EditorialThreadRead | null> {
+  const parameters = new URLSearchParams();
+  if (options.after_sequence !== undefined) {
+    parameters.set("after_sequence", String(options.after_sequence));
+  }
+  const query = parameters.size > 0 ? `?${parameters.toString()}` : "";
+  const headers = new Headers();
+  if (options.etag) headers.set("If-None-Match", options.etag);
+  const response = await fetch(
+    `/api/subjects/${encodeURIComponent(subjectId)}/editor/threads/${encodeURIComponent(occurrenceId)}${query}`,
+    { headers },
+  );
+  if (response.status === 304) return null;
+  if (!response.ok) throw await adaptApiError(response);
+  const payload = (await response.json()) as EditorialThreadRead;
+  return { ...payload, etag: response.headers.get("ETag") ?? payload.etag };
 }

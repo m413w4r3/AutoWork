@@ -91,6 +91,42 @@ export async function stubEditorialApi(
       await route.fulfill({ status: 404, body: "" });
       return;
     }
+    const threadPrefix = `${subjectPath}/editor/threads/`;
+    if (method === "GET" && url.pathname.startsWith(threadPrefix)) {
+      const etag = '"playwright-editorial-thread-empty"';
+      if (route.request().headers()["if-none-match"] === etag) {
+        await route.fulfill({ status: 304, headers: { ETag: etag } });
+        return;
+      }
+      const occurrenceId = url.pathname.slice(threadPrefix.length);
+      const binding = {
+        subject_id: EDITORIAL_FIXTURES.subject.id,
+        production_run_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        occurrence_id: occurrenceId,
+        artifact_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        artifact_version: 1,
+        canonical_sha256:
+          "44a1d590acdf039e4e198f3ef812e1e6f37ccef2226f0471be79c65331446dc2",
+      };
+      const afterSequence = Number(
+        url.searchParams.get("after_sequence") ?? "0",
+      );
+      const timeline: { sequence: number }[] = [];
+      await route.fulfill({
+        status: 200,
+        headers: { ETag: etag },
+        json: {
+          kind: "unopened",
+          binding,
+          current: binding,
+          bridge_status: "ready",
+          event_sequence: 0,
+          timeline: timeline.filter((event) => event.sequence > afterSequence),
+          etag,
+        },
+      });
+      return;
+    }
 
     capture.unexpectedRequests.push(`${method} ${url.pathname}`);
     await route.abort("blockedbyclient");

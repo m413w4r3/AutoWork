@@ -5,21 +5,19 @@ import { ApiError } from "../../api/editions";
 import { getEditorialWorkspaceSnapshot } from "../../api/editorialWorkspace";
 import { Link } from "../../routing";
 import { EditorialWorkspaceLayout } from "./EditorialWorkspaceLayout";
+import { editorialWorkspaceQueryKeys } from "./editorialWorkspaceQueries";
 import "./editorialWorkspace.css";
 
 interface EditorialWorkspacePageProps {
   subjectId: string;
 }
 
-const editorialWorkspaceQueryKey = (subjectId: string) =>
-  ["editorial-workspace", subjectId] as const;
-
 export function EditorialWorkspacePage({
   subjectId,
 }: EditorialWorkspacePageProps) {
   const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null);
   const snapshotQuery = useQuery({
-    queryKey: editorialWorkspaceQueryKey(subjectId),
+    queryKey: editorialWorkspaceQueryKeys.snapshot(subjectId),
     queryFn: () => getEditorialWorkspaceSnapshot(subjectId),
     retry: false,
   });

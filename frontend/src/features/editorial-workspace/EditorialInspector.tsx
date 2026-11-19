@@ -2,9 +2,11 @@ import type {
   EditorialWorkspaceBlock,
   EditorialWorkspaceSnapshot,
 } from "../../api/editorialWorkspace";
+import { EditorialConversation } from "./EditorialConversation";
 import { BLOCK_KIND_LABELS } from "./blockKindLabels";
 
 interface EditorialInspectorProps {
+  subjectId: string;
   snapshot: EditorialWorkspaceSnapshot;
   block: EditorialWorkspaceBlock | null;
   sectionTitle: string | null;
@@ -145,6 +147,7 @@ function BlockActionToolbar({
 }
 
 export function EditorialInspector({
+  subjectId,
   snapshot,
   block,
   sectionTitle,
@@ -182,6 +185,12 @@ export function EditorialInspector({
             block={block}
             readOnly={readOnly}
             onOpenSources={onOpenSources}
+          />
+          <EditorialConversation
+            subjectId={subjectId}
+            occurrenceId={block.block_id}
+            snapshotId={snapshot.snapshot_id}
+            targetLabel={block.text ?? BLOCK_KIND_LABELS[block.kind]}
           />
           <section
             className="editorial-evidence"

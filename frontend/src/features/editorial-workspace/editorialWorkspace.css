@@ -603,6 +603,59 @@ main:has(> .editorial-route-state) > .app-header {
   margin-top: 1.5rem;
 }
 
+.editorial-conversation {
+  margin: 1.25rem 0;
+  padding: 0.85rem;
+  border: 1px solid var(--editorial-divider);
+  border-radius: 0.55rem;
+  background: var(--editorial-panel);
+}
+
+.editorial-conversation h3 {
+  margin: 0 0 0.55rem;
+  font-size: 0.95rem;
+}
+
+.editorial-conversation__target,
+.editorial-conversation__origin {
+  margin: 0 0 0.5rem;
+  color: var(--editorial-muted);
+  font-size: 0.8rem;
+  overflow-wrap: anywhere;
+}
+
+.editorial-conversation__timeline {
+  display: grid;
+  gap: 0.65rem;
+  margin: 0.75rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.editorial-conversation__event {
+  min-width: 0;
+  padding: 0.7rem;
+  border-left: 2px solid var(--editorial-brand);
+  background: var(--editorial-white);
+  overflow-wrap: anywhere;
+}
+
+.editorial-conversation__event h4 {
+  margin: 0 0 0.35rem;
+  font-size: 0.8rem;
+}
+
+.editorial-conversation__event h4 span {
+  color: var(--editorial-muted);
+  font-weight: 500;
+}
+
+.editorial-conversation__event p {
+  margin: 0;
+  white-space: pre-wrap;
+  line-height: 1.5;
+}
+
 .editorial-evidence h3 {
   margin: 0 0 0.75rem;
   font-size: 0.95rem;

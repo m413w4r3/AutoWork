@@ -22,7 +22,7 @@ from cti_app.application.model_gateway import (
     ModelRoutingHint,
     ModelSubmissionReconciliationRequiredError,
 )
-from cti_app.application.persistence import UnitOfWorkFactory
+from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.domain.blobs import BlobRecord
 from cti_app.domain.model_conversations import (
     ConversationMode,
@@ -69,6 +69,14 @@ class VisibleRecoveryTransport(Protocol):
 class ModelConversationError(RuntimeError):
     code = "model_conversation_error"
     status_code = 400
+
+
+class EditorialPurposeReservedError(ModelConversationError):
+    code = "purpose_reserved_for_editorial_threads"
+    status_code = 403
+
+    def __init__(self) -> None:
+        super().__init__("Cette finalité est réservée aux discussions éditoriales.")
 
 
 class ModelConversationReconciliationError(ModelConversationError):
@@ -305,7 +313,15 @@ class ModelConversationService:
         subject_id: UUID | None,
         expected_profile: str | None,
         requested_model: str | None,
+        _editorial_thread_id: UUID | None = None,
     ) -> ModelConversation:
+        if purpose is ConversationPurpose.EDITORIAL_DISCUSSION and _editorial_thread_id is None:
+            raise EditorialPurposeReservedError()
+        if (
+            purpose is not ConversationPurpose.EDITORIAL_DISCUSSION
+            and _editorial_thread_id is not None
+        ):
+            raise EditorialPurposeReservedError()
         if (
             provider is not ModelProvider.OPENAI
             and transport is not ConversationTransport.APPLICATION_MANAGED
@@ -349,6 +365,7 @@ class ModelConversationService:
         subject_id: UUID | None,
         expected_profile: str | None,
         requested_model: str | None,
+        _editorial_thread_id: UUID | None = None,
     ) -> ModelConversation:
         """Reuse a conversation the caller can rederive a stable id for.
 
@@ -357,6 +374,13 @@ class ModelConversationService:
         on the same conversation instead of orphaning a new one — the turn
         idempotency check in `add_turn` requires exactly that.
         """
+        if purpose is ConversationPurpose.EDITORIAL_DISCUSSION and _editorial_thread_id is None:
+            raise EditorialPurposeReservedError()
+        if (
+            purpose is not ConversationPurpose.EDITORIAL_DISCUSSION
+            and _editorial_thread_id is not None
+        ):
+            raise EditorialPurposeReservedError()
         async with self._uow_factory() as uow:
             existing = await uow.model_conversations.get(conversation_id)
             if existing is not None:
@@ -1004,6 +1028,7 @@ class ModelConversationService:
         context_subject_id: UUID | None = None,
         lifecycle_policy: ConversationPolicy = ConversationPolicy.KEEP,
         bridge_external_effect_binding: BridgeExternalEffectBinding | None = None,
+        _editorial_thread_id: UUID | None = None,
     ) -> ModelConversationTurn:
         message = message.strip()
         if not message:
@@ -1015,6 +1040,8 @@ class ModelConversationService:
             if duplicate is not None:
                 conversation = await uow.model_conversations.get(duplicate.conversation_id)
                 self._ensure_visible(conversation, context_subject_id)
+                assert conversation is not None
+                await self._require_editorial_thread_path(uow, conversation, _editorial_thread_id)
                 if duplicate.conversation_id != conversation_id:
                     raise ConversationPolicyError(
                         "La clé d'idempotence appartient à une autre conversation"
@@ -1075,6 +1102,11 @@ class ModelConversationService:
                             else None
                         ),
                     )
+            else:
+                conversation = await uow.model_conversations.get(conversation_id)
+                self._ensure_visible(conversation, context_subject_id)
+                assert conversation is not None
+                await self._require_editorial_thread_path(uow, conversation, _editorial_thread_id)
 
         if duplicate_success is not None:
             # The durable result may have committed while the process crashed
@@ -1119,6 +1151,7 @@ class ModelConversationService:
             conversation = await uow.model_conversations.get_for_update(conversation_id)
             self._ensure_visible(conversation, context_subject_id)
             assert conversation is not None
+            await self._require_editorial_thread_path(uow, conversation, _editorial_thread_id)
             if conversation.status is ConversationStatus.BUSY:
                 raise ConversationBusyError("Une question est déjà en cours")
             if conversation.transport is ConversationTransport.OPENAI_RESPONSES:
@@ -1573,6 +1606,26 @@ class ModelConversationService:
             and conversation.subject_id != context_subject_id
         ):
             raise ConversationNotFoundError("Conversation introuvable dans ce sujet")
+
+    @staticmethod
+    async def _require_editorial_thread_path(
+        uow: UnitOfWork,
+        conversation: ModelConversation,
+        editorial_thread_id: UUID | None,
+    ) -> None:
+        if conversation.purpose is not ConversationPurpose.EDITORIAL_DISCUSSION:
+            if editorial_thread_id is not None:
+                raise EditorialPurposeReservedError()
+            return
+        if editorial_thread_id is None:
+            raise EditorialPurposeReservedError()
+        record = await uow.editorial_threads.get(editorial_thread_id)
+        if (
+            record is None
+            or record.thread.model_conversation_id != conversation.id
+            or record.thread.origin.subject_id != conversation.subject_id
+        ):
+            raise EditorialPurposeReservedError()
 
     async def _read_reference(self, reference: str, blobs: dict[UUID, BlobRecord | None]) -> str:
         blob_id = _blob_id(reference)

@@ -22,6 +22,7 @@ class ConversationPurpose(StrEnum):
     SUBJECT_RESEARCH = "subject_research"
     DRAFTING = "drafting"
     CRITIC = "critic"
+    EDITORIAL_DISCUSSION = "editorial_discussion"
 
 
 class ConversationStatus(StrEnum):
@@ -71,6 +72,7 @@ CONTINUABLE_PURPOSES = {
     ConversationPurpose.PIVOT_RESEARCH,
     ConversationPurpose.SUBJECT_RESEARCH,
     ConversationPurpose.DRAFTING,
+    ConversationPurpose.EDITORIAL_DISCUSSION,
 }
 
 

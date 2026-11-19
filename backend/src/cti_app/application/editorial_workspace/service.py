@@ -10,10 +10,14 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from cti_app.application.editorial_workspace.registry import (
+    WorkspaceOccurrenceResolution,
     WorkspaceSnapshotRecord,
     project_blocks,
     registry_hash,
     resolve_workspace_target,
+)
+from cti_app.application.editorial_workspace.registry import (
+    resolve_occurrence as resolve_registry_occurrence,
 )
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
@@ -69,6 +73,13 @@ class EditorialWorkspaceService:
         result, _record, _synthesis = await self._load_current(subject_id)
         return result
 
+    async def resolve_occurrence(
+        self, subject_id: UUID, occurrence_id: UUID
+    ) -> WorkspaceOccurrenceResolution:
+        """Resolve one occurrence against the subject's current registry snapshot."""
+        _snapshot, record, _synthesis = await self._load_current(subject_id)
+        return resolve_registry_occurrence(record, occurrence_id)
+
     async def resolve(
         self,
         *,
@@ -82,8 +93,8 @@ class EditorialWorkspaceService:
             raise EditorialWorkspaceError("editorial_snapshot_stale")
         if record.publication_kind is None:
             raise EditorialWorkspaceError("publication_kind_unresolved")
-        entries = record.block_registry
-        entry = next((item for item in entries if item.block_id == block_id), None)
+        occurrence = resolve_registry_occurrence(record, block_id)
+        entry = occurrence.entry
         if entry is None:
             raise EditorialWorkspaceError("editorial_block_missing")
         resolved = resolve_workspace_target(
@@ -300,6 +311,7 @@ class EditorialWorkspaceService:
                 entries=entries,
                 synthesis=synthesis,
                 enrichment=enrichment_content,
+                record=record,
                 allow_operations=kind is not None,
             )
             result: dict[str, object] = {

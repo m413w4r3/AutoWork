@@ -137,6 +137,41 @@ async function stubEditorApi(
       );
       return;
     }
+    const threadPrefix = `${subjectPath}/editor/threads/`;
+    if (method === "GET" && url.pathname.startsWith(threadPrefix)) {
+      const etag = '"playwright-auth-thread-empty"';
+      if (route.request().headers()["if-none-match"] === etag) {
+        await route.fulfill({ status: 304, headers: { ETag: etag } });
+        return;
+      }
+      const occurrenceId = url.pathname.slice(threadPrefix.length);
+      const binding = {
+        subject_id: snapshot.subject_id,
+        production_run_id: snapshot.production_run_id,
+        occurrence_id: occurrenceId,
+        artifact_id: snapshot.synthesis_artifact_id,
+        artifact_version: snapshot.synthesis_version,
+        canonical_sha256: snapshot.synthesis_canonical_sha256,
+      };
+      const afterSequence = Number(
+        url.searchParams.get("after_sequence") ?? "0",
+      );
+      const timeline: { sequence: number }[] = [];
+      await route.fulfill({
+        status: 200,
+        headers: { ETag: etag },
+        json: {
+          kind: "unopened",
+          binding,
+          current: binding,
+          bridge_status: "ready",
+          event_sequence: 0,
+          timeline: timeline.filter((event) => event.sequence > afterSequence),
+          etag,
+        },
+      });
+      return;
+    }
     if (method === "GET" && url.pathname === subjectPath) {
       await route.fulfill({ json: EDITORIAL_FIXTURES.subject });
       return;

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, Literal, cast
 from uuid import UUID
 
 from cti_app.application.production_synthesis_revision import (
@@ -69,11 +69,63 @@ class WorkspaceSnapshotRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkspaceOccurrenceResolution:
+    record: WorkspaceSnapshotRecord
+    entry: BlockRegistryEntry | None
+    binding_state: Literal["valid", "stale", "ambiguous"]
+    artifact_id: UUID | None
+    artifact_version: int | None
+    canonical_sha256: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class ResolvedWorkspaceTarget:
     block_id: UUID
     path: str
     before_hash: str
     operation: str
+
+
+def resolve_occurrence(
+    record: WorkspaceSnapshotRecord, occurrence_id: UUID
+) -> WorkspaceOccurrenceResolution:
+    """Resolve current ownership and continuity for one registry occurrence."""
+    entry = next((item for item in record.block_registry if item.block_id == occurrence_id), None)
+    if entry is None:
+        return WorkspaceOccurrenceResolution(
+            record=record,
+            entry=None,
+            binding_state="stale",
+            artifact_id=None,
+            artifact_version=None,
+            canonical_sha256=None,
+        )
+
+    if entry.source_stage is EditorialSourceStage.EDITORIAL_ENRICHMENT:
+        artifact_id = record.enrichment_artifact_id
+        artifact_version = record.enrichment_version
+        canonical_sha256 = record.enrichment_canonical_sha256
+    else:
+        artifact_id = record.synthesis_artifact_id
+        artifact_version = record.synthesis_version
+        canonical_sha256 = record.synthesis_canonical_sha256
+
+    if artifact_id is None or artifact_version is None or canonical_sha256 is None:
+        binding_state: Literal["valid", "stale", "ambiguous"] = "stale"
+    elif entry.revision_status is EditorialRevisionStatus.READY:
+        binding_state = "valid"
+    elif entry.revision_status is EditorialRevisionStatus.NEEDS_REVIEW:
+        binding_state = "ambiguous"
+    else:
+        binding_state = "stale"
+    return WorkspaceOccurrenceResolution(
+        record=record,
+        entry=entry,
+        binding_state=binding_state,
+        artifact_id=artifact_id,
+        artifact_version=artifact_version,
+        canonical_sha256=canonical_sha256,
+    )
 
 
 def serialize_registry(entries: Sequence[BlockRegistryEntry]) -> list[dict[str, object]]:
@@ -288,6 +340,7 @@ def project_blocks(
     entries: Sequence[BlockRegistryEntry],
     synthesis: Mapping[str, Any],
     enrichment: Mapping[str, Any] | None,
+    record: WorkspaceSnapshotRecord | None = None,
     needs_review_ids: frozenset[UUID] = frozenset(),
     allow_operations: bool = True,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
@@ -296,6 +349,13 @@ def project_blocks(
     outline: list[dict[str, object]] = []
     heading_children: dict[UUID, list[UUID]] = {}
     for entry in entries:
+        binding_state: str | None = None
+        if record is not None:
+            resolved = resolve_occurrence(record, entry.block_id)
+            if resolved.entry is None:
+                raise EditorialRegistryConflictError("editorial_registry_conflict")
+            entry = resolved.entry
+            binding_state = resolved.binding_state
         source = synthesis if entry.source_stage is EditorialSourceStage.SYNTHESIS else enrichment
         if source is None:
             raise EditorialRegistryConflictError("editorial_registry_conflict")
@@ -351,8 +411,11 @@ def project_blocks(
             "allowed_operations": list(operations),
             "revision_status": (
                 "needs_review"
-                if entry.revision_status is EditorialRevisionStatus.NEEDS_REVIEW
+                if binding_state == "ambiguous"
+                or entry.revision_status is EditorialRevisionStatus.NEEDS_REVIEW
                 or entry.block_id in needs_review_ids
+                else "stale"
+                if binding_state == "stale"
                 else "ready"
             ),
         }

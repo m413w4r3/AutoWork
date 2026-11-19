@@ -65,6 +65,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     edition_publication,
     editions,
     editorial,
+    editorial_threads,
     editorial_workspace,
     external_effects,
     invariants,
@@ -249,6 +250,18 @@ EXPECTED_TRIGGERS: dict[tuple[str, str], str] = {
         "editorial_workspace_snapshots",
         "trg_editorial_workspace_snapshots_no_truncate",
     ): "reject_editorial_workspace_snapshot_mutation",
+    (
+        "editorial_threads",
+        "trg_editorial_threads_origin_immutable",
+    ): "reject_editorial_thread_origin_mutation",
+    (
+        "editorial_thread_events",
+        "trg_editorial_thread_events_append_only",
+    ): "reject_editorial_thread_event_mutation",
+    (
+        "editorial_thread_events",
+        "trg_editorial_thread_events_no_truncate",
+    ): "reject_editorial_thread_event_mutation",
     ("subjects", "trg_subjects_prevent_tlp_downgrade"): "prevent_tlp_downgrade",
     ("source_documents", "trg_source_documents_prevent_tlp_downgrade"): "prevent_tlp_downgrade",
     ("samples", "trg_samples_prevent_tlp_downgrade"): "prevent_tlp_downgrade",
@@ -1135,7 +1148,7 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     command.upgrade(config, "head")
     command.current(config)
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert _head_revision() == "0011_editorial_workspace_snapshots"
+    assert _head_revision() == "0012_editorial_threads"
     assert asyncio.run(_alembic_version_column_length(temporary_postgres_url)) == 64
 
     collection_attempt_columns = asyncio.run(
@@ -1246,7 +1259,7 @@ def test_frozen_collection_attempt_baseline_precedes_acquisition_additions(
 
     command.upgrade(config, "head")
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert _head_revision() == "0011_editorial_workspace_snapshots"
+    assert _head_revision() == "0012_editorial_threads"
     final_schema = asyncio.run(_database_snapshot(temporary_postgres_url))["collection_attempts"]
     table = Base.metadata.tables["collection_attempts"]
     assert final_schema["columns"] == _expected_columns(table)
@@ -1463,11 +1476,24 @@ def test_migration_up_and_down_on_temporary_postgres(temporary_postgres_url: str
             "effect_acquisition_dispatch_links",
             "production_routing_decisions",
             "editorial_workspace_snapshots",
+            "editorial_threads",
+            "editorial_thread_events",
+            "editorial_thread_jobs",
         }
     )
     at_0004 = asyncio.run(_database_snapshot(temporary_postgres_url))
     assert "dispatch_attempt_id" not in at_0004["sample_acquisition_attempts"]["columns"]
     assert "routing_decision_id" not in at_0004["production_runs"]["columns"]
+    assert "objective" not in at_0004["model_conversation_turns"]["columns"]
+    assert (
+        "ck_model_conversation_turns_objective" not in at_0004["model_conversation_turns"]["checks"]
+    )
+    assert (
+        "editorial_discussion"
+        not in asyncio.run(_check_constraints(temporary_postgres_url, "model_conversations"))[
+            "ck_model_conversations_purpose"
+        ]
+    )
     assert not any(
         index[0] == "uq_sample_acquisition_attempt_dispatch"
         for index in at_0004["sample_acquisition_attempts"]["indexes"]

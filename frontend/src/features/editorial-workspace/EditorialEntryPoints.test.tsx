@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "../../App";
 import type {
+  EditorialThreadRead,
   EditorialWorkspaceBlock,
   EditorialWorkspaceSnapshot,
 } from "../../api/editorialWorkspace";
@@ -22,6 +23,24 @@ const subjectId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const titleId = "00000000-0000-4000-8000-000000000000";
 const headingId = "11111111-1111-4111-8111-111111111111";
 const paragraphId = "22222222-2222-4222-8222-222222222222";
+const threadEtag = '"vitest-editorial-thread-empty"';
+const threadBinding = {
+  subject_id: subjectId,
+  production_run_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+  occurrence_id: paragraphId,
+  artifact_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+  artifact_version: 4,
+  canonical_sha256: "a".repeat(64),
+};
+const unopenedThread: EditorialThreadRead = {
+  kind: "unopened",
+  binding: threadBinding,
+  current: threadBinding,
+  bridge_status: "ready",
+  event_sequence: 0,
+  timeline: [],
+  etag: threadEtag,
+};
 
 const snapshot: EditorialWorkspaceSnapshot = {
   subject_id: subjectId,
@@ -98,7 +117,7 @@ function renderApp(editorResponseValue: Response | Promise<Response>) {
   window.history.replaceState({}, "", `/subjects/${subjectId}/editor`);
   vi.stubGlobal(
     "fetch",
-    vi.fn((input: RequestInfo | URL) => {
+    vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url =
         typeof input === "string"
           ? input
@@ -108,6 +127,38 @@ function renderApp(editorResponseValue: Response | Promise<Response>) {
       if (url.includes("/api/editions")) {
         return Promise.resolve(
           Response.json({ items: [], total: 0, page: 1, page_size: 20 }),
+        );
+      }
+      if (url.includes("/editor/threads/")) {
+        const requestUrl = new URL(url, window.location.origin);
+        const afterSequence = Number(
+          requestUrl.searchParams.get("after_sequence") ?? "0",
+        );
+        const headers = new Headers(
+          init?.headers ??
+            (input instanceof Request ? input.headers : undefined),
+        );
+        if (headers.get("If-None-Match") === threadEtag) {
+          return Promise.resolve(
+            new Response(null, { status: 304, headers: { ETag: threadEtag } }),
+          );
+        }
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              ...unopenedThread,
+              timeline: unopenedThread.timeline.filter(
+                (event) => event.sequence > afterSequence,
+              ),
+            }),
+            {
+              status: 200,
+              headers: {
+                "Content-Type": "application/json",
+                ETag: threadEtag,
+              },
+            },
+          ),
         );
       }
       return Promise.resolve(editorResponseValue).then((response) =>
@@ -400,6 +451,9 @@ describe("atelier éditorial", () => {
 
     firstItem.focus();
     await user.keyboard("{ArrowDown}");
+    await screen.findByText(
+      "Aucune discussion n’a encore été ouverte pour ce bloc.",
+    );
     expect(secondItem).toHaveFocus();
     expect(secondItem).toHaveAttribute("aria-selected", "true");
 

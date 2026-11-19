@@ -42,6 +42,7 @@ from cti_app.application.persistence import (
     EditionReleaseRepository,
     EditionRenderRepository,
     EditionRepository,
+    EditorialThreadRepository,
     EditorialWorkspaceSnapshotRepository,
     GoodwareBaselineRepository,
     HumanDecisionRepository,
@@ -147,6 +148,9 @@ from cti_app.infrastructure.database.repositories.editions import (
     SqlAlchemyEditionRepository,
 )
 from cti_app.infrastructure.database.repositories.editorial import SqlAlchemyHumanDecisionRepository
+from cti_app.infrastructure.database.repositories.editorial_threads import (
+    SqlAlchemyEditorialThreadRepository,
+)
 from cti_app.infrastructure.database.repositories.editorial_workspace import (
     SqlAlchemyEditorialWorkspaceSnapshotRepository,
 )
@@ -287,6 +291,7 @@ class SqlAlchemyUnitOfWork:
     production_runs: ProductionRunRepository
     production_routing_decisions: ProductionRoutingDecisionRepository
     editorial_workspace_snapshots: EditorialWorkspaceSnapshotRepository
+    editorial_threads: EditorialThreadRepository
     production_input_snapshots: ProductionInputSnapshotRepository
     production_artifacts: ProductionArtifactRepository
     production_source_additions: ProductionSourceAdditionRepository
@@ -390,6 +395,7 @@ class SqlAlchemyUnitOfWork:
         self.editorial_workspace_snapshots = SqlAlchemyEditorialWorkspaceSnapshotRepository(
             self._session
         )
+        self.editorial_threads = SqlAlchemyEditorialThreadRepository(self._session)
         self.production_input_snapshots = SqlAlchemyProductionInputSnapshotRepository(self._session)
         self.production_artifacts = SqlAlchemyProductionArtifactRepository(self._session)
         self.production_source_additions = SqlAlchemyProductionSourceAdditionRepository(

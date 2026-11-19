@@ -57,6 +57,12 @@ from cti_app.domain.edition_publication import (
 from cti_app.domain.edition_render import EditionRender
 from cti_app.domain.editions import Edition, EditionAuditEvent, EditionStatus
 from cti_app.domain.editorial import AnalystDecision, HumanDecision
+from cti_app.domain.editorial_thread import (
+    EditorialThread,
+    EditorialThreadEvent,
+    EditorialThreadEventKind,
+    EditorialThreadRecord,
+)
 from cti_app.domain.entities import ProvenanceEvent, Sample, SourceDocument, Subject
 from cti_app.domain.goodware import GoodwareBaseline, GoodwareIndexArtifact, GoodwareSource
 from cti_app.domain.invariants import (
@@ -170,6 +176,30 @@ class EditorialWorkspaceSnapshotRepository(Protocol):
     async def append_if_absent(
         self, record: WorkspaceSnapshotRecord
     ) -> WorkspaceSnapshotRecord: ...
+
+
+class EditorialThreadRepository(Protocol):
+    async def get_current_by_occurrence(
+        self, subject_id: UUID, production_run_id: UUID, occurrence_id: UUID
+    ) -> EditorialThreadRecord | None: ...
+
+    async def get(self, thread_id: UUID) -> EditorialThreadRecord | None: ...
+
+    async def create_if_absent(self, thread: EditorialThread) -> EditorialThread: ...
+
+    async def append_event(
+        self,
+        *,
+        thread_id: UUID,
+        kind: EditorialThreadEventKind,
+        actor_id: UUID | None,
+        idempotency_key: str,
+        request_sha256: str,
+        payload_blob_ref: UUID | None = None,
+        payload_sha256: str | None = None,
+        proposal_id: UUID | None = None,
+        model_turn_id: UUID | None = None,
+    ) -> EditorialThreadEvent: ...
 
 
 class MediaAssetRepository(Protocol):
@@ -964,6 +994,7 @@ class UnitOfWork(Protocol):
     production_runs: ProductionRunRepository
     production_routing_decisions: ProductionRoutingDecisionRepository
     editorial_workspace_snapshots: EditorialWorkspaceSnapshotRepository
+    editorial_threads: EditorialThreadRepository
     production_input_snapshots: ProductionInputSnapshotRepository
     production_artifacts: ProductionArtifactRepository
     production_source_additions: ProductionSourceAdditionRepository

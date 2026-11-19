@@ -14,6 +14,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     edition_render,
     editions,
     editorial,
+    editorial_threads,
     editorial_workspace,
     external_effects,
     invariants,
@@ -64,6 +65,9 @@ _OSINT_ENVELOPE_COLUMNS = frozenset(
 _SAMPLE_ACQUISITION_DISPATCH_COLUMNS = frozenset({"dispatch_attempt_id"})
 _ROUTING_DECISION_TABLES = frozenset({"production_routing_decisions"})
 _EDITORIAL_WORKSPACE_TABLES = frozenset({"editorial_workspace_snapshots"})
+_EDITORIAL_THREAD_TABLES = frozenset(
+    {"editorial_threads", "editorial_thread_events", "editorial_thread_jobs"}
+)
 _ROUTING_RUN_COLUMNS = frozenset({"routing_decision_id"})
 _COLLECTION_ATTEMPT_ADDITIONS = frozenset(
     {
@@ -89,6 +93,10 @@ _COLLECTION_ATTEMPT_ADDITION_CHECKS = frozenset(
         "ck_collection_attempts_quality_score",
     }
 )
+_EDITORIAL_THREAD_TURN_COLUMNS = frozenset({"objective"})
+_BASELINE_CONVERSATION_PURPOSE_SQL = (
+    "'discovery', 'analyst_assistance', 'pivot_research', 'drafting', 'critic', 'subject_research'"
+)
 
 
 def _metadata_for_frozen_baseline() -> MetaData:
@@ -106,6 +114,7 @@ def _metadata_for_frozen_baseline() -> MetaData:
             or source_table.name in _EXTERNAL_EFFECT_TABLES
             or source_table.name in _ROUTING_DECISION_TABLES
             or source_table.name in _EDITORIAL_WORKSPACE_TABLES
+            or source_table.name in _EDITORIAL_THREAD_TABLES
         ):
             continue
         table = source_table.to_metadata(metadata)
@@ -193,6 +202,23 @@ def _metadata_for_frozen_baseline() -> MetaData:
                 if any(column.name in _COLLECTION_ATTEMPT_ADDITIONS for column in index.columns):
                     table.indexes.discard(index)
             for column_name in _COLLECTION_ATTEMPT_ADDITIONS:
+                if column_name in table.c:
+                    table._columns.remove(table.c[column_name])
+        if table.name == "model_conversations":
+            for constraint in tuple(table.constraints):
+                if constraint.name == "ck_model_conversations_purpose":
+                    table.constraints.discard(constraint)
+            table.append_constraint(
+                CheckConstraint(
+                    f"purpose IN ({_BASELINE_CONVERSATION_PURPOSE_SQL})",
+                    name="ck_model_conversations_purpose",
+                )
+            )
+        if table.name == "model_conversation_turns":
+            for constraint in tuple(table.constraints):
+                if constraint.name == "ck_model_conversation_turns_objective":
+                    table.constraints.discard(constraint)
+            for column_name in _EDITORIAL_THREAD_TURN_COLUMNS:
                 if column_name in table.c:
                     table._columns.remove(table.c[column_name])
     return metadata
