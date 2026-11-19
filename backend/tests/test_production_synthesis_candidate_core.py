@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import date
 from typing import Any
@@ -13,6 +14,8 @@ import pytest
 from cti_app.application.editorial_synthesis import candidate as candidate_core
 from cti_app.application.editorial_synthesis import targets
 from cti_app.application.editorial_synthesis.patch_validation import WirePatch
+from cti_app.application.model_gateway import ModelGateway
+from cti_app.application.persistence import ProductionUnitOfWork
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_stages import SynthesisService
 from cti_app.application.production_synthesis import (
@@ -34,6 +37,7 @@ from cti_app.domain.production import (
     SynthesisMode,
 )
 from cti_app.domain.production_editorial_revision import (
+    TargetedEditorialRevisionConflictError,
     TargetedEditorialRevisionOperation,
     TargetedEditorialRevisionTarget,
     TargetedEditorialRevisionTargetKind,
@@ -199,7 +203,11 @@ def _fixture() -> _CandidateFixture:
     )
 
 
-def _build_candidate(fixture: _CandidateFixture) -> candidate_core.SynthesisCandidate:
+def _build_candidate(
+    fixture: _CandidateFixture,
+    *,
+    apply_patch: candidate_core.PatchApplicator = _apply_wire_patch,
+) -> candidate_core.SynthesisCandidate:
     return candidate_core.build_candidate_from_validated_patch(
         base_artifact=fixture.base_artifact,
         base_payload=fixture.payload,
@@ -211,7 +219,7 @@ def _build_candidate(fixture: _CandidateFixture) -> candidate_core.SynthesisCand
         evidence_pack=fixture.evidence_pack,
         extraction=fixture.extraction,
         snapshot=fixture.snapshot,
-        apply_patch=_apply_wire_patch,
+        apply_patch=apply_patch,
         publication_kind=PublicationKind.BRIEF,
     )
 
@@ -241,20 +249,64 @@ def test_candidate_core_matches_legacy_revise_candidate_bytes() -> None:
     assert candidate.canonical_sha256 == legacy_sha256
 
 
-def test_candidate_core_makes_no_model_call_and_no_write() -> None:
+def test_candidate_core_makes_no_model_call_and_no_write(monkeypatch: pytest.MonkeyPatch) -> None:
     fixture = _fixture()
-    model_gateway_calls = 0
-    persistence_write_calls = 0
-    blob_write_calls = 0
+
+    async def fail_if_called(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("candidate construction must not call runtime ports")
+
+    monkeypatch.setattr(ModelGateway, "_execute", fail_if_called)
+    for method_name in (
+        "put_text",
+        "put_bytes",
+        "put_json",
+        "put_canonical_json",
+        "read_text",
+        "read_bytes",
+        "read_verified_range",
+        "read_json",
+    ):
+        monkeypatch.setattr(ProductionArtifactStore, method_name, fail_if_called)
+    monkeypatch.setattr(
+        candidate_core.SynthesisService,
+        "store_synthesis_result",
+        fail_if_called,
+    )
+    monkeypatch.setattr(ProductionUnitOfWork, "__aenter__", fail_if_called, raising=False)
+    monkeypatch.setattr(ProductionUnitOfWork, "__aexit__", fail_if_called, raising=False)
+    for symbol_name in ("datetime", "time", "random", "secrets", "uuid4"):
+        monkeypatch.setattr(candidate_core, symbol_name, fail_if_called, raising=False)
 
     candidate = _build_candidate(fixture)
 
     assert candidate.canonical_bytes
-    assert model_gateway_calls == 0
-    assert persistence_write_calls == 0
-    assert blob_write_calls == 0
     parameters = inspect.signature(candidate_core.build_candidate_from_validated_patch).parameters
     assert not {"model_gateway", "persistence", "artifact_store", "uow"}.intersection(parameters)
+
+
+def test_candidate_builder_rejects_inconsistent_patch_result() -> None:
+    fixture = _fixture()
+
+    def inconsistent_applicator(**kwargs: Any) -> tuple[ProductionSynthesisV1, dict[str, Any], str]:
+        synthesis, payload, before_hash = _apply_wire_patch(**kwargs)
+        return synthesis, {**payload, "title": "Different payload title"}, before_hash
+
+    with pytest.raises(ValueError, match="synthesis_candidate_payload_inconsistent"):
+        _build_candidate(fixture, apply_patch=inconsistent_applicator)
+
+
+def test_candidate_builder_rejects_invalid_serialization_round_trip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture()
+    monkeypatch.setattr(
+        candidate_core,
+        "production_synthesis_from_json",
+        lambda _payload: fixture.synthesis,
+    )
+
+    with pytest.raises(ValueError, match="synthesis_candidate_round_trip_invalid"):
+        _build_candidate(fixture)
 
 
 class _StableMemoryBlobStore:
@@ -263,6 +315,7 @@ class _StableMemoryBlobStore:
         self.payloads: dict[UUID, dict[str, Any]] = {}
         self.read_bytes_calls = 0
         self.write_calls = 0
+        self.read_guard: Callable[[], None] | None = None
 
     def add_json(self, payload: dict[str, Any]) -> UUID:
         encoded = ProductionArtifactStore.canonical_json_bytes(payload)
@@ -285,6 +338,8 @@ class _StableMemoryBlobStore:
 
     async def read_bytes(self, blob_id: UUID, **kwargs: object) -> bytes:
         del kwargs
+        if self.read_guard is not None:
+            self.read_guard()
         self.read_bytes_calls += 1
         return self.bytes[blob_id]
 
@@ -354,6 +409,15 @@ class _MemoryArtifactRepository:
 class _MemoryUnitOfWork:
     def __init__(self, artifacts: _MemoryArtifactRepository) -> None:
         self.production_artifacts = artifacts
+        self.active = False
+
+    async def __aenter__(self) -> _MemoryUnitOfWork:
+        self.active = True
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        del args
+        self.active = False
 
 
 def _normalized_rows(repository: _MemoryArtifactRepository) -> list[ProductionArtifact]:
@@ -456,7 +520,7 @@ async def test_persist_candidate_writes_same_rows_as_legacy() -> None:
 
 
 @pytest.mark.asyncio
-async def test_persist_candidate_uses_verified_blobs_without_blob_io_in_uow() -> None:
+async def test_persist_candidate_reuses_preuploaded_blob_after_uow_verification() -> None:
     fixture = _fixture()
     candidate = _build_candidate(fixture)
     blob_store = _StableMemoryBlobStore()
@@ -473,7 +537,7 @@ async def test_persist_candidate_uses_verified_blobs_without_blob_io_in_uow() ->
     base_artifact = replace(fixture.base_artifact, canonical_blob_id=base_blob_id)
     repository = _MemoryArtifactRepository((base_artifact,))
     uow = _MemoryUnitOfWork(repository)
-    writer = SynthesisService(lambda: uow, None)  # type: ignore[arg-type]
+    writer = SynthesisService(lambda: uow, blob_store)  # type: ignore[arg-type]
     persistence = candidate_core.SynthesisCandidatePersistence(
         run_id=fixture.run_id,
         subject_id=fixture.snapshot.subject_id,
@@ -488,22 +552,115 @@ async def test_persist_candidate_uses_verified_blobs_without_blob_io_in_uow() ->
         expected_current_input_hash=base_artifact.input_hash,
         expected_current_canonical_sha256=fixture.base_sha256,
         stale_stages=frozenset({ProductionArtifactStage.PUBLICATION.value}),
-        verified_candidate_blob=candidate_core.VerifiedSynthesisCandidateBlob(
-            blob_id=candidate_blob_id,
-            canonical_sha256=candidate.canonical_sha256,
-        ),
-        base_canonical_sha256_verified=True,
+        candidate_blob=candidate_core.SynthesisCandidateBlobReference(blob_id=candidate_blob_id),
     )
 
-    artifact = await candidate_core.persist_candidate(
-        uow,  # type: ignore[arg-type]
-        writer=writer,
-        candidate=candidate,
-        persistence=persistence,
-    )
+    def assert_reads_inside_uow() -> None:
+        assert uow.active
+
+    blob_store.read_guard = assert_reads_inside_uow
+    async with uow:
+        artifact = await candidate_core.persist_candidate(
+            uow,  # type: ignore[arg-type]
+            writer=writer,
+            candidate=candidate,
+            persistence=persistence,
+        )
 
     assert artifact.canonical_blob_id == candidate_blob_id
     assert artifact.raw_blob_id is None
     assert artifact.rendered_blob_id is None
-    assert blob_store.read_bytes_calls == verified_read_count
+    assert blob_store.read_bytes_calls == verified_read_count + 2
     assert blob_store.write_calls == verified_write_count
+
+
+@pytest.mark.asyncio
+async def test_persist_candidate_rehashes_base_blob_inside_uow() -> None:
+    fixture = _fixture()
+    candidate = _build_candidate(fixture)
+    blob_store = _StableMemoryBlobStore()
+    base_blob_id = blob_store.add_json(fixture.payload)
+    candidate_blob_id = blob_store.upload_json_bytes(candidate.canonical_bytes)
+    base_artifact = replace(fixture.base_artifact, canonical_blob_id=base_blob_id)
+    blob_store.bytes[base_blob_id] += b" "
+
+    repository = _MemoryArtifactRepository((base_artifact,))
+    uow = _MemoryUnitOfWork(repository)
+    writer = SynthesisService(lambda: uow, blob_store)  # type: ignore[arg-type]
+    persistence = candidate_core.SynthesisCandidatePersistence(
+        run_id=fixture.run_id,
+        subject_id=fixture.snapshot.subject_id,
+        input_hash=base_artifact.input_hash,
+        extraction=fixture.extraction,
+        snapshot=fixture.snapshot,
+        raw_result=None,
+        model_run_id=None,
+        publication_kind=PublicationKind.BRIEF,
+        expected_current_artifact_id=base_artifact.id,
+        expected_current_input_hash=base_artifact.input_hash,
+        expected_current_canonical_sha256=fixture.base_sha256,
+        stale_stages=frozenset({ProductionArtifactStage.PUBLICATION.value}),
+        candidate_blob=candidate_core.SynthesisCandidateBlobReference(blob_id=candidate_blob_id),
+    )
+
+    def assert_reads_inside_uow() -> None:
+        assert uow.active
+
+    blob_store.read_guard = assert_reads_inside_uow
+    with pytest.raises(TargetedEditorialRevisionConflictError):
+        async with uow:
+            await candidate_core.persist_candidate(
+                uow,  # type: ignore[arg-type]
+                writer=writer,
+                candidate=candidate,
+                persistence=persistence,
+            )
+
+    assert not repository.events
+
+
+@pytest.mark.asyncio
+async def test_persist_candidate_rehashes_preuploaded_payload_against_candidate() -> None:
+    fixture = _fixture()
+    candidate = _build_candidate(fixture)
+    blob_store = _StableMemoryBlobStore()
+    base_blob_id = blob_store.add_json(fixture.payload)
+    candidate_blob_id = blob_store.upload_json_bytes(candidate.canonical_bytes)
+    tampered_candidate = bytearray(blob_store.bytes[candidate_blob_id])
+    tampered_candidate[0] ^= 1
+    blob_store.bytes[candidate_blob_id] = bytes(tampered_candidate)
+
+    base_artifact = replace(fixture.base_artifact, canonical_blob_id=base_blob_id)
+    repository = _MemoryArtifactRepository((base_artifact,))
+    uow = _MemoryUnitOfWork(repository)
+    writer = SynthesisService(lambda: uow, blob_store)  # type: ignore[arg-type]
+    persistence = candidate_core.SynthesisCandidatePersistence(
+        run_id=fixture.run_id,
+        subject_id=fixture.snapshot.subject_id,
+        input_hash=base_artifact.input_hash,
+        extraction=fixture.extraction,
+        snapshot=fixture.snapshot,
+        raw_result=None,
+        model_run_id=None,
+        publication_kind=PublicationKind.BRIEF,
+        expected_current_artifact_id=base_artifact.id,
+        expected_current_input_hash=base_artifact.input_hash,
+        expected_current_canonical_sha256=fixture.base_sha256,
+        stale_stages=frozenset({ProductionArtifactStage.PUBLICATION.value}),
+        candidate_blob=candidate_core.SynthesisCandidateBlobReference(blob_id=candidate_blob_id),
+    )
+
+    def assert_reads_inside_uow() -> None:
+        assert uow.active
+
+    blob_store.read_guard = assert_reads_inside_uow
+    with pytest.raises(ValueError, match="synthesis_candidate_blob_content_mismatch"):
+        async with uow:
+            await candidate_core.persist_candidate(
+                uow,  # type: ignore[arg-type]
+                writer=writer,
+                candidate=candidate,
+                persistence=persistence,
+            )
+
+    assert not repository.events

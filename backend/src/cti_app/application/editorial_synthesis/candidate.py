@@ -67,11 +67,10 @@ class SynthesisCandidate:
 
 
 @dataclass(frozen=True, slots=True)
-class VerifiedSynthesisCandidateBlob:
-    """Canonical candidate blob uploaded and read back before opening the UOW."""
+class SynthesisCandidateBlobReference:
+    """Reference to a preuploaded canonical candidate blob."""
 
     blob_id: UUID
-    canonical_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,8 +97,7 @@ class SynthesisCandidatePersistence:
     expected_routing_decision_id: UUID | None = None
     expected_routing_decision_hash: str | None = None
     stale_stages: frozenset[str] | None = None
-    verified_candidate_blob: VerifiedSynthesisCandidateBlob | None = None
-    base_canonical_sha256_verified: bool = False
+    candidate_blob: SynthesisCandidateBlobReference | None = None
 
 
 def build_candidate_from_validated_patch(
@@ -195,22 +193,18 @@ async def persist_candidate(
             set(persistence.stale_stages) if persistence.stale_stages is not None else None
         ),
     }
-    if persistence.verified_candidate_blob is not None:
-        if persistence.verified_candidate_blob.canonical_sha256 != candidate.canonical_sha256:
-            raise ValueError("synthesis_candidate_blob_hash_mismatch")
+    if persistence.candidate_blob is not None:
         if (
-            not persistence.base_canonical_sha256_verified
-            or persistence.expected_current_artifact_id is None
+            persistence.expected_current_artifact_id is None
             or persistence.expected_current_input_hash is None
             or persistence.expected_current_canonical_sha256 is None
         ):
-            raise ValueError("synthesis_candidate_base_fence_not_verified")
+            raise ValueError("synthesis_candidate_base_fence_required")
         store_kwargs["preuploaded_payload_ids"] = (
             None,
-            persistence.verified_candidate_blob.blob_id,
+            persistence.candidate_blob.blob_id,
             None,
         )
-        store_kwargs["expected_current_canonical_sha256_verified"] = True
 
     return await writer.store_synthesis_result(
         **store_kwargs,
