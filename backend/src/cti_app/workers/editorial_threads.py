@@ -13,6 +13,7 @@ from cti_app.application.editorial_thread_job_completion import (
     EditorialThreadJobCompletion,
     EditorialThreadRefusalOutcome,
     EditorialThreadReplyOutcome,
+    EditorialThreadSessionLostOutcome,
     EditorialThreadStateOutcome,
 )
 from cti_app.application.editorial_threads import EditorialThreadApplicationError
@@ -166,6 +167,19 @@ class EditorialThreadWorker:
             )
             return retry_after * 1000
         except ConversationTurnFailedError as error:
+            if error.submission_state == "pre_submission" and error.code in {
+                "conversation_unavailable",
+                "bridge_tab_closed",
+            }:
+                await self._completion.close(
+                    job_id,
+                    lease_token,
+                    EditorialThreadSessionLostOutcome(
+                        thread_id=record.thread.id,
+                        reason_code=error.code,
+                    ),
+                )
+                return None
             if error.status is ConversationTurnStatus.NEEDS_REVIEW or (
                 error.submission_state != "pre_submission"
             ):

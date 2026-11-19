@@ -92,6 +92,9 @@ export type EditorialThreadEventKind =
   | "reconciliation"
   | "generation";
 
+export type EditorialThreadReconciliationOutcome =
+  "reconciled_reply" | "not_submitted" | "still_unknown" | "session_lost";
+
 export type EditorialThreadSendGeneration =
   | "queued"
   | "waiting_for_capacity"
@@ -125,6 +128,7 @@ export interface EditorialThreadTimelineEvent {
   proposal_id: string | null;
   created_at: string;
   body: string | null;
+  reconciliation_outcome?: EditorialThreadReconciliationOutcome | null;
 }
 
 interface EditorialThreadReadBase {
@@ -145,6 +149,7 @@ export interface EditorialThreadOpenRead extends EditorialThreadReadBase {
   thread_id: string;
   origin: EditorialThreadBinding;
   binding_state: "valid";
+  previous_sessions: number[];
 }
 
 export interface EditorialThreadStaleRead extends EditorialThreadReadBase {
@@ -158,6 +163,18 @@ export type EditorialThreadRead =
   | EditorialThreadUnopenedRead
   | EditorialThreadOpenRead
   | EditorialThreadStaleRead;
+
+export interface EditorialThreadReconciliationResult {
+  thread_id: string;
+  outcome: EditorialThreadReconciliationOutcome;
+  message: string;
+}
+
+export interface EditorialThreadSessionStartResult {
+  kind: "session_started";
+  thread_id: string;
+  session_number: number;
+}
 
 const EDITORIAL_THREAD_TRANSPORT_UNCERTAIN_MESSAGE =
   "L’état de votre envoi est incertain. Consultez le fil avant de continuer.";
@@ -192,7 +209,11 @@ const ERROR_MESSAGES: Record<string, string> = {
   idempotency_conflict: "Cette clé est déjà associée à une autre demande.",
   idempotency_key_required:
     "Une clé d’idempotence est requise pour envoyer ce message.",
-  idempotency_key_invalid: "La clé d’idempotence est invalide.",
+  idempotency_key_invalid: "La clé d’idempotence doit être un UUID valide.",
+  editorial_thread_session_not_lost:
+    "La session actuelle est encore disponible. Aucune nouvelle discussion n’a été créée.",
+  session_lost:
+    "Cette session Bridge est perdue. Ouvrez un nouveau fil pour poursuivre",
   editorial_message_invalid: "Saisissez un message avant de l’envoyer.",
   editorial_thread_transport_uncertain:
     EDITORIAL_THREAD_TRANSPORT_UNCERTAIN_MESSAGE,
@@ -309,4 +330,35 @@ export async function sendEditorialThreadMessage(
       );
     }
   }
+}
+
+export async function reconcileEditorialThread(
+  subjectId: string,
+  occurrenceId: string,
+): Promise<EditorialThreadReconciliationResult> {
+  return request<EditorialThreadReconciliationResult>(
+    `/api/subjects/${encodeURIComponent(subjectId)}/editor/threads/${encodeURIComponent(occurrenceId)}/reconcile`,
+    {
+      method: "POST",
+      headers: { "Idempotency-Key": crypto.randomUUID() },
+    },
+  );
+}
+
+export async function startNewEditorialThreadSession(
+  subjectId: string,
+  occurrenceId: string,
+  idempotencyKey: string,
+): Promise<EditorialThreadSessionStartResult> {
+  return request<EditorialThreadSessionStartResult>(
+    `/api/subjects/${encodeURIComponent(subjectId)}/editor/threads/${encodeURIComponent(occurrenceId)}/entries`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Idempotency-Key": idempotencyKey,
+      },
+      body: JSON.stringify({ kind: "message", start_new_session: true }),
+    },
+  );
 }

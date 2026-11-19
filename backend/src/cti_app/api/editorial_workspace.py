@@ -8,9 +8,12 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, Resp
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 from starlette.responses import JSONResponse
 
+from cti_app.application.editorial_thread_common import is_valid_editorial_idempotency_key
 from cti_app.application.editorial_threads import (
     EditorialThreadApplicationError,
+    EditorialThreadReconciliationResult,
     EditorialThreadService,
+    EditorialThreadSessionStartResult,
 )
 from cti_app.application.editorial_workspace import EditorialWorkspaceService
 from cti_app.domain.editorial_thread import EditorialThreadEventKind
@@ -136,6 +139,9 @@ class EditorialThreadTimelineEventView(BaseModel):
     proposal_id: UUID | None
     created_at: datetime
     body: str | None
+    reconciliation_outcome: (
+        Literal["reconciled_reply", "not_submitted", "still_unknown", "session_lost"] | None
+    ) = None
 
 
 class UnopenedThreadReadView(BaseModel):
@@ -178,6 +184,7 @@ class OpenThreadReadView(BaseModel):
     event_sequence: int
     timeline: list[EditorialThreadTimelineEventView]
     etag: str
+    previous_sessions: list[int] = Field(default_factory=list)
 
 
 class StaleThreadReadView(BaseModel):
@@ -217,6 +224,28 @@ class EditorialThreadSendResultView(BaseModel):
         "failed",
         "cancelled",
     ]
+
+
+class EditorialThreadSessionStartResultView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["session_started"]
+    thread_id: UUID
+    session_number: int
+
+
+class EditorialThreadReconciliationResultView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    thread_id: UUID
+    outcome: Literal["reconciled_reply", "not_submitted", "still_unknown", "session_lost"]
+    message: str
+
+
+EditorialThreadEntryResultView = Annotated[
+    EditorialThreadSendResultView | EditorialThreadSessionStartResultView,
+    Field(discriminator="kind"),
+]
 
 
 EditorialThreadReadView = Annotated[
@@ -269,6 +298,11 @@ _ERROR_MESSAGES = {
     "editorial_thread_service_unavailable": "La discussion est temporairement indisponible.",
     "editorial_thread_conversation_missing": "La conversation de ce fil est indisponible.",
     "editorial_thread_job_missing": "La génération de ce message est indisponible.",
+    "editorial_thread_session_not_lost": (
+        "La session actuelle est encore disponible. Aucune nouvelle discussion n’a été créée."  # noqa: RUF001
+    ),
+    "session_lost": "Cette session Bridge est perdue. Ouvrez un nouveau fil pour poursuivre.",
+    "editorial_reconciliation_invalid": "La requête de réconciliation est invalide.",
 }
 
 
@@ -430,7 +464,7 @@ async def get_editorial_thread(
 
 @router.post(
     "/subjects/{subject_id}/editor/threads/{occurrence_id}/entries",
-    response_model=EditorialThreadSendResultView,
+    response_model=EditorialThreadEntryResultView,
     status_code=status.HTTP_202_ACCEPTED,
 )
 async def send_editorial_thread_entry(
@@ -439,7 +473,15 @@ async def send_editorial_thread_entry(
     request: Request,
     payload: dict[str, object] = Body(...),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
-) -> EditorialThreadSendResultView:
+) -> EditorialThreadSendResultView | EditorialThreadSessionStartResultView:
+    if idempotency_key is not None and not is_valid_editorial_idempotency_key(idempotency_key):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "idempotency_key_invalid",
+                "message": _ERROR_MESSAGES["idempotency_key_invalid"],
+            },
+        )
     if payload.get("kind") == "propose":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -456,7 +498,13 @@ async def send_editorial_thread_entry(
                 "message": _ERROR_MESSAGES["idempotency_key_required"],
             },
         )
-    if set(payload) != {"kind", "text"} or payload.get("kind") != "message":
+    start_new_session = payload.get("start_new_session") is True
+    allowed_shape = (
+        set(payload) == {"kind", "start_new_session"}
+        if start_new_session
+        else set(payload) == {"kind", "text"}
+    )
+    if not allowed_shape or payload.get("kind") != "message":
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={
@@ -465,7 +513,7 @@ async def send_editorial_thread_entry(
             },
         )
     text_value = payload.get("text")
-    if not isinstance(text_value, str):
+    if not start_new_session and not isinstance(text_value, str):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={
@@ -474,11 +522,26 @@ async def send_editorial_thread_entry(
             },
         )
     try:
-        result = await _thread_service(request).send_message(
+        actor_id = await _thread_actor_id(request)
+        service = _thread_service(request)
+        if start_new_session:
+            session: EditorialThreadSessionStartResult = await service.start_new_session(
+                subject_id,
+                occurrence_id,
+                idempotency_key=idempotency_key,
+            )
+            return EditorialThreadSessionStartResultView(
+                kind="session_started",
+                thread_id=session.thread_id,
+                session_number=session.session_number,
+            )
+        if not isinstance(text_value, str):
+            raise EditorialThreadApplicationError("editorial_message_invalid")
+        result = await service.send_message(
             subject_id,
             occurrence_id,
             text=text_value,
-            actor_id=await _thread_actor_id(request),
+            actor_id=actor_id,
             idempotency_key=idempotency_key,
         )
     except EditorialThreadApplicationError as error:
@@ -492,6 +555,8 @@ async def send_editorial_thread_entry(
             if code
             in {
                 "editorial_thread_busy",
+                "editorial_thread_session_not_lost",
+                "session_lost",
                 "reconciliation_required",
                 "idempotency_conflict",
             }
@@ -513,4 +578,70 @@ async def send_editorial_thread_entry(
         thread_id=result.thread_id,
         entry_id=result.entry_id,
         generation=result.generation.value,
+    )
+
+
+@router.post(
+    "/subjects/{subject_id}/editor/threads/{occurrence_id}/reconcile",
+    response_model=EditorialThreadReconciliationResultView,
+)
+async def reconcile_editorial_thread_entry(
+    subject_id: UUID,
+    occurrence_id: UUID,
+    request: Request,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> EditorialThreadReconciliationResultView:
+    if idempotency_key is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "idempotency_key_required",
+                "message": _ERROR_MESSAGES["idempotency_key_required"],
+            },
+        )
+    if not is_valid_editorial_idempotency_key(idempotency_key):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "idempotency_key_invalid",
+                "message": _ERROR_MESSAGES["idempotency_key_invalid"],
+            },
+        )
+    if await request.body():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": "editorial_reconciliation_invalid",
+                "message": _ERROR_MESSAGES["editorial_reconciliation_invalid"],
+            },
+        )
+    try:
+        result: EditorialThreadReconciliationResult = await _thread_service(request).reconcile(
+            subject_id,
+            occurrence_id,
+            actor_id=await _thread_actor_id(request),
+            idempotency_key=idempotency_key,
+        )
+    except EditorialThreadApplicationError as error:
+        code = error.code
+        response_status = (
+            status.HTTP_404_NOT_FOUND
+            if code == "thread_not_found"
+            else status.HTTP_409_CONFLICT
+            if code in {"reconciliation_required", "idempotency_conflict"}
+            else status.HTTP_400_BAD_REQUEST
+            if code == "idempotency_key_invalid"
+            else status.HTTP_503_SERVICE_UNAVAILABLE
+        )
+        raise HTTPException(
+            response_status,
+            detail={
+                "code": code,
+                "message": _ERROR_MESSAGES.get(code, "La réconciliation est indisponible."),
+            },
+        ) from None
+    return EditorialThreadReconciliationResultView(
+        thread_id=result.thread_id,
+        outcome=result.outcome.value,
+        message=result.message,
     )

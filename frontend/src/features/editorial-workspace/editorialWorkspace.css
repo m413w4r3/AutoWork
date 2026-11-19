@@ -709,7 +709,9 @@ main:has(> .editorial-route-state) > .app-header {
 
 .editorial-conversation__composer textarea:focus-visible,
 .editorial-conversation__suggestions button:focus-visible,
-.editorial-conversation__send:focus-visible {
+.editorial-conversation__send:focus-visible,
+.editorial-conversation__reconcile:focus-visible,
+.editorial-conversation__new-session:focus-visible {
   outline: 3px solid var(--editorial-brand);
   outline-offset: 2px;
 }
@@ -745,7 +747,28 @@ main:has(> .editorial-route-state) > .app-header {
   cursor: pointer;
 }
 
+.editorial-conversation__reconcile,
+.editorial-conversation__new-session {
+  min-height: 44px;
+  margin-top: 0.5rem;
+  padding: 0.55rem 0.85rem;
+  border: 1px solid var(--editorial-brand);
+  border-radius: 0.4rem;
+  color: var(--editorial-brand);
+  background: var(--editorial-white);
+  font: inherit;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.editorial-conversation__reconcile {
+  color: var(--editorial-white);
+  background: var(--editorial-brand);
+}
+
 .editorial-conversation__send:disabled,
+.editorial-conversation__reconcile:disabled,
+.editorial-conversation__new-session:disabled,
 .editorial-conversation__suggestions button:disabled {
   border-color: var(--editorial-control-border);
   color: var(--editorial-muted);

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import httpx
 import pytest
@@ -16,14 +17,23 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 
 from cti_app.api import editorial_workspace as editorial_workspace_api
 from cti_app.application.diagnostics import DiagnosticsLog
-from cti_app.application.editorial_threads import EditorialThreadService
+from cti_app.application.editorial_thread_job_completion import (
+    EditorialThreadJobCompletion,
+    EditorialThreadSessionLostOutcome,
+)
+from cti_app.application.editorial_threads import (
+    EditorialThreadApplicationError,
+    EditorialThreadService,
+)
 from cti_app.application.model_conversations import (
     EDITORIAL_DISCUSSION_PROMPT_VERSION,
     NO_EVIDENCE_PACK_HASH,
     ConversationBusyError,
+    ConversationNotFoundError,
     ConversationTurnFailedError,
     EditorialDiscussionContext,
     EditorialDiscussionObjective,
+    ModelConversationError,
     _editorial_discussion_prompt,
 )
 from cti_app.application.model_gateway import (
@@ -40,12 +50,14 @@ from cti_app.domain.editorial_thread import (
     EditorialThreadEventKind,
     EditorialThreadJob,
     EditorialThreadJobState,
+    EditorialThreadReconciliationOutcome,
     EditorialThreadRecord,
 )
 from cti_app.domain.editorial_workspace import EditorialSourceStage
 from cti_app.domain.model_conversations import (
     ConversationMode,
     ConversationPurpose,
+    ConversationStatus,
     ConversationTransport,
     ConversationTurnStatus,
     ModelConversation,
@@ -114,13 +126,38 @@ class MemoryThreadRepository:
         ]
         return max(matches, key=lambda item: item.thread.session_number, default=None)
 
+    async def get(self, thread_id: UUID) -> EditorialThreadRecord | None:
+        return next((record for record in self.records if record.thread.id == thread_id), None)
+
+    async def list_previous_sessions(
+        self,
+        subject_id: UUID,
+        production_run_id: UUID,
+        occurrence_id: UUID,
+        *,
+        before_session_number: int,
+    ) -> tuple[int, ...]:
+        return tuple(
+            sorted(
+                record.thread.session_number
+                for record in self.records
+                if record.thread.origin.subject_id == subject_id
+                and record.thread.origin.production_run_id == production_run_id
+                and record.thread.origin.occurrence_id == occurrence_id
+                and record.thread.session_number < before_session_number
+            )
+        )
+
     async def create_if_absent(self, thread: EditorialThread) -> EditorialThread:
         record = await self.get_current_by_occurrence(
             thread.origin.subject_id,
             thread.origin.production_run_id,
             thread.origin.occurrence_id,
         )
-        if record is not None:
+        if record is not None and not (
+            record.thread.bridge_status is EditorialBridgeStatus.SESSION_LOST
+            and thread.session_number == record.thread.session_number + 1
+        ):
             return record.thread
         self.records.append(EditorialThreadRecord(thread, ()))
         return thread
@@ -131,6 +168,50 @@ class MemoryThreadRepository:
     async def latest_job_for_thread(self, thread_id: UUID) -> EditorialThreadJob | None:
         jobs = [job for job in self.jobs.values() if job.thread_id == thread_id]
         return jobs[-1] if jobs else None
+
+    async def append_event(self, **values):
+        record = next(item for item in self.records if item.thread.id == values["thread_id"])
+        existing = next(
+            (
+                event
+                for event in record.events
+                if event.idempotency_key == values["idempotency_key"]
+            ),
+            None,
+        )
+        if existing is not None:
+            if existing.request_sha256 != values["request_sha256"]:
+                raise ValueError("idempotency_conflict")
+            return existing
+        thread, event = record.thread.append_event(
+            kind=values["kind"],
+            actor_id=values["actor_id"],
+            idempotency_key=values["idempotency_key"],
+            request_sha256=values["request_sha256"],
+            payload_blob_ref=values.get("payload_blob_ref"),
+            payload_sha256=values.get("payload_sha256"),
+            model_turn_id=values.get("model_turn_id"),
+        )
+        self.records = [
+            EditorialThreadRecord(thread, (*record.events, event))
+            if item.thread.id == thread.id
+            else item
+            for item in self.records
+        ]
+        return event
+
+    async def set_job_state(self, job_id: UUID, state: EditorialThreadJobState, **_kwargs) -> None:
+        self.jobs[job_id] = replace(
+            self.jobs[job_id], state=state, lease_token=None, lease_until=None
+        )
+
+    async def set_bridge_status(self, thread_id: UUID, status: EditorialBridgeStatus) -> None:
+        self.records = [
+            replace(item, thread=replace(item.thread, bridge_status=status))
+            if item.thread.id == thread_id
+            else item
+            for item in self.records
+        ]
 
     async def enqueue_message(
         self,
@@ -230,6 +311,22 @@ class WorkerThreadRepository:
 
     async def get(self, thread_id: UUID):
         return self.record if self.record.thread.id == thread_id else None
+
+    async def get_current_by_occurrence(
+        self, subject_id: UUID, production_run_id: UUID, occurrence_id: UUID
+    ):
+        origin = self.record.thread.origin
+        return (
+            self.record
+            if origin.subject_id == subject_id
+            and origin.production_run_id == production_run_id
+            and origin.occurrence_id == occurrence_id
+            else None
+        )
+
+    async def latest_job_for_thread(self, thread_id: UUID):
+        jobs = [job for job in self.jobs.values() if job.thread_id == thread_id]
+        return jobs[-1] if jobs else None
 
     async def set_job_state(
         self,
@@ -639,6 +736,8 @@ def make_service(monkeypatch: pytest.MonkeyPatch, *, binding_state: str = "valid
     class ModelConversations:
         def __init__(self) -> None:
             self.conversations: dict[UUID, object] = {}
+            self.reconcile_calls: list[tuple[UUID, UUID, str]] = []
+            self.turn_ids: dict[str, UUID] = {}
 
         async def get_or_create(
             self,
@@ -653,7 +752,21 @@ def make_service(monkeypatch: pytest.MonkeyPatch, *, binding_state: str = "valid
             expected_profile: str | None,
             requested_model: str | None,
             _editorial_thread_id: UUID | None,
+            _allow_missing_editorial_thread_recovery: bool = False,
         ):
+            existing = self.conversations.get(conversation_id)
+            if existing is not None and _editorial_thread_id is not None:
+                thread_record = await repository.get(_editorial_thread_id)
+                if thread_record is None and not _allow_missing_editorial_thread_recovery:
+                    raise ValueError("Conversation introuvable")
+                if (
+                    existing.id != conversation_id
+                    or existing.subject_id != subject_id
+                    or existing.purpose is not purpose
+                    or existing.transport is not transport
+                ):
+                    raise ValueError("Conversation introuvable")
+                return existing
             conversation = SimpleNamespace(
                 id=conversation_id,
                 subject_id=subject_id,
@@ -668,6 +781,39 @@ def make_service(monkeypatch: pytest.MonkeyPatch, *, binding_state: str = "valid
             )
             self.conversations[conversation_id] = conversation
             return conversation
+
+        def turn_id_for(self, key: str) -> UUID:
+            if key not in self.turn_ids:
+                self.turn_ids[key] = uuid4()
+            return self.turn_ids[key]
+
+        async def turn_content_by_idempotency_key(
+            self,
+            _conversation_id: UUID,
+            idempotency_key: str,
+            *,
+            context_subject_id: UUID,
+            editorial_thread_id: UUID | None = None,
+        ):
+            assert context_subject_id == subject_id
+            assert editorial_thread_id is not None
+            return SimpleNamespace(turn=SimpleNamespace(id=self.turn_id_for(idempotency_key)))
+
+        async def _reconcile_editorial_thread_turn(
+            self,
+            conversation_id: UUID,
+            *,
+            thread_id: UUID,
+            turn_idempotency_key: str,
+            context_subject_id: UUID,
+        ):
+            assert context_subject_id == subject_id
+            self.reconcile_calls.append((conversation_id, thread_id, turn_idempotency_key))
+            return SimpleNamespace(
+                outcome=EditorialThreadReconciliationOutcome.STILL_UNKNOWN,
+                turn_id=uuid4(),
+                reply=None,
+            )
 
     repository = MemoryThreadRepository()
     artifact_store = MemoryArtifactStore()
@@ -905,7 +1051,7 @@ async def test_message_body_shape_and_propose_are_rejected_with_stable_code() ->
         propose = await client.post(
             url,
             json={"kind": "propose", "text": "non"},
-            headers={"Idempotency-Key": "proposal-key"},
+            headers={"Idempotency-Key": "proposal-key-0001"},
         )
         missing_key = await client.post(url, json={"kind": "message", "text": "oui"})
 
@@ -913,6 +1059,674 @@ async def test_message_body_shape_and_propose_are_rejected_with_stable_code() ->
     assert propose.json()["detail"]["code"] == "propose_not_enabled"
     assert missing_key.status_code == 400
     assert missing_key.json()["detail"]["code"] == "idempotency_key_required"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_reads_exact_turn_without_second_gateway_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject_id, occurrence_id, service, repository, _store, _queued, conversations = make_service(
+        monkeypatch
+    )
+    await service.send_message(
+        subject_id,
+        occurrence_id,
+        text="Synthetic reconciliation message.",
+        actor_id=UUID("00000000-0000-0000-0000-000000000099"),
+        idempotency_key="send-message-key-0001",
+    )
+    record = repository.records[0]
+    job = next(iter(repository.jobs.values()))
+    repository.jobs[job.id] = replace(job, state=EditorialThreadJobState.RECONCILIATION_REQUIRED)
+    repository.records[0] = replace(
+        record,
+        thread=replace(record.thread, bridge_status=EditorialBridgeStatus.RECONCILIATION_REQUIRED),
+    )
+    send_event = record.events[0]
+    app = FastAPI()
+    app.include_router(editorial_workspace_api.router)
+    url = f"/api/subjects/{subject_id}/editor/threads/{occurrence_id}/reconcile"
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
+    ) as client:
+        response = await client.post(
+            url,
+            headers={"Idempotency-Key": "reconcile-key-0001"},
+        )
+        replay = await client.post(url, headers={"Idempotency-Key": "reconcile-key-0001"})
+
+    assert response.status_code == 200
+    assert replay.status_code == 200
+    assert response.json() == replay.json()
+    assert response.json()["outcome"] == "still_unknown"
+    assert conversations.reconcile_calls == [
+        (
+            record.thread.model_conversation_id,
+            record.thread.id,
+            f"editorial-thread-message:{send_event.id}",
+        )
+    ]
+    assert repository.jobs[job.id].state is EditorialThreadJobState.RECONCILIATION_REQUIRED
+    assert repository.records[0].events[-1].kind is EditorialThreadEventKind.RECONCILIATION
+
+
+@pytest.mark.asyncio
+async def test_reconcile_key_is_bound_to_the_current_pending_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject_id, occurrence_id, service, repository, _store, _queued, conversations = make_service(
+        monkeypatch
+    )
+    actor_id = UUID("00000000-0000-0000-0000-000000000099")
+    await service.send_message(
+        subject_id,
+        occurrence_id,
+        text="Synthetic first turn.",
+        actor_id=actor_id,
+        idempotency_key="first-send-key-0001",
+    )
+    first_job = next(iter(repository.jobs.values()))
+    first_record = repository.records[0]
+    repository.jobs[first_job.id] = replace(
+        first_job, state=EditorialThreadJobState.RECONCILIATION_REQUIRED
+    )
+    repository.records[0] = replace(
+        first_record,
+        thread=replace(
+            first_record.thread,
+            bridge_status=EditorialBridgeStatus.RECONCILIATION_REQUIRED,
+        ),
+    )
+
+    async def not_submitted(*_args, turn_idempotency_key: str, **_kwargs):
+        return SimpleNamespace(
+            outcome=EditorialThreadReconciliationOutcome.NOT_SUBMITTED,
+            turn_id=conversations.turn_id_for(turn_idempotency_key),
+            reply=None,
+        )
+
+    conversations._reconcile_editorial_thread_turn = not_submitted
+    key = "reconcile-key-0001"
+    first_result = await service.reconcile(
+        subject_id,
+        occurrence_id,
+        actor_id=actor_id,
+        idempotency_key=key,
+    )
+    assert first_result.outcome is EditorialThreadReconciliationOutcome.NOT_SUBMITTED
+
+    await service.send_message(
+        subject_id,
+        occurrence_id,
+        text="Synthetic second turn.",
+        actor_id=actor_id,
+        idempotency_key="second-send-key-0001",
+    )
+    second_job = next(job for job in repository.jobs.values() if job.id != first_job.id)
+    current_record = repository.records[0]
+    repository.jobs[second_job.id] = replace(
+        second_job, state=EditorialThreadJobState.RECONCILIATION_REQUIRED
+    )
+    repository.records[0] = replace(
+        current_record,
+        thread=replace(
+            current_record.thread,
+            bridge_status=EditorialBridgeStatus.RECONCILIATION_REQUIRED,
+        ),
+    )
+
+    with pytest.raises(EditorialThreadApplicationError) as error:
+        await service.reconcile(
+            subject_id,
+            occurrence_id,
+            actor_id=actor_id,
+            idempotency_key=key,
+        )
+
+    assert error.value.code == "idempotency_conflict"
+    assert repository.jobs[second_job.id].state is EditorialThreadJobState.RECONCILIATION_REQUIRED
+    reconciliation_events = [
+        event
+        for event in repository.records[0].events
+        if event.kind is EditorialThreadEventKind.RECONCILIATION
+    ]
+    assert len(reconciliation_events) == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_rejects_unexpected_request_body() -> None:
+    app = FastAPI()
+    app.include_router(editorial_workspace_api.router)
+    url = (
+        "/api/subjects/00000000-0000-0000-0000-000000000001/editor/threads/"
+        "00000000-0000-0000-0000-000000000002/reconcile"
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
+    ) as client:
+        response = await client.post(
+            url,
+            content=b'{"unexpected":"synthetic"}',
+            headers={
+                "Content-Type": "application/json",
+                "Idempotency-Key": "unexpected-body-key-0001",
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "editorial_reconciliation_invalid"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route_kind", ["send", "new_session", "reconcile", "propose"])
+async def test_editorial_thread_routes_reject_prose_idempotency_keys(
+    monkeypatch: pytest.MonkeyPatch,
+    route_kind: str,
+) -> None:
+    subject_id, occurrence_id, _service, repository, _store, _queued, _conversations = make_service(
+        monkeypatch
+    )
+    app = FastAPI()
+    app.include_router(editorial_workspace_api.router)
+    entries_url = f"/api/subjects/{subject_id}/editor/threads/{occurrence_id}/entries"
+    url = (
+        f"/api/subjects/{subject_id}/editor/threads/{occurrence_id}/reconcile"
+        if route_kind == "reconcile"
+        else entries_url
+    )
+    payloads = {
+        "send": {"kind": "message", "text": "Synthetic message."},
+        "new_session": {"kind": "message", "start_new_session": True},
+        "propose": {"kind": "propose", "text": "Synthetic proposal."},
+    }
+    request_body = None if route_kind == "reconcile" else payloads[route_kind]
+    caller_prose = "Patient Jane Doe SSN 123-45-6789"
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
+    ) as client:
+        response = await client.post(
+            url,
+            json=request_body,
+            headers={"Idempotency-Key": caller_prose},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "idempotency_key_invalid"
+    assert response.json()["detail"]["message"] == "La clé d’idempotence est invalide."  # noqa: RUF001
+    assert all(
+        event.idempotency_key != caller_prose
+        for record in repository.records
+        for event in record.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_lost_session_start_recovers_after_conversation_commit_crash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject_id, occurrence_id, service, repository, _store, _queued, conversations = make_service(
+        monkeypatch
+    )
+    await service.send_message(
+        subject_id,
+        occurrence_id,
+        text="Synthetic turn proving an existing session.",
+        actor_id=UUID("00000000-0000-0000-0000-000000000099"),
+        idempotency_key="initial-session-send-01",
+    )
+    previous_conversation_count = len(conversations.conversations)
+    original = repository.records[0]
+    repository.records[0] = replace(
+        original,
+        thread=replace(original.thread, bridge_status=EditorialBridgeStatus.SESSION_LOST),
+    )
+    original_create = repository.create_if_absent
+    fail_once = True
+
+    async def crash_after_conversation_commit(thread: EditorialThread):
+        nonlocal fail_once
+        if fail_once:
+            fail_once = False
+            raise RuntimeError("simulated crash after conversation commit")
+        return await original_create(thread)
+
+    repository.create_if_absent = crash_after_conversation_commit
+
+    with pytest.raises(EditorialThreadApplicationError) as first_error:
+        await service.start_new_session(
+            subject_id,
+            occurrence_id,
+            idempotency_key="lost-session-action-key-01",
+        )
+    assert first_error.value.code == "editorial_thread_service_unavailable"
+    assert len(conversations.conversations) == previous_conversation_count + 1
+    assert len(repository.records) == 1
+
+    created_conversation = next(
+        conversation
+        for conversation in conversations.conversations.values()
+        if conversation.thread_id != repository.records[0].thread.id
+    )
+    original_subject_id = created_conversation.subject_id
+    created_conversation.subject_id = uuid4()
+    with pytest.raises(EditorialThreadApplicationError) as mismatch_error:
+        await service.start_new_session(
+            subject_id,
+            occurrence_id,
+            idempotency_key="lost-session-action-key-01",
+        )
+    assert mismatch_error.value.code == "editorial_thread_service_unavailable"
+    assert len(repository.records) == 1
+    created_conversation.subject_id = original_subject_id
+
+    recovered = await service.start_new_session(
+        subject_id,
+        occurrence_id,
+        idempotency_key="lost-session-action-key-01",
+    )
+
+    assert recovered.session_number == 2
+    assert recovered.thread_id == repository.records[-1].thread.id
+    assert repository.records[-1].thread.model_conversation_id in conversations.conversations
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "reply", "expected_bridge_status", "expected_job_state"),
+    [
+        (
+            EditorialThreadReconciliationOutcome.RECONCILED_REPLY,
+            "Réponse durable.",
+            EditorialBridgeStatus.REPLY_AVAILABLE,
+            EditorialThreadJobState.COMPLETE,
+        ),
+        (
+            EditorialThreadReconciliationOutcome.NOT_SUBMITTED,
+            None,
+            EditorialBridgeStatus.READY,
+            EditorialThreadJobState.COMPLETE,
+        ),
+        (
+            EditorialThreadReconciliationOutcome.STILL_UNKNOWN,
+            None,
+            EditorialBridgeStatus.RECONCILIATION_REQUIRED,
+            EditorialThreadJobState.RECONCILIATION_REQUIRED,
+        ),
+        (
+            EditorialThreadReconciliationOutcome.SESSION_LOST,
+            None,
+            EditorialBridgeStatus.SESSION_LOST,
+            EditorialThreadJobState.COMPLETE,
+        ),
+    ],
+)
+async def test_reconcile_records_each_typed_outcome_and_replays_result(
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: EditorialThreadReconciliationOutcome,
+    reply: str | None,
+    expected_bridge_status: EditorialBridgeStatus,
+    expected_job_state: EditorialThreadJobState,
+) -> None:
+    subject_id, occurrence_id, service, repository, _store, queued, conversations = make_service(
+        monkeypatch
+    )
+    await service.send_message(
+        subject_id,
+        occurrence_id,
+        text="Synthetic reconciliation message.",
+        actor_id=UUID("00000000-0000-0000-0000-000000000099"),
+        idempotency_key="outcome-send-key",
+    )
+    record = repository.records[0]
+    job = next(iter(repository.jobs.values()))
+    repository.jobs[job.id] = replace(job, state=EditorialThreadJobState.RECONCILIATION_REQUIRED)
+    repository.records[0] = replace(
+        record,
+        thread=replace(record.thread, bridge_status=EditorialBridgeStatus.RECONCILIATION_REQUIRED),
+    )
+
+    async def report_outcome(*_args, turn_idempotency_key: str, **_kwargs):
+        return SimpleNamespace(
+            outcome=outcome,
+            turn_id=conversations.turn_id_for(turn_idempotency_key),
+            reply=reply,
+        )
+
+    conversations._reconcile_editorial_thread_turn = report_outcome
+    app = FastAPI()
+    app.include_router(editorial_workspace_api.router)
+    url = f"/api/subjects/{subject_id}/editor/threads/{occurrence_id}/reconcile"
+    headers = {"Idempotency-Key": f"result-{outcome.value}"}
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
+    ) as client:
+        first = await client.post(url, headers=headers)
+        replay = await client.post(url, headers=headers)
+
+    assert first.status_code == replay.status_code == 200
+    assert first.json() == replay.json()
+    assert first.json()["outcome"] == outcome.value
+    assert repository.jobs[job.id].state is expected_job_state
+    assert repository.records[0].thread.bridge_status is expected_bridge_status
+    assert repository.records[0].events[-1].kind is EditorialThreadEventKind.RECONCILIATION
+    assert len(conversations.reconcile_calls) == 0
+    replies = [
+        event
+        for event in repository.records[0].events
+        if event.kind is EditorialThreadEventKind.BRIDGE_REPLY
+    ]
+    assert len(replies) == int(outcome is EditorialThreadReconciliationOutcome.RECONCILED_REPLY)
+
+    if outcome is EditorialThreadReconciliationOutcome.SESSION_LOST:
+        expected_copy = "Cette session Bridge est perdue. Ouvrez un nouveau fil pour poursuivre."
+        assert first.json()["message"] == expected_copy
+        lost_event = repository.records[0].events[-1]
+        assert lost_event.payload_blob_ref is not None
+        assert json.loads(_store.payloads[lost_event.payload_blob_ref])["message"] == expected_copy
+        entries_url = f"/api/subjects/{subject_id}/editor/threads/{occurrence_id}/entries"
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
+        ) as client:
+            blocked_send = await client.post(
+                entries_url,
+                json={"kind": "message", "text": "No new send in the lost session."},
+                headers={"Idempotency-Key": "send-in-lost-session"},
+            )
+            started = await client.post(
+                entries_url,
+                json={"kind": "message", "start_new_session": True},
+                headers={"Idempotency-Key": "new-session-after-loss"},
+            )
+            opened = await client.get(f"/api/subjects/{subject_id}/editor/threads/{occurrence_id}")
+        assert blocked_send.status_code == 409
+        assert blocked_send.json()["detail"]["code"] == "session_lost"
+        assert len(queued) == 1
+        assert started.status_code == 202
+        assert started.json()["session_number"] == 2
+        assert opened.status_code == 200
+        assert opened.json()["previous_sessions"] == [1]
+        old, new = repository.records
+        assert old.thread.origin == new.thread.origin
+        assert old.thread.model_conversation_id != new.thread.model_conversation_id
+
+
+@pytest.mark.asyncio
+async def test_lost_session_requires_new_thread(monkeypatch: pytest.MonkeyPatch) -> None:
+    subject_id, occurrence_id, _service, _repository, _store, _queued, _conversations = (
+        make_service(monkeypatch)
+    )
+    app = FastAPI()
+    app.include_router(editorial_workspace_api.router)
+    url = f"/api/subjects/{subject_id}/editor/threads/{occurrence_id}/entries"
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
+    ) as client:
+        response = await client.post(
+            url,
+            json={"kind": "message", "start_new_session": True},
+            headers={"Idempotency-Key": "new-session-key-0001"},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "editorial_thread_session_not_lost"
+
+
+@pytest.mark.asyncio
+async def test_propose_api_is_refused_until_unique_adoption_is_ready() -> None:
+    app = FastAPI()
+    app.include_router(editorial_workspace_api.router)
+    url = (
+        "/api/subjects/00000000-0000-0000-0000-000000000001/editor/threads/"
+        "00000000-0000-0000-0000-000000000002/entries"
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
+    ) as client:
+        response = await client.post(
+            url,
+            json={"kind": "propose", "text": "synthetic"},
+            headers={"Idempotency-Key": "proposal-key-0001"},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "propose_not_enabled"
+
+
+@pytest.mark.asyncio
+async def test_thread_binding_stale_blocks_message_and_propose_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject_id, occurrence_id, _service, repository, _store, queued, _conversations = make_service(
+        monkeypatch, binding_state="stale"
+    )
+    app = FastAPI()
+    app.include_router(editorial_workspace_api.router)
+    url = f"/api/subjects/{subject_id}/editor/threads/{occurrence_id}/entries"
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
+    ) as client:
+        response = await client.post(
+            url,
+            json={"kind": "message", "text": "synthetic"},
+            headers={"Idempotency-Key": "stale-binding-key"},
+        )
+
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "thread_not_found"
+    assert repository.records == []
+    assert queued == []
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
+    ) as client:
+        proposal = await client.post(
+            url,
+            json={"kind": "propose", "text": "synthetic"},
+            headers={"Idempotency-Key": "stale-proposal-key-0001"},
+        )
+
+    # The API's M3 activation gate is evaluated before thread binding.
+    assert proposal.status_code == 409
+    assert proposal.json()["detail"]["code"] == "propose_not_enabled"
+    assert repository.records == []
+    assert queued == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_returns_neutral_404_for_ambiguous_occurrence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject_id, occurrence_id, _service, repository, _store, queued, conversations = make_service(
+        monkeypatch, binding_state="ambiguous"
+    )
+    app = FastAPI()
+    app.include_router(editorial_workspace_api.router)
+    url = f"/api/subjects/{subject_id}/editor/threads/{occurrence_id}/reconcile"
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
+    ) as client:
+        response = await client.post(url, headers={"Idempotency-Key": "ambiguous-reconcile"})
+
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "thread_not_found"
+    assert repository.records == []
+    assert queued == []
+    assert conversations.reconcile_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reconcile_action", "expected_outcome"),
+    [
+        ("completed", EditorialThreadReconciliationOutcome.RECONCILED_REPLY),
+        ("not_found", EditorialThreadReconciliationOutcome.STILL_UNKNOWN),
+        ("pre_submission", EditorialThreadReconciliationOutcome.NOT_SUBMITTED),
+    ],
+)
+async def test_private_reconciliation_uses_only_exact_persisted_run_without_resubmitting(
+    tmp_path: Path,
+    reconcile_action: str,
+    expected_outcome: EditorialThreadReconciliationOutcome,
+) -> None:
+    answer = "Réponse Bridge durable vérifiée."
+
+    class ReconcilingBridgeAdapter(_ScriptedBridgeAdapter):
+        def __init__(self) -> None:
+            super().__init__(answer)
+            self.reconcile_calls: list[str] = []
+
+        async def invoke(self, request, *, role, output_schema=None):
+            del role, output_schema
+            self.calls.append(request)
+            if reconcile_action == "pre_submission":
+                raise BridgeTransportError(
+                    "bridge_unreachable",
+                    "Échec avant soumission.",
+                    retryable=True,
+                    submission_request=False,
+                    submission_state="pre_submission",
+                )
+            raise BridgeTransportError(
+                "bridge_timeout",
+                "Résultat externe incertain.",
+                retryable=True,
+                phase="submission",
+                submission_request=True,
+                submission_state="submission_attempted",
+            )
+
+        async def reconcile_bridge_submission(self, request_id: str):
+            self.reconcile_calls.append(request_id)
+            if reconcile_action == "not_found":
+                raise BridgeTransportError(
+                    "bridge_run_not_found",
+                    "Aucun résultat durable n'a été retrouvé.",
+                    retryable=False,
+                    status_code=404,
+                )
+            return AdapterResult(
+                status=AdapterResultStatus.COMPLETED,
+                provider=self.provider,
+                requested_model=self.requested_model,
+                actual_model_version=self.requested_model,
+                usage=ModelUsage(input_tokens=3, output_tokens=5, total_tokens=8),
+                output_text=answer,
+            )
+
+    subject_id, thread_id, conversation_id = uuid4(), uuid4(), uuid4()
+    origin = EditorialThreadBinding(
+        subject_id=subject_id,
+        production_run_id=uuid4(),
+        occurrence_id=uuid4(),
+        artifact_id=uuid4(),
+        artifact_version=1,
+        canonical_sha256="a" * 64,
+    )
+    thread = EditorialThread(
+        id=thread_id,
+        origin=origin,
+        model_conversation_id=conversation_id,
+        bridge_status=EditorialBridgeStatus.READY,
+        next_sequence=1,
+        version=1,
+    )
+    conversation = ModelConversation(
+        id=conversation_id,
+        provider=ModelProvider.OPENAI,
+        transport=ConversationTransport.CHATGPT_BRIDGE,
+        purpose=ConversationPurpose.EDITORIAL_DISCUSSION,
+        title="Discussion éditoriale synthétique",
+        subject_id=subject_id,
+        status=ConversationStatus.READY,
+    )
+    adapter = ReconcilingBridgeAdapter()
+    service, state = _build_service(adapter, tmp_path, known_subject_ids={subject_id})
+    state.conversations[conversation_id] = conversation
+    record = EditorialThreadRecord(thread, ())
+    thread_repository = SimpleNamespace(
+        get=lambda requested_id: _async_value(record if requested_id == thread_id else None)
+    )
+
+    def editorial_uow_factory():
+        uow = state()
+        uow.editorial_threads = thread_repository
+        return uow
+
+    service._uow_factory = editorial_uow_factory
+    context = EditorialDiscussionContext(
+        section_title="Section synthétique",
+        block_text="Paragraphe synthétique à discuter.",
+        adjacent_paragraphs=(),
+        admitted_evidence=(),
+        history=(),
+        evidence_pack_hash="b" * 64,
+        context_sha256="c" * 64,
+        effective_tlp=TLP.CLEAR,
+    )
+    turn_key = "editorial-thread-message:synthetic-event"
+
+    with pytest.raises(ConversationTurnFailedError) as failure:
+        await service.add_turn(
+            conversation_id,
+            message="Clarifier le paragraphe.",
+            mode=ConversationMode.FRESH,
+            external_llm_allowed=True,
+            idempotency_key=turn_key,
+            correlation_id="synthetic-job",
+            context_subject_id=subject_id,
+            _editorial_thread_id=thread_id,
+            editorial_objective=EditorialDiscussionObjective.MESSAGE,
+            editorial_context=context,
+        )
+    assert failure.value.status is (
+        ConversationTurnStatus.FAILED
+        if reconcile_action == "pre_submission"
+        else ConversationTurnStatus.NEEDS_REVIEW
+    )
+
+    result = await service._reconcile_editorial_thread_turn(
+        conversation_id,
+        thread_id=thread_id,
+        turn_idempotency_key=turn_key,
+        context_subject_id=subject_id,
+    )
+    replay = await service._reconcile_editorial_thread_turn(
+        conversation_id,
+        thread_id=thread_id,
+        turn_idempotency_key=turn_key,
+        context_subject_id=subject_id,
+    )
+
+    assert result.outcome is expected_outcome
+    expected_reply = (
+        answer
+        if expected_outcome is EditorialThreadReconciliationOutcome.RECONCILED_REPLY
+        else None
+    )
+    assert result.reply == expected_reply
+    assert replay == result
+    assert len(adapter.calls) == 1
+    expected_reconcile_calls = {
+        "completed": 1,
+        "not_found": 2,
+        "pre_submission": 0,
+    }[reconcile_action]
+    assert len(adapter.reconcile_calls) == expected_reconcile_calls
+    persisted_turn = state.turns[next(iter(state.turns))]
+    expected_turn_status = {
+        EditorialThreadReconciliationOutcome.RECONCILED_REPLY: ConversationTurnStatus.SUCCEEDED,
+        EditorialThreadReconciliationOutcome.STILL_UNKNOWN: ConversationTurnStatus.NEEDS_REVIEW,
+        EditorialThreadReconciliationOutcome.NOT_SUBMITTED: ConversationTurnStatus.FAILED,
+    }[expected_outcome]
+    assert persisted_turn.status is expected_turn_status
 
 
 @pytest.mark.asyncio
@@ -1042,6 +1856,123 @@ async def test_message_uncertain_submission_requires_reconciliation_without_resu
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("run_status", "submission_state", "turn_status", "turn_error_code", "expected_state"),
+    [
+        (
+            ModelRunStatus.FAILED,
+            ModelSubmissionState.NOT_SUBMITTED,
+            ConversationTurnStatus.FAILED,
+            "conversation_unavailable",
+            EditorialThreadJobState.COMPLETE,
+        ),
+        (
+            ModelRunStatus.NEEDS_REVIEW,
+            ModelSubmissionState.EXTERNAL_STATE_UNKNOWN,
+            ConversationTurnStatus.NEEDS_REVIEW,
+            "conversation_unavailable",
+            EditorialThreadJobState.RECONCILIATION_REQUIRED,
+        ),
+        (
+            ModelRunStatus.FAILED,
+            ModelSubmissionState.NOT_SUBMITTED,
+            ConversationTurnStatus.FAILED,
+            "bridge_server_error",
+            EditorialThreadJobState.RECONCILIATION_REQUIRED,
+        ),
+    ],
+)
+async def test_worker_marks_session_lost_only_from_exact_pre_submission_proof(
+    run_status: ModelRunStatus,
+    submission_state: ModelSubmissionState,
+    turn_status: ConversationTurnStatus,
+    turn_error_code: str,
+    expected_state: EditorialThreadJobState,
+) -> None:
+    _worker, repository, artifact_store, model_conversations, _message = make_worker_runtime()
+    job_id = next(iter(repository.jobs))
+    job = repository.jobs[job_id]
+    lease_token = uuid4()
+    repository.jobs[job_id] = replace(
+        job,
+        state=EditorialThreadJobState.RUNNING,
+        lease_token=lease_token,
+    )
+    model_run = ModelRun(
+        provider=ModelProvider.OPENAI,
+        model_role=ModelRole.DRAFTING,
+        requested_model="chatgpt-web",
+        prompt_template_id=EDITORIAL_DISCUSSION_PROMPT_ID,
+        prompt_template_version=EDITORIAL_DISCUSSION_PROMPT_VERSION,
+        authorized_input_hash="a" * 64,
+        evidence_pack_hash="b" * 64,
+        parameters={},
+        status=run_status,
+        submission_state=submission_state,
+        error_code=turn_error_code,
+    )
+    turn = ModelConversationTurn(
+        conversation_id=repository.record.thread.model_conversation_id,
+        sequence=1,
+        model_run_id=model_run.id,
+        input_blob_reference="blob://synthetic-input",
+        input_sha256="c" * 64,
+        idempotency_key=f"editorial-thread-message:{job.send_event_id}",
+        objective="editorial_message",
+        status=turn_status,
+        error_code=turn_error_code,
+    )
+
+    class CompletionUow:
+        editorial_threads = repository
+        model_conversation_turns = SimpleNamespace(
+            get_by_idempotency_key=lambda _key: _async_value(turn)
+        )
+        model_runs = SimpleNamespace(get=lambda _run_id: _async_value(model_run))
+
+        async def commit(self) -> None:
+            return None
+
+    @asynccontextmanager
+    async def uow_factory():
+        yield CompletionUow()
+
+    completion = EditorialThreadJobCompletion(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+    )
+    await completion.close(
+        job_id,
+        lease_token,
+        EditorialThreadSessionLostOutcome(
+            thread_id=repository.record.thread.id,
+            reason_code="conversation_unavailable",
+        ),
+    )
+
+    assert repository.jobs[job_id].state is expected_state
+    if expected_state is EditorialThreadJobState.COMPLETE:
+        assert repository.record.thread.bridge_status is EditorialBridgeStatus.SESSION_LOST
+        event = repository.record.events[-1]
+        assert event.kind is EditorialThreadEventKind.RECONCILIATION
+        assert event.payload_blob_ref is not None
+        payload = json.loads(artifact_store.payloads[event.payload_blob_ref])
+        assert payload["outcome"] == "session_lost"
+        assert payload["message"] == (
+            "Cette session Bridge est perdue. Ouvrez un nouveau fil pour poursuivre."
+        )
+    else:
+        assert (
+            repository.record.thread.bridge_status is EditorialBridgeStatus.RECONCILIATION_REQUIRED
+        )
+        assert all(
+            event.kind is not EditorialThreadEventKind.RECONCILIATION
+            for event in repository.record.events
+        )
+    assert model_conversations.gateway_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_message_capacity_wait_is_durable_and_not_reclaimed_early() -> None:
     worker, repository, _store, model_conversations, _message = make_worker_runtime(
         failure=ConversationBusyError("conversation busy")
@@ -1151,7 +2082,8 @@ async def test_message_body_never_enters_logs_traces_or_error_telemetry(
     assert sentinel not in caplog.text
     assert sentinel not in repr(repository.record)
     assert sentinel not in repr(repository.jobs[job_id])
-    assert repository.jobs[job_id].state is EditorialThreadJobState.FAILED
+    assert repository.jobs[job_id].state is EditorialThreadJobState.RECONCILIATION_REQUIRED
+    assert repository.record.thread.bridge_status is EditorialBridgeStatus.RECONCILIATION_REQUIRED
 
 
 @pytest.mark.asyncio
@@ -1362,6 +2294,62 @@ def editorial_message_arguments(subject_id: UUID, thread_id: UUID, context):
 
 
 @pytest.mark.asyncio
+async def test_private_conversation_recovery_validates_deterministic_thread_identity(
+    tmp_path: Path,
+) -> None:
+    subject_id, thread_id = uuid4(), uuid4()
+    conversation_id = uuid5(NAMESPACE_URL, f"editorial-thread-conversation:{thread_id}")
+    service, state = _build_service(
+        _ScriptedBridgeAdapter("Unused recovery adapter"),
+        tmp_path,
+        known_subject_ids={subject_id},
+    )
+    thread_repository = SimpleNamespace(get=lambda _thread_id: _async_value(None))
+    base_uow_factory = service._uow_factory
+
+    def editorial_uow_factory():
+        uow = base_uow_factory()
+        uow.editorial_threads = thread_repository
+        return uow
+
+    service._uow_factory = editorial_uow_factory
+    arguments = {
+        "provider": ModelProvider.OPENAI,
+        "transport": ConversationTransport.CHATGPT_BRIDGE,
+        "purpose": ConversationPurpose.EDITORIAL_DISCUSSION,
+        "title": "Discussion éditoriale",
+        "edition_id": None,
+        "subject_id": subject_id,
+        "expected_profile": None,
+        "requested_model": None,
+        "_editorial_thread_id": thread_id,
+        "_allow_missing_editorial_thread_recovery": True,
+    }
+
+    created = await service.get_or_create(conversation_id, **arguments)
+    recovered = await service.get_or_create(conversation_id, **arguments)
+
+    assert recovered.id == created.id == conversation_id
+    assert recovered.subject_id == subject_id
+    assert recovered.purpose is ConversationPurpose.EDITORIAL_DISCUSSION
+    assert recovered.transport is ConversationTransport.CHATGPT_BRIDGE
+
+    original = state.conversations[conversation_id]
+    for corrupted in (
+        replace(original, subject_id=uuid4()),
+        replace(original, purpose=ConversationPurpose.PIVOT_RESEARCH),
+        replace(original, transport=ConversationTransport.OPENAI_RESPONSES),
+    ):
+        state.conversations[conversation_id] = corrupted
+        with pytest.raises(ModelConversationError):
+            await service.get_or_create(conversation_id, **arguments)
+        state.conversations[conversation_id] = original
+
+    with pytest.raises(ConversationNotFoundError):
+        await service.get_or_create(uuid4(), **arguments)
+
+
+@pytest.mark.asyncio
 async def test_editorial_replay_submits_persisted_not_submitted_run_once(
     tmp_path: Path,
 ) -> None:
@@ -1530,6 +2518,170 @@ async def test_worker_replay_attaches_durable_model_output_and_closes_job(
     assert artifact_store.payloads[reply.payload_blob_ref] == (
         b"Recovered worker reply after durable ModelRun success"
     )
+
+
+@pytest.mark.asyncio
+async def test_overlapping_reconcile_worker_turn_replay_and_second_reconcile_submit_once(
+    tmp_path: Path,
+) -> None:
+    class SimulatedCrash(BaseException):
+        pass
+
+    worker, repository, artifact_store, _fake_conversations, _message = make_worker_runtime()
+    thread = repository.record.thread
+    assert thread.model_conversation_id is not None
+    adapter = _ScriptedBridgeAdapter("Recovered concurrent Bridge reply")
+    model_service, state = _build_service(
+        adapter,
+        tmp_path,
+        known_subject_ids={thread.origin.subject_id},
+    )
+    state.conversations[thread.model_conversation_id] = ModelConversation(
+        id=thread.model_conversation_id,
+        provider=ModelProvider.OPENAI,
+        transport=ConversationTransport.CHATGPT_BRIDGE,
+        purpose=ConversationPurpose.EDITORIAL_DISCUSSION,
+        title="Synthetic editorial discussion",
+        subject_id=thread.origin.subject_id,
+    )
+    base_uow_factory = model_service._uow_factory
+
+    def editorial_uow_factory():
+        uow = base_uow_factory()
+        uow.editorial_threads = repository
+        return uow
+
+    model_service._uow_factory = editorial_uow_factory
+    worker._model_conversations = model_service
+    original_add_turn = model_service.add_turn
+    worker_turn_call: dict[str, object] = {}
+
+    async def capture_worker_turn(conversation_id, **kwargs):
+        worker_turn_call["conversation_id"] = conversation_id
+        worker_turn_call["kwargs"] = kwargs
+        return await original_add_turn(conversation_id, **kwargs)
+
+    model_service.add_turn = capture_worker_turn
+    real_execute = model_service._gateway.execute
+    gateway_calls = 0
+
+    async def crash_after_durable_success(request, role, **kwargs):
+        nonlocal gateway_calls
+        execution = await real_execute(request, role, **kwargs)
+        gateway_calls += 1
+        if gateway_calls == 1:
+            raise SimulatedCrash()
+        return execution
+
+    model_service._gateway.execute = crash_after_durable_success
+    job_id = next(iter(repository.jobs))
+    with pytest.raises(SimulatedCrash):
+        await worker.process(job_id)
+    assert len(adapter.calls) == 1
+    running_turn = next(iter(state.turns.values()))
+    assert running_turn.status is ConversationTurnStatus.RUNNING
+
+    repository.jobs[job_id] = replace(
+        repository.jobs[job_id],
+        state=EditorialThreadJobState.RECONCILIATION_REQUIRED,
+        lease_token=None,
+        lease_until=None,
+    )
+    repository.record = replace(
+        repository.record,
+        thread=replace(
+            repository.record.thread,
+            bridge_status=EditorialBridgeStatus.RECONCILIATION_REQUIRED,
+        ),
+    )
+    recovered_turn = await original_add_turn(
+        worker_turn_call["conversation_id"],
+        **worker_turn_call["kwargs"],
+    )
+    assert recovered_turn.id == running_turn.id
+    assert recovered_turn.status is ConversationTurnStatus.SUCCEEDED
+
+    binding = thread.origin
+    resolution = SimpleNamespace(
+        record=SimpleNamespace(
+            subject_id=binding.subject_id,
+            production_run_id=binding.production_run_id,
+        ),
+        entry=SimpleNamespace(block_id=binding.occurrence_id),
+        binding_state="valid",
+        artifact_id=binding.artifact_id,
+        artifact_version=binding.artifact_version,
+        canonical_sha256=binding.canonical_sha256,
+    )
+
+    class Workspace:
+        async def resolve_occurrence(self, _subject_id: UUID, _occurrence_id: UUID):
+            return resolution
+
+    thread_service = EditorialThreadService(
+        uow_factory=editorial_uow_factory,
+        workspace_service=Workspace(),
+        artifact_store=artifact_store,
+        model_conversations=model_service,
+    )
+    original_reconcile = model_service._reconcile_editorial_thread_turn
+    barrier = asyncio.Barrier(3)
+
+    async def synchronized_reconcile(*args, **kwargs):
+        await barrier.wait()
+        return await original_reconcile(*args, **kwargs)
+
+    model_service._reconcile_editorial_thread_turn = synchronized_reconcile
+    reconcile_key = "concurrent-reconcile-key-01"
+
+    async def worker_turn_replay():
+        await barrier.wait()
+        assert worker_turn_call["conversation_id"] == thread.model_conversation_id
+        return await original_add_turn(
+            worker_turn_call["conversation_id"],
+            **worker_turn_call["kwargs"],
+        )
+
+    first, turn_replay, second, worker_replay = await asyncio.gather(
+        thread_service.reconcile(
+            binding.subject_id,
+            binding.occurrence_id,
+            actor_id=UUID("00000000-0000-0000-0000-000000000099"),
+            idempotency_key=reconcile_key,
+        ),
+        worker_turn_replay(),
+        thread_service.reconcile(
+            binding.subject_id,
+            binding.occurrence_id,
+            actor_id=UUID("00000000-0000-0000-0000-000000000099"),
+            idempotency_key=reconcile_key,
+        ),
+        worker.process(job_id),
+    )
+
+    assert first.outcome is second.outcome is EditorialThreadReconciliationOutcome.RECONCILED_REPLY
+    assert first == second
+    assert turn_replay.id == running_turn.id
+    assert worker_replay is None
+    assert len(adapter.calls) == 1
+    assert state.turns[running_turn.id].status is ConversationTurnStatus.SUCCEEDED
+    assert repository.jobs[job_id].state is EditorialThreadJobState.COMPLETE
+    assert repository.record.thread.bridge_status is EditorialBridgeStatus.REPLY_AVAILABLE
+    reconciliation_events = [
+        event
+        for event in repository.record.events
+        if event.kind is EditorialThreadEventKind.RECONCILIATION
+        and event.idempotency_key == reconcile_key
+    ]
+    replies = [
+        event
+        for event in repository.record.events
+        if event.kind is EditorialThreadEventKind.BRIDGE_REPLY
+        and event.idempotency_key == f"editorial-thread-reconciled-reply:{job_id}"
+    ]
+    assert len(reconciliation_events) == 1
+    assert len(replies) == 1
+    assert reconciliation_events[0].model_turn_id == replies[0].model_turn_id == running_turn.id
 
 
 @pytest.mark.asyncio

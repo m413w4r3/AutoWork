@@ -3,12 +3,16 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from datetime import UTC, date, datetime, timedelta
-from uuid import uuid4
+from typing import cast
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import pytest
 from sqlalchemy import delete, func, inspect, select, text, update
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
+from cti_app.application.blob_storage import BlobStore
+from cti_app.application.model_conversations import ModelConversationService
+from cti_app.application.model_gateway import ModelGateway
 from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition
 from cti_app.domain.editorial_thread import (
@@ -18,6 +22,8 @@ from cti_app.domain.editorial_thread import (
     EditorialThreadJobState,
 )
 from cti_app.domain.entities import Subject
+from cti_app.domain.model_conversations import ConversationPurpose, ConversationTransport
+from cti_app.domain.model_runs import ModelProvider
 from cti_app.domain.production import ProductionArtifact, ProductionArtifactStage, ProductionRun
 from cti_app.infrastructure.database.models.editorial_threads import (
     EditorialThreadEventRow,
@@ -95,6 +101,51 @@ async def _event(thread_id, sequence: int, idempotency_key: str) -> EditorialThr
         proposal_id=None,
         model_turn_id=None,
     )
+
+
+@pytest.mark.asyncio
+async def test_editorial_session_retry_recovers_after_conversation_commit(
+    migrated_postgres_url: str,
+) -> None:
+    engine = create_postgres_engine(migrated_postgres_url)
+    session_factory = create_session_factory(engine)
+    try:
+        thread = await _create_thread_context(session_factory)
+        session_thread_id = uuid4()
+        conversation_id = uuid5(NAMESPACE_URL, f"editorial-thread-conversation:{session_thread_id}")
+        service = ModelConversationService(
+            lambda: SqlAlchemyUnitOfWork(session_factory),
+            cast(ModelGateway, object()),
+            cast(BlobStore, object()),
+        )
+        arguments = {
+            "provider": ModelProvider.OPENAI,
+            "transport": ConversationTransport.CHATGPT_BRIDGE,
+            "purpose": ConversationPurpose.EDITORIAL_DISCUSSION,
+            "title": "Discussion éditoriale",
+            "edition_id": None,
+            "subject_id": thread.subject_id,
+            "expected_profile": None,
+            "requested_model": None,
+            "_editorial_thread_id": session_thread_id,
+            "_allow_missing_editorial_thread_recovery": True,
+        }
+
+        # The first commit persists the private conversation. Omitting the
+        # subsequent thread insert models a crash between the two commits.
+        created = await service.get_or_create(conversation_id, **arguments)
+        recovered = await service.get_or_create(conversation_id, **arguments)
+
+        assert recovered.id == created.id == conversation_id
+        assert recovered.subject_id == thread.subject_id
+        assert recovered.purpose is ConversationPurpose.EDITORIAL_DISCUSSION
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            assert await uow.editorial_threads.get(session_thread_id) is None
+            persisted = await uow.model_conversations.get(conversation_id)
+        assert persisted is not None
+        assert persisted.id == recovered.id
+    finally:
+        await engine.dispose()
 
 
 async def test_thread_uniqueness_append_only_origin_jobs_and_no_sql_prose(

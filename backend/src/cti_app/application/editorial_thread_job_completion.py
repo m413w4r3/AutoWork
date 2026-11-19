@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
+from cti_app.application.editorial_conversation_turns import (
+    has_persisted_not_submitted_proof,
+)
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.domain.editorial_thread import (
@@ -14,7 +18,9 @@ from cti_app.domain.editorial_thread import (
     EditorialThreadEvent,
     EditorialThreadEventKind,
     EditorialThreadJobState,
+    EditorialThreadReconciliationOutcome,
 )
+from cti_app.domain.model_conversations import ConversationTurnStatus
 from cti_app.domain.model_runs import ModelSubmissionState
 
 
@@ -45,11 +51,18 @@ class EditorialThreadFailureOutcome:
     thread_id: UUID
 
 
+@dataclass(frozen=True, slots=True)
+class EditorialThreadSessionLostOutcome:
+    thread_id: UUID
+    reason_code: str
+
+
 type EditorialThreadJobOutcome = (
     EditorialThreadReplyOutcome
     | EditorialThreadRefusalOutcome
     | EditorialThreadStateOutcome
     | EditorialThreadFailureOutcome
+    | EditorialThreadSessionLostOutcome
 )
 
 
@@ -93,6 +106,8 @@ class EditorialThreadJobCompletion:
                     EditorialThreadJobState.FAILED,
                     EditorialBridgeStatus.READY,
                 )
+        elif isinstance(outcome, EditorialThreadSessionLostOutcome):
+            await self._session_lost(job_id, lease_token, outcome)
         else:
             await self._set_state(
                 job_id,
@@ -178,6 +193,86 @@ class EditorialThreadJobCompletion:
             await uow.editorial_threads.set_bridge_status(thread_id, EditorialBridgeStatus.REFUSED)
             await uow.commit()
 
+    async def _session_lost(
+        self,
+        job_id: UUID,
+        lease_token: UUID,
+        outcome: EditorialThreadSessionLostOutcome,
+    ) -> None:
+        allowed_reasons = {"conversation_unavailable", "bridge_tab_closed"}
+        if (
+            outcome.reason_code not in allowed_reasons
+            or await self._submission_state_for_job(job_id)
+            is not ModelSubmissionState.NOT_SUBMITTED
+            or await self._turn_error_code_for_job(job_id) != outcome.reason_code
+        ):
+            await self._set_state(
+                job_id,
+                outcome.thread_id,
+                lease_token,
+                EditorialThreadJobState.RECONCILIATION_REQUIRED,
+                EditorialBridgeStatus.RECONCILIATION_REQUIRED,
+            )
+            return
+        async with self._uow_factory() as uow:
+            job = await uow.editorial_threads.get_job(job_id)
+            record = await uow.editorial_threads.get(outcome.thread_id)
+            if job is None or record is None or job.thread_id != outcome.thread_id:
+                return
+            body = json.dumps(
+                {
+                    "outcome": EditorialThreadReconciliationOutcome.SESSION_LOST.value,
+                    "message": (
+                        "Cette session Bridge est perdue. Ouvrez un nouveau fil pour poursuivre."
+                    ),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            payload_sha256 = hashlib.sha256(body).hexdigest()
+            payload_blob_ref = await self._artifact_store.put_bytes(
+                body,
+                bucket="editorial-thread-events",
+                mime_type="text/plain; charset=utf-8",
+            )
+            await uow.editorial_threads.append_event(
+                thread_id=outcome.thread_id,
+                kind=EditorialThreadEventKind.RECONCILIATION,
+                actor_id=None,
+                idempotency_key=f"editorial-thread-session-lost:{job_id}",
+                request_sha256=hashlib.sha256(
+                    f"editorial-thread-session-lost:{job_id}:{job.send_event_id}".encode()
+                ).hexdigest(),
+                payload_blob_ref=payload_blob_ref,
+                payload_sha256=payload_sha256,
+            )
+            await uow.editorial_threads.set_job_state(
+                job_id, EditorialThreadJobState.COMPLETE, lease_token=lease_token
+            )
+            await uow.editorial_threads.set_bridge_status(
+                outcome.thread_id, EditorialBridgeStatus.SESSION_LOST
+            )
+            await uow.commit()
+
+    async def _turn_error_code_for_job(self, job_id: UUID) -> str | None:
+        async with self._uow_factory() as uow:
+            job = await uow.editorial_threads.get_job(job_id)
+            if job is None:
+                return None
+            turn = await uow.model_conversation_turns.get_by_idempotency_key(
+                f"editorial-thread-message:{job.send_event_id}"
+            )
+            record = await uow.editorial_threads.get(job.thread_id)
+            if (
+                turn is None
+                or record is None
+                or turn.conversation_id != record.thread.model_conversation_id
+                or turn.objective != "editorial_message"
+            ):
+                return None
+            return turn.error_code
+
     async def _set_state(
         self,
         job_id: UUID,
@@ -212,7 +307,18 @@ class EditorialThreadJobCompletion:
             turn = await uow.model_conversation_turns.get_by_idempotency_key(
                 f"editorial-thread-message:{job.send_event_id}"
             )
-            if turn is None:
-                return ModelSubmissionState.NOT_SUBMITTED
+            if (
+                turn is None
+                or turn.status
+                not in {
+                    ConversationTurnStatus.FAILED,
+                    ConversationTurnStatus.NEEDS_REVIEW,
+                }
+                or turn.conversation_id != record.thread.model_conversation_id
+                or turn.objective != "editorial_message"
+            ):
+                return None
             run = await uow.model_runs.get(turn.model_run_id)
-            return run.submission_state if run is not None else None
+            if run is None or not has_persisted_not_submitted_proof(turn, run):
+                return None
+            return ModelSubmissionState.NOT_SUBMITTED

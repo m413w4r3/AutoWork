@@ -77,6 +77,27 @@ class SqlAlchemyEditorialThreadRepository:
         row = await self._session.get(EditorialThreadRow, thread_id)
         return await self._record(row) if row is not None else None
 
+    async def list_previous_sessions(
+        self,
+        subject_id: UUID,
+        production_run_id: UUID,
+        occurrence_id: UUID,
+        *,
+        before_session_number: int,
+    ) -> tuple[int, ...]:
+        """List prior session numbers without loading their private timelines."""
+        rows = await self._session.scalars(
+            select(EditorialThreadRow.session_number)
+            .where(
+                EditorialThreadRow.subject_id == subject_id,
+                EditorialThreadRow.production_run_id == production_run_id,
+                EditorialThreadRow.occurrence_id == occurrence_id,
+                EditorialThreadRow.session_number < before_session_number,
+            )
+            .order_by(EditorialThreadRow.session_number.asc())
+        )
+        return tuple(rows)
+
     async def create_if_absent(self, thread: EditorialThread) -> EditorialThread:
         origin = thread.origin
         await self._session.scalar(

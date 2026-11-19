@@ -188,6 +188,15 @@ class EditorialThreadRepository(Protocol):
 
     async def get(self, thread_id: UUID) -> EditorialThreadRecord | None: ...
 
+    async def list_previous_sessions(
+        self,
+        subject_id: UUID,
+        production_run_id: UUID,
+        occurrence_id: UUID,
+        *,
+        before_session_number: int,
+    ) -> tuple[int, ...]: ...
+
     async def create_if_absent(self, thread: EditorialThread) -> EditorialThread: ...
 
     async def append_event(

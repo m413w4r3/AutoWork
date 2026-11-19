@@ -153,6 +153,25 @@ class _MemoryThreadRepository:
         ]
         return max(candidates, key=lambda record: record.thread.session_number, default=None)
 
+    async def list_previous_sessions(
+        self,
+        subject_id: UUID,
+        production_run_id: UUID,
+        occurrence_id: UUID,
+        *,
+        before_session_number: int,
+    ) -> tuple[int, ...]:
+        return tuple(
+            sorted(
+                record.thread.session_number
+                for record in self.records
+                if record.thread.origin.subject_id == subject_id
+                and record.thread.origin.production_run_id == production_run_id
+                and record.thread.origin.occurrence_id == occurrence_id
+                and record.thread.session_number < before_session_number
+            )
+        )
+
     async def append_event(
         self,
         *,

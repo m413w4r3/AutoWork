@@ -5,7 +5,7 @@ import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from cti_app.application.blob_storage import BlobStore
 from cti_app.application.blobs import BlobCatalogService
@@ -17,6 +17,7 @@ from cti_app.application.editorial_conversation_turns import (
     EditorialDiscussionContext,
     EditorialDiscussionObjective,
     EditorialThreadPathResult,
+    EditorialTurnReconciliation,
 )
 from cti_app.application.editorial_conversation_turns import (
     _editorial_discussion_prompt as _editorial_discussion_prompt,
@@ -374,6 +375,7 @@ class ModelConversationService:
         expected_profile: str | None,
         requested_model: str | None,
         _editorial_thread_id: UUID | None = None,
+        _allow_missing_editorial_thread_recovery: bool = False,
     ) -> ModelConversation:
         """Reuse a conversation the caller can rederive a stable id for.
 
@@ -389,6 +391,13 @@ class ModelConversationService:
             and _editorial_thread_id is not None
         ):
             raise EditorialPurposeReservedError()
+        if _allow_missing_editorial_thread_recovery and (
+            purpose is not ConversationPurpose.EDITORIAL_DISCUSSION
+            or _editorial_thread_id is None
+            or conversation_id
+            != uuid5(NAMESPACE_URL, f"editorial-thread-conversation:{_editorial_thread_id}")
+        ):
+            raise ConversationNotFoundError("Conversation introuvable")
         async with self._uow_factory() as uow:
             existing = await uow.model_conversations.get(conversation_id)
             if existing is not None:
@@ -396,6 +405,22 @@ class ModelConversationService:
                 if existing.purpose is ConversationPurpose.EDITORIAL_DISCUSSION:
                     if _editorial_thread_id is None:
                         raise ConversationNotFoundError("Conversation introuvable")
+                    if _allow_missing_editorial_thread_recovery:
+                        if (
+                            existing.id != conversation_id
+                            or existing.provider is not provider
+                            or existing.transport is not transport
+                            or existing.purpose is not purpose
+                            or existing.title != title
+                            or existing.edition_id != edition_id
+                            or existing.subject_id != subject_id
+                            or existing.expected_profile != expected_profile
+                            or existing.requested_model != requested_model
+                        ):
+                            raise ConversationNotFoundError("Conversation introuvable")
+                        thread_record = await uow.editorial_threads.get(_editorial_thread_id)
+                        if thread_record is None:
+                            return existing
                     await self._require_editorial_thread_path(uow, existing, _editorial_thread_id)
                 elif _editorial_thread_id is not None:
                     raise EditorialPurposeReservedError()
@@ -515,9 +540,17 @@ class ModelConversationService:
         idempotency_key: str,
         *,
         context_subject_id: UUID | None = None,
+        editorial_thread_id: UUID | None = None,
     ) -> ConversationTurnContent | None:
         """Load one persisted turn without replaying a conversation's full history."""
-        await self.get(conversation_id, context_subject_id=context_subject_id)
+        if editorial_thread_id is None:
+            await self.get(conversation_id, context_subject_id=context_subject_id)
+        else:
+            await self.get_editorial_thread_conversation(
+                conversation_id,
+                thread_id=editorial_thread_id,
+                context_subject_id=context_subject_id,
+            )
         async with self._uow_factory() as uow:
             turn = await uow.model_conversation_turns.get_by_idempotency_key(idempotency_key)
             if turn is None:
@@ -1103,6 +1136,23 @@ class ModelConversationService:
             _editorial_thread_id=_editorial_thread_id,
             editorial_objective=editorial_objective,
             editorial_context=editorial_context,
+        )
+
+    async def _reconcile_editorial_thread_turn(
+        self,
+        conversation_id: UUID,
+        *,
+        thread_id: UUID,
+        turn_idempotency_key: str,
+        context_subject_id: UUID,
+    ) -> EditorialTurnReconciliation:
+        """Keep editorial recovery behind the private conversation-turn seam."""
+        return await self._editorial_turns.reconcile_turn(
+            self,
+            conversation_id,
+            thread_id=thread_id,
+            turn_idempotency_key=turn_idempotency_key,
+            context_subject_id=context_subject_id,
         )
 
     async def _seal_interrupted_turn(

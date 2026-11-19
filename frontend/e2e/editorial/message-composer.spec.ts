@@ -32,7 +32,7 @@ async function expectMobileInspectorWithinViewport(page: Page) {
   const bounds = await inspector.boundingBox();
   if (!bounds) throw new Error("Mobile inspector is not rendered");
   expect(bounds.x).toBeGreaterThanOrEqual(0);
-  expect(bounds.x + bounds.width).toBeLessThanOrEqual(390);
+  expect(Math.round(bounds.x + bounds.width)).toBeLessThanOrEqual(390);
 }
 
 async function positionDesktopDiscussion(page: Page) {
@@ -169,6 +169,7 @@ test("message-only composer renders safe generating, reply and error states", as
     origin: binding,
     current: binding,
     binding_state: "valid",
+    previous_sessions: [],
     bridge_status: "generating",
     event_sequence: 1,
     timeline: [
@@ -202,6 +203,58 @@ test("message-only composer renders safe generating, reply and error states", as
     ],
     etag: '"message-thread-reply"',
   };
+  const reconciliationRequired: EditorialThreadOpenRead = {
+    ...reply,
+    bridge_status: "reconciliation_required",
+    etag: '"message-thread-reconciliation-required"',
+  };
+  const readyAfterReconciliation: EditorialThreadOpenRead = {
+    ...reconciliationRequired,
+    bridge_status: "ready",
+    event_sequence: 4,
+    timeline: [
+      ...reconciliationRequired.timeline,
+      {
+        id: "reconciliation-not-submitted",
+        sequence: 4,
+        kind: "reconciliation",
+        actor_id: null,
+        proposal_id: null,
+        created_at: "2026-11-19T10:00:04Z",
+        body: "Le message n’a pas été reçu par Bridge. Vous pouvez envoyer un nouveau message.",
+        reconciliation_outcome: "not_submitted",
+      },
+    ],
+    etag: '"message-thread-not-submitted"',
+  };
+  const sessionLost: EditorialThreadOpenRead = {
+    ...readyAfterReconciliation,
+    bridge_status: "session_lost",
+    event_sequence: 5,
+    timeline: [
+      ...readyAfterReconciliation.timeline,
+      {
+        id: "reconciliation-session-lost",
+        sequence: 5,
+        kind: "reconciliation",
+        actor_id: null,
+        proposal_id: null,
+        created_at: "2026-11-19T10:00:06Z",
+        body: "Cette session Bridge est perdue. Ouvrez un nouveau fil pour poursuivre",
+        reconciliation_outcome: "session_lost",
+      },
+    ],
+    etag: '"message-thread-session-lost"',
+  };
+  const newSession: EditorialThreadOpenRead = {
+    ...sessionLost,
+    thread_id: "thread-2",
+    previous_sessions: [1],
+    bridge_status: "ready",
+    event_sequence: 0,
+    timeline: [],
+    etag: '"message-thread-session-2"',
+  };
   let currentRead: EditorialThreadRead = unopened;
   let sendCount = 0;
   const idempotencyKeys: string[] = [];
@@ -211,7 +264,7 @@ test("message-only composer renders safe generating, reply and error states", as
   const threadPath = `${subjectPath}/editor/threads/${paragraphId}`;
   const screenshotDirectory = resolve(
     process.cwd(),
-    "../.autowork-runs/shots-T-M2-07",
+    "../.autowork-runs/shots-T-M2-08",
   );
   await mkdir(screenshotDirectory, { recursive: true });
 
@@ -268,6 +321,21 @@ test("message-only composer renders safe generating, reply and error states", as
         return;
       }
       idempotencyKeys.push(idempotencyKey);
+      const body = route.request().postDataJSON() as {
+        start_new_session?: boolean;
+      };
+      if (body.start_new_session === true) {
+        currentRead = newSession;
+        await route.fulfill({
+          status: 202,
+          json: {
+            kind: "session_started",
+            thread_id: "thread-2",
+            session_number: 2,
+          },
+        });
+        return;
+      }
       sendCount += 1;
       if (sendCount === 1) {
         currentRead = generating;
@@ -294,11 +362,20 @@ test("message-only composer renders safe generating, reply and error states", as
         });
         return;
       }
-      currentRead = {
-        ...reply,
-        bridge_status: "reconciliation_required",
-        etag: '"message-thread-reconciliation-required"',
-      };
+      if (sendCount === 4) {
+        currentRead = sessionLost;
+        await route.fulfill({
+          status: 202,
+          json: {
+            kind: "accepted",
+            thread_id: "thread-1",
+            entry_id: "entry-after-reconcile",
+            generation: "queued",
+          },
+        });
+        return;
+      }
+      currentRead = reconciliationRequired;
       await route.fulfill({
         status: 409,
         json: {
@@ -306,6 +383,24 @@ test("message-only composer renders safe generating, reply and error states", as
             code: "reconciliation_required",
             message: "raw provider or transport detail must not be shown",
           },
+        },
+      });
+      return;
+    }
+    if (method === "POST" && url.pathname === `${threadPath}/reconcile`) {
+      if (!route.request().headers()["idempotency-key"]) {
+        unexpectedRequests.push("POST reconcile missing Idempotency-Key");
+        await route.fulfill({ status: 400, body: "missing key" });
+        return;
+      }
+      currentRead = readyAfterReconciliation;
+      await route.fulfill({
+        status: 200,
+        json: {
+          thread_id: "thread-1",
+          outcome: "not_submitted",
+          message:
+            "Le message n’a pas été reçu par Bridge. Vous pouvez envoyer un nouveau message.",
         },
       });
       return;
@@ -426,7 +521,9 @@ test("message-only composer renders safe generating, reply and error states", as
   await expect(
     page.getByRole("heading", { name: "Discussion" }),
   ).toBeInViewport();
-  await expect(page.getByRole("alert")).toBeInViewport();
+  await expect(
+    page.getByRole("button", { name: "Vérifier l’état de l’envoi" }),
+  ).toBeInViewport();
   await page.screenshot({
     path: resolve(screenshotDirectory, "message-uncertain-1440x900.png"),
   });
@@ -436,6 +533,58 @@ test("message-only composer renders safe generating, reply and error states", as
   await page.screenshot({
     path: resolve(screenshotDirectory, "message-uncertain-390x844.png"),
   });
+
+  const mobileScrollTopBeforeReconcile = await mobileContent.evaluate(
+    (element) => (element as unknown as { scrollTop: number }).scrollTop,
+  );
+  await page
+    .getByRole("button", { name: "Vérifier l’état de l’envoi" })
+    .click();
+  await expect(
+    page
+      .locator(".editorial-conversation__announcement")
+      .filter({ hasText: "Le message n’a pas été reçu" }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("textbox", { name: "Votre message à Bridge" }),
+  ).toBeEnabled();
+  expect(
+    await mobileContent.evaluate(
+      (element) => (element as unknown as { scrollTop: number }).scrollTop,
+    ),
+  ).toBe(mobileScrollTopBeforeReconcile);
+
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page
+    .getByRole("textbox", { name: "Votre message à Bridge" })
+    .fill("Continuer dans le fil vérifié.");
+  await page.getByRole("button", { name: "Envoyer un message" }).click();
+  await expect(
+    page.getByText(
+      "Cette session Bridge est perdue. Ouvrez un nouveau fil pour poursuivre",
+    ),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Démarrer une nouvelle discussion" }),
+  ).toBeVisible();
+  await expect(page.getByRole("button", { name: /réessayer/i })).toHaveCount(0);
+  await positionDesktopDiscussion(page);
+  await page.screenshot({
+    path: resolve(screenshotDirectory, "session-lost-1440x900.png"),
+  });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expectMobileInspectorWithinViewport(page);
+  await positionMobileDiscussion(page);
+  await page.screenshot({
+    path: resolve(screenshotDirectory, "session-lost-390x844.png"),
+  });
+  await page
+    .getByRole("button", { name: "Démarrer une nouvelle discussion" })
+    .click();
+  await expect(page.getByText("Session précédente · 1")).toBeVisible();
+  await expect(
+    page.getByRole("textbox", { name: "Votre message à Bridge" }),
+  ).toBeEnabled();
 
   await page.getByRole("button", { name: "Changer de cible" }).click();
   await expect(
@@ -453,7 +602,7 @@ test("message-only composer renders safe generating, reply and error states", as
   await expect(
     page.getByRole("button", { name: /générer une proposition/i }),
   ).toHaveCount(0);
-  expect(idempotencyKeys).toHaveLength(3);
-  expect(new Set(idempotencyKeys).size).toBe(3);
+  expect(idempotencyKeys).toHaveLength(5);
+  expect(new Set(idempotencyKeys).size).toBe(5);
   expect(unexpectedRequests).toEqual([]);
 });

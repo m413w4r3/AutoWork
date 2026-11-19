@@ -58,6 +58,13 @@ class EditorialThreadEventKind(StrEnum):
     GENERATION = "generation"
 
 
+class EditorialThreadReconciliationOutcome(StrEnum):
+    RECONCILED_REPLY = "reconciled_reply"
+    NOT_SUBMITTED = "not_submitted"
+    STILL_UNKNOWN = "still_unknown"
+    SESSION_LOST = "session_lost"
+
+
 class EditorialThreadJobState(StrEnum):
     QUEUED = "queued"
     WAITING_FOR_CAPACITY = "waiting_for_capacity"

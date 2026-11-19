@@ -241,6 +241,7 @@ describe("EditorialConversation", () => {
       origin: binding,
       current: { ...binding, artifact_version: 4, artifact_id: "artifact-2" },
       binding_state: "valid",
+      previous_sessions: [],
       bridge_status: "reply_available",
       event_sequence: 1,
       timeline: [
@@ -282,6 +283,7 @@ describe("EditorialConversation", () => {
       origin: binding,
       current: binding,
       binding_state: "valid",
+      previous_sessions: [],
       bridge_status: "ready",
       event_sequence: 0,
       timeline: [],
@@ -358,6 +360,7 @@ describe("EditorialConversation", () => {
       origin: binding,
       current: binding,
       binding_state: "valid",
+      previous_sessions: [],
       bridge_status: "generating",
       event_sequence: 1,
       timeline: [
@@ -573,5 +576,341 @@ describe("EditorialConversation", () => {
     expect(
       fetchMock.mock.calls.filter(([, init]) => init?.method === "POST"),
     ).toHaveLength(1);
+  });
+
+  it("reconciles an uncertain send and unlocks only after a persisted no-submit outcome", async () => {
+    const uncertain: EditorialThreadRead = {
+      kind: "open",
+      thread_id: "thread-1",
+      origin: binding,
+      current: binding,
+      binding_state: "valid",
+      previous_sessions: [],
+      bridge_status: "reconciliation_required",
+      event_sequence: 2,
+      timeline: [],
+      etag: '"thread-uncertain"',
+    };
+    const ready: EditorialThreadRead = {
+      ...uncertain,
+      bridge_status: "ready",
+      event_sequence: 3,
+      etag: '"thread-not-submitted"',
+    };
+    let current = uncertain;
+    const fetchMock = vi.fn<typeof fetch>((input, init) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
+      if (init?.method === "POST" && url.endsWith("/reconcile")) {
+        current = ready;
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              thread_id: "thread-1",
+              outcome: "not_submitted",
+              message:
+                "Le message n’a pas été reçu… Vous pouvez en envoyer un nouveau.",
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          ),
+        );
+      }
+      return Promise.resolve(threadResponse(current));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, refetchInterval: false } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <EditorialConversation
+          subjectId={binding.subject_id}
+          occurrenceId={binding.occurrence_id}
+          snapshotId="snapshot-1"
+          targetLabel="Paragraphe synthétique"
+          onChangeTarget={() => undefined}
+        />
+      </QueryClientProvider>,
+    );
+
+    const composer = await screen.findByRole("textbox", {
+      name: "Votre message à Bridge",
+    });
+    expect(composer).toBeDisabled();
+    expect(
+      screen.queryByRole("button", { name: "Générer une proposition" }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Vérifier l’état de l’envoi" }),
+    );
+
+    expect(
+      await screen.findByText(
+        "Le message n’a pas été reçu… Vous pouvez en envoyer un nouveau.",
+      ),
+    ).toBeVisible();
+    await waitFor(() => expect(composer).toBeEnabled());
+    const reconcileCall = fetchMock.mock.calls.find(
+      ([, init]) => String(init?.method).toUpperCase() === "POST",
+    );
+    expect(reconcileCall?.[0]).toContain("/reconcile");
+    expect(
+      new Headers(reconcileCall?.[1]?.headers).get("Idempotency-Key"),
+    ).toBeTruthy();
+  });
+
+  it("starts a new discussion after session loss and shows prior sessions read-only", async () => {
+    const lost: EditorialThreadRead = {
+      kind: "open",
+      thread_id: "thread-1",
+      origin: binding,
+      current: binding,
+      binding_state: "valid",
+      previous_sessions: [],
+      bridge_status: "session_lost",
+      event_sequence: 1,
+      timeline: [],
+      etag: '"thread-lost"',
+    };
+    const currentSession: EditorialThreadRead = {
+      ...lost,
+      thread_id: "thread-2",
+      bridge_status: "ready",
+      previous_sessions: [1],
+      event_sequence: 0,
+      timeline: [],
+      etag: '"thread-session-two"',
+    };
+    let current = lost;
+    const fetchMock = vi.fn<typeof fetch>((input, init) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
+      if (init?.method === "POST" && url.endsWith("/entries")) {
+        expect(init.body).toBe(
+          JSON.stringify({ kind: "message", start_new_session: true }),
+        );
+        current = currentSession;
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              kind: "session_started",
+              thread_id: "thread-2",
+              session_number: 2,
+            }),
+            { status: 202, headers: { "Content-Type": "application/json" } },
+          ),
+        );
+      }
+      return Promise.resolve(threadResponse(current));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, refetchInterval: false } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <EditorialConversation
+          subjectId={binding.subject_id}
+          occurrenceId={binding.occurrence_id}
+          snapshotId="snapshot-1"
+          targetLabel="Paragraphe synthétique"
+          onChangeTarget={() => undefined}
+        />
+      </QueryClientProvider>,
+    );
+
+    expect(
+      await screen.findByText(
+        "Cette session Bridge est perdue. Ouvrez un nouveau fil pour poursuivre",
+      ),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("button", { name: "Générer une proposition" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Démarrer une nouvelle discussion" }),
+    ).toBeEnabled();
+    expect(screen.queryByRole("button", { name: /réessayer/i })).toBeNull();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Démarrer une nouvelle discussion" }),
+    );
+
+    expect(await screen.findByText("Session précédente · 1")).toBeVisible();
+    expect(
+      await screen.findByRole("textbox", { name: "Votre message à Bridge" }),
+    ).toBeEnabled();
+    expect(screen.getByText("Nouvelle discussion démarrée.")).toBeVisible();
+  });
+
+  it("shows the French message for rejected idempotency keys", async () => {
+    const lost: EditorialThreadRead = {
+      kind: "open",
+      thread_id: "thread-1",
+      origin: binding,
+      current: binding,
+      binding_state: "valid",
+      previous_sessions: [],
+      bridge_status: "session_lost",
+      event_sequence: 1,
+      timeline: [],
+      etag: '"thread-lost"',
+    };
+    const fetchMock = vi.fn<typeof fetch>((_input, init) => {
+      if (init?.method === "POST") {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              detail: {
+                code: "idempotency_key_invalid",
+                message: "raw backend detail",
+              },
+            }),
+            { status: 422, headers: { "Content-Type": "application/json" } },
+          ),
+        );
+      }
+      return Promise.resolve(threadResponse(lost));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, refetchInterval: false } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <EditorialConversation
+          subjectId={binding.subject_id}
+          occurrenceId={binding.occurrence_id}
+          snapshotId="snapshot-1"
+          targetLabel="Paragraphe synthétique"
+          onChangeTarget={() => undefined}
+        />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Démarrer une nouvelle discussion",
+      }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "La clé d’idempotence doit être un UUID valide.",
+    );
+  });
+
+  it("replays a lost new-session response with the same key after refreshing the thread", async () => {
+    const idempotencyKey = "00000000-0000-4000-8000-000000000003";
+    const key = vi.spyOn(crypto, "randomUUID").mockReturnValue(idempotencyKey);
+    const lost: EditorialThreadRead = {
+      kind: "open",
+      thread_id: "thread-1",
+      origin: binding,
+      current: binding,
+      binding_state: "valid",
+      previous_sessions: [],
+      bridge_status: "session_lost",
+      event_sequence: 1,
+      timeline: [],
+      etag: '"thread-lost"',
+    };
+    const currentSession: EditorialThreadRead = {
+      ...lost,
+      thread_id: "thread-2",
+      bridge_status: "ready",
+      previous_sessions: [1],
+      event_sequence: 0,
+      timeline: [],
+      etag: '"thread-session-two"',
+    };
+    let threadReads = 0;
+    let startRequests = 0;
+    let committedKey: string | null = null;
+    let releaseRefresh!: () => void;
+    const refreshGate = new Promise<void>((resolve) => {
+      releaseRefresh = resolve;
+    });
+    const requestKeys: string[] = [];
+    const fetchMock = vi.fn<typeof fetch>((input, init) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
+      if (init?.method === "POST" && url.endsWith("/entries")) {
+        startRequests += 1;
+        const requestKey = new Headers(init.headers).get("Idempotency-Key");
+        if (requestKey) requestKeys.push(requestKey);
+        expect(init.body).toBe(
+          JSON.stringify({ kind: "message", start_new_session: true }),
+        );
+        if (startRequests === 1) {
+          committedKey = requestKey;
+          return Promise.reject(new TypeError("response lost after commit"));
+        }
+        expect(committedKey).toBe(idempotencyKey);
+        expect(requestKey).toBe(committedKey);
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              kind: "session_started",
+              thread_id: "thread-2",
+              session_number: 2,
+            }),
+            { status: 202, headers: { "Content-Type": "application/json" } },
+          ),
+        );
+      }
+      threadReads += 1;
+      if (threadReads === 2) {
+        return refreshGate.then(() => threadResponse(lost));
+      }
+      return Promise.resolve(
+        threadResponse(startRequests > 1 ? currentSession : lost),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, refetchInterval: false } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <EditorialConversation
+          subjectId={binding.subject_id}
+          occurrenceId={binding.occurrence_id}
+          snapshotId="snapshot-1"
+          targetLabel="Paragraphe synthétique"
+          onChangeTarget={() => undefined}
+        />
+      </QueryClientProvider>,
+    );
+
+    const startButton = await screen.findByRole("button", {
+      name: "Démarrer une nouvelle discussion",
+    });
+    fireEvent.click(startButton);
+
+    await waitFor(() => expect(threadReads).toBe(2));
+    expect(startButton).toBeDisabled();
+    expect(committedKey).toBe(idempotencyKey);
+    releaseRefresh();
+
+    await waitFor(() => expect(startButton).toBeEnabled());
+    fireEvent.click(startButton);
+
+    expect(
+      await screen.findByText("Nouvelle discussion démarrée."),
+    ).toBeVisible();
+    expect(requestKeys).toEqual([idempotencyKey, idempotencyKey]);
+    expect(key).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText("Session précédente · 1")).toBeVisible();
   });
 });
