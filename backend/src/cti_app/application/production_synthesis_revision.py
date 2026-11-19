@@ -14,6 +14,7 @@ from typing import Any, cast
 from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid5
 
+from cti_app.application.editorial_synthesis import candidate as _candidate
 from cti_app.application.editorial_synthesis import patch_validation as _patch_validation
 from cti_app.application.editorial_synthesis import targets as _targets
 from cti_app.application.model_gateway import (
@@ -1676,6 +1677,7 @@ class ProductionSynthesisRevisionService:
             if result.refusal is None:
                 await uow.commit()
 
+        # Preview rendering stays post-commit behind the injected renderer port.
         if result.publication_artifact is not None:
             await self._publication_render_service.render_preview(result.publication_artifact.id)
         return result
@@ -2142,23 +2144,27 @@ class ProductionSynthesisRevisionService:
                 revision=None,
                 refusal=wire_patch.refusal,
             )
-        if wire_patch.base_artifact_hash != base_hash:
-            raise TargetedEditorialRevisionConflictError("The model patch references another base")
-        revised, revised_payload, before_hash = _apply_wire_patch(
-            base_synthesis=base_synthesis_for_apply,
+        candidate = _candidate.build_candidate_from_validated_patch(
+            base_artifact=context.base_artifact,
             base_payload=base_payload_for_apply,
+            base_synthesis=base_synthesis_for_apply,
+            base_canonical_sha256=base_hash,
+            patch=wire_patch,
             target=request.target,
             operation=request.operation,
-            patch=wire_patch,
             evidence_pack=evidence_pack,
             extraction=extraction,
             snapshot=context.snapshot,
+            apply_patch=_apply_wire_patch,
             publication_kind=publication_kind,
             source_addition_document_ids=source_addition_document_ids,
             require_claim_scopes=(
                 request.mode is TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION
             ),
         )
+        revised = candidate.synthesis
+        revised_payload = candidate.payload
+        before_hash = candidate.before_hash
         if request.mode is TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION:
             _assert_non_target_unchanged(
                 context.base_payload,
@@ -2203,7 +2209,7 @@ class ProductionSynthesisRevisionService:
             "source_additions_hash": request.source_additions_hash,
             "critical_source_waivers": [dict(item) for item in critical_source_waivers],
             "before_hash": before_hash,
-            "after_hash": _sha256(revised_payload),
+            "after_hash": candidate.canonical_sha256,
             "rationale": wire_patch.rationale,
             "created_at": datetime.now(UTC).isoformat(),
             "result_artifact_id": str(revision_id),
@@ -2218,42 +2224,45 @@ class ProductionSynthesisRevisionService:
             revision_id,
             source_addition_document_ids=source_addition_document_ids,
         )
-        artifact = await self._synthesis_persistence.store_synthesis_result(
-            run_id=context.run.id,
-            subject_id=request.subject_id,
-            input_hash=revision_input_hash,
-            synthesis=revised,
-            extraction=extraction,
-            snapshot=context.snapshot,
-            raw_result=raw_text,
-            model_run_id=execution.run.id,
-            mode=SynthesisMode.FRESH,
-            model_policy_version=str(
-                context.base_artifact.metadata.get("model_policy_version", "")
+        artifact = await _candidate.persist_candidate(
+            uow,
+            writer=self._synthesis_persistence,
+            candidate=candidate,
+            persistence=_candidate.SynthesisCandidatePersistence(
+                run_id=context.run.id,
+                subject_id=request.subject_id,
+                input_hash=revision_input_hash,
+                extraction=extraction,
+                snapshot=context.snapshot,
+                raw_result=raw_text,
+                model_run_id=execution.run.id,
+                mode=SynthesisMode.FRESH,
+                publication_kind=publication_kind,
+                model_policy_version=str(
+                    context.base_artifact.metadata.get("model_policy_version", "")
+                ),
+                routing_policy_version=str(
+                    context.base_artifact.metadata.get("routing_policy_version", "")
+                ),
+                projection_hash=projection.projection_hash if projection is not None else None,
+                metadata_extra={
+                    **routing_metadata,
+                    "revision": revision_data,
+                    "paragraph_provenance": provenance,
+                    "revision_contract_version": contract_version,
+                },
+                artifact_id=revision_id,
+                expected_current_artifact_id=context.base_artifact.id,
+                expected_current_input_hash=context.base_artifact.input_hash,
+                expected_current_canonical_sha256=base_hash,
+                expected_routing_decision_id=(
+                    routing_decision.decision_id if routing_decision is not None else None
+                ),
+                expected_routing_decision_hash=(
+                    routing_decision.decision_hash if routing_decision is not None else None
+                ),
+                stale_stages=frozenset({ProductionArtifactStage.PUBLICATION.value}),
             ),
-            routing_policy_version=str(
-                context.base_artifact.metadata.get("routing_policy_version", "")
-            ),
-            projection_hash=projection.projection_hash if projection is not None else None,
-            metadata_extra={
-                **routing_metadata,
-                "revision": revision_data,
-                "paragraph_provenance": provenance,
-                "revision_contract_version": contract_version,
-            },
-            artifact_id=revision_id,
-            expected_current_artifact_id=context.base_artifact.id,
-            expected_current_input_hash=context.base_artifact.input_hash,
-            expected_current_canonical_sha256=base_hash,
-            expected_routing_decision_id=(
-                routing_decision.decision_id if routing_decision is not None else None
-            ),
-            expected_routing_decision_hash=(
-                routing_decision.decision_hash if routing_decision is not None else None
-            ),
-            stale_stages={ProductionArtifactStage.PUBLICATION.value},
-            publication_kind=publication_kind,
-            uow=uow,
         )
 
         enrichment_artifact, enrichment = await self._rebase_enrichment_if_valid(
