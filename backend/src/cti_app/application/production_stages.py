@@ -386,6 +386,39 @@ class EditorialEnrichmentService(_ArtifactPayloadMixin):
         self._uow_factory = uow_factory
         self._artifact_store = artifact_store
 
+    async def assert_editorial_enrichment_revision_fence(
+        self,
+        *,
+        run_id: UUID,
+        expected_current_artifact_id: UUID,
+        expected_current_input_hash: str,
+        expected_current_canonical_sha256: str | None,
+        uow: ProductionUnitOfWork | None = None,
+    ) -> ProductionArtifact:
+        """Read and verify the current enrichment revision base without writing."""
+        if self._artifact_store is None:
+            raise ValueError("editorial_enrichment_inputs_missing")
+        async with _uow_scope(self._uow_factory, uow) as active_uow:
+            current = await active_uow.production_artifacts.get_current_for_revision(
+                run_id, ProductionArtifactStage.EDITORIAL_ENRICHMENT.value
+            )
+            if current is None or current.id != expected_current_artifact_id:
+                raise EditorialEnrichmentRevisionConflictError(
+                    "The Editorial Enrichment base is no longer current"
+                )
+            if current.input_hash != expected_current_input_hash:
+                raise EditorialEnrichmentRevisionConflictError(
+                    "The Editorial Enrichment base hash changed"
+                )
+            if expected_current_canonical_sha256 is not None:
+                assert current.canonical_blob_id is not None
+                current_bytes = await self._artifact_store.read_bytes(current.canonical_blob_id)
+                if hashlib.sha256(current_bytes).hexdigest() != expected_current_canonical_sha256:
+                    raise EditorialEnrichmentRevisionConflictError(
+                        "The Editorial Enrichment base content hash changed"
+                    )
+            return cast(ProductionArtifact, current)
+
     async def store_editorial_enrichment_result(
         self,
         *,
@@ -442,34 +475,20 @@ class EditorialEnrichmentService(_ArtifactPayloadMixin):
         stage = ProductionArtifactStage.EDITORIAL_ENRICHMENT
         provided_uow = uow
         async with _uow_scope(self._uow_factory, provided_uow) as uow:
-            current = (
-                await uow.production_artifacts.get_current_for_revision(run_id, stage.value)
-                if expected_current_artifact_id is not None
-                else await uow.production_artifacts.get_current(run_id, stage.value)
-            )
-            if expected_current_artifact_id is not None and (
-                current is None or current.id != expected_current_artifact_id
-            ):
-                raise EditorialEnrichmentRevisionConflictError(
-                    "The Editorial Enrichment base is no longer current"
-                )
+            current: ProductionArtifact | None
             if expected_current_artifact_id is not None:
-                if current is None or current.input_hash != (
-                    expected_current_input_hash or input_hash
-                ):
-                    raise EditorialEnrichmentRevisionConflictError(
-                        "The Editorial Enrichment base hash changed"
-                    )
-                if expected_current_canonical_sha256 is not None:
-                    assert current.canonical_blob_id is not None
-                    current_bytes = await self._artifact_store.read_bytes(current.canonical_blob_id)
-                    if (
-                        hashlib.sha256(current_bytes).hexdigest()
-                        != expected_current_canonical_sha256
-                    ):
-                        raise EditorialEnrichmentRevisionConflictError(
-                            "The Editorial Enrichment base content hash changed"
-                        )
+                current = await self.assert_editorial_enrichment_revision_fence(
+                    run_id=run_id,
+                    expected_current_artifact_id=expected_current_artifact_id,
+                    expected_current_input_hash=expected_current_input_hash or input_hash,
+                    expected_current_canonical_sha256=expected_current_canonical_sha256,
+                    uow=uow,
+                )
+            else:
+                current = cast(
+                    ProductionArtifact | None,
+                    await uow.production_artifacts.get_current(run_id, stage.value),
+                )
             if (
                 expected_current_artifact_id is None
                 and current is not None

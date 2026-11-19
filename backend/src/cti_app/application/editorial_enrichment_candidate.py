@@ -25,6 +25,7 @@ from cti_app.application.production_stages import EditorialEnrichmentService
 from cti_app.domain.production import ProductionArtifact, ProductionArtifactStage
 from cti_app.domain.production_editorial_enrichment import (
     EDITORIAL_RESOURCE_PROPOSAL_POLICY_VERSION,
+    DiagramSpecV1,
     EditorialEnrichmentElementKind,
     EditorialEnrichmentRevisionAction,
     EditorialEnrichmentRevisionOutcome,
@@ -38,28 +39,12 @@ from cti_app.domain.production_extraction import ProductionExtractionV1
 from cti_app.domain.production_synthesis import ProductionSynthesisV1
 
 
-class CandidatePayloadStore(Protocol):
-    async def store_stage_payloads(
-        self,
-        *,
-        raw: str | None = None,
-        canonical: dict[str, Any] | None = None,
-        rendered: str | None = None,
-    ) -> tuple[UUID | None, UUID | None, UUID | None]: ...
-
+class CandidatePayloadReader(Protocol):
     async def read_bytes(self, blob_id: UUID, *, max_bytes: int | None = None) -> bytes: ...
 
 
 class DiagramMaterializer(Protocol):
-    async def __call__(self, diagram: Any) -> Any: ...
-
-
-@dataclass(frozen=True, slots=True)
-class CandidatePayloadBlobs:
-    raw_blob_id: UUID | None
-    canonical_blob_id: UUID
-    raw_sha256: str | None
-    canonical_sha256: str
+    async def __call__(self, diagram: DiagramSpecV1) -> DiagramSpecV1: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +62,7 @@ class EditorialEnrichmentCandidate:
     after_element: dict[str, Any] | None
     outcome: EditorialEnrichmentRevisionOutcome
     resource_need: dict[str, Any] | None
+    diagram_materialization: DiagramSpecV1 | None = None
 
 
 def _field_name(element_kind: EditorialEnrichmentElementKind) -> str:
@@ -88,15 +74,14 @@ def _field_name(element_kind: EditorialEnrichmentElementKind) -> str:
     }[element_kind]
 
 
-async def replace_target(
+def replace_target(
     base: EditorialEnrichmentV1,
     candidate: EditorialEnrichmentV1,
     *,
     element_kind: EditorialEnrichmentElementKind,
     element_key: str,
-    diagram_materializer: DiagramMaterializer | None = None,
 ) -> EditorialEnrichmentV1:
-    """Apply one validated replacement, materializing diagram assets through a port."""
+    """Apply one validated replacement without writing any assets."""
     if element_kind is EditorialEnrichmentElementKind.TABLE:
         table_replacement = candidate.tables[0]
         return replace(
@@ -106,9 +91,7 @@ async def replace_target(
             ),
         )
     if element_kind is EditorialEnrichmentElementKind.DIAGRAM:
-        if diagram_materializer is None:
-            raise ValueError("editorial_enrichment_diagram_compilation_unavailable")
-        diagram_replacement = await diagram_materializer(candidate.diagrams[0])
+        diagram_replacement = candidate.diagrams[0]
         return replace(
             base,
             diagrams=tuple(
@@ -165,13 +148,12 @@ async def replace_target(
     )
 
 
-async def insert_target(
+def insert_target(
     base: EditorialEnrichmentV1,
     candidate: EditorialEnrichmentV1,
     *,
     element_kind: EditorialEnrichmentElementKind,
     element_key: str,
-    diagram_materializer: DiagramMaterializer | None = None,
 ) -> EditorialEnrichmentV1:
     """Append one validated element, retaining the legacy element-key rules."""
     if element_kind is EditorialEnrichmentElementKind.TABLE:
@@ -179,9 +161,7 @@ async def insert_target(
     if element_kind is EditorialEnrichmentElementKind.CHART:
         return replace(base, charts=(*base.charts, replace(candidate.charts[0], key=element_key)))
     if element_kind is EditorialEnrichmentElementKind.DIAGRAM:
-        if diagram_materializer is None:
-            raise ValueError("editorial_enrichment_diagram_compilation_unavailable")
-        diagram = await diagram_materializer(replace(candidate.diagrams[0], key=element_key))
+        diagram = replace(candidate.diagrams[0], key=element_key)
         return replace(base, diagrams=(*base.diagrams, diagram))
     raise ValueError("editorial_enrichment_source_figure_create_not_supported")
 
@@ -243,12 +223,16 @@ async def build_candidate_from_validated_patch(
     is_create: bool = False,
     is_delete: bool = False,
     resource_need_proposal: ResourceNeedProposalV1 | None = None,
-    diagram_materializer: DiagramMaterializer | None = None,
 ) -> EditorialEnrichmentCandidate:
-    """Build the canonical bytes from an already validated patch, without a gateway or row write.
+    """Prepare canonical enrichment bytes from a validated patch without external effects.
 
-    Diagram compilation and content-addressed media storage stay behind the explicit
-    ``diagram_materializer`` port to preserve the legacy compiled-asset contract.
+    Call :func:`materialize_candidate_diagrams` explicitly before persistence when
+    ``diagram_materialization`` is set. This keeps candidate preparation free of
+    media writes so future consumers can compose validation, materialization and
+    persistence as separate steps. Adoption contract: check the base artifact ID,
+    input hash and canonical hash before any materializer that writes media, then
+    persist through :func:`persist_candidate`, which rechecks the same fence in the
+    caller's UOW before storing payloads. The caller owns commit.
     """
     if base_artifact.canonical_blob_id is None:
         raise EditorialEnrichmentRevisionConflictError(
@@ -289,6 +273,7 @@ async def build_candidate_from_validated_patch(
         else EditorialEnrichmentRevisionOutcome.REVISED
     )
     resource_need: dict[str, Any] | None = None
+    diagram_materialization: DiagramSpecV1 | None = None
     if resource_need_proposal is not None:
         canonical_need = EditorialResourceNeedV1(
             key=_next_resource_need_key(base_enrichment),
@@ -329,12 +314,11 @@ async def build_candidate_from_validated_patch(
                 targeted_request=targeted_request,
                 synthesis=synthesis,
             )
-            revised_enrichment = await insert_target(
+            revised_enrichment = insert_target(
                 base_enrichment,
                 validated_patch,
                 element_kind=element_kind,
                 element_key=element_key,
-                diagram_materializer=diagram_materializer,
             )
         else:
             if (
@@ -364,12 +348,11 @@ async def build_candidate_from_validated_patch(
                             }
                         ]
                     )
-            revised_enrichment = await replace_target(
+            revised_enrichment = replace_target(
                 base_enrichment,
                 validated_patch,
                 element_kind=element_kind,
                 element_key=element_key,
-                diagram_materializer=diagram_materializer,
             )
             anchor_texts = semantic_annotation_anchor_texts(synthesis, revised_enrichment)
             retained_annotations = tuple(
@@ -385,12 +368,18 @@ async def build_candidate_from_validated_patch(
         after_element = (
             after_payload[list_name][-1] if is_create else after_payload[list_name][element_index]
         )
+        if element_kind is EditorialEnrichmentElementKind.DIAGRAM:
+            diagram_materialization = next(
+                item for item in revised_enrichment.diagrams if item.key == element_key
+            )
 
     validate_editorial_enrichment(revised_enrichment, extraction=extraction, synthesis=synthesis)
     revised_payload = editorial_enrichment_to_json(revised_enrichment)
     final_payload = dict(base_payload)
     final_payload[list_name] = list(base_elements)
-    if is_delete or action is EditorialEnrichmentRevisionAction.REMOVE_ELEMENT:
+    if outcome is EditorialEnrichmentRevisionOutcome.NEEDS_NEW_EVIDENCE:
+        pass
+    elif is_delete or action is EditorialEnrichmentRevisionAction.REMOVE_ELEMENT:
         assert element_index is not None
         final_payload[list_name].pop(element_index)
     elif is_create:
@@ -423,50 +412,70 @@ async def build_candidate_from_validated_patch(
         after_element=after_element,
         outcome=outcome,
         resource_need=resource_need,
+        diagram_materialization=diagram_materialization,
     )
 
 
-async def upload_candidate_payloads(
-    artifact_store: CandidatePayloadStore,
+async def materialize_candidate_diagrams(
     candidate: EditorialEnrichmentCandidate,
     *,
-    raw_result: str | None,
-) -> CandidatePayloadBlobs:
-    """Upload and read back artifact payloads before the caller opens its UOW."""
-    if ProductionArtifactStore.canonical_json_bytes(candidate.canonical_payload) != (
-        candidate.canonical_bytes
-    ):
-        raise ValueError("editorial_enrichment_revision_candidate_bytes_mismatch")
-    if hashlib.sha256(candidate.canonical_bytes).hexdigest() != candidate.canonical_sha256:
-        raise ValueError("editorial_enrichment_revision_candidate_hash_mismatch")
-    raw_blob_id, canonical_blob_id, _ = await artifact_store.store_stage_payloads(
-        raw=raw_result, canonical=candidate.canonical_payload
+    materializer: DiagramMaterializer,
+) -> EditorialEnrichmentCandidate:
+    """Materialize a prepared diagram and refresh its canonical candidate bytes.
+
+    Call only after a read-only base fence check when the materializer writes media.
+    Persistence still rechecks the fence inside the caller-owned UOW.
+    """
+    requested = candidate.diagram_materialization
+    if requested is None:
+        return candidate
+    materialized = await materializer(requested)
+    if materialized.key != requested.key:
+        raise ValueError("editorial_enrichment_diagram_materializer_key_mismatch")
+    diagrams = tuple(
+        materialized if diagram.key == requested.key else diagram
+        for diagram in candidate.enrichment.diagrams
     )
-    if canonical_blob_id is None:
-        raise ValueError("editorial_enrichment_validation_failed")
-    stored_candidate_bytes = await artifact_store.read_bytes(canonical_blob_id)
-    if stored_candidate_bytes != candidate.canonical_bytes:
-        raise ValueError("editorial_enrichment_revision_candidate_blob_mismatch")
-    if raw_result:
-        if raw_blob_id is None:
-            raise ValueError("editorial_enrichment_revision_raw_blob_missing")
-        if await artifact_store.read_bytes(raw_blob_id) != raw_result.encode("utf-8"):
-            raise ValueError("editorial_enrichment_revision_raw_blob_mismatch")
-    return CandidatePayloadBlobs(
-        raw_blob_id=raw_blob_id,
-        canonical_blob_id=canonical_blob_id,
-        raw_sha256=(hashlib.sha256(raw_result.encode("utf-8")).hexdigest() if raw_result else None),
-        canonical_sha256=candidate.canonical_sha256,
+    if all(diagram.key != requested.key for diagram in candidate.enrichment.diagrams):
+        raise ValueError("editorial_enrichment_diagram_materializer_target_missing")
+    enrichment = replace(candidate.enrichment, diagrams=diagrams)
+    validate_editorial_enrichment(
+        enrichment, extraction=candidate.extraction, synthesis=candidate.synthesis
+    )
+    revised_payload = editorial_enrichment_to_json(enrichment)
+    payload = dict(candidate.canonical_payload)
+    diagram_payloads = list(payload["diagrams"])
+    materialized_payload = next(
+        item for item in revised_payload["diagrams"] if item["key"] == requested.key
+    )
+    payload_index = next(
+        (index for index, item in enumerate(diagram_payloads) if item.get("key") == requested.key),
+        None,
+    )
+    if payload_index is None:
+        raise ValueError("editorial_enrichment_diagram_materializer_target_missing")
+    diagram_payloads[payload_index] = materialized_payload
+    payload["diagrams"] = diagram_payloads
+    if editorial_enrichment_from_json(payload) != enrichment:
+        raise ValueError("editorial_enrichment_revision_payload_mismatch")
+    encoded = ProductionArtifactStore.canonical_json_bytes(payload)
+    return replace(
+        candidate,
+        enrichment=enrichment,
+        canonical_payload=payload,
+        canonical_bytes=encoded,
+        canonical_sha256=hashlib.sha256(encoded).hexdigest(),
+        after_element=materialized_payload,
+        diagram_materialization=None,
     )
 
 
 async def persist_candidate(
     uow: ProductionUnitOfWork,
     *,
-    artifact_store: CandidatePayloadStore,
+    artifact_store: CandidatePayloadReader,
     persistence_service: EditorialEnrichmentService,
     candidate: EditorialEnrichmentCandidate,
-    payload_blobs: CandidatePayloadBlobs,
     raw_result: str | None,
     model_run_id: UUID | None,
     evidence_pack_hash: str,
@@ -479,21 +488,14 @@ async def persist_candidate(
     resource_search_enabled: bool = False,
 ) -> ProductionArtifact:
     """Append the candidate using the caller's UOW; this function never commits it."""
+    if candidate.diagram_materialization is not None:
+        raise ValueError("editorial_enrichment_candidate_diagram_not_materialized")
     if (
         ProductionArtifactStore.canonical_json_bytes(candidate.canonical_payload)
         != (candidate.canonical_bytes)
         or hashlib.sha256(candidate.canonical_bytes).hexdigest() != candidate.canonical_sha256
     ):
         raise ValueError("editorial_enrichment_revision_candidate_hash_mismatch")
-    expected_raw_sha256 = (
-        hashlib.sha256(raw_result.encode("utf-8")).hexdigest() if raw_result else None
-    )
-    if payload_blobs.canonical_sha256 != candidate.canonical_sha256 or (
-        payload_blobs.raw_sha256 != expected_raw_sha256
-    ):
-        raise ValueError("editorial_enrichment_revision_candidate_blob_mismatch")
-    if bool(raw_result) != (payload_blobs.raw_blob_id is not None):
-        raise ValueError("editorial_enrichment_revision_candidate_blob_mismatch")
     prior = await uow.production_artifacts.get(candidate.artifact_id)
     if prior is not None:
         if prior.subject_id != candidate.base_artifact.subject_id:
@@ -511,6 +513,13 @@ async def persist_candidate(
         prior_bytes = await artifact_store.read_bytes(prior.canonical_blob_id)
         if prior_bytes != candidate.canonical_bytes:
             raise ValueError("editorial_enrichment_revision_result_corrupt")
+        await persistence_service.assert_editorial_enrichment_revision_fence(
+            run_id=candidate.base_artifact.production_run_id,
+            expected_current_artifact_id=candidate.base_artifact.id,
+            expected_current_input_hash=candidate.base_artifact.input_hash,
+            expected_current_canonical_sha256=candidate.base_canonical_sha256,
+            uow=uow,
+        )
         return prior
     return await persistence_service.store_editorial_enrichment_result(
         run_id=candidate.base_artifact.production_run_id,
@@ -534,6 +543,5 @@ async def persist_candidate(
         expected_current_canonical_sha256=candidate.base_canonical_sha256,
         canonical_payload=candidate.canonical_payload,
         resource_search_enabled=resource_search_enabled,
-        preuploaded_payload_ids=(payload_blobs.raw_blob_id, payload_blobs.canonical_blob_id),
         uow=uow,
     )

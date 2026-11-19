@@ -13,8 +13,8 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from cti_app.application import editorial_enrichment_revision as enrichment_revision_rules
 from cti_app.application.editorial_enrichment_candidate import (
     build_candidate_from_validated_patch,
+    materialize_candidate_diagrams,
     persist_candidate,
-    upload_candidate_payloads,
 )
 from cti_app.application.editorial_enrichment_candidate import (
     insert_target as insert_candidate_target,
@@ -1632,7 +1632,17 @@ class ProductionEditorialEnrichmentRevisionService:
             assert targeted_request is not None
 
         is_remove = action is EditorialEnrichmentRevisionAction.REMOVE_ELEMENT
-        if is_remove and not is_delete and (parsed is None or not parsed.explicit_empty):
+        resource_need_proposal = (
+            parsed.proposal.resource_needs[0]
+            if parsed is not None and parsed.proposal is not None and parsed.proposal.resource_needs
+            else None
+        )
+        if (
+            is_remove
+            and not is_delete
+            and resource_need_proposal is None
+            and (parsed is None or not parsed.explicit_empty)
+        ):
             raise EditorialEnrichmentRevisionValidationError(
                 [
                     *validator_rejections,
@@ -1642,11 +1652,6 @@ class ProductionEditorialEnrichmentRevisionService:
                     },
                 ]
             )
-        resource_need_proposal = (
-            parsed.proposal.resource_needs[0]
-            if parsed is not None and parsed.proposal is not None and parsed.proposal.resource_needs
-            else None
-        )
         validated_patch: EditorialEnrichmentV1 | None = None
         try:
             if (
@@ -1723,7 +1728,16 @@ class ProductionEditorialEnrichmentRevisionService:
                 is_create=is_create,
                 is_delete=is_delete,
                 resource_need_proposal=resource_need_proposal,
-                diagram_materializer=lambda diagram: self._materialize_candidate_diagram(
+            )
+            await self._persistence.assert_editorial_enrichment_revision_fence(
+                run_id=base_artifact.production_run_id,
+                expected_current_artifact_id=base_artifact.id,
+                expected_current_input_hash=base_artifact.input_hash,
+                expected_current_canonical_sha256=base_canonical_sha256,
+            )
+            built_candidate = await materialize_candidate_diagrams(
+                built_candidate,
+                materializer=lambda diagram: self._materialize_candidate_diagram(
                     diagram, run_id=run.id
                 ),
             )
@@ -1882,16 +1896,12 @@ class ProductionEditorialEnrichmentRevisionService:
         artifact_store = self._enrichment._artifact_store
         if artifact_store is None:
             raise ValueError("editorial_enrichment_revision_inputs_missing")
-        payload_blobs = await upload_candidate_payloads(
-            artifact_store, built_candidate, raw_result=raw_text
-        )
         async with self._enrichment._uow_factory() as uow:
             artifact = await persist_candidate(
                 uow,
                 artifact_store=artifact_store,
                 persistence_service=self._persistence,
                 candidate=built_candidate,
-                payload_blobs=payload_blobs,
                 raw_result=raw_text,
                 model_run_id=execution.run.id if execution is not None else None,
                 evidence_pack_hash=evidence_pack_hash,
@@ -2288,7 +2298,7 @@ class ProductionEditorialEnrichmentRevisionService:
         )
 
     async def _materialize_candidate_diagram(self, diagram: Any, *, run_id: UUID) -> Any:
-        """Keep diagram compilation and asset upload behind the candidate port."""
+        """Compile and store a diagram during the explicit candidate materialization step."""
         if (
             self._enrichment._diagram_compiler is None
             or self._enrichment._media_asset_store is None
@@ -2322,13 +2332,21 @@ class ProductionEditorialEnrichmentRevisionService:
         element_key: str,
         run_id: UUID,
     ) -> EditorialEnrichmentV1:
-        return await replace_candidate_target(
+        revised = replace_candidate_target(
             base,
             candidate,
             element_kind=element_kind,
             element_key=element_key,
-            diagram_materializer=lambda diagram: self._materialize_candidate_diagram(
-                diagram, run_id=run_id
+        )
+        if element_kind is not EditorialEnrichmentElementKind.DIAGRAM:
+            return revised
+        materialized = await self._materialize_candidate_diagram(
+            next(item for item in revised.diagrams if item.key == element_key), run_id=run_id
+        )
+        return replace(
+            revised,
+            diagrams=tuple(
+                materialized if item.key == element_key else item for item in revised.diagrams
             ),
         )
 
@@ -2341,15 +2359,18 @@ class ProductionEditorialEnrichmentRevisionService:
         element_key: str,
         run_id: UUID,
     ) -> EditorialEnrichmentV1:
-        return await insert_candidate_target(
+        revised = insert_candidate_target(
             base,
             candidate,
             element_kind=element_kind,
             element_key=element_key,
-            diagram_materializer=lambda diagram: self._materialize_candidate_diagram(
-                diagram, run_id=run_id
-            ),
         )
+        if element_kind is not EditorialEnrichmentElementKind.DIAGRAM:
+            return revised
+        materialized = await self._materialize_candidate_diagram(
+            next(item for item in revised.diagrams if item.key == element_key), run_id=run_id
+        )
+        return replace(revised, diagrams=(*revised.diagrams[:-1], materialized))
 
     @staticmethod
     def _remove_target(
