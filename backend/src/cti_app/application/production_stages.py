@@ -561,18 +561,9 @@ class SynthesisService(_ArtifactPayloadMixin):
         stale_stages: set[str] | None = None,
         uow: Any | None = None,
         preuploaded_payload_ids: tuple[UUID | None, UUID, UUID | None] | None = None,
-        expected_current_canonical_sha256_verified: bool = False,
     ) -> ProductionArtifact:
-        if self._artifact_store is None and preuploaded_payload_ids is None:
+        if self._artifact_store is None:
             raise ValueError("Canonical synthesis requires an artifact store")
-        if type(expected_current_canonical_sha256_verified) is not bool:
-            raise ValueError("Verified synthesis base hash flag must be boolean")
-        if expected_current_canonical_sha256_verified and (
-            expected_current_artifact_id is None
-            or expected_current_input_hash is None
-            or expected_current_canonical_sha256 is None
-        ):
-            raise ValueError("Complete verified synthesis base fence is required")
         if synthesis.subject_id != subject_id or extraction.subject_id != subject_id:
             raise ValueError("Synthesis subject does not match artifact subject")
         if not is_production_extraction_hash(extraction, synthesis.extraction_hash):
@@ -709,19 +700,14 @@ class SynthesisService(_ArtifactPayloadMixin):
                         raise TargetedEditorialRevisionConflictError(
                             "The synthesis revision base has no canonical body"
                         )
-                    if not expected_current_canonical_sha256_verified:
-                        if self._artifact_store is None:
-                            raise ValueError("Canonical synthesis requires an artifact store")
-                        current_bytes = await self._artifact_store.read_bytes(
-                            current.canonical_blob_id
+                    current_bytes = await self._artifact_store.read_bytes(current.canonical_blob_id)
+                    if (
+                        hashlib.sha256(current_bytes).hexdigest()
+                        != expected_current_canonical_sha256
+                    ):
+                        raise TargetedEditorialRevisionConflictError(
+                            "The synthesis revision base content hash changed"
                         )
-                        if (
-                            hashlib.sha256(current_bytes).hexdigest()
-                            != expected_current_canonical_sha256
-                        ):
-                            raise TargetedEditorialRevisionConflictError(
-                                "The synthesis revision base content hash changed"
-                            )
             prior_versions = [
                 artifact.version
                 for artifact in existing
@@ -739,6 +725,17 @@ class SynthesisService(_ArtifactPayloadMixin):
                 raw_id, canonical_id, rendered_id = preuploaded_payload_ids
             if canonical_id is None:
                 raise ValueError("Canonical synthesis blob was not stored")
+            if preuploaded_payload_ids is not None:
+                expected_candidate_bytes = ProductionArtifactStore.canonical_json_bytes(
+                    canonical_payload
+                )
+                persisted_candidate_bytes = await self._artifact_store.read_bytes(canonical_id)
+                if (
+                    len(persisted_candidate_bytes) != len(expected_candidate_bytes)
+                    or hashlib.sha256(persisted_candidate_bytes).digest()
+                    != hashlib.sha256(expected_candidate_bytes).digest()
+                ):
+                    raise ValueError("synthesis_candidate_blob_content_mismatch")
             artifact = ProductionArtifact(
                 id=artifact_id or uuid4(),
                 production_run_id=run_id,
