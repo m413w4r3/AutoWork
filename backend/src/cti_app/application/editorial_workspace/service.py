@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from typing import Any
 from uuid import UUID, uuid4
@@ -89,6 +90,18 @@ class EditorialWorkspaceService:
     ) -> WorkspaceOccurrenceResolution:
         """Resolve one occurrence against the subject's current registry snapshot."""
         _snapshot, record, _synthesis = await self._load_current(subject_id)
+        return resolve_registry_occurrence(record, occurrence_id)
+
+    async def resolve_occurrence_in_uow(
+        self, uow: UnitOfWork, subject_id: UUID, occurrence_id: UUID
+    ) -> WorkspaceOccurrenceResolution:
+        """Resolve pins within a caller's transaction while it holds the run lock."""
+        _snapshot, record, _synthesis = await self._load_current(
+            subject_id,
+            uow=uow,
+            lock_creation=False,
+            commit_snapshot=False,
+        )
         return resolve_registry_occurrence(record, occurrence_id)
 
     async def resolve(
@@ -181,13 +194,19 @@ class EditorialWorkspaceService:
         )
 
     async def _load_current(
-        self, subject_id: UUID
+        self,
+        subject_id: UUID,
+        *,
+        uow: UnitOfWork | None = None,
+        lock_creation: bool = True,
+        commit_snapshot: bool = True,
     ) -> tuple[dict[str, object], WorkspaceSnapshotRecord, Mapping[str, Any]]:
-        async with self._uow_factory() as uow:
+        async with self._uow_scope(uow) as uow:
             subject = await uow.subjects.get(subject_id)
             if subject is None:
                 raise EditorialWorkspaceError("subject_not_found")
-            await uow.production_runs.lock_creation_for_subject(subject_id)
+            if lock_creation:
+                await uow.production_runs.lock_creation_for_subject(subject_id)
             run = await uow.production_runs.get_current_for_subject(subject_id)
             if run is None:
                 raise EditorialWorkspaceError("production_run_missing")
@@ -404,9 +423,17 @@ class EditorialWorkspaceService:
                 enrichment_artifact=enrichment_artifact,
                 publication_artifact=publication_artifact,
             )
-            if should_commit:
+            if should_commit and commit_snapshot:
                 await uow.commit()
             return result, record, synthesis
+
+    @asynccontextmanager
+    async def _uow_scope(self, existing_uow: UnitOfWork | None) -> AsyncIterator[UnitOfWork]:
+        if existing_uow is None:
+            async with self._uow_factory() as uow:
+                yield uow
+        else:
+            yield existing_uow
 
     @staticmethod
     def _reconcile_changed_stage(

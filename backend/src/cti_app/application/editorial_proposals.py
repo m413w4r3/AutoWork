@@ -567,25 +567,7 @@ class EditorialProposalService:
         return None
 
     async def _persist_stale_transition(self, proposal: EditorialProposal) -> EditorialProposal:
-        request_sha256 = _state_request_sha256(
-            action="stale",
-            proposal_id=proposal.id,
-            state_version=proposal.state_version,
-            patch_sha256=proposal.patch_sha256,
-        )
-        event = EditorialProposalEvent(
-            id=uuid4(),
-            proposal_id=proposal.id,
-            sequence=proposal.state_version + 1,
-            kind=EditorialProposalEventKind.STATE_CHANGED,
-            state=EditorialProposalState.STALE,
-            state_version=proposal.state_version + 1,
-            actor_id=proposal.actor_id,
-            idempotency_key=f"stale-{proposal.id.hex}-{proposal.state_version}",
-            request_sha256=request_sha256,
-            patch_sha256=proposal.patch_sha256,
-            diagnostics={"code": "proposal_base_stale"},
-        )
+        event = _stale_event(proposal)
         async with self._uow_factory() as uow:
             transitioned, changed = await uow.editorial_proposals.transition_if_current(
                 subject_id=proposal.subject_id,
@@ -650,14 +632,19 @@ class EditorialProposalService:
             workspace_service=workspace_service,
         )
         if inspected.state != EditorialProposalState.PROPOSED.value:
-            raise EditorialProposalApplicationError("proposal_state_conflict")
+            raise EditorialProposalApplicationError(
+                "proposal_stale"
+                if inspected.state == EditorialProposalState.STALE.value
+                else "proposal_state_conflict"
+            )
         if inspected.state_version != expected_state_version:
             raise EditorialProposalApplicationError("proposal_state_conflict")
         if inspected.patch_sha256 != patch_sha256:
             raise EditorialProposalApplicationError("proposal_patch_hash_mismatch")
 
+        stale = False
         async with self._uow_factory() as uow:
-            proposal = await uow.editorial_proposals.get_for_occurrence(
+            proposal = await uow.editorial_proposals.get_for_occurrence_for_update(
                 subject_id, occurrence_id, proposal_id
             )
             if proposal is None:
@@ -671,54 +658,95 @@ class EditorialProposalService:
                 raise EditorialProposalApplicationError("proposal_idempotency_conflict")
             if proposal.patch_sha256 != patch_sha256:
                 raise EditorialProposalApplicationError("proposal_patch_hash_mismatch")
-            if (
+            if proposal.state is EditorialProposalState.STALE:
+                stale = True
+            elif (
                 proposal.state is not EditorialProposalState.PROPOSED
                 or proposal.state_version != expected_state_version
             ):
                 raise EditorialProposalApplicationError("proposal_state_conflict")
 
-            rejected = proposal.transition(EditorialProposalState.REJECTED)
-            event = EditorialProposalEvent(
-                id=uuid4(),
-                proposal_id=proposal.id,
-                sequence=rejected.state_version,
-                kind=EditorialProposalEventKind.STATE_CHANGED,
-                state=EditorialProposalState.REJECTED,
-                state_version=rejected.state_version,
-                actor_id=actor_id,
-                idempotency_key=idempotency_key,
-                request_sha256=request_sha256,
-                patch_sha256=patch_sha256,
-            )
-            stored, changed = await uow.editorial_proposals.transition_if_current(
-                subject_id=subject_id,
-                occurrence_id=occurrence_id,
-                proposal_id=proposal_id,
-                expected_state=EditorialProposalState.PROPOSED,
-                expected_state_version=expected_state_version,
-                state=EditorialProposalState.REJECTED,
-                event=event,
-            )
-            if stored is None:
-                raise EditorialProposalApplicationError("proposal_not_found")
-            if not changed:
-                replay = await uow.editorial_proposals.get_event_by_idempotency(
-                    proposal_id, idempotency_key
+            if not stale:
+                run = await uow.production_runs.get_for_update(proposal.production_run_id)
+                resolution = (
+                    await workspace_service.resolve_occurrence_in_uow(
+                        uow, subject_id, occurrence_id
+                    )
+                    if run is not None
+                    else None
                 )
-                if replay is not None and _decision_event_matches(replay, actor_id, request_sha256):
-                    return stored
-                raise EditorialProposalApplicationError("proposal_state_conflict")
-            if stored.thread_id is not None:
-                await uow.editorial_threads.append_event(
-                    thread_id=stored.thread_id,
-                    kind=EditorialThreadEventKind.REJECTED,
+                pins_match = (
+                    resolution is not None
+                    and resolution.entry is not None
+                    and resolution.binding_state == "valid"
+                    and _proposal_pins_match(proposal, resolution)
+                )
+                if not pins_match:
+                    stale_event = _stale_event(proposal)
+                    stored_stale, changed = await uow.editorial_proposals.transition_if_current(
+                        subject_id=subject_id,
+                        occurrence_id=occurrence_id,
+                        proposal_id=proposal_id,
+                        expected_state=EditorialProposalState.PROPOSED,
+                        expected_state_version=proposal.state_version,
+                        state=EditorialProposalState.STALE,
+                        event=stale_event,
+                    )
+                    if stored_stale is None:
+                        raise EditorialProposalApplicationError("proposal_not_found")
+                    if changed:
+                        await uow.commit()
+                    stale = True
+
+            if not stale:
+                rejected = proposal.transition(EditorialProposalState.REJECTED)
+                event = EditorialProposalEvent(
+                    id=uuid4(),
+                    proposal_id=proposal.id,
+                    sequence=rejected.state_version,
+                    kind=EditorialProposalEventKind.STATE_CHANGED,
+                    state=EditorialProposalState.REJECTED,
+                    state_version=rejected.state_version,
                     actor_id=actor_id,
-                    idempotency_key=f"proposal-rejection:{idempotency_key}",
+                    idempotency_key=idempotency_key,
                     request_sha256=request_sha256,
-                    proposal_id=stored.id,
+                    patch_sha256=patch_sha256,
                 )
-            await uow.commit()
-            return stored
+                stored, changed = await uow.editorial_proposals.transition_if_current(
+                    subject_id=subject_id,
+                    occurrence_id=occurrence_id,
+                    proposal_id=proposal_id,
+                    expected_state=EditorialProposalState.PROPOSED,
+                    expected_state_version=expected_state_version,
+                    state=EditorialProposalState.REJECTED,
+                    event=event,
+                )
+                if stored is None:
+                    raise EditorialProposalApplicationError("proposal_not_found")
+                if not changed:
+                    replay = await uow.editorial_proposals.get_event_by_idempotency(
+                        proposal_id, idempotency_key
+                    )
+                    if replay is not None and _decision_event_matches(
+                        replay, actor_id, request_sha256
+                    ):
+                        return stored
+                    raise EditorialProposalApplicationError("proposal_state_conflict")
+                if stored.thread_id is not None:
+                    await uow.editorial_threads.append_event(
+                        thread_id=stored.thread_id,
+                        kind=EditorialThreadEventKind.REJECTED,
+                        actor_id=actor_id,
+                        idempotency_key=f"proposal-rejection:{idempotency_key}",
+                        request_sha256=request_sha256,
+                        proposal_id=stored.id,
+                    )
+                await uow.commit()
+                return stored
+
+        if stale:
+            raise EditorialProposalApplicationError("proposal_stale")
+        raise EditorialProposalApplicationError("proposal_state_conflict")
 
     async def cleanup_orphan_blob(self, descriptor: BlobDescriptor) -> bool:
         """Delete only when neither a proposal nor any other row references the blob."""
@@ -990,6 +1018,27 @@ def _proposal_pins_match(
         and resolution.artifact_id == proposal.base_artifact_id
         and resolution.artifact_version == proposal.base_artifact_version
         and resolution.canonical_sha256 == proposal.base_canonical_sha256
+    )
+
+
+def _stale_event(proposal: EditorialProposal) -> EditorialProposalEvent:
+    return EditorialProposalEvent(
+        id=uuid4(),
+        proposal_id=proposal.id,
+        sequence=proposal.state_version + 1,
+        kind=EditorialProposalEventKind.STATE_CHANGED,
+        state=EditorialProposalState.STALE,
+        state_version=proposal.state_version + 1,
+        actor_id=proposal.actor_id,
+        idempotency_key=f"stale-{proposal.id.hex}-{proposal.state_version}",
+        request_sha256=_state_request_sha256(
+            action="stale",
+            proposal_id=proposal.id,
+            state_version=proposal.state_version,
+            patch_sha256=proposal.patch_sha256,
+        ),
+        patch_sha256=proposal.patch_sha256,
+        diagnostics={"code": "proposal_base_stale"},
     )
 
 

@@ -67,6 +67,26 @@ class SqlAlchemyEditorialProposalRepository:
         row, link = result.one_or_none() or (None, None)
         return _proposal_from_rows(row, link) if row is not None else None
 
+    async def get_for_occurrence_for_update(
+        self, subject_id: UUID, occurrence_id: UUID, proposal_id: UUID
+    ) -> EditorialProposal | None:
+        statement = (
+            select(EditorialProposalRow, EditorialProposalModelRunRow)
+            .outerjoin(
+                EditorialProposalModelRunRow,
+                EditorialProposalModelRunRow.proposal_id == EditorialProposalRow.id,
+            )
+            .where(
+                EditorialProposalRow.id == proposal_id,
+                EditorialProposalRow.subject_id == subject_id,
+                EditorialProposalRow.occurrence_id == occurrence_id,
+            )
+            .with_for_update(of=EditorialProposalRow)
+        )
+        result = await self._session.execute(statement)
+        row, link = result.one_or_none() or (None, None)
+        return _proposal_from_rows(row, link) if row is not None else None
+
     async def get_event_by_idempotency(
         self, proposal_id: UUID, idempotency_key: str
     ) -> EditorialProposalEvent | None:

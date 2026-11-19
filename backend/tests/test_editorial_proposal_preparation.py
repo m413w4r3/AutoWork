@@ -125,6 +125,10 @@ def _setup(
                 None,
             )
 
+        async def get_for_occurrence_for_update(self, subject_id, occurrence_id, proposal_id):
+            calls.append("proposal_lock")
+            return await self.get_for_occurrence(subject_id, occurrence_id, proposal_id)
+
         async def get_event_by_idempotency(self, proposal_id, idempotency_key):
             return next(
                 (
@@ -270,6 +274,10 @@ def _setup(
         async def lock_creation_for_subject(self, _subject_id):
             calls.append("run_creation_lock")
 
+        async def get_for_update(self, _run_id):
+            calls.append("run_lock")
+            return SimpleNamespace(id=run_id)
+
     async def current_occurrence(requested_subject_id, requested_occurrence_id):
         if requested_subject_id != subject_id or requested_occurrence_id != occurrence_id:
             return SimpleNamespace(
@@ -292,8 +300,12 @@ def _setup(
             before_hash=resolved.before_hash,
         )
 
+    async def resolve_occurrence_in_uow(_uow, requested_subject_id, requested_occurrence_id):
+        return await current_occurrence(requested_subject_id, requested_occurrence_id)
+
     workspace_service = SimpleNamespace(
         resolve_occurrence=current_occurrence,
+        resolve_occurrence_in_uow=resolve_occurrence_in_uow,
         resolve_revision_target=resolve_revision_target,
     )
 
@@ -756,7 +768,7 @@ async def test_changed_pins_project_proposal_stale_and_persist_before_any_decisi
             idempotency_key=f"reject_{uuid4().hex}",
             workspace_service=setup.workspace_service,
         )
-    assert error.value.code == "proposal_state_conflict"
+    assert error.value.code == "proposal_stale"
     assert setup.repository.records[0].state.value == "stale"
     assert len(setup.repository.events) == 2
 
@@ -822,6 +834,62 @@ async def test_reject_is_terminal_and_keeps_artifact_pins() -> None:
         setup.current_snapshot.synthesis_version,
         setup.current_snapshot.synthesis_canonical_sha256,
     )
+
+
+@pytest.mark.asyncio
+async def test_reject_revalidates_pins_under_run_lock_after_inspect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cti_app.application.editorial_proposals import EditorialProposalApplicationError
+
+    setup = _setup()
+    proposal = await setup.service.prepare_bridge_result(setup.preparation())
+    idempotency_key = f"reject_{uuid4().hex}"
+    original_inspect = setup.service.inspect
+
+    async def inspect_then_advance_pins(*args, **kwargs):
+        view = await original_inspect(*args, **kwargs)
+        setup.current_snapshot.workspace_pin_hash = "8" * 64
+        return view
+
+    monkeypatch.setattr(setup.service, "inspect", inspect_then_advance_pins)
+
+    with pytest.raises(EditorialProposalApplicationError) as error:
+        await setup.service.reject(
+            setup.subject_id,
+            setup.occurrence_id,
+            proposal.id,
+            actor_id=setup.actor_id,
+            expected_state_version=proposal.state_version,
+            patch_sha256=proposal.patch_sha256,
+            idempotency_key=idempotency_key,
+            workspace_service=setup.workspace_service,
+        )
+
+    assert error.value.code == "proposal_stale"
+    assert setup.repository.records[0].state.value == "stale"
+    assert setup.repository.records[0].state_version == proposal.state_version + 1
+    assert setup.repository.events[-1].state.value == "stale"
+    assert setup.repository.events[-1].idempotency_key == (
+        f"stale-{proposal.id.hex}-{proposal.state_version}"
+    )
+    assert setup.calls.index("proposal_lock") < setup.calls.index("run_lock")
+    assert setup.repository.records[0].state.value != "rejected"
+
+    event_count = len(setup.repository.events)
+    with pytest.raises(EditorialProposalApplicationError) as replay_error:
+        await setup.service.reject(
+            setup.subject_id,
+            setup.occurrence_id,
+            proposal.id,
+            actor_id=setup.actor_id,
+            expected_state_version=proposal.state_version,
+            patch_sha256=proposal.patch_sha256,
+            idempotency_key=idempotency_key,
+            workspace_service=setup.workspace_service,
+        )
+    assert replay_error.value.code == "proposal_stale"
+    assert len(setup.repository.events) == event_count
 
 
 @pytest.mark.asyncio

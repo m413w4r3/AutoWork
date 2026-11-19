@@ -83,3 +83,76 @@ async def test_reject_route_is_versioned_and_does_not_expose_accept(
     assert not any(
         route.path.endswith("/accept") for route in editorial_workspace_api.router.routes
     )
+
+
+@pytest.mark.asyncio
+async def test_reject_validation_error_does_not_echo_submitted_values() -> None:
+    app = FastAPI()
+    app.include_router(editorial_workspace_api.router)
+    subject_id = uuid4()
+    occurrence_id = uuid4()
+    proposal_id = uuid4()
+    submitted_marker = "private submitted editorial text"
+    path = (
+        f"/api/subjects/{subject_id}/editor/threads/{occurrence_id}/proposals/{proposal_id}/reject"
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
+    ) as client:
+        response = await client.post(
+            path,
+            headers={"Idempotency-Key": f"reject_{uuid4().hex}"},
+            json={
+                "expected_state_version": 7,
+                "patch_sha256": "a" * 64,
+                "unexpected_text": submitted_marker,
+            },
+        )
+
+    assert response.status_code == 422
+    assert submitted_marker not in response.text
+    errors = response.json()["detail"]
+    assert errors
+    assert all(set(error) == {"loc", "type", "msg"} for error in errors)
+
+
+@pytest.mark.asyncio
+async def test_stale_rejection_returns_typed_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cti_app.application.editorial_proposals import EditorialProposalApplicationError
+
+    async def reject(*_args, **_kwargs):
+        raise EditorialProposalApplicationError("proposal_stale")
+
+    async def current_actor(_request):
+        return uuid4()
+
+    monkeypatch.setattr(EditorialProposalService, "reject", reject)
+    monkeypatch.setattr(editorial_workspace_api, "_thread_actor_id", current_actor)
+    app = FastAPI()
+    app.include_router(editorial_workspace_api.router)
+    app.state.uow_factory = lambda: None
+    app.state.production_artifact_store = object()
+    subject_id = uuid4()
+    occurrence_id = uuid4()
+    proposal_id = uuid4()
+    path = (
+        f"/api/subjects/{subject_id}/editor/threads/{occurrence_id}/proposals/{proposal_id}/reject"
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
+    ) as client:
+        response = await client.post(
+            path,
+            headers={"Idempotency-Key": f"reject_{uuid4().hex}"},
+            json={"expected_state_version": 7, "patch_sha256": "a" * 64},
+        )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "proposal_stale",
+            "message": "Les références de cette proposition ont changé. Rechargez l’atelier.",  # noqa: RUF001
+        }
+    }

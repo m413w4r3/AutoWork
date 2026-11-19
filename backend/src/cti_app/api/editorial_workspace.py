@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Coroutine
 from datetime import datetime
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, Response, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 from starlette.responses import JSONResponse
 
@@ -24,7 +27,29 @@ from cti_app.domain.editorial_thread import EditorialThreadEventKind
 from cti_app.domain.editorial_workspace import EditorialWorkspaceError
 from cti_app.domain.publication_kind import PublicationKind
 
-router = APIRouter(prefix="/api", tags=["editorial-workspace"])
+
+class EditorialWorkspaceRoute(APIRoute):
+    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+        original_handler = super().get_route_handler()
+
+        async def sanitized_handler(request: Request) -> Response:
+            try:
+                return await original_handler(request)
+            except RequestValidationError as error:
+                details = [
+                    {
+                        "loc": list(item.get("loc", ())),
+                        "type": str(item.get("type", "value_error")),
+                        "msg": str(item.get("msg", "Invalid value")),
+                    }
+                    for item in error.errors()
+                ]
+                return JSONResponse(status_code=422, content={"detail": details})
+
+        return sanitized_handler
+
+
+router = APIRouter(prefix="/api", tags=["editorial-workspace"], route_class=EditorialWorkspaceRoute)
 
 
 class EditorialWorkspaceCapabilities(BaseModel):
@@ -352,6 +377,9 @@ _ERROR_MESSAGES = {
     "proposal_base_unavailable": "Le texte de référence de cette proposition est indisponible.",
     "proposal_base_hash_mismatch": "Le texte de référence ne correspond plus à son empreinte.",
     "proposal_state_conflict": "La proposition a changé. Actualisez-la avant de décider.",
+    "proposal_stale": (
+        "Les références de cette proposition ont changé. Rechargez l’atelier."  # noqa: RUF001
+    ),
     "proposal_idempotency_conflict": "Cette clé est déjà associée à une autre décision.",
     "editorial_thread_conversation_missing": "La conversation de ce fil est indisponible.",
     "editorial_thread_job_missing": "La génération de ce message est indisponible.",

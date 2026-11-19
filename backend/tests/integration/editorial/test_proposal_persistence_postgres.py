@@ -326,6 +326,12 @@ async def test_proposal_persistence_is_exact_idempotent_and_append_only(
             patch_sha256=patch_sha256,
         )
         async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            locked_proposal = await uow.editorial_proposals.get_for_occurrence_for_update(
+                subject.id, occurrence_id, proposal.id
+            )
+            assert locked_proposal is not None
+            locked_run = await uow.production_runs.get_for_update(proposal.production_run_id)
+            assert locked_run is not None
             rejected, changed = await uow.editorial_proposals.transition_if_current(
                 subject_id=subject.id,
                 occurrence_id=occurrence_id,
@@ -414,6 +420,12 @@ async def test_proposal_persistence_is_exact_idempotent_and_append_only(
             diagnostics={"code": "proposal_base_stale"},
         )
         async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            locked_proposal = await uow.editorial_proposals.get_for_occurrence_for_update(
+                subject.id, occurrence_id, stale_proposal.id
+            )
+            assert locked_proposal is not None
+            locked_run = await uow.production_runs.get_for_update(stale_proposal.production_run_id)
+            assert locked_run is not None
             stale, stale_changed = await uow.editorial_proposals.transition_if_current(
                 subject_id=subject.id,
                 occurrence_id=occurrence_id,

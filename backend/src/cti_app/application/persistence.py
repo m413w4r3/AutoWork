@@ -288,6 +288,10 @@ class EditorialProposalRepository(Protocol):
         self, subject_id: UUID, occurrence_id: UUID, proposal_id: UUID
     ) -> EditorialProposal | None: ...
 
+    async def get_for_occurrence_for_update(
+        self, subject_id: UUID, occurrence_id: UUID, proposal_id: UUID
+    ) -> EditorialProposal | None: ...
+
     async def get_event_by_idempotency(
         self, proposal_id: UUID, idempotency_key: str
     ) -> EditorialProposalEvent | None: ...
