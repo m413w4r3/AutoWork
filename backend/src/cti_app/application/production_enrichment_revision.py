@@ -11,6 +11,20 @@ from typing import Any, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from cti_app.application import editorial_enrichment_revision as enrichment_revision_rules
+from cti_app.application.editorial_enrichment_candidate import (
+    build_candidate_from_validated_patch,
+    persist_candidate,
+    upload_candidate_payloads,
+)
+from cti_app.application.editorial_enrichment_candidate import (
+    insert_target as insert_candidate_target,
+)
+from cti_app.application.editorial_enrichment_candidate import (
+    remove_target as remove_candidate_target,
+)
+from cti_app.application.editorial_enrichment_candidate import (
+    replace_target as replace_candidate_target,
+)
 from cti_app.application.editorial_enrichment_revision import (
     EditorialEnrichmentRevisionLineage,
     EditorialEnrichmentRevisionValidationError,
@@ -36,7 +50,6 @@ from cti_app.application.production_editorial_enrichment import (
     editorial_enrichment_output_contract_example,
     parse_editorial_enrichment_proposal_wire,
     revalidate_editorial_enrichment_quality,
-    semantic_annotation_anchor_texts,
     validate_editorial_enrichment,
     validate_editorial_enrichment_proposal,
 )
@@ -73,12 +86,10 @@ from cti_app.domain.production import (
     ProductionStage,
 )
 from cti_app.domain.production_editorial_enrichment import (
-    EDITORIAL_RESOURCE_PROPOSAL_POLICY_VERSION,
     EditorialEnrichmentElementKind,
     EditorialEnrichmentRevisionAction,
     EditorialEnrichmentRevisionOutcome,
     EditorialEnrichmentV1,
-    EditorialResourceNeedV1,
     EnrichmentPlacementKind,
     editorial_enrichment_evidence_refs,
     editorial_enrichment_from_json,
@@ -1620,66 +1631,31 @@ class ProductionEditorialEnrichmentRevisionService:
         else:
             assert targeted_request is not None
 
-        outcome = EditorialEnrichmentRevisionOutcome.REVISED
         is_remove = action is EditorialEnrichmentRevisionAction.REMOVE_ELEMENT
-        resource_need: dict[str, Any] | None = None
-        if parsed is not None and parsed.proposal is not None and parsed.proposal.resource_needs:
-            need = parsed.proposal.resource_needs[0]
-            unique_key = self._next_resource_need_key(base_enrichment)
-            canonical_need = EditorialResourceNeedV1(
-                key=unique_key,
-                kind=need.kind,
-                reason=need.reason,
-                query_hint=need.query_hint,
-                policy_version=EDITORIAL_RESOURCE_PROPOSAL_POLICY_VERSION,
+        if is_remove and not is_delete and (parsed is None or not parsed.explicit_empty):
+            raise EditorialEnrichmentRevisionValidationError(
+                [
+                    *validator_rejections,
+                    {
+                        "block_id": element_key,
+                        "reason_code": "editorial_enrichment_revision_remove_requires_empty_marker",
+                    },
+                ]
             )
-            if base_enrichment.schema_version >= 3:
-                revised_enrichment = replace(
-                    base_enrichment,
-                    resource_needs=(*base_enrichment.resource_needs, canonical_need),
-                )
-            else:
-                revised_enrichment = base_enrichment
-            outcome = EditorialEnrichmentRevisionOutcome.NEEDS_NEW_EVIDENCE
-            resource_need = {
-                "key": canonical_need.key,
-                "kind": canonical_need.kind.value,
-                "reason": canonical_need.reason,
-                "query_hint": canonical_need.query_hint,
-            }
-            after_element = base_element
-        elif is_delete:
-            revised_enrichment = self._remove_target(
-                base_enrichment, element_kind=element_kind, element_key=element_key
-            )
-            validate_editorial_enrichment(
-                revised_enrichment, extraction=extraction, synthesis=synthesis
-            )
-            after_element = None
-        elif is_remove:
-            if parsed is None or not parsed.explicit_empty:
-                raise EditorialEnrichmentRevisionValidationError(
-                    [
-                        *validator_rejections,
-                        {
-                            "block_id": element_key,
-                            "reason_code": (
-                                "editorial_enrichment_revision_remove_requires_empty_marker"
-                            ),
-                        },
-                    ]
-                )
-            revised_enrichment = self._remove_target(
-                base_enrichment, element_kind=element_kind, element_key=element_key
-            )
-            validate_editorial_enrichment(
-                revised_enrichment, extraction=extraction, synthesis=synthesis
-            )
-            after_element = None
-        else:
-            assert parsed is not None and parsed.proposal is not None
-            try:
-                candidate = self._validate_target_proposal(
+        resource_need_proposal = (
+            parsed.proposal.resource_needs[0]
+            if parsed is not None and parsed.proposal is not None and parsed.proposal.resource_needs
+            else None
+        )
+        validated_patch: EditorialEnrichmentV1 | None = None
+        try:
+            if (
+                parsed is not None
+                and parsed.proposal is not None
+                and resource_need_proposal is None
+                and not is_remove
+            ):
+                validated_patch = self._validate_target_proposal(
                     parsed,
                     element_kind=element_kind,
                     element_key=element_key,
@@ -1690,10 +1666,10 @@ class ProductionEditorialEnrichmentRevisionService:
                     validator_rejections=validator_rejections,
                 )
                 candidate_elements = {
-                    EditorialEnrichmentElementKind.TABLE: candidate.tables,
-                    EditorialEnrichmentElementKind.DIAGRAM: candidate.diagrams,
-                    EditorialEnrichmentElementKind.CHART: candidate.charts,
-                    EditorialEnrichmentElementKind.FIGURE: candidate.source_figures,
+                    EditorialEnrichmentElementKind.TABLE: validated_patch.tables,
+                    EditorialEnrichmentElementKind.DIAGRAM: validated_patch.diagrams,
+                    EditorialEnrichmentElementKind.CHART: validated_patch.charts,
+                    EditorialEnrichmentElementKind.FIGURE: validated_patch.source_figures,
                 }[element_kind]
                 if len(candidate_elements) != 1:
                     reason_code = "editorial_enrichment_target_failed_final_validation"
@@ -1720,144 +1696,75 @@ class ProductionEditorialEnrichmentRevisionService:
                         rejection = {"block_id": element_key, "reason_code": reason_code}
                     validator_rejections.append(rejection)
                     raise EditorialEnrichmentRevisionValidationError(validator_rejections)
-                if is_create:
-                    self._assert_requested_placement(
-                        candidate=candidate,
-                        element_kind=element_kind,
-                        targeted_request=targeted_request,
-                        synthesis=synthesis,
-                    )
-                    revised_enrichment = await self._insert_target(
-                        base_enrichment,
-                        candidate,
-                        element_kind=element_kind,
-                        element_key=element_key,
-                        run_id=run.id,
-                    )
-                else:
-                    if (
-                        element_kind is EditorialEnrichmentElementKind.FIGURE
-                        and action is EditorialEnrichmentRevisionAction.CHOOSE_ANOTHER_FIGURE
-                    ):
-                        previous_figure = next(
-                            item
-                            for item in base_enrichment.source_figures
-                            if item.key == element_key
-                        )
-                        replacement_figure = candidate.source_figures[0]
-                        previous_figure_id = (
-                            previous_figure.resolved_figure.figure_id
-                            if previous_figure.resolved_figure is not None
-                            else None
-                        )
-                        replacement_figure_id = (
-                            replacement_figure.resolved_figure.figure_id
-                            if replacement_figure.resolved_figure is not None
-                            else None
-                        )
-                        if previous_figure_id == replacement_figure_id:
-                            raise EditorialEnrichmentRevisionValidationError(
-                                [
-                                    {
-                                        "block_id": element_key,
-                                        "reason_code": "editorial_enrichment_figure_not_changed",
-                                    }
-                                ]
-                            )
-                    revised_enrichment = await self._replace_target(
-                        base_enrichment,
-                        candidate,
-                        element_kind=element_kind,
-                        element_key=element_key,
-                        run_id=run.id,
-                    )
-                    anchor_texts = semantic_annotation_anchor_texts(synthesis, revised_enrichment)
-                    retained_annotations = tuple(
-                        annotation
-                        for annotation in revised_enrichment.annotations
-                        if (anchor_text := anchor_texts.get(annotation.paragraph_anchor))
-                        is not None
-                        and annotation.text in anchor_text
-                    )
-                    if retained_annotations != revised_enrichment.annotations:
-                        revised_enrichment = replace(
-                            revised_enrichment, annotations=retained_annotations
-                        )
-                validate_editorial_enrichment(
-                    revised_enrichment,
-                    extraction=extraction,
-                    synthesis=synthesis,
+            if base_artifact.canonical_blob_id is None:
+                raise EditorialEnrichmentRevisionConflictError(
+                    "The requested base artifact has no canonical payload"
                 )
-            except EditorialEnrichmentRevisionValidationError as exc:
-                if targeted_request is not None:
-                    reason = (
-                        "; ".join(item["reason_code"] for item in exc.rejections)
-                        or "The proposal failed an editorial enrichment rule."
-                    )
-                    if any(token in reason for token in ("trivial", "ioc_republication")):
-                        reason = (
-                            f"{reason}; delete the element instead of keeping a trivial rewrite."
-                        )
-                    return self._targeted_refusal(
-                        reason,
-                        None,
-                        refusal_reason=(
-                            TargetedEditorialRevisionRefusalReason.MODEL_OUTPUT_INVALID
-                        ),
-                        next_safe_action=(
-                            "Reformulate the instruction or correct the proposed enrichment block."
-                        ),
-                        details={"validator_rejections": exc.rejections},
-                    )
-                raise
-            except ValueError as exc:
-                if targeted_request is not None:
-                    return self._targeted_refusal(
-                        str(exc) or "The proposal failed canonical enrichment validation.",
-                        None,
-                        refusal_reason=(
-                            TargetedEditorialRevisionRefusalReason.MODEL_OUTPUT_INVALID
-                        ),
-                        next_safe_action=(
-                            "Reformulate the instruction or correct the proposed enrichment block."
-                        ),
-                    )
-                raise
-            after_payload = editorial_enrichment_to_json(revised_enrichment)
-            after_element = (
-                after_payload[list_name][-1]
-                if is_create
-                else after_payload[list_name][element_index]
+            artifact_store = self._enrichment._artifact_store
+            if artifact_store is None:
+                raise ValueError("editorial_enrichment_revision_inputs_missing")
+            built_candidate = await build_candidate_from_validated_patch(
+                base_artifact=base_artifact,
+                base_payload=base_payload,
+                base_canonical_bytes=await artifact_store.read_bytes(
+                    base_artifact.canonical_blob_id
+                ),
+                base_canonical_sha256=base_canonical_sha256,
+                base_enrichment=base_enrichment,
+                validated_patch=validated_patch,
+                extraction=extraction,
+                synthesis=synthesis,
+                element_kind=element_kind,
+                element_key=element_key,
+                action=action,
+                input_hash=input_hash,
+                artifact_id=revision_artifact_id,
+                targeted_request=targeted_request,
+                is_create=is_create,
+                is_delete=is_delete,
+                resource_need_proposal=resource_need_proposal,
+                diagram_materializer=lambda diagram: self._materialize_candidate_diagram(
+                    diagram, run_id=run.id
+                ),
             )
-
-        revised_payload = editorial_enrichment_to_json(revised_enrichment)
+        except EditorialEnrichmentRevisionValidationError as exc:
+            if targeted_request is not None:
+                reason = (
+                    "; ".join(item["reason_code"] for item in exc.rejections)
+                    or "The proposal failed an editorial enrichment rule."
+                )
+                if any(token in reason for token in ("trivial", "ioc_republication")):
+                    reason = f"{reason}; delete the element instead of keeping a trivial rewrite."
+                return self._targeted_refusal(
+                    reason,
+                    None,
+                    refusal_reason=TargetedEditorialRevisionRefusalReason.MODEL_OUTPUT_INVALID,
+                    next_safe_action=(
+                        "Reformulate the instruction or correct the proposed enrichment block."
+                    ),
+                    details={"validator_rejections": exc.rejections},
+                )
+            raise
+        except ValueError as exc:
+            if targeted_request is not None:
+                return self._targeted_refusal(
+                    str(exc) or "The proposal failed canonical enrichment validation.",
+                    None,
+                    refusal_reason=TargetedEditorialRevisionRefusalReason.MODEL_OUTPUT_INVALID,
+                    next_safe_action=(
+                        "Reformulate the revision instruction or correct the proposed target."
+                    ),
+                )
+            raise
+        revised_enrichment = built_candidate.enrichment
+        final_payload = built_candidate.canonical_payload
+        outcome = built_candidate.outcome
+        resource_need = built_candidate.resource_need
+        after_element = built_candidate.after_element
         if not is_remove and outcome is EditorialEnrichmentRevisionOutcome.REVISED:
             element_evidence_handles = self._element_evidence_handles(
                 element_kind, revised_enrichment, element_key, evidence_pack
             )
-        # Preserve every untouched serialized element exactly as it appeared in
-        # the base canonical payload. Only the requested block and L7b needs
-        # collection are replaced.
-        final_payload = dict(base_payload)
-        final_payload[list_name] = list(base_elements)
-        if is_remove:
-            assert element_index is not None
-            final_payload[list_name].pop(element_index)
-        elif is_create:
-            final_payload[list_name].append(after_element)
-        elif outcome is EditorialEnrichmentRevisionOutcome.REVISED:
-            assert element_index is not None
-            final_payload[list_name][element_index] = after_element
-        if element_kind is EditorialEnrichmentElementKind.FIGURE:
-            # Decision traces are coupled to the selected source figure. A
-            # replacement or deletion must carry the matching trace set.
-            final_payload["figure_decisions"] = revised_payload["figure_decisions"]
-        if revised_payload.get("annotations") != base_payload.get("annotations", []):
-            # Semantic annotations anchored to a deleted or rewritten enrichment
-            # block follow that block; unrelated annotation bytes are preserved.
-            final_payload["annotations"] = revised_payload["annotations"]
-        if targeted_request is None and "resource_needs" in revised_payload:
-            final_payload["resource_needs"] = revised_payload["resource_needs"]
         before_publication_id = previous_publication.id if previous_publication else None
         revision_data: dict[str, Any] = {
             "request_identity": request_identity,
@@ -1962,39 +1869,44 @@ class ProductionEditorialEnrichmentRevisionService:
                 result_artifact_id=revision_artifact_id,
                 is_delete=is_delete,
             )
-        artifact = await self._persistence.store_editorial_enrichment_result(
-            run_id=run.id,
-            subject_id=subject_id,
-            input_hash=input_hash,
-            enrichment=revised_enrichment,
-            extraction=extraction,
-            synthesis=synthesis,
-            raw_result=raw_text,
-            model_run_id=execution.run.id if execution is not None else None,
-            evidence_pack_hash=evidence_pack_hash,
-            access_policy_hash=base_artifact.metadata["access_policy_hash"],
-            model_policy_version=EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION,
-            routing_policy_version=str(base_artifact.metadata.get("routing_policy_version", "")),
-            projection_hash=projection.projection_hash if projection is not None else None,
-            source_figure_inventory_hash=inventory_hash,
-            metadata_extra={
-                "source_figure_provenance_version": SOURCE_FIGURE_PROVENANCE_DIAGNOSTICS_VERSION,
-                "source_figure_provenance_diagnostics": build_source_figure_provenance_diagnostics(
-                    inventory, figure_catalog, revised_enrichment
-                ),
-                "revision": revision_data,
-                **(
-                    {"element_provenance": element_provenance}
-                    if element_provenance is not None
-                    else {}
-                ),
-            },
-            artifact_id=revision_artifact_id,
-            expected_current_artifact_id=base_artifact.id,
-            expected_current_input_hash=base_artifact.input_hash,
-            expected_current_canonical_sha256=base_canonical_sha256,
-            canonical_payload=final_payload,
+        metadata_extra = {
+            "source_figure_provenance_version": SOURCE_FIGURE_PROVENANCE_DIAGNOSTICS_VERSION,
+            "source_figure_provenance_diagnostics": build_source_figure_provenance_diagnostics(
+                inventory, figure_catalog, revised_enrichment
+            ),
+            "revision": revision_data,
+            **(
+                {"element_provenance": element_provenance} if element_provenance is not None else {}
+            ),
+        }
+        artifact_store = self._enrichment._artifact_store
+        if artifact_store is None:
+            raise ValueError("editorial_enrichment_revision_inputs_missing")
+        payload_blobs = await upload_candidate_payloads(
+            artifact_store, built_candidate, raw_result=raw_text
         )
+        async with self._enrichment._uow_factory() as uow:
+            artifact = await persist_candidate(
+                uow,
+                artifact_store=artifact_store,
+                persistence_service=self._persistence,
+                candidate=built_candidate,
+                payload_blobs=payload_blobs,
+                raw_result=raw_text,
+                model_run_id=execution.run.id if execution is not None else None,
+                evidence_pack_hash=evidence_pack_hash,
+                access_policy_hash=str(base_artifact.metadata["access_policy_hash"]),
+                model_policy_version=EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION,
+                routing_policy_version=str(
+                    base_artifact.metadata.get("routing_policy_version", "")
+                ),
+                projection_hash=projection.projection_hash if projection is not None else None,
+                source_figure_inventory_hash=inventory_hash,
+                metadata_extra=metadata_extra,
+            )
+            await uow.commit()
+        # Publication assembly and preview rendering remain post-commit behind
+        # their existing services; they are not part of the candidate UOW.
         publication = await self._assemble_and_render(
             run=run,
             snapshot=snapshot,
@@ -2375,6 +2287,32 @@ class ProductionEditorialEnrichmentRevisionService:
             validator_rejections=validator_rejections,
         )
 
+    async def _materialize_candidate_diagram(self, diagram: Any, *, run_id: UUID) -> Any:
+        """Keep diagram compilation and asset upload behind the candidate port."""
+        if (
+            self._enrichment._diagram_compiler is None
+            or self._enrichment._media_asset_store is None
+        ):
+            raise ValueError("editorial_enrichment_diagram_compilation_unavailable")
+        compilation = await compile_and_store_diagrams(
+            (diagram,),
+            compiler=self._enrichment._diagram_compiler,
+            media_asset_store=self._enrichment._media_asset_store,
+            production_run_id=run_id,
+        )
+        if compilation.rejections:
+            rejection = compilation.rejections[0]
+            raise EditorialEnrichmentRevisionValidationError(
+                [
+                    {
+                        "block_id": rejection.diagram_key,
+                        "reason_code": rejection.warning_code,
+                        "compiler_error_code": rejection.reason_code,
+                    }
+                ]
+            )
+        return compilation.diagrams[0]
+
     async def _replace_target(
         self,
         base: EditorialEnrichmentV1,
@@ -2384,96 +2322,15 @@ class ProductionEditorialEnrichmentRevisionService:
         element_key: str,
         run_id: UUID,
     ) -> EditorialEnrichmentV1:
-        if element_kind is EditorialEnrichmentElementKind.TABLE:
-            table_replacement = candidate.tables[0]
-            return replace(
-                base,
-                tables=tuple(
-                    table_replacement if item.key == element_key else item for item in base.tables
-                ),
-            )
-        if element_kind is EditorialEnrichmentElementKind.DIAGRAM:
-            diagram_replacement = candidate.diagrams[0]
-            if (
-                self._enrichment._diagram_compiler is None
-                or self._enrichment._media_asset_store is None
-            ):
-                raise ValueError("editorial_enrichment_diagram_compilation_unavailable")
-            compilation = await compile_and_store_diagrams(
-                (diagram_replacement,),
-                compiler=self._enrichment._diagram_compiler,
-                media_asset_store=self._enrichment._media_asset_store,
-                production_run_id=run_id,
-            )
-            if compilation.rejections:
-                rejection = compilation.rejections[0]
-                raise EditorialEnrichmentRevisionValidationError(
-                    [
-                        {
-                            "block_id": rejection.diagram_key,
-                            "reason_code": rejection.warning_code,
-                            "compiler_error_code": rejection.reason_code,
-                        }
-                    ]
-                )
-            diagram_replacement = compilation.diagrams[0]
-            return replace(
-                base,
-                diagrams=tuple(
-                    diagram_replacement if item.key == element_key else item
-                    for item in base.diagrams
-                ),
-            )
-        if element_kind is EditorialEnrichmentElementKind.CHART:
-            chart_replacement = replace(candidate.charts[0], key=element_key)
-            return replace(
-                base,
-                charts=tuple(
-                    chart_replacement if item.key == element_key else item for item in base.charts
-                ),
-            )
-
-        old = next(item for item in base.source_figures if item.key == element_key)
-        if not candidate.source_figures:
-            raise EditorialEnrichmentRevisionValidationError(
-                [
-                    {
-                        "block_id": element_key,
-                        "reason_code": "editorial_enrichment_figure_not_selected",
-                    }
-                ]
-            )
-        figure_replacement = replace(candidate.source_figures[0], key=old.key)
-        figures = tuple(
-            figure_replacement if item.key == element_key else item for item in base.source_figures
+        return await replace_candidate_target(
+            base,
+            candidate,
+            element_kind=element_kind,
+            element_key=element_key,
+            diagram_materializer=lambda diagram: self._materialize_candidate_diagram(
+                diagram, run_id=run_id
+            ),
         )
-        old_id = old.resolved_figure.figure_id if old.resolved_figure is not None else None
-        new_id = (
-            figure_replacement.resolved_figure.figure_id
-            if figure_replacement.resolved_figure is not None
-            else None
-        )
-        new_decision = next(
-            (item for item in candidate.figure_decisions if item.figure_id == new_id), None
-        )
-        if new_id is not None and any(
-            item.resolved_figure is not None and item.resolved_figure.figure_id == new_id
-            for item in base.source_figures
-            if item.key != element_key
-        ):
-            raise EditorialEnrichmentRevisionValidationError(
-                [
-                    {
-                        "block_id": element_key,
-                        "reason_code": "editorial_enrichment_figure_already_selected",
-                    }
-                ]
-            )
-        replaced_ids = {figure_id for figure_id in (old_id, new_id) if figure_id is not None}
-        decisions = tuple(
-            item for item in base.figure_decisions if item.figure_id not in replaced_ids
-        ) + ((new_decision,) if new_decision is not None else ())
-        return replace(base, source_figures=figures, figure_decisions=decisions)
 
     async def _insert_target(
         self,
@@ -2484,38 +2341,15 @@ class ProductionEditorialEnrichmentRevisionService:
         element_key: str,
         run_id: UUID,
     ) -> EditorialEnrichmentV1:
-        if element_kind is EditorialEnrichmentElementKind.TABLE:
-            table_item = replace(candidate.tables[0], key=element_key)
-            return replace(base, tables=(*base.tables, table_item))
-        if element_kind is EditorialEnrichmentElementKind.CHART:
-            chart_item = replace(candidate.charts[0], key=element_key)
-            return replace(base, charts=(*base.charts, chart_item))
-        if element_kind is EditorialEnrichmentElementKind.DIAGRAM:
-            if (
-                self._enrichment._diagram_compiler is None
-                or self._enrichment._media_asset_store is None
-            ):
-                raise ValueError("editorial_enrichment_diagram_compilation_unavailable")
-            compilation = await compile_and_store_diagrams(
-                (replace(candidate.diagrams[0], key=element_key),),
-                compiler=self._enrichment._diagram_compiler,
-                media_asset_store=self._enrichment._media_asset_store,
-                production_run_id=run_id,
-            )
-            if compilation.rejections:
-                rejection = compilation.rejections[0]
-                raise EditorialEnrichmentRevisionValidationError(
-                    [
-                        {
-                            "block_id": rejection.diagram_key,
-                            "reason_code": rejection.warning_code,
-                            "compiler_error_code": rejection.reason_code,
-                        }
-                    ]
-                )
-            diagram_item = compilation.diagrams[0]
-            return replace(base, diagrams=(*base.diagrams, diagram_item))
-        raise ValueError("editorial_enrichment_source_figure_create_not_supported")
+        return await insert_candidate_target(
+            base,
+            candidate,
+            element_kind=element_kind,
+            element_key=element_key,
+            diagram_materializer=lambda diagram: self._materialize_candidate_diagram(
+                diagram, run_id=run_id
+            ),
+        )
 
     @staticmethod
     def _remove_target(
@@ -2524,44 +2358,7 @@ class ProductionEditorialEnrichmentRevisionService:
         element_kind: EditorialEnrichmentElementKind,
         element_key: str,
     ) -> EditorialEnrichmentV1:
-        field_name = {
-            EditorialEnrichmentElementKind.TABLE: "tables",
-            EditorialEnrichmentElementKind.DIAGRAM: "diagrams",
-            EditorialEnrichmentElementKind.CHART: "charts",
-            EditorialEnrichmentElementKind.FIGURE: "source_figures",
-        }[element_kind]
-        remaining = tuple(item for item in getattr(base, field_name) if item.key != element_key)
-        anchor_prefix = f"{element_kind.value}:{element_key}:"
-        annotations = tuple(
-            annotation
-            for annotation in base.annotations
-            if not annotation.paragraph_anchor.startswith(anchor_prefix)
-        )
-        if element_kind is EditorialEnrichmentElementKind.TABLE:
-            return replace(base, tables=remaining, annotations=annotations)
-        if element_kind is EditorialEnrichmentElementKind.DIAGRAM:
-            return replace(base, diagrams=remaining, annotations=annotations)
-        if element_kind is EditorialEnrichmentElementKind.CHART:
-            return replace(base, charts=remaining, annotations=annotations)
-        removed = next(item for item in base.source_figures if item.key == element_key)
-        removed_figure_id = (
-            removed.resolved_figure.figure_id if removed.resolved_figure is not None else None
-        )
-        decisions = (
-            tuple(
-                decision
-                for decision in base.figure_decisions
-                if decision.figure_id != removed_figure_id
-            )
-            if removed_figure_id is not None
-            else base.figure_decisions
-        )
-        return replace(
-            base,
-            source_figures=remaining,
-            figure_decisions=decisions,
-            annotations=annotations,
-        )
+        return remove_candidate_target(base, element_kind=element_kind, element_key=element_key)
 
     @staticmethod
     def _generated_element_key(

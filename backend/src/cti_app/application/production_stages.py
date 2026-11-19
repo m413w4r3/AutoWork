@@ -409,11 +409,14 @@ class EditorialEnrichmentService(_ArtifactPayloadMixin):
         expected_current_input_hash: str | None = None,
         expected_current_canonical_sha256: str | None = None,
         canonical_payload: dict[str, Any] | None = None,
+        preuploaded_payload_ids: tuple[UUID | None, UUID] | None = None,
         resource_search_enabled: bool = False,
         uow: ProductionUnitOfWork | None = None,
     ) -> ProductionArtifact:
         if self._artifact_store is None:
             raise ValueError("editorial_enrichment_inputs_missing")
+        if preuploaded_payload_ids is not None and uow is None:
+            raise ValueError("preuploaded_editorial_enrichment_payloads_require_uow")
         if enrichment.subject_id != subject_id:
             raise ValueError("editorial_enrichment_lineage_mismatch")
         validate_editorial_enrichment(enrichment, extraction=extraction, synthesis=synthesis)
@@ -478,7 +481,12 @@ class EditorialEnrichmentService(_ArtifactPayloadMixin):
                 return current
             previous = await uow.production_artifacts.list_for_run(run_id)
             version = max((item.version for item in previous if item.stage is stage), default=0) + 1
-            raw_id, canonical_id, _ = await self._store_payloads(raw=raw_result, canonical=payload)
+            if preuploaded_payload_ids is None:
+                raw_id, canonical_id, _ = await self._store_payloads(
+                    raw=raw_result, canonical=payload
+                )
+            else:
+                raw_id, canonical_id = preuploaded_payload_ids
             if canonical_id is None:
                 raise ValueError("editorial_enrichment_validation_failed")
             artifact_metadata = {
