@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from types import SimpleNamespace
 from uuid import uuid4
 
+import httpx
 import pytest
+from fastapi import FastAPI
 
 from cti_app.application.editorial_synthesis.targets import (
     build_targeted_revision_target_catalog,
@@ -170,6 +173,9 @@ def _setup(
                 return proposal_snapshot
             return None
 
+        async def latest_for_run(self, requested_run_id):
+            return proposal_snapshot if requested_run_id == run_id else None
+
     class MemoryThreads:
         async def get(self, requested_thread_id):
             if requested_thread_id != thread_id:
@@ -224,6 +230,10 @@ def _setup(
                 return None
             return SimpleNamespace(id=model_run_id, status=ModelRunStatus.SUCCEEDED)
 
+    class MemoryProductionRuns:
+        async def lock_creation_for_subject(self, _subject_id):
+            calls.append("run_creation_lock")
+
     async def current_occurrence(requested_subject_id, requested_occurrence_id):
         if requested_subject_id != subject_id or requested_occurrence_id != occurrence_id:
             return SimpleNamespace(
@@ -235,7 +245,21 @@ def _setup(
 
         return resolve_occurrence(proposal_snapshot, requested_occurrence_id)
 
-    workspace_service = SimpleNamespace(resolve_occurrence=current_occurrence)
+    async def resolve_revision_target(**_values):
+        occurrence = await current_occurrence(subject_id, occurrence_id)
+        return SimpleNamespace(
+            record=proposal_snapshot,
+            occurrence=occurrence,
+            canonical_content=base_content,
+            target=target,
+            target_id=str(target_entry["id"]),
+            before_hash=resolved.before_hash,
+        )
+
+    workspace_service = SimpleNamespace(
+        resolve_occurrence=current_occurrence,
+        resolve_revision_target=resolve_revision_target,
+    )
 
     class MemoryUnitOfWork:
         def __init__(self) -> None:
@@ -245,6 +269,7 @@ def _setup(
             self.editorial_threads = MemoryThreads()
             self.model_conversation_turns = MemoryTurns()
             self.model_runs = MemoryModelRuns()
+            self.production_runs = MemoryProductionRuns()
             self.production_artifact_writes = canonical_writes
             self._before: (
                 tuple[int, int, int, int, dict[str, object], dict[object, object]] | None
@@ -297,7 +322,11 @@ def _setup(
     def uow_factory():
         return MemoryUnitOfWork()
 
-    service = EditorialProposalService(uow_factory=uow_factory, blob_store=MemoryBlobStore())
+    service = EditorialProposalService(
+        uow_factory=uow_factory,
+        blob_store=MemoryBlobStore(),
+        workspace_service=workspace_service,
+    )
 
     subject_id = uuid4()
     run_id = uuid4()
@@ -341,6 +370,7 @@ def _setup(
         production_run_id=run_id,
         workspace_pin_hash=base_pin_hash,
         routing_decision_hash="3" * 64,
+        synthesis_input_hash="1" * 64,
         block_registry=(
             SimpleNamespace(
                 block_id=occurrence_id,
@@ -416,7 +446,78 @@ def _setup(
         occurrence_id=occurrence_id,
         model_run_id=model_run_id,
         model_turn_id=model_turn_id,
+        current_snapshot=proposal_snapshot,
     )
+
+
+@pytest.mark.asyncio
+async def test_preparation_rejects_a_supplied_target_that_differs_from_current_occurrence() -> None:
+    from cti_app.application.editorial_proposals import EditorialProposalApplicationError
+
+    setup = _setup()
+    preparation = replace(setup.preparation(), target_id="client-selected-target")
+
+    with pytest.raises(EditorialProposalApplicationError) as error:
+        await setup.service.prepare_bridge_result(preparation)
+
+    assert error.value.code == "proposal_target_mismatch"
+    assert setup.blob_bytes == {}
+    assert "uow_open" not in setup.calls
+
+
+@pytest.mark.asyncio
+async def test_preparation_rejects_mismatched_target_shape() -> None:
+    from cti_app.application.editorial_proposals import EditorialProposalApplicationError
+
+    setup = _setup()
+    preparation = replace(
+        setup.preparation(),
+        target=TargetedEditorialRevisionTarget(kind=TargetedEditorialRevisionTargetKind.LEAD),
+    )
+
+    with pytest.raises(EditorialProposalApplicationError) as error:
+        await setup.service.prepare_bridge_result(preparation)
+
+    assert error.value.code == "proposal_target_mismatch"
+    assert setup.blob_bytes == {}
+    assert "uow_open" not in setup.calls
+
+
+@pytest.mark.asyncio
+async def test_preparation_rejects_base_content_that_does_not_match_current_snapshot() -> None:
+    from cti_app.application.editorial_proposals import EditorialProposalApplicationError
+
+    setup = _setup()
+    preparation = setup.preparation()
+    changed_content = {**preparation.base_content, "title": "Autre titre synthétique"}
+
+    with pytest.raises(EditorialProposalApplicationError) as error:
+        await setup.service.prepare_bridge_result(
+            replace(preparation, base_content=changed_content)
+        )
+
+    assert error.value.code == "proposal_base_stale"
+    assert setup.blob_bytes == {}
+    assert "uow_open" not in setup.calls
+
+
+@pytest.mark.asyncio
+async def test_preparation_refuses_a_snapshot_that_advanced_after_the_bridge_turn() -> None:
+    from cti_app.application.editorial_proposals import EditorialProposalApplicationError
+
+    setup = _setup()
+    setup.current_snapshot.snapshot_id = uuid4()
+    setup.current_snapshot.workspace_pin_hash = "8" * 64
+    setup.current_snapshot.synthesis_artifact_id = uuid4()
+    setup.current_snapshot.synthesis_version = 5
+    setup.current_snapshot.synthesis_canonical_sha256 = "9" * 64
+
+    with pytest.raises(EditorialProposalApplicationError) as error:
+        await setup.service.prepare_bridge_result(setup.preparation())
+
+    assert error.value.code == "proposal_base_stale"
+    assert setup.blob_bytes == {}
+    assert "uow_open" not in setup.calls
 
 
 @pytest.mark.asyncio
@@ -487,6 +588,84 @@ async def test_proposal_get_projects_persisted_state_and_base_version() -> None:
             workspace_service=setup.workspace_service,
         )
     assert error.value.code == "proposal_not_found"
+
+
+@pytest.mark.asyncio
+async def test_proposal_get_projects_stale_when_current_pins_advance() -> None:
+    setup = _setup()
+    proposal = await setup.service.prepare_bridge_result(setup.preparation())
+    setup.current_snapshot.workspace_pin_hash = "8" * 64
+    setup.current_snapshot.synthesis_artifact_id = uuid4()
+    setup.current_snapshot.synthesis_version = 5
+    setup.current_snapshot.synthesis_input_hash = "a" * 64
+    setup.current_snapshot.synthesis_canonical_sha256 = "9" * 64
+
+    view = await setup.service.inspect(
+        setup.subject_id,
+        setup.occurrence_id,
+        proposal.id,
+        workspace_service=setup.workspace_service,
+    )
+
+    assert view.state == "stale"
+    assert view.patch is not None
+    assert setup.repository.records[0].state.value == "proposed"
+
+
+@pytest.mark.asyncio
+async def test_proposal_get_detects_patch_blob_altered_after_persistence() -> None:
+    from cti_app.application.editorial_proposals import EditorialProposalApplicationError
+
+    setup = _setup()
+    proposal = await setup.service.prepare_bridge_result(setup.preparation())
+    assert proposal.patch_sha256 is not None
+    setup.blob_bytes[proposal.patch_sha256] = b"altered synthetic patch"
+
+    with pytest.raises(EditorialProposalApplicationError) as error:
+        await setup.service.inspect(
+            setup.subject_id,
+            setup.occurrence_id,
+            proposal.id,
+            workspace_service=setup.workspace_service,
+        )
+
+    assert error.value.code == "proposal_patch_hash_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_get_non_current_proposal_returns_neutral_detail_without_patch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cti_app.api import editorial_workspace as editorial_workspace_api
+
+    subject_id = uuid4()
+    occurrence_id = uuid4()
+    proposal_id = uuid4()
+    app = FastAPI()
+    app.include_router(editorial_workspace_api.router)
+    app.state.uow_factory = lambda: None
+    app.state.production_artifact_store = object()
+
+    async def unresolved_occurrence(_subject_id, _occurrence_id):
+        return SimpleNamespace(entry=None, binding_state="stale", record=None)
+
+    monkeypatch.setattr(
+        editorial_workspace_api,
+        "_service",
+        lambda _request: SimpleNamespace(resolve_occurrence=unresolved_occurrence),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
+    ) as client:
+        response = await client.get(
+            f"/api/subjects/{subject_id}/editor/threads/{occurrence_id}/proposals/{proposal_id}"
+        )
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "detail": {"code": "proposal_not_found", "message": "Proposition introuvable."}
+    }
+    assert "patch" not in response.json()
 
 
 @pytest.mark.asyncio

@@ -132,4 +132,58 @@ describe("EditorialProposalCard", () => {
       "Paragraphe proposé synthétique",
     );
   });
+
+  it("shows a bounded French reason for a Bridge refusal", async () => {
+    const proposal = {
+      id: "proposal-refused",
+      subject_id: "subject-1",
+      production_run_id: "run-1",
+      occurrence_id: "occurrence-1",
+      thread_id: "thread-1",
+      state: "refused",
+      state_version: 1,
+      operation: "rewrite_title",
+      base_artifact_id: "artifact-1",
+      base_artifact_version: 4,
+      base_canonical_sha256: "a".repeat(64),
+      patch_sha256: null,
+      patch: null,
+      diagnostics: { code: "revision_not_applicable" },
+      created_at: "2026-11-19T12:00:00Z",
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          new Response(JSON.stringify(proposal), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+        ),
+      ),
+    );
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    render(
+      <QueryClientProvider client={client}>
+        <EditorialProposalCard
+          subjectId="subject-1"
+          occurrenceId="occurrence-1"
+          proposalId="proposal-refused"
+        />
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByText("Refus Bridge")).toBeVisible();
+    expect(
+      screen.getByText(
+        "Les données disponibles ne permettent pas de proposer cette révision.",
+      ),
+    ).toBeVisible();
+    expect(
+      screen.queryByText(/données synthétiques insuffisantes/i),
+    ).toBeNull();
+  });
 });

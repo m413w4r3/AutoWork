@@ -5,7 +5,7 @@ from datetime import UTC, date, datetime
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import func, select, text, update
+from sqlalchemy import func, insert, select, text, update
 from sqlalchemy.exc import DBAPIError
 
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
@@ -323,6 +323,33 @@ async def test_proposal_persistence_is_exact_idempotent_and_append_only(
         assert link.model_turn_id == model_turn_id
         assert event_count == 1
         assert artifact_count == 1
+
+        with pytest.raises(DBAPIError):
+            async with session_factory() as session, session.begin():
+                await session.execute(
+                    update(EditorialProposalRow)
+                    .where(EditorialProposalRow.id == proposal.id)
+                    .values(state="accepted", state_version=2)
+                )
+
+        async with session_factory() as session:
+            persisted_row = await session.get(EditorialProposalRow, proposal.id)
+            assert persisted_row is not None
+            accepted_values = {
+                column.name: getattr(persisted_row, column.name)
+                for column in EditorialProposalRow.__table__.columns
+            }
+        accepted_values.update(
+            id=uuid4(),
+            state="accepted",
+            state_version=1,
+            idempotency_key=f"accepted-{uuid4().hex}",
+            decision_id=None,
+            accepted_artifact_id=None,
+        )
+        with pytest.raises(DBAPIError):
+            async with session_factory() as session, session.begin():
+                await session.execute(insert(EditorialProposalRow).values(**accepted_values))
 
         with pytest.raises(DBAPIError):
             async with session_factory() as session, session.begin():

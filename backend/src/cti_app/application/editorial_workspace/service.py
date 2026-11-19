@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -35,6 +35,17 @@ from cti_app.domain.editorial_workspace import (
     workspace_pin_hash,
 )
 from cti_app.domain.production import ProductionArtifact, ProductionArtifactStage
+from cti_app.domain.production_editorial_revision import TargetedEditorialRevisionTarget
+
+
+@dataclass(frozen=True, slots=True)
+class EditorialRevisionTargetResolution:
+    record: WorkspaceSnapshotRecord
+    occurrence: WorkspaceOccurrenceResolution
+    canonical_content: Mapping[str, Any]
+    target: TargetedEditorialRevisionTarget
+    target_id: str
+    before_hash: str
 
 
 def advance_workspace_registry(
@@ -109,6 +120,43 @@ class EditorialWorkspaceService:
             "before_hash": resolved.before_hash,
             "operation": resolved.operation,
         }
+
+    async def resolve_revision_target(
+        self,
+        *,
+        subject_id: UUID,
+        snapshot_id: UUID,
+        block_id: UUID,
+        operation: str,
+    ) -> EditorialRevisionTargetResolution:
+        """Resolve the exact current occurrence and its canonical revision target."""
+        _snapshot, record, synthesis = await self._load_current(subject_id)
+        if record.snapshot_id != snapshot_id:
+            raise EditorialWorkspaceError("editorial_snapshot_stale")
+        if record.publication_kind is None:
+            raise EditorialWorkspaceError("publication_kind_unresolved")
+        occurrence = resolve_registry_occurrence(record, block_id)
+        if occurrence.entry is None:
+            raise EditorialWorkspaceError("editorial_block_missing")
+        if occurrence.binding_state == "stale":
+            raise EditorialWorkspaceError("editorial_snapshot_stale")
+        if occurrence.binding_state != "valid":
+            raise EditorialWorkspaceError("editorial_identity_ambiguous")
+        resolved = resolve_workspace_target(
+            entry=occurrence.entry,
+            canonical_content=synthesis,
+            operation=operation,
+        )
+        if resolved.legacy_target_id is None:
+            raise EditorialWorkspaceError("editorial_identity_ambiguous")
+        return EditorialRevisionTargetResolution(
+            record=record,
+            occurrence=occurrence,
+            canonical_content=synthesis,
+            target=resolved.target,
+            target_id=resolved.legacy_target_id,
+            before_hash=resolved.before_hash,
+        )
 
     def advance(
         self,

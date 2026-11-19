@@ -273,6 +273,10 @@ EXPECTED_TRIGGERS: dict[tuple[str, str], str] = {
         "trg_editorial_proposals_no_truncate",
     ): "guard_editorial_proposal_mutation",
     (
+        "editorial_proposals",
+        "trg_editorial_proposals_initial_state",
+    ): "guard_editorial_proposal_initial_state",
+    (
         "editorial_proposal_model_runs",
         "trg_editorial_proposal_model_runs_append_only",
     ): "reject_editorial_proposal_registry_mutation",

@@ -56,6 +56,12 @@ class EditorialProposalRow(Base):
             name="ck_editorial_proposals_state",
         ),
         CheckConstraint(
+            "state = 'accepted' AND decision_id IS NOT NULL AND "
+            "accepted_artifact_id IS NOT NULL OR "
+            "state <> 'accepted' AND decision_id IS NULL AND accepted_artifact_id IS NULL",
+            name="ck_editorial_proposals_acceptance_metadata",
+        ),
+        CheckConstraint(
             f"operation IN ({EDITORIAL_PROPOSAL_OPERATIONS_SQL})",
             name="ck_editorial_proposals_operation",
         ),

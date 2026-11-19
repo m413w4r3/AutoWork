@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 from typing import Any
 from uuid import UUID, uuid4
@@ -42,6 +42,7 @@ from cti_app.domain.editorial_proposal import (
     variant_group_identity,
 )
 from cti_app.domain.editorial_thread import EditorialThreadEventKind
+from cti_app.domain.editorial_workspace import EditorialWorkspaceError
 from cti_app.domain.errors import BlobIntegrityError
 from cti_app.domain.model_conversations import ConversationTurnStatus
 from cti_app.domain.model_runs import ModelRunStatus
@@ -128,16 +129,19 @@ class EditorialProposalService:
         uow_factory: UnitOfWorkFactory,
         blob_store: BlobStore | None = None,
         artifact_store: ProductionArtifactStore | None = None,
+        workspace_service: Any | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._blob_store = blob_store
         self._artifact_store = artifact_store
+        self._workspace_service = workspace_service
 
     async def prepare_bridge_result(
         self, preparation: EditorialProposalPreparation
     ) -> EditorialProposal:
         if not _IDEMPOTENCY_KEY.fullmatch(preparation.idempotency_key):
             raise EditorialProposalApplicationError("idempotency_key_invalid")
+        preparation = await self._resolve_authoritative_preparation(preparation)
         patch_payload, state, kind, diagnostics = self._validate_result(preparation)
         encoded_patch = (
             ProductionArtifactStore.canonical_json_bytes(patch_payload)
@@ -179,6 +183,72 @@ class EditorialProposalService:
             if descriptor is not None:
                 await self._best_effort_orphan_cleanup(descriptor)
             raise
+
+    async def _resolve_authoritative_preparation(
+        self, preparation: EditorialProposalPreparation
+    ) -> EditorialProposalPreparation:
+        if self._workspace_service is None:
+            raise EditorialProposalApplicationError("proposal_workspace_unavailable")
+        try:
+            resolved = await self._workspace_service.resolve_revision_target(
+                subject_id=preparation.subject_id,
+                snapshot_id=preparation.snapshot_id,
+                block_id=preparation.occurrence_id,
+                operation=preparation.operation.value,
+            )
+        except EditorialWorkspaceError as error:
+            code = (
+                "proposal_base_stale"
+                if error.code == "editorial_snapshot_stale"
+                else "proposal_target_ambiguous"
+                if error.code == "editorial_identity_ambiguous"
+                else "proposal_target_mismatch"
+            )
+            raise EditorialProposalApplicationError(code) from None
+
+        record = resolved.record
+        if (
+            record.snapshot_id != preparation.snapshot_id
+            or record.subject_id != preparation.subject_id
+            or record.production_run_id != preparation.production_run_id
+            or record.workspace_pin_hash != preparation.base_pin_hash
+            or record.routing_decision_hash != preparation.routing_decision_hash
+            or record.synthesis_artifact_id != preparation.base_artifact_id
+            or record.synthesis_version != preparation.base_artifact_version
+            or record.synthesis_input_hash != preparation.base_input_hash
+            or record.synthesis_canonical_sha256 != preparation.base_canonical_sha256
+        ):
+            raise EditorialProposalApplicationError("proposal_base_stale")
+
+        supplied_base_sha256 = hashlib.sha256(
+            ProductionArtifactStore.canonical_json_bytes(dict(preparation.base_content))
+        ).hexdigest()
+        resolved_base_sha256 = hashlib.sha256(
+            ProductionArtifactStore.canonical_json_bytes(dict(resolved.canonical_content))
+        ).hexdigest()
+        if (
+            supplied_base_sha256 != record.synthesis_canonical_sha256
+            or resolved_base_sha256 != record.synthesis_canonical_sha256
+        ):
+            raise EditorialProposalApplicationError("proposal_base_stale")
+        if (
+            resolved.occurrence.entry is None
+            or resolved.occurrence.binding_state != "valid"
+            or resolved.occurrence.artifact_id != record.synthesis_artifact_id
+            or resolved.occurrence.artifact_version != record.synthesis_version
+            or resolved.occurrence.canonical_sha256 != record.synthesis_canonical_sha256
+            or preparation.target != resolved.target
+            or preparation.target_id != resolved.target_id
+            or preparation.before_hash != resolved.before_hash
+        ):
+            raise EditorialProposalApplicationError("proposal_target_mismatch")
+        return replace(
+            preparation,
+            target=resolved.target,
+            target_id=resolved.target_id,
+            before_hash=resolved.before_hash,
+            base_content=resolved.canonical_content,
+        )
 
     async def _upload_and_verify_patch(self, encoded_patch: bytes) -> BlobDescriptor:
         if self._blob_store is None:
@@ -417,13 +487,27 @@ class EditorialProposalService:
             ):
                 raise EditorialProposalApplicationError("proposal_patch_unavailable")
             patch = decoded
+        projected_state = proposal.state.value
+        if proposal.state is EditorialProposalState.PROPOSED and (
+            resolution.record.workspace_pin_hash != proposal.base_pin_hash
+            or resolution.record.routing_decision_hash != proposal.base_routing_hash
+            or resolution.record.synthesis_artifact_id != proposal.base_artifact_id
+            or resolution.record.synthesis_version != proposal.base_artifact_version
+            or resolution.record.synthesis_input_hash != proposal.base_input_hash
+            or resolution.record.synthesis_canonical_sha256 != proposal.base_canonical_sha256
+            or resolution.artifact_id != proposal.base_artifact_id
+            or resolution.artifact_version != proposal.base_artifact_version
+            or resolution.canonical_sha256 != proposal.base_canonical_sha256
+        ):
+            # T-M3-13 persists this read-time stale projection before decisions are offered.
+            projected_state = EditorialProposalState.STALE.value
         return EditorialProposalRead(
             id=proposal.id,
             subject_id=proposal.subject_id,
             production_run_id=proposal.production_run_id,
             occurrence_id=proposal.occurrence_id,
             thread_id=proposal.thread_id,
-            state=proposal.state.value,
+            state=projected_state,
             state_version=proposal.state_version,
             operation=proposal.operation,
             base_artifact_id=proposal.base_artifact_id,
@@ -608,13 +692,23 @@ class EditorialProposalService:
     async def _assert_exact_bridge_origin(
         self, uow: UnitOfWork, preparation: EditorialProposalPreparation
     ) -> None:
+        await uow.production_runs.lock_creation_for_subject(preparation.subject_id)
         snapshot = await uow.editorial_workspace_snapshots.get_by_id(preparation.snapshot_id)
+        latest_snapshot = await uow.editorial_workspace_snapshots.latest_for_run(
+            preparation.production_run_id
+        )
         if (
             snapshot is None
+            or latest_snapshot is None
+            or latest_snapshot.snapshot_id != preparation.snapshot_id
             or snapshot.subject_id != preparation.subject_id
             or snapshot.production_run_id != preparation.production_run_id
             or snapshot.workspace_pin_hash != preparation.base_pin_hash
             or snapshot.routing_decision_hash != preparation.routing_decision_hash
+            or snapshot.synthesis_artifact_id != preparation.base_artifact_id
+            or snapshot.synthesis_version != preparation.base_artifact_version
+            or snapshot.synthesis_input_hash != preparation.base_input_hash
+            or snapshot.synthesis_canonical_sha256 != preparation.base_canonical_sha256
         ):
             raise EditorialProposalApplicationError("proposal_base_stale")
         resolution = resolve_occurrence(snapshot, preparation.occurrence_id)

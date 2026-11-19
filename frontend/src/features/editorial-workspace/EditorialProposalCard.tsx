@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 
 import {
   getEditorialProposal,
+  type EditorialProposalRefusalCode,
   type EditorialProposalState,
 } from "../../api/editorialWorkspace";
 import { editorialWorkspaceQueryKeys } from "./editorialWorkspaceQueries";
@@ -21,6 +22,18 @@ const stateLabels: Record<EditorialProposalState, string> = {
   rejected: "Rejetée",
   stale: "Périmée",
 };
+
+const refusalLabels: Record<EditorialProposalRefusalCode, string> = {
+  revision_not_applicable:
+    "Les données disponibles ne permettent pas de proposer cette révision.",
+};
+
+function refusalLabel(code: unknown): string {
+  if (code === "revision_not_applicable") {
+    return refusalLabels[code];
+  }
+  return "Le Bridge n’a pas produit de proposition exploitable.";
+}
 
 export function EditorialProposalCard({
   subjectId,
@@ -73,6 +86,10 @@ export function EditorialProposalCard({
           <h5>Texte proposé</h5>
           <p>{proposedText}</p>
         </div>
+      ) : proposal.state === "refused" ? (
+        <p className="editorial-proposal-card__status" role="status">
+          {refusalLabel(proposal.diagnostics.code)}
+        </p>
       ) : proposal.patch === null ? (
         <p className="editorial-proposal-card__status">
           Aucun patch éditorial n’est disponible pour cette proposition.

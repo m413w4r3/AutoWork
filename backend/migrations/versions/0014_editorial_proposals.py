@@ -23,14 +23,16 @@ _PROPOSALS = "editorial_proposals"
 _MODEL_RUNS = "editorial_proposal_model_runs"
 _EVENTS = "editorial_proposal_events"
 _MUTATION_FUNCTION = "guard_editorial_proposal_mutation"
+_INITIAL_STATE_FUNCTION = "guard_editorial_proposal_initial_state"
 _APPEND_ONLY_FUNCTION = "reject_editorial_proposal_registry_mutation"
-_EXPECTED_FUNCTIONS = {_MUTATION_FUNCTION, _APPEND_ONLY_FUNCTION}
+_EXPECTED_FUNCTIONS = {_MUTATION_FUNCTION, _INITIAL_STATE_FUNCTION, _APPEND_ONLY_FUNCTION}
 _TRIGGERS = {
     (_PROPOSALS, "trg_editorial_proposals_identity_immutable"): (
         _MUTATION_FUNCTION,
         1 | 2 | 8 | 16,
     ),
     (_PROPOSALS, "trg_editorial_proposals_no_truncate"): (_MUTATION_FUNCTION, 2 | 32),
+    (_PROPOSALS, "trg_editorial_proposals_initial_state"): (_INITIAL_STATE_FUNCTION, 1 | 2 | 4),
     (_MODEL_RUNS, "trg_editorial_proposal_model_runs_append_only"): (
         _APPEND_ONLY_FUNCTION,
         1 | 2 | 8 | 16,
@@ -75,6 +77,14 @@ END;
     _APPEND_ONLY_FUNCTION: """
 BEGIN
     RAISE EXCEPTION 'editorial_proposal_registry_is_append_only';
+END;
+""",
+    _INITIAL_STATE_FUNCTION: """
+BEGIN
+    IF NEW.state NOT IN ('preparing', 'proposed', 'refused', 'needs_review') THEN
+        RAISE EXCEPTION 'editorial_proposal_initial_state_invalid';
+    END IF;
+    RETURN NEW;
 END;
 """,
 }
@@ -199,6 +209,12 @@ _proposal_table = sa.Table(
         "origin IN ('bridge_draft', 'manual_patch')", name="ck_editorial_proposals_origin"
     ),
     sa.CheckConstraint(f"state IN ({_state_values})", name="ck_editorial_proposals_state"),
+    sa.CheckConstraint(
+        "state = 'accepted' AND decision_id IS NOT NULL AND "
+        "accepted_artifact_id IS NOT NULL OR "
+        "state <> 'accepted' AND decision_id IS NULL AND accepted_artifact_id IS NULL",
+        name="ck_editorial_proposals_acceptance_metadata",
+    ),
     sa.CheckConstraint(
         f"operation IN ({_operation_values})", name="ck_editorial_proposals_operation"
     ),
@@ -590,13 +606,9 @@ def _guard_errors(bind: Any, schema: str) -> list[str]:
                 "function.prosrc FROM pg_proc function JOIN pg_namespace namespace "
                 "ON namespace.oid = function.pronamespace JOIN pg_language language "
                 "ON language.oid = function.prolang WHERE namespace.nspname = :schema "
-                "AND function.proname IN (:mutation, :append_only)"
+                "AND function.proname = ANY(:names)"
             ),
-            {
-                "schema": schema,
-                "mutation": _MUTATION_FUNCTION,
-                "append_only": _APPEND_ONLY_FUNCTION,
-            },
+            {"schema": schema, "names": list(_EXPECTED_FUNCTIONS)},
         )
         .mappings()
         .all()
@@ -730,10 +742,20 @@ def upgrade() -> None:
         $$ LANGUAGE plpgsql;
         """
     )
+    op.execute(
+        f"""
+        CREATE FUNCTION {_INITIAL_STATE_FUNCTION}() RETURNS trigger AS $$
+        {_FUNCTION_BODIES[_INITIAL_STATE_FUNCTION]}
+        $$ LANGUAGE plpgsql;
+        """
+    )
     for (table, trigger), (function, trigger_type) in _TRIGGERS.items():
         if trigger_type & 32:
             event = "TRUNCATE"
             level = "STATEMENT"
+        elif trigger_type & 4:
+            event = "INSERT"
+            level = "ROW"
         else:
             event = "UPDATE OR DELETE"
             level = "ROW"
@@ -765,5 +787,6 @@ def downgrade() -> None:
     op.drop_table(_EVENTS)
     op.drop_table(_MODEL_RUNS)
     op.drop_table(_PROPOSALS)
+    op.execute(f"DROP FUNCTION {_INITIAL_STATE_FUNCTION}()")
     op.execute(f"DROP FUNCTION {_APPEND_ONLY_FUNCTION}()")
     op.execute(f"DROP FUNCTION {_MUTATION_FUNCTION}()")

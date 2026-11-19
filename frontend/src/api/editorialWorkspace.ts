@@ -185,6 +185,8 @@ export type EditorialProposalState =
   | "rejected"
   | "stale";
 
+export type EditorialProposalRefusalCode = "revision_not_applicable";
+
 export type EditorialProposalOperation =
   | "rewrite_title"
   | "rewrite_lead"

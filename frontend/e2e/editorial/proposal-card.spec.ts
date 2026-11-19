@@ -86,6 +86,7 @@ const proposal: EditorialProposalRead = {
 
 test("renders a persisted proposal with stubbed API data", async ({ page }) => {
   const unexpectedRequests: string[] = [];
+  let currentProposal = proposal;
   const proposalPath = `/api/subjects/${subjectId}/editor/threads/${occurrenceId}/proposals/${proposalId}`;
   const threadPath = `/api/subjects/${subjectId}/editor/threads/${occurrenceId}`;
   const snapshotPath = `/api/subjects/${subjectId}/editor/snapshot`;
@@ -148,7 +149,7 @@ test("renders a persisted proposal with stubbed API data", async ({ page }) => {
       return;
     }
     if (method === "GET" && url.pathname === proposalPath) {
-      await route.fulfill({ json: proposal });
+      await route.fulfill({ json: currentProposal });
       return;
     }
     unexpectedRequests.push(`${method} ${url.pathname}`);
@@ -175,6 +176,34 @@ test("renders a persisted proposal with stubbed API data", async ({ page }) => {
   await mkdir(screenshotDirectory, { recursive: true });
   await page.screenshot({
     path: resolve(screenshotDirectory, "proposal-card-1440x900.png"),
+    fullPage: true,
+  });
+
+  currentProposal = {
+    ...proposal,
+    state: "refused",
+    patch_sha256: null,
+    patch: null,
+    diagnostics: { code: "revision_not_applicable" },
+  };
+  await page.reload();
+  await page.locator(`[data-block-id="${occurrenceId}"]`).click();
+  const refusedCard = page.getByRole("article", {
+    name: "Proposition éditoriale",
+  });
+  await expect(refusedCard.getByText("Refus Bridge")).toBeVisible();
+  await expect(
+    refusedCard.getByText(
+      "Les données disponibles ne permettent pas de proposer cette révision.",
+    ),
+  ).toBeVisible();
+  const refusalScreenshotDirectory = resolve(
+    process.cwd(),
+    "../.autowork-runs/shots-T-M3-12",
+  );
+  await mkdir(refusalScreenshotDirectory, { recursive: true });
+  await page.screenshot({
+    path: resolve(refusalScreenshotDirectory, "proposal-refused-1440x900.png"),
     fullPage: true,
   });
   expect(unexpectedRequests).toEqual([]);

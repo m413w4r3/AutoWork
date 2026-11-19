@@ -78,6 +78,8 @@ class ResolvedWorkspaceTarget:
     path: str
     before_hash: str
     operation: str
+    target: TargetedEditorialRevisionTarget
+    legacy_target_id: str | None
 
 
 def resolve_canonical_target(
@@ -321,7 +323,7 @@ def resolve_workspace_target(
         raise EditorialBlockMissingError("editorial_block_missing")
     try:
         typed_operation = TargetedEditorialRevisionOperation(operation)
-        target, operations, _legacy_target_id = _target_for_entry(entry, canonical_content)
+        target, operations, legacy_target_id = _target_for_entry(entry, canonical_content)
         reduced_content = _copy_with_selected_occurrence(canonical_content, entry)
     except (TypeError, ValueError) as exc:
         raise EditorialBlockMissingError("editorial_block_missing") from exc
@@ -334,7 +336,14 @@ def resolve_workspace_target(
             raise EditorialIdentityAmbiguousError("editorial_identity_ambiguous") from exc
         raise EditorialBlockMissingError("editorial_block_missing") from exc
     path = f"synthesis{entry.structural_pointer}"
-    return ResolvedWorkspaceTarget(entry.block_id, path, resolved.before_hash, operation)
+    return ResolvedWorkspaceTarget(
+        entry.block_id,
+        path,
+        resolved.before_hash,
+        operation,
+        target,
+        legacy_target_id,
+    )
 
 
 def project_blocks(

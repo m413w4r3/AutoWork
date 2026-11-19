@@ -157,6 +157,41 @@ def test_unresolved_publication_kind_suppresses_operations_and_resolve(
     asyncio.run(exercise())
 
 
+def test_service_resolves_revision_target_from_current_occurrence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cti_app.application.editorial_workspace import service as service_module
+    from cti_app.domain.publication_kind import PublicationKind
+
+    service, subject_id, _repository, _artifacts, _artifact_store = _workspace_service(
+        _synthesis((_paragraph("synthetic paragraph"),)), monkeypatch
+    )
+    monkeypatch.setattr(
+        service_module,
+        "resolve_publication_kind",
+        lambda _routing, _publication: (PublicationKind.ARTICLE, "b" * 64),
+    )
+
+    async def exercise() -> None:
+        snapshot = await service.snapshot(subject_id)
+        title = next(block for block in snapshot["blocks"] if block["kind"] == "title")
+        resolved = await service.resolve_revision_target(
+            subject_id=subject_id,
+            snapshot_id=UUID(snapshot["snapshot_id"]),
+            block_id=UUID(title["block_id"]),
+            operation="rewrite_title",
+        )
+
+        assert resolved.record.snapshot_id == UUID(snapshot["snapshot_id"])
+        assert resolved.occurrence.entry is not None
+        assert resolved.occurrence.entry.block_id == UUID(title["block_id"])
+        assert resolved.target.kind.value == "title"
+        assert resolved.target_id == title["revision_target"]["legacy_target_id"]
+        assert resolved.before_hash == resolved.record.block_registry[0].content_sha256
+
+    asyncio.run(exercise())
+
+
 def test_unchanged_block_keeps_id_after_unrelated_paragraph_rewrite(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
