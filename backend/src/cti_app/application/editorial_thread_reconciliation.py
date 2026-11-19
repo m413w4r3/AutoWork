@@ -20,6 +20,7 @@ from cti_app.application.editorial_workspace import EditorialWorkspaceService
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.domain.editorial_bridge_generation_slot import BridgeGenerationSlotState
 from cti_app.domain.editorial_thread import (
     EditorialBridgeStatus,
     EditorialThreadEvent,
@@ -91,6 +92,15 @@ class EditorialThreadReconciliation:
                 raise EditorialThreadApplicationError("reconciliation_required")
             thread = record.thread
             conversation_id = thread.model_conversation_id
+            slot = await uow.bridge_generation_slots.get()
+            slot_lease_token = (
+                slot.lease_token
+                if slot.state
+                in {BridgeGenerationSlotState.HELD, BridgeGenerationSlotState.HELD_UNKNOWN}
+                and slot.holder_thread_id == thread.id
+                and slot.holder_job_id == job.id
+                else None
+            )
 
         if conversation_id is None or self._model_conversations is None:
             raise EditorialThreadApplicationError("reconciliation_required")
@@ -104,9 +114,7 @@ class EditorialThreadReconciliation:
             )
         except Exception:
             raise EditorialThreadApplicationError("reconciliation_required") from None
-        if turn_content is None:
-            raise EditorialThreadApplicationError("reconciliation_required")
-        turn_id = turn_content.turn.id
+        turn_id = turn_content.turn.id if turn_content is not None else None
         digest = hashlib.sha256(
             json.dumps(
                 {
@@ -116,7 +124,7 @@ class EditorialThreadReconciliation:
                     "target": {
                         "job_id": str(job.id),
                         "send_event_id": str(send_event.id),
-                        "turn_id": str(turn_id),
+                        "turn_id": str(turn_id) if turn_id is not None else None,
                     },
                 },
                 sort_keys=True,
@@ -156,15 +164,17 @@ class EditorialThreadReconciliation:
                 )
             if current_job.state is not EditorialThreadJobState.RECONCILIATION_REQUIRED:
                 raise EditorialThreadApplicationError("reconciliation_required")
-        try:
-            turn_result = await self._model_conversations._reconcile_editorial_thread_turn(
-                conversation_id,
-                thread_id=thread.id,
-                turn_idempotency_key=turn_idempotency_key,
-                context_subject_id=subject_id,
-            )
-        except Exception:
-            turn_result = None
+        turn_result = None
+        if turn_content is not None:
+            try:
+                turn_result = await self._model_conversations._reconcile_editorial_thread_turn(
+                    conversation_id,
+                    thread_id=thread.id,
+                    turn_idempotency_key=turn_idempotency_key,
+                    context_subject_id=subject_id,
+                )
+            except Exception:
+                turn_result = None
         if turn_result is not None and turn_result.turn_id not in (None, turn_id):
             turn_result = None
         outcome = (
@@ -258,6 +268,24 @@ class EditorialThreadReconciliation:
                 recorded_result = await _reconciliation_result_from_event(
                     thread.id, recorded_event, self._artifact_store
                 )
+                if (
+                    recorded_result.outcome
+                    in {
+                        EditorialThreadReconciliationOutcome.RECONCILED_REPLY,
+                        EditorialThreadReconciliationOutcome.NOT_SUBMITTED,
+                        EditorialThreadReconciliationOutcome.SESSION_LOST,
+                    }
+                    and slot_lease_token is not None
+                ):
+                    released = await uow.bridge_generation_slots.release_after_reconciliation(
+                        lease_token=slot_lease_token,
+                        thread_id=thread.id,
+                        job_id=job.id,
+                        turn_id=turn_id,
+                        outcome=recorded_result.outcome,
+                    )
+                    if not released:
+                        raise EditorialThreadApplicationError("reconciliation_required")
                 recorded_job_state = (
                     EditorialThreadJobState.RECONCILIATION_REQUIRED
                     if recorded_result.outcome is EditorialThreadReconciliationOutcome.STILL_UNKNOWN

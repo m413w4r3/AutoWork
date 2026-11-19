@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, timedelta
 from typing import cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
@@ -415,17 +415,14 @@ async def test_post_races_claim_and_completion_with_thread_then_job_lock_order(
                 await uow.commit()
                 return "accepted"
 
-        now = datetime.now(UTC)
         claim_token = uuid4()
-        lease_until = now + timedelta(minutes=1)
 
         async def claim():
             async with SqlAlchemyUnitOfWork(session_factory) as uow:
                 claimed = await uow.editorial_threads.claim_job(
                     job_id,
                     lease_token=claim_token,
-                    lease_until=lease_until,
-                    now=now,
+                    lease_duration=timedelta(minutes=1),
                 )
                 await uow.commit()
                 return claimed

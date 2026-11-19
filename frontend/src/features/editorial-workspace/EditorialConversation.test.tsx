@@ -320,6 +320,17 @@ describe("EditorialConversation", () => {
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
     await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(
+      screen.getByText(
+        "Votre demande attend qu’une capacité Bridge soit disponible. Son état sera suivi dans ce fil.",
+      ),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("button", { name: /réessayer/i }),
+    ).not.toBeInTheDocument();
+    await act(async () => {
       await vi.advanceTimersByTimeAsync(1_600);
     });
     expect(fetchMock).toHaveBeenCalledTimes(2);

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Collection, Mapping, Sequence
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Protocol, Self
 from uuid import UUID
@@ -57,6 +57,11 @@ from cti_app.domain.edition_publication import (
 from cti_app.domain.edition_render import EditionRender
 from cti_app.domain.editions import Edition, EditionAuditEvent, EditionStatus
 from cti_app.domain.editorial import AnalystDecision, HumanDecision
+from cti_app.domain.editorial_bridge_generation_slot import (
+    BridgeGenerationPreviousOutcome,
+    BridgeGenerationSlot,
+    BridgeGenerationSlotAcquireResult,
+)
 from cti_app.domain.editorial_thread import (
     EditorialBridgeStatus,
     EditorialThread,
@@ -64,6 +69,7 @@ from cti_app.domain.editorial_thread import (
     EditorialThreadEventKind,
     EditorialThreadJob,
     EditorialThreadJobState,
+    EditorialThreadReconciliationOutcome,
     EditorialThreadRecord,
 )
 from cti_app.domain.entities import ProvenanceEvent, Sample, SourceDocument, Subject
@@ -227,12 +233,18 @@ class EditorialThreadRepository(Protocol):
 
     async def get_job(self, job_id: UUID) -> EditorialThreadJob | None: ...
 
+    async def get_job_for_update(self, job_id: UUID) -> EditorialThreadJob | None: ...
+
+    async def is_current_worker_lease(
+        self, *, job_id: UUID, thread_id: UUID, lease_token: UUID
+    ) -> bool: ...
+
     async def get_job_for_event(self, event_id: UUID) -> EditorialThreadJob | None: ...
 
     async def latest_job_for_thread(self, thread_id: UUID) -> EditorialThreadJob | None: ...
 
     async def claim_job(
-        self, job_id: UUID, *, lease_token: UUID, lease_until: datetime, now: datetime
+        self, job_id: UUID, *, lease_token: UUID, lease_duration: timedelta
     ) -> EditorialThreadJob | None: ...
 
     async def set_job_state(
@@ -249,6 +261,56 @@ class EditorialThreadRepository(Protocol):
     async def list_dispatchable_jobs(
         self, *, now: datetime, limit: int = 100
     ) -> Sequence[UUID]: ...
+
+
+class BridgeGenerationSlotRepository(Protocol):
+    async def get(self) -> BridgeGenerationSlot: ...
+
+    async def is_held_unknown_for(
+        self, *, lease_token: int, thread_id: UUID, job_id: UUID
+    ) -> bool: ...
+
+    async def is_held_for(self, *, lease_token: int, thread_id: UUID, job_id: UUID) -> bool: ...
+
+    async def try_acquire(
+        self,
+        *,
+        expected_token: int,
+        previous_outcome: BridgeGenerationPreviousOutcome,
+        holder_thread_id: UUID,
+        holder_job_id: UUID,
+        lease_duration: timedelta,
+        allow_reentry: bool,
+        test_now: datetime | None = None,
+    ) -> BridgeGenerationSlotAcquireResult: ...
+
+    async def mark_unknown(
+        self,
+        *,
+        lease_token: int,
+        thread_id: UUID,
+        job_id: UUID,
+        turn_id: UUID | None,
+    ) -> bool: ...
+
+    async def release_after_terminal(
+        self,
+        *,
+        lease_token: int,
+        thread_id: UUID,
+        job_id: UUID,
+        turn_id: UUID | None,
+    ) -> bool: ...
+
+    async def release_after_reconciliation(
+        self,
+        *,
+        lease_token: int,
+        thread_id: UUID,
+        job_id: UUID,
+        turn_id: UUID | None,
+        outcome: EditorialThreadReconciliationOutcome,
+    ) -> bool: ...
 
 
 class MediaAssetRepository(Protocol):
@@ -1044,6 +1106,7 @@ class UnitOfWork(Protocol):
     production_routing_decisions: ProductionRoutingDecisionRepository
     editorial_workspace_snapshots: EditorialWorkspaceSnapshotRepository
     editorial_threads: EditorialThreadRepository
+    bridge_generation_slots: BridgeGenerationSlotRepository
     production_input_snapshots: ProductionInputSnapshotRepository
     production_artifacts: ProductionArtifactRepository
     production_source_additions: ProductionSourceAdditionRepository

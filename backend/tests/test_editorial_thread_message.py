@@ -5,6 +5,7 @@ import hashlib
 import json
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
@@ -17,6 +18,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 
 from cti_app.api import editorial_workspace as editorial_workspace_api
 from cti_app.application.diagnostics import DiagnosticsLog
+from cti_app.application.editorial_bridge_gate import EditorialBridgeGate
 from cti_app.application.editorial_thread_job_completion import (
     EditorialThreadJobCompletion,
     EditorialThreadSessionLostOutcome,
@@ -43,6 +45,12 @@ from cti_app.application.model_gateway import (
     ModelRoutingHint,
 )
 from cti_app.domain.classification import TLP
+from cti_app.domain.editorial_bridge_generation_slot import (
+    BridgeGenerationPreviousOutcome,
+    BridgeGenerationSlot,
+    BridgeGenerationSlotAcquireResult,
+    BridgeGenerationSlotState,
+)
 from cti_app.domain.editorial_thread import (
     EditorialBridgeStatus,
     EditorialThread,
@@ -65,6 +73,7 @@ from cti_app.domain.model_conversations import (
 )
 from cti_app.domain.model_runs import (
     EDITORIAL_DISCUSSION_PROMPT_ID,
+    ModelBackend,
     ModelProvider,
     ModelRole,
     ModelRun,
@@ -270,6 +279,11 @@ class MemoryThreadRepository:
 class MemoryUow:
     def __init__(self, repository: MemoryThreadRepository) -> None:
         self.editorial_threads = repository
+        slots = getattr(repository, "bridge_generation_slots", None)
+        if slots is None:
+            slots = MemoryBridgeGenerationSlots()
+            repository.bridge_generation_slots = slots
+        self.bridge_generation_slots = slots
         self.rollback_count = 0
 
     async def commit(self) -> None:
@@ -286,7 +300,8 @@ class WorkerThreadRepository:
         self.proposal_writes = 0
         self.canonical_writes = 0
 
-    async def claim_job(self, job_id: UUID, *, lease_token: UUID, lease_until, now):
+    async def claim_job(self, job_id: UUID, *, lease_token: UUID, lease_duration):
+        now = datetime.now(UTC)
         job = self.jobs.get(job_id)
         if job is None or not (
             job.state is EditorialThreadJobState.QUEUED
@@ -294,13 +309,18 @@ class WorkerThreadRepository:
                 job.state is EditorialThreadJobState.WAITING_FOR_CAPACITY
                 and (job.lease_until is None or job.lease_until <= now)
             )
+            or (
+                job.state is EditorialThreadJobState.RUNNING
+                and job.lease_until is not None
+                and job.lease_until <= now
+            )
         ):
             return None
         claimed = replace(
             job,
             state=EditorialThreadJobState.RUNNING,
             lease_token=lease_token,
-            lease_until=lease_until,
+            lease_until=now + lease_duration,
             attempt_count=job.attempt_count + 1,
         )
         self.jobs[job_id] = claimed
@@ -308,6 +328,20 @@ class WorkerThreadRepository:
 
     async def get_job(self, job_id: UUID):
         return self.jobs.get(job_id)
+
+    async def get_job_for_update(self, job_id: UUID):
+        return self.jobs.get(job_id)
+
+    async def is_current_worker_lease(self, *, job_id, thread_id, lease_token):
+        job = self.jobs.get(job_id)
+        return bool(
+            job is not None
+            and job.thread_id == thread_id
+            and job.state is EditorialThreadJobState.RUNNING
+            and job.lease_token == lease_token
+            and job.lease_until is not None
+            and job.lease_until > datetime.now(UTC)
+        )
 
     async def get(self, thread_id: UUID):
         return self.record if self.record.thread.id == thread_id else None
@@ -371,11 +405,149 @@ class WorkerThreadRepository:
         return event
 
 
+class MemoryBridgeGenerationSlots:
+    def __init__(self) -> None:
+        self.row = BridgeGenerationSlot(
+            singleton_key=1,
+            holder_thread_id=None,
+            holder_job_id=None,
+            holder_turn_id=None,
+            lease_token=0,
+            acquired_at=None,
+            lease_expires_at=None,
+            state=BridgeGenerationSlotState.FREE,
+        )
+
+    async def get(self):
+        return self.row
+
+    async def try_acquire(self, **values):
+        row = self.row
+        now = values["test_now"] or datetime.now(UTC)
+        if row.lease_token != values["expected_token"]:
+            return BridgeGenerationSlotAcquireResult.STALE
+        same_holder = (
+            row.holder_thread_id == values["holder_thread_id"]
+            and row.holder_job_id == values["holder_job_id"]
+        )
+        if (
+            same_holder
+            and row.state
+            in {BridgeGenerationSlotState.HELD, BridgeGenerationSlotState.HELD_UNKNOWN}
+            and values["allow_reentry"]
+        ):
+            self.row = replace(
+                row,
+                state=BridgeGenerationSlotState.HELD,
+                lease_expires_at=now + values["lease_duration"],
+            )
+            return BridgeGenerationSlotAcquireResult.REENTERED
+        if row.state is BridgeGenerationSlotState.HELD_UNKNOWN:
+            return BridgeGenerationSlotAcquireResult.HELD_UNKNOWN
+        if row.state is BridgeGenerationSlotState.HELD:
+            if row.lease_expires_at is None or row.lease_expires_at > now:
+                return BridgeGenerationSlotAcquireResult.BUSY
+            if values["previous_outcome"] is BridgeGenerationPreviousOutcome.UNKNOWN:
+                self.row = replace(row, state=BridgeGenerationSlotState.HELD_UNKNOWN)
+                return BridgeGenerationSlotAcquireResult.HELD_UNKNOWN
+        self.row = BridgeGenerationSlot(
+            singleton_key=1,
+            holder_thread_id=values["holder_thread_id"],
+            holder_job_id=values["holder_job_id"],
+            holder_turn_id=None,
+            lease_token=row.lease_token + 1,
+            acquired_at=now,
+            lease_expires_at=now + values["lease_duration"],
+            state=BridgeGenerationSlotState.HELD,
+        )
+        return BridgeGenerationSlotAcquireResult.ACQUIRED
+
+    async def is_held_for(self, *, lease_token, thread_id, job_id):
+        return (
+            self.row.state is BridgeGenerationSlotState.HELD
+            and self.row.lease_token == lease_token
+            and self.row.holder_thread_id == thread_id
+            and self.row.holder_job_id == job_id
+        )
+
+    async def mark_unknown(self, *, lease_token, thread_id, job_id, turn_id):
+        if (
+            self.row.lease_token != lease_token
+            or self.row.holder_thread_id != thread_id
+            or self.row.holder_job_id != job_id
+        ):
+            return False
+        self.row = replace(
+            self.row,
+            state=BridgeGenerationSlotState.HELD_UNKNOWN,
+            holder_turn_id=turn_id or self.row.holder_turn_id,
+        )
+        return True
+
+    async def release_after_terminal(self, *, lease_token, thread_id, job_id, turn_id):
+        if not _slot_matches(self.row, lease_token, thread_id, job_id, turn_id):
+            return False
+        self._clear()
+        return True
+
+    async def release_after_reconciliation(
+        self, *, lease_token, thread_id, job_id, turn_id, outcome
+    ):
+        if (
+            outcome
+            not in {
+                EditorialThreadReconciliationOutcome.RECONCILED_REPLY,
+                EditorialThreadReconciliationOutcome.NOT_SUBMITTED,
+                EditorialThreadReconciliationOutcome.SESSION_LOST,
+            }
+            or self.row.lease_token != lease_token
+            or self.row.state
+            not in {BridgeGenerationSlotState.HELD, BridgeGenerationSlotState.HELD_UNKNOWN}
+            or self.row.holder_thread_id != thread_id
+            or self.row.holder_job_id != job_id
+            or self.row.holder_turn_id not in (None, turn_id)
+        ):
+            return False
+        self._clear()
+        return True
+
+    def _clear(self) -> None:
+        self.row = BridgeGenerationSlot(
+            singleton_key=1,
+            holder_thread_id=None,
+            holder_job_id=None,
+            holder_turn_id=None,
+            lease_token=self.row.lease_token,
+            acquired_at=None,
+            lease_expires_at=None,
+            state=BridgeGenerationSlotState.FREE,
+        )
+
+
+def _slot_matches(row, lease_token, thread_id, job_id, turn_id):
+    return (
+        row.lease_token == lease_token
+        and row.state in {BridgeGenerationSlotState.HELD, BridgeGenerationSlotState.HELD_UNKNOWN}
+        and row.holder_thread_id == thread_id
+        and row.holder_job_id == job_id
+        and row.holder_turn_id in (None, turn_id)
+    )
+
+
 class WorkerUow:
     def __init__(
-        self, *, repo, run, production_snapshot, extraction_artifact, subject, source_docs
+        self,
+        *,
+        repo,
+        run,
+        production_snapshot,
+        extraction_artifact,
+        subject,
+        source_docs,
+        bridge_generation_slots,
     ):
         self.editorial_threads = repo
+        self.bridge_generation_slots = bridge_generation_slots
         self.production_runs = SimpleNamespace(
             get_current_for_subject=lambda _subject_id: _async_value(run)
         )
@@ -390,11 +562,15 @@ class WorkerUow:
         self.subjects = SimpleNamespace(get=lambda _subject_id: _async_value(subject))
         self.source_documents = source_docs
         self.source_collections = SimpleNamespace(get=lambda _collection_id: _async_value(None))
+        self.turns: dict[UUID, ModelConversationTurn] = {}
+        self.runs: dict[UUID, object] = {}
         self.model_conversation_turns = SimpleNamespace(
-            get=lambda _turn_id: _async_value(None),
-            get_by_idempotency_key=lambda _key: _async_value(None),
+            get=lambda turn_id: _async_value(self.turns.get(turn_id)),
+            get_by_idempotency_key=lambda key: _async_value(
+                next((turn for turn in self.turns.values() if turn.idempotency_key == key), None)
+            ),
         )
-        self.model_runs = SimpleNamespace(get=lambda _run_id: _async_value(None))
+        self.model_runs = SimpleNamespace(get=lambda run_id: _async_value(self.runs.get(run_id)))
 
     async def commit(self) -> None:
         return None
@@ -402,6 +578,23 @@ class WorkerUow:
 
 async def _async_value(value):
     return value
+
+
+def _terminal_bridge_run(
+    *,
+    status: ModelRunStatus = ModelRunStatus.SUCCEEDED,
+    submission_state: ModelSubmissionState = ModelSubmissionState.RESULT_OBTAINED,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        backend=ModelBackend.CHATGPT_BRIDGE,
+        status=status,
+        submission_state=submission_state,
+        response_id=None,
+        output_references=(),
+        raw_output_reference=None,
+        raw_output_sha256=None,
+        raw_output_chars=None,
+    )
 
 
 class WorkerSourceDocuments:
@@ -428,6 +621,7 @@ class WorkerModelConversations:
         thread_id: UUID,
         conversation_id: UUID,
         source_docs: WorkerSourceDocuments,
+        uow: WorkerUow,
         failure=None,
     ) -> None:
         self.thread_id = thread_id
@@ -440,6 +634,7 @@ class WorkerModelConversations:
             turn_count=0,
         )
         self.source_docs = source_docs
+        self.uow = uow
         self.failure = failure
         self.add_calls = 0
         self.gateway_calls = 0
@@ -459,11 +654,37 @@ class WorkerModelConversations:
         self.add_arguments = values
         assert self.source_docs.requested
         if self.failure is not None:
+            if isinstance(self.failure, ConversationTurnFailedError) or (
+                isinstance(self.failure, RuntimeError)
+                and not isinstance(self.failure, ConversationBusyError)
+            ):
+                self._persist_attempt(
+                    values,
+                    run_status=(
+                        ModelRunStatus.NEEDS_REVIEW
+                        if isinstance(self.failure, RuntimeError)
+                        or self.failure.status is ConversationTurnStatus.NEEDS_REVIEW
+                        else ModelRunStatus.FAILED
+                    ),
+                    submission_state=(
+                        ModelSubmissionState.EXTERNAL_STATE_UNKNOWN
+                        if isinstance(self.failure, RuntimeError)
+                        or self.failure.submission_state != "pre_submission"
+                        else ModelSubmissionState.NOT_SUBMITTED
+                    ),
+                    turn_status=(
+                        ConversationTurnStatus.NEEDS_REVIEW
+                        if isinstance(self.failure, RuntimeError)
+                        or self.failure.status is ConversationTurnStatus.NEEDS_REVIEW
+                        else ConversationTurnStatus.FAILED
+                    ),
+                )
             raise self.failure
         if self.replay_turn is not None:
             self.turn = self.replay_turn
+            self.uow.turns[self.turn.id] = self.turn
+            self.uow.runs[self.turn.model_run_id] = _terminal_bridge_run()
             return self.replay_turn
-        self.gateway_calls += 1
         assert values["editorial_objective"] is EditorialDiscussionObjective.MESSAGE
         assert isinstance(values["editorial_context"], EditorialDiscussionContext)
         self.turn = ModelConversationTurn(
@@ -480,7 +701,36 @@ class WorkerModelConversations:
             status=ConversationTurnStatus.SUCCEEDED,
             external_turn_id="verified-external-turn-1",
         )
+        self.uow.turns[self.turn.id] = self.turn
+        self.uow.runs[self.turn.model_run_id] = _terminal_bridge_run()
+        self.gateway_calls += 1
         return self.turn
+
+    def _persist_attempt(
+        self,
+        values,
+        *,
+        run_status: ModelRunStatus,
+        submission_state: ModelSubmissionState,
+        turn_status: ConversationTurnStatus,
+    ) -> None:
+        run_id = uuid4()
+        turn = ModelConversationTurn(
+            conversation_id=self.conversation.id,
+            sequence=1,
+            model_run_id=run_id,
+            input_blob_reference="blob://synthetic-input",
+            input_sha256="f" * 64,
+            idempotency_key=values["idempotency_key"],
+            correlation_id=values["correlation_id"],
+            objective="editorial_message",
+            status=turn_status,
+        )
+        self.turn = turn
+        self.uow.turns[turn.id] = turn
+        self.uow.runs[run_id] = _terminal_bridge_run(
+            status=run_status, submission_state=submission_state
+        )
 
     async def turns_for_editorial_thread(
         self, _conversation_id: UUID, *, thread_id: UUID, context_subject_id: UUID
@@ -679,6 +929,7 @@ def make_worker_runtime(
         async def snapshot(self, _subject_id: UUID):
             return workspace_view
 
+    bridge_generation_slots = MemoryBridgeGenerationSlots()
     uow = WorkerUow(
         repo=repository,
         run=run,
@@ -686,7 +937,10 @@ def make_worker_runtime(
         extraction_artifact=extraction_artifact,
         subject=subject,
         source_docs=source_docs,
+        bridge_generation_slots=bridge_generation_slots,
     )
+    repository.bridge_generation_slots = bridge_generation_slots
+    repository.worker_uow = uow
 
     @asynccontextmanager
     async def uow_factory():
@@ -697,6 +951,7 @@ def make_worker_runtime(
         thread_id=thread.id,
         conversation_id=model_conversation_id,
         source_docs=source_docs,
+        uow=uow,
         failure=failure,
     )
     worker = EditorialThreadWorker(
@@ -1109,6 +1364,93 @@ async def test_reconcile_reads_exact_turn_without_second_gateway_call(
     ]
     assert repository.jobs[job.id].state is EditorialThreadJobState.RECONCILIATION_REQUIRED
     assert repository.records[0].events[-1].kind is EditorialThreadEventKind.RECONCILIATION
+
+
+@pytest.mark.asyncio
+async def test_reconcile_without_exact_turn_stays_unknown_and_keeps_slot_held(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject_id, occurrence_id, service, repository, _store, _queued, conversations = make_service(
+        monkeypatch
+    )
+    await service.send_message(
+        subject_id,
+        occurrence_id,
+        text="Synthetic message with missing persisted turn.",
+        actor_id=UUID("00000000-0000-0000-0000-000000000099"),
+        idempotency_key="missing-turn-send-key",
+    )
+    record = repository.records[0]
+    job = next(iter(repository.jobs.values()))
+    repository.jobs[job.id] = replace(job, state=EditorialThreadJobState.RECONCILIATION_REQUIRED)
+    repository.records[0] = replace(
+        record,
+        thread=replace(record.thread, bridge_status=EditorialBridgeStatus.RECONCILIATION_REQUIRED),
+    )
+    slots = repository.bridge_generation_slots
+    slots.row = BridgeGenerationSlot(
+        singleton_key=1,
+        holder_thread_id=record.thread.id,
+        holder_job_id=job.id,
+        holder_turn_id=None,
+        lease_token=14,
+        acquired_at=datetime.now(UTC) - timedelta(hours=1),
+        lease_expires_at=datetime.now(UTC) - timedelta(minutes=30),
+        state=BridgeGenerationSlotState.HELD_UNKNOWN,
+    )
+
+    async def no_exact_turn(*_args, **_kwargs):
+        return None
+
+    conversations.turn_content_by_idempotency_key = no_exact_turn
+    app = FastAPI()
+    app.include_router(editorial_workspace_api.router)
+    url = f"/api/subjects/{subject_id}/editor/threads/{occurrence_id}/reconcile"
+    headers = {"Idempotency-Key": "missing-turn-reconcile-key"}
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
+    ) as client:
+        response = await client.post(url, headers=headers)
+        replay = await client.post(url, headers=headers)
+
+    assert response.status_code == 200
+    assert replay.status_code == 200
+    assert response.json() == replay.json()
+    assert response.json()["outcome"] == "still_unknown"
+    assert conversations.reconcile_calls == []
+    assert slots.row.state is BridgeGenerationSlotState.HELD_UNKNOWN
+    assert slots.row.lease_token == 14
+    assert repository.jobs[job.id].state is EditorialThreadJobState.RECONCILIATION_REQUIRED
+    assert repository.records[0].events[-1].model_turn_id is None
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_release_rejects_stale_slot_token() -> None:
+    slots = MemoryBridgeGenerationSlots()
+    thread_id, job_id, turn_id = uuid4(), uuid4(), uuid4()
+    slots.row = BridgeGenerationSlot(
+        singleton_key=1,
+        holder_thread_id=thread_id,
+        holder_job_id=job_id,
+        holder_turn_id=None,
+        lease_token=22,
+        acquired_at=datetime.now(UTC),
+        lease_expires_at=datetime.now(UTC) + timedelta(minutes=30),
+        state=BridgeGenerationSlotState.HELD,
+    )
+
+    released = await slots.release_after_reconciliation(
+        lease_token=21,
+        thread_id=thread_id,
+        job_id=job_id,
+        turn_id=turn_id,
+        outcome=EditorialThreadReconciliationOutcome.NOT_SUBMITTED,
+    )
+
+    assert not released
+    assert slots.row.state is BridgeGenerationSlotState.HELD
+    assert slots.row.lease_token == 22
 
 
 @pytest.mark.asyncio
@@ -1730,6 +2072,70 @@ async def test_private_reconciliation_uses_only_exact_persisted_run_without_resu
 
 
 @pytest.mark.asyncio
+async def test_worker_recovers_crash_before_add_turn_under_same_slot_fence() -> None:
+    worker, repository, _store, model_conversations, _message = make_worker_runtime()
+    job_id = next(iter(repository.jobs))
+    original_add_turn = model_conversations.add_turn
+    attempts = 0
+
+    async def crash_before_add_turn(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise asyncio.CancelledError
+        return await original_add_turn(*_args, **_kwargs)
+
+    model_conversations.add_turn = crash_before_add_turn
+    with pytest.raises(asyncio.CancelledError):
+        await worker.process(job_id)
+
+    slot = repository.bridge_generation_slots.row
+    assert slot.state is BridgeGenerationSlotState.HELD
+    first_fence = slot.lease_token
+    assert repository.worker_uow.turns == {}
+    assert repository.worker_uow.runs == {}
+    assert model_conversations.gateway_calls == 0
+
+    repository.jobs[job_id] = replace(
+        repository.jobs[job_id],
+        lease_until=datetime.now(UTC) - timedelta(seconds=1),
+    )
+    repository.bridge_generation_slots.row = replace(
+        repository.bridge_generation_slots.row,
+        lease_expires_at=datetime.now(UTC) - timedelta(seconds=1),
+    )
+    await worker.process(job_id)
+
+    assert attempts == 2
+    assert model_conversations.add_calls == 1
+    assert model_conversations.gateway_calls == 1
+    assert repository.jobs[job_id].state is EditorialThreadJobState.COMPLETE
+    assert repository.bridge_generation_slots.row.state is BridgeGenerationSlotState.FREE
+    assert repository.bridge_generation_slots.row.lease_token == first_fence
+
+
+@pytest.mark.asyncio
+async def test_worker_revalidates_lease_before_add_turn() -> None:
+    worker, repository, _store, model_conversations, _message = make_worker_runtime()
+    job_id = next(iter(repository.jobs))
+    original_check = worker._bridge_gate.is_current_worker
+
+    async def lose_worker_lease(bridge_lease):
+        repository.jobs[job_id] = replace(
+            repository.jobs[job_id],
+            lease_token=uuid4(),
+        )
+        return await original_check(bridge_lease)
+
+    worker._bridge_gate.is_current_worker = lose_worker_lease
+    await worker.process(job_id)
+
+    assert model_conversations.add_calls == 0
+    assert model_conversations.gateway_calls == 0
+    assert repository.bridge_generation_slots.row.state is BridgeGenerationSlotState.HELD
+
+
+@pytest.mark.asyncio
 async def test_message_objective_never_creates_proposal_or_canonical_artifact() -> None:
     worker, repository, store, model_conversations, _message = make_worker_runtime()
     job_id = next(iter(repository.jobs))
@@ -1987,6 +2393,55 @@ async def test_message_capacity_wait_is_durable_and_not_reclaimed_early() -> Non
     assert model_conversations.add_calls == 1
     assert repository.jobs[job_id].state is EditorialThreadJobState.WAITING_FOR_CAPACITY
     assert repository.jobs[job_id].lease_until is not None
+
+
+@pytest.mark.asyncio
+async def test_global_capacity_wait_keeps_job_and_request_key_queued_until_slot_frees() -> None:
+    worker, repository, _store, model_conversations, _message = make_worker_runtime()
+    job_id = next(iter(repository.jobs))
+    thread_id = repository.jobs[job_id].thread_id
+    slots = repository.bridge_generation_slots
+    slots.row = BridgeGenerationSlot(
+        singleton_key=1,
+        holder_thread_id=uuid4(),
+        holder_job_id=uuid4(),
+        holder_turn_id=None,
+        lease_token=8,
+        acquired_at=datetime.now(UTC),
+        lease_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        state=BridgeGenerationSlotState.HELD,
+    )
+
+    delay = await worker.process(job_id)
+
+    assert delay == 5_000
+    assert repository.jobs[job_id].state is EditorialThreadJobState.WAITING_FOR_CAPACITY
+    assert repository.record.thread.bridge_status is EditorialBridgeStatus.WAITING_FOR_CAPACITY
+    assert model_conversations.add_calls == 0
+    assert repository.worker_uow.turns == {}
+    assert repository.worker_uow.runs == {}
+
+    slots.row = replace(
+        slots.row,
+        holder_thread_id=None,
+        holder_job_id=None,
+        holder_turn_id=None,
+        acquired_at=None,
+        lease_expires_at=None,
+        state=BridgeGenerationSlotState.FREE,
+    )
+    repository.jobs[job_id] = replace(
+        repository.jobs[job_id],
+        lease_until=datetime.now(UTC) - timedelta(seconds=1),
+    )
+    await worker.process(job_id)
+
+    expected_key = f"editorial-thread-message:{repository.jobs[job_id].send_event_id}"
+    assert model_conversations.add_calls == 1
+    assert model_conversations.add_arguments is not None
+    assert model_conversations.add_arguments["idempotency_key"] == expected_key
+    assert repository.jobs[job_id].state is EditorialThreadJobState.COMPLETE
+    assert thread_id == repository.record.thread.id
 
 
 @pytest.mark.asyncio
@@ -2467,10 +2922,12 @@ async def test_worker_replay_attaches_durable_model_output_and_closes_job(
     def editorial_uow_factory():
         uow = base_uow_factory()
         uow.editorial_threads = repository
+        uow.bridge_generation_slots = repository.bridge_generation_slots
         return uow
 
     service._uow_factory = editorial_uow_factory
     worker._model_conversations = service
+    worker._bridge_gate = EditorialBridgeGate(editorial_uow_factory)
     real_execute = service._gateway.execute
     gateway_calls = 0
 
@@ -2499,6 +2956,10 @@ async def test_worker_replay_attaches_durable_model_output_and_closes_job(
         state=EditorialThreadJobState.QUEUED,
         lease_token=None,
         lease_until=None,
+    )
+    repository.bridge_generation_slots.row = replace(
+        repository.bridge_generation_slots.row,
+        lease_expires_at=datetime.now(UTC) - timedelta(seconds=1),
     )
     await worker.process(job_id)
 
@@ -2549,6 +3010,7 @@ async def test_overlapping_reconcile_worker_turn_replay_and_second_reconcile_sub
     def editorial_uow_factory():
         uow = base_uow_factory()
         uow.editorial_threads = repository
+        uow.bridge_generation_slots = repository.bridge_generation_slots
         return uow
 
     model_service._uow_factory = editorial_uow_factory

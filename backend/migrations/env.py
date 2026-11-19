@@ -7,6 +7,7 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from cti_app.infrastructure.database.models import (  # noqa: F401
+    bridge_generation_slots,
     collection,
     core,
     discovery,
@@ -68,6 +69,7 @@ _EDITORIAL_WORKSPACE_TABLES = frozenset({"editorial_workspace_snapshots"})
 _EDITORIAL_THREAD_TABLES = frozenset(
     {"editorial_threads", "editorial_thread_events", "editorial_thread_jobs"}
 )
+_EDITORIAL_BRIDGE_GENERATION_SLOT_TABLES = frozenset({"bridge_generation_slots"})
 _ROUTING_RUN_COLUMNS = frozenset({"routing_decision_id"})
 _COLLECTION_ATTEMPT_ADDITIONS = frozenset(
     {
@@ -115,6 +117,7 @@ def _metadata_for_frozen_baseline() -> MetaData:
             or source_table.name in _ROUTING_DECISION_TABLES
             or source_table.name in _EDITORIAL_WORKSPACE_TABLES
             or source_table.name in _EDITORIAL_THREAD_TABLES
+            or source_table.name in _EDITORIAL_BRIDGE_GENERATION_SLOT_TABLES
         ):
             continue
         table = source_table.to_metadata(metadata)

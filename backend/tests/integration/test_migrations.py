@@ -59,6 +59,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.sql.schema import Table
 
 from cti_app.infrastructure.database.models import (  # noqa: F401
+    bridge_generation_slots,
     collection,
     core,
     discovery,
@@ -262,6 +263,14 @@ EXPECTED_TRIGGERS: dict[tuple[str, str], str] = {
         "editorial_thread_events",
         "trg_editorial_thread_events_no_truncate",
     ): "reject_editorial_thread_event_mutation",
+    (
+        "bridge_generation_slots",
+        "trg_bridge_generation_slots_no_delete",
+    ): "reject_bridge_generation_slot_removal",
+    (
+        "bridge_generation_slots",
+        "trg_bridge_generation_slots_no_truncate",
+    ): "reject_bridge_generation_slot_removal",
     ("subjects", "trg_subjects_prevent_tlp_downgrade"): "prevent_tlp_downgrade",
     ("source_documents", "trg_source_documents_prevent_tlp_downgrade"): "prevent_tlp_downgrade",
     ("samples", "trg_samples_prevent_tlp_downgrade"): "prevent_tlp_downgrade",
@@ -1148,7 +1157,7 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     command.upgrade(config, "head")
     command.current(config)
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert _head_revision() == "0012_editorial_threads"
+    assert _head_revision() == "0013_bridge_generation_slots"
     assert asyncio.run(_alembic_version_column_length(temporary_postgres_url)) == 64
 
     collection_attempt_columns = asyncio.run(
@@ -1259,7 +1268,7 @@ def test_frozen_collection_attempt_baseline_precedes_acquisition_additions(
 
     command.upgrade(config, "head")
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert _head_revision() == "0012_editorial_threads"
+    assert _head_revision() == "0013_bridge_generation_slots"
     final_schema = asyncio.run(_database_snapshot(temporary_postgres_url))["collection_attempts"]
     table = Base.metadata.tables["collection_attempts"]
     assert final_schema["columns"] == _expected_columns(table)
@@ -1479,6 +1488,7 @@ def test_migration_up_and_down_on_temporary_postgres(temporary_postgres_url: str
             "editorial_threads",
             "editorial_thread_events",
             "editorial_thread_jobs",
+            "bridge_generation_slots",
         }
     )
     at_0004 = asyncio.run(_database_snapshot(temporary_postgres_url))
@@ -1512,6 +1522,143 @@ def test_migration_up_and_down_on_temporary_postgres(temporary_postgres_url: str
     assert asyncio.run(_table_names(temporary_postgres_url)) == EXPECTED_TABLES
     assert asyncio.run(_function_names(temporary_postgres_url)) == EXPECTED_FUNCTIONS
     assert asyncio.run(_trigger_function_pairs(temporary_postgres_url)) == EXPECTED_TRIGGERS
+
+
+def test_bridge_generation_slot_downgrade_allows_pristine_but_refuses_used_slot(
+    temporary_postgres_url: str,
+) -> None:
+    config = _alembic_config(temporary_postgres_url)
+    command.upgrade(config, "head")
+
+    command.downgrade(config, "0012_editorial_threads")
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0012_editorial_threads"
+    assert "bridge_generation_slots" not in asyncio.run(_table_names(temporary_postgres_url))
+
+    command.upgrade(config, "head")
+
+    async def _advance_lease_token() -> None:
+        engine = create_async_engine(temporary_postgres_url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "UPDATE bridge_generation_slots SET lease_token = 1 WHERE singleton_key = 1"
+                    )
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_advance_lease_token())
+    with pytest.raises(RuntimeError, match="after Bridge generation slot has been used"):
+        command.downgrade(config, "0012_editorial_threads")
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
+
+    async def _lease_token() -> int:
+        engine = create_async_engine(temporary_postgres_url)
+        try:
+            async with engine.connect() as connection:
+                result = await connection.execute(
+                    text("SELECT lease_token FROM bridge_generation_slots WHERE singleton_key = 1")
+                )
+                return int(result.scalar_one())
+        finally:
+            await engine.dispose()
+
+    assert asyncio.run(_lease_token()) == 1
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "ALTER TABLE bridge_generation_slots ALTER COLUMN lease_token TYPE INTEGER",
+        "ALTER TABLE bridge_generation_slots ALTER COLUMN lease_token DROP NOT NULL",
+        "ALTER TABLE bridge_generation_slots ALTER COLUMN lease_token SET DEFAULT 1",
+        (
+            "ALTER TABLE bridge_generation_slots DROP CONSTRAINT ck_bridge_generation_slots_state",
+            "ALTER TABLE bridge_generation_slots ADD CONSTRAINT "
+            "ck_bridge_generation_slots_state CHECK (state <> 'invalid')",
+        ),
+        (
+            "ALTER TABLE bridge_generation_slots DROP CONSTRAINT ck_bridge_generation_slots_token",
+            "ALTER TABLE bridge_generation_slots ADD CONSTRAINT "
+            "ck_bridge_generation_slots_token CHECK (lease_token::smallint >= 0)",
+        ),
+        (
+            "ALTER TABLE bridge_generation_slots DROP CONSTRAINT fk_bridge_generation_slots_thread",
+            "ALTER TABLE bridge_generation_slots ADD CONSTRAINT fk_bridge_generation_slots_thread "
+            "FOREIGN KEY (holder_thread_id) REFERENCES editorial_thread_jobs(id) ON DELETE CASCADE",
+        ),
+        (
+            "ALTER TABLE bridge_generation_slots DROP CONSTRAINT fk_bridge_generation_slots_thread",
+            "ALTER TABLE bridge_generation_slots ADD CONSTRAINT fk_bridge_generation_slots_thread "
+            "FOREIGN KEY (holder_thread_id) REFERENCES editorial_threads(id) "
+            "ON DELETE RESTRICT ON UPDATE CASCADE",
+        ),
+        (
+            "DROP TRIGGER trg_bridge_generation_slots_no_delete ON bridge_generation_slots",
+            "CREATE TRIGGER trg_bridge_generation_slots_no_delete AFTER DELETE "
+            "ON bridge_generation_slots FOR EACH ROW EXECUTE FUNCTION "
+            "reject_bridge_generation_slot_removal()",
+        ),
+        (
+            "DROP TRIGGER trg_bridge_generation_slots_no_delete ON bridge_generation_slots",
+            "CREATE TRIGGER trg_bridge_generation_slots_no_delete BEFORE DELETE "
+            "ON bridge_generation_slots FOR EACH STATEMENT EXECUTE FUNCTION "
+            "reject_bridge_generation_slot_removal()",
+        ),
+        (
+            "DROP TRIGGER trg_bridge_generation_slots_no_truncate ON bridge_generation_slots",
+            "CREATE TRIGGER trg_bridge_generation_slots_no_truncate BEFORE UPDATE "
+            "ON bridge_generation_slots FOR EACH STATEMENT EXECUTE FUNCTION "
+            "reject_bridge_generation_slot_removal()",
+        ),
+        "ALTER TABLE bridge_generation_slots DISABLE TRIGGER trg_bridge_generation_slots_no_delete",
+        (
+            "CREATE OR REPLACE FUNCTION reject_bridge_generation_slot_removal() "
+            "RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN OLD; END; $$"
+        ),
+    ],
+    ids=[
+        "column-type",
+        "column-nullability",
+        "column-default",
+        "check-expression",
+        "check-expression-numeric-cast",
+        "foreign-key-target-and-delete-action",
+        "foreign-key-update-action",
+        "trigger-timing",
+        "trigger-level",
+        "trigger-event",
+        "trigger-enabled",
+        "function-body",
+    ],
+)
+def test_bridge_generation_preflight_rejects_same_named_noncanonical_schema(
+    temporary_postgres_url: str,
+    mutation: str | tuple[str, ...],
+) -> None:
+    config = _alembic_config(temporary_postgres_url)
+    command.upgrade(config, "head")
+
+    async def _mutate_and_demote_revision() -> None:
+        engine = create_async_engine(temporary_postgres_url)
+        try:
+            async with engine.begin() as connection:
+                statements = (mutation,) if isinstance(mutation, str) else mutation
+                for statement in statements:
+                    await connection.execute(text(statement))
+                await connection.execute(
+                    text("UPDATE alembic_version SET version_num = '0012_editorial_threads'")
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_mutate_and_demote_revision())
+    with pytest.raises(RuntimeError, match=r"non-conforming|partial Bridge generation"):
+        command.upgrade(config, "head")
+
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0012_editorial_threads"
+    assert "bridge_generation_slots" in asyncio.run(_table_names(temporary_postgres_url))
 
 
 def test_c2_downgrade_refuses_to_discard_experiment_rows(

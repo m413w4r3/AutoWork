@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from uuid import UUID, uuid4
 
+from cti_app.application.editorial_bridge_gate import (
+    EditorialBridgeGate,
+    EditorialBridgeGateDisposition,
+    EditorialBridgeSubmissionResolution,
+)
 from cti_app.application.editorial_conversation_turns import EditorialDiscussionObjective
 from cti_app.application.editorial_discussion_context import EditorialDiscussionContextBuilder
 from cti_app.application.editorial_thread_job_completion import (
@@ -25,6 +30,7 @@ from cti_app.application.model_conversations import (
 )
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.domain.editorial_bridge_generation_slot import EditorialBridgeGenerationLease
 from cti_app.domain.editorial_thread import (
     EditorialBridgeStatus,
     EditorialThreadJobState,
@@ -70,16 +76,15 @@ class EditorialThreadWorker:
             artifact_store=artifact_store,
         )
         self._model_conversations = model_conversations
+        self._bridge_gate = EditorialBridgeGate(uow_factory)
 
     async def process(self, job_id: UUID) -> int | None:
-        now = datetime.now(UTC)
         lease_token = uuid4()
         async with self._uow_factory() as uow:
             claimed = await uow.editorial_threads.claim_job(
                 job_id,
                 lease_token=lease_token,
-                lease_until=now + EDITORIAL_THREAD_JOB_LEASE,
-                now=now,
+                lease_duration=EDITORIAL_THREAD_JOB_LEASE,
             )
             if claimed is None:
                 return None
@@ -101,6 +106,8 @@ class EditorialThreadWorker:
             await self._close_failed(job_id, record.thread.id, lease_token)
             return None
         original_send_event_id = send_event.id
+        bridge_lease: EditorialBridgeGenerationLease | None = None
+        turn_idempotency_key: str | None = None
 
         try:
             conversation = await self._model_conversations.get_editorial_thread_conversation(
@@ -137,13 +144,43 @@ class EditorialThreadWorker:
             ):
                 await self._close_reconciliation(job_id, record.thread.id, lease_token)
                 return None
+            turn_idempotency_key = f"editorial-thread-message:{current.send_event.id}"
+            assert turn_idempotency_key is not None
+            gate_attempt = await self._bridge_gate.acquire(
+                thread_id=record.thread.id,
+                job_id=job_id,
+                worker_lease_token=lease_token,
+                turn_idempotency_key=turn_idempotency_key,
+            )
+            if (
+                gate_attempt.disposition
+                is EditorialBridgeGateDisposition.CURRENT_REQUIRES_RECONCILIATION
+            ):
+                await self._close_reconciliation(job_id, record.thread.id, lease_token)
+                return None
+            if gate_attempt.lease is None:
+                retry_after = EDITORIAL_THREAD_CAPACITY_RETRY_SECONDS
+                await self._completion.close(
+                    job_id,
+                    lease_token,
+                    EditorialThreadStateOutcome(
+                        thread_id=record.thread.id,
+                        job_state=EditorialThreadJobState.WAITING_FOR_CAPACITY,
+                        bridge_status=EditorialBridgeStatus.WAITING_FOR_CAPACITY,
+                        retry_after_seconds=retry_after,
+                    ),
+                )
+                return retry_after * 1000
+            bridge_lease = gate_attempt.lease
+            if not await self._bridge_gate.is_current_worker(bridge_lease):
+                return None
             turn = await self._model_conversations.add_turn(
                 conversation_id,
                 message=current.instruction,
                 mode=mode,
                 external_llm_allowed=current.external_llm_allowed,
                 web_search=False,
-                idempotency_key=f"editorial-thread-message:{current.send_event.id}",
+                idempotency_key=turn_idempotency_key,
                 correlation_id=str(job_id),
                 context_subject_id=record.thread.origin.subject_id,
                 _editorial_thread_id=record.thread.id,
@@ -151,9 +188,24 @@ class EditorialThreadWorker:
                 editorial_context=current.context,
             )
         except EditorialThreadApplicationError as error:
+            if bridge_lease is not None and turn_idempotency_key is not None:
+                resolution = await self._bridge_gate.finish_failed_attempt(
+                    bridge_lease,
+                    turn_idempotency_key=turn_idempotency_key,
+                )
+                if resolution is EditorialBridgeSubmissionResolution.UNKNOWN:
+                    await self._close_reconciliation(job_id, record.thread.id, lease_token)
+                    return None
             await self._refuse_context_error(job_id, lease_token, error)
             return None
         except ConversationBusyError:
+            if bridge_lease is None or turn_idempotency_key is None:
+                await self._close_failed(job_id, record.thread.id, lease_token)
+                return None
+            await self._bridge_gate.finish_failed_attempt(
+                bridge_lease,
+                turn_idempotency_key=turn_idempotency_key,
+            )
             retry_after = EDITORIAL_THREAD_CAPACITY_RETRY_SECONDS
             await self._completion.close(
                 job_id,
@@ -167,6 +219,16 @@ class EditorialThreadWorker:
             )
             return retry_after * 1000
         except ConversationTurnFailedError as error:
+            if bridge_lease is None or turn_idempotency_key is None:
+                await self._close_failed(job_id, record.thread.id, lease_token)
+                return None
+            resolution = await self._bridge_gate.finish_failed_attempt(
+                bridge_lease,
+                turn_idempotency_key=turn_idempotency_key,
+            )
+            if resolution is EditorialBridgeSubmissionResolution.UNKNOWN:
+                await self._close_reconciliation(job_id, record.thread.id, lease_token)
+                return None
             if error.submission_state == "pre_submission" and error.code in {
                 "conversation_unavailable",
                 "bridge_tab_closed",
@@ -212,6 +274,14 @@ class EditorialThreadWorker:
             await self._close_failed(job_id, record.thread.id, lease_token)
             return None
         except Exception as error:
+            if bridge_lease is not None and turn_idempotency_key is not None:
+                resolution = await self._bridge_gate.finish_failed_attempt(
+                    bridge_lease,
+                    turn_idempotency_key=turn_idempotency_key,
+                )
+                if resolution is EditorialBridgeSubmissionResolution.UNKNOWN:
+                    await self._close_reconciliation(job_id, record.thread.id, lease_token)
+                    return None
             logger.warning(
                 "editorial_thread_job_failed job_id=%s error_type=%s",
                 job_id,
@@ -222,6 +292,13 @@ class EditorialThreadWorker:
                 lease_token,
                 EditorialThreadFailureOutcome(thread_id=record.thread.id),
             )
+            return None
+
+        if bridge_lease is None:
+            await self._close_reconciliation(job_id, record.thread.id, lease_token)
+            return None
+        if not await self._bridge_gate.finish_turn(bridge_lease, turn_id=turn.id):
+            await self._close_reconciliation(job_id, record.thread.id, lease_token)
             return None
 
         if (

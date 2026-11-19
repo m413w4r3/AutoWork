@@ -185,6 +185,11 @@ test("message-only composer renders safe generating, reply and error states", as
     ],
     etag: '"message-thread-generating"',
   };
+  const waitingForCapacity: EditorialThreadOpenRead = {
+    ...generating,
+    bridge_status: "waiting_for_capacity",
+    etag: '"message-thread-waiting-for-capacity"',
+  };
   const reply: EditorialThreadOpenRead = {
     ...generating,
     bridge_status: "reply_available",
@@ -264,7 +269,7 @@ test("message-only composer renders safe generating, reply and error states", as
   const threadPath = `${subjectPath}/editor/threads/${paragraphId}`;
   const screenshotDirectory = resolve(
     process.cwd(),
-    "../.autowork-runs/shots-T-M2-08",
+    "../.autowork-runs/shots-T-M2-09",
   );
   await mkdir(screenshotDirectory, { recursive: true });
 
@@ -338,7 +343,7 @@ test("message-only composer renders safe generating, reply and error states", as
       }
       sendCount += 1;
       if (sendCount === 1) {
-        currentRead = generating;
+        currentRead = waitingForCapacity;
         await route.fulfill({
           status: 202,
           json: {
@@ -420,18 +425,36 @@ test("message-only composer renders safe generating, reply and error states", as
   await page.getByRole("button", { name: "Envoyer un message" }).click();
   await expect(
     page.getByText(
-      "Bridge traite votre demande. L’état sera mis à jour dans ce fil.",
+      "Votre demande attend qu’une capacité Bridge soit disponible. Son état sera suivi dans ce fil.",
     ),
   ).toBeVisible();
+  await expect(page.getByRole("button", { name: /réessayer/i })).toHaveCount(0);
   await expect(
     page.locator(".editorial-conversation__announcement"),
   ).toBeFocused();
   await positionDesktopDiscussion(page);
   await page.screenshot({
-    path: resolve(screenshotDirectory, "message-generating-1440x900.png"),
+    path: resolve(screenshotDirectory, "waiting-for-capacity-1440x900.png"),
   });
   await page.setViewportSize({ width: 390, height: 844 });
   await page.getByRole("button", { name: "Inspecteur" }).click();
+  await expectMobileInspectorWithinViewport(page);
+  await positionMobileDiscussion(page);
+  await page.screenshot({
+    path: resolve(screenshotDirectory, "waiting-for-capacity-390x844.png"),
+  });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  currentRead = generating;
+  await expect(
+    page.getByText(
+      "Bridge traite votre demande. L’état sera mis à jour dans ce fil.",
+    ),
+  ).toBeVisible();
+  await positionDesktopDiscussion(page);
+  await page.screenshot({
+    path: resolve(screenshotDirectory, "message-generating-1440x900.png"),
+  });
+  await page.setViewportSize({ width: 390, height: 844 });
   await expectMobileInspectorWithinViewport(page);
   await positionMobileDiscussion(page);
   await page.screenshot({

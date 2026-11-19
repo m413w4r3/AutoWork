@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import cast
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -377,6 +377,39 @@ class SqlAlchemyEditorialThreadRepository:
         row = await self._session.get(EditorialThreadJobRow, job_id)
         return _job_from_row(row) if row is not None else None
 
+    async def get_job_for_update(self, job_id: UUID) -> EditorialThreadJob | None:
+        # Keep the editorial lock order: owning thread first, then its job.
+        if await self._lock_thread_for_job(job_id) is None:
+            return None
+        row = await self._session.scalar(
+            select(EditorialThreadJobRow)
+            .where(EditorialThreadJobRow.id == job_id)
+            .with_for_update()
+        )
+        return _job_from_row(row) if row is not None else None
+
+    async def is_current_worker_lease(
+        self, *, job_id: UUID, thread_id: UUID, lease_token: UUID
+    ) -> bool:
+        # Keep the thread → job lock order, and use PostgreSQL time for expiry.
+        if await self._lock_thread_for_job(job_id) is None:
+            return False
+        result = await self._session.execute(
+            select(EditorialThreadJobRow, func.statement_timestamp())
+            .where(EditorialThreadJobRow.id == job_id)
+            .with_for_update(of=EditorialThreadJobRow)
+        )
+        row, database_now = result.one_or_none() or (None, None)
+        return bool(
+            row is not None
+            and database_now is not None
+            and row.thread_id == thread_id
+            and row.state == EditorialThreadJobState.RUNNING.value
+            and row.lease_token == lease_token
+            and row.lease_until is not None
+            and row.lease_until > database_now
+        )
+
     async def get_job_for_event(self, event_id: UUID) -> EditorialThreadJob | None:
         row = await self._session.scalar(
             select(EditorialThreadJobRow).where(EditorialThreadJobRow.send_event_id == event_id)
@@ -393,16 +426,17 @@ class SqlAlchemyEditorialThreadRepository:
         return _job_from_row(row) if row is not None else None
 
     async def claim_job(
-        self, job_id: UUID, *, lease_token: UUID, lease_until: datetime, now: datetime
+        self, job_id: UUID, *, lease_token: UUID, lease_duration: timedelta
     ) -> EditorialThreadJob | None:
         if await self._lock_thread_for_job(job_id) is None:
             return None
-        row = await self._session.scalar(
-            select(EditorialThreadJobRow)
+        result = await self._session.execute(
+            select(EditorialThreadJobRow, func.statement_timestamp())
             .where(EditorialThreadJobRow.id == job_id)
-            .with_for_update(skip_locked=True)
+            .with_for_update(skip_locked=True, of=EditorialThreadJobRow)
         )
-        if row is None:
+        row, database_now = result.one_or_none() or (None, None)
+        if row is None or database_now is None:
             return None
         state = EditorialThreadJobState(row.state)
         runnable = state in {
@@ -414,7 +448,7 @@ class SqlAlchemyEditorialThreadRepository:
                 EditorialThreadJobState.RUNNING,
             }
             and row.lease_until is not None
-            and row.lease_until <= now
+            and row.lease_until <= database_now
         )
         if state is EditorialThreadJobState.WAITING_FOR_CAPACITY and row.lease_until is None:
             runnable = True
@@ -422,9 +456,9 @@ class SqlAlchemyEditorialThreadRepository:
             return None
         row.state = EditorialThreadJobState.RUNNING.value
         row.lease_token = lease_token
-        row.lease_until = lease_until
+        row.lease_until = database_now + lease_duration
         row.attempt_count += 1
-        row.updated_at = now
+        row.updated_at = database_now
         await self._session.flush()
         return _job_from_row(row)
 

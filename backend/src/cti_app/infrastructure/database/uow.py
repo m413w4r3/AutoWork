@@ -93,6 +93,9 @@ from cti_app.application.production_read_model import BatchStatusReadRepository
 from cti_app.infrastructure.database.models import (
     osint_open_policy as _osint_open_policy_models,  # noqa: F401
 )
+from cti_app.infrastructure.database.repositories.bridge_generation_slots import (
+    SqlAlchemyBridgeGenerationSlotRepository,
+)
 from cti_app.infrastructure.database.repositories.collection import (
     SqlAlchemyClaimRepository,
     SqlAlchemyCollectionAttemptRepository,
@@ -396,6 +399,7 @@ class SqlAlchemyUnitOfWork:
             self._session
         )
         self.editorial_threads = SqlAlchemyEditorialThreadRepository(self._session)
+        self.bridge_generation_slots = SqlAlchemyBridgeGenerationSlotRepository(self._session)
         self.production_input_snapshots = SqlAlchemyProductionInputSnapshotRepository(self._session)
         self.production_artifacts = SqlAlchemyProductionArtifactRepository(self._session)
         self.production_source_additions = SqlAlchemyProductionSourceAdditionRepository(
