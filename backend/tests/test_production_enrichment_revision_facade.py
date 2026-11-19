@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 
 import pytest
 
 from cti_app.application.editorial_enrichment_revision import (
+    assert_requested_placement,
     validate_editorial_enrichment_patch,
 )
 from cti_app.application.production_editorial_enrichment import (
@@ -15,8 +17,22 @@ from cti_app.application.production_enrichment_revision import (
     EditorialEnrichmentRevisionValidationError,
     ProductionEditorialEnrichmentRevisionService,
 )
-from cti_app.domain.production_editorial_enrichment import EditorialEnrichmentElementKind
+from cti_app.application.production_synthesis_revision import build_targeted_revision_target_catalog
+from cti_app.domain.production import ProductionArtifactStage
+from cti_app.domain.production_editorial_enrichment import (
+    EditorialEnrichmentElementKind,
+    EnrichmentPlacementKind,
+    EnrichmentPlacementV1,
+    editorial_enrichment_from_json,
+)
+from cti_app.domain.production_editorial_revision import (
+    TargetedEditorialRevisionOperation,
+    TargetedEditorialRevisionPlacement,
+    TargetedEditorialRevisionPlacementKind,
+)
+from cti_app.domain.production_synthesis import production_synthesis_to_json
 from tests.test_production_editorial_enrichment_application import (
+    _common_enrichment_request,
     _RecordingGateway,
     _revision_args,
     _revision_harness,
@@ -90,3 +106,86 @@ async def test_enrichment_validation_rejects_unsupported_patch(
         {"block_id": "proposal", "reason_code": "revision_patch_shape_invalid"}
     ]
     assert harness.world.gateway.calls == []
+
+
+@pytest.mark.asyncio
+async def test_after_timeline_targeted_placement_matches_legacy_placement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, _table_revision_wire())),
+    )
+    base = editorial_enrichment_from_json(harness.base_payload)
+    expected_placement = EnrichmentPlacementV1(EnrichmentPlacementKind.AFTER_TIMELINE)
+    candidate = replace(
+        base,
+        tables=(replace(base.tables[0], placement=expected_placement),),
+    )
+    targeted_request = _common_enrichment_request(
+        harness,
+        element_kind=EditorialEnrichmentElementKind.TABLE,
+        operation=TargetedEditorialRevisionOperation.CREATE_TABLE,
+        element_key=None,
+        placement=TargetedEditorialRevisionPlacement(
+            TargetedEditorialRevisionPlacementKind.AFTER_TIMELINE
+        ),
+    )
+
+    assert_requested_placement(
+        candidate=candidate,
+        element_kind=EditorialEnrichmentElementKind.TABLE,
+        targeted_request=targeted_request,
+        synthesis=harness.world.synthesis,
+    )
+
+
+@pytest.mark.asyncio
+async def test_after_section_targeted_placement_resolves_section_id_to_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, _table_revision_wire())),
+    )
+    first_section = harness.world.synthesis.sections[0]
+    second_section = replace(first_section, heading="Execution details")
+    synthesis = replace(
+        harness.world.synthesis,
+        sections=(first_section, second_section),
+    )
+    section_targets = build_targeted_revision_target_catalog(
+        ProductionArtifactStage.SYNTHESIS.value,
+        production_synthesis_to_json(synthesis),
+    )
+    second_section_target = next(
+        item["target"] for item in section_targets if item["label"] == "Section · Execution details"
+    )
+    section_id = second_section_target["stable_ids"][0]
+
+    base = editorial_enrichment_from_json(harness.base_payload)
+    expected_placement = EnrichmentPlacementV1(
+        EnrichmentPlacementKind.AFTER_SECTION,
+        section_index=1,
+    )
+    candidate = replace(
+        base,
+        tables=(replace(base.tables[0], placement=expected_placement),),
+    )
+    targeted_request = _common_enrichment_request(
+        harness,
+        element_kind=EditorialEnrichmentElementKind.TABLE,
+        operation=TargetedEditorialRevisionOperation.CREATE_TABLE,
+        element_key=None,
+        placement=TargetedEditorialRevisionPlacement(
+            TargetedEditorialRevisionPlacementKind.AFTER_SECTION,
+            section_id=section_id,
+        ),
+    )
+
+    assert_requested_placement(
+        candidate=candidate,
+        element_kind=EditorialEnrichmentElementKind.TABLE,
+        targeted_request=targeted_request,
+        synthesis=synthesis,
+    )
