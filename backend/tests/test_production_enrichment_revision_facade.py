@@ -3,13 +3,6 @@ from __future__ import annotations
 import hashlib
 
 import pytest
-from test_production_editorial_enrichment_application import (  # type: ignore[import-not-found]
-    _RecordingGateway,
-    _revision_args,
-    _revision_harness,
-    _succeeded_text,
-    _table_revision_wire,
-)
 
 from cti_app.application.editorial_enrichment_revision import (
     validate_editorial_enrichment_patch,
@@ -23,6 +16,13 @@ from cti_app.application.production_enrichment_revision import (
     ProductionEditorialEnrichmentRevisionService,
 )
 from cti_app.domain.production_editorial_enrichment import EditorialEnrichmentElementKind
+from tests.test_production_editorial_enrichment_application import (
+    _RecordingGateway,
+    _revision_args,
+    _revision_harness,
+    _succeeded_text,
+    _table_revision_wire,
+)
 
 
 @pytest.mark.asyncio
