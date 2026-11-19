@@ -37,99 +37,100 @@ async def _seed(uow_factory: UnitOfWorkFactory, *, proposal_count: int = 2) -> d
         tlp=TLP.AMBER,
         languages=("fr",),
     )
-    subject = Subject(
-        edition_id=edition.id,
-        title="Synthetic adoption subject",
-        slug=f"proposal-adoption-{uuid4().hex[:12]}",
-        tlp=TLP.AMBER,
-    )
-    run = ProductionRun(subject_id=subject.id, edition_id=edition.id)
-    base_artifact = ProductionArtifact(
-        production_run_id=run.id,
-        subject_id=subject.id,
-        stage=ProductionArtifactStage.SYNTHESIS,
-        version=1,
-        input_hash="1" * 64,
-    )
-    snapshot = WorkspaceSnapshotRecord(
-        snapshot_id=uuid4(),
-        subject_id=subject.id,
-        production_run_id=run.id,
-        synthesis_artifact_id=base_artifact.id,
-        synthesis_version=1,
-        synthesis_input_hash=base_artifact.input_hash,
-        synthesis_canonical_sha256="2" * 64,
-        enrichment_artifact_id=None,
-        enrichment_version=None,
-        enrichment_input_hash=None,
-        enrichment_canonical_sha256=None,
-        publication_artifact_id=None,
-        publication_version=None,
-        publication_input_hash=None,
-        publication_canonical_sha256=None,
-        pipeline_generation=0,
-        routing_decision_id=None,
-        routing_decision_hash=None,
-        publication_kind=PublicationKind.ARTICLE,
-        workspace_pin_hash="3" * 64,
-        registry_hash=registry_hash(()),
-        block_registry=(),
-    )
     patch_bytes = b'{"schema_version":"editorial-patch-v1","synthetic":true}'
     patch_sha256 = hashlib.sha256(patch_bytes).hexdigest()
-    patch_blob = BlobRecord(
-        descriptor=BlobDescriptor(
-            sha256=patch_sha256,
-            size=len(patch_bytes),
-            mime_type="application/vnd.autowork.editorial-patch+json",
-            logical_bucket="editorial-proposal-patches",
-        )
-    )
     actor_id = uuid4()
     variant_group_id = uuid4()
     occurrence_id = uuid4()
     proposals: list[EditorialProposal] = []
-    for index in range(proposal_count):
-        proposal = EditorialProposal(
-            id=uuid4(),
-            subject_id=subject.id,
-            production_run_id=run.id,
-            origin=EditorialProposalOrigin.MANUAL_PATCH,
-            snapshot_id=snapshot.snapshot_id,
-            occurrence_id=occurrence_id,
-            base_artifact_id=base_artifact.id,
-            base_artifact_version=1,
-            base_input_hash=base_artifact.input_hash,
-            base_canonical_sha256=snapshot.synthesis_canonical_sha256,
-            base_routing_hash=None,
-            base_pin_hash=snapshot.workspace_pin_hash,
-            target_id=f"synthetic-target-{index}",
-            operation="rewrite_title",
-            before_hash="4" * 64,
-            patch_blob_ref=patch_blob.id,
-            patch_sha256=patch_sha256,
-            evidence_refs=(),
-            diagnostics={},
-            thread_id=None,
-            variant_group_id=variant_group_id,
-            model_run_id=None,
-            model_turn_id=None,
-            state=EditorialProposalState.PROPOSED,
-            state_version=1,
-            actor_id=actor_id,
-            idempotency_key=f"synthetic-adoption-{index}-{uuid4().hex}",
-            request_sha256=hashlib.sha256(f"prepared-{index}".encode()).hexdigest(),
-        )
-        proposals.append(proposal)
 
     async with uow_factory() as uow:
+        # Resolve logical-key conflicts before capturing parent IDs in children.
         await uow.editions.add_if_absent(edition)
+        subject = Subject(
+            edition_id=edition.id,
+            title="Synthetic adoption subject",
+            slug=f"proposal-adoption-{uuid4().hex[:12]}",
+            tlp=TLP.AMBER,
+        )
         await uow.subjects.add(subject)
+        run = ProductionRun(subject_id=subject.id, edition_id=edition.id)
         await uow.production_runs.add(run)
+        base_artifact = ProductionArtifact(
+            production_run_id=run.id,
+            subject_id=subject.id,
+            stage=ProductionArtifactStage.SYNTHESIS,
+            version=1,
+            input_hash="1" * 64,
+        )
         await uow.production_artifacts.append(base_artifact)
-        await uow.blobs.add_if_absent(patch_blob)
+        snapshot = WorkspaceSnapshotRecord(
+            snapshot_id=uuid4(),
+            subject_id=subject.id,
+            production_run_id=run.id,
+            synthesis_artifact_id=base_artifact.id,
+            synthesis_version=1,
+            synthesis_input_hash=base_artifact.input_hash,
+            synthesis_canonical_sha256="2" * 64,
+            enrichment_artifact_id=None,
+            enrichment_version=None,
+            enrichment_input_hash=None,
+            enrichment_canonical_sha256=None,
+            publication_artifact_id=None,
+            publication_version=None,
+            publication_input_hash=None,
+            publication_canonical_sha256=None,
+            pipeline_generation=0,
+            routing_decision_id=None,
+            routing_decision_hash=None,
+            publication_kind=PublicationKind.ARTICLE,
+            workspace_pin_hash="3" * 64,
+            registry_hash=registry_hash(()),
+            block_registry=(),
+        )
         await uow.editorial_workspace_snapshots.append_if_absent(snapshot)
-        for proposal in proposals:
+        patch_blob = await uow.blobs.add_if_absent(
+            BlobRecord(
+                descriptor=BlobDescriptor(
+                    sha256=patch_sha256,
+                    size=len(patch_bytes),
+                    mime_type="application/vnd.autowork.editorial-patch+json",
+                    logical_bucket="editorial-proposal-patches",
+                )
+            )
+        )
+        for index in range(proposal_count):
+            proposal = EditorialProposal(
+                id=uuid4(),
+                subject_id=subject.id,
+                production_run_id=run.id,
+                origin=EditorialProposalOrigin.MANUAL_PATCH,
+                snapshot_id=snapshot.snapshot_id,
+                occurrence_id=occurrence_id,
+                base_artifact_id=base_artifact.id,
+                base_artifact_version=1,
+                base_input_hash=base_artifact.input_hash,
+                base_canonical_sha256=snapshot.synthesis_canonical_sha256,
+                base_routing_hash=None,
+                base_pin_hash=snapshot.workspace_pin_hash,
+                target_id=f"synthetic-target-{index}",
+                operation="rewrite_title",
+                before_hash="4" * 64,
+                patch_blob_ref=patch_blob.id,
+                patch_sha256=patch_sha256,
+                evidence_refs=(),
+                diagnostics={},
+                thread_id=None,
+                variant_group_id=variant_group_id,
+                model_run_id=None,
+                model_turn_id=None,
+                state=EditorialProposalState.PROPOSED,
+                state_version=1,
+                actor_id=actor_id,
+                idempotency_key=f"synthetic-adoption-{index}-{uuid4().hex}",
+                request_sha256=hashlib.sha256(f"prepared-{index}".encode()).hexdigest(),
+            )
+            proposals.append(proposal)
             event = EditorialProposalEvent(
                 id=uuid4(),
                 proposal_id=proposal.id,
