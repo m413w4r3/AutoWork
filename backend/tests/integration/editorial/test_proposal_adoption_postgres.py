@@ -691,6 +691,7 @@ async def test_orphan_catalog_row_can_be_recreated_by_later_adoption(
     uow_factory: UnitOfWorkFactory,
 ) -> None:
     seeded = await _seed(uow_factory, proposal_count=1)
+    existing_blob_addresses = set(seeded.blob_store.objects)
     proposal = seeded.proposals[0]
     service = _service(seeded, uow_factory)
     persist_acceptance = service._persist_acceptance
@@ -707,9 +708,10 @@ async def test_orphan_catalog_row_can_be_recreated_by_later_adoption(
     with pytest.raises(RuntimeError, match="after candidate upload"):
         await service.adopt(**_adopt_kwargs(seeded, proposal, f"adopt-after-collect-{uuid4().hex}"))
 
+    new_blob_addresses = set(seeded.blob_store.objects) - existing_blob_addresses
     candidate_objects = [
-        (address, content)
-        for address, content in seeded.blob_store.objects.items()
+        (address, seeded.blob_store.objects[address])
+        for address in new_blob_addresses
         if address[0] == _CANONICAL_BUCKET
     ]
     assert len(candidate_objects) == 1
