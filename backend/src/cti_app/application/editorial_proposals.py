@@ -1,4 +1,9 @@
-"""Prepare immutable editorial proposal patches without writing canonical artifacts."""
+"""Prepare immutable editorial proposal patches without writing canonical artifacts.
+
+Online orphan cleanup removes unreferenced catalog rows but retains their
+content-addressed bytes. Physical object purging belongs to an offline
+retention sweep.
+"""
 
 from __future__ import annotations
 
@@ -750,27 +755,23 @@ class EditorialProposalService:
         raise EditorialProposalApplicationError("proposal_state_conflict")
 
     async def cleanup_orphan_blob(self, descriptor: BlobDescriptor) -> bool:
-        """Delete only when neither a proposal nor any other row references the blob."""
-        if self._blob_store is None:
-            raise EditorialProposalApplicationError("proposal_patch_storage_unavailable")
+        """Remove an unreferenced catalog row while retaining its object bytes."""
         async with self._uow_factory() as uow:
             await uow.blobs.lock_address(descriptor.logical_bucket, descriptor.sha256)
             blob = await uow.blobs.get_by_address(descriptor.logical_bucket, descriptor.sha256)
-            if blob is not None:
-                generic_references = await uow.blobs.count_references(blob.id)
-                proposal_references = await uow.editorial_proposals.count_patch_references(blob.id)
-                if generic_references or proposal_references:
-                    return False
-                await uow.blobs.delete(blob.id)
-            # Hold the same address lock through object deletion and commit. A preparer
-            # waiting to register a reference re-reads the object after this critical section.
-            await self._blob_store.delete(descriptor)
+            if (
+                blob is None
+                or blob.descriptor.size != descriptor.size
+                or blob.descriptor.mime_type != descriptor.mime_type
+            ):
+                return False
+            if await uow.blobs.count_references(blob.id):
+                return False
+            await uow.blobs.delete(blob.id)
             await uow.commit()
         return True
 
     async def _best_effort_orphan_cleanup(self, descriptor: BlobDescriptor) -> None:
-        if self._blob_store is None:
-            return
         try:
             await self.cleanup_orphan_blob(descriptor)
         except Exception:

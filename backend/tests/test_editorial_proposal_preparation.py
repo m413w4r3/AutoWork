@@ -16,7 +16,7 @@ from cti_app.application.editorial_synthesis.targets import (
 from cti_app.application.editorial_workspace.registry import resolve_workspace_target
 from cti_app.application.editorial_workspace.service import EditorialWorkspaceService
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.domain.blobs import BlobDescriptor
+from cti_app.domain.blobs import BlobDescriptor, BlobRecord
 from cti_app.domain.editorial_workspace import (
     EditorialBlockKind,
     EditorialRevisionStatus,
@@ -489,6 +489,8 @@ def _setup(
         preparation=preparation,
         calls=calls,
         blob_bytes=blob_bytes,
+        blob_records=blob_records,
+        blob_records_by_id=blob_records_by_id,
         repository=repository,
         thread_events=thread_events,
         canonical_writes=canonical_writes,
@@ -959,7 +961,8 @@ async def test_blob_verified_before_uow_and_orphan_cleanup_idempotent() -> None:
 
     assert setup.calls.index("blob_put") < setup.calls.index("blob_read")
     assert setup.calls.index("blob_read") < setup.calls.index("uow_open")
-    assert setup.calls.count("blob_delete") == 1
+    assert setup.calls.count("blob_delete") == 0
+    assert len(setup.blob_bytes) == 1
 
     cleanup = _setup()
     orphan_bytes = b"synthetic orphan"
@@ -971,10 +974,14 @@ async def test_blob_verified_before_uow_and_orphan_cleanup_idempotent() -> None:
         mime_type="application/vnd.autowork.editorial-patch+json",
         logical_bucket="editorial-proposal-patches",
     )
-    await cleanup.service.cleanup_orphan_blob(descriptor)
-    await cleanup.service.cleanup_orphan_blob(descriptor)
-    assert cleanup.calls.count("blob_delete") == 1
-    assert orphan_sha256 not in cleanup.blob_bytes
+    orphan = BlobRecord(descriptor=descriptor)
+    cleanup.blob_records[f"{descriptor.logical_bucket}:{descriptor.sha256}"] = orphan
+    cleanup.blob_records_by_id[orphan.id] = orphan
+
+    assert await cleanup.service.cleanup_orphan_blob(descriptor)
+    assert not await cleanup.service.cleanup_orphan_blob(descriptor)
+    assert cleanup.calls.count("blob_delete") == 0
+    assert cleanup.blob_bytes[orphan_sha256] == orphan_bytes
 
 
 @pytest.mark.asyncio

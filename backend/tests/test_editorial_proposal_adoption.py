@@ -994,12 +994,12 @@ async def test_adoption_crash_after_upload_before_uow() -> None:
     )
     assert fixture.factory.state.impacts == {}
     assert fixture.blob_store.new_objects == 1
-    assert fixture.blob_store.delete_calls == 1
+    assert fixture.blob_store.delete_calls == 0
 
     result = await fixture.adopt()
 
     assert result.proposal.state is EditorialProposalState.ACCEPTED
-    assert fixture.blob_store.new_objects == 2
+    assert fixture.blob_store.new_objects == 1
     assert fixture.factory.state.impacts[fixture.proposal.id].state.value == "pending"
 
 
@@ -1084,7 +1084,8 @@ async def test_adoption_crash_after_commit_before_impact() -> None:
 @pytest.mark.asyncio
 async def test_cleanup_orphan_blob_is_idempotent_and_preserves_referenced_blobs() -> None:
     fixture = _fixture()
-    orphan_bytes = b"synthetic orphan"
+    plan = cast(_AdoptionHarness, fixture.service).plan
+    orphan_bytes = plan.candidate.canonical_bytes
     orphan_sha256 = hashlib.sha256(orphan_bytes).hexdigest()
     orphan_descriptor = BlobDescriptor(
         orphan_sha256,
@@ -1092,21 +1093,29 @@ async def test_cleanup_orphan_blob_is_idempotent_and_preserves_referenced_blobs(
         "application/json",
         _CANONICAL_BUCKET,
     )
-    fixture.blob_store.objects[(_CANONICAL_BUCKET, orphan_sha256)] = orphan_bytes
+    address = (_CANONICAL_BUCKET, orphan_sha256)
+    fixture.blob_store.objects[address] = orphan_bytes
+    async with fixture.factory() as uow:
+        orphan_record = await uow.blobs.add_if_absent(BlobRecord(descriptor=orphan_descriptor))
+        await uow.commit()
 
     assert await fixture.service.cleanup_orphan_blob(orphan_descriptor)
     assert not await fixture.service.cleanup_orphan_blob(orphan_descriptor)
-    assert (_CANONICAL_BUCKET, orphan_sha256) not in fixture.blob_store.objects
-    assert fixture.blob_store.delete_calls == 1
-    assert fixture.blob_store.commit_counts_at_delete == [fixture.factory.commits]
+    assert address in fixture.blob_store.objects
+    assert fixture.blob_store.delete_calls == 0
 
     accepted = await fixture.adopt()
     candidate_blob = fixture.factory.state.blobs[accepted.artifact.canonical_blob_id]
-    assert not await fixture.service.cleanup_orphan_blob(candidate_blob.descriptor)
+    assert candidate_blob.id != orphan_record.id
+    assert await fixture.service.cleanup_orphan_blob(candidate_blob.descriptor) is False
     assert (
         candidate_blob.descriptor.logical_bucket,
         candidate_blob.descriptor.sha256,
     ) in fixture.blob_store.objects
+    assert await fixture.blob_store.read(
+        candidate_blob.descriptor, max_bytes=len(orphan_bytes)
+    ) == (orphan_bytes)
+    assert fixture.blob_store.delete_calls == 0
 
 
 @pytest.mark.asyncio
@@ -1122,6 +1131,10 @@ async def test_orphan_object_is_retained_when_blob_row_commit_fails() -> None:
     )
     address = (descriptor.logical_bucket, descriptor.sha256)
     fixture.blob_store.objects[address] = orphan_bytes
+    async with fixture.factory() as uow:
+        await uow.blobs.add_if_absent(BlobRecord(descriptor=descriptor))
+        await uow.commit()
+    commits_before_cleanup = fixture.factory.commits
     fixture.factory.fail_commit_once = True
 
     with pytest.raises(RuntimeError, match="database commit failure"):
@@ -1129,7 +1142,7 @@ async def test_orphan_object_is_retained_when_blob_row_commit_fails() -> None:
 
     assert address in fixture.blob_store.objects
     assert fixture.blob_store.delete_calls == 0
-    assert fixture.factory.commits == 0
+    assert fixture.factory.commits == commits_before_cleanup
 
 
 @pytest.mark.asyncio

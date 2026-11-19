@@ -1,4 +1,9 @@
-"""Blob reads, uploads, verification, and orphan cleanup for proposal adoption."""
+"""Blob reads, uploads, verification, and orphan cleanup for proposal adoption.
+
+Online cleanup removes only unreferenced catalog rows. Content-addressed bytes
+remain available for a later idempotent put; physical purging belongs to an
+offline retention sweep.
+"""
 
 from __future__ import annotations
 
@@ -112,36 +117,16 @@ class EditorialProposalBlobManager:
         return descriptor
 
     async def cleanup_orphan_blob(self, descriptor: BlobDescriptor) -> bool:
-        """Delete a blob row first, then its object after a successful commit."""
-        object_exists = await self.blob_store.exists(descriptor)
-        if not object_exists:
-            async with self.uow_factory() as uow:
-                await uow.blobs.lock_address(descriptor.logical_bucket, descriptor.sha256)
-                blob = await uow.blobs.get_by_address(descriptor.logical_bucket, descriptor.sha256)
-                if blob is None:
-                    return False
-                if not _descriptor_matches(blob.descriptor, descriptor):
-                    return False
-                if await uow.blobs.count_references(blob.id):
-                    return False
-                await uow.blobs.delete(blob.id)
-                await uow.commit()
-            return True
-
+        """Remove an unreferenced catalog row while retaining its object bytes."""
         async with self.uow_factory() as uow:
             await uow.blobs.lock_address(descriptor.logical_bucket, descriptor.sha256)
             blob = await uow.blobs.get_by_address(descriptor.logical_bucket, descriptor.sha256)
-            if blob is not None:
-                if not _descriptor_matches(blob.descriptor, descriptor):
-                    return False
-                if await uow.blobs.count_references(blob.id):
-                    return False
-                await uow.blobs.delete(blob.id)
+            if blob is None or not _descriptor_matches(blob.descriptor, descriptor):
+                return False
+            if await uow.blobs.count_references(blob.id):
+                return False
+            await uow.blobs.delete(blob.id)
             await uow.commit()
-
-        # Object deletion is deliberately after the database commit. If commit
-        # fails, this line is never reached and the MinIO object remains intact.
-        await self.blob_store.delete(descriptor)
         return True
 
 

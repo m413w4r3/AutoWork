@@ -681,6 +681,69 @@ async def test_two_concurrent_adoptions_of_same_blob_have_one_winner_and_keep_ob
         assert await uow.blobs.count_references(blob.id) > 0
         assert await uow.editorial_proposal_impacts.get_by_proposal(proposal.id) is not None
     assert await seeded.blob_store.exists(blob.descriptor)
+    adopted_bytes = await seeded.blob_store.read(blob.descriptor, max_bytes=blob.descriptor.size)
+    assert hashlib.sha256(adopted_bytes).hexdigest() == blob.descriptor.sha256
+    assert seeded.blob_store.delete_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_orphan_catalog_row_can_be_recreated_by_later_adoption(
+    uow_factory: UnitOfWorkFactory,
+) -> None:
+    seeded = await _seed(uow_factory, proposal_count=1)
+    proposal = seeded.proposals[0]
+    service = _service(seeded, uow_factory)
+    persist_acceptance = service._persist_acceptance
+    fail_once = True
+
+    async def fail_before_persist(**kwargs: Any) -> Any:
+        nonlocal fail_once
+        if fail_once:
+            fail_once = False
+            raise RuntimeError("synthetic failure after candidate upload")
+        return await persist_acceptance(**kwargs)
+
+    service._persist_acceptance = fail_before_persist  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="after candidate upload"):
+        await service.adopt(**_adopt_kwargs(seeded, proposal, f"adopt-after-collect-{uuid4().hex}"))
+
+    candidate_objects = [
+        (address, content)
+        for address, content in seeded.blob_store.objects.items()
+        if address[0] == _CANONICAL_BUCKET
+    ]
+    assert len(candidate_objects) == 1
+    address, candidate_bytes = candidate_objects[0]
+    logical_bucket, digest = address
+    descriptor = BlobDescriptor(digest, len(candidate_bytes), "application/json", logical_bucket)
+    async with uow_factory() as uow:
+        orphan = await uow.blobs.add_if_absent(BlobRecord(descriptor=descriptor))
+        assert await uow.blobs.count_references(orphan.id) == 0
+        await uow.commit()
+
+    assert await service.cleanup_orphan_blob(descriptor)
+    async with uow_factory() as uow:
+        assert await uow.blobs.get_by_address(logical_bucket, digest) is None
+    assert await seeded.blob_store.exists(descriptor)
+
+    result = await service.adopt(
+        **_adopt_kwargs(seeded, proposal, f"adopt-after-collect-{uuid4().hex}")
+    )
+    async with uow_factory() as uow:
+        accepted = await uow.editorial_proposals.get_for_occurrence(
+            proposal.subject_id, proposal.occurrence_id, proposal.id
+        )
+        assert accepted is not None and accepted.state is EditorialProposalState.ACCEPTED
+        artifact = await uow.production_artifacts.get(cast(UUID, accepted.accepted_artifact_id))
+        assert artifact is not None and artifact.canonical_blob_id is not None
+        blob = await uow.blobs.get(artifact.canonical_blob_id)
+        assert blob is not None and blob.id != orphan.id
+        assert await uow.blobs.count_references(blob.id) > 0
+
+    assert result.artifact.id == artifact.id
+    assert await seeded.blob_store.read(blob.descriptor, max_bytes=blob.descriptor.size) == (
+        candidate_bytes
+    )
     assert seeded.blob_store.delete_calls == 0
 
 

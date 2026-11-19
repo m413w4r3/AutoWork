@@ -222,14 +222,6 @@ class SqlAlchemyEditorialProposalRepository:
             raise RuntimeError("editorial_proposal_insert_missing")
         return stored, True
 
-    async def count_patch_references(self, blob_id: UUID) -> int:
-        count = await self._session.scalar(
-            select(func.count())
-            .select_from(EditorialProposalRow)
-            .where(EditorialProposalRow.patch_blob_ref == blob_id)
-        )
-        return int(count or 0)
-
 
 def _proposal_values(proposal: EditorialProposal) -> dict[str, object]:
     return {
