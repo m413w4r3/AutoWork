@@ -59,6 +59,7 @@ class SynthesisCandidate:
     """A validated canonical payload, ready for a caller-owned commit."""
 
     base_artifact: ProductionArtifact
+    base_canonical_sha256: str
     synthesis: ProductionSynthesisV1
     payload: dict[str, Any]
     canonical_bytes: bytes
@@ -153,6 +154,7 @@ def build_candidate_from_validated_patch(
 
     return SynthesisCandidate(
         base_artifact=base_artifact,
+        base_canonical_sha256=base_canonical_sha256,
         synthesis=synthesis,
         payload=payload,
         canonical_bytes=canonical_bytes,
@@ -169,6 +171,16 @@ async def persist_candidate(
     persistence: SynthesisCandidatePersistence,
 ) -> ProductionArtifact:
     """Persist one candidate through the existing CAS writer in the supplied UOW."""
+    base_artifact = candidate.base_artifact
+    if (
+        persistence.run_id != base_artifact.production_run_id
+        or persistence.subject_id != base_artifact.subject_id
+        or persistence.expected_current_artifact_id != base_artifact.id
+        or persistence.expected_current_input_hash != base_artifact.input_hash
+        or persistence.expected_current_canonical_sha256 != candidate.base_canonical_sha256
+    ):
+        raise TargetedEditorialRevisionConflictError("synthesis_candidate_base_fence_mismatch")
+
     store_kwargs: dict[str, Any] = {
         "run_id": persistence.run_id,
         "subject_id": persistence.subject_id,

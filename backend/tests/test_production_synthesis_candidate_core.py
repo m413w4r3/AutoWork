@@ -242,6 +242,11 @@ def test_candidate_core_matches_legacy_revise_candidate_bytes() -> None:
 
     candidate = _build_candidate(fixture)
 
+    assert candidate.base_artifact.id == fixture.base_artifact.id
+    assert candidate.base_artifact.production_run_id == fixture.base_artifact.production_run_id
+    assert candidate.base_artifact.subject_id == fixture.base_artifact.subject_id
+    assert candidate.base_artifact.version == fixture.base_artifact.version
+    assert candidate.base_canonical_sha256 == fixture.base_sha256
     assert candidate.synthesis == legacy_synthesis
     assert candidate.payload == legacy_payload
     assert candidate.before_hash == legacy_before_hash
@@ -517,6 +522,75 @@ async def test_persist_candidate_writes_same_rows_as_legacy() -> None:
     assert candidate_repository.events == legacy_repository.events
     assert candidate_store.bytes[candidate_result.canonical_blob_id] == candidate.canonical_bytes
     assert legacy_store.bytes[legacy_result.canonical_blob_id] == candidate.canonical_bytes
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    (
+        "expected_current_artifact_id",
+        "run_id",
+        "subject_id",
+        "expected_current_input_hash",
+        "expected_current_canonical_sha256",
+    ),
+)
+@pytest.mark.asyncio
+async def test_persist_candidate_rejects_fence_not_bound_to_candidate_base(
+    field_name: str,
+) -> None:
+    fixture = _fixture()
+    candidate = _build_candidate(fixture)
+    base_b = replace(
+        fixture.base_artifact,
+        production_run_id=uuid4(),
+        subject_id=uuid4(),
+        version=fixture.base_artifact.version + 1,
+        input_hash="f" * 64,
+        id=uuid4(),
+    )
+    base_sha_b = "e" * 64
+    mismatch_values = {
+        "expected_current_artifact_id": base_b.id,
+        "run_id": base_b.production_run_id,
+        "subject_id": base_b.subject_id,
+        "expected_current_input_hash": base_b.input_hash,
+        "expected_current_canonical_sha256": base_sha_b,
+    }
+    persistence = candidate_core.SynthesisCandidatePersistence(
+        run_id=fixture.base_artifact.production_run_id,
+        subject_id=fixture.base_artifact.subject_id,
+        input_hash=fixture.base_artifact.input_hash,
+        extraction=fixture.extraction,
+        snapshot=fixture.snapshot,
+        raw_result=None,
+        model_run_id=None,
+        expected_current_artifact_id=fixture.base_artifact.id,
+        expected_current_input_hash=fixture.base_artifact.input_hash,
+        expected_current_canonical_sha256=fixture.base_sha256,
+    )
+    persistence = replace(persistence, **{field_name: mismatch_values[field_name]})
+    writer_calls = 0
+
+    class _WriterSpy:
+        async def store_synthesis_result(self, **_kwargs: Any) -> ProductionArtifact:
+            nonlocal writer_calls
+            writer_calls += 1
+            raise AssertionError("writer must not be called for a mismatched base fence")
+
+    writer: Any = _WriterSpy()
+    repository = _MemoryArtifactRepository(())
+    uow = _MemoryUnitOfWork(repository)
+
+    with pytest.raises(TargetedEditorialRevisionConflictError):
+        await candidate_core.persist_candidate(
+            uow,  # type: ignore[arg-type]
+            writer=writer,
+            candidate=candidate,
+            persistence=persistence,
+        )
+
+    assert writer_calls == 0
+    assert not repository.events
 
 
 @pytest.mark.asyncio
