@@ -8,12 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, cast
 from uuid import UUID
 
-from cti_app.application.production_synthesis_revision import (
-    _resolve_target as _resolve_target_impl,
-)
-from cti_app.application.production_synthesis_revision import (
-    build_targeted_revision_target_catalog,
-)
+from cti_app.application.editorial_synthesis import targets as synthesis_targets
 from cti_app.domain.editorial_workspace import (
     BlockRegistryEntry,
     EditorialBlockKind,
@@ -35,9 +30,8 @@ from cti_app.domain.production_editorial_revision import (
 )
 from cti_app.domain.publication_kind import PublicationKind
 
-# Public seam for the private, existing resolver. Keep occurrence-to-target
-# translation here so legacy target validation remains owned by one module.
-resolve_canonical_target = _resolve_target_impl
+# Compatibility seam for callers of the former canonical resolver.
+build_targeted_revision_target_catalog = synthesis_targets.build_targeted_revision_target_catalog
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +78,14 @@ class ResolvedWorkspaceTarget:
     path: str
     before_hash: str
     operation: str
+
+
+def resolve_canonical_target(
+    payload: Mapping[str, Any],
+    target: TargetedEditorialRevisionTarget,
+    operation: TargetedEditorialRevisionOperation,
+) -> synthesis_targets.ResolvedTarget:
+    return synthesis_targets.resolve_target(payload, target, operation)
 
 
 def resolve_occurrence(
