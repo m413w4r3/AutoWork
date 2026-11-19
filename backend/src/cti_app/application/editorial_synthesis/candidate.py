@@ -72,6 +72,8 @@ class SynthesisCandidateBlobReference:
     """Reference to a preuploaded canonical candidate blob."""
 
     blob_id: UUID
+    sha256: str | None = None
+    size: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,11 +214,22 @@ async def persist_candidate(
             or persistence.expected_current_canonical_sha256 is None
         ):
             raise ValueError("synthesis_candidate_base_fence_required")
+        has_verified_metadata = (
+            persistence.candidate_blob.sha256 is not None
+            and persistence.candidate_blob.size is not None
+        )
+        if has_verified_metadata and (
+            persistence.candidate_blob.sha256 != candidate.canonical_sha256
+            or persistence.candidate_blob.size != len(candidate.canonical_bytes)
+        ):
+            raise ValueError("synthesis_candidate_blob_reference_mismatch")
         store_kwargs["preuploaded_payload_ids"] = (
             None,
             persistence.candidate_blob.blob_id,
             None,
         )
+        if has_verified_metadata:
+            store_kwargs["preuploaded_payload_sha256"] = persistence.candidate_blob.sha256
 
     return await writer.store_synthesis_result(
         **store_kwargs,

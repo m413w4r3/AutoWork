@@ -15,6 +15,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     edition_render,
     editions,
     editorial,
+    editorial_proposal_impacts,
     editorial_proposals,
     editorial_threads,
     editorial_workspace,
@@ -72,7 +73,12 @@ _EDITORIAL_THREAD_TABLES = frozenset(
 )
 _EDITORIAL_BRIDGE_GENERATION_SLOT_TABLES = frozenset({"bridge_generation_slots"})
 _EDITORIAL_PROPOSAL_TABLES = frozenset(
-    {"editorial_proposals", "editorial_proposal_model_runs", "editorial_proposal_events"}
+    {
+        "editorial_proposals",
+        "editorial_proposal_model_runs",
+        "editorial_proposal_events",
+        "editorial_proposal_impacts",
+    }
 )
 _ROUTING_RUN_COLUMNS = frozenset({"routing_decision_id"})
 _COLLECTION_ATTEMPT_ADDITIONS = frozenset(

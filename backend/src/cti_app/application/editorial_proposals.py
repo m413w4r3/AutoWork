@@ -644,6 +644,7 @@ class EditorialProposalService:
 
         stale = False
         async with self._uow_factory() as uow:
+            await uow.editorial_proposals.lock_adoption_for_run(proposal.production_run_id)
             proposal = await uow.editorial_proposals.get_for_occurrence_for_update(
                 subject_id, occurrence_id, proposal_id
             )

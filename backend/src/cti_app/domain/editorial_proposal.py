@@ -79,6 +79,8 @@ class EditorialProposal:
     request_sha256: str
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    decision_id: UUID | None = None
+    accepted_artifact_id: UUID | None = None
 
     def __post_init__(self) -> None:
         if self.base_artifact_version < 1 or self.state_version < 1:

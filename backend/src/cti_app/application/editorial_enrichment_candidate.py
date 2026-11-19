@@ -48,6 +48,15 @@ class DiagramMaterializer(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class EnrichmentCandidateBlobReference:
+    """Reference to canonical bytes uploaded and verified before the UOW."""
+
+    blob_id: UUID
+    sha256: str
+    size: int
+
+
+@dataclass(frozen=True, slots=True)
 class EditorialEnrichmentCandidate:
     base_artifact: ProductionArtifact
     artifact_id: UUID
@@ -63,6 +72,7 @@ class EditorialEnrichmentCandidate:
     outcome: EditorialEnrichmentRevisionOutcome
     resource_need: dict[str, Any] | None
     diagram_materialization: DiagramSpecV1 | None = None
+    candidate_blob: EnrichmentCandidateBlobReference | None = None
 
 
 def _field_name(element_kind: EditorialEnrichmentElementKind) -> str:
@@ -486,6 +496,8 @@ async def persist_candidate(
     source_figure_inventory_hash: str | None = None,
     metadata_extra: Mapping[str, Any] | None = None,
     resource_search_enabled: bool = False,
+    candidate_blob: EnrichmentCandidateBlobReference | None = None,
+    invalidate_downstream: bool = True,
 ) -> ProductionArtifact:
     """Append the candidate using the caller's UOW; this function never commits it."""
     if candidate.diagram_materialization is not None:
@@ -496,6 +508,16 @@ async def persist_candidate(
         or hashlib.sha256(candidate.canonical_bytes).hexdigest() != candidate.canonical_sha256
     ):
         raise ValueError("editorial_enrichment_revision_candidate_hash_mismatch")
+    candidate_blob = candidate_blob or candidate.candidate_blob
+    preuploaded_payload_ids: tuple[UUID | None, UUID] | None = None
+    preuploaded_payload_sha256: str | None = None
+    if candidate_blob is not None:
+        if candidate_blob.sha256 != candidate.canonical_sha256 or candidate_blob.size != len(
+            candidate.canonical_bytes
+        ):
+            raise ValueError("editorial_enrichment_candidate_blob_reference_mismatch")
+        preuploaded_payload_ids = (None, candidate_blob.blob_id)
+        preuploaded_payload_sha256 = candidate_blob.sha256
     prior = await uow.production_artifacts.get(candidate.artifact_id)
     if prior is not None:
         if prior.subject_id != candidate.base_artifact.subject_id:
@@ -510,9 +532,15 @@ async def persist_candidate(
             raise ValueError("editorial_enrichment_revision_result_corrupt")
         if prior.canonical_blob_id is None:
             raise ValueError("editorial_enrichment_revision_result_corrupt")
-        prior_bytes = await artifact_store.read_bytes(prior.canonical_blob_id)
-        if prior_bytes != candidate.canonical_bytes:
-            raise ValueError("editorial_enrichment_revision_result_corrupt")
+        if candidate_blob is not None:
+            # Adoption has already uploaded and read-back verified these exact
+            # content-addressed bytes before opening its relational UOW.
+            if prior.canonical_blob_id != candidate_blob.blob_id:
+                raise ValueError("editorial_enrichment_revision_result_corrupt")
+        else:
+            prior_bytes = await artifact_store.read_bytes(prior.canonical_blob_id)
+            if prior_bytes != candidate.canonical_bytes:
+                raise ValueError("editorial_enrichment_revision_result_corrupt")
         await persistence_service.assert_editorial_enrichment_revision_fence(
             run_id=candidate.base_artifact.production_run_id,
             expected_current_artifact_id=candidate.base_artifact.id,
@@ -543,5 +571,8 @@ async def persist_candidate(
         expected_current_canonical_sha256=candidate.base_canonical_sha256,
         canonical_payload=candidate.canonical_payload,
         resource_search_enabled=resource_search_enabled,
+        preuploaded_payload_ids=preuploaded_payload_ids,
+        preuploaded_payload_sha256=preuploaded_payload_sha256,
+        invalidate_downstream=invalidate_downstream,
         uow=uow,
     )

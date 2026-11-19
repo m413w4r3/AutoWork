@@ -9,6 +9,7 @@ from uuid import uuid4
 import pytest
 
 from cti_app.application.editorial_enrichment_candidate import (
+    EnrichmentCandidateBlobReference,
     build_candidate_from_validated_patch,
     materialize_candidate_diagrams,
     persist_candidate,
@@ -253,6 +254,57 @@ async def test_persist_candidate_writes_same_rows_as_legacy(
         row for row in harness.artifacts.artifacts if row.stage.value == "publication"
     )
     assert replayed_publication.status is expected_publication.status
+
+
+@pytest.mark.asyncio
+async def test_preuploaded_candidate_replay_does_not_read_candidate_blob_in_uow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, _table_revision_wire())),
+    )
+    initial_rows = [
+        replace(row, metadata=dict(row.metadata)) for row in harness.artifacts.artifacts
+    ]
+    accepted = await harness.service.revise(**_revision_args(harness))
+    candidate = await _build_table_candidate(harness, artifact_id=accepted.artifact.id)
+    canonical_blob_id = accepted.artifact.canonical_blob_id
+    assert canonical_blob_id is not None
+    replay_artifacts = _RevisionArtifactRepository([*initial_rows, accepted.artifact])
+    uow = _RevisionUow(
+        run=harness.world.run,
+        snapshot=harness.world.snapshot,
+        source_documents=harness.service._enrichment._uow_factory().source_documents,  # type: ignore[attr-defined]
+        artifacts=replay_artifacts,
+        source_collections=harness.service._enrichment._uow_factory().source_collections,  # type: ignore[attr-defined]
+    )
+    persistence = EditorialEnrichmentService(lambda: cast(Any, uow), harness.world.store)
+
+    class CandidateReadGuard:
+        async def read_bytes(self, blob_id: Any, *, max_bytes: int | None = None) -> bytes:
+            assert blob_id != canonical_blob_id
+            return cast(bytes, await harness.world.store.read_bytes(blob_id, max_bytes=max_bytes))
+
+    with pytest.raises(EditorialEnrichmentRevisionConflictError):
+        await persist_candidate(
+            uow,
+            artifact_store=CandidateReadGuard(),
+            persistence_service=persistence,
+            candidate=candidate,
+            raw_result=None,
+            model_run_id=accepted.artifact.model_run_id,
+            evidence_pack_hash=str(harness.base.metadata["evidence_pack_hash"]),
+            access_policy_hash=str(harness.base.metadata["access_policy_hash"]),
+            model_policy_version=EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION,
+            routing_policy_version=str(harness.base.metadata["routing_policy_version"]),
+            source_figure_inventory_hash=str(harness.base.metadata["source_figure_inventory_hash"]),
+            candidate_blob=EnrichmentCandidateBlobReference(
+                blob_id=canonical_blob_id,
+                sha256=candidate.canonical_sha256,
+                size=len(candidate.canonical_bytes),
+            ),
+        )
 
 
 @pytest.mark.asyncio

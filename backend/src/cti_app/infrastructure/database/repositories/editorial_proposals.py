@@ -29,6 +29,16 @@ class SqlAlchemyEditorialProposalRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
+    async def lock_adoption_for_run(self, production_run_id: UUID) -> None:
+        """Serialize adoptions before locking proposal rows, avoiding sibling deadlocks."""
+        await self._session.execute(
+            select(
+                func.pg_advisory_xact_lock(
+                    func.hashtextextended(f"editorial-proposal-adoption:{production_run_id}", 0)
+                )
+            )
+        )
+
     async def get_by_idempotency_key(
         self, subject_id: UUID, actor_id: UUID, idempotency_key: str
     ) -> EditorialProposal | None:
@@ -98,6 +108,44 @@ class SqlAlchemyEditorialProposalRepository:
         )
         return _event_from_row(row) if row is not None else None
 
+    async def list_proposed_for_run_for_update(
+        self, production_run_id: UUID
+    ) -> tuple[EditorialProposal, ...]:
+        statement = (
+            select(EditorialProposalRow, EditorialProposalModelRunRow)
+            .outerjoin(
+                EditorialProposalModelRunRow,
+                EditorialProposalModelRunRow.proposal_id == EditorialProposalRow.id,
+            )
+            .where(
+                EditorialProposalRow.production_run_id == production_run_id,
+                EditorialProposalRow.state == EditorialProposalState.PROPOSED.value,
+            )
+            .order_by(EditorialProposalRow.id)
+            .with_for_update(of=EditorialProposalRow)
+        )
+        result = await self._session.execute(statement)
+        return tuple(_proposal_from_rows(row, link) for row, link in result.all())
+
+    async def list_proposed_variants_for_update(
+        self, variant_group_id: UUID
+    ) -> tuple[EditorialProposal, ...]:
+        statement = (
+            select(EditorialProposalRow, EditorialProposalModelRunRow)
+            .outerjoin(
+                EditorialProposalModelRunRow,
+                EditorialProposalModelRunRow.proposal_id == EditorialProposalRow.id,
+            )
+            .where(
+                EditorialProposalRow.variant_group_id == variant_group_id,
+                EditorialProposalRow.state == EditorialProposalState.PROPOSED.value,
+            )
+            .order_by(EditorialProposalRow.id)
+            .with_for_update(of=EditorialProposalRow)
+        )
+        result = await self._session.execute(statement)
+        return tuple(_proposal_from_rows(row, link) for row, link in result.all())
+
     async def transition_if_current(
         self,
         *,
@@ -108,8 +156,20 @@ class SqlAlchemyEditorialProposalRepository:
         expected_state_version: int,
         state: EditorialProposalState,
         event: EditorialProposalEvent,
+        decision_id: UUID | None = None,
+        accepted_artifact_id: UUID | None = None,
     ) -> tuple[EditorialProposal | None, bool]:
         """CAS one proposal state and append its event in the same transaction."""
+        values: dict[str, object] = {
+            "state": state.value,
+            "state_version": expected_state_version + 1,
+            "updated_at": event.created_at,
+        }
+        if state is EditorialProposalState.ACCEPTED:
+            if decision_id is None or accepted_artifact_id is None:
+                raise ValueError("editorial_proposal_acceptance_metadata_required")
+            values["decision_id"] = decision_id
+            values["accepted_artifact_id"] = accepted_artifact_id
         transitioned_id = await self._session.scalar(
             update(EditorialProposalRow)
             .where(
@@ -119,11 +179,7 @@ class SqlAlchemyEditorialProposalRepository:
                 EditorialProposalRow.state == expected_state.value,
                 EditorialProposalRow.state_version == expected_state_version,
             )
-            .values(
-                state=state.value,
-                state_version=expected_state_version + 1,
-                updated_at=event.created_at,
-            )
+            .values(**values)
             .returning(EditorialProposalRow.id)
         )
         if transitioned_id is not None:
@@ -203,6 +259,8 @@ def _proposal_values(proposal: EditorialProposal) -> dict[str, object]:
         "actor_id": proposal.actor_id,
         "idempotency_key": proposal.idempotency_key,
         "request_sha256": proposal.request_sha256,
+        "decision_id": proposal.decision_id,
+        "accepted_artifact_id": proposal.accepted_artifact_id,
         "created_at": proposal.created_at,
         "updated_at": proposal.updated_at,
     }
@@ -294,4 +352,6 @@ def _proposal_from_rows(
         request_sha256=row.request_sha256,
         created_at=row.created_at,
         updated_at=row.updated_at,
+        decision_id=row.decision_id,
+        accepted_artifact_id=row.accepted_artifact_id,
     )

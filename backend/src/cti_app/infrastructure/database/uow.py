@@ -42,6 +42,7 @@ from cti_app.application.persistence import (
     EditionReleaseRepository,
     EditionRenderRepository,
     EditionRepository,
+    EditorialProposalImpactRepository,
     EditorialProposalRepository,
     EditorialThreadRepository,
     EditorialWorkspaceSnapshotRepository,
@@ -152,6 +153,9 @@ from cti_app.infrastructure.database.repositories.editions import (
     SqlAlchemyEditionRepository,
 )
 from cti_app.infrastructure.database.repositories.editorial import SqlAlchemyHumanDecisionRepository
+from cti_app.infrastructure.database.repositories.editorial_proposal_impacts import (
+    SqlAlchemyEditorialProposalImpactRepository,
+)
 from cti_app.infrastructure.database.repositories.editorial_proposals import (
     SqlAlchemyEditorialProposalRepository,
 )
@@ -300,6 +304,7 @@ class SqlAlchemyUnitOfWork:
     editorial_workspace_snapshots: EditorialWorkspaceSnapshotRepository
     editorial_threads: EditorialThreadRepository
     editorial_proposals: EditorialProposalRepository
+    editorial_proposal_impacts: EditorialProposalImpactRepository
     production_input_snapshots: ProductionInputSnapshotRepository
     production_artifacts: ProductionArtifactRepository
     production_source_additions: ProductionSourceAdditionRepository
@@ -405,6 +410,7 @@ class SqlAlchemyUnitOfWork:
         )
         self.editorial_threads = SqlAlchemyEditorialThreadRepository(self._session)
         self.editorial_proposals = SqlAlchemyEditorialProposalRepository(self._session)
+        self.editorial_proposal_impacts = SqlAlchemyEditorialProposalImpactRepository(self._session)
         self.bridge_generation_slots = SqlAlchemyBridgeGenerationSlotRepository(self._session)
         self.production_input_snapshots = SqlAlchemyProductionInputSnapshotRepository(self._session)
         self.production_artifacts = SqlAlchemyProductionArtifactRepository(self._session)

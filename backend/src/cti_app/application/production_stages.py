@@ -443,6 +443,8 @@ class EditorialEnrichmentService(_ArtifactPayloadMixin):
         expected_current_canonical_sha256: str | None = None,
         canonical_payload: dict[str, Any] | None = None,
         preuploaded_payload_ids: tuple[UUID | None, UUID] | None = None,
+        preuploaded_payload_sha256: str | None = None,
+        invalidate_downstream: bool = True,
         resource_search_enabled: bool = False,
         uow: ProductionUnitOfWork | None = None,
     ) -> ProductionArtifact:
@@ -472,6 +474,11 @@ class EditorialEnrichmentService(_ArtifactPayloadMixin):
             if editorial_enrichment_from_json(payload) != enrichment:
                 raise ValueError("editorial_enrichment_revision_payload_mismatch")
         encoded = ProductionArtifactStore.canonical_json_bytes(payload)
+        if preuploaded_payload_ids is not None:
+            if preuploaded_payload_sha256 is None or hashlib.sha256(encoded).hexdigest() != (
+                preuploaded_payload_sha256
+            ):
+                raise ValueError("editorial_enrichment_candidate_blob_content_mismatch")
         stage = ProductionArtifactStage.EDITORIAL_ENRICHMENT
         provided_uow = uow
         async with _uow_scope(self._uow_factory, provided_uow) as uow:
@@ -546,7 +553,8 @@ class EditorialEnrichmentService(_ArtifactPayloadMixin):
                 id=artifact_id or uuid4(),
             )
             await uow.production_artifacts.append(artifact)
-            await uow.production_artifacts.mark_downstream_stale(run_id, stage.value)
+            if invalidate_downstream:
+                await uow.production_artifacts.mark_downstream_stale(run_id, stage.value)
             if provided_uow is None:
                 await uow.commit()
             return artifact
@@ -588,6 +596,7 @@ class SynthesisService(_ArtifactPayloadMixin):
         stale_stages: set[str] | None = None,
         uow: Any | None = None,
         preuploaded_payload_ids: tuple[UUID | None, UUID, UUID | None] | None = None,
+        preuploaded_payload_sha256: str | None = None,
     ) -> ProductionArtifact:
         if self._artifact_store is None:
             raise ValueError("Canonical synthesis requires an artifact store")
@@ -756,13 +765,18 @@ class SynthesisService(_ArtifactPayloadMixin):
                 expected_candidate_bytes = ProductionArtifactStore.canonical_json_bytes(
                     canonical_payload
                 )
-                persisted_candidate_bytes = await self._artifact_store.read_bytes(canonical_id)
-                if (
-                    len(persisted_candidate_bytes) != len(expected_candidate_bytes)
-                    or hashlib.sha256(persisted_candidate_bytes).digest()
-                    != hashlib.sha256(expected_candidate_bytes).digest()
-                ):
-                    raise ValueError("synthesis_candidate_blob_content_mismatch")
+                expected_candidate_sha256 = hashlib.sha256(expected_candidate_bytes).hexdigest()
+                if preuploaded_payload_sha256 is not None:
+                    if preuploaded_payload_sha256 != expected_candidate_sha256:
+                        raise ValueError("synthesis_candidate_blob_content_mismatch")
+                else:
+                    persisted_candidate_bytes = await self._artifact_store.read_bytes(canonical_id)
+                    if (
+                        len(persisted_candidate_bytes) != len(expected_candidate_bytes)
+                        or hashlib.sha256(persisted_candidate_bytes).hexdigest()
+                        != expected_candidate_sha256
+                    ):
+                        raise ValueError("synthesis_candidate_blob_content_mismatch")
             artifact = ProductionArtifact(
                 id=artifact_id or uuid4(),
                 production_run_id=run_id,

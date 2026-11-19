@@ -86,6 +86,9 @@ def _setup(
             self.events: list[object] = []
             self.model_runs: list[object] = []
 
+        async def lock_adoption_for_run(self, production_run_id):
+            calls.append(("adoption_guard", production_run_id))
+
         async def get_by_idempotency_key(self, subject_id, actor_id, idempotency_key):
             return next(
                 (

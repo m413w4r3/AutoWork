@@ -68,6 +68,7 @@ from cti_app.domain.editorial_proposal import (
     EditorialProposalModelRun,
     EditorialProposalState,
 )
+from cti_app.domain.editorial_proposal_impact import EditorialProposalImpact
 from cti_app.domain.editorial_thread import (
     EditorialBridgeStatus,
     EditorialThread,
@@ -272,6 +273,8 @@ class EditorialThreadRepository(Protocol):
 
 
 class EditorialProposalRepository(Protocol):
+    async def lock_adoption_for_run(self, production_run_id: UUID) -> None: ...
+
     async def get_by_idempotency_key(
         self, subject_id: UUID, actor_id: UUID, idempotency_key: str
     ) -> EditorialProposal | None: ...
@@ -296,6 +299,14 @@ class EditorialProposalRepository(Protocol):
         self, proposal_id: UUID, idempotency_key: str
     ) -> EditorialProposalEvent | None: ...
 
+    async def list_proposed_for_run_for_update(
+        self, production_run_id: UUID
+    ) -> Sequence[EditorialProposal]: ...
+
+    async def list_proposed_variants_for_update(
+        self, variant_group_id: UUID
+    ) -> Sequence[EditorialProposal]: ...
+
     async def transition_if_current(
         self,
         *,
@@ -306,9 +317,19 @@ class EditorialProposalRepository(Protocol):
         expected_state_version: int,
         state: EditorialProposalState,
         event: EditorialProposalEvent,
+        decision_id: UUID | None = None,
+        accepted_artifact_id: UUID | None = None,
     ) -> tuple[EditorialProposal | None, bool]: ...
 
     async def count_patch_references(self, blob_id: UUID) -> int: ...
+
+
+class EditorialProposalImpactRepository(Protocol):
+    async def add(self, impact: EditorialProposalImpact) -> None: ...
+
+    async def get_by_proposal(self, proposal_id: UUID) -> EditorialProposalImpact | None: ...
+
+    async def next_sequence_for_run(self, production_run_id: UUID) -> int: ...
 
 
 class BridgeGenerationSlotRepository(Protocol):
@@ -1155,6 +1176,7 @@ class UnitOfWork(Protocol):
     editorial_workspace_snapshots: EditorialWorkspaceSnapshotRepository
     editorial_threads: EditorialThreadRepository
     editorial_proposals: EditorialProposalRepository
+    editorial_proposal_impacts: EditorialProposalImpactRepository
     bridge_generation_slots: BridgeGenerationSlotRepository
     production_input_snapshots: ProductionInputSnapshotRepository
     production_artifacts: ProductionArtifactRepository
