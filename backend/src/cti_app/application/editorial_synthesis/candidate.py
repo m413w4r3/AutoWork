@@ -203,14 +203,18 @@ async def persist_candidate(
         "expected_current_artifact_id": persistence.expected_current_artifact_id,
         "expected_current_input_hash": persistence.expected_current_input_hash,
         "expected_current_canonical_sha256": persistence.expected_current_canonical_sha256,
-        "expected_current_canonical_blob_id": persistence.expected_current_canonical_blob_id,
-        "base_canonical_bytes_verified": persistence.base_canonical_bytes_verified,
         "expected_routing_decision_id": persistence.expected_routing_decision_id,
         "expected_routing_decision_hash": persistence.expected_routing_decision_hash,
         "stale_stages": (
             set(persistence.stale_stages) if persistence.stale_stages is not None else None
         ),
     }
+    if persistence.expected_current_canonical_blob_id is not None:
+        store_kwargs["expected_current_canonical_blob_id"] = (
+            persistence.expected_current_canonical_blob_id
+        )
+    if persistence.base_canonical_bytes_verified:
+        store_kwargs["base_canonical_bytes_verified"] = True
     if persistence.candidate_blob is not None:
         if (
             persistence.expected_current_artifact_id is None
