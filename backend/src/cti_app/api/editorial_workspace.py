@@ -8,6 +8,10 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, Resp
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 from starlette.responses import JSONResponse
 
+from cti_app.application.editorial_proposals import (
+    EditorialProposalApplicationError,
+    EditorialProposalService,
+)
 from cti_app.application.editorial_thread_common import is_valid_editorial_idempotency_key
 from cti_app.application.editorial_threads import (
     EditorialThreadApplicationError,
@@ -242,6 +246,34 @@ class EditorialThreadReconciliationResultView(BaseModel):
     message: str
 
 
+class EditorialProposalView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID
+    subject_id: UUID
+    production_run_id: UUID
+    occurrence_id: UUID
+    thread_id: UUID | None
+    state: Literal[
+        "preparing",
+        "proposed",
+        "refused",
+        "needs_review",
+        "accepted",
+        "rejected",
+        "stale",
+    ]
+    state_version: int
+    operation: str
+    base_artifact_id: UUID
+    base_artifact_version: int
+    base_canonical_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    patch_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    patch: dict[str, object] | None
+    diagnostics: dict[str, object]
+    created_at: str
+
+
 EditorialThreadEntryResultView = Annotated[
     EditorialThreadSendResultView | EditorialThreadSessionStartResultView,
     Field(discriminator="kind"),
@@ -296,6 +328,11 @@ _ERROR_MESSAGES = {
     "idempotency_key_invalid": "La clé d’idempotence est invalide.",  # noqa: RUF001
     "editorial_message_invalid": "Saisissez un message avant de l’envoyer.",  # noqa: RUF001
     "editorial_thread_service_unavailable": "La discussion est temporairement indisponible.",
+    "proposal_not_found": "Proposition introuvable.",
+    "proposal_patch_unavailable": (
+        "Le contenu de cette proposition est temporairement indisponible."
+    ),
+    "proposal_patch_hash_mismatch": ("Le contenu vérifié de cette proposition ne correspond plus."),
     "editorial_thread_conversation_missing": "La conversation de ce fil est indisponible.",
     "editorial_thread_job_missing": "La génération de ce message est indisponible.",
     "editorial_thread_session_not_lost": (
@@ -460,6 +497,42 @@ async def get_editorial_thread(
         return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
     view = _THREAD_READ_ADAPTER.validate_python(result, from_attributes=True)
     return JSONResponse(content=view.model_dump(mode="json"), headers=headers)
+
+
+@router.get(
+    "/subjects/{subject_id}/editor/threads/{occurrence_id}/proposals/{proposal_id}",
+    response_model=EditorialProposalView,
+)
+async def get_editorial_proposal(
+    subject_id: UUID,
+    occurrence_id: UUID,
+    proposal_id: UUID,
+    request: Request,
+) -> EditorialProposalView:
+    service = EditorialProposalService(
+        uow_factory=request.app.state.uow_factory,
+        artifact_store=request.app.state.production_artifact_store,
+    )
+    try:
+        view = await service.inspect(
+            subject_id,
+            occurrence_id,
+            proposal_id,
+            workspace_service=_service(request),
+        )
+    except EditorialProposalApplicationError as error:
+        code = (
+            error.code
+            if error.code in {"proposal_patch_hash_mismatch", "proposal_patch_unavailable"}
+            else "proposal_not_found"
+        )
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND
+            if code == "proposal_not_found"
+            else status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": code, "message": _ERROR_MESSAGES[code]},
+        ) from None
+    return EditorialProposalView.model_validate(view, from_attributes=True)
 
 
 @router.post(

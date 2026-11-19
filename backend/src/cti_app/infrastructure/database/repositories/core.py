@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.selectable import FromClause, TableClause
@@ -104,6 +104,14 @@ async def _execute_insert_chunks(
 class SqlAlchemyBlobRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
+
+    async def lock_address(self, logical_bucket: str, sha256: str) -> None:
+        """Serialize blob registration and orphan collection by content address."""
+        lock_key = f"autowork:blob:{logical_bucket}:{sha256}"
+        await self._session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+            {"lock_key": lock_key},
+        )
 
     async def add(self, blob: BlobRecord) -> None:
         descriptor = blob.descriptor

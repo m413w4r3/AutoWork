@@ -3,6 +3,7 @@ import { useEffect, useRef } from "react";
 import { EditorialConversationComposer } from "./EditorialConversationComposer";
 import { EditorialConversationStatus } from "./EditorialConversationStatus";
 import { EditorialConversationTimeline } from "./EditorialConversationTimeline";
+import { EditorialProposalCard } from "./EditorialProposalCard";
 import { useEditorialConversationDrafts } from "./useEditorialConversationDrafts";
 import { useEditorialThreadLifecycle } from "./useEditorialThreadLifecycle";
 
@@ -34,6 +35,16 @@ export function EditorialConversation({
   const focusAfterSubmitRef = useRef<string | null>(null);
   const restoreComposerFocusRef = useRef<string | null>(null);
   const controlsWereLockedRef = useRef(false);
+  const proposalIds =
+    lifecycle.threadQuery.data && lifecycle.threadQuery.data.kind !== "unopened"
+      ? Array.from(
+          new Set(
+            lifecycle.threadQuery.data.timeline.flatMap((event) =>
+              event.proposal_id ? [event.proposal_id] : [],
+            ),
+          ),
+        )
+      : [];
 
   useEffect(() => {
     if (lifecycle.submissionUncertain && lifecycle.controlsLocked) {
@@ -110,6 +121,18 @@ export function EditorialConversation({
         <EditorialConversationTimeline
           events={lifecycle.threadQuery.data.timeline}
         />
+      ) : null}
+      {proposalIds.length > 0 ? (
+        <div className="editorial-conversation__proposals">
+          {proposalIds.map((proposalId) => (
+            <EditorialProposalCard
+              key={proposalId}
+              subjectId={subjectId}
+              occurrenceId={occurrenceId}
+              proposalId={proposalId}
+            />
+          ))}
+        </div>
       ) : null}
       {lifecycle.canCompose ? (
         <EditorialConversationComposer

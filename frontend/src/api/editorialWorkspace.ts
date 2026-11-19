@@ -176,6 +176,71 @@ export interface EditorialThreadSessionStartResult {
   session_number: number;
 }
 
+export type EditorialProposalState =
+  | "preparing"
+  | "proposed"
+  | "refused"
+  | "needs_review"
+  | "accepted"
+  | "rejected"
+  | "stale";
+
+export type EditorialProposalOperation =
+  | "rewrite_title"
+  | "rewrite_lead"
+  | "rewrite_paragraph"
+  | "insert_paragraph"
+  | "delete_paragraph"
+  | "rewrite_section"
+  | "insert_section"
+  | "delete_section"
+  | "merge_sections"
+  | "split_section"
+  | "rename_section"
+  | "create_table"
+  | "rewrite_table"
+  | "delete_table"
+  | "create_diagram"
+  | "rewrite_diagram"
+  | "delete_diagram"
+  | "create_chart"
+  | "rewrite_chart"
+  | "delete_chart"
+  | "create_source_figure"
+  | "rewrite_source_figure"
+  | "replace_source_figure"
+  | "delete_source_figure";
+
+export interface EditorialProposalPatch {
+  schema_version: "editorial-patch-v1";
+  operation: EditorialProposalOperation;
+  target: Record<string, unknown>;
+  target_id: string;
+  occurrence_id: string;
+  before_hash: string;
+  rationale: string;
+  after?: string;
+  enrichment_patch?: Record<string, unknown>;
+}
+
+export interface EditorialProposalRead {
+  id: string;
+  subject_id: string;
+  production_run_id: string;
+  occurrence_id: string;
+  thread_id: string | null;
+  state: EditorialProposalState;
+  state_version: number;
+  operation: EditorialProposalOperation;
+  base_artifact_id: string;
+  base_artifact_version: number;
+  base_canonical_sha256: string;
+  patch_sha256: string | null;
+  patch: EditorialProposalPatch | null;
+  diagnostics: Record<string, unknown>;
+  created_at: string;
+}
+
 const EDITORIAL_THREAD_TRANSPORT_UNCERTAIN_MESSAGE =
   "L’état de votre envoi est incertain. Consultez le fil avant de continuer.";
 
@@ -199,6 +264,11 @@ const ERROR_MESSAGES: Record<string, string> = {
     "Le contenu de cette discussion est temporairement indisponible.",
   thread_body_hash_mismatch:
     "Le contenu de cette discussion ne correspond plus à son empreinte.",
+  proposal_not_found: "Proposition introuvable.",
+  proposal_patch_unavailable:
+    "Le contenu de cette proposition est temporairement indisponible.",
+  proposal_patch_hash_mismatch:
+    "Le contenu vérifié de cette proposition ne correspond plus.",
   propose_not_enabled: "La proposition n’est pas encore activée.",
   editorial_thread_busy: "Une réponse est déjà en cours pour ce paragraphe.",
   external_llm_blocked: "La politique interdit l’envoi externe de ce contenu.",
@@ -253,6 +323,16 @@ export function getEditorialWorkspaceSnapshot(
 ): Promise<EditorialWorkspaceSnapshot> {
   return request<EditorialWorkspaceSnapshot>(
     `/api/subjects/${encodeURIComponent(subjectId)}/editor/snapshot`,
+  );
+}
+
+export function getEditorialProposal(
+  subjectId: string,
+  occurrenceId: string,
+  proposalId: string,
+): Promise<EditorialProposalRead> {
+  return request<EditorialProposalRead>(
+    `/api/subjects/${encodeURIComponent(subjectId)}/editor/threads/${encodeURIComponent(occurrenceId)}/proposals/${encodeURIComponent(proposalId)}`,
   );
 }
 

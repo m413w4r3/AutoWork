@@ -15,6 +15,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     edition_render,
     editions,
     editorial,
+    editorial_proposals,
     editorial_threads,
     editorial_workspace,
     external_effects,
@@ -70,6 +71,9 @@ _EDITORIAL_THREAD_TABLES = frozenset(
     {"editorial_threads", "editorial_thread_events", "editorial_thread_jobs"}
 )
 _EDITORIAL_BRIDGE_GENERATION_SLOT_TABLES = frozenset({"bridge_generation_slots"})
+_EDITORIAL_PROPOSAL_TABLES = frozenset(
+    {"editorial_proposals", "editorial_proposal_model_runs", "editorial_proposal_events"}
+)
 _ROUTING_RUN_COLUMNS = frozenset({"routing_decision_id"})
 _COLLECTION_ATTEMPT_ADDITIONS = frozenset(
     {
@@ -118,6 +122,7 @@ def _metadata_for_frozen_baseline() -> MetaData:
             or source_table.name in _EDITORIAL_WORKSPACE_TABLES
             or source_table.name in _EDITORIAL_THREAD_TABLES
             or source_table.name in _EDITORIAL_BRIDGE_GENERATION_SLOT_TABLES
+            or source_table.name in _EDITORIAL_PROPOSAL_TABLES
         ):
             continue
         table = source_table.to_metadata(metadata)

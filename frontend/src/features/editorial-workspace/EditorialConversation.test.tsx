@@ -25,6 +25,14 @@ const binding = {
   canonical_sha256: "a".repeat(64),
 };
 
+function requestUrl(input: RequestInfo | URL): string {
+  return typeof input === "string"
+    ? input
+    : input instanceof URL
+      ? input.href
+      : input.url;
+}
+
 function renderConversation(
   response: EditorialThreadRead,
   onChangeTarget = vi.fn(),
@@ -117,6 +125,97 @@ describe("EditorialConversation", () => {
     );
 
     expect(onChangeTarget).toHaveBeenCalledOnce();
+  });
+
+  it("loads a referenced proposal from the current occurrence", async () => {
+    const proposalId = "proposal-1";
+    const proposal = {
+      id: proposalId,
+      subject_id: binding.subject_id,
+      production_run_id: binding.production_run_id,
+      occurrence_id: binding.occurrence_id,
+      thread_id: "thread-1",
+      state: "proposed",
+      state_version: 1,
+      operation: "rewrite_title",
+      base_artifact_id: "artifact-1",
+      base_artifact_version: 4,
+      base_canonical_sha256: "a".repeat(64),
+      patch_sha256: "b".repeat(64),
+      patch: {
+        schema_version: "editorial-patch-v1",
+        operation: "rewrite_title",
+        target: { kind: "title" },
+        target_id: "target-1",
+        occurrence_id: binding.occurrence_id,
+        before_hash: "c".repeat(64),
+        after: "Titre proposé dans le fil",
+        rationale: "Raison synthétique",
+      },
+      diagnostics: {},
+      created_at: "2026-11-19T12:00:00Z",
+    };
+    const thread: EditorialThreadRead = {
+      kind: "open",
+      thread_id: "thread-1",
+      origin: binding,
+      current: binding,
+      binding_state: "valid",
+      bridge_status: "ready",
+      event_sequence: 1,
+      timeline: [
+        {
+          id: "event-1",
+          sequence: 1,
+          kind: "proposal",
+          actor_id: null,
+          proposal_id: proposalId,
+          created_at: "2026-11-19T12:00:00Z",
+          body: null,
+        },
+      ],
+      etag: '"thread-1"',
+      previous_sessions: [],
+    };
+    const fetchMock = vi.fn<typeof fetch>((input) => {
+      if (requestUrl(input).includes(`/proposals/${proposalId}`)) {
+        return Promise.resolve(
+          new Response(JSON.stringify(proposal), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+        );
+      }
+      return Promise.resolve(threadResponse(thread));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, refetchInterval: false } },
+    });
+
+    render(
+      <QueryClientProvider client={client}>
+        <EditorialConversation
+          subjectId={binding.subject_id}
+          occurrenceId={binding.occurrence_id}
+          snapshotId="snapshot-1"
+          targetLabel="Titre synthétique"
+          onChangeTarget={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByText("Titre proposé dans le fil")).toBeVisible();
+    expect(
+      screen.queryByRole("button", { name: /proposer|accepter|rejeter/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.some(([input]) =>
+        requestUrl(input).includes(
+          `/threads/${binding.occurrence_id}/proposals/${proposalId}`,
+        ),
+      ),
+    ).toBe(true);
   });
 
   it("keeps message drafts with their occurrence when switching before send", async () => {

@@ -62,6 +62,11 @@ from cti_app.domain.editorial_bridge_generation_slot import (
     BridgeGenerationSlot,
     BridgeGenerationSlotAcquireResult,
 )
+from cti_app.domain.editorial_proposal import (
+    EditorialProposal,
+    EditorialProposalEvent,
+    EditorialProposalModelRun,
+)
 from cti_app.domain.editorial_thread import (
     EditorialBridgeStatus,
     EditorialThread,
@@ -160,6 +165,8 @@ if TYPE_CHECKING:
 
 
 class BlobRepository(Protocol):
+    async def lock_address(self, logical_bucket: str, sha256: str) -> None: ...
+
     async def add(self, blob: BlobRecord) -> None: ...
 
     async def add_if_absent(self, blob: BlobRecord) -> BlobRecord: ...
@@ -261,6 +268,26 @@ class EditorialThreadRepository(Protocol):
     async def list_dispatchable_jobs(
         self, *, now: datetime, limit: int = 100
     ) -> Sequence[UUID]: ...
+
+
+class EditorialProposalRepository(Protocol):
+    async def get_by_idempotency_key(
+        self, subject_id: UUID, actor_id: UUID, idempotency_key: str
+    ) -> EditorialProposal | None: ...
+
+    async def add_if_absent(
+        self,
+        proposal: EditorialProposal,
+        *,
+        event: EditorialProposalEvent,
+        model_run: EditorialProposalModelRun | None,
+    ) -> tuple[EditorialProposal, bool]: ...
+
+    async def get_for_occurrence(
+        self, subject_id: UUID, occurrence_id: UUID, proposal_id: UUID
+    ) -> EditorialProposal | None: ...
+
+    async def count_patch_references(self, blob_id: UUID) -> int: ...
 
 
 class BridgeGenerationSlotRepository(Protocol):
@@ -1106,6 +1133,7 @@ class UnitOfWork(Protocol):
     production_routing_decisions: ProductionRoutingDecisionRepository
     editorial_workspace_snapshots: EditorialWorkspaceSnapshotRepository
     editorial_threads: EditorialThreadRepository
+    editorial_proposals: EditorialProposalRepository
     bridge_generation_slots: BridgeGenerationSlotRepository
     production_input_snapshots: ProductionInputSnapshotRepository
     production_artifacts: ProductionArtifactRepository

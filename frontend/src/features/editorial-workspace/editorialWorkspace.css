@@ -683,6 +683,98 @@ main:has(> .editorial-route-state) > .app-header {
   line-height: 1.5;
 }
 
+.editorial-conversation__proposals {
+  display: grid;
+  gap: 0.65rem;
+  margin-top: 0.75rem;
+}
+
+.editorial-proposal-card {
+  min-width: 0;
+  padding: 0.8rem;
+  border: 1px solid var(--editorial-divider);
+  border-left: 3px solid var(--editorial-brand);
+  border-radius: 0.35rem;
+  background: var(--editorial-white);
+  overflow-wrap: anywhere;
+}
+
+.editorial-proposal-card__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.6rem;
+}
+
+.editorial-proposal-card__header h4,
+.editorial-proposal-card__content h5 {
+  margin: 0;
+  font-size: 0.85rem;
+}
+
+.editorial-proposal-card__header span,
+.editorial-proposal-card__base,
+.editorial-proposal-card__status {
+  color: var(--editorial-muted);
+  font-size: 0.78rem;
+}
+
+.editorial-proposal-card__base {
+  margin: 0.35rem 0 0.7rem;
+}
+
+.editorial-proposal-card__content p {
+  margin: 0.35rem 0 0;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.editorial-proposal-card__status {
+  margin: 0.45rem 0 0;
+}
+
+.editorial-proposal-card__details {
+  margin-top: 0.7rem;
+  font-size: 0.75rem;
+}
+
+.editorial-proposal-card__details summary {
+  min-height: 44px;
+  padding: 0.6rem 0;
+  color: var(--editorial-link);
+  cursor: pointer;
+}
+
+.editorial-proposal-card__details dl {
+  display: grid;
+  gap: 0.45rem;
+  margin: 0;
+}
+
+.editorial-proposal-card__details dt {
+  color: var(--editorial-muted);
+}
+
+.editorial-proposal-card__details dd {
+  margin: 0.1rem 0 0;
+  font-family: var(--font-mono, monospace);
+  overflow-wrap: anywhere;
+}
+
+.editorial-proposal-card__details pre {
+  max-height: 18rem;
+  margin: 0.5rem 0;
+  padding: 0.55rem;
+  overflow: auto;
+  border-radius: 0.25rem;
+  background: var(--editorial-panel);
+  font-family: var(--font-mono, monospace);
+  font-size: 0.72rem;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .editorial-conversation__composer {
   display: grid;
   gap: 0.55rem;

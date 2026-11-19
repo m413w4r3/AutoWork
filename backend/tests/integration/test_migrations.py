@@ -66,6 +66,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     edition_publication,
     editions,
     editorial,
+    editorial_proposals,
     editorial_threads,
     editorial_workspace,
     external_effects,
@@ -263,6 +264,30 @@ EXPECTED_TRIGGERS: dict[tuple[str, str], str] = {
         "editorial_thread_events",
         "trg_editorial_thread_events_no_truncate",
     ): "reject_editorial_thread_event_mutation",
+    (
+        "editorial_proposals",
+        "trg_editorial_proposals_identity_immutable",
+    ): "guard_editorial_proposal_mutation",
+    (
+        "editorial_proposals",
+        "trg_editorial_proposals_no_truncate",
+    ): "guard_editorial_proposal_mutation",
+    (
+        "editorial_proposal_model_runs",
+        "trg_editorial_proposal_model_runs_append_only",
+    ): "reject_editorial_proposal_registry_mutation",
+    (
+        "editorial_proposal_model_runs",
+        "trg_editorial_proposal_model_runs_no_truncate",
+    ): "reject_editorial_proposal_registry_mutation",
+    (
+        "editorial_proposal_events",
+        "trg_editorial_proposal_events_append_only",
+    ): "reject_editorial_proposal_registry_mutation",
+    (
+        "editorial_proposal_events",
+        "trg_editorial_proposal_events_no_truncate",
+    ): "reject_editorial_proposal_registry_mutation",
     (
         "bridge_generation_slots",
         "trg_bridge_generation_slots_no_delete",
@@ -1157,7 +1182,7 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     command.upgrade(config, "head")
     command.current(config)
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert _head_revision() == "0013_bridge_generation_slots"
+    assert _head_revision() == "0014_editorial_proposals"
     assert asyncio.run(_alembic_version_column_length(temporary_postgres_url)) == 64
 
     collection_attempt_columns = asyncio.run(
@@ -1268,7 +1293,7 @@ def test_frozen_collection_attempt_baseline_precedes_acquisition_additions(
 
     command.upgrade(config, "head")
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert _head_revision() == "0013_bridge_generation_slots"
+    assert _head_revision() == "0014_editorial_proposals"
     final_schema = asyncio.run(_database_snapshot(temporary_postgres_url))["collection_attempts"]
     table = Base.metadata.tables["collection_attempts"]
     assert final_schema["columns"] == _expected_columns(table)
@@ -1489,6 +1514,9 @@ def test_migration_up_and_down_on_temporary_postgres(temporary_postgres_url: str
             "editorial_thread_events",
             "editorial_thread_jobs",
             "bridge_generation_slots",
+            "editorial_proposals",
+            "editorial_proposal_model_runs",
+            "editorial_proposal_events",
         }
     )
     at_0004 = asyncio.run(_database_snapshot(temporary_postgres_url))

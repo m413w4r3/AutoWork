@@ -21,6 +21,7 @@ EXPECTED_CHAIN = (
     "0011_editorial_workspace_snapshots",
     "0012_editorial_threads",
     "0013_bridge_generation_slots",
+    "0014_editorial_proposals",
 )
 
 
@@ -31,7 +32,7 @@ def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
     revision_ids = [script.revision for script in revisions]
 
     assert scripts.get_heads() == [scripts.get_current_head()]
-    assert scripts.get_current_head() == "0013_bridge_generation_slots"
+    assert scripts.get_current_head() == "0014_editorial_proposals"
     assert all(revision_id for revision_id in revision_ids)
     assert {revision_id for revision_id in revision_ids if len(revision_id) > 32} == {
         "0009_acquisition_strategy_attempts",
@@ -54,4 +55,5 @@ def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
         "0011_editorial_workspace_snapshots": "0010_acquisition_provenance",
         "0012_editorial_threads": "0011_editorial_workspace_snapshots",
         "0013_bridge_generation_slots": "0012_editorial_threads",
+        "0014_editorial_proposals": "0013_bridge_generation_slots",
     }

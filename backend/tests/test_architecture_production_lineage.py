@@ -107,6 +107,7 @@ def test_schema_uses_a_frozen_baseline_and_additive_c2_revision() -> None:
         "0011_editorial_workspace.py",
         "0012_editorial_threads.py",
         "0013_bridge_generation_slots.py",
+        "0014_editorial_proposals.py",
     ]
 
 
