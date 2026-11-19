@@ -311,10 +311,16 @@ async def _seed(uow_factory: UnitOfWorkFactory, *, proposal_count: int = 2) -> _
         tlp=TLP.AMBER,
         languages=("fr",),
     )
+    async with uow_factory() as uow:
+        # Resolve the logical edition key before deriving child foreign keys.
+        # add_if_absent updates edition.id when this shared row already exists.
+        await uow.editions.add_if_absent(edition)
+        await uow.commit()
+
     subject = Subject(
         edition_id=edition.id,
         title="Synthetic adoption subject",
-        slug=f"proposal-adoption-{uuid4().hex[:12]}",
+        slug=f"proposal-adoption-{uuid4().hex}",
         tlp=TLP.AMBER,
     )
     run = ProductionRun(subject_id=subject.id, edition_id=edition.id)
@@ -472,11 +478,10 @@ async def _seed(uow_factory: UnitOfWorkFactory, *, proposal_count: int = 2) -> _
     proposals: list[EditorialProposal] = []
 
     async with uow_factory() as uow:
-        await uow.editions.add_if_absent(edition)
         await uow.subjects.add(subject)
         await uow.production_runs.add(run)
-        await uow.blobs.add_if_absent(base_blob)
-        await uow.blobs.add_if_absent(patch_blob)
+        base_blob = await uow.blobs.add_if_absent(base_blob)
+        patch_blob = await uow.blobs.add_if_absent(patch_blob)
         base_artifact = replace(base_artifact, canonical_blob_id=base_blob.id)
         await uow.production_artifacts.append(base_artifact)
         await uow.editorial_workspace_snapshots.append_if_absent(snapshot)
