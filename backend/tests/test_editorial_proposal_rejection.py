@@ -8,11 +8,13 @@ import pytest
 from fastapi import FastAPI
 
 from cti_app.api import editorial_workspace as editorial_workspace_api
+from cti_app.application.editorial_proposal_adoption import EditorialProposalAdoptionError
 from cti_app.application.editorial_proposals import EditorialProposalService
+from cti_app.config import Settings
 
 
 @pytest.mark.asyncio
-async def test_reject_route_is_versioned_and_does_not_expose_accept(
+async def test_reject_route_is_versioned_and_accept_is_disabled_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     subject_id = uuid4()
@@ -80,9 +82,70 @@ async def test_reject_route_is_versioned_and_does_not_expose_accept(
     assert received["patch_sha256"] == "a" * 64
     assert isinstance(received["idempotency_key"], str)
     assert "workspace_service" in received
-    assert not any(
-        route.path.endswith("/accept") for route in editorial_workspace_api.router.routes
+    accept_route = (
+        "/api/subjects/{subject_id}/editor/threads/{occurrence_id}/proposals/{proposal_id}/accept"
     )
+    assert any(
+        route.path == accept_route and "POST" in route.methods
+        for route in editorial_workspace_api.router.routes
+    )
+
+    settings = Settings(_env_file=None)
+    assert settings.editorial_proposal_accept_enabled is False
+    monkeypatch.setattr(editorial_workspace_api, "get_settings", lambda: settings)
+
+    def fail_if_accept_handler_runs(_request):
+        raise AssertionError("disabled accept handler was called")
+
+    monkeypatch.setattr(
+        editorial_workspace_api, "_proposal_adoption_service", fail_if_accept_handler_runs
+    )
+    accept_path = (
+        f"/api/subjects/{subject_id}/editor/threads/{occurrence_id}/proposals/{proposal_id}/accept"
+    )
+    accept_headers = {"Idempotency-Key": f"accept_{uuid4().hex}"}
+    accept_payload = {"expected_state_version": 7, "patch_sha256": "a" * 64}
+    app = FastAPI()
+    app.include_router(editorial_workspace_api.router)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
+    ) as client:
+        response = await client.post(accept_path, headers=accept_headers, json=accept_payload)
+
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "accept_not_enabled"
+
+    accept_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    class _AcceptSpy:
+        async def adopt(self, *args, **kwargs):
+            accept_calls.append((args, kwargs))
+            raise EditorialProposalAdoptionError("proposal_not_found")
+
+    def build_accept_spy(_request):
+        return _AcceptSpy()
+
+    monkeypatch.setattr(
+        editorial_workspace_api,
+        "get_settings",
+        lambda: Settings(_env_file=None, editorial_proposal_accept_enabled=True),
+    )
+    monkeypatch.setattr(editorial_workspace_api, "_proposal_adoption_service", build_accept_spy)
+    enabled_app = FastAPI()
+    enabled_app.include_router(editorial_workspace_api.router)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=enabled_app), base_url="http://editorial.test"
+    ) as client:
+        enabled_response = await client.post(
+            accept_path, headers=accept_headers, json=accept_payload
+        )
+
+    assert enabled_response.status_code == 404
+    assert enabled_response.json()["detail"]["code"] == "proposal_not_found"
+    assert len(accept_calls) == 1
+    assert accept_calls[0][0] == (subject_id, occurrence_id, proposal_id)
+    assert accept_calls[0][1]["expected_state_version"] == 7
+    assert accept_calls[0][1]["patch_sha256"] == "a" * 64
 
 
 @pytest.mark.asyncio
