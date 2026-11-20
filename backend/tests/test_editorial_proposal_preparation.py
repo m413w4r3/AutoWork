@@ -668,6 +668,33 @@ async def test_preparation_refuses_a_snapshot_that_advanced_after_the_bridge_tur
 
 
 @pytest.mark.asyncio
+async def test_preparation_revalidates_pins_under_run_lock_before_inserting() -> None:
+    from cti_app.application.editorial_proposals import EditorialProposalApplicationError
+
+    setup = _setup()
+    original_read = setup.service._blob_store.read
+
+    async def read_then_advance(descriptor, *, max_bytes):
+        content = await original_read(descriptor, max_bytes=max_bytes)
+        setup.current_snapshot.workspace_pin_hash = "8" * 64
+        setup.current_snapshot.synthesis_canonical_sha256 = "9" * 64
+        return content
+
+    setup.service._blob_store.read = read_then_advance
+
+    with pytest.raises(EditorialProposalApplicationError) as error:
+        await setup.service.prepare_bridge_result(setup.preparation())
+
+    assert error.value.code == "proposal_base_stale"
+    assert setup.repository.records == []
+    assert setup.repository.events == []
+    assert setup.thread_events == []
+    assert setup.calls.index(("adoption_guard", setup.preparation().production_run_id)) < (
+        setup.calls.index("blob_address_lock")
+    )
+
+
+@pytest.mark.asyncio
 async def test_bridge_patch_becomes_immutable_proposal_with_exact_sha() -> None:
     setup = _setup()
     preparation = setup.preparation()

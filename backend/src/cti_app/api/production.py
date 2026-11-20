@@ -20,6 +20,11 @@ from pydantic import (
 )
 
 from cti_app.application.bridge_identity import bridge_request_fingerprint
+from cti_app.application.editorial_enrichment_revision import (
+    EditorialEnrichmentRevisionValidationError,
+)
+from cti_app.application.editorial_revision_effects import EditorialRevisionEffects
+from cti_app.application.editorial_workspace.service import EditorialWorkspaceService
 from cti_app.application.identity import IdentityProvider
 from cti_app.application.jobs import (
     DuplicateJobError,
@@ -36,7 +41,6 @@ from cti_app.application.production_editorial_enrichment import (
 )
 from cti_app.application.production_enrichment_revision import (
     EditorialEnrichmentRevisionResult,
-    EditorialEnrichmentRevisionValidationError,
     ProductionEditorialEnrichmentRevisionService,
 )
 from cti_app.application.production_extraction import ProductionExtractionService
@@ -755,6 +759,12 @@ def _production_enrichment_revision_service(
     from cti_app.config import get_settings
 
     uow_factory = request.app.state.uow_factory
+    revision_effects = EditorialRevisionEffects(
+        workspace_service=EditorialWorkspaceService(
+            uow_factory=uow_factory,
+            artifact_store=artifact_store,
+        )
+    )
     collection_service = getattr(request.app.state, "collection_service", None)
     enrichment_service = ProductionEditorialEnrichmentService(
         uow_factory=uow_factory,
@@ -771,6 +781,7 @@ def _production_enrichment_revision_service(
         enrichment_service=enrichment_service,
         persistence_service=EditorialEnrichmentService(uow_factory, artifact_store),
         publication_render_service=render_service,
+        revision_effects=revision_effects,
     )
 
 
@@ -815,6 +826,12 @@ def _production_synthesis_revision_service(
     from cti_app.config import get_settings
 
     uow_factory = request.app.state.uow_factory
+    revision_effects = EditorialRevisionEffects(
+        workspace_service=EditorialWorkspaceService(
+            uow_factory=uow_factory,
+            artifact_store=artifact_store,
+        )
+    )
     synthesis_persistence = SynthesisService(uow_factory, artifact_store)
     synthesis_service = ProductionSynthesisService(
         uow_factory=uow_factory,
@@ -834,6 +851,7 @@ def _production_synthesis_revision_service(
         publication_render_service=render_service,
         enrichment_revision_service=_production_enrichment_revision_service(request),
         source_addition_service=source_addition_service,
+        revision_effects=revision_effects,
         resource_search_enabled=get_settings().production_editorial_resource_search_enabled,
     )
 
@@ -3239,6 +3257,7 @@ async def revise_editorial_enrichment_artifact(
                 element_key=payload.element_key,
                 action=payload.action,
                 instruction=payload.instruction,
+                actor=await _actor_id(request) if hasattr(request, "app") else None,
             ),
         )
     except TargetedEditorialRevisionTransportError as exc:

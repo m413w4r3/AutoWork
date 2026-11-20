@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import replace
+from types import SimpleNamespace
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
+from cti_app.api.production import EditorialEnrichmentRevisionResponse
 from cti_app.application.editorial_enrichment_revision import (
     assert_requested_placement,
     validate_editorial_enrichment_patch,
@@ -33,12 +36,34 @@ from cti_app.domain.production_editorial_revision import (
 from cti_app.domain.production_synthesis import production_synthesis_to_json
 from tests.test_production_editorial_enrichment_application import (
     _common_enrichment_request,
+    _install_stale_enrichment_restore_history,
     _RecordingGateway,
     _revision_args,
     _revision_harness,
+    _stale_enrichment_restore_args,
     _succeeded_text,
     _table_revision_wire,
 )
+
+
+class _RecordingRevisionEffects:
+    def __init__(self) -> None:
+        self.run_id = None
+        self.calls: list[dict[str, object]] = []
+
+    async def acquire_run_guard(self, _uow, production_run_id):
+        self.run_id = production_run_id
+        return SimpleNamespace(production_run_id=production_run_id)
+
+    async def lock_run_row(self, _uow, _guard):
+        return SimpleNamespace(id=self.run_id)
+
+    async def current_snapshot_in_uow(self, _uow, _subject_id):
+        return SimpleNamespace(production_run_id=self.run_id)
+
+    async def apply_after_write(self, _uow, **values):
+        self.calls.append(values)
+        return SimpleNamespace(snapshot=values["base_snapshot"])
 
 
 @pytest.mark.asyncio
@@ -65,6 +90,102 @@ async def test_enrichment_facade_characterization_keeps_replay_and_fences(
     assert len(harness.world.gateway.calls) == 1
     assert await harness.world.store.read_bytes(harness.base.canonical_blob_id) == base_bytes
     assert hashlib.sha256(base_bytes).hexdigest() == harness.base_sha256
+
+
+@pytest.mark.asyncio
+async def test_legacy_response_bytes_and_ids_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, _table_revision_wire())),
+    )
+    arguments = _revision_args(harness)
+
+    first = await harness.service.revise(**arguments)
+    first_bytes = await harness.world.store.read_bytes(first.artifact.canonical_blob_id)
+    replay = await harness.service.revise(**arguments)
+    replay_bytes = await harness.world.store.read_bytes(replay.artifact.canonical_blob_id)
+    first_response_model = EditorialEnrichmentRevisionResponse(
+        outcome=first.outcome.value,
+        request_identity=str(first.revision["request_identity"]),
+        artifact_id=first.artifact.id,
+        artifact_version=first.artifact.version,
+        artifact_input_hash=first.artifact.input_hash,
+        artifact_canonical_sha256=hashlib.sha256(first_bytes).hexdigest(),
+        publication_artifact_id=(
+            first.publication_artifact.id if first.publication_artifact is not None else None
+        ),
+        publication_artifact_version=(
+            first.publication_artifact.version if first.publication_artifact is not None else None
+        ),
+        previous_publication_artifact_id=first.previous_publication_artifact_id,
+        revision=first.revision,
+    )
+    replay_response_model = EditorialEnrichmentRevisionResponse(
+        outcome=replay.outcome.value,
+        request_identity=str(replay.revision["request_identity"]),
+        artifact_id=replay.artifact.id,
+        artifact_version=replay.artifact.version,
+        artifact_input_hash=replay.artifact.input_hash,
+        artifact_canonical_sha256=hashlib.sha256(replay_bytes).hexdigest(),
+        publication_artifact_id=(
+            replay.publication_artifact.id if replay.publication_artifact is not None else None
+        ),
+        publication_artifact_version=(
+            replay.publication_artifact.version if replay.publication_artifact is not None else None
+        ),
+        previous_publication_artifact_id=replay.previous_publication_artifact_id,
+        revision=replay.revision,
+    )
+    first_response = first_response_model.model_dump_json()
+    replay_response = replay_response_model.model_dump_json()
+
+    assert first.artifact.id == replay.artifact.id
+    assert first.artifact.id == uuid5(
+        NAMESPACE_URL,
+        f"production-editorial-enrichment-revision:{first.revision['request_identity']}",
+    )
+    assert first_bytes == replay_bytes
+    assert hashlib.sha256(first_bytes).hexdigest() == first_response_model.artifact_canonical_sha256
+    assert first_response == replay_response
+
+
+@pytest.mark.asyncio
+async def test_opaque_actor_revise_and_restore_reach_revision_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    revise_effects = _RecordingRevisionEffects()
+    revise_harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, _table_revision_wire())),
+        revision_effects=revise_effects,
+    )
+    revise_args = _revision_args(revise_harness)
+    revise_args["actor"] = "dev-analyst"
+    revised = await revise_harness.service.revise(**revise_args)
+
+    assert revised.artifact is not None
+    assert len(revise_effects.calls) == 1
+    assert revise_effects.calls[0]["actor_id"] == "dev-analyst"
+
+    restore_effects = _RecordingRevisionEffects()
+    restore_harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, "unexpected")),
+        include_figure=True,
+        include_target_annotations=True,
+        revision_effects=restore_effects,
+    )
+    await _install_stale_enrichment_restore_history(restore_harness)
+    restored = await restore_harness.service.restore_stale_enrichment_blocks(
+        **_stale_enrichment_restore_args(restore_harness),
+        actor="dev-analyst",
+    )
+
+    assert restored.artifact is not None
+    assert len(restore_effects.calls) == 1
+    assert restore_effects.calls[0]["actor_id"] == "dev-analyst"
 
 
 @pytest.mark.asyncio

@@ -85,6 +85,18 @@ class EditorialWorkspaceService:
         result, _record, _synthesis = await self._load_current(subject_id)
         return result
 
+    async def snapshot_record_in_uow(
+        self, uow: UnitOfWork, subject_id: UUID
+    ) -> WorkspaceSnapshotRecord:
+        """Resolve the current pins without committing outside the caller's transaction."""
+        _snapshot, record, _synthesis = await self._load_current(
+            subject_id,
+            uow=uow,
+            lock_creation=False,
+            commit_snapshot=False,
+        )
+        return record
+
     async def resolve_occurrence(
         self, subject_id: UUID, occurrence_id: UUID
     ) -> WorkspaceOccurrenceResolution:
