@@ -45,6 +45,7 @@ from cti_app.application.production_synthesis import (
     canonical_extraction_hash,
 )
 from cti_app.application.production_synthesis_revision import _apply_wire_patch
+from cti_app.application.subject_production import capture_production_input_snapshot
 from cti_app.config import Settings
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
 from cti_app.domain.classification import TLP
@@ -101,6 +102,10 @@ from cti_app.domain.production_synthesis import (
     production_synthesis_to_json,
 )
 from cti_app.domain.publication_kind import PublicationKind
+from tests.integration.test_production_reuse_postgres import (
+    _prepare_reusable_article,
+    _seed_subject_discovery_lineage,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -315,7 +320,12 @@ def _synthetic_candidate_context(
     )
 
 
-async def _seed(uow_factory: UnitOfWorkFactory, *, proposal_count: int = 2) -> _Seeded:
+async def _seed(
+    uow_factory: UnitOfWorkFactory,
+    *,
+    proposal_count: int = 2,
+    seed_discovery_lineage: bool = False,
+) -> _Seeded:
     blob_store = _MemoryBlobStore()
     edition = Edition(
         country="France",
@@ -338,32 +348,57 @@ async def _seed(uow_factory: UnitOfWorkFactory, *, proposal_count: int = 2) -> _
         tlp=TLP.AMBER,
     )
     run = ProductionRun(subject_id=subject.id, edition_id=edition.id)
+    if seed_discovery_lineage:
+        async with uow_factory() as uow:
+            await uow.subjects.add(subject)
+            await uow.commit()
+        discovery_batch, _ = await _prepare_reusable_article(
+            uow_factory,
+            edition=edition,
+            subject=subject,
+            title=subject.title,
+        )
+        await _seed_subject_discovery_lineage(
+            uow_factory,
+            edition=edition,
+            subject_batches=((subject, discovery_batch),),
+        )
+        async with uow_factory() as uow:
+            production_input = await capture_production_input_snapshot(
+                uow,
+                production_run_id=run.id,
+                subject_id=subject.id,
+                edition_id=edition.id,
+                research_date=date(2026, 11, 19),
+                captured_at=run.created_at,
+            )
+    else:
+        production_input = ProductionInputSnapshot(
+            production_run_id=run.id,
+            edition_id=edition.id,
+            subject_id=subject.id,
+            subject_version=1,
+            subject_title=subject.title,
+            subject_tlp=TLP.AMBER,
+            selection_decision_id=uuid4(),
+            origin_discovery_subject_id=uuid4(),
+            canonical_discovery_subject_id=uuid4(),
+            discovery_snapshot_id=uuid4(),
+            discovery_snapshot_version=1,
+            member_candidate_ids=(),
+            discovery_summary="Synthetic summary.",
+            actor_or_campaign="Synthetic actor",
+            period_start=date(2026, 11, 1),
+            period_end=date(2026, 11, 30),
+            publication_language="fr",
+            research_date=date(2026, 11, 19),
+        )
     operation = TargetedEditorialRevisionOperation.REWRITE_TITLE
     target = TargetedEditorialRevisionTarget(
         kind=TargetedEditorialRevisionTargetKind.TITLE,
         stable_ids=(),
     )
     source_document_id = uuid4()
-    production_input = ProductionInputSnapshot(
-        production_run_id=run.id,
-        edition_id=edition.id,
-        subject_id=subject.id,
-        subject_version=1,
-        subject_title=subject.title,
-        subject_tlp=TLP.AMBER,
-        selection_decision_id=uuid4(),
-        origin_discovery_subject_id=uuid4(),
-        canonical_discovery_subject_id=uuid4(),
-        discovery_snapshot_id=uuid4(),
-        discovery_snapshot_version=1,
-        member_candidate_ids=(),
-        discovery_summary="Synthetic summary.",
-        actor_or_campaign="Synthetic actor",
-        period_start=date(2026, 11, 1),
-        period_end=date(2026, 11, 30),
-        publication_language="fr",
-        research_date=date(2026, 11, 19),
-    )
     extraction = ProductionExtractionV1(
         schema_version=1,
         subject_id=subject.id,
@@ -499,7 +534,8 @@ async def _seed(uow_factory: UnitOfWorkFactory, *, proposal_count: int = 2) -> _
     proposals: list[EditorialProposal] = []
 
     async with uow_factory() as uow:
-        await uow.subjects.add(subject)
+        if not seed_discovery_lineage:
+            await uow.subjects.add(subject)
         await uow.production_runs.add(run)
         base_blob = await uow.blobs.add_if_absent(base_blob)
         patch_blob = await uow.blobs.add_if_absent(patch_blob)
@@ -832,7 +868,7 @@ async def test_accept_route_policy_refusal_keeps_sql_state_unchanged(
 async def test_adoption_rechecks_current_red_subject_tlp_without_sql_writes(
     uow_factory: UnitOfWorkFactory,
 ) -> None:
-    seeded = await _seed(uow_factory, proposal_count=1)
+    seeded = await _seed(uow_factory, proposal_count=1, seed_discovery_lineage=True)
     proposal = seeded.proposals[0]
     extraction_bytes = ProductionArtifactStore.canonical_json_bytes(
         production_extraction_to_json(seeded.extraction)
@@ -922,6 +958,12 @@ async def test_adoption_rechecks_current_red_subject_tlp_without_sql_writes(
     before_blob_addresses = set(seeded.blob_store.objects)
     before_put_calls = seeded.blob_store.put_calls
     async with uow_factory() as uow:
+        before_input_snapshot = await uow.production_input_snapshots.get_by_run(seeded.run.id)
+        assert before_input_snapshot == seeded.production_input
+        before_proposal = await uow.editorial_proposals.get_for_occurrence(
+            proposal.subject_id, proposal.occurrence_id, proposal.id
+        )
+        assert before_proposal == proposal
         before_artifact_ids = {
             item.id for item in await uow.production_artifacts.list_for_run(seeded.run.id)
         }
@@ -942,7 +984,11 @@ async def test_adoption_rechecks_current_red_subject_tlp_without_sql_writes(
         current = await uow.editorial_proposals.get_for_occurrence(
             proposal.subject_id, proposal.occurrence_id, proposal.id
         )
+        assert current == before_proposal
         assert current is not None and current.state is EditorialProposalState.PROPOSED
+        assert (
+            await uow.production_input_snapshots.get_by_run(seeded.run.id) == before_input_snapshot
+        )
         assert (
             await uow.editorial_proposals.get_event_by_idempotency(proposal.id, idempotency_key)
             is None
