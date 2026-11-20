@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import date
 from io import BytesIO
+from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -68,6 +70,10 @@ from cti_app.domain.production import (
     ProductionInputSnapshot,
     ProductionRun,
     SynthesisMode,
+)
+from cti_app.domain.production_editorial_enrichment import (
+    EditorialEnrichmentElementKind,
+    editorial_enrichment_from_json,
 )
 from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionOperation,
@@ -952,6 +958,279 @@ async def test_adopt_cas_appends_artifact_lineage_registry_and_outbox_atomically
     assert stored.impacts[fixture.proposal.id].sequence == 1
     assert stored.impacts[fixture.proposal.id].accepted_snapshot_id == result.snapshot.snapshot_id
     assert fixture.factory.commits == 1
+
+
+@pytest.mark.asyncio
+async def test_simple_enrichment_table_adoption_uses_parsed_base_and_production_candidate_core(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cti_app.application.editorial_proposal_adoption_inputs import (
+        ProductionEditorialProposalAdoptionInputs,
+        _target_id,
+    )
+    from cti_app.application.editorial_workspace.registry import resolve_occurrence
+    from cti_app.application.production_editorial_enrichment import (
+        EditorialEnrichmentV1,
+        build_editorial_figure_catalog,
+        parse_editorial_enrichment_proposal_wire,
+    )
+    from cti_app.application.production_stages import EditorialEnrichmentService
+    from cti_app.application.production_synthesis import SynthesisAccessPolicyV1
+    from cti_app.domain.editorial_workspace import (
+        EditorialSourceStage,
+    )
+    from cti_app.domain.production import ProductionArtifactStatus
+    from cti_app.domain.production_synthesis import production_synthesis_to_json
+    from tests.test_production_editorial_enrichment_application import (
+        _RecordingGateway,
+        _revision_harness,
+        _table_revision_wire,
+    )
+    from tests.test_production_enrichment_candidate_core import _validated_table_patch
+
+    harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(AssertionError("adoption must not call the model")),
+    )
+    validated_patch = await _validated_table_patch(harness)
+    base_enrichment = editorial_enrichment_from_json(harness.base_payload)
+    assert isinstance(base_enrichment, EditorialEnrichmentV1)
+    figure_catalog = build_editorial_figure_catalog(
+        harness.world.extraction, harness.inventory_state.value
+    )
+    parsed_patch = parse_editorial_enrichment_proposal_wire(
+        _table_revision_wire(), harness.evidence_pack, figure_catalog=figure_catalog
+    )
+    assert parsed_patch.proposal is not None
+    base_bytes = await harness.world.store.read_bytes(harness.base.canonical_blob_id)
+    run = harness.world.run
+    subject_id = harness.world.snapshot.subject_id
+    occurrence_id = uuid4()
+    actor_id = uuid4()
+
+    target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT,
+        element_kind=EditorialEnrichmentElementKind.TABLE,
+        element_key="tools_table",
+    )
+    target_id = _target_id(target)
+    before_hash = hashlib.sha256(
+        ProductionArtifactStore.canonical_json_bytes({"value": harness.base_payload["tables"][0]})
+    ).hexdigest()
+    entry = BlockRegistryEntry(
+        block_id=occurrence_id,
+        kind=EditorialBlockKind.TABLE,
+        parent_block_id=None,
+        position=0,
+        content_sha256=before_hash,
+        source_stage=EditorialSourceStage.EDITORIAL_ENRICHMENT,
+        structural_pointer="/tables/0",
+    )
+    snapshot = WorkspaceSnapshotRecord(
+        snapshot_id=uuid4(),
+        subject_id=subject_id,
+        production_run_id=run.id,
+        synthesis_artifact_id=harness.world.synthesis_artifact.id,
+        synthesis_version=harness.world.synthesis_artifact.version,
+        synthesis_input_hash=harness.world.synthesis_artifact.input_hash,
+        synthesis_canonical_sha256=hashlib.sha256(
+            ProductionArtifactStore.canonical_json_bytes(
+                production_synthesis_to_json(harness.world.synthesis)
+            )
+        ).hexdigest(),
+        enrichment_artifact_id=harness.base.id,
+        enrichment_version=harness.base.version,
+        enrichment_input_hash=harness.base.input_hash,
+        enrichment_canonical_sha256=harness.base_sha256,
+        publication_artifact_id=None,
+        publication_version=None,
+        publication_input_hash=None,
+        publication_canonical_sha256=None,
+        pipeline_generation=0,
+        routing_decision_id=None,
+        routing_decision_hash=None,
+        publication_kind=PublicationKind.BRIEF,
+        workspace_pin_hash="7" * 64,
+        registry_hash=registry_hash((entry,)),
+        block_registry=(entry,),
+    )
+    resolution = resolve_occurrence(snapshot, occurrence_id)
+    workspace = _MemoryWorkspace(resolution)
+    patch_payload = {
+        "schema_version": "editorial-patch-v1",
+        "operation": TargetedEditorialRevisionOperation.REWRITE_TABLE.value,
+        "target": target.to_json(),
+        "target_id": target_id,
+        "occurrence_id": str(occurrence_id),
+        "before_hash": before_hash,
+        "enrichment_patch": parsed_patch.proposal.model_dump(mode="json"),
+        "rationale": "Synthetic table replacement.",
+    }
+    patch_bytes = ProductionArtifactStore.canonical_json_bytes(patch_payload)
+    patch_sha256 = hashlib.sha256(patch_bytes).hexdigest()
+    patch_descriptor = BlobDescriptor(patch_sha256, len(patch_bytes), _PATCH_MIME, _PATCH_BUCKET)
+    patch_blob = BlobRecord(descriptor=patch_descriptor)
+    proposal_id = uuid4()
+    proposal = EditorialProposal(
+        id=proposal_id,
+        subject_id=subject_id,
+        production_run_id=run.id,
+        origin=EditorialProposalOrigin.MANUAL_PATCH,
+        snapshot_id=snapshot.snapshot_id,
+        occurrence_id=occurrence_id,
+        base_artifact_id=harness.base.id,
+        base_artifact_version=harness.base.version,
+        base_input_hash=harness.base.input_hash,
+        base_canonical_sha256=harness.base_sha256,
+        base_routing_hash=None,
+        base_pin_hash=snapshot.workspace_pin_hash,
+        target_id=target_id,
+        operation=TargetedEditorialRevisionOperation.REWRITE_TABLE.value,
+        before_hash=before_hash,
+        patch_blob_ref=patch_blob.id,
+        patch_sha256=patch_sha256,
+        evidence_refs=(),
+        diagnostics={},
+        thread_id=None,
+        variant_group_id=uuid4(),
+        model_run_id=None,
+        model_turn_id=None,
+        state=EditorialProposalState.PROPOSED,
+        state_version=1,
+        actor_id=actor_id,
+        idempotency_key=f"proposal-{uuid4().hex}",
+        request_sha256="4" * 64,
+    )
+
+    fixture = _fixture(service_type=EditorialProposalAdoptionService)
+    fixture.factory.state.proposals = {proposal.id: proposal}
+    fixture.factory.state.blobs = {patch_blob.id: patch_blob}
+    fixture.factory.state.artifacts = {
+        artifact.id: artifact
+        for artifact in (
+            harness.world.extraction_artifact,
+            harness.world.synthesis_artifact,
+            harness.base,
+        )
+    }
+    fixture.factory.state.snapshots = {snapshot.snapshot_id: snapshot}
+    fixture.factory.state.run = run
+    fixture.actor_id = actor_id
+    fixture.occurrence_id = occurrence_id
+    fixture.patch_sha256 = patch_sha256
+    fixture.blob_store.objects[(patch_descriptor.logical_bucket, patch_sha256)] = patch_bytes
+    artifact_store = fixture.service._artifact_store
+    artifact_store.canonical_bytes = base_bytes
+
+    evidence_pack_hash = str(harness.base.metadata["evidence_pack_hash"])
+    access_policy = SynthesisAccessPolicyV1(
+        subject_tlp=TLP.CLEAR,
+        effective_tlp=TLP.CLEAR,
+        external_llm_allowed=True,
+        do_not_submit=False,
+        sources=(),
+    )
+    fence = SimpleNamespace(
+        evidence_pack=harness.evidence_pack,
+        evidence_pack_hash=evidence_pack_hash,
+        inventory_hash=str(harness.base.metadata["source_figure_inventory_hash"]),
+        figure_catalog=figure_catalog,
+        input_hash=harness.input_hash,
+    )
+    enrichment_loader = SimpleNamespace()
+
+    async def load_extraction(*_args: Any, **_kwargs: Any) -> Any:
+        return harness.world.extraction
+
+    async def load_synthesis(*_args: Any, **_kwargs: Any) -> Any:
+        return harness.world.synthesis
+
+    enrichment_loader._load_extraction = load_extraction
+    enrichment_loader._load_synthesis = load_synthesis
+    revision_service = SimpleNamespace()
+
+    async def validate_input_fence(**_kwargs: Any) -> Any:
+        return fence
+
+    revision_service._validate_input_fence = validate_input_fence
+    inputs = ProductionEditorialProposalAdoptionInputs(
+        uow_factory=fixture.factory,
+        artifact_store=artifact_store,
+        workspace_service=workspace,
+        synthesis_loader=SimpleNamespace(),
+        enrichment_loader=enrichment_loader,
+        enrichment_revision_service=revision_service,
+    )
+
+    async def load_base_context(_proposal: EditorialProposal, **_kwargs: Any) -> tuple[Any, ...]:
+        return (
+            run,
+            harness.world.snapshot,
+            harness.world.extraction_artifact,
+            None,
+            harness.world.synthesis_artifact,
+        )
+
+    async def load_access_policy(*_args: Any, **_kwargs: Any) -> tuple[Any, int]:
+        return access_policy, harness.world.snapshot.subject_version
+
+    async def revalidate_fences(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    inputs._load_base_context = load_base_context
+    inputs._access_policy = load_access_policy
+    inputs.revalidate_evidence_policy_and_thread = revalidate_fences
+
+    class _PersistedEnrichmentAdoption(EditorialProposalAdoptionService):
+        async def _persist_candidate(
+            self,
+            uow: UnitOfWork,
+            stage: ProductionArtifactStage,
+            plan: _CandidatePlan,
+            blob: BlobRecord,
+            *,
+            proposal: EditorialProposal,
+            patch_sha256: str,
+        ) -> ProductionArtifact:
+            assert stage is ProductionArtifactStage.EDITORIAL_ENRICHMENT
+            candidate = plan.candidate
+            artifact = ProductionArtifact(
+                id=candidate.artifact_id,
+                production_run_id=proposal.production_run_id,
+                subject_id=proposal.subject_id,
+                stage=stage,
+                version=2,
+                input_hash=candidate.input_hash,
+                canonical_blob_id=blob.id,
+                status=ProductionArtifactStatus.VERIFIED,
+                metadata={"patch_sha256": patch_sha256},
+            )
+            await uow.production_artifacts.append(artifact)
+            return artifact
+
+    fixture.service = _PersistedEnrichmentAdoption(
+        uow_factory=fixture.factory,
+        blob_store=cast(Any, fixture.blob_store),
+        artifact_store=artifact_store,
+        workspace_service=workspace,
+        inputs=cast(EditorialProposalAdoptionInputs, inputs),
+        synthesis_writer=cast(Any, fixture.service._synthesis_writer),
+        enrichment_writer=cast(EditorialEnrichmentService, object()),
+    )
+
+    result = await fixture.adopt(proposal)
+
+    assert result.proposal.state is EditorialProposalState.ACCEPTED
+    assert result.artifact.stage is ProductionArtifactStage.EDITORIAL_ENRICHMENT
+    assert result.artifact.version == 2
+    accepted_blob = fixture.factory.state.blobs[result.artifact.canonical_blob_id]
+    adopted_payload = json.loads(
+        fixture.blob_store.objects[
+            (accepted_blob.descriptor.logical_bucket, accepted_blob.descriptor.sha256)
+        ]
+    )
+    assert adopted_payload["tables"][0]["title"] == validated_patch.tables[0].title
+    assert result.snapshot.enrichment_version == 2
 
 
 @pytest.mark.asyncio

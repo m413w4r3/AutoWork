@@ -670,14 +670,16 @@ class ProductionEditorialEnrichmentRevisionService:
             run,
             snapshot,
             base_artifact,
-            _base_payload,
-            base_enrichment,
+            base_payload,
+            _context_enrichment,
             references_artifact,
             extraction_artifact,
             projection_artifact,
             synthesis_artifact,
             previous_publication,
         ) = context
+        # The canonical payload is the source of truth for restore content.
+        base_enrichment = editorial_enrichment_from_json(base_payload)
         restored_enrichment, restored_blocks, non_restorable = evaluation
         if not restored_blocks:
             raise EditorialEnrichmentRevisionValidationError(
@@ -925,14 +927,16 @@ class ProductionEditorialEnrichmentRevisionService:
             run,
             snapshot,
             base_artifact,
-            _base_payload,
-            base_enrichment,
+            base_payload,
+            _context_enrichment,
             _references_artifact,
             extraction_artifact,
             projection_artifact,
             synthesis_artifact,
             _previous_publication,
         ) = context
+        # Reparse the canonical payload instead of trusting a cached context value.
+        base_enrichment = editorial_enrichment_from_json(base_payload)
         extraction = await self._enrichment._load_extraction(run, snapshot, extraction_artifact)
         projection = (
             await self._enrichment._load_projection(run, snapshot, extraction, projection_artifact)

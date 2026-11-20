@@ -25,6 +25,7 @@ from cti_app.application.editorial_proposal_adoption import (
 )
 from cti_app.application.editorial_proposal_adoption_inputs import (
     ProductionEditorialProposalAdoptionInputs,
+    _target_id,
 )
 from cti_app.application.editorial_synthesis import targets
 from cti_app.application.editorial_synthesis.candidate import (
@@ -38,7 +39,19 @@ from cti_app.application.editorial_workspace.registry import (
 )
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.application.production_stages import SynthesisService
+from cti_app.application.production_editorial_enrichment import (
+    AnalyticPurposeProposalV1,
+    EditorialEnrichmentProposalV1,
+    EnrichmentPlacementProposalV1,
+    TableColumnProposalV1,
+    TableProposalV1,
+    TableRowProposalV1,
+    build_editorial_enrichment_evidence_pack,
+    compute_editorial_enrichment_input_hash,
+    editorial_enrichment_evidence_pack_hash,
+    validate_editorial_enrichment_proposal,
+)
+from cti_app.application.production_stages import EditorialEnrichmentService, SynthesisService
 from cti_app.application.production_synthesis import (
     ProductionSynthesisService,
     build_synthesis_evidence_pack,
@@ -78,8 +91,16 @@ from cti_app.domain.production import (
     ProductionRun,
     SynthesisMode,
 )
+from cti_app.domain.production_editorial_enrichment import (
+    EditorialEnrichmentElementKind,
+    EnrichmentPlacementKind,
+    EnrichmentTableKind,
+    editorial_enrichment_to_json,
+)
 from cti_app.domain.production_editorial_revision import (
+    TargetedEditorialRevisionMode,
     TargetedEditorialRevisionOperation,
+    TargetedEditorialRevisionRequest,
     TargetedEditorialRevisionTarget,
     TargetedEditorialRevisionTargetKind,
 )
@@ -259,6 +280,23 @@ class _Inputs(EditorialProposalAdoptionInputs):
             raise EditorialProposalAdoptionError("thread_binding_stale")
         if not set(proposal.evidence_refs) <= self.fences.admitted_evidence_refs:
             raise EditorialProposalAdoptionError("proposal_evidence_not_admissible")
+
+
+class _EnrichmentInputs(_Inputs):
+    def __init__(
+        self,
+        synthesis: SynthesisCandidateInputs,
+        enrichment: EnrichmentCandidateInputs,
+    ) -> None:
+        super().__init__(synthesis)
+        self.enrichment = enrichment
+
+    async def enrichment_inputs(
+        self,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> EnrichmentCandidateInputs:
+        return self.enrichment
 
 
 @dataclass(frozen=True)
@@ -647,6 +685,231 @@ async def _seed(
     )
 
 
+def _table_proposal(handle: str, *, title: str) -> EditorialEnrichmentProposalV1:
+    purpose = AnalyticPurposeProposalV1(
+        question="What finding is stated in the report?",
+        available_data="The synthetic source records one finding.",
+        comprehension_gain="A row presents the finding for quick review.",
+        scope="Only the synthetic finding present in this source.",
+        evidence_handles=(handle,),
+        knowledge_limits="The source provides no additional detail in this fixture.",
+        placement_reason="Keep the table close to the opening context.",
+    )
+    return EditorialEnrichmentProposalV1(
+        tables=(
+            TableProposalV1(
+                key="synthetic_table",
+                kind=EnrichmentTableKind.CUSTOM,
+                title=title,
+                columns=(TableColumnProposalV1(key="finding", label="Finding"),),
+                rows=(
+                    TableRowProposalV1(
+                        cells=("Synthetic finding",),
+                        evidence_handles=(handle,),
+                    ),
+                ),
+                placement=EnrichmentPlacementProposalV1(kind=EnrichmentPlacementKind.AFTER_LEAD),
+                purpose=purpose,
+            ),
+        )
+    )
+
+
+async def _seed_enrichment_proposal(uow_factory: UnitOfWorkFactory) -> _Seeded:
+    seeded = await _seed(uow_factory, proposal_count=0, article_base=True)
+    evidence_pack = build_editorial_enrichment_evidence_pack(
+        seeded.production_input,
+        seeded.extraction,
+        seeded.synthesis,
+        None,
+    )
+    evidence_handle = next(
+        str(record["handle"])
+        for record in evidence_pack.narrative_evidence
+        if record.get("value") == "Synthetic finding"
+    )
+    base_enrichment = validate_editorial_enrichment_proposal(
+        _table_proposal(evidence_handle, title="Synthetic findings"),
+        evidence_pack,
+        seeded.extraction,
+        seeded.synthesis,
+    )
+    replacement_proposal = _table_proposal(evidence_handle, title="Revised synthetic findings")
+    evidence_pack_hash = editorial_enrichment_evidence_pack_hash(evidence_pack)
+    access_policy_hash = "e" * 64
+    input_hash = compute_editorial_enrichment_input_hash(
+        extraction=seeded.extraction,
+        synthesis=seeded.synthesis,
+        evidence_pack_hash=evidence_pack_hash,
+        access_policy_hash=access_policy_hash,
+    )
+    base_payload = editorial_enrichment_to_json(base_enrichment)
+    base_bytes = ProductionArtifactStore.canonical_json_bytes(base_payload)
+    base_sha256 = hashlib.sha256(base_bytes).hexdigest()
+    base_descriptor = BlobDescriptor(
+        base_sha256, len(base_bytes), "application/json", _CANONICAL_BUCKET
+    )
+    seeded.blob_store.seed(base_descriptor, base_bytes)
+    base_blob = BlobRecord(descriptor=base_descriptor)
+    base_artifact = ProductionArtifact(
+        production_run_id=seeded.run.id,
+        subject_id=seeded.subject.id,
+        stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+        version=1,
+        input_hash=input_hash,
+        status=ProductionArtifactStatus.VERIFIED,
+        metadata={"routing_policy_version": "synthetic-routing-policy"},
+    )
+
+    occurrence_id = uuid4()
+    target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT,
+        element_kind=EditorialEnrichmentElementKind.TABLE,
+        element_key="synthetic_table",
+    )
+    target_id = _target_id(target)
+    before_hash = hashlib.sha256(
+        ProductionArtifactStore.canonical_json_bytes({"value": base_payload["tables"][0]})
+    ).hexdigest()
+    entry = BlockRegistryEntry(
+        block_id=occurrence_id,
+        kind=EditorialBlockKind.TABLE,
+        parent_block_id=None,
+        position=0,
+        content_sha256=before_hash,
+        source_stage=EditorialSourceStage.EDITORIAL_ENRICHMENT,
+        structural_pointer="/tables/0",
+    )
+    snapshot = replace(
+        seeded.snapshot,
+        snapshot_id=uuid4(),
+        enrichment_artifact_id=base_artifact.id,
+        enrichment_version=base_artifact.version,
+        enrichment_input_hash=base_artifact.input_hash,
+        enrichment_canonical_sha256=base_sha256,
+        workspace_pin_hash="a" * 64,
+        registry_hash=registry_hash((entry,)),
+        block_registry=(entry,),
+        parent_snapshot_id=seeded.snapshot.snapshot_id,
+    )
+    operation = TargetedEditorialRevisionOperation.REWRITE_TABLE
+    patch_payload = {
+        "schema_version": "editorial-patch-v1",
+        "operation": operation.value,
+        "target": target.to_json(),
+        "target_id": target_id,
+        "occurrence_id": str(occurrence_id),
+        "before_hash": before_hash,
+        "enrichment_patch": replacement_proposal.model_dump(mode="json"),
+        "rationale": "Synthetic table replacement.",
+    }
+    patch_bytes = ProductionArtifactStore.canonical_json_bytes(patch_payload)
+    patch_sha256 = hashlib.sha256(patch_bytes).hexdigest()
+    patch_descriptor = BlobDescriptor(patch_sha256, len(patch_bytes), _PATCH_MIME, _PATCH_BUCKET)
+    seeded.blob_store.seed(patch_descriptor, patch_bytes)
+    patch_blob = BlobRecord(descriptor=patch_descriptor)
+    proposal = EditorialProposal(
+        id=uuid4(),
+        subject_id=seeded.subject.id,
+        production_run_id=seeded.run.id,
+        origin=EditorialProposalOrigin.MANUAL_PATCH,
+        snapshot_id=snapshot.snapshot_id,
+        occurrence_id=occurrence_id,
+        base_artifact_id=base_artifact.id,
+        base_artifact_version=base_artifact.version,
+        base_input_hash=base_artifact.input_hash,
+        base_canonical_sha256=base_sha256,
+        base_routing_hash=None,
+        base_pin_hash=snapshot.workspace_pin_hash,
+        target_id=target_id,
+        operation=operation.value,
+        before_hash=before_hash,
+        patch_blob_ref=patch_blob.id,
+        patch_sha256=patch_sha256,
+        evidence_refs=(),
+        diagnostics={},
+        thread_id=None,
+        variant_group_id=uuid4(),
+        model_run_id=None,
+        model_turn_id=None,
+        state=EditorialProposalState.PROPOSED,
+        state_version=1,
+        actor_id=seeded.actor_id,
+        idempotency_key=f"synthetic-enrichment-{uuid4().hex}",
+        request_sha256=hashlib.sha256(b"synthetic enrichment proposal").hexdigest(),
+    )
+    async with uow_factory() as uow:
+        base_blob = await uow.blobs.add_if_absent(base_blob)
+        patch_blob = await uow.blobs.add_if_absent(patch_blob)
+        base_artifact = replace(base_artifact, canonical_blob_id=base_blob.id)
+        await uow.production_artifacts.append(base_artifact)
+        await uow.editorial_workspace_snapshots.append_if_absent(snapshot)
+        event = EditorialProposalEvent(
+            id=uuid4(),
+            proposal_id=proposal.id,
+            sequence=1,
+            kind=EditorialProposalEventKind.PREPARED,
+            state=EditorialProposalState.PROPOSED,
+            state_version=1,
+            actor_id=seeded.actor_id,
+            idempotency_key=proposal.idempotency_key,
+            request_sha256=proposal.request_sha256,
+            patch_sha256=patch_sha256,
+        )
+        stored, inserted = await uow.editorial_proposals.add_if_absent(
+            proposal, event=event, model_run=None
+        )
+        assert inserted and stored.id == proposal.id
+        await uow.commit()
+
+    seeded.artifact_store.blobs[base_blob.id] = base_bytes
+    resolution = WorkspaceOccurrenceResolution(
+        record=snapshot,
+        entry=entry,
+        binding_state="valid",
+        artifact_id=base_artifact.id,
+        artifact_version=base_artifact.version,
+        canonical_sha256=base_sha256,
+    )
+    candidate_inputs = EnrichmentCandidateInputs(
+        base_payload=base_payload,
+        base_enrichment=base_enrichment,
+        extraction=seeded.extraction,
+        synthesis=seeded.synthesis,
+        evidence_pack=evidence_pack,
+        targeted_request=TargetedEditorialRevisionRequest(
+            subject_id=seeded.subject.id,
+            base_artifact_id=base_artifact.id,
+            base_version=base_artifact.version,
+            base_input_hash=base_artifact.input_hash,
+            base_canonical_sha256=base_sha256,
+            target=target,
+            operation=operation,
+            instruction="Accept synthetic table replacement",
+            mode=TargetedEditorialRevisionMode.EXISTING_EVIDENCE_ONLY,
+            requester=str(seeded.actor_id),
+            before_hash=before_hash,
+        ),
+        element_kind=EditorialEnrichmentElementKind.TABLE,
+        element_key="synthetic_table",
+        input_hash=input_hash,
+        artifact_id=uuid4(),
+        evidence_pack_hash=evidence_pack_hash,
+        access_policy_hash=access_policy_hash,
+        model_policy_version="synthetic-enrichment-policy",
+        routing_policy_version="synthetic-routing-policy",
+    )
+    return replace(
+        seeded,
+        base_artifact=base_artifact,
+        snapshot=snapshot,
+        proposals=(proposal,),
+        patch_sha256=patch_sha256,
+        workspace=_Workspace(resolution),
+        inputs=_EnrichmentInputs(seeded.inputs.synthesis, candidate_inputs),
+    )
+
+
 def _service(seeded: _Seeded, uow_factory: UnitOfWorkFactory) -> EditorialProposalAdoptionService:
     artifact_store = cast(ProductionArtifactStore, seeded.artifact_store)
     return EditorialProposalAdoptionService(
@@ -656,7 +919,7 @@ def _service(seeded: _Seeded, uow_factory: UnitOfWorkFactory) -> EditorialPropos
         workspace_service=seeded.workspace,
         inputs=seeded.inputs,
         synthesis_writer=SynthesisService(uow_factory, artifact_store),
-        enrichment_writer=cast(Any, None),
+        enrichment_writer=EditorialEnrichmentService(uow_factory, artifact_store),
     )
 
 
@@ -722,6 +985,57 @@ def _adopt_kwargs(seeded: _Seeded, proposal: EditorialProposal, key: str) -> dic
         "patch_sha256": seeded.patch_sha256,
         "idempotency_key": key,
     }
+
+
+@pytest.mark.asyncio
+async def test_accept_adopts_enrichment_table_replacement_and_advances_registry(
+    uow_factory: UnitOfWorkFactory,
+) -> None:
+    seeded = await _seed_enrichment_proposal(uow_factory)
+    proposal = seeded.proposals[0]
+
+    result = await _service(seeded, uow_factory).adopt(
+        **_adopt_kwargs(seeded, proposal, f"accept-enrichment-{uuid4().hex}")
+    )
+
+    assert result.proposal.state is EditorialProposalState.ACCEPTED
+    assert result.artifact.stage is ProductionArtifactStage.EDITORIAL_ENRICHMENT
+    assert result.artifact.version == 2
+    assert result.proposal.accepted_artifact_id == result.artifact.id
+    async with uow_factory() as uow:
+        accepted = await uow.editorial_proposals.get_for_occurrence(
+            proposal.subject_id, proposal.occurrence_id, proposal.id
+        )
+        current = await uow.production_artifacts.get_current(
+            proposal.production_run_id,
+            ProductionArtifactStage.EDITORIAL_ENRICHMENT.value,
+        )
+        persisted_snapshot = await uow.editorial_workspace_snapshots.get_by_id(
+            result.snapshot.snapshot_id
+        )
+        impact = await uow.editorial_proposal_impacts.get_by_proposal(proposal.id)
+        candidate_blob = (
+            await uow.blobs.get(current.canonical_blob_id)
+            if current is not None and current.canonical_blob_id is not None
+            else None
+        )
+    assert accepted is not None and accepted.state is EditorialProposalState.ACCEPTED
+    assert current is not None and current.id == result.artifact.id and current.version == 2
+    assert candidate_blob is not None
+    assert persisted_snapshot is not None
+    assert impact is not None and impact.accepted_snapshot_id == persisted_snapshot.snapshot_id
+    assert result.snapshot.enrichment_artifact_id == current.id
+    assert result.snapshot.enrichment_version == 2
+    assert result.snapshot.enrichment_canonical_sha256 == candidate_blob.descriptor.sha256
+    assert persisted_snapshot.enrichment_version == 2
+    assert persisted_snapshot.registry_hash != seeded.snapshot.registry_hash
+    assert persisted_snapshot.block_registry != seeded.snapshot.block_registry
+    candidate_bytes = await seeded.blob_store.read(
+        candidate_blob.descriptor,
+        max_bytes=candidate_blob.descriptor.size,
+    )
+    candidate_payload = json.loads(candidate_bytes)
+    assert candidate_payload["tables"][0]["title"] == "Revised synthetic findings"
 
 
 @pytest.mark.asyncio

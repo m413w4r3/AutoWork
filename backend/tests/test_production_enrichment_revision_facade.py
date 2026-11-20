@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
@@ -192,6 +193,34 @@ async def test_opaque_actor_revise_and_restore_reach_revision_effects(
     assert restored.artifact is not None
     assert len(restore_effects.calls) == 1
     assert restore_effects.calls[0]["actor_id"] == "dev-analyst"
+
+
+@pytest.mark.asyncio
+async def test_restore_reads_parsed_enrichment_from_canonical_context_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(AssertionError("restore must not call the model")),
+        include_figure=True,
+        include_target_annotations=True,
+    )
+    await _install_stale_enrichment_restore_history(harness)
+    load_context = harness.service._load_context
+
+    async def artifact_in_enrichment_slot(**kwargs: Any) -> tuple[Any, ...]:
+        context = await load_context(**kwargs)
+        return (*context[:4], context[2], *context[5:])
+
+    harness.service._load_context = artifact_in_enrichment_slot  # type: ignore[method-assign]
+
+    restored = await harness.service.restore_stale_enrichment_blocks(
+        **_stale_enrichment_restore_args(harness),
+        actor="dev-analyst",
+    )
+
+    assert restored.artifact is not None
+    assert restored.restorable_blocks
 
 
 @pytest.mark.asyncio

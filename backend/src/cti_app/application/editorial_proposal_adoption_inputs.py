@@ -336,6 +336,18 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                 raise EditorialProposalAdoptionError("proposal_target_mismatch")
             if target.element_kind is None or target.element_key is None:
                 raise EditorialProposalAdoptionError("proposal_target_mismatch")
+            is_create = operation in {
+                TargetedEditorialRevisionOperation.CREATE_TABLE,
+                TargetedEditorialRevisionOperation.CREATE_DIAGRAM,
+                TargetedEditorialRevisionOperation.CREATE_CHART,
+                TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE,
+            }
+            is_delete = operation in {
+                TargetedEditorialRevisionOperation.DELETE_TABLE,
+                TargetedEditorialRevisionOperation.DELETE_DIAGRAM,
+                TargetedEditorialRevisionOperation.DELETE_CHART,
+                TargetedEditorialRevisionOperation.DELETE_SOURCE_FIGURE,
+            }
             base_enrichment = editorial_enrichment_from_json(base_payload)
             target_entry = resolution.entry
             if (
@@ -370,24 +382,13 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                 synthesis=synthesis,
                 figure_catalog=fence.figure_catalog,
             )
-            assert_requested_placement(
-                candidate=validated_patch,
-                element_kind=target.element_kind,
-                targeted_request=request,
-                synthesis=synthesis,
-            )
-            is_create = operation in {
-                TargetedEditorialRevisionOperation.CREATE_TABLE,
-                TargetedEditorialRevisionOperation.CREATE_DIAGRAM,
-                TargetedEditorialRevisionOperation.CREATE_CHART,
-                TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE,
-            }
-            is_delete = operation in {
-                TargetedEditorialRevisionOperation.DELETE_TABLE,
-                TargetedEditorialRevisionOperation.DELETE_DIAGRAM,
-                TargetedEditorialRevisionOperation.DELETE_CHART,
-                TargetedEditorialRevisionOperation.DELETE_SOURCE_FIGURE,
-            }
+            if is_create:
+                assert_requested_placement(
+                    candidate=validated_patch,
+                    element_kind=target.element_kind,
+                    targeted_request=request,
+                    synthesis=synthesis,
+                )
             candidate = await build_enrichment_candidate(
                 base_artifact=base_artifact,
                 base_payload=base_payload,

@@ -592,12 +592,13 @@ class EditorialProposalAdoptionService:
                 synthesis=enrichment_inputs.synthesis,
                 figure_catalog=enrichment_inputs.figure_catalog,
             )
-            assert_requested_placement(
-                candidate=validated_patch,
-                element_kind=enrichment_inputs.element_kind,
-                targeted_request=request,
-                synthesis=enrichment_inputs.synthesis,
-            )
+            if enrichment_inputs.is_create:
+                assert_requested_placement(
+                    candidate=validated_patch,
+                    element_kind=enrichment_inputs.element_kind,
+                    targeted_request=request,
+                    synthesis=enrichment_inputs.synthesis,
+                )
             enrichment_candidate = await build_enrichment_candidate(
                 base_artifact=base_artifact,
                 base_payload=base_payload,
