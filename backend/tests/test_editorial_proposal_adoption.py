@@ -1140,8 +1140,12 @@ async def test_simple_enrichment_table_adoption_uses_parsed_base_and_production_
     figure_catalog = build_editorial_figure_catalog(
         harness.world.extraction, harness.inventory_state.value
     )
+    assert harness.evidence_pack.registered_anchor_ids is not None
+    anchor_block_id = min(harness.evidence_pack.registered_anchor_ids, key=str)
     parsed_patch = parse_editorial_enrichment_proposal_wire(
-        _table_revision_wire(), harness.evidence_pack, figure_catalog=figure_catalog
+        _table_revision_wire(anchor_block_id=anchor_block_id),
+        harness.evidence_pack,
+        figure_catalog=figure_catalog,
     )
     assert parsed_patch.proposal is not None
     base_bytes = await harness.world.store.read_bytes(harness.base.canonical_blob_id)

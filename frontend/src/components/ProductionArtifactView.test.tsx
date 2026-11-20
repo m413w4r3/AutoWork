@@ -1566,6 +1566,91 @@ it("affiche une brève V7 avec chronologie et synthèse sans annexe IOC", async 
   expect(screen.queryByText("observed.example")).not.toBeInTheDocument();
 });
 
+it("lit l'enveloppe V9 avec placement résolu et conserve le corps V7", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((input: RequestInfo | URL) => {
+      const url = urlOf(input);
+      if (url.includes("/publication/preview?")) {
+        return Promise.resolve(
+          Response.json({
+            status: "FAILED",
+            artifact_id: "publication-v9-brief",
+            artifact_version: 9,
+            artifact_input_hash: "a".repeat(64),
+            current_artifact_id: "publication-v9-brief",
+            current_artifact_version: 9,
+            render_id: null,
+            render_identity: null,
+            render_disposition: "EXPLICIT_RENDER",
+            published_edition_version: null,
+            error_code: "preview_not_requested",
+            error_message: null,
+            pdf_url: null,
+          }),
+        );
+      }
+      return Promise.resolve(
+        Response.json({
+          artifact_id: "publication-v9-brief",
+          stage: "publication",
+          version: 9,
+          status: "verified",
+          metadata: {},
+          canonical_content: {
+            schema_version: "9",
+            registry_hash: "b".repeat(64),
+            synthesis_canonical_sha256: "c".repeat(64),
+            enrichment_canonical_sha256: "d".repeat(64),
+            resolved_placements: [],
+            article_format: null,
+            base_publication: {
+              schema_version: "7",
+              publication_kind: "brief",
+              routing_decision_hash: "e".repeat(64),
+              routing_policy_version: "subject-publication-routing-v1",
+              base_publication: publicationV6({
+                schema_version: "5",
+                subject_id: SYNTHESIS_SUBJECT_ID,
+                publication_language: "fr",
+                title: "Brève V9 avec ancre enregistrée",
+                lead: [
+                  {
+                    text: "Le texte reste lisible dans l'enveloppe V9.",
+                    evidence_refs: [],
+                  },
+                ],
+                sections: [],
+                timeline: [],
+                indicators: [],
+                sources: [],
+                uncertainties: [],
+                tables: [],
+                diagrams: [],
+                figures: [],
+                references: [],
+                original_indicators: [],
+                rich_text: {
+                  schema_version: "1",
+                  policy_version: "semantic-annotation-policy-v3",
+                  paragraphs: [],
+                },
+              }),
+            },
+          },
+        }),
+      );
+    }),
+  );
+
+  renderArtifact("publication");
+
+  expect(await screen.findByText("Format : Brève")).toBeInTheDocument();
+  expect(screen.getByRole("region", { name: "SYNTHÈSE" })).toHaveTextContent(
+    "Le texte reste lisible dans l'enveloppe V9.",
+  );
+});
+
 it("affiche une publication V4 sans enrichissement comme une publication narrative", async () => {
   vi.stubGlobal(
     "fetch",

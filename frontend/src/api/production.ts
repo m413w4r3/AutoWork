@@ -1094,6 +1094,7 @@ export interface PublicationTableRowV1 {
 export interface PublicationPlacementV1 {
   kind: string;
   section_index: number | null;
+  anchor_block_id?: string | null;
 }
 
 export interface PublicationTableV1 {
@@ -1334,11 +1335,34 @@ export interface PublicationDocumentV8 {
   article_format: PublicationArticleFormatV1 | null;
 }
 
+export interface ResolvedPublicationPlacementV1 {
+  element_kind: "table" | "chart" | "diagram" | "figure";
+  element_key: string;
+  element_position: number;
+  anchor_block_id: string;
+  anchor_pointer: string;
+  anchor_canonical_position: number;
+  paragraph_kind: "lead" | "section";
+  section_index: number | null;
+  paragraph_index: number;
+}
+
+export interface PublicationDocumentV9 extends Omit<
+  PublicationDocumentV8,
+  "schema_version"
+> {
+  schema_version: "9";
+  registry_hash: string;
+  synthesis_canonical_sha256: string;
+  enrichment_canonical_sha256: string;
+  resolved_placements: ResolvedPublicationPlacementV1[];
+}
+
 export type PublicationDocument = PublicationDocumentV4 | PublicationDocumentV5;
 export type PublicationDocumentArtifact =
   PublicationDocument | PublicationDocumentV6 | PublicationDocumentV7;
 export type PublicationDocumentArtifactWithV8 =
-  PublicationDocumentArtifact | PublicationDocumentV8;
+  PublicationDocumentArtifact | PublicationDocumentV8 | PublicationDocumentV9;
 
 export type PublicationPreviewStatus =
   "IN_PROGRESS" | "READY" | "FAILED" | "STALE";

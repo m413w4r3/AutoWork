@@ -2778,6 +2778,137 @@ async def test_real_typst_renders_annotated_literal_content_without_evaluating_i
 
 
 @pytest.mark.asyncio
+async def test_real_typst_compiles_v9_placements_and_preserves_pdf_order(
+    tmp_path: Path,
+    typst_binary: str,
+    font_bundle_root: Path,
+) -> None:
+    from cti_app.application.production_artifact_store import ProductionArtifactStore
+    from cti_app.application.production_editorial_enrichment import (
+        canonical_synthesis_hash,
+    )
+    from cti_app.domain.editorial_workspace import bootstrap_block_registry
+    from cti_app.domain.production_editorial_enrichment import (
+        EnrichmentPlacementKind,
+        EnrichmentPlacementV1,
+    )
+    from cti_app.domain.production_synthesis import (
+        extraction_evidence_refs_v1,
+        production_synthesis_to_json,
+    )
+    from cti_app.domain.publication_document import (
+        PublicationDocumentV9,
+        parse_publication_document,
+    )
+    from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
+    from tests.editorial_enrichment_support import build_empty_editorial_enrichment
+    from tests.test_publication_assembly import (
+        _assemble,
+        _canonical_inputs,
+        _enrichment_table,
+        _run,
+        _service,
+        _workspace_record_for,
+    )
+
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    run = _run(snapshot)
+    synthesis_artifact_id = UUID(int=9771)
+    anchor = next(
+        item
+        for item in bootstrap_block_registry(
+            artifact_id=synthesis_artifact_id,
+            canonical_sha256=canonical_synthesis_hash(synthesis),
+            source_stage="synthesis",
+            canonical_content=production_synthesis_to_json(synthesis),
+        )
+        if item.kind.value in {"paragraph", "lead_paragraph"}
+    )
+    placement = EnrichmentPlacementV1(
+        EnrichmentPlacementKind.AFTER_PARAGRAPH,
+        anchor_block_id=anchor.block_id,
+    )
+    first = _enrichment_table(extraction_evidence_refs_v1(extraction)[0], key="z_canonical_first")
+    second = _enrichment_table(extraction_evidence_refs_v1(extraction)[0], key="a_canonical_second")
+    assert first.purpose is not None
+    assert second.purpose is not None
+    tables = (
+        replace(
+            first,
+            title="Z canonical first",
+            caption="Z first placement caption",
+            placement=placement,
+            purpose=replace(first.purpose, question="Which first canonical tool is documented?"),
+        ),
+        replace(
+            second,
+            title="A canonical second",
+            caption="A second placement caption",
+            placement=placement,
+            purpose=replace(second.purpose, question="Which second canonical tool is documented?"),
+        ),
+    )
+    enrichment = replace(
+        build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis),
+        tables=tables,
+    )
+    workspace_record = _workspace_record_for(
+        run=run,
+        synthesis=synthesis,
+        enrichment=enrichment,
+        synthesis_artifact_id=synthesis_artifact_id,
+    )
+    service, catalog, _artifacts = _service()
+    assembly = await _assemble(
+        service,
+        run=run,
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+        editorial_enrichment_artifact_id=workspace_record.enrichment_artifact_id,
+        workspace_snapshot_record=workspace_record,
+    )
+    document = parse_publication_document(
+        await ProductionArtifactStore(catalog).read_json(assembly.artifact.canonical_blob_id)
+    )
+    assert isinstance(document, PublicationDocumentV9)
+    assert [item.element_key for item in document.resolved_placements] == [
+        "z_canonical_first",
+        "a_canonical_second",
+    ]
+
+    template_bundle = load_template_bundle(_CHP_TYPST_ROOT)
+    render_source = _render(document, template_bundle)
+    workspace_root = tmp_path / "after-paragraph-v9-workspace"
+    _build_workspace(
+        workspace_root,
+        bundle_files=template_bundle.files,
+        render_data_bytes=render_source.render_data_bytes,
+        media_refs=render_source.media_refs,
+    )
+    font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
+    font_root = tmp_path / "after-paragraph-v9-fonts"
+    font_root.mkdir()
+    compiled = await TypstSubprocessCompiler(binary=typst_binary).compile(
+        TypstCompileRequest(
+            workspace_root=workspace_root,
+            entrypoint_relative_path="RENDERER/publication.typ",
+            font_paths=materialize_font_bundle(font_snapshot, font_root),
+        )
+    )
+    pdf_path = tmp_path / "after-paragraph-v9.pdf"
+    pdf_path.write_bytes(compiled.content)
+    text, _compact = _normalized_pdf_text(PdfReader(BytesIO(compiled.content), strict=True))
+    normalized = text.casefold()
+    lead_position = normalized.index("example finding.")
+    first_position = normalized.index("z canonical first")
+    second_position = normalized.index("a canonical second")
+    assert lead_position < first_position < second_position
+
+
+@pytest.mark.asyncio
 async def test_real_typst_frontmatter_hides_internal_and_legacy_annex_indicators(
     tmp_path: Path,
     typst_binary: str,

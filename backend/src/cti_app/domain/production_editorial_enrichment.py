@@ -27,7 +27,7 @@ from cti_app.domain.semantic_annotation import (
     semantic_annotation_proposal_to_json,
 )
 
-EDITORIAL_ENRICHMENT_SCHEMA_VERSION = 8
+EDITORIAL_ENRICHMENT_SCHEMA_VERSION = 9
 EDITORIAL_ENRICHMENT_V1_POLICY_VERSION = "editorial-enrichment-v1"
 EDITORIAL_ENRICHMENT_V2_POLICY_VERSION = "editorial-enrichment-v2-semantic-annotations"
 EDITORIAL_ENRICHMENT_V3_POLICY_VERSION = "editorial-enrichment-v3-figures-resource-proposals"
@@ -36,7 +36,11 @@ EDITORIAL_ENRICHMENT_V5_POLICY_VERSION = "editorial-enrichment-v5-diagram-node-r
 EDITORIAL_ENRICHMENT_V6_POLICY_VERSION = "editorial-enrichment-v6-source-figure-provenance"
 EDITORIAL_ENRICHMENT_V7_POLICY_VERSION = "editorial-enrichment-v7-analytic-media-arbitration"
 EDITORIAL_ENRICHMENT_V8_POLICY_VERSION = "editorial-enrichment-v8-timeline-charts"
-EDITORIAL_ENRICHMENT_POLICY_VERSION = "editorial-enrichment-v12-article-density-diagnostics"
+EDITORIAL_ENRICHMENT_V8_CURRENT_POLICY_VERSION = (
+    "editorial-enrichment-v12-article-density-diagnostics"
+)
+EDITORIAL_ENRICHMENT_V9_POLICY_VERSION = "editorial-enrichment-v13-after-paragraph-anchors"
+EDITORIAL_ENRICHMENT_POLICY_VERSION = EDITORIAL_ENRICHMENT_V9_POLICY_VERSION
 EDITORIAL_FIGURE_DECISION_POLICY_VERSION = "editorial-figure-selection-v3-source-context"
 EDITORIAL_RESOURCE_PROPOSAL_POLICY_VERSION = "editorial-resource-proposal-v1"
 
@@ -108,6 +112,7 @@ def _normalize_evidence_refs(
 class EnrichmentPlacementKind(StrEnum):
     AFTER_LEAD = "after_lead"
     AFTER_SECTION = "after_section"
+    AFTER_PARAGRAPH = "after_paragraph"
     AFTER_TIMELINE = "after_timeline"
     END = "end"
 
@@ -116,6 +121,7 @@ class EnrichmentPlacementKind(StrEnum):
 class EnrichmentPlacementV1:
     kind: EnrichmentPlacementKind
     section_index: int | None = None
+    anchor_block_id: UUID | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, EnrichmentPlacementKind):
@@ -123,8 +129,17 @@ class EnrichmentPlacementV1:
         if self.kind is EnrichmentPlacementKind.AFTER_SECTION:
             if type(self.section_index) is not int or self.section_index < 0:
                 raise ValueError("AFTER_SECTION requires a non-negative section_index")
+            if self.anchor_block_id is not None:
+                raise ValueError("anchor_block_id is only valid for AFTER_PARAGRAPH")
+        elif self.kind is EnrichmentPlacementKind.AFTER_PARAGRAPH:
+            if not isinstance(self.anchor_block_id, UUID):
+                raise ValueError("AFTER_PARAGRAPH requires a registered anchor_block_id")
+            if self.section_index is not None:
+                raise ValueError("section_index is only valid for AFTER_SECTION")
         elif self.section_index is not None:
             raise ValueError("section_index is only valid for AFTER_SECTION")
+        elif self.anchor_block_id is not None:
+            raise ValueError("anchor_block_id is only valid for AFTER_PARAGRAPH")
 
 
 class EnrichmentTableKind(StrEnum):
@@ -862,6 +877,7 @@ class EditorialEnrichmentV1:
             6,
             7,
             8,
+            9,
         }:
             raise ValueError("Editorial enrichment schema version is unsupported")
         if not isinstance(self.subject_id, UUID):
@@ -889,8 +905,10 @@ class EditorialEnrichmentV1:
             if self.schema_version == 6
             else {EDITORIAL_ENRICHMENT_V7_POLICY_VERSION, EDITORIAL_ENRICHMENT_V8_POLICY_VERSION}
             if self.schema_version == 7
-            else {EDITORIAL_ENRICHMENT_POLICY_VERSION}
+            else {EDITORIAL_ENRICHMENT_V8_CURRENT_POLICY_VERSION}
             if self.schema_version == 8
+            else {EDITORIAL_ENRICHMENT_V9_POLICY_VERSION}
+            if self.schema_version == 9
             else {expected_policy}
         )
         if self.enrichment_policy_version not in supported_policies:
@@ -911,6 +929,16 @@ class EditorialEnrichmentV1:
                 not isinstance(value, item_type) for value in values
             ):
                 raise ValueError(f"Editorial enrichment {label} have an invalid type")
+        placements = (
+            *(item.placement for item in self.tables),
+            *(item.placement for item in self.diagrams),
+            *(item.placement for item in self.source_figures),
+            *(item.placement for item in self.charts),
+        )
+        if self.schema_version < 9 and any(
+            placement.kind is EnrichmentPlacementKind.AFTER_PARAGRAPH for placement in placements
+        ):
+            raise ValueError("Legacy editorial enrichment cannot contain paragraph anchors")
         if not isinstance(self.warnings, tuple) or any(
             not isinstance(warning, str) or not warning.strip() for warning in self.warnings
         ):
@@ -1028,7 +1056,13 @@ def _ref_to_json(ref: ExtractionEvidenceRefV1) -> dict[str, str]:
 
 
 def _placement_to_json(placement: EnrichmentPlacementV1) -> dict[str, Any]:
-    return {"kind": placement.kind.value, "section_index": placement.section_index}
+    payload: dict[str, Any] = {
+        "kind": placement.kind.value,
+        "section_index": placement.section_index,
+    }
+    if placement.anchor_block_id is not None:
+        payload["anchor_block_id"] = str(placement.anchor_block_id)
+    return payload
 
 
 def placement_to_json(placement: EnrichmentPlacementV1) -> dict[str, Any]:
@@ -1314,8 +1348,10 @@ _ROOT_KEYS_V5 = _ROOT_KEYS_V4
 _ROOT_KEYS_V6 = _ROOT_KEYS_V5
 _ROOT_KEYS_V7 = _ROOT_KEYS_V6 | {"charts"}
 _ROOT_KEYS_V8 = _ROOT_KEYS_V7
+_ROOT_KEYS_V9 = _ROOT_KEYS_V8
 _REF_KEYS = frozenset({"source_document_id", "kind", "evidence_key"})
-_PLACEMENT_KEYS = frozenset({"kind", "section_index"})
+_PLACEMENT_BASE_KEYS = frozenset({"kind", "section_index"})
+_PLACEMENT_KEYS = _PLACEMENT_BASE_KEYS | {"anchor_block_id"}
 _COLUMN_KEYS = frozenset({"key", "label"})
 _ROW_KEYS = frozenset({"cells", "evidence_refs"})
 _TABLE_BASE_KEYS = frozenset({"key", "kind", "title", "caption", "columns", "rows", "placement"})
@@ -1439,13 +1475,24 @@ def _refs_from_json(raw: Any, label: str) -> tuple[ExtractionEvidenceRefV1, ...]
 
 
 def _placement_from_json(raw: Any) -> EnrichmentPlacementV1:
-    payload = _object(raw, _PLACEMENT_KEYS, "Editorial placement")
+    allowed_keys = (
+        _PLACEMENT_KEYS
+        if isinstance(raw, Mapping) and "anchor_block_id" in raw
+        else _PLACEMENT_BASE_KEYS
+    )
+    payload = _object(raw, allowed_keys, "Editorial placement")
     section_index = payload["section_index"]
     if section_index is not None and type(section_index) is not int:
         raise ValueError("Editorial placement section_index must be an integer or null")
+    anchor_block_id = (
+        _uuid(payload["anchor_block_id"], "Editorial placement anchor block ID")
+        if payload.get("anchor_block_id") is not None
+        else None
+    )
     return EnrichmentPlacementV1(
         kind=_enum(EnrichmentPlacementKind, payload["kind"], "Editorial placement kind"),
         section_index=section_index,
+        anchor_block_id=anchor_block_id,
     )
 
 
@@ -1827,7 +1874,7 @@ def _resource_proposal_from_json(raw: Any) -> EditorialResourceProposalV1:
 
 
 def editorial_enrichment_from_json(payload: Mapping[str, Any]) -> EditorialEnrichmentV1:
-    """Decode strict V1-V8 payloads; older artifacts retain empty review data."""
+    """Decode strict V1-V9 payloads; older artifacts retain empty review data."""
     if not isinstance(payload, Mapping):
         raise ValueError("Editorial enrichment must be an object")
     raw_version = payload.get("schema_version")
@@ -1842,6 +1889,7 @@ def editorial_enrichment_from_json(payload: Mapping[str, Any]) -> EditorialEnric
         6: _ROOT_KEYS_V6,
         7: _ROOT_KEYS_V7,
         8: _ROOT_KEYS_V8,
+        9: _ROOT_KEYS_V9,
     }.get(raw_version)
     if root_keys is None:
         raise ValueError("Editorial enrichment schema version is unsupported")

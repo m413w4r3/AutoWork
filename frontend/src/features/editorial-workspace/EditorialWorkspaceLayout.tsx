@@ -10,6 +10,7 @@ import type { InlineTextEditorProps } from "./InlineTextEditor";
 import { EditorialInspector } from "./EditorialInspector";
 import { EditorialOutline } from "./EditorialOutline";
 import { EditorialServerDraftStatus } from "./EditorialServerDraftStatus";
+import { SourceFigureGallery } from "./SourceFigureGallery";
 import { EditorialTopBar } from "./EditorialTopBar";
 
 interface EditorialWorkspaceLayoutProps {
@@ -60,6 +61,7 @@ export function EditorialWorkspaceLayout({
   const [openPanel, setOpenPanel] = useState<OpenPanel>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [technicalOpen, setTechnicalOpen] = useState(false);
+  const [figureGalleryOpen, setFigureGalleryOpen] = useState(false);
   const [editingBlockId, setEditingBlockId] = useState<string | null>(null);
   const overlayOpenerRef = useRef<HTMLElement | null>(null);
   const leaveConfirmedRef = useRef(false);
@@ -412,11 +414,18 @@ export function EditorialWorkspaceLayout({
             }}
             onStartEditing={startEditing}
             onOpenSources={showSources}
+            onOpenFigureGallery={() => setFigureGalleryOpen(true)}
             onBackToDocument={closeActiveOverlay}
             onChangeTarget={returnToTargetChoice}
           />
         </div>
       </div>
+      {figureGalleryOpen ? (
+        <SourceFigureGallery
+          subjectId={subjectId}
+          onClose={() => setFigureGalleryOpen(false)}
+        />
+      ) : null}
     </section>
   );
 }

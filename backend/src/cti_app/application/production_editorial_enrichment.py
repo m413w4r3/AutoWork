@@ -11,7 +11,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlsplit, urlunsplit
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -29,6 +29,10 @@ from cti_app.application.analytic_chart_compilation import (
     AnalyticChartCompiler,
 )
 from cti_app.application.diagram_compilation import DiagramCompiler
+from cti_app.application.editorial_workspace.registry import (
+    WorkspaceSnapshotRecord,
+    resolve_paragraph_anchor,
+)
 from cti_app.application.media_assets import (
     MAX_SOURCE_FIGURE_BYTES,
     MediaAssetStore,
@@ -98,6 +102,7 @@ from cti_app.application.source_figure_inventory import (
 from cti_app.application.source_media_collection import (
     SourceMediaArchiveService,
 )
+from cti_app.domain.editorial_workspace import EditorialWorkspaceError
 from cti_app.domain.model_runs import ModelRun, ModelRunStatus
 from cti_app.domain.production import (
     PRODUCTION_RECONCILIATION_ERROR_CODE,
@@ -207,11 +212,9 @@ EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION = (
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SOURCE_METADATA_POLICY_VERSION = (
     "editorial-enrichment-evidence-pack-v9-source-metadata-exclusion"
 )
-EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = (
-    "editorial-enrichment-validator-v18-ioc-republication-diagram-value"
-)
+EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = "editorial-enrichment-validator-v18-paragraph-anchor"
 EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION = (
-    "editorial-enrichment-analytic-policy-v6-ioc-republication-diagram-value"
+    "editorial-enrichment-analytic-policy-v6-paragraph-anchor"
 )
 TABLE_PARAPHRASE_TOKEN_DICE_THRESHOLD = 0.80
 DIAGRAM_STAR_LABEL_ANCHOR_OVERLAP = 0.50
@@ -301,14 +304,24 @@ def _editorial_enrichment_media_priority(block_kind: str) -> int:
 class EnrichmentPlacementProposalV1(_StrictEnrichmentProposalModel):
     kind: EnrichmentPlacementKind
     section_index: StrictInt | None = None
+    anchor_block_id: UUID | None = None
 
     @model_validator(mode="after")
     def _validate_section_index(self) -> EnrichmentPlacementProposalV1:
         if self.kind is EnrichmentPlacementKind.AFTER_SECTION:
             if self.section_index is None or self.section_index < 0:
                 raise ValueError("AFTER_SECTION requires a non-negative section_index")
+            if self.anchor_block_id is not None:
+                raise ValueError("anchor_block_id is only valid for AFTER_PARAGRAPH")
+        elif self.kind is EnrichmentPlacementKind.AFTER_PARAGRAPH:
+            if self.anchor_block_id is None:
+                raise ValueError("AFTER_PARAGRAPH requires a registered anchor_block_id")
+            if self.section_index is not None:
+                raise ValueError("section_index is only valid for AFTER_SECTION")
         elif self.section_index is not None:
             raise ValueError("section_index is only valid for AFTER_SECTION")
+        elif self.anchor_block_id is not None:
+            raise ValueError("anchor_block_id is only valid for AFTER_PARAGRAPH")
         return self
 
 
@@ -973,6 +986,8 @@ _ENRICHMENT_FIELD_ALIASES = {
     "placement": "placement",
     "section index": "section_index",
     "section_index": "section_index",
+    "anchor block id": "anchor_block_id",
+    "anchor_block_id": "anchor_block_id",
     "purpose": "purpose",
     "question": "purpose",
     "data": "available_data",
@@ -1220,10 +1235,35 @@ def _wire_placement(block: _EditorialEnrichmentWireBlock) -> EnrichmentPlacement
         if not re.fullmatch(r"\d+", raw_index.strip()):
             return None
         section_index = int(raw_index.strip())
+    raw_anchor = _wire_scalar(block, "anchor_block_id")
+    anchor_block_id: UUID | None = None
+    if raw_anchor is not None and raw_anchor.strip().casefold() not in {"", "-", "none", "null"}:
+        try:
+            anchor_block_id = UUID(raw_anchor.strip())
+        except ValueError:
+            return None
     try:
-        return EnrichmentPlacementProposalV1(kind=kind, section_index=section_index)
+        return EnrichmentPlacementProposalV1(
+            kind=kind,
+            section_index=section_index,
+            anchor_block_id=anchor_block_id,
+        )
     except ValueError:
         return None
+
+
+def _placement_registration_error(
+    placement: EnrichmentPlacementProposalV1,
+    evidence_pack: EditorialEnrichmentEvidencePackV1,
+) -> str | None:
+    registered_anchor_ids = evidence_pack.registered_anchor_ids
+    if registered_anchor_ids is None:
+        return None
+    if placement.kind is not EnrichmentPlacementKind.AFTER_PARAGRAPH:
+        return "editorial_enrichment_placement_invalid"
+    if placement.anchor_block_id not in registered_anchor_ids:
+        return "editorial_anchor_stale"
+    return None
 
 
 def _block_child_error(
@@ -1662,6 +1702,10 @@ def _parse_figure_wire_block(
     if placement is None:
         reject("editorial_enrichment_figure_placement_invalid")
         return None
+    placement_error = _placement_registration_error(placement, evidence_pack)
+    if placement_error is not None:
+        reject(placement_error)
+        return None
     if placement.kind is EnrichmentPlacementKind.AFTER_SECTION and (
         placement.section_index is None
         or placement.section_index >= len(evidence_pack.current_synthesis.get("sections", ()))
@@ -2070,6 +2114,20 @@ def _placement_anchor_sentences(
             for paragraph in section.get("paragraphs", ())
             if isinstance(paragraph, Mapping)
         )
+    elif kind == EnrichmentPlacementKind.AFTER_PARAGRAPH.value:
+        anchor_id = str(placement.anchor_block_id) if placement.anchor_block_id else None
+        paragraphs.extend(
+            item
+            for item in current_synthesis.get("lead", ())
+            if isinstance(item, Mapping) and item.get("block_id") == anchor_id
+        )
+        for section in current_synthesis.get("sections", ()):
+            if isinstance(section, Mapping):
+                paragraphs.extend(
+                    item
+                    for item in section.get("paragraphs", ())
+                    if isinstance(item, Mapping) and item.get("block_id") == anchor_id
+                )
     elif kind == EnrichmentPlacementKind.AFTER_TIMELINE.value:
         paragraphs.extend(
             item for item in current_synthesis.get("timeline", ()) if isinstance(item, Mapping)
@@ -2683,7 +2741,7 @@ def parse_editorial_enrichment_proposal_wire(
         if field_match is None:
             # Also accept common bare labels (for example ``TITLE text``).
             bare_match = re.match(
-                r"^(EVIDENCE\s+HANDLES?|SECTION\s+INDEX|NODE\s+IDS|SOURCE\s+NODE\s+ID|"
+                r"^(EVIDENCE\s+HANDLES?|SECTION\s+INDEX|ANCHOR\s+BLOCK\s+ID|NODE\s+IDS|SOURCE\s+NODE\s+ID|"
                 r"TARGET\s+NODE\s+ID|GROUP\s+ID|NODE\s+ID|COLUMN\s+KEY|"
                 r"PARAGRAPH\s+ANCHOR|EXACT\s+TEXT|FIGURE\s+HANDLE|NEED\s+KEY|QUERY\s+HINT|"
                 r"DATE|SERIES|"
@@ -2730,6 +2788,7 @@ def parse_editorial_enrichment_proposal_wire(
                 "caption",
                 "placement",
                 "section_index",
+                "anchor_block_id",
                 "purpose",
                 "available_data",
                 "comprehension_gain",
@@ -2745,6 +2804,7 @@ def parse_editorial_enrichment_proposal_wire(
                 "caption",
                 "placement",
                 "section_index",
+                "anchor_block_id",
                 "purpose",
                 "available_data",
                 "comprehension_gain",
@@ -2761,6 +2821,7 @@ def parse_editorial_enrichment_proposal_wire(
                 "profile",
                 "placement",
                 "section_index",
+                "anchor_block_id",
                 "direction",
                 "purpose",
                 "available_data",
@@ -2799,6 +2860,7 @@ def parse_editorial_enrichment_proposal_wire(
                 "reason",
                 "placement",
                 "section_index",
+                "anchor_block_id",
                 "purpose",
                 "available_data",
                 "comprehension_gain",
@@ -3591,6 +3653,7 @@ def _parse_enrichment_wire_table(
         "profile",
         "placement",
         "section_index",
+        "anchor_block_id",
         "purpose",
         "available_data",
         "comprehension_gain",
@@ -3616,6 +3679,10 @@ def _parse_enrichment_wire_table(
     title = _wire_scalar(block, "title")
     if not key or not title or kind is None or placement is None:
         reject(block, "editorial_enrichment_table_missing_or_invalid_field")
+        return None
+    placement_error = _placement_registration_error(placement, evidence_pack)
+    if placement_error is not None:
+        reject(block, placement_error)
         return None
     purpose = _parse_analytic_purpose(block, evidence_pack, rejections)
     if purpose is None:
@@ -3704,6 +3771,7 @@ def _parse_enrichment_wire_chart(
         "profile",
         "placement",
         "section_index",
+        "anchor_block_id",
         "purpose",
         "available_data",
         "comprehension_gain",
@@ -3729,6 +3797,10 @@ def _parse_enrichment_wire_chart(
     title = _wire_scalar(block, "title")
     if not key or not title or kind is None or placement is None:
         reject(block, "editorial_enrichment_chart_missing_or_invalid_field")
+        return None
+    placement_error = _placement_registration_error(placement, evidence_pack)
+    if placement_error is not None:
+        reject(block, placement_error)
         return None
     purpose = _parse_analytic_purpose(block, evidence_pack, rejections)
     if purpose is None:
@@ -3811,6 +3883,7 @@ def _parse_enrichment_wire_diagram(
         "caption",
         "placement",
         "section_index",
+        "anchor_block_id",
         "direction",
         "purpose",
         "available_data",
@@ -3878,6 +3951,10 @@ def _parse_enrichment_wire_diagram(
         or placement is None
     ):
         reject(block, "editorial_enrichment_diagram_missing_or_invalid_field")
+        return None
+    placement_error = _placement_registration_error(placement, evidence_pack)
+    if placement_error is not None:
+        reject(block, placement_error)
         return None
     caption = _wire_caption(block)
     if raw_profile is not None and caption is None:
@@ -4158,6 +4235,7 @@ class EditorialEnrichmentEvidencePackV1:
     source_pair_relations: tuple[Mapping[str, Any], ...]
     projection_hash: str | None = None
     policy_version: str = EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION
+    registered_anchor_ids: frozenset[UUID] | None = None
     _projected_ioc_keys: frozenset[tuple[ArtifactType, str]] = field(
         default_factory=frozenset, repr=False, compare=False
     )
@@ -4591,36 +4669,54 @@ def _prompt_evidence_record(
 def _synthesis_prompt_projection(
     synthesis: ProductionSynthesisV1,
     handle_for_ref: Mapping[ExtractionEvidenceRefV1, str],
+    paragraph_block_ids: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
+    paragraph_block_ids = paragraph_block_ids or {}
+
     def _catalogue_handles(refs: Iterable[ExtractionEvidenceRefV1]) -> list[str]:
         # The synthesis may cite reserve-only evidence (e.g. a fact supporting a
         # link_not_demonstrated relation, possibly classified out of scope); it has no E
         # handle and must not become citable by the enrichment model.
         return [handle_for_ref[ref] for ref in refs if ref in handle_for_ref]
 
-    def paragraph(item: Any, anchor: str) -> dict[str, Any] | None:
+    def paragraph(
+        item: Any,
+        anchor: str,
+        structural_pointer: str,
+    ) -> dict[str, Any] | None:
         if any(
             ref.kind is EvidenceKind.UNCERTAINTY and ref not in handle_for_ref
             for ref in item.evidence_refs
         ):
             return None
-        return {
+        projected = {
             "anchor": anchor,
             "text": item.text,
             "evidence_handles": _catalogue_handles(item.evidence_refs),
         }
+        block_id = paragraph_block_ids.get(structural_pointer)
+        if block_id is not None:
+            projected["block_id"] = block_id
+        return projected
 
     lead = [
         projected
         for index, item in enumerate(synthesis.lead, start=1)
-        if (projected := paragraph(item, lead_paragraph_anchor(index))) is not None
+        if (projected := paragraph(item, lead_paragraph_anchor(index), f"/lead/{index - 1}"))
+        is not None
     ]
     sections: list[dict[str, Any]] = []
     for index, section in enumerate(synthesis.sections):
         paragraphs = [
             projected
             for paragraph_index, item in enumerate(section.paragraphs, start=1)
-            if (projected := paragraph(item, section_paragraph_anchor(index, paragraph_index)))
+            if (
+                projected := paragraph(
+                    item,
+                    section_paragraph_anchor(index, paragraph_index),
+                    f"/sections/{index}/paragraphs/{paragraph_index - 1}",
+                )
+            )
             is not None
         ]
         if paragraphs:
@@ -4727,6 +4823,7 @@ def build_editorial_enrichment_evidence_pack(
     extraction: ProductionExtractionV1,
     synthesis: ProductionSynthesisV1,
     projection: RelevanceProjectionV1 | None = None,
+    workspace_record: WorkspaceSnapshotRecord | None = None,
 ) -> EditorialEnrichmentEvidencePackV1:
     """Build a stable source-free model projection and exact handle resolver."""
     if not isinstance(snapshot, ProductionInputSnapshot):
@@ -4750,6 +4847,31 @@ def build_editorial_enrichment_evidence_pack(
         )
         if projection.production_input_hash != snapshot.input_hash:
             raise ValueError("Editorial relevance projection does not match its snapshot")
+
+    paragraph_block_ids: dict[str, str] = {}
+    if workspace_record is not None:
+        if (
+            workspace_record.subject_id != snapshot.subject_id
+            or workspace_record.production_run_id != snapshot.production_run_id
+            or workspace_record.synthesis_canonical_sha256 != canonical_synthesis_hash(synthesis)
+        ):
+            raise ValueError("Editorial workspace registry does not match synthesis pins")
+        canonical_synthesis = production_synthesis_to_json(synthesis)
+        for entry in workspace_record.block_registry:
+            if entry.source_stage.value != "synthesis" or entry.kind.value not in {
+                "lead_paragraph",
+                "paragraph",
+            }:
+                continue
+            try:
+                resolved = resolve_paragraph_anchor(
+                    workspace_record,
+                    entry.block_id,
+                    synthesis=canonical_synthesis,
+                )
+            except EditorialWorkspaceError:
+                continue
+            paragraph_block_ids[resolved.structural_pointer] = str(resolved.block_id)
 
     entries = _all_evidence_entries(extraction)
     source_by_id = {source.source_document_id: source for source in extraction.sources}
@@ -4911,15 +5033,32 @@ def build_editorial_enrichment_evidence_pack(
         )
         for relation in (projection.source_pair_relations if projection is not None else ())
     )
+    current_synthesis = _synthesis_prompt_projection(synthesis, handle_for_ref, paragraph_block_ids)
+    registered_anchor_ids: frozenset[UUID] | None = None
+    if workspace_record is not None:
+        visible_paragraphs = [
+            *current_synthesis["lead"],
+            *(
+                paragraph
+                for section in current_synthesis["sections"]
+                for paragraph in section["paragraphs"]
+            ),
+        ]
+        registered_anchor_ids = frozenset(
+            UUID(str(paragraph["block_id"]))
+            for paragraph in visible_paragraphs
+            if isinstance(paragraph, Mapping) and paragraph.get("block_id") is not None
+        )
     return EditorialEnrichmentEvidencePackV1(
         publication_language=synthesis.publication_language,
-        current_synthesis=MappingProxyType(_synthesis_prompt_projection(synthesis, handle_for_ref)),
+        current_synthesis=MappingProxyType(current_synthesis),
         narrative_evidence=tuple(MappingProxyType(record) for record in narrative_evidence),
         technical_evidence=tuple(MappingProxyType(record) for record in technical_evidence),
         reserve_evidence=reserve_evidence,
         source_pair_relations=source_pair_relations,
         projection_hash=projection.projection_hash if projection is not None else None,
         policy_version=evidence_pack_policy_version,
+        registered_anchor_ids=registered_anchor_ids,
         _projected_ioc_keys=_projected_publication_ioc_keys(extraction, projection),
         _handle_to_ref=MappingProxyType(handle_to_ref),
         _reserve_handle_to_ref=MappingProxyType(
@@ -5415,6 +5554,23 @@ décrire qu'un média analytique pertinent manquant. Ne renvoie aucune URL dans 
             "Le nombre de FIGURE SOURCE proposées ne dépasse jamais "
             f"{maximum_figure_proposals}."
         )
+    contract = re.sub(
+        r"PLACEMENT: after_section\nSECTION_INDEX: \d+|PLACEMENT: after_lead",
+        "PLACEMENT: after_paragraph\n"
+        "ANCHOR_BLOCK_ID: [copy the exact registered block_id from current_synthesis]",
+        contract,
+    )
+    contract = contract.replace(
+        "Preserve supplied placement anchors and section indexes.",
+        "For every new element, use PLACEMENT: after_paragraph and copy one exact "
+        "registered block_id into ANCHOR_BLOCK_ID from current_synthesis. Never infer an "
+        "anchor from an ordinal, paragraph text, or similarity. Use only registered IDs.",
+    )
+    contract = contract.replace(
+        "Choisis un emplacement valide avec PLACEMENT et SECTION_INDEX.",
+        "Choisis un emplacement avec PLACEMENT: after_paragraph et un ANCHOR_BLOCK_ID "
+        "copié exactement depuis current_synthesis.",
+    )
     return contract
 
 
@@ -5543,7 +5699,11 @@ def build_editorial_enrichment_model_request(
             "diagramme doit renseigner PURPOSE (question du lecteur), DATA, GAIN "
             "(comprehension gain : avantage sur le paragraphe), SCOPE, "
             "PURPOSE_EVIDENCE, LIMITS, PLACEMENT et "
-            "PLACEMENT_REASON; tous sont obligatoires et non vides. Refuse un tableau qui "
+            "PLACEMENT_REASON; tous sont obligatoires et non vides. Pour tout nouvel élément, "
+            "choisis PLACEMENT: after_paragraph et copie exactement l'ANCHOR_BLOCK_ID d'un "
+            "paragraphe fourni dans current_synthesis. N'utilise jamais un ordinal, le texte ou "
+            "une similarité pour résoudre une ancre. Refuse tout placement non enregistré. "
+            "Refuse un tableau qui "
             "reformule seulement un paragraphe de synthèse; n'accepte pas un tableau d'une seule "
             "ligne. Un tableau qui duplique un chart ou une figure source doit être rejeté. "
             "Exemples de correspondances : « Commande SOAP | Namespace | Étape », « Type de "
@@ -5680,9 +5840,19 @@ def build_editorial_enrichment_model_request(
                 "maximum_node_characters": 40,
                 "maximum_edge_label_words": 5,
             },
-            "placements": [item.value for item in EnrichmentPlacementKind],
-            "section_indexes": [
-                int(item["section_index"]) for item in evidence_pack.current_synthesis["sections"]
+            "placements": [EnrichmentPlacementKind.AFTER_PARAGRAPH.value],
+            "registered_paragraph_anchor_ids": [
+                str(paragraph["block_id"])
+                for paragraph in (
+                    *evidence_pack.current_synthesis.get("lead", ()),
+                    *(
+                        paragraph
+                        for section in evidence_pack.current_synthesis.get("sections", ())
+                        if isinstance(section, Mapping)
+                        for paragraph in section.get("paragraphs", ())
+                    ),
+                )
+                if isinstance(paragraph, Mapping) and paragraph.get("block_id") is not None
             ],
             "analytic_validation_policy_version": EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION,
         },
@@ -6191,7 +6361,19 @@ def validate_editorial_enrichment_proposal(
                 EditorialEnrichmentStageErrorCode.PLACEMENT_INVALID,
                 message="placement_section_index_out_of_range",
             )
-        return EnrichmentPlacementV1(kind=value.kind, section_index=value.section_index)
+        if evidence_pack.registered_anchor_ids is not None and (
+            value.kind is not EnrichmentPlacementKind.AFTER_PARAGRAPH
+            or value.anchor_block_id not in evidence_pack.registered_anchor_ids
+        ):
+            raise EditorialEnrichmentProposalControlError(
+                EditorialEnrichmentStageErrorCode.PLACEMENT_INVALID,
+                message="editorial_anchor_stale",
+            )
+        return EnrichmentPlacementV1(
+            kind=value.kind,
+            section_index=value.section_index,
+            anchor_block_id=value.anchor_block_id,
+        )
 
     tables: list[TableSpecV1] = []
     charts: list[ChartSpecV1] = []
@@ -6827,6 +7009,35 @@ class ProductionEditorialEnrichmentService:
             )
             synthesis = await self._load_synthesis(run, snapshot, synthesis_artifact, extraction)
             async with self._uow_factory() as uow:
+                # New enrichments bind placement only to the pinned workspace registry.
+                # Keep this lookup in the same UOW as the source policy and route pins.
+                from cti_app.application.editorial_workspace.service import (
+                    EditorialWorkspaceService,
+                )
+
+                workspace_record = await EditorialWorkspaceService(
+                    uow_factory=cast(Any, self._uow_factory),
+                    artifact_store=self._artifact_store,
+                ).snapshot_record_in_uow(cast(Any, uow), snapshot.subject_id)
+                if (
+                    workspace_record.synthesis_artifact_id != synthesis_artifact.id
+                    or workspace_record.production_run_id != run.id
+                ):
+                    raise _EditorialEnrichmentInputControl(
+                        EditorialEnrichmentStageErrorCode.INPUTS_MISMATCH,
+                        "The editorial workspace registry does not pin the selected synthesis.",
+                        details={"reason": "editorial_anchor_stale"},
+                    )
+                if not any(
+                    entry.source_stage.value == "synthesis"
+                    and entry.kind.value in {"lead_paragraph", "paragraph"}
+                    for entry in workspace_record.block_registry
+                ):
+                    raise _EditorialEnrichmentInputControl(
+                        EditorialEnrichmentStageErrorCode.INPUTS_MISMATCH,
+                        "The editorial workspace has no registered paragraph anchors.",
+                        details={"reason": "editorial_anchor_stale"},
+                    )
                 try:
                     access_policy = await build_synthesis_access_policy(
                         snapshot,
@@ -6874,7 +7085,7 @@ class ProductionEditorialEnrichmentService:
             await self._ingest_source_figures(source_figure_inventory)
             figure_catalog = build_editorial_figure_catalog(extraction, source_figure_inventory)
             evidence_pack = build_editorial_enrichment_evidence_pack(
-                snapshot, extraction, synthesis, projection
+                snapshot, extraction, synthesis, projection, workspace_record
             )
             evidence_pack_hash = editorial_enrichment_evidence_pack_hash(evidence_pack)
             access_policy_hash = synthesis_access_policy_hash(access_policy)

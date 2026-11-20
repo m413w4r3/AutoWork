@@ -17,6 +17,12 @@ from cti_app.application.diagram_compilation import (
     DIAGRAM_COMPILATION_POLICY_VERSION,
     DiagramCompiler,
 )
+from cti_app.application.editorial_workspace.registry import (
+    WorkspaceSnapshotRecord,
+    read_pointer,
+    resolve_occurrence,
+    resolve_paragraph_anchor,
+)
 from cti_app.application.media_assets import MediaAssetStore, compile_and_store_diagrams
 from cti_app.application.persistence import ProductionArtifactRepository
 from cti_app.application.production_artifact_store import ProductionArtifactStore
@@ -33,10 +39,16 @@ from cti_app.application.production_synthesis import (
 from cti_app.application.publication_builder import (
     ARTICLE_FORMAT_POLICY_VERSION,
     ASSEMBLY_POLICY_VERSION,
+    PUBLICATION_ANCHOR_ASSEMBLY_POLICY_VERSION,
     PublicationAssemblyValidationError,
     build_article_format_v1,
     build_publication_document_v5,
     compute_assembly_input_hash,
+)
+from cti_app.domain.editorial_workspace import (
+    EditorialSourceStage,
+    EditorialWorkspaceError,
+    canonical_content_sha256,
 )
 from cti_app.domain.errors import BlobIntegrityError, EntityNotFoundError
 from cti_app.domain.production import (
@@ -46,15 +58,22 @@ from cti_app.domain.production import (
     ProductionInputSnapshot,
     ProductionRun,
 )
-from cti_app.domain.production_editorial_enrichment import EditorialEnrichmentV1
+from cti_app.domain.production_editorial_enrichment import (
+    EditorialEnrichmentV1,
+    EnrichmentPlacementKind,
+    editorial_enrichment_to_json,
+)
 from cti_app.domain.production_extraction import ProductionExtractionV1
 from cti_app.domain.production_references import ProductionReferenceCorpusV1
 from cti_app.domain.production_relevance import RelevanceProjectionV1
-from cti_app.domain.production_synthesis import ProductionSynthesisV1
+from cti_app.domain.production_synthesis import ProductionSynthesisV1, production_synthesis_to_json
 from cti_app.domain.publication import PublicationAssemblyErrorCode
 from cti_app.domain.publication_document import (
     PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION,
+    PUBLICATION_DOCUMENT_V9_SCHEMA_VERSION,
     PublicationDocumentV8,
+    PublicationDocumentV9,
+    ResolvedPublicationPlacementV1,
     parse_publication_document,
     serialize_publication_document,
 )
@@ -74,6 +93,115 @@ class PublicationAssemblyResult(NamedTuple):
 
     artifact: ProductionArtifact
     editorial_enrichment: EditorialEnrichmentV1 | None
+
+
+def _has_after_paragraph(enrichment: EditorialEnrichmentV1 | None) -> bool:
+    return enrichment is not None and any(
+        item.placement.kind is EnrichmentPlacementKind.AFTER_PARAGRAPH
+        for collection in (
+            enrichment.tables,
+            enrichment.charts,
+            enrichment.diagrams,
+            enrichment.source_figures,
+        )
+        for item in collection
+    )
+
+
+def _resolve_editorial_placements(
+    *,
+    record: WorkspaceSnapshotRecord | None,
+    run: ProductionRun,
+    synthesis: ProductionSynthesisV1,
+    enrichment: EditorialEnrichmentV1,
+    enrichment_artifact_id: UUID | None,
+) -> tuple[ResolvedPublicationPlacementV1, ...]:
+    if record is None or (
+        record.subject_id != run.subject_id
+        or record.production_run_id != run.id
+        or record.synthesis_canonical_sha256 != canonical_synthesis_hash(synthesis)
+        or record.enrichment_canonical_sha256 != canonical_editorial_enrichment_hash(enrichment)
+        or (
+            enrichment_artifact_id is not None
+            and record.enrichment_artifact_id != enrichment_artifact_id
+        )
+    ):
+        raise PublicationAssemblyValidationError(
+            PublicationAssemblyErrorCode.EDITORIAL_ANCHOR_STALE,
+            "editorial_anchor_stale",
+        )
+
+    synthesis_payload = production_synthesis_to_json(synthesis)
+    enrichment_payload = editorial_enrichment_to_json(enrichment)
+    family_by_kind = {
+        "table": "tables",
+        "chart": "charts",
+        "diagram": "diagrams",
+        "figure": "source_figures",
+    }
+    placements: list[ResolvedPublicationPlacementV1] = []
+    for entry in record.block_registry:
+        if entry.source_stage is not EditorialSourceStage.EDITORIAL_ENRICHMENT:
+            continue
+        try:
+            occurrence = resolve_occurrence(record, entry.block_id)
+            family = family_by_kind[entry.kind.value]
+            item = read_pointer(enrichment_payload, entry.structural_pointer)
+            if (
+                occurrence.binding_state != "valid"
+                or not isinstance(item, Mapping)
+                or canonical_content_sha256(item) != entry.content_sha256
+            ):
+                raise ValueError("editorial enrichment registry entry is stale")
+            if entry.structural_pointer.split("/")[1] != family:
+                raise ValueError("editorial enrichment registry family is inconsistent")
+            placement = item.get("placement")
+            if not isinstance(placement, Mapping):
+                raise ValueError("editorial enrichment placement is missing")
+            if placement.get("kind") != EnrichmentPlacementKind.AFTER_PARAGRAPH.value:
+                continue
+            anchor_block_id = UUID(str(placement["anchor_block_id"]))
+            anchor = resolve_paragraph_anchor(record, anchor_block_id, synthesis=synthesis_payload)
+            placements.append(
+                ResolvedPublicationPlacementV1(
+                    element_kind=entry.kind.value,
+                    element_key=str(item["key"]),
+                    element_position=entry.position,
+                    anchor_block_id=anchor.block_id,
+                    anchor_pointer=anchor.structural_pointer,
+                    anchor_canonical_position=anchor.canonical_position,
+                    paragraph_kind=anchor.paragraph_kind,
+                    section_index=anchor.section_index,
+                    paragraph_index=anchor.paragraph_index,
+                )
+            )
+        except (EditorialWorkspaceError, KeyError, IndexError, TypeError, ValueError) as exc:
+            raise PublicationAssemblyValidationError(
+                PublicationAssemblyErrorCode.EDITORIAL_ANCHOR_STALE,
+                "editorial_anchor_stale",
+            ) from exc
+
+    expected_count = sum(
+        1
+        for family in family_by_kind.values()
+        for item in getattr(enrichment, family)
+        if item.placement.kind is EnrichmentPlacementKind.AFTER_PARAGRAPH
+    )
+    if len(placements) != expected_count:
+        raise PublicationAssemblyValidationError(
+            PublicationAssemblyErrorCode.EDITORIAL_ANCHOR_STALE,
+            "editorial_anchor_stale",
+        )
+    return tuple(
+        sorted(
+            placements,
+            key=lambda item: (
+                item.anchor_canonical_position,
+                item.element_position,
+                item.element_key,
+            ),
+        )
+    )
 
 
 class PublicationAssemblyService:
@@ -105,10 +233,12 @@ class PublicationAssemblyService:
         publication_kind: PublicationKind | None = None,
         editorial_enrichment_artifact_id: UUID | None = None,
         editorial_enrichment_artifact_input_hash: str | None = None,
+        workspace_snapshot_record: WorkspaceSnapshotRecord | None = None,
         routing_decision_hash: str | None = None,
         routing_policy_version: str | None = None,
         metadata_extra: Mapping[str, Any] | None = None,
     ) -> PublicationAssemblyResult:
+        resolved_placements: tuple[ResolvedPublicationPlacementV1, ...] = ()
         if (
             not isinstance(publication_kind, PublicationKind)
             or routing_decision_hash is None
@@ -142,6 +272,14 @@ class PublicationAssemblyService:
                     PublicationAssemblyErrorCode.INPUTS_MISMATCH,
                     str(exc),
                 ) from exc
+            if _has_after_paragraph(editorial_enrichment):
+                resolved_placements = _resolve_editorial_placements(
+                    record=workspace_snapshot_record,
+                    run=run,
+                    synthesis=synthesis,
+                    enrichment=editorial_enrichment,
+                    enrichment_artifact_id=editorial_enrichment_artifact_id,
+                )
             if editorial_enrichment.production_input_hash != snapshot.input_hash:
                 raise PublicationAssemblyValidationError(
                     PublicationAssemblyErrorCode.INPUTS_MISMATCH,
@@ -176,6 +314,14 @@ class PublicationAssemblyService:
                 validate_editorial_enrichment(
                     editorial_enrichment, extraction=extraction, synthesis=synthesis
                 )
+                if _has_after_paragraph(editorial_enrichment):
+                    resolved_placements = _resolve_editorial_placements(
+                        record=workspace_snapshot_record,
+                        run=run,
+                        synthesis=synthesis,
+                        enrichment=editorial_enrichment,
+                        enrichment_artifact_id=editorial_enrichment_artifact_id,
+                    )
                 if editorial_enrichment.production_input_hash != snapshot.input_hash:
                     raise PublicationAssemblyValidationError(
                         PublicationAssemblyErrorCode.INPUTS_MISMATCH,
@@ -211,6 +357,7 @@ class PublicationAssemblyService:
                     editorial_enrichment = None
                     editorial_enrichment_artifact_id = None
                     editorial_enrichment_artifact_input_hash = None
+                    resolved_placements = ()
 
         assembly_metadata_extra = dict(metadata_extra or {})
         if publication_kind is PublicationKind.BRIEF and editorial_enrichment is None:
@@ -234,6 +381,7 @@ class PublicationAssemblyService:
             editorial_enrichment=editorial_enrichment,
             editorial_enrichment_artifact_id=editorial_enrichment_artifact_id,
             editorial_enrichment_artifact_input_hash=editorial_enrichment_artifact_input_hash,
+            workspace_snapshot_record=workspace_snapshot_record,
             relevance_projection=relevance_projection,
             routing_decision_hash=routing_decision_hash,
             routing_policy_version=routing_policy_version,
@@ -323,10 +471,31 @@ class PublicationAssemblyService:
                 if publication_kind is PublicationKind.ARTICLE
                 else None
             )
-            publication = PublicationDocumentV8(
+            publication_v8 = PublicationDocumentV8(
                 base_publication=base_v7,
                 article_format=article_format,
             )
+            publication: PublicationDocumentV8 = publication_v8
+            if _has_after_paragraph(editorial_enrichment):
+                if workspace_snapshot_record is None:
+                    raise PublicationAssemblyValidationError(
+                        PublicationAssemblyErrorCode.EDITORIAL_ANCHOR_STALE,
+                        "editorial_anchor_stale",
+                    )
+                enrichment_canonical_sha256 = workspace_snapshot_record.enrichment_canonical_sha256
+                if enrichment_canonical_sha256 is None:
+                    raise PublicationAssemblyValidationError(
+                        PublicationAssemblyErrorCode.EDITORIAL_ANCHOR_STALE,
+                        "editorial_anchor_stale",
+                    )
+                publication = PublicationDocumentV9(
+                    base_publication=base_v7,
+                    article_format=article_format,
+                    registry_hash=workspace_snapshot_record.registry_hash,
+                    synthesis_canonical_sha256=workspace_snapshot_record.synthesis_canonical_sha256,
+                    enrichment_canonical_sha256=enrichment_canonical_sha256,
+                    resolved_placements=resolved_placements,
+                )
             payload = serialize_publication_document(publication)
             return (
                 publication,
@@ -468,6 +637,7 @@ class PublicationAssemblyService:
         editorial_enrichment: EditorialEnrichmentV1 | None,
         editorial_enrichment_artifact_id: UUID | None = None,
         editorial_enrichment_artifact_input_hash: str | None = None,
+        workspace_snapshot_record: WorkspaceSnapshotRecord | None = None,
         relevance_projection: RelevanceProjectionV1 | None,
         routing_decision_hash: str,
         routing_policy_version: str,
@@ -483,20 +653,54 @@ class PublicationAssemblyService:
                 editorial_enrichment=editorial_enrichment,
                 relevance_projection=relevance_projection,
             )
+            if _has_after_paragraph(editorial_enrichment):
+                if workspace_snapshot_record is None:
+                    raise PublicationAssemblyValidationError(
+                        PublicationAssemblyErrorCode.EDITORIAL_ANCHOR_STALE,
+                        "editorial_anchor_stale",
+                    )
+                content_hash = hashlib.sha256(
+                    ProductionArtifactStore.canonical_json_bytes(
+                        {
+                            "content_input_hash": content_hash,
+                            "registry_hash": workspace_snapshot_record.registry_hash,
+                        }
+                    )
+                ).hexdigest()
         else:
             if relevance_projection is None:
                 raise ValueError("Brief assembly input hash requires relevance projection")
+            is_v9 = _has_after_paragraph(editorial_enrichment)
+            document_schema_version = (
+                PUBLICATION_DOCUMENT_V9_SCHEMA_VERSION
+                if is_v9
+                else PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION
+            )
             brief_identity: dict[str, Any] = {
                 "snapshot_input_hash": snapshot.input_hash,
                 "references_hash": references_corpus_hash(references),
                 "extraction_hash": canonical_extraction_hash(extraction),
                 "synthesis_hash": canonical_synthesis_hash(synthesis),
                 "relevance_projection_hash": relevance_projection.projection_hash,
-                "publication_document_schema_version": PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION,
+                "publication_document_schema_version": document_schema_version,
                 "brief_assembly_policy_version": BRIEF_ASSEMBLY_POLICY_VERSION,
                 "article_format_policy_version": ARTICLE_FORMAT_POLICY_VERSION,
             }
             if editorial_enrichment is not None:
+                if is_v9:
+                    if workspace_snapshot_record is None or (
+                        workspace_snapshot_record.subject_id != snapshot.subject_id
+                        or workspace_snapshot_record.production_run_id != snapshot.production_run_id
+                        or workspace_snapshot_record.synthesis_canonical_sha256
+                        != canonical_synthesis_hash(synthesis)
+                        or workspace_snapshot_record.enrichment_canonical_sha256
+                        != canonical_editorial_enrichment_hash(editorial_enrichment)
+                    ):
+                        raise PublicationAssemblyValidationError(
+                            PublicationAssemblyErrorCode.EDITORIAL_ANCHOR_STALE,
+                            "editorial_anchor_stale",
+                        )
+                    brief_identity["registry_hash"] = workspace_snapshot_record.registry_hash
                 brief_identity["editorial_enrichment_hash"] = canonical_editorial_enrichment_hash(
                     editorial_enrichment
                 )
@@ -511,6 +715,15 @@ class PublicationAssemblyService:
             content_hash = hashlib.sha256(
                 ProductionArtifactStore.canonical_json_bytes(brief_identity)
             ).hexdigest()
+        is_v9 = _has_after_paragraph(editorial_enrichment)
+        document_schema_version = (
+            PUBLICATION_DOCUMENT_V9_SCHEMA_VERSION
+            if is_v9
+            else PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION
+        )
+        assembly_policy_version = (
+            PUBLICATION_ANCHOR_ASSEMBLY_POLICY_VERSION if is_v9 else ASSEMBLY_POLICY_VERSION
+        )
         return hashlib.sha256(
             ProductionArtifactStore.canonical_json_bytes(
                 {
@@ -518,8 +731,8 @@ class PublicationAssemblyService:
                     "publication_kind": publication_kind.value,
                     "routing_decision_hash": routing_decision_hash,
                     "routing_policy_version": routing_policy_version,
-                    "publication_document_schema_version": PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION,
-                    "assembly_policy_version": ASSEMBLY_POLICY_VERSION,
+                    "publication_document_schema_version": document_schema_version,
+                    "assembly_policy_version": assembly_policy_version,
                     "article_format_policy_version": ARTICLE_FORMAT_POLICY_VERSION,
                 }
             )

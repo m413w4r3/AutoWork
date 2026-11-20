@@ -440,6 +440,13 @@ def test_placement_and_table_invariants_are_enforced() -> None:
         EnrichmentPlacementV1(EnrichmentPlacementKind.AFTER_SECTION, True)
     with pytest.raises(ValueError, match="only valid"):
         EnrichmentPlacementV1(EnrichmentPlacementKind.END, 0)
+    with pytest.raises(ValueError, match="registered anchor_block_id"):
+        EnrichmentPlacementV1(EnrichmentPlacementKind.AFTER_PARAGRAPH)
+    anchored = EnrichmentPlacementV1(
+        EnrichmentPlacementKind.AFTER_PARAGRAPH,
+        anchor_block_id=uuid4(),
+    )
+    assert anchored.anchor_block_id is not None
 
     ref = ExtractionEvidenceRefV1(_DOCUMENT_ID, EvidenceKind.FACT, "d" * 64)
     placement = EnrichmentPlacementV1(EnrichmentPlacementKind.END)
@@ -456,6 +463,28 @@ def test_placement_and_table_invariants_are_enforced() -> None:
         )
     with pytest.raises(ValueError, match="at least one evidence"):
         TableRowV1(("one", "two"), ())
+
+
+def test_v8_legacy_placement_still_reads() -> None:
+    extraction = _extraction()
+    synthesis = _synthesis(extraction)
+    current = _populated_enrichment(extraction, synthesis)
+    legacy = replace(
+        current,
+        schema_version=8,
+        enrichment_policy_version="editorial-enrichment-v12-article-density-diagnostics",
+    )
+
+    payload = editorial_enrichment_to_json(legacy)
+    restored = editorial_enrichment_from_json(payload)
+
+    assert payload["schema_version"] == 8
+    assert payload["tables"][0]["placement"] == {
+        "kind": "after_section",
+        "section_index": 0,
+    }
+    assert restored == legacy
+    assert editorial_enrichment_to_json(restored) == payload
 
 
 def test_diagram_node_edge_and_group_invariants_are_enforced() -> None:

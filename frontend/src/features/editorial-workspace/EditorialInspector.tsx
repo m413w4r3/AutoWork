@@ -15,6 +15,7 @@ interface EditorialInspectorProps {
   localDraftText: string;
   onLocalDraftChange: (text: string) => void;
   onOpenSources: () => void;
+  onOpenFigureGallery: () => void;
   onStartEditing: (blockId: string) => void;
   onBackToDocument: () => void;
   onChangeTarget: () => void;
@@ -161,6 +162,7 @@ export function EditorialInspector({
   localDraftText,
   onLocalDraftChange,
   onOpenSources,
+  onOpenFigureGallery,
   onStartEditing,
   onBackToDocument,
   onChangeTarget,
@@ -228,6 +230,14 @@ export function EditorialInspector({
               aria-labelledby="editorial-evidence-heading"
             >
               <h3 id="editorial-evidence-heading">Sources et preuves</h3>
+              <button
+                className="button button--secondary"
+                type="button"
+                onClick={onOpenFigureGallery}
+                aria-haspopup="dialog"
+              >
+                Images sources
+              </button>
               {block.evidence_refs.length > 0 ? (
                 <ul>
                   {block.evidence_refs.map((reference, index) => (

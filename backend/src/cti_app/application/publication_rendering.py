@@ -88,7 +88,7 @@ from cti_app.domain.publication_render import (
 from cti_app.domain.typst_render import TypstRenderFormat, TypstRenderStatus
 
 PUBLICATION_RENDERER = "typst"
-PUBLICATION_RENDERER_VERSION = "publication-v20-typst-v38-m21-opinion-render"
+PUBLICATION_RENDERER_VERSION = "publication-v21-typst-v41-after-paragraph-anchors"
 PUBLICATION_IDENTITY_LABEL_FIELD = "document_label"
 PDF_LINEAGE_RENDER_DATA_FIELD = "pdf_lineage"
 

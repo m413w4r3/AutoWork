@@ -8,6 +8,7 @@ editorial workshop can use the same validation without owning that workflow.
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from typing import Any, cast
 from uuid import UUID
 
@@ -27,6 +28,7 @@ from cti_app.application.production_prompts import (
     EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION,
     EDITORIAL_ENRICHMENT_REVISION_CONTRACT_VERSION,
     EDITORIAL_ENRICHMENT_REVISION_PROMPT_VERSION,
+    EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION,
 )
 from cti_app.application.production_synthesis import (
     canonical_extraction_hash,
@@ -81,7 +83,7 @@ def targeted_request_identity_payload(
         "contract_version": EDITORIAL_ENRICHMENT_REVISION_CONTRACT_VERSION,
         "editorial_contract_prompt_version": EDITORIAL_ENRICHMENT_PROMPT_VERSION,
         "editorial_contract_version": EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION,
-        "parser_version": "editorial-enrichment-wire-parser-v1",
+        "parser_version": EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION,
         "validator_version": "editorial-enrichment-validator-v1",
     }
 
@@ -249,12 +251,19 @@ def assert_requested_placement(
     element_kind: EditorialEnrichmentElementKind,
     targeted_request: TargetedEditorialRevisionRequest | None,
     synthesis: ProductionSynthesisV1,
+    evidence_pack: Any | None = None,
 ) -> None:
     """Check the placement requested for a new element without rewriting legacy data."""
     if targeted_request is None or targeted_request.target.placement is None:
         raise ValueError("targeted_enrichment_revision_placement_required")
     requested = targeted_request.target.placement
-    if requested.kind is TargetedEditorialRevisionPlacementKind.AFTER_LEAD:
+    if evidence_pack is not None:
+        expected = requested_registered_placement(
+            targeted_request=targeted_request,
+            synthesis=synthesis,
+            evidence_pack=evidence_pack,
+        )
+    elif requested.kind is TargetedEditorialRevisionPlacementKind.AFTER_LEAD:
         expected = EnrichmentPlacementV1(EnrichmentPlacementKind.AFTER_LEAD)
     elif requested.kind is TargetedEditorialRevisionPlacementKind.AFTER_TIMELINE:
         expected = EnrichmentPlacementV1(EnrichmentPlacementKind.AFTER_TIMELINE)
@@ -288,6 +297,61 @@ def assert_requested_placement(
                 }
             ]
         )
+
+
+def requested_registered_placement(
+    *,
+    targeted_request: TargetedEditorialRevisionRequest,
+    synthesis: ProductionSynthesisV1,
+    evidence_pack: Any,
+) -> EnrichmentPlacementV1:
+    """Resolve a targeted legacy placement request to its last registered paragraph."""
+    requested = targeted_request.target.placement
+    if requested is None:
+        raise ValueError("targeted_enrichment_revision_placement_required")
+    current_synthesis = evidence_pack.current_synthesis
+    if requested.kind is TargetedEditorialRevisionPlacementKind.AFTER_LEAD:
+        paragraphs = current_synthesis.get("lead", ())
+    elif requested.kind is TargetedEditorialRevisionPlacementKind.AFTER_SECTION:
+        payload = production_synthesis_to_json(synthesis)
+        section_index = next(
+            (
+                index
+                for index, section in enumerate(payload["sections"])
+                if _section_id(section) == requested.section_id
+            ),
+            None,
+        )
+        if section_index is None:
+            raise ValueError("targeted_enrichment_revision_placement_section_missing")
+        section = next(
+            (
+                value
+                for value in current_synthesis.get("sections", ())
+                if isinstance(value, Mapping) and value.get("section_index") == section_index
+            ),
+            None,
+        )
+        paragraphs = section.get("paragraphs", ()) if isinstance(section, Mapping) else ()
+    else:
+        raise ValueError("targeted_enrichment_revision_after_timeline_unsupported")
+
+    registered_anchor_ids = evidence_pack.registered_anchor_ids
+    if registered_anchor_ids is None:
+        raise ValueError("editorial_anchor_stale")
+    for paragraph in reversed(tuple(paragraphs)):
+        if not isinstance(paragraph, Mapping):
+            continue
+        try:
+            anchor_id = UUID(str(paragraph.get("block_id")))
+        except (TypeError, ValueError):
+            continue
+        if anchor_id in registered_anchor_ids:
+            return EnrichmentPlacementV1(
+                EnrichmentPlacementKind.AFTER_PARAGRAPH,
+                anchor_block_id=anchor_id,
+            )
+    raise ValueError("editorial_anchor_stale")
 
 
 def rebased_lineage_matches(

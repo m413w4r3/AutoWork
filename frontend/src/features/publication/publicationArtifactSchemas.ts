@@ -186,6 +186,22 @@ export function isPublicationDocument(
   value: unknown,
 ): value is PublicationDocumentArtifactWithV8 {
   if (!isRecord(value)) return false;
+  if (value.schema_version === "9") {
+    const base = value.base_publication;
+    return (
+      isRecord(base) &&
+      base.schema_version === "7" &&
+      isPublicationDocument(base) &&
+      (base.publication_kind === "article" ||
+        base.publication_kind === "brief") &&
+      isArticleFormat(value.article_format, base.publication_kind) &&
+      isSha256(value.registry_hash) &&
+      isSha256(value.synthesis_canonical_sha256) &&
+      isSha256(value.enrichment_canonical_sha256) &&
+      Array.isArray(value.resolved_placements) &&
+      value.resolved_placements.every(isResolvedPublicationPlacement)
+    );
+  }
   if (value.schema_version === "8") {
     const base = value.base_publication;
     return (
@@ -242,6 +258,33 @@ export function isPublicationDocument(
           Array.isArray(reference.evidence_refs),
       ) &&
       Array.isArray(value.original_indicators))
+  );
+}
+
+function isSha256(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
+function isResolvedPublicationPlacement(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    (value.element_kind === "table" ||
+      value.element_kind === "chart" ||
+      value.element_kind === "diagram" ||
+      value.element_kind === "figure") &&
+    typeof value.element_key === "string" &&
+    isNonNegativeInteger(value.element_position) &&
+    typeof value.anchor_block_id === "string" &&
+    typeof value.anchor_pointer === "string" &&
+    isNonNegativeInteger(value.anchor_canonical_position) &&
+    (value.paragraph_kind === "lead" || value.paragraph_kind === "section") &&
+    (value.section_index === null ||
+      isNonNegativeInteger(value.section_index)) &&
+    isNonNegativeInteger(value.paragraph_index)
   );
 }
 

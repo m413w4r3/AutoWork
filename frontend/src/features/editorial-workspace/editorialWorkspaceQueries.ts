@@ -13,4 +13,12 @@ export const editorialWorkspaceQueryKeys = {
     [...proposalPrefix(subjectId, occurrenceId), proposalId] as const,
   serverDraft: (subjectId: string, occurrenceId: string) =>
     ["editorial-server-draft", subjectId, occurrenceId] as const,
+  figureCatalog: (
+    subjectId: string,
+    status: string,
+    source: string,
+    search: string,
+  ) => ["editorial-figure-catalog", subjectId, status, source, search] as const,
+  figurePreview: (subjectId: string, figureId: string) =>
+    ["editorial-figure-preview", subjectId, figureId] as const,
 };

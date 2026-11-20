@@ -8258,9 +8258,38 @@ class _RevisionMemoryBlobStore:
         return raw_id, canonical_id, rendered_id
 
 
+class _MemoryWorkspaceSnapshotRepository:
+    def __init__(self) -> None:
+        self.records: list[Any] = []
+
+    async def get_by_pin(self, run_id: UUID, pin_hash: str) -> Any | None:
+        return next(
+            (
+                record
+                for record in self.records
+                if record.production_run_id == run_id and record.workspace_pin_hash == pin_hash
+            ),
+            None,
+        )
+
+    async def append_if_absent(self, record: Any) -> Any:
+        existing = await self.get_by_pin(record.production_run_id, record.workspace_pin_hash)
+        if existing is not None:
+            return existing
+        self.records.append(record)
+        return record
+
+    async def latest_for_run(self, run_id: UUID) -> Any | None:
+        return next(
+            (record for record in reversed(self.records) if record.production_run_id == run_id),
+            None,
+        )
+
+
 class _RevisionArtifactRepository:
     def __init__(self, artifacts: tuple[ProductionArtifact, ...]) -> None:
         self.artifacts = list(artifacts)
+        self.workspace_snapshots = _MemoryWorkspaceSnapshotRepository()
 
     async def get(self, artifact_id: UUID) -> ProductionArtifact | None:
         return next((item for item in self.artifacts if item.id == artifact_id), None)
@@ -8316,16 +8345,29 @@ class _RevisionMemoryUow:
         repair_decisions: tuple[ProductionRepairDecision, ...] = (),
         routing_decision: ProductionRoutingDecisionV1 | None = None,
     ) -> None:
+        self.subjects = SimpleNamespace(
+            get=lambda subject_id: _async_value(
+                SimpleNamespace(id=subject_id) if subject_id == run.subject_id else None
+            )
+        )
         self.production_runs = SimpleNamespace(
             get_current_for_subject=lambda subject_id: _async_value(
                 run if subject_id == run.subject_id else None
             ),
             get_for_update=lambda run_id: _async_value(run if run_id == run.id else None),
+            lock_creation_for_subject=lambda _subject_id: _async_value(None),
         )
         self.production_input_snapshots = SimpleNamespace(
             get_by_run=lambda run_id: _async_value(snapshot if run_id == run.id else None)
         )
         self.production_artifacts = artifacts
+        self.editorial_workspace_snapshots = artifacts.workspace_snapshots
+        self.editorial_proposal_impacts = SimpleNamespace(
+            latest_for_run=lambda _run_id: _async_value(None)
+        )
+        self.publication_renders = SimpleNamespace(
+            get_latest_for_artifact=lambda _artifact_id: _async_value(None)
+        )
         self.production_routing_decisions = SimpleNamespace(
             get=lambda decision_id: _async_value(
                 routing_decision

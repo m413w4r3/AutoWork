@@ -3340,6 +3340,12 @@ class ProductionSynthesisRevisionService:
         references_payload = await self._synthesis._artifact_store.read_json(references_blob_id)
         references = production_reference_corpus_from_json(references_payload)
         routing_decision = await get_adopted_production_routing_decision(uow=uow, run=context.run)
+        from cti_app.application.editorial_workspace.service import EditorialWorkspaceService
+
+        workspace_snapshot_record = await EditorialWorkspaceService(
+            uow_factory=cast(Any, self._synthesis._uow_factory),
+            artifact_store=self._synthesis._artifact_store,
+        ).snapshot_record_in_uow(cast(Any, uow), context.snapshot.subject_id)
         assembly = await PublicationAssemblyService(
             self._synthesis._artifact_store, uow.production_artifacts
         ).assemble_publication(
@@ -3352,6 +3358,7 @@ class ProductionSynthesisRevisionService:
             editorial_enrichment=enrichment,
             editorial_enrichment_artifact_id=enrichment_artifact.id,
             editorial_enrichment_artifact_input_hash=enrichment_artifact.input_hash,
+            workspace_snapshot_record=workspace_snapshot_record,
             publication_kind=(
                 routing_decision.publication_kind if routing_decision is not None else None
             ),

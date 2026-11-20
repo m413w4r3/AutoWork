@@ -38,6 +38,7 @@ from cti_app.domain.publication_document import (
     PublicationDocumentV6ValidationError,
     PublicationDocumentV7,
     PublicationDocumentV8,
+    PublicationDocumentV9,
     serialize_publication_document,
 )
 from cti_app.domain.publication_kind import PublicationKind
@@ -169,6 +170,7 @@ def qa_publication_v5(
     synthesis: ProductionSynthesisV1,
     editorial_enrichment: EditorialEnrichmentV1,
     publication: CanonicalPublicationDocument,
+    render_document: CanonicalPublicationDocument | None = None,
 ) -> dict[str, Any]:
     """Rebuild the pure projection and require byte-for-byte semantic equality."""
     v6 = publication if isinstance(publication, PublicationDocumentV6) else None
@@ -371,13 +373,25 @@ def qa_publication_v5(
     if not checks["no_uncertainty_list"]:
         errors.append("Publication contains a separate uncertainty list")
 
+    projection_source = publication
+    if render_document is not None:
+        render_document_matches = (
+            isinstance(render_document, PublicationDocumentV9)
+            and isinstance(publication, PublicationDocumentV6)
+            and render_document.base_publication.base_publication == publication
+        )
+        checks["resolved_projection_matches_v6"] = render_document_matches
+        if render_document_matches:
+            projection_source = render_document
+        else:
+            errors.append("Resolved publication projection does not match its canonical V6 body")
     try:
-        render_model = project_publication_to_typst_model(publication)
+        render_model = project_publication_to_typst_model(projection_source)
     except ValueError:
         checks["references_then_synthesis"] = False
     else:
         section_types = [section["type"] for section in render_model.content_sections]
-        expected_types = list(publication_content_section_types(publication))
+        expected_types = list(publication_content_section_types(projection_source))
         checks["references_then_synthesis"] = section_types == expected_types
         categories = (
             render_model.article_format.get("ioc_categories")
@@ -403,10 +417,10 @@ def qa_publication_v5(
                 for values in categories.values()
             )
         )
-        has_explicit_kind = getattr(publication, "publication_kind", None) is not None
+        has_explicit_kind = getattr(projection_source, "publication_kind", None) is not None
         article_format_valid = (
             render_model.article_format is None
-            if is_brief(publication)
+            if is_brief(projection_source)
             else valid_article_format
             if has_explicit_kind
             else render_model.article_format is None or valid_article_format
@@ -546,6 +560,7 @@ def qa_publication_v7(
 ) -> dict[str, Any]:
     """Apply input requirements selected by the explicit V7 publication kind."""
     publication_v8 = publication if isinstance(publication, PublicationDocumentV8) else None
+    render_document = publication if isinstance(publication, PublicationDocumentV9) else None
     if isinstance(publication, PublicationDocumentV8):
         publication = publication.base_publication
     if not isinstance(publication, PublicationDocumentV7):
@@ -568,6 +583,7 @@ def qa_publication_v7(
             synthesis=synthesis,
             editorial_enrichment=editorial_enrichment,
             publication=publication.base_publication,
+            render_document=render_document,
         )
         result["checks"]["publication_kind_explicit"] = True
         result["checks"]["routing_metadata_valid"] = bool(
@@ -742,7 +758,7 @@ def qa_publication_v7(
             errors.append(error_text)
 
     try:
-        render_model = project_publication_to_typst_model(publication)
+        render_model = project_publication_to_typst_model(render_document or publication)
     except ValueError:
         checks["brief_render_sections"] = False
         errors.append("Brief cannot be projected into the publication renderer")

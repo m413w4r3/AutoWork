@@ -611,9 +611,15 @@ async def test_canonical_synthesis_exact_reuse_skips_drafting(
         terminal.error_message,
         terminal.error_details,
     )
-    # Exact reuse: not a single provider submission, drafting included.
+    # Synthesis is exact-reused. Enrichment is requested again because its
+    # evidence-pack hash now includes this run's registered paragraph IDs;
+    # semantic annotation is also scoped to the new run.
     assert len(drafts) == 1
-    assert len(scenario.model.provider_calls) == provider_calls_before
+    new_provider_calls = scenario.model.provider_calls[provider_calls_before:]
+    assert [request.prompt_template_id for request in new_provider_calls] == [
+        "production-editorial-enrichment",
+        "production-semantic-annotation",
+    ]
 
     second_artifact = await _current_artifact(
         scenario, second_run.id, ProductionArtifactStage.SYNTHESIS

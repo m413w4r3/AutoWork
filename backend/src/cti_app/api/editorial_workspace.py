@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import traceback
@@ -20,6 +21,12 @@ from cti_app.application.editorial_drafts import (
     EditorialDraftApplicationError,
     EditorialDraftContent,
     EditorialDraftService,
+)
+from cti_app.application.editorial_figure_catalog import (
+    EditorialFigureCatalogError,
+    EditorialFigureCatalogItem,
+    EditorialFigureCatalogService,
+    FigureCatalogSource,
 )
 from cti_app.application.editorial_proposal_adoption import (
     EditorialProposalAdoptionError,
@@ -50,12 +57,21 @@ from cti_app.application.production_enrichment_revision import (
 from cti_app.application.production_stages import EditorialEnrichmentService, SynthesisService
 from cti_app.application.production_synthesis import ProductionSynthesisService
 from cti_app.config import get_settings
+from cti_app.domain.collection import CollectionState
 from cti_app.domain.editorial_proposal import EditorialProposalConflict
 from cti_app.domain.editorial_thread import EditorialThreadEventKind
 from cti_app.domain.editorial_workspace import EditorialWorkspaceError
 from cti_app.domain.publication_kind import PublicationKind
 from cti_app.infrastructure.analytic_chart_renderer import AnalyticChartRenderer
 from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
+from cti_app.infrastructure.figure_thumbnails import (
+    MAX_FIGURE_PREVIEW_EDGE_PX,
+    MAX_FIGURE_THUMBNAIL_EDGE_PX,
+    FigureThumbnailError,
+    PreparedFigureContent,
+    figure_thumbnail_cache,
+    prepare_figure_content,
+)
 
 _MAX_DRAFT_REQUEST_BYTES = MAX_DRAFT_BYTES * 6 + 4_096
 _MAX_MANUAL_EDIT_REQUEST_BYTES = 256 * 1024 + 4_096
@@ -70,6 +86,7 @@ class EditorialWorkspaceRoute(APIRoute):
             is_accept = self.path_format.endswith("/accept")
             is_manual_edit = self.path_format.endswith("/manual-edit")
             is_draft = self.path_format.endswith("/draft")
+            is_figure_catalog = "/editor/figures" in self.path_format
             if is_accept or is_manual_edit:
                 try:
                     enabled = get_settings().editorial_proposal_accept_enabled
@@ -113,7 +130,7 @@ class EditorialWorkspaceRoute(APIRoute):
             try:
                 response = await original_handler(request)
             except HTTPException as error:
-                if not is_draft:
+                if not is_draft and not is_figure_catalog:
                     raise
                 response = JSONResponse(
                     status_code=error.status_code,
@@ -121,7 +138,17 @@ class EditorialWorkspaceRoute(APIRoute):
                     headers=dict(error.headers or {}),
                 )
             except RequestValidationError as error:
-                if is_accept or is_manual_edit:
+                if is_figure_catalog:
+                    response = JSONResponse(
+                        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                        content={
+                            "detail": {
+                                "code": "figure_catalog_request_invalid",
+                                "message": "Les filtres de la galerie sont invalides.",
+                            }
+                        },
+                    )
+                elif is_accept or is_manual_edit:
                     code = "accept_request_invalid" if is_accept else "manual_edit_request_invalid"
                     message = (
                         "La requête d'acceptation est invalide."
@@ -137,7 +164,7 @@ class EditorialWorkspaceRoute(APIRoute):
                             }
                         },
                     )
-                if is_draft:
+                elif is_draft:
                     response = JSONResponse(
                         status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                         content={
@@ -147,7 +174,7 @@ class EditorialWorkspaceRoute(APIRoute):
                             }
                         },
                     )
-                else:
+                elif not is_figure_catalog:
                     details = [
                         {
                             "loc": list(item.get("loc", ())),
@@ -158,7 +185,17 @@ class EditorialWorkspaceRoute(APIRoute):
                     ]
                     response = JSONResponse(status_code=422, content={"detail": details})
             except Exception as error:
-                if is_manual_edit:
+                if is_figure_catalog:
+                    response = JSONResponse(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        content={
+                            "detail": {
+                                "code": "figure_catalog_unavailable",
+                                "message": "La galerie de figures est temporairement indisponible.",
+                            }
+                        },
+                    )
+                elif is_manual_edit:
                     return JSONResponse(
                         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                         content={
@@ -168,26 +205,30 @@ class EditorialWorkspaceRoute(APIRoute):
                             }
                         },
                     )
-                if not is_draft:
+                elif not is_draft:
                     raise
-                logger.warning(
-                    "draft_route_exception class=%s subject_id=%s occurrence_id=%s",
-                    type(error).__name__,
-                    request.path_params.get("subject_id", "unknown"),
-                    request.path_params.get("occurrence_id", "unknown"),
-                )
-                response = JSONResponse(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    content={
-                        "detail": {
-                            "code": "draft_storage_unavailable",
-                            "message": _ERROR_MESSAGES["draft_storage_unavailable"],
-                        }
-                    },
-                )
+                else:
+                    logger.warning(
+                        "draft_route_exception class=%s subject_id=%s occurrence_id=%s",
+                        type(error).__name__,
+                        request.path_params.get("subject_id", "unknown"),
+                        request.path_params.get("occurrence_id", "unknown"),
+                    )
+                    response = JSONResponse(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        content={
+                            "detail": {
+                                "code": "draft_storage_unavailable",
+                                "message": _ERROR_MESSAGES["draft_storage_unavailable"],
+                            }
+                        },
+                    )
 
             if is_draft:
                 response.headers["Cache-Control"] = "no-store"
+            if is_figure_catalog:
+                response.headers["Cache-Control"] = "private, no-store"
+                response.headers["X-Content-Type-Options"] = "nosniff"
             return response
 
         return sanitized_handler
@@ -267,6 +308,57 @@ class EditorialWorkspaceSnapshotView(BaseModel):
     impact_status: Literal["none", "pending", "running", "superseded", "up_to_date", "failed"]
     pdf_status: Literal["CURRENT", "STALE"]
     snapshot_id: UUID
+
+
+class EditorialFigureSourceView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_id: UUID
+    title: str | None
+    url: str | None
+
+
+class EditorialFigureCatalogItemView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    figure_id: UUID
+    original_name: str
+    original_caption: str | None
+    alt_text: str | None
+    source: EditorialFigureSourceView
+    page: int | None
+    section: str | None
+    context_before: str | None
+    context_after: str | None
+    width: int | None
+    height: int | None
+    mime_type: str | None
+    status: Literal[
+        "available",
+        "already_integrated",
+        "not_selected",
+        "ineligible",
+        "file_unavailable",
+        "unverified",
+    ]
+    selectable: bool
+    exclusion_reason: str | None
+    already_used: bool
+
+
+class EditorialFigureCatalogPageView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[EditorialFigureCatalogItemView]
+    sources: list[EditorialFigureSourceView]
+    total: int
+    available_count: int
+    offset: int
+    limit: int
+
+
+class EditorialFigurePreviewView(EditorialFigureCatalogItemView):
+    preview_image_url: str
 
 
 class ResolveWorkspaceIntent(BaseModel):
@@ -1076,6 +1168,274 @@ async def get_editorial_workspace_snapshot(
     if isinstance(capabilities, dict):
         capabilities["manual_edit"] = _manual_edit_capability_enabled(request, payload)
     return EditorialWorkspaceSnapshotView.model_validate(payload)
+
+
+_FIGURE_STATUS_FILTERS = Literal[
+    "available",
+    "already_integrated",
+    "not_selected",
+    "ineligible",
+    "file_unavailable",
+    "unverified",
+]
+
+
+def _figure_catalog_service(request: Request) -> EditorialFigureCatalogService:
+    artifact_store = getattr(request.app.state, "production_artifact_store", None)
+    uow_factory = getattr(request.app.state, "uow_factory", None)
+    if artifact_store is None or uow_factory is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "figure_catalog_unavailable",
+                "message": "La galerie de figures est temporairement indisponible.",
+            },
+        )
+    collection_service = getattr(request.app.state, "collection_service", None)
+    media_archiver = getattr(collection_service, "source_media_archiver", None)
+    policy_sha256 = getattr(media_archiver, "policy_sha256", None)
+    return EditorialFigureCatalogService(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        media_policy_sha256=policy_sha256 if isinstance(policy_sha256, str) else None,
+    )
+
+
+def _figure_catalog_http_error(error: EditorialFigureCatalogError) -> HTTPException:
+    if error.code == "editorial_figure_not_found":
+        status_code = status.HTTP_404_NOT_FOUND
+        message = "Cette figure n'est pas disponible dans cette galerie."
+    elif error.code == "figure_catalog_request_invalid":
+        status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
+        message = "Les filtres de la galerie sont invalides."
+    elif error.code == "figure_thumbnail_unavailable":
+        status_code = status.HTTP_404_NOT_FOUND
+        message = "L'aperçu de cette figure n'est pas disponible."
+    else:
+        status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        message = "La galerie de figures est temporairement indisponible."
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": error.code, "message": message},
+    )
+
+
+def _figure_source_view(source: FigureCatalogSource) -> EditorialFigureSourceView:
+    return EditorialFigureSourceView.model_validate(
+        {"source_id": source.source_id, "title": source.title, "url": source.url}
+    )
+
+
+def _figure_catalog_item_view(
+    item: EditorialFigureCatalogItem,
+) -> EditorialFigureCatalogItemView:
+    return EditorialFigureCatalogItemView.model_validate(
+        {
+            "figure_id": item.figure_id,
+            "original_name": item.original_name,
+            "original_caption": item.original_caption,
+            "alt_text": item.alt_text,
+            "source": _figure_source_view(item.source),
+            "page": item.page,
+            "section": item.section,
+            "context_before": item.context_before,
+            "context_after": item.context_after,
+            "width": item.width,
+            "height": item.height,
+            "mime_type": item.mime_type,
+            "status": item.status,
+            "selectable": item.selectable,
+            "exclusion_reason": item.exclusion_reason,
+            "already_used": item.already_used,
+        }
+    )
+
+
+@router.get(
+    "/subjects/{subject_id}/editor/figures",
+    response_model=EditorialFigureCatalogPageView,
+)
+async def get_editorial_figure_catalog(
+    subject_id: UUID,
+    request: Request,
+    response: Response,
+    figure_status: _FIGURE_STATUS_FILTERS | None = Query(default=None, alias="status"),
+    source_id: UUID | None = Query(default=None, alias="source"),
+    search: str | None = Query(default=None, alias="q", max_length=128),
+    offset: int = Query(default=0, ge=0, le=512),
+    limit: int = Query(default=30, ge=1, le=50),
+) -> EditorialFigureCatalogPageView:
+    try:
+        page = await _figure_catalog_service(request).catalog(
+            subject_id=subject_id,
+            status_filter=figure_status,
+            source_filter=source_id,
+            search=search,
+            offset=offset,
+            limit=limit,
+        )
+    except EditorialFigureCatalogError as error:
+        raise _figure_catalog_http_error(error) from None
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return EditorialFigureCatalogPageView(
+        items=[_figure_catalog_item_view(item) for item in page.items],
+        sources=[_figure_source_view(source) for source in page.sources],
+        total=page.total,
+        available_count=page.available_count,
+        offset=page.offset,
+        limit=page.limit,
+    )
+
+
+@router.get(
+    "/subjects/{subject_id}/editor/figures/{figure_id}/thumbnail",
+    response_class=Response,
+)
+async def get_editorial_figure_thumbnail(
+    subject_id: UUID, figure_id: UUID, request: Request
+) -> Response:
+    prepared, _item = await _read_editorial_figure(
+        request,
+        subject_id,
+        figure_id,
+        requested_size=MAX_FIGURE_THUMBNAIL_EDGE_PX,
+    )
+    return _figure_content_response(prepared)
+
+
+@router.get(
+    "/subjects/{subject_id}/editor/figures/{figure_id}/preview",
+    response_model=EditorialFigurePreviewView,
+)
+async def get_editorial_figure_preview(
+    subject_id: UUID,
+    figure_id: UUID,
+    request: Request,
+    response: Response,
+) -> EditorialFigurePreviewView:
+    try:
+        item = await _figure_catalog_service(request).resolve(
+            subject_id=subject_id, figure_id=figure_id
+        )
+    except EditorialFigureCatalogError as error:
+        raise _figure_catalog_http_error(error) from None
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return EditorialFigurePreviewView.model_validate(
+        {
+            **_figure_catalog_item_view(item).model_dump(mode="json"),
+            "preview_image_url": (
+                f"/api/subjects/{subject_id}/editor/figures/{figure_id}/preview/image"
+            ),
+        }
+    )
+
+
+@router.get(
+    "/subjects/{subject_id}/editor/figures/{figure_id}/preview/image",
+    response_class=Response,
+)
+async def get_editorial_figure_preview_image(
+    subject_id: UUID, figure_id: UUID, request: Request
+) -> Response:
+    prepared, _item = await _read_editorial_figure(
+        request,
+        subject_id,
+        figure_id,
+        requested_size=MAX_FIGURE_PREVIEW_EDGE_PX,
+    )
+    return _figure_content_response(prepared)
+
+
+def _figure_content_response(prepared: PreparedFigureContent) -> Response:
+    return Response(
+        content=prepared.content,
+        headers={
+            "Content-Type": prepared.media_type,
+            "Content-Security-Policy": prepared.content_security_policy,
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+async def _read_editorial_figure(
+    request: Request,
+    subject_id: UUID,
+    figure_id: UUID,
+    *,
+    requested_size: int,
+) -> tuple[PreparedFigureContent, EditorialFigureCatalogItem]:
+    service = _figure_catalog_service(request)
+    try:
+        item = await service.resolve(subject_id=subject_id, figure_id=figure_id)
+    except EditorialFigureCatalogError as error:
+        raise _figure_catalog_http_error(error) from None
+    if item._blob_id is None or item._sha256 is None or item._byte_size is None:
+        raise _figure_catalog_http_error(
+            EditorialFigureCatalogError("figure_thumbnail_unavailable")
+        ) from None
+    async with request.app.state.uow_factory() as uow:
+        subject = await uow.subjects.get(subject_id)
+        run = await uow.production_runs.get_current_for_subject(subject_id)
+        source_document = await uow.source_documents.get(item._source_document_id)
+        if (
+            subject is None
+            or run is None
+            or run.id != item._run_id
+            or source_document.subject_id != subject_id
+        ):
+            raise _figure_catalog_http_error(
+                EditorialFigureCatalogError("editorial_figure_not_found")
+            ) from None
+        if source_document.source_collection_id is not None:
+            collection = await uow.source_collections.get(source_document.source_collection_id)
+            if (
+                collection is None
+                or collection.subject_id != subject_id
+                or collection.state
+                not in {
+                    CollectionState.ARCHIVED,
+                    CollectionState.EXTRACTED,
+                    CollectionState.COMPLETED,
+                }
+                or (
+                    collection.source_document_id is not None
+                    and collection.source_document_id != source_document.id
+                )
+            ):
+                raise _figure_catalog_http_error(
+                    EditorialFigureCatalogError("editorial_figure_not_found")
+                ) from None
+        blob = await uow.blobs.get(item._blob_id)
+        if (
+            blob is None
+            or blob.descriptor.sha256 != item._sha256
+            or blob.descriptor.size != item._byte_size
+            or blob.descriptor.size > 5 * 1024 * 1024
+        ):
+            raise _figure_catalog_http_error(
+                EditorialFigureCatalogError("figure_thumbnail_unavailable")
+            ) from None
+    mime_type = item.mime_type or ""
+    prepared = figure_thumbnail_cache.get(item._sha256, requested_size, mime_type)
+    if prepared is None:
+        content = await request.app.state.production_artifact_store.read_bytes(
+            item._blob_id, max_bytes=5 * 1024 * 1024
+        )
+        if len(content) != item._byte_size or hashlib.sha256(content).hexdigest() != item._sha256:
+            raise _figure_catalog_http_error(
+                EditorialFigureCatalogError("figure_thumbnail_unavailable")
+            ) from None
+        try:
+            prepared = prepare_figure_content(content, mime_type)
+        except FigureThumbnailError as error:
+            raise _figure_catalog_http_error(
+                EditorialFigureCatalogError("figure_thumbnail_unavailable")
+            ) from error
+        figure_thumbnail_cache.put(item._sha256, requested_size, mime_type, prepared)
+    return prepared, item
 
 
 @router.get(

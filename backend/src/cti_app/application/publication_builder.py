@@ -94,6 +94,7 @@ from cti_app.domain.publication_document import (
     ARTICLE_FORMAT_TIMELINE_MAX_EVENTS,
     PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
     PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION,
+    PUBLICATION_DOCUMENT_V9_SCHEMA_VERSION,
     ArticleFormatV1,
     IOCArticleCategoriesV1,
     PublicationChartV1,
@@ -618,6 +619,7 @@ def _validate_publication_lineage(
 
 # V17 binds the versioned ArticleFormat projection into publication identity.
 ASSEMBLY_POLICY_VERSION: Final[str] = "17-publication-v8-m19-format"
+PUBLICATION_ANCHOR_ASSEMBLY_POLICY_VERSION: Final[str] = "18-publication-v9-after-paragraph-anchors"
 ARTICLE_FORMAT_POLICY_VERSION: Final[str] = "3-m19-publication-events"
 ARTICLE_TIMELINE_KEY_EVENT_LIMIT: Final[int] = ARTICLE_FORMAT_TIMELINE_MAX_EVENTS
 
@@ -826,6 +828,16 @@ def compute_assembly_input_hash(
     relevance_projection: RelevanceProjectionV1 | None = None,
 ) -> str:
     """Return the deterministic functional identity of canonical Assembly inputs."""
+    is_v9 = any(
+        item.placement.kind.value == "after_paragraph"
+        for collection in (
+            editorial_enrichment.tables,
+            editorial_enrichment.charts,
+            editorial_enrichment.diagrams,
+            editorial_enrichment.source_figures,
+        )
+        for item in collection
+    )
     payload = {
         "snapshot_input_hash": snapshot.input_hash,
         "references_hash": references_corpus_hash(references),
@@ -835,9 +847,15 @@ def compute_assembly_input_hash(
         "relevance_projection_hash": (
             relevance_projection.projection_hash if relevance_projection is not None else None
         ),
-        "publication_document_schema_version": PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION,
+        "publication_document_schema_version": (
+            PUBLICATION_DOCUMENT_V9_SCHEMA_VERSION
+            if is_v9
+            else PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION
+        ),
         "article_format_policy_version": ARTICLE_FORMAT_POLICY_VERSION,
-        "assembly_policy_version": ASSEMBLY_POLICY_VERSION,
+        "assembly_policy_version": (
+            PUBLICATION_ANCHOR_ASSEMBLY_POLICY_VERSION if is_v9 else ASSEMBLY_POLICY_VERSION
+        ),
         "legitimate_services_policy_version": LEGITIMATE_SERVICES_POLICY_VERSION,
         "semantic_annotation_policy_version": SEMANTIC_ANNOTATION_POLICY_VERSION,
     }

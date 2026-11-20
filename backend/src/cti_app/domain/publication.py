@@ -98,6 +98,7 @@ class PublicationAssemblyErrorCode(StrEnum):
     SOURCE_FIGURE_UNRESOLVED = "publication_source_figure_unresolved"
     SOURCE_FIGURE_INVALID = "publication_source_figure_invalid"
     SOURCE_FIGURE_METADATA_MISSING = "publication_source_figure_metadata_missing"
+    EDITORIAL_ANCHOR_STALE = "editorial_anchor_stale"
 
 
 class PublicationSectionKind(StrEnum):

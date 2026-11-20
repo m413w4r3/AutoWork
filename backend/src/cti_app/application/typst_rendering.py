@@ -85,6 +85,7 @@ from cti_app.domain.publication_document import (
     PublicationDocumentV6,
     PublicationDocumentV7,
     PublicationDocumentV8,
+    PublicationDocumentV9,
     PublicationIOCDisposition,
     PublicationSourceFigureV1,
     PublicationTableV1,
@@ -105,6 +106,7 @@ from cti_app.domain.subject_ioc_eligibility import is_supported_publication_ioc_
 
 # v40 localizes opinion IOC labels and keeps protocol figure proof captions visible.
 _RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v40-m21-opinion-render"
+_RENDER_DATA_SCHEMA_VERSION_V9 = "typst-publication-model-v41-after-paragraph-anchors"
 _BRIEF_PUBLICATION_EVENTS_POLICY_VERSION = "brief-assembly-v4-m19-publication-events"
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
 _FRENCH_MONTH_NAMES = (
@@ -2217,7 +2219,11 @@ class TypstRenderer:
             else document
         )
         render_data: dict[str, Any] = {
-            "schema_version": _RENDER_DATA_SCHEMA_VERSION,
+            "schema_version": (
+                _RENDER_DATA_SCHEMA_VERSION_V9
+                if isinstance(classification_document, PublicationDocumentV9)
+                else _RENDER_DATA_SCHEMA_VERSION
+            ),
             "kind": "brief" if is_brief(classification_document) else "article",
             "opinion_document": isinstance(document, TypstDraftPreviewDocument)
             or (
@@ -2388,6 +2394,7 @@ def project_publication_to_typst_model(
 ) -> TypstPublicationModelV2:
     """Project a canonical publication while keeping semantic content as data."""
     draft_preview = value if isinstance(value, TypstDraftPreviewDocument) else None
+    publication_v9 = value if isinstance(value, PublicationDocumentV9) else None
     publication_v8 = value if isinstance(value, PublicationDocumentV8) else None
     publication_v7 = (
         publication_v8.base_publication
@@ -2538,6 +2545,12 @@ def project_publication_to_typst_model(
 
     media_refs_by_id: dict[UUID, TypstMediaRef] = {}
     rich_by_placement: dict[tuple[EnrichmentPlacementKind, int | None], list[dict[str, Any]]] = {}
+    rich_after_paragraph: dict[str, list[tuple[int, str, dict[str, Any]]]] = {}
+    resolved_v9_placements = (
+        {(item.element_kind, item.element_key): item for item in publication_v9.resolved_placements}
+        if publication_v9 is not None
+        else {}
+    )
 
     def media_ref(
         *,
@@ -2570,7 +2583,29 @@ def project_publication_to_typst_model(
         kind: EnrichmentPlacementKind,
         section_index: int | None,
         block: dict[str, Any],
+        *,
+        element_kind: str,
+        element_key: str,
+        anchor_block_id: UUID | None,
     ) -> None:
+        if publication_v9 is not None and kind is EnrichmentPlacementKind.AFTER_PARAGRAPH:
+            resolved = resolved_v9_placements.get((element_kind, element_key))
+            if resolved is None or anchor_block_id != resolved.anchor_block_id:
+                raise ValueError("editorial_anchor_stale")
+            anchor = (
+                lead_paragraph_anchor(resolved.paragraph_index + 1)
+                if resolved.paragraph_kind == "lead"
+                else section_paragraph_anchor(
+                    resolved.section_index or 0,
+                    resolved.paragraph_index + 1,
+                )
+            )
+            rich_after_paragraph.setdefault(anchor, []).append(
+                (resolved.element_position, resolved.element_key, block)
+            )
+            return
+        if kind is EnrichmentPlacementKind.AFTER_PARAGRAPH:
+            raise ValueError("editorial_anchor_stale")
         if kind is EnrichmentPlacementKind.AFTER_SECTION and (
             section_index is None or section_index >= len(document.sections)
         ):
@@ -2616,6 +2651,9 @@ def project_publication_to_typst_model(
             table.placement.kind,
             table.placement.section_index,
             block,
+            element_kind="table",
+            element_key=table.key,
+            anchor_block_id=table.placement.anchor_block_id,
         )
     for diagram in document.diagrams:
         block = _diagram_block(diagram, media_ref)
@@ -2626,6 +2664,9 @@ def project_publication_to_typst_model(
             diagram.placement.kind,
             diagram.placement.section_index,
             block,
+            element_kind="diagram",
+            element_key=diagram.key,
+            anchor_block_id=diagram.placement.anchor_block_id,
         )
     for chart in document.charts:
         block = _chart_block(chart, media_ref)
@@ -2636,6 +2677,9 @@ def project_publication_to_typst_model(
             chart.placement.kind,
             chart.placement.section_index,
             block,
+            element_kind="chart",
+            element_key=chart.key,
+            anchor_block_id=chart.placement.anchor_block_id,
         )
     sources_by_id = {source.source_document_id: source for source in document.sources}
     for figure in document.figures:
@@ -2651,6 +2695,9 @@ def project_publication_to_typst_model(
             figure.placement.kind,
             figure.placement.section_index,
             block,
+            element_kind="figure",
+            element_key=figure.key,
+            anchor_block_id=figure.placement.anchor_block_id,
         )
 
     reference_blocks = list(
@@ -2735,16 +2782,20 @@ def project_publication_to_typst_model(
             references.append(reference)
         return references
 
-    lead_fingerprints = {
-        " ".join(lead_paragraph.text.casefold().split()) for lead_paragraph in document.lead
-    }
+    lead_fingerprints = (
+        set()
+        if publication_v9 is not None
+        else {" ".join(lead_paragraph.text.casefold().split()) for lead_paragraph in document.lead}
+    )
     body_anchor_texts = {
         lead_paragraph_anchor(index): lead_paragraph.text
         for index, lead_paragraph in enumerate(document.lead, start=1)
     }
     for section_index, publication_section in enumerate(document.sections):
         for paragraph_index, paragraph in enumerate(publication_section.paragraphs, start=1):
-            if " ".join(paragraph.text.casefold().split()) not in lead_fingerprints:
+            if publication_v9 is not None or (
+                " ".join(paragraph.text.casefold().split()) not in lead_fingerprints
+            ):
                 body_anchor_texts[section_paragraph_anchor(section_index, paragraph_index)] = (
                     paragraph.text
                 )
@@ -2797,6 +2848,12 @@ def project_publication_to_typst_model(
                 **({"semantic_spans": spans} if spans is not None else {}),
             }
         )
+        body_blocks.extend(
+            block
+            for _position, _element_key, block in sorted(
+                rich_after_paragraph.get(anchor, ()), key=lambda item: item[:2]
+            )
+        )
         body_blocks.extend(notes_by_anchor.get(anchor, ()))
 
     body_blocks: list[dict[str, Any]] = []
@@ -2827,6 +2884,7 @@ def project_publication_to_typst_model(
     for section_index, publication_section in enumerate(document.sections):
         if (
             has_projected_overview
+            and publication_v9 is None
             and section_index == 0
             and is_article_overview_heading(publication_section.heading)
         ):
@@ -2834,7 +2892,8 @@ def project_publication_to_typst_model(
         paragraph_blocks = [
             (paragraph_index, paragraph)
             for paragraph_index, paragraph in enumerate(publication_section.paragraphs, start=1)
-            if " ".join(paragraph.text.casefold().split()) not in lead_fingerprints
+            if publication_v9 is not None
+            or " ".join(paragraph.text.casefold().split()) not in lead_fingerprints
         ]
         if publication_section.heading and paragraph_blocks:
             display_heading, _heading_spans = project_text("", publication_section.heading)

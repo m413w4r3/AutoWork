@@ -24,6 +24,7 @@ from cti_app.application.production_editorial_enrichment import (
 from cti_app.application.production_stages import EditorialEnrichmentService
 from cti_app.domain.production import ProductionArtifact, ProductionArtifactStage
 from cti_app.domain.production_editorial_enrichment import (
+    EDITORIAL_ENRICHMENT_V9_POLICY_VERSION,
     EDITORIAL_RESOURCE_PROPOSAL_POLICY_VERSION,
     DiagramSpecV1,
     EditorialEnrichmentElementKind,
@@ -230,6 +231,7 @@ async def build_candidate_from_validated_patch(
     input_hash: str,
     artifact_id: UUID,
     targeted_request: TargetedEditorialRevisionRequest | None = None,
+    evidence_pack: Any | None = None,
     is_create: bool = False,
     is_delete: bool = False,
     resource_need_proposal: ResourceNeedProposalV1 | None = None,
@@ -277,6 +279,32 @@ async def build_candidate_from_validated_patch(
         raise ValueError("editorial_enrichment_revision_base_element_missing")
     base_element = base_elements[element_index] if element_index is not None else None
 
+    candidate_has_paragraph_placement = validated_patch is not None and any(
+        item.placement.kind.value == "after_paragraph"
+        for values in (
+            validated_patch.tables,
+            validated_patch.diagrams,
+            validated_patch.charts,
+            validated_patch.source_figures,
+        )
+        for item in values
+    )
+    if candidate_has_paragraph_placement and base_enrichment.schema_version < 9:
+        if base_enrichment.schema_version < 8:
+            raise EditorialEnrichmentRevisionValidationError(
+                [
+                    {
+                        "block_id": element_key,
+                        "reason_code": "editorial_enrichment_legacy_schema_upgrade_unsupported",
+                    }
+                ]
+            )
+        base_enrichment = replace(
+            base_enrichment,
+            schema_version=9,
+            enrichment_policy_version=EDITORIAL_ENRICHMENT_V9_POLICY_VERSION,
+        )
+
     outcome = (
         EditorialEnrichmentRevisionOutcome.NEEDS_NEW_EVIDENCE
         if resource_need_proposal is not None
@@ -323,6 +351,7 @@ async def build_candidate_from_validated_patch(
                 element_kind=element_kind,
                 targeted_request=targeted_request,
                 synthesis=synthesis,
+                evidence_pack=evidence_pack,
             )
             revised_enrichment = insert_target(
                 base_enrichment,
@@ -403,6 +432,9 @@ async def build_candidate_from_validated_patch(
         final_payload["annotations"] = revised_payload["annotations"]
     if resource_need_proposal is not None and "resource_needs" in revised_payload:
         final_payload["resource_needs"] = revised_payload["resource_needs"]
+    if revised_enrichment.schema_version == 9:
+        final_payload["schema_version"] = revised_enrichment.schema_version
+        final_payload["enrichment_policy_version"] = revised_enrichment.enrichment_policy_version
 
     if editorial_enrichment_from_json(final_payload) != revised_enrichment:
         raise ValueError("editorial_enrichment_revision_payload_mismatch")
