@@ -21,6 +21,7 @@ from cti_app.application.editorial_proposal_adoption import (
     EditorialProposalAdoptionInputs,
     EnrichmentCandidateInputs,
     SynthesisCandidateInputs,
+    assert_adoption_rewrite_table_placement,
 )
 from cti_app.application.editorial_synthesis.candidate import (
     SynthesisCandidatePersistence,
@@ -381,6 +382,14 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                 extraction=extraction,
                 synthesis=synthesis,
                 figure_catalog=fence.figure_catalog,
+            )
+            assert_adoption_rewrite_table_placement(
+                base_enrichment=base_enrichment,
+                candidate=validated_patch,
+                element_kind=target.element_kind,
+                element_key=target.element_key,
+                operation=operation,
+                is_create=is_create,
             )
             if is_create:
                 assert_requested_placement(

@@ -129,6 +129,29 @@ class EditorialProposalAdoptionError(ValueError):
         super().__init__(code)
 
 
+def assert_adoption_rewrite_table_placement(
+    *,
+    base_enrichment: EditorialEnrichmentV1,
+    candidate: EditorialEnrichmentV1,
+    element_kind: EditorialEnrichmentElementKind,
+    element_key: str,
+    operation: TargetedEditorialRevisionOperation,
+    is_create: bool,
+) -> None:
+    """Prevent an adopted table rewrite from changing its existing placement."""
+    if (
+        is_create
+        or operation is not TargetedEditorialRevisionOperation.REWRITE_TABLE
+        or element_kind is not EditorialEnrichmentElementKind.TABLE
+    ):
+        return
+    base_table = next((item for item in base_enrichment.tables if item.key == element_key), None)
+    if base_table is None:
+        raise EditorialProposalAdoptionError("proposal_base_stale")
+    if len(candidate.tables) != 1 or candidate.tables[0].placement != base_table.placement:
+        raise EditorialProposalAdoptionError("adoption_placement_changed")
+
+
 @dataclass(frozen=True, slots=True)
 class SynthesisCandidateInputs:
     """Current, policy-checked inputs needed by the pure synthesis candidate core."""
@@ -591,6 +614,14 @@ class EditorialProposalAdoptionService:
                 extraction=enrichment_inputs.extraction,
                 synthesis=enrichment_inputs.synthesis,
                 figure_catalog=enrichment_inputs.figure_catalog,
+            )
+            assert_adoption_rewrite_table_placement(
+                base_enrichment=enrichment_inputs.base_enrichment,
+                candidate=validated_patch,
+                element_kind=enrichment_inputs.element_kind,
+                element_key=enrichment_inputs.element_key,
+                operation=operation,
+                is_create=enrichment_inputs.is_create,
             )
             if enrichment_inputs.is_create:
                 assert_requested_placement(

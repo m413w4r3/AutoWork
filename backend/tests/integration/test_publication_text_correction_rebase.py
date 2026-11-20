@@ -12,7 +12,6 @@ import pytest
 
 from cti_app.application.analyst_opinion_preview import AnalystOpinionPreviewService
 from cti_app.application.analyst_opinion_service import AnalystOpinionService
-from cti_app.application.analyst_publication_service import AnalystPublicationService
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.editorial_workspace.service import EditorialWorkspaceService
 from cti_app.application.investigation_governance import (
@@ -24,6 +23,7 @@ from cti_app.application.production_artifact_store import ProductionArtifactStor
 from cti_app.application.production_references import production_reference_corpus_from_json
 from cti_app.application.publication_augmentation import (
     OpinionCitationContext,
+    PublicationAugmentationArtifactService,
     augment_publication_with_opinion,
 )
 from cti_app.application.publication_builder import (
@@ -608,15 +608,33 @@ async def test_postgres_correction_and_rebase_are_append_only(
         correlation_id=f"publication-correction-approval-{suffix}",
         bridge_drafting_gap_acknowledged=True,
     )
-    published = await AnalystPublicationService(
+    editorial_stages_before_augmentation = await editorial_stage_signature()
+    published = await PublicationAugmentationArtifactService(
         uow_factory=uow_factory,
         artifact_store=artifact_store,
-    ).publish_augmented_article(
-        approved.id,
-        approved.version,
-        "human:integration-publisher",
-        result.canonical_sha256,
+    ).publish(
+        base_publication_artifact_id=result.artifact.id,
+        opinion=approved,
+        citation_context=OpinionCitationContext(
+            base_publication_artifact_id=result.artifact.id,
+            base_publication_sha256=result.canonical_sha256,
+            investigation_id=investigation.id,
+            approver_id="human:integration-approver",
+            findings=(),
+            observations=(),
+            tlp_violation=False,
+            do_not_submit=False,
+        ),
+        bridge_drafting_gap_acknowledged=True,
     )
+    assert await editorial_stage_signature() == editorial_stages_before_augmentation
+    augmented_workspace = await workspace_service.snapshot(subject.id)
+    assert augmented_workspace["publication_artifact_id"] == str(published.id)
+    async with uow_factory() as uow:
+        augmented_workspace_record = await uow.editorial_workspace_snapshots.latest_for_run(run.id)
+    assert augmented_workspace_record is not None
+    assert augmented_workspace_record.parent_snapshot_id == corrected_workspace_record.snapshot_id
+    assert augmented_workspace_record.publication_artifact_id == published.id
     augmented_render = await render_service.render_pdf(published.id)
     assert augmented_render.output_blob_id is not None
     augmented_pdf = await artifact_store.read_bytes(augmented_render.output_blob_id)

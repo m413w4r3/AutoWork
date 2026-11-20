@@ -39,6 +39,7 @@ from cti_app.domain.production import ProductionArtifact, ProductionArtifactStag
 from cti_app.domain.production_editorial_enrichment import (
     EDITORIAL_ENRICHMENT_V3_POLICY_VERSION,
     EditorialEnrichmentV1,
+    editorial_enrichment_from_json,
     editorial_enrichment_to_json,
 )
 from cti_app.domain.semantic_annotation import SemanticAnnotationProposalV1, SemanticRole
@@ -307,12 +308,14 @@ async def test_accept_races_real_enrichment_restore_with_one_writer_and_one_snap
             input_hash=canonical_extraction_hash(seeded.extraction),
             canonical_blob_id=extraction_blob[1],
         )
+        parsed_enrichment = editorial_enrichment_from_json(payload)
+        assert isinstance(parsed_enrichment, EditorialEnrichmentV1)
         return (
             run,
             seeded.production_input,
             current,
             payload,
-            current_enrichment,
+            parsed_enrichment,
             references,
             extraction,
             None,

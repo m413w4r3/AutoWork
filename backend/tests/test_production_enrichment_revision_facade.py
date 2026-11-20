@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
@@ -25,6 +25,7 @@ from cti_app.application.production_synthesis_revision import build_targeted_rev
 from cti_app.domain.production import ProductionArtifactStage
 from cti_app.domain.production_editorial_enrichment import (
     EditorialEnrichmentElementKind,
+    EditorialEnrichmentV1,
     EnrichmentPlacementKind,
     EnrichmentPlacementV1,
     editorial_enrichment_from_json,
@@ -208,11 +209,12 @@ async def test_restore_reads_parsed_enrichment_from_canonical_context_payload(
     await _install_stale_enrichment_restore_history(harness)
     load_context = harness.service._load_context
 
-    async def artifact_in_enrichment_slot(**kwargs: Any) -> tuple[Any, ...]:
+    async def assert_parsed_enrichment_context(**kwargs: Any) -> tuple[Any, ...]:
         context = await load_context(**kwargs)
-        return (*context[:4], context[2], *context[5:])
+        assert isinstance(context[4], EditorialEnrichmentV1)
+        return cast(tuple[Any, ...], context)
 
-    harness.service._load_context = artifact_in_enrichment_slot  # type: ignore[method-assign]
+    harness.service._load_context = assert_parsed_enrichment_context  # type: ignore[method-assign]
 
     restored = await harness.service.restore_stale_enrichment_blocks(
         **_stale_enrichment_restore_args(harness),

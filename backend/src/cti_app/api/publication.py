@@ -57,6 +57,9 @@ from cti_app.application.edition_rule_archive import (
 )
 from cti_app.application.identity import IdentityProvider
 from cti_app.application.production_references import load_reference_projection
+from cti_app.application.production_repair_factory import (
+    create_production_repair_materialization_service,
+)
 from cti_app.application.production_repair_payloads import ProductionRepairPayloadResolver
 from cti_app.application.production_repairs import (
     ProductionReferenceRepairError,
@@ -1087,11 +1090,11 @@ def _repair_materialization_service(request: Request) -> ProductionRepairMateria
     configured = getattr(request.app.state, "production_repair_materialization_service", None)
     if configured is not None:
         return cast(ProductionRepairMaterializationService, configured)
-    return ProductionRepairMaterializationService(
+    return create_production_repair_materialization_service(
         request.app.state.uow_factory,
+        artifact_store=getattr(request.app.state, "production_artifact_store", None),
         projection_service=_repair_projection_service(request),
         checkpoint_service=getattr(request.app.state, "production_checkpoint", None),
-        artifact_store=getattr(request.app.state, "production_artifact_store", None),
         diagnostics=getattr(request.app.state, "production_diagnostics", None),
     )
 

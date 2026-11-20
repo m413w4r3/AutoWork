@@ -93,13 +93,15 @@ from cti_app.application.production_artifact_store import ProductionArtifactStor
 from cti_app.application.production_control_view import ProductionControlViewService
 from cti_app.application.production_jobs import ProductionStageChain
 from cti_app.application.production_pacing import ProductionPacingPolicy
+from cti_app.application.production_repair_factory import (
+    create_production_repair_materialization_service,
+)
 from cti_app.application.production_repair_payloads import ProductionRepairPayloadResolver
 from cti_app.application.production_repairs import (
     ProductionReferenceRepairService,
     ProductionRepairAdjudicationService,
     ProductionRepairDecisionService,
     ProductionRepairIssueService,
-    ProductionRepairMaterializationService,
     ProductionRepairProjectionService,
 )
 from cti_app.application.publication_rendering import PublicationRenderService
@@ -558,12 +560,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         uow_factory, production_artifact_store, payload_resolver=repair_payload_resolver
     )
     app.state.production_checkpoint = production_checkpoint
-    app.state.production_repair_materialization_service = ProductionRepairMaterializationService(
-        uow_factory,
-        projection_service=app.state.production_repair_projection_service,
-        checkpoint_service=production_checkpoint,
-        artifact_store=production_artifact_store,
-        diagnostics=production_diagnostics,
+    app.state.production_repair_materialization_service = (
+        create_production_repair_materialization_service(
+            uow_factory,
+            projection_service=app.state.production_repair_projection_service,
+            checkpoint_service=production_checkpoint,
+            artifact_store=production_artifact_store,
+            diagnostics=production_diagnostics,
+        )
     )
     app.state.production_repair_adjudication_service = ProductionRepairAdjudicationService(
         uow_factory,

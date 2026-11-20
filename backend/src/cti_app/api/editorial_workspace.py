@@ -861,6 +861,8 @@ async def accept_editorial_proposal(
             "proposal_registry_lineage_unavailable",
         }:
             response_status = status.HTTP_503_SERVICE_UNAVAILABLE
+        elif code == "adoption_placement_changed":
+            response_status = status.HTTP_409_CONFLICT
         else:
             response_status = status.HTTP_409_CONFLICT
         message = _ERROR_MESSAGES.get(code, "L'acceptation de cette proposition a été refusée.")

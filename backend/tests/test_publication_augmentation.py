@@ -340,7 +340,26 @@ async def test_artifact_service_appends_a_linked_version_without_changing_the_v5
         input_hash="d" * 64,
         canonical_blob_id=synthesis_blob_id,
     )
-    repository = _ArtifactRepository((base_artifact, synthesis_artifact))
+    enrichment_artifact = ProductionArtifact(
+        production_run_id=run_id,
+        subject_id=base.subject_id,
+        stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+        version=2,
+        input_hash="e" * 64,
+        canonical_blob_id=UUID(int=914),
+    )
+    repository = _ArtifactRepository((base_artifact, synthesis_artifact, enrichment_artifact))
+    editorial_identity_before = {
+        stage: tuple(
+            (item.id, item.version, item.input_hash)
+            for item in repository.items
+            if item.stage is stage
+        )
+        for stage in (
+            ProductionArtifactStage.SYNTHESIS,
+            ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+        )
+    }
     investigation = SimpleNamespace(
         production_run_id=run_id,
         subject_id=base.subject_id,
@@ -387,3 +406,14 @@ async def test_artifact_service_appends_a_linked_version_without_changing_the_v5
     assert blobs[base_blob_id] == base_bytes
     assert uow.committed is True
     assert preview.artifact_ids == [publication.id]
+    assert {
+        stage: tuple(
+            (item.id, item.version, item.input_hash)
+            for item in repository.items
+            if item.stage is stage
+        )
+        for stage in (
+            ProductionArtifactStage.SYNTHESIS,
+            ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+        )
+    } == editorial_identity_before

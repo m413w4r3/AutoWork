@@ -71,6 +71,9 @@ from cti_app.application.production_recovery import (
     ProductionRecoveryDisposition,
     ProductionRecoveryPolicyV1,
 )
+from cti_app.application.production_repair_factory import (
+    create_production_repair_materialization_service,
+)
 from cti_app.application.production_repairs import (
     ProductionReferenceRepairError,
     ProductionReferenceRepairService,
@@ -931,23 +934,12 @@ def _production_repair_materialization_service(
     service = getattr(request.app.state, "production_repair_materialization_service", None)
     if service is None:
         artifact_store = getattr(request.app.state, "production_artifact_store", None)
-        revision_effects = (
-            EditorialRevisionEffects(
-                workspace_service=EditorialWorkspaceService(
-                    uow_factory=request.app.state.uow_factory,
-                    artifact_store=artifact_store,
-                )
-            )
-            if artifact_store is not None
-            else None
-        )
-        service = ProductionRepairMaterializationService(
+        service = create_production_repair_materialization_service(
             request.app.state.uow_factory,
+            artifact_store=artifact_store,
             projection_service=_production_repair_projection_service(request),
             checkpoint_service=getattr(request.app.state, "production_checkpoint", None),
-            artifact_store=artifact_store,
             diagnostics=getattr(request.app.state, "production_diagnostics", None),
-            revision_effects=revision_effects,
         )
     return cast(ProductionRepairMaterializationService, service)
 

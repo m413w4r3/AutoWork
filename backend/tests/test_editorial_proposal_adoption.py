@@ -961,8 +961,10 @@ async def test_adopt_cas_appends_artifact_lineage_registry_and_outbox_atomically
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("placement_changed", [False, True])
 async def test_simple_enrichment_table_adoption_uses_parsed_base_and_production_candidate_core(
     monkeypatch: pytest.MonkeyPatch,
+    placement_changed: bool,
 ) -> None:
     from cti_app.application.editorial_proposal_adoption_inputs import (
         ProductionEditorialProposalAdoptionInputs,
@@ -971,6 +973,8 @@ async def test_simple_enrichment_table_adoption_uses_parsed_base_and_production_
     from cti_app.application.editorial_workspace.registry import resolve_occurrence
     from cti_app.application.production_editorial_enrichment import (
         EditorialEnrichmentV1,
+        EnrichmentPlacementKind,
+        EnrichmentPlacementProposalV1,
         build_editorial_figure_catalog,
         parse_editorial_enrichment_proposal_wire,
     )
@@ -1056,6 +1060,17 @@ async def test_simple_enrichment_table_adoption_uses_parsed_base_and_production_
     )
     resolution = resolve_occurrence(snapshot, occurrence_id)
     workspace = _MemoryWorkspace(resolution)
+    enrichment_patch = parsed_patch.proposal
+    if placement_changed:
+        changed_table = enrichment_patch.tables[0].model_copy(
+            update={
+                "placement": EnrichmentPlacementProposalV1(
+                    kind=EnrichmentPlacementKind.AFTER_SECTION,
+                    section_index=0,
+                )
+            }
+        )
+        enrichment_patch = enrichment_patch.model_copy(update={"tables": (changed_table,)})
     patch_payload = {
         "schema_version": "editorial-patch-v1",
         "operation": TargetedEditorialRevisionOperation.REWRITE_TABLE.value,
@@ -1063,7 +1078,7 @@ async def test_simple_enrichment_table_adoption_uses_parsed_base_and_production_
         "target_id": target_id,
         "occurrence_id": str(occurrence_id),
         "before_hash": before_hash,
-        "enrichment_patch": parsed_patch.proposal.model_dump(mode="json"),
+        "enrichment_patch": enrichment_patch.model_dump(mode="json"),
         "rationale": "Synthetic table replacement.",
     }
     patch_bytes = ProductionArtifactStore.canonical_json_bytes(patch_payload)
@@ -1218,6 +1233,19 @@ async def test_simple_enrichment_table_adoption_uses_parsed_base_and_production_
         enrichment_writer=cast(EditorialEnrichmentService, object()),
     )
 
+    artifact_ids_before = set(fixture.factory.state.artifacts)
+    snapshot_ids_before = set(fixture.factory.state.snapshots)
+    if placement_changed:
+        with pytest.raises(EditorialProposalAdoptionError) as rejected:
+            await fixture.adopt(proposal)
+        assert rejected.value.code == "adoption_placement_changed"
+        assert fixture.factory.commits == 0
+        assert set(fixture.factory.state.artifacts) == artifact_ids_before
+        assert set(fixture.factory.state.snapshots) == snapshot_ids_before
+        assert fixture.blob_store.new_objects == 0
+        assert fixture.factory.state.proposals[proposal.id].state is EditorialProposalState.PROPOSED
+        return
+
     result = await fixture.adopt(proposal)
 
     assert result.proposal.state is EditorialProposalState.ACCEPTED
@@ -1230,6 +1258,9 @@ async def test_simple_enrichment_table_adoption_uses_parsed_base_and_production_
         ]
     )
     assert adopted_payload["tables"][0]["title"] == validated_patch.tables[0].title
+    assert (
+        adopted_payload["tables"][0]["placement"] == harness.base_payload["tables"][0]["placement"]
+    )
     assert result.snapshot.enrichment_version == 2
 
 
@@ -1537,3 +1568,48 @@ async def test_accept_route_maps_candidate_blob_unavailable_to_static_503(
         "code": "proposal_candidate_blob_unavailable",
         "message": "L'acceptation des propositions est temporairement indisponible.",
     }
+
+
+@pytest.mark.asyncio
+async def test_accept_route_maps_rewrite_placement_change_to_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(service_type=EditorialProposalAdoptionService)
+
+    class _PlacementChangedService:
+        async def adopt(self, *_args: Any, **_kwargs: Any) -> None:
+            raise EditorialProposalAdoptionError("adoption_placement_changed")
+
+    monkeypatch.setattr(
+        editorial_workspace_api,
+        "get_settings",
+        lambda: Settings(_env_file=None, editorial_proposal_accept_enabled=True),
+    )
+    monkeypatch.setattr(
+        editorial_workspace_api,
+        "_proposal_adoption_service",
+        lambda _request: _PlacementChangedService(),
+    )
+
+    async def current_actor(_request: Any) -> UUID:
+        return fixture.actor_id
+
+    monkeypatch.setattr(editorial_workspace_api, "_thread_actor_id", current_actor)
+    app = FastAPI()
+    app.include_router(editorial_workspace_api.router)
+    path = (
+        f"/api/subjects/{fixture.proposal.subject_id}/editor/threads/"
+        f"{fixture.occurrence_id}/proposals/{fixture.proposal.id}/accept"
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
+    ) as client:
+        response = await client.post(
+            path,
+            headers={"Idempotency-Key": f"accept_{uuid4().hex}"},
+            json={"expected_state_version": 1, "patch_sha256": fixture.patch_sha256},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "adoption_placement_changed"
