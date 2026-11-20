@@ -10,9 +10,9 @@ Document de conception pour ARTICLE et BRIEF. Les opérations visibles dépenden
 4. Les brouillons et propositions ne changent pas le canonique avant validation humaine ; aucun parcours ne perd son contexte.
 5. Le rendu du document et du PDF doit refléter les mêmes contenus et placements confirmés.
 
-## 2. Cadres et responsive
+## 2. Cadres desktop
 
-Les dimensions ci-dessous sont des largeurs de colonnes indicatives en pixels CSS ; les gouttières s’ajoutent. La zone de lecture du document reste entre 680 et 860 px quand l’espace le permet.
+Décision utilisateur : interface desktop-only, avec une largeur de page prise en charge à partir de 1024 px. Les dimensions ci-dessous sont des largeurs de colonnes indicatives en pixels CSS ; les gouttières s’ajoutent. La zone de lecture du document reste entre 680 et 860 px quand l’espace le permet. À 1024 px et au-delà, la page ne présente aucun scroll horizontal.
 
 ### ≥ 1440 px — trois colonnes
 
@@ -43,36 +43,6 @@ Le plan contient titre, chapeau, sections hiérarchiques, recherche de titres et
 ~~~
 
 Le plan se replie en rail ou s’ouvre en panneau. L’inspecteur reste latéral ; le texte conserve une largeur lisible.
-
-### < 1024 px — document prioritaire
-
-~~~text
-┌─────────────────────────────────┐
-│ Retour · Sujet · vN · État · ⋯  │
-│ Plan     DOCUMENT      Inspecteur│
-├─────────────────────────────────┤
-│ DOCUMENT pleine largeur         │
-│ bloc sélectionné                │
-│                    [Inspecteur] │
-└─────────────────────────────────┘
-~~~
-
-Le document occupe la largeur disponible. Plan et inspecteur s’ouvrent par commandes explicites ; l’inspecteur apparaît en panneau latéral superposé sans redimensionner ni perdre la position du document. Un tableau large défile dans son propre conteneur, jamais sur toute la page.
-
-### < 768 px — inspecteur en feuille plein écran
-
-~~~text
-┌──────────────────────────────┐
-│ ‹ Retour au document         │
-│ Discussion sur : [cible]     │
-│ onglets                       │
-│ fil, comparaison ou sources   │
-│                               │
-│ composer ancré en bas         │
-└──────────────────────────────┘
-~~~
-
-La feuille remplace temporairement le document à l’écran. « Retour au document » est toujours visible, restaure le bloc et le défilement d’origine, et n’abandonne aucun brouillon. Il n’y a pas de défilement horizontal de page.
 
 ## 3. Barre supérieure et états document
 
@@ -171,7 +141,7 @@ Les erreurs sont en français, associées à un code stable côté serveur. Les 
 
 ## 6. Parcours clés et budget de clics
 
-Budget = nombre maximal de clics/taps sur les commandes ; saisie, chargement et réponse asynchrone ne comptent pas. Un clic sur une action de comparaison ou de décision compte. Les raccourcis clavier restent équivalents.
+Budget = nombre maximal de clics sur les commandes ; saisie, chargement et réponse asynchrone ne comptent pas. Un clic sur une action de comparaison ou de décision compte. Les raccourcis clavier restent équivalents.
 
 1. **Renommer le titre avec Bridge — budget 5.** Cliquer le titre → « Demander un autre titre »/« Discuter » → saisir la consigne → « Générer une proposition » → lire « Titre actuel / Titre proposé / Justification » en Comparaison → « Accepter ». Jusqu’à confirmation, le titre canonique ne change pas ; après acceptation, le titre et la version affichés s’actualisent sans quitter le document.
 2. **Réécrire un paragraphe en trois tours — budget 9.** Cliquer le paragraphe → « Discuter » → consigne et « Générer une proposition » (tour 1) → « Demander une variante », saisir « Plus court » et générer (tour 2) → choisir la suggestion « Je préfère la deuxième » qui référence explicitement la deuxième proposition affichée, puis générer (tour 3) → comparer → accepter la proposition voulue. L’ordinal est lié à son UUID/segments par l’interface ; il n’est jamais envoyé seul. Le fil reste ouvert et le bloc conserve son identité.
@@ -181,11 +151,10 @@ Budget = nombre maximal de clics/taps sur les commandes ; saisie, chargement et 
 6. **Galerie et sélection multiple — budget 6.** Sélectionner l’emplacement → « Ajouter après » → « Image issue des sources » → filtrer/rechercher → cocher deux figures éligibles → vérifier « 2 images sélectionnées », leur légende, ordre et emplacement → « Intégrer les images sélectionnées ». L’aperçu détaillé n’altère pas la sélection. Aucun appel modèle ; provenance visible après insertion. Pour BRIEF, le compteur bloque tout choix au-delà de trois figures.
 7. **Conflit entre deux sessions — budget 7.** Session A : sélectionner le bloc, générer une proposition et la laisser ouverte. Session B : sélectionner le même bloc, modifier puis enregistrer. Revenir à A et cliquer « Accepter » : afficher « Conflit », refuser l’adoption périmée et préserver le contenu de B ; actualiser, comparer les versions et créer une nouvelle proposition si souhaité. Aucun écrasement silencieux.
 8. **PDF obsolète puis régénération — budget 3.** Après une modification confirmée, cliquer « Voir le PDF » → constater l’état « PDF obsolète » et la version concernée → cliquer « Régénérer l’aperçu » → quand l’état est à jour, ouvrir le PDF. Aucune repin automatique d’édition.
-9. **Parcours mobile — budget 5.** À moins de 768 px, sélectionner un paragraphe → « Discuter » ouvre la feuille plein écran → saisir la consigne et « Générer une proposition » → comparer/accepter → « Retour au document ». La feuille restitue le paragraphe sélectionné et sa position ; composer et boutons restent visibles sans scroll horizontal.
 
 ## 7. Comparaison et différences
 
-- « Comparaison » montre « Version actuelle » et « Proposition » côte à côte sur grand écran, empilées sur écran étroit. Le paragraphe complet reste lisible ; la justification et les preuves sont accessibles près de la proposition.
+- « Comparaison » montre « Version actuelle » et « Proposition » côte à côte sur grand écran; dans l’implantation desktop intermédiaire, les panneaux peuvent s’empiler si la largeur restante l’exige. Le paragraphe complet reste lisible ; la justification et les preuves sont accessibles près de la proposition.
 - « Différences » affiche ajouts et suppressions dans le texte, au niveau du paragraphe ; jamais un diff JSON. Marqueurs, libellés (« Ajouté », « Supprimé ») et couleur distinguent les changements, même en monochrome ou lecteur d’écran.
 - Les deux vues comparent la même cible et la même proposition sélectionnée. Les variantes précédentes sont navigables dans le fil ; choisir « la deuxième » rattache explicitement la référence à la proposition correspondante.
 - Les commandes « Accepter », « Rejeter », « Demander une variante » et « Consulter les preuves » restent visibles et nommées. Accepter ne rappelle pas le modèle ; une proposition stale ne peut pas être acceptée.
@@ -201,11 +170,11 @@ L’aperçu détaillé présente image, source exacte, contexte textuel, page/se
 ## 9. Clavier et accessibilité
 
 - **Entrée / Maj+Entrée :** envoyer / saut de ligne dans le composer. **Ctrl/Cmd+Entrée :** soumettre une action seulement si l’action courante et son raccourci sont annoncés. **Ctrl/Cmd+S :** enregistrer l’édition manuelle. Ne pas intercepter les raccourcis natifs des champs.
-- **Échap :** fermer menu, feuille ou éditeur ; demander confirmation si la fermeture abandonnerait une saisie. **Tab / Maj+Tab :** ordre logique ; flèches dans le plan pour parcourir les entrées. Chaque action est accessible sans survol.
-- Après acceptation, laisser le focus sur le bloc mis à jour (ou son titre) et garder la sélection. À la fermeture d’une feuille/dialogue, rendre le focus au contrôle qui l’a ouvert. Après erreur, placer/annoncer le focus au message ou au premier contrôle utile sans sauter la page en haut.
+- **Échap :** fermer menu, dialogue ou éditeur ; demander confirmation si la fermeture abandonnerait une saisie. **Tab / Maj+Tab :** ordre logique ; flèches dans le plan pour parcourir les entrées. Chaque action est accessible sans survol.
+- Après acceptation, laisser le focus sur le bloc mis à jour (ou son titre) et garder la sélection. À la fermeture d’un dialogue, rendre le focus au contrôle qui l’a ouvert. Après erreur, placer/annoncer le focus au message ou au premier contrôle utile sans sauter la page en haut.
 - Annoncer les changements d’état et réponses asynchrones dans une région `aria-live="polite"`; réserver `role="alert"` aux erreurs bloquantes. Ne pas annoncer chaque poll ni déplacer le focus à l’arrivée d’une réponse.
-- Cibles tactiles d’au moins 44 × 44 px ; focus visible ; noms accessibles pour icônes ; structure de titres, libellés et tables sémantique ; contraste WCAG 2.2 AA ; ajouts/suppressions différenciés sans dépendre de la couleur.
-- Respecter `prefers-reduced-motion`; transitions discrètes, pas de défilement brutal vers une réponse. Aucun défilement horizontal de page sur mobile.
+- Focus visible ; noms accessibles pour icônes ; structure de titres, libellés et tables sémantique ; contraste WCAG 2.2 AA ; ajouts/suppressions différenciés sans dépendre de la couleur.
+- Respecter `prefers-reduced-motion`; transitions discrètes, pas de défilement brutal vers une réponse. Aucun scroll horizontal de page à partir de 1024 px.
 
 ## 10. Hiérarchie visuelle
 
@@ -235,5 +204,5 @@ Palette sobre de la feuille de style : texte #17211d, fond #eef2ed, action princ
 - **UX-16** — PDF obsolète : version périmée indiquée, régénération accessible, puis aperçu à jour consultable.
 - **UX-17** — Une version de publication devenue périmée est signalée ; aucune repin automatique d’édition n’a lieu.
 - **UX-18** — Clavier : sélectionner, ouvrir les onglets, modifier, comparer, décider et fermer sans souris ; focus restauré.
-- **UX-19** — Mobile : feuille inspecteur plein écran, retour au bloc et aucune barre de défilement horizontale de page.
+- **UX-19** — Abandonné (décision utilisateur : desktop-only). Identifiant conservé pour l’historique; aucune exigence ni scénario mobile.
 - **UX-20** — Ancienne version : affichage historique explicite en lecture seule ; aucune migration implicite ni réécriture de blob.

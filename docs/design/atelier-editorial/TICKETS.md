@@ -1,6 +1,6 @@
 # Mission 22 — atelier éditorial : tickets M1–M8
 
-**Base de reprise:** `8e556a9857282d7d42027ef64b6b3dafe2d0ce15`. **État:** proposition locale de DAG; M1 et M2 sont intégrés à cette base, M3–M8 restent à exécuter/revoir; aucun ticket tracker publié. Les contrats restent dans MISSION-SPEC.md, DECISIONS.md et ADR-0010; les choix d’architecture ci-dessous pointent vers les sections d’ARCHITECTURE.md au lieu de les recopier.
+**Base de reprise:** `887445f0`. **État:** proposition locale de DAG; M1, M2 et le cutover M3 jusqu’à T-M3-15d sont intégrés à cette base. T-M3-16/17 et M4–M8 restent à exécuter/revoir; aucun ticket tracker publié. Les contrats restent dans MISSION-SPEC.md, DECISIONS.md et ADR-0010; les choix d’architecture ci-dessous pointent vers les sections d’ARCHITECTURE.md au lieu de les recopier.
 
 **Repères de revue:** S = reviewer Standards; P = reviewer Spec/UX; G = reviewer sécurité-provenance. Tous les tickets requièrent S et P; G est requis dès qu’un ticket touche identité, données persistées, Bridge, preuves, fichiers, publication ou versions canoniques. Les tests restent synthétiques/offline.
 
@@ -12,24 +12,24 @@
 
     M1  T-M1-01 → (T-M1-02 ∥ T-M1-03) → T-M1-04 → T-M1-05
     M2  T-M1-05 → T-M2-06 → T-M2-07 → T-M2-08 → T-M2-09
-    M3  T-M2-09 → (T-M3-10 ∥ T-M3-11) → T-M3-12 → T-M3-13 → T-M3-14 → T-M3-15 → T-M3-16 → T-M3-17
+    M3  T-M2-09 → (T-M3-10 ∥ T-M3-11) → T-M3-12 → T-M3-13 → T-M3-14a → T-M3-14 → (T-M3-15b ∥ T-M3-15c) → T-M3-15d → T-M3-16 → T-M3-17
     M4  T-M3-17 → T-M4-18 → T-M4-19 → T-M4-20
     M5  T-M4-20 → T-M5-21 → T-M5-22 → T-M5-23
     M6  T-M5-23 → T-M6-24 → T-M6-25
     M7  T-M6-25 → T-M7-26 → T-M7-27 → T-M7-28 → T-M7-29
     M8  T-M7-29 → (T-M8-30 ∥ T-M8-31) → T-M8-32
 
-**Chemin critique:** T-M1-01 → T-M1-02/T-M1-03 (les deux bloquent T-M1-04) → T-M1-05 → T-M2-06…09 → T-M3-10/T-M3-11 (les deux bloquent T-M3-12) → T-M3-13…17 → T-M4-18…20 → T-M5-21…23 → T-M6-24…25 → T-M7-26…29 → T-M8-30/T-M8-31 → T-M8-32.
+**Chemin critique:** T-M1-01 → T-M1-02/T-M1-03 (les deux bloquent T-M1-04) → T-M1-05 → T-M2-06…09 → T-M3-10/T-M3-11 (les deux bloquent T-M3-12) → T-M3-13 → T-M3-14a → T-M3-14 → (T-M3-15b ∥ T-M3-15c) → T-M3-15d → T-M3-16 → T-M3-17 → T-M4-18…20 → T-M5-21…23 → T-M6-24…25 → T-M7-26…29 → T-M8-30/T-M8-31 → T-M8-32.
 
-**Frontières parallèles autorisées:** M1: T-M1-02 ∥ T-M1-03; M3: T-M3-10 ∥ T-M3-11; M8: T-M8-30 ∥ T-M8-31. Les lots restent ordonnés M1→M8 selon DECISIONS D6. Dans tout autre cas, suivre Depends-on; l’intersection de chemins autorisés interdit le parallélisme même si deux branches semblent indépendantes. App.tsx est réservé à T-M1-05; api/main.py à T-M1-02 puis n’est plus modifié; api/editorial_workspace.py est partagé et ses tickets sont séquencés ci-dessous; ProductionArtifactView.tsx est réservé à T-M1-03; les deux services de révision ont chacun un ticket propriétaire en M3 puis un en M8.
+**Frontières parallèles autorisées:** M1: T-M1-02 ∥ T-M1-03; M3: T-M3-10 ∥ T-M3-11 et T-M3-15b ∥ T-M3-15c (chemins disjoints); M8: T-M8-30 ∥ T-M8-31. Les lots restent ordonnés M1→M8 selon DECISIONS D6. Dans tout autre cas, suivre Depends-on; l’intersection de chemins autorisés interdit le parallélisme même si deux branches semblent indépendantes. App.tsx est réservé à T-M1-05; api/main.py à T-M1-02 puis n’est plus modifié; api/editorial_workspace.py est partagé et ses tickets sont séquencés ci-dessous; ProductionArtifactView.tsx est réservé à T-M1-03; les deux services de révision ont chacun un ticket propriétaire en M3 puis un en M8.
 
 **Pointeurs architecture par lot (les tickets héritent de ces sections):** M1: ARCH §1–4, §6–8; M2: §2–6, §9–10; M3: §1–6, §8–9; M4: §2–6, §9–10; M5: §2–8; M6: §2–5, §9; M7: §5–8; M8: §1, §5–10. Les critères ci-dessous ajoutent des gates d’exécution et de test aux contrats de ces sections.
 
 **Décisions de livraison additionnelles:** appliquer DECISIONS D7 en plus de D1–D6; les garde-fous, l’inventaire/cutover et les oracles ci-dessous sont obligatoires avant les décisions canoniques.
 
-**Règle Alembic — D8/D8b, tête unique:** `0001_baseline` reste gelée; toute DDL est additive après la tête intégrée. D8 autorise tout ticket DDL à modifier exactement, en plus de ses chemins propres: `backend/migrations/env.py` (import du nouveau module de modèles seulement), `backend/tests/integration/test_migrations.py` (assertions de tête et liste des modules de modèles seulement), `backend/tests/test_alembic_chain.py` (tête et chaîne seulement), `backend/tests/test_architecture_production_lineage.py` (liste des fichiers de migration seulement). D8b précise que `env.py` peut aussi exclure la nouvelle table de la métadonnée baseline gelée (`frozenset` des tables post-baseline et condition de `_metadata_for_frozen_baseline`), et que `test_migrations.py` peut ajouter les attentes de tables, triggers et fonctions du nouveau DDL. Le test d’intégration éditorial doit pouvoir faire `alembic upgrade head` sur base vide; oracle: `make test-integration INTEGRATION_TEST_PATH=tests/integration/test_migrations.py` et le test éditorial concerné. Chaque migration garde son préflight et garde de downgrade, avec vérification des états absent/exact/partiel.
+**Règle Alembic — D8/D8b, tête unique:** `0001_baseline` reste gelée; toute DDL est additive après la tête intégrée. D8 autorise chaque ticket DDL à modifier, en plus de ses chemins propres, uniquement `backend/migrations/env.py` (import du nouveau module de modèles), `backend/tests/integration/test_migrations.py` (tête et modules de modèles), `backend/tests/test_alembic_chain.py` (tête et chaîne) et `backend/tests/test_architecture_production_lineage.py` (liste des fichiers de migration). D8b autorise aussi dans `env.py` l’exclusion de la nouvelle table de la métadonnée baseline gelée (`frozenset` post-baseline et condition de `_metadata_for_frozen_baseline`) et dans `test_migrations.py` les attentes de tables, triggers et fonctions ajoutés. Toute nouvelle migration doit réussir `alembic upgrade head` sur base vide; oracle: `make test-integration INTEGRATION_TEST_PATH=tests/integration/test_migrations.py` plus le test éditorial concerné. Préflight: objet absent ou exactement conforme; état partiel/non conforme: échec avant DDL. Conserver les gardes de downgrade selon ADR-0007.
 
-**Tête intégrée à la base de reprise:** `0011_editorial_workspace_snapshots` (`backend/migrations/versions/0011_editorial_workspace.py`) → `0012_editorial_threads` (`0012_editorial_threads.py`) → `0013_bridge_generation_slots` (`0013_bridge_generation_slots.py`). Les tickets M1-02, M2-06 et M2-09 sont déjà intégrés. Le prochain ticket DDL se base sur cette tête réelle. Les worktrees n’intègrent jamais des branches Alembic concurrentes; à l’intégration, l’orchestrateur réattribue les revision IDs et chaque `down_revision` à la tête unique nouvellement intégrée.
+**Chaîne intégrée à la base de reprise:** `0011_editorial_workspace_snapshots` (`backend/migrations/versions/0011_editorial_workspace.py`) → `0012_editorial_threads` (`backend/migrations/versions/0012_editorial_threads.py`) → `0013_bridge_generation_slots` (`backend/migrations/versions/0013_bridge_generation_slots.py`) → `0014_editorial_proposals` (`backend/migrations/versions/0014_editorial_proposals.py`) → `0015_editorial_proposal_impacts` (`backend/migrations/versions/0015_editorial_proposal_impacts.py`). La tête réelle est 0015; les prochaines DDL commencent en 0016 (notamment `editorial_drafts`) et restent sérialisées sur une tête unique. Les worktrees n’intègrent jamais des branches Alembic concurrentes; à l’intégration, l’orchestrateur réattribue les revision IDs et chaque `down_revision` à la tête unique nouvellement intégrée.
 
 ## M1 — socle
 
@@ -47,7 +47,7 @@
 ### T-M1-02 — Snapshot et sélection d’occurrence
 - **Comportement:** cliquer un paragraphe affiche l’occurrence exacte, même si son texte est dupliqué; recharger reconstruit la même identité et l’état ambigu reste en lecture seule.
 - **Depends-on / parallélisme:** T-M1-01; parallèle avec T-M1-03, chemins disjoints.
-- **Chemins autorisés:** backend/migrations/versions/<revision>_editorial_workspace.py; backend/src/cti_app/domain/editorial_workspace.py; backend/src/cti_app/application/editorial_workspace/{__init__.py,service.py,registry.py}; backend/src/cti_app/infrastructure/database/models/editorial_workspace.py; backend/src/cti_app/infrastructure/database/repositories/editorial_workspace.py; backend/src/cti_app/api/editorial_workspace.py; backend/src/cti_app/api/main.py; backend/tests/test_editorial_workspace_snapshot.py; backend/tests/integration/editorial/test_workspace_snapshot_postgres.py; frontend/src/api/editorialWorkspace.ts; frontend/src/features/editorial-workspace/{EditorialWorkspacePage.tsx,EditorialDocument.tsx,EditorialDocument.test.tsx}.
+- **Chemins autorisés:** backend/migrations/versions/0011_editorial_workspace.py; backend/src/cti_app/domain/editorial_workspace.py; backend/src/cti_app/application/editorial_workspace/{__init__.py,service.py,registry.py}; backend/src/cti_app/infrastructure/database/models/editorial_workspace.py; backend/src/cti_app/infrastructure/database/repositories/editorial_workspace.py; backend/src/cti_app/api/editorial_workspace.py; backend/src/cti_app/api/main.py; backend/tests/test_editorial_workspace_snapshot.py; backend/tests/integration/editorial/test_workspace_snapshot_postgres.py; frontend/src/api/editorialWorkspace.ts; frontend/src/features/editorial-workspace/{EditorialWorkspacePage.tsx,EditorialDocument.tsx,EditorialDocument.test.tsx}.
 - **Tests rouges d’abord:** test_legacy_bootstrap_is_stable_and_duplicate_ids_differ (UUIDv5 stable, deux IDs); test_registry_contains_no_text_or_evidence (registre limité à structure/pins); test_snapshot_postgres_is_unique_append_only (conflit unique et refus update/delete); test_click_selects_server_block_id (UI envoie block_id reçu).
 - **Acceptation:** DTO plat reprend exactement subject_id, production_run_id, publication_kind, synthesis_artifact_id/version/canonical_sha256, enrichment_artifact_id/version, publication_artifact_id/version, pipeline_generation, blocks, enrichments, document_outline, capabilities, preview_status et snapshot_id opaque; aucun pins/outline parallèle. GET/resolve est pin-scoped; bootstrap idempotent sous concurrence; projection lit les blobs exacts; ambiguïté bloque l’édition.
 - **UX:** UX-01, UX-07.
@@ -83,8 +83,8 @@
 - **Chemins autorisés:** frontend/src/App.tsx; frontend/src/features/editorial-workspace/{EditorialWorkspacePage.tsx,EditorialWorkspaceLayout.tsx,EditorialOutline.tsx,EditorialInspector.tsx,EditorialEntryPoints.test.tsx}; frontend/src/components/{SubjectWorkbench.tsx,SubjectProduction.tsx,SubjectWorkbench.test.tsx,SubjectProduction.test.tsx}; frontend/src/features/subject/ArticleTab.tsx; frontend/src/features/edition-workflow/{ProductionConsole.tsx,ReviewItemCard.tsx,EditionPreviewPanel.tsx,EditionPreviewPanel.test.tsx}; frontend/e2e/editorial/{editor-route-auth.spec.ts,editor-entry-points.spec.ts}.
 - **Points d’entrée effectivement câblés à la base:** `frontend/src/components/SubjectWorkbench.tsx` (détail sujet), `frontend/src/features/subject/ArticleTab.tsx`, `frontend/src/components/SubjectProduction.tsx`, `frontend/src/features/edition-workflow/ReviewItemCard.tsx` et `ProductionConsole.tsx`, `frontend/src/features/edition-workflow/EditionPreviewPanel.tsx` (consultation article/brève); la route est dans `frontend/src/App.tsx`.
 - **Tests rouges d’abord:** test_editor_route_precedes_subject_detail_route (navigation directe/back); test_all_five_entry_surfaces_use_editorial_label_and_subject_id; test_forbidden_or_missing_subject_shows_safe_route_state; test_layout_keeps_selected_block_context (plan/inspecteur ne perd pas le bloc).
-- **Acceptation:** route placée avant détail sujet; responsive ≥1440/1024–1439/<1024 et feuille <768 sans scroll horizontal; pas de formulaire de cibles séparé; endpoint revalide l’autorisation sujet/run.
-- **UX:** UX-01, UX-14, UX-19.
+- **Acceptation:** route placée avant détail sujet; à partir de 1024 px, aucun scroll horizontal de page; pas de formulaire de cibles séparé; endpoint revalide l’autorisation sujet/run.
+- **UX:** UX-01, UX-14.
 - **Reviewers:** Standards + Spec + sécurité-provenance.
 - **Stop:** route capturée par le détail sujet ou sélection traduite en hash/ordinal client.
 - **Taille:** M.
@@ -96,7 +96,7 @@
 ### T-M2-06 — Fil append-only par occurrence
 - **Comportement:** sélectionner un bloc ouvre son fil ou l’état « unopened »; l’historique suit seulement une continuité prouvée et ne mélange pas deux occurrences identiques.
 - **Depends-on / parallélisme:** T-M1-05; DDL réservée à ce ticket.
-- **Chemins autorisés:** backend/migrations/versions/<revision>_editorial_threads.py; backend/src/cti_app/domain/editorial_thread.py; backend/src/cti_app/infrastructure/database/models/editorial_threads.py; backend/src/cti_app/infrastructure/database/repositories/editorial_threads.py; backend/src/cti_app/application/{editorial_threads.py,editorial_thread_common.py,editorial_thread_types.py,editorial_thread_sessions.py}; backend/src/cti_app/api/editorial_workspace.py; backend/tests/test_editorial_threads.py; backend/tests/integration/editorial/test_threads_postgres.py; frontend/src/features/editorial-workspace/{EditorialConversation.tsx,EditorialConversation.test.tsx,useEditorialThreadLifecycle.ts}.
+- **Chemins autorisés:** backend/migrations/versions/0012_editorial_threads.py; backend/src/cti_app/domain/editorial_thread.py; backend/src/cti_app/infrastructure/database/models/editorial_threads.py; backend/src/cti_app/infrastructure/database/repositories/editorial_threads.py; backend/src/cti_app/application/{editorial_threads.py,editorial_thread_common.py,editorial_thread_types.py,editorial_thread_sessions.py}; backend/src/cti_app/api/editorial_workspace.py; backend/tests/test_editorial_threads.py; backend/tests/integration/editorial/test_threads_postgres.py; frontend/src/features/editorial-workspace/{EditorialConversation.tsx,EditorialConversation.test.tsx,useEditorialThreadLifecycle.ts}.
 - **Tests rouges d’abord:** test_get_unopened_thread_creates_no_row; test_thread_origin_is_immutable_and_ambiguous_lineage_stales; test_thread_events_append_only_and_sequence_unique; test_thread_bodies_and_model_turns_use_subject_acl.
 - **Acceptation:** événement de fil référence proposal_id sans proposition dupliquée; ModelConversation reste privé; objectif/purpose editorial est typé et non-preuve; événements ordonnés/idempotents. Les corps de fil suivent l’ACL sujet et sont gardés comme archive éditoriale (pas de purge automatique); les tours ModelConversation suivent l’ACL sujet; texte absent des logs/traces/télémétrie.
 - **UX:** UX-01, UX-03, UX-07, UX-15.
@@ -142,7 +142,7 @@
 ### T-M3-10 — Expand synthesis: façade vers résolution/validation
 - **Comportement:** les révisions synthesis historiques gardent les mêmes résultats pendant qu’un chemin partagé expose résolution et validation testables par l’atelier.
 - **Depends-on / parallélisme:** T-M2-09; parallèle avec T-M3-11 sur fichiers disjoints.
-- **Chemins autorisés:** backend/src/cti_app/application/production_synthesis_revision.py; backend/src/cti_app/application/editorial_synthesis/{targets.py,patch_validation.py}; backend/tests/test_production_synthesis_revision_facade.py.
+- **Chemins autorisés:** backend/src/cti_app/application/production_synthesis_revision.py; backend/src/cti_app/application/editorial_synthesis/{candidate.py,targets.py,patch_validation.py}; backend/tests/test_production_synthesis_revision_facade.py.
 - **Tests rouges d’abord:** test_synthesis_facade_characterization_keeps_legacy_target_and_cas; test_synthesis_target_resolution_uses_registry_occurrence.
 - **Acceptation:** déplacer des responsabilités ciblées vers modules profonds; façade publique conservée; tests de caractérisation sur replay/hash/erreurs passent à l’intégration.
 - **UX:** UX-02, UX-04, UX-07, UX-08 via contrat partagé.
@@ -153,7 +153,7 @@
 ### T-M3-11 — Expand enrichment: façade vers patch/placement
 - **Comportement:** les révisions d’enrichissement historiques gardent leurs fences et leur rendu pendant que l’atelier utilise un validateur dédié.
 - **Depends-on / parallélisme:** T-M2-09; parallèle avec T-M3-10, sans fichier/test partagé.
-- **Chemins autorisés:** backend/src/cti_app/application/production_enrichment_revision.py; backend/src/cti_app/application/editorial_enrichment_revision.py; backend/tests/test_production_enrichment_revision_facade.py.
+- **Chemins autorisés:** backend/src/cti_app/application/production_enrichment_revision.py; backend/src/cti_app/application/{editorial_enrichment_candidate.py,editorial_enrichment_revision.py}; backend/tests/test_production_enrichment_revision_facade.py.
 - **Tests rouges d’abord:** test_enrichment_facade_characterization_keeps_replay_and_fences; test_enrichment_validation_rejects_unsupported_patch.
 - **Acceptation:** façade garde les API existantes; validation/target/lineage sortis sans déplacement monolithique; lecteurs V8 inchangés.
 - **UX:** UX-09, UX-10, UX-12 via contrats partagés.
@@ -163,8 +163,8 @@
 
 ### T-M3-12 — Préparer et consulter une proposition persistante
 - **Comportement:** le résultat Bridge validé devient une carte persistante consultable; le document canonique ne change pas et l’action Bridge « Proposer » reste masquée jusqu’à T-M3-16.
-- **Depends-on / parallélisme:** T-M3-10 et T-M3-11; DDL: proposals/model_runs/events.
-- **Chemins autorisés:** backend/migrations/versions/<revision>_editorial_proposals.py; backend/src/cti_app/domain/editorial_proposal.py; backend/src/cti_app/application/editorial_proposals.py; backend/src/cti_app/infrastructure/database/models/editorial_proposals.py; backend/src/cti_app/infrastructure/database/repositories/editorial_proposals.py; backend/src/cti_app/api/editorial_workspace.py; backend/tests/test_editorial_proposal_preparation.py; backend/tests/integration/editorial/test_proposal_persistence_postgres.py; frontend/src/features/editorial-workspace/{EditorialProposalCard.tsx,EditorialProposalCard.test.tsx,EditorialConversation.tsx}.
+- **Depends-on / parallélisme:** T-M3-10 et T-M3-11; DDL intégrée en 0014: propositions, ModelRuns et événements.
+- **Chemins autorisés:** backend/migrations/versions/0014_editorial_proposals.py; backend/src/cti_app/domain/editorial_proposal.py; backend/src/cti_app/application/editorial_proposals.py; backend/src/cti_app/infrastructure/database/models/editorial_proposals.py; backend/src/cti_app/infrastructure/database/repositories/editorial_proposals.py; backend/src/cti_app/api/editorial_workspace.py; backend/tests/test_editorial_proposal_preparation.py; backend/tests/integration/editorial/test_proposal_persistence_postgres.py; frontend/src/features/editorial-workspace/{EditorialProposalCard.tsx,EditorialProposalCard.test.tsx,EditorialConversation.tsx}.
 - **Tests rouges d’abord:** test_bridge_patch_becomes_immutable_proposal_with_exact_sha; test_refusal_and_needs_review_do_not_write_canonical_artifact; test_proposal_get_projects_persisted_state_and_base_version; test_proposal_blob_is_verified_before_relational_uow_and_orphan_cleanup_is_idempotent.
 - **Acceptation:** patch fermé/typé stocké en blob immuable re-hashé; upload-et-relecture SHA précèdent tout UOW; run/turn exacts liés; `variant_group_id` = (pin de base, occurrence cible, opération, thread_id); préparation/replay et réconciliation d’orphelins idempotents; aucun endpoint propose actif ni acceptation automatique.
 - **UX:** UX-02, UX-03, UX-11, UX-15.
@@ -177,40 +177,68 @@
 - **Depends-on / parallélisme:** T-M3-12; API et composants proposition partagés.
 - **Chemins autorisés:** backend/src/cti_app/application/editorial_proposals.py; backend/src/cti_app/api/editorial_workspace.py; backend/tests/test_editorial_proposal_rejection.py; frontend/src/features/editorial-workspace/{EditorialDiffView.tsx,EditorialProposalCard.tsx,EditorialDiffView.test.tsx}.
 - **Tests rouges d’abord:** test_reject_is_terminal_and_keeps_artifact_pins; test_diff_shows_text_changes_not_json; test_variant_reference_resolves_to_proposal_uuid; test_changed_pins_project_proposal_stale_and_persist_before_any_decision.
-- **Acceptation:** comparaison côte à côte/empilée et mode différence accessible; patch hash/base affichés en détails; pins changés projettent `stale` dès la lecture et sont persistés stale avant toute décision; rejet versionné/idempotent; accept est exposé seulement après T-M3-15.
+- **Acceptation:** comparaison côte à côte/empilée et mode différence accessible; patch hash/base affichés en détails; pins changés projettent `stale` dès la lecture et sont persistés stale avant toute décision; rejet versionné/idempotent; accept reste désactivé et n’est exposé aux utilisateurs qu’après T-M3-17.
 - **UX:** UX-02, UX-03, UX-04.
 - **Reviewers:** Standards + Spec + sécurité-provenance.
 - **Stop:** diff confondant variants, action accepter présente sans adoption prête, ou rejet déclenche révision.
 - **Taille:** M.
 
+### T-M3-14a — Extraire les noyaux sans modèle synthèse/enrichissement
+- **Statut:** livré.
+- **Comportement:** les candidats et validations éditoriales réutilisables pour synthèse/enrichissement s’exécutent sans appel modèle; les façades legacy et l’adoption partagent ces noyaux.
+- **Depends-on / parallélisme:** T-M3-10 et T-M3-11; prérequis de l’adoption T-M3-14.
+- **Chemins livrés:** backend/src/cti_app/application/editorial_synthesis/{candidate.py,targets.py,patch_validation.py}; backend/src/cti_app/application/{editorial_enrichment_candidate.py,editorial_enrichment_revision.py}.
+- **Acceptation:** logique de candidate/patch distincte du transport modèle; contrats historiques préservés; les mêmes validations sont appelables par l’adoption sans second appel Bridge.
+- **UX:** UX-02, UX-09.
+- **Reviewers:** Standards + Spec + sécurité-provenance.
+- **Taille:** M.
+
 ### T-M3-14 — Implémenter l’adoption unique par CAS
-- **Comportement:** le service d’adoption prépare une nouvelle version du bloc; replay retourne le même résultat, sans appel modèle. La route de décision reste désactivée jusqu’au cutover T-M3-15.
-- **Depends-on / parallélisme:** T-M3-13; DDL editorial_proposal_impacts réservée ici.
-- **Chemins autorisés:** backend/migrations/versions/<revision>_editorial_proposal_impacts.py; backend/src/cti_app/application/editorial_proposal_adoption.py; backend/src/cti_app/application/editorial_proposals.py; backend/src/cti_app/infrastructure/database/models/editorial_proposal_impacts.py; backend/src/cti_app/api/editorial_workspace.py; backend/tests/test_editorial_proposal_adoption.py; backend/tests/integration/editorial/test_proposal_adoption_postgres.py; frontend/src/features/editorial-workspace/{EditorialProposalCard.tsx,EditorialWorkspacePage.tsx}.
+- **Comportement:** le service d’adoption prépare une nouvelle version du bloc; replay retourne le même résultat, sans appel modèle. La route de décision reste désactivée après le cutover T-M3-15 et jusqu’à T-M3-17.
+- **Depends-on / parallélisme:** T-M3-13 et T-M3-14a; DDL intégrée en 0015: outbox editorial_proposal_impacts.
+- **Chemins autorisés:** backend/migrations/versions/0015_editorial_proposal_impacts.py; backend/src/cti_app/application/editorial_proposal_adoption.py; backend/src/cti_app/application/editorial_proposals.py; backend/src/cti_app/infrastructure/database/models/editorial_proposal_impacts.py; backend/src/cti_app/api/editorial_workspace.py; backend/tests/test_editorial_proposal_adoption.py; backend/tests/integration/editorial/test_proposal_adoption_postgres.py; frontend/src/features/editorial-workspace/{EditorialProposalCard.tsx,EditorialWorkspacePage.tsx}.
 - **Tests rouges d’abord:** test_accept_rehashes_patch_revalidates_fences_and_never_calls_gateway; test_accept_cas_appends_artifact_lineage_registry_and_outbox_atomically; test_accepting_variant_stales_siblings_atomically; test_adoption_crash_before_upload; test_adoption_crash_after_upload_before_uow; test_adoption_crash_after_commit_before_impact.
-- **Acceptation:** patch et candidat canonique uploadés puis relus par SHA avant UOW; UOW relationnel seulement: CAS, références, lineage, registre, événement et outbox; blob orphelin inoffensif/content-addressed et réconciliation/nettoyage idempotent; verrouille proposal puis run; l’acceptation rend atomiquement les variantes sœurs stale et tout autre proposal aux pins changés est persisté stale avant décision. Aucune adoption partielle, aucun rappel modèle ni repin de composition. Ce ticket fournit l’écrivain unique mais n’active pas encore sa route.
+- **Acceptation:** patch et candidat canonique uploadés puis relus par SHA avant UOW; UOW relationnel seulement: CAS, références, lineage, registre, événement et outbox; blob orphelin inoffensif/content-addressed et réconciliation/nettoyage idempotent; verrouille proposal puis run; l’acceptation rend atomiquement les variantes sœurs stale et tout autre proposal aux pins changés est persisté stale avant décision. Aucune adoption partielle, aucun rappel modèle ni repin de composition. La route est câblée ensuite par T-M3-15c, mais reste désactivée jusqu’à T-M3-17.
 - **UX:** UX-02, UX-03, UX-04, UX-08.
 - **Reviewers:** Standards + Spec + sécurité-provenance/concurrence.
 - **Stop:** transaction partielle, patch SHA différent, policy/révocation modifiée ou CAS manqué.
 - **Taille:** L.
 
 ### T-M3-15 — Inventorier et couper tous les écrivains legacy
-- **Comportement:** les révisions historiques passent par prepare+accept; aucune route synthesis/enrichment ne contourne adoption, registre, lineage ou outbox avant activation des décisions.
-- **Depends-on / parallélisme:** T-M3-14; ticket de cutover exclusif, aucun parallèle sur les écrivains/API concernés.
-- **Chemins autorisés:** backend/src/cti_app/application/production_synthesis_revision.py; backend/src/cti_app/application/production_enrichment_revision.py; backend/src/cti_app/application/publication_text_correction.py; backend/src/cti_app/application/editorial_proposal_adoption.py; backend/src/cti_app/application/editorial_revision_impact.py; backend/src/cti_app/api/production.py; backend/src/cti_app/api/editorial_workspace.py; backend/tests/test_editorial_writer_inventory.py; backend/tests/test_production_synthesis_revision_contract.py; backend/tests/test_production_enrichment_revision_contract.py; backend/tests/integration/editorial/test_editorial_writer_cutover_postgres.py; frontend/src/features/editorial-workspace/{EditorialProposalCard.tsx,EditorialWorkspacePage.tsx}; frontend/e2e/editorial/editorial-decision-cutover.spec.ts.
-- **Tests rouges d’abord:** test_writer_inventory_covers_revise_restore_rebase_and_publication_correction; test_accept_races_legacy_revise_exactly_one_winner_and_registry_outbox_never_bypass; test_legacy_revise_is_prepare_accept_facade; test_impact_rebase_advances_registry_under_run_guard.
-- **Acceptation:** tracer et classer chaque chemin de révision synthesis, revise enrichment, restore stale blocks, rebase d’impact et publication_text_correction (si elle écrit synthesis/enrichment); chaque écriture concernée passe par adoption, ou pour l’impact dérivé par le même garde run + registre/lineage/outbox. L’accept contre revise legacy concurrent a exactement un gagnant. La route accept devient accessible seulement après ces oracles; toute correction publication hors scope est justifiée par oracle de non-écriture.
+- **Statut:** livré par T-M3-15b, T-M3-15c et T-M3-15d.
+- **Écart formalisé à D7.B1:** les écrivains legacy `revise` restent des écrivains directs d’artefacts canoniques et gardent leurs endpoints. Ils partagent avec l’adoption l’étape `EditorialRevisionEffects` dans la même UOW: verrou du run, avance du registre et transitions stale des propositions dont les pins ont changé. Ils ne sont pas transformés en prepare+accept: fabriquer une proposition ou un ModelRun ferait croire à une origine Bridge qui n’existe pas. L’adoption reste l’unique écrivain des propositions acceptées; elle seule émet l’outbox d’impact d’adoption.
+- **Depends-on / parallélisme:** T-M3-14; T-M3-15b et T-M3-15c ont été livrés en parallèle sur chemins disjoints; T-M3-15d clôt le cutover.
+- **Chemins livrés:** backend/src/cti_app/application/{editorial_revision_effects.py,editorial_proposal_adoption.py,editorial_proposal_adoption_inputs.py,production_repair_factory.py,production_synthesis_revision.py,production_enrichment_revision.py,production_repairs.py,publication_text_correction.py,publication_augmentation.py}; backend/src/cti_app/api/{editorial_workspace.py,production.py}; backend/tests/test_editorial_writer_inventory.py; backend/tests/integration/editorial/{test_editorial_revision_effects_postgres.py,test_proposal_adoption_postgres.py}.
+- **Oracles:** inventaire statique AST des écrivains; course PostgreSQL accept‖revise/restore à un seul gagnant; correction de texte publication et augmentation d’opinion ne produisent aucune écriture synthesis/enrichment et gardent leur projection publication.
+- **Route accept:** câblée mais fail-closed par `EDITORIAL_PROPOSAL_ACCEPT_ENABLED=false` par défaut; 404 `{detail:{code:"accept_not_enabled"}}`. Elle n’est activée et montrée dans l’UI qu’après T-M3-17.
 - **UX:** UX-02, UX-04, UX-08, UX-20.
 - **Reviewers:** Standards + Spec + sécurité-provenance/concurrence.
-- **Stop:** writer non inventorié, revise restant writer privé, course à deux gagnants, ou rebase n’avançant pas le registre.
 - **Taille:** L.
 
+#### T-M3-15b — Étape commune d’effets de révision
+- **Statut:** livré.
+- **Comportement:** `EditorialRevisionEffects` partage le verrou du run, l’avance du registre et la persistance stale des propositions; câblé aux révisions de synthèse/enrichissement, au restore des blocs stale et au rebase d’impact.
+- **Chemins livrés:** backend/src/cti_app/application/{editorial_revision_effects.py,production_synthesis_revision.py,production_enrichment_revision.py,production_repairs.py}; backend/tests/test_editorial_revision_effects.py; backend/tests/integration/editorial/test_editorial_revision_effects_postgres.py.
+- **Oracle:** effets dans la même UOW que l’écriture legacy; une seule issue gagnante dans les courses contre accept.
+
+#### T-M3-15c — Inputs de production et route accept fail-closed
+- **Statut:** livré.
+- **Comportement:** `ProductionEditorialProposalAdoptionInputs` reconstruit les entrées de production et vérifie le TLP COURANT du sujet ainsi que l’état actuel du fil, des preuves et de la politique. La route accept est câblée, mais `EDITORIAL_PROPOSAL_ACCEPT_ENABLED` vaut `false` par défaut et renvoie 404 `accept_not_enabled`.
+- **Chemins livrés:** backend/src/cti_app/application/editorial_proposal_adoption_inputs.py; backend/src/cti_app/api/editorial_workspace.py; backend/src/cti_app/config.py; backend/tests/test_editorial_proposal_accept.py.
+- **Garde:** aucun accept utilisateur avant T-M3-17; l’échec de configuration reste fermé.
+
+#### T-M3-15d — Clôture du cutover
+- **Statut:** livré.
+- **Comportement:** le repair de production est construit par la fabrique unique `application/production_repair_factory.py`, qui exige les effets éditoriaux dans le câblage de production.
+- **Chemins livrés:** backend/src/cti_app/application/production_repair_factory.py; backend/tests/test_editorial_writer_inventory.py; backend/tests/integration/editorial/{test_editorial_revision_effects_postgres.py,test_proposal_adoption_postgres.py}.
+- **Oracles:** le test AST inventorie les écrivains; PostgreSQL couvre les courses accept‖revise/restore; publication_text_correction et publication_augmentation ont zéro écriture synthesis/enrichment et conservent leur projection publication.
+
 ### T-M3-16 — Activer « Proposer » après adoption unique
-- **Comportement:** « Proposer » transforme le dernier tour Bridge vérifié en proposition persistante uniquement après que T-M3-14/15 livrent agrégat et écrivain unique; message seul reste disponible.
-- **Depends-on / parallélisme:** T-M3-12, T-M3-14 et T-M3-15; D2 et le cutover sont requis avant activation frontend/API.
+- **Comportement:** « Proposer » transforme le dernier tour Bridge vérifié en proposition persistante uniquement après que T-M3-14/15 livrent agrégat et effets communs; message seul reste disponible. La route accept reste désactivée.
+- **Depends-on / parallélisme:** T-M3-12, T-M3-14 et T-M3-15; D2 et le cutover sont requis avant l’activation de « Proposer ».
 - **Chemins autorisés:** backend/src/cti_app/application/editorial_proposals.py; backend/src/cti_app/api/editorial_workspace.py; backend/tests/test_editorial_propose_activation.py; backend/tests/integration/editorial/test_proposal_activation_postgres.py; frontend/src/features/editorial-workspace/{EditorialConversation.tsx,EditorialProposalCard.tsx,EditorialWorkspacePage.tsx}; frontend/e2e/editorial/proposal-activation.spec.ts.
 - **Tests rouges d’abord:** test_propose_refused_without_unique_adoption_and_enabled_after_cutover; test_message_objective_still_never_creates_proposal; test_propose_uses_exact_thread_turn_without_second_gateway_call.
-- **Acceptation:** la bascule active les routes et contrôle UI dans le même déploiement; endpoint refuse fail-closed si l’adoption unique est indisponible; proposal references turn/run exacts; aucun second appel Bridge pour construire la carte.
+- **Acceptation:** la bascule active uniquement « Proposer » et sa carte UI; l’acceptation reste désactivée (`EDITORIAL_PROPOSAL_ACCEPT_ENABLED=false`, 404 `accept_not_enabled`); endpoint propose refuse fail-closed si le chemin d’adoption unique est indisponible; la proposition référence le turn/run exacts; aucun second appel Bridge pour construire la carte.
 - **UX:** UX-02, UX-03, UX-11, UX-15.
 - **Reviewers:** Standards + Spec + sécurité-provenance.
 - **Stop:** propose visible avant gate, mode message créant une proposition, ou Bridge rappelé pour projeter le dernier tour.
@@ -221,7 +249,7 @@
 - **Depends-on / parallélisme:** T-M3-16; aucun ticket parallèle sur projection/query partagée.
 - **Chemins autorisés:** backend/src/cti_app/application/editorial_revision_impact.py; backend/src/cti_app/workers/editorial_proposal_impacts.py; backend/src/cti_app/api/editorial_workspace.py; backend/tests/test_editorial_proposal_impact.py; backend/tests/integration/editorial/test_editorial_proposal_impact_order_postgres.py; frontend/src/features/editorial-workspace/{EditorialWorkspaceStatus.tsx,EditorialWorkspacePage.tsx}.
 - **Tests rouges d’abord:** test_impact_sequence_is_monotonic_per_run; test_out_of_order_impact_a_b_marks_old_pins_superseded_noop; test_worker_locks_run_and_rereads_current_pins; test_pending_impact_never_blocks_adoption; test_impact_failure_never_rolls_back_accepted_artifact.
-- **Acceptation:** séquence monotone par run; worker verrouille le run et relit les pins courants; un impact dépassé devient `superseded` no-op car le plus récent repart de l’état courant; adoption reste possible avec impact pending; outbox et reprises sont idempotents; composition n’est jamais repinnée automatiquement.
+- **Acceptation:** séquence monotone par run; worker verrouille le run et relit les pins courants; un impact dépassé devient `superseded` no-op car le plus récent repart de l’état courant; adoption reste possible avec impact pending; outbox et reprises sont idempotents; composition n’est jamais repinnée automatiquement. Après livraison de ce consommateur, exposer la route aux utilisateurs en activant `EDITORIAL_PROPOSAL_ACCEPT_ENABLED=true` et en ajoutant l’action UI « Accepter ».
 - **UX:** UX-02, UX-16, UX-17.
 - **Reviewers:** Standards + Spec + sécurité-provenance/concurrence.
 - **Stop:** résultat A/B hors séquence appliqué au mauvais état, impact bloquant une adoption, ou worker publiant/repinnant.
@@ -243,7 +271,7 @@
 ### T-M4-19 — Configuration rétention/PII et brouillon serveur
 - **Comportement:** l’utilisateur peut retrouver un brouillon non canonique sur un autre écran autorisé; ACL, expiry et état indisponible sont explicites.
 - **Depends-on / parallélisme:** T-M4-18; DDL editorial_drafts réservée ici.
-- **Chemins autorisés:** backend/migrations/versions/<revision>_editorial_drafts.py; backend/src/cti_app/domain/editorial_draft.py; backend/src/cti_app/application/editorial_drafts.py; backend/src/cti_app/infrastructure/database/models/editorial_drafts.py; backend/src/cti_app/infrastructure/database/repositories/editorial_drafts.py; backend/src/cti_app/api/editorial_workspace.py; backend/tests/test_editorial_drafts.py; backend/tests/integration/editorial/test_drafts_postgres.py; frontend/src/features/editorial-workspace/{EditorialDrafts.ts,EditorialWorkspacePage.tsx}.
+- **Chemins autorisés:** backend/migrations/versions/0016_editorial_drafts.py; backend/src/cti_app/domain/editorial_draft.py; backend/src/cti_app/application/editorial_drafts.py; backend/src/cti_app/infrastructure/database/models/editorial_drafts.py; backend/src/cti_app/infrastructure/database/repositories/editorial_drafts.py; backend/src/cti_app/api/editorial_workspace.py; backend/tests/test_editorial_drafts.py; backend/tests/integration/editorial/test_drafts_postgres.py; frontend/src/features/editorial-workspace/{EditorialDrafts.ts,EditorialWorkspacePage.tsx}.
 - **Tests rouges d’abord:** test_draft_subject_acl_and_version_fence; test_draft_ttl_defaults_to_30_days_after_last_change_and_is_configurable; test_expired_draft_is_unavailable_and_purged; test_adopt_reject_cancel_purge_server_draft; test_editorial_prose_and_block_text_never_enter_logs_traces_or_error_telemetry; test_unconfigured_retention_fails_closed.
 - **Acceptation:** brouillons, corps de fil et tours suivent l’ACL du sujet; blob SHA référencé, version If-Match; TTL serveur configurable, défaut 30 jours après dernière modification; expires_at et purge des brouillons à l’adoption/rejet/annulation/expiration; aucune persistance sans configuration de rétention. Les blobs de fil restent le dossier éditorial, sans purge automatique; les tours ModelConversation suivent l’ACL du sujet sans nouvelle règle de rétention ici. Prose utilisateur et texte de bloc absents des logs/traces/télémétrie; l’UI montre expiry et distingue brouillon serveur/local.
 - **UX:** UX-06, UX-08.
@@ -345,24 +373,24 @@
 - **Stop:** hash historique diffère après simple ouverture ou old schema converti au chargement.
 - **Taille:** M.
 
-### T-M7-28 — Clavier, mobile et focus
-- **Comportement:** actions usuelles sont utilisables au clavier/sans hover et sur mobile, sans perdre cible, brouillon ni position.
+### T-M7-28 — Clavier et focus
+- **Comportement:** actions usuelles sont utilisables au clavier et sans hover sur l’interface desktop, sans perdre cible, brouillon ni position.
 - **Depends-on / parallélisme:** T-M7-27; styles/composants éditoriaux partagés.
-- **Chemins autorisés:** frontend/src/features/editorial-workspace/{EditorialWorkspaceLayout.tsx,EditorialInspector.tsx,EditorialDocument.tsx,EditorialConversation.tsx,EditorialProposalCard.tsx,InlineTextEditor.tsx,SourceFigureGallery.tsx}; frontend/e2e/editorial/keyboard-mobile.spec.ts.
-- **Tests rouges d’abord:** test_keyboard_select_edit_compare_decide_and_restore_focus; test_mobile_inspector_sheet_restores_block_and_has_no_page_horizontal_scroll (390px); test_async_reply_does_not_steal_focus.
-- **Acceptation:** commandes Tab/flèches/Échap/Ctrl-S/Cmd-Entrée selon contexte; aria-live sans déplacer focus; cibles tactiles ≥44px; reduced-motion; axe WCAG 2.2 AA.
-- **UX:** UX-18, UX-19.
+- **Chemins autorisés:** frontend/src/features/editorial-workspace/{EditorialWorkspaceLayout.tsx,EditorialInspector.tsx,EditorialDocument.tsx,EditorialConversation.tsx,EditorialProposalCard.tsx,InlineTextEditor.tsx,SourceFigureGallery.tsx}; frontend/e2e/editorial/keyboard-focus.spec.ts.
+- **Tests rouges d’abord:** test_keyboard_select_edit_compare_decide_and_restore_focus; test_async_reply_does_not_steal_focus.
+- **Acceptation:** commandes Tab/flèches/Échap/Ctrl-S/Cmd-Entrée selon contexte; aria-live sans déplacer focus; focus visible; reduced-motion; axe WCAG 2.2 AA.
+- **UX:** UX-18.
 - **Reviewers:** Standards/accessibilité + Spec + sécurité-provenance (état/texte accessible).
-- **Stop:** raccourci natif intercepté, focus perdu ou scroll horizontal de page.
+- **Stop:** raccourci natif intercepté, focus perdu ou scroll horizontal de page à partir de 1024 px.
 - **Taille:** M.
 
 ### T-M7-29 — Captures Playwright pour revue visuelle
-- **Comportement:** reviewers peuvent inspecter captures cohérentes de l’application réelle aux tailles et états éditoriaux requis.
+- **Comportement:** reviewers peuvent inspecter captures cohérentes de l’application réelle aux tailles desktop et états éditoriaux requis.
 - **Depends-on / parallélisme:** T-M7-28; dernier ticket visuel avant M8.
 - **Chemins autorisés:** frontend/e2e/editorial/visual-review.spec.ts; frontend/playwright.editorial.config.ts; frontend/test-results/editorial-workspace/ (artefacts générés, non suivis).
-- **Tests rouges d’abord:** test_visual_review_captures_desktop_intermediate_mobile_and_states (capture présente pour chaque viewport/état).
-- **Acceptation:** commande: `cd frontend && pnpm exec playwright test --config playwright.editorial.config.ts e2e/editorial/visual-review.spec.ts`; Playwright capture desktop large, intermédiaire, mobile, paragraphe sélectionné, édition, conversation en cours, proposition+diff, tableau inséré, galerie, erreur/conflit; reviewer inspecte lisibilité, hiérarchie, alignements, espacements, débordements, position des boutons, densité, visibilité de l’action principale, place du document et contrôles répétés; captures ne contiennent que les fixtures synthétiques.
-- **UX:** UX-01..UX-20 comme états visibles; matrice finale reste T-M8-32.
+- **Tests rouges d’abord:** test_visual_review_captures_desktop_large_intermediate_and_states (capture présente pour chaque viewport/état actif).
+- **Acceptation:** commande: `cd frontend && pnpm exec playwright test --config playwright.editorial.config.ts e2e/editorial/visual-review.spec.ts`; Playwright capture desktop large et intermédiaire, paragraphe sélectionné, édition, conversation en cours, proposition+diff, tableau inséré, galerie, erreur/conflit; reviewer inspecte lisibilité, hiérarchie, alignements, espacements, débordements, position des boutons, densité, visibilité de l’action principale, place du document et contrôles répétés; captures ne contiennent que les fixtures synthétiques.
+- **UX:** UX-01..UX-18, UX-20 comme états visibles; UX-19 est abandonné (desktop-only); matrice finale reste T-M8-32.
 - **Reviewers:** Standards + Spec + revue visuelle; sécurité-provenance vérifie les fixtures sans données réelles.
 - **Stop:** capture absente, overflow bloquant, action principale introuvable ou interface encore confuse.
 - **Taille:** M.
@@ -370,34 +398,34 @@
 ## M8 — revue architecture et finition
 
 ### T-M8-30 — Contract synthesis façade après migration callers
-- **Comportement:** routes synthesis historiques restent compatibles mais exécutent désormais prepare→accept explicite avec clé legacy déterministe; aucun second writer privé ne subsiste.
+- **Comportement:** après migration des callers, formaliser la façade synthesis compatible: le `revise` legacy reste un écrivain direct, protégé par `EditorialRevisionEffects` dans sa UOW; ne pas fabriquer de prepare→accept ni de ModelRun synthétique.
 - **Depends-on / parallélisme:** T-M7-29; parallèle avec T-M8-31, service distinct.
 - **Chemins autorisés:** backend/src/cti_app/application/production_synthesis_revision.py; backend/tests/test_production_synthesis_revision_contract.py; backend/tests/test_production_api.py.
-- **Tests rouges d’abord:** test_legacy_revise_maps_to_prepare_accept_with_deterministic_key; test_legacy_replay_returns_same_adopted_artifact; test_only_editorial_adoption_writes_synthesis_version.
-- **Acceptation:** tous callers migrés; ancien revise demeure façade sur action explicite; previews restent lecture seule; historique/version/IDs legacy conservés.
+- **Tests rouges d’abord:** test_legacy_revise_runs_shared_effects_under_run_lock; test_legacy_revise_replay_returns_same_artifact; test_accept_races_legacy_revise_exactly_one_winner.
+- **Acceptation:** tous callers recensés/migrés; ancien revise reste la façade compatible vers l’écrivain direct avec verrou de run, avance du registre et propositions stale; previews restent lecture seule; historique/version/IDs legacy conservés.
 - **UX:** UX-02, UX-04, UX-08, UX-20.
 - **Reviewers:** Standards + Spec + sécurité-provenance/concurrence.
 - **Stop:** caller privé restant, appel modèle pendant accept, ou suppression anticipée d’un endpoint client.
 - **Taille:** L.
 
 ### T-M8-31 — Contract enrichment façade après migration callers
-- **Comportement:** routes enrichment historiques restent compatibles et n’écrivent qu’au travers du validateur/adoption partagé, avec placements versionnés.
+- **Comportement:** après migration des callers, formaliser la façade enrichment compatible: les routes legacy gardent l’écriture directe avec `EditorialRevisionEffects`; ne pas fabriquer de prepare→accept ni de ModelRun synthétique.
 - **Depends-on / parallélisme:** T-M7-29; parallèle avec T-M8-30, service et tests distincts.
 - **Chemins autorisés:** backend/src/cti_app/application/production_enrichment_revision.py; backend/tests/test_production_enrichment_revision_contract.py; backend/tests/test_production_editorial_enrichment_application.py.
-- **Tests rouges d’abord:** test_legacy_enrichment_revise_uses_shared_adoption; test_only_editorial_adoption_writes_enrichment_version; test_v8_and_v9_readers_preserve_placement_contracts.
-- **Acceptation:** vieux readers/wires restent valides; aucune écriture canonique privée; diagnostics lineage/anchor restent observables; nouvelles versions ne modifient pas les anciennes.
+- **Tests rouges d’abord:** test_legacy_enrichment_revise_runs_shared_effects_under_run_lock; test_accept_races_legacy_enrichment_revise_exactly_one_winner; test_v8_and_v9_readers_preserve_placement_contracts.
+- **Acceptation:** vieux readers/wires restent valides; toutes les écritures legacy passent par les effets communs dans leur UOW; diagnostics lineage/anchor restent observables; nouvelles versions ne modifient pas les anciennes.
 - **UX:** UX-09, UX-10, UX-12, UX-14, UX-20.
 - **Reviewers:** Standards + Spec + sécurité-provenance.
 - **Stop:** nouvelle placement interprétée silencieusement par ancien reader ou caller non migré.
 - **Taille:** L.
 
 ### T-M8-32 — Gate final et couverture complète UX-01…UX-20
-- **Comportement:** une livraison peut être déclarée complète seulement quand chaque scénario UX est relié à un test e2e ou integration, les lots sont revus et les rendus visuels/PDF acceptés.
+- **Comportement:** une livraison peut être déclarée complète seulement quand chaque scénario UX actif (UX-01..UX-18 et UX-20) est relié à un test e2e ou integration, UX-19 est marqué abandonné, les lots sont revus et les rendus visuels/PDF acceptés.
 - **Depends-on / parallélisme:** T-M8-30 et T-M8-31; gate terminal.
 - **Chemins autorisés:** backend/tests/integration/editorial/; backend/tests/test_editorial_*; frontend/e2e/editorial/; docs/design/atelier-editorial/TICKETS.md (matrice et noms de test uniquement).
 - **Tests rouges d’abord:** test_editorial_ux_matrix_has_all_twenty_scenarios (aucun UX-xx sans test existant); test_article_brief_editorial_replay_matrix (oracles fake, versions et pins stables).
-- **Acceptation:** chaque scénario ci-dessous possède un test exécuté et un résultat; orchestrateur exécute lui-même `make test-backend PYTEST_ARGS=…`, `make lint-backend`, `make typecheck-backend` et `make test-integration` via Docker; lancer `cd frontend && pnpm test --run`, `cd frontend && pnpm lint`, `cd frontend && pnpm typecheck`, `cd frontend && pnpm build`, Playwright et tests real-Typst selon les tickets; vérifier la cohérence D7 dans ADR-0010/ARCHITECTURE. ADR-0010 reste Proposé jusqu’à la décision d’acceptation de l’orchestrateur en M8; DECISIONS D1–D7 reste autoritatif jusque-là. Revue séparée standards/spec/sécurité-provenance; aucune preuve de replay présentée comme test transport live.
-- **UX:** UX-01..UX-20, matrice complète ci-dessous.
+- **Acceptation:** chaque scénario actif ci-dessous possède un test exécuté et un résultat; UX-19 reste explicitement abandonné; orchestrateur exécute lui-même `make test-backend PYTEST_ARGS=…`, `make lint-backend`, `make typecheck-backend` et `make test-integration` via Docker; lancer `cd frontend && pnpm test --run`, `cd frontend && pnpm lint`, `cd frontend && pnpm typecheck`, `cd frontend && pnpm build`, Playwright et tests real-Typst selon les tickets; vérifier l’écart D7.B1 formalisé dans ADR-0010/ARCHITECTURE. ADR-0010 reste Proposé jusqu’à la décision d’acceptation de l’orchestrateur en M8; DECISIONS D1–D7 reste autoritatif jusque-là hors de cet écart explicitement signalé. Revue séparée standards/spec/sécurité-provenance; aucune preuve de replay présentée comme test transport live.
+- **UX:** UX-01..UX-20, avec UX-19 abandonné, matrice ci-dessous.
 - **Reviewers:** Standards + Spec + sécurité-provenance + revue visuelle finale.
 - **Stop:** scénario sans test e2e/integration, provider live requis, review PDF/capture manquante, ou toute migration en tête concurrente.
 - **Taille:** L.
@@ -424,6 +452,6 @@
 | UX-16 PDF obsolète puis actuel | T-M3-17, T-M7-26, T-M8-32 | Playwright e2e + render identity integration |
 | UX-17 composition stale sans repin | T-M3-17, T-M7-26, T-M8-32 | Playwright e2e + composition integration |
 | UX-18 clavier/focus | T-M1-05, T-M4-18, T-M7-28..29, T-M8-32 | Playwright keyboard e2e + a11y assertions |
-| UX-19 mobile sans scroll horizontal | T-M1-05, T-M7-28..29, T-M8-32 | Playwright mobile viewport e2e + screenshot review |
+| UX-19 (abandonné : décision utilisateur, desktop-only) | — | Aucun critère mobile ni test ; identifiant conservé sans renumérotation |
 | UX-20 ancienne version en lecture seule | T-M1-04, T-M7-27, T-M8-30..32 | Playwright e2e + canonical SHA/read-only integration |
 
