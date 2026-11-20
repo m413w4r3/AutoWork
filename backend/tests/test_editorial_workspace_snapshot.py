@@ -273,6 +273,41 @@ def test_snapshot_reload_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
     asyncio.run(exercise())
 
 
+def test_lazy_snapshot_preserves_parent_across_pin_change_and_reload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, subject_id, repository, artifacts, artifact_store = _workspace_service(
+        _synthesis((_paragraph("stable paragraph"),)), monkeypatch
+    )
+
+    async def exercise() -> None:
+        first = await service.snapshot(subject_id)
+        first_record = repository.records[-1]
+        assert first_record.parent_snapshot_id is None
+
+        synthesis_artifact = artifacts.current["synthesis"]
+        assert synthesis_artifact is not None
+        publication = _make_artifact(
+            "publication",
+            {"schema_version": "8"},
+            production_run_id=synthesis_artifact.production_run_id,
+        )
+        artifacts.current["publication"] = publication
+        artifact_store.write(publication)
+
+        second = await service.snapshot(subject_id)
+        second_record = repository.records[-1]
+        assert second_record.parent_snapshot_id == first_record.snapshot_id
+        assert second["snapshot_id"] != first["snapshot_id"]
+        assert len(repository.records) == 2
+
+        reloaded = await service.snapshot(subject_id)
+        assert reloaded["snapshot_id"] == second["snapshot_id"]
+        assert len(repository.records) == 2
+
+    asyncio.run(exercise())
+
+
 def test_snapshot_rejects_artifact_pointer_change_between_reads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

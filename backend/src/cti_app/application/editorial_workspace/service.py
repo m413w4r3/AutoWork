@@ -360,6 +360,9 @@ class EditorialWorkspaceService:
                     workspace_pin_hash=pin_hash,
                     registry_hash=registry_hash(entries),
                     block_registry=tuple(entries),
+                    parent_snapshot_id=(
+                        previous_record.snapshot_id if previous_record is not None else None
+                    ),
                 )
                 await self._assert_artifact_pointers_current(
                     uow=uow,
