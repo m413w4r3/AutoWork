@@ -94,6 +94,18 @@ async function stubEditorApi(
       await route.continue();
       return;
     }
+    if (
+      method === "GET" &&
+      /^\/api\/subjects\/[^/]+\/editor\/blocks\/[^/]+\/draft$/.test(
+        url.pathname,
+      )
+    ) {
+      await route.fulfill({
+        status: 404,
+        json: { detail: { code: "draft_not_found" } },
+      });
+      return;
+    }
     const subjectSnapshot = snapshots.find(
       (candidate) =>
         url.pathname === `/api/subjects/${candidate.subject_id}` ||

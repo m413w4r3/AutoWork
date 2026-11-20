@@ -135,6 +135,18 @@ test("generates and displays a persisted proposal in the desktop thread", async 
       await route.continue();
       return;
     }
+    if (
+      method === "GET" &&
+      /^\/api\/subjects\/[^/]+\/editor\/blocks\/[^/]+\/draft$/.test(
+        url.pathname,
+      )
+    ) {
+      await route.fulfill({
+        status: 404,
+        json: { detail: { code: "draft_not_found" } },
+      });
+      return;
+    }
     if (method === "GET" && url.pathname === `/api/subjects/${subjectId}`) {
       await route.fulfill({ json: EDITORIAL_FIXTURES.subject });
       return;

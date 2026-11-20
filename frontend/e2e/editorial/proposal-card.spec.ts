@@ -108,6 +108,18 @@ test("compares and rejects a persisted proposal with stubbed API data", async ({
       await route.continue();
       return;
     }
+    if (
+      method === "GET" &&
+      /^\/api\/subjects\/[^/]+\/editor\/blocks\/[^/]+\/draft$/.test(
+        url.pathname,
+      )
+    ) {
+      await route.fulfill({
+        status: 404,
+        json: { detail: { code: "draft_not_found" } },
+      });
+      return;
+    }
     if (method === "GET" && url.pathname === snapshotPath) {
       await route.fulfill({ json: snapshot });
       return;

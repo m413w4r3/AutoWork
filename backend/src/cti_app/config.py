@@ -102,6 +102,10 @@ class Settings(BaseSettings):
     # External web search from Editorial Enrichment is an explicit operator opt-in.
     production_editorial_resource_search_enabled: bool = False
     editorial_proposal_accept_enabled: bool = True
+    # Server-side editorial prose is noncanonical and must always have a
+    # positive idle-retention period. Invalid environment values fail closed
+    # at the draft write boundary instead of preventing application startup.
+    editorial_draft_retention_days: int | None = 30
     # Palier de repos long inséré périodiquement pour laisser le bridge
     # ChatGPT récupérer. Zéro désactive le palier.
     production_cooldown_every_n_subjects: int = Field(default=3, ge=0)
@@ -363,6 +367,15 @@ class Settings(BaseSettings):
     @classmethod
     def validate_download_allowed_ports(cls, value: str) -> str:
         return ",".join(str(port) for port in sorted(_normalize_download_port_list(value)))
+
+    @field_validator("editorial_draft_retention_days", mode="before")
+    @classmethod
+    def parse_editorial_draft_retention_days(cls, value: object) -> int | None:
+        if type(value) is int:
+            return value
+        if isinstance(value, str) and value.isascii() and value.isdecimal():
+            return int(value)
+        return None
 
     @property
     def virustotal_retrohunt_proxy_enabled(self) -> bool:

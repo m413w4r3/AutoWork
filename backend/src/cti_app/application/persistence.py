@@ -62,6 +62,7 @@ from cti_app.domain.editorial_bridge_generation_slot import (
     BridgeGenerationSlot,
     BridgeGenerationSlotAcquireResult,
 )
+from cti_app.domain.editorial_draft import EditorialDraft
 from cti_app.domain.editorial_proposal import (
     EditorialProposal,
     EditorialProposalEvent,
@@ -199,6 +200,24 @@ class EditorialWorkspaceSnapshotRepository(Protocol):
     async def append_if_absent(
         self, record: WorkspaceSnapshotRecord
     ) -> WorkspaceSnapshotRecord: ...
+
+
+class EditorialDraftRepository(Protocol):
+    async def lock_for_key(self, subject_id: UUID, occurrence_id: UUID) -> None: ...
+
+    async def get_for_update(
+        self, subject_id: UUID, occurrence_id: UUID
+    ) -> EditorialDraft | None: ...
+
+    async def save(self, draft: EditorialDraft) -> EditorialDraft: ...
+
+    async def delete(self, draft_id: UUID) -> EditorialDraft | None: ...
+
+    async def delete_for_occurrence(
+        self, subject_id: UUID, occurrence_id: UUID
+    ) -> Sequence[EditorialDraft]: ...
+
+    async def purge_expired(self, now: datetime, *, limit: int) -> int: ...
 
 
 class EditorialThreadRepository(Protocol):
@@ -1218,6 +1237,7 @@ class UnitOfWork(Protocol):
     production_runs: ProductionRunRepository
     production_routing_decisions: ProductionRoutingDecisionRepository
     editorial_workspace_snapshots: EditorialWorkspaceSnapshotRepository
+    editorial_drafts: EditorialDraftRepository
     editorial_threads: EditorialThreadRepository
     editorial_proposals: EditorialProposalRepository
     editorial_proposal_impacts: EditorialProposalImpactRepository

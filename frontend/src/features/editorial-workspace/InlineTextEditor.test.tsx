@@ -1,3 +1,4 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { useState } from "react";
 import userEvent from "@testing-library/user-event";
@@ -91,7 +92,9 @@ function WorkspaceHarness({
         snapshot={activeSnapshot}
         localDrafts={localDrafts}
         selectedBlockId={selectedBlockId}
+        localDraftText=""
         onSelectBlock={setSelectedBlockId}
+        onLocalDraftChange={() => undefined}
         onRefresh={() => undefined}
         onSave={onSave}
       />
@@ -99,8 +102,31 @@ function WorkspaceHarness({
   );
 }
 
-function renderWorkspace() {
-  return render(<WorkspaceHarness />);
+function renderWorkspace(
+  props: {
+    onSave?: InlineTextEditorProps["onSave"];
+    nextSnapshot?: EditorialWorkspaceSnapshot;
+  } = {},
+) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false, gcTime: 0 } },
+  });
+  vi.stubGlobal(
+    "fetch",
+    vi.fn<typeof fetch>(() =>
+      Promise.resolve(
+        new Response(JSON.stringify({ detail: { code: "draft_not_found" } }), {
+          status: 404,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    ),
+  );
+  return render(
+    <QueryClientProvider client={client}>
+      <WorkspaceHarness {...props} />
+    </QueryClientProvider>,
+  );
 }
 
 async function selectBlock(
@@ -121,6 +147,7 @@ async function beginEditing(user: ReturnType<typeof userEvent.setup>) {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe("local editorial block drafts", () => {
@@ -271,7 +298,7 @@ describe("local editorial block drafts", () => {
   it("calls the optional save extension when supplied", async () => {
     const onSave = vi.fn<(blockId: string, value: string) => void>();
     const user = userEvent.setup();
-    render(<WorkspaceHarness onSave={onSave} />);
+    renderWorkspace({ onSave });
 
     await selectBlock(user, "block-occurrence-a");
     const editor = await beginEditing(user);
@@ -313,7 +340,7 @@ describe("local editorial block drafts", () => {
             : block,
         ),
       };
-      render(<WorkspaceHarness nextSnapshot={nextSnapshot} />);
+      renderWorkspace({ nextSnapshot });
 
       await selectBlock(user, "block-occurrence-a");
       const editor = await beginEditing(user);
@@ -351,7 +378,7 @@ describe("local editorial block drafts", () => {
           : block,
       ),
     };
-    render(<WorkspaceHarness nextSnapshot={nextSnapshot} onSave={vi.fn()} />);
+    renderWorkspace({ nextSnapshot, onSave: vi.fn() });
 
     await selectBlock(user, "block-occurrence-a");
     const editor = await beginEditing(user);
@@ -398,7 +425,7 @@ describe("local editorial block drafts", () => {
         (block) => block.block_id !== "block-occurrence-a",
       ),
     };
-    render(<WorkspaceHarness nextSnapshot={nextSnapshot} />);
+    renderWorkspace({ nextSnapshot });
 
     await selectBlock(user, "block-occurrence-a");
     const editor = await beginEditing(user);

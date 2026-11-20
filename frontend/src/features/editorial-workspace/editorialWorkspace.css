@@ -43,6 +43,47 @@ main:has(> .editorial-route-state) > .app-header {
   box-sizing: border-box;
 }
 
+.editorial-server-draft-status {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  width: min(100% - 2rem, 96rem);
+  margin: 0.75rem auto;
+  padding: 0.55rem 0.8rem;
+  border: 1px solid var(--editorial-divider);
+  border-radius: 0.5rem;
+  color: var(--editorial-muted);
+  background: var(--editorial-panel);
+  font-size: 0.875rem;
+}
+
+.editorial-server-draft-status p {
+  flex: 1 1 20rem;
+  margin: 0;
+}
+
+.editorial-server-draft-status .button {
+  min-height: 44px;
+  padding: 0.4rem 0.65rem;
+  font-size: 0.78rem;
+}
+
+.editorial-server-draft-status[data-stale="true"] {
+  border-color: var(--editorial-attention-indicator);
+  color: var(--editorial-warning);
+}
+
+@media (max-width: 1023px) {
+  .editorial-server-draft-status {
+    display: none;
+  }
+
+  .editorial-local-draft {
+    display: none;
+  }
+}
+
 .editorial-workspace {
   min-height: 100vh;
   overflow-x: clip;
@@ -213,6 +254,7 @@ main:has(> .editorial-route-state) > .app-header {
 .editorial-workspace button:focus-visible,
 .editorial-workspace a:focus-visible,
 .editorial-workspace input:focus-visible,
+.editorial-workspace textarea:focus-visible,
 .editorial-outline__item:focus-visible,
 .editorial-document__block:focus-visible,
 .editorial-technical-details summary:focus-visible,
@@ -719,6 +761,32 @@ main:has(> .editorial-route-state) > .app-header {
   font-size: 0.95rem;
   line-height: 1.55;
   user-select: text;
+}
+
+.editorial-local-draft {
+  display: grid;
+  gap: 0.4rem;
+  margin: 1rem 0;
+  color: var(--editorial-muted);
+  font-size: 0.85rem;
+}
+
+.editorial-local-draft__input {
+  width: 100%;
+  min-height: 8rem;
+  padding: 0.65rem;
+  border: 1px solid var(--editorial-control-border);
+  border-radius: 0.45rem;
+  color: var(--editorial-ink);
+  background: var(--editorial-white);
+  font: inherit;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.editorial-local-draft__privacy {
+  color: var(--editorial-muted);
+  font-size: 0.75rem;
 }
 
 .editorial-block-actions {

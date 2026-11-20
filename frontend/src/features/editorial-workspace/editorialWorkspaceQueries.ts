@@ -11,4 +11,6 @@ export const editorialWorkspaceQueryKeys = {
   proposalsForOccurrence: proposalPrefix,
   proposal: (subjectId: string, occurrenceId: string, proposalId: string) =>
     [...proposalPrefix(subjectId, occurrenceId), proposalId] as const,
+  serverDraft: (subjectId: string, occurrenceId: string) =>
+    ["editorial-server-draft", subjectId, occurrenceId] as const,
 };

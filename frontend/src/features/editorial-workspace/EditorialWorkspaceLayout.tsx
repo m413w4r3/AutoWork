@@ -9,6 +9,7 @@ import type { EditorialDraftController } from "./EditorialDrafts";
 import type { InlineTextEditorProps } from "./InlineTextEditor";
 import { EditorialInspector } from "./EditorialInspector";
 import { EditorialOutline } from "./EditorialOutline";
+import { EditorialServerDraftStatus } from "./EditorialServerDraftStatus";
 import { EditorialTopBar } from "./EditorialTopBar";
 
 interface EditorialWorkspaceLayoutProps {
@@ -16,7 +17,9 @@ interface EditorialWorkspaceLayoutProps {
   snapshot: EditorialWorkspaceSnapshot;
   localDrafts: EditorialDraftController;
   selectedBlockId: string | null;
+  localDraftText: string;
   onSelectBlock: (blockId: string) => void;
+  onLocalDraftChange: (blockId: string, text: string) => void;
   onRefresh: () => void;
   onSave?: InlineTextEditorProps["onSave"];
 }
@@ -48,7 +51,9 @@ export function EditorialWorkspaceLayout({
   snapshot,
   localDrafts,
   selectedBlockId,
+  localDraftText,
   onSelectBlock,
+  onLocalDraftChange,
   onRefresh,
   onSave,
 }: EditorialWorkspaceLayoutProps) {
@@ -297,6 +302,16 @@ export function EditorialWorkspaceLayout({
         onNavigateAway={allowNavigationAway}
       />
 
+      <EditorialServerDraftStatus
+        subjectId={subjectId}
+        occurrenceId={selectedBlock?.block_id ?? null}
+        snapshotId={snapshot.snapshot_id}
+        localDraftText={localDraftText}
+        onRecover={(text) => {
+          if (selectedBlock) onLocalDraftChange(selectedBlock.block_id, text);
+        }}
+      />
+
       {readOnly ? (
         <div className="editorial-readonly-banner" role="note">
           Type de publication indéterminé : le document est consultable en
@@ -389,6 +404,11 @@ export function EditorialWorkspaceLayout({
             block={selectedBlock}
             sectionTitle={sectionTitle}
             readOnly={readOnly}
+            localDraftText={localDraftText}
+            onLocalDraftChange={(text) => {
+              if (selectedBlock)
+                onLocalDraftChange(selectedBlock.block_id, text);
+            }}
             onStartEditing={startEditing}
             onOpenSources={showSources}
             onBackToDocument={closeActiveOverlay}

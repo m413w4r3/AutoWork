@@ -70,6 +70,24 @@ export interface EditorialWorkspaceSnapshot {
   snapshot_id: string;
 }
 
+export interface EditorialServerDraft {
+  id: string;
+  subject_id: string;
+  production_run_id: string;
+  occurrence_id: string;
+  base_snapshot_id: string;
+  base_artifact_id: string;
+  base_artifact_version: number;
+  base_canonical_sha256: string;
+  text_sha256: string;
+  version: number;
+  text: string;
+  is_stale: boolean;
+  created_at: string;
+  updated_at: string;
+  expires_at: string;
+}
+
 export interface ResolvedEditorialWorkspaceBlock {
   snapshot_id: string;
   block_id: string;
@@ -322,13 +340,31 @@ const ERROR_MESSAGES: Record<string, string> = {
   session_lost:
     "Cette session Bridge est perdue. Ouvrez un nouveau fil pour poursuivre",
   editorial_message_invalid: "Saisissez un message avant de l’envoyer.",
+  draft_not_found: "Aucun brouillon serveur n’est enregistré pour ce bloc.",
+  draft_expired: "Ce brouillon a expiré. Rechargez le document.",
+  draft_version_conflict:
+    "Le brouillon a changé. Rechargez-le avant de continuer.",
+  draft_base_stale:
+    "Le document a changé depuis ce brouillon. Rechargez l’atelier.",
+  draft_retention_unconfigured:
+    "La conservation des brouillons n’est pas configurée.",
+  draft_storage_unavailable:
+    "Le stockage du brouillon est temporairement indisponible.",
+  draft_cleanup_unavailable:
+    "La purge du brouillon est temporairement indisponible.",
+  draft_text_too_large: "Le brouillon dépasse la taille autorisée.",
+  draft_if_match_required:
+    "Une version de brouillon est requise pour cette modification.",
+  draft_if_match_invalid: "La version de brouillon est invalide.",
+  draft_request_invalid: "La requête de brouillon est invalide.",
   editorial_thread_transport_uncertain:
     EDITORIAL_THREAD_TRANSPORT_UNCERTAIN_MESSAGE,
 };
 
-interface ErrorDetail {
+interface ErrorDetail extends Record<string, unknown> {
   code?: string;
   message?: string;
+  expires_at?: string;
 }
 
 async function adaptApiError(response: Response): Promise<ApiError> {
@@ -346,13 +382,65 @@ async function adaptApiError(response: Response): Promise<ApiError> {
     ERROR_MESSAGES[code] ??
     detailObject?.message ??
     "L’atelier éditorial est indisponible.";
-  return new ApiError(message, code, response.status);
+  return new ApiError(message, code, response.status, detailObject);
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init);
   if (!response.ok) throw await adaptApiError(response);
   return (await response.json()) as T;
+}
+
+export function getEditorialServerDraft(
+  subjectId: string,
+  occurrenceId: string,
+): Promise<EditorialServerDraft> {
+  return request<EditorialServerDraft>(
+    `/api/subjects/${encodeURIComponent(subjectId)}/editor/blocks/${encodeURIComponent(occurrenceId)}/draft`,
+    { cache: "no-store" },
+  );
+}
+
+export function putEditorialServerDraft(
+  subjectId: string,
+  occurrenceId: string,
+  input: {
+    snapshot_id: string;
+    text: string;
+    expected_version: number;
+  },
+): Promise<EditorialServerDraft> {
+  return request<EditorialServerDraft>(
+    `/api/subjects/${encodeURIComponent(subjectId)}/editor/blocks/${encodeURIComponent(occurrenceId)}/draft`,
+    {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        "If-Match": `"${input.expected_version}"`,
+      },
+      body: JSON.stringify({
+        snapshot_id: input.snapshot_id,
+        text: input.text,
+      }),
+      cache: "no-store",
+    },
+  );
+}
+
+export async function deleteEditorialServerDraft(
+  subjectId: string,
+  occurrenceId: string,
+  expectedVersion: number,
+): Promise<void> {
+  const response = await fetch(
+    `/api/subjects/${encodeURIComponent(subjectId)}/editor/blocks/${encodeURIComponent(occurrenceId)}/draft`,
+    {
+      method: "DELETE",
+      headers: { "If-Match": `"${expectedVersion}"` },
+      cache: "no-store",
+    },
+  );
+  if (!response.ok) throw await adaptApiError(response);
 }
 
 export function getEditorialWorkspaceSnapshot(

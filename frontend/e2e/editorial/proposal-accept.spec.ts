@@ -176,6 +176,18 @@ async function installApiStubs(page: Page, mode: "accept" | "conflict") {
       await route.continue();
       return;
     }
+    if (
+      method === "GET" &&
+      /^\/api\/subjects\/[^/]+\/editor\/blocks\/[^/]+\/draft$/.test(
+        url.pathname,
+      )
+    ) {
+      await route.fulfill({
+        status: 404,
+        json: { detail: { code: "draft_not_found" } },
+      });
+      return;
+    }
     if (method === "GET" && url.pathname === snapshotPath) {
       snapshotReads += 1;
       const currentText = accepted

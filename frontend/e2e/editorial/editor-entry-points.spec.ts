@@ -119,6 +119,18 @@ async function stubEditorApi(
       await route.continue();
       return;
     }
+    if (
+      method === "GET" &&
+      /^\/api\/subjects\/[^/]+\/editor\/blocks\/[^/]+\/draft$/.test(
+        url.pathname,
+      )
+    ) {
+      await route.fulfill({
+        status: 404,
+        json: { detail: { code: "draft_not_found" } },
+      });
+      return;
+    }
     if (method === "GET" && url.pathname === snapshotPath) {
       await route.fulfill({ json: snapshot });
       return;
@@ -462,6 +474,18 @@ test("test_all_five_entry_surfaces_use_editorial_label_and_subject_id", async ({
     }
     if (!url.pathname.startsWith("/api/")) {
       await route.continue();
+      return;
+    }
+    if (
+      method === "GET" &&
+      /^\/api\/subjects\/[^/]+\/editor\/blocks\/[^/]+\/draft$/.test(
+        url.pathname,
+      )
+    ) {
+      await route.fulfill({
+        status: 404,
+        json: { detail: { code: "draft_not_found" } },
+      });
       return;
     }
     const requestedSnapshot = url.pathname.match(

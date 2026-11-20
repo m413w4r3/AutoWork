@@ -18,6 +18,9 @@ export function EditorialWorkspacePage({
   subjectId,
 }: EditorialWorkspacePageProps) {
   const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null);
+  const [serverDraftTexts, setServerDraftTexts] = useState<
+    Record<string, string>
+  >({});
   const snapshotQuery = useQuery({
     queryKey: editorialWorkspaceQueryKeys.snapshot(subjectId),
     queryFn: () => getEditorialWorkspaceSnapshot(subjectId),
@@ -85,6 +88,17 @@ export function EditorialWorkspacePage({
   }
 
   const snapshot = snapshotQuery.data;
+  const selectedLocalDraft = selectedBlockId
+    ? (serverDraftTexts[selectedBlockId] ?? "")
+    : "";
+  const updateServerDraftText = (blockId: string, text: string) => {
+    setServerDraftTexts((current) => {
+      const next = { ...current };
+      if (text.length === 0) delete next[blockId];
+      else next[blockId] = text;
+      return next;
+    });
+  };
   const hasNoProducedContent =
     snapshot.blocks.length === 0 && snapshot.enrichments.length === 0;
   if (hasNoProducedContent && !localDrafts.hasDrafts) {
@@ -130,7 +144,9 @@ export function EditorialWorkspacePage({
         snapshot={snapshot}
         localDrafts={localDrafts}
         selectedBlockId={selectedBlockId}
+        localDraftText={selectedLocalDraft}
         onSelectBlock={setSelectedBlockId}
+        onLocalDraftChange={updateServerDraftText}
         onRefresh={() => void snapshotQuery.refetch()}
       />
     </>
