@@ -13,6 +13,14 @@ from typing import Any, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from cti_app.application.diagnostics import DiagnosticsLog
+from cti_app.application.editorial_revision_effects import (
+    EditorialPublicationPins,
+    EditorialRevisionEffects,
+    EditorialRevisionEffectsError,
+    EditorialRevisionWrite,
+    EditorialRoutingPins,
+    EditorialRunGuard,
+)
 from cti_app.application.extraction import _html_encoding, parse_document
 from cti_app.application.persistence import (
     ProductionRoutingDecisionRepository,
@@ -4249,6 +4257,7 @@ class ProductionRepairMaterializationService:
         checkpoint_service: Any | None = None,
         artifact_store: ProductionArtifactStore | None = None,
         diagnostics: DiagnosticsLog | None = None,
+        revision_effects: EditorialRevisionEffects | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._projection = projection_service or ProductionRepairProjectionService(
@@ -4258,6 +4267,7 @@ class ProductionRepairMaterializationService:
         self._artifact_store = resolved_store
         self._checkpoint = checkpoint_service
         self._diagnostics = diagnostics or DiagnosticsLog(None)
+        self._revision_effects = revision_effects
 
     async def apply(
         self,
@@ -4322,7 +4332,7 @@ class ProductionRepairMaterializationService:
             raise ProductionRepairProjectionError("production_repair_actor_required")
 
         async with self._uow_factory() as uow:
-            run = await self._locked_run(
+            run, run_guard = await self._locked_run(
                 uow,
                 edition_id=edition_id,
                 subject_id=subject_id,
@@ -4415,6 +4425,8 @@ class ProductionRepairMaterializationService:
                         uow,
                         run=run,
                         extraction=projection.artifact,
+                        run_guard=run_guard,
+                        actor_id=actor_id,
                         repair_materialization=repair_audit,
                     )
                 except _EditorialEnrichmentRebuildRequired as exc:
@@ -4440,6 +4452,8 @@ class ProductionRepairMaterializationService:
                         uow,
                         run=run,
                         extraction=projection.artifact,
+                        run_guard=run_guard,
+                        actor_id=actor_id,
                         repair_materialization=repair_audit,
                     )
                 except _EditorialEnrichmentRebuildRequired as exc:
@@ -4673,7 +4687,7 @@ class ProductionRepairMaterializationService:
         subject_id: UUID,
         observed_run_id: UUID | None,
         observed_pipeline_generation: int | None,
-    ) -> Any:
+    ) -> tuple[Any, EditorialRunGuard | None]:
         """Take the Edition then Run locks and hold them for the whole plan.
 
         The lock order matches the publication freeze exactly, and the
@@ -4696,15 +4710,28 @@ class ProductionRepairMaterializationService:
             and initial.pipeline_generation != observed_pipeline_generation
         ):
             raise ProductionRepairStaleError(ProductionRepairStaleError.code)
+        run_guard = None
+        if self._revision_effects is not None:
+            try:
+                run_guard = await self._revision_effects.acquire_run_guard(uow, initial.id)
+            except EditorialRevisionEffectsError as error:
+                raise ProductionRepairProjectionError(error.code) from None
         await self._lock_edition_and_check(uow, edition_id)
-        run: Any = await _get_for_update(runs, initial.id)
+        try:
+            run: Any = (
+                await self._revision_effects.lock_run_row(uow, run_guard)
+                if self._revision_effects is not None and run_guard is not None
+                else await _get_for_update(runs, initial.id)
+            )
+        except EditorialRevisionEffectsError as error:
+            raise ProductionRepairProjectionError(error.code) from None
         self._check_reviewable_run(run, edition_id, subject_id)
         if (
             observed_pipeline_generation is not None
             and run.pipeline_generation != observed_pipeline_generation
         ):
             raise ProductionRepairStaleError(ProductionRepairStaleError.code)
-        return run
+        return run, run_guard
 
     async def _lock_edition_and_check(self, uow: Any, edition_id: UUID) -> Any:
         editions = getattr(uow, "editions", None)
@@ -4738,6 +4765,8 @@ class ProductionRepairMaterializationService:
         *,
         run: Any,
         extraction: ProductionArtifact,
+        run_guard: EditorialRunGuard | None,
+        actor_id: str,
         repair_materialization: Mapping[str, Any] | None = None,
     ) -> tuple[ProductionArtifact, dict[str, Any] | None]:
         """Stale, reassemble and QA the publication in the caller's UoW.
@@ -4750,6 +4779,8 @@ class ProductionRepairMaterializationService:
             uow,
             run=run,
             extraction=extraction,
+            run_guard=run_guard,
+            actor_id=actor_id,
             repair_materialization=repair_materialization,
         )
 
@@ -4759,6 +4790,8 @@ class ProductionRepairMaterializationService:
         *,
         run: Any,
         extraction: ProductionArtifact,
+        run_guard: EditorialRunGuard | None,
+        actor_id: str,
         repair_materialization: Mapping[str, Any] | None,
     ) -> tuple[ProductionArtifact, dict[str, Any]]:
         """Rebind unchanged narrative to IOC repairs, then assemble V4 atomically."""
@@ -4829,6 +4862,17 @@ class ProductionRepairMaterializationService:
                 critical_source_diagnostics=source_diagnostics,
             )
             previous_decision_id = run.routing_decision_id
+            base_workspace_snapshot = None
+            editorial_writes: list[EditorialRevisionWrite] = []
+            if self._revision_effects is not None:
+                if run_guard is None:
+                    raise ProductionRepairProjectionError("editorial_registry_conflict")
+                try:
+                    base_workspace_snapshot = await self._revision_effects.current_snapshot_in_uow(
+                        uow, run.subject_id
+                    )
+                except EditorialRevisionEffectsError as error:
+                    raise ProductionRepairProjectionError(error.code) from None
             route_decision = await routing_repository.append_and_adopt(
                 route_decision,
                 expected_version=run.version,
@@ -4937,10 +4981,25 @@ class ProductionRepairMaterializationService:
                 )
                 await uow.production_artifacts.append(rebased)
                 synthesis_artifact = rebased
+                if self._revision_effects is not None:
+                    synthesis_payload = production_synthesis_to_json(synthesis)
+                    editorial_writes.append(
+                        EditorialRevisionWrite(
+                            stage=ProductionArtifactStage.SYNTHESIS,
+                            artifact=rebased,
+                            canonical_sha256=hashlib.sha256(
+                                ProductionArtifactStore.canonical_json_bytes(synthesis_payload)
+                            ).hexdigest(),
+                            canonical_content=synthesis_payload,
+                        )
+                    )
 
             editorial_enrichment = None
             editorial_enrichment_artifact = None
             if route_decision.publication_kind is PublicationKind.ARTICLE:
+                previous_enrichment_artifact = await uow.production_artifacts.get_current(
+                    run.id, ProductionArtifactStage.EDITORIAL_ENRICHMENT.value
+                )
                 (
                     editorial_enrichment,
                     editorial_enrichment_artifact,
@@ -4954,6 +5013,27 @@ class ProductionRepairMaterializationService:
                     relevance_projection=relevance_projection,
                     relevance_projection_artifact=relevance_projection_artifact,
                 )
+                if (
+                    self._revision_effects is not None
+                    and editorial_enrichment_artifact is not None
+                    and editorial_enrichment_artifact.id
+                    != (
+                        previous_enrichment_artifact.id
+                        if previous_enrichment_artifact is not None
+                        else None
+                    )
+                ):
+                    enrichment_payload = editorial_enrichment_to_json(editorial_enrichment)
+                    editorial_writes.append(
+                        EditorialRevisionWrite(
+                            stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+                            artifact=editorial_enrichment_artifact,
+                            canonical_sha256=hashlib.sha256(
+                                ProductionArtifactStore.canonical_json_bytes(enrichment_payload)
+                            ).hexdigest(),
+                            canonical_content=enrichment_payload,
+                        )
+                    )
             publication = await uow.production_artifacts.get_current(
                 run.id, ProductionArtifactStage.PUBLICATION.value
             )
@@ -5021,6 +5101,31 @@ class ProductionRepairMaterializationService:
                 publication=document,
             )
             await self._ensure_qa_passed(qa_result)
+            if editorial_writes:
+                assert self._revision_effects is not None
+                assert run_guard is not None
+                assert base_workspace_snapshot is not None
+                try:
+                    await self._revision_effects.apply_after_writes(
+                        uow,
+                        run_guard=run_guard,
+                        base_snapshot=base_workspace_snapshot,
+                        writes=tuple(editorial_writes),
+                        actor_id=actor_id,
+                        routing_pins=EditorialRoutingPins(
+                            decision_id=route_decision.decision_id,
+                            decision_hash=route_decision.decision_hash,
+                            publication_kind=route_decision.publication_kind,
+                        ),
+                        publication_pins=EditorialPublicationPins(
+                            artifact=new_publication,
+                            canonical_sha256=hashlib.sha256(
+                                await store.read_bytes(new_publication.canonical_blob_id)
+                            ).hexdigest(),
+                        ),
+                    )
+                except EditorialRevisionEffectsError as error:
+                    raise ProductionRepairProjectionError(error.code) from None
             return new_publication, qa_result
         except ProductionRepairProjectionError:
             raise

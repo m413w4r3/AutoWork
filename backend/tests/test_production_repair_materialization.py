@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import cast
 from uuid import UUID
 
 import pytest
 
 from cti_app.application.diagnostics import DiagnosticsLog
+from cti_app.application.editorial_revision_effects import EditorialPublicationPins
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_editorial_enrichment import (
     build_editorial_enrichment_evidence_pack,
@@ -264,11 +266,29 @@ class _Checkpoint:
         return SimpleNamespace(rule_sidecar_error=None)
 
 
+class _RecordingRevisionEffects:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def acquire_run_guard(self, _uow: _Uow, run_id: UUID) -> object:
+        return SimpleNamespace(production_run_id=run_id)
+
+    async def lock_run_row(self, uow: _Uow, _guard: object) -> ProductionRun:
+        return cast(ProductionRun, await uow.production_runs.get_for_update(RUN_ID))
+
+    async def current_snapshot_in_uow(self, uow: _Uow, _subject_id: UUID) -> object:
+        return await uow.production_input_snapshots.get_by_run(RUN_ID)
+
+    async def apply_after_writes(self, _uow: _Uow, **kwargs: object) -> None:
+        self.calls.append(kwargs)
+
+
 def _service(
     kind: ProductionRepairImpactKind,
     *,
     edition_state: EditionStatus = EditionStatus.OPEN,
     diagnostics: DiagnosticsLog | None = None,
+    revision_effects: _RecordingRevisionEffects | None = None,
 ) -> tuple[ProductionRepairMaterializationService, _Uow, _Projection, _CanonicalStore, _Checkpoint]:
     snapshot, references, extraction, synthesis = _canonical_inputs()
     enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
@@ -330,6 +350,7 @@ def _service(
         checkpoint_service=checkpoint,
         artifact_store=store,
         diagnostics=diagnostics,
+        revision_effects=revision_effects,  # type: ignore[arg-type]
     )
     return service, uow, projection, store, checkpoint
 
@@ -457,13 +478,49 @@ async def test_repair_diagnostics_record_the_canonical_outcome(tmp_path) -> None
 
 @pytest.mark.asyncio
 async def test_repair_rebases_synthesis_built_on_a_legacy_extraction_hash() -> None:
-    service, uow, _projection, store, _checkpoint = _service(
-        ProductionRepairImpactKind.PUBLICATION_ONLY
+    effects = _RecordingRevisionEffects()
+    service, uow, projection, store, _checkpoint = _service(
+        ProductionRepairImpactKind.PUBLICATION_ONLY,
+        revision_effects=effects,
     )
     extraction = production_extraction_from_json(store.payloads[UUID(int=11)])
     hashes = production_extraction_hashes(extraction)
-    current_hash = hashes[0]
     legacy_hash = hashes[-1]
+    source = extraction.sources[0]
+    indicator = ExtractionIndicatorV1(
+        value="ioc.example",
+        artifact_type=ArtifactType.DOMAIN,
+        indicator_status=ExtractionIndicatorStatus.CONFIRMED_IOC,
+        context="Le serveur de commande est utilisé par l'acteur.",
+        evidence_quote="ioc.example est le serveur de commande.",
+        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+        source_document_ids=(source.source_document_id,),
+    )
+    repaired_extraction = replace(
+        extraction,
+        sources=(replace(source, indicators=(indicator,)), *extraction.sources[1:]),
+    )
+    store.payloads[UUID(int=17)] = production_extraction_to_json(extraction)
+    store.payloads[UUID(int=16)] = production_extraction_to_json(repaired_extraction)
+    prior_extraction_artifact = next(
+        item for item in uow.artifacts.items if item.stage is ProductionArtifactStage.EXTRACTION
+    )
+    prior_extraction_artifact.canonical_blob_id = UUID(int=17)
+    projection.result = replace(
+        projection.result,
+        artifact=replace(
+            prior_extraction_artifact,
+            id=UUID(int=116),
+            version=2,
+            input_hash=canonical_extraction_hash(repaired_extraction),
+            canonical_blob_id=UUID(int=16),
+        ),
+    )
+    prior_decision_id = uow.run.routing_decision_id
+    assert prior_decision_id is not None
+    uow.production_routing_decisions.decisions[
+        prior_decision_id
+    ].publication_kind = PublicationKind.ARTICLE
     synthesis = production_synthesis_from_json(store.payloads[UUID(int=12)])
     store.payloads[UUID(int=12)] = production_synthesis_to_json(
         replace(synthesis, extraction_hash=legacy_hash)
@@ -479,7 +536,27 @@ async def test_repair_rebases_synthesis_built_on_a_legacy_extraction_hash() -> N
     ]
     assert len(rebased) == 1
     rebased_synthesis = production_synthesis_from_json(store.payloads[rebased[0].canonical_blob_id])
-    assert rebased_synthesis.extraction_hash == current_hash
+    assert rebased_synthesis.extraction_hash == canonical_extraction_hash(repaired_extraction)
+    rebased_enrichment = [
+        item
+        for item in uow.artifacts.items
+        if item.stage is ProductionArtifactStage.EDITORIAL_ENRICHMENT
+        and item.metadata.get("lineage_rebased")
+    ]
+    assert len(rebased_enrichment) == 1
+    assert len(effects.calls) == 1
+    writes = effects.calls[0]["writes"]
+    assert isinstance(writes, tuple)
+    assert {write.stage for write in writes} == {
+        ProductionArtifactStage.SYNTHESIS,
+        ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+    }
+    assert effects.calls[0]["actor_id"] == "analyst"
+    publication_pins = effects.calls[0]["publication_pins"]
+    assert result.publication_artifact is not None
+    assert cast(EditorialPublicationPins, publication_pins).artifact.id == (
+        result.publication_artifact.id
+    )
 
 
 @pytest.mark.asyncio

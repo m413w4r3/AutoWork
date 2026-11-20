@@ -930,12 +930,24 @@ def _production_repair_materialization_service(
 ) -> ProductionRepairMaterializationService:
     service = getattr(request.app.state, "production_repair_materialization_service", None)
     if service is None:
+        artifact_store = getattr(request.app.state, "production_artifact_store", None)
+        revision_effects = (
+            EditorialRevisionEffects(
+                workspace_service=EditorialWorkspaceService(
+                    uow_factory=request.app.state.uow_factory,
+                    artifact_store=artifact_store,
+                )
+            )
+            if artifact_store is not None
+            else None
+        )
         service = ProductionRepairMaterializationService(
             request.app.state.uow_factory,
             projection_service=_production_repair_projection_service(request),
             checkpoint_service=getattr(request.app.state, "production_checkpoint", None),
-            artifact_store=getattr(request.app.state, "production_artifact_store", None),
+            artifact_store=artifact_store,
             diagnostics=getattr(request.app.state, "production_diagnostics", None),
+            revision_effects=revision_effects,
         )
     return cast(ProductionRepairMaterializationService, service)
 

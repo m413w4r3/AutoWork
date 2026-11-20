@@ -863,6 +863,10 @@ class ProductionEditorialEnrichmentRevisionService:
                         raise EditorialEnrichmentRevisionConflictError(
                             "The requested production run is no longer current"
                         )
+                    if base_workspace_snapshot.synthesis_artifact_id != synthesis_artifact.id:
+                        raise EditorialEnrichmentRevisionConflictError(
+                            "The requested synthesis base is no longer current"
+                        )
                     artifact = await persist_restore(uow)
                     await self._revision_effects.apply_after_write(
                         uow,

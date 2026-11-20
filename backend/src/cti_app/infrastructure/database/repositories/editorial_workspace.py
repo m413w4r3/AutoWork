@@ -56,6 +56,17 @@ class SqlAlchemyEditorialWorkspaceSnapshotRepository:
         row = result.scalar_one_or_none()
         return _record_from_row(row) if row is not None else None
 
+    async def list_for_run(self, production_run_id: UUID) -> tuple[WorkspaceSnapshotRecord, ...]:
+        result = await self._session.execute(
+            select(EditorialWorkspaceSnapshotRow)
+            .where(EditorialWorkspaceSnapshotRow.production_run_id == production_run_id)
+            .order_by(
+                EditorialWorkspaceSnapshotRow.created_at,
+                EditorialWorkspaceSnapshotRow.snapshot_id,
+            )
+        )
+        return tuple(_record_from_row(row) for row in result.scalars().all())
+
     async def append_if_absent(self, record: WorkspaceSnapshotRecord) -> WorkspaceSnapshotRecord:
         values = _row_values(record)
         statement = insert(EditorialWorkspaceSnapshotRow).values(**values)

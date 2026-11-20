@@ -218,6 +218,68 @@ def _fixture(*, augmented_current: bool = False):
     return document, canonical, artifacts, store, service, command
 
 
+@pytest.mark.asyncio
+async def test_text_correction_appends_publication_without_changing_synthesis_or_enrichment() -> (
+    None
+):
+    _document, _canonical, artifacts, store, service, command = _fixture()
+    stages = (ProductionArtifactStage.SYNTHESIS, ProductionArtifactStage.EDITORIAL_ENRICHMENT)
+    run_id = artifacts.items[0].production_run_id
+    subject_id = artifacts.items[0].subject_id
+    for stage, version, payload in (
+        (ProductionArtifactStage.SYNTHESIS, 3, b'{"stage":"synthetic-synthesis"}'),
+        (
+            ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+            5,
+            b'{"stage":"synthetic-enrichment"}',
+        ),
+    ):
+        blob_id = uuid4()
+        store.blobs[blob_id] = payload
+        artifacts.items.append(
+            ProductionArtifact(
+                production_run_id=run_id,
+                subject_id=subject_id,
+                stage=stage,
+                version=version,
+                input_hash=hashlib.sha256(stage.value.encode()).hexdigest(),
+                status=ProductionArtifactStatus.VERIFIED,
+                canonical_blob_id=blob_id,
+            )
+        )
+    before = {
+        stage: tuple(
+            (
+                item.id,
+                item.version,
+                item.input_hash,
+                hashlib.sha256(store.blobs[item.canonical_blob_id]).hexdigest(),
+            )
+            for item in artifacts.items
+            if item.stage is stage and item.canonical_blob_id is not None
+        )
+        for stage in stages
+    }
+
+    result = await service.correct(command)
+
+    assert result.artifact.stage is ProductionArtifactStage.PUBLICATION
+    assert len(artifacts.appended) == 1
+    assert artifacts.appended[0].id == result.artifact.id
+    for stage in stages:
+        after = tuple(
+            (
+                item.id,
+                item.version,
+                item.input_hash,
+                hashlib.sha256(store.blobs[item.canonical_blob_id]).hexdigest(),
+            )
+            for item in artifacts.items
+            if item.stage is stage and item.canonical_blob_id is not None
+        )
+        assert after == before[stage]
+
+
 def _install_chain_qa_runner(
     service: PublicationTextCorrectionService, *, fail_other_chained_check: bool = False
 ) -> None:

@@ -29,6 +29,7 @@ from cti_app.domain.editorial_workspace import (
     workspace_pin_hash,
 )
 from cti_app.domain.production import ProductionArtifact, ProductionArtifactStage
+from cti_app.domain.publication_kind import PublicationKind
 
 
 class EditorialRevisionEffectsError(RuntimeError):
@@ -67,6 +68,19 @@ class EditorialWorkspaceAdvancer(Protocol):
 @dataclass(frozen=True, slots=True)
 class EditorialRunGuard:
     production_run_id: UUID
+
+
+@dataclass(frozen=True, slots=True)
+class EditorialRoutingPins:
+    decision_id: UUID | None
+    decision_hash: str | None
+    publication_kind: PublicationKind | None
+
+
+@dataclass(frozen=True, slots=True)
+class EditorialPublicationPins:
+    artifact: ProductionArtifact
+    canonical_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +143,8 @@ class EditorialRevisionEffects:
         retired_block_ids: Sequence[UUID] = (),
         actor_id: str | UUID,
         accepted_proposal: EditorialProposal | None = None,
+        routing_pins: EditorialRoutingPins | None = None,
+        publication_pins: EditorialPublicationPins | None = None,
     ) -> EditorialRevisionEffectsResult:
         return await self.apply_after_writes(
             uow,
@@ -146,6 +162,8 @@ class EditorialRevisionEffects:
             ),
             actor_id=actor_id,
             accepted_proposal=accepted_proposal,
+            routing_pins=routing_pins,
+            publication_pins=publication_pins,
         )
 
     async def apply_after_writes(
@@ -157,6 +175,8 @@ class EditorialRevisionEffects:
         writes: Sequence[EditorialRevisionWrite],
         actor_id: str | UUID,
         accepted_proposal: EditorialProposal | None = None,
+        routing_pins: EditorialRoutingPins | None = None,
+        publication_pins: EditorialPublicationPins | None = None,
     ) -> EditorialRevisionEffectsResult:
         actor_id = editorial_actor_storage_id(actor_id)
         if run_guard.production_run_id != base_snapshot.production_run_id or not writes:
@@ -181,11 +201,19 @@ class EditorialRevisionEffects:
             or accepted_proposal.accepted_artifact_id not in {item.artifact.id for item in writes}
         ):
             raise EditorialRevisionEffectsError("editorial_proposal_state_conflict")
+        if publication_pins is not None and (
+            publication_pins.artifact.production_run_id != base_snapshot.production_run_id
+            or publication_pins.artifact.subject_id != base_snapshot.subject_id
+            or publication_pins.artifact.stage is not ProductionArtifactStage.PUBLICATION
+        ):
+            raise EditorialRevisionEffectsError("editorial_registry_conflict")
 
         snapshot = await self._append_workspace_snapshot(
             uow,
             base_snapshot,
             writes,
+            routing_pins=routing_pins,
+            publication_pins=publication_pins,
         )
         await stale_changed_pin_proposals(
             uow,
@@ -221,6 +249,9 @@ class EditorialRevisionEffects:
         uow: Any,
         base: WorkspaceSnapshotRecord,
         writes: Sequence[EditorialRevisionWrite],
+        *,
+        routing_pins: EditorialRoutingPins | None,
+        publication_pins: EditorialPublicationPins | None,
     ) -> WorkspaceSnapshotRecord:
         entries = base.block_registry
         retired = set(base.retired_block_ids)
@@ -244,6 +275,23 @@ class EditorialRevisionEffects:
             "routing_decision_hash": base.routing_decision_hash,
             "publication_kind": base.publication_kind,
         }
+        if routing_pins is not None:
+            pins.update(
+                {
+                    "routing_decision_id": routing_pins.decision_id,
+                    "routing_decision_hash": routing_pins.decision_hash,
+                    "publication_kind": routing_pins.publication_kind,
+                }
+            )
+        if publication_pins is not None:
+            pins.update(
+                {
+                    "publication_artifact_id": publication_pins.artifact.id,
+                    "publication_version": publication_pins.artifact.version,
+                    "publication_input_hash": publication_pins.artifact.input_hash,
+                    "publication_canonical_sha256": publication_pins.canonical_sha256,
+                }
+            )
         for write in writes:
             source_stage = EditorialSourceStage(write.stage.value)
             stage_entries = tuple(entry for entry in entries if entry.source_stage is source_stage)
@@ -298,11 +346,26 @@ class EditorialRevisionEffects:
             enrichment_version=cast(int | None, pins["enrichment_version"]),
             enrichment_input_hash=cast(str | None, pins["enrichment_input_hash"]),
             enrichment_canonical_sha256=cast(str | None, pins["enrichment_canonical_sha256"]),
+            publication_artifact_id=cast(UUID | None, pins["publication_artifact_id"]),
+            publication_version=cast(int | None, pins["publication_version"]),
+            publication_input_hash=cast(str | None, pins["publication_input_hash"]),
+            publication_canonical_sha256=cast(str | None, pins["publication_canonical_sha256"]),
             workspace_pin_hash=workspace_pin_hash(pins),
             registry_hash=registry_hash(entries),
             block_registry=tuple(entries),
             retired_block_ids=tuple(sorted(retired, key=str)),
             parent_snapshot_id=base.snapshot_id,
+            routing_decision_id=(
+                routing_pins.decision_id if routing_pins is not None else base.routing_decision_id
+            ),
+            routing_decision_hash=(
+                routing_pins.decision_hash
+                if routing_pins is not None
+                else base.routing_decision_hash
+            ),
+            publication_kind=(
+                routing_pins.publication_kind if routing_pins is not None else base.publication_kind
+            ),
         )
         stored = await uow.editorial_workspace_snapshots.append_if_absent(next_record)
         if (

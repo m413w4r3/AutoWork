@@ -14,6 +14,7 @@ from cti_app.application.analyst_opinion_preview import AnalystOpinionPreviewSer
 from cti_app.application.analyst_opinion_service import AnalystOpinionService
 from cti_app.application.analyst_publication_service import AnalystPublicationService
 from cti_app.application.blobs import BlobCatalogService
+from cti_app.application.editorial_workspace.service import EditorialWorkspaceService
 from cti_app.application.investigation_governance import (
     InvestigationEnvelopeProposal,
     InvestigationEnvelopeService,
@@ -414,6 +415,42 @@ async def test_postgres_correction_and_rebase_are_append_only(
         correlation_id=f"publication-correction-envelope-{suffix}",
     )
 
+    workspace_service = EditorialWorkspaceService(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+    )
+    initial_workspace = await workspace_service.snapshot(subject.id)
+    assert initial_workspace["publication_artifact_id"] == str(head.id)
+    async with uow_factory() as uow:
+        initial_workspace_record = await uow.editorial_workspace_snapshots.latest_for_run(run.id)
+        assert initial_workspace_record is not None
+
+    async def editorial_stage_signature() -> dict[ProductionArtifactStage, tuple[object, ...]]:
+        async with uow_factory() as uow:
+            artifacts = await uow.production_artifacts.list_for_run(run.id)
+        signature: dict[ProductionArtifactStage, tuple[object, ...]] = {}
+        for stage in (
+            ProductionArtifactStage.SYNTHESIS,
+            ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+        ):
+            stage_artifacts = [item for item in artifacts if item.stage is stage]
+            signature[stage] = tuple(
+                (
+                    item.id,
+                    item.version,
+                    item.input_hash,
+                    hashlib.sha256(
+                        await artifact_store.read_bytes(item.canonical_blob_id)
+                    ).hexdigest()
+                    if item.canonical_blob_id is not None
+                    else None,
+                )
+                for item in stage_artifacts
+            )
+        return signature
+
+    editorial_stages_before_correction = await editorial_stage_signature()
+
     before_title = document.title
     assert before_title == synthesis_value.title
     before_title_spans = next(
@@ -524,6 +561,14 @@ async def test_postgres_correction_and_rebase_are_append_only(
             replacement_spans=replacement_section_spans,
         )
     )
+    assert await editorial_stage_signature() == editorial_stages_before_correction
+    corrected_workspace = await workspace_service.snapshot(subject.id)
+    assert corrected_workspace["publication_artifact_id"] == str(result.artifact.id)
+    async with uow_factory() as uow:
+        corrected_workspace_record = await uow.editorial_workspace_snapshots.latest_for_run(run.id)
+        assert corrected_workspace_record is not None
+        assert corrected_workspace_record.parent_snapshot_id == initial_workspace_record.snapshot_id
+        assert corrected_workspace_record.publication_artifact_id == result.artifact.id
     opinion_service = AnalystOpinionService(
         uow_factory=uow_factory,
         artifact_store=artifact_store,
