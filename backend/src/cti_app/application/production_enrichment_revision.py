@@ -29,6 +29,10 @@ from cti_app.application.editorial_enrichment_revision import (
     EditorialEnrichmentRevisionLineage,
     EditorialEnrichmentRevisionValidationError,
 )
+from cti_app.application.editorial_revision_effects import (
+    EditorialRevisionEffects,
+    EditorialRevisionEffectsError,
+)
 from cti_app.application.media_assets import compile_and_store_diagrams
 from cti_app.application.model_gateway import ModelSubmissionReconciliationRequiredError
 from cti_app.application.production_artifact_store import ProductionArtifactStore
@@ -182,11 +186,13 @@ class ProductionEditorialEnrichmentRevisionService:
         enrichment_service: ProductionEditorialEnrichmentService,
         persistence_service: EditorialEnrichmentService,
         publication_render_service: PublicationRenderService,
+        revision_effects: EditorialRevisionEffects | None = None,
     ) -> None:
         self._enrichment = enrichment_service
         self._lineage = EditorialEnrichmentRevisionLineage(enrichment_service)
         self._persistence = persistence_service
         self._publication_render_service = publication_render_service
+        self._revision_effects = revision_effects
 
     async def _critical_source_assessment(
         self,
@@ -788,41 +794,95 @@ class ProductionEditorialEnrichmentRevisionService:
                 str(previous_publication.id) if previous_publication is not None else None
             ),
         }
-        artifact = await self._persistence.store_editorial_enrichment_result(
-            run_id=run.id,
-            subject_id=subject_id,
-            input_hash=fence.input_hash,
-            enrichment=restored_enrichment,
-            extraction=extraction,
-            synthesis=synthesis,
-            raw_result=None,
-            model_run_id=None,
-            evidence_pack_hash=fence.evidence_pack_hash,
-            access_policy_hash=synthesis_access_policy_hash(fence.access_policy),
-            model_policy_version=EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION,
-            routing_policy_version=str(base_artifact.metadata.get("routing_policy_version", "")),
-            projection_hash=projection.projection_hash if projection is not None else None,
-            source_figure_inventory_hash=fence.inventory_hash,
-            metadata_extra={
-                "source_figure_provenance_version": SOURCE_FIGURE_PROVENANCE_DIAGNOSTICS_VERSION,
-                "source_figure_provenance_diagnostics": build_source_figure_provenance_diagnostics(
-                    fence.inventory, fence.figure_catalog, restored_enrichment
+
+        async def persist_restore(uow: Any | None = None) -> ProductionArtifact:
+            return await self._persistence.store_editorial_enrichment_result(
+                run_id=run.id,
+                subject_id=subject_id,
+                input_hash=fence.input_hash,
+                enrichment=restored_enrichment,
+                extraction=extraction,
+                synthesis=synthesis,
+                raw_result=None,
+                model_run_id=None,
+                evidence_pack_hash=fence.evidence_pack_hash,
+                access_policy_hash=synthesis_access_policy_hash(fence.access_policy),
+                model_policy_version=EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION,
+                routing_policy_version=str(
+                    base_artifact.metadata.get("routing_policy_version", "")
                 ),
-                "revision": revision_data,
-                "revision_restore": {
-                    "from_artifact_id": str(base_artifact.id),
-                    "restored_blocks": restored_identities,
-                    "non_restorable_blocks": [dict(item) for item in non_restorable],
-                    "model_call_count": 0,
+                projection_hash=projection.projection_hash if projection is not None else None,
+                source_figure_inventory_hash=fence.inventory_hash,
+                metadata_extra={
+                    "source_figure_provenance_version": (
+                        SOURCE_FIGURE_PROVENANCE_DIAGNOSTICS_VERSION
+                    ),
+                    "source_figure_provenance_diagnostics": (
+                        build_source_figure_provenance_diagnostics(
+                            fence.inventory, fence.figure_catalog, restored_enrichment
+                        )
+                    ),
+                    "revision": revision_data,
+                    "revision_restore": {
+                        "from_artifact_id": str(base_artifact.id),
+                        "restored_blocks": restored_identities,
+                        "non_restorable_blocks": [dict(item) for item in non_restorable],
+                        "model_call_count": 0,
+                    },
                 },
-            },
-            artifact_id=revision_artifact_id,
-            expected_current_artifact_id=base_artifact.id,
-            expected_current_input_hash=base_artifact.input_hash,
-            expected_current_canonical_sha256=base_canonical_sha256,
-            canonical_payload=final_payload,
-            resource_search_enabled=self._enrichment._resource_search_enabled,
-        )
+                artifact_id=revision_artifact_id,
+                expected_current_artifact_id=base_artifact.id,
+                expected_current_input_hash=base_artifact.input_hash,
+                expected_current_canonical_sha256=base_canonical_sha256,
+                canonical_payload=final_payload,
+                resource_search_enabled=self._enrichment._resource_search_enabled,
+                uow=uow,
+            )
+
+        if self._revision_effects is None:
+            artifact = await persist_restore()
+        else:
+            try:
+                revision_actor_id = UUID(actor)
+            except ValueError:
+                raise EditorialEnrichmentRevisionConflictError(
+                    "editorial_revision_actor_invalid"
+                ) from None
+            try:
+                async with self._enrichment._uow_factory() as uow:
+                    run_guard = await self._revision_effects.acquire_run_guard(uow, run.id)
+                    await self._revision_effects.lock_run_row(uow, run_guard)
+                    current = await uow.production_artifacts.get_current(
+                        run.id, ProductionArtifactStage.EDITORIAL_ENRICHMENT.value
+                    )
+                    if current is None or current.id != base_artifact.id:
+                        raise EditorialEnrichmentRevisionConflictError(
+                            "The requested base artifact is stale"
+                        )
+                    base_workspace_snapshot = await self._revision_effects.current_snapshot_in_uow(
+                        uow, subject_id
+                    )
+                    if base_workspace_snapshot.production_run_id != run.id:
+                        raise EditorialEnrichmentRevisionConflictError(
+                            "The requested production run is no longer current"
+                        )
+                    artifact = await persist_restore(uow)
+                    await self._revision_effects.apply_after_write(
+                        uow,
+                        run_guard=run_guard,
+                        base_snapshot=base_workspace_snapshot,
+                        stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+                        artifact=artifact,
+                        canonical_sha256=hashlib.sha256(
+                            ProductionArtifactStore.canonical_json_bytes(final_payload)
+                        ).hexdigest(),
+                        canonical_content=final_payload,
+                        lineage=None,
+                        actor_id=revision_actor_id,
+                    )
+                    await uow.commit()
+            except EditorialRevisionEffectsError as error:
+                raise EditorialEnrichmentRevisionConflictError(error.code) from None
         references_blob_id = references_artifact.canonical_blob_id
         if references_blob_id is None:
             raise EditorialEnrichmentRevisionConflictError(
@@ -1255,6 +1315,7 @@ class ProductionEditorialEnrichmentRevisionService:
         action: EditorialEnrichmentRevisionAction,
         instruction: str,
         targeted_request: TargetedEditorialRevisionRequest | None = None,
+        actor: str | None = None,
     ) -> EditorialEnrichmentRevisionResult | TargetedSynthesisRevisionResult:
         normalized_instruction = instruction.strip()
         is_targeted_delete = targeted_request is not None and targeted_request.operation in {
@@ -1897,6 +1958,42 @@ class ProductionEditorialEnrichmentRevisionService:
         if artifact_store is None:
             raise ValueError("editorial_enrichment_revision_inputs_missing")
         async with self._enrichment._uow_factory() as uow:
+            run_guard = None
+            base_workspace_snapshot = None
+            revision_actor_id = None
+            if self._revision_effects is not None:
+                actor_value = actor or (
+                    targeted_request.requester if targeted_request is not None else None
+                )
+                if actor_value is None:
+                    raise EditorialEnrichmentRevisionConflictError(
+                        "editorial_revision_actor_invalid"
+                    )
+                try:
+                    revision_actor_id = UUID(actor_value)
+                except ValueError:
+                    raise EditorialEnrichmentRevisionConflictError(
+                        "editorial_revision_actor_invalid"
+                    ) from None
+                try:
+                    run_guard = await self._revision_effects.acquire_run_guard(uow, run.id)
+                    await self._revision_effects.lock_run_row(uow, run_guard)
+                    current = await uow.production_artifacts.get_current(
+                        run.id, ProductionArtifactStage.EDITORIAL_ENRICHMENT.value
+                    )
+                    if current is None or current.id != base_artifact.id:
+                        raise EditorialEnrichmentRevisionConflictError(
+                            "The requested base artifact is stale"
+                        )
+                    base_workspace_snapshot = await self._revision_effects.current_snapshot_in_uow(
+                        uow, subject_id
+                    )
+                    if base_workspace_snapshot.production_run_id != run.id:
+                        raise EditorialEnrichmentRevisionConflictError(
+                            "The requested production run is no longer current"
+                        )
+                except EditorialRevisionEffectsError as error:
+                    raise EditorialEnrichmentRevisionConflictError(error.code) from None
             artifact = await persist_candidate(
                 uow,
                 artifact_store=artifact_store,
@@ -1914,6 +2011,24 @@ class ProductionEditorialEnrichmentRevisionService:
                 source_figure_inventory_hash=inventory_hash,
                 metadata_extra=metadata_extra,
             )
+            if self._revision_effects is not None:
+                assert run_guard is not None
+                assert base_workspace_snapshot is not None
+                assert revision_actor_id is not None
+                try:
+                    await self._revision_effects.apply_after_write(
+                        uow,
+                        run_guard=run_guard,
+                        base_snapshot=base_workspace_snapshot,
+                        stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+                        artifact=artifact,
+                        canonical_sha256=built_candidate.canonical_sha256,
+                        canonical_content=final_payload,
+                        lineage=None,
+                        actor_id=revision_actor_id,
+                    )
+                except EditorialRevisionEffectsError as error:
+                    raise EditorialEnrichmentRevisionConflictError(error.code) from None
             await uow.commit()
         # Publication assembly and preview rendering remain post-commit behind
         # their existing services; they are not part of the candidate UOW.

@@ -39,6 +39,20 @@ from cti_app.application.editorial_proposal_blobs import (
     EditorialProposalBlobError,
     EditorialProposalBlobManager,
 )
+from cti_app.application.editorial_revision_effects import (
+    EditorialRevisionEffects,
+    EditorialRevisionEffectsError,
+    stale_changed_pin_proposals,
+)
+from cti_app.application.editorial_revision_effects import (
+    proposal_fences_match_record as _proposal_fences_match_record,
+)
+from cti_app.application.editorial_revision_effects import (
+    state_event as _state_event,
+)
+from cti_app.application.editorial_revision_effects import (
+    state_request_sha256 as _state_request_sha256,
+)
 from cti_app.application.editorial_synthesis.candidate import (
     PatchApplicator,
     SynthesisCandidate,
@@ -59,7 +73,6 @@ from cti_app.application.editorial_synthesis.targets import resolve_target
 from cti_app.application.editorial_workspace.registry import (
     WorkspaceOccurrenceResolution,
     WorkspaceSnapshotRecord,
-    registry_hash,
 )
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import (
@@ -85,7 +98,6 @@ from cti_app.domain.editorial_workspace import (
     AdvancedBlockRegistry,
     BlockRegistryEntry,
     EditorialSourceStage,
-    workspace_pin_hash,
 )
 from cti_app.domain.production import (
     ProductionArtifact,
@@ -260,6 +272,7 @@ class EditorialProposalAdoptionService:
         self._inputs = inputs
         self._synthesis_writer = synthesis_writer
         self._enrichment_writer = enrichment_writer
+        self._revision_effects = EditorialRevisionEffects(workspace_service=workspace_service)
 
     async def adopt(
         self,
@@ -642,7 +655,9 @@ class EditorialProposalAdoptionService:
         descriptor: BlobDescriptor,
     ) -> EditorialProposalAdoptionResult:
         async with self._uow_factory() as uow:
-            await uow.editorial_proposals.lock_adoption_for_run(proposal.production_run_id)
+            run_guard = await self._revision_effects.acquire_run_guard(
+                uow, proposal.production_run_id
+            )
             locked = await uow.editorial_proposals.get_for_occurrence_for_update(
                 subject_id, occurrence_id, proposal.id
             )
@@ -663,9 +678,10 @@ class EditorialProposalAdoptionService:
             ):
                 raise EditorialProposalAdoptionError("proposal_state_conflict")
 
-            run = await uow.production_runs.get_for_update(locked.production_run_id)
-            if run is None:
-                raise EditorialProposalAdoptionError("proposal_base_stale")
+            try:
+                await self._revision_effects.lock_run_row(uow, run_guard)
+            except EditorialRevisionEffectsError:
+                raise EditorialProposalAdoptionError("proposal_base_stale") from None
             try:
                 resolution = await self._workspace_service.resolve_occurrence_in_uow(
                     uow, subject_id, occurrence_id
@@ -691,11 +707,12 @@ class EditorialProposalAdoptionService:
                 )
                 if stale is None or not changed:
                     raise EditorialProposalAdoptionError("proposal_state_conflict")
-                await self._stale_outdated_proposals(
+                await stale_changed_pin_proposals(
                     uow,
-                    base_proposal=stale,
+                    production_run_id=stale.production_run_id,
                     actor_id=actor_id,
                     current_record=resolution.record if resolution is not None else None,
+                    base_proposal=stale,
                 )
                 await uow.commit()
                 raise EditorialProposalAdoptionError("proposal_stale")
@@ -729,9 +746,6 @@ class EditorialProposalAdoptionService:
                 blob,
                 proposal=locked,
                 patch_sha256=patch_sha256,
-            )
-            snapshot = await self._append_workspace_snapshot(
-                uow, resolution.record, stage, plan, artifact
             )
             decision_id = uuid4()
             accepted = locked.transition(EditorialProposalState.ACCEPTED)
@@ -771,28 +785,30 @@ class EditorialProposalAdoptionService:
                     proposal_id=stored.id,
                 )
 
-            await self._stale_outdated_proposals(
-                uow,
-                base_proposal=stored,
-                actor_id=actor_id,
-                current_record=snapshot,
-            )
-
-            sequence = await uow.editorial_proposal_impacts.next_sequence_for_run(
-                stored.production_run_id
-            )
-            impact = EditorialProposalImpact(
-                impact_id=uuid4(),
-                subject_id=stored.subject_id,
-                production_run_id=stored.production_run_id,
-                proposal_id=stored.id,
-                accepted_artifact_id=artifact.id,
-                accepted_snapshot_id=snapshot.snapshot_id,
-                base_pin_hash=stored.base_pin_hash,
-                accepted_pin_hash=snapshot.workspace_pin_hash,
-                sequence=sequence,
-            )
-            await uow.editorial_proposal_impacts.add(impact)
+            try:
+                effects = await self._revision_effects.apply_after_write(
+                    uow,
+                    run_guard=run_guard,
+                    base_snapshot=resolution.record,
+                    stage=stage,
+                    artifact=artifact,
+                    canonical_sha256=plan.candidate.canonical_sha256,
+                    canonical_content=(
+                        plan.candidate.payload
+                        if isinstance(plan, _SynthesisCandidatePlan)
+                        else plan.candidate.canonical_payload
+                    ),
+                    lineage=plan.registry_lineage,
+                    retired_block_ids=plan.retired_block_ids,
+                    actor_id=actor_id,
+                    accepted_proposal=stored,
+                )
+            except EditorialRevisionEffectsError as error:
+                raise EditorialProposalAdoptionError(error.code) from None
+            snapshot = effects.snapshot
+            impact = effects.impact
+            if impact is None:
+                raise EditorialProposalAdoptionError("editorial_impact_missing")
             await uow.commit()
             return EditorialProposalAdoptionResult(
                 proposal=stored,
@@ -869,185 +885,18 @@ class EditorialProposalAdoptionService:
             invalidate_downstream=False,
         )
 
-    async def _append_workspace_snapshot(
-        self,
-        uow: UnitOfWork,
-        base: WorkspaceSnapshotRecord,
-        stage: _Stage,
-        plan: _CandidatePlan,
-        artifact: ProductionArtifact,
-    ) -> WorkspaceSnapshotRecord:
-        source_stage = EditorialSourceStage(stage.value)
-        base_stage_entries = tuple(
-            entry for entry in base.block_registry if entry.source_stage is source_stage
-        )
-        try:
-            advanced = self._workspace_service.advance(
-                base_registry=base_stage_entries,
-                artifact_id=artifact.id,
-                canonical_sha256=plan.candidate.canonical_sha256,
-                source_stage=stage.value,
-                canonical_content=plan.candidate.payload
-                if isinstance(plan, _SynthesisCandidatePlan)
-                else plan.candidate.canonical_payload,
-                lineage=plan.registry_lineage,
-                retired_block_ids=plan.retired_block_ids,
-            )
-        except Exception:
-            raise EditorialProposalAdoptionError("editorial_registry_conflict") from None
-        unchanged_entries = tuple(
-            entry for entry in base.block_registry if entry.source_stage is not source_stage
-        )
-        if source_stage is EditorialSourceStage.SYNTHESIS:
-            entries = (*advanced.active, *unchanged_entries)
-        else:
-            entries = (*unchanged_entries, *advanced.active)
-        retired = tuple(
-            sorted(set(base.retired_block_ids) | set(advanced.retired_block_ids), key=str)
-        )
-
-        pins: dict[str, object] = {
-            "subject_id": base.subject_id,
-            "production_run_id": base.production_run_id,
-            "synthesis_artifact_id": base.synthesis_artifact_id,
-            "synthesis_version": base.synthesis_version,
-            "synthesis_input_hash": base.synthesis_input_hash,
-            "synthesis_canonical_sha256": base.synthesis_canonical_sha256,
-            "enrichment_artifact_id": base.enrichment_artifact_id,
-            "enrichment_version": base.enrichment_version,
-            "enrichment_input_hash": base.enrichment_input_hash,
-            "enrichment_canonical_sha256": base.enrichment_canonical_sha256,
-            "publication_artifact_id": base.publication_artifact_id,
-            "publication_version": base.publication_version,
-            "publication_input_hash": base.publication_input_hash,
-            "publication_canonical_sha256": base.publication_canonical_sha256,
-            "pipeline_generation": base.pipeline_generation,
-            "routing_decision_id": base.routing_decision_id,
-            "routing_decision_hash": base.routing_decision_hash,
-            "publication_kind": base.publication_kind,
-        }
-        pin_fields = (
-            ("synthesis",) if source_stage is EditorialSourceStage.SYNTHESIS else ("enrichment",)
-        )
-        prefix = pin_fields[0]
-        pins[f"{prefix}_artifact_id"] = artifact.id
-        pins[f"{prefix}_version"] = artifact.version
-        pins[f"{prefix}_input_hash"] = artifact.input_hash
-        pins[f"{prefix}_canonical_sha256"] = plan.candidate.canonical_sha256
-        next_record = replace(
-            base,
-            snapshot_id=uuid4(),
-            synthesis_artifact_id=(
-                artifact.id
-                if source_stage is EditorialSourceStage.SYNTHESIS
-                else base.synthesis_artifact_id
-            ),
-            synthesis_version=(
-                artifact.version
-                if source_stage is EditorialSourceStage.SYNTHESIS
-                else base.synthesis_version
-            ),
-            synthesis_input_hash=(
-                artifact.input_hash
-                if source_stage is EditorialSourceStage.SYNTHESIS
-                else base.synthesis_input_hash
-            ),
-            synthesis_canonical_sha256=(
-                plan.candidate.canonical_sha256
-                if source_stage is EditorialSourceStage.SYNTHESIS
-                else base.synthesis_canonical_sha256
-            ),
-            enrichment_artifact_id=(
-                artifact.id
-                if source_stage is EditorialSourceStage.EDITORIAL_ENRICHMENT
-                else base.enrichment_artifact_id
-            ),
-            enrichment_version=(
-                artifact.version
-                if source_stage is EditorialSourceStage.EDITORIAL_ENRICHMENT
-                else base.enrichment_version
-            ),
-            enrichment_input_hash=(
-                artifact.input_hash
-                if source_stage is EditorialSourceStage.EDITORIAL_ENRICHMENT
-                else base.enrichment_input_hash
-            ),
-            enrichment_canonical_sha256=(
-                plan.candidate.canonical_sha256
-                if source_stage is EditorialSourceStage.EDITORIAL_ENRICHMENT
-                else base.enrichment_canonical_sha256
-            ),
-            workspace_pin_hash=workspace_pin_hash(pins),
-            registry_hash=registry_hash(entries),
-            block_registry=tuple(entries),
-            retired_block_ids=retired,
-            parent_snapshot_id=base.snapshot_id,
-        )
-        stored = await uow.editorial_workspace_snapshots.append_if_absent(next_record)
-        if (
-            stored.workspace_pin_hash != next_record.workspace_pin_hash
-            or stored.registry_hash != next_record.registry_hash
-            or stored.block_registry != next_record.block_registry
-        ):
-            raise EditorialProposalAdoptionError("editorial_registry_conflict")
-        return stored
-
-    async def _stale_outdated_proposals(
-        self,
-        uow: UnitOfWork,
-        *,
-        base_proposal: EditorialProposal,
-        actor_id: UUID,
-        current_record: WorkspaceSnapshotRecord | None,
-    ) -> None:
-        for other in await uow.editorial_proposals.list_proposed_for_run_for_update(
-            base_proposal.production_run_id
-        ):
-            if other.id == base_proposal.id:
-                continue
-            if (
-                other.variant_group_id != base_proposal.variant_group_id
-                and current_record is not None
-                and _proposal_fences_match_record(other, current_record)
-            ):
-                continue
-            event = (
-                _stale_after_acceptance_event(
-                    other, base_proposal, actor_id, current_record.workspace_pin_hash
-                )
-                if base_proposal.state is EditorialProposalState.ACCEPTED
-                and current_record is not None
-                else _state_event(
-                    other,
-                    state=EditorialProposalState.STALE,
-                    actor_id=actor_id,
-                    idempotency_key=f"stale-{other.id.hex}-{other.state_version}",
-                    request_sha256=_state_request_sha256(other, "stale"),
-                )
-            )
-            stale, changed = await uow.editorial_proposals.transition_if_current(
-                subject_id=other.subject_id,
-                occurrence_id=other.occurrence_id,
-                proposal_id=other.id,
-                expected_state=EditorialProposalState.PROPOSED,
-                expected_state_version=other.state_version,
-                state=EditorialProposalState.STALE,
-                event=event,
-            )
-            if stale is None or not changed:
-                raise EditorialProposalAdoptionError("proposal_state_conflict")
-
     async def _persist_stale(self, proposal: EditorialProposal, *, actor_id: UUID) -> None:
         async with self._uow_factory() as uow:
-            await uow.editorial_proposals.lock_adoption_for_run(proposal.production_run_id)
+            guard = await self._revision_effects.acquire_run_guard(uow, proposal.production_run_id)
             locked = await uow.editorial_proposals.get_for_occurrence_for_update(
                 proposal.subject_id, proposal.occurrence_id, proposal.id
             )
             if locked is None:
                 raise EditorialProposalAdoptionError("proposal_not_found")
-            run = await uow.production_runs.get_for_update(locked.production_run_id)
-            if run is None:
-                raise EditorialProposalAdoptionError("proposal_base_stale")
+            try:
+                await self._revision_effects.lock_run_row(uow, guard)
+            except EditorialRevisionEffectsError:
+                raise EditorialProposalAdoptionError("proposal_base_stale") from None
             if locked.state is not EditorialProposalState.PROPOSED:
                 return
             try:
@@ -1075,11 +924,12 @@ class EditorialProposalAdoptionService:
             if stored is None:
                 raise EditorialProposalAdoptionError("proposal_not_found")
             if changed:
-                await self._stale_outdated_proposals(
+                await stale_changed_pin_proposals(
                     uow,
-                    base_proposal=stored,
+                    production_run_id=stored.production_run_id,
                     actor_id=actor_id,
                     current_record=resolution.record if resolution is not None else None,
+                    base_proposal=stored,
                 )
                 await uow.commit()
 
@@ -1207,32 +1057,6 @@ def _proposal_pins_match(
     )
 
 
-def _proposal_fences_match_record(
-    proposal: EditorialProposal, record: WorkspaceSnapshotRecord
-) -> bool:
-    if (
-        record.subject_id != proposal.subject_id
-        or record.production_run_id != proposal.production_run_id
-        or record.snapshot_id != proposal.snapshot_id
-        or record.workspace_pin_hash != proposal.base_pin_hash
-        or record.routing_decision_hash != proposal.base_routing_hash
-    ):
-        return False
-    if record.synthesis_artifact_id == proposal.base_artifact_id:
-        return (
-            record.synthesis_version == proposal.base_artifact_version
-            and record.synthesis_input_hash == proposal.base_input_hash
-            and record.synthesis_canonical_sha256 == proposal.base_canonical_sha256
-        )
-    if record.enrichment_artifact_id == proposal.base_artifact_id:
-        return (
-            record.enrichment_version == proposal.base_artifact_version
-            and record.enrichment_input_hash == proposal.base_input_hash
-            and record.enrichment_canonical_sha256 == proposal.base_canonical_sha256
-        )
-    return False
-
-
 def _decision_request_sha256(
     *,
     proposal_id: UUID,
@@ -1265,63 +1089,4 @@ def _matches_accept_event(
         and event.actor_id == actor_id
         and event.request_sha256 == request_sha256
         and event.patch_sha256 == patch_sha256
-    )
-
-
-def _state_event(
-    proposal: EditorialProposal,
-    *,
-    state: EditorialProposalState,
-    actor_id: UUID,
-    idempotency_key: str,
-    request_sha256: str,
-) -> EditorialProposalEvent:
-    return EditorialProposalEvent(
-        id=uuid4(),
-        proposal_id=proposal.id,
-        sequence=proposal.state_version + 1,
-        kind=EditorialProposalEventKind.STATE_CHANGED,
-        state=state,
-        state_version=proposal.state_version + 1,
-        actor_id=actor_id,
-        idempotency_key=idempotency_key,
-        request_sha256=request_sha256,
-        patch_sha256=proposal.patch_sha256,
-    )
-
-
-def _state_request_sha256(proposal: EditorialProposal, action: str) -> str:
-    body = {
-        "action": action,
-        "proposal_id": str(proposal.id),
-        "state_version": proposal.state_version,
-        "patch_sha256": proposal.patch_sha256,
-    }
-    return hashlib.sha256(
-        json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-
-
-def _stale_after_acceptance_event(
-    proposal: EditorialProposal,
-    accepted: EditorialProposal,
-    actor_id: UUID,
-    accepted_pin_hash: str,
-) -> EditorialProposalEvent:
-    body = {
-        "action": "stale_after_acceptance",
-        "proposal_id": str(proposal.id),
-        "accepted_proposal_id": str(accepted.id),
-        "accepted_pin_hash": accepted_pin_hash,
-        "state_version": proposal.state_version,
-    }
-    digest = hashlib.sha256(
-        json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-    return _state_event(
-        proposal,
-        state=EditorialProposalState.STALE,
-        actor_id=actor_id,
-        idempotency_key=f"accept-stale-{accepted.id.hex}-{proposal.id.hex}",
-        request_sha256=digest,
     )
