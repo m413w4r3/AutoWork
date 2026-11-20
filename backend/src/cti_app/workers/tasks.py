@@ -104,6 +104,7 @@ from cti_app.workers.broker import broker as broker
 # défaut de 600 000 ms, qui tuait le worker en pleine attente du bridge.
 EXECUTE_JOB_TIME_LIMIT_MS = int(get_settings().job_actor_time_limit_seconds * 1000)
 EDITORIAL_THREAD_JOB_KIND = "editorial_thread_message"
+EDITORIAL_DRAFT_PURGE_BATCH_SIZE = 500
 
 
 def _configure_worker_logging() -> None:
@@ -190,6 +191,14 @@ def dispatch_editorial_proposal_impacts() -> None:
     """Enqueue pending, failed-retryable, and abandoned running impacts."""
     for impact_id in asyncio.run(_dispatchable_editorial_proposal_impacts()):
         process_editorial_proposal_impact.send(str(impact_id))
+
+
+@dramatiq.actor(max_retries=0)
+def sweep_expired_editorial_drafts() -> None:
+    """Delete one batch of expired draft rows; content-addressed blobs are retained."""
+    deleted_count = asyncio.run(_sweep_expired_editorial_drafts())
+    if deleted_count == EDITORIAL_DRAFT_PURGE_BATCH_SIZE:
+        sweep_expired_editorial_drafts.send_with_options(delay=1_000)
 
 
 @dramatiq.actor(max_retries=0)
@@ -607,5 +616,25 @@ async def _recover_abandoned_jobs() -> list[tuple[UUID, str]]:
             )
         recovered.extend((job_id, EDITORIAL_THREAD_JOB_KIND) for job_id in editorial_jobs)
         return recovered
+    finally:
+        await engine.dispose()
+
+
+async def _sweep_expired_editorial_drafts() -> int:
+    from cti_app.application.editorial_drafts import purge_expired_editorial_drafts
+
+    settings = get_settings()
+    engine = create_postgres_engine(settings.postgres_dsn)
+    session_factory = create_session_factory(engine)
+
+    def uow_factory() -> UnitOfWork:
+        return cast(UnitOfWork, SqlAlchemyUnitOfWork(session_factory))
+
+    try:
+        return await purge_expired_editorial_drafts(
+            uow_factory,
+            now=datetime.now(UTC),
+            limit=EDITORIAL_DRAFT_PURGE_BATCH_SIZE,
+        )
     finally:
         await engine.dispose()

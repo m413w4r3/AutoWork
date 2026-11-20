@@ -7,13 +7,16 @@ import type {
 import { BLOCK_KIND_LABELS } from "./blockKindLabels";
 import { EditorialInspector } from "./EditorialInspector";
 import { EditorialOutline } from "./EditorialOutline";
+import { EditorialServerDraftStatus } from "./EditorialServerDraftStatus";
 import { EditorialTopBar } from "./EditorialTopBar";
 
 interface EditorialWorkspaceLayoutProps {
   subjectId: string;
   snapshot: EditorialWorkspaceSnapshot;
   selectedBlockId: string | null;
+  localDraftText: string;
   onSelectBlock: (blockId: string) => void;
+  onLocalDraftChange: (blockId: string, text: string) => void;
   onRefresh: () => void;
 }
 
@@ -63,7 +66,9 @@ export function EditorialWorkspaceLayout({
   subjectId,
   snapshot,
   selectedBlockId,
+  localDraftText,
   onSelectBlock,
+  onLocalDraftChange,
   onRefresh,
 }: EditorialWorkspaceLayoutProps) {
   const [openPanel, setOpenPanel] = useState<OpenPanel>(null);
@@ -196,6 +201,16 @@ export function EditorialWorkspaceLayout({
         onRefresh={onRefresh}
       />
 
+      <EditorialServerDraftStatus
+        subjectId={subjectId}
+        occurrenceId={selectedBlock?.block_id ?? null}
+        snapshotId={snapshot.snapshot_id}
+        localDraftText={localDraftText}
+        onRecover={(text) => {
+          if (selectedBlock) onLocalDraftChange(selectedBlock.block_id, text);
+        }}
+      />
+
       {readOnly ? (
         <div className="editorial-readonly-banner" role="note">
           Type de publication indéterminé : le document est consultable en
@@ -309,6 +324,11 @@ export function EditorialWorkspaceLayout({
             block={selectedBlock}
             sectionTitle={sectionTitle}
             readOnly={readOnly}
+            localDraftText={localDraftText}
+            onLocalDraftChange={(text) => {
+              if (selectedBlock)
+                onLocalDraftChange(selectedBlock.block_id, text);
+            }}
             onOpenSources={showSources}
             onBackToDocument={closeActiveOverlay}
             onChangeTarget={returnToTargetChoice}

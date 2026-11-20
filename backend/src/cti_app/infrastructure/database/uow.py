@@ -42,6 +42,7 @@ from cti_app.application.persistence import (
     EditionReleaseRepository,
     EditionRenderRepository,
     EditionRepository,
+    EditorialDraftRepository,
     EditorialProposalImpactRepository,
     EditorialProposalRepository,
     EditorialThreadRepository,
@@ -153,6 +154,9 @@ from cti_app.infrastructure.database.repositories.editions import (
     SqlAlchemyEditionRepository,
 )
 from cti_app.infrastructure.database.repositories.editorial import SqlAlchemyHumanDecisionRepository
+from cti_app.infrastructure.database.repositories.editorial_drafts import (
+    SqlAlchemyEditorialDraftRepository,
+)
 from cti_app.infrastructure.database.repositories.editorial_proposal_impacts import (
     SqlAlchemyEditorialProposalImpactRepository,
 )
@@ -302,6 +306,7 @@ class SqlAlchemyUnitOfWork:
     production_runs: ProductionRunRepository
     production_routing_decisions: ProductionRoutingDecisionRepository
     editorial_workspace_snapshots: EditorialWorkspaceSnapshotRepository
+    editorial_drafts: EditorialDraftRepository
     editorial_threads: EditorialThreadRepository
     editorial_proposals: EditorialProposalRepository
     editorial_proposal_impacts: EditorialProposalImpactRepository
@@ -408,6 +413,7 @@ class SqlAlchemyUnitOfWork:
         self.editorial_workspace_snapshots = SqlAlchemyEditorialWorkspaceSnapshotRepository(
             self._session
         )
+        self.editorial_drafts = SqlAlchemyEditorialDraftRepository(self._session)
         self.editorial_threads = SqlAlchemyEditorialThreadRepository(self._session)
         self.editorial_proposals = SqlAlchemyEditorialProposalRepository(self._session)
         self.editorial_proposal_impacts = SqlAlchemyEditorialProposalImpactRepository(self._session)

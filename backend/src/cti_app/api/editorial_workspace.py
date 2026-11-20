@@ -1,16 +1,25 @@
 from __future__ import annotations
 
+import logging
+import re
 from collections.abc import Callable, Coroutine
 from datetime import datetime
 from typing import Annotated, Any, Literal, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, Response, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 from starlette.responses import JSONResponse
 
+from cti_app.application.editorial_drafts import (
+    MAX_DRAFT_BYTES,
+    EditorialDraftApplicationError,
+    EditorialDraftContent,
+    EditorialDraftService,
+)
 from cti_app.application.editorial_proposal_adoption import (
     EditorialProposalAdoptionError,
     EditorialProposalAdoptionService,
@@ -45,6 +54,9 @@ from cti_app.domain.publication_kind import PublicationKind
 from cti_app.infrastructure.analytic_chart_renderer import AnalyticChartRenderer
 from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
 
+_MAX_DRAFT_REQUEST_BYTES = MAX_DRAFT_BYTES * 6 + 4_096
+logger = logging.getLogger(__name__)
+
 
 class EditorialWorkspaceRoute(APIRoute):
     def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
@@ -52,6 +64,7 @@ class EditorialWorkspaceRoute(APIRoute):
 
         async def sanitized_handler(request: Request) -> Response:
             is_accept = self.path_format.endswith("/accept")
+            is_draft = self.path_format.endswith("/draft")
             if is_accept:
                 try:
                     enabled = get_settings().editorial_proposal_accept_enabled
@@ -68,7 +81,15 @@ class EditorialWorkspaceRoute(APIRoute):
                         },
                     )
             try:
-                return await original_handler(request)
+                response = await original_handler(request)
+            except HTTPException as error:
+                if not is_draft:
+                    raise
+                response = JSONResponse(
+                    status_code=error.status_code,
+                    content={"detail": jsonable_encoder(error.detail)},
+                    headers=dict(error.headers or {}),
+                )
             except RequestValidationError as error:
                 if is_accept:
                     return JSONResponse(
@@ -80,15 +101,48 @@ class EditorialWorkspaceRoute(APIRoute):
                             }
                         },
                     )
-                details = [
-                    {
-                        "loc": list(item.get("loc", ())),
-                        "type": str(item.get("type", "value_error")),
-                        "msg": str(item.get("msg", "Invalid value")),
-                    }
-                    for item in error.errors()
-                ]
-                return JSONResponse(status_code=422, content={"detail": details})
+                if is_draft:
+                    response = JSONResponse(
+                        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                        content={
+                            "detail": {
+                                "code": "draft_request_invalid",
+                                "message": "La requête de brouillon est invalide.",
+                            }
+                        },
+                    )
+                else:
+                    details = [
+                        {
+                            "loc": list(item.get("loc", ())),
+                            "type": str(item.get("type", "value_error")),
+                            "msg": str(item.get("msg", "Invalid value")),
+                        }
+                        for item in error.errors()
+                    ]
+                    response = JSONResponse(status_code=422, content={"detail": details})
+            except Exception as error:
+                if not is_draft:
+                    raise
+                logger.warning(
+                    "draft_route_exception class=%s subject_id=%s occurrence_id=%s",
+                    type(error).__name__,
+                    request.path_params.get("subject_id", "unknown"),
+                    request.path_params.get("occurrence_id", "unknown"),
+                )
+                response = JSONResponse(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    content={
+                        "detail": {
+                            "code": "draft_storage_unavailable",
+                            "message": _ERROR_MESSAGES["draft_storage_unavailable"],
+                        }
+                    },
+                )
+
+            if is_draft:
+                response.headers["Cache-Control"] = "no-store"
+            return response
 
         return sanitized_handler
 
@@ -381,6 +435,33 @@ class EditorialProposalAcceptView(BaseModel):
     impact_state: str
 
 
+class EditorialDraftPutRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    snapshot_id: UUID
+    text: str = Field(max_length=MAX_DRAFT_BYTES)
+
+
+class EditorialDraftView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID
+    subject_id: UUID
+    production_run_id: UUID
+    occurrence_id: UUID
+    base_snapshot_id: UUID
+    base_artifact_id: UUID
+    base_artifact_version: int
+    base_canonical_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    text_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    version: int
+    text: str
+    is_stale: bool
+    created_at: datetime
+    updated_at: datetime
+    expires_at: datetime
+
+
 EditorialThreadEntryResultView = Annotated[
     EditorialThreadSendResultView | EditorialThreadSessionStartResultView,
     Field(discriminator="kind"),
@@ -461,6 +542,17 @@ _ERROR_MESSAGES = {
     ),
     "session_lost": "Cette session Bridge est perdue. Ouvrez un nouveau fil pour poursuivre.",
     "editorial_reconciliation_invalid": "La requête de réconciliation est invalide.",
+    "draft_not_found": "Brouillon introuvable.",
+    "draft_expired": "Ce brouillon a expiré. Rechargez le document.",
+    "draft_version_conflict": "Le brouillon a changé. Rechargez-le avant de continuer.",
+    "draft_base_stale": "Le document a changé depuis ce brouillon. Rechargez l’atelier.",  # noqa: RUF001
+    "draft_retention_unconfigured": "La conservation des brouillons n’est pas configurée.",  # noqa: RUF001
+    "draft_storage_unavailable": "Le stockage du brouillon est temporairement indisponible.",
+    "draft_cleanup_unavailable": "La purge du brouillon est temporairement indisponible.",
+    "draft_text_too_large": "Le brouillon dépasse la taille autorisée.",
+    "draft_if_match_required": "Une version de brouillon est requise pour cette modification.",
+    "draft_if_match_invalid": "La version de brouillon est invalide.",
+    "draft_request_invalid": "La requête de brouillon est invalide.",
 }
 
 
@@ -478,6 +570,148 @@ def _service(request: Request) -> EditorialWorkspaceService:
         uow_factory=request.app.state.uow_factory,
         artifact_store=artifact_store,
     )
+
+
+def _draft_service(request: Request) -> EditorialDraftService:
+    blob_store = getattr(request.app.state, "blob_store", None)
+    if blob_store is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "draft_storage_unavailable",
+                "message": _ERROR_MESSAGES["draft_storage_unavailable"],
+            },
+        )
+    try:
+        retention_days = get_settings().editorial_draft_retention_days
+    except Exception:
+        retention_days = None
+    return EditorialDraftService(
+        uow_factory=request.app.state.uow_factory,
+        workspace_service=_service(request),
+        blob_store=blob_store,
+        retention_days=retention_days,
+    )
+
+
+def _editorial_draft_http_error(error: EditorialDraftApplicationError) -> HTTPException:
+    code = error.code
+    response_status = (
+        status.HTTP_404_NOT_FOUND
+        if code == "draft_not_found"
+        else status.HTTP_410_GONE
+        if code == "draft_expired"
+        else status.HTTP_413_CONTENT_TOO_LARGE
+        if code == "draft_text_too_large"
+        else status.HTTP_428_PRECONDITION_REQUIRED
+        if code == "draft_if_match_required"
+        else status.HTTP_400_BAD_REQUEST
+        if code == "draft_if_match_invalid"
+        else status.HTTP_422_UNPROCESSABLE_CONTENT
+        if code == "draft_request_invalid"
+        else status.HTTP_503_SERVICE_UNAVAILABLE
+        if code
+        in {
+            "draft_retention_unconfigured",
+            "draft_storage_unavailable",
+            "draft_cleanup_unavailable",
+        }
+        else status.HTTP_409_CONFLICT
+    )
+    detail: dict[str, object] = {
+        "code": code,
+        "message": _ERROR_MESSAGES.get(code, "Le brouillon est indisponible."),
+    }
+    if error.expires_at is not None:
+        detail["expires_at"] = error.expires_at
+    return HTTPException(
+        status_code=response_status,
+        detail=detail,
+    )
+
+
+def _draft_view(content: EditorialDraftContent) -> EditorialDraftView:
+    draft = content.draft
+    return EditorialDraftView(
+        id=draft.id,
+        subject_id=draft.subject_id,
+        production_run_id=draft.production_run_id,
+        occurrence_id=draft.occurrence_id,
+        base_snapshot_id=draft.base_snapshot_id,
+        base_artifact_id=draft.base_artifact_id,
+        base_artifact_version=draft.base_artifact_version,
+        base_canonical_sha256=draft.base_canonical_sha256,
+        text_sha256=draft.text_sha256,
+        version=draft.version,
+        text=content.text,
+        is_stale=content.is_stale,
+        created_at=draft.created_at,
+        updated_at=draft.updated_at,
+        expires_at=draft.expires_at,
+    )
+
+
+def _draft_expected_version(if_match: str | None) -> int:
+    if if_match is None:
+        raise _editorial_draft_http_error(EditorialDraftApplicationError("draft_if_match_required"))
+    match = re.fullmatch(r'"(0|[1-9][0-9]*)"', if_match.strip())
+    if match is None:
+        raise _editorial_draft_http_error(EditorialDraftApplicationError("draft_if_match_invalid"))
+    return int(match.group(1))
+
+
+async def _read_draft_put_payload(request: Request) -> EditorialDraftPutRequest:
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except ValueError:
+            raise _editorial_draft_http_error(
+                EditorialDraftApplicationError("draft_request_invalid")
+            ) from None
+        if declared_length < 0:
+            raise _editorial_draft_http_error(
+                EditorialDraftApplicationError("draft_request_invalid")
+            )
+        if declared_length > _MAX_DRAFT_REQUEST_BYTES:
+            raise _editorial_draft_http_error(
+                EditorialDraftApplicationError("draft_text_too_large")
+            )
+
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > _MAX_DRAFT_REQUEST_BYTES:
+            raise _editorial_draft_http_error(
+                EditorialDraftApplicationError("draft_text_too_large")
+            )
+        body.extend(chunk)
+    try:
+        return EditorialDraftPutRequest.model_validate_json(bytes(body))
+    except ValidationError:
+        raise _editorial_draft_http_error(
+            EditorialDraftApplicationError("draft_request_invalid")
+        ) from None
+
+
+async def _purge_decided_server_draft(
+    request: Request, subject_id: UUID, occurrence_id: UUID
+) -> None:
+    # The draft store is wired atomically with the API's blob catalog. A test
+    # or reduced application without that feature cannot contain server drafts.
+    if getattr(request.app.state, "blob_store", None) is None:
+        return
+    try:
+        await _draft_service(request).purge(subject_id, occurrence_id)
+    except Exception as error:
+        # Canonical decisions are already committed. Draft cleanup is
+        # best-effort here; expiration sweep provides eventual row cleanup.
+        logger.warning(
+            "draft_purge_exception class=%s subject_id=%s occurrence_id=%s",
+            type(error).__name__,
+            subject_id,
+            occurrence_id,
+        )
+        return
 
 
 def _proposal_adoption_service(request: Request) -> EditorialProposalAdoptionService:
@@ -654,6 +888,91 @@ async def get_editorial_workspace_snapshot(
     return EditorialWorkspaceSnapshotView.model_validate(payload)
 
 
+@router.get(
+    "/subjects/{subject_id}/editor/blocks/{occurrence_id}/draft",
+    response_model=EditorialDraftView,
+)
+@router.get(
+    "/subjects/{subject_id}/editor/threads/{occurrence_id}/draft",
+    response_model=EditorialDraftView,
+    include_in_schema=False,
+)
+async def get_editorial_draft(
+    subject_id: UUID,
+    occurrence_id: UUID,
+    request: Request,
+    response: Response,
+) -> EditorialDraftView:
+    try:
+        content = await _draft_service(request).get(
+            subject_id=subject_id, occurrence_id=occurrence_id
+        )
+    except EditorialDraftApplicationError as error:
+        raise _editorial_draft_http_error(error) from None
+    response.headers["ETag"] = f'"{content.draft.version}"'
+    return _draft_view(content)
+
+
+@router.put(
+    "/subjects/{subject_id}/editor/blocks/{occurrence_id}/draft",
+    response_model=EditorialDraftView,
+)
+@router.put(
+    "/subjects/{subject_id}/editor/threads/{occurrence_id}/draft",
+    response_model=EditorialDraftView,
+    include_in_schema=False,
+)
+async def put_editorial_draft(
+    subject_id: UUID,
+    occurrence_id: UUID,
+    request: Request,
+    response: Response,
+    if_match: str | None = Header(default=None, alias="If-Match"),
+) -> EditorialDraftView:
+    expected_version = _draft_expected_version(if_match)
+    payload = await _read_draft_put_payload(request)
+    try:
+        content = await _draft_service(request).save(
+            subject_id=subject_id,
+            occurrence_id=occurrence_id,
+            actor_id=await _thread_actor_id(request),
+            snapshot_id=payload.snapshot_id,
+            text=payload.text,
+            expected_version=expected_version,
+        )
+    except EditorialDraftApplicationError as error:
+        raise _editorial_draft_http_error(error) from None
+    response.headers["ETag"] = f'"{content.draft.version}"'
+    return _draft_view(content)
+
+
+@router.delete(
+    "/subjects/{subject_id}/editor/blocks/{occurrence_id}/draft",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+@router.delete(
+    "/subjects/{subject_id}/editor/threads/{occurrence_id}/draft",
+    status_code=status.HTTP_204_NO_CONTENT,
+    include_in_schema=False,
+)
+async def delete_editorial_draft(
+    subject_id: UUID,
+    occurrence_id: UUID,
+    request: Request,
+    if_match: str | None = Header(default=None, alias="If-Match"),
+) -> Response:
+    expected_version = _draft_expected_version(if_match)
+    try:
+        await _draft_service(request).delete(
+            subject_id=subject_id,
+            occurrence_id=occurrence_id,
+            expected_version=expected_version,
+        )
+    except EditorialDraftApplicationError as error:
+        raise _editorial_draft_http_error(error) from None
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @router.post(
     "/subjects/{subject_id}/editor/resolve",
     response_model=ResolveWorkspaceResponse,
@@ -739,6 +1058,7 @@ async def get_editorial_proposal(
 ) -> EditorialProposalView:
     service = EditorialProposalService(
         uow_factory=request.app.state.uow_factory,
+        blob_store=getattr(request.app.state, "blob_store", None),
         artifact_store=request.app.state.production_artifact_store,
     )
     try:
@@ -793,6 +1113,7 @@ async def reject_editorial_proposal(
         )
     service = EditorialProposalService(
         uow_factory=request.app.state.uow_factory,
+        blob_store=getattr(request.app.state, "blob_store", None),
         artifact_store=request.app.state.production_artifact_store,
     )
     try:
@@ -830,6 +1151,7 @@ async def reject_editorial_proposal(
                 "message": _ERROR_MESSAGES.get(code, "La décision est indisponible."),
             },
         ) from None
+    await _purge_decided_server_draft(request, subject_id, occurrence_id)
     return EditorialProposalDecisionView(
         id=rejected.id,
         state="rejected",
@@ -924,6 +1246,7 @@ async def accept_editorial_proposal(
             },
         ) from None
 
+    await _purge_decided_server_draft(request, subject_id, occurrence_id)
     return EditorialProposalAcceptView(
         id=result.proposal.id,
         state="accepted",

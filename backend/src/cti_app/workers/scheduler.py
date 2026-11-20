@@ -6,6 +6,7 @@ from cti_app.logging import configure_logging
 from cti_app.workers.tasks import (
     dispatch_editorial_proposal_impacts,
     recover_abandoned_jobs,
+    sweep_expired_editorial_drafts,
 )
 
 
@@ -23,6 +24,7 @@ def main() -> None:
     while not stopped.is_set():
         recover_abandoned_jobs.send()
         dispatch_editorial_proposal_impacts.send()
+        sweep_expired_editorial_drafts.send()
         stopped.wait(settings.job_recovery_interval_seconds)
 
 

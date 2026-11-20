@@ -287,6 +287,18 @@ test("message-only composer renders safe generating, reply and error states", as
       await route.continue();
       return;
     }
+    if (
+      method === "GET" &&
+      /^\/api\/subjects\/[^/]+\/editor\/blocks\/[^/]+\/draft$/.test(
+        url.pathname,
+      )
+    ) {
+      await route.fulfill({
+        status: 404,
+        json: { detail: { code: "draft_not_found" } },
+      });
+      return;
+    }
     if (method === "GET" && url.pathname === subjectPath) {
       await route.fulfill({ json: EDITORIAL_FIXTURES.subject });
       return;
