@@ -3,11 +3,15 @@ from __future__ import annotations
 import hashlib
 from dataclasses import replace
 from typing import Any
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import pytest
 
-from cti_app.application.editorial_revision_effects import EditorialRevisionEffects
+from cti_app.application.editorial_revision_effects import (
+    EditorialRevisionEffects,
+    EditorialRevisionWrite,
+    editorial_actor_storage_id,
+)
 from cti_app.domain.editorial_proposal import EditorialProposalState
 from cti_app.domain.production import ProductionArtifactStage
 from tests.test_editorial_proposal_adoption import _fixture
@@ -49,7 +53,7 @@ async def test_legacy_synthesis_revise_advances_registry_and_stales_changed_pin_
             canonical_sha256=candidate.canonical_sha256,
             canonical_content=candidate.payload,
             lineage=None,
-            actor_id=fixture.actor_id,
+            actor_id="dev-analyst",
         )
         await uow.commit()
 
@@ -62,7 +66,70 @@ async def test_legacy_synthesis_revise_advances_registry_and_stales_changed_pin_
     assert (
         len([event for event in stored.events if event.state is EditorialProposalState.STALE]) == 2
     )
+    expected_actor_id = uuid5(NAMESPACE_URL, "autowork-actor:dev-analyst")
+    assert all(
+        event.actor_id == expected_actor_id
+        for event in stored.events
+        if event.state is EditorialProposalState.STALE
+    )
     assert not stored.impacts
+
+
+def test_opaque_actor_storage_id_matches_workspace_actor_convention() -> None:
+    assert editorial_actor_storage_id("dev-analyst") == uuid5(
+        NAMESPACE_URL, "autowork-actor:dev-analyst"
+    )
+    configured_uuid = uuid4()
+    assert editorial_actor_storage_id(str(configured_uuid)) == configured_uuid
+    assert editorial_actor_storage_id(configured_uuid) == configured_uuid
+
+
+@pytest.mark.asyncio
+async def test_combined_synthesis_and_enrichment_writes_append_one_final_snapshot() -> None:
+    fixture = _fixture()
+    base = fixture.factory.state.snapshots[fixture.proposal.snapshot_id]
+    base_artifact = fixture.factory.state.artifacts[fixture.proposal.base_artifact_id]
+    synthesis_artifact = _artifact(
+        base_artifact, stage=ProductionArtifactStage.SYNTHESIS, version=2
+    )
+    enrichment_artifact = _artifact(
+        base_artifact, stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT, version=2
+    )
+    effects = EditorialRevisionEffects(workspace_service=fixture.service._workspace_service)
+    synthesis_content = {"title": "Synthetic revised title"}
+    enrichment_content = {"tables": [], "diagrams": [], "charts": []}
+    uow = fixture.factory()
+    async with uow:
+        guard = await effects.acquire_run_guard(uow, fixture.proposal.production_run_id)
+        await effects.lock_run_row(uow, guard)
+        await uow.production_artifacts.append(synthesis_artifact)
+        await uow.production_artifacts.append(enrichment_artifact)
+        result = await effects.apply_after_writes(
+            uow,
+            run_guard=guard,
+            base_snapshot=base,
+            writes=(
+                EditorialRevisionWrite(
+                    stage=ProductionArtifactStage.SYNTHESIS,
+                    artifact=synthesis_artifact,
+                    canonical_sha256=hashlib.sha256(b"synthetic-synthesis").hexdigest(),
+                    canonical_content=synthesis_content,
+                ),
+                EditorialRevisionWrite(
+                    stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+                    artifact=enrichment_artifact,
+                    canonical_sha256=hashlib.sha256(b"synthetic-enrichment").hexdigest(),
+                    canonical_content=enrichment_content,
+                ),
+            ),
+            actor_id="dev-analyst",
+        )
+        await uow.commit()
+
+    assert result.snapshot.parent_snapshot_id == base.snapshot_id
+    assert result.snapshot.synthesis_artifact_id == synthesis_artifact.id
+    assert result.snapshot.enrichment_artifact_id == enrichment_artifact.id
+    assert len(fixture.factory.state.snapshots) == 2
 
 
 @pytest.mark.asyncio

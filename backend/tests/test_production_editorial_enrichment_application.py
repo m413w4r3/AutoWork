@@ -5070,6 +5070,7 @@ async def _revision_harness(
     include_target_annotations: bool = False,
     include_ioc_duplicate_table: bool = False,
     legacy_v8_identity: bool = False,
+    revision_effects: Any | None = None,
 ) -> SimpleNamespace:
     from cti_app.application.publication_assembly import (
         PublicationAssemblyResult,
@@ -5341,6 +5342,7 @@ async def _revision_harness(
         enrichment_service=world.service,
         persistence_service=EditorialEnrichmentService(uow_factory, world.store),
         publication_render_service=SimpleNamespace(render_preview=render_preview),  # type: ignore[arg-type]
+        revision_effects=revision_effects,
     )
     return SimpleNamespace(
         world=world,

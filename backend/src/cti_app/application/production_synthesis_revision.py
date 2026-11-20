@@ -17,15 +17,16 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from cti_app.application.editorial_revision_effects import (
     EditorialRevisionEffects,
     EditorialRevisionEffectsError,
+    EditorialRevisionWrite,
     EditorialRunGuard,
 )
 from cti_app.application.editorial_synthesis import candidate as _candidate
 from cti_app.application.editorial_synthesis import patch_validation as _patch_validation
 from cti_app.application.editorial_synthesis import targets as _targets
-from cti_app.application.editorial_workspace.registry import WorkspaceSnapshotRecord
 from cti_app.application.model_gateway import (
     ModelSubmissionReconciliationRequiredError,
 )
+from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_editorial_enrichment import (
     build_editorial_enrichment_evidence_pack,
     canonical_synthesis_hash,
@@ -2234,14 +2235,9 @@ class ProductionSynthesisRevisionService:
         )
         revision_guard: EditorialRunGuard | None = None
         base_workspace_snapshot = None
-        try:
-            revision_actor_id: UUID | None = (
-                UUID(request.requester) if self._revision_effects is not None else None
-            )
-        except ValueError:
-            raise TargetedEditorialRevisionConflictError(
-                "editorial_revision_actor_invalid"
-            ) from None
+        revision_actor_id: str | None = (
+            request.requester if self._revision_effects is not None else None
+        )
         if self._revision_effects is not None:
             try:
                 revision_guard = await self._revision_effects.acquire_run_guard(uow, context.run.id)
@@ -2293,27 +2289,6 @@ class ProductionSynthesisRevisionService:
             ),
         )
 
-        revision_effect_snapshot = None
-        if self._revision_effects is not None:
-            assert revision_guard is not None
-            assert base_workspace_snapshot is not None
-            assert revision_actor_id is not None
-            try:
-                effects = await self._revision_effects.apply_after_write(
-                    uow,
-                    run_guard=revision_guard,
-                    base_snapshot=base_workspace_snapshot,
-                    stage=ProductionArtifactStage.SYNTHESIS,
-                    artifact=artifact,
-                    canonical_sha256=candidate.canonical_sha256,
-                    canonical_content=candidate.payload,
-                    lineage=None,
-                    actor_id=revision_actor_id,
-                )
-            except EditorialRevisionEffectsError as error:
-                raise TargetedEditorialRevisionConflictError(error.code) from None
-            revision_effect_snapshot = effects.snapshot
-
         enrichment_artifact, enrichment = await self._rebase_enrichment_if_valid(
             context=context,
             extraction=extraction,
@@ -2322,10 +2297,41 @@ class ProductionSynthesisRevisionService:
             synthesis_artifact=artifact,
             access_policy_hash=policy_hash,
             uow=uow,
-            revision_guard=revision_guard,
-            base_workspace_snapshot=revision_effect_snapshot,
-            revision_actor_id=revision_actor_id,
         )
+        if self._revision_effects is not None:
+            assert revision_guard is not None
+            assert base_workspace_snapshot is not None
+            assert revision_actor_id is not None
+            effect_writes = [
+                EditorialRevisionWrite(
+                    stage=ProductionArtifactStage.SYNTHESIS,
+                    artifact=artifact,
+                    canonical_sha256=candidate.canonical_sha256,
+                    canonical_content=candidate.payload,
+                )
+            ]
+            if enrichment_artifact is not None and enrichment is not None:
+                effect_content = editorial_enrichment_to_json(enrichment)
+                effect_writes.append(
+                    EditorialRevisionWrite(
+                        stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+                        artifact=enrichment_artifact,
+                        canonical_sha256=hashlib.sha256(
+                            ProductionArtifactStore.canonical_json_bytes(effect_content)
+                        ).hexdigest(),
+                        canonical_content=effect_content,
+                    )
+                )
+            try:
+                await self._revision_effects.apply_after_writes(
+                    uow,
+                    run_guard=revision_guard,
+                    base_snapshot=base_workspace_snapshot,
+                    writes=tuple(effect_writes),
+                    actor_id=revision_actor_id,
+                )
+            except EditorialRevisionEffectsError as error:
+                raise TargetedEditorialRevisionConflictError(error.code) from None
         publication = None
         if enrichment_artifact is not None and enrichment is not None:
             publication = await self._assemble_and_render(
@@ -2964,9 +2970,6 @@ class ProductionSynthesisRevisionService:
         synthesis_artifact: ProductionArtifact,
         access_policy_hash: str,
         uow: Any | None = None,
-        revision_guard: EditorialRunGuard | None = None,
-        base_workspace_snapshot: WorkspaceSnapshotRecord | None = None,
-        revision_actor_id: UUID | None = None,
     ) -> tuple[ProductionArtifact | None, EditorialEnrichmentV1 | None]:
         if uow is None:
             async with self._synthesis._uow_factory() as active_uow:
@@ -2978,9 +2981,6 @@ class ProductionSynthesisRevisionService:
                     synthesis_artifact=synthesis_artifact,
                     access_policy_hash=access_policy_hash,
                     uow=active_uow,
-                    revision_guard=revision_guard,
-                    base_workspace_snapshot=base_workspace_snapshot,
-                    revision_actor_id=revision_actor_id,
                 )
                 await active_uow.commit()
                 return result
@@ -3186,31 +3186,6 @@ class ProductionSynthesisRevisionService:
             resource_search_enabled=self._resource_search_enabled,
             uow=uow,
         )
-        if self._revision_effects is not None:
-            if (
-                revision_guard is None
-                or base_workspace_snapshot is None
-                or revision_actor_id is None
-            ):
-                raise TargetedEditorialRevisionConflictError("editorial_run_guard_missing")
-            canonical_payload = editorial_enrichment_to_json(rebased)
-            canonical_bytes = self._synthesis._artifact_store.canonical_json_bytes(
-                canonical_payload
-            )
-            try:
-                await self._revision_effects.apply_after_write(
-                    uow,
-                    run_guard=revision_guard,
-                    base_snapshot=base_workspace_snapshot,
-                    stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
-                    artifact=rebased_artifact,
-                    canonical_sha256=hashlib.sha256(canonical_bytes).hexdigest(),
-                    canonical_content=canonical_payload,
-                    lineage=None,
-                    actor_id=revision_actor_id,
-                )
-            except EditorialRevisionEffectsError as error:
-                raise TargetedEditorialRevisionConflictError(error.code) from None
         return rebased_artifact, rebased
 
     async def _assemble_and_render(

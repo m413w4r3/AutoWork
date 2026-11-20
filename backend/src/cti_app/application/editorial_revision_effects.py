@@ -7,7 +7,7 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, Protocol, cast
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from cti_app.application.editorial_workspace.registry import (
     WorkspaceSnapshotRecord,
@@ -37,6 +37,19 @@ class EditorialRevisionEffectsError(RuntimeError):
         super().__init__(code)
 
 
+def editorial_actor_storage_id(actor_id: str | UUID) -> UUID:
+    """Map opaque configured actor names to the UUID identity used by editorial rows."""
+    if isinstance(actor_id, UUID):
+        return actor_id
+    value = actor_id.strip()
+    if not value:
+        raise EditorialRevisionEffectsError("editorial_revision_actor_invalid")
+    try:
+        return UUID(value)
+    except ValueError:
+        return uuid5(NAMESPACE_URL, f"autowork-actor:{value}")
+
+
 class EditorialWorkspaceAdvancer(Protocol):
     def advance(
         self,
@@ -60,6 +73,16 @@ class EditorialRunGuard:
 class EditorialRevisionEffectsResult:
     snapshot: WorkspaceSnapshotRecord
     impact: EditorialProposalImpact | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EditorialRevisionWrite:
+    stage: ProductionArtifactStage
+    artifact: ProductionArtifact
+    canonical_sha256: str
+    canonical_content: Mapping[str, Any]
+    lineage: Sequence[Mapping[str, object]] | None = None
+    retired_block_ids: Sequence[UUID] = ()
 
 
 class EditorialRevisionEffects:
@@ -104,48 +127,65 @@ class EditorialRevisionEffects:
         canonical_content: Mapping[str, Any],
         lineage: Sequence[Mapping[str, object]] | None,
         retired_block_ids: Sequence[UUID] = (),
-        actor_id: UUID,
+        actor_id: str | UUID,
         accepted_proposal: EditorialProposal | None = None,
     ) -> EditorialRevisionEffectsResult:
-        if (
-            run_guard.production_run_id != base_snapshot.production_run_id
-            or artifact.production_run_id != base_snapshot.production_run_id
-            or artifact.subject_id != base_snapshot.subject_id
-            or artifact.stage is not stage
-        ):
+        return await self.apply_after_writes(
+            uow,
+            run_guard=run_guard,
+            base_snapshot=base_snapshot,
+            writes=(
+                EditorialRevisionWrite(
+                    stage=stage,
+                    artifact=artifact,
+                    canonical_sha256=canonical_sha256,
+                    canonical_content=canonical_content,
+                    lineage=lineage,
+                    retired_block_ids=retired_block_ids,
+                ),
+            ),
+            actor_id=actor_id,
+            accepted_proposal=accepted_proposal,
+        )
+
+    async def apply_after_writes(
+        self,
+        uow: Any,
+        *,
+        run_guard: EditorialRunGuard,
+        base_snapshot: WorkspaceSnapshotRecord,
+        writes: Sequence[EditorialRevisionWrite],
+        actor_id: str | UUID,
+        accepted_proposal: EditorialProposal | None = None,
+    ) -> EditorialRevisionEffectsResult:
+        actor_id = editorial_actor_storage_id(actor_id)
+        if run_guard.production_run_id != base_snapshot.production_run_id or not writes:
             raise EditorialRevisionEffectsError("editorial_registry_conflict")
-        if stage not in {
-            ProductionArtifactStage.SYNTHESIS,
-            ProductionArtifactStage.EDITORIAL_ENRICHMENT,
-        }:
-            raise EditorialRevisionEffectsError("editorial_revision_stage_unsupported")
+        if len({item.stage for item in writes}) != len(writes):
+            raise EditorialRevisionEffectsError("editorial_revision_stage_duplicate")
+        for item in writes:
+            if (
+                item.artifact.production_run_id != base_snapshot.production_run_id
+                or item.artifact.subject_id != base_snapshot.subject_id
+                or item.artifact.stage is not item.stage
+            ):
+                raise EditorialRevisionEffectsError("editorial_registry_conflict")
+            if item.stage not in {
+                ProductionArtifactStage.SYNTHESIS,
+                ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+            }:
+                raise EditorialRevisionEffectsError("editorial_revision_stage_unsupported")
         if accepted_proposal is not None and (
             accepted_proposal.production_run_id != run_guard.production_run_id
             or accepted_proposal.state is not EditorialProposalState.ACCEPTED
-            or accepted_proposal.accepted_artifact_id != artifact.id
+            or accepted_proposal.accepted_artifact_id not in {item.artifact.id for item in writes}
         ):
             raise EditorialRevisionEffectsError("editorial_proposal_state_conflict")
 
-        effective_lineage = (
-            tuple(lineage)
-            if lineage is not None
-            else _legacy_lineage(
-                base_snapshot.block_registry,
-                artifact_id=artifact.id,
-                canonical_sha256=canonical_sha256,
-                source_stage=stage.value,
-                canonical_content=canonical_content,
-            )
-        )
         snapshot = await self._append_workspace_snapshot(
             uow,
             base_snapshot,
-            stage,
-            artifact,
-            canonical_sha256=canonical_sha256,
-            canonical_content=canonical_content,
-            lineage=effective_lineage,
-            retired_block_ids=tuple(retired_block_ids),
+            writes,
         )
         await stale_changed_pin_proposals(
             uow,
@@ -157,6 +197,8 @@ class EditorialRevisionEffects:
 
         impact = None
         if accepted_proposal is not None:
+            accepted_artifact_id = accepted_proposal.accepted_artifact_id
+            assert accepted_artifact_id is not None
             sequence = await uow.editorial_proposal_impacts.next_sequence_for_run(
                 accepted_proposal.production_run_id
             )
@@ -165,7 +207,7 @@ class EditorialRevisionEffects:
                 subject_id=accepted_proposal.subject_id,
                 production_run_id=accepted_proposal.production_run_id,
                 proposal_id=accepted_proposal.id,
-                accepted_artifact_id=artifact.id,
+                accepted_artifact_id=accepted_artifact_id,
                 accepted_snapshot_id=snapshot.snapshot_id,
                 base_pin_hash=accepted_proposal.base_pin_hash,
                 accepted_pin_hash=snapshot.workspace_pin_hash,
@@ -178,46 +220,10 @@ class EditorialRevisionEffects:
         self,
         uow: Any,
         base: WorkspaceSnapshotRecord,
-        stage: ProductionArtifactStage,
-        artifact: ProductionArtifact,
-        *,
-        canonical_sha256: str,
-        canonical_content: Mapping[str, Any],
-        lineage: tuple[Mapping[str, object], ...],
-        retired_block_ids: tuple[UUID, ...],
+        writes: Sequence[EditorialRevisionWrite],
     ) -> WorkspaceSnapshotRecord:
-        source_stage = EditorialSourceStage(stage.value)
-        base_stage_entries = tuple(
-            entry for entry in base.block_registry if entry.source_stage is source_stage
-        )
-        try:
-            advanced = self._workspace_service.advance(
-                base_registry=base_stage_entries,
-                artifact_id=artifact.id,
-                canonical_sha256=canonical_sha256,
-                source_stage=stage.value,
-                canonical_content=canonical_content,
-                lineage=lineage,
-                retired_block_ids=retired_block_ids,
-            )
-        except Exception as error:
-            code = getattr(error, "code", None) or getattr(error, "reason_code", None)
-            raise EditorialRevisionEffectsError(
-                str(code or "editorial_registry_conflict")
-            ) from None
-
-        unchanged_entries = tuple(
-            entry for entry in base.block_registry if entry.source_stage is not source_stage
-        )
-        entries = (
-            (*advanced.active, *unchanged_entries)
-            if source_stage is EditorialSourceStage.SYNTHESIS
-            else (*unchanged_entries, *advanced.active)
-        )
-        retired = tuple(
-            sorted(set(base.retired_block_ids) | set(advanced.retired_block_ids), key=str)
-        )
-        prefix = "synthesis" if source_stage is EditorialSourceStage.SYNTHESIS else "enrichment"
+        entries = base.block_registry
+        retired = set(base.retired_block_ids)
         pins: dict[str, object] = {
             "subject_id": base.subject_id,
             "production_run_id": base.production_run_id,
@@ -238,57 +244,64 @@ class EditorialRevisionEffects:
             "routing_decision_hash": base.routing_decision_hash,
             "publication_kind": base.publication_kind,
         }
-        pins[f"{prefix}_artifact_id"] = artifact.id
-        pins[f"{prefix}_version"] = artifact.version
-        pins[f"{prefix}_input_hash"] = artifact.input_hash
-        pins[f"{prefix}_canonical_sha256"] = canonical_sha256
+        for write in writes:
+            source_stage = EditorialSourceStage(write.stage.value)
+            stage_entries = tuple(entry for entry in entries if entry.source_stage is source_stage)
+            effective_lineage = (
+                tuple(write.lineage)
+                if write.lineage is not None
+                else _legacy_lineage(
+                    stage_entries,
+                    artifact_id=write.artifact.id,
+                    canonical_sha256=write.canonical_sha256,
+                    source_stage=write.stage.value,
+                    canonical_content=write.canonical_content,
+                )
+            )
+            try:
+                advanced = self._workspace_service.advance(
+                    base_registry=stage_entries,
+                    artifact_id=write.artifact.id,
+                    canonical_sha256=write.canonical_sha256,
+                    source_stage=write.stage.value,
+                    canonical_content=write.canonical_content,
+                    lineage=effective_lineage,
+                    retired_block_ids=tuple(write.retired_block_ids),
+                )
+            except Exception as error:
+                code = getattr(error, "code", None) or getattr(error, "reason_code", None)
+                raise EditorialRevisionEffectsError(
+                    str(code or "editorial_registry_conflict")
+                ) from None
+            unchanged_entries = tuple(
+                entry for entry in entries if entry.source_stage is not source_stage
+            )
+            entries = (
+                (*advanced.active, *unchanged_entries)
+                if source_stage is EditorialSourceStage.SYNTHESIS
+                else (*unchanged_entries, *advanced.active)
+            )
+            retired.update(advanced.retired_block_ids)
+            prefix = "synthesis" if source_stage is EditorialSourceStage.SYNTHESIS else "enrichment"
+            pins[f"{prefix}_artifact_id"] = write.artifact.id
+            pins[f"{prefix}_version"] = write.artifact.version
+            pins[f"{prefix}_input_hash"] = write.artifact.input_hash
+            pins[f"{prefix}_canonical_sha256"] = write.canonical_sha256
         next_record = replace(
             base,
             snapshot_id=uuid4(),
-            synthesis_artifact_id=(
-                artifact.id
-                if source_stage is EditorialSourceStage.SYNTHESIS
-                else base.synthesis_artifact_id
-            ),
-            synthesis_version=(
-                artifact.version
-                if source_stage is EditorialSourceStage.SYNTHESIS
-                else base.synthesis_version
-            ),
-            synthesis_input_hash=(
-                artifact.input_hash
-                if source_stage is EditorialSourceStage.SYNTHESIS
-                else base.synthesis_input_hash
-            ),
-            synthesis_canonical_sha256=(
-                canonical_sha256
-                if source_stage is EditorialSourceStage.SYNTHESIS
-                else base.synthesis_canonical_sha256
-            ),
-            enrichment_artifact_id=(
-                artifact.id
-                if source_stage is EditorialSourceStage.EDITORIAL_ENRICHMENT
-                else base.enrichment_artifact_id
-            ),
-            enrichment_version=(
-                artifact.version
-                if source_stage is EditorialSourceStage.EDITORIAL_ENRICHMENT
-                else base.enrichment_version
-            ),
-            enrichment_input_hash=(
-                artifact.input_hash
-                if source_stage is EditorialSourceStage.EDITORIAL_ENRICHMENT
-                else base.enrichment_input_hash
-            ),
-            enrichment_canonical_sha256=(
-                canonical_sha256
-                if source_stage is EditorialSourceStage.EDITORIAL_ENRICHMENT
-                else base.enrichment_canonical_sha256
-            ),
+            synthesis_artifact_id=cast(UUID, pins["synthesis_artifact_id"]),
+            synthesis_version=cast(int, pins["synthesis_version"]),
+            synthesis_input_hash=cast(str, pins["synthesis_input_hash"]),
+            synthesis_canonical_sha256=cast(str, pins["synthesis_canonical_sha256"]),
+            enrichment_artifact_id=cast(UUID | None, pins["enrichment_artifact_id"]),
+            enrichment_version=cast(int | None, pins["enrichment_version"]),
+            enrichment_input_hash=cast(str | None, pins["enrichment_input_hash"]),
+            enrichment_canonical_sha256=cast(str | None, pins["enrichment_canonical_sha256"]),
             workspace_pin_hash=workspace_pin_hash(pins),
             registry_hash=registry_hash(entries),
             block_registry=tuple(entries),
-            retired_block_ids=retired,
+            retired_block_ids=tuple(sorted(retired, key=str)),
             parent_snapshot_id=base.snapshot_id,
         )
         stored = await uow.editorial_workspace_snapshots.append_if_absent(next_record)

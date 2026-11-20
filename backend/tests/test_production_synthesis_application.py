@@ -9811,6 +9811,12 @@ def test_targeted_revision_applies_every_synthesis_operation(
 async def test_targeted_revision_persists_brief_metadata_timeline_and_assembles(
     operation: TargetedEditorialRevisionOperation,
 ) -> None:
+    from cti_app.application.production_editorial_enrichment import (
+        build_editorial_enrichment_evidence_pack,
+        canonical_synthesis_hash,
+        compute_editorial_enrichment_input_hash,
+        editorial_enrichment_evidence_pack_hash,
+    )
     from cti_app.application.production_stages import (
         EditorialEnrichmentService,
         SynthesisService,
@@ -9819,6 +9825,11 @@ async def test_targeted_revision_persists_brief_metadata_timeline_and_assembles(
         ProductionSynthesisRevisionService,
     )
     from cti_app.application.publication_assembly import PublicationAssemblyService
+    from cti_app.domain.production_editorial_enrichment import (
+        EDITORIAL_ENRICHMENT_V3_POLICY_VERSION,
+        EditorialEnrichmentV1,
+        editorial_enrichment_to_json,
+    )
 
     world, base, _, _ = _targeted_revision_fixture()
     source = world.extraction.sources[0]
@@ -9991,8 +10002,66 @@ async def test_targeted_revision_persists_brief_metadata_timeline_and_assembles(
             "relevance_projection_hash": projection.projection_hash,
         },
     )
+    initial_enrichment_artifact = None
+    if operation is TargetedEditorialRevisionOperation.REWRITE_TITLE:
+        initial_enrichment = EditorialEnrichmentV1(
+            schema_version=3,
+            subject_id=snapshot.subject_id,
+            production_input_hash=snapshot.input_hash,
+            extraction_hash=canonical_extraction_hash(extraction),
+            synthesis_hash=canonical_synthesis_hash(base),
+            publication_language=snapshot.publication_language,
+            enrichment_policy_version=EDITORIAL_ENRICHMENT_V3_POLICY_VERSION,
+            tables=(),
+            diagrams=(),
+            charts=(),
+            source_figures=(),
+            annotations=(),
+            warnings=(),
+        )
+        initial_enrichment_pack = build_editorial_enrichment_evidence_pack(
+            snapshot, extraction, base, projection
+        )
+        initial_enrichment_evidence_hash = editorial_enrichment_evidence_pack_hash(
+            initial_enrichment_pack
+        )
+        initial_enrichment_payload = editorial_enrichment_to_json(initial_enrichment)
+        initial_enrichment_artifact = ProductionArtifact(
+            production_run_id=run.id,
+            subject_id=snapshot.subject_id,
+            stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+            version=1,
+            input_hash=compute_editorial_enrichment_input_hash(
+                extraction=extraction,
+                synthesis=base,
+                evidence_pack_hash=initial_enrichment_evidence_hash,
+                access_policy_hash=policy_hash,
+                projection_hash=projection.projection_hash,
+                source_figure_inventory_hash=None,
+            ),
+            status=ProductionArtifactStatus.VERIFIED,
+            canonical_blob_id=artifact_store.add_json(initial_enrichment_payload),
+            metadata={
+                "evidence_pack_hash": initial_enrichment_evidence_hash,
+                "access_policy_hash": policy_hash,
+                "source_figure_inventory_hash": None,
+                "relevance_projection_hash": projection.projection_hash,
+                "model_policy_version": "synthetic-model-policy",
+                "routing_policy_version": "synthetic-routing-policy",
+            },
+        )
     repository = _RevisionArtifactRepository(
-        (references_artifact, extraction_artifact, projection_artifact, base_artifact)
+        tuple(
+            item
+            for item in (
+                references_artifact,
+                extraction_artifact,
+                projection_artifact,
+                base_artifact,
+                initial_enrichment_artifact,
+            )
+            if item is not None
+        )
     )
 
     def uow_factory() -> _RevisionMemoryUow:
@@ -10011,6 +10080,29 @@ async def test_targeted_revision_persists_brief_metadata_timeline_and_assembles(
         model_gateway=gateway,  # type: ignore[arg-type]
         synthesis_service=SynthesisService(uow_factory, artifact_store),  # type: ignore[arg-type]
     )
+
+    class _RecordingEffects:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def acquire_run_guard(self, _uow, production_run_id):
+            return SimpleNamespace(production_run_id=production_run_id)
+
+        async def lock_run_row(self, _uow, _guard):
+            return run
+
+        async def current_snapshot_in_uow(self, _uow, _subject_id):
+            return SimpleNamespace(production_run_id=run.id)
+
+        async def apply_after_writes(self, _uow, **values):
+            self.calls.append(values)
+            return SimpleNamespace(snapshot=values["base_snapshot"])
+
+    effects = _RecordingEffects()
+
+    async def render_preview(_artifact_id) -> None:
+        return None
+
     revision_service = ProductionSynthesisRevisionService(
         synthesis_service=synthesis_service,
         synthesis_persistence=SynthesisService(uow_factory, artifact_store),
@@ -10018,7 +10110,8 @@ async def test_targeted_revision_persists_brief_metadata_timeline_and_assembles(
             uow_factory,
             artifact_store,  # type: ignore[arg-type]
         ),
-        publication_render_service=SimpleNamespace(),  # type: ignore[arg-type]
+        publication_render_service=SimpleNamespace(render_preview=render_preview),  # type: ignore[arg-type]
+        revision_effects=effects,  # type: ignore[arg-type]
     )
     request = TargetedEditorialRevisionRequest(
         subject_id=snapshot.subject_id,
@@ -10030,11 +10123,20 @@ async def test_targeted_revision_persists_brief_metadata_timeline_and_assembles(
         operation=operation,
         instruction="Make the requested editorial change while preserving the evidence timeline.",
         mode=TargetedEditorialRevisionMode.EXISTING_EVIDENCE_ONLY,
-        requester="test-analyst",
+        requester="dev-analyst",
     )
 
     result = await revision_service.revise(request)
     assert result.artifact is not None
+    assert len(effects.calls) == 1
+    assert effects.calls[0]["actor_id"] == "dev-analyst"
+    writes = effects.calls[0]["writes"]
+    assert len(writes) == (2 if initial_enrichment_artifact is not None else 1)
+    assert writes[-1].stage is (
+        ProductionArtifactStage.EDITORIAL_ENRICHMENT
+        if initial_enrichment_artifact is not None
+        else ProductionArtifactStage.SYNTHESIS
+    )
     assert result.artifact.metadata["publication_kind"] == PublicationKind.BRIEF.value
     assert result.artifact.metadata["routing_decision_hash"] == routing_decision.decision_hash
     assert result.artifact.canonical_blob_id is not None

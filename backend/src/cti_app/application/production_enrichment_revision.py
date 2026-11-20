@@ -842,12 +842,9 @@ class ProductionEditorialEnrichmentRevisionService:
         if self._revision_effects is None:
             artifact = await persist_restore()
         else:
-            try:
-                revision_actor_id = UUID(actor)
-            except ValueError:
-                raise EditorialEnrichmentRevisionConflictError(
-                    "editorial_revision_actor_invalid"
-                ) from None
+            if not actor.strip():
+                raise EditorialEnrichmentRevisionConflictError("editorial_revision_actor_invalid")
+            revision_actor_id = actor
             try:
                 async with self._enrichment._uow_factory() as uow:
                     run_guard = await self._revision_effects.acquire_run_guard(uow, run.id)
@@ -1969,12 +1966,11 @@ class ProductionEditorialEnrichmentRevisionService:
                     raise EditorialEnrichmentRevisionConflictError(
                         "editorial_revision_actor_invalid"
                     )
-                try:
-                    revision_actor_id = UUID(actor_value)
-                except ValueError:
+                if not actor_value.strip():
                     raise EditorialEnrichmentRevisionConflictError(
                         "editorial_revision_actor_invalid"
-                    ) from None
+                    )
+                revision_actor_id = actor_value
                 try:
                     run_guard = await self._revision_effects.acquire_run_guard(uow, run.id)
                     await self._revision_effects.lock_run_row(uow, run_guard)

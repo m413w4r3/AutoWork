@@ -301,7 +301,12 @@ def _synthetic_candidate_context(
     )
 
 
-async def _seed(uow_factory: UnitOfWorkFactory, *, proposal_count: int = 2) -> _Seeded:
+async def _seed(
+    uow_factory: UnitOfWorkFactory,
+    *,
+    proposal_count: int = 2,
+    article_base: bool = False,
+) -> _Seeded:
     blob_store = _MemoryBlobStore()
     edition = Edition(
         country="France",
@@ -388,6 +393,27 @@ async def _seed(uow_factory: UnitOfWorkFactory, *, proposal_count: int = 2) -> _
         warnings=(),
     )
     evidence_ref = extraction_evidence_refs_v1(extraction)[0]
+    base_sections = (
+        (
+            SynthesisSectionV1(
+                SynthesisSectionKind.OVERVIEW,
+                "Vue d'ensemble",
+                (
+                    SynthesisParagraphV1("Victimologie : Synthetic victims.", (evidence_ref,)),
+                    SynthesisParagraphV1("Arsenal : Synthetic tool.", (evidence_ref,)),
+                    SynthesisParagraphV1("Objectif principal : Synthetic activity.", (evidence_ref,)),
+                ),
+            ),
+        )
+        if article_base
+        else (
+            SynthesisSectionV1(
+                SynthesisSectionKind.OVERVIEW,
+                "Synthetic observations",
+                (SynthesisParagraphV1("A synthetic section claim.", (evidence_ref,)),),
+            ),
+        )
+    )
     base_synthesis = ProductionSynthesisV1(
         schema_version=PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
         subject_id=subject.id,
@@ -397,13 +423,7 @@ async def _seed(uow_factory: UnitOfWorkFactory, *, proposal_count: int = 2) -> _
         synthesis_policy_version=SYNTHESIS_POLICY_VERSION,
         title="[Synthetic actor] Synthetic report",
         lead=(SynthesisParagraphV1("A synthetic lead claim.", (evidence_ref,)),),
-        sections=(
-            SynthesisSectionV1(
-                SynthesisSectionKind.OVERVIEW,
-                "Synthetic observations",
-                (SynthesisParagraphV1("A synthetic section claim.", (evidence_ref,)),),
-            ),
-        ),
+        sections=base_sections,
         timeline=(),
         uncertainties=(),
         warnings=(),
@@ -449,7 +469,7 @@ async def _seed(uow_factory: UnitOfWorkFactory, *, proposal_count: int = 2) -> _
         pipeline_generation=0,
         routing_decision_id=None,
         routing_decision_hash=None,
-        publication_kind=PublicationKind.BRIEF,
+        publication_kind=(PublicationKind.ARTICLE if article_base else PublicationKind.BRIEF),
         workspace_pin_hash="3" * 64,
         registry_hash=registry_hash((entry,)),
         block_registry=(entry,),

@@ -310,6 +310,7 @@ class EditorialProposalService:
         diagnostics: dict[str, object],
     ) -> EditorialProposal:
         async with self._uow_factory() as uow:
+            await uow.editorial_proposals.lock_adoption_for_run(preparation.production_run_id)
             if descriptor is not None:
                 await uow.blobs.lock_address(descriptor.logical_bucket, descriptor.sha256)
                 if encoded_patch is None or self._blob_store is None:
