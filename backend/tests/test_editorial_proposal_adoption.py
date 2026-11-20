@@ -9,8 +9,11 @@ from io import BytesIO
 from typing import Any, cast
 from uuid import UUID, uuid4
 
+import httpx
 import pytest
+from fastapi import FastAPI
 
+from cti_app.api import editorial_workspace as editorial_workspace_api
 from cti_app.application.editorial_proposal_adoption import (
     EditorialProposalAdoptionError,
     EditorialProposalAdoptionInputs,
@@ -36,6 +39,7 @@ from cti_app.application.production_synthesis import (
     canonical_extraction_hash,
 )
 from cti_app.application.production_synthesis_revision import _apply_wire_patch
+from cti_app.config import Settings
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import SourceRole
@@ -1163,3 +1167,46 @@ async def test_blob_reference_query_includes_every_orm_blob_foreign_key() -> Non
     assert references == 2
     assert "production_artifacts.canonical_blob_id" in sql
     assert "production_artifacts.raw_blob_id" in sql
+
+
+@pytest.mark.asyncio
+async def test_accept_route_adopts_once_and_replays_same_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(service_type=EditorialProposalAdoptionService)
+    monkeypatch.setattr(
+        editorial_workspace_api,
+        "get_settings",
+        lambda: Settings(_env_file=None, editorial_proposal_accept_enabled=True),
+    )
+    monkeypatch.setattr(
+        editorial_workspace_api, "_proposal_adoption_service", lambda _request: fixture.service
+    )
+
+    async def current_actor(_request: Any) -> UUID:
+        return fixture.actor_id
+
+    monkeypatch.setattr(editorial_workspace_api, "_thread_actor_id", current_actor)
+    app = FastAPI()
+    app.include_router(editorial_workspace_api.router)
+    path = (
+        f"/api/subjects/{fixture.proposal.subject_id}/editor/threads/"
+        f"{fixture.occurrence_id}/proposals/{fixture.proposal.id}/accept"
+    )
+    headers = {"Idempotency-Key": f"accept_{uuid4().hex}"}
+    payload = {"expected_state_version": 1, "patch_sha256": fixture.patch_sha256}
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
+    ) as client:
+        first = await client.post(path, headers=headers, json=payload)
+        replay = await client.post(path, headers=headers, json=payload)
+
+    assert first.status_code == replay.status_code == 200
+    assert first.json() == replay.json()
+    assert first.json()["state"] == EditorialProposalState.ACCEPTED.value
+    assert first.json()["artifact_id"] == str(
+        fixture.factory.state.proposals[fixture.proposal.id].accepted_artifact_id
+    )
+    assert fixture.factory.commits == 1
+    assert fixture.inputs.revalidated == 1

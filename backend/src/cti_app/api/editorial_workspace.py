@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Coroutine
 from datetime import datetime
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, Response, status
@@ -11,6 +11,13 @@ from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 from starlette.responses import JSONResponse
 
+from cti_app.application.editorial_proposal_adoption import (
+    EditorialProposalAdoptionError,
+    EditorialProposalAdoptionService,
+)
+from cti_app.application.editorial_proposal_adoption_inputs import (
+    ProductionEditorialProposalAdoptionInputs,
+)
 from cti_app.application.editorial_proposals import (
     EditorialProposalApplicationError,
     EditorialProposalService,
@@ -23,9 +30,20 @@ from cti_app.application.editorial_threads import (
     EditorialThreadSessionStartResult,
 )
 from cti_app.application.editorial_workspace import EditorialWorkspaceService
+from cti_app.application.production_editorial_enrichment import (
+    ProductionEditorialEnrichmentService,
+)
+from cti_app.application.production_enrichment_revision import (
+    ProductionEditorialEnrichmentRevisionService,
+)
+from cti_app.application.production_stages import EditorialEnrichmentService, SynthesisService
+from cti_app.application.production_synthesis import ProductionSynthesisService
+from cti_app.config import get_settings
 from cti_app.domain.editorial_thread import EditorialThreadEventKind
 from cti_app.domain.editorial_workspace import EditorialWorkspaceError
 from cti_app.domain.publication_kind import PublicationKind
+from cti_app.infrastructure.analytic_chart_renderer import AnalyticChartRenderer
+from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
 
 
 class EditorialWorkspaceRoute(APIRoute):
@@ -33,9 +51,35 @@ class EditorialWorkspaceRoute(APIRoute):
         original_handler = super().get_route_handler()
 
         async def sanitized_handler(request: Request) -> Response:
+            is_accept = self.path_format.endswith("/accept")
+            if is_accept:
+                try:
+                    enabled = get_settings().editorial_proposal_accept_enabled
+                except Exception:
+                    enabled = False
+                if not enabled:
+                    return JSONResponse(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        content={
+                            "detail": {
+                                "code": "accept_not_enabled",
+                                "message": "L'acceptation des propositions est désactivée.",
+                            }
+                        },
+                    )
             try:
                 return await original_handler(request)
             except RequestValidationError as error:
+                if is_accept:
+                    return JSONResponse(
+                        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                        content={
+                            "detail": {
+                                "code": "accept_request_invalid",
+                                "message": "La requête d'acceptation est invalide.",
+                            }
+                        },
+                    )
                 details = [
                     {
                         "loc": list(item.get("loc", ())),
@@ -315,6 +359,26 @@ class EditorialProposalDecisionView(BaseModel):
     state_version: int
 
 
+class EditorialProposalAcceptRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_state_version: int = Field(ge=1)
+    patch_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class EditorialProposalAcceptView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID
+    state: Literal["accepted"]
+    state_version: int
+    artifact_id: UUID
+    artifact_version: int
+    snapshot_id: UUID
+    impact_id: UUID
+    impact_state: str
+
+
 EditorialThreadEntryResultView = Annotated[
     EditorialThreadSendResultView | EditorialThreadSessionStartResultView,
     Field(discriminator="kind"),
@@ -381,6 +445,10 @@ _ERROR_MESSAGES = {
         "Les références de cette proposition ont changé. Rechargez l’atelier."  # noqa: RUF001
     ),
     "proposal_idempotency_conflict": "Cette clé est déjà associée à une autre décision.",
+    "accept_not_enabled": "L'acceptation des propositions est désactivée.",
+    "editorial_proposal_accept_unavailable": (
+        "L'acceptation des propositions est temporairement indisponible."
+    ),
     "editorial_thread_conversation_missing": "La conversation de ce fil est indisponible.",
     "editorial_thread_job_missing": "La génération de ce message est indisponible.",
     "editorial_thread_session_not_lost": (
@@ -404,6 +472,75 @@ def _service(request: Request) -> EditorialWorkspaceService:
     return EditorialWorkspaceService(
         uow_factory=request.app.state.uow_factory,
         artifact_store=artifact_store,
+    )
+
+
+def _proposal_adoption_service(request: Request) -> EditorialProposalAdoptionService:
+    artifact_store = getattr(request.app.state, "production_artifact_store", None)
+    blob_store = getattr(request.app.state, "blob_store", None)
+    model_gateway = getattr(request.app.state, "model_gateway", None)
+    render_service = getattr(request.app.state, "publication_render_service", None)
+    uow_factory = getattr(request.app.state, "uow_factory", None)
+    if any(
+        item is None
+        for item in (artifact_store, blob_store, model_gateway, render_service, uow_factory)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "editorial_proposal_accept_unavailable",
+                "message": _ERROR_MESSAGES["editorial_proposal_accept_unavailable"],
+            },
+        )
+
+    artifact_store = cast(Any, artifact_store)
+    blob_store = cast(Any, blob_store)
+    model_gateway = cast(Any, model_gateway)
+    render_service = cast(Any, render_service)
+    uow_factory = cast(Any, uow_factory)
+    synthesis_writer = SynthesisService(uow_factory, artifact_store)
+    enrichment_writer = EditorialEnrichmentService(uow_factory, artifact_store)
+    synthesis_loader = ProductionSynthesisService(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        model_gateway=model_gateway,
+        synthesis_service=synthesis_writer,
+    )
+    enrichment_loader = ProductionEditorialEnrichmentService(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        model_gateway=model_gateway,
+        editorial_enrichment_service=enrichment_writer,
+        media_asset_store=getattr(request.app.state, "media_asset_store", None),
+        diagram_compiler=D2DiagramCompiler(),
+        chart_compiler=AnalyticChartRenderer(),
+        source_media_archiver=getattr(
+            getattr(request.app.state, "collection_service", None), "source_media_archiver", None
+        ),
+        resource_search_enabled=get_settings().production_editorial_resource_search_enabled,
+    )
+    enrichment_revision = ProductionEditorialEnrichmentRevisionService(
+        enrichment_service=enrichment_loader,
+        persistence_service=enrichment_writer,
+        publication_render_service=render_service,
+    )
+    inputs = ProductionEditorialProposalAdoptionInputs(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        workspace_service=_service(request),
+        synthesis_loader=synthesis_loader,
+        enrichment_loader=enrichment_loader,
+        enrichment_revision_service=enrichment_revision,
+        resource_search_enabled=get_settings().production_editorial_resource_search_enabled,
+    )
+    return EditorialProposalAdoptionService(
+        uow_factory=uow_factory,
+        blob_store=blob_store,
+        artifact_store=artifact_store,
+        workspace_service=_service(request),
+        inputs=inputs,
+        synthesis_writer=synthesis_writer,
+        enrichment_writer=enrichment_writer,
     )
 
 
@@ -654,6 +791,102 @@ async def reject_editorial_proposal(
         id=rejected.id,
         state="rejected",
         state_version=rejected.state_version,
+    )
+
+
+@router.post(
+    "/subjects/{subject_id}/editor/threads/{occurrence_id}/proposals/{proposal_id}/accept",
+    response_model=EditorialProposalAcceptView,
+)
+async def accept_editorial_proposal(
+    subject_id: UUID,
+    occurrence_id: UUID,
+    proposal_id: UUID,
+    request: Request,
+    payload: EditorialProposalAcceptRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> EditorialProposalAcceptView:
+    if idempotency_key is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "idempotency_key_required",
+                "message": _ERROR_MESSAGES["idempotency_key_required"],
+            },
+        )
+    if not is_valid_editorial_idempotency_key(idempotency_key):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "idempotency_key_invalid",
+                "message": _ERROR_MESSAGES["idempotency_key_invalid"],
+            },
+        )
+
+    try:
+        service = _proposal_adoption_service(request)
+        result = await service.adopt(
+            subject_id,
+            occurrence_id,
+            proposal_id,
+            actor_id=await _thread_actor_id(request),
+            expected_state_version=payload.expected_state_version,
+            patch_sha256=payload.patch_sha256,
+            idempotency_key=idempotency_key,
+        )
+    except HTTPException:
+        raise
+    except EditorialProposalAdoptionError as error:
+        code = error.code
+        if code == "proposal_not_found":
+            response_status = status.HTTP_404_NOT_FOUND
+        elif code == "idempotency_key_invalid":
+            response_status = status.HTTP_400_BAD_REQUEST
+        elif code in {
+            "proposal_patch_invalid",
+            "proposal_target_mismatch",
+            "proposal_operation_unsupported",
+        }:
+            response_status = status.HTTP_422_UNPROCESSABLE_CONTENT
+        elif code in {
+            "proposal_patch_unavailable",
+            "proposal_patch_hash_mismatch",
+            "proposal_base_unavailable",
+            "proposal_base_hash_mismatch",
+            "proposal_policy_unavailable",
+            "proposal_candidate_blob_hash_mismatch",
+            "proposal_acceptance_incomplete",
+            "editorial_enrichment_diagram_materializer_unavailable",
+            "proposal_registry_lineage_unavailable",
+        }:
+            response_status = status.HTTP_503_SERVICE_UNAVAILABLE
+        else:
+            response_status = status.HTTP_409_CONFLICT
+        message = _ERROR_MESSAGES.get(code, "L'acceptation de cette proposition a été refusée.")
+        if response_status == status.HTTP_503_SERVICE_UNAVAILABLE:
+            message = _ERROR_MESSAGES["editorial_proposal_accept_unavailable"]
+        raise HTTPException(
+            status_code=response_status,
+            detail={"code": code, "message": message},
+        ) from None
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "editorial_proposal_accept_unavailable",
+                "message": _ERROR_MESSAGES["editorial_proposal_accept_unavailable"],
+            },
+        ) from None
+
+    return EditorialProposalAcceptView(
+        id=result.proposal.id,
+        state="accepted",
+        state_version=result.proposal.state_version,
+        artifact_id=result.artifact.id,
+        artifact_version=result.artifact.version,
+        snapshot_id=result.snapshot.snapshot_id,
+        impact_id=result.impact.impact_id,
+        impact_state=result.impact.state.value,
     )
 
 

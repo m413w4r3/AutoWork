@@ -497,6 +497,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.readiness = readiness
     app.state.uow_factory = uow_factory
     app.state.goodware_service = goodware_service
+    app.state.blob_store = blob_store
     app.state.production_artifact_store = production_artifact_store
     app.state.pdf_inspection_service = pdf_inspection_service
     app.state.render_input_inspection_service = render_input_inspection_service

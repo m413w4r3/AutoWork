@@ -9,8 +9,11 @@ from io import BytesIO
 from typing import Any, cast
 from uuid import UUID, uuid4
 
+import httpx
 import pytest
+from fastapi import FastAPI
 
+from cti_app.api import editorial_workspace as editorial_workspace_api
 from cti_app.application.blob_storage import BlobStore
 from cti_app.application.editorial_proposal_adoption import (
     EditorialProposalAdoptionError,
@@ -36,6 +39,7 @@ from cti_app.application.production_synthesis import (
     canonical_extraction_hash,
 )
 from cti_app.application.production_synthesis_revision import _apply_wire_patch
+from cti_app.config import Settings
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import SourceRole
@@ -684,6 +688,127 @@ async def test_two_concurrent_adoptions_of_same_blob_have_one_winner_and_keep_ob
     adopted_bytes = await seeded.blob_store.read(blob.descriptor, max_bytes=blob.descriptor.size)
     assert hashlib.sha256(adopted_bytes).hexdigest() == blob.descriptor.sha256
     assert seeded.blob_store.delete_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_accept_route_uses_sql_uow_and_replays_same_result(
+    uow_factory: UnitOfWorkFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seeded = await _seed(uow_factory, proposal_count=1)
+    proposal = seeded.proposals[0]
+    service = _service(seeded, uow_factory)
+    monkeypatch.setattr(
+        editorial_workspace_api,
+        "get_settings",
+        lambda: Settings(_env_file=None, editorial_proposal_accept_enabled=True),
+    )
+    monkeypatch.setattr(
+        editorial_workspace_api, "_proposal_adoption_service", lambda _request: service
+    )
+
+    async def current_actor(_request: Any) -> UUID:
+        return seeded.actor_id
+
+    monkeypatch.setattr(editorial_workspace_api, "_thread_actor_id", current_actor)
+    app = FastAPI()
+    app.include_router(editorial_workspace_api.router)
+    path = (
+        f"/api/subjects/{proposal.subject_id}/editor/threads/{proposal.occurrence_id}/"
+        f"proposals/{proposal.id}/accept"
+    )
+    headers = {"Idempotency-Key": f"accept_{uuid4().hex}"}
+    payload = {"expected_state_version": 1, "patch_sha256": seeded.patch_sha256}
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
+    ) as client:
+        first = await client.post(path, headers=headers, json=payload)
+        replay = await client.post(path, headers=headers, json=payload)
+
+    assert first.status_code == replay.status_code == 200
+    assert first.json() == replay.json()
+    assert first.json()["state"] == EditorialProposalState.ACCEPTED.value
+    assert seeded.inputs.revalidated == 1
+    async with uow_factory() as uow:
+        accepted = await uow.editorial_proposals.get_for_occurrence(
+            proposal.subject_id, proposal.occurrence_id, proposal.id
+        )
+        assert accepted is not None
+        assert accepted.state is EditorialProposalState.ACCEPTED
+        assert first.json()["artifact_id"] == str(accepted.accepted_artifact_id)
+        impact = await uow.editorial_proposal_impacts.get_by_proposal(proposal.id)
+        assert impact is not None
+
+
+@pytest.mark.asyncio
+async def test_accept_route_policy_refusal_keeps_sql_state_unchanged(
+    uow_factory: UnitOfWorkFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seeded = await _seed(uow_factory, proposal_count=1)
+    proposal = seeded.proposals[0]
+    seeded.inputs.fences.revoked = True
+    service = _service(seeded, uow_factory)
+    idempotency_key = f"reject_{uuid4().hex}"
+    async with uow_factory() as uow:
+        before_artifact_ids = {
+            item.id
+            for item in await uow.production_artifacts.list_for_run(proposal.production_run_id)
+        }
+    monkeypatch.setattr(
+        editorial_workspace_api,
+        "get_settings",
+        lambda: Settings(_env_file=None, editorial_proposal_accept_enabled=True),
+    )
+    monkeypatch.setattr(
+        editorial_workspace_api, "_proposal_adoption_service", lambda _request: service
+    )
+
+    async def current_actor(_request: Any) -> UUID:
+        return seeded.actor_id
+
+    monkeypatch.setattr(editorial_workspace_api, "_thread_actor_id", current_actor)
+    app = FastAPI()
+    app.include_router(editorial_workspace_api.router)
+    path = (
+        f"/api/subjects/{proposal.subject_id}/editor/threads/{proposal.occurrence_id}/"
+        f"proposals/{proposal.id}/accept"
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
+    ) as client:
+        response = await client.post(
+            path,
+            headers={"Idempotency-Key": idempotency_key},
+            json={"expected_state_version": 1, "patch_sha256": seeded.patch_sha256},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "proposal_evidence_revoked"
+    assert seeded.inputs.revalidated == 1
+    async with uow_factory() as uow:
+        current = await uow.editorial_proposals.get_for_occurrence(
+            proposal.subject_id, proposal.occurrence_id, proposal.id
+        )
+        assert current is not None and current.state is EditorialProposalState.PROPOSED
+        assert current.state_version == proposal.state_version
+        assert {
+            item.id
+            for item in await uow.production_artifacts.list_for_run(proposal.production_run_id)
+        } == before_artifact_ids
+        assert (
+            await uow.production_artifacts.get_current(
+                proposal.production_run_id, ProductionArtifactStage.SYNTHESIS.value
+            )
+            == seeded.base_artifact
+        )
+        assert await uow.editorial_proposal_impacts.get_by_proposal(proposal.id) is None
+        assert (
+            await uow.editorial_proposals.get_event_by_idempotency(proposal.id, idempotency_key)
+            is None
+        )
 
 
 @pytest.mark.asyncio
