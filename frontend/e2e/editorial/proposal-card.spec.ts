@@ -211,7 +211,7 @@ test("compares and rejects a persisted proposal with stubbed API data", async ({
   ).toBeVisible();
   await expect(card.getByText("Proposition à consulter")).toBeVisible();
   await expect(card.getByRole("button", { name: "Rejeter" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Accepter" })).toHaveCount(0);
+  await expect(card.getByRole("button", { name: "Accepter" })).toBeVisible();
   await page.screenshot({
     path: resolve(screenshotDirectory, "comparison-side-by-side-1440x900.png"),
     fullPage: true,
@@ -227,16 +227,6 @@ test("compares and rejects a persisted proposal with stubbed API data", async ({
   });
 
   await card.getByRole("button", { name: "Comparaison" }).click();
-  await page.setViewportSize({ width: 390, height: 844 });
-  await page.getByRole("button", { name: "Inspecteur" }).click();
-  const panels = card.locator(".editorial-diff-view__panels");
-  await expect(panels).toBeVisible();
-  await card.scrollIntoViewIfNeeded();
-  await page.screenshot({
-    path: resolve(screenshotDirectory, "comparison-stacked-390x844.png"),
-  });
-
-  await page.setViewportSize({ width: 1440, height: 900 });
   await card.getByRole("button", { name: "Rejeter" }).click();
   await expect(card.getByText("Rejetée")).toBeVisible();
   await expect(card.getByRole("button", { name: "Rejeter" })).toHaveCount(0);

@@ -86,4 +86,66 @@ describe("EditorialTopBar render state", () => {
     expect(screen.getByText(/retenté automatiquement/i)).toBeInTheDocument();
     expect(screen.queryByText(/régénérez l’aperçu/i)).not.toBeInTheDocument();
   });
+
+  it("shows local drafts without claiming the canonical document is current", () => {
+    render(
+      <EditorialTopBar
+        subjectId="subject-1"
+        snapshot={baseSnapshot}
+        stale={false}
+        hasLocalDrafts
+        menuOpen={false}
+        technicalOpen={false}
+        onToggleMenu={vi.fn()}
+        onOpenTechnicalDetails={vi.fn()}
+        onTechnicalOpenChange={vi.fn()}
+        onRefresh={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByRole("status", {
+        name: "Brouillon local. Un brouillon de ce bloc n’est pas encore enregistré comme nouvelle version canonique.",
+      }),
+    ).toHaveTextContent("Brouillon local");
+    expect(
+      screen.queryByRole("status", {
+        name: /dernière version canonique enregistrée/i,
+      }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps stale document and PDF states ahead of local drafts", () => {
+    const { rerender } = render(
+      <EditorialTopBar
+        subjectId="subject-1"
+        snapshot={{ ...baseSnapshot, preview_status: "READY" }}
+        stale
+        hasLocalDrafts
+        menuOpen={false}
+        technicalOpen={false}
+        onToggleMenu={vi.fn()}
+        onOpenTechnicalDetails={vi.fn()}
+        onTechnicalOpenChange={vi.fn()}
+        onRefresh={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Version périmée")).toBeVisible();
+
+    rerender(
+      <EditorialTopBar
+        subjectId="subject-1"
+        snapshot={{ ...baseSnapshot, preview_status: "STALE" }}
+        stale
+        hasLocalDrafts
+        menuOpen={false}
+        technicalOpen={false}
+        onToggleMenu={vi.fn()}
+        onOpenTechnicalDetails={vi.fn()}
+        onTechnicalOpenChange={vi.fn()}
+        onRefresh={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("PDF obsolète")).toBeVisible();
+  });
 });

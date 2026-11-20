@@ -26,7 +26,11 @@ async def test_mounted_application_queues_proposal_with_real_production_factory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     seeded = await _seed(uow_factory, proposal_count=0, seed_discovery_lineage=True)
-    monkeypatch.setattr(editorial_workspace_api, "get_settings", lambda: Settings(_env_file=None))
+    monkeypatch.setattr(
+        editorial_workspace_api,
+        "get_settings",
+        lambda: Settings(_env_file=None, editorial_proposal_accept_enabled=False),
+    )
     artifact_store = ProductionArtifactStore(BlobCatalogService(seeded.blob_store, uow_factory))
     gateway = object()
     model_conversations = ModelConversationService(

@@ -4,7 +4,9 @@ import type {
   EditorialWorkspaceBlock,
   EditorialWorkspaceSnapshot,
 } from "../../api/editorialWorkspace";
-import { BLOCK_KIND_LABELS } from "./blockKindLabels";
+import { EditorialDocument } from "./EditorialDocument";
+import type { EditorialDraftController } from "./EditorialDrafts";
+import type { InlineTextEditorProps } from "./InlineTextEditor";
 import { EditorialInspector } from "./EditorialInspector";
 import { EditorialOutline } from "./EditorialOutline";
 import { EditorialServerDraftStatus } from "./EditorialServerDraftStatus";
@@ -13,14 +15,18 @@ import { EditorialTopBar } from "./EditorialTopBar";
 interface EditorialWorkspaceLayoutProps {
   subjectId: string;
   snapshot: EditorialWorkspaceSnapshot;
+  localDrafts: EditorialDraftController;
   selectedBlockId: string | null;
   localDraftText: string;
   onSelectBlock: (blockId: string) => void;
   onLocalDraftChange: (blockId: string, text: string) => void;
   onRefresh: () => void;
+  onSave?: InlineTextEditorProps["onSave"];
 }
 
 type OpenPanel = "outline" | "inspector" | null;
+const LOCAL_DRAFT_NAVIGATION_WARNING =
+  "Quitter l’atelier ? Le brouillon local en mémoire sera perdu.";
 
 function selectedSection(
   selected: EditorialWorkspaceBlock | null,
@@ -40,41 +46,23 @@ function selectedSection(
   return null;
 }
 
-function kindElement(block: EditorialWorkspaceBlock) {
-  const className = "editorial-document__text";
-  if (block.kind === "title")
-    return <h2 className={className}>{block.text}</h2>;
-  if (block.kind === "section_heading") {
-    return <h3 className={className}>{block.text}</h3>;
-  }
-  if (block.kind === "lead_paragraph") {
-    return (
-      <p className={`${className} editorial-document__lead`}>{block.text}</p>
-    );
-  }
-  if (block.kind === "paragraph")
-    return <p className={className}>{block.text}</p>;
-  return (
-    <div className={`${className} editorial-document__structured`}>
-      <span>{BLOCK_KIND_LABELS[block.kind]}</span>
-      {block.text ? <p>{block.text}</p> : null}
-    </div>
-  );
-}
-
 export function EditorialWorkspaceLayout({
   subjectId,
   snapshot,
+  localDrafts,
   selectedBlockId,
   localDraftText,
   onSelectBlock,
   onLocalDraftChange,
   onRefresh,
+  onSave,
 }: EditorialWorkspaceLayoutProps) {
   const [openPanel, setOpenPanel] = useState<OpenPanel>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [technicalOpen, setTechnicalOpen] = useState(false);
+  const [editingBlockId, setEditingBlockId] = useState<string | null>(null);
   const overlayOpenerRef = useRef<HTMLElement | null>(null);
+  const leaveConfirmedRef = useRef(false);
   // The snapshot's `blocks` array is already the server-resolved document
   // order. `enrichments` is a companion projection of those same block IDs.
   const ordered = snapshot.blocks;
@@ -87,6 +75,116 @@ export function EditorialWorkspaceLayout({
   const activeSection = selectedSection(selectedBlock, ordered);
   const sectionTitle = activeSection?.text ?? null;
   const activeSectionId = activeSection?.block_id ?? null;
+  const workspacePath = `/subjects/${encodeURIComponent(subjectId)}/editor`;
+
+  const canEditBlock = (block: EditorialWorkspaceBlock | null) =>
+    Boolean(
+      block &&
+      block.text !== null &&
+      !readOnly &&
+      snapshot.capabilities.manual_edit &&
+      block.allowed_operations.some(
+        (operation) =>
+          operation.startsWith("rewrite_") || operation === "modify",
+      ),
+    );
+
+  const selectBlock = (blockId: string) => {
+    if (blockId !== selectedBlockId) setEditingBlockId(null);
+    onSelectBlock(blockId);
+  };
+
+  const startEditing = (blockId: string) => {
+    const block = ordered.find((candidate) => candidate.block_id === blockId);
+    if (!canEditBlock(block ?? null)) return;
+    setEditingBlockId(blockId);
+    onSelectBlock(blockId);
+  };
+
+  const resumeDraft = (blockId: string) => {
+    if (!Object.prototype.hasOwnProperty.call(localDrafts.drafts, blockId)) {
+      return;
+    }
+    const block = ordered.find((candidate) => candidate.block_id === blockId);
+    if (!block) return;
+    if (!localDrafts.staleDraftIds.has(blockId) && !canEditBlock(block)) return;
+
+    setEditingBlockId(blockId);
+    onSelectBlock(blockId);
+    setOpenPanel(null);
+    setMenuOpen(false);
+    overlayOpenerRef.current = null;
+    window.requestAnimationFrame(() => {
+      const documentBlock = Array.from(
+        document.querySelectorAll<HTMLElement>(".editorial-document__block"),
+      ).find((candidate) => candidate.dataset.blockId === blockId);
+      documentBlock
+        ?.querySelector<HTMLTextAreaElement>(
+          ".editorial-inline-editor textarea",
+        )
+        ?.focus();
+    });
+  };
+
+  const cancelDraft = (blockId: string) => {
+    localDrafts.clearDraft(blockId);
+    if (editingBlockId === blockId) setEditingBlockId(null);
+  };
+
+  const updateDraft = (blockId: string, value: string) => {
+    const block = ordered.find((candidate) => candidate.block_id === blockId);
+    if (!block) return;
+    localDrafts.updateDraft(blockId, value, block.text ?? "");
+  };
+
+  const saveDraft = async (blockId: string, value: string) => {
+    if (!onSave) return;
+    await onSave(blockId, value);
+    cancelDraft(blockId);
+  };
+
+  const allowNavigationAway = () => {
+    if (!localDrafts.hasDrafts) return true;
+    const allowed = window.confirm(LOCAL_DRAFT_NAVIGATION_WARNING);
+    if (allowed) leaveConfirmedRef.current = true;
+    return allowed;
+  };
+
+  useEffect(() => {
+    if (!localDrafts.hasDrafts) return;
+    const warnOnClose = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnOnClose);
+    return () => window.removeEventListener("beforeunload", warnOnClose);
+  }, [localDrafts.hasDrafts]);
+
+  useEffect(() => {
+    if (!localDrafts.hasDrafts) return;
+    const warnOnHistoryNavigation = () => {
+      if (leaveConfirmedRef.current) {
+        leaveConfirmedRef.current = false;
+        return;
+      }
+      if (window.location.pathname === workspacePath) return;
+      if (window.confirm(LOCAL_DRAFT_NAVIGATION_WARNING)) return;
+      window.history.pushState({}, "", workspacePath);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    };
+    window.addEventListener("popstate", warnOnHistoryNavigation);
+    return () =>
+      window.removeEventListener("popstate", warnOnHistoryNavigation);
+  }, [localDrafts.hasDrafts, workspacePath]);
+
+  useEffect(() => {
+    if (
+      editingBlockId &&
+      !ordered.some((block) => block.block_id === editingBlockId)
+    ) {
+      setEditingBlockId(null);
+    }
+  }, [editingBlockId, ordered]);
 
   useEffect(() => {
     const closeTransientUi = (event: KeyboardEvent) => {
@@ -108,7 +206,7 @@ export function EditorialWorkspaceLayout({
   }, []);
 
   const selectFromOutline = (blockId: string) => {
-    onSelectBlock(blockId);
+    selectBlock(blockId);
     setOpenPanel(null);
     setMenuOpen(false);
     overlayOpenerRef.current = null;
@@ -193,12 +291,15 @@ export function EditorialWorkspaceLayout({
         subjectId={subjectId}
         snapshot={snapshot}
         stale={stale}
+        hasLocalDrafts={localDrafts.hasDrafts}
+        hasStaleLocalDrafts={localDrafts.hasStaleDrafts}
         menuOpen={menuOpen}
         technicalOpen={technicalOpen}
         onToggleMenu={toggleMenu}
         onOpenTechnicalDetails={openTechnicalDetails}
         onTechnicalOpenChange={setTechnicalOpen}
         onRefresh={onRefresh}
+        onNavigateAway={allowNavigationAway}
       />
 
       <EditorialServerDraftStatus
@@ -272,47 +373,26 @@ export function EditorialWorkspaceLayout({
             outline={snapshot.document_outline}
             selectedBlockId={selectedBlockId}
             activeSectionId={activeSectionId}
+            drafts={localDrafts.drafts}
+            staleDraftIds={localDrafts.staleDraftIds}
             onSelectBlock={selectFromOutline}
+            onResumeDraft={resumeDraft}
+            onCancelDraft={cancelDraft}
           />
         </div>
         <div className="editorial-document-column">
-          <article
-            className="editorial-document"
-            aria-label="Document éditorial"
-          >
-            {ordered.map((block) => {
-              const selected = block.block_id === selectedBlockId;
-              return (
-                <div
-                  key={block.block_id}
-                  className="editorial-document__block"
-                  tabIndex={-1}
-                  data-block-id={block.block_id}
-                  data-selected={selected}
-                  data-kind={block.kind}
-                  onClick={(event) => {
-                    if (
-                      event.target instanceof HTMLElement &&
-                      event.target.closest("a, button")
-                    ) {
-                      return;
-                    }
-                    onSelectBlock(block.block_id);
-                  }}
-                >
-                  {kindElement(block)}
-                  {selected ? (
-                    <span
-                      className="editorial-document__selected-status"
-                      role="status"
-                    >
-                      Bloc sélectionné
-                    </span>
-                  ) : null}
-                </div>
-              );
-            })}
-          </article>
+          <EditorialDocument
+            snapshot={snapshot}
+            selectedBlockId={selectedBlockId}
+            drafts={localDrafts.drafts}
+            staleDraftIds={localDrafts.staleDraftIds}
+            editingBlockId={editingBlockId}
+            onSelectBlock={selectBlock}
+            onDraftChange={updateDraft}
+            onResumeDraft={resumeDraft}
+            onCancelDraft={cancelDraft}
+            onSave={onSave ? saveDraft : undefined}
+          />
         </div>
         <div
           className="editorial-workspace__inspector-column"
@@ -329,6 +409,7 @@ export function EditorialWorkspaceLayout({
               if (selectedBlock)
                 onLocalDraftChange(selectedBlock.block_id, text);
             }}
+            onStartEditing={startEditing}
             onOpenSources={showSources}
             onBackToDocument={closeActiveOverlay}
             onChangeTarget={returnToTargetChoice}

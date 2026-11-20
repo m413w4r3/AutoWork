@@ -101,7 +101,7 @@ class Settings(BaseSettings):
     production_relevance_classifier_enabled: bool = True
     # External web search from Editorial Enrichment is an explicit operator opt-in.
     production_editorial_resource_search_enabled: bool = False
-    editorial_proposal_accept_enabled: bool = False
+    editorial_proposal_accept_enabled: bool = True
     # Server-side editorial prose is noncanonical and must always have a
     # positive idle-retention period. Invalid environment values fail closed
     # at the draft write boundary instead of preventing application startup.
