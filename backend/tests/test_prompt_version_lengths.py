@@ -10,7 +10,7 @@ _MAX_VERSION_LENGTH = 64
 
 
 def test_prompt_and_contract_version_constants_fit_database_columns() -> None:
-    all_prompt_and_domain_modules = (prompts, enrichment_domain)
+    all_prompt_and_domain_modules = (prompts, enrichment_domain, editorial_enrichment)
     targeted_version_constants = {
         synthesis: {
             "SYNTHESIS_VALIDATOR_VERSION",

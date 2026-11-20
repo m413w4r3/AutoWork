@@ -529,7 +529,45 @@ class EditorialWorkspaceService:
     ) -> list[BlockRegistryEntry]:
         current_stage = [entry for entry in entries if entry.source_stage is stage]
         if unchanged:
-            return entries
+            previous_stage = [
+                entry for entry in previous_record.block_registry if entry.source_stage is stage
+            ]
+            previous_by_pointer = {entry.structural_pointer: entry for entry in previous_stage}
+            current_by_pointer = {entry.structural_pointer: entry for entry in current_stage}
+            if previous_by_pointer.keys() != current_by_pointer.keys():
+                return entries
+
+            previous_pointer_by_id = {
+                entry.block_id: entry.structural_pointer for entry in previous_stage
+            }
+            current_pointer_by_id = {
+                entry.block_id: entry.structural_pointer for entry in current_stage
+            }
+            for pointer, current in current_by_pointer.items():
+                previous = previous_by_pointer[pointer]
+                previous_parent_pointer = (
+                    previous_pointer_by_id.get(previous.parent_block_id)
+                    if previous.parent_block_id is not None
+                    else None
+                )
+                current_parent_pointer = (
+                    current_pointer_by_id.get(current.parent_block_id)
+                    if current.parent_block_id is not None
+                    else None
+                )
+                if (
+                    previous.kind is not current.kind
+                    or previous.position != current.position
+                    or previous.content_sha256 != current.content_sha256
+                    or previous_parent_pointer != current_parent_pointer
+                ):
+                    return entries
+
+            replacements = {
+                current.block_id: previous_by_pointer[pointer]
+                for pointer, current in current_by_pointer.items()
+            }
+            return [replacements.get(entry.block_id, entry) for entry in entries]
         previous_stage = [
             entry for entry in previous_record.block_registry if entry.source_stage is stage
         ]

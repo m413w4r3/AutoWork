@@ -11,19 +11,26 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from typing import Any, Literal, cast
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from cti_app.application.persistence import ProductionUnitOfWorkFactory
+from cti_app.application.editorial_workspace.registry import (
+    registry_hash,
+    resolve_paragraph_anchor,
+)
+from cti_app.application.persistence import ProductionUnitOfWork, ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import (
     MAX_ARTIFACT_BYTES,
     ProductionArtifactStore,
 )
 from cti_app.application.production_batch_repointing import _repoint_batch_item
 from cti_app.application.production_editorial_enrichment import (
+    canonical_editorial_enrichment_hash,
+    canonical_synthesis_hash,
     validate_editorial_enrichment,
 )
 from cti_app.application.production_extraction import references_corpus_hash
@@ -39,6 +46,7 @@ from cti_app.application.subject_production import (
     _lock_open_edition,
     capture_production_input_snapshot,
 )
+from cti_app.domain.editorial_workspace import EditorialWorkspaceError, workspace_pin_hash
 from cti_app.domain.errors import EntityNotFoundError
 from cti_app.domain.production import (
     ProductionArtifact,
@@ -50,6 +58,7 @@ from cti_app.domain.production import (
 )
 from cti_app.domain.production_editorial_enrichment import (
     EditorialEnrichmentV1,
+    EnrichmentPlacementKind,
     editorial_enrichment_from_json,
 )
 from cti_app.domain.production_extraction import (
@@ -61,6 +70,7 @@ from cti_app.domain.production_references import ProductionReferenceCorpusV1
 from cti_app.domain.production_synthesis import (
     ProductionSynthesisV1,
     production_synthesis_from_json,
+    production_synthesis_to_json,
 )
 
 PRODUCTION_STATE_FORMAT = "autowork.production-state"
@@ -394,6 +404,111 @@ def _validate_import_lineage(
             "Production artifact input hash does not match the local production snapshot"
         )
     return canonical
+
+
+async def _seed_imported_workspace_registry(
+    uow: ProductionUnitOfWork,
+    *,
+    source_run_id: UUID,
+    run: ProductionRun,
+    synthesis_artifact: ProductionArtifact,
+    enrichment_artifact: ProductionArtifact,
+    synthesis: ProductionSynthesisV1,
+    enrichment: EditorialEnrichmentV1,
+) -> None:
+    """Carry verified anchor identities when an exact state is imported locally.
+
+    The portable state contains canonical payloads but not the sidecar registry.
+    When its source run is still present, reuse that registry only if its pins
+    match these exact payloads and every paragraph anchor resolves. Otherwise
+    leave the new run unseeded so assembly fails closed on an unknown anchor.
+    """
+    anchors = tuple(
+        item.placement.anchor_block_id
+        for collection in (
+            enrichment.tables,
+            enrichment.charts,
+            enrichment.diagrams,
+            enrichment.source_figures,
+        )
+        for item in collection
+        if item.placement.kind is EnrichmentPlacementKind.AFTER_PARAGRAPH
+        and item.placement.anchor_block_id is not None
+    )
+    if not anchors:
+        return
+
+    repository = uow.editorial_workspace_snapshots
+    source_record = await repository.latest_for_run(source_run_id)
+    synthesis_sha = canonical_synthesis_hash(synthesis)
+    enrichment_sha = canonical_editorial_enrichment_hash(enrichment)
+    if (
+        source_record is None
+        or source_record.production_run_id != source_run_id
+        or source_record.subject_id != run.subject_id
+        or source_record.synthesis_canonical_sha256 != synthesis_sha
+        or source_record.enrichment_canonical_sha256 != enrichment_sha
+        or source_record.registry_hash != registry_hash(source_record.block_registry)
+    ):
+        return
+
+    synthesis_payload = production_synthesis_to_json(synthesis)
+    try:
+        for anchor_id in anchors:
+            resolve_paragraph_anchor(source_record, anchor_id, synthesis=synthesis_payload)
+    except (EditorialWorkspaceError, ValueError):
+        return
+
+    pins: dict[str, object] = {
+        "subject_id": run.subject_id,
+        "production_run_id": run.id,
+        "synthesis_artifact_id": synthesis_artifact.id,
+        "synthesis_version": synthesis_artifact.version,
+        "synthesis_input_hash": synthesis_artifact.input_hash,
+        "synthesis_canonical_sha256": synthesis_sha,
+        "enrichment_artifact_id": enrichment_artifact.id,
+        "enrichment_version": enrichment_artifact.version,
+        "enrichment_input_hash": enrichment_artifact.input_hash,
+        "enrichment_canonical_sha256": enrichment_sha,
+        "publication_artifact_id": None,
+        "publication_version": None,
+        "publication_input_hash": None,
+        "publication_canonical_sha256": None,
+        "pipeline_generation": run.pipeline_generation,
+        "routing_decision_id": None,
+        "routing_decision_hash": None,
+        "publication_kind": None,
+    }
+    imported_record = replace(
+        source_record,
+        snapshot_id=uuid4(),
+        production_run_id=run.id,
+        synthesis_artifact_id=synthesis_artifact.id,
+        synthesis_version=synthesis_artifact.version,
+        synthesis_input_hash=synthesis_artifact.input_hash,
+        synthesis_canonical_sha256=synthesis_sha,
+        enrichment_artifact_id=enrichment_artifact.id,
+        enrichment_version=enrichment_artifact.version,
+        enrichment_input_hash=enrichment_artifact.input_hash,
+        enrichment_canonical_sha256=enrichment_sha,
+        publication_artifact_id=None,
+        publication_version=None,
+        publication_input_hash=None,
+        publication_canonical_sha256=None,
+        pipeline_generation=run.pipeline_generation,
+        routing_decision_id=None,
+        routing_decision_hash=None,
+        publication_kind=None,
+        workspace_pin_hash=workspace_pin_hash(pins),
+        registry_hash=registry_hash(source_record.block_registry),
+        parent_snapshot_id=source_record.snapshot_id,
+    )
+    stored_record = await repository.append_if_absent(imported_record)
+    if (
+        stored_record.registry_hash != imported_record.registry_hash
+        or stored_record.block_registry != imported_record.block_registry
+    ):
+        raise _invalid("Imported workspace registry conflicts with the verified source registry")
 
 
 def _snapshot_metadata(snapshot: ProductionStateSnapshotV5, now: datetime) -> dict[str, Any]:
@@ -854,6 +969,15 @@ class ProductionStateService:
                 relevance_projection,
                 self._artifact_store,
                 mark_downstream_stale=False,
+            )
+            await _seed_imported_workspace_registry(
+                uow,
+                source_run_id=snapshot.origin.production_run_id,
+                run=run,
+                synthesis_artifact=synthesis,
+                enrichment_artifact=enrichment,
+                synthesis=parsed_synthesis,
+                enrichment=parsed_enrichment,
             )
             await uow.commit()
         return ProductionStateImportResult(

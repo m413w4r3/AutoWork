@@ -111,6 +111,7 @@ from cti_app.domain.production import (
     ProductionRun,
 )
 from cti_app.domain.production_editorial_enrichment import (
+    EDITORIAL_ENRICHMENT_V8_CURRENT_POLICY_VERSION,
     DiagramEdgeV1,
     DiagramNodeRole,
     DiagramNodeV1,
@@ -606,7 +607,20 @@ def test_accepted_ioc_profile_source_figure_gets_a_catalog_handle() -> None:
     assert diagnostics["accepted"][0]["handle"] == "F001"
 
 
-def _proposal(handle: str) -> EditorialEnrichmentProposalV1:
+def _proposal(handle: str, *, anchor_block_id: UUID | None = None) -> EditorialEnrichmentProposalV1:
+    placement = (
+        EnrichmentPlacementProposalV1(
+            kind=EnrichmentPlacementKind.AFTER_PARAGRAPH,
+            anchor_block_id=anchor_block_id,
+        )
+        if anchor_block_id is not None
+        else EnrichmentPlacementProposalV1(kind=EnrichmentPlacementKind.AFTER_LEAD)
+    )
+    wire_placement = (
+        {"kind": "after_paragraph", "anchor_block_id": str(anchor_block_id)}
+        if anchor_block_id is not None
+        else {"kind": "after_section", "section_index": 0}
+    )
     return EditorialEnrichmentProposalV1(
         tables=(
             TableProposalV1(
@@ -623,7 +637,7 @@ def _proposal(handle: str) -> EditorialEnrichmentProposalV1:
                         cells=("ExampleRAT", "launches execution"), evidence_handles=(handle,)
                     ),
                 ),
-                placement=EnrichmentPlacementProposalV1(kind=EnrichmentPlacementKind.AFTER_LEAD),
+                placement=placement,
                 purpose=AnalyticPurposeProposalV1(
                     question="Which named tool is documented?",
                     available_data="The report names ExampleRAT.",
@@ -657,7 +671,7 @@ def _proposal(handle: str) -> EditorialEnrichmentProposalV1:
                         "evidence_handles": [handle],
                     }
                 ],
-                "placement": {"kind": "after_section", "section_index": 0},
+                "placement": wire_placement,
                 "purpose": {
                     "question": "Does ExampleRAT launch an execution step?",
                     "available_data": "The source states that ExampleRAT launches execution.",
@@ -2545,6 +2559,7 @@ def _figure_wire(
     purpose_question: str = "What execution action does ExampleRAT perform?",
     placement: str | None = "after_section",
     section_index: int = 0,
+    anchor_block_id: UUID | None = None,
     extra: str = "",
 ) -> str:
     lines = [
@@ -2564,6 +2579,8 @@ def _figure_wire(
         lines.append(f"PLACEMENT: {placement}")
     if placement == "after_section":
         lines.append(f"SECTION_INDEX: {section_index}")
+    elif placement == "after_paragraph" and anchor_block_id is not None:
+        lines.append(f"ANCHOR_BLOCK_ID: {anchor_block_id}")
     lines.extend(
         ["REASON: The source figure clarifies the execution context.", extra, "END FIGURE"]
     )
@@ -2889,7 +2906,7 @@ def test_annotation_wire_blocks_validate_anchor_and_segment_then_persist() -> No
         parsed.proposal, pack, extraction, synthesis
     )
     assert enrichment.annotations[0].text == "ExampleRAT"
-    assert enrichment.schema_version == 8
+    assert enrichment.schema_version == 9
     assert editorial_enrichment_from_json(editorial_enrichment_to_json(enrichment)) == enrichment
 
 
@@ -3242,7 +3259,7 @@ def test_model_request_is_stateless_versioned_and_uses_exact_route() -> None:
     assert "RELATION_TYPE: factual | inference | comparison" in request.text
     assert EDITORIAL_ENRICHMENT_GENERATOR_VERSION == "model-text-blocks-v11-brief-enrichment"
     assert EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION == (
-        "editorial-enrichment-block-contract-v14-article-density"
+        "editorial-enrichment-block-contract-v15-after-paragraph-anchors"
     )
 
     assert "au moins deux TABLE utiles" in request.text
@@ -3354,7 +3371,7 @@ def test_validator_version_changes_artifact_identity_without_changing_invocation
     artifact_after = compute_editorial_enrichment_input_hash(**common)
 
     assert EDITORIAL_ENRICHMENT_VALIDATOR_VERSION == (
-        "editorial-enrichment-validator-v18-ioc-republication-diagram-value"
+        "editorial-enrichment-validator-v18-paragraph-anchor"
     )
     assert invocation_before == invocation_after
     assert artifact_before != artifact_after
@@ -3492,11 +3509,47 @@ class _Uow:
         self,
         documents: _MemorySourceDocuments,
         collections: tuple[SourceCollection, ...] = (),
+        *,
+        workspace: SimpleNamespace | None = None,
     ) -> None:
         self.source_documents = documents
         self.source_collections = _MemorySourceCollections(collections)
         self.blobs = _MemoryBlobs()
         self.source_media_candidates = _MemorySourceMediaCandidates()
+        if workspace is not None:
+            self.subjects = SimpleNamespace(get=self._get_workspace_subject)
+            self.production_runs = SimpleNamespace(
+                get_current_for_subject=self._get_workspace_run,
+                lock_creation_for_subject=self._lock_workspace_run_creation,
+            )
+            self.production_artifacts = _MemoryWorkspaceArtifacts(workspace.artifacts)
+            self.editorial_workspace_snapshots = workspace.snapshots
+            self.editorial_proposal_impacts = SimpleNamespace(
+                latest_for_run=self._latest_editorial_impact
+            )
+            self.publication_renders = SimpleNamespace(
+                get_latest_for_artifact=self._latest_publication_render
+            )
+            self._workspace = workspace
+
+    async def _get_workspace_subject(self, subject_id: UUID) -> object | None:
+        if self._workspace.subject_id != subject_id:
+            return None
+        return SimpleNamespace(id=subject_id)
+
+    async def _get_workspace_run(self, subject_id: UUID) -> ProductionRun | None:
+        if self._workspace.subject_id != subject_id:
+            return None
+        return cast(ProductionRun, self._workspace.run)
+
+    async def _lock_workspace_run_creation(self, _subject_id: UUID) -> None:
+        return None
+
+    async def _latest_editorial_impact(self, _run_id: UUID) -> None:
+        return None
+
+    async def _latest_publication_render(self, _artifact_id: UUID) -> None:
+        return None
 
     async def __aenter__(self) -> _Uow:
         return self
@@ -3521,6 +3574,55 @@ class _MemorySourceMediaCandidates:
     ) -> tuple[SourceMediaRecord, ...]:
         self.calls.append((subject_id, policy_sha256))
         return self.records
+
+
+class _MemoryWorkspaceArtifacts:
+    def __init__(self, artifacts: tuple[ProductionArtifact, ...]) -> None:
+        self.artifacts = list(artifacts)
+
+    async def get_current(self, run_id: UUID, stage: str) -> ProductionArtifact | None:
+        candidates = [
+            item
+            for item in self.artifacts
+            if item.production_run_id == run_id
+            and item.stage.value == stage
+            and item.status is not ProductionArtifactStatus.STALE
+        ]
+        return max(candidates, key=lambda item: item.version, default=None)
+
+    async def get_current_for_revision(self, run_id: UUID, stage: str) -> ProductionArtifact | None:
+        return await self.get_current(run_id, stage)
+
+    async def list_for_run(self, run_id: UUID) -> tuple[ProductionArtifact, ...]:
+        return tuple(item for item in self.artifacts if item.production_run_id == run_id)
+
+
+class _MemoryWorkspaceSnapshotRepository:
+    def __init__(self) -> None:
+        self.records: list[Any] = []
+
+    async def get_by_pin(self, run_id: UUID, pin_hash: str) -> Any | None:
+        return next(
+            (
+                record
+                for record in self.records
+                if record.production_run_id == run_id and record.workspace_pin_hash == pin_hash
+            ),
+            None,
+        )
+
+    async def append_if_absent(self, record: Any) -> Any:
+        existing = await self.get_by_pin(record.production_run_id, record.workspace_pin_hash)
+        if existing is not None:
+            return existing
+        self.records.append(record)
+        return record
+
+    async def latest_for_run(self, run_id: UUID) -> Any | None:
+        return next(
+            (record for record in reversed(self.records) if record.production_run_id == run_id),
+            None,
+        )
 
 
 class _RecordingGateway:
@@ -3678,7 +3780,11 @@ def _succeeded(request: ModelRequest, proposal: BaseModel | None) -> ModelExecut
         if isinstance(proposal, EditorialEnrichmentProposalV1)
         else "raw answer"
     )
-    return ModelExecution(run=run, output_text=output_text, structured_output=None)
+    return ModelExecution(
+        run=run,
+        output_text=_registered_anchor_model_response(request, output_text),
+        structured_output=None,
+    )
 
 
 def _succeeded_text(request: ModelRequest, output_text: str) -> ModelExecution:
@@ -3690,7 +3796,75 @@ def _succeeded_text(request: ModelRequest, output_text: str) -> ModelExecution:
         output_references=("model-output://1",),
         response_id=None,
     )
-    return ModelExecution(run=run, output_text=output_text, structured_output=None)
+    return ModelExecution(
+        run=run,
+        output_text=_registered_anchor_model_response(request, output_text),
+        structured_output=None,
+    )
+
+
+def _registered_anchor_model_response(request: ModelRequest, output_text: str) -> str:
+    try:
+        payload = json.loads(request.text)
+    except (json.JSONDecodeError, TypeError):
+        return output_text
+    admitted_pack = payload.get("admitted_evidence_pack")
+    synthesis = payload.get("current_synthesis")
+    if synthesis is None and isinstance(admitted_pack, dict):
+        synthesis = admitted_pack.get("current_synthesis")
+    if not isinstance(synthesis, dict):
+        return output_text
+    paragraphs = [
+        *synthesis.get("lead", ()),
+        *(
+            paragraph
+            for section in synthesis.get("sections", ())
+            for paragraph in section.get("paragraphs", ())
+        ),
+    ]
+    anchor_id = next(
+        (
+            str(paragraph["block_id"])
+            for paragraph in paragraphs
+            if isinstance(paragraph, dict) and paragraph.get("block_id") is not None
+        ),
+        None,
+    )
+    target = payload.get("target")
+    target_placement = target.get("placement") if isinstance(target, dict) else None
+    if (
+        isinstance(target_placement, dict)
+        and target_placement.get("kind") == "after_paragraph"
+        and target_placement.get("anchor_block_id") is not None
+    ):
+        target_anchor_id = str(target_placement["anchor_block_id"])
+        if target_anchor_id in {
+            str(paragraph.get("block_id"))
+            for paragraph in paragraphs
+            if isinstance(paragraph, dict) and paragraph.get("block_id") is not None
+        }:
+            anchor_id = target_anchor_id
+    if anchor_id is None:
+        return output_text
+    normalized: list[str] = []
+    replace_following_placement_details = False
+    for line in output_text.splitlines():
+        if replace_following_placement_details and (
+            line.startswith("SECTION_INDEX:") or line.startswith("ANCHOR_BLOCK_ID:")
+        ):
+            replace_following_placement_details = False
+            continue
+        replace_following_placement_details = False
+        if line.startswith("PLACEMENT:") and line.split(":", 1)[1].strip() in {
+            "after_lead",
+            "after_paragraph",
+            "after_section",
+        }:
+            normalized.extend(("PLACEMENT: after_paragraph", f"ANCHOR_BLOCK_ID: {anchor_id}"))
+            replace_following_placement_details = True
+            continue
+        normalized.append(line)
+    return "\n".join(normalized)
 
 
 def _proposal_to_wire(proposal: EditorialEnrichmentProposalV1) -> str:
@@ -3723,6 +3897,8 @@ def _proposal_to_wire(proposal: EditorialEnrichmentProposalV1) -> str:
         lines.append(f"PLACEMENT: {placement['kind']}")
         if placement.get("section_index") is not None:
             lines.append(f"SECTION_INDEX: {placement['section_index']}")
+        if placement.get("anchor_block_id") is not None:
+            lines.append(f"ANCHOR_BLOCK_ID: {placement['anchor_block_id']}")
         for column_index, column in enumerate(table["columns"], start=1):
             lines.extend(
                 [
@@ -3767,6 +3943,8 @@ def _proposal_to_wire(proposal: EditorialEnrichmentProposalV1) -> str:
         lines.append(f"PLACEMENT: {placement['kind']}")
         if placement.get("section_index") is not None:
             lines.append(f"SECTION_INDEX: {placement['section_index']}")
+        if placement.get("anchor_block_id") is not None:
+            lines.append(f"ANCHOR_BLOCK_ID: {placement['anchor_block_id']}")
         for node_index, node in enumerate(diagram["nodes"], start=1):
             lines.extend(
                 [
@@ -3968,8 +4146,30 @@ def _world(
     source_documents = _MemorySourceDocuments(
         documents if documents is not None else (_document(),)
     )
+    extraction_artifact = ProductionArtifact(
+        production_run_id=run.id,
+        subject_id=snapshot.subject_id,
+        stage=ProductionArtifactStage.EXTRACTION,
+        version=1,
+        input_hash="e" * 64,
+        canonical_blob_id=store.put(production_extraction_to_json(extraction)),
+    )
+    synthesis_artifact = ProductionArtifact(
+        production_run_id=run.id,
+        subject_id=snapshot.subject_id,
+        stage=ProductionArtifactStage.SYNTHESIS,
+        version=1,
+        input_hash="e" * 64,
+        canonical_blob_id=store.put(production_synthesis_to_json(synthesis)),
+    )
+    workspace = SimpleNamespace(
+        subject_id=snapshot.subject_id,
+        run=run,
+        artifacts=(synthesis_artifact,),
+        snapshots=_MemoryWorkspaceSnapshotRepository(),
+    )
     service = ProductionEditorialEnrichmentService(
-        uow_factory=lambda: _Uow(source_documents, collections),  # type: ignore[arg-type,return-value]
+        uow_factory=lambda: _Uow(source_documents, collections, workspace=workspace),  # type: ignore[arg-type,return-value]
         artifact_store=store,  # type: ignore[arg-type]
         model_gateway=gateway,  # type: ignore[arg-type]
         editorial_enrichment_service=writer,  # type: ignore[arg-type]
@@ -3978,16 +4178,6 @@ def _world(
         diagram_compiler=_MemoryDiagramCompiler(),  # type: ignore[arg-type]
     )
 
-    def artifact(stage: ProductionArtifactStage, payload: dict[str, object]) -> ProductionArtifact:
-        return ProductionArtifact(
-            production_run_id=run.id,
-            subject_id=snapshot.subject_id,
-            stage=stage,
-            version=1,
-            input_hash="e" * 64,
-            canonical_blob_id=store.put(payload),
-        )
-
     return SimpleNamespace(
         service=service,
         store=store,
@@ -3995,14 +4185,11 @@ def _world(
         gateway=gateway,
         run=run,
         snapshot=snapshot,
+        workspace=workspace,
         extraction=extraction,
         synthesis=synthesis,
-        extraction_artifact=artifact(
-            ProductionArtifactStage.EXTRACTION, production_extraction_to_json(extraction)
-        ),
-        synthesis_artifact=artifact(
-            ProductionArtifactStage.SYNTHESIS, production_synthesis_to_json(synthesis)
-        ),
+        extraction_artifact=extraction_artifact,
+        synthesis_artifact=synthesis_artifact,
     )
 
 
@@ -4198,6 +4385,13 @@ async def test_service_drafts_once_statelessly_and_stores_model_provenance() -> 
 
     assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
     assert (result.model_calls, result.table_count, result.diagram_count) == (2, 1, 1)
+    assert (
+        sum(
+            request.prompt_template_id == "production-editorial-enrichment"
+            for request, _schema in world.gateway.calls
+        )
+        == 1
+    )
     assert result.source_figure_count == 0
     request, schema = world.gateway.calls[0]
     assert schema is None
@@ -4210,7 +4404,9 @@ async def test_service_drafts_once_statelessly_and_stores_model_provenance() -> 
         )
     )
     stored = world.writer.calls[0]
-    assert stored["raw_result"] == _proposal_to_wire(_proposal("E001"))
+    assert stored["raw_result"] == _registered_anchor_model_response(
+        request, _proposal_to_wire(_proposal("E001"))
+    )
     assert stored["model_run_id"] == result.model_run_id
     assert stored["input_hash"] == result.input_hash
     enrichment = stored["enrichment"]
@@ -4302,6 +4498,13 @@ async def test_empty_model_decision_is_a_valid_stored_enrichment() -> None:
 
     assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
     assert (result.table_count, result.diagram_count, result.model_calls) == (0, 0, 2)
+    assert (
+        sum(
+            request.prompt_template_id == "production-editorial-enrichment"
+            for request, _schema in world.gateway.calls
+        )
+        == 1
+    )
     assert len(world.writer.calls) == 1
 
 
@@ -4363,6 +4566,7 @@ async def test_rejecting_every_quality_block_can_store_an_empty_success() -> Non
         world.synthesis_artifact,
         canonical_blob_id=world.store.put(production_synthesis_to_json(synthesis)),
     )
+    world.workspace.artifacts = (world.synthesis_artifact,)
 
     evidence_pack = build_editorial_enrichment_evidence_pack(world.snapshot, extraction, synthesis)
     ioc_handles = {
@@ -4432,7 +4636,10 @@ async def test_resource_need_is_persisted_and_search_stays_off_by_default() -> N
 
     assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
     assert world.service._resource_search_enabled is False
-    assert len(world.gateway.calls) == 2
+    request_ids = [request.prompt_template_id for request, _schema in world.gateway.calls]
+    assert request_ids.count("production-editorial-enrichment") == 1
+    assert request_ids.count("production-semantic-annotation") == 1
+    assert "production-editorial-resource-proposal" not in request_ids
     enrichment = world.writer.calls[0]["enrichment"]
     assert len(enrichment.resource_needs) == 1  # type: ignore[attr-defined]
     assert enrichment.resource_needs[0].kind.value == "MEDIA"  # type: ignore[attr-defined]
@@ -4467,7 +4674,11 @@ async def test_resource_search_opt_in_uses_separate_call_and_persists_proposals_
 
     assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
     assert result.model_calls == 3
-    assert [request.web_search for request, _schema in world.gateway.calls] == [False, True, False]
+    assert [request.web_search for request, _schema in world.gateway.calls] == [
+        False,
+        True,
+        False,
+    ]
     assert all(request.conversation is None for request, _schema in world.gateway.calls)
     enrichment = world.writer.calls[0]["enrichment"]
     assert len(enrichment.resource_needs) == 1  # type: ignore[attr-defined]
@@ -4504,7 +4715,9 @@ async def test_brief_resource_search_stays_disabled_even_when_configuration_enab
 
     assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
     assert result.model_calls == 2
-    assert len(world.gateway.calls) == 2
+    request_ids = [request.prompt_template_id for request, _schema in world.gateway.calls]
+    assert request_ids.count("production-editorial-enrichment") == 1
+    assert request_ids.count("production-semantic-annotation") == 1
     assert all(request.web_search is False for request, _schema in world.gateway.calls)
     assert result.details["resource_proposal_search"]["status"] == "disabled_for_brief"
     assert lineage_writer.calls[0]["resource_search_enabled"] is False
@@ -4601,7 +4814,10 @@ async def test_dirty_text_blocks_keep_valid_items_and_report_local_rejections() 
     )
     world = _world(
         _RecordingGateway(
-            lambda request: replace(_succeeded(request, _proposal("E001")), output_text=polluted)
+            lambda request: replace(
+                _succeeded(request, _proposal("E001")),
+                output_text=_registered_anchor_model_response(request, polluted),
+            )
         )
     )
 
@@ -4621,8 +4837,11 @@ async def test_dirty_text_blocks_keep_valid_items_and_report_local_rejections() 
     assert len(enrichment.tables[0].rows) == 2  # type: ignore[attr-defined]
     assert enrichment.tables[0].rows[0].cells[0] == '"ExampleRAT"'  # type: ignore[attr-defined]
     assert enrichment.diagrams == ()  # type: ignore[attr-defined]
-    assert enrichment.tables[0].placement.kind is EnrichmentPlacementKind.AFTER_LEAD  # type: ignore[attr-defined]
-    assert world.writer.calls[0]["raw_result"] == polluted
+    assert enrichment.tables[0].placement.kind is EnrichmentPlacementKind.AFTER_PARAGRAPH  # type: ignore[attr-defined]
+    assert enrichment.tables[0].placement.anchor_block_id is not None  # type: ignore[attr-defined]
+    assert world.writer.calls[0]["raw_result"] == _registered_anchor_model_response(
+        world.gateway.calls[0][0], polluted
+    )
     run = world.gateway.runs[result.model_run_id]
     assert "bridge_ui_markers_removed" in run.transformations
     assert "markdown_fences_removed" in run.transformations
@@ -4652,7 +4871,7 @@ async def test_unintelligible_nonempty_response_needs_review() -> None:
 
 
 @pytest.mark.asyncio
-async def test_parser_version_bump_reparses_archived_output_without_model_call(
+async def test_parser_version_bump_reparses_archived_output_without_new_enrichment_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     world = _world(_RecordingGateway(lambda request: _succeeded(request, _proposal("E001"))))
@@ -4660,6 +4879,11 @@ async def test_parser_version_bump_reparses_archived_output_without_model_call(
     first_enrichment = world.writer.calls[0]["enrichment"]
     original_identity = world.gateway.runs[first.model_run_id].normalization_version
     original_normalized_sha256 = world.gateway.runs[first.model_run_id].normalized_output_sha256
+    enrichment_run_ids_after_first = tuple(
+        request.run_id
+        for request, _schema in world.gateway.calls
+        if request.prompt_template_id == "production-editorial-enrichment"
+    )
 
     monkeypatch.setattr(
         enrichment_module,
@@ -4670,7 +4894,15 @@ async def test_parser_version_bump_reparses_archived_output_without_model_call(
 
     assert first.status is second.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
     assert second.model_calls == 0
-    assert len(world.gateway.calls) == 2
+    assert len(enrichment_run_ids_after_first) == 1
+    assert (
+        tuple(
+            request.run_id
+            for request, _schema in world.gateway.calls
+            if request.prompt_template_id == "production-editorial-enrichment"
+        )
+        == enrichment_run_ids_after_first
+    )
     assert second.model_run_id == first.model_run_id
     assert second.input_hash != first.input_hash
     reparsed = world.writer.calls[1]["enrichment"]
@@ -4705,12 +4937,24 @@ async def test_prompt_or_contract_version_bump_uses_a_new_model_invocation(
 ) -> None:
     world = _world(_RecordingGateway(lambda request: _succeeded(request, _proposal("E001"))))
     first = await _execute(world)
+    first_enrichment_run_ids = tuple(
+        request.run_id
+        for request, _schema in world.gateway.calls
+        if request.prompt_template_id == "production-editorial-enrichment"
+    )
     monkeypatch.setattr(enrichment_module, version_name, version_value)
 
     second = await _execute(world)
 
     assert second.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
-    assert len(world.gateway.calls) == 3
+    enrichment_run_ids = tuple(
+        request.run_id
+        for request, _schema in world.gateway.calls
+        if request.prompt_template_id == "production-editorial-enrichment"
+    )
+    assert len(first_enrichment_run_ids) == 1
+    assert len(enrichment_run_ids) == 2
+    assert enrichment_run_ids[0] == first_enrichment_run_ids[0]
     assert second.model_calls == 1
     assert second.input_hash != first.input_hash
     assert second.model_run_id != first.model_run_id
@@ -4743,6 +4987,11 @@ async def test_restart_resumes_from_verified_raw_output_with_identical_result() 
     world = _world(_RecordingGateway(lambda request: _succeeded(request, _proposal("E001"))))
     first = await _execute(world)
     first_enrichment = world.writer.calls[0]["enrichment"]
+    enrichment_run_ids_after_first = tuple(
+        request.run_id
+        for request, _schema in world.gateway.calls
+        if request.prompt_template_id == "production-editorial-enrichment"
+    )
     world.service = ProductionEditorialEnrichmentService(
         uow_factory=world.service._uow_factory,  # type: ignore[attr-defined,arg-type]
         artifact_store=world.store,  # type: ignore[arg-type]
@@ -4757,7 +5006,14 @@ async def test_restart_resumes_from_verified_raw_output_with_identical_result() 
 
     assert resumed.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
     assert resumed.model_calls == 0
-    assert len(world.gateway.calls) == 2
+    assert (
+        tuple(
+            request.run_id
+            for request, _schema in world.gateway.calls
+            if request.prompt_template_id == "production-editorial-enrichment"
+        )
+        == enrichment_run_ids_after_first
+    )
     assert resumed.model_run_id == first.model_run_id
     resumed_enrichment = world.writer.calls[1]["enrichment"]
     assert resumed_enrichment.tables == first_enrichment.tables  # type: ignore[attr-defined]
@@ -4941,7 +5197,10 @@ async def test_key_collision_rejects_only_the_conflicting_wire_block(
         for item in result.details["rejections"]
     )
     # One conflicting table is rejected and receives the bounded repair attempt.
-    assert result.model_calls == 3
+    assert result.model_calls == 3, (
+        result.details.get("semantic_annotation") if result.details is not None else None,
+        [request.prompt_template_id for request, _schema in world.gateway.calls],
+    )
     assert len(world.writer.calls) == 1
 
 
@@ -5021,14 +5280,25 @@ class _RevisionUow:
         source_documents: _MemorySourceDocuments,
         artifacts: _RevisionArtifactRepository,
         source_collections: _MemorySourceCollections,
+        workspace_snapshots: _MemoryWorkspaceSnapshotRepository | None = None,
         repair_decisions: tuple[ProductionRepairDecision, ...] = (),
     ) -> None:
+        self.subjects = SimpleNamespace(get=self._get_subject)
         self.production_runs = SimpleNamespace(get_current_for_subject=self._current_run)
         self.production_input_snapshots = SimpleNamespace(get_by_run=self._snapshot_for_run)
         self.source_documents = source_documents
         self.source_collections = source_collections
         self.blobs = _MemoryBlobs()
         self.production_artifacts = artifacts
+        self.editorial_workspace_snapshots = (
+            workspace_snapshots or _MemoryWorkspaceSnapshotRepository()
+        )
+        self.editorial_proposal_impacts = SimpleNamespace(
+            latest_for_run=self._latest_editorial_impact
+        )
+        self.publication_renders = SimpleNamespace(
+            get_latest_for_artifact=self._latest_publication_render
+        )
 
         async def effective_decisions(edition_id: UUID, subject_id: UUID | None) -> tuple[Any, ...]:
             return tuple(
@@ -5044,6 +5314,15 @@ class _RevisionUow:
 
     async def _current_run(self, subject_id: UUID) -> ProductionRun | None:
         return self._run if self._run.subject_id == subject_id else None
+
+    async def _get_subject(self, subject_id: UUID) -> object | None:
+        return SimpleNamespace(id=subject_id) if subject_id == self._run.subject_id else None
+
+    async def _latest_editorial_impact(self, _run_id: UUID) -> None:
+        return None
+
+    async def _latest_publication_render(self, _artifact_id: UUID) -> None:
+        return None
 
     async def _snapshot_for_run(self, run_id: UUID) -> ProductionInputSnapshot | None:
         return self._snapshot if self._snapshot.production_run_id == run_id else None
@@ -5131,6 +5410,15 @@ async def _revision_harness(
         lambda _payload: SimpleNamespace(sources=()),
     )
 
+    world.workspace.artifacts = (world.synthesis_artifact,)
+    from cti_app.application.editorial_workspace.service import EditorialWorkspaceService
+
+    async with world.service._uow_factory() as workspace_uow:
+        workspace_record = await EditorialWorkspaceService(
+            uow_factory=world.service._uow_factory,
+            artifact_store=world.store,  # type: ignore[arg-type]
+        ).snapshot_record_in_uow(workspace_uow, world.snapshot.subject_id)
+
     document = _document()
     if collection is not None:
         document = replace(document, source_collection_id=collection.id)
@@ -5140,7 +5428,10 @@ async def _revision_harness(
         world.snapshot, world.extraction, source_documents, source_collections
     )
     evidence_pack = build_editorial_enrichment_evidence_pack(
-        world.snapshot, world.extraction, world.synthesis
+        world.snapshot,
+        world.extraction,
+        world.synthesis,
+        workspace_record=workspace_record,
     )
     evidence_pack_hash = editorial_enrichment_evidence_pack_hash(evidence_pack)
     access_hash = synthesis_access_policy_hash(policy)
@@ -5162,8 +5453,16 @@ async def _revision_harness(
         for record in evidence_pack.narrative_evidence
         if record.get("value") == "ExampleRAT"
     )
+    registered_anchor_id = next(
+        entry.block_id
+        for entry in workspace_record.block_registry
+        if entry.kind.value in {"lead_paragraph", "paragraph"}
+    )
     enrichment = validate_editorial_enrichment_proposal(
-        _proposal(fact_handle), evidence_pack, world.extraction, world.synthesis
+        _proposal(fact_handle, anchor_block_id=registered_anchor_id),
+        evidence_pack,
+        world.extraction,
+        world.synthesis,
     )
     if include_ioc_duplicate_table:
         handles = {
@@ -5189,7 +5488,11 @@ async def _revision_harness(
         enrichment = replace(enrichment, tables=(ioc_table,))
     figure_catalog = build_editorial_figure_catalog(world.extraction, inventory)
     if include_figure:
-        figure_wire = _figure_wire(handle=figure_catalog[0].handle)
+        figure_wire = _figure_wire(
+            handle=figure_catalog[0].handle,
+            placement="after_paragraph",
+            anchor_block_id=registered_anchor_id,
+        )
         parsed_figure = parse_editorial_enrichment_proposal_wire(
             figure_wire, evidence_pack, figure_catalog=figure_catalog
         )
@@ -5288,6 +5591,7 @@ async def _revision_harness(
             publication_artifact,
         ]
     )
+    workspace_snapshots = _MemoryWorkspaceSnapshotRepository()
     effective_repair_decisions: list[ProductionRepairDecision] = []
 
     def uow_factory() -> _RevisionUow:
@@ -5297,6 +5601,7 @@ async def _revision_harness(
             source_documents=source_documents,
             artifacts=artifacts,
             source_collections=source_collections,
+            workspace_snapshots=workspace_snapshots,
             repair_decisions=tuple(effective_repair_decisions),
         )
 
@@ -5389,6 +5694,8 @@ async def _install_stale_enrichment_restore_history(
     )
     source_enrichment = replace(
         original,
+        schema_version=8,
+        enrichment_policy_version=EDITORIAL_ENRICHMENT_V8_CURRENT_POLICY_VERSION,
         tables=tuple(replace(item, placement=section_placement) for item in original.tables),
         diagrams=tuple(replace(item, placement=section_placement) for item in original.diagrams),
         charts=tuple(replace(item, placement=section_placement) for item in original.charts),
@@ -5462,11 +5769,29 @@ async def _install_stale_enrichment_restore_history(
 
     original_base = harness.base
     source_payload = editorial_enrichment_to_json(source_enrichment)
+    legacy_evidence_pack = build_editorial_enrichment_evidence_pack(
+        world.snapshot, world.extraction, world.synthesis
+    )
+    legacy_evidence_hash = editorial_enrichment_evidence_pack_hash(legacy_evidence_pack)
+    access_hash = str(original_base.metadata["access_policy_hash"])
+    inventory_hash = str(original_base.metadata["source_figure_inventory_hash"])
+    source_input_hash = compute_editorial_enrichment_input_hash(
+        extraction=world.extraction,
+        synthesis=world.synthesis,
+        evidence_pack_hash=legacy_evidence_hash,
+        access_policy_hash=access_hash,
+        projection_hash=None,
+        source_figure_inventory_hash=inventory_hash,
+    )
     source_artifact = replace(
         original_base,
+        input_hash=source_input_hash,
         canonical_blob_id=world.store.put(source_payload),
         metadata={
             **original_base.metadata,
+            "evidence_pack_hash": legacy_evidence_hash,
+            "generator_version": "model-text-blocks-v8-editorial-tables",
+            "routing_policy_version": "editorial-enrichment-routing-policy-v2-resource-search-off",
             "synthesis_hash": canonical_synthesis_hash(world.synthesis),
             "extraction_hash": canonical_extraction_hash(world.extraction),
         },
@@ -5520,7 +5845,7 @@ async def _install_stale_enrichment_restore_history(
             world.extraction, harness.inventory_state.value
         )
         metadata: dict[str, Any] = {
-            **original_base.metadata,
+            **source_artifact.metadata,
             "evidence_pack_hash": evidence_hash,
             "extraction_hash": canonical_extraction_hash(world.extraction),
             "synthesis_hash": canonical_synthesis_hash(synthesis),
@@ -5785,6 +6110,11 @@ async def test_stale_enrichment_restore_recovers_verified_blocks_after_title_and
     )
     history = await _install_stale_enrichment_restore_history(harness)
     original_count = len(harness.artifacts.artifacts)
+    assert harness.base.metadata["evidence_pack_hash"] == editorial_enrichment_evidence_pack_hash(
+        build_editorial_enrichment_evidence_pack(
+            harness.world.snapshot, harness.world.extraction, harness.world.synthesis
+        )
+    )
 
     preview = await harness.service.preview_restore_stale_enrichment_blocks(
         **_stale_enrichment_restore_args(harness)
@@ -5829,9 +6159,18 @@ async def test_stale_enrichment_restore_recovers_verified_blocks_after_title_and
         "section:0:paragraph:0001",
     }
     assert quality_rejections == ()
+    legacy_evidence_pack = build_editorial_enrichment_evidence_pack(
+        harness.world.snapshot,
+        harness.world.extraction,
+        harness.world.synthesis,
+    )
+    assert restored.schema_version == 8
+    assert result.artifact.metadata[
+        "evidence_pack_hash"
+    ] == editorial_enrichment_evidence_pack_hash(legacy_evidence_pack)
     assert (
         result.artifact.metadata["evidence_pack_hash"]
-        == (harness.base.metadata["evidence_pack_hash"])
+        == harness.base.metadata["evidence_pack_hash"]
     )
     assert result.publication_artifact.status is ProductionArtifactStatus.VERIFIED
     assert result.publication_artifact.metadata["input_artifacts"][
@@ -6010,9 +6349,18 @@ def _revision_args(harness: SimpleNamespace) -> dict[str, Any]:
     }
 
 
-def _table_revision_wire() -> str:
+def _table_revision_wire(*, anchor_block_id: UUID | None = None) -> str:
     proposal = _proposal("E001")
     table = proposal.tables[0].model_copy(update={"title": "Documented tools"})
+    if anchor_block_id is not None:
+        table = table.model_copy(
+            update={
+                "placement": EnrichmentPlacementProposalV1(
+                    kind=EnrichmentPlacementKind.AFTER_PARAGRAPH,
+                    anchor_block_id=anchor_block_id,
+                )
+            }
+        )
     targeted = proposal.model_copy(update={"tables": (table,), "diagrams": ()})
     return _proposal_to_wire(targeted)
 
@@ -7479,6 +7827,16 @@ def _common_enrichment_request(
     )
 
 
+def _registered_section_placement(harness: SimpleNamespace) -> TargetedEditorialRevisionPlacement:
+    from cti_app.application.production_synthesis_revision import _section_id
+
+    section = production_synthesis_to_json(harness.world.synthesis)["sections"][0]
+    return TargetedEditorialRevisionPlacement(
+        TargetedEditorialRevisionPlacementKind.AFTER_SECTION,
+        section_id=_section_id(section),
+    )
+
+
 def _canonical_enrichment_with_family_sibling(
     harness: SimpleNamespace,
     kind: EditorialEnrichmentElementKind,
@@ -7562,14 +7920,20 @@ def _canonical_enrichment_with_family_sibling(
             harness.world.extraction, harness.inventory_state.value
         )
         assert len(catalog) >= 2
+        assert harness.evidence_pack.registered_anchor_ids is not None
+        anchor_block_id = min(harness.evidence_pack.registered_anchor_ids, key=str)
         first_wire = _figure_wire(
             handle=catalog[0].handle,
             purpose_question="What does the first source visual establish?",
+            placement="after_paragraph",
+            anchor_block_id=anchor_block_id,
         )
         second_wire = _figure_wire(
             handle=catalog[1].handle,
             caption="Alternative documented source visual",
             purpose_question="What additional visual evidence is present?",
+            placement="after_paragraph",
+            anchor_block_id=anchor_block_id,
         ).replace("FIGURE P001", "FIGURE P002", 1)
         parsed = parse_editorial_enrichment_proposal_wire(
             f"{first_wire}\n\n{second_wire}",
@@ -7757,7 +8121,9 @@ async def test_restore_does_not_resurrect_any_explicit_delete_family(
     assert deleted_key not in {item["key"] for item in restored_payload[field_name]}
 
 
-def _simulate_repair_rebase_with_uncontextualized_fact(harness: SimpleNamespace) -> None:
+async def _simulate_repair_rebase_with_uncontextualized_fact(
+    harness: SimpleNamespace,
+) -> None:
     """Model the verified artifacts emitted by an IOC repair that grows extraction."""
     world = harness.world
     previous_base = harness.base
@@ -7846,8 +8212,18 @@ def _simulate_repair_rebase_with_uncontextualized_fact(harness: SimpleNamespace)
         ProductionArtifactStore.canonical_json_bytes(rebased_payload)
     ).hexdigest()
 
+    from cti_app.application.editorial_workspace.service import EditorialWorkspaceService
+
+    async with harness.service._enrichment._uow_factory() as uow:  # type: ignore[attr-defined]
+        workspace_record = await EditorialWorkspaceService(
+            uow_factory=harness.service._enrichment._uow_factory,  # type: ignore[attr-defined,arg-type]
+            artifact_store=world.store,  # type: ignore[arg-type]
+        ).snapshot_record_in_uow(uow, world.snapshot.subject_id)
     current_pack = build_editorial_enrichment_evidence_pack(
-        world.snapshot, world.extraction, world.synthesis
+        world.snapshot,
+        world.extraction,
+        world.synthesis,
+        workspace_record=workspace_record,
     )
     harness.current_evidence_pack_hash = editorial_enrichment_evidence_pack_hash(current_pack)
     harness.current_input_hash = compute_editorial_enrichment_input_hash(
@@ -7987,7 +8363,7 @@ async def test_rebased_enrichment_revision_reseals_current_hashes_for_followup(
         monkeypatch,
         _RecordingGateway(lambda request: _succeeded_text(request, _table_revision_wire())),
     )
-    _simulate_repair_rebase_with_uncontextualized_fact(harness)
+    await _simulate_repair_rebase_with_uncontextualized_fact(harness)
     assert harness.current_evidence_pack_hash != harness.base.metadata["evidence_pack_hash"]
 
     request = _common_enrichment_request(
@@ -8048,7 +8424,7 @@ async def test_rebased_enrichment_revision_conflicts_on_real_lineage_divergence(
         _RecordingGateway(lambda request: _succeeded_text(request, _table_revision_wire())),
         include_figure=divergence == "figure_inventory_hash",
     )
-    _simulate_repair_rebase_with_uncontextualized_fact(harness)
+    await _simulate_repair_rebase_with_uncontextualized_fact(harness)
     if divergence == "extraction_artifact_id":
         _replace_rebased_base_metadata(
             harness,
@@ -8095,7 +8471,7 @@ async def test_non_rebased_enrichment_keeps_strict_evidence_pack_fence(
         monkeypatch,
         _RecordingGateway(lambda request: _succeeded_text(request, _table_revision_wire())),
     )
-    _simulate_repair_rebase_with_uncontextualized_fact(harness)
+    await _simulate_repair_rebase_with_uncontextualized_fact(harness)
     assert harness.current_input_hash != harness.base.input_hash
     _replace_rebased_base_metadata(
         harness,
@@ -8427,7 +8803,16 @@ async def test_common_create_table_uses_deterministic_key_and_adds_only_one_tabl
         prompt = json.loads(request.text)
         assert prompt["current_editorial_enrichment"]["tables"][0]["key"] == "tools_table"
         assert "[" in prompt["stable_current_synthesis"]
-        assert prompt["target"]["placement"] == {"kind": "after_lead", "section_id": None}
+        registered_section_ids = [
+            paragraph["block_id"]
+            for section in prompt["admitted_evidence_pack"]["current_synthesis"]["sections"]
+            for paragraph in section["paragraphs"]
+            if paragraph.get("block_id") is not None
+        ]
+        assert prompt["target"]["placement"] == {
+            "kind": "after_paragraph",
+            "anchor_block_id": registered_section_ids[-1],
+        }
         assert prompt["editorial_contract"]["contract_version"]
         contract_example = prompt["editorial_contract"]["output_contract"]
         assert "column of projected IOC values" in contract_example
@@ -8455,9 +8840,7 @@ async def test_common_create_table_uses_deterministic_key_and_adds_only_one_tabl
         element_kind=EditorialEnrichmentElementKind.TABLE,
         operation=TargetedEditorialRevisionOperation.CREATE_TABLE,
         element_key=None,
-        placement=TargetedEditorialRevisionPlacement(
-            TargetedEditorialRevisionPlacementKind.AFTER_LEAD
-        ),
+        placement=_registered_section_placement(harness),
     )
     result = await service.revise(request)
     replay = await service.revise(request)
@@ -8731,9 +9114,7 @@ async def test_common_create_diagram_accepts_evidenced_pipeline_and_returns_type
         element_kind=EditorialEnrichmentElementKind.DIAGRAM,
         operation=TargetedEditorialRevisionOperation.CREATE_DIAGRAM,
         element_key=None,
-        placement=TargetedEditorialRevisionPlacement(
-            TargetedEditorialRevisionPlacementKind.AFTER_LEAD
-        ),
+        placement=_registered_section_placement(harness),
     )
     preview = await service.preview(request)
     result = await service.revise(request)
@@ -8758,9 +9139,7 @@ async def test_common_create_diagram_accepts_evidenced_pipeline_and_returns_type
         element_kind=EditorialEnrichmentElementKind.DIAGRAM,
         operation=TargetedEditorialRevisionOperation.CREATE_DIAGRAM,
         element_key=None,
-        placement=TargetedEditorialRevisionPlacement(
-            TargetedEditorialRevisionPlacementKind.AFTER_LEAD
-        ),
+        placement=_registered_section_placement(refused_harness),
     )
     refused = await _common_revision_service(refused_harness).revise(refused_request)
     assert refused.artifact is None
@@ -8806,9 +9185,7 @@ async def test_common_create_diagram_rejects_unknown_handles_and_unsupported_rel
             element_kind=EditorialEnrichmentElementKind.DIAGRAM,
             operation=TargetedEditorialRevisionOperation.CREATE_DIAGRAM,
             element_key=None,
-            placement=TargetedEditorialRevisionPlacement(
-                TargetedEditorialRevisionPlacementKind.AFTER_LEAD
-            ),
+            placement=_registered_section_placement(harness),
             instruction=instruction,
         )
         result = await _common_revision_service(harness).revise(request)
@@ -8891,9 +9268,7 @@ END CHART"""
         element_kind=EditorialEnrichmentElementKind.CHART,
         operation=TargetedEditorialRevisionOperation.CREATE_CHART,
         element_key=None,
-        placement=TargetedEditorialRevisionPlacement(
-            TargetedEditorialRevisionPlacementKind.AFTER_LEAD
-        ),
+        placement=_registered_section_placement(harness),
     )
     result = await _common_revision_service(harness).revise(request)
 
@@ -9083,7 +9458,10 @@ END DIAGRAM"""
 async def test_targeted_output_invalid_includes_validation_diagnostic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    anchor = "ExampleRAT downloads the payload and starts execution."
+    anchor = (
+        "ExampleRAT downloads a payload; the payload installs a service, the service connects "
+        "to the command server, and the payload also reports to that server."
+    )
 
     def draft_with_markdown_title(request: ModelRequest) -> ModelExecution:
         prompt = json.loads(request.text)
@@ -9093,8 +9471,18 @@ async def test_targeted_output_invalid_includes_validation_diagnostic(
             if item.get("value") == anchor
         )
         wire = _diagram_wire_for_quality(
-            (("malware", "ExampleRAT", "unknown"), ("payload", "payload", "unknown")),
-            (("malware", "payload", "downloads"),),
+            (
+                ("rat", "ExampleRAT", "unknown"),
+                ("payload", "payload", "unknown"),
+                ("service", "service", "unknown"),
+                ("c2", "command server", "unknown"),
+            ),
+            (
+                ("rat", "payload", "downloads"),
+                ("payload", "service", "installs"),
+                ("service", "c2", "connects"),
+                ("payload", "c2", "reports"),
+            ),
             evidence_handle=str(handle),
             key=str(prompt["target"]["key"]),
         ).replace("PLACEMENT: after_section\nSECTION_INDEX: 0", "PLACEMENT: after_lead")
@@ -9111,14 +9499,15 @@ async def test_targeted_output_invalid_includes_validation_diagnostic(
         element_kind=EditorialEnrichmentElementKind.DIAGRAM,
         operation=TargetedEditorialRevisionOperation.CREATE_DIAGRAM,
         element_key=None,
-        placement=TargetedEditorialRevisionPlacement(
-            TargetedEditorialRevisionPlacementKind.AFTER_LEAD
-        ),
+        placement=_registered_section_placement(harness),
     )
 
     result = await _common_revision_service(harness).revise(request)
 
     assert result.refusal is not None
+    raw_output = next(iter(harness.world.gateway.outputs.values())).decode()
+    reparsed_output = parse_editorial_enrichment_proposal_wire(raw_output, harness.evidence_pack)
+    assert reparsed_output.proposal is not None, reparsed_output
     assert result.refusal.recommended_restart_stage is None
     assert result.refusal.refusal_reason.value == "model_output_invalid"
     assert result.refusal.next_safe_action

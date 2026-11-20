@@ -212,11 +212,9 @@ EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION = (
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SOURCE_METADATA_POLICY_VERSION = (
     "editorial-enrichment-evidence-pack-v9-source-metadata-exclusion"
 )
-EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = (
-    "editorial-enrichment-validator-v18-ioc-republication-diagram-value"
-)
+EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = "editorial-enrichment-validator-v18-paragraph-anchor"
 EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION = (
-    "editorial-enrichment-analytic-policy-v6-ioc-republication-diagram-value"
+    "editorial-enrichment-analytic-policy-v6-paragraph-anchor"
 )
 TABLE_PARAPHRASE_TOKEN_DICE_THRESHOLD = 0.80
 DIAGRAM_STAR_LABEL_ANCHOR_OVERLAP = 0.50

@@ -3843,7 +3843,7 @@ def publication_document_v8_from_json(payload: Mapping[str, Any]) -> Publication
 
 
 def publication_document_v8_to_json(document: PublicationDocumentV8) -> dict[str, Any]:
-    if not isinstance(document, PublicationDocumentV8):
+    if type(document) is not PublicationDocumentV8:
         raise ValueError("Expected a PublicationDocumentV8")
     return document._to_json()
 

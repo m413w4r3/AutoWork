@@ -9,8 +9,16 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from cti_app.application.editorial_workspace.registry import (
+    WorkspaceSnapshotRecord,
+    registry_hash,
+    resolve_paragraph_anchor,
+)
 from cti_app.application.production_artifact_store import MAX_ARTIFACT_BYTES
-from cti_app.application.production_editorial_enrichment import canonical_synthesis_hash
+from cti_app.application.production_editorial_enrichment import (
+    canonical_editorial_enrichment_hash,
+    canonical_synthesis_hash,
+)
 from cti_app.application.production_extraction import references_corpus_hash
 from cti_app.application.production_references import production_reference_corpus_to_json
 from cti_app.application.production_state import (
@@ -30,6 +38,7 @@ from cti_app.application.subject_production import capture_production_input_snap
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole
+from cti_app.domain.editorial_workspace import bootstrap_block_registry, workspace_pin_hash
 from cti_app.domain.production import (
     EditionProductionBatchItem,
     ExtractionProfile,
@@ -48,6 +57,7 @@ from cti_app.domain.production_editorial_enrichment import (
     TableColumnV1,
     TableRowV1,
     TableSpecV1,
+    editorial_enrichment_from_json,
     editorial_enrichment_to_json,
 )
 from cti_app.domain.production_extraction import (
@@ -330,6 +340,7 @@ class _ImportUow:
             list_for_run=AsyncMock(return_value=[]),
         )
         self.production_input_snapshots = SimpleNamespace(add=AsyncMock())
+        self.editorial_workspace_snapshots = _ImportWorkspaceSnapshotRepository()
         self.commit = AsyncMock()
 
     async def __aenter__(self) -> "_ImportUow":
@@ -345,6 +356,19 @@ class _ImportFactory:
 
     def __call__(self) -> _ImportUow:
         return self.uow
+
+
+class _ImportWorkspaceSnapshotRepository:
+    def __init__(self) -> None:
+        self.source_records: dict[UUID, WorkspaceSnapshotRecord] = {}
+        self.appended_records: list[WorkspaceSnapshotRecord] = []
+
+    async def latest_for_run(self, run_id: UUID) -> WorkspaceSnapshotRecord | None:
+        return self.source_records.get(run_id)
+
+    async def append_if_absent(self, record: WorkspaceSnapshotRecord) -> WorkspaceSnapshotRecord:
+        self.appended_records.append(record)
+        return record
 
 
 class _ImportArtifactStore:
@@ -396,6 +420,129 @@ async def _payload_for_import(
         discovery_snapshot_id=local.discovery_snapshot_id,
         discovery_snapshot_version=local.discovery_snapshot_version,
     )
+
+
+def _add_after_paragraph_anchor(
+    payload: dict[str, Any],
+) -> tuple[WorkspaceSnapshotRecord, UUID, dict[str, Any]]:
+    subject_id = UUID(payload["origin"]["subject_id"])
+    source_run_id = UUID(payload["origin"]["production_run_id"])
+    artifacts = payload["artifacts"]
+    synthesis_payload = artifacts["synthesis"]["canonical_content"]
+    synthesis = production_synthesis_from_json(synthesis_payload)
+    synthesis_artifact_id = uuid4()
+    synthesis_sha = canonical_synthesis_hash(synthesis)
+    synthesis_entries = bootstrap_block_registry(
+        artifact_id=synthesis_artifact_id,
+        canonical_sha256=synthesis_sha,
+        source_stage=ProductionArtifactStage.SYNTHESIS.value,
+        canonical_content=synthesis_payload,
+    )
+    anchor = next(
+        entry for entry in synthesis_entries if entry.kind.value in {"lead_paragraph", "paragraph"}
+    )
+
+    enrichment = editorial_enrichment_from_json(
+        artifacts["editorial_enrichment"]["canonical_content"]
+    )
+    anchored_enrichment = replace(
+        enrichment,
+        tables=(
+            replace(
+                enrichment.tables[0],
+                placement=EnrichmentPlacementV1(
+                    EnrichmentPlacementKind.AFTER_PARAGRAPH,
+                    anchor_block_id=anchor.block_id,
+                ),
+            ),
+        ),
+    )
+    enrichment_payload = editorial_enrichment_to_json(anchored_enrichment)
+    artifacts["editorial_enrichment"]["canonical_content"] = enrichment_payload
+    payload["content_sha256"] = "0" * 64
+    payload["content_sha256"] = compute_production_state_checksum(
+        ProductionStateSnapshotV5.model_validate(payload)
+    )
+
+    enrichment_artifact_id = uuid4()
+    enrichment_sha = canonical_editorial_enrichment_hash(anchored_enrichment)
+    enrichment_entries = bootstrap_block_registry(
+        artifact_id=enrichment_artifact_id,
+        canonical_sha256=enrichment_sha,
+        source_stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT.value,
+        canonical_content=enrichment_payload,
+    )
+    synthesis_input_hash = artifacts["synthesis"]["input_hash"]
+    enrichment_input_hash = artifacts["editorial_enrichment"]["input_hash"]
+    pins: dict[str, object] = {
+        "subject_id": subject_id,
+        "production_run_id": source_run_id,
+        "synthesis_artifact_id": synthesis_artifact_id,
+        "synthesis_version": 1,
+        "synthesis_input_hash": synthesis_input_hash,
+        "synthesis_canonical_sha256": synthesis_sha,
+        "enrichment_artifact_id": enrichment_artifact_id,
+        "enrichment_version": 1,
+        "enrichment_input_hash": enrichment_input_hash,
+        "enrichment_canonical_sha256": enrichment_sha,
+        "publication_artifact_id": None,
+        "publication_version": None,
+        "publication_input_hash": None,
+        "publication_canonical_sha256": None,
+        "pipeline_generation": 0,
+        "routing_decision_id": None,
+        "routing_decision_hash": None,
+        "publication_kind": None,
+    }
+    entries = (*synthesis_entries, *enrichment_entries)
+    record = WorkspaceSnapshotRecord(
+        snapshot_id=uuid4(),
+        subject_id=subject_id,
+        production_run_id=source_run_id,
+        synthesis_artifact_id=synthesis_artifact_id,
+        synthesis_version=1,
+        synthesis_input_hash=str(synthesis_input_hash),
+        synthesis_canonical_sha256=synthesis_sha,
+        enrichment_artifact_id=enrichment_artifact_id,
+        enrichment_version=1,
+        enrichment_input_hash=str(enrichment_input_hash),
+        enrichment_canonical_sha256=enrichment_sha,
+        publication_artifact_id=None,
+        publication_version=None,
+        publication_input_hash=None,
+        publication_canonical_sha256=None,
+        pipeline_generation=0,
+        routing_decision_id=None,
+        routing_decision_hash=None,
+        publication_kind=None,
+        workspace_pin_hash=workspace_pin_hash(pins),
+        registry_hash=registry_hash(entries),
+        block_registry=entries,
+    )
+    return record, anchor.block_id, synthesis_payload
+
+
+@pytest.mark.asyncio
+async def test_import_preserves_verified_workspace_ids_for_after_paragraph() -> None:
+    service, uow, subject_id, edition_id = _import_service(None)
+    payload = await _payload_for_import(uow, subject_id=subject_id, edition_id=edition_id)
+    source_record, anchor_id, synthesis_payload = _add_after_paragraph_anchor(payload)
+    uow.editorial_workspace_snapshots.source_records[source_record.production_run_id] = (
+        source_record
+    )
+
+    result = await service.import_state(
+        subject_id=subject_id, edition_id=edition_id, payload=payload
+    )
+
+    imported_records = uow.editorial_workspace_snapshots.appended_records
+    assert len(imported_records) == 1
+    imported_record = imported_records[0]
+    assert imported_record.production_run_id == result.run_id
+    assert imported_record.synthesis_artifact_id != source_record.synthesis_artifact_id
+    assert imported_record.block_registry == source_record.block_registry
+    resolved = resolve_paragraph_anchor(imported_record, anchor_id, synthesis=synthesis_payload)
+    assert resolved.block_id == anchor_id
 
 
 @pytest.mark.asyncio

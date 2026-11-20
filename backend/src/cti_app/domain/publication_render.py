@@ -16,7 +16,7 @@ from cti_app.domain.typst_render import (
     validate_typst_render_record,
 )
 
-PUBLICATION_RENDER_POLICY_VERSION = "typst-publication-v12-m21-opinion-render"
+PUBLICATION_RENDER_POLICY_VERSION = "typst-publication-v13-after-paragraph-anchors"
 
 
 class PublicationPreviewStatus(StrEnum):

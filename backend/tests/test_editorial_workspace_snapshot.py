@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -28,6 +29,7 @@ from cti_app.domain.editorial_workspace import (
     BlockRegistryEntry,
     EditorialIdentityAmbiguousError,
     EditorialRegistryConflictError,
+    EditorialSourceStage,
     EditorialWorkspaceError,
     bootstrap_block_registry,
     workspace_pin_hash,
@@ -590,6 +592,41 @@ def _snapshot_record(entries: tuple[BlockRegistryEntry, ...]) -> WorkspaceSnapsh
         registry_hash=registry_hash(entries),
         block_registry=entries,
     )
+
+
+def test_unchanged_imported_stage_preserves_registered_occurrence_ids() -> None:
+    content = _synthesis((_paragraph("anchored paragraph"),))
+    source_artifact_id = uuid4()
+    imported_artifact_id = uuid4()
+    canonical_sha = "b" * 64
+    source_entries = bootstrap_block_registry(
+        artifact_id=source_artifact_id,
+        canonical_sha256=canonical_sha,
+        source_stage="synthesis",
+        canonical_content=content,
+    )
+    imported_entries = bootstrap_block_registry(
+        artifact_id=imported_artifact_id,
+        canonical_sha256=canonical_sha,
+        source_stage="synthesis",
+        canonical_content=content,
+    )
+    previous_record = replace(
+        _snapshot_record(source_entries),
+        synthesis_artifact_id=imported_artifact_id,
+        synthesis_canonical_sha256=canonical_sha,
+    )
+
+    preserved = EditorialWorkspaceService._reconcile_changed_stage(
+        entries=list(imported_entries),
+        previous_record=previous_record,
+        stage=EditorialSourceStage.SYNTHESIS,
+        unchanged=True,
+        current_version=1,
+        previous_version=1,
+    )
+
+    assert [entry.block_id for entry in preserved] == [entry.block_id for entry in source_entries]
 
 
 def test_bootstrap_gives_duplicate_sections_distinct_occurrence_ids() -> None:

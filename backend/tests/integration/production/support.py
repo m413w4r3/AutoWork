@@ -1041,7 +1041,22 @@ def _grounded_brief_synthesis_proposal(prompt_text: str) -> str:
 
 def grounded_editorial_proposal(prompt_text: str) -> str:
     """Return grounded multirow editorial content under the current policy."""
-    pack = json.loads(prompt_text)["current_evidence_pack"]
+    prompt = json.loads(prompt_text)
+    pack = prompt["current_evidence_pack"]
+    synthesis = prompt["current_synthesis"]
+    paragraphs = [
+        *synthesis.get("lead", ()),
+        *(
+            paragraph
+            for section in synthesis.get("sections", ())
+            for paragraph in section.get("paragraphs", ())
+        ),
+    ]
+    anchor_id = next(
+        str(paragraph["block_id"])
+        for paragraph in paragraphs
+        if isinstance(paragraph, Mapping) and paragraph.get("block_id") is not None
+    )
     evidence: list[Mapping[str, Any]] = []
     seen_handles: set[str] = set()
     for record in (*pack["narrative_evidence"], *pack["technical_evidence"]):
@@ -1096,6 +1111,9 @@ def grounded_editorial_proposal(prompt_text: str) -> str:
             "PLACEMENT_REASON: Placé après le paragraphe d'introduction.",
         )
 
+    def placement() -> tuple[str, str]:
+        return "PLACEMENT: after_paragraph", f"ANCHOR_BLOCK_ID: {anchor_id}"
+
     return "\n".join(
         (
             "TABLE T001",
@@ -1110,7 +1128,7 @@ def grounded_editorial_proposal(prompt_text: str) -> str:
                 "le rôle éditorial de sa source.",
                 (handle, second_handle),
             ),
-            "PLACEMENT: after_lead",
+            *placement(),
             "COLUMN C001_001",
             "KEY: editorial_role",
             "LABEL: Rôle éditorial",
@@ -1153,7 +1171,7 @@ def grounded_editorial_proposal(prompt_text: str) -> str:
                 (diagram_handle,),
             ),
             "DIRECTION: left_to_right",
-            "PLACEMENT: after_lead",
+            *placement(),
             "NODE N001_001",
             "ID: malware",
             "LABEL: ExampleRAT",

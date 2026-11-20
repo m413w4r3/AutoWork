@@ -297,9 +297,14 @@ class ProductionEditorialEnrichmentRevisionService:
             await self._enrichment._artifact_store.read_json(base_artifact.canonical_blob_id)
         )
 
-        evidence_pack = build_editorial_enrichment_evidence_pack(
-            snapshot, extraction, synthesis, projection, workspace_record
-        )
+        try:
+            evidence_pack = build_editorial_enrichment_evidence_pack(
+                snapshot, extraction, synthesis, projection, workspace_record
+            )
+        except ValueError as exc:
+            raise EditorialEnrichmentRevisionConflictError(
+                "The editorial workspace registry does not match the current synthesis"
+            ) from exc
         evidence_pack_hash = editorial_enrichment_evidence_pack_hash(evidence_pack)
         legacy_evidence_pack = (
             build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis, projection)
@@ -740,6 +745,25 @@ class ProductionEditorialEnrichmentRevisionService:
             synthesis=synthesis,
             read_only_media=True,
         )
+        restore_evidence_pack_hash = fence.evidence_pack_hash
+        restore_input_hash = fence.input_hash
+        restore_access_policy_hash = synthesis_access_policy_hash(fence.access_policy)
+        if restored_enrichment.schema_version < 9:
+            legacy_evidence_pack = build_editorial_enrichment_evidence_pack(
+                snapshot, extraction, synthesis, projection
+            )
+            restore_evidence_pack_hash = editorial_enrichment_evidence_pack_hash(
+                legacy_evidence_pack
+            )
+            restore_input_hash = compute_editorial_enrichment_input_hash(
+                extraction=extraction,
+                synthesis=synthesis,
+                evidence_pack_hash=restore_evidence_pack_hash,
+                access_policy_hash=restore_access_policy_hash,
+                projection_hash=projection.projection_hash if projection is not None else None,
+                source_figure_inventory_hash=fence.inventory_hash,
+                resource_search_enabled=self._enrichment._resource_search_enabled,
+            )
 
         before_refs = editorial_enrichment_evidence_refs(base_enrichment)
         restored_refs = editorial_enrichment_evidence_refs(restored_enrichment) - before_refs
@@ -830,14 +854,14 @@ class ProductionEditorialEnrichmentRevisionService:
             return await self._persistence.store_editorial_enrichment_result(
                 run_id=run.id,
                 subject_id=subject_id,
-                input_hash=fence.input_hash,
+                input_hash=restore_input_hash,
                 enrichment=restored_enrichment,
                 extraction=extraction,
                 synthesis=synthesis,
                 raw_result=None,
                 model_run_id=None,
-                evidence_pack_hash=fence.evidence_pack_hash,
-                access_policy_hash=synthesis_access_policy_hash(fence.access_policy),
+                evidence_pack_hash=restore_evidence_pack_hash,
+                access_policy_hash=restore_access_policy_hash,
                 model_policy_version=EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION,
                 routing_policy_version=str(
                     base_artifact.metadata.get("routing_policy_version", "")
@@ -845,6 +869,15 @@ class ProductionEditorialEnrichmentRevisionService:
                 projection_hash=projection.projection_hash if projection is not None else None,
                 source_figure_inventory_hash=fence.inventory_hash,
                 metadata_extra={
+                    **(
+                        {
+                            "generator_version": (
+                                enrichment_revision_rules._LEGACY_EDITORIAL_ENRICHMENT_GENERATOR_VERSION
+                            )
+                        }
+                        if restored_enrichment.schema_version < 9
+                        else {}
+                    ),
                     "source_figure_provenance_version": (
                         SOURCE_FIGURE_PROVENANCE_DIAGNOSTICS_VERSION
                     ),

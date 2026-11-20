@@ -8,6 +8,7 @@ from uuid import UUID
 
 import pytest
 
+import cti_app.application.production_repairs as repairs_module
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.editorial_revision_effects import EditorialPublicationPins
 from cti_app.application.production_artifact_store import ProductionArtifactStore
@@ -269,6 +270,9 @@ class _Checkpoint:
 class _RecordingRevisionEffects:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
+        self.current_snapshot = SimpleNamespace(registry_hash="current-registry")
+        self.previewed_snapshots: list[object] = []
+        self.applied_snapshots: list[object] = []
 
     async def acquire_run_guard(self, _uow: _Uow, run_id: UUID) -> object:
         return SimpleNamespace(production_run_id=run_id)
@@ -277,10 +281,19 @@ class _RecordingRevisionEffects:
         return cast(ProductionRun, await uow.production_runs.get_for_update(RUN_ID))
 
     async def current_snapshot_in_uow(self, uow: _Uow, _subject_id: UUID) -> object:
-        return await uow.production_input_snapshots.get_by_run(RUN_ID)
+        del uow
+        return self.current_snapshot
 
-    async def apply_after_writes(self, _uow: _Uow, **kwargs: object) -> None:
+    def preview_after_writes(self, **_kwargs: object) -> object:
+        snapshot = SimpleNamespace(registry_hash="preview-registry")
+        self.previewed_snapshots.append(snapshot)
+        return snapshot
+
+    async def apply_after_writes(self, _uow: _Uow, **kwargs: object) -> object:
         self.calls.append(kwargs)
+        snapshot = SimpleNamespace(registry_hash="preview-registry")
+        self.applied_snapshots.append(snapshot)
+        return SimpleNamespace(snapshot=snapshot)
 
 
 def _service(
@@ -382,6 +395,45 @@ async def test_canonical_publication_materialization_is_one_transaction() -> Non
     assert projection.calls == 1
     assert uow.commits == 1
     assert uow.rolled_back is False
+
+
+@pytest.mark.asyncio
+async def test_publication_only_repair_assembles_against_the_current_registry_without_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    effects = _RecordingRevisionEffects()
+    service, _uow, _projection, _store, _checkpoint = _service(
+        ProductionRepairImpactKind.PUBLICATION_ONLY,
+        revision_effects=effects,
+    )
+    snapshot, _references, extraction, synthesis = _canonical_inputs()
+    relevance = build_relevance_projection(snapshot, extraction)
+    synthesis_artifact = next(
+        item for item in _uow.artifacts.items if item.stage is ProductionArtifactStage.SYNTHESIS
+    )
+    synthesis_artifact.metadata["relevance_projection_hash"] = relevance.projection_hash
+    _store.payloads[UUID(int=12)] = production_synthesis_to_json(
+        replace(synthesis, extraction_hash=canonical_extraction_hash(extraction))
+    )
+    captured_records: list[object] = []
+    assemble = repairs_module.CanonicalAssemblyService.assemble_publication
+
+    async def capture_registry(self, **kwargs):
+        captured_records.append(kwargs["workspace_snapshot_record"])
+        return await assemble(self, **kwargs)
+
+    monkeypatch.setattr(
+        repairs_module.CanonicalAssemblyService,
+        "assemble_publication",
+        capture_registry,
+    )
+
+    result = await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
+
+    assert result.action == "publication_reassembled"
+    assert captured_records == [effects.current_snapshot]
+    assert effects.previewed_snapshots == []
+    assert effects.calls == []
 
 
 @pytest.mark.asyncio
@@ -529,6 +581,9 @@ async def test_repair_rebases_synthesis_built_on_a_legacy_extraction_hash() -> N
     result = await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
 
     assert result.action == "publication_reassembled"
+    assert (
+        effects.previewed_snapshots[0].registry_hash == effects.applied_snapshots[0].registry_hash
+    )
     rebased = [
         item
         for item in uow.artifacts.items

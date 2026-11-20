@@ -1591,6 +1591,7 @@ class ProductionUnitOfWork(Protocol):
     edition_audit: EditionAuditRepository
     production_runs: ProductionRunRepository
     production_routing_decisions: ProductionRoutingDecisionRepository
+    editorial_workspace_snapshots: EditorialWorkspaceSnapshotRepository
     production_input_snapshots: ProductionInputSnapshotRepository
     production_artifacts: ProductionArtifactRepository
     production_source_additions: ProductionSourceAdditionRepository

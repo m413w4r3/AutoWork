@@ -32,7 +32,7 @@ from cti_app.domain.production import (
 from cti_app.domain.production_editorial_enrichment import editorial_enrichment_from_json
 from cti_app.domain.production_extraction import production_extraction_from_json
 from cti_app.domain.production_synthesis import production_synthesis_from_json
-from cti_app.domain.publication_document import parse_publication_document
+from cti_app.domain.publication_document import PublicationDocumentV9, parse_publication_document
 from cti_app.infrastructure.database.models.production import ProductionArtifactRow
 from tests.integration.production.support import ProductionScenario, grounded_editorial_proposal
 
@@ -134,11 +134,27 @@ async def test_editorial_enrichment_persists_grounded_structures_on_postgres(
     publication_payload = await scenario.artifact_store.read_json(
         publication_artifact.canonical_blob_id
     )
-    assert publication_payload["schema_version"] == "8"
+    assert publication_payload["schema_version"] == "9"
     publication = parse_publication_document(publication_payload)
+    assert isinstance(publication, PublicationDocumentV9)
     assert len(publication.tables) == len(publication.diagrams) == 1
     assert publication.tables[0].rows[0].cells
     assert publication.diagrams[0].asset_id == compiled_asset_id
+    assert {
+        (item.element_kind, item.element_key, item.anchor_block_id)
+        for item in publication.resolved_placements
+    } == {
+        (
+            "table",
+            enrichment.tables[0].key,
+            enrichment.tables[0].placement.anchor_block_id,
+        ),
+        (
+            "diagram",
+            enrichment.diagrams[0].key,
+            enrichment.diagrams[0].placement.anchor_block_id,
+        ),
+    }
     assert (
         len(
             [

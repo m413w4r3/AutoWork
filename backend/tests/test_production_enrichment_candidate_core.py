@@ -47,8 +47,12 @@ async def _validated_table_patch(harness: SimpleNamespace) -> Any:
     figure_catalog = build_editorial_figure_catalog(
         harness.world.extraction, harness.inventory_state.value
     )
+    assert harness.evidence_pack.registered_anchor_ids is not None
+    anchor_block_id = min(harness.evidence_pack.registered_anchor_ids, key=str)
     parsed = parse_editorial_enrichment_proposal_wire(
-        _table_revision_wire(), harness.evidence_pack, figure_catalog=figure_catalog
+        _table_revision_wire(anchor_block_id=anchor_block_id),
+        harness.evidence_pack,
+        figure_catalog=figure_catalog,
     )
     return validate_editorial_enrichment_patch(
         parsed,

@@ -467,7 +467,7 @@ EDITORIAL_ENRICHMENT_REVISION_PROMPT_VERSION = (
     "editorial-enrichment-revision-v7-after-paragraph-anchors"
 )
 EDITORIAL_ENRICHMENT_REVISION_CONTRACT_VERSION = (
-    "editorial-enrichment-revision-contract-v8-after-paragraph-anchors"
+    "editorial-enrichment-revision-contract-v8-paragraph-anchor"
 )
 RELEVANCE_CLASSIFIER_PROMPT_VERSION = "subject-relevance-classifier-v5-other-case-out-of-scope"
 RELEVANCE_CLASSIFIER_CONTRACT_VERSION = "subject-relevance-text-blocks-v3-other-case-out-of-scope"

@@ -113,6 +113,7 @@ from cti_app.domain.publication_document import (
     PublicationDocumentV8,
     PublicationDocumentV9,
     parse_publication_document,
+    publication_document_v8_to_json,
     serialize_publication_document,
 )
 from cti_app.domain.publication_kind import PublicationKind
@@ -610,6 +611,15 @@ async def test_assembly_persists_exact_v8_body_and_one_publication_artifact() ->
 
 @pytest.mark.asyncio
 async def test_after_paragraph_assembly_resolves_registered_anchor_and_rebuilds_stably() -> None:
+    from cti_app.application.edition_document import (
+        EditionDocumentArtifactRef,
+        build_edition_document,
+    )
+    from cti_app.application.publication_augmentation import augment_publication_with_opinion
+    from cti_app.domain.classification import TLP
+    from cti_app.domain.editions import Edition, EditionStatus
+    from tests.test_publication_document_v6 import _approved_opinion
+
     snapshot, references, extraction, synthesis = _canonical_inputs()
     run = _run(snapshot)
     service, catalog, _artifacts = _service()
@@ -623,16 +633,29 @@ async def test_after_paragraph_assembly_resolves_registered_anchor_and_rebuilds_
     )
     anchor = next(item for item in synthesis_entries if item.kind.value == "lead_paragraph")
     evidence_ref = extraction_evidence_refs_v1(extraction)[0]
-    table = replace(
-        _enrichment_table(evidence_ref),
-        placement=EnrichmentPlacementV1(
-            EnrichmentPlacementKind.AFTER_PARAGRAPH,
-            anchor_block_id=anchor.block_id,
+    placement = EnrichmentPlacementV1(
+        EnrichmentPlacementKind.AFTER_PARAGRAPH,
+        anchor_block_id=anchor.block_id,
+    )
+    first = _enrichment_table(evidence_ref, key="z_canonical_first")
+    second = _enrichment_table(evidence_ref, key="a_canonical_second")
+    assert first.purpose is not None
+    assert second.purpose is not None
+    tables = (
+        replace(
+            first,
+            placement=placement,
+            purpose=replace(first.purpose, question="Which first canonical tool is documented?"),
+        ),
+        replace(
+            second,
+            placement=placement,
+            purpose=replace(second.purpose, question="Which second canonical tool is documented?"),
         ),
     )
     enrichment = replace(
         build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis),
-        tables=(table,),
+        tables=tables,
     )
     workspace_record = _workspace_record_for(
         run=run,
@@ -669,13 +692,102 @@ async def test_after_paragraph_assembly_resolves_registered_anchor_and_rebuilds_
 
     assert isinstance(document, PublicationDocumentV9)
     assert document.registry_hash == workspace_record.registry_hash
-    assert document.resolved_placements == (document.resolved_placements[0],)
-    resolved = document.resolved_placements[0]
-    assert resolved.element_kind == "table"
-    assert resolved.element_key == table.key
-    assert resolved.anchor_block_id == anchor.block_id
-    assert resolved.anchor_pointer == "/lead/0"
+    assert [item.element_key for item in document.resolved_placements] == [
+        "z_canonical_first",
+        "a_canonical_second",
+    ]
+    assert [item.element_position for item in document.resolved_placements] == [0, 1]
+    assert all(item.element_kind == "table" for item in document.resolved_placements)
+    assert all(item.anchor_block_id == anchor.block_id for item in document.resolved_placements)
+    assert all(item.anchor_pointer == "/lead/0" for item in document.resolved_placements)
+    with pytest.raises(ValueError, match="Expected a PublicationDocumentV8"):
+        publication_document_v8_to_json(document)
     assert rebuilt.artifact.id == assembly.artifact.id
+
+    placement_qa = qa_publication_v7(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        relevance_projection=None,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+        publication=document,
+    )
+    assert placement_qa["passed"] is True, placement_qa
+
+    base_v5 = document.base_publication.base_publication.base_publication
+    opinion, citation_context = _approved_opinion(base_v5)
+    publication_with_opinion = replace(
+        document,
+        base_publication=replace(
+            document.base_publication,
+            base_publication=augment_publication_with_opinion(
+                base_v5,
+                opinion,
+                citation_context,
+            ),
+        ),
+    )
+    qa_result = qa_publication_v7(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        relevance_projection=None,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+        publication=publication_with_opinion,
+    )
+    assert qa_result["checks"]["references_then_synthesis"] is True
+    assert qa_result["checks"]["lead_is_first_and_not_duplicated"] is True
+    assert qa_result["errors"] == [
+        "Reader projection contains invalid IOC fields or legacy provenance"
+    ]
+
+    edition = Edition(
+        id=run.edition_id,
+        country="France",
+        country_code="FR",
+        period_start=date(2026, 8, 1),
+        period_end=date(2026, 8, 31),
+        tlp=TLP.GREEN,
+        languages=("fr",),
+        state=EditionStatus.OPEN,
+    )
+
+    async def get_run(run_id: UUID) -> ProductionRun | None:
+        return run if run_id == run.id else None
+
+    async def get_artifact(artifact_id: UUID) -> ProductionArtifact | None:
+        return assembly.artifact if artifact_id == assembly.artifact.id else None
+
+    uow = SimpleNamespace(
+        production_runs=SimpleNamespace(get=get_run),
+        production_artifacts=SimpleNamespace(get=get_artifact),
+    )
+    composed = await build_edition_document(
+        uow,
+        ProductionArtifactStore(catalog),
+        edition,
+        (
+            EditionDocumentArtifactRef(
+                position=1,
+                subject_id=run.subject_id,
+                production_run_id=run.id,
+                pipeline_generation=run.pipeline_generation,
+                artifact_id=assembly.artifact.id,
+                artifact_version=assembly.artifact.version,
+                input_hash=assembly.artifact.input_hash,
+            ),
+        ),
+        require_current=False,
+    )
+    composed_document = composed.publications[0].document
+    assert isinstance(composed_document, PublicationDocumentV9)
+    assert composed_document.resolved_placements == document.resolved_placements
+    assert [item.element_key for item in composed_document.resolved_placements] == [
+        "z_canonical_first",
+        "a_canonical_second",
+    ]
 
 
 @pytest.mark.asyncio

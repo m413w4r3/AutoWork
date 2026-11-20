@@ -5075,7 +5075,7 @@ class ProductionRepairMaterializationService:
             }
             if repair_materialization is not None:
                 metadata["repair_materialization"] = dict(repair_materialization)
-            assembly_workspace_snapshot = None
+            assembly_workspace_snapshot = base_workspace_snapshot
             repair_routing_pins = EditorialRoutingPins(
                 decision_id=route_decision.decision_id,
                 decision_hash=route_decision.decision_hash,
