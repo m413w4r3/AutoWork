@@ -16,6 +16,9 @@ from fastapi import FastAPI
 
 from cti_app.api import editorial_workspace as editorial_workspace_api
 from cti_app.application.blob_storage import BlobStore
+from cti_app.application.editorial_enrichment_revision import (
+    validate_editorial_enrichment_patch,
+)
 from cti_app.application.editorial_proposal_adoption import (
     EditorialProposalAdoptionError,
     EditorialProposalAdoptionInputs,
@@ -41,14 +44,17 @@ from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_editorial_enrichment import (
     AnalyticPurposeProposalV1,
+    EditorialEnrichmentEvidencePackV1,
     EditorialEnrichmentProposalV1,
     EnrichmentPlacementProposalV1,
     TableColumnProposalV1,
     TableProposalV1,
     TableRowProposalV1,
     build_editorial_enrichment_evidence_pack,
+    canonical_editorial_enrichment_hash,
     compute_editorial_enrichment_input_hash,
     editorial_enrichment_evidence_pack_hash,
+    validate_editorial_enrichment,
     validate_editorial_enrichment_proposal,
 )
 from cti_app.application.production_stages import EditorialEnrichmentService, SynthesisService
@@ -78,6 +84,7 @@ from cti_app.domain.editorial_workspace import (
     EditorialRevisionStatus,
     EditorialSourceStage,
     EditorialTransition,
+    canonical_content_sha256,
 )
 from cti_app.domain.entities import SourceDocument, Subject
 from cti_app.domain.production import (
@@ -92,9 +99,15 @@ from cti_app.domain.production import (
     SynthesisMode,
 )
 from cti_app.domain.production_editorial_enrichment import (
+    EditorialAnalyticPurposeV1,
     EditorialEnrichmentElementKind,
+    EditorialEnrichmentV1,
     EnrichmentPlacementKind,
+    EnrichmentPlacementV1,
     EnrichmentTableKind,
+    TableColumnV1,
+    TableRowV1,
+    TableSpecV1,
     editorial_enrichment_to_json,
 )
 from cti_app.domain.production_editorial_revision import (
@@ -315,6 +328,17 @@ class _Seeded:
     artifact_store: _MemoryArtifactStore
     workspace: _Workspace
     inputs: _Inputs
+
+
+@dataclass(frozen=True)
+class _EnrichmentSeedContent:
+    evidence_pack: EditorialEnrichmentEvidencePackV1
+    base_enrichment: EditorialEnrichmentV1
+    replacement_proposal: EditorialEnrichmentProposalV1
+    base_payload: dict[str, Any]
+    base_bytes: bytes
+    base_sha256: str
+    before_hash: str
 
 
 def _synthetic_candidate_context(
@@ -701,10 +725,17 @@ def _table_proposal(handle: str, *, title: str) -> EditorialEnrichmentProposalV1
                 key="synthetic_table",
                 kind=EnrichmentTableKind.CUSTOM,
                 title=title,
-                columns=(TableColumnProposalV1(key="finding", label="Finding"),),
+                columns=(
+                    TableColumnProposalV1(key="finding", label="Finding"),
+                    TableColumnProposalV1(key="evidence", label="Evidence detail"),
+                ),
                 rows=(
                     TableRowProposalV1(
-                        cells=("Synthetic finding",),
+                        cells=("Synthetic finding", "Synthetic test context."),
+                        evidence_handles=(handle,),
+                    ),
+                    TableRowProposalV1(
+                        cells=("Synthetic finding", "The synthetic report records this finding."),
                         evidence_handles=(handle,),
                     ),
                 ),
@@ -715,12 +746,15 @@ def _table_proposal(handle: str, *, title: str) -> EditorialEnrichmentProposalV1
     )
 
 
-async def _seed_enrichment_proposal(uow_factory: UnitOfWorkFactory) -> _Seeded:
-    seeded = await _seed(uow_factory, proposal_count=0, article_base=True)
+def _enrichment_seed_content(
+    production_input: ProductionInputSnapshot,
+    extraction: ProductionExtractionV1,
+    synthesis: ProductionSynthesisV1,
+) -> _EnrichmentSeedContent:
     evidence_pack = build_editorial_enrichment_evidence_pack(
-        seeded.production_input,
-        seeded.extraction,
-        seeded.synthesis,
+        production_input,
+        extraction,
+        synthesis,
         None,
     )
     evidence_handle = next(
@@ -728,13 +762,82 @@ async def _seed_enrichment_proposal(uow_factory: UnitOfWorkFactory) -> _Seeded:
         for record in evidence_pack.narrative_evidence
         if record.get("value") == "Synthetic finding"
     )
-    base_enrichment = validate_editorial_enrichment_proposal(
-        _table_proposal(evidence_handle, title="Synthetic findings"),
-        evidence_pack,
+    evidence_refs = (evidence_pack.resolve_handle(evidence_handle),)
+    purpose = EditorialAnalyticPurposeV1(
+        question="What finding and evidence detail are stated in the report?",
+        available_data="The synthetic source records one finding and its context.",
+        comprehension_gain="A table keeps the finding beside its source context.",
+        scope="Only the synthetic finding present in this source.",
+        evidence_refs=evidence_refs,
+        knowledge_limits="The source provides no additional detail in this fixture.",
+        placement_reason="Keep the table close to the opening context.",
+    )
+    base_table = TableSpecV1(
+        key="synthetic_table",
+        kind=EnrichmentTableKind.CUSTOM,
+        title="Synthetic findings",
+        caption=None,
+        columns=(
+            TableColumnV1(key="finding", label="Finding"),
+            TableColumnV1(key="evidence", label="Evidence detail"),
+        ),
+        rows=(
+            TableRowV1(
+                cells=("Synthetic finding", "Synthetic test context."),
+                evidence_refs=evidence_refs,
+            ),
+            TableRowV1(
+                cells=("Synthetic finding", "The synthetic report records this finding."),
+                evidence_refs=evidence_refs,
+            ),
+        ),
+        placement=EnrichmentPlacementV1(kind=EnrichmentPlacementKind.AFTER_LEAD),
+        purpose=purpose,
+    )
+    empty_enrichment = validate_editorial_enrichment_proposal(
+        EditorialEnrichmentProposalV1(), evidence_pack, extraction, synthesis
+    )
+    base_enrichment = replace(empty_enrichment, tables=(base_table,))
+    validate_editorial_enrichment(base_enrichment, extraction=extraction, synthesis=synthesis)
+
+    replacement_proposal = _table_proposal(evidence_handle, title="Revised synthetic findings")
+    validated_patch = validate_editorial_enrichment_patch(
+        replacement_proposal,
+        element_kind=EditorialEnrichmentElementKind.TABLE,
+        element_key="synthetic_table",
+        evidence_pack=evidence_pack,
+        extraction=extraction,
+        synthesis=synthesis,
+        figure_catalog=(),
+    )
+    assert len(validated_patch.tables) == 1
+    assert validated_patch.tables[0].key == base_table.key
+
+    base_payload = editorial_enrichment_to_json(base_enrichment)
+    base_bytes = ProductionArtifactStore.canonical_json_bytes(base_payload)
+    base_sha256 = canonical_editorial_enrichment_hash(base_enrichment)
+    before_hash = canonical_content_sha256({"value": base_payload["tables"][0]})
+    return _EnrichmentSeedContent(
+        evidence_pack=evidence_pack,
+        base_enrichment=base_enrichment,
+        replacement_proposal=replacement_proposal,
+        base_payload=base_payload,
+        base_bytes=base_bytes,
+        base_sha256=base_sha256,
+        before_hash=before_hash,
+    )
+
+
+async def _seed_enrichment_proposal(uow_factory: UnitOfWorkFactory) -> _Seeded:
+    seeded = await _seed(uow_factory, proposal_count=0, article_base=True)
+    enrichment_content = _enrichment_seed_content(
+        seeded.production_input,
         seeded.extraction,
         seeded.synthesis,
     )
-    replacement_proposal = _table_proposal(evidence_handle, title="Revised synthetic findings")
+    evidence_pack = enrichment_content.evidence_pack
+    base_enrichment = enrichment_content.base_enrichment
+    replacement_proposal = enrichment_content.replacement_proposal
     evidence_pack_hash = editorial_enrichment_evidence_pack_hash(evidence_pack)
     access_policy_hash = "e" * 64
     input_hash = compute_editorial_enrichment_input_hash(
@@ -743,9 +846,9 @@ async def _seed_enrichment_proposal(uow_factory: UnitOfWorkFactory) -> _Seeded:
         evidence_pack_hash=evidence_pack_hash,
         access_policy_hash=access_policy_hash,
     )
-    base_payload = editorial_enrichment_to_json(base_enrichment)
-    base_bytes = ProductionArtifactStore.canonical_json_bytes(base_payload)
-    base_sha256 = hashlib.sha256(base_bytes).hexdigest()
+    base_payload = enrichment_content.base_payload
+    base_bytes = enrichment_content.base_bytes
+    base_sha256 = enrichment_content.base_sha256
     base_descriptor = BlobDescriptor(
         base_sha256, len(base_bytes), "application/json", _CANONICAL_BUCKET
     )
@@ -768,9 +871,7 @@ async def _seed_enrichment_proposal(uow_factory: UnitOfWorkFactory) -> _Seeded:
         element_key="synthetic_table",
     )
     target_id = _target_id(target)
-    before_hash = hashlib.sha256(
-        ProductionArtifactStore.canonical_json_bytes({"value": base_payload["tables"][0]})
-    ).hexdigest()
+    before_hash = enrichment_content.before_hash
     entry = BlockRegistryEntry(
         block_id=occurrence_id,
         kind=EditorialBlockKind.TABLE,
