@@ -244,9 +244,49 @@ class EditorialRevisionEffects:
             await uow.editorial_proposal_impacts.add(impact)
         return EditorialRevisionEffectsResult(snapshot=snapshot, impact=impact)
 
+    def preview_after_writes(
+        self,
+        *,
+        base_snapshot: WorkspaceSnapshotRecord,
+        writes: Sequence[EditorialRevisionWrite],
+        routing_pins: EditorialRoutingPins | None = None,
+    ) -> WorkspaceSnapshotRecord:
+        """Build the exact registry projection for a candidate revision without storing it."""
+        if not writes:
+            raise EditorialRevisionEffectsError("editorial_registry_conflict")
+        return self._next_workspace_snapshot(
+            base_snapshot,
+            writes,
+            routing_pins=routing_pins,
+            publication_pins=None,
+        )
+
     async def _append_workspace_snapshot(
         self,
         uow: Any,
+        base: WorkspaceSnapshotRecord,
+        writes: Sequence[EditorialRevisionWrite],
+        *,
+        routing_pins: EditorialRoutingPins | None,
+        publication_pins: EditorialPublicationPins | None,
+    ) -> WorkspaceSnapshotRecord:
+        next_record = self._next_workspace_snapshot(
+            base,
+            writes,
+            routing_pins=routing_pins,
+            publication_pins=publication_pins,
+        )
+        stored = await uow.editorial_workspace_snapshots.append_if_absent(next_record)
+        if (
+            stored.workspace_pin_hash != next_record.workspace_pin_hash
+            or stored.registry_hash != next_record.registry_hash
+            or stored.block_registry != next_record.block_registry
+        ):
+            raise EditorialRevisionEffectsError("editorial_registry_conflict")
+        return cast(WorkspaceSnapshotRecord, stored)
+
+    def _next_workspace_snapshot(
+        self,
         base: WorkspaceSnapshotRecord,
         writes: Sequence[EditorialRevisionWrite],
         *,
@@ -367,14 +407,7 @@ class EditorialRevisionEffects:
                 routing_pins.publication_kind if routing_pins is not None else base.publication_kind
             ),
         )
-        stored = await uow.editorial_workspace_snapshots.append_if_absent(next_record)
-        if (
-            stored.workspace_pin_hash != next_record.workspace_pin_hash
-            or stored.registry_hash != next_record.registry_hash
-            or stored.block_registry != next_record.block_registry
-        ):
-            raise EditorialRevisionEffectsError("editorial_registry_conflict")
-        return cast(WorkspaceSnapshotRecord, stored)
+        return next_record
 
 
 async def stale_changed_pin_proposals(

@@ -446,16 +446,16 @@ MISSING COVERAGE: <thème absent des preuves fournies, en une phrase française>
 """
 # Editorial-only prompt changes preserve REFERENCES, EXTRACTION, RELEVANCE_PROJECTION,
 # and SYNTHESIS; only EDITORIAL_ENRICHMENT and its downstream PUBLICATION need rebuilding.
-EDITORIAL_ENRICHMENT_PROMPT_VERSION = "editorial-enrichment-text-blocks-v21-content-first-figures"
+EDITORIAL_ENRICHMENT_PROMPT_VERSION = "editorial-enrichment-text-blocks-v22-after-paragraph-anchors"
 EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION = (
-    "editorial-enrichment-block-contract-v14-article-density"
+    "editorial-enrichment-block-contract-v15-after-paragraph-anchors"
 )
-EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION = (
-    "editorial-enrichment-wire-v15-article-omission-diagnostics"
+EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION = "editorial-enrichment-wire-v16-after-paragraph-anchors"
+EDITORIAL_ENRICHMENT_REPAIR_PROMPT_VERSION = (
+    "editorial-enrichment-repair-v9-after-paragraph-anchors"
 )
-EDITORIAL_ENRICHMENT_REPAIR_PROMPT_VERSION = "editorial-enrichment-repair-v8-article-density"
 EDITORIAL_ENRICHMENT_REPAIR_CONTRACT_VERSION = (
-    "editorial-enrichment-repair-contract-v7-article-density"
+    "editorial-enrichment-repair-contract-v8-after-paragraph-anchors"
 )
 SEMANTIC_ANNOTATION_PROMPT_VERSION = "semantic-annotation-document-lexicon-v3-semantic-styles"
 SEMANTIC_ANNOTATION_CONTRACT_VERSION = "semantic-annotation-term-role-blocks-v3-semantic-styles"
@@ -463,9 +463,11 @@ SEMANTIC_ANNOTATION_WIRE_PARSER_VERSION = "semantic-annotation-wire-v4-proper-na
 EDITORIAL_RESOURCE_PROPOSAL_PROMPT_VERSION = "editorial-resource-proposal-v1-bounded-web-search"
 EDITORIAL_RESOURCE_PROPOSAL_CONTRACT_VERSION = "editorial-resource-proposal-blocks-v1"
 EDITORIAL_RESOURCE_PROPOSAL_WIRE_PARSER_VERSION = "editorial-resource-proposal-wire-v1"
-EDITORIAL_ENRICHMENT_REVISION_PROMPT_VERSION = "editorial-enrichment-revision-v6-article-density"
+EDITORIAL_ENRICHMENT_REVISION_PROMPT_VERSION = (
+    "editorial-enrichment-revision-v7-after-paragraph-anchors"
+)
 EDITORIAL_ENRICHMENT_REVISION_CONTRACT_VERSION = (
-    "editorial-enrichment-revision-contract-v7-article-density"
+    "editorial-enrichment-revision-contract-v8-after-paragraph-anchors"
 )
 RELEVANCE_CLASSIFIER_PROMPT_VERSION = "subject-relevance-classifier-v5-other-case-out-of-scope"
 RELEVANCE_CLASSIFIER_CONTRACT_VERSION = "subject-relevance-text-blocks-v3-other-case-out-of-scope"

@@ -12,6 +12,8 @@ import pytest
 from cti_app.application.editorial_workspace.registry import (
     WorkspaceSnapshotRecord,
     project_blocks,
+    registry_hash,
+    resolve_paragraph_anchor,
     resolve_workspace_target,
 )
 from cti_app.application.editorial_workspace.service import (
@@ -23,6 +25,7 @@ from cti_app.domain.editorial_proposal_impact import (
     EditorialProposalImpactState,
 )
 from cti_app.domain.editorial_workspace import (
+    BlockRegistryEntry,
     EditorialIdentityAmbiguousError,
     EditorialRegistryConflictError,
     EditorialWorkspaceError,
@@ -30,6 +33,7 @@ from cti_app.domain.editorial_workspace import (
     workspace_pin_hash,
 )
 from cti_app.domain.production import ProductionArtifactStatus
+from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.typst_render import TypstRenderStatus
 
 
@@ -420,6 +424,174 @@ def test_enrichment_projection_preserves_pinned_legacy_placement() -> None:
     ]
 
 
+def test_after_paragraph_requires_registered_anchor() -> None:
+    synthesis = _synthesis((_paragraph("first"), _paragraph("anchor")))
+    synthesis_entries = bootstrap_block_registry(
+        artifact_id=uuid4(),
+        canonical_sha256="3" * 64,
+        source_stage="synthesis",
+        canonical_content=synthesis,
+    )
+    anchor = next(
+        entry
+        for entry in synthesis_entries
+        if entry.kind == "paragraph" and entry.structural_pointer.endswith("/1")
+    )
+    enrichment = {
+        "tables": [
+            {
+                "key": "anchored-table",
+                "element_key": "anchored-table",
+                "caption": "After the registered paragraph",
+                "placement": {
+                    "kind": "after_paragraph",
+                    "anchor_block_id": str(anchor.block_id),
+                },
+            }
+        ],
+        "diagrams": [],
+        "charts": [],
+        "source_figures": [],
+    }
+    enrichment_entries = bootstrap_block_registry(
+        artifact_id=uuid4(),
+        canonical_sha256="4" * 64,
+        source_stage="editorial_enrichment",
+        canonical_content=enrichment,
+    )
+    entries = (*synthesis_entries, *enrichment_entries)
+    record = _snapshot_record(entries)
+
+    blocks, enrichments, _outline = project_blocks(
+        entries=entries,
+        synthesis=synthesis,
+        enrichment=enrichment,
+        record=record,
+    )
+
+    assert [block["text"] for block in blocks][-2:] == [
+        "anchor",
+        "After the registered paragraph",
+    ]
+    assert enrichments[0]["revision_status"] == "ready"
+
+    unregistered_enrichment = {
+        **enrichment,
+        "tables": [
+            {
+                **enrichment["tables"][0],
+                "placement": {
+                    "kind": "after_paragraph",
+                    "anchor_block_id": str(uuid4()),
+                },
+            }
+        ],
+    }
+    unregistered_entries = (
+        *synthesis_entries,
+        *bootstrap_block_registry(
+            artifact_id=uuid4(),
+            canonical_sha256="5" * 64,
+            source_stage="editorial_enrichment",
+            canonical_content=unregistered_enrichment,
+        ),
+    )
+    stale_blocks, stale_enrichments, _stale_outline = project_blocks(
+        entries=unregistered_entries,
+        synthesis=synthesis,
+        enrichment=unregistered_enrichment,
+        record=_snapshot_record(unregistered_entries),
+    )
+
+    assert all(block.get("text") != "After the registered paragraph" for block in stale_blocks)
+    assert stale_enrichments[0]["revision_status"] == "stale"
+
+
+def test_deleted_anchor_marks_enrichment_and_preview_stale_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cti_app.application.editorial_workspace import service as service_module
+
+    service, subject_id, _repository, artifacts, artifact_store = _workspace_service(
+        _synthesis((_paragraph("anchor paragraph"), _paragraph("paragraph to keep"))),
+        monkeypatch,
+    )
+
+    async def exercise() -> None:
+        initial = await service.snapshot(subject_id)
+        anchor = next(block for block in initial["blocks"] if block["text"] == "anchor paragraph")
+        synthesis_artifact = artifacts.current["synthesis"]
+        assert synthesis_artifact is not None
+        enrichment = _make_artifact(
+            "editorial_enrichment",
+            {
+                "schema_version": 9,
+                "tables": [
+                    {
+                        "key": "anchored-table",
+                        "element_key": "anchored-table",
+                        "caption": "Do not move to the end",
+                        "placement": {
+                            "kind": "after_paragraph",
+                            "anchor_block_id": anchor["block_id"],
+                        },
+                    }
+                ],
+                "diagrams": [],
+                "charts": [],
+                "source_figures": [],
+            },
+            production_run_id=synthesis_artifact.production_run_id,
+        )
+        artifacts.current["editorial_enrichment"] = enrichment
+        artifact_store.write(enrichment)
+
+        valid = await service.snapshot(subject_id)
+        assert valid["preview_status"] == "READY"
+        assert any(block["text"] == "Do not move to the end" for block in valid["blocks"])
+
+        artifacts.replace_synthesis(_synthesis((_paragraph("paragraph to keep"),)), artifact_store)
+        stale = await service.snapshot(subject_id)
+
+        assert stale["preview_status"] == "STALE"
+        assert all(block["text"] != "Do not move to the end" for block in stale["blocks"])
+        assert stale["enrichments"][0]["revision_status"] == "stale"
+
+    monkeypatch.setattr(
+        service_module,
+        "resolve_publication_kind",
+        lambda _routing, _publication: (PublicationKind.ARTICLE, "b" * 64),
+    )
+    asyncio.run(exercise())
+
+
+def _snapshot_record(entries: tuple[BlockRegistryEntry, ...]) -> WorkspaceSnapshotRecord:
+    return WorkspaceSnapshotRecord(
+        snapshot_id=uuid4(),
+        subject_id=uuid4(),
+        production_run_id=uuid4(),
+        synthesis_artifact_id=uuid4(),
+        synthesis_version=1,
+        synthesis_input_hash="a" * 64,
+        synthesis_canonical_sha256="b" * 64,
+        enrichment_artifact_id=uuid4(),
+        enrichment_version=1,
+        enrichment_input_hash="c" * 64,
+        enrichment_canonical_sha256="d" * 64,
+        publication_artifact_id=None,
+        publication_version=None,
+        publication_input_hash=None,
+        publication_canonical_sha256=None,
+        pipeline_generation=1,
+        routing_decision_id=None,
+        routing_decision_hash=None,
+        publication_kind=PublicationKind.ARTICLE,
+        workspace_pin_hash="e" * 64,
+        registry_hash=registry_hash(entries),
+        block_registry=entries,
+    )
+
+
 def test_bootstrap_gives_duplicate_sections_distinct_occurrence_ids() -> None:
     duplicate_section = {
         "kind": "narrative",
@@ -493,6 +665,99 @@ def test_advance_preserves_rewritten_id_and_retires_deleted_occurrence() -> None
     inserted = [item for item in advanced.active if item.transition == "insert"]
     assert len(inserted) == 1
     assert inserted[0].structural_pointer == "/sections/0/paragraphs/1"
+
+
+def test_paragraph_anchor_survives_rewrite_insertion_before_and_section_move() -> None:
+    base = {
+        **_synthesis(()),
+        "sections": [
+            {
+                "kind": "narrative",
+                "heading": "Original heading",
+                "paragraphs": [_paragraph("before"), _paragraph("anchor before edit")],
+            }
+        ],
+    }
+    initial = bootstrap_block_registry(
+        artifact_id=uuid4(),
+        canonical_sha256="1" * 64,
+        source_stage="synthesis",
+        canonical_content=base,
+    )
+    target = next(item for item in initial if item.structural_pointer == "/sections/0/paragraphs/1")
+    updated = {
+        **_synthesis(()),
+        "sections": [
+            {
+                "kind": "narrative",
+                "heading": "Inserted section",
+                "paragraphs": [_paragraph("inserted before target")],
+            },
+            {
+                "kind": "narrative",
+                "heading": "Original heading revised",
+                "paragraphs": [_paragraph("anchor after edit")],
+            },
+        ],
+    }
+    target_heading = next(item for item in initial if item.kind == "section_heading")
+    title = next(item for item in initial if item.kind == "title")
+    lead = next(item for item in initial if item.kind == "lead_paragraph")
+    lineage: list[dict[str, str | None]] = []
+    for item in initial:
+        if item.block_id == target_heading.block_id:
+            lineage.append(
+                {
+                    "block_id": str(item.block_id),
+                    "transition": "rewrite",
+                    "pointer": "/sections/1/heading",
+                }
+            )
+        elif item.block_id == title.block_id:
+            lineage.append(
+                {"block_id": str(item.block_id), "transition": "move", "pointer": "/title"}
+            )
+        elif item.block_id == lead.block_id:
+            lineage.append(
+                {
+                    "block_id": str(item.block_id),
+                    "transition": "move",
+                    "pointer": "/lead/0",
+                }
+            )
+        elif item.block_id == target.block_id:
+            lineage.append(
+                {
+                    "block_id": str(item.block_id),
+                    "transition": "rewrite",
+                    "pointer": "/sections/1/paragraphs/0",
+                }
+            )
+        else:
+            lineage.append(
+                {"block_id": str(item.block_id), "transition": "delete", "pointer": None}
+            )
+    advanced = advance_workspace_registry(
+        base_registry=initial,
+        artifact_id=uuid4(),
+        canonical_sha256="2" * 64,
+        source_stage="synthesis",
+        canonical_content=updated,
+        lineage=(
+            *lineage,
+            {"transition": "insert", "pointer": "/sections/0/heading"},
+            {"transition": "insert", "pointer": "/sections/0/paragraphs/0"},
+        ),
+    )
+
+    record = _snapshot_record(advanced.active)
+    resolved = resolve_paragraph_anchor(record, target.block_id, synthesis=updated)
+
+    assert resolved.block_id == target.block_id
+    assert resolved.structural_pointer == "/sections/1/paragraphs/0"
+    assert resolved.section_index == 1
+    assert resolved.paragraph_index == 0
+    assert resolved.canonical_position == 0
 
 
 def test_advance_refuses_missing_legacy_correspondence() -> None:

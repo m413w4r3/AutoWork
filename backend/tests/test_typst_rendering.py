@@ -14,6 +14,10 @@ import pytest
 from cti_app.application import typst_rendering as typst_rendering_module
 from cti_app.application.protocol_diagram_projection import PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION
 from cti_app.application.publication_augmentation import augment_publication_with_opinion
+from cti_app.application.publication_builder import (
+    build_article_format_v1,
+    build_publication_document_v5,
+)
 from cti_app.application.semantic_annotation import EnglishTermDetector, SemanticAnnotator
 from cti_app.application.typst_rendering import (
     _FINDING_ASSESSMENT_LABELS,
@@ -67,7 +71,11 @@ from cti_app.domain.production_editorial_enrichment import (
 )
 from cti_app.domain.production_references import ProductionEditorialRole
 from cti_app.domain.production_relevance import RelevanceClassification, RelevanceReasonCode
-from cti_app.domain.production_synthesis import EvidenceKind, ExtractionEvidenceRefV1
+from cti_app.domain.production_synthesis import (
+    EvidenceKind,
+    ExtractionEvidenceRefV1,
+    extraction_evidence_refs_v1,
+)
 from cti_app.domain.protocol_model import ProtocolDiagramKind
 from cti_app.domain.publication import (
     ArtifactType,
@@ -87,10 +95,13 @@ from cti_app.domain.publication_document import (
     PublicationDocumentV5,
     PublicationDocumentV6,
     PublicationDocumentV7,
+    PublicationDocumentV8,
+    PublicationDocumentV9,
     PublicationIOCDetailV1,
     PublicationIOCDisposition,
     PublicationTableColumnV1,
     PublicationTableRowV1,
+    ResolvedPublicationPlacementV1,
     publication_document_from_json,
     publication_document_text_anchors,
     publication_document_v5_sha256,
@@ -104,9 +115,24 @@ from cti_app.domain.semantic_annotation import (
     SemanticRole,
     SemanticTextV1,
 )
-from tests.test_publication_builder_v4 import _frontmatter_v6_case
+from tests.editorial_enrichment_support import build_empty_editorial_enrichment
+from tests.test_publication_builder_v4 import (
+    _canonical_inputs,
+    _frontmatter_v6_case,
+)
+from tests.test_publication_builder_v4 import (
+    _table as _enrichment_table,
+)
 from tests.test_publication_document_v6 import _approved_opinion, _base_v5
-from tests.test_publication_v4 import _SOURCE_ID, _diagram, _document, _figure, _source, _table
+from tests.test_publication_document_v7 import _v6
+from tests.test_publication_v4 import (
+    _SOURCE_ID,
+    _diagram,
+    _document,
+    _figure,
+    _source,
+    _table,
+)
 
 _SECOND_SOURCE_ID = UUID("00000000-0000-0000-0000-000000000002")
 _THIRD_SOURCE_ID = UUID("00000000-0000-0000-0000-000000000003")
@@ -402,6 +428,91 @@ def _figure_at(
         ),
         placement=_placement(kind, index),
     )
+
+
+def test_v9_renders_after_the_registered_paragraph_and_v8_keeps_v40(tmp_path: Path) -> None:
+    renderer, bundle = _renderer(tmp_path)
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    anchor_id = UUID(int=777)
+    table = replace(
+        _enrichment_table(
+            extraction_evidence_refs_v1(extraction)[0], key="after-registered-paragraph"
+        ),
+        placement=EnrichmentPlacementV1(
+            EnrichmentPlacementKind.AFTER_PARAGRAPH,
+            anchor_block_id=anchor_id,
+        ),
+    )
+    anchored_enrichment = replace(
+        build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis),
+        tables=(table,),
+    )
+    anchored_v5 = build_publication_document_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=anchored_enrichment,
+    )
+    v7 = PublicationDocumentV7(
+        base_publication=_v6(anchored_v5),
+        publication_kind=PublicationKind.ARTICLE,
+        routing_decision_hash="a" * 64,
+        routing_policy_version="routing-policy-v1",
+    )
+    v9 = PublicationDocumentV9(
+        base_publication=v7,
+        article_format=build_article_format_v1(anchored_v5, extraction),
+        registry_hash="b" * 64,
+        synthesis_canonical_sha256="c" * 64,
+        enrichment_canonical_sha256="d" * 64,
+        resolved_placements=(
+            ResolvedPublicationPlacementV1(
+                element_kind="table",
+                element_key=table.key,
+                element_position=0,
+                anchor_block_id=anchor_id,
+                anchor_pointer="/lead/0",
+                anchor_canonical_position=0,
+                paragraph_kind="lead",
+                section_index=None,
+                paragraph_index=0,
+            ),
+        ),
+    )
+    v9_render = json.loads(_render(renderer, v9, bundle).render_data_bytes)
+    legacy_table = replace(
+        table,
+        placement=EnrichmentPlacementV1(EnrichmentPlacementKind.AFTER_LEAD),
+    )
+    legacy_enrichment = replace(anchored_enrichment, tables=(legacy_table,))
+    legacy_v5 = build_publication_document_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=legacy_enrichment,
+    )
+    v8 = PublicationDocumentV8(
+        base_publication=PublicationDocumentV7(
+            base_publication=_v6(legacy_v5),
+            publication_kind=PublicationKind.ARTICLE,
+            routing_decision_hash="a" * 64,
+            routing_policy_version="routing-policy-v1",
+        ),
+        article_format=build_article_format_v1(legacy_v5, extraction),
+    )
+    v8_render = json.loads(_render(renderer, v8, bundle).render_data_bytes)
+
+    assert v9_render["schema_version"] == "typst-publication-model-v41-after-paragraph-anchors"
+    v9_blocks = next(item for item in v9_render["content_sections"] if item["type"] == "synthesis")[
+        "blocks"
+    ]
+    assert [item.get("key", item["type"]) for item in v9_blocks[:2]] == [
+        "paragraph",
+        "after-registered-paragraph",
+    ]
+    assert v8_render["schema_version"] == "typst-publication-model-v40-m21-opinion-render"
 
 
 def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_path: Path) -> None:

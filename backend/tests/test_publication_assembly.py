@@ -4,7 +4,7 @@ from datetime import date
 from inspect import signature
 from types import SimpleNamespace
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -13,7 +13,15 @@ from cti_app.application.diagram_compilation import (
     DIAGRAM_COMPILATION_POLICY_VERSION,
     CompiledDiagram,
 )
+from cti_app.application.editorial_workspace.registry import (
+    WorkspaceSnapshotRecord,
+    registry_hash,
+)
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_editorial_enrichment import (
+    canonical_editorial_enrichment_hash,
+    canonical_synthesis_hash,
+)
 from cti_app.application.production_extraction import references_corpus_hash
 from cti_app.application.production_references import production_reference_corpus_to_json
 from cti_app.application.production_relevance import build_relevance_projection
@@ -37,6 +45,7 @@ from cti_app.application.publication_qa import qa_publication_v4, qa_publication
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole
+from cti_app.domain.editorial_workspace import bootstrap_block_registry
 from cti_app.domain.errors import EntityNotFoundError
 from cti_app.domain.production import (
     ExtractionProfile,
@@ -102,11 +111,13 @@ from cti_app.domain.production_synthesis import (
 from cti_app.domain.publication import ArtifactType, PublicationAssemblyErrorCode
 from cti_app.domain.publication_document import (
     PublicationDocumentV8,
+    PublicationDocumentV9,
     parse_publication_document,
     serialize_publication_document,
 )
 from cti_app.domain.publication_kind import PublicationKind
 from tests.editorial_enrichment_support import build_empty_editorial_enrichment
+from tests.test_publication_builder_v4 import _table as _enrichment_table
 
 
 def _canonical_inputs() -> tuple[
@@ -309,6 +320,57 @@ def _run(snapshot: ProductionInputSnapshot) -> ProductionRun:
         subject_id=snapshot.subject_id,
         edition_id=snapshot.edition_id,
         id=snapshot.production_run_id,
+    )
+
+
+def _workspace_record_for(
+    *,
+    run: ProductionRun,
+    synthesis: ProductionSynthesisV1,
+    enrichment: EditorialEnrichmentV1,
+    synthesis_artifact_id: UUID | None = None,
+) -> WorkspaceSnapshotRecord:
+    synthesis_artifact_id = synthesis_artifact_id or uuid4()
+    enrichment_artifact_id = uuid4()
+    synthesis_hash = canonical_synthesis_hash(synthesis)
+    enrichment_hash = canonical_editorial_enrichment_hash(enrichment)
+    entries = (
+        *bootstrap_block_registry(
+            artifact_id=synthesis_artifact_id,
+            canonical_sha256=synthesis_hash,
+            source_stage="synthesis",
+            canonical_content=production_synthesis_to_json(synthesis),
+        ),
+        *bootstrap_block_registry(
+            artifact_id=enrichment_artifact_id,
+            canonical_sha256=enrichment_hash,
+            source_stage="editorial_enrichment",
+            canonical_content=editorial_enrichment_to_json(enrichment),
+        ),
+    )
+    return WorkspaceSnapshotRecord(
+        snapshot_id=uuid4(),
+        subject_id=run.subject_id,
+        production_run_id=run.id,
+        synthesis_artifact_id=synthesis_artifact_id,
+        synthesis_version=1,
+        synthesis_input_hash=synthesis.production_input_hash,
+        synthesis_canonical_sha256=synthesis_hash,
+        enrichment_artifact_id=enrichment_artifact_id,
+        enrichment_version=1,
+        enrichment_input_hash=enrichment.production_input_hash,
+        enrichment_canonical_sha256=enrichment_hash,
+        publication_artifact_id=None,
+        publication_version=None,
+        publication_input_hash=None,
+        publication_canonical_sha256=None,
+        pipeline_generation=1,
+        routing_decision_id=None,
+        routing_decision_hash=None,
+        publication_kind=PublicationKind.ARTICLE,
+        workspace_pin_hash="e" * 64,
+        registry_hash=registry_hash(entries),
+        block_registry=entries,
     )
 
 
@@ -544,6 +606,76 @@ async def test_assembly_persists_exact_v8_body_and_one_publication_artifact() ->
         "base_publication",
         "article_format",
     }
+
+
+@pytest.mark.asyncio
+async def test_after_paragraph_assembly_resolves_registered_anchor_and_rebuilds_stably() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    run = _run(snapshot)
+    service, catalog, _artifacts = _service()
+    synthesis_artifact_id = uuid4()
+    synthesis_hash = canonical_synthesis_hash(synthesis)
+    synthesis_entries = bootstrap_block_registry(
+        artifact_id=synthesis_artifact_id,
+        canonical_sha256=synthesis_hash,
+        source_stage="synthesis",
+        canonical_content=production_synthesis_to_json(synthesis),
+    )
+    anchor = next(item for item in synthesis_entries if item.kind.value == "lead_paragraph")
+    evidence_ref = extraction_evidence_refs_v1(extraction)[0]
+    table = replace(
+        _enrichment_table(evidence_ref),
+        placement=EnrichmentPlacementV1(
+            EnrichmentPlacementKind.AFTER_PARAGRAPH,
+            anchor_block_id=anchor.block_id,
+        ),
+    )
+    enrichment = replace(
+        build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis),
+        tables=(table,),
+    )
+    workspace_record = _workspace_record_for(
+        run=run,
+        synthesis=synthesis,
+        enrichment=enrichment,
+        synthesis_artifact_id=synthesis_artifact_id,
+    )
+
+    assembly = await _assemble(
+        service,
+        run=run,
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+        editorial_enrichment_artifact_id=workspace_record.enrichment_artifact_id,
+        workspace_snapshot_record=workspace_record,
+    )
+    document = parse_publication_document(
+        await ProductionArtifactStore(catalog).read_json(assembly.artifact.canonical_blob_id)
+    )
+    rebuilt = await _assemble(
+        service,
+        run=run,
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+        editorial_enrichment_artifact_id=workspace_record.enrichment_artifact_id,
+        workspace_snapshot_record=workspace_record,
+    )
+
+    assert isinstance(document, PublicationDocumentV9)
+    assert document.registry_hash == workspace_record.registry_hash
+    assert document.resolved_placements == (document.resolved_placements[0],)
+    resolved = document.resolved_placements[0]
+    assert resolved.element_kind == "table"
+    assert resolved.element_key == table.key
+    assert resolved.anchor_block_id == anchor.block_id
+    assert resolved.anchor_pointer == "/lead/0"
+    assert rebuilt.artifact.id == assembly.artifact.id
 
 
 @pytest.mark.asyncio

@@ -102,6 +102,7 @@ PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION = "5"
 PUBLICATION_DOCUMENT_V6_SCHEMA_VERSION = "6"
 PUBLICATION_DOCUMENT_V7_SCHEMA_VERSION = "7"
 PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION = "8"
+PUBLICATION_DOCUMENT_V9_SCHEMA_VERSION = "9"
 _PUBLICATION_SOURCE_REQUIRED_FIELDS = frozenset(
     {
         "source_document_id",
@@ -3258,6 +3259,206 @@ class PublicationDocumentV8:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class ResolvedPublicationPlacementV1:
+    """A placement resolved from an enrichment anchor through one pinned registry."""
+
+    element_kind: str
+    element_key: str
+    element_position: int
+    anchor_block_id: UUID
+    anchor_pointer: str
+    anchor_canonical_position: int
+    paragraph_kind: str
+    section_index: int | None
+    paragraph_index: int
+
+    def __post_init__(self) -> None:
+        if self.element_kind not in {"table", "chart", "diagram", "figure"}:
+            raise ValueError("Resolved publication placement element kind is invalid")
+        validate_editorial_key(self.element_key, "Resolved publication element key")
+        if type(self.element_position) is not int or self.element_position < 0:
+            raise ValueError("Resolved publication element position is invalid")
+        if not isinstance(self.anchor_block_id, UUID):
+            raise ValueError("Resolved publication anchor ID is invalid")
+        validate_text(self.anchor_pointer, "Resolved publication anchor pointer", semantic=True)
+        if self.paragraph_kind not in {"lead", "section"}:
+            raise ValueError("Resolved publication paragraph kind is invalid")
+        if type(self.anchor_canonical_position) is not int or self.anchor_canonical_position < 0:
+            raise ValueError("Resolved publication anchor position is invalid")
+        if type(self.paragraph_index) is not int or self.paragraph_index < 0:
+            raise ValueError("Resolved publication paragraph index is invalid")
+        if self.paragraph_kind == "lead":
+            if self.section_index is not None or not re.fullmatch(
+                rf"/lead/{self.paragraph_index}", self.anchor_pointer
+            ):
+                raise ValueError("Resolved lead paragraph pointer is inconsistent")
+        elif (
+            type(self.section_index) is not int
+            or self.section_index < 0
+            or not re.fullmatch(
+                rf"/sections/{self.section_index}/paragraphs/{self.paragraph_index}",
+                self.anchor_pointer,
+            )
+        ):
+            raise ValueError("Resolved section paragraph pointer is inconsistent")
+
+    def _to_json(self) -> dict[str, Any]:
+        return {
+            "element_kind": self.element_kind,
+            "element_key": self.element_key,
+            "element_position": self.element_position,
+            "anchor_block_id": str(self.anchor_block_id),
+            "anchor_pointer": self.anchor_pointer,
+            "anchor_canonical_position": self.anchor_canonical_position,
+            "paragraph_kind": self.paragraph_kind,
+            "section_index": self.section_index,
+            "paragraph_index": self.paragraph_index,
+        }
+
+    @classmethod
+    def _from_json(cls, value: Any) -> ResolvedPublicationPlacementV1:
+        item = json_object(
+            value,
+            frozenset(
+                {
+                    "element_kind",
+                    "element_key",
+                    "element_position",
+                    "anchor_block_id",
+                    "anchor_pointer",
+                    "anchor_canonical_position",
+                    "paragraph_kind",
+                    "section_index",
+                    "paragraph_index",
+                }
+            ),
+            "Resolved publication placement",
+        )
+        return cls(
+            element_kind=json_text(item["element_kind"], "Resolved element kind"),
+            element_key=json_text(item["element_key"], "Resolved element key"),
+            element_position=json_int(item["element_position"], "Resolved element position"),
+            anchor_block_id=json_uuid(item["anchor_block_id"], "Resolved anchor ID"),
+            anchor_pointer=json_text(item["anchor_pointer"], "Resolved anchor pointer"),
+            anchor_canonical_position=json_int(
+                item["anchor_canonical_position"], "Resolved anchor position"
+            ),
+            paragraph_kind=json_text(item["paragraph_kind"], "Resolved paragraph kind"),
+            section_index=(
+                json_int(item["section_index"], "Resolved section index")
+                if item["section_index"] is not None
+                else None
+            ),
+            paragraph_index=json_int(item["paragraph_index"], "Resolved paragraph index"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationDocumentV9(PublicationDocumentV8):
+    """Publication envelope with placement coordinates resolved by a pinned registry."""
+
+    registry_hash: str
+    synthesis_canonical_sha256: str
+    enrichment_canonical_sha256: str
+    resolved_placements: tuple[ResolvedPublicationPlacementV1, ...]
+
+    @property
+    def schema_version(self) -> str:
+        return PUBLICATION_DOCUMENT_V9_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        PublicationDocumentV8.__post_init__(self)
+        validate_sha256(self.registry_hash, "Publication registry hash")
+        validate_sha256(self.synthesis_canonical_sha256, "Publication synthesis pin")
+        validate_sha256(self.enrichment_canonical_sha256, "Publication enrichment pin")
+        if not isinstance(self.resolved_placements, tuple) or any(
+            not isinstance(item, ResolvedPublicationPlacementV1)
+            for item in self.resolved_placements
+        ):
+            raise ValueError("PublicationDocumentV9 resolved placements are invalid")
+
+        base_v5 = self.base_publication.base_publication.base_publication
+        body = base_v5.document
+        expected: dict[tuple[str, str], UUID] = {}
+        for element_kind, values in (
+            ("table", body.tables),
+            ("chart", body.charts),
+            ("diagram", body.diagrams),
+            ("figure", body.figures),
+        ):
+            for enrichment_item in values:
+                if enrichment_item.placement.kind.value != "after_paragraph":
+                    continue
+                anchor_block_id = enrichment_item.placement.anchor_block_id
+                if anchor_block_id is None:
+                    raise ValueError("PublicationDocumentV9 placement anchor is missing")
+                identity = (element_kind, enrichment_item.key)
+                if identity in expected:
+                    raise ValueError("PublicationDocumentV9 element keys are ambiguous")
+                expected[identity] = anchor_block_id
+        actual: dict[tuple[str, str], ResolvedPublicationPlacementV1] = {}
+        for resolved_item in self.resolved_placements:
+            identity = (resolved_item.element_kind, resolved_item.element_key)
+            if identity in actual or expected.get(identity) != resolved_item.anchor_block_id:
+                raise ValueError("PublicationDocumentV9 resolved anchor does not match element")
+            actual[identity] = resolved_item
+        if set(actual) != set(expected):
+            raise ValueError("PublicationDocumentV9 requires one resolved anchor per element")
+
+    def _to_json(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "base_publication": self.base_publication._to_json(),
+            "article_format": _article_format_to_json(self.article_format),
+            "registry_hash": self.registry_hash,
+            "synthesis_canonical_sha256": self.synthesis_canonical_sha256,
+            "enrichment_canonical_sha256": self.enrichment_canonical_sha256,
+            "resolved_placements": [item._to_json() for item in self.resolved_placements],
+        }
+
+    @classmethod
+    def _from_json(cls, payload: Mapping[str, Any]) -> PublicationDocumentV9:
+        document = json_object(
+            payload,
+            frozenset(
+                {
+                    "schema_version",
+                    "base_publication",
+                    "article_format",
+                    "registry_hash",
+                    "synthesis_canonical_sha256",
+                    "enrichment_canonical_sha256",
+                    "resolved_placements",
+                }
+            ),
+            "PublicationDocumentV9",
+        )
+        if document["schema_version"] != PUBLICATION_DOCUMENT_V9_SCHEMA_VERSION:
+            raise ValueError("PublicationDocumentV9 schema version is unsupported")
+        raw_base = document["base_publication"]
+        if (
+            not isinstance(raw_base, Mapping)
+            or raw_base.get("schema_version") != PUBLICATION_DOCUMENT_V7_SCHEMA_VERSION
+        ):
+            raise ValueError("PublicationDocumentV9 base must be a V7 publication")
+        return cls(
+            base_publication=publication_document_v7_from_json(raw_base),
+            article_format=_article_format_from_json(document["article_format"]),
+            registry_hash=json_sha256(document["registry_hash"], "Publication registry hash"),
+            synthesis_canonical_sha256=json_sha256(
+                document["synthesis_canonical_sha256"], "Publication synthesis pin"
+            ),
+            enrichment_canonical_sha256=json_sha256(
+                document["enrichment_canonical_sha256"], "Publication enrichment pin"
+            ),
+            resolved_placements=tuple(
+                ResolvedPublicationPlacementV1._from_json(item)
+                for item in json_array(document["resolved_placements"], "Resolved placements")
+            ),
+        )
+
+
 _OPINION_BLOCK_ORDER = {item: index for index, item in enumerate(OpinionBlockType)}
 _OPINION_BLOCK_HEADINGS = {
     OpinionBlockType.KEY_FINDINGS: "Apports de l'analyse",
@@ -3580,6 +3781,7 @@ type CanonicalPublicationDocument = (
     | PublicationDocumentV6
     | PublicationDocumentV7
     | PublicationDocumentV8
+    | PublicationDocumentV9
 )
 
 
@@ -3646,6 +3848,16 @@ def publication_document_v8_to_json(document: PublicationDocumentV8) -> dict[str
     return document._to_json()
 
 
+def publication_document_v9_from_json(payload: Mapping[str, Any]) -> PublicationDocumentV9:
+    return PublicationDocumentV9._from_json(payload)
+
+
+def publication_document_v9_to_json(document: PublicationDocumentV9) -> dict[str, Any]:
+    if not isinstance(document, PublicationDocumentV9):
+        raise ValueError("Expected a PublicationDocumentV9")
+    return document._to_json()
+
+
 def publication_document_from_json(payload: Mapping[str, Any]) -> CanonicalPublicationDocument:
     version = payload.get("schema_version")
     if version == PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION:
@@ -3658,6 +3870,8 @@ def publication_document_from_json(payload: Mapping[str, Any]) -> CanonicalPubli
         return publication_document_v7_from_json(payload)
     if version == PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION:
         return publication_document_v8_from_json(payload)
+    if version == PUBLICATION_DOCUMENT_V9_SCHEMA_VERSION:
+        return publication_document_v9_from_json(payload)
     raise ValueError(f"unsupported publication document schema_version={version!r}")
 
 
@@ -3673,6 +3887,7 @@ def validate_publication_document(
             PublicationDocumentV6,
             PublicationDocumentV7,
             PublicationDocumentV8,
+            PublicationDocumentV9,
         ),
     ):
         if value.schema_version not in {
@@ -3681,6 +3896,7 @@ def validate_publication_document(
             PUBLICATION_DOCUMENT_V6_SCHEMA_VERSION,
             PUBLICATION_DOCUMENT_V7_SCHEMA_VERSION,
             PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION,
+            PUBLICATION_DOCUMENT_V9_SCHEMA_VERSION,
         }:
             raise ValueError(
                 f"unsupported publication document schema_version={value.schema_version!r}"
@@ -3705,6 +3921,8 @@ def serialize_publication_document(
         return validated._to_json()
     if isinstance(validated, PublicationDocumentV7):
         return validated._to_json()
+    if isinstance(validated, PublicationDocumentV9):
+        return validated._to_json()
     if isinstance(validated, PublicationDocumentV8):
         return validated._to_json()
     if isinstance(validated, PublicationDocumentV5):
@@ -3719,6 +3937,7 @@ __all__ = [
     "PUBLICATION_DOCUMENT_V6_SCHEMA_VERSION",
     "PUBLICATION_DOCUMENT_V7_SCHEMA_VERSION",
     "PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION",
+    "PUBLICATION_DOCUMENT_V9_SCHEMA_VERSION",
     "ArticleFormatV1",
     "ArticleOverviewV1",
     "CanonicalPublicationDocument",
@@ -3737,11 +3956,13 @@ __all__ = [
     "PublicationDocumentV6ValidationError",
     "PublicationDocumentV7",
     "PublicationDocumentV8",
+    "PublicationDocumentV9",
     "PublicationIOCValueV1",
     "PublicationSourceFigureV1",
     "PublicationTableColumnV1",
     "PublicationTableRowV1",
     "PublicationTableV1",
+    "ResolvedPublicationPlacementV1",
     "TimelineKeyEventV1",
     "build_publication_date_events",
     "build_publication_date_events_v3",
@@ -3763,6 +3984,8 @@ __all__ = [
     "publication_document_v7_to_json",
     "publication_document_v8_from_json",
     "publication_document_v8_to_json",
+    "publication_document_v9_from_json",
+    "publication_document_v9_to_json",
     "select_article_timeline_key_events_v1",
     "select_publication_timeline_key_events_v2",
     "select_publication_timeline_key_events_v3",

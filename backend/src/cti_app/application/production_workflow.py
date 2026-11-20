@@ -2217,6 +2217,14 @@ class ProductionWorkflowOrchestrator:
                         extraction=canonical_extraction,
                         synthesis=canonical_synthesis,
                     )
+                from cti_app.application.editorial_workspace.service import (
+                    EditorialWorkspaceService,
+                )
+
+                workspace_snapshot_record = await EditorialWorkspaceService(
+                    uow_factory=self._uow_factory,
+                    artifact_store=self._artifact_store,
+                ).snapshot_record_in_uow(uow, snapshot.subject_id)
                 assembly = await PublicationAssemblyService(
                     self._artifact_store,
                     uow.production_artifacts,
@@ -2235,6 +2243,7 @@ class ProductionWorkflowOrchestrator:
                     editorial_enrichment_artifact_input_hash=(
                         enrichment.input_hash if enrichment else None
                     ),
+                    workspace_snapshot_record=workspace_snapshot_record,
                     routing_decision_hash=routing_decision.decision_hash,
                     routing_policy_version=routing_decision.policy_version,
                     metadata_extra={

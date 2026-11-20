@@ -82,6 +82,68 @@ class ResolvedWorkspaceTarget:
     legacy_target_id: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class ResolvedParagraphAnchor:
+    block_id: UUID
+    structural_pointer: str
+    canonical_position: int
+    paragraph_kind: Literal["lead", "section"]
+    section_index: int | None
+    paragraph_index: int
+
+
+def resolve_paragraph_anchor(
+    record: WorkspaceSnapshotRecord,
+    block_id: UUID,
+    *,
+    synthesis: Mapping[str, Any] | None = None,
+) -> ResolvedParagraphAnchor:
+    """Resolve a registered paragraph occurrence against one exact workspace pin."""
+    occurrence = resolve_occurrence(record, block_id)
+    entry = occurrence.entry
+    if (
+        entry is None
+        or occurrence.binding_state != "valid"
+        or entry.source_stage is not EditorialSourceStage.SYNTHESIS
+    ):
+        raise EditorialWorkspaceError("editorial_anchor_stale")
+
+    tokens = _pointer_tokens(entry.structural_pointer)
+    try:
+        if entry.kind.value == "lead_paragraph" and len(tokens) == 2 and tokens[0] == "lead":
+            paragraph_index = int(tokens[1])
+            paragraph_kind: Literal["lead", "section"] = "lead"
+            section_index = None
+        elif (
+            entry.kind.value == "paragraph"
+            and len(tokens) == 4
+            and tokens[0] == "sections"
+            and tokens[2] == "paragraphs"
+        ):
+            section_index = int(tokens[1])
+            paragraph_index = int(tokens[3])
+            paragraph_kind = "section"
+        else:
+            raise ValueError("invalid paragraph pointer")
+        if paragraph_index < 0 or (section_index is not None and section_index < 0):
+            raise ValueError("invalid paragraph pointer")
+        if synthesis is not None:
+            value = read_pointer(synthesis, entry.structural_pointer)
+            if canonical_content_sha256(value) != entry.content_sha256:
+                raise ValueError("paragraph content does not match the pinned registry")
+    except (IndexError, KeyError, TypeError, ValueError) as exc:
+        raise EditorialWorkspaceError("editorial_anchor_stale") from exc
+
+    return ResolvedParagraphAnchor(
+        block_id=entry.block_id,
+        structural_pointer=entry.structural_pointer,
+        canonical_position=entry.position,
+        paragraph_kind=paragraph_kind,
+        section_index=section_index,
+        paragraph_index=paragraph_index,
+    )
+
+
 def resolve_canonical_target(
     payload: Mapping[str, Any],
     target: TargetedEditorialRevisionTarget,
@@ -454,6 +516,7 @@ def project_blocks(
     synthesis_blocks = [block_by_id[entry.block_id] for entry in synthesis_entries]
     enrichment_blocks_by_id = {UUID(str(block["block_id"])): block for block in enrichments}
     insertions: dict[int, list[tuple[int, int, str, dict[str, object]]]] = {}
+    stale_enrichments: list[tuple[int, str, dict[str, object]]] = []
     section_count = len(synthesis.get("sections", []))
     for entry in enrichment_entries:
         if enrichment is None:
@@ -466,6 +529,7 @@ def project_blocks(
             raise EditorialRegistryConflictError("editorial_registry_conflict")
         placement_kind = str(placement["kind"])
         section_index: int | None = None
+        stale_anchor = False
         if placement_kind == "after_lead":
             boundary = next(
                 (
@@ -491,18 +555,50 @@ def project_blocks(
                 raise EditorialWorkspaceError("editorial_anchor_stale")
             boundary = max(matches) + 1
             placement_rank = section_index + 1
+        elif placement_kind == "after_paragraph":
+            try:
+                anchor_block_id = UUID(str(placement["anchor_block_id"]))
+                resolved_anchor = (
+                    resolve_paragraph_anchor(record, anchor_block_id, synthesis=synthesis)
+                    if record is not None
+                    else None
+                )
+            except (KeyError, TypeError, ValueError, EditorialWorkspaceError):
+                resolved_anchor = None
+            anchor_index = (
+                next(
+                    (
+                        index
+                        for index, synthesis_entry in enumerate(synthesis_entries)
+                        if synthesis_entry.block_id == resolved_anchor.block_id
+                    ),
+                    None,
+                )
+                if resolved_anchor is not None
+                else None
+            )
+            if anchor_index is None:
+                stale_anchor = True
+            else:
+                boundary = anchor_index + 1
+                placement_rank = 0
         elif placement_kind in {"after_timeline", "end"}:
             boundary = len(synthesis_entries)
             placement_rank = section_count + (1 if placement_kind == "after_timeline" else 2)
         else:
             raise EditorialRegistryConflictError("editorial_registry_conflict")
-        element_key = str(item.get("element_key") or entry.structural_pointer)
+        element_key = str(item.get("element_key") or item.get("key") or entry.structural_pointer)
+        enrichment_block = enrichment_blocks_by_id[entry.block_id]
+        if stale_anchor:
+            enrichment_block["revision_status"] = "stale"
+            stale_enrichments.append((entry.position, element_key, enrichment_block))
+            continue
         insertions.setdefault(boundary, []).append(
             (
                 placement_rank,
                 entry.position,
                 element_key,
-                enrichment_blocks_by_id[entry.block_id],
+                enrichment_block,
             )
         )
 
@@ -515,6 +611,9 @@ def project_blocks(
             ordered_enrichments.append(block)
         if boundary < len(synthesis_blocks):
             ordered_blocks.append(synthesis_blocks[boundary])
+    ordered_enrichments.extend(
+        block for _position, _element_key, block in sorted(stale_enrichments)
+    )
     blocks = ordered_blocks
     enrichments = ordered_enrichments
     return blocks, enrichments, outline

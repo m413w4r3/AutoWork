@@ -444,6 +444,9 @@ class EditorialWorkspaceService:
                             != current_enrichment_id
                         )
                     )
+            publication_stale = publication_stale or any(
+                enrichment.get("revision_status") == "stale" for enrichment in enrichments
+            )
             render_status = (
                 PublicationPreviewStatus.READY
                 if publication_render is None

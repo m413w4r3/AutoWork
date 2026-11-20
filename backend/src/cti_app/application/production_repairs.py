@@ -5075,6 +5075,23 @@ class ProductionRepairMaterializationService:
             }
             if repair_materialization is not None:
                 metadata["repair_materialization"] = dict(repair_materialization)
+            assembly_workspace_snapshot = None
+            repair_routing_pins = EditorialRoutingPins(
+                decision_id=route_decision.decision_id,
+                decision_hash=route_decision.decision_hash,
+                publication_kind=route_decision.publication_kind,
+            )
+            if editorial_writes:
+                assert revision_effects is not None
+                assert base_workspace_snapshot is not None
+                try:
+                    assembly_workspace_snapshot = revision_effects.preview_after_writes(
+                        base_snapshot=base_workspace_snapshot,
+                        writes=tuple(editorial_writes),
+                        routing_pins=repair_routing_pins,
+                    )
+                except EditorialRevisionEffectsError as error:
+                    raise ProductionRepairProjectionError(error.code) from None
             assembly = await CanonicalAssemblyService(
                 store, uow.production_artifacts
             ).assemble_publication(
@@ -5088,6 +5105,7 @@ class ProductionRepairMaterializationService:
                 publication_kind=route_decision.publication_kind,
                 routing_decision_hash=route_decision.decision_hash,
                 routing_policy_version=route_decision.policy_version,
+                workspace_snapshot_record=assembly_workspace_snapshot,
                 metadata_extra=metadata,
             )
             new_publication = assembly.artifact
@@ -5118,11 +5136,7 @@ class ProductionRepairMaterializationService:
                         base_snapshot=base_workspace_snapshot,
                         writes=tuple(editorial_writes),
                         actor_id=actor_id,
-                        routing_pins=EditorialRoutingPins(
-                            decision_id=route_decision.decision_id,
-                            decision_hash=route_decision.decision_hash,
-                            publication_kind=route_decision.publication_kind,
-                        ),
+                        routing_pins=repair_routing_pins,
                         publication_pins=EditorialPublicationPins(
                             artifact=new_publication,
                             canonical_sha256=hashlib.sha256(

@@ -156,7 +156,8 @@ function LegacyWorkbenchFallback({
 function PublicationContent({ content }: { content: SubjectContentResponse }) {
   const publicationKind = content.publication_kind;
   const document =
-    content.canonical_content.schema_version === "8"
+    content.canonical_content.schema_version === "8" ||
+    content.canonical_content.schema_version === "9"
       ? publicationDocumentBody(content.canonical_content.base_publication)
       : publicationDocumentBody(content.canonical_content);
   return (

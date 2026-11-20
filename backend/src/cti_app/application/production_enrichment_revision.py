@@ -28,6 +28,7 @@ from cti_app.application.editorial_enrichment_candidate import (
 from cti_app.application.editorial_enrichment_revision import (
     EditorialEnrichmentRevisionLineage,
     EditorialEnrichmentRevisionValidationError,
+    requested_registered_placement,
 )
 from cti_app.application.editorial_revision_effects import (
     EditorialRevisionEffects,
@@ -62,6 +63,7 @@ from cti_app.application.production_prompts import (
     EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION,
     EDITORIAL_ENRICHMENT_REVISION_CONTRACT_VERSION,
     EDITORIAL_ENRICHMENT_REVISION_PROMPT_VERSION,
+    EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION,
 )
 from cti_app.application.production_references import production_reference_corpus_from_json
 from cti_app.application.production_repairs import _effective_decisions_for_reader
@@ -154,6 +156,7 @@ class _EditorialEnrichmentRevisionFence:
     evidence_pack_hash: str
     inventory_hash: str | None
     input_hash: str
+    workspace_record: Any
 
 
 class _StoredSourceMediaArchiver:
@@ -249,6 +252,18 @@ class ProductionEditorialEnrichmentRevisionService:
                 artifact_store=self._enrichment._artifact_store,
                 media_archiver=media_archiver,
             )
+            from cti_app.application.editorial_workspace.service import (
+                EditorialWorkspaceService,
+            )
+
+            workspace_record = await EditorialWorkspaceService(
+                uow_factory=cast(Any, self._enrichment._uow_factory),
+                artifact_store=self._enrichment._artifact_store,
+            ).snapshot_record_in_uow(cast(Any, uow), snapshot.subject_id)
+            if workspace_record.synthesis_artifact_id != synthesis_artifact.id:
+                raise EditorialEnrichmentRevisionConflictError(
+                    "The pinned synthesis no longer matches the requested revision base"
+                )
 
         lineage_rebased = base_artifact.metadata.get("lineage_rebased") is True
         extraction_hash = canonical_extraction_hash(extraction)
@@ -274,12 +289,25 @@ class ProductionEditorialEnrichmentRevisionService:
                 "The access policy no longer matches the base artifact"
             )
 
+        if base_artifact.canonical_blob_id is None:
+            raise EditorialEnrichmentRevisionConflictError(
+                "The base enrichment artifact has no canonical payload"
+            )
+        base_enrichment = editorial_enrichment_from_json(
+            await self._enrichment._artifact_store.read_json(base_artifact.canonical_blob_id)
+        )
+
         evidence_pack = build_editorial_enrichment_evidence_pack(
-            snapshot, extraction, synthesis, projection
+            snapshot, extraction, synthesis, projection, workspace_record
         )
         evidence_pack_hash = editorial_enrichment_evidence_pack_hash(evidence_pack)
+        legacy_evidence_pack = (
+            build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis, projection)
+            if base_enrichment.schema_version < 9
+            else evidence_pack
+        )
         if not lineage_rebased and base_artifact.metadata.get("evidence_pack_hash") != (
-            evidence_pack_hash
+            editorial_enrichment_evidence_pack_hash(legacy_evidence_pack)
         ):
             raise EditorialEnrichmentRevisionConflictError(
                 "The admitted evidence pack no longer matches the base artifact"
@@ -327,6 +355,7 @@ class ProductionEditorialEnrichmentRevisionService:
             evidence_pack_hash=evidence_pack_hash,
             inventory_hash=inventory_hash,
             input_hash=input_hash,
+            workspace_record=workspace_record,
         )
 
     @staticmethod
@@ -1572,11 +1601,23 @@ class ProductionEditorialEnrichmentRevisionService:
                     "editorial_guidance": base_editorial_prompt["editorial_guidance"],
                     "output_contract": base_editorial_prompt["output_contract"],
                 }
-            placement_json = (
-                targeted_request.target.placement.to_json()
-                if targeted_request is not None and targeted_request.target.placement is not None
-                else None
-            )
+            placement_json = None
+            if targeted_request is not None and targeted_request.target.placement is not None:
+                if is_create:
+                    try:
+                        registered_placement = requested_registered_placement(
+                            targeted_request=targeted_request,
+                            synthesis=synthesis,
+                            evidence_pack=evidence_pack,
+                        )
+                    except ValueError as exc:
+                        return self._targeted_refusal(str(exc), None)
+                    placement_json = {
+                        "kind": registered_placement.kind.value,
+                        "anchor_block_id": str(registered_placement.anchor_block_id),
+                    }
+                else:
+                    placement_json = targeted_request.target.placement.to_json()
             request = self._model_request(
                 request_identity=request_identity,
                 request_identity_payload=request_identity_payload,
@@ -1791,6 +1832,7 @@ class ProductionEditorialEnrichmentRevisionService:
                 input_hash=input_hash,
                 artifact_id=revision_artifact_id,
                 targeted_request=targeted_request,
+                evidence_pack=evidence_pack,
                 is_create=is_create,
                 is_delete=is_delete,
                 resource_need_proposal=resource_need_proposal,
@@ -1923,7 +1965,7 @@ class ProductionEditorialEnrichmentRevisionService:
                     "contract_version": EDITORIAL_ENRICHMENT_REVISION_CONTRACT_VERSION,
                     "editorial_contract_prompt_version": EDITORIAL_ENRICHMENT_PROMPT_VERSION,
                     "editorial_contract_version": EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION,
-                    "parser_version": "editorial-enrichment-wire-parser-v1",
+                    "parser_version": EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION,
                     "validator_version": "editorial-enrichment-validator-v2-source-waiver",
                     "evidence_refs": evidence_refs,
                     "evidence_handles": element_evidence_handles,
@@ -2530,12 +2572,14 @@ class ProductionEditorialEnrichmentRevisionService:
         element_kind: EditorialEnrichmentElementKind,
         targeted_request: TargetedEditorialRevisionRequest | None,
         synthesis: Any,
+        evidence_pack: Any | None = None,
     ) -> None:
         enrichment_revision_rules.assert_requested_placement(
             candidate=candidate,
             element_kind=element_kind,
             targeted_request=targeted_request,
             synthesis=synthesis,
+            evidence_pack=evidence_pack,
         )
 
     @staticmethod
@@ -2605,10 +2649,15 @@ class ProductionEditorialEnrichmentRevisionService:
         synthesis: Any,
         enrichment: EditorialEnrichmentV1,
     ) -> ProductionArtifact:
+        from cti_app.application.editorial_workspace.service import EditorialWorkspaceService
         from cti_app.application.publication_assembly import PublicationAssemblyService
 
         async with self._enrichment._uow_factory() as uow:
             routing_decision = await get_adopted_production_routing_decision(uow=uow, run=run)
+            workspace_snapshot_record = await EditorialWorkspaceService(
+                uow_factory=cast(Any, self._enrichment._uow_factory),
+                artifact_store=self._enrichment._artifact_store,
+            ).snapshot_record_in_uow(cast(Any, uow), snapshot.subject_id)
             assembly = await PublicationAssemblyService(
                 self._enrichment._artifact_store, uow.production_artifacts
             ).assemble_publication(
@@ -2621,6 +2670,7 @@ class ProductionEditorialEnrichmentRevisionService:
                 editorial_enrichment=enrichment,
                 editorial_enrichment_artifact_id=enrichment_artifact.id,
                 editorial_enrichment_artifact_input_hash=enrichment_artifact.input_hash,
+                workspace_snapshot_record=workspace_snapshot_record,
                 publication_kind=(
                     routing_decision.publication_kind if routing_decision is not None else None
                 ),
