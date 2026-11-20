@@ -255,6 +255,17 @@ export interface EditorialProposalDecisionResult {
   state_version: number;
 }
 
+export interface EditorialProposalAcceptResult {
+  id: string;
+  state: "accepted";
+  state_version: number;
+  artifact_id: string;
+  artifact_version: number;
+  snapshot_id: string;
+  impact_id: string;
+  impact_state: "pending" | "running" | "done" | "failed" | "superseded";
+}
+
 const EDITORIAL_THREAD_TRANSPORT_UNCERTAIN_MESSAGE =
   "L’état de votre envoi est incertain. Consultez le fil avant de continuer.";
 
@@ -289,6 +300,10 @@ const ERROR_MESSAGES: Record<string, string> = {
     "Le texte de référence ne correspond plus à son empreinte.",
   proposal_state_conflict:
     "La proposition a changé. Actualisez-la avant de décider.",
+  proposal_base_stale:
+    "Cette proposition repose sur une version qui a changé. Elle n’a pas été appliquée. Actualisez le document, puis comparez et formulez une nouvelle proposition.",
+  editorial_proposal_accept_unavailable:
+    "L’acceptation des propositions est temporairement indisponible.",
   proposal_idempotency_conflict:
     "Cette clé est déjà associée à une autre décision.",
   propose_not_enabled: "La proposition n’est pas encore activée.",
@@ -366,6 +381,25 @@ export function rejectEditorialProposal(
 ): Promise<EditorialProposalDecisionResult> {
   return request<EditorialProposalDecisionResult>(
     `/api/subjects/${encodeURIComponent(subjectId)}/editor/threads/${encodeURIComponent(occurrenceId)}/proposals/${encodeURIComponent(proposalId)}/reject`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Idempotency-Key": crypto.randomUUID(),
+      },
+      body: JSON.stringify(decision),
+    },
+  );
+}
+
+export function acceptEditorialProposal(
+  subjectId: string,
+  occurrenceId: string,
+  proposalId: string,
+  decision: { expected_state_version: number; patch_sha256: string },
+): Promise<EditorialProposalAcceptResult> {
+  return request<EditorialProposalAcceptResult>(
+    `/api/subjects/${encodeURIComponent(subjectId)}/editor/threads/${encodeURIComponent(occurrenceId)}/proposals/${encodeURIComponent(proposalId)}/accept`,
     {
       method: "POST",
       headers: {

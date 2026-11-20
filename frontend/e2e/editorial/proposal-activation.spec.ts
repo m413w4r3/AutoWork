@@ -257,7 +257,7 @@ test("generates and displays a persisted proposal in the desktop thread", async 
       "Une réponse est disponible dans ce fil. Consultez-la avant toute décision.",
     ),
   ).toBeVisible();
-  await expect(page.getByRole("button", { name: "Accepter" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Accepter" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Rejeter" })).toBeVisible();
   await card.scrollIntoViewIfNeeded();
   await page.screenshot({

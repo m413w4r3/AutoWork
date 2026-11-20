@@ -101,7 +101,7 @@ class Settings(BaseSettings):
     production_relevance_classifier_enabled: bool = True
     # External web search from Editorial Enrichment is an explicit operator opt-in.
     production_editorial_resource_search_enabled: bool = False
-    editorial_proposal_accept_enabled: bool = False
+    editorial_proposal_accept_enabled: bool = True
     # Palier de repos long inséré périodiquement pour laisser le bridge
     # ChatGPT récupérer. Zéro désactive le palier.
     production_cooldown_every_n_subjects: int = Field(default=3, ge=0)
