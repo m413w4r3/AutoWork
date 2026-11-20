@@ -3,17 +3,19 @@ import type { FormEvent, KeyboardEvent, RefObject } from "react";
 interface EditorialConversationComposerProps {
   draft: string;
   active: boolean;
+  canPropose: boolean;
   controlsLocked: boolean;
   hasQueryError: boolean;
   sendPending: boolean;
   sendSuccess: boolean;
+  sendKind: "message" | "propose" | undefined;
   sendErrorMessage: string | null;
   submissionBelongsToCurrentTarget: boolean;
   composerRef: RefObject<HTMLTextAreaElement | null>;
   sendAnnouncementRef: RefObject<HTMLParagraphElement | null>;
   onDraftChange: (value: string) => void;
   onSuggestion: (value: string) => void;
-  onSubmit: () => void;
+  onSubmit: (kind: "message" | "propose") => void;
 }
 
 const suggestions = [
@@ -25,10 +27,12 @@ const suggestions = [
 export function EditorialConversationComposer({
   draft,
   active,
+  canPropose,
   controlsLocked,
   hasQueryError,
   sendPending,
   sendSuccess,
+  sendKind,
   sendErrorMessage,
   submissionBelongsToCurrentTarget,
   composerRef,
@@ -39,7 +43,7 @@ export function EditorialConversationComposer({
 }: EditorialConversationComposerProps) {
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    onSubmit();
+    onSubmit("message");
   }
 
   function handleKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -49,7 +53,7 @@ export function EditorialConversationComposer({
       !event.nativeEvent.isComposing
     ) {
       event.preventDefault();
-      onSubmit();
+      onSubmit("message");
     }
   }
 
@@ -81,13 +85,29 @@ export function EditorialConversationComposer({
           </button>
         ))}
       </div>
-      <button
-        className="editorial-conversation__send"
-        type="submit"
-        disabled={!draft.trim() || controlsLocked || hasQueryError}
-      >
-        {sendPending ? "Envoi en cours…" : "Envoyer un message"}
-      </button>
+      <div className="editorial-conversation__actions">
+        <button
+          className="editorial-conversation__send"
+          type="submit"
+          disabled={!draft.trim() || controlsLocked || hasQueryError}
+        >
+          {sendPending && sendKind === "message"
+            ? "Envoi en cours…"
+            : "Envoyer un message"}
+        </button>
+        {canPropose ? (
+          <button
+            className="editorial-conversation__propose"
+            type="button"
+            disabled={!draft.trim() || controlsLocked || hasQueryError}
+            onClick={() => onSubmit("propose")}
+          >
+            {sendPending && sendKind === "propose"
+              ? "Génération en cours…"
+              : "Générer une proposition"}
+          </button>
+        ) : null}
+      </div>
       <p
         ref={sendAnnouncementRef}
         className="editorial-conversation__announcement"
@@ -97,9 +117,13 @@ export function EditorialConversationComposer({
         tabIndex={-1}
       >
         {sendPending && submissionBelongsToCurrentTarget
-          ? "Envoi du message en cours."
+          ? sendKind === "propose"
+            ? "Génération de la proposition en cours."
+            : "Envoi du message en cours."
           : sendSuccess && submissionBelongsToCurrentTarget
-            ? "Message envoyé."
+            ? sendKind === "propose"
+              ? "Demande de proposition envoyée à Bridge."
+              : "Message envoyé."
             : ""}
       </p>
       {sendErrorMessage && submissionBelongsToCurrentTarget ? (

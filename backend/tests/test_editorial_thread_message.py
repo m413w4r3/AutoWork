@@ -19,6 +19,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from cti_app.api import editorial_workspace as editorial_workspace_api
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.editorial_bridge_gate import EditorialBridgeGate
+from cti_app.application.editorial_thread_common import encode_thread_request
 from cti_app.application.editorial_thread_job_completion import (
     EditorialThreadJobCompletion,
     EditorialThreadSessionLostOutcome,
@@ -623,6 +624,7 @@ class WorkerModelConversations:
         source_docs: WorkerSourceDocuments,
         uow: WorkerUow,
         failure=None,
+        objective: EditorialDiscussionObjective = EditorialDiscussionObjective.MESSAGE,
     ) -> None:
         self.thread_id = thread_id
         self.conversation = SimpleNamespace(
@@ -636,11 +638,13 @@ class WorkerModelConversations:
         self.source_docs = source_docs
         self.uow = uow
         self.failure = failure
+        self.objective = objective
         self.add_calls = 0
         self.gateway_calls = 0
         self.add_arguments: dict[str, object] | None = None
         self.turn: ModelConversationTurn | None = None
         self.replay_turn: ModelConversationTurn | None = None
+        self.output_text = "Réponse Bridge factice."
 
     async def get_editorial_thread_conversation(
         self, _conversation_id: UUID, *, thread_id: UUID, context_subject_id: UUID
@@ -685,8 +689,19 @@ class WorkerModelConversations:
             self.uow.turns[self.turn.id] = self.turn
             self.uow.runs[self.turn.model_run_id] = _terminal_bridge_run()
             return self.replay_turn
-        assert values["editorial_objective"] is EditorialDiscussionObjective.MESSAGE
+        assert values["editorial_objective"] is self.objective
         assert isinstance(values["editorial_context"], EditorialDiscussionContext)
+        output_text = (
+            "@@ TARGET @@\nsynthesis/title\n@@ ACTION @@\nrewrite_title\n"
+            "@@ BASE_ARTIFACT_HASH @@\n"
+            + "a" * 64
+            + "\n@@ BEFORE_HASH @@\n"
+            + "b" * 64
+            + "\n@@ AFTER @@\nTitre proposé synthétique\n@@ RATIONALE @@\n"
+            "Motif synthétique\n@@ END @@"
+            if self.objective is EditorialDiscussionObjective.PROPOSAL
+            else "Réponse Bridge factice."
+        )
         self.turn = ModelConversationTurn(
             conversation_id=self.conversation.id,
             sequence=1,
@@ -695,15 +710,16 @@ class WorkerModelConversations:
             input_sha256="f" * 64,
             idempotency_key=values["idempotency_key"],
             correlation_id=values["correlation_id"],
-            objective="editorial_message",
+            objective=f"editorial_{self.objective.value}",
             output_blob_reference="blob://synthetic-output",
-            output_sha256="e" * 64,
+            output_sha256=hashlib.sha256(output_text.encode()).hexdigest(),
             status=ConversationTurnStatus.SUCCEEDED,
             external_turn_id="verified-external-turn-1",
         )
         self.uow.turns[self.turn.id] = self.turn
         self.uow.runs[self.turn.model_run_id] = _terminal_bridge_run()
         self.gateway_calls += 1
+        self.output_text = output_text
         return self.turn
 
     def _persist_attempt(
@@ -723,7 +739,7 @@ class WorkerModelConversations:
             input_sha256="f" * 64,
             idempotency_key=values["idempotency_key"],
             correlation_id=values["correlation_id"],
-            objective="editorial_message",
+            objective=f"editorial_{self.objective.value}",
             status=turn_status,
         )
         self.turn = turn
@@ -738,7 +754,7 @@ class WorkerModelConversations:
         assert thread_id == self.thread_id
         assert context_subject_id == self.conversation.subject_id
         assert self.turn is not None
-        return [SimpleNamespace(turn=self.turn, output_text="Réponse Bridge factice.")]
+        return [SimpleNamespace(turn=self.turn, output_text=self.output_text)]
 
 
 def make_worker_runtime(
@@ -748,6 +764,8 @@ def make_worker_runtime(
     message: str | None = None,
     revoke_external_after_first_read: bool = False,
     advance_pin: bool = False,
+    objective: EditorialDiscussionObjective = EditorialDiscussionObjective.MESSAGE,
+    proposal_service=None,
 ):
     subject_id = uuid4()
     occurrence_id = uuid4()
@@ -814,7 +832,11 @@ def make_worker_runtime(
         )
         events.append(event)
     message = message or "Clarifier l’occurrence sélectionnée."  # noqa: RUF001
-    message_bytes = message.encode()
+    message_bytes = (
+        encode_thread_request(message, "proposal")
+        if objective is EditorialDiscussionObjective.PROPOSAL
+        else message.encode()
+    )
     message_blob_id = uuid4()
     artifact_store.payloads[message_blob_id] = message_bytes
     thread, send_event = thread.append_event(
@@ -880,7 +902,9 @@ def make_worker_runtime(
         },
         {
             "block_id": str(occurrence_id),
-            "kind": "paragraph",
+            "kind": (
+                "title" if objective is EditorialDiscussionObjective.PROPOSAL else "paragraph"
+            ),
             "parent_block_id": None,
             "position": 3,
             "text": "Texte canonique du paragraphe cible.",
@@ -892,6 +916,8 @@ def make_worker_runtime(
                 }
             ],
             "revision_status": "ready",
+            "before_hash": "b" * 64,
+            "allowed_operations": ["rewrite_title"],
         },
         {
             "block_id": str(uuid4()),
@@ -907,6 +933,7 @@ def make_worker_runtime(
     context_blocks[3]["parent_block_id"] = context_blocks[1]["block_id"]
     context_blocks[4]["parent_block_id"] = context_blocks[1]["block_id"]
     workspace_view = {
+        "snapshot_id": str(uuid4()),
         "production_run_id": str(run_id),
         "synthesis_artifact_id": str(current_binding.artifact_id),
         "synthesis_version": current_binding.artifact_version,
@@ -915,7 +942,11 @@ def make_worker_runtime(
     }
     resolution = SimpleNamespace(
         record=SimpleNamespace(production_run_id=run_id),
-        entry=SimpleNamespace(block_id=occurrence_id, source_stage=EditorialSourceStage.SYNTHESIS),
+        entry=SimpleNamespace(
+            block_id=occurrence_id,
+            source_stage=EditorialSourceStage.SYNTHESIS,
+            structural_pointer="/title",
+        ),
         binding_state="valid",
         artifact_id=current_binding.artifact_id,
         artifact_version=current_binding.artifact_version,
@@ -953,12 +984,14 @@ def make_worker_runtime(
         source_docs=source_docs,
         uow=uow,
         failure=failure,
+        objective=objective,
     )
     worker = EditorialThreadWorker(
         uow_factory=uow_factory,
         workspace_service=Workspace(),
         artifact_store=artifact_store,
         model_conversations=model_conversations,
+        proposal_service=proposal_service,
     )
     return worker, repository, artifact_store, model_conversations, message
 
@@ -1310,7 +1343,7 @@ async def test_message_body_shape_and_propose_are_rejected_with_stable_code() ->
         )
         missing_key = await client.post(url, json={"kind": "message", "text": "oui"})
 
-    assert propose.status_code == 409
+    assert propose.status_code == 503
     assert propose.json()["detail"]["code"] == "propose_not_enabled"
     assert missing_key.status_code == 400
     assert missing_key.json()["detail"]["code"] == "idempotency_key_required"
@@ -1364,6 +1397,187 @@ async def test_reconcile_reads_exact_turn_without_second_gateway_call(
     ]
     assert repository.jobs[job.id].state is EditorialThreadJobState.RECONCILIATION_REQUIRED
     assert repository.records[0].events[-1].kind is EditorialThreadEventKind.RECONCILIATION
+
+
+@pytest.mark.asyncio
+async def test_reconciled_proposal_is_prepared_once_from_the_exact_turn_before_job_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject_id, occurrence_id, service, repository, _store, _queued, conversations = make_service(
+        monkeypatch
+    )
+    actor_id = UUID("00000000-0000-0000-0000-000000000099")
+    await service.send_proposal(
+        subject_id,
+        occurrence_id,
+        text="Proposer une reformulation cible.",
+        actor_id=actor_id,
+        idempotency_key="reconcile-proposal-send-0001",
+    )
+    record = repository.records[0]
+    send_event = record.events[0]
+    job = next(iter(repository.jobs.values()))
+    repository.jobs[job.id] = replace(job, state=EditorialThreadJobState.RECONCILIATION_REQUIRED)
+    repository.records[0] = replace(
+        record,
+        thread=replace(record.thread, bridge_status=EditorialBridgeStatus.RECONCILIATION_REQUIRED),
+    )
+    turn_id, model_run_id = uuid4(), uuid4()
+    reply = "@@ TARGET @@\nsynthesis/title\n@@ ACTION @@\nrewrite_title"
+    reply += "\n@@ BASE_ARTIFACT_HASH @@\n" + "a" * 64
+    reply += "\n@@ BEFORE_HASH @@\n" + "b" * 64
+    reply += "\n@@ AFTER @@\nTitre proposé\n@@ RATIONALE @@\nRaison\n@@ END @@"
+    conversations.gateway_calls = 0
+
+    async def exact_turn_content(*_args, **_kwargs):
+        return SimpleNamespace(
+            turn=SimpleNamespace(
+                id=turn_id,
+                model_run_id=model_run_id,
+                objective="editorial_proposal",
+                status=ConversationTurnStatus.SUCCEEDED,
+            ),
+            output_text=reply,
+        )
+
+    async def reconciled_result(*_args, **_kwargs):
+        conversations.reconcile_calls.append(
+            (
+                record.thread.model_conversation_id,
+                record.thread.id,
+                f"editorial-thread-message:{send_event.id}",
+            )
+        )
+        return SimpleNamespace(
+            outcome=EditorialThreadReconciliationOutcome.RECONCILED_REPLY,
+            turn_id=turn_id,
+            reply=reply,
+        )
+
+    monkeypatch.setattr(conversations, "turn_content_by_idempotency_key", exact_turn_content)
+    monkeypatch.setattr(conversations, "_reconcile_editorial_thread_turn", reconciled_result)
+    context = EditorialDiscussionContext(
+        section_title="Section synthétique",
+        block_text="Paragraphe à reformuler.",
+        adjacent_paragraphs=(),
+        admitted_evidence=(),
+        history=(),
+        evidence_pack_hash="b" * 64,
+        context_sha256="c" * 64,
+        effective_tlp=TLP.CLEAR,
+    )
+    prepared_context = SimpleNamespace(
+        record=repository.records[0],
+        send_event=send_event,
+        instruction="Proposer une reformulation cible.",
+        context=context,
+        objective=EditorialDiscussionObjective.PROPOSAL,
+    )
+
+    class ContextBuilder:
+        async def prepare_job(self, requested_job_id):
+            assert requested_job_id == job.id
+            return prepared_context
+
+    calls: list[tuple[UUID, UUID, UUID, str]] = []
+
+    class ProposalService:
+        async def prepare_thread_turn(self, **values):
+            assert repository.jobs[job.id].state is EditorialThreadJobState.RECONCILIATION_REQUIRED
+            assert values["raw_response"] == reply
+            calls.append(
+                (
+                    values["thread_id"],
+                    values["model_run_id"],
+                    values["model_turn_id"],
+                    values["raw_response"],
+                )
+            )
+            return SimpleNamespace(state="proposed")
+
+    service._proposal_service = ProposalService()
+    service._discussion_context_builder = ContextBuilder()
+
+    first = await service.reconcile(
+        subject_id,
+        occurrence_id,
+        actor_id=actor_id,
+        idempotency_key="reconcile-proposal-key-0001",
+    )
+    replay = await service.reconcile(
+        subject_id,
+        occurrence_id,
+        actor_id=actor_id,
+        idempotency_key="reconcile-proposal-key-0001",
+    )
+
+    assert first.outcome is EditorialThreadReconciliationOutcome.RECONCILED_REPLY
+    assert replay == first
+    assert calls == [(record.thread.id, model_run_id, turn_id, reply)]
+    assert conversations.gateway_calls == 0
+    assert repository.jobs[job.id].state is EditorialThreadJobState.COMPLETE
+    assert not any(
+        event.kind is EditorialThreadEventKind.BRIDGE_REPLY
+        for event in repository.records[0].events
+    )
+
+
+@pytest.mark.asyncio
+async def test_reconciled_message_still_becomes_a_bridge_reply_without_proposal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject_id, occurrence_id, service, repository, _store, _queued, conversations = make_service(
+        monkeypatch
+    )
+    actor_id = UUID("00000000-0000-0000-0000-000000000099")
+    await service.send_message(
+        subject_id,
+        occurrence_id,
+        text="Message destiné à Bridge.",
+        actor_id=actor_id,
+        idempotency_key="reconcile-message-send-0001",
+    )
+    record = repository.records[0]
+    job = next(iter(repository.jobs.values()))
+    repository.jobs[job.id] = replace(job, state=EditorialThreadJobState.RECONCILIATION_REQUIRED)
+    repository.records[0] = replace(
+        record,
+        thread=replace(record.thread, bridge_status=EditorialBridgeStatus.RECONCILIATION_REQUIRED),
+    )
+    reply = "Réponse Bridge reprise pour un message."
+    turn_id = uuid4()
+
+    async def reconciled_result(*_args, **_kwargs):
+        return SimpleNamespace(
+            outcome=EditorialThreadReconciliationOutcome.RECONCILED_REPLY,
+            turn_id=turn_id,
+            reply=reply,
+        )
+
+    async def exact_turn_content(*_args, **_kwargs):
+        return SimpleNamespace(
+            turn=SimpleNamespace(id=turn_id, objective="editorial_message"),
+            output_text=reply,
+        )
+
+    monkeypatch.setattr(conversations, "_reconcile_editorial_thread_turn", reconciled_result)
+    monkeypatch.setattr(conversations, "turn_content_by_idempotency_key", exact_turn_content)
+
+    result = await service.reconcile(
+        subject_id,
+        occurrence_id,
+        actor_id=actor_id,
+        idempotency_key="reconcile-message-key-0001",
+    )
+
+    assert result.outcome is EditorialThreadReconciliationOutcome.RECONCILED_REPLY
+    assert repository.jobs[job.id].state is EditorialThreadJobState.COMPLETE
+    reply_event = next(
+        event
+        for event in repository.records[0].events
+        if event.kind is EditorialThreadEventKind.BRIDGE_REPLY
+    )
+    assert _store.payloads[reply_event.payload_blob_ref] == reply.encode("utf-8")
 
 
 @pytest.mark.asyncio
@@ -1836,7 +2050,7 @@ async def test_propose_api_is_refused_until_unique_adoption_is_ready() -> None:
             headers={"Idempotency-Key": "proposal-key-0001"},
         )
 
-    assert response.status_code == 409
+    assert response.status_code == 503
     assert response.json()["detail"]["code"] == "propose_not_enabled"
 
 
@@ -1875,7 +2089,7 @@ async def test_thread_binding_stale_blocks_message_and_propose_gate(
         )
 
     # The API's M3 activation gate is evaluated before thread binding.
-    assert proposal.status_code == 409
+    assert proposal.status_code == 503
     assert proposal.json()["detail"]["code"] == "propose_not_enabled"
     assert repository.records == []
     assert queued == []
@@ -2190,6 +2404,36 @@ async def test_message_context_is_rebuilt_and_policy_checked_before_gateway() ->
     assert context.effective_tlp is TLP.CLEAR
     assert model_conversations.source_docs.requested
     assert repository.jobs[job_id].state is EditorialThreadJobState.COMPLETE
+
+
+@pytest.mark.asyncio
+async def test_message_context_keeps_a_bridge_reply_that_matches_the_request_envelope_raw() -> None:
+    worker, repository, store, model_conversations, _message = make_worker_runtime()
+    bridge_reply = encode_thread_request("Bridge returned this complete v1 envelope.", "proposal")
+    reply_event = next(
+        event
+        for event in repository.record.events
+        if event.kind is EditorialThreadEventKind.BRIDGE_REPLY
+    )
+    assert reply_event.payload_blob_ref is not None
+    store.payloads[reply_event.payload_blob_ref] = bridge_reply
+    repository.record = replace(
+        repository.record,
+        events=tuple(
+            replace(event, payload_sha256=hashlib.sha256(bridge_reply).hexdigest())
+            if event.id == reply_event.id
+            else event
+            for event in repository.record.events
+        ),
+    )
+    job_id = next(iter(repository.jobs))
+
+    await worker.process(job_id)
+
+    assert model_conversations.add_arguments is not None
+    context = model_conversations.add_arguments["editorial_context"]
+    assert isinstance(context, EditorialDiscussionContext)
+    assert context.history[-1] == ("Bridge", bridge_reply.decode("utf-8"))
 
 
 @pytest.mark.asyncio
@@ -2665,7 +2909,7 @@ def test_editorial_prompt_encodes_all_untrusted_fields_inside_nonce_envelope() -
     end_marker = f"<<<END_EDITORIAL_DATA:{nonce}>>>"
     payload = prompt.split(start_marker, 1)[1].split(end_marker, 1)[0].strip()
 
-    assert EDITORIAL_DISCUSSION_PROMPT_VERSION == "2"
+    assert EDITORIAL_DISCUSSION_PROMPT_VERSION == "3"
     assert prompt.count(marker) == 1
     assert prompt.count("<<<END_EDITORIAL_DATA:") == 1
     assert "\nPREUVES ADMISES:" not in prompt

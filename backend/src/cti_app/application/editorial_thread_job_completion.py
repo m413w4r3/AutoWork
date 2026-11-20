@@ -6,13 +6,17 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Protocol
 from uuid import UUID
 
 from cti_app.application.editorial_conversation_turns import (
+    EditorialDiscussionObjective,
     has_persisted_not_submitted_proof,
 )
+from cti_app.application.editorial_thread_common import is_editorial_turn_objective
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.domain.editorial_proposal import EditorialProposalState
 from cti_app.domain.editorial_thread import (
     EditorialBridgeStatus,
     EditorialThreadEvent,
@@ -23,6 +27,59 @@ from cti_app.domain.editorial_thread import (
 from cti_app.domain.model_conversations import ConversationTurnStatus
 from cti_app.domain.model_runs import ModelSubmissionState
 
+if TYPE_CHECKING:
+    from cti_app.application.editorial_conversation_turns import EditorialDiscussionContext
+    from cti_app.application.editorial_discussion_context import PreparedEditorialDiscussion
+    from cti_app.domain.editorial_proposal import EditorialProposal
+
+
+class _ThreadProposalService(Protocol):
+    async def prepare_thread_turn(
+        self,
+        *,
+        thread_id: UUID,
+        actor_id: UUID,
+        model_run_id: UUID,
+        model_turn_id: UUID,
+        instruction: str,
+        raw_response: str,
+        context: EditorialDiscussionContext,
+    ) -> EditorialProposal: ...
+
+
+class _PreparedProposal(Protocol):
+    @property
+    def state(self) -> EditorialProposalState: ...
+
+
+async def prepare_editorial_thread_proposal(
+    proposal_service: _ThreadProposalService,
+    prepared: PreparedEditorialDiscussion,
+    *,
+    expected_thread_id: UUID,
+    expected_send_event_id: UUID,
+    model_run_id: UUID,
+    model_turn_id: UUID,
+    raw_response: str,
+) -> _PreparedProposal:
+    """Use the worker's exact-turn preparation path for normal and recovered replies."""
+    if (
+        prepared.objective is not EditorialDiscussionObjective.PROPOSAL
+        or prepared.record.thread.id != expected_thread_id
+        or prepared.send_event.id != expected_send_event_id
+        or prepared.send_event.actor_id is None
+    ):
+        raise ValueError("editorial_thread_proposal_turn_mismatch")
+    return await proposal_service.prepare_thread_turn(
+        thread_id=prepared.record.thread.id,
+        actor_id=prepared.send_event.actor_id,
+        model_run_id=model_run_id,
+        model_turn_id=model_turn_id,
+        instruction=prepared.instruction,
+        raw_response=raw_response,
+        context=prepared.context,
+    )
+
 
 @dataclass(frozen=True, slots=True)
 class EditorialThreadReplyOutcome:
@@ -30,6 +87,12 @@ class EditorialThreadReplyOutcome:
     send_event: EditorialThreadEvent
     turn_id: UUID
     reply: str
+
+
+@dataclass(frozen=True, slots=True)
+class EditorialThreadProposalOutcome:
+    thread_id: UUID
+    proposal_state: EditorialProposalState
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +122,7 @@ class EditorialThreadSessionLostOutcome:
 
 type EditorialThreadJobOutcome = (
     EditorialThreadReplyOutcome
+    | EditorialThreadProposalOutcome
     | EditorialThreadRefusalOutcome
     | EditorialThreadStateOutcome
     | EditorialThreadFailureOutcome
@@ -86,6 +150,8 @@ class EditorialThreadJobCompletion:
     ) -> None:
         if isinstance(outcome, EditorialThreadReplyOutcome):
             await self._reply(job_id, lease_token, outcome)
+        elif isinstance(outcome, EditorialThreadProposalOutcome):
+            await self._proposal(job_id, lease_token, outcome)
         elif isinstance(outcome, EditorialThreadRefusalOutcome):
             await self._refusal(job_id, lease_token, outcome)
         elif isinstance(outcome, EditorialThreadFailureOutcome):
@@ -152,6 +218,25 @@ class EditorialThreadJobCompletion:
                 outcome.thread_id, EditorialBridgeStatus.REPLY_AVAILABLE
             )
             await uow.commit()
+
+    async def _proposal(
+        self,
+        job_id: UUID,
+        lease_token: UUID,
+        outcome: EditorialThreadProposalOutcome,
+    ) -> None:
+        status = (
+            EditorialBridgeStatus.REFUSED
+            if outcome.proposal_state is EditorialProposalState.REFUSED
+            else EditorialBridgeStatus.REPLY_AVAILABLE
+        )
+        await self._set_state(
+            job_id,
+            outcome.thread_id,
+            lease_token,
+            EditorialThreadJobState.COMPLETE,
+            status,
+        )
 
     async def _refusal(
         self,
@@ -268,7 +353,7 @@ class EditorialThreadJobCompletion:
                 turn is None
                 or record is None
                 or turn.conversation_id != record.thread.model_conversation_id
-                or turn.objective != "editorial_message"
+                or not is_editorial_turn_objective(turn.objective)
             ):
                 return None
             return turn.error_code
@@ -315,7 +400,7 @@ class EditorialThreadJobCompletion:
                     ConversationTurnStatus.NEEDS_REVIEW,
                 }
                 or turn.conversation_id != record.thread.model_conversation_id
-                or turn.objective != "editorial_message"
+                or not is_editorial_turn_objective(turn.objective)
             ):
                 return None
             run = await uow.model_runs.get(turn.model_run_id)

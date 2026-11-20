@@ -8,6 +8,7 @@ from enum import StrEnum
 from uuid import UUID
 
 from cti_app.application.editorial_conversation_turns import has_persisted_not_submitted_proof
+from cti_app.application.editorial_thread_common import is_editorial_turn_objective
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.domain.editorial_bridge_generation_slot import (
     BridgeGenerationPreviousOutcome,
@@ -221,7 +222,7 @@ class EditorialBridgeGate:
                 or run is None
                 or turn.conversation_id != record.thread.model_conversation_id
                 or turn.idempotency_key != lease.turn_idempotency_key
-                or turn.objective != "editorial_message"
+                or not is_editorial_turn_objective(turn.objective)
                 or run.backend is not ModelBackend.CHATGPT_BRIDGE
                 or not (
                     has_persisted_not_submitted_proof(turn, run)
@@ -270,7 +271,7 @@ class EditorialBridgeGate:
                 turn is not None
                 and record is not None
                 and turn.conversation_id == record.thread.model_conversation_id
-                and turn.objective == "editorial_message"
+                and is_editorial_turn_objective(turn.objective)
                 and run is not None
                 and run.backend is ModelBackend.CHATGPT_BRIDGE
             )
@@ -345,7 +346,7 @@ class EditorialBridgeGate:
             if (
                 turn.conversation_id != record.thread.model_conversation_id
                 or turn.idempotency_key != idempotency_key
-                or turn.objective != "editorial_message"
+                or not is_editorial_turn_objective(turn.objective)
             ):
                 return BridgeGenerationPreviousOutcome.UNKNOWN, True
             run = await uow.model_runs.get(turn.model_run_id)

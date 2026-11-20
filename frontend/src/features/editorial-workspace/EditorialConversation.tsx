@@ -12,6 +12,7 @@ interface EditorialConversationProps {
   occurrenceId: string;
   snapshotId: string;
   targetLabel: string;
+  allowedOperations?: readonly string[];
   onChangeTarget: () => void;
 }
 
@@ -20,6 +21,7 @@ export function EditorialConversation({
   occurrenceId,
   snapshotId,
   targetLabel,
+  allowedOperations = [],
   onChangeTarget,
 }: EditorialConversationProps) {
   const drafts = useEditorialConversationDrafts(occurrenceId);
@@ -78,8 +80,8 @@ export function EditorialConversation({
     if (lifecycle.controlsLocked) controlsWereLockedRef.current = true;
   }, [lifecycle.controlsLocked, lifecycle.submissionUncertain, occurrenceId]);
 
-  function submitMessage() {
-    if (lifecycle.submitMessage(drafts.draft))
+  function submitMessage(kind: "message" | "propose") {
+    if (lifecycle.submitMessage(drafts.draft, kind))
       focusAfterSubmitRef.current = occurrenceId;
   }
 
@@ -139,10 +141,16 @@ export function EditorialConversation({
         <EditorialConversationComposer
           draft={drafts.draft}
           active={lifecycle.active}
+          canPropose={allowedOperations.some(
+            (operation) =>
+              operation === "rewrite_title" ||
+              operation === "rewrite_paragraph",
+          )}
           controlsLocked={lifecycle.controlsLocked}
           hasQueryError={lifecycle.threadQuery.isError}
           sendPending={lifecycle.sendState.isPending}
           sendSuccess={lifecycle.sendState.isSuccess}
+          sendKind={lifecycle.submissionKind}
           sendErrorMessage={
             lifecycle.sendState.isError
               ? lifecycle.sendState.errorMessage

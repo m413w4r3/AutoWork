@@ -186,6 +186,7 @@ def recover_abandoned_jobs() -> None:
 
 
 async def _execute_editorial_thread_job(job_id: UUID) -> int | None:
+    from cti_app.application.editorial_proposals import EditorialProposalService
     from cti_app.application.editorial_workspace import EditorialWorkspaceService
     from cti_app.workers.editorial_threads import EditorialThreadWorker
 
@@ -216,13 +217,20 @@ async def _execute_editorial_thread_job(job_id: UUID) -> int | None:
             retention_days=settings.model_conversation_retention_days,
             conversation_session_closer=bridge_provider,
         )
+        workspace_service = EditorialWorkspaceService(
+            uow_factory=uow_factory, artifact_store=artifact_store
+        )
         worker = EditorialThreadWorker(
             uow_factory=uow_factory,
-            workspace_service=EditorialWorkspaceService(
-                uow_factory=uow_factory, artifact_store=artifact_store
-            ),
+            workspace_service=workspace_service,
             artifact_store=artifact_store,
             model_conversations=model_conversations,
+            proposal_service=EditorialProposalService(
+                uow_factory=uow_factory,
+                blob_store=blob_store,
+                artifact_store=artifact_store,
+                workspace_service=workspace_service,
+            ),
         )
         return await worker.process(job_id)
     finally:

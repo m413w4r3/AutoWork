@@ -6,9 +6,13 @@ import hashlib
 import json
 import logging
 from collections.abc import Callable
+from typing import Literal
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from cti_app.application.editorial_thread_common import is_valid_editorial_idempotency_key
+from cti_app.application.editorial_thread_common import (
+    encode_thread_request,
+    is_valid_editorial_idempotency_key,
+)
 from cti_app.application.editorial_thread_types import (
     EditorialThreadApplicationError,
     EditorialThreadSendResult,
@@ -62,15 +66,16 @@ class EditorialThreadMessages:
         text: str,
         actor_id: UUID,
         idempotency_key: str,
+        request_kind: Literal["message", "proposal"] = "message",
     ) -> EditorialThreadSendResult:
         """Append a message and durable job after resolving the current occurrence."""
-        if not text.strip():
+        if not text.strip() or request_kind not in {"message", "proposal"}:
             raise EditorialThreadApplicationError("editorial_message_invalid")
         if not is_valid_editorial_idempotency_key(idempotency_key):
             raise EditorialThreadApplicationError("idempotency_key_invalid")
         payload_digest = hashlib.sha256(
             json.dumps(
-                {"kind": "message", "text": text},
+                {"kind": request_kind, "text": text},
                 ensure_ascii=False,
                 sort_keys=True,
                 separators=(",", ":"),
@@ -192,7 +197,7 @@ class EditorialThreadMessages:
                 except Exception:
                     raise EditorialThreadApplicationError("thread_not_found") from None
 
-        body = text.encode("utf-8")
+        body = encode_thread_request(text, request_kind)
         try:
             blob_id = await self._artifact_store.put_bytes(
                 body,

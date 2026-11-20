@@ -1,4 +1,4 @@
-"""Durable execution for message-only editorial Bridge jobs."""
+"""Durable execution for editorial message and proposal Bridge jobs."""
 
 from __future__ import annotations
 
@@ -13,13 +13,16 @@ from cti_app.application.editorial_bridge_gate import (
 )
 from cti_app.application.editorial_conversation_turns import EditorialDiscussionObjective
 from cti_app.application.editorial_discussion_context import EditorialDiscussionContextBuilder
+from cti_app.application.editorial_proposals import EditorialProposalService
 from cti_app.application.editorial_thread_job_completion import (
     EditorialThreadFailureOutcome,
     EditorialThreadJobCompletion,
+    EditorialThreadProposalOutcome,
     EditorialThreadRefusalOutcome,
     EditorialThreadReplyOutcome,
     EditorialThreadSessionLostOutcome,
     EditorialThreadStateOutcome,
+    prepare_editorial_thread_proposal,
 )
 from cti_app.application.editorial_threads import EditorialThreadApplicationError
 from cti_app.application.editorial_workspace import EditorialWorkspaceService
@@ -31,6 +34,7 @@ from cti_app.application.model_conversations import (
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.domain.editorial_bridge_generation_slot import EditorialBridgeGenerationLease
+from cti_app.domain.editorial_proposal import EditorialProposalState
 from cti_app.domain.editorial_thread import (
     EditorialBridgeStatus,
     EditorialThreadJobState,
@@ -64,6 +68,7 @@ class EditorialThreadWorker:
         workspace_service: EditorialWorkspaceService,
         artifact_store: ProductionArtifactStore,
         model_conversations: ModelConversationService,
+        proposal_service: EditorialProposalService | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._context_builder = EditorialDiscussionContextBuilder(
@@ -76,6 +81,7 @@ class EditorialThreadWorker:
             artifact_store=artifact_store,
         )
         self._model_conversations = model_conversations
+        self._proposal_service = proposal_service
         self._bridge_gate = EditorialBridgeGate(uow_factory)
 
     async def process(self, job_id: UUID) -> int | None:
@@ -144,6 +150,24 @@ class EditorialThreadWorker:
             ):
                 await self._close_reconciliation(job_id, record.thread.id, lease_token)
                 return None
+            if current.objective is EditorialDiscussionObjective.PROPOSAL and (
+                self._proposal_service is None
+                or current.context.proposal_snapshot_id is None
+                or current.context.proposal_before_hash is None
+                or current.context.proposal_base_sha256 is None
+                or not current.context.proposal_operations
+            ):
+                refusal_code = (
+                    "proposal_operation_unsupported"
+                    if not current.context.proposal_operations
+                    else "editorial_context_unavailable"
+                )
+                await self._refuse_context_error(
+                    job_id,
+                    lease_token,
+                    EditorialThreadApplicationError(refusal_code),
+                )
+                return None
             turn_idempotency_key = f"editorial-thread-message:{current.send_event.id}"
             assert turn_idempotency_key is not None
             gate_attempt = await self._bridge_gate.acquire(
@@ -184,7 +208,7 @@ class EditorialThreadWorker:
                 correlation_id=str(job_id),
                 context_subject_id=record.thread.origin.subject_id,
                 _editorial_thread_id=record.thread.id,
-                editorial_objective=EditorialDiscussionObjective.MESSAGE,
+                editorial_objective=current.objective,
                 editorial_context=current.context,
             )
         except EditorialThreadApplicationError as error:
@@ -302,7 +326,7 @@ class EditorialThreadWorker:
             return None
 
         if (
-            turn.objective != "editorial_message"
+            turn.objective != f"editorial_{current.objective.value}"
             or turn.status is not ConversationTurnStatus.SUCCEEDED
         ):
             await self._close_reconciliation(job_id, record.thread.id, lease_token)
@@ -315,6 +339,37 @@ class EditorialThreadWorker:
         content = next((item for item in contents if item.turn.id == turn.id), None)
         if content is None or not content.output_text:
             await self._close_reconciliation(job_id, record.thread.id, lease_token)
+            return None
+        if current.objective is EditorialDiscussionObjective.PROPOSAL:
+            if self._proposal_service is None or send_event.actor_id is None:
+                await self._close_failed(job_id, record.thread.id, lease_token)
+                return None
+            try:
+                proposal = await prepare_editorial_thread_proposal(
+                    self._proposal_service,
+                    current,
+                    expected_thread_id=record.thread.id,
+                    expected_send_event_id=send_event.id,
+                    model_run_id=turn.model_run_id,
+                    model_turn_id=turn.id,
+                    raw_response=content.output_text,
+                )
+            except Exception as error:
+                logger.warning(
+                    "editorial_thread_proposal_completion_failed job_id=%s error_type=%s",
+                    job_id,
+                    type(error).__name__,
+                )
+                await self._close_failed(job_id, record.thread.id, lease_token)
+                return None
+            await self._completion.close(
+                job_id,
+                lease_token,
+                EditorialThreadProposalOutcome(
+                    thread_id=record.thread.id,
+                    proposal_state=EditorialProposalState(proposal.state),
+                ),
+            )
             return None
         await self._completion.close(
             job_id,
@@ -335,6 +390,11 @@ class EditorialThreadWorker:
             outcome = EditorialThreadRefusalOutcome(
                 reason_code=error.code,
                 message=EDITORIAL_THREAD_POLICY_REFUSAL,
+            )
+        elif error.code == "proposal_operation_unsupported":
+            outcome = EditorialThreadRefusalOutcome(
+                reason_code=error.code,
+                message="Aucune opération de proposition sûre n’est disponible pour ce bloc.",  # noqa: RUF001
             )
         else:
             outcome = EditorialThreadRefusalOutcome(

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import re
+from typing import Literal
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from cti_app.application.editorial_thread_types import EditorialThreadApplicationError
@@ -17,6 +19,45 @@ from cti_app.domain.editorial_workspace import EditorialWorkspaceError
 
 # Editorial HTTP idempotency keys are opaque tokens: ^[A-Za-z0-9_-]{16,128}$.
 _EDITORIAL_IDEMPOTENCY_KEY = re.compile(r"[A-Za-z0-9_-]{16,128}")
+_EDITORIAL_REQUEST_SCHEMA = "editorial-thread-request-v1"
+
+
+def encode_thread_request(text: str, objective: Literal["message", "proposal"]) -> bytes:
+    return json.dumps(
+        {
+            "schema_version": _EDITORIAL_REQUEST_SCHEMA,
+            "objective": objective,
+            "instruction": text,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def decode_thread_request(body: bytes) -> tuple[Literal["message", "proposal"], str]:
+    """Read the versioned request envelope and retain compatibility with M2 text blobs."""
+    try:
+        value = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        value = None
+    if (
+        isinstance(value, dict)
+        and value.get("schema_version") == _EDITORIAL_REQUEST_SCHEMA
+        and value.get("objective") in {"message", "proposal"}
+        and isinstance(value.get("instruction"), str)
+        and set(value) == {"schema_version", "objective", "instruction"}
+    ):
+        objective = value["objective"]
+        return objective, value["instruction"]
+    try:
+        return "message", body.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("editorial_thread_message_corrupt") from None
+
+
+def is_editorial_turn_objective(value: str | None) -> bool:
+    return value in {"editorial_message", "editorial_proposal"}
 
 
 def is_valid_editorial_idempotency_key(value: str) -> bool:

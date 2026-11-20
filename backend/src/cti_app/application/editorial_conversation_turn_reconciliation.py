@@ -9,6 +9,7 @@ from cti_app.application.editorial_conversation_turns import (
     EditorialTurnReconciliation,
     has_persisted_not_submitted_proof,
 )
+from cti_app.application.editorial_thread_common import is_editorial_turn_objective
 from cti_app.domain.editorial_thread import EditorialThreadReconciliationOutcome
 from cti_app.domain.model_conversations import (
     ConversationPurpose,
@@ -51,7 +52,7 @@ async def reconcile_editorial_turn(
         turn = await uow.model_conversation_turns.get_by_idempotency_key(turn_idempotency_key)
         if turn is None or turn.conversation_id != conversation_id:
             return EditorialTurnReconciliation(EditorialThreadReconciliationOutcome.STILL_UNKNOWN)
-        if turn.objective != "editorial_message":
+        if not is_editorial_turn_objective(turn.objective):
             return EditorialTurnReconciliation(
                 EditorialThreadReconciliationOutcome.STILL_UNKNOWN,
                 turn_id=turn.id,
@@ -122,7 +123,7 @@ async def reconcile_editorial_turn(
                 )
             if (
                 turn.conversation_id != conversation_id
-                or turn.objective != "editorial_message"
+                or not is_editorial_turn_objective(turn.objective)
                 or not has_persisted_not_submitted_proof(turn, run)
             ):
                 return EditorialTurnReconciliation(

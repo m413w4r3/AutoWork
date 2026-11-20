@@ -8,9 +8,10 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from uuid import UUID
 
+from cti_app.application.editorial_thread_common import decode_thread_request
 from cti_app.application.editorial_thread_messages import EditorialThreadMessages
 from cti_app.application.editorial_thread_reconciliation import (
     EditorialThreadReconciliation,
@@ -41,6 +42,10 @@ from cti_app.domain.editorial_thread import (
     EditorialThreadRecord,
 )
 from cti_app.domain.editorial_workspace import EditorialWorkspaceError
+
+if TYPE_CHECKING:
+    from cti_app.application.editorial_discussion_context import EditorialDiscussionContextBuilder
+    from cti_app.application.editorial_proposals import EditorialProposalService
 
 logger = logging.getLogger(__name__)
 
@@ -121,12 +126,16 @@ class EditorialThreadService:
         artifact_store: ProductionArtifactStore,
         model_conversations: ModelConversationService | None = None,
         enqueue_job: Callable[[UUID], None] | None = None,
+        proposal_service: EditorialProposalService | None = None,
+        discussion_context_builder: EditorialDiscussionContextBuilder | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._workspace = workspace_service
         self._artifact_store = artifact_store
         self._model_conversations = model_conversations
         self._enqueue_job = enqueue_job
+        self._proposal_service = proposal_service
+        self._discussion_context_builder = discussion_context_builder
 
     async def read(
         self,
@@ -292,6 +301,8 @@ class EditorialThreadService:
             workspace_service=self._workspace,
             artifact_store=self._artifact_store,
             model_conversations=self._model_conversations,
+            proposal_service=self._proposal_service,
+            discussion_context_builder=self._discussion_context_builder,
         ).reconcile(
             subject_id,
             occurrence_id,
@@ -307,6 +318,7 @@ class EditorialThreadService:
         text: str,
         actor_id: UUID,
         idempotency_key: str,
+        request_kind: Literal["message", "proposal"] = "message",
     ) -> EditorialThreadSendResult:
         return await EditorialThreadMessages(
             uow_factory=self._uow_factory,
@@ -320,6 +332,25 @@ class EditorialThreadService:
             text=text,
             actor_id=actor_id,
             idempotency_key=idempotency_key,
+            request_kind=request_kind,
+        )
+
+    async def send_proposal(
+        self,
+        subject_id: UUID,
+        occurrence_id: UUID,
+        *,
+        text: str,
+        actor_id: UUID,
+        idempotency_key: str,
+    ) -> EditorialThreadSendResult:
+        return await self.send_message(
+            subject_id,
+            occurrence_id,
+            text=text,
+            actor_id=actor_id,
+            idempotency_key=idempotency_key,
+            request_kind="proposal",
         )
 
     async def append_event(
@@ -367,8 +398,13 @@ class EditorialThreadService:
                 if hashlib.sha256(body).hexdigest() != event.payload_sha256:
                     raise EditorialThreadApplicationError("thread_body_hash_mismatch") from None
                 try:
-                    body_text = body.decode("utf-8")
+                    if event.kind is EditorialThreadEventKind.USER_MESSAGE:
+                        _objective, body_text = decode_thread_request(body)
+                    else:
+                        body_text = body.decode("utf-8")
                 except UnicodeDecodeError:
+                    raise EditorialThreadApplicationError("thread_body_unavailable") from None
+                except ValueError:
                     raise EditorialThreadApplicationError("thread_body_unavailable") from None
                 if event.kind is EditorialThreadEventKind.RECONCILIATION:
                     body_text = _reconciliation_message(body)

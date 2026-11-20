@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from cti_app.application.editorial_thread_common import (
@@ -12,6 +13,7 @@ from cti_app.application.editorial_thread_common import (
     _same_thread_scope,
     is_valid_editorial_idempotency_key,
 )
+from cti_app.application.editorial_thread_job_completion import prepare_editorial_thread_proposal
 from cti_app.application.editorial_thread_types import (
     EditorialThreadApplicationError,
     EditorialThreadReconciliationResult,
@@ -21,6 +23,7 @@ from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.domain.editorial_bridge_generation_slot import BridgeGenerationSlotState
+from cti_app.domain.editorial_proposal import EditorialProposalState
 from cti_app.domain.editorial_thread import (
     EditorialBridgeStatus,
     EditorialThreadEvent,
@@ -28,6 +31,10 @@ from cti_app.domain.editorial_thread import (
     EditorialThreadJobState,
     EditorialThreadReconciliationOutcome,
 )
+
+if TYPE_CHECKING:
+    from cti_app.application.editorial_discussion_context import EditorialDiscussionContextBuilder
+    from cti_app.application.editorial_proposals import EditorialProposalService
 
 _RECONCILIATION_MESSAGES = {
     EditorialThreadReconciliationOutcome.RECONCILED_REPLY: (
@@ -55,11 +62,15 @@ class EditorialThreadReconciliation:
         workspace_service: EditorialWorkspaceService,
         artifact_store: ProductionArtifactStore,
         model_conversations: ModelConversationService | None,
+        proposal_service: EditorialProposalService | None = None,
+        discussion_context_builder: EditorialDiscussionContextBuilder | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._workspace = workspace_service
         self._artifact_store = artifact_store
         self._model_conversations = model_conversations
+        self._proposal_service = proposal_service
+        self._discussion_context_builder = discussion_context_builder
 
     async def reconcile(
         self,
@@ -185,16 +196,53 @@ class EditorialThreadReconciliation:
         message = _RECONCILIATION_MESSAGES[outcome]
         reply_blob: UUID | None = None
         reply_digest: str | None = None
+        recovered_proposal_state: EditorialProposalState | None = None
         if outcome is EditorialThreadReconciliationOutcome.RECONCILED_REPLY:
             if turn_result is None or not turn_result.reply:
                 outcome = EditorialThreadReconciliationOutcome.STILL_UNKNOWN
                 message = _RECONCILIATION_MESSAGES[outcome]
             else:
-                reply = turn_result.reply.encode("utf-8")
-                reply_digest = hashlib.sha256(reply).hexdigest()
-                reply_blob = await self._artifact_store.put_bytes(
-                    reply, bucket="editorial-thread-events", mime_type="text/plain; charset=utf-8"
-                )
+                turn = turn_content.turn if turn_content is not None else None
+                if turn is not None and getattr(turn, "objective", None) == "editorial_proposal":
+                    if (
+                        self._proposal_service is None
+                        or self._discussion_context_builder is None
+                        or turn_content is None
+                        or turn.model_run_id is None
+                        or turn.id != turn_result.turn_id
+                        or turn_content.output_text != turn_result.reply
+                    ):
+                        raise EditorialThreadApplicationError(
+                            "editorial_thread_service_unavailable"
+                        )
+                    try:
+                        prepared = await self._discussion_context_builder.prepare_job(job.id)
+                        if prepared.send_event.id != send_event.id:
+                            raise ValueError("editorial_thread_send_event_changed")
+                        proposal = await prepare_editorial_thread_proposal(
+                            self._proposal_service,
+                            prepared,
+                            expected_thread_id=thread.id,
+                            expected_send_event_id=send_event.id,
+                            model_run_id=turn.model_run_id,
+                            model_turn_id=turn.id,
+                            raw_response=turn_result.reply,
+                        )
+                    except Exception:
+                        # Leave the job reconciliation-required. The exact turn and
+                        # proposal idempotency key make this preparation safe to replay.
+                        raise EditorialThreadApplicationError(
+                            "editorial_thread_service_unavailable"
+                        ) from None
+                    recovered_proposal_state = proposal.state
+                else:
+                    reply = turn_result.reply.encode("utf-8")
+                    reply_digest = hashlib.sha256(reply).hexdigest()
+                    reply_blob = await self._artifact_store.put_bytes(
+                        reply,
+                        bucket="editorial-thread-events",
+                        mime_type="text/plain; charset=utf-8",
+                    )
 
         reconciliation_payload = json.dumps(
             {"outcome": outcome.value, "message": message},
@@ -303,6 +351,11 @@ class EditorialThreadReconciliation:
                         EditorialBridgeStatus.SESSION_LOST
                     ),
                 }[recorded_result.outcome]
+                if (
+                    recorded_result.outcome is EditorialThreadReconciliationOutcome.RECONCILED_REPLY
+                    and recovered_proposal_state is EditorialProposalState.REFUSED
+                ):
+                    recorded_bridge_status = EditorialBridgeStatus.REFUSED
                 await uow.editorial_threads.set_job_state(job.id, recorded_job_state)
                 await uow.editorial_threads.set_bridge_status(thread.id, recorded_bridge_status)
                 await uow.commit()

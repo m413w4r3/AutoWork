@@ -422,6 +422,9 @@ _ERROR_MESSAGES = {
         "Le contenu de cette discussion ne correspond plus à son empreinte."
     ),
     "propose_not_enabled": "La proposition n’est pas encore activée.",  # noqa: RUF001
+    "proposal_operation_unsupported": (
+        "Aucune opération de proposition sûre n’est disponible pour ce bloc."  # noqa: RUF001
+    ),
     "editorial_thread_busy": "Une réponse est déjà en cours pour ce paragraphe.",
     "external_llm_blocked": "La politique interdit l’envoi externe de ce contenu.",  # noqa: RUF001
     "bridge_unavailable": "Le Bridge est indisponible. Actualisez avant de continuer.",
@@ -544,14 +547,52 @@ def _proposal_adoption_service(request: Request) -> EditorialProposalAdoptionSer
     )
 
 
+def _require_proposal_writer(request: Request) -> None:
+    """Fail closed unless the production unique adoption writer is constructible."""
+    try:
+        service = _proposal_adoption_service(request)
+    except Exception:
+        service = None
+    if service is None or not callable(getattr(service, "adopt", None)):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "propose_not_enabled",
+                "message": _ERROR_MESSAGES["propose_not_enabled"],
+            },
+        ) from None
+
+
 def _thread_service(request: Request) -> EditorialThreadService:
+    from cti_app.application.editorial_discussion_context import (
+        EditorialDiscussionContextBuilder,
+    )
+
     workspace_service = _service(request)
+    artifact_store = request.app.state.production_artifact_store
+    blob_store = getattr(request.app.state, "blob_store", None)
+    proposal_service = (
+        EditorialProposalService(
+            uow_factory=request.app.state.uow_factory,
+            blob_store=blob_store,
+            artifact_store=artifact_store,
+            workspace_service=workspace_service,
+        )
+        if blob_store is not None
+        else None
+    )
     return EditorialThreadService(
         uow_factory=request.app.state.uow_factory,
         workspace_service=workspace_service,
-        artifact_store=request.app.state.production_artifact_store,
+        artifact_store=artifact_store,
         model_conversations=getattr(request.app.state, "model_conversation_service", None),
         enqueue_job=_enqueue_editorial_thread_job,
+        proposal_service=proposal_service,
+        discussion_context_builder=EditorialDiscussionContextBuilder(
+            uow_factory=request.app.state.uow_factory,
+            workspace_service=workspace_service,
+            artifact_store=artifact_store,
+        ),
     )
 
 
@@ -913,14 +954,6 @@ async def send_editorial_thread_entry(
                 "message": _ERROR_MESSAGES["idempotency_key_invalid"],
             },
         )
-    if payload.get("kind") == "propose":
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "code": "propose_not_enabled",
-                "message": _ERROR_MESSAGES["propose_not_enabled"],
-            },
-        )
     if idempotency_key is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -929,13 +962,16 @@ async def send_editorial_thread_entry(
                 "message": _ERROR_MESSAGES["idempotency_key_required"],
             },
         )
+    request_kind = payload.get("kind")
     start_new_session = payload.get("start_new_session") is True
+    if request_kind == "propose":
+        _require_proposal_writer(request)
     allowed_shape = (
         set(payload) == {"kind", "start_new_session"}
         if start_new_session
         else set(payload) == {"kind", "text"}
     )
-    if not allowed_shape or payload.get("kind") != "message":
+    if not allowed_shape or request_kind not in {"message", "propose"}:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={
@@ -968,13 +1004,22 @@ async def send_editorial_thread_entry(
             )
         if not isinstance(text_value, str):
             raise EditorialThreadApplicationError("editorial_message_invalid")
-        result = await service.send_message(
-            subject_id,
-            occurrence_id,
-            text=text_value,
-            actor_id=actor_id,
-            idempotency_key=idempotency_key,
-        )
+        if request_kind == "propose":
+            result = await service.send_proposal(
+                subject_id,
+                occurrence_id,
+                text=text_value,
+                actor_id=actor_id,
+                idempotency_key=idempotency_key,
+            )
+        else:
+            result = await service.send_message(
+                subject_id,
+                occurrence_id,
+                text=text_value,
+                actor_id=actor_id,
+                idempotency_key=idempotency_key,
+            )
     except EditorialThreadApplicationError as error:
         code = error.code
         response_status = (

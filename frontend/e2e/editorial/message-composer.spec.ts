@@ -623,7 +623,7 @@ test("message-only composer renders safe generating, reply and error states", as
       .getByText("Paragraphe synthétique inchangé.", { exact: true }),
   ).toBeVisible();
   await expect(
-    page.getByRole("button", { name: /générer une proposition/i }),
+    page.getByRole("button", { name: "Générer une proposition" }),
   ).toHaveCount(0);
   expect(idempotencyKeys).toHaveLength(5);
   expect(new Set(idempotencyKeys).size).toBe(5);

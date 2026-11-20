@@ -7,10 +7,11 @@ import {
   within,
   waitFor,
 } from "@testing-library/react";
-import { useState } from "react";
+import { createRef, useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { EditorialConversation } from "./EditorialConversation";
+import { EditorialConversationComposer } from "./EditorialConversationComposer";
 import {
   sendEditorialThreadMessage,
   type EditorialThreadRead,
@@ -37,6 +38,7 @@ function requestUrl(input: RequestInfo | URL): string {
 function renderConversation(
   response: EditorialThreadRead,
   onChangeTarget = vi.fn(),
+  allowedOperations: readonly string[] = ["rewrite_title"],
 ) {
   vi.stubGlobal(
     "fetch",
@@ -59,6 +61,7 @@ function renderConversation(
         occurrenceId={binding.occurrence_id}
         snapshotId="snapshot-1"
         targetLabel="Paragraphe synthétique"
+        allowedOperations={allowedOperations}
         onChangeTarget={onChangeTarget}
       />
     </QueryClientProvider>,
@@ -79,6 +82,68 @@ afterEach(() => {
 });
 
 describe("EditorialConversation", () => {
+  it("hides proposal action when the block has no supported proposal operation", async () => {
+    renderConversation(
+      {
+        kind: "unopened",
+        binding,
+        current: binding,
+        bridge_status: "ready",
+        event_sequence: 0,
+        timeline: [],
+        etag: '"thread-empty"',
+      },
+      vi.fn(),
+      ["insert_paragraph"],
+    );
+
+    expect(
+      await screen.findByRole("button", { name: "Envoyer un message" }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("button", { name: "Générer une proposition" }),
+    ).toBeNull();
+  });
+
+  it.each([
+    {
+      sendKind: "message" as const,
+      activeLabel: "Envoi en cours…",
+      inactiveLabel: "Générer une proposition",
+    },
+    {
+      sendKind: "propose" as const,
+      activeLabel: "Génération en cours…",
+      inactiveLabel: "Envoyer un message",
+    },
+  ])(
+    "labels only the active $sendKind action as pending",
+    ({ sendKind, activeLabel, inactiveLabel }) => {
+      render(
+        <EditorialConversationComposer
+          draft="Clarifier ce passage"
+          active={false}
+          canPropose
+          controlsLocked={false}
+          hasQueryError={false}
+          sendPending
+          sendSuccess={false}
+          sendKind={sendKind}
+          sendErrorMessage={null}
+          submissionBelongsToCurrentTarget
+          composerRef={createRef<HTMLTextAreaElement>()}
+          sendAnnouncementRef={createRef<HTMLParagraphElement>()}
+          onDraftChange={vi.fn()}
+          onSuggestion={vi.fn()}
+          onSubmit={vi.fn()}
+        />,
+      );
+
+      expect(screen.getByRole("button", { name: activeLabel })).toBeVisible();
+      expect(screen.getByRole("button", { name: inactiveLabel })).toBeVisible();
+    },
+  );
+
   it("shows the unopened state without opening or writing a thread", async () => {
     renderConversation({
       kind: "unopened",
@@ -102,8 +167,8 @@ describe("EditorialConversation", () => {
       screen.getByRole("button", { name: "Envoyer un message" }),
     ).toBeDisabled();
     expect(
-      screen.queryByRole("button", { name: /proposition/i }),
-    ).not.toBeInTheDocument();
+      screen.getByRole("button", { name: "Générer une proposition" }),
+    ).toBeDisabled();
   });
 
   it("offers a target-change action from the discussion header", async () => {
@@ -201,6 +266,7 @@ describe("EditorialConversation", () => {
           occurrenceId={binding.occurrence_id}
           snapshotId="snapshot-1"
           targetLabel="Titre synthétique"
+          allowedOperations={["rewrite_title"]}
           onChangeTarget={vi.fn()}
         />
       </QueryClientProvider>,
@@ -295,6 +361,7 @@ describe("EditorialConversation", () => {
           occurrenceId={binding.occurrence_id}
           snapshotId="snapshot-1"
           targetLabel="Paragraphe synthétique"
+          allowedOperations={["rewrite_paragraph"]}
           onChangeTarget={() => undefined}
         />
       </QueryClientProvider>,
@@ -389,6 +456,7 @@ describe("EditorialConversation", () => {
             occurrenceId={occurrenceId}
             snapshotId="snapshot-1"
             targetLabel={occurrenceId === "occurrence-a" ? "Bloc A" : "Bloc B"}
+            allowedOperations={["rewrite_paragraph"]}
             onChangeTarget={() => undefined}
           />
         </>
@@ -440,11 +508,20 @@ describe("EditorialConversation", () => {
       binding_state: "valid",
       previous_sessions: [],
       bridge_status: "reply_available",
-      event_sequence: 1,
+      event_sequence: 2,
       timeline: [
         {
-          id: "event-1",
+          id: "event-user-1",
           sequence: 1,
+          kind: "user_message",
+          actor_id: "analyst-1",
+          proposal_id: null,
+          created_at: "2026-11-19T09:59:00Z",
+          body: "Texte utilisateur projeté.",
+        },
+        {
+          id: "event-1",
+          sequence: 2,
           kind: "bridge_reply",
           actor_id: null,
           proposal_id: null,
@@ -459,6 +536,14 @@ describe("EditorialConversation", () => {
       expect(
         screen.getByText("Réponse synthétique de démonstration."),
       ).toBeVisible(),
+    );
+    expect(screen.getByText("Texte utilisateur projeté.")).toBeVisible();
+    const responseStatus = screen.getByText(
+      "Une réponse est disponible dans ce fil. Consultez-la avant toute décision.",
+    );
+    expect(responseStatus.closest('[role="status"]')).toHaveAttribute(
+      "aria-live",
+      "polite",
     );
     expect(screen.getByText("Version de référence du fil : v3")).toBeVisible();
     expect(
@@ -506,6 +591,7 @@ describe("EditorialConversation", () => {
           occurrenceId={binding.occurrence_id}
           snapshotId="snapshot-1"
           targetLabel="Paragraphe synthétique"
+          allowedOperations={["rewrite_paragraph"]}
           onChangeTarget={() => undefined}
         />
       </QueryClientProvider>,
@@ -618,6 +704,7 @@ describe("EditorialConversation", () => {
           occurrenceId={binding.occurrence_id}
           snapshotId="snapshot-1"
           targetLabel="Paragraphe synthétique"
+          allowedOperations={["rewrite_paragraph"]}
           onChangeTarget={() => undefined}
         />
       </QueryClientProvider>,
@@ -721,6 +808,71 @@ describe("EditorialConversation", () => {
     ]);
   });
 
+  it("sends proposal requests with their own objective", async () => {
+    const idempotencyKey = "00000000-0000-4000-8000-000000000010";
+    vi.spyOn(crypto, "randomUUID").mockReturnValue(idempotencyKey);
+    const unopened: EditorialThreadRead = {
+      kind: "unopened",
+      binding,
+      current: binding,
+      bridge_status: "ready",
+      event_sequence: 0,
+      timeline: [],
+      etag: '"thread-empty-proposal"',
+    };
+    let postBody: string | null = null;
+    let postKey: string | null = null;
+    const fetchMock = vi.fn<typeof fetch>((_input, init) => {
+      if (init?.method === "POST") {
+        expect(typeof init.body).toBe("string");
+        postBody = init.body as string;
+        postKey = new Headers(init.headers).get("Idempotency-Key");
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              kind: "accepted",
+              thread_id: "thread-proposal",
+              entry_id: "entry-proposal",
+              generation: "queued",
+            }),
+            { status: 202, headers: { "Content-Type": "application/json" } },
+          ),
+        );
+      }
+      return Promise.resolve(threadResponse(unopened));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, refetchInterval: false } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <EditorialConversation
+          subjectId={binding.subject_id}
+          occurrenceId={binding.occurrence_id}
+          snapshotId="snapshot-1"
+          targetLabel="Paragraphe synthétique"
+          allowedOperations={["rewrite_paragraph"]}
+          onChangeTarget={() => undefined}
+        />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.change(
+      await screen.findByRole("textbox", { name: "Votre message à Bridge" }),
+      { target: { value: "Raccourcir le passage." } },
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Générer une proposition" }),
+    );
+
+    await waitFor(() => expect(postBody).not.toBeNull());
+    expect(postBody).toBe(
+      JSON.stringify({ kind: "propose", text: "Raccourcir le passage." }),
+    );
+    expect(postKey).toBe(idempotencyKey);
+  });
+
   it("shows stable French errors and offers no retry after an uncertain send", async () => {
     const unopened: EditorialThreadRead = {
       kind: "unopened",
@@ -758,6 +910,7 @@ describe("EditorialConversation", () => {
           occurrenceId={binding.occurrence_id}
           snapshotId="snapshot-1"
           targetLabel="Paragraphe synthétique"
+          allowedOperations={["rewrite_paragraph"]}
           onChangeTarget={() => undefined}
         />
       </QueryClientProvider>,
@@ -840,6 +993,7 @@ describe("EditorialConversation", () => {
           occurrenceId={binding.occurrence_id}
           snapshotId="snapshot-1"
           targetLabel="Paragraphe synthétique"
+          allowedOperations={["rewrite_paragraph"]}
           onChangeTarget={() => undefined}
         />
       </QueryClientProvider>,
@@ -850,8 +1004,8 @@ describe("EditorialConversation", () => {
     });
     expect(composer).toBeDisabled();
     expect(
-      screen.queryByRole("button", { name: "Générer une proposition" }),
-    ).not.toBeInTheDocument();
+      screen.getByRole("button", { name: "Générer une proposition" }),
+    ).toBeDisabled();
     fireEvent.click(
       screen.getByRole("button", { name: "Vérifier l’état de l’envoi" }),
     );
@@ -930,6 +1084,7 @@ describe("EditorialConversation", () => {
           occurrenceId={binding.occurrence_id}
           snapshotId="snapshot-1"
           targetLabel="Paragraphe synthétique"
+          allowedOperations={["rewrite_paragraph"]}
           onChangeTarget={() => undefined}
         />
       </QueryClientProvider>,
@@ -941,8 +1096,8 @@ describe("EditorialConversation", () => {
       ),
     ).toBeVisible();
     expect(
-      screen.queryByRole("button", { name: "Générer une proposition" }),
-    ).not.toBeInTheDocument();
+      screen.getByRole("button", { name: "Générer une proposition" }),
+    ).toBeDisabled();
     expect(
       screen.getByRole("button", { name: "Démarrer une nouvelle discussion" }),
     ).toBeEnabled();
@@ -998,6 +1153,7 @@ describe("EditorialConversation", () => {
           occurrenceId={binding.occurrence_id}
           snapshotId="snapshot-1"
           targetLabel="Paragraphe synthétique"
+          allowedOperations={["rewrite_paragraph"]}
           onChangeTarget={() => undefined}
         />
       </QueryClientProvider>,
@@ -1096,6 +1252,7 @@ describe("EditorialConversation", () => {
           occurrenceId={binding.occurrence_id}
           snapshotId="snapshot-1"
           targetLabel="Paragraphe synthétique"
+          allowedOperations={["rewrite_paragraph"]}
           onChangeTarget={() => undefined}
         />
       </QueryClientProvider>,

@@ -415,6 +415,7 @@ export async function sendEditorialThreadMessage(
   subjectId: string,
   occurrenceId: string,
   text: string,
+  kind: "message" | "propose" = "message",
 ): Promise<EditorialThreadSendResult> {
   const idempotencyKey = crypto.randomUUID();
   const url = `/api/subjects/${encodeURIComponent(subjectId)}/editor/threads/${encodeURIComponent(occurrenceId)}/entries`;
@@ -427,7 +428,7 @@ export async function sendEditorialThreadMessage(
           "Content-Type": "application/json",
           "Idempotency-Key": idempotencyKey,
         },
-        body: JSON.stringify({ kind: "message", text }),
+        body: JSON.stringify({ kind, text }),
       });
       if (!response.ok) throw await adaptApiError(response);
       return (await response.json()) as EditorialThreadSendResult;

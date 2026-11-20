@@ -22,6 +22,7 @@ interface ThreadTarget {
 
 interface SendMessageVariables extends ThreadTarget {
   text: string;
+  kind: "message" | "propose";
 }
 
 type ReconcileVariables = ThreadTarget;
@@ -129,8 +130,14 @@ export function useEditorialThreadLifecycle({
       subjectId: targetSubjectId,
       occurrenceId: targetOccurrenceId,
       text,
+      kind,
     }: SendMessageVariables) =>
-      sendEditorialThreadMessage(targetSubjectId, targetOccurrenceId, text),
+      sendEditorialThreadMessage(
+        targetSubjectId,
+        targetOccurrenceId,
+        text,
+        kind,
+      ),
     onSuccess: (result, variables) => {
       onMessageSent(variables.occurrenceId);
       const targetQueryKey = threadQueryKey(variables);
@@ -270,12 +277,21 @@ export function useEditorialThreadLifecycle({
     threadQuery.data.kind !== "stale" &&
     !threadQuery.isError;
 
-  function submitMessage(text: string): boolean {
+  function submitMessage(
+    text: string,
+    kind: "message" | "propose" = "message",
+  ): boolean {
     const message = text.trim();
     if (!message || sendMutation.isPending || active) return false;
     reconcileMutation.reset();
     startSessionMutation.reset();
-    sendMutation.mutate({ subjectId, occurrenceId, snapshotId, text: message });
+    sendMutation.mutate({
+      subjectId,
+      occurrenceId,
+      snapshotId,
+      text: message,
+      kind,
+    });
     return true;
   }
 
@@ -313,6 +329,7 @@ export function useEditorialThreadLifecycle({
     controlsLocked,
     canCompose,
     submissionBelongsToCurrentTarget,
+    submissionKind: sendMutation.variables?.kind,
     submissionUncertain,
     sendState: {
       isPending: sendMutation.isPending,

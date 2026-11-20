@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import replace
 from types import SimpleNamespace
 from uuid import uuid4
@@ -551,6 +552,147 @@ def _install_real_workspace_resolver(setup):
     )
 
 
+def _paragraph_wire_response(
+    *,
+    target_path: str,
+    operation: str,
+    base_sha256: str,
+    before_hash: str,
+    after: str,
+) -> str:
+    return "\n".join(
+        (
+            "@@ TARGET @@",
+            target_path,
+            "@@ ACTION @@",
+            operation,
+            "@@ BASE_ARTIFACT_HASH @@",
+            base_sha256,
+            "@@ BEFORE_HASH @@",
+            before_hash,
+            "@@ AFTER @@",
+            after,
+            "@@ RATIONALE @@",
+            "Raison synthétique.",
+            "@@ END @@",
+        )
+    )
+
+
+def _install_paragraph_proposal_context(setup):
+    from cti_app.application.editorial_conversation_turns import (
+        EditorialParagraphEvidenceContext,
+    )
+    from cti_app.application.production_synthesis import (
+        build_synthesis_evidence_pack,
+        canonical_extraction_hash,
+    )
+    from cti_app.domain.production import ProductionArtifact, ProductionArtifactStage
+    from cti_app.domain.production_synthesis import (
+        SYNTHESIS_POLICY_VERSION,
+        extraction_evidence_elements,
+    )
+    from tests.test_production_synthesis_application import (
+        make_extraction,
+        make_fact,
+        make_snapshot,
+        make_source,
+    )
+
+    base = setup.preparation()
+    source_id = uuid4()
+    fact = make_fact(source_id, "FooRAT")
+    extraction = make_extraction(
+        setup.subject_id,
+        (make_source(source_id, facts=(fact,)),),
+    )
+    snapshot = make_snapshot(setup.subject_id)
+    extraction = replace(extraction, production_input_hash=snapshot.input_hash)
+    evidence_pack = build_synthesis_evidence_pack(snapshot, extraction)
+    evidence_ref, _payload = extraction_evidence_elements(extraction)[0]
+    evidence_handle = evidence_pack.handle_for(evidence_ref)
+    assert evidence_handle is not None
+
+    paragraph = {
+        "text": "FooRAT appears in the report.",
+        "evidence_refs": [
+            {
+                "source_document_id": str(evidence_ref.source_document_id),
+                "kind": evidence_ref.kind.value,
+                "evidence_key": evidence_ref.evidence_key,
+            }
+        ],
+    }
+    base_content = dict(base.base_content)
+    base_content["schema_version"] = 2
+    base_content["synthesis_policy_version"] = SYNTHESIS_POLICY_VERSION
+    base_content["production_input_hash"] = snapshot.input_hash
+    base_content["extraction_hash"] = canonical_extraction_hash(extraction)
+    base_content["lead"] = [paragraph]
+    canonical_sha256 = hashlib.sha256(
+        ProductionArtifactStore.canonical_json_bytes(base_content)
+    ).hexdigest()
+    entries = list(
+        bootstrap_block_registry(
+            artifact_id=base.base_artifact_id,
+            canonical_sha256=canonical_sha256,
+            source_stage="synthesis",
+            canonical_content=base_content,
+        )
+    )
+    paragraph_entry = next(
+        entry for entry in entries if entry.kind is EditorialBlockKind.LEAD_PARAGRAPH
+    )
+    entries[entries.index(paragraph_entry)] = replace(paragraph_entry, block_id=setup.occurrence_id)
+    setup.current_snapshot.block_registry = tuple(entries)
+    setup.current_snapshot.synthesis_canonical_sha256 = canonical_sha256
+    setup.current_snapshot.publication_kind = "brief"
+
+    class StaticWorkspaceService(EditorialWorkspaceService):
+        async def _load_current(self, subject_id):
+            return {}, setup.current_snapshot, base_content
+
+    setup.service._workspace_service = StaticWorkspaceService(
+        uow_factory=None,
+        artifact_store=None,
+    )
+    target_resolution = resolve_workspace_target(
+        entry=next(entry for entry in entries if entry.block_id == setup.occurrence_id),
+        canonical_content=base_content,
+        operation="rewrite_paragraph",
+    )
+    artifact = ProductionArtifact(
+        production_run_id=setup.current_snapshot.production_run_id,
+        subject_id=setup.subject_id,
+        stage=ProductionArtifactStage.SYNTHESIS,
+        version=base.base_artifact_version,
+        input_hash=base.base_input_hash,
+        canonical_blob_id=uuid4(),
+        id=base.base_artifact_id,
+    )
+    context = EditorialParagraphEvidenceContext(
+        evidence_pack=evidence_pack,
+        extraction=extraction,
+        snapshot=snapshot,
+        base_artifact=artifact,
+        evidence_refs=(evidence_ref,),
+        evidence_handles=(evidence_handle,),
+        publication_kind=None,
+    )
+    preparation = replace(
+        base,
+        target=target_resolution.target,
+        target_id=target_resolution.legacy_target_id,
+        operation=TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH,
+        before_hash=target_resolution.before_hash,
+        base_content=base_content,
+        base_canonical_sha256=canonical_sha256,
+        paragraph_evidence_context=context,
+        strict_wire=True,
+    )
+    return preparation, evidence_handle
+
+
 @pytest.mark.asyncio
 async def test_preparation_rejects_a_supplied_target_that_differs_from_current_occurrence() -> None:
     from cti_app.application.editorial_proposals import EditorialProposalApplicationError
@@ -697,7 +839,7 @@ async def test_preparation_revalidates_pins_under_run_lock_before_inserting() ->
 @pytest.mark.asyncio
 async def test_bridge_patch_becomes_immutable_proposal_with_exact_sha() -> None:
     setup = _setup()
-    preparation = setup.preparation()
+    preparation = replace(setup.preparation(), strict_wire=True)
     proposal = await setup.service.prepare_bridge_result(preparation)
     replay = await setup.service.prepare_bridge_result(preparation)
 
@@ -724,16 +866,143 @@ async def test_refusal_and_needs_review_do_not_write_canonical_artifact() -> Non
             "@@ END @@",
         )
     )
-    refused = await setup.service.prepare_bridge_result(setup.preparation(refusal))
+    refused = await setup.service.prepare_bridge_result(
+        replace(setup.preparation(refusal), strict_wire=True)
+    )
     needs_review = await setup.service.prepare_bridge_result(
-        setup.preparation("Réponse synthétique sans patch typé")
+        replace(
+            setup.preparation("Texte libre avant le patch. " + setup.preparation().raw_response),
+            strict_wire=True,
+        )
+    )
+    valid_wire = setup.preparation().raw_response
+    markup_response = valid_wire.replace("Titre proposé synthétique", "<svg>libre</svg>")
+    markup = await setup.service.prepare_bridge_result(
+        replace(setup.preparation(markup_response), strict_wire=True)
     )
 
     assert refused.state == "refused"
     assert needs_review.state == "needs_review"
+    assert markup.state == "needs_review"
     assert setup.blob_bytes == {}
     assert setup.canonical_writes == []
-    assert len(setup.thread_events) == 2
+    assert len(setup.thread_events) == 3
+
+
+@pytest.mark.parametrize(
+    "freeform_text",
+    [
+        '#link("https://example.invalid", [x])',
+        '#raw("<script>run()</script>")',
+        '#import "local.typ"',
+        '#read("/etc/passwd")',
+        '#include "local.typ"',
+        "<script>alert(1)</script>",
+        '<svg><a href="javascript:alert(1)">x</a></svg>',
+    ],
+)
+@pytest.mark.asyncio
+async def test_strict_proposal_text_rejects_typst_html_and_svg_markup(
+    freeform_text: str,
+) -> None:
+    setup = _setup()
+    valid_wire = setup.preparation().raw_response
+    response = valid_wire.replace("Titre proposé synthétique", freeform_text)
+
+    proposal = await setup.service.prepare_bridge_result(
+        replace(setup.preparation(response), strict_wire=True)
+    )
+
+    assert proposal.state == "needs_review"
+    assert proposal.diagnostics["code"] == "revision_wire_markup_forbidden"
+    assert setup.blob_bytes == {}
+    assert setup.canonical_writes == []
+
+
+@pytest.mark.asyncio
+async def test_rewrite_paragraph_patch_is_prepared_with_exact_patch_sha() -> None:
+    setup = _setup()
+    preparation, handle = _install_paragraph_proposal_context(setup)
+    paragraph = preparation.base_content["lead"][0]
+    assert isinstance(paragraph, dict)
+    resolved = resolve_target(
+        preparation.base_content,
+        preparation.target,
+        TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH,
+    )
+    raw_response = _paragraph_wire_response(
+        target_path=resolved.path,
+        operation="rewrite_paragraph",
+        base_sha256=preparation.base_canonical_sha256,
+        before_hash=resolved.before_hash,
+        after=(
+            f"@@LEAD@@\n@@CLAIM L001@@\nEVIDENCE: {handle}\nTEXT: The report identifies FooRAT.\n"
+        ),
+    )
+    setup.preparation(raw_response)
+    proposal = await setup.service.prepare_bridge_result(
+        replace(preparation, raw_response=raw_response)
+    )
+
+    assert proposal.state.value == "proposed", proposal.diagnostics
+    assert proposal.patch_sha256 is not None
+    encoded = setup.blob_bytes[proposal.patch_sha256]
+    assert hashlib.sha256(encoded).hexdigest() == proposal.patch_sha256
+    assert json.loads(encoded)["after"] == (
+        f"@@LEAD@@\n@@CLAIM L001@@\nEVIDENCE: {handle}\nTEXT: The report identifies FooRAT."
+    )
+
+
+@pytest.mark.asyncio
+async def test_rewrite_paragraph_stale_fence_and_unsupported_fact_write_nothing() -> None:
+    setup = _setup()
+    stale, handle = _install_paragraph_proposal_context(setup)
+    resolved = resolve_target(
+        stale.base_content,
+        stale.target,
+        TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH,
+    )
+    stale = replace(
+        stale,
+        raw_response=_paragraph_wire_response(
+            target_path=resolved.path,
+            operation="rewrite_paragraph",
+            base_sha256=stale.base_canonical_sha256,
+            before_hash="f" * 64,
+            after=(
+                f"@@LEAD@@\n@@CLAIM L001@@\nEVIDENCE: {handle}\n"
+                "TEXT: The report identifies FooRAT.\n"
+            ),
+        ),
+    )
+
+    _stale_patch, stale_state, _kind, stale_diagnostics = setup.service._validate_result(stale)
+
+    assert stale_state.value == "needs_review"
+    assert stale_diagnostics["code"] == "proposal_base_stale"
+    assert setup.canonical_writes == []
+
+    unsupported = replace(
+        stale,
+        raw_response=_paragraph_wire_response(
+            target_path=resolved.path,
+            operation="rewrite_paragraph",
+            base_sha256=stale.base_canonical_sha256,
+            before_hash=resolved.before_hash,
+            after=(
+                f"@@LEAD@@\n@@CLAIM L001@@\nEVIDENCE: {handle}\n"
+                "TEXT: UnsupportedFamilyX controlled the infected environment.\n"
+            ),
+        ),
+    )
+
+    _unsupported_patch, unsupported_state, _kind, diagnostics = setup.service._validate_result(
+        unsupported
+    )
+
+    assert unsupported_state.value == "needs_review"
+    assert diagnostics["code"] == "synthesis_relation_not_evidenced", diagnostics
+    assert setup.canonical_writes == []
 
 
 @pytest.mark.asyncio

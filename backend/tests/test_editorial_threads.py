@@ -11,6 +11,7 @@ import pytest
 from fastapi import HTTPException
 
 from cti_app.api import editorial_workspace as editorial_workspace_api
+from cti_app.application.editorial_thread_common import encode_thread_request
 from cti_app.application.editorial_threads import EditorialThreadService
 from cti_app.application.editorial_workspace import resolve_occurrence
 from cti_app.application.editorial_workspace.registry import (
@@ -864,6 +865,91 @@ async def test_thread_route_returns_etag_and_honors_if_none_match(
     assert first.headers["ETag"] == first_body["etag"]  # type: ignore[union-attr]
     assert second.status_code == 304  # type: ignore[union-attr]
     assert second.headers["ETag"] == first.headers["ETag"]  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_thread_api_decodes_message_and_proposal_requests_with_legacy_text_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject_id, occurrence_id = uuid4(), uuid4()
+    binding = _binding(subject_id, occurrence_id)
+    thread = _thread(binding)
+    artifact_store = _MemoryArtifactStore({})
+    expected_bodies = (
+        ("message", "Texte utilisateur du message."),
+        ("proposal", "Instruction utilisateur pour proposer."),
+        ("message", "Ancien message M2 en texte brut."),
+    )
+    events = []
+    for index, (objective, text) in enumerate(expected_bodies, start=1):
+        body = encode_thread_request(text, objective) if index < 3 else text.encode("utf-8")
+        blob_id = uuid4()
+        artifact_store.payloads[blob_id] = body
+        thread, event = thread.append_event(
+            kind=EditorialThreadEventKind.USER_MESSAGE,
+            actor_id=uuid4(),
+            idempotency_key=f"thread-read-{index}",
+            request_sha256=str(index) * 64,
+            payload_blob_ref=blob_id,
+            payload_sha256=hashlib.sha256(body).hexdigest(),
+        )
+        events.append(event)
+    repository = _MemoryThreadRepository(EditorialThreadRecord(thread, tuple(events)))
+    service = EditorialThreadService(
+        uow_factory=_uow_factory(repository),
+        workspace_service=_Workspace({subject_id: _workspace_record(binding)}),
+        artifact_store=artifact_store,
+    )
+    monkeypatch.setattr(editorial_workspace_api, "_thread_service", lambda _request: service)
+
+    response = await editorial_workspace_api.get_editorial_thread(
+        subject_id,
+        occurrence_id,
+        None,  # type: ignore[arg-type]
+        after_sequence=0,
+        if_none_match=None,
+    )
+
+    assert response.status_code == 200  # type: ignore[union-attr]
+    timeline = json.loads(response.body)["timeline"]  # type: ignore[union-attr]
+    assert [item["body"] for item in timeline] == [text for _, text in expected_bodies]
+
+
+def test_proposal_context_offers_only_operations_with_a_preparation_path() -> None:
+    from cti_app.application.editorial_discussion_context import (
+        _supported_proposal_operations,
+    )
+
+    assert _supported_proposal_operations(
+        stage="synthesis",
+        block_kind="title",
+        offered_operations={"rewrite_title", "rewrite_section"},
+        paragraph_validation_ready=False,
+    ) == ("rewrite_title",)
+    assert _supported_proposal_operations(
+        stage="synthesis",
+        block_kind="paragraph",
+        offered_operations={"rewrite_paragraph", "rewrite_section"},
+        paragraph_validation_ready=True,
+    ) == ("rewrite_paragraph",)
+    assert (
+        _supported_proposal_operations(
+            stage="synthesis",
+            block_kind="paragraph",
+            offered_operations={"rewrite_paragraph"},
+            paragraph_validation_ready=False,
+        )
+        == ()
+    )
+    assert (
+        _supported_proposal_operations(
+            stage="editorial_enrichment",
+            block_kind="figure",
+            offered_operations={"rewrite_title", "rewrite_paragraph"},
+            paragraph_validation_ready=True,
+        )
+        == ()
+    )
 
 
 @pytest.mark.asyncio

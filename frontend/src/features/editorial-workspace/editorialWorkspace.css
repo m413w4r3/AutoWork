@@ -925,6 +925,7 @@ main:has(> .editorial-route-state) > .app-header {
 .editorial-conversation__composer textarea:focus-visible,
 .editorial-conversation__suggestions button:focus-visible,
 .editorial-conversation__send:focus-visible,
+.editorial-conversation__propose:focus-visible,
 .editorial-conversation__reconcile:focus-visible,
 .editorial-conversation__new-session:focus-visible {
   outline: 3px solid var(--editorial-brand);
@@ -949,6 +950,13 @@ main:has(> .editorial-route-state) > .app-header {
   cursor: pointer;
 }
 
+.editorial-conversation__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 0.55rem;
+}
+
 .editorial-conversation__send {
   min-height: 44px;
   justify-self: start;
@@ -957,6 +965,19 @@ main:has(> .editorial-route-state) > .app-header {
   border-radius: 0.4rem;
   color: var(--editorial-white);
   background: var(--editorial-brand);
+  font: inherit;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.editorial-conversation__propose {
+  min-height: 44px;
+  justify-self: start;
+  padding: 0.55rem 0.85rem;
+  border: 1px solid var(--editorial-brand);
+  border-radius: 0.4rem;
+  color: var(--editorial-brand);
+  background: var(--editorial-white);
   font: inherit;
   font-weight: 650;
   cursor: pointer;
@@ -982,6 +1003,7 @@ main:has(> .editorial-route-state) > .app-header {
 }
 
 .editorial-conversation__send:disabled,
+.editorial-conversation__propose:disabled,
 .editorial-conversation__reconcile:disabled,
 .editorial-conversation__new-session:disabled,
 .editorial-conversation__suggestions button:disabled {
@@ -994,6 +1016,10 @@ main:has(> .editorial-route-state) > .app-header {
 
 .editorial-conversation__send:disabled {
   border: 1px solid var(--editorial-control-border);
+}
+
+.editorial-conversation__propose:disabled {
+  border-color: var(--editorial-control-border);
 }
 
 .editorial-conversation__announcement,

@@ -14,6 +14,7 @@ from cti_app.application.editorial_conversation_turns import (
     EditorialDiscussionObjective,
     EditorialTurnContractError,
 )
+from cti_app.application.editorial_thread_common import is_editorial_turn_objective
 from cti_app.application.model_gateway import (
     BRIDGE_SOURCE_PROVENANCE_KEY,
     BridgeExternalEffectBinding,
@@ -116,6 +117,7 @@ async def submit_editorial_turn(
                     "La clé d'idempotence appartient à une autre conversation"
                 )
             if editorial_turn is not None:
+                assert editorial_objective is not None
                 input_blob_id = _blob_id(duplicate.input_blob_reference)
                 input_blob = (
                     await uow.blobs.get(input_blob_id) if input_blob_id is not None else None
@@ -128,7 +130,10 @@ async def submit_editorial_turn(
                     duplicate.input_blob_reference, {input_blob_id: input_blob}
                 )
                 if not turns.matches_persisted_input(
-                    persisted_input, message, editorial_turn.context
+                    persisted_input,
+                    message,
+                    editorial_turn.context,
+                    editorial_objective,
                 ):
                     raise ConversationPolicyError(
                         "La clé d'idempotence appartient à un autre message"
@@ -148,7 +153,7 @@ async def submit_editorial_turn(
                 run = await uow.model_runs.get(duplicate.model_run_id)
                 if (
                     editorial_turn is not None
-                    and duplicate.objective == "editorial_message"
+                    and is_editorial_turn_objective(duplicate.objective)
                     and run is not None
                     and run.status is ModelRunStatus.SUCCEEDED
                 ):
@@ -156,7 +161,7 @@ async def submit_editorial_turn(
                     durable_editorial_run = run
                 elif (
                     editorial_turn is not None
-                    and duplicate.objective == "editorial_message"
+                    and is_editorial_turn_objective(duplicate.objective)
                     and run is not None
                     and run.status is ModelRunStatus.RUNNING
                     and run.submission_state is ModelSubmissionState.NOT_SUBMITTED

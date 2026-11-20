@@ -27,6 +27,13 @@ _OUTER_WIRE_BLOCK = re.compile(
     r"^\s*@@\s*(TARGET|ACTION|BASE_ARTIFACT_HASH|BEFORE_HASH|AFTER|RATIONALE|REFUSAL|END)\s*@@\s*$",
     re.IGNORECASE,
 )
+_SYNTHESIS_AFTER_MARKER = re.compile(
+    r"^@@\s*(?:LEAD|SYNTHESIS\s+LEAD|SYNTHESIS\s+OUTPUT|"
+    r"CLAIM(?:\s+[A-Za-z0-9._-]+)?|SECTION(?:\s+[A-Za-z0-9._-]+)?|"
+    r"SOURCE[_ ]NOTE\s+[A-Za-z0-9._-]+|END\s+(?:CLAIM|ITEM|SECTION|"
+    r"SOURCE[_ ]NOTE|LEAD))\s*@@$",
+    re.IGNORECASE,
+)
 
 
 class TargetedSynthesisRevisionValidationError(RuntimeError):
@@ -49,29 +56,45 @@ class _WirePatch:
     refusal: TargetedEditorialRevisionRefusal | None = None
 
 
-def _parse_wire_patch(raw_text: str) -> _WirePatch:
+def _parse_wire_patch(raw_text: str, *, strict: bool = False) -> _WirePatch:
     if not isinstance(raw_text, str):
         raise TargetedSynthesisRevisionValidationError("revision_wire_invalid")
     blocks: dict[str, list[str]] = {}
     active: str | None = None
+    ended = False
     for line in raw_text.replace("\r\n", "\n").replace("\r", "\n").splitlines():
         match = _OUTER_WIRE_BLOCK.fullmatch(line)
         if match is not None:
             name = match.group(1).upper()
             if name == "END":
+                if strict and ended:
+                    raise TargetedSynthesisRevisionValidationError("revision_wire_duplicate_end")
+                ended = strict
                 active = None
                 continue
+            if strict and ended:
+                raise TargetedSynthesisRevisionValidationError("revision_wire_data_after_end")
             if name in blocks:
                 raise TargetedSynthesisRevisionValidationError("revision_wire_duplicate_block")
             blocks[name] = []
             active = name
             continue
+        if strict and ended and line.strip():
+            raise TargetedSynthesisRevisionValidationError("revision_wire_data_after_end")
+        if strict and line.lstrip().startswith("@@"):
+            if active != "AFTER" or not _SYNTHESIS_AFTER_MARKER.fullmatch(line.strip()):
+                raise TargetedSynthesisRevisionValidationError("revision_wire_marker_invalid")
         if active is not None:
             blocks[active].append(line)
-        elif line.strip() and not re.fullmatch(r"\s*```(?:[A-Za-z0-9_-]+)?\s*", line):
+        elif line.strip():
             # Bridge preambles are tolerated; the dedicated markers remain authoritative.
-            continue
+            if strict:
+                raise TargetedSynthesisRevisionValidationError("revision_wire_unexpected_text")
+    if strict and not ended:
+        raise TargetedSynthesisRevisionValidationError("revision_wire_end_missing")
     if "REFUSAL" in blocks:
+        if strict and set(blocks) != {"REFUSAL"}:
+            raise TargetedSynthesisRevisionValidationError("revision_wire_refusal_shape_invalid")
         raw = "\n".join(blocks["REFUSAL"]).strip()
         values: dict[str, str] = {}
         for line in raw.splitlines():
@@ -104,6 +127,8 @@ def _parse_wire_patch(raw_text: str) -> _WirePatch:
     required = {"TARGET", "ACTION", "BASE_ARTIFACT_HASH", "BEFORE_HASH", "AFTER", "RATIONALE"}
     if not required <= set(blocks):
         raise TargetedSynthesisRevisionValidationError("revision_wire_missing_block")
+    if strict and set(blocks) != required:
+        raise TargetedSynthesisRevisionValidationError("revision_wire_shape_invalid")
     values = {name: "\n".join(lines).strip() for name, lines in blocks.items()}
     try:
         action = TargetedEditorialRevisionOperation(values["ACTION"])
@@ -256,4 +281,11 @@ def _assert_non_target_unchanged(
 
 WirePatch = _WirePatch
 parse_wire_patch = _parse_wire_patch
+
+
+def parse_wire_patch_strict(raw_text: str) -> _WirePatch:
+    """Parse one complete patch/refusal response with no free-form framing."""
+    return _parse_wire_patch(raw_text, strict=True)
+
+
 assert_non_target_unchanged = _assert_non_target_unchanged

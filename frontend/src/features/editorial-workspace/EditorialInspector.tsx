@@ -194,6 +194,7 @@ export function EditorialInspector({
               occurrenceId={block.block_id}
               snapshotId={snapshot.snapshot_id}
               targetLabel={block.text ?? BLOCK_KIND_LABELS[block.kind]}
+              allowedOperations={block.allowed_operations}
               onChangeTarget={onChangeTarget}
             />
             <section

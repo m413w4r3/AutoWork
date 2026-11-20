@@ -9,7 +9,12 @@ from dataclasses import dataclass
 from typing import TypedDict, cast
 from uuid import UUID
 
-from cti_app.application.editorial_conversation_turns import EditorialDiscussionContext
+from cti_app.application.editorial_conversation_turns import (
+    EditorialDiscussionContext,
+    EditorialDiscussionObjective,
+    EditorialParagraphEvidenceContext,
+)
+from cti_app.application.editorial_thread_common import decode_thread_request
 from cti_app.application.editorial_threads import EditorialThreadApplicationError
 from cti_app.application.editorial_workspace import EditorialWorkspaceService
 from cti_app.application.persistence import UnitOfWorkFactory
@@ -30,13 +35,19 @@ from cti_app.domain.editorial_thread import (
     EditorialThreadRecord,
 )
 from cti_app.domain.model_runs import EDITORIAL_DISCUSSION_PROMPT_ID
-from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
+from cti_app.domain.production import (
+    ProductionArtifactStage,
+    ProductionArtifactStatus,
+)
 from cti_app.domain.production_extraction import production_extraction_from_json
 from cti_app.domain.production_relevance import (
     relevance_projection_from_json,
     validate_relevance_projection_lineage,
 )
-from cti_app.domain.production_synthesis import EvidenceKind, ExtractionEvidenceRefV1
+from cti_app.domain.production_synthesis import (
+    EvidenceKind,
+    ExtractionEvidenceRefV1,
+)
 
 
 class EditorialWorkspaceBlock(TypedDict, total=False):
@@ -73,6 +84,7 @@ class PreparedEditorialDiscussion:
     instruction: str
     context: EditorialDiscussionContext
     external_llm_allowed: bool
+    objective: EditorialDiscussionObjective
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +95,12 @@ class _EditorialDiscussionContextBase:
     admitted_evidence: tuple[dict[str, object], ...]
     access_policy: SynthesisAccessPolicyV1
     current_subject_tlp: TLP
+    proposal_snapshot_id: UUID | None
+    proposal_target_path: str | None
+    proposal_operations: tuple[str, ...]
+    proposal_before_hash: str | None
+    proposal_base_sha256: str | None
+    paragraph_evidence_context: EditorialParagraphEvidenceContext | None
 
 
 class EditorialDiscussionContextBuilder:
@@ -118,7 +136,10 @@ class EditorialDiscussionContextBuilder:
         )
         if send_event is None or send_event.payload_blob_ref is None:
             raise EditorialThreadApplicationError("editorial_thread_message_missing")
-        instruction = await self._read_event_text(send_event, "editorial_thread_message_corrupt")
+        objective_value, instruction = await self._read_event_request(
+            send_event, "editorial_thread_message_corrupt"
+        )
+        objective = EditorialDiscussionObjective(objective_value)
         context_base = await self._load_base(record.thread)
         history: list[EditorialDiscussionHistoryEntry] = []
         for event in record.events:
@@ -129,7 +150,12 @@ class EditorialDiscussionContextBuilder:
                 EditorialThreadEventKind.BRIDGE_REPLY,
             }:
                 continue
-            prior_text = await self._read_event_text(event, "editorial_context_unavailable")
+            if event.kind is EditorialThreadEventKind.USER_MESSAGE:
+                _prior_objective, prior_text = await self._read_event_request(
+                    event, "editorial_context_unavailable"
+                )
+            else:
+                prior_text = await self._read_event_text(event, "editorial_context_unavailable")
             history.append(
                 EditorialDiscussionHistoryEntry(
                     "Utilisateur"
@@ -145,6 +171,7 @@ class EditorialDiscussionContextBuilder:
             instruction=instruction,
             context=context,
             external_llm_allowed=context.effective_tlp is not TLP.RED,
+            objective=objective,
         )
 
     async def build(
@@ -211,11 +238,40 @@ class EditorialDiscussionContextBuilder:
             raise EditorialThreadApplicationError("editorial_context_unavailable")
         section_title = _section_title(target, blocks)
         adjacent = _adjacent_paragraphs(target, blocks)
+        raw_snapshot_id = snapshot_view.get("snapshot_id")
+        proposal_snapshot_id = None
+        if isinstance(raw_snapshot_id, str):
+            try:
+                proposal_snapshot_id = UUID(raw_snapshot_id)
+            except ValueError:
+                pass
+        raw_operations = target.get("allowed_operations", [])
+        offered_operations = (
+            {value for value in raw_operations if isinstance(value, str)}
+            if isinstance(raw_operations, list)
+            else set()
+        )
+        structural_pointer = getattr(resolution.entry, "structural_pointer", None)
+        proposal_target_path = (
+            f"synthesis{structural_pointer}" if isinstance(structural_pointer, str) else None
+        )
+        raw_before_hash = target.get("before_hash")
+        proposal_before_hash = raw_before_hash if isinstance(raw_before_hash, str) else None
 
         async with self._uow_factory() as uow:
             run = await uow.production_runs.get_current_for_subject(origin.subject_id)
             production_snapshot = (
                 await uow.production_input_snapshots.get_by_run(run.id) if run else None
+            )
+            synthesis_artifact = (
+                await uow.production_artifacts.get(resolution.artifact_id)
+                if (
+                    run is not None
+                    and stage_value == "synthesis"
+                    and target.get("kind") in {"paragraph", "lead_paragraph"}
+                    and "rewrite_paragraph" in offered_operations
+                )
+                else None
             )
             extraction_artifact = (
                 await uow.production_artifacts.get_current(
@@ -303,6 +359,7 @@ class EditorialDiscussionContextBuilder:
                 }
 
         admitted: list[EditorialEvidenceEntry] = []
+        admitted_refs: list[ExtractionEvidenceRefV1] = []
         raw_refs = target.get("evidence_refs", [])
         if not isinstance(raw_refs, list):
             raise EditorialThreadApplicationError("editorial_context_unavailable")
@@ -320,7 +377,63 @@ class EditorialDiscussionContextBuilder:
                 raise EditorialThreadApplicationError("editorial_context_unavailable") from None
             handle = evidence_pack.handle_for(reference)
             if handle is not None and handle in evidence_by_handle:
+                admitted_refs.append(reference)
                 admitted.append(evidence_by_handle[handle])
+
+        paragraph_evidence_context: EditorialParagraphEvidenceContext | None = None
+        if stage_value == "synthesis" and target.get("kind") in {"paragraph", "lead_paragraph"}:
+            if (
+                "rewrite_paragraph" in offered_operations
+                and admitted_refs
+                and synthesis_artifact is not None
+                and synthesis_artifact.status is ProductionArtifactStatus.VERIFIED
+                and synthesis_artifact.canonical_blob_id is not None
+                and synthesis_artifact.id == resolution.artifact_id
+                and synthesis_artifact.version == resolution.artifact_version
+                and synthesis_artifact.production_run_id == origin.production_run_id
+            ):
+                try:
+                    base_artifact_content = await self._artifact_store.read_json(
+                        synthesis_artifact.canonical_blob_id
+                    )
+                    paragraph_evidence_context = EditorialParagraphEvidenceContext(
+                        evidence_pack=evidence_pack,
+                        extraction=extraction,
+                        snapshot=production_snapshot,
+                        base_artifact=synthesis_artifact,
+                        evidence_refs=tuple(admitted_refs),
+                        evidence_handles=tuple(
+                            dict.fromkeys(
+                                handle
+                                for reference in admitted_refs
+                                if (handle := evidence_pack.handle_for(reference)) is not None
+                            )
+                        ),
+                        publication_kind=resolution.record.publication_kind,
+                    )
+                    if not paragraph_evidence_context.evidence_handles:
+                        paragraph_evidence_context = None
+                    else:
+                        # Check canonical artifact bytes against the resolution used for the fence.
+                        canonical_digest = hashlib.sha256(
+                            self._artifact_store.canonical_json_bytes(base_artifact_content)
+                        ).hexdigest()
+                        if canonical_digest != resolution.canonical_sha256:
+                            paragraph_evidence_context = None
+                        elif (
+                            paragraph_evidence_context.base_artifact.stage
+                            is not ProductionArtifactStage.SYNTHESIS
+                        ):
+                            paragraph_evidence_context = None
+                except Exception:
+                    paragraph_evidence_context = None
+
+        proposal_operations = _supported_proposal_operations(
+            stage=stage_value,
+            block_kind=str(target.get("kind", "")),
+            offered_operations=offered_operations,
+            paragraph_validation_ready=paragraph_evidence_context is not None,
+        )
 
         return _EditorialDiscussionContextBase(
             section_title=section_title,
@@ -329,6 +442,12 @@ class EditorialDiscussionContextBuilder:
             admitted_evidence=tuple(entry["payload"] for entry in admitted),
             access_policy=access_policy,
             current_subject_tlp=current_subject.tlp,
+            proposal_snapshot_id=proposal_snapshot_id,
+            proposal_target_path=proposal_target_path,
+            proposal_operations=proposal_operations,
+            proposal_before_hash=proposal_before_hash,
+            proposal_base_sha256=pinned_sha256,
+            paragraph_evidence_context=paragraph_evidence_context,
         )
 
     @staticmethod
@@ -367,6 +486,18 @@ class EditorialDiscussionContextBuilder:
             "access_policy_hash": synthesis_access_policy_hash(access_policy),
             "current_subject_tlp": current_subject_tlp.value,
             "effective_tlp": effective_tlp.value,
+            "proposal_snapshot_id": (
+                str(base.proposal_snapshot_id) if base.proposal_snapshot_id is not None else None
+            ),
+            "proposal_target_path": base.proposal_target_path,
+            "proposal_operations": base.proposal_operations,
+            "proposal_before_hash": base.proposal_before_hash,
+            "proposal_base_sha256": base.proposal_base_sha256,
+            "paragraph_evidence_handles": (
+                base.paragraph_evidence_context.evidence_handles
+                if base.paragraph_evidence_context is not None
+                else ()
+            ),
         }
         context_sha256 = hashlib.sha256(
             json.dumps(
@@ -390,18 +521,37 @@ class EditorialDiscussionContextBuilder:
             context_sha256=context_sha256,
             effective_tlp=effective_tlp,
             instruction=instruction,
+            proposal_snapshot_id=base.proposal_snapshot_id,
+            proposal_target_path=base.proposal_target_path,
+            proposal_operations=base.proposal_operations,
+            proposal_before_hash=base.proposal_before_hash,
+            proposal_base_sha256=base.proposal_base_sha256,
+            paragraph_evidence_context=base.paragraph_evidence_context,
         )
 
+    async def _read_event_request(
+        self, event: EditorialThreadEvent, error_code: str
+    ) -> tuple[str, str]:
+        body = await self._read_event_body(event, error_code)
+        try:
+            return decode_thread_request(body)
+        except (UnicodeDecodeError, ValueError):
+            raise EditorialThreadApplicationError(error_code) from None
+
     async def _read_event_text(self, event: EditorialThreadEvent, error_code: str) -> str:
+        body = await self._read_event_body(event, error_code)
+        try:
+            return body.decode("utf-8")
+        except UnicodeDecodeError:
+            raise EditorialThreadApplicationError(error_code) from None
+
+    async def _read_event_body(self, event: EditorialThreadEvent, error_code: str) -> bytes:
         if event.payload_blob_ref is None or event.payload_sha256 is None:
             raise EditorialThreadApplicationError(error_code)
         body = await self._artifact_store.read_bytes(event.payload_blob_ref)
         if hashlib.sha256(body).hexdigest() != event.payload_sha256:
             raise EditorialThreadApplicationError(error_code)
-        try:
-            return body.decode("utf-8")
-        except UnicodeDecodeError:
-            raise EditorialThreadApplicationError(error_code) from None
+        return body
 
 
 def _workspace_blocks(value: object) -> list[EditorialWorkspaceBlock | object]:
@@ -411,6 +561,26 @@ def _workspace_blocks(value: object) -> list[EditorialWorkspaceBlock | object]:
         cast(EditorialWorkspaceBlock, _object_mapping(item)) if isinstance(item, Mapping) else item
         for item in value
     ]
+
+
+def _supported_proposal_operations(
+    *,
+    stage: str | None,
+    block_kind: str,
+    offered_operations: set[str],
+    paragraph_validation_ready: bool,
+) -> tuple[str, ...]:
+    if stage != "synthesis":
+        return ()
+    if block_kind == "title" and "rewrite_title" in offered_operations:
+        return ("rewrite_title",)
+    if (
+        block_kind in {"paragraph", "lead_paragraph"}
+        and "rewrite_paragraph" in offered_operations
+        and paragraph_validation_ready
+    ):
+        return ("rewrite_paragraph",)
+    return ()
 
 
 def _object_mapping(value: Mapping[str, object]) -> dict[str, object]:

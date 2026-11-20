@@ -1698,6 +1698,10 @@ def test_plain_text_violation_reason_localizes_claim_trigger_and_bounded_span(
     assert "\n" not in excerpt and "\r" not in excerpt
 
 
+def test_legacy_plain_text_accepts_a_literal_typst_include_reference() -> None:
+    synthesis_module._validate_plain_text("The report literally mentions #include as text.")
+
+
 def test_plain_text_corrective_request_keeps_brief_prompt_hash_and_base_version() -> None:
     prompt = build_brief_synthesis_prompt(
         subject_title="Fixture article",
