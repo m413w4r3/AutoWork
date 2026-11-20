@@ -434,19 +434,24 @@ async def test_postgres_correction_and_rebase_are_append_only(
             ProductionArtifactStage.EDITORIAL_ENRICHMENT,
         ):
             stage_artifacts = [item for item in artifacts if item.stage is stage]
-            signature[stage] = tuple(
-                (
-                    item.id,
-                    item.version,
-                    item.input_hash,
+            stage_signature: list[tuple[object, ...]] = []
+            for item in stage_artifacts:
+                canonical_sha256 = (
                     hashlib.sha256(
                         await artifact_store.read_bytes(item.canonical_blob_id)
                     ).hexdigest()
                     if item.canonical_blob_id is not None
-                    else None,
+                    else None
                 )
-                for item in stage_artifacts
-            )
+                stage_signature.append(
+                    (
+                        item.id,
+                        item.version,
+                        item.input_hash,
+                        canonical_sha256,
+                    )
+                )
+            signature[stage] = tuple(stage_signature)
         return signature
 
     editorial_stages_before_correction = await editorial_stage_signature()

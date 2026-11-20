@@ -102,6 +102,7 @@ from cti_app.domain.production_synthesis import (
     production_synthesis_to_json,
 )
 from cti_app.domain.publication_kind import PublicationKind
+from tests.integration.edition_codes import reserve_edition_code
 from tests.integration.test_production_reuse_postgres import (
     _prepare_reusable_article,
     _seed_subject_discovery_lineage,
@@ -330,15 +331,15 @@ async def _seed(
     blob_store = _MemoryBlobStore()
     edition = Edition(
         country="France",
-        country_code="FR",
+        country_code=reserve_edition_code(),
         period_start=date(2026, 11, 1),
         period_end=date(2026, 11, 30),
         tlp=TLP.AMBER,
         languages=("fr",),
     )
     async with uow_factory() as uow:
-        # Resolve the logical edition key before deriving child foreign keys.
-        # add_if_absent updates edition.id when this shared row already exists.
+        # Each seed call needs its own edition so discovery snapshot version 1
+        # cannot collide with lineage left by another test in the shared DB.
         await uow.editions.add_if_absent(edition)
         await uow.commit()
 
