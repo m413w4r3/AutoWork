@@ -10,6 +10,10 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from uuid import NAMESPACE_URL, UUID, uuid5
 
+from cti_app.domain.production_editorial_enrichment import (
+    EnrichmentPlacementKind,
+    TableSpecV1,
+)
 from cti_app.domain.production_editorial_revision import TargetedEditorialRevisionOperation
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -58,10 +62,35 @@ class ManualTextPatch:
 
 
 @dataclass(frozen=True, slots=True)
+class ManualTablePatch:
+    """A typed, evidence-cited table insertion at one registered paragraph."""
+
+    anchor_block_id: UUID
+    table: TableSpecV1
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.anchor_block_id, UUID):
+            raise EditorialProposalError("proposal_patch_invalid")
+        if not isinstance(self.table, TableSpecV1):
+            raise EditorialProposalError("proposal_patch_invalid")
+        if (
+            self.table.placement.kind is not EnrichmentPlacementKind.AFTER_PARAGRAPH
+            or self.table.placement.anchor_block_id != self.anchor_block_id
+        ):
+            raise EditorialProposalError("editorial_anchor_stale")
+        if any(not row.evidence_refs for row in self.table.rows):
+            raise EditorialProposalError("manual_edit_new_fact_unadmitted")
+
+    @property
+    def operation(self) -> TargetedEditorialRevisionOperation:
+        return TargetedEditorialRevisionOperation.CREATE_TABLE
+
+
+@dataclass(frozen=True, slots=True)
 class ManualPatch:
     """The persisted proposal origin for one validated typed manual patch."""
 
-    typed_patch: ManualTextPatch
+    typed_patch: ManualTextPatch | ManualTablePatch
 
 
 class EditorialProposalEventKind(StrEnum):

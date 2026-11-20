@@ -19,6 +19,9 @@ from cti_app.application.editorial_threads import EditorialThreadApplicationErro
 from cti_app.application.editorial_workspace import EditorialWorkspaceService
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_editorial_enrichment import (
+    build_editorial_enrichment_evidence_pack,
+)
 from cti_app.application.production_synthesis import (
     SynthesisAccessPolicyV1,
     build_synthesis_access_policy,
@@ -49,6 +52,7 @@ from cti_app.domain.production_synthesis import (
     EvidenceKind,
     ExtractionEvidenceRefV1,
     extraction_evidence_refs_v1,
+    production_synthesis_from_json,
 )
 
 
@@ -103,6 +107,7 @@ class _EditorialDiscussionContextBase:
     proposal_before_hash: str | None
     proposal_base_sha256: str | None
     paragraph_evidence_context: EditorialParagraphEvidenceContext | None
+    proposal_enrichment_context: Mapping[str, object] | None
 
 
 class EditorialDiscussionContextBuilder:
@@ -306,7 +311,10 @@ class EditorialDiscussionContextBuilder:
                         (target.get("kind") == "title" and "rewrite_title" in offered_operations)
                         or (
                             target.get("kind") in {"paragraph", "lead_paragraph"}
-                            and "rewrite_paragraph" in offered_operations
+                            and (
+                                "rewrite_paragraph" in offered_operations
+                                or "create_table" in offered_operations
+                            )
                         )
                     )
                 )
@@ -324,6 +332,13 @@ class EditorialDiscussionContextBuilder:
                     run.id, ProductionArtifactStage.RELEVANCE_PROJECTION.value
                 )
                 if run
+                else None
+            )
+            enrichment_artifact = (
+                await uow.production_artifacts.get_current(
+                    run.id, ProductionArtifactStage.EDITORIAL_ENRICHMENT.value
+                )
+                if run is not None and "create_table" in offered_operations
                 else None
             )
             current_subject = await uow.subjects.get(origin.subject_id)
@@ -475,11 +490,101 @@ class EditorialDiscussionContextBuilder:
                 except Exception:
                     paragraph_evidence_context = None
 
+        enrichment_proposal_context: Mapping[str, object] | None = None
+        table_admitted: list[EditorialEvidenceEntry] | None = None
+        can_prepare_table = (
+            stage_value == "synthesis"
+            and kind in {"paragraph", "lead_paragraph"}
+            and "create_table" in offered_operations
+            and synthesis_artifact is not None
+            and synthesis_artifact.status is ProductionArtifactStatus.VERIFIED
+            and synthesis_artifact.canonical_blob_id is not None
+            and synthesis_artifact.id == resolution.record.synthesis_artifact_id
+            and synthesis_artifact.version == resolution.record.synthesis_version
+            and synthesis_artifact.production_run_id == origin.production_run_id
+            and enrichment_artifact is not None
+            and enrichment_artifact.status is ProductionArtifactStatus.VERIFIED
+            and enrichment_artifact.canonical_blob_id is not None
+            and enrichment_artifact.id == resolution.record.enrichment_artifact_id
+            and enrichment_artifact.version == resolution.record.enrichment_version
+            and enrichment_artifact.input_hash == resolution.record.enrichment_input_hash
+            and enrichment_artifact.production_run_id == origin.production_run_id
+            and enrichment_artifact.subject_id == origin.subject_id
+        )
+        if can_prepare_table:
+            assert synthesis_artifact is not None
+            assert synthesis_artifact.canonical_blob_id is not None
+            assert enrichment_artifact is not None
+            assert enrichment_artifact.canonical_blob_id is not None
+            try:
+                synthesis_payload = await self._artifact_store.read_json(
+                    synthesis_artifact.canonical_blob_id
+                )
+                synthesis = production_synthesis_from_json(synthesis_payload)
+                if (
+                    hashlib.sha256(
+                        self._artifact_store.canonical_json_bytes(synthesis_payload)
+                    ).hexdigest()
+                    != resolution.record.synthesis_canonical_sha256
+                ):
+                    raise ValueError("synthesis_pin_mismatch")
+                enrichment_payload = await self._artifact_store.read_json(
+                    enrichment_artifact.canonical_blob_id
+                )
+                if (
+                    hashlib.sha256(
+                        self._artifact_store.canonical_json_bytes(enrichment_payload)
+                    ).hexdigest()
+                    != resolution.record.enrichment_canonical_sha256
+                ):
+                    raise ValueError("enrichment_pin_mismatch")
+                enrichment_pack = build_editorial_enrichment_evidence_pack(
+                    production_snapshot,
+                    extraction,
+                    synthesis,
+                    projection,
+                    workspace_record=resolution.record,
+                )
+                if (
+                    enrichment_pack.registered_anchor_ids is None
+                    or origin.occurrence_id not in enrichment_pack.registered_anchor_ids
+                ):
+                    raise ValueError("editorial_anchor_stale")
+                table_records = (
+                    *enrichment_pack.narrative_evidence,
+                    *enrichment_pack.technical_evidence,
+                )
+                table_admitted = [
+                    {"handle": str(item["handle"]), "payload": _object_mapping(item)}
+                    for item in table_records
+                    if isinstance(item.get("handle"), str)
+                ]
+                enrichment_proposal_context = {
+                    "anchor_block_id": str(origin.occurrence_id),
+                    "target_path": proposal_target_path,
+                    "base_artifact_id": str(enrichment_artifact.id),
+                    "base_artifact_version": enrichment_artifact.version,
+                    "base_input_hash": enrichment_artifact.input_hash,
+                    "base_canonical_sha256": resolution.record.enrichment_canonical_sha256,
+                    "base_content": _object_mapping(enrichment_payload),
+                    "evidence_pack": enrichment_pack,
+                    "extraction": extraction,
+                    "synthesis": synthesis,
+                    "figure_catalog": (),
+                }
+            except Exception:
+                enrichment_proposal_context = None
+                table_admitted = None
+
+        if enrichment_proposal_context is not None and table_admitted is not None:
+            admitted = table_admitted
+
         proposal_operations = _supported_proposal_operations(
             stage=stage_value,
             block_kind=str(target.get("kind", "")),
             offered_operations=offered_operations,
             paragraph_validation_ready=paragraph_evidence_context is not None,
+            table_validation_ready=enrichment_proposal_context is not None,
         )
 
         return _EditorialDiscussionContextBase(
@@ -493,8 +598,13 @@ class EditorialDiscussionContextBuilder:
             proposal_target_path=proposal_target_path,
             proposal_operations=proposal_operations,
             proposal_before_hash=proposal_before_hash,
-            proposal_base_sha256=pinned_sha256,
+            proposal_base_sha256=(
+                resolution.record.enrichment_canonical_sha256
+                if enrichment_proposal_context is not None
+                else pinned_sha256
+            ),
             paragraph_evidence_context=paragraph_evidence_context,
+            proposal_enrichment_context=enrichment_proposal_context,
         )
 
     @staticmethod
@@ -545,6 +655,16 @@ class EditorialDiscussionContextBuilder:
                 if base.paragraph_evidence_context is not None
                 else ()
             ),
+            "proposal_enrichment_anchor": (
+                base.proposal_enrichment_context.get("anchor_block_id")
+                if base.proposal_enrichment_context is not None
+                else None
+            ),
+            "proposal_enrichment_base_sha256": (
+                base.proposal_enrichment_context.get("base_canonical_sha256")
+                if base.proposal_enrichment_context is not None
+                else None
+            ),
         }
         context_sha256 = hashlib.sha256(
             json.dumps(
@@ -574,6 +694,7 @@ class EditorialDiscussionContextBuilder:
             proposal_before_hash=base.proposal_before_hash,
             proposal_base_sha256=base.proposal_base_sha256,
             paragraph_evidence_context=base.paragraph_evidence_context,
+            proposal_enrichment_context=base.proposal_enrichment_context,
         )
 
     async def _read_event_request(
@@ -616,17 +737,19 @@ def _supported_proposal_operations(
     block_kind: str,
     offered_operations: set[str],
     paragraph_validation_ready: bool,
+    table_validation_ready: bool = False,
 ) -> tuple[str, ...]:
     if stage != "synthesis":
         return ()
     if block_kind == "title" and "rewrite_title" in offered_operations:
         return ("rewrite_title",)
-    if (
-        block_kind in {"paragraph", "lead_paragraph"}
-        and "rewrite_paragraph" in offered_operations
-        and paragraph_validation_ready
-    ):
-        return ("rewrite_paragraph",)
+    if block_kind in {"paragraph", "lead_paragraph"}:
+        operations: list[str] = []
+        if "rewrite_paragraph" in offered_operations and paragraph_validation_ready:
+            operations.append("rewrite_paragraph")
+        if "create_table" in offered_operations and table_validation_ready:
+            operations.append("create_table")
+        return tuple(operations)
     return ()
 
 

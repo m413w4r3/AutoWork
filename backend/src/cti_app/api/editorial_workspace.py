@@ -13,7 +13,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, Resp
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
 from starlette.responses import JSONResponse
 
 from cti_app.application.editorial_drafts import (
@@ -61,6 +61,16 @@ from cti_app.domain.collection import CollectionState
 from cti_app.domain.editorial_proposal import EditorialProposalConflict
 from cti_app.domain.editorial_thread import EditorialThreadEventKind
 from cti_app.domain.editorial_workspace import EditorialWorkspaceError
+from cti_app.domain.production_editorial_enrichment import (
+    EditorialAnalyticPurposeV1,
+    EnrichmentPlacementKind,
+    EnrichmentPlacementV1,
+    EnrichmentTableKind,
+    TableColumnV1,
+    TableRowV1,
+    TableSpecV1,
+)
+from cti_app.domain.production_synthesis import EvidenceKind, ExtractionEvidenceRefV1
 from cti_app.domain.publication_kind import PublicationKind
 from cti_app.infrastructure.analytic_chart_renderer import AnalyticChartRenderer
 from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
@@ -85,9 +95,10 @@ class EditorialWorkspaceRoute(APIRoute):
         async def sanitized_handler(request: Request) -> Response:
             is_accept = self.path_format.endswith("/accept")
             is_manual_edit = self.path_format.endswith("/manual-edit")
+            is_manual_table_proposal = self.path_format.endswith("/table-proposals")
             is_draft = self.path_format.endswith("/draft")
             is_figure_catalog = "/editor/figures" in self.path_format
-            if is_accept or is_manual_edit:
+            if is_accept or is_manual_edit or is_manual_table_proposal:
                 try:
                     enabled = get_settings().editorial_proposal_accept_enabled
                 except Exception:
@@ -105,7 +116,7 @@ class EditorialWorkspaceRoute(APIRoute):
                             }
                         },
                     )
-            if is_manual_edit:
+            if is_manual_edit or is_manual_table_proposal:
                 raw_length = request.headers.get("content-length")
                 if raw_length is not None:
                     try:
@@ -567,6 +578,73 @@ class EditorialManualEditRequest(BaseModel):
     snapshot_id: UUID
     operation: Literal["rewrite_title", "rewrite_paragraph"]
     text: str = Field(min_length=1)
+
+
+class EditorialTableEvidenceReferenceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_document_id: UUID
+    kind: EvidenceKind
+    evidence_key: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    def to_domain(self) -> ExtractionEvidenceRefV1:
+        return ExtractionEvidenceRefV1(
+            source_document_id=self.source_document_id,
+            kind=self.kind,
+            evidence_key=self.evidence_key,
+        )
+
+
+class EditorialTableColumnRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    key: str = Field(min_length=1, max_length=128)
+    label: str = Field(min_length=1, max_length=500)
+
+
+class EditorialTableRowRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    cells: list[str] = Field(min_length=2, max_length=64)
+    evidence_refs: list[EditorialTableEvidenceReferenceRequest] = Field(min_length=1)
+
+
+class EditorialTablePurposeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question: str = Field(min_length=1, max_length=1000)
+    available_data: str = Field(min_length=1, max_length=1000)
+    comprehension_gain: str = Field(min_length=1, max_length=1000)
+    scope: str = Field(min_length=1, max_length=1000)
+    evidence_refs: list[EditorialTableEvidenceReferenceRequest] = Field(min_length=1)
+    knowledge_limits: str = Field(min_length=1, max_length=1000)
+    placement_reason: str = Field(min_length=1, max_length=1000)
+
+
+class EditorialTableDraftRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    key: str = Field(min_length=1, max_length=128)
+    kind: EnrichmentTableKind
+    title: str = Field(min_length=1, max_length=1000)
+    caption: str | None = Field(default=None, max_length=2000)
+    columns: list[EditorialTableColumnRequest] = Field(min_length=2, max_length=64)
+    rows: list[EditorialTableRowRequest] = Field(min_length=1, max_length=1000)
+    purpose: EditorialTablePurposeRequest
+
+    @model_validator(mode="after")
+    def _row_widths_match_columns(self) -> EditorialTableDraftRequest:
+        if any(len(row.cells) != len(self.columns) for row in self.rows):
+            raise ValueError("table_row_width_mismatch")
+        return self
+
+
+class EditorialManualTableProposalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    snapshot_id: UUID
+    anchor_block_id: UUID
+    table: EditorialTableDraftRequest
 
 
 class EditorialProposalAcceptView(BaseModel):
@@ -1816,6 +1894,155 @@ async def accept_editorial_proposal(
         impact_id=result.impact.impact_id,
         impact_state=result.impact.state.value,
     )
+
+
+@router.post(
+    "/subjects/{subject_id}/editor/blocks/{occurrence_id}/table-proposals",
+    response_model=EditorialProposalView,
+)
+async def prepare_manual_editorial_table_proposal(
+    subject_id: UUID,
+    occurrence_id: UUID,
+    request: Request,
+    payload: EditorialManualTableProposalRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> EditorialProposalView:
+    if idempotency_key is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "idempotency_key_required",
+                "message": _ERROR_MESSAGES["idempotency_key_required"],
+            },
+        )
+    if not is_valid_editorial_idempotency_key(idempotency_key):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "idempotency_key_invalid",
+                "message": _ERROR_MESSAGES["idempotency_key_invalid"],
+            },
+        )
+    if payload.anchor_block_id != occurrence_id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "code": "editorial_anchor_stale",
+                "message": _ERROR_MESSAGES["editorial_anchor_stale"],
+            },
+        )
+    if not _proposal_impact_consumer_wired():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "manual_edit_unavailable",
+                "message": _ERROR_MESSAGES["manual_edit_unavailable"],
+            },
+        )
+
+    from cti_app.domain.editorial_proposal import ManualPatch, ManualTablePatch
+
+    table_input = payload.table
+    purpose_input = table_input.purpose
+    try:
+        table = TableSpecV1(
+            key=table_input.key,
+            kind=table_input.kind,
+            title=table_input.title,
+            caption=table_input.caption,
+            columns=tuple(
+                TableColumnV1(column.key, column.label) for column in table_input.columns
+            ),
+            rows=tuple(
+                TableRowV1(
+                    tuple(row.cells),
+                    tuple(reference.to_domain() for reference in row.evidence_refs),
+                )
+                for row in table_input.rows
+            ),
+            placement=EnrichmentPlacementV1(
+                EnrichmentPlacementKind.AFTER_PARAGRAPH,
+                anchor_block_id=occurrence_id,
+            ),
+            purpose=EditorialAnalyticPurposeV1(
+                question=purpose_input.question,
+                available_data=purpose_input.available_data,
+                comprehension_gain=purpose_input.comprehension_gain,
+                scope=purpose_input.scope,
+                evidence_refs=tuple(
+                    reference.to_domain() for reference in purpose_input.evidence_refs
+                ),
+                knowledge_limits=purpose_input.knowledge_limits,
+                placement_reason=purpose_input.placement_reason,
+            ),
+        )
+        service = _manual_proposal_service(request)
+        actor_id = await _thread_actor_id(request)
+        proposal = await service.prepare_manual_patch(
+            subject_id=subject_id,
+            snapshot_id=payload.snapshot_id,
+            occurrence_id=occurrence_id,
+            actor_id=actor_id,
+            idempotency_key=idempotency_key,
+            patch=ManualPatch(
+                typed_patch=ManualTablePatch(anchor_block_id=occurrence_id, table=table)
+            ),
+        )
+        if proposal.patch_sha256 is None:
+            raise EditorialProposalApplicationError("proposal_patch_invalid")
+        view = await service.inspect(
+            subject_id,
+            occurrence_id,
+            proposal.id,
+            workspace_service=_service(request),
+        )
+        return EditorialProposalView.model_validate(view, from_attributes=True)
+    except HTTPException:
+        raise
+    except EditorialProposalConflict as error:
+        logger.warning(
+            "manual_table_proposal_rejected code=%s subject_id=%s occurrence_id=%s",
+            error.code,
+            subject_id,
+            occurrence_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "proposal_idempotency_conflict",
+                "message": _ERROR_MESSAGES["proposal_idempotency_conflict"],
+            },
+        ) from error
+    except (EditorialProposalApplicationError, EditorialWorkspaceError, ValueError) as error:
+        code = getattr(error, "code", None) or str(error)
+        logger.warning(
+            "manual_table_proposal_rejected code=%s subject_id=%s occurrence_id=%s",
+            code,
+            subject_id,
+            occurrence_id,
+        )
+        if code in {"editorial_anchor_stale", "proposal_base_stale", "editorial_snapshot_stale"}:
+            response_status = status.HTTP_409_CONFLICT
+        elif code in {
+            "manual_edit_new_fact_unadmitted",
+            "manual_edit_patch_invalid",
+            "proposal_target_mismatch",
+            "proposal_operation_unsupported",
+        }:
+            response_status = status.HTTP_422_UNPROCESSABLE_CONTENT
+        elif code in {"proposal_base_unavailable", "proposal_workspace_unavailable"}:
+            response_status = status.HTTP_503_SERVICE_UNAVAILABLE
+        else:
+            response_status = status.HTTP_422_UNPROCESSABLE_CONTENT
+        raise HTTPException(
+            status_code=response_status,
+            detail={
+                "code": code,
+                "message": _ERROR_MESSAGES.get(
+                    code, "Le brouillon de tableau ne respecte pas le contrat éditorial."
+                ),
+            },
+        ) from None
 
 
 @router.post(

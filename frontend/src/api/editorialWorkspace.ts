@@ -297,7 +297,100 @@ export interface EditorialProposalPatch {
   before_hash: string;
   rationale: string;
   after?: string;
-  enrichment_patch?: Record<string, unknown>;
+  enrichment_patch?: EditorialEnrichmentProposalPatch;
+}
+
+export type EditorialEnrichmentTableKind =
+  | "commands"
+  | "dropped_files"
+  | "tools"
+  | "techniques"
+  | "infrastructure"
+  | "timeline"
+  | "configuration"
+  | "custom";
+
+export interface EditorialEvidenceReference {
+  source_document_id: string;
+  kind:
+    | "fact"
+    | "event"
+    | "source_metadata"
+    | "indicator"
+    | "rule"
+    | "uncertainty";
+  evidence_key: string;
+}
+
+export interface EditorialTableColumn {
+  key: string;
+  label: string;
+}
+
+export interface EditorialTableRow {
+  cells: string[];
+  evidence_handles: string[];
+}
+
+export interface EditorialTablePurpose {
+  question: string;
+  available_data: string;
+  comprehension_gain: string;
+  scope: string;
+  evidence_handles: string[];
+  knowledge_limits: string;
+  placement_reason: string;
+}
+
+export interface EditorialTableProposal {
+  key: string;
+  kind: EditorialEnrichmentTableKind;
+  title: string;
+  caption: string | null;
+  columns: EditorialTableColumn[];
+  rows: EditorialTableRow[];
+  placement: {
+    kind:
+      | "after_paragraph"
+      | "after_lead"
+      | "after_timeline"
+      | "after_section"
+      | "end";
+    section_index?: number | null;
+    anchor_block_id?: string | null;
+  };
+  purpose: EditorialTablePurpose;
+}
+
+export interface EditorialEnrichmentProposalPatch {
+  tables?: EditorialTableProposal[];
+  charts?: unknown[];
+  diagrams?: unknown[];
+  annotations?: unknown[];
+  figures?: unknown[];
+  resource_needs?: unknown[];
+  [key: string]: unknown;
+}
+
+export interface EditorialManualTableDraft {
+  key: string;
+  kind: EditorialEnrichmentTableKind;
+  title: string;
+  caption?: string | null;
+  columns: EditorialTableColumn[];
+  rows: Array<{
+    cells: string[];
+    evidence_refs: EditorialEvidenceReference[];
+  }>;
+  purpose: Omit<EditorialTablePurpose, "evidence_handles"> & {
+    evidence_refs: EditorialEvidenceReference[];
+  };
+}
+
+export interface EditorialManualTableProposalInput {
+  snapshot_id: string;
+  anchor_block_id: string;
+  table: EditorialManualTableDraft;
 }
 
 export interface EditorialProposalRead {
@@ -600,6 +693,25 @@ export function acceptEditorialProposal(
         "Idempotency-Key": crypto.randomUUID(),
       },
       body: JSON.stringify(decision),
+    },
+  );
+}
+
+export function createManualEditorialTableProposal(
+  subjectId: string,
+  anchorBlockId: string,
+  idempotencyKey: string,
+  input: EditorialManualTableProposalInput,
+): Promise<EditorialProposalRead> {
+  return request<EditorialProposalRead>(
+    `/api/subjects/${encodeURIComponent(subjectId)}/editor/blocks/${encodeURIComponent(anchorBlockId)}/table-proposals`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Idempotency-Key": idempotencyKey,
+      },
+      body: JSON.stringify(input),
     },
   );
 }

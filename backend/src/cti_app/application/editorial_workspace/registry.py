@@ -23,8 +23,11 @@ from cti_app.domain.editorial_workspace import (
     validate_block_registry,
 )
 from cti_app.domain.production import ProductionArtifactStage
+from cti_app.domain.production_editorial_enrichment import EditorialEnrichmentElementKind
 from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionOperation,
+    TargetedEditorialRevisionPlacement,
+    TargetedEditorialRevisionPlacementKind,
     TargetedEditorialRevisionTarget,
     TargetedEditorialRevisionTargetKind,
 )
@@ -366,10 +369,17 @@ def _is_legacy_catalog_target_for_entry(
 def allowed_operations(
     entry: BlockRegistryEntry,
     canonical_content: Mapping[str, Any],
+    *,
+    allow_table_insertion: bool = False,
 ) -> tuple[str, ...]:
     if entry.source_stage != "synthesis":
         return ()
     _, operations, _legacy_target_id = _target_for_entry(entry, canonical_content)
+    if allow_table_insertion and entry.kind in {
+        EditorialBlockKind.LEAD_PARAGRAPH,
+        EditorialBlockKind.PARAGRAPH,
+    }:
+        operations = (*operations, TargetedEditorialRevisionOperation.CREATE_TABLE.value)
     return operations
 
 
@@ -390,7 +400,30 @@ def resolve_workspace_target(
     except (TypeError, ValueError) as exc:
         raise EditorialBlockMissingError("editorial_block_missing") from exc
     if operation not in operations:
-        raise EditorialBlockMissingError("editorial_block_missing")
+        if typed_operation is TargetedEditorialRevisionOperation.CREATE_TABLE and entry.kind in {
+            EditorialBlockKind.LEAD_PARAGRAPH,
+            EditorialBlockKind.PARAGRAPH,
+        }:
+            operations = (*operations, typed_operation.value)
+        else:
+            raise EditorialBlockMissingError("editorial_block_missing")
+    if typed_operation is TargetedEditorialRevisionOperation.CREATE_TABLE:
+        table_target = TargetedEditorialRevisionTarget(
+            kind=TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT,
+            element_kind=EditorialEnrichmentElementKind.TABLE,
+            placement=TargetedEditorialRevisionPlacement(
+                kind=TargetedEditorialRevisionPlacementKind.AFTER_PARAGRAPH,
+                anchor_block_id=entry.block_id,
+            ),
+        )
+        return ResolvedWorkspaceTarget(
+            entry.block_id,
+            f"synthesis{entry.structural_pointer}",
+            entry.content_sha256,
+            operation,
+            table_target,
+            canonical_content_sha256(table_target.to_json()),
+        )
     try:
         resolved = resolve_canonical_target(reduced_content, target, typed_operation)
     except ValueError as exc:
@@ -450,7 +483,15 @@ def project_blocks(
             text_value = str(value)
         evidence_refs = _project_evidence_refs(value)
         operations = (
-            allowed_operations(entry, synthesis)
+            allowed_operations(
+                entry,
+                synthesis,
+                allow_table_insertion=(
+                    record is not None
+                    and record.enrichment_artifact_id is not None
+                    and record.enrichment_canonical_sha256 is not None
+                ),
+            )
             if allow_operations and entry.revision_status is EditorialRevisionStatus.READY
             else ()
         )

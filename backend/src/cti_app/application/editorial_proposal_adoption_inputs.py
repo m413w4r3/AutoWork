@@ -466,7 +466,7 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                 raise EditorialProposalAdoptionError("proposal_target_mismatch")
             if _target_id(target) != proposal.target_id:
                 raise EditorialProposalAdoptionError("proposal_target_mismatch")
-            if target.element_kind is None or target.element_key is None:
+            if target.element_kind is None:
                 raise EditorialProposalAdoptionError("proposal_target_mismatch")
             is_create = operation in {
                 TargetedEditorialRevisionOperation.CREATE_TABLE,
@@ -480,16 +480,52 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                 TargetedEditorialRevisionOperation.DELETE_CHART,
                 TargetedEditorialRevisionOperation.DELETE_SOURCE_FIGURE,
             }
+            table_insertion = operation is TargetedEditorialRevisionOperation.CREATE_TABLE
+            raw_patch = patch.get("enrichment_patch")
+            if not isinstance(raw_patch, dict):
+                raise EditorialProposalAdoptionError("proposal_patch_invalid")
+            table_key: str | None = None
+            if table_insertion:
+                raw_tables = raw_patch.get("tables")
+                if (
+                    target.element_kind is not EditorialEnrichmentElementKind.TABLE
+                    or target.element_key is not None
+                    or target.placement is None
+                    or target.placement.kind
+                    is not TargetedEditorialRevisionPlacementKind.AFTER_PARAGRAPH
+                    or target.placement.anchor_block_id != proposal.occurrence_id
+                    or not isinstance(raw_tables, list)
+                    or len(raw_tables) != 1
+                    or not isinstance(raw_tables[0], Mapping)
+                    or not isinstance(raw_tables[0].get("key"), str)
+                ):
+                    raise EditorialProposalAdoptionError("editorial_anchor_stale")
+                table_key = str(raw_tables[0]["key"])
+            element_key = table_key if table_insertion else target.element_key
+            if element_key is None:
+                raise EditorialProposalAdoptionError("proposal_target_mismatch")
             base_enrichment = editorial_enrichment_from_json(base_payload)
             target_entry = resolution.entry
             if (
                 target_entry is None
                 or resolution.binding_state != "valid"
-                or target_entry.source_stage is not EditorialSourceStage.EDITORIAL_ENRICHMENT
+                or (
+                    target_entry.source_stage is not EditorialSourceStage.SYNTHESIS
+                    if table_insertion
+                    else target_entry.source_stage is not EditorialSourceStage.EDITORIAL_ENRICHMENT
+                )
                 or target_entry.content_sha256 != proposal.before_hash
+                or (
+                    table_insertion
+                    and (
+                        target_entry.kind.value not in {"paragraph", "lead_paragraph"}
+                        or target_entry.block_id != proposal.occurrence_id
+                    )
+                )
             ):
                 raise EditorialProposalAdoptionError(
-                    "proposal_base_stale", reason="pins:enrichment_occurrence"
+                    "editorial_anchor_stale" if table_insertion else "proposal_base_stale",
+                    reason=None if table_insertion else "pins:enrichment_occurrence",
                 )
             request = TargetedEditorialRevisionRequest(
                 subject_id=proposal.subject_id,
@@ -504,13 +540,10 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                 requester=str(proposal.actor_id),
                 before_hash=proposal.before_hash,
             )
-            raw_patch = patch.get("enrichment_patch")
-            if not isinstance(raw_patch, dict):
-                raise EditorialProposalAdoptionError("proposal_patch_invalid")
             validated_patch = validate_editorial_enrichment_patch(
                 raw_patch,
                 element_kind=target.element_kind,
-                element_key=target.element_key,
+                element_key=element_key,
                 evidence_pack=fence.evidence_pack,
                 extraction=extraction,
                 synthesis=synthesis,
@@ -520,7 +553,7 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                 base_enrichment=base_enrichment,
                 candidate=validated_patch,
                 element_kind=target.element_kind,
-                element_key=target.element_key,
+                element_key=element_key,
                 operation=operation,
                 is_create=is_create,
             )
@@ -530,6 +563,7 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                     element_kind=target.element_kind,
                     targeted_request=request,
                     synthesis=synthesis,
+                    evidence_pack=fence.evidence_pack if table_insertion else None,
                 )
             candidate = await build_enrichment_candidate(
                 base_artifact=base_artifact,
@@ -541,7 +575,7 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                 extraction=extraction,
                 synthesis=synthesis,
                 element_kind=target.element_kind,
-                element_key=target.element_key,
+                element_key=element_key,
                 action=targeted_action(operation),
                 input_hash=fence.input_hash,
                 artifact_id=uuid4(),
@@ -560,7 +594,7 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                 evidence_pack=fence.evidence_pack,
                 targeted_request=request,
                 element_kind=target.element_kind,
-                element_key=target.element_key,
+                element_key=element_key,
                 input_hash=fence.input_hash,
                 artifact_id=candidate.artifact_id,
                 figure_catalog=fence.figure_catalog,
@@ -881,15 +915,27 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
             raise EditorialProposalAdoptionError(
                 "proposal_base_stale", reason="routing:decision_hash"
             )
-        if resolution.artifact_id != artifact.id:
+        table_insertion = (
+            stage is ProductionArtifactStage.EDITORIAL_ENRICHMENT
+            and proposal.operation == TargetedEditorialRevisionOperation.CREATE_TABLE.value
+            and resolution.entry is not None
+            and resolution.entry.source_stage is EditorialSourceStage.SYNTHESIS
+        )
+        expected_occurrence_artifact = current_synthesis_artifact if table_insertion else artifact
+        if (
+            expected_occurrence_artifact is None
+            or resolution.artifact_id != expected_occurrence_artifact.id
+            or resolution.artifact_version != expected_occurrence_artifact.version
+        ):
             raise EditorialProposalAdoptionError(
                 "proposal_base_stale", reason="resolution:artifact_id"
             )
-        if resolution.artifact_version != artifact.version:
-            raise EditorialProposalAdoptionError(
-                "proposal_base_stale", reason="resolution:artifact_version"
-            )
-        if resolution.canonical_sha256 != proposal.base_canonical_sha256:
+        expected_resolution_sha = (
+            resolution.record.synthesis_canonical_sha256
+            if table_insertion
+            else proposal.base_canonical_sha256
+        )
+        if resolution.canonical_sha256 != expected_resolution_sha:
             raise EditorialProposalAdoptionError(
                 "proposal_base_stale", reason="resolution:canonical_sha256"
             )
@@ -1207,6 +1253,11 @@ def _enrichment_target(raw: object) -> TargetedEditorialRevisionTarget:
                 section_id=(
                     str(placement_data["section_id"])
                     if placement_data.get("section_id") is not None
+                    else None
+                ),
+                anchor_block_id=(
+                    UUID(str(placement_data["anchor_block_id"]))
+                    if placement_data.get("anchor_block_id") is not None
                     else None
                 ),
             )

@@ -41,7 +41,10 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
 )
-from cti_app.domain.production_editorial_revision import TargetedEditorialRevisionTarget
+from cti_app.domain.production_editorial_revision import (
+    TargetedEditorialRevisionOperation,
+    TargetedEditorialRevisionTarget,
+)
 from cti_app.domain.publication_render import PublicationPreviewStatus
 from cti_app.domain.typst_render import TypstRenderStatus
 
@@ -136,6 +139,13 @@ class EditorialWorkspaceService:
             raise EditorialWorkspaceError("editorial_snapshot_stale")
         if record.publication_kind is None:
             raise EditorialWorkspaceError("publication_kind_unresolved")
+        if operation == TargetedEditorialRevisionOperation.CREATE_TABLE.value and (
+            record.enrichment_artifact_id is None
+            or record.enrichment_version is None
+            or record.enrichment_input_hash is None
+            or record.enrichment_canonical_sha256 is None
+        ):
+            raise EditorialWorkspaceError("editorial_block_missing")
         occurrence = resolve_registry_occurrence(record, block_id)
         entry = occurrence.entry
         if entry is None:
@@ -167,6 +177,13 @@ class EditorialWorkspaceService:
             raise EditorialWorkspaceError("editorial_snapshot_stale")
         if record.publication_kind is None:
             raise EditorialWorkspaceError("publication_kind_unresolved")
+        if operation == TargetedEditorialRevisionOperation.CREATE_TABLE.value and (
+            record.enrichment_artifact_id is None
+            or record.enrichment_version is None
+            or record.enrichment_input_hash is None
+            or record.enrichment_canonical_sha256 is None
+        ):
+            raise EditorialWorkspaceError("editorial_block_missing")
         occurrence = resolve_registry_occurrence(record, block_id)
         if occurrence.entry is None:
             raise EditorialWorkspaceError("editorial_block_missing")

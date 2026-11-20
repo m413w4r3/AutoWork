@@ -136,6 +136,11 @@ def validate_targeted_request(request: TargetedEditorialRevisionRequest) -> None
     if request.operation in create_operations:
         if target.element_key is not None or target.placement is None:
             raise ValueError("targeted_enrichment_revision_create_target_invalid")
+        if target.placement.kind is TargetedEditorialRevisionPlacementKind.AFTER_PARAGRAPH and (
+            request.operation is not TargetedEditorialRevisionOperation.CREATE_TABLE
+            or target.placement.anchor_block_id is None
+        ):
+            raise ValueError("targeted_enrichment_revision_placement_invalid")
     elif target.element_key is None or target.placement is not None:
         raise ValueError("targeted_enrichment_revision_element_target_invalid")
 
@@ -263,6 +268,13 @@ def assert_requested_placement(
             synthesis=synthesis,
             evidence_pack=evidence_pack,
         )
+    elif requested.kind is TargetedEditorialRevisionPlacementKind.AFTER_PARAGRAPH:
+        if targeted_request.operation is not TargetedEditorialRevisionOperation.CREATE_TABLE:
+            raise ValueError("targeted_enrichment_revision_placement_invalid")
+        expected = EnrichmentPlacementV1(
+            EnrichmentPlacementKind.AFTER_PARAGRAPH,
+            anchor_block_id=requested.anchor_block_id,
+        )
     elif requested.kind is TargetedEditorialRevisionPlacementKind.AFTER_LEAD:
         expected = EnrichmentPlacementV1(EnrichmentPlacementKind.AFTER_LEAD)
     elif requested.kind is TargetedEditorialRevisionPlacementKind.AFTER_TIMELINE:
@@ -310,6 +322,33 @@ def requested_registered_placement(
     if requested is None:
         raise ValueError("targeted_enrichment_revision_placement_required")
     current_synthesis = evidence_pack.current_synthesis
+    if requested.kind is TargetedEditorialRevisionPlacementKind.AFTER_PARAGRAPH:
+        anchor_id = requested.anchor_block_id
+        if (
+            targeted_request.operation is not TargetedEditorialRevisionOperation.CREATE_TABLE
+            or anchor_id is None
+            or evidence_pack.registered_anchor_ids is None
+            or anchor_id not in evidence_pack.registered_anchor_ids
+        ):
+            raise ValueError("editorial_anchor_stale")
+        paragraphs = (
+            *current_synthesis.get("lead", ()),
+            *(
+                paragraph
+                for section in current_synthesis.get("sections", ())
+                if isinstance(section, Mapping)
+                for paragraph in section.get("paragraphs", ())
+            ),
+        )
+        if not any(
+            isinstance(paragraph, Mapping) and paragraph.get("block_id") == str(anchor_id)
+            for paragraph in paragraphs
+        ):
+            raise ValueError("editorial_anchor_stale")
+        return EnrichmentPlacementV1(
+            EnrichmentPlacementKind.AFTER_PARAGRAPH,
+            anchor_block_id=anchor_id,
+        )
     if requested.kind is TargetedEditorialRevisionPlacementKind.AFTER_LEAD:
         paragraphs = current_synthesis.get("lead", ())
     elif requested.kind is TargetedEditorialRevisionPlacementKind.AFTER_SECTION:

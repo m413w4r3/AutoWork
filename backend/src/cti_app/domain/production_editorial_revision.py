@@ -65,6 +65,7 @@ class TargetedEditorialRevisionTargetKind(StrEnum):
 class TargetedEditorialRevisionPlacementKind(StrEnum):
     AFTER_LEAD = "after_lead"
     AFTER_SECTION = "after_section"
+    AFTER_PARAGRAPH = "after_paragraph"
     AFTER_TIMELINE = "after_timeline"
 
 
@@ -72,6 +73,7 @@ class TargetedEditorialRevisionPlacementKind(StrEnum):
 class TargetedEditorialRevisionPlacement:
     kind: TargetedEditorialRevisionPlacementKind
     section_id: str | None = None
+    anchor_block_id: UUID | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, TargetedEditorialRevisionPlacementKind):
@@ -79,11 +81,19 @@ class TargetedEditorialRevisionPlacement:
         if self.kind is TargetedEditorialRevisionPlacementKind.AFTER_SECTION:
             if self.section_id is None or _SHA256.fullmatch(self.section_id) is None:
                 raise ValueError("targeted_editorial_revision_placement_section_required")
-        elif self.section_id is not None:
+            if self.anchor_block_id is not None:
+                raise ValueError("targeted_editorial_revision_placement_anchor_invalid")
+        elif self.kind is TargetedEditorialRevisionPlacementKind.AFTER_PARAGRAPH:
+            if not isinstance(self.anchor_block_id, UUID) or self.section_id is not None:
+                raise ValueError("targeted_editorial_revision_anchor_required")
+        elif self.section_id is not None or self.anchor_block_id is not None:
             raise ValueError("targeted_editorial_revision_placement_section_invalid")
 
     def to_json(self) -> dict[str, Any]:
-        return {"kind": self.kind.value, "section_id": self.section_id}
+        payload: dict[str, Any] = {"kind": self.kind.value, "section_id": self.section_id}
+        if self.anchor_block_id is not None:
+            payload["anchor_block_id"] = str(self.anchor_block_id)
+        return payload
 
 
 class TargetedEditorialRevisionRefusalCode(StrEnum):

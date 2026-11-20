@@ -1086,6 +1086,23 @@ def _proposal_stage(
     target_kind = target.get("kind")
     if target_kind == TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT.value:
         stage = ProductionArtifactStage.EDITORIAL_ENRICHMENT
+        placement = target.get("placement")
+        is_paragraph_table_create = (
+            proposal.operation == TargetedEditorialRevisionOperation.CREATE_TABLE.value
+            and target.get("element_kind") == EditorialEnrichmentElementKind.TABLE.value
+            and target.get("element_key") is None
+            and isinstance(placement, Mapping)
+            and placement.get("kind") == "after_paragraph"
+            and str(placement.get("anchor_block_id")) == str(proposal.occurrence_id)
+        )
+        if is_paragraph_table_create:
+            if (
+                resolution.entry is None
+                or resolution.entry.source_stage is not EditorialSourceStage.SYNTHESIS
+                or resolution.entry.kind.value not in {"paragraph", "lead_paragraph"}
+            ):
+                raise EditorialProposalAdoptionError("editorial_anchor_stale")
+            return stage
     elif target_kind in {
         TargetedEditorialRevisionTargetKind.TITLE.value,
         TargetedEditorialRevisionTargetKind.LEAD.value,
@@ -1114,10 +1131,25 @@ def _proposal_pins_match(
     if (
         resolution.entry is None
         or resolution.binding_state != "valid"
-        or resolution.artifact_id != proposal.base_artifact_id
+        or not _proposal_fences_match_record(proposal, record)
+    ):
+        return False
+    if proposal.operation == TargetedEditorialRevisionOperation.CREATE_TABLE.value:
+        return (
+            resolution.entry.source_stage is EditorialSourceStage.SYNTHESIS
+            and resolution.entry.kind.value in {"paragraph", "lead_paragraph"}
+            and resolution.artifact_id == record.synthesis_artifact_id
+            and resolution.artifact_version == record.synthesis_version
+            and resolution.canonical_sha256 == record.synthesis_canonical_sha256
+            and record.enrichment_artifact_id == proposal.base_artifact_id
+            and record.enrichment_version == proposal.base_artifact_version
+            and record.enrichment_input_hash == proposal.base_input_hash
+            and record.enrichment_canonical_sha256 == proposal.base_canonical_sha256
+        )
+    if (
+        resolution.artifact_id != proposal.base_artifact_id
         or resolution.artifact_version != proposal.base_artifact_version
         or resolution.canonical_sha256 != proposal.base_canonical_sha256
-        or not _proposal_fences_match_record(proposal, record)
     ):
         return False
     if resolution.entry.source_stage is EditorialSourceStage.SYNTHESIS:

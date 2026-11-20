@@ -2778,7 +2778,7 @@ async def test_real_typst_renders_annotated_literal_content_without_evaluating_i
 
 
 @pytest.mark.asyncio
-async def test_real_typst_compiles_v9_placements_and_preserves_pdf_order(
+async def test_real_typst_table_follows_anchor_paragraph_in_pdf(
     tmp_path: Path,
     typst_binary: str,
     font_bundle_root: Path,
@@ -2791,6 +2791,7 @@ async def test_real_typst_compiles_v9_placements_and_preserves_pdf_order(
     from cti_app.domain.production_editorial_enrichment import (
         EnrichmentPlacementKind,
         EnrichmentPlacementV1,
+        TableRowV1,
     )
     from cti_app.domain.production_synthesis import (
         extraction_evidence_refs_v1,
@@ -2830,8 +2831,12 @@ async def test_real_typst_compiles_v9_placements_and_preserves_pdf_order(
     )
     first = _enrichment_table(extraction_evidence_refs_v1(extraction)[0], key="z_canonical_first")
     second = _enrichment_table(extraction_evidence_refs_v1(extraction)[0], key="a_canonical_second")
+    long_table = _enrichment_table(
+        extraction_evidence_refs_v1(extraction)[0], key="m_long_anchored_table"
+    )
     assert first.purpose is not None
     assert second.purpose is not None
+    assert long_table.purpose is not None
     tables = (
         replace(
             first,
@@ -2846,6 +2851,19 @@ async def test_real_typst_compiles_v9_placements_and_preserves_pdf_order(
             caption="A second placement caption",
             placement=placement,
             purpose=replace(second.purpose, question="Which second canonical tool is documented?"),
+        ),
+        replace(
+            long_table,
+            title="Long anchored table",
+            caption="T-M5-22 long table caption",
+            rows=tuple(
+                TableRowV1(first.rows[0].cells, first.rows[0].evidence_refs) for _ in range(80)
+            ),
+            placement=placement,
+            purpose=replace(
+                long_table.purpose,
+                question="Which documented actor and infrastructure values are cited?",
+            ),
         ),
     )
     enrichment = replace(
@@ -2877,6 +2895,7 @@ async def test_real_typst_compiles_v9_placements_and_preserves_pdf_order(
     assert [item.element_key for item in document.resolved_placements] == [
         "z_canonical_first",
         "a_canonical_second",
+        "m_long_anchored_table",
     ]
 
     template_bundle = load_template_bundle(_CHP_TYPST_ROOT)
@@ -2900,12 +2919,23 @@ async def test_real_typst_compiles_v9_placements_and_preserves_pdf_order(
     )
     pdf_path = tmp_path / "after-paragraph-v9.pdf"
     pdf_path.write_bytes(compiled.content)
-    text, _compact = _normalized_pdf_text(PdfReader(BytesIO(compiled.content), strict=True))
+    reader = PdfReader(BytesIO(compiled.content), strict=True)
+    text, _compact = _normalized_pdf_text(reader)
     normalized = text.casefold()
     lead_position = normalized.index("example finding.")
     first_position = normalized.index("z canonical first")
     second_position = normalized.index("a canonical second")
-    assert lead_position < first_position < second_position
+    long_position = normalized.index("long anchored table")
+    caption_position = normalized.index("t-m5-22 long table caption")
+    assert lead_position < first_position < second_position < long_position
+    assert caption_position > long_position
+    pages_with_rows = sum(
+        "execution" in (page.extract_text() or "").casefold() for page in reader.pages
+    )
+    assert pages_with_rows >= 2
+    demo_output = os.environ.get("AUTOWORK_TABLE_DEMO_OUTPUT")
+    if demo_output:
+        _write_pdf(Path(demo_output), compiled.content)
 
 
 @pytest.mark.asyncio

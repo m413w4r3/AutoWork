@@ -7,9 +7,10 @@ import json
 import logging
 import re
 import secrets
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, NotRequired, Protocol, TypedDict
+from typing import TYPE_CHECKING, Any, NotRequired, Protocol, TypedDict
 from uuid import UUID
 
 from cti_app.application.blobs import BlobCatalogService
@@ -46,7 +47,7 @@ if TYPE_CHECKING:
     from cti_app.domain.production_synthesis import ExtractionEvidenceRefV1
     from cti_app.domain.publication_kind import PublicationKind
 
-EDITORIAL_DISCUSSION_PROMPT_VERSION = "3"
+EDITORIAL_DISCUSSION_PROMPT_VERSION = "4"
 
 
 class EditorialDiscussionObjective(StrEnum):
@@ -84,6 +85,7 @@ class EditorialDiscussionContext:
     proposal_before_hash: str | None = None
     proposal_base_sha256: str | None = None
     paragraph_evidence_context: EditorialParagraphEvidenceContext | None = None
+    proposal_enrichment_context: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         for value in (self.evidence_pack_hash, self.context_sha256):
@@ -122,6 +124,12 @@ def _editorial_discussion_data(
             "allowed_operations": list(context.proposal_operations),
             "before_hash": context.proposal_before_hash,
             "base_artifact_hash": context.proposal_base_sha256,
+            "anchor_block_id": (
+                str(context.proposal_enrichment_context.get("anchor_block_id"))
+                if context.proposal_enrichment_context is not None
+                and context.proposal_enrichment_context.get("anchor_block_id") is not None
+                else None
+            ),
         }
     return data
 
@@ -143,6 +151,16 @@ def _editorial_discussion_prompt(
         untrusted_data.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
     )
     if objective is EditorialDiscussionObjective.PROPOSAL:
+        table_instructions = (
+            " Pour create_table, AFTER doit être un objet JSON EditorialEnrichmentProposalV1 "
+            "avec exactement une table, charts/diagrams/annotations/figures/resource_needs vides, "
+            "des colonnes {key,label}, des lignes {cells,evidence_handles}, et une purpose "
+            "avec evidence_handles. Chaque ligne doit citer au moins un handle admis. Le placement "
+            "doit être {kind: after_paragraph, anchor_block_id: l'UUID exact fourni}. Aucun champ "
+            "de cellule ne peut contenir de HTML, SVG, Typst ou autre balisage."
+            if "create_table" in context.proposal_operations
+            else ""
+        )
         instructions = (
             "EDITORIAL PROPOSAL — TYPED PATCH ONLY\n"
             "Répondez uniquement par un patch éditorial typé au format à marqueurs ci-dessous, "
@@ -151,7 +169,9 @@ def _editorial_discussion_prompt(
             "recopiez exactement la cible et les deux empreintes fournies. Si aucune opération "
             "sûre ne convient, répondez avec le marqueur REFUSAL et le code "
             "revision_not_applicable. Pour un patch, utilisez exactement TARGET, ACTION, "
-            "BASE_ARTIFACT_HASH, BEFORE_HASH, AFTER et RATIONALE, chacun dans son bloc @@.\n\n"
+            "BASE_ARTIFACT_HASH, BEFORE_HASH, AFTER et RATIONALE, chacun dans son bloc @@."
+            + table_instructions
+            + "\n\n"
         )
     else:
         instructions = (
