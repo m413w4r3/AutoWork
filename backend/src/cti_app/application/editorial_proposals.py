@@ -72,6 +72,7 @@ from cti_app.domain.errors import BlobIntegrityError
 from cti_app.domain.model_conversations import ConversationTurnStatus
 from cti_app.domain.model_runs import ModelRunStatus
 from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
+from cti_app.domain.production_editorial_enrichment import normalize_analytic_question
 from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionConflictError,
     TargetedEditorialRevisionMode,
@@ -330,6 +331,32 @@ def _manual_table_evidence_handles(
         raise EditorialProposalApplicationError("manual_edit_new_fact_unadmitted")
     refs.extend(_evidence_reference_json(reference) for reference in table.purpose.evidence_refs)
     return table_handles, refs
+
+
+def _manual_table_question_conflicts_with_base(
+    question: str,
+    base_content: Mapping[str, Any],
+) -> bool:
+    normalized_question = normalize_analytic_question(question)
+    if not normalized_question:
+        return False
+    for collection_name in ("tables", "diagrams", "charts", "source_figures"):
+        entries = base_content.get(collection_name)
+        if not isinstance(entries, (list, tuple)):
+            continue
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                continue
+            purpose = entry.get("purpose")
+            if not isinstance(purpose, Mapping):
+                continue
+            existing_question = purpose.get("question")
+            if (
+                isinstance(existing_question, str)
+                and normalize_analytic_question(existing_question) == normalized_question
+            ):
+                return True
+    return False
 
 
 def _manual_table_request_sha256(
@@ -904,6 +931,11 @@ class EditorialProposalService:
         ):
             raise EditorialProposalApplicationError("proposal_operation_unsupported")
         enrichment_context = context.proposal_enrichment_context
+        base_content = enrichment_context.get("base_content")
+        if not isinstance(base_content, Mapping):
+            raise EditorialProposalApplicationError("proposal_base_unavailable")
+        if _manual_table_question_conflicts_with_base(table.purpose.question, base_content):
+            raise EditorialProposalApplicationError("manual_table_analytic_question_duplicate")
         evidence_pack = enrichment_context.get("evidence_pack")
         if evidence_pack is None:
             raise EditorialProposalApplicationError("proposal_base_unavailable")
@@ -940,9 +972,6 @@ class EditorialProposalService:
             or enrichment_context.get("base_canonical_sha256") != record.enrichment_canonical_sha256
         ):
             raise EditorialProposalApplicationError("editorial_anchor_stale")
-        base_content = enrichment_context.get("base_content")
-        if not isinstance(base_content, Mapping):
-            raise EditorialProposalApplicationError("proposal_base_unavailable")
         raw_table = _manual_table_proposal_json(
             table,
             row_handles=table_handles,

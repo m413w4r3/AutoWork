@@ -5,7 +5,10 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from fastapi import FastAPI, HTTPException
+from starlette.requests import Request
 
+from cti_app.api import editorial_workspace as editorial_workspace_api
 from cti_app.application.editorial_proposal_adoption import (
     EditorialProposalAdoptionError,
     _proposal_pins_match,
@@ -23,9 +26,12 @@ from cti_app.domain.editorial_workspace import (
     EditorialSourceStage,
     canonical_content_sha256,
 )
+from cti_app.domain.production_editorial_enrichment import EditorialEnrichmentElementKind
 from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionPlacement,
     TargetedEditorialRevisionPlacementKind,
+    TargetedEditorialRevisionTarget,
+    TargetedEditorialRevisionTargetKind,
 )
 
 
@@ -218,3 +224,194 @@ def test_table_patch_keeps_anchor_through_adoption() -> None:
 def test_manual_table_text_rejects_markup() -> None:
     assert _editorial_patch_text_violation("<b>forged cell</b>")
     assert _editorial_patch_text_violation('#raw("forged Typst")')
+
+
+@pytest.mark.asyncio
+async def test_manual_table_patch_rejects_duplicate_normalized_analytic_question() -> None:
+    from cti_app.application.editorial_proposals import EditorialProposalService
+    from cti_app.domain.editorial_proposal import ManualPatch, ManualTablePatch
+    from cti_app.domain.production_synthesis import EvidenceKind, ExtractionEvidenceRefV1
+
+    anchor = uuid4()
+    reference = ExtractionEvidenceRefV1(
+        uuid4(), EvidenceKind.FACT, hashlib.sha256(b"admitted-table-evidence").hexdigest()
+    )
+    table = _table_spec(anchor, (reference,))
+    snapshot_id = uuid4()
+    base_content = {"tables": [{"purpose": {"question": "WHICH synthetic tools are documented!"}}]}
+
+    class ProposalRepository:
+        async def get_by_idempotency_key(self, *_args):
+            return None
+
+    class UnitOfWork:
+        editorial_proposals = ProposalRepository()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class ContextBuilder:
+        async def build_manual(self, *_args):
+            return SimpleNamespace(
+                proposal_snapshot_id=snapshot_id,
+                proposal_operations=("create_table",),
+                proposal_enrichment_context={
+                    "anchor_block_id": str(anchor),
+                    "base_artifact_id": str(record.enrichment_artifact_id),
+                    "base_artifact_version": record.enrichment_version,
+                    "base_input_hash": record.enrichment_input_hash,
+                    "base_canonical_sha256": record.enrichment_canonical_sha256,
+                    "evidence_pack": SimpleNamespace(_handle_to_ref={"ev-1": reference}),
+                    "base_content": base_content,
+                },
+            )
+
+    record = SimpleNamespace(
+        production_run_id=uuid4(),
+        workspace_pin_hash="3" * 64,
+        routing_decision_hash="4" * 64,
+        synthesis_artifact_id=uuid4(),
+        synthesis_version=1,
+        synthesis_canonical_sha256="5" * 64,
+        enrichment_artifact_id=uuid4(),
+        enrichment_version=1,
+        enrichment_input_hash="6" * 64,
+        enrichment_canonical_sha256="7" * 64,
+    )
+    entry = BlockRegistryEntry(
+        block_id=anchor,
+        kind=EditorialBlockKind.PARAGRAPH,
+        parent_block_id=None,
+        position=0,
+        content_sha256="8" * 64,
+        source_stage=EditorialSourceStage.SYNTHESIS,
+        structural_pointer="/sections/0/paragraphs/0",
+    )
+    target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT,
+        element_kind=EditorialEnrichmentElementKind.TABLE,
+        element_key=None,
+        placement=TargetedEditorialRevisionPlacement(
+            kind=TargetedEditorialRevisionPlacementKind.AFTER_PARAGRAPH,
+            anchor_block_id=anchor,
+        ),
+    )
+
+    class WorkspaceService:
+        async def resolve_revision_target(self, **_kwargs):
+            return SimpleNamespace(
+                record=record,
+                occurrence=SimpleNamespace(entry=entry, binding_state="valid"),
+                target=target,
+                target_id="target-id",
+                before_hash=entry.content_sha256,
+            )
+
+    service = EditorialProposalService(
+        uow_factory=UnitOfWork,
+        blob_store=object(),
+        artifact_store=object(),
+        workspace_service=WorkspaceService(),
+        discussion_context_builder=ContextBuilder(),
+    )
+
+    async def should_not_prepare(*_args, **_kwargs):
+        pytest.fail("A colliding analytic question must be rejected before proposal storage")
+
+    service._prepare_result = should_not_prepare
+
+    with pytest.raises(EditorialProposalApplicationError) as caught:
+        await service.prepare_manual_patch(
+            subject_id=uuid4(),
+            snapshot_id=snapshot_id,
+            occurrence_id=anchor,
+            actor_id=uuid4(),
+            idempotency_key="manual-table-question-0001",
+            patch=ManualPatch(typed_patch=ManualTablePatch(anchor_block_id=anchor, table=table)),
+        )
+
+    assert caught.value.code == "manual_table_analytic_question_duplicate"
+
+
+@pytest.mark.asyncio
+async def test_manual_table_route_returns_stable_question_collision_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject_id, anchor = uuid4(), uuid4()
+
+    class IdentityProvider:
+        async def current(self):
+            return SimpleNamespace(actor_id="dev-analyst")
+
+    class ProposalService:
+        async def prepare_manual_patch(self, **_kwargs):
+            raise EditorialProposalApplicationError("manual_table_analytic_question_duplicate")
+
+    monkeypatch.setattr(editorial_workspace_api, "_proposal_impact_consumer_wired", lambda: True)
+    monkeypatch.setattr(
+        editorial_workspace_api, "_manual_proposal_service", lambda _request: ProposalService()
+    )
+    app = FastAPI()
+    app.state.identity_provider = IdentityProvider()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/table-proposals",
+            "headers": [],
+            "query_string": b"",
+            "server": ("editorial.test", 80),
+            "client": ("test", 1),
+            "app": app,
+        }
+    )
+    evidence = editorial_workspace_api.EditorialTableEvidenceReferenceRequest(
+        source_document_id=uuid4(),
+        kind="fact",
+        evidence_key=hashlib.sha256(b"admitted-table-evidence").hexdigest(),
+    )
+    payload = editorial_workspace_api.EditorialManualTableProposalRequest(
+        snapshot_id=uuid4(),
+        anchor_block_id=anchor,
+        table=editorial_workspace_api.EditorialTableDraftRequest(
+            key="manual-question-collision",
+            kind="custom",
+            title="Synthetic table",
+            columns=[
+                editorial_workspace_api.EditorialTableColumnRequest(key="finding", label="Finding"),
+                editorial_workspace_api.EditorialTableColumnRequest(key="source", label="Source"),
+            ],
+            rows=[
+                editorial_workspace_api.EditorialTableRowRequest(
+                    cells=["Synthetic finding", "Synthetic source"], evidence_refs=[evidence]
+                )
+            ],
+            purpose=editorial_workspace_api.EditorialTablePurposeRequest(
+                question="Which source supports the finding?",
+                available_data="Synthetic source details.",
+                comprehension_gain="Compare the source details.",
+                scope="The synthetic source.",
+                evidence_refs=[evidence],
+                knowledge_limits="No other source is represented.",
+                placement_reason="After the anchor paragraph.",
+            ),
+        ),
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        await editorial_workspace_api.prepare_manual_editorial_table_proposal(
+            subject_id,
+            anchor,
+            request,
+            payload,
+            "manual-table-question-0002",
+        )
+
+    assert caught.value.status_code == 422
+    assert caught.value.detail["code"] == "manual_table_analytic_question_duplicate"
+    assert caught.value.detail["message"] == (
+        "La question analytique existe déjà dans l'enrichissement."
+    )

@@ -773,6 +773,9 @@ _ERROR_MESSAGES = {
         "Cette nouvelle valeur technique n'est pas étayée par les preuves disponibles. "
         "Modifiez le passage ou ajoutez une source autorisée."
     ),
+    "manual_table_analytic_question_duplicate": (
+        "La question analytique existe déjà dans l'enrichissement."
+    ),
     "manual_edit_patch_invalid": "Le texte proposé ne respecte pas le format éditorial autorisé.",
     "manual_edit_request_too_large": "La requête de modification dépasse la taille autorisée.",
     "manual_edit_idempotency_conflict": (
@@ -2026,6 +2029,7 @@ async def prepare_manual_editorial_table_proposal(
         elif code in {
             "manual_edit_new_fact_unadmitted",
             "manual_edit_patch_invalid",
+            "manual_table_analytic_question_duplicate",
             "proposal_target_mismatch",
             "proposal_operation_unsupported",
         }:
