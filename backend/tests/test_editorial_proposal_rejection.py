@@ -14,7 +14,7 @@ from cti_app.config import Settings
 
 
 @pytest.mark.asyncio
-async def test_reject_route_is_versioned_and_accept_is_disabled_by_default(
+async def test_reject_route_is_versioned_and_accept_can_be_disabled_explicitly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     subject_id = uuid4()
@@ -91,8 +91,9 @@ async def test_reject_route_is_versioned_and_accept_is_disabled_by_default(
     )
 
     settings = Settings(_env_file=None)
-    assert settings.editorial_proposal_accept_enabled is False
-    monkeypatch.setattr(editorial_workspace_api, "get_settings", lambda: settings)
+    assert settings.editorial_proposal_accept_enabled is True
+    disabled_settings = Settings(_env_file=None, editorial_proposal_accept_enabled=False)
+    monkeypatch.setattr(editorial_workspace_api, "get_settings", lambda: disabled_settings)
 
     def fail_if_accept_handler_runs(_request):
         raise AssertionError("disabled accept handler was called")

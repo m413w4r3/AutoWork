@@ -273,7 +273,7 @@ describe("EditorialConversation", () => {
     );
 
     expect(await screen.findByText("Titre proposé dans le fil")).toBeVisible();
-    expect(screen.queryByRole("button", { name: "Accepter" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Accepter" })).toBeVisible();
     expect(
       fetchMock.mock.calls.some(([input]) =>
         requestUrl(input).includes(

@@ -797,6 +797,34 @@ main:has(> .editorial-route-state) > .app-header {
   cursor: not-allowed;
 }
 
+.editorial-proposal-card__actions .editorial-proposal-card__accept {
+  border-color: var(--editorial-brand);
+  color: var(--editorial-white);
+  background: var(--editorial-brand);
+}
+
+.editorial-proposal-card__actions
+  .editorial-proposal-card__accept[aria-disabled="true"] {
+  border-color: var(--editorial-divider);
+  color: var(--editorial-muted);
+  background: var(--editorial-disabled-surface);
+  cursor: default;
+}
+
+.editorial-proposal-card__recovery {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.55rem;
+  margin-top: 0.75rem;
+}
+
+.editorial-proposal-card__recovery p {
+  flex-basis: 100%;
+  margin: 0;
+  color: var(--editorial-danger);
+}
+
 .editorial-proposal-card__actions p {
   flex-basis: 100%;
   margin: 0;
