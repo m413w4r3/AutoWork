@@ -16,6 +16,58 @@ export type EditorialImpactStatus =
   "none" | "pending" | "running" | "superseded" | "up_to_date" | "failed";
 export type EditorialPdfStatus = "CURRENT" | "STALE";
 
+export type EditorialFigureStatus =
+  | "available"
+  | "already_integrated"
+  | "not_selected"
+  | "ineligible"
+  | "file_unavailable"
+  | "unverified";
+
+export interface EditorialFigureSource {
+  source_id: string;
+  title: string | null;
+  url: string | null;
+}
+
+export interface EditorialFigureCatalogItem {
+  figure_id: string;
+  original_name: string;
+  original_caption: string | null;
+  alt_text: string | null;
+  source: EditorialFigureSource;
+  page: number | null;
+  section: string | null;
+  context_before: string | null;
+  context_after: string | null;
+  width: number | null;
+  height: number | null;
+  mime_type: string | null;
+  status: EditorialFigureStatus;
+  selectable: boolean;
+  exclusion_reason: string | null;
+  already_used: boolean;
+}
+
+export interface EditorialFigureCatalogPage {
+  items: EditorialFigureCatalogItem[];
+  sources: EditorialFigureSource[];
+  total: number;
+  available_count: number;
+  offset: number;
+  limit: number;
+}
+
+export interface EditorialFigurePreview extends EditorialFigureCatalogItem {
+  preview_image_url: string;
+}
+
+export interface EditorialFigureCatalogFilters {
+  status?: EditorialFigureStatus;
+  source?: string;
+  q?: string;
+}
+
 export interface EditorialWorkspaceRevisionTarget {
   block_id: string;
   legacy_target_id: string | null;
@@ -448,6 +500,42 @@ export function getEditorialWorkspaceSnapshot(
 ): Promise<EditorialWorkspaceSnapshot> {
   return request<EditorialWorkspaceSnapshot>(
     `/api/subjects/${encodeURIComponent(subjectId)}/editor/snapshot`,
+  );
+}
+
+export function getEditorialFigureCatalog(
+  subjectId: string,
+  filters: EditorialFigureCatalogFilters,
+  offset: number,
+  limit = 30,
+): Promise<EditorialFigureCatalogPage> {
+  const params = new URLSearchParams({
+    offset: String(offset),
+    limit: String(limit),
+  });
+  if (filters.status) params.set("status", filters.status);
+  if (filters.source) params.set("source", filters.source);
+  if (filters.q) params.set("q", filters.q);
+  return request<EditorialFigureCatalogPage>(
+    `/api/subjects/${encodeURIComponent(subjectId)}/editor/figures?${params.toString()}`,
+    { cache: "no-store" },
+  );
+}
+
+export function editorialFigureThumbnailUrl(
+  subjectId: string,
+  figureId: string,
+): string {
+  return `/api/subjects/${encodeURIComponent(subjectId)}/editor/figures/${encodeURIComponent(figureId)}/thumbnail`;
+}
+
+export function getEditorialFigurePreview(
+  subjectId: string,
+  figureId: string,
+): Promise<EditorialFigurePreview> {
+  return request<EditorialFigurePreview>(
+    `/api/subjects/${encodeURIComponent(subjectId)}/editor/figures/${encodeURIComponent(figureId)}/preview`,
+    { cache: "no-store" },
   );
 }
 
