@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from datetime import date
+from datetime import UTC, date, datetime
 from io import BytesIO
 from typing import Any, cast
 from uuid import UUID, uuid4
@@ -22,6 +23,9 @@ from cti_app.application.editorial_proposal_adoption import (
     EnrichmentCandidateInputs,
     SynthesisCandidateInputs,
 )
+from cti_app.application.editorial_proposal_adoption_inputs import (
+    ProductionEditorialProposalAdoptionInputs,
+)
 from cti_app.application.editorial_synthesis import targets
 from cti_app.application.editorial_synthesis.candidate import (
     SynthesisCandidatePersistence,
@@ -30,11 +34,13 @@ from cti_app.application.editorial_workspace.registry import (
     WorkspaceOccurrenceResolution,
     WorkspaceSnapshotRecord,
     registry_hash,
+    resolve_workspace_target,
 )
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_stages import SynthesisService
 from cti_app.application.production_synthesis import (
+    ProductionSynthesisService,
     build_synthesis_evidence_pack,
     canonical_extraction_hash,
 )
@@ -59,7 +65,7 @@ from cti_app.domain.editorial_workspace import (
     EditorialSourceStage,
     EditorialTransition,
 )
-from cti_app.domain.entities import Subject
+from cti_app.domain.entities import SourceDocument, Subject
 from cti_app.domain.production import (
     EXTRACTION_PROFILE_POLICY_VERSION,
     ExtractionProfile,
@@ -81,6 +87,7 @@ from cti_app.domain.production_extraction import (
     ExtractionReuseState,
     ProductionExtractionV1,
     ProductionSourceExtractionV1,
+    production_extraction_to_json,
 )
 from cti_app.domain.production_references import ProductionReferenceKind, ProductionReferenceTier
 from cti_app.domain.production_synthesis import (
@@ -150,6 +157,9 @@ class _MemoryArtifactStore:
         if max_bytes is not None and len(content) > max_bytes:
             raise ValueError("synthetic_read_limit")
         return content
+
+    async def read_json(self, blob_id: UUID) -> Any:
+        return json.loads(await self.read_bytes(blob_id))
 
 
 class _Workspace:
@@ -434,6 +444,13 @@ async def _seed(uow_factory: UnitOfWorkFactory, *, proposal_count: int = 2) -> _
         structural_pointer="/title",
         revision_status=EditorialRevisionStatus.READY,
     )
+    workspace_target = resolve_workspace_target(
+        entry=entry,
+        canonical_content=base_payload,
+        operation=operation.value,
+    )
+    proposal_target_id = workspace_target.legacy_target_id
+    assert proposal_target_id is not None
     snapshot = WorkspaceSnapshotRecord(
         snapshot_id=uuid4(),
         subject_id=subject.id,
@@ -462,7 +479,7 @@ async def _seed(uow_factory: UnitOfWorkFactory, *, proposal_count: int = 2) -> _
         "schema_version": "editorial-patch-v1",
         "operation": operation.value,
         "target": target.to_json(),
-        "target_id": "synthetic-title",
+        "target_id": proposal_target_id,
         "occurrence_id": str(entry.block_id),
         "before_hash": resolved_target.before_hash,
         "after": "[Synthetic actor] Revised report",
@@ -503,7 +520,7 @@ async def _seed(uow_factory: UnitOfWorkFactory, *, proposal_count: int = 2) -> _
                 base_canonical_sha256=base_sha256,
                 base_routing_hash=None,
                 base_pin_hash=snapshot.workspace_pin_hash,
-                target_id="synthetic-title",
+                target_id=proposal_target_id,
                 operation=operation.value,
                 before_hash=resolved_target.before_hash,
                 patch_blob_ref=patch_blob.id,
@@ -809,6 +826,131 @@ async def test_accept_route_policy_refusal_keeps_sql_state_unchanged(
             await uow.editorial_proposals.get_event_by_idempotency(proposal.id, idempotency_key)
             is None
         )
+
+
+@pytest.mark.asyncio
+async def test_adoption_rechecks_current_red_subject_tlp_without_sql_writes(
+    uow_factory: UnitOfWorkFactory,
+) -> None:
+    seeded = await _seed(uow_factory, proposal_count=1)
+    proposal = seeded.proposals[0]
+    extraction_bytes = ProductionArtifactStore.canonical_json_bytes(
+        production_extraction_to_json(seeded.extraction)
+    )
+    extraction_sha256 = hashlib.sha256(extraction_bytes).hexdigest()
+    extraction_blob = BlobRecord(
+        descriptor=BlobDescriptor(
+            extraction_sha256,
+            len(extraction_bytes),
+            "application/json",
+            _CANONICAL_BUCKET,
+        )
+    )
+    source_bytes = b"synthetic source document for policy revalidation"
+    source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+    source_blob = BlobRecord(
+        descriptor=BlobDescriptor(
+            source_sha256,
+            len(source_bytes),
+            "text/plain",
+            "source-documents",
+        )
+    )
+    extraction_artifact = ProductionArtifact(
+        production_run_id=seeded.run.id,
+        subject_id=seeded.subject.id,
+        stage=ProductionArtifactStage.EXTRACTION,
+        version=1,
+        input_hash=seeded.production_input.input_hash,
+        canonical_blob_id=extraction_blob.id,
+    )
+
+    seeded.blob_store.seed(extraction_blob.descriptor, extraction_bytes)
+    seeded.blob_store.seed(source_blob.descriptor, source_bytes)
+    seeded.artifact_store.blobs[extraction_blob.id] = extraction_bytes
+    async with uow_factory() as uow:
+        await uow.blobs.add_if_absent(extraction_blob)
+        await uow.blobs.add_if_absent(source_blob)
+        await uow.production_artifacts.append(extraction_artifact)
+        await uow.production_input_snapshots.add(seeded.production_input)
+        await uow.source_documents.add(
+            SourceDocument(
+                id=seeded.extraction.sources[0].source_document_id,
+                subject_id=seeded.subject.id,
+                blob_id=source_blob.id,
+                original_name="synthetic-report.txt",
+                origin="synthetic integration fixture",
+                acquired_at=datetime.now(UTC),
+                license_restriction=None,
+                tlp=TLP.AMBER,
+                do_not_submit=False,
+                external_llm_allowed=True,
+            )
+        )
+        current_subject = await uow.subjects.get(seeded.subject.id)
+        assert current_subject is not None and current_subject.version == 1
+        current_subject.update_metadata(title=current_subject.title, tlp=TLP.RED)
+        assert await uow.subjects.update(current_subject, expected_version=1)
+        await uow.commit()
+
+    artifact_store = cast(ProductionArtifactStore, seeded.artifact_store)
+    synthesis_writer = SynthesisService(uow_factory, artifact_store)
+    synthesis_loader = ProductionSynthesisService(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        model_gateway=cast(Any, None),
+        synthesis_service=synthesis_writer,
+    )
+
+    production_inputs = ProductionEditorialProposalAdoptionInputs(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        workspace_service=seeded.workspace,
+        synthesis_loader=synthesis_loader,
+        enrichment_loader=cast(Any, None),
+        enrichment_revision_service=cast(Any, None),
+    )
+    service = EditorialProposalAdoptionService(
+        uow_factory=uow_factory,
+        blob_store=cast(BlobStore, seeded.blob_store),
+        artifact_store=artifact_store,
+        workspace_service=seeded.workspace,
+        inputs=production_inputs,
+        synthesis_writer=synthesis_writer,
+        enrichment_writer=cast(Any, None),
+    )
+    before_blob_addresses = set(seeded.blob_store.objects)
+    before_put_calls = seeded.blob_store.put_calls
+    async with uow_factory() as uow:
+        before_artifact_ids = {
+            item.id for item in await uow.production_artifacts.list_for_run(seeded.run.id)
+        }
+
+    idempotency_key = f"red-subject-{uuid4().hex}"
+    with pytest.raises(
+        EditorialProposalAdoptionError,
+        match="external_llm_tlp_blocked",
+    ):
+        await service.adopt(**_adopt_kwargs(seeded, proposal, idempotency_key))
+
+    assert set(seeded.blob_store.objects) == before_blob_addresses
+    assert seeded.blob_store.put_calls == before_put_calls
+    async with uow_factory() as uow:
+        current_subject = await uow.subjects.get(seeded.subject.id)
+        assert current_subject is not None
+        assert current_subject.tlp is TLP.RED and current_subject.version == 2
+        current = await uow.editorial_proposals.get_for_occurrence(
+            proposal.subject_id, proposal.occurrence_id, proposal.id
+        )
+        assert current is not None and current.state is EditorialProposalState.PROPOSED
+        assert (
+            await uow.editorial_proposals.get_event_by_idempotency(proposal.id, idempotency_key)
+            is None
+        )
+        assert {
+            item.id for item in await uow.production_artifacts.list_for_run(seeded.run.id)
+        } == before_artifact_ids
+        assert await uow.editorial_proposal_impacts.get_by_proposal(proposal.id) is None
 
 
 @pytest.mark.asyncio

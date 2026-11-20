@@ -1,19 +1,35 @@
 from __future__ import annotations
 
+from datetime import date
 from types import SimpleNamespace
 from typing import Any, cast
 from uuid import uuid4
 
 import pytest
 
+from cti_app.api import editorial_workspace as editorial_workspace_api
+from cti_app.api import main as api_main
+from cti_app.application import editorial_proposal_adoption_inputs as adoption_inputs_module
 from cti_app.application.editorial_proposal_adoption import EditorialProposalAdoptionError
 from cti_app.application.editorial_proposal_adoption_inputs import (
     ProductionEditorialProposalAdoptionInputs,
 )
+from cti_app.config import Settings
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.editorial_proposal import EditorialProposalOrigin
-from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
+from cti_app.domain.editorial_workspace import EditorialSourceStage
+from cti_app.domain.production import (
+    ProductionArtifactStage,
+    ProductionArtifactStatus,
+    ProductionInputSnapshot,
+)
+from cti_app.domain.production_editorial_enrichment import EditorialEnrichmentElementKind
+from cti_app.domain.production_editorial_revision import (
+    TargetedEditorialRevisionOperation,
+    TargetedEditorialRevisionTarget,
+    TargetedEditorialRevisionTargetKind,
+)
 
 
 class _ForbiddenArtifactStore:
@@ -48,8 +64,16 @@ class _Repository:
 
 class _Uow:
     def __init__(
-        self, *, document: Any, collection: Any, run: Any, snapshot: Any, artifacts: Any
+        self,
+        *,
+        document: Any,
+        collection: Any,
+        subject: Any,
+        run: Any,
+        snapshot: Any,
+        artifacts: Any,
     ) -> None:
+        self.subjects = _Repository(subject)
         self.source_documents = _Repository(document)
         self.source_collections = _Repository(collection)
         self.editorial_threads = _Repository(None)
@@ -58,9 +82,20 @@ class _Uow:
         self.production_artifacts = _Repository(artifacts)
         self.write_count = 0
 
+    async def __aenter__(self) -> _Uow:
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
 
 def _revalidation_fixture(
-    *, tlp: TLP = TLP.AMBER, external_llm_allowed: bool = True, revoked: bool = False
+    *,
+    tlp: TLP = TLP.AMBER,
+    subject_tlp: TLP = TLP.CLEAR,
+    subject_version: int = 1,
+    external_llm_allowed: bool = True,
+    revoked: bool = False,
 ) -> tuple[Any, Any, Any, Any, Any]:
     subject_id, run_id, occurrence_id = uuid4(), uuid4(), uuid4()
     source_id = uuid4()
@@ -82,6 +117,7 @@ def _revalidation_fixture(
         state=CollectionState.BLOCKED if revoked else CollectionState.COMPLETED,
         source_document_id=None,
     )
+    subject = SimpleNamespace(id=subject_id, tlp=subject_tlp, version=subject_version)
     proposal = SimpleNamespace(
         id=uuid4(),
         subject_id=subject_id,
@@ -121,6 +157,7 @@ def _revalidation_fixture(
         id=proposal.snapshot_id,
         production_run_id=run_id,
         subject_id=subject_id,
+        subject_version=1,
         subject_tlp=TLP.CLEAR,
         input_hash="snapshot-input",
     )
@@ -167,6 +204,7 @@ def _revalidation_fixture(
     uow = _Uow(
         document=document,
         collection=collection,
+        subject=subject,
         run=run,
         snapshot=snapshot,
         artifacts={
@@ -176,6 +214,300 @@ def _revalidation_fixture(
         },
     )
     return inputs, proposal, resolution, uow, context
+
+
+@pytest.mark.asyncio
+async def test_current_red_subject_tlp_is_rechecked_in_uow_without_writes() -> None:
+    inputs, proposal, resolution, uow, _context = _revalidation_fixture()
+    uow.subjects.value.tlp = TLP.RED
+    uow.subjects.value.version = 2
+
+    with pytest.raises(EditorialProposalAdoptionError, match="external_llm_tlp_blocked"):
+        await inputs.revalidate_evidence_policy_and_thread(uow, proposal, {}, resolution=resolution)
+
+    assert uow.write_count == 0
+
+
+@pytest.mark.asyncio
+async def test_current_subject_version_is_part_of_the_adoption_fence() -> None:
+    inputs, proposal, resolution, uow, _context = _revalidation_fixture(
+        subject_tlp=TLP.AMBER,
+        subject_version=2,
+    )
+
+    with pytest.raises(EditorialProposalAdoptionError, match="proposal_base_stale"):
+        await inputs.revalidate_evidence_policy_and_thread(uow, proposal, {}, resolution=resolution)
+
+    assert uow.write_count == 0
+
+
+@pytest.mark.asyncio
+async def test_access_policy_uses_current_subject_tlp_and_keeps_more_restrictive_sources() -> None:
+    inputs, _proposal, _resolution, uow, context = _revalidation_fixture(
+        tlp=TLP.CLEAR,
+        subject_tlp=TLP.GREEN,
+    )
+    inputs._uow_factory = lambda: uow
+
+    policy, subject_version = await inputs._access_policy(context.snapshot, context.extraction)
+
+    assert policy.subject_tlp is TLP.GREEN
+    assert policy.effective_tlp is TLP.GREEN
+    assert subject_version == 1
+
+
+@pytest.mark.asyncio
+async def test_thread_origin_artifact_can_be_older_than_current_proposal_binding() -> None:
+    inputs, proposal, resolution, uow, _context = _revalidation_fixture()
+    thread_id = uuid4()
+    proposal.thread_id = thread_id
+    uow.editorial_threads.value = SimpleNamespace(
+        thread=SimpleNamespace(
+            id=thread_id,
+            origin=SimpleNamespace(
+                subject_id=proposal.subject_id,
+                production_run_id=proposal.production_run_id,
+                occurrence_id=proposal.occurrence_id,
+                artifact_id=uuid4(),
+                artifact_version=1,
+                canonical_sha256="d" * 64,
+            ),
+        )
+    )
+
+    await inputs.revalidate_evidence_policy_and_thread(uow, proposal, {}, resolution=resolution)
+
+    assert uow.write_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope_field", ["subject_id", "occurrence_id"])
+async def test_thread_origin_scope_mismatch_is_refused(scope_field: str) -> None:
+    inputs, proposal, resolution, uow, _context = _revalidation_fixture()
+    thread_id = uuid4()
+    proposal.thread_id = thread_id
+    origin = {
+        "subject_id": proposal.subject_id,
+        "production_run_id": proposal.production_run_id,
+        "occurrence_id": proposal.occurrence_id,
+        "artifact_id": proposal.base_artifact_id,
+        "artifact_version": proposal.base_artifact_version,
+        "canonical_sha256": proposal.base_canonical_sha256,
+    }
+    origin[scope_field] = uuid4()
+    uow.editorial_threads.value = SimpleNamespace(
+        thread=SimpleNamespace(id=thread_id, origin=SimpleNamespace(**origin))
+    )
+
+    with pytest.raises(EditorialProposalAdoptionError, match="thread_binding_stale"):
+        await inputs.revalidate_evidence_policy_and_thread(uow, proposal, {}, resolution=resolution)
+
+    assert uow.write_count == 0
+
+
+@pytest.mark.asyncio
+async def test_production_di_exercises_synthesis_and_enrichment_inputs_without_external_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _inputs, proposal, resolution, backing_uow, context = _revalidation_fixture()
+    proposal.actor_id = uuid4()
+    backing_uow.subjects.value.tlp = TLP.GREEN
+    context.snapshot = ProductionInputSnapshot(
+        production_run_id=proposal.production_run_id,
+        edition_id=uuid4(),
+        subject_id=proposal.subject_id,
+        subject_version=1,
+        subject_title="Synthetic subject",
+        subject_tlp=TLP.CLEAR,
+        selection_decision_id=uuid4(),
+        origin_discovery_subject_id=uuid4(),
+        canonical_discovery_subject_id=uuid4(),
+        discovery_snapshot_id=uuid4(),
+        discovery_snapshot_version=1,
+        member_candidate_ids=(),
+        discovery_summary="Synthetic summary.",
+        actor_or_campaign="Synthetic actor",
+        period_start=date(2026, 1, 1),
+        period_end=date(2026, 1, 31),
+        publication_language="fr",
+        research_date=date(2026, 2, 1),
+    )
+
+    class _TrackedUowContext:
+        def __init__(self, factory: _TrackedUowFactory) -> None:
+            self.factory = factory
+
+        async def __aenter__(self) -> _Uow:
+            self.factory.open_uows += 1
+            return cast(_Uow, backing_uow)
+
+        async def __aexit__(self, *_args: object) -> None:
+            self.factory.open_uows -= 1
+
+    class _TrackedUowFactory:
+        def __init__(self) -> None:
+            self.open_uows = 0
+
+        def __call__(self) -> _TrackedUowContext:
+            return _TrackedUowContext(self)
+
+    class _ExternalGuard:
+        def __init__(self, factory: _TrackedUowFactory, name: str) -> None:
+            self.factory = factory
+            self.name = name
+            self.calls = 0
+
+        def __getattr__(self, _name: str) -> Any:
+            self.calls += 1
+            if self.factory.open_uows:
+                raise AssertionError(f"{self.name} called while a UOW is open")
+            raise AssertionError(f"unexpected {self.name} call")
+
+    settings = Settings(_env_file=None)
+    monkeypatch.setattr(api_main, "get_settings", lambda: settings)
+    monkeypatch.setattr(editorial_workspace_api, "get_settings", lambda: settings)
+    app = api_main.create_app()
+    factory = _TrackedUowFactory()
+    gateway = _ExternalGuard(factory, "gateway")
+    blob_store = _ExternalGuard(factory, "blob store")
+    app.state.uow_factory = factory
+    app.state.production_artifact_store = object()
+    app.state.blob_store = blob_store
+    app.state.model_gateway = gateway
+    app.state.publication_render_service = object()
+    service = editorial_workspace_api._proposal_adoption_service(SimpleNamespace(app=app))
+    production_inputs = service._inputs
+    assert isinstance(production_inputs, ProductionEditorialProposalAdoptionInputs)
+
+    async def load_context(_proposal: Any, **_kwargs: Any) -> tuple[Any, ...]:
+        return (
+            context.run,
+            context.snapshot,
+            context.extraction_artifact,
+            None,
+            context.synthesis_artifact,
+        )
+
+    monkeypatch.setattr(production_inputs, "_load_base_context", load_context)
+
+    async def load_synthesis_extraction(*_args: Any, **_kwargs: Any) -> tuple[Any, str]:
+        return context.extraction, "f" * 64
+
+    async def load_enrichment_extraction(*_args: Any, **_kwargs: Any) -> Any:
+        return context.extraction
+
+    async def load_synthesis(*_args: Any, **_kwargs: Any) -> Any:
+        return SimpleNamespace()
+
+    monkeypatch.setattr(
+        production_inputs._synthesis_loader,
+        "_load_extraction",
+        load_synthesis_extraction,
+    )
+    monkeypatch.setattr(
+        production_inputs._enrichment_loader,
+        "_load_extraction",
+        load_enrichment_extraction,
+    )
+    monkeypatch.setattr(production_inputs._enrichment_loader, "_load_synthesis", load_synthesis)
+    monkeypatch.setattr(
+        adoption_inputs_module,
+        "build_synthesis_evidence_pack",
+        lambda *_args, **_kwargs: SimpleNamespace(_handle_to_ref={}),
+    )
+    monkeypatch.setattr(
+        adoption_inputs_module,
+        "production_synthesis_from_json",
+        lambda _payload: SimpleNamespace(),
+    )
+
+    synthesis_target = SimpleNamespace(to_json=lambda: {"kind": "title"})
+    monkeypatch.setattr(
+        adoption_inputs_module,
+        "resolve_workspace_target",
+        lambda **_kwargs: SimpleNamespace(
+            legacy_target_id="synthetic-target",
+            before_hash="e" * 64,
+            target=synthesis_target,
+            path="/title",
+        ),
+    )
+    proposal.operation = TargetedEditorialRevisionOperation.REWRITE_TITLE.value
+    proposal.target_id = "synthetic-target"
+    proposal.before_hash = "e" * 64
+    synthesis_artifact = context.base_artifact
+
+    with pytest.raises(EditorialProposalAdoptionError, match="proposal_patch_invalid"):
+        await production_inputs.synthesis_inputs(
+            proposal,
+            {"target": {"kind": "title"}},
+            base_artifact=synthesis_artifact,
+            base_payload={},
+            base_bytes=b"synthetic base",
+            resolution=resolution,
+        )
+
+    enrichment_target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT,
+        element_kind=EditorialEnrichmentElementKind.TABLE,
+        element_key="table_synthetic",
+    )
+    proposal.operation = TargetedEditorialRevisionOperation.REWRITE_TABLE.value
+    proposal.target_id = adoption_inputs_module._target_id(enrichment_target)
+    enrichment_artifact = SimpleNamespace(
+        id=uuid4(),
+        production_run_id=proposal.production_run_id,
+        subject_id=proposal.subject_id,
+        stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+        version=1,
+        input_hash=proposal.base_input_hash,
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=uuid4(),
+        metadata={},
+    )
+    resolution.entry = SimpleNamespace(
+        block_id=proposal.occurrence_id,
+        source_stage=EditorialSourceStage.EDITORIAL_ENRICHMENT,
+        content_sha256=proposal.before_hash,
+    )
+    current_policy: dict[str, Any] = {}
+    original_access_policy = production_inputs._access_policy
+
+    async def capture_access_policy(snapshot: Any, extraction: Any) -> tuple[Any, int]:
+        result = await original_access_policy(snapshot, extraction)
+        current_policy["value"] = result[0]
+        return result
+
+    async def validate_input_fence(**_kwargs: Any) -> Any:
+        assert _kwargs["snapshot"].subject_tlp is TLP.CLEAR
+        assert current_policy["value"].subject_tlp is TLP.GREEN
+        return SimpleNamespace(access_policy=current_policy["value"])
+
+    def parse_enrichment(_payload: Any) -> Any:
+        return SimpleNamespace()
+
+    monkeypatch.setattr(production_inputs, "_access_policy", capture_access_policy)
+    monkeypatch.setattr(
+        production_inputs._enrichment_revision_service,
+        "_validate_input_fence",
+        validate_input_fence,
+    )
+    monkeypatch.setattr(adoption_inputs_module, "editorial_enrichment_from_json", parse_enrichment)
+
+    with pytest.raises(EditorialProposalAdoptionError, match="proposal_patch_invalid"):
+        await production_inputs.enrichment_inputs(
+            proposal,
+            {"target": enrichment_target.to_json()},
+            base_artifact=enrichment_artifact,
+            base_payload={"schema_version": 1},
+            base_bytes=b"synthetic enrichment",
+            resolution=resolution,
+        )
+
+    assert factory.open_uows == 0
+    assert gateway.calls == 0
+    assert blob_store.calls == 0
+    assert current_policy["value"].effective_tlp is TLP.AMBER
 
 
 @pytest.mark.asyncio

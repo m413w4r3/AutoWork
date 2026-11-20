@@ -854,6 +854,7 @@ async def accept_editorial_proposal(
             "proposal_base_unavailable",
             "proposal_base_hash_mismatch",
             "proposal_policy_unavailable",
+            "proposal_candidate_blob_unavailable",
             "proposal_candidate_blob_hash_mismatch",
             "proposal_acceptance_incomplete",
             "editorial_enrichment_diagram_materializer_unavailable",

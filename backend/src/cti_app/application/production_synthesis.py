@@ -1331,6 +1331,8 @@ async def build_synthesis_access_policy(
     extraction: ProductionExtractionV1,
     source_documents: SourceDocumentRepository,
     source_collections: SourceCollectionRepository | None = None,
+    *,
+    current_subject_tlp: TLP | None = None,
 ) -> SynthesisAccessPolicyV1:
     """Load exact source metadata and conservatively fold its model access policy."""
     if snapshot.subject_id != extraction.subject_id:
@@ -1381,9 +1383,16 @@ async def build_synthesis_access_policy(
             )
         )
 
-    tlps = (snapshot.subject_tlp, *(record.tlp for record in records))
+    subject_tlp = snapshot.subject_tlp
+    if current_subject_tlp is not None:
+        if not isinstance(current_subject_tlp, TLP):
+            raise ValueError("Synthesis current subject TLP is invalid")
+        subject_tlp = max(
+            (subject_tlp, current_subject_tlp), key=lambda item: tuple(TLP).index(item)
+        )
+    tlps = (subject_tlp, *(record.tlp for record in records))
     return SynthesisAccessPolicyV1(
-        subject_tlp=snapshot.subject_tlp,
+        subject_tlp=subject_tlp,
         effective_tlp=max(tlps, key=lambda item: tuple(TLP).index(item)),
         external_llm_allowed=all(record.external_llm_allowed for record in records),
         do_not_submit=any(record.do_not_submit for record in records),

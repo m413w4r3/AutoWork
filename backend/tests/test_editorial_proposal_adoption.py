@@ -1210,3 +1210,51 @@ async def test_accept_route_adopts_once_and_replays_same_result(
     )
     assert fixture.factory.commits == 1
     assert fixture.inputs.revalidated == 1
+
+
+@pytest.mark.asyncio
+async def test_accept_route_maps_candidate_blob_unavailable_to_static_503(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(service_type=EditorialProposalAdoptionService)
+
+    class _UnavailableService:
+        async def adopt(self, *_args: Any, **_kwargs: Any) -> None:
+            raise EditorialProposalAdoptionError("proposal_candidate_blob_unavailable")
+
+    monkeypatch.setattr(
+        editorial_workspace_api,
+        "get_settings",
+        lambda: Settings(_env_file=None, editorial_proposal_accept_enabled=True),
+    )
+    monkeypatch.setattr(
+        editorial_workspace_api,
+        "_proposal_adoption_service",
+        lambda _request: _UnavailableService(),
+    )
+
+    async def current_actor(_request: Any) -> UUID:
+        return fixture.actor_id
+
+    monkeypatch.setattr(editorial_workspace_api, "_thread_actor_id", current_actor)
+    app = FastAPI()
+    app.include_router(editorial_workspace_api.router)
+    path = (
+        f"/api/subjects/{fixture.proposal.subject_id}/editor/threads/"
+        f"{fixture.occurrence_id}/proposals/{fixture.proposal.id}/accept"
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
+    ) as client:
+        response = await client.post(
+            path,
+            headers={"Idempotency-Key": f"accept_{uuid4().hex}"},
+            json={"expected_state_version": 1, "patch_sha256": fixture.patch_sha256},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == {
+        "code": "proposal_candidate_blob_unavailable",
+        "message": "L'acceptation des propositions est temporairement indisponible.",
+    }

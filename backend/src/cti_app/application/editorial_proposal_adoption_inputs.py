@@ -168,8 +168,9 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                 if projection_artifact is not None
                 else None
             )
-            access_policy = await self._access_policy(snapshot, extraction)
+            access_policy, subject_version = await self._access_policy(snapshot, extraction)
             self._require_allowed(access_policy)
+            self._require_snapshot_subject_version(snapshot, subject_version)
             evidence_pack = build_synthesis_evidence_pack(snapshot, extraction, projection)
             base_synthesis = production_synthesis_from_json(base_payload)
             operation = TargetedEditorialRevisionOperation(proposal.operation)
@@ -312,6 +313,9 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
             synthesis = await self._enrichment_loader._load_synthesis(
                 run, snapshot, current_synthesis_artifact, extraction
             )
+            access_policy, subject_version = await self._access_policy(snapshot, extraction)
+            self._require_allowed(access_policy)
+            self._require_snapshot_subject_version(snapshot, subject_version)
             fence = await self._enrichment_revision_service._validate_input_fence(
                 snapshot=snapshot,
                 base_artifact=base_artifact,
@@ -323,7 +327,6 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                 synthesis=synthesis,
                 read_only_media=True,
             )
-            access_policy = fence.access_policy
             self._require_allowed(access_policy)
             operation = TargetedEditorialRevisionOperation(proposal.operation)
             target = _enrichment_target(patch.get("target"))
@@ -513,6 +516,7 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
         current_synthesis = await uow.production_artifacts.get_current(
             proposal.production_run_id, ProductionArtifactStage.SYNTHESIS.value
         )
+        current_subject = await uow.subjects.get(proposal.subject_id)
         routing = (
             await get_adopted_production_routing_decision(uow=uow, run=run)
             if run is not None
@@ -527,6 +531,8 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
             or current_run.pipeline_generation != prepared.run.pipeline_generation
             or snapshot is None
             or snapshot.id != prepared.snapshot.id
+            or current_subject is None
+            or current_subject.id != proposal.subject_id
             or not _same_current_artifact(current_base, prepared.base_artifact)
             or not _same_current_artifact(current_extraction, prepared.extraction_artifact)
             or not _same_optional_current_artifact(current_projection, prepared.projection_artifact)
@@ -545,10 +551,12 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                 prepared.extraction,
                 uow.source_documents,
                 uow.source_collections,
+                current_subject_tlp=current_subject.tlp,
             )
         except Exception:
             raise EditorialProposalAdoptionError("proposal_policy_unavailable") from None
         self._require_allowed(access_policy)
+        self._require_snapshot_subject_version(prepared.snapshot, current_subject.version)
         current_refs = _evidence_ref_keys(prepared.evidence_pack)
         if not _proposal_evidence_keys(proposal.evidence_refs) <= current_refs:
             raise EditorialProposalAdoptionError("proposal_evidence_not_admissible")
@@ -643,14 +651,27 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
 
     async def _access_policy(
         self, snapshot: ProductionInputSnapshot, extraction: ProductionExtractionV1
-    ) -> SynthesisAccessPolicyV1:
+    ) -> tuple[SynthesisAccessPolicyV1, int]:
         async with self._uow_factory() as uow:
             try:
-                return await build_synthesis_access_policy(
-                    snapshot, extraction, uow.source_documents, uow.source_collections
+                subject = await uow.subjects.get(snapshot.subject_id)
+                if subject is None or subject.id != snapshot.subject_id:
+                    raise ValueError("current_subject_unavailable")
+                policy = await build_synthesis_access_policy(
+                    snapshot,
+                    extraction,
+                    uow.source_documents,
+                    uow.source_collections,
+                    current_subject_tlp=subject.tlp,
                 )
+                return policy, subject.version
             except Exception:
                 raise EditorialProposalAdoptionError("proposal_policy_unavailable") from None
+
+    @staticmethod
+    def _require_snapshot_subject_version(snapshot: ProductionInputSnapshot, version: int) -> None:
+        if version != snapshot.subject_version:
+            raise EditorialProposalAdoptionError("proposal_base_stale")
 
     async def _revalidate_sources(self, uow: Any, extraction: ProductionExtractionV1) -> None:
         for source in extraction.sources:
@@ -690,9 +711,10 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
             or origin.subject_id != proposal.subject_id
             or origin.production_run_id != proposal.production_run_id
             or origin.occurrence_id != proposal.occurrence_id
-            or origin.artifact_id != proposal.base_artifact_id
-            or origin.artifact_version != proposal.base_artifact_version
-            or origin.canonical_sha256 != proposal.base_canonical_sha256
+            or origin.subject_id != resolution.record.subject_id
+            or origin.production_run_id != resolution.record.production_run_id
+            or resolution.entry is None
+            or origin.occurrence_id != resolution.entry.block_id
             or resolution.record.snapshot_id != proposal.snapshot_id
         ):
             raise EditorialProposalAdoptionError("thread_binding_stale")
