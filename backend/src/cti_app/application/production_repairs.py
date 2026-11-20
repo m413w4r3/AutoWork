@@ -4790,11 +4790,16 @@ class ProductionRepairMaterializationService:
         *,
         run: Any,
         extraction: ProductionArtifact,
-        run_guard: EditorialRunGuard | None,
-        actor_id: str,
-        repair_materialization: Mapping[str, Any] | None,
+        run_guard: EditorialRunGuard | None = None,
+        actor_id: str | None = None,
+        repair_materialization: Mapping[str, Any] | None = None,
     ) -> tuple[ProductionArtifact, dict[str, Any]]:
         """Rebind unchanged narrative to IOC repairs, then assemble V4 atomically."""
+        if self._revision_effects is not None and (run_guard is None) != (actor_id is None):
+            raise ProductionRepairProjectionError("editorial_registry_conflict")
+        revision_effects = (
+            self._revision_effects if run_guard is not None and actor_id is not None else None
+        )
         store = self._artifact_store
         if store is None or extraction.canonical_blob_id is None:
             raise ProductionRepairProjectionError("assembly_inputs_missing")
@@ -4864,11 +4869,11 @@ class ProductionRepairMaterializationService:
             previous_decision_id = run.routing_decision_id
             base_workspace_snapshot = None
             editorial_writes: list[EditorialRevisionWrite] = []
-            if self._revision_effects is not None:
+            if revision_effects is not None:
                 if run_guard is None:
                     raise ProductionRepairProjectionError("editorial_registry_conflict")
                 try:
-                    base_workspace_snapshot = await self._revision_effects.current_snapshot_in_uow(
+                    base_workspace_snapshot = await revision_effects.current_snapshot_in_uow(
                         uow, run.subject_id
                     )
                 except EditorialRevisionEffectsError as error:
@@ -5102,11 +5107,12 @@ class ProductionRepairMaterializationService:
             )
             await self._ensure_qa_passed(qa_result)
             if editorial_writes:
-                assert self._revision_effects is not None
+                assert revision_effects is not None
                 assert run_guard is not None
+                assert actor_id is not None
                 assert base_workspace_snapshot is not None
                 try:
-                    await self._revision_effects.apply_after_writes(
+                    await revision_effects.apply_after_writes(
                         uow,
                         run_guard=run_guard,
                         base_snapshot=base_workspace_snapshot,

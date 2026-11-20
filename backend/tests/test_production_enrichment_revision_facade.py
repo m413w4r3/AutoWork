@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import replace
 from types import SimpleNamespace
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
 
@@ -49,6 +49,7 @@ from tests.test_production_editorial_enrichment_application import (
 class _RecordingRevisionEffects:
     def __init__(self) -> None:
         self.run_id = None
+        self.synthesis_artifact_id: UUID | None = None
         self.calls: list[dict[str, object]] = []
 
     async def acquire_run_guard(self, _uow, production_run_id):
@@ -59,7 +60,10 @@ class _RecordingRevisionEffects:
         return SimpleNamespace(id=self.run_id)
 
     async def current_snapshot_in_uow(self, _uow, _subject_id):
-        return SimpleNamespace(production_run_id=self.run_id)
+        return SimpleNamespace(
+            production_run_id=self.run_id,
+            synthesis_artifact_id=self.synthesis_artifact_id,
+        )
 
     async def apply_after_write(self, _uow, **values):
         self.calls.append(values)
@@ -161,6 +165,7 @@ async def test_opaque_actor_revise_and_restore_reach_revision_effects(
         _RecordingGateway(lambda request: _succeeded_text(request, _table_revision_wire())),
         revision_effects=revise_effects,
     )
+    revise_effects.synthesis_artifact_id = revise_harness.world.synthesis_artifact.id
     revise_args = _revision_args(revise_harness)
     revise_args["actor"] = "dev-analyst"
     revised = await revise_harness.service.revise(**revise_args)
@@ -178,6 +183,7 @@ async def test_opaque_actor_revise_and_restore_reach_revision_effects(
         revision_effects=restore_effects,
     )
     await _install_stale_enrichment_restore_history(restore_harness)
+    restore_effects.synthesis_artifact_id = restore_harness.world.synthesis_artifact.id
     restored = await restore_harness.service.restore_stale_enrichment_blocks(
         **_stale_enrichment_restore_args(restore_harness),
         actor="dev-analyst",

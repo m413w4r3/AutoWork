@@ -156,7 +156,7 @@ async def _persist_enrichment_history(
         source_figure_inventory_hash=None,
     )
     annotation = SemanticAnnotationProposalV1(
-        role=SemanticRole.TEXT,
+        role=SemanticRole.TECHNICAL,
         paragraph_anchor="section:0:paragraph:0001",
         text=seeded.synthesis.sections[0].paragraphs[0].text,
     )
