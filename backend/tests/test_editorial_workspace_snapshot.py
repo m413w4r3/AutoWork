@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -17,6 +18,10 @@ from cti_app.application.editorial_workspace.service import (
     EditorialWorkspaceService,
     advance_workspace_registry,
 )
+from cti_app.domain.editorial_proposal_impact import (
+    EditorialProposalImpact,
+    EditorialProposalImpactState,
+)
 from cti_app.domain.editorial_workspace import (
     EditorialIdentityAmbiguousError,
     EditorialRegistryConflictError,
@@ -24,6 +29,8 @@ from cti_app.domain.editorial_workspace import (
     bootstrap_block_registry,
     workspace_pin_hash,
 )
+from cti_app.domain.production import ProductionArtifactStatus
+from cti_app.domain.typst_render import TypstRenderStatus
 
 
 def _synthesis(paragraphs: tuple[dict[str, object], ...]) -> dict[str, object]:
@@ -541,6 +548,212 @@ def test_workspace_pin_hash_is_stable_for_same_pins() -> None:
     assert workspace_pin_hash(pins) == workspace_pin_hash(dict(pins))
 
 
+@pytest.mark.parametrize(
+    ("render_status", "expected_preview_status"),
+    [
+        (TypstRenderStatus.SUCCEEDED, "READY"),
+        (TypstRenderStatus.RUNNING, "IN_PROGRESS"),
+        (TypstRenderStatus.FAILED, "FAILED"),
+    ],
+)
+def test_workspace_snapshot_reads_publication_render_cycle_without_impact(
+    monkeypatch: pytest.MonkeyPatch,
+    render_status: TypstRenderStatus,
+    expected_preview_status: str,
+) -> None:
+    from cti_app.application.editorial_workspace import service as service_module
+    from cti_app.domain.publication_kind import PublicationKind
+
+    service, subject_id, _repository, artifacts, artifact_store = _workspace_service(
+        _synthesis((_paragraph("synthetic paragraph"),)), monkeypatch
+    )
+    publication = _make_artifact(
+        "publication",
+        {"schema_version": "9", "title": "Synthetic publication"},
+        production_run_id=artifacts.current["synthesis"].production_run_id,
+    )
+    artifacts.current["publication"] = publication
+    artifact_store.write(publication)
+    uow = service._uow_factory()
+    uow.publication_render = SimpleNamespace(status=render_status)
+    monkeypatch.setattr(
+        service_module,
+        "resolve_publication_kind",
+        lambda _routing, _publication: (PublicationKind.ARTICLE, "b" * 64),
+    )
+
+    async def exercise() -> None:
+        snapshot = await service.snapshot(subject_id)
+
+        assert snapshot["impact_status"] == "none"
+        assert snapshot["preview_status"] == expected_preview_status
+
+    asyncio.run(exercise())
+
+
+def test_workspace_snapshot_preserves_stale_render_status_without_impact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, subject_id, _repository, artifacts, artifact_store = _workspace_service(
+        _synthesis((_paragraph("synthetic paragraph"),)), monkeypatch
+    )
+    publication = _make_artifact(
+        "publication",
+        {"schema_version": "9", "title": "Synthetic publication"},
+        production_run_id=artifacts.current["synthesis"].production_run_id,
+    )
+    publication.status = ProductionArtifactStatus.STALE
+    artifacts.current["publication"] = publication
+    artifact_store.write(publication)
+
+    async def exercise() -> None:
+        snapshot = await service.snapshot(subject_id)
+        assert snapshot["impact_status"] == "none"
+        assert snapshot["preview_status"] == "STALE"
+        assert snapshot["pdf_status"] == "STALE"
+
+    asyncio.run(exercise())
+
+
+def test_pending_impact_without_publication_does_not_mark_preview_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, subject_id, _repository, _artifacts, _artifact_store = _workspace_service(
+        _synthesis((_paragraph("synthetic paragraph"),)),
+        monkeypatch,
+        impact_state=EditorialProposalImpactState.PENDING,
+    )
+
+    async def exercise() -> None:
+        snapshot = await service.snapshot(subject_id)
+        assert snapshot["impact_status"] == "pending"
+        assert snapshot["publication_artifact_id"] is None
+        assert snapshot["preview_status"] == "READY"
+        assert snapshot["pdf_status"] == "CURRENT"
+
+    asyncio.run(exercise())
+
+
+def test_pending_impact_marks_preview_stale_when_publication_uses_old_synthesis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cti_app.application.editorial_workspace import service as service_module
+    from cti_app.domain.publication_kind import PublicationKind
+
+    service, subject_id, _repository, artifacts, artifact_store = _workspace_service(
+        _synthesis((_paragraph("synthetic paragraph"),)),
+        monkeypatch,
+        impact_state=EditorialProposalImpactState.PENDING,
+    )
+    old_synthesis = artifacts.current["synthesis"]
+    assert old_synthesis is not None
+    artifacts.replace_synthesis(
+        _synthesis((_paragraph("revised synthetic paragraph"),)), artifact_store
+    )
+    publication = _make_artifact(
+        "publication",
+        {"schema_version": "8", "title": "Synthetic publication from old synthesis"},
+        production_run_id=old_synthesis.production_run_id,
+    )
+    publication.metadata = {"input_artifacts": {"synthesis_artifact_id": str(old_synthesis.id)}}
+    artifacts.current["publication"] = publication
+    artifact_store.write(publication)
+    monkeypatch.setattr(
+        service_module,
+        "resolve_publication_kind",
+        lambda _routing, _publication: (PublicationKind.BRIEF, "b" * 64),
+    )
+
+    async def exercise() -> None:
+        snapshot = await service.snapshot(subject_id)
+        assert snapshot["impact_status"] == "pending"
+        assert snapshot["publication_artifact_id"] == str(publication.id)
+        assert snapshot["preview_status"] == "STALE"
+        assert snapshot["pdf_status"] == "STALE"
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("has_current_enrichment", "expected_preview_status", "expected_pdf_status"),
+    [(False, "READY", "CURRENT"), (True, "STALE", "STALE")],
+)
+def test_publication_without_enrichment_pin_is_stale_only_when_enrichment_exists(
+    monkeypatch: pytest.MonkeyPatch,
+    has_current_enrichment: bool,
+    expected_preview_status: str,
+    expected_pdf_status: str,
+) -> None:
+    from cti_app.application.editorial_workspace import service as service_module
+    from cti_app.domain.publication_kind import PublicationKind
+
+    service, subject_id, _repository, artifacts, artifact_store = _workspace_service(
+        _synthesis((_paragraph("synthetic paragraph"),)),
+        monkeypatch,
+        impact_state=EditorialProposalImpactState.PENDING,
+    )
+    synthesis_artifact = artifacts.current["synthesis"]
+    assert synthesis_artifact is not None
+    if has_current_enrichment:
+        enrichment = _make_artifact(
+            "editorial_enrichment",
+            {"schema_version": "8", "elements": []},
+            production_run_id=synthesis_artifact.production_run_id,
+        )
+        artifacts.current["editorial_enrichment"] = enrichment
+        artifact_store.write(enrichment)
+
+    publication = _make_artifact(
+        "publication",
+        {"schema_version": "9", "title": "Synthetic publication without enrichment"},
+        production_run_id=synthesis_artifact.production_run_id,
+    )
+    publication.metadata = {
+        "input_artifacts": {"synthesis_artifact_id": str(synthesis_artifact.id)}
+    }
+    artifacts.current["publication"] = publication
+    artifact_store.write(publication)
+    monkeypatch.setattr(
+        service_module,
+        "resolve_publication_kind",
+        lambda _routing, _publication: (PublicationKind.BRIEF, "b" * 64),
+    )
+
+    async def exercise() -> None:
+        snapshot = await service.snapshot(subject_id)
+        assert snapshot["impact_status"] == "pending"
+        assert snapshot["preview_status"] == expected_preview_status
+        assert snapshot["pdf_status"] == expected_pdf_status
+
+    asyncio.run(exercise())
+
+
+def test_snapshot_keeps_latest_stale_publication_visible_after_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, subject_id, _repository, artifacts, _artifact_store = _workspace_service(
+        _synthesis((_paragraph("synthetic paragraph"),)),
+        monkeypatch,
+        impact_state=EditorialProposalImpactState.DONE,
+    )
+    stale_publication = _make_artifact(
+        "publication",
+        {"schema_version": "8", "title": "Synthetic stale publication"},
+        production_run_id=artifacts.current["synthesis"].production_run_id,
+    )
+    stale_publication.status = ProductionArtifactStatus.STALE
+    artifacts.history.append(stale_publication)
+
+    async def exercise() -> None:
+        snapshot = await service.snapshot(subject_id)
+        assert snapshot["impact_status"] == "up_to_date"
+        assert snapshot["publication_artifact_id"] is None
+        assert snapshot["preview_status"] == "STALE"
+        assert snapshot["pdf_status"] == "STALE"
+
+    asyncio.run(exercise())
+
+
 def _make_artifact(
     stage: str,
     content: dict[str, object],
@@ -554,7 +767,9 @@ def _make_artifact(
         stage=stage,
         version=version,
         input_hash="a" * 64,
+        status=ProductionArtifactStatus.VERIFIED,
         canonical_blob_id=artifact_id,
+        metadata={},
         content=content,
         production_run_id=production_run_id,
     )
@@ -563,6 +778,8 @@ def _make_artifact(
 def _workspace_service(
     synthesis: dict[str, object],
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    impact_state: EditorialProposalImpactState | None = None,
 ) -> tuple[
     EditorialWorkspaceService,
     UUID,
@@ -578,7 +795,33 @@ def _workspace_service(
     synthesis_artifact = _make_artifact("synthesis", synthesis, production_run_id=run.id)
     repository = _FakeWorkspaceRepository()
     artifacts = _FakeProductionArtifacts(synthesis_artifact)
-    uow = _FakeUnitOfWork(subject_id, run, artifacts, repository)
+    impact = (
+        EditorialProposalImpact(
+            impact_id=uuid4(),
+            subject_id=subject_id,
+            production_run_id=run.id,
+            proposal_id=uuid4(),
+            accepted_artifact_id=synthesis_artifact.id,
+            accepted_snapshot_id=uuid4(),
+            base_pin_hash="a" * 64,
+            accepted_pin_hash="b" * 64,
+            sequence=1,
+            state=impact_state,
+            completed_at=(
+                datetime.now(UTC)
+                if impact_state
+                in {
+                    EditorialProposalImpactState.DONE,
+                    EditorialProposalImpactState.FAILED,
+                    EditorialProposalImpactState.SUPERSEDED,
+                }
+                else None
+            ),
+        )
+        if impact_state is not None
+        else None
+    )
+    uow = _FakeUnitOfWork(subject_id, run, artifacts, repository, impact)
     artifact_store = _FakeArtifactStore()
     artifact_store.write(synthesis_artifact)
 
@@ -615,6 +858,7 @@ class _FakeProductionArtifacts:
             "editorial_enrichment": None,
             "publication": None,
         }
+        self.history: list[SimpleNamespace] = []
         self._synthesis_reads = 0
         self.change_synthesis_on_second_read: SimpleNamespace | None = None
 
@@ -629,6 +873,12 @@ class _FakeProductionArtifacts:
 
     async def get_current(self, _run_id: UUID, stage: str) -> SimpleNamespace | None:
         return self.current[stage]
+
+    async def list_for_run(self, _run_id: UUID) -> tuple[SimpleNamespace, ...]:
+        return (
+            *self.history,
+            *(item for item in self.current.values() if item is not None),
+        )
 
     def replace_synthesis(
         self, content: dict[str, object], artifact_store: _FakeArtifactStore
@@ -680,6 +930,7 @@ class _FakeUnitOfWork:
         run: SimpleNamespace,
         artifacts: _FakeProductionArtifacts,
         repository: _FakeWorkspaceRepository,
+        impact: EditorialProposalImpact | None,
     ):
         self.subjects = SimpleNamespace(get=self._get_subject)
         self.production_runs = SimpleNamespace(
@@ -688,8 +939,14 @@ class _FakeUnitOfWork:
         )
         self.production_artifacts = artifacts
         self.editorial_workspace_snapshots = repository
+        self.editorial_proposal_impacts = SimpleNamespace(latest_for_run=self._latest_impact)
+        self.publication_render = None
+        self.publication_renders = SimpleNamespace(
+            get_latest_for_artifact=self._latest_publication_render
+        )
         self.subject_id = subject_id
         self.run = run
+        self.impact = impact
 
     async def _get_subject(self, subject_id: UUID) -> SimpleNamespace | None:
         return SimpleNamespace(id=subject_id) if subject_id == self.subject_id else None
@@ -699,6 +956,12 @@ class _FakeUnitOfWork:
 
     async def _lock_creation_for_subject(self, _subject_id: UUID) -> None:
         return None
+
+    async def _latest_impact(self, _run_id: UUID) -> EditorialProposalImpact | None:
+        return self.impact
+
+    async def _latest_publication_render(self, _artifact_id: UUID):
+        return self.publication_render
 
     async def __aenter__(self) -> _FakeUnitOfWork:
         return self

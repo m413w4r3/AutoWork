@@ -144,6 +144,8 @@ test("message-only composer renders safe generating, reply and error states", as
       can_preview_pdf: false,
     },
     preview_status: "READY",
+    impact_status: "none",
+    pdf_status: "CURRENT",
     snapshot_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
   };
   const binding = {

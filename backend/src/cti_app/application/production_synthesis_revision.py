@@ -23,6 +23,7 @@ from cti_app.application.editorial_revision_effects import (
 from cti_app.application.editorial_synthesis import candidate as _candidate
 from cti_app.application.editorial_synthesis import patch_validation as _patch_validation
 from cti_app.application.editorial_synthesis import targets as _targets
+from cti_app.application.editorial_workspace.registry import WorkspaceSnapshotRecord
 from cti_app.application.model_gateway import (
     ModelSubmissionReconciliationRequiredError,
 )
@@ -1213,7 +1214,7 @@ class ProductionSynthesisRevisionService:
         synthesis_service: ProductionSynthesisService,
         synthesis_persistence: SynthesisService,
         enrichment_persistence: EditorialEnrichmentService,
-        publication_render_service: PublicationRenderService,
+        publication_render_service: PublicationRenderService | None,
         enrichment_revision_service: Any | None = None,
         source_addition_service: SourceAdditionService | None = None,
         revision_effects: EditorialRevisionEffects | None = None,
@@ -1688,6 +1689,10 @@ class ProductionSynthesisRevisionService:
 
         # Preview rendering stays post-commit behind the injected renderer port.
         if result.publication_artifact is not None:
+            if self._publication_render_service is None:
+                raise TargetedSynthesisRevisionValidationError(
+                    "targeted_synthesis_revision_renderer_unavailable"
+                )
             await self._publication_render_service.render_preview(result.publication_artifact.id)
         return result
 
@@ -2959,6 +2964,135 @@ class ProductionSynthesisRevisionService:
             for key in sorted(provenance)
             if key in {_paragraph_id(item) for item in new_paragraphs}
         }
+
+    async def rebase_adopted_synthesis(
+        self,
+        uow: Any,
+        *,
+        run: ProductionRun,
+        run_guard: EditorialRunGuard,
+        base_snapshot: WorkspaceSnapshotRecord,
+        accepted_snapshot: WorkspaceSnapshotRecord,
+        actor_id: str,
+    ) -> None:
+        """Reuse the synthesis revision's enrichment rebase after proposal adoption."""
+        if self._revision_effects is None:
+            raise EditorialRevisionEffectsError("editorial_revision_effects_unavailable")
+        if (
+            base_snapshot.production_run_id != run.id
+            or accepted_snapshot.production_run_id != run.id
+            or base_snapshot.subject_id != run.subject_id
+            or accepted_snapshot.subject_id != run.subject_id
+            or accepted_snapshot.parent_snapshot_id != base_snapshot.snapshot_id
+            or accepted_snapshot.publication_kind is None
+        ):
+            raise EditorialRevisionEffectsError("editorial_impact_snapshot_mismatch")
+
+        base_artifact = await uow.production_artifacts.get(base_snapshot.synthesis_artifact_id)
+        accepted_artifact = await uow.production_artifacts.get(
+            accepted_snapshot.synthesis_artifact_id
+        )
+        production_input = await uow.production_input_snapshots.get_by_run(run.id)
+        references_artifact = await uow.production_artifacts.get_current(
+            run.id, ProductionArtifactStage.REFERENCES.value
+        )
+        extraction_artifact = await uow.production_artifacts.get_current(
+            run.id, ProductionArtifactStage.EXTRACTION.value
+        )
+        projection_artifact = await uow.production_artifacts.get_current(
+            run.id, ProductionArtifactStage.RELEVANCE_PROJECTION.value
+        )
+        publication_artifact = await uow.production_artifacts.get_current(
+            run.id, ProductionArtifactStage.PUBLICATION.value
+        )
+        if (
+            base_artifact is None
+            or accepted_artifact is None
+            or production_input is None
+            or references_artifact is None
+            or extraction_artifact is None
+            or accepted_artifact.id != accepted_snapshot.synthesis_artifact_id
+            or accepted_artifact.status is not ProductionArtifactStatus.VERIFIED
+            or accepted_artifact.canonical_blob_id is None
+            or base_artifact.stage is not ProductionArtifactStage.SYNTHESIS
+            or base_artifact.canonical_blob_id is None
+            or accepted_artifact.stage is not ProductionArtifactStage.SYNTHESIS
+            or references_artifact.status is not ProductionArtifactStatus.VERIFIED
+            or references_artifact.canonical_blob_id is None
+            or extraction_artifact.status is not ProductionArtifactStatus.VERIFIED
+            or extraction_artifact.canonical_blob_id is None
+        ):
+            raise EditorialRevisionEffectsError("editorial_impact_inputs_missing")
+        base_bytes = await self._synthesis._artifact_store.read_bytes(
+            base_artifact.canonical_blob_id
+        )
+        accepted_bytes = await self._synthesis._artifact_store.read_bytes(
+            accepted_artifact.canonical_blob_id
+        )
+        if (
+            hashlib.sha256(base_bytes).hexdigest() != base_snapshot.synthesis_canonical_sha256
+            or hashlib.sha256(accepted_bytes).hexdigest()
+            != accepted_snapshot.synthesis_canonical_sha256
+        ):
+            raise EditorialRevisionEffectsError("editorial_impact_artifact_hash_mismatch")
+        base_payload = json.loads(base_bytes)
+        accepted_payload = json.loads(accepted_bytes)
+        if not isinstance(base_payload, dict) or not isinstance(accepted_payload, dict):
+            raise EditorialRevisionEffectsError("editorial_impact_synthesis_invalid")
+
+        extraction, extraction_hash = await self._synthesis._load_extraction(
+            run, production_input, extraction_artifact
+        )
+        projection = (
+            await self._synthesis._load_projection(
+                run,
+                production_input,
+                extraction,
+                extraction_hash,
+                projection_artifact,
+            )
+            if projection_artifact is not None
+            else None
+        )
+        access_policy = await self._synthesis._load_access_policy(production_input, extraction)
+        context = _RevisionContext(
+            run=run,
+            snapshot=production_input,
+            base_artifact=base_artifact,
+            base_payload=base_payload,
+            references_artifact=references_artifact,
+            extraction_artifact=extraction_artifact,
+            projection_artifact=projection_artifact,
+            publication_artifact=publication_artifact,
+            effective_repair_decisions=(),
+            publication_kind=accepted_snapshot.publication_kind,
+        )
+        rebased_artifact, rebased = await self._rebase_enrichment_if_valid(
+            context=context,
+            extraction=extraction,
+            projection=projection,
+            revised_synthesis=production_synthesis_from_json(accepted_payload),
+            synthesis_artifact=accepted_artifact,
+            access_policy_hash=synthesis_access_policy_hash(access_policy),
+            uow=uow,
+        )
+        if rebased_artifact is None or rebased is None:
+            return
+        canonical_content = editorial_enrichment_to_json(rebased)
+        canonical_sha256 = hashlib.sha256(
+            ProductionArtifactStore.canonical_json_bytes(canonical_content)
+        ).hexdigest()
+        await self._revision_effects.apply_after_write(
+            uow,
+            run_guard=run_guard,
+            base_snapshot=accepted_snapshot,
+            stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+            artifact=rebased_artifact,
+            canonical_sha256=canonical_sha256,
+            canonical_content=canonical_content,
+            lineage=None,
+            actor_id=actor_id,
+        )
 
     async def _rebase_enrichment_if_valid(
         self,

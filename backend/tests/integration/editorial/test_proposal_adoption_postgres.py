@@ -64,6 +64,7 @@ from cti_app.application.production_synthesis import (
     canonical_extraction_hash,
 )
 from cti_app.application.production_synthesis_revision import _apply_wire_patch
+from cti_app.application.publication_builder import build_article_format_v1
 from cti_app.application.subject_production import capture_production_input_snapshot
 from cti_app.config import Settings
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
@@ -135,12 +136,20 @@ from cti_app.domain.production_synthesis import (
     extraction_evidence_refs_v1,
     production_synthesis_to_json,
 )
+from cti_app.domain.publication_document import (
+    PublicationDocumentV8,
+    parse_publication_document,
+    serialize_publication_document,
+)
 from cti_app.domain.publication_kind import PublicationKind
+from cti_app.domain.publication_render import PublicationRender
+from cti_app.domain.typst_render import TypstRenderFormat, TypstRenderStatus
 from tests.integration.edition_codes import reserve_edition_code
 from tests.integration.test_production_reuse_postgres import (
     _prepare_reusable_article,
     _seed_subject_discovery_lineage,
 )
+from tests.test_publication_kind_resolution import _brief_v8_payload
 
 pytestmark = pytest.mark.integration
 
@@ -828,7 +837,11 @@ def _enrichment_seed_content(
     )
 
 
-async def _seed_enrichment_proposal(uow_factory: UnitOfWorkFactory) -> _Seeded:
+async def _seed_enrichment_proposal(
+    uow_factory: UnitOfWorkFactory,
+    *,
+    publication_base: bool = False,
+) -> _Seeded:
     seeded = await _seed(uow_factory, proposal_count=0, article_base=True)
     enrichment_content = _enrichment_seed_content(
         seeded.production_input,
@@ -864,6 +877,89 @@ async def _seed_enrichment_proposal(uow_factory: UnitOfWorkFactory) -> _Seeded:
         metadata={"routing_policy_version": "synthetic-routing-policy"},
     )
 
+    publication_artifact: ProductionArtifact | None = None
+    publication_blob: BlobRecord | None = None
+    render_output_blob: BlobRecord | None = None
+    publication_render: PublicationRender | None = None
+    publication_sha256: str | None = None
+    publication_input_hash: str | None = None
+    if publication_base:
+        # Keep a verified publication and successful render pinned to the inputs
+        # that adoption is about to advance.
+        brief = parse_publication_document(_brief_v8_payload())
+        assert isinstance(brief, PublicationDocumentV8)
+        article_v7 = replace(brief.base_publication, publication_kind=PublicationKind.ARTICLE)
+        article = PublicationDocumentV8(
+            base_publication=article_v7,
+            article_format=build_article_format_v1(
+                article_v7.base_publication.base_publication,
+                seeded.extraction,
+            ),
+        )
+        publication_payload = serialize_publication_document(article)
+        publication_bytes = ProductionArtifactStore.canonical_json_bytes(publication_payload)
+        publication_sha256 = hashlib.sha256(publication_bytes).hexdigest()
+        publication_input_hash = hashlib.sha256(
+            f"{seeded.base_artifact.id}:{base_artifact.id}".encode()
+        ).hexdigest()
+        publication_descriptor = BlobDescriptor(
+            publication_sha256,
+            len(publication_bytes),
+            "application/json",
+            _CANONICAL_BUCKET,
+        )
+        seeded.blob_store.seed(publication_descriptor, publication_bytes)
+        publication_blob = BlobRecord(descriptor=publication_descriptor)
+        publication_artifact = ProductionArtifact(
+            production_run_id=seeded.run.id,
+            subject_id=seeded.subject.id,
+            stage=ProductionArtifactStage.PUBLICATION,
+            version=1,
+            input_hash=publication_input_hash,
+            status=ProductionArtifactStatus.VERIFIED,
+            metadata={
+                "input_artifacts": {
+                    "synthesis_artifact_id": str(seeded.base_artifact.id),
+                    "editorial_enrichment_artifact_id": str(base_artifact.id),
+                }
+            },
+        )
+
+        pdf_bytes = b"%PDF-1.7\n% synthetic prior publication\n%%EOF\n"
+        pdf_descriptor = BlobDescriptor(
+            hashlib.sha256(pdf_bytes).hexdigest(),
+            len(pdf_bytes),
+            "application/pdf",
+            "editorial-impact-test-renders",
+        )
+        seeded.blob_store.seed(pdf_descriptor, pdf_bytes)
+        render_output_blob = BlobRecord(descriptor=pdf_descriptor)
+        render_time = datetime.now(UTC)
+        publication_render = PublicationRender(
+            id=uuid4(),
+            publication_artifact_id=publication_artifact.id,
+            renderer="typst",
+            renderer_version="synthetic-renderer-v1",
+            template_version="synthetic-template-v1",
+            template_sha256="a" * 64,
+            compiler="typst",
+            compiler_version="synthetic-compiler-v1",
+            font_bundle_version="synthetic-fonts-v1",
+            render_policy_version="synthetic-render-policy-v1",
+            format=TypstRenderFormat.PDF,
+            input_hash=hashlib.sha256(uuid4().bytes).hexdigest(),
+            source_blob_id=None,
+            render_data_blob_id=None,
+            output_blob_id=render_output_blob.id,
+            output_sha256=pdf_descriptor.sha256,
+            output_byte_size=pdf_descriptor.size,
+            status=TypstRenderStatus.SUCCEEDED,
+            error_code=None,
+            error_message=None,
+            created_at=render_time,
+            updated_at=render_time,
+        )
+
     occurrence_id = uuid4()
     target = TargetedEditorialRevisionTarget(
         kind=TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT,
@@ -877,7 +973,7 @@ async def _seed_enrichment_proposal(uow_factory: UnitOfWorkFactory) -> _Seeded:
         kind=EditorialBlockKind.TABLE,
         parent_block_id=None,
         position=0,
-        content_sha256=before_hash,
+        content_sha256=canonical_content_sha256(base_payload["tables"][0]),
         source_stage=EditorialSourceStage.EDITORIAL_ENRICHMENT,
         structural_pointer="/tables/0",
     )
@@ -888,6 +984,13 @@ async def _seed_enrichment_proposal(uow_factory: UnitOfWorkFactory) -> _Seeded:
         enrichment_version=base_artifact.version,
         enrichment_input_hash=base_artifact.input_hash,
         enrichment_canonical_sha256=base_sha256,
+        publication_artifact_id=(publication_artifact.id if publication_artifact else None),
+        publication_version=(publication_artifact.version if publication_artifact else None),
+        publication_input_hash=publication_input_hash,
+        publication_canonical_sha256=publication_sha256,
+        # Without a publication envelope the production fixture has no resolved kind.
+        publication_kind=(PublicationKind.ARTICLE if publication_artifact else None),
+        routing_decision_hash=("d" * 64 if publication_artifact else None),
         workspace_pin_hash="a" * 64,
         registry_hash=registry_hash((entry,)),
         block_registry=(entry,),
@@ -920,7 +1023,7 @@ async def _seed_enrichment_proposal(uow_factory: UnitOfWorkFactory) -> _Seeded:
         base_artifact_version=base_artifact.version,
         base_input_hash=base_artifact.input_hash,
         base_canonical_sha256=base_sha256,
-        base_routing_hash=None,
+        base_routing_hash=snapshot.routing_decision_hash,
         base_pin_hash=snapshot.workspace_pin_hash,
         target_id=target_id,
         operation=operation.value,
@@ -943,7 +1046,24 @@ async def _seed_enrichment_proposal(uow_factory: UnitOfWorkFactory) -> _Seeded:
         base_blob = await uow.blobs.add_if_absent(base_blob)
         patch_blob = await uow.blobs.add_if_absent(patch_blob)
         base_artifact = replace(base_artifact, canonical_blob_id=base_blob.id)
+        proposal = replace(proposal, patch_blob_ref=patch_blob.id)
         await uow.production_artifacts.append(base_artifact)
+        if publication_artifact is not None:
+            assert publication_blob is not None
+            assert render_output_blob is not None
+            assert publication_render is not None
+            publication_blob = await uow.blobs.add_if_absent(publication_blob)
+            render_output_blob = await uow.blobs.add_if_absent(render_output_blob)
+            publication_render = replace(
+                publication_render,
+                output_blob_id=render_output_blob.id,
+            )
+            publication_artifact = replace(
+                publication_artifact,
+                canonical_blob_id=publication_blob.id,
+            )
+            await uow.production_artifacts.append(publication_artifact)
+            await uow.publication_renders.add(publication_render)
         await uow.editorial_workspace_snapshots.append_if_absent(snapshot)
         event = EditorialProposalEvent(
             id=uuid4(),
@@ -993,6 +1113,13 @@ async def _seed_enrichment_proposal(uow_factory: UnitOfWorkFactory) -> _Seeded:
         ),
         element_kind=EditorialEnrichmentElementKind.TABLE,
         element_key="synthetic_table",
+        registry_lineage=(
+            {
+                "block_id": str(occurrence_id),
+                "transition": "rewrite",
+                "pointer": "/tables/0",
+            },
+        ),
         input_hash=input_hash,
         artifact_id=uuid4(),
         evidence_pack_hash=evidence_pack_hash,

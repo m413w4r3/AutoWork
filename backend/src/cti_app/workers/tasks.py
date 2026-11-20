@@ -1,5 +1,6 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
+from typing import cast
 from uuid import UUID
 
 import dramatiq
@@ -36,6 +37,10 @@ from cti_app.application.edition_workspace import (
     EditionProductionCheckpointService,
     EditionWorkspaceMaterializer,
 )
+from cti_app.application.editorial_revision_impact import (
+    EDITORIAL_IMPACT_DISPATCH_RETRY_AFTER,
+    EDITORIAL_IMPACT_RUNNING_RECOVERY_AFTER,
+)
 from cti_app.application.investigation_jobs import (
     make_investigation_runner,
 )
@@ -54,6 +59,9 @@ from cti_app.application.production_jobs import (
     stage_job_kind,
 )
 from cti_app.application.production_pacing import ProductionPacingPolicy
+from cti_app.application.production_repair_factory import (
+    create_editorial_proposal_impact_service,
+)
 from cti_app.application.typst_paths import typst_bundle_paths
 from cti_app.application.virustotal import VirusTotalCapabilities, VirusTotalRoutingPolicy
 from cti_app.application.virustotal_persistence import VirusTotalObservationService
@@ -172,6 +180,19 @@ def execute_editorial_thread_job(job_id: str) -> None:
 
 
 @dramatiq.actor(max_retries=0)
+def process_editorial_proposal_impact(impact_id: str) -> None:
+    """Apply one committed editorial impact through its production wiring."""
+    asyncio.run(_process_editorial_proposal_impact(UUID(impact_id)))
+
+
+@dramatiq.actor(max_retries=0)
+def dispatch_editorial_proposal_impacts() -> None:
+    """Enqueue pending, failed-retryable, and abandoned running impacts."""
+    for impact_id in asyncio.run(_dispatchable_editorial_proposal_impacts()):
+        process_editorial_proposal_impact.send(str(impact_id))
+
+
+@dramatiq.actor(max_retries=0)
 def recover_abandoned_jobs() -> None:
     """Requeue jobs whose running worker stopped updating its heartbeat."""
     for job_id, kind in asyncio.run(_recover_abandoned_jobs()):
@@ -195,7 +216,7 @@ async def _execute_editorial_thread_job(job_id: UUID) -> int | None:
     session_factory = create_session_factory(engine)
 
     def uow_factory() -> UnitOfWork:
-        return SqlAlchemyUnitOfWork(session_factory)
+        return cast(UnitOfWork, SqlAlchemyUnitOfWork(session_factory))
 
     try:
         blob_store = MinioBlobStore(
@@ -237,6 +258,74 @@ async def _execute_editorial_thread_job(job_id: UUID) -> int | None:
         await engine.dispose()
 
 
+async def _process_editorial_proposal_impact(impact_id: UUID) -> None:
+    settings = get_settings()
+    engine = create_postgres_engine(settings.postgres_dsn)
+    session_factory = create_session_factory(engine)
+
+    def uow_factory() -> UnitOfWork:
+        return cast(UnitOfWork, SqlAlchemyUnitOfWork(session_factory))
+
+    try:
+        blob_store = MinioBlobStore(
+            Minio(
+                settings.s3_endpoint,
+                access_key=settings.s3_access_key,
+                secret_key=settings.s3_secret_key,
+                secure=settings.s3_secure,
+            ),
+            physical_bucket=settings.s3_bucket,
+        )
+        artifact_store = ProductionArtifactStore(BlobCatalogService(blob_store, uow_factory))
+        impact_service = create_editorial_proposal_impact_service(
+            uow_factory,
+            artifact_store=artifact_store,
+            model_gateway=create_model_gateway(settings, uow_factory),
+            resource_search_enabled=settings.production_editorial_resource_search_enabled,
+        )
+        from cti_app.workers.editorial_proposal_impacts import EditorialProposalImpactWorker
+
+        await EditorialProposalImpactWorker(impact_service).process(impact_id)
+    finally:
+        await engine.dispose()
+
+
+async def _dispatchable_editorial_proposal_impacts() -> tuple[UUID, ...]:
+    settings = get_settings()
+    engine = create_postgres_engine(settings.postgres_dsn)
+    session_factory = create_session_factory(engine)
+
+    def uow_factory() -> UnitOfWork:
+        return cast(UnitOfWork, SqlAlchemyUnitOfWork(session_factory))
+
+    try:
+        async with uow_factory() as uow:
+            now = datetime.now(UTC)
+            repository = uow.editorial_proposal_impacts
+            stale_running_before = now - EDITORIAL_IMPACT_RUNNING_RECOVERY_AFTER
+            dispatch_before = now - EDITORIAL_IMPACT_DISPATCH_RETRY_AFTER
+            candidates = await repository.list_dispatchable(
+                now=now,
+                stale_running_before=stale_running_before,
+                dispatch_before=dispatch_before,
+                limit=100,
+            )
+            reserved: list[UUID] = []
+            for impact_id in candidates:
+                if await repository.reserve_dispatch(
+                    impact_id,
+                    now=now,
+                    stale_running_before=stale_running_before,
+                    dispatch_before=dispatch_before,
+                ):
+                    reserved.append(impact_id)
+            if reserved:
+                await uow.commit()
+            return tuple(reserved)
+    finally:
+        await engine.dispose()
+
+
 async def _execute_job(job_id: UUID) -> int | None:
     settings = get_settings()
     engine = create_postgres_engine(settings.postgres_dsn)
@@ -258,7 +347,7 @@ async def _execute_job(job_id: UUID) -> int | None:
         )
 
     def uow_factory() -> UnitOfWork:
-        return SqlAlchemyUnitOfWork(session_factory)
+        return cast(UnitOfWork, SqlAlchemyUnitOfWork(session_factory))
 
     try:
         if settings.virustotal_proxy_url:

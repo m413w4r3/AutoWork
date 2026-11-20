@@ -68,7 +68,10 @@ from cti_app.domain.editorial_proposal import (
     EditorialProposalModelRun,
     EditorialProposalState,
 )
-from cti_app.domain.editorial_proposal_impact import EditorialProposalImpact
+from cti_app.domain.editorial_proposal_impact import (
+    EditorialProposalImpact,
+    EditorialProposalImpactState,
+)
 from cti_app.domain.editorial_thread import (
     EditorialBridgeStatus,
     EditorialThread,
@@ -329,7 +332,48 @@ class EditorialProposalImpactRepository(Protocol):
 
     async def get_by_proposal(self, proposal_id: UUID) -> EditorialProposalImpact | None: ...
 
+    async def get_by_id(self, impact_id: UUID) -> EditorialProposalImpact | None: ...
+
+    async def latest_for_run(self, production_run_id: UUID) -> EditorialProposalImpact | None: ...
+
     async def next_sequence_for_run(self, production_run_id: UUID) -> int: ...
+
+    async def claim(
+        self,
+        impact_id: UUID,
+        *,
+        now: datetime,
+        stale_running_before: datetime,
+    ) -> EditorialProposalImpact | None: ...
+
+    async def list_dispatchable(
+        self,
+        *,
+        now: datetime,
+        stale_running_before: datetime,
+        dispatch_before: datetime,
+        limit: int,
+    ) -> Sequence[UUID]: ...
+
+    async def reserve_dispatch(
+        self,
+        impact_id: UUID,
+        *,
+        now: datetime,
+        stale_running_before: datetime,
+        dispatch_before: datetime,
+    ) -> bool: ...
+
+    async def set_state(
+        self,
+        impact_id: UUID,
+        *,
+        state: EditorialProposalImpactState,
+        expected_claimed_at: datetime,
+        now: datetime,
+        available_at: datetime,
+        last_error_code: str | None,
+    ) -> EditorialProposalImpact | None: ...
 
 
 class BridgeGenerationSlotRepository(Protocol):

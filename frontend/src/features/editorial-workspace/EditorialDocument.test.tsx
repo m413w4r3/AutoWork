@@ -58,6 +58,8 @@ const snapshot: EditorialWorkspaceSnapshot = {
     can_preview_pdf: false,
   },
   preview_status: "READY",
+  impact_status: "none",
+  pdf_status: "CURRENT",
   snapshot_id: "snapshot-1",
 };
 

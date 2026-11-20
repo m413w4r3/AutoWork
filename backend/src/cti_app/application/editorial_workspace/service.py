@@ -24,6 +24,7 @@ from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_routing import get_adopted_production_routing_decision
 from cti_app.application.subject_content import resolve_publication_kind
+from cti_app.domain.editorial_proposal_impact import project_editorial_impact_status
 from cti_app.domain.editorial_workspace import (
     AdvancedBlockRegistry,
     BlockRegistryEntry,
@@ -35,8 +36,14 @@ from cti_app.domain.editorial_workspace import (
     reconcile_exact_block_registry,
     workspace_pin_hash,
 )
-from cti_app.domain.production import ProductionArtifact, ProductionArtifactStage
+from cti_app.domain.production import (
+    ProductionArtifact,
+    ProductionArtifactStage,
+    ProductionArtifactStatus,
+)
 from cti_app.domain.production_editorial_revision import TargetedEditorialRevisionTarget
+from cti_app.domain.publication_render import PublicationPreviewStatus
+from cti_app.domain.typst_render import TypstRenderStatus
 
 
 @dataclass(frozen=True, slots=True)
@@ -396,6 +403,61 @@ class EditorialWorkspaceService:
                 record=record,
                 allow_operations=kind is not None,
             )
+            impact = await uow.editorial_proposal_impacts.latest_for_run(run.id)
+            publication_render = (
+                await uow.publication_renders.get_latest_for_artifact(publication_artifact.id)
+                if publication_artifact is not None
+                else None
+            )
+            publication_stale = False
+            if publication_artifact is None:
+                publication_history = [
+                    item
+                    for item in await uow.production_artifacts.list_for_run(run.id)
+                    if item.stage == ProductionArtifactStage.PUBLICATION
+                ]
+                latest_publication = max(
+                    publication_history,
+                    key=lambda item: item.version,
+                    default=None,
+                )
+                publication_stale = (
+                    latest_publication is not None
+                    and latest_publication.status is ProductionArtifactStatus.STALE
+                )
+            else:
+                publication_stale = publication_artifact.status is ProductionArtifactStatus.STALE
+                input_artifacts = publication_artifact.metadata.get("input_artifacts")
+                if isinstance(input_artifacts, Mapping):
+                    current_enrichment_id = (
+                        str(enrichment_artifact.id) if enrichment_artifact is not None else None
+                    )
+                    publication_stale = (
+                        publication_stale
+                        or (
+                            "synthesis_artifact_id" in input_artifacts
+                            and input_artifacts.get("synthesis_artifact_id")
+                            != str(synthesis_artifact.id)
+                        )
+                        or (
+                            input_artifacts.get("editorial_enrichment_artifact_id")
+                            != current_enrichment_id
+                        )
+                    )
+            render_status = (
+                PublicationPreviewStatus.READY
+                if publication_render is None
+                else {
+                    TypstRenderStatus.RUNNING: PublicationPreviewStatus.IN_PROGRESS,
+                    TypstRenderStatus.SUCCEEDED: PublicationPreviewStatus.READY,
+                    TypstRenderStatus.FAILED: PublicationPreviewStatus.FAILED,
+                }[publication_render.status]
+            )
+            impact_status, preview_status, pdf_status = project_editorial_impact_status(
+                impact,
+                render_status=render_status,
+                publication_stale=publication_stale,
+            )
             result: dict[str, object] = {
                 "subject_id": str(subject.id),
                 "production_run_id": str(run.id),
@@ -426,7 +488,9 @@ class EditorialWorkspaceService:
                     "can_add_enrichment": False,
                     "can_preview_pdf": False,
                 },
-                "preview_status": "READY",
+                "preview_status": preview_status,
+                "impact_status": impact_status,
+                "pdf_status": pdf_status,
                 "snapshot_id": str(record.snapshot_id),
             }
             await self._assert_artifact_pointers_current(

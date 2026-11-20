@@ -164,6 +164,35 @@ main:has(> .editorial-route-state) > .app-header {
   background: var(--editorial-attention-indicator);
 }
 
+.editorial-workspace-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.55rem 1rem;
+  border-bottom: 1px solid var(--editorial-control-border);
+  background: var(--editorial-panel);
+  color: var(--editorial-ink);
+  font-size: 0.875rem;
+}
+
+.editorial-workspace-status__impact,
+.editorial-workspace-status__pdf {
+  margin: 0;
+  font-weight: 650;
+}
+
+.editorial-workspace-status__impact--attention,
+.editorial-workspace-status__pdf {
+  color: var(--editorial-warning);
+}
+
+.editorial-workspace-status__detail {
+  flex-basis: 100%;
+  margin: 0;
+  color: var(--editorial-muted);
+}
+
 .editorial-topbar .button,
 .editorial-workspace .button {
   min-height: 44px;

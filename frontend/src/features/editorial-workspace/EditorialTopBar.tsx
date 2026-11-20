@@ -58,9 +58,14 @@ export function EditorialTopBar({
             : "À jour";
   const statusDescription =
     snapshot.preview_status === "STALE"
-      ? "Le PDF correspond à une version antérieure du document. Régénérez l’aperçu pour consulter la version actuelle."
+      ? snapshot.impact_status === "failed"
+        ? "Le traitement de l’impact sera retenté automatiquement et peut être rejoué sans annuler l’édition. La prévisualisation PDF se relance depuis l’écran d’aperçu de l’édition."
+        : snapshot.impact_status === "pending" ||
+            snapshot.impact_status === "running"
+          ? "Le traitement de l’impact est en cours. La prévisualisation PDF se relance depuis l’écran d’aperçu de l’édition."
+          : "La publication affichée est périmée. La prévisualisation PDF se relance depuis l’écran d’aperçu de l’édition."
       : stale
-        ? "Le document a changé. Rechargez l’atelier."
+        ? "Le document a changé. Actualisez le statut de l’atelier."
         : snapshot.preview_status === "IN_PROGRESS"
           ? "Le rendu de l’aperçu est en cours. Le document reste consultable."
           : snapshot.preview_status === "FAILED"
@@ -164,17 +169,13 @@ export function EditorialTopBar({
       ) : null}
       {stale ? (
         <div className="editorial-stale-notice" role="status">
-          <p>
-            {snapshot.preview_status === "STALE"
-              ? "Le PDF correspond à une version antérieure du document. Régénérez l’aperçu pour consulter la version actuelle."
-              : "Le document a changé. Rechargez l’atelier."}
-          </p>
+          <p>{statusDescription}</p>
           <button
             className="button button--secondary"
             type="button"
             onClick={onRefresh}
           >
-            Actualiser
+            Actualiser le statut
           </button>
         </div>
       ) : null}

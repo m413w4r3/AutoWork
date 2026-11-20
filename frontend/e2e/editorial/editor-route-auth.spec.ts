@@ -1,6 +1,12 @@
 import { expect, test } from "@playwright/test";
 import type { Page } from "@playwright/test";
+import { mkdir } from "node:fs/promises";
+import { resolve } from "node:path";
 
+import type {
+  EditorialImpactStatus,
+  EditorialPdfStatus,
+} from "../../src/api/editorialWorkspace";
 import {
   EDITORIAL_APP_ORIGIN,
   EDITORIAL_FIXTURES,
@@ -98,12 +104,16 @@ const snapshot = {
     can_preview_pdf: true,
   },
   preview_status: "READY",
+  impact_status: "none",
+  pdf_status: "CURRENT",
   snapshot_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
 } as const;
 
 async function stubEditorApi(
   page: Page,
   snapshotStatus = 200,
+  impactStatus: EditorialImpactStatus = "none",
+  pdfStatus: EditorialPdfStatus = "CURRENT",
 ): Promise<ApiCapture> {
   const capture: ApiCapture = { unexpectedRequests: [] };
   const subjectPath = `/api/subjects/${subjectId}`;
@@ -122,7 +132,14 @@ async function stubEditorApi(
     if (method === "GET" && url.pathname === snapshotPath) {
       await route.fulfill(
         snapshotStatus === 200
-          ? { json: snapshot }
+          ? {
+              json: {
+                ...snapshot,
+                impact_status: impactStatus,
+                pdf_status: pdfStatus,
+                preview_status: pdfStatus === "STALE" ? "STALE" : "READY",
+              },
+            }
           : {
               status: snapshotStatus,
               json: {
@@ -209,6 +226,38 @@ test("la route directe précède le détail sujet et le retour suit l’historiq
   ).toBeVisible();
 
   expect(api.unexpectedRequests).toEqual([]);
+});
+
+test("affiche les impacts et le PDF obsolète avec des captures API simulées", async ({
+  page,
+}) => {
+  const captureDirectory = resolve(
+    process.cwd(),
+    "../.autowork-runs/shots-T-M3-17",
+  );
+  await mkdir(captureDirectory, { recursive: true });
+
+  const pendingApi = await stubEditorApi(page, 200, "pending", "STALE");
+  await page.goto(`/subjects/${subjectId}/editor`);
+  await expect(page.getByRole("status", { name: /en attente/i })).toBeVisible();
+  await expect(
+    page.getByRole("status", { name: /^PDF obsolète\./ }),
+  ).toBeVisible();
+  await expect(page.getByLabel("PDF obsolète")).toHaveCount(1);
+  await page.screenshot({
+    path: resolve(captureDirectory, "impact-pending.png"),
+    fullPage: true,
+  });
+  expect(pendingApi.unexpectedRequests).toEqual([]);
+
+  const failedApi = await stubEditorApi(page, 200, "failed", "STALE");
+  await page.goto(`/subjects/${subjectId}/editor`);
+  await expect(page.getByRole("status", { name: /échoué/i })).toBeVisible();
+  await page.screenshot({
+    path: resolve(captureDirectory, "impact-failed.png"),
+    fullPage: true,
+  });
+  expect(failedApi.unexpectedRequests).toEqual([]);
 });
 
 for (const status of [403, 404]) {

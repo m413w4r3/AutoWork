@@ -110,6 +110,8 @@ const snapshot: EditorialWorkspaceSnapshot = {
     can_preview_pdf: true,
   },
   preview_status: "READY",
+  impact_status: "none",
+  pdf_status: "CURRENT",
   snapshot_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
 };
 
@@ -390,7 +392,7 @@ describe("atelier éditorial", () => {
       await screen.findByRole("status", { name: /PDF obsolète/i }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Actualiser" }),
+      screen.getByRole("button", { name: "Actualiser le statut" }),
     ).toBeInTheDocument();
   });
 

@@ -5,6 +5,7 @@ import { ApiError } from "../../api/editions";
 import { getEditorialWorkspaceSnapshot } from "../../api/editorialWorkspace";
 import { Link } from "../../routing";
 import { EditorialWorkspaceLayout } from "./EditorialWorkspaceLayout";
+import { EditorialWorkspaceStatus } from "./EditorialWorkspaceStatus";
 import { editorialWorkspaceQueryKeys } from "./editorialWorkspaceQueries";
 import "./editorialWorkspace.css";
 
@@ -20,6 +21,11 @@ export function EditorialWorkspacePage({
     queryKey: editorialWorkspaceQueryKeys.snapshot(subjectId),
     queryFn: () => getEditorialWorkspaceSnapshot(subjectId),
     retry: false,
+    refetchInterval: ({ state }) =>
+      state.data?.impact_status === "pending" ||
+      state.data?.impact_status === "running"
+        ? 2_500
+        : false,
   });
 
   if (snapshotQuery.isPending) {
@@ -69,7 +75,7 @@ export function EditorialWorkspacePage({
           type="button"
           onClick={() => void snapshotQuery.refetch()}
         >
-          Actualiser
+          Réessayer la lecture
         </button>
         <Link to="/editions">Retour aux éditions</Link>
       </section>
@@ -85,6 +91,10 @@ export function EditorialWorkspacePage({
       >
         <Link to={`/subjects/${subjectId}`}>← Retour au sujet</Link>
         <h1 id="editorial-empty-heading">Atelier éditorial</h1>
+        <EditorialWorkspaceStatus
+          impactStatus={snapshot.impact_status}
+          pdfStatus={snapshot.pdf_status}
+        />
         <h2>Aucun contenu produit</h2>
         <p>Aucun contenu n’est disponible pour cette version.</p>
         {snapshot.publication_kind === null ? (
@@ -98,12 +108,20 @@ export function EditorialWorkspacePage({
   }
 
   return (
-    <EditorialWorkspaceLayout
-      subjectId={subjectId}
-      snapshot={snapshot}
-      selectedBlockId={selectedBlockId}
-      onSelectBlock={setSelectedBlockId}
-      onRefresh={() => void snapshotQuery.refetch()}
-    />
+    <>
+      <EditorialWorkspaceStatus
+        impactStatus={snapshot.impact_status}
+        pdfStatus={snapshot.pdf_status}
+        showPdfStatus={snapshot.preview_status !== "STALE"}
+        showImpactDetails={snapshot.preview_status !== "STALE"}
+      />
+      <EditorialWorkspaceLayout
+        subjectId={subjectId}
+        snapshot={snapshot}
+        selectedBlockId={selectedBlockId}
+        onSelectBlock={setSelectedBlockId}
+        onRefresh={() => void snapshotQuery.refetch()}
+      />
+    </>
   );
 }

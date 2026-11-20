@@ -42,6 +42,7 @@ from cti_app.application.editorial_proposal_blobs import (
 from cti_app.application.editorial_revision_effects import (
     EditorialRevisionEffects,
     EditorialRevisionEffectsError,
+    editorial_actor_storage_id,
     stale_changed_pin_proposals,
 )
 from cti_app.application.editorial_revision_effects import (
@@ -303,11 +304,15 @@ class EditorialProposalAdoptionService:
         occurrence_id: UUID,
         proposal_id: UUID,
         *,
-        actor_id: UUID,
+        actor_id: str | UUID,
         expected_state_version: int,
         patch_sha256: str,
         idempotency_key: str,
     ) -> EditorialProposalAdoptionResult:
+        try:
+            actor_id = editorial_actor_storage_id(actor_id)
+        except EditorialRevisionEffectsError as error:
+            raise EditorialProposalAdoptionError(error.code) from None
         if not _IDEMPOTENCY_KEY.fullmatch(idempotency_key):
             raise EditorialProposalAdoptionError("idempotency_key_invalid")
         if not _SHA256.fullmatch(patch_sha256):

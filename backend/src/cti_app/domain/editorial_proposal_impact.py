@@ -7,6 +7,8 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from uuid import UUID
 
+from cti_app.domain.publication_render import PublicationPreviewStatus
+
 
 class EditorialProposalImpactState(StrEnum):
     PENDING = "pending"
@@ -14,6 +16,20 @@ class EditorialProposalImpactState(StrEnum):
     DONE = "done"
     FAILED = "failed"
     SUPERSEDED = "superseded"
+
+
+class EditorialWorkspaceImpactStatus(StrEnum):
+    NONE = "none"
+    PENDING = "pending"
+    RUNNING = "running"
+    SUPERSEDED = "superseded"
+    UP_TO_DATE = "up_to_date"
+    FAILED = "failed"
+
+
+class EditorialPdfStatus(StrEnum):
+    CURRENT = "CURRENT"
+    STALE = "STALE"
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,3 +67,26 @@ class EditorialProposalImpact:
             and self.completed_at is None
         ):
             raise ValueError("editorial_proposal_impact_completion_missing")
+
+
+def project_editorial_impact_status(
+    impact: EditorialProposalImpact | None,
+    *,
+    render_status: PublicationPreviewStatus | str,
+    publication_stale: bool,
+) -> tuple[EditorialWorkspaceImpactStatus, PublicationPreviewStatus, EditorialPdfStatus]:
+    """Combine the durable impact state with the real publication render state."""
+    if impact is None:
+        impact_status = EditorialWorkspaceImpactStatus.NONE
+    elif impact.state is EditorialProposalImpactState.DONE:
+        impact_status = EditorialWorkspaceImpactStatus.UP_TO_DATE
+    else:
+        impact_status = EditorialWorkspaceImpactStatus(impact.state.value)
+
+    preview_status = PublicationPreviewStatus(render_status)
+    pdf_is_stale = publication_stale or preview_status is PublicationPreviewStatus.STALE
+    if pdf_is_stale and preview_status is PublicationPreviewStatus.READY:
+        preview_status = PublicationPreviewStatus.STALE
+
+    pdf_status = EditorialPdfStatus.STALE if pdf_is_stale else EditorialPdfStatus.CURRENT
+    return impact_status, preview_status, pdf_status

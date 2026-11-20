@@ -164,6 +164,8 @@ class EditorialWorkspaceSnapshotView(BaseModel):
     document_outline: list[EditorialDocumentOutlineNode]
     capabilities: EditorialWorkspaceCapabilities
     preview_status: Literal["IN_PROGRESS", "READY", "FAILED", "STALE"]
+    impact_status: Literal["none", "pending", "running", "superseded", "up_to_date", "failed"]
+    pdf_status: Literal["CURRENT", "STALE"]
     snapshot_id: UUID
 
 

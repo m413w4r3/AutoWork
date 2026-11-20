@@ -12,6 +12,9 @@ export type EditorialBlockKind =
   | "figure";
 export type EditorialRevisionStatus =
   "ready" | "proposal_pending" | "stale" | "needs_review";
+export type EditorialImpactStatus =
+  "none" | "pending" | "running" | "superseded" | "up_to_date" | "failed";
+export type EditorialPdfStatus = "CURRENT" | "STALE";
 
 export interface EditorialWorkspaceRevisionTarget {
   block_id: string;
@@ -62,6 +65,8 @@ export interface EditorialWorkspaceSnapshot {
   document_outline: EditorialDocumentOutlineNode[];
   capabilities: EditorialWorkspaceCapabilities;
   preview_status: "IN_PROGRESS" | "READY" | "FAILED" | "STALE";
+  impact_status: EditorialImpactStatus;
+  pdf_status: EditorialPdfStatus;
   snapshot_id: string;
 }
 
