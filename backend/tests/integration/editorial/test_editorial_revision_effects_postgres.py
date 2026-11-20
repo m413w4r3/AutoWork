@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, cast
@@ -15,6 +16,7 @@ from cti_app.application.editorial_revision_effects import (
     EditorialRevisionEffects,
     EditorialRevisionEffectsError,
 )
+from cti_app.application.editorial_synthesis import targets as synthesis_targets
 from cti_app.application.editorial_workspace.registry import (
     WorkspaceOccurrenceResolution,
     WorkspaceSnapshotRecord,
@@ -53,6 +55,7 @@ from cti_app.domain.model_runs import (
     ModelUsage,
 )
 from cti_app.domain.production import (
+    ProductionArtifact,
     ProductionArtifactStage,
 )
 from cti_app.domain.production_editorial_enrichment import (
@@ -67,7 +70,6 @@ from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionTarget,
     TargetedEditorialRevisionTargetKind,
 )
-from cti_app.domain.production_synthesis import production_synthesis_to_json
 from cti_app.domain.publication_kind import PublicationKind
 from tests.integration.editorial.test_proposal_adoption_postgres import (
     _adopt_kwargs,
@@ -191,18 +193,60 @@ class _DeterministicRevisionGateway:
         return content
 
 
-def _revision_wire(seeded: _Seeded, base_sha256: str) -> str:
-    title_hash = hashlib.sha256(seeded.synthesis.title.encode()).hexdigest()
+def _revision_request_from_persisted_base(
+    *, subject_id: UUID, base_artifact: ProductionArtifact, base_bytes: bytes
+) -> tuple[dict[str, Any], TargetedEditorialRevisionRequest, str]:
+    base_payload = json.loads(base_bytes)
+    if not isinstance(base_payload, dict):
+        raise AssertionError("persisted synthesis artifact must be a JSON object")
+    operation = TargetedEditorialRevisionOperation.REWRITE_TITLE
+    catalog = synthesis_targets.build_targeted_revision_target_catalog(
+        ProductionArtifactStage.SYNTHESIS.value, base_payload
+    )
+    title_option = next(
+        item
+        for item in catalog
+        if item["target"].get("kind") == TargetedEditorialRevisionTargetKind.TITLE.value
+        and operation.value in item["operations"]
+    )
+    target_payload = title_option["target"]
+    target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind(target_payload["kind"]),
+        stable_ids=tuple(target_payload.get("stable_ids", ())),
+        parent_id=target_payload.get("parent_id"),
+        anchor_id=target_payload.get("anchor_id"),
+        insert_after=target_payload.get("insert_after", False),
+    )
+    resolved = synthesis_targets.resolve_target(base_payload, target, operation)
+    base_sha256 = hashlib.sha256(base_bytes).hexdigest()
+    request = TargetedEditorialRevisionRequest(
+        subject_id=subject_id,
+        base_artifact_id=base_artifact.id,
+        base_version=base_artifact.version,
+        base_input_hash=base_artifact.input_hash,
+        base_canonical_sha256=base_sha256,
+        target=target,
+        operation=operation,
+        instruction="Apply the deterministic synthetic title revision.",
+        mode=TargetedEditorialRevisionMode.EXISTING_EVIDENCE_ONLY,
+        requester="dev-analyst",
+        before_hash=resolved.before_hash,
+    )
+    return base_payload, request, resolved.path
+
+
+def _revision_wire(request: TargetedEditorialRevisionRequest, target_path: str) -> str:
+    assert request.before_hash is not None
     return "\n".join(
         (
             "@@TARGET@@",
-            "synthesis.title",
+            target_path,
             "@@ACTION@@",
-            "rewrite_title",
+            request.operation.value,
             "@@BASE_ARTIFACT_HASH@@",
-            base_sha256,
+            request.base_canonical_sha256,
             "@@BEFORE_HASH@@",
-            title_hash,
+            request.before_hash,
             "@@AFTER@@",
             "@@TITLE@@",
             "[Synthetic actor] Revised report",
@@ -212,6 +256,54 @@ def _revision_wire(seeded: _Seeded, base_sha256: str) -> str:
             "@@END@@",
         )
     )
+
+
+def test_revision_request_rebuilds_fences_from_persisted_synthesis_bytes() -> None:
+    subject_id = uuid4()
+    base_artifact = ProductionArtifact(
+        production_run_id=uuid4(),
+        subject_id=subject_id,
+        stage=ProductionArtifactStage.SYNTHESIS,
+        version=7,
+        input_hash="a" * 64,
+    )
+    base_payload = {
+        "schema_version": "2",
+        "title": "[Synthetic actor] Persisted title",
+        "lead": [],
+        "sections": [],
+        "timeline": [],
+        "source_notes": [],
+    }
+    base_bytes = ProductionArtifactStore.canonical_json_bytes(base_payload)
+
+    restored_payload, request, target_path = _revision_request_from_persisted_base(
+        subject_id=subject_id,
+        base_artifact=base_artifact,
+        base_bytes=base_bytes,
+    )
+
+    catalog = synthesis_targets.build_targeted_revision_target_catalog(
+        ProductionArtifactStage.SYNTHESIS.value, base_payload
+    )
+    title_option = next(
+        item
+        for item in catalog
+        if item["target"].get("kind") == TargetedEditorialRevisionTargetKind.TITLE.value
+    )
+    resolved = synthesis_targets.resolve_target(restored_payload, request.target, request.operation)
+    ProductionSynthesisRevisionService._validate_request(request)
+    assert request.target.to_json() == title_option["target"]
+    assert request.base_artifact_id == base_artifact.id
+    assert request.base_version == base_artifact.version
+    assert request.base_input_hash == base_artifact.input_hash
+    assert request.base_canonical_sha256 == hashlib.sha256(base_bytes).hexdigest()
+    assert request.before_hash == resolved.before_hash
+    assert request.before_hash != hashlib.sha256(base_payload["title"].encode()).hexdigest()
+    assert target_path == resolved.path == "synthesis.title"
+    wire = _revision_wire(request, target_path)
+    assert f"@@BASE_ARTIFACT_HASH@@\n{request.base_canonical_sha256}\n" in wire
+    assert f"@@BEFORE_HASH@@\n{request.before_hash}\n" in wire
 
 
 async def _revision_service(
@@ -228,7 +320,11 @@ async def _revision_service(
     effects = EditorialRevisionEffects(workspace_service=workspace)
     artifact_store = ProductionArtifactStore(BlobCatalogService(seeded.blob_store, uow_factory))
     base_bytes = await artifact_store.read_bytes(seeded.base_artifact.canonical_blob_id)
-    base_sha256 = hashlib.sha256(base_bytes).hexdigest()
+    base_payload, request, target_path = _revision_request_from_persisted_base(
+        subject_id=seeded.subject.id,
+        base_artifact=seeded.base_artifact,
+        base_bytes=base_bytes,
+    )
     policy = SynthesisAccessPolicyV1(
         subject_tlp=TLP.AMBER,
         effective_tlp=TLP.AMBER,
@@ -244,7 +340,7 @@ async def _revision_service(
             for source in seeded.extraction.sources
         ),
     )
-    wire = _revision_wire(seeded, base_sha256)
+    wire = _revision_wire(request, target_path)
     gateway = _DeterministicRevisionGateway(uow_factory, wire)
     synthesis_persistence = SynthesisService(uow_factory, artifact_store)
     synthesis_service = ProductionSynthesisService(
@@ -255,11 +351,13 @@ async def _revision_service(
     )
     references_artifact = replace(
         seeded.base_artifact,
+        id=uuid4(),
         stage=ProductionArtifactStage.REFERENCES,
         input_hash="a" * 64,
     )
     extraction_artifact = replace(
         seeded.base_artifact,
+        id=uuid4(),
         stage=ProductionArtifactStage.EXTRACTION,
         input_hash=canonical_extraction_hash(seeded.extraction),
     )
@@ -267,7 +365,7 @@ async def _revision_service(
         run=seeded.run,
         snapshot=seeded.production_input,
         base_artifact=seeded.base_artifact,
-        base_payload=production_synthesis_to_json(seeded.synthesis),
+        base_payload=base_payload,
         references_artifact=references_artifact,
         extraction_artifact=extraction_artifact,
         projection_artifact=None,
@@ -302,18 +400,6 @@ async def _revision_service(
     )
     revision_service._load_context = load_context  # type: ignore[method-assign]
     revision_service._critical_extraction_assessment = no_critical_failures  # type: ignore[method-assign]
-    request = TargetedEditorialRevisionRequest(
-        subject_id=seeded.subject.id,
-        base_artifact_id=seeded.base_artifact.id,
-        base_version=seeded.base_artifact.version,
-        base_input_hash=seeded.base_artifact.input_hash,
-        base_canonical_sha256=base_sha256,
-        target=TargetedEditorialRevisionTarget(kind=TargetedEditorialRevisionTargetKind.TITLE),
-        operation=TargetedEditorialRevisionOperation.REWRITE_TITLE,
-        instruction="Apply the deterministic synthetic title revision.",
-        mode=TargetedEditorialRevisionMode.EXISTING_EVIDENCE_ONLY,
-        requester="dev-analyst",
-    )
     return revision_service, request, gateway, artifact_store, workspace
 
 
