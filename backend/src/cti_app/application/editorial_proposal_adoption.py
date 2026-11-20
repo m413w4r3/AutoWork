@@ -125,8 +125,13 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class EditorialProposalAdoptionError(ValueError):
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, *, reason: str | None = None) -> None:
+        if code == "proposal_base_stale" and (
+            reason is None or re.fullmatch(r"[a-z][a-z0-9_]*:[a-z][a-z0-9_]*", reason) is None
+        ):
+            raise ValueError("proposal_base_stale requires a closed reason")
         self.code = code
+        self.reason = reason
         super().__init__(code)
 
 
@@ -148,7 +153,9 @@ def assert_adoption_rewrite_table_placement(
         return
     base_table = next((item for item in base_enrichment.tables if item.key == element_key), None)
     if base_table is None:
-        raise EditorialProposalAdoptionError("proposal_base_stale")
+        raise EditorialProposalAdoptionError(
+            "proposal_base_stale", reason="enrichment:table_key_missing"
+        )
     if len(candidate.tables) != 1 or candidate.tables[0].placement != base_table.placement:
         raise EditorialProposalAdoptionError("adoption_placement_changed")
 
@@ -449,7 +456,9 @@ class EditorialProposalAdoptionService:
             resolution = await self._workspace_service.resolve_occurrence(subject_id, occurrence_id)
             return resolution
         except Exception:
-            raise EditorialProposalAdoptionError("proposal_base_stale") from None
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="workspace:occurrence_resolution"
+            ) from None
 
     async def _build_candidate(
         self,
@@ -472,21 +481,31 @@ class EditorialProposalAdoptionService:
                 resolution=resolution,
             )
             if synthesis_inputs.base_payload != base_payload:
-                raise EditorialProposalAdoptionError("proposal_base_stale")
+                raise EditorialProposalAdoptionError(
+                    "proposal_base_stale", reason="base_context:synthesis_payload"
+                )
             try:
                 operation = TargetedEditorialRevisionOperation(proposal.operation)
             except ValueError:
                 raise EditorialProposalAdoptionError("proposal_operation_unsupported") from None
             if synthesis_inputs.persistence.expected_current_artifact_id != base_artifact.id:
-                raise EditorialProposalAdoptionError("proposal_base_stale")
+                raise EditorialProposalAdoptionError(
+                    "proposal_base_stale", reason="fence:synthesis_artifact_id"
+                )
             if synthesis_inputs.persistence.expected_current_input_hash != proposal.base_input_hash:
-                raise EditorialProposalAdoptionError("proposal_base_stale")
+                raise EditorialProposalAdoptionError(
+                    "proposal_base_stale", reason="fence:synthesis_input_hash"
+                )
             if synthesis_inputs.persistence.input_hash != proposal.base_input_hash:
-                raise EditorialProposalAdoptionError("proposal_base_stale")
+                raise EditorialProposalAdoptionError(
+                    "proposal_base_stale", reason="fence:synthesis_input_hash"
+                )
             if synthesis_inputs.persistence.expected_current_canonical_sha256 != (
                 proposal.base_canonical_sha256
             ):
-                raise EditorialProposalAdoptionError("proposal_base_stale")
+                raise EditorialProposalAdoptionError(
+                    "proposal_base_stale", reason="fence:synthesis_canonical_sha256"
+                )
             if patch.get("target") != synthesis_inputs.target.to_json():
                 raise EditorialProposalAdoptionError("proposal_target_mismatch")
             after = patch.get("after")
@@ -498,7 +517,9 @@ class EditorialProposalAdoptionService:
             except Exception:
                 raise EditorialProposalAdoptionError("proposal_target_mismatch") from None
             if resolved.before_hash != proposal.before_hash:
-                raise EditorialProposalAdoptionError("proposal_base_stale")
+                raise EditorialProposalAdoptionError(
+                    "proposal_base_stale", reason="fence:before_hash"
+                )
             try:
                 wire_patch = parse_wire_patch(
                     "\n".join(
@@ -566,7 +587,11 @@ class EditorialProposalAdoptionService:
                 expected_current_canonical_blob_id=base_artifact.canonical_blob_id,
                 base_canonical_bytes_verified=True,
                 expected_routing_decision_id=resolution.record.routing_decision_id,
-                expected_routing_decision_hash=resolution.record.routing_decision_hash,
+                expected_routing_decision_hash=(
+                    resolution.record.routing_decision_hash
+                    if resolution.record.routing_decision_id is not None
+                    else None
+                ),
                 stale_stages=frozenset(),
                 candidate_blob=None,
             )
@@ -586,22 +611,34 @@ class EditorialProposalAdoptionService:
             resolution=resolution,
         )
         if enrichment_inputs.base_payload != base_payload:
-            raise EditorialProposalAdoptionError("proposal_base_stale")
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="base_context:enrichment_payload"
+            )
         request = enrichment_inputs.targeted_request
         try:
             operation = TargetedEditorialRevisionOperation(proposal.operation)
         except ValueError:
             raise EditorialProposalAdoptionError("proposal_operation_unsupported") from None
-        if (
-            request.base_artifact_id != proposal.base_artifact_id
-            or request.base_version != proposal.base_artifact_version
-            or request.base_input_hash != proposal.base_input_hash
-            or request.base_canonical_sha256 != proposal.base_canonical_sha256
-            or enrichment_inputs.input_hash != proposal.base_input_hash
-            or request.operation is not operation
-            or request.target.element_kind is not enrichment_inputs.element_kind
-        ):
-            raise EditorialProposalAdoptionError("proposal_base_stale")
+        if request.base_artifact_id != proposal.base_artifact_id:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="fence:base_artifact_id"
+            )
+        if request.base_version != proposal.base_artifact_version:
+            raise EditorialProposalAdoptionError("proposal_base_stale", reason="fence:base_version")
+        if request.base_input_hash != proposal.base_input_hash:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="fence:base_input_hash"
+            )
+        if request.base_canonical_sha256 != proposal.base_canonical_sha256:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="fence:base_canonical_sha256"
+            )
+        if enrichment_inputs.input_hash != proposal.base_input_hash:
+            raise EditorialProposalAdoptionError("proposal_base_stale", reason="fence:input_hash")
+        if request.operation is not operation:
+            raise EditorialProposalAdoptionError("proposal_base_stale", reason="fence:operation")
+        if request.target.element_kind is not enrichment_inputs.element_kind:
+            raise EditorialProposalAdoptionError("proposal_base_stale", reason="fence:element_kind")
         if patch.get("target") != request.target.to_json():
             raise EditorialProposalAdoptionError("proposal_target_mismatch")
         raw_enrichment_patch = patch.get("enrichment_patch")
@@ -718,7 +755,9 @@ class EditorialProposalAdoptionService:
             try:
                 await self._revision_effects.lock_run_row(uow, run_guard)
             except EditorialRevisionEffectsError:
-                raise EditorialProposalAdoptionError("proposal_base_stale") from None
+                raise EditorialProposalAdoptionError(
+                    "proposal_base_stale", reason="fence:run_lock"
+                ) from None
             try:
                 resolution = await self._workspace_service.resolve_occurrence_in_uow(
                     uow, subject_id, occurrence_id
@@ -933,7 +972,9 @@ class EditorialProposalAdoptionService:
             try:
                 await self._revision_effects.lock_run_row(uow, guard)
             except EditorialRevisionEffectsError:
-                raise EditorialProposalAdoptionError("proposal_base_stale") from None
+                raise EditorialProposalAdoptionError(
+                    "proposal_base_stale", reason="fence:run_lock"
+                ) from None
             if locked.state is not EditorialProposalState.PROPOSED:
                 return
             try:

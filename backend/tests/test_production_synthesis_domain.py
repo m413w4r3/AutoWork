@@ -389,10 +389,8 @@ def test_decoder_rejects_unknown_section_kind_and_nested_extra_fields() -> None:
         production_synthesis_from_json(payload)
 
 
-def test_sourced_paragraph_rejects_empty_or_duplicate_evidence() -> None:
-    with pytest.raises(ValueError):
-        SynthesisParagraphV1("An unsupported claim.", ())
-
+def test_sourced_paragraph_allows_empty_refs_but_rejects_duplicates() -> None:
+    assert SynthesisParagraphV1("A stylistic paragraph.", ()).evidence_refs == ()
     ref = _ref()
     with pytest.raises(ValueError):
         SynthesisParagraphV1("A claim.", (ref, ref))

@@ -211,9 +211,9 @@ test("local drafts stay with their block and remain in browser memory", async ({
   await expect(editor).toHaveValue(
     "Synthetic unsaved local edit, held only in React memory.",
   );
-  await expect(page.getByRole("button", { name: "Enregistrer" })).toHaveCount(
-    0,
-  );
+  await expect(
+    page.getByRole("button", { name: "Enregistrer", exact: true }),
+  ).toHaveCount(1);
   await expect(
     page.getByRole("button", { name: "Annuler", exact: true }),
   ).toBeVisible();

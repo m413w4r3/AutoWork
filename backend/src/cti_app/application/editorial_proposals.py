@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from io import BytesIO
@@ -47,6 +48,7 @@ from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_synthesis import (
     _plain_text_violation,
+    _technical_literals,
     parse_synthesis_proposal_wire,
 )
 from cti_app.application.production_synthesis_revision import _apply_wire_patch
@@ -59,6 +61,8 @@ from cti_app.domain.editorial_proposal import (
     EditorialProposalModelRun,
     EditorialProposalOrigin,
     EditorialProposalState,
+    ManualPatch,
+    ManualTextPatch,
     variant_group_identity,
 )
 from cti_app.domain.editorial_thread import EditorialThreadEventKind
@@ -76,6 +80,7 @@ from cti_app.domain.production_editorial_revision import (
 )
 from cti_app.domain.production_synthesis import (
     production_synthesis_from_json,
+    production_synthesis_to_json,
 )
 
 _PATCH_BUCKET = "editorial-proposal-patches"
@@ -89,16 +94,221 @@ _EDITORIAL_UNSAFE_MARKUP = re.compile(
 )
 
 
-def _editorial_patch_text_violation(value: str) -> bool:
+def _editorial_patch_text_violation(value: str, *, allow_newline_tab: bool = False) -> bool:
+    allowed_controls = {"\n", "\t"} if allow_newline_tab else set()
     return (
         _plain_text_violation(value) is not None
         or _EDITORIAL_UNSAFE_MARKUP.search(value) is not None
+        or any(
+            char not in allowed_controls and unicodedata.category(char) in {"Cc", "Cf"}
+            for char in value
+        )
+    )
+
+
+def _normalize_editorial_grounding_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value)
+    normalized = re.sub(r"\bhxxps(?=://)", "https", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\bhxxp(?=://)", "http", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(
+        r"\s*(?:\[\s*\.\s*\]|\(\s*\.\s*\)|\{\s*\.\s*\})\s*",
+        ".",
+        normalized,
+    )
+    return re.sub(r"(?<=\d)\s*\.\s*(?=\d)", ".", normalized)
+
+
+def _validate_editorial_text_grounding(
+    value: str,
+    *,
+    admitted_evidence_texts: tuple[str, ...] | list[str],
+    allow_newline_tab: bool = False,
+) -> None:
+    """Apply stricter local grounding to editorial patches without changing legacy synthesis."""
+    if _editorial_patch_text_violation(value, allow_newline_tab=allow_newline_tab):
+        raise EditorialProposalApplicationError("manual_edit_patch_invalid")
+    candidate_literals = _technical_literals(_normalize_editorial_grounding_text(value))
+    if not candidate_literals:
+        return
+    admitted_literals = {
+        literal
+        for evidence_text in admitted_evidence_texts
+        for literal in _technical_literals(_normalize_editorial_grounding_text(evidence_text))
+    }
+    if not candidate_literals <= admitted_literals:
+        raise EditorialProposalApplicationError("manual_edit_new_fact_unadmitted")
+
+
+def _validate_editorial_paragraph_wire_grounding(
+    value: str,
+    *,
+    admitted_evidence_texts: tuple[str, ...] | list[str],
+) -> None:
+    parsed = parse_synthesis_proposal_wire(value, require_lead=True)
+    if parsed.proposal is None or parsed.error_code is not None:
+        return
+    claims = (
+        *parsed.proposal.lead,
+        *(claim for section in parsed.proposal.sections for claim in section.claims),
+    )
+    for claim in claims:
+        _validate_editorial_text_grounding(
+            claim.text,
+            admitted_evidence_texts=admitted_evidence_texts,
+            allow_newline_tab=True,
+        )
+
+
+def _admitted_evidence_texts(
+    context: EditorialParagraphEvidenceContext | None,
+) -> tuple[str, ...]:
+    if context is None or not context.evidence_handles:
+        return ()
+    admitted_handles = set(context.evidence_handles)
+    entries = (
+        *context.evidence_pack.narrative_evidence,
+        *context.evidence_pack.technical_evidence,
+        *context.evidence_pack.reserve_evidence,
+    )
+    return tuple(
+        json.dumps(entry, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        for entry in entries
+        if isinstance(entry.get("handle"), str) and entry["handle"] in admitted_handles
+    )
+
+
+def _editorial_evidence_reference_values(
+    context: EditorialParagraphEvidenceContext | None,
+) -> list[dict[str, str]]:
+    if context is None:
+        return []
+    return [
+        {
+            "source_document_id": str(reference.source_document_id),
+            "kind": reference.kind.value,
+            "evidence_key": reference.evidence_key,
+        }
+        for reference in context.evidence_refs
+    ]
+
+
+def _manual_idempotency_key(purpose: str, client_key: str) -> str:
+    digest = hashlib.sha256(client_key.encode("utf-8")).hexdigest()
+    return f"manual_{purpose}_{digest}"
+
+
+def editorial_manual_decision_idempotency_key(client_key: str) -> str:
+    """Derive a decision key distinct from the preparation event key."""
+    return _manual_idempotency_key("accept", client_key)
+
+
+def _manual_request_sha256(
+    *,
+    subject_id: UUID,
+    snapshot_id: UUID,
+    occurrence_id: UUID,
+    operation: TargetedEditorialRevisionOperation,
+    text: str,
+) -> str:
+    identity = {
+        "subject_id": str(subject_id),
+        "snapshot_id": str(snapshot_id),
+        "occurrence_id": str(occurrence_id),
+        "operation": operation.value,
+        "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+    }
+    return hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _editorial_workspace_error_code(error: EditorialWorkspaceError) -> str:
+    return error.code if error.code != "editorial_workspace_error" else str(error)
+
+
+def _manual_wire_response(
+    *,
+    target_path: str,
+    operation: TargetedEditorialRevisionOperation,
+    base_sha256: str,
+    before_hash: str,
+    after: str,
+) -> str:
+    return "\n".join(
+        (
+            "@@ TARGET @@",
+            target_path,
+            "@@ ACTION @@",
+            operation.value,
+            "@@ BASE_ARTIFACT_HASH @@",
+            base_sha256,
+            "@@ BEFORE_HASH @@",
+            before_hash,
+            "@@ AFTER @@",
+            after,
+            "@@ RATIONALE @@",
+            "Modification manuelle validée par l’analyste.",  # noqa: RUF001
+            "@@ END @@",
+        )
+    )
+
+
+def _manual_paragraph_wire(
+    *,
+    after: str,
+    target: TargetedEditorialRevisionTarget,
+    target_indexes: Any,
+    canonical_content: Mapping[str, Any],
+    evidence_context: EditorialParagraphEvidenceContext,
+) -> str:
+    handles = tuple(
+        dict.fromkeys(
+            handle
+            for reference in evidence_context.evidence_refs
+            if (handle := evidence_context.evidence_pack.handle_for(reference)) is not None
+        )
+    )
+    if not handles:
+        return after
+    evidence_line = " AND ".join(handles)
+    if target.kind is TargetedEditorialRevisionTargetKind.LEAD_PARAGRAPH:
+        group_open, group_close = "@@LEAD@@", "@@END LEAD@@"
+    elif target.kind is TargetedEditorialRevisionTargetKind.SECTION_PARAGRAPH:
+        sections = canonical_content.get("sections")
+        parent_index = target_indexes.parent_index
+        if (
+            not isinstance(sections, list)
+            or parent_index is None
+            or parent_index >= len(sections)
+            or not isinstance(sections[parent_index], Mapping)
+        ):
+            raise EditorialProposalApplicationError("proposal_target_mismatch")
+        section_kind = sections[parent_index].get("kind")
+        if not isinstance(section_kind, str):
+            raise EditorialProposalApplicationError("proposal_target_mismatch")
+        group_open, group_close = f"@@SECTION {section_kind}@@", "@@END SECTION@@"
+    else:
+        raise EditorialProposalApplicationError("proposal_operation_unsupported")
+    return "\n".join(
+        (
+            group_open,
+            "@@CLAIM@@",
+            f"EVIDENCE: {evidence_line}",
+            f"TEXT: {after}",
+            "@@END CLAIM@@",
+            group_close,
+        )
     )
 
 
 class EditorialProposalApplicationError(ValueError):
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, *, reason: str | None = None) -> None:
+        if code == "proposal_base_stale" and (
+            reason is None or re.fullmatch(r"[a-z][a-z0-9_]*:[a-z][a-z0-9_]*", reason) is None
+        ):
+            raise ValueError("proposal_base_stale requires a closed reason")
         self.code = code
+        self.reason = reason
         super().__init__(code)
 
 
@@ -108,13 +318,13 @@ class _ProposalPatchBlobMissing(Exception):
 
 @dataclass(frozen=True, slots=True)
 class EditorialProposalPreparation:
-    """Server-resolved input captured for the exact Bridge proposal turn."""
+    """Server-resolved input captured for Bridge or manual proposal preparation."""
 
     subject_id: UUID
     production_run_id: UUID
     snapshot_id: UUID
     occurrence_id: UUID
-    thread_id: UUID
+    thread_id: UUID | None
     base_artifact_id: UUID
     base_artifact_version: int
     base_input_hash: str
@@ -127,8 +337,8 @@ class EditorialProposalPreparation:
     before_hash: str
     base_content: Mapping[str, Any]
     raw_response: str
-    model_run_id: UUID
-    model_turn_id: UUID
+    model_run_id: UUID | None
+    model_turn_id: UUID | None
     actor_id: UUID
     idempotency_key: str
     request_sha256: str
@@ -138,6 +348,8 @@ class EditorialProposalPreparation:
     enrichment_context: Mapping[str, Any] | None = None
     strict_wire: bool = False
     paragraph_evidence_context: EditorialParagraphEvidenceContext | None = None
+    origin: EditorialProposalOrigin = EditorialProposalOrigin.BRIDGE_DRAFT
+    manual_patch: ManualPatch | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +359,7 @@ class EditorialProposalRead:
     production_run_id: UUID
     occurrence_id: UUID
     thread_id: UUID | None
+    origin: str
     state: str
     state_version: int
     operation: str
@@ -170,11 +383,13 @@ class EditorialProposalService:
         blob_store: BlobStore | None = None,
         artifact_store: ProductionArtifactStore | None = None,
         workspace_service: Any | None = None,
+        discussion_context_builder: Any | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._blob_store = blob_store
         self._artifact_store = artifact_store
         self._workspace_service = workspace_service
+        self._discussion_context_builder = discussion_context_builder
 
     async def prepare_thread_turn(
         self,
@@ -234,7 +449,9 @@ class EditorialProposalService:
                 operation=operation.value,
             )
         except Exception:
-            raise EditorialProposalApplicationError("proposal_base_stale") from None
+            raise EditorialProposalApplicationError(
+                "proposal_base_stale", reason="workspace:resolve_revision_target"
+            ) from None
         record = resolved.record
         request_identity = hashlib.sha256(
             json.dumps(
@@ -282,10 +499,197 @@ class EditorialProposalService:
     async def prepare_bridge_result(
         self, preparation: EditorialProposalPreparation
     ) -> EditorialProposal:
+        return await self._prepare_result(preparation, reject_invalid_manual=False)
+
+    async def prepare_manual_patch(
+        self,
+        *,
+        subject_id: UUID,
+        snapshot_id: UUID,
+        occurrence_id: UUID,
+        actor_id: UUID,
+        idempotency_key: str,
+        patch: ManualPatch,
+    ) -> EditorialProposal:
+        """Persist a validated manual text patch without creating a model run."""
+        if not _IDEMPOTENCY_KEY.fullmatch(idempotency_key):
+            raise EditorialProposalApplicationError("idempotency_key_invalid")
+        if self._workspace_service is None:
+            raise EditorialProposalApplicationError("proposal_workspace_unavailable")
+
+        typed_patch = patch.typed_patch
+        operation = typed_patch.operation
+        received_text = typed_patch.text
+        if len(received_text.encode("utf-8")) > _MAX_PATCH_BYTES:
+            raise EditorialProposalApplicationError("manual_edit_request_too_large")
+        after = received_text.strip()
+        if (
+            not after
+            or _editorial_patch_text_violation(
+                after,
+                allow_newline_tab=(
+                    operation is TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH
+                ),
+            )
+            or re.search(r"(?m)^\s*@@.*@@\s*$", after)
+        ):
+            raise EditorialProposalApplicationError("manual_edit_patch_invalid")
+
+        preparation_key = _manual_idempotency_key("prepare", idempotency_key)
+        request_sha256 = _manual_request_sha256(
+            subject_id=subject_id,
+            snapshot_id=snapshot_id,
+            occurrence_id=occurrence_id,
+            operation=operation,
+            text=received_text,
+        )
+        async with self._uow_factory() as uow:
+            existing = await uow.editorial_proposals.get_by_idempotency_key(
+                subject_id, actor_id, preparation_key
+            )
+        if existing is not None:
+            if existing.request_sha256 != request_sha256:
+                raise EditorialProposalConflict("proposal_idempotency_conflict")
+            return existing
+
+        paragraph_evidence_context = None
+        if (
+            operation is TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH
+            and self._discussion_context_builder is None
+        ):
+            raise EditorialProposalApplicationError("proposal_base_unavailable")
+        if (
+            operation
+            in {
+                TargetedEditorialRevisionOperation.REWRITE_TITLE,
+                TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH,
+            }
+            and self._discussion_context_builder is not None
+        ):
+            try:
+                context = await self._discussion_context_builder.build_manual(
+                    subject_id, occurrence_id
+                )
+            except Exception as error:
+                raise EditorialProposalApplicationError("proposal_base_unavailable") from error
+            if context.proposal_snapshot_id != snapshot_id:
+                raise EditorialProposalApplicationError(
+                    "proposal_base_stale", reason="context:proposal_snapshot_id"
+                )
+            paragraph_evidence_context = context.paragraph_evidence_context
+            if operation is TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH and (
+                paragraph_evidence_context is None
+            ):
+                raise EditorialProposalApplicationError("proposal_base_unavailable")
+
+        try:
+            resolved = await self._workspace_service.resolve_revision_target(
+                subject_id=subject_id,
+                snapshot_id=snapshot_id,
+                block_id=occurrence_id,
+                operation=operation.value,
+            )
+        except EditorialWorkspaceError as error:
+            workspace_code = _editorial_workspace_error_code(error)
+            code = (
+                "proposal_base_stale"
+                if workspace_code == "editorial_snapshot_stale"
+                else workspace_code
+                if workspace_code == "publication_kind_unresolved"
+                else "proposal_target_mismatch"
+            )
+            reason = "workspace:snapshot_stale" if code == "proposal_base_stale" else None
+            raise EditorialProposalApplicationError(code, reason=reason) from error
+        entry = resolved.occurrence.entry
+        if entry is None:
+            raise EditorialProposalApplicationError("proposal_target_mismatch")
+        current_value = read_pointer(resolved.canonical_content, entry.structural_pointer)
+        current_text = (
+            current_value
+            if isinstance(current_value, str)
+            else (current_value.get("text") if isinstance(current_value, Mapping) else None)
+        )
+        if not isinstance(current_text, str):
+            raise EditorialProposalApplicationError("proposal_target_mismatch")
+        if after == current_text.strip():
+            raise EditorialProposalApplicationError("manual_edit_no_change")
+
+        if operation is TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH:
+            if paragraph_evidence_context is None:
+                raise EditorialProposalApplicationError("manual_edit_new_fact_unadmitted")
+            after = _manual_paragraph_wire(
+                after=after,
+                target=resolved.target,
+                target_indexes=resolve_target(
+                    resolved.canonical_content, resolved.target, operation
+                ),
+                canonical_content=resolved.canonical_content,
+                evidence_context=paragraph_evidence_context,
+            )
+        raw_response = _manual_wire_response(
+            target_path=resolve_target(resolved.canonical_content, resolved.target, operation).path,
+            operation=operation,
+            base_sha256=resolved.record.synthesis_canonical_sha256,
+            before_hash=resolved.before_hash,
+            after=after,
+        )
+        preparation = EditorialProposalPreparation(
+            subject_id=subject_id,
+            production_run_id=resolved.record.production_run_id,
+            snapshot_id=snapshot_id,
+            occurrence_id=occurrence_id,
+            thread_id=None,
+            base_artifact_id=resolved.record.synthesis_artifact_id,
+            base_artifact_version=resolved.record.synthesis_version,
+            base_input_hash=resolved.record.synthesis_input_hash,
+            base_canonical_sha256=resolved.record.synthesis_canonical_sha256,
+            base_pin_hash=resolved.record.workspace_pin_hash,
+            routing_decision_hash=resolved.record.routing_decision_hash,
+            target_id=resolved.target_id,
+            target=resolved.target,
+            operation=operation,
+            before_hash=resolved.before_hash,
+            base_content=resolved.canonical_content,
+            raw_response=raw_response,
+            model_run_id=None,
+            model_turn_id=None,
+            actor_id=actor_id,
+            idempotency_key=preparation_key,
+            request_sha256=request_sha256,
+            strict_wire=True,
+            paragraph_evidence_context=paragraph_evidence_context,
+            origin=EditorialProposalOrigin.MANUAL_PATCH,
+            manual_patch=ManualPatch(typed_patch=ManualTextPatch(operation, typed_patch.text)),
+        )
+        return await self._prepare_result(preparation, reject_invalid_manual=True)
+
+    async def _prepare_result(
+        self,
+        preparation: EditorialProposalPreparation,
+        *,
+        reject_invalid_manual: bool,
+    ) -> EditorialProposal:
         if not _IDEMPOTENCY_KEY.fullmatch(preparation.idempotency_key):
             raise EditorialProposalApplicationError("idempotency_key_invalid")
         preparation = await self._resolve_authoritative_preparation(preparation)
         patch_payload, state, kind, diagnostics = self._validate_result(preparation)
+        if reject_invalid_manual and state is not EditorialProposalState.PROPOSED:
+            code = str(diagnostics.get("code", "proposal_patch_invalid"))
+            if code in {
+                "synthesis_relation_not_evidenced",
+                "synthesis_unknown_evidence",
+                "synthesis_unknown_technical_value",
+                "synthesis_unknown_date",
+                "proposal_patch_requires_review",
+                "proposal_evidence_not_admissible",
+                "manual_edit_new_fact_unadmitted",
+            }:
+                raise EditorialProposalApplicationError("manual_edit_new_fact_unadmitted")
+            if code == "proposal_base_stale":
+                raise EditorialProposalApplicationError(
+                    "proposal_base_stale", reason="validation:proposal_base_stale"
+                )
+            raise EditorialProposalApplicationError("manual_edit_patch_invalid")
         evidence_refs = patch_payload.get("evidence_refs") if patch_payload is not None else None
         if isinstance(evidence_refs, list):
             preparation = replace(
@@ -358,28 +762,56 @@ class EditorialProposalService:
                 operation=preparation.operation.value,
             )
         except EditorialWorkspaceError as error:
+            workspace_code = _editorial_workspace_error_code(error)
             code = (
                 "proposal_base_stale"
-                if error.code == "editorial_snapshot_stale"
+                if workspace_code == "editorial_snapshot_stale"
                 else "proposal_target_ambiguous"
-                if error.code == "editorial_identity_ambiguous"
+                if workspace_code == "editorial_identity_ambiguous"
+                else workspace_code
+                if workspace_code == "publication_kind_unresolved"
                 else "proposal_target_mismatch"
             )
-            raise EditorialProposalApplicationError(code) from None
+            reason = "workspace:snapshot_stale" if code == "proposal_base_stale" else None
+            raise EditorialProposalApplicationError(code, reason=reason) from error
 
         record = resolved.record
-        if (
-            record.snapshot_id != preparation.snapshot_id
-            or record.subject_id != preparation.subject_id
-            or record.production_run_id != preparation.production_run_id
-            or record.workspace_pin_hash != preparation.base_pin_hash
-            or record.routing_decision_hash != preparation.routing_decision_hash
-            or record.synthesis_artifact_id != preparation.base_artifact_id
-            or record.synthesis_version != preparation.base_artifact_version
-            or record.synthesis_input_hash != preparation.base_input_hash
-            or record.synthesis_canonical_sha256 != preparation.base_canonical_sha256
-        ):
-            raise EditorialProposalApplicationError("proposal_base_stale")
+        if record.snapshot_id != preparation.snapshot_id:
+            raise EditorialProposalApplicationError(
+                "proposal_base_stale", reason="snapshot:id_mismatch"
+            )
+        if record.subject_id != preparation.subject_id:
+            raise EditorialProposalApplicationError(
+                "proposal_base_stale", reason="snapshot:subject_id"
+            )
+        if record.production_run_id != preparation.production_run_id:
+            raise EditorialProposalApplicationError(
+                "proposal_base_stale", reason="snapshot:production_run_id"
+            )
+        if record.workspace_pin_hash != preparation.base_pin_hash:
+            raise EditorialProposalApplicationError(
+                "proposal_base_stale", reason="pins:workspace_pin_hash"
+            )
+        if record.routing_decision_hash != preparation.routing_decision_hash:
+            raise EditorialProposalApplicationError(
+                "proposal_base_stale", reason="routing:decision_hash"
+            )
+        if record.synthesis_artifact_id != preparation.base_artifact_id:
+            raise EditorialProposalApplicationError(
+                "proposal_base_stale", reason="pins:synthesis_artifact_id"
+            )
+        if record.synthesis_version != preparation.base_artifact_version:
+            raise EditorialProposalApplicationError(
+                "proposal_base_stale", reason="pins:synthesis_version"
+            )
+        if record.synthesis_input_hash != preparation.base_input_hash:
+            raise EditorialProposalApplicationError(
+                "proposal_base_stale", reason="pins:synthesis_input_hash"
+            )
+        if record.synthesis_canonical_sha256 != preparation.base_canonical_sha256:
+            raise EditorialProposalApplicationError(
+                "proposal_base_stale", reason="pins:synthesis_canonical_sha256"
+            )
 
         supplied_base_sha256 = hashlib.sha256(
             ProductionArtifactStore.canonical_json_bytes(dict(preparation.base_content))
@@ -387,11 +819,14 @@ class EditorialProposalService:
         resolved_base_sha256 = hashlib.sha256(
             ProductionArtifactStore.canonical_json_bytes(dict(resolved.canonical_content))
         ).hexdigest()
-        if (
-            supplied_base_sha256 != record.synthesis_canonical_sha256
-            or resolved_base_sha256 != record.synthesis_canonical_sha256
-        ):
-            raise EditorialProposalApplicationError("proposal_base_stale")
+        if supplied_base_sha256 != record.synthesis_canonical_sha256:
+            raise EditorialProposalApplicationError(
+                "proposal_base_stale", reason="base:supplied_sha256"
+            )
+        if resolved_base_sha256 != record.synthesis_canonical_sha256:
+            raise EditorialProposalApplicationError(
+                "proposal_base_stale", reason="base:resolved_sha256"
+            )
         if (
             resolved.occurrence.entry is None
             or resolved.occurrence.binding_state != "valid"
@@ -472,7 +907,7 @@ class EditorialProposalService:
                     # uploads and verifies again only after this transaction releases lock.
                     raise _ProposalPatchBlobMissing from None
 
-            await self._assert_exact_bridge_origin(uow, preparation)
+            await self._assert_exact_origin(uow, preparation)
             existing = await uow.editorial_proposals.get_by_idempotency_key(
                 preparation.subject_id,
                 preparation.actor_id,
@@ -482,7 +917,8 @@ class EditorialProposalService:
             if existing is not None:
                 if not _replay_matches(existing, preparation, patch_sha256):
                     raise EditorialProposalConflict("proposal_idempotency_conflict")
-                await self._append_thread_reference(uow, existing)
+                if existing.origin is EditorialProposalOrigin.BRIDGE_DRAFT:
+                    await self._append_thread_reference(uow, existing)
                 await uow.commit()
                 return existing
 
@@ -499,7 +935,7 @@ class EditorialProposalService:
                 id=uuid4(),
                 subject_id=preparation.subject_id,
                 production_run_id=preparation.production_run_id,
-                origin=EditorialProposalOrigin.BRIDGE_DRAFT,
+                origin=preparation.origin,
                 snapshot_id=preparation.snapshot_id,
                 occurrence_id=preparation.occurrence_id,
                 base_artifact_id=preparation.base_artifact_id,
@@ -543,18 +979,26 @@ class EditorialProposalService:
                 patch_sha256=patch_sha256,
                 diagnostics=diagnostics,
             )
-            model_run = EditorialProposalModelRun(
-                proposal_id=proposal.id,
-                thread_id=preparation.thread_id,
-                model_run_id=preparation.model_run_id,
-                model_turn_id=preparation.model_turn_id,
+            model_run = (
+                EditorialProposalModelRun(
+                    proposal_id=proposal.id,
+                    thread_id=preparation.thread_id,
+                    model_run_id=preparation.model_run_id,
+                    model_turn_id=preparation.model_turn_id,
+                )
+                if preparation.origin is EditorialProposalOrigin.BRIDGE_DRAFT
+                and preparation.thread_id is not None
+                and preparation.model_run_id is not None
+                and preparation.model_turn_id is not None
+                else None
             )
             stored, inserted = await uow.editorial_proposals.add_if_absent(
                 proposal, event=event, model_run=model_run
             )
             if not inserted and not _replay_matches(stored, preparation, patch_sha256):
                 raise EditorialProposalConflict("proposal_idempotency_conflict")
-            await self._append_thread_reference(uow, stored)
+            if stored.origin is EditorialProposalOrigin.BRIDGE_DRAFT:
+                await self._append_thread_reference(uow, stored)
             await uow.commit()
             return stored
 
@@ -668,6 +1112,7 @@ class EditorialProposalService:
             production_run_id=proposal.production_run_id,
             occurrence_id=proposal.occurrence_id,
             thread_id=proposal.thread_id,
+            origin=proposal.origin.value,
             state=proposal.state.value,
             state_version=proposal.state_version,
             operation=proposal.operation,
@@ -978,7 +1423,9 @@ class EditorialProposalService:
                 patch.base_artifact_hash != preparation.base_canonical_sha256
                 or patch.before_hash != preparation.before_hash
             ):
-                raise EditorialProposalApplicationError("proposal_base_stale")
+                raise EditorialProposalApplicationError(
+                    "proposal_base_stale", reason="patch:base_hash"
+                )
             if preparation.target.kind is TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT:
                 return self._validate_enrichment_result(preparation, patch)
             resolved = resolve_target(
@@ -990,6 +1437,12 @@ class EditorialProposalService:
                 if preparation.operation is TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH:
                     return self._validate_rewrite_paragraph_result(preparation, patch)
                 raise EditorialProposalApplicationError("proposal_operation_unsupported")
+            _validate_editorial_text_grounding(
+                patch.after,
+                admitted_evidence_texts=_admitted_evidence_texts(
+                    preparation.paragraph_evidence_context
+                ),
+            )
             revised = dict(preparation.base_content)
             revised["title"] = patch.after
             assert_non_target_unchanged(
@@ -1009,6 +1462,9 @@ class EditorialProposalService:
                     "before_hash": resolved.before_hash,
                     "after": patch.after,
                     "rationale": patch.rationale,
+                    "evidence_refs": _editorial_evidence_reference_values(
+                        preparation.paragraph_evidence_context
+                    ),
                 },
                 EditorialProposalState.PROPOSED,
                 EditorialProposalEventKind.PREPARED,
@@ -1064,6 +1520,63 @@ class EditorialProposalService:
         ):
             raise EditorialProposalApplicationError("proposal_operation_unsupported")
 
+        if (
+            preparation.origin is EditorialProposalOrigin.MANUAL_PATCH
+            and not context.evidence_handles
+        ):
+            _validate_editorial_text_grounding(
+                patch.after,
+                admitted_evidence_texts=(),
+                allow_newline_tab=True,
+            )
+            base_payload = dict(preparation.base_content)
+            synthesis = production_synthesis_from_json(base_payload)
+            target_resolution = resolve_target(
+                base_payload, preparation.target, preparation.operation
+            )
+            if preparation.target.kind is TargetedEditorialRevisionTargetKind.LEAD_PARAGRAPH:
+                target_index = target_resolution.indexes[0]
+                paragraphs = list(synthesis.lead)
+                paragraphs[target_index] = replace(
+                    paragraphs[target_index], text=patch.after, evidence_refs=()
+                )
+                revised_synthesis = replace(synthesis, lead=tuple(paragraphs))
+            else:
+                assert target_resolution.parent_index is not None
+                section_index = target_resolution.parent_index
+                paragraph_index = target_resolution.indexes[0]
+                sections = list(synthesis.sections)
+                paragraphs = list(sections[section_index].paragraphs)
+                paragraphs[paragraph_index] = replace(
+                    paragraphs[paragraph_index], text=patch.after, evidence_refs=()
+                )
+                sections[section_index] = replace(
+                    sections[section_index], paragraphs=tuple(paragraphs)
+                )
+                revised_synthesis = replace(synthesis, sections=tuple(sections))
+            revised_payload = production_synthesis_to_json(revised_synthesis)
+            return (
+                {
+                    "schema_version": "editorial-patch-v1",
+                    "operation": preparation.operation.value,
+                    "target": preparation.target.to_json(),
+                    "target_id": preparation.target_id,
+                    "occurrence_id": str(preparation.occurrence_id),
+                    "before_hash": target_resolution.before_hash,
+                    "after": patch.after,
+                    "rationale": patch.rationale,
+                    "evidence_refs": [],
+                    "manual_text_without_evidence": True,
+                },
+                EditorialProposalState.PROPOSED,
+                EditorialProposalEventKind.PREPARED,
+                {
+                    "canonical_candidate_sha256": hashlib.sha256(
+                        ProductionArtifactStore.canonical_json_bytes(revised_payload)
+                    ).hexdigest()
+                },
+            )
+
         parsed_after = parse_synthesis_proposal_wire(
             patch.after,
             require_lead=(
@@ -1075,6 +1588,13 @@ class EditorialProposalService:
                 *parsed_after.proposal.lead,
                 *(claim for section in parsed_after.proposal.sections for claim in section.claims),
             )
+            admitted_texts = _admitted_evidence_texts(context)
+            for claim in claims:
+                _validate_editorial_text_grounding(
+                    claim.text,
+                    admitted_evidence_texts=admitted_texts,
+                    allow_newline_tab=True,
+                )
             admitted_handles = set(context.evidence_handles)
             if any(
                 handle not in admitted_handles
@@ -1200,7 +1720,7 @@ class EditorialProposalService:
             {},
         )
 
-    async def _assert_exact_bridge_origin(
+    async def _assert_exact_origin(
         self, uow: UnitOfWork, preparation: EditorialProposalPreparation
     ) -> None:
         await uow.production_runs.lock_creation_for_subject(preparation.subject_id)
@@ -1208,29 +1728,78 @@ class EditorialProposalService:
         latest_snapshot = await uow.editorial_workspace_snapshots.latest_for_run(
             preparation.production_run_id
         )
-        if (
-            snapshot is None
-            or latest_snapshot is None
-            or latest_snapshot.snapshot_id != preparation.snapshot_id
-            or snapshot.subject_id != preparation.subject_id
-            or snapshot.production_run_id != preparation.production_run_id
-            or snapshot.workspace_pin_hash != preparation.base_pin_hash
-            or snapshot.routing_decision_hash != preparation.routing_decision_hash
-            or snapshot.synthesis_artifact_id != preparation.base_artifact_id
-            or snapshot.synthesis_version != preparation.base_artifact_version
-            or snapshot.synthesis_input_hash != preparation.base_input_hash
-            or snapshot.synthesis_canonical_sha256 != preparation.base_canonical_sha256
-        ):
-            raise EditorialProposalApplicationError("proposal_base_stale")
+        if snapshot is None or latest_snapshot is None:
+            raise EditorialProposalApplicationError(
+                "proposal_base_stale", reason="snapshot:latest_missing"
+            )
+        if latest_snapshot.snapshot_id != preparation.snapshot_id:
+            raise EditorialProposalApplicationError(
+                "proposal_base_stale", reason="snapshot:id_mismatch"
+            )
+        if snapshot.subject_id != preparation.subject_id:
+            raise EditorialProposalApplicationError(
+                "proposal_base_stale", reason="snapshot:subject_id"
+            )
+        if snapshot.production_run_id != preparation.production_run_id:
+            raise EditorialProposalApplicationError(
+                "proposal_base_stale", reason="snapshot:production_run_id"
+            )
+        if snapshot.workspace_pin_hash != preparation.base_pin_hash:
+            raise EditorialProposalApplicationError(
+                "proposal_base_stale", reason="pins:workspace_pin_hash"
+            )
+        if snapshot.routing_decision_hash != preparation.routing_decision_hash:
+            raise EditorialProposalApplicationError(
+                "proposal_base_stale", reason="routing:decision_hash"
+            )
+        if snapshot.synthesis_artifact_id != preparation.base_artifact_id:
+            raise EditorialProposalApplicationError(
+                "proposal_base_stale", reason="pins:synthesis_artifact_id"
+            )
+        if snapshot.synthesis_version != preparation.base_artifact_version:
+            raise EditorialProposalApplicationError(
+                "proposal_base_stale", reason="pins:synthesis_version"
+            )
+        if snapshot.synthesis_input_hash != preparation.base_input_hash:
+            raise EditorialProposalApplicationError(
+                "proposal_base_stale", reason="pins:synthesis_input_hash"
+            )
+        if snapshot.synthesis_canonical_sha256 != preparation.base_canonical_sha256:
+            raise EditorialProposalApplicationError(
+                "proposal_base_stale", reason="pins:synthesis_canonical_sha256"
+            )
         resolution = resolve_occurrence(snapshot, preparation.occurrence_id)
+        if resolution.entry is None or resolution.binding_state != "valid":
+            raise EditorialProposalApplicationError(
+                "proposal_base_stale", reason="snapshot:occurrence_binding"
+            )
+        if resolution.artifact_id != preparation.base_artifact_id:
+            raise EditorialProposalApplicationError(
+                "proposal_base_stale", reason="pins:artifact_id"
+            )
+        if resolution.artifact_version != preparation.base_artifact_version:
+            raise EditorialProposalApplicationError(
+                "proposal_base_stale", reason="pins:artifact_version"
+            )
+        if resolution.canonical_sha256 != preparation.base_canonical_sha256:
+            raise EditorialProposalApplicationError(
+                "proposal_base_stale", reason="pins:canonical_sha256"
+            )
+        if preparation.origin is EditorialProposalOrigin.MANUAL_PATCH:
+            if (
+                preparation.thread_id is not None
+                or preparation.model_run_id is not None
+                or preparation.model_turn_id is not None
+                or preparation.manual_patch is None
+            ):
+                raise EditorialProposalApplicationError("proposal_model_run_reference_invalid")
+            return
         if (
-            resolution.entry is None
-            or resolution.binding_state != "valid"
-            or resolution.artifact_id != preparation.base_artifact_id
-            or resolution.artifact_version != preparation.base_artifact_version
-            or resolution.canonical_sha256 != preparation.base_canonical_sha256
+            preparation.thread_id is None
+            or preparation.model_run_id is None
+            or preparation.model_turn_id is None
         ):
-            raise EditorialProposalApplicationError("proposal_base_stale")
+            raise EditorialProposalApplicationError("proposal_bridge_origin_invalid")
         thread_record = await uow.editorial_threads.get(preparation.thread_id)
         if thread_record is None:
             raise EditorialProposalApplicationError("proposal_not_found")
@@ -1266,6 +1835,7 @@ def _replay_matches(
 ) -> bool:
     return (
         existing.request_sha256 == preparation.request_sha256
+        and existing.origin is preparation.origin
         and existing.patch_sha256 == patch_sha256
         and existing.production_run_id == preparation.production_run_id
         and existing.snapshot_id == preparation.snapshot_id

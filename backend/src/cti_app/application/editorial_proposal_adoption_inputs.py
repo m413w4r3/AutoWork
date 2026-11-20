@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -23,6 +24,10 @@ from cti_app.application.editorial_proposal_adoption import (
     SynthesisCandidateInputs,
     assert_adoption_rewrite_table_placement,
 )
+from cti_app.application.editorial_proposals import (
+    _validate_editorial_paragraph_wire_grounding,
+    _validate_editorial_text_grounding,
+)
 from cti_app.application.editorial_synthesis.candidate import (
     SynthesisCandidatePersistence,
 )
@@ -30,6 +35,7 @@ from cti_app.application.editorial_synthesis.candidate import (
     build_candidate_from_validated_patch as build_synthesis_candidate,
 )
 from cti_app.application.editorial_synthesis.patch_validation import WirePatch
+from cti_app.application.editorial_synthesis.targets import resolve_target
 from cti_app.application.editorial_workspace.registry import (
     WorkspaceOccurrenceResolution,
     read_pointer,
@@ -51,7 +57,7 @@ from cti_app.application.production_synthesis import (
 from cti_app.application.production_synthesis_revision import _apply_wire_patch
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
-from cti_app.domain.editorial_proposal import EditorialProposal
+from cti_app.domain.editorial_proposal import EditorialProposal, EditorialProposalOrigin
 from cti_app.domain.editorial_workspace import (
     EditorialSourceStage,
     bootstrap_block_registry,
@@ -79,7 +85,12 @@ from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionTargetKind,
 )
 from cti_app.domain.production_extraction import ProductionExtractionV1
-from cti_app.domain.production_synthesis import production_synthesis_from_json
+from cti_app.domain.production_synthesis import (
+    EvidenceKind,
+    ExtractionEvidenceRefV1,
+    production_synthesis_from_json,
+    production_synthesis_to_json,
+)
 from cti_app.domain.publication_kind import PublicationKind
 
 
@@ -99,6 +110,86 @@ class _PreparedInputs:
 _ACTIVE_SOURCE_STATES = frozenset(
     {CollectionState.ARCHIVED, CollectionState.EXTRACTED, CollectionState.COMPLETED}
 )
+
+
+def _manual_text_without_evidence_patch(
+    *,
+    base_synthesis: Any,
+    base_payload: dict[str, Any],
+    target: TargetedEditorialRevisionTarget,
+    operation: TargetedEditorialRevisionOperation,
+    patch: WirePatch,
+    evidence_pack: SynthesisEvidencePackV1,
+    extraction: ProductionExtractionV1,
+    snapshot: ProductionInputSnapshot,
+    publication_kind: PublicationKind | None = None,
+    source_addition_document_ids: frozenset[UUID] = frozenset(),
+    require_claim_scopes: bool = False,
+) -> tuple[Any, dict[str, Any], str]:
+    del evidence_pack, extraction, snapshot, publication_kind
+    del source_addition_document_ids, require_claim_scopes
+    if operation is not TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH:
+        raise ValueError("manual_edit_patch_invalid")
+    resolved = resolve_target(base_payload, target, operation)
+    if patch.target != resolved.path or patch.before_hash != resolved.before_hash:
+        raise EditorialProposalAdoptionError(
+            "proposal_base_stale", reason="patch:target_or_before_hash"
+        )
+    if target.kind is TargetedEditorialRevisionTargetKind.LEAD_PARAGRAPH:
+        target_index = resolved.indexes[0]
+        old_paragraph = base_synthesis.lead[target_index]
+        if old_paragraph.evidence_refs:
+            raise EditorialProposalAdoptionError("proposal_target_mismatch")
+        paragraphs = list(base_synthesis.lead)
+        paragraphs[target_index] = replace(old_paragraph, text=patch.after, evidence_refs=())
+        revised_synthesis = replace(base_synthesis, lead=tuple(paragraphs))
+    elif target.kind is TargetedEditorialRevisionTargetKind.SECTION_PARAGRAPH:
+        if resolved.parent_index is None:
+            raise EditorialProposalAdoptionError("proposal_target_mismatch")
+        section_index = resolved.parent_index
+        paragraph_index = resolved.indexes[0]
+        sections = list(base_synthesis.sections)
+        old_paragraph = sections[section_index].paragraphs[paragraph_index]
+        if old_paragraph.evidence_refs:
+            raise EditorialProposalAdoptionError("proposal_target_mismatch")
+        paragraphs = list(sections[section_index].paragraphs)
+        paragraphs[paragraph_index] = replace(old_paragraph, text=patch.after, evidence_refs=())
+        sections[section_index] = replace(sections[section_index], paragraphs=tuple(paragraphs))
+        revised_synthesis = replace(base_synthesis, sections=tuple(sections))
+    else:
+        raise EditorialProposalAdoptionError("proposal_target_mismatch")
+    _validate_editorial_text_grounding(patch.after, admitted_evidence_texts=())
+    return revised_synthesis, production_synthesis_to_json(revised_synthesis), resolved.before_hash
+
+
+def _proposal_evidence_texts(
+    evidence_pack: SynthesisEvidencePackV1,
+    references: Sequence[Mapping[str, object]],
+) -> tuple[str, ...]:
+    handles: set[str] = set()
+    for reference in references:
+        try:
+            evidence_ref = ExtractionEvidenceRefV1(
+                source_document_id=UUID(str(reference["source_document_id"])),
+                kind=EvidenceKind(str(reference["kind"])),
+                evidence_key=str(reference["evidence_key"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            raise EditorialProposalAdoptionError("proposal_evidence_not_admissible") from None
+        handle = evidence_pack.handle_for(evidence_ref)
+        if handle is None:
+            raise EditorialProposalAdoptionError("proposal_evidence_not_admissible")
+        handles.add(handle)
+    entries = (
+        *evidence_pack.narrative_evidence,
+        *evidence_pack.technical_evidence,
+        *evidence_pack.reserve_evidence,
+    )
+    return tuple(
+        json.dumps(entry, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        for entry in entries
+        if isinstance(entry.get("handle"), str) and entry["handle"] in handles
+    )
 
 
 class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs):
@@ -176,7 +267,9 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
             base_synthesis = production_synthesis_from_json(base_payload)
             operation = TargetedEditorialRevisionOperation(proposal.operation)
             if resolution.entry is None or resolution.binding_state != "valid":
-                raise EditorialProposalAdoptionError("proposal_base_stale")
+                raise EditorialProposalAdoptionError(
+                    "proposal_base_stale", reason="snapshot:occurrence_binding"
+                )
             resolved = resolve_workspace_target(
                 entry=resolution.entry,
                 canonical_content=base_payload,
@@ -192,8 +285,36 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
             rationale = patch.get("rationale")
             if not isinstance(after, str) or not isinstance(rationale, str):
                 raise EditorialProposalAdoptionError("proposal_patch_invalid")
+            manual_text_without_evidence = patch.get("manual_text_without_evidence") is True
+            if manual_text_without_evidence and (
+                proposal.origin is not EditorialProposalOrigin.MANUAL_PATCH
+                or patch.get("evidence_refs") != []
+            ):
+                raise EditorialProposalAdoptionError("proposal_patch_invalid")
+            admitted_evidence_texts = (
+                ()
+                if manual_text_without_evidence
+                else _proposal_evidence_texts(evidence_pack, proposal.evidence_refs)
+            )
+            if manual_text_without_evidence:
+                _validate_editorial_text_grounding(
+                    after,
+                    admitted_evidence_texts=(),
+                    allow_newline_tab=True,
+                )
+            elif operation is TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH:
+                _validate_editorial_paragraph_wire_grounding(
+                    after,
+                    admitted_evidence_texts=admitted_evidence_texts,
+                )
+            else:
+                _validate_editorial_text_grounding(
+                    after,
+                    admitted_evidence_texts=admitted_evidence_texts,
+                )
+            canonical_target = resolve_target(base_payload, resolved.target, operation)
             wire_patch = WirePatch(
-                target=resolved.path,
+                target=canonical_target.path,
                 action=operation,
                 base_artifact_hash=proposal.base_canonical_sha256,
                 before_hash=proposal.before_hash,
@@ -211,7 +332,11 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                 evidence_pack=evidence_pack,
                 extraction=extraction,
                 snapshot=snapshot,
-                apply_patch=_apply_wire_patch,
+                apply_patch=(
+                    _manual_text_without_evidence_patch
+                    if manual_text_without_evidence
+                    else _apply_wire_patch
+                ),
                 publication_kind=resolution.record.publication_kind,
             )
             lineage = self._synthesis_lineage(
@@ -249,7 +374,9 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
             raise
         except Exception as error:
             code = getattr(error, "reason_code", None) or getattr(error, "code", None)
-            raise EditorialProposalAdoptionError(str(code or "proposal_base_unavailable")) from None
+            mapped_code = str(code or "proposal_base_unavailable")
+            reason = "candidate:input_validation" if mapped_code == "proposal_base_stale" else None
+            raise EditorialProposalAdoptionError(mapped_code, reason=reason) from None
 
         self._prepared[proposal.id] = _PreparedInputs(
             run=run,
@@ -269,10 +396,14 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
             evidence_pack=evidence_pack,
             extraction=extraction,
             snapshot=snapshot,
-            apply_patch=_apply_wire_patch,
             persistence=persistence,
             registry_lineage=lineage,
             publication_kind=resolution.record.publication_kind,
+            apply_patch=(
+                _manual_text_without_evidence_patch
+                if patch.get("manual_text_without_evidence") is True
+                else _apply_wire_patch
+            ),
         )
 
     async def enrichment_inputs(
@@ -357,7 +488,9 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                 or target_entry.source_stage is not EditorialSourceStage.EDITORIAL_ENRICHMENT
                 or target_entry.content_sha256 != proposal.before_hash
             ):
-                raise EditorialProposalAdoptionError("proposal_base_stale")
+                raise EditorialProposalAdoptionError(
+                    "proposal_base_stale", reason="pins:enrichment_occurrence"
+                )
             request = TargetedEditorialRevisionRequest(
                 subject_id=proposal.subject_id,
                 base_artifact_id=base_artifact.id,
@@ -453,7 +586,9 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
             raise
         except Exception as error:
             code = getattr(error, "reason_code", None) or getattr(error, "code", None)
-            raise EditorialProposalAdoptionError(str(code or "proposal_base_unavailable")) from None
+            mapped_code = str(code or "proposal_base_unavailable")
+            reason = "candidate:input_validation" if mapped_code == "proposal_base_stale" else None
+            raise EditorialProposalAdoptionError(mapped_code, reason=reason) from None
 
         self._prepared[proposal.id] = _PreparedInputs(
             run=run,
@@ -496,20 +631,59 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
             if prepared.stage is ProductionArtifactStage.SYNTHESIS
             else record.enrichment_canonical_sha256
         )
-        if (
-            resolution.binding_state != "valid"
-            or record.subject_id != proposal.subject_id
-            or record.production_run_id != proposal.production_run_id
-            or record.snapshot_id != proposal.snapshot_id
-            or resolution.entry is None
-            or resolution.entry.block_id != proposal.occurrence_id
-            or record.workspace_pin_hash != proposal.base_pin_hash
-            or expected_artifact_id != proposal.base_artifact_id
-            or expected_version != proposal.base_artifact_version
-            or expected_sha256 != proposal.base_canonical_sha256
-            or record.routing_decision_hash != proposal.base_routing_hash
-        ):
-            raise EditorialProposalAdoptionError("proposal_base_stale")
+        if resolution.binding_state != "valid":
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="snapshot:binding_state"
+            )
+        if record.subject_id != proposal.subject_id:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="snapshot:subject_id"
+            )
+        if record.production_run_id != proposal.production_run_id:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="snapshot:production_run_id"
+            )
+        if record.snapshot_id != proposal.snapshot_id:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="snapshot:id_mismatch"
+            )
+        if resolution.entry is None:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="snapshot:entry_missing"
+            )
+        if resolution.entry.block_id != proposal.occurrence_id:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="snapshot:occurrence_id"
+            )
+        if record.workspace_pin_hash != proposal.base_pin_hash:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="pins:workspace_pin_hash"
+            )
+        if expected_artifact_id != proposal.base_artifact_id:
+            field = (
+                "synthesis_artifact_id"
+                if prepared.stage is ProductionArtifactStage.SYNTHESIS
+                else "enrichment_artifact_id"
+            )
+            raise EditorialProposalAdoptionError("proposal_base_stale", reason=f"pins:{field}")
+        if expected_version != proposal.base_artifact_version:
+            field = (
+                "synthesis_version"
+                if prepared.stage is ProductionArtifactStage.SYNTHESIS
+                else "enrichment_version"
+            )
+            raise EditorialProposalAdoptionError("proposal_base_stale", reason=f"pins:{field}")
+        if expected_sha256 != proposal.base_canonical_sha256:
+            field = (
+                "synthesis_canonical_sha256"
+                if prepared.stage is ProductionArtifactStage.SYNTHESIS
+                else "enrichment_canonical_sha256"
+            )
+            raise EditorialProposalAdoptionError("proposal_base_stale", reason=f"pins:{field}")
+        if record.routing_decision_hash != proposal.base_routing_hash:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="routing:decision_hash"
+            )
 
         run = await uow.production_runs.get_for_update(proposal.production_run_id)
         current_run = await uow.production_runs.get_current_for_subject(proposal.subject_id)
@@ -532,26 +706,56 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
             if run is not None
             else None
         )
-        if (
-            run is None
-            or run.id != prepared.run.id
-            or run.subject_id != proposal.subject_id
-            or current_run is None
-            or current_run.id != run.id
-            or current_run.pipeline_generation != prepared.run.pipeline_generation
-            or snapshot is None
-            or snapshot.id != prepared.snapshot.id
-            or current_subject is None
-            or current_subject.id != proposal.subject_id
-            or not _same_current_artifact(current_base, prepared.base_artifact)
-            or not _same_current_artifact(current_extraction, prepared.extraction_artifact)
-            or not _same_optional_current_artifact(current_projection, prepared.projection_artifact)
-            or not _same_current_artifact(current_synthesis, prepared.synthesis_artifact)
-            or record.routing_decision_id != (routing.decision_id if routing is not None else None)
-            or record.routing_decision_hash
-            != (routing.decision_hash if routing is not None else None)
-        ):
-            raise EditorialProposalAdoptionError("proposal_base_stale")
+        if run is None or run.id != prepared.run.id:
+            raise EditorialProposalAdoptionError("proposal_base_stale", reason="run:id")
+        if run.subject_id != proposal.subject_id:
+            raise EditorialProposalAdoptionError("proposal_base_stale", reason="run:subject_id")
+        if current_run is None or current_run.id != run.id:
+            raise EditorialProposalAdoptionError("proposal_base_stale", reason="run:not_current")
+        if current_run.pipeline_generation != prepared.run.pipeline_generation:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="run:pipeline_generation"
+            )
+        if snapshot is None:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="base_context:input_snapshot_missing"
+            )
+        if snapshot.id != prepared.snapshot.id:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="snapshot:id_mismatch"
+            )
+        if current_subject is None or current_subject.id != proposal.subject_id:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="subject:id_mismatch"
+            )
+        if not _same_current_artifact(current_base, prepared.base_artifact):
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="artifacts:current_base"
+            )
+        if not _same_current_artifact(current_extraction, prepared.extraction_artifact):
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="artifacts:current_extraction"
+            )
+        if not _same_optional_current_artifact(current_projection, prepared.projection_artifact):
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="artifacts:current_projection"
+            )
+        if not _same_current_artifact(current_synthesis, prepared.synthesis_artifact):
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="artifacts:current_synthesis"
+            )
+        if record.routing_decision_id != (routing.decision_id if routing is not None else None):
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="routing:decision_id"
+            )
+        if routing is None and run.routing_decision_id is not None:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="routing:decision_missing"
+            )
+        if routing is not None and record.routing_decision_hash != routing.decision_hash:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="routing:decision_hash"
+            )
 
         await self._revalidate_thread(uow, proposal, resolution)
         await self._revalidate_sources(uow, prepared.extraction)
@@ -609,53 +813,132 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                 if run is not None
                 else None
             )
-        if (
-            run is None
-            or run.id != proposal.production_run_id
-            or artifact is None
-            or artifact != base_artifact
-            or current is None
-            or current.id != artifact.id
-            or artifact.stage is not stage
-            or artifact.version != proposal.base_artifact_version
-            or artifact.input_hash != proposal.base_input_hash
-            or artifact.status is not ProductionArtifactStatus.VERIFIED
-            or artifact.canonical_blob_id is None
-            or snapshot is None
-            or snapshot.production_run_id != run.id
-            or resolution.record.snapshot_id != proposal.snapshot_id
-            or resolution.record.workspace_pin_hash != proposal.base_pin_hash
-            or resolution.record.routing_decision_hash
-            != (routing.decision_hash if routing is not None else None)
-            or resolution.record.routing_decision_id
-            != (routing.decision_id if routing is not None else None)
-            or resolution.artifact_id != artifact.id
-            or resolution.artifact_version != artifact.version
-            or resolution.canonical_sha256 != proposal.base_canonical_sha256
+        if run is None or run.id != proposal.production_run_id:
+            raise EditorialProposalAdoptionError("proposal_base_stale", reason="run:not_current")
+        if artifact is None:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="base_context:artifact_missing"
+            )
+        if artifact != base_artifact:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="base_context:artifact_mismatch"
+            )
+        if current is None or current.id != artifact.id:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="pins:current_artifact_id"
+            )
+        if artifact.stage is not stage:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="pins:artifact_stage"
+            )
+        if artifact.version != proposal.base_artifact_version:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="pins:artifact_version"
+            )
+        if artifact.input_hash != proposal.base_input_hash:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="pins:artifact_input_hash"
+            )
+        if artifact.status is not ProductionArtifactStatus.VERIFIED:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="base_context:artifact_status"
+            )
+        if artifact.canonical_blob_id is None:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="base_context:canonical_blob_id"
+            )
+        if snapshot is None:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="base_context:input_snapshot_missing"
+            )
+        if snapshot.production_run_id != run.id:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="snapshot:production_run_id"
+            )
+        if resolution.record.snapshot_id != proposal.snapshot_id:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="snapshot:id_mismatch"
+            )
+        if resolution.record.workspace_pin_hash != proposal.base_pin_hash:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="pins:workspace_pin_hash"
+            )
+        if resolution.record.routing_decision_id != (
+            routing.decision_id if routing is not None else None
         ):
-            raise EditorialProposalAdoptionError("proposal_base_stale")
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="routing:decision_id"
+            )
+        if routing is None and run.routing_decision_id is not None:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="routing:decision_missing"
+            )
+        # V7+ publication envelopes may carry the resolved route hash when no
+        # separate routing-decision row exists. The workspace pin already
+        # fences that envelope hash; compare against a row only when one is
+        # currently adopted.
+        if routing is not None and resolution.record.routing_decision_hash != routing.decision_hash:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="routing:decision_hash"
+            )
+        if resolution.artifact_id != artifact.id:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="resolution:artifact_id"
+            )
+        if resolution.artifact_version != artifact.version:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="resolution:artifact_version"
+            )
+        if resolution.canonical_sha256 != proposal.base_canonical_sha256:
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="resolution:canonical_sha256"
+            )
         if extraction_artifact is None or current_synthesis_artifact is None:
             raise EditorialProposalAdoptionError("proposal_base_unavailable")
         if stage is ProductionArtifactStage.SYNTHESIS:
-            if (
-                current_synthesis_artifact.id != artifact.id
-                or resolution.record.synthesis_artifact_id != artifact.id
-                or resolution.record.synthesis_version != artifact.version
-                or resolution.record.synthesis_canonical_sha256 != proposal.base_canonical_sha256
-            ):
-                raise EditorialProposalAdoptionError("proposal_base_stale")
+            if current_synthesis_artifact.id != artifact.id:
+                raise EditorialProposalAdoptionError(
+                    "proposal_base_stale", reason="pins:synthesis_artifact_id"
+                )
+            if resolution.record.synthesis_artifact_id != artifact.id:
+                raise EditorialProposalAdoptionError(
+                    "proposal_base_stale", reason="pins:synthesis_artifact_id"
+                )
+            if resolution.record.synthesis_version != artifact.version:
+                raise EditorialProposalAdoptionError(
+                    "proposal_base_stale", reason="pins:synthesis_version"
+                )
+            if resolution.record.synthesis_canonical_sha256 != proposal.base_canonical_sha256:
+                raise EditorialProposalAdoptionError(
+                    "proposal_base_stale", reason="pins:synthesis_canonical_sha256"
+                )
             if resolution.record.publication_kind is None:
                 raise EditorialProposalAdoptionError("publication_kind_unresolved")
         else:
-            if (
-                resolution.record.synthesis_artifact_id != current_synthesis_artifact.id
-                or resolution.record.synthesis_version != current_synthesis_artifact.version
-                or resolution.record.synthesis_canonical_sha256 is None
-                or resolution.record.enrichment_artifact_id != artifact.id
-                or resolution.record.enrichment_version != artifact.version
-                or resolution.record.enrichment_canonical_sha256 != proposal.base_canonical_sha256
-            ):
-                raise EditorialProposalAdoptionError("proposal_base_stale")
+            if resolution.record.synthesis_artifact_id != current_synthesis_artifact.id:
+                raise EditorialProposalAdoptionError(
+                    "proposal_base_stale", reason="pins:synthesis_artifact_id"
+                )
+            if resolution.record.synthesis_version != current_synthesis_artifact.version:
+                raise EditorialProposalAdoptionError(
+                    "proposal_base_stale", reason="pins:synthesis_version"
+                )
+            if resolution.record.synthesis_canonical_sha256 is None:
+                raise EditorialProposalAdoptionError(
+                    "proposal_base_stale", reason="pins:synthesis_canonical_sha256"
+                )
+            if resolution.record.enrichment_artifact_id != artifact.id:
+                raise EditorialProposalAdoptionError(
+                    "proposal_base_stale", reason="pins:enrichment_artifact_id"
+                )
+            if resolution.record.enrichment_version != artifact.version:
+                raise EditorialProposalAdoptionError(
+                    "proposal_base_stale", reason="pins:enrichment_version"
+                )
+            if resolution.record.enrichment_canonical_sha256 != proposal.base_canonical_sha256:
+                raise EditorialProposalAdoptionError(
+                    "proposal_base_stale", reason="pins:enrichment_canonical_sha256"
+                )
         # Only the service's read-only, canonical artifact readers are used after this point.
         return run, snapshot, extraction_artifact, projection_artifact, current_synthesis_artifact
 
@@ -681,7 +964,9 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
     @staticmethod
     def _require_snapshot_subject_version(snapshot: ProductionInputSnapshot, version: int) -> None:
         if version != snapshot.subject_version:
-            raise EditorialProposalAdoptionError("proposal_base_stale")
+            raise EditorialProposalAdoptionError(
+                "proposal_base_stale", reason="snapshot:subject_version"
+            )
 
     async def _revalidate_sources(self, uow: Any, extraction: ProductionExtractionV1) -> None:
         for source in extraction.sources:

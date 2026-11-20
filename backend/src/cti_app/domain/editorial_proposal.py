@@ -40,6 +40,30 @@ class EditorialProposalOrigin(StrEnum):
     MANUAL_PATCH = "manual_patch"
 
 
+@dataclass(frozen=True, slots=True)
+class ManualTextPatch:
+    """A closed manual text operation accepted by the editorial workshop."""
+
+    operation: TargetedEditorialRevisionOperation
+    text: str
+
+    def __post_init__(self) -> None:
+        if self.operation not in {
+            TargetedEditorialRevisionOperation.REWRITE_TITLE,
+            TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH,
+        }:
+            raise EditorialProposalError("proposal_operation_unsupported")
+        if not isinstance(self.text, str):
+            raise EditorialProposalError("proposal_patch_invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class ManualPatch:
+    """The persisted proposal origin for one validated typed manual patch."""
+
+    typed_patch: ManualTextPatch
+
+
 class EditorialProposalEventKind(StrEnum):
     PREPARED = "prepared"
     REFUSED = "refused"
@@ -203,9 +227,9 @@ class EditorialProposalModelRun:
 
 
 def variant_group_identity(
-    *, base_pin_hash: str, occurrence_id: UUID, operation: str, thread_id: UUID
+    *, base_pin_hash: str, occurrence_id: UUID, operation: str, thread_id: UUID | None
 ) -> UUID:
-    """Return a stable variant identity for this exact pin/target/thread tuple."""
+    """Return a stable variant identity for this pin, target, operation and origin scope."""
     payload = json.dumps(
         [base_pin_hash, str(occurrence_id), operation, str(thread_id)],
         separators=(",", ":"),

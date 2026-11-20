@@ -11,6 +11,7 @@ interface EditorialInspectorProps {
   block: EditorialWorkspaceBlock | null;
   sectionTitle: string | null;
   readOnly: boolean;
+  isEditing: boolean;
   localDraftText: string;
   onLocalDraftChange: (text: string) => void;
   onOpenSources: () => void;
@@ -156,6 +157,7 @@ export function EditorialInspector({
   block,
   sectionTitle,
   readOnly,
+  isEditing,
   localDraftText,
   onLocalDraftChange,
   onOpenSources,
@@ -189,21 +191,23 @@ export function EditorialInspector({
               Section : {sectionTitle ?? "Document"}
             </p>
             <p className="editorial-inspector__selected-text">{block.text}</p>
-            <label className="editorial-local-draft">
-              <span>Brouillon local</span>
-              <textarea
-                className="editorial-local-draft__input"
-                aria-label="Brouillon local"
-                value={localDraftText}
-                onChange={(event) =>
-                  onLocalDraftChange(event.currentTarget.value)
-                }
-                rows={5}
-              />
-              <span className="editorial-local-draft__privacy">
-                Conservé en mémoire dans cet écran jusqu’à sa fermeture.
-              </span>
-            </label>
+            {!isEditing ? (
+              <label className="editorial-local-draft">
+                <span>Brouillon local</span>
+                <textarea
+                  className="editorial-local-draft__input"
+                  aria-label="Brouillon local"
+                  value={localDraftText}
+                  onChange={(event) =>
+                    onLocalDraftChange(event.currentTarget.value)
+                  }
+                  rows={5}
+                />
+                <span className="editorial-local-draft__privacy">
+                  Conservé en mémoire dans cet écran jusqu’à sa fermeture.
+                </span>
+              </label>
+            ) : null}
             <BlockActionToolbar
               snapshot={snapshot}
               block={block}

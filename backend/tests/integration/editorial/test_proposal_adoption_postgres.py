@@ -291,7 +291,7 @@ class _Inputs(EditorialProposalAdoptionInputs):
     ) -> None:
         self.revalidated += 1
         if resolution.record.subject_id != proposal.subject_id:
-            raise EditorialProposalAdoptionError("proposal_base_stale")
+            raise EditorialProposalAdoptionError("proposal_base_stale", reason="test:subject_id")
         if self.fences.tlp is TLP.RED:
             raise EditorialProposalAdoptionError("external_llm_tlp_blocked")
         if self.fences.revoked:

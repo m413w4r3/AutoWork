@@ -4,6 +4,7 @@ import { useState } from "react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { ApiError } from "../../api/editions";
 import type { EditorialWorkspaceSnapshot } from "../../api/editorialWorkspace";
 import { EditorialWorkspaceLayout } from "./EditorialWorkspaceLayout";
 import { useEditorialDrafts } from "./EditorialDrafts";
@@ -309,6 +310,101 @@ describe("local editorial block drafts", () => {
       "block-occurrence-a",
       "Updated synthetic text",
     );
+  });
+
+  it("saves on Ctrl+S, announces pending state, and restores block focus", async () => {
+    const user = userEvent.setup();
+    let finishSave: (() => void) | undefined;
+    const onSave = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finishSave = resolve;
+        }),
+    );
+    renderWorkspace({ onSave });
+    await selectBlock(user, "block-occurrence-a");
+    const editor = await beginEditing(user);
+    await user.clear(editor);
+    await user.type(editor, "Saved paragraph A");
+    fireEvent.keyDown(editor, { key: "s", ctrlKey: true });
+
+    const savingButton = screen.getByRole("button", {
+      name: "Enregistrement…",
+    });
+    expect(savingButton).toBeDisabled();
+    expect(
+      document.querySelector(".editorial-inline-editor__announcement"),
+    ).toHaveTextContent("Enregistrement…");
+    expect(finishSave).toBeDefined();
+    finishSave?.();
+
+    await screen.findByText("Saved paragraph A");
+    const selectedBlock = document.querySelector<HTMLElement>(
+      '.editorial-document__block[data-block-id="block-occurrence-a"]',
+    );
+    expect(selectedBlock).toHaveAttribute("data-selected", "true");
+    await vi.waitFor(() => expect(document.activeElement).toBe(selectedBlock));
+    expect(
+      screen.queryByRole("status", { name: /Brouillon local/ }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps the local draft and shows the actionable unsupported-fact error", async () => {
+    const user = userEvent.setup();
+    const onSave = vi.fn(() =>
+      Promise.reject(
+        new ApiError(
+          "Cette nouvelle valeur technique n'est pas étayée par les preuves disponibles. Modifiez le passage ou ajoutez une source autorisée.",
+          "manual_edit_new_fact_unadmitted",
+          422,
+        ),
+      ),
+    );
+    renderWorkspace({ onSave });
+    await selectBlock(user, "block-occurrence-a");
+    const editor = await beginEditing(user);
+    await user.clear(editor);
+    await user.type(editor, "UnsupportedFamilyX claim");
+    await user.click(screen.getByRole("button", { name: "Enregistrer" }));
+
+    expect(
+      await screen.findByText(/ajoutez une source autorisée/i),
+    ).toBeVisible();
+    expect(screen.getByRole("textbox", { name: "Texte du bloc" })).toHaveValue(
+      "UnsupportedFamilyX claim",
+    );
+    expect(
+      screen.queryByRole("textbox", { name: "Brouillon local" }),
+    ).toBeNull();
+  });
+
+  it("announces a 409 as a blocking error and retains the draft for recovery", async () => {
+    const user = userEvent.setup();
+    const onSave = vi.fn(() =>
+      Promise.reject(
+        new ApiError(
+          "Le document a changé. Actualisez l’atelier.",
+          "manual_edit_stale",
+          409,
+        ),
+      ),
+    );
+    renderWorkspace({ onSave });
+    await selectBlock(user, "block-occurrence-a");
+    const editor = await beginEditing(user);
+    await user.clear(editor);
+    await user.type(editor, "Draft retained after conflict");
+    await user.click(screen.getByRole("button", { name: "Enregistrer" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      /Actualisez l’atelier avant de réessayer.*brouillon local est conservé/i,
+    );
+    expect(screen.getByRole("textbox", { name: "Texte du bloc" })).toHaveValue(
+      "Draft retained after conflict",
+    );
+    expect(
+      screen.queryByRole("textbox", { name: "Brouillon local" }),
+    ).toBeNull();
   });
 
   it.each([

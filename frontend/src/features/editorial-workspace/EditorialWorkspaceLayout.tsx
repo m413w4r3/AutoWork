@@ -404,6 +404,7 @@ export function EditorialWorkspaceLayout({
             block={selectedBlock}
             sectionTitle={sectionTitle}
             readOnly={readOnly}
+            isEditing={editingBlockId === selectedBlock?.block_id}
             localDraftText={localDraftText}
             onLocalDraftChange={(text) => {
               if (selectedBlock)

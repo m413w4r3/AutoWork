@@ -254,6 +254,7 @@ export interface EditorialProposalRead {
   production_run_id: string;
   occurrence_id: string;
   thread_id: string | null;
+  origin: "bridge_draft" | "manual_patch";
   state: EditorialProposalState;
   state_version: number;
   operation: EditorialProposalOperation;
@@ -283,6 +284,11 @@ export interface EditorialProposalAcceptResult {
   impact_id: string;
   impact_state: "pending" | "running" | "done" | "failed" | "superseded";
 }
+
+export type EditorialManualEditOperation =
+  "rewrite_title" | "rewrite_paragraph";
+
+export type EditorialManualEditResult = EditorialProposalAcceptResult;
 
 const EDITORIAL_THREAD_TRANSPORT_UNCERTAIN_MESSAGE =
   "L’état de votre envoi est incertain. Consultez le fil avant de continuer.";
@@ -320,6 +326,17 @@ const ERROR_MESSAGES: Record<string, string> = {
     "La proposition a changé. Actualisez-la avant de décider.",
   proposal_base_stale:
     "Cette proposition repose sur une version qui a changé. Elle n’a pas été appliquée. Actualisez le document, puis comparez et formulez une nouvelle proposition.",
+  manual_edit_no_change:
+    "Le texte n’a pas changé. Aucune nouvelle version n’a été créée.",
+  manual_edit_stale:
+    "Le document a changé. Actualisez l’atelier, puis réappliquez votre brouillon local.",
+  manual_edit_new_fact_unadmitted:
+    "Cette nouvelle valeur technique n'est pas étayée par les preuves disponibles. Modifiez le passage ou ajoutez une source autorisée.",
+  manual_edit_patch_invalid:
+    "Le texte proposé ne respecte pas le format éditorial autorisé.",
+  manual_edit_request_invalid: "La requête de modification est invalide.",
+  manual_edit_unavailable:
+    "La modification manuelle est temporairement indisponible.",
   editorial_proposal_accept_unavailable:
     "L’acceptation des propositions est temporairement indisponible.",
   proposal_idempotency_conflict:
@@ -495,6 +512,30 @@ export function acceptEditorialProposal(
         "Idempotency-Key": crypto.randomUUID(),
       },
       body: JSON.stringify(decision),
+    },
+  );
+}
+
+export function saveManualEditorialEdit(
+  subjectId: string,
+  occurrenceId: string,
+  idempotencyKey: string,
+  input: {
+    snapshot_id: string;
+    operation: EditorialManualEditOperation;
+    text: string;
+  },
+): Promise<EditorialManualEditResult> {
+  return request<EditorialManualEditResult>(
+    `/api/subjects/${encodeURIComponent(subjectId)}/editor/blocks/${encodeURIComponent(occurrenceId)}/manual-edit`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Idempotency-Key": idempotencyKey,
+      },
+      body: JSON.stringify(input),
+      cache: "no-store",
     },
   );
 }

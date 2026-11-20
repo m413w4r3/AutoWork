@@ -89,6 +89,7 @@ function createProposal(
 ): EditorialProposalRead {
   return {
     id,
+    origin: "bridge_draft",
     subject_id: subjectId,
     production_run_id: initialSnapshot.production_run_id,
     occurrence_id: occurrenceId,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import date
 from types import SimpleNamespace
 from typing import Any, cast
@@ -14,11 +15,13 @@ from cti_app.application.editorial_proposal_adoption import EditorialProposalAdo
 from cti_app.application.editorial_proposal_adoption_inputs import (
     ProductionEditorialProposalAdoptionInputs,
 )
+from cti_app.application.editorial_synthesis.targets import resolve_target
+from cti_app.application.editorial_workspace.registry import resolve_workspace_target
 from cti_app.config import Settings
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.editorial_proposal import EditorialProposalOrigin
-from cti_app.domain.editorial_workspace import EditorialSourceStage
+from cti_app.domain.editorial_workspace import EditorialSourceStage, bootstrap_block_registry
 from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
@@ -30,6 +33,7 @@ from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionTarget,
     TargetedEditorialRevisionTargetKind,
 )
+from cti_app.domain.publication_kind import PublicationKind
 
 
 class _ForbiddenArtifactStore:
@@ -537,3 +541,178 @@ async def test_inputs_adapter_never_touches_gateway_or_blobstore() -> None:
     await inputs.revalidate_evidence_policy_and_thread(uow, proposal, {}, resolution=resolution)
 
     assert uow.write_count == 0
+
+
+@pytest.mark.asyncio
+async def test_inputs_adapter_accepts_v8_envelope_route_hash_without_persisted_decision() -> None:
+    inputs, proposal, resolution, uow, context = _revalidation_fixture()
+    base_bytes = b"synthetic canonical synthesis"
+    base_sha256 = hashlib.sha256(base_bytes).hexdigest()
+    proposal.base_canonical_sha256 = base_sha256
+    resolution.record.synthesis_canonical_sha256 = base_sha256
+    resolution.record.routing_decision_id = None
+    resolution.record.routing_decision_hash = "d" * 64
+    proposal.base_routing_hash = "d" * 64
+    resolution.record.publication_kind = PublicationKind.BRIEF
+    resolution.artifact_id = proposal.base_artifact_id
+    resolution.artifact_version = proposal.base_artifact_version
+    resolution.canonical_sha256 = base_sha256
+
+    async def get_artifact(_artifact_id: Any) -> Any:
+        return context.base_artifact
+
+    uow.production_artifacts.get = get_artifact
+
+    class _UowContext:
+        async def __aenter__(self) -> _Uow:
+            return cast(_Uow, uow)
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    inputs._uow_factory = lambda: _UowContext()
+
+    await inputs.revalidate_evidence_policy_and_thread(uow, proposal, {}, resolution=resolution)
+
+    loaded = await inputs._load_base_context(
+        proposal,
+        base_artifact=context.base_artifact,
+        base_bytes=base_bytes,
+        resolution=resolution,
+        stage=ProductionArtifactStage.SYNTHESIS,
+    )
+
+    assert loaded[0] is context.run
+    assert loaded[1] is context.snapshot
+
+
+@pytest.mark.asyncio
+async def test_inputs_adapter_rejects_missing_adopted_routing_row() -> None:
+    inputs, proposal, resolution, uow, _context = _revalidation_fixture()
+    uow.production_routing_decisions = _Repository(None)
+    uow.production_runs.value.routing_decision_id = uuid4()
+
+    with pytest.raises(EditorialProposalAdoptionError) as error:
+        await inputs.revalidate_evidence_policy_and_thread(uow, proposal, {}, resolution=resolution)
+
+    assert error.value.code == "proposal_base_stale"
+    assert error.value.reason == "routing:decision_missing"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("block_kind", "operation"),
+    [
+        ("title", TargetedEditorialRevisionOperation.REWRITE_TITLE),
+        ("lead_paragraph", TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH),
+    ],
+)
+async def test_synthesis_adoption_uses_canonical_target_path_for_title_and_paragraph_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+    block_kind: str,
+    operation: TargetedEditorialRevisionOperation,
+) -> None:
+    inputs, proposal, resolution, _uow, context = _revalidation_fixture()
+    payload = {
+        "title": "[Synthetic actor] Synthetic report",
+        "lead": [{"text": "Synthetic lead claim.", "evidence_refs": []}],
+        "sections": [],
+    }
+    entries = bootstrap_block_registry(
+        artifact_id=uuid4(),
+        canonical_sha256="a" * 64,
+        source_stage=EditorialSourceStage.SYNTHESIS,
+        canonical_content=payload,
+    )
+    entry = next(item for item in entries if item.kind.value == block_kind)
+    resolution.entry = entry
+    resolution.record.publication_kind = PublicationKind.BRIEF
+    resolution.record.block_registry = entries
+    proposal.occurrence_id = entry.block_id
+    proposal.operation = operation.value
+    proposal.origin = EditorialProposalOrigin.MANUAL_PATCH
+    proposal.base_canonical_sha256 = "b" * 64
+    proposal.before_hash = resolve_workspace_target(
+        entry=entry,
+        canonical_content=payload,
+        operation=operation.value,
+    ).before_hash
+    workspace_target = resolve_workspace_target(
+        entry=entry,
+        canonical_content=payload,
+        operation=operation.value,
+    )
+    proposal.target_id = workspace_target.legacy_target_id
+    base_artifact = context.base_artifact
+    base_artifact.metadata = {}
+    base_artifact.input_hash = proposal.base_input_hash
+    context.synthesis_artifact = base_artifact
+    evidence_pack = SimpleNamespace(
+        _handle_to_ref={}, narrative_evidence=(), technical_evidence=(), reserve_evidence=()
+    )
+    synthesis = SimpleNamespace()
+
+    async def load_base_context(*_args: Any, **_kwargs: Any) -> tuple[Any, ...]:
+        return (
+            context.run,
+            context.snapshot,
+            context.extraction_artifact,
+            None,
+            base_artifact,
+        )
+
+    async def load_extraction(*_args: Any, **_kwargs: Any) -> tuple[Any, str]:
+        return context.extraction, "c" * 64
+
+    async def access_policy(*_args: Any, **_kwargs: Any) -> tuple[Any, int]:
+        return SimpleNamespace(effective_tlp=TLP.CLEAR, external_llm_allowed=True), 1
+
+    async def routing(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    captured: list[dict[str, Any]] = []
+
+    def capture_candidate(**kwargs: Any) -> Any:
+        captured.append(kwargs)
+        return SimpleNamespace(payload=payload)
+
+    monkeypatch.setattr(inputs, "_load_base_context", load_base_context)
+    monkeypatch.setattr(inputs, "_access_policy", access_policy)
+    monkeypatch.setattr(inputs, "_routing", routing)
+    monkeypatch.setattr(inputs, "_synthesis_lineage", lambda *_args, **_kwargs: ())
+    inputs._synthesis_loader = SimpleNamespace(_load_extraction=load_extraction)
+    monkeypatch.setattr(
+        adoption_inputs_module,
+        "build_synthesis_evidence_pack",
+        lambda *_args, **_kwargs: evidence_pack,
+    )
+    monkeypatch.setattr(
+        adoption_inputs_module,
+        "production_synthesis_from_json",
+        lambda _payload: synthesis,
+    )
+    monkeypatch.setattr(adoption_inputs_module, "build_synthesis_candidate", capture_candidate)
+
+    patch: dict[str, object] = {
+        "target": workspace_target.target.to_json(),
+        "after": "[Synthetic actor] Revised report",
+        "rationale": "Synthetic manual edit.",
+        "evidence_refs": [],
+    }
+    if operation is TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH:
+        patch["manual_text_without_evidence"] = True
+
+    await inputs.synthesis_inputs(
+        proposal,
+        patch,
+        base_artifact=base_artifact,
+        base_payload=payload,
+        base_bytes=b"synthetic canonical synthesis",
+        resolution=resolution,
+    )
+
+    assert len(captured) == 1
+    canonical_target = resolve_target(payload, workspace_target.target, operation)
+    wire_patch = captured[0]["patch"]
+    assert wire_patch.target == canonical_target.path
+    assert wire_patch.action is operation

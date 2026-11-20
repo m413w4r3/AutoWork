@@ -8,6 +8,7 @@ import { EditorialWorkspaceLayout } from "./EditorialWorkspaceLayout";
 import { useEditorialDrafts } from "./EditorialDrafts";
 import { EditorialWorkspaceStatus } from "./EditorialWorkspaceStatus";
 import { editorialWorkspaceQueryKeys } from "./editorialWorkspaceQueries";
+import { useManualEditorialEdit } from "./useManualEditorialEdit";
 import "./editorialWorkspace.css";
 
 interface EditorialWorkspacePageProps {
@@ -18,9 +19,10 @@ export function EditorialWorkspacePage({
   subjectId,
 }: EditorialWorkspacePageProps) {
   const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null);
-  const [serverDraftTexts, setServerDraftTexts] = useState<
-    Record<string, string>
-  >({});
+  const [savedManualEdit, setSavedManualEdit] = useState<{
+    proposalId: string;
+    artifactVersion: number;
+  } | null>(null);
   const snapshotQuery = useQuery({
     queryKey: editorialWorkspaceQueryKeys.snapshot(subjectId),
     queryFn: () => getEditorialWorkspaceSnapshot(subjectId),
@@ -32,6 +34,7 @@ export function EditorialWorkspacePage({
         : false,
   });
   const localDrafts = useEditorialDrafts(snapshotQuery.data);
+  const manualEdit = useManualEditorialEdit(subjectId);
 
   if (snapshotQuery.isPending) {
     return (
@@ -89,15 +92,11 @@ export function EditorialWorkspacePage({
 
   const snapshot = snapshotQuery.data;
   const selectedLocalDraft = selectedBlockId
-    ? (serverDraftTexts[selectedBlockId] ?? "")
+    ? (localDrafts.drafts[selectedBlockId] ?? "")
     : "";
-  const updateServerDraftText = (blockId: string, text: string) => {
-    setServerDraftTexts((current) => {
-      const next = { ...current };
-      if (text.length === 0) delete next[blockId];
-      else next[blockId] = text;
-      return next;
-    });
+  const recoverServerDraftText = (blockId: string, text: string) => {
+    const block = snapshot.blocks.find((item) => item.block_id === blockId);
+    if (block) localDrafts.updateDraft(blockId, text, block.text ?? "");
   };
   const hasNoProducedContent =
     snapshot.blocks.length === 0 && snapshot.enrichments.length === 0;
@@ -133,6 +132,17 @@ export function EditorialWorkspacePage({
         showPdfStatus={snapshot.preview_status !== "STALE"}
         showImpactDetails={snapshot.preview_status !== "STALE"}
       />
+      {savedManualEdit ? (
+        <p
+          key={savedManualEdit.proposalId}
+          className="editorial-manual-edit-confirmation"
+          role="status"
+          data-proposal-id={savedManualEdit.proposalId}
+        >
+          Modification manuelle enregistrée (version{" "}
+          {savedManualEdit.artifactVersion}).
+        </p>
+      ) : null}
       {hasNoProducedContent ? (
         <p className="editorial-route-state" role="note">
           Aucun contenu n’est disponible pour cette version. Les brouillons
@@ -146,8 +156,35 @@ export function EditorialWorkspacePage({
         selectedBlockId={selectedBlockId}
         localDraftText={selectedLocalDraft}
         onSelectBlock={setSelectedBlockId}
-        onLocalDraftChange={updateServerDraftText}
+        onLocalDraftChange={recoverServerDraftText}
         onRefresh={() => void snapshotQuery.refetch()}
+        onSave={async (blockId, text) => {
+          const block = snapshot.blocks.find(
+            (item) => item.block_id === blockId,
+          );
+          if (!block)
+            throw new Error("Ce bloc n’existe plus dans cette version.");
+          const operation =
+            block.kind === "title"
+              ? "rewrite_title"
+              : block.kind === "lead_paragraph" || block.kind === "paragraph"
+                ? "rewrite_paragraph"
+                : null;
+          if (!operation || !block.allowed_operations.includes(operation)) {
+            throw new Error("Ce bloc ne peut pas être modifié directement.");
+          }
+          setSavedManualEdit(null);
+          const accepted = await manualEdit.mutateAsync({
+            occurrenceId: blockId,
+            snapshotId: snapshot.snapshot_id,
+            operation,
+            text,
+          });
+          setSavedManualEdit({
+            proposalId: accepted.id,
+            artifactVersion: accepted.artifact_version,
+          });
+        }}
       />
     </>
   );

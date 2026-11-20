@@ -142,7 +142,7 @@ async def test_accept_route_maps_a_missed_fence_to_a_french_conflict(
 
     class _StaleService:
         async def adopt(self, *_args, **_kwargs):
-            raise EditorialProposalAdoptionError("proposal_base_stale")
+            raise EditorialProposalAdoptionError("proposal_base_stale", reason="fence:test_missed")
 
     async def current_actor(_request):
         return uuid4()

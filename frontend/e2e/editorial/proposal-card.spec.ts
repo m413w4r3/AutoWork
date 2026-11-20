@@ -61,6 +61,7 @@ const snapshot: EditorialWorkspaceSnapshot = {
 
 const proposal: EditorialProposalRead = {
   id: proposalId,
+  origin: "bridge_draft",
   subject_id: subjectId,
   production_run_id: snapshot.production_run_id,
   occurrence_id: occurrenceId,

@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import type { ChangeEvent, KeyboardEvent } from "react";
 
+import { ApiError } from "../../api/editions";
+
 export interface InlineTextEditorProps {
   blockId: string;
   value: string;
@@ -23,6 +25,7 @@ export function InlineTextEditor({
   const editorRef = useRef<HTMLTextAreaElement>(null);
   const [saving, setSaving] = useState(false);
   const [announcement, setAnnouncement] = useState("");
+  const [announcementIsError, setAnnouncementIsError] = useState(false);
 
   useEffect(() => {
     const editor = editorRef.current;
@@ -41,12 +44,28 @@ export function InlineTextEditor({
     }
     if (saving) return;
 
+    const block = editorRef.current?.closest<HTMLElement>(
+      ".editorial-document__block",
+    );
     setSaving(true);
     setAnnouncement("");
+    setAnnouncementIsError(false);
     try {
       await onSave(blockId, value);
-    } catch {
-      setAnnouncement("L’enregistrement a échoué. Le brouillon est conservé.");
+      window.requestAnimationFrame(() => block?.focus());
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "L’enregistrement a échoué.";
+      const recovery =
+        error instanceof ApiError && error.status === 409
+          ? "Actualisez l’atelier avant de réessayer."
+          : error instanceof ApiError && error.status === 503
+            ? "Réessayez plus tard."
+            : "";
+      setAnnouncement(
+        `${message}${recovery ? ` ${recovery}` : ""} Le brouillon local est conservé.`,
+      );
+      setAnnouncementIsError(true);
     } finally {
       setSaving(false);
     }
@@ -62,6 +81,7 @@ export function InlineTextEditor({
     if (event.key !== "Escape") return;
     event.preventDefault();
     event.stopPropagation();
+    if (saving) return;
     if (
       hasLocalDraft &&
       !window.confirm("Abandonner le brouillon local de ce bloc ?")
@@ -81,6 +101,7 @@ export function InlineTextEditor({
 
   const handleChange = (event: ChangeEvent<HTMLTextAreaElement>) => {
     setAnnouncement("");
+    setAnnouncementIsError(false);
     onChange(event.currentTarget.value);
   };
 
@@ -114,12 +135,13 @@ export function InlineTextEditor({
             disabled={saving || staleDraft}
             onClick={() => void save()}
           >
-            Enregistrer
+            {saving ? "Enregistrement…" : "Enregistrer"}
           </button>
         ) : null}
         <button
           className="button button--secondary"
           type="button"
+          disabled={saving}
           onClick={cancel}
         >
           Annuler
@@ -127,10 +149,10 @@ export function InlineTextEditor({
       </div>
       <p
         className="editorial-inline-editor__announcement"
-        role="status"
-        aria-live="polite"
+        role={announcementIsError ? "alert" : "status"}
+        aria-live={announcementIsError ? "assertive" : "polite"}
       >
-        {announcement}
+        {saving ? "Enregistrement…" : announcement}
       </p>
     </div>
   );

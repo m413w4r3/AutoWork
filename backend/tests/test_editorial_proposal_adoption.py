@@ -33,7 +33,11 @@ from cti_app.application.editorial_workspace.registry import (
     WorkspaceSnapshotRecord,
     registry_hash,
 )
-from cti_app.application.persistence import ProductionUnitOfWorkFactory, UnitOfWork
+from cti_app.application.persistence import (
+    ProductionUnitOfWorkFactory,
+    StaleProductionRoutingDecisionError,
+    UnitOfWork,
+)
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_stages import SynthesisService
 from cti_app.application.production_synthesis import (
@@ -115,6 +119,7 @@ class _MemoryState:
     impacts: dict[UUID, EditorialProposalImpact] = field(default_factory=dict)
     thread_events: list[dict[str, Any]] = field(default_factory=list)
     run: ProductionRun | None = None
+    routing_decision: Any | None = None
 
 
 class _MemoryUowFactory:
@@ -136,6 +141,7 @@ class _MemoryUow:
         self.blobs = _MemoryBlobRepository(self)
         self.production_artifacts = _MemoryArtifactRepository(self)
         self.production_runs = _MemoryRunRepository(self)
+        self.production_routing_decisions = _MemoryRoutingDecisionRepository(self)
         self.editorial_workspace_snapshots = _MemorySnapshotRepository(self)
         self.editorial_threads = _MemoryThreadRepository(self)
         self.editorial_proposal_impacts = _MemoryImpactRepository(self)
@@ -314,6 +320,15 @@ class _MemoryRunRepository:
 
     async def get_for_update(self, _run_id: UUID) -> ProductionRun | None:
         return self.uow.state.run
+
+
+class _MemoryRoutingDecisionRepository:
+    def __init__(self, uow: _MemoryUow) -> None:
+        self.uow = uow
+
+    async def get(self, decision_id: UUID) -> Any | None:
+        decision = self.uow.state.routing_decision
+        return decision if decision is not None and decision.decision_id == decision_id else None
 
 
 class _MemorySnapshotRepository:
@@ -958,6 +973,129 @@ async def test_adopt_cas_appends_artifact_lineage_registry_and_outbox_atomically
     assert stored.impacts[fixture.proposal.id].sequence == 1
     assert stored.impacts[fixture.proposal.id].accepted_snapshot_id == result.snapshot.snapshot_id
     assert fixture.factory.commits == 1
+
+
+@pytest.mark.asyncio
+async def test_v8_envelope_route_hash_does_not_create_incomplete_writer_fence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(service_type=EditorialProposalAdoptionService)
+    route_hash = "d" * 64
+    workspace = fixture.service._workspace_service
+    resolution = workspace.resolution
+    workspace.resolution = replace(
+        resolution,
+        record=replace(resolution.record, routing_decision_hash=route_hash),
+    )
+    fixture.proposal = replace(fixture.proposal, base_routing_hash=route_hash)
+    fixture.factory.state.proposals[fixture.proposal.id] = fixture.proposal
+
+    writer = fixture.service._synthesis_writer
+    store_synthesis_result = writer.store_synthesis_result
+    received_route_identity: list[tuple[UUID | None, str | None]] = []
+
+    async def capture_store(**kwargs: Any) -> ProductionArtifact:
+        received_route_identity.append(
+            (
+                kwargs.get("expected_routing_decision_id"),
+                kwargs.get("expected_routing_decision_hash"),
+            )
+        )
+        return await store_synthesis_result(**kwargs)
+
+    monkeypatch.setattr(writer, "store_synthesis_result", capture_store)
+
+    result = await fixture.adopt()
+
+    assert result.proposal.state is EditorialProposalState.ACCEPTED
+    assert received_route_identity == [(None, None)]
+
+
+@pytest.mark.asyncio
+async def test_persisted_routing_decision_is_passed_as_a_complete_writer_fence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(service_type=EditorialProposalAdoptionService)
+    decision_id = uuid4()
+    route_hash = "e" * 64
+    workspace = fixture.service._workspace_service
+    resolution = workspace.resolution
+    workspace.resolution = replace(
+        resolution,
+        record=replace(
+            resolution.record,
+            routing_decision_id=decision_id,
+            routing_decision_hash=route_hash,
+        ),
+    )
+    fixture.proposal = replace(fixture.proposal, base_routing_hash=route_hash)
+    fixture.factory.state.proposals[fixture.proposal.id] = fixture.proposal
+    run = fixture.factory.state.run
+    assert run is not None
+    fixture.factory.state.run = replace(
+        run,
+        routing_decision_id=decision_id,
+    )
+    fixture.factory.state.routing_decision = SimpleNamespace(
+        decision_id=decision_id,
+        decision_hash=route_hash,
+        production_run_id=fixture.proposal.production_run_id,
+        pipeline_generation=0,
+    )
+
+    writer = fixture.service._synthesis_writer
+    store_synthesis_result = writer.store_synthesis_result
+    received_route_identity: list[tuple[UUID | None, str | None]] = []
+
+    async def capture_store(**kwargs: Any) -> ProductionArtifact:
+        received_route_identity.append(
+            (
+                kwargs.get("expected_routing_decision_id"),
+                kwargs.get("expected_routing_decision_hash"),
+            )
+        )
+        return await store_synthesis_result(**kwargs)
+
+    monkeypatch.setattr(writer, "store_synthesis_result", capture_store)
+
+    result = await fixture.adopt()
+
+    assert result.proposal.state is EditorialProposalState.ACCEPTED
+    assert received_route_identity == [(decision_id, route_hash)]
+
+
+@pytest.mark.asyncio
+async def test_persisted_routing_decision_hash_mismatch_keeps_writer_fence_strict() -> None:
+    fixture = _fixture(service_type=EditorialProposalAdoptionService)
+    decision_id = uuid4()
+    pinned_hash = "e" * 64
+    workspace = fixture.service._workspace_service
+    resolution = workspace.resolution
+    workspace.resolution = replace(
+        resolution,
+        record=replace(
+            resolution.record,
+            routing_decision_id=decision_id,
+            routing_decision_hash=pinned_hash,
+        ),
+    )
+    fixture.proposal = replace(fixture.proposal, base_routing_hash=pinned_hash)
+    fixture.factory.state.proposals[fixture.proposal.id] = fixture.proposal
+    run = fixture.factory.state.run
+    assert run is not None
+    fixture.factory.state.run = replace(
+        run,
+        routing_decision_id=decision_id,
+    )
+    fixture.factory.state.routing_decision = SimpleNamespace(
+        decision_id=decision_id,
+        decision_hash="f" * 64,
+        production_run_id=fixture.proposal.production_run_id,
+        pipeline_generation=0,
+    )
+
+    with pytest.raises(StaleProductionRoutingDecisionError):
+        await fixture.adopt()
 
 
 @pytest.mark.asyncio

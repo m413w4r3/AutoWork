@@ -274,9 +274,9 @@ def evidence_ref_sort_key(ref: ExtractionEvidenceRefV1) -> tuple[str, str, str]:
 
 
 def _normalize_evidence_refs(
-    refs: tuple[ExtractionEvidenceRefV1, ...], label: str
+    refs: tuple[ExtractionEvidenceRefV1, ...], label: str, *, allow_empty: bool = False
 ) -> tuple[ExtractionEvidenceRefV1, ...]:
-    if not isinstance(refs, tuple) or not refs:
+    if not isinstance(refs, tuple) or (not refs and not allow_empty):
         raise ValueError(f"{label} requires a tuple of evidence references")
     if any(not isinstance(ref, ExtractionEvidenceRefV1) for ref in refs):
         raise ValueError(f"{label} evidence references have an invalid type")
@@ -310,7 +310,9 @@ class SynthesisParagraphV1:
         if contains_wire_marker_line(self.text):
             raise ValueError("Synthesis paragraph text contains a wire marker")
         object.__setattr__(
-            self, "evidence_refs", _normalize_evidence_refs(self.evidence_refs, "Paragraph")
+            self,
+            "evidence_refs",
+            _normalize_evidence_refs(self.evidence_refs, "Paragraph", allow_empty=True),
         )
 
 
@@ -949,9 +951,11 @@ def _ref_from_json(raw: Any) -> ExtractionEvidenceRefV1:
     )
 
 
-def _refs_from_json(raw: Any, label: str) -> tuple[ExtractionEvidenceRefV1, ...]:
+def _refs_from_json(
+    raw: Any, label: str, *, allow_empty: bool = False
+) -> tuple[ExtractionEvidenceRefV1, ...]:
     refs = tuple(_ref_from_json(value) for value in _array(raw, label))
-    if not refs:
+    if not refs and not allow_empty:
         raise ValueError(f"{label} must not be empty")
     return refs
 
@@ -960,7 +964,9 @@ def _paragraph_from_json(raw: Any) -> SynthesisParagraphV1:
     payload = _object(raw, _PARAGRAPH_KEYS, "Synthesis paragraph")
     return SynthesisParagraphV1(
         text=_text(payload["text"], "Paragraph text", semantic=True),
-        evidence_refs=_refs_from_json(payload["evidence_refs"], "Paragraph evidence references"),
+        evidence_refs=_refs_from_json(
+            payload["evidence_refs"], "Paragraph evidence references", allow_empty=True
+        ),
     )
 
 

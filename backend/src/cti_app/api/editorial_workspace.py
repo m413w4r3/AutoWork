@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Callable, Coroutine
+import traceback
+from collections.abc import Callable, Coroutine, Mapping
 from datetime import datetime
 from typing import Annotated, Any, Literal, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -30,6 +31,7 @@ from cti_app.application.editorial_proposal_adoption_inputs import (
 from cti_app.application.editorial_proposals import (
     EditorialProposalApplicationError,
     EditorialProposalService,
+    editorial_manual_decision_idempotency_key,
 )
 from cti_app.application.editorial_thread_common import is_valid_editorial_idempotency_key
 from cti_app.application.editorial_threads import (
@@ -48,6 +50,7 @@ from cti_app.application.production_enrichment_revision import (
 from cti_app.application.production_stages import EditorialEnrichmentService, SynthesisService
 from cti_app.application.production_synthesis import ProductionSynthesisService
 from cti_app.config import get_settings
+from cti_app.domain.editorial_proposal import EditorialProposalConflict
 from cti_app.domain.editorial_thread import EditorialThreadEventKind
 from cti_app.domain.editorial_workspace import EditorialWorkspaceError
 from cti_app.domain.publication_kind import PublicationKind
@@ -55,6 +58,7 @@ from cti_app.infrastructure.analytic_chart_renderer import AnalyticChartRenderer
 from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
 
 _MAX_DRAFT_REQUEST_BYTES = MAX_DRAFT_BYTES * 6 + 4_096
+_MAX_MANUAL_EDIT_REQUEST_BYTES = 256 * 1024 + 4_096
 logger = logging.getLogger(__name__)
 
 
@@ -64,22 +68,48 @@ class EditorialWorkspaceRoute(APIRoute):
 
         async def sanitized_handler(request: Request) -> Response:
             is_accept = self.path_format.endswith("/accept")
+            is_manual_edit = self.path_format.endswith("/manual-edit")
             is_draft = self.path_format.endswith("/draft")
-            if is_accept:
+            if is_accept or is_manual_edit:
                 try:
                     enabled = get_settings().editorial_proposal_accept_enabled
                 except Exception:
                     enabled = False
                 if not enabled:
+                    code = "accept_not_enabled" if is_accept else "manual_edit_unavailable"
                     return JSONResponse(
                         status_code=status.HTTP_404_NOT_FOUND,
                         content={
                             "detail": {
-                                "code": "accept_not_enabled",
-                                "message": "L'acceptation des propositions est désactivée.",
+                                "code": code,
+                                "message": _ERROR_MESSAGES.get(
+                                    code, "L'acceptation des propositions est désactivée."
+                                ),
                             }
                         },
                     )
+            if is_manual_edit:
+                raw_length = request.headers.get("content-length")
+                if raw_length is not None:
+                    try:
+                        if int(raw_length) > _MAX_MANUAL_EDIT_REQUEST_BYTES:
+                            return _manual_edit_too_large_response()
+                    except ValueError:
+                        return JSONResponse(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            content={
+                                "detail": {
+                                    "code": "manual_edit_request_invalid",
+                                    "message": _ERROR_MESSAGES["manual_edit_request_invalid"],
+                                }
+                            },
+                        )
+                body = bytearray()
+                async for chunk in request.stream():
+                    if len(body) + len(chunk) > _MAX_MANUAL_EDIT_REQUEST_BYTES:
+                        return _manual_edit_too_large_response()
+                    body.extend(chunk)
+                cast(Any, request)._body = bytes(body)
             try:
                 response = await original_handler(request)
             except HTTPException as error:
@@ -91,13 +121,19 @@ class EditorialWorkspaceRoute(APIRoute):
                     headers=dict(error.headers or {}),
                 )
             except RequestValidationError as error:
-                if is_accept:
+                if is_accept or is_manual_edit:
+                    code = "accept_request_invalid" if is_accept else "manual_edit_request_invalid"
+                    message = (
+                        "La requête d'acceptation est invalide."
+                        if is_accept
+                        else "La requête de modification est invalide."
+                    )
                     return JSONResponse(
                         status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                         content={
                             "detail": {
-                                "code": "accept_request_invalid",
-                                "message": "La requête d'acceptation est invalide.",
+                                "code": code,
+                                "message": message,
                             }
                         },
                     )
@@ -122,6 +158,16 @@ class EditorialWorkspaceRoute(APIRoute):
                     ]
                     response = JSONResponse(status_code=422, content={"detail": details})
             except Exception as error:
+                if is_manual_edit:
+                    return JSONResponse(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        content={
+                            "detail": {
+                                "code": "manual_edit_unavailable",
+                                "message": _ERROR_MESSAGES["manual_edit_unavailable"],
+                            }
+                        },
+                    )
                 if not is_draft:
                     raise
                 logger.warning(
@@ -379,6 +425,7 @@ class EditorialProposalView(BaseModel):
     production_run_id: UUID
     occurrence_id: UUID
     thread_id: UUID | None
+    origin: Literal["bridge_draft", "manual_patch"]
     state: Literal[
         "preparing",
         "proposed",
@@ -420,6 +467,14 @@ class EditorialProposalAcceptRequest(BaseModel):
 
     expected_state_version: int = Field(ge=1)
     patch_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class EditorialManualEditRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    snapshot_id: UUID
+    operation: Literal["rewrite_title", "rewrite_paragraph"]
+    text: str = Field(min_length=1)
 
 
 class EditorialProposalAcceptView(BaseModel):
@@ -535,6 +590,26 @@ _ERROR_MESSAGES = {
         "Les références de cette proposition ont changé. Rechargez l’atelier."  # noqa: RUF001
     ),
     "proposal_idempotency_conflict": "Cette clé est déjà associée à une autre décision.",
+    "manual_edit_no_change": "Le texte n’a pas changé. Aucune nouvelle version n’a été créée.",  # noqa: RUF001
+    "manual_edit_stale": (
+        "Le document a changé. Actualisez l’atelier, puis réappliquez votre brouillon local."  # noqa: RUF001
+    ),
+    "manual_edit_format_uneditable": (
+        "Le format de publication ne permet pas cette modification. Actualisez l'atelier."
+    ),
+    "manual_edit_target_mismatch": "Le bloc cible n'est pas compatible avec cette modification.",
+    "manual_edit_target_ambiguous": "L'emplacement du bloc est ambigu. Actualisez l'atelier.",
+    "manual_edit_new_fact_unadmitted": (
+        "Cette nouvelle valeur technique n'est pas étayée par les preuves disponibles. "
+        "Modifiez le passage ou ajoutez une source autorisée."
+    ),
+    "manual_edit_patch_invalid": "Le texte proposé ne respecte pas le format éditorial autorisé.",
+    "manual_edit_request_too_large": "La requête de modification dépasse la taille autorisée.",
+    "manual_edit_idempotency_conflict": (
+        "Cette clé de modification est déjà associée à un autre texte. Actualisez l’atelier."  # noqa: RUF001
+    ),
+    "manual_edit_request_invalid": "La requête de modification est invalide.",
+    "manual_edit_unavailable": "La modification manuelle est temporairement indisponible.",
     "accept_not_enabled": "L'acceptation des propositions est désactivée.",
     "editorial_proposal_accept_unavailable": (
         "L'acceptation des propositions est temporairement indisponible."
@@ -558,6 +633,58 @@ _ERROR_MESSAGES = {
     "draft_if_match_invalid": "La version de brouillon est invalide.",
     "draft_request_invalid": "La requête de brouillon est invalide.",
 }
+
+
+def _manual_edit_too_large_response() -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+        content={
+            "detail": {
+                "code": "manual_edit_request_too_large",
+                "message": _ERROR_MESSAGES["manual_edit_request_too_large"],
+            }
+        },
+    )
+
+
+def _manual_edit_capability_enabled(request: Request, payload: Mapping[str, object]) -> bool:
+    try:
+        if not get_settings().editorial_proposal_accept_enabled:
+            return False
+        if not _proposal_impact_consumer_wired():
+            return False
+        if payload.get("publication_kind") not in {"article", "brief"}:
+            return False
+        if not isinstance(payload.get("production_run_id"), str):
+            return False
+        adoption_service = _proposal_adoption_service(request)
+        proposal_service = _manual_proposal_service(request)
+        if not callable(getattr(adoption_service, "adopt", None)):
+            return False
+        if not callable(getattr(proposal_service, "prepare_manual_patch", None)):
+            return False
+        blocks = payload.get("blocks")
+        if not isinstance(blocks, list):
+            return False
+        return any(
+            isinstance(block, Mapping)
+            and isinstance(block.get("text"), str)
+            and block.get("before_hash") is not None
+            and block.get("revision_status") == "ready"
+            and (
+                (
+                    block.get("kind") == "title"
+                    and "rewrite_title" in block.get("allowed_operations", [])
+                )
+                or (
+                    block.get("kind") in {"lead_paragraph", "paragraph"}
+                    and "rewrite_paragraph" in block.get("allowed_operations", [])
+                )
+            )
+            for block in blocks
+        )
+    except Exception:
+        return False
 
 
 def _service(request: Request) -> EditorialWorkspaceService:
@@ -787,6 +914,36 @@ def _proposal_adoption_service(request: Request) -> EditorialProposalAdoptionSer
     )
 
 
+def _manual_proposal_service(request: Request) -> EditorialProposalService:
+    uow_factory = getattr(request.app.state, "uow_factory", None)
+    artifact_store = getattr(request.app.state, "production_artifact_store", None)
+    blob_store = getattr(request.app.state, "blob_store", None)
+    if uow_factory is None or artifact_store is None or blob_store is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "manual_edit_unavailable",
+                "message": _ERROR_MESSAGES["manual_edit_unavailable"],
+            },
+        )
+    from cti_app.application.editorial_discussion_context import (
+        EditorialDiscussionContextBuilder,
+    )
+
+    workspace_service = _service(request)
+    return EditorialProposalService(
+        uow_factory=uow_factory,
+        blob_store=blob_store,
+        artifact_store=artifact_store,
+        workspace_service=workspace_service,
+        discussion_context_builder=EditorialDiscussionContextBuilder(
+            uow_factory=uow_factory,
+            workspace_service=workspace_service,
+            artifact_store=artifact_store,
+        ),
+    )
+
+
 def _proposal_impact_consumer_wired() -> bool:
     """Return whether acceptance has a registered worker consumer and dispatcher."""
     try:
@@ -915,6 +1072,9 @@ async def get_editorial_workspace_snapshot(
         payload = await _service(request).snapshot(subject_id)
     except EditorialWorkspaceError as error:
         _raise_workspace_error(error)
+    capabilities = payload.get("capabilities")
+    if isinstance(capabilities, dict):
+        capabilities["manual_edit"] = _manual_edit_capability_enabled(request, payload)
     return EditorialWorkspaceSnapshotView.model_validate(payload)
 
 
@@ -1284,6 +1444,263 @@ async def accept_editorial_proposal(
                 "message": _ERROR_MESSAGES["editorial_proposal_accept_unavailable"],
             },
         ) from None
+
+    await _purge_decided_server_draft(request, subject_id, occurrence_id)
+    return EditorialProposalAcceptView(
+        id=result.proposal.id,
+        state="accepted",
+        state_version=result.proposal.state_version,
+        artifact_id=result.artifact.id,
+        artifact_version=result.artifact.version,
+        snapshot_id=result.snapshot.snapshot_id,
+        impact_id=result.impact.impact_id,
+        impact_state=result.impact.state.value,
+    )
+
+
+@router.post(
+    "/subjects/{subject_id}/editor/blocks/{occurrence_id}/manual-edit",
+    response_model=EditorialProposalAcceptView,
+)
+async def manually_edit_editorial_block(
+    subject_id: UUID,
+    occurrence_id: UUID,
+    request: Request,
+    payload: EditorialManualEditRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> EditorialProposalAcceptView:
+    if idempotency_key is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "idempotency_key_required",
+                "message": _ERROR_MESSAGES["idempotency_key_required"],
+            },
+        )
+    if not is_valid_editorial_idempotency_key(idempotency_key):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "idempotency_key_invalid",
+                "message": _ERROR_MESSAGES["idempotency_key_invalid"],
+            },
+        )
+    if not _proposal_impact_consumer_wired():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "manual_edit_unavailable",
+                "message": _ERROR_MESSAGES["manual_edit_unavailable"],
+            },
+        )
+
+    from cti_app.domain.editorial_proposal import ManualPatch, ManualTextPatch
+    from cti_app.domain.production_editorial_revision import TargetedEditorialRevisionOperation
+
+    actor_id = await _thread_actor_id(request)
+    try:
+        proposal = await _manual_proposal_service(request).prepare_manual_patch(
+            subject_id=subject_id,
+            snapshot_id=payload.snapshot_id,
+            occurrence_id=occurrence_id,
+            actor_id=actor_id,
+            idempotency_key=idempotency_key,
+            patch=ManualPatch(
+                typed_patch=ManualTextPatch(
+                    operation=TargetedEditorialRevisionOperation(payload.operation),
+                    text=payload.text,
+                )
+            ),
+        )
+        if proposal.patch_sha256 is None:
+            raise EditorialProposalApplicationError("proposal_patch_invalid")
+        result = await _proposal_adoption_service(request).adopt(
+            subject_id,
+            occurrence_id,
+            proposal.id,
+            actor_id=actor_id,
+            expected_state_version=1,
+            patch_sha256=proposal.patch_sha256,
+            idempotency_key=editorial_manual_decision_idempotency_key(idempotency_key),
+        )
+    except HTTPException:
+        raise
+    except EditorialProposalConflict as error:
+        logger.warning(
+            "manual_edit_rejected code=%s reason=%s subject_id=%s occurrence_id=%s",
+            error.code,
+            "not_applicable",
+            subject_id,
+            occurrence_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "manual_edit_idempotency_conflict",
+                "message": _ERROR_MESSAGES["manual_edit_idempotency_conflict"],
+            },
+        ) from error
+    except EditorialProposalApplicationError as error:
+        code = error.code
+        logger.warning(
+            "manual_edit_rejected code=%s reason=%s subject_id=%s occurrence_id=%s",
+            code,
+            error.reason or "not_applicable",
+            subject_id,
+            occurrence_id,
+        )
+        if code == "idempotency_key_invalid":
+            response_status = status.HTTP_400_BAD_REQUEST
+        elif code in {"proposal_base_stale", "proposal_state_conflict"}:
+            response_status = status.HTTP_409_CONFLICT
+        elif code == "publication_kind_unresolved":
+            response_status = status.HTTP_422_UNPROCESSABLE_CONTENT
+            code = "manual_edit_format_uneditable"
+        elif code == "proposal_target_mismatch":
+            response_status = status.HTTP_422_UNPROCESSABLE_CONTENT
+            code = "manual_edit_target_mismatch"
+        elif code == "proposal_target_ambiguous":
+            response_status = status.HTTP_409_CONFLICT
+            code = "manual_edit_target_ambiguous"
+        elif code in {
+            "manual_edit_no_change",
+            "manual_edit_new_fact_unadmitted",
+            "manual_edit_patch_invalid",
+            "proposal_operation_unsupported",
+        }:
+            response_status = status.HTTP_422_UNPROCESSABLE_CONTENT
+        elif code == "manual_edit_request_too_large":
+            response_status = status.HTTP_413_CONTENT_TOO_LARGE
+        elif code in {
+            "proposal_workspace_unavailable",
+            "proposal_base_unavailable",
+            "proposal_patch_storage_unavailable",
+        }:
+            response_status = status.HTTP_503_SERVICE_UNAVAILABLE
+        else:
+            response_status = status.HTTP_409_CONFLICT
+        if code in {"proposal_base_stale", "proposal_state_conflict"}:
+            code = "manual_edit_stale"
+        if response_status == status.HTTP_503_SERVICE_UNAVAILABLE:
+            code = "manual_edit_unavailable"
+        raise HTTPException(
+            status_code=response_status,
+            detail={
+                "code": code,
+                "message": _ERROR_MESSAGES.get(
+                    code,
+                    "La modification a été refusée. Rechargez l’atelier avant de réessayer.",  # noqa: RUF001
+                ),
+            },
+        ) from error
+    except EditorialProposalAdoptionError as error:
+        code = error.code
+        logger.warning(
+            "manual_edit_rejected code=%s reason=%s subject_id=%s occurrence_id=%s",
+            code,
+            error.reason or "not_applicable",
+            subject_id,
+            occurrence_id,
+        )
+        if code in {
+            "proposal_patch_invalid",
+            "proposal_target_mismatch",
+            "proposal_operation_unsupported",
+            "synthesis_relation_not_evidenced",
+            "synthesis_unknown_evidence",
+            "synthesis_unknown_technical_value",
+            "synthesis_unknown_date",
+            "manual_edit_new_fact_unadmitted",
+        }:
+            response_status = status.HTTP_422_UNPROCESSABLE_CONTENT
+        elif code == "publication_kind_unresolved":
+            response_status = status.HTTP_422_UNPROCESSABLE_CONTENT
+        elif code == "proposal_target_ambiguous":
+            response_status = status.HTTP_409_CONFLICT
+        elif code in {
+            "proposal_patch_unavailable",
+            "proposal_patch_hash_mismatch",
+            "proposal_base_unavailable",
+            "proposal_base_hash_mismatch",
+            "proposal_policy_unavailable",
+            "proposal_candidate_blob_unavailable",
+            "proposal_candidate_blob_hash_mismatch",
+            "proposal_acceptance_incomplete",
+            "proposal_registry_lineage_unavailable",
+        }:
+            response_status = status.HTTP_503_SERVICE_UNAVAILABLE
+        else:
+            response_status = status.HTTP_409_CONFLICT
+        message = _ERROR_MESSAGES.get(code)
+        if code in {
+            "proposal_base_stale",
+            "proposal_state_conflict",
+            "proposal_stale",
+            "adoption_placement_changed",
+        }:
+            code = "manual_edit_stale"
+            message = _ERROR_MESSAGES[code]
+        elif code == "publication_kind_unresolved":
+            code = "manual_edit_format_uneditable"
+            message = _ERROR_MESSAGES[code]
+        elif code == "proposal_target_mismatch":
+            code = "manual_edit_target_mismatch"
+            message = _ERROR_MESSAGES[code]
+        elif code == "proposal_target_ambiguous":
+            code = "manual_edit_target_ambiguous"
+            message = _ERROR_MESSAGES[code]
+        if code in {
+            "synthesis_relation_not_evidenced",
+            "synthesis_unknown_evidence",
+            "synthesis_unknown_technical_value",
+            "synthesis_unknown_date",
+        }:
+            code = "manual_edit_new_fact_unadmitted"
+            message = _ERROR_MESSAGES[code]
+        if response_status == status.HTTP_503_SERVICE_UNAVAILABLE:
+            code = "manual_edit_unavailable"
+            message = _ERROR_MESSAGES[code]
+        raise HTTPException(
+            status_code=response_status,
+            detail={
+                "code": code,
+                "message": message or "La modification a été refusée. Rechargez l’atelier.",  # noqa: RUF001
+            },
+        ) from error
+    except Exception as error:
+        trace = traceback.extract_tb(error.__traceback__)
+        origin_frame = trace[-1] if trace else None
+        previous_frame = trace[-2] if len(trace) > 1 else None
+        origin = (
+            f"{origin_frame.filename.rsplit('/', 1)[-1]}:{origin_frame.lineno}:{origin_frame.name}"
+            if origin_frame is not None
+            else "unavailable"
+        )
+        previous_origin = (
+            f"{previous_frame.filename.rsplit('/', 1)[-1]}:"
+            f"{previous_frame.lineno}:{previous_frame.name}"
+            if previous_frame is not None
+            else "unavailable"
+        )
+        logger.warning(
+            "manual_edit_rejected code=%s reason=%s "
+            "exception_class=%s origin=%s previous_origin=%s "
+            "subject_id=%s occurrence_id=%s",
+            "manual_edit_unexpected",
+            "not_applicable",
+            type(error).__name__,
+            origin,
+            previous_origin,
+            subject_id,
+            occurrence_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "manual_edit_unavailable",
+                "message": _ERROR_MESSAGES["manual_edit_unavailable"],
+            },
+        ) from error
 
     await _purge_decided_server_draft(request, subject_id, occurrence_id)
     return EditorialProposalAcceptView(

@@ -30,6 +30,7 @@ from cti_app.domain.classification import TLP
 from cti_app.domain.editorial_thread import (
     EditorialBindingState,
     EditorialThread,
+    EditorialThreadBinding,
     EditorialThreadEvent,
     EditorialThreadEventKind,
     EditorialThreadRecord,
@@ -47,6 +48,7 @@ from cti_app.domain.production_relevance import (
 from cti_app.domain.production_synthesis import (
     EvidenceKind,
     ExtractionEvidenceRefV1,
+    extraction_evidence_refs_v1,
 )
 
 
@@ -184,8 +186,40 @@ class EditorialDiscussionContextBuilder:
         base = await self._load_base(thread)
         return self._compose_context(base, instruction, history)
 
-    async def _load_base(self, thread: EditorialThread) -> _EditorialDiscussionContextBase:
-        origin = thread.origin
+    async def build_manual(
+        self, subject_id: UUID, occurrence_id: UUID
+    ) -> EditorialDiscussionContext:
+        """Build local evidence validation context without creating a thread or model turn."""
+        try:
+            resolution = await self._workspace.resolve_occurrence(subject_id, occurrence_id)
+        except Exception:
+            raise EditorialThreadApplicationError("editorial_context_unavailable") from None
+        if (
+            resolution.entry is None
+            or resolution.binding_state != EditorialBindingState.VALID.value
+            or resolution.artifact_id is None
+            or resolution.artifact_version is None
+            or resolution.canonical_sha256 is None
+        ):
+            raise EditorialThreadApplicationError("editorial_context_unavailable")
+        origin = EditorialThreadBinding(
+            subject_id=subject_id,
+            production_run_id=resolution.record.production_run_id,
+            occurrence_id=occurrence_id,
+            artifact_id=resolution.artifact_id,
+            artifact_version=resolution.artifact_version,
+            canonical_sha256=resolution.canonical_sha256,
+        )
+        base = await self._load_base(origin, require_external_llm=False)
+        return self._compose_context(base, "", ())
+
+    async def _load_base(
+        self,
+        thread: EditorialThread | EditorialThreadBinding,
+        *,
+        require_external_llm: bool = True,
+    ) -> _EditorialDiscussionContextBase:
+        origin = thread.origin if isinstance(thread, EditorialThread) else thread
         try:
             resolution = await self._workspace.resolve_occurrence(
                 origin.subject_id, origin.occurrence_id
@@ -268,8 +302,13 @@ class EditorialDiscussionContextBuilder:
                 if (
                     run is not None
                     and stage_value == "synthesis"
-                    and target.get("kind") in {"paragraph", "lead_paragraph"}
-                    and "rewrite_paragraph" in offered_operations
+                    and (
+                        (target.get("kind") == "title" and "rewrite_title" in offered_operations)
+                        or (
+                            target.get("kind") in {"paragraph", "lead_paragraph"}
+                            and "rewrite_paragraph" in offered_operations
+                        )
+                    )
                 )
                 else None
             )
@@ -338,7 +377,7 @@ class EditorialDiscussionContextBuilder:
             except Exception:
                 raise EditorialThreadApplicationError("editorial_context_unavailable") from None
 
-        if (
+        if require_external_llm and (
             not access_policy.external_llm_allowed
             or access_policy.effective_tlp is TLP.RED
             or subject_tlp_tightened
@@ -360,32 +399,44 @@ class EditorialDiscussionContextBuilder:
 
         admitted: list[EditorialEvidenceEntry] = []
         admitted_refs: list[ExtractionEvidenceRefV1] = []
-        raw_refs = target.get("evidence_refs", [])
-        if not isinstance(raw_refs, list):
-            raise EditorialThreadApplicationError("editorial_context_unavailable")
-        for raw_ref in raw_refs:
-            reference_data = _evidence_reference(raw_ref)
-            if reference_data is None:
+        references: Sequence[ExtractionEvidenceRefV1]
+        if target.get("kind") == "title":
+            references = extraction_evidence_refs_v1(extraction)
+        else:
+            raw_refs = target.get("evidence_refs", [])
+            if not isinstance(raw_refs, list):
                 raise EditorialThreadApplicationError("editorial_context_unavailable")
-            try:
-                reference = ExtractionEvidenceRefV1(
-                    source_document_id=UUID(reference_data["source_document_id"]),
-                    kind=EvidenceKind(reference_data["kind"]),
-                    evidence_key=reference_data["evidence_key"],
-                )
-            except (KeyError, TypeError, ValueError):
-                raise EditorialThreadApplicationError("editorial_context_unavailable") from None
+            parsed_references: list[ExtractionEvidenceRefV1] = []
+            for raw_ref in raw_refs:
+                reference_data = _evidence_reference(raw_ref)
+                if reference_data is None:
+                    raise EditorialThreadApplicationError("editorial_context_unavailable")
+                try:
+                    parsed_references.append(
+                        ExtractionEvidenceRefV1(
+                            source_document_id=UUID(reference_data["source_document_id"]),
+                            kind=EvidenceKind(reference_data["kind"]),
+                            evidence_key=reference_data["evidence_key"],
+                        )
+                    )
+                except (KeyError, TypeError, ValueError):
+                    raise EditorialThreadApplicationError("editorial_context_unavailable") from None
+            references = tuple(parsed_references)
+        for reference in references:
             handle = evidence_pack.handle_for(reference)
             if handle is not None and handle in evidence_by_handle:
                 admitted_refs.append(reference)
                 admitted.append(evidence_by_handle[handle])
 
         paragraph_evidence_context: EditorialParagraphEvidenceContext | None = None
-        if stage_value == "synthesis" and target.get("kind") in {"paragraph", "lead_paragraph"}:
+        kind = target.get("kind")
+        can_validate_title = kind == "title" and "rewrite_title" in offered_operations
+        can_validate_paragraph = (
+            kind in {"paragraph", "lead_paragraph"} and "rewrite_paragraph" in offered_operations
+        )
+        if stage_value == "synthesis" and (can_validate_title or can_validate_paragraph):
             if (
-                "rewrite_paragraph" in offered_operations
-                and admitted_refs
-                and synthesis_artifact is not None
+                synthesis_artifact is not None
                 and synthesis_artifact.status is ProductionArtifactStatus.VERIFIED
                 and synthesis_artifact.canonical_blob_id is not None
                 and synthesis_artifact.id == resolution.artifact_id
@@ -411,20 +462,16 @@ class EditorialDiscussionContextBuilder:
                         ),
                         publication_kind=resolution.record.publication_kind,
                     )
-                    if not paragraph_evidence_context.evidence_handles:
+                    # Check canonical artifact bytes against the resolution used for the fence.
+                    canonical_digest = hashlib.sha256(
+                        self._artifact_store.canonical_json_bytes(base_artifact_content)
+                    ).hexdigest()
+                    if (
+                        canonical_digest != resolution.canonical_sha256
+                        or paragraph_evidence_context.base_artifact.stage
+                        is not ProductionArtifactStage.SYNTHESIS
+                    ):
                         paragraph_evidence_context = None
-                    else:
-                        # Check canonical artifact bytes against the resolution used for the fence.
-                        canonical_digest = hashlib.sha256(
-                            self._artifact_store.canonical_json_bytes(base_artifact_content)
-                        ).hexdigest()
-                        if canonical_digest != resolution.canonical_sha256:
-                            paragraph_evidence_context = None
-                        elif (
-                            paragraph_evidence_context.base_artifact.stage
-                            is not ProductionArtifactStage.SYNTHESIS
-                        ):
-                            paragraph_evidence_context = None
                 except Exception:
                     paragraph_evidence_context = None
 

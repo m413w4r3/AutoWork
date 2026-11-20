@@ -18,6 +18,7 @@ describe("EditorialProposalCard", () => {
       production_run_id: "run-1",
       occurrence_id: "occurrence-1",
       thread_id: "thread-1",
+      origin: "manual_patch",
       state: "proposed",
       state_version: 1,
       operation: "rewrite_title",
@@ -63,6 +64,7 @@ describe("EditorialProposalCard", () => {
     );
 
     expect(await screen.findByText("Titre proposé synthétique")).toBeVisible();
+    expect(screen.getByText("Modification manuelle")).toBeVisible();
     expect(screen.getByText("Proposition à consulter")).toBeVisible();
     expect(screen.getByText("Base canonique · version 4")).toBeVisible();
     expect(screen.getByRole("button", { name: "Accepter" })).toBeVisible();

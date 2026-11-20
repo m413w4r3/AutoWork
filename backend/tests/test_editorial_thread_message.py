@@ -556,9 +556,10 @@ class WorkerUow:
             get_by_run=lambda _run_id: _async_value(production_snapshot)
         )
         self.production_artifacts = SimpleNamespace(
+            get=lambda _artifact_id: _async_value(None),
             get_current=lambda _run_id, stage: _async_value(
                 extraction_artifact if stage == ProductionArtifactStage.EXTRACTION.value else None
-            )
+            ),
         )
         self.subjects = SimpleNamespace(get=lambda _subject_id: _async_value(subject))
         self.source_documents = source_docs

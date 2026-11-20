@@ -179,6 +179,9 @@ export function EditorialProposalCard({
       <p className="editorial-proposal-card__base">
         Base canonique · version {proposal.base_artifact_version}
       </p>
+      {proposal.origin === "manual_patch" ? (
+        <p className="editorial-proposal-card__origin">Modification manuelle</p>
+      ) : null}
       {typeof proposedText === "string" ? (
         typeof proposal.base_text === "string" ? (
           <EditorialDiffView
