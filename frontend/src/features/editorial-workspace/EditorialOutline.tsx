@@ -12,7 +12,11 @@ interface EditorialOutlineProps {
   outline: EditorialDocumentOutlineNode[];
   selectedBlockId: string | null;
   activeSectionId: string | null;
+  drafts: Readonly<Record<string, string>>;
+  staleDraftIds: ReadonlySet<string>;
   onSelectBlock: (blockId: string) => void;
+  onResumeDraft: (blockId: string) => void;
+  onCancelDraft: (blockId: string) => void;
 }
 
 interface OutlineItem {
@@ -86,10 +90,23 @@ export function EditorialOutline({
   outline,
   selectedBlockId,
   activeSectionId,
+  drafts,
+  staleDraftIds,
   onSelectBlock,
+  onResumeDraft,
+  onCancelDraft,
 }: EditorialOutlineProps) {
   const [search, setSearch] = useState("");
+  const [recoveredDraftId, setRecoveredDraftId] = useState<string | null>(null);
   const itemRefs = useRef(new Map<string, HTMLButtonElement>());
+  const blockIds = useMemo(
+    () => new Set(blocks.map((block) => block.block_id)),
+    [blocks],
+  );
+  const missingDraftIds = useMemo(
+    () => Object.keys(drafts).filter((blockId) => !blockIds.has(blockId)),
+    [blockIds, drafts],
+  );
   const items = useMemo(
     () => matchingItems(blocks, outline, search),
     [blocks, outline, search],
@@ -125,41 +142,137 @@ export function EditorialOutline({
       <div className="editorial-outline__tree" role="tree">
         {items.map((item, index) => {
           const selected = item.block.block_id === selectedBlockId;
+          const hasDraft = Object.prototype.hasOwnProperty.call(
+            drafts,
+            item.block.block_id,
+          );
+          const staleDraft = staleDraftIds.has(item.block.block_id);
           return (
-            <button
+            <div
               key={item.block.block_id}
-              ref={(element) => {
-                if (element) itemRefs.current.set(item.block.block_id, element);
-                else itemRefs.current.delete(item.block.block_id);
-              }}
-              type="button"
-              role="treeitem"
-              aria-level={item.depth + 1}
-              aria-selected={selected}
-              aria-current={
-                item.block.block_id === activeSectionId ? "location" : undefined
-              }
-              tabIndex={selected || (!selectedBlockId && index === 0) ? 0 : -1}
-              className="editorial-outline__item"
-              data-selected={selected}
-              data-active-section={item.block.block_id === activeSectionId}
-              data-depth={item.depth}
-              onClick={() => onSelectBlock(item.block.block_id)}
-              onKeyDown={(event) => {
-                if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-                  handleArrow(event, index);
-                }
-              }}
+              className="editorial-outline__row"
+              role="none"
             >
-              <span className="editorial-outline__kind">
-                {OUTLINE_BLOCK_KIND_LABELS[item.block.kind]}
-              </span>
-              <span>{item.label}</span>
-            </button>
+              <button
+                ref={(element) => {
+                  if (element)
+                    itemRefs.current.set(item.block.block_id, element);
+                  else itemRefs.current.delete(item.block.block_id);
+                }}
+                type="button"
+                role="treeitem"
+                aria-level={item.depth + 1}
+                aria-selected={selected}
+                aria-current={
+                  item.block.block_id === activeSectionId
+                    ? "location"
+                    : undefined
+                }
+                tabIndex={
+                  selected || (!selectedBlockId && index === 0) ? 0 : -1
+                }
+                className="editorial-outline__item"
+                data-selected={selected}
+                data-active-section={item.block.block_id === activeSectionId}
+                data-depth={item.depth}
+                onClick={() => onSelectBlock(item.block.block_id)}
+                onKeyDown={(event) => {
+                  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                    handleArrow(event, index);
+                  }
+                }}
+              >
+                <span className="editorial-outline__kind">
+                  {OUTLINE_BLOCK_KIND_LABELS[item.block.kind]}
+                </span>
+                <span>{item.label}</span>
+                {hasDraft ? (
+                  <span className="editorial-local-draft-label">
+                    Brouillon local
+                  </span>
+                ) : null}
+                {staleDraft ? (
+                  <span
+                    className="editorial-local-draft-stale"
+                    aria-live="polite"
+                  >
+                    La version du document a changé depuis ce brouillon
+                  </span>
+                ) : null}
+              </button>
+              {hasDraft ? (
+                <div className="editorial-outline__draft-actions">
+                  <button
+                    className="editorial-outline__draft-resume"
+                    type="button"
+                    aria-label={`Reprendre le brouillon : ${item.label}`}
+                    onClick={() => onResumeDraft(item.block.block_id)}
+                  >
+                    Reprendre le brouillon
+                  </button>
+                  <button
+                    className="editorial-outline__draft-cancel"
+                    type="button"
+                    aria-label={`Annuler le brouillon : ${item.label}`}
+                    onClick={() => {
+                      onCancelDraft(item.block.block_id);
+                      window.requestAnimationFrame(() =>
+                        itemRefs.current.get(item.block.block_id)?.focus(),
+                      );
+                    }}
+                  >
+                    Annuler
+                  </button>
+                </div>
+              ) : null}
+            </div>
           );
         })}
         {items.length === 0 ? <p>Aucun résultat dans le plan.</p> : null}
       </div>
+      {missingDraftIds.length > 0 ? (
+        <section
+          className="editorial-outline__missing-drafts"
+          aria-label="Brouillons de blocs introuvables"
+        >
+          <h3>Brouillons conservés</h3>
+          {missingDraftIds.map((blockId) => (
+            <div className="editorial-outline__missing-draft" key={blockId}>
+              <p>Bloc introuvable</p>
+              {staleDraftIds.has(blockId) ? (
+                <p className="editorial-local-draft-stale" aria-live="polite">
+                  La version du document a changé depuis ce brouillon
+                </p>
+              ) : null}
+              <div className="editorial-outline__draft-actions">
+                <button
+                  type="button"
+                  className="editorial-outline__draft-resume"
+                  onClick={() => setRecoveredDraftId(blockId)}
+                >
+                  Reprendre le brouillon
+                </button>
+                <button
+                  type="button"
+                  className="editorial-outline__draft-cancel"
+                  onClick={() => {
+                    setRecoveredDraftId(null);
+                    onCancelDraft(blockId);
+                  }}
+                >
+                  Annuler
+                </button>
+              </div>
+              {recoveredDraftId === blockId ? (
+                <label className="editorial-outline__recovered-draft">
+                  Texte récupéré du brouillon
+                  <textarea readOnly value={drafts[blockId] ?? ""} rows={6} />
+                </label>
+              ) : null}
+            </div>
+          ))}
+        </section>
+      ) : null}
     </nav>
   );
 }

@@ -70,13 +70,17 @@ describe("EditorialDocument", () => {
       <EditorialDocument
         snapshot={snapshot}
         selectedBlockId={null}
+        drafts={{}}
+        staleDraftIds={new Set()}
+        editingBlockId={null}
         onSelectBlock={onSelectBlock}
+        onDraftChange={() => undefined}
+        onResumeDraft={() => undefined}
+        onCancelDraft={() => undefined}
       />,
     );
 
-    const paragraphs = screen.getAllByRole("button", {
-      name: "Repeated synthetic text",
-    });
+    const paragraphs = screen.getAllByText("Repeated synthetic text");
     const firstParagraph = paragraphs[0];
     const secondParagraph = paragraphs[1];
     if (!firstParagraph || !secondParagraph) {

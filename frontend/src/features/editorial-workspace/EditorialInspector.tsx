@@ -12,6 +12,7 @@ interface EditorialInspectorProps {
   sectionTitle: string | null;
   readOnly: boolean;
   onOpenSources: () => void;
+  onStartEditing: (blockId: string) => void;
   onBackToDocument: () => void;
   onChangeTarget: () => void;
 }
@@ -54,11 +55,13 @@ function BlockActionToolbar({
   block,
   readOnly,
   onOpenSources,
+  onStartEditing,
 }: {
   snapshot: EditorialWorkspaceSnapshot;
   block: EditorialWorkspaceBlock;
   readOnly: boolean;
   onOpenSources: () => void;
+  onStartEditing: (blockId: string) => void;
 }) {
   const operations = new Set(block.allowed_operations);
   const canModify =
@@ -96,9 +99,7 @@ function BlockActionToolbar({
         <button
           className="button button--secondary"
           type="button"
-          disabled
-          aria-label="Modifier. La modification sera disponible dans une prochaine étape."
-          title="La modification sera disponible dans une prochaine étape."
+          onClick={() => onStartEditing(block.block_id)}
         >
           Modifier
         </button>
@@ -154,6 +155,7 @@ export function EditorialInspector({
   sectionTitle,
   readOnly,
   onOpenSources,
+  onStartEditing,
   onBackToDocument,
   onChangeTarget,
 }: EditorialInspectorProps) {
@@ -188,6 +190,7 @@ export function EditorialInspector({
               block={block}
               readOnly={readOnly}
               onOpenSources={onOpenSources}
+              onStartEditing={onStartEditing}
             />
             <EditorialConversation
               subjectId={subjectId}
