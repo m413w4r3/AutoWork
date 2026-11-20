@@ -1,8 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useRef } from "react";
 
+import { ApiError } from "../../api/editions";
 import {
+  acceptEditorialProposal,
   getEditorialProposal,
   rejectEditorialProposal,
+  type EditorialProposalRead,
   type EditorialProposalRefusalCode,
   type EditorialProposalState,
 } from "../../api/editorialWorkspace";
@@ -14,6 +18,8 @@ interface EditorialProposalCardProps {
   occurrenceId: string;
   proposalId: string;
   referenceOrdinal?: number;
+  onRequestVariant?: () => void;
+  onAccepted?: () => void;
 }
 
 const stateLabels: Record<EditorialProposalState, string> = {
@@ -21,7 +27,7 @@ const stateLabels: Record<EditorialProposalState, string> = {
   proposed: "Proposition à consulter",
   refused: "Refus Bridge",
   needs_review: "Revue nécessaire",
-  accepted: "Adoptée",
+  accepted: "Acceptée",
   rejected: "Rejetée",
   stale: "Périmée",
 };
@@ -43,15 +49,66 @@ export function EditorialProposalCard({
   occurrenceId,
   proposalId,
   referenceOrdinal,
+  onRequestVariant,
+  onAccepted,
 }: EditorialProposalCardProps) {
   const queryClient = useQueryClient();
+  const acceptButtonRef = useRef<HTMLButtonElement>(null);
+  const restoreAcceptFocus = useRef(false);
+  const proposalQueryKey = editorialWorkspaceQueryKeys.proposal(
+    subjectId,
+    occurrenceId,
+    proposalId,
+  );
   const proposalQuery = useQuery({
-    queryKey: editorialWorkspaceQueryKeys.proposal(
-      subjectId,
-      occurrenceId,
-      proposalId,
-    ),
+    queryKey: proposalQueryKey,
     queryFn: () => getEditorialProposal(subjectId, occurrenceId, proposalId),
+  });
+  const invalidateDecisionContext = async () => {
+    await Promise.all([
+      queryClient.invalidateQueries({
+        queryKey: editorialWorkspaceQueryKeys.snapshot(subjectId),
+      }),
+      queryClient.invalidateQueries({
+        queryKey: editorialWorkspaceQueryKeys.threadsForOccurrence(
+          subjectId,
+          occurrenceId,
+        ),
+      }),
+      queryClient.invalidateQueries({
+        queryKey: editorialWorkspaceQueryKeys.proposalsForOccurrence(
+          subjectId,
+          occurrenceId,
+        ),
+      }),
+    ]);
+  };
+  const acceptMutation = useMutation({
+    mutationFn: () => {
+      const proposal = proposalQuery.data;
+      if (!proposal?.patch_sha256) {
+        throw new Error("L’empreinte du patch est indisponible.");
+      }
+      return acceptEditorialProposal(subjectId, occurrenceId, proposalId, {
+        expected_state_version: proposal.state_version,
+        patch_sha256: proposal.patch_sha256,
+      });
+    },
+    onSuccess: async (accepted) => {
+      queryClient.setQueryData<EditorialProposalRead>(
+        proposalQueryKey,
+        (current) =>
+          current
+            ? {
+                ...current,
+                state: "accepted",
+                state_version: accepted.state_version,
+              }
+            : current,
+      );
+      await invalidateDecisionContext();
+      onAccepted?.();
+    },
   });
   const rejectMutation = useMutation({
     mutationFn: () => {
@@ -66,14 +123,17 @@ export function EditorialProposalCard({
     },
     onSuccess: async () => {
       await queryClient.invalidateQueries({
-        queryKey: editorialWorkspaceQueryKeys.proposal(
-          subjectId,
-          occurrenceId,
-          proposalId,
-        ),
+        queryKey: proposalQueryKey,
       });
     },
   });
+
+  useEffect(() => {
+    if (acceptMutation.isSuccess && restoreAcceptFocus.current) {
+      restoreAcceptFocus.current = false;
+      acceptButtonRef.current?.focus({ preventScroll: true });
+    }
+  }, [acceptMutation.isSuccess]);
 
   if (proposalQuery.isPending) {
     return (
@@ -93,6 +153,14 @@ export function EditorialProposalCard({
 
   const proposal = proposalQuery.data;
   const proposedText = proposal.patch?.after;
+  const acceptanceConflict =
+    acceptMutation.isError &&
+    acceptMutation.error instanceof ApiError &&
+    acceptMutation.error.status === 409;
+  const recoverableProposal = proposal.state === "stale" || acceptanceConflict;
+  const acceptanceComplete =
+    proposal.state === "accepted" || acceptMutation.isSuccess;
+  const decisionPending = acceptMutation.isPending || rejectMutation.isPending;
 
   return (
     <article
@@ -147,17 +215,120 @@ export function EditorialProposalCard({
           {proposal.patch.rationale}
         </p>
       ) : null}
-      {proposal.state === "proposed" ? (
+      {proposal.state === "proposed" || proposal.state === "accepted" ? (
         <div className="editorial-proposal-card__actions">
           <button
+            ref={acceptButtonRef}
+            className="editorial-proposal-card__accept"
             type="button"
-            onClick={() => rejectMutation.mutate()}
-            disabled={rejectMutation.isPending || !proposal.patch_sha256}
+            aria-disabled={
+              acceptanceComplete ||
+              acceptanceConflict ||
+              decisionPending ||
+              !proposal.patch_sha256
+            }
+            disabled={decisionPending}
+            onClick={() => {
+              if (
+                acceptanceComplete ||
+                acceptanceConflict ||
+                decisionPending ||
+                !proposal.patch_sha256
+              ) {
+                return;
+              }
+              restoreAcceptFocus.current =
+                !onAccepted &&
+                document.activeElement === acceptButtonRef.current;
+              acceptMutation.mutate();
+            }}
           >
-            Rejeter
+            {acceptanceComplete
+              ? "Acceptée"
+              : acceptMutation.isPending
+                ? "Acceptation en cours…"
+                : "Accepter"}
           </button>
+          {proposal.state === "proposed" ? (
+            <button
+              className="editorial-proposal-card__reject"
+              type="button"
+              onClick={() => rejectMutation.mutate()}
+              disabled={
+                decisionPending || acceptanceConflict || !proposal.patch_sha256
+              }
+            >
+              Rejeter
+            </button>
+          ) : null}
           {rejectMutation.isError ? (
             <p role="alert">{rejectMutation.error.message}</p>
+          ) : null}
+        </div>
+      ) : null}
+      {acceptMutation.isPending ? (
+        <p
+          className="editorial-proposal-card__status"
+          role="status"
+          aria-live="polite"
+        >
+          Acceptation en cours…
+        </p>
+      ) : null}
+      {rejectMutation.isPending ? (
+        <p
+          className="editorial-proposal-card__status"
+          role="status"
+          aria-live="polite"
+        >
+          Rejet en cours…
+        </p>
+      ) : null}
+      {acceptMutation.isSuccess ? (
+        <p
+          className="editorial-proposal-card__status"
+          role="status"
+          aria-live="polite"
+        >
+          Proposition acceptée. Le document et les éléments associés sont
+          actualisés.
+        </p>
+      ) : null}
+      {acceptMutation.isError && !acceptanceConflict ? (
+        <p className="editorial-proposal-card__error" role="alert">
+          {acceptMutation.error.message}
+        </p>
+      ) : null}
+      {recoverableProposal ? (
+        <div className="editorial-proposal-card__recovery">
+          {acceptanceConflict || proposal.state === "stale" ? (
+            <p role="alert" aria-live="polite">
+              {acceptanceConflict
+                ? acceptMutation.error.message
+                : "Cette proposition repose sur une version qui a changé. Elle n’a pas été appliquée. Actualisez le document, puis comparez et formulez une nouvelle proposition."}
+            </p>
+          ) : null}
+          <button
+            className="button button--secondary"
+            type="button"
+            onClick={() => {
+              acceptMutation.reset();
+              void invalidateDecisionContext();
+            }}
+          >
+            Comparer à nouveau
+          </button>
+          {onRequestVariant ? (
+            <button
+              className="button button--secondary"
+              type="button"
+              onClick={() => {
+                acceptMutation.reset();
+                onRequestVariant();
+              }}
+            >
+              Demander une variante
+            </button>
           ) : null}
         </div>
       ) : null}

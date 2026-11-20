@@ -1,17 +1,20 @@
 import { subjectPublicationPdfUrl } from "../../api/subjectContent";
 import type { EditorialWorkspaceSnapshot } from "../../api/editorialWorkspace";
-import { Link } from "../../routing";
+import { navigate } from "../../navigation";
 
 interface EditorialTopBarProps {
   subjectId: string;
   snapshot: EditorialWorkspaceSnapshot;
   stale: boolean;
+  hasLocalDrafts?: boolean;
+  hasStaleLocalDrafts?: boolean;
   menuOpen: boolean;
   technicalOpen: boolean;
   onToggleMenu: (button: HTMLButtonElement) => void;
   onOpenTechnicalDetails: () => void;
   onTechnicalOpenChange: (open: boolean) => void;
   onRefresh: () => void;
+  onNavigateAway?: () => boolean;
 }
 
 function technicalDetailRows(snapshot: EditorialWorkspaceSnapshot) {
@@ -34,12 +37,15 @@ export function EditorialTopBar({
   subjectId,
   snapshot,
   stale,
+  hasLocalDrafts = false,
+  hasStaleLocalDrafts = false,
   menuOpen,
   technicalOpen,
   onToggleMenu,
   onOpenTechnicalDetails,
   onTechnicalOpenChange,
   onRefresh,
+  onNavigateAway = () => true,
 }: EditorialTopBarProps) {
   const title =
     snapshot.blocks.find((block) => block.kind === "title")?.text?.trim() ||
@@ -51,11 +57,15 @@ export function EditorialTopBar({
       ? "PDF obsolète"
       : stale
         ? "Version périmée"
-        : snapshot.preview_status === "IN_PROGRESS"
-          ? "Aperçu en cours"
-          : snapshot.preview_status === "FAILED"
-            ? "PDF indisponible"
-            : "À jour";
+        : hasStaleLocalDrafts
+          ? "Version périmée"
+          : hasLocalDrafts
+            ? "Brouillon local"
+            : snapshot.preview_status === "IN_PROGRESS"
+              ? "Aperçu en cours"
+              : snapshot.preview_status === "FAILED"
+                ? "PDF indisponible"
+                : "À jour";
   const statusDescription =
     snapshot.preview_status === "STALE"
       ? snapshot.impact_status === "failed"
@@ -66,11 +76,15 @@ export function EditorialTopBar({
           : "La publication affichée est périmée. La prévisualisation PDF se relance depuis l’écran d’aperçu de l’édition."
       : stale
         ? "Le document a changé. Actualisez le statut de l’atelier."
-        : snapshot.preview_status === "IN_PROGRESS"
-          ? "Le rendu de l’aperçu est en cours. Le document reste consultable."
-          : snapshot.preview_status === "FAILED"
-            ? "L’aperçu PDF est indisponible."
-            : "Le document affiché correspond à la dernière version canonique enregistrée.";
+        : hasStaleLocalDrafts
+          ? "La version du document a changé depuis ce brouillon. Il est conservé et n’a pas été appliqué à la version actuelle."
+          : hasLocalDrafts
+            ? "Un brouillon de ce bloc n’est pas encore enregistré comme nouvelle version canonique."
+            : snapshot.preview_status === "IN_PROGRESS"
+              ? "Le rendu de l’aperçu est en cours. Le document reste consultable."
+              : snapshot.preview_status === "FAILED"
+                ? "L’aperçu PDF est indisponible."
+                : "Le document affiché correspond à la dernière version canonique enregistrée.";
   const publicationKindLabel =
     snapshot.publication_kind === "article"
       ? "Article"
@@ -87,7 +101,24 @@ export function EditorialTopBar({
     <header className="editorial-topbar">
       <div className="editorial-topbar__identity">
         <div className="editorial-topbar__back">
-          <Link to={`/subjects/${subjectId}`}>← Retour au sujet</Link>
+          <a
+            href={`/subjects/${subjectId}`}
+            onClick={(event) => {
+              if (
+                event.button !== 0 ||
+                event.metaKey ||
+                event.ctrlKey ||
+                event.shiftKey ||
+                event.altKey
+              ) {
+                return;
+              }
+              event.preventDefault();
+              if (onNavigateAway()) navigate(`/subjects/${subjectId}`);
+            }}
+          >
+            ← Retour au sujet
+          </a>
         </div>
         <div>
           <p className="editorial-topbar__subject">Atelier éditorial</p>
@@ -103,7 +134,10 @@ export function EditorialTopBar({
           {snapshot.publication_version ?? snapshot.synthesis_version}
         </span>
         <span
-          className={`editorial-status${stale ? " editorial-status--attention" : ""}`}
+          className={
+            "editorial-status" +
+            (stale || hasStaleLocalDrafts ? " editorial-status--attention" : "")
+          }
           role="status"
           aria-live="polite"
           aria-label={`${statusLabel}. ${statusDescription}`}

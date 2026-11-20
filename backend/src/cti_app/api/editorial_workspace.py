@@ -446,6 +446,10 @@ _ERROR_MESSAGES = {
     "proposal_base_unavailable": "Le texte de référence de cette proposition est indisponible.",
     "proposal_base_hash_mismatch": "Le texte de référence ne correspond plus à son empreinte.",
     "proposal_state_conflict": "La proposition a changé. Actualisez-la avant de décider.",
+    "proposal_base_stale": (
+        "Cette proposition repose sur une version qui a changé. Elle n’a pas été appliquée. "  # noqa: RUF001
+        "Actualisez le document, puis comparez et formulez une nouvelle proposition."
+    ),
     "proposal_stale": (
         "Les références de cette proposition ont changé. Rechargez l’atelier."  # noqa: RUF001
     ),
@@ -546,6 +550,32 @@ def _proposal_adoption_service(request: Request) -> EditorialProposalAdoptionSer
         inputs=inputs,
         synthesis_writer=synthesis_writer,
         enrichment_writer=enrichment_writer,
+    )
+
+
+def _proposal_impact_consumer_wired() -> bool:
+    """Return whether acceptance has a registered worker consumer and dispatcher."""
+    try:
+        from cti_app.application.production_repair_factory import (
+            create_editorial_proposal_impact_service,
+        )
+        from cti_app.workers.editorial_proposal_impacts import EditorialProposalImpactWorker
+        from cti_app.workers.scheduler import main as run_impact_dispatch_scheduler
+        from cti_app.workers.tasks import (
+            dispatch_editorial_proposal_impacts,
+            process_editorial_proposal_impact,
+        )
+    except Exception:
+        return False
+
+    return all(
+        (
+            callable(create_editorial_proposal_impact_service),
+            callable(EditorialProposalImpactWorker),
+            callable(run_impact_dispatch_scheduler),
+            callable(getattr(dispatch_editorial_proposal_impacts, "send", None)),
+            callable(getattr(process_editorial_proposal_impact, "send", None)),
+        )
     )
 
 
@@ -863,6 +893,15 @@ async def accept_editorial_proposal(
             detail={
                 "code": "idempotency_key_invalid",
                 "message": _ERROR_MESSAGES["idempotency_key_invalid"],
+            },
+        )
+
+    if not _proposal_impact_consumer_wired():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "editorial_proposal_accept_unavailable",
+                "message": _ERROR_MESSAGES["editorial_proposal_accept_unavailable"],
             },
         )
 

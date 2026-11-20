@@ -5,6 +5,7 @@ import { ApiError } from "../../api/editions";
 import { getEditorialWorkspaceSnapshot } from "../../api/editorialWorkspace";
 import { Link } from "../../routing";
 import { EditorialWorkspaceLayout } from "./EditorialWorkspaceLayout";
+import { useEditorialDrafts } from "./EditorialDrafts";
 import { EditorialWorkspaceStatus } from "./EditorialWorkspaceStatus";
 import { editorialWorkspaceQueryKeys } from "./editorialWorkspaceQueries";
 import "./editorialWorkspace.css";
@@ -27,6 +28,7 @@ export function EditorialWorkspacePage({
         ? 2_500
         : false,
   });
+  const localDrafts = useEditorialDrafts(snapshotQuery.data);
 
   if (snapshotQuery.isPending) {
     return (
@@ -83,7 +85,9 @@ export function EditorialWorkspacePage({
   }
 
   const snapshot = snapshotQuery.data;
-  if (snapshot.blocks.length === 0 && snapshot.enrichments.length === 0) {
+  const hasNoProducedContent =
+    snapshot.blocks.length === 0 && snapshot.enrichments.length === 0;
+  if (hasNoProducedContent && !localDrafts.hasDrafts) {
     return (
       <section
         className="editorial-route-state"
@@ -115,9 +119,16 @@ export function EditorialWorkspacePage({
         showPdfStatus={snapshot.preview_status !== "STALE"}
         showImpactDetails={snapshot.preview_status !== "STALE"}
       />
+      {hasNoProducedContent ? (
+        <p className="editorial-route-state" role="note">
+          Aucun contenu n’est disponible pour cette version. Les brouillons
+          conservés restent accessibles dans le plan.
+        </p>
+      ) : null}
       <EditorialWorkspaceLayout
         subjectId={subjectId}
         snapshot={snapshot}
+        localDrafts={localDrafts}
         selectedBlockId={selectedBlockId}
         onSelectBlock={setSelectedBlockId}
         onRefresh={() => void snapshotQuery.refetch()}

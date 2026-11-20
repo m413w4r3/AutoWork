@@ -85,6 +85,23 @@ export function EditorialConversation({
       focusAfterSubmitRef.current = occurrenceId;
   }
 
+  function requestVariant() {
+    if (!drafts.draft.trim()) {
+      drafts.setDraft("Propose une variante à partir de la version actuelle.");
+    }
+    lifecycle.clearSendResult();
+    composerRef.current?.focus({ preventScroll: true });
+  }
+
+  function focusSelectedBlock() {
+    const selectedBlock = Array.from(
+      document.querySelectorAll<HTMLElement>(
+        ".editorial-document__block[data-block-id]",
+      ),
+    ).find((block) => block.dataset.blockId === occurrenceId);
+    selectedBlock?.focus({ preventScroll: true });
+  }
+
   return (
     <section
       className="editorial-conversation"
@@ -133,6 +150,10 @@ export function EditorialConversation({
               occurrenceId={occurrenceId}
               proposalId={proposalId}
               referenceOrdinal={index + 1}
+              onRequestVariant={
+                lifecycle.canCompose ? requestVariant : undefined
+              }
+              onAccepted={focusSelectedBlock}
             />
           ))}
         </div>
