@@ -321,9 +321,19 @@ describe("EditorialWorkspacePage manual editing", () => {
     ).toBeVisible();
     expect(screen.getByText("Raison : version historique.")).toBeVisible();
     expect(screen.getByText("Synthetic historical publication")).toBeVisible();
+    expect(screen.getByText("Version historique")).toBeVisible();
     expect(
-      screen.getByRole("link", { name: "Revenir à la version courante" }),
-    ).toHaveAttribute("href", `/subjects/${subjectId}/editor`);
+      screen.queryByRole("link", { name: "← Atelier courant" }),
+    ).not.toBeInTheDocument();
+    const returnLinks = screen.getAllByRole("link", {
+      name: /version courante/i,
+    });
+    expect(returnLinks).toHaveLength(1);
+    expect(returnLinks[0]).toHaveAttribute(
+      "href",
+      `/subjects/${subjectId}/editor`,
+    );
+    expect(returnLinks[0]).toHaveClass("button", "button--secondary");
     expect(screen.queryByRole("button", { name: "Modifier" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Proposer" })).toBeNull();
   });

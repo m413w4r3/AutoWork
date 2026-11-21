@@ -231,6 +231,11 @@ test("un paragraphe garde son contexte exact aux trois largeurs attendues", asyn
   await expect(page.getByRole("button", { name: "Plan" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Inspecteur" })).toBeHidden();
   await expect(page.getByText("Section : Contexte")).toBeVisible();
+  const firstPlanItem = page
+    .getByRole("navigation", { name: "Plan éditorial" })
+    .getByRole("treeitem")
+    .first();
+  await expect(firstPlanItem).toHaveAttribute("title", /: .+/);
   await page.screenshot({
     path: resolve(screenshotDirectory, "atelier-1180x800.png"),
   });

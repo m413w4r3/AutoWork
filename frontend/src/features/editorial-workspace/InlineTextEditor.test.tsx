@@ -88,9 +88,11 @@ const snapshot: EditorialWorkspaceSnapshot = {
 function WorkspaceHarness({
   onSave,
   nextSnapshot = snapshot,
+  localDraftText = "",
 }: {
   onSave?: InlineTextEditorProps["onSave"];
   nextSnapshot?: EditorialWorkspaceSnapshot;
+  localDraftText?: string;
 }) {
   const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null);
   const [activeSnapshot, setActiveSnapshot] = useState(snapshot);
@@ -105,7 +107,7 @@ function WorkspaceHarness({
         snapshot={activeSnapshot}
         localDrafts={localDrafts}
         selectedBlockId={selectedBlockId}
-        localDraftText=""
+        localDraftText={localDraftText}
         onSelectBlock={setSelectedBlockId}
         onLocalDraftChange={() => undefined}
         onRefresh={() => undefined}
@@ -119,6 +121,7 @@ function renderWorkspace(
   props: {
     onSave?: InlineTextEditorProps["onSave"];
     nextSnapshot?: EditorialWorkspaceSnapshot;
+    localDraftText?: string;
   } = {},
 ) {
   const client = new QueryClient({
@@ -260,6 +263,64 @@ describe("local editorial block drafts", () => {
     expect(window.localStorage.length).toBe(0);
     expect(window.sessionStorage.length).toBe(0);
     expect(screen.queryByRole("button", { name: "Enregistrer" })).toBeNull();
+  });
+
+  it("ne rend pas de champ de brouillon local vide dans l’inspecteur", async () => {
+    const user = userEvent.setup();
+    renderWorkspace();
+
+    await selectBlock(user, "block-occurrence-a");
+
+    expect(
+      screen.queryByRole("textbox", { name: "Brouillon local" }),
+    ).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Écrire un brouillon local" }),
+    ).toBeVisible();
+  });
+
+  it("ouvre le champ de brouillon local à la demande", async () => {
+    const user = userEvent.setup();
+    renderWorkspace();
+
+    await selectBlock(user, "block-occurrence-a");
+    await user.click(
+      screen.getByRole("button", { name: "Écrire un brouillon local" }),
+    );
+
+    expect(
+      screen.getByRole("textbox", { name: "Brouillon local" }),
+    ).toHaveValue("");
+  });
+
+  it("affiche le brouillon local retenu pour le bloc sélectionné", async () => {
+    const user = userEvent.setup();
+    renderWorkspace({ localDraftText: "Brouillon retenu" });
+
+    await selectBlock(user, "block-occurrence-a");
+
+    expect(
+      screen.getByRole("textbox", { name: "Brouillon local" }),
+    ).toHaveValue("Brouillon retenu");
+    expect(
+      screen.queryByRole("button", { name: "Écrire un brouillon local" }),
+    ).toBeNull();
+  });
+
+  it("expose le libellé complet du plan avec une classe tronquée", async () => {
+    renderWorkspace();
+
+    const items = await screen.findAllByRole("treeitem");
+    const firstItem = items[0];
+    if (!firstItem)
+      throw new Error("Le plan synthétique doit contenir un bloc.");
+    expect(firstItem).toHaveAttribute(
+      "title",
+      "Paragraphe : Synthetic paragraph A",
+    );
+    expect(
+      firstItem.querySelector(".editorial-outline__label"),
+    ).toHaveTextContent("Synthetic paragraph A");
   });
 
   it("asks before Escape abandons the active local draft", async () => {

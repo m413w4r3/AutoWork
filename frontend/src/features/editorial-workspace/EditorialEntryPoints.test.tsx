@@ -474,6 +474,39 @@ describe("atelier éditorial", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("donne le focus au composeur de discussion depuis le bouton Discuter", async () => {
+    const discussSnapshot: EditorialWorkspaceSnapshot = {
+      ...snapshot,
+      capabilities: { ...snapshot.capabilities, can_discuss: true },
+      blocks: snapshot.blocks.map((block) =>
+        block.kind === "paragraph"
+          ? { ...block, allowed_operations: ["rewrite_paragraph", "discuss"] }
+          : block,
+      ),
+    };
+    renderApp(editorResponse(200, discussSnapshot));
+    const user = userEvent.setup();
+    await screen.findAllByText("Le paragraphe exact reste sélectionné.");
+    const paragraph = document.querySelector(
+      `[data-block-id="${paragraphId}"] .editorial-document__text`,
+    );
+    if (!(paragraph instanceof HTMLElement)) {
+      throw new Error("Le paragraphe synthétique est absent du document.");
+    }
+    await user.click(paragraph);
+
+    const discuss = await screen.findByRole("button", { name: "Discuter" });
+    expect(discuss).toBeEnabled();
+    expect(discuss).not.toHaveAttribute("title");
+    const composer = await screen.findByRole("textbox", {
+      name: "Votre message à Bridge",
+    });
+
+    await user.click(discuss);
+
+    expect(composer).toHaveFocus();
+  });
+
   it("annonce la sélection comme un statut sans rendre le bloc sélectionné en bouton", async () => {
     renderApp(editorResponse());
     const user = userEvent.setup();

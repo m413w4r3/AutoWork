@@ -175,6 +175,7 @@ export function EditorialOutline({
                 data-selected={selected}
                 data-active-section={item.block.block_id === activeSectionId}
                 data-depth={item.depth}
+                title={`${OUTLINE_BLOCK_KIND_LABELS[item.block.kind]} : ${item.label}`}
                 onClick={() => onSelectBlock(item.block.block_id)}
                 onKeyDown={(event) => {
                   if (event.key === "ArrowDown" || event.key === "ArrowUp") {
@@ -185,7 +186,7 @@ export function EditorialOutline({
                 <span className="editorial-outline__kind">
                   {OUTLINE_BLOCK_KIND_LABELS[item.block.kind]}
                 </span>
-                <span>{item.label}</span>
+                <span className="editorial-outline__label">{item.label}</span>
                 {hasDraft ? (
                   <span className="editorial-local-draft-label">
                     Brouillon local

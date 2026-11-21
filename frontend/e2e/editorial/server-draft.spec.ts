@@ -229,6 +229,9 @@ test("server draft status is desktop-only and does not show draft prose", async 
     path: resolve(screenshotDirectory, "server-draft-1440x900.png"),
   });
 
+  // The local draft field stays collapsed until a draft exists or the
+  // reader explicitly opens it.
+  await page.getByRole("button", { name: "Écrire un brouillon local" }).click();
   const localEditor = page.getByRole("textbox", { name: "Brouillon local" });
   await localEditor.fill("Texte local à remplacer");
   page.once("dialog", (dialog) => dialog.accept());

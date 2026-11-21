@@ -60,9 +60,17 @@ test("opens a V4 publication as desktop read-only history", async ({
       name: "Publication historique synthétique",
     }),
   ).toBeVisible();
+  const returnLink = page.getByRole("link", {
+    name: "Revenir à la version courante",
+  });
+  await expect(returnLink).toHaveAttribute(
+    "href",
+    `/subjects/${subjectId}/editor`,
+  );
+  await expect(returnLink).toHaveClass(/button/);
   await expect(
-    page.getByRole("link", { name: "Revenir à la version courante" }),
-  ).toHaveAttribute("href", `/subjects/${subjectId}/editor`);
+    page.getByRole("link", { name: /atelier courant|version courante/i }),
+  ).toHaveCount(1);
   await expect(page.getByRole("textbox")).toHaveCount(0);
 
   const screenshotPath = resolve(

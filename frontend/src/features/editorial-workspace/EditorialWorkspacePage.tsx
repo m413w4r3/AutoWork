@@ -73,7 +73,9 @@ function HistoricalPublicationWorkspacePage({
       >
         <h1 id="history-error">Lecture historique indisponible</h1>
         <p role="alert">Cette version ne peut pas être consultée.</p>
-        <a href={currentVersionHref}>Revenir à la version courante</a>
+        <a className="button button--secondary" href={currentVersionHref}>
+          Revenir à la version courante
+        </a>
       </section>
     );
   }
@@ -87,16 +89,22 @@ function HistoricalPublicationWorkspacePage({
       className="editorial-route-state editorial-route-state--historical"
       aria-labelledby="history-heading"
     >
-      <a href={currentVersionHref}>← Atelier courant</a>
-      <h1 id="history-heading">
-        Atelier éditorial — version {artifact.version}
-      </h1>
+      <header className="editorial-route-state__header">
+        <div>
+          <p className="editorial-topbar__subject">Version historique</p>
+          <h1 id="history-heading">
+            Atelier éditorial — version {artifact.version}
+          </h1>
+        </div>
+        <a className="button button--secondary" href={currentVersionHref}>
+          Revenir à la version courante
+        </a>
+      </header>
       {document ? (
         <PublicationDocumentView
           document={document}
           publicationKind={artifact.publication_kind}
           readOnlyReason={artifact.read_only_reason}
-          currentVersionHref={currentVersionHref}
         />
       ) : (
         <aside className="editorial-readonly-banner" role="note">
@@ -110,9 +118,6 @@ function HistoricalPublicationWorkspacePage({
               ? editorialReadOnlyReasonText(artifact.read_only_reason)
               : "Cette publication ne peut pas être affichée dans cette vue."}
           </p>
-          {artifact.read_only_reason === "historical_version" ? (
-            <a href={currentVersionHref}>Revenir à la version courante</a>
-          ) : null}
         </aside>
       )}
     </section>

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 import type {
   EditorialWorkspaceBlock,
@@ -66,6 +66,7 @@ function BlockActionToolbar({
   onStartEditing,
   onRefresh,
   onAskBridge,
+  onDiscuss,
 }: {
   snapshot: EditorialWorkspaceSnapshot;
   block: EditorialWorkspaceBlock;
@@ -74,6 +75,7 @@ function BlockActionToolbar({
   onStartEditing: (blockId: string) => void;
   onRefresh: () => void;
   onAskBridge: (instruction: string) => void;
+  onDiscuss: () => void;
 }) {
   const operations = new Set(block.allowed_operations);
   const canModify =
@@ -123,9 +125,7 @@ function BlockActionToolbar({
         <button
           className="button button--secondary"
           type="button"
-          disabled
-          aria-label="Discuter. La discussion sera disponible dans une prochaine étape."
-          title="La discussion sera disponible dans une prochaine étape."
+          onClick={onDiscuss}
         >
           Discuter
         </button>
@@ -182,6 +182,26 @@ export function EditorialInspector({
   const [bridgeProposalPrompt, setBridgeProposalPrompt] = useState<
     string | null
   >(null);
+  const [draftEditorBlockId, setDraftEditorBlockId] = useState<string | null>(
+    null,
+  );
+  const conversationRef = useRef<HTMLDivElement>(null);
+  const focusDiscussionComposer = () => {
+    const container = conversationRef.current;
+    const composer = container?.querySelector<HTMLTextAreaElement>(
+      "#editorial-message-composer",
+    );
+    if (composer) {
+      composer.focus({ preventScroll: true });
+      if (typeof composer.scrollIntoView === "function") {
+        composer.scrollIntoView({ block: "nearest" });
+      }
+      return;
+    }
+    if (container && typeof container.scrollIntoView === "function") {
+      container.scrollIntoView({ block: "nearest" });
+    }
+  };
   return (
     <aside className="editorial-inspector" aria-label="Inspecteur éditorial">
       <button
@@ -209,21 +229,32 @@ export function EditorialInspector({
             </p>
             <p className="editorial-inspector__selected-text">{block.text}</p>
             {!isEditing ? (
-              <label className="editorial-local-draft">
-                <span>Brouillon local</span>
-                <textarea
-                  className="editorial-local-draft__input"
-                  aria-label="Brouillon local"
-                  value={localDraftText}
-                  onChange={(event) =>
-                    onLocalDraftChange(event.currentTarget.value)
-                  }
-                  rows={5}
-                />
-                <span className="editorial-local-draft__privacy">
-                  Conservé en mémoire dans cet écran jusqu’à sa fermeture.
-                </span>
-              </label>
+              localDraftText.length > 0 ||
+              draftEditorBlockId === block.block_id ? (
+                <label className="editorial-local-draft">
+                  <span>Brouillon local</span>
+                  <textarea
+                    className="editorial-local-draft__input"
+                    aria-label="Brouillon local"
+                    value={localDraftText}
+                    onChange={(event) =>
+                      onLocalDraftChange(event.currentTarget.value)
+                    }
+                    rows={3}
+                  />
+                  <span className="editorial-local-draft__privacy">
+                    Conservé en mémoire dans cet écran jusqu’à sa fermeture.
+                  </span>
+                </label>
+              ) : (
+                <button
+                  className="editorial-local-draft__toggle"
+                  type="button"
+                  onClick={() => setDraftEditorBlockId(block.block_id)}
+                >
+                  Écrire un brouillon local
+                </button>
+              )
             ) : null}
             <BlockActionToolbar
               snapshot={snapshot}
@@ -233,17 +264,20 @@ export function EditorialInspector({
               onStartEditing={onStartEditing}
               onRefresh={onRefresh}
               onAskBridge={setBridgeProposalPrompt}
+              onDiscuss={focusDiscussionComposer}
             />
-            <EditorialConversation
-              subjectId={subjectId}
-              occurrenceId={block.block_id}
-              snapshotId={snapshot.snapshot_id}
-              targetLabel={block.text ?? BLOCK_KIND_LABELS[block.kind]}
-              allowedOperations={block.allowed_operations}
-              proposalPrompt={bridgeProposalPrompt}
-              onProposalPromptApplied={() => setBridgeProposalPrompt(null)}
-              onChangeTarget={onChangeTarget}
-            />
+            <div ref={conversationRef}>
+              <EditorialConversation
+                subjectId={subjectId}
+                occurrenceId={block.block_id}
+                snapshotId={snapshot.snapshot_id}
+                targetLabel={block.text ?? BLOCK_KIND_LABELS[block.kind]}
+                allowedOperations={block.allowed_operations}
+                proposalPrompt={bridgeProposalPrompt}
+                onProposalPromptApplied={() => setBridgeProposalPrompt(null)}
+                onChangeTarget={onChangeTarget}
+              />
+            </div>
             <section
               className="editorial-evidence"
               aria-labelledby="editorial-evidence-heading"
