@@ -4,6 +4,7 @@ import hashlib
 import os
 from dataclasses import replace
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import cast
 from uuid import UUID, uuid4
 
@@ -14,9 +15,15 @@ from fastapi import FastAPI
 from cti_app.api import editorial_workspace as editorial_workspace_api
 from cti_app.api import main as api_main
 from cti_app.application.editorial_pdf_preview import PublicationPreviewRenderer
+from cti_app.application.editorial_workspace.service import EditorialWorkspaceService
 from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_editorial_enrichment import (
+    build_editorial_enrichment_evidence_pack,
+    compute_editorial_enrichment_input_hash,
+    editorial_enrichment_evidence_pack_hash,
+)
 from cti_app.application.production_extraction import references_corpus_hash
 from cti_app.application.production_references import (
     ProductionReferenceCorpusV1,
@@ -29,12 +36,17 @@ from cti_app.application.production_relevance import build_relevance_projection
 from cti_app.application.production_routing import (
     decide_and_adopt_production_routing,
 )
-from cti_app.application.production_synthesis import canonical_extraction_hash
+from cti_app.application.production_synthesis import (
+    build_synthesis_access_policy,
+    canonical_extraction_hash,
+    synthesis_access_policy_hash,
+)
 from cti_app.application.publication_assembly import PublicationAssemblyService
 from cti_app.application.publication_rendering import (
     PublicationRenderAttempt,
     PublicationRenderService,
 )
+from cti_app.application.source_figure_inventory import load_archived_source_figure_inventory
 from cti_app.application.typst_paths import typst_bundle_paths
 from cti_app.application.typst_rendering import TypstRenderer
 from cti_app.config import Settings
@@ -231,6 +243,8 @@ async def _seed_current_inputs(
         extraction_hash=canonical_extraction_hash(extraction),
     )
     enrichment = _enrichment_seed_content(seeded.production_input, extraction, synthesis)
+    synthesis_payload = production_synthesis_to_json(synthesis)
+    synthesis_artifact_id = uuid4()
 
     references_blob_id = await artifact_store.put_json(
         references_payload, bucket="production-artifacts-canonical"
@@ -242,10 +256,7 @@ async def _seed_current_inputs(
         relevance_projection_to_json(projection), bucket="production-artifacts-canonical"
     )
     synthesis_blob_id = await artifact_store.put_json(
-        production_synthesis_to_json(synthesis), bucket="production-artifacts-canonical"
-    )
-    enrichment_blob_id = await artifact_store.put_json(
-        enrichment.base_payload, bucket="production-artifacts-canonical"
+        synthesis_payload, bucket="production-artifacts-canonical"
     )
 
     references_artifact = ProductionArtifact(
@@ -276,6 +287,7 @@ async def _seed_current_inputs(
         canonical_blob_id=projection_blob_id,
     )
     synthesis_artifact = ProductionArtifact(
+        id=synthesis_artifact_id,
         production_run_id=seeded.run.id,
         subject_id=seeded.subject.id,
         stage=ProductionArtifactStage.SYNTHESIS,
@@ -284,29 +296,90 @@ async def _seed_current_inputs(
         status=ProductionArtifactStatus.VERIFIED,
         canonical_blob_id=synthesis_blob_id,
     )
-
     async with uow_factory() as uow:
-        old_enrichment = await uow.production_artifacts.get_current(
-            seeded.run.id, ProductionArtifactStage.EDITORIAL_ENRICHMENT.value
-        )
-        metadata = dict(old_enrichment.metadata) if old_enrichment is not None else {}
-        metadata["routing_policy_version"] = ROUTING_POLICY_VERSION
         await uow.production_artifacts.append(references_artifact)
         await uow.production_artifacts.append(extraction_artifact)
         await uow.production_artifacts.append(projection_artifact)
         await uow.production_artifacts.append(synthesis_artifact)
-        await uow.production_artifacts.append(
-            ProductionArtifact(
-                production_run_id=seeded.run.id,
-                subject_id=seeded.subject.id,
-                stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
-                version=2,
-                input_hash="e" * 64,
-                status=ProductionArtifactStatus.VERIFIED,
-                metadata=metadata,
-                canonical_blob_id=enrichment_blob_id,
-            )
+        await uow.commit()
+
+    workspace_service = EditorialWorkspaceService(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+    )
+    async with uow_factory() as uow:
+        workspace_record = await workspace_service.snapshot_record_in_uow(uow, seeded.subject.id)
+        await uow.commit()
+    assert workspace_record.synthesis_artifact_id == synthesis_artifact.id
+    assert workspace_record.synthesis_version == synthesis_artifact.version
+    assert workspace_record.enrichment_artifact_id is not None
+
+    collection_service = editorial_workspace_api._collection_service_for_request(
+        SimpleNamespace(app=app)
+    )
+    media_archiver = getattr(collection_service, "source_media_archiver", None)
+    media_policy_sha256 = getattr(media_archiver, "policy_sha256", None)
+    if not isinstance(media_policy_sha256, str):
+        media_policy_sha256 = None
+    async with uow_factory() as uow:
+        access_policy = await build_synthesis_access_policy(
+            seeded.production_input,
+            extraction,
+            uow.source_documents,
+            uow.source_collections,
         )
+        inventory = await load_archived_source_figure_inventory(
+            subject_id=seeded.subject.id,
+            extraction_sources=extraction.sources,
+            source_document_repository=uow.source_documents,
+            blob_repository=uow.blobs,
+            artifact_store=artifact_store,
+            source_media_repository=uow.source_media_candidates,
+            media_policy_sha256=media_policy_sha256,
+        )
+    access_policy_hash = synthesis_access_policy_hash(access_policy)
+    evidence_pack = build_editorial_enrichment_evidence_pack(
+        seeded.production_input,
+        extraction,
+        synthesis,
+        projection,
+        workspace_record,
+    )
+    evidence_pack_hash = editorial_enrichment_evidence_pack_hash(evidence_pack)
+    inventory_hash = inventory.functional_hash()
+    enrichment_input_hash = compute_editorial_enrichment_input_hash(
+        extraction=extraction,
+        synthesis=synthesis,
+        evidence_pack_hash=evidence_pack_hash,
+        access_policy_hash=access_policy_hash,
+        projection_hash=projection.projection_hash,
+        source_figure_inventory_hash=inventory_hash,
+        resource_search_enabled=False,
+    )
+
+    enrichment_blob_id = await artifact_store.put_json(
+        enrichment.base_payload, bucket="production-artifacts-canonical"
+    )
+    enrichment_artifact = ProductionArtifact(
+        id=uuid4(),
+        production_run_id=seeded.run.id,
+        subject_id=seeded.subject.id,
+        stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+        version=2,
+        input_hash=enrichment_input_hash,
+        status=ProductionArtifactStatus.VERIFIED,
+        metadata={
+            "access_policy_hash": access_policy_hash,
+            "synthesis_access_policy_hash": access_policy_hash,
+            "evidence_pack_hash": evidence_pack_hash,
+            "source_figure_inventory_hash": inventory_hash,
+            "routing_policy_version": ROUTING_POLICY_VERSION,
+        },
+        canonical_blob_id=enrichment_blob_id,
+    )
+
+    async with uow_factory() as uow:
+        await uow.production_artifacts.append(enrichment_artifact)
         run = await uow.production_runs.get(seeded.run.id)
         assert run is not None
         expected_version = run.version
@@ -544,6 +617,22 @@ async def test_editorial_pdf_postgres_adoption_regeneration_history_and_composit
     )
     monkeypatch.setattr(editorial_workspace_api, "_proposal_impact_consumer_wired", lambda: True)
     seeded, app, _model_gateway, _old_enrichment = await _ready_for_manual_table_route(uow_factory)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
+    ) as client:
+        initial_snapshot_response = await client.get(
+            f"/api/subjects/{seeded.subject.id}/editor/snapshot"
+        )
+    assert initial_snapshot_response.status_code == 200, initial_snapshot_response.text
+    initial_snapshot = initial_snapshot_response.json()
+    assert initial_snapshot["publication_kind"] == PublicationKind.BRIEF.value
+    initial_anchor = next(
+        block
+        for block in initial_snapshot["blocks"]
+        if block["kind"] in {"paragraph", "lead_paragraph"}
+    )
+    assert initial_anchor["revision_status"] == "ready"
+
     enrichment = await _seed_current_inputs(seeded, app, uow_factory)
     artifact_store = cast(ProductionArtifactStore, app.state.production_artifact_store)
     app.state.publication_render_service = _publication_renderer(app, uow_factory, artifact_store)
@@ -586,7 +675,16 @@ async def test_editorial_pdf_postgres_adoption_regeneration_history_and_composit
             for block in snapshot["blocks"]
             if block["kind"] in {"paragraph", "lead_paragraph"}
         )
+        assert anchor["revision_status"] == "ready"
         anchor_id = UUID(anchor["block_id"])
+        assert anchor_id == UUID(initial_anchor["block_id"])
+        input_artifacts = old_publication.metadata.get("input_artifacts")
+        assert isinstance(input_artifacts, dict)
+        assert input_artifacts["synthesis_artifact_id"] == snapshot["synthesis_artifact_id"]
+        assert (
+            input_artifacts["editorial_enrichment_artifact_id"]
+            == snapshot["enrichment_artifact_id"]
+        )
         evidence = enrichment.base_enrichment.tables[0].rows[0].evidence_refs[0]
         evidence_ref = {
             "source_document_id": str(evidence.source_document_id),
@@ -650,6 +748,9 @@ async def test_editorial_pdf_postgres_adoption_regeneration_history_and_composit
             },
         )
         assert accepted.status_code == 200, accepted.text
+        assert accepted.json()["state"] == EditorialProposalState.ACCEPTED.value
+        assert accepted.json()["impact_state"] == "pending"
+        assert accepted.json()["impact_id"]
 
         stale = await client.get(f"/api/subjects/{seeded.subject.id}/editor/pdf")
         assert stale.status_code == 200, stale.text
