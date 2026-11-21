@@ -2,6 +2,9 @@ import { defineConfig, devices } from "@playwright/test";
 
 export default defineConfig({
   testDir: "./e2e",
+  // Editorial specs intercept requests against their worktree-derived origin
+  // (playwright.editorial.config.ts) and are run by that config only.
+  testIgnore: ["**/editorial/**"],
   timeout: 10_000,
   fullyParallel: true,
   workers: process.env.CI ? 2 : undefined,
