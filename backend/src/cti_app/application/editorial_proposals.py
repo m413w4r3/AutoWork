@@ -2390,7 +2390,8 @@ class EditorialProposalService:
         ).hexdigest()
         if digest != proposal.base_canonical_sha256:
             raise EditorialProposalApplicationError("proposal_base_hash_mismatch")
-        if proposal.operation == TargetedEditorialRevisionOperation.CREATE_TABLE.value:
+        operation = TargetedEditorialRevisionOperation(proposal.operation)
+        if operation.paragraph_enrichment_element_kind is not None:
             if (
                 snapshot.enrichment_artifact_id != proposal.base_artifact_id
                 or snapshot.enrichment_version != proposal.base_artifact_version
@@ -3426,7 +3427,8 @@ def _proposal_pins_match(
     ):
         return False
 
-    if proposal.operation == TargetedEditorialRevisionOperation.CREATE_TABLE.value:
+    operation = TargetedEditorialRevisionOperation(proposal.operation)
+    if operation.paragraph_enrichment_element_kind is not None:
         return (
             resolution.entry.source_stage is EditorialSourceStage.SYNTHESIS
             and resolution.entry.kind

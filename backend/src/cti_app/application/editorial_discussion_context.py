@@ -48,6 +48,7 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
 )
+from cti_app.domain.production_editorial_revision import TargetedEditorialRevisionOperation
 from cti_app.domain.production_extraction import production_extraction_from_json
 from cti_app.domain.production_relevance import (
     relevance_projection_from_json,
@@ -295,6 +296,10 @@ class EditorialDiscussionContextBuilder:
             if isinstance(raw_operations, list)
             else set()
         )
+        paragraph_enrichment_insertions = (
+            offered_operations
+            & TargetedEditorialRevisionOperation.paragraph_enrichment_insertion_values()
+        )
         proposal_target_path = (
             revision_target_path(resolution.entry) if resolution.entry is not None else None
         )
@@ -317,7 +322,7 @@ class EditorialDiscussionContextBuilder:
                             target.get("kind") in {"paragraph", "lead_paragraph"}
                             and (
                                 "rewrite_paragraph" in offered_operations
-                                or "create_table" in offered_operations
+                                or bool(paragraph_enrichment_insertions)
                             )
                         )
                     )
@@ -342,7 +347,7 @@ class EditorialDiscussionContextBuilder:
                 await uow.production_artifacts.get_current(
                     run.id, ProductionArtifactStage.EDITORIAL_ENRICHMENT.value
                 )
-                if run is not None and "create_table" in offered_operations
+                if run is not None and paragraph_enrichment_insertions
                 else None
             )
             current_subject = await uow.subjects.get(origin.subject_id)
@@ -495,17 +500,17 @@ class EditorialDiscussionContextBuilder:
                     paragraph_evidence_context = None
 
         enrichment_proposal_context: Mapping[str, object] | None = None
-        table_admitted: list[EditorialEvidenceEntry] | None = None
-        can_check_table = (
+        enrichment_admitted: list[EditorialEvidenceEntry] | None = None
+        can_check_paragraph_enrichment = (
             stage_value == "synthesis"
             and kind in {"paragraph", "lead_paragraph"}
-            and bool({"create_table", "create_bar_chart"} & offered_operations)
+            and bool(paragraph_enrichment_insertions)
             and synthesis_artifact is not None
             and synthesis_artifact.canonical_blob_id is not None
             and enrichment_artifact is not None
             and enrichment_artifact.canonical_blob_id is not None
         )
-        if can_check_table:
+        if can_check_paragraph_enrichment:
             assert synthesis_artifact is not None
             assert synthesis_artifact.canonical_blob_id is not None
             assert enrichment_artifact is not None
@@ -546,13 +551,13 @@ class EditorialDiscussionContextBuilder:
                     enrichment_read_sha256=enrichment_read_sha256,
                     anchor_registered=anchor_registered,
                 ):
-                    table_records = (
+                    enrichment_records = (
                         *enrichment_pack.narrative_evidence,
                         *enrichment_pack.technical_evidence,
                     )
-                    table_admitted = [
+                    enrichment_admitted = [
                         {"handle": str(item["handle"]), "payload": _object_mapping(item)}
-                        for item in table_records
+                        for item in enrichment_records
                         if isinstance(item.get("handle"), str)
                     ]
                     enrichment_proposal_context = {
@@ -570,17 +575,17 @@ class EditorialDiscussionContextBuilder:
                     }
             except Exception:
                 enrichment_proposal_context = None
-                table_admitted = None
+                enrichment_admitted = None
 
-        if enrichment_proposal_context is not None and table_admitted is not None:
-            admitted = table_admitted
+        if enrichment_proposal_context is not None and enrichment_admitted is not None:
+            admitted = enrichment_admitted
 
         proposal_operations = _supported_proposal_operations(
             stage=stage_value,
             block_kind=str(target.get("kind", "")),
             offered_operations=offered_operations,
             paragraph_validation_ready=paragraph_evidence_context is not None,
-            table_validation_ready=enrichment_proposal_context is not None,
+            enrichment_validation_ready=enrichment_proposal_context is not None,
             bar_chart_validation_ready=(
                 enrichment_proposal_context is not None
                 and "create_bar_chart" in offered_operations
@@ -746,7 +751,7 @@ def _supported_proposal_operations(
     block_kind: str,
     offered_operations: set[str],
     paragraph_validation_ready: bool,
-    table_validation_ready: bool = False,
+    enrichment_validation_ready: bool = False,
     bar_chart_validation_ready: bool = False,
 ) -> tuple[str, ...]:
     if stage != "synthesis":
@@ -757,7 +762,7 @@ def _supported_proposal_operations(
         operations: list[str] = []
         if "rewrite_paragraph" in offered_operations and paragraph_validation_ready:
             operations.append("rewrite_paragraph")
-        if "create_table" in offered_operations and table_validation_ready:
+        if "create_table" in offered_operations and enrichment_validation_ready:
             operations.append("create_table")
         if "create_bar_chart" in offered_operations and bar_chart_validation_ready:
             operations.append("create_bar_chart")
