@@ -91,6 +91,7 @@ from cti_app.domain.editorial_proposal import (
     ManualBarChartPatch,
     ManualPatch,
     ManualSourceFigurePatch,
+    ManualSourceFigureSelection,
     ManualTablePatch,
     ManualTextPatch,
     variant_group_identity,
@@ -741,6 +742,43 @@ def _manual_bar_chart_request_sha256(
                 "occurrence_id": str(occurrence_id),
                 "operation": TargetedEditorialRevisionOperation.CREATE_BAR_CHART.value,
                 "chart": _manual_bar_chart_domain_json(chart),
+            }
+        )
+    ).hexdigest()
+
+
+def _manual_figure_request_sha256(
+    *,
+    subject_id: UUID,
+    snapshot_id: UUID,
+    occurrence_id: UUID,
+    figures: tuple[ManualSourceFigureSelection, ...],
+    references: tuple[ManualSourceFigureArchiveReference, ...],
+) -> str:
+    return hashlib.sha256(
+        ProductionArtifactStore.canonical_json_bytes(
+            {
+                "subject_id": str(subject_id),
+                "snapshot_id": str(snapshot_id),
+                "anchor_block_id": str(occurrence_id),
+                "figures": [
+                    {
+                        "figure_id": str(reference.figure_id),
+                        "source_figure_id": str(reference.source_figure_id),
+                        "caption": selection.caption.strip(),
+                        "order": selection.order,
+                        "production_run_id": str(reference.production_run_id),
+                        "source_document_id": str(reference.source_document_id),
+                        "source_url": reference.source_url,
+                        "sha256": reference.sha256,
+                        "mime_type": reference.mime_type,
+                        "byte_size": reference.byte_size,
+                        "width": reference.width,
+                        "height": reference.height,
+                        "provenance": reference.provenance,
+                    }
+                    for selection, reference in zip(figures, references, strict=True)
+                ],
             }
         )
     ).hexdigest()
@@ -1878,6 +1916,26 @@ class EditorialProposalService:
                 error.code, reason, frame=_exception_origin_frame(error)
             ) from None
 
+        preparation_key = _manual_idempotency_key("prepare", idempotency_key)
+        request_sha256 = _manual_figure_request_sha256(
+            subject_id=subject_id,
+            snapshot_id=snapshot_id,
+            occurrence_id=occurrence_id,
+            figures=typed_patch.figures,
+            references=archive_references,
+        )
+        async with self._uow_factory() as uow:
+            existing = await uow.editorial_proposals.get_by_idempotency_key(
+                subject_id, actor_id, preparation_key
+            )
+        if existing is not None:
+            if existing.request_sha256 != request_sha256:
+                raise _manual_figure_failure(
+                    "proposal_idempotency_conflict",
+                    EditorialFigureDiagnosticReason.IDEMPOTENCY_CONFLICT,
+                )
+            return existing
+
         await self._refuse_read_only_context(subject_id, occurrence_id)
         try:
             context = await self._discussion_context_builder.build_manual(subject_id, occurrence_id)
@@ -1978,47 +2036,6 @@ class EditorialProposalService:
                 _manual_figure_error_reason(error.code),
                 frame=_exception_origin_frame(error),
             ) from None
-
-        preparation_key = _manual_idempotency_key("prepare", idempotency_key)
-        request_payload = {
-            "subject_id": str(subject_id),
-            "snapshot_id": str(snapshot_id),
-            "anchor_block_id": str(occurrence_id),
-            "figures": [
-                {
-                    "figure_id": str(reference.figure_id),
-                    "source_figure_id": str(reference.source_figure_id),
-                    "caption": selection.caption.strip(),
-                    "order": selection.order,
-                    "production_run_id": str(reference.production_run_id),
-                    "source_document_id": str(reference.source_document_id),
-                    "source_url": reference.source_url,
-                    "sha256": reference.sha256,
-                    "mime_type": reference.mime_type,
-                    "byte_size": reference.byte_size,
-                    "width": reference.width,
-                    "height": reference.height,
-                    "provenance": reference.provenance,
-                }
-                for selection, reference in zip(
-                    typed_patch.figures, archive_references, strict=True
-                )
-            ],
-        }
-        request_sha256 = hashlib.sha256(
-            ProductionArtifactStore.canonical_json_bytes(request_payload)
-        ).hexdigest()
-        async with self._uow_factory() as uow:
-            existing = await uow.editorial_proposals.get_by_idempotency_key(
-                subject_id, actor_id, preparation_key
-            )
-        if existing is not None:
-            if existing.request_sha256 != request_sha256:
-                raise _manual_figure_failure(
-                    "proposal_idempotency_conflict",
-                    EditorialFigureDiagnosticReason.IDEMPOTENCY_CONFLICT,
-                )
-            return existing
 
         placement = EnrichmentPlacementV1(
             kind=EnrichmentPlacementKind.AFTER_PARAGRAPH,
