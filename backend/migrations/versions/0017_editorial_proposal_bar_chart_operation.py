@@ -39,34 +39,66 @@ _NEW_OPERATION_VALUES = (
     "'replace_source_figure', 'delete_source_figure'"
 )
 
+_OLD_OPERATION_SET = frozenset(re.findall(r"'([a-z_]+)'", _OLD_OPERATION_VALUES))
+_NEW_OPERATION_SET = frozenset(re.findall(r"'([a-z_]+)'", _NEW_OPERATION_VALUES))
 
-def _normalize_sql(value: str | None) -> str | None:
-    if value is None:
-        return None
-    normalized = value.lower()
-    normalized = re.sub(r"::(?:character varying|text)(?:\[\])?", "", normalized)
-    normalized = re.sub(
-        r"=\s*any\s*\(\s*\(\s*array\s*\[(.*?)\]\s*\)\s*\)",
-        r"in (\1)",
-        normalized,
-    )
-    normalized = re.sub(r"\(([a-z_][a-z0-9_.]*)\)", r"\1", normalized)
-    normalized = re.sub(r"\s+", " ", normalized).strip()
+_SQL_OPERATION_VALUE = r"'[a-z_]+'(?:\s*::\s*(?:character varying|text))?"
+_SQL_OPERATION_VALUE_LIST = rf"(?P<values>{_SQL_OPERATION_VALUE}(?:\s*,\s*{_SQL_OPERATION_VALUE})*)"
+_SQL_OPERATION_COLUMN = r"(?:operation|\(\s*operation\s*\))"
+_SQL_OPERATION_CAST = r"(?:\s*::\s*(?:character varying|text))?"
+_OPERATION_IN_CHECK = re.compile(
+    rf"{_SQL_OPERATION_COLUMN}{_SQL_OPERATION_CAST}\s+IN\s*"
+    rf"\(\s*{_SQL_OPERATION_VALUE_LIST}\s*\)",
+    re.IGNORECASE,
+)
+_OPERATION_ARRAY_CHECK = re.compile(
+    rf"{_SQL_OPERATION_COLUMN}{_SQL_OPERATION_CAST}\s*=\s*ANY\s*\(\s*"
+    rf"\(?\s*ARRAY\s*\[\s*{_SQL_OPERATION_VALUE_LIST}\s*\]\s*\)?"
+    rf"\s*(?:::\s*text\s*\[\])?\s*\)",
+    re.IGNORECASE,
+)
+
+
+def _strip_outer_parentheses(value: str) -> str:
+    normalized = value.strip()
     while normalized.startswith("(") and normalized.endswith(")"):
         depth = 0
+        in_string = False
         closes_at_end = True
-        for index, character in enumerate(normalized):
-            if character == "(":
+        index = 0
+        while index < len(normalized):
+            character = normalized[index]
+            if character == "'":
+                if in_string and index + 1 < len(normalized) and normalized[index + 1] == "'":
+                    index += 2
+                    continue
+                in_string = not in_string
+            elif not in_string and character == "(":
                 depth += 1
-            elif character == ")":
+            elif not in_string and character == ")":
                 depth -= 1
+                if depth < 0:
+                    closes_at_end = False
+                    break
                 if depth == 0 and index != len(normalized) - 1:
                     closes_at_end = False
                     break
-        if not closes_at_end or depth != 0:
+            index += 1
+        if in_string or depth != 0 or not closes_at_end:
             break
         normalized = normalized[1:-1].strip()
     return normalized
+
+
+def _parse_operation_check_values(sqltext: str | None) -> list[str] | None:
+    if sqltext is None:
+        return None
+    expression = _strip_outer_parentheses(sqltext)
+    for pattern in (_OPERATION_IN_CHECK, _OPERATION_ARRAY_CHECK):
+        match = pattern.fullmatch(expression)
+        if match is not None:
+            return re.findall(r"'([a-z_]+)'", match.group("values"))
+    return None
 
 
 def _operation_check_state(bind: Connection) -> str:
@@ -86,10 +118,20 @@ def _operation_check_state(bind: Connection) -> str:
             f"{_TABLE} preflight rejected: expected only {_CONSTRAINT}, actual {names}"
         )
 
-    actual_sql = _normalize_sql(str(operation_checks[0].get("sqltext")))
-    if actual_sql == _normalize_sql(f"operation IN ({_OLD_OPERATION_VALUES})"):
+    actual_values = _parse_operation_check_values(str(operation_checks[0].get("sqltext", "")))
+    if actual_values is None:
+        raise RuntimeError(
+            f"{_TABLE} preflight rejected: {_CONSTRAINT} has an unexpected definition"
+        )
+    if len(actual_values) != len(set(actual_values)):
+        raise RuntimeError(
+            f"{_TABLE} preflight rejected: {_CONSTRAINT} contains duplicate operation values"
+        )
+
+    actual_set = set(actual_values)
+    if actual_set == _OLD_OPERATION_SET:
         return "old"
-    if actual_sql == _normalize_sql(f"operation IN ({_NEW_OPERATION_VALUES})"):
+    if actual_set == _NEW_OPERATION_SET:
         return "new"
     raise RuntimeError(f"{_TABLE} preflight rejected: {_CONSTRAINT} has an unexpected definition")
 

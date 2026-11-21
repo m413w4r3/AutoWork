@@ -173,7 +173,8 @@ def test_editorial_grounding_rejects_newlines_and_tabs_for_title_text() -> None:
     "origin",
     (EditorialProposalOrigin.MANUAL_PATCH, EditorialProposalOrigin.BRIDGE_DRAFT),
 )
-def test_title_rewrite_rejects_unknown_technical_literals_for_every_origin(origin) -> None:
+@pytest.mark.asyncio
+async def test_title_rewrite_rejects_unknown_technical_literals_for_every_origin(origin) -> None:
     from cti_app.application.editorial_proposals import _manual_wire_response
 
     setup = _setup()
@@ -194,7 +195,7 @@ def test_title_rewrite_rejects_unknown_technical_literals_for_every_origin(origi
         raw_response=raw_response,
     )
 
-    _patch, state, _event, diagnostics = setup.service._validate_result(candidate)
+    _patch, state, _event, diagnostics = await setup.service._validate_result(candidate)
 
     assert state.value == "needs_review"
     assert diagnostics["code"] == "manual_edit_new_fact_unadmitted"
