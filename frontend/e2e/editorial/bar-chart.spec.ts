@@ -11,6 +11,7 @@ import type {
 import {
   EDITORIAL_APP_ORIGIN,
   EDITORIAL_FIXTURES,
+  fulfillEditorialReadStatuses,
 } from "./fixtures/editorialApi";
 
 const subjectId = EDITORIAL_FIXTURES.subject.id;
@@ -151,10 +152,20 @@ function createSnapshot(withChart: boolean): EditorialWorkspaceSnapshot {
       manual_edit: true,
       can_add_enrichment: true,
       can_preview_pdf: true,
+      can_regenerate_pdf: false,
     },
     preview_status: "READY",
     impact_status: withChart ? "pending" : "none",
     pdf_status: "CURRENT",
+    pdf_artifact_id: null,
+    pdf_artifact_version: null,
+    pdf_artifact_input_hash: null,
+    pdf_artifact_canonical_sha256: null,
+    pdf_render_id: null,
+    pdf_render_identity: null,
+    pdf_error_code: null,
+    pdf_error_message: null,
+    pdf_url: null,
     snapshot_id: withChart
       ? "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
       : "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab",
@@ -247,6 +258,11 @@ async function installRoutes(page: Page, respondWithInsufficientData = false) {
       return;
     }
     requests.push(`${method} ${url.pathname}`);
+    if (
+      await fulfillEditorialReadStatuses(route, method, url.pathname, snapshot)
+    ) {
+      return;
+    }
     if (method === "GET" && url.pathname === snapshotPath) {
       await route.fulfill({ json: snapshot });
       return;

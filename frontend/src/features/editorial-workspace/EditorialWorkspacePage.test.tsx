@@ -59,10 +59,20 @@ function createSnapshot(
       manual_edit: true,
       can_add_enrichment: false,
       can_preview_pdf: false,
+      can_regenerate_pdf: false,
     },
     preview_status: "READY",
     impact_status: impactStatus,
     pdf_status: "CURRENT",
+    pdf_artifact_id: null,
+    pdf_artifact_version: null,
+    pdf_artifact_input_hash: null,
+    pdf_artifact_canonical_sha256: null,
+    pdf_render_id: null,
+    pdf_render_identity: null,
+    pdf_error_code: null,
+    pdf_error_message: null,
+    pdf_url: null,
     snapshot_id:
       version === 1
         ? "ffffffff-ffff-4fff-8fff-ffffffffffff"

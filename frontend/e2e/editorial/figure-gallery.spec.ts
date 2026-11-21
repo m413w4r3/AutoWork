@@ -12,6 +12,7 @@ import type {
 import {
   EDITORIAL_APP_ORIGIN,
   EDITORIAL_FIXTURES,
+  fulfillEditorialReadStatuses,
 } from "./fixtures/editorialApi";
 
 const subjectId = EDITORIAL_FIXTURES.subject.id;
@@ -120,10 +121,20 @@ const snapshot: EditorialWorkspaceSnapshot = {
     manual_edit: false,
     can_add_enrichment: false,
     can_preview_pdf: true,
+    can_regenerate_pdf: false,
   },
   preview_status: "READY",
   impact_status: "none",
   pdf_status: "CURRENT",
+  pdf_artifact_id: null,
+  pdf_artifact_version: null,
+  pdf_artifact_input_hash: null,
+  pdf_artifact_canonical_sha256: null,
+  pdf_render_id: null,
+  pdf_render_identity: null,
+  pdf_error_code: null,
+  pdf_error_message: null,
+  pdf_url: null,
   snapshot_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
 };
 
@@ -144,6 +155,11 @@ async function stubEditorApi(page: Page): Promise<string[]> {
     }
     if (!url.pathname.startsWith("/api/")) {
       await route.continue();
+      return;
+    }
+    if (
+      await fulfillEditorialReadStatuses(route, method, url.pathname, snapshot)
+    ) {
       return;
     }
     if (method === "GET" && url.pathname === subjectPath) {

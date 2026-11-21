@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 
 import type {
+  EditorialCompositionStatusView,
+  EditorialPdfStatusView,
   EditorialWorkspaceBlock,
   EditorialWorkspaceSnapshot,
 } from "../../api/editorialWorkspace";
@@ -12,16 +14,24 @@ import { EditorialOutline } from "./EditorialOutline";
 import { EditorialServerDraftStatus } from "./EditorialServerDraftStatus";
 import { SourceFigureGallery } from "./SourceFigureGallery";
 import { EditorialTopBar } from "./EditorialTopBar";
+import { EditorialHistory } from "./EditorialHistory";
 
 interface EditorialWorkspaceLayoutProps {
   subjectId: string;
   snapshot: EditorialWorkspaceSnapshot;
+  pdfStatus?: EditorialPdfStatusView;
+  pdfStatusUnavailable?: boolean;
+  pdfRegenerationPending?: boolean;
+  pdfRegenerationError?: string | null;
+  compositionStatus?: EditorialCompositionStatusView;
   localDrafts: EditorialDraftController;
   selectedBlockId: string | null;
   localDraftText: string;
   onSelectBlock: (blockId: string) => void;
   onLocalDraftChange: (blockId: string, text: string) => void;
   onRefresh: () => void;
+  onRefreshPdfStatus?: () => void;
+  onRegeneratePdf?: () => void;
   onSave?: InlineTextEditorProps["onSave"];
 }
 
@@ -50,34 +60,59 @@ function selectedSection(
 export function EditorialWorkspaceLayout({
   subjectId,
   snapshot,
+  pdfStatus,
+  pdfStatusUnavailable,
+  pdfRegenerationPending,
+  pdfRegenerationError,
+  compositionStatus,
   localDrafts,
   selectedBlockId,
   localDraftText,
   onSelectBlock,
   onLocalDraftChange,
   onRefresh,
+  onRefreshPdfStatus,
+  onRegeneratePdf,
   onSave,
 }: EditorialWorkspaceLayoutProps) {
   const [openPanel, setOpenPanel] = useState<OpenPanel>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [technicalOpen, setTechnicalOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [figureGalleryOpen, setFigureGalleryOpen] = useState(false);
   const [editingBlockId, setEditingBlockId] = useState<string | null>(null);
   const overlayOpenerRef = useRef<HTMLElement | null>(null);
   const leaveConfirmedRef = useRef(false);
+  const linkedThreadHandledRef = useRef(false);
   // The snapshot's `blocks` array is already the server-resolved document
   // order. `enrichments` is a companion projection of those same block IDs.
   const ordered = snapshot.blocks;
   const selectedBlock =
     ordered.find((block) => block.block_id === selectedBlockId) ?? null;
   const readOnly = snapshot.publication_kind === null;
-  const stale =
-    snapshot.preview_status === "STALE" ||
-    snapshot.blocks.some((block) => block.revision_status === "stale");
+  const stale = snapshot.blocks.some(
+    (block) => block.revision_status === "stale",
+  );
   const activeSection = selectedSection(selectedBlock, ordered);
   const sectionTitle = activeSection?.text ?? null;
   const activeSectionId = activeSection?.block_id ?? null;
   const workspacePath = `/subjects/${encodeURIComponent(subjectId)}/editor`;
+
+  useEffect(() => {
+    if (linkedThreadHandledRef.current) return;
+    const occurrenceId = new URLSearchParams(window.location.search).get(
+      "thread",
+    );
+    if (
+      !occurrenceId ||
+      !ordered.some((block) => block.block_id === occurrenceId)
+    ) {
+      return;
+    }
+    linkedThreadHandledRef.current = true;
+    onSelectBlock(occurrenceId);
+    setOpenPanel("inspector");
+  }, [onSelectBlock, ordered]);
 
   const canEditBlock = (block: EditorialWorkspaceBlock | null) =>
     Boolean(
@@ -284,6 +319,18 @@ export function EditorialWorkspaceLayout({
     });
   };
 
+  const openHistory = () => {
+    setHistoryOpen(true);
+    setMenuOpen(false);
+  };
+
+  const openHistoryThread = (occurrenceId: string) => {
+    setHistoryOpen(false);
+    selectBlock(occurrenceId);
+    setOpenPanel("inspector");
+    setMenuOpen(false);
+  };
+
   return (
     <section
       className="editorial-workspace"
@@ -292,6 +339,11 @@ export function EditorialWorkspaceLayout({
       <EditorialTopBar
         subjectId={subjectId}
         snapshot={snapshot}
+        pdfStatus={pdfStatus}
+        pdfStatusUnavailable={pdfStatusUnavailable}
+        pdfRegenerationPending={pdfRegenerationPending}
+        pdfRegenerationError={pdfRegenerationError}
+        compositionStatus={compositionStatus}
         stale={stale}
         hasLocalDrafts={localDrafts.hasDrafts}
         hasStaleLocalDrafts={localDrafts.hasStaleDrafts}
@@ -301,8 +353,19 @@ export function EditorialWorkspaceLayout({
         onOpenTechnicalDetails={openTechnicalDetails}
         onTechnicalOpenChange={setTechnicalOpen}
         onRefresh={onRefresh}
+        onRefreshPdfStatus={onRefreshPdfStatus}
+        onRegeneratePdf={onRegeneratePdf}
+        onOpenHistory={openHistory}
         onNavigateAway={allowNavigationAway}
       />
+
+      {historyOpen ? (
+        <EditorialHistory
+          subjectId={subjectId}
+          onClose={() => setHistoryOpen(false)}
+          onOpenThread={openHistoryThread}
+        />
+      ) : null}
 
       <EditorialServerDraftStatus
         subjectId={subjectId}

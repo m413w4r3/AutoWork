@@ -111,10 +111,20 @@ const snapshot: EditorialWorkspaceSnapshot = {
     manual_edit: false,
     can_add_enrichment: false,
     can_preview_pdf: true,
+    can_regenerate_pdf: false,
   },
   preview_status: "READY",
   impact_status: "none",
   pdf_status: "CURRENT",
+  pdf_artifact_id: null,
+  pdf_artifact_version: null,
+  pdf_artifact_input_hash: null,
+  pdf_artifact_canonical_sha256: null,
+  pdf_render_id: null,
+  pdf_render_identity: null,
+  pdf_error_code: null,
+  pdf_error_message: null,
+  pdf_url: null,
   snapshot_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
 };
 
@@ -389,14 +399,20 @@ describe("atelier éditorial", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
-  it("annonce un snapshot périmé et propose une actualisation sûre", async () => {
-    renderApp(editorResponse(200, { ...snapshot, preview_status: "STALE" }));
+  it("annonce un PDF obsolète et propose une régénération explicite", async () => {
+    renderApp(
+      editorResponse(200, {
+        ...snapshot,
+        preview_status: "STALE",
+        capabilities: { ...snapshot.capabilities, can_regenerate_pdf: true },
+      }),
+    );
 
     expect(
       await screen.findByRole("status", { name: /PDF obsolète/i }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Actualiser le statut" }),
+      screen.getByRole("button", { name: "Régénérer le PDF" }),
     ).toBeInTheDocument();
   });
 

@@ -2876,3 +2876,185 @@ main:has(> .editorial-route-state) > .app-header {
     transition-duration: 0.01ms;
   }
 }
+/* T-M7-26 additions: server-backed PDF state, composition notice, and history. */
+.editorial-pdf-status__error,
+.editorial-composition-stale,
+.editorial-history {
+  grid-column: 1 / -1;
+}
+
+.editorial-pdf-status__error {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem 0.9rem;
+  padding: 0.65rem 1rem;
+  border-top: 1px solid var(--editorial-control-border);
+  color: var(--editorial-warning);
+  font-size: 0.875rem;
+}
+
+.editorial-pdf-status__error p {
+  margin: 0;
+}
+
+.editorial-composition-stale {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem 0.75rem;
+  margin: 0;
+  padding: 0.5rem 1rem;
+  border-top: 1px solid var(--editorial-control-border);
+  color: var(--editorial-muted);
+  font-size: 0.85rem;
+}
+
+.editorial-composition-stale a,
+.editorial-history__thread-link {
+  color: var(--editorial-link);
+  font-weight: 650;
+  text-decoration: underline;
+  text-underline-offset: 0.15em;
+}
+
+.editorial-history {
+  margin: 0;
+  padding: 1rem 1.25rem;
+  border: 1px solid var(--editorial-control-border);
+  border-radius: 0.75rem;
+  background: var(--editorial-white);
+  box-shadow: 0 8px 26px rgb(23 33 29 / 8%);
+}
+
+.editorial-history__header,
+.editorial-history__item-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem 1rem;
+}
+
+.editorial-history__eyebrow {
+  margin: 0 0 0.15rem;
+  color: var(--editorial-muted);
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.editorial-history h2,
+.editorial-history h3 {
+  margin: 0;
+  color: var(--editorial-ink);
+}
+
+.editorial-history h2 {
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 1.35rem;
+  font-weight: 500;
+}
+
+.editorial-history h3 {
+  font-size: 1rem;
+}
+
+.editorial-history__state {
+  margin: 1rem 0 0;
+  color: var(--editorial-muted);
+}
+
+.editorial-history__state[role="alert"] {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1rem;
+  color: var(--editorial-warning);
+}
+
+.editorial-history__list {
+  display: grid;
+  max-height: min(42rem, 60vh);
+  gap: 0.75rem;
+  margin: 1rem 0 0;
+  padding: 0.15rem 0.4rem 0.15rem 1.5rem;
+  overflow: auto;
+}
+
+.editorial-history__item {
+  padding: 0.85rem 1rem;
+  border: 1px solid var(--editorial-control-border);
+  border-radius: 0.6rem;
+  background: var(--editorial-panel);
+}
+
+.editorial-history__state-label {
+  color: var(--editorial-link);
+  font-size: 0.84rem;
+  font-weight: 700;
+}
+
+.editorial-history__summary,
+.editorial-history__technical dl {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.5rem 1rem;
+  margin: 0.75rem 0;
+}
+
+.editorial-history__summary dt,
+.editorial-history__technical dt {
+  color: var(--editorial-muted);
+  font-size: 0.74rem;
+  font-weight: 650;
+}
+
+.editorial-history__summary dd,
+.editorial-history__technical dd {
+  margin: 0.1rem 0 0;
+  overflow-wrap: anywhere;
+  color: var(--editorial-ink);
+  font-size: 0.85rem;
+}
+
+.editorial-history__thread-link {
+  display: inline-flex;
+  min-height: 2.25rem;
+  align-items: center;
+  margin: 0.1rem 1rem 0.25rem 0;
+}
+
+.editorial-history__technical {
+  color: var(--editorial-technical);
+  font-size: 0.8rem;
+}
+
+.editorial-history__technical summary {
+  display: inline-flex;
+  min-height: 2.25rem;
+  align-items: center;
+  cursor: pointer;
+}
+
+.editorial-history__technical dl {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  padding: 0.75rem;
+  border: 1px solid var(--editorial-control-border);
+  border-radius: 0.5rem;
+  background: var(--editorial-white);
+}
+
+.editorial-history__load-more {
+  margin-top: 0.85rem;
+}
+
+.editorial-history button:focus-visible,
+.editorial-history a:focus-visible,
+.editorial-history summary:focus-visible,
+.editorial-composition-stale a:focus-visible,
+.editorial-pdf-status__error button:focus-visible {
+  outline: 3px solid var(--editorial-focus-ring);
+  outline-offset: 3px;
+}

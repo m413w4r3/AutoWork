@@ -11,6 +11,7 @@ import type {
 import {
   EDITORIAL_APP_ORIGIN,
   EDITORIAL_FIXTURES,
+  fulfillEditorialReadStatuses,
 } from "./fixtures/editorialApi";
 
 const subjectId = EDITORIAL_FIXTURES.subject.id;
@@ -67,10 +68,20 @@ function createSnapshot(
       manual_edit: false,
       can_add_enrichment: false,
       can_preview_pdf: false,
+      can_regenerate_pdf: false,
     },
     preview_status: "READY",
     impact_status: impactStatus,
     pdf_status: "CURRENT",
+    pdf_artifact_id: null,
+    pdf_artifact_version: null,
+    pdf_artifact_input_hash: null,
+    pdf_artifact_canonical_sha256: null,
+    pdf_render_id: null,
+    pdf_render_identity: null,
+    pdf_error_code: null,
+    pdf_error_message: null,
+    pdf_url: null,
     snapshot_id:
       version === 4
         ? "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
@@ -176,6 +187,22 @@ async function installApiStubs(page: Page, mode: "accept" | "conflict") {
     }
     if (!url.pathname.startsWith("/api/")) {
       await route.continue();
+      return;
+    }
+    if (
+      await fulfillEditorialReadStatuses(
+        route,
+        method,
+        url.pathname,
+        createSnapshot(
+          accepted
+            ? "Synthetic accepted paragraph in the current document."
+            : "Synthetic current paragraph in the editorial thread.",
+          accepted ? "up_to_date" : "none",
+          accepted ? 5 : 4,
+        ),
+      )
+    ) {
       return;
     }
     if (

@@ -1,10 +1,18 @@
-import { subjectPublicationPdfUrl } from "../../api/subjectContent";
-import type { EditorialWorkspaceSnapshot } from "../../api/editorialWorkspace";
+import type {
+  EditorialCompositionStatusView,
+  EditorialPdfStatusView,
+  EditorialWorkspaceSnapshot,
+} from "../../api/editorialWorkspace";
 import { navigate } from "../../navigation";
 
 interface EditorialTopBarProps {
   subjectId: string;
   snapshot: EditorialWorkspaceSnapshot;
+  pdfStatus?: EditorialPdfStatusView;
+  pdfStatusUnavailable?: boolean;
+  pdfRegenerationPending?: boolean;
+  pdfRegenerationError?: string | null;
+  compositionStatus?: EditorialCompositionStatusView;
   stale: boolean;
   hasLocalDrafts?: boolean;
   hasStaleLocalDrafts?: boolean;
@@ -14,10 +22,16 @@ interface EditorialTopBarProps {
   onOpenTechnicalDetails: () => void;
   onTechnicalOpenChange: (open: boolean) => void;
   onRefresh: () => void;
+  onRefreshPdfStatus?: () => void;
+  onRegeneratePdf?: () => void;
+  onOpenHistory?: () => void;
   onNavigateAway?: () => boolean;
 }
 
-function technicalDetailRows(snapshot: EditorialWorkspaceSnapshot) {
+function technicalDetailRows(
+  snapshot: EditorialWorkspaceSnapshot,
+  pdfStatus?: EditorialPdfStatusView,
+) {
   return [
     ["Identifiant du snapshot", snapshot.snapshot_id],
     ["Identifiant du sujet", snapshot.subject_id],
@@ -30,12 +44,24 @@ function technicalDetailRows(snapshot: EditorialWorkspaceSnapshot) {
     ["Artefact de publication", snapshot.publication_artifact_id ?? "—"],
     ["Version de publication", String(snapshot.publication_version ?? "—")],
     ["Génération du pipeline", String(snapshot.pipeline_generation)],
+    ["Identifiant du PDF", pdfStatus?.artifact_id ?? "—"],
+    ["Version du PDF", String(pdfStatus?.artifact_version ?? "—")],
+    ["Hash des entrées du PDF", pdfStatus?.artifact_input_hash ?? "—"],
+    ["SHA-256 canonique du PDF", pdfStatus?.artifact_canonical_sha256 ?? "—"],
+    ["Identifiant du rendu PDF", pdfStatus?.render_id ?? "—"],
+    ["Identité exacte du rendu PDF", pdfStatus?.render_identity ?? "—"],
+    ["Code d’erreur PDF", pdfStatus?.error_code ?? "—"],
   ] as const;
 }
 
 export function EditorialTopBar({
   subjectId,
   snapshot,
+  pdfStatus,
+  pdfStatusUnavailable = false,
+  pdfRegenerationPending = false,
+  pdfRegenerationError = null,
+  compositionStatus,
   stale,
   hasLocalDrafts = false,
   hasStaleLocalDrafts = false,
@@ -45,6 +71,9 @@ export function EditorialTopBar({
   onOpenTechnicalDetails,
   onTechnicalOpenChange,
   onRefresh,
+  onRefreshPdfStatus,
+  onRegeneratePdf,
+  onOpenHistory,
   onNavigateAway = () => true,
 }: EditorialTopBarProps) {
   const title =
@@ -52,38 +81,38 @@ export function EditorialTopBar({
     "Document éditorial";
   const shortTitle =
     title.length > 64 ? `${title.slice(0, 61).trimEnd()}…` : title;
-  const statusLabel =
-    snapshot.preview_status === "STALE"
+  const currentPdfStatus = pdfStatus?.status ?? snapshot.preview_status;
+  const statusLabel = pdfStatusUnavailable
+    ? "Statut PDF indisponible"
+    : currentPdfStatus === "STALE"
       ? "PDF obsolète"
-      : stale
-        ? "Version périmée"
-        : hasStaleLocalDrafts
-          ? "Version périmée"
-          : hasLocalDrafts
-            ? "Brouillon local"
-            : snapshot.preview_status === "IN_PROGRESS"
-              ? "Aperçu en cours"
-              : snapshot.preview_status === "FAILED"
-                ? "PDF indisponible"
-                : "À jour";
-  const statusDescription =
-    snapshot.preview_status === "STALE"
-      ? snapshot.impact_status === "failed"
-        ? "Le traitement de l’impact sera retenté automatiquement et peut être rejoué sans annuler l’édition. La prévisualisation PDF se relance depuis l’écran d’aperçu de l’édition."
-        : snapshot.impact_status === "pending" ||
-            snapshot.impact_status === "running"
-          ? "Le traitement de l’impact est en cours. La prévisualisation PDF se relance depuis l’écran d’aperçu de l’édition."
-          : "La publication affichée est périmée. La prévisualisation PDF se relance depuis l’écran d’aperçu de l’édition."
-      : stale
-        ? "Le document a changé. Actualisez le statut de l’atelier."
-        : hasStaleLocalDrafts
-          ? "La version du document a changé depuis ce brouillon. Il est conservé et n’a pas été appliqué à la version actuelle."
-          : hasLocalDrafts
-            ? "Un brouillon de ce bloc n’est pas encore enregistré comme nouvelle version canonique."
-            : snapshot.preview_status === "IN_PROGRESS"
-              ? "Le rendu de l’aperçu est en cours. Le document reste consultable."
-              : snapshot.preview_status === "FAILED"
-                ? "L’aperçu PDF est indisponible."
+      : currentPdfStatus === "GENERATING"
+        ? "Génération du PDF en cours"
+        : currentPdfStatus === "FAILED"
+          ? "Erreur de rendu du PDF"
+          : stale || hasStaleLocalDrafts
+            ? "Version périmée"
+            : hasLocalDrafts
+              ? "Brouillon local"
+              : "À jour";
+  const pdfErrorMessage =
+    pdfRegenerationError ??
+    pdfStatus?.error_message ??
+    "La génération du PDF a échoué. Vérifiez la configuration Typst avant de relancer le rendu.";
+  const statusDescription = pdfStatusUnavailable
+    ? "L’état du PDF n’a pas pu être lu. Actualisez son statut avant de relancer une génération."
+    : currentPdfStatus === "STALE"
+      ? "Le PDF correspond à une version antérieure du document. Régénérez l’aperçu pour consulter la version actuelle."
+      : currentPdfStatus === "GENERATING"
+        ? "La génération du PDF est en cours. Le document reste consultable."
+        : currentPdfStatus === "FAILED"
+          ? pdfErrorMessage
+          : stale
+            ? "Le document a changé. Actualisez le statut de l’atelier."
+            : hasStaleLocalDrafts
+              ? "La version du document a changé depuis ce brouillon. Il est conservé et n’a pas été appliqué à la version actuelle."
+              : hasLocalDrafts
+                ? "Un brouillon de ce bloc n’est pas encore enregistré comme nouvelle version canonique."
                 : "Le document affiché correspond à la dernière version canonique enregistrée.";
   const publicationKindLabel =
     snapshot.publication_kind === "article"
@@ -91,18 +120,25 @@ export function EditorialTopBar({
       : snapshot.publication_kind === "brief"
         ? "Brève"
         : "Type indéterminé";
+  const pdfUrl = pdfStatus ? pdfStatus.pdf_url : snapshot.pdf_url;
   const canOpenPdf =
+    !pdfStatusUnavailable &&
+    currentPdfStatus === "READY" &&
     snapshot.capabilities.can_preview_pdf &&
-    snapshot.publication_artifact_id !== null &&
-    snapshot.publication_version !== null &&
+    pdfUrl !== null &&
     !stale;
+  const canRegeneratePdf =
+    snapshot.capabilities.can_regenerate_pdf &&
+    (currentPdfStatus === "STALE" ||
+      currentPdfStatus === "GENERATING" ||
+      currentPdfStatus === "FAILED");
 
   return (
     <header className="editorial-topbar">
       <div className="editorial-topbar__identity">
         <div className="editorial-topbar__back">
           <a
-            href={`/subjects/${subjectId}`}
+            href={`/subjects/${encodeURIComponent(subjectId)}`}
             onClick={(event) => {
               if (
                 event.button !== 0 ||
@@ -114,7 +150,8 @@ export function EditorialTopBar({
                 return;
               }
               event.preventDefault();
-              if (onNavigateAway()) navigate(`/subjects/${subjectId}`);
+              if (onNavigateAway())
+                navigate(`/subjects/${encodeURIComponent(subjectId)}`);
             }}
           >
             ← Retour au sujet
@@ -136,18 +173,21 @@ export function EditorialTopBar({
         <span
           className={
             "editorial-status" +
-            (stale || hasStaleLocalDrafts ? " editorial-status--attention" : "")
+            (stale || hasStaleLocalDrafts || currentPdfStatus !== "READY"
+              ? " editorial-status--attention"
+              : "")
           }
           role="status"
           aria-live="polite"
+          aria-atomic="true"
           aria-label={`${statusLabel}. ${statusDescription}`}
         >
           {statusLabel}
         </span>
-        {canOpenPdf ? (
+        {canOpenPdf && pdfUrl ? (
           <a
             className="button button--secondary editorial-topbar__pdf"
-            href={subjectPublicationPdfUrl(subjectId)}
+            href={pdfUrl}
             target="_blank"
             rel="noreferrer"
           >
@@ -158,11 +198,27 @@ export function EditorialTopBar({
             className="button button--secondary editorial-topbar__pdf"
             type="button"
             disabled
-            title="Aucun aperçu PDF disponible pour cette version."
+            title="Aucun aperçu PDF à jour n’est disponible pour cette version."
           >
             Voir le PDF
           </button>
         )}
+        {canRegeneratePdf ? (
+          <button
+            className="button button--secondary editorial-topbar__pdf-regenerate"
+            type="button"
+            disabled={
+              currentPdfStatus === "GENERATING" ||
+              pdfRegenerationPending ||
+              pdfStatusUnavailable
+            }
+            onClick={onRegeneratePdf}
+          >
+            {pdfRegenerationPending
+              ? "Génération en cours…"
+              : "Régénérer le PDF"}
+          </button>
+        ) : null}
         <div className="editorial-topbar__menu-wrap">
           <button
             className="button button--secondary"
@@ -179,8 +235,7 @@ export function EditorialTopBar({
               <button
                 type="button"
                 role="menuitem"
-                disabled
-                title="L’historique sera disponible dans une prochaine étape."
+                onClick={() => onOpenHistory?.()}
               >
                 Historique
               </button>
@@ -195,6 +250,38 @@ export function EditorialTopBar({
           ) : null}
         </div>
       </div>
+      {pdfStatusUnavailable ? (
+        <div className="editorial-pdf-status__error" role="alert">
+          <p>{statusDescription}</p>
+          {onRefreshPdfStatus ? (
+            <button
+              className="button button--secondary"
+              type="button"
+              onClick={onRefreshPdfStatus}
+            >
+              Actualiser le statut PDF
+            </button>
+          ) : null}
+        </div>
+      ) : currentPdfStatus === "FAILED" || pdfRegenerationError ? (
+        <div className="editorial-pdf-status__error" role="alert">
+          <p>{pdfErrorMessage}</p>
+          <p>
+            Corrigez le problème signalé, puis lancez explicitement un nouveau
+            rendu.
+          </p>
+        </div>
+      ) : null}
+      {compositionStatus?.status === "stale" ? (
+        <p className="editorial-composition-stale" role="status">
+          Composition à mettre à jour
+          <a
+            href={`/editions/${encodeURIComponent(compositionStatus.edition_id)}/composition`}
+          >
+            Ouvrir la composition
+          </a>
+        </p>
+      ) : null}
       {snapshot.publication_kind === null ? (
         <p className="editorial-readonly-note" role="note">
           Le type de publication est indéterminé. L’atelier reste en lecture
@@ -220,7 +307,7 @@ export function EditorialTopBar({
       >
         <summary>Détails techniques</summary>
         <dl>
-          {technicalDetailRows(snapshot).map(([label, value]) => (
+          {technicalDetailRows(snapshot, pdfStatus).map(([label, value]) => (
             <div key={label}>
               <dt>{label}</dt>
               <dd>{value}</dd>

@@ -1,8 +1,13 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 
 import { ApiError } from "../../api/editions";
-import { getEditorialWorkspaceSnapshot } from "../../api/editorialWorkspace";
+import {
+  getEditorialCompositionStatus,
+  getEditorialPdfStatus,
+  getEditorialWorkspaceSnapshot,
+  regenerateEditorialPdf,
+} from "../../api/editorialWorkspace";
 import { Link } from "../../routing";
 import { EditorialWorkspaceLayout } from "./EditorialWorkspaceLayout";
 import { useEditorialDrafts } from "./EditorialDrafts";
@@ -32,6 +37,54 @@ export function EditorialWorkspacePage({
       state.data?.impact_status === "running"
         ? 2_500
         : false,
+  });
+  const snapshotForStatus = snapshotQuery.data;
+  const pdfStatusQuery = useQuery({
+    queryKey: editorialWorkspaceQueryKeys.pdfStatus(
+      subjectId,
+      snapshotForStatus?.snapshot_id ?? "pending",
+    ),
+    queryFn: () => getEditorialPdfStatus(subjectId),
+    enabled: snapshotForStatus !== undefined,
+    initialData: snapshotForStatus
+      ? {
+          subject_id: snapshotForStatus.subject_id,
+          status: snapshotForStatus.preview_status,
+          artifact_id: snapshotForStatus.pdf_artifact_id,
+          artifact_version: snapshotForStatus.pdf_artifact_version,
+          artifact_input_hash: snapshotForStatus.pdf_artifact_input_hash,
+          artifact_canonical_sha256:
+            snapshotForStatus.pdf_artifact_canonical_sha256,
+          render_id: snapshotForStatus.pdf_render_id,
+          render_identity: snapshotForStatus.pdf_render_identity,
+          error_code: snapshotForStatus.pdf_error_code,
+          error_message: snapshotForStatus.pdf_error_message,
+          pdf_url: snapshotForStatus.pdf_url,
+        }
+      : undefined,
+    retry: false,
+    refetchInterval: ({ state }) =>
+      state.data?.status === "GENERATING" ? 1_500 : false,
+  });
+  const compositionStatusQuery = useQuery({
+    queryKey: editorialWorkspaceQueryKeys.compositionStatus(
+      subjectId,
+      snapshotForStatus?.snapshot_id ?? "pending",
+    ),
+    queryFn: () => getEditorialCompositionStatus(subjectId),
+    enabled: snapshotForStatus !== undefined,
+    retry: false,
+  });
+  const queryClient = useQueryClient();
+  const pdfStatusQueryKey = editorialWorkspaceQueryKeys.pdfStatus(
+    subjectId,
+    snapshotForStatus?.snapshot_id ?? "pending",
+  );
+  const regeneratePdfMutation = useMutation({
+    mutationFn: () => regenerateEditorialPdf(subjectId),
+    onSuccess: (status) => {
+      queryClient.setQueryData(pdfStatusQueryKey, status);
+    },
   });
   const localDrafts = useEditorialDrafts(snapshotQuery.data);
   const manualEdit = useManualEditorialEdit(subjectId);
@@ -152,12 +205,23 @@ export function EditorialWorkspacePage({
       <EditorialWorkspaceLayout
         subjectId={subjectId}
         snapshot={snapshot}
+        pdfStatus={pdfStatusQuery.data}
+        pdfStatusUnavailable={pdfStatusQuery.isError}
+        pdfRegenerationPending={regeneratePdfMutation.isPending}
+        pdfRegenerationError={
+          regeneratePdfMutation.error instanceof Error
+            ? regeneratePdfMutation.error.message
+            : null
+        }
+        compositionStatus={compositionStatusQuery.data}
         localDrafts={localDrafts}
         selectedBlockId={selectedBlockId}
         localDraftText={selectedLocalDraft}
         onSelectBlock={setSelectedBlockId}
         onLocalDraftChange={recoverServerDraftText}
         onRefresh={() => void snapshotQuery.refetch()}
+        onRefreshPdfStatus={() => void pdfStatusQuery.refetch()}
+        onRegeneratePdf={() => regeneratePdfMutation.mutate()}
         onSave={async (blockId, text) => {
           const block = snapshot.blocks.find(
             (item) => item.block_id === blockId,

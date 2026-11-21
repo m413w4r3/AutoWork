@@ -15,7 +15,8 @@ export type EditorialRevisionStatus =
 export type EditorialImpactStatus =
   "none" | "pending" | "running" | "superseded" | "up_to_date" | "failed";
 export type EditorialPdfStatus = "CURRENT" | "STALE";
-export type EditorialPdfPreviewStatus = "READY" | "STALE" | "GENERATING" | "FAILED";
+export type EditorialPdfPreviewStatus =
+  "READY" | "STALE" | "GENERATING" | "FAILED";
 
 export type EditorialFigureStatus =
   | "available"

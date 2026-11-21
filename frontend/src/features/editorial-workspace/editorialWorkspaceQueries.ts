@@ -5,6 +5,11 @@ const proposalPrefix = (subjectId: string, occurrenceId: string) =>
 
 export const editorialWorkspaceQueryKeys = {
   snapshot: (subjectId: string) => ["editorial-workspace", subjectId] as const,
+  pdfStatus: (subjectId: string, snapshotId: string) =>
+    ["editorial-pdf-status", subjectId, snapshotId] as const,
+  compositionStatus: (subjectId: string, snapshotId: string) =>
+    ["editorial-composition-status", subjectId, snapshotId] as const,
+  history: (subjectId: string) => ["editorial-history", subjectId] as const,
   threadsForOccurrence: threadPrefix,
   thread: (subjectId: string, occurrenceId: string, snapshotId: string) =>
     [...threadPrefix(subjectId, occurrenceId), snapshotId] as const,

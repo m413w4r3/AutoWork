@@ -1,6 +1,13 @@
 import type { Page } from "@playwright/test";
+import type { Route } from "@playwright/test";
 
 import type { Subject } from "../../../src/api/editions";
+import type {
+  EditorialCompositionStatusView,
+  EditorialPdfPreviewStatus,
+  EditorialPdfStatusView,
+  EditorialWorkspaceSnapshot,
+} from "../../../src/api/editorialWorkspace";
 import { editorialAppOrigin } from "../editorialOrigin";
 
 export const EDITORIAL_APP_ORIGIN = editorialAppOrigin();
@@ -55,6 +62,109 @@ export const EDITORIAL_FIXTURES = {
 export interface EditorialApiCapture {
   requests: string[];
   unexpectedRequests: string[];
+}
+
+type EditorialPdfSnapshotSource = Pick<
+  EditorialWorkspaceSnapshot,
+  | "subject_id"
+  | "preview_status"
+  | "pdf_artifact_id"
+  | "pdf_artifact_version"
+  | "pdf_artifact_input_hash"
+  | "pdf_artifact_canonical_sha256"
+  | "pdf_render_id"
+  | "pdf_render_identity"
+  | "pdf_error_code"
+  | "pdf_error_message"
+  | "pdf_url"
+>;
+
+function isEditorialPdfSnapshotSourceArray(
+  value: EditorialPdfSnapshotSource | readonly EditorialPdfSnapshotSource[],
+): value is readonly EditorialPdfSnapshotSource[] {
+  return Array.isArray(value);
+}
+
+function pdfStatusForSnapshot(
+  snapshot: EditorialPdfSnapshotSource,
+  status: EditorialPdfPreviewStatus = snapshot.preview_status,
+): EditorialPdfStatusView {
+  return {
+    subject_id: snapshot.subject_id,
+    status,
+    artifact_id: snapshot.pdf_artifact_id,
+    artifact_version: snapshot.pdf_artifact_version,
+    artifact_input_hash: snapshot.pdf_artifact_input_hash,
+    artifact_canonical_sha256: snapshot.pdf_artifact_canonical_sha256,
+    render_id: snapshot.pdf_render_id,
+    render_identity: snapshot.pdf_render_identity,
+    error_code: snapshot.pdf_error_code,
+    error_message: snapshot.pdf_error_message,
+    pdf_url:
+      status === "READY"
+        ? (snapshot.pdf_url ??
+          `/api/subjects/${encodeURIComponent(snapshot.subject_id)}/publication/pdf`)
+        : null,
+  };
+}
+
+function compositionStatusForSnapshot(
+  subjectId: string,
+): EditorialCompositionStatusView {
+  const editionId = EDITORIAL_FIXTURES.subject.edition_id;
+  return {
+    edition_id: editionId,
+    subject_id: subjectId,
+    status: "not_pinned",
+    message: "Aucune composition n’est épinglée à cette édition.",
+    composition_id: null,
+    composition_version: null,
+    pinned_artifact_id: null,
+    pinned_artifact_version: null,
+    current_artifact_id: null,
+    current_artifact_version: null,
+    current_version_available: true,
+    composition_url: `/api/editions/${encodeURIComponent(editionId)}/composition`,
+  };
+}
+
+export async function fulfillEditorialReadStatuses(
+  route: Route,
+  method: string,
+  pathname: string,
+  snapshots: EditorialPdfSnapshotSource | readonly EditorialPdfSnapshotSource[],
+  pdfStatusOverride?: EditorialPdfPreviewStatus,
+): Promise<boolean> {
+  const requestedSubjectId = pathname.match(
+    /^\/api\/subjects\/([^/]+)\/editor\/(?:pdf|composition)$/,
+  )?.[1];
+  if (!requestedSubjectId) return false;
+  const snapshot = isEditorialPdfSnapshotSourceArray(snapshots)
+    ? (snapshots.find((item) => item.subject_id === requestedSubjectId) ??
+      snapshots[0])
+    : snapshots;
+  if (!snapshot || snapshot.subject_id !== requestedSubjectId) return false;
+  if (
+    method === "GET" &&
+    pathname ===
+      `/api/subjects/${encodeURIComponent(snapshot.subject_id)}/editor/pdf`
+  ) {
+    await route.fulfill({
+      json: pdfStatusForSnapshot(snapshot, pdfStatusOverride),
+    });
+    return true;
+  }
+  if (
+    method === "GET" &&
+    pathname ===
+      `/api/subjects/${encodeURIComponent(snapshot.subject_id)}/editor/composition`
+  ) {
+    await route.fulfill({
+      json: compositionStatusForSnapshot(snapshot.subject_id),
+    });
+    return true;
+  }
+  return false;
 }
 
 export async function stubEditorialApi(
