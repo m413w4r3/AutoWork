@@ -101,6 +101,7 @@ from cti_app.domain.editorial_workspace import (
     AdvancedBlockRegistry,
     BlockRegistryEntry,
     EditorialSourceStage,
+    EditorialWorkspaceError,
 )
 from cti_app.domain.production import (
     ProductionArtifact,
@@ -491,7 +492,7 @@ class EditorialProposalAdoptionService:
         try:
             resolution = await self._workspace_service.resolve_occurrence(subject_id, occurrence_id)
             return resolution
-        except Exception:
+        except EditorialWorkspaceError:
             raise EditorialProposalAdoptionError(
                 "proposal_base_stale", reason="workspace:occurrence_resolution"
             ) from None

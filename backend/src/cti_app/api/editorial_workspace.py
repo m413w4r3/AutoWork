@@ -24,6 +24,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from sqlalchemy.exc import SQLAlchemyError
 from starlette.responses import JSONResponse
 
 from cti_app.application.blobs import BlobCatalogService
@@ -2578,11 +2579,18 @@ async def accept_editorial_proposal(
         raise
     except EditorialProposalAdoptionError as error:
         code = error.code
+        reason = error.reason
+        if not isinstance(reason, str) or re.fullmatch(r"[a-z][a-z0-9_:-]{0,63}", reason) is None:
+            reason = "not_applicable"
+        frame = error.frame
+        if not isinstance(frame, str) or _DIAGNOSTIC_FRAME.fullmatch(frame) is None:
+            frame = _caller_frame()
         logger.warning(
-            "proposal_decision_rejected code=%s reason=%s frame=%s proposal_id=%s",
+            "proposal_decision_rejected code=%s reason=%s frame=%s exc_type=%s proposal_id=%s",
             code,
-            error.reason or "not_applicable",
-            error.frame or "unavailable:0:unknown",
+            reason,
+            frame,
+            type(error).__name__,
             proposal_id,
         )
         if code == "proposal_not_found":
@@ -2619,7 +2627,17 @@ async def accept_editorial_proposal(
             status_code=response_status,
             detail={"code": code, "message": message},
         ) from None
-    except Exception:
+    except SQLAlchemyError as error:
+        frame = _exception_frame(error) or _caller_frame()
+        if _DIAGNOSTIC_FRAME.fullmatch(frame) is None:
+            frame = _caller_frame()
+        logger.warning(
+            "proposal_decision_unavailable reason=%s frame=%s exc_type=%s proposal_id=%s",
+            "database_unavailable",
+            frame,
+            type(error).__name__,
+            proposal_id,
+        )
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={
