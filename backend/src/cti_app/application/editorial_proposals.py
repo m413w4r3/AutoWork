@@ -56,9 +56,16 @@ from cti_app.application.editorial_text_policy import (
 from cti_app.application.editorial_text_policy import (
     editorial_patch_text_violation as _editorial_patch_text_violation,
 )
+from cti_app.application.editorial_visual_revision import (
+    VisualRevisionContextLoader,
+    VisualRevisionRejected,
+    plan_visual_revision,
+)
 from cti_app.application.editorial_workspace.registry import (
     WorkspaceOccurrenceResolution,
     read_pointer,
+    resolve_enrichment_element_target,
+    resolve_enrichment_order_target,
     resolve_occurrence,
     revision_target_path,
 )
@@ -79,6 +86,15 @@ from cti_app.application.production_synthesis import (
 )
 from cti_app.application.production_synthesis_revision import _apply_wire_patch
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
+from cti_app.domain.editorial_enrichment_patch import (
+    IMPLEMENTED_VISUAL_REVISION_OPERATIONS,
+    VISUAL_REVISION_PATCH_SCHEMA_VERSION,
+    MoveEnrichmentElementPatch,
+    ReorderEnrichmentElementsPatch,
+    UpdateVisualCaptionPatch,
+    VisualRevisionPatch,
+    visual_patch_to_json,
+)
 from cti_app.domain.editorial_figure_keys import adopted_source_figure_key
 from cti_app.domain.editorial_proposal import (
     EditorialProposal,
@@ -123,12 +139,14 @@ from cti_app.domain.production_editorial_enrichment import (
     TableSpecV1,
     bar_chart_evidence_contains_unit,
     editorial_enrichment_from_json,
+    editorial_enrichment_to_json,
     normalize_analytic_question,
 )
 from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionConflictError,
     TargetedEditorialRevisionMode,
     TargetedEditorialRevisionOperation,
+    TargetedEditorialRevisionPlacement,
     TargetedEditorialRevisionPlacementKind,
     TargetedEditorialRevisionRequest,
     TargetedEditorialRevisionTarget,
@@ -540,6 +558,39 @@ def _manual_request_sha256(
     ).hexdigest()
 
 
+def _visual_revision_request_sha256(
+    *,
+    subject_id: UUID,
+    snapshot_id: UUID,
+    occurrence_id: UUID,
+    patch: VisualRevisionPatch,
+) -> str:
+    identity = {
+        "action": "prepare_visual_revision",
+        "subject_id": str(subject_id),
+        "snapshot_id": str(snapshot_id),
+        "occurrence_id": str(occurrence_id),
+        "patch": visual_patch_to_json(patch),
+    }
+    return hashlib.sha256(ProductionArtifactStore.canonical_json_bytes(identity)).hexdigest()
+
+
+def _visual_revision_failure(
+    error: VisualRevisionRejected,
+) -> EditorialProposalApplicationError:
+    diagnostics = dict(error.diagnostics)
+    if error.code == "proposal_base_stale":
+        raw_reason = diagnostics.get("reason")
+        reason = (
+            raw_reason
+            if isinstance(raw_reason, str)
+            and re.fullmatch(r"[a-z][a-z0-9_]*:[a-z][a-z0-9_]*", raw_reason) is not None
+            else "workspace:visual_revision"
+        )
+        return EditorialProposalApplicationError(error.code, reason=reason, diagnostics=diagnostics)
+    return EditorialProposalApplicationError(error.code, diagnostics=diagnostics)
+
+
 def _evidence_reference_json(reference: Any) -> dict[str, object]:
     return {
         "source_document_id": str(reference.source_document_id),
@@ -939,6 +990,7 @@ class EditorialProposalApplicationError(ValueError):
         reason: str | None = None,
         frame: str | None = None,
         validator_code: str | None = None,
+        diagnostics: Mapping[str, object] | None = None,
     ) -> None:
         if code == "proposal_base_stale" and (
             reason is None or re.fullmatch(r"[a-z][a-z0-9_]*:[a-z][a-z0-9_]*", reason) is None
@@ -948,6 +1000,7 @@ class EditorialProposalApplicationError(ValueError):
         self.reason = reason
         self.frame = frame
         self.validator_code = validator_code
+        self.diagnostics: dict[str, object] = dict(diagnostics or {})
         super().__init__(code)
 
 
@@ -1252,6 +1305,7 @@ class EditorialProposalService:
         chart_compiler: Any | None = None,
         media_asset_store: MediaAssetStore | None = None,
         figure_catalog_service: Any | None = None,
+        visual_revision_loader: VisualRevisionContextLoader | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._blob_store = blob_store
@@ -1261,6 +1315,7 @@ class EditorialProposalService:
         self._chart_compiler = chart_compiler
         self._media_asset_store = media_asset_store
         self._figure_catalog_service = figure_catalog_service
+        self._visual_revision_loader = visual_revision_loader
 
     async def prepare_thread_turn(
         self,
@@ -1438,6 +1493,193 @@ class EditorialProposalService:
             raise EditorialProposalApplicationError(
                 "editorial_read_only", reason=resolution.read_only_reason.value
             )
+
+    async def prepare_visual_revision(
+        self,
+        *,
+        subject_id: UUID,
+        snapshot_id: UUID,
+        occurrence_id: UUID,
+        actor_id: UUID,
+        idempotency_key: str,
+        patch: VisualRevisionPatch,
+    ) -> EditorialProposal:
+        """Prepare one typed visual revision without writing canonical artifacts.
+
+        The shared planner is the only validation path; the proposal stores the
+        reparsed patch plus its bounded preview, and adoption calls the same
+        planner against the fenced current state.
+        """
+        if not _IDEMPOTENCY_KEY.fullmatch(idempotency_key):
+            raise EditorialProposalApplicationError("idempotency_key_invalid")
+        operation = patch.operation
+        if operation not in IMPLEMENTED_VISUAL_REVISION_OPERATIONS:
+            raise _visual_revision_failure(
+                VisualRevisionRejected(
+                    "enrichment_revision_unsupported_operation",
+                    {"variant": type(patch).__name__, "slice": "F2-03b/F2-03c"},
+                )
+            )
+        if self._workspace_service is None or self._visual_revision_loader is None:
+            raise EditorialProposalApplicationError("proposal_base_unavailable")
+        preparation_key = _manual_idempotency_key("prepare", idempotency_key)
+        request_sha256 = _visual_revision_request_sha256(
+            subject_id=subject_id,
+            snapshot_id=snapshot_id,
+            occurrence_id=occurrence_id,
+            patch=patch,
+        )
+        async with self._uow_factory() as uow:
+            existing = await uow.editorial_proposals.get_by_idempotency_key(
+                subject_id, actor_id, preparation_key
+            )
+        if existing is not None:
+            if existing.request_sha256 != request_sha256:
+                raise EditorialProposalConflict("proposal_idempotency_conflict")
+            return existing
+
+        await self._refuse_read_only_context(subject_id, occurrence_id)
+        try:
+            loaded = await self._visual_revision_loader.load(
+                subject_id=subject_id,
+                snapshot_id=snapshot_id,
+                occurrence_id=occurrence_id,
+            )
+        except VisualRevisionRejected as error:
+            raise _visual_revision_failure(error) from None
+        entry = loaded.entry
+        base_payload = editorial_enrichment_to_json(loaded.context.base_enrichment)
+        if isinstance(patch, ReorderEnrichmentElementsPatch):
+            if (
+                entry.source_stage is not EditorialSourceStage.SYNTHESIS
+                or entry.kind
+                not in {EditorialBlockKind.PARAGRAPH, EditorialBlockKind.LEAD_PARAGRAPH}
+                or patch.anchor_block_id != occurrence_id
+            ):
+                raise _visual_revision_failure(VisualRevisionRejected("editorial_anchor_stale", {}))
+            try:
+                resolved = resolve_enrichment_order_target(
+                    entry=entry,
+                    enrichment=base_payload,
+                    operation=operation.value,
+                )
+            except (EditorialWorkspaceError, ValueError):
+                raise _visual_revision_failure(
+                    VisualRevisionRejected("editorial_anchor_stale", {})
+                ) from None
+            target = resolved.target
+            before_hash = resolved.before_hash
+        else:
+            if not isinstance(patch, (UpdateVisualCaptionPatch, MoveEnrichmentElementPatch)):
+                raise _visual_revision_failure(
+                    VisualRevisionRejected(
+                        "enrichment_revision_unsupported_operation",
+                        {"variant": type(patch).__name__},
+                    )
+                )
+            if (
+                entry.source_stage is not EditorialSourceStage.EDITORIAL_ENRICHMENT
+                or entry.kind.value != patch.element_kind.value
+                or entry.block_id != occurrence_id
+            ):
+                raise _visual_revision_failure(
+                    VisualRevisionRejected(
+                        "enrichment_element_kind_mismatch",
+                        {"element_kind": patch.element_kind.value},
+                    )
+                )
+            try:
+                resolved = resolve_enrichment_element_target(
+                    entry=entry,
+                    enrichment=base_payload,
+                    operation=operation.value,
+                )
+            except (EditorialWorkspaceError, ValueError):
+                raise _visual_revision_failure(
+                    VisualRevisionRejected("enrichment_element_not_found", {})
+                ) from None
+            target = resolved.target
+            before_hash = resolved.before_hash
+            if isinstance(patch, MoveEnrichmentElementPatch):
+                target = replace(
+                    target,
+                    placement=TargetedEditorialRevisionPlacement(
+                        kind=TargetedEditorialRevisionPlacementKind.AFTER_PARAGRAPH,
+                        anchor_block_id=patch.anchor_block_id,
+                    ),
+                )
+        target_id = hashlib.sha256(
+            ProductionArtifactStore.canonical_json_bytes(target.to_json())
+        ).hexdigest()
+        try:
+            plan = plan_visual_revision(loaded.context, patch)
+        except VisualRevisionRejected as error:
+            raise _visual_revision_failure(error) from None
+        patch_payload: dict[str, object] = {
+            "schema_version": VISUAL_REVISION_PATCH_SCHEMA_VERSION,
+            "operation": operation.value,
+            "target": target.to_json(),
+            "target_id": target_id,
+            "occurrence_id": str(occurrence_id),
+            "before_hash": before_hash,
+            "visual_patch": visual_patch_to_json(patch),
+            "rationale": "Révision visuelle manuelle validée par l’analyste.",  # noqa: RUF001
+        }
+        candidate_payload = editorial_enrichment_to_json(plan.revised_enrichment)
+        diagnostics: dict[str, object] = {
+            "preview": plan.preview,
+            "canonical_candidate_sha256": hashlib.sha256(
+                ProductionArtifactStore.canonical_json_bytes(candidate_payload)
+            ).hexdigest(),
+        }
+        encoded_patch = ProductionArtifactStore.canonical_json_bytes(patch_payload)
+        if len(encoded_patch) > _MAX_PATCH_BYTES:
+            raise EditorialProposalApplicationError("proposal_patch_too_large")
+        preparation = EditorialProposalPreparation(
+            subject_id=subject_id,
+            production_run_id=loaded.production_run_id,
+            snapshot_id=snapshot_id,
+            occurrence_id=occurrence_id,
+            thread_id=None,
+            base_artifact_id=loaded.base_artifact.id,
+            base_artifact_version=loaded.base_artifact.version,
+            base_input_hash=loaded.base_artifact.input_hash,
+            base_canonical_sha256=loaded.base_canonical_sha256,
+            base_pin_hash=loaded.base_pin_hash,
+            routing_decision_hash=loaded.routing_decision_hash,
+            target_id=target_id,
+            target=target,
+            operation=operation,
+            before_hash=before_hash,
+            base_content=editorial_enrichment_to_json(loaded.context.base_enrichment),
+            raw_response=encoded_patch.decode("utf-8"),
+            model_run_id=None,
+            model_turn_id=None,
+            actor_id=actor_id,
+            idempotency_key=preparation_key,
+            request_sha256=request_sha256,
+            instruction="Révision visuelle manuelle",
+            requester=str(actor_id),
+            origin=EditorialProposalOrigin.MANUAL_PATCH,
+        )
+        descriptor = await self._upload_and_verify_patch(encoded_patch)
+        try:
+            while True:
+                try:
+                    return await self._persist_prepared_result(
+                        preparation,
+                        encoded_patch=encoded_patch,
+                        descriptor=descriptor,
+                        state=EditorialProposalState.PROPOSED,
+                        kind=EditorialProposalEventKind.PREPARED,
+                        diagnostics=diagnostics,
+                    )
+                except _ProposalPatchBlobMissing:
+                    descriptor = await self._upload_and_verify_patch(encoded_patch)
+        except Exception:
+            if descriptor is not None:
+                await self._best_effort_orphan_cleanup(descriptor)
+            raise
 
     async def prepare_manual_patch(
         self,
@@ -2873,7 +3115,8 @@ class EditorialProposalService:
                 raise EditorialProposalApplicationError("proposal_patch_unavailable") from None
             if (
                 not isinstance(decoded, dict)
-                or decoded.get("schema_version") != "editorial-patch-v1"
+                or decoded.get("schema_version")
+                not in {"editorial-patch-v1", VISUAL_REVISION_PATCH_SCHEMA_VERSION}
                 or decoded.get("operation") != proposal.operation
                 or decoded.get("occurrence_id") != str(proposal.occurrence_id)
             ):
@@ -2924,7 +3167,10 @@ class EditorialProposalService:
         if digest != proposal.base_canonical_sha256:
             raise EditorialProposalApplicationError("proposal_base_hash_mismatch")
         operation = TargetedEditorialRevisionOperation(proposal.operation)
-        if operation.paragraph_enrichment_element_kind is not None:
+        if (
+            operation.paragraph_enrichment_element_kind is not None
+            or operation is TargetedEditorialRevisionOperation.REORDER_ENRICHMENT_ELEMENTS
+        ):
             if (
                 snapshot.enrichment_artifact_id != proposal.base_artifact_id
                 or snapshot.enrichment_version != proposal.base_artifact_version
@@ -4009,12 +4255,27 @@ class EditorialProposalService:
             or preparation.target.placement.anchor_block_id != preparation.occurrence_id
         ):
             raise EditorialProposalApplicationError("editorial_anchor_stale")
+        if (
+            is_enrichment_target
+            and not is_enrichment_insertion
+            and not is_enrichment_order
+            and (
+                resolution.entry.source_stage is not EditorialSourceStage.EDITORIAL_ENRICHMENT
+                or resolution.entry.content_sha256 != preparation.before_hash
+            )
+        ):
+            raise EditorialProposalApplicationError(
+                "proposal_base_stale", reason="pins:before_hash"
+            )
         if preparation.origin is EditorialProposalOrigin.MANUAL_PATCH:
             if (
                 preparation.thread_id is not None
                 or preparation.model_run_id is not None
                 or preparation.model_turn_id is not None
-                or preparation.manual_patch is None
+                or (
+                    preparation.manual_patch is None
+                    and preparation.operation not in IMPLEMENTED_VISUAL_REVISION_OPERATIONS
+                )
             ):
                 raise EditorialProposalApplicationError("proposal_model_run_reference_invalid")
             return

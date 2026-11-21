@@ -34,6 +34,7 @@ from cti_app.application.production_synthesis import (
     build_synthesis_access_policy,
     synthesis_access_policy_hash,
 )
+from cti_app.application.publication_builder import build_article_format_v1
 from cti_app.application.source_figure_inventory import load_archived_source_figure_inventory
 from cti_app.config import Settings
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
@@ -127,6 +128,8 @@ async def _ready_for_manual_table_route(
     bar_chart_facts: bool = False,
     source_figure_count: int = 0,
     base_table_placement: EnrichmentPlacementV1 | None = None,
+    base_table_placement_factory: Any | None = None,
+    publication_kind: PublicationKind = PublicationKind.BRIEF,
 ) -> tuple[_Seeded, Any, _NoModelCalls, Any]:
     # Use the real discovery lineage and persist the rows required by the
     # production discussion/adoption adapters. Blob IDs come from add_if_absent
@@ -137,6 +140,10 @@ async def _ready_for_manual_table_route(
         seed_discovery_lineage=True,
         bar_chart_facts=bar_chart_facts,
     )
+    if base_table_placement_factory is not None:
+        if base_table_placement is not None:
+            raise ValueError("base_table_placement_and_factory_are_exclusive")
+        base_table_placement = base_table_placement_factory(seeded)
     enrichment_content = _enrichment_seed_content(
         seeded.production_input,
         seeded.extraction,
@@ -162,9 +169,23 @@ async def _ready_for_manual_table_route(
         if source_figure_assets
         else b"synthetic manual-table integration source"
     )
-    publication_bytes = ProductionArtifactStore.canonical_json_bytes(
-        _brief_v8_payload_for_subject(seeded.subject.id)
-    )
+    publication_content = _brief_v8_payload_for_subject(seeded.subject.id)
+    if publication_kind is PublicationKind.ARTICLE:
+        brief_document = parse_publication_document(publication_content)
+        if not isinstance(brief_document, PublicationDocumentV8):
+            raise TypeError("synthetic_publication_fixture_invalid")
+        article_v7 = replace(
+            brief_document.base_publication, publication_kind=PublicationKind.ARTICLE
+        )
+        article_document = PublicationDocumentV8(
+            base_publication=article_v7,
+            article_format=build_article_format_v1(
+                article_v7.base_publication.base_publication,
+                seeded.extraction,
+            ),
+        )
+        publication_content = serialize_publication_document(article_document)
+    publication_bytes = ProductionArtifactStore.canonical_json_bytes(publication_content)
 
     def blob_record(content: bytes, mime_type: str, bucket: str) -> BlobRecord:
         return BlobRecord(

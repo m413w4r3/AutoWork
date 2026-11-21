@@ -10,6 +10,7 @@ from uuid import UUID
 
 from cti_app.application.editorial_legacy_read_only import EditorialLegacyReadOnlyReason
 from cti_app.application.editorial_synthesis import targets as synthesis_targets
+from cti_app.domain.editorial_enrichment_patch import enrichment_order_group_hash
 from cti_app.domain.editorial_workspace import (
     BlockRegistryEntry,
     EditorialBlockKind,
@@ -30,11 +31,13 @@ from cti_app.domain.production import (
 )
 from cti_app.domain.production_editorial_enrichment import (
     EditorialEnrichmentElementKind,
+    EditorialEnrichmentV1,
     EnrichmentElementRef,
     EnrichmentOrderEntry,
     EnrichmentPlacementKind,
     EnrichmentPlacementV1,
     EnrichmentTableKind,
+    editorial_enrichment_from_json,
     enrichment_order_rank_from_entries,
 )
 from cti_app.domain.production_editorial_revision import (
@@ -382,6 +385,44 @@ def _is_legacy_catalog_target_for_entry(
     return stable_ids == expected_stable_ids and parent_id == expected_parent_id
 
 
+_ENRICHMENT_ELEMENT_OPERATIONS: dict[EditorialEnrichmentElementKind, tuple[str, ...]] = {
+    EditorialEnrichmentElementKind.TABLE: (
+        TargetedEditorialRevisionOperation.REWRITE_TABLE.value,
+        TargetedEditorialRevisionOperation.DELETE_TABLE.value,
+        TargetedEditorialRevisionOperation.UPDATE_VISUAL_CAPTION.value,
+        TargetedEditorialRevisionOperation.MOVE_ENRICHMENT_ELEMENT.value,
+    ),
+    EditorialEnrichmentElementKind.CHART: (
+        TargetedEditorialRevisionOperation.REWRITE_CHART.value,
+        TargetedEditorialRevisionOperation.DELETE_CHART.value,
+        TargetedEditorialRevisionOperation.UPDATE_VISUAL_CAPTION.value,
+        TargetedEditorialRevisionOperation.MOVE_ENRICHMENT_ELEMENT.value,
+    ),
+    EditorialEnrichmentElementKind.DIAGRAM: (
+        TargetedEditorialRevisionOperation.REWRITE_DIAGRAM.value,
+        TargetedEditorialRevisionOperation.DELETE_DIAGRAM.value,
+        TargetedEditorialRevisionOperation.UPDATE_VISUAL_CAPTION.value,
+        TargetedEditorialRevisionOperation.MOVE_ENRICHMENT_ELEMENT.value,
+    ),
+    EditorialEnrichmentElementKind.FIGURE: (
+        TargetedEditorialRevisionOperation.REPLACE_SOURCE_FIGURE.value,
+        TargetedEditorialRevisionOperation.DELETE_SOURCE_FIGURE.value,
+        TargetedEditorialRevisionOperation.UPDATE_VISUAL_CAPTION.value,
+        TargetedEditorialRevisionOperation.MOVE_ENRICHMENT_ELEMENT.value,
+    ),
+}
+
+
+def enrichment_element_kind(entry: BlockRegistryEntry) -> EditorialEnrichmentElementKind | None:
+    """Typed element family for one enrichment occurrence, when it has one."""
+    if entry.source_stage is not EditorialSourceStage.EDITORIAL_ENRICHMENT:
+        return None
+    try:
+        return EditorialEnrichmentElementKind(entry.kind.value)
+    except ValueError:
+        return None
+
+
 def allowed_operations(
     entry: BlockRegistryEntry,
     canonical_content: Mapping[str, Any],
@@ -389,7 +430,17 @@ def allowed_operations(
     allow_table_insertion: bool = False,
     allow_bar_chart_insertion: bool = False,
     allow_figure_insertion: bool = False,
+    allow_enrichment_reorder: bool = False,
 ) -> tuple[str, ...]:
+    enrichment_kind = enrichment_element_kind(entry)
+    if enrichment_kind is not None:
+        operations = _ENRICHMENT_ELEMENT_OPERATIONS.get(enrichment_kind, ())
+        if allow_enrichment_reorder:
+            operations = (
+                *operations,
+                TargetedEditorialRevisionOperation.REORDER_ENRICHMENT_ELEMENTS.value,
+            )
+        return operations
     if entry.source_stage != "synthesis":
         return ()
     _, operations, _legacy_target_id = _target_for_entry(entry, canonical_content)
@@ -519,6 +570,97 @@ def resolve_workspace_target(
         operation,
         target,
         legacy_target_id,
+    )
+
+
+def _enrichment_element_key(item: object, entry: BlockRegistryEntry) -> str:
+    if isinstance(item, Mapping):
+        for field_name in ("element_key", "key"):
+            value = item.get(field_name)
+            if isinstance(value, str) and value.strip():
+                return value
+    return entry.structural_pointer
+
+
+def _enrichment_payload(enrichment: Mapping[str, Any]) -> EditorialEnrichmentV1:
+    try:
+        return editorial_enrichment_from_json(dict(enrichment))
+    except (TypeError, ValueError) as exc:
+        raise EditorialRegistryConflictError("editorial_registry_conflict") from exc
+
+
+def resolve_enrichment_element_target(
+    *,
+    entry: BlockRegistryEntry,
+    enrichment: Mapping[str, Any],
+    operation: str,
+) -> ResolvedWorkspaceTarget:
+    """Resolve one enrichment element occurrence and its content CAS fence.
+
+    The returned target has no placement: caption/rewrite/delete keep the base
+    placement, and move is the only variant that carries a new anchor, which
+    the caller supplies from its own typed patch.
+    """
+    kind = enrichment_element_kind(entry)
+    if kind is None:
+        raise EditorialBlockMissingError("editorial_block_missing")
+    if entry.revision_status is EditorialRevisionStatus.NEEDS_REVIEW:
+        raise EditorialIdentityAmbiguousError("editorial_identity_ambiguous")
+    if operation not in _ENRICHMENT_ELEMENT_OPERATIONS[kind]:
+        raise EditorialBlockMissingError("editorial_block_missing")
+    item = read_pointer(enrichment, entry.structural_pointer)
+    if not isinstance(item, Mapping):
+        raise EditorialRegistryConflictError("editorial_registry_conflict")
+    target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT,
+        element_kind=kind,
+        element_key=_enrichment_element_key(item, entry),
+    )
+    return ResolvedWorkspaceTarget(
+        entry.block_id,
+        revision_target_path(entry),
+        entry.content_sha256,
+        operation,
+        target,
+        canonical_content_sha256(target.to_json()),
+    )
+
+
+def resolve_enrichment_order_target(
+    *,
+    entry: BlockRegistryEntry,
+    enrichment: Mapping[str, Any],
+    operation: str,
+) -> ResolvedWorkspaceTarget:
+    """Resolve the paragraph anchor of one reorder group and its group CAS fence."""
+    if entry.source_stage is not EditorialSourceStage.SYNTHESIS or entry.kind not in {
+        EditorialBlockKind.PARAGRAPH,
+        EditorialBlockKind.LEAD_PARAGRAPH,
+    }:
+        raise EditorialBlockMissingError("editorial_block_missing")
+    if entry.revision_status is EditorialRevisionStatus.NEEDS_REVIEW:
+        raise EditorialIdentityAmbiguousError("editorial_identity_ambiguous")
+    if operation != TargetedEditorialRevisionOperation.REORDER_ENRICHMENT_ELEMENTS.value:
+        raise EditorialBlockMissingError("editorial_block_missing")
+    target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind.ENRICHMENT_ORDER,
+        placement=TargetedEditorialRevisionPlacement(
+            kind=TargetedEditorialRevisionPlacementKind.AFTER_PARAGRAPH,
+            anchor_block_id=entry.block_id,
+        ),
+    )
+    placement = EnrichmentPlacementV1(
+        EnrichmentPlacementKind.AFTER_PARAGRAPH,
+        anchor_block_id=entry.block_id,
+    )
+    before_hash = enrichment_order_group_hash(_enrichment_payload(enrichment), placement)
+    return ResolvedWorkspaceTarget(
+        entry.block_id,
+        revision_target_path(entry),
+        before_hash,
+        operation,
+        target,
+        canonical_content_sha256(target.to_json()),
     )
 
 
@@ -666,7 +808,7 @@ def project_blocks(
             except EditorialIdentityAmbiguousError:
                 legacy_target_id = None
         before_hash = entry.content_sha256
-        if operations:
+        if operations and entry.source_stage is EditorialSourceStage.SYNTHESIS:
             before_hash = resolve_workspace_target(
                 entry=entry,
                 canonical_content=synthesis,
@@ -726,6 +868,9 @@ def project_blocks(
     insertions: dict[int, list[tuple[int, EnrichmentElementRef, str, dict[str, object]]]] = {}
     stale_enrichments: list[tuple[int, str, dict[str, object]]] = []
     order_entries: list[EnrichmentOrderEntry] = []
+    placement_by_block: dict[UUID, EnrichmentPlacementV1] = {}
+    ref_by_block: dict[UUID, EnrichmentElementRef] = {}
+    entry_by_block = {entry.block_id: entry for entry in enrichment_entries}
     section_count = len(synthesis.get("sections", []))
     for entry in enrichment_entries:
         if enrichment is None:
@@ -800,16 +945,25 @@ def project_blocks(
             placement_rank = section_count + (1 if placement_kind == "after_timeline" else 2)
         else:
             raise EditorialRegistryConflictError("editorial_registry_conflict")
-        element_key = str(item.get("element_key") or item.get("key") or entry.structural_pointer)
+        element_key = _enrichment_element_key(item, entry)
         enrichment_block = enrichment_blocks_by_id[entry.block_id]
+        enrichment_block["element_kind"] = entry.kind.value
+        enrichment_block["element_key"] = element_key
+        enrichment_block["caption"] = (
+            item.get("caption") if isinstance(item.get("caption"), str) else None
+        )
         if stale_anchor:
             enrichment_block["revision_status"] = "stale"
+            enrichment_block["allowed_operations"] = []
+            enrichment_block["order"] = None
             stale_enrichments.append((entry.position, element_key, enrichment_block))
             continue
         if typed_placement is None:
             raise EditorialRegistryConflictError("editorial_registry_conflict")
         element_kind = EditorialEnrichmentElementKind(entry.kind.value)
         element_ref = EnrichmentElementRef(element_kind, element_key)
+        placement_by_block[entry.block_id] = typed_placement
+        ref_by_block[entry.block_id] = element_ref
         order_entries.append(
             EnrichmentOrderEntry(
                 kind=element_kind,
@@ -824,6 +978,24 @@ def project_blocks(
         )
 
     order_rank = enrichment_order_rank_from_entries(order_entries)
+    group_sizes: dict[EnrichmentPlacementV1, int] = {}
+    for placement in placement_by_block.values():
+        group_sizes[placement] = group_sizes.get(placement, 0) + 1
+    for block_id, element_ref in ref_by_block.items():
+        block = enrichment_blocks_by_id[block_id]
+        if element_ref in order_rank:
+            block["order"] = order_rank[element_ref]
+        entry = entry_by_block[block_id]
+        if (
+            allow_operations
+            and entry.revision_status is EditorialRevisionStatus.READY
+            and group_sizes[placement_by_block[block_id]] >= 2
+        ):
+            block_operations = block.get("allowed_operations")
+            if isinstance(block_operations, list):
+                block_operations.append(
+                    TargetedEditorialRevisionOperation.REORDER_ENRICHMENT_ELEMENTS.value
+                )
 
     ordered_blocks: list[dict[str, object]] = []
     ordered_enrichments: list[dict[str, object]] = []

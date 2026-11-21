@@ -516,6 +516,67 @@ async def build_candidate_from_validated_patch(
     )
 
 
+def build_candidate_from_revised_enrichment(
+    *,
+    base_artifact: ProductionArtifact,
+    base_payload: dict[str, Any],
+    base_canonical_bytes: bytes,
+    base_canonical_sha256: str,
+    base_enrichment: EditorialEnrichmentV1,
+    revised_enrichment: EditorialEnrichmentV1,
+    extraction: ProductionExtractionV1,
+    synthesis: ProductionSynthesisV1,
+    input_hash: str,
+    artifact_id: UUID,
+) -> EditorialEnrichmentCandidate:
+    """Prepare canonical bytes from a planner-validated complete enrichment.
+
+    Visual revisions (caption/move/reorder and the later chart/diagram/figure
+    variants) are planned on the whole artifact rather than through the legacy
+    one-element wire patch. The base bytes and hashes are rechecked here so the
+    caller's earlier read cannot be reused across a changed artifact.
+    """
+    if base_artifact.canonical_blob_id is None:
+        raise EditorialEnrichmentRevisionConflictError(
+            "The requested base artifact has no canonical payload"
+        )
+    if hashlib.sha256(base_canonical_bytes).hexdigest() != base_canonical_sha256:
+        raise EditorialEnrichmentRevisionConflictError(
+            "The requested base artifact content hash changed"
+        )
+    if json.loads(base_canonical_bytes) != base_payload:
+        raise ValueError("editorial_enrichment_revision_base_payload_mismatch")
+    if base_artifact.stage is not ProductionArtifactStage.EDITORIAL_ENRICHMENT:
+        raise ValueError("editorial_enrichment_revision_base_stage_invalid")
+    if not isinstance(revised_enrichment, EditorialEnrichmentV1):
+        raise ValueError("editorial_enrichment_revision_revised_payload_missing")
+    validate_editorial_enrichment(
+        revised_enrichment,
+        extraction=extraction,
+        synthesis=synthesis,
+    )
+    revised_payload = editorial_enrichment_to_json(revised_enrichment)
+    if editorial_enrichment_from_json(revised_payload) != revised_enrichment:
+        raise ValueError("editorial_enrichment_revision_payload_mismatch")
+    canonical_bytes = ProductionArtifactStore.canonical_json_bytes(revised_payload)
+    canonical_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
+    return EditorialEnrichmentCandidate(
+        base_artifact=base_artifact,
+        artifact_id=artifact_id,
+        input_hash=input_hash,
+        base_canonical_sha256=base_canonical_sha256,
+        enrichment=revised_enrichment,
+        extraction=extraction,
+        synthesis=synthesis,
+        canonical_payload=revised_payload,
+        canonical_bytes=canonical_bytes,
+        canonical_sha256=canonical_sha256,
+        after_element=None,
+        outcome=EditorialEnrichmentRevisionOutcome.REVISED,
+        resource_need=None,
+    )
+
+
 async def materialize_candidate_diagrams(
     candidate: EditorialEnrichmentCandidate,
     *,

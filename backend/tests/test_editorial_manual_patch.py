@@ -773,3 +773,89 @@ async def test_manual_patch_rejects_noop_and_stale_snapshot_without_writes() -> 
     assert "Manual report" not in stale.value.reason
     assert setup.repository.records == []
     assert setup.blob_bytes == {}
+
+
+@pytest.mark.asyncio
+async def test_visual_revision_preparation_fails_closed_without_pinned_loader() -> None:
+    from cti_app.domain.editorial_enrichment_patch import (
+        ReviseChartPatch,
+        UpdateVisualCaptionPatch,
+    )
+    from cti_app.domain.production_editorial_enrichment import (
+        ChartKind,
+        ChartPointV1,
+        ChartSpecV1,
+        EditorialAnalyticPurposeV1,
+        EditorialEnrichmentElementKind,
+        EnrichmentPlacementKind,
+        EnrichmentPlacementV1,
+    )
+    from cti_app.domain.production_synthesis import extraction_evidence_refs_v1
+    from tests.test_production_editorial_enrichment import _extraction
+
+    setup = _setup()
+    extraction = _extraction()
+    ref = extraction_evidence_refs_v1(extraction)[0]
+    caption = UpdateVisualCaptionPatch(
+        element_kind=EditorialEnrichmentElementKind.TABLE,
+        element_key="table_one",
+        caption="Nouvelle légende",
+    )
+    with pytest.raises(EditorialProposalApplicationError) as unavailable:
+        await setup.service.prepare_visual_revision(
+            subject_id=setup.subject_id,
+            snapshot_id=uuid4(),
+            occurrence_id=setup.occurrence_id,
+            actor_id=setup.actor_id,
+            idempotency_key="visual-preparation-key-001",
+            patch=caption,
+        )
+    assert unavailable.value.code == "proposal_base_unavailable"
+
+    with pytest.raises(EditorialProposalApplicationError) as invalid_key:
+        await setup.service.prepare_visual_revision(
+            subject_id=setup.subject_id,
+            snapshot_id=uuid4(),
+            occurrence_id=setup.occurrence_id,
+            actor_id=setup.actor_id,
+            idempotency_key="short",
+            patch=caption,
+        )
+    assert invalid_key.value.code == "idempotency_key_invalid"
+
+    chart = ChartSpecV1(
+        key="chart_one",
+        kind=ChartKind.TIMELINE,
+        title="Timeline chart",
+        caption="Chart caption",
+        placement=EnrichmentPlacementV1(EnrichmentPlacementKind.AFTER_LEAD),
+        purpose=EditorialAnalyticPurposeV1(
+            question="Which synthetic steps are ordered?",
+            available_data="Synthetic evidence.",
+            comprehension_gain="A compact timeline.",
+            scope="Synthetic only.",
+            evidence_refs=(ref,),
+            knowledge_limits="Synthetic only.",
+            placement_reason="Synthetic only.",
+        ),
+        points=(
+            ChartPointV1(
+                label="First observed",
+                date="2026-01-01",
+                series="Documented events",
+                evidence_refs=(ref,),
+            ),
+        ),
+    )
+    with pytest.raises(EditorialProposalApplicationError) as unsupported:
+        await setup.service.prepare_visual_revision(
+            subject_id=setup.subject_id,
+            snapshot_id=uuid4(),
+            occurrence_id=setup.occurrence_id,
+            actor_id=setup.actor_id,
+            idempotency_key="visual-preparation-key-002",
+            patch=ReviseChartPatch(element_key="chart_one", chart=chart),
+        )
+    assert unsupported.value.code == "enrichment_revision_unsupported_operation"
+    assert setup.repository.records == []
+    assert setup.blob_bytes == {}
