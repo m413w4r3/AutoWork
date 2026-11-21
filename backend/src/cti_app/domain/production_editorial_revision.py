@@ -39,6 +39,9 @@ class TargetedEditorialRevisionOperation(StrEnum):
     REWRITE_SOURCE_FIGURE = "rewrite_source_figure"
     REPLACE_SOURCE_FIGURE = "replace_source_figure"
     DELETE_SOURCE_FIGURE = "delete_source_figure"
+    UPDATE_VISUAL_CAPTION = "update_visual_caption"
+    MOVE_ENRICHMENT_ELEMENT = "move_enrichment_element"
+    REORDER_ENRICHMENT_ELEMENTS = "reorder_enrichment_elements"
 
     @classmethod
     def paragraph_enrichment_insertion_values(cls) -> frozenset[str]:
@@ -80,6 +83,7 @@ class TargetedEditorialRevisionTargetKind(StrEnum):
     SECTION = "section"
     SECTION_PARAGRAPH = "section_paragraph"
     ENRICHMENT_ELEMENT = "enrichment_element"
+    ENRICHMENT_ORDER = "enrichment_order"
 
 
 class TargetedEditorialRevisionPlacementKind(StrEnum):
@@ -262,6 +266,21 @@ class TargetedEditorialRevisionTarget:
                 not self.element_key.strip() or len(self.element_key) > 128
             ):
                 raise ValueError("targeted_editorial_revision_enrichment_key_invalid")
+        elif self.kind is TargetedEditorialRevisionTargetKind.ENRICHMENT_ORDER:
+            if (
+                self.stable_ids
+                or self.parent_id is not None
+                or self.anchor_id is not None
+                or self.insert_after
+                or self.element_kind is not None
+                or self.element_key is not None
+            ):
+                raise ValueError("targeted_editorial_revision_enrichment_order_target_invalid")
+            if (
+                self.placement is None
+                or self.placement.kind is not TargetedEditorialRevisionPlacementKind.AFTER_PARAGRAPH
+            ):
+                raise ValueError("targeted_editorial_revision_enrichment_order_placement_invalid")
         elif (
             self.element_kind is not None
             or self.element_key is not None
@@ -277,7 +296,10 @@ class TargetedEditorialRevisionTarget:
             "anchor_id": self.anchor_id,
             "insert_after": self.insert_after,
         }
-        if self.kind is TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT:
+        if self.kind in {
+            TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT,
+            TargetedEditorialRevisionTargetKind.ENRICHMENT_ORDER,
+        }:
             payload.update(
                 {
                     "element_kind": (

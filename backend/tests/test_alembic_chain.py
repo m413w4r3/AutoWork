@@ -3,6 +3,7 @@
 import importlib
 import re
 from pathlib import Path
+from types import ModuleType
 from typing import cast
 
 import pytest
@@ -30,14 +31,23 @@ EXPECTED_CHAIN = (
     "0015_editorial_proposal_impacts",
     "0016_editorial_drafts",
     "0017_editorial_proposal_bar_chart_operation",
+    "0018_editorial_enrichment_element_operations",
 )
 
 BAR_CHART_MIGRATION = importlib.import_module(
     "migrations.versions.0017_editorial_proposal_bar_chart_operation"
 )
+ENRICHMENT_ELEMENT_MIGRATION = importlib.import_module(
+    "migrations.versions.0018_editorial_enrichment_element_operations"
+)
 
 
-def _operation_check_state_for(sqltext: str, monkeypatch: pytest.MonkeyPatch) -> str:
+def _operation_check_state_for(
+    sqltext: str,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    migration: ModuleType = BAR_CHART_MIGRATION,
+) -> str:
     class _Inspector:
         def has_table(self, table_name: str) -> bool:
             return table_name == "editorial_proposals"
@@ -52,10 +62,10 @@ def _operation_check_state_for(sqltext: str, monkeypatch: pytest.MonkeyPatch) ->
             ]
 
     inspector = _Inspector()
-    monkeypatch.setattr(BAR_CHART_MIGRATION.sa, "inspect", lambda _bind: inspector)
+    monkeypatch.setattr(migration.sa, "inspect", lambda _bind: inspector)
     return cast(
         str,
-        BAR_CHART_MIGRATION._operation_check_state(cast(Connection, object())),
+        migration._operation_check_state(cast(Connection, object())),
     )
 
 
@@ -113,6 +123,55 @@ def test_editorial_operation_preflight_rejects_noncanonical_checks(
         _operation_check_state_for(sqltext, monkeypatch)
 
 
+def test_enrichment_element_operation_preflight_extends_bar_chart_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bar_chart_values = re.findall(r"'([a-z_]+)'", BAR_CHART_MIGRATION._NEW_OPERATION_VALUES)
+    old_values = re.findall(r"'([a-z_]+)'", ENRICHMENT_ELEMENT_MIGRATION._OLD_OPERATION_VALUES)
+    new_values = re.findall(r"'([a-z_]+)'", ENRICHMENT_ELEMENT_MIGRATION._NEW_OPERATION_VALUES)
+
+    assert set(old_values) == set(bar_chart_values)
+    assert len(old_values) == len(set(old_values)) == 25
+    assert len(new_values) == len(set(new_values)) == 28
+    assert set(new_values) - set(old_values) == {
+        "update_visual_caption",
+        "move_enrichment_element",
+        "reorder_enrichment_elements",
+    }
+
+    postgres_values = ", ".join(f"'{value}'::character varying" for value in new_values)
+    postgres_check = f"((operation)::text = ANY ((ARRAY[{postgres_values}])::text[]))"
+    parsed_old = ENRICHMENT_ELEMENT_MIGRATION._parse_operation_check_values(
+        f"operation IN ({ENRICHMENT_ELEMENT_MIGRATION._OLD_OPERATION_VALUES})"
+    )
+    parsed_postgres = ENRICHMENT_ELEMENT_MIGRATION._parse_operation_check_values(postgres_check)
+
+    assert parsed_old is not None
+    assert set(parsed_old) == set(old_values)
+    assert parsed_postgres is not None
+    assert set(parsed_postgres) == set(new_values)
+    assert (
+        _operation_check_state_for(
+            f"operation IN ({ENRICHMENT_ELEMENT_MIGRATION._OLD_OPERATION_VALUES})",
+            monkeypatch,
+            migration=ENRICHMENT_ELEMENT_MIGRATION,
+        )
+        == "old"
+    )
+    assert (
+        _operation_check_state_for(
+            postgres_check, monkeypatch, migration=ENRICHMENT_ELEMENT_MIGRATION
+        )
+        == "new"
+    )
+    with pytest.raises(RuntimeError, match="unexpected definition"):
+        _operation_check_state_for(
+            "operation IN ('rewrite_title', 'update_visual_caption')",
+            monkeypatch,
+            migration=ENRICHMENT_ELEMENT_MIGRATION,
+        )
+
+
 def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
     config = Config(BACKEND_ROOT / "alembic.ini")
     scripts = ScriptDirectory.from_config(config)
@@ -120,12 +179,13 @@ def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
     revision_ids = [script.revision for script in revisions]
 
     assert scripts.get_heads() == [scripts.get_current_head()]
-    assert scripts.get_current_head() == "0017_editorial_proposal_bar_chart_operation"
+    assert scripts.get_current_head() == "0018_editorial_enrichment_element_operations"
     assert all(revision_id for revision_id in revision_ids)
     assert {revision_id for revision_id in revision_ids if len(revision_id) > 32} == {
         "0009_acquisition_strategy_attempts",
         "0011_editorial_workspace_snapshots",
         "0017_editorial_proposal_bar_chart_operation",
+        "0018_editorial_enrichment_element_operations",
     }
     assert len(revision_ids) == len(set(revision_ids)), "duplicate Alembic revision IDs"
     assert set(revision_ids) == set(EXPECTED_CHAIN)
@@ -148,4 +208,7 @@ def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
         "0015_editorial_proposal_impacts": "0014_editorial_proposals",
         "0016_editorial_drafts": "0015_editorial_proposal_impacts",
         "0017_editorial_proposal_bar_chart_operation": "0016_editorial_drafts",
+        "0018_editorial_enrichment_element_operations": (
+            "0017_editorial_proposal_bar_chart_operation"
+        ),
     }

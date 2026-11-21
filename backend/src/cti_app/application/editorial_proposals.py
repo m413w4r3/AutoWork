@@ -3876,6 +3876,14 @@ class EditorialProposalService:
             }
             and preparation.target.kind is TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT
         )
+        is_enrichment_order = (
+            preparation.target.kind is TargetedEditorialRevisionTargetKind.ENRICHMENT_ORDER
+        )
+        is_enrichment_target = preparation.target.kind in {
+            TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT,
+            TargetedEditorialRevisionTargetKind.ENRICHMENT_ORDER,
+        }
+        occurrence_is_synthesis = is_enrichment_insertion or is_enrichment_order
         await uow.production_runs.lock_creation_for_subject(preparation.subject_id)
         snapshot = await uow.editorial_workspace_snapshots.get_by_id(preparation.snapshot_id)
         latest_snapshot = await uow.editorial_workspace_snapshots.latest_for_run(
@@ -3907,48 +3915,48 @@ class EditorialProposalService:
             )
         expected_artifact_id = (
             snapshot.enrichment_artifact_id
-            if is_enrichment_insertion
+            if is_enrichment_target
             else snapshot.synthesis_artifact_id
         )
         expected_artifact_version = (
-            snapshot.enrichment_version if is_enrichment_insertion else snapshot.synthesis_version
+            snapshot.enrichment_version if is_enrichment_target else snapshot.synthesis_version
         )
         expected_input_hash = (
             snapshot.enrichment_input_hash
-            if is_enrichment_insertion
+            if is_enrichment_target
             else snapshot.synthesis_input_hash
         )
         expected_sha256 = (
             snapshot.enrichment_canonical_sha256
-            if is_enrichment_insertion
+            if is_enrichment_target
             else snapshot.synthesis_canonical_sha256
         )
         if expected_artifact_id != preparation.base_artifact_id:
             raise EditorialProposalApplicationError(
                 "proposal_base_stale",
                 reason="pins:enrichment_artifact_id"
-                if is_enrichment_insertion
+                if is_enrichment_target
                 else "pins:synthesis_artifact_id",
             )
         if expected_artifact_version != preparation.base_artifact_version:
             raise EditorialProposalApplicationError(
                 "proposal_base_stale",
                 reason="pins:enrichment_version"
-                if is_enrichment_insertion
+                if is_enrichment_target
                 else "pins:synthesis_version",
             )
         if expected_input_hash != preparation.base_input_hash:
             raise EditorialProposalApplicationError(
                 "proposal_base_stale",
                 reason="pins:enrichment_input_hash"
-                if is_enrichment_insertion
+                if is_enrichment_target
                 else "pins:synthesis_input_hash",
             )
         if expected_sha256 != preparation.base_canonical_sha256:
             raise EditorialProposalApplicationError(
                 "proposal_base_stale",
                 reason="pins:enrichment_canonical_sha256"
-                if is_enrichment_insertion
+                if is_enrichment_target
                 else "pins:synthesis_canonical_sha256",
             )
         resolution = resolve_occurrence(snapshot, preparation.occurrence_id)
@@ -3958,17 +3966,17 @@ class EditorialProposalService:
             )
         expected_occurrence_artifact_id = (
             snapshot.synthesis_artifact_id
-            if is_enrichment_insertion
+            if occurrence_is_synthesis
             else preparation.base_artifact_id
         )
         expected_occurrence_version = (
             snapshot.synthesis_version
-            if is_enrichment_insertion
+            if occurrence_is_synthesis
             else preparation.base_artifact_version
         )
         expected_occurrence_sha256 = (
             snapshot.synthesis_canonical_sha256
-            if is_enrichment_insertion
+            if occurrence_is_synthesis
             else preparation.base_canonical_sha256
         )
         if resolution.artifact_id != expected_occurrence_artifact_id:
@@ -3986,6 +3994,17 @@ class EditorialProposalService:
         if is_enrichment_insertion and (
             resolution.entry.source_stage.value != "synthesis"
             or resolution.entry.content_sha256 != preparation.before_hash
+            or preparation.target.placement is None
+            or preparation.target.placement.anchor_block_id != preparation.occurrence_id
+        ):
+            raise EditorialProposalApplicationError("editorial_anchor_stale")
+        if is_enrichment_order and (
+            resolution.entry.source_stage.value != "synthesis"
+            or resolution.entry.kind
+            not in {
+                EditorialBlockKind.PARAGRAPH,
+                EditorialBlockKind.LEAD_PARAGRAPH,
+            }
             or preparation.target.placement is None
             or preparation.target.placement.anchor_block_id != preparation.occurrence_id
         ):
@@ -4078,6 +4097,20 @@ def _proposal_pins_match(
 
     operation = TargetedEditorialRevisionOperation(proposal.operation)
     if operation.paragraph_enrichment_element_kind is not None:
+        return (
+            resolution.entry.source_stage is EditorialSourceStage.SYNTHESIS
+            and resolution.entry.kind
+            in {EditorialBlockKind.PARAGRAPH, EditorialBlockKind.LEAD_PARAGRAPH}
+            and resolution.artifact_id == record.synthesis_artifact_id
+            and resolution.artifact_version == record.synthesis_version
+            and resolution.canonical_sha256 == record.synthesis_canonical_sha256
+            and record.enrichment_artifact_id == proposal.base_artifact_id
+            and record.enrichment_version == proposal.base_artifact_version
+            and record.enrichment_input_hash == proposal.base_input_hash
+            and record.enrichment_canonical_sha256 == proposal.base_canonical_sha256
+        )
+
+    if operation is TargetedEditorialRevisionOperation.REORDER_ENRICHMENT_ELEMENTS:
         return (
             resolution.entry.source_stage is EditorialSourceStage.SYNTHESIS
             and resolution.entry.kind

@@ -34,7 +34,8 @@ EDITORIAL_PROPOSAL_OPERATIONS_SQL = (
     "'rewrite_table', 'delete_table', 'create_diagram', 'rewrite_diagram', "
     "'delete_diagram', 'create_chart', 'rewrite_chart', 'delete_chart', "
     "'create_source_figure', 'rewrite_source_figure', 'replace_source_figure', "
-    "'delete_source_figure'"
+    "'delete_source_figure', 'update_visual_caption', 'move_enrichment_element', "
+    "'reorder_enrichment_elements'"
 )
 
 

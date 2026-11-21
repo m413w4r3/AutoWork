@@ -425,7 +425,10 @@ export type EditorialProposalOperation =
   | "create_source_figure"
   | "rewrite_source_figure"
   | "replace_source_figure"
-  | "delete_source_figure";
+  | "delete_source_figure"
+  | "update_visual_caption"
+  | "move_enrichment_element"
+  | "reorder_enrichment_elements";
 
 export interface EditorialProposalPatch {
   schema_version: "editorial-patch-v1";

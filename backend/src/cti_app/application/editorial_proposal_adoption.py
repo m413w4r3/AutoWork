@@ -115,6 +115,7 @@ from cti_app.domain.production_editorial_enrichment import (
 )
 from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionOperation,
+    TargetedEditorialRevisionPlacementKind,
     TargetedEditorialRevisionRequest,
     TargetedEditorialRevisionTarget,
     TargetedEditorialRevisionTargetKind,
@@ -1163,6 +1164,18 @@ def _proposal_stage(
     if not isinstance(target, Mapping):
         raise EditorialProposalAdoptionError("proposal_patch_invalid")
     target_kind = target.get("kind")
+    if target_kind == TargetedEditorialRevisionTargetKind.ENRICHMENT_ORDER.value:
+        placement = target.get("placement")
+        if (
+            resolution.entry is None
+            or resolution.entry.source_stage is not EditorialSourceStage.SYNTHESIS
+            or resolution.entry.kind.value not in {"paragraph", "lead_paragraph"}
+            or not isinstance(placement, Mapping)
+            or placement.get("kind") != TargetedEditorialRevisionPlacementKind.AFTER_PARAGRAPH
+            or str(placement.get("anchor_block_id")) != str(proposal.occurrence_id)
+        ):
+            raise EditorialProposalAdoptionError("editorial_anchor_stale")
+        return ProductionArtifactStage.EDITORIAL_ENRICHMENT
     if target_kind == TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT.value:
         stage = ProductionArtifactStage.EDITORIAL_ENRICHMENT
         placement = target.get("placement")
@@ -1217,6 +1230,18 @@ def _proposal_pins_match(
         return False
     operation = TargetedEditorialRevisionOperation(proposal.operation)
     if operation.paragraph_enrichment_element_kind is not None:
+        return (
+            resolution.entry.source_stage is EditorialSourceStage.SYNTHESIS
+            and resolution.entry.kind.value in {"paragraph", "lead_paragraph"}
+            and resolution.artifact_id == record.synthesis_artifact_id
+            and resolution.artifact_version == record.synthesis_version
+            and resolution.canonical_sha256 == record.synthesis_canonical_sha256
+            and record.enrichment_artifact_id == proposal.base_artifact_id
+            and record.enrichment_version == proposal.base_artifact_version
+            and record.enrichment_input_hash == proposal.base_input_hash
+            and record.enrichment_canonical_sha256 == proposal.base_canonical_sha256
+        )
+    if operation is TargetedEditorialRevisionOperation.REORDER_ENRICHMENT_ELEMENTS:
         return (
             resolution.entry.source_stage is EditorialSourceStage.SYNTHESIS
             and resolution.entry.kind.value in {"paragraph", "lead_paragraph"}
