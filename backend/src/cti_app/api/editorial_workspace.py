@@ -1955,6 +1955,13 @@ async def accept_editorial_proposal(
         raise
     except EditorialProposalAdoptionError as error:
         code = error.code
+        logger.warning(
+            "proposal_decision_rejected code=%s reason=%s frame=%s proposal_id=%s",
+            code,
+            error.reason or "not_applicable",
+            error.frame or "unavailable:0:unknown",
+            proposal_id,
+        )
         if code == "proposal_not_found":
             response_status = status.HTTP_404_NOT_FOUND
         elif code == "idempotency_key_invalid":

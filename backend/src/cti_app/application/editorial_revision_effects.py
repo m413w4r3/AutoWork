@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from enum import StrEnum
 from typing import Any, Protocol, cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
@@ -32,9 +34,50 @@ from cti_app.domain.production import ProductionArtifact, ProductionArtifactStag
 from cti_app.domain.publication_kind import PublicationKind
 
 
+class EditorialConflictReason(StrEnum):
+    NOT_APPLICABLE = "not_applicable"
+    EXPECTED_STATE_VERSION_INVALID = "expected_state_version_invalid"
+    PROPOSAL_NOT_PROPOSED = "proposal_not_proposed"
+    EXPECTED_STATE_VERSION_MISMATCH = "expected_state_version_mismatch"
+    LOCKED_PROPOSAL_STATE_MISMATCH = "locked_proposal_state_mismatch"
+    STALE_TRANSITION_CAS_CONFLICT = "stale_transition_cas_conflict"
+    ACCEPT_TRANSITION_CAS_CONFLICT = "accept_transition_cas_conflict"
+    ACCEPTED_PROPOSAL_INVARIANT_CONFLICT = "accepted_proposal_invariant_conflict"
+    STALE_PROPOSAL_SCOPE_CONFLICT = "stale_proposal_scope_conflict"
+    WORKSPACE_REGISTRY_CONFLICT = "workspace_registry_conflict"
+
+
+_DEFAULT_CONFLICT_REASON = {
+    "editorial_registry_conflict": EditorialConflictReason.WORKSPACE_REGISTRY_CONFLICT,
+    "editorial_proposal_state_conflict": (
+        EditorialConflictReason.ACCEPTED_PROPOSAL_INVARIANT_CONFLICT
+    ),
+    "proposal_state_conflict": EditorialConflictReason.STALE_TRANSITION_CAS_CONFLICT,
+}
+
+
 class EditorialRevisionEffectsError(RuntimeError):
-    def __init__(self, code: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        *,
+        reason: EditorialConflictReason | None = None,
+        frame: str | None = None,
+    ) -> None:
+        if reason is None:
+            reason = _DEFAULT_CONFLICT_REASON.get(code)
+        elif not isinstance(reason, EditorialConflictReason):
+            try:
+                reason = EditorialConflictReason(reason)
+            except ValueError:
+                raise ValueError("editorial revision conflict requires a closed reason") from None
+        caller = sys._getframe(1)
         self.code = code
+        self.reason = reason.value if reason is not None else None
+        self.frame = frame or (
+            f"{caller.f_code.co_filename.rsplit('/', 1)[-1]}:"
+            f"{caller.f_lineno}:{caller.f_code.co_name}"
+        )
         super().__init__(code)
 
 
@@ -420,7 +463,10 @@ async def stale_changed_pin_proposals(
 ) -> None:
     """Persist stale transitions for proposals whose exact pins no longer match."""
     if base_proposal is not None and base_proposal.production_run_id != production_run_id:
-        raise EditorialRevisionEffectsError("editorial_proposal_state_conflict")
+        raise EditorialRevisionEffectsError(
+            "editorial_proposal_state_conflict",
+            reason=EditorialConflictReason.STALE_PROPOSAL_SCOPE_CONFLICT,
+        )
     for proposal in await uow.editorial_proposals.list_proposed_for_run_for_update(
         production_run_id
     ):

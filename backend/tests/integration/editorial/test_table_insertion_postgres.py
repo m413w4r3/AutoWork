@@ -343,6 +343,7 @@ async def test_manual_table_patch_accept_publishes_table_at_registered_anchor(
         )
         assert manual_table.status_code == 200, manual_table.text
         proposal_view = manual_table.json()
+        assert proposal_view["state"] == EditorialProposalState.PROPOSED.value
         proposal_id = UUID(proposal_view["id"])
         proposal = None
         async with uow_factory() as uow:
@@ -351,6 +352,7 @@ async def test_manual_table_patch_accept_publishes_table_at_registered_anchor(
             )
         assert proposal is not None
         assert proposal.origin is EditorialProposalOrigin.MANUAL_PATCH
+        assert proposal.state is EditorialProposalState.PROPOSED
         assert proposal.actor_id == uuid5(NAMESPACE_URL, "autowork-actor:dev-analyst")
         assert proposal.thread_id is None
         assert proposal.model_run_id is None

@@ -72,7 +72,11 @@ from cti_app.domain.editorial_proposal import (
     variant_group_identity,
 )
 from cti_app.domain.editorial_thread import EditorialThreadEventKind
-from cti_app.domain.editorial_workspace import EditorialWorkspaceError
+from cti_app.domain.editorial_workspace import (
+    EditorialBlockKind,
+    EditorialSourceStage,
+    EditorialWorkspaceError,
+)
 from cti_app.domain.errors import BlobIntegrityError
 from cti_app.domain.model_conversations import ConversationTurnStatus
 from cti_app.domain.model_runs import ModelRunStatus
@@ -2694,16 +2698,51 @@ def _proposal_pins_match(
     proposal: EditorialProposal, resolution: WorkspaceOccurrenceResolution
 ) -> bool:
     record = resolution.record
+    if (
+        resolution.entry is None
+        or resolution.binding_state != "valid"
+        or record.subject_id != proposal.subject_id
+        or record.production_run_id != proposal.production_run_id
+        or record.snapshot_id != proposal.snapshot_id
+        or record.workspace_pin_hash != proposal.base_pin_hash
+        or record.routing_decision_hash != proposal.base_routing_hash
+    ):
+        return False
+
+    if proposal.operation == TargetedEditorialRevisionOperation.CREATE_TABLE.value:
+        return (
+            resolution.entry.source_stage is EditorialSourceStage.SYNTHESIS
+            and resolution.entry.kind
+            in {EditorialBlockKind.PARAGRAPH, EditorialBlockKind.LEAD_PARAGRAPH}
+            and resolution.artifact_id == record.synthesis_artifact_id
+            and resolution.artifact_version == record.synthesis_version
+            and resolution.canonical_sha256 == record.synthesis_canonical_sha256
+            and record.enrichment_artifact_id == proposal.base_artifact_id
+            and record.enrichment_version == proposal.base_artifact_version
+            and record.enrichment_input_hash == proposal.base_input_hash
+            and record.enrichment_canonical_sha256 == proposal.base_canonical_sha256
+        )
+
+    if resolution.entry.source_stage is EditorialSourceStage.SYNTHESIS:
+        return (
+            resolution.artifact_id == proposal.base_artifact_id
+            and resolution.artifact_version == proposal.base_artifact_version
+            and resolution.canonical_sha256 == proposal.base_canonical_sha256
+            and record.synthesis_artifact_id == proposal.base_artifact_id
+            and record.synthesis_version == proposal.base_artifact_version
+            and record.synthesis_input_hash == proposal.base_input_hash
+            and record.synthesis_canonical_sha256 == proposal.base_canonical_sha256
+        )
+
     return (
-        record.workspace_pin_hash == proposal.base_pin_hash
-        and record.routing_decision_hash == proposal.base_routing_hash
-        and record.synthesis_artifact_id == proposal.base_artifact_id
-        and record.synthesis_version == proposal.base_artifact_version
-        and record.synthesis_input_hash == proposal.base_input_hash
-        and record.synthesis_canonical_sha256 == proposal.base_canonical_sha256
+        resolution.entry.source_stage is EditorialSourceStage.EDITORIAL_ENRICHMENT
         and resolution.artifact_id == proposal.base_artifact_id
         and resolution.artifact_version == proposal.base_artifact_version
         and resolution.canonical_sha256 == proposal.base_canonical_sha256
+        and record.enrichment_artifact_id == proposal.base_artifact_id
+        and record.enrichment_version == proposal.base_artifact_version
+        and record.enrichment_input_hash == proposal.base_input_hash
+        and record.enrichment_canonical_sha256 == proposal.base_canonical_sha256
     )
 
 

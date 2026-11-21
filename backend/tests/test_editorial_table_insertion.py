@@ -21,7 +21,11 @@ from cti_app.application.editorial_proposals import (
     _editorial_patch_text_violation,
     _manual_table_evidence_handles,
 )
+from cti_app.application.editorial_proposals import (
+    _proposal_pins_match as _proposal_inspection_pins_match,
+)
 from cti_app.application.editorial_workspace.registry import (
+    WorkspaceOccurrenceResolution,
     WorkspaceSnapshotRecord,
     allowed_operations,
     project_blocks,
@@ -343,16 +347,22 @@ def test_manual_table_rejects_row_evidence_outside_the_admitted_pack() -> None:
     assert error.value.code == "manual_edit_new_fact_unadmitted"
 
 
-def test_table_patch_keeps_anchor_through_adoption() -> None:
+@pytest.mark.asyncio
+async def test_table_patch_keeps_anchor_through_adoption() -> None:
+    from cti_app.domain.editorial_proposal import (
+        EditorialProposal,
+        EditorialProposalOrigin,
+        EditorialProposalState,
+    )
     from cti_app.domain.production import ProductionArtifactStage
     from cti_app.domain.production_editorial_enrichment import EditorialEnrichmentElementKind
+    from cti_app.domain.production_editorial_revision import TargetedEditorialRevisionOperation
 
     anchor = uuid4()
     synthesis_artifact_id = uuid4()
     enrichment_artifact_id = uuid4()
     subject_id = uuid4()
     run_id = uuid4()
-    snapshot_id = uuid4()
     entry = BlockRegistryEntry(
         block_id=anchor,
         kind=EditorialBlockKind.PARAGRAPH,
@@ -362,38 +372,59 @@ def test_table_patch_keeps_anchor_through_adoption() -> None:
         source_stage=EditorialSourceStage.SYNTHESIS,
         structural_pointer="/sections/0/paragraphs/0",
     )
-    record = SimpleNamespace(
+    enrichment_artifact = ProductionArtifact(
+        id=enrichment_artifact_id,
+        production_run_id=run_id,
+        subject_id=subject_id,
+        stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+        version=5,
+        input_hash="f" * 64,
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=uuid4(),
+    )
+    record = _workspace_record(
         subject_id=subject_id,
         production_run_id=run_id,
-        snapshot_id=snapshot_id,
-        workspace_pin_hash="b" * 64,
-        routing_decision_hash="c" * 64,
         synthesis_artifact_id=synthesis_artifact_id,
-        synthesis_version=3,
-        synthesis_input_hash="d" * 64,
-        synthesis_canonical_sha256="e" * 64,
-        enrichment_artifact_id=enrichment_artifact_id,
-        enrichment_version=5,
-        enrichment_input_hash="f" * 64,
-        enrichment_canonical_sha256="1" * 64,
+        synthesis_sha256="e" * 64,
+        entries=(entry,),
+        enrichment_artifact=enrichment_artifact,
+        enrichment_sha256="1" * 64,
     )
-    proposal = SimpleNamespace(
-        operation="create_table",
-        occurrence_id=anchor,
+    proposal = EditorialProposal(
+        id=uuid4(),
         subject_id=subject_id,
         production_run_id=run_id,
-        snapshot_id=snapshot_id,
-        base_pin_hash=record.workspace_pin_hash,
-        base_routing_hash=record.routing_decision_hash,
+        origin=EditorialProposalOrigin.MANUAL_PATCH,
+        snapshot_id=record.snapshot_id,
+        occurrence_id=anchor,
         base_artifact_id=enrichment_artifact_id,
-        base_artifact_version=record.enrichment_version,
-        base_input_hash=record.enrichment_input_hash,
-        base_canonical_sha256=record.enrichment_canonical_sha256,
+        base_artifact_version=record.enrichment_version or 0,
+        base_input_hash=record.enrichment_input_hash or "",
+        base_canonical_sha256=record.enrichment_canonical_sha256 or "",
+        base_routing_hash=record.routing_decision_hash,
+        base_pin_hash=record.workspace_pin_hash,
+        target_id="synthetic-table-target",
+        operation=TargetedEditorialRevisionOperation.CREATE_TABLE.value,
+        before_hash=entry.content_sha256,
+        patch_blob_ref=uuid4(),
+        patch_sha256="2" * 64,
+        evidence_refs=(),
+        diagnostics={},
+        thread_id=None,
+        variant_group_id=uuid4(),
+        model_run_id=None,
+        model_turn_id=None,
+        state=EditorialProposalState.PROPOSED,
+        state_version=1,
+        actor_id=uuid4(),
+        idempotency_key="table-proposal-00000001",
+        request_sha256="3" * 64,
     )
-    resolution = SimpleNamespace(
+    resolution = WorkspaceOccurrenceResolution(
+        record=record,
         entry=entry,
         binding_state="valid",
-        record=record,
         artifact_id=synthesis_artifact_id,
         artifact_version=record.synthesis_version,
         canonical_sha256=record.synthesis_canonical_sha256,
@@ -414,10 +445,115 @@ def test_table_patch_keeps_anchor_through_adoption() -> None:
         _proposal_stage(proposal, patch, resolution) is ProductionArtifactStage.EDITORIAL_ENRICHMENT
     )
     assert _proposal_pins_match(proposal, resolution)
+    assert _proposal_inspection_pins_match(proposal, resolution)
+    stale_resolution = replace(resolution, record=replace(record, enrichment_version=6))
+    assert not _proposal_pins_match(proposal, stale_resolution)
+    assert not _proposal_inspection_pins_match(proposal, stale_resolution)
+
+    from cti_app.application.editorial_proposal_adoption_inputs import (
+        ProductionEditorialProposalAdoptionInputs,
+    )
+
+    inputs = ProductionEditorialProposalAdoptionInputs(
+        uow_factory=object(),
+        artifact_store=object(),
+        workspace_service=object(),
+        synthesis_loader=object(),
+        enrichment_loader=object(),
+        enrichment_revision_service=object(),
+    )
+    await inputs._revalidate_thread(None, proposal, resolution)
 
     patch["target"]["placement"]["anchor_block_id"] = str(uuid4())
     with pytest.raises(EditorialProposalAdoptionError, match="proposal_target_mismatch"):
         _proposal_stage(proposal, patch, resolution)
+
+
+def test_revision_effect_conflict_has_closed_reason_and_origin_frame() -> None:
+    from cti_app.application.editorial_revision_effects import EditorialRevisionEffectsError
+
+    with pytest.raises(EditorialRevisionEffectsError) as caught:
+        raise EditorialRevisionEffectsError("proposal_state_conflict")
+
+    assert caught.value.reason == "stale_transition_cas_conflict"
+    assert caught.value.frame is not None
+    assert caught.value.frame.startswith("test_editorial_table_insertion.py:")
+    assert caught.value.frame.endswith(
+        ":test_revision_effect_conflict_has_closed_reason_and_origin_frame"
+    )
+    with pytest.raises(ValueError, match="closed reason"):
+        EditorialRevisionEffectsError("proposal_state_conflict", reason="untrusted source text")
+
+
+@pytest.mark.asyncio
+async def test_accept_route_logs_closed_rejection_reason_and_source_frame(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from cti_app.application.editorial_revision_effects import EditorialConflictReason
+
+    subject_id, occurrence_id, proposal_id, actor_id = (uuid4() for _ in range(4))
+
+    class AdoptionService:
+        async def adopt(self, *_args, **_kwargs):
+            raise EditorialProposalAdoptionError(
+                "proposal_state_conflict",
+                reason=EditorialConflictReason.EXPECTED_STATE_VERSION_MISMATCH,
+            )
+
+    async def actor_id_for_request(_request: Request) -> UUID:
+        return actor_id
+
+    monkeypatch.setattr(editorial_workspace_api, "_proposal_impact_consumer_wired", lambda: True)
+    monkeypatch.setattr(
+        editorial_workspace_api, "_proposal_adoption_service", lambda _request: AdoptionService()
+    )
+    monkeypatch.setattr(editorial_workspace_api, "_thread_actor_id", actor_id_for_request)
+    app = FastAPI()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/accept",
+            "headers": [],
+            "query_string": b"",
+            "server": ("editorial.test", 80),
+            "client": ("test", 1),
+            "app": app,
+        }
+    )
+    payload = editorial_workspace_api.EditorialProposalAcceptRequest(
+        expected_state_version=1,
+        patch_sha256="a" * 64,
+    )
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(HTTPException) as caught:
+            await editorial_workspace_api.accept_editorial_proposal(
+                subject_id,
+                occurrence_id,
+                proposal_id,
+                request,
+                payload,
+                "accept-table-decision-0001",
+            )
+
+    assert caught.value.status_code == 409
+    assert caught.value.detail["code"] == "proposal_state_conflict"
+    assert "proposal_decision_rejected code=proposal_state_conflict" in caplog.text
+    assert "reason=expected_state_version_mismatch" in caplog.text
+    assert "proposal_id=" + str(proposal_id) in caplog.text
+    assert "frame=test_editorial_table_insertion.py:" in caplog.text
+    assert ":adopt" in caplog.text
+    assert "Synthetic" not in caplog.text
+
+
+def test_proposal_state_conflict_rejects_non_vocabulary_reason() -> None:
+    with pytest.raises(ValueError, match="closed reason"):
+        EditorialProposalAdoptionError(
+            "proposal_state_conflict",
+            reason="proposal state did not match user prose",
+        )
 
 
 def test_manual_table_text_rejects_markup() -> None:
