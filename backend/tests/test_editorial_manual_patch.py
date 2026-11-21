@@ -16,6 +16,7 @@ from cti_app.application.editorial_proposals import (
     EditorialProposalApplicationError,
     _validate_editorial_text_grounding,
 )
+from cti_app.application.editorial_revision_effects import EditorialConflictReason
 from cti_app.config import Settings
 from cti_app.domain.editorial_proposal import (
     EditorialProposalConflict,
@@ -420,7 +421,13 @@ async def test_manual_route_maps_causes_and_logs_code_reason_and_ids(
     import logging
 
     subject_id, occurrence_id = uuid4(), uuid4()
-    stale_reason = "test:base_snapshot" if internal_code == "proposal_base_stale" else None
+    stale_reason = (
+        "test:base_snapshot"
+        if internal_code == "proposal_base_stale"
+        else EditorialConflictReason.STALE_TRANSITION_CAS_CONFLICT.value
+        if internal_code == "proposal_state_conflict"
+        else None
+    )
     internal_error = error_type(internal_code, reason=stale_reason)
 
     class ProposalService:
