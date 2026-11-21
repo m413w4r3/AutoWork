@@ -402,7 +402,7 @@ describe("VisualInsertionComposer", () => {
     ).toBe(false);
   });
 
-  it("keeps the manual table flow available when Bridge table proposals are unavailable", async () => {
+  it("requires the server create_table capability before opening the table flow", async () => {
     const noTableOperation = {
       ...anchor,
       allowed_operations: ["insert_after"],
@@ -423,14 +423,90 @@ describe("VisualInsertionComposer", () => {
 
     const addButton = screen.getByRole("button", { name: "Ajouter après" });
     fireEvent.click(addButton);
-    fireEvent.click(screen.getByRole("menuitem", { name: "Tableau" }));
-    expect(screen.getByRole("textbox", { name: "Consigne" })).toBeVisible();
+    const tableMenuItem = screen.getByRole("menuitem", { name: "Tableau" });
+    expect(tableMenuItem).toBeDisabled();
     expect(
-      screen.getByText(/Le Bridge ne peut pas proposer un tableau/),
+      screen.getByText(
+        "Création de tableau indisponible pour ce passage : les artefacts éditoriaux ne sont pas prêts.",
+      ),
     ).toBeVisible();
     expect(
       screen.queryByRole("button", { name: "Demander au Bridge" }),
     ).not.toBeInTheDocument();
+    fireEvent.click(tableMenuItem);
+    expect(
+      screen.queryByRole("region", { name: "Créer un tableau" }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Proposer" })).toBeNull();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(
+      screen.queryByRole("region", { name: "Créer un tableau" }),
+    ).not.toBeInTheDocument();
+    await waitFor(() => expect(addButton).toHaveFocus());
+  });
+
+  it("reuses the proposal idempotency key after a network failure", async () => {
+    const proposalRequests: RequestInit[] = [];
+    let proposalAttempt = 0;
+    const fetchMock = vi.fn<typeof fetch>((input, init) => {
+      const url = requestUrl(input);
+      if (url.endsWith("/table-proposals") && init?.method === "POST") {
+        proposalRequests.push(init);
+        proposalAttempt += 1;
+        if (proposalAttempt === 1) {
+          return Promise.reject(new TypeError("Network unavailable"));
+        }
+        if (proposalAttempt === 2) {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                detail: {
+                  code: "manual_table_request_invalid",
+                  message: "La proposition est invalide.",
+                },
+              }),
+              {
+                status: 422,
+                headers: { "Content-Type": "application/json" },
+              },
+            ),
+          );
+        }
+        return Promise.resolve(
+          new Response(JSON.stringify(proposal), {
+            status: 201,
+            headers: { "Content-Type": "application/json" },
+          }),
+        );
+      }
+      if (url.endsWith(`/proposals/${proposal.id}`)) {
+        return Promise.resolve(
+          new Response(JSON.stringify(proposal), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+        );
+      }
+      throw new Error(`Unexpected request ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    render(
+      <QueryClientProvider client={client}>
+        <VisualInsertionComposer
+          subjectId="subject-1"
+          snapshot={snapshot}
+          block={anchor}
+          readOnly={false}
+        />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Ajouter après" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Tableau" }));
     fireEvent.change(
       screen.getByRole("textbox", { name: "Titre du tableau" }),
       {
@@ -456,11 +532,35 @@ describe("VisualInsertionComposer", () => {
     fireEvent.click(
       screen.getByRole("checkbox", { name: /Source synthétique/ }),
     );
-    expect(screen.getByRole("button", { name: "Proposer" })).toBeEnabled();
-    fireEvent.keyDown(window, { key: "Escape" });
-    expect(
-      screen.queryByRole("region", { name: "Créer un tableau" }),
-    ).not.toBeInTheDocument();
-    await waitFor(() => expect(addButton).toHaveFocus());
+
+    const proposeButton = screen.getByRole("button", { name: "Proposer" });
+    fireEvent.click(proposeButton);
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Network unavailable",
+    );
+    fireEvent.click(proposeButton);
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Le tableau est incomplet ou incohérent.",
+    );
+
+    const keyFor = (init: RequestInit) =>
+      new Headers(init.headers).get("Idempotency-Key");
+    expect(proposalRequests).toHaveLength(2);
+    expect(keyFor(proposalRequests[1]!)).toBe(keyFor(proposalRequests[0]!));
+
+    fireEvent.click(proposeButton);
+    await screen.findByRole("article", { name: "Proposition éditoriale" });
+    expect(proposalRequests).toHaveLength(3);
+    expect(keyFor(proposalRequests[2]!)).not.toBe(keyFor(proposalRequests[1]!));
+
+    fireEvent.change(
+      screen.getByRole("textbox", { name: "Titre du tableau" }),
+      {
+        target: { value: "Résumé synthétique révisé" },
+      },
+    );
+    fireEvent.click(proposeButton);
+    await waitFor(() => expect(proposalRequests).toHaveLength(4));
+    expect(keyFor(proposalRequests[3]!)).not.toBe(keyFor(proposalRequests[2]!));
   });
 });

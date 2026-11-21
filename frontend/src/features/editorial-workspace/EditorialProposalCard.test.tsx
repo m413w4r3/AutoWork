@@ -76,11 +76,14 @@ describe("EditorialProposalCard", () => {
   });
 
   it("shows a structured table insertion with its anchor and consultable evidence", async () => {
+    const anchorId = "22222222-2222-4222-8222-222222222222";
+    const sourceDocumentId = "11111111-1111-4111-8111-111111111111";
+    const evidenceKey = "d".repeat(64);
     const proposal = {
       id: "proposal-table",
       subject_id: "subject-1",
       production_run_id: "run-1",
-      occurrence_id: "anchor-1",
+      occurrence_id: anchorId,
       thread_id: null,
       origin: "manual_patch",
       state: "proposed",
@@ -98,11 +101,11 @@ describe("EditorialProposalCard", () => {
           kind: "enrichment_element",
           placement: {
             kind: "after_paragraph",
-            anchor_block_id: "anchor-1",
+            anchor_block_id: anchorId,
           },
         },
         target_id: "target-table-1",
-        occurrence_id: "anchor-1",
+        occurrence_id: anchorId,
         before_hash: "c".repeat(64),
         rationale: "Insertion manuelle fondée sur les preuves choisies.",
         enrichment_patch: {
@@ -124,7 +127,7 @@ describe("EditorialProposalCard", () => {
               ],
               placement: {
                 kind: "after_paragraph",
-                anchor_block_id: "anchor-1",
+                anchor_block_id: anchorId,
               },
               purpose: {
                 question: "Quelles informations sont rapportées ?",
@@ -140,9 +143,9 @@ describe("EditorialProposalCard", () => {
         },
         evidence_refs: [
           {
-            source_document_id: "source-1",
+            source_document_id: sourceDocumentId,
             kind: "fact",
-            evidence_key: "d".repeat(64),
+            evidence_key: evidenceKey,
           },
         ],
       },
@@ -168,7 +171,7 @@ describe("EditorialProposalCard", () => {
       <QueryClientProvider client={client}>
         <EditorialProposalCard
           subjectId="subject-1"
-          occurrenceId="anchor-1"
+          occurrenceId={anchorId}
           proposalId="proposal-table"
         />
       </QueryClientProvider>,
@@ -184,9 +187,15 @@ describe("EditorialProposalCard", () => {
     ).toBeVisible();
     expect(screen.getByText("Échantillon")).toBeVisible();
     expect(screen.getByText("Après ce paragraphe")).toBeVisible();
+    expect(screen.getByText(`Ancre · ${anchorId}`)).not.toBeVisible();
+    expect(
+      screen.getByText(`Source ${sourceDocumentId} · fact`),
+    ).not.toBeVisible();
+    fireEvent.click(screen.getByText("Détails de la proposition"));
+    expect(screen.getByText(`Ancre · ${anchorId}`)).toBeVisible();
     fireEvent.click(screen.getByText("Preuves associées"));
-    expect(screen.getByText("d".repeat(64))).toBeVisible();
-    expect(screen.getByText("Source source-1 · fact")).toBeVisible();
+    expect(screen.getByText(evidenceKey)).toBeVisible();
+    expect(screen.getByText(`Source ${sourceDocumentId} · fact`)).toBeVisible();
     expect(screen.getByRole("button", { name: "Accepter" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Rejeter" })).toBeVisible();
   });

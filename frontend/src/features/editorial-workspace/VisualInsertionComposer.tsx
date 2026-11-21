@@ -1,6 +1,7 @@
 import { useMutation } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 
+import { ApiError } from "../../api/editions";
 import {
   createManualEditorialTableProposal,
   type EditorialEvidenceReference,
@@ -8,6 +9,8 @@ import {
   type EditorialWorkspaceSnapshot,
 } from "../../api/editorialWorkspace";
 import { EditorialProposalCard } from "./EditorialProposalCard";
+import { ManualTableEditor, type AdmittedEvidence } from "./ManualTableEditor";
+import type { TableColumnDraft, TableRowDraft } from "./ManualTablePreview";
 
 const DEFAULT_INSTRUCTION =
   "Créer un tableau à partir des informations de ce passage et de ses preuves associées.";
@@ -20,22 +23,6 @@ interface VisualInsertionComposerProps {
   block: EditorialWorkspaceBlock;
   readOnly: boolean;
   onAskBridge?: (instruction: string) => void;
-}
-
-interface AdmittedEvidence {
-  reference: EditorialEvidenceReference;
-  identity: string;
-  label: string;
-  passage: string | null;
-}
-
-interface TableColumnDraft {
-  label: string;
-}
-
-interface TableRowDraft {
-  cells: string[];
-  evidenceIdentities: string[];
 }
 
 const evidenceKinds = new Set<EditorialEvidenceReference["kind"]>([
@@ -131,6 +118,10 @@ export function VisualInsertionComposer({
   const [rows, setRows] = useState<TableRowDraft[]>([newRow(2)]);
   const [proposalId, setProposalId] = useState<string | null>(null);
   const [requestError, setRequestError] = useState<string | null>(null);
+  const proposalRequestRef = useRef<{
+    idempotencyKey: string;
+    tableKey: string;
+  } | null>(null);
   const admitted = admittedEvidence(block);
   const admittedByIdentity = new Map(
     admitted.map((item) => [item.identity, item.reference]),
@@ -144,6 +135,11 @@ export function VisualInsertionComposer({
     canInsertAfter && block.allowed_operations.includes("create_table");
   const proposalMutation = useMutation({
     mutationFn: () => {
+      const proposalRequest = proposalRequestRef.current ?? {
+        idempotencyKey: crypto.randomUUID(),
+        tableKey: crypto.randomUUID(),
+      };
+      proposalRequestRef.current = proposalRequest;
       const evidenceForRows = rows.map((row) =>
         row.evidenceIdentities.flatMap((identity) => {
           const reference = admittedByIdentity.get(identity);
@@ -163,12 +159,12 @@ export function VisualInsertionComposer({
       return createManualEditorialTableProposal(
         subjectId,
         block.block_id,
-        crypto.randomUUID(),
+        proposalRequest.idempotencyKey,
         {
           snapshot_id: snapshot.snapshot_id,
           anchor_block_id: block.block_id,
           table: {
-            key: `table-${crypto.randomUUID()}`,
+            key: `table-${proposalRequest.tableKey}`,
             kind: "custom",
             title: title.trim(),
             caption: caption.trim() || null,
@@ -197,10 +193,18 @@ export function VisualInsertionComposer({
       );
     },
     onSuccess: (proposal) => {
+      proposalRequestRef.current = null;
       setProposalId(proposal.id);
       setRequestError(null);
     },
     onError: (error: Error) => {
+      if (
+        error instanceof ApiError &&
+        error.status >= 400 &&
+        error.status < 500
+      ) {
+        proposalRequestRef.current = null;
+      }
       setRequestError(error.message);
     },
   });
@@ -224,6 +228,10 @@ export function VisualInsertionComposer({
   }, [editorOpen]);
 
   useEffect(() => {
+    proposalRequestRef.current = null;
+  }, [block.block_id, snapshot.snapshot_id, subjectId]);
+
+  useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
       if (!editorOpen && !menuOpen) return;
@@ -239,8 +247,28 @@ export function VisualInsertionComposer({
 
   if (!canInsertAfter) return null;
 
+  const invalidateProposalRequest = () => {
+    proposalRequestRef.current = null;
+  };
+
+  const updateInstruction = (value: string) => {
+    invalidateProposalRequest();
+    setInstruction(value);
+  };
+
+  const updateTitle = (value: string) => {
+    invalidateProposalRequest();
+    setTitle(value);
+  };
+
+  const updateCaption = (value: string) => {
+    invalidateProposalRequest();
+    setCaption(value);
+  };
+
   const addColumn = () => {
     if (columns.length >= 64) return;
+    invalidateProposalRequest();
     setColumns((current) => [...current, newColumn()]);
     setRows((current) =>
       current.map((row) => ({ ...row, cells: [...row.cells, ""] })),
@@ -249,6 +277,7 @@ export function VisualInsertionComposer({
 
   const removeColumn = (columnIndex: number) => {
     if (columns.length <= 2) return;
+    invalidateProposalRequest();
     setColumns((current) =>
       current.filter((_, index) => index !== columnIndex),
     );
@@ -261,6 +290,7 @@ export function VisualInsertionComposer({
   };
 
   const updateCell = (rowIndex: number, columnIndex: number, value: string) => {
+    invalidateProposalRequest();
     setRows((current) =>
       current.map((row, index) =>
         index === rowIndex
@@ -280,6 +310,7 @@ export function VisualInsertionComposer({
     identity: string,
     checked: boolean,
   ) => {
+    invalidateProposalRequest();
     setRows((current) =>
       current.map((row, index) => {
         if (index !== rowIndex) return row;
@@ -289,6 +320,27 @@ export function VisualInsertionComposer({
         return { ...row, evidenceIdentities };
       }),
     );
+  };
+
+  const updateColumnLabel = (columnIndex: number, label: string) => {
+    invalidateProposalRequest();
+    setColumns((current) =>
+      current.map((item, index) =>
+        index === columnIndex ? { ...item, label } : item,
+      ),
+    );
+  };
+
+  const addRow = () => {
+    if (rows.length >= 1000) return;
+    invalidateProposalRequest();
+    setRows((current) => [...current, newRow(columns.length)]);
+  };
+
+  const removeRow = (rowIndex: number) => {
+    if (rows.length <= 1) return;
+    invalidateProposalRequest();
+    setRows((current) => current.filter((_, index) => index !== rowIndex));
   };
 
   return (
@@ -312,13 +364,24 @@ export function VisualInsertionComposer({
           <button
             type="button"
             role="menuitem"
+            disabled={!canCreateTable}
             onClick={() => {
+              if (!canCreateTable) return;
               setMenuOpen(false);
               setEditorOpen(true);
             }}
           >
             Tableau
           </button>
+          {!canCreateTable ? (
+            <p
+              className="editorial-visual-insertion__bridge-reason"
+              role="note"
+            >
+              Création de tableau indisponible pour ce passage : les artefacts
+              éditoriaux ne sont pas prêts.
+            </p>
+          ) : null}
         </div>
       ) : null}
       {editorOpen ? (
@@ -344,199 +407,25 @@ export function VisualInsertionComposer({
           <p className="editorial-visual-insertion__manual-note">
             Cette proposition est créée manuellement, sans appel de modèle.
           </p>
-          <label className="editorial-visual-insertion__field">
-            <span>Consigne</span>
-            <textarea
-              ref={instructionRef}
-              value={instruction}
-              onChange={(event) => setInstruction(event.currentTarget.value)}
-              rows={2}
-            />
-          </label>
-          <label className="editorial-visual-insertion__field">
-            <span>Titre du tableau</span>
-            <input
-              value={title}
-              onChange={(event) => setTitle(event.currentTarget.value)}
-              maxLength={1000}
-            />
-          </label>
-          <label className="editorial-visual-insertion__field">
-            <span>Légende</span>
-            <input
-              value={caption}
-              onChange={(event) => setCaption(event.currentTarget.value)}
-              maxLength={2000}
-            />
-          </label>
-          <fieldset className="editorial-visual-insertion__columns">
-            <legend>Intitulés de colonnes</legend>
-            {columns.map((column, columnIndex) => (
-              <div
-                className="editorial-visual-insertion__column"
-                key={columnIndex}
-              >
-                <label>
-                  <span>Colonne {columnIndex + 1}</span>
-                  <input
-                    aria-label={`Intitulé de colonne ${columnIndex + 1}`}
-                    value={column.label}
-                    maxLength={500}
-                    onChange={(event) => {
-                      const label = event.currentTarget.value;
-                      setColumns((current) =>
-                        current.map((item, index) =>
-                          index === columnIndex ? { ...item, label } : item,
-                        ),
-                      );
-                    }}
-                  />
-                </label>
-                <button
-                  className="button button--secondary"
-                  type="button"
-                  disabled={columns.length <= 2}
-                  aria-label={`Supprimer la colonne ${columnIndex + 1}`}
-                  onClick={() => removeColumn(columnIndex)}
-                >
-                  Supprimer
-                </button>
-              </div>
-            ))}
-            <button
-              className="button button--secondary"
-              type="button"
-              disabled={columns.length >= 64}
-              onClick={addColumn}
-            >
-              Ajouter une colonne
-            </button>
-          </fieldset>
-          <fieldset className="editorial-visual-insertion__rows">
-            <legend>Lignes et preuves associées</legend>
-            {rows.map((row, rowIndex) => (
-              <section
-                className="editorial-visual-insertion__row"
-                key={rowIndex}
-                aria-labelledby={`editorial-table-row-${rowIndex + 1}`}
-              >
-                <header>
-                  <h4 id={`editorial-table-row-${rowIndex + 1}`}>
-                    Ligne {rowIndex + 1}
-                  </h4>
-                  <button
-                    className="button button--secondary"
-                    type="button"
-                    disabled={rows.length <= 1}
-                    aria-label={`Supprimer la ligne ${rowIndex + 1}`}
-                    onClick={() =>
-                      setRows((current) =>
-                        current.filter((_, index) => index !== rowIndex),
-                      )
-                    }
-                  >
-                    Supprimer la ligne
-                  </button>
-                </header>
-                <div className="editorial-visual-insertion__cells">
-                  {columns.map((_, columnIndex) => (
-                    <label key={columnIndex}>
-                      <span>Colonne {columnIndex + 1}</span>
-                      <input
-                        aria-label={`Cellule ligne ${rowIndex + 1}, colonne ${columnIndex + 1}`}
-                        value={row.cells[columnIndex] ?? ""}
-                        maxLength={2000}
-                        onChange={(event) =>
-                          updateCell(
-                            rowIndex,
-                            columnIndex,
-                            event.currentTarget.value,
-                          )
-                        }
-                      />
-                    </label>
-                  ))}
-                </div>
-                <fieldset
-                  className="editorial-visual-insertion__evidence"
-                  aria-label={`Preuves ligne ${rowIndex + 1}`}
-                >
-                  <legend>Preuves admises pour cette ligne</legend>
-                  {admitted.length > 0 ? (
-                    admitted.map((item) => (
-                      <label key={item.identity}>
-                        <input
-                          type="checkbox"
-                          checked={row.evidenceIdentities.includes(
-                            item.identity,
-                          )}
-                          onChange={(event) =>
-                            toggleRowEvidence(
-                              rowIndex,
-                              item.identity,
-                              event.currentTarget.checked,
-                            )
-                          }
-                        />
-                        <span>
-                          <strong>{item.label}</strong>
-                          {item.passage ? <small>{item.passage}</small> : null}
-                        </span>
-                      </label>
-                    ))
-                  ) : (
-                    <p>
-                      Aucune preuve admise n’est disponible pour ce paragraphe.
-                    </p>
-                  )}
-                </fieldset>
-              </section>
-            ))}
-            <button
-              className="button button--secondary"
-              type="button"
-              disabled={rows.length >= 1000}
-              onClick={() =>
-                setRows((current) => [...current, newRow(columns.length)])
-              }
-            >
-              Ajouter une ligne
-            </button>
-          </fieldset>
-          <section
-            className="editorial-visual-insertion__preview"
-            aria-labelledby="editorial-table-preview-heading"
-          >
-            <h4 id="editorial-table-preview-heading">Aperçu du tableau</h4>
-            <p className="editorial-visual-insertion__table-title">
-              {title || "Titre du tableau"}
-            </p>
-            <div className="editorial-visual-insertion__table-scroll">
-              <table aria-label={title || "Aperçu du tableau"}>
-                <caption>{caption || title || "Tableau proposé"}</caption>
-                <thead>
-                  <tr>
-                    {columns.map((column, index) => (
-                      <th key={index} scope="col">
-                        {column.label || `Colonne ${index + 1}`}
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {rows.map((row, rowIndex) => (
-                    <tr key={rowIndex}>
-                      {columns.map((_, columnIndex) => (
-                        <td key={columnIndex}>
-                          {row.cells[columnIndex] || "—"}
-                        </td>
-                      ))}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </section>
+          <ManualTableEditor
+            instruction={instruction}
+            instructionRef={instructionRef}
+            title={title}
+            caption={caption}
+            columns={columns}
+            rows={rows}
+            admitted={admitted}
+            onInstructionChange={updateInstruction}
+            onTitleChange={updateTitle}
+            onCaptionChange={updateCaption}
+            onColumnLabelChange={updateColumnLabel}
+            onAddColumn={addColumn}
+            onRemoveColumn={removeColumn}
+            onCellChange={updateCell}
+            onToggleRowEvidence={toggleRowEvidence}
+            onAddRow={addRow}
+            onRemoveRow={removeRow}
+          />
           {canCreateTable ? (
             <button
               className="button button--secondary editorial-visual-insertion__bridge"
@@ -545,22 +434,25 @@ export function VisualInsertionComposer({
             >
               Demander au Bridge
             </button>
-          ) : (
+          ) : null}
+          {!canCreateTable ? (
             <p
               className="editorial-visual-insertion__bridge-reason"
               role="note"
             >
-              Le Bridge ne peut pas proposer un tableau pour ce paragraphe :
-              l’opération « create_table » n’est pas autorisée dans
-              l’instantané.
+              Création de tableau indisponible pour ce passage : les artefacts
+              éditoriaux ne sont pas prêts.
             </p>
-          )}
+          ) : null}
           {requestError ? <p role="alert">{requestError}</p> : null}
           <button
             className="button editorial-visual-insertion__propose"
             type="button"
-            disabled={!validTable || proposalMutation.isPending}
+            disabled={
+              !canCreateTable || !validTable || proposalMutation.isPending
+            }
             onClick={() => {
+              if (!canCreateTable) return;
               setProposalId(null);
               setRequestError(null);
               proposalMutation.mutate();

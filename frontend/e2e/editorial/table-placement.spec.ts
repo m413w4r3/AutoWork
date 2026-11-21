@@ -428,9 +428,10 @@ test("a table proposal is accepted after paragraph three in snapshot order", asy
     paragraphIds[3],
   ]);
   await page.getByRole("button", { name: "Fermer" }).click();
+  await page.evaluate("window.scrollTo(0, 0)");
   await page.screenshot({
     path: resolve(shotsDirectory, "document-tableau-insere-desktop.png"),
-    fullPage: true,
+    fullPage: false,
   });
   expect(requests.some((request) => request.includes("/entries"))).toBe(false);
   expect(unexpectedRequests).toEqual([]);

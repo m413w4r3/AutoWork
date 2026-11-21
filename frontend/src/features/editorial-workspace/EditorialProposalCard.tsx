@@ -108,9 +108,6 @@ function TableProposalComparison({
             </tbody>
           </table>
         </div>
-        <p className="editorial-proposal-card__table-anchor-id">
-          Ancre · {table.placement.anchor_block_id ?? "non renseignée"}
-        </p>
         {table.rows.some((row) => row.evidence_handles.length > 0) ? (
           <details className="editorial-proposal-card__table-handles">
             <summary>Références associées aux lignes</summary>
@@ -452,6 +449,12 @@ export function EditorialProposalCard({
       ) : null}
       <details className="editorial-proposal-card__details">
         <summary>Détails de la proposition</summary>
+        {tableProposal ? (
+          <p className="editorial-proposal-card__table-anchor-id">
+            Ancre ·{" "}
+            {tableProposal.placement.anchor_block_id ?? "non renseignée"}
+          </p>
+        ) : null}
         {proposal.patch?.enrichment_patch ? (
           <pre aria-label="Patch éditorial typé">
             {JSON.stringify(proposal.patch.enrichment_patch, null, 2)}
