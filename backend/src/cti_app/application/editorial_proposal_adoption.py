@@ -218,6 +218,7 @@ class EnrichmentCandidateInputs:
     input_hash: str
     artifact_id: UUID
     figure_catalog: tuple[ResolvedSourceFigureV1, ...] = ()
+    validated_patch: EditorialEnrichmentV1 | None = None
     registry_lineage: tuple[Mapping[str, object], ...] = ()
     retired_block_ids: tuple[UUID, ...] = ()
     is_create: bool = False
@@ -683,15 +684,17 @@ class EditorialProposalAdoptionService:
             validate_targeted_request(request)
             action = targeted_action(operation)
             validate_targeted_action(enrichment_inputs.element_kind, action)
-            validated_patch = validate_editorial_enrichment_patch(
-                raw_enrichment_patch,
-                element_kind=enrichment_inputs.element_kind,
-                element_key=enrichment_inputs.element_key,
-                evidence_pack=enrichment_inputs.evidence_pack,
-                extraction=enrichment_inputs.extraction,
-                synthesis=enrichment_inputs.synthesis,
-                figure_catalog=enrichment_inputs.figure_catalog,
-            )
+            validated_patch = enrichment_inputs.validated_patch
+            if validated_patch is None:
+                validated_patch = validate_editorial_enrichment_patch(
+                    raw_enrichment_patch,
+                    element_kind=enrichment_inputs.element_kind,
+                    element_key=enrichment_inputs.element_key,
+                    evidence_pack=enrichment_inputs.evidence_pack,
+                    extraction=enrichment_inputs.extraction,
+                    synthesis=enrichment_inputs.synthesis,
+                    figure_catalog=enrichment_inputs.figure_catalog,
+                )
             if operation is TargetedEditorialRevisionOperation.CREATE_BAR_CHART:
                 asset = enrichment_inputs.compiled_chart_asset
                 if (

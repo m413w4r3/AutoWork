@@ -16,7 +16,7 @@ from cti_app.domain.typst_render import (
     validate_typst_render_record,
 )
 
-PUBLICATION_RENDER_POLICY_VERSION = "typst-publication-v14-evidence-backed-bar-charts"
+PUBLICATION_RENDER_POLICY_VERSION = "typst-publication-v15-source-figure-provenance"
 
 
 class PublicationPreviewStatus(StrEnum):

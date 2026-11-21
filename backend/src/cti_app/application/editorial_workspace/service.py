@@ -429,6 +429,7 @@ class EditorialWorkspaceService:
                 enrichment_artifact=enrichment_artifact,
                 enrichment_read_sha256=enrichment_sha,
                 allow_operations=kind is not None,
+                allow_figure_insertion=kind is not None,
             )
             impact = await uow.editorial_proposal_impacts.latest_for_run(run.id)
             publication_render = (

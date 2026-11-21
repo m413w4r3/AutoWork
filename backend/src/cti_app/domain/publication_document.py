@@ -313,6 +313,8 @@ class PublicationSourceFigureV1:
     provenance: str
     locator: SourceFigureLocatorV1
     placement: EnrichmentPlacementV1
+    width: int | None = None
+    height: int | None = None
 
     def __post_init__(self) -> None:
         validate_editorial_key(self.key, "Publication source figure key")
@@ -332,6 +334,12 @@ class PublicationSourceFigureV1:
             raise ValueError("Publication source figure locator is invalid")
         if not isinstance(self.placement, EnrichmentPlacementV1):
             raise ValueError("Publication source figure placement is invalid")
+        if (self.width is None) != (self.height is None):
+            raise ValueError("Publication source figure dimensions must be complete")
+        if self.width is not None and (type(self.width) is not int or self.width < 1):
+            raise ValueError("Publication source figure width must be positive")
+        if self.height is not None and (type(self.height) is not int or self.height < 1):
+            raise ValueError("Publication source figure height must be positive")
 
 
 def _date_from_json(value: Any, label: str) -> date | None:
@@ -537,7 +545,7 @@ def _chart_from_json(raw: Any, *, allow_bar: bool = False) -> PublicationChartV1
 
 
 def _figure_to_json(figure: PublicationSourceFigureV1) -> dict[str, Any]:
-    return {
+    payload = {
         "key": figure.key,
         "asset_id": str(figure.asset_id),
         "sha256": figure.sha256,
@@ -550,28 +558,36 @@ def _figure_to_json(figure: PublicationSourceFigureV1) -> dict[str, Any]:
         "locator": source_figure_locator_to_json(figure.locator),
         "placement": placement_to_json(figure.placement),
     }
+    if figure.width is not None:
+        payload["width"] = figure.width
+        payload["height"] = figure.height
+    return payload
 
 
 def _figure_from_json(raw: Any) -> PublicationSourceFigureV1:
-    item = json_object(
-        raw,
-        frozenset(
-            {
-                "key",
-                "asset_id",
-                "sha256",
-                "mime_type",
-                "byte_size",
-                "source_document_id",
-                "source_url",
-                "caption",
-                "provenance",
-                "locator",
-                "placement",
-            }
-        ),
-        "Publication source figure",
+    required = frozenset(
+        {
+            "key",
+            "asset_id",
+            "sha256",
+            "mime_type",
+            "byte_size",
+            "source_document_id",
+            "source_url",
+            "caption",
+            "provenance",
+            "locator",
+            "placement",
+        }
     )
+    if not isinstance(raw, Mapping):
+        raise ValueError("Publication source figure must be an object")
+    keys = frozenset(raw)
+    if not required <= keys or keys - required - {"width", "height"}:
+        raise ValueError("Publication source figure has missing or extra fields")
+    if ("width" in keys) != ("height" in keys):
+        raise ValueError("Publication source figure dimensions must be complete")
+    item = raw
     return PublicationSourceFigureV1(
         key=json_text(item["key"], "Source figure key"),
         asset_id=json_uuid(item["asset_id"], "Source figure asset ID"),
@@ -586,6 +602,8 @@ def _figure_from_json(raw: Any) -> PublicationSourceFigureV1:
         provenance=json_text(item["provenance"], "Source figure provenance"),
         locator=source_figure_locator_from_json(item["locator"]),
         placement=placement_from_json(item["placement"]),
+        width=(json_int(item["width"], "Source figure width") if "width" in item else None),
+        height=(json_int(item["height"], "Source figure height") if "height" in item else None),
     )
 
 

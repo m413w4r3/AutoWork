@@ -18,6 +18,11 @@ from cti_app.application.editorial_enrichment_revision import (
     targeted_action,
     validate_editorial_enrichment_patch,
 )
+from cti_app.application.editorial_figure_catalog import (
+    EditorialFigureCatalogError,
+    opaque_figure_id,
+    validate_figure_insertion_limit,
+)
 from cti_app.application.editorial_proposal_adoption import (
     EditorialProposalAdoptionError,
     EditorialProposalAdoptionInputs,
@@ -37,6 +42,7 @@ from cti_app.application.editorial_synthesis.candidate import (
 )
 from cti_app.application.editorial_synthesis.patch_validation import WirePatch
 from cti_app.application.editorial_synthesis.targets import resolve_target
+from cti_app.application.editorial_text_policy import editorial_patch_text_violation
 from cti_app.application.editorial_workspace.registry import (
     WorkspaceOccurrenceResolution,
     read_pointer,
@@ -46,6 +52,9 @@ from cti_app.application.production_artifact_store import ProductionArtifactStor
 from cti_app.application.production_editorial_enrichment import (
     EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION,
     EditorialEnrichmentEvidencePackV1,
+    EditorialFigureCatalogEntry,
+    build_editorial_figure_catalog,
+    validate_editorial_enrichment,
 )
 from cti_app.application.production_routing import get_adopted_production_routing_decision
 from cti_app.application.production_synthesis import (
@@ -56,6 +65,7 @@ from cti_app.application.production_synthesis import (
     synthesis_access_policy_hash,
 )
 from cti_app.application.production_synthesis_revision import _apply_wire_patch
+from cti_app.application.source_figure_inventory import load_archived_source_figure_inventory
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.editorial_proposal import EditorialProposal, EditorialProposalOrigin
@@ -74,9 +84,15 @@ from cti_app.domain.production import (
     SynthesisMode,
 )
 from cti_app.domain.production_editorial_enrichment import (
+    EDITORIAL_ENRICHMENT_V9_POLICY_VERSION,
     ChartKind,
     EditorialEnrichmentElementKind,
     EditorialEnrichmentV1,
+    EnrichmentPlacementKind,
+    EnrichmentPlacementV1,
+    SourceFigureCandidateV1,
+    SourceFigureDecision,
+    SourceFigureInclusionStatus,
     editorial_enrichment_from_json,
 )
 from cti_app.domain.production_editorial_revision import (
@@ -109,11 +125,163 @@ class _PreparedInputs:
     synthesis_artifact: ProductionArtifact
     evidence_pack: SynthesisEvidencePackV1 | EditorialEnrichmentEvidencePackV1
     stage: ProductionArtifactStage
+    base_enrichment: EditorialEnrichmentV1 | None = None
+    synthesis: Any | None = None
 
 
 _ACTIVE_SOURCE_STATES = frozenset(
     {CollectionState.ARCHIVED, CollectionState.EXTRACTED, CollectionState.COMPLETED}
 )
+
+_MANUAL_SOURCE_FIGURE_FIELDS = frozenset(
+    {
+        "figure_id",
+        "caption",
+        "order",
+        "source_document_id",
+        "source_url",
+        "sha256",
+        "mime_type",
+        "byte_size",
+        "width",
+        "height",
+        "provenance",
+    }
+)
+
+
+def _manual_source_figure_candidate_patch(
+    raw_patch: Mapping[str, Any],
+    *,
+    subject_id: UUID,
+    run_id: UUID,
+    catalog: tuple[EditorialFigureCatalogEntry, ...],
+    extraction: ProductionExtractionV1,
+    base_enrichment: EditorialEnrichmentV1,
+    anchor_block_id: UUID,
+    publication_kind: PublicationKind,
+    inventory_limit: int,
+) -> tuple[EditorialEnrichmentV1, str]:
+    """Rebuild a multi-figure candidate exclusively from current archived inventory."""
+    raw_figures = raw_patch.get("manual_source_figures")
+    if not isinstance(raw_figures, list) or not raw_figures:
+        raise EditorialProposalAdoptionError("proposal_patch_invalid")
+    by_public_id = {
+        opaque_figure_id(subject_id, run_id, entry.figure.figure_id): entry for entry in catalog
+    }
+    sources = {source.source_document_id: source for source in extraction.sources}
+    placements = EnrichmentPlacementV1(
+        kind=EnrichmentPlacementKind.AFTER_PARAGRAPH,
+        anchor_block_id=anchor_block_id,
+    )
+    candidates: list[SourceFigureCandidateV1] = []
+    selected_ids: set[UUID] = set()
+    existing_ids = {
+        item.resolved_figure.figure_id
+        for item in base_enrichment.source_figures
+        if item.resolved_figure is not None
+    }
+    included_ids = {
+        item.resolved_figure.figure_id
+        for item in base_enrichment.source_figures
+        if item.inclusion_status is SourceFigureInclusionStatus.INCLUDED
+        and item.resolved_figure is not None
+    }
+    for position, raw in enumerate(raw_figures):
+        if not isinstance(raw, Mapping) or set(raw) != _MANUAL_SOURCE_FIGURE_FIELDS:
+            raise EditorialProposalAdoptionError("proposal_patch_invalid")
+        public_id = raw.get("figure_id")
+        caption = raw.get("caption")
+        order = raw.get("order")
+        if (
+            not isinstance(public_id, str)
+            or not isinstance(caption, str)
+            or editorial_patch_text_violation(caption)
+            or not caption.strip()
+            or len(caption.strip()) > 500
+            or type(order) is not int
+            or order != position
+            or type(raw.get("byte_size")) is not int
+            or type(raw.get("width")) is not int
+            or type(raw.get("height")) is not int
+        ):
+            raise EditorialProposalAdoptionError("proposal_patch_invalid")
+        entry = by_public_id.get(public_id)
+        if entry is None:
+            raise EditorialProposalAdoptionError("editorial_figure_not_eligible")
+        figure = entry.figure
+        metadata = entry.metadata
+        source = sources.get(figure.source_document_id)
+        if (
+            figure.decision is not SourceFigureDecision.ACCEPTED
+            or figure.blob_id is None
+            or figure.sha256 is None
+            or figure.mime_type is None
+            or figure.byte_size is None
+            or metadata.width is None
+            or metadata.height is None
+            or metadata.width < 1
+            or metadata.height < 1
+            or source is None
+            or figure.source != source.canonical_url
+            or figure.figure_id in existing_ids
+            or figure.figure_id in selected_ids
+            or raw.get("source_document_id") != str(figure.source_document_id)
+            or raw.get("source_url") != source.canonical_url
+            or raw.get("sha256") != figure.sha256
+            or raw.get("mime_type") != figure.mime_type
+            or raw.get("byte_size") != figure.byte_size
+            or raw.get("width") != metadata.width
+            or raw.get("height") != metadata.height
+            or raw.get("provenance") != figure.provenance
+        ):
+            raise EditorialProposalAdoptionError("editorial_figure_not_eligible")
+        selected_ids.add(figure.figure_id)
+        candidates.append(
+            SourceFigureCandidateV1(
+                key=f"source_figure_{figure.figure_id.hex}",
+                source_document_id=figure.source_document_id,
+                source_url=source.canonical_url,
+                caption=caption.strip(),
+                provenance=figure.provenance,
+                locator=figure.locator,
+                inclusion_status=SourceFigureInclusionStatus.INCLUDED,
+                placement=placements,
+                resolved_figure=figure,
+                width=metadata.width,
+                height=metadata.height,
+                order=len(base_enrichment.source_figures) + order,
+            )
+        )
+    try:
+        validate_figure_insertion_limit(
+            publication_kind=publication_kind,
+            integrated_count=len(included_ids),
+            requested_count=len(candidates),
+            inventory_limit=inventory_limit,
+        )
+    except EditorialFigureCatalogError as error:
+        raise EditorialProposalAdoptionError(error.code) from None
+    if base_enrichment.schema_version < 8:
+        raise EditorialProposalAdoptionError("proposal_operation_unsupported")
+    candidate_enrichment = replace(
+        replace(
+            base_enrichment,
+            schema_version=9,
+            enrichment_policy_version=EDITORIAL_ENRICHMENT_V9_POLICY_VERSION,
+        )
+        if base_enrichment.schema_version < 9
+        else base_enrichment,
+        tables=(),
+        diagrams=(),
+        charts=(),
+        source_figures=tuple(candidates),
+        figure_decisions=(),
+        annotations=(),
+    )
+    identity = "|".join(sorted(str(value) for value in selected_ids))
+    key_suffix = hashlib.sha256(identity.encode()).hexdigest()[:24]
+    return candidate_enrichment, f"manual_source_figures_{key_suffix}"
 
 
 def _manual_text_without_evidence_patch(
@@ -549,12 +717,18 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
             }
             table_insertion = operation is TargetedEditorialRevisionOperation.CREATE_TABLE
             bar_chart_insertion = operation is TargetedEditorialRevisionOperation.CREATE_BAR_CHART
-            paragraph_enrichment_insertion = table_insertion or bar_chart_insertion
+            source_figure_insertion = (
+                operation is TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE
+            )
+            paragraph_enrichment_insertion = (
+                table_insertion or bar_chart_insertion or source_figure_insertion
+            )
             raw_patch = patch.get("enrichment_patch")
             if not isinstance(raw_patch, dict):
                 raise EditorialProposalAdoptionError("proposal_patch_invalid")
             table_key: str | None = None
             chart_key: str | None = None
+            source_figure_key: str | None = None
             if table_insertion:
                 raw_tables = raw_patch.get("tables")
                 if (
@@ -588,6 +762,16 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                 ):
                     raise EditorialProposalAdoptionError("editorial_anchor_stale")
                 chart_key = str(raw_charts[0]["key"])
+            if source_figure_insertion:
+                if (
+                    target.element_kind is not EditorialEnrichmentElementKind.FIGURE
+                    or target.element_key is not None
+                    or target.placement is None
+                    or target.placement.kind
+                    is not TargetedEditorialRevisionPlacementKind.AFTER_PARAGRAPH
+                    or target.placement.anchor_block_id != proposal.occurrence_id
+                ):
+                    raise EditorialProposalAdoptionError("editorial_anchor_stale")
             element_key = (
                 table_key
                 if table_insertion
@@ -595,9 +779,43 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                 if bar_chart_insertion
                 else target.element_key
             )
+            base_enrichment = editorial_enrichment_from_json(base_payload)
+            validated_manual_figure_patch: EditorialEnrichmentV1 | None = None
+            if source_figure_insertion:
+                if resolution.record.publication_kind not in {
+                    PublicationKind.ARTICLE,
+                    PublicationKind.BRIEF,
+                }:
+                    raise EditorialProposalAdoptionError("proposal_operation_unsupported")
+                validated_manual_figure_patch, source_figure_key = (
+                    _manual_source_figure_candidate_patch(
+                        raw_patch,
+                        subject_id=proposal.subject_id,
+                        run_id=proposal.production_run_id,
+                        catalog=tuple(fence.figure_catalog),
+                        extraction=extraction,
+                        base_enrichment=base_enrichment,
+                        anchor_block_id=proposal.occurrence_id,
+                        publication_kind=resolution.record.publication_kind,
+                        inventory_limit=fence.inventory.max_figures,
+                    )
+                )
+                validate_editorial_enrichment(
+                    validated_manual_figure_patch,
+                    extraction=extraction,
+                    synthesis=synthesis,
+                )
+            element_key = (
+                table_key
+                if table_insertion
+                else chart_key
+                if bar_chart_insertion
+                else source_figure_key
+                if source_figure_insertion
+                else target.element_key
+            )
             if element_key is None:
                 raise EditorialProposalAdoptionError("proposal_target_mismatch")
-            base_enrichment = editorial_enrichment_from_json(base_payload)
             target_entry = resolution.entry
             if (
                 target_entry is None
@@ -635,15 +853,17 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                 requester=str(proposal.actor_id),
                 before_hash=proposal.before_hash,
             )
-            validated_patch = validate_editorial_enrichment_patch(
-                raw_patch,
-                element_kind=target.element_kind,
-                element_key=element_key,
-                evidence_pack=fence.evidence_pack,
-                extraction=extraction,
-                synthesis=synthesis,
-                figure_catalog=fence.figure_catalog,
-            )
+            validated_patch = validated_manual_figure_patch
+            if validated_patch is None:
+                validated_patch = validate_editorial_enrichment_patch(
+                    raw_patch,
+                    element_kind=target.element_kind,
+                    element_key=element_key,
+                    evidence_pack=fence.evidence_pack,
+                    extraction=extraction,
+                    synthesis=synthesis,
+                    figure_catalog=fence.figure_catalog,
+                )
             validated_patch, compiled_chart_asset = await self._verify_bar_chart_asset(
                 proposal_patch=patch,
                 candidate=validated_patch,
@@ -698,6 +918,7 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                 input_hash=fence.input_hash,
                 artifact_id=candidate.artifact_id,
                 figure_catalog=fence.figure_catalog,
+                validated_patch=validated_manual_figure_patch,
                 registry_lineage=lineage,
                 is_create=is_create,
                 is_delete=is_delete,
@@ -735,6 +956,8 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
             synthesis_artifact=current_synthesis_artifact,
             evidence_pack=fence.evidence_pack,
             stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+            base_enrichment=base_enrichment,
+            synthesis=synthesis,
         )
         return return_inputs
 
@@ -746,7 +969,6 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
         *,
         resolution: WorkspaceOccurrenceResolution,
     ) -> None:
-        del patch
         prepared = self._prepared.pop(proposal.id, None)
         if prepared is None:
             raise EditorialProposalAdoptionError("proposal_base_unavailable")
@@ -909,6 +1131,58 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
         current_refs = _evidence_ref_keys(prepared.evidence_pack)
         if not _proposal_evidence_keys(proposal.evidence_refs) <= current_refs:
             raise EditorialProposalAdoptionError("proposal_evidence_not_admissible")
+        if proposal.operation == TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE.value:
+            if prepared.stage is not ProductionArtifactStage.EDITORIAL_ENRICHMENT:
+                raise EditorialProposalAdoptionError("proposal_target_mismatch")
+            if prepared.base_enrichment is None:
+                raise EditorialProposalAdoptionError("proposal_base_unavailable")
+            try:
+                source_media_archiver = (
+                    self._enrichment_revision_service._enrichment._source_media_archiver
+                )
+                if source_media_archiver is not None:
+                    from cti_app.application.production_enrichment_revision import (
+                        _StoredSourceMediaArchiver,
+                    )
+
+                    source_media_archiver = _StoredSourceMediaArchiver(
+                        self._uow_factory, source_media_archiver
+                    )
+                inventory = await load_archived_source_figure_inventory(
+                    subject_id=proposal.subject_id,
+                    extraction_sources=prepared.extraction.sources,
+                    source_document_repository=uow.source_documents,
+                    blob_repository=uow.blobs,
+                    artifact_store=self._enrichment_revision_service._enrichment._artifact_store,
+                    media_archiver=source_media_archiver,
+                )
+                current_catalog = build_editorial_figure_catalog(
+                    prepared.extraction, inventory
+                )
+                current_candidate, _current_element_key = (
+                    _manual_source_figure_candidate_patch(
+                        patch.get("enrichment_patch")
+                        if isinstance(patch.get("enrichment_patch"), Mapping)
+                        else {},
+                        subject_id=proposal.subject_id,
+                        run_id=proposal.production_run_id,
+                        catalog=current_catalog,
+                        extraction=prepared.extraction,
+                        base_enrichment=prepared.base_enrichment,
+                        anchor_block_id=proposal.occurrence_id,
+                        publication_kind=record.publication_kind,
+                        inventory_limit=inventory.max_figures,
+                    )
+                )
+                validate_editorial_enrichment(
+                    current_candidate,
+                    extraction=prepared.extraction,
+                    synthesis=prepared.synthesis,
+                )
+            except EditorialProposalAdoptionError:
+                raise
+            except Exception:
+                raise EditorialProposalAdoptionError("editorial_figure_not_eligible") from None
 
     async def _load_base_context(
         self,

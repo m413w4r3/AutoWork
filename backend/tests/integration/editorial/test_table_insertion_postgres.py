@@ -4,6 +4,7 @@ import hashlib
 import json
 from dataclasses import replace
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
@@ -65,6 +66,19 @@ pytestmark = pytest.mark.integration
 _CANONICAL_BUCKET = "production-artifacts-canonical"
 
 
+def _local_archived_figure_assets(count: int) -> tuple[tuple[str, bytes], ...]:
+    repository_root = Path(__file__).resolve().parents[4]
+    local_figure_paths = (
+        repository_root / "chpTypst" / "UTILS" / "chap.png",
+        repository_root / "docs" / "mission01" / "typst-captures" / "current" / "page-1.png",
+        repository_root / "docs" / "mission01" / "typst-captures" / "current" / "page-2.png",
+    )
+    return tuple(
+        (f"https://media.example.test/figure-{index + 1}.png", path.read_bytes())
+        for index, path in enumerate(local_figure_paths[:count])
+    )
+
+
 class _NoModelCalls:
     def __init__(self) -> None:
         self.calls: list[str] = []
@@ -81,6 +95,7 @@ async def _ready_for_manual_table_route(
     uow_factory: Any,
     *,
     bar_chart_facts: bool = False,
+    source_figure_count: int = 0,
 ) -> tuple[_Seeded, Any, _NoModelCalls, Any]:
     # Use the real discovery lineage and persist the rows required by the
     # production discussion/adoption adapters. Blob IDs come from add_if_absent
@@ -100,7 +115,21 @@ async def _ready_for_manual_table_route(
     extraction_bytes = ProductionArtifactStore.canonical_json_bytes(
         production_extraction_to_json(seeded.extraction)
     )
-    source_bytes = b"synthetic manual-table integration source"
+    if not 0 <= source_figure_count <= 3:
+        raise ValueError("source_figure_count_out_of_bounds")
+    source_figure_assets = _local_archived_figure_assets(source_figure_count)
+    source_bytes = (
+        (
+            "<article><p>Synthetic report body.</p>"
+            + "".join(
+                f'<figure><img src="{url}" alt="Synthetic archived figure {index + 1}"></figure>'
+                for index, (url, _content) in enumerate(source_figure_assets)
+            )
+            + "</article>"
+        ).encode()
+        if source_figure_assets
+        else b"synthetic manual-table integration source"
+    )
     publication_bytes = ProductionArtifactStore.canonical_json_bytes(_brief_v8_payload())
 
     def blob_record(content: bytes, mime_type: str, bucket: str) -> BlobRecord:
@@ -114,12 +143,18 @@ async def _ready_for_manual_table_route(
     extraction_blob = blob_record(extraction_bytes, "application/json", _CANONICAL_BUCKET)
     source_blob = blob_record(source_bytes, "text/plain", "source-documents")
     publication_blob = blob_record(publication_bytes, "application/json", _CANONICAL_BUCKET)
+    image_blobs = tuple(
+        blob_record(content, "image/png", "source-documents")
+        for _url, content in source_figure_assets
+    )
     for blob, content in (
         (enrichment_blob, enrichment_bytes),
         (extraction_blob, extraction_bytes),
         (source_blob, source_bytes),
         (publication_blob, publication_bytes),
     ):
+        seeded.blob_store.seed(blob.descriptor, content)
+    for blob, (_url, content) in zip(image_blobs, source_figure_assets, strict=True):
         seeded.blob_store.seed(blob.descriptor, content)
 
     async with uow_factory() as uow:
@@ -133,15 +168,38 @@ async def _ready_for_manual_table_route(
                 id=seeded.extraction.sources[0].source_document_id,
                 subject_id=seeded.subject.id,
                 blob_id=stored_source_blob.id,
-                original_name="synthetic-report.txt",
+                original_name=(
+                    "synthetic-report.html"
+                    if source_figure_assets
+                    else "synthetic-report.txt"
+                ),
                 origin="synthetic integration fixture",
                 acquired_at=datetime.now(UTC),
                 license_restriction=None,
                 tlp=TLP.AMBER,
                 do_not_submit=False,
                 external_llm_allowed=True,
+                final_url=seeded.extraction.sources[0].canonical_url,
+                detected_mime_type=("text/html" if source_figure_assets else "text/plain"),
             )
         )
+        for (url, _content), image_blob in zip(source_figure_assets, image_blobs, strict=True):
+            stored_image_blob = await uow.blobs.add_if_absent(image_blob)
+            await uow.source_documents.add(
+                SourceDocument(
+                    subject_id=seeded.subject.id,
+                    blob_id=stored_image_blob.id,
+                    original_name=url.rsplit("/", 1)[-1],
+                    origin=url,
+                    acquired_at=datetime.now(UTC),
+                    license_restriction=None,
+                    tlp=TLP.AMBER,
+                    do_not_submit=False,
+                    external_llm_allowed=True,
+                    final_url=url,
+                    detected_mime_type="image/png",
+                )
+            )
         await uow.production_artifacts.append(
             ProductionArtifact(
                 production_run_id=seeded.run.id,

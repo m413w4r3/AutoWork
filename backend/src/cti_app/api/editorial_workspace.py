@@ -47,6 +47,7 @@ from cti_app.application.editorial_proposal_adoption_inputs import (
 )
 from cti_app.application.editorial_proposals import (
     EditorialBarChartDiagnosticReason,
+    EditorialFigureDiagnosticReason,
     EditorialProposalApplicationError,
     EditorialProposalService,
     EditorialTableDiagnosticReason,
@@ -69,6 +70,7 @@ from cti_app.application.production_enrichment_revision import (
 )
 from cti_app.application.production_stages import EditorialEnrichmentService, SynthesisService
 from cti_app.application.production_synthesis import ProductionSynthesisService
+from cti_app.application.source_figure_inventory import MAX_SOURCE_FIGURES
 from cti_app.config import get_settings
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.editorial_proposal import EditorialProposalConflict
@@ -169,6 +171,7 @@ class EditorialWorkspaceRoute(APIRoute):
             is_manual_edit = self.path_format.endswith("/manual-edit")
             is_manual_table_proposal = self.path_format.endswith("/table-proposals")
             is_manual_bar_chart_proposal = self.path_format.endswith("/bar-chart-proposals")
+            is_manual_source_figure_proposal = self.path_format.endswith("/figure-proposals")
             is_draft = self.path_format.endswith("/draft")
             is_figure_catalog = "/editor/figures" in self.path_format
             if (
@@ -176,6 +179,7 @@ class EditorialWorkspaceRoute(APIRoute):
                 or is_manual_edit
                 or is_manual_table_proposal
                 or is_manual_bar_chart_proposal
+                or is_manual_source_figure_proposal
             ):
                 try:
                     enabled = get_settings().editorial_proposal_accept_enabled
@@ -194,7 +198,12 @@ class EditorialWorkspaceRoute(APIRoute):
                             }
                         },
                     )
-            if is_manual_edit or is_manual_table_proposal or is_manual_bar_chart_proposal:
+            if (
+                is_manual_edit
+                or is_manual_table_proposal
+                or is_manual_bar_chart_proposal
+                or is_manual_source_figure_proposal
+            ):
                 raw_length = request.headers.get("content-length")
                 if raw_length is not None:
                     try:
@@ -292,6 +301,28 @@ class EditorialWorkspaceRoute(APIRoute):
                             "detail": {
                                 "code": "manual_bar_chart_request_invalid",
                                 "message": _ERROR_MESSAGES["manual_bar_chart_request_invalid"],
+                            }
+                        },
+                    )
+                elif is_manual_source_figure_proposal:
+                    logger.warning(
+                        "manual_source_figure_proposal_rejected code=%s reason=%s "
+                        "validator_code=%s frame=%s subject_id=%s occurrence_id=%s",
+                        "manual_source_figure_request_invalid",
+                        EditorialFigureDiagnosticReason.REQUEST_INVALID.value,
+                        "figure_request_schema_invalid",
+                        _caller_frame(),
+                        request.path_params.get("subject_id", "unknown"),
+                        request.path_params.get("occurrence_id", "unknown"),
+                    )
+                    response = JSONResponse(
+                        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                        content={
+                            "detail": {
+                                "code": "manual_source_figure_request_invalid",
+                                "message": _ERROR_MESSAGES[
+                                    "manual_source_figure_request_invalid"
+                                ],
                             }
                         },
                     )
@@ -436,6 +467,27 @@ class EditorialWorkspaceBarChart(BaseModel):
     anchor_block_id: UUID
 
 
+class EditorialWorkspaceFigure(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    key: str
+    caption: str
+    source_url: str
+    source: str | None
+    provenance: str
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    mime_type: str
+    byte_size: int = Field(gt=0)
+    width: int | None = Field(default=None, gt=0)
+    height: int | None = Field(default=None, gt=0)
+    status: Literal["proposed", "included", "excluded"]
+    order: int | None = Field(default=None, ge=0)
+    anchor_block_id: UUID | None
+    placement: Literal["after_paragraph", "after_lead", "after_timeline", "after_section", "end"]
+    page: int | None = Field(default=None, ge=1)
+    section: str | None
+
+
 class EditorialWorkspaceBlock(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -456,6 +508,7 @@ class EditorialWorkspaceBlock(BaseModel):
     evidence_refs: list[dict[str, object]]
     table: EditorialWorkspaceTable | None = None
     chart: EditorialWorkspaceBarChart | None = None
+    figure: EditorialWorkspaceFigure | None = None
     revision_target: EditorialWorkspaceRevisionTarget
     before_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     allowed_operations: list[str]
@@ -823,6 +876,32 @@ class EditorialManualTableProposalRequest(BaseModel):
     table: EditorialTableDraftRequest
 
 
+class EditorialManualSourceFigureSelectionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    figure_id: UUID
+    caption: str = Field(min_length=1, max_length=500)
+    order: int = Field(ge=0, le=MAX_SOURCE_FIGURES - 1)
+
+
+class EditorialManualSourceFigureProposalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    snapshot_id: UUID
+    anchor_block_id: UUID
+    figures: list[EditorialManualSourceFigureSelectionRequest] = Field(
+        min_length=1, max_length=MAX_SOURCE_FIGURES
+    )
+
+    @model_validator(mode="after")
+    def _selections_are_unique_and_ordered(self) -> EditorialManualSourceFigureProposalRequest:
+        if len({item.figure_id for item in self.figures}) != len(self.figures):
+            raise ValueError("Figure catalogue identities must be unique")
+        if [item.order for item in self.figures] != list(range(len(self.figures))):
+            raise ValueError("Figure order must be contiguous")
+        return self
+
+
 class EditorialBarChartPointRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1012,6 +1091,14 @@ _ERROR_MESSAGES = {
     "manual_edit_request_invalid": "La requête de modification est invalide.",
     "manual_table_request_invalid": "La requête de tableau est invalide.",
     "manual_bar_chart_request_invalid": "La requête de graphique à barres est invalide.",
+    "manual_source_figure_request_invalid": "La sélection de figures est invalide.",
+    "brief_figure_limit_exceeded": "Une brève ne peut contenir plus de trois figures intégrées.",
+    "source_figure_inventory_limit_exceeded": (
+        "Le nombre de figures dépasse la limite de l'inventaire archivé."
+    ),
+    "editorial_figure_not_eligible": "Cette figure archivée ne peut pas être intégrée.",
+    "editorial_figure_not_found": "Cette figure n'est plus disponible dans l'inventaire.",
+    "figure_catalog_unavailable": "La galerie de figures est temporairement indisponible.",
     "manual_bar_chart_analytic_question_duplicate": (
         "La question analytique existe déjà dans l'enrichissement."
     ),
@@ -1361,6 +1448,7 @@ def _manual_proposal_service(request: Request) -> EditorialProposalService:
             artifact_store=artifact_store,
         ),
         chart_compiler=AnalyticChartRenderer(),
+        figure_catalog_service=_figure_catalog_service(request),
         media_asset_store=_media_asset_store_for_request(
             request, artifact_store=artifact_store, uow_factory=uow_factory
         ),
@@ -2330,6 +2418,189 @@ async def prepare_manual_editorial_table_proposal(
                 "message": _ERROR_MESSAGES.get(
                     code, "Le brouillon de tableau ne respecte pas le contrat éditorial."
                 ),
+            },
+        ) from None
+
+
+_MANUAL_FIGURE_VALIDATOR_CODES = frozenset(
+    {
+        "figure_caption_markup_forbidden",
+        "brief_figure_limit_exceeded",
+        "source_figure_inventory_limit_exceeded",
+        "editorial_figure_not_eligible",
+        "editorial_figure_not_found",
+        "figure_catalog_unavailable",
+        "editorial_anchor_stale",
+        "proposal_base_unavailable",
+        "proposal_operation_unsupported",
+        "proposal_target_mismatch",
+        "proposal_patch_invalid",
+        "revision_wire_markup_forbidden",
+    }
+)
+
+
+def _manual_figure_validator_log_code(error: BaseException | None) -> str:
+    value = getattr(error, "validator_code", None)
+    return value if isinstance(value, str) and value in _MANUAL_FIGURE_VALIDATOR_CODES else "none"
+
+
+@router.post(
+    "/subjects/{subject_id}/editor/blocks/{occurrence_id}/figure-proposals",
+    response_model=EditorialProposalView,
+)
+async def prepare_manual_editorial_source_figure_proposal(
+    subject_id: UUID,
+    occurrence_id: UUID,
+    request: Request,
+    payload: EditorialManualSourceFigureProposalRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> EditorialProposalView:
+    if idempotency_key is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "idempotency_key_required",
+                "message": _ERROR_MESSAGES["idempotency_key_required"],
+            },
+        )
+    if not is_valid_editorial_idempotency_key(idempotency_key):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "idempotency_key_invalid",
+                "message": _ERROR_MESSAGES["idempotency_key_invalid"],
+            },
+        )
+    if payload.anchor_block_id != occurrence_id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "code": "editorial_anchor_stale",
+                "message": _ERROR_MESSAGES["editorial_anchor_stale"],
+            },
+        )
+    if not _proposal_impact_consumer_wired():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "manual_edit_unavailable",
+                "message": _ERROR_MESSAGES["manual_edit_unavailable"],
+            },
+        )
+
+    from cti_app.domain.editorial_proposal import (
+        ManualPatch,
+        ManualSourceFigurePatch,
+        ManualSourceFigureSelection,
+    )
+
+    try:
+        service = _manual_proposal_service(request)
+        proposal = await service.prepare_manual_patch(
+            subject_id=subject_id,
+            snapshot_id=payload.snapshot_id,
+            occurrence_id=occurrence_id,
+            actor_id=await _thread_actor_id(request),
+            idempotency_key=idempotency_key,
+            patch=ManualPatch(
+                typed_patch=ManualSourceFigurePatch(
+                    anchor_block_id=occurrence_id,
+                    figures=tuple(
+                        ManualSourceFigureSelection(
+                            figure_id=item.figure_id,
+                            caption=item.caption,
+                            order=item.order,
+                        )
+                        for item in payload.figures
+                    ),
+                )
+            ),
+        )
+        if proposal.patch_sha256 is None:
+            raise EditorialProposalApplicationError("proposal_patch_invalid")
+        view = await service.inspect(
+            subject_id,
+            occurrence_id,
+            proposal.id,
+            workspace_service=_service(request),
+        )
+        return EditorialProposalView.model_validate(view, from_attributes=True)
+    except HTTPException:
+        raise
+    except EditorialProposalConflict as error:
+        logger.warning(
+            "manual_source_figure_proposal_rejected code=%s reason=%s validator_code=%s "
+            "frame=%s subject_id=%s occurrence_id=%s",
+            "proposal_idempotency_conflict",
+            EditorialFigureDiagnosticReason.IDEMPOTENCY_CONFLICT.value,
+            _manual_figure_validator_log_code(error),
+            _manual_table_frame(error),
+            subject_id,
+            occurrence_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "proposal_idempotency_conflict",
+                "message": _ERROR_MESSAGES["proposal_idempotency_conflict"],
+            },
+        ) from None
+    except (EditorialProposalApplicationError, EditorialWorkspaceError, ValueError) as error:
+        raw_code = getattr(error, "code", None)
+        code = (
+            raw_code
+            if isinstance(raw_code, str) and re.fullmatch(r"[a-z][a-z0-9_]*", raw_code)
+            else "manual_edit_patch_invalid"
+        )
+        raw_reason = getattr(error, "reason", None)
+        try:
+            reason = EditorialFigureDiagnosticReason(raw_reason)
+        except (TypeError, ValueError):
+            reason = {
+                "editorial_anchor_stale": EditorialFigureDiagnosticReason.ANCHOR_STALE,
+                "editorial_figure_not_found": EditorialFigureDiagnosticReason.CATALOG_UNAVAILABLE,
+                "figure_catalog_unavailable": EditorialFigureDiagnosticReason.CATALOG_UNAVAILABLE,
+                "editorial_figure_not_eligible": EditorialFigureDiagnosticReason.NOT_ELIGIBLE,
+                "brief_figure_limit_exceeded": EditorialFigureDiagnosticReason.BRIEF_LIMIT,
+                "source_figure_inventory_limit_exceeded": (
+                    EditorialFigureDiagnosticReason.INVENTORY_LIMIT
+                ),
+                "manual_edit_patch_invalid": EditorialFigureDiagnosticReason.MARKUP_REJECTED,
+                "proposal_base_unavailable": (
+                    EditorialFigureDiagnosticReason.DEPENDENCIES_UNAVAILABLE
+                ),
+                "proposal_workspace_unavailable": (
+                    EditorialFigureDiagnosticReason.DEPENDENCIES_UNAVAILABLE
+                ),
+            }.get(code, EditorialFigureDiagnosticReason.VALIDATOR_REJECTED)
+        logger.warning(
+            "manual_source_figure_proposal_rejected code=%s reason=%s validator_code=%s "
+            "frame=%s subject_id=%s occurrence_id=%s",
+            code,
+            reason.value,
+            _manual_figure_validator_log_code(error),
+            _manual_table_frame(error, getattr(error, "frame", None)),
+            subject_id,
+            occurrence_id,
+        )
+        response_status = (
+            status.HTTP_409_CONFLICT
+            if code in {"editorial_anchor_stale", "proposal_base_stale", "editorial_snapshot_stale"}
+            else status.HTTP_503_SERVICE_UNAVAILABLE
+            if code
+            in {
+                "proposal_base_unavailable",
+                "proposal_workspace_unavailable",
+                "figure_catalog_unavailable",
+            }
+            else status.HTTP_422_UNPROCESSABLE_CONTENT
+        )
+        raise HTTPException(
+            status_code=response_status,
+            detail={
+                "code": code,
+                "message": _ERROR_MESSAGES.get(code, _ERROR_MESSAGES["manual_edit_patch_invalid"]),
             },
         ) from None
 

@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import io
 import json
+import os
+import shutil
+import struct
+import subprocess
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
@@ -10,6 +16,7 @@ from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
+from pypdf import PdfReader
 
 from cti_app.application import typst_rendering as typst_rendering_module
 from cti_app.application.protocol_diagram_projection import PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION
@@ -19,6 +26,11 @@ from cti_app.application.publication_builder import (
     build_publication_document_v5,
 )
 from cti_app.application.semantic_annotation import EnglishTermDetector, SemanticAnnotator
+from cti_app.application.typst_compilation import (
+    TypstCompileRequest,
+    load_font_bundle_snapshot,
+    materialize_font_bundle,
+)
 from cti_app.application.typst_rendering import (
     _FINDING_ASSESSMENT_LABELS,
     _IOC_DISPOSITION_LABELS,
@@ -62,12 +74,18 @@ from cti_app.domain.analyst_opinion import (
 )
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.investigation import FindingAssessment, FindingKind, NoveltyClass
-from cti_app.domain.media_assets import MediaAssetKind
+from cti_app.domain.media_assets import MediaAssetKind, media_asset_id
 from cti_app.domain.production import ProductionEvidenceBasis
 from cti_app.domain.production_editorial_enrichment import (
     ChartKind,
     EnrichmentPlacementKind,
     EnrichmentPlacementV1,
+    ResolvedSourceFigureV1,
+    SourceFigureCandidateV1,
+    SourceFigureDecision,
+    SourceFigureInclusionStatus,
+    SourceFigureLocatorV1,
+    source_figure_id,
 )
 from cti_app.domain.production_references import ProductionEditorialRole
 from cti_app.domain.production_relevance import RelevanceClassification, RelevanceReasonCode
@@ -115,6 +133,7 @@ from cti_app.domain.semantic_annotation import (
     SemanticRole,
     SemanticTextV1,
 )
+from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 from tests.editorial_enrichment_support import build_empty_editorial_enrichment
 from tests.test_publication_builder_v4 import (
     _canonical_inputs,
@@ -504,7 +523,7 @@ def test_v9_renders_after_the_registered_paragraph_and_v8_keeps_v40(tmp_path: Pa
     )
     v8_render = json.loads(_render(renderer, v8, bundle).render_data_bytes)
 
-    assert v9_render["schema_version"] == "typst-publication-model-v41-after-paragraph-anchors"
+    assert v9_render["schema_version"] == "typst-publication-model-v43-source-figure-provenance"
     v9_blocks = next(item for item in v9_render["content_sections"] if item["type"] == "synthesis")[
         "blocks"
     ]
@@ -513,6 +532,195 @@ def test_v9_renders_after_the_registered_paragraph_and_v8_keeps_v40(tmp_path: Pa
         "after-registered-paragraph",
     ]
     assert v8_render["schema_version"] == "typst-publication-model-v40-m21-opinion-render"
+
+
+def test_real_typst_multi_figure_pdf_uses_local_assets_after_anchor(
+    tmp_path: Path,
+) -> None:
+    binary = os.environ.get("TYPST_BINARY") or str(
+        Path.home() / ".local" / "share" / "autowork-tools" / "typst"
+    )
+    if shutil.which(binary) is None and not Path(binary).is_file():
+        pytest.skip("pinned Typst 0.15.1 is unavailable")
+    version = subprocess.run(
+        (binary, "--version"), capture_output=True, check=True, text=True, timeout=10
+    ).stdout.strip()
+    assert version.startswith("typst 0.15.1"), version
+
+    repository_root = Path(__file__).resolve().parents[2]
+    template_root = repository_root / "chpTypst"
+    image_paths = (
+        template_root / "UTILS" / "chap.png",
+        repository_root / "docs" / "mission01" / "typst-captures" / "current" / "page-1.png",
+    )
+    image_bytes = tuple(path.read_bytes() for path in image_paths)
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    source = extraction.sources[0]
+    anchor_id = UUID(int=777)
+    placement = EnrichmentPlacementV1(
+        kind=EnrichmentPlacementKind.AFTER_PARAGRAPH,
+        anchor_block_id=anchor_id,
+    )
+    figure_candidates: list[SourceFigureCandidateV1] = []
+    asset_bytes_by_id: dict[UUID, bytes] = {}
+    for position, content in enumerate(image_bytes):
+        assert content.startswith(b"\x89PNG\r\n\x1a\n")
+        width, height = struct.unpack(">II", content[16:24])
+        content_sha256 = hashlib.sha256(content).hexdigest()
+        locator = SourceFigureLocatorV1(
+            page=position + 1,
+            section="Asset local de démonstration",
+            figure_label=f"Figure locale {position + 1}",
+        )
+        figure_id = source_figure_id(
+            source_document_id=source.source_document_id,
+            sha256=content_sha256,
+            source=source.canonical_url,
+            locator=locator,
+        )
+        asset_id = media_asset_id(content_sha256, "image/png")
+        provenance = (
+            "Asset du dépôt local utilisé comme substitut de rendu; "
+            "ce document ne constitue pas une preuve CTI."
+        )
+        resolved = ResolvedSourceFigureV1(
+            figure_id=figure_id,
+            blob_id=UUID(int=7101 + position),
+            sha256=content_sha256,
+            mime_type="image/png",
+            byte_size=len(content),
+            source_document_id=source.source_document_id,
+            source=source.canonical_url,
+            provenance=provenance,
+            locator=locator,
+            decision=SourceFigureDecision.ACCEPTED,
+            decision_reason="archived_blob_verified",
+        )
+        figure_candidates.append(
+            SourceFigureCandidateV1(
+                key=f"source_figure_demo_{position + 1}",
+                source_document_id=source.source_document_id,
+                source_url=source.canonical_url,
+                caption=f"Figure de démonstration locale {position + 1}",
+                provenance=provenance,
+                locator=locator,
+                inclusion_status=SourceFigureInclusionStatus.INCLUDED,
+                placement=placement,
+                resolved_figure=resolved,
+                width=width,
+                height=height,
+                order=position,
+            )
+        )
+        asset_bytes_by_id[asset_id] = content
+
+    anchored_enrichment = replace(
+        build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis),
+        source_figures=tuple(figure_candidates),
+    )
+    anchored_v5 = build_publication_document_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=anchored_enrichment,
+    )
+    v7 = PublicationDocumentV7(
+        base_publication=_v6(anchored_v5),
+        publication_kind=PublicationKind.ARTICLE,
+        routing_decision_hash="a" * 64,
+        routing_policy_version="routing-policy-v1",
+    )
+    figures = anchored_v5.document.figures
+    v9 = PublicationDocumentV9(
+        base_publication=v7,
+        article_format=build_article_format_v1(anchored_v5, extraction),
+        registry_hash="b" * 64,
+        synthesis_canonical_sha256="c" * 64,
+        enrichment_canonical_sha256="d" * 64,
+        resolved_placements=tuple(
+            ResolvedPublicationPlacementV1(
+                element_kind="figure",
+                element_key=figure.key,
+                element_position=position,
+                anchor_block_id=anchor_id,
+                anchor_pointer="/lead/0",
+                anchor_canonical_position=0,
+                paragraph_kind="lead",
+                section_index=None,
+                paragraph_index=0,
+            )
+            for position, figure in enumerate(figures)
+        ),
+    )
+    bundle = load_template_bundle(template_root)
+    rendered = TypstRenderer().render(
+        v9,
+        bundle,
+        document_label="Démonstration locale multi-figures",
+    )
+    render_data = json.loads(rendered.render_data_bytes)
+    synthesis_section = next(
+        section for section in render_data["content_sections"] if section["type"] == "synthesis"
+    )
+    blocks = synthesis_section["blocks"]
+    anchor_position = next(
+        index
+        for index, block in enumerate(blocks)
+        if block["type"] == "paragraph" and block.get("anchor_target") is not None
+    )
+    figure_positions = [
+        index for index, block in enumerate(blocks) if block["type"] == "figure"
+    ]
+    assert figure_positions == [anchor_position + 1, anchor_position + 2]
+    assert len(rendered.media_refs) == 2
+    assert all(ref.media_path.startswith("media/") for ref in rendered.media_refs)
+
+    workspace = tmp_path / "workspace"
+    for template_file in bundle.files:
+        destination = workspace / template_file.relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(template_file.content)
+    render_data_path = workspace / rendered.render_data_relative_path
+    render_data_path.parent.mkdir(parents=True, exist_ok=True)
+    render_data_path.write_bytes(rendered.render_data_bytes)
+    for media_ref in rendered.media_refs:
+        media_path = workspace / "RENDERER" / media_ref.media_path
+        media_path.parent.mkdir(parents=True, exist_ok=True)
+        media_path.write_bytes(asset_bytes_by_id[media_ref.asset_id])
+
+    font_root = Path(os.environ.get("FONT_BUNDLE_ROOT", str(template_root)))
+    fonts_lock = Path(
+        os.environ.get(
+            "TYPST_FONTS_LOCK_FILE",
+            str(repository_root / "infra" / "typst-fonts.lock"),
+        )
+    )
+    font_snapshot = load_font_bundle_snapshot(font_root, fonts_lock)
+    font_paths = materialize_font_bundle(font_snapshot, tmp_path / "fonts")
+    compiled = asyncio.run(
+        TypstSubprocessCompiler(binary=binary).compile(
+            TypstCompileRequest(
+                workspace_root=workspace,
+                entrypoint_relative_path=rendered.entrypoint_relative_path,
+                font_paths=font_paths,
+            )
+        )
+    )
+    demo_output = os.environ.get("AUTOWORK_T_M6_25_DEMO_PDF")
+    if demo_output is not None:
+        output_path = Path(demo_output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(compiled.content)
+    assert compiled.media_type == "application/pdf"
+    pdf = PdfReader(io.BytesIO(compiled.content), strict=True)
+    assert pdf.pages
+    pdf_text = " ".join(
+        (page.extract_text() or "") for page in pdf.pages
+    )
+    assert "Figure de démonstration locale 1" in pdf_text
+    assert "Figure de démonstration locale 2" in pdf_text
+    assert "Source : example.com" in pdf_text
 
 
 def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_path: Path) -> None:
@@ -2099,7 +2307,7 @@ def test_figure_reader_source_hides_pipeline_locators_and_media_refs_deduplicate
         not {"classification", "source_note", "attribution"}.intersection(block)
         for block in figure_blocks
     )
-    assert figure_blocks[0]["caption"] == "Caption one"
+    assert figure_blocks[0]["caption"].startswith("Caption one — Source : secret.example")
     assert figure_blocks[0]["sha256"] == first.sha256
     assert figure_blocks[0]["byte_size"] == first.byte_size
     render_data = rendered.render_data_bytes.decode("utf-8")

@@ -135,6 +135,7 @@ def validate_targeted_request(request: TargetedEditorialRevisionRequest) -> None
         TargetedEditorialRevisionOperation.CREATE_DIAGRAM,
         TargetedEditorialRevisionOperation.CREATE_CHART,
         TargetedEditorialRevisionOperation.CREATE_BAR_CHART,
+        TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE,
     }
     if request.operation in create_operations:
         if target.element_key is not None or target.placement is None:
@@ -144,6 +145,7 @@ def validate_targeted_request(request: TargetedEditorialRevisionRequest) -> None
             not in {
                 TargetedEditorialRevisionOperation.CREATE_TABLE,
                 TargetedEditorialRevisionOperation.CREATE_BAR_CHART,
+                TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE,
             }
             or target.placement.anchor_block_id is None
         ):
@@ -279,6 +281,7 @@ def assert_requested_placement(
         if targeted_request.operation not in {
             TargetedEditorialRevisionOperation.CREATE_TABLE,
             TargetedEditorialRevisionOperation.CREATE_BAR_CHART,
+            TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE,
         }:
             raise ValueError("targeted_enrichment_revision_placement_invalid")
         expected = EnrichmentPlacementV1(
@@ -310,7 +313,10 @@ def assert_requested_placement(
         EditorialEnrichmentElementKind.CHART: candidate.charts,
         EditorialEnrichmentElementKind.FIGURE: candidate.source_figures,
     }[element_kind]
-    if len(values) != 1 or getattr(values[0], "placement", None) != expected:
+    if (
+        (not values if element_kind is EditorialEnrichmentElementKind.FIGURE else len(values) != 1)
+        or any(getattr(value, "placement", None) != expected for value in values)
+    ):
         raise EditorialEnrichmentRevisionValidationError(
             [
                 {
@@ -339,6 +345,7 @@ def requested_registered_placement(
             not in {
                 TargetedEditorialRevisionOperation.CREATE_TABLE,
                 TargetedEditorialRevisionOperation.CREATE_BAR_CHART,
+                TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE,
             }
             or anchor_id is None
             or evidence_pack.registered_anchor_ids is None

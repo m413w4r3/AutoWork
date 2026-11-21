@@ -1298,6 +1298,8 @@ def _project_publication_figures(
                     provenance=candidate.provenance,
                     locator=candidate.locator,
                     placement=candidate.placement,
+                    width=candidate.width,
+                    height=candidate.height,
                 )
             )
         except ValueError as exc:

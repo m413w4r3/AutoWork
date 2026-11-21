@@ -114,6 +114,30 @@ export interface EditorialWorkspaceBarChart {
   anchor_block_id: string;
 }
 
+export interface EditorialWorkspaceFigure {
+  key: string;
+  caption: string;
+  source_url: string;
+  source: string | null;
+  provenance: string;
+  sha256: string;
+  mime_type: string;
+  byte_size: number;
+  width: number | null;
+  height: number | null;
+  status: "proposed" | "included" | "excluded";
+  order: number | null;
+  anchor_block_id: string | null;
+  placement:
+    | "after_paragraph"
+    | "after_lead"
+    | "after_timeline"
+    | "after_section"
+    | "end";
+  page: number | null;
+  section: string | null;
+}
+
 export interface EditorialWorkspaceBlock {
   block_id: string;
   kind: EditorialBlockKind;
@@ -123,6 +147,7 @@ export interface EditorialWorkspaceBlock {
   evidence_refs: Record<string, unknown>[];
   table?: EditorialWorkspaceTable | null;
   chart: EditorialWorkspaceBarChart | null;
+  figure?: EditorialWorkspaceFigure | null;
   revision_target: EditorialWorkspaceRevisionTarget;
   before_hash: string | null;
   allowed_operations: string[];
@@ -408,6 +433,7 @@ export interface EditorialEnrichmentProposalPatch {
   diagrams?: unknown[];
   annotations?: unknown[];
   figures?: unknown[];
+  manual_source_figures?: EditorialManualSourceFigurePatchReference[];
   resource_needs?: unknown[];
   [key: string]: unknown;
 }
@@ -461,6 +487,32 @@ export interface EditorialManualBarChartProposalInput {
   snapshot_id: string;
   anchor_block_id: string;
   chart: EditorialManualBarChartDraft;
+}
+
+export interface EditorialManualSourceFigureSelection {
+  figure_id: string;
+  caption: string;
+  order: number;
+}
+
+export interface EditorialManualSourceFigureProposalInput {
+  snapshot_id: string;
+  anchor_block_id: string;
+  figures: EditorialManualSourceFigureSelection[];
+}
+
+export interface EditorialManualSourceFigurePatchReference {
+  figure_id: string;
+  caption: string;
+  order: number;
+  sha256: string;
+  mime_type: string;
+  byte_size: number;
+  width: number;
+  height: number;
+  source_document_id: string;
+  source_url: string;
+  provenance: string;
 }
 
 export interface EditorialProposalRead {
@@ -810,6 +862,25 @@ export function createManualEditorialBarChartProposal(
 ): Promise<EditorialProposalRead> {
   return request<EditorialProposalRead>(
     `/api/subjects/${encodeURIComponent(subjectId)}/editor/blocks/${encodeURIComponent(anchorBlockId)}/bar-chart-proposals`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Idempotency-Key": idempotencyKey,
+      },
+      body: JSON.stringify(input),
+    },
+  );
+}
+
+export function createManualEditorialSourceFigureProposal(
+  subjectId: string,
+  anchorBlockId: string,
+  idempotencyKey: string,
+  input: EditorialManualSourceFigureProposalInput,
+): Promise<EditorialProposalRead> {
+  return request<EditorialProposalRead>(
+    `/api/subjects/${encodeURIComponent(subjectId)}/editor/blocks/${encodeURIComponent(anchorBlockId)}/figure-proposals`,
     {
       method: "POST",
       headers: {

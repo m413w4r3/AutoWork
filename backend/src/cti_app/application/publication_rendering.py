@@ -88,7 +88,7 @@ from cti_app.domain.publication_render import (
 from cti_app.domain.typst_render import TypstRenderFormat, TypstRenderStatus
 
 PUBLICATION_RENDERER = "typst"
-PUBLICATION_RENDERER_VERSION = "publication-v22-typst-v42-evidence-backed-bar-charts"
+PUBLICATION_RENDERER_VERSION = "publication-v23-typst-v44-source-figure-provenance"
 PUBLICATION_IDENTITY_LABEL_FIELD = "document_label"
 PDF_LINEAGE_RENDER_DATA_FIELD = "pdf_lineage"
 

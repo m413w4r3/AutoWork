@@ -55,6 +55,8 @@ class TargetedEditorialRevisionOperation(StrEnum):
             return EditorialEnrichmentElementKind.TABLE
         if self is TargetedEditorialRevisionOperation.CREATE_BAR_CHART:
             return EditorialEnrichmentElementKind.CHART
+        if self is TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE:
+            return EditorialEnrichmentElementKind.FIGURE
         return None
 
 

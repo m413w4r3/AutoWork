@@ -34,6 +34,12 @@ from cti_app.application.editorial_enrichment_revision import (
     validate_targeted_action,
     validate_targeted_request,
 )
+from cti_app.application.editorial_figure_catalog import (
+    EditorialFigureCatalogError,
+    ManualSourceFigureArchiveReference,
+    archive_reference_for_catalog_item,
+    validate_figure_insertion_limit,
+)
 from cti_app.application.editorial_synthesis import candidate as synthesis_candidate
 from cti_app.application.editorial_synthesis.patch_validation import (
     TargetedSynthesisRevisionValidationError,
@@ -43,6 +49,9 @@ from cti_app.application.editorial_synthesis.patch_validation import (
 )
 from cti_app.application.editorial_synthesis.targets import (
     resolve_target,
+)
+from cti_app.application.editorial_text_policy import (
+    editorial_patch_text_violation as _editorial_patch_text_violation,
 )
 from cti_app.application.editorial_workspace.registry import (
     WorkspaceOccurrenceResolution,
@@ -58,10 +67,10 @@ from cti_app.application.production_editorial_enrichment import (
     EditorialEnrichmentProposalV1,
     EditorialEnrichmentStageErrorCode,
     TableProposalV1,
+    validate_editorial_enrichment,
 )
 from cti_app.application.production_synthesis import (
     _all_evidence_entries,
-    _plain_text_violation,
     _technical_literals,
     parse_synthesis_proposal_wire,
 )
@@ -77,6 +86,7 @@ from cti_app.domain.editorial_proposal import (
     EditorialProposalState,
     ManualBarChartPatch,
     ManualPatch,
+    ManualSourceFigurePatch,
     ManualTablePatch,
     ManualTextPatch,
     variant_group_identity,
@@ -93,19 +103,27 @@ from cti_app.domain.model_runs import ModelRunStatus
 from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
 from cti_app.domain.production_editorial_enrichment import (
     BAR_CHART_INSUFFICIENT_DATA_MESSAGE,
+    EDITORIAL_ENRICHMENT_V9_POLICY_VERSION,
     MAX_BAR_CHART_ADJUSTED_EXPONENT,
     MAX_BAR_CHART_SIGNIFICANT_DIGITS,
     ChartKind,
     ChartSpecV1,
     EditorialEnrichmentElementKind,
+    EnrichmentPlacementKind,
+    EnrichmentPlacementV1,
+    SourceFigureCandidateV1,
+    SourceFigureDecision,
+    SourceFigureInclusionStatus,
     TableSpecV1,
     bar_chart_evidence_contains_unit,
+    editorial_enrichment_from_json,
     normalize_analytic_question,
 )
 from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionConflictError,
     TargetedEditorialRevisionMode,
     TargetedEditorialRevisionOperation,
+    TargetedEditorialRevisionPlacementKind,
     TargetedEditorialRevisionRequest,
     TargetedEditorialRevisionTarget,
     TargetedEditorialRevisionTargetKind,
@@ -116,17 +134,12 @@ from cti_app.domain.production_synthesis import (
     production_synthesis_from_json,
     production_synthesis_to_json,
 )
+from cti_app.domain.publication_kind import PublicationKind
 
 _PATCH_BUCKET = "editorial-proposal-patches"
 _IDEMPOTENCY_KEY = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MAX_PATCH_BYTES = 256 * 1024
-_EDITORIAL_UNSAFE_MARKUP = re.compile(
-    r"(?m)(?<![\w-])#\s*(?:link|raw|import|read|include)\b"
-    r"|<\s*/?\s*[A-Za-z][A-Za-z0-9_.:-]*(?=\s|/?>)"
-    r"|https?://|www\.",
-    re.IGNORECASE,
-)
 _BAR_NUMBER_TOKEN = re.compile(r"(?<![\w.])[-+]?(?:\d+(?:\.\d+)?|\.\d+)(?![\w.])")
 _CLOSED_EDITORIAL_VALIDATOR_CODES = frozenset(
     {
@@ -146,6 +159,12 @@ _CLOSED_EDITORIAL_VALIDATOR_CODES = frozenset(
         "manual_edit_new_fact_unadmitted",
         "manual_table_analytic_question_duplicate",
         "manual_table_row_width_mismatch",
+        "figure_caption_markup_forbidden",
+        "brief_figure_limit_exceeded",
+        "source_figure_inventory_limit_exceeded",
+        "editorial_figure_not_eligible",
+        "editorial_figure_not_found",
+        "figure_catalog_unavailable",
         "table_raw_url_forbidden",
         "proposal_base_unavailable",
         "proposal_patch_invalid",
@@ -196,6 +215,52 @@ class EditorialBarChartDiagnosticReason(StrEnum):
     IDEMPOTENCY_CONFLICT = "manual_bar_chart:idempotency_conflict"
 
 
+class EditorialFigureDiagnosticReason(StrEnum):
+    REQUEST_INVALID = "manual_source_figure:request_invalid"
+    ANCHOR_STALE = "manual_source_figure:anchor_stale"
+    DEPENDENCIES_UNAVAILABLE = "manual_source_figure:dependencies_unavailable"
+    CATALOG_UNAVAILABLE = "manual_source_figure:catalog_unavailable"
+    NOT_ELIGIBLE = "manual_source_figure:not_eligible"
+    BRIEF_LIMIT = "manual_source_figure:brief_limit"
+    INVENTORY_LIMIT = "manual_source_figure:inventory_limit"
+    MARKUP_REJECTED = "manual_source_figure:markup_rejected"
+    IDEMPOTENCY_CONFLICT = "manual_source_figure:idempotency_conflict"
+    VALIDATOR_REJECTED = "manual_source_figure:validator_rejected"
+
+
+def _manual_figure_error_reason(code: str) -> EditorialFigureDiagnosticReason:
+    return {
+        "editorial_anchor_stale": EditorialFigureDiagnosticReason.ANCHOR_STALE,
+        "proposal_base_unavailable": EditorialFigureDiagnosticReason.DEPENDENCIES_UNAVAILABLE,
+        "proposal_workspace_unavailable": EditorialFigureDiagnosticReason.DEPENDENCIES_UNAVAILABLE,
+        "editorial_figure_not_found": EditorialFigureDiagnosticReason.CATALOG_UNAVAILABLE,
+        "figure_catalog_unavailable": EditorialFigureDiagnosticReason.CATALOG_UNAVAILABLE,
+        "editorial_figure_not_eligible": EditorialFigureDiagnosticReason.NOT_ELIGIBLE,
+        "brief_figure_limit_exceeded": EditorialFigureDiagnosticReason.BRIEF_LIMIT,
+        "source_figure_inventory_limit_exceeded": EditorialFigureDiagnosticReason.INVENTORY_LIMIT,
+        "manual_edit_patch_invalid": EditorialFigureDiagnosticReason.MARKUP_REJECTED,
+        "proposal_operation_unsupported": EditorialFigureDiagnosticReason.DEPENDENCIES_UNAVAILABLE,
+    }.get(code, EditorialFigureDiagnosticReason.VALIDATOR_REJECTED)
+
+
+def _manual_figure_failure(
+    code: str,
+    reason: EditorialFigureDiagnosticReason,
+    *,
+    frame: str | None = None,
+    validator_code: str | None = None,
+) -> EditorialProposalApplicationError:
+    if frame is None:
+        caller = sys._getframe(1)
+        frame = _frame_string(caller.f_code.co_filename, caller.f_lineno, caller.f_code.co_name)
+    return EditorialProposalApplicationError(
+        code,
+        reason=reason.value,
+        frame=frame,
+        validator_code=validator_code or code,
+    )
+
+
 def _manual_bar_chart_error_reason(code: str) -> EditorialBarChartDiagnosticReason:
     return {
         "editorial_anchor_stale": EditorialBarChartDiagnosticReason.ANCHOR_STALE,
@@ -243,18 +308,6 @@ def _exception_origin_frame(error: BaseException) -> str | None:
         return None
     frame = frames[-1]
     return _frame_string(frame.filename, frame.lineno or 0, frame.name)
-
-
-def _editorial_patch_text_violation(value: str, *, allow_newline_tab: bool = False) -> bool:
-    allowed_controls = {"\n", "\t"} if allow_newline_tab else set()
-    return (
-        _plain_text_violation(value) is not None
-        or _EDITORIAL_UNSAFE_MARKUP.search(value) is not None
-        or any(
-            char not in allowed_controls and unicodedata.category(char) in {"Cc", "Cf"}
-            for char in value
-        )
-    )
 
 
 def _editorial_table_text_violation(table: TableSpecV1 | TableProposalV1) -> bool:
@@ -893,6 +946,25 @@ def _manual_table_validation_diagnostics(
 ) -> dict[str, object]:
     if (
         preparation.origin is EditorialProposalOrigin.MANUAL_PATCH
+        and preparation.operation is TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE
+    ):
+        frame_value = (
+            getattr(error, "frame", None) or _exception_origin_frame(error)
+            if error is not None
+            else None
+        )
+        frame = frame_value if isinstance(frame_value, str) else None
+        if frame is None:
+            caller = sys._getframe(1)
+            frame = _frame_string(caller.f_code.co_filename, caller.f_lineno, caller.f_code.co_name)
+        return {
+            "code": code,
+            "reason": _manual_figure_error_reason(code).value,
+            "validator_code": _manual_table_validator_code(error, fallback=code),
+            "frame": frame,
+        }
+    if (
+        preparation.origin is EditorialProposalOrigin.MANUAL_PATCH
         and preparation.operation is TargetedEditorialRevisionOperation.CREATE_BAR_CHART
     ):
         bar_reason = _manual_bar_chart_error_reason(code)
@@ -993,6 +1065,23 @@ def _manual_table_failure_from_diagnostics(
 ) -> EditorialProposalApplicationError:
     if (
         preparation.origin is EditorialProposalOrigin.MANUAL_PATCH
+        and preparation.operation is TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE
+    ):
+        raw_reason = diagnostics.get("reason")
+        try:
+            figure_reason = EditorialFigureDiagnosticReason(str(raw_reason))
+        except ValueError:
+            figure_reason = _manual_figure_error_reason(code)
+        frame_value = diagnostics.get("frame")
+        return _manual_figure_failure(
+            code,
+            figure_reason,
+            frame=frame_value if isinstance(frame_value, str) else None,
+            validator_code=_closed_editorial_validator_code(diagnostics.get("validator_code"))
+            or _manual_table_validator_code(None, fallback=code),
+        )
+    if (
+        preparation.origin is EditorialProposalOrigin.MANUAL_PATCH
         and preparation.operation is TargetedEditorialRevisionOperation.CREATE_BAR_CHART
     ):
         raw_reason = diagnostics.get("reason")
@@ -1071,6 +1160,8 @@ class EditorialProposalPreparation:
     paragraph_evidence_context: EditorialParagraphEvidenceContext | None = None
     origin: EditorialProposalOrigin = EditorialProposalOrigin.BRIDGE_DRAFT
     manual_patch: ManualPatch | None = None
+    manual_figure_references: tuple[ManualSourceFigureArchiveReference, ...] = ()
+    manual_figure_candidates: tuple[SourceFigureCandidateV1, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1107,6 +1198,7 @@ class EditorialProposalService:
         discussion_context_builder: Any | None = None,
         chart_compiler: Any | None = None,
         media_asset_store: MediaAssetStore | None = None,
+        figure_catalog_service: Any | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._blob_store = blob_store
@@ -1115,6 +1207,7 @@ class EditorialProposalService:
         self._discussion_context_builder = discussion_context_builder
         self._chart_compiler = chart_compiler
         self._media_asset_store = media_asset_store
+        self._figure_catalog_service = figure_catalog_service
 
     async def prepare_thread_turn(
         self,
@@ -1282,6 +1375,7 @@ class EditorialProposalService:
         typed_patch = patch.typed_patch
         is_manual_table = isinstance(typed_patch, ManualTablePatch)
         is_manual_bar_chart = isinstance(typed_patch, ManualBarChartPatch)
+        is_manual_source_figure = isinstance(typed_patch, ManualSourceFigurePatch)
         if not _IDEMPOTENCY_KEY.fullmatch(idempotency_key):
             if is_manual_table:
                 raise _manual_table_failure(
@@ -1292,6 +1386,10 @@ class EditorialProposalService:
                 raise _manual_bar_chart_failure(
                     "idempotency_key_invalid",
                     EditorialBarChartDiagnosticReason.REQUEST_INVALID,
+                )
+            if is_manual_source_figure:
+                raise _manual_figure_failure(
+                    "idempotency_key_invalid", EditorialFigureDiagnosticReason.REQUEST_INVALID
                 )
             raise EditorialProposalApplicationError("idempotency_key_invalid")
         if self._workspace_service is None:
@@ -1304,6 +1402,11 @@ class EditorialProposalService:
                 raise _manual_bar_chart_failure(
                     "proposal_workspace_unavailable",
                     EditorialBarChartDiagnosticReason.DEPENDENCIES_UNAVAILABLE,
+                )
+            if is_manual_source_figure:
+                raise _manual_figure_failure(
+                    "proposal_workspace_unavailable",
+                    EditorialFigureDiagnosticReason.DEPENDENCIES_UNAVAILABLE,
                 )
             raise EditorialProposalApplicationError("proposal_workspace_unavailable")
 
@@ -1318,6 +1421,15 @@ class EditorialProposalService:
             )
         if isinstance(typed_patch, ManualBarChartPatch):
             return await self._prepare_manual_bar_chart_patch(
+                subject_id=subject_id,
+                snapshot_id=snapshot_id,
+                occurrence_id=occurrence_id,
+                actor_id=actor_id,
+                idempotency_key=idempotency_key,
+                typed_patch=typed_patch,
+            )
+        if isinstance(typed_patch, ManualSourceFigurePatch):
+            return await self._prepare_manual_source_figure_patch(
                 subject_id=subject_id,
                 snapshot_id=snapshot_id,
                 occurrence_id=occurrence_id,
@@ -1672,6 +1784,291 @@ class EditorialProposalService:
         )
         return await self._prepare_result(preparation, reject_invalid_manual=True)
 
+    async def _prepare_manual_source_figure_patch(
+        self,
+        *,
+        subject_id: UUID,
+        snapshot_id: UUID,
+        occurrence_id: UUID,
+        actor_id: UUID,
+        idempotency_key: str,
+        typed_patch: ManualSourceFigurePatch,
+    ) -> EditorialProposal:
+        if (
+            self._discussion_context_builder is None
+            or self._artifact_store is None
+            or self._workspace_service is None
+            or self._figure_catalog_service is None
+        ):
+            raise _manual_figure_failure(
+                "proposal_base_unavailable",
+                EditorialFigureDiagnosticReason.DEPENDENCIES_UNAVAILABLE,
+            )
+        if occurrence_id != typed_patch.anchor_block_id:
+            raise _manual_figure_failure(
+                "editorial_anchor_stale", EditorialFigureDiagnosticReason.ANCHOR_STALE
+            )
+        if any(
+            _editorial_patch_text_violation(selection.caption.strip())
+            or not selection.caption.strip()
+            for selection in typed_patch.figures
+        ):
+            raise _manual_figure_failure(
+                "manual_edit_patch_invalid",
+                EditorialFigureDiagnosticReason.MARKUP_REJECTED,
+                validator_code="figure_caption_markup_forbidden",
+            )
+        try:
+            items = await self._figure_catalog_service.resolve_many_for_insertion(
+                subject_id=subject_id,
+                figure_ids=tuple(selection.figure_id for selection in typed_patch.figures),
+            )
+            archive_references = tuple(archive_reference_for_catalog_item(item) for item in items)
+        except EditorialFigureCatalogError as error:
+            reason = _manual_figure_error_reason(error.code)
+            raise _manual_figure_failure(
+                error.code, reason, frame=_exception_origin_frame(error)
+            ) from None
+
+        try:
+            context = await self._discussion_context_builder.build_manual(
+                subject_id, occurrence_id
+            )
+        except Exception as error:
+            raise _manual_figure_failure(
+                "proposal_base_unavailable",
+                EditorialFigureDiagnosticReason.DEPENDENCIES_UNAVAILABLE,
+                frame=_exception_origin_frame(error),
+            ) from None
+        if (
+            context.proposal_snapshot_id != snapshot_id
+            or context.proposal_enrichment_context is None
+            or TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE.value
+            not in context.proposal_operations
+        ):
+            raise _manual_figure_failure(
+                "proposal_operation_unsupported",
+                EditorialFigureDiagnosticReason.DEPENDENCIES_UNAVAILABLE,
+            )
+        enrichment_context = context.proposal_enrichment_context
+        base_content = enrichment_context.get("base_content")
+        if not isinstance(base_content, Mapping):
+            raise _manual_figure_failure(
+                "proposal_base_unavailable",
+                EditorialFigureDiagnosticReason.DEPENDENCIES_UNAVAILABLE,
+            )
+        try:
+            base_enrichment = editorial_enrichment_from_json(base_content)
+        except (TypeError, ValueError):
+            raise _manual_figure_failure(
+                "proposal_base_unavailable",
+                EditorialFigureDiagnosticReason.DEPENDENCIES_UNAVAILABLE,
+            ) from None
+        existing_figure_ids = {
+            item.resolved_figure.figure_id
+            for item in base_enrichment.source_figures
+            if item.resolved_figure is not None
+        }
+        if any(
+            item._resolved_figure is not None
+            and item._resolved_figure.figure_id in existing_figure_ids
+            for item in items
+        ):
+            raise _manual_figure_failure(
+                "editorial_figure_not_eligible", EditorialFigureDiagnosticReason.NOT_ELIGIBLE
+            )
+        integrated_count = sum(
+            item.inclusion_status is SourceFigureInclusionStatus.INCLUDED
+            for item in base_enrichment.source_figures
+        )
+        try:
+            resolved = await self._workspace_service.resolve_revision_target(
+                subject_id=subject_id,
+                snapshot_id=snapshot_id,
+                block_id=occurrence_id,
+                operation=TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE.value,
+            )
+        except EditorialWorkspaceError as error:
+            raise _manual_figure_failure(
+                _editorial_workspace_error_code(error),
+                EditorialFigureDiagnosticReason.ANCHOR_STALE,
+                frame=_exception_origin_frame(error),
+            ) from error
+        record = resolved.record
+        anchor_entry = resolved.occurrence.entry
+        if (
+            record.publication_kind not in {PublicationKind.ARTICLE, PublicationKind.BRIEF}
+            or anchor_entry is None
+            or resolved.occurrence.binding_state != "valid"
+            or anchor_entry.kind not in {"paragraph", "lead_paragraph"}
+            or enrichment_context.get("anchor_block_id") != str(occurrence_id)
+            or enrichment_context.get("target_path") != revision_target_path(anchor_entry)
+            or enrichment_context.get("base_artifact_id") != str(record.enrichment_artifact_id)
+            or enrichment_context.get("base_artifact_version") != record.enrichment_version
+            or enrichment_context.get("base_input_hash") != record.enrichment_input_hash
+            or enrichment_context.get("base_canonical_sha256")
+            != record.enrichment_canonical_sha256
+            or any(item._run_id != record.production_run_id for item in items)
+        ):
+            raise _manual_figure_failure(
+                "editorial_anchor_stale", EditorialFigureDiagnosticReason.ANCHOR_STALE
+            )
+        try:
+            inventory_limits = {item._inventory_max_figures for item in items}
+            if len(inventory_limits) != 1:
+                raise EditorialFigureCatalogError("figure_catalog_unavailable")
+            validate_figure_insertion_limit(
+                publication_kind=record.publication_kind,
+                integrated_count=integrated_count,
+                requested_count=len(items),
+                inventory_limit=next(iter(inventory_limits)),
+            )
+        except EditorialFigureCatalogError as error:
+            raise _manual_figure_failure(
+                error.code,
+                _manual_figure_error_reason(error.code),
+                frame=_exception_origin_frame(error),
+            ) from None
+
+        preparation_key = _manual_idempotency_key("prepare", idempotency_key)
+        request_payload = {
+            "subject_id": str(subject_id),
+            "snapshot_id": str(snapshot_id),
+            "anchor_block_id": str(occurrence_id),
+            "figures": [
+                {
+                    "figure_id": str(reference.figure_id),
+                    "caption": selection.caption.strip(),
+                    "order": selection.order,
+                    "production_run_id": str(reference.production_run_id),
+                    "source_document_id": str(reference.source_document_id),
+                    "source_url": reference.source_url,
+                    "sha256": reference.sha256,
+                    "mime_type": reference.mime_type,
+                    "byte_size": reference.byte_size,
+                    "width": reference.width,
+                    "height": reference.height,
+                    "provenance": reference.provenance,
+                }
+                for selection, reference in zip(
+                    typed_patch.figures, archive_references, strict=True
+                )
+            ],
+        }
+        request_sha256 = hashlib.sha256(
+            ProductionArtifactStore.canonical_json_bytes(request_payload)
+        ).hexdigest()
+        async with self._uow_factory() as uow:
+            existing = await uow.editorial_proposals.get_by_idempotency_key(
+                subject_id, actor_id, preparation_key
+            )
+        if existing is not None:
+            if existing.request_sha256 != request_sha256:
+                raise _manual_figure_failure(
+                    "proposal_idempotency_conflict",
+                    EditorialFigureDiagnosticReason.IDEMPOTENCY_CONFLICT,
+                )
+            return existing
+
+        placement = EnrichmentPlacementV1(
+            kind=EnrichmentPlacementKind.AFTER_PARAGRAPH,
+            anchor_block_id=occurrence_id,
+        )
+        extraction_sources = {
+            source.source_document_id: source
+            for source in getattr(enrichment_context.get("extraction"), "sources", ())
+        }
+        candidates: list[SourceFigureCandidateV1] = []
+        for selection, item, reference in zip(
+            typed_patch.figures, items, archive_references, strict=True
+        ):
+            resolved_figure = item._resolved_figure
+            if (
+                resolved_figure is None
+                or resolved_figure.decision is not SourceFigureDecision.ACCEPTED
+            ):
+                raise _manual_figure_failure(
+                    "editorial_figure_not_eligible", EditorialFigureDiagnosticReason.NOT_ELIGIBLE
+                )
+            extraction_source = extraction_sources.get(resolved_figure.source_document_id)
+            if extraction_source is None:
+                raise _manual_figure_failure(
+                    "editorial_figure_not_eligible", EditorialFigureDiagnosticReason.NOT_ELIGIBLE
+                )
+            if resolved_figure.source != extraction_source.canonical_url:
+                raise _manual_figure_failure(
+                    "editorial_figure_not_eligible", EditorialFigureDiagnosticReason.NOT_ELIGIBLE
+                )
+            candidates.append(
+                SourceFigureCandidateV1(
+                    key=f"source_figure_{resolved_figure.figure_id.hex}",
+                    source_document_id=resolved_figure.source_document_id,
+                    source_url=extraction_source.canonical_url,
+                    caption=selection.caption.strip(),
+                    provenance=reference.provenance,
+                    locator=resolved_figure.locator,
+                    inclusion_status=SourceFigureInclusionStatus.INCLUDED,
+                    placement=placement,
+                    resolved_figure=resolved_figure,
+                    width=reference.width,
+                    height=reference.height,
+                    order=len(base_enrichment.source_figures) + selection.order,
+                )
+            )
+        try:
+            resolved_target = await self._workspace_service.resolve_revision_target(
+                subject_id=subject_id,
+                snapshot_id=snapshot_id,
+                block_id=occurrence_id,
+                operation=TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE.value,
+            )
+        except EditorialWorkspaceError as error:
+            raise _manual_figure_failure(
+                _editorial_workspace_error_code(error),
+                EditorialFigureDiagnosticReason.ANCHOR_STALE,
+                frame=_exception_origin_frame(error),
+            ) from error
+        raw_response = _manual_wire_response(
+            target_path=revision_target_path(anchor_entry),
+            operation=TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE,
+            base_sha256=record.enrichment_canonical_sha256 or "",
+            before_hash=resolved_target.before_hash,
+            after="{}",
+        )
+        preparation = EditorialProposalPreparation(
+            subject_id=subject_id,
+            production_run_id=record.production_run_id,
+            snapshot_id=snapshot_id,
+            occurrence_id=occurrence_id,
+            thread_id=None,
+            base_artifact_id=record.enrichment_artifact_id,
+            base_artifact_version=record.enrichment_version,
+            base_input_hash=record.enrichment_input_hash,
+            base_canonical_sha256=record.enrichment_canonical_sha256,
+            base_pin_hash=record.workspace_pin_hash,
+            routing_decision_hash=record.routing_decision_hash,
+            target_id=resolved_target.target_id,
+            target=resolved_target.target,
+            operation=TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE,
+            before_hash=resolved_target.before_hash,
+            base_content=base_content,
+            raw_response=raw_response,
+            model_run_id=None,
+            model_turn_id=None,
+            actor_id=actor_id,
+            idempotency_key=preparation_key,
+            request_sha256=request_sha256,
+            instruction="Manual archived source figure insertion",
+            requester=str(actor_id),
+            enrichment_context=enrichment_context,
+            strict_wire=True,
+            origin=EditorialProposalOrigin.MANUAL_PATCH,
+            manual_patch=ManualPatch(typed_patch=typed_patch),
+            manual_figure_references=archive_references,
+            manual_figure_candidates=tuple(candidates),
+        )
+        return await self._prepare_result(preparation, reject_invalid_manual=True)
+
     async def _prepare_manual_bar_chart_patch(
         self,
         *,
@@ -1853,6 +2250,14 @@ class EditorialProposalService:
                     "idempotency_key_invalid",
                     EditorialBarChartDiagnosticReason.REQUEST_INVALID,
                 )
+            if (
+                preparation.origin is EditorialProposalOrigin.MANUAL_PATCH
+                and preparation.operation
+                is TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE
+            ):
+                raise _manual_figure_failure(
+                    "idempotency_key_invalid", EditorialFigureDiagnosticReason.REQUEST_INVALID
+                )
             raise EditorialProposalApplicationError("idempotency_key_invalid")
         try:
             preparation = await self._resolve_authoritative_preparation(preparation)
@@ -1873,6 +2278,17 @@ class EditorialProposalService:
                 raise _manual_bar_chart_failure(
                     error.code,
                     _manual_bar_chart_error_reason(error.code),
+                    frame=error.frame or _exception_origin_frame(error),
+                    validator_code=error.validator_code or error.code,
+                ) from error
+            if (
+                preparation.origin is EditorialProposalOrigin.MANUAL_PATCH
+                and preparation.operation
+                is TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE
+            ):
+                raise _manual_figure_failure(
+                    error.code,
+                    _manual_figure_error_reason(error.code),
                     frame=error.frame or _exception_origin_frame(error),
                     validator_code=error.validator_code or error.code,
                 ) from error
@@ -2712,6 +3128,12 @@ class EditorialProposalService:
             and preparation.target.kind is TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT
             and preparation.target.element_kind is EditorialEnrichmentElementKind.CHART
         )
+        typed_source_figure_patch = (
+            preparation.operation is TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE
+            and preparation.target.kind
+            is TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT
+            and preparation.target.element_kind is EditorialEnrichmentElementKind.FIGURE
+        )
         if preparation.strict_wire and (typed_table_patch or typed_bar_chart_patch):
             try:
                 typed_proposal = EditorialEnrichmentProposalV1.model_validate(
@@ -2743,6 +3165,7 @@ class EditorialProposalService:
                 preparation.operation is TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH
                 or typed_table_patch
                 or typed_bar_chart_patch
+                or typed_source_figure_patch
             )
             else (patch.after, patch.rationale)
         )
@@ -3044,7 +3467,97 @@ class EditorialProposalService:
         create_bar_chart = (
             preparation.operation is TargetedEditorialRevisionOperation.CREATE_BAR_CHART
         )
+        create_source_figure = (
+            preparation.operation is TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE
+        )
         raw = _parse_editorial_patch_payload(patch.after, exact_chart_numbers=create_bar_chart)
+
+        if create_source_figure:
+            target = preparation.target
+            placement = target.placement
+            candidates = preparation.manual_figure_candidates
+            references = preparation.manual_figure_references
+            if (
+                target.element_kind is not EditorialEnrichmentElementKind.FIGURE
+                or target.element_key is not None
+                or placement is None
+                or placement.kind is not TargetedEditorialRevisionPlacementKind.AFTER_PARAGRAPH
+                or placement.anchor_block_id != preparation.occurrence_id
+                or patch.target != context.get("target_path")
+                or not candidates
+                or len(candidates) != len(references)
+                or any(
+                    candidate.placement.kind is not EnrichmentPlacementKind.AFTER_PARAGRAPH
+                    or candidate.placement.anchor_block_id != preparation.occurrence_id
+                    or candidate.resolved_figure is None
+                    or candidate.resolved_figure.figure_id != reference.figure_id
+                    or candidate.resolved_figure.sha256 != reference.sha256
+                    or candidate.resolved_figure.mime_type != reference.mime_type
+                    or candidate.resolved_figure.byte_size != reference.byte_size
+                    or candidate.width != reference.width
+                    or candidate.height != reference.height
+                    for candidate, reference in zip(candidates, references, strict=True)
+                )
+            ):
+                raise EditorialProposalApplicationError("proposal_target_mismatch")
+            base_enrichment = editorial_enrichment_from_json(context["base_content"])
+            if base_enrichment.schema_version < 8:
+                raise EditorialProposalApplicationError("proposal_operation_unsupported")
+            if base_enrichment.schema_version < 9:
+                base_enrichment = replace(
+                    base_enrichment,
+                    schema_version=9,
+                    enrichment_policy_version=EDITORIAL_ENRICHMENT_V9_POLICY_VERSION,
+                )
+            candidate_enrichment = replace(
+                base_enrichment,
+                tables=(),
+                diagrams=(),
+                charts=(),
+                source_figures=candidates,
+                figure_decisions=(),
+                annotations=(),
+            )
+            validate_editorial_enrichment(
+                candidate_enrichment,
+                extraction=context["extraction"],
+                synthesis=context["synthesis"],
+            )
+            return (
+                {
+                    "schema_version": "editorial-patch-v1",
+                    "operation": preparation.operation.value,
+                    "target": target.to_json(),
+                    "target_id": preparation.target_id,
+                    "occurrence_id": str(preparation.occurrence_id),
+                    "before_hash": preparation.before_hash,
+                    "enrichment_patch": {
+                        "manual_source_figures": [
+                            {
+                                "figure_id": str(reference.figure_id),
+                                "caption": candidate.caption,
+                                "order": position,
+                                "source_document_id": str(reference.source_document_id),
+                                "source_url": candidate.source_url,
+                                "sha256": reference.sha256,
+                                "mime_type": reference.mime_type,
+                                "byte_size": reference.byte_size,
+                                "width": reference.width,
+                                "height": reference.height,
+                                "provenance": reference.provenance,
+                            }
+                            for position, (candidate, reference) in enumerate(
+                                zip(candidates, references, strict=True)
+                            )
+                        ]
+                    },
+                    "rationale": "Manual archived source figure insertion",
+                    "evidence_refs": [],
+                },
+                EditorialProposalState.PROPOSED,
+                EditorialProposalEventKind.PREPARED,
+                {},
+            )
 
         def refuse_bar_chart_for_insufficient_data() -> tuple[
             None,

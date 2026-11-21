@@ -905,6 +905,9 @@ class SourceFigureCandidateV1:
     placement: EnrichmentPlacementV1
     resolved_figure: ResolvedSourceFigureV1 | None = None
     purpose: EditorialAnalyticPurposeV1 | None = None
+    width: int | None = None
+    height: int | None = None
+    order: int | None = None
 
     def __post_init__(self) -> None:
         _key(self.key, "Source figure key")
@@ -929,6 +932,14 @@ class SourceFigureCandidateV1:
             raise ValueError("A source figure candidate must reference an accepted local figure")
         if self.purpose is not None and not isinstance(self.purpose, EditorialAnalyticPurposeV1):
             raise ValueError("Source figure analytic purpose is invalid")
+        if (self.width is None) != (self.height is None):
+            raise ValueError("Source figure dimensions must be complete")
+        if self.width is not None and (type(self.width) is not int or self.width < 1):
+            raise ValueError("Source figure width must be a positive integer")
+        if self.height is not None and (type(self.height) is not int or self.height < 1):
+            raise ValueError("Source figure height must be a positive integer")
+        if self.order is not None and (type(self.order) is not int or self.order < 0):
+            raise ValueError("Source figure order must be a non-negative integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1335,6 +1346,11 @@ def _figure_to_json(figure: SourceFigureCandidateV1) -> dict[str, Any]:
         }
     if figure.purpose is not None:
         payload["purpose"] = _purpose_to_json(figure.purpose)
+    if figure.width is not None:
+        payload["width"] = figure.width
+        payload["height"] = figure.height
+    if figure.order is not None:
+        payload["order"] = figure.order
     return payload
 
 
@@ -1506,6 +1522,7 @@ _FIGURE_KEYS = frozenset(
     }
 )
 _FIGURE_BASE_KEYS = _FIGURE_KEYS - {"resolved_figure"}
+_FIGURE_ARCHIVE_METADATA_KEYS = frozenset({"width", "height", "order"})
 _FIGURE_PURPOSE_BASE_KEYS = _FIGURE_BASE_KEYS | {"purpose"}
 _FIGURE_PURPOSE_KEYS = _FIGURE_KEYS | {"purpose"}
 _FIGURE_DECISION_KEYS = frozenset(
@@ -1882,12 +1899,13 @@ def _locator_from_json(raw: Any) -> SourceFigureLocatorV1:
 
 
 def _figure_from_json(raw: Any) -> SourceFigureCandidateV1:
-    if not isinstance(raw, Mapping) or frozenset(raw) not in {
-        _FIGURE_BASE_KEYS,
-        _FIGURE_KEYS,
-        _FIGURE_PURPOSE_BASE_KEYS,
-        _FIGURE_PURPOSE_KEYS,
-    }:
+    if not isinstance(raw, Mapping):
+        raise ValueError("Source figure candidate has missing or extra fields")
+    keys = frozenset(raw)
+    if (
+        not _FIGURE_BASE_KEYS <= keys
+        or keys - (_FIGURE_KEYS | _FIGURE_ARCHIVE_METADATA_KEYS | {"purpose"})
+    ):
         raise ValueError("Source figure candidate has missing or extra fields")
     payload = raw
     resolved_figure = None
@@ -1950,6 +1968,11 @@ def _figure_from_json(raw: Any) -> SourceFigureCandidateV1:
         placement=_placement_from_json(payload["placement"]),
         resolved_figure=resolved_figure,
         purpose=_purpose_from_json(payload["purpose"]) if "purpose" in payload else None,
+        width=(json_int(payload["width"], "Source figure width") if "width" in payload else None),
+        height=(
+            json_int(payload["height"], "Source figure height") if "height" in payload else None
+        ),
+        order=(json_int(payload["order"], "Source figure order") if "order" in payload else None),
     )
 
 

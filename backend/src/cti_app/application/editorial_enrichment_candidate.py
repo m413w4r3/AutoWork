@@ -168,7 +168,7 @@ def insert_target(
     element_kind: EditorialEnrichmentElementKind,
     element_key: str,
 ) -> EditorialEnrichmentV1:
-    """Append one validated element, retaining the legacy element-key rules."""
+    """Append validated elements, retaining the legacy element-key rules."""
     if element_kind is EditorialEnrichmentElementKind.TABLE:
         return replace(base, tables=(*base.tables, replace(candidate.tables[0], key=element_key)))
     if element_kind is EditorialEnrichmentElementKind.CHART:
@@ -176,6 +176,45 @@ def insert_target(
     if element_kind is EditorialEnrichmentElementKind.DIAGRAM:
         diagram = replace(candidate.diagrams[0], key=element_key)
         return replace(base, diagrams=(*base.diagrams, diagram))
+    if element_kind is EditorialEnrichmentElementKind.FIGURE:
+        if not candidate.source_figures:
+            raise EditorialEnrichmentRevisionValidationError(
+                [
+                    {
+                        "block_id": element_key,
+                        "reason_code": "editorial_enrichment_figure_not_selected",
+                    }
+                ]
+            )
+        existing_ids = {
+            item.resolved_figure.figure_id
+            for item in base.source_figures
+            if item.resolved_figure is not None
+        }
+        candidate_ids = [
+            item.resolved_figure.figure_id
+            for item in candidate.source_figures
+            if item.resolved_figure is not None
+        ]
+        if len(candidate_ids) != len(candidate.source_figures) or len(set(candidate_ids)) != len(
+            candidate_ids
+        ) or any(figure_id in existing_ids for figure_id in candidate_ids):
+            raise EditorialEnrichmentRevisionValidationError(
+                [
+                    {
+                        "block_id": element_key,
+                        "reason_code": "editorial_enrichment_figure_already_selected",
+                    }
+                ]
+            )
+        decisions = tuple(
+            item for item in base.figure_decisions if item.figure_id not in set(candidate_ids)
+        )
+        return replace(
+            base,
+            source_figures=(*base.source_figures, *candidate.source_figures),
+            figure_decisions=decisions,
+        )
     raise ValueError("editorial_enrichment_source_figure_create_not_supported")
 
 
@@ -433,7 +472,12 @@ async def build_candidate_from_validated_patch(
         assert element_index is not None
         final_payload[list_name].pop(element_index)
     elif is_create:
-        final_payload[list_name].append(after_element)
+        if element_kind is EditorialEnrichmentElementKind.FIGURE:
+            final_payload[list_name].extend(
+                after_payload[list_name][-len(validated_patch.source_figures) :]
+            )
+        else:
+            final_payload[list_name].append(after_element)
     elif outcome is EditorialEnrichmentRevisionOutcome.REVISED:
         assert element_index is not None
         final_payload[list_name][element_index] = after_element

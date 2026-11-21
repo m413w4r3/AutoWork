@@ -114,10 +114,55 @@ class ManualBarChartPatch:
 
 
 @dataclass(frozen=True, slots=True)
+class ManualSourceFigureSelection:
+    """A client selection by opaque catalogue ID, with editorial text and order only."""
+
+    figure_id: UUID
+    caption: str
+    order: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.figure_id, UUID):
+            raise EditorialProposalError("proposal_patch_invalid")
+        if not isinstance(self.caption, str) or not self.caption.strip():
+            raise EditorialProposalError("proposal_patch_invalid")
+        if len(self.caption.strip()) > 500:
+            raise EditorialProposalError("proposal_patch_invalid")
+        if type(self.order) is not int or self.order < 0:
+            raise EditorialProposalError("proposal_patch_invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class ManualSourceFigurePatch:
+    """One archived-figure insertion request anchored to a registered paragraph."""
+
+    anchor_block_id: UUID
+    figures: tuple[ManualSourceFigureSelection, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.anchor_block_id, UUID):
+            raise EditorialProposalError("proposal_patch_invalid")
+        if not isinstance(self.figures, tuple) or not self.figures:
+            raise EditorialProposalError("proposal_patch_invalid")
+        if any(not isinstance(item, ManualSourceFigureSelection) for item in self.figures):
+            raise EditorialProposalError("proposal_patch_invalid")
+        if len({item.figure_id for item in self.figures}) != len(self.figures):
+            raise EditorialProposalError("proposal_patch_invalid")
+        if tuple(item.order for item in self.figures) != tuple(range(len(self.figures))):
+            raise EditorialProposalError("proposal_patch_invalid")
+
+    @property
+    def operation(self) -> TargetedEditorialRevisionOperation:
+        return TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE
+
+
+@dataclass(frozen=True, slots=True)
 class ManualPatch:
     """The persisted proposal origin for one validated typed manual patch."""
 
-    typed_patch: ManualTextPatch | ManualTablePatch | ManualBarChartPatch
+    typed_patch: (
+        ManualTextPatch | ManualTablePatch | ManualBarChartPatch | ManualSourceFigurePatch
+    )
 
 
 class EditorialProposalEventKind(StrEnum):

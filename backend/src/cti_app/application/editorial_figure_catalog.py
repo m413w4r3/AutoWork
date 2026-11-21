@@ -28,6 +28,7 @@ from cti_app.application.source_figure_inventory import (
     MAX_SOURCE_DOCUMENT_BYTES,
     MAX_SOURCE_FIGURE_BYTES,
     MAX_SOURCE_FIGURE_TOTAL_BYTES,
+    MAX_SOURCE_FIGURES,
     SourceFigureInventoryResult,
     load_archived_source_figure_inventory,
 )
@@ -42,6 +43,7 @@ from cti_app.domain.production import (
 from cti_app.domain.production_editorial_enrichment import (
     EditorialEnrichmentV1,
     EditorialFigureDecision,
+    ResolvedSourceFigureV1,
     SourceFigureDecision,
     editorial_enrichment_from_json,
 )
@@ -50,6 +52,7 @@ from cti_app.domain.production_extraction import (
     production_extraction_from_json,
 )
 from cti_app.domain.publication_document import parse_publication_document
+from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.source_media import SourceMediaRecord
 
 _ACTIVE_SOURCE_STATES = frozenset(
@@ -114,6 +117,24 @@ class EditorialFigureCatalogItem:
     _sha256: str | None = field(repr=False)
     _byte_size: int | None = field(repr=False)
     _run_id: UUID = field(repr=False)
+    _inventory_max_figures: int = field(default=MAX_SOURCE_FIGURES, repr=False)
+    _resolved_figure: ResolvedSourceFigureV1 | None = field(default=None, repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class ManualSourceFigureArchiveReference:
+    """Safe, server-resolved archive facts pinned into a manual figure patch."""
+
+    figure_id: UUID
+    production_run_id: UUID
+    source_document_id: UUID
+    source_url: str
+    sha256: str
+    mime_type: str
+    byte_size: int
+    width: int
+    height: int
+    provenance: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,6 +295,87 @@ def classify_source_figure(
     return FigureEligibility("available", True, None)
 
 
+def archive_reference_for_catalog_item(
+    item: EditorialFigureCatalogItem,
+) -> ManualSourceFigureArchiveReference:
+    """Resolve only an eligible, verified catalogue row to safe archive metadata."""
+    figure = item._resolved_figure
+    if (
+        not item.selectable
+        or item.already_used
+        or item.status not in {"available", "not_selected"}
+        or figure is None
+        or figure.decision is not SourceFigureDecision.ACCEPTED
+        or figure.blob_id is None
+        or figure.sha256 is None
+        or figure.mime_type is None
+        or figure.byte_size is None
+        or item._blob_id != figure.blob_id
+        or item._sha256 != figure.sha256
+        or item.mime_type != figure.mime_type
+        or item._byte_size != figure.byte_size
+        or item.width is None
+        or item.width < 1
+        or item.height is None
+        or item.height < 1
+    ):
+        raise EditorialFigureCatalogError("editorial_figure_not_eligible")
+    try:
+        figure_id = UUID(item.figure_id)
+    except ValueError:
+        raise EditorialFigureCatalogError("figure_catalog_unavailable") from None
+    return ManualSourceFigureArchiveReference(
+        figure_id=figure_id,
+        production_run_id=item._run_id,
+        source_document_id=figure.source_document_id,
+        source_url=figure.source,
+        sha256=figure.sha256,
+        mime_type=figure.mime_type,
+        byte_size=figure.byte_size,
+        width=item.width,
+        height=item.height,
+        provenance=figure.provenance,
+    )
+
+
+def assert_archive_reference_matches(
+    expected: ManualSourceFigureArchiveReference,
+    item: EditorialFigureCatalogItem,
+) -> bool:
+    """Compare the complete persisted archive fence with a fresh catalogue read."""
+    try:
+        current = archive_reference_for_catalog_item(item)
+    except EditorialFigureCatalogError:
+        return False
+    return current == expected
+
+
+def validate_figure_insertion_limit(
+    *,
+    publication_kind: PublicationKind,
+    integrated_count: int,
+    requested_count: int,
+    inventory_limit: int,
+) -> None:
+    """Enforce the publication-specific ceiling before preparation and adoption."""
+    if (
+        type(integrated_count) is not int
+        or integrated_count < 0
+        or type(requested_count) is not int
+        or requested_count < 1
+        or type(inventory_limit) is not int
+        or inventory_limit < 1
+    ):
+        raise EditorialFigureCatalogError("figure_catalog_request_invalid")
+    if publication_kind is PublicationKind.BRIEF and integrated_count + requested_count > 3:
+        raise EditorialFigureCatalogError("brief_figure_limit_exceeded")
+    if (
+        publication_kind is PublicationKind.ARTICLE
+        and integrated_count + requested_count > inventory_limit
+    ):
+        raise EditorialFigureCatalogError("source_figure_inventory_limit_exceeded")
+
+
 class EditorialFigureCatalogService:
     """Resolve a catalogue only from the subject's currently pinned production run."""
 
@@ -335,7 +437,35 @@ class EditorialFigureCatalogService:
                 return item
         raise EditorialFigureCatalogError("editorial_figure_not_found")
 
-    async def _load_current(self, subject_id: UUID) -> tuple[EditorialFigureCatalogItem, ...]:
+    async def resolve_for_insertion(
+        self, *, subject_id: UUID, figure_id: UUID
+    ) -> EditorialFigureCatalogItem:
+        """Force an uncached inventory and archived-blob read for a write decision."""
+        items = await self.resolve_many_for_insertion(
+            subject_id=subject_id, figure_ids=(figure_id,)
+        )
+        return items[0]
+
+    async def resolve_many_for_insertion(
+        self, *, subject_id: UUID, figure_ids: Sequence[UUID]
+    ) -> tuple[EditorialFigureCatalogItem, ...]:
+        """Resolve a selected set from one fresh inventory and blob verification pass."""
+        if not figure_ids or len(set(figure_ids)) != len(figure_ids):
+            raise EditorialFigureCatalogError("figure_catalog_request_invalid")
+        items = await self._load_current(subject_id, use_cache=False)
+        by_id = {item.figure_id: item for item in items}
+        selected: list[EditorialFigureCatalogItem] = []
+        for figure_id in figure_ids:
+            item = by_id.get(str(figure_id))
+            if item is None:
+                raise EditorialFigureCatalogError("editorial_figure_not_found")
+            archive_reference_for_catalog_item(item)
+            selected.append(item)
+        return tuple(selected)
+
+    async def _load_current(
+        self, subject_id: UUID, *, use_cache: bool = True
+    ) -> tuple[EditorialFigureCatalogItem, ...]:
         async with self._uow_factory() as uow:
             subject = await uow.subjects.get(subject_id)
             if subject is None:
@@ -418,7 +548,7 @@ class EditorialFigureCatalogService:
                 media_policy_sha256=self._media_policy_sha256,
                 media_records=media_records,
             )
-            cached = self._cache.get(cache_key)
+            cached = self._cache.get(cache_key) if use_cache else None
             if cached is not None:
                 if (
                     cached.access_extraction.subject_id != subject_id
@@ -469,14 +599,15 @@ class EditorialFigureCatalogService:
             )
             if not active_sources:
                 items: tuple[EditorialFigureCatalogItem, ...] = ()
-                self._cache.put(
-                    cache_key,
-                    _CachedFigureCatalog(
-                        items=items,
-                        access_extraction=_minimal_access_extraction(extraction),
-                        effective_tlp=access_policy.effective_tlp,
-                    ),
-                )
+                if use_cache:
+                    self._cache.put(
+                        cache_key,
+                        _CachedFigureCatalog(
+                            items=items,
+                            access_extraction=_minimal_access_extraction(extraction),
+                            effective_tlp=access_policy.effective_tlp,
+                        ),
+                    )
                 return items
 
             await _ensure_inventory_bounds(
@@ -565,14 +696,15 @@ class EditorialFigureCatalogService:
             not_selected_ids=frozenset(not_selected_ids),
         )
         items = self._items(context)
-        self._cache.put(
-            cache_key,
-            _CachedFigureCatalog(
-                items=items,
-                access_extraction=_minimal_access_extraction(extraction),
-                effective_tlp=access_policy.effective_tlp,
-            ),
-        )
+        if use_cache:
+            self._cache.put(
+                cache_key,
+                _CachedFigureCatalog(
+                    items=items,
+                    access_extraction=_minimal_access_extraction(extraction),
+                    effective_tlp=access_policy.effective_tlp,
+                ),
+            )
         return items
 
     async def _read_artifact_json(
@@ -714,6 +846,8 @@ class EditorialFigureCatalogService:
                     _sha256=figure.sha256,
                     _byte_size=figure.byte_size,
                     _run_id=context.run.id,
+                    _inventory_max_figures=context.inventory.max_figures,
+                    _resolved_figure=figure,
                 )
             )
         return tuple(items)

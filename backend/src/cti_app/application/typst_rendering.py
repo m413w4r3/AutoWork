@@ -99,6 +99,7 @@ from cti_app.domain.publication_document import (
 )
 from cti_app.domain.semantic_annotation import (
     SEMANTIC_ROLE_TYPST_FUNCTION_V1,
+    SemanticRole,
     lead_paragraph_anchor,
     section_paragraph_anchor,
     timeline_anchor,
@@ -107,8 +108,8 @@ from cti_app.domain.subject_ioc_eligibility import is_supported_publication_ioc_
 
 # v40 localizes opinion IOC labels and keeps protocol figure proof captions visible.
 _RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v40-m21-opinion-render"
-_RENDER_DATA_SCHEMA_VERSION_V9 = "typst-publication-model-v41-after-paragraph-anchors"
-_RENDER_DATA_SCHEMA_VERSION_V10 = "typst-publication-model-v42-evidence-backed-bar-charts"
+_RENDER_DATA_SCHEMA_VERSION_V9 = "typst-publication-model-v43-source-figure-provenance"
+_RENDER_DATA_SCHEMA_VERSION_V10 = "typst-publication-model-v44-source-figure-provenance"
 _BRIEF_PUBLICATION_EVENTS_POLICY_VERSION = "brief-assembly-v4-m19-publication-events"
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
 _FRENCH_MONTH_NAMES = (
@@ -2702,6 +2703,18 @@ def project_publication_to_typst_model(
             )
         block = _figure_block(figure, source, media_ref)
         rich_block(block, "semantic_caption", f"figure:{figure.key}:caption", figure.caption)
+        source_note = _reader_facing_figure_source(figure, source)
+        if source_note is not None:
+            source_suffix = f" — Source : {source_note}"
+            block["caption"] = f"{block['caption']}{source_suffix}"
+            semantic_caption = block.get("semantic_caption")
+            if isinstance(semantic_caption, list):
+                semantic_caption.append(
+                    {
+                        "style": SEMANTIC_ROLE_TYPST_FUNCTION_V1[SemanticRole.TEXT],
+                        "text": source_suffix,
+                    }
+                )
         add_rich(
             figure.placement.kind,
             figure.placement.section_index,
@@ -4616,6 +4629,8 @@ def _figure_block(
         "type": "figure",
         "key": figure.key,
         "caption": figure.caption,
+        "width": figure.width,
+        "height": figure.height,
         "sha256": figure.sha256,
         "sha256_spans": _breakable_typst_display_text(figure.sha256, interval=8),
         "byte_size": figure.byte_size,

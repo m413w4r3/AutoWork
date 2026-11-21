@@ -378,6 +378,7 @@ def allowed_operations(
     *,
     allow_table_insertion: bool = False,
     allow_bar_chart_insertion: bool = False,
+    allow_figure_insertion: bool = False,
 ) -> tuple[str, ...]:
     if entry.source_stage != "synthesis":
         return ()
@@ -392,6 +393,11 @@ def allowed_operations(
         EditorialBlockKind.PARAGRAPH,
     }:
         operations = (*operations, TargetedEditorialRevisionOperation.CREATE_BAR_CHART.value)
+    if allow_figure_insertion and entry.kind in {
+        EditorialBlockKind.LEAD_PARAGRAPH,
+        EditorialBlockKind.PARAGRAPH,
+    }:
+        operations = (*operations, TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE.value)
     return operations
 
 
@@ -518,6 +524,7 @@ def project_blocks(
     enrichment_read_sha256: str | None = None,
     needs_review_ids: frozenset[UUID] = frozenset(),
     allow_operations: bool = True,
+    allow_figure_insertion: bool = False,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
     blocks: list[dict[str, object]] = []
     enrichments: list[dict[str, object]] = []
@@ -563,6 +570,12 @@ def project_blocks(
             and entry.source_stage is EditorialSourceStage.EDITORIAL_ENRICHMENT
             else None
         )
+        structured_figure = (
+            _project_structured_figure(value)
+            if entry.kind is EditorialBlockKind.FIGURE
+            and entry.source_stage is EditorialSourceStage.EDITORIAL_ENRICHMENT
+            else None
+        )
         operations = (
             allowed_operations(
                 entry,
@@ -590,6 +603,24 @@ def project_blocks(
                         enrichment_read_sha256=enrichment_read_sha256,
                         anchor_registered=True,
                     )
+                ),
+                allow_figure_insertion=(
+                    allow_figure_insertion
+                    and record is not None
+                    and table_insertion_preparation_ready(
+                        record=record,
+                        entry=entry,
+                        synthesis_artifact=synthesis_artifact,
+                        synthesis_read_sha256=synthesis_read_sha256,
+                        enrichment_artifact=enrichment_artifact,
+                        enrichment_read_sha256=enrichment_read_sha256,
+                        anchor_registered=True,
+                    )
+                    and entry.source_stage is EditorialSourceStage.SYNTHESIS
+                    and entry.kind in {
+                        EditorialBlockKind.PARAGRAPH,
+                        EditorialBlockKind.LEAD_PARAGRAPH,
+                    }
                 ),
             )
             if allow_operations and entry.revision_status is EditorialRevisionStatus.READY
@@ -619,6 +650,7 @@ def project_blocks(
             "evidence_refs": evidence_refs,
             "table": structured_table,
             "chart": structured_chart,
+            "figure": structured_figure,
             "revision_target": {
                 "block_id": str(entry.block_id),
                 "legacy_target_id": legacy_target_id,
@@ -658,7 +690,7 @@ def project_blocks(
     block_by_id = {UUID(str(block["block_id"])): block for block in blocks}
     synthesis_blocks = [block_by_id[entry.block_id] for entry in synthesis_entries]
     enrichment_blocks_by_id = {UUID(str(block["block_id"])): block for block in enrichments}
-    insertions: dict[int, list[tuple[int, int, str, dict[str, object]]]] = {}
+    insertions: dict[int, list[tuple[int, int, int, str, dict[str, object]]]] = {}
     stale_enrichments: list[tuple[int, str, dict[str, object]]] = []
     section_count = len(synthesis.get("sections", []))
     for entry in enrichment_entries:
@@ -739,6 +771,12 @@ def project_blocks(
         insertions.setdefault(boundary, []).append(
             (
                 placement_rank,
+                (
+                    int(item["order"])
+                    if entry.kind is EditorialBlockKind.FIGURE
+                    and type(item.get("order")) is int
+                    else entry.position
+                ),
                 entry.position,
                 element_key,
                 enrichment_block,
@@ -749,7 +787,7 @@ def project_blocks(
     ordered_enrichments: list[dict[str, object]] = []
     for boundary in range(len(synthesis_blocks) + 1):
         attached = sorted(insertions.get(boundary, []), key=lambda item: item[:3])
-        for _rank, _position, _key, block in attached:
+        for _rank, _document_order, _position, _key, block in attached:
             ordered_blocks.append(block)
             ordered_enrichments.append(block)
         if boundary < len(synthesis_blocks):
@@ -862,6 +900,61 @@ def _project_structured_chart(value: Any) -> dict[str, object] | None:
         "unit": value.get("unit"),
         "points": projected_points,
         "anchor_block_id": placement.get("anchor_block_id"),
+    }
+
+
+def _project_structured_figure(value: Any) -> dict[str, object] | None:
+    if not isinstance(value, Mapping):
+        return None
+    resolved = value.get("resolved_figure")
+    placement = value.get("placement")
+    locator = value.get("locator")
+    if (
+        not isinstance(value.get("key"), str)
+        or not isinstance(value.get("caption"), str)
+        or not isinstance(value.get("provenance"), str)
+        or not isinstance(value.get("source_url"), str)
+        or not isinstance(value.get("inclusion_status"), str)
+        or not isinstance(resolved, Mapping)
+        or not isinstance(placement, Mapping)
+        or not isinstance(placement.get("kind"), str)
+        or not isinstance(locator, Mapping)
+        or not isinstance(resolved.get("sha256"), str)
+        or not isinstance(resolved.get("mime_type"), str)
+        or type(resolved.get("byte_size")) is not int
+    ):
+        return None
+    placement_kind = placement["kind"]
+    if placement_kind not in {
+        "after_paragraph",
+        "after_lead",
+        "after_timeline",
+        "after_section",
+        "end",
+    }:
+        return None
+    anchor_block_id = placement.get("anchor_block_id")
+    if anchor_block_id is not None and not isinstance(anchor_block_id, str):
+        anchor_block_id = None
+    if placement_kind == "after_paragraph" and anchor_block_id is None:
+        return None
+    return {
+        "key": value["key"],
+        "caption": value["caption"],
+        "source_url": value["source_url"],
+        "provenance": value["provenance"],
+        "source": resolved.get("source"),
+        "sha256": resolved["sha256"],
+        "mime_type": resolved["mime_type"],
+        "byte_size": resolved["byte_size"],
+        "width": value.get("width") if type(value.get("width")) is int else None,
+        "height": value.get("height") if type(value.get("height")) is int else None,
+        "status": value["inclusion_status"],
+        "order": value.get("order") if type(value.get("order")) is int else None,
+        "anchor_block_id": anchor_block_id,
+        "placement": placement_kind,
+        "page": locator.get("page") if type(locator.get("page")) is int else None,
+        "section": locator.get("section") if isinstance(locator.get("section"), str) else None,
     }
 
 
