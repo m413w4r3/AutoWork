@@ -69,6 +69,8 @@ from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
+    ProductionRunStatus,
+    ProductionStage,
 )
 from cti_app.domain.production_extraction import production_extraction_to_json
 from cti_app.domain.production_relevance import relevance_projection_to_json
@@ -428,6 +430,34 @@ async def _seed_current_inputs(
     return enrichment
 
 
+async def _finish_seeded_production_run(
+    seeded: _Seeded,
+    uow_factory: UnitOfWorkFactory,
+) -> _Seeded:
+    async with uow_factory() as uow:
+        run = await uow.production_runs.get(seeded.run.id)
+        assert run is not None
+        assert run.status is ProductionRunStatus.QUEUED
+        assert run.current_stage is ProductionStage.SOURCES
+        assert run.pipeline_generation == 0
+        now = datetime.now(UTC)
+        run.start_running(now=now)
+        while run.current_stage is not ProductionStage.ASSEMBLY:
+            run.advance_stage(publication_kind=PublicationKind.BRIEF, now=now)
+        run.mark_ready(now=now)
+        await uow.production_runs.save(run)
+        await uow.commit()
+
+    async with uow_factory() as uow:
+        persisted_run = await uow.production_runs.get(seeded.run.id)
+    assert persisted_run is not None
+    assert persisted_run.status is ProductionRunStatus.READY
+    assert persisted_run.current_stage is ProductionStage.ASSEMBLY
+    assert persisted_run.pipeline_generation == 0
+    assert persisted_run.finished_at is not None
+    return replace(seeded, run=persisted_run)
+
+
 async def _seed_bridge_history_proposal(
     *,
     migrated_postgres_url: str,
@@ -634,6 +664,7 @@ async def test_editorial_pdf_postgres_adoption_regeneration_history_and_composit
     assert initial_anchor["revision_status"] == "ready"
 
     enrichment = await _seed_current_inputs(seeded, app, uow_factory)
+    seeded = await _finish_seeded_production_run(seeded, uow_factory)
     artifact_store = cast(ProductionArtifactStore, app.state.production_artifact_store)
     app.state.publication_render_service = _publication_renderer(app, uow_factory, artifact_store)
 
