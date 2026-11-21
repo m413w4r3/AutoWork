@@ -149,6 +149,7 @@ async def test_figure_adoption_makes_zero_gateway_calls(
         )
     assert persisted_snapshot is not None
     assert impact is not None
+    assert impact.proposal_id == proposal_id
     assert impact.state.value == "pending"
     assert impact.accepted_snapshot_id == persisted_snapshot.snapshot_id
     inserted = [
@@ -166,12 +167,10 @@ async def test_figure_adoption_makes_zero_gateway_calls(
         if entry.source_stage.value == "editorial_enrichment" and entry.kind.value == "figure"
     ]
     assert len(figure_entries) == 2
+    ordered_figure_entries = sorted(figure_entries, key=lambda item: item.position)
     assert [
-        entry.structural_pointer for entry in sorted(figure_entries, key=lambda item: item.position)
-    ] == [
-        "/source_figures/0",
-        "/source_figures/1",
-    ]
+        (entry.structural_pointer, entry.transition.value) for entry in ordered_figure_entries
+    ] == [("/source_figures/0", "insert"), ("/source_figures/1", "insert")]
     updated_blocks = updated_snapshot["blocks"]
     updated_anchor_index = next(
         index for index, block in enumerate(updated_blocks) if block["block_id"] == str(anchor_id)
@@ -195,6 +194,8 @@ async def test_figure_adoption_makes_zero_gateway_calls(
         entry.block_id for entry in sorted(figure_entries, key=lambda item: item.position)
     ]
     inserted_indices = [updated_blocks.index(block) for block in inserted_blocks]
+    assert len(inserted_indices) == 2
+    assert inserted_indices[0] < inserted_indices[1]
     same_anchor_blocks = [
         block
         for block in updated_blocks
@@ -205,17 +206,35 @@ async def test_figure_adoption_makes_zero_gateway_calls(
         )
     ]
     assert all(index > updated_anchor_index for index in inserted_indices)
-    if len(same_anchor_blocks) == len(inserted_blocks):
-        assert inserted_indices == [updated_anchor_index + 1, updated_anchor_index + 2]
-    else:
-        # Other elements share this anchor; their canonical order is position, then element key.
-        canonical_anchor_blocks = sorted(
-            same_anchor_blocks,
-            key=lambda block: (block["position"], block[block["kind"]]["key"]),
-        )
-        assert [block["block_id"] for block in same_anchor_blocks] == [
-            block["block_id"] for block in canonical_anchor_blocks
-        ]
+    # Other elements may share this anchor; their canonical order is position, then element key.
+    canonical_anchor_blocks = sorted(
+        same_anchor_blocks,
+        key=lambda block: (block["position"], block[block["kind"]]["key"]),
+    )
+    assert [block["block_id"] for block in same_anchor_blocks] == [
+        block["block_id"] for block in canonical_anchor_blocks
+    ]
+    last_figure_index = inserted_indices[-1]
+    between_anchor_and_last_figure = updated_blocks[
+        updated_anchor_index + 1 : last_figure_index + 1
+    ]
+    assert all(
+        block["kind"] in {"figure", "table", "chart", "diagram"}
+        and block[block["kind"]].get("anchor_block_id") == str(anchor_id)
+        for block in between_anchor_and_last_figure
+    )
+    fixture_table = next(
+        block
+        for block in snapshot["blocks"]
+        if block["kind"] == "table" and block["table"]["key"] == "synthetic_table"
+    )
+    assert fixture_table["table"]["anchor_block_id"] == str(anchor_id)
+    fixture_table_index = next(
+        index
+        for index, block in enumerate(updated_blocks)
+        if block["block_id"] == fixture_table["block_id"]
+    )
+    assert inserted_indices[0] < fixture_table_index < inserted_indices[-1]
     assert all("blob_id" not in json.dumps(block["figure"]) for block in inserted_blocks)
 
     anchor_entry = next(
@@ -304,3 +323,9 @@ async def test_figure_adoption_makes_zero_gateway_calls(
     assert all(
         item.anchor_pointer == anchor_entry.structural_pointer for item in published_placements
     )
+    published_anchor_placements = [
+        item for item in publication.resolved_placements if item.anchor_block_id == anchor_id
+    ]
+    assert [(item.element_kind, item.element_key) for item in published_anchor_placements] == [
+        (block["kind"], block[block["kind"]]["key"]) for block in same_anchor_blocks
+    ]
