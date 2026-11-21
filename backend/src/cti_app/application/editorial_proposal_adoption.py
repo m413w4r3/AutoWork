@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
@@ -40,6 +41,7 @@ from cti_app.application.editorial_proposal_blobs import (
     EditorialProposalBlobManager,
 )
 from cti_app.application.editorial_revision_effects import (
+    EditorialConflictReason,
     EditorialRevisionEffects,
     EditorialRevisionEffectsError,
     editorial_actor_storage_id,
@@ -125,13 +127,35 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class EditorialProposalAdoptionError(ValueError):
-    def __init__(self, code: str, *, reason: str | None = None) -> None:
+    def __init__(
+        self,
+        code: str,
+        *,
+        reason: str | EditorialConflictReason | None = None,
+        frame: str | None = None,
+    ) -> None:
         if code == "proposal_base_stale" and (
             reason is None or re.fullmatch(r"[a-z][a-z0-9_]*:[a-z][a-z0-9_]*", reason) is None
         ):
             raise ValueError("proposal_base_stale requires a closed reason")
+        if code in {
+            "proposal_state_conflict",
+            "editorial_proposal_state_conflict",
+            "editorial_registry_conflict",
+        }:
+            if reason is None:
+                raise ValueError("editorial proposal conflict requires a closed reason")
+            try:
+                reason = EditorialConflictReason(reason)
+            except (TypeError, ValueError):
+                raise ValueError("editorial proposal conflict requires a closed reason") from None
+        caller = sys._getframe(1)
         self.code = code
-        self.reason = reason
+        self.reason = reason.value if isinstance(reason, EditorialConflictReason) else reason
+        self.frame = frame or (
+            f"{caller.f_code.co_filename.rsplit('/', 1)[-1]}:"
+            f"{caller.f_lineno}:{caller.f_code.co_name}"
+        )
         super().__init__(code)
 
 
@@ -319,13 +343,18 @@ class EditorialProposalAdoptionService:
         try:
             actor_id = editorial_actor_storage_id(actor_id)
         except EditorialRevisionEffectsError as error:
-            raise EditorialProposalAdoptionError(error.code) from None
+            raise EditorialProposalAdoptionError(
+                error.code, reason=error.reason, frame=error.frame
+            ) from None
         if not _IDEMPOTENCY_KEY.fullmatch(idempotency_key):
             raise EditorialProposalAdoptionError("idempotency_key_invalid")
         if not _SHA256.fullmatch(patch_sha256):
             raise EditorialProposalAdoptionError("proposal_patch_hash_mismatch")
         if expected_state_version < 1:
-            raise EditorialProposalAdoptionError("proposal_state_conflict")
+            raise EditorialProposalAdoptionError(
+                "proposal_state_conflict",
+                reason=EditorialConflictReason.EXPECTED_STATE_VERSION_INVALID,
+            )
 
         request_sha256 = _decision_request_sha256(
             proposal_id=proposal_id,
@@ -346,9 +375,14 @@ class EditorialProposalAdoptionService:
                 return await self._load_replay(proposal)
             raise EditorialProposalAdoptionError("proposal_idempotency_conflict")
         if proposal.state is not EditorialProposalState.PROPOSED:
-            raise EditorialProposalAdoptionError("proposal_state_conflict")
+            raise EditorialProposalAdoptionError(
+                "proposal_state_conflict", reason=EditorialConflictReason.PROPOSAL_NOT_PROPOSED
+            )
         if proposal.state_version != expected_state_version:
-            raise EditorialProposalAdoptionError("proposal_state_conflict")
+            raise EditorialProposalAdoptionError(
+                "proposal_state_conflict",
+                reason=EditorialConflictReason.EXPECTED_STATE_VERSION_MISMATCH,
+            )
         if proposal.patch_sha256 != patch_sha256 or proposal.patch_blob_ref is None:
             raise EditorialProposalAdoptionError("proposal_patch_hash_mismatch")
         try:
@@ -750,13 +784,16 @@ class EditorialProposalAdoptionService:
                 or locked.state_version != expected_state_version
                 or locked.patch_sha256 != patch_sha256
             ):
-                raise EditorialProposalAdoptionError("proposal_state_conflict")
+                raise EditorialProposalAdoptionError(
+                    "proposal_state_conflict",
+                    reason=EditorialConflictReason.LOCKED_PROPOSAL_STATE_MISMATCH,
+                )
 
             try:
                 await self._revision_effects.lock_run_row(uow, run_guard)
-            except EditorialRevisionEffectsError:
+            except EditorialRevisionEffectsError as error:
                 raise EditorialProposalAdoptionError(
-                    "proposal_base_stale", reason="fence:run_lock"
+                    "proposal_base_stale", reason="fence:run_lock", frame=error.frame
                 ) from None
             try:
                 resolution = await self._workspace_service.resolve_occurrence_in_uow(
@@ -782,7 +819,10 @@ class EditorialProposalAdoptionService:
                     event=stale_event,
                 )
                 if stale is None or not changed:
-                    raise EditorialProposalAdoptionError("proposal_state_conflict")
+                    raise EditorialProposalAdoptionError(
+                        "proposal_state_conflict",
+                        reason=EditorialConflictReason.STALE_TRANSITION_CAS_CONFLICT,
+                    )
                 await stale_changed_pin_proposals(
                     uow,
                     production_run_id=stale.production_run_id,
@@ -849,7 +889,10 @@ class EditorialProposalAdoptionService:
                 accepted_artifact_id=artifact.id,
             )
             if stored is None or not changed:
-                raise EditorialProposalAdoptionError("proposal_state_conflict")
+                raise EditorialProposalAdoptionError(
+                    "proposal_state_conflict",
+                    reason=EditorialConflictReason.ACCEPT_TRANSITION_CAS_CONFLICT,
+                )
 
             if stored.thread_id is not None:
                 await uow.editorial_threads.append_event(
@@ -880,7 +923,9 @@ class EditorialProposalAdoptionService:
                     accepted_proposal=stored,
                 )
             except EditorialRevisionEffectsError as error:
-                raise EditorialProposalAdoptionError(error.code) from None
+                raise EditorialProposalAdoptionError(
+                    error.code, reason=error.reason, frame=error.frame
+                ) from None
             snapshot = effects.snapshot
             impact = effects.impact
             if impact is None:
@@ -971,9 +1016,9 @@ class EditorialProposalAdoptionService:
                 raise EditorialProposalAdoptionError("proposal_not_found")
             try:
                 await self._revision_effects.lock_run_row(uow, guard)
-            except EditorialRevisionEffectsError:
+            except EditorialRevisionEffectsError as error:
                 raise EditorialProposalAdoptionError(
-                    "proposal_base_stale", reason="fence:run_lock"
+                    "proposal_base_stale", reason="fence:run_lock", frame=error.frame
                 ) from None
             if locked.state is not EditorialProposalState.PROPOSED:
                 return
@@ -1027,7 +1072,10 @@ class EditorialProposalAdoptionService:
             proposal.state is not EditorialProposalState.ACCEPTED
             or proposal.accepted_artifact_id is None
         ):
-            raise EditorialProposalAdoptionError("proposal_state_conflict")
+            raise EditorialProposalAdoptionError(
+                "proposal_state_conflict",
+                reason=EditorialConflictReason.ACCEPTED_PROPOSAL_INVARIANT_CONFLICT,
+            )
         artifact = await uow.production_artifacts.get(proposal.accepted_artifact_id)
         impact = await uow.editorial_proposal_impacts.get_by_proposal(proposal.id)
         if artifact is None or impact is None:
