@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import json
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -339,3 +339,317 @@ def test_current_unknown_kind_keeps_workspace_read_only(
         not value for key, value in snapshot["capabilities"].items() if key != "read_only_reason"
     )
     assert all(block["allowed_operations"] == [] for block in snapshot["blocks"])
+
+
+def _read_only_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Any, UUID]:
+    service, subject_id, _repository, artifacts, artifact_store = _workspace_service(
+        _synthesis((_paragraph("synthetic current paragraph"),)), monkeypatch
+    )
+    synthesis = artifacts.current["synthesis"]
+    assert synthesis is not None
+    synthesis.content["schema_version"] = "1"
+    artifact_store.write(synthesis)
+    publication = _make_artifact(
+        "publication",
+        _legacy_documents()[-1],
+        version=8,
+        production_run_id=synthesis.production_run_id,
+    )
+    artifacts.current["publication"] = publication
+    artifact_store.write(publication)
+    return service, subject_id
+
+
+@pytest.mark.parametrize(
+    ("operation", "block_kind"),
+    (
+        ("rewrite_title", "title"),
+        ("rewrite_paragraph", "paragraph"),
+        ("create_table", "paragraph"),
+        ("create_bar_chart", "paragraph"),
+        ("create_source_figure", "paragraph"),
+    ),
+)
+def test_read_only_context_refuses_every_revision_operation(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    block_kind: str,
+) -> None:
+    from cti_app.domain.editorial_workspace import EditorialReadOnlyError
+
+    service, subject_id = _read_only_workspace(monkeypatch)
+
+    async def exercise() -> None:
+        snapshot = await service.snapshot(subject_id)
+        assert snapshot["capabilities"]["read_only_reason"] == "format_not_editable"
+        block = next(block for block in snapshot["blocks"] if block["kind"] == block_kind)
+        with pytest.raises(EditorialReadOnlyError) as caught:
+            await service.resolve_revision_target(
+                subject_id=subject_id,
+                snapshot_id=UUID(str(snapshot["snapshot_id"])),
+                block_id=UUID(str(block["block_id"])),
+                operation=operation,
+            )
+        assert caught.value.code == "editorial_read_only"
+        assert caught.value.reason == "format_not_editable"
+
+    asyncio.run(exercise())
+
+
+def test_current_v8_context_still_resolves_editable_rewrite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cti_app.application.editorial_workspace import registry as registry_module
+    from cti_app.application.editorial_workspace import service as service_module
+
+    service, subject_id, _repository, artifacts, artifact_store = _workspace_service(
+        _synthesis((_paragraph("synthetic current paragraph"),)), monkeypatch
+    )
+    synthesis = artifacts.current["synthesis"]
+    assert synthesis is not None
+    publication = _make_artifact(
+        "publication",
+        _legacy_documents()[-1],
+        version=8,
+        production_run_id=synthesis.production_run_id,
+    )
+    artifacts.current["publication"] = publication
+    artifact_store.write(publication)
+    monkeypatch.setattr(service_module, "_figure_insertion_available", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        registry_module, "table_insertion_preparation_ready", lambda **_kwargs: True
+    )
+
+    async def exercise() -> None:
+        snapshot = await service.snapshot(subject_id)
+        assert snapshot["capabilities"]["read_only_reason"] is None
+        title = next(block for block in snapshot["blocks"] if block["kind"] == "title")
+        resolved = await service.resolve_revision_target(
+            subject_id=subject_id,
+            snapshot_id=UUID(str(snapshot["snapshot_id"])),
+            block_id=UUID(str(title["block_id"])),
+            operation="rewrite_title",
+        )
+        assert resolved.target.kind.value == "title"
+
+    asyncio.run(exercise())
+
+
+def test_manual_edit_prepare_refuses_read_only_context_before_any_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cti_app.application.editorial_proposals import EditorialProposalApplicationError
+    from cti_app.domain.editorial_proposal import ManualPatch, ManualTextPatch
+    from cti_app.domain.production_editorial_revision import TargetedEditorialRevisionOperation
+    from tests.test_editorial_proposal_preparation import _setup
+
+    setup = _setup()
+    workspace, subject_id = _read_only_workspace(monkeypatch)
+    setup.service._workspace_service = workspace
+    setup.service._discussion_context_builder = None
+
+    async def exercise() -> None:
+        snapshot = await workspace.snapshot(subject_id)
+        title = next(block for block in snapshot["blocks"] if block["kind"] == "title")
+        with pytest.raises(EditorialProposalApplicationError) as caught:
+            await setup.service.prepare_manual_patch(
+                subject_id=subject_id,
+                snapshot_id=UUID(str(snapshot["snapshot_id"])),
+                occurrence_id=UUID(str(title["block_id"])),
+                actor_id=uuid4(),
+                idempotency_key="manual-client-key-readonly-01",
+                patch=ManualPatch(
+                    typed_patch=ManualTextPatch(
+                        operation=TargetedEditorialRevisionOperation.REWRITE_TITLE,
+                        text="Synthetic replaced title",
+                    )
+                ),
+            )
+        assert caught.value.code == "editorial_read_only"
+        assert caught.value.reason == "format_not_editable"
+        assert setup.repository.records == []
+        assert setup.blob_bytes == {}
+
+    asyncio.run(exercise())
+
+
+def test_manual_edit_checks_read_only_before_building_the_discussion_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Read-only snapshots must answer `editorial_read_only`, not a context failure.
+
+    The production discussion context refuses read-only blocks with a generic
+    `editorial_context_unavailable`; checking it first would surface
+    `proposal_base_unavailable` instead of the stable read-only code.
+    """
+    from cti_app.application.editorial_proposals import EditorialProposalApplicationError
+    from cti_app.application.editorial_thread_types import EditorialThreadApplicationError
+    from cti_app.domain.editorial_proposal import ManualPatch, ManualTextPatch
+    from cti_app.domain.production_editorial_revision import TargetedEditorialRevisionOperation
+    from tests.test_editorial_proposal_preparation import _setup
+
+    setup = _setup()
+    workspace, subject_id = _read_only_workspace(monkeypatch)
+    setup.service._workspace_service = workspace
+    context_calls: list[tuple[UUID, UUID]] = []
+
+    class ReadOnlyContextBuilder:
+        async def build_manual(self, subject_id: UUID, occurrence_id: UUID) -> object:
+            context_calls.append((subject_id, occurrence_id))
+            raise EditorialThreadApplicationError("editorial_context_unavailable")
+
+    setup.service._discussion_context_builder = ReadOnlyContextBuilder()
+
+    async def exercise() -> None:
+        snapshot = await workspace.snapshot(subject_id)
+        title = next(block for block in snapshot["blocks"] if block["kind"] == "title")
+        occurrence_id = UUID(str(title["block_id"]))
+        with pytest.raises(EditorialProposalApplicationError) as caught:
+            await setup.service.prepare_manual_patch(
+                subject_id=subject_id,
+                snapshot_id=UUID(str(snapshot["snapshot_id"])),
+                occurrence_id=occurrence_id,
+                actor_id=uuid4(),
+                idempotency_key="manual-client-key-readonly-order-01",
+                patch=ManualPatch(
+                    typed_patch=ManualTextPatch(
+                        operation=TargetedEditorialRevisionOperation.REWRITE_TITLE,
+                        text="Synthetic replaced title",
+                    )
+                ),
+            )
+        assert caught.value.code == "editorial_read_only"
+        assert caught.value.reason == "format_not_editable"
+        assert context_calls == []
+        assert setup.repository.records == []
+        assert setup.blob_bytes == {}
+
+    asyncio.run(exercise())
+
+
+def test_manual_table_prepare_refuses_read_only_context_before_any_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cti_app.application.editorial_proposals import EditorialProposalApplicationError
+    from cti_app.domain.editorial_proposal import ManualPatch, ManualTablePatch
+    from cti_app.domain.production_synthesis import EvidenceKind, ExtractionEvidenceRefV1
+    from tests.test_editorial_proposal_preparation import _setup
+    from tests.test_editorial_table_insertion import _table_spec
+
+    setup = _setup()
+    workspace, subject_id = _read_only_workspace(monkeypatch)
+    reference = ExtractionEvidenceRefV1(
+        uuid4(),
+        EvidenceKind.FACT,
+        hashlib.sha256(b"synthetic read-only table evidence").hexdigest(),
+    )
+
+    async def exercise() -> None:
+        snapshot = await workspace.snapshot(subject_id)
+        paragraph = next(block for block in snapshot["blocks"] if block["kind"] == "paragraph")
+        anchor_id = UUID(str(paragraph["block_id"]))
+        table = _table_spec(anchor_id, (reference,))
+        enrichment_context = {
+            "anchor_block_id": str(anchor_id),
+            "base_content": {"tables": []},
+            "evidence_pack": SimpleNamespace(_handle_to_ref={"ev-1": reference}),
+        }
+
+        class ContextBuilder:
+            async def build_manual(self, *_args: object) -> SimpleNamespace:
+                return SimpleNamespace(
+                    proposal_snapshot_id=UUID(str(snapshot["snapshot_id"])),
+                    proposal_operations=("create_table",),
+                    proposal_enrichment_context=enrichment_context,
+                )
+
+        setup.service._artifact_store = object()
+        setup.service._workspace_service = workspace
+        setup.service._discussion_context_builder = ContextBuilder()
+
+        with pytest.raises(EditorialProposalApplicationError) as caught:
+            await setup.service.prepare_manual_patch(
+                subject_id=subject_id,
+                snapshot_id=UUID(str(snapshot["snapshot_id"])),
+                occurrence_id=anchor_id,
+                actor_id=uuid4(),
+                idempotency_key="manual-client-key-readonly-table-01",
+                patch=ManualPatch(
+                    typed_patch=ManualTablePatch(anchor_block_id=anchor_id, table=table)
+                ),
+            )
+        assert caught.value.code == "editorial_read_only"
+        assert caught.value.reason == "format_not_editable"
+        assert setup.repository.records == []
+
+    asyncio.run(exercise())
+
+
+def test_accept_resolution_refuses_read_only_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cti_app.application.editorial_proposal_adoption import (
+        EditorialProposalAdoptionError,
+        EditorialProposalAdoptionService,
+    )
+
+    workspace, subject_id = _read_only_workspace(monkeypatch)
+    adoption = EditorialProposalAdoptionService(
+        uow_factory=cast(Any, None),
+        blob_store=cast(Any, None),
+        artifact_store=cast(Any, None),
+        workspace_service=workspace,
+        inputs=cast(Any, None),
+        synthesis_writer=cast(Any, None),
+        enrichment_writer=cast(Any, None),
+    )
+
+    async def exercise() -> None:
+        snapshot = await workspace.snapshot(subject_id)
+        title = next(block for block in snapshot["blocks"] if block["kind"] == "title")
+        with pytest.raises(EditorialProposalAdoptionError) as caught:
+            await adoption._resolve_current(subject_id, UUID(str(title["block_id"])))
+        assert caught.value.code == "editorial_read_only"
+        assert caught.value.reason == "format_not_editable"
+
+    asyncio.run(exercise())
+
+
+def test_accept_resolution_keeps_current_v8_context_editable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cti_app.application.editorial_proposal_adoption import EditorialProposalAdoptionService
+
+    service, subject_id, _repository, artifacts, artifact_store = _workspace_service(
+        _synthesis((_paragraph("synthetic current paragraph"),)), monkeypatch
+    )
+    synthesis = artifacts.current["synthesis"]
+    assert synthesis is not None
+    publication = _make_artifact(
+        "publication",
+        _legacy_documents()[-1],
+        version=8,
+        production_run_id=synthesis.production_run_id,
+    )
+    artifacts.current["publication"] = publication
+    artifact_store.write(publication)
+    adoption = EditorialProposalAdoptionService(
+        uow_factory=cast(Any, None),
+        blob_store=cast(Any, None),
+        artifact_store=cast(Any, None),
+        workspace_service=service,
+        inputs=cast(Any, None),
+        synthesis_writer=cast(Any, None),
+        enrichment_writer=cast(Any, None),
+    )
+
+    async def exercise() -> None:
+        snapshot = await service.snapshot(subject_id)
+        title = next(block for block in snapshot["blocks"] if block["kind"] == "title")
+        resolution = await adoption._resolve_current(subject_id, UUID(str(title["block_id"])))
+        assert resolution.read_only_reason is None
+        assert resolution.entry is not None
+
+    asyncio.run(exercise())

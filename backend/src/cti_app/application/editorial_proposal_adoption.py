@@ -491,11 +491,15 @@ class EditorialProposalAdoptionService:
     ) -> WorkspaceOccurrenceResolution:
         try:
             resolution = await self._workspace_service.resolve_occurrence(subject_id, occurrence_id)
-            return resolution
         except EditorialWorkspaceError:
             raise EditorialProposalAdoptionError(
                 "proposal_base_stale", reason="workspace:occurrence_resolution"
             ) from None
+        if resolution.read_only_reason is not None:
+            raise EditorialProposalAdoptionError(
+                "editorial_read_only", reason=resolution.read_only_reason.value
+            )
+        return resolution
 
     async def _build_candidate(
         self,

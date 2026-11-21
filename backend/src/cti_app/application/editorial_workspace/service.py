@@ -17,9 +17,8 @@ if TYPE_CHECKING:
     )
 
 from cti_app.application.editorial_legacy_read_only import (
-    pinned_editorial_inputs_read_only_reason,
-    publication_kind_is_ambiguous,
-    publication_read_only_reason,
+    EditorialLegacyReadOnlyReason,
+    current_editorial_read_only_reason,
 )
 from cti_app.application.editorial_workspace.registry import (
     WorkspaceOccurrenceResolution,
@@ -42,6 +41,7 @@ from cti_app.domain.editorial_proposal_impact import (
 from cti_app.domain.editorial_workspace import (
     AdvancedBlockRegistry,
     BlockRegistryEntry,
+    EditorialReadOnlyError,
     EditorialRevisionStatus,
     EditorialSourceStage,
     EditorialWorkspaceError,
@@ -66,6 +66,19 @@ from cti_app.domain.production_editorial_revision import (
 from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.publication_render import PublicationPreviewStatus
 from cti_app.domain.typst_render import TypstRenderStatus
+
+
+def _snapshot_read_only_reason(
+    snapshot: Mapping[str, object],
+) -> EditorialLegacyReadOnlyReason | None:
+    """Read the policy value the snapshot already computed from live pinned artifacts."""
+    capabilities = snapshot.get("capabilities")
+    if not isinstance(capabilities, Mapping):
+        return None
+    value = capabilities.get("read_only_reason")
+    if not isinstance(value, str):
+        return None
+    return EditorialLegacyReadOnlyReason(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,20 +178,32 @@ class EditorialWorkspaceService:
         self, subject_id: UUID, occurrence_id: UUID
     ) -> WorkspaceOccurrenceResolution:
         """Resolve one occurrence against the subject's current registry snapshot."""
-        _snapshot, record, _synthesis = await self._load_current(subject_id)
-        return resolve_registry_occurrence(record, occurrence_id)
+        snapshot, record, _synthesis = await self._load_current(subject_id)
+        return self._occurrence_with_policy(snapshot, record, occurrence_id)
 
     async def resolve_occurrence_in_uow(
         self, uow: UnitOfWork, subject_id: UUID, occurrence_id: UUID
     ) -> WorkspaceOccurrenceResolution:
         """Resolve pins within a caller's transaction while it holds the run lock."""
-        _snapshot, record, _synthesis = await self._load_current(
+        snapshot, record, _synthesis = await self._load_current(
             subject_id,
             uow=uow,
             lock_creation=False,
             commit_snapshot=False,
         )
-        return resolve_registry_occurrence(record, occurrence_id)
+        return self._occurrence_with_policy(snapshot, record, occurrence_id)
+
+    @staticmethod
+    def _occurrence_with_policy(
+        snapshot: Mapping[str, object],
+        record: WorkspaceSnapshotRecord,
+        occurrence_id: UUID,
+    ) -> WorkspaceOccurrenceResolution:
+        resolution = resolve_registry_occurrence(record, occurrence_id)
+        reason = _snapshot_read_only_reason(snapshot)
+        if reason is None:
+            return resolution
+        return replace(resolution, read_only_reason=reason)
 
     async def resolve(
         self,
@@ -230,11 +255,14 @@ class EditorialWorkspaceService:
         operation: str,
     ) -> EditorialRevisionTargetResolution:
         """Resolve the exact current occurrence and its canonical revision target."""
-        _snapshot, record, synthesis = await self._load_current(subject_id)
+        snapshot, record, synthesis = await self._load_current(subject_id)
         if record.snapshot_id != snapshot_id:
             raise EditorialWorkspaceError("editorial_snapshot_stale")
         if record.publication_kind is None:
             raise EditorialWorkspaceError("publication_kind_unresolved")
+        read_only_reason = _snapshot_read_only_reason(snapshot)
+        if read_only_reason is not None:
+            raise EditorialReadOnlyError(read_only_reason.value)
         if operation in {
             TargetedEditorialRevisionOperation.CREATE_TABLE.value,
             TargetedEditorialRevisionOperation.CREATE_BAR_CHART.value,
@@ -357,16 +385,13 @@ class EditorialWorkspaceService:
 
             routing_decision = await get_adopted_production_routing_decision(uow=uow, run=run)
             kind, routing_hash = resolve_publication_kind(routing_decision, publication_content)
-            read_only_reason = publication_read_only_reason(
-                publication_content,
-                kind,
-                ambiguous_kind=publication_kind_is_ambiguous(routing_decision, publication_content),
+            read_only_reason = current_editorial_read_only_reason(
+                routing_decision=routing_decision,
+                publication_content=publication_content,
+                publication_kind=kind,
+                synthesis_content=synthesis,
+                enrichment_content=enrichment_content,
             )
-            if read_only_reason is None:
-                read_only_reason = pinned_editorial_inputs_read_only_reason(
-                    synthesis,
-                    enrichment_content,
-                )
             pins: dict[str, object] = {
                 "subject_id": subject.id,
                 "production_run_id": run.id,

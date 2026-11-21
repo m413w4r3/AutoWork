@@ -1209,6 +1209,7 @@ _ERROR_MESSAGES = {
         "La production n'est pas encore prête. Attendez sa fin avant de régénérer le PDF."
     ),
     "editorial_snapshot_stale": "Le document a changé. Rechargez l'atelier.",
+    "editorial_read_only": ("Cette version est en lecture seule : elle ne peut pas être modifiée."),
     "editorial_identity_ambiguous": (
         "L'identité de ce bloc historique est ambiguë. Il reste en lecture seule."
     ),
@@ -2882,7 +2883,12 @@ async def prepare_manual_editorial_table_proposal(
             subject_id,
             occurrence_id,
         )
-        if code in {"editorial_anchor_stale", "proposal_base_stale", "editorial_snapshot_stale"}:
+        if code in {
+            "editorial_anchor_stale",
+            "editorial_read_only",
+            "proposal_base_stale",
+            "editorial_snapshot_stale",
+        }:
             response_status = status.HTTP_409_CONFLICT
         elif code in {
             "manual_edit_new_fact_unadmitted",
@@ -3075,7 +3081,13 @@ async def prepare_manual_editorial_source_figure_proposal(
         )
         response_status = (
             status.HTTP_409_CONFLICT
-            if code in {"editorial_anchor_stale", "proposal_base_stale", "editorial_snapshot_stale"}
+            if code
+            in {
+                "editorial_anchor_stale",
+                "editorial_read_only",
+                "proposal_base_stale",
+                "editorial_snapshot_stale",
+            }
             else status.HTTP_503_SERVICE_UNAVAILABLE
             if code
             in {
@@ -3264,7 +3276,13 @@ async def prepare_manual_editorial_bar_chart_proposal(
         )
         response_status = (
             status.HTTP_409_CONFLICT
-            if code in {"editorial_anchor_stale", "proposal_base_stale", "editorial_snapshot_stale"}
+            if code
+            in {
+                "editorial_anchor_stale",
+                "editorial_read_only",
+                "proposal_base_stale",
+                "editorial_snapshot_stale",
+            }
             else status.HTTP_503_SERVICE_UNAVAILABLE
             if code in {"proposal_base_unavailable", "proposal_workspace_unavailable"}
             else status.HTTP_422_UNPROCESSABLE_CONTENT

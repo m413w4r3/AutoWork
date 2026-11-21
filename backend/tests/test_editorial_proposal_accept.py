@@ -272,3 +272,47 @@ async def test_accept_route_does_not_swallow_unexpected_programming_errors(
             ),
             "accept-programming-error-0001",
         )
+
+
+@pytest.mark.asyncio
+async def test_accept_route_maps_read_only_context_to_a_stable_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        editorial_workspace_api,
+        "get_settings",
+        lambda: Settings(_env_file=None, editorial_proposal_accept_enabled=True),
+    )
+
+    class _ReadOnlyService:
+        async def adopt(self, *_args: object, **_kwargs: object) -> None:
+            raise EditorialProposalAdoptionError(
+                "editorial_read_only", reason="format_not_editable"
+            )
+
+    async def current_actor(_request: Request) -> UUID:
+        return uuid4()
+
+    monkeypatch.setattr(
+        editorial_workspace_api,
+        "_proposal_adoption_service",
+        lambda _request: _ReadOnlyService(),
+    )
+    monkeypatch.setattr(editorial_workspace_api, "_thread_actor_id", current_actor)
+    app = FastAPI()
+    app.include_router(editorial_workspace_api.router)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
+    ) as client:
+        response = await client.post(
+            f"/api/subjects/{uuid4()}/editor/threads/{uuid4()}/proposals/{uuid4()}/accept",
+            headers={"Idempotency-Key": f"accept_{uuid4().hex}"},
+            json={"expected_state_version": 1, "patch_sha256": "a" * 64},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "editorial_read_only",
+        "message": "Cette version est en lecture seule : elle ne peut pas être modifiée.",
+    }
+    assert "format_not_editable" not in response.text

@@ -77,8 +77,28 @@ def pinned_editorial_inputs_read_only_reason(
     return None
 
 
+def current_editorial_read_only_reason(
+    *,
+    routing_decision: ProductionRoutingDecisionV1 | None,
+    publication_content: Mapping[str, Any] | None,
+    publication_kind: PublicationKind | None,
+    synthesis_content: Mapping[str, Any],
+    enrichment_content: Mapping[str, Any] | None,
+) -> EditorialLegacyReadOnlyReason | None:
+    """Single policy computation shared by the snapshot projection and every write guard."""
+    reason = publication_read_only_reason(
+        publication_content,
+        publication_kind,
+        ambiguous_kind=publication_kind_is_ambiguous(routing_decision, publication_content),
+    )
+    if reason is None:
+        reason = pinned_editorial_inputs_read_only_reason(synthesis_content, enrichment_content)
+    return reason
+
+
 __all__ = [
     "EditorialLegacyReadOnlyReason",
+    "current_editorial_read_only_reason",
     "pinned_editorial_inputs_read_only_reason",
     "publication_kind_is_ambiguous",
     "publication_read_only_reason",

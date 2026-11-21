@@ -56,6 +56,14 @@ class EditorialRegistryConflictError(EditorialWorkspaceError):
     code = "editorial_registry_conflict"
 
 
+class EditorialReadOnlyError(EditorialWorkspaceError):
+    code = "editorial_read_only"
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(self.code)
+        self.reason = reason
+
+
 @dataclass(frozen=True, slots=True)
 class BlockRegistryEntry:
     block_id: UUID
