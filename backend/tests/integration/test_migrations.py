@@ -1196,7 +1196,7 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     command.upgrade(config, "head")
     command.current(config)
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert _head_revision() == "0017_editorial_proposal_bar_chart_operation"
+    assert _head_revision() == "0018_editorial_enrichment_element_operations"
     assert asyncio.run(_alembic_version_column_length(temporary_postgres_url)) == 64
 
     collection_attempt_columns = asyncio.run(
@@ -1280,9 +1280,7 @@ def test_editorial_bar_chart_operation_check_downgrades_when_unused(
     config = _alembic_config(temporary_postgres_url)
     command.upgrade(config, "head")
 
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == (
-        "0017_editorial_proposal_bar_chart_operation"
-    )
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
     expanded_check = asyncio.run(_check_constraints(temporary_postgres_url, "editorial_proposals"))[
         "ck_editorial_proposals_operation"
     ]
@@ -1361,13 +1359,176 @@ def test_editorial_bar_chart_operation_downgrade_refuses_matching_rows(
     ):
         command.downgrade(config, "0016_editorial_drafts")
 
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == (
-        "0017_editorial_proposal_bar_chart_operation"
-    )
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
     expanded_check = asyncio.run(_check_constraints(temporary_postgres_url, "editorial_proposals"))[
         "ck_editorial_proposals_operation"
     ]
     assert "'create_bar_chart'" in expanded_check
+    assert "'update_visual_caption'" in expanded_check
+
+
+_EDITORIAL_PROPOSAL_PARENT_FKS = (
+    "fk_editorial_proposals_subject",
+    "fk_editorial_proposals_run",
+    "fk_editorial_proposals_snapshot",
+    "fk_editorial_proposals_base_artifact",
+)
+
+
+async def _drop_editorial_proposal_parent_fks(database_url: str) -> None:
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.begin() as connection:
+            for constraint in _EDITORIAL_PROPOSAL_PARENT_FKS:
+                await connection.execute(
+                    text(f"ALTER TABLE editorial_proposals DROP CONSTRAINT {constraint}")
+                )
+    finally:
+        await engine.dispose()
+
+
+async def _insert_editorial_proposal_row(database_url: str, operation: str) -> None:
+    """Insert one synthetic proposal row; the fixture does not need its parent rows."""
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO editorial_proposals ("
+                    "id, subject_id, production_run_id, origin, snapshot_id, "
+                    "occurrence_id, base_artifact_id, base_artifact_version, "
+                    "base_input_hash, base_canonical_sha256, base_pin_hash, target_id, "
+                    "operation, before_hash, evidence_refs, diagnostics, variant_group_id, "
+                    "state, state_version, actor_id, idempotency_key, request_sha256"
+                    ") VALUES ("
+                    ":id, :subject_id, :production_run_id, 'manual_patch', :snapshot_id, "
+                    ":occurrence_id, :base_artifact_id, 1, :hash, :hash, :hash, 'element', "
+                    ":operation, :hash, '[]'::jsonb, '{}'::jsonb, :variant_group_id, "
+                    "'proposed', 1, :actor_id, :idempotency_key, :hash"
+                    ")"
+                ),
+                {
+                    "id": uuid4(),
+                    "subject_id": uuid4(),
+                    "production_run_id": uuid4(),
+                    "snapshot_id": uuid4(),
+                    "occurrence_id": uuid4(),
+                    "base_artifact_id": uuid4(),
+                    "variant_group_id": uuid4(),
+                    "actor_id": uuid4(),
+                    "idempotency_key": f"migration-{uuid4().hex}",
+                    "operation": operation,
+                    "hash": "b" * 64,
+                },
+            )
+    finally:
+        await engine.dispose()
+
+
+async def _editorial_proposal_operations(database_url: str) -> list[str]:
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.connect() as connection:
+            rows = await connection.execute(
+                text("SELECT operation FROM editorial_proposals ORDER BY operation")
+            )
+            return [str(row[0]) for row in rows]
+    finally:
+        await engine.dispose()
+
+
+def test_editorial_enrichment_element_operation_upgrade_extends_check_on_nonempty_table(
+    temporary_postgres_url: str,
+) -> None:
+    config = _alembic_config(temporary_postgres_url)
+    command.upgrade(config, "0017_editorial_proposal_bar_chart_operation")
+
+    before = asyncio.run(_check_constraints(temporary_postgres_url, "editorial_proposals"))[
+        "ck_editorial_proposals_operation"
+    ]
+    assert "'create_bar_chart'" in before
+    assert "'update_visual_caption'" not in before
+
+    asyncio.run(_drop_editorial_proposal_parent_fks(temporary_postgres_url))
+    asyncio.run(_insert_editorial_proposal_row(temporary_postgres_url, "rewrite_table"))
+    with pytest.raises(DBAPIError) as exc_info:
+        asyncio.run(_insert_editorial_proposal_row(temporary_postgres_url, "update_visual_caption"))
+    assert _sqlstate(exc_info.value) == "23514"
+
+    command.upgrade(config, "head")
+
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
+    after = asyncio.run(_check_constraints(temporary_postgres_url, "editorial_proposals"))[
+        "ck_editorial_proposals_operation"
+    ]
+    for value in (
+        "update_visual_caption",
+        "move_enrichment_element",
+        "reorder_enrichment_elements",
+    ):
+        assert f"'{value}'" in after
+    assert asyncio.run(_editorial_proposal_operations(temporary_postgres_url)) == ["rewrite_table"]
+
+    asyncio.run(
+        _insert_editorial_proposal_row(temporary_postgres_url, "reorder_enrichment_elements")
+    )
+    assert asyncio.run(_editorial_proposal_operations(temporary_postgres_url)) == [
+        "reorder_enrichment_elements",
+        "rewrite_table",
+    ]
+
+
+def test_editorial_enrichment_element_operation_downgrade_refuses_matching_rows(
+    temporary_postgres_url: str,
+) -> None:
+    config = _alembic_config(temporary_postgres_url)
+    command.upgrade(config, "head")
+
+    asyncio.run(_drop_editorial_proposal_parent_fks(temporary_postgres_url))
+    asyncio.run(_insert_editorial_proposal_row(temporary_postgres_url, "move_enrichment_element"))
+
+    downgrade_message = (
+        "refusing to downgrade ck_editorial_proposals_operation while "
+        "enrichment element operation proposals exist"
+    )
+    with pytest.raises(RuntimeError, match=downgrade_message):
+        command.downgrade(config, "0017_editorial_proposal_bar_chart_operation")
+
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
+    expanded_check = asyncio.run(_check_constraints(temporary_postgres_url, "editorial_proposals"))[
+        "ck_editorial_proposals_operation"
+    ]
+    assert "'move_enrichment_element'" in expanded_check
+
+
+def test_editorial_enrichment_element_operation_downgrades_when_unused(
+    temporary_postgres_url: str,
+) -> None:
+    config = _alembic_config(temporary_postgres_url)
+    command.upgrade(config, "head")
+
+    asyncio.run(_drop_editorial_proposal_parent_fks(temporary_postgres_url))
+    asyncio.run(_insert_editorial_proposal_row(temporary_postgres_url, "rewrite_table"))
+    expanded_check = asyncio.run(_check_constraints(temporary_postgres_url, "editorial_proposals"))[
+        "ck_editorial_proposals_operation"
+    ]
+    assert "'update_visual_caption'" in expanded_check
+
+    command.downgrade(config, "0017_editorial_proposal_bar_chart_operation")
+
+    assert (
+        asyncio.run(_alembic_version(temporary_postgres_url))
+        == "0017_editorial_proposal_bar_chart_operation"
+    )
+    restored_check = asyncio.run(_check_constraints(temporary_postgres_url, "editorial_proposals"))[
+        "ck_editorial_proposals_operation"
+    ]
+    assert "'update_visual_caption'" not in restored_check
+    assert "'move_enrichment_element'" not in restored_check
+    assert "'reorder_enrichment_elements'" not in restored_check
+    assert "'create_bar_chart'" in restored_check
+    assert "'create_source_figure'" in restored_check
+    assert asyncio.run(_editorial_proposal_operations(temporary_postgres_url)) == ["rewrite_table"]
 
 
 def test_fresh_upgrade_stamps_acquisition_revisions_without_truncation(
@@ -1403,7 +1564,7 @@ def test_frozen_collection_attempt_baseline_precedes_acquisition_additions(
 
     command.upgrade(config, "head")
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert _head_revision() == "0017_editorial_proposal_bar_chart_operation"
+    assert _head_revision() == "0018_editorial_enrichment_element_operations"
     final_schema = asyncio.run(_database_snapshot(temporary_postgres_url))["collection_attempts"]
     table = Base.metadata.tables["collection_attempts"]
     assert final_schema["columns"] == _expected_columns(table)

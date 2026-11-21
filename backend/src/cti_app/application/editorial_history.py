@@ -39,6 +39,9 @@ _OPERATION_LABELS = {
     "rewrite_source_figure": "Modification d'une figure",
     "replace_source_figure": "Remplacement d'une figure",
     "delete_source_figure": "Retrait d'une figure",
+    "update_visual_caption": "Modification d'une légende",
+    "move_enrichment_element": "Déplacement d'un élément",
+    "reorder_enrichment_elements": "Réordonnancement des éléments",
 }
 
 

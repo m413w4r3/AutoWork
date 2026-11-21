@@ -23,6 +23,8 @@ from cti_app.application.editorial_proposal_adoption import (
     EditorialProposalAdoptionService,
     SynthesisCandidateInputs,
     _CandidatePlan,
+    _proposal_pins_match,
+    _proposal_stage,
     _SynthesisCandidatePlan,
 )
 from cti_app.application.editorial_synthesis import targets
@@ -1814,3 +1816,129 @@ async def test_accept_route_maps_rewrite_placement_change_to_conflict(
 
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "adoption_placement_changed"
+
+
+def _stage_resolution(
+    *,
+    source_stage: EditorialSourceStage,
+    kind: EditorialBlockKind,
+) -> SimpleNamespace:
+    synthesis_artifact_id, enrichment_artifact_id = uuid4(), uuid4()
+    record = SimpleNamespace(
+        subject_id=uuid4(),
+        production_run_id=uuid4(),
+        snapshot_id=uuid4(),
+        workspace_pin_hash="5" * 64,
+        routing_decision_hash="3" * 64,
+        synthesis_artifact_id=synthesis_artifact_id,
+        synthesis_version=4,
+        synthesis_input_hash="1" * 64,
+        synthesis_canonical_sha256="a" * 64,
+        enrichment_artifact_id=enrichment_artifact_id,
+        enrichment_version=2,
+        enrichment_input_hash="2" * 64,
+        enrichment_canonical_sha256="b" * 64,
+    )
+    is_enrichment = source_stage is EditorialSourceStage.EDITORIAL_ENRICHMENT
+    entry = SimpleNamespace(source_stage=source_stage, kind=kind, content_sha256="c" * 64)
+    return SimpleNamespace(
+        record=record,
+        entry=entry,
+        binding_state="valid",
+        artifact_id=enrichment_artifact_id if is_enrichment else synthesis_artifact_id,
+        artifact_version=2 if is_enrichment else 4,
+        canonical_sha256="b" * 64 if is_enrichment else "a" * 64,
+    )
+
+
+def test_proposal_stage_pins_reorder_to_enrichment_stage_on_its_paragraph_anchor() -> None:
+    resolution = _stage_resolution(
+        source_stage=EditorialSourceStage.SYNTHESIS,
+        kind=EditorialBlockKind.LEAD_PARAGRAPH,
+    )
+    proposal = SimpleNamespace(
+        operation=TargetedEditorialRevisionOperation.REORDER_ENRICHMENT_ELEMENTS.value,
+        occurrence_id=uuid4(),
+    )
+    patch = {
+        "target": {
+            "kind": "enrichment_order",
+            "placement": {
+                "kind": "after_paragraph",
+                "anchor_block_id": str(proposal.occurrence_id),
+            },
+        }
+    }
+
+    assert (
+        _proposal_stage(proposal, patch, resolution) is ProductionArtifactStage.EDITORIAL_ENRICHMENT
+    )
+
+    patch["target"]["placement"]["anchor_block_id"] = str(uuid4())
+    with pytest.raises(EditorialProposalAdoptionError, match="editorial_anchor_stale"):
+        _proposal_stage(proposal, patch, resolution)
+
+
+def test_proposal_stage_pins_existing_enrichment_element_operations() -> None:
+    resolution = _stage_resolution(
+        source_stage=EditorialSourceStage.EDITORIAL_ENRICHMENT,
+        kind=EditorialBlockKind.TABLE,
+    )
+    patch = {
+        "target": {
+            "kind": "enrichment_element",
+            "element_kind": "table",
+            "element_key": "table-a",
+        }
+    }
+
+    for operation in (
+        TargetedEditorialRevisionOperation.REWRITE_TABLE,
+        TargetedEditorialRevisionOperation.DELETE_TABLE,
+        TargetedEditorialRevisionOperation.UPDATE_VISUAL_CAPTION,
+        TargetedEditorialRevisionOperation.MOVE_ENRICHMENT_ELEMENT,
+    ):
+        proposal = SimpleNamespace(operation=operation.value, occurrence_id=uuid4())
+        assert (
+            _proposal_stage(proposal, patch, resolution)
+            is ProductionArtifactStage.EDITORIAL_ENRICHMENT
+        )
+
+
+def _pinned_proposal_namespace(
+    record: SimpleNamespace, operation: TargetedEditorialRevisionOperation
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        subject_id=record.subject_id,
+        production_run_id=record.production_run_id,
+        snapshot_id=record.snapshot_id,
+        base_artifact_id=record.enrichment_artifact_id,
+        base_artifact_version=record.enrichment_version,
+        base_input_hash=record.enrichment_input_hash,
+        base_canonical_sha256=record.enrichment_canonical_sha256,
+        base_pin_hash=record.workspace_pin_hash,
+        base_routing_hash=record.routing_decision_hash,
+        operation=operation.value,
+    )
+
+
+def test_proposal_pins_match_reorder_uses_synthesis_anchor_and_enrichment_base() -> None:
+    resolution = _stage_resolution(
+        source_stage=EditorialSourceStage.SYNTHESIS,
+        kind=EditorialBlockKind.LEAD_PARAGRAPH,
+    )
+    proposal = _pinned_proposal_namespace(
+        resolution.record, TargetedEditorialRevisionOperation.REORDER_ENRICHMENT_ELEMENTS
+    )
+
+    assert _proposal_pins_match(proposal, resolution)
+
+    enrichment_resolution = _stage_resolution(
+        source_stage=EditorialSourceStage.EDITORIAL_ENRICHMENT,
+        kind=EditorialBlockKind.TABLE,
+    )
+    enrichment_proposal = _pinned_proposal_namespace(
+        enrichment_resolution.record,
+        TargetedEditorialRevisionOperation.REORDER_ENRICHMENT_ELEMENTS,
+    )
+    assert not _proposal_pins_match(enrichment_proposal, enrichment_resolution)

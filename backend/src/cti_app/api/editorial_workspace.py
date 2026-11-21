@@ -647,6 +647,9 @@ class EditorialHistoryItemView(BaseModel):
         "rewrite_source_figure",
         "replace_source_figure",
         "delete_source_figure",
+        "update_visual_caption",
+        "move_enrichment_element",
+        "reorder_enrichment_elements",
     ]
     operation_label: str
     actor_id: UUID

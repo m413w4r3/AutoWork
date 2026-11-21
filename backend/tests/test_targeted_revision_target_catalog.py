@@ -1,7 +1,24 @@
 from __future__ import annotations
 
+import re
+from typing import get_args
+from uuid import uuid4
+
+import pytest
+
+from cti_app.api.editorial_workspace import EditorialHistoryItemView
 from cti_app.application.production_synthesis_revision import (
     build_targeted_revision_target_catalog,
+)
+from cti_app.domain.production_editorial_revision import (
+    TargetedEditorialRevisionOperation,
+    TargetedEditorialRevisionPlacement,
+    TargetedEditorialRevisionPlacementKind,
+    TargetedEditorialRevisionTarget,
+    TargetedEditorialRevisionTargetKind,
+)
+from cti_app.infrastructure.database.models.editorial_proposals import (
+    EDITORIAL_PROPOSAL_OPERATIONS_SQL,
 )
 
 
@@ -59,3 +76,54 @@ def test_enrichment_catalog_includes_tables_charts_figures_and_create_operations
 
 def test_catalog_for_an_unsupported_stage_is_empty() -> None:
     assert build_targeted_revision_target_catalog("extraction", {}) == []
+
+
+def test_editorial_operation_vocabulary_matches_domain_check_and_api_literal() -> None:
+    enum_values = {operation.value for operation in TargetedEditorialRevisionOperation}
+    check_values = set(re.findall(r"'([a-z_]+)'", EDITORIAL_PROPOSAL_OPERATIONS_SQL))
+    api_values = set(get_args(EditorialHistoryItemView.model_fields["operation"].annotation))
+
+    assert enum_values == check_values == api_values
+    assert len(enum_values) == 28
+    assert {
+        "update_visual_caption",
+        "move_enrichment_element",
+        "reorder_enrichment_elements",
+    } <= enum_values
+
+
+def test_enrichment_order_target_requires_a_paragraph_placement() -> None:
+    anchor_block_id = uuid4()
+    placement = TargetedEditorialRevisionPlacement(
+        kind=TargetedEditorialRevisionPlacementKind.AFTER_PARAGRAPH,
+        anchor_block_id=anchor_block_id,
+    )
+
+    target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind.ENRICHMENT_ORDER,
+        placement=placement,
+    )
+
+    payload = target.to_json()
+    assert payload["kind"] == "enrichment_order"
+    assert payload["element_kind"] is None
+    assert payload["element_key"] is None
+    assert payload["placement"]["anchor_block_id"] == str(anchor_block_id)
+
+    with pytest.raises(ValueError, match="enrichment_order_placement_invalid"):
+        TargetedEditorialRevisionTarget(
+            kind=TargetedEditorialRevisionTargetKind.ENRICHMENT_ORDER,
+        )
+    with pytest.raises(ValueError, match="enrichment_order_target_invalid"):
+        TargetedEditorialRevisionTarget(
+            kind=TargetedEditorialRevisionTargetKind.ENRICHMENT_ORDER,
+            element_key="table-a",
+            placement=placement,
+        )
+    with pytest.raises(ValueError, match="enrichment_order_placement_invalid"):
+        TargetedEditorialRevisionTarget(
+            kind=TargetedEditorialRevisionTargetKind.ENRICHMENT_ORDER,
+            placement=TargetedEditorialRevisionPlacement(
+                kind=TargetedEditorialRevisionPlacementKind.AFTER_LEAD
+            ),
+        )

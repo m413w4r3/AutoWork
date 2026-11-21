@@ -4,21 +4,30 @@ import hashlib
 import json
 from dataclasses import replace
 from types import SimpleNamespace
-from uuid import uuid4
+from typing import TYPE_CHECKING, cast
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
 from fastapi import FastAPI
 
+if TYPE_CHECKING:
+    from cti_app.application.editorial_proposals import EditorialProposalPreparation
+
 from cti_app.application.editorial_synthesis.targets import (
     build_targeted_revision_target_catalog,
     resolve_target,
 )
-from cti_app.application.editorial_workspace.registry import resolve_workspace_target
+from cti_app.application.editorial_workspace.registry import (
+    resolve_occurrence,
+    resolve_workspace_target,
+)
 from cti_app.application.editorial_workspace.service import EditorialWorkspaceService
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
+from cti_app.domain.editorial_proposal import EditorialProposalOrigin
 from cti_app.domain.editorial_workspace import (
+    BlockRegistryEntry,
     EditorialBlockKind,
     EditorialRevisionStatus,
     EditorialSourceStage,
@@ -26,8 +35,11 @@ from cti_app.domain.editorial_workspace import (
 )
 from cti_app.domain.model_conversations import ConversationTurnStatus
 from cti_app.domain.model_runs import ModelRunStatus
+from cti_app.domain.production_editorial_enrichment import EditorialEnrichmentElementKind
 from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionOperation,
+    TargetedEditorialRevisionPlacement,
+    TargetedEditorialRevisionPlacementKind,
     TargetedEditorialRevisionTarget,
     TargetedEditorialRevisionTargetKind,
 )
@@ -1312,3 +1324,299 @@ async def test_missing_patch_during_initial_readback_reuploads_before_uow() -> N
     reads = [index for index, call in enumerate(setup.calls) if call == "blob_read"]
     assert reads[1] < setup.calls.index("uow_open")
     assert setup.calls.count("blob_address_lock") == 1
+
+
+def _enrichment_workspace_record() -> SimpleNamespace:
+    subject_id, run_id, snapshot_id = uuid4(), uuid4(), uuid4()
+    synthesis_artifact_id, enrichment_artifact_id = uuid4(), uuid4()
+    synthesis_content = {
+        "title": "Titre synthétique",
+        "lead": [{"text": "Chapeau synthétique"}],
+        "sections": [],
+    }
+    enrichment_content = {"tables": [{"key": "table-a", "title": "Table A"}]}
+    synthesis_sha256 = hashlib.sha256(
+        ProductionArtifactStore.canonical_json_bytes(synthesis_content)
+    ).hexdigest()
+    enrichment_sha256 = hashlib.sha256(
+        ProductionArtifactStore.canonical_json_bytes(enrichment_content)
+    ).hexdigest()
+    synthesis_entries = bootstrap_block_registry(
+        artifact_id=synthesis_artifact_id,
+        canonical_sha256=synthesis_sha256,
+        source_stage="synthesis",
+        canonical_content=synthesis_content,
+    )
+    enrichment_entries = bootstrap_block_registry(
+        artifact_id=enrichment_artifact_id,
+        canonical_sha256=enrichment_sha256,
+        source_stage="editorial_enrichment",
+        canonical_content=enrichment_content,
+    )
+    return SimpleNamespace(
+        subject_id=subject_id,
+        production_run_id=run_id,
+        snapshot_id=snapshot_id,
+        workspace_pin_hash="5" * 64,
+        routing_decision_hash="3" * 64,
+        synthesis_artifact_id=synthesis_artifact_id,
+        synthesis_version=4,
+        synthesis_input_hash="1" * 64,
+        synthesis_canonical_sha256=synthesis_sha256,
+        enrichment_artifact_id=enrichment_artifact_id,
+        enrichment_version=2,
+        enrichment_input_hash="2" * 64,
+        enrichment_canonical_sha256=enrichment_sha256,
+        block_registry=(*synthesis_entries, *enrichment_entries),
+        publication_kind="article",
+    )
+
+
+def _pinned_proposal(
+    record: SimpleNamespace,
+    *,
+    operation: TargetedEditorialRevisionOperation,
+    before_hash: str,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        subject_id=record.subject_id,
+        production_run_id=record.production_run_id,
+        snapshot_id=record.snapshot_id,
+        base_artifact_id=record.enrichment_artifact_id,
+        base_artifact_version=record.enrichment_version,
+        base_input_hash=record.enrichment_input_hash,
+        base_canonical_sha256=record.enrichment_canonical_sha256,
+        base_pin_hash=record.workspace_pin_hash,
+        base_routing_hash=record.routing_decision_hash,
+        operation=operation.value,
+        before_hash=before_hash,
+    )
+
+
+def test_proposal_pins_match_all_non_create_enrichment_element_operations() -> None:
+    from cti_app.application import editorial_proposals as editorial_proposals_module
+
+    record = _enrichment_workspace_record()
+    table_entry = next(
+        entry
+        for entry in record.block_registry
+        if entry.source_stage is EditorialSourceStage.EDITORIAL_ENRICHMENT
+        and entry.kind is EditorialBlockKind.TABLE
+    )
+    resolution = resolve_occurrence(record, table_entry.block_id)
+    non_create_operations = (
+        TargetedEditorialRevisionOperation.REWRITE_TABLE,
+        TargetedEditorialRevisionOperation.DELETE_TABLE,
+        TargetedEditorialRevisionOperation.REWRITE_DIAGRAM,
+        TargetedEditorialRevisionOperation.DELETE_DIAGRAM,
+        TargetedEditorialRevisionOperation.REWRITE_CHART,
+        TargetedEditorialRevisionOperation.DELETE_CHART,
+        TargetedEditorialRevisionOperation.REWRITE_SOURCE_FIGURE,
+        TargetedEditorialRevisionOperation.REPLACE_SOURCE_FIGURE,
+        TargetedEditorialRevisionOperation.DELETE_SOURCE_FIGURE,
+        TargetedEditorialRevisionOperation.UPDATE_VISUAL_CAPTION,
+        TargetedEditorialRevisionOperation.MOVE_ENRICHMENT_ELEMENT,
+    )
+
+    for operation in non_create_operations:
+        proposal = _pinned_proposal(
+            record, operation=operation, before_hash=table_entry.content_sha256
+        )
+        assert editorial_proposals_module._proposal_pins_match(proposal, resolution), operation
+
+    stale_proposal = _pinned_proposal(
+        record,
+        operation=TargetedEditorialRevisionOperation.UPDATE_VISUAL_CAPTION,
+        before_hash=table_entry.content_sha256,
+    )
+    record.enrichment_canonical_sha256 = "f" * 64
+    stale_resolution = resolve_occurrence(record, table_entry.block_id)
+    assert not editorial_proposals_module._proposal_pins_match(stale_proposal, stale_resolution)
+
+
+def test_proposal_pins_match_reorder_uses_synthesis_anchor_and_enrichment_base() -> None:
+    from cti_app.application import editorial_proposals as editorial_proposals_module
+
+    record = _enrichment_workspace_record()
+    paragraph_entry = next(
+        entry
+        for entry in record.block_registry
+        if entry.source_stage is EditorialSourceStage.SYNTHESIS
+        and entry.kind is EditorialBlockKind.LEAD_PARAGRAPH
+    )
+    proposal = _pinned_proposal(
+        record,
+        operation=TargetedEditorialRevisionOperation.REORDER_ENRICHMENT_ELEMENTS,
+        before_hash="9" * 64,
+    )
+
+    assert editorial_proposals_module._proposal_pins_match(
+        proposal, resolve_occurrence(record, paragraph_entry.block_id)
+    )
+
+    enrichment_entry = next(
+        entry
+        for entry in record.block_registry
+        if entry.source_stage is EditorialSourceStage.EDITORIAL_ENRICHMENT
+        and entry.kind is EditorialBlockKind.TABLE
+    )
+    assert not editorial_proposals_module._proposal_pins_match(
+        proposal, resolve_occurrence(record, enrichment_entry.block_id)
+    )
+
+    record.workspace_pin_hash = "e" * 64
+    assert not editorial_proposals_module._proposal_pins_match(
+        proposal, resolve_occurrence(record, paragraph_entry.block_id)
+    )
+
+
+def _install_dual_stage_registry(
+    setup: SimpleNamespace,
+) -> tuple[BlockRegistryEntry, BlockRegistryEntry, UUID, str]:
+    record = setup.current_snapshot
+    synthesis_content = {
+        "title": "Titre synthétique",
+        "lead": [{"text": "Chapeau synthétique"}],
+        "sections": [],
+    }
+    enrichment_content = {"tables": [{"key": "table-a", "title": "Table A"}]}
+    synthesis_sha256 = hashlib.sha256(
+        ProductionArtifactStore.canonical_json_bytes(synthesis_content)
+    ).hexdigest()
+    enrichment_sha256 = hashlib.sha256(
+        ProductionArtifactStore.canonical_json_bytes(enrichment_content)
+    ).hexdigest()
+    enrichment_artifact_id = uuid4()
+    synthesis_entries = bootstrap_block_registry(
+        artifact_id=record.synthesis_artifact_id,
+        canonical_sha256=synthesis_sha256,
+        source_stage="synthesis",
+        canonical_content=synthesis_content,
+    )
+    enrichment_entries = bootstrap_block_registry(
+        artifact_id=enrichment_artifact_id,
+        canonical_sha256=enrichment_sha256,
+        source_stage="editorial_enrichment",
+        canonical_content=enrichment_content,
+    )
+    record.block_registry = (*synthesis_entries, *enrichment_entries)
+    record.synthesis_canonical_sha256 = synthesis_sha256
+    record.enrichment_artifact_id = enrichment_artifact_id
+    record.enrichment_version = 2
+    record.enrichment_input_hash = "2" * 64
+    record.enrichment_canonical_sha256 = enrichment_sha256
+    paragraph_entry = next(
+        entry for entry in synthesis_entries if entry.kind is EditorialBlockKind.LEAD_PARAGRAPH
+    )
+    table_entry = next(
+        entry for entry in enrichment_entries if entry.kind is EditorialBlockKind.TABLE
+    )
+    return paragraph_entry, table_entry, enrichment_artifact_id, enrichment_sha256
+
+
+def _manual_enrichment_preparation(
+    setup: SimpleNamespace,
+    *,
+    occurrence_id: UUID,
+    target: TargetedEditorialRevisionTarget,
+    operation: TargetedEditorialRevisionOperation,
+    before_hash: str,
+    enrichment_artifact_id: UUID,
+    enrichment_sha256: str,
+) -> EditorialProposalPreparation:
+    return cast(
+        "EditorialProposalPreparation",
+        replace(
+            setup.preparation(),
+            occurrence_id=occurrence_id,
+            base_artifact_id=enrichment_artifact_id,
+            base_artifact_version=2,
+            base_input_hash="2" * 64,
+            base_canonical_sha256=enrichment_sha256,
+            target=target,
+            operation=operation,
+            before_hash=before_hash,
+            origin=EditorialProposalOrigin.MANUAL_PATCH,
+            thread_id=None,
+            model_run_id=None,
+            model_turn_id=None,
+            manual_patch=SimpleNamespace(),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_exact_origin_accepts_a_move_on_an_existing_enrichment_element() -> None:
+    from cti_app.application.editorial_proposals import EditorialProposalApplicationError
+
+    setup = _setup()
+    _paragraph_entry, table_entry, enrichment_artifact_id, enrichment_sha256 = (
+        _install_dual_stage_registry(setup)
+    )
+    preparation = _manual_enrichment_preparation(
+        setup,
+        occurrence_id=table_entry.block_id,
+        target=TargetedEditorialRevisionTarget(
+            kind=TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT,
+            element_kind=EditorialEnrichmentElementKind.TABLE,
+            element_key="table-a",
+        ),
+        operation=TargetedEditorialRevisionOperation.MOVE_ENRICHMENT_ELEMENT,
+        before_hash=table_entry.content_sha256,
+        enrichment_artifact_id=enrichment_artifact_id,
+        enrichment_sha256=enrichment_sha256,
+    )
+
+    async with setup.service._uow_factory() as uow:
+        await setup.service._assert_exact_origin(uow, preparation)
+
+    stale = replace(preparation, base_canonical_sha256="f" * 64)
+    with pytest.raises(EditorialProposalApplicationError) as exc_info:
+        async with setup.service._uow_factory() as stale_uow:
+            await setup.service._assert_exact_origin(stale_uow, stale)
+    assert exc_info.value.code == "proposal_base_stale"
+    assert exc_info.value.reason == "pins:enrichment_canonical_sha256"
+
+
+@pytest.mark.asyncio
+async def test_exact_origin_accepts_reorder_on_its_synthesis_anchor() -> None:
+    from cti_app.application.editorial_proposals import EditorialProposalApplicationError
+
+    setup = _setup()
+    paragraph_entry, _table_entry, enrichment_artifact_id, enrichment_sha256 = (
+        _install_dual_stage_registry(setup)
+    )
+    target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind.ENRICHMENT_ORDER,
+        placement=TargetedEditorialRevisionPlacement(
+            kind=TargetedEditorialRevisionPlacementKind.AFTER_PARAGRAPH,
+            anchor_block_id=paragraph_entry.block_id,
+        ),
+    )
+    preparation = _manual_enrichment_preparation(
+        setup,
+        occurrence_id=paragraph_entry.block_id,
+        target=target,
+        operation=TargetedEditorialRevisionOperation.REORDER_ENRICHMENT_ELEMENTS,
+        before_hash="9" * 64,
+        enrichment_artifact_id=enrichment_artifact_id,
+        enrichment_sha256=enrichment_sha256,
+    )
+
+    async with setup.service._uow_factory() as uow:
+        await setup.service._assert_exact_origin(uow, preparation)
+
+    misplaced = replace(
+        preparation,
+        target=TargetedEditorialRevisionTarget(
+            kind=TargetedEditorialRevisionTargetKind.ENRICHMENT_ORDER,
+            placement=TargetedEditorialRevisionPlacement(
+                kind=TargetedEditorialRevisionPlacementKind.AFTER_PARAGRAPH,
+                anchor_block_id=uuid4(),
+            ),
+        ),
+    )
+    with pytest.raises(EditorialProposalApplicationError) as exc_info:
+        async with setup.service._uow_factory() as stale_uow:
+            await setup.service._assert_exact_origin(stale_uow, misplaced)
+    assert exc_info.value.code == "editorial_anchor_stale"

@@ -1629,7 +1629,11 @@ def _enrichment_target(raw: object) -> TargetedEditorialRevisionTarget:
         raise EditorialProposalAdoptionError("proposal_target_mismatch")
     try:
         kind = TargetedEditorialRevisionTargetKind(str(raw.get("kind")))
-        element_kind = EditorialEnrichmentElementKind(str(raw.get("element_kind")))
+        element_kind = (
+            EditorialEnrichmentElementKind(str(raw["element_kind"]))
+            if raw.get("element_kind") is not None
+            else None
+        )
         placement_data = raw.get("placement")
         placement = None
         if placement_data is not None:

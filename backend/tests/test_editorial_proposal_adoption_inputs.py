@@ -30,6 +30,8 @@ from cti_app.domain.production import (
 from cti_app.domain.production_editorial_enrichment import EditorialEnrichmentElementKind
 from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionOperation,
+    TargetedEditorialRevisionPlacement,
+    TargetedEditorialRevisionPlacementKind,
     TargetedEditorialRevisionTarget,
     TargetedEditorialRevisionTargetKind,
 )
@@ -607,6 +609,57 @@ def test_manual_source_figure_candidate_rejects_url_schemes_in_caption(caption: 
             publication_kind=PublicationKind.ARTICLE,
             inventory_limit=1,
         )
+
+
+def test_enrichment_target_parser_accepts_element_and_order_targets() -> None:
+    element_target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT,
+        element_kind=EditorialEnrichmentElementKind.CHART,
+        element_key="chart_synthetic",
+    )
+    assert adoption_inputs_module._enrichment_target(element_target.to_json()) == element_target
+
+    anchor_block_id = uuid4()
+    order_target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind.ENRICHMENT_ORDER,
+        placement=TargetedEditorialRevisionPlacement(
+            kind=TargetedEditorialRevisionPlacementKind.AFTER_PARAGRAPH,
+            anchor_block_id=anchor_block_id,
+        ),
+    )
+
+    parsed = adoption_inputs_module._enrichment_target(order_target.to_json())
+
+    assert parsed == order_target
+    assert parsed.kind is TargetedEditorialRevisionTargetKind.ENRICHMENT_ORDER
+    assert parsed.element_kind is None
+    assert parsed.element_key is None
+    assert parsed.placement is not None
+    assert parsed.placement.anchor_block_id == anchor_block_id
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        {"kind": "enrichment_order"},
+        {
+            "kind": "enrichment_order",
+            "element_kind": "table",
+            "placement": {
+                "kind": "after_paragraph",
+                "section_id": None,
+                "anchor_block_id": str(uuid4()),
+            },
+        },
+        {
+            "kind": "enrichment_order",
+            "placement": {"kind": "after_lead", "section_id": None, "anchor_block_id": None},
+        },
+    ),
+)
+def test_enrichment_target_parser_rejects_invalid_order_targets(raw: dict[str, object]) -> None:
+    with pytest.raises(EditorialProposalAdoptionError, match="proposal_target_mismatch"):
+        adoption_inputs_module._enrichment_target(raw)
 
 
 @pytest.mark.asyncio
