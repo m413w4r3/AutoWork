@@ -405,6 +405,7 @@ async def test_manual_route_enforces_raw_request_byte_limit_with_specific_error(
         for error_type in (EditorialProposalApplicationError, EditorialProposalAdoptionError)
         for internal_code, expected_status, expected_code in (
             ("publication_kind_unresolved", 422, "manual_edit_format_uneditable"),
+            ("editorial_read_only", 409, "editorial_read_only"),
             ("proposal_target_mismatch", 422, "manual_edit_target_mismatch"),
             ("proposal_base_stale", 409, "manual_edit_stale"),
             ("proposal_state_conflict", 409, "manual_edit_stale"),
@@ -485,6 +486,10 @@ async def test_manual_route_maps_causes_and_logs_code_reason_and_ids(
     if internal_code == "proposal_state_conflict":
         assert caught.value.detail["message"] == (
             "Le document a changé. Actualisez l’atelier, puis réappliquez votre brouillon local."  # noqa: RUF001
+        )
+    if internal_code == "editorial_read_only":
+        assert caught.value.detail["message"] == (
+            "Cette version est en lecture seule : elle ne peut pas être modifiée."
         )
     assert caught.value.__cause__ is internal_error
     message = caplog.records[-1].getMessage()

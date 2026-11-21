@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, cast
 from uuid import UUID
 
+from cti_app.application.editorial_legacy_read_only import EditorialLegacyReadOnlyReason
 from cti_app.application.editorial_synthesis import targets as synthesis_targets
 from cti_app.domain.editorial_workspace import (
     BlockRegistryEntry,
@@ -79,6 +80,9 @@ class WorkspaceOccurrenceResolution:
     artifact_id: UUID | None
     artifact_version: int | None
     canonical_sha256: str | None
+    # Current-context write policy; populated by the workspace service for callers
+    # (for example adoption) that must refuse writes without recomputing it.
+    read_only_reason: EditorialLegacyReadOnlyReason | None = None
 
 
 @dataclass(frozen=True, slots=True)

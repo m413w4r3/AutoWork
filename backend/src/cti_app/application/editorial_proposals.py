@@ -98,6 +98,7 @@ from cti_app.domain.editorial_proposal import (
 from cti_app.domain.editorial_thread import EditorialThreadEventKind
 from cti_app.domain.editorial_workspace import (
     EditorialBlockKind,
+    EditorialReadOnlyError,
     EditorialSourceStage,
     EditorialWorkspaceError,
 )
@@ -809,6 +810,14 @@ def _editorial_workspace_error_code(error: EditorialWorkspaceError) -> str:
     return error.code if error.code != "editorial_workspace_error" else str(error)
 
 
+def _editorial_read_only_failure(
+    error: EditorialWorkspaceError,
+) -> EditorialProposalApplicationError | None:
+    if isinstance(error, EditorialReadOnlyError):
+        return EditorialProposalApplicationError("editorial_read_only", reason=error.reason)
+    return None
+
+
 def _manual_wire_response(
     *,
     target_path: str,
@@ -1274,6 +1283,10 @@ class EditorialProposalService:
                 block_id=origin.occurrence_id,
                 operation=operation.value,
             )
+        except EditorialReadOnlyError as error:
+            raise EditorialProposalApplicationError(
+                "editorial_read_only", reason=error.reason
+            ) from error
         except Exception:
             raise EditorialProposalApplicationError(
                 "proposal_base_stale", reason="workspace:resolve_revision_target"
@@ -1366,6 +1379,27 @@ class EditorialProposalService:
         self, preparation: EditorialProposalPreparation
     ) -> EditorialProposal:
         return await self._prepare_result(preparation, reject_invalid_manual=False)
+
+    async def _refuse_read_only_context(self, subject_id: UUID, occurrence_id: UUID) -> None:
+        """Refuse a manual write while the current snapshot policy is read-only.
+
+        The reason is the one the workspace already derives from live pinned
+        artifacts and exposes on every occurrence resolution; the discussion
+        context rejects read-only blocks with a generic error, so consulting the
+        policy first keeps the stable `editorial_read_only` code visible.
+        """
+        if self._workspace_service is None:
+            return
+        try:
+            resolution = await self._workspace_service.resolve_occurrence(subject_id, occurrence_id)
+        except EditorialWorkspaceError as error:
+            raise EditorialProposalApplicationError(
+                "proposal_base_unavailable", reason="workspace:resolve_occurrence"
+            ) from error
+        if resolution.read_only_reason is not None:
+            raise EditorialProposalApplicationError(
+                "editorial_read_only", reason=resolution.read_only_reason.value
+            )
 
     async def prepare_manual_patch(
         self,
@@ -1477,6 +1511,7 @@ class EditorialProposalService:
                 raise EditorialProposalConflict("proposal_idempotency_conflict")
             return existing
 
+        await self._refuse_read_only_context(subject_id, occurrence_id)
         paragraph_evidence_context = None
         if (
             operation is TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH
@@ -1515,6 +1550,9 @@ class EditorialProposalService:
                 operation=operation.value,
             )
         except EditorialWorkspaceError as error:
+            read_only = _editorial_read_only_failure(error)
+            if read_only is not None:
+                raise read_only from error
             workspace_code = _editorial_workspace_error_code(error)
             code = (
                 "proposal_base_stale"
@@ -1653,6 +1691,7 @@ class EditorialProposalService:
                 raise EditorialProposalConflict("proposal_idempotency_conflict")
             return existing
 
+        await self._refuse_read_only_context(subject_id, occurrence_id)
         try:
             context = await self._discussion_context_builder.build_manual(subject_id, occurrence_id)
         except Exception as error:
@@ -1715,6 +1754,9 @@ class EditorialProposalService:
                 operation=TargetedEditorialRevisionOperation.CREATE_TABLE.value,
             )
         except EditorialWorkspaceError as error:
+            read_only = _editorial_read_only_failure(error)
+            if read_only is not None:
+                raise read_only from error
             raise _manual_table_failure(
                 _editorial_workspace_error_code(error),
                 EditorialTableDiagnosticReason.TARGET_UNAVAILABLE,
@@ -1836,6 +1878,7 @@ class EditorialProposalService:
                 error.code, reason, frame=_exception_origin_frame(error)
             ) from None
 
+        await self._refuse_read_only_context(subject_id, occurrence_id)
         try:
             context = await self._discussion_context_builder.build_manual(subject_id, occurrence_id)
         except Exception as error:
@@ -1893,6 +1936,9 @@ class EditorialProposalService:
                 operation=TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE.value,
             )
         except EditorialWorkspaceError as error:
+            read_only = _editorial_read_only_failure(error)
+            if read_only is not None:
+                raise read_only from error
             raise _manual_figure_failure(
                 _editorial_workspace_error_code(error),
                 EditorialFigureDiagnosticReason.ANCHOR_STALE,
@@ -2027,6 +2073,9 @@ class EditorialProposalService:
                 operation=TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE.value,
             )
         except EditorialWorkspaceError as error:
+            read_only = _editorial_read_only_failure(error)
+            if read_only is not None:
+                raise read_only from error
             raise _manual_figure_failure(
                 _editorial_workspace_error_code(error),
                 EditorialFigureDiagnosticReason.ANCHOR_STALE,
@@ -2118,6 +2167,7 @@ class EditorialProposalService:
                 raise EditorialProposalConflict("proposal_idempotency_conflict")
             return existing
 
+        await self._refuse_read_only_context(subject_id, occurrence_id)
         try:
             context = await self._discussion_context_builder.build_manual(subject_id, occurrence_id)
         except Exception as error:
@@ -2389,6 +2439,9 @@ class EditorialProposalService:
                 operation=preparation.operation.value,
             )
         except EditorialWorkspaceError as error:
+            read_only = _editorial_read_only_failure(error)
+            if read_only is not None:
+                raise read_only from error
             workspace_code = _editorial_workspace_error_code(error)
             code = (
                 "proposal_base_stale"

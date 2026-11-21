@@ -1150,7 +1150,9 @@ async def test_typed_table_wire_uses_real_validator_for_registered_anchor_payloa
 
 
 @pytest.mark.asyncio
-async def test_manual_table_patch_rejects_duplicate_normalized_analytic_question() -> None:
+async def test_manual_table_patch_rejects_duplicate_normalized_analytic_question(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from cti_app.application.editorial_proposals import EditorialProposalService
     from cti_app.domain.editorial_proposal import ManualPatch, ManualTablePatch
     from cti_app.domain.production_synthesis import EvidenceKind, ExtractionEvidenceRefV1
@@ -1209,6 +1211,12 @@ async def test_manual_table_patch_rejects_duplicate_normalized_analytic_question
         artifact_store=object(),
     )
 
+    async def load_current(*_args, **_kwargs):
+        # The read-only policy guard reads the current snapshot before the context;
+        # this test only needs an editable policy, not a full snapshot projection.
+        return {}, SimpleNamespace(block_registry=()), {}
+
+    monkeypatch.setattr(workspace_service, "_load_current", load_current)
     service = EditorialProposalService(
         uow_factory=UnitOfWork,
         blob_store=object(),

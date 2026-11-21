@@ -163,3 +163,117 @@ async def test_legacy_read_only_postgres_keeps_artifact_bytes_and_versions(
         item_id: hashlib.sha256(value).hexdigest() for item_id, value in after_bytes.items()
     } == before_shas
     assert after_bytes == before_bytes
+
+
+@pytest.mark.asyncio
+async def test_forged_write_on_read_only_context_writes_no_proposal_or_revision(
+    uow_factory: UnitOfWorkFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cti_app.domain.production_synthesis import production_synthesis_to_json
+
+    monkeypatch.setattr(
+        api_main,
+        "get_settings",
+        lambda: Settings(_env_file=None, app_env="development", api_bind_host="127.0.0.1"),
+    )
+    monkeypatch.setattr(
+        editorial_workspace_api,
+        "get_settings",
+        lambda: Settings(
+            _env_file=None,
+            editorial_proposal_accept_enabled=True,
+            production_editorial_resource_search_enabled=False,
+        ),
+    )
+    monkeypatch.setattr(editorial_workspace_api, "_proposal_impact_consumer_wired", lambda: True)
+    seeded = await _seed(
+        uow_factory,
+        proposal_count=0,
+        seed_discovery_lineage=True,
+        persist_real_revision_inputs=True,
+    )
+    blob_store = cast(BlobStore, seeded.blob_store)
+    artifact_store = ProductionArtifactStore(BlobCatalogService(blob_store, uow_factory))
+
+    # The current publication resolves the kind, while the pinned synthesis format is
+    # unsupported: the snapshot is read-only, so any write must be refused server-side.
+    publication_blob_id, _publication_sha = await artifact_store.put_canonical_json(
+        _legacy_documents()[-1], bucket="production-artifacts-canonical"
+    )
+    publication = ProductionArtifact(
+        production_run_id=seeded.run.id,
+        subject_id=seeded.subject.id,
+        stage=ProductionArtifactStage.PUBLICATION,
+        version=1,
+        status=ProductionArtifactStatus.VERIFIED,
+        input_hash=hashlib.sha256(b"read-only-current-publication").hexdigest(),
+        canonical_blob_id=publication_blob_id,
+    )
+    unsupported_payload = production_synthesis_to_json(seeded.synthesis)
+    unsupported_payload["schema_version"] = "1"
+    synthesis_blob_id, _synthesis_sha = await artifact_store.put_canonical_json(
+        unsupported_payload, bucket="production-artifacts-canonical"
+    )
+    unsupported_synthesis = ProductionArtifact(
+        production_run_id=seeded.run.id,
+        subject_id=seeded.subject.id,
+        stage=ProductionArtifactStage.SYNTHESIS,
+        version=seeded.base_artifact.version + 1,
+        status=ProductionArtifactStatus.VERIFIED,
+        input_hash=seeded.base_artifact.input_hash,
+        canonical_blob_id=synthesis_blob_id,
+    )
+    async with uow_factory() as uow:
+        await uow.production_artifacts.append(publication)
+        await uow.production_artifacts.append(unsupported_synthesis)
+        await uow.commit()
+
+    app = create_app()
+    app.state.uow_factory = uow_factory
+    app.state.blob_store = blob_store
+    app.state.production_artifact_store = artifact_store
+    app.state.identity_provider = LocalIdentityProvider("dev-analyst")
+
+    async with uow_factory() as uow:
+        proposals_before = await uow.editorial_proposals.list_for_subject(
+            seeded.subject.id, occurrence_id=None, before=None, limit=100
+        )
+        artifacts_before = sorted(
+            (item.id, item.version)
+            for item in await uow.production_artifacts.list_for_run(seeded.run.id)
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        snapshot_response = await client.get(f"/api/subjects/{seeded.subject.id}/editor/snapshot")
+        assert snapshot_response.status_code == 200, snapshot_response.text
+        snapshot = snapshot_response.json()
+        assert snapshot["capabilities"]["read_only_reason"] == "format_not_editable"
+        title = next(block for block in snapshot["blocks"] if block["kind"] == "title")
+        response = await client.post(
+            f"/api/subjects/{seeded.subject.id}/editor/blocks/{title['block_id']}/manual-edit",
+            headers={"Idempotency-Key": "forged-read-only-write-0001"},
+            json={
+                "snapshot_id": snapshot["snapshot_id"],
+                "operation": "rewrite_title",
+                "text": "Synthetic forged replacement title",
+            },
+        )
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"] == {
+            "code": "editorial_read_only",
+            "message": "Cette version est en lecture seule : elle ne peut pas être modifiée.",
+        }
+
+    async with uow_factory() as uow:
+        proposals_after = await uow.editorial_proposals.list_for_subject(
+            seeded.subject.id, occurrence_id=None, before=None, limit=100
+        )
+        artifacts_after = sorted(
+            (item.id, item.version)
+            for item in await uow.production_artifacts.list_for_run(seeded.run.id)
+        )
+    assert [item.id for item in proposals_after] == [item.id for item in proposals_before]
+    assert artifacts_after == artifacts_before
