@@ -22,6 +22,7 @@ from cti_app.application.diagram_compilation import (
     CompiledDiagram,
     DiagramCompilerProcessError,
 )
+from cti_app.application.editorial_enrichment_candidate import remove_target, replace_target
 from cti_app.application.model_gateway import (
     ModelExecution,
     ModelGatewayError,
@@ -8287,12 +8288,11 @@ async def test_targeted_rewrite_preserves_same_family_siblings(
     )
     candidate = replace(base, **{field_name: (replacement,)})
 
-    revised = await harness.service._replace_target(
+    revised = replace_target(
         base,
         candidate,
         element_kind=kind,
         element_key=target.key,
-        run_id=harness.world.run.id,
     )
     revised_payload = editorial_enrichment_to_json(revised)
     original_payload = editorial_enrichment_to_json(base)
@@ -8336,7 +8336,7 @@ async def test_targeted_delete_removes_only_the_requested_family_key(
     }[kind]
     target, sibling = getattr(base, field_name)
 
-    deleted = harness.service._remove_target(
+    deleted = remove_target(
         base,
         element_kind=kind,
         element_key=target.key,
