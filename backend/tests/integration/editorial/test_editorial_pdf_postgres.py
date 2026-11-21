@@ -30,6 +30,7 @@ from cti_app.application.production_routing import (
     decide_and_adopt_production_routing,
 )
 from cti_app.application.production_synthesis import canonical_extraction_hash
+from cti_app.application.publication_assembly import PublicationAssemblyService
 from cti_app.application.publication_rendering import (
     PublicationRenderAttempt,
     PublicationRenderService,
@@ -311,12 +312,46 @@ async def _seed_current_inputs(
         expected_version = run.version
         await uow.commit()
 
-    await decide_and_adopt_production_routing(
+    routing_decision = await decide_and_adopt_production_routing(
         uow_factory=uow_factory,
         artifact_store=artifact_store,
         production_run_id=seeded.run.id,
         expected_version=expected_version,
     )
+
+    assert routing_decision.publication_kind is PublicationKind.BRIEF
+    async with uow_factory() as uow:
+        run = await uow.production_runs.get(seeded.run.id)
+        enrichment_artifact = await uow.production_artifacts.get_current(
+            seeded.run.id, ProductionArtifactStage.EDITORIAL_ENRICHMENT.value
+        )
+        assert run is not None and enrichment_artifact is not None
+        assert run.routing_decision_id == routing_decision.decision_id
+        assembly = PublicationAssemblyService(artifact_store, uow.production_artifacts)
+        await assembly.assemble_publication(
+            run=run,
+            snapshot=seeded.production_input,
+            references=references,
+            extraction=extraction,
+            relevance_projection=projection,
+            synthesis=synthesis,
+            editorial_enrichment=enrichment.base_enrichment,
+            publication_kind=routing_decision.publication_kind,
+            editorial_enrichment_artifact_id=enrichment_artifact.id,
+            editorial_enrichment_artifact_input_hash=enrichment_artifact.input_hash,
+            routing_decision_hash=routing_decision.decision_hash,
+            routing_policy_version=routing_decision.policy_version,
+            metadata_extra={
+                "input_artifacts": {
+                    "references_artifact_id": str(references_artifact.id),
+                    "extraction_artifact_id": str(extraction_artifact.id),
+                    "relevance_projection_artifact_id": str(projection_artifact.id),
+                    "synthesis_artifact_id": str(synthesis_artifact.id),
+                    "editorial_enrichment_artifact_id": str(enrichment_artifact.id),
+                }
+            },
+        )
+        await uow.commit()
     return enrichment
 
 
