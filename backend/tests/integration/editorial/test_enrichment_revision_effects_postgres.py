@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from dataclasses import replace
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID, uuid4
@@ -37,7 +38,11 @@ from cti_app.application.production_synthesis_revision import (
     TargetedEditorialRevisionConflictError,
 )
 from cti_app.application.source_figure_inventory import load_archived_source_figure_inventory
+from cti_app.domain.blobs import BlobDescriptor, BlobRecord
+from cti_app.domain.classification import TLP
+from cti_app.domain.collection import CollectionState, SourceCollection, SourceOriginKind
 from cti_app.domain.editorial_proposal import EditorialProposalState
+from cti_app.domain.entities import SourceDocument
 from cti_app.domain.production import ProductionArtifact, ProductionArtifactStage
 from cti_app.domain.production_editorial_enrichment import (
     EditorialEnrichmentElementKind,
@@ -80,6 +85,58 @@ class _UnexpectedModelGateway:
 
     async def get_run(self, _run_id: UUID) -> None:
         return None
+
+
+async def _persist_source_access_records(
+    seeded: _Seeded,
+    uow_factory: UnitOfWorkFactory,
+) -> None:
+    """Persist exact extracted source IDs and their effective access metadata."""
+    async with uow_factory() as uow:
+        for source in seeded.extraction.sources:
+            source_id = source.source_document_id
+            content = f"Synthetic archived source {source_id}\n".encode()
+            descriptor = BlobDescriptor(
+                sha256=hashlib.sha256(content).hexdigest(),
+                size=len(content),
+                mime_type="text/plain",
+                logical_bucket="source-documents",
+            )
+            seeded.blob_store.seed(descriptor, content)
+            blob = await uow.blobs.add_if_absent(BlobRecord(descriptor=descriptor))
+            collection = SourceCollection(
+                subject_id=seeded.subject.id,
+                edition_id=seeded.subject.edition_id,
+                requested_url=source.canonical_url,
+                canonical_url=source.canonical_url,
+                proposed_role=source.role,
+                origin_kind=SourceOriginKind.REFERENCE_RESEARCH,
+                source_tlp=TLP.AMBER,
+                sensitivity="internal",
+                external_llm_allowed=True,
+                do_not_submit=False,
+                state=CollectionState.ARCHIVED,
+                source_document_id=source_id,
+            )
+            await uow.source_documents.add(
+                SourceDocument(
+                    id=source_id,
+                    subject_id=seeded.subject.id,
+                    blob_id=blob.id,
+                    original_name="synthetic-source.txt",
+                    origin="synthetic enrichment revision fixture",
+                    acquired_at=datetime.now(UTC),
+                    license_restriction=None,
+                    tlp=TLP.AMBER,
+                    do_not_submit=False,
+                    external_llm_allowed=True,
+                    source_collection_id=collection.id,
+                    final_url=source.canonical_url,
+                    detected_mime_type="text/plain",
+                )
+            )
+            assert await uow.source_collections.add_if_absent(collection)
+        await uow.commit()
 
 
 async def _persist_enrichment_history(
@@ -252,6 +309,7 @@ async def test_accept_races_real_enrichment_revise_or_restore_with_one_winner_an
         seed_discovery_lineage=True,
         article_base=True,
     )
+    await _persist_source_access_records(seeded, uow_factory)
     artifact_store, current_enrichment, input_hash = await _persist_enrichment_history(
         seeded, uow_factory
     )
