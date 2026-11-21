@@ -561,20 +561,149 @@ def test_manual_table_text_rejects_markup() -> None:
     assert _editorial_patch_text_violation('#raw("forged Typst")')
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("row_count", "invalid_cell", "expected_state", "expected_validator_code"),
+    ("field_name", "unsafe_text"),
     [
-        (2, None, "proposed", None),
-        (1, None, "needs_review", "editorial_enrichment_output_invalid"),
-        (2, "<b>forged cell</b>", "needs_review", "editorial_enrichment_output_invalid"),
-        (2, "203.0.113.99", "needs_review", "editorial_enrichment_unknown_technical_value"),
+        ("cell", '#raw(read("x"))'),
+        ("title", '#include("x")'),
+        ("caption", '#link("https://example.test", "link")'),
+        ("cell", "<b>forged cell</b>"),
+        ("purpose", "This [E001] citation must stay in its structured field."),
     ],
 )
-def test_manual_table_wire_uses_real_validator_for_registered_anchor_payload(
+async def test_manual_table_input_rejects_unsafe_text_with_stable_code(
+    field_name: str, unsafe_text: str
+) -> None:
+    from cti_app.application.editorial_proposals import EditorialProposalService
+    from cti_app.domain.editorial_proposal import ManualTablePatch
+    from cti_app.domain.production_synthesis import EvidenceKind, ExtractionEvidenceRefV1
+
+    anchor_id = uuid4()
+    evidence_ref = ExtractionEvidenceRefV1(
+        uuid4(), EvidenceKind.FACT, hashlib.sha256(b"manual table evidence").hexdigest()
+    )
+    table = _table_spec(anchor_id, (evidence_ref,))
+    if field_name == "cell":
+        row = replace(table.rows[0], cells=(unsafe_text, table.rows[0].cells[1]))
+        table = replace(table, rows=(row,))
+    elif field_name in {"title", "caption"}:
+        table = replace(table, **{field_name: unsafe_text})
+    elif field_name == "purpose":
+        assert table.purpose is not None
+        table = replace(table, purpose=replace(table.purpose, question=unsafe_text))
+    else:
+        raise AssertionError(f"Unhandled test field: {field_name}")
+    service = EditorialProposalService(
+        uow_factory=object(),
+        artifact_store=object(),
+        workspace_service=object(),
+        discussion_context_builder=object(),
+    )
+
+    with pytest.raises(EditorialProposalApplicationError) as caught:
+        await service._prepare_manual_table_patch(
+            subject_id=uuid4(),
+            snapshot_id=uuid4(),
+            occurrence_id=anchor_id,
+            actor_id=uuid4(),
+            idempotency_key="manual-table-markup-test-0001",
+            typed_patch=ManualTablePatch(anchor_block_id=anchor_id, table=table),
+        )
+
+    assert caught.value.code == "manual_edit_patch_invalid"
+    assert caught.value.reason == "manual_table:markup_rejected"
+
+
+@pytest.mark.parametrize("origin_value", ["bridge_draft", "manual_patch"])
+@pytest.mark.parametrize(
+    ("row_count", "invalid_field", "invalid_text", "expected_state", "expected_validator_code"),
+    [
+        (2, None, None, "proposed", None),
+        (1, None, None, "needs_review", "editorial_enrichment_output_invalid"),
+        (
+            2,
+            "cell",
+            "203.0.113.99",
+            "needs_review",
+            "editorial_enrichment_unknown_technical_value",
+        ),
+        (2, "cell", '#raw(read("x"))', "needs_review", "revision_wire_markup_forbidden"),
+        (2, "key", "table [E001] key", "needs_review", "revision_wire_markup_forbidden"),
+        (2, "title", '#include("x")', "needs_review", "revision_wire_markup_forbidden"),
+        (
+            2,
+            "caption",
+            '#link("https://example.test", "link")',
+            "needs_review",
+            "revision_wire_markup_forbidden",
+        ),
+        (2, "cell", "<b>forged cell</b>", "needs_review", "revision_wire_markup_forbidden"),
+        (
+            2,
+            "column_key",
+            "column [E001] key",
+            "needs_review",
+            "revision_wire_markup_forbidden",
+        ),
+        (
+            2,
+            "column_label",
+            "column [E001] label",
+            "needs_review",
+            "revision_wire_markup_forbidden",
+        ),
+        (
+            2,
+            "purpose_question",
+            "This [E001] citation must stay in its structured field.",
+            "needs_review",
+            "revision_wire_markup_forbidden",
+        ),
+        (
+            2,
+            "purpose_available_data",
+            "Available data [E001] remains prose, not a handle.",
+            "needs_review",
+            "revision_wire_markup_forbidden",
+        ),
+        (
+            2,
+            "purpose_comprehension_gain",
+            "Compare [E001] with source text.",
+            "needs_review",
+            "revision_wire_markup_forbidden",
+        ),
+        (
+            2,
+            "purpose_scope",
+            "Scope [E001] stays plain text.",
+            "needs_review",
+            "revision_wire_markup_forbidden",
+        ),
+        (
+            2,
+            "purpose_knowledge_limits",
+            "Limits [E001] stay plain text.",
+            "needs_review",
+            "revision_wire_markup_forbidden",
+        ),
+        (
+            2,
+            "purpose_placement_reason",
+            "Placement [E001] stays plain text.",
+            "needs_review",
+            "revision_wire_markup_forbidden",
+        ),
+    ],
+)
+def test_typed_table_wire_uses_real_validator_for_registered_anchor_payload(
     row_count: int,
-    invalid_cell: str | None,
+    invalid_field: str | None,
+    invalid_text: str | None,
     expected_state: str,
     expected_validator_code: str | None,
+    origin_value: str,
 ) -> None:
     import json
 
@@ -704,37 +833,46 @@ def test_manual_table_wire_uses_real_validator_for_registered_anchor_payload(
             "evidence_handles": ["E001"],
         },
     ][:row_count]
-    if invalid_cell is not None:
-        rows[0]["cells"][0] = invalid_cell
+    table_payload = {
+        "key": "table_inserted_after_registered_paragraph",
+        "kind": "custom",
+        "title": "Inserted synthetic findings",
+        "caption": "Synthetic findings placed after the selected paragraph.",
+        "columns": [
+            {"key": "finding", "label": "Finding"},
+            {"key": "source", "label": "Source detail"},
+        ],
+        "rows": rows,
+        "placement": {
+            "kind": "after_paragraph",
+            "section_index": None,
+            "anchor_block_id": str(anchor_id),
+        },
+        "purpose": {
+            "question": "Which source passage supports this finding?",
+            "available_data": "The cited synthetic finding and its source context.",
+            "comprehension_gain": "Compare source context beside the finding.",
+            "scope": "Only the synthetic finding and its cited source context.",
+            "evidence_handles": ["E001"],
+            "knowledge_limits": "No other source detail is represented.",
+            "placement_reason": "Keep the table after its anchor paragraph.",
+        },
+    }
+    if invalid_text is not None:
+        if invalid_field == "cell":
+            rows[0]["cells"][0] = invalid_text
+        elif invalid_field in {"key", "title", "caption"}:
+            table_payload[invalid_field] = invalid_text
+        elif invalid_field in {"column_key", "column_label"}:
+            column_field = "key" if invalid_field == "column_key" else "label"
+            table_payload["columns"][0][column_field] = invalid_text
+        elif invalid_field.startswith("purpose_"):
+            table_payload["purpose"][invalid_field.removeprefix("purpose_")] = invalid_text
+        else:
+            raise AssertionError(f"Unhandled test field: {invalid_field}")
     patch_after = json.dumps(
         {
-            "tables": [
-                {
-                    "key": "table_inserted_after_registered_paragraph",
-                    "kind": "custom",
-                    "title": "Inserted synthetic findings",
-                    "caption": "Synthetic findings placed after the selected paragraph.",
-                    "columns": [
-                        {"key": "finding", "label": "Finding"},
-                        {"key": "source", "label": "Source detail"},
-                    ],
-                    "rows": rows,
-                    "placement": {
-                        "kind": "after_paragraph",
-                        "section_index": None,
-                        "anchor_block_id": str(anchor_id),
-                    },
-                    "purpose": {
-                        "question": "Which source passage supports this finding?",
-                        "available_data": "The cited synthetic finding and its source context.",
-                        "comprehension_gain": "Compare source context beside the finding.",
-                        "scope": "Only the synthetic finding and its cited source context.",
-                        "evidence_handles": ["E001"],
-                        "knowledge_limits": "No other source detail is represented.",
-                        "placement_reason": "Keep the table after its anchor paragraph.",
-                    },
-                }
-            ],
+            "tables": [table_payload],
             "charts": [],
             "diagrams": [],
             "annotations": [],
@@ -776,7 +914,7 @@ def test_manual_table_wire_uses_real_validator_for_registered_anchor_payload(
         production_run_id=uuid4(),
         snapshot_id=uuid4(),
         occurrence_id=anchor_id,
-        thread_id=None,
+        thread_id=uuid4() if origin_value == "bridge_draft" else None,
         base_artifact_id=uuid4(),
         base_artifact_version=1,
         base_input_hash=extraction.production_input_hash,
@@ -789,8 +927,8 @@ def test_manual_table_wire_uses_real_validator_for_registered_anchor_payload(
         before_hash=before_hash,
         base_content={"tables": []},
         raw_response=raw_response,
-        model_run_id=None,
-        model_turn_id=None,
+        model_run_id=uuid4() if origin_value == "bridge_draft" else None,
+        model_turn_id=uuid4() if origin_value == "bridge_draft" else None,
         actor_id=uuid4(),
         idempotency_key="manual-table-unit-wire-0001",
         request_sha256="2" * 64,
@@ -802,7 +940,7 @@ def test_manual_table_wire_uses_real_validator_for_registered_anchor_payload(
             "figure_catalog": (),
         },
         strict_wire=True,
-        origin=EditorialProposalOrigin.MANUAL_PATCH,
+        origin=EditorialProposalOrigin(origin_value),
     )
     service = EditorialProposalService(uow_factory=object())
 
@@ -831,18 +969,28 @@ def test_manual_table_wire_uses_real_validator_for_registered_anchor_payload(
         assert diagnostics == {}
     else:
         assert state is EditorialProposalState.NEEDS_REVIEW
+        assert event_kind is EditorialProposalEventKind.NEEDS_REVIEW
         assert expected_validator_code is not None
-        assert diagnostics["validator_code"] == expected_validator_code
-        assert diagnostics["reason"] == "manual_table:validator_rejected"
-        rejected = _manual_table_failure_from_diagnostics(
-            preparation,
-            "manual_edit_patch_invalid",
-            diagnostics,
-        )
-        assert rejected.validator_code == expected_validator_code
-        assert editorial_workspace_api._manual_table_validator_log_code(rejected) == (
-            expected_validator_code
-        )
+        if origin_value == "bridge_draft":
+            if expected_validator_code == "revision_wire_markup_forbidden":
+                assert diagnostics["code"] == expected_validator_code
+            else:
+                assert diagnostics
+        elif expected_validator_code != "revision_wire_markup_forbidden":
+            assert diagnostics["validator_code"] == expected_validator_code
+            assert diagnostics["reason"] == "manual_table:validator_rejected"
+            rejected = _manual_table_failure_from_diagnostics(
+                preparation,
+                "manual_edit_patch_invalid",
+                diagnostics,
+            )
+            assert rejected.validator_code == expected_validator_code
+            assert editorial_workspace_api._manual_table_validator_log_code(rejected) == (
+                expected_validator_code
+            )
+        else:
+            assert diagnostics["code"] == expected_validator_code
+            assert diagnostics["validator_code"] == expected_validator_code
 
 
 @pytest.mark.asyncio

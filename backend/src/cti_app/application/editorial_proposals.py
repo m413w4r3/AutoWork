@@ -51,6 +51,10 @@ from cti_app.application.editorial_workspace.registry import (
 )
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_editorial_enrichment import (
+    EditorialEnrichmentProposalV1,
+    TableProposalV1,
+)
 from cti_app.application.production_synthesis import (
     _plain_text_violation,
     _technical_literals,
@@ -81,7 +85,10 @@ from cti_app.domain.errors import BlobIntegrityError
 from cti_app.domain.model_conversations import ConversationTurnStatus
 from cti_app.domain.model_runs import ModelRunStatus
 from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
-from cti_app.domain.production_editorial_enrichment import normalize_analytic_question
+from cti_app.domain.production_editorial_enrichment import (
+    TableSpecV1,
+    normalize_analytic_question,
+)
 from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionConflictError,
     TargetedEditorialRevisionMode,
@@ -150,6 +157,26 @@ def _editorial_patch_text_violation(value: str, *, allow_newline_tab: bool = Fal
             for char in value
         )
     )
+
+
+def _editorial_table_text_violation(table: TableSpecV1 | TableProposalV1) -> bool:
+    text_values = [table.key, table.title]
+    if table.caption is not None:
+        text_values.append(table.caption)
+    text_values.extend(value for column in table.columns for value in (column.key, column.label))
+    text_values.extend(cell for row in table.rows for cell in row.cells)
+    if table.purpose is not None:
+        text_values.extend(
+            (
+                table.purpose.question,
+                table.purpose.available_data,
+                table.purpose.comprehension_gain,
+                table.purpose.scope,
+                table.purpose.knowledge_limits,
+                table.purpose.placement_reason,
+            )
+        )
+    return any(_editorial_patch_text_violation(value) for value in text_values)
 
 
 def _normalize_editorial_grounding_text(value: str) -> str:
@@ -1093,29 +1120,12 @@ class EditorialProposalService:
             raise _manual_table_failure(
                 "editorial_anchor_stale", EditorialTableDiagnosticReason.ANCHOR_MISMATCH
             )
-        text_values = [table.key, table.title]
-        if table.caption is not None:
-            text_values.append(table.caption)
-        text_values.extend(
-            value for column in table.columns for value in (column.key, column.label)
-        )
-        text_values.extend(cell for row in table.rows for cell in row.cells)
         if table.purpose is None:
             raise _manual_table_failure(
                 "manual_edit_new_fact_unadmitted",
                 EditorialTableDiagnosticReason.EVIDENCE_UNADMITTED,
             )
-        text_values.extend(
-            (
-                table.purpose.question,
-                table.purpose.available_data,
-                table.purpose.comprehension_gain,
-                table.purpose.scope,
-                table.purpose.knowledge_limits,
-                table.purpose.placement_reason,
-            )
-        )
-        if any(_editorial_patch_text_violation(value) for value in text_values):
+        if _editorial_table_text_violation(table):
             raise _manual_table_failure(
                 "manual_edit_patch_invalid", EditorialTableDiagnosticReason.MARKUP_REJECTED
             )
@@ -2132,6 +2142,26 @@ class EditorialProposalService:
             and preparation.target.element_kind is not None
             and preparation.target.element_kind.value == "table"
         )
+        if preparation.strict_wire and typed_table_patch:
+            try:
+                typed_proposal = EditorialEnrichmentProposalV1.model_validate(
+                    json.loads(patch.after)
+                )
+            except (TypeError, ValueError):
+                typed_proposal = None
+            if (
+                typed_proposal is not None
+                and len(typed_proposal.tables) == 1
+                and _editorial_table_text_violation(typed_proposal.tables[0])
+            ):
+                return (
+                    None,
+                    EditorialProposalState.NEEDS_REVIEW,
+                    EditorialProposalEventKind.NEEDS_REVIEW,
+                    _manual_table_validation_diagnostics(
+                        preparation, None, code="revision_wire_markup_forbidden"
+                    ),
+                )
         strict_text_values = (
             (patch.rationale,)
             if (
