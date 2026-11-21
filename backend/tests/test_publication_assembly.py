@@ -1,7 +1,9 @@
 import hashlib
+import json
 from dataclasses import replace
 from datetime import date
 from inspect import signature
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
@@ -15,6 +17,7 @@ from cti_app.application.diagram_compilation import (
 )
 from cti_app.application.editorial_workspace.registry import (
     WorkspaceSnapshotRecord,
+    project_blocks,
     registry_hash,
 )
 from cti_app.application.production_artifact_store import ProductionArtifactStore
@@ -42,9 +45,11 @@ from cti_app.application.publication_builder import (
     build_publication_document_v5,
 )
 from cti_app.application.publication_qa import qa_publication_v4, qa_publication_v7
+from cti_app.application.typst_rendering import TypstRenderer, load_template_bundle
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole
+from cti_app.domain.editorial_figure_keys import ADOPTED_SOURCE_FIGURE_KEY_PREFIX
 from cti_app.domain.editorial_workspace import bootstrap_block_registry
 from cti_app.domain.errors import EntityNotFoundError
 from cti_app.domain.production import (
@@ -105,6 +110,8 @@ from cti_app.domain.production_synthesis import (
     ExtractionEvidenceRefV1,
     ProductionSynthesisV1,
     SynthesisParagraphV1,
+    SynthesisSectionKind,
+    SynthesisSectionV1,
     extraction_evidence_refs_v1,
     production_synthesis_to_json,
 )
@@ -788,6 +795,220 @@ async def test_after_paragraph_assembly_resolves_registered_anchor_and_rebuilds_
         "z_canonical_first",
         "a_canonical_second",
     ]
+
+
+@pytest.mark.parametrize("anchor_index", (1, 2), ids=("middle-paragraph", "last-paragraph"))
+async def test_snapshot_publication_and_typst_keep_anchored_figures_before_section_end_table(
+    tmp_path: Path,
+    anchor_index: int,
+) -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    evidence_ref = extraction_evidence_refs_v1(extraction)[0]
+    section_paragraphs = tuple(
+        SynthesisParagraphV1(f"Synthetic section paragraph {index + 1}.", (evidence_ref,))
+        for index in range(3)
+    )
+    synthesis = replace(
+        synthesis,
+        sections=(
+            SynthesisSectionV1(
+                SynthesisSectionKind.TECHNICAL,
+                "Synthetic technical section",
+                section_paragraphs,
+            ),
+        ),
+    )
+    run = _run(snapshot)
+    synthesis_artifact_id = uuid4()
+    synthesis_entries = bootstrap_block_registry(
+        artifact_id=synthesis_artifact_id,
+        canonical_sha256=canonical_synthesis_hash(synthesis),
+        source_stage="synthesis",
+        canonical_content=production_synthesis_to_json(synthesis),
+    )
+    anchor = next(
+        entry
+        for entry in synthesis_entries
+        if entry.structural_pointer == f"/sections/0/paragraphs/{anchor_index}"
+    )
+    anchor_placement = EnrichmentPlacementV1(
+        EnrichmentPlacementKind.AFTER_PARAGRAPH,
+        anchor_block_id=anchor.block_id,
+    )
+    section_end_placement = EnrichmentPlacementV1(
+        EnrichmentPlacementKind.AFTER_SECTION,
+        section_index=0,
+    )
+    table = replace(
+        _enrichment_table(evidence_ref, key="table_at_section_end"),
+        placement=section_end_placement,
+    )
+    source = extraction.sources[0]
+    figures: list[SourceFigureCandidateV1] = []
+    figure_key_suffixes = ("z_canonical_first", "a_canonical_second")
+    for order in range(2):
+        locator = SourceFigureLocatorV1(
+            page=order + 1,
+            section="Synthetic technical section",
+            figure_label=f"Synthetic figure {order + 1}",
+        )
+        sha256 = hashlib.sha256(f"synthetic figure bytes {order}".encode()).hexdigest()
+        figure_id = source_figure_id(
+            source_document_id=source.source_document_id,
+            sha256=sha256,
+            source=source.canonical_url,
+            locator=locator,
+        )
+        provenance = "Synthetic archived figure fixture."
+        resolved = ResolvedSourceFigureV1(
+            figure_id=figure_id,
+            blob_id=UUID(int=8100 + order),
+            sha256=sha256,
+            mime_type="image/png",
+            byte_size=128,
+            source_document_id=source.source_document_id,
+            source=source.canonical_url,
+            provenance=provenance,
+            locator=locator,
+            decision=SourceFigureDecision.ACCEPTED,
+            decision_reason="archived_blob_verified",
+        )
+        figures.append(
+            SourceFigureCandidateV1(
+                key=f"{ADOPTED_SOURCE_FIGURE_KEY_PREFIX}{figure_key_suffixes[order]}",
+                source_document_id=source.source_document_id,
+                source_url=source.canonical_url,
+                caption=f"Synthetic figure caption {order + 1}",
+                provenance=provenance,
+                locator=locator,
+                inclusion_status=SourceFigureInclusionStatus.INCLUDED,
+                placement=anchor_placement,
+                resolved_figure=resolved,
+                width=8,
+                height=6,
+                order=order,
+            )
+        )
+    enrichment = replace(
+        build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis),
+        tables=(table,),
+        source_figures=tuple(figures),
+    )
+    workspace_record = _workspace_record_for(
+        run=run,
+        synthesis=synthesis,
+        enrichment=enrichment,
+        synthesis_artifact_id=synthesis_artifact_id,
+    )
+    synthesis_payload = production_synthesis_to_json(synthesis)
+    enrichment_payload = editorial_enrichment_to_json(enrichment)
+    snapshot_blocks, _enrichments, _outline = project_blocks(
+        entries=workspace_record.block_registry,
+        synthesis=synthesis_payload,
+        enrichment=enrichment_payload,
+        record=workspace_record,
+        allow_operations=False,
+    )
+
+    service, catalog, _artifacts = _service()
+    assembly = await _assemble(
+        service,
+        run=run,
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+        editorial_enrichment_artifact_id=workspace_record.enrichment_artifact_id,
+        workspace_snapshot_record=workspace_record,
+    )
+    document = parse_publication_document(
+        await ProductionArtifactStore(catalog).read_json(assembly.artifact.canonical_blob_id)
+    )
+    assert isinstance(document, PublicationDocumentV9)
+    figure_keys = [figure.key for figure in figures]
+    assert [placement.element_key for placement in document.resolved_placements] == figure_keys
+    assert all(
+        placement.anchor_block_id == anchor.block_id for placement in document.resolved_placements
+    )
+    publication_v5 = document.base_publication.base_publication.base_publication
+    assert publication_v5.document.tables[0].placement == section_end_placement
+
+    template_root = tmp_path / "typst-template"
+    entrypoint = template_root / "RENDERER" / "publication.typ"
+    entrypoint.parent.mkdir(parents=True)
+    entrypoint.write_text('#let publication = json("render-data.json")\n', encoding="utf-8")
+    (template_root / "renderer-manifest.json").write_text(
+        json.dumps({"template_version": "test-v1", "files": ["RENDERER/publication.typ"]}),
+        encoding="utf-8",
+    )
+    rendered = TypstRenderer().render(
+        document,
+        load_template_bundle(template_root),
+        document_label="Synthetic placement fixture",
+    )
+    typst_payload = json.loads(rendered.render_data_bytes)
+    typst_blocks = next(
+        section["blocks"]
+        for section in typst_payload["content_sections"]
+        if section["type"] == "synthesis"
+    )
+
+    snapshot_anchor_index = next(
+        index
+        for index, block in enumerate(snapshot_blocks)
+        if block["block_id"] == str(anchor.block_id)
+    )
+    snapshot_table_index = next(
+        index
+        for index, block in enumerate(snapshot_blocks)
+        if block["kind"] == "table" and block["table"]["key"] == table.key
+    )
+    typst_anchor_index = next(
+        index
+        for index, block in enumerate(typst_blocks)
+        if block["type"] == "paragraph" and block["text"] == section_paragraphs[anchor_index].text
+    )
+    typst_table_index = next(
+        index
+        for index, block in enumerate(typst_blocks)
+        if block["type"] == "table" and block["key"] == table.key
+    )
+
+    def snapshot_label(block: dict[str, object]) -> tuple[str, str]:
+        kind = str(block["kind"])
+        if kind in {"paragraph", "lead_paragraph"}:
+            return "paragraph", str(block["text"])
+        if kind in {"figure", "table"}:
+            payload = block[kind]
+            assert isinstance(payload, dict)
+            return kind, str(payload["key"])
+        raise AssertionError(f"Unexpected snapshot block in placement sequence: {kind}")
+
+    def typst_label(block: dict[str, object]) -> tuple[str, str]:
+        kind = str(block["type"])
+        if kind == "paragraph":
+            return kind, str(block["text"])
+        if kind in {"figure", "table"}:
+            return kind, str(block["key"])
+        raise AssertionError(f"Unexpected Typst block in placement sequence: {kind}")
+
+    snapshot_sequence = [
+        snapshot_label(block)
+        for block in snapshot_blocks[snapshot_anchor_index : snapshot_table_index + 1]
+    ]
+    typst_sequence = [
+        typst_label(block) for block in typst_blocks[typst_anchor_index : typst_table_index + 1]
+    ]
+    expected_sequence = [
+        ("paragraph", section_paragraphs[anchor_index].text),
+        *(("figure", key) for key in figure_keys),
+        *(("paragraph", paragraph.text) for paragraph in section_paragraphs[anchor_index + 1 :]),
+        ("table", table.key),
+    ]
+    assert snapshot_sequence == expected_sequence
+    assert typst_sequence == expected_sequence
+    assert snapshot_sequence == typst_sequence
 
 
 @pytest.mark.asyncio

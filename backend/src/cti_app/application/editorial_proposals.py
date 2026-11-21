@@ -51,6 +51,9 @@ from cti_app.application.editorial_synthesis.targets import (
     resolve_target,
 )
 from cti_app.application.editorial_text_policy import (
+    editorial_caption_text_violation as _editorial_caption_text_violation,
+)
+from cti_app.application.editorial_text_policy import (
     editorial_patch_text_violation as _editorial_patch_text_violation,
 )
 from cti_app.application.editorial_workspace.registry import (
@@ -314,7 +317,8 @@ def _exception_origin_frame(error: BaseException) -> str | None:
 def _editorial_table_text_violation(table: TableSpecV1 | TableProposalV1) -> bool:
     text_values = [table.key, table.title]
     if table.caption is not None:
-        text_values.append(table.caption)
+        if _editorial_caption_text_violation(table.caption):
+            return True
     text_values.extend(value for column in table.columns for value in (column.key, column.label))
     text_values.extend(cell for row in table.rows for cell in row.cells)
     if table.purpose is not None:
@@ -342,7 +346,8 @@ def _editorial_bar_chart_text_violation(chart: ChartSpecV1 | ChartProposalV1) ->
         *(point.series for point in chart.points),
     ]
     if chart.caption is not None:
-        text_values.append(chart.caption)
+        if _editorial_caption_text_violation(chart.caption):
+            return True
     text_values.extend(
         (
             chart.purpose.question,
@@ -1810,7 +1815,7 @@ class EditorialProposalService:
                 "editorial_anchor_stale", EditorialFigureDiagnosticReason.ANCHOR_STALE
             )
         if any(
-            _editorial_patch_text_violation(selection.caption.strip())
+            _editorial_caption_text_violation(selection.caption.strip())
             or not selection.caption.strip()
             for selection in typed_patch.figures
         ):

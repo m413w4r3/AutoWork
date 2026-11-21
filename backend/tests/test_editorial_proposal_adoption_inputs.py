@@ -220,6 +220,42 @@ def _revalidation_fixture(
     return inputs, proposal, resolution, uow, context
 
 
+def _figure_revalidation_fixture() -> tuple[Any, Any, Any, Any, Any]:
+    inputs, proposal, resolution, uow, context = _revalidation_fixture()
+    synthesis_artifact = context.synthesis_artifact
+    enrichment_artifact = SimpleNamespace(
+        id=uuid4(),
+        production_run_id=proposal.production_run_id,
+        subject_id=proposal.subject_id,
+        stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+        version=2,
+        input_hash="figure-enrichment-input",
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=uuid4(),
+    )
+    context.stage = ProductionArtifactStage.EDITORIAL_ENRICHMENT
+    context.base_artifact = enrichment_artifact
+    context.base_enrichment = SimpleNamespace(source_figures=())
+    context.synthesis_artifact = synthesis_artifact
+    context.synthesis = SimpleNamespace()
+    proposal.operation = TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE.value
+    proposal.base_artifact_id = enrichment_artifact.id
+    proposal.base_artifact_version = enrichment_artifact.version
+    proposal.base_canonical_sha256 = "d" * 64
+    resolution.record.enrichment_artifact_id = enrichment_artifact.id
+    resolution.record.enrichment_version = enrichment_artifact.version
+    resolution.record.enrichment_canonical_sha256 = proposal.base_canonical_sha256
+    resolution.record.publication_kind = PublicationKind.ARTICLE
+    uow.production_artifacts.value[ProductionArtifactStage.EDITORIAL_ENRICHMENT.value] = (
+        enrichment_artifact
+    )
+    uow.blobs = SimpleNamespace()
+    inputs._enrichment_revision_service = SimpleNamespace(
+        _enrichment=SimpleNamespace(_source_media_archiver=None, _artifact_store=object())
+    )
+    return inputs, proposal, resolution, uow, context
+
+
 @pytest.mark.asyncio
 async def test_current_red_subject_tlp_is_rechecked_in_uow_without_writes() -> None:
     inputs, proposal, resolution, uow, _context = _revalidation_fixture()
@@ -541,6 +577,72 @@ async def test_inputs_adapter_never_touches_gateway_or_blobstore() -> None:
     await inputs.revalidate_evidence_policy_and_thread(uow, proposal, {}, resolution=resolution)
 
     assert uow.write_count == 0
+
+
+@pytest.mark.parametrize("caption", ("ftp://example.test/a", "mailto:user@example.test"))
+def test_manual_source_figure_candidate_rejects_url_schemes_in_caption(caption: str) -> None:
+    raw_figure = {
+        "figure_id": "opaque-figure-id",
+        "caption": caption,
+        "order": 0,
+        "source_document_id": str(uuid4()),
+        "source_url": "https://example.test/article",
+        "sha256": "a" * 64,
+        "mime_type": "image/png",
+        "byte_size": 10,
+        "width": 10,
+        "height": 10,
+        "provenance": "Synthetic archived source.",
+    }
+
+    with pytest.raises(EditorialProposalAdoptionError, match="proposal_patch_invalid"):
+        adoption_inputs_module._manual_source_figure_candidate_patch(
+            {"manual_source_figures": [raw_figure]},
+            subject_id=uuid4(),
+            run_id=uuid4(),
+            catalog=(),
+            extraction=SimpleNamespace(sources=()),
+            base_enrichment=SimpleNamespace(source_figures=()),
+            anchor_block_id=uuid4(),
+            publication_kind=PublicationKind.ARTICLE,
+            inventory_limit=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_policy_programming_error_is_not_converted_to_a_business_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs, proposal, resolution, uow, _context = _revalidation_fixture()
+
+    async def fail_with_attribute_error(*_args: Any, **_kwargs: Any) -> Any:
+        raise AttributeError("injected policy programming error")
+
+    monkeypatch.setattr(
+        adoption_inputs_module, "build_synthesis_access_policy", fail_with_attribute_error
+    )
+
+    with pytest.raises(AttributeError, match="injected policy programming error"):
+        await inputs.revalidate_evidence_policy_and_thread(uow, proposal, {}, resolution=resolution)
+
+
+@pytest.mark.asyncio
+async def test_figure_inventory_programming_error_is_not_converted_to_ineligible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs, proposal, resolution, uow, _context = _figure_revalidation_fixture()
+
+    async def fail_with_attribute_error(**_kwargs: Any) -> Any:
+        raise AttributeError("injected inventory programming error")
+
+    monkeypatch.setattr(
+        adoption_inputs_module,
+        "load_archived_source_figure_inventory",
+        fail_with_attribute_error,
+    )
+
+    with pytest.raises(AttributeError, match="injected inventory programming error"):
+        await inputs.revalidate_evidence_policy_and_thread(uow, proposal, {}, resolution=resolution)
 
 
 @pytest.mark.asyncio

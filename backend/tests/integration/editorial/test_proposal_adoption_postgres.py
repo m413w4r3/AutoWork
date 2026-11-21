@@ -788,6 +788,8 @@ def _enrichment_seed_content(
     production_input: ProductionInputSnapshot,
     extraction: ProductionExtractionV1,
     synthesis: ProductionSynthesisV1,
+    *,
+    base_table_placement: EnrichmentPlacementV1 | None = None,
 ) -> _EnrichmentSeedContent:
     evidence_pack = build_editorial_enrichment_evidence_pack(
         production_input,
@@ -829,7 +831,8 @@ def _enrichment_seed_content(
                 evidence_refs=evidence_refs,
             ),
         ),
-        placement=EnrichmentPlacementV1(kind=EnrichmentPlacementKind.AFTER_LEAD),
+        placement=base_table_placement
+        or EnrichmentPlacementV1(kind=EnrichmentPlacementKind.AFTER_LEAD),
         purpose=purpose,
     )
     empty_enrichment = validate_editorial_enrichment_proposal(

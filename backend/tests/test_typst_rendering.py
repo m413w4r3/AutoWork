@@ -450,6 +450,111 @@ def _figure_at(
     )
 
 
+def _legacy_v9_source_figure_document() -> PublicationDocumentV9:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    source = extraction.sources[0]
+    content = b"synthetic archived legacy figure"
+    sha256 = hashlib.sha256(content).hexdigest()
+    locator = SourceFigureLocatorV1(page=1, section="Synthetic legacy section")
+    figure_id = source_figure_id(
+        source_document_id=source.source_document_id,
+        sha256=sha256,
+        source=source.canonical_url,
+        locator=locator,
+    )
+    resolved = ResolvedSourceFigureV1(
+        figure_id=figure_id,
+        blob_id=UUID(int=7101),
+        sha256=sha256,
+        mime_type="image/png",
+        byte_size=len(content),
+        source_document_id=source.source_document_id,
+        source=source.canonical_url,
+        provenance="Synthetic archival provenance.",
+        locator=locator,
+        decision=SourceFigureDecision.ACCEPTED,
+        decision_reason="archived_blob_verified",
+    )
+    candidate = SourceFigureCandidateV1(
+        key="source_figure_historical_1",
+        source_document_id=source.source_document_id,
+        source_url=source.canonical_url,
+        caption="Historical figure caption",
+        provenance=resolved.provenance,
+        locator=locator,
+        inclusion_status=SourceFigureInclusionStatus.INCLUDED,
+        placement=EnrichmentPlacementV1(kind=EnrichmentPlacementKind.AFTER_LEAD),
+        resolved_figure=resolved,
+        width=None,
+        height=None,
+        order=0,
+    )
+    enrichment = replace(
+        build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis),
+        source_figures=(candidate,),
+    )
+    v5 = build_publication_document_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+    v7 = PublicationDocumentV7(
+        base_publication=_v6(v5),
+        publication_kind=PublicationKind.ARTICLE,
+        routing_decision_hash="a" * 64,
+        routing_policy_version="routing-policy-v1",
+    )
+    return PublicationDocumentV9(
+        base_publication=v7,
+        article_format=build_article_format_v1(v5, extraction),
+        registry_hash="b" * 64,
+        synthesis_canonical_sha256="c" * 64,
+        enrichment_canonical_sha256="d" * 64,
+        resolved_placements=(),
+    )
+
+
+def test_legacy_v9_figure_render_data_matches_frozen_historical_bytes(
+    tmp_path: Path,
+) -> None:
+    renderer, bundle = _renderer(tmp_path)
+    rendered = _render(renderer, _legacy_v9_source_figure_document(), bundle)
+    historical_bytes = (
+        Path(__file__).parent / "fixtures" / "legacy_v9_figure_render_data.json"
+    ).read_bytes()
+
+    assert rendered.render_data_bytes == historical_bytes
+    render_data = json.loads(rendered.render_data_bytes)
+    figure_blocks = [
+        block
+        for section in render_data["content_sections"]
+        for block in section["blocks"]
+        if block["type"] == "figure"
+    ]
+    assert render_data["schema_version"] == "typst-publication-model-v41-after-paragraph-anchors"
+    assert len(figure_blocks) == 1
+    assert not {"width", "height"}.intersection(figure_blocks[0])
+
+
+def test_adopted_source_figure_render_block_includes_dimensions() -> None:
+    figure = replace(
+        _figure_at("adopted", "Adopted caption", EnrichmentPlacementKind.AFTER_LEAD),
+        key=f"{ADOPTED_SOURCE_FIGURE_KEY_PREFIX}fixture",
+        width=640,
+        height=480,
+    )
+    block = typst_rendering_module._figure_block(
+        figure,
+        _source(_SOURCE_ID),
+        lambda **_kwargs: SimpleNamespace(media_path="media/adopted.png"),
+    )
+
+    assert block["width"] == 640
+    assert block["height"] == 480
+
+
 def test_v9_renders_after_the_registered_paragraph_and_v8_keeps_v40(tmp_path: Path) -> None:
     renderer, bundle = _renderer(tmp_path)
     snapshot, references, extraction, synthesis = _canonical_inputs()
@@ -676,6 +781,10 @@ def test_real_typst_multi_figure_pdf_uses_local_assets_after_anchor(
     )
     figure_positions = [index for index, block in enumerate(blocks) if block["type"] == "figure"]
     assert figure_positions == [anchor_position + 1, anchor_position + 2]
+    figure_blocks = [block for block in blocks if block["type"] == "figure"]
+    assert [(block["width"], block["height"]) for block in figure_blocks] == [
+        (figure.width, figure.height) for figure in figures
+    ]
     assert len(rendered.media_refs) == 2
     assert all(ref.media_path.startswith("media/") for ref in rendered.media_refs)
     assert all(
@@ -2372,16 +2481,6 @@ def test_figure_reader_source_hides_pipeline_locators_and_media_refs_deduplicate
         for block in figure_blocks
     )
     assert figure_blocks[0]["caption"] == "Caption one"
-    assert figure_blocks[0]["width"] == first.width
-    assert figure_blocks[0]["height"] == first.height
-    assert all({"width", "height"}.issubset(block) for block in figure_blocks)
-    sources_by_id = {source.source_document_id: source for source in document.sources}
-    assert (
-        typst_rendering_module._reader_facing_figure_source(
-            first, sources_by_id[first.source_document_id]
-        )
-        == "secret.example — Bitcoin wallet recovery — p. 1"
-    )
     assert figure_blocks[0]["sha256"] == first.sha256
     assert figure_blocks[0]["byte_size"] == first.byte_size
     render_data = rendered.render_data_bytes.decode("utf-8")

@@ -22,7 +22,11 @@ from cti_app.config import Settings
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.editorial_proposal import EditorialProposalOrigin, EditorialProposalState
 from cti_app.domain.production import ProductionArtifactStage
-from cti_app.domain.production_editorial_enrichment import editorial_enrichment_from_json
+from cti_app.domain.production_editorial_enrichment import (
+    EnrichmentPlacementKind,
+    EnrichmentPlacementV1,
+    editorial_enrichment_from_json,
+)
 from cti_app.domain.publication_document import (
     PublicationDocumentV9,
     parse_publication_document,
@@ -61,6 +65,10 @@ async def test_figure_adoption_makes_zero_gateway_calls(
     seeded, app, model_gateway, _enrichment_content = await _ready_for_manual_table_route(
         uow_factory,
         source_figure_count=2,
+        base_table_placement=EnrichmentPlacementV1(
+            EnrichmentPlacementKind.AFTER_SECTION,
+            section_index=0,
+        ),
     )
     assert isinstance(model_gateway, _NoModelCalls)
 
@@ -70,11 +78,9 @@ async def test_figure_adoption_makes_zero_gateway_calls(
         snapshot_response = await client.get(f"/api/subjects/{seeded.subject.id}/editor/snapshot")
         assert snapshot_response.status_code == 200, snapshot_response.text
         snapshot = snapshot_response.json()
-        anchor = next(
-            block
-            for block in snapshot["blocks"]
-            if block["kind"] in {"paragraph", "lead_paragraph"}
-        )
+        section_paragraphs = [block for block in snapshot["blocks"] if block["kind"] == "paragraph"]
+        assert section_paragraphs
+        anchor = section_paragraphs[-1]
         anchor_id = UUID(anchor["block_id"])
         assert "create_source_figure" in anchor["allowed_operations"]
 
@@ -206,6 +212,7 @@ async def test_figure_adoption_makes_zero_gateway_calls(
         )
     ]
     assert all(index > updated_anchor_index for index in inserted_indices)
+    assert inserted_indices == [updated_anchor_index + 1, updated_anchor_index + 2]
     # Other elements may share this anchor; their canonical order is position, then element key.
     canonical_anchor_blocks = sorted(
         same_anchor_blocks,
@@ -228,13 +235,14 @@ async def test_figure_adoption_makes_zero_gateway_calls(
         for block in snapshot["blocks"]
         if block["kind"] == "table" and block["table"]["key"] == "synthetic_table"
     )
-    assert fixture_table["table"]["anchor_block_id"] == str(anchor_id)
+    assert fixture_table["table"]["placement"] == EnrichmentPlacementKind.AFTER_SECTION.value
+    assert fixture_table["table"]["anchor_block_id"] is None
     fixture_table_index = next(
         index
         for index, block in enumerate(updated_blocks)
         if block["block_id"] == fixture_table["block_id"]
     )
-    assert inserted_indices[0] < fixture_table_index < inserted_indices[-1]
+    assert inserted_indices[-1] < fixture_table_index
     assert all("blob_id" not in json.dumps(block["figure"]) for block in inserted_blocks)
 
     anchor_entry = next(
