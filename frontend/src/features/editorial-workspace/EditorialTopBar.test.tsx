@@ -469,7 +469,41 @@ describe("EditorialTopBar render state", () => {
       />,
     );
 
-    await user.click(screen.getByRole("menuitem", { name: "Historique" }));
+    const historyButton = screen.getByRole("button", { name: "Historique" });
+    await user.click(historyButton);
     expect(onOpenHistory).toHaveBeenCalledOnce();
+    expect(onOpenHistory).toHaveBeenCalledWith(
+      screen.getByRole("button", { name: "Historique et détails" }),
+    );
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(screen.queryByRole("menuitem")).toBeNull();
+  });
+
+  it("connects the top bar disclosure to its regular action buttons", () => {
+    render(
+      <EditorialTopBar
+        subjectId="subject-1"
+        snapshot={baseSnapshot}
+        stale={false}
+        menuOpen
+        technicalOpen={false}
+        onToggleMenu={vi.fn()}
+        onOpenTechnicalDetails={vi.fn()}
+        onTechnicalOpenChange={vi.fn()}
+        onRefresh={vi.fn()}
+      />,
+    );
+
+    const disclosure = screen.getByRole("button", {
+      name: "Historique et détails",
+    });
+    expect(disclosure).toHaveAttribute("aria-expanded", "true");
+    expect(disclosure).toHaveAttribute(
+      "aria-controls",
+      "editorial-topbar-history-actions",
+    );
+    expect(
+      screen.getByRole("button", { name: "Détails techniques" }),
+    ).toBeVisible();
   });
 });

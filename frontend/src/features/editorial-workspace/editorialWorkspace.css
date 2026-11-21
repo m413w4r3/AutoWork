@@ -258,6 +258,7 @@ main:has(> .editorial-route-state) > .app-header {
 .editorial-workspace textarea:focus-visible,
 .editorial-outline__item:focus-visible,
 .editorial-document__block:focus-visible,
+.editorial-history h2:focus-visible,
 .editorial-technical-details summary:focus-visible,
 .editorial-block-actions__more summary:focus-visible {
   outline: 3px solid var(--editorial-focus-ring);
@@ -281,6 +282,10 @@ main:has(> .editorial-route-state) > .app-header {
   border-radius: 0.7rem;
   background: var(--editorial-white);
   box-shadow: 0 12px 32px rgb(23 33 29 / 14%);
+}
+
+.editorial-topbar__menu[hidden] {
+  display: none;
 }
 
 .editorial-topbar__menu button {

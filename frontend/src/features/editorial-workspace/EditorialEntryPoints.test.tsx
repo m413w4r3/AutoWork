@@ -555,7 +555,7 @@ describe("atelier éditorial", () => {
     });
     await user.click(menuToggle);
     await user.click(
-      screen.getByRole("menuitem", { name: "Détails techniques" }),
+      screen.getByRole("button", { name: "Détails techniques" }),
     );
 
     const summary = document.querySelector(

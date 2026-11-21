@@ -252,6 +252,7 @@ class ProductionEditorialEnrichmentRevisionService:
         projection: Any,
         synthesis: Any,
         read_only_media: bool = False,
+        read_only_snapshot: bool = False,
     ) -> _EditorialEnrichmentRevisionFence:
         media_archiver: Any = self._enrichment._source_media_archiver
         if read_only_media and media_archiver is not None:
@@ -277,12 +278,12 @@ class ProductionEditorialEnrichmentRevisionService:
                 EditorialWorkspaceService,
             )
 
+            # Preview prechecks once appended missing snapshots; keep this read path append-free.
+            snapshot_uow = _ReadOnlyWorkspaceSnapshotUow(uow) if read_only_snapshot else uow
             workspace_record = await EditorialWorkspaceService(
                 uow_factory=cast(Any, self._enrichment._uow_factory),
                 artifact_store=self._enrichment._artifact_store,
-            ).snapshot_record_in_uow(
-                cast(Any, _ReadOnlyWorkspaceSnapshotUow(uow)), snapshot.subject_id
-            )
+            ).snapshot_record_in_uow(cast(Any, snapshot_uow), snapshot.subject_id)
             if workspace_record.synthesis_artifact_id != synthesis_artifact.id:
                 raise EditorialEnrichmentRevisionConflictError(
                     "The pinned synthesis no longer matches the requested revision base"
@@ -590,6 +591,7 @@ class ProductionEditorialEnrichmentRevisionService:
                 projection=projection,
                 synthesis=synthesis,
                 read_only_media=True,
+                read_only_snapshot=True,
             )
         except EditorialEnrichmentRevisionConflictError as exc:
             from cti_app.domain.production_editorial_revision import (
@@ -694,7 +696,7 @@ class ProductionEditorialEnrichmentRevisionService:
             base_input_hash=base_input_hash,
             base_canonical_sha256=base_canonical_sha256,
         )
-        evaluation = await self._evaluate_stale_enrichment_restore(context)
+        evaluation = await self._evaluate_stale_enrichment_restore(context, read_only_snapshot=True)
         base_artifact = context[2]
         return StaleEnrichmentRestorePreview(
             base_artifact_id=base_artifact.id,
@@ -1001,7 +1003,7 @@ class ProductionEditorialEnrichmentRevisionService:
         )
 
     async def _evaluate_stale_enrichment_restore(
-        self, context: tuple[Any, ...]
+        self, context: tuple[Any, ...], *, read_only_snapshot: bool = False
     ) -> tuple[EditorialEnrichmentV1, list[dict[str, Any]], list[dict[str, Any]]]:
         from cti_app.application.production_synthesis_revision import (
             _enrichment_section_anchor_id,
@@ -1041,6 +1043,7 @@ class ProductionEditorialEnrichmentRevisionService:
             projection=projection,
             synthesis=synthesis,
             read_only_media=True,
+            read_only_snapshot=read_only_snapshot,
         )
 
         async with self._enrichment._uow_factory() as uow:

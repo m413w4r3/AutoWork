@@ -18,6 +18,7 @@ from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.publication_rendering import PublicationRenderService
 from cti_app.application.subject_content import SubjectContentService
+from cti_app.application.typst_compilation import TYPST_COMPILER
 from cti_app.config import Settings
 from cti_app.domain.editorial_proposal import (
     EditorialProposal,
@@ -25,6 +26,7 @@ from cti_app.domain.editorial_proposal import (
     EditorialProposalState,
 )
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
+from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 
 
 class _EmptySubjectRepository:
@@ -72,6 +74,7 @@ async def test_editorial_pdf_routes_build_real_services_without_lifespan(
     settings = Settings(_env_file=None)
     monkeypatch.setattr(api_main, "get_settings", lambda: settings)
     monkeypatch.setattr(publication_runtime_api, "get_settings", lambda: settings)
+    monkeypatch.setenv("TYPST_BINARY", "/tmp/typst-must-not-be-used")
 
     subject_id = uuid4()
     requests = (
@@ -95,6 +98,8 @@ async def test_editorial_pdf_routes_build_real_services_without_lifespan(
             assert isinstance(app.state.media_asset_store, MediaAssetStore)
             assert isinstance(app.state.publication_render_service, PublicationRenderService)
             assert isinstance(app.state.subject_content_service, SubjectContentService)
+            assert type(app.state.typst_compiler) is TypstSubprocessCompiler
+            assert app.state.typst_compiler._binary == TYPST_COMPILER
 
 
 class _HistorySubjectRepository:

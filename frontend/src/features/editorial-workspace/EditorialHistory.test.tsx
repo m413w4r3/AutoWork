@@ -52,6 +52,30 @@ afterEach(() => {
 });
 
 describe("EditorialHistory", () => {
+  it("moves focus to the history heading when the section opens", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify({ items: [], next_cursor: null, limit: 20 }),
+            {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            },
+          ),
+        ),
+      ),
+    );
+
+    renderHistory();
+
+    const heading = await screen.findByRole("heading", {
+      name: "Historique des propositions",
+    });
+    await waitFor(() => expect(heading).toHaveFocus());
+  });
+
   it("lists manual and Bridge proposals and loads the next page on request", async () => {
     const user = userEvent.setup();
     const bridge = historyItem({

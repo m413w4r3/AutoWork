@@ -3,6 +3,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { EditorialServerDraftStatus } from "./EditorialServerDraftStatus";
+import { editorialWorkspaceQueryKeys } from "./editorialWorkspaceQueries";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -53,7 +54,7 @@ function renderStatus({
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
-  render(
+  const { container } = render(
     <QueryClientProvider client={client}>
       <EditorialServerDraftStatus
         subjectId="subject-1"
@@ -64,10 +65,36 @@ function renderStatus({
       />
     </QueryClientProvider>,
   );
-  return { fetchMock, onRecover };
+  return { client, container, fetchMock, onRecover };
 }
 
 describe("EditorialServerDraftStatus", () => {
+  it("does not render an empty status container when no server or local draft exists", async () => {
+    const fetchMock = vi.fn<typeof fetch>(() =>
+      Promise.resolve(
+        new Response(JSON.stringify({ detail: { code: "draft_not_found" } }), {
+          status: 404,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    );
+    const { client, container } = renderStatus({
+      fetchImplementation: fetchMock,
+    });
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(
+        client.getQueryState(
+          editorialWorkspaceQueryKeys.serverDraft("subject-1", "occurrence-1"),
+        )?.status,
+      ).toBe("success");
+      expect(
+        container.querySelector(".editorial-server-draft-status"),
+      ).toBeNull();
+    });
+  });
+
   it("identifies a server draft and its expiry without rendering its text", async () => {
     const { fetchMock } = renderStatus();
 

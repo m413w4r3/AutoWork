@@ -457,6 +457,43 @@ test("test_keyboard_select_edit_compare_decide_and_restore_focus", async ({
   expect(unexpectedRequests).toEqual([]);
 });
 
+test("opens history from the keyboard and restores focus when it closes", async ({
+  page,
+}) => {
+  await installWorkspaceStubs(page);
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.goto(`/subjects/${subjectId}/editor`);
+
+  const disclosure = page.getByRole("button", {
+    name: "Historique et détails",
+  });
+  await tabTo(page, disclosure);
+  await page.keyboard.press("Enter");
+  await expect(disclosure).toHaveAttribute("aria-expanded", "true");
+
+  await page.keyboard.press("Tab");
+  await expect(
+    page.getByRole("button", { name: "Historique", exact: true }),
+  ).toBeFocused();
+  await page.keyboard.press("Enter");
+
+  const historyHeading = page.getByRole("heading", {
+    name: "Historique des propositions",
+  });
+  await expect(historyHeading).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(historyHeading).toHaveCount(0);
+  await expect(disclosure).toBeFocused();
+
+  await page.keyboard.press("Enter");
+  await page.keyboard.press("Tab");
+  await page.keyboard.press("Enter");
+  await expect(historyHeading).toBeFocused();
+  await page.getByRole("button", { name: "Fermer l’historique" }).click();
+  await expect(historyHeading).toHaveCount(0);
+  await expect(disclosure).toBeFocused();
+});
+
 test("test_async_reply_does_not_steal_focus", async ({ page }) => {
   const { unexpectedRequests } = await installWorkspaceStubs(page);
   const paragraphId = blockId;

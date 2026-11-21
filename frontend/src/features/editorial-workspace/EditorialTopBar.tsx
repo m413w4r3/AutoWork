@@ -1,3 +1,5 @@
+import { useRef } from "react";
+
 import type {
   EditorialCompositionStatusView,
   EditorialPdfStatusView,
@@ -24,7 +26,7 @@ interface EditorialTopBarProps {
   onRefresh: () => void;
   onRefreshPdfStatus?: () => void;
   onRegeneratePdf?: () => void;
-  onOpenHistory?: () => void;
+  onOpenHistory?: (button: HTMLButtonElement) => void;
   onNavigateAway?: () => boolean;
 }
 
@@ -76,6 +78,7 @@ export function EditorialTopBar({
   onOpenHistory,
   onNavigateAway = () => true,
 }: EditorialTopBarProps) {
+  const historyDisclosureRef = useRef<HTMLButtonElement>(null);
   const title =
     snapshot.blocks.find((block) => block.kind === "title")?.text?.trim() ||
     "Document éditorial";
@@ -225,29 +228,30 @@ export function EditorialTopBar({
             type="button"
             aria-label="Historique et détails"
             aria-expanded={menuOpen}
-            aria-haspopup="menu"
+            aria-controls="editorial-topbar-history-actions"
+            ref={historyDisclosureRef}
             onClick={(event) => onToggleMenu(event.currentTarget)}
           >
             Historique et détails
           </button>
-          {menuOpen ? (
-            <div className="editorial-topbar__menu" role="menu">
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => onOpenHistory?.()}
-              >
-                Historique
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                onClick={onOpenTechnicalDetails}
-              >
-                Détails techniques
-              </button>
-            </div>
-          ) : null}
+          <div
+            className="editorial-topbar__menu"
+            id="editorial-topbar-history-actions"
+            hidden={!menuOpen}
+          >
+            <button
+              type="button"
+              onClick={() => {
+                const disclosure = historyDisclosureRef.current;
+                if (disclosure) onOpenHistory?.(disclosure);
+              }}
+            >
+              Historique
+            </button>
+            <button type="button" onClick={onOpenTechnicalDetails}>
+              Détails techniques
+            </button>
+          </div>
         </div>
       </div>
       {pdfStatusUnavailable ? (

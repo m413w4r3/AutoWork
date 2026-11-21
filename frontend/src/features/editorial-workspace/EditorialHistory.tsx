@@ -1,4 +1,5 @@
 import { useInfiniteQuery } from "@tanstack/react-query";
+import { useEffect, useRef } from "react";
 
 import { ApiError } from "../../api/editions";
 import {
@@ -50,6 +51,7 @@ export function EditorialHistory({
   onClose,
   onOpenThread,
 }: EditorialHistoryProps) {
+  const headingRef = useRef<HTMLHeadingElement>(null);
   const historyQuery = useInfiniteQuery({
     queryKey: editorialWorkspaceQueryKeys.history(subjectId),
     queryFn: ({ pageParam }) =>
@@ -67,6 +69,10 @@ export function EditorialHistory({
       ? historyQuery.error.message
       : "L’historique est momentanément indisponible.";
 
+  useEffect(() => {
+    headingRef.current?.focus({ preventScroll: true });
+  }, []);
+
   return (
     <section
       className="editorial-history"
@@ -77,7 +83,9 @@ export function EditorialHistory({
       <div className="editorial-history__header">
         <div>
           <p className="editorial-history__eyebrow">Consultation</p>
-          <h2 id="editorial-history-heading">Historique des propositions</h2>
+          <h2 id="editorial-history-heading" ref={headingRef} tabIndex={-1}>
+            Historique des propositions
+          </h2>
         </div>
         <button
           className="button button--secondary"

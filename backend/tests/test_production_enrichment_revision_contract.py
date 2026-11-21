@@ -2,18 +2,20 @@ from __future__ import annotations
 
 import copy
 import hashlib
-from dataclasses import replace
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
 
 import pytest
 
+import cti_app.application.production_enrichment_revision as revision_module
 from cti_app.application.editorial_enrichment_revision import (
     targeted_request_identity,
     targeted_request_identity_payload,
 )
 from cti_app.application.editorial_revision_effects import (
+    EditorialRevisionEffects,
     EditorialRevisionEffectsResult,
     EditorialRunGuard,
 )
@@ -129,6 +131,79 @@ def _write_events(trace: list[tuple[str, object]]) -> list[tuple[str, object]]:
             "commit",
         }
     ]
+
+
+def _install_real_revision_effects(harness: SimpleNamespace) -> None:
+    original_factory = harness.service._enrichment._uow_factory
+
+    def effects_uow_factory() -> Any:
+        uow = original_factory()
+
+        async def no_op(*_args: object) -> None:
+            return None
+
+        async def no_proposals(_run_id: UUID) -> tuple[Any, ...]:
+            return ()
+
+        async def get_for_update(run_id: UUID) -> object | None:
+            return harness.world.run if run_id == harness.world.run.id else None
+
+        uow.editorial_proposals = SimpleNamespace(
+            lock_adoption_for_run=no_op,
+            list_proposed_for_run_for_update=no_proposals,
+        )
+        uow.production_runs.get_for_update = get_for_update
+        return uow
+
+    harness.service._enrichment._uow_factory = effects_uow_factory
+    harness.service._persistence._uow_factory = effects_uow_factory
+    workspace_service = EditorialWorkspaceService(
+        uow_factory=effects_uow_factory,
+        artifact_store=harness.world.store,
+    )
+    harness.service._revision_effects = EditorialRevisionEffects(
+        workspace_service=workspace_service
+    )
+
+
+def _without_created_at(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _without_created_at(item) for key, item in value.items() if key != "created_at"
+        }
+    if isinstance(value, list):
+        return [_without_created_at(item) for item in value]
+    return value
+
+
+async def _persistent_revision_state(harness: SimpleNamespace) -> tuple[Any, Any]:
+    snapshot_repository = harness.service._enrichment._uow_factory().editorial_workspace_snapshots
+    snapshots = []
+    for record in snapshot_repository.records:
+        state = asdict(record)
+        state.pop("snapshot_id")
+        state["parent_snapshot_id"] = record.parent_snapshot_id is not None
+        snapshots.append(state)
+
+    artifacts = []
+    for artifact in harness.artifacts.artifacts:
+        canonical_sha256 = None
+        if artifact.canonical_blob_id is not None:
+            canonical_sha256 = hashlib.sha256(
+                await harness.world.store.read_bytes(artifact.canonical_blob_id)
+            ).hexdigest()
+        artifacts.append(
+            (
+                (None if artifact.stage is ProductionArtifactStage.PUBLICATION else artifact.id),
+                artifact.stage,
+                artifact.version,
+                artifact.input_hash,
+                artifact.status,
+                canonical_sha256,
+                _without_created_at(artifact.metadata),
+            )
+        )
+    return snapshots, artifacts
 
 
 @pytest.mark.asyncio
@@ -259,6 +334,125 @@ async def test_enrichment_preview_never_writes(monkeypatch: pytest.MonkeyPatch) 
     assert harness.world.store.payloads == payloads_before
     assert harness.world.gateway.calls == []
     assert harness.world.writer.calls == []
+
+
+@pytest.mark.asyncio
+async def test_targeted_enrichment_revise_advances_snapshot_and_registry_without_preview_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, "unexpected")),
+    )
+    _install_real_revision_effects(harness)
+    monkeypatch.setattr(
+        revision_module,
+        "_ReadOnlyWorkspaceSnapshotUow",
+        lambda *_args: pytest.fail("write path used the preview-only snapshot wrapper"),
+    )
+    request = _common_enrichment_request(
+        harness,
+        element_kind=EditorialEnrichmentElementKind.TABLE,
+        operation=TargetedEditorialRevisionOperation.DELETE_TABLE,
+        element_key="tools_table",
+    )
+
+    result = await harness.service.revise_targeted(request)
+
+    assert result.artifact is not None
+    records = harness.service._enrichment._uow_factory().editorial_workspace_snapshots.records
+    assert len(records) >= 2
+    base_record = records[0]
+    advanced_record = next(
+        record
+        for record in records[1:]
+        if record.parent_snapshot_id == base_record.snapshot_id
+        and record.enrichment_artifact_id == result.artifact.id
+    )
+    assert advanced_record.parent_snapshot_id == base_record.snapshot_id
+    assert advanced_record.enrichment_artifact_id == result.artifact.id
+    assert advanced_record.enrichment_version == result.artifact.version
+    assert advanced_record.registry_hash != base_record.registry_hash
+
+
+@pytest.mark.asyncio
+async def test_stale_enrichment_restore_advances_snapshot_and_registry_without_preview_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, "unexpected")),
+        include_figure=True,
+        include_target_annotations=True,
+    )
+    await _install_stale_enrichment_restore_history(harness)
+    _install_real_revision_effects(harness)
+    monkeypatch.setattr(
+        revision_module,
+        "_ReadOnlyWorkspaceSnapshotUow",
+        lambda *_args: pytest.fail("write path used the preview-only snapshot wrapper"),
+    )
+
+    result = await harness.service.restore_stale_enrichment_blocks(
+        subject_id=harness.world.snapshot.subject_id,
+        base_artifact_id=harness.base.id,
+        base_version=harness.base.version,
+        base_input_hash=harness.base.input_hash,
+        base_canonical_sha256=harness.base_sha256,
+        actor="dev-analyst",
+    )
+
+    records = harness.service._enrichment._uow_factory().editorial_workspace_snapshots.records
+    assert len(records) >= 2
+    base_record = records[0]
+    advanced_record = next(
+        record
+        for record in records[1:]
+        if record.parent_snapshot_id == base_record.snapshot_id
+        and record.enrichment_artifact_id == result.artifact.id
+    )
+    assert advanced_record.parent_snapshot_id == base_record.snapshot_id
+    assert advanced_record.enrichment_artifact_id == result.artifact.id
+    assert advanced_record.enrichment_version == result.artifact.version
+    assert advanced_record.registry_hash != base_record.registry_hash
+
+
+@pytest.mark.asyncio
+async def test_preview_then_targeted_revise_matches_revise_only_persistent_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, "unexpected")),
+    )
+    _install_real_revision_effects(harness)
+    request = _common_enrichment_request(
+        harness,
+        element_kind=EditorialEnrichmentElementKind.TABLE,
+        operation=TargetedEditorialRevisionOperation.DELETE_TABLE,
+        element_key="tools_table",
+    )
+    initial_artifacts = copy.deepcopy(harness.artifacts.artifacts)
+    initial_payloads = copy.deepcopy(harness.world.store.payloads)
+
+    revise_only = await harness.service.revise_targeted(request)
+    assert revise_only.artifact is not None
+    revise_only_state = await _persistent_revision_state(harness)
+
+    harness.artifacts.artifacts = copy.deepcopy(initial_artifacts)
+    harness.world.store.payloads = copy.deepcopy(initial_payloads)
+    snapshot_repository = harness.service._enrichment._uow_factory().editorial_workspace_snapshots
+    snapshot_repository.records.clear()
+    harness.assembled.clear()
+    harness.rendered.clear()
+
+    preview = await harness.service.preview_targeted(request)
+    assert preview.expected_model_calls == 0
+    assert snapshot_repository.records == []
+    preview_then_revise = await harness.service.revise_targeted(request)
+    assert preview_then_revise.artifact is not None
+
+    assert await _persistent_revision_state(harness) == revise_only_state
 
 
 @pytest.mark.asyncio

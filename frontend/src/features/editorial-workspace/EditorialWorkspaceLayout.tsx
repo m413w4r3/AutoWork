@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import type {
   EditorialCompositionStatusView,
@@ -82,6 +82,7 @@ export function EditorialWorkspaceLayout({
   const [figureGalleryOpen, setFigureGalleryOpen] = useState(false);
   const [editingBlockId, setEditingBlockId] = useState<string | null>(null);
   const overlayOpenerRef = useRef<HTMLElement | null>(null);
+  const historyOpenerRef = useRef<HTMLButtonElement | null>(null);
   const leaveConfirmedRef = useRef(false);
   const linkedThreadHandledRef = useRef(false);
   // The snapshot's `blocks` array is already the server-resolved document
@@ -187,6 +188,13 @@ export function EditorialWorkspaceLayout({
     return allowed;
   };
 
+  const closeHistory = useCallback(() => {
+    setHistoryOpen(false);
+    const opener = historyOpenerRef.current;
+    historyOpenerRef.current = null;
+    window.requestAnimationFrame(() => opener?.focus({ preventScroll: true }));
+  }, []);
+
   useEffect(() => {
     if (!localDrafts.hasDrafts) return;
     const warnOnClose = (event: BeforeUnloadEvent) => {
@@ -226,6 +234,11 @@ export function EditorialWorkspaceLayout({
   useEffect(() => {
     const closeTransientUi = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
+      if (historyOpen) {
+        event.preventDefault();
+        closeHistory();
+        return;
+      }
       setOpenPanel(null);
       setMenuOpen(false);
       setTechnicalOpen(false);
@@ -240,7 +253,7 @@ export function EditorialWorkspaceLayout({
     };
     window.addEventListener("keydown", closeTransientUi);
     return () => window.removeEventListener("keydown", closeTransientUi);
-  }, []);
+  }, [closeHistory, historyOpen]);
 
   const selectFromOutline = (blockId: string) => {
     selectBlock(blockId);
@@ -319,12 +332,15 @@ export function EditorialWorkspaceLayout({
     });
   };
 
-  const openHistory = () => {
+  const openHistory = (button: HTMLButtonElement) => {
+    historyOpenerRef.current = button;
+    overlayOpenerRef.current = null;
     setHistoryOpen(true);
     setMenuOpen(false);
   };
 
   const openHistoryThread = (occurrenceId: string) => {
+    historyOpenerRef.current = null;
     setHistoryOpen(false);
     selectBlock(occurrenceId);
     setOpenPanel("inspector");
@@ -362,7 +378,7 @@ export function EditorialWorkspaceLayout({
       {historyOpen ? (
         <EditorialHistory
           subjectId={subjectId}
-          onClose={() => setHistoryOpen(false)}
+          onClose={closeHistory}
           onOpenThread={openHistoryThread}
         />
       ) : null}

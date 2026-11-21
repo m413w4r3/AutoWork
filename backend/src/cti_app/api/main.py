@@ -1,5 +1,4 @@
 import logging
-import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -438,7 +437,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     typst_paths = publication_runtime.resolve_typst_bundle_paths()
     chp_typst_root, font_bundle_root, typst_fonts_lock_path = typst_paths
-    typst_compiler = TypstSubprocessCompiler(binary=os.environ.get("TYPST_BINARY", "typst"))
+    typst_compiler = TypstSubprocessCompiler()
     media_asset_store = MediaAssetStore(production_artifact_store, uow_factory)
     edition_typst_renderer = EditionTypstRenderer()
     edition_render_service = EditionRenderService(

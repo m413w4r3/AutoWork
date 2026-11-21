@@ -375,7 +375,7 @@ test("canonical adoption refreshes the PDF and keeps history and composition pin
 
   await page.reload();
   await page.getByRole("button", { name: "Historique et détails" }).click();
-  await page.getByRole("menuitem", { name: "Historique" }).click();
+  await page.getByRole("button", { name: "Historique", exact: true }).click();
   await expect(page.getByText("Tableau")).toBeVisible();
   await expect(page.getByText("Bridge", { exact: true })).toBeVisible();
   await expect(page.getByText("Réécriture")).toBeVisible();

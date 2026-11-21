@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -75,11 +74,7 @@ def build_publication_runtime_services(
     chp_typst_root, font_bundle_root, typst_fonts_lock_path = (
         typst_bundle_paths() if typst_paths is None else typst_paths
     )
-    compiler = (
-        typst_compiler
-        if typst_compiler is not None
-        else TypstSubprocessCompiler(binary=os.environ.get("TYPST_BINARY", "typst"))
-    )
+    compiler = typst_compiler if typst_compiler is not None else TypstSubprocessCompiler()
     cache = (
         mapping_cache
         if mapping_cache is not None

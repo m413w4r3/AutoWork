@@ -71,6 +71,8 @@ export function EditorialServerDraftStatus({
   }
 
   const state = draftQuery.data;
+  if (state.kind === "missing" && localDraftText.length === 0) return null;
+
   const draft = state.kind === "available" ? state.draft : null;
   const expiry = formatExpiry(
     state.kind === "available"

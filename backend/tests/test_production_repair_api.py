@@ -10,7 +10,9 @@ from cti_app.api import production as production_api
 from cti_app.api import publication as publication_api
 from cti_app.api import publication_runtime as publication_runtime_api
 from cti_app.application.diagnostics import DiagnosticsLog
+from cti_app.application.typst_compilation import TYPST_COMPILER
 from cti_app.config import Settings
+from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 
 
 class _Engine:
@@ -67,6 +69,7 @@ async def test_real_app_lifespan_and_repair_fallbacks_require_revision_effects(
         shodan_count_enabled=False,
         ghidra_enabled=False,
     )
+    monkeypatch.setenv("TYPST_BINARY", "/tmp/typst-must-not-be-used")
     monkeypatch.setattr(api_main, "settings", settings)
     monkeypatch.setattr(api_main, "get_settings", lambda: settings)
     monkeypatch.setattr(api_main, "InfrastructureReadinessChecker", lambda _settings: _Readiness())
@@ -110,6 +113,8 @@ async def test_real_app_lifespan_and_repair_fallbacks_require_revision_effects(
 
     app = api_main.create_app()
     async with app.router.lifespan_context(app):
+        assert type(app.state.typst_compiler) is TypstSubprocessCompiler
+        assert app.state.typst_compiler._binary == TYPST_COMPILER
         request = SimpleNamespace(app=app)
         configured = app.state.production_repair_materialization_service
         assert configured._revision_effects is not None
