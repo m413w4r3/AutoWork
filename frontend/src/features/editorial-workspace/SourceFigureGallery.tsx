@@ -1,5 +1,5 @@
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
 
 import {
   editorialFigureThumbnailUrl,
@@ -31,9 +31,17 @@ function sourceLabel(item: EditorialFigureCatalogItem): string {
 export function SourceFigureGallery({
   subjectId,
   onClose,
+  selectedFigures,
+  onSelectionChange,
+  selectionLimit,
+  initialFocusRef,
 }: {
   subjectId: string;
   onClose: () => void;
+  selectedFigures?: EditorialFigureCatalogItem[];
+  onSelectionChange?: (items: EditorialFigureCatalogItem[]) => void;
+  selectionLimit?: number;
+  initialFocusRef?: RefObject<HTMLElement | null>;
 }) {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
@@ -42,7 +50,9 @@ export function SourceFigureGallery({
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState<EditorialFigureStatus | "">("");
   const [source, setSource] = useState("");
-  const [selected, setSelected] = useState<Set<string>>(() => new Set());
+  const [localSelectedFigures, setLocalSelectedFigures] = useState<
+    EditorialFigureCatalogItem[]
+  >([]);
   const [previewFigureId, setPreviewFigureId] = useState<string | null>(null);
   const [failedThumbnails, setFailedThumbnails] = useState<Set<string>>(
     () => new Set(),
@@ -57,9 +67,10 @@ export function SourceFigureGallery({
     const dialog = dialogRef.current;
     if (!dialog) return;
     openerRef.current =
-      document.activeElement instanceof HTMLElement
+      initialFocusRef?.current ??
+      (document.activeElement instanceof HTMLElement
         ? document.activeElement
-        : null;
+        : null);
     if (typeof dialog.showModal === "function") dialog.showModal();
     else dialog.setAttribute("open", "");
     closeButtonRef.current?.focus();
@@ -67,7 +78,7 @@ export function SourceFigureGallery({
       if (dialog.open && typeof dialog.close === "function") dialog.close();
       openerRef.current?.focus();
     };
-  }, []);
+  }, [initialFocusRef]);
 
   const catalogQuery = useInfiniteQuery({
     queryKey: editorialWorkspaceQueryKeys.figureCatalog(
@@ -96,6 +107,15 @@ export function SourceFigureGallery({
     () => catalogQuery.data?.pages.flatMap((page) => page.items) ?? [],
     [catalogQuery.data],
   );
+  const controlledSelection =
+    selectedFigures !== undefined && onSelectionChange !== undefined;
+  const currentSelection = controlledSelection
+    ? selectedFigures
+    : localSelectedFigures;
+  const selectedIds = useMemo(
+    () => new Set(currentSelection.map((item) => item.figure_id)),
+    [currentSelection],
+  );
   const firstPage = catalogQuery.data?.pages[0];
   const previewQuery = useQuery({
     queryKey: editorialWorkspaceQueryKeys.figurePreview(
@@ -107,14 +127,17 @@ export function SourceFigureGallery({
   });
 
   useEffect(() => {
-    setSelected((current) => {
-      const next = new Set(current);
-      for (const item of items) {
-        if (!item.selectable) next.delete(item.figure_id);
-      }
-      return next.size === current.size ? current : next;
-    });
-  }, [items]);
+    const newlyIneligible = new Set(
+      items.filter((item) => !item.selectable).map((item) => item.figure_id),
+    );
+    if (newlyIneligible.size === 0) return;
+    const next = currentSelection.filter(
+      (item) => !newlyIneligible.has(item.figure_id),
+    );
+    if (next.length === currentSelection.length) return;
+    if (controlledSelection) onSelectionChange(next);
+    else setLocalSelectedFigures(next);
+  }, [controlledSelection, currentSelection, items, onSelectionChange]);
 
   useEffect(() => {
     setPreviewImageFailed(false);
@@ -122,12 +145,21 @@ export function SourceFigureGallery({
 
   const toggleSelected = (item: EditorialFigureCatalogItem) => {
     if (!item.selectable) return;
-    setSelected((current) => {
-      const next = new Set(current);
-      if (next.has(item.figure_id)) next.delete(item.figure_id);
-      else next.add(item.figure_id);
-      return next;
-    });
+    const isSelected = selectedIds.has(item.figure_id);
+    if (
+      !isSelected &&
+      selectionLimit !== undefined &&
+      selectedIds.size >= selectionLimit
+    ) {
+      return;
+    }
+    const next = isSelected
+      ? currentSelection.filter(
+          (selectedItem) => selectedItem.figure_id !== item.figure_id,
+        )
+      : [...currentSelection, item];
+    if (controlledSelection) onSelectionChange(next);
+    else setLocalSelectedFigures(next);
   };
 
   const close = () => onClose();
@@ -215,9 +247,26 @@ export function SourceFigureGallery({
           </label>
           <p className="editorial-figure-gallery__counts" aria-live="polite">
             <span>Disponibles : {firstPage?.available_count ?? 0}</span>
-            <span>Sélectionnées : {selected.size}</span>
+            <span>
+              {selectedIds.size}{" "}
+              {selectedIds.size === 1
+                ? "image sélectionnée"
+                : "images sélectionnées"}
+            </span>
           </p>
         </div>
+
+        {selectionLimit !== undefined ? (
+          <p
+            id="editorial-figure-selection-limit"
+            className="editorial-figure-gallery__limit"
+            role="note"
+          >
+            {selectionLimit === 0
+              ? "Une brève ne peut contenir plus de trois figures intégrées. Le plafond est atteint."
+              : `Cette insertion peut ajouter jusqu’à ${selectionLimit} figure${selectionLimit > 1 ? "s" : ""}.`}
+          </p>
+        ) : null}
 
         {catalogQuery.isPending ? (
           <p className="editorial-figure-gallery__state" role="status">
@@ -252,82 +301,94 @@ export function SourceFigureGallery({
                 className="editorial-figure-gallery__grid"
                 aria-label="Figures candidates"
               >
-                {items.map((item) => (
-                  <li key={item.figure_id}>
-                    <article className="editorial-figure-card">
-                      <div className="editorial-figure-card__image">
-                        {failedThumbnails.has(item.figure_id) ? (
-                          <span role="status">Erreur de miniature</span>
-                        ) : (
-                          <img
-                            src={editorialFigureThumbnailUrl(
-                              subjectId,
-                              item.figure_id,
-                            )}
-                            alt={item.alt_text ?? item.original_name}
-                            loading="lazy"
-                            onError={() =>
-                              setFailedThumbnails((current) =>
-                                new Set(current).add(item.figure_id),
-                              )
-                            }
-                          />
-                        )}
-                      </div>
-                      <div className="editorial-figure-card__body">
-                        <h3>{item.original_name}</h3>
-                        {item.original_caption ? (
-                          <p>{item.original_caption}</p>
-                        ) : null}
-                        <p className="editorial-figure-card__source">
-                          {sourceLabel(item)}
-                        </p>
-                        <p
-                          className={`editorial-figure-status editorial-figure-status--${item.status}`}
-                        >
-                          {STATUS_LABELS[item.status]}
-                          {item.already_used ? " · Déjà utilisée" : ""}
-                        </p>
-                        {item.exclusion_reason ? (
-                          <p
-                            id={`figure-exclusion-${item.figure_id}`}
-                            className="editorial-figure-card__reason"
-                          >
-                            {item.exclusion_reason}
-                          </p>
-                        ) : null}
-                        <div className="editorial-figure-card__actions">
-                          <label className="editorial-figure-card__checkbox">
-                            <input
-                              type="checkbox"
-                              checked={selected.has(item.figure_id)}
-                              disabled={!item.selectable}
-                              onChange={() => toggleSelected(item)}
-                              aria-label={`Sélectionner ${item.original_name}`}
-                              aria-describedby={
-                                item.exclusion_reason
-                                  ? `figure-exclusion-${item.figure_id}`
-                                  : undefined
+                {items.map((item) => {
+                  const disabledByLimit =
+                    selectionLimit !== undefined &&
+                    selectedIds.size >= selectionLimit &&
+                    !selectedIds.has(item.figure_id);
+                  const descriptions = [
+                    item.exclusion_reason
+                      ? `figure-exclusion-${item.figure_id}`
+                      : null,
+                    disabledByLimit ? "editorial-figure-selection-limit" : null,
+                  ].filter((value): value is string => value !== null);
+                  return (
+                    <li key={item.figure_id}>
+                      <article className="editorial-figure-card">
+                        <div className="editorial-figure-card__image">
+                          {failedThumbnails.has(item.figure_id) ? (
+                            <span role="status">Erreur de miniature</span>
+                          ) : (
+                            <img
+                              src={editorialFigureThumbnailUrl(
+                                subjectId,
+                                item.figure_id,
+                              )}
+                              alt={item.alt_text ?? item.original_name}
+                              loading="lazy"
+                              onError={() =>
+                                setFailedThumbnails((current) =>
+                                  new Set(current).add(item.figure_id),
+                                )
                               }
                             />
-                            <span>
-                              {selected.has(item.figure_id)
-                                ? "Sélectionnée"
-                                : "Sélectionner"}
-                            </span>
-                          </label>
-                          <button
-                            className="button button--secondary"
-                            type="button"
-                            onClick={() => setPreviewFigureId(item.figure_id)}
-                          >
-                            Aperçu détaillé
-                          </button>
+                          )}
                         </div>
-                      </div>
-                    </article>
-                  </li>
-                ))}
+                        <div className="editorial-figure-card__body">
+                          <h3>{item.original_name}</h3>
+                          {item.original_caption ? (
+                            <p>{item.original_caption}</p>
+                          ) : null}
+                          <p className="editorial-figure-card__source">
+                            {sourceLabel(item)}
+                          </p>
+                          <p
+                            className={`editorial-figure-status editorial-figure-status--${item.status}`}
+                          >
+                            {STATUS_LABELS[item.status]}
+                            {item.already_used ? " · Déjà utilisée" : ""}
+                          </p>
+                          {item.exclusion_reason ? (
+                            <p
+                              id={`figure-exclusion-${item.figure_id}`}
+                              className="editorial-figure-card__reason"
+                            >
+                              {item.exclusion_reason}
+                            </p>
+                          ) : null}
+                          <div className="editorial-figure-card__actions">
+                            <label className="editorial-figure-card__checkbox">
+                              <input
+                                type="checkbox"
+                                checked={selectedIds.has(item.figure_id)}
+                                disabled={!item.selectable || disabledByLimit}
+                                onChange={() => toggleSelected(item)}
+                                aria-label={`Sélectionner ${item.original_name}`}
+                                aria-describedby={
+                                  descriptions.length > 0
+                                    ? descriptions.join(" ")
+                                    : undefined
+                                }
+                              />
+                              <span>
+                                {selectedIds.has(item.figure_id)
+                                  ? "Sélectionnée"
+                                  : "Sélectionner"}
+                              </span>
+                            </label>
+                            <button
+                              className="button button--secondary"
+                              type="button"
+                              onClick={() => setPreviewFigureId(item.figure_id)}
+                            >
+                              Aperçu détaillé
+                            </button>
+                          </div>
+                        </div>
+                      </article>
+                    </li>
+                  );
+                })}
               </ul>
               {previewFigureId ? (
                 <aside

@@ -20,6 +20,7 @@ interface EditorialInspectorProps {
   onOpenSources: () => void;
   onOpenFigureGallery: () => void;
   onStartEditing: (blockId: string) => void;
+  onRefresh: () => void;
   onBackToDocument: () => void;
   onChangeTarget: () => void;
 }
@@ -63,6 +64,7 @@ function BlockActionToolbar({
   readOnly,
   onOpenSources,
   onStartEditing,
+  onRefresh,
   onAskBridge,
 }: {
   snapshot: EditorialWorkspaceSnapshot;
@@ -70,6 +72,7 @@ function BlockActionToolbar({
   readOnly: boolean;
   onOpenSources: () => void;
   onStartEditing: (blockId: string) => void;
+  onRefresh: () => void;
   onAskBridge: (instruction: string) => void;
 }) {
   const operations = new Set(block.allowed_operations);
@@ -96,6 +99,8 @@ function BlockActionToolbar({
     "sources",
     "read_evidence",
     "create_table",
+    "create_bar_chart",
+    "create_source_figure",
   ]);
   const hasAdditionalOperations =
     !readOnly &&
@@ -133,6 +138,7 @@ function BlockActionToolbar({
           block={block}
           readOnly={readOnly}
           onAskBridge={onAskBridge}
+          onRefresh={onRefresh}
         />
       ) : null}
       {canViewSources ? (
@@ -169,6 +175,7 @@ export function EditorialInspector({
   onOpenSources,
   onOpenFigureGallery,
   onStartEditing,
+  onRefresh,
   onBackToDocument,
   onChangeTarget,
 }: EditorialInspectorProps) {
@@ -224,6 +231,7 @@ export function EditorialInspector({
               readOnly={readOnly}
               onOpenSources={onOpenSources}
               onStartEditing={onStartEditing}
+              onRefresh={onRefresh}
               onAskBridge={setBridgeProposalPrompt}
             />
             <EditorialConversation

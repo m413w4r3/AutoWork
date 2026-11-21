@@ -5,6 +5,7 @@ import type {
   EditorialWorkspaceSnapshot,
 } from "../../api/editorialWorkspace";
 import { BarChartInsertionPanel } from "./BarChartInsertionPanel";
+import { FigureInsertionPanel } from "./FigureInsertionPanel";
 import { TableInsertionPanel } from "./TableInsertionPanel";
 
 interface VisualInsertionComposerProps {
@@ -13,6 +14,7 @@ interface VisualInsertionComposerProps {
   block: EditorialWorkspaceBlock;
   readOnly: boolean;
   onAskBridge?: (instruction: string) => void;
+  onRefresh?: () => void;
 }
 
 function isParagraphAnchor(block: EditorialWorkspaceBlock): boolean {
@@ -25,10 +27,13 @@ export function VisualInsertionComposer({
   block,
   readOnly,
   onAskBridge,
+  onRefresh,
 }: VisualInsertionComposerProps) {
   const addButtonRef = useRef<HTMLButtonElement>(null);
   const [menuOpen, setMenuOpen] = useState(false);
-  const [editorMode, setEditorMode] = useState<"table" | "chart" | null>(null);
+  const [editorMode, setEditorMode] = useState<
+    "table" | "chart" | "figure" | null
+  >(null);
   const canInsertAfter =
     !readOnly &&
     snapshot.capabilities.can_add_enrichment &&
@@ -38,6 +43,8 @@ export function VisualInsertionComposer({
     canInsertAfter && block.allowed_operations.includes("create_table");
   const canCreateBarChart =
     canInsertAfter && block.allowed_operations.includes("create_bar_chart");
+  const canCreateFigure =
+    canInsertAfter && block.allowed_operations.includes("create_source_figure");
 
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
@@ -122,6 +129,29 @@ export function VisualInsertionComposer({
                 : " l’opération n’est pas autorisée par l’instantané."}
             </p>
           ) : null}
+          <button
+            type="button"
+            role="menuitem"
+            disabled={!canCreateFigure}
+            onClick={() => {
+              if (!canCreateFigure) return;
+              setMenuOpen(false);
+              setEditorMode("figure");
+            }}
+          >
+            Image issue des sources
+          </button>
+          {!canCreateFigure ? (
+            <p
+              className="editorial-visual-insertion__bridge-reason"
+              role="note"
+            >
+              Images sources indisponibles pour ce paragraphe :
+              {block.allowed_operations.includes("create_source_figure")
+                ? " la préparation de l’insertion n’est pas disponible."
+                : " l’opération n’est pas autorisée par l’instantané."}
+            </p>
+          ) : null}
         </div>
       ) : null}
       <TableInsertionPanel
@@ -142,6 +172,16 @@ export function VisualInsertionComposer({
         onClose={closePanel}
         onSwitchToTable={() => setEditorMode("table")}
       />
+      {editorMode === "figure" ? (
+        <FigureInsertionPanel
+          subjectId={subjectId}
+          snapshot={snapshot}
+          block={block}
+          canCreateFigure={canCreateFigure}
+          onClose={closePanel}
+          onRefresh={onRefresh ?? (() => undefined)}
+        />
+      ) : null}
     </div>
   );
 }

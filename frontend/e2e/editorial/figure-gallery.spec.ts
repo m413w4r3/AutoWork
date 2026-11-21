@@ -342,7 +342,7 @@ test("galerie figures: états bornés, sélection locale et aperçu détaillé �
   await gallery
     .getByRole("checkbox", { name: "Sélectionner Carte des flux réseau" })
     .check();
-  await expect(gallery.getByText("Sélectionnées : 1")).toBeVisible();
+  await expect(gallery.getByText("1 image sélectionnée")).toBeVisible();
   await page.screenshot({
     path: resolve(screenshotDirectory, "galerie-1440x1000.png"),
   });
@@ -359,7 +359,7 @@ test("galerie figures: états bornés, sélection locale et aperçu détaillé �
     gallery.getByText("Contexte précédent conservé depuis la source."),
   ).toBeVisible();
   await expect(gallery.getByText("Page 1 · Infrastructure")).toBeVisible();
-  await expect(gallery.getByText("Sélectionnées : 1")).toBeVisible();
+  await expect(gallery.getByText("1 image sélectionnée")).toBeVisible();
   await page.screenshot({
     path: resolve(screenshotDirectory, "apercu-detaille-1440x1000.png"),
   });

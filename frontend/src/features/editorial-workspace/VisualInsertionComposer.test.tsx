@@ -564,4 +564,39 @@ describe("VisualInsertionComposer", () => {
     await waitFor(() => expect(proposalRequests).toHaveLength(4));
     expect(keyFor(proposalRequests[3]!)).not.toBe(keyFor(proposalRequests[2]!));
   });
+
+  it("requires the snapshot create_source_figure operation before opening the figure flow", () => {
+    const noFigureOperation = {
+      ...anchor,
+      allowed_operations: ["insert_after", "create_table"],
+    };
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <VisualInsertionComposer
+          subjectId="subject-1"
+          snapshot={snapshot}
+          block={noFigureOperation}
+          readOnly={false}
+        />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Ajouter après" }));
+    const figureMenuItem = screen.getByRole("menuitem", {
+      name: "Image issue des sources",
+    });
+    expect(figureMenuItem).toBeDisabled();
+    expect(
+      screen.getByText(
+        "Images sources indisponibles pour ce paragraphe : l’opération n’est pas autorisée par l’instantané.",
+      ),
+    ).toBeVisible();
+    fireEvent.click(figureMenuItem);
+    expect(
+      screen.queryByRole("region", { name: "Intégrer des images sources" }),
+    ).not.toBeInTheDocument();
+  });
 });

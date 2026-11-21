@@ -6,6 +6,8 @@ import {
   acceptEditorialProposal,
   getEditorialProposal,
   rejectEditorialProposal,
+  editorialFigureThumbnailUrl,
+  type EditorialManualSourceFigurePatchReference,
   type EditorialProposalPatch,
   type EditorialProposalRead,
   type EditorialProposalRefusalCode,
@@ -54,6 +56,15 @@ function tableFromPatch(
   if (patch?.operation !== "create_table") return null;
   const tables = patch.enrichment_patch?.tables;
   return tables?.length === 1 ? (tables[0] ?? null) : null;
+}
+
+function sourceFiguresFromPatch(
+  patch: EditorialProposalPatch | null,
+): EditorialManualSourceFigurePatchReference[] | null {
+  if (patch?.operation !== "create_source_figure") return null;
+  const figures = patch.enrichment_patch?.manual_source_figures;
+  if (!figures || figures.length === 0) return null;
+  return [...figures].sort((left, right) => left.order - right.order);
 }
 
 interface BarChartProposalPoint {
@@ -297,6 +308,68 @@ function TableProposalComparison({
   );
 }
 
+function SourceFigureProposalComparison({
+  subjectId,
+  figures,
+  anchorText,
+}: {
+  subjectId: string;
+  figures: EditorialManualSourceFigurePatchReference[];
+  anchorText: string | undefined;
+}) {
+  return (
+    <section
+      className="editorial-proposal-card__figure-comparison"
+      aria-labelledby="editorial-proposal-figure-heading"
+    >
+      <div className="editorial-proposal-card__table-anchor">
+        <h5>Paragraphe d’ancrage</h5>
+        <p>{anchorText || "Paragraphe sélectionné"}</p>
+      </div>
+      <p className="editorial-proposal-card__table-placement">
+        Après ce paragraphe
+      </p>
+      <div className="editorial-proposal-card__figure-proposed">
+        <h5 id="editorial-proposal-figure-heading">
+          Comparaison de l’insertion de figures
+        </h5>
+        <ol>
+          {figures.map((figure) => (
+            <li key={`${figure.figure_id}-${figure.order}`}>
+              <figure className="editorial-proposal-card__source-figure">
+                <img
+                  src={editorialFigureThumbnailUrl(subjectId, figure.figure_id)}
+                  alt={figure.caption}
+                  loading="lazy"
+                />
+                <figcaption>{figure.caption}</figcaption>
+                <p>
+                  <strong>Source · </strong>
+                  {figure.source_url}
+                </p>
+                <p>
+                  <strong>Provenance · </strong>
+                  {figure.provenance}
+                </p>
+                <p>
+                  {figure.width} × {figure.height} px · {figure.mime_type} ·{" "}
+                  {figure.byte_size} octets
+                </p>
+                <details>
+                  <summary>Preuves et détails de l’archive</summary>
+                  <p>Source document · {figure.source_document_id}</p>
+                  <p>Figure · {figure.figure_id}</p>
+                  <p>SHA-256 · {figure.sha256}</p>
+                </details>
+              </figure>
+            </li>
+          ))}
+        </ol>
+      </div>
+    </section>
+  );
+}
+
 export function EditorialProposalCard({
   subjectId,
   occurrenceId,
@@ -409,6 +482,7 @@ export function EditorialProposalCard({
   const proposedText = proposal.patch?.after;
   const tableProposal = tableFromPatch(proposal.patch);
   const barChartProposal = barChartFromPatch(proposal.patch);
+  const sourceFigureProposal = sourceFiguresFromPatch(proposal.patch);
   const acceptanceConflict =
     acceptMutation.isError &&
     acceptMutation.error instanceof ApiError &&
@@ -449,6 +523,12 @@ export function EditorialProposalCard({
           chart={barChartProposal}
           anchorText={anchorText}
           evidenceRefs={proposal.patch?.evidence_refs}
+        />
+      ) : sourceFigureProposal ? (
+        <SourceFigureProposalComparison
+          subjectId={subjectId}
+          figures={sourceFigureProposal}
+          anchorText={anchorText}
         />
       ) : typeof proposedText === "string" ? (
         typeof proposal.base_text === "string" ? (

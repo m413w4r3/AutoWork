@@ -170,7 +170,7 @@ describe("SourceFigureGallery", () => {
     ).toBeVisible();
 
     await user.click(available);
-    expect(within(dialog).getByText("Sélectionnées : 1")).toBeVisible();
+    expect(within(dialog).getByText("1 image sélectionnée")).toBeVisible();
     await user.click(
       within(dialog).getAllByRole("button", { name: "Aperçu détaillé" })[0]!,
     );
@@ -180,7 +180,7 @@ describe("SourceFigureGallery", () => {
     expect(
       screen.getByRole("heading", { name: "Aperçu détaillé" }),
     ).toHaveFocus();
-    expect(within(dialog).getByText("Sélectionnées : 1")).toBeVisible();
+    expect(within(dialog).getByText("1 image sélectionnée")).toBeVisible();
     expect(fetchMock).toHaveBeenCalledWith(
       expect.stringContaining(`/editor/figures/${AVAILABLE_ID}/preview`),
       expect.objectContaining({ cache: "no-store" }),

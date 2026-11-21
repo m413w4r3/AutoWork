@@ -1,8 +1,83 @@
-import type { EditorialWorkspaceSnapshot } from "../../api/editorialWorkspace";
+import { useState } from "react";
+
+import {
+  editorialFigureThumbnailUrl,
+  type EditorialWorkspaceFigure,
+  type EditorialWorkspaceSnapshot,
+} from "../../api/editorialWorkspace";
 import { BLOCK_KIND_LABELS } from "./blockKindLabels";
 import { InlineTextEditor } from "./InlineTextEditor";
 import type { InlineTextEditorProps } from "./InlineTextEditor";
 import { ManualBarChartPreview } from "./ManualBarChartPreview";
+
+const ADOPTED_SOURCE_FIGURE_KEY_PREFIX = "adopted_source_figure_";
+
+function adoptedFigureId(key: string): string | null {
+  if (!key.startsWith(ADOPTED_SOURCE_FIGURE_KEY_PREFIX)) return null;
+  const compactId = key.slice(ADOPTED_SOURCE_FIGURE_KEY_PREFIX.length);
+  return /^[0-9a-f]{32}$/i.test(compactId) ? compactId : null;
+}
+
+function EditorialSourceFigure({
+  subjectId,
+  figure,
+  allowedOperations,
+}: {
+  subjectId: string;
+  figure: EditorialWorkspaceFigure;
+  allowedOperations: string[];
+}) {
+  const figureId = adoptedFigureId(figure.key);
+  const [imageUnavailable, setImageUnavailable] = useState(false);
+  return (
+    <figure
+      className="editorial-document__source-figure"
+      aria-label={figure.caption}
+    >
+      {figureId && !imageUnavailable ? (
+        <img
+          src={editorialFigureThumbnailUrl(subjectId, figureId)}
+          alt={figure.caption}
+          loading="lazy"
+          onError={() => setImageUnavailable(true)}
+        />
+      ) : (
+        <p className="editorial-document__figure-unavailable" role="status">
+          Image locale indisponible dans l’archive.
+        </p>
+      )}
+      <figcaption>{figure.caption}</figcaption>
+      {figure.source ? (
+        <p className="editorial-document__figure-source">{figure.source}</p>
+      ) : null}
+      <p className="editorial-document__figure-provenance">
+        {figure.provenance}
+      </p>
+      {figure.width && figure.height ? (
+        <p className="editorial-document__figure-dimensions">
+          {figure.width} × {figure.height} px · {figure.mime_type}
+        </p>
+      ) : null}
+      <details className="editorial-document__figure-details">
+        <summary>Provenance et détails de l’archive</summary>
+        <p>Source · {figure.source_url}</p>
+        {figure.page ? <p>Page · {figure.page}</p> : null}
+        {figure.section ? <p>Section · {figure.section}</p> : null}
+        <p>
+          Type · {figure.mime_type} · {figure.byte_size} octets
+        </p>
+        <p>SHA-256 · {figure.sha256}</p>
+        {!allowedOperations.includes("delete_source_figure") &&
+        !allowedOperations.includes("replace_source_figure") ? (
+          <p>
+            Retrait et remplacement indisponibles : aucune opération n’est
+            déclarée par l’instantané serveur.
+          </p>
+        ) : null}
+      </details>
+    </figure>
+  );
+}
 
 interface EditorialDocumentProps {
   snapshot: EditorialWorkspaceSnapshot;
@@ -17,8 +92,20 @@ interface EditorialDocumentProps {
   onSave?: InlineTextEditorProps["onSave"];
 }
 
-function blockContent(block: EditorialWorkspaceSnapshot["blocks"][number]) {
+function blockContent(
+  subjectId: string,
+  block: EditorialWorkspaceSnapshot["blocks"][number],
+) {
   const className = "editorial-document__text";
+  if (block.kind === "figure" && block.figure?.status === "included") {
+    return (
+      <EditorialSourceFigure
+        subjectId={subjectId}
+        figure={block.figure}
+        allowedOperations={block.allowed_operations}
+      />
+    );
+  }
   if (block.kind === "chart" && block.chart) {
     return (
       <section
@@ -172,7 +259,7 @@ export function EditorialDocument({
                 onSave={onSave}
               />
             ) : (
-              blockContent(block)
+              blockContent(snapshot.subject_id, block)
             )}
             {hasDraft && !editing ? (
               <div className="editorial-document__draft-actions">

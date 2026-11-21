@@ -413,6 +413,7 @@ export function EditorialWorkspaceLayout({
                 onLocalDraftChange(selectedBlock.block_id, text);
             }}
             onStartEditing={startEditing}
+            onRefresh={onRefresh}
             onOpenSources={showSources}
             onOpenFigureGallery={() => setFigureGalleryOpen(true)}
             onBackToDocument={closeActiveOverlay}

@@ -275,4 +275,89 @@ describe("EditorialDocument", () => {
     fireEvent.click(screen.getByText(/Sources du point 1/));
     expect(screen.getByText(/d{64}/)).toBeVisible();
   });
+
+  it("renders included figures in the exact snapshot order with local images and provenance", () => {
+    const anchorBlock = snapshot.blocks[0];
+    const followingBlock = snapshot.blocks[1];
+    if (!anchorBlock || !followingBlock) {
+      throw new Error("Expected the synthetic paragraph blocks");
+    }
+    const figureBlock = {
+      block_id: "inserted-figure-occurrence",
+      kind: "figure" as const,
+      parent_block_id: null,
+      position: 1,
+      text: "Schéma réseau annoté",
+      evidence_refs: [],
+      chart: null,
+      figure: {
+        key: "adopted_source_figure_11111111111141118111111111111111",
+        caption: "Schéma réseau annoté",
+        source_url: "https://source.example/report",
+        source: "Rapport synthétique",
+        provenance: "Figure archivée, vérifiée et conservée depuis le rapport.",
+        sha256: "f".repeat(64),
+        mime_type: "image/png",
+        byte_size: 1024,
+        width: 800,
+        height: 450,
+        status: "included" as const,
+        order: 0,
+        anchor_block_id: anchorBlock.block_id,
+        placement: "after_paragraph" as const,
+        page: 4,
+        section: "Infrastructure",
+      },
+      revision_target: {
+        block_id: "inserted-figure-occurrence",
+        legacy_target_id: null,
+      },
+      before_hash: null,
+      allowed_operations: [],
+      revision_status: "ready" as const,
+    };
+    const orderedSnapshot: EditorialWorkspaceSnapshot = {
+      ...snapshot,
+      blocks: [anchorBlock, figureBlock, followingBlock],
+    };
+
+    const { container } = render(
+      <EditorialDocument
+        snapshot={orderedSnapshot}
+        selectedBlockId={null}
+        drafts={{}}
+        staleDraftIds={new Set()}
+        editingBlockId={null}
+        onSelectBlock={() => undefined}
+        onDraftChange={() => undefined}
+        onResumeDraft={() => undefined}
+        onCancelDraft={() => undefined}
+      />,
+    );
+
+    const orderedIds = Array.from(
+      container.querySelectorAll<HTMLElement>(".editorial-document__block"),
+    ).map((block) => block.dataset.blockId);
+    expect(orderedIds).toEqual([
+      anchorBlock.block_id,
+      figureBlock.block_id,
+      followingBlock.block_id,
+    ]);
+    expect(
+      screen.getByRole("figure", { name: "Schéma réseau annoté" }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("img", { name: "Schéma réseau annoté" }),
+    ).toHaveAttribute(
+      "src",
+      "/api/subjects/subject-1/editor/figures/11111111111141118111111111111111/thumbnail",
+    );
+    expect(screen.getByText("Rapport synthétique")).toBeVisible();
+    expect(
+      screen.getByText(
+        "Figure archivée, vérifiée et conservée depuis le rapport.",
+      ),
+    ).toBeVisible();
+    expect(screen.getByText("800 × 450 px · image/png")).toBeVisible();
+  });
 });
