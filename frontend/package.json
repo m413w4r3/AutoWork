@@ -11,7 +11,8 @@
     "typecheck": "tsc -b --pretty false",
     "format": "prettier --write .",
     "test": "vitest",
-    "test:e2e": "playwright test",
+    "test:e2e": "playwright test && pnpm test:e2e:editorial",
+    "test:e2e:editorial": "playwright test --config playwright.editorial.config.ts",
     "test:e2e:real": "playwright test -c playwright.real.config.ts"
   },
   "dependencies": {
