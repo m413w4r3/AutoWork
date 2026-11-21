@@ -1351,3 +1351,148 @@ class _FakeUnitOfWork:
 
     async def commit(self) -> None:
         return None
+
+
+def _order_fixture_synthesis() -> dict[str, object]:
+    return _synthesis(
+        (
+            _paragraph("first paragraph"),
+            _paragraph("anchor paragraph"),
+            _paragraph("last paragraph"),
+        )
+    )
+
+
+def _order_fixture_enrichment(
+    anchor_block_id: UUID, *, explicit: bool = False
+) -> dict[str, object]:
+    def group_order(value: int | None) -> dict[str, int]:
+        return {} if value is None else {"group_order": value}
+
+    after_paragraph = {
+        "kind": "after_paragraph",
+        "anchor_block_id": str(anchor_block_id),
+    }
+    after_section = {"kind": "after_section", "section_index": 0}
+    return {
+        "tables": [
+            {
+                "key": "table_anchor",
+                "placement": after_paragraph,
+                **group_order(1 if explicit else None),
+            },
+            {
+                "key": "table_end",
+                "placement": after_section,
+            },
+        ],
+        "diagrams": [],
+        "charts": [],
+        "source_figures": [
+            {
+                "key": "figure_z",
+                "order": 1,
+                "placement": after_paragraph,
+                **group_order(2 if explicit else None),
+            },
+            {
+                "key": "figure_a",
+                "order": 0,
+                "placement": after_paragraph,
+                **group_order(0 if explicit else None),
+            },
+            {
+                "key": "figure_end",
+                "placement": after_section,
+            },
+        ],
+    }
+
+
+def _project_order_fixture(
+    *, explicit: bool
+) -> tuple[
+    list[dict[str, object]],
+    list[dict[str, object]],
+    dict[UUID, str],
+]:
+    synthesis = _order_fixture_synthesis()
+    synthesis_entries = bootstrap_block_registry(
+        artifact_id=uuid4(),
+        canonical_sha256="6" * 64,
+        source_stage="synthesis",
+        canonical_content=synthesis,
+    )
+    anchor = next(
+        entry
+        for entry in synthesis_entries
+        if entry.structural_pointer == "/sections/0/paragraphs/1"
+    )
+    enrichment = _order_fixture_enrichment(anchor.block_id, explicit=explicit)
+    enrichment_entries = bootstrap_block_registry(
+        artifact_id=uuid4(),
+        canonical_sha256="7" * 64,
+        source_stage="editorial_enrichment",
+        canonical_content=enrichment,
+    )
+    entries = (*synthesis_entries, *enrichment_entries)
+    blocks, enrichments, _outline = project_blocks(
+        entries=entries,
+        synthesis=synthesis,
+        enrichment=enrichment,
+        record=_snapshot_record(entries),
+    )
+    key_by_block_id = {
+        entry.block_id: str(
+            enrichment[entry.structural_pointer.split("/")[1]][
+                int(entry.structural_pointer.split("/")[2])
+            ]["key"]
+        )
+        for entry in enrichment_entries
+    }
+    return blocks, enrichments, key_by_block_id
+
+
+def _enrichment_key(block: dict[str, object], keys: dict[UUID, str]) -> str:
+    return keys[UUID(str(block["block_id"]))]
+
+
+def test_snapshot_legacy_order_ignores_figure_order_and_matches_the_pdf() -> None:
+    blocks, enrichments, keys = _project_order_fixture(explicit=False)
+
+    anchor_index = next(
+        index for index, block in enumerate(blocks) if block.get("text") == "anchor paragraph"
+    )
+    ordered_keys = [
+        _enrichment_key(block, keys)
+        for block in blocks[anchor_index + 1 :]
+        if block["kind"] in {"table", "figure"}
+    ]
+    # after_paragraph rank is (family-local index, key): figure_z (index 0)
+    # precedes table_anchor (index 0, key after f) which precedes figure_a
+    # (index 1). The declared figure.order values are deliberately reversed.
+    assert ordered_keys[:3] == ["figure_z", "table_anchor", "figure_a"]
+    # after_section rank is (family rank, family-local index, key).
+    assert ordered_keys[-2:] == ["table_end", "figure_end"]
+    assert [_enrichment_key(block, keys) for block in enrichments] == [
+        "figure_z",
+        "table_anchor",
+        "figure_a",
+        "table_end",
+        "figure_end",
+    ]
+
+
+def test_snapshot_explicit_group_order_orders_the_after_paragraph_group() -> None:
+    blocks, _enrichments, keys = _project_order_fixture(explicit=True)
+
+    anchor_index = next(
+        index for index, block in enumerate(blocks) if block.get("text") == "anchor paragraph"
+    )
+    ordered_keys = [
+        _enrichment_key(block, keys)
+        for block in blocks[anchor_index + 1 :]
+        if block["kind"] in {"table", "figure"}
+    ]
+    assert ordered_keys[:3] == ["figure_a", "table_anchor", "figure_z"]
+    assert ordered_keys[-2:] == ["table_end", "figure_end"]

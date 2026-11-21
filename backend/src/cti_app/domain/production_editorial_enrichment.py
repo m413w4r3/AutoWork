@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date as Date
 from datetime import datetime as DateTime
 from decimal import Decimal, InvalidOperation
@@ -28,7 +28,10 @@ from cti_app.domain.semantic_annotation import (
     semantic_annotation_proposal_to_json,
 )
 
+# V11 is readable and editable but is only written when an element carries an
+# explicit ``group_order`` (reorder, or a create/move into an already ordered group).
 EDITORIAL_ENRICHMENT_SCHEMA_VERSION = 10
+EDITORIAL_ENRICHMENT_MAX_SCHEMA_VERSION = 11
 EDITORIAL_ENRICHMENT_V1_POLICY_VERSION = "editorial-enrichment-v1"
 EDITORIAL_ENRICHMENT_V2_POLICY_VERSION = "editorial-enrichment-v2-semantic-annotations"
 EDITORIAL_ENRICHMENT_V3_POLICY_VERSION = "editorial-enrichment-v3-figures-resource-proposals"
@@ -42,6 +45,7 @@ EDITORIAL_ENRICHMENT_V8_CURRENT_POLICY_VERSION = (
 )
 EDITORIAL_ENRICHMENT_V9_POLICY_VERSION = "editorial-enrichment-v13-after-paragraph-anchors"
 EDITORIAL_ENRICHMENT_V10_POLICY_VERSION = "editorial-enrichment-v14-evidence-backed-bar-charts"
+EDITORIAL_ENRICHMENT_V11_POLICY_VERSION = "editorial-enrichment-v15-element-order"
 EDITORIAL_ENRICHMENT_POLICY_VERSION = EDITORIAL_ENRICHMENT_V10_POLICY_VERSION
 BAR_CHART_INSUFFICIENT_DATA_MESSAGE = (
     "Aucun graphique quantitatif vérifiable ne peut être créé à partir des preuves actuelles. "
@@ -114,6 +118,14 @@ def _key(value: Any, label: str) -> str:
     if _KEY.fullmatch(text) is None:
         raise ValueError(f"{label} must match the editorial key format")
     return text
+
+
+def _group_order(value: Any, label: str) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{label} must be a non-negative integer or null")
+    return value
 
 
 def _normalize_evidence_refs(
@@ -295,6 +307,7 @@ class ChartSpecV1:
     category_axis_label: str | None = None
     value_axis_label: str | None = None
     unit: str | None = None
+    group_order: int | None = None
 
     def __post_init__(self) -> None:
         _key(self.key, "Chart key")
@@ -354,6 +367,7 @@ class ChartSpecV1:
                 raise ValueError("Editorial bar chart category labels must be unique")
         if self.compiled_asset_id is not None and not isinstance(self.compiled_asset_id, UUID):
             raise ValueError("Compiled chart asset identity must be a UUID")
+        _group_order(self.group_order, "Chart group order")
 
 
 class BarChartInsufficientDataError(ValueError):
@@ -400,6 +414,7 @@ class TableSpecV1:
     rows: tuple[TableRowV1, ...]
     placement: EnrichmentPlacementV1
     purpose: EditorialAnalyticPurposeV1 | None = None
+    group_order: int | None = None
 
     def __post_init__(self) -> None:
         _key(self.key, "Table key")
@@ -431,6 +446,7 @@ class TableSpecV1:
             raise ValueError("Table placement is invalid")
         if self.purpose is not None and not isinstance(self.purpose, EditorialAnalyticPurposeV1):
             raise ValueError("Table analytic purpose is invalid")
+        _group_order(self.group_order, "Table group order")
 
 
 class EnrichmentDiagramKind(StrEnum):
@@ -604,6 +620,7 @@ class DiagramSpecV1:
     compiled_asset_id: UUID | None = None
     purpose: EditorialAnalyticPurposeV1 | None = None
     profile: DiagramProfile | None = None
+    group_order: int | None = None
 
     def __post_init__(self) -> None:
         _key(self.key, "Diagram key")
@@ -659,6 +676,7 @@ class DiagramSpecV1:
             raise ValueError("Diagram analytic purpose is invalid")
         if self.profile is not None and not isinstance(self.profile, DiagramProfile):
             raise ValueError("Diagram profile is invalid")
+        _group_order(self.group_order, "Diagram group order")
 
 
 class SourceFigureInclusionStatus(StrEnum):
@@ -908,6 +926,7 @@ class SourceFigureCandidateV1:
     width: int | None = None
     height: int | None = None
     order: int | None = None
+    group_order: int | None = None
 
     def __post_init__(self) -> None:
         _key(self.key, "Source figure key")
@@ -940,6 +959,7 @@ class SourceFigureCandidateV1:
             raise ValueError("Source figure height must be a positive integer")
         if self.order is not None and (type(self.order) is not int or self.order < 0):
             raise ValueError("Source figure order must be a non-negative integer")
+        _group_order(self.group_order, "Source figure group order")
 
 
 @dataclass(frozen=True, slots=True)
@@ -973,6 +993,7 @@ class EditorialEnrichmentV1:
             8,
             9,
             10,
+            11,
         }:
             raise ValueError("Editorial enrichment schema version is unsupported")
         if not isinstance(self.subject_id, UUID):
@@ -1006,6 +1027,8 @@ class EditorialEnrichmentV1:
             if self.schema_version == 9
             else {EDITORIAL_ENRICHMENT_V10_POLICY_VERSION}
             if self.schema_version == 10
+            else {EDITORIAL_ENRICHMENT_V11_POLICY_VERSION}
+            if self.schema_version == 11
             else {expected_policy}
         )
         if self.enrichment_policy_version not in supported_policies:
@@ -1082,6 +1105,25 @@ class EditorialEnrichmentV1:
         ]
         if len(keys) != len(set(keys)):
             raise ValueError("Editorial enrichment keys must be globally unique")
+        elements: list[TableSpecV1 | DiagramSpecV1 | ChartSpecV1 | SourceFigureCandidateV1] = [
+            *self.tables,
+            *self.diagrams,
+            *self.charts,
+            *self.source_figures,
+        ]
+        ordered_elements = [item for item in elements if item.group_order is not None]
+        if self.schema_version < 11 and ordered_elements:
+            raise ValueError("Legacy editorial enrichment cannot contain element order")
+        if any(
+            item.placement.kind is not EnrichmentPlacementKind.AFTER_PARAGRAPH
+            for item in ordered_elements
+        ):
+            raise ValueError("Explicit editorial enrichment order requires a paragraph anchor")
+        group_order_keys = [(item.placement, item.group_order) for item in ordered_elements]
+        if len(group_order_keys) != len(set(group_order_keys)):
+            raise ValueError(
+                "Editorial enrichment group order must be unique within a placement group"
+            )
         if self.schema_version >= 4:
             required_purposes = [table.purpose for table in self.tables] + [
                 diagram.purpose for diagram in self.diagrams
@@ -1100,6 +1142,321 @@ class EditorialEnrichmentV1:
             if any(not question for question in questions) or len(questions) != len(set(questions)):
                 raise ValueError("Editorial enrichment analytic questions must be distinct")
         object.__setattr__(self, "warnings", tuple(sorted(set(self.warnings))))
+
+
+ENRICHMENT_ELEMENT_FAMILY_ORDER: tuple[EditorialEnrichmentElementKind, ...] = (
+    EditorialEnrichmentElementKind.TABLE,
+    EditorialEnrichmentElementKind.DIAGRAM,
+    EditorialEnrichmentElementKind.CHART,
+    EditorialEnrichmentElementKind.FIGURE,
+)
+_ENRICHMENT_FAMILY_RANK = {kind: rank for rank, kind in enumerate(ENRICHMENT_ELEMENT_FAMILY_ORDER)}
+_PLACEMENT_GROUP_RANK = {
+    EnrichmentPlacementKind.AFTER_LEAD: 0,
+    EnrichmentPlacementKind.AFTER_SECTION: 1,
+    EnrichmentPlacementKind.AFTER_PARAGRAPH: 2,
+    EnrichmentPlacementKind.AFTER_TIMELINE: 3,
+    EnrichmentPlacementKind.END: 4,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class EnrichmentElementRef:
+    """Identity of one enrichment element inside the canonical order."""
+
+    kind: EditorialEnrichmentElementKind
+    key: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, EditorialEnrichmentElementKind):
+            raise ValueError("Enrichment element kind is invalid")
+        # Canonical element keys are stricter; the registry also ranks legacy
+        # fixtures whose fallback identity is the structural pointer.
+        _text(self.key, "Enrichment element key", semantic=True)
+
+
+@dataclass(frozen=True, slots=True)
+class EnrichmentOrderGroup:
+    """All enrichment elements sharing one placement, in canonical order."""
+
+    placement: EnrichmentPlacementV1
+    members: tuple[EnrichmentElementRef, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.placement, EnrichmentPlacementV1):
+            raise ValueError("Enrichment order group placement is invalid")
+        if not isinstance(self.members, tuple) or any(
+            not isinstance(member, EnrichmentElementRef) for member in self.members
+        ):
+            raise ValueError("Enrichment order group members are invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class EnrichmentOrderEntry:
+    """Ordering inputs for one element, independent of its representation.
+
+    ``family_index`` is the element's index inside its own family tuple. It is
+    the legacy PDF order for old artifacts and the fallback order for elements
+    without an explicit ``group_order``.
+    """
+
+    kind: EditorialEnrichmentElementKind
+    key: str
+    placement: EnrichmentPlacementV1
+    family_index: int
+    group_order: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, EditorialEnrichmentElementKind):
+            raise ValueError("Enrichment order entry kind is invalid")
+        _text(self.key, "Enrichment order entry key", semantic=True)
+        if not isinstance(self.placement, EnrichmentPlacementV1):
+            raise ValueError("Enrichment order entry placement is invalid")
+        if type(self.family_index) is not int or self.family_index < 0:
+            raise ValueError("Enrichment order entry family index is invalid")
+        _group_order(self.group_order, "Enrichment order entry group order")
+
+
+def _placement_group_sort_key(
+    placement: EnrichmentPlacementV1,
+) -> tuple[int, int, str]:
+    return (
+        _PLACEMENT_GROUP_RANK[placement.kind],
+        placement.section_index if placement.section_index is not None else -1,
+        str(placement.anchor_block_id) if placement.anchor_block_id is not None else "",
+    )
+
+
+def _legacy_element_sort_key(entry: EnrichmentOrderEntry) -> tuple[int | str, ...]:
+    """Reproduce the historical PDF order for elements without explicit order.
+
+    ``after_paragraph`` groups use the family-local index, exactly like the
+    publication assembly sort before V11. Every other placement uses the Typst
+    family-loop order (tables, diagrams, charts, figures) then the family-local
+    index. Source figure ``order`` is deliberately not consulted at any schema
+    version: the workshop snapshot and the PDF previously disagreed on it.
+    """
+    if entry.placement.kind is EnrichmentPlacementKind.AFTER_PARAGRAPH:
+        return (entry.family_index, entry.key)
+    return (_ENRICHMENT_FAMILY_RANK[entry.kind], entry.family_index, entry.key)
+
+
+def _explicit_element_sort_key(entry: EnrichmentOrderEntry) -> tuple[int, str, str]:
+    if entry.group_order is None:
+        raise ValueError("An explicit enrichment order requires a group order")
+    return (entry.group_order, entry.kind.value, entry.key)
+
+
+def enrichment_order_groups(
+    entries: Iterable[EnrichmentOrderEntry],
+) -> tuple[EnrichmentOrderGroup, ...]:
+    """Return the canonical order of every element, grouped by placement.
+
+    This is the single ordering authority shared by the workshop snapshot,
+    publication assembly and Typst rendering. A group with at least one
+    explicit ``group_order`` orders its explicit members first (``group_order``,
+    kind, key) and its remaining members afterwards by the legacy key. A group
+    without any explicit order keeps the historical PDF order.
+    """
+    grouped: dict[EnrichmentPlacementV1, list[EnrichmentOrderEntry]] = {}
+    for entry in entries:
+        grouped.setdefault(entry.placement, []).append(entry)
+    groups: list[EnrichmentOrderGroup] = []
+    for placement in sorted(grouped, key=_placement_group_sort_key):
+        members = grouped[placement]
+        explicit = sorted(
+            (member for member in members if member.group_order is not None),
+            key=_explicit_element_sort_key,
+        )
+        implicit = sorted(
+            (member for member in members if member.group_order is None),
+            key=_legacy_element_sort_key,
+        )
+        groups.append(
+            EnrichmentOrderGroup(
+                placement=placement,
+                members=tuple(
+                    EnrichmentElementRef(member.kind, member.key)
+                    for member in (*explicit, *implicit)
+                ),
+            )
+        )
+    return tuple(groups)
+
+
+def enrichment_order_rank_from_entries(
+    entries: Iterable[EnrichmentOrderEntry],
+) -> Mapping[EnrichmentElementRef, int]:
+    """Rank 0..n-1 inside each placement group from raw ordering entries."""
+    ranks: dict[EnrichmentElementRef, int] = {}
+    for group in enrichment_order_groups(entries):
+        for rank, member in enumerate(group.members):
+            ranks[member] = rank
+    return ranks
+
+
+def _enrichment_order_entries(
+    enrichment: EditorialEnrichmentV1,
+) -> tuple[EnrichmentOrderEntry, ...]:
+    entries: list[EnrichmentOrderEntry] = []
+    for index, table in enumerate(enrichment.tables):
+        entries.append(
+            EnrichmentOrderEntry(
+                kind=EditorialEnrichmentElementKind.TABLE,
+                key=table.key,
+                placement=table.placement,
+                family_index=index,
+                group_order=table.group_order,
+            )
+        )
+    for index, diagram in enumerate(enrichment.diagrams):
+        entries.append(
+            EnrichmentOrderEntry(
+                kind=EditorialEnrichmentElementKind.DIAGRAM,
+                key=diagram.key,
+                placement=diagram.placement,
+                family_index=index,
+                group_order=diagram.group_order,
+            )
+        )
+    for index, chart in enumerate(enrichment.charts):
+        entries.append(
+            EnrichmentOrderEntry(
+                kind=EditorialEnrichmentElementKind.CHART,
+                key=chart.key,
+                placement=chart.placement,
+                family_index=index,
+                group_order=chart.group_order,
+            )
+        )
+    for index, figure in enumerate(enrichment.source_figures):
+        entries.append(
+            EnrichmentOrderEntry(
+                kind=EditorialEnrichmentElementKind.FIGURE,
+                key=figure.key,
+                placement=figure.placement,
+                family_index=index,
+                group_order=figure.group_order,
+            )
+        )
+    return tuple(entries)
+
+
+def enrichment_element_order(
+    enrichment: EditorialEnrichmentV1,
+) -> tuple[EnrichmentOrderGroup, ...]:
+    """Canonical order of every enrichment element, grouped by placement."""
+    if not isinstance(enrichment, EditorialEnrichmentV1):
+        raise ValueError("Expected an EditorialEnrichmentV1")
+    return enrichment_order_groups(_enrichment_order_entries(enrichment))
+
+
+def enrichment_order_rank(
+    enrichment: EditorialEnrichmentV1,
+) -> Mapping[EnrichmentElementRef, int]:
+    """Rank 0..n-1 inside each placement group for this enrichment."""
+    if not isinstance(enrichment, EditorialEnrichmentV1):
+        raise ValueError("Expected an EditorialEnrichmentV1")
+    return enrichment_order_rank_from_entries(_enrichment_order_entries(enrichment))
+
+
+def next_group_order(
+    enrichment: EditorialEnrichmentV1,
+    placement: EnrichmentPlacementV1,
+) -> int | None:
+    """Order assigned to a new element in this group (max+1), or None if legacy."""
+    if not isinstance(enrichment, EditorialEnrichmentV1):
+        raise ValueError("Expected an EditorialEnrichmentV1")
+    if not isinstance(placement, EnrichmentPlacementV1):
+        raise ValueError("Enrichment placement is invalid")
+    explicit_orders = [
+        entry.group_order
+        for entry in _enrichment_order_entries(enrichment)
+        if entry.placement == placement and entry.group_order is not None
+    ]
+    return max(explicit_orders) + 1 if explicit_orders else None
+
+
+def _replace_element(
+    enrichment: EditorialEnrichmentV1,
+    ref: EnrichmentElementRef,
+    replacement: TableSpecV1 | DiagramSpecV1 | ChartSpecV1 | SourceFigureCandidateV1,
+) -> EditorialEnrichmentV1:
+    def replaced(items: tuple[Any, ...]) -> tuple[Any, ...]:
+        if sum(item.key == ref.key for item in items) != 1:
+            raise ValueError("Editorial enrichment element not found")
+        return tuple(replacement if item.key == ref.key else item for item in items)
+
+    if ref.kind is EditorialEnrichmentElementKind.TABLE:
+        return replace(enrichment, tables=replaced(enrichment.tables))
+    if ref.kind is EditorialEnrichmentElementKind.DIAGRAM:
+        return replace(enrichment, diagrams=replaced(enrichment.diagrams))
+    if ref.kind is EditorialEnrichmentElementKind.CHART:
+        return replace(enrichment, charts=replaced(enrichment.charts))
+    return replace(enrichment, source_figures=replaced(enrichment.source_figures))
+
+
+def with_element_group_order(
+    enrichment: EditorialEnrichmentV1,
+    ref: EnrichmentElementRef,
+    group_order: int | None,
+) -> EditorialEnrichmentV1:
+    """Return a copy with one element's explicit order set or cleared.
+
+    Reorder normalizes a whole group to ``0..n-1`` through this helper. Moving
+    an element clears its order (``None``): in an explicitly ordered group it
+    then sorts after every explicitly ordered member.
+    """
+    if not isinstance(enrichment, EditorialEnrichmentV1):
+        raise ValueError("Expected an EditorialEnrichmentV1")
+    if not isinstance(ref, EnrichmentElementRef):
+        raise ValueError("Expected an EnrichmentElementRef")
+    validated = _group_order(group_order, "Element group order")
+    current: TableSpecV1 | DiagramSpecV1 | ChartSpecV1 | SourceFigureCandidateV1 | None
+    if ref.kind is EditorialEnrichmentElementKind.TABLE:
+        current = next((item for item in enrichment.tables if item.key == ref.key), None)
+    elif ref.kind is EditorialEnrichmentElementKind.DIAGRAM:
+        current = next((item for item in enrichment.diagrams if item.key == ref.key), None)
+    elif ref.kind is EditorialEnrichmentElementKind.CHART:
+        current = next((item for item in enrichment.charts if item.key == ref.key), None)
+    else:
+        current = next((item for item in enrichment.source_figures if item.key == ref.key), None)
+    if current is None:
+        raise ValueError("Editorial enrichment element not found")
+    return _replace_element(enrichment, ref, replace(current, group_order=validated))
+
+
+def clear_group_order(
+    enrichment: EditorialEnrichmentV1,
+    ref: EnrichmentElementRef,
+) -> EditorialEnrichmentV1:
+    """Clear one element's explicit order, e.g. when it is moved."""
+    return with_element_group_order(enrichment, ref, None)
+
+
+def remove_enrichment_element(
+    enrichment: EditorialEnrichmentV1,
+    ref: EnrichmentElementRef,
+) -> EditorialEnrichmentV1:
+    """Return a copy without one element; other positions and orders are kept."""
+    if not isinstance(enrichment, EditorialEnrichmentV1):
+        raise ValueError("Expected an EditorialEnrichmentV1")
+    if not isinstance(ref, EnrichmentElementRef):
+        raise ValueError("Expected an EnrichmentElementRef")
+
+    def removed(items: tuple[Any, ...]) -> tuple[Any, ...]:
+        remaining = tuple(item for item in items if item.key != ref.key)
+        if len(remaining) != len(items) - 1:
+            raise ValueError("Editorial enrichment element not found")
+        return remaining
+
+    if ref.kind is EditorialEnrichmentElementKind.TABLE:
+        return replace(enrichment, tables=removed(enrichment.tables))
+    if ref.kind is EditorialEnrichmentElementKind.DIAGRAM:
+        return replace(enrichment, diagrams=removed(enrichment.diagrams))
+    if ref.kind is EditorialEnrichmentElementKind.CHART:
+        return replace(enrichment, charts=removed(enrichment.charts))
+    return replace(enrichment, source_figures=removed(enrichment.source_figures))
 
 
 def editorial_enrichment_evidence_refs(
@@ -1181,8 +1538,13 @@ def _purpose_to_json(purpose: EditorialAnalyticPurposeV1) -> dict[str, Any]:
     }
 
 
-def _table_to_json(table: TableSpecV1, *, include_analytic: bool = False) -> dict[str, Any]:
-    payload = {
+def _table_to_json(
+    table: TableSpecV1,
+    *,
+    include_analytic: bool = False,
+    include_group_order: bool = False,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
         "key": table.key,
         "kind": table.kind.value,
         "title": table.title,
@@ -1201,6 +1563,8 @@ def _table_to_json(table: TableSpecV1, *, include_analytic: bool = False) -> dic
         if table.purpose is None:
             raise ValueError("V4 editorial table is missing its analytic purpose")
         payload["purpose"] = _purpose_to_json(table.purpose)
+    if include_group_order and table.group_order is not None:
+        payload["group_order"] = table.group_order
     return payload
 
 
@@ -1210,8 +1574,9 @@ def _diagram_to_json(
     include_analytic: bool = False,
     include_roles: bool = True,
     include_profile: bool = False,
+    include_group_order: bool = False,
 ) -> dict[str, Any]:
-    payload = {
+    payload: dict[str, Any] = {
         "key": diagram.key,
         "kind": diagram.kind.value,
         "title": diagram.title,
@@ -1239,10 +1604,17 @@ def _diagram_to_json(
         if diagram.profile is None:
             raise ValueError("V8 editorial diagram is missing its composition profile")
         payload["profile"] = diagram.profile.value
+    if include_group_order and diagram.group_order is not None:
+        payload["group_order"] = diagram.group_order
     return payload
 
 
-def _chart_to_json(chart: ChartSpecV1, *, include_quantitative: bool = False) -> dict[str, Any]:
+def _chart_to_json(
+    chart: ChartSpecV1,
+    *,
+    include_quantitative: bool = False,
+    include_group_order: bool = False,
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "key": chart.key,
         "kind": chart.kind.value,
@@ -1270,6 +1642,8 @@ def _chart_to_json(chart: ChartSpecV1, *, include_quantitative: bool = False) ->
         payload["unit"] = chart.unit
     if chart.compiled_asset_id is not None:
         payload["compiled_asset_id"] = str(chart.compiled_asset_id)
+    if include_group_order and chart.group_order is not None:
+        payload["group_order"] = chart.group_order
     return payload
 
 
@@ -1318,7 +1692,9 @@ def source_figure_locator_to_json(locator: SourceFigureLocatorV1) -> dict[str, A
     }
 
 
-def _figure_to_json(figure: SourceFigureCandidateV1) -> dict[str, Any]:
+def _figure_to_json(
+    figure: SourceFigureCandidateV1, *, include_group_order: bool = False
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "key": figure.key,
         "source_document_id": str(figure.source_document_id),
@@ -1351,6 +1727,8 @@ def _figure_to_json(figure: SourceFigureCandidateV1) -> dict[str, Any]:
         payload["height"] = figure.height
     if figure.order is not None:
         payload["order"] = figure.order
+    if include_group_order and figure.group_order is not None:
+        payload["group_order"] = figure.group_order
     return payload
 
 
@@ -1404,7 +1782,11 @@ def editorial_enrichment_to_json(enrichment: EditorialEnrichmentV1) -> dict[str,
         "publication_language": enrichment.publication_language,
         "enrichment_policy_version": enrichment.enrichment_policy_version,
         "tables": [
-            _table_to_json(table, include_analytic=enrichment.schema_version >= 4)
+            _table_to_json(
+                table,
+                include_analytic=enrichment.schema_version >= 4,
+                include_group_order=enrichment.schema_version >= 11,
+            )
             for table in enrichment.tables
         ],
         "diagrams": [
@@ -1413,10 +1795,14 @@ def editorial_enrichment_to_json(enrichment: EditorialEnrichmentV1) -> dict[str,
                 include_analytic=enrichment.schema_version >= 4,
                 include_roles=enrichment.schema_version >= 5,
                 include_profile=enrichment.schema_version >= 8,
+                include_group_order=enrichment.schema_version >= 11,
             )
             for diagram in enrichment.diagrams
         ],
-        "source_figures": [_figure_to_json(figure) for figure in enrichment.source_figures],
+        "source_figures": [
+            _figure_to_json(figure, include_group_order=enrichment.schema_version >= 11)
+            for figure in enrichment.source_figures
+        ],
         "warnings": list(enrichment.warnings),
     }
     if enrichment.schema_version >= 2:
@@ -1435,7 +1821,11 @@ def editorial_enrichment_to_json(enrichment: EditorialEnrichmentV1) -> dict[str,
         ]
     if enrichment.schema_version >= 7:
         payload["charts"] = [
-            _chart_to_json(chart, include_quantitative=enrichment.schema_version >= 10)
+            _chart_to_json(
+                chart,
+                include_quantitative=enrichment.schema_version >= 10,
+                include_group_order=enrichment.schema_version >= 11,
+            )
             for chart in enrichment.charts
         ]
     return payload
@@ -1465,6 +1855,7 @@ _ROOT_KEYS_V7 = _ROOT_KEYS_V6 | {"charts"}
 _ROOT_KEYS_V8 = _ROOT_KEYS_V7
 _ROOT_KEYS_V9 = _ROOT_KEYS_V8
 _ROOT_KEYS_V10 = _ROOT_KEYS_V9
+_ROOT_KEYS_V11 = _ROOT_KEYS_V10
 _REF_KEYS = frozenset({"source_document_id", "kind", "evidence_key"})
 _PLACEMENT_BASE_KEYS = frozenset({"kind", "section_index"})
 _PLACEMENT_KEYS = _PLACEMENT_BASE_KEYS | {"anchor_block_id"}
@@ -1545,10 +1936,26 @@ _RESOURCE_NEED_KEYS = frozenset({"key", "kind", "reason", "query_hint", "policy_
 _RESOURCE_PROPOSAL_KEYS = frozenset(
     {"need_key", "url", "justification", "source_model_run_id", "policy_version"}
 )
+# V11 keeps the V10 shape and allows exactly one additional optional key per
+# element. Every accepted key set is exhaustive, so stray fields still fail.
+_TABLE_V11_KEYS = _TABLE_KEYS | {"group_order"}
+_DIAGRAM_V11_BASE_KEYS = _DIAGRAM_V8_BASE_KEYS | {"group_order"}
+_DIAGRAM_V11_KEYS = _DIAGRAM_V8_KEYS | {"group_order"}
+_CHART_V11_BASE_KEYS = _CHART_BASE_KEYS | {"group_order"}
+_CHART_V11_KEYS = _CHART_KEYS | {"group_order"}
+_CHART_BAR_V11_BASE_KEYS = _CHART_BAR_BASE_KEYS | {"group_order"}
+_CHART_BAR_V11_KEYS = _CHART_BAR_KEYS | {"group_order"}
+_FIGURE_V11_KEYS = _FIGURE_KEYS | _FIGURE_ARCHIVE_METADATA_KEYS | {"purpose", "group_order"}
 
 
 def _object(raw: Any, keys: frozenset[str], label: str) -> Mapping[str, Any]:
     if not isinstance(raw, Mapping) or set(raw) != keys:
+        raise ValueError(f"{label} has missing or extra fields")
+    return raw
+
+
+def _object_one_of(raw: Any, key_sets: frozenset[frozenset[str]], label: str) -> Mapping[str, Any]:
+    if not isinstance(raw, Mapping) or frozenset(raw) not in key_sets:
         raise ValueError(f"{label} has missing or extra fields")
     return raw
 
@@ -1643,9 +2050,14 @@ def _purpose_from_json(raw: Any) -> EditorialAnalyticPurposeV1:
     )
 
 
-def _table_from_json(raw: Any, *, require_analytic: bool = False) -> TableSpecV1:
+def _table_from_json(
+    raw: Any, *, require_analytic: bool = False, allow_group_order: bool = False
+) -> TableSpecV1:
     allowed_keys = _TABLE_KEYS if require_analytic else _TABLE_BASE_KEYS
-    payload = _object(raw, allowed_keys, "Editorial table")
+    key_sets = {allowed_keys}
+    if allow_group_order:
+        key_sets.add(_TABLE_V11_KEYS if require_analytic else allowed_keys | {"group_order"})
+    payload = _object_one_of(raw, frozenset(key_sets), "Editorial table")
     caption = payload["caption"]
     if caption is not None:
         caption = _text(caption, "Table caption")
@@ -1683,6 +2095,11 @@ def _table_from_json(raw: Any, *, require_analytic: bool = False) -> TableSpecV1
         rows=rows,
         placement=_placement_from_json(payload["placement"]),
         purpose=_purpose_from_json(payload["purpose"]) if require_analytic else None,
+        group_order=(
+            json_int(payload["group_order"], "Table group order")
+            if "group_order" in payload
+            else None
+        ),
     )
 
 
@@ -1757,6 +2174,7 @@ def _diagram_from_json(
     require_analytic: bool = False,
     require_roles: bool = False,
     require_profile: bool = False,
+    allow_group_order: bool = False,
 ) -> DiagramSpecV1:
     allowed_key_sets = (
         {_DIAGRAM_V8_BASE_KEYS, _DIAGRAM_V8_KEYS}
@@ -1765,9 +2183,13 @@ def _diagram_from_json(
         if require_analytic
         else {_DIAGRAM_BASE_KEYS, _DIAGRAM_KEYS}
     )
-    if not isinstance(raw, Mapping) or frozenset(raw) not in allowed_key_sets:
-        raise ValueError("Editorial diagram has missing or extra fields")
-    payload = raw
+    if allow_group_order:
+        allowed_key_sets = (
+            allowed_key_sets | {_DIAGRAM_V11_BASE_KEYS, _DIAGRAM_V11_KEYS}
+            if require_profile
+            else allowed_key_sets | {keys | {"group_order"} for keys in allowed_key_sets}
+        )
+    payload = _object_one_of(raw, frozenset(allowed_key_sets), "Editorial diagram")
     caption = payload["caption"]
     if caption is not None:
         caption = _text(caption, "Diagram caption")
@@ -1804,6 +2226,11 @@ def _diagram_from_json(
             if require_profile
             else None
         ),
+        group_order=(
+            json_int(payload["group_order"], "Diagram group order")
+            if "group_order" in payload
+            else None
+        ),
     )
 
 
@@ -1813,14 +2240,17 @@ def _chart_from_json(raw: Any, *, schema_version: int) -> ChartSpecV1:
     payload = raw
     kind = _enum(ChartKind, payload.get("kind"), "Chart kind")
     if kind is ChartKind.BAR:
-        if schema_version < 10 or frozenset(payload) not in {
-            _CHART_BAR_BASE_KEYS,
-            _CHART_BAR_KEYS,
-        }:
+        allowed_keys = {_CHART_BAR_BASE_KEYS, _CHART_BAR_KEYS}
+        if schema_version >= 11:
+            allowed_keys |= {_CHART_BAR_V11_BASE_KEYS, _CHART_BAR_V11_KEYS}
+        if schema_version < 10 or frozenset(payload) not in allowed_keys:
             raise ValueError("Editorial quantitative chart has missing or extra fields")
         point_keys = _CHART_BAR_POINT_KEYS
     else:
-        if frozenset(payload) not in {_CHART_BASE_KEYS, _CHART_KEYS}:
+        allowed_keys = {_CHART_BASE_KEYS, _CHART_KEYS}
+        if schema_version >= 11:
+            allowed_keys |= {_CHART_V11_BASE_KEYS, _CHART_V11_KEYS}
+        if frozenset(payload) not in allowed_keys:
             raise ValueError("Editorial chart has missing or extra fields")
         point_keys = _CHART_POINT_KEYS
     caption = payload["caption"]
@@ -1878,6 +2308,11 @@ def _chart_from_json(raw: Any, *, schema_version: int) -> ChartSpecV1:
         unit=_text(payload["unit"], "Bar chart unit", semantic=True)
         if kind is ChartKind.BAR
         else None,
+        group_order=(
+            json_int(payload["group_order"], "Chart group order")
+            if "group_order" in payload
+            else None
+        ),
     )
 
 
@@ -1898,13 +2333,16 @@ def _locator_from_json(raw: Any) -> SourceFigureLocatorV1:
     )
 
 
-def _figure_from_json(raw: Any) -> SourceFigureCandidateV1:
+def _figure_from_json(raw: Any, *, allow_group_order: bool = False) -> SourceFigureCandidateV1:
     if not isinstance(raw, Mapping):
         raise ValueError("Source figure candidate has missing or extra fields")
     keys = frozenset(raw)
-    if not _FIGURE_BASE_KEYS <= keys or keys - (
-        _FIGURE_KEYS | _FIGURE_ARCHIVE_METADATA_KEYS | {"purpose"}
-    ):
+    allowed_keys = (
+        _FIGURE_V11_KEYS
+        if allow_group_order
+        else (_FIGURE_KEYS | _FIGURE_ARCHIVE_METADATA_KEYS | {"purpose"})
+    )
+    if not _FIGURE_BASE_KEYS <= keys or keys - allowed_keys:
         raise ValueError("Source figure candidate has missing or extra fields")
     payload = raw
     resolved_figure = None
@@ -1972,6 +2410,11 @@ def _figure_from_json(raw: Any) -> SourceFigureCandidateV1:
             json_int(payload["height"], "Source figure height") if "height" in payload else None
         ),
         order=(json_int(payload["order"], "Source figure order") if "order" in payload else None),
+        group_order=(
+            json_int(payload["group_order"], "Source figure group order")
+            if "group_order" in payload
+            else None
+        ),
     )
 
 
@@ -2038,7 +2481,7 @@ def _resource_proposal_from_json(raw: Any) -> EditorialResourceProposalV1:
 
 
 def editorial_enrichment_from_json(payload: Mapping[str, Any]) -> EditorialEnrichmentV1:
-    """Decode strict V1-V9 payloads; older artifacts retain empty review data."""
+    """Decode strict V1-V11 payloads; older artifacts retain empty review data."""
     if not isinstance(payload, Mapping):
         raise ValueError("Editorial enrichment must be an object")
     raw_version = payload.get("schema_version")
@@ -2055,6 +2498,7 @@ def editorial_enrichment_from_json(payload: Mapping[str, Any]) -> EditorialEnric
         8: _ROOT_KEYS_V8,
         9: _ROOT_KEYS_V9,
         10: _ROOT_KEYS_V10,
+        11: _ROOT_KEYS_V11,
     }.get(raw_version)
     if root_keys is None:
         raise ValueError("Editorial enrichment schema version is unsupported")
@@ -2079,7 +2523,11 @@ def editorial_enrichment_from_json(payload: Mapping[str, Any]) -> EditorialEnric
             body["enrichment_policy_version"], "Enrichment policy version"
         ),
         tables=tuple(
-            _table_from_json(value, require_analytic=schema_version >= 4)
+            _table_from_json(
+                value,
+                require_analytic=schema_version >= 4,
+                allow_group_order=schema_version >= 11,
+            )
             for value in _array(body["tables"], "Editorial tables")
         ),
         diagrams=tuple(
@@ -2088,11 +2536,13 @@ def editorial_enrichment_from_json(payload: Mapping[str, Any]) -> EditorialEnric
                 require_analytic=schema_version >= 4,
                 require_roles=schema_version >= 5,
                 require_profile=schema_version >= 8,
+                allow_group_order=schema_version >= 11,
             )
             for value in _array(body["diagrams"], "Editorial diagrams")
         ),
         source_figures=tuple(
-            _figure_from_json(value) for value in _array(body["source_figures"], "Source figures")
+            _figure_from_json(value, allow_group_order=schema_version >= 11)
+            for value in _array(body["source_figures"], "Source figures")
         ),
         warnings=warnings,
         annotations=(

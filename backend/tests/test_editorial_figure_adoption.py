@@ -685,7 +685,16 @@ async def test_figure_factories_build_archive_dependencies_without_lifespan(
         await engine.dispose()
 
 
-def test_figure_document_order_uses_figure_order_not_registry_position() -> None:
+def test_figure_document_order_uses_canonical_family_order_not_figure_order() -> None:
+    """The workshop no longer honors ``figure.order``: it now matches the PDF.
+
+    F2-01 makes the snapshot, publication and Typst consume one canonical
+    ordering function. Legacy artifacts rank ``after_paragraph`` elements by
+    ``(family-local index, key)``, so the historical PDF order wins over the
+    figure-local ``order`` field that only the workshop used to read. The PDF
+    parity of this fixture is proven in
+    ``test_editorial_enrichment_order_parity.py``.
+    """
     from cti_app.application.editorial_workspace.registry import (
         WorkspaceSnapshotRecord,
         project_blocks,
@@ -803,7 +812,9 @@ def test_figure_document_order_uses_figure_order_not_registry_position() -> None
         allow_operations=False,
     )
 
+    # Legacy rank is the family-local index, not ``figure.order``: the first
+    # candidate keeps its position even though it declares order 1.
     assert [block["figure"]["caption"] for block in blocks if block["kind"] == "figure"] == [
-        "First in document order",
         "Second in document order",
+        "First in document order",
     ]
