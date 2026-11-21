@@ -51,6 +51,8 @@ from cti_app.application.editorial_figure_catalog import (
 )
 from cti_app.application.editorial_history import (
     EditorialHistoryError,
+    EditorialHistoryItem,
+    EditorialHistoryPage,
     EditorialHistoryService,
 )
 from cti_app.application.editorial_pdf_preview import (
@@ -654,6 +656,27 @@ class EditorialHistoryItemView(BaseModel):
     thread_id: UUID | None
     thread_url: str | None
 
+    @classmethod
+    def from_domain(cls, item: EditorialHistoryItem) -> EditorialHistoryItemView:
+        return cls(
+            proposal_id=item.proposal_id,
+            subject_id=item.subject_id,
+            occurrence_id=item.occurrence_id,
+            state=item.state,
+            origin=item.origin,
+            operation=item.operation,
+            operation_label=item.operation_label,
+            actor_id=item.actor_id,
+            actor_display=item.actor_display,
+            created_at=item.created_at,
+            updated_at=item.updated_at,
+            canonical_result_artifact_id=item.canonical_result_artifact_id,
+            canonical_result_version=item.canonical_result_version,
+            canonical_result_stage=item.canonical_result_stage,
+            thread_id=item.thread_id,
+            thread_url=item.thread_url,
+        )
+
 
 class EditorialHistoryPageView(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -661,6 +684,14 @@ class EditorialHistoryPageView(BaseModel):
     items: list[EditorialHistoryItemView]
     next_cursor: str | None
     limit: int = Field(ge=1, le=100)
+
+    @classmethod
+    def from_domain(cls, page: EditorialHistoryPage) -> EditorialHistoryPageView:
+        return cls(
+            items=[EditorialHistoryItemView.from_domain(item) for item in page.items],
+            next_cursor=page.next_cursor,
+            limit=page.limit,
+        )
 
 
 class EditorialCompositionStatusView(BaseModel):
@@ -1988,11 +2019,7 @@ async def get_editorial_history(
                 ),
             },
         ) from error
-    return EditorialHistoryPageView(
-        items=[EditorialHistoryItemView.model_validate(item) for item in page.items],
-        next_cursor=page.next_cursor,
-        limit=page.limit,
-    )
+    return EditorialHistoryPageView.from_domain(page)
 
 
 _FIGURE_STATUS_FILTERS = Literal[
