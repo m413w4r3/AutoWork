@@ -1,12 +1,15 @@
 import type {
   PublicationDocument,
-  PublicationDocumentArtifact,
+  PublicationDocumentArtifactWithV8,
 } from "../../api/production";
 import { isRecord } from "./publicationValueGuards";
 
 export function publicationDocumentBody(
-  document: PublicationDocumentArtifact,
+  document: PublicationDocumentArtifactWithV8,
 ): PublicationDocument {
+  if (document.schema_version === "8" || document.schema_version === "9") {
+    return document.base_publication.base_publication.base_publication;
+  }
   if (document.schema_version === "7") {
     return document.base_publication.base_publication;
   }

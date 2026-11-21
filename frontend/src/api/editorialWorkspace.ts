@@ -1,4 +1,5 @@
 import { ApiError } from "./editions";
+import type { EditorialReadOnlyReason } from "./editorialReadOnly";
 
 export type EditorialPublicationKind = "article" | "brief";
 export type EditorialBlockKind =
@@ -154,6 +155,7 @@ export interface EditorialWorkspaceBlock {
   revision_target: EditorialWorkspaceRevisionTarget;
   before_hash: string | null;
   allowed_operations: string[];
+  read_only_reason?: EditorialReadOnlyReason | null;
   revision_status: EditorialRevisionStatus;
 }
 
@@ -170,6 +172,7 @@ export interface EditorialWorkspaceCapabilities {
   can_add_enrichment: boolean;
   can_preview_pdf: boolean;
   can_regenerate_pdf: boolean;
+  read_only_reason?: EditorialReadOnlyReason | null;
 }
 
 export interface EditorialWorkspaceSnapshot {

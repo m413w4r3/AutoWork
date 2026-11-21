@@ -4,6 +4,7 @@ import {
   getEditorialEnrichmentArtifact,
   getExtractionArtifact,
   getPublicationArtifact,
+  getPublicationArtifactVersion,
   getPublicationArtifactPreview,
   getPublicationPreviewPdf,
   getReferencesArtifact,
@@ -90,15 +91,35 @@ export function ProductionArtifactView({
   onClose,
 }: ProductionArtifactViewProps) {
   const fetcher = getArtifactFetcher(stage);
+  const requestedPublicationArtifactId =
+    stage === "publication"
+      ? new URLSearchParams(window.location.search).get(
+          "publication_artifact_id",
+        )
+      : null;
 
   const {
     data: artifact,
     isLoading,
     error,
   } = useQuery({
-    queryKey: ["production-artifact", subjectId, stage],
-    queryFn: () => fetcher(subjectId),
-    refetchInterval: stage === "publication" ? 2500 : false,
+    queryKey: [
+      "production-artifact",
+      subjectId,
+      stage,
+      requestedPublicationArtifactId,
+    ],
+    queryFn: () =>
+      stage === "publication" && requestedPublicationArtifactId
+        ? getPublicationArtifactVersion(
+            subjectId,
+            requestedPublicationArtifactId,
+          )
+        : fetcher(subjectId),
+    refetchInterval:
+      stage === "publication" && requestedPublicationArtifactId === null
+        ? 2500
+        : false,
   });
 
   const publicationEnvelope =
@@ -108,18 +129,9 @@ export function ProductionArtifactView({
       ? artifact.canonical_content
       : null;
   const publicationDocument = publicationEnvelope
-    ? publicationEnvelope.schema_version === "8" ||
-      publicationEnvelope.schema_version === "9"
-      ? publicationDocumentBody(publicationEnvelope.base_publication)
-      : publicationDocumentBody(publicationEnvelope)
+    ? publicationDocumentBody(publicationEnvelope)
     : null;
-  const publicationKind =
-    publicationEnvelope?.schema_version === "7"
-      ? publicationEnvelope.publication_kind
-      : publicationEnvelope?.schema_version === "8" ||
-          publicationEnvelope?.schema_version === "9"
-        ? publicationEnvelope.base_publication.publication_kind
-        : null;
+  const publicationKind = artifact?.publication_kind ?? null;
   const publicationInputArtifacts = recordValue(
     artifact?.metadata.input_artifacts,
   );
@@ -296,6 +308,9 @@ export function ProductionArtifactView({
           <PublicationDocumentView
             document={publicationDocument}
             publicationKind={publicationKind}
+            readOnlyReason={artifact.read_only_reason ?? null}
+            currentVersionHref={`/subjects/${encodeURIComponent(subjectId)}/editor`}
+            historicalWorkspaceHref={`/subjects/${encodeURIComponent(subjectId)}/editor?publication_artifact_id=${encodeURIComponent(artifact.artifact_id)}`}
           />
         </>
       )}

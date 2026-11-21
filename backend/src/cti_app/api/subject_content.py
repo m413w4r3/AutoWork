@@ -14,6 +14,7 @@ from cti_app.api.publication_runtime import (
     publication_runtime_for_request,
     uow_factory_for_request,
 )
+from cti_app.application.editorial_legacy_read_only import EditorialLegacyReadOnlyReason
 from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.production_parsers import IndicatorStatus
 from cti_app.application.publication_rendering import (
@@ -92,6 +93,7 @@ class ContentResponse(BaseModel):
     schema_version: str
     document_version: str
     publication_kind: PublicationKind | None
+    read_only_reason: EditorialLegacyReadOnlyReason | None
     canonical_content: dict[str, Any]
     analyst_opinion: AnalystOpinionContentResponse | None
 

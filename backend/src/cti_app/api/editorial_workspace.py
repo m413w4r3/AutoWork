@@ -55,6 +55,7 @@ from cti_app.application.editorial_history import (
     EditorialHistoryPage,
     EditorialHistoryService,
 )
+from cti_app.application.editorial_legacy_read_only import EditorialLegacyReadOnlyReason
 from cti_app.application.editorial_pdf_preview import (
     EditorialPdfPreviewService,
     EditorialPdfRegenerationError,
@@ -442,6 +443,7 @@ class EditorialWorkspaceCapabilities(BaseModel):
     can_add_enrichment: bool
     can_preview_pdf: bool
     can_regenerate_pdf: bool
+    read_only_reason: EditorialLegacyReadOnlyReason | None = None
 
 
 class EditorialWorkspaceRevisionTarget(BaseModel):
@@ -549,6 +551,7 @@ class EditorialWorkspaceBlock(BaseModel):
     before_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     allowed_operations: list[str]
     revision_status: Literal["ready", "proposal_pending", "stale", "needs_review"]
+    read_only_reason: EditorialLegacyReadOnlyReason | None = None
 
 
 class EditorialDocumentOutlineNode(BaseModel):
@@ -1335,6 +1338,9 @@ def _manual_edit_too_large_response() -> JSONResponse:
 
 
 def _manual_edit_capability_enabled(request: Request, payload: Mapping[str, object]) -> bool:
+    capabilities = payload.get("capabilities")
+    if isinstance(capabilities, Mapping) and capabilities.get("read_only_reason") is not None:
+        return False
     try:
         if not get_settings().editorial_proposal_accept_enabled:
             return False

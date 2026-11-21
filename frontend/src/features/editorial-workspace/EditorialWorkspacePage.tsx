@@ -3,12 +3,20 @@ import { useState } from "react";
 
 import { ApiError } from "../../api/editions";
 import {
+  getPublicationArtifactVersion,
+  type HistoricalPublicationArtifactResponse,
+} from "../../api/production";
+import {
   getEditorialCompositionStatus,
   getEditorialPdfStatus,
   getEditorialWorkspaceSnapshot,
   regenerateEditorialPdf,
 } from "../../api/editorialWorkspace";
 import { Link } from "../../routing";
+import { PublicationDocumentView } from "../publication/PublicationDocumentView";
+import { publicationDocumentBody } from "../publication/publicationArtifactDisplay";
+import { isPublicationDocument } from "../publication/publicationArtifactSchemas";
+import { editorialReadOnlyReasonText } from "../publication/publicationReadOnly";
 import { EditorialWorkspaceLayout } from "./EditorialWorkspaceLayout";
 import { useEditorialDrafts } from "./EditorialDrafts";
 import { EditorialWorkspaceStatus } from "./EditorialWorkspaceStatus";
@@ -21,6 +29,87 @@ interface EditorialWorkspacePageProps {
 }
 
 export function EditorialWorkspacePage({
+  subjectId,
+}: EditorialWorkspacePageProps) {
+  const publicationArtifactId = new URLSearchParams(window.location.search).get(
+    "publication_artifact_id",
+  );
+  if (publicationArtifactId) {
+    return (
+      <HistoricalPublicationWorkspacePage
+        subjectId={subjectId}
+        artifactId={publicationArtifactId}
+      />
+    );
+  }
+  return <CurrentEditorialWorkspacePage subjectId={subjectId} />;
+}
+
+function HistoricalPublicationWorkspacePage({
+  subjectId,
+  artifactId,
+}: {
+  subjectId: string;
+  artifactId: string;
+}) {
+  const historyQuery = useQuery({
+    queryKey: ["historical-publication", subjectId, artifactId],
+    queryFn: () => getPublicationArtifactVersion(subjectId, artifactId),
+    retry: false,
+  });
+  const currentVersionHref = `/subjects/${encodeURIComponent(subjectId)}/editor`;
+  if (historyQuery.isPending) {
+    return (
+      <section className="editorial-route-state" aria-busy="true">
+        <p role="status">Chargement de la version historique…</p>
+      </section>
+    );
+  }
+  if (historyQuery.isError || !historyQuery.data) {
+    return (
+      <section
+        className="editorial-route-state"
+        aria-labelledby="history-error"
+      >
+        <h1 id="history-error">Lecture historique indisponible</h1>
+        <p role="alert">Cette version ne peut pas être consultée.</p>
+        <a href={currentVersionHref}>Revenir à la version courante</a>
+      </section>
+    );
+  }
+
+  const artifact: HistoricalPublicationArtifactResponse = historyQuery.data;
+  const document = isPublicationDocument(artifact.canonical_content)
+    ? publicationDocumentBody(artifact.canonical_content)
+    : null;
+  return (
+    <section
+      className="editorial-route-state editorial-route-state--historical"
+      aria-labelledby="history-heading"
+    >
+      <a href={currentVersionHref}>← Atelier courant</a>
+      <h1 id="history-heading">
+        Atelier éditorial — version {artifact.version}
+      </h1>
+      {document ? (
+        <PublicationDocumentView
+          document={document}
+          publicationKind={artifact.publication_kind}
+          readOnlyReason={artifact.read_only_reason}
+          currentVersionHref={currentVersionHref}
+        />
+      ) : (
+        <aside className="editorial-readonly-banner" role="note">
+          <strong>Version historique — lecture seule</strong>
+          <p>{editorialReadOnlyReasonText(artifact.read_only_reason)}</p>
+          <a href={currentVersionHref}>Revenir à la version courante</a>
+        </aside>
+      )}
+    </section>
+  );
+}
+
+function CurrentEditorialWorkspacePage({
   subjectId,
 }: EditorialWorkspacePageProps) {
   const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null);

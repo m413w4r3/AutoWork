@@ -11,6 +11,10 @@ from cti_app.application.edition_classification import (
     explicit_publication_kind,
     is_legacy_historical_brief,
 )
+from cti_app.application.editorial_legacy_read_only import (
+    publication_kind_is_ambiguous,
+    publication_read_only_reason,
+)
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_resolver import current_publication_artifact
 from cti_app.application.production_extraction import legacy_technical_extraction_from_payload
@@ -57,6 +61,7 @@ class SubjectContentView:
     schema_version: str
     document_version: str
     publication_kind: PublicationKind | None
+    read_only_reason: str | None
     canonical_content: dict[str, Any]
     analyst_opinion: dict[str, Any] | None
 
@@ -193,6 +198,11 @@ class SubjectContentService:
         publication_kind, _routing_hash = resolve_publication_kind(
             publication.routing_decision, document
         )
+        read_only_reason = publication_read_only_reason(
+            canonical,
+            publication_kind,
+            ambiguous_kind=publication_kind_is_ambiguous(publication.routing_decision, canonical),
+        )
         document_version = document.schema_version
         analyst_opinion: dict[str, Any] | None = None
         if isinstance(document, PublicationDocumentV8):
@@ -221,6 +231,7 @@ class SubjectContentService:
             schema_version=document.schema_version,
             document_version=document_version,
             publication_kind=publication_kind,
+            read_only_reason=(read_only_reason.value if read_only_reason is not None else None),
             canonical_content=canonical,
             analyst_opinion=analyst_opinion,
         )

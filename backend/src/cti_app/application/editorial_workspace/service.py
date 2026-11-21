@@ -16,6 +16,10 @@ if TYPE_CHECKING:
         EditorialFigureCatalogService,
     )
 
+from cti_app.application.editorial_legacy_read_only import (
+    publication_kind_is_ambiguous,
+    publication_read_only_reason,
+)
 from cti_app.application.editorial_workspace.registry import (
     WorkspaceOccurrenceResolution,
     WorkspaceSnapshotRecord,
@@ -352,6 +356,11 @@ class EditorialWorkspaceService:
 
             routing_decision = await get_adopted_production_routing_decision(uow=uow, run=run)
             kind, routing_hash = resolve_publication_kind(routing_decision, publication_content)
+            read_only_reason = publication_read_only_reason(
+                publication_content,
+                kind,
+                ambiguous_kind=publication_kind_is_ambiguous(routing_decision, publication_content),
+            )
             pins: dict[str, object] = {
                 "subject_id": subject.id,
                 "production_run_id": run.id,
@@ -524,6 +533,11 @@ class EditorialWorkspaceService:
                 allow_figure_insertion=kind is not None and figure_inventory_available,
                 catalog_figure_ids=catalog_figure_ids,
             )
+            if read_only_reason is not None:
+                reason = read_only_reason.value
+                for block in (*blocks, *enrichments):
+                    block["allowed_operations"] = []
+                    block["read_only_reason"] = reason
             impact = await uow.editorial_proposal_impacts.latest_for_run(run.id)
             publication_render = (
                 await uow.publication_renders.get_latest_for_artifact(publication_artifact.id)
@@ -617,8 +631,13 @@ class EditorialWorkspaceService:
                     "can_preview_revision": False,
                     "manual_edit": False,
                     "can_add_enrichment": False,
-                    "can_preview_pdf": pdf_preview.status.value == "READY",
-                    "can_regenerate_pdf": kind is not None,
+                    "can_preview_pdf": (
+                        read_only_reason is None and pdf_preview.status.value == "READY"
+                    ),
+                    "can_regenerate_pdf": kind is not None and read_only_reason is None,
+                    "read_only_reason": (
+                        read_only_reason.value if read_only_reason is not None else None
+                    ),
                 },
                 "preview_status": preview_status.value,
                 "impact_status": impact_status,

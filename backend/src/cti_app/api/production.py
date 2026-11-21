@@ -23,6 +23,10 @@ from cti_app.application.bridge_identity import bridge_request_fingerprint
 from cti_app.application.editorial_enrichment_revision import (
     EditorialEnrichmentRevisionValidationError,
 )
+from cti_app.application.editorial_legacy_read_only import (
+    publication_kind_is_ambiguous,
+    publication_read_only_reason,
+)
 from cti_app.application.editorial_revision_effects import EditorialRevisionEffects
 from cti_app.application.editorial_workspace.service import EditorialWorkspaceService
 from cti_app.application.identity import IdentityProvider
@@ -97,6 +101,7 @@ from cti_app.application.production_resume import (
     plan_production_resume,
 )
 from cti_app.application.production_review_recovery import ReviewRecoveryConflictError
+from cti_app.application.production_routing import get_adopted_production_routing_decision
 from cti_app.application.production_source_additions import (
     SourceAdditionConflictError,
     SourceAdditionError,
@@ -127,7 +132,7 @@ from cti_app.application.publication_text_correction import (
     PublicationTextCorrectionErrorCode,
     PublicationTextCorrectionService,
 )
-from cti_app.application.subject_content import analyst_opinion_view
+from cti_app.application.subject_content import analyst_opinion_view, resolve_publication_kind
 from cti_app.application.subject_production import (
     EditionProductionBatchNotFoundError,
     EditionProductionBatchOwnershipError,
@@ -3116,6 +3121,11 @@ async def _artifact_view_for_run(
         )
         if not artifact:
             raise HTTPException(status_code=404, detail=f"{stage} artifact not found")
+        routing_decision = (
+            await get_adopted_production_routing_decision(uow=uow, run=run)
+            if artifact.stage is ProductionArtifactStage.PUBLICATION
+            else None
+        )
 
         store = getattr(request.app.state, "production_artifact_store", None)
         rendered = None
@@ -3130,6 +3140,16 @@ async def _artifact_view_for_run(
                 canonical = await store.read_json(artifact.canonical_blob_id)
 
         publication_v6_extras: dict[str, Any] = {}
+        publication_kind = None
+        read_only_reason = None
+        if artifact.stage is ProductionArtifactStage.PUBLICATION:
+            publication_kind, _routing_hash = resolve_publication_kind(routing_decision, canonical)
+            reason = publication_read_only_reason(
+                canonical,
+                publication_kind,
+                ambiguous_kind=publication_kind_is_ambiguous(routing_decision, canonical),
+            )
+            read_only_reason = reason.value if reason is not None else None
         if (
             artifact.stage is ProductionArtifactStage.PUBLICATION
             and isinstance(canonical, dict)
@@ -3166,6 +3186,11 @@ async def _artifact_view_for_run(
                 artifact.stage.value, canonical
             ),
         }
+        if artifact.stage is ProductionArtifactStage.PUBLICATION:
+            response["publication_kind"] = (
+                publication_kind.value if publication_kind is not None else None
+            )
+            response["read_only_reason"] = read_only_reason
         if artifact.stage is not ProductionArtifactStage.PUBLICATION:
             response["rendered_content"] = rendered
         response.update(publication_v6_extras)
@@ -3774,6 +3799,7 @@ async def get_publication_artifact_version(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={"code": "publication_artifact_not_found"},
             )
+        routing_decision = await get_adopted_production_routing_decision(uow=uow, run=run)
 
     canonical = None
     canonical_sha256 = None
@@ -3782,6 +3808,13 @@ async def get_publication_artifact_version(
         canonical_bytes = await store.read_bytes(artifact.canonical_blob_id)
         canonical_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
         canonical = await store.read_json(artifact.canonical_blob_id)
+    publication_kind, _routing_hash = resolve_publication_kind(routing_decision, canonical)
+    reason = publication_read_only_reason(
+        canonical,
+        publication_kind,
+        ambiguous_kind=publication_kind_is_ambiguous(routing_decision, canonical),
+        historical=True,
+    )
     return {
         "artifact_id": str(artifact.id),
         "production_run_id": str(artifact.production_run_id),
@@ -3798,6 +3831,8 @@ async def get_publication_artifact_version(
             else None
         ),
         "metadata": artifact.metadata,
+        "publication_kind": publication_kind.value if publication_kind is not None else None,
+        "read_only_reason": reason.value if reason is not None else None,
         "canonical_content": canonical,
     }
 

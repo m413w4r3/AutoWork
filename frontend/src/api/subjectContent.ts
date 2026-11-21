@@ -1,4 +1,5 @@
 import { ApiError } from "./editions";
+import type { EditorialReadOnlyReason } from "./editorialReadOnly";
 import type { PublicationDocumentArtifactWithV8 } from "./production";
 
 export interface SubjectContentResponse {
@@ -11,6 +12,7 @@ export interface SubjectContentResponse {
   status: string;
   schema_version: string;
   publication_kind: "article" | "brief" | null;
+  read_only_reason?: EditorialReadOnlyReason | null;
   canonical_content: PublicationDocumentArtifactWithV8;
 }
 

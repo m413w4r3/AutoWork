@@ -155,11 +155,10 @@ function LegacyWorkbenchFallback({
 
 function PublicationContent({ content }: { content: SubjectContentResponse }) {
   const publicationKind = content.publication_kind;
-  const document =
-    content.canonical_content.schema_version === "8" ||
-    content.canonical_content.schema_version === "9"
-      ? publicationDocumentBody(content.canonical_content.base_publication)
-      : publicationDocumentBody(content.canonical_content);
+  const document = publicationDocumentBody(content.canonical_content);
+  const editorialWorkspaceHref = content.read_only_reason
+    ? `/subjects/${content.subject_id}/editor?publication_artifact_id=${encodeURIComponent(content.artifact_id)}`
+    : `/subjects/${content.subject_id}/editor`;
   return (
     <section
       className="subject-article"
@@ -179,13 +178,13 @@ function PublicationContent({ content }: { content: SubjectContentResponse }) {
             Télécharger le PDF
           </a>
         ) : null}
-        <Link to={`/subjects/${content.subject_id}/editor`}>
-          Ouvrir l’atelier éditorial
-        </Link>
+        <Link to={editorialWorkspaceHref}>Ouvrir l’atelier éditorial</Link>
       </div>
       <PublicationDocumentView
         document={document}
         publicationKind={publicationKind}
+        readOnlyReason={content.read_only_reason}
+        currentVersionHref={`/subjects/${encodeURIComponent(content.subject_id)}/editor`}
       />
     </section>
   );

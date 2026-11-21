@@ -6,6 +6,8 @@ import type {
   EditorialWorkspaceBlock,
   EditorialWorkspaceSnapshot,
 } from "../../api/editorialWorkspace";
+import { Link } from "../../routing";
+import { editorialReadOnlyReasonText } from "../publication/publicationReadOnly";
 import { EditorialDocument } from "./EditorialDocument";
 import type { EditorialDraftController } from "./EditorialDrafts";
 import type { InlineTextEditorProps } from "./InlineTextEditor";
@@ -90,7 +92,10 @@ export function EditorialWorkspaceLayout({
   const ordered = snapshot.blocks;
   const selectedBlock =
     ordered.find((block) => block.block_id === selectedBlockId) ?? null;
-  const readOnly = snapshot.publication_kind === null;
+  const readOnlyReason =
+    snapshot.capabilities.read_only_reason ??
+    (snapshot.publication_kind === null ? "publication_kind_unknown" : null);
+  const readOnly = readOnlyReason !== null;
   const stale = snapshot.blocks.some(
     (block) => block.revision_status === "stale",
   );
@@ -395,8 +400,9 @@ export function EditorialWorkspaceLayout({
 
       {readOnly ? (
         <div className="editorial-readonly-banner" role="note">
-          Type de publication indéterminé : le document est consultable en
-          lecture seule.
+          <strong>Version historique — lecture seule</strong>
+          <p>{editorialReadOnlyReasonText(readOnlyReason)}</p>
+          <Link to={workspacePath}>Revenir à la version courante</Link>
         </div>
       ) : null}
       <div className="editorial-workspace__controls">

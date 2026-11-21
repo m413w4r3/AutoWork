@@ -193,4 +193,70 @@ describe("EditorialWorkspacePage manual editing", () => {
       screen.queryByRole("status", { name: /Brouillon local/ }),
     ).not.toBeInTheDocument();
   });
+
+  it("shows historical content read only and links back to the current version", async () => {
+    const snapshot = createSnapshot(
+      "Synthetic historical paragraph.",
+      1,
+      "none",
+    );
+    snapshot.capabilities = {
+      ...snapshot.capabilities,
+      manual_edit: false,
+      can_discuss: false,
+      can_preview_revision: false,
+      can_add_enrichment: false,
+      can_preview_pdf: false,
+      can_regenerate_pdf: false,
+      read_only_reason: "format_not_editable",
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>((input) => {
+        const url =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url;
+        if (url.endsWith("/editor/snapshot")) {
+          return Promise.resolve(
+            new Response(JSON.stringify(snapshot), {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            }),
+          );
+        }
+        return Promise.resolve(
+          new Response(JSON.stringify({ detail: { code: "not_found" } }), {
+            status: 404,
+            headers: { "Content-Type": "application/json" },
+          }),
+        );
+      }),
+    );
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: 0 } },
+    });
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <EditorialWorkspacePage subjectId={subjectId} />
+      </QueryClientProvider>,
+    );
+
+    expect(
+      await screen.findByText("Version historique — lecture seule"),
+    ).toBeVisible();
+    expect(screen.getByText(/format non éditable/i)).toBeVisible();
+    expect(
+      screen.queryByRole("button", { name: "Modifier" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Proposer" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: "Revenir à la version courante" }),
+    ).toHaveAttribute("href", `/subjects/${subjectId}/editor`);
+  });
 });

@@ -1495,6 +1495,7 @@ it("affiche une brève V7 avec chronologie et synthèse sans annexe IOC", async 
           stage: "publication",
           version: 7,
           status: "verified",
+          publication_kind: "brief",
           metadata: {},
           canonical_content: {
             schema_version: "7",
@@ -1596,6 +1597,7 @@ it("lit l'enveloppe V9 avec placement résolu et conserve le corps V7", async ()
           stage: "publication",
           version: 9,
           status: "verified",
+          publication_kind: "brief",
           metadata: {},
           canonical_content: {
             schema_version: "9",

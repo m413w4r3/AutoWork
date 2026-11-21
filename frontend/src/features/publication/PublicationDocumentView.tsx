@@ -1,5 +1,6 @@
 import { useState } from "react";
 
+import type { EditorialReadOnlyReason } from "../../api/editorialReadOnly";
 import type {
   PublicationDocument,
   PublicationEvidenceRefV1,
@@ -14,13 +15,21 @@ import {
   type PublicationPassage,
 } from "./PublicationProvenance";
 import { PublicationSemanticContent } from "./PublicationSemanticContent";
+import { editorialReadOnlyReasonText } from "./publicationReadOnly";
+import { Link } from "../../routing";
 
 export function PublicationDocumentView({
   document,
   publicationKind,
+  readOnlyReason = null,
+  currentVersionHref,
+  historicalWorkspaceHref,
 }: {
   document: PublicationDocument;
   publicationKind: "article" | "brief" | null;
+  readOnlyReason?: EditorialReadOnlyReason | null;
+  currentVersionHref?: string;
+  historicalWorkspaceHref?: string;
 }) {
   const [selectedPassage, setSelectedPassage] =
     useState<PublicationPassage | null>(null);
@@ -35,6 +44,22 @@ export function PublicationDocumentView({
   return (
     <div className="publication-preview__layout">
       <article className="publication-preview">
+        {readOnlyReason ? (
+          <aside className="editorial-readonly-banner" role="note">
+            <strong>Version historique — lecture seule</strong>
+            <p>{editorialReadOnlyReasonText(readOnlyReason)}</p>
+            {historicalWorkspaceHref ? (
+              <p>
+                <Link to={historicalWorkspaceHref}>
+                  Ouvrir en lecture seule dans l’atelier
+                </Link>
+              </p>
+            ) : null}
+            {currentVersionHref ? (
+              <a href={currentVersionHref}>Revenir à la version courante</a>
+            ) : null}
+          </aside>
+        ) : null}
         {publicationKind ? (
           <p className="publication-preview__kind">
             Format : {publicationKind === "brief" ? "Brève" : "Article"}

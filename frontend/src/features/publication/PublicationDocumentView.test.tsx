@@ -260,7 +260,28 @@ function renderDocumentView(
   );
 }
 
-function renderArtifactView(canonicalContent: unknown) {
+it("explains a historical publication is read only and returns to the current version", () => {
+  render(
+    <PublicationDocumentView
+      document={baseDocument}
+      publicationKind="article"
+      readOnlyReason="format_not_editable"
+      currentVersionHref={`/subjects/${SUBJECT_ID}/editor`}
+    />,
+  );
+
+  expect(screen.getByText("Version historique — lecture seule")).toBeVisible();
+  expect(screen.getByText(/format non éditable/i)).toBeVisible();
+  expect(
+    screen.getByRole("link", { name: "Revenir à la version courante" }),
+  ).toHaveAttribute("href", `/subjects/${SUBJECT_ID}/editor`);
+  expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+});
+
+function renderArtifactView(
+  canonicalContent: unknown,
+  publicationKind: "article" | "brief" | null = null,
+) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -280,6 +301,7 @@ function renderArtifactView(canonicalContent: unknown) {
             stage: "publication",
             version: 7,
             status: "verified",
+            publication_kind: publicationKind,
             metadata: {},
             canonical_content: canonicalContent,
           }),
@@ -296,11 +318,14 @@ function renderArtifactView(canonicalContent: unknown) {
 }
 
 it("test_v8_brief_read_fixture_renders_in_the_historical_view", async () => {
-  renderArtifactView({
-    schema_version: "8",
-    base_publication: documentV7,
-    article_format: null,
-  });
+  renderArtifactView(
+    {
+      schema_version: "8",
+      base_publication: documentV7,
+      article_format: null,
+    },
+    "brief",
+  );
 
   expect(await screen.findByText("Dossier Sample Orchard")).toBeInTheDocument();
   expect(screen.getByText("Format : Brève")).toBeInTheDocument();
@@ -943,7 +968,7 @@ it("conserve le rendu du document V5 sous l'enveloppe V6", async () => {
 });
 
 it("caractérise le rendu V7 d'une brève sans annexe IOC", async () => {
-  const { container } = renderArtifactView(documentV7);
+  const { container } = renderArtifactView(documentV7, "brief");
   await screen.findByText("Format : Brève");
   expect(publicationLayout(container)).toMatchInlineSnapshot(`
     <div

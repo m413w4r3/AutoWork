@@ -1685,6 +1685,20 @@ main:has(> .editorial-route-state) > .app-header {
   font-weight: 500;
 }
 
+.editorial-route-state--historical {
+  width: min(100% - 2rem, 72rem);
+}
+
+.editorial-route-state--historical h1 {
+  margin-block: 0.45em;
+  font-size: clamp(2rem, 3.2vw, 3rem);
+  line-height: 1.1;
+}
+
+.editorial-route-state--historical .publication-preview__layout {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .editorial-route-state [role="alert"] {
   color: var(--editorial-warning);
 }

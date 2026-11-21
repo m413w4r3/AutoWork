@@ -1,4 +1,5 @@
 import { ApiError, type EditionStatus } from "./editions";
+import type { EditorialReadOnlyReason } from "./editorialReadOnly";
 
 export type ProductionRunStatus =
   "queued" | "running" | "ready" | "needs_review" | "failed" | "cancelled";
@@ -368,6 +369,8 @@ export interface ArtifactResponse {
   version: number;
   input_hash: string;
   canonical_sha256: string | null;
+  publication_kind?: "article" | "brief" | null;
+  read_only_reason?: EditorialReadOnlyReason | null;
   status: "verified" | "stale" | "needs_review";
   reused?: boolean;
   reused_from_artifact_id?: string | null;
@@ -383,6 +386,11 @@ export interface ArtifactResponse {
     | ExtractionDocumentV2
     | Record<string, unknown>
     | null;
+}
+
+export interface HistoricalPublicationArtifactResponse extends ArtifactResponse {
+  publication_kind: "article" | "brief" | null;
+  read_only_reason: EditorialReadOnlyReason;
 }
 
 export type ProductionExtractionTierV1 = "core" | "supporting" | "technical";
@@ -2133,6 +2141,15 @@ export async function getPublicationArtifact(
   subjectId: string,
 ): Promise<ArtifactResponse> {
   return request(`/api/subjects/${subjectId}/production/artifacts/publication`);
+}
+
+export async function getPublicationArtifactVersion(
+  subjectId: string,
+  artifactId: string,
+): Promise<HistoricalPublicationArtifactResponse> {
+  return request<HistoricalPublicationArtifactResponse>(
+    `/api/subjects/${encodeURIComponent(subjectId)}/production/artifacts/publication/${encodeURIComponent(artifactId)}`,
+  );
 }
 
 export async function getPublicationArtifactPreview(
