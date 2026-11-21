@@ -260,6 +260,8 @@ async def _execute_editorial_thread_job(job_id: UUID) -> int | None:
                 blob_store=blob_store,
                 artifact_store=artifact_store,
                 workspace_service=workspace_service,
+                chart_compiler=AnalyticChartRenderer(),
+                media_asset_store=MediaAssetStore(artifact_store, uow_factory),
             ),
         )
         return await worker.process(job_id)

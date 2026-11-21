@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import replace
 from decimal import Decimal
+from typing import cast
 from uuid import uuid4
 
 import pytest
@@ -152,3 +153,66 @@ def test_bar_svg_compilation_is_deterministic_and_escapes_labels() -> None:
     assert first == second
     assert b"Source &lt;A&gt;" in first
     assert hashlib.sha256(first).hexdigest() == hashlib.sha256(second).hexdigest()
+
+
+def test_editorial_proposal_services_build_real_media_store_without_app_lifespan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi import FastAPI
+    from starlette.requests import Request
+
+    from cti_app.api import editorial_workspace as editorial_workspace_api
+    from cti_app.application.blob_storage import BlobStore
+    from cti_app.application.blobs import BlobCatalogService
+    from cti_app.application.media_assets import MediaAssetStore
+    from cti_app.application.persistence import UnitOfWorkFactory
+    from cti_app.application.production_artifact_store import ProductionArtifactStore
+    from cti_app.config import Settings
+    from cti_app.infrastructure.analytic_chart_renderer import AnalyticChartRenderer
+
+    monkeypatch.setattr(
+        editorial_workspace_api,
+        "get_settings",
+        lambda: Settings(
+            _env_file=None,
+            production_editorial_resource_search_enabled=False,
+        ),
+    )
+    app = FastAPI()
+    uow_factory = cast(UnitOfWorkFactory, object())
+    blob_store = cast(BlobStore, object())
+    artifact_store = ProductionArtifactStore(BlobCatalogService(blob_store, uow_factory))
+    app.state.uow_factory = uow_factory
+    app.state.blob_store = blob_store
+    app.state.production_artifact_store = artifact_store
+    app.state.model_gateway = object()
+    app.state.publication_render_service = object()
+    request = Request(
+        {
+            "type": "http",
+            "app": app,
+            "method": "POST",
+            "path": "/api/subjects/test/editor/blocks/test/bar-chart-proposals",
+            "headers": [],
+        }
+    )
+
+    manual_service = editorial_workspace_api._manual_proposal_service(request)
+    thread_service = editorial_workspace_api._thread_service(request)
+    adoption_service = editorial_workspace_api._proposal_adoption_service(request)
+    thread_proposal_service = thread_service._proposal_service
+    adoption_enrichment_loader = adoption_service._inputs._enrichment_loader
+
+    assert isinstance(manual_service._chart_compiler, AnalyticChartRenderer)
+    assert isinstance(manual_service._media_asset_store, MediaAssetStore)
+    assert manual_service._media_asset_store._blob_store is artifact_store
+    assert manual_service._media_asset_store._uow_factory is uow_factory
+    assert thread_proposal_service is not None
+    assert isinstance(thread_proposal_service._chart_compiler, AnalyticChartRenderer)
+    assert isinstance(thread_proposal_service._media_asset_store, MediaAssetStore)
+    assert thread_proposal_service._media_asset_store._blob_store is artifact_store
+    assert thread_proposal_service._media_asset_store._uow_factory is uow_factory
+    assert isinstance(adoption_enrichment_loader._chart_compiler, AnalyticChartRenderer)
+    assert isinstance(adoption_enrichment_loader._media_asset_store, MediaAssetStore)
+    assert adoption_enrichment_loader._media_asset_store._blob_store is artifact_store
+    assert adoption_enrichment_loader._media_asset_store._uow_factory is uow_factory
