@@ -9,6 +9,7 @@ import pytest
 from cti_app.application.editorial_figure_catalog import (
     EditorialFigureCatalogError,
     EditorialFigureCatalogItem,
+    EditorialFigureCatalogPage,
     FigureCatalogSource,
     archive_reference_for_catalog_item,
     assert_archive_reference_matches,
@@ -110,6 +111,51 @@ def test_article_respects_the_archived_inventory_figure_limit() -> None:
             requested_count=2,
             inventory_limit=2,
         )
+
+
+def test_snapshot_figure_capability_requires_inventory_and_remaining_capacity() -> None:
+    from cti_app.application.editorial_workspace.service import _figure_insertion_available
+
+    item = _catalog_item()
+    page = EditorialFigureCatalogPage(
+        items=(item,),
+        sources=(item.source,),
+        total=1,
+        available_count=1,
+        offset=0,
+        limit=1,
+    )
+
+    assert _figure_insertion_available(
+        page,
+        publication_kind=PublicationKind.ARTICLE,
+        production_run_id=item._run_id,
+        integrated_count=0,
+    )
+    assert not _figure_insertion_available(
+        replace(page, available_count=0),
+        publication_kind=PublicationKind.ARTICLE,
+        production_run_id=item._run_id,
+        integrated_count=0,
+    )
+    assert not _figure_insertion_available(
+        page,
+        publication_kind=PublicationKind.BRIEF,
+        production_run_id=item._run_id,
+        integrated_count=3,
+    )
+    assert not _figure_insertion_available(
+        page,
+        publication_kind=PublicationKind.ARTICLE,
+        production_run_id=item._run_id,
+        integrated_count=item._inventory_max_figures,
+    )
+    assert not _figure_insertion_available(
+        page,
+        publication_kind=PublicationKind.ARTICLE,
+        production_run_id=uuid4(),
+        integrated_count=0,
+    )
 
 
 def test_ineligible_or_pending_figure_refused() -> None:

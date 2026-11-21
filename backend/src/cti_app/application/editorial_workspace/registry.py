@@ -617,7 +617,8 @@ def project_blocks(
                         anchor_registered=True,
                     )
                     and entry.source_stage is EditorialSourceStage.SYNTHESIS
-                    and entry.kind in {
+                    and entry.kind
+                    in {
                         EditorialBlockKind.PARAGRAPH,
                         EditorialBlockKind.LEAD_PARAGRAPH,
                     }
@@ -690,7 +691,7 @@ def project_blocks(
     block_by_id = {UUID(str(block["block_id"])): block for block in blocks}
     synthesis_blocks = [block_by_id[entry.block_id] for entry in synthesis_entries]
     enrichment_blocks_by_id = {UUID(str(block["block_id"])): block for block in enrichments}
-    insertions: dict[int, list[tuple[int, int, int, str, dict[str, object]]]] = {}
+    insertions: dict[int, list[tuple[int, int, str, dict[str, object]]]] = {}
     stale_enrichments: list[tuple[int, str, dict[str, object]]] = []
     section_count = len(synthesis.get("sections", []))
     for entry in enrichment_entries:
@@ -773,11 +774,9 @@ def project_blocks(
                 placement_rank,
                 (
                     int(item["order"])
-                    if entry.kind is EditorialBlockKind.FIGURE
-                    and type(item.get("order")) is int
+                    if entry.kind is EditorialBlockKind.FIGURE and type(item.get("order")) is int
                     else entry.position
                 ),
-                entry.position,
                 element_key,
                 enrichment_block,
             )
@@ -787,7 +786,7 @@ def project_blocks(
     ordered_enrichments: list[dict[str, object]] = []
     for boundary in range(len(synthesis_blocks) + 1):
         attached = sorted(insertions.get(boundary, []), key=lambda item: item[:3])
-        for _rank, _document_order, _position, _key, block in attached:
+        for _rank, _document_order, _key, block in attached:
             ordered_blocks.append(block)
             ordered_enrichments.append(block)
         if boundary < len(synthesis_blocks):

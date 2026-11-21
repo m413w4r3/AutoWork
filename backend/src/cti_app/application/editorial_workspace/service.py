@@ -7,8 +7,14 @@ import json
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
+
+if TYPE_CHECKING:
+    from cti_app.application.editorial_figure_catalog import (
+        EditorialFigureCatalogPage,
+        EditorialFigureCatalogService,
+    )
 
 from cti_app.application.editorial_workspace.registry import (
     WorkspaceOccurrenceResolution,
@@ -41,10 +47,15 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
 )
+from cti_app.domain.production_editorial_enrichment import (
+    SourceFigureInclusionStatus,
+    editorial_enrichment_from_json,
+)
 from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionOperation,
     TargetedEditorialRevisionTarget,
 )
+from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.publication_render import PublicationPreviewStatus
 from cti_app.domain.typst_render import TypstRenderStatus
 
@@ -57,6 +68,39 @@ class EditorialRevisionTargetResolution:
     target: TargetedEditorialRevisionTarget
     target_id: str
     before_hash: str
+
+
+def _figure_insertion_available(
+    catalog_page: EditorialFigureCatalogPage | None,
+    *,
+    publication_kind: PublicationKind | None,
+    production_run_id: UUID,
+    integrated_count: int | None,
+) -> bool:
+    from cti_app.application.editorial_figure_catalog import (
+        EditorialFigureCatalogError,
+        validate_figure_insertion_limit,
+    )
+
+    if (
+        catalog_page is None
+        or catalog_page.available_count < 1
+        or not catalog_page.items
+        or publication_kind not in {PublicationKind.ARTICLE, PublicationKind.BRIEF}
+        or integrated_count is None
+        or catalog_page.items[0]._run_id != production_run_id
+    ):
+        return False
+    try:
+        validate_figure_insertion_limit(
+            publication_kind=publication_kind,
+            integrated_count=integrated_count,
+            requested_count=1,
+            inventory_limit=catalog_page.items[0]._inventory_max_figures,
+        )
+    except EditorialFigureCatalogError:
+        return False
+    return True
 
 
 def advance_workspace_registry(
@@ -87,9 +131,11 @@ class EditorialWorkspaceService:
         *,
         uow_factory: UnitOfWorkFactory,
         artifact_store: ProductionArtifactStore,
+        figure_catalog_service: EditorialFigureCatalogService | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._artifact_store = artifact_store
+        self._figure_catalog_service = figure_catalog_service
 
     async def snapshot(self, subject_id: UUID) -> dict[str, object]:
         result, _record, _synthesis = await self._load_current(subject_id)
@@ -245,6 +291,20 @@ class EditorialWorkspaceService:
         lock_creation: bool = True,
         commit_snapshot: bool = True,
     ) -> tuple[dict[str, object], WorkspaceSnapshotRecord, Mapping[str, Any]]:
+        figure_catalog_page: EditorialFigureCatalogPage | None = None
+        if uow is None and self._figure_catalog_service is not None:
+            from cti_app.application.editorial_figure_catalog import EditorialFigureCatalogError
+
+            try:
+                # Figure insertion is a manual operation and is advertised only
+                # when the current archived inventory has a selectable item.
+                figure_catalog_page = await self._figure_catalog_service.catalog(
+                    subject_id=subject_id,
+                    limit=1,
+                )
+            except EditorialFigureCatalogError:
+                pass
+
         async with self._uow_scope(uow) as uow:
             subject = await uow.subjects.get(subject_id)
             if subject is None:
@@ -421,6 +481,23 @@ class EditorialWorkspaceService:
                 pins=pins,
                 workspace_pin_hash_value=pin_hash,
             )
+            integrated_figure_count: int | None = None
+            if enrichment_content is not None:
+                try:
+                    parsed_enrichment = editorial_enrichment_from_json(enrichment_content)
+                except (TypeError, ValueError):
+                    pass
+                else:
+                    integrated_figure_count = sum(
+                        figure.inclusion_status is SourceFigureInclusionStatus.INCLUDED
+                        for figure in parsed_enrichment.source_figures
+                    )
+            figure_inventory_available = _figure_insertion_available(
+                figure_catalog_page,
+                publication_kind=kind,
+                production_run_id=run.id,
+                integrated_count=integrated_figure_count,
+            )
             blocks, enrichments, outline = project_blocks(
                 entries=entries,
                 synthesis=synthesis,
@@ -431,7 +508,7 @@ class EditorialWorkspaceService:
                 enrichment_artifact=enrichment_artifact,
                 enrichment_read_sha256=enrichment_sha,
                 allow_operations=kind is not None,
-                allow_figure_insertion=kind is not None,
+                allow_figure_insertion=kind is not None and figure_inventory_available,
             )
             impact = await uow.editorial_proposal_impacts.latest_for_run(run.id)
             publication_render = (

@@ -1205,9 +1205,20 @@ def _service(request: Request) -> EditorialWorkspaceService:
                 "message": "Le stockage des documents éditoriaux est indisponible.",
             },
         )
+    figure_catalog_service: EditorialFigureCatalogService | None = None
+    if (
+        isinstance(getattr(request.app.state, "settings", None), Settings)
+        or getattr(request.app.state, "collection_service", None) is not None
+    ):
+        figure_catalog_service = _figure_catalog_service(
+            request,
+            artifact_store=artifact_store,
+            uow_factory=request.app.state.uow_factory,
+        )
     return EditorialWorkspaceService(
         uow_factory=request.app.state.uow_factory,
         artifact_store=artifact_store,
+        figure_catalog_service=figure_catalog_service,
     )
 
 

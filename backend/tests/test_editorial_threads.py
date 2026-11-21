@@ -919,6 +919,13 @@ def test_proposal_context_offers_only_operations_with_a_preparation_path() -> No
     from cti_app.application.editorial_discussion_context import (
         _supported_proposal_operations,
     )
+    from cti_app.domain.production_editorial_revision import TargetedEditorialRevisionOperation
+
+    manual_enrichment_operations = {
+        TargetedEditorialRevisionOperation.CREATE_TABLE.value,
+        TargetedEditorialRevisionOperation.CREATE_BAR_CHART.value,
+        TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE.value,
+    }
 
     assert _supported_proposal_operations(
         stage="synthesis",
@@ -950,6 +957,35 @@ def test_proposal_context_offers_only_operations_with_a_preparation_path() -> No
         )
         == ()
     )
+    assert _supported_proposal_operations(
+        stage="synthesis",
+        block_kind="paragraph",
+        offered_operations=manual_enrichment_operations,
+        paragraph_validation_ready=False,
+        enrichment_validation_ready=True,
+        bar_chart_validation_ready=True,
+    ) == ("create_table", "create_bar_chart")
+    assert (
+        _supported_proposal_operations(
+            stage="synthesis",
+            block_kind="paragraph",
+            offered_operations=manual_enrichment_operations,
+            paragraph_validation_ready=False,
+            enrichment_validation_ready=False,
+            bar_chart_validation_ready=False,
+            include_manual_source_figure=True,
+        )
+        == ()
+    )
+    assert _supported_proposal_operations(
+        stage="synthesis",
+        block_kind="paragraph",
+        offered_operations=manual_enrichment_operations,
+        paragraph_validation_ready=False,
+        enrichment_validation_ready=True,
+        bar_chart_validation_ready=True,
+        include_manual_source_figure=True,
+    ) == ("create_table", "create_bar_chart", "create_source_figure")
 
 
 @pytest.mark.asyncio

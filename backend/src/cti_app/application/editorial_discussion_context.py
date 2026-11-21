@@ -221,7 +221,11 @@ class EditorialDiscussionContextBuilder:
             artifact_version=resolution.artifact_version,
             canonical_sha256=resolution.canonical_sha256,
         )
-        base = await self._load_base(origin, require_external_llm=False)
+        base = await self._load_base(
+            origin,
+            require_external_llm=False,
+            include_manual_source_figure=True,
+        )
         return self._compose_context(base, "", ())
 
     async def _load_base(
@@ -229,6 +233,7 @@ class EditorialDiscussionContextBuilder:
         thread: EditorialThread | EditorialThreadBinding,
         *,
         require_external_llm: bool = True,
+        include_manual_source_figure: bool = False,
     ) -> _EditorialDiscussionContextBase:
         origin = thread.origin if isinstance(thread, EditorialThread) else thread
         try:
@@ -599,6 +604,7 @@ class EditorialDiscussionContextBuilder:
                     anchor_registered=anchor_registered,
                 )
             ),
+            include_manual_source_figure=include_manual_source_figure,
         )
 
         return _EditorialDiscussionContextBase(
@@ -753,6 +759,7 @@ def _supported_proposal_operations(
     paragraph_validation_ready: bool,
     enrichment_validation_ready: bool = False,
     bar_chart_validation_ready: bool = False,
+    include_manual_source_figure: bool = False,
 ) -> tuple[str, ...]:
     if stage != "synthesis":
         return ()
@@ -766,6 +773,12 @@ def _supported_proposal_operations(
             operations.append("create_table")
         if "create_bar_chart" in offered_operations and bar_chart_validation_ready:
             operations.append("create_bar_chart")
+        if (
+            include_manual_source_figure
+            and "create_source_figure" in offered_operations
+            and enrichment_validation_ready
+        ):
+            operations.append("create_source_figure")
         return tuple(operations)
     return ()
 

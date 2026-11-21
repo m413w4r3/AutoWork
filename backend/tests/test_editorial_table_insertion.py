@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import cast
 from uuid import UUID, uuid4
 
 import httpx
@@ -205,6 +206,35 @@ def test_table_insertion_is_offered_for_a_registered_paragraph() -> None:
     ready = ready_to_prepare()
     assert ready
     assert "create_table" in allowed_operations(entry, synthesis, allow_table_insertion=ready)
+    assert "create_source_figure" not in allowed_operations(entry, synthesis)
+    assert "create_source_figure" in allowed_operations(
+        entry, synthesis, allow_figure_insertion=ready
+    )
+
+    def projected_operations(
+        *,
+        inventory_available: bool,
+        pinned_enrichment: ProductionArtifact = enrichment_artifact,
+    ) -> list[str]:
+        blocks, _, _ = project_blocks(
+            entries=(entry,),
+            synthesis=synthesis,
+            enrichment={},
+            record=record,
+            synthesis_artifact=synthesis_artifact,
+            synthesis_read_sha256=synthesis_sha256,
+            enrichment_artifact=pinned_enrichment,
+            enrichment_read_sha256=enrichment_sha256,
+            allow_figure_insertion=inventory_available,
+        )
+        return cast(list[str], blocks[0]["allowed_operations"])
+
+    assert "create_source_figure" not in projected_operations(inventory_available=False)
+    assert "create_source_figure" in projected_operations(inventory_available=True)
+    assert "create_source_figure" not in projected_operations(
+        inventory_available=True,
+        pinned_enrichment=replace(enrichment_artifact, status=ProductionArtifactStatus.STALE),
+    )
 
     for not_ready in (
         ready_to_prepare(
@@ -218,6 +248,98 @@ def test_table_insertion_is_offered_for_a_registered_paragraph() -> None:
         assert "create_table" not in allowed_operations(
             entry, synthesis, allow_table_insertion=not_ready
         )
+        assert "create_source_figure" not in allowed_operations(
+            entry, synthesis, allow_figure_insertion=not_ready
+        )
+
+
+def test_snapshot_orders_enrichments_by_position_then_element_key() -> None:
+    subject_id, run_id, synthesis_artifact_id, enrichment_artifact_id = (uuid4() for _ in range(4))
+    anchor_id = uuid4()
+    paragraph = {"text": "Synthetic registered paragraph."}
+    synthesis: dict[str, object] = {
+        "title": "Synthetic report",
+        "lead": [paragraph],
+        "sections": [],
+        "timeline": [],
+        "uncertainties": [],
+        "warnings": [],
+    }
+    synthesis_sha256 = canonical_content_sha256(synthesis)
+    anchor_entry = BlockRegistryEntry(
+        block_id=anchor_id,
+        kind=EditorialBlockKind.LEAD_PARAGRAPH,
+        parent_block_id=None,
+        position=0,
+        content_sha256=canonical_content_sha256(paragraph),
+        source_stage=EditorialSourceStage.SYNTHESIS,
+        structural_pointer="/lead/0",
+    )
+    placement = {"kind": "after_paragraph", "anchor_block_id": str(anchor_id)}
+    table = {"key": "z_table", "title": "Z table", "placement": placement}
+    charts = [
+        {"key": "a_chart", "title": "A chart", "placement": placement},
+        {"key": "z_chart", "title": "Z chart", "placement": placement},
+    ]
+    enrichment: dict[str, object] = {"tables": [table], "charts": charts}
+    enrichment_sha256 = canonical_content_sha256(enrichment)
+    enrichment_artifact = ProductionArtifact(
+        production_run_id=run_id,
+        subject_id=subject_id,
+        stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+        version=1,
+        input_hash="f" * 64,
+        canonical_blob_id=uuid4(),
+        id=enrichment_artifact_id,
+    )
+    table_entry = BlockRegistryEntry(
+        block_id=uuid4(),
+        kind=EditorialBlockKind.TABLE,
+        parent_block_id=None,
+        position=0,
+        content_sha256=canonical_content_sha256(table),
+        source_stage=EditorialSourceStage.EDITORIAL_ENRICHMENT,
+        structural_pointer="/tables/0",
+    )
+    chart_entries = tuple(
+        BlockRegistryEntry(
+            block_id=uuid4(),
+            kind=EditorialBlockKind.CHART,
+            parent_block_id=None,
+            position=index,
+            content_sha256=canonical_content_sha256(chart),
+            source_stage=EditorialSourceStage.EDITORIAL_ENRICHMENT,
+            structural_pointer=f"/charts/{index}",
+        )
+        for index, chart in enumerate(charts)
+    )
+    entries = (anchor_entry, table_entry, *chart_entries)
+    record = _workspace_record(
+        subject_id=subject_id,
+        production_run_id=run_id,
+        synthesis_artifact_id=synthesis_artifact_id,
+        synthesis_sha256=synthesis_sha256,
+        entries=entries,
+        enrichment_artifact=enrichment_artifact,
+        enrichment_sha256=enrichment_sha256,
+    )
+
+    blocks, _, _ = project_blocks(
+        entries=entries,
+        synthesis=synthesis,
+        enrichment=enrichment,
+        record=record,
+        allow_operations=False,
+    )
+
+    anchor_index = next(
+        index for index, block in enumerate(blocks) if block["block_id"] == str(anchor_id)
+    )
+    assert [block["block_id"] for block in blocks[anchor_index + 1 : anchor_index + 4]] == [
+        str(chart_entries[0].block_id),
+        str(table_entry.block_id),
+        str(chart_entries[1].block_id),
+    ]
 
 
 def test_snapshot_projects_pinned_table_after_its_registered_anchor() -> None:
