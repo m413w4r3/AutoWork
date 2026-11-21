@@ -430,7 +430,7 @@ test("accepts a supported bar chart and renders it after its anchor in snapshot 
     fullPage: false,
   });
 
-  await page.getByRole("button", { name: "Proposer" }).click();
+  await page.getByRole("button", { name: "Proposer", exact: true }).click();
   const comparison = page.getByRole("region", {
     name: "Comparaison de l’insertion de graphique",
   });
@@ -508,7 +508,7 @@ test("offers a descriptive table when the chart endpoint refuses insufficient da
   await page.goto(`/subjects/${subjectId}/editor`);
   await openChartComposer(page);
   await fillChartForm(page);
-  await page.getByRole("button", { name: "Proposer" }).click();
+  await page.getByRole("button", { name: "Proposer", exact: true }).click();
   await expect(page.getByRole("alert")).toHaveText(insufficientDataMessage);
   await page
     .getByRole("button", { name: "Proposer un tableau à la place" })

@@ -830,6 +830,7 @@ async function prepareState(page: Page, state: VisualState) {
     return;
   }
   if (state === "figure-gallery-selected") {
+    await page.getByRole("tab", { name: "Sources" }).click();
     await page.getByRole("button", { name: "Images sources" }).click();
     const gallery = page.getByRole("dialog", {
       name: "Galerie d’images sources",

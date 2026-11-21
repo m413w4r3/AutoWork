@@ -566,9 +566,13 @@ describe("atelier éditorial", () => {
     const menuToggle = await screen.findByRole("button", {
       name: "Historique et détails",
     });
-    expect(
-      document.querySelector(".editorial-block-actions__more summary"),
-    ).toHaveTextContent("Autres actions du bloc");
+    const moreActions = document.querySelector(
+      ".editorial-block-actions__more summary",
+    );
+    expect(moreActions).toHaveTextContent("···");
+    expect(moreActions?.getAttribute("aria-label") ?? "").toContain(
+      "Autres actions pour",
+    );
     expect(
       screen.queryByRole("button", { name: "Plus" }),
     ).not.toBeInTheDocument();

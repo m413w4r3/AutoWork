@@ -20,6 +20,7 @@ import { editorialReadOnlyReasonText } from "../publication/publicationReadOnly"
 import { EditorialWorkspaceLayout } from "./EditorialWorkspaceLayout";
 import { useEditorialDrafts } from "./EditorialDrafts";
 import { EditorialWorkspaceStatus } from "./EditorialWorkspaceStatus";
+import { manualEditOperationFor } from "./manualEditOperation";
 import { editorialWorkspaceQueryKeys } from "./editorialWorkspaceQueries";
 import { useManualEditorialEdit } from "./useManualEditorialEdit";
 import "./editorialWorkspace.css";
@@ -292,12 +293,12 @@ function CurrentEditorialWorkspacePage({
       {savedManualEdit ? (
         <p
           key={savedManualEdit.proposalId}
-          className="sr-only editorial-manual-edit-confirmation"
+          className="editorial-manual-edit-confirmation"
           role="status"
+          aria-live="polite"
           data-proposal-id={savedManualEdit.proposalId}
         >
-          Modification manuelle enregistrée (version{" "}
-          {savedManualEdit.artifactVersion}).
+          Enregistré · v{savedManualEdit.artifactVersion}
         </p>
       ) : null}
       {hasNoProducedContent ? (
@@ -332,13 +333,8 @@ function CurrentEditorialWorkspacePage({
           );
           if (!block)
             throw new Error("Ce bloc n’existe plus dans cette version.");
-          const operation =
-            block.kind === "title"
-              ? "rewrite_title"
-              : block.kind === "lead_paragraph" || block.kind === "paragraph"
-                ? "rewrite_paragraph"
-                : null;
-          if (!operation || !block.allowed_operations.includes(operation)) {
+          const operation = manualEditOperationFor(block);
+          if (!operation) {
             throw new Error("Ce bloc ne peut pas être modifié directement.");
           }
           setSavedManualEdit(null);
@@ -352,6 +348,7 @@ function CurrentEditorialWorkspacePage({
             proposalId: accepted.id,
             artifactVersion: accepted.artifact_version,
           });
+          return accepted.artifact_version;
         }}
       />
     </>

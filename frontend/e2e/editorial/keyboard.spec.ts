@@ -660,14 +660,14 @@ test("test_async_reply_does_not_steal_focus", async ({ page }) => {
   await composer.press("Control+Enter");
   await expect(page.getByText("Message envoyé.")).toBeVisible();
 
-  const galleryButton = page.getByRole("button", { name: "Images sources" });
-  await page.keyboard.press("Tab");
-  await expect(galleryButton).toBeFocused();
+  const focusAnchor = page.getByRole("button", { name: "Changer de cible" });
+  await focusAnchor.focus();
+  await expect(focusAnchor).toBeFocused();
   replyAvailable = true;
   await expect(page.getByText("Réponse synthétique du Bridge.")).toBeVisible({
     timeout: 10_000,
   });
-  await expect(galleryButton).toBeFocused();
+  await expect(focusAnchor).toBeFocused();
   expect(unexpectedRequests).toEqual([]);
 });
 

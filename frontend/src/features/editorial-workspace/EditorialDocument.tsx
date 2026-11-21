@@ -3,6 +3,7 @@ import type { KeyboardEvent } from "react";
 
 import {
   editorialFigureThumbnailUrl,
+  type EditorialWorkspaceBlock,
   type EditorialWorkspaceFigure,
   type EditorialWorkspaceSnapshot,
 } from "../../api/editorialWorkspace";
@@ -10,6 +11,8 @@ import { BLOCK_KIND_LABELS } from "./blockKindLabels";
 import { InlineTextEditor } from "./InlineTextEditor";
 import type { InlineTextEditorProps } from "./InlineTextEditor";
 import { ManualBarChartPreview } from "./ManualBarChartPreview";
+import { manualEditOperationFor } from "./manualEditOperation";
+import { VisualInsertionComposer } from "./VisualInsertionComposer";
 
 function EditorialSourceFigure({
   subjectId,
@@ -82,6 +85,166 @@ interface EditorialDocumentProps {
   onResumeDraft: (blockId: string) => void;
   onCancelDraft: (blockId: string) => void;
   onSave?: InlineTextEditorProps["onSave"];
+  readOnly?: boolean;
+  onStartEditing?: (blockId: string) => void;
+  onDiscuss?: (blockId: string) => void;
+  onOpenSources?: (blockId: string) => void;
+  onOpenHistory?: (blockId: string) => void;
+  onAskBridge?: (instruction: string) => void;
+  onRefresh?: () => void;
+}
+
+const INSERTION_OPERATIONS = [
+  "insert_after",
+  "create_table",
+  "create_bar_chart",
+  "create_source_figure",
+];
+
+function blockLabel(block: EditorialWorkspaceBlock): string {
+  const text = block.text?.trim();
+  const excerpt =
+    text && text.length > 60 ? `${text.slice(0, 57).trimEnd()}…` : text;
+  return excerpt
+    ? `${BLOCK_KIND_LABELS[block.kind]} : ${excerpt}`
+    : BLOCK_KIND_LABELS[block.kind];
+}
+
+function BlockActionBar({
+  snapshot,
+  block,
+  readOnly,
+  onStartEditing,
+  onDiscuss,
+  onOpenSources,
+  onOpenHistory,
+  onAskBridge,
+  onRefresh,
+}: {
+  snapshot: EditorialWorkspaceSnapshot;
+  block: EditorialWorkspaceBlock;
+  readOnly: boolean;
+  onStartEditing?: (blockId: string) => void;
+  onDiscuss?: (blockId: string) => void;
+  onOpenSources?: (blockId: string) => void;
+  onOpenHistory?: (blockId: string) => void;
+  onAskBridge?: (instruction: string) => void;
+  onRefresh?: () => void;
+}) {
+  const operation = manualEditOperationFor(block);
+  const canModify = Boolean(
+    !readOnly &&
+    snapshot.capabilities.manual_edit &&
+    operation &&
+    onStartEditing,
+  );
+  const canDiscuss = Boolean(
+    !readOnly &&
+    snapshot.capabilities.can_discuss &&
+    block.text !== null &&
+    onDiscuss,
+  );
+  const canInsertAfter = Boolean(
+    !readOnly &&
+    snapshot.capabilities.can_add_enrichment &&
+    (block.kind === "paragraph" || block.kind === "lead_paragraph") &&
+    block.allowed_operations.includes("insert_after"),
+  );
+  const canViewSources = Boolean(
+    block.evidence_refs.length > 0 && onOpenSources,
+  );
+  const consumed = new Set<string>([
+    ...(operation ? [operation] : []),
+    ...(canInsertAfter ? INSERTION_OPERATIONS : []),
+  ]);
+  const unsupportedOperations = block.allowed_operations.filter(
+    (candidate) =>
+      !consumed.has(candidate) &&
+      candidate !== "discuss" &&
+      candidate !== "sources",
+  );
+  const canOpenMore =
+    !readOnly && Boolean(onOpenHistory || unsupportedOperations.length > 0);
+
+  if (
+    !canModify &&
+    !canDiscuss &&
+    !canInsertAfter &&
+    !canViewSources &&
+    !canOpenMore
+  ) {
+    return null;
+  }
+
+  return (
+    <div
+      className="editorial-block-actions editorial-block-actions--block"
+      role="toolbar"
+      aria-label={`Actions du bloc : ${blockLabel(block)}`}
+    >
+      {canModify ? (
+        <button
+          className="button button--secondary"
+          type="button"
+          onClick={() => onStartEditing?.(block.block_id)}
+        >
+          Modifier
+        </button>
+      ) : null}
+      {canDiscuss ? (
+        <button
+          className="button button--secondary"
+          type="button"
+          onClick={() => onDiscuss?.(block.block_id)}
+        >
+          Discuter
+        </button>
+      ) : null}
+      {canInsertAfter ? (
+        <VisualInsertionComposer
+          key={block.block_id}
+          subjectId={snapshot.subject_id}
+          snapshot={snapshot}
+          block={block}
+          readOnly={readOnly}
+          onAskBridge={onAskBridge}
+          onRefresh={onRefresh}
+        />
+      ) : null}
+      {canViewSources ? (
+        <button
+          className="button button--secondary"
+          type="button"
+          onClick={() => onOpenSources?.(block.block_id)}
+        >
+          Sources
+        </button>
+      ) : null}
+      {canOpenMore ? (
+        <details className="editorial-block-actions__more">
+          <summary aria-label={`Autres actions pour ${blockLabel(block)}`}>
+            ···
+          </summary>
+          {onOpenHistory ? (
+            <button
+              className="button button--secondary"
+              type="button"
+              onClick={() => onOpenHistory(block.block_id)}
+            >
+              Historique
+            </button>
+          ) : null}
+          {unsupportedOperations.length > 0 ? (
+            <p>
+              Certaines opérations déclarées par le serveur ne sont pas exposées
+              par cet atelier. Aucune action canonique correspondante n’est
+              disponible ici.
+            </p>
+          ) : null}
+        </details>
+      ) : null}
+    </div>
+  );
 }
 
 function blockContent(
@@ -210,7 +373,19 @@ export function EditorialDocument({
   onResumeDraft,
   onCancelDraft,
   onSave,
+  readOnly = false,
+  onStartEditing,
+  onDiscuss,
+  onOpenSources,
+  onOpenHistory,
+  onAskBridge,
+  onRefresh,
 }: EditorialDocumentProps) {
+  const [hoveredBlockId, setHoveredBlockId] = useState<string | null>(null);
+  const [focusedBlockId, setFocusedBlockId] = useState<string | null>(null);
+  const actionBlockId =
+    hoveredBlockId ?? focusedBlockId ?? selectedBlockId ?? null;
+
   return (
     <article className="editorial-document" aria-label="Document éditorial">
       {snapshot.blocks.map((block) => {
@@ -234,6 +409,25 @@ export function EditorialDocument({
             data-block-id={block.block_id}
             data-selected={selected}
             data-kind={block.kind}
+            onMouseEnter={() => setHoveredBlockId(block.block_id)}
+            onMouseLeave={() =>
+              setHoveredBlockId((current) =>
+                current === block.block_id ? null : current,
+              )
+            }
+            onFocus={() => setFocusedBlockId(block.block_id)}
+            onBlur={(event) => {
+              const nextFocus = event.relatedTarget;
+              if (
+                nextFocus instanceof Node &&
+                event.currentTarget.contains(nextFocus)
+              ) {
+                return;
+              }
+              setFocusedBlockId((current) =>
+                current === block.block_id ? null : current,
+              );
+            }}
             onClick={(event) => {
               if (
                 event.target instanceof HTMLElement &&
@@ -289,6 +483,19 @@ export function EditorialDocument({
               >
                 Bloc sélectionné
               </span>
+            ) : null}
+            {!editing && actionBlockId === block.block_id ? (
+              <BlockActionBar
+                snapshot={snapshot}
+                block={block}
+                readOnly={readOnly}
+                onStartEditing={onStartEditing}
+                onDiscuss={onDiscuss}
+                onOpenSources={onOpenSources}
+                onOpenHistory={onOpenHistory}
+                onAskBridge={onAskBridge}
+                onRefresh={onRefresh}
+              />
             ) : null}
           </div>
         );

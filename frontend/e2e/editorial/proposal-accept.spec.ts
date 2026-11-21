@@ -394,7 +394,7 @@ test("shows a recoverable French conflict without leaving the selected thread", 
     page.getByRole("button", { name: "Comparer à nouveau" }),
   ).toBeVisible();
   await expect(
-    page.getByRole("button", { name: "Demander une variante" }),
+    card.getByRole("button", { name: "Demander une variante" }),
   ).toBeVisible();
   await page
     .getByRole("button", { name: "Comparer à nouveau" })
@@ -406,7 +406,7 @@ test("shows a recoverable French conflict without leaving the selected thread", 
 
   await page.getByRole("button", { name: "Comparer à nouveau" }).click();
   await expect(card.getByText("Périmée")).toBeVisible();
-  await page.getByRole("button", { name: "Demander une variante" }).click();
+  await card.getByRole("button", { name: "Demander une variante" }).click();
   await expect(page.getByLabel("Votre message à Bridge")).toBeFocused();
   await expect(
     page.getByRole("button", { name: "Générer une proposition" }),

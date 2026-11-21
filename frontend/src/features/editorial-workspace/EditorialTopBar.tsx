@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useLayoutEffect, useRef } from "react";
 
 import type {
   EditorialCompositionStatusView,
@@ -18,6 +18,10 @@ interface EditorialTopBarProps {
   stale: boolean;
   hasLocalDrafts?: boolean;
   hasStaleLocalDrafts?: boolean;
+  readOnlyReason?: string | null;
+  manualEditSaving?: boolean;
+  manualEditConflict?: boolean;
+  pendingProposal?: boolean;
   menuOpen: boolean;
   technicalOpen: boolean;
   onToggleMenu: (button: HTMLButtonElement) => void;
@@ -67,6 +71,10 @@ export function EditorialTopBar({
   stale,
   hasLocalDrafts = false,
   hasStaleLocalDrafts = false,
+  readOnlyReason = null,
+  manualEditSaving = false,
+  manualEditConflict = false,
+  pendingProposal = false,
   menuOpen,
   technicalOpen,
   onToggleMenu,
@@ -79,6 +87,25 @@ export function EditorialTopBar({
   onNavigateAway = () => true,
 }: EditorialTopBarProps) {
   const historyDisclosureRef = useRef<HTMLButtonElement>(null);
+  const headerRef = useRef<HTMLElement>(null);
+  useLayoutEffect(() => {
+    const header = headerRef.current;
+    if (!header) return;
+    const applyHeight = () => {
+      const height = header.getBoundingClientRect().height;
+      if (height > 0) {
+        document.documentElement.style.setProperty(
+          "--editorial-topbar-height",
+          `${height}px`,
+        );
+      }
+    };
+    applyHeight();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(applyHeight);
+    observer.observe(header);
+    return () => observer.disconnect();
+  }, []);
   const title =
     snapshot.blocks.find((block) => block.kind === "title")?.text?.trim() ||
     "Document éditorial";
@@ -87,36 +114,52 @@ export function EditorialTopBar({
   const currentPdfStatus = pdfStatus?.status ?? snapshot.preview_status;
   const statusLabel = pdfStatusUnavailable
     ? "Statut PDF indisponible"
-    : currentPdfStatus === "STALE"
-      ? "PDF obsolète"
-      : currentPdfStatus === "GENERATING"
-        ? "Génération du PDF en cours"
-        : currentPdfStatus === "FAILED"
-          ? "Erreur de rendu du PDF"
-          : stale || hasStaleLocalDrafts
-            ? "Version périmée"
-            : hasLocalDrafts
-              ? "Brouillon local"
-              : "À jour";
+    : readOnlyReason !== null
+      ? "Lecture seule"
+      : manualEditConflict
+        ? "Conflit"
+        : manualEditSaving
+          ? "Modification en cours"
+          : currentPdfStatus === "STALE"
+            ? "PDF obsolète"
+            : currentPdfStatus === "GENERATING"
+              ? "Génération du PDF en cours"
+              : currentPdfStatus === "FAILED"
+                ? "Erreur de rendu du PDF"
+                : stale || hasStaleLocalDrafts
+                  ? "Version périmée"
+                  : pendingProposal
+                    ? "Proposition en attente"
+                    : hasLocalDrafts
+                      ? "Brouillon local"
+                      : "À jour";
   const pdfErrorMessage =
     pdfRegenerationError ??
     pdfStatus?.error_message ??
     "La génération du PDF a échoué. Vérifiez la configuration Typst avant de relancer le rendu.";
   const statusDescription = pdfStatusUnavailable
     ? "L’état du PDF n’a pas pu être lu. Actualisez son statut avant de relancer une génération."
-    : currentPdfStatus === "STALE"
-      ? "Le PDF correspond à une version antérieure du document. Régénérez l’aperçu pour consulter la version actuelle."
-      : currentPdfStatus === "GENERATING"
-        ? "La génération du PDF est en cours. Le document reste consultable."
-        : currentPdfStatus === "FAILED"
-          ? pdfErrorMessage
-          : stale
-            ? "Le document a changé. Actualisez le statut de l’atelier."
-            : hasStaleLocalDrafts
-              ? "La version du document a changé depuis ce brouillon. Il est conservé et n’a pas été appliqué à la version actuelle."
-              : hasLocalDrafts
-                ? "Un brouillon de ce bloc n’est pas encore enregistré comme nouvelle version canonique."
-                : "Le document affiché correspond à la dernière version canonique enregistrée.";
+    : readOnlyReason !== null
+      ? "Le document est en lecture seule : aucune modification canonique n’est possible."
+      : manualEditConflict
+        ? "La version a changé depuis le début de cette modification ; aucun changement concurrent n’a été écrasé."
+        : manualEditSaving
+          ? "Une modification est en cours de validation ; le document affiché est encore la version enregistrée."
+          : currentPdfStatus === "STALE"
+            ? "Le PDF correspond à une version antérieure du document. Régénérez l’aperçu pour consulter la version actuelle."
+            : currentPdfStatus === "GENERATING"
+              ? "La génération du PDF est en cours. Le document reste consultable."
+              : currentPdfStatus === "FAILED"
+                ? pdfErrorMessage
+                : stale
+                  ? "Le document a changé. Actualisez le statut de l’atelier."
+                  : hasStaleLocalDrafts
+                    ? "La version du document a changé depuis ce brouillon. Il est conservé et n’a pas été appliqué à la version actuelle."
+                    : pendingProposal
+                      ? "Une proposition attend votre décision ; le document canonique reste inchangé."
+                      : hasLocalDrafts
+                        ? "Un brouillon de ce bloc n’est pas encore enregistré comme nouvelle version canonique."
+                        : "Le document affiché correspond à la dernière version canonique enregistrée.";
   const publicationKindLabel =
     snapshot.publication_kind === "article"
       ? "Article"
@@ -137,7 +180,7 @@ export function EditorialTopBar({
       currentPdfStatus === "FAILED");
 
   return (
-    <header className="editorial-topbar">
+    <header className="editorial-topbar" ref={headerRef}>
       <div className="editorial-topbar__identity">
         <div className="editorial-topbar__back">
           <a
@@ -176,7 +219,13 @@ export function EditorialTopBar({
         <span
           className={
             "editorial-status" +
-            (stale || hasStaleLocalDrafts || currentPdfStatus !== "READY"
+            (stale ||
+            hasStaleLocalDrafts ||
+            currentPdfStatus !== "READY" ||
+            readOnlyReason !== null ||
+            manualEditConflict ||
+            manualEditSaving ||
+            pendingProposal
               ? " editorial-status--attention"
               : "")
           }

@@ -211,6 +211,7 @@ test("un paragraphe garde son contexte exact aux largeurs desktop attendues", as
   await paragraph.click();
   await expect(paragraph).toHaveAttribute("data-selected", "true");
   await expect(page.getByText("Section : Contexte")).toBeVisible();
+  await page.getByRole("tab", { name: "Sources" }).click();
   await expect(
     page.getByText("Passage étayant l’occurrence sélectionnée."),
   ).toBeVisible();

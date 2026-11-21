@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { ApiError } from "../../api/editions";
 import type {
   EditorialCompositionStatusView,
   EditorialPdfStatusView,
@@ -12,6 +13,8 @@ import { EditorialDocument } from "./EditorialDocument";
 import type { EditorialDraftController } from "./EditorialDrafts";
 import type { InlineTextEditorProps } from "./InlineTextEditor";
 import { EditorialInspector } from "./EditorialInspector";
+import type { InspectorTab } from "./EditorialInspector";
+import { manualEditOperationFor } from "./manualEditOperation";
 import { EditorialOutline } from "./EditorialOutline";
 import { EditorialServerDraftStatus } from "./EditorialServerDraftStatus";
 import { SourceFigureGallery } from "./SourceFigureGallery";
@@ -83,6 +86,14 @@ export function EditorialWorkspaceLayout({
   const [historyOpen, setHistoryOpen] = useState(false);
   const [figureGalleryOpen, setFigureGalleryOpen] = useState(false);
   const [editingBlockId, setEditingBlockId] = useState<string | null>(null);
+  const [inspectorTab, setInspectorTab] = useState<InspectorTab>("discussion");
+  const [focusComposerRequest, setFocusComposerRequest] = useState(0);
+  const [bridgeProposalPrompt, setBridgeProposalPrompt] = useState<
+    string | null
+  >(null);
+  const [manualSaving, setManualSaving] = useState(false);
+  const [manualConflict, setManualConflict] = useState(false);
+  const [pendingProposal, setPendingProposal] = useState(false);
   const overlayOpenerRef = useRef<HTMLElement | null>(null);
   const historyOpenerRef = useRef<HTMLButtonElement | null>(null);
   const leaveConfirmedRef = useRef(false);
@@ -129,13 +140,9 @@ export function EditorialWorkspaceLayout({
   const canEditBlock = (block: EditorialWorkspaceBlock | null) =>
     Boolean(
       block &&
-      block.text !== null &&
       !readOnly &&
       snapshot.capabilities.manual_edit &&
-      block.allowed_operations.some(
-        (operation) =>
-          operation.startsWith("rewrite_") || operation === "modify",
-      ),
+      manualEditOperationFor(block),
     );
 
   const selectBlock = (blockId: string) => {
@@ -188,8 +195,49 @@ export function EditorialWorkspaceLayout({
 
   const saveDraft = async (blockId: string, value: string) => {
     if (!onSave) return;
-    await onSave(blockId, value);
-    cancelDraft(blockId);
+    setManualSaving(true);
+    setManualConflict(false);
+    try {
+      await onSave(blockId, value);
+      cancelDraft(blockId);
+    } catch (error) {
+      setManualConflict(error instanceof ApiError && error.status === 409);
+      throw error;
+    } finally {
+      setManualSaving(false);
+    }
+  };
+
+  const discussBlock = (blockId: string) => {
+    selectBlock(blockId);
+    setInspectorTab("discussion");
+    setOpenPanel(null);
+    setMenuOpen(false);
+    setFocusComposerRequest((request) => request + 1);
+  };
+
+  const openSourcesForBlock = (blockId: string) => {
+    selectBlock(blockId);
+    setInspectorTab("sources");
+    setOpenPanel(null);
+    setMenuOpen(false);
+    window.requestAnimationFrame(() => {
+      const heading = document.getElementById("editorial-evidence-heading");
+      if (typeof heading?.scrollIntoView === "function") {
+        heading.scrollIntoView({ block: "nearest" });
+      }
+    });
+  };
+
+  const openHistoryForBlock = (blockId: string) => {
+    selectBlock(blockId);
+    historyOpenerRef.current =
+      document.activeElement instanceof HTMLButtonElement
+        ? document.activeElement
+        : null;
+    overlayOpenerRef.current = null;
+    setHistoryOpen(true);
+    setMenuOpen(false);
   };
 
   const allowNavigationAway = () => {
@@ -203,7 +251,18 @@ export function EditorialWorkspaceLayout({
     setHistoryOpen(false);
     const opener = historyOpenerRef.current;
     historyOpenerRef.current = null;
-    window.requestAnimationFrame(() => opener?.focus({ preventScroll: true }));
+    window.requestAnimationFrame(() => {
+      const selected = document.querySelector<HTMLElement>(
+        '.editorial-document__block[data-selected="true"]',
+      );
+      if (typeof selected?.scrollIntoView === "function") {
+        selected.scrollIntoView({ block: "nearest" });
+      }
+      opener?.focus({ preventScroll: true });
+      if (document.activeElement === document.body) {
+        selected?.focus({ preventScroll: true });
+      }
+    });
   }, []);
 
   useEffect(() => {
@@ -271,24 +330,12 @@ export function EditorialWorkspaceLayout({
     setOpenPanel(null);
     setMenuOpen(false);
     overlayOpenerRef.current = null;
-  };
-
-  const showSources = () => {
-    const compactViewport =
-      typeof window.matchMedia === "function" &&
-      window.matchMedia("(max-width: 1023px)").matches;
-    const activeElement = document.activeElement;
-    overlayOpenerRef.current =
-      compactViewport && activeElement instanceof HTMLElement
-        ? activeElement
-        : null;
-    setOpenPanel(compactViewport ? "inspector" : null);
     window.requestAnimationFrame(() => {
-      const evidenceHeading = document.getElementById(
-        "editorial-evidence-heading",
+      const target = document.querySelector<HTMLElement>(
+        `.editorial-document__block[data-block-id="${CSS.escape(blockId)}"]`,
       );
-      if (typeof evidenceHeading?.scrollIntoView === "function") {
-        evidenceHeading.scrollIntoView({ block: "nearest" });
+      if (typeof target?.scrollIntoView === "function") {
+        target.scrollIntoView({ block: "start" });
       }
     });
   };
@@ -376,6 +423,10 @@ export function EditorialWorkspaceLayout({
         stale={stale}
         hasLocalDrafts={localDrafts.hasDrafts}
         hasStaleLocalDrafts={localDrafts.hasStaleDrafts}
+        readOnlyReason={readOnlyReason}
+        manualEditSaving={manualSaving}
+        manualEditConflict={manualConflict}
+        pendingProposal={pendingProposal}
         menuOpen={menuOpen}
         technicalOpen={technicalOpen}
         onToggleMenu={toggleMenu}
@@ -497,6 +548,13 @@ export function EditorialWorkspaceLayout({
             onResumeDraft={resumeDraft}
             onCancelDraft={cancelDraft}
             onSave={onSave ? saveDraft : undefined}
+            readOnly={readOnly}
+            onStartEditing={startEditing}
+            onDiscuss={discussBlock}
+            onOpenSources={openSourcesForBlock}
+            onOpenHistory={openHistoryForBlock}
+            onAskBridge={setBridgeProposalPrompt}
+            onRefresh={onRefresh}
           />
         </div>
         <div
@@ -512,16 +570,22 @@ export function EditorialWorkspaceLayout({
             readOnly={readOnly}
             isEditing={editingBlockId === selectedBlock?.block_id}
             localDraftText={localDraftText}
+            activeTab={inspectorTab}
+            focusComposerRequest={focusComposerRequest}
+            proposalPrompt={bridgeProposalPrompt}
+            onProposalPromptApplied={() => setBridgeProposalPrompt(null)}
             onLocalDraftChange={(text) => {
               if (selectedBlock)
                 onLocalDraftChange(selectedBlock.block_id, text);
             }}
             onStartEditing={startEditing}
             onRefresh={onRefresh}
-            onOpenSources={showSources}
             onOpenFigureGallery={() => setFigureGalleryOpen(true)}
             onBackToDocument={closeActiveOverlay}
             onChangeTarget={returnToTargetChoice}
+            onTabChange={setInspectorTab}
+            onOpenHistoryThread={openHistoryThread}
+            onPendingProposalsChange={setPendingProposal}
           />
         </div>
       </div>
