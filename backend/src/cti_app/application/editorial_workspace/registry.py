@@ -29,7 +29,13 @@ from cti_app.domain.production import (
     ProductionArtifactStatus,
 )
 from cti_app.domain.production_editorial_enrichment import (
+    EditorialEnrichmentElementKind,
+    EnrichmentElementRef,
+    EnrichmentOrderEntry,
+    EnrichmentPlacementKind,
+    EnrichmentPlacementV1,
     EnrichmentTableKind,
+    enrichment_order_rank_from_entries,
 )
 from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionOperation,
@@ -516,6 +522,27 @@ def resolve_workspace_target(
     )
 
 
+def _enrichment_placement(
+    placement_kind: str, placement: Mapping[str, Any]
+) -> EnrichmentPlacementV1:
+    """Typed placement for the shared ordering function; raises when malformed."""
+    kind = EnrichmentPlacementKind(placement_kind)
+    if kind is EnrichmentPlacementKind.AFTER_SECTION:
+        section_index = int(placement["section_index"])
+    else:
+        section_index = None
+    anchor_block_id = (
+        UUID(str(placement["anchor_block_id"]))
+        if kind is EnrichmentPlacementKind.AFTER_PARAGRAPH
+        else None
+    )
+    return EnrichmentPlacementV1(
+        kind=kind,
+        section_index=section_index,
+        anchor_block_id=anchor_block_id,
+    )
+
+
 def project_blocks(
     *,
     entries: Sequence[BlockRegistryEntry],
@@ -696,8 +723,9 @@ def project_blocks(
     block_by_id = {UUID(str(block["block_id"])): block for block in blocks}
     synthesis_blocks = [block_by_id[entry.block_id] for entry in synthesis_entries]
     enrichment_blocks_by_id = {UUID(str(block["block_id"])): block for block in enrichments}
-    insertions: dict[int, list[tuple[int, int, str, dict[str, object]]]] = {}
+    insertions: dict[int, list[tuple[int, EnrichmentElementRef, str, dict[str, object]]]] = {}
     stale_enrichments: list[tuple[int, str, dict[str, object]]] = []
+    order_entries: list[EnrichmentOrderEntry] = []
     section_count = len(synthesis.get("sections", []))
     for entry in enrichment_entries:
         if enrichment is None:
@@ -709,6 +737,10 @@ def project_blocks(
         if not isinstance(placement, Mapping) or not isinstance(placement.get("kind"), str):
             raise EditorialRegistryConflictError("editorial_registry_conflict")
         placement_kind = str(placement["kind"])
+        try:
+            typed_placement = _enrichment_placement(placement_kind, placement)
+        except (KeyError, TypeError, ValueError):
+            typed_placement = None
         section_index: int | None = None
         stale_anchor = False
         if placement_kind == "after_lead":
@@ -774,24 +806,33 @@ def project_blocks(
             enrichment_block["revision_status"] = "stale"
             stale_enrichments.append((entry.position, element_key, enrichment_block))
             continue
-        insertions.setdefault(boundary, []).append(
-            (
-                placement_rank,
-                (
-                    int(item["order"])
-                    if entry.kind is EditorialBlockKind.FIGURE and type(item.get("order")) is int
-                    else entry.position
-                ),
-                element_key,
-                enrichment_block,
+        if typed_placement is None:
+            raise EditorialRegistryConflictError("editorial_registry_conflict")
+        element_kind = EditorialEnrichmentElementKind(entry.kind.value)
+        element_ref = EnrichmentElementRef(element_kind, element_key)
+        order_entries.append(
+            EnrichmentOrderEntry(
+                kind=element_kind,
+                key=element_key,
+                placement=typed_placement,
+                family_index=entry.position,
+                group_order=(item["group_order"] if type(item.get("group_order")) is int else None),
             )
         )
+        insertions.setdefault(boundary, []).append(
+            (placement_rank, element_ref, element_key, enrichment_block)
+        )
+
+    order_rank = enrichment_order_rank_from_entries(order_entries)
 
     ordered_blocks: list[dict[str, object]] = []
     ordered_enrichments: list[dict[str, object]] = []
     for boundary in range(len(synthesis_blocks) + 1):
-        attached = sorted(insertions.get(boundary, []), key=lambda item: item[:3])
-        for _rank, _document_order, _key, block in attached:
+        attached = sorted(
+            insertions.get(boundary, []),
+            key=lambda item: (item[0], order_rank[item[1]], item[2]),
+        )
+        for _rank, _element_ref, _key, block in attached:
             ordered_blocks.append(block)
             ordered_enrichments.append(block)
         if boundary < len(synthesis_blocks):

@@ -21,6 +21,7 @@ from cti_app.domain.production import ExtractionProfile, ProductionEvidenceBasis
 from cti_app.domain.production_editorial_enrichment import (
     EDITORIAL_ENRICHMENT_POLICY_VERSION,
     EDITORIAL_ENRICHMENT_SCHEMA_VERSION,
+    EDITORIAL_ENRICHMENT_V11_POLICY_VERSION,
     DiagramEdgeV1,
     DiagramGroupV1,
     DiagramNodeV1,
@@ -28,9 +29,12 @@ from cti_app.domain.production_editorial_enrichment import (
     DiagramRelationDirection,
     DiagramSpecV1,
     EditorialAnalyticPurposeV1,
+    EditorialEnrichmentElementKind,
     EditorialEnrichmentV1,
     EnrichmentDiagramDirection,
     EnrichmentDiagramKind,
+    EnrichmentElementRef,
+    EnrichmentOrderEntry,
     EnrichmentPlacementKind,
     EnrichmentPlacementV1,
     EnrichmentTableKind,
@@ -42,10 +46,17 @@ from cti_app.domain.production_editorial_enrichment import (
     TableColumnV1,
     TableRowV1,
     TableSpecV1,
+    clear_group_order,
     editorial_enrichment_evidence_refs,
     editorial_enrichment_from_json,
     editorial_enrichment_to_json,
+    enrichment_element_order,
+    enrichment_order_rank,
+    enrichment_order_rank_from_entries,
+    next_group_order,
+    remove_enrichment_element,
     source_figure_id,
+    with_element_group_order,
 )
 from cti_app.domain.production_extraction import (
     EXTRACTION_PROFILE_POLICY_VERSION,
@@ -677,3 +688,340 @@ def test_label_coverage_tolerates_accents_inflection_and_partial_wording():
     assert _record_covers(record, "Malware qui récupérait des donnees")
     assert not _record_covers(record, "Compromission du portefeuille crypto")
     assert not _record_covers(record, "")
+
+
+def _ordering_enrichment(
+    *,
+    schema_version: int = 11,
+    tables: tuple[TableSpecV1, ...] = (),
+    diagrams: tuple[DiagramSpecV1, ...] = (),
+    figures: tuple[SourceFigureCandidateV1, ...] = (),
+) -> EditorialEnrichmentV1:
+    extraction = _extraction()
+    synthesis = _synthesis(extraction)
+    base = _populated_enrichment(extraction, synthesis)
+    return replace(
+        base,
+        schema_version=schema_version,
+        enrichment_policy_version=(
+            EDITORIAL_ENRICHMENT_V11_POLICY_VERSION
+            if schema_version == 11
+            else EDITORIAL_ENRICHMENT_POLICY_VERSION
+        ),
+        tables=tables,
+        diagrams=diagrams,
+        source_figures=figures,
+    )
+
+
+def _ordering_table(
+    template: TableSpecV1,
+    *,
+    key: str,
+    placement: EnrichmentPlacementV1,
+    group_order: int | None = None,
+    question: str | None = None,
+) -> TableSpecV1:
+    assert template.purpose is not None
+    return replace(
+        template,
+        key=key,
+        placement=placement,
+        group_order=group_order,
+        purpose=replace(
+            template.purpose,
+            question=question or f"Which documented value does {key} expose?",
+        ),
+    )
+
+
+def _ordering_figure(
+    template: SourceFigureCandidateV1,
+    *,
+    key: str,
+    placement: EnrichmentPlacementV1,
+    group_order: int | None = None,
+    order: int | None = None,
+) -> SourceFigureCandidateV1:
+    return replace(
+        template,
+        key=key,
+        placement=placement,
+        group_order=group_order,
+        order=order,
+    )
+
+
+def test_v11_round_trips_group_order_for_every_family() -> None:
+    anchor = uuid4()
+    placement = EnrichmentPlacementV1(
+        EnrichmentPlacementKind.AFTER_PARAGRAPH, anchor_block_id=anchor
+    )
+    base = _populated_enrichment(_extraction(), _synthesis(_extraction()))
+    assert base.diagrams[0].purpose is not None
+    table = _ordering_table(
+        _populated_enrichment(_extraction(), _synthesis(_extraction())).tables[0],
+        key="ordered_table",
+        placement=placement,
+        group_order=1,
+    )
+    diagram = replace(
+        base.diagrams[0],
+        key="ordered_diagram",
+        placement=placement,
+        group_order=2,
+    )
+    figure = _ordering_figure(
+        base.source_figures[0], key="ordered_figure", placement=placement, group_order=0
+    )
+    enrichment = _ordering_enrichment(tables=(table,), diagrams=(diagram,), figures=(figure,))
+
+    payload = editorial_enrichment_to_json(enrichment)
+
+    assert payload["schema_version"] == 11
+    assert payload["enrichment_policy_version"] == EDITORIAL_ENRICHMENT_V11_POLICY_VERSION
+    assert payload["tables"][0]["group_order"] == 1
+    assert payload["diagrams"][0]["group_order"] == 2
+    assert payload["source_figures"][0]["group_order"] == 0
+    assert editorial_enrichment_from_json(payload) == enrichment
+    assert editorial_enrichment_to_json(editorial_enrichment_from_json(payload)) == payload
+
+    unordered = _ordering_enrichment(
+        tables=(_ordering_table(table, key="plain_table", placement=placement),)
+    )
+    unordered_payload = editorial_enrichment_to_json(unordered)
+    assert "group_order" not in unordered_payload["tables"][0]
+    assert editorial_enrichment_from_json(unordered_payload) == unordered
+
+
+def test_v10_reader_rejects_group_order_without_rewriting_legacy_payloads() -> None:
+    placement = EnrichmentPlacementV1(EnrichmentPlacementKind.END)
+    table = _ordering_table(
+        _populated_enrichment(_extraction(), _synthesis(_extraction())).tables[0],
+        key="legacy_table",
+        placement=placement,
+    )
+    legacy = _ordering_enrichment(schema_version=10, tables=(table,))
+    payload = editorial_enrichment_to_json(legacy)
+    assert "group_order" not in payload["tables"][0]
+    assert editorial_enrichment_from_json(payload) == legacy
+
+    payload["tables"][0]["group_order"] = 0
+    with pytest.raises(ValueError, match="missing or extra fields"):
+        editorial_enrichment_from_json(payload)
+
+
+def test_v11_requires_its_policy_and_rejects_unknown_keys() -> None:
+    with pytest.raises(ValueError, match="policy version is unsupported"):
+        replace(
+            _ordering_enrichment(schema_version=11),
+            enrichment_policy_version=EDITORIAL_ENRICHMENT_POLICY_VERSION,
+        )
+    with pytest.raises(ValueError, match="policy version is unsupported"):
+        replace(
+            _ordering_enrichment(schema_version=10),
+            enrichment_policy_version=EDITORIAL_ENRICHMENT_V11_POLICY_VERSION,
+        )
+
+    placement = EnrichmentPlacementV1(EnrichmentPlacementKind.END)
+    table = _ordering_table(
+        _populated_enrichment(_extraction(), _synthesis(_extraction())).tables[0],
+        key="unknown_key_table",
+        placement=placement,
+    )
+    payload = editorial_enrichment_to_json(_ordering_enrichment(tables=(table,)))
+    payload["tables"][0]["unexpected_field"] = "x"
+    with pytest.raises(ValueError, match="missing or extra fields"):
+        editorial_enrichment_from_json(payload)
+
+    payload = editorial_enrichment_to_json(_ordering_enrichment(tables=(table,)))
+    payload["tables"][0]["group_order"] = -1
+    with pytest.raises(ValueError, match="non-negative integer"):
+        editorial_enrichment_from_json(payload)
+
+
+def test_group_order_must_be_unique_within_a_placement_group() -> None:
+    anchor = uuid4()
+    placement = EnrichmentPlacementV1(
+        EnrichmentPlacementKind.AFTER_PARAGRAPH, anchor_block_id=anchor
+    )
+    base = _populated_enrichment(_extraction(), _synthesis(_extraction()))
+    first = _ordering_table(base.tables[0], key="first_table", placement=placement, group_order=0)
+    second = _ordering_table(base.tables[0], key="second_table", placement=placement, group_order=0)
+    with pytest.raises(ValueError, match="unique within a placement group"):
+        _ordering_enrichment(tables=(first, second))
+
+    other_placement = EnrichmentPlacementV1(
+        EnrichmentPlacementKind.AFTER_PARAGRAPH, anchor_block_id=uuid4()
+    )
+    third = _ordering_table(
+        base.tables[0], key="third_table", placement=other_placement, group_order=0
+    )
+    assert len(_ordering_enrichment(tables=(first, third)).tables) == 2
+
+
+def test_legacy_rank_reproduces_todays_pdf_order() -> None:
+    anchor = uuid4()
+    paragraph_placement = EnrichmentPlacementV1(
+        EnrichmentPlacementKind.AFTER_PARAGRAPH, anchor_block_id=anchor
+    )
+    lead_placement = EnrichmentPlacementV1(EnrichmentPlacementKind.AFTER_LEAD)
+    base = _populated_enrichment(_extraction(), _synthesis(_extraction()))
+    assert base.diagrams[0].purpose is not None
+    enrichment = _ordering_enrichment(
+        tables=(
+            _ordering_table(base.tables[0], key="t_a", placement=paragraph_placement),
+            _ordering_table(base.tables[0], key="t_z", placement=lead_placement),
+        ),
+        diagrams=(
+            replace(
+                base.diagrams[0],
+                key="d_a",
+                placement=lead_placement,
+                purpose=replace(base.diagrams[0].purpose, question="Which diagram is documented?"),
+            ),
+        ),
+        figures=(
+            _ordering_figure(
+                base.source_figures[0], key="f_z", placement=paragraph_placement, order=1
+            ),
+            _ordering_figure(
+                base.source_figures[0], key="f_a", placement=paragraph_placement, order=0
+            ),
+            _ordering_figure(base.source_figures[0], key="f_lead", placement=lead_placement),
+        ),
+    )
+
+    assert len(enrichment_element_order(enrichment)) == 2
+    ranks = enrichment_order_rank(enrichment)
+
+    # after_paragraph: (family-local index, key), exactly the historical sort.
+    assert ranks[EnrichmentElementRef(EditorialEnrichmentElementKind.FIGURE, "f_z")] == 0
+    assert ranks[EnrichmentElementRef(EditorialEnrichmentElementKind.TABLE, "t_a")] == 1
+    assert ranks[EnrichmentElementRef(EditorialEnrichmentElementKind.FIGURE, "f_a")] == 2
+    # Figure.order is ignored: f_a declares order 0 but sorts after f_z (order 1).
+    # Other placements: (family rank, family-local index, key) = Typst family loops.
+    assert ranks[EnrichmentElementRef(EditorialEnrichmentElementKind.TABLE, "t_z")] == 0
+    assert ranks[EnrichmentElementRef(EditorialEnrichmentElementKind.DIAGRAM, "d_a")] == 1
+    assert ranks[EnrichmentElementRef(EditorialEnrichmentElementKind.FIGURE, "f_lead")] == 2
+
+
+def test_explicit_group_order_ranks_mixed_members_and_implicit_members_last() -> None:
+    anchor = uuid4()
+    placement = EnrichmentPlacementV1(
+        EnrichmentPlacementKind.AFTER_PARAGRAPH, anchor_block_id=anchor
+    )
+    base = _populated_enrichment(_extraction(), _synthesis(_extraction()))
+    enrichment = _ordering_enrichment(
+        tables=(
+            _ordering_table(
+                base.tables[0], key="table_ordered", placement=placement, group_order=2
+            ),
+            _ordering_table(base.tables[0], key="table_implicit", placement=placement),
+        ),
+        figures=(
+            _ordering_figure(
+                base.source_figures[0], key="figure_ordered", placement=placement, group_order=0
+            ),
+        ),
+    )
+
+    groups = enrichment_element_order(enrichment)
+    assert len(groups) == 1
+    assert groups[0].placement == placement
+    assert groups[0].members == (
+        EnrichmentElementRef(EditorialEnrichmentElementKind.FIGURE, "figure_ordered"),
+        EnrichmentElementRef(EditorialEnrichmentElementKind.TABLE, "table_ordered"),
+        EnrichmentElementRef(EditorialEnrichmentElementKind.TABLE, "table_implicit"),
+    )
+    # Raw ordering entries follow the same single implementation.
+    assert enrichment_order_rank_from_entries(
+        (
+            EnrichmentOrderEntry(
+                EditorialEnrichmentElementKind.TABLE,
+                "table_ordered",
+                placement,
+                0,
+                2,
+            ),
+            EnrichmentOrderEntry(
+                EditorialEnrichmentElementKind.TABLE,
+                "table_implicit",
+                placement,
+                1,
+            ),
+            EnrichmentOrderEntry(
+                EditorialEnrichmentElementKind.FIGURE,
+                "figure_ordered",
+                placement,
+                0,
+                0,
+            ),
+        )
+    ) == enrichment_order_rank(enrichment)
+
+
+def test_create_move_and_delete_helpers_apply_the_deterministic_rules() -> None:
+    anchor = uuid4()
+    placement = EnrichmentPlacementV1(
+        EnrichmentPlacementKind.AFTER_PARAGRAPH, anchor_block_id=anchor
+    )
+    base = _populated_enrichment(_extraction(), _synthesis(_extraction()))
+    enrichment = _ordering_enrichment(
+        tables=(
+            _ordering_table(base.tables[0], key="alpha", placement=placement, group_order=1),
+            _ordering_table(base.tables[0], key="beta", placement=placement, group_order=4),
+            _ordering_table(base.tables[0], key="gamma", placement=placement),
+        )
+    )
+
+    assert next_group_order(enrichment, placement) == 5
+    assert next_group_order(enrichment, EnrichmentPlacementV1(EnrichmentPlacementKind.END)) is None
+
+    reordered = with_element_group_order(
+        enrichment,
+        EnrichmentElementRef(EditorialEnrichmentElementKind.TABLE, "gamma"),
+        7,
+    )
+    assert next_group_order(reordered, placement) == 8
+    assert (
+        enrichment_order_rank(reordered)[
+            EnrichmentElementRef(EditorialEnrichmentElementKind.TABLE, "gamma")
+        ]
+        == 2
+    )
+
+    cleared = clear_group_order(
+        enrichment, EnrichmentElementRef(EditorialEnrichmentElementKind.TABLE, "alpha")
+    )
+    ranks = enrichment_order_rank(cleared)
+    assert ranks[EnrichmentElementRef(EditorialEnrichmentElementKind.TABLE, "beta")] == 0
+    assert ranks[EnrichmentElementRef(EditorialEnrichmentElementKind.TABLE, "alpha")] == 1
+    assert ranks[EnrichmentElementRef(EditorialEnrichmentElementKind.TABLE, "gamma")] == 2
+
+    removed = remove_enrichment_element(
+        enrichment, EnrichmentElementRef(EditorialEnrichmentElementKind.TABLE, "beta")
+    )
+    assert [item.key for item in removed.tables] == ["alpha", "gamma"]
+    assert [item.group_order for item in removed.tables] == [1, None]
+    assert (
+        enrichment_order_rank(removed)[
+            EnrichmentElementRef(EditorialEnrichmentElementKind.TABLE, "alpha")
+        ]
+        == 0
+    )
+
+    with pytest.raises(ValueError, match="element not found"):
+        clear_group_order(
+            enrichment, EnrichmentElementRef(EditorialEnrichmentElementKind.CHART, "missing")
+        )
+
+
+def test_explicit_order_requires_a_paragraph_anchor() -> None:
+    base = _populated_enrichment(_extraction(), _synthesis(_extraction()))
+    legacy_placement = EnrichmentPlacementV1(EnrichmentPlacementKind.AFTER_LEAD)
+    table = _ordering_table(
+        base.tables[0], key="legacy_ordered_table", placement=legacy_placement, group_order=0
+    )
+    with pytest.raises(ValueError, match="requires a paragraph anchor"):
+        _ordering_enrichment(tables=(table,))

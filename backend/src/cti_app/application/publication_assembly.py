@@ -61,9 +61,12 @@ from cti_app.domain.production import (
 )
 from cti_app.domain.production_editorial_enrichment import (
     ChartKind,
+    EditorialEnrichmentElementKind,
     EditorialEnrichmentV1,
+    EnrichmentElementRef,
     EnrichmentPlacementKind,
     editorial_enrichment_to_json,
+    enrichment_order_rank,
 )
 from cti_app.domain.production_extraction import ProductionExtractionV1
 from cti_app.domain.production_references import ProductionReferenceCorpusV1
@@ -153,6 +156,7 @@ def _resolve_editorial_placements(
 
     synthesis_payload = production_synthesis_to_json(synthesis)
     enrichment_payload = editorial_enrichment_to_json(enrichment)
+    order_rank = enrichment_order_rank(enrichment)
     family_by_kind = {
         "table": "tables",
         "chart": "charts",
@@ -182,11 +186,16 @@ def _resolve_editorial_placements(
                 continue
             anchor_block_id = UUID(str(placement["anchor_block_id"]))
             anchor = resolve_paragraph_anchor(record, anchor_block_id, synthesis=synthesis_payload)
+            element_key = str(item["key"])
             placements.append(
                 ResolvedPublicationPlacementV1(
                     element_kind=entry.kind.value,
-                    element_key=str(item["key"]),
-                    element_position=entry.position,
+                    element_key=element_key,
+                    element_position=order_rank[
+                        EnrichmentElementRef(
+                            EditorialEnrichmentElementKind(entry.kind.value), element_key
+                        )
+                    ],
                     anchor_block_id=anchor.block_id,
                     anchor_pointer=anchor.structural_pointer,
                     anchor_canonical_position=anchor.canonical_position,

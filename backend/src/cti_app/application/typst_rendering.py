@@ -65,7 +65,14 @@ from cti_app.domain.investigation import (
 from cti_app.domain.investigation_graph import InvestigationGraph, InvestigationGraphNodeKind
 from cti_app.domain.media_assets import MediaAssetKind
 from cti_app.domain.production import ProductionArtifact
-from cti_app.domain.production_editorial_enrichment import EnrichmentPlacementKind
+from cti_app.domain.production_editorial_enrichment import (
+    EditorialEnrichmentElementKind,
+    EnrichmentElementRef,
+    EnrichmentOrderEntry,
+    EnrichmentPlacementKind,
+    EnrichmentPlacementV1,
+    enrichment_order_rank_from_entries,
+)
 from cti_app.domain.production_synthesis import ProductionSynthesisV1
 from cti_app.domain.publication import (
     ArtifactType,
@@ -2570,8 +2577,12 @@ def project_publication_to_typst_model(
             block[field_name] = spans
 
     media_refs_by_id: dict[UUID, TypstMediaRef] = {}
-    rich_by_placement: dict[tuple[EnrichmentPlacementKind, int | None], list[dict[str, Any]]] = {}
+    rich_by_placement: dict[
+        tuple[EnrichmentPlacementKind, int | None],
+        list[tuple[EnrichmentElementRef, dict[str, Any]]],
+    ] = {}
     rich_after_paragraph: dict[str, list[tuple[int, str, dict[str, Any]]]] = {}
+    rich_order_entries: list[EnrichmentOrderEntry] = []
     resolved_v9_placements = (
         {(item.element_kind, item.element_key): item for item in publication_v9.resolved_placements}
         if publication_v9 is not None
@@ -2613,6 +2624,7 @@ def project_publication_to_typst_model(
         element_kind: str,
         element_key: str,
         anchor_block_id: UUID | None,
+        family_index: int,
     ) -> None:
         if publication_v9 is not None and kind is EnrichmentPlacementKind.AFTER_PARAGRAPH:
             resolved = resolved_v9_placements.get((element_kind, element_key))
@@ -2636,9 +2648,19 @@ def project_publication_to_typst_model(
             section_index is None or section_index >= len(document.sections)
         ):
             raise ValueError(f"Enrichment placement refers to missing section {section_index}")
-        rich_by_placement.setdefault((kind, section_index), []).append(block)
+        typed_element_kind = EditorialEnrichmentElementKind(element_kind)
+        element_ref = EnrichmentElementRef(typed_element_kind, element_key)
+        rich_order_entries.append(
+            EnrichmentOrderEntry(
+                kind=typed_element_kind,
+                key=element_key,
+                placement=EnrichmentPlacementV1(kind=kind, section_index=section_index),
+                family_index=family_index,
+            )
+        )
+        rich_by_placement.setdefault((kind, section_index), []).append((element_ref, block))
 
-    for table in document.tables:
+    for table_index, table in enumerate(document.tables):
         block = _table_block(table)
         rich_block(block, "semantic_title", f"table:{table.key}:title", table.title)
         if table.caption is not None:
@@ -2680,8 +2702,9 @@ def project_publication_to_typst_model(
             element_kind="table",
             element_key=table.key,
             anchor_block_id=table.placement.anchor_block_id,
+            family_index=table_index,
         )
-    for diagram in document.diagrams:
+    for diagram_index, diagram in enumerate(document.diagrams):
         block = _diagram_block(diagram, media_ref)
         rich_block(block, "semantic_title", f"diagram:{diagram.key}:title", diagram.title)
         if diagram.caption is not None:
@@ -2693,8 +2716,9 @@ def project_publication_to_typst_model(
             element_kind="diagram",
             element_key=diagram.key,
             anchor_block_id=diagram.placement.anchor_block_id,
+            family_index=diagram_index,
         )
-    for chart in document.charts:
+    for chart_index, chart in enumerate(document.charts):
         block = _chart_block(chart, media_ref)
         rich_block(block, "semantic_title", f"chart:{chart.key}:title", chart.title)
         if chart.caption is not None:
@@ -2706,9 +2730,10 @@ def project_publication_to_typst_model(
             element_kind="chart",
             element_key=chart.key,
             anchor_block_id=chart.placement.anchor_block_id,
+            family_index=chart_index,
         )
     sources_by_id = {source.source_document_id: source for source in document.sources}
-    for figure in document.figures:
+    for figure_index, figure in enumerate(document.figures):
         source = sources_by_id.get(figure.source_document_id)
         if source is None:
             raise ValueError(
@@ -2740,11 +2765,25 @@ def project_publication_to_typst_model(
             element_kind="figure",
             element_key=figure.key,
             anchor_block_id=figure.placement.anchor_block_id,
+            family_index=figure_index,
         )
 
-    reference_blocks = list(
-        rich_by_placement.get((EnrichmentPlacementKind.AFTER_TIMELINE, None), ())
-    )
+    # The same domain rank that orders the workshop snapshot and publication
+    # placements now orders every non-paragraph placement in the PDF body.
+    rich_placement_rank = enrichment_order_rank_from_entries(rich_order_entries)
+
+    def ordered_rich(
+        kind: EnrichmentPlacementKind, section_index: int | None
+    ) -> list[dict[str, Any]]:
+        return [
+            block
+            for reference, block in sorted(
+                rich_by_placement.get((kind, section_index), ()),
+                key=lambda item: rich_placement_rank[item[0]],
+            )
+        ]
+
+    reference_blocks = ordered_rich(EnrichmentPlacementKind.AFTER_TIMELINE, None)
     preview_findings_by_logical_id: dict[UUID, InvestigationFinding] = {}
     preview_evidence_by_id: dict[UUID, EvidenceObservation] = {}
     if draft_preview is not None:
@@ -2901,7 +2940,7 @@ def project_publication_to_typst_model(
     body_blocks: list[dict[str, Any]] = []
     for index, lead_paragraph in enumerate(document.lead, start=1):
         append_paragraph(lead_paragraph.text, lead_paragraph_anchor(index))
-    body_blocks.extend(rich_by_placement.get((EnrichmentPlacementKind.AFTER_LEAD, None), ()))
+    body_blocks.extend(ordered_rich(EnrichmentPlacementKind.AFTER_LEAD, None))
     article_overview_render = (
         article_format_render.get("overview") if article_format_render is not None else None
     )
@@ -2945,10 +2984,8 @@ def project_publication_to_typst_model(
                 paragraph.text,
                 section_paragraph_anchor(section_index, paragraph_index),
             )
-        body_blocks.extend(
-            rich_by_placement.get((EnrichmentPlacementKind.AFTER_SECTION, section_index), ())
-        )
-    body_blocks.extend(rich_by_placement.get((EnrichmentPlacementKind.END, None), ()))
+        body_blocks.extend(ordered_rich(EnrichmentPlacementKind.AFTER_SECTION, section_index))
+    body_blocks.extend(ordered_rich(EnrichmentPlacementKind.END, None))
 
     figure_number = 0
     for block in (*reference_blocks, *body_blocks):

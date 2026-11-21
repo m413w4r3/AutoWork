@@ -1940,3 +1940,237 @@ async def test_invalid_lineage_fails_before_body_or_artifact_persistence(
 
     assert catalog.writes == []
     assert artifacts.appended == []
+
+
+def _anchored_source_figure(
+    extraction: Any,
+    *,
+    key: str,
+    placement: EnrichmentPlacementV1,
+    order: int,
+    ordinal: int,
+):
+    locator = SourceFigureLocatorV1(
+        page=ordinal + 1,
+        section="Synthetic anchored section",
+        figure_label=f"Synthetic anchored figure {ordinal + 1}",
+    )
+    sha256 = hashlib.sha256(f"synthetic anchored figure {ordinal}".encode()).hexdigest()
+    source = extraction.sources[0]
+    figure_id = source_figure_id(
+        source_document_id=source.source_document_id,
+        sha256=sha256,
+        source=source.canonical_url,
+        locator=locator,
+    )
+    return SourceFigureCandidateV1(
+        key=key,
+        source_document_id=source.source_document_id,
+        source_url=source.canonical_url,
+        caption=f"Synthetic anchored caption {ordinal + 1}",
+        provenance="Synthetic archived figure fixture.",
+        locator=locator,
+        inclusion_status=SourceFigureInclusionStatus.INCLUDED,
+        placement=placement,
+        resolved_figure=ResolvedSourceFigureV1(
+            figure_id=figure_id,
+            blob_id=UUID(int=8200 + ordinal),
+            sha256=sha256,
+            mime_type="image/png",
+            byte_size=96,
+            source_document_id=source.source_document_id,
+            source=source.canonical_url,
+            provenance="Synthetic archived figure fixture.",
+            locator=locator,
+            decision=SourceFigureDecision.ACCEPTED,
+            decision_reason="archived_blob_verified",
+        ),
+        width=8,
+        height=6,
+        order=order,
+    )
+
+
+def _anchored_diagram(
+    ref: ExtractionEvidenceRefV1,
+    *,
+    key: str,
+    placement: EnrichmentPlacementV1,
+    group_order: int,
+):
+    return DiagramSpecV1(
+        key=key,
+        kind=EnrichmentDiagramKind.INFECTION_CHAIN,
+        profile=DiagramProfile.FLOW,
+        title="Synthetic ordered diagram",
+        caption="Synthetic diagram caption.",
+        direction=EnrichmentDiagramDirection.LEFT_TO_RIGHT,
+        nodes=(
+            DiagramNodeV1("loader", "Loader", (ref,)),
+            DiagramNodeV1("payload", "Payload", (ref,), role=DiagramNodeRole.MALWARE_TOOL),
+        ),
+        edges=(DiagramEdgeV1("loader", "payload", "loads", (ref,)),),
+        groups=(),
+        placement=placement,
+        compiled_asset_id=UUID(int=8300),
+        purpose=EditorialAnalyticPurposeV1(
+            question="Which ordered diagram is documented?",
+            available_data="The source records one loader action.",
+            comprehension_gain="The edge exposes the documented action.",
+            scope="The two synthetic nodes.",
+            evidence_refs=(ref,),
+            knowledge_limits="No further stages are documented.",
+            placement_reason="Placed after the anchor paragraph.",
+        ),
+        group_order=group_order,
+    )
+
+
+@pytest.mark.asyncio
+async def test_assembly_legacy_order_ignores_figure_order_for_resolved_positions() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    run = _run(snapshot)
+    synthesis_artifact_id = uuid4()
+    synthesis_entries = bootstrap_block_registry(
+        artifact_id=synthesis_artifact_id,
+        canonical_sha256=canonical_synthesis_hash(synthesis),
+        source_stage="synthesis",
+        canonical_content=production_synthesis_to_json(synthesis),
+    )
+    anchor = next(entry for entry in synthesis_entries if entry.kind.value == "lead_paragraph")
+    placement = EnrichmentPlacementV1(
+        EnrichmentPlacementKind.AFTER_PARAGRAPH,
+        anchor_block_id=anchor.block_id,
+    )
+    figures = (
+        _anchored_source_figure(
+            extraction, key="figure_family_first", placement=placement, order=1, ordinal=0
+        ),
+        _anchored_source_figure(
+            extraction, key="figure_family_second", placement=placement, order=0, ordinal=1
+        ),
+    )
+    enrichment = replace(
+        build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis),
+        source_figures=figures,
+    )
+    workspace_record = _workspace_record_for(
+        run=run,
+        synthesis=synthesis,
+        enrichment=enrichment,
+        synthesis_artifact_id=synthesis_artifact_id,
+    )
+    service, catalog, _artifacts = _service()
+    assembly = await _assemble(
+        service,
+        run=run,
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+        editorial_enrichment_artifact_id=workspace_record.enrichment_artifact_id,
+        workspace_snapshot_record=workspace_record,
+    )
+    document = parse_publication_document(
+        await ProductionArtifactStore(catalog).read_json(assembly.artifact.canonical_blob_id)
+    )
+    assert isinstance(document, PublicationDocumentV9)
+    assert [item.element_key for item in document.resolved_placements] == [
+        "figure_family_first",
+        "figure_family_second",
+    ]
+    assert [item.element_position for item in document.resolved_placements] == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_assembly_explicit_group_order_drives_resolved_positions_and_rebuilds() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    run = _run(snapshot)
+    synthesis_artifact_id = uuid4()
+    synthesis_entries = bootstrap_block_registry(
+        artifact_id=synthesis_artifact_id,
+        canonical_sha256=canonical_synthesis_hash(synthesis),
+        source_stage="synthesis",
+        canonical_content=production_synthesis_to_json(synthesis),
+    )
+    anchor = next(entry for entry in synthesis_entries if entry.kind.value == "lead_paragraph")
+    placement = EnrichmentPlacementV1(
+        EnrichmentPlacementKind.AFTER_PARAGRAPH,
+        anchor_block_id=anchor.block_id,
+    )
+    evidence_ref = extraction_evidence_refs_v1(extraction)[0]
+    first = _enrichment_table(evidence_ref, key="table_ordered_second")
+    second = _enrichment_table(evidence_ref, key="table_ordered_first")
+    assert first.purpose is not None
+    assert second.purpose is not None
+    tables = (
+        replace(
+            first,
+            placement=placement,
+            group_order=2,
+            purpose=replace(first.purpose, question="Which second ordered table is documented?"),
+        ),
+        replace(
+            second,
+            placement=placement,
+            group_order=0,
+            purpose=replace(second.purpose, question="Which first ordered table is documented?"),
+        ),
+    )
+    diagram = _anchored_diagram(
+        evidence_ref,
+        key="diagram_ordered_middle",
+        placement=placement,
+        group_order=1,
+    )
+    enrichment = replace(
+        build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis),
+        schema_version=11,
+        enrichment_policy_version="editorial-enrichment-v15-element-order",
+        tables=tables,
+        diagrams=(diagram,),
+    )
+    workspace_record = _workspace_record_for(
+        run=run,
+        synthesis=synthesis,
+        enrichment=enrichment,
+        synthesis_artifact_id=synthesis_artifact_id,
+    )
+    service, catalog, _artifacts = _service()
+    assembly = await _assemble(
+        service,
+        run=run,
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+        editorial_enrichment_artifact_id=workspace_record.enrichment_artifact_id,
+        workspace_snapshot_record=workspace_record,
+    )
+    document = parse_publication_document(
+        await ProductionArtifactStore(catalog).read_json(assembly.artifact.canonical_blob_id)
+    )
+    assert isinstance(document, PublicationDocumentV9)
+    assert [
+        (item.element_kind, item.element_key, item.element_position)
+        for item in document.resolved_placements
+    ] == [
+        ("table", "table_ordered_first", 0),
+        ("diagram", "diagram_ordered_middle", 1),
+        ("table", "table_ordered_second", 2),
+    ]
+
+    rebuilt = await _assemble(
+        service,
+        run=run,
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+        editorial_enrichment_artifact_id=workspace_record.enrichment_artifact_id,
+        workspace_snapshot_record=workspace_record,
+    )
+    assert rebuilt.artifact.id == assembly.artifact.id
