@@ -202,6 +202,8 @@ def test_bar_point_requires_value_and_unit_in_the_same_admitted_evidence() -> No
     [
         ("title", "https://example.test/report"),
         ("caption", "www.example.test/report"),
+        ("caption", "ftp://example.test/a"),
+        ("caption", "mailto:user@example.test"),
         ("category_axis_label", "https://example.test/category"),
         ("value_axis_label", "www.example.test/value"),
         ("unit", "https://example.test/unit"),

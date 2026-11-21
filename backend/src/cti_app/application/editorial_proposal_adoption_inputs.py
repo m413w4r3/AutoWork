@@ -42,7 +42,7 @@ from cti_app.application.editorial_synthesis.candidate import (
 )
 from cti_app.application.editorial_synthesis.patch_validation import WirePatch
 from cti_app.application.editorial_synthesis.targets import resolve_target
-from cti_app.application.editorial_text_policy import editorial_patch_text_violation
+from cti_app.application.editorial_text_policy import editorial_caption_text_violation
 from cti_app.application.editorial_workspace.registry import (
     WorkspaceOccurrenceResolution,
     read_pointer,
@@ -52,6 +52,7 @@ from cti_app.application.production_artifact_store import ProductionArtifactStor
 from cti_app.application.production_editorial_enrichment import (
     EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION,
     EditorialEnrichmentEvidencePackV1,
+    EditorialEnrichmentValidationError,
     EditorialFigureCatalogEntry,
     build_editorial_figure_catalog,
     validate_editorial_enrichment,
@@ -197,7 +198,7 @@ def _manual_source_figure_candidate_patch(
         if (
             not isinstance(public_id, str)
             or not isinstance(caption, str)
-            or editorial_patch_text_violation(caption)
+            or editorial_caption_text_violation(caption)
             or not caption.strip()
             or len(caption.strip()) > 500
             or type(order) is not int
@@ -1125,7 +1126,7 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                 uow.source_collections,
                 current_subject_tlp=current_subject.tlp,
             )
-        except Exception:
+        except ValueError:
             raise EditorialProposalAdoptionError("proposal_policy_unavailable") from None
         self._require_allowed(access_policy)
         self._require_snapshot_subject_version(prepared.snapshot, current_subject.version)
@@ -1187,7 +1188,7 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                 )
             except EditorialProposalAdoptionError:
                 raise
-            except Exception:
+            except (EditorialFigureCatalogError, EditorialEnrichmentValidationError, ValueError):
                 raise EditorialProposalAdoptionError("editorial_figure_not_eligible") from None
 
     async def _load_base_context(

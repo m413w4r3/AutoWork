@@ -692,6 +692,8 @@ def test_manual_table_text_rejects_markup() -> None:
         ("cell", '#raw(read("x"))'),
         ("title", '#include("x")'),
         ("caption", '#link("https://example.test", "link")'),
+        ("caption", "ftp://example.test/a"),
+        ("caption", "mailto:user@example.test"),
         ("cell", "<b>forged cell</b>"),
         ("purpose", "This [E001] citation must stay in its structured field."),
     ],

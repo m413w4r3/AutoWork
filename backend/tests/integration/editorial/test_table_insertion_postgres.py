@@ -47,6 +47,9 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
 )
+from cti_app.domain.production_editorial_enrichment import (
+    EnrichmentPlacementV1,
+)
 from cti_app.domain.production_extraction import production_extraction_to_json
 from cti_app.domain.production_synthesis import production_synthesis_to_json
 from cti_app.domain.publication_document import (
@@ -123,6 +126,7 @@ async def _ready_for_manual_table_route(
     *,
     bar_chart_facts: bool = False,
     source_figure_count: int = 0,
+    base_table_placement: EnrichmentPlacementV1 | None = None,
 ) -> tuple[_Seeded, Any, _NoModelCalls, Any]:
     # Use the real discovery lineage and persist the rows required by the
     # production discussion/adoption adapters. Blob IDs come from add_if_absent
@@ -137,6 +141,7 @@ async def _ready_for_manual_table_route(
         seeded.production_input,
         seeded.extraction,
         seeded.synthesis,
+        base_table_placement=base_table_placement,
     )
     enrichment_bytes = ProductionArtifactStore.canonical_json_bytes(enrichment_content.base_payload)
     extraction_bytes = ProductionArtifactStore.canonical_json_bytes(

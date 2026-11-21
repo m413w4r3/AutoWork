@@ -4647,13 +4647,14 @@ def _figure_block(
         "type": "figure",
         "key": figure.key,
         "caption": figure.caption,
-        "width": figure.width,
-        "height": figure.height,
         "sha256": figure.sha256,
         "sha256_spans": _breakable_typst_display_text(figure.sha256, interval=8),
         "byte_size": figure.byte_size,
         "media_path": media.media_path,
     }
+    if figure.key.startswith(ADOPTED_SOURCE_FIGURE_KEY_PREFIX):
+        block["width"] = figure.width
+        block["height"] = figure.height
     return block
 
 

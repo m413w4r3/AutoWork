@@ -13,6 +13,10 @@ _EDITORIAL_UNSAFE_MARKUP = re.compile(
     r"|https?://|www\.",
     re.IGNORECASE,
 )
+_EDITORIAL_CAPTION_URL_SCHEME = re.compile(
+    r"(?<![\w.+-])(?:[a-z][a-z0-9+.-]*://|mailto:|ftp:|data:|javascript:)",
+    re.IGNORECASE,
+)
 
 
 def editorial_patch_text_violation(value: str, *, allow_newline_tab: bool = False) -> bool:
@@ -25,4 +29,11 @@ def editorial_patch_text_violation(value: str, *, allow_newline_tab: bool = Fals
             char not in allowed_controls and unicodedata.category(char) in {"Cc", "Cf"}
             for char in value
         )
+    )
+
+
+def editorial_caption_text_violation(value: str) -> bool:
+    """Reject URL schemes in a caption while leaving ordinary prose handling unchanged."""
+    return editorial_patch_text_violation(value) or (
+        _EDITORIAL_CAPTION_URL_SCHEME.search(value) is not None
     )
