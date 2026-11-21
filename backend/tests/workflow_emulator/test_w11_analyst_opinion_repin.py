@@ -95,6 +95,7 @@ from tests.integration.test_edition_multibatch_publication_postgres import _comp
 
 from . import invariants
 from .driver import WorkflowDriver
+from .pdf_contract import ANALYST_OPINION_HEADING, fold_pdf_text
 
 pytestmark = [pytest.mark.integration, pytest.mark.workflow_full]
 
@@ -397,7 +398,7 @@ async def test_w11_analyst_opinion_requires_explicit_repin_for_multibatch_editio
                 assertions=("real-typst-pdf-v1", "poppler-inspected-pdf-v1"),
             )
             invariants.require(
-                "avis de l'analyste" not in pdf_v1_text.casefold()
+                ANALYST_OPINION_HEADING not in fold_pdf_text(pdf_v1_text)
                 and all(f"Corps article {label} W11" in pdf_v1_text for label in ("A", "B", "C")),
                 driver.scenario,
                 "render_v1_real_typst_and_poppler",
@@ -774,8 +775,8 @@ async def test_w11_analyst_opinion_requires_explicit_repin_for_multibatch_editio
                     "v2_edition_document_opinion_provenance",
                     "frozen V2 document must carry A's V6 provenance and unchanged B/C V5 articles",
                 )
-                normalized_v2_text = pdf_v2_text.casefold().replace(chr(0x2019), "'")
-                heading = "avis de l'analyste"
+                normalized_v2_text = fold_pdf_text(pdf_v2_text)
+                heading = ANALYST_OPINION_HEADING
                 invariants.require(
                     normalized_v2_text.count(heading) == 1
                     and "Constat W11 propre à A".casefold() in normalized_v2_text

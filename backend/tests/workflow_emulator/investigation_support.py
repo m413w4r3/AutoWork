@@ -895,7 +895,12 @@ def composition_factory(
                 else virustotal
             )
             download_adapter.configure_external_effects(
-                create_external_effect_coordinator(session_factory),
+                create_external_effect_coordinator(
+                    session_factory,
+                    # Relationship-grounded child-hash downloads read the cited
+                    # VT relationship payload through this store during consume.
+                    blob_store=artifact_store._catalog._store,
+                ),
                 observations,
             )
             acquisition = VirusTotalSampleAcquisitionService(

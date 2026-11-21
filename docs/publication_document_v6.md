@@ -28,8 +28,9 @@ path that persists V6.
   stable `error_codes` for V6 failures. Existing V5 QA result shape is retained.
 
 The rendered article order is `references`, `synthesis`, optional
-`analyst_opinion`, optional `technical_annex`. The opinion uses the heading
-“Avis de l'analyste”; its blocks follow `OpinionBlockType` order, show the
+`analyst_opinion`, optional `technical_annex`. The opinion uses the reader-facing
+heading “Note de l'analyste” (the CHP `noteAnalyste` title); its blocks follow
+`OpinionBlockType` order, show the
 fact/inference/hypothesis qualification and confidence, link finding and
 evidence UUIDs, and include unresolved points. No opinion means no opinion
 section. A V5 document still serializes and renders as V5.

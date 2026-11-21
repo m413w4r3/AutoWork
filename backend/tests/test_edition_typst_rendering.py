@@ -550,7 +550,7 @@ def test_edition_restores_v6_opinion_legacy_sections(tmp_path: Path) -> None:
     technical_annex = next(item for item in with_opinion if item["type"] == "technical_annex")
     assert technical_annex["ioc_rows"]
     opinion_section = next(item for item in with_opinion if item["type"] == "analyst_opinion")
-    assert opinion_section["heading"] == "Avis de l'analyste"
+    assert opinion_section["heading"] == "Note de l'analyste"
     assert opinion_section["blocks"][0]["text"] == "Le constat supplémentaire est corroboré."
     assert "analyst_opinion" not in {
         section["type"] for section in data["publications"][1]["content_sections"]
