@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import sys
 import traceback
 from collections.abc import Callable, Coroutine, Mapping
 from datetime import datetime
@@ -38,6 +39,7 @@ from cti_app.application.editorial_proposal_adoption_inputs import (
 from cti_app.application.editorial_proposals import (
     EditorialProposalApplicationError,
     EditorialProposalService,
+    EditorialTableDiagnosticReason,
     editorial_manual_decision_idempotency_key,
 )
 from cti_app.application.editorial_thread_common import is_valid_editorial_idempotency_key
@@ -85,7 +87,55 @@ from cti_app.infrastructure.figure_thumbnails import (
 
 _MAX_DRAFT_REQUEST_BYTES = MAX_DRAFT_BYTES * 6 + 4_096
 _MAX_MANUAL_EDIT_REQUEST_BYTES = 256 * 1024 + 4_096
+_DIAGNOSTIC_FRAME = re.compile(r"^[A-Za-z0-9_.<>-]+:[0-9]+:[A-Za-z0-9_.<>-]+$")
 logger = logging.getLogger(__name__)
+
+
+class EditorialTableRequestValidationError(ValueError):
+    def __init__(self, reason: EditorialTableDiagnosticReason, *, frame: str) -> None:
+        self.reason = reason.value
+        self.frame = frame
+        super().__init__(reason.value)
+
+
+def _caller_frame() -> str:
+    caller = sys._getframe(1)
+    filename = caller.f_code.co_filename.rsplit("/", 1)[-1]
+    return f"{filename}:{caller.f_lineno}:{caller.f_code.co_name}"
+
+
+def _exception_frame(error: BaseException) -> str | None:
+    frames = traceback.extract_tb(error.__traceback__)
+    if not frames:
+        return None
+    frame = frames[-1]
+    return f"{frame.filename.rsplit('/', 1)[-1]}:{frame.lineno}:{frame.name}"
+
+
+def _manual_table_frame(error: BaseException, attached: object = None) -> str:
+    if isinstance(attached, str) and _DIAGNOSTIC_FRAME.fullmatch(attached):
+        return attached
+    frame = _exception_frame(error)
+    if frame is not None and _DIAGNOSTIC_FRAME.fullmatch(frame):
+        return frame
+    return _caller_frame()
+
+
+def _manual_table_request_diagnostics(
+    error: RequestValidationError,
+) -> tuple[EditorialTableDiagnosticReason, str]:
+    for item in error.errors():
+        context = item.get("ctx")
+        validation_error = context.get("error") if isinstance(context, Mapping) else None
+        if isinstance(validation_error, EditorialTableRequestValidationError):
+            return (
+                EditorialTableDiagnosticReason(validation_error.reason),
+                _manual_table_frame(validation_error, validation_error.frame),
+            )
+    return (
+        EditorialTableDiagnosticReason.REQUEST_SCHEMA_INVALID,
+        _manual_table_frame(error),
+    )
 
 
 class EditorialWorkspaceRoute(APIRoute):
@@ -172,6 +222,26 @@ class EditorialWorkspaceRoute(APIRoute):
                             "detail": {
                                 "code": code,
                                 "message": message,
+                            }
+                        },
+                    )
+                elif is_manual_table_proposal:
+                    reason, frame = _manual_table_request_diagnostics(error)
+                    logger.warning(
+                        "manual_table_proposal_rejected code=%s reason=%s frame=%s "
+                        "subject_id=%s occurrence_id=%s",
+                        "manual_table_request_invalid",
+                        reason.value,
+                        frame,
+                        request.path_params.get("subject_id", "unknown"),
+                        request.path_params.get("occurrence_id", "unknown"),
+                    )
+                    response = JSONResponse(
+                        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                        content={
+                            "detail": {
+                                "code": "manual_table_request_invalid",
+                                "message": _ERROR_MESSAGES["manual_table_request_invalid"],
                             }
                         },
                     )
@@ -265,6 +335,34 @@ class EditorialWorkspaceRevisionTarget(BaseModel):
     legacy_target_id: str | None
 
 
+class EditorialWorkspaceTableColumn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    key: str
+    label: str
+
+
+class EditorialWorkspaceTableRow(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    cells: list[str]
+    evidence_refs: list[dict[str, object]]
+
+
+class EditorialWorkspaceTable(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    key: str
+    kind: EnrichmentTableKind
+    title: str
+    caption: str | None
+    columns: list[EditorialWorkspaceTableColumn]
+    rows: list[EditorialWorkspaceTableRow]
+    evidence_refs: list[dict[str, object]]
+    anchor_block_id: UUID | None
+    placement: Literal["after_paragraph", "after_lead", "after_timeline", "after_section", "end"]
+
+
 class EditorialWorkspaceBlock(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -283,6 +381,7 @@ class EditorialWorkspaceBlock(BaseModel):
     position: int
     text: str | None
     evidence_refs: list[dict[str, object]]
+    table: EditorialWorkspaceTable | None = None
     revision_target: EditorialWorkspaceRevisionTarget
     before_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     allowed_operations: list[str]
@@ -635,7 +734,10 @@ class EditorialTableDraftRequest(BaseModel):
     @model_validator(mode="after")
     def _row_widths_match_columns(self) -> EditorialTableDraftRequest:
         if any(len(row.cells) != len(self.columns) for row in self.rows):
-            raise ValueError("table_row_width_mismatch")
+            raise EditorialTableRequestValidationError(
+                EditorialTableDiagnosticReason.ROW_WIDTH_MISMATCH,
+                frame=_caller_frame(),
+            )
         return self
 
 
@@ -782,6 +884,7 @@ _ERROR_MESSAGES = {
         "Cette clé de modification est déjà associée à un autre texte. Actualisez l’atelier."  # noqa: RUF001
     ),
     "manual_edit_request_invalid": "La requête de modification est invalide.",
+    "manual_table_request_invalid": "La requête de tableau est invalide.",
     "manual_edit_unavailable": "La modification manuelle est temporairement indisponible.",
     "accept_not_enabled": "L'acceptation des propositions est désactivée.",
     "editorial_proposal_accept_unavailable": (
@@ -2003,9 +2106,13 @@ async def prepare_manual_editorial_table_proposal(
     except HTTPException:
         raise
     except EditorialProposalConflict as error:
+        frame = _manual_table_frame(error)
         logger.warning(
-            "manual_table_proposal_rejected code=%s subject_id=%s occurrence_id=%s",
+            "manual_table_proposal_rejected code=%s reason=%s frame=%s "
+            "subject_id=%s occurrence_id=%s",
             error.code,
+            EditorialTableDiagnosticReason.IDEMPOTENCY_CONFLICT.value,
+            frame,
             subject_id,
             occurrence_id,
         )
@@ -2017,10 +2124,26 @@ async def prepare_manual_editorial_table_proposal(
             },
         ) from error
     except (EditorialProposalApplicationError, EditorialWorkspaceError, ValueError) as error:
-        code = getattr(error, "code", None) or str(error)
+        raw_code = getattr(error, "code", None)
+        code = (
+            raw_code
+            if isinstance(raw_code, str) and re.fullmatch(r"[a-z][a-z0-9_]*", raw_code)
+            else "manual_edit_patch_invalid"
+        )
+        raw_reason = getattr(error, "reason", None)
+        try:
+            if not isinstance(raw_reason, str):
+                raise ValueError
+            reason = EditorialTableDiagnosticReason(raw_reason)
+        except ValueError:
+            reason = EditorialTableDiagnosticReason.VALIDATOR_REJECTED
+        frame = _manual_table_frame(error, getattr(error, "frame", None))
         logger.warning(
-            "manual_table_proposal_rejected code=%s subject_id=%s occurrence_id=%s",
+            "manual_table_proposal_rejected code=%s reason=%s frame=%s "
+            "subject_id=%s occurrence_id=%s",
             code,
+            reason.value,
+            frame,
             subject_id,
             occurrence_id,
         )

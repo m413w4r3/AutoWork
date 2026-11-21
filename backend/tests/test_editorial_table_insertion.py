@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
+import httpx
 import pytest
 from fastapi import FastAPI, HTTPException
 from starlette.requests import Request
@@ -19,12 +21,22 @@ from cti_app.application.editorial_proposals import (
     _editorial_patch_text_violation,
     _manual_table_evidence_handles,
 )
-from cti_app.application.editorial_workspace.registry import allowed_operations
+from cti_app.application.editorial_workspace.registry import (
+    WorkspaceSnapshotRecord,
+    allowed_operations,
+    project_blocks,
+    table_insertion_preparation_ready,
+)
 from cti_app.domain.editorial_workspace import (
     BlockRegistryEntry,
     EditorialBlockKind,
     EditorialSourceStage,
     canonical_content_sha256,
+)
+from cti_app.domain.production import (
+    ProductionArtifact,
+    ProductionArtifactStage,
+    ProductionArtifactStatus,
 )
 from cti_app.domain.production_editorial_enrichment import EditorialEnrichmentElementKind
 from cti_app.domain.production_editorial_revision import (
@@ -60,6 +72,42 @@ def _paragraph_registry_entry() -> tuple[BlockRegistryEntry, dict[str, object]]:
         structural_pointer="/sections/0/paragraphs/0",
     )
     return entry, synthesis
+
+
+def _workspace_record(
+    *,
+    subject_id: UUID,
+    production_run_id: UUID,
+    synthesis_artifact_id: UUID,
+    synthesis_sha256: str,
+    entries: tuple[BlockRegistryEntry, ...],
+    enrichment_artifact: ProductionArtifact | None = None,
+    enrichment_sha256: str | None = None,
+) -> WorkspaceSnapshotRecord:
+    return WorkspaceSnapshotRecord(
+        snapshot_id=uuid4(),
+        subject_id=subject_id,
+        production_run_id=production_run_id,
+        synthesis_artifact_id=synthesis_artifact_id,
+        synthesis_version=1,
+        synthesis_input_hash="a" * 64,
+        synthesis_canonical_sha256=synthesis_sha256,
+        enrichment_artifact_id=enrichment_artifact.id if enrichment_artifact else None,
+        enrichment_version=enrichment_artifact.version if enrichment_artifact else None,
+        enrichment_input_hash=enrichment_artifact.input_hash if enrichment_artifact else None,
+        enrichment_canonical_sha256=enrichment_sha256,
+        publication_artifact_id=None,
+        publication_version=None,
+        publication_input_hash=None,
+        publication_canonical_sha256=None,
+        pipeline_generation=1,
+        routing_decision_id=None,
+        routing_decision_hash=None,
+        publication_kind=None,
+        workspace_pin_hash="b" * 64,
+        registry_hash="c" * 64,
+        block_registry=tuple(entries),
+    )
 
 
 def _table_spec(anchor, evidence_refs):
@@ -100,7 +148,155 @@ def test_table_insertion_is_offered_for_a_registered_paragraph() -> None:
     entry, synthesis = _paragraph_registry_entry()
 
     assert "create_table" not in allowed_operations(entry, synthesis)
-    assert "create_table" in allowed_operations(entry, synthesis, allow_table_insertion=True)
+    subject_id, run_id = uuid4(), uuid4()
+    synthesis_artifact_id, enrichment_artifact_id = uuid4(), uuid4()
+    synthesis_sha256, enrichment_sha256 = "d" * 64, "e" * 64
+    synthesis_artifact = ProductionArtifact(
+        production_run_id=run_id,
+        subject_id=subject_id,
+        stage=ProductionArtifactStage.SYNTHESIS,
+        version=1,
+        input_hash="a" * 64,
+        canonical_blob_id=uuid4(),
+        id=synthesis_artifact_id,
+    )
+    enrichment_artifact = ProductionArtifact(
+        production_run_id=run_id,
+        subject_id=subject_id,
+        stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+        version=1,
+        input_hash="f" * 64,
+        canonical_blob_id=uuid4(),
+        id=enrichment_artifact_id,
+    )
+    record = _workspace_record(
+        subject_id=subject_id,
+        production_run_id=run_id,
+        synthesis_artifact_id=synthesis_artifact_id,
+        synthesis_sha256=synthesis_sha256,
+        entries=(entry,),
+        enrichment_artifact=enrichment_artifact,
+        enrichment_sha256=enrichment_sha256,
+    )
+
+    def ready_to_prepare(
+        *,
+        table_artifact: ProductionArtifact = enrichment_artifact,
+        table_read_sha256: str = enrichment_sha256,
+        anchor_registered: bool = True,
+    ) -> bool:
+        return table_insertion_preparation_ready(
+            record=record,
+            entry=entry,
+            synthesis_artifact=synthesis_artifact,
+            synthesis_read_sha256=synthesis_sha256,
+            enrichment_artifact=table_artifact,
+            enrichment_read_sha256=table_read_sha256,
+            anchor_registered=anchor_registered,
+        )
+
+    ready = ready_to_prepare()
+    assert ready
+    assert "create_table" in allowed_operations(entry, synthesis, allow_table_insertion=ready)
+
+    for not_ready in (
+        ready_to_prepare(
+            table_artifact=replace(enrichment_artifact, status=ProductionArtifactStatus.STALE)
+        ),
+        ready_to_prepare(table_artifact=replace(enrichment_artifact, input_hash="0" * 64)),
+        ready_to_prepare(table_read_sha256="0" * 64),
+        ready_to_prepare(anchor_registered=False),
+    ):
+        assert not not_ready
+        assert "create_table" not in allowed_operations(
+            entry, synthesis, allow_table_insertion=not_ready
+        )
+
+
+def test_snapshot_projects_pinned_table_after_its_registered_anchor() -> None:
+    anchor_entry, synthesis = _paragraph_registry_entry()
+    anchor_id = anchor_entry.block_id
+    evidence_ref = {
+        "source_document_id": str(uuid4()),
+        "kind": "fact",
+        "evidence_key": hashlib.sha256(b"snapshot-table-evidence").hexdigest(),
+    }
+    table = {
+        "key": "snapshot_table",
+        "kind": "custom",
+        "title": "Pinned synthetic table",
+        "caption": "Read from the pinned enrichment.",
+        "columns": [
+            {"key": "finding", "label": "Finding"},
+            {"key": "source", "label": "Source"},
+        ],
+        "rows": [
+            {
+                "cells": ["Synthetic finding", "Synthetic source"],
+                "evidence_refs": [evidence_ref],
+            }
+        ],
+        "placement": {"kind": "after_paragraph", "anchor_block_id": str(anchor_id)},
+        "purpose": {"evidence_refs": [evidence_ref]},
+    }
+    table_entry = BlockRegistryEntry(
+        block_id=uuid4(),
+        kind=EditorialBlockKind.TABLE,
+        parent_block_id=None,
+        position=0,
+        content_sha256=canonical_content_sha256(table),
+        source_stage=EditorialSourceStage.EDITORIAL_ENRICHMENT,
+        structural_pointer="/tables/0",
+    )
+    synthesis_artifact_id, enrichment_artifact_id = uuid4(), uuid4()
+    subject_id, run_id = uuid4(), uuid4()
+    record = _workspace_record(
+        subject_id=subject_id,
+        production_run_id=run_id,
+        synthesis_artifact_id=synthesis_artifact_id,
+        synthesis_sha256="d" * 64,
+        entries=(anchor_entry, table_entry),
+        enrichment_artifact=ProductionArtifact(
+            production_run_id=run_id,
+            subject_id=subject_id,
+            stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+            version=1,
+            input_hash="f" * 64,
+            canonical_blob_id=uuid4(),
+            id=enrichment_artifact_id,
+        ),
+        enrichment_sha256="e" * 64,
+    )
+    blocks, _, _ = project_blocks(
+        entries=(anchor_entry, table_entry),
+        synthesis=synthesis,
+        enrichment={"tables": [table]},
+        record=record,
+        allow_operations=False,
+    )
+
+    anchor_index = next(
+        index for index, block in enumerate(blocks) if block["block_id"] == str(anchor_id)
+    )
+    anchor_block = blocks[anchor_index]
+    table_block = next(block for block in blocks if block["block_id"] == str(table_entry.block_id))
+    assert blocks[anchor_index + 1] is table_block
+    projected_anchor = editorial_workspace_api.EditorialWorkspaceBlock.model_validate(anchor_block)
+    projected_block = editorial_workspace_api.EditorialWorkspaceBlock.model_validate(table_block)
+    assert projected_anchor.table is None
+    projected = projected_block.table
+    assert projected is not None
+    assert projected.title == "Pinned synthetic table"
+    assert projected.caption == "Read from the pinned enrichment."
+    assert [(column.key, column.label) for column in projected.columns] == [
+        ("finding", "Finding"),
+        ("source", "Source"),
+    ]
+    assert projected.rows[0].cells == ["Synthetic finding", "Synthetic source"]
+    assert projected.rows[0].evidence_refs == [evidence_ref]
+    assert projected.evidence_refs == [evidence_ref]
+    assert projected.anchor_block_id == anchor_id
+    assert projected.placement == "after_paragraph"
 
 
 def test_table_insertion_request_uses_the_exact_registered_anchor() -> None:
@@ -334,11 +530,16 @@ async def test_manual_table_patch_rejects_duplicate_normalized_analytic_question
         )
 
     assert caught.value.code == "manual_table_analytic_question_duplicate"
+    assert caught.value.reason == "manual_table:duplicate_question"
+    assert caught.value.frame is not None
+    assert caught.value.frame.startswith("editorial_proposals.py:")
+    assert caught.value.frame.endswith(":_prepare_manual_table_patch")
 
 
 @pytest.mark.asyncio
 async def test_manual_table_route_returns_stable_question_collision_error(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     subject_id, anchor = uuid4(), uuid4()
 
@@ -415,3 +616,72 @@ async def test_manual_table_route_returns_stable_question_collision_error(
     assert caught.value.detail["message"] == (
         "La question analytique existe déjà dans l'enrichissement."
     )
+    assert "manual_table_proposal_rejected code=manual_table_analytic_question_duplicate" in (
+        caplog.text
+    )
+    assert "reason=manual_table:validator_rejected" in caplog.text
+    assert "frame=test_editorial_table_insertion.py:" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_manual_table_route_returns_stable_row_width_validation_error(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(
+        editorial_workspace_api,
+        "get_settings",
+        lambda: SimpleNamespace(editorial_proposal_accept_enabled=True),
+    )
+    app = FastAPI()
+    app.include_router(editorial_workspace_api.router)
+    subject_id, anchor_id = uuid4(), uuid4()
+    evidence_ref = {
+        "source_document_id": str(uuid4()),
+        "kind": "fact",
+        "evidence_key": hashlib.sha256(b"request-validation-evidence").hexdigest(),
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
+    ) as client:
+        response = await client.post(
+            f"/api/subjects/{subject_id}/editor/blocks/{anchor_id}/table-proposals",
+            headers={"Idempotency-Key": "manual-table-invalid-width-0001"},
+            json={
+                "snapshot_id": str(uuid4()),
+                "anchor_block_id": str(anchor_id),
+                "table": {
+                    "key": "invalid_width_table",
+                    "kind": "custom",
+                    "title": "Synthetic table",
+                    "columns": [
+                        {"key": "finding", "label": "Finding"},
+                        {"key": "source", "label": "Source"},
+                    ],
+                    "rows": [
+                        {
+                            "cells": ["one", "two", "three"],
+                            "evidence_refs": [evidence_ref],
+                        }
+                    ],
+                    "purpose": {
+                        "question": "Which synthetic source supports this finding?",
+                        "available_data": "One synthetic source record.",
+                        "comprehension_gain": "Compare both synthetic values.",
+                        "scope": "This one synthetic row.",
+                        "evidence_refs": [evidence_ref],
+                        "knowledge_limits": "No other values are included.",
+                        "placement_reason": "After the selected anchor paragraph.",
+                    },
+                },
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == {
+        "code": "manual_table_request_invalid",
+        "message": "La requête de tableau est invalide.",
+    }
+    assert "manual_table_proposal_rejected code=manual_table_request_invalid" in caplog.text
+    assert "reason=manual_table:row_width_mismatch" in caplog.text
+    assert "frame=editorial_workspace.py:" in caplog.text

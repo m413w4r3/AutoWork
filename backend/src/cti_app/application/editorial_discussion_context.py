@@ -17,6 +17,10 @@ from cti_app.application.editorial_conversation_turns import (
 from cti_app.application.editorial_thread_common import decode_thread_request
 from cti_app.application.editorial_threads import EditorialThreadApplicationError
 from cti_app.application.editorial_workspace import EditorialWorkspaceService
+from cti_app.application.editorial_workspace.registry import (
+    revision_target_path,
+    table_insertion_preparation_ready,
+)
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_editorial_enrichment import (
@@ -290,9 +294,8 @@ class EditorialDiscussionContextBuilder:
             if isinstance(raw_operations, list)
             else set()
         )
-        structural_pointer = getattr(resolution.entry, "structural_pointer", None)
         proposal_target_path = (
-            f"synthesis{structural_pointer}" if isinstance(structural_pointer, str) else None
+            revision_target_path(resolution.entry) if resolution.entry is not None else None
         )
         raw_before_hash = target.get("before_hash")
         proposal_before_hash = raw_before_hash if isinstance(raw_before_hash, str) else None
@@ -492,52 +495,36 @@ class EditorialDiscussionContextBuilder:
 
         enrichment_proposal_context: Mapping[str, object] | None = None
         table_admitted: list[EditorialEvidenceEntry] | None = None
-        can_prepare_table = (
+        can_check_table = (
             stage_value == "synthesis"
             and kind in {"paragraph", "lead_paragraph"}
             and "create_table" in offered_operations
             and synthesis_artifact is not None
-            and synthesis_artifact.status is ProductionArtifactStatus.VERIFIED
             and synthesis_artifact.canonical_blob_id is not None
-            and synthesis_artifact.id == resolution.record.synthesis_artifact_id
-            and synthesis_artifact.version == resolution.record.synthesis_version
-            and synthesis_artifact.production_run_id == origin.production_run_id
             and enrichment_artifact is not None
-            and enrichment_artifact.status is ProductionArtifactStatus.VERIFIED
             and enrichment_artifact.canonical_blob_id is not None
-            and enrichment_artifact.id == resolution.record.enrichment_artifact_id
-            and enrichment_artifact.version == resolution.record.enrichment_version
-            and enrichment_artifact.input_hash == resolution.record.enrichment_input_hash
-            and enrichment_artifact.production_run_id == origin.production_run_id
-            and enrichment_artifact.subject_id == origin.subject_id
         )
-        if can_prepare_table:
+        if can_check_table:
             assert synthesis_artifact is not None
             assert synthesis_artifact.canonical_blob_id is not None
             assert enrichment_artifact is not None
             assert enrichment_artifact.canonical_blob_id is not None
             try:
-                synthesis_payload = await self._artifact_store.read_json(
+                synthesis_bytes = await self._artifact_store.read_bytes(
                     synthesis_artifact.canonical_blob_id
                 )
+                synthesis_payload = json.loads(synthesis_bytes)
+                if not isinstance(synthesis_payload, dict):
+                    raise ValueError("synthesis_payload_invalid")
                 synthesis = production_synthesis_from_json(synthesis_payload)
-                if (
-                    hashlib.sha256(
-                        self._artifact_store.canonical_json_bytes(synthesis_payload)
-                    ).hexdigest()
-                    != resolution.record.synthesis_canonical_sha256
-                ):
-                    raise ValueError("synthesis_pin_mismatch")
-                enrichment_payload = await self._artifact_store.read_json(
+                synthesis_read_sha256 = hashlib.sha256(synthesis_bytes).hexdigest()
+                enrichment_bytes = await self._artifact_store.read_bytes(
                     enrichment_artifact.canonical_blob_id
                 )
-                if (
-                    hashlib.sha256(
-                        self._artifact_store.canonical_json_bytes(enrichment_payload)
-                    ).hexdigest()
-                    != resolution.record.enrichment_canonical_sha256
-                ):
-                    raise ValueError("enrichment_pin_mismatch")
+                enrichment_payload = json.loads(enrichment_bytes)
+                if not isinstance(enrichment_payload, dict):
+                    raise ValueError("enrichment_payload_invalid")
+                enrichment_read_sha256 = hashlib.sha256(enrichment_bytes).hexdigest()
                 enrichment_pack = build_editorial_enrichment_evidence_pack(
                     production_snapshot,
                     extraction,
@@ -545,33 +532,41 @@ class EditorialDiscussionContextBuilder:
                     projection,
                     workspace_record=resolution.record,
                 )
-                if (
-                    enrichment_pack.registered_anchor_ids is None
-                    or origin.occurrence_id not in enrichment_pack.registered_anchor_ids
-                ):
-                    raise ValueError("editorial_anchor_stale")
-                table_records = (
-                    *enrichment_pack.narrative_evidence,
-                    *enrichment_pack.technical_evidence,
+                anchor_registered = (
+                    enrichment_pack.registered_anchor_ids is not None
+                    and origin.occurrence_id in enrichment_pack.registered_anchor_ids
                 )
-                table_admitted = [
-                    {"handle": str(item["handle"]), "payload": _object_mapping(item)}
-                    for item in table_records
-                    if isinstance(item.get("handle"), str)
-                ]
-                enrichment_proposal_context = {
-                    "anchor_block_id": str(origin.occurrence_id),
-                    "target_path": proposal_target_path,
-                    "base_artifact_id": str(enrichment_artifact.id),
-                    "base_artifact_version": enrichment_artifact.version,
-                    "base_input_hash": enrichment_artifact.input_hash,
-                    "base_canonical_sha256": resolution.record.enrichment_canonical_sha256,
-                    "base_content": _object_mapping(enrichment_payload),
-                    "evidence_pack": enrichment_pack,
-                    "extraction": extraction,
-                    "synthesis": synthesis,
-                    "figure_catalog": (),
-                }
+                if table_insertion_preparation_ready(
+                    record=resolution.record,
+                    entry=resolution.entry,
+                    synthesis_artifact=synthesis_artifact,
+                    synthesis_read_sha256=synthesis_read_sha256,
+                    enrichment_artifact=enrichment_artifact,
+                    enrichment_read_sha256=enrichment_read_sha256,
+                    anchor_registered=anchor_registered,
+                ):
+                    table_records = (
+                        *enrichment_pack.narrative_evidence,
+                        *enrichment_pack.technical_evidence,
+                    )
+                    table_admitted = [
+                        {"handle": str(item["handle"]), "payload": _object_mapping(item)}
+                        for item in table_records
+                        if isinstance(item.get("handle"), str)
+                    ]
+                    enrichment_proposal_context = {
+                        "anchor_block_id": str(origin.occurrence_id),
+                        "target_path": proposal_target_path,
+                        "base_artifact_id": str(enrichment_artifact.id),
+                        "base_artifact_version": enrichment_artifact.version,
+                        "base_input_hash": enrichment_artifact.input_hash,
+                        "base_canonical_sha256": resolution.record.enrichment_canonical_sha256,
+                        "base_content": _object_mapping(enrichment_payload),
+                        "evidence_pack": enrichment_pack,
+                        "extraction": extraction,
+                        "synthesis": synthesis,
+                        "figure_catalog": (),
+                    }
             except Exception:
                 enrichment_proposal_context = None
                 table_admitted = None

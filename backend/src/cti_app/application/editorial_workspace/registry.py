@@ -22,8 +22,15 @@ from cti_app.domain.editorial_workspace import (
     canonical_content_sha256,
     validate_block_registry,
 )
-from cti_app.domain.production import ProductionArtifactStage
-from cti_app.domain.production_editorial_enrichment import EditorialEnrichmentElementKind
+from cti_app.domain.production import (
+    ProductionArtifact,
+    ProductionArtifactStage,
+    ProductionArtifactStatus,
+)
+from cti_app.domain.production_editorial_enrichment import (
+    EditorialEnrichmentElementKind,
+    EnrichmentTableKind,
+)
 from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionOperation,
     TargetedEditorialRevisionPlacement,
@@ -383,6 +390,53 @@ def allowed_operations(
     return operations
 
 
+def revision_target_path(entry: BlockRegistryEntry) -> str:
+    """Resolve the canonical revision path for one registered synthesis block."""
+    return f"synthesis{entry.structural_pointer}"
+
+
+def table_insertion_preparation_ready(
+    *,
+    record: WorkspaceSnapshotRecord,
+    entry: BlockRegistryEntry,
+    synthesis_artifact: ProductionArtifact | None,
+    synthesis_read_sha256: str | None,
+    enrichment_artifact: ProductionArtifact | None,
+    enrichment_read_sha256: str | None,
+    anchor_registered: bool,
+) -> bool:
+    """Return whether a table can be prepared against these verified pins."""
+    if (
+        not anchor_registered
+        or entry not in record.block_registry
+        or entry.source_stage is not EditorialSourceStage.SYNTHESIS
+        or entry.kind not in {EditorialBlockKind.PARAGRAPH, EditorialBlockKind.LEAD_PARAGRAPH}
+        or entry.revision_status is not EditorialRevisionStatus.READY
+        or synthesis_artifact is None
+        or synthesis_artifact.stage is not ProductionArtifactStage.SYNTHESIS
+        or synthesis_artifact.status is not ProductionArtifactStatus.VERIFIED
+        or synthesis_artifact.canonical_blob_id is None
+        or synthesis_artifact.id != record.synthesis_artifact_id
+        or synthesis_artifact.version != record.synthesis_version
+        or synthesis_artifact.input_hash != record.synthesis_input_hash
+        or synthesis_artifact.production_run_id != record.production_run_id
+        or synthesis_artifact.subject_id != record.subject_id
+        or synthesis_read_sha256 != record.synthesis_canonical_sha256
+        or enrichment_artifact is None
+        or enrichment_artifact.stage is not ProductionArtifactStage.EDITORIAL_ENRICHMENT
+        or enrichment_artifact.status is not ProductionArtifactStatus.VERIFIED
+        or enrichment_artifact.canonical_blob_id is None
+        or enrichment_artifact.id != record.enrichment_artifact_id
+        or enrichment_artifact.version != record.enrichment_version
+        or enrichment_artifact.input_hash != record.enrichment_input_hash
+        or enrichment_artifact.production_run_id != record.production_run_id
+        or enrichment_artifact.subject_id != record.subject_id
+        or enrichment_read_sha256 != record.enrichment_canonical_sha256
+    ):
+        return False
+    return True
+
+
 def resolve_workspace_target(
     *,
     entry: BlockRegistryEntry,
@@ -418,7 +472,7 @@ def resolve_workspace_target(
         )
         return ResolvedWorkspaceTarget(
             entry.block_id,
-            f"synthesis{entry.structural_pointer}",
+            revision_target_path(entry),
             entry.content_sha256,
             operation,
             table_target,
@@ -430,7 +484,7 @@ def resolve_workspace_target(
         if "ambiguous" in str(exc):
             raise EditorialIdentityAmbiguousError("editorial_identity_ambiguous") from exc
         raise EditorialBlockMissingError("editorial_block_missing") from exc
-    path = f"synthesis{entry.structural_pointer}"
+    path = revision_target_path(entry)
     return ResolvedWorkspaceTarget(
         entry.block_id,
         path,
@@ -447,6 +501,10 @@ def project_blocks(
     synthesis: Mapping[str, Any],
     enrichment: Mapping[str, Any] | None,
     record: WorkspaceSnapshotRecord | None = None,
+    synthesis_artifact: ProductionArtifact | None = None,
+    synthesis_read_sha256: str | None = None,
+    enrichment_artifact: ProductionArtifact | None = None,
+    enrichment_read_sha256: str | None = None,
     needs_review_ids: frozenset[UUID] = frozenset(),
     allow_operations: bool = True,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
@@ -482,14 +540,27 @@ def project_blocks(
         else:
             text_value = str(value)
         evidence_refs = _project_evidence_refs(value)
+        structured_table = (
+            _project_structured_table(value)
+            if entry.kind is EditorialBlockKind.TABLE
+            and entry.source_stage is EditorialSourceStage.EDITORIAL_ENRICHMENT
+            else None
+        )
         operations = (
             allowed_operations(
                 entry,
                 synthesis,
                 allow_table_insertion=(
                     record is not None
-                    and record.enrichment_artifact_id is not None
-                    and record.enrichment_canonical_sha256 is not None
+                    and table_insertion_preparation_ready(
+                        record=record,
+                        entry=entry,
+                        synthesis_artifact=synthesis_artifact,
+                        synthesis_read_sha256=synthesis_read_sha256,
+                        enrichment_artifact=enrichment_artifact,
+                        enrichment_read_sha256=enrichment_read_sha256,
+                        anchor_registered=True,
+                    )
                 ),
             )
             if allow_operations and entry.revision_status is EditorialRevisionStatus.READY
@@ -517,6 +588,7 @@ def project_blocks(
             "position": entry.position,
             "text": text_value,
             "evidence_refs": evidence_refs,
+            "table": structured_table,
             "revision_target": {
                 "block_id": str(entry.block_id),
                 "legacy_target_id": legacy_target_id,
@@ -658,6 +730,72 @@ def project_blocks(
     blocks = ordered_blocks
     enrichments = ordered_enrichments
     return blocks, enrichments, outline
+
+
+def _project_structured_table(value: Any) -> dict[str, object] | None:
+    if not isinstance(value, Mapping):
+        return None
+    title = value.get("title")
+    columns = value.get("columns")
+    rows = value.get("rows")
+    placement = value.get("placement")
+    key = value.get("key")
+    table_kind = value.get("kind")
+    if (
+        not isinstance(key, str)
+        or not isinstance(table_kind, str)
+        or table_kind not in {kind.value for kind in EnrichmentTableKind}
+        or not isinstance(title, str)
+        or not isinstance(columns, list)
+        or not isinstance(rows, list)
+        or not isinstance(placement, Mapping)
+        or not isinstance(placement.get("kind"), str)
+    ):
+        return None
+    placement_kind = placement["kind"]
+    if placement_kind not in {
+        "after_paragraph",
+        "after_lead",
+        "after_timeline",
+        "after_section",
+        "end",
+    }:
+        return None
+    projected_columns = [
+        {"key": column["key"], "label": column["label"]}
+        for column in columns
+        if isinstance(column, Mapping)
+        and isinstance(column.get("key"), str)
+        and isinstance(column.get("label"), str)
+    ]
+    projected_rows = [
+        {
+            "cells": list(row["cells"]),
+            "evidence_refs": _project_evidence_refs(row),
+        }
+        for row in rows
+        if isinstance(row, Mapping)
+        and isinstance(row.get("cells"), list)
+        and all(isinstance(cell, str) for cell in row["cells"])
+    ]
+    if len(projected_columns) != len(columns) or len(projected_rows) != len(rows):
+        return None
+    anchor_block_id = placement.get("anchor_block_id")
+    if anchor_block_id is not None and not isinstance(anchor_block_id, str):
+        anchor_block_id = None
+    if placement_kind == "after_paragraph" and anchor_block_id is None:
+        return None
+    return {
+        "key": key,
+        "kind": table_kind,
+        "title": title,
+        "caption": value.get("caption") if isinstance(value.get("caption"), str) else None,
+        "columns": projected_columns,
+        "rows": projected_rows,
+        "evidence_refs": _project_evidence_refs(value),
+        "anchor_block_id": anchor_block_id,
+        "placement": placement_kind,
+    }
 
 
 def _project_evidence_refs(value: Any) -> list[dict[str, object]]:

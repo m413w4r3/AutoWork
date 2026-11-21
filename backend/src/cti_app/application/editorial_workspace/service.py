@@ -418,6 +418,10 @@ class EditorialWorkspaceService:
                 synthesis=synthesis,
                 enrichment=enrichment_content,
                 record=record,
+                synthesis_artifact=synthesis_artifact,
+                synthesis_read_sha256=synthesis_sha,
+                enrichment_artifact=enrichment_artifact,
+                enrichment_read_sha256=enrichment_sha,
                 allow_operations=kind is not None,
             )
             impact = await uow.editorial_proposal_impacts.latest_for_run(run.id)

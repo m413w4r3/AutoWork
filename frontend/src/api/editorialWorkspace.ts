@@ -73,6 +73,28 @@ export interface EditorialWorkspaceRevisionTarget {
   legacy_target_id: string | null;
 }
 
+export interface EditorialWorkspaceTableRow {
+  cells: string[];
+  evidence_refs: EditorialEvidenceReference[];
+}
+
+export interface EditorialWorkspaceTable {
+  key: string;
+  kind: EditorialEnrichmentTableKind;
+  title: string;
+  caption: string | null;
+  columns: EditorialTableColumn[];
+  rows: EditorialWorkspaceTableRow[];
+  evidence_refs: EditorialEvidenceReference[];
+  anchor_block_id: string | null;
+  placement:
+    | "after_paragraph"
+    | "after_lead"
+    | "after_timeline"
+    | "after_section"
+    | "end";
+}
+
 export interface EditorialWorkspaceBlock {
   block_id: string;
   kind: EditorialBlockKind;
@@ -80,6 +102,7 @@ export interface EditorialWorkspaceBlock {
   position: number;
   text: string | null;
   evidence_refs: Record<string, unknown>[];
+  table?: EditorialWorkspaceTable | null;
   revision_target: EditorialWorkspaceRevisionTarget;
   before_hash: string | null;
   allowed_operations: string[];
@@ -313,12 +336,7 @@ export type EditorialEnrichmentTableKind =
 export interface EditorialEvidenceReference {
   source_document_id: string;
   kind:
-    | "fact"
-    | "event"
-    | "source_metadata"
-    | "indicator"
-    | "rule"
-    | "uncertainty";
+    "fact" | "event" | "source_metadata" | "indicator" | "rule" | "uncertainty";
   evidence_key: string;
 }
 

@@ -10,9 +10,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sys
+import traceback
 import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from enum import StrEnum
 from io import BytesIO
 from typing import Any
 from uuid import UUID, uuid4
@@ -95,6 +98,40 @@ _EDITORIAL_UNSAFE_MARKUP = re.compile(
     r"|<\s*/?\s*[A-Za-z][A-Za-z0-9_.:-]*(?=\s|/?>)",
     re.IGNORECASE,
 )
+
+
+class EditorialTableDiagnosticReason(StrEnum):
+    IDEMPOTENCY_KEY_INVALID = "manual_table:idempotency_key_invalid"
+    DEPENDENCIES_UNAVAILABLE = "manual_table:dependencies_unavailable"
+    ANCHOR_MISMATCH = "manual_table:anchor_mismatch"
+    MARKUP_REJECTED = "manual_table:markup_rejected"
+    REQUEST_TOO_LARGE = "manual_table:request_too_large"
+    IDEMPOTENCY_CONFLICT = "manual_table:idempotency_conflict"
+    CONTEXT_UNAVAILABLE = "manual_table:context_unavailable"
+    SNAPSHOT_MISMATCH = "manual_table:snapshot_mismatch"
+    OPERATION_UNAVAILABLE = "manual_table:operation_unavailable"
+    BASE_CONTENT_UNAVAILABLE = "manual_table:base_content_unavailable"
+    DUPLICATE_QUESTION = "manual_table:duplicate_question"
+    EVIDENCE_PACK_UNAVAILABLE = "manual_table:evidence_pack_unavailable"
+    EVIDENCE_UNADMITTED = "manual_table:evidence_unadmitted"
+    TARGET_UNAVAILABLE = "manual_table:target_unavailable"
+    ANCHOR_STALE = "manual_table:anchor_stale"
+    VALIDATOR_REJECTED = "manual_table:validator_rejected"
+    PIN_STALE = "manual_table:pin_stale"
+    ROW_WIDTH_MISMATCH = "manual_table:row_width_mismatch"
+    REQUEST_SCHEMA_INVALID = "manual_table:request_schema_invalid"
+
+
+def _frame_string(filename: str, lineno: int, function: str) -> str:
+    return f"{filename.rsplit('/', 1)[-1]}:{lineno}:{function}"
+
+
+def _exception_origin_frame(error: BaseException) -> str | None:
+    frames = traceback.extract_tb(error.__traceback__)
+    if not frames:
+        return None
+    frame = frames[-1]
+    return _frame_string(frame.filename, frame.lineno or 0, frame.name)
 
 
 def _editorial_patch_text_violation(value: str, *, allow_newline_tab: bool = False) -> bool:
@@ -454,14 +491,105 @@ def _manual_paragraph_wire(
 
 
 class EditorialProposalApplicationError(ValueError):
-    def __init__(self, code: str, *, reason: str | None = None) -> None:
+    def __init__(self, code: str, *, reason: str | None = None, frame: str | None = None) -> None:
         if code == "proposal_base_stale" and (
             reason is None or re.fullmatch(r"[a-z][a-z0-9_]*:[a-z][a-z0-9_]*", reason) is None
         ):
             raise ValueError("proposal_base_stale requires a closed reason")
         self.code = code
         self.reason = reason
+        self.frame = frame
         super().__init__(code)
+
+
+def _manual_table_failure(
+    code: str,
+    reason: EditorialTableDiagnosticReason,
+    *,
+    frame: str | None = None,
+) -> EditorialProposalApplicationError:
+    if frame is None:
+        caller = sys._getframe(1)
+        frame = _frame_string(
+            caller.f_code.co_filename,
+            caller.f_lineno,
+            caller.f_code.co_name,
+        )
+    return EditorialProposalApplicationError(code, reason=reason.value, frame=frame)
+
+
+def _manual_table_error_reason(code: str) -> EditorialTableDiagnosticReason:
+    return {
+        "idempotency_key_invalid": EditorialTableDiagnosticReason.IDEMPOTENCY_KEY_INVALID,
+        "manual_edit_request_too_large": EditorialTableDiagnosticReason.REQUEST_TOO_LARGE,
+        "editorial_anchor_stale": EditorialTableDiagnosticReason.ANCHOR_STALE,
+        "proposal_base_stale": EditorialTableDiagnosticReason.PIN_STALE,
+        "editorial_snapshot_stale": EditorialTableDiagnosticReason.PIN_STALE,
+        "proposal_workspace_unavailable": EditorialTableDiagnosticReason.DEPENDENCIES_UNAVAILABLE,
+        "proposal_base_unavailable": EditorialTableDiagnosticReason.CONTEXT_UNAVAILABLE,
+        "proposal_operation_unsupported": EditorialTableDiagnosticReason.OPERATION_UNAVAILABLE,
+        "manual_table_analytic_question_duplicate": (
+            EditorialTableDiagnosticReason.DUPLICATE_QUESTION
+        ),
+        "manual_edit_new_fact_unadmitted": EditorialTableDiagnosticReason.EVIDENCE_UNADMITTED,
+        "proposal_target_mismatch": EditorialTableDiagnosticReason.TARGET_UNAVAILABLE,
+    }.get(code, EditorialTableDiagnosticReason.VALIDATOR_REJECTED)
+
+
+def _manual_table_validation_diagnostics(
+    preparation: EditorialProposalPreparation,
+    error: BaseException | None,
+    *,
+    code: str,
+) -> dict[str, object]:
+    if (
+        preparation.origin is not EditorialProposalOrigin.MANUAL_PATCH
+        or preparation.operation is not TargetedEditorialRevisionOperation.CREATE_TABLE
+    ):
+        return {"code": code}
+    reason = _manual_table_error_reason(code)
+    frame = (
+        getattr(error, "frame", None) or _exception_origin_frame(error)
+        if error is not None
+        else None
+    )
+    if frame is None:
+        caller = sys._getframe(1)
+        frame = _frame_string(caller.f_code.co_filename, caller.f_lineno, caller.f_code.co_name)
+    assert frame is not None
+    return {
+        "code": code,
+        "reason": reason.value,
+        "frame": frame,
+    }
+
+
+def _manual_table_failure_from_diagnostics(
+    preparation: EditorialProposalPreparation,
+    code: str,
+    diagnostics: Mapping[str, object],
+) -> EditorialProposalApplicationError:
+    if (
+        preparation.origin is not EditorialProposalOrigin.MANUAL_PATCH
+        or preparation.operation is not TargetedEditorialRevisionOperation.CREATE_TABLE
+    ):
+        return EditorialProposalApplicationError(
+            code,
+            reason="validation:proposal_base_stale" if code == "proposal_base_stale" else None,
+        )
+    raw_reason = diagnostics.get("reason")
+    try:
+        reason = EditorialTableDiagnosticReason(str(raw_reason))
+    except ValueError:
+        reason = _manual_table_error_reason(code)
+    if code == "proposal_base_stale":
+        reason = EditorialTableDiagnosticReason.PIN_STALE
+    frame = diagnostics.get("frame")
+    return _manual_table_failure(
+        code,
+        reason,
+        frame=frame if isinstance(frame, str) else None,
+    )
 
 
 class _ProposalPatchBlobMissing(Exception):
@@ -694,12 +822,23 @@ class EditorialProposalService:
         patch: ManualPatch,
     ) -> EditorialProposal:
         """Persist a validated manual text patch without creating a model run."""
+        typed_patch = patch.typed_patch
+        is_manual_table = isinstance(typed_patch, ManualTablePatch)
         if not _IDEMPOTENCY_KEY.fullmatch(idempotency_key):
+            if is_manual_table:
+                raise _manual_table_failure(
+                    "idempotency_key_invalid",
+                    EditorialTableDiagnosticReason.IDEMPOTENCY_KEY_INVALID,
+                )
             raise EditorialProposalApplicationError("idempotency_key_invalid")
         if self._workspace_service is None:
+            if is_manual_table:
+                raise _manual_table_failure(
+                    "proposal_workspace_unavailable",
+                    EditorialTableDiagnosticReason.DEPENDENCIES_UNAVAILABLE,
+                )
             raise EditorialProposalApplicationError("proposal_workspace_unavailable")
 
-        typed_patch = patch.typed_patch
         if isinstance(typed_patch, ManualTablePatch):
             return await self._prepare_manual_table_patch(
                 subject_id=subject_id,
@@ -865,18 +1004,27 @@ class EditorialProposalService:
         typed_patch: ManualTablePatch,
     ) -> EditorialProposal:
         if not _IDEMPOTENCY_KEY.fullmatch(idempotency_key):
-            raise EditorialProposalApplicationError("idempotency_key_invalid")
+            raise _manual_table_failure(
+                "idempotency_key_invalid", EditorialTableDiagnosticReason.IDEMPOTENCY_KEY_INVALID
+            )
         if (
             self._discussion_context_builder is None
             or self._artifact_store is None
             or self._workspace_service is None
         ):
-            raise EditorialProposalApplicationError("proposal_base_unavailable")
+            raise _manual_table_failure(
+                "proposal_base_unavailable",
+                EditorialTableDiagnosticReason.DEPENDENCIES_UNAVAILABLE,
+            )
         if occurrence_id != typed_patch.anchor_block_id:
-            raise EditorialProposalApplicationError("editorial_anchor_stale")
+            raise _manual_table_failure(
+                "editorial_anchor_stale", EditorialTableDiagnosticReason.ANCHOR_MISMATCH
+            )
         table = typed_patch.table
         if table.placement.anchor_block_id != occurrence_id:
-            raise EditorialProposalApplicationError("editorial_anchor_stale")
+            raise _manual_table_failure(
+                "editorial_anchor_stale", EditorialTableDiagnosticReason.ANCHOR_MISMATCH
+            )
         text_values = [table.key, table.title]
         if table.caption is not None:
             text_values.append(table.caption)
@@ -885,7 +1033,10 @@ class EditorialProposalService:
         )
         text_values.extend(cell for row in table.rows for cell in row.cells)
         if table.purpose is None:
-            raise EditorialProposalApplicationError("manual_edit_new_fact_unadmitted")
+            raise _manual_table_failure(
+                "manual_edit_new_fact_unadmitted",
+                EditorialTableDiagnosticReason.EVIDENCE_UNADMITTED,
+            )
         text_values.extend(
             (
                 table.purpose.question,
@@ -897,12 +1048,16 @@ class EditorialProposalService:
             )
         )
         if any(_editorial_patch_text_violation(value) for value in text_values):
-            raise EditorialProposalApplicationError("manual_edit_patch_invalid")
+            raise _manual_table_failure(
+                "manual_edit_patch_invalid", EditorialTableDiagnosticReason.MARKUP_REJECTED
+            )
         if (
             len(ProductionArtifactStore.canonical_json_bytes(_manual_table_domain_json(table)))
             > _MAX_PATCH_BYTES
         ):
-            raise EditorialProposalApplicationError("manual_edit_request_too_large")
+            raise _manual_table_failure(
+                "manual_edit_request_too_large", EditorialTableDiagnosticReason.REQUEST_TOO_LARGE
+            )
 
         preparation_key = _manual_idempotency_key("prepare", idempotency_key)
         request_sha256 = _manual_table_request_sha256(
@@ -922,31 +1077,56 @@ class EditorialProposalService:
 
         try:
             context = await self._discussion_context_builder.build_manual(subject_id, occurrence_id)
-        except Exception:
-            raise EditorialProposalApplicationError("proposal_base_unavailable") from None
+        except Exception as error:
+            raise _manual_table_failure(
+                "proposal_base_unavailable",
+                EditorialTableDiagnosticReason.CONTEXT_UNAVAILABLE,
+                frame=_exception_origin_frame(error),
+            ) from None
         if (
             context.proposal_snapshot_id != snapshot_id
             or context.proposal_enrichment_context is None
             or "create_table" not in context.proposal_operations
         ):
-            raise EditorialProposalApplicationError("proposal_operation_unsupported")
+            reason = (
+                EditorialTableDiagnosticReason.SNAPSHOT_MISMATCH
+                if context.proposal_snapshot_id != snapshot_id
+                else EditorialTableDiagnosticReason.OPERATION_UNAVAILABLE
+            )
+            raise _manual_table_failure("proposal_operation_unsupported", reason)
         enrichment_context = context.proposal_enrichment_context
         base_content = enrichment_context.get("base_content")
         if not isinstance(base_content, Mapping):
-            raise EditorialProposalApplicationError("proposal_base_unavailable")
+            raise _manual_table_failure(
+                "proposal_base_unavailable",
+                EditorialTableDiagnosticReason.BASE_CONTENT_UNAVAILABLE,
+            )
         if _manual_table_question_conflicts_with_base(table.purpose.question, base_content):
-            raise EditorialProposalApplicationError("manual_table_analytic_question_duplicate")
+            raise _manual_table_failure(
+                "manual_table_analytic_question_duplicate",
+                EditorialTableDiagnosticReason.DUPLICATE_QUESTION,
+            )
         evidence_pack = enrichment_context.get("evidence_pack")
         if evidence_pack is None:
-            raise EditorialProposalApplicationError("proposal_base_unavailable")
+            raise _manual_table_failure(
+                "proposal_base_unavailable",
+                EditorialTableDiagnosticReason.EVIDENCE_PACK_UNAVAILABLE,
+            )
         handles_by_ref = {
             reference: handle
             for handle, reference in getattr(evidence_pack, "_handle_to_ref", {}).items()
         }
-        table_handles, refs = _manual_table_evidence_handles(
-            table,
-            handles_by_ref=handles_by_ref,
-        )
+        try:
+            table_handles, refs = _manual_table_evidence_handles(
+                table,
+                handles_by_ref=handles_by_ref,
+            )
+        except EditorialProposalApplicationError as error:
+            raise _manual_table_failure(
+                error.code,
+                _manual_table_error_reason(error.code),
+                frame=_exception_origin_frame(error),
+            ) from error
         purpose_handles = [handles_by_ref[reference] for reference in table.purpose.evidence_refs]
 
         try:
@@ -957,8 +1137,10 @@ class EditorialProposalService:
                 operation=TargetedEditorialRevisionOperation.CREATE_TABLE.value,
             )
         except EditorialWorkspaceError as error:
-            raise EditorialProposalApplicationError(
-                _editorial_workspace_error_code(error)
+            raise _manual_table_failure(
+                _editorial_workspace_error_code(error),
+                EditorialTableDiagnosticReason.TARGET_UNAVAILABLE,
+                frame=_exception_origin_frame(error),
             ) from error
         record = resolved.record
         if (
@@ -971,7 +1153,9 @@ class EditorialProposalService:
             or enrichment_context.get("base_input_hash") != record.enrichment_input_hash
             or enrichment_context.get("base_canonical_sha256") != record.enrichment_canonical_sha256
         ):
-            raise EditorialProposalApplicationError("editorial_anchor_stale")
+            raise _manual_table_failure(
+                "editorial_anchor_stale", EditorialTableDiagnosticReason.ANCHOR_STALE
+            )
         raw_table = _manual_table_proposal_json(
             table,
             row_handles=table_handles,
@@ -986,7 +1170,7 @@ class EditorialProposalService:
             "resource_needs": [],
         }
         raw_response = _manual_wire_response(
-            target_path=f"synthesis{resolved.occurrence.entry.structural_pointer}",
+            target_path=resolved.path,
             operation=TargetedEditorialRevisionOperation.CREATE_TABLE,
             base_sha256=record.enrichment_canonical_sha256 or "",
             before_hash=resolved.before_hash,
@@ -1032,8 +1216,28 @@ class EditorialProposalService:
         reject_invalid_manual: bool,
     ) -> EditorialProposal:
         if not _IDEMPOTENCY_KEY.fullmatch(preparation.idempotency_key):
+            if (
+                preparation.origin is EditorialProposalOrigin.MANUAL_PATCH
+                and preparation.operation is TargetedEditorialRevisionOperation.CREATE_TABLE
+            ):
+                raise _manual_table_failure(
+                    "idempotency_key_invalid",
+                    EditorialTableDiagnosticReason.IDEMPOTENCY_KEY_INVALID,
+                )
             raise EditorialProposalApplicationError("idempotency_key_invalid")
-        preparation = await self._resolve_authoritative_preparation(preparation)
+        try:
+            preparation = await self._resolve_authoritative_preparation(preparation)
+        except EditorialProposalApplicationError as error:
+            if (
+                preparation.origin is EditorialProposalOrigin.MANUAL_PATCH
+                and preparation.operation is TargetedEditorialRevisionOperation.CREATE_TABLE
+            ):
+                raise _manual_table_failure(
+                    error.code,
+                    _manual_table_error_reason(error.code),
+                    frame=error.frame or _exception_origin_frame(error),
+                ) from error
+            raise
         patch_payload, state, kind, diagnostics = self._validate_result(preparation)
         if reject_invalid_manual and state is not EditorialProposalState.PROPOSED:
             code = str(diagnostics.get("code", "proposal_patch_invalid"))
@@ -1046,12 +1250,16 @@ class EditorialProposalService:
                 "proposal_evidence_not_admissible",
                 "manual_edit_new_fact_unadmitted",
             }:
-                raise EditorialProposalApplicationError("manual_edit_new_fact_unadmitted")
-            if code == "proposal_base_stale":
-                raise EditorialProposalApplicationError(
-                    "proposal_base_stale", reason="validation:proposal_base_stale"
+                raise _manual_table_failure_from_diagnostics(
+                    preparation, "manual_edit_new_fact_unadmitted", diagnostics
                 )
-            raise EditorialProposalApplicationError("manual_edit_patch_invalid")
+            if code == "proposal_base_stale":
+                raise _manual_table_failure_from_diagnostics(
+                    preparation, "proposal_base_stale", diagnostics
+                )
+            raise _manual_table_failure_from_diagnostics(
+                preparation, "manual_edit_patch_invalid", diagnostics
+            )
         evidence_refs = patch_payload.get("evidence_refs") if patch_payload is not None else None
         if isinstance(evidence_refs, list):
             preparation = replace(
@@ -1838,7 +2046,7 @@ class EditorialProposalService:
                 None,
                 EditorialProposalState.NEEDS_REVIEW,
                 EditorialProposalEventKind.NEEDS_REVIEW,
-                {"code": error.reason_code},
+                _manual_table_validation_diagnostics(preparation, error, code=error.reason_code),
             )
         if patch.refusal is not None:
             return (
@@ -1859,7 +2067,9 @@ class EditorialProposalService:
                 None,
                 EditorialProposalState.NEEDS_REVIEW,
                 EditorialProposalEventKind.NEEDS_REVIEW,
-                {"code": "revision_wire_markup_forbidden"},
+                _manual_table_validation_diagnostics(
+                    preparation, None, code="revision_wire_markup_forbidden"
+                ),
             )
         try:
             if patch.action is not preparation.operation:
@@ -1920,21 +2130,23 @@ class EditorialProposalService:
                 None,
                 EditorialProposalState.NEEDS_REVIEW,
                 EditorialProposalEventKind.NEEDS_REVIEW,
-                {"code": error.code},
+                _manual_table_validation_diagnostics(preparation, error, code=error.code),
             )
-        except TargetedEditorialRevisionConflictError:
+        except TargetedEditorialRevisionConflictError as error:
             return (
                 None,
                 EditorialProposalState.NEEDS_REVIEW,
                 EditorialProposalEventKind.NEEDS_REVIEW,
-                {"code": "proposal_base_stale"},
+                _manual_table_validation_diagnostics(
+                    preparation, error, code="proposal_base_stale"
+                ),
             )
         except TargetedSynthesisRevisionValidationError as error:
             return (
                 None,
                 EditorialProposalState.NEEDS_REVIEW,
                 EditorialProposalEventKind.NEEDS_REVIEW,
-                {"code": error.reason_code},
+                _manual_table_validation_diagnostics(preparation, error, code=error.reason_code),
             )
         except (TypeError, ValueError) as error:
             code = getattr(error, "reason_code", "proposal_patch_invalid")
@@ -1942,7 +2154,7 @@ class EditorialProposalService:
                 None,
                 EditorialProposalState.NEEDS_REVIEW,
                 EditorialProposalEventKind.NEEDS_REVIEW,
-                {"code": str(code)},
+                _manual_table_validation_diagnostics(preparation, error, code=str(code)),
             )
 
     def _validate_rewrite_paragraph_result(
