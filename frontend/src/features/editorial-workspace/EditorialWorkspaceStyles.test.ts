@@ -127,7 +127,7 @@ describe("editorial workspace visual accessibility", () => {
       }
     }
 
-    for (const scrimSurface of ["scrim-tablet", "scrim-mobile"]) {
+    for (const scrimSurface of ["scrim-tablet", "scrim-drawer"]) {
       expect(
         contrastRatio(readToken("focus-ring"), readToken(scrimSurface)),
         `focus-ring on ${scrimSurface}`,
