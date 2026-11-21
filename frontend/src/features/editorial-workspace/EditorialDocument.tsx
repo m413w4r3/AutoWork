@@ -2,6 +2,7 @@ import type { EditorialWorkspaceSnapshot } from "../../api/editorialWorkspace";
 import { BLOCK_KIND_LABELS } from "./blockKindLabels";
 import { InlineTextEditor } from "./InlineTextEditor";
 import type { InlineTextEditorProps } from "./InlineTextEditor";
+import { ManualBarChartPreview } from "./ManualBarChartPreview";
 
 interface EditorialDocumentProps {
   snapshot: EditorialWorkspaceSnapshot;
@@ -18,6 +19,32 @@ interface EditorialDocumentProps {
 
 function blockContent(block: EditorialWorkspaceSnapshot["blocks"][number]) {
   const className = "editorial-document__text";
+  if (block.kind === "chart" && block.chart) {
+    return (
+      <section
+        className="editorial-document__chart"
+        aria-label={block.chart.title}
+      >
+        <ManualBarChartPreview
+          title={block.chart.title}
+          caption={block.chart.caption}
+          legend={block.chart.legend}
+          categoryAxisLabel={block.chart.category_axis_label}
+          valueAxisLabel={block.chart.value_axis_label}
+          unit={block.chart.unit}
+          points={block.chart.points.map((point) => ({
+            label: point.label,
+            value: point.value,
+            evidence: point.evidence_refs.map((reference) => ({
+              label: `Source ${reference.source_document_id} · ${reference.kind}`,
+              passage: null,
+              detail: `${reference.source_document_id} · ${reference.kind} · ${reference.evidence_key}`,
+            })),
+          }))}
+        />
+      </section>
+    );
+  }
   if (block.kind === "table" && block.table) {
     return (
       <section

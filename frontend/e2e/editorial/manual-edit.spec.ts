@@ -37,6 +37,7 @@ function makeSnapshot(
         position: 0,
         text,
         evidence_refs: [],
+        chart: null,
         revision_target: { block_id: blockId, legacy_target_id: null },
         before_hash: "c".repeat(64),
         allowed_operations: ["rewrite_paragraph"],

@@ -3,12 +3,18 @@ import { useEffect, useRef, useState } from "react";
 
 import { ApiError } from "../../api/editions";
 import {
+  createManualEditorialBarChartProposal,
   createManualEditorialTableProposal,
   type EditorialEvidenceReference,
+  type EditorialManualBarChartProposalInput,
   type EditorialWorkspaceBlock,
   type EditorialWorkspaceSnapshot,
 } from "../../api/editorialWorkspace";
 import { EditorialProposalCard } from "./EditorialProposalCard";
+import {
+  ManualBarChartEditor,
+  type BarChartPointDraft,
+} from "./ManualBarChartEditor";
 import { ManualTableEditor, type AdmittedEvidence } from "./ManualTableEditor";
 import type { TableColumnDraft, TableRowDraft } from "./ManualTablePreview";
 
@@ -16,6 +22,12 @@ const DEFAULT_INSTRUCTION =
   "Créer un tableau à partir des informations de ce passage et de ses preuves associées.";
 const BRIDGE_TABLE_INSTRUCTION =
   "Propose un tableau typé à partir de ce paragraphe et de ses preuves admises, sans ajouter de fait.";
+const DEFAULT_BAR_CHART_INSTRUCTION =
+  "Créer un graphique à barres à partir des valeurs chiffrées de ce passage et de ses preuves associées.";
+const INSUFFICIENT_CHART_DATA_CODES = new Set([
+  "bar_chart_insufficient_data",
+  "bar_chart_value_not_evidenced",
+]);
 
 interface VisualInsertionComposerProps {
   subjectId: string;
@@ -93,7 +105,11 @@ function newRow(columnCount: number): TableRowDraft {
   };
 }
 
-function isTableBlock(block: EditorialWorkspaceBlock): boolean {
+function newChartPoint(): BarChartPointDraft {
+  return { label: "", value: "", evidenceIdentities: [] };
+}
+
+function isParagraphAnchor(block: EditorialWorkspaceBlock): boolean {
   return block.kind === "paragraph" || block.kind === "lead_paragraph";
 }
 
@@ -107,7 +123,7 @@ export function VisualInsertionComposer({
   const addButtonRef = useRef<HTMLButtonElement>(null);
   const instructionRef = useRef<HTMLTextAreaElement>(null);
   const [menuOpen, setMenuOpen] = useState(false);
-  const [editorOpen, setEditorOpen] = useState(false);
+  const [editorMode, setEditorMode] = useState<"table" | "chart" | null>(null);
   const [instruction, setInstruction] = useState(DEFAULT_INSTRUCTION);
   const [title, setTitle] = useState("");
   const [caption, setCaption] = useState("");
@@ -116,11 +132,32 @@ export function VisualInsertionComposer({
     newColumn(),
   ]);
   const [rows, setRows] = useState<TableRowDraft[]>([newRow(2)]);
+  const [chartInstruction, setChartInstruction] = useState(
+    DEFAULT_BAR_CHART_INSTRUCTION,
+  );
+  const [chartTitle, setChartTitle] = useState("");
+  const [chartLegend, setChartLegend] = useState("");
+  const [chartCategoryAxisLabel, setChartCategoryAxisLabel] = useState("");
+  const [chartValueAxisLabel, setChartValueAxisLabel] = useState("");
+  const [chartUnit, setChartUnit] = useState("");
+  const [chartPoints, setChartPoints] = useState<BarChartPointDraft[]>([
+    newChartPoint(),
+    newChartPoint(),
+  ]);
   const [proposalId, setProposalId] = useState<string | null>(null);
   const [requestError, setRequestError] = useState<string | null>(null);
+  const [chartProposalId, setChartProposalId] = useState<string | null>(null);
+  const [chartRequestError, setChartRequestError] = useState<string | null>(
+    null,
+  );
+  const [chartDataInsufficient, setChartDataInsufficient] = useState(false);
   const proposalRequestRef = useRef<{
     idempotencyKey: string;
     tableKey: string;
+  } | null>(null);
+  const chartProposalRequestRef = useRef<{
+    idempotencyKey: string;
+    chartKey: string;
   } | null>(null);
   const admitted = admittedEvidence(block);
   const admittedByIdentity = new Map(
@@ -130,9 +167,11 @@ export function VisualInsertionComposer({
     !readOnly &&
     snapshot.capabilities.can_add_enrichment &&
     block.allowed_operations.includes("insert_after") &&
-    isTableBlock(block);
+    isParagraphAnchor(block);
   const canCreateTable =
     canInsertAfter && block.allowed_operations.includes("create_table");
+  const canCreateBarChart =
+    canInsertAfter && block.allowed_operations.includes("create_bar_chart");
   const proposalMutation = useMutation({
     mutationFn: () => {
       const proposalRequest = proposalRequestRef.current ?? {
@@ -208,6 +247,86 @@ export function VisualInsertionComposer({
       setRequestError(error.message);
     },
   });
+  const chartProposalMutation = useMutation({
+    mutationFn: () => {
+      const proposalRequest = chartProposalRequestRef.current ?? {
+        idempotencyKey: crypto.randomUUID(),
+        chartKey: crypto.randomUUID(),
+      };
+      chartProposalRequestRef.current = proposalRequest;
+      const evidenceForPoints = chartPoints.map((point) =>
+        point.evidenceIdentities.flatMap((identity) => {
+          const reference = admittedByIdentity.get(identity);
+          return reference ? [reference] : [];
+        }),
+      );
+      const purposeEvidence = Array.from(
+        new Map(
+          evidenceForPoints.flatMap((references) =>
+            references.map((reference) => [
+              `${reference.source_document_id}:${reference.kind}:${reference.evidence_key}`,
+              reference,
+            ]),
+          ),
+        ).values(),
+      );
+      const input: EditorialManualBarChartProposalInput = {
+        snapshot_id: snapshot.snapshot_id,
+        anchor_block_id: block.block_id,
+        chart: {
+          key: `chart-${proposalRequest.chartKey}`,
+          title: chartTitle.trim(),
+          caption: null,
+          category_axis_label: chartCategoryAxisLabel.trim(),
+          value_axis_label: chartValueAxisLabel.trim(),
+          unit: chartUnit.trim(),
+          points: chartPoints.map((point, index) => ({
+            label: point.label.trim(),
+            series: chartLegend.trim(),
+            value: point.value.trim(),
+            evidence_refs: evidenceForPoints[index] ?? [],
+          })),
+          purpose: {
+            question: chartInstruction.trim(),
+            available_data:
+              "Valeurs chiffrées du paragraphe et preuves admises sélectionnées.",
+            comprehension_gain:
+              "Comparer les valeurs quantitatives documentées.",
+            scope: "Le paragraphe d’ancrage et les preuves sélectionnées.",
+            evidence_refs: purposeEvidence,
+            knowledge_limits:
+              "Ne pas ajouter, extrapoler ou calculer de valeur au-delà des preuves sélectionnées.",
+            placement_reason: "Après le paragraphe sélectionné.",
+          },
+        },
+      };
+      return createManualEditorialBarChartProposal(
+        subjectId,
+        block.block_id,
+        proposalRequest.idempotencyKey,
+        input,
+      );
+    },
+    onSuccess: (proposal) => {
+      setChartProposalId(proposal.id);
+      setChartRequestError(null);
+      setChartDataInsufficient(false);
+    },
+    onError: (error: Error) => {
+      if (
+        error instanceof ApiError &&
+        error.status >= 400 &&
+        error.status < 500
+      ) {
+        chartProposalRequestRef.current = null;
+      }
+      setChartRequestError(error.message);
+      setChartDataInsufficient(
+        error instanceof ApiError &&
+          INSUFFICIENT_CHART_DATA_CODES.has(error.code),
+      );
+    },
+  });
   const validTable =
     title.trim().length > 0 &&
     instruction.trim().length > 0 &&
@@ -222,33 +341,63 @@ export function VisualInsertionComposer({
           admittedByIdentity.has(identity),
         ),
     );
+  const validChart =
+    chartTitle.trim().length > 0 &&
+    chartLegend.trim().length > 0 &&
+    chartCategoryAxisLabel.trim().length > 0 &&
+    chartValueAxisLabel.trim().length > 0 &&
+    chartUnit.trim().length > 0 &&
+    chartInstruction.trim().length > 0 &&
+    chartPoints.length >= 2 &&
+    chartPoints.length <= 24 &&
+    new Set(chartPoints.map((point) => point.label.trim().toLocaleLowerCase()))
+      .size === chartPoints.length &&
+    chartPoints.every((point) => {
+      const value = point.value.trim();
+      return (
+        point.label.trim().length > 0 &&
+        value.length > 0 &&
+        Number.isFinite(Number(value)) &&
+        point.evidenceIdentities.some((identity) =>
+          admittedByIdentity.has(identity),
+        )
+      );
+    });
 
   useEffect(() => {
-    if (editorOpen) instructionRef.current?.focus();
-  }, [editorOpen]);
+    if (editorMode !== null) instructionRef.current?.focus();
+  }, [editorMode]);
 
   useEffect(() => {
     proposalRequestRef.current = null;
+    chartProposalRequestRef.current = null;
   }, [block.block_id, snapshot.snapshot_id, subjectId]);
 
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
-      if (!editorOpen && !menuOpen) return;
+      if (editorMode === null && !menuOpen) return;
       event.preventDefault();
       event.stopPropagation();
       setMenuOpen(false);
-      setEditorOpen(false);
+      setEditorMode(null);
       window.requestAnimationFrame(() => addButtonRef.current?.focus());
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [editorOpen, menuOpen]);
+  }, [editorMode, menuOpen]);
 
   if (!canInsertAfter) return null;
 
   const invalidateProposalRequest = () => {
     proposalRequestRef.current = null;
+  };
+
+  const invalidateChartDraft = () => {
+    chartProposalRequestRef.current = null;
+    setChartProposalId(null);
+    setChartRequestError(null);
+    setChartDataInsufficient(false);
   };
 
   const updateInstruction = (value: string) => {
@@ -343,6 +492,72 @@ export function VisualInsertionComposer({
     setRows((current) => current.filter((_, index) => index !== rowIndex));
   };
 
+  const updateChartInstruction = (value: string) => {
+    invalidateChartDraft();
+    setChartInstruction(value);
+  };
+  const updateChartTitle = (value: string) => {
+    invalidateChartDraft();
+    setChartTitle(value);
+  };
+  const updateChartLegend = (value: string) => {
+    invalidateChartDraft();
+    setChartLegend(value);
+  };
+  const updateChartCategoryAxisLabel = (value: string) => {
+    invalidateChartDraft();
+    setChartCategoryAxisLabel(value);
+  };
+  const updateChartValueAxisLabel = (value: string) => {
+    invalidateChartDraft();
+    setChartValueAxisLabel(value);
+  };
+  const updateChartUnit = (value: string) => {
+    invalidateChartDraft();
+    setChartUnit(value);
+  };
+  const updateChartPoint = (
+    pointIndex: number,
+    update: (point: BarChartPointDraft) => BarChartPointDraft,
+  ) => {
+    invalidateChartDraft();
+    setChartPoints((current) =>
+      current.map((point, index) =>
+        index === pointIndex ? update(point) : point,
+      ),
+    );
+  };
+  const updateChartPointLabel = (pointIndex: number, value: string) => {
+    updateChartPoint(pointIndex, (point) => ({ ...point, label: value }));
+  };
+  const updateChartPointValue = (pointIndex: number, value: string) => {
+    updateChartPoint(pointIndex, (point) => ({ ...point, value }));
+  };
+  const toggleChartPointEvidence = (
+    pointIndex: number,
+    identity: string,
+    checked: boolean,
+  ) => {
+    updateChartPoint(pointIndex, (point) => ({
+      ...point,
+      evidenceIdentities: checked
+        ? [...new Set([...point.evidenceIdentities, identity])]
+        : point.evidenceIdentities.filter((item) => item !== identity),
+    }));
+  };
+  const addChartPoint = () => {
+    if (chartPoints.length >= 24) return;
+    invalidateChartDraft();
+    setChartPoints((current) => [...current, newChartPoint()]);
+  };
+  const removeChartPoint = (pointIndex: number) => {
+    if (chartPoints.length <= 2) return;
+    invalidateChartDraft();
+    setChartPoints((current) =>
+      current.filter((_, index) => index !== pointIndex),
+    );
+  };
+
   return (
     <div className="editorial-visual-insertion">
       <button
@@ -368,7 +583,7 @@ export function VisualInsertionComposer({
             onClick={() => {
               if (!canCreateTable) return;
               setMenuOpen(false);
-              setEditorOpen(true);
+              setEditorMode("table");
             }}
           >
             Tableau
@@ -382,9 +597,32 @@ export function VisualInsertionComposer({
               éditoriaux ne sont pas prêts.
             </p>
           ) : null}
+          <button
+            type="button"
+            role="menuitem"
+            disabled={!canCreateBarChart}
+            onClick={() => {
+              if (!canCreateBarChart) return;
+              setMenuOpen(false);
+              setEditorMode("chart");
+            }}
+          >
+            Graphique
+          </button>
+          {!canCreateBarChart ? (
+            <p
+              className="editorial-visual-insertion__bridge-reason"
+              role="note"
+            >
+              Création de graphique à barres indisponible pour ce paragraphe :
+              {block.allowed_operations.includes("create_bar_chart")
+                ? " les artefacts éditoriaux ne sont pas prêts."
+                : " l’opération n’est pas autorisée par l’instantané."}
+            </p>
+          ) : null}
         </div>
       ) : null}
-      {editorOpen ? (
+      {editorMode === "table" ? (
         <section
           className="editorial-visual-insertion__panel"
           aria-labelledby="editorial-table-composer-heading"
@@ -395,7 +633,7 @@ export function VisualInsertionComposer({
               className="editorial-visual-insertion__close"
               type="button"
               onClick={() => {
-                setEditorOpen(false);
+                setEditorMode(null);
                 window.requestAnimationFrame(() =>
                   addButtonRef.current?.focus(),
                 );
@@ -468,6 +706,98 @@ export function VisualInsertionComposer({
                 subjectId={subjectId}
                 occurrenceId={block.block_id}
                 proposalId={proposalId}
+                anchorText={block.text ?? undefined}
+              />
+            </div>
+          ) : null}
+        </section>
+      ) : null}
+      {editorMode === "chart" ? (
+        <section
+          className="editorial-visual-insertion__panel"
+          aria-labelledby="editorial-bar-chart-composer-heading"
+        >
+          <header>
+            <h3 id="editorial-bar-chart-composer-heading">
+              Créer un graphique à barres
+            </h3>
+            <button
+              className="editorial-visual-insertion__close"
+              type="button"
+              onClick={() => {
+                setEditorMode(null);
+                window.requestAnimationFrame(() =>
+                  addButtonRef.current?.focus(),
+                );
+              }}
+            >
+              Fermer
+            </button>
+          </header>
+          <p className="editorial-visual-insertion__manual-note">
+            Cette proposition est créée manuellement, sans appel de modèle.
+          </p>
+          <ManualBarChartEditor
+            instruction={chartInstruction}
+            instructionRef={instructionRef}
+            title={chartTitle}
+            legend={chartLegend}
+            categoryAxisLabel={chartCategoryAxisLabel}
+            valueAxisLabel={chartValueAxisLabel}
+            unit={chartUnit}
+            points={chartPoints}
+            admitted={admitted}
+            onInstructionChange={updateChartInstruction}
+            onTitleChange={updateChartTitle}
+            onLegendChange={updateChartLegend}
+            onCategoryAxisLabelChange={updateChartCategoryAxisLabel}
+            onValueAxisLabelChange={updateChartValueAxisLabel}
+            onUnitChange={updateChartUnit}
+            onPointLabelChange={updateChartPointLabel}
+            onPointValueChange={updateChartPointValue}
+            onTogglePointEvidence={toggleChartPointEvidence}
+            onAddPoint={addChartPoint}
+            onRemovePoint={removeChartPoint}
+          />
+          {chartRequestError ? <p role="alert">{chartRequestError}</p> : null}
+          {chartDataInsufficient ? (
+            <button
+              className="button button--secondary"
+              type="button"
+              onClick={() => setEditorMode("table")}
+            >
+              Proposer un tableau à la place
+            </button>
+          ) : null}
+          <button
+            className="button editorial-visual-insertion__propose"
+            type="button"
+            disabled={
+              !canCreateBarChart ||
+              !validChart ||
+              chartProposalMutation.isPending ||
+              chartProposalId !== null
+            }
+            onClick={() => {
+              if (!canCreateBarChart) return;
+              setChartProposalId(null);
+              setChartRequestError(null);
+              setChartDataInsufficient(false);
+              chartProposalMutation.mutate();
+            }}
+          >
+            {chartProposalMutation.isPending
+              ? "Création de la proposition…"
+              : chartProposalId
+                ? "Proposition créée"
+                : "Proposer"}
+          </button>
+          {chartProposalId ? (
+            <div className="editorial-visual-insertion__proposal">
+              <EditorialProposalCard
+                subjectId={subjectId}
+                occurrenceId={block.block_id}
+                proposalId={chartProposalId}
                 anchorText={block.text ?? undefined}
               />
             </div>

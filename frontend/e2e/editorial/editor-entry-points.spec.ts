@@ -45,6 +45,7 @@ const snapshot: EditorialWorkspaceSnapshot = {
       position: 0,
       text: EDITORIAL_FIXTURES.article.title,
       evidence_refs: [],
+      chart: null,
       revision_target: { block_id: titleId, legacy_target_id: null },
       before_hash: null,
       allowed_operations: [],
@@ -57,6 +58,7 @@ const snapshot: EditorialWorkspaceSnapshot = {
       position: 1,
       text: "Contexte",
       evidence_refs: [],
+      chart: null,
       revision_target: { block_id: sectionId, legacy_target_id: null },
       before_hash: null,
       allowed_operations: ["rewrite_section", "delete_section"],
@@ -74,6 +76,7 @@ const snapshot: EditorialWorkspaceSnapshot = {
           passage: "Passage étayant l’occurrence sélectionnée.",
         },
       ],
+      chart: null,
       revision_target: { block_id: paragraphId, legacy_target_id: null },
       before_hash: null,
       allowed_operations: [

@@ -52,6 +52,7 @@ function createSnapshot(
         position: 0,
         text,
         evidence_refs: [],
+        chart: null,
         revision_target: { block_id: occurrenceId, legacy_target_id: null },
         before_hash: canonicalSha256,
         allowed_operations: ["rewrite_paragraph"],

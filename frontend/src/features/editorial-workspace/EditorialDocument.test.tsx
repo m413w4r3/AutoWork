@@ -178,4 +178,86 @@ describe("EditorialDocument", () => {
     fireEvent.click(screen.getByText("Preuves de la ligne 1"));
     expect(screen.getByText("d".repeat(64))).toBeVisible();
   });
+
+  it("renders a chart block at the position supplied by the snapshot", () => {
+    const anchorBlock = snapshot.blocks[0];
+    const followingBlock = snapshot.blocks[1];
+    if (!anchorBlock || !followingBlock) {
+      throw new Error("Expected the synthetic paragraph blocks");
+    }
+    const insertedChart = {
+      block_id: "inserted-chart-occurrence",
+      kind: "chart" as const,
+      parent_block_id: null,
+      position: 1,
+      text: "Valeurs documentées",
+      evidence_refs: [],
+      chart: {
+        key: "chart-synthetic",
+        kind: "bar" as const,
+        title: "Valeurs documentées",
+        caption: null,
+        legend: ["Série synthétique"],
+        category_axis_label: "Catégorie",
+        value_axis_label: "Valeur",
+        unit: "unités",
+        points: [
+          {
+            label: "Premier",
+            value: "4",
+            evidence_refs: [
+              {
+                source_document_id: "11111111-1111-4111-8111-111111111111",
+                kind: "fact" as const,
+                evidence_key: "d".repeat(64),
+              },
+            ],
+          },
+          { label: "Second", value: "8", evidence_refs: [] },
+        ],
+        anchor_block_id: anchorBlock.block_id,
+      },
+      revision_target: {
+        block_id: "inserted-chart-occurrence",
+        legacy_target_id: null,
+      },
+      before_hash: null,
+      allowed_operations: [],
+      revision_status: "ready" as const,
+    };
+    const orderedSnapshot: EditorialWorkspaceSnapshot = {
+      ...snapshot,
+      blocks: [anchorBlock, insertedChart, followingBlock],
+    };
+
+    const { container } = render(
+      <EditorialDocument
+        snapshot={orderedSnapshot}
+        selectedBlockId={null}
+        drafts={{}}
+        staleDraftIds={new Set()}
+        editingBlockId={null}
+        onSelectBlock={() => undefined}
+        onDraftChange={() => undefined}
+        onResumeDraft={() => undefined}
+        onCancelDraft={() => undefined}
+      />,
+    );
+
+    const orderedIds = Array.from(
+      container.querySelectorAll<HTMLElement>(".editorial-document__block"),
+    ).map((block) => block.dataset.blockId);
+    expect(orderedIds).toEqual([
+      anchorBlock.block_id,
+      insertedChart.block_id,
+      followingBlock.block_id,
+    ]);
+    expect(
+      screen.getByRole("figure", { name: "Graphique : Valeurs documentées" }),
+    ).toBeVisible();
+    expect(screen.getByText("Série synthétique")).toBeVisible();
+    expect(screen.getByText("8 unités")).toBeVisible();
+    fireEvent.click(screen.getByText(/Sources du point 1/));
+    expect(screen.getByText(/d{64}/)).toBeVisible();
+  });
 });

@@ -105,6 +105,7 @@ const snapshot: EditorialWorkspaceSnapshot = {
           passage: "Preuve synthétique.",
         },
       ],
+      chart: null,
       revision_target: { block_id: paragraphId, legacy_target_id: null },
       before_hash: null,
       allowed_operations: ["rewrite_paragraph", "insert_paragraph"],

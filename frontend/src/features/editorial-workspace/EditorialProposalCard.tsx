@@ -14,6 +14,7 @@ import {
 } from "../../api/editorialWorkspace";
 import { editorialWorkspaceQueryKeys } from "./editorialWorkspaceQueries";
 import { EditorialDiffView } from "./EditorialDiffView";
+import { ManualBarChartPreview } from "./ManualBarChartPreview";
 
 interface EditorialProposalCardProps {
   subjectId: string;
@@ -53,6 +54,154 @@ function tableFromPatch(
   if (patch?.operation !== "create_table") return null;
   const tables = patch.enrichment_patch?.tables;
   return tables?.length === 1 ? (tables[0] ?? null) : null;
+}
+
+interface BarChartProposalPoint {
+  label: string;
+  series: string;
+  value: string;
+  evidence_handles: string[];
+}
+
+interface BarChartProposal {
+  title: string;
+  caption: string | null;
+  category_axis_label: string;
+  value_axis_label: string;
+  unit: string;
+  points: BarChartProposalPoint[];
+  anchor_block_id: string | null;
+  purpose_question: string;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function stringArray(value: unknown): string[] | null {
+  return Array.isArray(value) && value.every((item) => typeof item === "string")
+    ? value
+    : null;
+}
+
+function barChartFromPatch(
+  patch: EditorialProposalPatch | null,
+): BarChartProposal | null {
+  if (patch?.operation !== "create_bar_chart") return null;
+  const rawChart = patch.enrichment_patch?.charts?.[0];
+  if (!isRecord(rawChart) || rawChart.kind !== "bar") return null;
+  const rawPoints = rawChart.points;
+  const placement = rawChart.placement;
+  const purpose = rawChart.purpose;
+  if (
+    typeof rawChart.title !== "string" ||
+    (rawChart.caption !== null && typeof rawChart.caption !== "string") ||
+    typeof rawChart.category_axis_label !== "string" ||
+    typeof rawChart.value_axis_label !== "string" ||
+    typeof rawChart.unit !== "string" ||
+    !Array.isArray(rawPoints) ||
+    !isRecord(placement) ||
+    !isRecord(purpose)
+  ) {
+    return null;
+  }
+  const points: BarChartProposalPoint[] = [];
+  for (const rawPoint of rawPoints) {
+    if (
+      !isRecord(rawPoint) ||
+      typeof rawPoint.label !== "string" ||
+      typeof rawPoint.series !== "string" ||
+      typeof rawPoint.value !== "string"
+    ) {
+      return null;
+    }
+    const evidenceHandles = stringArray(rawPoint.evidence_handles);
+    if (!evidenceHandles) return null;
+    points.push({
+      label: rawPoint.label,
+      series: rawPoint.series,
+      value: rawPoint.value,
+      evidence_handles: evidenceHandles,
+    });
+  }
+  return {
+    title: rawChart.title,
+    caption: typeof rawChart.caption === "string" ? rawChart.caption : null,
+    category_axis_label: rawChart.category_axis_label,
+    value_axis_label: rawChart.value_axis_label,
+    unit: rawChart.unit,
+    points,
+    anchor_block_id:
+      typeof placement.anchor_block_id === "string"
+        ? placement.anchor_block_id
+        : null,
+    purpose_question:
+      typeof purpose.question === "string" ? purpose.question : "",
+  };
+}
+
+function BarChartProposalComparison({
+  chart,
+  anchorText,
+  evidenceRefs,
+}: {
+  chart: BarChartProposal;
+  anchorText: string | undefined;
+  evidenceRefs: EditorialProposalPatch["evidence_refs"];
+}) {
+  const legend = Array.from(new Set(chart.points.map((point) => point.series)));
+  return (
+    <section
+      className="editorial-proposal-card__chart-comparison"
+      aria-label="Comparaison de l’insertion de graphique"
+    >
+      <div className="editorial-proposal-card__table-anchor">
+        <h5>Paragraphe d’ancrage</h5>
+        <p>{anchorText || "Paragraphe sélectionné"}</p>
+      </div>
+      <p className="editorial-proposal-card__table-placement">
+        Après ce paragraphe
+      </p>
+      <div className="editorial-proposal-card__chart-proposed">
+        <h5>Insertion de graphique</h5>
+        <p className="editorial-proposal-card__table-purpose">
+          <strong>Consigne · </strong>
+          {chart.purpose_question}
+        </p>
+        <ManualBarChartPreview
+          title={chart.title}
+          caption={chart.caption}
+          legend={legend}
+          categoryAxisLabel={chart.category_axis_label}
+          valueAxisLabel={chart.value_axis_label}
+          unit={chart.unit}
+          points={chart.points.map(({ label, value }) => ({ label, value }))}
+        />
+        <details className="editorial-proposal-card__table-evidence">
+          <summary>Preuves associées</summary>
+          {evidenceRefs && evidenceRefs.length > 0 ? (
+            <ul>
+              {evidenceRefs.map((reference, index) => (
+                <li
+                  key={`${reference.source_document_id}-${reference.evidence_key}-${index}`}
+                >
+                  <span>
+                    Source {reference.source_document_id} · {reference.kind}
+                  </span>
+                  <code>{reference.evidence_key}</code>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p>
+              Aucune référence de preuve n’est disponible pour cette
+              proposition.
+            </p>
+          )}
+        </details>
+      </div>
+    </section>
+  );
 }
 
 function TableProposalComparison({
@@ -259,6 +408,7 @@ export function EditorialProposalCard({
   const proposal = proposalQuery.data;
   const proposedText = proposal.patch?.after;
   const tableProposal = tableFromPatch(proposal.patch);
+  const barChartProposal = barChartFromPatch(proposal.patch);
   const acceptanceConflict =
     acceptMutation.isError &&
     acceptMutation.error instanceof ApiError &&
@@ -291,6 +441,12 @@ export function EditorialProposalCard({
       {tableProposal ? (
         <TableProposalComparison
           table={tableProposal}
+          anchorText={anchorText}
+          evidenceRefs={proposal.patch?.evidence_refs}
+        />
+      ) : barChartProposal ? (
+        <BarChartProposalComparison
+          chart={barChartProposal}
           anchorText={anchorText}
           evidenceRefs={proposal.patch?.evidence_refs}
         />
@@ -453,6 +609,11 @@ export function EditorialProposalCard({
           <p className="editorial-proposal-card__table-anchor-id">
             Ancre ·{" "}
             {tableProposal.placement.anchor_block_id ?? "non renseignée"}
+          </p>
+        ) : null}
+        {barChartProposal ? (
+          <p className="editorial-proposal-card__table-anchor-id">
+            Ancre · {barChartProposal.anchor_block_id ?? "non renseignée"}
           </p>
         ) : null}
         {proposal.patch?.enrichment_patch ? (

@@ -42,6 +42,7 @@ function createSnapshot(withTable: boolean): EditorialWorkspaceSnapshot {
     parent_block_id: sectionId,
     position: index + 2,
     text: `Paragraphe synthétique ${index + 1} avec preuve admise.`,
+    chart: null,
     evidence_refs:
       index === 2
         ? [
@@ -65,6 +66,7 @@ function createSnapshot(withTable: boolean): EditorialWorkspaceSnapshot {
     position: 5,
     text: "Résumé synthétique",
     evidence_refs: [evidence],
+    chart: null,
     table: {
       key: "table-synthetic",
       kind: "custom" as const,
@@ -99,6 +101,7 @@ function createSnapshot(withTable: boolean): EditorialWorkspaceSnapshot {
           text: "Article synthétique",
           evidence_refs: [],
           table: null,
+          chart: null,
           revision_target: { block_id: titleId, legacy_target_id: null },
           before_hash: null,
           allowed_operations: [],
@@ -112,6 +115,7 @@ function createSnapshot(withTable: boolean): EditorialWorkspaceSnapshot {
           text: "Contexte",
           evidence_refs: [],
           table: null,
+          chart: null,
           revision_target: { block_id: sectionId, legacy_target_id: null },
           before_hash: null,
           allowed_operations: [],
@@ -132,6 +136,7 @@ function createSnapshot(withTable: boolean): EditorialWorkspaceSnapshot {
           text: "Article synthétique",
           evidence_refs: [],
           table: null,
+          chart: null,
           revision_target: { block_id: titleId, legacy_target_id: null },
           before_hash: null,
           allowed_operations: [],
@@ -145,6 +150,7 @@ function createSnapshot(withTable: boolean): EditorialWorkspaceSnapshot {
           text: "Contexte",
           evidence_refs: [],
           table: null,
+          chart: null,
           revision_target: { block_id: sectionId, legacy_target_id: null },
           before_hash: null,
           allowed_operations: [],
