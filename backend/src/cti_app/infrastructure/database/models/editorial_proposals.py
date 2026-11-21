@@ -30,7 +30,7 @@ EDITORIAL_PROPOSAL_EVENT_KINDS_SQL = "'prepared', 'refused', 'needs_review', 'st
 EDITORIAL_PROPOSAL_OPERATIONS_SQL = (
     "'rewrite_title', 'rewrite_lead', 'rewrite_paragraph', 'insert_paragraph', "
     "'delete_paragraph', 'rewrite_section', 'insert_section', 'delete_section', "
-    "'merge_sections', 'split_section', 'rename_section', 'create_table', "
+    "'merge_sections', 'split_section', 'rename_section', 'create_table', 'create_bar_chart', "
     "'rewrite_table', 'delete_table', 'create_diagram', 'rewrite_diagram', "
     "'delete_diagram', 'create_chart', 'rewrite_chart', 'delete_chart', "
     "'create_source_figure', 'rewrite_source_figure', 'replace_source_figure', "
