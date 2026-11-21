@@ -23,6 +23,7 @@ from cti_app.application.persistence import (
     AnalystInputPackRepository,
     AnalystInvestigationRepository,
     BlobRepository,
+    BridgeGenerationSlotRepository,
     CapabilitySetRepository,
     ClaimRepository,
     CodeFeatureSetRepository,
@@ -310,6 +311,7 @@ class SqlAlchemyUnitOfWork:
     editorial_threads: EditorialThreadRepository
     editorial_proposals: EditorialProposalRepository
     editorial_proposal_impacts: EditorialProposalImpactRepository
+    bridge_generation_slots: BridgeGenerationSlotRepository
     production_input_snapshots: ProductionInputSnapshotRepository
     production_artifacts: ProductionArtifactRepository
     production_source_additions: ProductionSourceAdditionRepository

@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Mapping
 from dataclasses import replace
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, TypeGuard
 from uuid import UUID, uuid4
 
 from cti_app.application.brief_publication_builder import (
@@ -99,7 +99,9 @@ class PublicationAssemblyResult(NamedTuple):
     editorial_enrichment: EditorialEnrichmentV1 | None
 
 
-def _has_after_paragraph(enrichment: EditorialEnrichmentV1 | None) -> bool:
+def _has_after_paragraph(
+    enrichment: EditorialEnrichmentV1 | None,
+) -> TypeGuard[EditorialEnrichmentV1]:
     return enrichment is not None and any(
         item.placement.kind is EnrichmentPlacementKind.AFTER_PARAGRAPH
         for collection in (
@@ -506,20 +508,20 @@ class PublicationAssemblyService:
                         PublicationAssemblyErrorCode.EDITORIAL_ANCHOR_STALE,
                         "editorial_anchor_stale",
                     )
-                envelope = {
-                    "base_publication": base_v7,
-                    "article_format": article_format,
-                    "registry_hash": workspace_snapshot_record.registry_hash,
-                    "synthesis_canonical_sha256": (
+                publication_document = (
+                    PublicationDocumentV10
+                    if any(chart.kind is ChartKind.BAR for chart in editorial_enrichment.charts)
+                    else PublicationDocumentV9
+                )
+                publication = publication_document(
+                    base_publication=base_v7,
+                    article_format=article_format,
+                    registry_hash=workspace_snapshot_record.registry_hash,
+                    synthesis_canonical_sha256=(
                         workspace_snapshot_record.synthesis_canonical_sha256
                     ),
-                    "enrichment_canonical_sha256": enrichment_canonical_sha256,
-                    "resolved_placements": resolved_placements,
-                }
-                publication = (
-                    PublicationDocumentV10(**envelope)
-                    if any(chart.kind is ChartKind.BAR for chart in editorial_enrichment.charts)
-                    else PublicationDocumentV9(**envelope)
+                    enrichment_canonical_sha256=enrichment_canonical_sha256,
+                    resolved_placements=resolved_placements,
                 )
             payload = serialize_publication_document(publication)
             return (

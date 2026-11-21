@@ -347,8 +347,8 @@ class ChartSpecV1:
                 (self.value_axis_label, "value axis label"),
                 (self.unit, "unit"),
             ):
-                _diagram_label(label, f"Chart {value}")
-                if len(label.strip()) > 120:
+                label_text = _diagram_label(label, f"Chart {value}")
+                if len(label_text.strip()) > 120:
                     raise ValueError(f"Chart {value} exceeds the supported size")
             if len({point.label.casefold() for point in self.points}) != len(self.points):
                 raise ValueError("Editorial bar chart category labels must be unique")

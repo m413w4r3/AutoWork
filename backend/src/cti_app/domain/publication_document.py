@@ -3545,11 +3545,11 @@ class PublicationDocumentV10(PublicationDocumentV8):
                     raise ValueError("PublicationDocumentV10 element keys are ambiguous")
                 expected[identity] = anchor
         actual: dict[tuple[str, str], ResolvedPublicationPlacementV1] = {}
-        for item in self.resolved_placements:
-            identity = (item.element_kind, item.element_key)
-            if identity in actual or expected.get(identity) != item.anchor_block_id:
+        for placement in self.resolved_placements:
+            identity = (placement.element_kind, placement.element_key)
+            if identity in actual or expected.get(identity) != placement.anchor_block_id:
                 raise ValueError("PublicationDocumentV10 resolved anchor does not match element")
-            actual[identity] = item
+            actual[identity] = placement
         if set(actual) != set(expected):
             raise ValueError("PublicationDocumentV10 requires one resolved anchor per element")
 

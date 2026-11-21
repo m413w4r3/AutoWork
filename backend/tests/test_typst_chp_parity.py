@@ -3092,8 +3092,8 @@ async def test_real_typst_bar_chart_pdf_has_labels_values_and_anchor(
     chart_media = next(
         item for item in render_source.media_refs if item.asset_id == chart.compiled_asset_id
     )
-    svg_bytes = await AnalyticChartRenderer().compile(chart)
-    svg_bytes = svg_bytes.media_bytes
+    compiled_chart = await AnalyticChartRenderer().compile(chart)
+    svg_bytes = compiled_chart.media_bytes
     chart_path = workspace_root / "RENDERER" / chart_media.media_path
     chart_path.parent.mkdir(parents=True, exist_ok=True)
     chart_path.write_bytes(svg_bytes)
