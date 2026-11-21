@@ -52,7 +52,7 @@ export function InlineTextEditor({
     setAnnouncementIsError(false);
     try {
       await onSave(blockId, value);
-      window.requestAnimationFrame(() => block?.focus());
+      window.requestAnimationFrame(() => block?.focus({ preventScroll: true }));
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "L’enregistrement a échoué.";
@@ -96,7 +96,7 @@ export function InlineTextEditor({
       ".editorial-document__block",
     );
     onCancel();
-    window.requestAnimationFrame(() => block?.focus());
+    window.requestAnimationFrame(() => block?.focus({ preventScroll: true }));
   };
 
   const handleChange = (event: ChangeEvent<HTMLTextAreaElement>) => {

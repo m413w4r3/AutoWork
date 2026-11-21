@@ -324,6 +324,7 @@ export function EditorialWorkspaceLayout({
         <button
           className="button button--secondary editorial-workspace__outline-toggle"
           type="button"
+          aria-controls="editorial-workspace-outline-panel"
           aria-expanded={openPanel === "outline"}
           onClick={(event) => {
             if (openPanel === "outline") {
@@ -341,6 +342,7 @@ export function EditorialWorkspaceLayout({
         <button
           className="button button--secondary editorial-workspace__inspector-toggle"
           type="button"
+          aria-controls="editorial-workspace-inspector-panel"
           aria-expanded={openPanel === "inspector"}
           onClick={(event) => {
             if (openPanel === "inspector") {
@@ -367,6 +369,7 @@ export function EditorialWorkspaceLayout({
       ) : null}
       <div className="editorial-workspace__grid">
         <div
+          id="editorial-workspace-outline-panel"
           className="editorial-workspace__outline-column"
           data-panel-open={openPanel === "outline"}
         >
@@ -397,6 +400,7 @@ export function EditorialWorkspaceLayout({
           />
         </div>
         <div
+          id="editorial-workspace-inspector-panel"
           className="editorial-workspace__inspector-column"
           data-panel-open={openPanel === "inspector"}
         >

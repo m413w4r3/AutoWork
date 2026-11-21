@@ -1,5 +1,4 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useRef } from "react";
 
 import { ApiError } from "../../api/editions";
 import {
@@ -25,7 +24,6 @@ interface EditorialProposalCardProps {
   referenceOrdinal?: number;
   anchorText?: string;
   onRequestVariant?: () => void;
-  onAccepted?: () => void;
 }
 
 const stateLabels: Record<EditorialProposalState, string> = {
@@ -48,6 +46,15 @@ function refusalLabel(code: unknown): string {
     return refusalLabels[code];
   }
   return "Le Bridge n’a pas produit de proposition exploitable.";
+}
+
+function focusDocumentBlock(occurrenceId: string) {
+  const block = Array.from(
+    document.querySelectorAll<HTMLElement>(
+      ".editorial-document__block[data-block-id]",
+    ),
+  ).find((candidate) => candidate.dataset.blockId === occurrenceId);
+  block?.focus({ preventScroll: true });
 }
 
 function tableFromPatch(
@@ -377,11 +384,8 @@ export function EditorialProposalCard({
   referenceOrdinal,
   anchorText,
   onRequestVariant,
-  onAccepted,
 }: EditorialProposalCardProps) {
   const queryClient = useQueryClient();
-  const acceptButtonRef = useRef<HTMLButtonElement>(null);
-  const restoreAcceptFocus = useRef(false);
   const proposalQueryKey = editorialWorkspaceQueryKeys.proposal(
     subjectId,
     occurrenceId,
@@ -434,7 +438,7 @@ export function EditorialProposalCard({
             : current,
       );
       await invalidateDecisionContext();
-      onAccepted?.();
+      focusDocumentBlock(occurrenceId);
     },
   });
   const rejectMutation = useMutation({
@@ -452,15 +456,9 @@ export function EditorialProposalCard({
       await queryClient.invalidateQueries({
         queryKey: proposalQueryKey,
       });
+      focusDocumentBlock(occurrenceId);
     },
   });
-
-  useEffect(() => {
-    if (acceptMutation.isSuccess && restoreAcceptFocus.current) {
-      restoreAcceptFocus.current = false;
-      acceptButtonRef.current?.focus({ preventScroll: true });
-    }
-  }, [acceptMutation.isSuccess]);
 
   if (proposalQuery.isPending) {
     return (
@@ -569,7 +567,6 @@ export function EditorialProposalCard({
       {proposal.state === "proposed" || proposal.state === "accepted" ? (
         <div className="editorial-proposal-card__actions">
           <button
-            ref={acceptButtonRef}
             className="editorial-proposal-card__accept"
             type="button"
             aria-disabled={
@@ -588,9 +585,6 @@ export function EditorialProposalCard({
               ) {
                 return;
               }
-              restoreAcceptFocus.current =
-                !onAccepted &&
-                document.activeElement === acceptButtonRef.current;
               acceptMutation.mutate();
             }}
           >

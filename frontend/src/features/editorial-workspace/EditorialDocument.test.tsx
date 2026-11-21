@@ -97,6 +97,40 @@ describe("EditorialDocument", () => {
     ]);
   });
 
+  it("selects the focused occurrence with Enter and Space", () => {
+    const onSelectBlock = vi.fn<(blockId: string) => void>();
+    const { container } = render(
+      <EditorialDocument
+        snapshot={snapshot}
+        selectedBlockId={null}
+        drafts={{}}
+        staleDraftIds={new Set()}
+        editingBlockId={null}
+        onSelectBlock={onSelectBlock}
+        onDraftChange={() => undefined}
+        onResumeDraft={() => undefined}
+        onCancelDraft={() => undefined}
+      />,
+    );
+
+    const [firstBlock, secondBlock] = container.querySelectorAll<HTMLElement>(
+      ".editorial-document__block",
+    );
+    if (!firstBlock || !secondBlock) {
+      throw new Error("Expected two synthetic paragraph occurrences");
+    }
+
+    expect(firstBlock).toHaveAttribute("tabindex", "0");
+    firstBlock.focus();
+    fireEvent.keyDown(firstBlock, { key: "Enter" });
+    fireEvent.keyDown(secondBlock, { key: " " });
+
+    expect(onSelectBlock.mock.calls.map(([blockId]) => blockId)).toEqual([
+      "first-occurrence",
+      "second-occurrence",
+    ]);
+  });
+
   it("renders an inserted table in the exact order supplied by the snapshot", () => {
     const anchorBlock = snapshot.blocks[0];
     const followingBlock = snapshot.blocks[1];

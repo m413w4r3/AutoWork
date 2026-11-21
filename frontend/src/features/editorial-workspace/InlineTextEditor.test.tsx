@@ -269,6 +269,7 @@ describe("local editorial block drafts", () => {
     expect(screen.getByRole("textbox", { name: "Texte du bloc" })).toHaveValue(
       "Draft retained until confirmed",
     );
+    expect(editor).toHaveFocus();
 
     confirm.mockReturnValue(true);
     fireEvent.keyDown(editor, { key: "Escape" });
@@ -280,6 +281,10 @@ describe("local editorial block drafts", () => {
         name: "Reprendre le brouillon : Synthetic paragraph A",
       }),
     ).not.toBeInTheDocument();
+    const block = document.querySelector<HTMLElement>(
+      '.editorial-document__block[data-block-id="block-occurrence-a"]',
+    );
+    await vi.waitFor(() => expect(block).toHaveFocus());
   });
 
   it("handles Ctrl+S without claiming a server save is available", async () => {
