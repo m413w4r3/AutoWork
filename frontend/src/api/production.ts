@@ -390,7 +390,7 @@ export interface ArtifactResponse {
 
 export interface HistoricalPublicationArtifactResponse extends ArtifactResponse {
   publication_kind: "article" | "brief" | null;
-  read_only_reason: EditorialReadOnlyReason;
+  read_only_reason: EditorialReadOnlyReason | null;
 }
 
 export type ProductionExtractionTierV1 = "core" | "supporting" | "technical";

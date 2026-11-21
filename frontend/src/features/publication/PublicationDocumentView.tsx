@@ -46,16 +46,21 @@ export function PublicationDocumentView({
       <article className="publication-preview">
         {readOnlyReason ? (
           <aside className="editorial-readonly-banner" role="note">
-            <strong>Version historique — lecture seule</strong>
+            <strong>
+              {readOnlyReason === "historical_version"
+                ? "Version historique — lecture seule"
+                : "Publication en lecture seule"}
+            </strong>
             <p>{editorialReadOnlyReasonText(readOnlyReason)}</p>
-            {historicalWorkspaceHref ? (
+            {readOnlyReason === "historical_version" &&
+            historicalWorkspaceHref ? (
               <p>
                 <Link to={historicalWorkspaceHref}>
                   Ouvrir en lecture seule dans l’atelier
                 </Link>
               </p>
             ) : null}
-            {currentVersionHref ? (
+            {readOnlyReason === "historical_version" && currentVersionHref ? (
               <a href={currentVersionHref}>Revenir à la version courante</a>
             ) : null}
           </aside>

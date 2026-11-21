@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     )
 
 from cti_app.application.editorial_legacy_read_only import (
+    pinned_editorial_inputs_read_only_reason,
     publication_kind_is_ambiguous,
     publication_read_only_reason,
 )
@@ -361,6 +362,11 @@ class EditorialWorkspaceService:
                 kind,
                 ambiguous_kind=publication_kind_is_ambiguous(routing_decision, publication_content),
             )
+            if read_only_reason is None:
+                read_only_reason = pinned_editorial_inputs_read_only_reason(
+                    synthesis,
+                    enrichment_content,
+                )
             pins: dict[str, object] = {
                 "subject_id": subject.id,
                 "production_run_id": run.id,

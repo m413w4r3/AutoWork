@@ -2287,6 +2287,48 @@ async def test_publication_artifact_version_by_id_reads_prior_base_in_current_ru
     assert response.json()["canonical_sha256"] == hashlib.sha256(canonical_bytes).hexdigest()
 
 
+async def test_publication_artifact_version_marks_only_noncurrent_v8_as_historical(
+    api: AsyncClient,
+    uow: _Uow,
+    production_app: FastAPI,
+) -> None:
+    from tests.test_publication_kind_resolution import _brief_v8_payload
+
+    subject_id = uuid4()
+    run = _terminal_run(uuid4(), subject_id, status=ProductionRunStatus.FAILED)
+    await uow.production_runs.add(run)
+    payload = _brief_v8_payload()
+    store = production_app.state.production_artifact_store
+    historical_blob_id, _ = await store.put_canonical_json(
+        payload, bucket="production-artifacts-canonical"
+    )
+    current_blob_id, _ = await store.put_canonical_json(
+        payload, bucket="production-artifacts-canonical"
+    )
+    historical = _artifact(run, ProductionArtifactStage.PUBLICATION)
+    historical.version = 8
+    historical.canonical_blob_id = historical_blob_id
+    current = _artifact(run, ProductionArtifactStage.PUBLICATION)
+    current.version = 9
+    current.canonical_blob_id = current_blob_id
+    await uow.production_artifacts.append(historical)
+    await uow.production_artifacts.append(current)
+
+    historical_response = await api.get(
+        f"/api/subjects/{subject_id}/production/artifacts/publication/{historical.id}"
+    )
+    current_response = await api.get(
+        f"/api/subjects/{subject_id}/production/artifacts/publication/{current.id}"
+    )
+
+    assert historical_response.status_code == 200, historical_response.text
+    assert historical_response.json()["read_only_reason"] == "historical_version"
+    assert "capabilities" not in historical_response.json()
+    assert "allowed_operations" not in historical_response.json()
+    assert current_response.status_code == 200, current_response.text
+    assert current_response.json()["read_only_reason"] is None
+
+
 async def test_publication_artifact_response_has_no_rendered_content(
     api: AsyncClient,
     uow: _Uow,

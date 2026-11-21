@@ -3799,6 +3799,8 @@ async def get_publication_artifact_version(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={"code": "publication_artifact_not_found"},
             )
+        current_artifact = await current_publication_artifact(uow.production_artifacts, run.id)
+        is_historical = current_artifact is None or current_artifact.id != artifact.id
         routing_decision = await get_adopted_production_routing_decision(uow=uow, run=run)
 
     canonical = None
@@ -3813,7 +3815,7 @@ async def get_publication_artifact_version(
         canonical,
         publication_kind,
         ambiguous_kind=publication_kind_is_ambiguous(routing_decision, canonical),
-        historical=True,
+        historical=is_historical,
     )
     return {
         "artifact_id": str(artifact.id),

@@ -265,17 +265,35 @@ it("explains a historical publication is read only and returns to the current ve
     <PublicationDocumentView
       document={baseDocument}
       publicationKind="article"
-      readOnlyReason="format_not_editable"
+      readOnlyReason="historical_version"
       currentVersionHref={`/subjects/${SUBJECT_ID}/editor`}
     />,
   );
 
   expect(screen.getByText("Version historique — lecture seule")).toBeVisible();
-  expect(screen.getByText(/format non éditable/i)).toBeVisible();
+  expect(screen.getByText("Raison : version historique.")).toBeVisible();
   expect(
     screen.getByRole("link", { name: "Revenir à la version courante" }),
   ).toHaveAttribute("href", `/subjects/${SUBJECT_ID}/editor`);
   expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+});
+
+it("does not label a current read-only publication as historical", () => {
+  render(
+    <PublicationDocumentView
+      document={baseDocument}
+      publicationKind={null}
+      readOnlyReason="publication_kind_unknown"
+      currentVersionHref={`/subjects/${SUBJECT_ID}/editor`}
+    />,
+  );
+
+  expect(screen.queryByText("Version historique — lecture seule")).toBeNull();
+  expect(screen.getByText("Publication en lecture seule")).toBeVisible();
+  expect(screen.getByText(/type de publication inconnu/i)).toBeVisible();
+  expect(
+    screen.queryByRole("link", { name: "Revenir à la version courante" }),
+  ).toBeNull();
 });
 
 function renderArtifactView(

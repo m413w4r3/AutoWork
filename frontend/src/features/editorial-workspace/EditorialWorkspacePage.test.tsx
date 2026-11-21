@@ -82,6 +82,7 @@ function createSnapshot(
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  window.history.replaceState({}, "", "/");
 });
 
 describe("EditorialWorkspacePage manual editing", () => {
@@ -194,12 +195,10 @@ describe("EditorialWorkspacePage manual editing", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("shows historical content read only and links back to the current version", async () => {
-    const snapshot = createSnapshot(
-      "Synthetic historical paragraph.",
-      1,
-      "none",
-    );
+  it("does not label a read-only current workspace as historical", async () => {
+    const snapshot = createSnapshot("Synthetic current paragraph.", 1, "none");
+    snapshot.blocks[0]!.allowed_operations = [];
+    snapshot.blocks[0]!.read_only_reason = "publication_kind_unknown";
     snapshot.capabilities = {
       ...snapshot.capabilities,
       manual_edit: false,
@@ -208,7 +207,7 @@ describe("EditorialWorkspacePage manual editing", () => {
       can_add_enrichment: false,
       can_preview_pdf: false,
       can_regenerate_pdf: false,
-      read_only_reason: "format_not_editable",
+      read_only_reason: "publication_kind_unknown",
     };
     vi.stubGlobal(
       "fetch",
@@ -245,18 +244,87 @@ describe("EditorialWorkspacePage manual editing", () => {
       </QueryClientProvider>,
     );
 
+    await screen.findAllByText("Synthetic current paragraph.");
     expect(
-      await screen.findByText("Version historique — lecture seule"),
-    ).toBeVisible();
-    expect(screen.getByText(/format non éditable/i)).toBeVisible();
+      screen.queryByText("Version historique — lecture seule"),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("Atelier en lecture seule")).toBeVisible();
     expect(
       screen.queryByRole("button", { name: "Modifier" }),
     ).not.toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "Proposer" }),
     ).not.toBeInTheDocument();
+  });
+
+  it("shows the historical banner only for an explicitly opened prior version", async () => {
+    const artifactId = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    const canonicalContent = {
+      schema_version: "4",
+      subject_id: subjectId,
+      publication_language: "fr",
+      title: "Synthetic historical publication",
+      lead: [],
+      sections: [],
+      timeline: [],
+      indicators: [],
+      sources: [],
+      uncertainties: [],
+      tables: [],
+      diagrams: [],
+      figures: [],
+    };
+    window.history.replaceState(
+      {},
+      "",
+      `/subjects/${subjectId}/editor?publication_artifact_id=${artifactId}`,
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify({
+              artifact_id: artifactId,
+              production_run_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+              subject_id: subjectId,
+              stage: "publication",
+              version: 8,
+              input_hash: "a".repeat(64),
+              canonical_sha256: "b".repeat(64),
+              status: "verified",
+              metadata: {},
+              publication_kind: "brief",
+              read_only_reason: "historical_version",
+              canonical_content: canonicalContent,
+            }),
+            {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            },
+          ),
+        ),
+      ),
+    );
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: 0 } },
+    });
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <EditorialWorkspacePage subjectId={subjectId} />
+      </QueryClientProvider>,
+    );
+
+    expect(
+      await screen.findByText("Version historique — lecture seule"),
+    ).toBeVisible();
+    expect(screen.getByText("Raison : version historique.")).toBeVisible();
+    expect(screen.getByText("Synthetic historical publication")).toBeVisible();
     expect(
       screen.getByRole("link", { name: "Revenir à la version courante" }),
     ).toHaveAttribute("href", `/subjects/${subjectId}/editor`);
+    expect(screen.queryByRole("button", { name: "Modifier" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Proposer" })).toBeNull();
   });
 });

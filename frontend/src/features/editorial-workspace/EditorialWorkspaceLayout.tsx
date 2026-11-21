@@ -400,9 +400,15 @@ export function EditorialWorkspaceLayout({
 
       {readOnly ? (
         <div className="editorial-readonly-banner" role="note">
-          <strong>Version historique — lecture seule</strong>
+          <strong>
+            {readOnlyReason === "historical_version"
+              ? "Version historique — lecture seule"
+              : "Atelier en lecture seule"}
+          </strong>
           <p>{editorialReadOnlyReasonText(readOnlyReason)}</p>
-          <Link to={workspacePath}>Revenir à la version courante</Link>
+          {readOnlyReason === "historical_version" ? (
+            <Link to={workspacePath}>Revenir à la version courante</Link>
+          ) : null}
         </div>
       ) : null}
       <div className="editorial-workspace__controls">

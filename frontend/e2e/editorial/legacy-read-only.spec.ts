@@ -40,7 +40,7 @@ test("opens a V4 publication as desktop read-only history", async ({
           status: "verified",
           metadata: {},
           publication_kind: "article",
-          read_only_reason: "format_not_editable",
+          read_only_reason: "historical_version",
           canonical_content: canonicalContent,
         },
       });
@@ -54,7 +54,7 @@ test("opens a V4 publication as desktop read-only history", async ({
   await expect(
     page.getByText("Version historique — lecture seule"),
   ).toBeVisible();
-  await expect(page.getByText("Raison : format non éditable.")).toBeVisible();
+  await expect(page.getByText("Raison : version historique.")).toBeVisible();
   await expect(
     page.getByRole("heading", {
       name: "Publication historique synthétique",

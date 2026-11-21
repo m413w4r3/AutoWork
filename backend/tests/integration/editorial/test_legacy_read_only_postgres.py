@@ -69,6 +69,23 @@ async def test_legacy_read_only_postgres_keeps_artifact_bytes_and_versions(
         publication_artifacts.append(artifact)
         seeded_shas[artifact.id] = canonical_sha256
 
+    # Keep a V8 artifact in history while the subject's current publication is
+    # also V8, matching a pre-V9 production run that remains editable in M22.
+    current_v8_blob_id, current_v8_sha256 = await artifact_store.put_canonical_json(
+        legacy_documents[-1], bucket="production-artifacts-canonical"
+    )
+    current_v8 = ProductionArtifact(
+        production_run_id=seeded.run.id,
+        subject_id=seeded.subject.id,
+        stage=ProductionArtifactStage.PUBLICATION,
+        version=len(publication_artifacts) + 1,
+        status=ProductionArtifactStatus.VERIFIED,
+        input_hash=hashlib.sha256(b"current-v8-publication").hexdigest(),
+        canonical_blob_id=current_v8_blob_id,
+    )
+    publication_artifacts.append(current_v8)
+    seeded_shas[current_v8.id] = current_v8_sha256
+
     async with uow_factory() as uow:
         for artifact in publication_artifacts:
             await uow.production_artifacts.append(artifact)
@@ -102,27 +119,32 @@ async def test_legacy_read_only_postgres_keeps_artifact_bytes_and_versions(
             body = response.json()
             assert body["version"] == artifact.version
             assert body["canonical_sha256"] == before_shas[artifact.id]
-            assert body["read_only_reason"] in {
-                "format_not_editable",
-                "publication_kind_ambiguous",
-            }
-            assert body["canonical_content"] == legacy_documents[artifact.version - 1]
+            if artifact.id == current_v8.id:
+                assert body["read_only_reason"] is None
+            else:
+                assert body["read_only_reason"] in {
+                    "historical_version",
+                    "publication_kind_ambiguous",
+                    "publication_kind_unknown",
+                }
+                assert "capabilities" not in body
+                assert "allowed_operations" not in body
+            expected_document = (
+                legacy_documents[-1]
+                if artifact.id == current_v8.id
+                else legacy_documents[artifact.version - 1]
+            )
+            assert body["canonical_content"] == expected_document
 
         snapshot_response = await client.get(f"/api/subjects/{seeded.subject.id}/editor/snapshot")
         assert snapshot_response.status_code == 200, snapshot_response.text
         snapshot = snapshot_response.json()
-        assert snapshot["publication_version"] == 5
-        assert snapshot["capabilities"]["read_only_reason"] in {
-            "format_not_editable",
-            "publication_kind_ambiguous",
-        }
-        assert all(
-            not value
-            for key, value in snapshot["capabilities"].items()
-            if key != "read_only_reason"
-        )
+        assert snapshot["publication_version"] == current_v8.version
+        assert snapshot["capabilities"]["read_only_reason"] is None
         assert snapshot["blocks"]
-        assert all(block["allowed_operations"] == [] for block in snapshot["blocks"])
+        assert any(
+            "rewrite_paragraph" in block["allowed_operations"] for block in snapshot["blocks"]
+        )
 
     async with uow_factory() as uow:
         current_publications = [

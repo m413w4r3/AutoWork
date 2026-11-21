@@ -1,4 +1,4 @@
-"""Read-only policy for historical publication documents."""
+"""Read-only policy for publication identity and pinned editorial inputs."""
 
 from __future__ import annotations
 
@@ -7,7 +7,9 @@ from enum import StrEnum
 from typing import Any
 
 from cti_app.application.edition_classification import explicit_publication_kind
+from cti_app.domain.production_editorial_enrichment import EDITORIAL_ENRICHMENT_SCHEMA_VERSION
 from cti_app.domain.production_routing import ProductionRoutingDecisionV1
+from cti_app.domain.production_synthesis import PRODUCTION_SYNTHESIS_SCHEMA_VERSION
 from cti_app.domain.publication_document import parse_publication_document
 from cti_app.domain.publication_kind import PublicationKind
 
@@ -17,9 +19,6 @@ class EditorialLegacyReadOnlyReason(StrEnum):
     PUBLICATION_KIND_AMBIGUOUS = "publication_kind_ambiguous"
     PUBLICATION_KIND_UNKNOWN = "publication_kind_unknown"
     HISTORICAL_VERSION = "historical_version"
-
-
-_LEGACY_READ_ONLY_FORMATS = frozenset({"4", "5", "6", "7", "8"})
 
 
 def publication_kind_is_ambiguous(
@@ -50,18 +49,37 @@ def publication_read_only_reason(
         return EditorialLegacyReadOnlyReason.PUBLICATION_KIND_AMBIGUOUS
     if publication_kind is None:
         return EditorialLegacyReadOnlyReason.PUBLICATION_KIND_UNKNOWN
-    schema_version = (
-        publication_content.get("schema_version") if publication_content is not None else None
-    )
-    if schema_version in _LEGACY_READ_ONLY_FORMATS:
-        return EditorialLegacyReadOnlyReason.FORMAT_NOT_EDITABLE
     if historical:
         return EditorialLegacyReadOnlyReason.HISTORICAL_VERSION
     return None
 
 
+def pinned_editorial_inputs_read_only_reason(
+    synthesis_content: Mapping[str, Any],
+    enrichment_content: Mapping[str, Any] | None,
+) -> EditorialLegacyReadOnlyReason | None:
+    """Fail closed when a pinned source artifact uses an unsupported editor format."""
+    synthesis_version = synthesis_content.get("schema_version")
+    synthesis_supported = synthesis_version == str(PRODUCTION_SYNTHESIS_SCHEMA_VERSION) or (
+        type(synthesis_version) is int and synthesis_version == PRODUCTION_SYNTHESIS_SCHEMA_VERSION
+    )
+    if not synthesis_supported:
+        return EditorialLegacyReadOnlyReason.FORMAT_NOT_EDITABLE
+
+    if enrichment_content is not None:
+        enrichment_version = enrichment_content.get("schema_version")
+        if (
+            type(enrichment_version) is not int
+            or enrichment_version < 1
+            or enrichment_version > EDITORIAL_ENRICHMENT_SCHEMA_VERSION
+        ):
+            return EditorialLegacyReadOnlyReason.FORMAT_NOT_EDITABLE
+    return None
+
+
 __all__ = [
     "EditorialLegacyReadOnlyReason",
+    "pinned_editorial_inputs_read_only_reason",
     "publication_kind_is_ambiguous",
     "publication_read_only_reason",
 ]

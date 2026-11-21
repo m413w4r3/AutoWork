@@ -100,9 +100,19 @@ function HistoricalPublicationWorkspacePage({
         />
       ) : (
         <aside className="editorial-readonly-banner" role="note">
-          <strong>Version historique — lecture seule</strong>
-          <p>{editorialReadOnlyReasonText(artifact.read_only_reason)}</p>
-          <a href={currentVersionHref}>Revenir à la version courante</a>
+          <strong>
+            {artifact.read_only_reason === "historical_version"
+              ? "Version historique — lecture seule"
+              : "Publication en lecture seule"}
+          </strong>
+          <p>
+            {artifact.read_only_reason
+              ? editorialReadOnlyReasonText(artifact.read_only_reason)
+              : "Cette publication ne peut pas être affichée dans cette vue."}
+          </p>
+          {artifact.read_only_reason === "historical_version" ? (
+            <a href={currentVersionHref}>Revenir à la version courante</a>
+          ) : null}
         </aside>
       )}
     </section>
