@@ -1831,9 +1831,7 @@ class EditorialProposalService:
             ) from None
 
         try:
-            context = await self._discussion_context_builder.build_manual(
-                subject_id, occurrence_id
-            )
+            context = await self._discussion_context_builder.build_manual(subject_id, occurrence_id)
         except Exception as error:
             raise _manual_figure_failure(
                 "proposal_base_unavailable",
@@ -1906,8 +1904,7 @@ class EditorialProposalService:
             or enrichment_context.get("base_artifact_id") != str(record.enrichment_artifact_id)
             or enrichment_context.get("base_artifact_version") != record.enrichment_version
             or enrichment_context.get("base_input_hash") != record.enrichment_input_hash
-            or enrichment_context.get("base_canonical_sha256")
-            != record.enrichment_canonical_sha256
+            or enrichment_context.get("base_canonical_sha256") != record.enrichment_canonical_sha256
             or any(item._run_id != record.production_run_id for item in items)
         ):
             raise _manual_figure_failure(
@@ -2252,8 +2249,7 @@ class EditorialProposalService:
                 )
             if (
                 preparation.origin is EditorialProposalOrigin.MANUAL_PATCH
-                and preparation.operation
-                is TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE
+                and preparation.operation is TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE
             ):
                 raise _manual_figure_failure(
                     "idempotency_key_invalid", EditorialFigureDiagnosticReason.REQUEST_INVALID
@@ -2283,8 +2279,7 @@ class EditorialProposalService:
                 ) from error
             if (
                 preparation.origin is EditorialProposalOrigin.MANUAL_PATCH
-                and preparation.operation
-                is TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE
+                and preparation.operation is TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE
             ):
                 raise _manual_figure_failure(
                     error.code,
@@ -2406,6 +2401,7 @@ class EditorialProposalService:
             in {
                 TargetedEditorialRevisionOperation.CREATE_TABLE,
                 TargetedEditorialRevisionOperation.CREATE_BAR_CHART,
+                TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE,
             }
             and preparation.target.kind is TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT
         )
@@ -3130,8 +3126,7 @@ class EditorialProposalService:
         )
         typed_source_figure_patch = (
             preparation.operation is TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE
-            and preparation.target.kind
-            is TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT
+            and preparation.target.kind is TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT
             and preparation.target.element_kind is EditorialEnrichmentElementKind.FIGURE
         )
         if preparation.strict_wire and (typed_table_patch or typed_bar_chart_patch):
@@ -3783,6 +3778,7 @@ class EditorialProposalService:
             in {
                 TargetedEditorialRevisionOperation.CREATE_TABLE,
                 TargetedEditorialRevisionOperation.CREATE_BAR_CHART,
+                TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE,
             }
             and preparation.target.kind is TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT
         )

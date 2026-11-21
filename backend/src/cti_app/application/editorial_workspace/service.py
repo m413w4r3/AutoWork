@@ -142,6 +142,7 @@ class EditorialWorkspaceService:
         if operation in {
             TargetedEditorialRevisionOperation.CREATE_TABLE.value,
             TargetedEditorialRevisionOperation.CREATE_BAR_CHART.value,
+            TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE.value,
         } and (
             record.enrichment_artifact_id is None
             or record.enrichment_version is None
@@ -183,6 +184,7 @@ class EditorialWorkspaceService:
         if operation in {
             TargetedEditorialRevisionOperation.CREATE_TABLE.value,
             TargetedEditorialRevisionOperation.CREATE_BAR_CHART.value,
+            TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE.value,
         } and (
             record.enrichment_artifact_id is None
             or record.enrichment_version is None

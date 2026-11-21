@@ -131,3 +131,201 @@ def test_manual_figure_selection_contains_only_catalog_id_caption_and_order() ->
     assert selection.caption == "Synthetic editorial caption"
     assert selection.order == 0
     assert not hasattr(selection, "blob_id")
+
+
+@pytest.mark.asyncio
+async def test_figure_factories_build_archive_dependencies_without_lifespan(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from cti_app.api import editorial_workspace as editorial_workspace_api
+    from cti_app.api import main as api_main
+    from cti_app.application.editorial_figure_catalog import EditorialFigureCatalogService
+    from cti_app.application.production_artifact_store import ProductionArtifactStore
+    from cti_app.application.source_media_collection import (
+        SourceMediaArchiveService,
+        SourceMediaPolicy,
+    )
+    from cti_app.config import Settings
+    from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
+    from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
+
+    settings = Settings(
+        _env_file=None,
+        app_env="development",
+        api_bind_host="127.0.0.1",
+        production_editorial_resource_search_enabled=False,
+    )
+    monkeypatch.setattr(api_main, "get_settings", lambda: settings)
+    monkeypatch.setattr(editorial_workspace_api, "get_settings", lambda: settings)
+
+    # Construct the real SQLAlchemy UOW factory without opening a connection.
+    engine = create_async_engine(
+        "postgresql+asyncpg://figure-test:figure-test@127.0.0.1:1/autowork"
+    )
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    def uow_factory() -> SqlAlchemyUnitOfWork:
+        return SqlAlchemyUnitOfWork(session_factory)
+
+    try:
+        app = api_main.create_app()
+        blob_store = FilesystemBlobStore(tmp_path / "figure-blobs")
+        app.state.uow_factory = uow_factory
+        app.state.blob_store = blob_store
+        app.state.model_gateway = object()
+        app.state.publication_render_service = object()
+        assert getattr(app.state, "collection_service", None) is None
+        assert getattr(app.state, "production_artifact_store", None) is None
+
+        from starlette.requests import Request
+
+        request = Request(
+            {
+                "type": "http",
+                "app": app,
+                "method": "POST",
+                "path": "/api/subjects/test/editor/blocks/test/figure-proposals",
+                "headers": [],
+            }
+        )
+        manual_service = editorial_workspace_api._manual_proposal_service(request)
+        adoption_service = editorial_workspace_api._proposal_adoption_service(request)
+        adoption_enrichment_loader = adoption_service._inputs._enrichment_loader
+
+        assert isinstance(app.state.production_artifact_store, ProductionArtifactStore)
+        assert isinstance(manual_service._figure_catalog_service, EditorialFigureCatalogService)
+        assert manual_service._figure_catalog_service._media_policy_sha256 == (
+            SourceMediaPolicy().sha256
+        )
+        source_media_archiver = app.state.collection_service.source_media_archiver
+        assert isinstance(source_media_archiver, SourceMediaArchiveService)
+        assert adoption_enrichment_loader._source_media_archiver is source_media_archiver
+    finally:
+        await engine.dispose()
+
+
+def test_figure_document_order_uses_figure_order_not_registry_position() -> None:
+    from cti_app.application.editorial_workspace.registry import (
+        WorkspaceSnapshotRecord,
+        project_blocks,
+        registry_hash,
+    )
+    from cti_app.domain.editorial_workspace import (
+        EditorialSourceStage,
+        bootstrap_block_registry,
+        canonical_content_sha256,
+    )
+    from cti_app.domain.publication_kind import PublicationKind
+
+    subject_id, run_id, synthesis_artifact_id, enrichment_artifact_id = (uuid4() for _ in range(4))
+    synthesis = {
+        "title": "Synthetic title",
+        "lead": [{"block_id": str(uuid4()), "text": "Synthetic anchor paragraph."}],
+        "sections": [],
+    }
+    synthesis_sha256 = canonical_content_sha256(synthesis)
+    synthesis_entries = bootstrap_block_registry(
+        artifact_id=synthesis_artifact_id,
+        canonical_sha256=synthesis_sha256,
+        source_stage=EditorialSourceStage.SYNTHESIS,
+        canonical_content=synthesis,
+    )
+    anchor_id = next(
+        entry.block_id for entry in synthesis_entries if entry.kind.value == "lead_paragraph"
+    )
+    enrichment = {
+        "source_figures": [
+            {
+                "key": "figure-second",
+                "caption": "Second in document order",
+                "provenance": "Synthetic archived source",
+                "source_url": "https://sources.example.test/article",
+                "inclusion_status": "included",
+                "order": 1,
+                "width": 320,
+                "height": 180,
+                "resolved_figure": {
+                    "source": "https://sources.example.test/article",
+                    "sha256": "b" * 64,
+                    "mime_type": "image/png",
+                    "byte_size": 20,
+                },
+                "placement": {
+                    "kind": "after_paragraph",
+                    "anchor_block_id": str(anchor_id),
+                },
+                "locator": {"page": 1},
+            },
+            {
+                "key": "figure-first",
+                "caption": "First in document order",
+                "provenance": "Synthetic archived source",
+                "source_url": "https://sources.example.test/article",
+                "inclusion_status": "included",
+                "order": 0,
+                "width": 320,
+                "height": 180,
+                "resolved_figure": {
+                    "source": "https://sources.example.test/article",
+                    "sha256": "a" * 64,
+                    "mime_type": "image/png",
+                    "byte_size": 10,
+                },
+                "placement": {
+                    "kind": "after_paragraph",
+                    "anchor_block_id": str(anchor_id),
+                },
+                "locator": {"page": 1},
+            },
+        ]
+    }
+    enrichment_sha256 = canonical_content_sha256(enrichment)
+    entries = (
+        *synthesis_entries,
+        *bootstrap_block_registry(
+            artifact_id=enrichment_artifact_id,
+            canonical_sha256=enrichment_sha256,
+            source_stage=EditorialSourceStage.EDITORIAL_ENRICHMENT,
+            canonical_content=enrichment,
+        ),
+    )
+    record = WorkspaceSnapshotRecord(
+        snapshot_id=uuid4(),
+        subject_id=subject_id,
+        production_run_id=run_id,
+        synthesis_artifact_id=synthesis_artifact_id,
+        synthesis_version=1,
+        synthesis_input_hash="1" * 64,
+        synthesis_canonical_sha256=synthesis_sha256,
+        enrichment_artifact_id=enrichment_artifact_id,
+        enrichment_version=2,
+        enrichment_input_hash="2" * 64,
+        enrichment_canonical_sha256=enrichment_sha256,
+        publication_artifact_id=None,
+        publication_version=None,
+        publication_input_hash=None,
+        publication_canonical_sha256=None,
+        pipeline_generation=1,
+        routing_decision_id=None,
+        routing_decision_hash=None,
+        publication_kind=PublicationKind.ARTICLE,
+        workspace_pin_hash="3" * 64,
+        registry_hash=registry_hash(entries),
+        block_registry=entries,
+    )
+
+    blocks, _, _ = project_blocks(
+        entries=entries,
+        synthesis=synthesis,
+        enrichment=enrichment,
+        record=record,
+        allow_operations=False,
+    )
+
+    assert [block["figure"]["caption"] for block in blocks if block["kind"] == "figure"] == [
+        "First in document order",
+        "Second in document order",
+    ]

@@ -1131,7 +1131,9 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
         current_refs = _evidence_ref_keys(prepared.evidence_pack)
         if not _proposal_evidence_keys(proposal.evidence_refs) <= current_refs:
             raise EditorialProposalAdoptionError("proposal_evidence_not_admissible")
-        if proposal.operation == TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE.value:
+        if getattr(proposal, "operation", None) == (
+            TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE.value
+        ):
             if prepared.stage is not ProductionArtifactStage.EDITORIAL_ENRICHMENT:
                 raise EditorialProposalAdoptionError("proposal_target_mismatch")
             if prepared.base_enrichment is None:
@@ -1156,28 +1158,31 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                     artifact_store=self._enrichment_revision_service._enrichment._artifact_store,
                     media_archiver=source_media_archiver,
                 )
-                current_catalog = build_editorial_figure_catalog(
-                    prepared.extraction, inventory
-                )
-                current_candidate, _current_element_key = (
-                    _manual_source_figure_candidate_patch(
-                        patch.get("enrichment_patch")
-                        if isinstance(patch.get("enrichment_patch"), Mapping)
-                        else {},
-                        subject_id=proposal.subject_id,
-                        run_id=proposal.production_run_id,
-                        catalog=current_catalog,
-                        extraction=prepared.extraction,
-                        base_enrichment=prepared.base_enrichment,
-                        anchor_block_id=proposal.occurrence_id,
-                        publication_kind=record.publication_kind,
-                        inventory_limit=inventory.max_figures,
-                    )
+                current_catalog = build_editorial_figure_catalog(prepared.extraction, inventory)
+                raw_enrichment_patch = patch.get("enrichment_patch")
+                if not isinstance(raw_enrichment_patch, Mapping):
+                    raise EditorialProposalAdoptionError("proposal_patch_invalid")
+                publication_kind = record.publication_kind
+                if publication_kind not in {PublicationKind.ARTICLE, PublicationKind.BRIEF}:
+                    raise EditorialProposalAdoptionError("proposal_operation_unsupported")
+                synthesis = prepared.synthesis
+                if synthesis is None:
+                    raise EditorialProposalAdoptionError("proposal_base_unavailable")
+                current_candidate, _current_element_key = _manual_source_figure_candidate_patch(
+                    raw_enrichment_patch,
+                    subject_id=proposal.subject_id,
+                    run_id=proposal.production_run_id,
+                    catalog=current_catalog,
+                    extraction=prepared.extraction,
+                    base_enrichment=prepared.base_enrichment,
+                    anchor_block_id=proposal.occurrence_id,
+                    publication_kind=publication_kind,
+                    inventory_limit=inventory.max_figures,
                 )
                 validate_editorial_enrichment(
                     current_candidate,
                     extraction=prepared.extraction,
-                    synthesis=prepared.synthesis,
+                    synthesis=synthesis,
                 )
             except EditorialProposalAdoptionError:
                 raise

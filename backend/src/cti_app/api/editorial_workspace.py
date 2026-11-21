@@ -26,6 +26,7 @@ from pydantic import (
 )
 from starlette.responses import JSONResponse
 
+from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.editorial_drafts import (
     MAX_DRAFT_BYTES,
     EditorialDraftApplicationError,
@@ -62,6 +63,7 @@ from cti_app.application.editorial_threads import (
 )
 from cti_app.application.editorial_workspace import EditorialWorkspaceService
 from cti_app.application.media_assets import MediaAssetStore
+from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_editorial_enrichment import (
     ProductionEditorialEnrichmentService,
 )
@@ -71,7 +73,7 @@ from cti_app.application.production_enrichment_revision import (
 from cti_app.application.production_stages import EditorialEnrichmentService, SynthesisService
 from cti_app.application.production_synthesis import ProductionSynthesisService
 from cti_app.application.source_figure_inventory import MAX_SOURCE_FIGURES
-from cti_app.config import get_settings
+from cti_app.config import Settings, get_settings
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.editorial_proposal import EditorialProposalConflict
 from cti_app.domain.editorial_thread import EditorialThreadEventKind
@@ -92,6 +94,7 @@ from cti_app.domain.production_editorial_enrichment import (
 from cti_app.domain.production_synthesis import EvidenceKind, ExtractionEvidenceRefV1
 from cti_app.domain.publication_kind import PublicationKind
 from cti_app.infrastructure.analytic_chart_renderer import AnalyticChartRenderer
+from cti_app.infrastructure.collection_runtime import create_subject_collection_service
 from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
 from cti_app.infrastructure.figure_thumbnails import (
     MAX_FIGURE_PREVIEW_EDGE_PX,
@@ -320,9 +323,7 @@ class EditorialWorkspaceRoute(APIRoute):
                         content={
                             "detail": {
                                 "code": "manual_source_figure_request_invalid",
-                                "message": _ERROR_MESSAGES[
-                                    "manual_source_figure_request_invalid"
-                                ],
+                                "message": _ERROR_MESSAGES["manual_source_figure_request_invalid"],
                             }
                         },
                     )
@@ -1183,7 +1184,7 @@ def _manual_edit_capability_enabled(request: Request, payload: Mapping[str, obje
 
 
 def _service(request: Request) -> EditorialWorkspaceService:
-    artifact_store = getattr(request.app.state, "production_artifact_store", None)
+    artifact_store = _production_artifact_store_for_request(request)
     if artifact_store is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -1196,6 +1197,40 @@ def _service(request: Request) -> EditorialWorkspaceService:
         uow_factory=request.app.state.uow_factory,
         artifact_store=artifact_store,
     )
+
+
+def _production_artifact_store_for_request(request: Request) -> ProductionArtifactStore | None:
+    configured = getattr(request.app.state, "production_artifact_store", None)
+    if configured is not None:
+        return cast(ProductionArtifactStore, configured)
+    blob_store = getattr(request.app.state, "blob_store", None)
+    uow_factory = getattr(request.app.state, "uow_factory", None)
+    if blob_store is None or uow_factory is None:
+        return None
+    artifact_store = ProductionArtifactStore(BlobCatalogService(blob_store, uow_factory))
+    request.app.state.production_artifact_store = artifact_store
+    return artifact_store
+
+
+def _collection_service_for_request(request: Request) -> Any | None:
+    configured = getattr(request.app.state, "collection_service", None)
+    if configured is not None:
+        return configured
+    blob_store = getattr(request.app.state, "blob_store", None)
+    uow_factory = getattr(request.app.state, "uow_factory", None)
+    if blob_store is None or uow_factory is None:
+        return None
+    settings = getattr(request.app.state, "settings", None)
+    if not isinstance(settings, Settings):
+        settings = get_settings()
+    collection_service = create_subject_collection_service(
+        settings=settings,
+        uow_factory=uow_factory,
+        blob_store=blob_store,
+        model_gateway=getattr(request.app.state, "model_gateway", None),
+    )
+    request.app.state.collection_service = collection_service
+    return collection_service
 
 
 def _draft_service(request: Request) -> EditorialDraftService:
@@ -1350,7 +1385,7 @@ def _media_asset_store_for_request(
 
 
 def _proposal_adoption_service(request: Request) -> EditorialProposalAdoptionService:
-    artifact_store = getattr(request.app.state, "production_artifact_store", None)
+    artifact_store = _production_artifact_store_for_request(request)
     blob_store = getattr(request.app.state, "blob_store", None)
     model_gateway = getattr(request.app.state, "model_gateway", None)
     render_service = getattr(request.app.state, "publication_render_service", None)
@@ -1391,7 +1426,7 @@ def _proposal_adoption_service(request: Request) -> EditorialProposalAdoptionSer
         diagram_compiler=D2DiagramCompiler(),
         chart_compiler=AnalyticChartRenderer(),
         source_media_archiver=getattr(
-            getattr(request.app.state, "collection_service", None), "source_media_archiver", None
+            _collection_service_for_request(request), "source_media_archiver", None
         ),
         resource_search_enabled=get_settings().production_editorial_resource_search_enabled,
     )
@@ -1422,7 +1457,7 @@ def _proposal_adoption_service(request: Request) -> EditorialProposalAdoptionSer
 
 def _manual_proposal_service(request: Request) -> EditorialProposalService:
     uow_factory = getattr(request.app.state, "uow_factory", None)
-    artifact_store = getattr(request.app.state, "production_artifact_store", None)
+    artifact_store = _production_artifact_store_for_request(request)
     blob_store = getattr(request.app.state, "blob_store", None)
     if uow_factory is None or artifact_store is None or blob_store is None:
         raise HTTPException(
@@ -1606,7 +1641,7 @@ _FIGURE_STATUS_FILTERS = Literal[
 
 
 def _figure_catalog_service(request: Request) -> EditorialFigureCatalogService:
-    artifact_store = getattr(request.app.state, "production_artifact_store", None)
+    artifact_store = _production_artifact_store_for_request(request)
     uow_factory = getattr(request.app.state, "uow_factory", None)
     if artifact_store is None or uow_factory is None:
         raise HTTPException(
@@ -1616,7 +1651,7 @@ def _figure_catalog_service(request: Request) -> EditorialFigureCatalogService:
                 "message": "La galerie de figures est temporairement indisponible.",
             },
         )
-    collection_service = getattr(request.app.state, "collection_service", None)
+    collection_service = _collection_service_for_request(request)
     media_archiver = getattr(collection_service, "source_media_archiver", None)
     policy_sha256 = getattr(media_archiver, "policy_sha256", None)
     return EditorialFigureCatalogService(
@@ -2555,6 +2590,8 @@ async def prepare_manual_editorial_source_figure_proposal(
         )
         raw_reason = getattr(error, "reason", None)
         try:
+            if not isinstance(raw_reason, str):
+                raise ValueError("figure_reason_invalid")
             reason = EditorialFigureDiagnosticReason(raw_reason)
         except (TypeError, ValueError):
             reason = {

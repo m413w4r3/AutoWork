@@ -492,6 +492,7 @@ def _paragraph_enrichment_proposal_fixture(
     [
         pytest.param(TargetedEditorialRevisionOperation.CREATE_TABLE, id="table"),
         pytest.param(TargetedEditorialRevisionOperation.CREATE_BAR_CHART, id="bar-chart"),
+        pytest.param(TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE, id="source-figure"),
     ],
 )
 async def test_paragraph_enrichment_inspection_reads_enrichment_base(
@@ -515,6 +516,7 @@ async def test_paragraph_enrichment_inspection_reads_enrichment_base(
     [
         pytest.param(TargetedEditorialRevisionOperation.CREATE_TABLE, id="table"),
         pytest.param(TargetedEditorialRevisionOperation.CREATE_BAR_CHART, id="bar-chart"),
+        pytest.param(TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE, id="source-figure"),
     ],
 )
 def test_paragraph_enrichment_proposal_pins_follow_synthesis_anchor(
@@ -537,6 +539,8 @@ def test_paragraph_enrichment_proposal_pins_follow_synthesis_anchor(
         EditorialEnrichmentElementKind.TABLE
         if operation is TargetedEditorialRevisionOperation.CREATE_TABLE
         else EditorialEnrichmentElementKind.CHART
+        if operation is TargetedEditorialRevisionOperation.CREATE_BAR_CHART
+        else EditorialEnrichmentElementKind.FIGURE
     )
     paragraph_enrichment_operations = (
         TargetedEditorialRevisionOperation.paragraph_enrichment_insertion_values()
@@ -544,7 +548,11 @@ def test_paragraph_enrichment_proposal_pins_follow_synthesis_anchor(
 
     assert entry.kind.value == "paragraph"
     assert operation.paragraph_enrichment_element_kind is expected_element_kind
-    assert paragraph_enrichment_operations == {"create_table", "create_bar_chart"}
+    assert paragraph_enrichment_operations == {
+        "create_table",
+        "create_bar_chart",
+        "create_source_figure",
+    }
     assert resolved_target.target.element_kind is expected_element_kind
     assert _proposal_pins_match(proposal, resolution)
     assert (
