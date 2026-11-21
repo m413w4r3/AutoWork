@@ -191,6 +191,12 @@ async def test_manual_figure_preparation_validates_single_or_group_target(
     )
     from cti_app.application.editorial_enrichment_revision import targeted_action
     from cti_app.application.editorial_figure_catalog import opaque_figure_id
+    from cti_app.application.editorial_proposal_adoption import (
+        _proposal_pins_match as adoption_pins_match,
+    )
+    from cti_app.application.editorial_proposal_adoption import (
+        _proposal_stage,
+    )
     from cti_app.application.editorial_proposal_adoption_inputs import (
         ProductionEditorialProposalAdoptionInputs,
         _manual_source_figure_candidate_patch,
@@ -199,22 +205,36 @@ async def test_manual_figure_preparation_validates_single_or_group_target(
         EditorialProposalPreparation,
         EditorialProposalService,
         _manual_wire_response,
+        _proposal_pins_match,
     )
     from cti_app.application.editorial_synthesis.patch_validation import parse_wire_patch_strict
+    from cti_app.application.editorial_workspace.registry import (
+        WorkspaceOccurrenceResolution,
+        WorkspaceSnapshotRecord,
+        registry_hash,
+    )
     from cti_app.application.production_artifact_store import ProductionArtifactStore
     from cti_app.application.production_editorial_enrichment import EditorialFigureCatalogEntry
     from cti_app.application.production_synthesis import canonical_extraction_hash
     from cti_app.application.source_figure_inventory import SourceFigureCatalogMetadata
     from cti_app.domain.discovery import SourceRole
     from cti_app.domain.editorial_proposal import (
+        EditorialProposal,
         EditorialProposalOrigin,
+        EditorialProposalState,
         ManualPatch,
         ManualSourceFigurePatch,
+    )
+    from cti_app.domain.editorial_workspace import (
+        EditorialBlockKind,
+        EditorialSourceStage,
+        bootstrap_block_registry,
     )
     from cti_app.domain.production import (
         ExtractionProfile,
         ProductionArtifact,
         ProductionArtifactStage,
+        ProductionArtifactStatus,
     )
     from cti_app.domain.production_editorial_enrichment import (
         EditorialEnrichmentElementKind,
@@ -247,10 +267,12 @@ async def test_manual_figure_preparation_validates_single_or_group_target(
         PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
         SYNTHESIS_POLICY_VERSION,
         ProductionSynthesisV1,
+        SynthesisParagraphV1,
+        production_synthesis_to_json,
     )
     from tests.editorial_enrichment_support import build_empty_editorial_enrichment
 
-    subject_id, source_document_id, anchor_id, run_id = uuid4(), uuid4(), uuid4(), uuid4()
+    subject_id, source_document_id, run_id = uuid4(), uuid4(), uuid4()
     raw_items = tuple(
         _catalog_item(
             source_document_id=source_document_id,
@@ -303,12 +325,34 @@ async def test_manual_figure_preparation_validates_single_or_group_target(
         publication_language="fr",
         synthesis_policy_version=SYNTHESIS_POLICY_VERSION,
         title="Synthetic report",
-        lead=(),
+        lead=(SynthesisParagraphV1("Synthetic anchor paragraph.", ()),),
         sections=(),
         timeline=(),
         uncertainties=(),
         warnings=(),
     )
+    synthesis_payload = production_synthesis_to_json(synthesis)
+    synthesis_bytes = ProductionArtifactStore.canonical_json_bytes(synthesis_payload)
+    synthesis_sha256 = hashlib.sha256(synthesis_bytes).hexdigest()
+    synthesis_artifact = ProductionArtifact(
+        production_run_id=run_id,
+        subject_id=subject_id,
+        stage=ProductionArtifactStage.SYNTHESIS,
+        version=1,
+        input_hash=extraction.production_input_hash,
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=uuid4(),
+    )
+    synthesis_entries = bootstrap_block_registry(
+        artifact_id=synthesis_artifact.id,
+        canonical_sha256=synthesis_sha256,
+        source_stage=EditorialSourceStage.SYNTHESIS,
+        canonical_content=synthesis_payload,
+    )
+    anchor_entry = next(
+        entry for entry in synthesis_entries if entry.kind is EditorialBlockKind.LEAD_PARAGRAPH
+    )
+    anchor_id = anchor_entry.block_id
     base_enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
     base_content = editorial_enrichment_to_json(base_enrichment)
     base_sha256 = hashlib.sha256(
@@ -359,7 +403,7 @@ async def test_manual_figure_preparation_validates_single_or_group_target(
         target_path=target_path,
         operation=TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE,
         base_sha256=base_sha256,
-        before_hash="d" * 64,
+        before_hash=anchor_entry.content_sha256,
         after="{}",
     )
     preparation = EditorialProposalPreparation(
@@ -379,7 +423,7 @@ async def test_manual_figure_preparation_validates_single_or_group_target(
         ).hexdigest(),
         target=target,
         operation=TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE,
-        before_hash="d" * 64,
+        before_hash=anchor_entry.content_sha256,
         base_content=base_content,
         raw_response=raw_response,
         model_run_id=None,
@@ -462,7 +506,7 @@ async def test_manual_figure_preparation_validates_single_or_group_target(
         instruction="Manual archived source figure insertion",
         mode=TargetedEditorialRevisionMode.EXISTING_EVIDENCE_ONLY,
         requester="synthetic-test-actor",
-        before_hash="d" * 64,
+        before_hash=anchor_entry.content_sha256,
     )
     candidate = await build_candidate_from_validated_patch(
         base_artifact=base_artifact,
@@ -489,6 +533,82 @@ async def test_manual_figure_preparation_validates_single_or_group_target(
     )
     inserted_pointers = [item["pointer"] for item in lineage if item["transition"] == "insert"]
     assert inserted_pointers == [f"/source_figures/{index}" for index in range(figure_count)]
+
+    pin_hash = preparation.base_pin_hash
+    snapshot = WorkspaceSnapshotRecord(
+        snapshot_id=preparation.snapshot_id,
+        subject_id=subject_id,
+        production_run_id=run_id,
+        synthesis_artifact_id=synthesis_artifact.id,
+        synthesis_version=synthesis_artifact.version,
+        synthesis_input_hash=synthesis_artifact.input_hash,
+        synthesis_canonical_sha256=synthesis_sha256,
+        enrichment_artifact_id=base_artifact.id,
+        enrichment_version=base_artifact.version,
+        enrichment_input_hash=base_artifact.input_hash,
+        enrichment_canonical_sha256=base_sha256,
+        publication_artifact_id=None,
+        publication_version=None,
+        publication_input_hash=None,
+        publication_canonical_sha256=None,
+        pipeline_generation=1,
+        routing_decision_id=None,
+        routing_decision_hash=None,
+        publication_kind=PublicationKind.ARTICLE,
+        workspace_pin_hash=pin_hash,
+        registry_hash=registry_hash(synthesis_entries),
+        block_registry=synthesis_entries,
+    )
+    proposal = EditorialProposal(
+        id=uuid4(),
+        subject_id=subject_id,
+        production_run_id=run_id,
+        origin=EditorialProposalOrigin.MANUAL_PATCH,
+        snapshot_id=snapshot.snapshot_id,
+        occurrence_id=anchor_id,
+        base_artifact_id=base_artifact.id,
+        base_artifact_version=base_artifact.version,
+        base_input_hash=base_artifact.input_hash,
+        base_canonical_sha256=base_sha256,
+        base_routing_hash=None,
+        base_pin_hash=pin_hash,
+        target_id=preparation.target_id,
+        operation=TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE.value,
+        before_hash=anchor_entry.content_sha256,
+        patch_blob_ref=uuid4(),
+        patch_sha256="a" * 64,
+        evidence_refs=(),
+        diagnostics={},
+        thread_id=None,
+        variant_group_id=uuid4(),
+        model_run_id=None,
+        model_turn_id=None,
+        state=EditorialProposalState.PROPOSED,
+        state_version=1,
+        actor_id=uuid4(),
+        idempotency_key="synthetic-figure-acceptance",
+        request_sha256="b" * 64,
+    )
+    resolution = WorkspaceOccurrenceResolution(
+        record=snapshot,
+        entry=anchor_entry,
+        binding_state="valid",
+        artifact_id=synthesis_artifact.id,
+        artifact_version=synthesis_artifact.version,
+        canonical_sha256=synthesis_sha256,
+    )
+    assert _proposal_pins_match(proposal, resolution)
+    assert adoption_pins_match(proposal, resolution)
+    assert (
+        _proposal_stage(proposal, {"target": target.to_json()}, resolution)
+        is ProductionArtifactStage.EDITORIAL_ENRICHMENT
+    )
+    stale_resolution = replace(
+        resolution,
+        record=replace(snapshot, enrichment_canonical_sha256="c" * 64),
+    )
+    assert not _proposal_pins_match(proposal, stale_resolution)
+    assert not adoption_pins_match(proposal, stale_resolution)
 
 
 @pytest.mark.asyncio

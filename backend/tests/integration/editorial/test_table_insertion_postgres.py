@@ -241,6 +241,20 @@ async def _ready_for_manual_table_route(
 
     blob_store = cast(BlobStore, seeded.blob_store)
     artifact_store = ProductionArtifactStore(BlobCatalogService(blob_store, uow_factory))
+    app = create_app()
+    model_gateway = _NoModelCalls()
+    app.state.uow_factory = uow_factory
+    app.state.blob_store = blob_store
+    app.state.production_artifact_store = artifact_store
+    app.state.model_gateway = model_gateway
+    app.state.publication_render_service = object()
+    collection_service = editorial_workspace_api._collection_service_for_request(
+        SimpleNamespace(app=app)
+    )
+    media_archiver = getattr(collection_service, "source_media_archiver", None)
+    media_policy_sha256 = getattr(media_archiver, "policy_sha256", None)
+    if not isinstance(media_policy_sha256, str):
+        media_policy_sha256 = None
     synthesis_payload = production_synthesis_to_json(seeded.synthesis)
     synthesis_sha256 = hashlib.sha256(
         ProductionArtifactStore.canonical_json_bytes(synthesis_payload)
@@ -272,6 +286,8 @@ async def _ready_for_manual_table_route(
             source_document_repository=uow.source_documents,
             blob_repository=uow.blobs,
             artifact_store=artifact_store,
+            source_media_repository=uow.source_media_candidates,
+            media_policy_sha256=media_policy_sha256,
         )
     access_policy_hash = synthesis_access_policy_hash(access_policy)
     evidence_pack = build_editorial_enrichment_evidence_pack(
@@ -329,13 +345,6 @@ async def _ready_for_manual_table_route(
         await uow.production_artifacts.append(publication_artifact)
         await uow.commit()
 
-    app = create_app()
-    app.state.uow_factory = uow_factory
-    app.state.blob_store = blob_store
-    app.state.production_artifact_store = artifact_store
-    model_gateway = _NoModelCalls()
-    app.state.model_gateway = model_gateway
-    app.state.publication_render_service = object()
     from cti_app.application.identity import LocalIdentityProvider
 
     app.state.identity_provider = LocalIdentityProvider("dev-analyst")
