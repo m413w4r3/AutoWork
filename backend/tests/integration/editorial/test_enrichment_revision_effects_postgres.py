@@ -104,20 +104,31 @@ async def _persist_source_access_records(
             )
             seeded.blob_store.seed(descriptor, content)
             blob = await uow.blobs.add_if_absent(BlobRecord(descriptor=descriptor))
-            collection = SourceCollection(
-                subject_id=seeded.subject.id,
-                edition_id=seeded.subject.edition_id,
-                requested_url=source.canonical_url,
-                canonical_url=source.canonical_url,
-                proposed_role=source.role,
-                origin_kind=SourceOriginKind.REFERENCE_RESEARCH,
-                source_tlp=TLP.AMBER,
-                sensitivity="internal",
-                external_llm_allowed=True,
-                do_not_submit=False,
-                state=CollectionState.ARCHIVED,
-                source_document_id=source_id,
+            collection = await uow.source_collections.get_by_canonical_url(
+                seeded.subject.id, source.canonical_url
             )
+            if collection is None:
+                collection = SourceCollection(
+                    subject_id=seeded.subject.id,
+                    edition_id=seeded.subject.edition_id,
+                    requested_url=source.canonical_url,
+                    canonical_url=source.canonical_url,
+                    proposed_role=source.role,
+                    origin_kind=SourceOriginKind.REFERENCE_RESEARCH,
+                    source_tlp=TLP.AMBER,
+                    sensitivity="internal",
+                    external_llm_allowed=True,
+                    do_not_submit=False,
+                    state=CollectionState.ARCHIVED,
+                )
+                assert await uow.source_collections.add_if_absent(collection)
+            else:
+                collection.state = CollectionState.ARCHIVED
+                collection.source_document_id = source_id
+                collection.source_tlp = TLP.AMBER
+                collection.sensitivity = "internal"
+                collection.external_llm_allowed = True
+                collection.do_not_submit = False
             await uow.source_documents.add(
                 SourceDocument(
                     id=source_id,
@@ -135,7 +146,8 @@ async def _persist_source_access_records(
                     detected_mime_type="text/plain",
                 )
             )
-            assert await uow.source_collections.add_if_absent(collection)
+            collection.source_document_id = source_id
+            await uow.source_collections.save(collection)
         await uow.commit()
 
 
@@ -308,6 +320,7 @@ async def test_accept_races_real_enrichment_revise_or_restore_with_one_winner_an
         proposal_count=1,
         seed_discovery_lineage=True,
         article_base=True,
+        persist_real_revision_inputs=True,
     )
     await _persist_source_access_records(seeded, uow_factory)
     artifact_store, current_enrichment, input_hash = await _persist_enrichment_history(

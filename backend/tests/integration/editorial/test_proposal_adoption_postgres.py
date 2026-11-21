@@ -16,6 +16,7 @@ from fastapi import FastAPI
 
 from cti_app.api import editorial_workspace as editorial_workspace_api
 from cti_app.application.blob_storage import BlobStore
+from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.editorial_enrichment_revision import (
     validate_editorial_enrichment_patch,
 )
@@ -57,18 +58,30 @@ from cti_app.application.production_editorial_enrichment import (
     validate_editorial_enrichment,
     validate_editorial_enrichment_proposal,
 )
-from cti_app.application.production_stages import EditorialEnrichmentService, SynthesisService
+from cti_app.application.production_extraction import build_extraction_plan
+from cti_app.application.production_references import (
+    ReferenceCollectionObservation,
+    build_production_reference_corpus,
+)
+from cti_app.application.production_stages import (
+    EditorialEnrichmentService,
+    ExtractionService,
+    ReferenceResearchService,
+    SynthesisService,
+)
 from cti_app.application.production_synthesis import (
     ProductionSynthesisService,
     build_synthesis_evidence_pack,
     canonical_extraction_hash,
 )
 from cti_app.application.production_synthesis_revision import _apply_wire_patch
+from cti_app.application.production_workflow import _references_input_hash
 from cti_app.application.publication_builder import build_article_format_v1
 from cti_app.application.subject_production import capture_production_input_snapshot
 from cti_app.config import Settings
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
 from cti_app.domain.classification import TLP
+from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.editions import Edition
 from cti_app.domain.editorial_proposal import (
@@ -399,6 +412,7 @@ async def _seed(
     seed_discovery_lineage: bool = False,
     article_base: bool = False,
     bar_chart_facts: bool = False,
+    persist_real_revision_inputs: bool = False,
 ) -> _Seeded:
     blob_store = _MemoryBlobStore()
     edition = Edition(
@@ -538,6 +552,78 @@ async def _seed(
         omitted_sources=(),
         warnings=(),
     )
+    revision_inputs_persisted = False
+    if persist_real_revision_inputs:
+        if not seed_discovery_lineage or not production_input.core_sources:
+            raise ValueError("real revision inputs require captured discovery sources")
+
+        source_id = extraction.sources[0].source_document_id
+        source_bytes = f"Synthetic archived source {source_id}\n".encode()
+        source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+        core_source = production_input.core_sources[0]
+        async with uow_factory() as uow:
+            source_collection = await uow.source_collections.get_by_canonical_url(
+                subject.id, core_source.canonical_url
+            )
+        if source_collection is None:
+            raise ValueError("captured discovery source collection is missing")
+        extraction_source = replace(
+            extraction.sources[0],
+            canonical_url=core_source.canonical_url,
+            content_sha256=source_sha256,
+            role=core_source.role,
+        )
+        extraction = replace(extraction, sources=(extraction_source,))
+        corpus = build_production_reference_corpus(
+            subject_id=subject.id,
+            research_date=production_input.research_date,
+            production_input_hash=production_input.input_hash,
+            core_sources=production_input.core_sources,
+            proposals=(),
+            observations={
+                core_source.canonical_url: ReferenceCollectionObservation(
+                    collection_id=source_collection.id,
+                    state=CollectionState.ARCHIVED,
+                    source_document_id=source_id,
+                    content_sha256=source_sha256,
+                )
+            },
+            warnings=(),
+        )
+        extraction_plan = build_extraction_plan(corpus)
+        extraction = replace(
+            extraction,
+            references_corpus_hash=extraction_plan.references_corpus_hash,
+        )
+
+        pipeline_artifact_store = ProductionArtifactStore(
+            BlobCatalogService(blob_store, uow_factory)
+        )
+        async with uow_factory() as uow:
+            if not seed_discovery_lineage:
+                await uow.subjects.add(subject)
+            await uow.production_runs.add(run)
+            await uow.production_input_snapshots.add(production_input)
+            await uow.commit()
+        await ReferenceResearchService(
+            uow_factory, pipeline_artifact_store
+        ).store_references_result(
+            run_id=run.id,
+            subject_id=subject.id,
+            input_hash=_references_input_hash(
+                snapshot=production_input,
+                research_date=production_input.research_date,
+            ),
+            raw_result="Synthetic reference corpus fixture.",
+            corpus=corpus,
+        )
+        await ExtractionService(uow_factory, pipeline_artifact_store).store_extraction_result(
+            run_id=run.id,
+            subject_id=subject.id,
+            input_hash=extraction_plan.input_hash,
+            extraction=extraction,
+        )
+        revision_inputs_persisted = True
     evidence_ref = extraction_evidence_refs_v1(extraction)[0]
     base_sections = (
         (
@@ -653,9 +739,10 @@ async def _seed(
     proposals: list[EditorialProposal] = []
 
     async with uow_factory() as uow:
-        if not seed_discovery_lineage:
-            await uow.subjects.add(subject)
-        await uow.production_runs.add(run)
+        if not revision_inputs_persisted:
+            if not seed_discovery_lineage:
+                await uow.subjects.add(subject)
+            await uow.production_runs.add(run)
         base_blob = await uow.blobs.add_if_absent(base_blob)
         patch_blob = await uow.blobs.add_if_absent(patch_blob)
         base_artifact = replace(base_artifact, canonical_blob_id=base_blob.id)
