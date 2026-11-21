@@ -196,9 +196,11 @@ def insert_target(
             for item in candidate.source_figures
             if item.resolved_figure is not None
         ]
-        if len(candidate_ids) != len(candidate.source_figures) or len(set(candidate_ids)) != len(
-            candidate_ids
-        ) or any(figure_id in existing_ids for figure_id in candidate_ids):
+        if (
+            len(candidate_ids) != len(candidate.source_figures)
+            or len(set(candidate_ids)) != len(candidate_ids)
+            or any(figure_id in existing_ids for figure_id in candidate_ids)
+        ):
             raise EditorialEnrichmentRevisionValidationError(
                 [
                     {
@@ -473,6 +475,7 @@ async def build_candidate_from_validated_patch(
         final_payload[list_name].pop(element_index)
     elif is_create:
         if element_kind is EditorialEnrichmentElementKind.FIGURE:
+            assert validated_patch is not None
             final_payload[list_name].extend(
                 after_payload[list_name][-len(validated_patch.source_figures) :]
             )

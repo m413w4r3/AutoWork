@@ -1319,7 +1319,7 @@ def source_figure_locator_to_json(locator: SourceFigureLocatorV1) -> dict[str, A
 
 
 def _figure_to_json(figure: SourceFigureCandidateV1) -> dict[str, Any]:
-    payload = {
+    payload: dict[str, Any] = {
         "key": figure.key,
         "source_document_id": str(figure.source_document_id),
         "source_url": figure.source_url,
@@ -1902,9 +1902,8 @@ def _figure_from_json(raw: Any) -> SourceFigureCandidateV1:
     if not isinstance(raw, Mapping):
         raise ValueError("Source figure candidate has missing or extra fields")
     keys = frozenset(raw)
-    if (
-        not _FIGURE_BASE_KEYS <= keys
-        or keys - (_FIGURE_KEYS | _FIGURE_ARCHIVE_METADATA_KEYS | {"purpose"})
+    if not _FIGURE_BASE_KEYS <= keys or keys - (
+        _FIGURE_KEYS | _FIGURE_ARCHIVE_METADATA_KEYS | {"purpose"}
     ):
         raise ValueError("Source figure candidate has missing or extra fields")
     payload = raw

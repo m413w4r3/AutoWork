@@ -49,7 +49,13 @@ from cti_app.domain.production import (
 )
 from cti_app.domain.production_extraction import production_extraction_to_json
 from cti_app.domain.production_synthesis import production_synthesis_to_json
-from cti_app.domain.publication_document import PublicationDocumentV9, parse_publication_document
+from cti_app.domain.publication_document import (
+    PublicationDocumentV8,
+    PublicationDocumentV9,
+    parse_publication_document,
+    publication_document_v5_sha256,
+    serialize_publication_document,
+)
 from cti_app.domain.publication_kind import PublicationKind
 from tests.integration.editorial.test_proposal_adoption_postgres import (
     _enrichment_seed_content,
@@ -77,6 +83,27 @@ def _local_archived_figure_assets(count: int) -> tuple[tuple[str, bytes], ...]:
         (f"https://media.example.test/figure-{index + 1}.png", path.read_bytes())
         for index, path in enumerate(local_figure_paths[:count])
     )
+
+
+def _brief_v8_payload_for_subject(subject_id: UUID) -> dict[str, object]:
+    publication = parse_publication_document(_brief_v8_payload())
+    if not isinstance(publication, PublicationDocumentV8):
+        raise TypeError("synthetic_publication_fixture_invalid")
+    v7 = publication.base_publication
+    v6 = v7.base_publication
+    v5 = v6.base_publication
+    v5 = replace(v5, document=replace(v5.document, subject_id=subject_id))
+    base_sha256 = publication_document_v5_sha256(v5)
+    provenance = replace(
+        v6.provenance,
+        base_publication_sha256=base_sha256,
+        base_publication_body_sha256=(
+            base_sha256 if v6.provenance.base_publication_body_sha256 is not None else None
+        ),
+    )
+    v6 = replace(v6, base_publication=v5, provenance=provenance)
+    v7 = replace(v7, base_publication=v6)
+    return serialize_publication_document(replace(publication, base_publication=v7))
 
 
 class _NoModelCalls:
@@ -130,7 +157,9 @@ async def _ready_for_manual_table_route(
         if source_figure_assets
         else b"synthetic manual-table integration source"
     )
-    publication_bytes = ProductionArtifactStore.canonical_json_bytes(_brief_v8_payload())
+    publication_bytes = ProductionArtifactStore.canonical_json_bytes(
+        _brief_v8_payload_for_subject(seeded.subject.id)
+    )
 
     def blob_record(content: bytes, mime_type: str, bucket: str) -> BlobRecord:
         return BlobRecord(
@@ -169,9 +198,7 @@ async def _ready_for_manual_table_route(
                 subject_id=seeded.subject.id,
                 blob_id=stored_source_blob.id,
                 original_name=(
-                    "synthetic-report.html"
-                    if source_figure_assets
-                    else "synthetic-report.txt"
+                    "synthetic-report.html" if source_figure_assets else "synthetic-report.txt"
                 ),
                 origin="synthetic integration fixture",
                 acquired_at=datetime.now(UTC),

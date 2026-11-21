@@ -3,24 +3,33 @@ from __future__ import annotations
 import hashlib
 import struct
 import zlib
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 from uuid import UUID, uuid4
 
 import httpx
 import pytest
 from fastapi import FastAPI
+from starlette.requests import Request
 
 from cti_app.api import editorial_workspace as editorial_workspace_api
+from cti_app.api import main as api_main
 from cti_app.application import editorial_figure_catalog as editorial_figure_catalog_module
 from cti_app.application.editorial_figure_catalog import (
     EditorialFigureCatalogCache,
     EditorialFigureCatalogItem,
+    EditorialFigureCatalogService,
     FigureCatalogSource,
     _CachedFigureCatalog,
     classify_source_figure,
     opaque_figure_id,
 )
+from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
+from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.config import Settings
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
 from cti_app.domain.classification import TLP
 from cti_app.domain.production_editorial_enrichment import (
@@ -29,6 +38,7 @@ from cti_app.domain.production_editorial_enrichment import (
     SourceFigureLocatorV1,
     source_figure_id,
 )
+from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from cti_app.infrastructure.figure_thumbnails import (
     FigureThumbnailCache,
     FigureThumbnailError,
@@ -50,6 +60,49 @@ def _png(width: int, height: int) -> bytes:
         + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
         + chunk(b"IDAT", zlib.compress(rows))
         + chunk(b"IEND", b"")
+    )
+
+
+class _MissingSubjectRepository:
+    async def get(self, _subject_id: UUID) -> None:
+        return None
+
+
+def _missing_subject_uow_factory() -> UnitOfWorkFactory:
+    @asynccontextmanager
+    async def open_uow() -> AsyncIterator[UnitOfWork]:
+        yield cast(UnitOfWork, SimpleNamespace(subjects=_MissingSubjectRepository()))
+
+    return cast(UnitOfWorkFactory, open_uow)
+
+
+def _figure_route_app(monkeypatch: pytest.MonkeyPatch, blob_root: Path) -> FastAPI:
+    settings = Settings(
+        _env_file=None,
+        app_env="development",
+        api_bind_host="127.0.0.1",
+        editorial_proposal_accept_enabled=True,
+        production_editorial_resource_search_enabled=False,
+    )
+    monkeypatch.setattr(api_main, "get_settings", lambda: settings)
+    monkeypatch.setattr(editorial_workspace_api, "get_settings", lambda: settings)
+    monkeypatch.setattr(editorial_workspace_api, "_proposal_impact_consumer_wired", lambda: True)
+    app = api_main.create_app()
+    app.state.uow_factory = _missing_subject_uow_factory()
+    app.state.blob_store = FilesystemBlobStore(blob_root)
+    assert getattr(app.state, "production_artifact_store", None) is None
+    return app
+
+
+def _request_for_app(app: FastAPI, path: str) -> Request:
+    return Request(
+        {
+            "type": "http",
+            "app": app,
+            "method": "GET",
+            "path": path,
+            "headers": [],
+        }
     )
 
 
@@ -152,6 +205,55 @@ def _thumbnail_route_app(
         app,
         f"/api/subjects/{subject_id}/editor/figures/{figure_id}/thumbnail",
     )
+
+
+@pytest.mark.asyncio
+async def test_catalog_route_builds_real_services_without_lifespan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    subject_id = uuid4()
+
+    app = _figure_route_app(monkeypatch, tmp_path / "catalog-blobs")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
+    ) as client:
+        response = await client.get(f"/api/subjects/{subject_id}/editor/figures")
+
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "editorial_figure_not_found"
+    assert isinstance(app.state.production_artifact_store, ProductionArtifactStore)
+    assert isinstance(
+        editorial_workspace_api._figure_catalog_service(
+            _request_for_app(app, f"/api/subjects/{subject_id}/editor/figures")
+        ),
+        EditorialFigureCatalogService,
+    )
+
+
+@pytest.mark.asyncio
+async def test_figure_proposal_route_builds_real_catalog_without_lifespan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    subject_id = uuid4()
+    occurrence_id = uuid4()
+
+    app = _figure_route_app(monkeypatch, tmp_path / "proposal-blobs")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
+    ) as client:
+        response = await client.post(
+            f"/api/subjects/{subject_id}/editor/blocks/{occurrence_id}/figure-proposals",
+            headers={"Idempotency-Key": "figure-proposal-unit-test-001"},
+            json={
+                "snapshot_id": str(uuid4()),
+                "anchor_block_id": str(occurrence_id),
+                "figures": [{"figure_id": str(uuid4()), "caption": "Synthetic figure", "order": 0}],
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "editorial_figure_not_found"
+    assert isinstance(app.state.production_artifact_store, ProductionArtifactStore)
 
 
 def test_opaque_figure_id_is_scoped_to_subject_and_current_run() -> None:
