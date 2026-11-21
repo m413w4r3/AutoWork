@@ -26,6 +26,7 @@ from cti_app.application.editorial_conversation_turns import (
     EditorialParagraphEvidenceContext,
 )
 from cti_app.application.editorial_enrichment_revision import (
+    EditorialEnrichmentRevisionValidationError,
     assert_requested_placement,
     targeted_action,
     validate_editorial_enrichment_patch,
@@ -46,6 +47,7 @@ from cti_app.application.editorial_workspace.registry import (
     WorkspaceOccurrenceResolution,
     read_pointer,
     resolve_occurrence,
+    revision_target_path,
 )
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
@@ -491,7 +493,14 @@ def _manual_paragraph_wire(
 
 
 class EditorialProposalApplicationError(ValueError):
-    def __init__(self, code: str, *, reason: str | None = None, frame: str | None = None) -> None:
+    def __init__(
+        self,
+        code: str,
+        *,
+        reason: str | None = None,
+        frame: str | None = None,
+        validator_code: str | None = None,
+    ) -> None:
         if code == "proposal_base_stale" and (
             reason is None or re.fullmatch(r"[a-z][a-z0-9_]*:[a-z][a-z0-9_]*", reason) is None
         ):
@@ -499,6 +508,7 @@ class EditorialProposalApplicationError(ValueError):
         self.code = code
         self.reason = reason
         self.frame = frame
+        self.validator_code = validator_code
         super().__init__(code)
 
 
@@ -507,6 +517,7 @@ def _manual_table_failure(
     reason: EditorialTableDiagnosticReason,
     *,
     frame: str | None = None,
+    validator_code: str | None = None,
 ) -> EditorialProposalApplicationError:
     if frame is None:
         caller = sys._getframe(1)
@@ -515,7 +526,12 @@ def _manual_table_failure(
             caller.f_lineno,
             caller.f_code.co_name,
         )
-    return EditorialProposalApplicationError(code, reason=reason.value, frame=frame)
+    return EditorialProposalApplicationError(
+        code,
+        reason=reason.value,
+        frame=frame,
+        validator_code=validator_code,
+    )
 
 
 def _manual_table_error_reason(code: str) -> EditorialTableDiagnosticReason:
@@ -560,8 +576,49 @@ def _manual_table_validation_diagnostics(
     return {
         "code": code,
         "reason": reason.value,
+        "validator_code": _manual_table_validator_code(error, fallback=code),
         "frame": frame,
     }
+
+
+def _manual_table_validator_code(error: BaseException | None, *, fallback: str) -> str:
+    """Return a stable internal code, never an exception message or user text."""
+    candidates: list[object] = []
+    if isinstance(error, EditorialEnrichmentRevisionValidationError):
+        candidates.extend(
+            value
+            for rejection in error.rejections
+            for value in (rejection.get("diagnostic_code"), rejection.get("reason_code"))
+        )
+    if error is not None:
+        diagnostics = getattr(error, "diagnostics", None)
+        if isinstance(diagnostics, Mapping):
+            candidates.append(diagnostics.get("code"))
+        candidates.extend(
+            (
+                getattr(error, "reason_code", None),
+                getattr(error, "diagnostic_code", None),
+                getattr(error, "validator_code", None),
+                getattr(error, "code", None),
+            )
+        )
+    candidates.append(fallback)
+    for candidate in candidates:
+        value = getattr(candidate, "value", candidate)
+        if isinstance(value, str) and re.fullmatch(r"[a-z][a-z0-9_]{2,}", value):
+            return value
+    return "proposal_patch_invalid"
+
+
+def _dropped_table_validator_code(warnings: tuple[str, ...]) -> str | None:
+    prefix = "editorial_enrichment_validation_block_dropped:TABLE:"
+    for warning in warnings:
+        if not warning.startswith(prefix):
+            continue
+        candidate = warning.rsplit(":", 1)[-1]
+        if re.fullmatch(r"[a-z][a-z0-9_]{2,}", candidate):
+            return candidate
+    return None
 
 
 def _manual_table_failure_from_diagnostics(
@@ -585,10 +642,17 @@ def _manual_table_failure_from_diagnostics(
     if code == "proposal_base_stale":
         reason = EditorialTableDiagnosticReason.PIN_STALE
     frame = diagnostics.get("frame")
+    validator_code = diagnostics.get("validator_code")
     return _manual_table_failure(
         code,
         reason,
         frame=frame if isinstance(frame, str) else None,
+        validator_code=(
+            validator_code
+            if isinstance(validator_code, str)
+            and re.fullmatch(r"[a-z][a-z0-9_]{2,}", validator_code)
+            else None
+        ),
     )
 
 
@@ -1143,11 +1207,13 @@ class EditorialProposalService:
                 frame=_exception_origin_frame(error),
             ) from error
         record = resolved.record
+        anchor_entry = resolved.occurrence.entry
         if (
-            resolved.occurrence.entry is None
+            anchor_entry is None
             or resolved.occurrence.binding_state != "valid"
-            or resolved.occurrence.entry.kind not in {"paragraph", "lead_paragraph"}
+            or anchor_entry.kind not in {"paragraph", "lead_paragraph"}
             or enrichment_context.get("anchor_block_id") != str(occurrence_id)
+            or enrichment_context.get("target_path") != revision_target_path(anchor_entry)
             or enrichment_context.get("base_artifact_id") != str(record.enrichment_artifact_id)
             or enrichment_context.get("base_artifact_version") != record.enrichment_version
             or enrichment_context.get("base_input_hash") != record.enrichment_input_hash
@@ -1156,6 +1222,7 @@ class EditorialProposalService:
             raise _manual_table_failure(
                 "editorial_anchor_stale", EditorialTableDiagnosticReason.ANCHOR_STALE
             )
+        target_path = revision_target_path(anchor_entry)
         raw_table = _manual_table_proposal_json(
             table,
             row_handles=table_handles,
@@ -1170,7 +1237,7 @@ class EditorialProposalService:
             "resource_needs": [],
         }
         raw_response = _manual_wire_response(
-            target_path=resolved.path,
+            target_path=target_path,
             operation=TargetedEditorialRevisionOperation.CREATE_TABLE,
             base_sha256=record.enrichment_canonical_sha256 or "",
             before_hash=resolved.before_hash,
@@ -2055,9 +2122,18 @@ class EditorialProposalService:
                 EditorialProposalEventKind.REFUSED,
                 {"code": patch.refusal.code.value},
             )
+        typed_table_patch = (
+            preparation.operation is TargetedEditorialRevisionOperation.CREATE_TABLE
+            and preparation.target.kind is TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT
+            and preparation.target.element_kind is not None
+            and preparation.target.element_kind.value == "table"
+        )
         strict_text_values = (
             (patch.rationale,)
-            if (preparation.operation is TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH)
+            if (
+                preparation.operation is TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH
+                or typed_table_patch
+            )
             else (patch.after, patch.rationale)
         )
         if preparation.strict_wire and any(
@@ -2147,6 +2223,15 @@ class EditorialProposalService:
                 EditorialProposalState.NEEDS_REVIEW,
                 EditorialProposalEventKind.NEEDS_REVIEW,
                 _manual_table_validation_diagnostics(preparation, error, code=error.reason_code),
+            )
+        except EditorialEnrichmentRevisionValidationError as error:
+            return (
+                None,
+                EditorialProposalState.NEEDS_REVIEW,
+                EditorialProposalEventKind.NEEDS_REVIEW,
+                _manual_table_validation_diagnostics(
+                    preparation, error, code="proposal_patch_invalid"
+                ),
             )
         except (TypeError, ValueError) as error:
             code = getattr(error, "reason_code", "proposal_patch_invalid")
@@ -2374,6 +2459,13 @@ class EditorialProposalService:
             synthesis=context["synthesis"],
             figure_catalog=tuple(context.get("figure_catalog", ())),
         )
+        if create_table and (len(candidate.tables) != 1 or candidate.tables[0].key != table_key):
+            raise EditorialProposalApplicationError(
+                "proposal_patch_invalid",
+                validator_code=(
+                    _dropped_table_validator_code(candidate.warnings) or "proposal_patch_invalid"
+                ),
+            )
         assert_requested_placement(
             candidate=candidate,
             element_kind=preparation.target.element_kind,
@@ -2383,8 +2475,6 @@ class EditorialProposalService:
         )
         evidence_refs: list[dict[str, object]] = []
         if create_table:
-            if len(candidate.tables) != 1 or candidate.tables[0].key != table_key:
-                raise EditorialProposalApplicationError("proposal_patch_invalid")
             purpose = candidate.tables[0].purpose
             if purpose is None:
                 raise EditorialProposalApplicationError("proposal_patch_invalid")

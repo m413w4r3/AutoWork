@@ -25,7 +25,12 @@ from cti_app.application.editorial_workspace.registry import (
     WorkspaceSnapshotRecord,
     allowed_operations,
     project_blocks,
+    revision_target_path,
     table_insertion_preparation_ready,
+)
+from cti_app.application.editorial_workspace.service import (
+    EditorialRevisionTargetResolution,
+    EditorialWorkspaceService,
 )
 from cti_app.domain.editorial_workspace import (
     BlockRegistryEntry,
@@ -38,13 +43,11 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
 )
-from cti_app.domain.production_editorial_enrichment import EditorialEnrichmentElementKind
 from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionPlacement,
     TargetedEditorialRevisionPlacementKind,
-    TargetedEditorialRevisionTarget,
-    TargetedEditorialRevisionTargetKind,
 )
+from cti_app.domain.publication_kind import PublicationKind
 
 
 def _paragraph_registry_entry() -> tuple[BlockRegistryEntry, dict[str, object]]:
@@ -422,6 +425,290 @@ def test_manual_table_text_rejects_markup() -> None:
     assert _editorial_patch_text_violation('#raw("forged Typst")')
 
 
+@pytest.mark.parametrize(
+    ("row_count", "invalid_cell", "expected_state", "expected_validator_code"),
+    [
+        (2, None, "proposed", None),
+        (1, None, "needs_review", "editorial_enrichment_output_invalid"),
+        (2, "<b>forged cell</b>", "needs_review", "editorial_enrichment_output_invalid"),
+        (2, "203.0.113.99", "needs_review", "editorial_enrichment_unknown_technical_value"),
+    ],
+)
+def test_manual_table_wire_uses_real_validator_for_registered_anchor_payload(
+    row_count: int,
+    invalid_cell: str | None,
+    expected_state: str,
+    expected_validator_code: str | None,
+) -> None:
+    import json
+
+    from cti_app.application.editorial_proposals import (
+        EditorialProposalPreparation,
+        EditorialProposalService,
+        _manual_table_failure_from_diagnostics,
+    )
+    from cti_app.application.production_editorial_enrichment import (
+        EditorialEnrichmentEvidencePackV1,
+    )
+    from cti_app.application.production_synthesis import canonical_extraction_hash
+    from cti_app.domain.discovery import SourceRole
+    from cti_app.domain.editorial_proposal import (
+        EditorialProposalEventKind,
+        EditorialProposalOrigin,
+        EditorialProposalState,
+    )
+    from cti_app.domain.production import ExtractionProfile, ProductionEvidenceBasis
+    from cti_app.domain.production_editorial_enrichment import EditorialEnrichmentElementKind
+    from cti_app.domain.production_editorial_revision import (
+        TargetedEditorialRevisionOperation,
+        TargetedEditorialRevisionPlacement,
+        TargetedEditorialRevisionPlacementKind,
+        TargetedEditorialRevisionTarget,
+        TargetedEditorialRevisionTargetKind,
+    )
+    from cti_app.domain.production_extraction import (
+        EXTRACTION_PROFILE_POLICY_VERSION,
+        ExtractionFactV1,
+        ExtractionReuseState,
+        ProductionExtractionV1,
+        ProductionSourceExtractionV1,
+    )
+    from cti_app.domain.production_references import (
+        ProductionReferenceKind,
+        ProductionReferenceTier,
+    )
+    from cti_app.domain.production_synthesis import (
+        PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
+        SYNTHESIS_POLICY_VERSION,
+        ProductionSynthesisV1,
+        SynthesisParagraphV1,
+        extraction_evidence_refs_v1,
+    )
+
+    subject_id, source_document_id, anchor_id = uuid4(), uuid4(), uuid4()
+    extraction = ProductionExtractionV1(
+        schema_version=1,
+        subject_id=subject_id,
+        production_input_hash="a" * 64,
+        references_corpus_hash="b" * 64,
+        profile_policy_version=EXTRACTION_PROFILE_POLICY_VERSION,
+        sources=(
+            ProductionSourceExtractionV1(
+                source_document_id=source_document_id,
+                canonical_url="https://example.test/synthetic-report",
+                content_sha256="c" * 64,
+                tier=ProductionReferenceTier.CORE,
+                kind=ProductionReferenceKind.PUBLICATION,
+                role=SourceRole.PRIMARY,
+                profile=ExtractionProfile.FULL,
+                checkpoint_id=None,
+                reuse_state=ExtractionReuseState.FRESH,
+                facts=(
+                    ExtractionFactV1(
+                        category="other_technical",
+                        value="Synthetic finding",
+                        attack_id=None,
+                        context="Synthetic test context.",
+                        evidence_quote="The synthetic report records this finding.",
+                        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+                        source_document_ids=(source_document_id,),
+                    ),
+                ),
+                events=(),
+                indicators=(),
+                rules=(),
+                uncertainties=(),
+            ),
+        ),
+        omitted_sources=(),
+        warnings=(),
+    )
+    evidence_ref = extraction_evidence_refs_v1(extraction)[0]
+    synthesis = ProductionSynthesisV1(
+        schema_version=PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
+        subject_id=subject_id,
+        production_input_hash=extraction.production_input_hash,
+        extraction_hash=canonical_extraction_hash(extraction),
+        publication_language="fr",
+        synthesis_policy_version=SYNTHESIS_POLICY_VERSION,
+        title="Synthetic report",
+        lead=(SynthesisParagraphV1("Synthetic lead claim.", (evidence_ref,)),),
+        sections=(),
+        timeline=(),
+        uncertainties=(),
+        warnings=(),
+    )
+    evidence_pack = EditorialEnrichmentEvidencePackV1(
+        publication_language="fr",
+        current_synthesis={"lead": [{"block_id": str(anchor_id)}], "sections": []},
+        narrative_evidence=(),
+        technical_evidence=(),
+        reserve_evidence=(),
+        source_pair_relations=(),
+        registered_anchor_ids=frozenset({anchor_id}),
+        _handle_to_ref={"E001": evidence_ref},
+    )
+    anchor_entry = BlockRegistryEntry(
+        block_id=anchor_id,
+        kind=EditorialBlockKind.PARAGRAPH,
+        parent_block_id=None,
+        position=0,
+        content_sha256="d" * 64,
+        source_stage=EditorialSourceStage.SYNTHESIS,
+        structural_pointer="/lead/0",
+    )
+    target_path = revision_target_path(anchor_entry)
+    rows = [
+        {
+            "cells": ["Synthetic finding", "Synthetic test context."],
+            "evidence_handles": ["E001"],
+        },
+        {
+            "cells": ["Synthetic finding", "The synthetic report records this finding."],
+            "evidence_handles": ["E001"],
+        },
+    ][:row_count]
+    if invalid_cell is not None:
+        rows[0]["cells"][0] = invalid_cell
+    patch_after = json.dumps(
+        {
+            "tables": [
+                {
+                    "key": "table_inserted_after_registered_paragraph",
+                    "kind": "custom",
+                    "title": "Inserted synthetic findings",
+                    "caption": "Synthetic findings placed after the selected paragraph.",
+                    "columns": [
+                        {"key": "finding", "label": "Finding"},
+                        {"key": "source", "label": "Source detail"},
+                    ],
+                    "rows": rows,
+                    "placement": {
+                        "kind": "after_paragraph",
+                        "section_index": None,
+                        "anchor_block_id": str(anchor_id),
+                    },
+                    "purpose": {
+                        "question": "Which source passage supports this finding?",
+                        "available_data": "The cited synthetic finding and its source context.",
+                        "comprehension_gain": "Compare source context beside the finding.",
+                        "scope": "Only the synthetic finding and its cited source context.",
+                        "evidence_handles": ["E001"],
+                        "knowledge_limits": "No other source detail is represented.",
+                        "placement_reason": "Keep the table after its anchor paragraph.",
+                    },
+                }
+            ],
+            "charts": [],
+            "diagrams": [],
+            "annotations": [],
+            "figures": [],
+            "resource_needs": [],
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    assert _editorial_patch_text_violation(patch_after)
+    target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT,
+        element_kind=EditorialEnrichmentElementKind.TABLE,
+        placement=TargetedEditorialRevisionPlacement(
+            kind=TargetedEditorialRevisionPlacementKind.AFTER_PARAGRAPH,
+            anchor_block_id=anchor_id,
+        ),
+    )
+    before_hash = "e" * 64
+    raw_response = "\n".join(
+        (
+            "@@ TARGET @@",
+            target_path,
+            "@@ ACTION @@",
+            TargetedEditorialRevisionOperation.CREATE_TABLE.value,
+            "@@ BASE_ARTIFACT_HASH @@",
+            "f" * 64,
+            "@@ BEFORE_HASH @@",
+            before_hash,
+            "@@ AFTER @@",
+            patch_after,
+            "@@ RATIONALE @@",
+            "Modification manuelle validée par l’analyste.",  # noqa: RUF001
+            "@@ END @@",
+        )
+    )
+    preparation = EditorialProposalPreparation(
+        subject_id=subject_id,
+        production_run_id=uuid4(),
+        snapshot_id=uuid4(),
+        occurrence_id=anchor_id,
+        thread_id=None,
+        base_artifact_id=uuid4(),
+        base_artifact_version=1,
+        base_input_hash=extraction.production_input_hash,
+        base_canonical_sha256="f" * 64,
+        base_pin_hash="1" * 64,
+        routing_decision_hash=None,
+        target_id="registered-table-target",
+        target=target,
+        operation=TargetedEditorialRevisionOperation.CREATE_TABLE,
+        before_hash=before_hash,
+        base_content={"tables": []},
+        raw_response=raw_response,
+        model_run_id=None,
+        model_turn_id=None,
+        actor_id=uuid4(),
+        idempotency_key="manual-table-unit-wire-0001",
+        request_sha256="2" * 64,
+        enrichment_context={
+            "target_path": target_path,
+            "evidence_pack": evidence_pack,
+            "extraction": extraction,
+            "synthesis": synthesis,
+            "figure_catalog": (),
+        },
+        strict_wire=True,
+        origin=EditorialProposalOrigin.MANUAL_PATCH,
+    )
+    service = EditorialProposalService(uow_factory=object())
+
+    patch_payload, state, event_kind, diagnostics = service._validate_result(preparation)
+
+    assert state.value == expected_state
+    if expected_state == "proposed":
+        assert event_kind is EditorialProposalEventKind.PREPARED
+        assert patch_payload is not None
+        table_payload = patch_payload["enrichment_patch"]["tables"][0]
+        assert table_payload["title"] == "Inserted synthetic findings"
+        assert table_payload["caption"] == (
+            "Synthetic findings placed after the selected paragraph."
+        )
+        assert [row["cells"] for row in table_payload["rows"]] == [
+            ["Synthetic finding", "Synthetic test context."],
+            ["Synthetic finding", "The synthetic report records this finding."],
+        ]
+        assert table_payload["placement"]["anchor_block_id"] == str(anchor_id)
+        expected_ref = {
+            "source_document_id": str(evidence_ref.source_document_id),
+            "kind": evidence_ref.kind.value,
+            "evidence_key": evidence_ref.evidence_key,
+        }
+        assert patch_payload["evidence_refs"] == [expected_ref, expected_ref, expected_ref]
+        assert diagnostics == {}
+    else:
+        assert state is EditorialProposalState.NEEDS_REVIEW
+        assert expected_validator_code is not None
+        assert diagnostics["validator_code"] == expected_validator_code
+        assert diagnostics["reason"] == "manual_table:validator_rejected"
+        rejected = _manual_table_failure_from_diagnostics(
+            preparation,
+            "manual_edit_patch_invalid",
+            diagnostics,
+        )
+        assert rejected.validator_code == expected_validator_code
+        assert editorial_workspace_api._manual_table_validator_log_code(rejected) == (
+            expected_validator_code
+        )
+
+
 @pytest.mark.asyncio
 async def test_manual_table_patch_rejects_duplicate_normalized_analytic_question() -> None:
     from cti_app.application.editorial_proposals import EditorialProposalService
@@ -477,40 +764,16 @@ async def test_manual_table_patch_rejects_duplicate_normalized_analytic_question
         enrichment_input_hash="6" * 64,
         enrichment_canonical_sha256="7" * 64,
     )
-    entry = BlockRegistryEntry(
-        block_id=anchor,
-        kind=EditorialBlockKind.PARAGRAPH,
-        parent_block_id=None,
-        position=0,
-        content_sha256="8" * 64,
-        source_stage=EditorialSourceStage.SYNTHESIS,
-        structural_pointer="/sections/0/paragraphs/0",
+    workspace_service = EditorialWorkspaceService(
+        uow_factory=UnitOfWork,
+        artifact_store=object(),
     )
-    target = TargetedEditorialRevisionTarget(
-        kind=TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT,
-        element_kind=EditorialEnrichmentElementKind.TABLE,
-        element_key=None,
-        placement=TargetedEditorialRevisionPlacement(
-            kind=TargetedEditorialRevisionPlacementKind.AFTER_PARAGRAPH,
-            anchor_block_id=anchor,
-        ),
-    )
-
-    class WorkspaceService:
-        async def resolve_revision_target(self, **_kwargs):
-            return SimpleNamespace(
-                record=record,
-                occurrence=SimpleNamespace(entry=entry, binding_state="valid"),
-                target=target,
-                target_id="target-id",
-                before_hash=entry.content_sha256,
-            )
 
     service = EditorialProposalService(
         uow_factory=UnitOfWork,
         blob_store=object(),
         artifact_store=object(),
-        workspace_service=WorkspaceService(),
+        workspace_service=workspace_service,
         discussion_context_builder=ContextBuilder(),
     )
 
@@ -534,6 +797,140 @@ async def test_manual_table_patch_rejects_duplicate_normalized_analytic_question
     assert caught.value.frame is not None
     assert caught.value.frame.startswith("editorial_proposals.py:")
     assert caught.value.frame.endswith(":_prepare_manual_table_patch")
+
+
+@pytest.mark.asyncio
+async def test_manual_table_patch_uses_registered_path_from_real_workspace_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from typing import cast
+
+    from cti_app.application.editorial_proposals import (
+        EditorialProposalPreparation,
+        EditorialProposalService,
+    )
+    from cti_app.domain.editorial_proposal import (
+        EditorialProposal,
+        ManualPatch,
+        ManualTablePatch,
+    )
+    from cti_app.domain.production_synthesis import EvidenceKind, ExtractionEvidenceRefV1
+
+    anchor_entry, synthesis = _paragraph_registry_entry()
+    subject_id, production_run_id, snapshot_id = uuid4(), uuid4(), uuid4()
+    enrichment_artifact = ProductionArtifact(
+        production_run_id=production_run_id,
+        subject_id=subject_id,
+        stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+        version=1,
+        input_hash="6" * 64,
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=uuid4(),
+    )
+    record = _workspace_record(
+        subject_id=subject_id,
+        production_run_id=production_run_id,
+        synthesis_artifact_id=uuid4(),
+        synthesis_sha256=canonical_content_sha256(synthesis),
+        entries=(anchor_entry,),
+        enrichment_artifact=enrichment_artifact,
+        enrichment_sha256="7" * 64,
+    )
+    record = replace(
+        record,
+        snapshot_id=snapshot_id,
+        publication_kind=PublicationKind.ARTICLE,
+    )
+
+    class ProposalRepository:
+        async def get_by_idempotency_key(self, *_args):
+            return None
+
+    class UnitOfWork:
+        editorial_proposals = ProposalRepository()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    reference = ExtractionEvidenceRefV1(
+        uuid4(), EvidenceKind.FACT, hashlib.sha256(b"registered table evidence").hexdigest()
+    )
+    table = _table_spec(anchor_entry.block_id, (reference,))
+    enrichment_context = {
+        "anchor_block_id": str(anchor_entry.block_id),
+        "target_path": revision_target_path(anchor_entry),
+        "base_artifact_id": str(enrichment_artifact.id),
+        "base_artifact_version": enrichment_artifact.version,
+        "base_input_hash": enrichment_artifact.input_hash,
+        "base_canonical_sha256": "7" * 64,
+        "evidence_pack": SimpleNamespace(_handle_to_ref={"ev-1": reference}),
+        "base_content": {"tables": []},
+    }
+
+    class ContextBuilder:
+        async def build_manual(self, *_args):
+            return SimpleNamespace(
+                proposal_snapshot_id=snapshot_id,
+                proposal_operations=("create_table",),
+                proposal_enrichment_context=enrichment_context,
+            )
+
+    workspace_service = EditorialWorkspaceService(
+        uow_factory=UnitOfWork,
+        artifact_store=object(),
+    )
+
+    async def load_current(*_args, **_kwargs):
+        return {}, record, synthesis
+
+    monkeypatch.setattr(workspace_service, "_load_current", load_current)
+    resolutions: list[EditorialRevisionTargetResolution] = []
+    resolve_revision_target = workspace_service.resolve_revision_target
+
+    async def record_resolution(**kwargs):
+        resolved = await resolve_revision_target(**kwargs)
+        resolutions.append(resolved)
+        return resolved
+
+    monkeypatch.setattr(workspace_service, "resolve_revision_target", record_resolution)
+    service = EditorialProposalService(
+        uow_factory=UnitOfWork,
+        blob_store=object(),
+        artifact_store=object(),
+        workspace_service=workspace_service,
+        discussion_context_builder=ContextBuilder(),
+    )
+    preparations: list[EditorialProposalPreparation] = []
+
+    async def capture_preparation(
+        preparation: EditorialProposalPreparation, *, reject_invalid_manual: bool
+    ) -> EditorialProposal:
+        assert reject_invalid_manual
+        preparations.append(preparation)
+        return cast(EditorialProposal, preparation)
+
+    monkeypatch.setattr(service, "_prepare_result", capture_preparation)
+
+    await service.prepare_manual_patch(
+        subject_id=subject_id,
+        snapshot_id=snapshot_id,
+        occurrence_id=anchor_entry.block_id,
+        actor_id=uuid4(),
+        idempotency_key="manual-table-registered-path-0001",
+        patch=ManualPatch(
+            typed_patch=ManualTablePatch(anchor_block_id=anchor_entry.block_id, table=table)
+        ),
+    )
+
+    assert len(resolutions) == 1
+    assert isinstance(resolutions[0], EditorialRevisionTargetResolution)
+    assert resolutions[0].occurrence.entry is anchor_entry
+    assert len(preparations) == 1
+    assert f"@@ TARGET @@\n{revision_target_path(anchor_entry)}\n" in preparations[0].raw_response
+    assert preparations[0].target == resolutions[0].target
 
 
 @pytest.mark.asyncio
@@ -620,6 +1017,7 @@ async def test_manual_table_route_returns_stable_question_collision_error(
         caplog.text
     )
     assert "reason=manual_table:validator_rejected" in caplog.text
+    assert "validator_code=none" in caplog.text
     assert "frame=test_editorial_table_insertion.py:" in caplog.text
 
 

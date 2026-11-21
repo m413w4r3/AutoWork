@@ -121,6 +121,13 @@ def _manual_table_frame(error: BaseException, attached: object = None) -> str:
     return _caller_frame()
 
 
+def _manual_table_validator_log_code(error: BaseException | None = None) -> str:
+    value = getattr(error, "validator_code", None)
+    if isinstance(value, str) and re.fullmatch(r"[a-z][a-z0-9_]{2,}", value):
+        return value
+    return "none"
+
+
 def _manual_table_request_diagnostics(
     error: RequestValidationError,
 ) -> tuple[EditorialTableDiagnosticReason, str]:
@@ -228,10 +235,12 @@ class EditorialWorkspaceRoute(APIRoute):
                 elif is_manual_table_proposal:
                     reason, frame = _manual_table_request_diagnostics(error)
                     logger.warning(
-                        "manual_table_proposal_rejected code=%s reason=%s frame=%s "
+                        "manual_table_proposal_rejected code=%s reason=%s validator_code=%s "
+                        "frame=%s "
                         "subject_id=%s occurrence_id=%s",
                         "manual_table_request_invalid",
                         reason.value,
+                        "none",
                         frame,
                         request.path_params.get("subject_id", "unknown"),
                         request.path_params.get("occurrence_id", "unknown"),
@@ -2108,10 +2117,11 @@ async def prepare_manual_editorial_table_proposal(
     except EditorialProposalConflict as error:
         frame = _manual_table_frame(error)
         logger.warning(
-            "manual_table_proposal_rejected code=%s reason=%s frame=%s "
+            "manual_table_proposal_rejected code=%s reason=%s validator_code=%s frame=%s "
             "subject_id=%s occurrence_id=%s",
             error.code,
             EditorialTableDiagnosticReason.IDEMPOTENCY_CONFLICT.value,
+            _manual_table_validator_log_code(error),
             frame,
             subject_id,
             occurrence_id,
@@ -2139,10 +2149,11 @@ async def prepare_manual_editorial_table_proposal(
             reason = EditorialTableDiagnosticReason.VALIDATOR_REJECTED
         frame = _manual_table_frame(error, getattr(error, "frame", None))
         logger.warning(
-            "manual_table_proposal_rejected code=%s reason=%s frame=%s "
+            "manual_table_proposal_rejected code=%s reason=%s validator_code=%s frame=%s "
             "subject_id=%s occurrence_id=%s",
             code,
             reason.value,
+            _manual_table_validator_log_code(error),
             frame,
             subject_id,
             occurrence_id,

@@ -320,13 +320,20 @@ async def test_manual_table_patch_accept_publishes_table_at_registered_anchor(
                         {
                             "cells": ["Synthetic finding", "Synthetic test context."],
                             "evidence_refs": [evidence_ref],
-                        }
+                        },
+                        {
+                            "cells": [
+                                "Synthetic finding",
+                                "The synthetic report records this finding.",
+                            ],
+                            "evidence_refs": [evidence_ref],
+                        },
                     ],
                     "purpose": {
                         "question": "Which source passage supports this finding?",
-                        "available_data": "The cited synthetic source passage.",
-                        "comprehension_gain": "Inspect the cited passage beside the finding.",
-                        "scope": "Only the synthetic finding and its cited passage.",
+                        "available_data": "The cited synthetic finding and its source context.",
+                        "comprehension_gain": "Compare source context beside the finding.",
+                        "scope": "Only the synthetic finding and its cited source context.",
                         "evidence_refs": [evidence_ref],
                         "knowledge_limits": "No other source detail is represented.",
                         "placement_reason": "Keep the table after its anchor paragraph.",
@@ -423,6 +430,13 @@ async def test_manual_table_patch_accept_publishes_table_at_registered_anchor(
         enrichment_artifact_id=current.id,
     )
     inserted = next(item for item in enrichment.tables if item.key == table_key)
+    assert inserted.title == "Inserted synthetic findings"
+    assert inserted.caption == "Synthetic findings placed after the selected paragraph."
+    assert [row.cells for row in inserted.rows] == [
+        ("Synthetic finding", "Synthetic test context."),
+        ("Synthetic finding", "The synthetic report records this finding."),
+    ]
+    assert all(row.evidence_refs == (evidence,) for row in inserted.rows)
     assert len(placements) == 1
     assert placements[0].element_key == inserted.key
     assert placements[0].anchor_block_id == anchor_id
@@ -486,7 +500,13 @@ async def test_manual_table_patch_accept_publishes_table_at_registered_anchor(
         await ProductionArtifactStore(catalog).read_json(assembly.artifact.canonical_blob_id)
     )
     assert isinstance(document, PublicationDocumentV9)
-    assert any(table.key == inserted.key for table in document.tables)
+    published_table = next(table for table in document.tables if table.key == inserted.key)
+    assert published_table.title == inserted.title
+    assert published_table.caption == inserted.caption
+    assert [row.cells for row in published_table.rows] == [
+        ("Synthetic finding", "Synthetic test context."),
+        ("Synthetic finding", "The synthetic report records this finding."),
+    ]
     published_placement = next(
         item for item in document.resolved_placements if item.element_key == inserted.key
     )
