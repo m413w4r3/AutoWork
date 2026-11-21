@@ -12,9 +12,18 @@ from cti_app.api import main as api_main
 from cti_app.api.main import create_app
 from cti_app.application.blob_storage import BlobStore
 from cti_app.application.blobs import BlobCatalogService
+from cti_app.application.editorial_proposal_adoption import (
+    EditorialProposalAdoptionError,
+    EditorialProposalAdoptionService,
+)
+from cti_app.application.editorial_workspace.service import EditorialWorkspaceService
 from cti_app.application.identity import LocalIdentityProvider
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_stages import (
+    EditorialEnrichmentService,
+    SynthesisService,
+)
 from cti_app.config import Settings
 from cti_app.domain.production import (
     ProductionArtifact,
@@ -277,3 +286,107 @@ async def test_forged_write_on_read_only_context_writes_no_proposal_or_revision(
         )
     assert [item.id for item in proposals_after] == [item.id for item in proposals_before]
     assert artifacts_after == artifacts_before
+
+
+@pytest.mark.asyncio
+async def test_accept_of_existing_proposal_on_context_become_read_only_writes_no_version(
+    uow_factory: UnitOfWorkFactory,
+) -> None:
+    from cti_app.domain.editorial_proposal import EditorialProposalState
+    from cti_app.domain.production_synthesis import production_synthesis_to_json
+
+    seeded = await _seed(uow_factory, proposal_count=1)
+    proposal = seeded.proposals[0]
+    blob_store = cast(BlobStore, seeded.blob_store)
+    artifact_store = ProductionArtifactStore(BlobCatalogService(blob_store, uow_factory))
+    workspace = EditorialWorkspaceService(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+    )
+
+    # The preparation-time context is editable: a current V8 publication resolves
+    # the kind while the pinned synthesis format is supported.
+    publication_blob_id, _publication_sha = await artifact_store.put_canonical_json(
+        _legacy_documents()[-1], bucket="production-artifacts-canonical"
+    )
+    publication = ProductionArtifact(
+        production_run_id=seeded.run.id,
+        subject_id=seeded.subject.id,
+        stage=ProductionArtifactStage.PUBLICATION,
+        version=1,
+        status=ProductionArtifactStatus.VERIFIED,
+        input_hash=hashlib.sha256(b"read-only-flip-current-publication").hexdigest(),
+        canonical_blob_id=publication_blob_id,
+    )
+    async with uow_factory() as uow:
+        await uow.production_artifacts.append(publication)
+        await uow.commit()
+
+    editable_snapshot = await workspace.snapshot(seeded.subject.id)
+    assert editable_snapshot["capabilities"]["read_only_reason"] is None
+
+    # The context becomes read-only after preparation: the current synthesis now
+    # uses an unsupported pinned editor format.
+    unsupported_payload = production_synthesis_to_json(seeded.synthesis)
+    unsupported_payload["schema_version"] = "1"
+    unsupported_blob_id, _unsupported_sha = await artifact_store.put_canonical_json(
+        unsupported_payload, bucket="production-artifacts-canonical"
+    )
+    unsupported_synthesis = ProductionArtifact(
+        production_run_id=seeded.run.id,
+        subject_id=seeded.subject.id,
+        stage=ProductionArtifactStage.SYNTHESIS,
+        version=seeded.base_artifact.version + 1,
+        status=ProductionArtifactStatus.VERIFIED,
+        input_hash=seeded.base_artifact.input_hash,
+        canonical_blob_id=unsupported_blob_id,
+    )
+    async with uow_factory() as uow:
+        await uow.production_artifacts.append(unsupported_synthesis)
+        await uow.commit()
+
+    read_only_snapshot = await workspace.snapshot(seeded.subject.id)
+    assert read_only_snapshot["capabilities"]["read_only_reason"] == "format_not_editable"
+
+    service = EditorialProposalAdoptionService(
+        uow_factory=uow_factory,
+        blob_store=blob_store,
+        artifact_store=artifact_store,
+        workspace_service=workspace,
+        inputs=seeded.inputs,
+        synthesis_writer=SynthesisService(uow_factory, artifact_store),
+        enrichment_writer=EditorialEnrichmentService(uow_factory, artifact_store),
+    )
+    async with uow_factory() as uow:
+        artifacts_before = sorted(
+            (item.id, item.version)
+            for item in await uow.production_artifacts.list_for_run(seeded.run.id)
+        )
+    puts_before = seeded.blob_store.put_calls
+
+    with pytest.raises(EditorialProposalAdoptionError) as caught:
+        await service.adopt(
+            proposal.subject_id,
+            proposal.occurrence_id,
+            proposal.id,
+            actor_id=seeded.actor_id,
+            expected_state_version=1,
+            patch_sha256=seeded.patch_sha256,
+            idempotency_key=f"accept-read-only-{proposal.id.hex}",
+        )
+
+    assert caught.value.code == "editorial_read_only"
+    assert caught.value.reason == "format_not_editable"
+    assert seeded.blob_store.put_calls == puts_before
+    async with uow_factory() as uow:
+        artifacts_after = sorted(
+            (item.id, item.version)
+            for item in await uow.production_artifacts.list_for_run(seeded.run.id)
+        )
+        current = await uow.editorial_proposals.get_for_occurrence(
+            proposal.subject_id, proposal.occurrence_id, proposal.id
+        )
+    assert artifacts_after == artifacts_before
+    assert current is not None
+    assert current.state is EditorialProposalState.PROPOSED
+    assert current.state_version == 1

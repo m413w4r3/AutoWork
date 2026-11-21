@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID, uuid4
@@ -74,7 +75,7 @@ def test_v4_to_v8_exact_readers_have_no_write_capabilities(
             return self.payloads[blob_id]
 
         async def read_json(self, blob_id: UUID) -> dict[str, Any]:
-            return json.loads(self.payloads[blob_id])
+            return cast(dict[str, Any], json.loads(self.payloads[blob_id]))
 
     class _UowContext:
         def __init__(self, uow: SimpleNamespace) -> None:
@@ -583,6 +584,238 @@ def test_manual_table_prepare_refuses_read_only_context_before_any_write(
         assert caught.value.code == "editorial_read_only"
         assert caught.value.reason == "format_not_editable"
         assert setup.repository.records == []
+
+    asyncio.run(exercise())
+
+
+def test_manual_bar_chart_prepare_refuses_read_only_context_before_any_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cti_app.application.editorial_proposals import EditorialProposalApplicationError
+    from cti_app.domain.editorial_proposal import ManualBarChartPatch, ManualPatch
+    from cti_app.domain.production_editorial_enrichment import (
+        EnrichmentPlacementKind,
+        EnrichmentPlacementV1,
+    )
+    from tests.test_editorial_bar_chart import _bar_chart
+    from tests.test_editorial_proposal_preparation import _setup
+
+    setup = _setup()
+    workspace, subject_id = _read_only_workspace(monkeypatch)
+
+    class ContextBuilder:
+        async def build_manual(self, *_args: object) -> None:
+            raise AssertionError("A read-only context must refuse before the discussion context")
+
+    async def exercise() -> None:
+        snapshot = await workspace.snapshot(subject_id)
+        paragraph = next(block for block in snapshot["blocks"] if block["kind"] == "paragraph")
+        anchor_id = UUID(str(paragraph["block_id"]))
+        chart = replace(
+            _bar_chart(),
+            placement=EnrichmentPlacementV1(
+                EnrichmentPlacementKind.AFTER_PARAGRAPH,
+                anchor_block_id=anchor_id,
+            ),
+        )
+        setup.service._artifact_store = object()
+        setup.service._workspace_service = workspace
+        setup.service._discussion_context_builder = ContextBuilder()
+
+        with pytest.raises(EditorialProposalApplicationError) as caught:
+            await setup.service.prepare_manual_patch(
+                subject_id=subject_id,
+                snapshot_id=UUID(str(snapshot["snapshot_id"])),
+                occurrence_id=anchor_id,
+                actor_id=uuid4(),
+                idempotency_key="manual-bar-chart-readonly-0001",
+                patch=ManualPatch(
+                    typed_patch=ManualBarChartPatch(anchor_block_id=anchor_id, chart=chart)
+                ),
+            )
+        assert caught.value.code == "editorial_read_only"
+        assert caught.value.reason == "format_not_editable"
+        assert setup.repository.records == []
+
+    asyncio.run(exercise())
+
+
+def _figure_preparation_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Any, Any, UUID, UUID, Any, Any]:
+    from cti_app.domain.editorial_proposal import (
+        ManualSourceFigurePatch,
+        ManualSourceFigureSelection,
+    )
+    from tests.test_editorial_figure_adoption import _catalog_item
+    from tests.test_editorial_proposal_preparation import _setup
+
+    setup = _setup()
+    workspace, subject_id = _read_only_workspace(monkeypatch)
+    item = _catalog_item()
+    typed_patch = ManualSourceFigurePatch(
+        anchor_block_id=uuid4(),
+        figures=(
+            ManualSourceFigureSelection(
+                figure_id=UUID(item.figure_id),
+                caption="Synthetic archived caption",
+                order=0,
+            ),
+        ),
+    )
+    return setup, workspace, subject_id, UUID(item.figure_id), item, typed_patch
+
+
+def test_manual_source_figure_prepare_refuses_read_only_context_before_any_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cti_app.application.editorial_proposals import EditorialProposalApplicationError
+    from cti_app.domain.editorial_proposal import ManualPatch
+
+    setup, workspace, subject_id, figure_id, item, template = _figure_preparation_context(
+        monkeypatch
+    )
+
+    class FigureCatalog:
+        async def resolve_many_for_insertion(
+            self, *, figure_ids: tuple[UUID, ...], **_kwargs: object
+        ):
+            assert figure_ids == (figure_id,)
+            return (item,)
+
+    class ContextBuilder:
+        async def build_manual(self, *_args: object) -> None:
+            raise AssertionError("A read-only context must refuse before the discussion context")
+
+    async def exercise() -> None:
+        snapshot = await workspace.snapshot(subject_id)
+        paragraph = next(block for block in snapshot["blocks"] if block["kind"] == "paragraph")
+        anchor_id = UUID(str(paragraph["block_id"]))
+        setup.service._artifact_store = object()
+        setup.service._workspace_service = workspace
+        setup.service._figure_catalog_service = FigureCatalog()
+        setup.service._discussion_context_builder = ContextBuilder()
+
+        with pytest.raises(EditorialProposalApplicationError) as caught:
+            await setup.service.prepare_manual_patch(
+                subject_id=subject_id,
+                snapshot_id=UUID(str(snapshot["snapshot_id"])),
+                occurrence_id=anchor_id,
+                actor_id=uuid4(),
+                idempotency_key="manual-figure-readonly-0001",
+                patch=ManualPatch(typed_patch=replace(template, anchor_block_id=anchor_id)),
+            )
+        assert caught.value.code == "editorial_read_only"
+        assert caught.value.reason == "format_not_editable"
+        assert setup.repository.records == []
+
+    asyncio.run(exercise())
+
+
+def test_manual_source_figure_replay_on_read_only_context_returns_existing_proposal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cti_app.application.editorial_figure_catalog import (
+        archive_reference_for_catalog_item,
+    )
+    from cti_app.application.editorial_proposals import (
+        _manual_figure_request_sha256,
+        _manual_idempotency_key,
+    )
+    from cti_app.domain.editorial_proposal import (
+        EditorialProposal,
+        EditorialProposalOrigin,
+        EditorialProposalState,
+        ManualPatch,
+    )
+
+    setup, workspace, subject_id, figure_id, item, template = _figure_preparation_context(
+        monkeypatch
+    )
+    client_key = "manual-figure-replay-readonly-0001"
+
+    class FigureCatalog:
+        async def resolve_many_for_insertion(
+            self, *, figure_ids: tuple[UUID, ...], **_kwargs: object
+        ):
+            assert figure_ids == (figure_id,)
+            return (item,)
+
+    class ContextBuilder:
+        async def build_manual(self, *_args: object) -> None:
+            raise AssertionError("An idempotent replay must return before rebuilding the context")
+
+    guard_calls: list[tuple[UUID, UUID]] = []
+    resolve_occurrence = workspace.resolve_occurrence
+
+    async def record_guard(*args: Any, **kwargs: Any) -> Any:
+        guard_calls.append((args[0], args[1]))
+        return await resolve_occurrence(*args, **kwargs)
+
+    monkeypatch.setattr(workspace, "resolve_occurrence", record_guard)
+
+    async def exercise() -> None:
+        snapshot = await workspace.snapshot(subject_id)
+        paragraph = next(block for block in snapshot["blocks"] if block["kind"] == "paragraph")
+        anchor_id = UUID(str(paragraph["block_id"]))
+        snapshot_id = UUID(str(snapshot["snapshot_id"]))
+        typed_patch = replace(template, anchor_block_id=anchor_id)
+        reference = archive_reference_for_catalog_item(item)
+        request_sha256 = _manual_figure_request_sha256(
+            subject_id=subject_id,
+            snapshot_id=snapshot_id,
+            occurrence_id=anchor_id,
+            figures=typed_patch.figures,
+            references=(reference,),
+        )
+        existing = EditorialProposal(
+            id=uuid4(),
+            subject_id=subject_id,
+            production_run_id=uuid4(),
+            origin=EditorialProposalOrigin.MANUAL_PATCH,
+            snapshot_id=snapshot_id,
+            occurrence_id=anchor_id,
+            base_artifact_id=uuid4(),
+            base_artifact_version=1,
+            base_input_hash="1" * 64,
+            base_canonical_sha256="2" * 64,
+            base_routing_hash=None,
+            base_pin_hash="3" * 64,
+            target_id="synthetic-source-figure",
+            operation="create_source_figure",
+            before_hash="4" * 64,
+            patch_blob_ref=uuid4(),
+            patch_sha256="5" * 64,
+            evidence_refs=(),
+            diagnostics={},
+            thread_id=None,
+            variant_group_id=uuid4(),
+            model_run_id=None,
+            model_turn_id=None,
+            state=EditorialProposalState.PROPOSED,
+            state_version=1,
+            actor_id=uuid4(),
+            idempotency_key=_manual_idempotency_key("prepare", client_key),
+            request_sha256=request_sha256,
+        )
+        setup.repository.records.append(existing)
+        setup.service._artifact_store = object()
+        setup.service._workspace_service = workspace
+        setup.service._figure_catalog_service = FigureCatalog()
+        setup.service._discussion_context_builder = ContextBuilder()
+
+        result = await setup.service.prepare_manual_patch(
+            subject_id=subject_id,
+            snapshot_id=snapshot_id,
+            occurrence_id=anchor_id,
+            actor_id=existing.actor_id,
+            idempotency_key=client_key,
+            patch=ManualPatch(typed_patch=typed_patch),
+        )
+
+        assert result is existing
+        assert guard_calls == []
+        assert setup.repository.records == [existing]
 
     asyncio.run(exercise())
 

@@ -2,9 +2,10 @@
 
 Every active scenario UX-01..UX-18 and UX-20 must name at least one real,
 collectable test. UX-19 is abandoned by DECISIONS.md D9 (desktop-only UI) and
-carries no fake test. The visual review capture is written in a parallel
-worktree (T-M7-29): it is an explicit external reference that this integration
-gate does not resolve yet.
+carries no fake test. The same `path::name` references must appear in the
+"Matrice de couverture UX" table of TICKETS.md, and no referenced test may be
+disabled by `.only`, `.skip`, `.fixme`, `.failing`, `describe.skip`, `skip` or
+`xfail`.
 """
 
 from __future__ import annotations
@@ -14,13 +15,15 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+_TICKETS_DOCUMENT = "docs/design/atelier-editorial/TICKETS.md"
+_MATRIX_HEADING = "## Matrice de couverture UX"
+
 
 @dataclass(frozen=True)
 class CoverageReference:
     path: str
     name: str
     kind: str
-    external_ticket: str | None = None
 
     @property
     def label(self) -> str:
@@ -39,9 +42,6 @@ VISUAL_REVIEW = CoverageReference(
     path="frontend/e2e/editorial/visual-review.spec.ts",
     name="test_visual_review_captures_desktop_and_states",
     kind="e2e",
-    # Written by another agent in a parallel worktree. This exact reference is
-    # the only one allowed to stay external to the current integration.
-    external_ticket="T-M7-29",
 )
 
 UX_19_ABANDONED = (
@@ -454,59 +454,162 @@ UX_COVERAGE: dict[str, ScenarioCoverage] = {
     ),
 }
 
-_SKIPPED_MARKERS = frozenset({"skip", "skipif", "xfail"})
+_PYTHON_DISABLED_MARKERS = frozenset({"skip", "skipif", "xfail"})
+_TS_DISABLED_MODIFIERS = frozenset({"only", "skip", "fixme", "failing", "todo"})
 _TS_TEST_TITLE = re.compile(
     r"(?<![\w.])(?:test|it)"
     r"(?P<modifiers>(?:\.(?:only|concurrent|sequential|failing|todo|skip|each))*)"
     r"\s*\(\s*(?P<quote>['\"`])(?P<title>.*?)(?P=quote)",
     re.DOTALL,
 )
+_TS_DESCRIBE = re.compile(
+    r"(?<![\w.])(?:test\s*\.\s*)?describe\s*(?:\.\s*(?P<modifier>only|skip|fixme))?\s*\("
+)
+_UX_ROW = re.compile(r"^\|\s*(?P<scenario>UX-\d{2})\s*\|\s*(?P<body>.*?)\s*\|\s*$")
+_MARKDOWN_REF = re.compile(r"`([^`]+::[^`]+)`")
 
 
-def _decorator_tail(node: ast.expr) -> str:
-    if isinstance(node, ast.Call):
-        return _decorator_tail(node.func)
-    if isinstance(node, ast.Attribute):
-        return node.attr
-    if isinstance(node, ast.Name):
-        return node.id
-    return ""
+def _marked_disabled(node: ast.expr) -> bool:
+    return any(
+        isinstance(child, ast.Attribute) and child.attr in _PYTHON_DISABLED_MARKERS
+        for child in ast.walk(node)
+    )
 
 
-def _python_test_names(source: str) -> set[str]:
-    names: set[str] = set()
-    for node in ast.parse(source).body:
+def _python_module_is_disabled(tree: ast.Module) -> bool:
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        else:
+            continue
+        if any(isinstance(target, ast.Name) and target.id == "pytestmark" for target in targets):
+            return node.value is not None and _marked_disabled(node.value)
+    return False
+
+
+def _python_test_sources(source: str) -> tuple[set[str], set[str]]:
+    tree = ast.parse(source)
+    declared: set[str] = set()
+    disabled: set[str] = set()
+    module_disabled = _python_module_is_disabled(tree)
+    for node in tree.body:
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         if not node.name.startswith("test_"):
             continue
-        if any(_decorator_tail(item) in _SKIPPED_MARKERS for item in node.decorator_list):
+        declared.add(node.name)
+        if module_disabled or any(_marked_disabled(item) for item in node.decorator_list):
+            disabled.add(node.name)
+    return declared, disabled
+
+
+def _matching_paren(source: str, opening: int) -> int:
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    index = opening
+    while index < len(source):
+        char = source[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+        elif char in {"'", '"', "`"}:
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return len(source)
+
+
+def _typescript_describe_spans(source: str) -> list[tuple[int, int, str]]:
+    spans: list[tuple[int, int, str]] = []
+    for match in _TS_DESCRIBE.finditer(source):
+        spans.append(
+            (
+                match.start(),
+                _matching_paren(source, match.end() - 1),
+                match.group("modifier") or "",
+            )
+        )
+    return spans
+
+
+def _typescript_test_sources(source: str) -> tuple[set[str], set[str]]:
+    matches = list(_TS_TEST_TITLE.finditer(source))
+    declared = {match.group("title") for match in matches}
+    disabled: set[str] = set()
+    focused: set[str] = set()
+    for match in matches:
+        modifiers = {part for part in match.group("modifiers").split(".") if part}
+        if modifiers & _TS_DISABLED_MODIFIERS:
+            disabled.add(match.group("title"))
+        if "only" in modifiers:
+            focused.add(match.group("title"))
+    for start, end, modifier in _typescript_describe_spans(source):
+        if modifier not in {"only", "skip", "fixme"}:
             continue
-        names.add(node.name)
-    return names
+        for match in matches:
+            if start <= match.start() <= end:
+                if modifier == "only":
+                    focused.add(match.group("title"))
+                else:
+                    disabled.add(match.group("title"))
+    if focused:
+        # A focused test silently skips every sibling declared in the same file.
+        disabled.update(declared - focused)
+    return declared, disabled
 
 
-def _typescript_test_titles(source: str) -> set[str]:
-    titles: set[str] = set()
-    for match in _TS_TEST_TITLE.finditer(source):
-        modifiers = match.group("modifiers")
-        if any(marker in modifiers for marker in (".skip", ".todo", ".each")):
-            continue
-        titles.add(match.group("title"))
-    return titles
-
-
-def _declared_tests(reference: CoverageReference, source: str) -> set[str]:
+def _test_sources(reference: CoverageReference, source: str) -> tuple[set[str], set[str]]:
     if reference.path.endswith(".py"):
-        return _python_test_names(source)
-    return _typescript_test_titles(source)
+        return _python_test_sources(source)
+    return _typescript_test_sources(source)
+
+
+def _ux_matrix_section(repository_root: Path) -> str:
+    document = (repository_root / _TICKETS_DOCUMENT).read_text(encoding="utf-8")
+    try:
+        start = document.index(_MATRIX_HEADING)
+    except ValueError:
+        raise AssertionError(f"{_TICKETS_DOCUMENT} has no {_MATRIX_HEADING!r} section") from None
+    end = document.find("\n## ", start + len(_MATRIX_HEADING))
+    return document[start:] if end < 0 else document[start:end]
+
+
+def _documented_matrix_refs(section: str) -> dict[str, set[str]]:
+    refs: dict[str, set[str]] = {}
+    for line in section.splitlines():
+        row = _UX_ROW.match(line)
+        if row is None:
+            continue
+        refs[row.group("scenario")] = set(_MARKDOWN_REF.findall(row.group("body")))
+    return refs
 
 
 def test_editorial_ux_matrix_has_all_twenty_scenarios() -> None:
     expected = {f"UX-{number:02d}" for number in range(1, 21)}
     assert set(UX_COVERAGE) == expected
-    assert VISUAL_REVIEW.external_ticket == "T-M7-29"
     repository_root = Path(__file__).resolve().parents[2]
+    section = _ux_matrix_section(repository_root)
+    documented = _documented_matrix_refs(section)
+    assert set(documented) == expected, (
+        "TICKETS.md UX matrix rows differ from the executable matrix: "
+        f"missing rows={sorted(expected - set(documented))}, "
+        f"extra rows={sorted(set(documented) - expected)}"
+    )
+    assert VISUAL_REVIEW.label in section, (
+        f"TICKETS.md must document the visual review capture {VISUAL_REVIEW.label}"
+    )
 
     for scenario_id, coverage in UX_COVERAGE.items():
         if coverage.abandoned_reason is not None:
@@ -516,31 +619,44 @@ def test_editorial_ux_matrix_has_all_twenty_scenarios() -> None:
             assert "desktop" in coverage.abandoned_reason
             assert coverage.tests == ()
             assert coverage.visual_review is None
-            continue
-
-        assert coverage.tests, f"{scenario_id} has no test references"
-        assert coverage.visual_review is VISUAL_REVIEW
-        assert len(set(coverage.tests)) == len(coverage.tests), (
-            f"{scenario_id} repeats a test reference"
-        )
-        assert any(test.kind in {"e2e", "ui"} for test in coverage.tests), (
-            f"{scenario_id} needs a UI or end-to-end test"
-        )
-        assert any(test.kind in {"e2e", "integration"} for test in coverage.tests), (
-            f"{scenario_id} needs an end-to-end or integration test"
-        )
-        if coverage.requires_backend:
-            assert any(test.kind in {"backend", "integration"} for test in coverage.tests), (
-                f"{scenario_id} needs a backend or integration test"
+            expected_refs: set[str] = set()
+        else:
+            assert coverage.tests, f"{scenario_id} has no test references"
+            assert coverage.visual_review is VISUAL_REVIEW
+            assert len(set(coverage.tests)) == len(coverage.tests), (
+                f"{scenario_id} repeats a test reference"
             )
+            assert any(test.kind in {"e2e", "ui"} for test in coverage.tests), (
+                f"{scenario_id} needs a UI or end-to-end test"
+            )
+            assert any(test.kind in {"e2e", "integration"} for test in coverage.tests), (
+                f"{scenario_id} needs an end-to-end or integration test"
+            )
+            if coverage.requires_backend:
+                assert any(test.kind in {"backend", "integration"} for test in coverage.tests), (
+                    f"{scenario_id} needs a backend or integration test"
+                )
+            expected_refs = {reference.label for reference in coverage.tests}
+
+        assert documented[scenario_id] == expected_refs, (
+            f"{scenario_id} references differ between TICKETS.md and the executable matrix: "
+            f"missing from TICKETS.md={sorted(expected_refs - documented[scenario_id])}, "
+            f"extra in TICKETS.md={sorted(documented[scenario_id] - expected_refs)}"
+        )
 
         for reference in (*coverage.tests, coverage.visual_review):
-            if reference.external_ticket is not None:
-                assert reference is VISUAL_REVIEW
+            if reference is None:
                 continue
             source_path = repository_root / reference.path
             assert source_path.is_file(), f"{scenario_id} references missing {reference.path}"
             source = source_path.read_text(encoding="utf-8")
-            assert reference.name in _declared_tests(reference, source), (
-                f"{scenario_id} references missing test {reference.label}"
+            declared, disabled = _test_sources(reference, source)
+            assert reference.name in declared, (
+                f"{scenario_id} references missing test {reference.label}; "
+                f"declared tests in {reference.path}: {sorted(declared)}"
+            )
+            assert reference.name not in disabled, (
+                f"{scenario_id} references a disabled test {reference.label} "
+                "(only/skip/fixme/failing/todo/xfail); "
+                f"disabled tests in {reference.path}: {sorted(disabled)}"
             )

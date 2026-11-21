@@ -513,8 +513,13 @@ test("two identical paragraphs stay distinct selectable occurrences", async ({
       return;
     }
     const threadPrefix = `${subjectPath}/editor/threads/`;
-    if (method === "GET" && url.pathname.startsWith(threadPrefix)) {
-      const occurrence = url.pathname.slice(threadPrefix.length);
+    const occurrence = url.pathname.startsWith(threadPrefix)
+      ? url.pathname.slice(threadPrefix.length)
+      : null;
+    if (
+      method === "GET" &&
+      (occurrence === firstDuplicateId || occurrence === secondDuplicateId)
+    ) {
       const etag = '"duplicate-occurrence-thread"';
       const binding = {
         subject_id: snapshot.subject_id,

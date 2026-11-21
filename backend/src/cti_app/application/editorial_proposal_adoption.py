@@ -826,6 +826,12 @@ class EditorialProposalAdoptionService:
                 )
             except Exception:
                 resolution = None
+            if resolution is not None and resolution.read_only_reason is not None:
+                # The pre-lock check can race with a policy flip; refuse the same
+                # read-only contexts under the lock, before any write.
+                raise EditorialProposalAdoptionError(
+                    "editorial_read_only", reason=resolution.read_only_reason.value
+                )
             if resolution is None or not _proposal_pins_match(locked, resolution):
                 stale_event = _state_event(
                     locked,

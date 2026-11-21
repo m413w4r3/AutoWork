@@ -16,6 +16,7 @@ import pytest
 from fastapi import FastAPI
 
 from cti_app.api import editorial_workspace as editorial_workspace_api
+from cti_app.application.editorial_legacy_read_only import EditorialLegacyReadOnlyReason
 from cti_app.application.editorial_proposal_adoption import (
     EditorialProposalAdoptionError,
     EditorialProposalAdoptionInputs,
@@ -946,6 +947,46 @@ async def test_adopt_does_not_relabel_unexpected_workspace_failure_as_stale(
 
     with pytest.raises(RuntimeError, match="Synthetic workspace programming failure"):
         await fixture.adopt()
+
+
+@pytest.mark.asyncio
+async def test_policy_turned_read_only_under_lock_refuses_acceptance_without_writes() -> None:
+    fixture = _fixture()
+    editable = cast(WorkspaceOccurrenceResolution, fixture.service._workspace_service.resolution)
+    read_only = replace(
+        editable,
+        read_only_reason=EditorialLegacyReadOnlyReason.FORMAT_NOT_EDITABLE,
+    )
+
+    class _FlipWorkspace(_MemoryWorkspace):
+        def __init__(self) -> None:
+            super().__init__(editable)
+            self.in_uow_calls = 0
+
+        async def resolve_occurrence_in_uow(
+            self, _uow: Any, _subject_id: UUID, _occurrence_id: UUID
+        ) -> WorkspaceOccurrenceResolution:
+            self.in_uow_calls += 1
+            return read_only
+
+    workspace = _FlipWorkspace()
+    fixture.service._workspace_service = workspace
+
+    with pytest.raises(EditorialProposalAdoptionError) as caught:
+        await fixture.adopt()
+
+    assert caught.value.code == "editorial_read_only"
+    assert caught.value.reason == "format_not_editable"
+    assert workspace.in_uow_calls == 1
+    assert fixture.inputs.revalidated == 0
+    assert fixture.factory.commits == 0
+    state = fixture.factory.state
+    stored = state.proposals[fixture.proposal.id]
+    assert stored.state is EditorialProposalState.PROPOSED
+    assert stored.state_version == 1
+    assert set(state.artifacts) == {fixture.proposal.base_artifact_id}
+    assert state.impacts == {}
+    assert state.events == []
 
 
 @pytest.mark.asyncio
