@@ -75,6 +75,122 @@ describe("EditorialProposalCard", () => {
     );
   });
 
+  it("shows a structured table insertion with its anchor and consultable evidence", async () => {
+    const proposal = {
+      id: "proposal-table",
+      subject_id: "subject-1",
+      production_run_id: "run-1",
+      occurrence_id: "anchor-1",
+      thread_id: null,
+      origin: "manual_patch",
+      state: "proposed",
+      state_version: 1,
+      operation: "create_table",
+      base_artifact_id: "enrichment-1",
+      base_artifact_version: 2,
+      base_canonical_sha256: "a".repeat(64),
+      base_text: null,
+      patch_sha256: "b".repeat(64),
+      patch: {
+        schema_version: "editorial-patch-v1",
+        operation: "create_table",
+        target: {
+          kind: "enrichment_element",
+          placement: {
+            kind: "after_paragraph",
+            anchor_block_id: "anchor-1",
+          },
+        },
+        target_id: "target-table-1",
+        occurrence_id: "anchor-1",
+        before_hash: "c".repeat(64),
+        rationale: "Insertion manuelle fondée sur les preuves choisies.",
+        enrichment_patch: {
+          tables: [
+            {
+              key: "table-1",
+              kind: "custom",
+              title: "Résumé synthétique",
+              caption: "Informations rapportées",
+              columns: [
+                { key: "item", label: "Élément" },
+                { key: "value", label: "Valeur" },
+              ],
+              rows: [
+                {
+                  cells: ["Échantillon", "Confirmé"],
+                  evidence_handles: ["fact-1"],
+                },
+              ],
+              placement: {
+                kind: "after_paragraph",
+                anchor_block_id: "anchor-1",
+              },
+              purpose: {
+                question: "Quelles informations sont rapportées ?",
+                available_data: "Informations du passage.",
+                comprehension_gain: "Lecture structurée.",
+                scope: "Paragraphe d’ancrage.",
+                evidence_handles: ["fact-1"],
+                knowledge_limits: "Aucune extrapolation.",
+                placement_reason: "Après le paragraphe.",
+              },
+            },
+          ],
+        },
+        evidence_refs: [
+          {
+            source_document_id: "source-1",
+            kind: "fact",
+            evidence_key: "d".repeat(64),
+          },
+        ],
+      },
+      diagnostics: {},
+      created_at: "2026-11-21T12:00:00Z",
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          new Response(JSON.stringify(proposal), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+        ),
+      ),
+    );
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    render(
+      <QueryClientProvider client={client}>
+        <EditorialProposalCard
+          subjectId="subject-1"
+          occurrenceId="anchor-1"
+          proposalId="proposal-table"
+        />
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByText("Insertion de tableau")).toBeVisible();
+    expect(
+      screen.getByRole("table", { name: "Résumé synthétique" }),
+    ).toBeVisible();
+    expect(screen.getByText("Résumé synthétique")).toBeVisible();
+    expect(
+      screen.getByText("Quelles informations sont rapportées ?"),
+    ).toBeVisible();
+    expect(screen.getByText("Échantillon")).toBeVisible();
+    expect(screen.getByText("Après ce paragraphe")).toBeVisible();
+    fireEvent.click(screen.getByText("Preuves associées"));
+    expect(screen.getByText("d".repeat(64))).toBeVisible();
+    expect(screen.getByText("Source source-1 · fact")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Accepter" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Rejeter" })).toBeVisible();
+  });
+
   it("makes a structured enrichment patch inspectable in the details", async () => {
     const proposal = {
       id: "proposal-2",

@@ -2006,3 +2006,353 @@ main:has(> .editorial-route-state) > .app-header {
     transition: none;
   }
 }
+.editorial-visual-insertion {
+  position: relative;
+  min-width: 0;
+}
+
+.editorial-visual-insertion__menu {
+  position: absolute;
+  z-index: 12;
+  top: calc(100% + 0.3rem);
+  left: 0;
+  display: grid;
+  min-width: 12rem;
+  gap: 0.25rem;
+  padding: 0.4rem;
+  border: 1px solid var(--editorial-divider);
+  border-radius: 0.45rem;
+  background: var(--editorial-white);
+  box-shadow: 0 0.5rem 1.4rem var(--editorial-scrim-tablet);
+}
+
+.editorial-visual-insertion__menu button {
+  min-height: 44px;
+  padding: 0.45rem 0.65rem;
+  border: 0;
+  border-radius: 0.3rem;
+  color: var(--editorial-link);
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.editorial-visual-insertion__menu button:hover,
+.editorial-visual-insertion__menu button:focus-visible {
+  outline: 2px solid var(--editorial-focus-ring);
+  outline-offset: -2px;
+  background: var(--editorial-outline-hover);
+}
+
+.editorial-visual-insertion__menu button:disabled {
+  color: var(--editorial-muted);
+  cursor: not-allowed;
+}
+
+.editorial-visual-insertion__menu p {
+  margin: 0.25rem 0.45rem 0.4rem;
+  color: var(--editorial-muted);
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.editorial-visual-insertion__panel {
+  display: grid;
+  gap: 0.8rem;
+  width: min(32rem, 100%);
+  min-width: 0;
+  margin-top: 0.75rem;
+  padding: 1rem;
+  border: 1px solid var(--editorial-divider);
+  border-radius: 0.55rem;
+  background: var(--editorial-panel);
+}
+
+.editorial-visual-insertion__panel > header,
+.editorial-visual-insertion__row > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+}
+
+.editorial-visual-insertion__panel h3,
+.editorial-visual-insertion__panel h4,
+.editorial-visual-insertion__panel p {
+  margin: 0;
+}
+
+.editorial-visual-insertion__panel h3 {
+  font-size: 1.05rem;
+}
+
+.editorial-visual-insertion__panel h4 {
+  font-size: 0.9rem;
+}
+
+.editorial-visual-insertion__manual-note {
+  color: var(--editorial-muted);
+  font-size: 0.78rem;
+}
+
+.editorial-visual-insertion__close {
+  min-height: 40px;
+  border: 0;
+  color: var(--editorial-link);
+  background: transparent;
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.editorial-visual-insertion__field,
+.editorial-visual-insertion__column label,
+.editorial-visual-insertion__cells label {
+  display: grid;
+  gap: 0.3rem;
+  color: var(--editorial-ink);
+  font-size: 0.82rem;
+  font-weight: 650;
+}
+
+.editorial-visual-insertion__field input,
+.editorial-visual-insertion__field textarea,
+.editorial-visual-insertion__column input,
+.editorial-visual-insertion__cells input {
+  width: 100%;
+  min-height: 42px;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--editorial-control-border);
+  border-radius: 0.35rem;
+  color: var(--editorial-ink);
+  background: var(--editorial-white);
+  font: inherit;
+  font-weight: 400;
+}
+
+.editorial-visual-insertion__field textarea {
+  min-height: 4rem;
+  resize: vertical;
+}
+
+.editorial-visual-insertion__panel input:focus-visible,
+.editorial-visual-insertion__panel textarea:focus-visible,
+.editorial-visual-insertion__panel button:focus-visible,
+.editorial-proposal-card__table-evidence summary:focus-visible,
+.editorial-document__table-evidence summary:focus-visible {
+  outline: 3px solid var(--editorial-focus-ring);
+  outline-offset: 2px;
+}
+
+.editorial-visual-insertion__columns,
+.editorial-visual-insertion__rows,
+.editorial-visual-insertion__evidence {
+  display: grid;
+  gap: 0.55rem;
+  min-width: 0;
+  margin: 0;
+  padding: 0.7rem;
+  border: 1px solid var(--editorial-divider);
+  border-radius: 0.4rem;
+}
+
+.editorial-visual-insertion__columns legend,
+.editorial-visual-insertion__rows legend,
+.editorial-visual-insertion__evidence legend {
+  padding: 0 0.25rem;
+  color: var(--editorial-ink);
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.editorial-visual-insertion__column {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 0.5rem;
+}
+
+.editorial-visual-insertion__column .button,
+.editorial-visual-insertion__rows > .button,
+.editorial-visual-insertion__row .button {
+  min-height: 40px;
+  padding: 0.4rem 0.6rem;
+  font-size: 0.78rem;
+}
+
+.editorial-visual-insertion__row {
+  display: grid;
+  gap: 0.55rem;
+  padding: 0.65rem;
+  border: 1px solid var(--editorial-divider);
+  border-radius: 0.4rem;
+  background: var(--editorial-white);
+}
+
+.editorial-visual-insertion__cells {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr));
+  gap: 0.5rem;
+}
+
+.editorial-visual-insertion__evidence > label {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 0.5rem;
+  font-size: 0.8rem;
+  font-weight: 400;
+}
+
+.editorial-visual-insertion__evidence input[type="checkbox"] {
+  width: 1rem;
+  min-height: 1rem;
+  margin: 0.1rem 0 0;
+  accent-color: var(--editorial-brand);
+}
+
+.editorial-visual-insertion__evidence span,
+.editorial-visual-insertion__evidence small {
+  display: block;
+}
+
+.editorial-visual-insertion__evidence small {
+  margin-top: 0.18rem;
+  color: var(--editorial-muted);
+  font-weight: 400;
+}
+
+.editorial-visual-insertion__preview,
+.editorial-proposal-card__table-comparison {
+  display: grid;
+  gap: 0.55rem;
+  min-width: 0;
+}
+
+.editorial-visual-insertion__table-scroll {
+  width: 100%;
+  overflow-x: auto;
+}
+
+.editorial-visual-insertion__table-scroll table {
+  width: 100%;
+  border-collapse: collapse;
+  color: var(--editorial-ink);
+  background: var(--editorial-white);
+  font-size: 0.85rem;
+  line-height: 1.45;
+}
+
+.editorial-visual-insertion__table-title,
+.editorial-proposal-card__table-title {
+  margin: 0;
+  color: var(--editorial-ink);
+  font-weight: 700;
+}
+
+.editorial-proposal-card__table-purpose {
+  margin: 0 0 0.45rem;
+  color: var(--editorial-muted);
+  font-size: 0.8rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.editorial-visual-insertion__table-scroll caption {
+  padding: 0.45rem;
+  color: var(--editorial-muted);
+  text-align: left;
+}
+
+.editorial-visual-insertion__table-scroll th,
+.editorial-visual-insertion__table-scroll td {
+  min-width: 6rem;
+  padding: 0.5rem;
+  border: 1px solid var(--editorial-divider);
+  text-align: left;
+  vertical-align: top;
+}
+
+.editorial-visual-insertion__table-scroll th {
+  background: var(--editorial-outline-hover);
+}
+
+.editorial-visual-insertion__bridge-reason,
+.editorial-proposal-card__table-anchor-id {
+  color: var(--editorial-muted);
+  font-size: 0.78rem;
+}
+
+.editorial-visual-insertion__proposal {
+  min-width: 0;
+  padding-top: 0.25rem;
+}
+
+.editorial-document__table {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.editorial-document__table h3 {
+  margin: 0;
+  font-family: Georgia, serif;
+  font-size: 1.1rem;
+}
+
+.editorial-document__table-evidence summary,
+.editorial-proposal-card__table-evidence summary,
+.editorial-proposal-card__table-handles summary {
+  color: var(--editorial-link);
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.editorial-document__table-evidence ul,
+.editorial-proposal-card__table-evidence ul,
+.editorial-proposal-card__table-handles ul {
+  display: grid;
+  gap: 0.35rem;
+  padding-left: 1.2rem;
+  overflow-wrap: anywhere;
+  font-size: 0.76rem;
+}
+
+.editorial-proposal-card__table-evidence li {
+  display: grid;
+  gap: 0.15rem;
+}
+
+.editorial-proposal-card__table-evidence code,
+.editorial-document__table-evidence code {
+  overflow-wrap: anywhere;
+}
+
+.editorial-proposal-card__table-anchor,
+.editorial-proposal-card__table-proposed {
+  padding: 0.65rem;
+  border: 1px solid var(--editorial-divider);
+  border-radius: 0.35rem;
+  background: var(--editorial-panel);
+}
+
+.editorial-proposal-card__table-anchor h5,
+.editorial-proposal-card__table-proposed h5 {
+  margin: 0 0 0.4rem;
+  font-size: 0.84rem;
+}
+
+.editorial-proposal-card__table-anchor p {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.editorial-proposal-card__table-placement {
+  color: var(--editorial-muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.editorial-proposal-card__table-anchor-id {
+  margin: 0.45rem 0 0;
+}

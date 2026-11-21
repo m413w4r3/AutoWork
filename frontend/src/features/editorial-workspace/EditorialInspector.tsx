@@ -1,8 +1,11 @@
+import { useState } from "react";
+
 import type {
   EditorialWorkspaceBlock,
   EditorialWorkspaceSnapshot,
 } from "../../api/editorialWorkspace";
 import { EditorialConversation } from "./EditorialConversation";
+import { VisualInsertionComposer } from "./VisualInsertionComposer";
 import { BLOCK_KIND_LABELS } from "./blockKindLabels";
 
 interface EditorialInspectorProps {
@@ -60,12 +63,14 @@ function BlockActionToolbar({
   readOnly,
   onOpenSources,
   onStartEditing,
+  onAskBridge,
 }: {
   snapshot: EditorialWorkspaceSnapshot;
   block: EditorialWorkspaceBlock;
   readOnly: boolean;
   onOpenSources: () => void;
   onStartEditing: (blockId: string) => void;
+  onAskBridge: (instruction: string) => void;
 }) {
   const operations = new Set(block.allowed_operations);
   const canModify =
@@ -90,6 +95,7 @@ function BlockActionToolbar({
     "insert_after",
     "sources",
     "read_evidence",
+    "create_table",
   ]);
   const hasAdditionalOperations =
     !readOnly &&
@@ -120,15 +126,14 @@ function BlockActionToolbar({
         </button>
       ) : null}
       {canInsertAfter ? (
-        <button
-          className="button button--secondary"
-          type="button"
-          disabled
-          aria-label="Ajouter après. L’insertion sera disponible dans une prochaine étape."
-          title="L’insertion sera disponible dans une prochaine étape."
-        >
-          Ajouter après
-        </button>
+        <VisualInsertionComposer
+          key={block.block_id}
+          subjectId={snapshot.subject_id}
+          snapshot={snapshot}
+          block={block}
+          readOnly={readOnly}
+          onAskBridge={onAskBridge}
+        />
       ) : null}
       {canViewSources ? (
         <button
@@ -167,6 +172,9 @@ export function EditorialInspector({
   onBackToDocument,
   onChangeTarget,
 }: EditorialInspectorProps) {
+  const [bridgeProposalPrompt, setBridgeProposalPrompt] = useState<
+    string | null
+  >(null);
   return (
     <aside className="editorial-inspector" aria-label="Inspecteur éditorial">
       <button
@@ -216,6 +224,7 @@ export function EditorialInspector({
               readOnly={readOnly}
               onOpenSources={onOpenSources}
               onStartEditing={onStartEditing}
+              onAskBridge={setBridgeProposalPrompt}
             />
             <EditorialConversation
               subjectId={subjectId}
@@ -223,6 +232,8 @@ export function EditorialInspector({
               snapshotId={snapshot.snapshot_id}
               targetLabel={block.text ?? BLOCK_KIND_LABELS[block.kind]}
               allowedOperations={block.allowed_operations}
+              proposalPrompt={bridgeProposalPrompt}
+              onProposalPromptApplied={() => setBridgeProposalPrompt(null)}
               onChangeTarget={onChangeTarget}
             />
             <section

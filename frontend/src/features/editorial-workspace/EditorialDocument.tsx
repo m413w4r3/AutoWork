@@ -18,6 +18,61 @@ interface EditorialDocumentProps {
 
 function blockContent(block: EditorialWorkspaceSnapshot["blocks"][number]) {
   const className = "editorial-document__text";
+  if (block.kind === "table" && block.table) {
+    return (
+      <section
+        className="editorial-document__table"
+        aria-label={block.table.title}
+      >
+        <h3>{block.table.title}</h3>
+        <div className="editorial-visual-insertion__table-scroll">
+          <table aria-label={block.table.title}>
+            <caption>{block.table.caption || block.table.title}</caption>
+            <thead>
+              <tr>
+                {block.table.columns.map((column) => (
+                  <th key={column.key} scope="col">
+                    {column.label}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {block.table.rows.map((row, rowIndex) => (
+                <tr key={`${block.table?.key}-row-${rowIndex}`}>
+                  {row.cells.map((cell, cellIndex) => (
+                    <td
+                      key={`${block.table?.key}-row-${rowIndex}-cell-${cellIndex}`}
+                    >
+                      {cell}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        {block.table.rows.map((row, rowIndex) =>
+          row.evidence_refs.length > 0 ? (
+            <details
+              className="editorial-document__table-evidence"
+              key={`${block.table?.key}-evidence-${rowIndex}`}
+            >
+              <summary>Preuves de la ligne {rowIndex + 1}</summary>
+              <ul>
+                {row.evidence_refs.map((reference, referenceIndex) => (
+                  <li key={`${reference.evidence_key}-${referenceIndex}`}>
+                    Source {reference.source_document_id} · {reference.kind} ·{" "}
+                    <code>{reference.evidence_key}</code>
+                  </li>
+                ))}
+              </ul>
+            </details>
+          ) : null,
+        )}
+      </section>
+    );
+  }
   if (block.kind === "title")
     return <h2 className={className}>{block.text}</h2>;
   if (block.kind === "section_heading") {

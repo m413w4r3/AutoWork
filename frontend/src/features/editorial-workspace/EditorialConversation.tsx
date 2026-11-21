@@ -13,6 +13,8 @@ interface EditorialConversationProps {
   snapshotId: string;
   targetLabel: string;
   allowedOperations?: readonly string[];
+  proposalPrompt?: string | null;
+  onProposalPromptApplied?: () => void;
   onChangeTarget: () => void;
 }
 
@@ -22,6 +24,8 @@ export function EditorialConversation({
   snapshotId,
   targetLabel,
   allowedOperations = [],
+  proposalPrompt = null,
+  onProposalPromptApplied,
   onChangeTarget,
 }: EditorialConversationProps) {
   const drafts = useEditorialConversationDrafts(occurrenceId);
@@ -37,6 +41,7 @@ export function EditorialConversation({
   const focusAfterSubmitRef = useRef<string | null>(null);
   const restoreComposerFocusRef = useRef<string | null>(null);
   const controlsWereLockedRef = useRef(false);
+  const appliedProposalPromptRef = useRef<string | null>(null);
   const proposalIds =
     lifecycle.threadQuery.data && lifecycle.threadQuery.data.kind !== "unopened"
       ? Array.from(
@@ -79,6 +84,19 @@ export function EditorialConversation({
 
     if (lifecycle.controlsLocked) controlsWereLockedRef.current = true;
   }, [lifecycle.controlsLocked, lifecycle.submissionUncertain, occurrenceId]);
+
+  useEffect(() => {
+    if (!proposalPrompt) {
+      appliedProposalPromptRef.current = null;
+      return;
+    }
+    if (appliedProposalPromptRef.current === proposalPrompt) return;
+    appliedProposalPromptRef.current = proposalPrompt;
+    drafts.setDraft(proposalPrompt);
+    lifecycle.clearSendResult();
+    composerRef.current?.focus({ preventScroll: true });
+    onProposalPromptApplied?.();
+  }, [drafts, lifecycle, onProposalPromptApplied, proposalPrompt]);
 
   function submitMessage(kind: "message" | "propose") {
     if (lifecycle.submitMessage(drafts.draft, kind))
@@ -150,6 +168,7 @@ export function EditorialConversation({
               occurrenceId={occurrenceId}
               proposalId={proposalId}
               referenceOrdinal={index + 1}
+              anchorText={targetLabel}
               onRequestVariant={
                 lifecycle.canCompose ? requestVariant : undefined
               }
@@ -165,8 +184,14 @@ export function EditorialConversation({
           canPropose={allowedOperations.some(
             (operation) =>
               operation === "rewrite_title" ||
-              operation === "rewrite_paragraph",
+              operation === "rewrite_paragraph" ||
+              operation === "create_table",
           )}
+          proposalLabel={
+            allowedOperations.includes("create_table")
+              ? "Demander au Bridge"
+              : undefined
+          }
           controlsLocked={lifecycle.controlsLocked}
           hasQueryError={lifecycle.threadQuery.isError}
           sendPending={lifecycle.sendState.isPending}

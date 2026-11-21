@@ -321,6 +321,7 @@ export interface EditorialProposalPatch {
   rationale: string;
   after?: string;
   enrichment_patch?: EditorialEnrichmentProposalPatch;
+  evidence_refs?: EditorialEvidenceReference[];
 }
 
 export type EditorialEnrichmentTableKind =
@@ -466,7 +467,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   editorial_before_hash_mismatch:
     "Ce bloc a changé. Rechargez l’atelier avant de réessayer.",
   editorial_anchor_stale:
-    "Le paragraphe d’ancrage a changé ou a été supprimé. Repositionnez l’élément.",
+    "Le paragraphe d’ancrage a changé ou a été supprimé. Actualisez l’atelier, puis choisissez un paragraphe disponible.",
   editorial_registry_conflict:
     "La continuité de ce bloc ne peut pas être prouvée. Une revue est nécessaire.",
   thread_not_found: "Discussion introuvable.",
@@ -496,14 +497,24 @@ const ERROR_MESSAGES: Record<string, string> = {
   manual_edit_new_fact_unadmitted:
     "Cette nouvelle valeur technique n'est pas étayée par les preuves disponibles. Modifiez le passage ou ajoutez une source autorisée.",
   manual_edit_patch_invalid:
-    "Le texte proposé ne respecte pas le format éditorial autorisé.",
+    "La proposition ne respecte pas le format éditorial autorisé. Vérifiez son contenu et réessayez.",
+  manual_table_request_invalid:
+    "Le tableau est incomplet ou incohérent. Vérifiez les intitulés, les cellules et les preuves de chaque ligne.",
+  manual_table_analytic_question_duplicate:
+    "Une question analytique équivalente existe déjà. Modifiez la consigne du tableau avant de proposer une nouvelle insertion.",
+  manual_edit_request_too_large:
+    "Le tableau dépasse la taille autorisée. Réduisez son contenu avant de réessayer.",
+  proposal_operation_unsupported:
+    "Cette insertion n’est pas autorisée pour le paragraphe sélectionné. Actualisez l’atelier.",
+  proposal_target_mismatch:
+    "La cible de cette insertion a changé. Actualisez l’atelier et recommencez.",
   manual_edit_request_invalid: "La requête de modification est invalide.",
   manual_edit_unavailable:
-    "La modification manuelle est temporairement indisponible.",
+    "Cette opération éditoriale est temporairement indisponible. Actualisez l’atelier avant de réessayer.",
   editorial_proposal_accept_unavailable:
     "L’acceptation des propositions est temporairement indisponible.",
   proposal_idempotency_conflict:
-    "Cette clé est déjà associée à une autre décision.",
+    "Cette clé est déjà associée à une autre décision. Actualisez l’atelier, puis réessayez.",
   propose_not_enabled: "La proposition n’est pas encore activée.",
   editorial_thread_busy: "Une réponse est déjà en cours pour ce paragraphe.",
   external_llm_blocked: "La politique interdit l’envoi externe de ce contenu.",

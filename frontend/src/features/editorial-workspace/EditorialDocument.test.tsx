@@ -94,4 +94,85 @@ describe("EditorialDocument", () => {
       "second-occurrence",
     ]);
   });
+
+  it("renders an inserted table in the exact order supplied by the snapshot", () => {
+    const anchorBlock = snapshot.blocks[0];
+    const followingBlock = snapshot.blocks[1];
+    if (!anchorBlock || !followingBlock) {
+      throw new Error("Expected the synthetic paragraph blocks");
+    }
+    const insertedTable = {
+      block_id: "inserted-table-occurrence",
+      kind: "table" as const,
+      parent_block_id: null,
+      position: 1,
+      text: "Résumé vérifiable",
+      evidence_refs: [],
+      table: {
+        key: "table-synthetic",
+        kind: "custom" as const,
+        title: "Résumé vérifiable",
+        caption: "Informations rapportées",
+        columns: [
+          { key: "item", label: "Élément" },
+          { key: "value", label: "Valeur" },
+        ],
+        rows: [
+          {
+            cells: ["Échantillon", "Confirmé"],
+            evidence_refs: [
+              {
+                source_document_id: "source-1",
+                kind: "fact" as const,
+                evidence_key: "d".repeat(64),
+              },
+            ],
+          },
+        ],
+        evidence_refs: [],
+        anchor_block_id: anchorBlock.block_id,
+        placement: "after_paragraph" as const,
+      },
+      revision_target: {
+        block_id: "inserted-table-occurrence",
+        legacy_target_id: null,
+      },
+      before_hash: null,
+      allowed_operations: [],
+      revision_status: "ready" as const,
+    };
+    const orderedSnapshot: EditorialWorkspaceSnapshot = {
+      ...snapshot,
+      blocks: [anchorBlock, insertedTable, followingBlock],
+    };
+
+    const { container } = render(
+      <EditorialDocument
+        snapshot={orderedSnapshot}
+        selectedBlockId={null}
+        drafts={{}}
+        staleDraftIds={new Set()}
+        editingBlockId={null}
+        onSelectBlock={() => undefined}
+        onDraftChange={() => undefined}
+        onResumeDraft={() => undefined}
+        onCancelDraft={() => undefined}
+      />,
+    );
+
+    const orderedIds = Array.from(
+      container.querySelectorAll<HTMLElement>(".editorial-document__block"),
+    ).map((block) => block.dataset.blockId);
+    expect(orderedIds).toEqual([
+      anchorBlock.block_id,
+      insertedTable.block_id,
+      followingBlock.block_id,
+    ]);
+    expect(
+      screen.getByRole("table", { name: "Résumé vérifiable" }),
+    ).toBeVisible();
+    expect(screen.getByText("Preuves de la ligne 1")).toBeVisible();
+    fireEvent.click(screen.getByText("Preuves de la ligne 1"));
+    expect(screen.getByText("d".repeat(64))).toBeVisible();
+  });
 });

@@ -10,6 +10,7 @@ interface EditorialConversationComposerProps {
   sendSuccess: boolean;
   sendKind: "message" | "propose" | undefined;
   sendErrorMessage: string | null;
+  proposalLabel?: string;
   submissionBelongsToCurrentTarget: boolean;
   composerRef: RefObject<HTMLTextAreaElement | null>;
   sendAnnouncementRef: RefObject<HTMLParagraphElement | null>;
@@ -34,6 +35,7 @@ export function EditorialConversationComposer({
   sendSuccess,
   sendKind,
   sendErrorMessage,
+  proposalLabel = "Générer une proposition",
   submissionBelongsToCurrentTarget,
   composerRef,
   sendAnnouncementRef,
@@ -104,7 +106,7 @@ export function EditorialConversationComposer({
           >
             {sendPending && sendKind === "propose"
               ? "Génération en cours…"
-              : "Générer une proposition"}
+              : proposalLabel}
           </button>
         ) : null}
       </div>

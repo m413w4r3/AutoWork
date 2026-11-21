@@ -6,9 +6,11 @@ import {
   acceptEditorialProposal,
   getEditorialProposal,
   rejectEditorialProposal,
+  type EditorialProposalPatch,
   type EditorialProposalRead,
   type EditorialProposalRefusalCode,
   type EditorialProposalState,
+  type EditorialTableProposal,
 } from "../../api/editorialWorkspace";
 import { editorialWorkspaceQueryKeys } from "./editorialWorkspaceQueries";
 import { EditorialDiffView } from "./EditorialDiffView";
@@ -18,6 +20,7 @@ interface EditorialProposalCardProps {
   occurrenceId: string;
   proposalId: string;
   referenceOrdinal?: number;
+  anchorText?: string;
   onRequestVariant?: () => void;
   onAccepted?: () => void;
 }
@@ -44,11 +47,116 @@ function refusalLabel(code: unknown): string {
   return "Le Bridge n’a pas produit de proposition exploitable.";
 }
 
+function tableFromPatch(
+  patch: EditorialProposalPatch | null,
+): EditorialTableProposal | null {
+  if (patch?.operation !== "create_table") return null;
+  const tables = patch.enrichment_patch?.tables;
+  return tables?.length === 1 ? (tables[0] ?? null) : null;
+}
+
+function TableProposalComparison({
+  table,
+  anchorText,
+  evidenceRefs,
+}: {
+  table: EditorialTableProposal;
+  anchorText: string | undefined;
+  evidenceRefs: EditorialProposalPatch["evidence_refs"];
+}) {
+  return (
+    <section
+      className="editorial-proposal-card__table-comparison"
+      aria-label="Comparaison de l’insertion de tableau"
+    >
+      <div className="editorial-proposal-card__table-anchor">
+        <h5>Paragraphe d’ancrage</h5>
+        <p>{anchorText || "Paragraphe sélectionné"}</p>
+      </div>
+      <p className="editorial-proposal-card__table-placement">
+        Après ce paragraphe
+      </p>
+      <div className="editorial-proposal-card__table-proposed">
+        <h5>Insertion de tableau</h5>
+        <p className="editorial-proposal-card__table-title">{table.title}</p>
+        <p className="editorial-proposal-card__table-purpose">
+          <strong>Consigne · </strong>
+          {table.purpose.question}
+        </p>
+        <div className="editorial-visual-insertion__table-scroll">
+          <table aria-label={table.title}>
+            <caption>{table.caption || table.title}</caption>
+            <thead>
+              <tr>
+                {table.columns.map((column) => (
+                  <th key={column.key} scope="col">
+                    {column.label}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {table.rows.map((row, index) => (
+                <tr key={`${table.key}-row-${index}`}>
+                  {row.cells.map((cell, cellIndex) => (
+                    <td key={`${table.key}-row-${index}-cell-${cellIndex}`}>
+                      {cell}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <p className="editorial-proposal-card__table-anchor-id">
+          Ancre · {table.placement.anchor_block_id ?? "non renseignée"}
+        </p>
+        {table.rows.some((row) => row.evidence_handles.length > 0) ? (
+          <details className="editorial-proposal-card__table-handles">
+            <summary>Références associées aux lignes</summary>
+            <ul>
+              {table.rows.flatMap((row, index) =>
+                row.evidence_handles.map((handle) => (
+                  <li key={`${index}-${handle}`}>
+                    Ligne {index + 1} · {handle}
+                  </li>
+                )),
+              )}
+            </ul>
+          </details>
+        ) : null}
+      </div>
+      <details className="editorial-proposal-card__table-evidence">
+        <summary>Preuves associées</summary>
+        {evidenceRefs && evidenceRefs.length > 0 ? (
+          <ul>
+            {evidenceRefs.map((reference, index) => (
+              <li
+                key={`${reference.source_document_id}-${reference.evidence_key}-${index}`}
+              >
+                <span>
+                  Source {reference.source_document_id} · {reference.kind}
+                </span>
+                <code>{reference.evidence_key}</code>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p>
+            Aucune référence de preuve n’est disponible pour cette proposition.
+          </p>
+        )}
+      </details>
+    </section>
+  );
+}
+
 export function EditorialProposalCard({
   subjectId,
   occurrenceId,
   proposalId,
   referenceOrdinal,
+  anchorText,
   onRequestVariant,
   onAccepted,
 }: EditorialProposalCardProps) {
@@ -153,6 +261,7 @@ export function EditorialProposalCard({
 
   const proposal = proposalQuery.data;
   const proposedText = proposal.patch?.after;
+  const tableProposal = tableFromPatch(proposal.patch);
   const acceptanceConflict =
     acceptMutation.isError &&
     acceptMutation.error instanceof ApiError &&
@@ -182,7 +291,13 @@ export function EditorialProposalCard({
       {proposal.origin === "manual_patch" ? (
         <p className="editorial-proposal-card__origin">Modification manuelle</p>
       ) : null}
-      {typeof proposedText === "string" ? (
+      {tableProposal ? (
+        <TableProposalComparison
+          table={tableProposal}
+          anchorText={anchorText}
+          evidenceRefs={proposal.patch?.evidence_refs}
+        />
+      ) : typeof proposedText === "string" ? (
         typeof proposal.base_text === "string" ? (
           <EditorialDiffView
             baseText={proposal.base_text}
