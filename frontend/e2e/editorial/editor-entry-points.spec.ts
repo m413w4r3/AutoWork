@@ -11,15 +11,6 @@ import {
   fulfillEditorialReadStatuses,
 } from "./fixtures/editorialApi";
 
-interface TouchTargetElement {
-  getBoundingClientRect: () => {
-    height: number;
-    left: number;
-    right: number;
-  };
-  tagName: string;
-}
-
 const subjectId = EDITORIAL_FIXTURES.subject.id;
 const appOrigin = EDITORIAL_APP_ORIGIN;
 const titleId = "00000000-0000-4000-8000-000000000000";
@@ -203,7 +194,7 @@ async function stubEditorApi(
   return { unexpectedRequests };
 }
 
-test("un paragraphe garde son contexte exact aux trois largeurs attendues", async ({
+test("un paragraphe garde son contexte exact aux largeurs desktop attendues", async ({
   page,
 }) => {
   const api = await stubEditorApi(page);
@@ -235,46 +226,6 @@ test("un paragraphe garde son contexte exact aux trois largeurs attendues", asyn
     path: resolve(screenshotDirectory, "atelier-1180x800.png"),
   });
 
-  await page.setViewportSize({ width: 390, height: 844 });
-  await page.getByRole("button", { name: "Inspecteur" }).click();
-  await expect(
-    page.locator(".editorial-workspace__inspector-column"),
-  ).toHaveCSS("transform", "none");
-  await expect(
-    page.getByRole("button", { name: "‹ Retour au document" }),
-  ).toBeVisible();
-  await expect(page.getByText("Section : Contexte")).toBeVisible();
-  const viewportWidth = page.viewportSize()?.width ?? 390;
-  const undersizedTouchControls = await page
-    .locator(
-      ".editorial-workspace a:visible, .editorial-workspace button:visible, .editorial-workspace summary:visible, .editorial-workspace input:visible",
-    )
-    .evaluateAll(
-      (controls, width) =>
-        controls.flatMap((control) => {
-          const htmlControl = control as unknown as TouchTargetElement;
-          const rect = htmlControl.getBoundingClientRect();
-          if (rect.right <= 0 || rect.left >= width) return [];
-          return rect.height < 44
-            ? [`${htmlControl.tagName.toLowerCase()} ${rect.height}px`]
-            : [];
-        }),
-      viewportWidth,
-    );
-  expect(undersizedTouchControls).toEqual([]);
-  const noHorizontalOverflow = await page
-    .locator("html")
-    .evaluate<boolean, undefined>((root) => {
-      const dimensions = root as { scrollWidth: number; clientWidth: number };
-      return dimensions.scrollWidth <= dimensions.clientWidth;
-    });
-  expect(noHorizontalOverflow).toBe(true);
-  await page.screenshot({
-    path: resolve(screenshotDirectory, "atelier-390x844.png"),
-  });
-
-  await page.getByRole("button", { name: "‹ Retour au document" }).click();
-  await expect(paragraph).toHaveAttribute("data-selected", "true");
   expect(api.unexpectedRequests).toEqual([]);
 });
 

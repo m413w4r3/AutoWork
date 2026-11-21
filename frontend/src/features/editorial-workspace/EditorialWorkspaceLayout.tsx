@@ -119,7 +119,7 @@ export function EditorialWorkspaceLayout({
     onSelectBlock(occurrenceId);
     // At >= 1024px the inspector is already a lateral column; opening the
     // "inspector" panel there would render a scrim over a non-overlay column
-    // and make the document unclickable. Only the mobile drawer needs it.
+    // and make the document unclickable. Only the narrow-viewport drawer needs it.
     const inspectorIsDrawer =
       typeof window.matchMedia === "function" &&
       window.matchMedia("(max-width: 1023px)").matches;
@@ -302,9 +302,9 @@ export function EditorialWorkspaceLayout({
   };
 
   const returnToTargetChoice = () => {
-    const mobileViewport =
+    const drawerViewport =
       typeof window.matchMedia === "function" &&
-      window.matchMedia("(max-width: 767px)").matches;
+      window.matchMedia("(max-width: 1023px)").matches;
     setOpenPanel(null);
     setMenuOpen(false);
     overlayOpenerRef.current = null;
@@ -315,7 +315,9 @@ export function EditorialWorkspaceLayout({
       const selectedOutlineItem = document.querySelector<HTMLElement>(
         ".editorial-outline__item[data-selected='true']",
       );
-      const focusTarget = mobileViewport
+      // Below 1024px the outline is an off-canvas drawer, so focus returns to
+      // the document block; above it the visible outline item is preferred.
+      const focusTarget = drawerViewport
         ? selectedDocumentBlock
         : (selectedOutlineItem ?? selectedDocumentBlock);
       focusTarget?.focus({ preventScroll: true });

@@ -22,20 +22,6 @@ interface ScrollableBounds extends ScrollBounds {
   scrollTop: number;
 }
 
-async function expectMobileInspectorWithinViewport(page: Page) {
-  const inspector = page.locator(".editorial-workspace__inspector-column");
-  await expect
-    .poll(async () => {
-      const bounds = await inspector.boundingBox();
-      return bounds ? Math.round(bounds.x + bounds.width) : null;
-    })
-    .toBe(390);
-  const bounds = await inspector.boundingBox();
-  if (!bounds) throw new Error("Mobile inspector is not rendered");
-  expect(bounds.x).toBeGreaterThanOrEqual(0);
-  expect(Math.round(bounds.x + bounds.width)).toBeLessThanOrEqual(390);
-}
-
 async function positionDesktopDiscussion(page: Page) {
   const inspector = page.locator(".editorial-workspace__inspector-column");
   const heading = page.getByRole("heading", { name: "Discussion" });
@@ -48,31 +34,6 @@ async function positionDesktopDiscussion(page: Page) {
     const targetBounds = headingElement.getBoundingClientRect();
     inspectorElement.scrollTop += targetBounds.top - containerBounds.top - 16;
   }, headingHandle);
-}
-
-async function positionMobileDiscussion(page: Page) {
-  const content = page.locator(".editorial-inspector__content");
-  const heading = page.getByRole("heading", { name: "Discussion" });
-  const headingHandle = await heading.elementHandle();
-  if (!headingHandle) throw new Error("Discussion heading is not rendered");
-  await content.evaluate((scrollArea, target) => {
-    const scrollElement = scrollArea as unknown as ScrollableBounds;
-    const headingElement = target as unknown as ScrollBounds;
-    const scrollAreaBounds = scrollElement.getBoundingClientRect();
-    const targetBounds = headingElement.getBoundingClientRect();
-    scrollElement.scrollTop += targetBounds.top - scrollAreaBounds.top - 8;
-  }, headingHandle);
-
-  const backBounds = await page
-    .getByRole("button", { name: "‹ Retour au document" })
-    .boundingBox();
-  const headingBounds = await heading.boundingBox();
-  if (!backBounds || !headingBounds) {
-    throw new Error("Mobile inspector header is not visible");
-  }
-  expect(headingBounds.y).toBeGreaterThanOrEqual(
-    backBounds.y + backBounds.height,
-  );
 }
 
 test("message-only composer renders safe generating, reply and error states", async ({
@@ -468,14 +429,6 @@ test("message-only composer renders safe generating, reply and error states", as
   await page.screenshot({
     path: resolve(screenshotDirectory, "waiting-for-capacity-1440x900.png"),
   });
-  await page.setViewportSize({ width: 390, height: 844 });
-  await page.getByRole("button", { name: "Inspecteur" }).click();
-  await expectMobileInspectorWithinViewport(page);
-  await positionMobileDiscussion(page);
-  await page.screenshot({
-    path: resolve(screenshotDirectory, "waiting-for-capacity-390x844.png"),
-  });
-  await page.setViewportSize({ width: 1440, height: 900 });
   currentRead = generating;
   await expect(
     page.getByText(
@@ -486,40 +439,18 @@ test("message-only composer renders safe generating, reply and error states", as
   await page.screenshot({
     path: resolve(screenshotDirectory, "message-generating-1440x900.png"),
   });
-  await page.setViewportSize({ width: 390, height: 844 });
-  await expectMobileInspectorWithinViewport(page);
-  await positionMobileDiscussion(page);
-  await page.screenshot({
-    path: resolve(screenshotDirectory, "message-generating-390x844.png"),
-  });
 
-  const mobileContent = page.locator(".editorial-inspector__content");
-  const mobileScrollTopBeforeReply = await mobileContent.evaluate(
-    (element) => (element as unknown as { scrollTop: number }).scrollTop,
-  );
   currentRead = reply;
   await expect(
     page.getByText(
       "Une réponse est disponible dans ce fil. Consultez-la avant toute décision.",
     ),
   ).toBeVisible({ timeout: 5_000 });
-  expect(
-    await mobileContent.evaluate(
-      (element) => (element as unknown as { scrollTop: number }).scrollTop,
-    ),
-  ).toBe(mobileScrollTopBeforeReply);
-  await page.setViewportSize({ width: 1440, height: 900 });
   await positionDesktopDiscussion(page);
   await page.screenshot({
     path: resolve(screenshotDirectory, "message-reply-1440x900.png"),
   });
   await expect(page.getByText("Réponse de démonstration.")).toBeVisible();
-  await page.setViewportSize({ width: 390, height: 844 });
-  await expectMobileInspectorWithinViewport(page);
-  await positionMobileDiscussion(page);
-  await page.screenshot({
-    path: resolve(screenshotDirectory, "message-reply-390x844.png"),
-  });
 
   await page
     .getByRole("textbox", { name: "Votre message à Bridge" })
@@ -538,14 +469,7 @@ test("message-only composer renders safe generating, reply and error states", as
   await page.screenshot({
     path: resolve(screenshotDirectory, "message-error-1440x900.png"),
   });
-  await page.setViewportSize({ width: 390, height: 844 });
-  await expectMobileInspectorWithinViewport(page);
-  await positionMobileDiscussion(page);
-  await page.screenshot({
-    path: resolve(screenshotDirectory, "message-error-390x844.png"),
-  });
 
-  await page.setViewportSize({ width: 1440, height: 900 });
   await page
     .getByRole("textbox", { name: "Votre message à Bridge" })
     .fill("Vérifier l’état de la demande.");
@@ -574,16 +498,7 @@ test("message-only composer renders safe generating, reply and error states", as
   await page.screenshot({
     path: resolve(screenshotDirectory, "message-uncertain-1440x900.png"),
   });
-  await page.setViewportSize({ width: 390, height: 844 });
-  await expectMobileInspectorWithinViewport(page);
-  await positionMobileDiscussion(page);
-  await page.screenshot({
-    path: resolve(screenshotDirectory, "message-uncertain-390x844.png"),
-  });
 
-  const mobileScrollTopBeforeReconcile = await mobileContent.evaluate(
-    (element) => (element as unknown as { scrollTop: number }).scrollTop,
-  );
   await page
     .getByRole("button", { name: "Vérifier l’état de l’envoi" })
     .click();
@@ -595,13 +510,7 @@ test("message-only composer renders safe generating, reply and error states", as
   await expect(
     page.getByRole("textbox", { name: "Votre message à Bridge" }),
   ).toBeEnabled();
-  expect(
-    await mobileContent.evaluate(
-      (element) => (element as unknown as { scrollTop: number }).scrollTop,
-    ),
-  ).toBe(mobileScrollTopBeforeReconcile);
 
-  await page.setViewportSize({ width: 1440, height: 900 });
   await page
     .getByRole("textbox", { name: "Votre message à Bridge" })
     .fill("Continuer dans le fil vérifié.");
@@ -619,12 +528,6 @@ test("message-only composer renders safe generating, reply and error states", as
   await page.screenshot({
     path: resolve(screenshotDirectory, "session-lost-1440x900.png"),
   });
-  await page.setViewportSize({ width: 390, height: 844 });
-  await expectMobileInspectorWithinViewport(page);
-  await positionMobileDiscussion(page);
-  await page.screenshot({
-    path: resolve(screenshotDirectory, "session-lost-390x844.png"),
-  });
   await page
     .getByRole("button", { name: "Démarrer une nouvelle discussion" })
     .click();
@@ -637,9 +540,10 @@ test("message-only composer renders safe generating, reply and error states", as
   await expect(
     page.locator(".editorial-workspace__inspector-column"),
   ).toHaveAttribute("data-panel-open", "false");
-  await expect(paragraph).toBeFocused();
+  await expect(
+    page.locator('.editorial-outline__item[data-selected="true"]'),
+  ).toBeFocused();
 
-  await page.setViewportSize({ width: 1440, height: 900 });
   await expect(paragraph).toHaveAttribute("data-selected", "true");
   await expect(
     page

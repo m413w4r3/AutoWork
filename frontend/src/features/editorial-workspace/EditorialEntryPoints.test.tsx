@@ -262,11 +262,11 @@ describe("atelier éditorial", () => {
     ).toHaveAttribute("data-selected", "true");
   });
 
-  it("returns to the document for another target and closes the mobile inspector", async () => {
+  it("returns to the document for another target and closes the narrow-viewport inspector", async () => {
     vi.stubGlobal(
       "matchMedia",
       vi.fn((media: string) => ({
-        matches: media === "(max-width: 767px)",
+        matches: media === "(max-width: 1023px)",
         media,
         onchange: null,
         addListener: vi.fn(),
@@ -291,7 +291,7 @@ describe("atelier éditorial", () => {
       ".editorial-workspace__inspector-toggle",
     );
     if (!(inspectorToggle instanceof HTMLButtonElement)) {
-      throw new Error("Le bouton inspecteur mobile est absent.");
+      throw new Error("Le bouton inspecteur de la fenêtre étroite est absent.");
     }
     fireEvent.click(inspectorToggle);
     const inspectorColumn = document.querySelector(
