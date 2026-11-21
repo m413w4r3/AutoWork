@@ -58,7 +58,7 @@ UX_COVERAGE: dict[str, ScenarioCoverage] = {
         tests=(
             _ref(
                 "frontend/e2e/editorial/editor-entry-points.spec.ts",
-                "un paragraphe garde son contexte exact aux trois largeurs attendues",
+                "un paragraphe garde son contexte exact aux largeurs desktop attendues",
                 "e2e",
             ),
             _ref(
