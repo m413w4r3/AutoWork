@@ -1196,7 +1196,7 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     command.upgrade(config, "head")
     command.current(config)
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert _head_revision() == "0016_editorial_drafts"
+    assert _head_revision() == "0017_editorial_proposal_bar_chart_operation"
     assert asyncio.run(_alembic_version_column_length(temporary_postgres_url)) == 64
 
     collection_attempt_columns = asyncio.run(
@@ -1274,6 +1274,102 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     assert asyncio.run(_trigger_definitions(temporary_postgres_url)) == trigger_definitions
 
 
+def test_editorial_bar_chart_operation_check_downgrades_when_unused(
+    temporary_postgres_url: str,
+) -> None:
+    config = _alembic_config(temporary_postgres_url)
+    command.upgrade(config, "head")
+
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == (
+        "0017_editorial_proposal_bar_chart_operation"
+    )
+    expanded_check = asyncio.run(_check_constraints(temporary_postgres_url, "editorial_proposals"))[
+        "ck_editorial_proposals_operation"
+    ]
+    assert "'create_bar_chart'" in expanded_check
+    assert "'create_source_figure'" in expanded_check
+
+    command.downgrade(config, "0016_editorial_drafts")
+
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0016_editorial_drafts"
+    restored_check = asyncio.run(_check_constraints(temporary_postgres_url, "editorial_proposals"))[
+        "ck_editorial_proposals_operation"
+    ]
+    assert "'create_bar_chart'" not in restored_check
+    assert "'create_source_figure'" in restored_check
+
+
+def test_editorial_bar_chart_operation_downgrade_refuses_matching_rows(
+    temporary_postgres_url: str,
+) -> None:
+    config = _alembic_config(temporary_postgres_url)
+    command.upgrade(config, "head")
+
+    async def _insert_bar_chart_proposal() -> None:
+        engine = create_async_engine(temporary_postgres_url)
+        try:
+            async with engine.begin() as connection:
+                # The test targets the operation CHECK and migration guard;
+                # its fixture does not need the four editorial parent rows.
+                for constraint in (
+                    "fk_editorial_proposals_subject",
+                    "fk_editorial_proposals_run",
+                    "fk_editorial_proposals_snapshot",
+                    "fk_editorial_proposals_base_artifact",
+                ):
+                    await connection.execute(
+                        text(f"ALTER TABLE editorial_proposals DROP CONSTRAINT {constraint}")
+                    )
+                await connection.execute(
+                    text(
+                        "INSERT INTO editorial_proposals ("
+                        "id, subject_id, production_run_id, origin, snapshot_id, "
+                        "occurrence_id, base_artifact_id, base_artifact_version, "
+                        "base_input_hash, base_canonical_sha256, base_pin_hash, target_id, "
+                        "operation, before_hash, evidence_refs, diagnostics, variant_group_id, "
+                        "state, state_version, actor_id, idempotency_key, request_sha256"
+                        ") VALUES ("
+                        ":id, :subject_id, :production_run_id, 'manual_patch', :snapshot_id, "
+                        ":occurrence_id, :base_artifact_id, 1, :hash, :hash, :hash, 'chart', "
+                        "'create_bar_chart', :hash, '[]'::jsonb, '{}'::jsonb, :variant_group_id, "
+                        "'proposed', 1, :actor_id, 'migration-downgrade-guard', :hash"
+                        ")"
+                    ),
+                    {
+                        "id": uuid4(),
+                        "subject_id": uuid4(),
+                        "production_run_id": uuid4(),
+                        "snapshot_id": uuid4(),
+                        "occurrence_id": uuid4(),
+                        "base_artifact_id": uuid4(),
+                        "variant_group_id": uuid4(),
+                        "actor_id": uuid4(),
+                        "hash": "a" * 64,
+                    },
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_insert_bar_chart_proposal())
+    downgrade_message = (
+        "refusing to downgrade ck_editorial_proposals_operation while "
+        "create_bar_chart proposals exist"
+    )
+    with pytest.raises(
+        RuntimeError,
+        match=downgrade_message,
+    ):
+        command.downgrade(config, "0016_editorial_drafts")
+
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == (
+        "0017_editorial_proposal_bar_chart_operation"
+    )
+    expanded_check = asyncio.run(_check_constraints(temporary_postgres_url, "editorial_proposals"))[
+        "ck_editorial_proposals_operation"
+    ]
+    assert "'create_bar_chart'" in expanded_check
+
+
 def test_fresh_upgrade_stamps_acquisition_revisions_without_truncation(
     temporary_postgres_url: str,
 ) -> None:
@@ -1307,7 +1403,7 @@ def test_frozen_collection_attempt_baseline_precedes_acquisition_additions(
 
     command.upgrade(config, "head")
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert _head_revision() == "0016_editorial_drafts"
+    assert _head_revision() == "0017_editorial_proposal_bar_chart_operation"
     final_schema = asyncio.run(_database_snapshot(temporary_postgres_url))["collection_attempts"]
     table = Base.metadata.tables["collection_attempts"]
     assert final_schema["columns"] == _expected_columns(table)

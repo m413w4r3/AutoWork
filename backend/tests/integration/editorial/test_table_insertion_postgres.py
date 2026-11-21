@@ -656,9 +656,8 @@ async def test_manual_bar_chart_patch_accepts_with_registered_evidence_and_ancho
         )
         assert adopted_snapshot_response.status_code == 200, adopted_snapshot_response.text
         adopted_snapshot = adopted_snapshot_response.json()
-        chart_block = next(
-            item for item in adopted_snapshot["enrichments"] if item["kind"] == "chart"
-        )
+        adopted_blocks = adopted_snapshot["blocks"]
+        chart_block = next(item for item in adopted_blocks if item["kind"] == "chart")
         assert chart_block["chart"]["title"] == "Comptes synthétiques rapportés"
         assert chart_block["chart"]["unit"] == "endpoints"
         assert chart_block["chart"]["legend"] == ["endpoints"]
@@ -666,11 +665,34 @@ async def test_manual_bar_chart_patch_accepts_with_registered_evidence_and_ancho
             ("Alpha", "12"),
             ("Beta", "18"),
         ]
+        assert [point["evidence_refs"] for point in chart_block["chart"]["points"]] == [
+            [
+                {
+                    "source_document_id": str(alpha_ref.source_document_id),
+                    "kind": alpha_ref.kind.value,
+                    "evidence_key": alpha_ref.evidence_key,
+                }
+            ],
+            [
+                {
+                    "source_document_id": str(beta_ref.source_document_id),
+                    "kind": beta_ref.kind.value,
+                    "evidence_key": beta_ref.evidence_key,
+                }
+            ],
+        ]
         assert chart_block["chart"]["anchor_block_id"] == str(anchor_id)
-        adopted_anchor = next(
-            item for item in adopted_snapshot["blocks"] if item["block_id"] == str(anchor_id)
-        )
+        adopted_anchor = next(item for item in adopted_blocks if item["block_id"] == str(anchor_id))
         assert adopted_anchor["chart"] is None
+        anchor_index = next(
+            index for index, item in enumerate(adopted_blocks) if item["block_id"] == str(anchor_id)
+        )
+        chart_index = next(
+            index
+            for index, item in enumerate(adopted_blocks)
+            if item["block_id"] == chart_block["block_id"]
+        )
+        assert chart_index == anchor_index + 1
 
     assert model_gateway.calls == []
     async with uow_factory() as uow:
@@ -720,6 +742,4 @@ async def test_manual_bar_chart_patch_accepts_with_registered_evidence_and_ancho
         if entry.source_stage is EditorialSourceStage.EDITORIAL_ENRICHMENT
         and entry.structural_pointer == "/charts/0"
     )
-    assert inserted_entry.position > next(
-        entry.position for entry in persisted_snapshot.block_registry if entry.block_id == anchor_id
-    )
+    assert inserted_entry.block_id == UUID(chart_block["block_id"])

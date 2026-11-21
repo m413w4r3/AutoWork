@@ -1152,18 +1152,11 @@ def _proposal_stage(
     if target_kind == TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT.value:
         stage = ProductionArtifactStage.EDITORIAL_ENRICHMENT
         placement = target.get("placement")
+        operation = TargetedEditorialRevisionOperation(proposal.operation)
+        paragraph_enrichment_element_kind = operation.paragraph_enrichment_element_kind
         is_paragraph_enrichment_create = (
-            proposal.operation
-            in {
-                TargetedEditorialRevisionOperation.CREATE_TABLE.value,
-                TargetedEditorialRevisionOperation.CREATE_BAR_CHART.value,
-            }
-            and target.get("element_kind")
-            == (
-                EditorialEnrichmentElementKind.TABLE.value
-                if proposal.operation == TargetedEditorialRevisionOperation.CREATE_TABLE.value
-                else EditorialEnrichmentElementKind.CHART.value
-            )
+            paragraph_enrichment_element_kind is not None
+            and target.get("element_kind") == paragraph_enrichment_element_kind.value
             and target.get("element_key") is None
             and isinstance(placement, Mapping)
             and placement.get("kind") == "after_paragraph"
@@ -1208,10 +1201,8 @@ def _proposal_pins_match(
         or not _proposal_fences_match_record(proposal, record)
     ):
         return False
-    if proposal.operation in {
-        TargetedEditorialRevisionOperation.CREATE_TABLE.value,
-        TargetedEditorialRevisionOperation.CREATE_BAR_CHART.value,
-    }:
+    operation = TargetedEditorialRevisionOperation(proposal.operation)
+    if operation.paragraph_enrichment_element_kind is not None:
         return (
             resolution.entry.source_stage is EditorialSourceStage.SYNTHESIS
             and resolution.entry.kind.value in {"paragraph", "lead_paragraph"}

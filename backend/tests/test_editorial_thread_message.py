@@ -2910,7 +2910,7 @@ def test_editorial_prompt_encodes_all_untrusted_fields_inside_nonce_envelope() -
     end_marker = f"<<<END_EDITORIAL_DATA:{nonce}>>>"
     payload = prompt.split(start_marker, 1)[1].split(end_marker, 1)[0].strip()
 
-    assert EDITORIAL_DISCUSSION_PROMPT_VERSION == "4"
+    assert EDITORIAL_DISCUSSION_PROMPT_VERSION == "5"
     assert prompt.count(marker) == 1
     assert prompt.count("<<<END_EDITORIAL_DATA:") == 1
     assert "\nPREUVES ADMISES:" not in prompt

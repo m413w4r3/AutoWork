@@ -28,7 +28,6 @@ from cti_app.domain.production import (
     ProductionArtifactStatus,
 )
 from cti_app.domain.production_editorial_enrichment import (
-    EditorialEnrichmentElementKind,
     EnrichmentTableKind,
 )
 from cti_app.domain.production_editorial_revision import (
@@ -464,28 +463,19 @@ def resolve_workspace_target(
         reduced_content = _copy_with_selected_occurrence(canonical_content, entry)
     except (TypeError, ValueError) as exc:
         raise EditorialBlockMissingError("editorial_block_missing") from exc
+    paragraph_enrichment_element_kind = typed_operation.paragraph_enrichment_element_kind
     if operation not in operations:
-        if typed_operation in {
-            TargetedEditorialRevisionOperation.CREATE_TABLE,
-            TargetedEditorialRevisionOperation.CREATE_BAR_CHART,
-        } and entry.kind in {
+        if paragraph_enrichment_element_kind is not None and entry.kind in {
             EditorialBlockKind.LEAD_PARAGRAPH,
             EditorialBlockKind.PARAGRAPH,
         }:
             operations = (*operations, typed_operation.value)
         else:
             raise EditorialBlockMissingError("editorial_block_missing")
-    if typed_operation in {
-        TargetedEditorialRevisionOperation.CREATE_TABLE,
-        TargetedEditorialRevisionOperation.CREATE_BAR_CHART,
-    }:
+    if paragraph_enrichment_element_kind is not None:
         table_target = TargetedEditorialRevisionTarget(
             kind=TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT,
-            element_kind=(
-                EditorialEnrichmentElementKind.TABLE
-                if typed_operation is TargetedEditorialRevisionOperation.CREATE_TABLE
-                else EditorialEnrichmentElementKind.CHART
-            ),
+            element_kind=paragraph_enrichment_element_kind,
             placement=TargetedEditorialRevisionPlacement(
                 kind=TargetedEditorialRevisionPlacementKind.AFTER_PARAGRAPH,
                 anchor_block_id=entry.block_id,

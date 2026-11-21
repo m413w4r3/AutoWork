@@ -40,6 +40,23 @@ class TargetedEditorialRevisionOperation(StrEnum):
     REPLACE_SOURCE_FIGURE = "replace_source_figure"
     DELETE_SOURCE_FIGURE = "delete_source_figure"
 
+    @classmethod
+    def paragraph_enrichment_insertion_values(cls) -> frozenset[str]:
+        return frozenset(
+            operation.value
+            for operation in cls
+            if operation.paragraph_enrichment_element_kind is not None
+        )
+
+    @property
+    def paragraph_enrichment_element_kind(self) -> EditorialEnrichmentElementKind | None:
+        """Element kind inserted after a paragraph by this operation, if any."""
+        if self is TargetedEditorialRevisionOperation.CREATE_TABLE:
+            return EditorialEnrichmentElementKind.TABLE
+        if self is TargetedEditorialRevisionOperation.CREATE_BAR_CHART:
+            return EditorialEnrichmentElementKind.CHART
+        return None
+
 
 class TargetedEditorialRevisionMode(StrEnum):
     EXISTING_EVIDENCE_ONLY = "existing_evidence_only"

@@ -60,6 +60,7 @@ from cti_app.application.editorial_threads import (
     EditorialThreadSessionStartResult,
 )
 from cti_app.application.editorial_workspace import EditorialWorkspaceService
+from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.production_editorial_enrichment import (
     ProductionEditorialEnrichmentService,
 )
@@ -1252,6 +1253,15 @@ async def _purge_decided_server_draft(
         return
 
 
+def _media_asset_store_for_request(
+    request: Request, *, artifact_store: Any, uow_factory: Any
+) -> MediaAssetStore:
+    configured = getattr(request.app.state, "media_asset_store", None)
+    if configured is not None:
+        return cast(MediaAssetStore, configured)
+    return MediaAssetStore(artifact_store, uow_factory)
+
+
 def _proposal_adoption_service(request: Request) -> EditorialProposalAdoptionService:
     artifact_store = getattr(request.app.state, "production_artifact_store", None)
     blob_store = getattr(request.app.state, "blob_store", None)
@@ -1288,7 +1298,9 @@ def _proposal_adoption_service(request: Request) -> EditorialProposalAdoptionSer
         artifact_store=artifact_store,
         model_gateway=model_gateway,
         editorial_enrichment_service=enrichment_writer,
-        media_asset_store=getattr(request.app.state, "media_asset_store", None),
+        media_asset_store=_media_asset_store_for_request(
+            request, artifact_store=artifact_store, uow_factory=uow_factory
+        ),
         diagram_compiler=D2DiagramCompiler(),
         chart_compiler=AnalyticChartRenderer(),
         source_media_archiver=getattr(
@@ -1349,7 +1361,9 @@ def _manual_proposal_service(request: Request) -> EditorialProposalService:
             artifact_store=artifact_store,
         ),
         chart_compiler=AnalyticChartRenderer(),
-        media_asset_store=getattr(request.app.state, "media_asset_store", None),
+        media_asset_store=_media_asset_store_for_request(
+            request, artifact_store=artifact_store, uow_factory=uow_factory
+        ),
     )
 
 
@@ -1409,6 +1423,12 @@ def _thread_service(request: Request) -> EditorialThreadService:
             blob_store=blob_store,
             artifact_store=artifact_store,
             workspace_service=workspace_service,
+            chart_compiler=AnalyticChartRenderer(),
+            media_asset_store=_media_asset_store_for_request(
+                request,
+                artifact_store=artifact_store,
+                uow_factory=request.app.state.uow_factory,
+            ),
         )
         if blob_store is not None
         else None
@@ -2452,8 +2472,10 @@ async def prepare_manual_editorial_bar_chart_proposal(
         )
         raw_reason = getattr(error, "reason", None)
         try:
+            if not isinstance(raw_reason, str):
+                raise ValueError
             reason = EditorialBarChartDiagnosticReason(raw_reason)
-        except (TypeError, ValueError):
+        except ValueError:
             reason = {
                 "bar_chart_insufficient_data": (
                     EditorialBarChartDiagnosticReason.EVIDENCE_UNADMITTED

@@ -1016,13 +1016,18 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
             raise EditorialProposalAdoptionError(
                 "proposal_base_stale", reason="routing:decision_hash"
             )
-        table_insertion = (
+        paragraph_enrichment_insertion = (
             stage is ProductionArtifactStage.EDITORIAL_ENRICHMENT
-            and proposal.operation == TargetedEditorialRevisionOperation.CREATE_TABLE.value
+            and TargetedEditorialRevisionOperation(
+                proposal.operation
+            ).paragraph_enrichment_element_kind
+            is not None
             and resolution.entry is not None
             and resolution.entry.source_stage is EditorialSourceStage.SYNTHESIS
         )
-        expected_occurrence_artifact = current_synthesis_artifact if table_insertion else artifact
+        expected_occurrence_artifact = (
+            current_synthesis_artifact if paragraph_enrichment_insertion else artifact
+        )
         if (
             expected_occurrence_artifact is None
             or resolution.artifact_id != expected_occurrence_artifact.id
@@ -1033,7 +1038,7 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
             )
         expected_resolution_sha = (
             resolution.record.synthesis_canonical_sha256
-            if table_insertion
+            if paragraph_enrichment_insertion
             else proposal.base_canonical_sha256
         )
         if resolution.canonical_sha256 != expected_resolution_sha:
