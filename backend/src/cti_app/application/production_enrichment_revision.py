@@ -16,15 +16,6 @@ from cti_app.application.editorial_enrichment_candidate import (
     materialize_candidate_diagrams,
     persist_candidate,
 )
-from cti_app.application.editorial_enrichment_candidate import (
-    insert_target as insert_candidate_target,
-)
-from cti_app.application.editorial_enrichment_candidate import (
-    remove_target as remove_candidate_target,
-)
-from cti_app.application.editorial_enrichment_candidate import (
-    replace_target as replace_candidate_target,
-)
 from cti_app.application.editorial_enrichment_revision import (
     EditorialEnrichmentRevisionLineage,
     EditorialEnrichmentRevisionValidationError,
@@ -34,6 +25,7 @@ from cti_app.application.editorial_revision_effects import (
     EditorialRevisionEffects,
     EditorialRevisionEffectsError,
 )
+from cti_app.application.editorial_workspace.registry import WorkspaceSnapshotRecord
 from cti_app.application.media_assets import compile_and_store_diagrams
 from cti_app.application.model_gateway import ModelSubmissionReconciliationRequiredError
 from cti_app.application.production_artifact_store import ProductionArtifactStore
@@ -159,6 +151,35 @@ class _EditorialEnrichmentRevisionFence:
     workspace_record: Any
 
 
+class _ReadOnlyWorkspaceSnapshotRepository:
+    """Let workspace readers build an ephemeral snapshot without appending it."""
+
+    def __init__(self, repository: Any) -> None:
+        self._repository = repository
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._repository, name)
+
+    async def append_if_absent(self, record: WorkspaceSnapshotRecord) -> WorkspaceSnapshotRecord:
+        existing = await self._repository.get_by_pin(
+            record.production_run_id, record.workspace_pin_hash
+        )
+        return cast(WorkspaceSnapshotRecord, existing or record)
+
+
+class _ReadOnlyWorkspaceSnapshotUow:
+    """Proxy one UOW while making its snapshot repository read-only."""
+
+    def __init__(self, uow: Any) -> None:
+        self._uow = uow
+        self.editorial_workspace_snapshots = _ReadOnlyWorkspaceSnapshotRepository(
+            uow.editorial_workspace_snapshots
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._uow, name)
+
+
 class _StoredSourceMediaArchiver:
     """Expose already persisted media candidates without collecting new media."""
 
@@ -259,7 +280,9 @@ class ProductionEditorialEnrichmentRevisionService:
             workspace_record = await EditorialWorkspaceService(
                 uow_factory=cast(Any, self._enrichment._uow_factory),
                 artifact_store=self._enrichment._artifact_store,
-            ).snapshot_record_in_uow(cast(Any, uow), snapshot.subject_id)
+            ).snapshot_record_in_uow(
+                cast(Any, _ReadOnlyWorkspaceSnapshotUow(uow)), snapshot.subject_id
+            )
             if workspace_record.synthesis_artifact_id != synthesis_artifact.id:
                 raise EditorialEnrichmentRevisionConflictError(
                     "The pinned synthesis no longer matches the requested revision base"
@@ -2518,64 +2541,6 @@ class ProductionEditorialEnrichmentRevisionService:
             )
         return compilation.diagrams[0]
 
-    async def _replace_target(
-        self,
-        base: EditorialEnrichmentV1,
-        candidate: EditorialEnrichmentV1,
-        *,
-        element_kind: EditorialEnrichmentElementKind,
-        element_key: str,
-        run_id: UUID,
-    ) -> EditorialEnrichmentV1:
-        revised = replace_candidate_target(
-            base,
-            candidate,
-            element_kind=element_kind,
-            element_key=element_key,
-        )
-        if element_kind is not EditorialEnrichmentElementKind.DIAGRAM:
-            return revised
-        materialized = await self._materialize_candidate_diagram(
-            next(item for item in revised.diagrams if item.key == element_key), run_id=run_id
-        )
-        return replace(
-            revised,
-            diagrams=tuple(
-                materialized if item.key == element_key else item for item in revised.diagrams
-            ),
-        )
-
-    async def _insert_target(
-        self,
-        base: EditorialEnrichmentV1,
-        candidate: EditorialEnrichmentV1,
-        *,
-        element_kind: EditorialEnrichmentElementKind,
-        element_key: str,
-        run_id: UUID,
-    ) -> EditorialEnrichmentV1:
-        revised = insert_candidate_target(
-            base,
-            candidate,
-            element_kind=element_kind,
-            element_key=element_key,
-        )
-        if element_kind is not EditorialEnrichmentElementKind.DIAGRAM:
-            return revised
-        materialized = await self._materialize_candidate_diagram(
-            next(item for item in revised.diagrams if item.key == element_key), run_id=run_id
-        )
-        return replace(revised, diagrams=(*revised.diagrams[:-1], materialized))
-
-    @staticmethod
-    def _remove_target(
-        base: EditorialEnrichmentV1,
-        *,
-        element_kind: EditorialEnrichmentElementKind,
-        element_key: str,
-    ) -> EditorialEnrichmentV1:
-        return remove_candidate_target(base, element_kind=element_kind, element_key=element_key)
-
     @staticmethod
     def _generated_element_key(
         element_kind: EditorialEnrichmentElementKind,
@@ -2746,13 +2711,6 @@ class ProductionEditorialEnrichmentRevisionService:
             ):
                 return item
         return None
-
-    @staticmethod
-    def _next_resource_need_key(enrichment: EditorialEnrichmentV1) -> str:
-        numbers = [
-            int(item.key[1:]) for item in enrichment.resource_needs if item.key[1:].isdigit()
-        ]
-        return f"N{max(numbers, default=0) + 1:03d}"
 
     @staticmethod
     def _optional_uuid(value: Any) -> UUID | None:
