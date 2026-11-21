@@ -149,6 +149,130 @@ def test_bar_data_requires_finite_evidence_backed_values() -> None:
     assert getattr(caught.value, "code", None) == "bar_chart_insufficient_data"
 
 
+def test_bar_point_requires_value_and_unit_in_the_same_admitted_evidence() -> None:
+    from cti_app.application.editorial_proposals import _validate_bar_chart_evidence
+
+    value_ref, unit_ref = _reference(), _reference()
+    chart = _bar_chart(values=("12", "18"), evidence_refs=(value_ref, unit_ref))
+    chart = replace(
+        chart,
+        points=(
+            replace(chart.points[0], evidence_refs=(value_ref, unit_ref)),
+            replace(chart.points[1], evidence_refs=(unit_ref,)),
+        ),
+    )
+    evidence_entries = {
+        value_ref: {"value": "12", "evidence_quote": "Alpha recorded 12 observations."},
+        unit_ref: {
+            "value": "Beta recorded 18 endpoints",
+            "evidence_quote": "Beta recorded 18 endpoints.",
+        },
+    }
+
+    with pytest.raises(ValueError) as caught:
+        _validate_bar_chart_evidence(
+            chart,
+            evidence_entries=evidence_entries,
+            admitted_refs=frozenset(evidence_entries),
+        )
+
+    assert getattr(caught.value, "code", None) == "bar_chart_insufficient_data"
+    assert getattr(caught.value, "validator_code", None) == "bar_chart_value_not_evidenced"
+
+    evidence_entries[value_ref] = {
+        "value": "Alpha recorded 12 endpoints and Beta recorded 18 endpoints.",
+        "evidence_quote": "Alpha recorded 12 endpoints and Beta recorded 18 endpoints.",
+    }
+    supported = replace(
+        chart,
+        points=(
+            replace(chart.points[0], evidence_refs=(value_ref,)),
+            replace(chart.points[1], evidence_refs=(value_ref,)),
+        ),
+    )
+    _validate_bar_chart_evidence(
+        supported,
+        evidence_entries=evidence_entries,
+        admitted_refs=frozenset(evidence_entries),
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("title", "https://example.test/report"),
+        ("caption", "www.example.test/report"),
+        ("category_axis_label", "https://example.test/category"),
+        ("value_axis_label", "www.example.test/value"),
+        ("unit", "https://example.test/unit"),
+        ("point_label", "www.example.test/point"),
+        ("series", "https://example.test/series"),
+    ],
+)
+def test_manual_bar_chart_text_rejects_raw_urls(field: str, value: str) -> None:
+    from cti_app.application.editorial_proposals import _editorial_bar_chart_text_violation
+
+    chart = _bar_chart()
+    if field in {"point_label", "series"}:
+        point = chart.points[0]
+        point = replace(point, **{"label" if field == "point_label" else field: value})
+        chart = replace(chart, points=(point, *chart.points[1:]))
+    else:
+        chart = replace(chart, **{field: value})
+
+    assert _editorial_bar_chart_text_violation(chart)
+
+
+def test_manual_validator_code_does_not_expose_user_keys() -> None:
+    from cti_app.application.editorial_proposals import (
+        EditorialProposalApplicationError,
+        _manual_table_validator_code,
+    )
+
+    error = EditorialProposalApplicationError(
+        "manual_edit_patch_invalid", validator_code="client_case_alpha"
+    )
+
+    assert _manual_table_validator_code(error, fallback="manual_edit_patch_invalid") == (
+        "manual_edit_patch_invalid"
+    )
+
+
+def test_bar_chart_json_parsing_preserves_exact_decimal_values() -> None:
+    from cti_app.application.editorial_proposals import (
+        _parse_editorial_patch_payload,
+        _validate_bar_chart_evidence,
+    )
+
+    payload = _parse_editorial_patch_payload(
+        '{"value":0.10000000000000001,"count":18}', exact_chart_numbers=True
+    )
+    exact_value = payload["value"]
+    assert exact_value == Decimal("0.10000000000000001")
+    assert exact_value != Decimal("0.1")
+    assert payload["count"] == Decimal("18")
+
+    chart = _bar_chart()
+    chart = replace(
+        chart,
+        points=(
+            replace(chart.points[0], value=exact_value),
+            chart.points[1],
+        ),
+    )
+    evidence_entries = {
+        chart.points[0].evidence_refs[0]: {"value": "0.1 endpoints"},
+        chart.points[1].evidence_refs[0]: {"value": "18 endpoints"},
+    }
+    with pytest.raises(ValueError) as caught:
+        _validate_bar_chart_evidence(
+            chart,
+            evidence_entries=evidence_entries,
+            admitted_refs=frozenset(evidence_entries),
+        )
+    assert getattr(caught.value, "validator_code", None) == "bar_chart_value_not_evidenced"
+
+
 def test_insufficient_data_refuses_without_invented_value() -> None:
     reference = _reference()
 

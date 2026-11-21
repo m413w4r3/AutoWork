@@ -465,7 +465,7 @@ EDITORIAL_ENRICHMENT_REVISION_PROMPT_VERSION = (
     "editorial-enrichment-revision-v8-evidence-backed-bar-charts"
 )
 EDITORIAL_ENRICHMENT_REVISION_CONTRACT_VERSION = (
-    "editorial-enrichment-revision-contract-v9-evidence-backed-bar-charts"
+    "editorial-enrichment-revision-contract-v9-bar-evidence"
 )
 RELEVANCE_CLASSIFIER_PROMPT_VERSION = "subject-relevance-classifier-v5-other-case-out-of-scope"
 RELEVANCE_CLASSIFIER_CONTRACT_VERSION = "subject-relevance-text-blocks-v3-other-case-out-of-scope"

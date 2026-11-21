@@ -559,6 +559,8 @@ def test_proposal_state_conflict_rejects_non_vocabulary_reason() -> None:
 def test_manual_table_text_rejects_markup() -> None:
     assert _editorial_patch_text_violation("<b>forged cell</b>")
     assert _editorial_patch_text_violation('#raw("forged Typst")')
+    assert _editorial_patch_text_violation("https://example.test/report")
+    assert _editorial_patch_text_violation("www.example.test/report")
 
 
 @pytest.mark.asyncio
@@ -635,6 +637,34 @@ async def test_manual_table_input_rejects_unsafe_text_with_stable_code(
             2,
             "caption",
             '#link("https://example.test", "link")',
+            "needs_review",
+            "revision_wire_markup_forbidden",
+        ),
+        (
+            2,
+            "title",
+            "https://example.test/report",
+            "needs_review",
+            "revision_wire_markup_forbidden",
+        ),
+        (
+            2,
+            "caption",
+            "www.example.test/report",
+            "needs_review",
+            "revision_wire_markup_forbidden",
+        ),
+        (
+            2,
+            "column_label",
+            "https://example.test/source",
+            "needs_review",
+            "revision_wire_markup_forbidden",
+        ),
+        (
+            2,
+            "cell",
+            "www.example.test/value",
             "needs_review",
             "revision_wire_markup_forbidden",
         ),

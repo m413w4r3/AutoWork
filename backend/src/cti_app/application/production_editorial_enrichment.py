@@ -269,6 +269,7 @@ _RENDERER_SYNTAX = re.compile(
 )
 _EVIDENCE_HANDLE_RE = re.compile(r"^E[0-9]{3,}$")
 _BAR_VALUE_TOKEN_RE = re.compile(r"(?<![\w.])[-+]?(?:\d+(?:\.\d+)?|\.\d+)(?![\w.])")
+_RAW_EDITORIAL_URL_RE = re.compile(r"(?:https?://|www\.)", re.IGNORECASE)
 
 
 def _canonical_json_bytes(payload: Any) -> bytes:
@@ -4367,13 +4368,34 @@ class EditorialEnrichmentStageErrorCode(StrEnum):
     RECONCILIATION_REQUIRED = PRODUCTION_RECONCILIATION_ERROR_CODE
 
 
+_EDITORIAL_ENRICHMENT_DIAGNOSTIC_CODES = frozenset(
+    {
+        *(code.value for code in EditorialEnrichmentStageErrorCode),
+        "bar_chart_value_not_finite",
+        "bar_chart_value_not_evidenced",
+        "bar_chart_category_axis_label_missing",
+        "bar_chart_value_axis_label_missing",
+        "bar_chart_unit_missing",
+        "bar_chart_raw_url_forbidden",
+        "chart_purpose_evidence_not_used_by_points",
+        "plain_text_violation",
+        "renderer_syntax_not_allowed_in_plain_editorial_text",
+    }
+)
+
+
 def _editorial_enrichment_diagnostic_code(message: str | None, *, fallback: str) -> str:
     if message:
-        tail = message.rsplit(":", 1)[-1].strip().rstrip(".,;)")
-        match = re.fullmatch(r"[a-z][a-z0-9_]{2,}", tail, re.IGNORECASE)
-        if match is not None:
-            return match.group()
-    return fallback
+        if message.startswith("chart_purpose_evidence_not_used_by_points:"):
+            return "chart_purpose_evidence_not_used_by_points"
+        candidate = message.strip().rstrip(".,;)")
+        if ":" not in candidate and candidate in _EDITORIAL_ENRICHMENT_DIAGNOSTIC_CODES:
+            return candidate
+    return (
+        fallback
+        if fallback in _EDITORIAL_ENRICHMENT_DIAGNOSTIC_CODES
+        else EditorialEnrichmentStageErrorCode.OUTPUT_INVALID.value
+    )
 
 
 class EditorialEnrichmentProposalControlError(RuntimeError):
@@ -6141,6 +6163,48 @@ def _editorial_text_diagnostic(context: str | None, reason: str) -> str:
     return f"{context}:{reason}" if context else reason
 
 
+def _proposal_text_has_raw_url(values: tuple[str, ...]) -> bool:
+    return any(_RAW_EDITORIAL_URL_RE.search(value) for value in values)
+
+
+def _table_proposal_has_raw_url(table: TableProposalV1) -> bool:
+    purpose = table.purpose
+    values = (
+        table.key,
+        table.title,
+        table.caption or "",
+        *(value for column in table.columns for value in (column.key, column.label)),
+        *(cell for row in table.rows for cell in row.cells),
+        purpose.question,
+        purpose.available_data,
+        purpose.comprehension_gain,
+        purpose.scope,
+        purpose.knowledge_limits,
+        purpose.placement_reason,
+    )
+    return _proposal_text_has_raw_url(values)
+
+
+def _bar_chart_proposal_has_raw_url(chart: ChartProposalV1) -> bool:
+    purpose = chart.purpose
+    values = (
+        chart.key,
+        chart.title,
+        chart.caption or "",
+        chart.category_axis_label or "",
+        chart.value_axis_label or "",
+        chart.unit or "",
+        *(value for point in chart.points for value in (point.label, point.series)),
+        purpose.question,
+        purpose.available_data,
+        purpose.comprehension_gain,
+        purpose.scope,
+        purpose.knowledge_limits,
+        purpose.placement_reason,
+    )
+    return _proposal_text_has_raw_url(values)
+
+
 def _validate_plain_editorial_text(value: str, *, context: str | None = None) -> None:
     plain_text_value = value
     if (
@@ -6422,6 +6486,12 @@ def validate_editorial_enrichment_proposal(
         )
 
     for table in parsed.tables:
+        if _table_proposal_has_raw_url(table):
+            raise EditorialEnrichmentProposalControlError(
+                EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
+                message="table_raw_url_forbidden",
+                diagnostic_code="table_raw_url_forbidden",
+            )
         if _table_republishes_projected_iocs(table, evidence_pack._projected_ioc_keys):
             raise EditorialEnrichmentProposalControlError(
                 EditorialEnrichmentStageErrorCode.TABLE_IOC_REPUBLICATION,
@@ -6704,6 +6774,12 @@ def validate_editorial_enrichment_proposal(
             ) from exc
 
     for chart in parsed.charts:
+        if chart.kind is ChartKind.BAR and _bar_chart_proposal_has_raw_url(chart):
+            raise EditorialEnrichmentProposalControlError(
+                EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
+                message="bar_chart_raw_url_forbidden",
+                diagnostic_code="bar_chart_raw_url_forbidden",
+            )
         if not chart.points:
             raise EditorialEnrichmentProposalControlError(
                 EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
@@ -6724,26 +6800,28 @@ def validate_editorial_enrichment_proposal(
                         EditorialEnrichmentStageErrorCode.UNKNOWN_TECHNICAL_VALUE,
                         message="bar_chart_value_not_finite",
                     )
-                numeric_supported = False
-                unit_supported = False
+                value_and_unit_share_evidence = False
                 for ref in refs:
                     if ref.kind not in {EvidenceKind.FACT, EvidenceKind.EVENT}:
                         continue
                     payload = entries[ref]
                     texts = tuple(_string_values(payload))
-                    if any(
-                        bar_chart_evidence_contains_unit(chart.unit or "", text) for text in texts
-                    ):
-                        unit_supported = True
+                    value_is_documented = False
+                    unit_is_documented = False
                     for text in texts:
+                        if bar_chart_evidence_contains_unit(chart.unit or "", text):
+                            unit_is_documented = True
                         for match in _BAR_VALUE_TOKEN_RE.finditer(text):
                             try:
-                                value = Decimal(match.group())
+                                observed_value = Decimal(match.group())
                             except InvalidOperation:
                                 continue
-                            if value.is_finite() and value == point.value:
-                                numeric_supported = True
-                if not numeric_supported or not unit_supported:
+                            if observed_value.is_finite() and observed_value == point.value:
+                                value_is_documented = True
+                    if value_is_documented and unit_is_documented:
+                        value_and_unit_share_evidence = True
+                        break
+                if not value_and_unit_share_evidence:
                     raise EditorialEnrichmentProposalControlError(
                         EditorialEnrichmentStageErrorCode.UNKNOWN_TECHNICAL_VALUE,
                         message="bar_chart_value_not_evidenced",
@@ -6823,9 +6901,9 @@ def validate_editorial_enrichment_proposal(
         if not purpose_refs or not set(purpose_refs) <= chart_refs:
             raise EditorialEnrichmentProposalControlError(
                 EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
-                message=f"chart_purpose_evidence_not_used_by_points:{chart.key}",
+                message="chart_purpose_evidence_not_used_by_points",
             )
-        for field_name, value in (
+        for field_name, purpose_value in (
             ("question", chart.purpose.question),
             ("available_data", chart.purpose.available_data),
             ("comprehension_gain", chart.purpose.comprehension_gain),
@@ -6834,25 +6912,25 @@ def validate_editorial_enrichment_proposal(
             ("placement_reason", chart.purpose.placement_reason),
         ):
             _validate_grounded_editorial_text(
-                value,
+                purpose_value,
                 purpose_refs,
                 entries,
                 technical_support,
                 context=f"chart:{chart.key}:purpose.{field_name}",
             )
         if chart.kind is ChartKind.BAR:
-            for field_name, value in (
+            for field_name, axis_value in (
                 ("category_axis_label", chart.category_axis_label),
                 ("value_axis_label", chart.value_axis_label),
                 ("unit", chart.unit),
             ):
-                if not isinstance(value, str) or not value.strip():
+                if not isinstance(axis_value, str) or not axis_value.strip():
                     raise EditorialEnrichmentProposalControlError(
                         EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
                         message=f"bar_chart_{field_name}_missing",
                     )
                 _validate_ungrounded_editorial_text(
-                    value, context=f"chart:{chart.key}:{field_name}"
+                    axis_value, context=f"chart:{chart.key}:{field_name}"
                 )
         try:
             charts.append(

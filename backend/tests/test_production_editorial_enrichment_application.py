@@ -1715,6 +1715,211 @@ END CHART"""
     assert serialized["charts"][0]["unit"] == "endpoints"
 
 
+def _bar_chart_proposal_payload(
+    *,
+    evidence_handles: tuple[str, ...],
+    point_handles: tuple[tuple[str, ...], tuple[str, ...]],
+    title: str = "Reported endpoint counts",
+) -> dict[str, object]:
+    return {
+        "charts": [
+            {
+                "key": "reported_endpoint_counts",
+                "kind": "bar",
+                "title": title,
+                "caption": "The two documented counts.",
+                "placement": {"kind": EnrichmentPlacementKind.AFTER_LEAD},
+                "purpose": {
+                    "question": "Which endpoint counts are reported?",
+                    "available_data": "The two cited endpoint counts.",
+                    "comprehension_gain": "Compare the documented counts.",
+                    "scope": "Only the two cited records.",
+                    "evidence_handles": evidence_handles,
+                    "knowledge_limits": "No additional count is inferred.",
+                    "placement_reason": "Place beside the count summary.",
+                },
+                "points": [
+                    {
+                        "label": "Alpha",
+                        "date": None,
+                        "series": "endpoints",
+                        "evidence_handles": point_handles[0],
+                        "value": Decimal("12"),
+                    },
+                    {
+                        "label": "Beta",
+                        "date": None,
+                        "series": "endpoints",
+                        "evidence_handles": point_handles[1],
+                        "value": Decimal("18"),
+                    },
+                ],
+                "category_axis_label": "Category",
+                "value_axis_label": "Reported count",
+                "unit": "endpoints",
+            }
+        ]
+    }
+
+
+def _bar_chart_validation_inputs(
+    texts: tuple[str, ...],
+) -> tuple[
+    ProductionInputSnapshot,
+    ProductionExtractionV1,
+    ProductionSynthesisV1,
+    EditorialEnrichmentEvidencePackV1,
+    dict[str, str],
+]:
+    snapshot = _snapshot()
+    facts = tuple(
+        ExtractionFactV1(
+            category="other_technical",
+            value=text,
+            attack_id=None,
+            context=text,
+            evidence_quote=text,
+            evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+            source_document_ids=(_DOCUMENT_ID,),
+        )
+        for text in texts
+    )
+    extraction = _extraction(facts=facts, input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    handles_by_text = {str(item["value"]): str(item["handle"]) for item in pack.narrative_evidence}
+    return snapshot, extraction, synthesis, pack, handles_by_text
+
+
+def test_bridge_bar_point_requires_value_and_unit_in_the_same_evidence() -> None:
+    _, extraction, synthesis, pack, handles = _bar_chart_validation_inputs(
+        ("Alpha reported 12 observations.", "Beta reported 18 endpoints.")
+    )
+    alpha_handle = handles["Alpha reported 12 observations."]
+    beta_handle = handles["Beta reported 18 endpoints."]
+    split_evidence = EditorialEnrichmentProposalV1.model_validate(
+        _bar_chart_proposal_payload(
+            evidence_handles=(alpha_handle, beta_handle),
+            point_handles=((alpha_handle, beta_handle), (beta_handle,)),
+        )
+    )
+
+    with pytest.raises(EditorialEnrichmentProposalControlError) as caught:
+        validate_editorial_enrichment_proposal(
+            split_evidence,
+            pack,
+            extraction,
+            synthesis,
+            _drop_invalid_blocks=False,
+        )
+
+    assert caught.value.code is EditorialEnrichmentStageErrorCode.UNKNOWN_TECHNICAL_VALUE
+    assert caught.value.diagnostic_code == "bar_chart_value_not_evidenced"
+
+    _, same_extraction, same_synthesis, same_pack, same_handles = _bar_chart_validation_inputs(
+        ("Alpha reported 12 endpoints and Beta reported 18 endpoints.",)
+    )
+    same_handle = same_handles["Alpha reported 12 endpoints and Beta reported 18 endpoints."]
+    same_evidence = EditorialEnrichmentProposalV1.model_validate(
+        _bar_chart_proposal_payload(
+            evidence_handles=(same_handle,),
+            point_handles=((same_handle,), (same_handle,)),
+        )
+    )
+    result = validate_editorial_enrichment_proposal(
+        same_evidence,
+        same_pack,
+        same_extraction,
+        same_synthesis,
+    )
+    assert len(result.charts) == 1
+
+
+def test_bridge_bar_chart_rejects_raw_urls_in_display_text() -> None:
+    _, extraction, synthesis, pack, handles = _bar_chart_validation_inputs(
+        ("Alpha reported 12 endpoints and Beta reported 18 endpoints.",)
+    )
+    handle = handles["Alpha reported 12 endpoints and Beta reported 18 endpoints."]
+    proposal = EditorialEnrichmentProposalV1.model_validate(
+        _bar_chart_proposal_payload(
+            evidence_handles=(handle,),
+            point_handles=((handle,), (handle,)),
+            title="https://example.test/report",
+        )
+    )
+
+    with pytest.raises(EditorialEnrichmentProposalControlError) as caught:
+        validate_editorial_enrichment_proposal(
+            proposal,
+            pack,
+            extraction,
+            synthesis,
+            _drop_invalid_blocks=False,
+        )
+
+    assert caught.value.code is EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+    assert caught.value.diagnostic_code == "bar_chart_raw_url_forbidden"
+
+
+def test_bridge_table_rejects_raw_urls_in_display_text() -> None:
+    _, extraction, synthesis, pack, handles = _bar_chart_validation_inputs(
+        ("Alpha reported 12 endpoints and Beta reported 18 endpoints.",)
+    )
+    handle = handles["Alpha reported 12 endpoints and Beta reported 18 endpoints."]
+    proposal = EditorialEnrichmentProposalV1.model_validate(
+        {
+            "tables": [
+                {
+                    "key": "reported_endpoint_counts",
+                    "kind": "custom",
+                    "title": "www.example.test/report",
+                    "caption": "The two documented counts.",
+                    "columns": [
+                        {"key": "category", "label": "Category"},
+                        {"key": "count", "label": "Count"},
+                    ],
+                    "rows": [
+                        {"cells": ["Alpha", "12"], "evidence_handles": [handle]},
+                        {"cells": ["Beta", "18"], "evidence_handles": [handle]},
+                    ],
+                    "placement": {"kind": EnrichmentPlacementKind.AFTER_LEAD},
+                    "purpose": {
+                        "question": "Which counts are reported?",
+                        "available_data": "The two cited counts.",
+                        "comprehension_gain": "Compare the documented counts.",
+                        "scope": "Only the two cited records.",
+                        "evidence_handles": [handle],
+                        "knowledge_limits": "No additional count is inferred.",
+                        "placement_reason": "Place beside the count summary.",
+                    },
+                }
+            ]
+        }
+    )
+
+    with pytest.raises(EditorialEnrichmentProposalControlError) as caught:
+        validate_editorial_enrichment_proposal(
+            proposal,
+            pack,
+            extraction,
+            synthesis,
+            _drop_invalid_blocks=False,
+        )
+
+    assert caught.value.code is EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+    assert caught.value.diagnostic_code == "table_raw_url_forbidden"
+
+
+def test_enrichment_diagnostic_code_does_not_expose_chart_keys() -> None:
+    assert (
+        enrichment_module._editorial_enrichment_diagnostic_code(
+            "chart_purpose_evidence_not_used_by_points:client_case_alpha",
+            fallback=EditorialEnrichmentStageErrorCode.OUTPUT_INVALID.value,
+        )
+        == "chart_purpose_evidence_not_used_by_points"
+    )
+
+
 def test_fixture_d_structured_exfiltration_mapping_keeps_one_table() -> None:
     text = (
         "Credentials are collected during exfiltration at the collection step under "

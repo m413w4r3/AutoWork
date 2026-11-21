@@ -257,6 +257,21 @@ describe("EditorialDocument", () => {
     ).toBeVisible();
     expect(screen.getByText("Série synthétique")).toBeVisible();
     expect(screen.getByText("8 unités")).toBeVisible();
+    const documentChart = screen.getByRole("figure", {
+      name: "Graphique : Valeurs documentées",
+    });
+    const documentBars = Array.from(
+      documentChart.querySelectorAll<HTMLElement>(".editorial-bar-chart__bar"),
+    );
+    expect(documentBars.map((bar) => bar.style.left)).toEqual(["0%", "0%"]);
+    expect(documentBars.map((bar) => bar.style.width)).toEqual(["50%", "100%"]);
+    expect(
+      Array.from(
+        documentChart.querySelectorAll<HTMLElement>(
+          ".editorial-bar-chart__zero",
+        ),
+      ).map((axis) => axis.style.left),
+    ).toEqual(["0%", "0%"]);
     fireEvent.click(screen.getByText(/Sources du point 1/));
     expect(screen.getByText(/d{64}/)).toBeVisible();
   });

@@ -2523,14 +2523,13 @@ main:has(> .editorial-route-state) > .app-header {
   background: var(--editorial-panel);
 }
 
-.editorial-bar-chart__track::after {
+.editorial-bar-chart__zero {
   position: absolute;
   top: 0;
   bottom: 0;
-  left: 50%;
+  z-index: 2;
   width: 1px;
   background: var(--editorial-divider-strong);
-  content: "";
 }
 
 .editorial-bar-chart__bar {

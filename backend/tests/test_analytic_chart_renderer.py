@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import xml.etree.ElementTree as ET
+from decimal import Decimal
 from uuid import UUID
 
 import pytest
@@ -20,6 +21,7 @@ from cti_app.domain.production_synthesis import EvidenceKind, ExtractionEvidence
 from cti_app.infrastructure.analytic_chart_renderer import (
     ANALYTIC_CHART_PALETTE,
     AnalyticChartRenderer,
+    render_bar_svg,
     render_timeline_svg,
 )
 
@@ -181,3 +183,24 @@ def test_compiler_returns_repeatable_svg_bytes_and_sha256() -> None:
     digest = hashlib.sha256(first.media_bytes).hexdigest()
     assert first.media_sha256 == second.media_sha256 == digest
     ET.fromstring(first.media_bytes)
+
+
+def test_bar_renderer_rejects_xml_10_forbidden_characters() -> None:
+    chart = ChartSpecV1(
+        key="documented_counts",
+        kind=ChartKind.BAR,
+        title="Documented counts\ufffe",
+        caption="Two cited counts.",
+        placement=EnrichmentPlacementV1(EnrichmentPlacementKind.AFTER_LEAD),
+        purpose=_PURPOSE,
+        points=(
+            ChartPointV1("Alpha", None, "Endpoints", (_REF,), Decimal("12")),
+            ChartPointV1("Beta", None, "Endpoints", (_REF,), Decimal("18")),
+        ),
+        category_axis_label="Category",
+        value_axis_label="Reported count",
+        unit="endpoints",
+    )
+
+    with pytest.raises(ValueError, match=r"XML 1\.0"):
+        render_bar_svg(chart)

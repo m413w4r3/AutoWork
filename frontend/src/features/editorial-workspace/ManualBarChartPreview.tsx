@@ -1,3 +1,5 @@
+import { getBarChartScale } from "./BarChartScale";
+
 export interface BarChartPreviewEvidence {
   label: string;
   passage: string | null;
@@ -39,11 +41,9 @@ export function ManualBarChartPreview({
   unit,
   points,
 }: ManualBarChartPreviewProps) {
-  const magnitudes = points.flatMap((point) => {
-    const value = parsedValue(point.value);
-    return value === null ? [] : [Math.abs(value)];
-  });
-  const maximumMagnitude = Math.max(0, ...magnitudes);
+  const scale = getBarChartScale(
+    points.map((point) => parsedValue(point.value)),
+  );
 
   return (
     <figure
@@ -78,14 +78,13 @@ export function ManualBarChartPreview({
       </p>
       <ol className="editorial-bar-chart__points">
         {points.map((point, index) => {
-          const numericValue = parsedValue(point.value);
-          const magnitude = numericValue === null ? 0 : Math.abs(numericValue);
-          const width =
-            maximumMagnitude === 0 ? 0 : (magnitude / maximumMagnitude) * 50;
-          const barStyle =
-            numericValue !== null && numericValue < 0
-              ? { right: "50%", width: `${width}%` }
-              : { left: "50%", width: `${width}%` };
+          const geometry = scale.points[index];
+          const barStyle = geometry
+            ? {
+                left: `${geometry.startPercent}%`,
+                width: `${geometry.widthPercent}%`,
+              }
+            : undefined;
 
           return (
             <li
@@ -96,6 +95,10 @@ export function ManualBarChartPreview({
                 {point.label || `Point ${index + 1}`}
               </span>
               <span className="editorial-bar-chart__track" aria-hidden="true">
+                <span
+                  className="editorial-bar-chart__zero"
+                  style={{ left: `${scale.zeroPositionPercent}%` }}
+                />
                 <span className="editorial-bar-chart__bar" style={barStyle} />
               </span>
               <span className="editorial-bar-chart__value">

@@ -261,6 +261,21 @@ describe("VisualInsertionComposer bar chart", () => {
     ).toHaveLength(2);
 
     fillChart();
+    const chartPreview = screen.getByRole("figure", {
+      name: "Graphique : Valeurs documentées",
+    });
+    const previewBars = Array.from(
+      chartPreview.querySelectorAll<HTMLElement>(".editorial-bar-chart__bar"),
+    );
+    expect(previewBars.map((bar) => bar.style.left)).toEqual(["0%", "0%"]);
+    expect(previewBars.map((bar) => bar.style.width)).toEqual(["50%", "100%"]);
+    expect(
+      Array.from(
+        chartPreview.querySelectorAll<HTMLElement>(
+          ".editorial-bar-chart__zero",
+        ),
+      ).map((axis) => axis.style.left),
+    ).toEqual(["0%", "0%"]);
     expect(
       screen.getByRole("button", { name: "Ajouter un point" }),
     ).toBeEnabled();

@@ -7,6 +7,7 @@ from collections import defaultdict
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from html import escape
+from typing import cast
 
 from cti_app.application.analytic_chart_compilation import (
     AnalyticChartCompilationError,
@@ -90,7 +91,7 @@ def render_timeline_svg(chart: ChartSpecV1) -> bytes:
         name: ANALYTIC_CHART_PALETTE[index % len(ANALYTIC_CHART_PALETTE)]
         for index, name in enumerate(series_names)
     }
-    instants = [_instant(point.date) for point in points]
+    instants = [_instant(cast(str, point.date)) for point in points]
     low = min(instants)
     high = max(instants)
     span = (high - low).total_seconds()
@@ -106,14 +107,14 @@ def render_timeline_svg(chart: ChartSpecV1) -> bytes:
     # Exact duplicates in one series stay visible by receiving a small stable x offset.
     grouped: dict[tuple[str, datetime], list[tuple[int, ChartPointV1]]] = defaultdict(list)
     for index, point in enumerate(points):
-        grouped[(point.series, _instant(point.date))].append((index, point))
+        grouped[(point.series, _instant(cast(str, point.date)))].append((index, point))
     jitter: dict[int, float] = {}
     for (_series, _moment), siblings in grouped.items():
         ordered = sorted(siblings, key=lambda item: _point_identity(item[1]))
         for offset, (point_index, _point) in enumerate(ordered):
             jitter[point_index] = (offset - (len(ordered) - 1) / 2) * 5.0
 
-    date_only = all(len(point.date) == 10 for point in points)
+    date_only = all(len(cast(str, point.date)) == 10 for point in points)
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{_WIDTH}" height="{height}" '
         f'viewBox="0 0 {_WIDTH} {height}" role="img" aria-labelledby="title desc">',
@@ -149,7 +150,7 @@ def render_timeline_svg(chart: ChartSpecV1) -> bytes:
 
     label_boxes: list[tuple[float, float, float, float]] = []
     for point_index, point in enumerate(points):
-        instant = _instant(point.date)
+        instant = _instant(cast(str, point.date))
         base_x = x_position(instant)
         x = min(_PLOT_RIGHT - 2, max(_PLOT_LEFT + 2, base_x + jitter[point_index]))
         y = _PLOT_TOP + series_index[point.series] * _ROW_HEIGHT + 22
@@ -157,7 +158,7 @@ def render_timeline_svg(chart: ChartSpecV1) -> bytes:
         parts.append(
             f'<circle cx="{x:.2f}" cy="{y:.2f}" r="4.2" fill="{color}" '
             f'stroke="#FFFFFF" stroke-width="1.2"><title>{_xml_text(point.label)} | '
-            f"{_xml_text(point.date)} | {_xml_text(point.series)}</title></circle>"
+            f"{_xml_text(cast(str, point.date))} | {_xml_text(point.series)}</title></circle>"
         )
 
         label = _short_label(point.label)
@@ -230,10 +231,42 @@ def _bar_label(value: str, *, maximum: int = 32) -> str:
     return compact[: maximum - 1].rstrip() + "…"
 
 
+def _is_xml_10_text(value: str) -> bool:
+    return all(
+        ord(character) in {0x9, 0xA, 0xD}
+        or 0x20 <= ord(character) <= 0xD7FF
+        or 0xE000 <= ord(character) <= 0xFFFD
+        or 0x10000 <= ord(character) <= 0x10FFFF
+        for character in value
+    )
+
+
+def _validate_bar_chart_xml_text(chart: ChartSpecV1) -> None:
+    purpose = chart.purpose
+    values = (
+        chart.key,
+        chart.title,
+        chart.caption or "",
+        chart.category_axis_label or "",
+        chart.value_axis_label or "",
+        chart.unit or "",
+        *(value for point in chart.points for value in (point.label, point.series)),
+        purpose.question,
+        purpose.available_data,
+        purpose.comprehension_gain,
+        purpose.scope,
+        purpose.knowledge_limits,
+        purpose.placement_reason,
+    )
+    if any(not _is_xml_10_text(value) for value in values):
+        raise ValueError("Bar chart text contains characters forbidden by XML 1.0")
+
+
 def render_bar_svg(chart: ChartSpecV1) -> bytes:
     """Render exact finite values and labels without deriving data points."""
     if not isinstance(chart, ChartSpecV1) or chart.kind.value != "bar":
         raise ValueError("Expected a typed bar ChartSpecV1")
+    _validate_bar_chart_xml_text(chart)
     if any(point.value is None for point in chart.points):
         raise ValueError("Bar chart point is missing its value")
 

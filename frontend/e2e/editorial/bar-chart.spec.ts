@@ -390,6 +390,19 @@ test("accepts a supported bar chart and renders it after its anchor in snapshot 
 
   const anchor = await openChartComposer(page);
   await fillChartForm(page);
+  const preview = page.getByRole("figure", {
+    name: "Graphique : Valeurs documentées",
+  });
+  await expect(
+    preview.locator(".editorial-bar-chart__bar").nth(0),
+  ).toHaveAttribute("style", /left:\s*0%;\s*width:\s*50%/);
+  await expect(
+    preview.locator(".editorial-bar-chart__bar").nth(1),
+  ).toHaveAttribute("style", /left:\s*0%;\s*width:\s*100%/);
+  const previewZeroAxes = preview.locator(".editorial-bar-chart__zero");
+  await expect(previewZeroAxes).toHaveCount(2);
+  await expect(previewZeroAxes.nth(0)).toHaveAttribute("style", "left: 0%;");
+  await expect(previewZeroAxes.nth(1)).toHaveAttribute("style", "left: 0%;");
   const shotsDirectory = resolve(
     process.cwd(),
     "../.autowork-runs/shots-t-m5-23",
@@ -439,6 +452,16 @@ test("accepts a supported bar chart and renders it after its anchor in snapshot 
   await expect(
     chartBlock.getByRole("figure", { name: "Graphique : Valeurs documentées" }),
   ).toBeVisible();
+  await expect(
+    chartBlock.locator(".editorial-bar-chart__bar").nth(0),
+  ).toHaveAttribute("style", /left:\s*0%;\s*width:\s*50%/);
+  await expect(
+    chartBlock.locator(".editorial-bar-chart__bar").nth(1),
+  ).toHaveAttribute("style", /left:\s*0%;\s*width:\s*100%/);
+  const documentZeroAxes = chartBlock.locator(".editorial-bar-chart__zero");
+  await expect(documentZeroAxes).toHaveCount(2);
+  await expect(documentZeroAxes.nth(0)).toHaveAttribute("style", "left: 0%;");
+  await expect(documentZeroAxes.nth(1)).toHaveAttribute("style", "left: 0%;");
   await expect(anchor).toHaveAttribute("data-selected", "true");
   const documentBlocks = await page.locator(".editorial-document__block").all();
   const blockOrder = await Promise.all(

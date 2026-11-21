@@ -54,7 +54,9 @@ from cti_app.application.media_assets import MediaAssetStore, compile_and_store_
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_editorial_enrichment import (
+    ChartProposalV1,
     EditorialEnrichmentProposalV1,
+    EditorialEnrichmentStageErrorCode,
     TableProposalV1,
 )
 from cti_app.application.production_synthesis import (
@@ -121,10 +123,44 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MAX_PATCH_BYTES = 256 * 1024
 _EDITORIAL_UNSAFE_MARKUP = re.compile(
     r"(?m)(?<![\w-])#\s*(?:link|raw|import|read|include)\b"
-    r"|<\s*/?\s*[A-Za-z][A-Za-z0-9_.:-]*(?=\s|/?>)",
+    r"|<\s*/?\s*[A-Za-z][A-Za-z0-9_.:-]*(?=\s|/?>)"
+    r"|https?://|www\.",
     re.IGNORECASE,
 )
 _BAR_NUMBER_TOKEN = re.compile(r"(?<![\w.])[-+]?(?:\d+(?:\.\d+)?|\.\d+)(?![\w.])")
+_CLOSED_EDITORIAL_VALIDATOR_CODES = frozenset(
+    {
+        *(code.value for code in EditorialEnrichmentStageErrorCode),
+        "bar_chart_insufficient_data",
+        "bar_chart_value_missing",
+        "bar_chart_evidence_unadmitted",
+        "bar_chart_value_not_evidenced",
+        "bar_chart_markup_forbidden",
+        "bar_chart_raw_url_forbidden",
+        "bar_chart_question_duplicate",
+        "bar_chart_local_compilation_failed",
+        "bar_chart_media_manifest_missing",
+        "chart_purpose_evidence_not_used_by_points",
+        "manual_bar_chart_analytic_question_duplicate",
+        "manual_edit_patch_invalid",
+        "manual_edit_new_fact_unadmitted",
+        "manual_table_analytic_question_duplicate",
+        "manual_table_row_width_mismatch",
+        "table_raw_url_forbidden",
+        "proposal_base_unavailable",
+        "proposal_patch_invalid",
+        "proposal_target_mismatch",
+        "editorial_anchor_stale",
+        "revision_wire_markup_forbidden",
+    }
+)
+_EDITORIAL_VALIDATOR_CODE_PREFIXES = ("chart_purpose_evidence_not_used_by_points",)
+
+
+def _parse_editorial_patch_payload(value: str, *, exact_chart_numbers: bool = False) -> Any:
+    if exact_chart_numbers:
+        return json.loads(value, parse_float=Decimal, parse_int=Decimal)
+    return json.loads(value)
 
 
 class EditorialTableDiagnosticReason(StrEnum):
@@ -241,7 +277,7 @@ def _editorial_table_text_violation(table: TableSpecV1 | TableProposalV1) -> boo
     return any(_editorial_patch_text_violation(value) for value in text_values)
 
 
-def _editorial_bar_chart_text_violation(chart: ChartSpecV1) -> bool:
+def _editorial_bar_chart_text_violation(chart: ChartSpecV1 | ChartProposalV1) -> bool:
     text_values = [
         chart.key,
         chart.title,
@@ -288,14 +324,15 @@ def _validate_bar_chart_evidence(
                 EditorialBarChartDiagnosticReason.EVIDENCE_UNADMITTED,
                 validator_code="bar_chart_evidence_unadmitted",
             )
-        value_is_documented = False
-        unit_is_documented = False
+        value_and_unit_share_evidence = False
         for reference in point.evidence_refs:
             if reference.kind not in {EvidenceKind.FACT, EvidenceKind.EVENT}:
                 continue
             payload = evidence_entries.get(reference)
             if payload is None:
                 continue
+            value_is_documented = False
+            unit_is_documented = False
             value_fields = (
                 ("value", "evidence_quote")
                 if reference.kind is EvidenceKind.FACT
@@ -315,7 +352,10 @@ def _validate_bar_chart_evidence(
                         continue
                     if observed.is_finite() and observed == point.value:
                         value_is_documented = True
-        if not value_is_documented or not unit_is_documented:
+            if value_is_documented and unit_is_documented:
+                value_and_unit_share_evidence = True
+                break
+        if not value_and_unit_share_evidence:
             raise _manual_bar_chart_failure(
                 "bar_chart_insufficient_data",
                 EditorialBarChartDiagnosticReason.EVIDENCE_UNADMITTED,
@@ -855,18 +895,19 @@ def _manual_table_validation_diagnostics(
         preparation.origin is EditorialProposalOrigin.MANUAL_PATCH
         and preparation.operation is TargetedEditorialRevisionOperation.CREATE_BAR_CHART
     ):
-        reason = _manual_bar_chart_error_reason(code)
-        frame = (
+        bar_reason = _manual_bar_chart_error_reason(code)
+        frame_value = (
             getattr(error, "frame", None) or _exception_origin_frame(error)
             if error is not None
             else None
         )
+        frame = frame_value if isinstance(frame_value, str) else None
         if frame is None:
             caller = sys._getframe(1)
             frame = _frame_string(caller.f_code.co_filename, caller.f_lineno, caller.f_code.co_name)
         return {
             "code": code,
-            "reason": reason.value,
+            "reason": bar_reason.value,
             "validator_code": _manual_table_validator_code(error, fallback=code),
             "frame": frame,
         }
@@ -875,7 +916,7 @@ def _manual_table_validation_diagnostics(
         or preparation.operation is not TargetedEditorialRevisionOperation.CREATE_TABLE
     ):
         return {"code": code}
-    reason = _manual_table_error_reason(code)
+    table_reason = _manual_table_error_reason(code)
     frame = (
         getattr(error, "frame", None) or _exception_origin_frame(error)
         if error is not None
@@ -887,10 +928,22 @@ def _manual_table_validation_diagnostics(
     assert frame is not None
     return {
         "code": code,
-        "reason": reason.value,
+        "reason": table_reason.value,
         "validator_code": _manual_table_validator_code(error, fallback=code),
         "frame": frame,
     }
+
+
+def _closed_editorial_validator_code(value: object) -> str | None:
+    candidate = getattr(value, "value", value)
+    if not isinstance(candidate, str):
+        return None
+    if candidate in _CLOSED_EDITORIAL_VALIDATOR_CODES:
+        return candidate
+    for prefix in _EDITORIAL_VALIDATOR_CODE_PREFIXES:
+        if candidate.startswith(f"{prefix}:"):
+            return prefix
+    return None
 
 
 def _manual_table_validator_code(error: BaseException | None, *, fallback: str) -> str:
@@ -916,10 +969,10 @@ def _manual_table_validator_code(error: BaseException | None, *, fallback: str) 
         )
     candidates.append(fallback)
     for candidate in candidates:
-        value = getattr(candidate, "value", candidate)
-        if isinstance(value, str) and re.fullmatch(r"[a-z][a-z0-9_]{2,}", value):
-            return value
-    return "proposal_patch_invalid"
+        closed_code = _closed_editorial_validator_code(candidate)
+        if closed_code is not None:
+            return closed_code
+    return _closed_editorial_validator_code(fallback) or "proposal_patch_invalid"
 
 
 def _dropped_table_validator_code(warnings: tuple[str, ...]) -> str | None:
@@ -944,20 +997,16 @@ def _manual_table_failure_from_diagnostics(
     ):
         raw_reason = diagnostics.get("reason")
         try:
-            reason = EditorialBarChartDiagnosticReason(str(raw_reason))
+            bar_reason = EditorialBarChartDiagnosticReason(str(raw_reason))
         except ValueError:
-            reason = _manual_bar_chart_error_reason(code)
-        validator_code = diagnostics.get("validator_code")
+            bar_reason = _manual_bar_chart_error_reason(code)
+        validator_code = _closed_editorial_validator_code(diagnostics.get("validator_code"))
+        frame_value = diagnostics.get("frame")
         return _manual_bar_chart_failure(
             code,
-            reason,
-            frame=diagnostics.get("frame") if isinstance(diagnostics.get("frame"), str) else None,
-            validator_code=(
-                validator_code
-                if isinstance(validator_code, str)
-                and re.fullmatch(r"[a-z][a-z0-9_]{2,}", validator_code)
-                else code
-            ),
+            bar_reason,
+            frame=frame_value if isinstance(frame_value, str) else None,
+            validator_code=validator_code or _manual_table_validator_code(None, fallback=code),
         )
     if (
         preparation.origin is not EditorialProposalOrigin.MANUAL_PATCH
@@ -969,23 +1018,18 @@ def _manual_table_failure_from_diagnostics(
         )
     raw_reason = diagnostics.get("reason")
     try:
-        reason = EditorialTableDiagnosticReason(str(raw_reason))
+        table_reason = EditorialTableDiagnosticReason(str(raw_reason))
     except ValueError:
-        reason = _manual_table_error_reason(code)
+        table_reason = _manual_table_error_reason(code)
     if code == "proposal_base_stale":
-        reason = EditorialTableDiagnosticReason.PIN_STALE
-    frame = diagnostics.get("frame")
-    validator_code = diagnostics.get("validator_code")
+        table_reason = EditorialTableDiagnosticReason.PIN_STALE
+    table_frame_value = diagnostics.get("frame")
+    table_validator_code = diagnostics.get("validator_code")
     return _manual_table_failure(
         code,
-        reason,
-        frame=frame if isinstance(frame, str) else None,
-        validator_code=(
-            validator_code
-            if isinstance(validator_code, str)
-            and re.fullmatch(r"[a-z][a-z0-9_]{2,}", validator_code)
-            else None
-        ),
+        table_reason,
+        frame=table_frame_value if isinstance(table_frame_value, str) else None,
+        validator_code=_closed_editorial_validator_code(table_validator_code),
     )
 
 
@@ -2671,7 +2715,9 @@ class EditorialProposalService:
         if preparation.strict_wire and (typed_table_patch or typed_bar_chart_patch):
             try:
                 typed_proposal = EditorialEnrichmentProposalV1.model_validate(
-                    json.loads(patch.after)
+                    _parse_editorial_patch_payload(
+                        patch.after, exact_chart_numbers=typed_bar_chart_patch
+                    )
                 )
             except (TypeError, ValueError):
                 typed_proposal = None
@@ -2994,17 +3040,17 @@ class EditorialProposalService:
         validate_targeted_action(
             preparation.target.element_kind, targeted_action(preparation.operation)
         )
-        raw = json.loads(patch.after)
         create_table = preparation.operation is TargetedEditorialRevisionOperation.CREATE_TABLE
         create_bar_chart = (
             preparation.operation is TargetedEditorialRevisionOperation.CREATE_BAR_CHART
         )
+        raw = _parse_editorial_patch_payload(patch.after, exact_chart_numbers=create_bar_chart)
 
         def refuse_bar_chart_for_insufficient_data() -> tuple[
             None,
             EditorialProposalState,
             EditorialProposalEventKind,
-            dict[str, str],
+            dict[str, object],
         ]:
             return (
                 None,
@@ -3034,9 +3080,9 @@ class EditorialProposalService:
                 raw_value = point.get("value")
                 try:
                     value = (
-                        Decimal(str(raw_value))
-                        if isinstance(raw_value, str) or type(raw_value) in {int, float}
-                        else None
+                        raw_value
+                        if isinstance(raw_value, Decimal)
+                        else (Decimal(raw_value) if isinstance(raw_value, str) else None)
                     )
                 except InvalidOperation:
                     value = None
