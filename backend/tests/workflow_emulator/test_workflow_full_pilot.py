@@ -135,6 +135,7 @@ from tests.workflow_emulator.investigation_support import (
     seed_investigation_for_existing_article,
     start_investigation_http,
 )
+from tests.workflow_emulator.pdf_contract import fold_pdf_text, rendered_protocol_caption
 from tests.workflow_emulator.test_w14_agent_opinion import (
     _family_similarity,
     _feature_pack,
@@ -1925,7 +1926,7 @@ async def test_workflow_full_supervised_first_run_dynamic_pilot(
                 env={**os.environ, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
             )
             pdf_text = " ".join(
-                text_result.stdout.decode("utf-8", errors="replace").casefold().split()
+                fold_pdf_text(text_result.stdout.decode("utf-8", errors="replace")).split()
             )
             assert "l1.1" in pdf_text
             assert "exfiltration" in pdf_text or "exfiltré" in pdf_text
@@ -1962,7 +1963,7 @@ async def test_workflow_full_supervised_first_run_dynamic_pilot(
             assert all(item.stat().st_size > 1_024 for item in rendered_pages)
             caption_search_from = 0
             for figure in figures:
-                caption = " ".join(figure.caption.casefold().split())
+                caption = " ".join(fold_pdf_text(rendered_protocol_caption(figure)).split())
                 assert caption, "PDF captions must not be empty"
                 caption_position = pdf_text.find(caption, caption_search_from)
                 assert caption_position >= 0, caption

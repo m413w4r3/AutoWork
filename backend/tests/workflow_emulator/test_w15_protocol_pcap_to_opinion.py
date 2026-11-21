@@ -126,6 +126,7 @@ from tests.workflow_emulator.investigation_support import (
     seed_investigation_for_existing_article,
     start_investigation_http,
 )
+from tests.workflow_emulator.pdf_contract import rendered_protocol_caption
 
 pytestmark = [pytest.mark.integration, pytest.mark.workflow_full]
 
@@ -1414,7 +1415,7 @@ async def test_w15_protocol_pcap_to_opinion_with_real_d2_typst_and_multibatch_pd
                 assert article_sha256 == article_render.output_sha256
                 article_pdf_path = output_root / "article.pdf"
                 article_pdf_path.write_bytes(article_bytes)
-                captions = tuple(item.caption for item in figures)
+                captions = tuple(rendered_protocol_caption(item) for item in figures)
                 article_text = _verify_pdf(article_pdf_path, captions=captions)
                 assert "charge tls" in article_text.casefold()
                 assert "opcode candidate" in article_text.casefold()

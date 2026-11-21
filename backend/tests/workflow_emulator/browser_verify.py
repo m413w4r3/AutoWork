@@ -27,6 +27,7 @@ from cti_app.domain.publication_document import PublicationDocumentV6
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
+from tests.workflow_emulator.pdf_contract import ANALYST_OPINION_HEADING, fold_pdf_text
 
 EXPECTED_ACTOR = "workflow-analyst"
 
@@ -398,8 +399,8 @@ async def _verify_investigation(state: dict[str, object], admin_dsn: str) -> Non
             downloaded_copy.write_bytes(downloaded_pdf)
             pdf_text = await asyncio.to_thread(_extract_pdf_text, downloaded_copy)
         # Typst renders a typographic apostrophe (U+2019) in small caps.
-        folded_text = pdf_text.casefold().replace("\u2019", "'")
-        opinion_heading = "avis de l'analyste"
+        folded_text = fold_pdf_text(pdf_text)
+        opinion_heading = ANALYST_OPINION_HEADING
         _require(
             folded_text.count(opinion_heading) == 1,
             "PDF text",

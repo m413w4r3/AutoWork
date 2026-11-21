@@ -73,6 +73,7 @@ from tests.workflow_emulator.investigation_support import (
     seed_investigation_for_existing_article,
     start_investigation_http,
 )
+from tests.workflow_emulator.pdf_contract import ANALYST_OPINION_HEADING, fold_pdf_text
 
 pytestmark = [pytest.mark.integration, pytest.mark.workflow_full]
 
@@ -924,9 +925,9 @@ async def test_w12_discovery_chain_claim_review_and_explicit_repin(
                     identities={"release": release_v1.id, "manifest": manifest_v1.id},
                     assertions=("typst-pdf-v1-real", "poppler-v1-integrity-and-text"),
                 )
-                text_v1_folded = text_v1.casefold()
+                text_v1_folded = fold_pdf_text(text_v1)
                 invariants.require(
-                    "avis de l'analyste" not in text_v1_folded
+                    ANALYST_OPINION_HEADING not in text_v1_folded
                     and all(f"Corps article {label} W12" in text_v1 for label in ("A", "B", "C")),
                     driver.scenario,
                     "render_v1_real_typst_poppler",
@@ -1045,14 +1046,14 @@ async def test_w12_discovery_chain_claim_review_and_explicit_repin(
                     "repin_only_a",
                     "V2 manifest must retain exact B/C article entries and pin V6 for A",
                 )
-                normalized_v2_text = text_v2.casefold().replace(chr(0x2019), "'")
-                heading = "avis de l'analyste"
+                normalized_v2_text = fold_pdf_text(text_v2)
+                heading = ANALYST_OPINION_HEADING
                 invariants.require(
                     normalized_v2_text.count(heading) == 1
                     and material.sample_hash in text_v2
                     and "C1" in text_v2
                     and "hypothèse" in normalized_v2_text
-                    and "avis de l'analyste" not in text_v1.casefold(),
+                    and ANALYST_OPINION_HEADING not in text_v1_folded,
                     driver.scenario,
                     "render_v2_opinion_for_a_only",
                     "the real V2 PDF must render the discovery and qualified C1 opinion exactly "

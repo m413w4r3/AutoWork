@@ -4170,7 +4170,9 @@ def project_publication_to_typst_model(
 
         projected_opinion_section = {
             "type": "analyst_opinion",
-            "heading": "Avis de l'analyste",
+            # Reader-facing label, matching the CHP noteAnalyste title used by
+            # the Typst templates and the extracted PDF text.
+            "heading": "Note de l'analyste",
             "blocks": projected_opinion_blocks,
             "unresolved_points": list(unresolved_points),
             "unresolved_point_render_data": [

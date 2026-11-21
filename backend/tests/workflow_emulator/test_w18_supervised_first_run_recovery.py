@@ -87,6 +87,7 @@ from tests.workflow_emulator.investigation_support import (
     publish_opinion_http,
     run_http_job,
 )
+from tests.workflow_emulator.pdf_contract import ANALYST_OPINION_HEADING, fold_pdf_text
 from tests.workflow_emulator.providers import capture_bundle
 
 pytestmark = [pytest.mark.integration, pytest.mark.workflow_full]
@@ -1328,11 +1329,11 @@ async def test_w18_supervised_first_run_recovers_without_replaying_confirmed_eff
     preview_v1_text, preview_v1_pages, preview_v1_bytes = await preview_current(
         draft, home_output / "opinion-preview-v1.pdf"
     )
-    preview_normalized = preview_v1_text.casefold().replace(chr(0x2019), "'")
+    preview_normalized = fold_pdf_text(preview_v1_text)
     assert "brouillon non approuvé" in preview_normalized
     assert sample_material.seed_hash in preview_v1_text
     assert sample_material.ip in preview_v1_text
-    assert "avis de l'analyste" in preview_normalized
+    assert ANALYST_OPINION_HEADING in preview_normalized
     assert any(
         item["source"] == "synthetic-entry-article-v5"
         for item in resumed_checkpoint["investigation"]["observations"]
@@ -1610,8 +1611,8 @@ async def test_w18_supervised_first_run_recovers_without_replaying_confirmed_eff
         pdftotext=pdftotext,
         pdftoppm=pdftoppm,
     )
-    final_normalized = final_pdf_text.casefold().replace(chr(0x2019), "'")
-    assert "avis de l'analyste" in final_normalized
+    final_normalized = fold_pdf_text(final_pdf_text)
+    assert ANALYST_OPINION_HEADING in final_normalized
     assert "retouche w18 v3" in final_normalized
     # Long hashes in prose may wrap across lines; compare the full value without layout whitespace.
     final_compact = "".join(final_pdf_text.split())

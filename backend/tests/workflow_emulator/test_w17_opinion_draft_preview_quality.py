@@ -72,6 +72,7 @@ from tests.test_publication_builder_v4 import (
     _enrichment_with,
     build_publication_document_v5,
 )
+from tests.workflow_emulator.pdf_contract import ANALYST_OPINION_HEADING
 
 
 def _inspect_rendered_pdf(
@@ -523,7 +524,7 @@ async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
         pdftoppm,
     )
     normalized_empty_text = " ".join(empty_text.split()).casefold().replace("\u2019", "'")
-    assert "avis de l'analyste" not in normalized_empty_text
+    assert ANALYST_OPINION_HEADING not in normalized_empty_text
     assert "aucun avis publié" not in normalized_empty_text
     assert "chronologie" in normalized_empty_text
     assert "annexe technique" not in normalized_empty_text
