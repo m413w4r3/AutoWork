@@ -76,6 +76,7 @@ from cti_app.application.production_synthesis import (
 )
 from cti_app.application.production_synthesis_revision import _apply_wire_patch
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
+from cti_app.domain.editorial_figure_keys import ADOPTED_SOURCE_FIGURE_KEY_PREFIX
 from cti_app.domain.editorial_proposal import (
     EditorialProposal,
     EditorialProposalConflict,
@@ -1998,7 +1999,7 @@ class EditorialProposalService:
                 )
             candidates.append(
                 SourceFigureCandidateV1(
-                    key=f"source_figure_{resolved_figure.figure_id.hex}",
+                    key=f"{ADOPTED_SOURCE_FIGURE_KEY_PREFIX}{resolved_figure.figure_id.hex}",
                     source_document_id=resolved_figure.source_document_id,
                     source_url=extraction_source.canonical_url,
                     caption=selection.caption.strip(),

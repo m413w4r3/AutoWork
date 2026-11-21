@@ -52,6 +52,7 @@ from cti_app.domain.analyst_opinion import (
     OpinionProtocolFigureV1,
     normalize_opinion_text,
 )
+from cti_app.domain.editorial_figure_keys import ADOPTED_SOURCE_FIGURE_KEY_PREFIX
 from cti_app.domain.investigation import (
     EvidenceKind,
     EvidenceObservation,
@@ -108,7 +109,10 @@ from cti_app.domain.subject_ioc_eligibility import is_supported_publication_ioc_
 
 # v40 localizes opinion IOC labels and keeps protocol figure proof captions visible.
 _RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v40-m21-opinion-render"
-_RENDER_DATA_SCHEMA_VERSION_V9 = "typst-publication-model-v43-source-figure-provenance"
+_RENDER_DATA_SCHEMA_VERSION_V9 = "typst-publication-model-v41-after-paragraph-anchors"
+_RENDER_DATA_SCHEMA_VERSION_ADOPTED_FIGURE = (
+    "typst-publication-model-v43-adopted-source-figure-notes"
+)
 _RENDER_DATA_SCHEMA_VERSION_V10 = "typst-publication-model-v44-source-figure-provenance"
 _BRIEF_PUBLICATION_EVENTS_POLICY_VERSION = "brief-assembly-v4-m19-publication-events"
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
@@ -2221,10 +2225,20 @@ class TypstRenderer:
             if isinstance(document, TypstDraftPreviewDocument)
             else document
         )
+        adopted_source_figure_present = any(
+            block.get("type") == "figure"
+            and isinstance(block.get("key"), str)
+            and block["key"].startswith(ADOPTED_SOURCE_FIGURE_KEY_PREFIX)
+            for section in model.content_sections
+            for block in section.get("blocks", [])
+            if isinstance(block, dict)
+        )
         render_data: dict[str, Any] = {
             "schema_version": (
                 _RENDER_DATA_SCHEMA_VERSION_V10
                 if isinstance(classification_document, PublicationDocumentV10)
+                else _RENDER_DATA_SCHEMA_VERSION_ADOPTED_FIGURE
+                if adopted_source_figure_present
                 else _RENDER_DATA_SCHEMA_VERSION_V9
                 if isinstance(classification_document, PublicationDocumentV9)
                 else _RENDER_DATA_SCHEMA_VERSION
@@ -2703,7 +2717,11 @@ def project_publication_to_typst_model(
             )
         block = _figure_block(figure, source, media_ref)
         rich_block(block, "semantic_caption", f"figure:{figure.key}:caption", figure.caption)
-        source_note = _reader_facing_figure_source(figure, source)
+        source_note = (
+            _reader_facing_figure_source(figure, source)
+            if figure.key.startswith(ADOPTED_SOURCE_FIGURE_KEY_PREFIX)
+            else None
+        )
         if source_note is not None:
             source_suffix = f" — Source : {source_note}"
             block["caption"] = f"{block['caption']}{source_suffix}"
@@ -4625,7 +4643,7 @@ def _figure_block(
         expected_sha256=figure.sha256,
         expected_byte_size=figure.byte_size,
     )
-    return {
+    block = {
         "type": "figure",
         "key": figure.key,
         "caption": figure.caption,
@@ -4636,6 +4654,7 @@ def _figure_block(
         "byte_size": figure.byte_size,
         "media_path": media.media_path,
     }
+    return block
 
 
 _INTERNAL_FIGURE_LOCATOR_TEXT = re.compile(
@@ -4662,10 +4681,14 @@ def _reader_facing_figure_source(
 ) -> str | None:
     """Project technical figure metadata into a short, reader-facing source note."""
     parts: list[str] = []
-    try:
-        host = urlsplit(source.canonical_url).hostname
-    except ValueError:
-        host = None
+    host = None
+    for source_url in (figure.source_url, source.canonical_url):
+        try:
+            host = urlsplit(source_url).hostname
+        except ValueError:
+            host = None
+        if host:
+            break
     if host and not _INTERNAL_FIGURE_LOCATOR_TEXT.search(host):
         parts.append(host.removeprefix("www."))
     elif (title := _reader_facing_editorial_text(source.title)) is not None:

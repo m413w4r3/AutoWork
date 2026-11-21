@@ -231,6 +231,19 @@ class EditorialWorkspaceRoute(APIRoute):
             try:
                 response = await original_handler(request)
             except HTTPException as error:
+                if (
+                    is_figure_catalog or is_manual_source_figure_proposal
+                ) and error.status_code >= 500:
+                    logger.warning(
+                        "figure_proposal_failed reason=%s frame=%s exc_type=%s",
+                        (
+                            "dependency_unavailable"
+                            if error.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+                            else "http_exception"
+                        ),
+                        _exception_frame(error) or _caller_frame(),
+                        type(error).__name__,
+                    )
                 if not is_draft and not is_figure_catalog:
                     raise
                 response = JSONResponse(
@@ -310,11 +323,12 @@ class EditorialWorkspaceRoute(APIRoute):
                 elif is_manual_source_figure_proposal:
                     logger.warning(
                         "manual_source_figure_proposal_rejected code=%s reason=%s "
-                        "validator_code=%s frame=%s subject_id=%s occurrence_id=%s",
+                        "validator_code=%s exc_type=%s frame=%s subject_id=%s occurrence_id=%s",
                         "manual_source_figure_request_invalid",
                         EditorialFigureDiagnosticReason.REQUEST_INVALID.value,
                         "figure_request_schema_invalid",
-                        _caller_frame(),
+                        type(error).__name__,
+                        _exception_frame(error) or _caller_frame(),
                         request.path_params.get("subject_id", "unknown"),
                         request.path_params.get("occurrence_id", "unknown"),
                     )
@@ -348,16 +362,14 @@ class EditorialWorkspaceRoute(APIRoute):
                     ]
                     response = JSONResponse(status_code=422, content={"detail": details})
             except Exception as error:
-                if is_figure_catalog:
-                    response = JSONResponse(
-                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                        content={
-                            "detail": {
-                                "code": "figure_catalog_unavailable",
-                                "message": "La galerie de figures est temporairement indisponible.",
-                            }
-                        },
+                if is_figure_catalog or is_manual_source_figure_proposal:
+                    logger.error(
+                        "figure_proposal_failed reason=%s frame=%s exc_type=%s",
+                        "unexpected_exception",
+                        _exception_frame(error) or _caller_frame(),
+                        type(error).__name__,
                     )
+                    raise
                 elif is_manual_edit:
                     return JSONResponse(
                         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -1483,7 +1495,11 @@ def _manual_proposal_service(request: Request) -> EditorialProposalService:
             artifact_store=artifact_store,
         ),
         chart_compiler=AnalyticChartRenderer(),
-        figure_catalog_service=_figure_catalog_service(request),
+        figure_catalog_service=_figure_catalog_service(
+            request,
+            artifact_store=artifact_store,
+            uow_factory=uow_factory,
+        ),
         media_asset_store=_media_asset_store_for_request(
             request, artifact_store=artifact_store, uow_factory=uow_factory
         ),
@@ -1640,10 +1656,21 @@ _FIGURE_STATUS_FILTERS = Literal[
 ]
 
 
-def _figure_catalog_service(request: Request) -> EditorialFigureCatalogService:
-    artifact_store = _production_artifact_store_for_request(request)
-    uow_factory = getattr(request.app.state, "uow_factory", None)
-    if artifact_store is None or uow_factory is None:
+def _figure_catalog_service(
+    request: Request,
+    *,
+    artifact_store: ProductionArtifactStore | None = None,
+    uow_factory: Any | None = None,
+) -> EditorialFigureCatalogService:
+    resolved_artifact_store = (
+        artifact_store
+        if artifact_store is not None
+        else _production_artifact_store_for_request(request)
+    )
+    resolved_uow_factory = (
+        uow_factory if uow_factory is not None else getattr(request.app.state, "uow_factory", None)
+    )
+    if resolved_artifact_store is None or resolved_uow_factory is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={
@@ -1655,8 +1682,8 @@ def _figure_catalog_service(request: Request) -> EditorialFigureCatalogService:
     media_archiver = getattr(collection_service, "source_media_archiver", None)
     policy_sha256 = getattr(media_archiver, "policy_sha256", None)
     return EditorialFigureCatalogService(
-        uow_factory=uow_factory,
-        artifact_store=artifact_store,
+        uow_factory=resolved_uow_factory,
+        artifact_store=resolved_artifact_store,
         media_policy_sha256=policy_sha256 if isinstance(policy_sha256, str) else None,
     )
 
@@ -2566,10 +2593,11 @@ async def prepare_manual_editorial_source_figure_proposal(
     except EditorialProposalConflict as error:
         logger.warning(
             "manual_source_figure_proposal_rejected code=%s reason=%s validator_code=%s "
-            "frame=%s subject_id=%s occurrence_id=%s",
+            "exc_type=%s frame=%s subject_id=%s occurrence_id=%s",
             "proposal_idempotency_conflict",
             EditorialFigureDiagnosticReason.IDEMPOTENCY_CONFLICT.value,
             _manual_figure_validator_log_code(error),
+            type(error).__name__,
             _manual_table_frame(error),
             subject_id,
             occurrence_id,
@@ -2581,7 +2609,7 @@ async def prepare_manual_editorial_source_figure_proposal(
                 "message": _ERROR_MESSAGES["proposal_idempotency_conflict"],
             },
         ) from None
-    except (EditorialProposalApplicationError, EditorialWorkspaceError, ValueError) as error:
+    except (EditorialProposalApplicationError, EditorialWorkspaceError) as error:
         raw_code = getattr(error, "code", None)
         code = (
             raw_code
@@ -2613,10 +2641,11 @@ async def prepare_manual_editorial_source_figure_proposal(
             }.get(code, EditorialFigureDiagnosticReason.VALIDATOR_REJECTED)
         logger.warning(
             "manual_source_figure_proposal_rejected code=%s reason=%s validator_code=%s "
-            "frame=%s subject_id=%s occurrence_id=%s",
+            "exc_type=%s frame=%s subject_id=%s occurrence_id=%s",
             code,
             reason.value,
             _manual_figure_validator_log_code(error),
+            type(error).__name__,
             _manual_table_frame(error, getattr(error, "frame", None)),
             subject_id,
             occurrence_id,

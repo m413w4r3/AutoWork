@@ -73,6 +73,7 @@ from cti_app.domain.analyst_opinion import (
     opinion_blocks_with_observations,
 )
 from cti_app.domain.discovery import SourceRole
+from cti_app.domain.editorial_figure_keys import ADOPTED_SOURCE_FIGURE_KEY_PREFIX
 from cti_app.domain.investigation import FindingAssessment, FindingKind, NoveltyClass
 from cti_app.domain.media_assets import MediaAssetKind, media_asset_id
 from cti_app.domain.production import ProductionEvidenceBasis
@@ -523,7 +524,7 @@ def test_v9_renders_after_the_registered_paragraph_and_v8_keeps_v40(tmp_path: Pa
     )
     v8_render = json.loads(_render(renderer, v8, bundle).render_data_bytes)
 
-    assert v9_render["schema_version"] == "typst-publication-model-v43-source-figure-provenance"
+    assert v9_render["schema_version"] == "typst-publication-model-v41-after-paragraph-anchors"
     v9_blocks = next(item for item in v9_render["content_sections"] if item["type"] == "synthesis")[
         "blocks"
     ]
@@ -598,7 +599,7 @@ def test_real_typst_multi_figure_pdf_uses_local_assets_after_anchor(
         )
         figure_candidates.append(
             SourceFigureCandidateV1(
-                key=f"source_figure_demo_{position + 1}",
+                key=f"{ADOPTED_SOURCE_FIGURE_KEY_PREFIX}demo_{position + 1}",
                 source_document_id=source.source_document_id,
                 source_url=source.canonical_url,
                 caption=f"Figure de démonstration locale {position + 1}",
@@ -632,9 +633,10 @@ def test_real_typst_multi_figure_pdf_uses_local_assets_after_anchor(
         routing_policy_version="routing-policy-v1",
     )
     figures = anchored_v5.document.figures
+    article_format = build_article_format_v1(anchored_v5, extraction)
     v9 = PublicationDocumentV9(
         base_publication=v7,
-        article_format=build_article_format_v1(anchored_v5, extraction),
+        article_format=article_format,
         registry_hash="b" * 64,
         synthesis_canonical_sha256="c" * 64,
         enrichment_canonical_sha256="d" * 64,
@@ -660,6 +662,9 @@ def test_real_typst_multi_figure_pdf_uses_local_assets_after_anchor(
         document_label="Démonstration locale multi-figures",
     )
     render_data = json.loads(rendered.render_data_bytes)
+    assert render_data["schema_version"] == (
+        "typst-publication-model-v43-adopted-source-figure-notes"
+    )
     synthesis_section = next(
         section for section in render_data["content_sections"] if section["type"] == "synthesis"
     )
@@ -669,12 +674,73 @@ def test_real_typst_multi_figure_pdf_uses_local_assets_after_anchor(
         for index, block in enumerate(blocks)
         if block["type"] == "paragraph" and block.get("anchor_target") is not None
     )
-    figure_positions = [
-        index for index, block in enumerate(blocks) if block["type"] == "figure"
-    ]
+    figure_positions = [index for index, block in enumerate(blocks) if block["type"] == "figure"]
     assert figure_positions == [anchor_position + 1, anchor_position + 2]
     assert len(rendered.media_refs) == 2
     assert all(ref.media_path.startswith("media/") for ref in rendered.media_refs)
+    assert all(
+        "Source : example.com" in block["caption"] for block in blocks if block["type"] == "figure"
+    )
+
+    legacy_candidates = tuple(
+        replace(candidate, key=f"source_figure_demo_{position + 1}")
+        for position, candidate in enumerate(figure_candidates)
+    )
+    legacy_v5 = build_publication_document_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=replace(anchored_enrichment, source_figures=legacy_candidates),
+    )
+    legacy_v7 = PublicationDocumentV7(
+        base_publication=_v6(legacy_v5),
+        publication_kind=PublicationKind.ARTICLE,
+        routing_decision_hash="a" * 64,
+        routing_policy_version="routing-policy-v1",
+    )
+    legacy_figures = legacy_v5.document.figures
+    legacy_v9 = PublicationDocumentV9(
+        base_publication=legacy_v7,
+        article_format=build_article_format_v1(legacy_v5, extraction),
+        registry_hash="b" * 64,
+        synthesis_canonical_sha256="c" * 64,
+        enrichment_canonical_sha256="d" * 64,
+        resolved_placements=tuple(
+            ResolvedPublicationPlacementV1(
+                element_kind="figure",
+                element_key=figure.key,
+                element_position=position,
+                anchor_block_id=anchor_id,
+                anchor_pointer="/lead/0",
+                anchor_canonical_position=0,
+                paragraph_kind="lead",
+                section_index=None,
+                paragraph_index=0,
+            )
+            for position, figure in enumerate(legacy_figures)
+        ),
+    )
+    legacy_render_data = json.loads(
+        TypstRenderer()
+        .render(
+            legacy_v9,
+            bundle,
+            document_label="Legacy source figure projection",
+        )
+        .render_data_bytes
+    )
+    legacy_blocks = next(
+        section
+        for section in legacy_render_data["content_sections"]
+        if section["type"] == "synthesis"
+    )["blocks"]
+    assert legacy_render_data["schema_version"] == (
+        "typst-publication-model-v41-after-paragraph-anchors"
+    )
+    assert all(
+        "Source :" not in block["caption"] for block in legacy_blocks if block["type"] == "figure"
+    )
 
     workspace = tmp_path / "workspace"
     for template_file in bundle.files:
@@ -715,9 +781,7 @@ def test_real_typst_multi_figure_pdf_uses_local_assets_after_anchor(
     assert compiled.media_type == "application/pdf"
     pdf = PdfReader(io.BytesIO(compiled.content), strict=True)
     assert pdf.pages
-    pdf_text = " ".join(
-        (page.extract_text() or "") for page in pdf.pages
-    )
+    pdf_text = " ".join((page.extract_text() or "") for page in pdf.pages)
     assert "Figure de démonstration locale 1" in pdf_text
     assert "Figure de démonstration locale 2" in pdf_text
     assert "Source : example.com" in pdf_text
@@ -2307,7 +2371,17 @@ def test_figure_reader_source_hides_pipeline_locators_and_media_refs_deduplicate
         not {"classification", "source_note", "attribution"}.intersection(block)
         for block in figure_blocks
     )
-    assert figure_blocks[0]["caption"].startswith("Caption one — Source : secret.example")
+    assert figure_blocks[0]["caption"] == "Caption one"
+    assert figure_blocks[0]["width"] == first.width
+    assert figure_blocks[0]["height"] == first.height
+    assert all({"width", "height"}.issubset(block) for block in figure_blocks)
+    sources_by_id = {source.source_document_id: source for source in document.sources}
+    assert (
+        typst_rendering_module._reader_facing_figure_source(
+            first, sources_by_id[first.source_document_id]
+        )
+        == "secret.example — Bitcoin wallet recovery — p. 1"
+    )
     assert figure_blocks[0]["sha256"] == first.sha256
     assert figure_blocks[0]["byte_size"] == first.byte_size
     render_data = rendered.render_data_bytes.decode("utf-8")
