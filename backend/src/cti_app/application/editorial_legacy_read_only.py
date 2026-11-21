@@ -7,7 +7,9 @@ from enum import StrEnum
 from typing import Any
 
 from cti_app.application.edition_classification import explicit_publication_kind
-from cti_app.domain.production_editorial_enrichment import EDITORIAL_ENRICHMENT_SCHEMA_VERSION
+from cti_app.domain.production_editorial_enrichment import (
+    EDITORIAL_ENRICHMENT_MAX_SCHEMA_VERSION,
+)
 from cti_app.domain.production_routing import ProductionRoutingDecisionV1
 from cti_app.domain.production_synthesis import PRODUCTION_SYNTHESIS_SCHEMA_VERSION
 from cti_app.domain.publication_document import parse_publication_document
@@ -71,7 +73,7 @@ def pinned_editorial_inputs_read_only_reason(
         if (
             type(enrichment_version) is not int
             or enrichment_version < 1
-            or enrichment_version > EDITORIAL_ENRICHMENT_SCHEMA_VERSION
+            or enrichment_version > EDITORIAL_ENRICHMENT_MAX_SCHEMA_VERSION
         ):
             return EditorialLegacyReadOnlyReason.FORMAT_NOT_EDITABLE
     return None

@@ -11,6 +11,9 @@ from uuid import UUID, uuid4
 import pytest
 
 from cti_app.application.editorial_legacy_read_only import publication_read_only_reason
+from cti_app.domain.production_editorial_enrichment import (
+    EDITORIAL_ENRICHMENT_MAX_SCHEMA_VERSION,
+)
 from cti_app.domain.publication_document import (
     PublicationDocumentV7,
     PublicationDocumentV8,
@@ -234,7 +237,7 @@ def test_unsupported_pinned_editorial_format_remains_read_only(
         enrichment = _make_artifact(
             "editorial_enrichment",
             {
-                "schema_version": 11,
+                "schema_version": EDITORIAL_ENRICHMENT_MAX_SCHEMA_VERSION + 1,
                 "tables": [],
                 "diagrams": [],
                 "charts": [],

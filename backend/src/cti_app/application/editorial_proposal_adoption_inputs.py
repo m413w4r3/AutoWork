@@ -17,6 +17,7 @@ from cti_app.application.editorial_enrichment_revision import (
     assert_requested_placement,
     targeted_action,
     validate_editorial_enrichment_patch,
+    validate_targeted_request,
 )
 from cti_app.application.editorial_figure_catalog import (
     EditorialFigureCatalogError,
@@ -43,6 +44,11 @@ from cti_app.application.editorial_synthesis.candidate import (
 from cti_app.application.editorial_synthesis.patch_validation import WirePatch
 from cti_app.application.editorial_synthesis.targets import resolve_target
 from cti_app.application.editorial_text_policy import editorial_caption_text_violation
+from cti_app.application.editorial_visual_revision import (
+    VisualRevisionContext,
+    VisualRevisionRejected,
+    plan_visual_revision,
+)
 from cti_app.application.editorial_workspace.registry import (
     WorkspaceOccurrenceResolution,
     read_pointer,
@@ -69,9 +75,20 @@ from cti_app.application.production_synthesis_revision import _apply_wire_patch
 from cti_app.application.source_figure_inventory import load_archived_source_figure_inventory
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
+from cti_app.domain.editorial_enrichment_patch import (
+    IMPLEMENTED_VISUAL_REVISION_OPERATIONS,
+    EditorialEnrichmentPatchError,
+    MoveEnrichmentElementPatch,
+    ReorderEnrichmentElementsPatch,
+    UnsupportedEnrichmentRevisionOperation,
+    UpdateVisualCaptionPatch,
+    enrichment_order_group_hash,
+    visual_patch_from_json,
+)
 from cti_app.domain.editorial_figure_keys import adopted_source_figure_key
 from cti_app.domain.editorial_proposal import EditorialProposal, EditorialProposalOrigin
 from cti_app.domain.editorial_workspace import (
+    EditorialBlockKind,
     EditorialSourceStage,
     bootstrap_block_registry,
     canonical_content_sha256,
@@ -110,6 +127,7 @@ from cti_app.domain.production_extraction import ProductionExtractionV1
 from cti_app.domain.production_synthesis import (
     EvidenceKind,
     ExtractionEvidenceRefV1,
+    ProductionSynthesisV1,
     production_synthesis_from_json,
     production_synthesis_to_json,
 )
@@ -698,11 +716,50 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
             self._require_allowed(access_policy)
             operation = TargetedEditorialRevisionOperation(proposal.operation)
             target = _enrichment_target(patch.get("target"))
-            if target.kind is not TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT:
+            if target.kind not in {
+                TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT,
+                TargetedEditorialRevisionTargetKind.ENRICHMENT_ORDER,
+            }:
                 raise EditorialProposalAdoptionError("proposal_target_mismatch")
             if _target_id(target) != proposal.target_id:
                 raise EditorialProposalAdoptionError("proposal_target_mismatch")
-            if target.element_kind is None:
+            base_enrichment = editorial_enrichment_from_json(base_payload)
+            if operation in IMPLEMENTED_VISUAL_REVISION_OPERATIONS:
+                return_inputs = await self._visual_revision_inputs(
+                    proposal=proposal,
+                    patch=patch,
+                    resolution=resolution,
+                    run=run,
+                    snapshot=snapshot,
+                    extraction=extraction,
+                    synthesis=synthesis,
+                    access_policy=access_policy,
+                    fence=fence,
+                    base_artifact=base_artifact,
+                    base_payload=base_payload,
+                    base_enrichment=base_enrichment,
+                    target=target,
+                    operation=operation,
+                    projection=projection,
+                )
+                self._prepared[proposal.id] = _PreparedInputs(
+                    run=run,
+                    snapshot=snapshot,
+                    extraction=extraction,
+                    base_artifact=base_artifact,
+                    extraction_artifact=extraction_artifact,
+                    projection_artifact=projection_artifact,
+                    synthesis_artifact=current_synthesis_artifact,
+                    evidence_pack=fence.evidence_pack,
+                    stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+                    base_enrichment=base_enrichment,
+                    synthesis=synthesis,
+                )
+                return return_inputs
+            if (
+                target.kind is not TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT
+                or target.element_kind is None
+            ):
                 raise EditorialProposalAdoptionError("proposal_target_mismatch")
             is_create = operation in {
                 TargetedEditorialRevisionOperation.CREATE_TABLE,
@@ -781,7 +838,6 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                 if bar_chart_insertion
                 else target.element_key
             )
-            base_enrichment = editorial_enrichment_from_json(base_payload)
             validated_manual_figure_patch: EditorialEnrichmentV1 | None = None
             if source_figure_insertion:
                 if resolution.record.publication_kind not in {
@@ -962,6 +1018,143 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
             synthesis=synthesis,
         )
         return return_inputs
+
+    async def _visual_revision_inputs(
+        self,
+        *,
+        proposal: EditorialProposal,
+        patch: Mapping[str, Any],
+        resolution: WorkspaceOccurrenceResolution,
+        run: ProductionRun,
+        snapshot: ProductionInputSnapshot,
+        extraction: ProductionExtractionV1,
+        synthesis: ProductionSynthesisV1,
+        access_policy: SynthesisAccessPolicyV1,
+        fence: Any,
+        base_artifact: ProductionArtifact,
+        base_payload: dict[str, Any],
+        base_enrichment: EditorialEnrichmentV1,
+        target: TargetedEditorialRevisionTarget,
+        operation: TargetedEditorialRevisionOperation,
+        projection: Any,
+    ) -> EnrichmentCandidateInputs:
+        try:
+            typed_patch = visual_patch_from_json(patch.get("visual_patch"))
+        except UnsupportedEnrichmentRevisionOperation:
+            raise EditorialProposalAdoptionError(
+                "enrichment_revision_unsupported_operation"
+            ) from None
+        except EditorialEnrichmentPatchError:
+            raise EditorialProposalAdoptionError("proposal_patch_invalid") from None
+        if typed_patch.operation is not operation:
+            raise EditorialProposalAdoptionError("proposal_patch_invalid")
+        request = TargetedEditorialRevisionRequest(
+            subject_id=proposal.subject_id,
+            base_artifact_id=base_artifact.id,
+            base_version=base_artifact.version,
+            base_input_hash=base_artifact.input_hash,
+            base_canonical_sha256=proposal.base_canonical_sha256,
+            target=target,
+            operation=operation,
+            instruction="Accepted editorial proposal",
+            mode=TargetedEditorialRevisionMode.EXISTING_EVIDENCE_ONLY,
+            requester=str(proposal.actor_id),
+            before_hash=proposal.before_hash,
+        )
+        validate_targeted_request(request)
+        entry = resolution.entry
+        if target.kind is TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT:
+            if not isinstance(typed_patch, (UpdateVisualCaptionPatch, MoveEnrichmentElementPatch)):
+                raise EditorialProposalAdoptionError("proposal_target_mismatch")
+            if (
+                target.element_kind is not typed_patch.element_kind
+                or target.element_key != typed_patch.element_key
+            ):
+                raise EditorialProposalAdoptionError("proposal_target_mismatch")
+            if isinstance(typed_patch, MoveEnrichmentElementPatch):
+                if (
+                    target.placement is None
+                    or target.placement.anchor_block_id != typed_patch.anchor_block_id
+                ):
+                    raise EditorialProposalAdoptionError("proposal_target_mismatch")
+            elif target.placement is not None:
+                raise EditorialProposalAdoptionError("proposal_target_mismatch")
+            if (
+                entry is None
+                or entry.source_stage is not EditorialSourceStage.EDITORIAL_ENRICHMENT
+                or entry.block_id != proposal.occurrence_id
+                or entry.content_sha256 != proposal.before_hash
+            ):
+                raise EditorialProposalAdoptionError(
+                    "proposal_base_stale", reason="enrichment:element_occurrence"
+                )
+        elif target.kind is TargetedEditorialRevisionTargetKind.ENRICHMENT_ORDER:
+            if not isinstance(typed_patch, ReorderEnrichmentElementsPatch):
+                raise EditorialProposalAdoptionError("proposal_target_mismatch")
+            if (
+                target.placement is None
+                or target.placement.anchor_block_id != typed_patch.anchor_block_id
+                or proposal.occurrence_id != typed_patch.anchor_block_id
+            ):
+                raise EditorialProposalAdoptionError("editorial_anchor_stale")
+            if (
+                entry is None
+                or entry.source_stage is not EditorialSourceStage.SYNTHESIS
+                or entry.kind
+                not in {EditorialBlockKind.PARAGRAPH, EditorialBlockKind.LEAD_PARAGRAPH}
+            ):
+                raise EditorialProposalAdoptionError("editorial_anchor_stale")
+            placement = EnrichmentPlacementV1(
+                EnrichmentPlacementKind.AFTER_PARAGRAPH,
+                anchor_block_id=typed_patch.anchor_block_id,
+            )
+            current_group_hash = enrichment_order_group_hash(base_enrichment, placement)
+            if current_group_hash != proposal.before_hash:
+                raise EditorialProposalAdoptionError(
+                    "proposal_base_stale", reason="enrichment:order_group_changed"
+                )
+        else:
+            raise EditorialProposalAdoptionError("proposal_target_mismatch")
+        context = VisualRevisionContext(
+            base_enrichment=base_enrichment,
+            evidence_pack=fence.evidence_pack,
+            extraction=extraction,
+            synthesis=synthesis,
+            figure_catalog=tuple(fence.figure_catalog),
+            registered_anchor_ids=fence.evidence_pack.registered_anchor_ids,
+        )
+        try:
+            plan = plan_visual_revision(context, typed_patch)
+        except VisualRevisionRejected as error:
+            raise EditorialProposalAdoptionError(error.code) from None
+        return EnrichmentCandidateInputs(
+            base_payload=base_payload,
+            base_enrichment=base_enrichment,
+            extraction=extraction,
+            synthesis=synthesis,
+            evidence_pack=fence.evidence_pack,
+            targeted_request=request,
+            element_kind=target.element_kind,
+            element_key=target.element_key,
+            input_hash=fence.input_hash,
+            artifact_id=uuid4(),
+            figure_catalog=fence.figure_catalog,
+            revised_enrichment=plan.revised_enrichment,
+            is_create=False,
+            is_delete=False,
+            evidence_pack_hash=fence.evidence_pack_hash,
+            access_policy_hash=synthesis_access_policy_hash(access_policy),
+            model_policy_version=EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION,
+            routing_policy_version=str(base_artifact.metadata.get("routing_policy_version", "")),
+            projection_hash=projection.projection_hash if projection is not None else None,
+            source_figure_inventory_hash=fence.inventory_hash,
+            resource_search_enabled=self._resource_search_enabled,
+            diagram_materializer=lambda diagram: (
+                self._enrichment_revision_service._materialize_candidate_diagram(
+                    diagram, run_id=run.id
+                )
+            ),
+        )
 
     async def revalidate_evidence_policy_and_thread(
         self,
@@ -1297,17 +1490,21 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
             raise EditorialProposalAdoptionError(
                 "proposal_base_stale", reason="routing:decision_hash"
             )
-        paragraph_enrichment_insertion = (
-            stage is ProductionArtifactStage.EDITORIAL_ENRICHMENT
-            and TargetedEditorialRevisionOperation(
-                proposal.operation
-            ).paragraph_enrichment_element_kind
-            is not None
-            and resolution.entry is not None
-            and resolution.entry.source_stage is EditorialSourceStage.SYNTHESIS
-        )
+        # Insertion after a paragraph and reorder both address the synthesis
+        # anchor occurrence while basing the write on the enrichment artifact.
+        synthesis_occurrence = False
+        if stage is ProductionArtifactStage.EDITORIAL_ENRICHMENT:
+            operation = TargetedEditorialRevisionOperation(proposal.operation)
+            synthesis_occurrence = (
+                (
+                    operation.paragraph_enrichment_element_kind is not None
+                    or operation is TargetedEditorialRevisionOperation.REORDER_ENRICHMENT_ELEMENTS
+                )
+                and resolution.entry is not None
+                and resolution.entry.source_stage is EditorialSourceStage.SYNTHESIS
+            )
         expected_occurrence_artifact = (
-            current_synthesis_artifact if paragraph_enrichment_insertion else artifact
+            current_synthesis_artifact if synthesis_occurrence else artifact
         )
         if (
             expected_occurrence_artifact is None
@@ -1319,7 +1516,7 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
             )
         expected_resolution_sha = (
             resolution.record.synthesis_canonical_sha256
-            if paragraph_enrichment_insertion
+            if synthesis_occurrence
             else proposal.base_canonical_sha256
         )
         if resolution.canonical_sha256 != expected_resolution_sha:

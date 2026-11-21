@@ -1942,3 +1942,191 @@ def test_proposal_pins_match_reorder_uses_synthesis_anchor_and_enrichment_base()
         TargetedEditorialRevisionOperation.REORDER_ENRICHMENT_ELEMENTS,
     )
     assert not _proposal_pins_match(enrichment_proposal, enrichment_resolution)
+
+
+@pytest.mark.asyncio
+async def test_visual_revision_candidate_is_the_complete_planner_output() -> None:
+    from cti_app.application.editorial_proposal_adoption import EnrichmentCandidateInputs
+    from cti_app.application.editorial_visual_revision import plan_visual_revision
+    from cti_app.application.editorial_workspace.registry import resolve_occurrence
+    from cti_app.domain.editorial_enrichment_patch import (
+        UpdateVisualCaptionPatch,
+        visual_patch_to_json,
+    )
+    from cti_app.domain.editorial_workspace import bootstrap_block_registry
+    from cti_app.domain.production_editorial_enrichment import editorial_enrichment_to_json
+    from cti_app.domain.production_editorial_revision import (
+        TargetedEditorialRevisionMode,
+        TargetedEditorialRevisionRequest,
+    )
+    from tests.test_editorial_visual_revision import _context
+
+    subject_id, run_id = uuid4(), uuid4()
+    context = _context()
+    base_enrichment = context.base_enrichment
+    base_payload = editorial_enrichment_to_json(base_enrichment)
+    base_bytes = ProductionArtifactStore.canonical_json_bytes(base_payload)
+    base_sha256 = hashlib.sha256(base_bytes).hexdigest()
+    base_artifact = ProductionArtifact(
+        id=uuid4(),
+        production_run_id=run_id,
+        subject_id=subject_id,
+        stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+        version=1,
+        input_hash="2" * 64,
+        canonical_blob_id=uuid4(),
+    )
+    entries = bootstrap_block_registry(
+        artifact_id=base_artifact.id,
+        canonical_sha256=base_sha256,
+        source_stage=EditorialSourceStage.EDITORIAL_ENRICHMENT,
+        canonical_content=base_payload,
+    )
+    table_entry = next(
+        entry
+        for entry in entries
+        if entry.kind is EditorialBlockKind.TABLE and entry.structural_pointer == "/tables/0"
+    )
+    snapshot = WorkspaceSnapshotRecord(
+        snapshot_id=uuid4(),
+        subject_id=subject_id,
+        production_run_id=run_id,
+        synthesis_artifact_id=uuid4(),
+        synthesis_version=1,
+        synthesis_input_hash="1" * 64,
+        synthesis_canonical_sha256="1" * 64,
+        enrichment_artifact_id=base_artifact.id,
+        enrichment_version=1,
+        enrichment_input_hash=base_artifact.input_hash,
+        enrichment_canonical_sha256=base_sha256,
+        publication_artifact_id=None,
+        publication_version=None,
+        publication_input_hash=None,
+        publication_canonical_sha256=None,
+        pipeline_generation=0,
+        routing_decision_id=None,
+        routing_decision_hash=None,
+        publication_kind=PublicationKind.BRIEF,
+        workspace_pin_hash="7" * 64,
+        registry_hash=registry_hash(entries),
+        block_registry=entries,
+    )
+    resolution = resolve_occurrence(snapshot, table_entry.block_id)
+    caption_patch = UpdateVisualCaptionPatch(
+        element_kind=EditorialEnrichmentElementKind.TABLE,
+        element_key="table_one",
+        caption="Nouvelle légende synthétique",
+    )
+    revised = plan_visual_revision(context, caption_patch)
+    target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT,
+        element_kind=EditorialEnrichmentElementKind.TABLE,
+        element_key="table_one",
+    )
+    target_id = hashlib.sha256(
+        ProductionArtifactStore.canonical_json_bytes(target.to_json())
+    ).hexdigest()
+    patch_payload = {
+        "schema_version": "editorial-enrichment-visual-patch-v1",
+        "operation": TargetedEditorialRevisionOperation.UPDATE_VISUAL_CAPTION.value,
+        "target": target.to_json(),
+        "target_id": target_id,
+        "occurrence_id": str(table_entry.block_id),
+        "before_hash": table_entry.content_sha256,
+        "visual_patch": visual_patch_to_json(caption_patch),
+        "rationale": "Synthetic rationale.",
+    }
+    proposal = EditorialProposal(
+        id=uuid4(),
+        subject_id=subject_id,
+        production_run_id=run_id,
+        origin=EditorialProposalOrigin.MANUAL_PATCH,
+        snapshot_id=snapshot.snapshot_id,
+        occurrence_id=table_entry.block_id,
+        base_artifact_id=base_artifact.id,
+        base_artifact_version=1,
+        base_input_hash=base_artifact.input_hash,
+        base_canonical_sha256=base_sha256,
+        base_routing_hash=None,
+        base_pin_hash=snapshot.workspace_pin_hash,
+        target_id=target_id,
+        operation=TargetedEditorialRevisionOperation.UPDATE_VISUAL_CAPTION.value,
+        before_hash=table_entry.content_sha256,
+        patch_blob_ref=uuid4(),
+        patch_sha256="6" * 64,
+        evidence_refs=(),
+        diagnostics={},
+        thread_id=None,
+        variant_group_id=uuid4(),
+        model_run_id=None,
+        model_turn_id=None,
+        state=EditorialProposalState.PROPOSED,
+        state_version=1,
+        actor_id=uuid4(),
+        idempotency_key=f"proposal-{uuid4().hex}",
+        request_sha256="4" * 64,
+    )
+    request = TargetedEditorialRevisionRequest(
+        subject_id=subject_id,
+        base_artifact_id=base_artifact.id,
+        base_version=1,
+        base_input_hash=base_artifact.input_hash,
+        base_canonical_sha256=base_sha256,
+        target=target,
+        operation=TargetedEditorialRevisionOperation.UPDATE_VISUAL_CAPTION,
+        instruction="Accepted editorial proposal",
+        mode=TargetedEditorialRevisionMode.EXISTING_EVIDENCE_ONLY,
+        requester=str(proposal.actor_id),
+        before_hash=table_entry.content_sha256,
+    )
+    inputs = EnrichmentCandidateInputs(
+        base_payload=base_payload,
+        base_enrichment=base_enrichment,
+        extraction=context.extraction,
+        synthesis=context.synthesis,
+        evidence_pack=cast(Any, None),
+        targeted_request=request,
+        element_kind=EditorialEnrichmentElementKind.TABLE,
+        element_key="table_one",
+        input_hash=base_artifact.input_hash,
+        artifact_id=uuid4(),
+        revised_enrichment=revised.revised_enrichment,
+    )
+
+    class _VisualInputs:
+        async def enrichment_inputs(self, *_args: Any, **_kwargs: Any) -> Any:
+            return inputs
+
+        async def revalidate_evidence_policy_and_thread(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+    service = EditorialProposalAdoptionService(
+        uow_factory=cast(Any, object()),
+        blob_store=cast(Any, object()),
+        artifact_store=cast(Any, object()),
+        workspace_service=cast(Any, object()),
+        inputs=cast(Any, _VisualInputs()),
+        synthesis_writer=cast(Any, object()),
+        enrichment_writer=cast(Any, object()),
+    )
+
+    plan = await service._build_candidate(
+        ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+        proposal,
+        patch_payload,
+        base_artifact=base_artifact,
+        base_payload=base_payload,
+        base_bytes=base_bytes,
+        resolution=resolution,
+    )
+
+    assert plan.candidate.enrichment == revised.revised_enrichment
+    assert plan.candidate.canonical_payload == editorial_enrichment_to_json(
+        revised.revised_enrichment
+    )
+    assert (
+        plan.candidate.canonical_sha256
+        == hashlib.sha256(plan.candidate.canonical_bytes).hexdigest()
+    )
+    assert plan.candidate.base_canonical_sha256 == base_sha256
+    assert plan.inputs.revised_enrichment == revised.revised_enrichment

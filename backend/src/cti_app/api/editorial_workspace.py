@@ -551,6 +551,10 @@ class EditorialWorkspaceBlock(BaseModel):
     before_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     allowed_operations: list[str]
     revision_status: Literal["ready", "proposal_pending", "stale", "needs_review"]
+    element_kind: Literal["table", "diagram", "chart", "figure"] | None = None
+    element_key: str | None = None
+    order: int | None = Field(default=None, ge=0)
+    caption: str | None = None
     read_only_reason: EditorialLegacyReadOnlyReason | None = None
 
 

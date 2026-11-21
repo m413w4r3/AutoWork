@@ -21,6 +21,7 @@ from cti_app.application.editorial_enrichment_candidate import (
     DiagramMaterializer,
     EditorialEnrichmentCandidate,
     EnrichmentCandidateBlobReference,
+    build_candidate_from_revised_enrichment,
     materialize_candidate_diagrams,
 )
 from cti_app.application.editorial_enrichment_candidate import (
@@ -89,6 +90,7 @@ from cti_app.application.production_editorial_enrichment import (
 from cti_app.application.production_stages import EditorialEnrichmentService, SynthesisService
 from cti_app.application.production_synthesis import SynthesisEvidencePackV1
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
+from cti_app.domain.editorial_enrichment_patch import IMPLEMENTED_VISUAL_REVISION_OPERATIONS
 from cti_app.domain.editorial_proposal import (
     EditorialProposal,
     EditorialProposalEvent,
@@ -215,12 +217,13 @@ class EnrichmentCandidateInputs:
     synthesis: ProductionSynthesisV1
     evidence_pack: EditorialEnrichmentEvidencePackV1
     targeted_request: TargetedEditorialRevisionRequest
-    element_kind: EditorialEnrichmentElementKind
-    element_key: str
+    element_kind: EditorialEnrichmentElementKind | None
+    element_key: str | None
     input_hash: str
     artifact_id: UUID
     figure_catalog: tuple[ResolvedSourceFigureV1, ...] = ()
     validated_patch: EditorialEnrichmentV1 | None = None
+    revised_enrichment: EditorialEnrichmentV1 | None = None
     registry_lineage: tuple[Mapping[str, object], ...] = ()
     retired_block_ids: tuple[UUID, ...] = ()
     is_create: bool = False
@@ -679,23 +682,61 @@ class EditorialProposalAdoptionService:
             raise EditorialProposalAdoptionError("proposal_base_stale", reason="fence:input_hash")
         if request.operation is not operation:
             raise EditorialProposalAdoptionError("proposal_base_stale", reason="fence:operation")
-        if request.target.element_kind is not enrichment_inputs.element_kind:
+        visual_revision = operation in IMPLEMENTED_VISUAL_REVISION_OPERATIONS
+        if not visual_revision and request.target.element_kind is not (
+            enrichment_inputs.element_kind
+        ):
             raise EditorialProposalAdoptionError("proposal_base_stale", reason="fence:element_kind")
         if patch.get("target") != request.target.to_json():
             raise EditorialProposalAdoptionError("proposal_target_mismatch")
+        if visual_revision:
+            revised_enrichment = enrichment_inputs.revised_enrichment
+            if revised_enrichment is None:
+                raise EditorialProposalAdoptionError("proposal_base_stale", reason="fence:planner")
+            try:
+                validate_targeted_request(request)
+                enrichment_candidate = build_candidate_from_revised_enrichment(
+                    base_artifact=base_artifact,
+                    base_payload=base_payload,
+                    base_canonical_bytes=base_bytes,
+                    base_canonical_sha256=proposal.base_canonical_sha256,
+                    base_enrichment=enrichment_inputs.base_enrichment,
+                    revised_enrichment=revised_enrichment,
+                    extraction=enrichment_inputs.extraction,
+                    synthesis=enrichment_inputs.synthesis,
+                    input_hash=enrichment_inputs.input_hash,
+                    artifact_id=enrichment_inputs.artifact_id,
+                )
+            except EditorialProposalAdoptionError:
+                raise
+            except Exception as error:
+                code = getattr(error, "reason_code", None) or getattr(error, "code", None)
+                raise EditorialProposalAdoptionError(
+                    str(code or "proposal_patch_invalid")
+                ) from None
+            return _EnrichmentCandidatePlan(
+                candidate=enrichment_candidate,
+                inputs=enrichment_inputs,
+                registry_lineage=enrichment_inputs.registry_lineage,
+                retired_block_ids=enrichment_inputs.retired_block_ids,
+            )
         raw_enrichment_patch = patch.get("enrichment_patch")
         if not isinstance(raw_enrichment_patch, dict):
+            raise EditorialProposalAdoptionError("proposal_patch_invalid")
+        element_kind = enrichment_inputs.element_kind
+        element_key = enrichment_inputs.element_key
+        if element_kind is None or element_key is None:
             raise EditorialProposalAdoptionError("proposal_patch_invalid")
         try:
             validate_targeted_request(request)
             action = targeted_action(operation)
-            validate_targeted_action(enrichment_inputs.element_kind, action)
+            validate_targeted_action(element_kind, action)
             validated_patch = enrichment_inputs.validated_patch
             if validated_patch is None:
                 validated_patch = validate_editorial_enrichment_patch(
                     raw_enrichment_patch,
-                    element_kind=enrichment_inputs.element_kind,
-                    element_key=enrichment_inputs.element_key,
+                    element_kind=element_kind,
+                    element_key=element_key,
                     evidence_pack=enrichment_inputs.evidence_pack,
                     extraction=enrichment_inputs.extraction,
                     synthesis=enrichment_inputs.synthesis,
@@ -720,15 +761,15 @@ class EditorialProposalAdoptionService:
             assert_adoption_rewrite_table_placement(
                 base_enrichment=enrichment_inputs.base_enrichment,
                 candidate=validated_patch,
-                element_kind=enrichment_inputs.element_kind,
-                element_key=enrichment_inputs.element_key,
+                element_kind=element_kind,
+                element_key=element_key,
                 operation=operation,
                 is_create=enrichment_inputs.is_create,
             )
             if enrichment_inputs.is_create:
                 assert_requested_placement(
                     candidate=validated_patch,
-                    element_kind=enrichment_inputs.element_kind,
+                    element_kind=element_kind,
                     targeted_request=request,
                     synthesis=enrichment_inputs.synthesis,
                 )
@@ -741,8 +782,8 @@ class EditorialProposalAdoptionService:
                 validated_patch=validated_patch,
                 extraction=enrichment_inputs.extraction,
                 synthesis=enrichment_inputs.synthesis,
-                element_kind=enrichment_inputs.element_kind,
-                element_key=enrichment_inputs.element_key,
+                element_kind=element_kind,
+                element_key=element_key,
                 action=action,
                 input_hash=enrichment_inputs.input_hash,
                 artifact_id=enrichment_inputs.artifact_id,

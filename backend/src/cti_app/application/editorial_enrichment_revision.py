@@ -126,10 +126,35 @@ def targeted_action(
 
 def validate_targeted_request(request: TargetedEditorialRevisionRequest) -> None:
     target = request.target
+    if target.kind is TargetedEditorialRevisionTargetKind.ENRICHMENT_ORDER:
+        if request.operation is not (
+            TargetedEditorialRevisionOperation.REORDER_ENRICHMENT_ELEMENTS
+        ):
+            raise ValueError("targeted_enrichment_revision_target_invalid")
+        if (
+            target.placement is None
+            or target.placement.kind is not TargetedEditorialRevisionPlacementKind.AFTER_PARAGRAPH
+            or target.placement.anchor_block_id is None
+        ):
+            raise ValueError("targeted_enrichment_revision_placement_invalid")
+        return
     if target.kind is not TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT:
         raise ValueError("targeted_enrichment_revision_target_invalid")
     if target.element_kind is None:
         raise ValueError("targeted_enrichment_revision_kind_required")
+    if request.operation is TargetedEditorialRevisionOperation.MOVE_ENRICHMENT_ELEMENT:
+        if (
+            target.element_key is None
+            or target.placement is None
+            or target.placement.kind is not TargetedEditorialRevisionPlacementKind.AFTER_PARAGRAPH
+            or target.placement.anchor_block_id is None
+        ):
+            raise ValueError("targeted_enrichment_revision_placement_invalid")
+        return
+    if request.operation is TargetedEditorialRevisionOperation.UPDATE_VISUAL_CAPTION:
+        if target.element_key is None or target.placement is not None:
+            raise ValueError("targeted_enrichment_revision_element_target_invalid")
+        return
     create_operations = {
         TargetedEditorialRevisionOperation.CREATE_TABLE,
         TargetedEditorialRevisionOperation.CREATE_DIAGRAM,

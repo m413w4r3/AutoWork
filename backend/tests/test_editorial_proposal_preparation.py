@@ -1620,3 +1620,279 @@ async def test_exact_origin_accepts_reorder_on_its_synthesis_anchor() -> None:
         async with setup.service._uow_factory() as stale_uow:
             await setup.service._assert_exact_origin(stale_uow, misplaced)
     assert exc_info.value.code == "editorial_anchor_stale"
+
+
+def _visual_loader(
+    setup: SimpleNamespace,
+    *,
+    context,
+    entry: BlockRegistryEntry,
+    enrichment_artifact_id: UUID,
+    enrichment_sha256: str,
+):
+    from cti_app.application.editorial_visual_revision import (
+        VisualRevisionContext,
+        VisualRevisionPreparation,
+    )
+    from cti_app.domain.production import ProductionArtifact, ProductionArtifactStage
+
+    if not isinstance(context, VisualRevisionContext):
+        raise TypeError("synthetic_visual_context_invalid")
+    artifact = ProductionArtifact(
+        id=enrichment_artifact_id,
+        production_run_id=setup.current_snapshot.production_run_id,
+        subject_id=setup.subject_id,
+        stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+        version=2,
+        input_hash="2" * 64,
+        canonical_blob_id=uuid4(),
+    )
+
+    class _Loader:
+        async def load(self, *, subject_id, snapshot_id, occurrence_id):
+            assert subject_id == setup.subject_id
+            assert occurrence_id == entry.block_id
+            return VisualRevisionPreparation(
+                context=context,
+                base_artifact=artifact,
+                entry=entry,
+                snapshot_id=snapshot_id,
+                subject_id=subject_id,
+                production_run_id=setup.current_snapshot.production_run_id,
+                base_canonical_sha256=enrichment_sha256,
+                base_pin_hash=setup.current_snapshot.workspace_pin_hash,
+                routing_decision_hash=setup.current_snapshot.routing_decision_hash,
+            )
+
+    return _Loader()
+
+
+def _install_visual_workspace(setup: SimpleNamespace) -> SimpleNamespace:
+    async def resolve_current_occurrence(subject_id, occurrence_id):
+        del subject_id
+        return resolve_occurrence(setup.current_snapshot, occurrence_id)
+
+    workspace = SimpleNamespace(resolve_occurrence=resolve_current_occurrence)
+    setup.service._workspace_service = workspace
+    return workspace
+
+
+@pytest.mark.asyncio
+async def test_prepare_visual_caption_proposal_is_non_canonical_and_idempotent() -> None:
+    from cti_app.application.editorial_proposals import EditorialProposalConflict
+    from cti_app.domain.editorial_enrichment_patch import UpdateVisualCaptionPatch
+    from cti_app.domain.editorial_proposal import EditorialProposalState
+    from cti_app.domain.production_editorial_enrichment import (
+        EditorialEnrichmentElementKind,
+    )
+    from tests.test_editorial_visual_revision import _context
+
+    setup = _setup()
+    _paragraph_entry, table_entry, enrichment_artifact_id, enrichment_sha256 = (
+        _install_dual_stage_registry(setup)
+    )
+    _install_visual_workspace(setup)
+    context = _context()
+    setup.service._visual_revision_loader = _visual_loader(
+        setup,
+        context=context,
+        entry=table_entry,
+        enrichment_artifact_id=enrichment_artifact_id,
+        enrichment_sha256=enrichment_sha256,
+    )
+    patch = UpdateVisualCaptionPatch(
+        element_kind=EditorialEnrichmentElementKind.TABLE,
+        element_key="table_one",
+        caption="Nouvelle légende synthétique",
+    )
+    proposal = await setup.service.prepare_visual_revision(
+        subject_id=setup.subject_id,
+        snapshot_id=setup.current_snapshot.snapshot_id,
+        occurrence_id=table_entry.block_id,
+        actor_id=setup.actor_id,
+        idempotency_key="visual-caption-key-0001",
+        patch=patch,
+    )
+
+    assert proposal.state is EditorialProposalState.PROPOSED
+    assert proposal.operation == "update_visual_caption"
+    assert proposal.before_hash == table_entry.content_sha256
+    assert proposal.base_artifact_id == enrichment_artifact_id
+    assert proposal.base_canonical_sha256 == enrichment_sha256
+    preview = cast(dict[str, object], proposal.diagnostics["preview"])
+    assert preview["element_key"] == "table_one"
+    assert proposal.patch_sha256 is not None
+    assert proposal.patch_blob_ref is not None
+    assert setup.canonical_writes == []
+    assert setup.repository.model_runs == []
+
+    replay = await setup.service.prepare_visual_revision(
+        subject_id=setup.subject_id,
+        snapshot_id=setup.current_snapshot.snapshot_id,
+        occurrence_id=table_entry.block_id,
+        actor_id=setup.actor_id,
+        idempotency_key="visual-caption-key-0001",
+        patch=patch,
+    )
+    assert replay.id == proposal.id
+
+    with pytest.raises(EditorialProposalConflict):
+        await setup.service.prepare_visual_revision(
+            subject_id=setup.subject_id,
+            snapshot_id=setup.current_snapshot.snapshot_id,
+            occurrence_id=table_entry.block_id,
+            actor_id=setup.actor_id,
+            idempotency_key="visual-caption-key-0001",
+            patch=UpdateVisualCaptionPatch(
+                element_kind=EditorialEnrichmentElementKind.TABLE,
+                element_key="table_one",
+                caption="Autre légende synthétique",
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_prepare_visual_move_targets_the_new_anchor_and_reorder_uses_the_group_hash() -> None:
+    from cti_app.application.editorial_visual_revision import enrichment_order_group_hash
+    from cti_app.domain.editorial_enrichment_patch import (
+        MoveEnrichmentElementPatch,
+        ReorderEnrichmentElementsPatch,
+    )
+    from cti_app.domain.production_editorial_enrichment import (
+        EditorialEnrichmentElementKind,
+        EnrichmentElementRef,
+        EnrichmentPlacementKind,
+        EnrichmentPlacementV1,
+    )
+    from tests.test_editorial_visual_revision import (
+        _anchor,
+        _base_enrichment,
+        _context,
+        _table,
+    )
+
+    setup = _setup()
+    paragraph_entry, table_entry, enrichment_artifact_id, enrichment_sha256 = (
+        _install_dual_stage_registry(setup)
+    )
+    _install_visual_workspace(setup)
+    base = _base_enrichment()
+    setup.service._visual_revision_loader = _visual_loader(
+        setup,
+        context=_context_for(base),
+        entry=table_entry,
+        enrichment_artifact_id=enrichment_artifact_id,
+        enrichment_sha256=enrichment_sha256,
+    )
+    from tests.test_editorial_visual_revision import ANCHOR_B
+
+    move = MoveEnrichmentElementPatch(
+        element_kind=EditorialEnrichmentElementKind.TABLE,
+        element_key="table_one",
+        anchor_block_id=ANCHOR_B,
+    )
+    moved = await setup.service.prepare_visual_revision(
+        subject_id=setup.subject_id,
+        snapshot_id=setup.current_snapshot.snapshot_id,
+        occurrence_id=table_entry.block_id,
+        actor_id=setup.actor_id,
+        idempotency_key="visual-move-key-000001",
+        patch=move,
+    )
+    assert moved.operation == "move_enrichment_element"
+    assert moved.target_id is not None
+
+    group_anchor = paragraph_entry.block_id
+    grouped = replace(
+        base,
+        tables=(
+            _table("table_one", _anchor(group_anchor), "Which command is documented first?"),
+            _table("table_two", _anchor(group_anchor), "Which command is documented second?"),
+        ),
+    )
+    setup.service._visual_revision_loader = _visual_loader(
+        setup,
+        context=_context(grouped, registered=frozenset({group_anchor, ANCHOR_B})),
+        entry=paragraph_entry,
+        enrichment_artifact_id=enrichment_artifact_id,
+        enrichment_sha256=enrichment_sha256,
+    )
+    order = (
+        EnrichmentElementRef(EditorialEnrichmentElementKind.TABLE, "table_two"),
+        EnrichmentElementRef(EditorialEnrichmentElementKind.TABLE, "table_one"),
+    )
+    reordered = await setup.service.prepare_visual_revision(
+        subject_id=setup.subject_id,
+        snapshot_id=setup.current_snapshot.snapshot_id,
+        occurrence_id=paragraph_entry.block_id,
+        actor_id=setup.actor_id,
+        idempotency_key="visual-reorder-key-0001",
+        patch=ReorderEnrichmentElementsPatch(anchor_block_id=group_anchor, order=order),
+    )
+    assert reordered.operation == "reorder_enrichment_elements"
+    expected_hash = enrichment_order_group_hash(
+        grouped,
+        EnrichmentPlacementV1(
+            EnrichmentPlacementKind.AFTER_PARAGRAPH, anchor_block_id=group_anchor
+        ),
+    )
+    assert reordered.before_hash == expected_hash
+
+
+def _context_for(enrichment):
+    from tests.test_editorial_visual_revision import _context
+
+    return _context(enrichment)
+
+
+@pytest.mark.asyncio
+async def test_prepare_visual_revision_maps_planner_rejections_to_typed_errors() -> None:
+    from cti_app.application.editorial_proposals import EditorialProposalApplicationError
+    from cti_app.domain.editorial_enrichment_patch import (
+        ReviseChartPatch,
+        UpdateVisualCaptionPatch,
+    )
+    from cti_app.domain.production_editorial_enrichment import (
+        EditorialEnrichmentElementKind,
+    )
+    from tests.test_editorial_visual_revision import _context, _timeline_chart
+
+    setup = _setup()
+    _paragraph_entry, table_entry, enrichment_artifact_id, enrichment_sha256 = (
+        _install_dual_stage_registry(setup)
+    )
+    _install_visual_workspace(setup)
+    setup.service._visual_revision_loader = _visual_loader(
+        setup,
+        context=_context(),
+        entry=table_entry,
+        enrichment_artifact_id=enrichment_artifact_id,
+        enrichment_sha256=enrichment_sha256,
+    )
+    with pytest.raises(EditorialProposalApplicationError) as no_change:
+        await setup.service.prepare_visual_revision(
+            subject_id=setup.subject_id,
+            snapshot_id=setup.current_snapshot.snapshot_id,
+            occurrence_id=table_entry.block_id,
+            actor_id=setup.actor_id,
+            idempotency_key="visual-nochange-key-001",
+            patch=UpdateVisualCaptionPatch(
+                element_kind=EditorialEnrichmentElementKind.TABLE,
+                element_key="table_one",
+                caption="Caption table_one",
+            ),
+        )
+    assert no_change.value.code == "enrichment_revision_no_change"
+    assert no_change.value.diagnostics["element_key"] == "table_one"
+
+    with pytest.raises(EditorialProposalApplicationError) as unsupported:
+        await setup.service.prepare_visual_revision(
+            subject_id=setup.subject_id,
+            snapshot_id=setup.current_snapshot.snapshot_id,
+            occurrence_id=table_entry.block_id,
+            actor_id=setup.actor_id,
+            idempotency_key="visual-unsupported-key-01",
+            patch=ReviseChartPatch(element_key="chart_one", chart=_timeline_chart()),
+        )
+    assert unsupported.value.code == "enrichment_revision_unsupported_operation"
+    assert setup.repository.records == []
