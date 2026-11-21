@@ -8,6 +8,7 @@ import pytest
 from cti_app.api import main as api_main
 from cti_app.api import production as production_api
 from cti_app.api import publication as publication_api
+from cti_app.api import publication_runtime as publication_runtime_api
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.config import Settings
 
@@ -98,7 +99,9 @@ async def test_real_app_lifespan_and_repair_fallbacks_require_revision_effects(
     monkeypatch.setattr(api_main, "create_job_registry", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(api_main, "DramatiqJobDispatcher", lambda: object())
     monkeypatch.setattr(api_main, "describe_tool_inventory", lambda _composition: {})
-    monkeypatch.setattr(api_main, "typst_bundle_paths", lambda: (Path("/tmp"),) * 3)
+    monkeypatch.setattr(
+        publication_runtime_api, "resolve_typst_bundle_paths", lambda: (Path("/tmp"),) * 3
+    )
     monkeypatch.setattr(
         api_main.DiagnosticsLog,
         "from_env",

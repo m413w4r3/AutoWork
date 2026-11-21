@@ -103,6 +103,7 @@ const snapshot = {
     manual_edit: false,
     can_add_enrichment: false,
     can_preview_pdf: true,
+    can_regenerate_pdf: false,
   },
   preview_status: "READY",
   impact_status: "none",

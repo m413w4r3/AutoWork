@@ -1,4 +1,5 @@
 import logging
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -10,6 +11,7 @@ from minio import Minio
 from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import Response
 
+from cti_app.api import publication_runtime
 from cti_app.api.analyst_opinion import router as analyst_opinion_router
 from cti_app.api.collection import router as collection_router
 from cti_app.api.detection import router as detection_router
@@ -36,10 +38,6 @@ from cti_app.api.pdf_inspection import router as pdf_inspection_router
 from cti_app.api.production import router as production_router
 from cti_app.api.production_control import router as production_control_router
 from cti_app.api.publication import router as publication_router
-from cti_app.api.publication_runtime import (
-    build_production_artifact_store,
-    build_publication_runtime_services,
-)
 from cti_app.api.selection import selection_router
 from cti_app.api.subject_content import router as subject_content_router
 from cti_app.api.subjects import router as subjects_router
@@ -88,6 +86,7 @@ from cti_app.application.identity import (
 )
 from cti_app.application.investigation_jobs import make_investigation_runner
 from cti_app.application.jobs import DuplicateJobError, JobService, create_job_registry
+from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.network_capture_import import NetworkCaptureImportService
 from cti_app.application.pdf_inspection import PdfInspectionService
@@ -134,6 +133,7 @@ from cti_app.infrastructure.jobs import DramatiqJobDispatcher
 from cti_app.infrastructure.pdf_inspection import PdfInspectionCache, PopplerSubprocess
 from cti_app.infrastructure.quarantined_capture_source import ProductionQuarantinedCaptureSource
 from cti_app.infrastructure.shodan import create_shodan_http_adapter, create_shodan_http_client
+from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 from cti_app.infrastructure.virustotal import (
     create_virustotal_direct_http_client,
     create_virustotal_http_adapter,
@@ -364,7 +364,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     blob_catalog = BlobCatalogService(blob_store, uow_factory)
     goodware_service = GoodwareService(blob_catalog, uow_factory)
     await goodware_service.check_startup()
-    production_artifact_store = build_production_artifact_store(blob_catalog)
+    production_artifact_store = publication_runtime.build_production_artifact_store(blob_catalog)
     network_capture_import_service = NetworkCaptureImportService(
         uow_factory=uow_factory,
         blob_catalog=blob_catalog,
@@ -436,17 +436,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         uow_factory,
         production_artifact_store,
     )
-    publication_runtime = build_publication_runtime_services(
-        uow_factory=uow_factory,
-        artifact_store=production_artifact_store,
-        settings=settings,
-        mapping_cache=pdf_inspection_cache,
-    )
-    media_asset_store = publication_runtime.media_asset_store
-    typst_compiler = publication_runtime.typst_compiler
-    chp_typst_root = publication_runtime.chp_typst_root
-    font_bundle_root = publication_runtime.font_bundle_root
-    typst_fonts_lock_path = publication_runtime.typst_fonts_lock_path
+    typst_paths = publication_runtime.resolve_typst_bundle_paths()
+    chp_typst_root, font_bundle_root, typst_fonts_lock_path = typst_paths
+    typst_compiler = TypstSubprocessCompiler(binary=os.environ.get("TYPST_BINARY", "typst"))
+    media_asset_store = MediaAssetStore(production_artifact_store, uow_factory)
     edition_typst_renderer = EditionTypstRenderer()
     edition_render_service = EditionRenderService(
         uow_factory=uow_factory,
@@ -468,8 +461,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         typst_fonts_lock_path=typst_fonts_lock_path,
         mapping_cache=pdf_inspection_cache,
     )
-    publication_render_service = publication_runtime.render_service
-    subject_content_service = publication_runtime.subject_content_service
+    publication_runtime_services = publication_runtime.build_publication_runtime_services(
+        uow_factory=uow_factory,
+        artifact_store=production_artifact_store,
+        settings=settings,
+        media_asset_store=media_asset_store,
+        typst_compiler=typst_compiler,
+        typst_paths=typst_paths,
+        mapping_cache=pdf_inspection_cache,
+    )
+    publication_render_service = publication_runtime_services.render_service
+    subject_content_service = publication_runtime_services.subject_content_service
     production_chain = ProductionStageChain(production_pacing)
     job_dispatcher = DramatiqJobDispatcher()
     registry = create_job_registry(
@@ -497,8 +499,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.blob_store = blob_store
     app.state.production_artifact_store = production_artifact_store
     app.state.pdf_inspection_service = pdf_inspection_service
-    app.state.pdf_inspection_cache = publication_runtime.mapping_cache
-    app.state.typst_compiler = publication_runtime.typst_compiler
+    app.state.pdf_inspection_cache = publication_runtime_services.mapping_cache
+    app.state.typst_compiler = publication_runtime_services.typst_compiler
     app.state.render_input_inspection_service = render_input_inspection_service
     app.state.media_asset_store = media_asset_store
     app.state.subject_content_service = subject_content_service

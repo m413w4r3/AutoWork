@@ -12,6 +12,7 @@ import type {
 import {
   EDITORIAL_APP_ORIGIN,
   EDITORIAL_FIXTURES,
+  fulfillEditorialReadStatuses,
 } from "./fixtures/editorialApi";
 
 const subjectId = EDITORIAL_FIXTURES.subject.id;
@@ -21,6 +22,7 @@ const proposalId = "44444444-4444-4444-8444-444444444444";
 const secondProposalId = "55555555-5555-4555-8555-555555555555";
 const threadId = "66666666-6666-4666-8666-666666666666";
 const artifactId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+const pdfArtifactId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 const initialSha = "a".repeat(64);
 const subjectPath = `/api/subjects/${subjectId}`;
 const snapshotPath = `${subjectPath}/editor/snapshot`;
@@ -31,7 +33,9 @@ function makeSnapshot(
   text: string,
   version: number,
   discussion = true,
+  previewStatus: EditorialWorkspaceSnapshot["preview_status"] = "READY",
 ): EditorialWorkspaceSnapshot {
+  const isReady = previewStatus === "READY";
   return {
     subject_id: subjectId,
     production_run_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
@@ -86,11 +90,23 @@ function makeSnapshot(
       can_preview_revision: false,
       manual_edit: true,
       can_add_enrichment: true,
-      can_preview_pdf: false,
+      can_preview_pdf: true,
+      can_regenerate_pdf: true,
     },
-    preview_status: "READY",
+    preview_status: previewStatus,
     impact_status: "none",
-    pdf_status: "CURRENT",
+    pdf_status: isReady ? "CURRENT" : "STALE",
+    pdf_artifact_id: isReady ? pdfArtifactId : null,
+    pdf_artifact_version: isReady ? version : null,
+    pdf_artifact_input_hash: isReady ? "e".repeat(64) : null,
+    pdf_artifact_canonical_sha256: isReady ? "f".repeat(64) : null,
+    pdf_render_id: isReady ? "88888888-8888-4888-8888-888888888888" : null,
+    pdf_render_identity: isReady ? `keyboard-render-v${version}` : null,
+    pdf_error_code: null,
+    pdf_error_message: null,
+    pdf_url: isReady
+      ? `/api/subjects/${subjectId}/editor/pdf/download?version=${version}`
+      : null,
     snapshot_id:
       version === 1
         ? "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
@@ -233,6 +249,11 @@ async function installWorkspaceStubs(
       return;
     }
     if (
+      await fulfillEditorialReadStatuses(route, method, url.pathname, snapshot)
+    ) {
+      return;
+    }
+    if (
       method === "GET" &&
       url.pathname.startsWith(`${subjectPath}/editor/figures`)
     ) {
@@ -287,7 +308,12 @@ async function installWorkspaceStubs(
       url.pathname === `${subjectPath}/editor/blocks/${blockId}/manual-edit`
     ) {
       const body = route.request().postDataJSON() as Record<string, unknown>;
-      snapshot = makeSnapshot(String(body.text), 2, options.discussion ?? true);
+      snapshot = makeSnapshot(
+        String(body.text),
+        2,
+        options.discussion ?? true,
+        "STALE",
+      );
       await route.fulfill({
         json: {
           id: proposalId,
@@ -299,6 +325,12 @@ async function installWorkspaceStubs(
           impact_id: "88888888-8888-4888-8888-888888888888",
           impact_state: "pending",
         },
+      });
+      return;
+    }
+    if (method === "GET" && url.pathname === `${subjectPath}/editor/history`) {
+      await route.fulfill({
+        json: { items: [], next_cursor: null, limit: 20 },
       });
       return;
     }
@@ -488,6 +520,7 @@ test("test_async_reply_does_not_steal_focus", async ({ page }) => {
   let currentThread: EditorialThreadRead = unopened;
   let replyAvailable = false;
   const threadEntriesPath = `${threadPath}/entries`;
+  const snapshot = makeSnapshot("Synthetic original paragraph.", 1);
 
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
@@ -509,9 +542,12 @@ test("test_async_reply_does_not_steal_focus", async ({ page }) => {
       return;
     }
     if (method === "GET" && url.pathname === snapshotPath) {
-      await route.fulfill({
-        json: makeSnapshot("Synthetic original paragraph.", 1),
-      });
+      await route.fulfill({ json: snapshot });
+      return;
+    }
+    if (
+      await fulfillEditorialReadStatuses(route, method, url.pathname, snapshot)
+    ) {
       return;
     }
     if (method === "GET" && url.pathname === threadPath) {
@@ -554,6 +590,12 @@ test("test_async_reply_does_not_steal_focus", async ({ page }) => {
       await route.fulfill({
         status: 404,
         json: { detail: { code: "draft_not_found" } },
+      });
+      return;
+    }
+    if (method === "GET" && url.pathname === `${subjectPath}/editor/history`) {
+      await route.fulfill({
+        json: { items: [], next_cursor: null, limit: 20 },
       });
       return;
     }

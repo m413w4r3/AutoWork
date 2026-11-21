@@ -188,7 +188,7 @@ export function EditorialWorkspacePage({
       {savedManualEdit ? (
         <p
           key={savedManualEdit.proposalId}
-          className="editorial-manual-edit-confirmation"
+          className="sr-only editorial-manual-edit-confirmation"
           role="status"
           data-proposal-id={savedManualEdit.proposalId}
         >

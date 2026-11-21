@@ -25,6 +25,11 @@ from cti_app.infrastructure.pdf_inspection import PdfInspectionCache
 from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 
 
+def resolve_typst_bundle_paths() -> tuple[Path, Path, Path]:
+    """Resolve Typst paths at the same point in lifespan construction as before."""
+    return typst_bundle_paths()
+
+
 @dataclass(frozen=True, slots=True)
 class PublicationRuntimeServices:
     uow_factory: UnitOfWorkFactory
@@ -56,6 +61,7 @@ def build_publication_runtime_services(
     settings: Settings,
     media_asset_store: MediaAssetStore | None = None,
     typst_compiler: TypstCompiler | None = None,
+    typst_paths: tuple[Path, Path, Path] | None = None,
     render_service: PublicationPreviewRenderer | None = None,
     subject_content_service: SubjectContentService | None = None,
     mapping_cache: TypstMappingSidecarCache | None = None,
@@ -66,7 +72,9 @@ def build_publication_runtime_services(
         if media_asset_store is not None
         else MediaAssetStore(artifact_store, uow_factory)
     )
-    chp_typst_root, font_bundle_root, typst_fonts_lock_path = typst_bundle_paths()
+    chp_typst_root, font_bundle_root, typst_fonts_lock_path = (
+        typst_bundle_paths() if typst_paths is None else typst_paths
+    )
     compiler = (
         typst_compiler
         if typst_compiler is not None
