@@ -664,6 +664,7 @@ async def test_accept_route_logs_closed_rejection_reason_and_source_frame(
     assert caught.value.detail["code"] == "proposal_state_conflict"
     assert "proposal_decision_rejected code=proposal_state_conflict" in caplog.text
     assert "reason=expected_state_version_mismatch" in caplog.text
+    assert "exc_type=EditorialProposalAdoptionError" in caplog.text
     assert "proposal_id=" + str(proposal_id) in caplog.text
     assert "frame=test_editorial_table_insertion.py:" in caplog.text
     assert ":adopt" in caplog.text

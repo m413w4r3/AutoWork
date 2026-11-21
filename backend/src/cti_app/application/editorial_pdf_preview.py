@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import hashlib
-from typing import Any, Protocol
+from typing import Protocol
 from uuid import UUID
 
 from cti_app.application.editorial_revision_effects import EditorialRevisionEffects
 from cti_app.application.editorial_workspace.service import EditorialWorkspaceService
+from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_references import production_reference_corpus_from_json
 from cti_app.application.production_routing import get_adopted_production_routing_decision
 from cti_app.application.publication_assembly import PublicationAssemblyService
 from cti_app.application.publication_builder import PublicationAssemblyValidationError
+from cti_app.application.publication_rendering import PublicationRenderAttempt
 from cti_app.domain.editorial_proposal_impact import (
     EditorialPdfPreview,
     EditorialPdfPreviewStatus,
@@ -30,7 +32,6 @@ from cti_app.domain.production_extraction import production_extraction_from_json
 from cti_app.domain.production_relevance import relevance_projection_from_json
 from cti_app.domain.production_synthesis import production_synthesis_from_json
 from cti_app.domain.publication_kind import PublicationKind
-from cti_app.domain.publication_render import PublicationRender
 from cti_app.domain.typst_render import TypstRenderStatus
 from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
 
@@ -48,7 +49,7 @@ def require_explicit_publication_kind(kind: PublicationKind | None) -> Publicati
 
 
 class PublicationPreviewRenderer(Protocol):
-    async def render_preview(self, publication_artifact_id: UUID) -> Any: ...
+    async def render_preview(self, publication_artifact_id: UUID) -> PublicationRenderAttempt: ...
 
 
 class EditorialPdfPreviewService:
@@ -59,7 +60,7 @@ class EditorialPdfPreviewService:
         artifact_store: ProductionArtifactStore,
         workspace_service: EditorialWorkspaceService,
         render_service: PublicationPreviewRenderer,
-        media_asset_store: Any | None,
+        media_asset_store: MediaAssetStore | None,
     ) -> None:
         self._uow_factory = uow_factory
         self._artifact_store = artifact_store
@@ -75,7 +76,7 @@ class EditorialPdfPreviewService:
         artifact_is_current = snapshot.get("pdf_status") == "CURRENT" and snapshot.get(
             "pdf_artifact_id"
         ) == str(artifact.id)
-        render = attempt.render if isinstance(attempt.render, PublicationRender) else None
+        render = attempt.render
         preview = project_editorial_pdf_preview(
             subject_id=subject_id,
             current_artifact=artifact if artifact_is_current else None,

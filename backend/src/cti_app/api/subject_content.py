@@ -9,8 +9,12 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, ConfigDict
 
+from cti_app.api.publication_runtime import (
+    production_artifact_store_for_request,
+    publication_runtime_for_request,
+    uow_factory_for_request,
+)
 from cti_app.application.media_assets import MediaAssetStore
-from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_parsers import IndicatorStatus
 from cti_app.application.publication_rendering import (
     PublicationRenderError,
@@ -142,26 +146,41 @@ class PublicationArtifactPreviewResponse(BaseModel):
 
 
 def _service(request: Request) -> SubjectContentService:
-    return cast(SubjectContentService, request.app.state.subject_content_service)
+    configured = getattr(request.app.state, "subject_content_service", None)
+    if configured is not None:
+        return cast(SubjectContentService, configured)
+    runtime = publication_runtime_for_request(request)
+    if runtime is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "subject_content_unavailable"},
+        )
+    return runtime.subject_content_service
 
 
 def _publication_render_service(request: Request) -> PublicationRenderService:
     configured = getattr(request.app.state, "publication_render_service", None)
     if configured is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={"code": "publication_render_unavailable"},
-        )
+        runtime = publication_runtime_for_request(request)
+        if runtime is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "publication_render_unavailable"},
+            )
+        configured = runtime.render_service
     return cast(PublicationRenderService, configured)
 
 
 def _media_asset_store(request: Request) -> MediaAssetStore:
     configured = getattr(request.app.state, "media_asset_store", None)
     if configured is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={"code": "publication_media_unavailable"},
-        )
+        runtime = publication_runtime_for_request(request)
+        if runtime is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "publication_media_unavailable"},
+            )
+        configured = runtime.media_asset_store
     return cast(MediaAssetStore, configured)
 
 
@@ -216,7 +235,12 @@ async def download_subject_publication_pdf(subject_id: UUID, request: Request) -
             detail={"code": exc.code},
         ) from exc
 
-    artifact_store = cast(ProductionArtifactStore, request.app.state.production_artifact_store)
+    artifact_store = production_artifact_store_for_request(request)
+    if artifact_store is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "publication_pdf_storage_unavailable"},
+        )
     try:
         content = await read_verified_render_pdf(artifact_store, render)
     except TypstRenderOutputStorageError as exc:
@@ -256,7 +280,13 @@ async def _publication_preview(
             detail={"code": "publication_not_available"},
         )
 
-    async with request.app.state.uow_factory() as uow:
+    uow_factory = uow_factory_for_request(request)
+    if uow_factory is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "publication_preview_unavailable"},
+        )
+    async with uow_factory() as uow:
         requested = await uow.production_artifacts.get(artifact_id)
         if (
             requested is None
@@ -451,7 +481,12 @@ async def get_subject_publication_preview_pdf(
             detail={"code": "publication_preview_identity_mismatch"},
         )
 
-    artifact_store = cast(ProductionArtifactStore, request.app.state.production_artifact_store)
+    artifact_store = production_artifact_store_for_request(request)
+    if artifact_store is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "publication_pdf_storage_unavailable"},
+        )
     try:
         content = await read_verified_render_pdf(artifact_store, render)
     except TypstRenderOutputStorageError as exc:

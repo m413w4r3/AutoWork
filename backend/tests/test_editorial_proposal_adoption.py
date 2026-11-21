@@ -931,6 +931,24 @@ async def test_adopt_rehashes_patch_revalidates_fences_and_never_calls_gateway()
 
 
 @pytest.mark.asyncio
+async def test_adopt_does_not_relabel_unexpected_workspace_failure_as_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture()
+    workspace = fixture.service._workspace_service
+
+    async def fail_resolution(
+        _subject_id: UUID, _occurrence_id: UUID
+    ) -> WorkspaceOccurrenceResolution:
+        raise RuntimeError("Synthetic workspace programming failure")
+
+    monkeypatch.setattr(workspace, "resolve_occurrence", fail_resolution)
+
+    with pytest.raises(RuntimeError, match="Synthetic workspace programming failure"):
+        await fixture.adopt()
+
+
+@pytest.mark.asyncio
 async def test_same_idempotency_key_with_different_body_conflicts() -> None:
     fixture = _fixture()
     accepted = await fixture.adopt()
