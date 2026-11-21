@@ -232,6 +232,7 @@ class SqlAlchemyEditionCompositionRepository:
             select(
                 ProductionRunRow.subject_id.label("subject_id"),
                 ProductionRunRow.id.label("run_id"),
+                ProductionArtifactRow.id.label("artifact_id"),
                 ProductionArtifactRow.version.label("artifact_version"),
                 func.row_number()
                 .over(
@@ -260,12 +261,13 @@ class SqlAlchemyEditionCompositionRepository:
             select(
                 latest_publications.c.subject_id,
                 latest_publications.c.run_id,
+                latest_publications.c.artifact_id,
                 latest_publications.c.artifact_version,
             ).where(latest_publications.c.artifact_rank == 1)
         )
         latest_by_run = {
-            (subject_id, run_id): (run_id, artifact_version)
-            for subject_id, run_id, artifact_version in latest_rows
+            (subject_id, run_id): (run_id, artifact_id, artifact_version)
+            for subject_id, run_id, artifact_id, artifact_version in latest_rows
         }
 
         decision_ids = {
@@ -347,7 +349,8 @@ class SqlAlchemyEditionCompositionRepository:
                 artifact_version=artifact.version if artifact is not None else None,
                 artifact_input_hash=artifact.input_hash if artifact is not None else None,
                 latest_artifact_run_id=latest_publication[0] if latest_publication else None,
-                latest_artifact_version=latest_publication[1] if latest_publication else None,
+                latest_artifact_id=latest_publication[1] if latest_publication else None,
+                latest_artifact_version=latest_publication[2] if latest_publication else None,
                 linked_batch_id=linked_batch_id,
                 supplied_batch_exists_in_edition=(
                     entry.provenance_batch_id in supplied_batches

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,6 +29,43 @@ class SqlAlchemyEditorialProposalRepository:
 
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
+
+    async def list_for_subject(
+        self,
+        subject_id: UUID,
+        *,
+        occurrence_id: UUID | None,
+        before: tuple[datetime, UUID] | None,
+        limit: int,
+    ) -> tuple[EditorialProposal, ...]:
+        """Read newest persisted proposals for one subject and optional block."""
+        if limit < 1 or limit > 101:
+            raise ValueError("editorial_history_limit_invalid")
+        statement = (
+            select(EditorialProposalRow, EditorialProposalModelRunRow)
+            .outerjoin(
+                EditorialProposalModelRunRow,
+                EditorialProposalModelRunRow.proposal_id == EditorialProposalRow.id,
+            )
+            .where(EditorialProposalRow.subject_id == subject_id)
+            .order_by(EditorialProposalRow.created_at.desc(), EditorialProposalRow.id.desc())
+            .limit(limit)
+        )
+        if occurrence_id is not None:
+            statement = statement.where(EditorialProposalRow.occurrence_id == occurrence_id)
+        if before is not None:
+            before_created_at, before_id = before
+            statement = statement.where(
+                or_(
+                    EditorialProposalRow.created_at < before_created_at,
+                    and_(
+                        EditorialProposalRow.created_at == before_created_at,
+                        EditorialProposalRow.id < before_id,
+                    ),
+                )
+            )
+        result = await self._session.execute(statement)
+        return tuple(_proposal_from_rows(row, link) for row, link in result.all())
 
     async def lock_adoption_for_run(self, production_run_id: UUID) -> None:
         """Serialize adoptions before locking proposal rows, avoiding sibling deadlocks."""

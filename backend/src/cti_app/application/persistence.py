@@ -297,6 +297,15 @@ class EditorialThreadRepository(Protocol):
 
 
 class EditorialProposalRepository(Protocol):
+    async def list_for_subject(
+        self,
+        subject_id: UUID,
+        *,
+        occurrence_id: UUID | None,
+        before: tuple[datetime, UUID] | None,
+        limit: int,
+    ) -> Sequence[EditorialProposal]: ...
+
     async def lock_adoption_for_run(self, production_run_id: UUID) -> None: ...
 
     async def get_by_idempotency_key(

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Protocol
@@ -132,6 +132,101 @@ class CompositionRead:
     composition: EditionComposition | None
     reasons: tuple[CompositionValidationReason, ...]
     axes: CompositionValidationAxes
+    reference_states: Mapping[UUID, CompositionReferenceState] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class CompositionSubjectPinStatus:
+    edition_id: UUID
+    subject_id: UUID
+    status: str
+    message: str
+    composition_id: UUID | None
+    composition_version: int | None
+    pinned_artifact_id: UUID | None
+    pinned_artifact_version: int | None
+    current_artifact_id: UUID | None
+    current_artifact_version: int | None
+    current_version_available: bool
+    composition_url: str
+
+
+def project_subject_composition_pin_status(
+    read: CompositionRead,
+    subject_id: UUID,
+    *,
+    composition_url: str,
+) -> CompositionSubjectPinStatus:
+    composition = read.composition
+    entry = (
+        next(
+            (item for item in composition.entries if item.subject_id == subject_id),
+            None,
+        )
+        if composition is not None
+        else None
+    )
+    state = read.reference_states.get(subject_id)
+    reasons = tuple(reason for reason in read.reasons if reason.subject_id == subject_id)
+    if entry is None or entry.disposition is not CompositionDisposition.INCLUDED:
+        return CompositionSubjectPinStatus(
+            edition_id=read.edition_id,
+            subject_id=subject_id,
+            status="not_pinned",
+            message="Ce sujet n'est pas inclus dans la composition courante.",
+            composition_id=composition.id if composition is not None else None,
+            composition_version=composition.version if composition is not None else None,
+            pinned_artifact_id=None,
+            pinned_artifact_version=None,
+            current_artifact_id=(state.latest_artifact_id if state is not None else None),
+            current_artifact_version=(state.latest_artifact_version if state is not None else None),
+            current_version_available=state is not None
+            and state.latest_artifact_version is not None,
+            composition_url=composition_url,
+        )
+
+    stale_codes = {
+        CompositionValidationCode.RUN_NOT_IN_EDITION,
+        CompositionValidationCode.ARTIFACT_NOT_FOUND,
+        CompositionValidationCode.ARTIFACT_NOT_VERIFIED,
+        CompositionValidationCode.ARTIFACT_PIN_MISMATCH,
+        CompositionValidationCode.SUPERSEDED_ARTIFACT_AVAILABLE,
+        CompositionValidationCode.PRODUCTION_RUN_NOT_READY,
+    }
+    stale = any(reason.code in stale_codes for reason in reasons) or (
+        state is not None
+        and (
+            state.artifact_status is not ProductionArtifactStatus.VERIFIED
+            or state.artifact_version != entry.artifact_version
+            or state.artifact_input_hash != entry.artifact_input_hash
+        )
+    )
+    current_version = state.latest_artifact_version if state is not None else None
+    current_artifact_id = state.latest_artifact_id if state is not None else None
+    return CompositionSubjectPinStatus(
+        edition_id=read.edition_id,
+        subject_id=subject_id,
+        status="stale" if stale else "current",
+        message=(
+            "Composition à mettre à jour"
+            if stale
+            else "La composition utilise la publication courante."
+        ),
+        composition_id=composition.id if composition is not None else None,
+        composition_version=composition.version if composition is not None else None,
+        pinned_artifact_id=entry.artifact_id,
+        pinned_artifact_version=entry.artifact_version,
+        current_artifact_id=current_artifact_id,
+        current_artifact_version=current_version,
+        current_version_available=(
+            current_version is not None
+            and (
+                current_version != entry.artifact_version
+                or current_artifact_id != entry.artifact_id
+            )
+        ),
+        composition_url=composition_url,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,6 +245,7 @@ class CompositionReferenceState:
     artifact_version: int | None = None
     artifact_input_hash: str | None = None
     latest_artifact_run_id: UUID | None = None
+    latest_artifact_id: UUID | None = None
     latest_artifact_version: int | None = None
     linked_batch_id: UUID | None = None
     supplied_batch_exists_in_edition: bool = False
@@ -311,6 +407,7 @@ class EditionCompositionService:
                 discovery_update_available=discovery_update_available,
                 composition_eligibility=composition is not None and not reasons,
             ),
+            reference_states=references.entries,
         )
 
     async def validate(self, edition_id: UUID) -> CompositionRead:

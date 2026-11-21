@@ -27,6 +27,11 @@ from pydantic import (
 from starlette.responses import JSONResponse
 
 from cti_app.application.blobs import BlobCatalogService
+from cti_app.application.edition_composition import (
+    CompositionNotFound,
+    EditionCompositionService,
+    project_subject_composition_pin_status,
+)
 from cti_app.application.editorial_drafts import (
     MAX_DRAFT_BYTES,
     EditorialDraftApplicationError,
@@ -38,6 +43,14 @@ from cti_app.application.editorial_figure_catalog import (
     EditorialFigureCatalogItem,
     EditorialFigureCatalogService,
     FigureCatalogSource,
+)
+from cti_app.application.editorial_history import (
+    EditorialHistoryError,
+    EditorialHistoryService,
+)
+from cti_app.application.editorial_pdf_preview import (
+    EditorialPdfPreviewService,
+    EditorialPdfRegenerationError,
 )
 from cti_app.application.editorial_proposal_adoption import (
     EditorialProposalAdoptionError,
@@ -420,6 +433,7 @@ class EditorialWorkspaceCapabilities(BaseModel):
     manual_edit: bool
     can_add_enrichment: bool
     can_preview_pdf: bool
+    can_regenerate_pdf: bool
 
 
 class EditorialWorkspaceRevisionTarget(BaseModel):
@@ -555,10 +569,109 @@ class EditorialWorkspaceSnapshotView(BaseModel):
     enrichments: list[EditorialWorkspaceBlock]
     document_outline: list[EditorialDocumentOutlineNode]
     capabilities: EditorialWorkspaceCapabilities
-    preview_status: Literal["IN_PROGRESS", "READY", "FAILED", "STALE"]
+    preview_status: Literal["READY", "STALE", "GENERATING", "FAILED"]
     impact_status: Literal["none", "pending", "running", "superseded", "up_to_date", "failed"]
     pdf_status: Literal["CURRENT", "STALE"]
+    pdf_artifact_id: UUID | None
+    pdf_artifact_version: int | None
+    pdf_artifact_input_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    pdf_artifact_canonical_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    pdf_render_id: UUID | None
+    pdf_render_identity: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    pdf_error_code: str | None
+    pdf_error_message: str | None
+    pdf_url: str | None
     snapshot_id: UUID
+
+
+class EditorialPdfStatusView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    subject_id: UUID
+    status: Literal["READY", "STALE", "GENERATING", "FAILED"]
+    artifact_id: UUID | None
+    artifact_version: int | None
+    artifact_input_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    artifact_canonical_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    render_id: UUID | None
+    render_identity: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    error_code: str | None
+    error_message: str | None
+    pdf_url: str | None
+
+
+class EditorialHistoryItemView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    proposal_id: UUID
+    subject_id: UUID
+    occurrence_id: UUID
+    state: Literal[
+        "preparing", "proposed", "refused", "needs_review", "accepted", "rejected", "stale"
+    ]
+    origin: Literal["manual_patch", "bridge_draft"]
+    operation: Literal[
+        "rewrite_title",
+        "rewrite_lead",
+        "rewrite_paragraph",
+        "insert_paragraph",
+        "delete_paragraph",
+        "rewrite_section",
+        "insert_section",
+        "delete_section",
+        "merge_sections",
+        "split_section",
+        "rename_section",
+        "create_table",
+        "create_bar_chart",
+        "rewrite_table",
+        "delete_table",
+        "create_diagram",
+        "rewrite_diagram",
+        "delete_diagram",
+        "create_chart",
+        "rewrite_chart",
+        "delete_chart",
+        "create_source_figure",
+        "rewrite_source_figure",
+        "replace_source_figure",
+        "delete_source_figure",
+    ]
+    operation_label: str
+    actor_id: UUID
+    actor_display: str
+    created_at: datetime
+    updated_at: datetime
+    canonical_result_artifact_id: UUID | None
+    canonical_result_version: int | None
+    canonical_result_stage: str | None
+    thread_id: UUID | None
+    thread_url: str | None
+
+
+class EditorialHistoryPageView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[EditorialHistoryItemView]
+    next_cursor: str | None
+    limit: int = Field(ge=1, le=100)
+
+
+class EditorialCompositionStatusView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    edition_id: UUID
+    subject_id: UUID
+    status: Literal["current", "stale", "not_pinned"]
+    message: str
+    composition_id: UUID | None
+    composition_version: int | None
+    pinned_artifact_id: UUID | None
+    pinned_artifact_version: int | None
+    current_artifact_id: UUID | None
+    current_artifact_version: int | None
+    current_version_available: bool
+    composition_url: str
 
 
 class EditorialFigureSourceView(BaseModel):
@@ -1026,6 +1139,34 @@ _ERROR_MESSAGES = {
     "production_run_missing": "Aucune production n'est disponible pour ce sujet.",
     "publication_kind_unresolved": (
         "Le type de publication est indéterminé. L'atelier reste en lecture seule."
+    ),
+    "editorial_history_cursor_invalid": (
+        "La page d'historique demandée n'est plus valide. Rechargez l'historique."
+    ),
+    "editorial_history_limit_invalid": "Le nombre de révisions demandé est invalide.",
+    "publication_preview_regeneration_unavailable": (
+        "La régénération du PDF est indisponible. Vérifiez la configuration Typst, puis réessayez."
+    ),
+    "publication_preview_generation_failed": (
+        "La génération du PDF a échoué. Vérifiez la configuration Typst, puis réessayez."
+    ),
+    "publication_routing_unavailable": (
+        "Le type de publication ne peut pas être confirmé. Rechargez le sujet avant "
+        "de régénérer le PDF."
+    ),
+    "publication_preview_inputs_unavailable": (
+        "Les versions courantes nécessaires au rendu ne sont pas disponibles. "
+        "Réessayez après la fin de leur mise à jour."
+    ),
+    "publication_preview_inputs_invalid": (
+        "Les données de publication ne peuvent pas être assemblées. Vérifiez les artefacts "
+        "courants avant de réessayer."
+    ),
+    "publication_preview_assembly_failed": (
+        "La publication ne peut pas être assemblée. Corrigez les éléments signalés, puis réessayez."
+    ),
+    "production_run_not_ready": (
+        "La production n'est pas encore prête. Attendez sa fin avant de régénérer le PDF."
     ),
     "editorial_snapshot_stale": "Le document a changé. Rechargez l'atelier.",
     "editorial_identity_ambiguous": (
@@ -1656,6 +1797,182 @@ async def get_editorial_workspace_snapshot(
     if isinstance(capabilities, dict):
         capabilities["manual_edit"] = _manual_edit_capability_enabled(request, payload)
     return EditorialWorkspaceSnapshotView.model_validate(payload)
+
+
+@router.get(
+    "/subjects/{subject_id}/editor/pdf",
+    response_model=EditorialPdfStatusView,
+)
+async def get_editorial_pdf_status(subject_id: UUID, request: Request) -> EditorialPdfStatusView:
+    try:
+        snapshot = await _service(request).snapshot(subject_id)
+    except EditorialWorkspaceError as error:
+        _raise_workspace_error(error)
+    return EditorialPdfStatusView(
+        subject_id=subject_id,
+        status=cast(Literal["READY", "STALE", "GENERATING", "FAILED"], snapshot["preview_status"]),
+        artifact_id=UUID(str(snapshot["pdf_artifact_id"])) if snapshot["pdf_artifact_id"] else None,
+        artifact_version=cast(int | None, snapshot["pdf_artifact_version"]),
+        artifact_input_hash=cast(str | None, snapshot["pdf_artifact_input_hash"]),
+        artifact_canonical_sha256=cast(str | None, snapshot["pdf_artifact_canonical_sha256"]),
+        render_id=UUID(str(snapshot["pdf_render_id"])) if snapshot["pdf_render_id"] else None,
+        render_identity=cast(str | None, snapshot["pdf_render_identity"]),
+        error_code=cast(str | None, snapshot["pdf_error_code"]),
+        error_message=cast(str | None, snapshot["pdf_error_message"]),
+        pdf_url=cast(str | None, snapshot["pdf_url"]),
+    )
+
+
+@router.post(
+    "/subjects/{subject_id}/editor/pdf/regenerate",
+    response_model=EditorialPdfStatusView,
+)
+async def regenerate_editorial_pdf(subject_id: UUID, request: Request) -> EditorialPdfStatusView:
+    artifact_store = _production_artifact_store_for_request(request)
+    if artifact_store is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "editorial_snapshot_storage_unavailable",
+                "message": "Le stockage des documents éditoriaux est indisponible.",
+            },
+        )
+    render_service = getattr(request.app.state, "publication_render_service", None)
+    if render_service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "publication_preview_regeneration_unavailable",
+                "message": _ERROR_MESSAGES["publication_preview_regeneration_unavailable"],
+            },
+        )
+    service = EditorialPdfPreviewService(
+        uow_factory=request.app.state.uow_factory,
+        artifact_store=artifact_store,
+        workspace_service=_service(request),
+        render_service=render_service,
+        media_asset_store=getattr(request.app.state, "media_asset_store", None),
+    )
+    try:
+        preview = await service.regenerate(subject_id)
+    except EditorialPdfRegenerationError as error:
+        code = error.code
+        error_status = (
+            status.HTTP_404_NOT_FOUND
+            if code in {"production_run_missing", "subject_not_found"}
+            else status.HTTP_503_SERVICE_UNAVAILABLE
+            if code in {"publication_preview_regeneration_unavailable"}
+            else status.HTTP_409_CONFLICT
+        )
+        raise HTTPException(
+            status_code=error_status,
+            detail={
+                "code": code,
+                "message": _ERROR_MESSAGES.get(
+                    code, _ERROR_MESSAGES["publication_preview_generation_failed"]
+                ),
+            },
+        ) from error
+    return EditorialPdfStatusView(
+        subject_id=subject_id,
+        status=preview.status.value,
+        artifact_id=preview.artifact_id,
+        artifact_version=preview.artifact_version,
+        artifact_input_hash=preview.artifact_input_hash,
+        artifact_canonical_sha256=preview.artifact_canonical_sha256,
+        render_id=preview.render_id,
+        render_identity=preview.render_identity,
+        error_code=preview.error_code,
+        error_message=preview.error_message,
+        pdf_url=preview.pdf_url,
+    )
+
+
+@router.get(
+    "/subjects/{subject_id}/editor/composition",
+    response_model=EditorialCompositionStatusView,
+)
+async def get_editorial_composition_status(
+    subject_id: UUID, request: Request
+) -> EditorialCompositionStatusView:
+    async with request.app.state.uow_factory() as uow:
+        subject = await uow.subjects.get(subject_id)
+        if subject is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "code": "subject_not_found",
+                    "message": _ERROR_MESSAGES["subject_not_found"],
+                },
+            )
+        run = await uow.production_runs.get_current_for_subject(subject_id)
+    if run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "code": "production_run_missing",
+                "message": _ERROR_MESSAGES["production_run_missing"],
+            },
+        )
+    composition_service = getattr(request.app.state, "edition_composition_service", None)
+    if composition_service is None:
+        composition_service = EditionCompositionService(request.app.state.uow_factory)
+    try:
+        read = await composition_service.get(run.edition_id)
+    except CompositionNotFound as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "code": error.code,
+                "message": "La composition de cette édition est introuvable.",
+            },
+        ) from error
+    projection = project_subject_composition_pin_status(
+        read,
+        subject_id,
+        composition_url=f"/api/editions/{run.edition_id}/composition",
+    )
+    return EditorialCompositionStatusView.model_validate(projection, from_attributes=True)
+
+
+@router.get(
+    "/subjects/{subject_id}/editor/history",
+    response_model=EditorialHistoryPageView,
+)
+async def get_editorial_history(
+    subject_id: UUID,
+    request: Request,
+    block_id: UUID | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+    limit: int = Query(default=20),
+) -> EditorialHistoryPageView:
+    try:
+        page = await EditorialHistoryService(request.app.state.uow_factory).read(
+            subject_id,
+            occurrence_id=block_id,
+            cursor=cursor,
+            limit=limit,
+        )
+    except EditorialHistoryError as error:
+        error_status = (
+            status.HTTP_404_NOT_FOUND
+            if error.code == "subject_not_found"
+            else status.HTTP_400_BAD_REQUEST
+        )
+        raise HTTPException(
+            status_code=error_status,
+            detail={
+                "code": error.code,
+                "message": _ERROR_MESSAGES.get(
+                    error.code, "L'historique éditorial est temporairement indisponible."
+                ),
+            },
+        ) from error
+    return EditorialHistoryPageView(
+        items=[EditorialHistoryItemView.model_validate(item) for item in page.items],
+        next_cursor=page.next_cursor,
+        limit=page.limit,
+    )
 
 
 _FIGURE_STATUS_FILTERS = Literal[

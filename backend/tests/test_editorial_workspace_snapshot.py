@@ -36,7 +36,8 @@ from cti_app.domain.editorial_workspace import (
 )
 from cti_app.domain.production import ProductionArtifactStatus
 from cti_app.domain.publication_kind import PublicationKind
-from cti_app.domain.typst_render import TypstRenderStatus
+from cti_app.domain.publication_render import PublicationRender
+from cti_app.domain.typst_render import TypstRenderFormat, TypstRenderStatus
 
 
 def _synthesis(paragraphs: tuple[dict[str, object], ...]) -> dict[str, object]:
@@ -589,7 +590,7 @@ def test_deleted_anchor_marks_enrichment_and_preview_stale_without_fallback(
         artifact_store.write(enrichment)
 
         valid = await service.snapshot(subject_id)
-        assert valid["preview_status"] == "READY"
+        assert valid["preview_status"] == "STALE"
         assert any(block["text"] == "Do not move to the end" for block in valid["blocks"])
 
         artifacts.replace_synthesis(_synthesis((_paragraph("paragraph to keep"),)), artifact_store)
@@ -891,17 +892,18 @@ def test_workspace_pin_hash_is_stable_for_same_pins() -> None:
 
 
 @pytest.mark.parametrize(
-    ("render_status", "expected_preview_status"),
+    ("render_status", "expected_preview_status", "expected_pdf_status"),
     [
-        (TypstRenderStatus.SUCCEEDED, "READY"),
-        (TypstRenderStatus.RUNNING, "IN_PROGRESS"),
-        (TypstRenderStatus.FAILED, "FAILED"),
+        (TypstRenderStatus.SUCCEEDED, "READY", "CURRENT"),
+        (TypstRenderStatus.RUNNING, "GENERATING", "STALE"),
+        (TypstRenderStatus.FAILED, "FAILED", "STALE"),
     ],
 )
 def test_workspace_snapshot_reads_publication_render_cycle_without_impact(
     monkeypatch: pytest.MonkeyPatch,
     render_status: TypstRenderStatus,
     expected_preview_status: str,
+    expected_pdf_status: str,
 ) -> None:
     from cti_app.application.editorial_workspace import service as service_module
     from cti_app.domain.publication_kind import PublicationKind
@@ -917,7 +919,7 @@ def test_workspace_snapshot_reads_publication_render_cycle_without_impact(
     artifacts.current["publication"] = publication
     artifact_store.write(publication)
     uow = service._uow_factory()
-    uow.publication_render = SimpleNamespace(status=render_status)
+    uow.publication_render = _publication_render(publication.id, render_status)
     monkeypatch.setattr(
         service_module,
         "resolve_publication_kind",
@@ -929,6 +931,7 @@ def test_workspace_snapshot_reads_publication_render_cycle_without_impact(
 
         assert snapshot["impact_status"] == "none"
         assert snapshot["preview_status"] == expected_preview_status
+        assert snapshot["pdf_status"] == expected_pdf_status
 
     asyncio.run(exercise())
 
@@ -970,8 +973,8 @@ def test_pending_impact_without_publication_does_not_mark_preview_stale(
         snapshot = await service.snapshot(subject_id)
         assert snapshot["impact_status"] == "pending"
         assert snapshot["publication_artifact_id"] is None
-        assert snapshot["preview_status"] == "READY"
-        assert snapshot["pdf_status"] == "CURRENT"
+        assert snapshot["preview_status"] == "STALE"
+        assert snapshot["pdf_status"] == "STALE"
 
     asyncio.run(exercise())
 
@@ -1055,6 +1058,8 @@ def test_publication_without_enrichment_pin_is_stale_only_when_enrichment_exists
     }
     artifacts.current["publication"] = publication
     artifact_store.write(publication)
+    uow = service._uow_factory()
+    uow.publication_render = _publication_render(publication.id, TypstRenderStatus.SUCCEEDED)
     monkeypatch.setattr(
         service_module,
         "resolve_publication_kind",
@@ -1114,6 +1119,39 @@ def _make_artifact(
         metadata={},
         content=content,
         production_run_id=production_run_id,
+    )
+
+
+def _publication_render(
+    publication_artifact_id: UUID,
+    status: TypstRenderStatus,
+) -> PublicationRender:
+    succeeded = status is TypstRenderStatus.SUCCEEDED
+    failed = status is TypstRenderStatus.FAILED
+    now = datetime.now(UTC)
+    return PublicationRender(
+        id=uuid4(),
+        publication_artifact_id=publication_artifact_id,
+        renderer="typst",
+        renderer_version="1",
+        template_version="1",
+        template_sha256="b" * 64,
+        compiler="typst",
+        compiler_version="1",
+        font_bundle_version="1",
+        render_policy_version="1",
+        format=TypstRenderFormat.PDF,
+        input_hash="c" * 64,
+        source_blob_id=None,
+        render_data_blob_id=None,
+        output_blob_id=uuid4() if succeeded else None,
+        output_sha256="d" * 64 if succeeded else None,
+        output_byte_size=128 if succeeded else None,
+        status=status,
+        error_code="typst_binary_unavailable" if failed else None,
+        error_message="Typst binary is unavailable" if failed else None,
+        created_at=now,
+        updated_at=now,
     )
 
 

@@ -15,6 +15,7 @@ export type EditorialRevisionStatus =
 export type EditorialImpactStatus =
   "none" | "pending" | "running" | "superseded" | "up_to_date" | "failed";
 export type EditorialPdfStatus = "CURRENT" | "STALE";
+export type EditorialPdfPreviewStatus = "READY" | "STALE" | "GENERATING" | "FAILED";
 
 export type EditorialFigureStatus =
   | "available"
@@ -167,6 +168,7 @@ export interface EditorialWorkspaceCapabilities {
   manual_edit: boolean;
   can_add_enrichment: boolean;
   can_preview_pdf: boolean;
+  can_regenerate_pdf: boolean;
 }
 
 export interface EditorialWorkspaceSnapshot {
@@ -185,10 +187,73 @@ export interface EditorialWorkspaceSnapshot {
   enrichments: EditorialWorkspaceBlock[];
   document_outline: EditorialDocumentOutlineNode[];
   capabilities: EditorialWorkspaceCapabilities;
-  preview_status: "IN_PROGRESS" | "READY" | "FAILED" | "STALE";
+  preview_status: EditorialPdfPreviewStatus;
   impact_status: EditorialImpactStatus;
   pdf_status: EditorialPdfStatus;
+  pdf_artifact_id: string | null;
+  pdf_artifact_version: number | null;
+  pdf_artifact_input_hash: string | null;
+  pdf_artifact_canonical_sha256: string | null;
+  pdf_render_id: string | null;
+  pdf_render_identity: string | null;
+  pdf_error_code: string | null;
+  pdf_error_message: string | null;
+  pdf_url: string | null;
   snapshot_id: string;
+}
+
+export interface EditorialPdfStatusView {
+  subject_id: string;
+  status: EditorialPdfPreviewStatus;
+  artifact_id: string | null;
+  artifact_version: number | null;
+  artifact_input_hash: string | null;
+  artifact_canonical_sha256: string | null;
+  render_id: string | null;
+  render_identity: string | null;
+  error_code: string | null;
+  error_message: string | null;
+  pdf_url: string | null;
+}
+
+export interface EditorialHistoryItem {
+  proposal_id: string;
+  subject_id: string;
+  occurrence_id: string;
+  state: EditorialProposalState;
+  origin: "manual_patch" | "bridge_draft";
+  operation: EditorialProposalOperation;
+  operation_label: string;
+  actor_id: string;
+  actor_display: string;
+  created_at: string;
+  updated_at: string;
+  canonical_result_artifact_id: string | null;
+  canonical_result_version: number | null;
+  canonical_result_stage: string | null;
+  thread_id: string | null;
+  thread_url: string | null;
+}
+
+export interface EditorialHistoryPage {
+  items: EditorialHistoryItem[];
+  next_cursor: string | null;
+  limit: number;
+}
+
+export interface EditorialCompositionStatusView {
+  edition_id: string;
+  subject_id: string;
+  status: "current" | "stale" | "not_pinned";
+  message: string;
+  composition_id: string | null;
+  composition_version: number | null;
+  pinned_artifact_id: string | null;
+  pinned_artifact_version: number | null;
+  current_artifact_id: string | null;
+  current_artifact_version: number | null;
+  current_version_available: boolean;
+  composition_url: string;
 }
 
 export interface EditorialServerDraft {
@@ -564,6 +629,16 @@ const EDITORIAL_THREAD_TRANSPORT_UNCERTAIN_MESSAGE =
 const ERROR_MESSAGES: Record<string, string> = {
   publication_kind_unresolved:
     "Le type de publication est indéterminé. L’atelier reste en lecture seule.",
+  editorial_history_cursor_invalid:
+    "La page d’historique demandée n’est plus valide. Rechargez l’historique.",
+  editorial_history_limit_invalid:
+    "Le nombre de révisions demandé est invalide.",
+  publication_preview_regeneration_unavailable:
+    "La régénération du PDF est indisponible. Vérifiez la configuration Typst, puis réessayez.",
+  publication_preview_generation_failed:
+    "La génération du PDF a échoué. Vérifiez la configuration Typst, puis réessayez.",
+  editorial_composition_status_unavailable:
+    "L’état de la composition est temporairement indisponible.",
   editorial_snapshot_stale: "Le document a changé. Rechargez l’atelier.",
   editorial_identity_ambiguous:
     "L’identité de ce bloc historique est ambiguë. Il reste en lecture seule.",
@@ -749,6 +824,54 @@ export function getEditorialWorkspaceSnapshot(
 ): Promise<EditorialWorkspaceSnapshot> {
   return request<EditorialWorkspaceSnapshot>(
     `/api/subjects/${encodeURIComponent(subjectId)}/editor/snapshot`,
+  );
+}
+
+export function getEditorialPdfStatus(
+  subjectId: string,
+): Promise<EditorialPdfStatusView> {
+  return request<EditorialPdfStatusView>(
+    `/api/subjects/${encodeURIComponent(subjectId)}/editor/pdf`,
+    { cache: "no-store" },
+  );
+}
+
+export function regenerateEditorialPdf(
+  subjectId: string,
+): Promise<EditorialPdfStatusView> {
+  return request<EditorialPdfStatusView>(
+    `/api/subjects/${encodeURIComponent(subjectId)}/editor/pdf/regenerate`,
+    { method: "POST" },
+  );
+}
+
+export interface EditorialHistoryFilters {
+  occurrenceId?: string;
+  cursor?: string;
+  limit?: number;
+}
+
+export function getEditorialHistory(
+  subjectId: string,
+  filters: EditorialHistoryFilters = {},
+): Promise<EditorialHistoryPage> {
+  const params = new URLSearchParams();
+  if (filters.occurrenceId) params.set("block_id", filters.occurrenceId);
+  if (filters.cursor) params.set("cursor", filters.cursor);
+  if (filters.limit !== undefined) params.set("limit", String(filters.limit));
+  const query = params.size > 0 ? `?${params.toString()}` : "";
+  return request<EditorialHistoryPage>(
+    `/api/subjects/${encodeURIComponent(subjectId)}/editor/history${query}`,
+    { cache: "no-store" },
+  );
+}
+
+export function getEditorialCompositionStatus(
+  subjectId: string,
+): Promise<EditorialCompositionStatusView> {
+  return request<EditorialCompositionStatusView>(
+    `/api/subjects/${encodeURIComponent(subjectId)}/editor/composition`,
+    { cache: "no-store" },
   );
 }
 

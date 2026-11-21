@@ -195,22 +195,24 @@ def _impact(*, accepted_pin_hash: str = "b" * 64) -> EditorialProposalImpact:
 
 
 @pytest.mark.parametrize(
-    ("render_status", "expected_pdf_status"),
+    ("render_status", "expected_preview_status", "expected_pdf_status"),
     [
-        ("READY", "CURRENT"),
-        ("IN_PROGRESS", "CURRENT"),
-        ("FAILED", "CURRENT"),
-        ("STALE", "STALE"),
+        ("READY", "READY", "CURRENT"),
+        ("IN_PROGRESS", "GENERATING", "STALE"),
+        ("GENERATING", "GENERATING", "STALE"),
+        ("FAILED", "FAILED", "STALE"),
+        ("STALE", "STALE", "STALE"),
+        (None, "STALE", "STALE"),
     ],
 )
 def test_impact_projection_preserves_real_pdf_render_statuses(
-    render_status: str, expected_pdf_status: str
+    render_status: str | None, expected_preview_status: str, expected_pdf_status: str
 ) -> None:
     assert project_editorial_impact_status(
         None,
         render_status=render_status,
         publication_stale=False,
-    ) == ("none", render_status, expected_pdf_status)
+    ) == ("none", expected_preview_status, expected_pdf_status)
 
 
 @pytest.mark.parametrize(
@@ -267,12 +269,12 @@ def test_pending_impact_preserves_real_render_states_when_publication_is_outdate
         pending,
         render_status="IN_PROGRESS",
         publication_stale=True,
-    ) == ("pending", "IN_PROGRESS", "STALE")
+    ) == ("pending", "STALE", "STALE")
     assert project_editorial_impact_status(
         pending,
         render_status="FAILED",
         publication_stale=True,
-    ) == ("pending", "FAILED", "STALE")
+    ) == ("pending", "STALE", "STALE")
 
 
 def test_done_impact_only_marks_pdf_stale_when_publication_is_stale() -> None:

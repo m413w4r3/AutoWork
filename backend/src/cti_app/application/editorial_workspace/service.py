@@ -30,7 +30,10 @@ from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_routing import get_adopted_production_routing_decision
 from cti_app.application.subject_content import resolve_publication_kind
-from cti_app.domain.editorial_proposal_impact import project_editorial_impact_status
+from cti_app.domain.editorial_proposal_impact import (
+    project_editorial_impact_status,
+    project_editorial_pdf_preview,
+)
 from cti_app.domain.editorial_workspace import (
     AdvancedBlockRegistry,
     BlockRegistryEntry,
@@ -566,17 +569,24 @@ class EditorialWorkspaceService:
                 enrichment.get("revision_status") == "stale" for enrichment in enrichments
             )
             render_status = (
-                PublicationPreviewStatus.READY
-                if publication_render is None
-                else {
+                {
                     TypstRenderStatus.RUNNING: PublicationPreviewStatus.IN_PROGRESS,
                     TypstRenderStatus.SUCCEEDED: PublicationPreviewStatus.READY,
                     TypstRenderStatus.FAILED: PublicationPreviewStatus.FAILED,
                 }[publication_render.status]
+                if publication_render is not None
+                else None
             )
             impact_status, preview_status, pdf_status = project_editorial_impact_status(
                 impact,
                 render_status=render_status,
+                publication_stale=publication_stale,
+            )
+            pdf_preview = project_editorial_pdf_preview(
+                subject_id=subject.id,
+                current_artifact=publication_artifact,
+                current_canonical_sha256=publication_sha,
+                render=publication_render,
                 publication_stale=publication_stale,
             )
             result: dict[str, object] = {
@@ -607,11 +617,25 @@ class EditorialWorkspaceService:
                     "can_preview_revision": False,
                     "manual_edit": False,
                     "can_add_enrichment": False,
-                    "can_preview_pdf": False,
+                    "can_preview_pdf": pdf_preview.status.value == "READY",
+                    "can_regenerate_pdf": kind is not None,
                 },
-                "preview_status": preview_status,
+                "preview_status": preview_status.value,
                 "impact_status": impact_status,
                 "pdf_status": pdf_status,
+                "pdf_artifact_id": (
+                    str(pdf_preview.artifact_id) if pdf_preview.artifact_id is not None else None
+                ),
+                "pdf_artifact_version": pdf_preview.artifact_version,
+                "pdf_artifact_input_hash": pdf_preview.artifact_input_hash,
+                "pdf_artifact_canonical_sha256": pdf_preview.artifact_canonical_sha256,
+                "pdf_render_id": (
+                    str(pdf_preview.render_id) if pdf_preview.render_id is not None else None
+                ),
+                "pdf_render_identity": pdf_preview.render_identity,
+                "pdf_error_code": pdf_preview.error_code,
+                "pdf_error_message": pdf_preview.error_message,
+                "pdf_url": pdf_preview.pdf_url,
                 "snapshot_id": str(record.snapshot_id),
             }
             await self._assert_artifact_pointers_current(
