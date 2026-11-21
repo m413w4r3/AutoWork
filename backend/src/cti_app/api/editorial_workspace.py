@@ -27,7 +27,11 @@ from pydantic import (
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.responses import JSONResponse
 
-from cti_app.application.blobs import BlobCatalogService
+from cti_app.api.publication_runtime import (
+    production_artifact_store_for_request,
+    publication_runtime_for_request,
+    uow_factory_for_request,
+)
 from cti_app.application.edition_composition import (
     CompositionNotFound,
     EditionCompositionService,
@@ -77,6 +81,7 @@ from cti_app.application.editorial_threads import (
 )
 from cti_app.application.editorial_workspace import EditorialWorkspaceService
 from cti_app.application.media_assets import MediaAssetStore
+from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_editorial_enrichment import (
     ProductionEditorialEnrichmentService,
@@ -1340,6 +1345,7 @@ def _manual_edit_capability_enabled(request: Request, payload: Mapping[str, obje
 
 def _service(request: Request) -> EditorialWorkspaceService:
     artifact_store = _production_artifact_store_for_request(request)
+    uow_factory = _uow_factory_for_request(request)
     if artifact_store is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -1356,26 +1362,30 @@ def _service(request: Request) -> EditorialWorkspaceService:
         figure_catalog_service = _figure_catalog_service(
             request,
             artifact_store=artifact_store,
-            uow_factory=request.app.state.uow_factory,
+            uow_factory=uow_factory,
         )
     return EditorialWorkspaceService(
-        uow_factory=request.app.state.uow_factory,
+        uow_factory=uow_factory,
         artifact_store=artifact_store,
         figure_catalog_service=figure_catalog_service,
     )
 
 
 def _production_artifact_store_for_request(request: Request) -> ProductionArtifactStore | None:
-    configured = getattr(request.app.state, "production_artifact_store", None)
-    if configured is not None:
-        return cast(ProductionArtifactStore, configured)
-    blob_store = getattr(request.app.state, "blob_store", None)
-    uow_factory = getattr(request.app.state, "uow_factory", None)
-    if blob_store is None or uow_factory is None:
-        return None
-    artifact_store = ProductionArtifactStore(BlobCatalogService(blob_store, uow_factory))
-    request.app.state.production_artifact_store = artifact_store
-    return artifact_store
+    return production_artifact_store_for_request(request)
+
+
+def _uow_factory_for_request(request: Request) -> UnitOfWorkFactory:
+    configured = uow_factory_for_request(request)
+    if configured is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "editorial_snapshot_storage_unavailable",
+                "message": "Le stockage des documents éditoriaux est indisponible.",
+            },
+        )
+    return configured
 
 
 def _collection_service_for_request(request: Request) -> Any | None:
@@ -1409,15 +1419,13 @@ def _draft_service(request: Request) -> EditorialDraftService:
                 "message": _ERROR_MESSAGES["draft_storage_unavailable"],
             },
         )
-    try:
-        retention_days = get_settings().editorial_draft_retention_days
-    except Exception:
-        retention_days = None
+    configured_settings = getattr(request.app.state, "settings", None)
+    settings = configured_settings if isinstance(configured_settings, Settings) else get_settings()
     return EditorialDraftService(
-        uow_factory=request.app.state.uow_factory,
+        uow_factory=_uow_factory_for_request(request),
         workspace_service=_service(request),
         blob_store=blob_store,
-        retention_days=retention_days,
+        retention_days=settings.editorial_draft_retention_days,
     )
 
 
@@ -1542,11 +1550,14 @@ async def _purge_decided_server_draft(
 
 
 def _media_asset_store_for_request(
-    request: Request, *, artifact_store: Any, uow_factory: Any
+    request: Request,
+    *,
+    artifact_store: ProductionArtifactStore,
+    uow_factory: UnitOfWorkFactory,
 ) -> MediaAssetStore:
-    configured = getattr(request.app.state, "media_asset_store", None)
-    if configured is not None:
-        return cast(MediaAssetStore, configured)
+    runtime = publication_runtime_for_request(request)
+    if runtime is not None:
+        return runtime.media_asset_store
     return MediaAssetStore(artifact_store, uow_factory)
 
 
@@ -1554,7 +1565,12 @@ def _proposal_adoption_service(request: Request) -> EditorialProposalAdoptionSer
     artifact_store = _production_artifact_store_for_request(request)
     blob_store = getattr(request.app.state, "blob_store", None)
     model_gateway = getattr(request.app.state, "model_gateway", None)
-    render_service = getattr(request.app.state, "publication_render_service", None)
+    runtime = publication_runtime_for_request(request)
+    render_service = (
+        runtime.render_service
+        if runtime is not None
+        else getattr(request.app.state, "publication_render_service", None)
+    )
     uow_factory = getattr(request.app.state, "uow_factory", None)
     if any(
         item is None
@@ -1690,7 +1706,9 @@ def _require_proposal_writer(request: Request) -> None:
     """Fail closed unless the production unique adoption writer is constructible."""
     try:
         service = _proposal_adoption_service(request)
-    except Exception:
+    except HTTPException as error:
+        if error.status_code != status.HTTP_503_SERVICE_UNAVAILABLE:
+            raise
         service = None
     if service is None or not callable(getattr(service, "adopt", None)):
         raise HTTPException(
@@ -1708,11 +1726,20 @@ def _thread_service(request: Request) -> EditorialThreadService:
     )
 
     workspace_service = _service(request)
-    artifact_store = request.app.state.production_artifact_store
+    artifact_store = _production_artifact_store_for_request(request)
+    if artifact_store is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "editorial_snapshot_storage_unavailable",
+                "message": "Le stockage des documents éditoriaux est indisponible.",
+            },
+        )
+    uow_factory = _uow_factory_for_request(request)
     blob_store = getattr(request.app.state, "blob_store", None)
     proposal_service = (
         EditorialProposalService(
-            uow_factory=request.app.state.uow_factory,
+            uow_factory=uow_factory,
             blob_store=blob_store,
             artifact_store=artifact_store,
             workspace_service=workspace_service,
@@ -1720,21 +1747,21 @@ def _thread_service(request: Request) -> EditorialThreadService:
             media_asset_store=_media_asset_store_for_request(
                 request,
                 artifact_store=artifact_store,
-                uow_factory=request.app.state.uow_factory,
+                uow_factory=uow_factory,
             ),
         )
         if blob_store is not None
         else None
     )
     return EditorialThreadService(
-        uow_factory=request.app.state.uow_factory,
+        uow_factory=uow_factory,
         workspace_service=workspace_service,
         artifact_store=artifact_store,
         model_conversations=getattr(request.app.state, "model_conversation_service", None),
         enqueue_job=_enqueue_editorial_thread_job,
         proposal_service=proposal_service,
         discussion_context_builder=EditorialDiscussionContextBuilder(
-            uow_factory=request.app.state.uow_factory,
+            uow_factory=uow_factory,
             workspace_service=workspace_service,
             artifact_store=artifact_store,
         ),
@@ -1829,8 +1856,8 @@ async def get_editorial_pdf_status(subject_id: UUID, request: Request) -> Editor
     response_model=EditorialPdfStatusView,
 )
 async def regenerate_editorial_pdf(subject_id: UUID, request: Request) -> EditorialPdfStatusView:
-    artifact_store = _production_artifact_store_for_request(request)
-    if artifact_store is None:
+    runtime = publication_runtime_for_request(request)
+    if runtime is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={
@@ -1838,21 +1865,12 @@ async def regenerate_editorial_pdf(subject_id: UUID, request: Request) -> Editor
                 "message": "Le stockage des documents éditoriaux est indisponible.",
             },
         )
-    render_service = getattr(request.app.state, "publication_render_service", None)
-    if render_service is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={
-                "code": "publication_preview_regeneration_unavailable",
-                "message": _ERROR_MESSAGES["publication_preview_regeneration_unavailable"],
-            },
-        )
     service = EditorialPdfPreviewService(
-        uow_factory=request.app.state.uow_factory,
-        artifact_store=artifact_store,
+        uow_factory=runtime.uow_factory,
+        artifact_store=runtime.artifact_store,
         workspace_service=_service(request),
-        render_service=render_service,
-        media_asset_store=getattr(request.app.state, "media_asset_store", None),
+        render_service=runtime.render_service,
+        media_asset_store=runtime.media_asset_store,
     )
     try:
         preview = await service.regenerate(subject_id)
@@ -1896,7 +1914,8 @@ async def regenerate_editorial_pdf(subject_id: UUID, request: Request) -> Editor
 async def get_editorial_composition_status(
     subject_id: UUID, request: Request
 ) -> EditorialCompositionStatusView:
-    async with request.app.state.uow_factory() as uow:
+    uow_factory = _uow_factory_for_request(request)
+    async with uow_factory() as uow:
         subject = await uow.subjects.get(subject_id)
         if subject is None:
             raise HTTPException(
@@ -1917,7 +1936,7 @@ async def get_editorial_composition_status(
         )
     composition_service = getattr(request.app.state, "edition_composition_service", None)
     if composition_service is None:
-        composition_service = EditionCompositionService(request.app.state.uow_factory)
+        composition_service = EditionCompositionService(uow_factory)
     try:
         read = await composition_service.get(run.edition_id)
     except CompositionNotFound as error:
@@ -1948,7 +1967,7 @@ async def get_editorial_history(
     limit: int = Query(default=20),
 ) -> EditorialHistoryPageView:
     try:
-        page = await EditorialHistoryService(request.app.state.uow_factory).read(
+        page = await EditorialHistoryService(_uow_factory_for_request(request)).read(
             subject_id,
             occurrence_id=block_id,
             cursor=cursor,
@@ -2193,13 +2212,14 @@ async def _read_editorial_figure(
         raise _figure_catalog_http_error(
             EditorialFigureCatalogError("figure_thumbnail_unavailable")
         ) from None
-    async with request.app.state.uow_factory() as uow:
+    async with _uow_factory_for_request(request)() as uow:
         subject = await uow.subjects.get(subject_id)
         run = await uow.production_runs.get_current_for_subject(subject_id)
         source_document = await uow.source_documents.get(item._source_document_id)
         if (
             subject is None
             or run is None
+            or source_document is None
             or run.id != item._run_id
             or source_document.subject_id != subject_id
         ):
@@ -2238,9 +2258,12 @@ async def _read_editorial_figure(
     mime_type = item.mime_type or ""
     prepared = figure_thumbnail_cache.get(item._sha256, requested_size, mime_type)
     if prepared is None:
-        content = await request.app.state.production_artifact_store.read_bytes(
-            item._blob_id, max_bytes=5 * 1024 * 1024
-        )
+        artifact_store = _production_artifact_store_for_request(request)
+        if artifact_store is None:
+            raise _figure_catalog_http_error(
+                EditorialFigureCatalogError("figure_thumbnail_unavailable")
+            ) from None
+        content = await artifact_store.read_bytes(item._blob_id, max_bytes=5 * 1024 * 1024)
         if len(content) != item._byte_size or hashlib.sha256(content).hexdigest() != item._sha256:
             raise _figure_catalog_http_error(
                 EditorialFigureCatalogError("figure_thumbnail_unavailable")
@@ -2423,17 +2446,27 @@ async def get_editorial_proposal(
     proposal_id: UUID,
     request: Request,
 ) -> EditorialProposalView:
+    workspace_service = _service(request)
+    artifact_store = _production_artifact_store_for_request(request)
+    if artifact_store is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "proposal_patch_unavailable",
+                "message": _ERROR_MESSAGES["proposal_patch_unavailable"],
+            },
+        )
     service = EditorialProposalService(
-        uow_factory=request.app.state.uow_factory,
+        uow_factory=_uow_factory_for_request(request),
         blob_store=getattr(request.app.state, "blob_store", None),
-        artifact_store=request.app.state.production_artifact_store,
+        artifact_store=artifact_store,
     )
     try:
         view = await service.inspect(
             subject_id,
             occurrence_id,
             proposal_id,
-            workspace_service=_service(request),
+            workspace_service=workspace_service,
         )
     except EditorialProposalApplicationError as error:
         code = (
@@ -2478,10 +2511,20 @@ async def reject_editorial_proposal(
                 "message": _ERROR_MESSAGES["idempotency_key_invalid"],
             },
         )
+    workspace_service = _service(request)
+    artifact_store = _production_artifact_store_for_request(request)
+    if artifact_store is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "proposal_patch_unavailable",
+                "message": _ERROR_MESSAGES["proposal_patch_unavailable"],
+            },
+        )
     service = EditorialProposalService(
-        uow_factory=request.app.state.uow_factory,
+        uow_factory=_uow_factory_for_request(request),
         blob_store=getattr(request.app.state, "blob_store", None),
-        artifact_store=request.app.state.production_artifact_store,
+        artifact_store=artifact_store,
     )
     try:
         rejected = await service.reject(
@@ -2492,7 +2535,7 @@ async def reject_editorial_proposal(
             expected_state_version=payload.expected_state_version,
             patch_sha256=payload.patch_sha256,
             idempotency_key=idempotency_key,
-            workspace_service=_service(request),
+            workspace_service=workspace_service,
         )
     except EditorialProposalApplicationError as error:
         code = error.code

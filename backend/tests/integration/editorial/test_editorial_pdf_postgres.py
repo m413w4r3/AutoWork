@@ -176,6 +176,13 @@ class _ExplicitFakePublicationRenderer:
             await uow.commit()
         return PublicationRenderAttempt(TypstRenderStatus.SUCCEEDED, render)
 
+    async def lineage_manifest_for_render(self, render: PublicationRender) -> dict[str, object]:
+        return {
+            "schema_version": "pdf-lineage.v1",
+            "render_identity": render.input_hash,
+            "artifact_id": str(render.publication_artifact_id),
+        }
+
 
 def _publication_renderer(
     app: FastAPI, uow_factory: UnitOfWorkFactory, artifact_store: ProductionArtifactStore
