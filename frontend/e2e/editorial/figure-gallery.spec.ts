@@ -305,6 +305,7 @@ test("galerie figures: états bornés, sélection locale et aperçu détaillé �
     "Paragraphe synthétique utilisé pour ouvrir l’inspecteur.",
   );
   await paragraph.click();
+  await page.getByRole("tab", { name: "Sources" }).click();
   await page.getByRole("button", { name: "Images sources" }).click();
 
   const gallery = page.getByRole("dialog", {

@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { EditorialConversationComposer } from "./EditorialConversationComposer";
 import { EditorialConversationStatus } from "./EditorialConversationStatus";
@@ -6,6 +6,7 @@ import { EditorialConversationTimeline } from "./EditorialConversationTimeline";
 import { EditorialProposalCard } from "./EditorialProposalCard";
 import { useEditorialConversationDrafts } from "./useEditorialConversationDrafts";
 import { useEditorialThreadLifecycle } from "./useEditorialThreadLifecycle";
+import type { EditorialProposalState } from "../../api/editorialWorkspace";
 
 interface EditorialConversationProps {
   subjectId: string;
@@ -16,6 +17,7 @@ interface EditorialConversationProps {
   proposalPrompt?: string | null;
   onProposalPromptApplied?: () => void;
   onChangeTarget: () => void;
+  onPendingProposalsChange?: (pending: boolean) => void;
 }
 
 export function EditorialConversation({
@@ -27,8 +29,36 @@ export function EditorialConversation({
   proposalPrompt = null,
   onProposalPromptApplied,
   onChangeTarget,
+  onPendingProposalsChange,
 }: EditorialConversationProps) {
   const drafts = useEditorialConversationDrafts(occurrenceId);
+  const [proposalStates, setProposalStates] = useState<
+    Record<string, EditorialProposalState>
+  >({});
+  const reportProposalState = useCallback(
+    (proposalId: string, state: EditorialProposalState) => {
+      setProposalStates((current) =>
+        current[proposalId] === state
+          ? current
+          : { ...current, [proposalId]: state },
+      );
+    },
+    [],
+  );
+  useEffect(() => {
+    setProposalStates({});
+  }, [occurrenceId]);
+  useEffect(() => {
+    if (!onPendingProposalsChange) return;
+    onPendingProposalsChange(
+      Object.values(proposalStates).some(
+        (state) =>
+          state === "preparing" ||
+          state === "proposed" ||
+          state === "needs_review",
+      ),
+    );
+  }, [onPendingProposalsChange, proposalStates]);
   const lifecycle = useEditorialThreadLifecycle({
     subjectId,
     occurrenceId,
@@ -129,6 +159,7 @@ export function EditorialConversation({
               onRequestVariant={
                 lifecycle.canCompose ? requestVariant : undefined
               }
+              onStateChange={reportProposalState}
             />
           ))}
         </div>

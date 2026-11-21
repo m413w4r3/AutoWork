@@ -175,9 +175,7 @@ describe("EditorialWorkspacePage manual editing", () => {
         .length,
     ).toBeGreaterThan(0);
     expect(await screen.findByText("Impact en attente")).toBeVisible();
-    const confirmation = await screen.findByText(
-      "Modification manuelle enregistrée (version 2).",
-    );
+    const confirmation = await screen.findByText("Enregistré · v2");
     expect(confirmation).toHaveAttribute("data-proposal-id", editResult.id);
     expect(manualRequests).toHaveLength(1);
     expect(manualRequests[0]?.url).toContain(
@@ -193,6 +191,95 @@ describe("EditorialWorkspacePage manual editing", () => {
     expect(
       screen.queryByRole("status", { name: /Brouillon local/ }),
     ).not.toBeInTheDocument();
+  });
+
+  it("saves the lead paragraph with the canonical rewrite_lead operation", async () => {
+    const user = userEvent.setup();
+    const leadSnapshot = createSnapshot("Synthetic lead paragraph.", 1, "none");
+    leadSnapshot.blocks = [
+      {
+        ...leadSnapshot.blocks[0]!,
+        kind: "lead_paragraph",
+        allowed_operations: ["rewrite_lead"],
+      },
+    ];
+    const manualRequests: { url: string; body: Record<string, unknown> }[] = [];
+    const editResult: EditorialManualEditResult = {
+      id: "55555555-5555-4555-8555-555555555555",
+      state: "accepted",
+      state_version: 2,
+      artifact_id: "33333333-3333-4333-8333-333333333333",
+      artifact_version: 2,
+      snapshot_id: "11111111-1111-4111-8111-111111111111",
+      impact_id: "44444444-4444-4444-8444-444444444444",
+      impact_state: "pending",
+    };
+    const jsonResponse = (value: unknown, status = 200) =>
+      Promise.resolve(
+        new Response(JSON.stringify(value), {
+          status,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>((input, init) => {
+        const url =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url;
+        if (url.endsWith("/editor/snapshot")) {
+          return jsonResponse(leadSnapshot);
+        }
+        if (url.endsWith("/manual-edit") && init?.method === "POST") {
+          if (typeof init.body !== "string") {
+            throw new Error("Expected a JSON request body");
+          }
+          manualRequests.push({
+            url,
+            body: JSON.parse(init.body) as Record<string, unknown>,
+          });
+          return jsonResponse(editResult);
+        }
+        return jsonResponse({ detail: { code: "draft_not_found" } }, 404);
+      }),
+    );
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: 0 } },
+    });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <EditorialWorkspacePage subjectId={subjectId} />
+      </QueryClientProvider>,
+    );
+    await waitFor(() =>
+      expect(
+        document.querySelector(
+          `.editorial-document__block[data-block-id="${blockId}"]`,
+        ),
+      ).toBeInTheDocument(),
+    );
+    const documentBlock = document.querySelector<HTMLElement>(
+      `.editorial-document__block[data-block-id="${blockId}"]`,
+    );
+    if (!documentBlock) {
+      throw new Error("Expected the synthetic lead block");
+    }
+    await user.click(documentBlock);
+    await user.click(screen.getByRole("button", { name: "Modifier" }));
+    const editor = screen.getByRole("textbox", { name: "Texte du bloc" });
+    await user.clear(editor);
+    await user.type(editor, "Synthetic edited lead paragraph.");
+    await user.click(screen.getByRole("button", { name: "Enregistrer" }));
+
+    await waitFor(() => expect(manualRequests).toHaveLength(1));
+    expect(manualRequests[0]?.body).toEqual({
+      snapshot_id: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+      operation: "rewrite_lead",
+      text: "Synthetic edited lead paragraph.",
+    });
   });
 
   it("does not label a read-only current workspace as historical", async () => {

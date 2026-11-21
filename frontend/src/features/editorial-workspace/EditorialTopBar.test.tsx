@@ -507,3 +507,75 @@ describe("EditorialTopBar render state", () => {
     ).toBeVisible();
   });
 });
+
+describe("EditorialTopBar editing states", () => {
+  function renderTopBar(props: {
+    readOnlyReason?: string | null;
+    manualEditSaving?: boolean;
+    manualEditConflict?: boolean;
+    pendingProposal?: boolean;
+  }) {
+    render(
+      <EditorialTopBar
+        subjectId="subject-1"
+        snapshot={baseSnapshot}
+        stale={false}
+        menuOpen={false}
+        technicalOpen={false}
+        onToggleMenu={vi.fn()}
+        onOpenTechnicalDetails={vi.fn()}
+        onTechnicalOpenChange={vi.fn()}
+        onRefresh={vi.fn()}
+        {...props}
+      />,
+    );
+  }
+
+  it("shows Lecture seule with its accessible description", () => {
+    renderTopBar({ readOnlyReason: "historical_version" });
+    expect(
+      screen.getByRole("status", {
+        name: /Lecture seule\. Le document est en lecture seule/i,
+      }),
+    ).toHaveTextContent("Lecture seule");
+  });
+
+  it("shows Modification en cours while a manual save is in flight", () => {
+    renderTopBar({ manualEditSaving: true });
+    expect(
+      screen.getByRole("status", {
+        name: /Modification en cours\. Une modification est en cours de validation/i,
+      }),
+    ).toHaveTextContent("Modification en cours");
+  });
+
+  it("shows Conflit when a concurrent version change is detected", () => {
+    renderTopBar({ manualEditConflict: true });
+    expect(
+      screen.getByRole("status", {
+        name: /Conflit\. La version a changé depuis le début de cette modification/i,
+      }),
+    ).toHaveTextContent("Conflit");
+  });
+
+  it("shows Proposition en attente without claiming the document changed", () => {
+    renderTopBar({ pendingProposal: true });
+    expect(
+      screen.getByRole("status", {
+        name: /Proposition en attente\. Une proposition attend votre décision/i,
+      }),
+    ).toHaveTextContent("Proposition en attente");
+    expect(
+      screen.queryByText("Dernière version canonique enregistrée"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps Lecture seule ahead of transient edit states", () => {
+    renderTopBar({
+      readOnlyReason: "publication_kind_unresolved",
+      manualEditSaving: true,
+      pendingProposal: true,
+    });
+    expect(screen.getByRole("status")).toHaveTextContent("Lecture seule");
+  });
+});

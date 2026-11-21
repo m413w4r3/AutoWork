@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { ApiError } from "../../api/editions";
@@ -24,6 +25,7 @@ interface EditorialProposalCardProps {
   referenceOrdinal?: number;
   anchorText?: string;
   onRequestVariant?: () => void;
+  onStateChange?: (proposalId: string, state: EditorialProposalState) => void;
 }
 
 const stateLabels: Record<EditorialProposalState, string> = {
@@ -384,6 +386,7 @@ export function EditorialProposalCard({
   referenceOrdinal,
   anchorText,
   onRequestVariant,
+  onStateChange,
 }: EditorialProposalCardProps) {
   const queryClient = useQueryClient();
   const proposalQueryKey = editorialWorkspaceQueryKeys.proposal(
@@ -395,6 +398,11 @@ export function EditorialProposalCard({
     queryKey: proposalQueryKey,
     queryFn: () => getEditorialProposal(subjectId, occurrenceId, proposalId),
   });
+  const proposalState = proposalQuery.data?.state;
+  useEffect(() => {
+    if (!proposalState) return;
+    onStateChange?.(proposalId, proposalState);
+  }, [onStateChange, proposalId, proposalState]);
   const invalidateDecisionContext = async () => {
     await Promise.all([
       queryClient.invalidateQueries({
@@ -507,6 +515,12 @@ export function EditorialProposalCard({
       <p className="editorial-proposal-card__base">
         Base canonique · version {proposal.base_artifact_version}
       </p>
+      {anchorText ? (
+        <p className="editorial-proposal-card__target">
+          <strong>Bloc ciblé · </strong>
+          {anchorText}
+        </p>
+      ) : null}
       {proposal.origin === "manual_patch" ? (
         <p className="editorial-proposal-card__origin">Modification manuelle</p>
       ) : null}
@@ -564,6 +578,26 @@ export function EditorialProposalCard({
           {proposal.patch.rationale}
         </p>
       ) : null}
+      {!tableProposal &&
+      !barChartProposal &&
+      !sourceFigureProposal &&
+      (proposal.patch?.evidence_refs?.length ?? 0) > 0 ? (
+        <details className="editorial-proposal-card__text-evidence">
+          <summary>Preuves concernées</summary>
+          <ul>
+            {proposal.patch?.evidence_refs?.map((reference, index) => (
+              <li
+                key={`${reference.source_document_id}-${reference.evidence_key}-${index}`}
+              >
+                <span>
+                  Source {reference.source_document_id} · {reference.kind}
+                </span>
+                <code>{reference.evidence_key}</code>
+              </li>
+            ))}
+          </ul>
+        </details>
+      ) : null}
       {proposal.state === "proposed" || proposal.state === "accepted" ? (
         <div className="editorial-proposal-card__actions">
           <button
@@ -604,6 +638,21 @@ export function EditorialProposalCard({
               }
             >
               Rejeter
+            </button>
+          ) : null}
+          {proposal.state === "proposed" &&
+          onRequestVariant &&
+          !recoverableProposal ? (
+            <button
+              className="editorial-proposal-card__variant"
+              type="button"
+              disabled={decisionPending || acceptanceConflict}
+              onClick={() => {
+                acceptMutation.reset();
+                onRequestVariant();
+              }}
+            >
+              Demander une variante
             </button>
           ) : null}
           {rejectMutation.isError ? (

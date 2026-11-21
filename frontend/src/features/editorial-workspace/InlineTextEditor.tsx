@@ -10,7 +10,7 @@ export interface InlineTextEditorProps {
   staleDraft: boolean;
   onChange: (value: string) => void;
   onCancel: () => void;
-  onSave?: (blockId: string, value: string) => void | Promise<void>;
+  onSave?: (blockId: string, value: string) => void | Promise<number | void>;
 }
 
 export function InlineTextEditor({

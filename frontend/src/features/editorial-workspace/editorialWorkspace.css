@@ -23,6 +23,7 @@
   --editorial-scrim-tablet: rgb(23 33 29 / 28%);
   --editorial-scrim-drawer: rgb(23 33 29 / 32%);
   --editorial-scrim-dialog: rgb(23 33 29 / 48%);
+  --editorial-topbar-height: 5.25rem;
 }
 
 main:has(> .editorial-workspace),
@@ -413,9 +414,9 @@ main:has(> .editorial-route-state) > .app-header {
 .editorial-workspace__outline-column,
 .editorial-workspace__inspector-column {
   position: sticky;
-  top: 5.25rem;
+  top: var(--editorial-topbar-height);
   z-index: 5;
-  height: calc(100vh - 5.25rem);
+  height: calc(100vh - var(--editorial-topbar-height));
   overflow: auto;
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
@@ -1749,8 +1750,8 @@ main:has(> .editorial-route-state) > .app-header {
 
   .editorial-workspace__inspector-column {
     position: sticky;
-    top: 5.25rem;
-    height: calc(100vh - 5.25rem);
+    top: var(--editorial-topbar-height);
+    height: calc(100vh - var(--editorial-topbar-height));
   }
 
   .editorial-workspace__controls {
@@ -1823,7 +1824,7 @@ main:has(> .editorial-route-state) > .app-header {
   .editorial-workspace__outline-column[data-panel-open="true"] {
     position: fixed;
     z-index: 42;
-    top: 6.3rem;
+    top: var(--editorial-topbar-height);
     bottom: 0;
     left: 0;
     width: min(320px, 38vw);
@@ -1874,7 +1875,7 @@ main:has(> .editorial-route-state) > .app-header {
   .editorial-workspace__scrim {
     position: fixed;
     z-index: 40;
-    inset: 5.25rem 0 0;
+    inset: var(--editorial-topbar-height) 0 0;
     display: block;
     border: 0;
     background: var(--editorial-scrim-tablet);
@@ -1899,7 +1900,7 @@ main:has(> .editorial-route-state) > .app-header {
   .editorial-workspace__controls {
     position: sticky;
     z-index: 20;
-    top: 5.25rem;
+    top: var(--editorial-topbar-height);
     display: flex;
   }
 
@@ -3022,4 +3023,203 @@ main:has(> .editorial-route-state) > .app-header {
 .editorial-pdf-status__error button:focus-visible {
   outline: 3px solid var(--editorial-focus-ring);
   outline-offset: 3px;
+}
+
+@media (max-width: 1279px) {
+  .editorial-topbar {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0.5rem;
+  }
+
+  .editorial-topbar__metadata {
+    justify-content: flex-start;
+  }
+}
+
+/* F1 — text editing UX. Scoped additions shared with the later visual lot:
+   only .editorial-block-actions--block, .editorial-inspector-tab*,
+   .editorial-inspector-panel*, .editorial-manual-edit-confirmation and
+   .editorial-inspector__reason are introduced here. */
+
+.editorial-document__block {
+  scroll-margin-top: 6.5rem;
+}
+
+.editorial-block-actions--block {
+  position: absolute;
+  z-index: 8;
+  top: 100%;
+  right: 0.5rem;
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 0.3rem;
+  margin: -0.35rem 0 0;
+  padding: 0.15rem 0.3rem;
+  border: 1px solid var(--editorial-divider);
+  border-radius: 0.55rem;
+  background: var(--editorial-white);
+  box-shadow: 0 2px 10px rgb(23 33 29 / 10%);
+  white-space: nowrap;
+}
+
+.editorial-block-actions--block .button,
+.editorial-block-actions--block .editorial-visual-insertion > .button {
+  min-height: 30px;
+  padding: 0.25rem 0.5rem;
+  font-size: 0.76rem;
+}
+
+.editorial-block-actions--block .editorial-block-actions__more {
+  display: flex;
+  align-items: center;
+}
+
+.editorial-block-actions--block .editorial-block-actions__more summary {
+  min-height: 30px;
+  padding: 0.25rem 0.5rem;
+  font-weight: 700;
+}
+
+.editorial-block-actions--block .editorial-block-actions__more[open] {
+  position: absolute;
+  z-index: 16;
+  top: calc(100% + 0.3rem);
+  right: 0;
+  display: block;
+  width: min(22rem, calc(100vw - 3rem));
+  padding: 0.6rem;
+  border: 1px solid var(--editorial-control-border);
+  border-radius: 0.55rem;
+  background: var(--editorial-white);
+  box-shadow: 0 8px 24px rgb(23 33 29 / 14%);
+  white-space: normal;
+}
+
+.editorial-block-actions--block .editorial-block-actions__more[open] summary {
+  margin-bottom: 0.4rem;
+}
+
+.editorial-block-actions--block .editorial-visual-insertion__menu {
+  z-index: 17;
+}
+
+.editorial-block-actions--block .editorial-visual-insertion__panel {
+  position: absolute;
+  z-index: 18;
+  top: calc(100% + 0.4rem);
+  right: 0;
+  width: min(32rem, calc(100vw - 3rem));
+  max-height: 70vh;
+  overflow: auto;
+  background: var(--editorial-white);
+  box-shadow: 0 8px 26px rgb(23 33 29 / 16%);
+}
+
+.editorial-inspector-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin: 0.75rem 0;
+  padding-bottom: 0.4rem;
+  border-bottom: 1px solid var(--editorial-divider);
+}
+
+.editorial-inspector-tab {
+  min-height: 36px;
+  padding: 0.35rem 0.55rem;
+  border: 1px solid transparent;
+  border-radius: 0.45rem;
+  color: var(--editorial-link);
+  background: transparent;
+  font: inherit;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.editorial-inspector-tab:hover {
+  background: var(--editorial-outline-hover);
+}
+
+.editorial-inspector-tab[aria-selected="true"] {
+  border-color: var(--editorial-control-border);
+  color: var(--editorial-ink);
+  background: var(--editorial-white);
+}
+
+.editorial-inspector-tab:focus-visible,
+.editorial-inspector-panel:focus-visible {
+  outline: 3px solid var(--editorial-focus-ring);
+  outline-offset: 2px;
+}
+
+.editorial-inspector-panel[hidden] {
+  display: none;
+}
+
+.editorial-inspector__reason {
+  margin: 0.5rem 0;
+  color: var(--editorial-muted);
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+
+.editorial-inspector__modifier {
+  display: grid;
+  gap: 0.75rem;
+  justify-items: start;
+}
+
+.editorial-inspector__history .editorial-history {
+  margin: 0;
+  padding: 0.5rem 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.editorial-conversation__suggestion-help {
+  margin: 0.3rem 0 0.6rem;
+  color: var(--editorial-muted);
+  font-size: 0.75rem;
+}
+
+.editorial-manual-edit-confirmation {
+  margin: 0 1rem 0.75rem;
+  padding: 0.55rem 0.85rem;
+  border: 1px solid var(--editorial-attention-indicator);
+  border-radius: 0.5rem;
+  color: var(--editorial-brand);
+  background: var(--editorial-panel);
+  font-size: 0.85rem;
+  font-weight: 650;
+}
+
+.editorial-proposal-card__target {
+  margin: 0.35rem 0;
+  color: var(--editorial-ink);
+  font-size: 0.85rem;
+  line-height: 1.45;
+}
+
+.editorial-proposal-card__text-evidence {
+  margin: 0.5rem 0;
+  color: var(--editorial-muted);
+  font-size: 0.8rem;
+}
+
+.editorial-proposal-card__text-evidence ul {
+  margin: 0.4rem 0;
+  padding-left: 1.1rem;
+}
+
+.editorial-proposal-card__text-evidence code {
+  overflow-wrap: anywhere;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .editorial-block-actions--block {
+    transition: opacity 100ms ease;
+  }
 }

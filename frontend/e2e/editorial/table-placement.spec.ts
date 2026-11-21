@@ -414,7 +414,7 @@ test("a table proposal is accepted after paragraph three in snapshot order", asy
     .getByRole("textbox", { name: "Cellule ligne 1, colonne 2" })
     .fill("Confirmé");
   await page.getByRole("checkbox", { name: /Source synthétique/ }).check();
-  await page.getByRole("button", { name: "Proposer" }).click();
+  await page.getByRole("button", { name: "Proposer", exact: true }).click();
   await expect(
     page
       .getByRole("region", { name: "Comparaison de l’insertion de tableau" })

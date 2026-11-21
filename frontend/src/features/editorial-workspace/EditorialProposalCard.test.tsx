@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { editorialWorkspaceQueryKeys } from "./editorialWorkspaceQueries";
@@ -701,5 +701,106 @@ describe("EditorialProposalCard", () => {
     expect(
       screen.getByRole("button", { name: "Comparer à nouveau" }),
     ).toBeVisible();
+  });
+});
+
+describe("EditorialProposalCard text proposal contract", () => {
+  const textProposal = {
+    id: "proposal-text",
+    subject_id: "subject-1",
+    production_run_id: "run-1",
+    occurrence_id: "occurrence-1",
+    thread_id: "thread-1",
+    origin: "bridge_draft",
+    state: "proposed",
+    state_version: 1,
+    operation: "rewrite_paragraph",
+    base_artifact_id: "artifact-1",
+    base_artifact_version: 4,
+    base_canonical_sha256: "a".repeat(64),
+    base_text: "Paragraphe canonique actuel.",
+    patch_sha256: "b".repeat(64),
+    patch: {
+      schema_version: "editorial-patch-v1",
+      operation: "rewrite_paragraph",
+      target: { block_id: "occurrence-1" },
+      target_id: "target-1",
+      occurrence_id: "occurrence-1",
+      before_hash: "c".repeat(64),
+      after: "Paragraphe proposé.",
+      rationale: "Justification synthétique.",
+      evidence_refs: [
+        {
+          source_document_id: "11111111-1111-4111-8111-111111111111",
+          kind: "fact",
+          evidence_key: "d".repeat(64),
+        },
+      ],
+    },
+    diagnostics: {},
+    created_at: "2026-11-19T12:00:00Z",
+  };
+
+  function renderCard(
+    onRequestVariant?: () => void,
+    onStateChange?: (id: string, state: string) => void,
+  ) {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          new Response(JSON.stringify(textProposal), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+        ),
+      ),
+    );
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <EditorialProposalCard
+          subjectId="subject-1"
+          occurrenceId="occurrence-1"
+          proposalId="proposal-text"
+          anchorText="Paragraphe canonique sélectionné."
+          onRequestVariant={onRequestVariant}
+          onStateChange={onStateChange}
+        />
+      </QueryClientProvider>,
+    );
+  }
+
+  it("shows the target block, reference version, current/proposed text, justification and evidence", async () => {
+    renderCard();
+    await screen.findByText("Paragraphe proposé.");
+    expect(
+      document.querySelector(".editorial-proposal-card__target"),
+    ).toHaveTextContent("Bloc ciblé · Paragraphe canonique sélectionné.");
+    expect(screen.getByText("Base canonique · version 4")).toBeVisible();
+    expect(screen.getByText("Paragraphe canonique actuel.")).toBeVisible();
+    expect(screen.getByText("Paragraphe proposé.")).toBeVisible();
+    expect(
+      document.querySelector(".editorial-proposal-card__rationale"),
+    ).toHaveTextContent("Justification · Justification synthétique.");
+    fireEvent.click(screen.getByText("Preuves concernées"));
+    expect(
+      document.querySelector(".editorial-proposal-card__text-evidence li"),
+    ).toHaveTextContent("Source 11111111-1111-4111-8111-111111111111 · fact");
+  });
+
+  it("offers Demander une variante on an active proposal and reports its state", async () => {
+    const onRequestVariant = vi.fn();
+    const onStateChange = vi.fn();
+    renderCard(onRequestVariant, onStateChange);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Demander une variante" }),
+    );
+    expect(onRequestVariant).toHaveBeenCalledTimes(1);
+    await waitFor(() =>
+      expect(onStateChange).toHaveBeenCalledWith("proposal-text", "proposed"),
+    );
   });
 });

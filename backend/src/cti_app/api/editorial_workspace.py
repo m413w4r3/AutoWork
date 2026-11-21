@@ -969,7 +969,7 @@ class EditorialManualEditRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     snapshot_id: UUID
-    operation: Literal["rewrite_title", "rewrite_paragraph"]
+    operation: Literal["rewrite_title", "rewrite_lead", "rewrite_paragraph"]
     text: str = Field(min_length=1)
 
 
@@ -1371,7 +1371,11 @@ def _manual_edit_capability_enabled(request: Request, payload: Mapping[str, obje
                     and "rewrite_title" in block.get("allowed_operations", [])
                 )
                 or (
-                    block.get("kind") in {"lead_paragraph", "paragraph"}
+                    block.get("kind") == "lead_paragraph"
+                    and "rewrite_lead" in block.get("allowed_operations", [])
+                )
+                or (
+                    block.get("kind") == "paragraph"
                     and "rewrite_paragraph" in block.get("allowed_operations", [])
                 )
             )

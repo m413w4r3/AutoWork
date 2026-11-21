@@ -19,10 +19,37 @@ interface EditorialConversationComposerProps {
 }
 
 const suggestions = [
-  "Clarifier le contexte de ce passage",
-  "Raccourcir ce passage sans perdre les faits établis",
-  "Préciser le lien avec les preuves admises",
-];
+  {
+    label: "Raccourcir",
+    instruction: "Raccourcis ce passage sans perdre les faits établis.",
+  },
+  {
+    label: "Clarifier",
+    instruction: "Clarifie ce passage sans ajouter de faits non étayés.",
+  },
+  {
+    label: "Détailler",
+    instruction:
+      "Détaille davantage ce passage en t’appuyant sur les preuves admises.",
+  },
+  {
+    label: "Reformuler",
+    instruction: "Reformule ce passage sans en changer le sens ni les faits.",
+  },
+  {
+    label: "Corriger les imprécisions",
+    instruction:
+      "Corrige les imprécisions de ce passage sans introduire de faits non étayés.",
+  },
+  {
+    label: "Améliorer la structure",
+    instruction: "Améliore la structure de ce passage sans modifier les faits.",
+  },
+  {
+    label: "Proposer une autre formulation",
+    instruction: "Propose une autre formulation de ce passage.",
+  },
+] as const;
 
 export function EditorialConversationComposer({
   draft,
@@ -85,18 +112,22 @@ export function EditorialConversationComposer({
       <div
         className="editorial-conversation__suggestions"
         aria-label="Suggestions de message"
+        role="group"
       >
         {suggestions.map((suggestion) => (
           <button
-            key={suggestion}
+            key={suggestion.label}
             type="button"
             disabled={locked}
-            onClick={() => onSuggestion(suggestion)}
+            onClick={() => onSuggestion(suggestion.instruction)}
           >
-            {suggestion}
+            {suggestion.label}
           </button>
         ))}
       </div>
+      <p className="editorial-conversation__suggestion-help">
+        Une suggestion préremplit une consigne modifiable ; elle n’envoie rien.
+      </p>
       <div className="editorial-conversation__actions">
         <button
           className="editorial-conversation__send"

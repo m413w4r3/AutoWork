@@ -56,6 +56,7 @@ class ManualTextPatch:
     def __post_init__(self) -> None:
         if self.operation not in {
             TargetedEditorialRevisionOperation.REWRITE_TITLE,
+            TargetedEditorialRevisionOperation.REWRITE_LEAD,
             TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH,
         }:
             raise EditorialProposalError("proposal_operation_unsupported")

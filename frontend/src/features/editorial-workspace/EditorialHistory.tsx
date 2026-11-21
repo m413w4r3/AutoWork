@@ -13,6 +13,7 @@ interface EditorialHistoryProps {
   subjectId: string;
   onClose: () => void;
   onOpenThread: (occurrenceId: string) => void;
+  autoFocusHeading?: boolean;
 }
 
 const stateLabels: Record<EditorialProposalState, string> = {
@@ -50,6 +51,7 @@ export function EditorialHistory({
   subjectId,
   onClose,
   onOpenThread,
+  autoFocusHeading = true,
 }: EditorialHistoryProps) {
   const headingRef = useRef<HTMLHeadingElement>(null);
   const historyQuery = useInfiniteQuery({
@@ -70,8 +72,9 @@ export function EditorialHistory({
       : "L’historique est momentanément indisponible.";
 
   useEffect(() => {
+    if (!autoFocusHeading) return;
     headingRef.current?.focus({ preventScroll: true });
-  }, []);
+  }, [autoFocusHeading]);
 
   return (
     <section

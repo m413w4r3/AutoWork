@@ -161,6 +161,10 @@ async function beginEditing(user: ReturnType<typeof userEvent.setup>) {
   return screen.getByRole("textbox", { name: "Texte du bloc" });
 }
 
+async function openModifierTab(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(screen.getByRole("tab", { name: "Modifier" }));
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
@@ -270,6 +274,7 @@ describe("local editorial block drafts", () => {
     renderWorkspace();
 
     await selectBlock(user, "block-occurrence-a");
+    await openModifierTab(user);
 
     expect(
       screen.queryByRole("textbox", { name: "Brouillon local" }),
@@ -284,6 +289,7 @@ describe("local editorial block drafts", () => {
     renderWorkspace();
 
     await selectBlock(user, "block-occurrence-a");
+    await openModifierTab(user);
     await user.click(
       screen.getByRole("button", { name: "Écrire un brouillon local" }),
     );
@@ -298,6 +304,7 @@ describe("local editorial block drafts", () => {
     renderWorkspace({ localDraftText: "Brouillon retenu" });
 
     await selectBlock(user, "block-occurrence-a");
+    await openModifierTab(user);
 
     expect(
       screen.getByRole("textbox", { name: "Brouillon local" }),

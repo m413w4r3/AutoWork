@@ -623,7 +623,7 @@ export interface EditorialProposalAcceptResult {
 }
 
 export type EditorialManualEditOperation =
-  "rewrite_title" | "rewrite_paragraph";
+  "rewrite_title" | "rewrite_lead" | "rewrite_paragraph";
 
 export type EditorialManualEditResult = EditorialProposalAcceptResult;
 

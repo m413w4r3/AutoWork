@@ -714,10 +714,25 @@ describe("EditorialConversation", () => {
     });
     fireEvent.click(
       screen.getByRole("button", {
-        name: "Clarifier le contexte de ce passage",
+        name: "Raccourcir",
       }),
     );
-    expect(textarea).toHaveValue("Clarifier le contexte de ce passage");
+    expect(textarea).toHaveValue(
+      "Raccourcis ce passage sans perdre les faits établis.",
+    );
+    for (const chip of [
+      "Clarifier",
+      "Détailler",
+      "Reformuler",
+      "Corriger les imprécisions",
+      "Améliorer la structure",
+      "Proposer une autre formulation",
+    ]) {
+      expect(screen.getByRole("button", { name: chip })).toBeVisible();
+    }
+    expect(
+      screen.getByText(/Une suggestion préremplit une consigne modifiable/),
+    ).toBeVisible();
     expect(threadReadCount).toBe(1);
 
     fireEvent.change(textarea, { target: { value: "Instruction\ncomplétée" } });
