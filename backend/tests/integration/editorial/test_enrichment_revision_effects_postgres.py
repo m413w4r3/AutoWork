@@ -16,6 +16,7 @@ from cti_app.application.editorial_workspace.service import EditorialWorkspaceSe
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_editorial_enrichment import (
+    EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION,
     ProductionEditorialEnrichmentService,
     build_editorial_enrichment_evidence_pack,
     build_editorial_figure_catalog,
@@ -39,7 +40,6 @@ from cti_app.application.source_figure_inventory import load_archived_source_fig
 from cti_app.domain.editorial_proposal import EditorialProposalState
 from cti_app.domain.production import ProductionArtifact, ProductionArtifactStage
 from cti_app.domain.production_editorial_enrichment import (
-    EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION,
     EditorialEnrichmentElementKind,
     EditorialEnrichmentV1,
     editorial_enrichment_to_json,
@@ -54,6 +54,8 @@ from cti_app.domain.production_editorial_revision import (
 from cti_app.domain.semantic_annotation import SemanticAnnotationProposalV1, SemanticRole
 from tests.integration.editorial.test_editorial_revision_effects_postgres import (
     _CurrentWorkspace,
+)
+from tests.integration.editorial.test_editorial_writer_cutover_postgres import (
     _snapshots,
     _stage_rows,
 )
