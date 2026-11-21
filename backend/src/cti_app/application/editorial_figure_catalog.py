@@ -125,7 +125,10 @@ class EditorialFigureCatalogItem:
 class ManualSourceFigureArchiveReference:
     """Safe, server-resolved archive facts pinned into a manual figure patch."""
 
+    # ``figure_id`` is the opaque catalogue handle submitted by the client.
     figure_id: UUID
+    # This is the canonical inventory identity stored in ResolvedSourceFigureV1.
+    source_figure_id: UUID
     production_run_id: UUID
     source_document_id: UUID
     source_url: str
@@ -326,6 +329,7 @@ def archive_reference_for_catalog_item(
         raise EditorialFigureCatalogError("figure_catalog_unavailable") from None
     return ManualSourceFigureArchiveReference(
         figure_id=figure_id,
+        source_figure_id=figure.figure_id,
         production_run_id=item._run_id,
         source_document_id=figure.source_document_id,
         source_url=figure.source,

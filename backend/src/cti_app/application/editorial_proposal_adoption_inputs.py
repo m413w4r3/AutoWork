@@ -68,6 +68,7 @@ from cti_app.application.production_synthesis_revision import _apply_wire_patch
 from cti_app.application.source_figure_inventory import load_archived_source_figure_inventory
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
+from cti_app.domain.editorial_figure_keys import adopted_source_figure_key
 from cti_app.domain.editorial_proposal import EditorialProposal, EditorialProposalOrigin
 from cti_app.domain.editorial_workspace import (
     EditorialSourceStage,
@@ -239,7 +240,7 @@ def _manual_source_figure_candidate_patch(
         selected_ids.add(figure.figure_id)
         candidates.append(
             SourceFigureCandidateV1(
-                key=f"source_figure_{figure.figure_id.hex}",
+                key=adopted_source_figure_key(figure.figure_id),
                 source_document_id=figure.source_document_id,
                 source_url=source.canonical_url,
                 caption=caption.strip(),

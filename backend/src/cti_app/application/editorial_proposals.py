@@ -76,7 +76,7 @@ from cti_app.application.production_synthesis import (
 )
 from cti_app.application.production_synthesis_revision import _apply_wire_patch
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
-from cti_app.domain.editorial_figure_keys import ADOPTED_SOURCE_FIGURE_KEY_PREFIX
+from cti_app.domain.editorial_figure_keys import adopted_source_figure_key
 from cti_app.domain.editorial_proposal import (
     EditorialProposal,
     EditorialProposalConflict,
@@ -1936,6 +1936,7 @@ class EditorialProposalService:
             "figures": [
                 {
                     "figure_id": str(reference.figure_id),
+                    "source_figure_id": str(reference.source_figure_id),
                     "caption": selection.caption.strip(),
                     "order": selection.order,
                     "production_run_id": str(reference.production_run_id),
@@ -1999,7 +2000,7 @@ class EditorialProposalService:
                 )
             candidates.append(
                 SourceFigureCandidateV1(
-                    key=f"{ADOPTED_SOURCE_FIGURE_KEY_PREFIX}{resolved_figure.figure_id.hex}",
+                    key=adopted_source_figure_key(resolved_figure.figure_id),
                     source_document_id=resolved_figure.source_document_id,
                     source_url=extraction_source.canonical_url,
                     caption=selection.caption.strip(),
@@ -3473,6 +3474,14 @@ class EditorialProposalService:
             placement = target.placement
             candidates = preparation.manual_figure_candidates
             references = preparation.manual_figure_references
+            typed_patch = (
+                preparation.manual_patch.typed_patch
+                if preparation.manual_patch is not None
+                else None
+            )
+            selections = (
+                typed_patch.figures if isinstance(typed_patch, ManualSourceFigurePatch) else ()
+            )
             if (
                 target.element_kind is not EditorialEnrichmentElementKind.FIGURE
                 or target.element_key is not None
@@ -3482,17 +3491,26 @@ class EditorialProposalService:
                 or patch.target != context.get("target_path")
                 or not candidates
                 or len(candidates) != len(references)
+                or len(candidates) != len(selections)
                 or any(
                     candidate.placement.kind is not EnrichmentPlacementKind.AFTER_PARAGRAPH
                     or candidate.placement.anchor_block_id != preparation.occurrence_id
                     or candidate.resolved_figure is None
-                    or candidate.resolved_figure.figure_id != reference.figure_id
+                    or selection.figure_id != reference.figure_id
+                    or selection.order != position
+                    or candidate.caption != selection.caption.strip()
+                    or candidate.resolved_figure.figure_id != reference.source_figure_id
+                    or candidate.resolved_figure.source_document_id != reference.source_document_id
+                    or candidate.source_url != reference.source_url
+                    or candidate.provenance != reference.provenance
                     or candidate.resolved_figure.sha256 != reference.sha256
                     or candidate.resolved_figure.mime_type != reference.mime_type
                     or candidate.resolved_figure.byte_size != reference.byte_size
                     or candidate.width != reference.width
                     or candidate.height != reference.height
-                    for candidate, reference in zip(candidates, references, strict=True)
+                    for position, (candidate, reference, selection) in enumerate(
+                        zip(candidates, references, selections, strict=True)
+                    )
                 )
             ):
                 raise EditorialProposalApplicationError("proposal_target_mismatch")
