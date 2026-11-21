@@ -116,6 +116,7 @@ export interface EditorialWorkspaceBarChart {
 
 export interface EditorialWorkspaceFigure {
   key: string;
+  catalog_figure_id: string | null;
   caption: string;
   source_url: string;
   source: string | null;

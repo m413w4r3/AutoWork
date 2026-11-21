@@ -83,6 +83,7 @@ function workspaceSnapshot(
       allowed_operations: [],
       figure: {
         key: `adopted_source_figure_${FIGURE_ONE.replaceAll("-", "")}`,
+        catalog_figure_id: FIGURE_ONE,
         caption: `Figure déjà intégrée ${index + 1}`,
         source_url: "https://source.example/report",
         source: "Rapport synthétique",

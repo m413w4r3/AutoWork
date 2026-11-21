@@ -441,6 +441,18 @@ class EditorialFigureCatalogService:
                 return item
         raise EditorialFigureCatalogError("editorial_figure_not_found")
 
+    async def source_figure_catalog_ids(
+        self, subject_id: UUID
+    ) -> tuple[UUID | None, dict[UUID, str]]:
+        """Map canonical source figure IDs to current opaque catalogue handles."""
+        items = await self._load_current(subject_id)
+        if not items:
+            return None, {}
+        run_id = items[0]._run_id
+        return run_id, {
+            item._source_figure_id: item.figure_id for item in items if item._run_id == run_id
+        }
+
     async def resolve_for_insertion(
         self, *, subject_id: UUID, figure_id: UUID
     ) -> EditorialFigureCatalogItem:

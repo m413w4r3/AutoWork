@@ -147,6 +147,46 @@ def test_projection_has_no_legacy_target_for_duplicate_catalog_occurrences() -> 
     assert all(block["revision_target"]["legacy_target_id"] is None for block in paragraphs)
 
 
+def test_snapshot_passes_current_catalog_figure_ids_to_registry_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import Mock
+
+    from cti_app.application.editorial_figure_catalog import opaque_figure_id
+    from cti_app.application.editorial_workspace import service as service_module
+
+    service, subject_id, _repository, artifacts, _artifact_store = _workspace_service(
+        _synthesis((_paragraph("synthetic paragraph"),)), monkeypatch
+    )
+    synthesis = artifacts.current["synthesis"]
+    assert synthesis is not None
+    run_id = synthesis.production_run_id
+    source_figure_id = uuid4()
+    expected_id = opaque_figure_id(subject_id, run_id, source_figure_id)
+
+    class _Catalog:
+        async def catalog(self, *, subject_id: UUID, limit: int) -> SimpleNamespace:
+            assert subject_id == service_subject_id
+            assert limit == 1
+            return SimpleNamespace(items=(), available_count=0)
+
+        async def source_figure_catalog_ids(self, subject_id: UUID) -> tuple[UUID, dict[UUID, str]]:
+            assert subject_id == service_subject_id
+            return run_id, {source_figure_id: expected_id}
+
+    service_subject_id = subject_id
+    service._figure_catalog_service = _Catalog()
+    project_blocks_spy = Mock(wraps=service_module.project_blocks)
+    monkeypatch.setattr(service_module, "project_blocks", project_blocks_spy)
+
+    asyncio.run(service.snapshot(subject_id))
+
+    assert project_blocks_spy.call_args is not None
+    assert project_blocks_spy.call_args.kwargs["catalog_figure_ids"] == {
+        source_figure_id: expected_id
+    }
+
+
 def test_unresolved_publication_kind_suppresses_operations_and_resolve(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

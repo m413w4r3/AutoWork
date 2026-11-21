@@ -10,14 +10,6 @@ import { InlineTextEditor } from "./InlineTextEditor";
 import type { InlineTextEditorProps } from "./InlineTextEditor";
 import { ManualBarChartPreview } from "./ManualBarChartPreview";
 
-const ADOPTED_SOURCE_FIGURE_KEY_PREFIX = "adopted_source_figure_";
-
-function adoptedFigureId(key: string): string | null {
-  if (!key.startsWith(ADOPTED_SOURCE_FIGURE_KEY_PREFIX)) return null;
-  const compactId = key.slice(ADOPTED_SOURCE_FIGURE_KEY_PREFIX.length);
-  return /^[0-9a-f]{32}$/i.test(compactId) ? compactId : null;
-}
-
 function EditorialSourceFigure({
   subjectId,
   figure,
@@ -27,23 +19,22 @@ function EditorialSourceFigure({
   figure: EditorialWorkspaceFigure;
   allowedOperations: string[];
 }) {
-  const figureId = adoptedFigureId(figure.key);
   const [imageUnavailable, setImageUnavailable] = useState(false);
   return (
     <figure
       className="editorial-document__source-figure"
       aria-label={figure.caption}
     >
-      {figureId && !imageUnavailable ? (
+      {figure.catalog_figure_id && !imageUnavailable ? (
         <img
-          src={editorialFigureThumbnailUrl(subjectId, figureId)}
+          src={editorialFigureThumbnailUrl(subjectId, figure.catalog_figure_id)}
           alt={figure.caption}
           loading="lazy"
           onError={() => setImageUnavailable(true)}
         />
       ) : (
         <p className="editorial-document__figure-unavailable" role="status">
-          Image locale indisponible dans l’archive.
+          Aperçu indisponible
         </p>
       )}
       <figcaption>{figure.caption}</figcaption>

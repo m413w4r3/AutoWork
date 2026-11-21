@@ -17,6 +17,7 @@ from starlette.requests import Request
 
 from cti_app.api import editorial_workspace as editorial_workspace_api
 from cti_app.api import main as api_main
+from cti_app.api.editorial_workspace import EditorialWorkspaceBlock
 from cti_app.application import editorial_figure_catalog as editorial_figure_catalog_module
 from cti_app.application.editorial_figure_catalog import (
     EditorialFigureCatalogCache,
@@ -27,11 +28,13 @@ from cti_app.application.editorial_figure_catalog import (
     classify_source_figure,
     opaque_figure_id,
 )
+from cti_app.application.editorial_workspace.registry import project_blocks
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.config import Settings
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
 from cti_app.domain.classification import TLP
+from cti_app.domain.editorial_workspace import bootstrap_block_registry
 from cti_app.domain.production_editorial_enrichment import (
     ResolvedSourceFigureV1,
     SourceFigureDecision,
@@ -266,6 +269,104 @@ def test_opaque_figure_id_is_scoped_to_subject_and_current_run() -> None:
     assert public_id != str(figure_id)
     assert public_id != opaque_figure_id(uuid4(), run_id, figure_id)
     assert public_id != opaque_figure_id(subject_id, uuid4(), figure_id)
+
+
+@pytest.mark.asyncio
+async def test_adopted_figure_snapshot_exposes_resolvable_catalog_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject_id, run_id, source_document_id, internal_id = (uuid4() for _ in range(4))
+    catalog_id = opaque_figure_id(subject_id, run_id, internal_id)
+    item = EditorialFigureCatalogItem(
+        figure_id=catalog_id,
+        original_name="Synthetic archived figure",
+        original_caption="Synthetic caption",
+        alt_text=None,
+        source=FigureCatalogSource(
+            source_id=str(source_document_id),
+            title="Synthetic source",
+            url="https://sources.example.test/report",
+        ),
+        page=2,
+        section="Analysis",
+        context_before=None,
+        context_after=None,
+        width=320,
+        height=180,
+        mime_type="image/png",
+        status="already_integrated",
+        selectable=False,
+        exclusion_reason=None,
+        already_used=True,
+        _source_figure_id=internal_id,
+        _source_document_id=source_document_id,
+        _blob_id=uuid4(),
+        _sha256="a" * 64,
+        _byte_size=1024,
+        _run_id=run_id,
+    )
+    catalog = EditorialFigureCatalogService(
+        uow_factory=cast(UnitOfWorkFactory, object()),
+        artifact_store=cast(ProductionArtifactStore, object()),
+    )
+
+    async def current_catalog(_subject_id: UUID, *, use_cache: bool = True):
+        assert _subject_id == subject_id
+        assert use_cache
+        return (item,)
+
+    monkeypatch.setattr(catalog, "_load_current", current_catalog)
+    catalog_run_id, catalog_ids = await catalog.source_figure_catalog_ids(subject_id)
+    assert catalog_run_id == run_id
+
+    enrichment = {
+        "source_figures": [
+            {
+                "key": f"adopted_source_figure_{internal_id.hex}",
+                "caption": "Synthetic caption",
+                "source_url": "https://sources.example.test/report",
+                "source": "Synthetic source",
+                "provenance": "Archived source figure.",
+                "sha256": "a" * 64,
+                "mime_type": "image/png",
+                "byte_size": 1024,
+                "width": 320,
+                "height": 180,
+                "inclusion_status": "included",
+                "resolved_figure": {
+                    "figure_id": str(internal_id),
+                    "sha256": "a" * 64,
+                    "mime_type": "image/png",
+                    "byte_size": 1024,
+                    "source": "https://sources.example.test/report",
+                },
+                "placement": {"kind": "end"},
+                "locator": {"page": 2, "section": "Analysis"},
+            }
+        ]
+    }
+    entries = bootstrap_block_registry(
+        artifact_id=uuid4(),
+        canonical_sha256="b" * 64,
+        source_stage="editorial_enrichment",
+        canonical_content=enrichment,
+    )
+    projected, _enrichments, _outline = project_blocks(
+        entries=entries,
+        synthesis={},
+        enrichment=enrichment,
+        catalog_figure_ids=catalog_ids,
+        allow_operations=False,
+    )
+    block = EditorialWorkspaceBlock.model_validate(projected[0])
+
+    assert block.figure is not None
+    assert str(block.figure.catalog_figure_id) == catalog_id
+    assert catalog_id != str(internal_id)
+    resolved = await catalog.resolve(subject_id=subject_id, figure_id=UUID(catalog_id))
+    assert resolved is item
+    with pytest.raises(editorial_figure_catalog_module.EditorialFigureCatalogError):
+        await catalog.resolve(subject_id=subject_id, figure_id=internal_id)
 
 
 def test_ineligible_figure_exposes_reason_and_is_not_selectable() -> None:

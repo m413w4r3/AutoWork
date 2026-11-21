@@ -525,6 +525,7 @@ def project_blocks(
     needs_review_ids: frozenset[UUID] = frozenset(),
     allow_operations: bool = True,
     allow_figure_insertion: bool = False,
+    catalog_figure_ids: Mapping[UUID, str] | None = None,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
     blocks: list[dict[str, object]] = []
     enrichments: list[dict[str, object]] = []
@@ -571,7 +572,7 @@ def project_blocks(
             else None
         )
         structured_figure = (
-            _project_structured_figure(value)
+            _project_structured_figure(value, catalog_figure_ids=catalog_figure_ids)
             if entry.kind is EditorialBlockKind.FIGURE
             and entry.source_stage is EditorialSourceStage.EDITORIAL_ENRICHMENT
             else None
@@ -902,7 +903,11 @@ def _project_structured_chart(value: Any) -> dict[str, object] | None:
     }
 
 
-def _project_structured_figure(value: Any) -> dict[str, object] | None:
+def _project_structured_figure(
+    value: Any,
+    *,
+    catalog_figure_ids: Mapping[UUID, str] | None = None,
+) -> dict[str, object] | None:
     if not isinstance(value, Mapping):
         return None
     resolved = value.get("resolved_figure")
@@ -937,8 +942,18 @@ def _project_structured_figure(value: Any) -> dict[str, object] | None:
         anchor_block_id = None
     if placement_kind == "after_paragraph" and anchor_block_id is None:
         return None
+    source_figure_id = resolved.get("figure_id")
+    try:
+        canonical_figure_id = UUID(source_figure_id) if isinstance(source_figure_id, str) else None
+    except ValueError:
+        canonical_figure_id = None
     return {
         "key": value["key"],
+        "catalog_figure_id": (
+            catalog_figure_ids.get(canonical_figure_id)
+            if catalog_figure_ids is not None and canonical_figure_id is not None
+            else None
+        ),
         "caption": value["caption"],
         "source_url": value["source_url"],
         "provenance": value["provenance"],

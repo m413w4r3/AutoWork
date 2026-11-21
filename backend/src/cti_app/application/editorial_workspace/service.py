@@ -292,6 +292,8 @@ class EditorialWorkspaceService:
         commit_snapshot: bool = True,
     ) -> tuple[dict[str, object], WorkspaceSnapshotRecord, Mapping[str, Any]]:
         figure_catalog_page: EditorialFigureCatalogPage | None = None
+        figure_catalog_run_id: UUID | None = None
+        catalog_figure_ids: dict[UUID, str] = {}
         if uow is None and self._figure_catalog_service is not None:
             from cti_app.application.editorial_figure_catalog import EditorialFigureCatalogError
 
@@ -302,8 +304,14 @@ class EditorialWorkspaceService:
                     subject_id=subject_id,
                     limit=1,
                 )
+                (
+                    figure_catalog_run_id,
+                    catalog_figure_ids,
+                ) = await self._figure_catalog_service.source_figure_catalog_ids(subject_id)
             except EditorialFigureCatalogError:
-                pass
+                figure_catalog_page = None
+                figure_catalog_run_id = None
+                catalog_figure_ids = {}
 
         async with self._uow_scope(uow) as uow:
             subject = await uow.subjects.get(subject_id)
@@ -314,6 +322,8 @@ class EditorialWorkspaceService:
             run = await uow.production_runs.get_current_for_subject(subject_id)
             if run is None:
                 raise EditorialWorkspaceError("production_run_missing")
+            if figure_catalog_run_id != run.id:
+                catalog_figure_ids = {}
             synthesis_artifact = await uow.production_artifacts.get_current_for_revision(
                 run.id, ProductionArtifactStage.SYNTHESIS.value
             )
@@ -509,6 +519,7 @@ class EditorialWorkspaceService:
                 enrichment_read_sha256=enrichment_sha,
                 allow_operations=kind is not None,
                 allow_figure_insertion=kind is not None and figure_inventory_available,
+                catalog_figure_ids=catalog_figure_ids,
             )
             impact = await uow.editorial_proposal_impacts.latest_for_run(run.id)
             publication_render = (

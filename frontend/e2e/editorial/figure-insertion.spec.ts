@@ -35,6 +35,11 @@ const figureIds = [
   "55555555-5555-4555-8555-555555555555",
   "66666666-6666-4666-8666-666666666666",
 ];
+const internalFigureIds = [
+  "99999999-9999-4999-8999-999999999999",
+  "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+];
 const sourceId = "77777777-7777-4777-8777-777777777777";
 const proposalId = "88888888-8888-4888-8888-888888888888";
 const anchorId = paragraphIds[1];
@@ -147,6 +152,11 @@ function createSnapshot(
     { length: existingFigures },
     (_, index) => {
       const figureId = figureIds[index % figureIds.length];
+      const internalFigureId =
+        internalFigureIds[index % internalFigureIds.length];
+      if (!figureId || !internalFigureId) {
+        throw new Error("Missing synthetic figure identity");
+      }
       return {
         ...paragraphs[1],
         block_id: `existing-figure-${index}`,
@@ -155,7 +165,8 @@ function createSnapshot(
         text: `Figure déjà intégrée ${index + 1}`,
         allowed_operations: [],
         figure: {
-          key: `adopted_source_figure_${figureId.replaceAll("-", "")}`,
+          key: `adopted_source_figure_${internalFigureId.replaceAll("-", "")}`,
+          catalog_figure_id: figureId,
           caption: `Figure déjà intégrée ${index + 1}`,
           source_url: "https://publisher.example/report",
           source: "Rapport public synthétique",
@@ -177,10 +188,14 @@ function createSnapshot(
   );
   const inserted: EditorialWorkspaceBlock[] = insertedFigures.map(
     (selection, index) => {
+      const internalFigureId =
+        internalFigureIds[index % internalFigureIds.length];
       const catalogItem = catalogItems.find(
         (item) => item.figure_id === selection.figure_id,
       );
-      if (!catalogItem) throw new Error("Missing synthetic catalog figure");
+      if (!catalogItem || !internalFigureId) {
+        throw new Error("Missing synthetic figure identity");
+      }
       return {
         ...paragraphs[1],
         block_id: `inserted-figure-${index + 1}`,
@@ -189,7 +204,8 @@ function createSnapshot(
         text: selection.caption,
         allowed_operations: [],
         figure: {
-          key: `adopted_source_figure_${selection.figure_id.replaceAll("-", "")}`,
+          key: `adopted_source_figure_${internalFigureId.replaceAll("-", "")}`,
+          catalog_figure_id: selection.figure_id,
           caption: selection.caption,
           source_url: catalogItem.source.url ?? "",
           source: catalogItem.source.title,
@@ -372,6 +388,18 @@ async function installRoutes(
       url.pathname.startsWith(`${figuresPath}/`) &&
       url.pathname.endsWith("/thumbnail")
     ) {
+      const figureId = url.pathname.slice(
+        figuresPath.length + 1,
+        -"/thumbnail".length,
+      );
+      if (!catalogItems.some((item) => item.figure_id === figureId)) {
+        unexpectedRequests.push(`${method} ${url.pathname}`);
+        await route.fulfill({
+          status: 404,
+          json: { detail: { code: "editorial_figure_not_found" } },
+        });
+        return;
+      }
       await route.fulfill({
         status: 200,
         contentType: "image/jpeg",
@@ -478,7 +506,7 @@ test("intègre deux figures après le paragraphe, les compare puis les accepte d
     "../.autowork-runs/shots-t-m6-25",
   );
   await mkdir(shotsDirectory, { recursive: true });
-  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.setViewportSize({ width: 1440, height: 1400 });
   await page.goto(`/subjects/${subjectId}/editor`);
 
   const anchor = page.locator(
@@ -597,8 +625,31 @@ test("intègre deux figures après le paragraphe, les compare puis les accepte d
     firstFigure.getByRole("img", { name: "Carte des échanges observés" }),
   ).toHaveAttribute(
     "src",
-    `/api/subjects/${subjectId}/editor/figures/${figureIds[0].replaceAll("-", "")}/thumbnail`,
+    `/api/subjects/${subjectId}/editor/figures/${figureIds[0]}/thumbnail`,
   );
+  await expect
+    .poll(() =>
+      firstFigure
+        .getByRole("img", { name: "Carte des échanges observés" })
+        .evaluate((image) => (image as { naturalWidth: number }).naturalWidth),
+    )
+    .toBeGreaterThan(0);
+  await expect
+    .poll(() =>
+      secondFigure
+        .getByRole("img", { name: "Schéma de l’infrastructure observée" })
+        .evaluate((image) => (image as { naturalWidth: number }).naturalWidth),
+    )
+    .toBeGreaterThan(0);
+  await firstFigure.scrollIntoViewIfNeeded();
+  await expect(
+    firstFigure.getByRole("img", { name: "Carte des échanges observés" }),
+  ).toBeInViewport({ ratio: 1 });
+  await expect(
+    secondFigure.getByRole("img", {
+      name: "Schéma de l’infrastructure observée",
+    }),
+  ).toBeInViewport({ ratio: 1 });
   await page.screenshot({
     path: resolve(shotsDirectory, "document-figures-integrees-desktop.png"),
   });

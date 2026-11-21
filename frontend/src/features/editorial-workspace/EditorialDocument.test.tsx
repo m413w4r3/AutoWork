@@ -291,7 +291,8 @@ describe("EditorialDocument", () => {
       evidence_refs: [],
       chart: null,
       figure: {
-        key: "adopted_source_figure_11111111111141118111111111111111",
+        key: "adopted_source_figure_99999999999949998999999999999999",
+        catalog_figure_id: "11111111-1111-4111-8111-111111111111",
         caption: "Schéma réseau annoté",
         source_url: "https://source.example/report",
         source: "Rapport synthétique",
@@ -350,7 +351,7 @@ describe("EditorialDocument", () => {
       screen.getByRole("img", { name: "Schéma réseau annoté" }),
     ).toHaveAttribute(
       "src",
-      "/api/subjects/subject-1/editor/figures/11111111111141118111111111111111/thumbnail",
+      "/api/subjects/subject-1/editor/figures/11111111-1111-4111-8111-111111111111/thumbnail",
     );
     expect(screen.getByText("Rapport synthétique")).toBeVisible();
     expect(
@@ -359,5 +360,75 @@ describe("EditorialDocument", () => {
       ),
     ).toBeVisible();
     expect(screen.getByText("800 × 450 px · image/png")).toBeVisible();
+  });
+
+  it("shows the caption and provenance when the catalog preview is missing", () => {
+    const anchorBlock = snapshot.blocks[0];
+    const followingBlock = snapshot.blocks[1];
+    if (!anchorBlock || !followingBlock) {
+      throw new Error("Expected the synthetic paragraph blocks");
+    }
+    const unavailableFigure = {
+      block_id: "unavailable-figure-occurrence",
+      kind: "figure" as const,
+      parent_block_id: null,
+      position: 1,
+      text: "Figure sans aperçu",
+      evidence_refs: [],
+      chart: null,
+      figure: {
+        key: "adopted_source_figure_88888888888848888888888888888888",
+        catalog_figure_id: null,
+        caption: "Figure sans aperçu",
+        source_url: "https://source.example/report",
+        source: "Rapport synthétique",
+        provenance: "Figure archivée, vérifiée et conservée depuis le rapport.",
+        sha256: "f".repeat(64),
+        mime_type: "image/png",
+        byte_size: 1024,
+        width: 800,
+        height: 450,
+        status: "included" as const,
+        order: 0,
+        anchor_block_id: anchorBlock.block_id,
+        placement: "after_paragraph" as const,
+        page: 4,
+        section: "Infrastructure",
+      },
+      revision_target: {
+        block_id: "unavailable-figure-occurrence",
+        legacy_target_id: null,
+      },
+      before_hash: null,
+      allowed_operations: [],
+      revision_status: "ready" as const,
+    };
+    const { container } = render(
+      <EditorialDocument
+        snapshot={{
+          ...snapshot,
+          blocks: [anchorBlock, unavailableFigure, followingBlock],
+        }}
+        selectedBlockId={null}
+        drafts={{}}
+        staleDraftIds={new Set()}
+        editingBlockId={null}
+        onSelectBlock={() => undefined}
+        onDraftChange={() => undefined}
+        onResumeDraft={() => undefined}
+        onCancelDraft={() => undefined}
+      />,
+    );
+
+    expect(screen.getByText("Aperçu indisponible")).toBeVisible();
+    expect(screen.getByText("Figure sans aperçu")).toBeVisible();
+    expect(
+      screen.getByText(
+        "Figure archivée, vérifiée et conservée depuis le rapport.",
+      ),
+    ).toBeVisible();
+    expect(
+      container.querySelector(".editorial-document__source-figure img"),
+    ).toBeNull();
   });
 });

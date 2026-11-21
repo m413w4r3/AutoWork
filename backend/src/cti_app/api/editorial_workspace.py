@@ -499,6 +499,7 @@ class EditorialWorkspaceFigure(BaseModel):
     placement: Literal["after_paragraph", "after_lead", "after_timeline", "after_section", "end"]
     page: int | None = Field(default=None, ge=1)
     section: str | None
+    catalog_figure_id: UUID | None = None
 
 
 class EditorialWorkspaceBlock(BaseModel):
