@@ -160,9 +160,7 @@ class ManualSourceFigurePatch:
 class ManualPatch:
     """The persisted proposal origin for one validated typed manual patch."""
 
-    typed_patch: (
-        ManualTextPatch | ManualTablePatch | ManualBarChartPatch | ManualSourceFigurePatch
-    )
+    typed_patch: ManualTextPatch | ManualTablePatch | ManualBarChartPatch | ManualSourceFigurePatch
 
 
 class EditorialProposalEventKind(StrEnum):

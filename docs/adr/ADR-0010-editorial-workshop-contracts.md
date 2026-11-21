@@ -1,6 +1,6 @@
 # ADR-0010 — Contrats de l’atelier éditorial interactif
 
-Statut : Proposed — créé le 2026-11-18, précisé le 2026-11-20. `DECISIONS.md` D1–D7 fait autorité pour la mission jusqu’à acceptation explicite de cet ADR par l’orchestrateur en M8, après implémentation et revues. Il reste proposé à la base intégrée `887445f0`; cette mise à jour documentaire ne l’accepte pas. En cas de divergence, s’arrêter et signaler.
+Statut : Accepted — 2026-11-21. Créé le 2026-11-18, précisé le 2026-11-20, implémenté en M1–M8, revu, gates verts ; l’orchestrateur a accepté l’ADR le 2026-11-21.
 
 ## Contexte
 
@@ -30,7 +30,7 @@ Le placement ajouté est `after_paragraph` avec `anchor_block_id` obligatoire, r
 
 ### D6 — Persistance additive
 
-Toute persistance suit la tête Alembic courante. À la base intégrée `887445f0`, la chaîne éditoriale réelle est `0011_editorial_workspace_snapshots` (`backend/migrations/versions/0011_editorial_workspace.py`) → `0012_editorial_threads` (`backend/migrations/versions/0012_editorial_threads.py`) → `0013_bridge_generation_slots` (`backend/migrations/versions/0013_bridge_generation_slots.py`) → `0014_editorial_proposals` (`backend/migrations/versions/0014_editorial_proposals.py`) → `0015_editorial_proposal_impacts` (`backend/migrations/versions/0015_editorial_proposal_impacts.py`). Les migrations 0014 et 0015 ajoutent respectivement propositions/ModelRuns/événements et outbox d’impacts. Le prochain DDL part de 0015 (0016+ inclut notamment `editorial_drafts`). `0001_baseline`, les blobs historiques et leurs hashes restent intacts. Prévalider les objets préexistants ; état partiel ou non conforme : échec avant DDL. Protéger le downgrade selon ADR-0007.
+Toute persistance suit la tête Alembic courante, `0017_editorial_proposal_bar_chart_operation`. Les migrations 0011–0017 sont additives (détail dans les Conséquences) ; `0001_baseline`, les blobs historiques et leurs hashes restent intacts. Prévalider les objets préexistants ; état partiel ou non conforme : échec avant DDL. Protéger le downgrade selon ADR-0007.
 
 ### D7 — Résolutions M0
 
@@ -40,14 +40,48 @@ Toute persistance suit la tête Alembic courante. À la base intégrée `887445f
 - **M3, variantes :** `variant_group_id = (base pin, occurrence cible, opération, thread_id)`. L’acceptation rend atomiquement les sœurs `stale`. Toute autre proposition aux pins modifiés est projetée puis persistée `stale` avant décision.
 - **M4, prose/PII :** brouillons, fils et tours ont les ACL du sujet. Brouillon serveur : TTL configurable, défaut 30 jours après dernière modification, purgé à adoption/rejet/annulation. Blobs de fil conservés comme dossier éditorial, sans purge automatique. Logs, traces et télémétrie d’erreur excluent prose et texte de bloc ; navigateur : mémoire React seulement, sans stockage persistant.
 - **M5, accès :** « Ouvrir l’atelier éditorial » depuis détail sujet, onglet Article, `SubjectProduction`, `ReviewItemCard`/`ProductionConsole`, et consultation article/brève. La route réautorise sujet/run ; interdit ou absent montre un état sûr sans fuite.
-- **M6, autorité :** le présent statut Proposé est subordonné à `DECISIONS.md` D1–D7 jusqu’à acceptation M8 par l’orchestrateur après implémentation et revues ; toute divergence arrête le travail et est signalée.
+- **M6, autorité :** cet ADR accepté et `DECISIONS.md` D1–D9 font autorité ; toute divergence arrête le travail et est signalée.
 - **m1, frontend/visuel :** types stricts sans `any`, pas de hook/composant générique sans usage démontré, composants de présentation sans logique métier backend, réseau via la couche API. Décision utilisateur : desktop-only. Captures Playwright couvrent les tailles desktop large/intermédiaire et états éditoriaux actifs, avec revue visuelle et commandes pnpm/Make; aucun scroll horizontal de page à partir de 1024 px.
 - **m2, snapshot :** DTO plat avec `snapshot_id` opaque et champs `subject_id`, `production_run_id`, `publication_kind`, `synthesis_artifact_id/version/canonical_sha256`, `enrichment_artifact_id/version`, `publication_artifact_id/version`, `pipeline_generation`, `blocks`, `enrichments`, `document_outline`, `capabilities`, `preview_status`. Pas de `pins` ni `outline` parallèles.
 - **m3, activation :** M2 expose seulement `message`; T-M3-16 active `Proposer` après le cutover partagé. La route accept reste désactivée; seulement après T-M3-17, l’impact worker est disponible et `EDITORIAL_PROPOSAL_ACCEPT_ENABLED=true` avec l’action UI `Accepter` expose l’acceptation aux utilisateurs.
 
+### D8 — Périmètre des tickets DDL
+
+Un ticket qui ajoute une migration Alembic ne peut modifier, en plus de celle-ci, que `backend/migrations/env.py` (import du module de modèles, exclusion de la métadonnée de baseline gelée), `backend/tests/integration/test_migrations.py` (tête, modules, triggers/fonctions/tables attendus), `backend/tests/test_alembic_chain.py` (tête et chaîne) et `backend/tests/test_architecture_production_lineage.py` (liste des migrations) ; règle complète et oracle d’une base vide : `DECISIONS.md` D8/D8b.
+
+### D9 — Écrivains legacy et périmètre desktop
+
+D9 amende D7.B1 et formalise la décision T-M3-15 (cutover simplifié). Les écrivains legacy `revise` de synthèse et d’enrichissement, `restore` et le rebase d’impact restent des écritures canoniques directes, endpoints inchangés. Dans leur UOW, ils appellent l’étape commune `application/editorial_revision_effects.py` (verrou du run, avance du registre, propositions aux pins changés persistées `stale`), partagée avec l’adoption. Ils ne deviennent pas des façades `prepare + accept` et ne créent ni proposition ni ModelRun factices. L’oracle PostgreSQL accept‖revise/restore impose un seul gagnant. L’UI de l’atelier est desktop-only : UX-19 (« mobile ») est abandonné, sans critère ni capture mobile. La route accept n’est exposée aux utilisateurs qu’après T-M3-17.
+
 ## Conséquences
 
 Le registre latéral, l’agrégat, le fil et les outboxes portent identité, décision et reprise. Les reassemblages suivent les nouvelles versions ; les compositions gardent leurs pins jusqu’à action explicite. Le lease singleton de `bridge_generation_slots` sérialise les générations Bridge lancées par l’atelier éditorial avec fencing; il ne limite pas les autres consommateurs de Bridge et ne prouve pas une règle globale côté Bridge. Les écritures legacy directes et l’adoption partagent le verrou de run et les effets registre/stale; seule l’adoption écrit l’outbox d’impact d’une proposition.
+
+Migrations livrées, chaîne linéaire et tête unique `0017_editorial_proposal_bar_chart_operation` : `0011_editorial_workspace_snapshots` (instantanés épinglés, registre append-only), `0012_editorial_threads` (fils, événements, jobs), `0013_bridge_generation_slots` (lease de génération avec fencing), `0014_editorial_proposals` (propositions, ModelRuns, événements), `0015_editorial_proposal_impacts` (outbox d’impacts), `0016_editorial_drafts` (brouillons serveur), `0017_editorial_proposal_bar_chart_operation` (CHECK des opérations étendu à `create_bar_chart`). `0001_baseline` et les blobs historiques restent inchangés.
+
+Opérations ajoutées : placement `after_paragraph` avec `anchor_block_id`, et opérations `create_table`, `create_bar_chart`, `create_source_figure`.
+
+Garde serveur unique `editorial_read_only` : `resolve_revision_target` et l’adoption refusent une écriture sur une cible en lecture seule, avec recontrôle sous verrou avant l’écriture adoptante. Les lectures, le rejet et l’historique restent permis.
+
+Versions vérifiées à la tête (`ARCHITECTURE.md` §6) : schéma d’enrichissement V10, politique V14 (`evidence-backed-bar-charts`), prompt V23, parser V17, document de publication V10, données Typst V42–V44 (renderer v23), SVG `editorial-chart-svg-v2-bar-data` (renderer 2.0), politique de rendu V15.
+
+La route `POST /subjects/{subject_id}/editor/threads/{occurrence_id}/proposals/{proposal_id}/accept` est exposée (`editorial_proposal_accept_enabled`, défaut vrai) et l’action UI « Accepter » est disponible.
+
+## Écarts et risques résiduels connus
+
+- Routes legacy `revise`/`restore` de `api/production.py` non gardées par `editorial_read_only` (écrivains legacy admis par D9).
+- Retrait et remplacement de figure non exposés dans l’interface actuelle.
+- Re-hash des blobs d’inventaire non refait : le chargeur partagé legacy reste utilisé.
+- URL canonique de source exposée en lecture comme provenance.
+- SVG non assaini à l’ingestion (pipeline legacy M19), assaini seulement à l’aperçu.
+- GET de prévisualisation pouvant relancer un rendu `FAILED` sans plafond global (comportement legacy).
+- Heuristique de kind V4–V6 : résolveur legacy ADR-0008 (D1/D5).
+- Audit axe non réalisé (risque accepté).
+- Curseur d’historique non signé (filtrage par sujet intact).
+- `editorial_proposals.py` ~4,1 k lignes non contracté (4 183 lignes).
+- mypy : erreurs préexistantes hors diff.
+- Bundle JS ~771 kB (build local ; 771 451 octets).
+- Réutilisation inter-run d’enrichissement non exacte (V10, appels modèle possibles).
 
 ## Options rejetées
 

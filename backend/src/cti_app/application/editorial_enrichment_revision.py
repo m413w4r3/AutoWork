@@ -314,9 +314,8 @@ def assert_requested_placement(
         EditorialEnrichmentElementKind.FIGURE: candidate.source_figures,
     }[element_kind]
     if (
-        (not values if element_kind is EditorialEnrichmentElementKind.FIGURE else len(values) != 1)
-        or any(getattr(value, "placement", None) != expected for value in values)
-    ):
+        not values if element_kind is EditorialEnrichmentElementKind.FIGURE else len(values) != 1
+    ) or any(getattr(value, "placement", None) != expected for value in values):
         raise EditorialEnrichmentRevisionValidationError(
             [
                 {
