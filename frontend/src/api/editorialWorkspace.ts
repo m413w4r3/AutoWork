@@ -95,6 +95,25 @@ export interface EditorialWorkspaceTable {
     | "end";
 }
 
+export interface EditorialWorkspaceBarChartPoint {
+  label: string;
+  value: string;
+  evidence_refs: EditorialEvidenceReference[];
+}
+
+export interface EditorialWorkspaceBarChart {
+  key: string;
+  kind: "bar";
+  title: string;
+  caption: string | null;
+  legend: string[];
+  category_axis_label: string;
+  value_axis_label: string;
+  unit: string;
+  points: EditorialWorkspaceBarChartPoint[];
+  anchor_block_id: string;
+}
+
 export interface EditorialWorkspaceBlock {
   block_id: string;
   kind: EditorialBlockKind;
@@ -103,6 +122,7 @@ export interface EditorialWorkspaceBlock {
   text: string | null;
   evidence_refs: Record<string, unknown>[];
   table?: EditorialWorkspaceTable | null;
+  chart: EditorialWorkspaceBarChart | null;
   revision_target: EditorialWorkspaceRevisionTarget;
   before_hash: string | null;
   allowed_operations: string[];
@@ -298,6 +318,7 @@ export type EditorialProposalOperation =
   | "split_section"
   | "rename_section"
   | "create_table"
+  | "create_bar_chart"
   | "rewrite_table"
   | "delete_table"
   | "create_diagram"
@@ -412,6 +433,36 @@ export interface EditorialManualTableProposalInput {
   table: EditorialManualTableDraft;
 }
 
+export interface EditorialManualBarChartDraft {
+  key: string;
+  title: string;
+  caption?: string | null;
+  category_axis_label: string;
+  value_axis_label: string;
+  unit: string;
+  points: Array<{
+    label: string;
+    series: string;
+    value: string;
+    evidence_refs: EditorialEvidenceReference[];
+  }>;
+  purpose: {
+    question: string;
+    available_data: string;
+    comprehension_gain: string;
+    scope: string;
+    evidence_refs: EditorialEvidenceReference[];
+    knowledge_limits: string;
+    placement_reason: string;
+  };
+}
+
+export interface EditorialManualBarChartProposalInput {
+  snapshot_id: string;
+  anchor_block_id: string;
+  chart: EditorialManualBarChartDraft;
+}
+
 export interface EditorialProposalRead {
   id: string;
   subject_id: string;
@@ -500,6 +551,12 @@ const ERROR_MESSAGES: Record<string, string> = {
     "La proposition ne respecte pas le format éditorial autorisé. Vérifiez son contenu et réessayez.",
   manual_table_request_invalid:
     "Le tableau est incomplet ou incohérent. Vérifiez les intitulés, les cellules et les preuves de chaque ligne.",
+  manual_bar_chart_request_invalid:
+    "La requête de graphique à barres est invalide. Vérifiez les points, les valeurs et les preuves citées.",
+  bar_chart_insufficient_data:
+    "Aucun graphique quantitatif vérifiable ne peut être créé à partir des preuves actuelles. Un tableau descriptif peut être proposé à la place.",
+  bar_chart_value_not_evidenced:
+    "Aucun graphique quantitatif vérifiable ne peut être créé à partir des preuves actuelles. Un tableau descriptif peut être proposé à la place.",
   manual_table_analytic_question_duplicate:
     "Une question analytique équivalente existe déjà. Modifiez la consigne du tableau avant de proposer une nouvelle insertion.",
   manual_edit_request_too_large:
@@ -734,6 +791,25 @@ export function createManualEditorialTableProposal(
 ): Promise<EditorialProposalRead> {
   return request<EditorialProposalRead>(
     `/api/subjects/${encodeURIComponent(subjectId)}/editor/blocks/${encodeURIComponent(anchorBlockId)}/table-proposals`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Idempotency-Key": idempotencyKey,
+      },
+      body: JSON.stringify(input),
+    },
+  );
+}
+
+export function createManualEditorialBarChartProposal(
+  subjectId: string,
+  anchorBlockId: string,
+  idempotencyKey: string,
+  input: EditorialManualBarChartProposalInput,
+): Promise<EditorialProposalRead> {
+  return request<EditorialProposalRead>(
+    `/api/subjects/${encodeURIComponent(subjectId)}/editor/blocks/${encodeURIComponent(anchorBlockId)}/bar-chart-proposals`,
     {
       method: "POST",
       headers: {

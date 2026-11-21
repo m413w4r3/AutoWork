@@ -8,6 +8,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date as Date
 from datetime import datetime as DateTime
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Any
 from urllib.parse import urlsplit
@@ -27,7 +28,7 @@ from cti_app.domain.semantic_annotation import (
     semantic_annotation_proposal_to_json,
 )
 
-EDITORIAL_ENRICHMENT_SCHEMA_VERSION = 9
+EDITORIAL_ENRICHMENT_SCHEMA_VERSION = 10
 EDITORIAL_ENRICHMENT_V1_POLICY_VERSION = "editorial-enrichment-v1"
 EDITORIAL_ENRICHMENT_V2_POLICY_VERSION = "editorial-enrichment-v2-semantic-annotations"
 EDITORIAL_ENRICHMENT_V3_POLICY_VERSION = "editorial-enrichment-v3-figures-resource-proposals"
@@ -40,9 +41,29 @@ EDITORIAL_ENRICHMENT_V8_CURRENT_POLICY_VERSION = (
     "editorial-enrichment-v12-article-density-diagnostics"
 )
 EDITORIAL_ENRICHMENT_V9_POLICY_VERSION = "editorial-enrichment-v13-after-paragraph-anchors"
-EDITORIAL_ENRICHMENT_POLICY_VERSION = EDITORIAL_ENRICHMENT_V9_POLICY_VERSION
+EDITORIAL_ENRICHMENT_V10_POLICY_VERSION = "editorial-enrichment-v14-evidence-backed-bar-charts"
+EDITORIAL_ENRICHMENT_POLICY_VERSION = EDITORIAL_ENRICHMENT_V10_POLICY_VERSION
+BAR_CHART_INSUFFICIENT_DATA_MESSAGE = (
+    "Aucun graphique quantitatif vérifiable ne peut être créé à partir des preuves actuelles. "
+    "Un tableau descriptif peut être proposé à la place."
+)
+MAX_BAR_CHART_POINTS = 24
+MAX_BAR_CHART_SERIES = 6
+MAX_BAR_CHART_SIGNIFICANT_DIGITS = 18
+MAX_BAR_CHART_ADJUSTED_EXPONENT = 12
 EDITORIAL_FIGURE_DECISION_POLICY_VERSION = "editorial-figure-selection-v3-source-context"
 EDITORIAL_RESOURCE_PROPOSAL_POLICY_VERSION = "editorial-resource-proposal-v1"
+
+
+def bar_chart_evidence_contains_unit(unit: str, text: str) -> bool:
+    """Match a displayed unit as a phrase instead of an arbitrary substring."""
+    normalized_unit = " ".join(unit.split())
+    if not normalized_unit:
+        return False
+    phrase = re.escape(normalized_unit).replace(r"\ ", r"\s+")
+    prefix = r"(?<!\w)" if normalized_unit[0].isalnum() or normalized_unit[0] == "_" else ""
+    suffix = r"(?!\w)" if normalized_unit[-1].isalnum() or normalized_unit[-1] == "_" else ""
+    return re.search(prefix + phrase + suffix, text, flags=re.IGNORECASE) is not None
 
 
 class EditorialEnrichmentRevisionAction(StrEnum):
@@ -155,6 +176,7 @@ class EnrichmentTableKind(StrEnum):
 
 class ChartKind(StrEnum):
     TIMELINE = "timeline"
+    BAR = "bar"
 
 
 class EditorialMediaType(StrEnum):
@@ -231,19 +253,33 @@ def validate_chart_date(value: Any) -> str:
 @dataclass(frozen=True, slots=True)
 class ChartPointV1:
     label: str
-    date: str
+    date: str | None
     series: str
     evidence_refs: tuple[ExtractionEvidenceRefV1, ...]
+    value: Decimal | None = None
 
     def __post_init__(self) -> None:
         _diagram_label(self.label, "Chart point label")
-        validate_chart_date(self.date)
+        if self.date is not None:
+            validate_chart_date(self.date)
         _diagram_label(self.series, "Chart point series")
         object.__setattr__(
             self,
             "evidence_refs",
             _normalize_evidence_refs(self.evidence_refs, "Chart point evidence references"),
         )
+        if self.value is not None:
+            if not isinstance(self.value, Decimal) or not self.value.is_finite():
+                raise ValueError("Chart point value must be finite")
+            normalized_value = self.value.normalize()
+            if self.value == 0:
+                normalized_value = Decimal(0)
+            if (
+                len(normalized_value.as_tuple().digits) > MAX_BAR_CHART_SIGNIFICANT_DIGITS
+                or abs(normalized_value.adjusted()) > MAX_BAR_CHART_ADJUSTED_EXPONENT
+            ):
+                raise ValueError("Chart point value exceeds the supported numeric bounds")
+            object.__setattr__(self, "value", normalized_value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,10 +292,13 @@ class ChartSpecV1:
     purpose: EditorialAnalyticPurposeV1
     points: tuple[ChartPointV1, ...]
     compiled_asset_id: UUID | None = None
+    category_axis_label: str | None = None
+    value_axis_label: str | None = None
+    unit: str | None = None
 
     def __post_init__(self) -> None:
         _key(self.key, "Chart key")
-        if self.kind is not ChartKind.TIMELINE:
+        if not isinstance(self.kind, ChartKind):
             raise ValueError("Editorial chart kind is invalid")
         _diagram_label(self.title, "Chart title")
         if self.caption is not None:
@@ -274,10 +313,54 @@ class ChartSpecV1:
             not isinstance(point, ChartPointV1) for point in self.points
         ):
             raise ValueError("Chart points must be a tuple of ChartPointV1")
-        if not self.points:
-            raise ValueError("Editorial timeline charts require at least one point")
+        if self.kind is ChartKind.TIMELINE:
+            if not self.points or any(
+                point.date is None or point.value is not None for point in self.points
+            ):
+                raise ValueError("Editorial timeline charts require dated points")
+            if any(
+                label is not None
+                for label in (self.category_axis_label, self.value_axis_label, self.unit)
+            ):
+                raise ValueError("Editorial timeline chart axes are not supported")
+        else:
+            if len(self.points) < 2 or any(
+                point.value is None or point.date is not None or not point.evidence_refs
+                for point in self.points
+            ):
+                raise BarChartInsufficientDataError()
+            if len(self.points) > MAX_BAR_CHART_POINTS:
+                raise ValueError("Editorial bar chart point limit exceeded")
+            if len(self.title) > 1000 or (self.caption is not None and len(self.caption) > 2000):
+                raise ValueError("Editorial bar chart text size limit exceeded")
+            if len(self.purpose.evidence_refs) > 24:
+                raise ValueError("Editorial bar chart purpose evidence limit exceeded")
+            if len({point.series for point in self.points}) > MAX_BAR_CHART_SERIES:
+                raise ValueError("Editorial bar chart series limit exceeded")
+            if any(
+                len(point.label) > 500 or len(point.series) > 120 or len(point.evidence_refs) > 8
+                for point in self.points
+            ):
+                raise ValueError("Editorial bar chart point size limit exceeded")
+            for label, value in (
+                (self.category_axis_label, "category axis label"),
+                (self.value_axis_label, "value axis label"),
+                (self.unit, "unit"),
+            ):
+                _diagram_label(label, f"Chart {value}")
+                if len(label.strip()) > 120:
+                    raise ValueError(f"Chart {value} exceeds the supported size")
+            if len({point.label.casefold() for point in self.points}) != len(self.points):
+                raise ValueError("Editorial bar chart category labels must be unique")
         if self.compiled_asset_id is not None and not isinstance(self.compiled_asset_id, UUID):
             raise ValueError("Compiled chart asset identity must be a UUID")
+
+
+class BarChartInsufficientDataError(ValueError):
+    code = "bar_chart_insufficient_data"
+
+    def __init__(self) -> None:
+        super().__init__(BAR_CHART_INSUFFICIENT_DATA_MESSAGE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -878,6 +961,7 @@ class EditorialEnrichmentV1:
             7,
             8,
             9,
+            10,
         }:
             raise ValueError("Editorial enrichment schema version is unsupported")
         if not isinstance(self.subject_id, UUID):
@@ -909,12 +993,16 @@ class EditorialEnrichmentV1:
             if self.schema_version == 8
             else {EDITORIAL_ENRICHMENT_V9_POLICY_VERSION}
             if self.schema_version == 9
+            else {EDITORIAL_ENRICHMENT_V10_POLICY_VERSION}
+            if self.schema_version == 10
             else {expected_policy}
         )
         if self.enrichment_policy_version not in supported_policies:
             raise ValueError("Editorial enrichment policy version is unsupported")
         if self.schema_version < 7 and self.charts:
             raise ValueError("Legacy editorial enrichment cannot contain charts")
+        if self.schema_version < 10 and any(chart.kind is ChartKind.BAR for chart in self.charts):
+            raise ValueError("Legacy editorial enrichment cannot contain quantitative charts")
         if self.schema_version >= 8 and any(
             diagram.profile is None or diagram.caption is None for diagram in self.diagrams
         ):
@@ -1143,7 +1231,7 @@ def _diagram_to_json(
     return payload
 
 
-def _chart_to_json(chart: ChartSpecV1) -> dict[str, Any]:
+def _chart_to_json(chart: ChartSpecV1, *, include_quantitative: bool = False) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "key": chart.key,
         "kind": chart.kind.value,
@@ -1154,13 +1242,21 @@ def _chart_to_json(chart: ChartSpecV1) -> dict[str, Any]:
         "points": [
             {
                 "label": point.label,
-                "date": point.date,
                 "series": point.series,
                 "evidence_refs": [_ref_to_json(ref) for ref in point.evidence_refs],
+                **(
+                    {"value": format(point.value, "f")}
+                    if include_quantitative and point.value is not None
+                    else {"date": point.date}
+                ),
             }
             for point in chart.points
         ],
     }
+    if include_quantitative and chart.kind is ChartKind.BAR:
+        payload["category_axis_label"] = chart.category_axis_label
+        payload["value_axis_label"] = chart.value_axis_label
+        payload["unit"] = chart.unit
     if chart.compiled_asset_id is not None:
         payload["compiled_asset_id"] = str(chart.compiled_asset_id)
     return payload
@@ -1322,7 +1418,10 @@ def editorial_enrichment_to_json(enrichment: EditorialEnrichmentV1) -> dict[str,
             _resource_proposal_to_json(item) for item in enrichment.resource_proposals
         ]
     if enrichment.schema_version >= 7:
-        payload["charts"] = [_chart_to_json(chart) for chart in enrichment.charts]
+        payload["charts"] = [
+            _chart_to_json(chart, include_quantitative=enrichment.schema_version >= 10)
+            for chart in enrichment.charts
+        ]
     return payload
 
 
@@ -1349,6 +1448,7 @@ _ROOT_KEYS_V6 = _ROOT_KEYS_V5
 _ROOT_KEYS_V7 = _ROOT_KEYS_V6 | {"charts"}
 _ROOT_KEYS_V8 = _ROOT_KEYS_V7
 _ROOT_KEYS_V9 = _ROOT_KEYS_V8
+_ROOT_KEYS_V10 = _ROOT_KEYS_V9
 _REF_KEYS = frozenset({"source_document_id", "kind", "evidence_key"})
 _PLACEMENT_BASE_KEYS = frozenset({"kind", "section_index"})
 _PLACEMENT_KEYS = _PLACEMENT_BASE_KEYS | {"anchor_block_id"}
@@ -1382,8 +1482,15 @@ _DIAGRAM_ANALYTIC_KEYS = _DIAGRAM_KEYS | {"purpose"}
 _DIAGRAM_V8_BASE_KEYS = _DIAGRAM_BASE_KEYS | {"purpose", "profile"}
 _DIAGRAM_V8_KEYS = _DIAGRAM_KEYS | {"purpose", "profile"}
 _CHART_POINT_KEYS = frozenset({"label", "date", "series", "evidence_refs"})
+_CHART_BAR_POINT_KEYS = frozenset({"label", "value", "series", "evidence_refs"})
 _CHART_BASE_KEYS = frozenset({"key", "kind", "title", "caption", "placement", "purpose", "points"})
 _CHART_KEYS = _CHART_BASE_KEYS | {"compiled_asset_id"}
+_CHART_BAR_BASE_KEYS = _CHART_BASE_KEYS | {
+    "category_axis_label",
+    "value_axis_label",
+    "unit",
+}
+_CHART_BAR_KEYS = _CHART_BAR_BASE_KEYS | {"compiled_asset_id"}
 _LOCATOR_KEYS = frozenset({"page", "section", "figure_label", "original_asset_url"})
 _FIGURE_KEYS = frozenset(
     {
@@ -1683,42 +1790,77 @@ def _diagram_from_json(
     )
 
 
-def _chart_from_json(raw: Any) -> ChartSpecV1:
-    if not isinstance(raw, Mapping) or frozenset(raw) not in {
-        _CHART_BASE_KEYS,
-        _CHART_KEYS,
-    }:
+def _chart_from_json(raw: Any, *, schema_version: int) -> ChartSpecV1:
+    if not isinstance(raw, Mapping):
         raise ValueError("Editorial chart has missing or extra fields")
     payload = raw
+    kind = _enum(ChartKind, payload.get("kind"), "Chart kind")
+    if kind is ChartKind.BAR:
+        if schema_version < 10 or frozenset(payload) not in {
+            _CHART_BAR_BASE_KEYS,
+            _CHART_BAR_KEYS,
+        }:
+            raise ValueError("Editorial quantitative chart has missing or extra fields")
+        point_keys = _CHART_BAR_POINT_KEYS
+    else:
+        if frozenset(payload) not in {_CHART_BASE_KEYS, _CHART_KEYS}:
+            raise ValueError("Editorial chart has missing or extra fields")
+        point_keys = _CHART_POINT_KEYS
     caption = payload["caption"]
     if caption is not None:
         caption = _text(caption, "Chart caption")
-    return ChartSpecV1(
-        key=_text(payload["key"], "Chart key"),
-        kind=_enum(ChartKind, payload["kind"], "Chart kind"),
-        title=_text(payload["title"], "Chart title", semantic=True),
-        caption=caption,
-        placement=_placement_from_json(payload["placement"]),
-        purpose=_purpose_from_json(payload["purpose"]),
-        points=tuple(
+    points: list[ChartPointV1] = []
+    for raw_point in _array(payload["points"], "Chart points"):
+        point = _object(raw_point, point_keys, "Chart point")
+        value: Decimal | None = None
+        point_date: str | None = None
+        if kind is ChartKind.BAR:
+            raw_value = point["value"]
+            if not isinstance(raw_value, str):
+                raise ValueError("Bar chart value must be canonical decimal text")
+            try:
+                value = Decimal(raw_value)
+            except InvalidOperation as exc:
+                raise ValueError("Bar chart value must be a finite decimal") from exc
+        else:
+            point_date = validate_chart_date(point["date"])
+        points.append(
             ChartPointV1(
                 label=_text(point["label"], "Chart point label", semantic=True),
-                date=validate_chart_date(point["date"]),
+                date=point_date,
                 series=_text(point["series"], "Chart point series", semantic=True),
                 evidence_refs=_refs_from_json(
                     point["evidence_refs"], "Chart point evidence references"
                 ),
+                value=value,
             )
-            for point in (
-                _object(value, _CHART_POINT_KEYS, "Chart point")
-                for value in _array(payload["points"], "Chart points")
-            )
-        ),
+        )
+    return ChartSpecV1(
+        key=_text(payload["key"], "Chart key"),
+        kind=kind,
+        title=_text(payload["title"], "Chart title", semantic=True),
+        caption=caption,
+        placement=_placement_from_json(payload["placement"]),
+        purpose=_purpose_from_json(payload["purpose"]),
+        points=tuple(points),
         compiled_asset_id=(
             _uuid(payload["compiled_asset_id"], "Compiled chart asset ID")
             if "compiled_asset_id" in payload
             else None
         ),
+        category_axis_label=(
+            _text(payload["category_axis_label"], "Category axis label", semantic=True)
+            if kind is ChartKind.BAR
+            else None
+        ),
+        value_axis_label=(
+            _text(payload["value_axis_label"], "Value axis label", semantic=True)
+            if kind is ChartKind.BAR
+            else None
+        ),
+        unit=_text(payload["unit"], "Bar chart unit", semantic=True)
+        if kind is ChartKind.BAR
+        else None,
     )
 
 
@@ -1890,6 +2032,7 @@ def editorial_enrichment_from_json(payload: Mapping[str, Any]) -> EditorialEnric
         7: _ROOT_KEYS_V7,
         8: _ROOT_KEYS_V8,
         9: _ROOT_KEYS_V9,
+        10: _ROOT_KEYS_V10,
     }.get(raw_version)
     if root_keys is None:
         raise ValueError("Editorial enrichment schema version is unsupported")
@@ -1963,7 +2106,10 @@ def editorial_enrichment_from_json(payload: Mapping[str, Any]) -> EditorialEnric
             else ()
         ),
         charts=(
-            tuple(_chart_from_json(value) for value in _array(body["charts"], "Editorial charts"))
+            tuple(
+                _chart_from_json(value, schema_version=schema_version)
+                for value in _array(body["charts"], "Editorial charts")
+            )
             if schema_version >= 7
             else ()
         ),

@@ -2423,6 +2423,7 @@ class ProductionSynthesisRevisionService:
             TargetedEditorialRevisionOperation.REWRITE_DIAGRAM,
             TargetedEditorialRevisionOperation.DELETE_DIAGRAM,
             TargetedEditorialRevisionOperation.CREATE_CHART,
+            TargetedEditorialRevisionOperation.CREATE_BAR_CHART,
             TargetedEditorialRevisionOperation.REWRITE_CHART,
             TargetedEditorialRevisionOperation.DELETE_CHART,
             TargetedEditorialRevisionOperation.REPLACE_SOURCE_FIGURE,
@@ -2440,6 +2441,7 @@ class ProductionSynthesisRevisionService:
                 TargetedEditorialRevisionOperation.REWRITE_DIAGRAM: "diagram",
                 TargetedEditorialRevisionOperation.DELETE_DIAGRAM: "diagram",
                 TargetedEditorialRevisionOperation.CREATE_CHART: "chart",
+                TargetedEditorialRevisionOperation.CREATE_BAR_CHART: "chart",
                 TargetedEditorialRevisionOperation.REWRITE_CHART: "chart",
                 TargetedEditorialRevisionOperation.DELETE_CHART: "chart",
                 TargetedEditorialRevisionOperation.REPLACE_SOURCE_FIGURE: "figure",
@@ -2452,6 +2454,7 @@ class ProductionSynthesisRevisionService:
                 TargetedEditorialRevisionOperation.CREATE_TABLE,
                 TargetedEditorialRevisionOperation.CREATE_DIAGRAM,
                 TargetedEditorialRevisionOperation.CREATE_CHART,
+                TargetedEditorialRevisionOperation.CREATE_BAR_CHART,
             }
             if is_create:
                 if request.target.element_key is not None or request.target.placement is None:

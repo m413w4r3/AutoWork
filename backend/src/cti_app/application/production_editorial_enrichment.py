@@ -9,6 +9,7 @@ import unicodedata
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
@@ -150,6 +151,7 @@ from cti_app.domain.production_editorial_enrichment import (
     TableColumnV1,
     TableRowV1,
     TableSpecV1,
+    bar_chart_evidence_contains_unit,
     diagram_requires_vertical_layout,
     editorial_enrichment_evidence_refs,
     editorial_enrichment_from_json,
@@ -212,9 +214,9 @@ EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION = (
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SOURCE_METADATA_POLICY_VERSION = (
     "editorial-enrichment-evidence-pack-v9-source-metadata-exclusion"
 )
-EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = "editorial-enrichment-validator-v18-paragraph-anchor"
+EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = "editorial-enrichment-validator-v19-evidence-backed-bars"
 EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION = (
-    "editorial-enrichment-analytic-policy-v6-paragraph-anchor"
+    "editorial-enrichment-analytic-policy-v7-evidence-backed-bars"
 )
 TABLE_PARAPHRASE_TOKEN_DICE_THRESHOLD = 0.80
 DIAGRAM_STAR_LABEL_ANCHOR_OVERLAP = 0.50
@@ -266,6 +268,7 @@ _RENDERER_SYNTAX = re.compile(
     r"(?im)(?:```|~~~|<\s*/?\s*[a-z][^>]*>|^\s*(?:graph\s+|digraph\b|subgraph\b|flowchart\b|sequenceDiagram\b|classDiagram\b|stateDiagram\b|erDiagram\b|mindmap\b|architecture-beta\b)|^\s*(?:direction\s*:\s*(?:right|down|left|up)|[\w.-]+\s*(?:->|<-|<->|-->|\.\.>|--|\|>))|\\begin\s*\{|\\(?:tikz|node|draw|path)\b|#(?:set|let|show|import)\b|<svg\b|^\s*\|.*\|\s*$)"
 )
 _EVIDENCE_HANDLE_RE = re.compile(r"^E[0-9]{3,}$")
+_BAR_VALUE_TOKEN_RE = re.compile(r"(?<![\w.])[-+]?(?:\d+(?:\.\d+)?|\.\d+)(?![\w.])")
 
 
 def _canonical_json_bytes(payload: Any) -> bytes:
@@ -398,9 +401,10 @@ class TableProposalV1(_StrictEnrichmentProposalModel):
 
 class ChartPointProposalV1(_StrictEnrichmentProposalModel):
     label: StrictStr
-    date: StrictStr
+    date: StrictStr | None = None
     series: StrictStr
     evidence_handles: tuple[StrictStr, ...]
+    value: Decimal | None = None
 
     @field_validator("label", "series")
     @classmethod
@@ -409,8 +413,15 @@ class ChartPointProposalV1(_StrictEnrichmentProposalModel):
 
     @field_validator("date")
     @classmethod
-    def _exact_iso_date(cls, value: str) -> str:
-        return validate_chart_date(value)
+    def _exact_iso_date(cls, value: str | None) -> str | None:
+        return validate_chart_date(value) if value is not None else None
+
+    @field_validator("value")
+    @classmethod
+    def _finite_numeric_value(cls, value: Decimal | None) -> Decimal | None:
+        if value is not None and not value.is_finite():
+            raise ValueError("Chart point value must be finite")
+        return value
 
     @field_validator("evidence_handles")
     @classmethod
@@ -426,6 +437,9 @@ class ChartProposalV1(_StrictEnrichmentProposalModel):
     placement: EnrichmentPlacementProposalV1
     purpose: AnalyticPurposeProposalV1
     points: tuple[ChartPointProposalV1, ...]
+    category_axis_label: StrictStr | None = None
+    value_axis_label: StrictStr | None = None
+    unit: StrictStr | None = None
 
     @field_validator("key", "title")
     @classmethod
@@ -443,8 +457,40 @@ class ChartProposalV1(_StrictEnrichmentProposalModel):
         cls, value: tuple[ChartPointProposalV1, ...]
     ) -> tuple[ChartPointProposalV1, ...]:
         if not value:
-            raise ValueError("A timeline chart requires at least one point")
+            raise ValueError("A chart requires at least one point")
         return value
+
+    @model_validator(mode="after")
+    def _validate_kind_shape(self) -> ChartProposalV1:
+        if self.kind is ChartKind.BAR:
+            if len(self.points) < 2 or any(
+                point.value is None or point.date is not None for point in self.points
+            ):
+                raise ValueError("A quantitative chart requires two finite values")
+            if (
+                len(self.points) > 24
+                or len(self.title) > 1000
+                or (self.caption is not None and len(self.caption) > 2000)
+            ):
+                raise ValueError("A quantitative chart exceeds the supported size")
+            if any(
+                len(point.label) > 500 or len(point.series) > 120 or len(point.evidence_handles) > 8
+                for point in self.points
+            ):
+                raise ValueError("A quantitative chart point exceeds the supported size")
+            if not self.category_axis_label or not self.value_axis_label or not self.unit:
+                raise ValueError("A quantitative chart requires axis labels and a unit")
+            if any(
+                len(value) > 120
+                for value in (self.category_axis_label, self.value_axis_label, self.unit)
+            ):
+                raise ValueError("A quantitative chart axis or unit exceeds the supported size")
+        elif any(point.date is None or point.value is not None for point in self.points) or any(
+            value is not None
+            for value in (self.category_axis_label, self.value_axis_label, self.unit)
+        ):
+            raise ValueError("A timeline chart requires dates and no quantitative fields")
+        return self
 
 
 class DiagramNodeProposalV1(_StrictEnrichmentProposalModel):
@@ -1000,11 +1046,15 @@ _ENRICHMENT_FIELD_ALIASES = {
     "limits": "knowledge_limits",
     "knowledge limits": "knowledge_limits",
     "placement reason": "placement_reason",
+    "category axis label": "category_axis_label",
+    "value axis label": "value_axis_label",
+    "unit": "unit",
     "relation type": "relation_type",
     "relation_type": "relation_type",
     "column key": "key",
     "label": "label",
     "date": "date",
+    "value": "value",
     "series": "series",
     "cell": "cell",
     "evidence": "evidence_handles",
@@ -2744,7 +2794,7 @@ def parse_editorial_enrichment_proposal_wire(
                 r"^(EVIDENCE\s+HANDLES?|SECTION\s+INDEX|ANCHOR\s+BLOCK\s+ID|NODE\s+IDS|SOURCE\s+NODE\s+ID|"
                 r"TARGET\s+NODE\s+ID|GROUP\s+ID|NODE\s+ID|COLUMN\s+KEY|"
                 r"PARAGRAPH\s+ANCHOR|EXACT\s+TEXT|FIGURE\s+HANDLE|NEED\s+KEY|QUERY\s+HINT|"
-                r"DATE|SERIES|"
+                r"DATE|VALUE|SERIES|UNIT|CATEGORY AXIS LABEL|VALUE AXIS LABEL|"
                 r"CATEGORY|ROLE|ANCHOR|SEGMENT|TEXT|"
                 r"KEY|KIND|TITLE|CAPTION|PLACEMENT|LABEL|CELL|HANDLES|DIRECTION|ID|"
                 r"FROM|TO|SOURCE|TARGET|NODES)\s+(.+)$",
@@ -2812,6 +2862,9 @@ def parse_editorial_enrichment_proposal_wire(
                 "purpose_evidence_handles",
                 "knowledge_limits",
                 "placement_reason",
+                "category_axis_label",
+                "value_axis_label",
+                "unit",
             },
             "DIAGRAM": {
                 "key",
@@ -2833,7 +2886,7 @@ def parse_editorial_enrichment_proposal_wire(
             },
             "COLUMN": {"key", "label"},
             "ROW": {"cell", "evidence_handles"},
-            "POINT": {"date", "label", "series", "evidence_handles"},
+            "POINT": {"date", "value", "label", "series", "evidence_handles"},
             "NODE": {"node_id", "id", "label", "role", "evidence_handles"},
             "RELATION": {
                 "source_node_id",
@@ -3779,6 +3832,9 @@ def _parse_enrichment_wire_chart(
         "purpose_evidence_handles",
         "knowledge_limits",
         "placement_reason",
+        "category_axis_label",
+        "value_axis_label",
+        "unit",
     }
     if set(block.fields) - allowed_top_fields:
         reject(block, "editorial_enrichment_unknown_field")
@@ -3812,14 +3868,22 @@ def _parse_enrichment_wire_chart(
     for child in block.children:
         if child.kind != "POINT":
             continue
-        error = _block_child_error(
-            child, frozenset({"date", "label", "series", "evidence_handles"})
-        )
+        point_fields = {"label", "series", "evidence_handles"}
+        point_fields.add("value" if kind is ChartKind.BAR else "date")
+        error = _block_child_error(child, frozenset(point_fields))
         raw_date = _wire_scalar(child, "date")
+        raw_value = _wire_scalar(child, "value")
         label = _wire_scalar(child, "label")
         series = _wire_scalar(child, "series")
         handles = _wire_handles(_wire_scalar(child, "evidence_handles"))
-        if error is not None or not raw_date or not label or not series or handles is None:
+        if (
+            error is not None
+            or (kind is ChartKind.TIMELINE and not raw_date)
+            or (kind is ChartKind.BAR and not raw_value)
+            or not label
+            or not series
+            or handles is None
+        ):
             reject(child, error or "editorial_enrichment_chart_point_missing_or_invalid_field")
             invalid_point = True
             continue
@@ -3828,12 +3892,21 @@ def _parse_enrichment_wire_chart(
             invalid_point = True
             continue
         try:
+            value = None
+            if kind is ChartKind.BAR:
+                try:
+                    value = Decimal(raw_value or "")
+                except InvalidOperation:
+                    raise ValueError("Bar chart values must be finite decimals") from None
+                if not value.is_finite():
+                    raise ValueError("Bar chart values must be finite decimals")
             points.append(
                 ChartPointProposalV1(
-                    date=raw_date,
+                    date=raw_date if kind is ChartKind.TIMELINE else None,
                     label=label,
                     series=series,
                     evidence_handles=handles,
+                    value=value,
                 )
             )
         except (TypeError, ValueError, ValidationError):
@@ -3859,6 +3932,9 @@ def _parse_enrichment_wire_chart(
             placement=placement,
             purpose=purpose,
             points=tuple(points),
+            category_axis_label=_wire_scalar(block, "category_axis_label"),
+            value_axis_label=_wire_scalar(block, "value_axis_label"),
+            unit=_wire_scalar(block, "unit"),
         )
     except (TypeError, ValueError, ValidationError):
         reject(block, "editorial_enrichment_chart_invalid")
@@ -5256,10 +5332,18 @@ reprennent au moins la moitié de leurs termes de contenu d'une phrase d'ancrage
 Montre une structure qui aide à comprendre le contenu, pas seulement les mêmes
 noms reliés par des flèches. Aucun nombre minimal de nœuds ne s'applique.
 
-CHART accepte uniquement le KIND timeline. Chaque POINT doit citer une date ISO
-exacte, un LABEL et une SERIES présents dans ses preuves, plus au moins un
+CHART accepte KIND timeline ou bar. Pour timeline, chaque POINT cite une date
+ISO exacte, un LABEL et une SERIES présents dans ses preuves, plus au moins un
 EVIDENCE handle. N'invente pas de dates, n'utilise pas de dates relatives et
-n'interpole aucun point. Le renderer choisit les couleurs.
+n'interpole aucun point. Pour bar, ne propose le graphique que si au moins deux
+catégories comparables ont chacune une valeur numérique exacte et finie, une
+unité identique et une preuve FACT ou EVENT qui contient littéralement cette
+valeur et cette unité. N'invente, ne calcule et n'extrapole aucune valeur.
+Renseigne CATEGORY_AXIS_LABEL, VALUE_AXIS_LABEL et UNIT en texte brut. Chaque
+POINT bar contient LABEL, VALUE décimal, SERIES et EVIDENCE; DATE est interdit.
+Les libellés doivent être présents dans les preuves citées. Si une valeur ou son
+unité n'est pas étayée, omets le graphique; un tableau descriptif peut convenir
+si les preuves permettent une comparaison fidèle. Le renderer choisit les couleurs.
 """
         + "Une représentation existante de la source est prioritaire sur une représentation "
         + "reconstruite, lorsque les deux répondent à la même question analytique.\n"
@@ -5299,6 +5383,37 @@ DATE: 2026-07-27T10:13:40+02:00
 LABEL: example-domain.test
 SERIES: UTA0560
 EVIDENCE: E021
+END POINT
+END CHART
+
+CHART C002
+KEY: documented_sizes
+KIND: bar
+TITLE: Tailles explicitement rapportées
+CAPTION: Deux tailles exactes citées dans les observations.
+PURPOSE: Quelles tailles exactes les deux observations rapportent-elles ?
+DATA: Deux catégories et valeurs rapportées avec la même unité.
+GAIN: Les barres rendent directement visible la comparaison des tailles.
+SCOPE: Uniquement ces deux valeurs citées.
+PURPOSE_EVIDENCE: E031, E032
+LIMITS: Aucune extrapolation aux objets non décrits.
+PLACEMENT: after_section
+SECTION_INDEX: 2
+PLACEMENT_REASON: À côté du passage qui compare les deux tailles.
+CATEGORY_AXIS_LABEL: Observation
+VALUE_AXIS_LABEL: Taille rapportée
+UNIT: octets
+POINT P003
+LABEL: Premier échantillon
+VALUE: 1024
+SERIES: Taille
+EVIDENCE: E031
+END POINT
+POINT P004
+LABEL: Second échantillon
+VALUE: 2048
+SERIES: Taille
+EVIDENCE: E032
 END POINT
 END CHART
 
@@ -6603,16 +6718,61 @@ def validate_editorial_enrichment_proposal(
                     EditorialEnrichmentStageErrorCode.UNKNOWN_EVIDENCE,
                     message=f"chart_point_has_no_evidence:{chart.key}",
                 )
-            _validate_grounded_editorial_text(
-                point.date,
-                refs,
-                entries,
-                technical_support,
-                context=f"chart:{chart.key}:point.{point.label}.date",
-            )
-            _validate_exact_evidence_text(
-                point.date, refs, entries, context=f"chart:{chart.key}:point.{point.label}.date"
-            )
+            if chart.kind is ChartKind.BAR:
+                if point.value is None or not point.value.is_finite():
+                    raise EditorialEnrichmentProposalControlError(
+                        EditorialEnrichmentStageErrorCode.UNKNOWN_TECHNICAL_VALUE,
+                        message="bar_chart_value_not_finite",
+                    )
+                numeric_supported = False
+                unit_supported = False
+                for ref in refs:
+                    if ref.kind not in {EvidenceKind.FACT, EvidenceKind.EVENT}:
+                        continue
+                    payload = entries[ref]
+                    texts = tuple(_string_values(payload))
+                    if any(
+                        bar_chart_evidence_contains_unit(chart.unit or "", text) for text in texts
+                    ):
+                        unit_supported = True
+                    for text in texts:
+                        for match in _BAR_VALUE_TOKEN_RE.finditer(text):
+                            try:
+                                value = Decimal(match.group())
+                            except InvalidOperation:
+                                continue
+                            if value.is_finite() and value == point.value:
+                                numeric_supported = True
+                if not numeric_supported or not unit_supported:
+                    raise EditorialEnrichmentProposalControlError(
+                        EditorialEnrichmentStageErrorCode.UNKNOWN_TECHNICAL_VALUE,
+                        message="bar_chart_value_not_evidenced",
+                    )
+                _validate_ungrounded_editorial_text(
+                    point.label, context=f"chart:{chart.key}:point.{point.label}.label"
+                )
+                _validate_ungrounded_editorial_text(
+                    point.series, context=f"chart:{chart.key}:point.{point.label}.series"
+                )
+            else:
+                if point.date is None:
+                    raise EditorialEnrichmentProposalControlError(
+                        EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
+                        message=f"timeline_chart_date_missing:{chart.key}",
+                    )
+                _validate_grounded_editorial_text(
+                    point.date,
+                    refs,
+                    entries,
+                    technical_support,
+                    context=f"chart:{chart.key}:point.{point.label}.date",
+                )
+                _validate_exact_evidence_text(
+                    point.date,
+                    refs,
+                    entries,
+                    context=f"chart:{chart.key}:point.{point.label}.date",
+                )
             _validate_grounded_editorial_text(
                 point.label,
                 refs,
@@ -6640,6 +6800,7 @@ def validate_editorial_enrichment_proposal(
                     date=point.date,
                     series=point.series,
                     evidence_refs=refs,
+                    value=point.value,
                 )
             )
         ordered_chart_refs = tuple(sorted(chart_refs, key=evidence_ref_sort_key))
@@ -6679,6 +6840,20 @@ def validate_editorial_enrichment_proposal(
                 technical_support,
                 context=f"chart:{chart.key}:purpose.{field_name}",
             )
+        if chart.kind is ChartKind.BAR:
+            for field_name, value in (
+                ("category_axis_label", chart.category_axis_label),
+                ("value_axis_label", chart.value_axis_label),
+                ("unit", chart.unit),
+            ):
+                if not isinstance(value, str) or not value.strip():
+                    raise EditorialEnrichmentProposalControlError(
+                        EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
+                        message=f"bar_chart_{field_name}_missing",
+                    )
+                _validate_ungrounded_editorial_text(
+                    value, context=f"chart:{chart.key}:{field_name}"
+                )
         try:
             charts.append(
                 ChartSpecV1(
@@ -6697,6 +6872,9 @@ def validate_editorial_enrichment_proposal(
                         placement_reason=chart.purpose.placement_reason,
                     ),
                     points=tuple(points),
+                    category_axis_label=chart.category_axis_label,
+                    value_axis_label=chart.value_axis_label,
+                    unit=chart.unit,
                 )
             )
         except ValueError as exc:

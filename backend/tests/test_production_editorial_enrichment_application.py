@@ -5,6 +5,7 @@ import json
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -112,6 +113,7 @@ from cti_app.domain.production import (
 )
 from cti_app.domain.production_editorial_enrichment import (
     EDITORIAL_ENRICHMENT_V8_CURRENT_POLICY_VERSION,
+    ChartKind,
     DiagramEdgeV1,
     DiagramNodeRole,
     DiagramNodeV1,
@@ -1051,7 +1053,7 @@ def test_prompt_output_contract_example_satisfies_the_enforced_contract() -> Non
     assert "EVIDENCE: E001" in contract
     assert "D2" in contract
     assert "CHART" in contract
-    assert "CHART accepte uniquement le KIND timeline" in contract
+    assert "CHART accepte KIND timeline ou bar." in contract
     assert (
         "Une représentation existante de la source est prioritaire sur une représentation "
         "reconstruite, lorsque les deux répondent à la même question analytique."
@@ -1141,7 +1143,7 @@ def test_prompt_uses_analytic_intent_without_row_or_node_quotas() -> None:
     assert "Détermine intérieurement une question analytique" in request.text
     assert "ne produis pas de bloc QUESTION" in request.text
     assert "DIRECTION est une préférence de rendu" in request.text
-    assert "CHART accepte uniquement le KIND timeline" in request.text
+    assert "CHART accepte KIND timeline ou bar." in request.text
     assert "plusieurs valeurs exactes doivent être consultées rapidement" in request.text
     assert "Domaine | Date | Acteur" in request.text
     assert "pour comprendre leur répartition dans le temps, choisis CHART" in request.text
@@ -1644,6 +1646,73 @@ END CHART"""
     )
     assert missing_evidence.proposal is None
     assert missing_evidence.error_code == "editorial_enrichment_no_valid_blocks"
+
+
+def test_evidence_backed_bar_chart_wire_parses_exact_values_axes_and_unit() -> None:
+    snapshot = _snapshot()
+    fact_text = "Alpha had 12 endpoints and Beta had 18 endpoints."
+    fact = ExtractionFactV1(
+        category="other_technical",
+        value=fact_text,
+        attack_id=None,
+        context=fact_text,
+        evidence_quote=fact_text,
+        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+        source_document_ids=(_DOCUMENT_ID,),
+    )
+    extraction = _extraction(facts=(fact,), input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    wire = """CHART C001
+KEY: reported_endpoint_counts
+KIND: bar
+TITLE: Comptes rapportés
+CAPTION: Deux catégories documentées.
+PURPOSE: Quels nombres sont rapportés pour Alpha et Beta ?
+DATA: La source donne deux nombres exacts avec la même unité.
+GAIN: La comparaison rend les nombres et leur écart visibles.
+SCOPE: Alpha et Beta tels que cités.
+PURPOSE_EVIDENCE: E001
+LIMITS: Aucune autre catégorie n'est extrapolée.
+PLACEMENT: after_lead
+PLACEMENT_REASON: Présenter la comparaison après le résumé.
+CATEGORY_AXIS_LABEL: Catégorie
+VALUE_AXIS_LABEL: Nombre rapporté
+UNIT: endpoints
+POINT P001
+LABEL: Alpha
+VALUE: 12
+SERIES: endpoints
+EVIDENCE: E001
+END POINT
+POINT P002
+LABEL: Beta
+VALUE: 18
+SERIES: endpoints
+EVIDENCE: E001
+END POINT
+END CHART"""
+
+    parsed = parse_editorial_enrichment_proposal_wire(wire, pack)
+
+    assert parsed.proposal is not None, parsed.rejections
+    assert len(parsed.proposal.charts) == 1
+    chart_proposal = parsed.proposal.charts[0]
+    assert chart_proposal.kind is ChartKind.BAR
+    assert [point.value for point in chart_proposal.points] == [Decimal("12"), Decimal("18")]
+    assert chart_proposal.category_axis_label == "Catégorie"
+    assert chart_proposal.value_axis_label == "Nombre rapporté"
+    assert chart_proposal.unit == "endpoints"
+    enrichment = validate_editorial_enrichment_proposal(
+        parsed.proposal,
+        pack,
+        extraction,
+        synthesis,
+    )
+    serialized = editorial_enrichment_to_json(enrichment)
+    assert serialized["schema_version"] == 10
+    assert serialized["charts"][0]["points"][0]["value"] == "12"
+    assert serialized["charts"][0]["unit"] == "endpoints"
 
 
 def test_fixture_d_structured_exfiltration_mapping_keeps_one_table() -> None:
@@ -2906,7 +2975,7 @@ def test_annotation_wire_blocks_validate_anchor_and_segment_then_persist() -> No
         parsed.proposal, pack, extraction, synthesis
     )
     assert enrichment.annotations[0].text == "ExampleRAT"
-    assert enrichment.schema_version == 9
+    assert enrichment.schema_version == 10
     assert editorial_enrichment_from_json(editorial_enrichment_to_json(enrichment)) == enrichment
 
 
@@ -3259,7 +3328,7 @@ def test_model_request_is_stateless_versioned_and_uses_exact_route() -> None:
     assert "RELATION_TYPE: factual | inference | comparison" in request.text
     assert EDITORIAL_ENRICHMENT_GENERATOR_VERSION == "model-text-blocks-v11-brief-enrichment"
     assert EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION == (
-        "editorial-enrichment-block-contract-v15-after-paragraph-anchors"
+        "editorial-enrichment-block-contract-v16-evidence-backed-bars"
     )
 
     assert "au moins deux TABLE utiles" in request.text
@@ -3371,7 +3440,7 @@ def test_validator_version_changes_artifact_identity_without_changing_invocation
     artifact_after = compute_editorial_enrichment_input_hash(**common)
 
     assert EDITORIAL_ENRICHMENT_VALIDATOR_VERSION == (
-        "editorial-enrichment-validator-v18-paragraph-anchor"
+        "editorial-enrichment-validator-v19-evidence-backed-bars"
     )
     assert invocation_before == invocation_after
     assert artifact_before != artifact_after

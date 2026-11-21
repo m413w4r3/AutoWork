@@ -139,7 +139,10 @@ class EditorialWorkspaceService:
             raise EditorialWorkspaceError("editorial_snapshot_stale")
         if record.publication_kind is None:
             raise EditorialWorkspaceError("publication_kind_unresolved")
-        if operation == TargetedEditorialRevisionOperation.CREATE_TABLE.value and (
+        if operation in {
+            TargetedEditorialRevisionOperation.CREATE_TABLE.value,
+            TargetedEditorialRevisionOperation.CREATE_BAR_CHART.value,
+        } and (
             record.enrichment_artifact_id is None
             or record.enrichment_version is None
             or record.enrichment_input_hash is None
@@ -177,7 +180,10 @@ class EditorialWorkspaceService:
             raise EditorialWorkspaceError("editorial_snapshot_stale")
         if record.publication_kind is None:
             raise EditorialWorkspaceError("publication_kind_unresolved")
-        if operation == TargetedEditorialRevisionOperation.CREATE_TABLE.value and (
+        if operation in {
+            TargetedEditorialRevisionOperation.CREATE_TABLE.value,
+            TargetedEditorialRevisionOperation.CREATE_BAR_CHART.value,
+        } and (
             record.enrichment_artifact_id is None
             or record.enrichment_version is None
             or record.enrichment_input_hash is None

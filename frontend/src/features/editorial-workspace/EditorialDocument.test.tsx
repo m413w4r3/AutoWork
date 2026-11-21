@@ -24,6 +24,7 @@ const snapshot: EditorialWorkspaceSnapshot = {
       position: 0,
       text: "Repeated synthetic text",
       evidence_refs: [],
+      chart: null,
       revision_target: {
         block_id: "first-occurrence",
         legacy_target_id: null,
@@ -39,6 +40,7 @@ const snapshot: EditorialWorkspaceSnapshot = {
       position: 1,
       text: "Repeated synthetic text",
       evidence_refs: [],
+      chart: null,
       revision_target: {
         block_id: "second-occurrence",
         legacy_target_id: null,
@@ -108,6 +110,7 @@ describe("EditorialDocument", () => {
       position: 1,
       text: "Résumé vérifiable",
       evidence_refs: [],
+      chart: null,
       table: {
         key: "table-synthetic",
         kind: "custom" as const,

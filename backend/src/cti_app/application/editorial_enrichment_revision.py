@@ -114,6 +114,8 @@ def targeted_action(
         TargetedEditorialRevisionOperation.CREATE_DIAGRAM,
     }:
         return EditorialEnrichmentRevisionAction.DETAIL_DIAGRAM
+    if operation is TargetedEditorialRevisionOperation.CREATE_BAR_CHART:
+        return EditorialEnrichmentRevisionAction.CUSTOM
     if operation in {
         TargetedEditorialRevisionOperation.REPLACE_SOURCE_FIGURE,
         TargetedEditorialRevisionOperation.REWRITE_SOURCE_FIGURE,
@@ -132,12 +134,17 @@ def validate_targeted_request(request: TargetedEditorialRevisionRequest) -> None
         TargetedEditorialRevisionOperation.CREATE_TABLE,
         TargetedEditorialRevisionOperation.CREATE_DIAGRAM,
         TargetedEditorialRevisionOperation.CREATE_CHART,
+        TargetedEditorialRevisionOperation.CREATE_BAR_CHART,
     }
     if request.operation in create_operations:
         if target.element_key is not None or target.placement is None:
             raise ValueError("targeted_enrichment_revision_create_target_invalid")
         if target.placement.kind is TargetedEditorialRevisionPlacementKind.AFTER_PARAGRAPH and (
-            request.operation is not TargetedEditorialRevisionOperation.CREATE_TABLE
+            request.operation
+            not in {
+                TargetedEditorialRevisionOperation.CREATE_TABLE,
+                TargetedEditorialRevisionOperation.CREATE_BAR_CHART,
+            }
             or target.placement.anchor_block_id is None
         ):
             raise ValueError("targeted_enrichment_revision_placement_invalid")
@@ -269,7 +276,10 @@ def assert_requested_placement(
             evidence_pack=evidence_pack,
         )
     elif requested.kind is TargetedEditorialRevisionPlacementKind.AFTER_PARAGRAPH:
-        if targeted_request.operation is not TargetedEditorialRevisionOperation.CREATE_TABLE:
+        if targeted_request.operation not in {
+            TargetedEditorialRevisionOperation.CREATE_TABLE,
+            TargetedEditorialRevisionOperation.CREATE_BAR_CHART,
+        }:
             raise ValueError("targeted_enrichment_revision_placement_invalid")
         expected = EnrichmentPlacementV1(
             EnrichmentPlacementKind.AFTER_PARAGRAPH,
@@ -325,7 +335,11 @@ def requested_registered_placement(
     if requested.kind is TargetedEditorialRevisionPlacementKind.AFTER_PARAGRAPH:
         anchor_id = requested.anchor_block_id
         if (
-            targeted_request.operation is not TargetedEditorialRevisionOperation.CREATE_TABLE
+            targeted_request.operation
+            not in {
+                TargetedEditorialRevisionOperation.CREATE_TABLE,
+                TargetedEditorialRevisionOperation.CREATE_BAR_CHART,
+            }
             or anchor_id is None
             or evidence_pack.registered_anchor_ids is None
             or anchor_id not in evidence_pack.registered_anchor_ids

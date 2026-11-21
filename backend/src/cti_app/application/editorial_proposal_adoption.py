@@ -232,6 +232,7 @@ class EnrichmentCandidateInputs:
     metadata_extra: Mapping[str, Any] | None = None
     resource_search_enabled: bool = False
     diagram_materializer: DiagramMaterializer | None = None
+    compiled_chart_asset: Mapping[str, object] | None = None
 
 
 class EditorialProposalAdoptionInputs(Protocol):
@@ -691,6 +692,22 @@ class EditorialProposalAdoptionService:
                 synthesis=enrichment_inputs.synthesis,
                 figure_catalog=enrichment_inputs.figure_catalog,
             )
+            if operation is TargetedEditorialRevisionOperation.CREATE_BAR_CHART:
+                asset = enrichment_inputs.compiled_chart_asset
+                if (
+                    not isinstance(asset, Mapping)
+                    or dict(asset) != patch.get("compiled_chart_asset")
+                    or len(validated_patch.charts) != 1
+                ):
+                    raise EditorialProposalAdoptionError("proposal_patch_invalid")
+                try:
+                    asset_id = UUID(str(asset["asset_id"]))
+                except (KeyError, TypeError, ValueError):
+                    raise EditorialProposalAdoptionError("proposal_patch_invalid") from None
+                validated_patch = replace(
+                    validated_patch,
+                    charts=(replace(validated_patch.charts[0], compiled_asset_id=asset_id),),
+                )
             assert_adoption_rewrite_table_placement(
                 base_enrichment=enrichment_inputs.base_enrichment,
                 candidate=validated_patch,
@@ -1135,15 +1152,24 @@ def _proposal_stage(
     if target_kind == TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT.value:
         stage = ProductionArtifactStage.EDITORIAL_ENRICHMENT
         placement = target.get("placement")
-        is_paragraph_table_create = (
-            proposal.operation == TargetedEditorialRevisionOperation.CREATE_TABLE.value
-            and target.get("element_kind") == EditorialEnrichmentElementKind.TABLE.value
+        is_paragraph_enrichment_create = (
+            proposal.operation
+            in {
+                TargetedEditorialRevisionOperation.CREATE_TABLE.value,
+                TargetedEditorialRevisionOperation.CREATE_BAR_CHART.value,
+            }
+            and target.get("element_kind")
+            == (
+                EditorialEnrichmentElementKind.TABLE.value
+                if proposal.operation == TargetedEditorialRevisionOperation.CREATE_TABLE.value
+                else EditorialEnrichmentElementKind.CHART.value
+            )
             and target.get("element_key") is None
             and isinstance(placement, Mapping)
             and placement.get("kind") == "after_paragraph"
             and str(placement.get("anchor_block_id")) == str(proposal.occurrence_id)
         )
-        if is_paragraph_table_create:
+        if is_paragraph_enrichment_create:
             if (
                 resolution.entry is None
                 or resolution.entry.source_stage is not EditorialSourceStage.SYNTHESIS
@@ -1182,7 +1208,10 @@ def _proposal_pins_match(
         or not _proposal_fences_match_record(proposal, record)
     ):
         return False
-    if proposal.operation == TargetedEditorialRevisionOperation.CREATE_TABLE.value:
+    if proposal.operation in {
+        TargetedEditorialRevisionOperation.CREATE_TABLE.value,
+        TargetedEditorialRevisionOperation.CREATE_BAR_CHART.value,
+    }:
         return (
             resolution.entry.source_stage is EditorialSourceStage.SYNTHESIS
             and resolution.entry.kind.value in {"paragraph", "lead_paragraph"}

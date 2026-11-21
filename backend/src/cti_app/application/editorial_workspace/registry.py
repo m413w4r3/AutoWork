@@ -378,6 +378,7 @@ def allowed_operations(
     canonical_content: Mapping[str, Any],
     *,
     allow_table_insertion: bool = False,
+    allow_bar_chart_insertion: bool = False,
 ) -> tuple[str, ...]:
     if entry.source_stage != "synthesis":
         return ()
@@ -387,6 +388,11 @@ def allowed_operations(
         EditorialBlockKind.PARAGRAPH,
     }:
         operations = (*operations, TargetedEditorialRevisionOperation.CREATE_TABLE.value)
+    if allow_bar_chart_insertion and entry.kind in {
+        EditorialBlockKind.LEAD_PARAGRAPH,
+        EditorialBlockKind.PARAGRAPH,
+    }:
+        operations = (*operations, TargetedEditorialRevisionOperation.CREATE_BAR_CHART.value)
     return operations
 
 
@@ -437,6 +443,11 @@ def table_insertion_preparation_ready(
     return True
 
 
+def bar_chart_insertion_preparation_ready(**kwargs: Any) -> bool:
+    """A bar chart shares the same verified anchor and enrichment pins as table insertion."""
+    return table_insertion_preparation_ready(**kwargs)
+
+
 def resolve_workspace_target(
     *,
     entry: BlockRegistryEntry,
@@ -454,17 +465,27 @@ def resolve_workspace_target(
     except (TypeError, ValueError) as exc:
         raise EditorialBlockMissingError("editorial_block_missing") from exc
     if operation not in operations:
-        if typed_operation is TargetedEditorialRevisionOperation.CREATE_TABLE and entry.kind in {
+        if typed_operation in {
+            TargetedEditorialRevisionOperation.CREATE_TABLE,
+            TargetedEditorialRevisionOperation.CREATE_BAR_CHART,
+        } and entry.kind in {
             EditorialBlockKind.LEAD_PARAGRAPH,
             EditorialBlockKind.PARAGRAPH,
         }:
             operations = (*operations, typed_operation.value)
         else:
             raise EditorialBlockMissingError("editorial_block_missing")
-    if typed_operation is TargetedEditorialRevisionOperation.CREATE_TABLE:
+    if typed_operation in {
+        TargetedEditorialRevisionOperation.CREATE_TABLE,
+        TargetedEditorialRevisionOperation.CREATE_BAR_CHART,
+    }:
         table_target = TargetedEditorialRevisionTarget(
             kind=TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT,
-            element_kind=EditorialEnrichmentElementKind.TABLE,
+            element_kind=(
+                EditorialEnrichmentElementKind.TABLE
+                if typed_operation is TargetedEditorialRevisionOperation.CREATE_TABLE
+                else EditorialEnrichmentElementKind.CHART
+            ),
             placement=TargetedEditorialRevisionPlacement(
                 kind=TargetedEditorialRevisionPlacementKind.AFTER_PARAGRAPH,
                 anchor_block_id=entry.block_id,
@@ -546,6 +567,12 @@ def project_blocks(
             and entry.source_stage is EditorialSourceStage.EDITORIAL_ENRICHMENT
             else None
         )
+        structured_chart = (
+            _project_structured_chart(value)
+            if entry.kind is EditorialBlockKind.CHART
+            and entry.source_stage is EditorialSourceStage.EDITORIAL_ENRICHMENT
+            else None
+        )
         operations = (
             allowed_operations(
                 entry,
@@ -553,6 +580,18 @@ def project_blocks(
                 allow_table_insertion=(
                     record is not None
                     and table_insertion_preparation_ready(
+                        record=record,
+                        entry=entry,
+                        synthesis_artifact=synthesis_artifact,
+                        synthesis_read_sha256=synthesis_read_sha256,
+                        enrichment_artifact=enrichment_artifact,
+                        enrichment_read_sha256=enrichment_read_sha256,
+                        anchor_registered=True,
+                    )
+                ),
+                allow_bar_chart_insertion=(
+                    record is not None
+                    and bar_chart_insertion_preparation_ready(
                         record=record,
                         entry=entry,
                         synthesis_artifact=synthesis_artifact,
@@ -589,6 +628,7 @@ def project_blocks(
             "text": text_value,
             "evidence_refs": evidence_refs,
             "table": structured_table,
+            "chart": structured_chart,
             "revision_target": {
                 "block_id": str(entry.block_id),
                 "legacy_target_id": legacy_target_id,
@@ -795,6 +835,43 @@ def _project_structured_table(value: Any) -> dict[str, object] | None:
         "evidence_refs": _project_evidence_refs(value),
         "anchor_block_id": anchor_block_id,
         "placement": placement_kind,
+    }
+
+
+def _project_structured_chart(value: Any) -> dict[str, object] | None:
+    if not isinstance(value, Mapping) or value.get("kind") != "bar":
+        return None
+    points = value.get("points")
+    placement = value.get("placement")
+    if not isinstance(points, list) or not isinstance(placement, Mapping):
+        return None
+    projected_points: list[dict[str, object]] = []
+    for point in points:
+        if not isinstance(point, Mapping) or not isinstance(point.get("value"), str):
+            return None
+        refs = _project_evidence_refs(point)
+        if not refs or not isinstance(point.get("label"), str):
+            return None
+        projected_points.append(
+            {
+                "label": point["label"],
+                "value": point["value"],
+                "evidence_refs": refs,
+            }
+        )
+    return {
+        "key": value.get("key"),
+        "kind": "bar",
+        "title": value.get("title"),
+        "caption": value.get("caption"),
+        "legend": list(
+            dict.fromkeys(point.get("series") for point in points if isinstance(point, Mapping))
+        ),
+        "category_axis_label": value.get("category_axis_label"),
+        "value_axis_label": value.get("value_axis_label"),
+        "unit": value.get("unit"),
+        "points": projected_points,
+        "anchor_block_id": placement.get("anchor_block_id"),
     }
 
 

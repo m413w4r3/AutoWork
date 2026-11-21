@@ -18,6 +18,7 @@ from cti_app.application.editorial_thread_common import decode_thread_request
 from cti_app.application.editorial_threads import EditorialThreadApplicationError
 from cti_app.application.editorial_workspace import EditorialWorkspaceService
 from cti_app.application.editorial_workspace.registry import (
+    bar_chart_insertion_preparation_ready,
     revision_target_path,
     table_insertion_preparation_ready,
 )
@@ -498,7 +499,7 @@ class EditorialDiscussionContextBuilder:
         can_check_table = (
             stage_value == "synthesis"
             and kind in {"paragraph", "lead_paragraph"}
-            and "create_table" in offered_operations
+            and bool({"create_table", "create_bar_chart"} & offered_operations)
             and synthesis_artifact is not None
             and synthesis_artifact.canonical_blob_id is not None
             and enrichment_artifact is not None
@@ -580,6 +581,19 @@ class EditorialDiscussionContextBuilder:
             offered_operations=offered_operations,
             paragraph_validation_ready=paragraph_evidence_context is not None,
             table_validation_ready=enrichment_proposal_context is not None,
+            bar_chart_validation_ready=(
+                enrichment_proposal_context is not None
+                and "create_bar_chart" in offered_operations
+                and bar_chart_insertion_preparation_ready(
+                    record=resolution.record,
+                    entry=resolution.entry,
+                    synthesis_artifact=synthesis_artifact,
+                    synthesis_read_sha256=synthesis_read_sha256,
+                    enrichment_artifact=enrichment_artifact,
+                    enrichment_read_sha256=enrichment_read_sha256,
+                    anchor_registered=anchor_registered,
+                )
+            ),
         )
 
         return _EditorialDiscussionContextBase(
@@ -733,6 +747,7 @@ def _supported_proposal_operations(
     offered_operations: set[str],
     paragraph_validation_ready: bool,
     table_validation_ready: bool = False,
+    bar_chart_validation_ready: bool = False,
 ) -> tuple[str, ...]:
     if stage != "synthesis":
         return ()
@@ -744,6 +759,8 @@ def _supported_proposal_operations(
             operations.append("rewrite_paragraph")
         if "create_table" in offered_operations and table_validation_ready:
             operations.append("create_table")
+        if "create_bar_chart" in offered_operations and bar_chart_validation_ready:
+            operations.append("create_bar_chart")
         return tuple(operations)
     return ()
 

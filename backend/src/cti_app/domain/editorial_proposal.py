@@ -11,6 +11,8 @@ from enum import StrEnum
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from cti_app.domain.production_editorial_enrichment import (
+    ChartKind,
+    ChartSpecV1,
     EnrichmentPlacementKind,
     TableSpecV1,
 )
@@ -87,10 +89,35 @@ class ManualTablePatch:
 
 
 @dataclass(frozen=True, slots=True)
+class ManualBarChartPatch:
+    """A typed, evidence-cited quantitative chart after a registered paragraph."""
+
+    anchor_block_id: UUID
+    chart: ChartSpecV1
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.anchor_block_id, UUID):
+            raise EditorialProposalError("proposal_patch_invalid")
+        if not isinstance(self.chart, ChartSpecV1) or self.chart.kind is not ChartKind.BAR:
+            raise EditorialProposalError("proposal_patch_invalid")
+        if (
+            self.chart.placement.kind is not EnrichmentPlacementKind.AFTER_PARAGRAPH
+            or self.chart.placement.anchor_block_id != self.anchor_block_id
+        ):
+            raise EditorialProposalError("editorial_anchor_stale")
+        if any(point.value is None or not point.evidence_refs for point in self.chart.points):
+            raise EditorialProposalError("manual_edit_new_fact_unadmitted")
+
+    @property
+    def operation(self) -> TargetedEditorialRevisionOperation:
+        return TargetedEditorialRevisionOperation.CREATE_BAR_CHART
+
+
+@dataclass(frozen=True, slots=True)
 class ManualPatch:
     """The persisted proposal origin for one validated typed manual patch."""
 
-    typed_patch: ManualTextPatch | ManualTablePatch
+    typed_patch: ManualTextPatch | ManualTablePatch | ManualBarChartPatch
 
 
 class EditorialProposalEventKind(StrEnum):

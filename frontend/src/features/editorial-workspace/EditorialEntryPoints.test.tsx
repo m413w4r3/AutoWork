@@ -62,6 +62,7 @@ const snapshot: EditorialWorkspaceSnapshot = {
       position: 0,
       text: "Synthetic editorial article",
       evidence_refs: [],
+      chart: null,
       revision_target: { block_id: titleId, legacy_target_id: null },
       before_hash: null,
       allowed_operations: [],
@@ -74,6 +75,7 @@ const snapshot: EditorialWorkspaceSnapshot = {
       position: 1,
       text: "Contexte",
       evidence_refs: [],
+      chart: null,
       revision_target: { block_id: headingId, legacy_target_id: null },
       before_hash: null,
       allowed_operations: ["rewrite_section", "delete_section"],
@@ -88,6 +90,7 @@ const snapshot: EditorialWorkspaceSnapshot = {
       evidence_refs: [
         { source_title: "Rapport synthétique", passage: "Contexte exact." },
       ],
+      chart: null,
       revision_target: { block_id: paragraphId, legacy_target_id: null },
       before_hash: null,
       allowed_operations: [
@@ -308,6 +311,7 @@ describe("atelier éditorial", () => {
       position: 3,
       text: "Figure synthétique",
       evidence_refs: [],
+      chart: null,
       revision_target: {
         block_id: "33333333-3333-4333-8333-333333333333",
         legacy_target_id: null,

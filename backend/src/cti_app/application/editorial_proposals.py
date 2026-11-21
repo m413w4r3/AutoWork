@@ -15,6 +15,7 @@ import traceback
 import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from io import BytesIO
 from typing import Any
@@ -49,6 +50,7 @@ from cti_app.application.editorial_workspace.registry import (
     resolve_occurrence,
     revision_target_path,
 )
+from cti_app.application.media_assets import MediaAssetStore, compile_and_store_charts
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_editorial_enrichment import (
@@ -56,6 +58,7 @@ from cti_app.application.production_editorial_enrichment import (
     TableProposalV1,
 )
 from cti_app.application.production_synthesis import (
+    _all_evidence_entries,
     _plain_text_violation,
     _technical_literals,
     parse_synthesis_proposal_wire,
@@ -70,6 +73,7 @@ from cti_app.domain.editorial_proposal import (
     EditorialProposalModelRun,
     EditorialProposalOrigin,
     EditorialProposalState,
+    ManualBarChartPatch,
     ManualPatch,
     ManualTablePatch,
     ManualTextPatch,
@@ -86,7 +90,14 @@ from cti_app.domain.model_conversations import ConversationTurnStatus
 from cti_app.domain.model_runs import ModelRunStatus
 from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
 from cti_app.domain.production_editorial_enrichment import (
+    BAR_CHART_INSUFFICIENT_DATA_MESSAGE,
+    MAX_BAR_CHART_ADJUSTED_EXPONENT,
+    MAX_BAR_CHART_SIGNIFICANT_DIGITS,
+    ChartKind,
+    ChartSpecV1,
+    EditorialEnrichmentElementKind,
     TableSpecV1,
+    bar_chart_evidence_contains_unit,
     normalize_analytic_question,
 )
 from cti_app.domain.production_editorial_revision import (
@@ -98,6 +109,8 @@ from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionTargetKind,
 )
 from cti_app.domain.production_synthesis import (
+    EvidenceKind,
+    ExtractionEvidenceRefV1,
     production_synthesis_from_json,
     production_synthesis_to_json,
 )
@@ -111,6 +124,7 @@ _EDITORIAL_UNSAFE_MARKUP = re.compile(
     r"|<\s*/?\s*[A-Za-z][A-Za-z0-9_.:-]*(?=\s|/?>)",
     re.IGNORECASE,
 )
+_BAR_NUMBER_TOKEN = re.compile(r"(?<![\w.])[-+]?(?:\d+(?:\.\d+)?|\.\d+)(?![\w.])")
 
 
 class EditorialTableDiagnosticReason(StrEnum):
@@ -129,10 +143,58 @@ class EditorialTableDiagnosticReason(StrEnum):
     EVIDENCE_UNADMITTED = "manual_table:evidence_unadmitted"
     TARGET_UNAVAILABLE = "manual_table:target_unavailable"
     ANCHOR_STALE = "manual_table:anchor_stale"
-    VALIDATOR_REJECTED = "manual_table:validator_rejected"
     PIN_STALE = "manual_table:pin_stale"
     ROW_WIDTH_MISMATCH = "manual_table:row_width_mismatch"
     REQUEST_SCHEMA_INVALID = "manual_table:request_schema_invalid"
+    VALIDATOR_REJECTED = "manual_table:validator_rejected"
+
+
+class EditorialBarChartDiagnosticReason(StrEnum):
+    REQUEST_INVALID = "manual_bar_chart:request_invalid"
+    ANCHOR_STALE = "manual_bar_chart:anchor_stale"
+    DEPENDENCIES_UNAVAILABLE = "manual_bar_chart:dependencies_unavailable"
+    EVIDENCE_UNADMITTED = "manual_bar_chart:evidence_unadmitted"
+    QUESTION_DUPLICATE = "manual_bar_chart:question_duplicate"
+    MARKUP_REJECTED = "manual_bar_chart:markup_rejected"
+    VALIDATOR_REJECTED = "manual_bar_chart:validator_rejected"
+    IDEMPOTENCY_CONFLICT = "manual_bar_chart:idempotency_conflict"
+
+
+def _manual_bar_chart_error_reason(code: str) -> EditorialBarChartDiagnosticReason:
+    return {
+        "editorial_anchor_stale": EditorialBarChartDiagnosticReason.ANCHOR_STALE,
+        "proposal_base_unavailable": (EditorialBarChartDiagnosticReason.DEPENDENCIES_UNAVAILABLE),
+        "proposal_workspace_unavailable": (
+            EditorialBarChartDiagnosticReason.DEPENDENCIES_UNAVAILABLE
+        ),
+        "manual_edit_new_fact_unadmitted": EditorialBarChartDiagnosticReason.EVIDENCE_UNADMITTED,
+        "bar_chart_insufficient_data": EditorialBarChartDiagnosticReason.EVIDENCE_UNADMITTED,
+        "manual_bar_chart_analytic_question_duplicate": (
+            EditorialBarChartDiagnosticReason.QUESTION_DUPLICATE
+        ),
+        "manual_edit_patch_invalid": EditorialBarChartDiagnosticReason.MARKUP_REJECTED,
+        "proposal_operation_unsupported": (
+            EditorialBarChartDiagnosticReason.DEPENDENCIES_UNAVAILABLE
+        ),
+    }.get(code, EditorialBarChartDiagnosticReason.VALIDATOR_REJECTED)
+
+
+def _manual_bar_chart_failure(
+    code: str,
+    reason: EditorialBarChartDiagnosticReason,
+    *,
+    frame: str | None = None,
+    validator_code: str | None = None,
+) -> EditorialProposalApplicationError:
+    if frame is None:
+        caller = sys._getframe(1)
+        frame = _frame_string(caller.f_code.co_filename, caller.f_lineno, caller.f_code.co_name)
+    return EditorialProposalApplicationError(
+        code,
+        reason=reason.value,
+        frame=frame,
+        validator_code=validator_code or code,
+    )
 
 
 def _frame_string(filename: str, lineno: int, function: str) -> str:
@@ -177,6 +239,88 @@ def _editorial_table_text_violation(table: TableSpecV1 | TableProposalV1) -> boo
             )
         )
     return any(_editorial_patch_text_violation(value) for value in text_values)
+
+
+def _editorial_bar_chart_text_violation(chart: ChartSpecV1) -> bool:
+    text_values = [
+        chart.key,
+        chart.title,
+        chart.category_axis_label or "",
+        chart.value_axis_label or "",
+        chart.unit or "",
+        *(point.label for point in chart.points),
+        *(point.series for point in chart.points),
+    ]
+    if chart.caption is not None:
+        text_values.append(chart.caption)
+    text_values.extend(
+        (
+            chart.purpose.question,
+            chart.purpose.available_data,
+            chart.purpose.comprehension_gain,
+            chart.purpose.scope,
+            chart.purpose.knowledge_limits,
+            chart.purpose.placement_reason,
+        )
+    )
+    return any(_editorial_patch_text_violation(value) for value in text_values)
+
+
+def _validate_bar_chart_evidence(
+    chart: ChartSpecV1,
+    *,
+    evidence_entries: Mapping[ExtractionEvidenceRefV1, Mapping[str, Any]],
+    admitted_refs: frozenset[ExtractionEvidenceRefV1],
+) -> None:
+    """Require every displayed number and unit in the cited admitted source record."""
+    if chart.kind is not ChartKind.BAR:
+        raise EditorialProposalApplicationError("proposal_operation_unsupported")
+    for point in chart.points:
+        if point.value is None or not point.evidence_refs:
+            raise _manual_bar_chart_failure(
+                "bar_chart_insufficient_data",
+                EditorialBarChartDiagnosticReason.EVIDENCE_UNADMITTED,
+                validator_code="bar_chart_value_missing",
+            )
+        if any(reference not in admitted_refs for reference in point.evidence_refs):
+            raise _manual_bar_chart_failure(
+                "bar_chart_insufficient_data",
+                EditorialBarChartDiagnosticReason.EVIDENCE_UNADMITTED,
+                validator_code="bar_chart_evidence_unadmitted",
+            )
+        value_is_documented = False
+        unit_is_documented = False
+        for reference in point.evidence_refs:
+            if reference.kind not in {EvidenceKind.FACT, EvidenceKind.EVENT}:
+                continue
+            payload = evidence_entries.get(reference)
+            if payload is None:
+                continue
+            value_fields = (
+                ("value", "evidence_quote")
+                if reference.kind is EvidenceKind.FACT
+                else ("text", "evidence_quote")
+            )
+            for field_name in value_fields:
+                text_value = payload.get(field_name)
+                if not isinstance(text_value, str):
+                    continue
+                unit_is_documented = unit_is_documented or bar_chart_evidence_contains_unit(
+                    chart.unit or "", text_value
+                )
+                for match in _BAR_NUMBER_TOKEN.finditer(text_value):
+                    try:
+                        observed = Decimal(match.group())
+                    except InvalidOperation:
+                        continue
+                    if observed.is_finite() and observed == point.value:
+                        value_is_documented = True
+        if not value_is_documented or not unit_is_documented:
+            raise _manual_bar_chart_failure(
+                "bar_chart_insufficient_data",
+                EditorialBarChartDiagnosticReason.EVIDENCE_UNADMITTED,
+                validator_code="bar_chart_value_not_evidenced",
+            )
 
 
 def _normalize_editorial_grounding_text(value: str) -> str:
@@ -382,6 +526,124 @@ def _manual_table_proposal_json(
             "placement_reason": purpose.placement_reason,
         },
     }
+
+
+def _manual_bar_chart_proposal_json(
+    chart: ChartSpecV1,
+    *,
+    point_handles: list[list[str]],
+    purpose_handles: list[str],
+) -> dict[str, object]:
+    purpose = chart.purpose
+    return {
+        "key": chart.key,
+        "kind": ChartKind.BAR.value,
+        "title": chart.title,
+        "caption": chart.caption,
+        "category_axis_label": chart.category_axis_label,
+        "value_axis_label": chart.value_axis_label,
+        "unit": chart.unit,
+        "placement": {
+            "kind": "after_paragraph",
+            "section_index": None,
+            "anchor_block_id": str(chart.placement.anchor_block_id),
+        },
+        "purpose": {
+            "question": purpose.question,
+            "available_data": purpose.available_data,
+            "comprehension_gain": purpose.comprehension_gain,
+            "scope": purpose.scope,
+            "evidence_handles": purpose_handles,
+            "knowledge_limits": purpose.knowledge_limits,
+            "placement_reason": purpose.placement_reason,
+        },
+        "points": [
+            {
+                "label": point.label,
+                "series": point.series,
+                "value": format(point.value, "f") if point.value is not None else None,
+                "evidence_handles": point_handles[index],
+            }
+            for index, point in enumerate(chart.points)
+        ],
+    }
+
+
+def _manual_bar_chart_domain_json(chart: ChartSpecV1) -> dict[str, object]:
+    return {
+        "key": chart.key,
+        "kind": ChartKind.BAR.value,
+        "title": chart.title,
+        "caption": chart.caption,
+        "placement": {
+            "kind": chart.placement.kind.value,
+            "section_index": chart.placement.section_index,
+            "anchor_block_id": str(chart.placement.anchor_block_id),
+        },
+        "purpose": {
+            "question": chart.purpose.question,
+            "available_data": chart.purpose.available_data,
+            "comprehension_gain": chart.purpose.comprehension_gain,
+            "scope": chart.purpose.scope,
+            "evidence_refs": [
+                _evidence_reference_json(reference) for reference in chart.purpose.evidence_refs
+            ],
+            "knowledge_limits": chart.purpose.knowledge_limits,
+            "placement_reason": chart.purpose.placement_reason,
+        },
+        "points": [
+            {
+                "label": point.label,
+                "series": point.series,
+                "value": format(point.value, "f") if point.value is not None else None,
+                "evidence_refs": [
+                    _evidence_reference_json(reference) for reference in point.evidence_refs
+                ],
+            }
+            for point in chart.points
+        ],
+        "category_axis_label": chart.category_axis_label,
+        "value_axis_label": chart.value_axis_label,
+        "unit": chart.unit,
+    }
+
+
+def _manual_bar_chart_evidence_handles(
+    chart: ChartSpecV1, *, handles_by_ref: Mapping[Any, str]
+) -> tuple[list[list[str]], list[dict[str, object]]]:
+    point_handles: list[list[str]] = []
+    refs: list[dict[str, object]] = []
+    for point in chart.points:
+        handles = [handles_by_ref.get(reference) for reference in point.evidence_refs]
+        if not handles or any(handle is None for handle in handles):
+            raise EditorialProposalApplicationError(
+                "manual_edit_new_fact_unadmitted", validator_code="bar_chart_evidence_unadmitted"
+            )
+        point_handles.append([str(handle) for handle in handles])
+        refs.extend(_evidence_reference_json(reference) for reference in point.evidence_refs)
+    purpose_handles = [handles_by_ref.get(reference) for reference in chart.purpose.evidence_refs]
+    if not purpose_handles or any(handle is None for handle in purpose_handles):
+        raise EditorialProposalApplicationError(
+            "manual_edit_new_fact_unadmitted", validator_code="bar_chart_evidence_unadmitted"
+        )
+    refs.extend(_evidence_reference_json(reference) for reference in chart.purpose.evidence_refs)
+    return point_handles, refs
+
+
+def _manual_bar_chart_request_sha256(
+    *, subject_id: UUID, snapshot_id: UUID, occurrence_id: UUID, chart: ChartSpecV1
+) -> str:
+    return hashlib.sha256(
+        ProductionArtifactStore.canonical_json_bytes(
+            {
+                "subject_id": str(subject_id),
+                "snapshot_id": str(snapshot_id),
+                "occurrence_id": str(occurrence_id),
+                "operation": TargetedEditorialRevisionOperation.CREATE_BAR_CHART.value,
+                "chart": _manual_bar_chart_domain_json(chart),
+            }
+        )
+    ).hexdigest()
 
 
 def _manual_table_evidence_handles(
@@ -590,6 +852,25 @@ def _manual_table_validation_diagnostics(
     code: str,
 ) -> dict[str, object]:
     if (
+        preparation.origin is EditorialProposalOrigin.MANUAL_PATCH
+        and preparation.operation is TargetedEditorialRevisionOperation.CREATE_BAR_CHART
+    ):
+        reason = _manual_bar_chart_error_reason(code)
+        frame = (
+            getattr(error, "frame", None) or _exception_origin_frame(error)
+            if error is not None
+            else None
+        )
+        if frame is None:
+            caller = sys._getframe(1)
+            frame = _frame_string(caller.f_code.co_filename, caller.f_lineno, caller.f_code.co_name)
+        return {
+            "code": code,
+            "reason": reason.value,
+            "validator_code": _manual_table_validator_code(error, fallback=code),
+            "frame": frame,
+        }
+    if (
         preparation.origin is not EditorialProposalOrigin.MANUAL_PATCH
         or preparation.operation is not TargetedEditorialRevisionOperation.CREATE_TABLE
     ):
@@ -657,6 +938,27 @@ def _manual_table_failure_from_diagnostics(
     code: str,
     diagnostics: Mapping[str, object],
 ) -> EditorialProposalApplicationError:
+    if (
+        preparation.origin is EditorialProposalOrigin.MANUAL_PATCH
+        and preparation.operation is TargetedEditorialRevisionOperation.CREATE_BAR_CHART
+    ):
+        raw_reason = diagnostics.get("reason")
+        try:
+            reason = EditorialBarChartDiagnosticReason(str(raw_reason))
+        except ValueError:
+            reason = _manual_bar_chart_error_reason(code)
+        validator_code = diagnostics.get("validator_code")
+        return _manual_bar_chart_failure(
+            code,
+            reason,
+            frame=diagnostics.get("frame") if isinstance(diagnostics.get("frame"), str) else None,
+            validator_code=(
+                validator_code
+                if isinstance(validator_code, str)
+                and re.fullmatch(r"[a-z][a-z0-9_]{2,}", validator_code)
+                else code
+            ),
+        )
     if (
         preparation.origin is not EditorialProposalOrigin.MANUAL_PATCH
         or preparation.operation is not TargetedEditorialRevisionOperation.CREATE_TABLE
@@ -759,12 +1061,16 @@ class EditorialProposalService:
         artifact_store: ProductionArtifactStore | None = None,
         workspace_service: Any | None = None,
         discussion_context_builder: Any | None = None,
+        chart_compiler: Any | None = None,
+        media_asset_store: MediaAssetStore | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._blob_store = blob_store
         self._artifact_store = artifact_store
         self._workspace_service = workspace_service
         self._discussion_context_builder = discussion_context_builder
+        self._chart_compiler = chart_compiler
+        self._media_asset_store = media_asset_store
 
     async def prepare_thread_turn(
         self,
@@ -787,6 +1093,7 @@ class EditorialProposalService:
             TargetedEditorialRevisionOperation.REWRITE_TITLE.value,
             TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH.value,
             TargetedEditorialRevisionOperation.CREATE_TABLE.value,
+            TargetedEditorialRevisionOperation.CREATE_BAR_CHART.value,
         }
         if not allowed_operations <= supported_operations:
             raise EditorialProposalApplicationError("proposal_operation_unsupported")
@@ -830,23 +1137,34 @@ class EditorialProposalService:
             ) from None
         record = resolved.record
         table_context = context.proposal_enrichment_context
-        is_table = operation is TargetedEditorialRevisionOperation.CREATE_TABLE
-        if is_table and (
+        is_enrichment_insertion = operation in {
+            TargetedEditorialRevisionOperation.CREATE_TABLE,
+            TargetedEditorialRevisionOperation.CREATE_BAR_CHART,
+        }
+        if is_enrichment_insertion and (
             table_context is None
             or table_context.get("anchor_block_id") != str(origin.occurrence_id)
         ):
             raise EditorialProposalApplicationError("proposal_operation_unsupported")
         base_artifact_id = (
-            record.enrichment_artifact_id if is_table else record.synthesis_artifact_id
+            record.enrichment_artifact_id
+            if is_enrichment_insertion
+            else record.synthesis_artifact_id
         )
-        base_artifact_version = record.enrichment_version if is_table else record.synthesis_version
-        base_input_hash = record.enrichment_input_hash if is_table else record.synthesis_input_hash
+        base_artifact_version = (
+            record.enrichment_version if is_enrichment_insertion else record.synthesis_version
+        )
+        base_input_hash = (
+            record.enrichment_input_hash if is_enrichment_insertion else record.synthesis_input_hash
+        )
         base_sha256 = (
-            record.enrichment_canonical_sha256 if is_table else record.synthesis_canonical_sha256
+            record.enrichment_canonical_sha256
+            if is_enrichment_insertion
+            else record.synthesis_canonical_sha256
         )
         base_content = (
             table_context.get("base_content")
-            if is_table and table_context is not None
+            if is_enrichment_insertion and table_context is not None
             else resolved.canonical_content
         )
         if (
@@ -897,7 +1215,7 @@ class EditorialProposalService:
             instruction=instruction,
             strict_wire=True,
             paragraph_evidence_context=context.paragraph_evidence_context,
-            enrichment_context=table_context if is_table else None,
+            enrichment_context=table_context if is_enrichment_insertion else None,
         )
         return await self.prepare_bridge_result(preparation)
 
@@ -919,11 +1237,17 @@ class EditorialProposalService:
         """Persist a validated manual text patch without creating a model run."""
         typed_patch = patch.typed_patch
         is_manual_table = isinstance(typed_patch, ManualTablePatch)
+        is_manual_bar_chart = isinstance(typed_patch, ManualBarChartPatch)
         if not _IDEMPOTENCY_KEY.fullmatch(idempotency_key):
             if is_manual_table:
                 raise _manual_table_failure(
                     "idempotency_key_invalid",
                     EditorialTableDiagnosticReason.IDEMPOTENCY_KEY_INVALID,
+                )
+            if is_manual_bar_chart:
+                raise _manual_bar_chart_failure(
+                    "idempotency_key_invalid",
+                    EditorialBarChartDiagnosticReason.REQUEST_INVALID,
                 )
             raise EditorialProposalApplicationError("idempotency_key_invalid")
         if self._workspace_service is None:
@@ -932,10 +1256,24 @@ class EditorialProposalService:
                     "proposal_workspace_unavailable",
                     EditorialTableDiagnosticReason.DEPENDENCIES_UNAVAILABLE,
                 )
+            if is_manual_bar_chart:
+                raise _manual_bar_chart_failure(
+                    "proposal_workspace_unavailable",
+                    EditorialBarChartDiagnosticReason.DEPENDENCIES_UNAVAILABLE,
+                )
             raise EditorialProposalApplicationError("proposal_workspace_unavailable")
 
         if isinstance(typed_patch, ManualTablePatch):
             return await self._prepare_manual_table_patch(
+                subject_id=subject_id,
+                snapshot_id=snapshot_id,
+                occurrence_id=occurrence_id,
+                actor_id=actor_id,
+                idempotency_key=idempotency_key,
+                typed_patch=typed_patch,
+            )
+        if isinstance(typed_patch, ManualBarChartPatch):
+            return await self._prepare_manual_bar_chart_patch(
                 subject_id=subject_id,
                 snapshot_id=snapshot_id,
                 occurrence_id=occurrence_id,
@@ -1290,6 +1628,164 @@ class EditorialProposalService:
         )
         return await self._prepare_result(preparation, reject_invalid_manual=True)
 
+    async def _prepare_manual_bar_chart_patch(
+        self,
+        *,
+        subject_id: UUID,
+        snapshot_id: UUID,
+        occurrence_id: UUID,
+        actor_id: UUID,
+        idempotency_key: str,
+        typed_patch: ManualBarChartPatch,
+    ) -> EditorialProposal:
+        chart = typed_patch.chart
+        if (
+            self._discussion_context_builder is None
+            or self._artifact_store is None
+            or self._workspace_service is None
+        ):
+            raise EditorialProposalApplicationError("proposal_base_unavailable")
+        if occurrence_id != typed_patch.anchor_block_id:
+            raise EditorialProposalApplicationError("editorial_anchor_stale")
+        if _editorial_bar_chart_text_violation(chart):
+            raise EditorialProposalApplicationError(
+                "manual_edit_patch_invalid", validator_code="bar_chart_markup_forbidden"
+            )
+        if (
+            len(ProductionArtifactStore.canonical_json_bytes(_manual_bar_chart_domain_json(chart)))
+            > _MAX_PATCH_BYTES
+        ):
+            raise EditorialProposalApplicationError("manual_edit_request_too_large")
+
+        preparation_key = _manual_idempotency_key("prepare", idempotency_key)
+        request_sha256 = _manual_bar_chart_request_sha256(
+            subject_id=subject_id,
+            snapshot_id=snapshot_id,
+            occurrence_id=occurrence_id,
+            chart=chart,
+        )
+        async with self._uow_factory() as uow:
+            existing = await uow.editorial_proposals.get_by_idempotency_key(
+                subject_id, actor_id, preparation_key
+            )
+        if existing is not None:
+            if existing.request_sha256 != request_sha256:
+                raise EditorialProposalConflict("proposal_idempotency_conflict")
+            return existing
+
+        try:
+            context = await self._discussion_context_builder.build_manual(subject_id, occurrence_id)
+        except Exception as error:
+            raise EditorialProposalApplicationError(
+                "proposal_base_unavailable", frame=_exception_origin_frame(error)
+            ) from None
+        if (
+            context.proposal_snapshot_id != snapshot_id
+            or context.proposal_enrichment_context is None
+            or "create_bar_chart" not in context.proposal_operations
+        ):
+            raise EditorialProposalApplicationError("proposal_operation_unsupported")
+        enrichment_context = context.proposal_enrichment_context
+        base_content = enrichment_context.get("base_content")
+        if not isinstance(base_content, Mapping):
+            raise EditorialProposalApplicationError("proposal_base_unavailable")
+        if _manual_table_question_conflicts_with_base(chart.purpose.question, base_content):
+            raise EditorialProposalApplicationError(
+                "manual_bar_chart_analytic_question_duplicate",
+                validator_code="bar_chart_question_duplicate",
+            )
+        evidence_pack = enrichment_context.get("evidence_pack")
+        extraction = enrichment_context.get("extraction")
+        if evidence_pack is None or extraction is None:
+            raise EditorialProposalApplicationError("proposal_base_unavailable")
+        handles_by_ref = {
+            reference: handle
+            for handle, reference in getattr(evidence_pack, "_handle_to_ref", {}).items()
+        }
+        point_handles, refs = _manual_bar_chart_evidence_handles(
+            chart, handles_by_ref=handles_by_ref
+        )
+        _validate_bar_chart_evidence(
+            chart,
+            evidence_entries=_all_evidence_entries(extraction),
+            admitted_refs=frozenset(handles_by_ref),
+        )
+        purpose_handles = [handles_by_ref[reference] for reference in chart.purpose.evidence_refs]
+
+        resolved = await self._workspace_service.resolve_revision_target(
+            subject_id=subject_id,
+            snapshot_id=snapshot_id,
+            block_id=occurrence_id,
+            operation=TargetedEditorialRevisionOperation.CREATE_BAR_CHART.value,
+        )
+        record = resolved.record
+        anchor_entry = resolved.occurrence.entry
+        if (
+            anchor_entry is None
+            or resolved.occurrence.binding_state != "valid"
+            or anchor_entry.kind not in {"paragraph", "lead_paragraph"}
+            or enrichment_context.get("anchor_block_id") != str(occurrence_id)
+            or enrichment_context.get("target_path") != revision_target_path(anchor_entry)
+            or enrichment_context.get("base_artifact_id") != str(record.enrichment_artifact_id)
+            or enrichment_context.get("base_artifact_version") != record.enrichment_version
+            or enrichment_context.get("base_input_hash") != record.enrichment_input_hash
+            or enrichment_context.get("base_canonical_sha256") != record.enrichment_canonical_sha256
+            or chart.placement.anchor_block_id != occurrence_id
+        ):
+            raise EditorialProposalApplicationError("editorial_anchor_stale")
+        raw_chart = _manual_bar_chart_proposal_json(
+            chart,
+            point_handles=point_handles,
+            purpose_handles=[str(handle) for handle in purpose_handles],
+        )
+        raw_patch: dict[str, object] = {
+            "tables": [],
+            "charts": [raw_chart],
+            "diagrams": [],
+            "annotations": [],
+            "figures": [],
+            "resource_needs": [],
+        }
+        raw_response = _manual_wire_response(
+            target_path=revision_target_path(anchor_entry),
+            operation=TargetedEditorialRevisionOperation.CREATE_BAR_CHART,
+            base_sha256=record.enrichment_canonical_sha256 or "",
+            before_hash=resolved.before_hash,
+            after=json.dumps(raw_patch, ensure_ascii=True, separators=(",", ":")),
+        )
+        preparation = EditorialProposalPreparation(
+            subject_id=subject_id,
+            production_run_id=record.production_run_id,
+            snapshot_id=snapshot_id,
+            occurrence_id=occurrence_id,
+            thread_id=None,
+            base_artifact_id=record.enrichment_artifact_id,
+            base_artifact_version=record.enrichment_version,
+            base_input_hash=record.enrichment_input_hash,
+            base_canonical_sha256=record.enrichment_canonical_sha256,
+            base_pin_hash=record.workspace_pin_hash,
+            routing_decision_hash=record.routing_decision_hash,
+            target_id=resolved.target_id,
+            target=resolved.target,
+            operation=TargetedEditorialRevisionOperation.CREATE_BAR_CHART,
+            before_hash=resolved.before_hash,
+            base_content=base_content,
+            raw_response=raw_response,
+            model_run_id=None,
+            model_turn_id=None,
+            actor_id=actor_id,
+            idempotency_key=preparation_key,
+            request_sha256=request_sha256,
+            evidence_refs=tuple(refs),
+            instruction="Manual typed evidence-backed bar chart insertion",
+            requester=str(actor_id),
+            enrichment_context=enrichment_context,
+            strict_wire=True,
+            origin=EditorialProposalOrigin.MANUAL_PATCH,
+            manual_patch=ManualPatch(typed_patch=typed_patch),
+        )
+        return await self._prepare_result(preparation, reject_invalid_manual=True)
+
     async def _prepare_result(
         self,
         preparation: EditorialProposalPreparation,
@@ -1305,6 +1801,14 @@ class EditorialProposalService:
                     "idempotency_key_invalid",
                     EditorialTableDiagnosticReason.IDEMPOTENCY_KEY_INVALID,
                 )
+            if (
+                preparation.origin is EditorialProposalOrigin.MANUAL_PATCH
+                and preparation.operation is TargetedEditorialRevisionOperation.CREATE_BAR_CHART
+            ):
+                raise _manual_bar_chart_failure(
+                    "idempotency_key_invalid",
+                    EditorialBarChartDiagnosticReason.REQUEST_INVALID,
+                )
             raise EditorialProposalApplicationError("idempotency_key_invalid")
         try:
             preparation = await self._resolve_authoritative_preparation(preparation)
@@ -1318,8 +1822,18 @@ class EditorialProposalService:
                     _manual_table_error_reason(error.code),
                     frame=error.frame or _exception_origin_frame(error),
                 ) from error
+            if (
+                preparation.origin is EditorialProposalOrigin.MANUAL_PATCH
+                and preparation.operation is TargetedEditorialRevisionOperation.CREATE_BAR_CHART
+            ):
+                raise _manual_bar_chart_failure(
+                    error.code,
+                    _manual_bar_chart_error_reason(error.code),
+                    frame=error.frame or _exception_origin_frame(error),
+                    validator_code=error.validator_code or error.code,
+                ) from error
             raise
-        patch_payload, state, kind, diagnostics = self._validate_result(preparation)
+        patch_payload, state, kind, diagnostics = await self._validate_result(preparation)
         if reject_invalid_manual and state is not EditorialProposalState.PROPOSED:
             code = str(diagnostics.get("code", "proposal_patch_invalid"))
             if code in {
@@ -1427,8 +1941,12 @@ class EditorialProposalService:
             raise EditorialProposalApplicationError(code, reason=reason) from error
 
         record = resolved.record
-        is_table_insertion = (
-            preparation.operation is TargetedEditorialRevisionOperation.CREATE_TABLE
+        is_enrichment_insertion = (
+            preparation.operation
+            in {
+                TargetedEditorialRevisionOperation.CREATE_TABLE,
+                TargetedEditorialRevisionOperation.CREATE_BAR_CHART,
+            }
             and preparation.target.kind is TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT
         )
         if record.snapshot_id != preparation.snapshot_id:
@@ -1452,50 +1970,52 @@ class EditorialProposalService:
                 "proposal_base_stale", reason="routing:decision_hash"
             )
         expected_artifact_id = (
-            record.enrichment_artifact_id if is_table_insertion else record.synthesis_artifact_id
+            record.enrichment_artifact_id
+            if is_enrichment_insertion
+            else record.synthesis_artifact_id
         )
         expected_artifact_version = (
-            record.enrichment_version if is_table_insertion else record.synthesis_version
+            record.enrichment_version if is_enrichment_insertion else record.synthesis_version
         )
         expected_input_hash = (
-            record.enrichment_input_hash if is_table_insertion else record.synthesis_input_hash
+            record.enrichment_input_hash if is_enrichment_insertion else record.synthesis_input_hash
         )
         expected_sha256 = (
             record.enrichment_canonical_sha256
-            if is_table_insertion
+            if is_enrichment_insertion
             else record.synthesis_canonical_sha256
         )
         if expected_artifact_id != preparation.base_artifact_id:
             raise EditorialProposalApplicationError(
                 "proposal_base_stale",
                 reason="pins:enrichment_artifact_id"
-                if is_table_insertion
+                if is_enrichment_insertion
                 else "pins:synthesis_artifact_id",
             )
         if expected_artifact_version != preparation.base_artifact_version:
             raise EditorialProposalApplicationError(
                 "proposal_base_stale",
                 reason="pins:enrichment_version"
-                if is_table_insertion
+                if is_enrichment_insertion
                 else "pins:synthesis_version",
             )
         if expected_input_hash != preparation.base_input_hash:
             raise EditorialProposalApplicationError(
                 "proposal_base_stale",
                 reason="pins:enrichment_input_hash"
-                if is_table_insertion
+                if is_enrichment_insertion
                 else "pins:synthesis_input_hash",
             )
         if expected_sha256 != preparation.base_canonical_sha256:
             raise EditorialProposalApplicationError(
                 "proposal_base_stale",
                 reason="pins:enrichment_canonical_sha256"
-                if is_table_insertion
+                if is_enrichment_insertion
                 else "pins:synthesis_canonical_sha256",
             )
 
         authoritative_content: Mapping[str, Any] = resolved.canonical_content
-        if is_table_insertion:
+        if is_enrichment_insertion:
             if (
                 preparation.target.placement is None
                 or preparation.target.placement.anchor_block_id != preparation.occurrence_id
@@ -2108,7 +2628,7 @@ class EditorialProposalService:
             # The original persistence or verification failure remains authoritative.
             return
 
-    def _validate_result(
+    async def _validate_result(
         self, preparation: EditorialProposalPreparation
     ) -> tuple[
         dict[str, object] | None,
@@ -2142,18 +2662,26 @@ class EditorialProposalService:
             and preparation.target.element_kind is not None
             and preparation.target.element_kind.value == "table"
         )
-        if preparation.strict_wire and typed_table_patch:
+        typed_bar_chart_patch = (
+            preparation.operation is TargetedEditorialRevisionOperation.CREATE_BAR_CHART
+            and preparation.target.kind is TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT
+            and preparation.target.element_kind is EditorialEnrichmentElementKind.CHART
+        )
+        if preparation.strict_wire and (typed_table_patch or typed_bar_chart_patch):
             try:
                 typed_proposal = EditorialEnrichmentProposalV1.model_validate(
                     json.loads(patch.after)
                 )
             except (TypeError, ValueError):
                 typed_proposal = None
-            if (
-                typed_proposal is not None
-                and len(typed_proposal.tables) == 1
+            markup_violation = typed_proposal is not None and (
+                len(typed_proposal.tables) == 1
                 and _editorial_table_text_violation(typed_proposal.tables[0])
-            ):
+                if typed_table_patch
+                else len(typed_proposal.charts) == 1
+                and _editorial_bar_chart_text_violation(typed_proposal.charts[0])
+            )
+            if markup_violation:
                 return (
                     None,
                     EditorialProposalState.NEEDS_REVIEW,
@@ -2167,6 +2695,7 @@ class EditorialProposalService:
             if (
                 preparation.operation is TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH
                 or typed_table_patch
+                or typed_bar_chart_patch
             )
             else (patch.after, patch.rationale)
         )
@@ -2192,7 +2721,7 @@ class EditorialProposalService:
                     "proposal_base_stale", reason="patch:base_hash"
                 )
             if preparation.target.kind is TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT:
-                return self._validate_enrichment_result(preparation, patch)
+                return await self._validate_enrichment_result(preparation, patch)
             resolved = resolve_target(
                 preparation.base_content, preparation.target, preparation.operation
             )
@@ -2434,7 +2963,7 @@ class EditorialProposalService:
             {},
         )
 
-    def _validate_enrichment_result(
+    async def _validate_enrichment_result(
         self, preparation: EditorialProposalPreparation, patch: Any
     ) -> tuple[
         dict[str, object] | None,
@@ -2466,6 +2995,68 @@ class EditorialProposalService:
         )
         raw = json.loads(patch.after)
         create_table = preparation.operation is TargetedEditorialRevisionOperation.CREATE_TABLE
+        create_bar_chart = (
+            preparation.operation is TargetedEditorialRevisionOperation.CREATE_BAR_CHART
+        )
+
+        def refuse_bar_chart_for_insufficient_data() -> tuple[
+            None,
+            EditorialProposalState,
+            EditorialProposalEventKind,
+            dict[str, str],
+        ]:
+            return (
+                None,
+                EditorialProposalState.REFUSED,
+                EditorialProposalEventKind.REFUSED,
+                {
+                    "code": "bar_chart_insufficient_data",
+                    "message": BAR_CHART_INSUFFICIENT_DATA_MESSAGE,
+                },
+            )
+
+        if create_bar_chart:
+            raw_charts = raw.get("charts") if isinstance(raw, dict) else None
+            points = (
+                raw_charts[0].get("points")
+                if isinstance(raw_charts, list)
+                and len(raw_charts) == 1
+                and isinstance(raw_charts[0], dict)
+                else None
+            )
+            admitted_handles = getattr(context.get("evidence_pack"), "_handle_to_ref", {})
+            if not isinstance(points, list) or len(points) < 2:
+                return refuse_bar_chart_for_insufficient_data()
+            for point in points:
+                if not isinstance(point, Mapping):
+                    return refuse_bar_chart_for_insufficient_data()
+                raw_value = point.get("value")
+                try:
+                    value = (
+                        Decimal(str(raw_value))
+                        if isinstance(raw_value, str) or type(raw_value) in {int, float}
+                        else None
+                    )
+                except InvalidOperation:
+                    value = None
+                handles = point.get("evidence_handles")
+                if (
+                    value is None
+                    or not value.is_finite()
+                    or not isinstance(handles, list)
+                    or not handles
+                    or any(
+                        not isinstance(handle, str) or handle not in admitted_handles
+                        for handle in handles
+                    )
+                ):
+                    return refuse_bar_chart_for_insufficient_data()
+                normalized_value = value.normalize() if value else Decimal(0)
+                if (
+                    len(normalized_value.as_tuple().digits) > MAX_BAR_CHART_SIGNIFICANT_DIGITS
+                    or abs(normalized_value.adjusted()) > MAX_BAR_CHART_ADJUSTED_EXPONENT
+                ):
+                    return refuse_bar_chart_for_insufficient_data()
         table_key = None
         if create_table:
             tables = raw.get("tables") if isinstance(raw, dict) else None
@@ -2483,16 +3074,48 @@ class EditorialProposalService:
                 or not isinstance(table_key, str)
             ):
                 raise EditorialProposalApplicationError("proposal_target_mismatch")
-        candidate = validate_editorial_enrichment_patch(
-            raw,
-            element_kind=preparation.target.element_kind,
-            element_key=(table_key if create_table else preparation.target.element_key)
-            or "new-element",
-            evidence_pack=context["evidence_pack"],
-            extraction=context["extraction"],
-            synthesis=context["synthesis"],
-            figure_catalog=tuple(context.get("figure_catalog", ())),
-        )
+        chart_key = None
+        if create_bar_chart:
+            charts = raw.get("charts") if isinstance(raw, dict) else None
+            chart_key = (
+                charts[0].get("key")
+                if isinstance(charts, list) and len(charts) == 1 and isinstance(charts[0], dict)
+                else None
+            )
+            if (
+                preparation.target.element_kind is not EditorialEnrichmentElementKind.CHART
+                or preparation.target.element_key is not None
+                or preparation.target.placement is None
+                or preparation.target.placement.anchor_block_id != preparation.occurrence_id
+                or patch.target != context.get("target_path")
+                or not isinstance(chart_key, str)
+            ):
+                raise EditorialProposalApplicationError("proposal_target_mismatch")
+        try:
+            candidate = validate_editorial_enrichment_patch(
+                raw,
+                element_kind=preparation.target.element_kind,
+                element_key=(
+                    table_key
+                    if create_table
+                    else chart_key
+                    if create_bar_chart
+                    else preparation.target.element_key
+                )
+                or "new-element",
+                evidence_pack=context["evidence_pack"],
+                extraction=context["extraction"],
+                synthesis=context["synthesis"],
+                figure_catalog=tuple(context.get("figure_catalog", ())),
+            )
+        except EditorialEnrichmentRevisionValidationError as error:
+            if create_bar_chart and any(
+                rejection.get("diagnostic_code")
+                in {"bar_chart_value_not_finite", "bar_chart_value_not_evidenced"}
+                for rejection in error.rejections
+            ):
+                return refuse_bar_chart_for_insufficient_data()
+            raise
         if create_table and (len(candidate.tables) != 1 or candidate.tables[0].key != table_key):
             raise EditorialProposalApplicationError(
                 "proposal_patch_invalid",
@@ -2500,12 +3123,20 @@ class EditorialProposalService:
                     _dropped_table_validator_code(candidate.warnings) or "proposal_patch_invalid"
                 ),
             )
+        if create_bar_chart and (
+            len(candidate.charts) != 1
+            or candidate.charts[0].kind is not ChartKind.BAR
+            or candidate.charts[0].key != chart_key
+        ):
+            return refuse_bar_chart_for_insufficient_data()
         assert_requested_placement(
             candidate=candidate,
             element_kind=preparation.target.element_kind,
             targeted_request=request,
             synthesis=context["synthesis"],
-            evidence_pack=context.get("evidence_pack") if create_table else None,
+            evidence_pack=context.get("evidence_pack")
+            if create_table or create_bar_chart
+            else None,
         )
         evidence_refs: list[dict[str, object]] = []
         if create_table:
@@ -2521,6 +3152,47 @@ class EditorialProposalService:
             evidence_refs.extend(
                 _evidence_reference_json(reference) for reference in purpose.evidence_refs
             )
+        compiled_chart_asset: dict[str, str] | None = None
+        if create_bar_chart:
+            chart = candidate.charts[0]
+            if self._chart_compiler is None or self._media_asset_store is None:
+                raise EditorialProposalApplicationError("proposal_workspace_unavailable")
+            batch = await compile_and_store_charts(
+                (chart,),
+                compiler=self._chart_compiler,
+                media_asset_store=self._media_asset_store,
+                production_run_id=preparation.production_run_id,
+            )
+            if (
+                batch.rejections
+                or len(batch.charts) != 1
+                or batch.charts[0].compiled_asset_id is None
+            ):
+                raise EditorialProposalApplicationError(
+                    "editorial_enrichment_chart_render_failed",
+                    validator_code="bar_chart_local_compilation_failed",
+                )
+            manifest = await self._media_asset_store.get(batch.charts[0].compiled_asset_id)
+            if manifest is None:
+                raise EditorialProposalApplicationError(
+                    "editorial_enrichment_chart_render_failed",
+                    validator_code="bar_chart_media_manifest_missing",
+                )
+            compiled_chart_asset = {
+                "asset_id": str(manifest.asset_id),
+                "sha256": manifest.sha256,
+                "compiler_name": str(manifest.compiler_name),
+                "compiler_version": str(manifest.compiler_version),
+                "policy_version": manifest.policy_version,
+            }
+            evidence_refs.extend(
+                _evidence_reference_json(reference)
+                for point in chart.points
+                for reference in point.evidence_refs
+            )
+            evidence_refs.extend(
+                _evidence_reference_json(reference) for reference in chart.purpose.evidence_refs
+            )
         return (
             {
                 "schema_version": "editorial-patch-v1",
@@ -2530,6 +3202,11 @@ class EditorialProposalService:
                 "occurrence_id": str(preparation.occurrence_id),
                 "before_hash": preparation.before_hash,
                 "enrichment_patch": raw,
+                **(
+                    {"compiled_chart_asset": compiled_chart_asset}
+                    if compiled_chart_asset is not None
+                    else {}
+                ),
                 "rationale": patch.rationale,
                 "evidence_refs": evidence_refs,
             },
@@ -2541,8 +3218,12 @@ class EditorialProposalService:
     async def _assert_exact_origin(
         self, uow: UnitOfWork, preparation: EditorialProposalPreparation
     ) -> None:
-        is_table_insertion = (
-            preparation.operation is TargetedEditorialRevisionOperation.CREATE_TABLE
+        is_enrichment_insertion = (
+            preparation.operation
+            in {
+                TargetedEditorialRevisionOperation.CREATE_TABLE,
+                TargetedEditorialRevisionOperation.CREATE_BAR_CHART,
+            }
             and preparation.target.kind is TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT
         )
         await uow.production_runs.lock_creation_for_subject(preparation.subject_id)
@@ -2576,46 +3257,48 @@ class EditorialProposalService:
             )
         expected_artifact_id = (
             snapshot.enrichment_artifact_id
-            if is_table_insertion
+            if is_enrichment_insertion
             else snapshot.synthesis_artifact_id
         )
         expected_artifact_version = (
-            snapshot.enrichment_version if is_table_insertion else snapshot.synthesis_version
+            snapshot.enrichment_version if is_enrichment_insertion else snapshot.synthesis_version
         )
         expected_input_hash = (
-            snapshot.enrichment_input_hash if is_table_insertion else snapshot.synthesis_input_hash
+            snapshot.enrichment_input_hash
+            if is_enrichment_insertion
+            else snapshot.synthesis_input_hash
         )
         expected_sha256 = (
             snapshot.enrichment_canonical_sha256
-            if is_table_insertion
+            if is_enrichment_insertion
             else snapshot.synthesis_canonical_sha256
         )
         if expected_artifact_id != preparation.base_artifact_id:
             raise EditorialProposalApplicationError(
                 "proposal_base_stale",
                 reason="pins:enrichment_artifact_id"
-                if is_table_insertion
+                if is_enrichment_insertion
                 else "pins:synthesis_artifact_id",
             )
         if expected_artifact_version != preparation.base_artifact_version:
             raise EditorialProposalApplicationError(
                 "proposal_base_stale",
                 reason="pins:enrichment_version"
-                if is_table_insertion
+                if is_enrichment_insertion
                 else "pins:synthesis_version",
             )
         if expected_input_hash != preparation.base_input_hash:
             raise EditorialProposalApplicationError(
                 "proposal_base_stale",
                 reason="pins:enrichment_input_hash"
-                if is_table_insertion
+                if is_enrichment_insertion
                 else "pins:synthesis_input_hash",
             )
         if expected_sha256 != preparation.base_canonical_sha256:
             raise EditorialProposalApplicationError(
                 "proposal_base_stale",
                 reason="pins:enrichment_canonical_sha256"
-                if is_table_insertion
+                if is_enrichment_insertion
                 else "pins:synthesis_canonical_sha256",
             )
         resolution = resolve_occurrence(snapshot, preparation.occurrence_id)
@@ -2624,14 +3307,18 @@ class EditorialProposalService:
                 "proposal_base_stale", reason="snapshot:occurrence_binding"
             )
         expected_occurrence_artifact_id = (
-            snapshot.synthesis_artifact_id if is_table_insertion else preparation.base_artifact_id
+            snapshot.synthesis_artifact_id
+            if is_enrichment_insertion
+            else preparation.base_artifact_id
         )
         expected_occurrence_version = (
-            snapshot.synthesis_version if is_table_insertion else preparation.base_artifact_version
+            snapshot.synthesis_version
+            if is_enrichment_insertion
+            else preparation.base_artifact_version
         )
         expected_occurrence_sha256 = (
             snapshot.synthesis_canonical_sha256
-            if is_table_insertion
+            if is_enrichment_insertion
             else preparation.base_canonical_sha256
         )
         if resolution.artifact_id != expected_occurrence_artifact_id:
@@ -2646,7 +3333,7 @@ class EditorialProposalService:
             raise EditorialProposalApplicationError(
                 "proposal_base_stale", reason="pins:canonical_sha256"
             )
-        if is_table_insertion and (
+        if is_enrichment_insertion and (
             resolution.entry.source_stage.value != "synthesis"
             or resolution.entry.content_sha256 != preparation.before_hash
             or preparation.target.placement is None

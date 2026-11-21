@@ -47,7 +47,7 @@ if TYPE_CHECKING:
     from cti_app.domain.production_synthesis import ExtractionEvidenceRefV1
     from cti_app.domain.publication_kind import PublicationKind
 
-EDITORIAL_DISCUSSION_PROMPT_VERSION = "4"
+EDITORIAL_DISCUSSION_PROMPT_VERSION = "5"
 
 
 class EditorialDiscussionObjective(StrEnum):
@@ -161,6 +161,20 @@ def _editorial_discussion_prompt(
             if "create_table" in context.proposal_operations
             else ""
         )
+        bar_chart_instructions = (
+            " Pour create_bar_chart, AFTER doit être un objet JSON EditorialEnrichmentProposalV1 "
+            "avec exactement un graphique kind=bar, aucun tableau/diagramme/annotation/figure/"
+            "resource_need, des category_axis_label, value_axis_label et unit en texte brut, "
+            "et au moins deux points {label,series,value,evidence_handles}. Chaque valeur doit "
+            "être un nombre fini recopié exactement depuis les preuves admises du point; ne "
+            "calculez, n'extrapolez et n'inventez aucune valeur. Les points citent chacun des "
+            "handles admis qui attestent la valeur et l'unité. Le placement doit être "
+            "{kind: after_paragraph, anchor_block_id: l'UUID exact fourni}. N'émettez aucun SVG, "
+            "Typst, HTML, JavaScript ni balisage. Si les preuves actuelles n'étayent pas au "
+            "moins deux valeurs quantitatives, refusez avec bar_chart_insufficient_data."
+            if "create_bar_chart" in context.proposal_operations
+            else ""
+        )
         instructions = (
             "EDITORIAL PROPOSAL — TYPED PATCH ONLY\n"
             "Répondez uniquement par un patch éditorial typé au format à marqueurs ci-dessous, "
@@ -171,6 +185,7 @@ def _editorial_discussion_prompt(
             "revision_not_applicable. Pour un patch, utilisez exactement TARGET, ACTION, "
             "BASE_ARTIFACT_HASH, BEFORE_HASH, AFTER et RATIONALE, chacun dans son bloc @@."
             + table_instructions
+            + bar_chart_instructions
             + "\n\n"
         )
     else:

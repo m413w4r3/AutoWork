@@ -79,6 +79,8 @@ class _NoModelCalls:
 
 async def _ready_for_manual_table_route(
     uow_factory: Any,
+    *,
+    bar_chart_facts: bool = False,
 ) -> tuple[_Seeded, Any, _NoModelCalls, Any]:
     # Use the real discovery lineage and persist the rows required by the
     # production discussion/adoption adapters. Blob IDs come from add_if_absent
@@ -87,6 +89,7 @@ async def _ready_for_manual_table_route(
         uow_factory,
         proposal_count=0,
         seed_discovery_lineage=True,
+        bar_chart_facts=bar_chart_facts,
     )
     enrichment_content = _enrichment_seed_content(
         seeded.production_input,
@@ -514,3 +517,209 @@ async def test_manual_table_patch_accept_publishes_table_at_registered_anchor(
     )
     assert published_placement.anchor_block_id == anchor_id
     assert published_placement.anchor_pointer == anchor_entry.structural_pointer
+
+
+@pytest.mark.asyncio
+async def test_manual_bar_chart_patch_accepts_with_registered_evidence_and_anchor(
+    uow_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        api_main,
+        "get_settings",
+        lambda: Settings(_env_file=None, app_env="development", api_bind_host="127.0.0.1"),
+    )
+    monkeypatch.setattr(
+        editorial_workspace_api,
+        "get_settings",
+        lambda: Settings(
+            _env_file=None,
+            editorial_proposal_accept_enabled=True,
+            production_editorial_resource_search_enabled=False,
+        ),
+    )
+    monkeypatch.setattr(editorial_workspace_api, "_proposal_impact_consumer_wired", lambda: True)
+    seeded, app, model_gateway, enrichment_content = await _ready_for_manual_table_route(
+        uow_factory,
+        bar_chart_facts=True,
+    )
+
+    records = {
+        str(record["value"]): enrichment_content.evidence_pack.resolve_handle(str(record["handle"]))
+        for record in enrichment_content.evidence_pack.narrative_evidence
+        if record.get("value") in {"Alpha: 12 endpoints", "Beta: 18 endpoints"}
+    }
+    alpha_ref = records["Alpha: 12 endpoints"]
+    beta_ref = records["Beta: 18 endpoints"]
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
+    ) as client:
+        snapshot_response = await client.get(f"/api/subjects/{seeded.subject.id}/editor/snapshot")
+        assert snapshot_response.status_code == 200, snapshot_response.text
+        snapshot = snapshot_response.json()
+        anchor_block = next(
+            block
+            for block in snapshot["blocks"]
+            if block["kind"] in {"paragraph", "lead_paragraph"}
+        )
+        anchor_id = UUID(anchor_block["block_id"])
+        assert "create_bar_chart" in anchor_block["allowed_operations"]
+        chart_response = await client.post(
+            f"/api/subjects/{seeded.subject.id}/editor/blocks/{anchor_id}/bar-chart-proposals",
+            headers={"Idempotency-Key": f"manual-bar-chart-{uuid4().hex}"},
+            json={
+                "snapshot_id": snapshot["snapshot_id"],
+                "anchor_block_id": str(anchor_id),
+                "chart": {
+                    "key": "synthetic_endpoint_counts",
+                    "title": "Comptes synthétiques rapportés",
+                    "caption": "Deux valeurs exactes de la fixture d'intégration.",
+                    "category_axis_label": "Catégorie",
+                    "value_axis_label": "Nombre rapporté",
+                    "unit": "endpoints",
+                    "points": [
+                        {
+                            "label": "Alpha",
+                            "series": "endpoints",
+                            "value": 12,
+                            "evidence_refs": [
+                                {
+                                    "source_document_id": str(alpha_ref.source_document_id),
+                                    "kind": alpha_ref.kind.value,
+                                    "evidence_key": alpha_ref.evidence_key,
+                                }
+                            ],
+                        },
+                        {
+                            "label": "Beta",
+                            "series": "endpoints",
+                            "value": 18,
+                            "evidence_refs": [
+                                {
+                                    "source_document_id": str(beta_ref.source_document_id),
+                                    "kind": beta_ref.kind.value,
+                                    "evidence_key": beta_ref.evidence_key,
+                                }
+                            ],
+                        },
+                    ],
+                    "purpose": {
+                        "question": "Quels nombres d'endpoints sont rapportés pour Alpha et Beta ?",
+                        "available_data": "Deux valeurs exactes sont citées pour ces catégories.",
+                        "comprehension_gain": (
+                            "La comparaison rend visible l'écart entre les valeurs rapportées."
+                        ),
+                        "scope": "Uniquement Alpha et Beta dans la fixture de test.",
+                        "evidence_refs": [
+                            {
+                                "source_document_id": str(alpha_ref.source_document_id),
+                                "kind": alpha_ref.kind.value,
+                                "evidence_key": alpha_ref.evidence_key,
+                            },
+                            {
+                                "source_document_id": str(beta_ref.source_document_id),
+                                "kind": beta_ref.kind.value,
+                                "evidence_key": beta_ref.evidence_key,
+                            },
+                        ],
+                        "knowledge_limits": "Aucune autre catégorie n'est extrapolée.",
+                        "placement_reason": "Placer le graphique après le paragraphe choisi.",
+                    },
+                },
+            },
+        )
+        assert chart_response.status_code == 200, chart_response.text
+        proposal_view = chart_response.json()
+        assert proposal_view["state"] == EditorialProposalState.PROPOSED.value
+        proposal_id = UUID(proposal_view["id"])
+        async with uow_factory() as uow:
+            proposal = await uow.editorial_proposals.get_for_occurrence(
+                seeded.subject.id, anchor_id, proposal_id
+            )
+        assert proposal is not None
+        assert proposal.origin is EditorialProposalOrigin.MANUAL_PATCH
+        assert proposal.actor_id == uuid5(NAMESPACE_URL, "autowork-actor:dev-analyst")
+        assert proposal.model_run_id is None and proposal.model_turn_id is None
+        accepted = await client.post(
+            f"/api/subjects/{seeded.subject.id}/editor/threads/{anchor_id}/"
+            f"proposals/{proposal_id}/accept",
+            headers={"Idempotency-Key": f"accept-bar-chart-{uuid4().hex}"},
+            json={
+                "expected_state_version": proposal.state_version,
+                "patch_sha256": proposal.patch_sha256,
+            },
+        )
+        assert accepted.status_code == 200, accepted.text
+        adopted_snapshot_response = await client.get(
+            f"/api/subjects/{seeded.subject.id}/editor/snapshot"
+        )
+        assert adopted_snapshot_response.status_code == 200, adopted_snapshot_response.text
+        adopted_snapshot = adopted_snapshot_response.json()
+        chart_block = next(
+            item for item in adopted_snapshot["enrichments"] if item["kind"] == "chart"
+        )
+        assert chart_block["chart"]["title"] == "Comptes synthétiques rapportés"
+        assert chart_block["chart"]["unit"] == "endpoints"
+        assert chart_block["chart"]["legend"] == ["endpoints"]
+        assert [(point["label"], point["value"]) for point in chart_block["chart"]["points"]] == [
+            ("Alpha", "12"),
+            ("Beta", "18"),
+        ]
+        assert chart_block["chart"]["anchor_block_id"] == str(anchor_id)
+        adopted_anchor = next(
+            item for item in adopted_snapshot["blocks"] if item["block_id"] == str(anchor_id)
+        )
+        assert adopted_anchor["chart"] is None
+
+    assert model_gateway.calls == []
+    async with uow_factory() as uow:
+        current = await uow.production_artifacts.get_current(
+            seeded.run.id,
+            ProductionArtifactStage.EDITORIAL_ENRICHMENT.value,
+        )
+        persisted_snapshot = await uow.editorial_workspace_snapshots.get_by_id(
+            UUID(accepted.json()["snapshot_id"])
+        )
+        stored_proposal = await uow.editorial_proposals.get_for_occurrence(
+            seeded.subject.id, anchor_id, proposal_id
+        )
+    assert current is not None and current.version == 2 and current.canonical_blob_id is not None
+    assert persisted_snapshot is not None
+    assert stored_proposal is not None and stored_proposal.state is EditorialProposalState.ACCEPTED
+    adoption_metadata = current.metadata.get("editorial_adoption")
+    assert isinstance(adoption_metadata, dict)
+    assert adoption_metadata["operation"] == "create_bar_chart"
+
+    async with uow_factory() as uow:
+        canonical_blob = await uow.blobs.get(current.canonical_blob_id)
+        assert canonical_blob is not None
+        enrichment_payload = json.loads(
+            await seeded.blob_store.read(
+                canonical_blob.descriptor,
+                max_bytes=canonical_blob.descriptor.size,
+            )
+        )
+        manifest = await uow.media_assets.get(
+            UUID(enrichment_payload["charts"][0]["compiled_asset_id"])
+        )
+        assert manifest is not None
+        assert manifest.sha256
+
+    enrichment = editorial_enrichment_from_json(enrichment_payload)
+    chart = next(item for item in enrichment.charts if item.key == "synthetic_endpoint_counts")
+    assert chart.kind.value == "bar"
+    assert [(point.label, str(point.value)) for point in chart.points] == [
+        ("Alpha", "12"),
+        ("Beta", "18"),
+    ]
+    assert chart.placement.anchor_block_id == anchor_id
+    inserted_entry = next(
+        entry
+        for entry in persisted_snapshot.block_registry
+        if entry.source_stage is EditorialSourceStage.EDITORIAL_ENRICHMENT
+        and entry.structural_pointer == "/charts/0"
+    )
+    assert inserted_entry.position > next(
+        entry.position for entry in persisted_snapshot.block_registry if entry.block_id == anchor_id
+    )

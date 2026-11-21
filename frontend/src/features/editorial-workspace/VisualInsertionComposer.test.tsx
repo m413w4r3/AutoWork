@@ -37,6 +37,7 @@ const anchor: EditorialWorkspaceBlock = {
     },
   ],
   table: null,
+  chart: null,
   revision_target: {
     block_id: "22222222-2222-4222-8222-222222222222",
     legacy_target_id: null,

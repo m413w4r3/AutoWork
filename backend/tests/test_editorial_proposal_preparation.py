@@ -976,7 +976,9 @@ async def test_rewrite_paragraph_stale_fence_and_unsupported_fact_write_nothing(
         ),
     )
 
-    _stale_patch, stale_state, _kind, stale_diagnostics = setup.service._validate_result(stale)
+    _stale_patch, stale_state, _kind, stale_diagnostics = await setup.service._validate_result(
+        stale
+    )
 
     assert stale_state.value == "needs_review"
     assert stale_diagnostics["code"] == "proposal_base_stale"
@@ -996,9 +998,12 @@ async def test_rewrite_paragraph_stale_fence_and_unsupported_fact_write_nothing(
         ),
     )
 
-    _unsupported_patch, unsupported_state, _kind, diagnostics = setup.service._validate_result(
-        unsupported
-    )
+    (
+        _unsupported_patch,
+        unsupported_state,
+        _kind,
+        diagnostics,
+    ) = await setup.service._validate_result(unsupported)
 
     assert unsupported_state.value == "needs_review"
     assert diagnostics["code"] == "synthesis_relation_not_evidenced", diagnostics

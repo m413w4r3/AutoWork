@@ -26,6 +26,7 @@ class TargetedEditorialRevisionOperation(StrEnum):
     SPLIT_SECTION = "split_section"
     RENAME_SECTION = "rename_section"
     CREATE_TABLE = "create_table"
+    CREATE_BAR_CHART = "create_bar_chart"
     REWRITE_TABLE = "rewrite_table"
     DELETE_TABLE = "delete_table"
     CREATE_DIAGRAM = "create_diagram"

@@ -460,8 +460,8 @@ def test_annotation_request_is_separate_from_the_table_diagram_request_and_versi
     assert SEMANTIC_ANNOTATION_PROMPT_VERSION == (
         "semantic-annotation-document-lexicon-v3-semantic-styles"
     )
-    assert EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION.endswith("after-paragraph-anchors")
-    assert EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION.endswith("after-paragraph-anchors")
+    assert EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION.endswith("evidence-backed-bars")
+    assert EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION.endswith("quantitative-bar-points")
     assert "@@ANCHOR title@@" not in annotation_request.text
     assert "@@ANCHOR section:0:paragraph:0001@@" in annotation_request.text
     assert "@@ANCHOR diagram:" not in annotation_request.text

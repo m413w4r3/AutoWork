@@ -1307,10 +1307,10 @@ async def test_render_uses_the_loaded_template_and_font_snapshots(
     assert render.template_sha256 == template_bundle.sha256
     assert render.font_bundle_version == font_bundle.font_bundle_version
     assert render.render_policy_version == PUBLICATION_RENDER_POLICY_VERSION
-    assert PUBLICATION_RENDER_POLICY_VERSION == "typst-publication-v13-after-paragraph-anchors"
+    assert PUBLICATION_RENDER_POLICY_VERSION == "typst-publication-v14-evidence-backed-bar-charts"
     assert (
         publication_rendering.PUBLICATION_RENDERER_VERSION
-        == "publication-v21-typst-v41-after-paragraph-anchors"
+        == "publication-v22-typst-v42-evidence-backed-bar-charts"
     )
     expected_templates = {file.relative_path: file.content for file in template_bundle.files}
     observed_templates = {

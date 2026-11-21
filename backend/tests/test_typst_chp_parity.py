@@ -2939,6 +2939,193 @@ async def test_real_typst_table_follows_anchor_paragraph_in_pdf(
 
 
 @pytest.mark.asyncio
+async def test_real_typst_bar_chart_pdf_has_labels_values_and_anchor(
+    tmp_path: Path,
+    typst_binary: str,
+    font_bundle_root: Path,
+) -> None:
+    from decimal import Decimal
+
+    from cti_app.application.production_editorial_enrichment import (
+        build_editorial_enrichment_evidence_pack,
+        canonical_synthesis_hash,
+    )
+    from cti_app.application.production_synthesis import canonical_extraction_hash
+    from cti_app.domain.editorial_workspace import bootstrap_block_registry
+    from cti_app.domain.production import ProductionEvidenceBasis
+    from cti_app.domain.production_editorial_enrichment import (
+        ChartKind,
+        ChartPointV1,
+        ChartSpecV1,
+        EditorialAnalyticPurposeV1,
+        EnrichmentPlacementKind,
+        EnrichmentPlacementV1,
+    )
+    from cti_app.domain.production_extraction import ExtractionFactV1
+    from cti_app.domain.production_synthesis import production_synthesis_to_json
+    from cti_app.domain.publication_document import (
+        PublicationDocumentV10,
+        parse_publication_document,
+    )
+    from cti_app.infrastructure.analytic_chart_renderer import AnalyticChartRenderer
+    from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
+    from tests.editorial_enrichment_support import build_empty_editorial_enrichment
+    from tests.test_publication_assembly import (
+        _assemble,
+        _canonical_inputs,
+        _run,
+        _service,
+        _workspace_record_for,
+    )
+
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    source = extraction.sources[0]
+    quantitative_facts = (
+        ExtractionFactV1(
+            category="other_technical",
+            value="Alpha: 12 endpoints",
+            attack_id=None,
+            context="Synthetic PDF fixture category Alpha.",
+            evidence_quote="The synthetic report records Alpha with 12 endpoints.",
+            evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+            source_document_ids=(source.source_document_id,),
+        ),
+        ExtractionFactV1(
+            category="other_technical",
+            value="Beta: 18 endpoints",
+            attack_id=None,
+            context="Synthetic PDF fixture category Beta.",
+            evidence_quote="The synthetic report records Beta with 18 endpoints.",
+            evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+            source_document_ids=(source.source_document_id,),
+        ),
+    )
+    extraction = replace(
+        extraction, sources=(replace(source, facts=(*source.facts, *quantitative_facts)),)
+    )
+    synthesis = replace(synthesis, extraction_hash=canonical_extraction_hash(extraction))
+    evidence_pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis, None)
+    refs_by_value = {
+        str(record["value"]): evidence_pack.resolve_handle(str(record["handle"]))
+        for record in evidence_pack.narrative_evidence
+        if record.get("value") in {"Alpha: 12 endpoints", "Beta: 18 endpoints"}
+    }
+    alpha_ref, beta_ref = refs_by_value["Alpha: 12 endpoints"], refs_by_value["Beta: 18 endpoints"]
+    run = _run(snapshot)
+    synthesis_artifact_id = UUID(int=9772)
+    anchor = next(
+        entry
+        for entry in bootstrap_block_registry(
+            artifact_id=synthesis_artifact_id,
+            canonical_sha256=canonical_synthesis_hash(synthesis),
+            source_stage="synthesis",
+            canonical_content=production_synthesis_to_json(synthesis),
+        )
+        if entry.kind.value in {"paragraph", "lead_paragraph"}
+    )
+    placement = EnrichmentPlacementV1(
+        EnrichmentPlacementKind.AFTER_PARAGRAPH,
+        anchor_block_id=anchor.block_id,
+    )
+    chart = ChartSpecV1(
+        key="synthetic_endpoint_counts",
+        kind=ChartKind.BAR,
+        title="Comptes synthétiques rapportés",
+        caption="Deux valeurs exactes de la fixture, en endpoints.",
+        placement=placement,
+        purpose=EditorialAnalyticPurposeV1(
+            question="Quels comptes d'endpoints sont rapportés pour Alpha et Beta ?",
+            available_data="Deux nombres exacts sont cités pour ces catégories.",
+            comprehension_gain="La comparaison rend visible l'écart entre les valeurs.",
+            scope="Uniquement Alpha et Beta dans cette fixture.",
+            evidence_refs=(alpha_ref, beta_ref),
+            knowledge_limits="Aucune autre catégorie n'est extrapolée.",
+            placement_reason="Après le paragraphe d'ancrage.",
+        ),
+        points=(
+            ChartPointV1("Alpha", None, "endpoints", (alpha_ref,), value=Decimal("12")),
+            ChartPointV1("Beta", None, "endpoints", (beta_ref,), value=Decimal("18")),
+        ),
+        category_axis_label="Catégorie",
+        value_axis_label="Nombre rapporté",
+        unit="endpoints",
+        compiled_asset_id=UUID(int=5771),
+    )
+    enrichment = replace(
+        build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis),
+        charts=(chart,),
+    )
+    workspace_record = _workspace_record_for(
+        run=run,
+        synthesis=synthesis,
+        enrichment=enrichment,
+        synthesis_artifact_id=synthesis_artifact_id,
+    )
+    service, catalog, _artifacts = _service()
+    assembly = await _assemble(
+        service,
+        run=run,
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+        editorial_enrichment_artifact_id=workspace_record.enrichment_artifact_id,
+        workspace_snapshot_record=workspace_record,
+    )
+    document = parse_publication_document(
+        await ProductionArtifactStore(catalog).read_json(assembly.artifact.canonical_blob_id)
+    )
+    assert isinstance(document, PublicationDocumentV10)
+    assert [item.element_key for item in document.resolved_placements] == [chart.key]
+    assert document.resolved_placements[0].anchor_block_id == anchor.block_id
+
+    template_bundle = load_template_bundle(_CHP_TYPST_ROOT)
+    render_source = _render(document, template_bundle)
+    workspace_root = tmp_path / "bar-chart-v10-workspace"
+    _build_workspace(
+        workspace_root,
+        bundle_files=template_bundle.files,
+        render_data_bytes=render_source.render_data_bytes,
+        media_refs=render_source.media_refs,
+    )
+    chart_media = next(
+        item for item in render_source.media_refs if item.asset_id == chart.compiled_asset_id
+    )
+    svg_bytes = await AnalyticChartRenderer().compile(chart)
+    svg_bytes = svg_bytes.media_bytes
+    chart_path = workspace_root / "RENDERER" / chart_media.media_path
+    chart_path.parent.mkdir(parents=True, exist_ok=True)
+    chart_path.write_bytes(svg_bytes)
+    assert all(token in svg_bytes for token in (b"Alpha", b"Beta", b"12", b"18", b"endpoints"))
+
+    font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
+    font_root = tmp_path / "bar-chart-v10-fonts"
+    font_root.mkdir()
+    compiled = await TypstSubprocessCompiler(binary=typst_binary).compile(
+        TypstCompileRequest(
+            workspace_root=workspace_root,
+            entrypoint_relative_path="RENDERER/publication.typ",
+            font_paths=materialize_font_bundle(font_snapshot, font_root),
+        )
+    )
+    reader = PdfReader(BytesIO(compiled.content), strict=True)
+    text, _compact = _normalized_pdf_text(reader)
+    normalized = text.casefold()
+    assert "example finding." in normalized
+    assert "deux valeurs exactes de la fixture" in normalized
+    for label in ("Alpha", "Beta", "12", "18", "endpoints", "Catégorie", "Nombre rapporté"):
+        assert label in text
+    assert text.index("Example finding.") < text.index("Comptes synthétiques rapportés")
+    assert text.index("Comptes synthétiques rapportés") < text.index(
+        "Deux valeurs exactes de la fixture"
+    )
+    demo_output = os.environ.get("AUTOWORK_BAR_CHART_DEMO_OUTPUT")
+    if demo_output:
+        _write_pdf(Path(demo_output), compiled.content)
+
+
+@pytest.mark.asyncio
 async def test_real_typst_frontmatter_hides_internal_and_legacy_annex_indicators(
     tmp_path: Path,
     typst_binary: str,

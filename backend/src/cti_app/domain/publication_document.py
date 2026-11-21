@@ -103,6 +103,7 @@ PUBLICATION_DOCUMENT_V6_SCHEMA_VERSION = "6"
 PUBLICATION_DOCUMENT_V7_SCHEMA_VERSION = "7"
 PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION = "8"
 PUBLICATION_DOCUMENT_V9_SCHEMA_VERSION = "9"
+PUBLICATION_DOCUMENT_V10_SCHEMA_VERSION = "10"
 _PUBLICATION_SOURCE_REQUIRED_FIELDS = frozenset(
     {
         "source_document_id",
@@ -281,7 +282,7 @@ class PublicationChartV1:
 
     def __post_init__(self) -> None:
         validate_editorial_key(self.key, "Publication chart key")
-        if self.kind is not ChartKind.TIMELINE:
+        if self.kind not in {ChartKind.TIMELINE, ChartKind.BAR}:
             raise ValueError("Publication chart kind is invalid")
         validate_text(self.title, "Publication chart title", semantic=True)
         if self.caption is not None:
@@ -510,7 +511,7 @@ def _chart_to_json(chart: PublicationChartV1) -> dict[str, Any]:
     }
 
 
-def _chart_from_json(raw: Any) -> PublicationChartV1:
+def _chart_from_json(raw: Any, *, allow_bar: bool = False) -> PublicationChartV1:
     item = json_object(
         raw,
         frozenset({"key", "kind", "title", "caption", "placement", "asset_id", "evidence_refs"}),
@@ -519,9 +520,12 @@ def _chart_from_json(raw: Any) -> PublicationChartV1:
     caption = item["caption"]
     if caption is not None:
         caption = json_text(caption, "Chart caption")
+    kind = json_enum(ChartKind, item["kind"], "Chart kind")
+    if kind is ChartKind.BAR and not allow_bar:
+        raise ValueError("Publication chart kind is invalid")
     return PublicationChartV1(
         key=json_text(item["key"], "Chart key"),
-        kind=json_enum(ChartKind, item["kind"], "Chart kind"),
+        kind=kind,
         title=json_text(item["title"], "Chart title"),
         caption=caption,
         placement=placement_from_json(item["placement"]),
@@ -991,6 +995,7 @@ class PublicationDocumentV4:
         *,
         additional_source_ids: frozenset[UUID] = frozenset(),
         require_node_roles: bool = False,
+        allow_bar_charts: bool = False,
     ) -> PublicationDocumentV4:
         root_keys = frozenset(
             {
@@ -1194,7 +1199,10 @@ class PublicationDocumentV4:
             ),
             additional_source_ids=additional_source_ids,
             charts=(
-                tuple(_chart_from_json(raw) for raw in json_array(document["charts"], "Charts"))
+                tuple(
+                    _chart_from_json(raw, allow_bar=allow_bar_charts)
+                    for raw in json_array(document["charts"], "Charts")
+                )
                 if "charts" in document
                 else ()
             ),
@@ -1557,7 +1565,9 @@ class PublicationDocumentV5:
         return payload
 
     @classmethod
-    def _from_json(cls, payload: Mapping[str, Any]) -> PublicationDocumentV5:
+    def _from_json(
+        cls, payload: Mapping[str, Any], *, allow_bar_charts: bool = False
+    ) -> PublicationDocumentV5:
         root_keys = frozenset(
             {
                 "schema_version",
@@ -1617,6 +1627,7 @@ class PublicationDocumentV5:
             base_payload,
             additional_source_ids=frozenset(additional_source_ids),
             require_node_roles=True,
+            allow_bar_charts=allow_bar_charts,
         )
         return cls(
             document=base,
@@ -2227,7 +2238,9 @@ class PublicationDocumentV6:
         return payload
 
     @classmethod
-    def _from_json(cls, payload: Mapping[str, Any]) -> PublicationDocumentV6:
+    def _from_json(
+        cls, payload: Mapping[str, Any], *, allow_bar_charts: bool = False
+    ) -> PublicationDocumentV6:
         fields = {
             "schema_version",
             "base_publication",
@@ -2252,7 +2265,11 @@ class PublicationDocumentV6:
             or raw_base.get("schema_version") != PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION
         ):
             raise PublicationDocumentV6BaseMismatchError()
-        base = publication_document_v5_from_json(raw_base)
+        base = (
+            PublicationDocumentV5._from_json(raw_base, allow_bar_charts=True)
+            if allow_bar_charts
+            else publication_document_v5_from_json(raw_base)
+        )
         raw_opinion = document["analyst_opinion"]
         raw_rendered = document["rendered_opinion"]
         return cls(
@@ -2307,7 +2324,9 @@ class PublicationDocumentV7:
         }
 
     @classmethod
-    def _from_json(cls, payload: Mapping[str, Any]) -> PublicationDocumentV7:
+    def _from_json(
+        cls, payload: Mapping[str, Any], *, allow_bar_charts: bool = False
+    ) -> PublicationDocumentV7:
         document = json_object(
             payload,
             frozenset(
@@ -2330,7 +2349,11 @@ class PublicationDocumentV7:
         ):
             raise ValueError("PublicationDocumentV7 base must be a V6 publication")
         return cls(
-            base_publication=publication_document_v6_from_json(raw_base),
+            base_publication=(
+                PublicationDocumentV6._from_json(raw_base, allow_bar_charts=True)
+                if allow_bar_charts
+                else publication_document_v6_from_json(raw_base)
+            ),
             publication_kind=json_enum(
                 PublicationKind, document["publication_kind"], "V7 publication kind"
             ),
@@ -3369,6 +3392,9 @@ class PublicationDocumentV9(PublicationDocumentV8):
 
     def __post_init__(self) -> None:
         PublicationDocumentV8.__post_init__(self)
+        base_v5 = self.base_publication.base_publication.base_publication
+        if any(chart.kind is ChartKind.BAR for chart in base_v5.document.charts):
+            raise ValueError("PublicationDocumentV9 does not support quantitative charts")
         validate_sha256(self.registry_hash, "Publication registry hash")
         validate_sha256(self.synthesis_canonical_sha256, "Publication synthesis pin")
         validate_sha256(self.enrichment_canonical_sha256, "Publication enrichment pin")
@@ -3444,6 +3470,109 @@ class PublicationDocumentV9(PublicationDocumentV8):
             raise ValueError("PublicationDocumentV9 base must be a V7 publication")
         return cls(
             base_publication=publication_document_v7_from_json(raw_base),
+            article_format=_article_format_from_json(document["article_format"]),
+            registry_hash=json_sha256(document["registry_hash"], "Publication registry hash"),
+            synthesis_canonical_sha256=json_sha256(
+                document["synthesis_canonical_sha256"], "Publication synthesis pin"
+            ),
+            enrichment_canonical_sha256=json_sha256(
+                document["enrichment_canonical_sha256"], "Publication enrichment pin"
+            ),
+            resolved_placements=tuple(
+                ResolvedPublicationPlacementV1._from_json(item)
+                for item in json_array(document["resolved_placements"], "Resolved placements")
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationDocumentV10(PublicationDocumentV8):
+    """Resolved publication envelope whose SVG bars were locally compiled."""
+
+    registry_hash: str
+    synthesis_canonical_sha256: str
+    enrichment_canonical_sha256: str
+    resolved_placements: tuple[ResolvedPublicationPlacementV1, ...]
+
+    @property
+    def schema_version(self) -> str:
+        return PUBLICATION_DOCUMENT_V10_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        PublicationDocumentV8.__post_init__(self)
+        validate_sha256(self.registry_hash, "Publication registry hash")
+        validate_sha256(self.synthesis_canonical_sha256, "Publication synthesis pin")
+        validate_sha256(self.enrichment_canonical_sha256, "Publication enrichment pin")
+        if not isinstance(self.resolved_placements, tuple) or any(
+            not isinstance(item, ResolvedPublicationPlacementV1)
+            for item in self.resolved_placements
+        ):
+            raise ValueError("PublicationDocumentV10 resolved placements are invalid")
+        base_v5 = self.base_publication.base_publication.base_publication
+        expected: dict[tuple[str, str], UUID] = {}
+        for element_kind, values in (
+            ("table", base_v5.document.tables),
+            ("chart", base_v5.document.charts),
+            ("diagram", base_v5.document.diagrams),
+            ("figure", base_v5.document.figures),
+        ):
+            for item in values:
+                if item.placement.kind.value != "after_paragraph":
+                    continue
+                anchor = item.placement.anchor_block_id
+                if anchor is None:
+                    raise ValueError("PublicationDocumentV10 placement anchor is missing")
+                identity = (element_kind, item.key)
+                if identity in expected:
+                    raise ValueError("PublicationDocumentV10 element keys are ambiguous")
+                expected[identity] = anchor
+        actual: dict[tuple[str, str], ResolvedPublicationPlacementV1] = {}
+        for item in self.resolved_placements:
+            identity = (item.element_kind, item.element_key)
+            if identity in actual or expected.get(identity) != item.anchor_block_id:
+                raise ValueError("PublicationDocumentV10 resolved anchor does not match element")
+            actual[identity] = item
+        if set(actual) != set(expected):
+            raise ValueError("PublicationDocumentV10 requires one resolved anchor per element")
+
+    def _to_json(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "base_publication": self.base_publication._to_json(),
+            "article_format": _article_format_to_json(self.article_format),
+            "registry_hash": self.registry_hash,
+            "synthesis_canonical_sha256": self.synthesis_canonical_sha256,
+            "enrichment_canonical_sha256": self.enrichment_canonical_sha256,
+            "resolved_placements": [item._to_json() for item in self.resolved_placements],
+        }
+
+    @classmethod
+    def _from_json(cls, payload: Mapping[str, Any]) -> PublicationDocumentV10:
+        document = json_object(
+            payload,
+            frozenset(
+                {
+                    "schema_version",
+                    "base_publication",
+                    "article_format",
+                    "registry_hash",
+                    "synthesis_canonical_sha256",
+                    "enrichment_canonical_sha256",
+                    "resolved_placements",
+                }
+            ),
+            "PublicationDocumentV10",
+        )
+        if document["schema_version"] != PUBLICATION_DOCUMENT_V10_SCHEMA_VERSION:
+            raise ValueError("PublicationDocumentV10 schema version is unsupported")
+        raw_base = document["base_publication"]
+        if (
+            not isinstance(raw_base, Mapping)
+            or raw_base.get("schema_version") != PUBLICATION_DOCUMENT_V7_SCHEMA_VERSION
+        ):
+            raise ValueError("PublicationDocumentV10 base must be a V7 publication")
+        return cls(
+            base_publication=PublicationDocumentV7._from_json(raw_base, allow_bar_charts=True),
             article_format=_article_format_from_json(document["article_format"]),
             registry_hash=json_sha256(document["registry_hash"], "Publication registry hash"),
             synthesis_canonical_sha256=json_sha256(
@@ -3782,6 +3911,7 @@ type CanonicalPublicationDocument = (
     | PublicationDocumentV7
     | PublicationDocumentV8
     | PublicationDocumentV9
+    | PublicationDocumentV10
 )
 
 
@@ -3828,8 +3958,10 @@ def publication_document_v6_from_json(payload: Mapping[str, Any]) -> Publication
     return PublicationDocumentV6._from_json(payload)
 
 
-def publication_document_v7_from_json(payload: Mapping[str, Any]) -> PublicationDocumentV7:
-    return PublicationDocumentV7._from_json(payload)
+def publication_document_v7_from_json(
+    payload: Mapping[str, Any], *, allow_bar_charts: bool = False
+) -> PublicationDocumentV7:
+    return PublicationDocumentV7._from_json(payload, allow_bar_charts=allow_bar_charts)
 
 
 def publication_document_v7_to_json(document: PublicationDocumentV7) -> dict[str, Any]:
@@ -3858,6 +3990,16 @@ def publication_document_v9_to_json(document: PublicationDocumentV9) -> dict[str
     return document._to_json()
 
 
+def publication_document_v10_from_json(payload: Mapping[str, Any]) -> PublicationDocumentV10:
+    return PublicationDocumentV10._from_json(payload)
+
+
+def publication_document_v10_to_json(document: PublicationDocumentV10) -> dict[str, Any]:
+    if not isinstance(document, PublicationDocumentV10):
+        raise ValueError("Expected a PublicationDocumentV10")
+    return document._to_json()
+
+
 def publication_document_from_json(payload: Mapping[str, Any]) -> CanonicalPublicationDocument:
     version = payload.get("schema_version")
     if version == PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION:
@@ -3872,6 +4014,8 @@ def publication_document_from_json(payload: Mapping[str, Any]) -> CanonicalPubli
         return publication_document_v8_from_json(payload)
     if version == PUBLICATION_DOCUMENT_V9_SCHEMA_VERSION:
         return publication_document_v9_from_json(payload)
+    if version == PUBLICATION_DOCUMENT_V10_SCHEMA_VERSION:
+        return publication_document_v10_from_json(payload)
     raise ValueError(f"unsupported publication document schema_version={version!r}")
 
 
@@ -3888,6 +4032,7 @@ def validate_publication_document(
             PublicationDocumentV7,
             PublicationDocumentV8,
             PublicationDocumentV9,
+            PublicationDocumentV10,
         ),
     ):
         if value.schema_version not in {
@@ -3897,6 +4042,7 @@ def validate_publication_document(
             PUBLICATION_DOCUMENT_V7_SCHEMA_VERSION,
             PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION,
             PUBLICATION_DOCUMENT_V9_SCHEMA_VERSION,
+            PUBLICATION_DOCUMENT_V10_SCHEMA_VERSION,
         }:
             raise ValueError(
                 f"unsupported publication document schema_version={value.schema_version!r}"
@@ -3921,6 +4067,8 @@ def serialize_publication_document(
         return validated._to_json()
     if isinstance(validated, PublicationDocumentV7):
         return validated._to_json()
+    if isinstance(validated, PublicationDocumentV10):
+        return validated._to_json()
     if isinstance(validated, PublicationDocumentV9):
         return validated._to_json()
     if isinstance(validated, PublicationDocumentV8):
@@ -3938,6 +4086,7 @@ __all__ = [
     "PUBLICATION_DOCUMENT_V7_SCHEMA_VERSION",
     "PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION",
     "PUBLICATION_DOCUMENT_V9_SCHEMA_VERSION",
+    "PUBLICATION_DOCUMENT_V10_SCHEMA_VERSION",
     "ArticleFormatV1",
     "ArticleOverviewV1",
     "CanonicalPublicationDocument",
@@ -3957,6 +4106,7 @@ __all__ = [
     "PublicationDocumentV7",
     "PublicationDocumentV8",
     "PublicationDocumentV9",
+    "PublicationDocumentV10",
     "PublicationIOCValueV1",
     "PublicationSourceFigureV1",
     "PublicationTableColumnV1",
@@ -3986,6 +4136,8 @@ __all__ = [
     "publication_document_v8_to_json",
     "publication_document_v9_from_json",
     "publication_document_v9_to_json",
+    "publication_document_v10_from_json",
+    "publication_document_v10_to_json",
     "select_article_timeline_key_events_v1",
     "select_publication_timeline_key_events_v2",
     "select_publication_timeline_key_events_v3",

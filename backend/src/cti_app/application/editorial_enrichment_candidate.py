@@ -25,7 +25,9 @@ from cti_app.application.production_stages import EditorialEnrichmentService
 from cti_app.domain.production import ProductionArtifact, ProductionArtifactStage
 from cti_app.domain.production_editorial_enrichment import (
     EDITORIAL_ENRICHMENT_V9_POLICY_VERSION,
+    EDITORIAL_ENRICHMENT_V10_POLICY_VERSION,
     EDITORIAL_RESOURCE_PROPOSAL_POLICY_VERSION,
+    ChartKind,
     DiagramSpecV1,
     EditorialEnrichmentElementKind,
     EditorialEnrichmentRevisionAction,
@@ -289,6 +291,9 @@ async def build_candidate_from_validated_patch(
         )
         for item in values
     )
+    candidate_has_bar_chart = validated_patch is not None and any(
+        chart.kind is ChartKind.BAR for chart in validated_patch.charts
+    )
     if candidate_has_paragraph_placement and base_enrichment.schema_version < 9:
         if base_enrichment.schema_version < 8:
             raise EditorialEnrichmentRevisionValidationError(
@@ -303,6 +308,12 @@ async def build_candidate_from_validated_patch(
             base_enrichment,
             schema_version=9,
             enrichment_policy_version=EDITORIAL_ENRICHMENT_V9_POLICY_VERSION,
+        )
+    if candidate_has_bar_chart and base_enrichment.schema_version < 10:
+        base_enrichment = replace(
+            base_enrichment,
+            schema_version=10,
+            enrichment_policy_version=EDITORIAL_ENRICHMENT_V10_POLICY_VERSION,
         )
 
     outcome = (

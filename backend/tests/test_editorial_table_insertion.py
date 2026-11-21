@@ -697,7 +697,8 @@ async def test_manual_table_input_rejects_unsafe_text_with_stable_code(
         ),
     ],
 )
-def test_typed_table_wire_uses_real_validator_for_registered_anchor_payload(
+@pytest.mark.asyncio
+async def test_typed_table_wire_uses_real_validator_for_registered_anchor_payload(
     row_count: int,
     invalid_field: str | None,
     invalid_text: str | None,
@@ -944,7 +945,7 @@ def test_typed_table_wire_uses_real_validator_for_registered_anchor_payload(
     )
     service = EditorialProposalService(uow_factory=object())
 
-    patch_payload, state, event_kind, diagnostics = service._validate_result(preparation)
+    patch_payload, state, event_kind, diagnostics = await service._validate_result(preparation)
 
     assert state.value == expected_state
     if expected_state == "proposed":

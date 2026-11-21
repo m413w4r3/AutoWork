@@ -40,6 +40,7 @@ from cti_app.application.publication_builder import (
     ARTICLE_FORMAT_POLICY_VERSION,
     ASSEMBLY_POLICY_VERSION,
     PUBLICATION_ANCHOR_ASSEMBLY_POLICY_VERSION,
+    QUANTITATIVE_CHART_ASSEMBLY_POLICY_VERSION,
     PublicationAssemblyValidationError,
     build_article_format_v1,
     build_publication_document_v5,
@@ -59,6 +60,7 @@ from cti_app.domain.production import (
     ProductionRun,
 )
 from cti_app.domain.production_editorial_enrichment import (
+    ChartKind,
     EditorialEnrichmentV1,
     EnrichmentPlacementKind,
     editorial_enrichment_to_json,
@@ -71,8 +73,10 @@ from cti_app.domain.publication import PublicationAssemblyErrorCode
 from cti_app.domain.publication_document import (
     PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION,
     PUBLICATION_DOCUMENT_V9_SCHEMA_VERSION,
+    PUBLICATION_DOCUMENT_V10_SCHEMA_VERSION,
     PublicationDocumentV8,
     PublicationDocumentV9,
+    PublicationDocumentV10,
     ResolvedPublicationPlacementV1,
     parse_publication_document,
     serialize_publication_document,
@@ -106,6 +110,20 @@ def _has_after_paragraph(enrichment: EditorialEnrichmentV1 | None) -> bool:
         )
         for item in collection
     )
+
+
+def _has_bar_chart(enrichment: EditorialEnrichmentV1 | None) -> bool:
+    return enrichment is not None and any(
+        chart.kind is ChartKind.BAR for chart in enrichment.charts
+    )
+
+
+def _publication_schema_version(enrichment: EditorialEnrichmentV1 | None) -> str:
+    if _has_bar_chart(enrichment):
+        return PUBLICATION_DOCUMENT_V10_SCHEMA_VERSION
+    if _has_after_paragraph(enrichment):
+        return PUBLICATION_DOCUMENT_V9_SCHEMA_VERSION
+    return PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION
 
 
 def _resolve_editorial_placements(
@@ -488,13 +506,20 @@ class PublicationAssemblyService:
                         PublicationAssemblyErrorCode.EDITORIAL_ANCHOR_STALE,
                         "editorial_anchor_stale",
                     )
-                publication = PublicationDocumentV9(
-                    base_publication=base_v7,
-                    article_format=article_format,
-                    registry_hash=workspace_snapshot_record.registry_hash,
-                    synthesis_canonical_sha256=workspace_snapshot_record.synthesis_canonical_sha256,
-                    enrichment_canonical_sha256=enrichment_canonical_sha256,
-                    resolved_placements=resolved_placements,
+                envelope = {
+                    "base_publication": base_v7,
+                    "article_format": article_format,
+                    "registry_hash": workspace_snapshot_record.registry_hash,
+                    "synthesis_canonical_sha256": (
+                        workspace_snapshot_record.synthesis_canonical_sha256
+                    ),
+                    "enrichment_canonical_sha256": enrichment_canonical_sha256,
+                    "resolved_placements": resolved_placements,
+                }
+                publication = (
+                    PublicationDocumentV10(**envelope)
+                    if any(chart.kind is ChartKind.BAR for chart in editorial_enrichment.charts)
+                    else PublicationDocumentV9(**envelope)
                 )
             payload = serialize_publication_document(publication)
             return (
@@ -670,12 +695,8 @@ class PublicationAssemblyService:
         else:
             if relevance_projection is None:
                 raise ValueError("Brief assembly input hash requires relevance projection")
-            is_v9 = _has_after_paragraph(editorial_enrichment)
-            document_schema_version = (
-                PUBLICATION_DOCUMENT_V9_SCHEMA_VERSION
-                if is_v9
-                else PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION
-            )
+            has_after_paragraph = _has_after_paragraph(editorial_enrichment)
+            document_schema_version = _publication_schema_version(editorial_enrichment)
             brief_identity: dict[str, Any] = {
                 "snapshot_input_hash": snapshot.input_hash,
                 "references_hash": references_corpus_hash(references),
@@ -687,7 +708,7 @@ class PublicationAssemblyService:
                 "article_format_policy_version": ARTICLE_FORMAT_POLICY_VERSION,
             }
             if editorial_enrichment is not None:
-                if is_v9:
+                if has_after_paragraph:
                     if workspace_snapshot_record is None or (
                         workspace_snapshot_record.subject_id != snapshot.subject_id
                         or workspace_snapshot_record.production_run_id != snapshot.production_run_id
@@ -715,14 +736,15 @@ class PublicationAssemblyService:
             content_hash = hashlib.sha256(
                 ProductionArtifactStore.canonical_json_bytes(brief_identity)
             ).hexdigest()
-        is_v9 = _has_after_paragraph(editorial_enrichment)
-        document_schema_version = (
-            PUBLICATION_DOCUMENT_V9_SCHEMA_VERSION
-            if is_v9
-            else PUBLICATION_DOCUMENT_V8_SCHEMA_VERSION
-        )
+        has_after_paragraph = _has_after_paragraph(editorial_enrichment)
+        has_bar_chart = _has_bar_chart(editorial_enrichment)
+        document_schema_version = _publication_schema_version(editorial_enrichment)
         assembly_policy_version = (
-            PUBLICATION_ANCHOR_ASSEMBLY_POLICY_VERSION if is_v9 else ASSEMBLY_POLICY_VERSION
+            QUANTITATIVE_CHART_ASSEMBLY_POLICY_VERSION
+            if has_bar_chart
+            else PUBLICATION_ANCHOR_ASSEMBLY_POLICY_VERSION
+            if has_after_paragraph
+            else ASSEMBLY_POLICY_VERSION
         )
         return hashlib.sha256(
             ProductionArtifactStore.canonical_json_bytes(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
@@ -63,6 +64,7 @@ from cti_app.domain.editorial_workspace import (
     bootstrap_block_registry,
     canonical_content_sha256,
 )
+from cti_app.domain.media_assets import MediaAssetKind
 from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
@@ -72,7 +74,9 @@ from cti_app.domain.production import (
     SynthesisMode,
 )
 from cti_app.domain.production_editorial_enrichment import (
+    ChartKind,
     EditorialEnrichmentElementKind,
+    EditorialEnrichmentV1,
     editorial_enrichment_from_json,
 )
 from cti_app.domain.production_editorial_revision import (
@@ -219,6 +223,68 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
         self._enrichment_revision_service = enrichment_revision_service
         self._resource_search_enabled = resource_search_enabled
         self._prepared: dict[UUID, _PreparedInputs] = {}
+
+    async def _verify_bar_chart_asset(
+        self,
+        *,
+        proposal_patch: Mapping[str, Any],
+        candidate: EditorialEnrichmentV1,
+        operation: TargetedEditorialRevisionOperation,
+    ) -> tuple[EditorialEnrichmentV1, Mapping[str, object] | None]:
+        if operation is not TargetedEditorialRevisionOperation.CREATE_BAR_CHART:
+            return candidate, None
+        raw_manifest = proposal_patch.get("compiled_chart_asset")
+        required = {
+            "asset_id",
+            "sha256",
+            "compiler_name",
+            "compiler_version",
+            "policy_version",
+        }
+        if not isinstance(raw_manifest, Mapping) or set(raw_manifest) != required:
+            raise EditorialProposalAdoptionError("proposal_patch_invalid")
+        try:
+            asset_id = UUID(str(raw_manifest["asset_id"]))
+        except (TypeError, ValueError):
+            raise EditorialProposalAdoptionError("proposal_patch_invalid") from None
+        if (
+            len(candidate.charts) != 1
+            or candidate.charts[0].kind is not ChartKind.BAR
+            or not isinstance(raw_manifest.get("sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", str(raw_manifest["sha256"])) is None
+            or any(
+                not isinstance(raw_manifest.get(field_name), str)
+                for field_name in ("compiler_name", "compiler_version", "policy_version")
+            )
+        ):
+            raise EditorialProposalAdoptionError("proposal_patch_invalid")
+        media_store = getattr(self._enrichment_loader, "_media_asset_store", None)
+        compiler = getattr(self._enrichment_loader, "_chart_compiler", None)
+        if media_store is None or compiler is None:
+            raise EditorialProposalAdoptionError("editorial_enrichment_chart_render_failed")
+        chart = candidate.charts[0]
+        try:
+            compiled = await compiler.compile(chart)
+            manifest = await media_store.get(asset_id)
+            content = await media_store.read(asset_id)
+        except Exception:
+            raise EditorialProposalAdoptionError(
+                "editorial_enrichment_chart_render_failed"
+            ) from None
+        if (
+            manifest is None
+            or manifest.asset_id != asset_id
+            or manifest.kind is not MediaAssetKind.CHART_SVG
+            or manifest.sha256 != raw_manifest["sha256"]
+            or manifest.compiler_name != raw_manifest["compiler_name"]
+            or manifest.compiler_version != raw_manifest["compiler_version"]
+            or manifest.policy_version != raw_manifest["policy_version"]
+            or compiled.media_sha256 != manifest.sha256
+            or compiled.media_bytes != content
+        ):
+            raise EditorialProposalAdoptionError("proposal_patch_invalid")
+        compiled_chart = replace(chart, compiled_asset_id=asset_id)
+        return replace(candidate, charts=(compiled_chart,)), dict(raw_manifest)
 
     async def synthesis_inputs(
         self,
@@ -470,6 +536,7 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                 raise EditorialProposalAdoptionError("proposal_target_mismatch")
             is_create = operation in {
                 TargetedEditorialRevisionOperation.CREATE_TABLE,
+                TargetedEditorialRevisionOperation.CREATE_BAR_CHART,
                 TargetedEditorialRevisionOperation.CREATE_DIAGRAM,
                 TargetedEditorialRevisionOperation.CREATE_CHART,
                 TargetedEditorialRevisionOperation.CREATE_SOURCE_FIGURE,
@@ -481,10 +548,13 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                 TargetedEditorialRevisionOperation.DELETE_SOURCE_FIGURE,
             }
             table_insertion = operation is TargetedEditorialRevisionOperation.CREATE_TABLE
+            bar_chart_insertion = operation is TargetedEditorialRevisionOperation.CREATE_BAR_CHART
+            paragraph_enrichment_insertion = table_insertion or bar_chart_insertion
             raw_patch = patch.get("enrichment_patch")
             if not isinstance(raw_patch, dict):
                 raise EditorialProposalAdoptionError("proposal_patch_invalid")
             table_key: str | None = None
+            chart_key: str | None = None
             if table_insertion:
                 raw_tables = raw_patch.get("tables")
                 if (
@@ -501,7 +571,30 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                 ):
                     raise EditorialProposalAdoptionError("editorial_anchor_stale")
                 table_key = str(raw_tables[0]["key"])
-            element_key = table_key if table_insertion else target.element_key
+            if bar_chart_insertion:
+                raw_charts = raw_patch.get("charts")
+                if (
+                    target.element_kind is not EditorialEnrichmentElementKind.CHART
+                    or target.element_key is not None
+                    or target.placement is None
+                    or target.placement.kind
+                    is not TargetedEditorialRevisionPlacementKind.AFTER_PARAGRAPH
+                    or target.placement.anchor_block_id != proposal.occurrence_id
+                    or not isinstance(raw_charts, list)
+                    or len(raw_charts) != 1
+                    or not isinstance(raw_charts[0], Mapping)
+                    or raw_charts[0].get("kind") != ChartKind.BAR.value
+                    or not isinstance(raw_charts[0].get("key"), str)
+                ):
+                    raise EditorialProposalAdoptionError("editorial_anchor_stale")
+                chart_key = str(raw_charts[0]["key"])
+            element_key = (
+                table_key
+                if table_insertion
+                else chart_key
+                if bar_chart_insertion
+                else target.element_key
+            )
             if element_key is None:
                 raise EditorialProposalAdoptionError("proposal_target_mismatch")
             base_enrichment = editorial_enrichment_from_json(base_payload)
@@ -511,12 +604,12 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                 or resolution.binding_state != "valid"
                 or (
                     target_entry.source_stage is not EditorialSourceStage.SYNTHESIS
-                    if table_insertion
+                    if paragraph_enrichment_insertion
                     else target_entry.source_stage is not EditorialSourceStage.EDITORIAL_ENRICHMENT
                 )
                 or target_entry.content_sha256 != proposal.before_hash
                 or (
-                    table_insertion
+                    paragraph_enrichment_insertion
                     and (
                         target_entry.kind.value not in {"paragraph", "lead_paragraph"}
                         or target_entry.block_id != proposal.occurrence_id
@@ -524,8 +617,10 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                 )
             ):
                 raise EditorialProposalAdoptionError(
-                    "editorial_anchor_stale" if table_insertion else "proposal_base_stale",
-                    reason=None if table_insertion else "pins:enrichment_occurrence",
+                    "editorial_anchor_stale"
+                    if paragraph_enrichment_insertion
+                    else "proposal_base_stale",
+                    reason=None if paragraph_enrichment_insertion else "pins:enrichment_occurrence",
                 )
             request = TargetedEditorialRevisionRequest(
                 subject_id=proposal.subject_id,
@@ -549,6 +644,11 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                 synthesis=synthesis,
                 figure_catalog=fence.figure_catalog,
             )
+            validated_patch, compiled_chart_asset = await self._verify_bar_chart_asset(
+                proposal_patch=patch,
+                candidate=validated_patch,
+                operation=operation,
+            )
             assert_adoption_rewrite_table_placement(
                 base_enrichment=base_enrichment,
                 candidate=validated_patch,
@@ -563,7 +663,7 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                     element_kind=target.element_kind,
                     targeted_request=request,
                     synthesis=synthesis,
-                    evidence_pack=fence.evidence_pack if table_insertion else None,
+                    evidence_pack=(fence.evidence_pack if paragraph_enrichment_insertion else None),
                 )
             candidate = await build_enrichment_candidate(
                 base_artifact=base_artifact,
@@ -615,6 +715,7 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                         diagram, run_id=run.id
                     )
                 ),
+                compiled_chart_asset=compiled_chart_asset,
             )
         except EditorialProposalAdoptionError:
             raise

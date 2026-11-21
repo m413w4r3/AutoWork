@@ -1576,6 +1576,7 @@ class ProductionEditorialEnrichmentRevisionService:
             TargetedEditorialRevisionOperation.CREATE_TABLE,
             TargetedEditorialRevisionOperation.CREATE_DIAGRAM,
             TargetedEditorialRevisionOperation.CREATE_CHART,
+            TargetedEditorialRevisionOperation.CREATE_BAR_CHART,
         }
         if is_create:
             element_key = self._generated_element_key(element_kind, request_identity, base_elements)

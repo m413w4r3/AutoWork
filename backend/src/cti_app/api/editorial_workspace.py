@@ -7,6 +7,7 @@ import sys
 import traceback
 from collections.abc import Callable, Coroutine, Mapping
 from datetime import datetime
+from decimal import Decimal
 from typing import Annotated, Any, Literal, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -14,7 +15,15 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, Resp
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from starlette.responses import JSONResponse
 
 from cti_app.application.editorial_drafts import (
@@ -37,6 +46,7 @@ from cti_app.application.editorial_proposal_adoption_inputs import (
     ProductionEditorialProposalAdoptionInputs,
 )
 from cti_app.application.editorial_proposals import (
+    EditorialBarChartDiagnosticReason,
     EditorialProposalApplicationError,
     EditorialProposalService,
     EditorialTableDiagnosticReason,
@@ -64,6 +74,10 @@ from cti_app.domain.editorial_proposal import EditorialProposalConflict
 from cti_app.domain.editorial_thread import EditorialThreadEventKind
 from cti_app.domain.editorial_workspace import EditorialWorkspaceError
 from cti_app.domain.production_editorial_enrichment import (
+    BAR_CHART_INSUFFICIENT_DATA_MESSAGE,
+    ChartKind,
+    ChartPointV1,
+    ChartSpecV1,
     EditorialAnalyticPurposeV1,
     EnrichmentPlacementKind,
     EnrichmentPlacementV1,
@@ -153,9 +167,15 @@ class EditorialWorkspaceRoute(APIRoute):
             is_accept = self.path_format.endswith("/accept")
             is_manual_edit = self.path_format.endswith("/manual-edit")
             is_manual_table_proposal = self.path_format.endswith("/table-proposals")
+            is_manual_bar_chart_proposal = self.path_format.endswith("/bar-chart-proposals")
             is_draft = self.path_format.endswith("/draft")
             is_figure_catalog = "/editor/figures" in self.path_format
-            if is_accept or is_manual_edit or is_manual_table_proposal:
+            if (
+                is_accept
+                or is_manual_edit
+                or is_manual_table_proposal
+                or is_manual_bar_chart_proposal
+            ):
                 try:
                     enabled = get_settings().editorial_proposal_accept_enabled
                 except Exception:
@@ -173,7 +193,7 @@ class EditorialWorkspaceRoute(APIRoute):
                             }
                         },
                     )
-            if is_manual_edit or is_manual_table_proposal:
+            if is_manual_edit or is_manual_table_proposal or is_manual_bar_chart_proposal:
                 raw_length = request.headers.get("content-length")
                 if raw_length is not None:
                     try:
@@ -251,6 +271,26 @@ class EditorialWorkspaceRoute(APIRoute):
                             "detail": {
                                 "code": "manual_table_request_invalid",
                                 "message": _ERROR_MESSAGES["manual_table_request_invalid"],
+                            }
+                        },
+                    )
+                elif is_manual_bar_chart_proposal:
+                    logger.warning(
+                        "manual_bar_chart_proposal_rejected code=%s reason=%s "
+                        "validator_code=%s frame=%s subject_id=%s occurrence_id=%s",
+                        "manual_bar_chart_request_invalid",
+                        EditorialBarChartDiagnosticReason.REQUEST_INVALID.value,
+                        "bar_chart_request_schema_invalid",
+                        _caller_frame(),
+                        request.path_params.get("subject_id", "unknown"),
+                        request.path_params.get("occurrence_id", "unknown"),
+                    )
+                    response = JSONResponse(
+                        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                        content={
+                            "detail": {
+                                "code": "manual_bar_chart_request_invalid",
+                                "message": _ERROR_MESSAGES["manual_bar_chart_request_invalid"],
                             }
                         },
                     )
@@ -372,6 +412,29 @@ class EditorialWorkspaceTable(BaseModel):
     placement: Literal["after_paragraph", "after_lead", "after_timeline", "after_section", "end"]
 
 
+class EditorialWorkspaceBarChartPoint(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    label: str
+    value: str
+    evidence_refs: list[dict[str, object]]
+
+
+class EditorialWorkspaceBarChart(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    key: str
+    kind: Literal["bar"]
+    title: str
+    caption: str | None
+    legend: list[str]
+    category_axis_label: str
+    value_axis_label: str
+    unit: str
+    points: list[EditorialWorkspaceBarChartPoint]
+    anchor_block_id: UUID
+
+
 class EditorialWorkspaceBlock(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -391,6 +454,7 @@ class EditorialWorkspaceBlock(BaseModel):
     text: str | None
     evidence_refs: list[dict[str, object]]
     table: EditorialWorkspaceTable | None = None
+    chart: EditorialWorkspaceBarChart | None = None
     revision_target: EditorialWorkspaceRevisionTarget
     before_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     allowed_operations: list[str]
@@ -714,7 +778,7 @@ class EditorialTableRowRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     cells: list[str] = Field(min_length=2, max_length=64)
-    evidence_refs: list[EditorialTableEvidenceReferenceRequest] = Field(min_length=1)
+    evidence_refs: list[EditorialTableEvidenceReferenceRequest] = Field(min_length=1, max_length=8)
 
 
 class EditorialTablePurposeRequest(BaseModel):
@@ -756,6 +820,58 @@ class EditorialManualTableProposalRequest(BaseModel):
     snapshot_id: UUID
     anchor_block_id: UUID
     table: EditorialTableDraftRequest
+
+
+class EditorialBarChartPointRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    label: str = Field(min_length=1, max_length=500)
+    series: str = Field(min_length=1, max_length=120)
+    value: Decimal
+    evidence_refs: list[EditorialTableEvidenceReferenceRequest] = Field(min_length=1)
+
+    @field_validator("value")
+    @classmethod
+    def _bounded_finite_value(cls, value: Decimal) -> Decimal:
+        if not value.is_finite():
+            raise ValueError("Bar chart values must be finite")
+        normalized = value.normalize() if value else Decimal(0)
+        if len(normalized.as_tuple().digits) > 18 or abs(normalized.adjusted()) > 12:
+            raise ValueError("Bar chart value exceeds the supported numeric bounds")
+        return value
+
+
+class EditorialBarChartDraftRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    key: str = Field(min_length=1, max_length=128)
+    title: str = Field(min_length=1, max_length=1000)
+    caption: str | None = Field(default=None, max_length=2000)
+    category_axis_label: str = Field(min_length=1, max_length=120)
+    value_axis_label: str = Field(min_length=1, max_length=120)
+    unit: str = Field(min_length=1, max_length=120)
+    points: list[EditorialBarChartPointRequest] = Field(min_length=2, max_length=24)
+    purpose: EditorialTablePurposeRequest
+
+    @model_validator(mode="after")
+    def _bar_chart_shape(self) -> EditorialBarChartDraftRequest:
+        if any(not point.value.is_finite() for point in self.points):
+            raise ValueError("Bar chart values must be finite")
+        if len({point.series for point in self.points}) > 6:
+            raise ValueError("Bar chart series limit exceeded")
+        if len({point.label.casefold() for point in self.points}) != len(self.points):
+            raise ValueError("Bar chart labels must be unique")
+        if len(self.purpose.evidence_refs) > 24:
+            raise ValueError("Bar chart purpose evidence limit exceeded")
+        return self
+
+
+class EditorialManualBarChartProposalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    snapshot_id: UUID
+    anchor_block_id: UUID
+    chart: EditorialBarChartDraftRequest
 
 
 class EditorialProposalAcceptView(BaseModel):
@@ -894,6 +1010,12 @@ _ERROR_MESSAGES = {
     ),
     "manual_edit_request_invalid": "La requête de modification est invalide.",
     "manual_table_request_invalid": "La requête de tableau est invalide.",
+    "manual_bar_chart_request_invalid": "La requête de graphique à barres est invalide.",
+    "manual_bar_chart_analytic_question_duplicate": (
+        "La question analytique existe déjà dans l'enrichissement."
+    ),
+    "bar_chart_insufficient_data": BAR_CHART_INSUFFICIENT_DATA_MESSAGE,
+    "bar_chart_value_not_evidenced": BAR_CHART_INSUFFICIENT_DATA_MESSAGE,
     "manual_edit_unavailable": "La modification manuelle est temporairement indisponible.",
     "accept_not_enabled": "L'acceptation des propositions est désactivée.",
     "editorial_proposal_accept_unavailable": (
@@ -1226,6 +1348,8 @@ def _manual_proposal_service(request: Request) -> EditorialProposalService:
             workspace_service=workspace_service,
             artifact_store=artifact_store,
         ),
+        chart_compiler=AnalyticChartRenderer(),
+        media_asset_store=getattr(request.app.state, "media_asset_store", None),
     )
 
 
@@ -2187,6 +2311,190 @@ async def prepare_manual_editorial_table_proposal(
                     code, "Le brouillon de tableau ne respecte pas le contrat éditorial."
                 ),
             },
+        ) from None
+
+
+@router.post(
+    "/subjects/{subject_id}/editor/blocks/{occurrence_id}/bar-chart-proposals",
+    response_model=EditorialProposalView,
+)
+async def prepare_manual_editorial_bar_chart_proposal(
+    subject_id: UUID,
+    occurrence_id: UUID,
+    request: Request,
+    payload: EditorialManualBarChartProposalRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> EditorialProposalView:
+    if idempotency_key is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "idempotency_key_required",
+                "message": _ERROR_MESSAGES["idempotency_key_required"],
+            },
+        )
+    if not is_valid_editorial_idempotency_key(idempotency_key):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "idempotency_key_invalid",
+                "message": _ERROR_MESSAGES["idempotency_key_invalid"],
+            },
+        )
+    if payload.anchor_block_id != occurrence_id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "code": "editorial_anchor_stale",
+                "message": _ERROR_MESSAGES["editorial_anchor_stale"],
+            },
+        )
+    if not _proposal_impact_consumer_wired():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "manual_edit_unavailable",
+                "message": _ERROR_MESSAGES["manual_edit_unavailable"],
+            },
+        )
+
+    from cti_app.domain.editorial_proposal import ManualBarChartPatch, ManualPatch
+
+    chart_input = payload.chart
+    purpose_input = chart_input.purpose
+    try:
+        if len(chart_input.points) < 2:
+            raise ValueError("bar_chart_insufficient_data")
+        chart = ChartSpecV1(
+            key=chart_input.key,
+            kind=ChartKind.BAR,
+            title=chart_input.title,
+            caption=chart_input.caption,
+            placement=EnrichmentPlacementV1(
+                EnrichmentPlacementKind.AFTER_PARAGRAPH,
+                anchor_block_id=occurrence_id,
+            ),
+            purpose=EditorialAnalyticPurposeV1(
+                question=purpose_input.question,
+                available_data=purpose_input.available_data,
+                comprehension_gain=purpose_input.comprehension_gain,
+                scope=purpose_input.scope,
+                evidence_refs=tuple(
+                    reference.to_domain() for reference in purpose_input.evidence_refs
+                ),
+                knowledge_limits=purpose_input.knowledge_limits,
+                placement_reason=purpose_input.placement_reason,
+            ),
+            points=tuple(
+                ChartPointV1(
+                    label=point.label,
+                    date=None,
+                    series=point.series,
+                    evidence_refs=tuple(reference.to_domain() for reference in point.evidence_refs),
+                    value=point.value,
+                )
+                for point in chart_input.points
+            ),
+            category_axis_label=chart_input.category_axis_label,
+            value_axis_label=chart_input.value_axis_label,
+            unit=chart_input.unit,
+        )
+        service = _manual_proposal_service(request)
+        actor_id = await _thread_actor_id(request)
+        proposal = await service.prepare_manual_patch(
+            subject_id=subject_id,
+            snapshot_id=payload.snapshot_id,
+            occurrence_id=occurrence_id,
+            actor_id=actor_id,
+            idempotency_key=idempotency_key,
+            patch=ManualPatch(
+                typed_patch=ManualBarChartPatch(
+                    anchor_block_id=occurrence_id,
+                    chart=chart,
+                )
+            ),
+        )
+        if proposal.patch_sha256 is None:
+            raise EditorialProposalApplicationError("proposal_patch_invalid")
+        view = await service.inspect(
+            subject_id,
+            occurrence_id,
+            proposal.id,
+            workspace_service=_service(request),
+        )
+        return EditorialProposalView.model_validate(view, from_attributes=True)
+    except HTTPException:
+        raise
+    except EditorialProposalConflict as error:
+        logger.warning(
+            "manual_bar_chart_proposal_rejected code=%s reason=%s validator_code=%s frame=%s "
+            "subject_id=%s occurrence_id=%s",
+            error.code,
+            EditorialBarChartDiagnosticReason.IDEMPOTENCY_CONFLICT.value,
+            _manual_table_validator_log_code(error),
+            _manual_table_frame(error),
+            subject_id,
+            occurrence_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "proposal_idempotency_conflict",
+                "message": _ERROR_MESSAGES["proposal_idempotency_conflict"],
+            },
+        ) from error
+    except (EditorialProposalApplicationError, EditorialWorkspaceError, ValueError) as error:
+        raw_code = getattr(error, "code", None)
+        code = (
+            raw_code
+            if isinstance(raw_code, str) and re.fullmatch(r"[a-z][a-z0-9_]*", raw_code)
+            else "manual_edit_patch_invalid"
+        )
+        raw_reason = getattr(error, "reason", None)
+        try:
+            reason = EditorialBarChartDiagnosticReason(raw_reason)
+        except (TypeError, ValueError):
+            reason = {
+                "bar_chart_insufficient_data": (
+                    EditorialBarChartDiagnosticReason.EVIDENCE_UNADMITTED
+                ),
+                "manual_edit_new_fact_unadmitted": (
+                    EditorialBarChartDiagnosticReason.EVIDENCE_UNADMITTED
+                ),
+                "editorial_anchor_stale": EditorialBarChartDiagnosticReason.ANCHOR_STALE,
+                "proposal_base_unavailable": (
+                    EditorialBarChartDiagnosticReason.DEPENDENCIES_UNAVAILABLE
+                ),
+                "proposal_workspace_unavailable": (
+                    EditorialBarChartDiagnosticReason.DEPENDENCIES_UNAVAILABLE
+                ),
+            }.get(code, EditorialBarChartDiagnosticReason.VALIDATOR_REJECTED)
+        frame = _manual_table_frame(error, getattr(error, "frame", None))
+        logger.warning(
+            "manual_bar_chart_proposal_rejected code=%s reason=%s validator_code=%s frame=%s "
+            "subject_id=%s occurrence_id=%s",
+            code,
+            reason.value,
+            _manual_table_validator_log_code(error),
+            frame,
+            subject_id,
+            occurrence_id,
+        )
+        response_status = (
+            status.HTTP_409_CONFLICT
+            if code in {"editorial_anchor_stale", "proposal_base_stale", "editorial_snapshot_stale"}
+            else status.HTTP_503_SERVICE_UNAVAILABLE
+            if code in {"proposal_base_unavailable", "proposal_workspace_unavailable"}
+            else status.HTTP_422_UNPROCESSABLE_CONTENT
+        )
+        message = (
+            BAR_CHART_INSUFFICIENT_DATA_MESSAGE
+            if code in {"bar_chart_insufficient_data", "bar_chart_value_not_evidenced"}
+            else _ERROR_MESSAGES.get(code, _ERROR_MESSAGES["manual_edit_patch_invalid"])
+        )
+        raise HTTPException(
+            status_code=response_status,
+            detail={"code": code, "message": message},
         ) from None
 
 

@@ -86,6 +86,7 @@ from cti_app.domain.publication_document import (
     PublicationDocumentV7,
     PublicationDocumentV8,
     PublicationDocumentV9,
+    PublicationDocumentV10,
     PublicationIOCDisposition,
     PublicationSourceFigureV1,
     PublicationTableV1,
@@ -107,6 +108,7 @@ from cti_app.domain.subject_ioc_eligibility import is_supported_publication_ioc_
 # v40 localizes opinion IOC labels and keeps protocol figure proof captions visible.
 _RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v40-m21-opinion-render"
 _RENDER_DATA_SCHEMA_VERSION_V9 = "typst-publication-model-v41-after-paragraph-anchors"
+_RENDER_DATA_SCHEMA_VERSION_V10 = "typst-publication-model-v42-evidence-backed-bar-charts"
 _BRIEF_PUBLICATION_EVENTS_POLICY_VERSION = "brief-assembly-v4-m19-publication-events"
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
 _FRENCH_MONTH_NAMES = (
@@ -2220,7 +2222,9 @@ class TypstRenderer:
         )
         render_data: dict[str, Any] = {
             "schema_version": (
-                _RENDER_DATA_SCHEMA_VERSION_V9
+                _RENDER_DATA_SCHEMA_VERSION_V10
+                if isinstance(classification_document, PublicationDocumentV10)
+                else _RENDER_DATA_SCHEMA_VERSION_V9
                 if isinstance(classification_document, PublicationDocumentV9)
                 else _RENDER_DATA_SCHEMA_VERSION
             ),
@@ -2229,7 +2233,12 @@ class TypstRenderer:
             or (
                 isinstance(
                     document,
-                    (PublicationDocumentV6, PublicationDocumentV7, PublicationDocumentV8),
+                    (
+                        PublicationDocumentV6,
+                        PublicationDocumentV7,
+                        PublicationDocumentV8,
+                        PublicationDocumentV10,
+                    ),
                 )
                 and document.analyst_opinion is not None
             ),
@@ -2394,7 +2403,9 @@ def project_publication_to_typst_model(
 ) -> TypstPublicationModelV2:
     """Project a canonical publication while keeping semantic content as data."""
     draft_preview = value if isinstance(value, TypstDraftPreviewDocument) else None
-    publication_v9 = value if isinstance(value, PublicationDocumentV9) else None
+    publication_v9 = (
+        value if isinstance(value, (PublicationDocumentV9, PublicationDocumentV10)) else None
+    )
     publication_v8 = value if isinstance(value, PublicationDocumentV8) else None
     publication_v7 = (
         publication_v8.base_publication

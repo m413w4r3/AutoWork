@@ -34,6 +34,7 @@ const snapshot: EditorialWorkspaceSnapshot = {
       position: 0,
       text: "Synthetic paragraph A",
       evidence_refs: [],
+      chart: null,
       revision_target: {
         block_id: "block-occurrence-a",
         legacy_target_id: null,
@@ -49,6 +50,7 @@ const snapshot: EditorialWorkspaceSnapshot = {
       position: 1,
       text: "Synthetic paragraph B",
       evidence_refs: [],
+      chart: null,
       revision_target: {
         block_id: "block-occurrence-b",
         legacy_target_id: null,

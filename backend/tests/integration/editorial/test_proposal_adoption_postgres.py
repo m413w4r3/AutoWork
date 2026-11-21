@@ -398,6 +398,7 @@ async def _seed(
     proposal_count: int = 2,
     seed_discovery_lineage: bool = False,
     article_base: bool = False,
+    bar_chart_facts: bool = False,
 ) -> _Seeded:
     blob_store = _MemoryBlobStore()
     edition = Edition(
@@ -498,6 +499,34 @@ async def _seed(
                         evidence_quote="The synthetic report records this finding.",
                         evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
                         source_document_ids=(source_document_id,),
+                    ),
+                    *(
+                        (
+                            ExtractionFactV1(
+                                category="other_technical",
+                                value="Alpha: 12 endpoints",
+                                attack_id=None,
+                                context="Synthetic bar-chart integration point Alpha.",
+                                evidence_quote=(
+                                    "The synthetic report records Alpha with 12 endpoints."
+                                ),
+                                evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+                                source_document_ids=(source_document_id,),
+                            ),
+                            ExtractionFactV1(
+                                category="other_technical",
+                                value="Beta: 18 endpoints",
+                                attack_id=None,
+                                context="Synthetic bar-chart integration point Beta.",
+                                evidence_quote=(
+                                    "The synthetic report records Beta with 18 endpoints."
+                                ),
+                                evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+                                source_document_ids=(source_document_id,),
+                            ),
+                        )
+                        if bar_chart_facts
+                        else ()
                     ),
                 ),
                 events=(),
