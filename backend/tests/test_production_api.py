@@ -2396,6 +2396,70 @@ async def test_synthesis_artifact_exposes_server_derived_revision_targets(
     assert len(paragraph["target"]["stable_ids"][0]) == 64
 
 
+async def test_synthesis_revision_preview_route_calls_preview_without_revising(
+    api: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cti_app.application.production_synthesis_revision import (
+        TargetedSynthesisRevisionPreview,
+    )
+    from cti_app.domain.production_editorial_revision import (
+        TargetedEditorialRevisionOperation,
+        TargetedEditorialRevisionTargetKind,
+    )
+
+    subject_id = uuid4()
+    base_artifact_id = uuid4()
+    calls: list[str] = []
+    preview = TargetedSynthesisRevisionPreview(
+        base_artifact_id=base_artifact_id,
+        base_version=1,
+        base_input_hash="a" * 64,
+        base_canonical_sha256="b" * 64,
+        target_path="synthesis.title",
+        stages_preserved=("references", "extraction"),
+        stages_invalidated=("publication",),
+        stages_conditionally_rebased=("editorial_enrichment",),
+        source_extension=False,
+        expected_model_calls=1,
+        enrichment_rebase="revalidate_anchors_and_evidence; adopt if valid, otherwise stale",
+    )
+
+    class PreviewOnlyRevisionService:
+        async def preview(self, _request: Any) -> TargetedSynthesisRevisionPreview:
+            calls.append("preview")
+            return preview
+
+        async def revise(self, _request: Any) -> None:
+            calls.append("revise")
+            raise AssertionError("The preview route must not call revise")
+
+    service = PreviewOnlyRevisionService()
+    monkeypatch.setattr(
+        production_api,
+        "_production_synthesis_revision_service",
+        lambda _request: service,
+    )
+
+    response = await api.post(
+        f"/api/subjects/{subject_id}/production/artifacts/synthesis/revisions/preview",
+        json={
+            "base_artifact_id": str(base_artifact_id),
+            "base_version": 1,
+            "base_input_hash": "a" * 64,
+            "base_canonical_sha256": "b" * 64,
+            "target": {"kind": TargetedEditorialRevisionTargetKind.TITLE.value},
+            "operation": TargetedEditorialRevisionOperation.REWRITE_TITLE.value,
+            "instruction": "Correct the synthetic title.",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["base_artifact_id"] == str(base_artifact_id)
+    assert response.json()["expected_model_calls"] == 1
+    assert calls == ["preview"]
+
+
 async def test_retry_by_run_changes_only_the_requested_run(
     api: AsyncClient,
     uow: _Uow,
