@@ -2,6 +2,8 @@
 
 Document de conception pour ARTICLE et BRIEF. Les opérations visibles dépendent des capacités et des opérations autorisées par le snapshot serveur. Le serveur reste autorité pour l’identité des blocs, les preuves, les versions et l’adoption des propositions. Les chaînes marquées « proposées » sont du texte UX à mapper aux codes d’erreur stables, pas une définition de comportement backend.
 
+**Statut D9 :** l’atelier livré est desktop-only à partir de 1024 px. UX-19 (mobile) est abandonné ; les anciens critères de layout sous 1024 px et 768 px dans la mission ne sont plus des critères de livraison. Les captures et revues visuelles prévues concernent les formats desktop.
+
 ## 1. Principes
 
 1. Le document est le centre : la cible se choisit dans le texte, jamais dans un formulaire séparé.
