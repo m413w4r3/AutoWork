@@ -545,7 +545,7 @@ def test_editorial_draft_preflight_accepts_exact_existing_table(
     temporary_postgres_url: str,
 ) -> None:
     config = _alembic_config(temporary_postgres_url)
-    command.upgrade(config, "head")
+    command.upgrade(config, "0016_editorial_drafts")
 
     async def _demote_revision() -> None:
         engine = create_async_engine(temporary_postgres_url)
@@ -560,7 +560,7 @@ def test_editorial_draft_preflight_accepts_exact_existing_table(
             await engine.dispose()
 
     asyncio.run(_demote_revision())
-    command.upgrade(config, "head")
+    command.upgrade(config, "0016_editorial_drafts")
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0016_editorial_drafts"
 
 
