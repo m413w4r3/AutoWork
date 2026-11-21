@@ -1375,6 +1375,12 @@ main:has(> .editorial-route-state) > .app-header {
   gap: 0.65rem;
 }
 
+/* The proposal card lives in the 340-420px inspector: side-by-side panels
+   leave ~150px per column and break the paragraph into unreadable shards. */
+.editorial-proposal-card .editorial-diff-view__panels {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .editorial-diff-view__panels section,
 .editorial-diff-view__changes {
   min-width: 0;
@@ -1844,6 +1850,11 @@ main:has(> .editorial-route-state) > .app-header {
     display: block;
     border: 0;
     background: var(--editorial-scrim-tablet);
+  }
+
+  /* The inspector stays lateral at this width; only the outline is an overlay. */
+  .editorial-workspace__scrim[data-panel="inspector"] {
+    display: none;
   }
 }
 

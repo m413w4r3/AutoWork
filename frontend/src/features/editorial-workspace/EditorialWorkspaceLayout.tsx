@@ -117,7 +117,13 @@ export function EditorialWorkspaceLayout({
     }
     linkedThreadHandledRef.current = true;
     onSelectBlock(occurrenceId);
-    setOpenPanel("inspector");
+    // At >= 1024px the inspector is already a lateral column; opening the
+    // "inspector" panel there would render a scrim over a non-overlay column
+    // and make the document unclickable. Only the mobile drawer needs it.
+    const inspectorIsDrawer =
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(max-width: 1023px)").matches;
+    if (inspectorIsDrawer) setOpenPanel("inspector");
   }, [onSelectBlock, ordered]);
 
   const canEditBlock = (block: EditorialWorkspaceBlock | null) =>
@@ -455,6 +461,7 @@ export function EditorialWorkspaceLayout({
           className="editorial-workspace__scrim"
           type="button"
           aria-label="Fermer le panneau"
+          data-panel={openPanel}
           onClick={closeActiveOverlay}
         />
       ) : null}
