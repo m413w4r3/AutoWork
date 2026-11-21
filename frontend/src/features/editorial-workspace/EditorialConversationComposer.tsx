@@ -13,7 +13,6 @@ interface EditorialConversationComposerProps {
   proposalLabel?: string;
   submissionBelongsToCurrentTarget: boolean;
   composerRef: RefObject<HTMLTextAreaElement | null>;
-  sendAnnouncementRef: RefObject<HTMLParagraphElement | null>;
   onDraftChange: (value: string) => void;
   onSuggestion: (value: string) => void;
   onSubmit: (kind: "message" | "propose") => void;
@@ -38,13 +37,15 @@ export function EditorialConversationComposer({
   proposalLabel = "Générer une proposition",
   submissionBelongsToCurrentTarget,
   composerRef,
-  sendAnnouncementRef,
   onDraftChange,
   onSuggestion,
   onSubmit,
 }: EditorialConversationComposerProps) {
+  const locked = controlsLocked || active || sendPending;
+
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (locked) return;
     onSubmit("message");
   }
 
@@ -52,10 +53,11 @@ export function EditorialConversationComposer({
     if (
       event.key === "Enter" &&
       !event.shiftKey &&
+      !event.altKey &&
       !event.nativeEvent.isComposing
     ) {
       event.preventDefault();
-      onSubmit("message");
+      if (!locked) onSubmit("message");
     }
   }
 
@@ -68,10 +70,18 @@ export function EditorialConversationComposer({
         rows={3}
         value={draft}
         placeholder="Que souhaitez-vous modifier ou clarifier ?"
-        disabled={active || sendPending}
+        readOnly={locked}
+        aria-describedby="editorial-message-composer-shortcuts"
         onChange={(event) => onDraftChange(event.currentTarget.value)}
         onKeyDown={handleKeyDown}
       />
+      <p
+        id="editorial-message-composer-shortcuts"
+        className="editorial-conversation__shortcut-help"
+      >
+        Entrée envoie le message, Maj+Entrée ajoute une ligne et Ctrl/Cmd+Entrée
+        envoie le message.
+      </p>
       <div
         className="editorial-conversation__suggestions"
         aria-label="Suggestions de message"
@@ -80,7 +90,7 @@ export function EditorialConversationComposer({
           <button
             key={suggestion}
             type="button"
-            disabled={controlsLocked}
+            disabled={locked}
             onClick={() => onSuggestion(suggestion)}
           >
             {suggestion}
@@ -91,7 +101,7 @@ export function EditorialConversationComposer({
         <button
           className="editorial-conversation__send"
           type="submit"
-          disabled={!draft.trim() || controlsLocked || hasQueryError}
+          disabled={!draft.trim() || locked || hasQueryError}
         >
           {sendPending && sendKind === "message"
             ? "Envoi en cours…"
@@ -101,7 +111,7 @@ export function EditorialConversationComposer({
           <button
             className="editorial-conversation__propose"
             type="button"
-            disabled={!draft.trim() || controlsLocked || hasQueryError}
+            disabled={!draft.trim() || locked || hasQueryError}
             onClick={() => onSubmit("propose")}
           >
             {sendPending && sendKind === "propose"
@@ -111,12 +121,10 @@ export function EditorialConversationComposer({
         ) : null}
       </div>
       <p
-        ref={sendAnnouncementRef}
         className="editorial-conversation__announcement"
         role="status"
         aria-live="polite"
         aria-atomic="true"
-        tabIndex={-1}
       >
         {sendPending && submissionBelongsToCurrentTarget
           ? sendKind === "propose"

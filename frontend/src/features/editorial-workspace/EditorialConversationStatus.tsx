@@ -1,5 +1,3 @@
-import type { RefObject } from "react";
-
 import type { EditorialThreadRead } from "../../api/editorialWorkspace";
 
 interface ReconcileStatus {
@@ -25,7 +23,6 @@ interface EditorialConversationStatusProps {
   queryErrorMessage: string | null;
   reconcile: ReconcileStatus;
   startSession: StartSessionStatus;
-  bridgeStatusRef: RefObject<HTMLParagraphElement | null>;
   onReconcile: () => void;
   onStartSession: () => void;
 }
@@ -52,7 +49,6 @@ export function EditorialConversationStatus({
   queryErrorMessage,
   reconcile,
   startSession,
-  bridgeStatusRef,
   onReconcile,
   onStartSession,
 }: EditorialConversationStatusProps) {
@@ -77,13 +73,7 @@ export function EditorialConversationStatus({
               Version de référence du fil : v{data.origin.artifact_version}
             </p>
           ) : null}
-          <p
-            ref={bridgeStatusRef}
-            role="status"
-            aria-live="polite"
-            aria-atomic="true"
-            tabIndex={-1}
-          >
+          <p role="status" aria-live="polite" aria-atomic="true">
             {bridgeLabels[data.bridge_status]}
           </p>
           {data.bridge_status === "reconciliation_required" ? (

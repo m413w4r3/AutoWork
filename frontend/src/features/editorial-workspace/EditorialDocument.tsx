@@ -1,4 +1,5 @@
 import { useState } from "react";
+import type { KeyboardEvent } from "react";
 
 import {
   editorialFigureThumbnailUrl,
@@ -225,7 +226,11 @@ export function EditorialDocument({
           <div
             key={block.block_id}
             className="editorial-document__block"
-            tabIndex={-1}
+            role="group"
+            aria-label={`${BLOCK_KIND_LABELS[block.kind]}${block.text ? ` : ${block.text}` : ""}`}
+            aria-keyshortcuts="Enter Space"
+            aria-current={selected ? "true" : undefined}
+            tabIndex={0}
             data-block-id={block.block_id}
             data-selected={selected}
             data-kind={block.kind}
@@ -236,6 +241,12 @@ export function EditorialDocument({
               ) {
                 return;
               }
+              onSelectBlock(block.block_id);
+            }}
+            onKeyDown={(event: KeyboardEvent<HTMLDivElement>) => {
+              if (event.target !== event.currentTarget) return;
+              if (event.key !== "Enter" && event.key !== " ") return;
+              event.preventDefault();
               onSelectBlock(block.block_id);
             }}
           >

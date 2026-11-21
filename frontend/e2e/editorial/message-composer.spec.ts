@@ -452,9 +452,10 @@ test("message-only composer renders safe generating, reply and error states", as
   const paragraph = page.locator(`[data-block-id="${paragraphId}"]`);
   await paragraph.click();
   await expect(paragraph).toHaveAttribute("data-selected", "true");
-  await page
-    .getByRole("textbox", { name: "Votre message à Bridge" })
-    .fill("Clarifier le passage.");
+  const composer = page.getByRole("textbox", {
+    name: "Votre message à Bridge",
+  });
+  await composer.fill("Clarifier le passage.");
   await page.getByRole("button", { name: "Envoyer un message" }).click();
   await expect(
     page.getByText(
@@ -462,9 +463,7 @@ test("message-only composer renders safe generating, reply and error states", as
     ),
   ).toBeVisible();
   await expect(page.getByRole("button", { name: /réessayer/i })).toHaveCount(0);
-  await expect(
-    page.locator(".editorial-conversation__announcement"),
-  ).toBeFocused();
+  await expect(composer).toBeFocused();
   await positionDesktopDiscussion(page);
   await page.screenshot({
     path: resolve(screenshotDirectory, "waiting-for-capacity-1440x900.png"),
@@ -504,9 +503,6 @@ test("message-only composer renders safe generating, reply and error states", as
       "Une réponse est disponible dans ce fil. Consultez-la avant toute décision.",
     ),
   ).toBeVisible({ timeout: 5_000 });
-  await expect(
-    page.getByRole("textbox", { name: "Votre message à Bridge" }),
-  ).toBeFocused();
   expect(
     await mobileContent.evaluate(
       (element) => (element as unknown as { scrollTop: number }).scrollTop,
@@ -537,6 +533,7 @@ test("message-only composer renders safe generating, reply and error states", as
   await expect(
     page.getByRole("heading", { name: "Discussion" }),
   ).toBeInViewport();
+  await page.getByRole("alert").scrollIntoViewIfNeeded();
   await expect(page.getByRole("alert")).toBeInViewport();
   await page.screenshot({
     path: resolve(screenshotDirectory, "message-error-1440x900.png"),
@@ -561,18 +558,12 @@ test("message-only composer renders safe generating, reply and error states", as
       "L’état de votre envoi est incertain. Vérifiez son état dans ce fil avant de continuer ; la demande ne sera pas renvoyée automatiquement.",
     ),
   ).toBeVisible();
-  await expect(
-    page.getByRole("textbox", { name: "Votre message à Bridge" }),
-  ).toBeDisabled();
+  await expect(composer).toHaveAttribute("readonly");
   await expect(
     page.getByRole("button", { name: "Envoyer un message" }),
   ).toBeDisabled();
   await expect(page.getByRole("button", { name: /réessayer/i })).toHaveCount(0);
-  await expect(
-    page.getByText(
-      "L’état de votre envoi est incertain. Vérifiez son état dans ce fil avant de continuer ; la demande ne sera pas renvoyée automatiquement.",
-    ),
-  ).toBeFocused();
+  await expect(composer).toBeFocused();
   await positionDesktopDiscussion(page);
   await expect(
     page.getByRole("heading", { name: "Discussion" }),

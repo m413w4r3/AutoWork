@@ -159,6 +159,44 @@ function requestUrl(input: RequestInfo | URL): string {
 }
 
 describe("VisualInsertionComposer", () => {
+  it("supports arrow navigation and Escape in the insertion menu", async () => {
+    const keyboardAnchor = {
+      ...anchor,
+      allowed_operations: ["insert_after", "create_table", "create_bar_chart"],
+    };
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: 0 } },
+    });
+
+    render(
+      <QueryClientProvider client={client}>
+        <VisualInsertionComposer
+          subjectId="subject-1"
+          snapshot={snapshot}
+          block={keyboardAnchor}
+          readOnly={false}
+        />
+      </QueryClientProvider>,
+    );
+
+    const trigger = screen.getByRole("button", { name: "Ajouter après" });
+    fireEvent.click(trigger);
+    const menu = screen.getByRole("menu", { name: "Ajouter après" });
+    const table = within(menu).getByRole("menuitem", { name: "Tableau" });
+    const chart = within(menu).getByRole("menuitem", { name: "Graphique" });
+
+    expect(trigger).toHaveAttribute("aria-controls", menu.id);
+    expect(table).toHaveFocus();
+    fireEvent.keyDown(table, { key: "ArrowDown" });
+    expect(chart).toHaveFocus();
+    fireEvent.keyDown(chart, { key: "Escape" });
+
+    await waitFor(() => {
+      expect(trigger).toHaveAttribute("aria-expanded", "false");
+      expect(trigger).toHaveFocus();
+    });
+  });
+
   it("turns stable table-route errors into actionable French messages", async () => {
     vi.stubGlobal(
       "fetch",

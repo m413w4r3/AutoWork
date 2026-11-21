@@ -116,12 +116,12 @@ export function EditorialOutline({
     event: KeyboardEvent<HTMLButtonElement>,
     index: number,
   ) => {
+    event.preventDefault();
     const nextIndex =
       event.key === "ArrowDown"
         ? Math.min(index + 1, items.length - 1)
         : Math.max(index - 1, 0);
     if (nextIndex === index) return;
-    event.preventDefault();
     const next = items[nextIndex];
     if (!next) return;
     itemRefs.current.get(next.block.block_id)?.focus();
@@ -217,7 +217,9 @@ export function EditorialOutline({
                     onClick={() => {
                       onCancelDraft(item.block.block_id);
                       window.requestAnimationFrame(() =>
-                        itemRefs.current.get(item.block.block_id)?.focus(),
+                        itemRefs.current
+                          .get(item.block.block_id)
+                          ?.focus({ preventScroll: true }),
                       );
                     }}
                   >

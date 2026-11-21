@@ -132,7 +132,6 @@ describe("EditorialConversation", () => {
           sendErrorMessage={null}
           submissionBelongsToCurrentTarget
           composerRef={createRef<HTMLTextAreaElement>()}
-          sendAnnouncementRef={createRef<HTMLParagraphElement>()}
           onDraftChange={vi.fn()}
           onSuggestion={vi.fn()}
           onSubmit={vi.fn()}
@@ -741,7 +740,15 @@ describe("EditorialConversation", () => {
     expect(key).toHaveBeenCalledTimes(1);
     expect(await screen.findByText("Message envoyé.")).toBeVisible();
     const sendAnnouncement = screen.getByText("Message envoyé.");
-    expect(sendAnnouncement).toHaveFocus();
+    expect(sendAnnouncement).toHaveAttribute("aria-live", "polite");
+    expect(textarea).toHaveFocus();
+    expect(textarea).toHaveAttribute(
+      "aria-describedby",
+      "editorial-message-composer-shortcuts",
+    );
+    expect(
+      screen.getByText(/Ctrl\/Cmd\+Entrée envoie le message/),
+    ).toBeVisible();
 
     const queryKey = editorialWorkspaceQueryKeys.thread(
       binding.subject_id,
@@ -927,7 +934,7 @@ describe("EditorialConversation", () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
     expect(
       screen.getByRole("textbox", { name: "Votre message à Bridge" }),
-    ).toBeDisabled();
+    ).toHaveAttribute("readonly");
     expect(
       screen.getByRole("button", { name: "Envoyer un message" }),
     ).toBeDisabled();
@@ -1002,7 +1009,7 @@ describe("EditorialConversation", () => {
     const composer = await screen.findByRole("textbox", {
       name: "Votre message à Bridge",
     });
-    expect(composer).toBeDisabled();
+    expect(composer).toHaveAttribute("readonly");
     expect(
       screen.getByRole("button", { name: "Générer une proposition" }),
     ).toBeDisabled();

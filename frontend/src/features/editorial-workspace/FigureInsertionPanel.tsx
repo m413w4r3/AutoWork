@@ -374,7 +374,6 @@ export function FigureInsertionPanel({
             occurrenceId={block.block_id}
             proposalId={proposalId}
             anchorText={block.text ?? undefined}
-            onAccepted={onRefresh}
           />
         </div>
       ) : null}

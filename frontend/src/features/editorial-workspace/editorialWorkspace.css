@@ -1494,6 +1494,13 @@ main:has(> .editorial-route-state) > .app-header {
   resize: vertical;
 }
 
+.editorial-conversation__shortcut-help {
+  margin: -0.35rem 0 0.65rem;
+  color: var(--editorial-muted);
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
 .editorial-conversation__composer textarea:focus-visible,
 .editorial-conversation__suggestions button:focus-visible,
 .editorial-conversation__send:focus-visible,
@@ -2031,6 +2038,10 @@ main:has(> .editorial-route-state) > .app-header {
   border-radius: 0.45rem;
   background: var(--editorial-white);
   box-shadow: 0 0.5rem 1.4rem var(--editorial-scrim-tablet);
+}
+
+.editorial-visual-insertion__menu[hidden] {
+  display: none;
 }
 
 .editorial-visual-insertion__menu button {

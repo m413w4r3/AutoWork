@@ -36,11 +36,6 @@ export function EditorialConversation({
     onMessageSent: drafts.clearDraft,
   });
   const composerRef = useRef<HTMLTextAreaElement>(null);
-  const bridgeStatusRef = useRef<HTMLParagraphElement>(null);
-  const sendAnnouncementRef = useRef<HTMLParagraphElement>(null);
-  const focusAfterSubmitRef = useRef<string | null>(null);
-  const restoreComposerFocusRef = useRef<string | null>(null);
-  const controlsWereLockedRef = useRef(false);
   const appliedProposalPromptRef = useRef<string | null>(null);
   const proposalIds =
     lifecycle.threadQuery.data && lifecycle.threadQuery.data.kind !== "unopened"
@@ -52,38 +47,6 @@ export function EditorialConversation({
           ),
         )
       : [];
-
-  useEffect(() => {
-    if (lifecycle.submissionUncertain && lifecycle.controlsLocked) {
-      bridgeStatusRef.current?.focus({ preventScroll: true });
-      return;
-    }
-
-    if (focusAfterSubmitRef.current === occurrenceId) {
-      focusAfterSubmitRef.current = null;
-      restoreComposerFocusRef.current = occurrenceId;
-      if (lifecycle.controlsLocked) {
-        sendAnnouncementRef.current?.focus({ preventScroll: true });
-        controlsWereLockedRef.current = true;
-      } else {
-        restoreComposerFocusRef.current = null;
-        composerRef.current?.focus({ preventScroll: true });
-      }
-      return;
-    }
-
-    if (controlsWereLockedRef.current && !lifecycle.controlsLocked) {
-      controlsWereLockedRef.current = false;
-      const restoreOccurrenceId = restoreComposerFocusRef.current;
-      restoreComposerFocusRef.current = null;
-      if (restoreOccurrenceId === occurrenceId) {
-        composerRef.current?.focus({ preventScroll: true });
-      }
-      return;
-    }
-
-    if (lifecycle.controlsLocked) controlsWereLockedRef.current = true;
-  }, [lifecycle.controlsLocked, lifecycle.submissionUncertain, occurrenceId]);
 
   useEffect(() => {
     if (!proposalPrompt) {
@@ -99,8 +62,12 @@ export function EditorialConversation({
   }, [drafts, lifecycle, onProposalPromptApplied, proposalPrompt]);
 
   function submitMessage(kind: "message" | "propose") {
-    if (lifecycle.submitMessage(drafts.draft, kind))
-      focusAfterSubmitRef.current = occurrenceId;
+    if (
+      lifecycle.submitMessage(drafts.draft, kind) &&
+      document.activeElement !== composerRef.current
+    ) {
+      composerRef.current?.focus({ preventScroll: true });
+    }
   }
 
   function requestVariant() {
@@ -109,15 +76,6 @@ export function EditorialConversation({
     }
     lifecycle.clearSendResult();
     composerRef.current?.focus({ preventScroll: true });
-  }
-
-  function focusSelectedBlock() {
-    const selectedBlock = Array.from(
-      document.querySelectorAll<HTMLElement>(
-        ".editorial-document__block[data-block-id]",
-      ),
-    ).find((block) => block.dataset.blockId === occurrenceId);
-    selectedBlock?.focus({ preventScroll: true });
   }
 
   return (
@@ -149,7 +107,6 @@ export function EditorialConversation({
         }
         reconcile={lifecycle.reconcileState}
         startSession={lifecycle.startSessionState}
-        bridgeStatusRef={bridgeStatusRef}
         onReconcile={lifecycle.reconcile}
         onStartSession={lifecycle.startNewSession}
       />
@@ -172,7 +129,6 @@ export function EditorialConversation({
               onRequestVariant={
                 lifecycle.canCompose ? requestVariant : undefined
               }
-              onAccepted={focusSelectedBlock}
             />
           ))}
         </div>
@@ -206,7 +162,6 @@ export function EditorialConversation({
             lifecycle.submissionBelongsToCurrentTarget
           }
           composerRef={composerRef}
-          sendAnnouncementRef={sendAnnouncementRef}
           onDraftChange={(value) => {
             drafts.setDraft(value);
             lifecycle.clearSendResult();
