@@ -61,6 +61,7 @@ from cti_app.application.investigation_persistence import (
     InMemoryWorkspaceBindingRepository,
 )
 from cti_app.application.investigation_task_events import TaskEventType
+from cti_app.application.investigation_tasks import TaskSessionOutcome, TaskSessionRelease
 from cti_app.application.investigation_tools import ToolEffect
 from cti_app.application.operator_tool_invocation import OperatorToolInvocationError
 from cti_app.application.workspace_agent import (
@@ -683,6 +684,58 @@ async def test_broker_maps_task_commands_to_the_engine() -> None:
 
 
 @pytest.mark.asyncio
+async def test_broker_submit_result_flushes_the_host_release_after_commit() -> None:
+    """B2: the broker closes a leased session and must stop its host after commit."""
+    fixture = _fixture()
+    await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
+    tasks = InMemoryInvestigationTaskRepository()
+    sessions = InMemoryAgentSessionRepository()
+    task, session_id, _secret = await _seed_agent_session(fixture, tasks, sessions)
+    uow = _BrokerUnitOfWork(fixture, tasks, sessions)
+    timeline: list[str] = []
+    flushed: list[list[TaskSessionRelease]] = []
+
+    async def commit() -> None:
+        uow.commit_count += 1
+        timeline.append("commit")
+
+    async def release(items: Any) -> None:
+        timeline.append("flush")
+        flushed.append(list(items))
+
+    broker = AgenticToolBroker(
+        investigation_id=fixture.investigation_id,
+        prose_authority=ProseAuthority.BRIDGE_ONLY,
+        uow=uow,
+        invocations=_service(fixture),
+        handoffs=None,
+        task_limits=TASK_LIMIT_DEFAULTS,
+        clock=lambda: NOW,
+        commit=commit,
+        release_host=release,
+    )
+    submitted = await broker.invoke(
+        session=_verified(session_id, fixture.investigation_id, task),
+        tool_name="task.submit_result",
+        schema_version="1",
+        arguments={
+            "expected_status_version": 3,
+            "lease_fence": 1,
+            "result_refs": [{"id": str(uuid4()), "kind": "observation"}],
+        },
+        client_idempotency_key="submit-flush-1",
+    )
+
+    assert submitted.status == TaskStatus.AWAITING_REVIEW.value
+    assert timeline == ["commit", "flush"]
+    assert len(flushed) == 1
+    assert flushed[0][0].session_id == session_id
+    assert flushed[0][0].outcome is TaskSessionOutcome.CLOSED
+    stored = await sessions.get(session_id)
+    assert stored is not None and stored.state is AgentSessionState.CLOSED
+
+
+@pytest.mark.asyncio
 async def test_broker_maps_handoff_submit_to_the_session_task() -> None:
     fixture = _fixture()
     await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
@@ -1142,7 +1195,7 @@ async def test_broker_contribution_import_attributes_task_fence_and_emits_event(
     task = _running_task(harness.investigation_id, session_id)
     await harness.tasks.add(task)
     session_row, _secret = _session_row(harness.investigation_id, task, session_id=session_id)
-    sessions = InMemoryAgentSessionRepository()
+    sessions = harness.sessions
     await sessions.add(session_row)
     revision = await harness.add_revision(
         f"notes/agents/{task.id}/analyse.md",

@@ -16,9 +16,14 @@ inventing a second policy:
 * the configured advisor disclosure profile allowing the family
   (:meth:`AdvisorDisclosurePolicy.allows_disclosure`).
 
-The gate runs before every host call and before any session row is written.
-Its refusal is typed (``agent_session_external_llm_not_allowed``) and carries
-only a stable reason code, never evidence.
+The gate runs before every host call that can *start or feed* the external
+operator — ``prepare``/``open``/``start``/``resume``, a transfer that opens a
+destination session, and a live instruction delivery (including a note
+continuation) — and before any session row is written.  Transport-only host
+calls (interrupt, reconcile, collect, release) do not carry new evidence and
+are not gated.  Its refusal is typed
+(``agent_session_external_llm_not_allowed``) and carries only a stable reason
+code, never evidence.
 """
 
 from __future__ import annotations

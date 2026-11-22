@@ -46,6 +46,7 @@ from cti_app.application.agent_session_verification import (
 )
 from cti_app.application.agentic_sessions import (
     AgentSessionSecretDeliveryPort,
+    HostSessionReleaseService,
     PreparedAgentSession,
     SessionError,
     SessionRuntimeUnavailableError,
@@ -114,6 +115,12 @@ class InterruptRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=4096)
 
 
+class CloseAgentSessionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(min_length=1, max_length=4096)
+
+
 class CollectRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -161,6 +168,15 @@ def _disclosure_gate(request: Request) -> Callable[[UUID], Awaitable[None]]:
     return require_external_disclosure
 
 
+def _release_service(request: Request) -> HostSessionReleaseService:
+    """Host teardown after a pre-lease close; no DB lock is held during the UDS call."""
+    return HostSessionReleaseService(
+        uow_factory=cast(Callable[[], SessionUnitOfWork], _uow_factory(request)),
+        host=getattr(request.app.state, "host_sessions", None),
+        wait_seconds=_settings(request).m24_host_release_wait_seconds,
+    )
+
+
 def _service(request: Request) -> SessionService:
     runtime = getattr(request.app.state, "agent_session_runtime", None)
     if runtime is not None and not getattr(runtime, "available", True):
@@ -180,6 +196,7 @@ def _service(request: Request) -> SessionService:
         secret_delivery=_secret_delivery(request),
         note_resolver=WorkspaceNoteCatalog(uow_factory=transfer_factory),
         disclosure=_disclosure_gate(request),
+        release_host=_release_service(request).flush,
         cli_network_mode=settings.agent_sessions_cli_network_mode,
         task_limits=settings.task_limits(),
     )
@@ -461,6 +478,29 @@ async def interrupt_agent_session(
     actor = await _human_actor(request)
     try:
         session = await _service(request).interrupt(
+            investigation_id, session_id, reason=body.reason, actor=actor
+        )
+    except SessionError as exc:
+        raise _session_http_error(exc) from exc
+    return session.to_payload()
+
+
+@router.post("/{investigation_id}/agent-sessions/{session_id}/close")
+async def close_agent_session(
+    investigation_id: UUID, session_id: UUID, body: CloseAgentSessionRequest, request: Request
+) -> dict[str, Any]:
+    """The human escape hatch: release a session the lease no longer owns.
+
+    A crash between the ``provisioning``/``ready`` commit and the lease
+    acquisition otherwise blocks every later open of the task through the
+    one-active-session index.  A session the current task lease still owns is
+    refused here (the task command that releases the lease closes it); this
+    route only ever closes an unleased session, and the host teardown happens
+    after the commit.
+    """
+    actor = await _human_actor(request)
+    try:
+        session = await _service(request).close(
             investigation_id, session_id, reason=body.reason, actor=actor
         )
     except SessionError as exc:

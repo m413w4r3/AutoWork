@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from datetime import UTC, date, datetime
+from dataclasses import replace
+from datetime import UTC, date, datetime, timedelta
+from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -20,13 +22,26 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cti_app.application.agent_session_verification import HmacSessionSecretDeriver
-from cti_app.application.agentic_sessions import SessionSecret, SessionService
+from cti_app.application.agentic_host_sessions import (
+    HostBudgetUsageV1,
+    HostCloseResultV1,
+    HostInterruptResultV1,
+    HostReasonRequestV1,
+    HostSessionsPort,
+    HostSessionStatusV1,
+)
+from cti_app.application.agentic_sessions import (
+    HostSessionReleaseService,
+    SessionSecret,
+    SessionService,
+)
 from cti_app.application.investigation_handoffs import (
     HandoffCreateRequest,
     HandoffTaskStaleError,
     InvestigationHandoffService,
 )
 from cti_app.application.investigation_persistence import VersionConflictError
+from cti_app.application.investigation_task_sweep import recover_orphan_agent_sessions
 from cti_app.application.investigation_tasks import (
     InvestigationTaskService,
     RepositoryTaskSessionPort,
@@ -79,6 +94,9 @@ from cti_app.domain.production import (
     ProductionRun,
 )
 from cti_app.infrastructure.database.models.investigation import ToolInvocationRow
+from cti_app.infrastructure.database.repositories.agent_sessions import (
+    SqlAlchemyAgentSessionRepository,
+)
 from cti_app.infrastructure.database.session import (
     create_postgres_engine,
     create_session_factory,
@@ -771,6 +789,163 @@ def test_open_session_holds_no_lock_during_the_host_start(
                 sessions = await uow.agent_sessions.list_for_task(task.id)
                 assert len(sessions) == 1
                 assert sessions[0].state is AgentSessionState.FAILED
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+class _ClosingHost:
+    """The real host port method the release service needs; records the calls."""
+
+    def __init__(self) -> None:
+        self.closed: list[UUID] = []
+
+    async def close_session(
+        self, session_id: UUID, request: HostReasonRequestV1, *, idempotency_key: str
+    ) -> HostCloseResultV1:
+        self.closed.append(session_id)
+        return HostCloseResultV1(state="closed")
+
+    async def interrupt_session(
+        self, session_id: UUID, request: HostReasonRequestV1, *, idempotency_key: str
+    ) -> HostInterruptResultV1:
+        return HostInterruptResultV1(state="interrupt_requested", signal_sent=True)
+
+    async def get_session_status(self, session_id: UUID) -> HostSessionStatusV1:
+        return HostSessionStatusV1(
+            state="closed",
+            state_version=1,
+            adapter_kind="codex_cli",
+            budgets_used=HostBudgetUsageV1(wall_seconds=0, output_bytes=0, instructions=0),
+            last_activity_at=NOW,
+            log_cursor=0,
+        )
+
+
+def test_crash_orphan_is_failed_and_the_task_becomes_openable(
+    temporary_postgres_url: str,
+) -> None:
+    """BLOCKER 1(b): the sweep recovers a session a crash left without a lease."""
+    command.upgrade(_alembic_config(temporary_postgres_url), "head")
+
+    async def run() -> None:
+        engine = create_postgres_engine(temporary_postgres_url)
+        try:
+            factory = create_session_factory(engine)
+            investigation = await _seed_investigation(factory)
+            task = await _seed_task(factory, investigation.id, task_key="lead-orphan")
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                engine_service = InvestigationTaskService(
+                    tasks=uow.investigation_tasks,
+                    decisions=uow.analyst_decisions,
+                    sessions=RepositoryTaskSessionPort(uow.agent_sessions),
+                    limits=TaskLimits(),
+                )
+                assigned = await engine_service.assign(
+                    task_id=task.id,
+                    actor=TaskActor(kind=TaskActorKind.HUMAN, actor_id="analyst:test"),
+                    target=TaskActor(kind=TaskActorKind.OPERATOR, actor_id="codex:operator-1"),
+                    expected_status_version=1,
+                    idempotency_key="assign-orphan",
+                    now=NOW,
+                )
+                await uow.commit()
+            assert assigned.task.status is TaskStatus.ASSIGNED
+            handoff_id = await _seed_handoff(factory, investigation.id, task.id)
+
+            # The crash: the provisioning/ready row was committed, the lease
+            # never was, and the created_at is older than the sweep grace.
+            orphan = replace(
+                _session(
+                    investigation.id,
+                    task.id,
+                    handoff_id,
+                    idempotency_key="crashed-open",
+                    state=AgentSessionState.READY,
+                ),
+                created_at=NOW - timedelta(hours=2),
+                opened_at=NOW - timedelta(hours=2),
+                updated_at=NOW - timedelta(hours=2),
+            )
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                await uow.agent_sessions.add(orphan)
+                await uow.commit()
+
+            class _Source:
+                async def list_orphan_sessions(
+                    self, *, grace_seconds: int, limit: int
+                ) -> tuple[AgentSessionV1, ...]:
+                    async with factory() as db_session:
+                        return await SqlAlchemyAgentSessionRepository(
+                            db_session
+                        ).list_orphan_sessions(grace_seconds=grace_seconds, limit=limit)
+
+                async def list_pending_host_release_sessions(
+                    self, *, grace_seconds: int, limit: int
+                ) -> tuple[AgentSessionV1, ...]:
+                    async with factory() as db_session:
+                        return await SqlAlchemyAgentSessionRepository(
+                            db_session
+                        ).list_pending_host_release_sessions(
+                            grace_seconds=grace_seconds, limit=limit
+                        )
+
+            host = _ClosingHost()
+            releases = HostSessionReleaseService(
+                uow_factory=lambda: SqlAlchemyUnitOfWork(factory),
+                host=cast(HostSessionsPort, host),
+                wait_seconds=0.0,
+            )
+            recovered, pending = await recover_orphan_agent_sessions(
+                source=_Source(),
+                uow_factory=lambda: SqlAlchemyUnitOfWork(factory),
+                flush_releases=releases.flush,
+                grace_seconds=60,
+                batch_size=10,
+            )
+            assert recovered == 1
+            assert orphan.id in host.closed, "the host teardown is requested, never a relaunch"
+            assert pending == 0, "the confirmed release is no longer pending"
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                stored = await uow.agent_sessions.get(orphan.id)
+                assert stored is not None
+                assert stored.state is AgentSessionState.FAILED
+                assert stored.close_reason == "orphaned_no_lease"
+                events = await uow.investigation_tasks.list_events(task.id)
+            assert any(event.idempotency_key == f"host-release:{orphan.id}" for event in events), (
+                "the confirmed host release is a durable journal marker"
+            )
+
+            # The one-active-session index no longer blocks the task: a human
+            # opens a fresh session with a new key.
+            operator = _BlockingOperator()
+            operator.release.set()
+            service = SessionService(
+                uow_factory=lambda: SqlAlchemyUnitOfWork(factory),
+                deriver=HmacSessionSecretDeriver("0123456789abcdef0123456789abcdef"),
+                operator=operator,
+                secret_delivery=_SecretDelivery(),
+                disclosure=_allow_disclosure,
+                task_limits=TaskLimits(),
+                clock=lambda: NOW,
+            )
+            reopened = await service.open_session(
+                investigation.id,
+                task_id=task.id,
+                adapter_kind=OperatorAdapterKind.CODEX_CLI,
+                handoff_id=handoff_id,
+                executable="/usr/local/bin/codex",
+                actor=TaskActor(kind=TaskActorKind.HUMAN, actor_id="analyst:test"),
+                idempotency_key="open-after-orphan",
+                now=NOW,
+            )
+            assert reopened.session.state is AgentSessionState.RUNNING
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                stored_task = await uow.investigation_tasks.get(task.id)
+                assert stored_task is not None
+                assert stored_task.status is TaskStatus.RUNNING
+                assert stored_task.lease_session_id == reopened.session.id
         finally:
             await engine.dispose()
 

@@ -24,10 +24,14 @@ terminal and a retry is a new row with a new attempt key.
 
 Authority split (D3/D6/D7): a verified human API call may claim ``human`` or
 ``host``; ``host`` never links a task lease and is never attributed to an
-operator.  ``agent`` requires a task whose current ``lease_fence`` and live
-lease the service validates here — but lot 07 exposes **no** unsigned route for
-it: the session-bound call belongs to lot 05B2, which verifies the D7 HMAC and
-passes this authority.  The route refuses ``agent`` with
+operator.  ``agent`` requires a task whose current ``lease_fence``, live lease
+and owning session the service validates — the pre-read before the workspace
+content read is cheap, and the authoritative revalidation runs again in the
+persisting transaction under the advisory-then-task-row order, so a cancel or
+sweep committed during the read refuses the write instead of leaving a
+canonical row under a superseded fence.  Lot 07 exposes **no** unsigned route
+for ``agent``: the session-bound call belongs to lot 05B2, which verifies the
+D7 HMAC and passes this authority.  The route refuses ``agent`` with
 ``operator_session_required``.
 """
 
@@ -47,6 +51,7 @@ from cti_app.application.evidence_recorder import ProductionEvidenceRecorder
 from cti_app.application.investigation_acquisition import sample_association_id
 from cti_app.application.investigation_findings import FindingService
 from cti_app.application.investigation_persistence import (
+    AgentSessionRepository,
     EvidenceObservationRepository,
     FindingRepository,
     InvestigationTaskRepository,
@@ -57,6 +62,7 @@ from cti_app.application.investigation_persistence import (
     WorkspaceFileRevisionRepository,
     same_work_contribution_request,
 )
+from cti_app.application.investigation_task_events import TaskEvent
 from cti_app.application.persistence import BlobRepository
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.research_context_builder import ArticleSnapshotPort
@@ -134,6 +140,19 @@ class WorkContributionStorageError(WorkContributionError):
     status_code = 503
 
 
+class ContributionLeaseAuthorityError(WorkContributionError):
+    """The session/lease/fence no longer authorises this agent write (D3).
+
+    Raised only from the locked persistence transaction, after the authority
+    was re-read under the advisory-then-task-row order: a cancel, a sweep or a
+    new session committed between the UDS read and the write leaves no
+    canonical contribution behind.
+    """
+
+    code = "work_contribution_lease_stale"
+    status_code = 409
+
+
 class ContributionArtifactStore(Protocol):
     """The one ``ProductionArtifactStore`` method a contribution needs."""
 
@@ -149,6 +168,7 @@ class WorkContributionUnitOfWork(Protocol):
     investigation_findings: FindingRepository
     sample_associations: SampleAssociationRepository
     investigation_tasks: InvestigationTaskRepository
+    agent_sessions: AgentSessionRepository
 
     async def __aenter__(self) -> Self: ...
 
@@ -174,13 +194,15 @@ class ContributionAuthority:
 
     ``origin='agent'`` is only constructed by the session-bound broker (05B2)
     after the D7 signature; the human route refuses it before this object
-    exists.
+    exists.  The session id is revalidated together with the task fence inside
+    the persisting transaction, so an expired session can never write.
     """
 
     origin: WorkContributionOrigin
     actor_id: str | None = None
     task_id: UUID | None = None
     lease_fence: int | None = None
+    session_id: UUID | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.origin, WorkContributionOrigin):
@@ -188,10 +210,25 @@ class ContributionAuthority:
         if self.actor_id is not None and not self.actor_id.strip():
             raise ValueError("actor_id must be a non-empty explicit identity")
         if self.origin is WorkContributionOrigin.AGENT:
-            if self.task_id is None or self.lease_fence is None:
-                raise ValueError("an agent contribution requires task_id and lease_fence")
-        elif self.lease_fence is not None:
+            if self.task_id is None or self.lease_fence is None or self.session_id is None:
+                raise ValueError(
+                    "an agent contribution requires task_id, lease_fence and session_id"
+                )
+        elif self.lease_fence is not None or self.session_id is not None:
             raise ValueError("only an agent contribution claims lease authority")
+
+
+class ContributionEventWriter(Protocol):
+    """Append the ``contribution_imported`` event in the persisting UoW."""
+
+    async def __call__(
+        self,
+        tasks: InvestigationTaskRepository,
+        contribution: WorkContributionV1,
+        *,
+        task: InvestigationTaskV1,
+        occurred_at: datetime,
+    ) -> tuple[TaskEvent | None, bool]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,6 +300,7 @@ class WorkContributionService:
         declaration: ContributionDeclarationV1,
         authority: ContributionAuthority,
         idempotency_key: str,
+        event_writer: ContributionEventWriter | None = None,
     ) -> WorkContributionV1:
         if not re.fullmatch(r"[A-Za-z0-9._:-]{8,128}", idempotency_key):
             raise WorkContributionRequestError("Idempotency-Key must match [A-Za-z0-9._:-]{8,128}")
@@ -287,6 +325,7 @@ class WorkContributionService:
                 authority=authority,
                 idempotency_key=idempotency_key,
                 task=target.task,
+                event_writer=event_writer,
                 status=WorkContributionImportStatus.REJECTED,
                 code=target.terminal_code,
             )
@@ -298,6 +337,7 @@ class WorkContributionService:
                 authority=authority,
                 idempotency_key=idempotency_key,
                 task=target.task,
+                event_writer=event_writer,
                 status=WorkContributionImportStatus.SKIPPED,
                 code=WorkContributionValidationCode.INTERNAL_WORKSPACE_PATH,
             )
@@ -309,6 +349,7 @@ class WorkContributionService:
                 authority=authority,
                 idempotency_key=idempotency_key,
                 task=target.task,
+                event_writer=event_writer,
                 status=WorkContributionImportStatus.REJECTED,
                 code=WorkContributionValidationCode.CONTRIBUTION_TOO_LARGE,
             )
@@ -323,6 +364,7 @@ class WorkContributionService:
                 authority=authority,
                 idempotency_key=idempotency_key,
                 task=target.task,
+                event_writer=event_writer,
                 status=WorkContributionImportStatus.REJECTED,
                 code=mismatch,
             )
@@ -334,6 +376,7 @@ class WorkContributionService:
                 authority=authority,
                 idempotency_key=idempotency_key,
                 task=target.task,
+                event_writer=event_writer,
                 status=WorkContributionImportStatus.REJECTED,
                 code=WorkContributionValidationCode.CONTRIBUTION_TOO_LARGE,
             )
@@ -345,6 +388,7 @@ class WorkContributionService:
                 authority=authority,
                 idempotency_key=idempotency_key,
                 task=target.task,
+                event_writer=event_writer,
                 status=WorkContributionImportStatus.REJECTED,
                 code=WorkContributionValidationCode.EMPTY_CONTENT,
             )
@@ -359,6 +403,7 @@ class WorkContributionService:
                 authority=authority,
                 idempotency_key=idempotency_key,
                 task=target.task,
+                event_writer=event_writer,
                 status=WorkContributionImportStatus.REJECTED,
                 code=exc.code,
             )
@@ -377,6 +422,7 @@ class WorkContributionService:
             declaration=declaration,
             authority=authority,
             task=target.task,
+            event_writer=event_writer,
             idempotency_key=idempotency_key,
             blob_id=blob_id,
             content_sha256=revision.sha256,
@@ -602,6 +648,7 @@ class WorkContributionService:
         code: WorkContributionValidationCode,
         content_sha256: str | None = None,
         task: InvestigationTaskV1 | None = None,
+        event_writer: ContributionEventWriter | None = None,
     ) -> WorkContributionV1:
         row = self._row(
             investigation_id,
@@ -618,7 +665,13 @@ class WorkContributionService:
             sample_association_id=None,
             task=task,
         )
-        return await self._append(row, revision)
+        return await self._append(
+            row,
+            revision,
+            investigation_id=investigation_id,
+            authority=authority,
+            event_writer=event_writer,
+        )
 
     async def _persist_imported(
         self,
@@ -632,8 +685,16 @@ class WorkContributionService:
         blob_id: UUID,
         content_sha256: str,
         metadata_line: str | None,
+        event_writer: ContributionEventWriter | None = None,
     ) -> WorkContributionV1:
         async with self._uow_factory() as uow:
+            # D3/BLOCKER: the authority was checked before the UDS content
+            # read, which is not serialised with a cancel or sweep.  It is
+            # re-checked here, under the advisory-then-task-row order, in the
+            # *same* transaction that writes the row and its event.
+            locked_task = await self._lock_agent_authority(uow, investigation_id, authority)
+            if locked_task is not None:
+                task = locked_task
             blob = await uow.blobs.get(blob_id)
             if (
                 blob is None
@@ -702,6 +763,7 @@ class WorkContributionService:
                         code=_finding_validation_code(exc),
                         content_sha256=content_sha256,
                         task=task,
+                        event_writer=event_writer,
                     )
                 finding_id = finding.id
                 if finding_declaration.proposed_sample_sha256 is not None:
@@ -723,7 +785,15 @@ class WorkContributionService:
                 sample_association_id=sample_id,
                 task=task,
             )
-            stored = await self._append_in_uow(uow, row, revision)
+            stored, created = await self._append_in_uow(uow, row, revision)
+            await self._write_contribution_event(
+                uow,
+                stored,
+                authority=authority,
+                task=task,
+                event_writer=event_writer,
+                created=created,
+            )
             await uow.commit()
             return stored
 
@@ -756,26 +826,129 @@ class WorkContributionService:
         return stored.id
 
     async def _append(
-        self, row: WorkContributionV1, revision: WorkspaceFileRevisionV1
+        self,
+        row: WorkContributionV1,
+        revision: WorkspaceFileRevisionV1,
+        *,
+        investigation_id: UUID,
+        authority: ContributionAuthority,
+        event_writer: ContributionEventWriter | None = None,
     ) -> WorkContributionV1:
         async with self._uow_factory() as uow:
+            locked_task = await self._lock_agent_authority(uow, investigation_id, authority)
             active = await uow.work_contributions.get_non_rejected_for_revision(
                 revision.workspace_id, revision.revision_id
             )
             if active is not None:
                 return active
-            stored = await self._append_in_uow(uow, row, revision)
+            stored, created = await self._append_in_uow(uow, row, revision)
+            await self._write_contribution_event(
+                uow,
+                stored,
+                authority=authority,
+                task=locked_task,
+                event_writer=event_writer,
+                created=created,
+            )
             await uow.commit()
             return stored
+
+    async def _lock_agent_authority(
+        self,
+        uow: WorkContributionUnitOfWork,
+        investigation_id: UUID,
+        authority: ContributionAuthority,
+    ) -> InvestigationTaskV1 | None:
+        """Re-read session/lease/fence under the canonical lock order (D3).
+
+        Runs in the persisting transaction: a release that committed between
+        the pre-read and this point is visible here, and a concurrent release
+        waits on the advisory/row locks until this transaction ends.  A host or
+        human import carries no lease and takes no lock.
+        """
+        if authority.origin is not WorkContributionOrigin.AGENT:
+            return None
+        if (
+            authority.task_id is None
+            or authority.lease_fence is None
+            or authority.session_id is None
+        ):  # pragma: no cover - ContributionAuthority enforces the triple
+            raise RuntimeError("agent authority lost its validated task link")
+        await uow.investigation_tasks.lock_investigation(investigation_id)
+        task = await uow.investigation_tasks.lock_task(authority.task_id)
+        if task is None or task.investigation_id != investigation_id:
+            raise ContributionLeaseAuthorityError(
+                "the agent task does not belong to this investigation",
+                details={"code": WorkContributionValidationCode.TASK_NOT_IN_INVESTIGATION.value},
+            )
+        if task.lease_fence != authority.lease_fence:
+            raise ContributionLeaseAuthorityError(
+                "agent lease fence is stale",
+                details={"code": WorkContributionValidationCode.LEASE_FENCE_STALE.value},
+            )
+        if task.status not in _ACTIVE_LEASE_STATUSES or task.lease_expires_at is None:
+            raise ContributionLeaseAuthorityError(
+                "agent task holds no active lease",
+                details={"code": WorkContributionValidationCode.LEASE_EXPIRED.value},
+            )
+        now = await uow.investigation_tasks.database_now()
+        if task.lease_expires_at <= now:
+            raise ContributionLeaseAuthorityError(
+                "agent lease has expired",
+                details={"code": WorkContributionValidationCode.LEASE_EXPIRED.value},
+            )
+        session = await uow.agent_sessions.get(authority.session_id)
+        if (
+            session is None
+            or not session.is_active
+            or session.investigation_id != investigation_id
+            or session.task_id != task.id
+            or session.task_lease_fence != authority.lease_fence
+            or task.lease_session_id != session.id
+        ):
+            raise ContributionLeaseAuthorityError(
+                "the agent session no longer owns the lease",
+                details={
+                    "code": WorkContributionValidationCode.LEASE_FENCE_STALE.value,
+                    "reason": "session_inactive_or_superseded",
+                },
+            )
+        return task
+
+    async def _write_contribution_event(
+        self,
+        uow: WorkContributionUnitOfWork,
+        contribution: WorkContributionV1,
+        *,
+        authority: ContributionAuthority,
+        task: InvestigationTaskV1 | None,
+        event_writer: ContributionEventWriter | None,
+        created: bool,
+    ) -> None:
+        """Append the journal event only for the row this transaction created.
+
+        A replayed row already owns its event (or is repaired by the caller),
+        and its historical fence must not be journaled at a newer one.
+        """
+        if not created or event_writer is None or task is None:
+            return
+        if authority.origin is not WorkContributionOrigin.AGENT:
+            return
+        await event_writer(
+            uow.investigation_tasks,
+            contribution,
+            task=task,
+            occurred_at=self._clock(),
+        )
 
     @staticmethod
     async def _append_in_uow(
         uow: WorkContributionUnitOfWork,
         row: WorkContributionV1,
         revision: WorkspaceFileRevisionV1,
-    ) -> WorkContributionV1:
+    ) -> tuple[WorkContributionV1, bool]:
         try:
-            stored, _created = await uow.work_contributions.append_if_absent(row)
+            stored, created = await uow.work_contributions.append_if_absent(row)
         except VersionConflictError as exc:
             raise WorkContributionConflictError(
                 "the workspace revision already has a different contribution",
@@ -792,7 +965,7 @@ class WorkContributionService:
                     "workspace_revision_id": revision.revision_id,
                 },
             )
-        return stored
+        return stored, created and stored.id == row.id
 
     def _row(
         self,
@@ -855,6 +1028,8 @@ __all__ = [
     "WORK_CONTRIBUTION_BUCKET",
     "ContributionArtifactStore",
     "ContributionAuthority",
+    "ContributionEventWriter",
+    "ContributionLeaseAuthorityError",
     "OperatorSessionRequiredError",
     "WorkContributionConflictError",
     "WorkContributionError",

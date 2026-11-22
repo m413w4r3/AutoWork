@@ -23,7 +23,11 @@ instead of introducing a second journal, budget or evidence pipeline:
   worker capability (``analysis.exec``) and G2/budgets stay authoritative;
 * ``contribution.import`` reuses the M24-07 import service with an
   ``origin='agent'`` authority derived from the verified session and the locked
-  task row, then appends the ``contribution_imported`` task event;
+  task row; the import service revalidates that authority and appends the
+  ``contribution_imported`` event in its own persisting transaction;
+* ``task.submit_result`` closes the session in the command transaction and
+  requests host teardown only after the commit (a missing flusher records the
+  unconfirmed effect instead of dropping it);
 * ``note.capture`` publishes the agent's own note/result through the host
   workspace layer (origin ``agent`` + task header), never as evidence.
 
@@ -48,6 +52,10 @@ from cti_app.application.agentic_note_tools import (
     AgenticNoteCaptureService,
     NoteCaptureError,
 )
+from cti_app.application.agentic_sessions import (
+    SessionReleaseFlusher,
+    mark_host_release_unconfirmed,
+)
 from cti_app.application.investigation_handoffs import (
     HandoffCreateRequest,
     InvestigationHandoffService,
@@ -66,6 +74,7 @@ from cti_app.application.investigation_task_events import (
 from cti_app.application.investigation_tasks import (
     InvestigationTaskService,
     TaskSessionOutcome,
+    TaskSessionRelease,
 )
 from cti_app.application.operator_tool_invocation import (
     OperatorToolInvocationResult,
@@ -401,9 +410,11 @@ class _BoundSessionPort:
         self,
         session: VerifiedAgentSession,
         sessions: AgentSessionRepository | None,
+        releases: list[TaskSessionRelease] | None = None,
     ) -> None:
         self._session = session
         self._sessions = sessions
+        self._releases = releases
 
     async def is_active_session(
         self, *, session_id: UUID, investigation_id: UUID, task_id: UUID
@@ -432,6 +443,16 @@ class _BoundSessionPort:
             outcome=outcome.value,
             reason=reason,
         )
+        if self._releases is not None:
+            self._releases.append(
+                TaskSessionRelease(
+                    session_id=session_id,
+                    investigation_id=investigation_id,
+                    task_id=task_id,
+                    outcome=outcome,
+                    reason=reason,
+                )
+            )
 
 
 class AgenticToolBroker:
@@ -450,6 +471,7 @@ class AgenticToolBroker:
         task_limits: TaskLimits = TASK_LIMIT_DEFAULTS,
         clock: Callable[[], datetime] | None = None,
         commit: Callable[[], Awaitable[None]] | None = None,
+        release_host: SessionReleaseFlusher | None = None,
     ) -> None:
         if not isinstance(investigation_id, UUID):
             raise TypeError("investigation_id must be a UUID")
@@ -465,6 +487,8 @@ class AgenticToolBroker:
         self._task_limits = task_limits
         self._clock = clock or (lambda: datetime.now(UTC))
         self._commit = commit
+        self._release_host = release_host
+        self._releases: list[TaskSessionRelease] = []
 
     async def invoke(
         self,
@@ -484,6 +508,9 @@ class AgenticToolBroker:
             raise AgenticArgumentsInvalidError("schema_version must be a non-empty string")
         if not isinstance(arguments, Mapping):
             raise AgenticArgumentsInvalidError("arguments must be a JSON object")
+        # A release produced by a previous call whose flush never ran is
+        # flushed before any new effect, never silently forgotten.
+        await self._flush_releases()
         canonical_tool = "advisor.consult" if tool_name == BRIDGE_CONSULT_ALIAS else tool_name
         if canonical_tool in OPINION_TOOL_NAMES:
             # D4: an agentic session never writes publishable prose, whatever
@@ -654,7 +681,7 @@ class AgenticToolBroker:
         engine = InvestigationTaskService(
             tasks=self._uow.investigation_tasks,
             decisions=self._uow.analyst_decisions,
-            sessions=_BoundSessionPort(session, self._uow.agent_sessions),
+            sessions=_BoundSessionPort(session, self._uow.agent_sessions, self._releases),
             limits=self._task_limits,
         )
         actor = TaskActor(kind=TaskActorKind.OPERATOR, actor_id=operator_id)
@@ -689,6 +716,9 @@ class AgenticToolBroker:
             )
         if self._commit is not None:
             await self._commit()
+        # ``task.submit_result`` closes the session in the committed UoW; the
+        # host teardown happens only now, outside any lock (B2).
+        await self._flush_releases()
         return AgenticToolResult(
             investigation_id=self._investigation_id,
             session_id=session.session_id,
@@ -707,6 +737,39 @@ class AgenticToolBroker:
                 "event_id": str(command.event.id) if command.event is not None else None,
             },
         )
+
+    async def _flush_releases(self) -> None:
+        """Flush buffered host releases after the command commit (B2).
+
+        The broker shares the route's UoW, so without a wired host runtime the
+        unconfirmed effect is recorded on the session as a
+        ``lost_unreconciled`` marker instead of disappearing.
+        """
+        releases = self._releases
+        self._releases = []
+        if not releases:
+            return
+        try:
+            if self._release_host is not None:
+                await self._release_host(releases)
+                return
+            now = self._clock()
+            for release in releases:
+                session = await self._uow.agent_sessions.get(release.session_id)
+                if session is None:
+                    continue
+                if (
+                    await mark_host_release_unconfirmed(
+                        self._uow, session, "host runtime is not wired", now=now
+                    )
+                    is not None
+                ):
+                    await self._uow.commit()
+        except BaseException:
+            # Keep the buffered releases: a later call (or the crash recovery)
+            # must be able to see the unconfirmed effect.
+            self._releases = releases + self._releases
+            raise
 
     # ----------------------------------------------------------- handoff path
 
@@ -785,6 +848,10 @@ class AgenticToolBroker:
             actor_id=operator_id,
             task_id=task.id,
             lease_fence=task.lease_fence,
+            session_id=session.session_id,
+        )
+        recorder = _ContributionEventRecorder(
+            investigation_id=self._investigation_id, operator_id=operator_id
         )
         try:
             contribution = await self._contributions.import_revision(
@@ -794,6 +861,7 @@ class AgenticToolBroker:
                 declaration=declaration,
                 authority=authority,
                 idempotency_key=_bound_effect_key("contribution", idempotency_key),
+                event_writer=recorder,
             )
         except WorkContributionError as exc:
             raise AgenticContributionRefusedError(
@@ -802,9 +870,19 @@ class AgenticToolBroker:
                 status_code=exc.status_code,
                 details={str(name): str(value) for name, value in exc.details.items()},
             ) from exc
-        event, created = await self._append_contribution_event(
-            contribution, task=task, operator_id=operator_id, now=now
-        )
+        if recorder.result is not None:
+            event, created = recorder.result
+        else:
+            # A replay returns the stored row without writing anything: repair
+            # its event idempotently in the route UoW, never a second effect.
+            event, created = await _append_contribution_event(
+                self._uow.investigation_tasks,
+                contribution,
+                investigation_id=self._investigation_id,
+                task=task,
+                operator_id=operator_id,
+                occurred_at=now,
+            )
         if self._commit is not None:
             await self._commit()
         output = dict(contribution.to_payload())
@@ -818,68 +896,6 @@ class AgenticToolBroker:
             status=contribution.import_status.value,
             idempotent_replay=event is None or not created,
             output=output,
-        )
-
-    async def _append_contribution_event(
-        self,
-        contribution: WorkContributionV1,
-        *,
-        task: InvestigationTaskV1,
-        operator_id: str,
-        now: datetime,
-    ) -> tuple[TaskEvent | None, bool]:
-        """Append ``contribution_imported`` once for this agent's own row.
-
-        A row already imported by another actor (host watcher or another task)
-        is returned unchanged but must not be journaled as this task's import.
-        """
-        if (
-            contribution.origin is not WorkContributionOrigin.AGENT
-            or contribution.task_id != task.id
-        ):
-            return None, False
-        return await append_task_event(
-            self._uow.investigation_tasks,
-            TaskEventDraft(
-                investigation_id=self._investigation_id,
-                task_id=task.id,
-                event_type=TaskEventType.CONTRIBUTION_IMPORTED,
-                actor=TaskActor(kind=TaskActorKind.OPERATOR, actor_id=operator_id),
-                idempotency_key=f"contribution:{contribution.id}",
-                payload={
-                    "contribution_id": str(contribution.id),
-                    "category": contribution.category.value,
-                    "import_status": contribution.import_status.value,
-                    "origin": contribution.origin.value,
-                    "workspace_id": contribution.workspace_id,
-                    "workspace_revision_id": contribution.workspace_revision_id,
-                    "file_relpath": contribution.file_relpath,
-                    "file_sha256": contribution.file_sha256,
-                    "task_id": str(contribution.task_id),
-                    "lease_fence": contribution.lease_fence,
-                    "observation_id": (
-                        str(contribution.observation_id)
-                        if contribution.observation_id is not None
-                        else None
-                    ),
-                    "finding_id": (
-                        str(contribution.finding_id)
-                        if contribution.finding_id is not None
-                        else None
-                    ),
-                    "sample_association_id": (
-                        str(contribution.sample_association_id)
-                        if contribution.sample_association_id is not None
-                        else None
-                    ),
-                    "validation_error_code": (
-                        contribution.validation_error_code.value
-                        if contribution.validation_error_code is not None
-                        else None
-                    ),
-                },
-            ),
-            occurred_at=now,
         )
 
     # ------------------------------------------------------- note capture path
@@ -975,6 +991,101 @@ class AgenticToolBroker:
                 raise AgenticArgumentsInvalidError("investigation_id is not a UUID") from None
             if bound_investigation != task.investigation_id:
                 raise AgenticBindingRefusedError("the tool arguments target another investigation")
+
+
+class _ContributionEventRecorder:
+    """Writes ``contribution_imported`` inside the import service's transaction.
+
+    The service calls it with *its* task repository, so the contribution row,
+    the validated fence and the event commit atomically.  ``result`` lets the
+    broker report the event id, and its absence distinguishes the replay path
+    (no row was written) from a fresh import.
+    """
+
+    def __init__(self, *, investigation_id: UUID, operator_id: str) -> None:
+        self._investigation_id = investigation_id
+        self._operator_id = operator_id
+        self.result: tuple[TaskEvent | None, bool] | None = None
+
+    async def __call__(
+        self,
+        tasks: InvestigationTaskRepository,
+        contribution: WorkContributionV1,
+        *,
+        task: InvestigationTaskV1,
+        occurred_at: datetime,
+    ) -> tuple[TaskEvent | None, bool]:
+        self.result = await _append_contribution_event(
+            tasks,
+            contribution,
+            investigation_id=self._investigation_id,
+            task=task,
+            operator_id=self._operator_id,
+            occurred_at=occurred_at,
+        )
+        return self.result
+
+
+async def _append_contribution_event(
+    tasks: InvestigationTaskRepository,
+    contribution: WorkContributionV1,
+    *,
+    investigation_id: UUID,
+    task: InvestigationTaskV1,
+    operator_id: str,
+    occurred_at: datetime,
+) -> tuple[TaskEvent | None, bool]:
+    """Append ``contribution_imported`` once for this agent's own row.
+
+    The event's ``lease_fence`` column is read from the locked task row; the
+    caller holds that row lock in the same transaction, so it is exactly the
+    fence the import revalidated.  A row already imported by another actor
+    (host watcher or another task) is returned unchanged but must not be
+    journaled as this task's import.
+    """
+    if contribution.origin is not WorkContributionOrigin.AGENT or contribution.task_id != task.id:
+        return None, False
+    return await append_task_event(
+        tasks,
+        TaskEventDraft(
+            investigation_id=investigation_id,
+            task_id=task.id,
+            event_type=TaskEventType.CONTRIBUTION_IMPORTED,
+            actor=TaskActor(kind=TaskActorKind.OPERATOR, actor_id=operator_id),
+            idempotency_key=f"contribution:{contribution.id}",
+            payload={
+                "contribution_id": str(contribution.id),
+                "category": contribution.category.value,
+                "import_status": contribution.import_status.value,
+                "origin": contribution.origin.value,
+                "workspace_id": contribution.workspace_id,
+                "workspace_revision_id": contribution.workspace_revision_id,
+                "file_relpath": contribution.file_relpath,
+                "file_sha256": contribution.file_sha256,
+                "task_id": str(contribution.task_id),
+                "lease_fence": contribution.lease_fence,
+                "observation_id": (
+                    str(contribution.observation_id)
+                    if contribution.observation_id is not None
+                    else None
+                ),
+                "finding_id": (
+                    str(contribution.finding_id) if contribution.finding_id is not None else None
+                ),
+                "sample_association_id": (
+                    str(contribution.sample_association_id)
+                    if contribution.sample_association_id is not None
+                    else None
+                ),
+                "validation_error_code": (
+                    contribution.validation_error_code.value
+                    if contribution.validation_error_code is not None
+                    else None
+                ),
+            },
+        ),
+        occurred_at=occurred_at,
+    )
 
 
 def _bound_effect_key(prefix: str, bound_key: str) -> str:

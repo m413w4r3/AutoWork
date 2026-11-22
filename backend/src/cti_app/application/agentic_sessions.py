@@ -63,7 +63,15 @@ from cti_app.application.investigation_persistence import (
     InvestigationTaskRepository,
     VersionConflictError,
 )
+from cti_app.application.investigation_task_events import (
+    TaskEventConflictError,
+    TaskEventDraft,
+    TaskEventType,
+    TaskNotFoundError,
+    append_task_event,
+)
 from cti_app.application.investigation_tasks import (
+    SYSTEM_TASK_ACTOR,
     InvestigationTaskService,
     TaskSessionOutcome,
     TaskSessionRelease,
@@ -467,6 +475,14 @@ _HOST_CLOSABLE_STATES = frozenset({"ready", "stopped", "lost", "failed", "closed
 _HOST_RELEASE_POLL_SECONDS = 0.2
 
 
+def host_release_event_key(session_id: UUID) -> str:
+    """Durable confirmation key: a release without this event is still pending."""
+    return f"host-release:{session_id}"
+
+
+SessionReleaseFlusher = Callable[[Sequence[TaskSessionRelease]], Awaitable[None]]
+
+
 class HostSessionReleaseService:
     """Request host teardown for sessions the DB already released (B2).
 
@@ -520,6 +536,8 @@ class HostSessionReleaseService:
         unconfirmed = await self._close_host(host, session, release.reason)
         if unconfirmed is not None:
             await self._mark_unconfirmed(session, unconfirmed)
+            return
+        await self._mark_released(session)
 
     async def _close_host(
         self, host: HostSessionsPort, session: AgentSessionV1, reason: str
@@ -574,34 +592,88 @@ class HostSessionReleaseService:
             return f"host close after interrupt failed ({type(exc).__name__})"
         return None
 
+    async def _mark_released(self, session: AgentSessionV1) -> None:
+        """Record a durable host-teardown confirmation on the task journal.
+
+        The event is the marker the crash recovery reads: a terminal session
+        whose host reference carries no such event still has a pending host
+        release.  The payload is stable so a concurrent or retried release
+        replays the same event instead of conflicting.
+        """
+        now = self._clock()
+        async with self._uow_factory() as uow:
+            task = await uow.investigation_tasks.get(session.task_id)
+            if task is None:
+                # Nothing canonical to journal; the session row stays terminal.
+                return
+            try:
+                await append_task_event(
+                    uow.investigation_tasks,
+                    TaskEventDraft(
+                        investigation_id=session.investigation_id,
+                        task_id=session.task_id,
+                        event_type=TaskEventType.SESSION_STATE_CHANGED,
+                        actor=SYSTEM_TASK_ACTOR,
+                        idempotency_key=host_release_event_key(session.id),
+                        payload={
+                            "session_id": str(session.id),
+                            "action": "host_session_released",
+                        },
+                    ),
+                    occurred_at=now,
+                )
+            except (TaskEventConflictError, TaskNotFoundError):
+                # Another release path confirmed this session concurrently, or
+                # the task row vanished with no journal left to write.
+                return
+            await uow.commit()
+
     async def _mark_unconfirmed(self, session: AgentSessionV1, detail: str) -> None:
         """Persist a ``lost_unreconciled`` marker without overwriting a real one."""
         now = self._clock()
-        payload = {
-            "outcome": SessionReconcileOutcome.LOST_UNRECONCILED.value,
-            "detail": f"host release unconfirmed: {detail}",
-            "observed_at": now.isoformat(),
-            "session_id": str(session.id),
-        }
-        digest = hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
         async with self._uow_factory() as uow:
             current = await uow.agent_sessions.get(session.id)
-            if current is None or current.reconciliation is not None or current.is_active:
-                # A still-active row belongs to a live lease path; a terminal
-                # or stopped row may carry the transport marker.  An existing
-                # typed D7 outcome is never overwritten.
+            if current is None:
                 return
-            marked = current.with_reconciliation(payload, digest, now=now)
-            if (
-                await uow.agent_sessions.update_state(
-                    marked, expected_state_version=current.state_version
-                )
-                is None
-            ):
-                # A concurrent writer recorded its own typed outcome; that is
-                # stronger than this transport marker.
-                return
+            await mark_host_release_unconfirmed(uow, current, detail, now=now)
             await uow.commit()
+
+
+class AgentSessionMutationUnitOfWork(Protocol):
+    """The one store a transport marker needs; any wider UoW satisfies it."""
+
+    agent_sessions: AgentSessionRepository
+
+
+async def mark_host_release_unconfirmed(
+    uow: AgentSessionMutationUnitOfWork,
+    session: AgentSessionV1,
+    detail: str,
+    *,
+    now: datetime,
+) -> AgentSessionV1 | None:
+    """Mark a terminal session's unconfirmed host effect; never overwrite.
+
+    ``None`` means a live lease path owns the row or a stronger typed D7
+    outcome already exists; the caller still owns its commit.
+    """
+    if session.reconciliation is not None or session.is_active:
+        # A still-active row belongs to a live lease path; a terminal or
+        # stopped row may carry the transport marker.  An existing typed D7
+        # outcome is never overwritten.
+        return None
+    payload = {
+        "outcome": SessionReconcileOutcome.LOST_UNRECONCILED.value,
+        "detail": f"host release unconfirmed: {detail}",
+        "observed_at": now.isoformat(),
+        "session_id": str(session.id),
+    }
+    digest = hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+    marked = session.with_reconciliation(payload, digest, now=now)
+    stored = await uow.agent_sessions.update_state(
+        marked, expected_state_version=session.state_version
+    )
+    return stored
 
 
 def _host_release_key(action: str, session_id: UUID) -> str:
@@ -631,6 +703,7 @@ class SessionService:
         secret_delivery: AgentSessionSecretDeliveryPort | None = None,
         note_resolver: InstructionNoteResolver | None = None,
         disclosure: Callable[[UUID], Awaitable[None]] | None = None,
+        release_host: SessionReleaseFlusher | None = None,
         cli_network_mode: str = "isolated_egress",
         task_limits: TaskLimits = TASK_LIMIT_DEFAULTS,
         clock: Callable[[], datetime] | None = None,
@@ -643,6 +716,7 @@ class SessionService:
         self._secret_delivery = secret_delivery
         self._note_resolver = note_resolver
         self._disclosure = disclosure
+        self._release_host = release_host
         self._cli_network_mode = cli_network_mode
         self._task_limits = task_limits
         self._clock = clock or (lambda: datetime.now(UTC))
@@ -703,7 +777,15 @@ class SessionService:
             await self._deliver_secret(provisioned, key)
             return provisioned
         prepared = await self._prepare_host(operator, provisioned, request, key, timestamp)
-        session = await self._transition_prepared(prepared.session, timestamp)
+        try:
+            session = await self._transition_prepared(prepared.session, timestamp)
+        except Exception:
+            # A crash inside this phase must not leave an active row that no
+            # later open can replace: the durable ``failed`` row is the marker.
+            await self._compensate_failed_activation(
+                operator, prepared.session, "transition_ready_failed"
+            )
+            raise
         return PreparedAgentSession(session=session, secret=prepared.secret)
 
     async def open_session(
@@ -763,7 +845,13 @@ class SessionService:
             await self._deliver_secret(provisioned, key)
             return provisioned
         prepared = await self._prepare_host(operator, provisioned, request, key, timestamp)
-        ready = await self._transition_prepared(prepared.session, timestamp)
+        try:
+            ready = await self._transition_prepared(prepared.session, timestamp)
+        except Exception:
+            await self._compensate_failed_activation(
+                operator, prepared.session, "transition_ready_failed"
+            )
+            raise
         prepared = PreparedAgentSession(session=ready, secret=prepared.secret)
         await self._host_start(operator, ready, timestamp)
         return await self._activate_prepared(operator, investigation_id, prepared, timestamp)
@@ -880,6 +968,12 @@ class SessionService:
         key = _idempotency_key(idempotency_key)
         timestamp = _now(self._clock, now)
         self._require_human(actor)
+        # R03b M1: the disclosure gate binds every delivery to the external
+        # provider, not only the session opening.  This instruction may be
+        # delivered live to an idle CLI, and a revoke/TLP change after the
+        # opening must stop it (B2).  Queueing alone has no host effect, but
+        # the gate runs first so the decision cannot drift before delivery.
+        await self._require_external_disclosure(investigation_id)
         resolution: NoteInstructionResolution | None = None
         composed_text = text.strip()
         if note_refs:
@@ -1381,7 +1475,26 @@ class SessionService:
                 session.with_state(target, now=timestamp, close_reason=reason.strip()),
             )
             await uow.commit()
-            return closed
+        # Pre-lease close: the DB row is terminal, so the host object (if any)
+        # must be stopped or its unconfirmed effect durably marked (B2).
+        await self._flush_releases(
+            [
+                TaskSessionRelease(
+                    session_id=closed.id,
+                    investigation_id=closed.investigation_id,
+                    task_id=closed.task_id,
+                    outcome=(
+                        TaskSessionOutcome.LOST
+                        if closed.state is AgentSessionState.FAILED
+                        else TaskSessionOutcome.CLOSED
+                    ),
+                    reason="session_closed",
+                )
+            ]
+            if closed.host_session_ref is not None
+            else []
+        )
+        return closed
 
     # ---------------------------------------------------------------- helpers
 
@@ -1475,6 +1588,7 @@ class SessionService:
     ) -> PreparedAgentSession:
         """Host prepare + one-shot secret delivery, with no lock held."""
         session = prepared.session
+        host_session_ref: str | None = None
         try:
             host = await operator.prepare_session(
                 PrepareSessionRequest(
@@ -1497,12 +1611,19 @@ class SessionService:
                 raise SessionOperatorContractError(
                     "prepare_session answered a different session or capability probe"
                 )
-            recorded = await self._record_host_ref(session, host.host_session_ref)
+            host_session_ref = host.host_session_ref
+            recorded = await self._record_host_ref(session, host_session_ref)
             prepared = PreparedAgentSession(session=recorded, secret=prepared.secret)
             await self._deliver_secret(prepared, key)
             return prepared
         except Exception:
             await self._fail_session(session.id, "prepare_failed_before_start")
+            if host_session_ref is not None:
+                # The prepared host object exists even though the durable row
+                # could not record or deliver: stop it best effort.
+                await self._interrupt_host_quietly(
+                    operator, session.id, host_session_ref, "prepare_failed_before_start"
+                )
             raise
 
     async def _record_host_ref(
@@ -1542,18 +1663,30 @@ class SessionService:
     async def _host_start(
         self, operator: AgenticOperatorPort, session: AgentSessionV1, timestamp: datetime
     ) -> None:
-        """Start the host run with no lock held; a dead run is durably failed."""
+        """Start the host run with no lock held; a dead or failed run is durably failed.
+
+        An adapter exception is the same outcome as ``alive=False``: a CLI may
+        already be running while the backend knows nothing, so the durable
+        ``failed`` row plus a best-effort interrupt is the only safe marker.
+        """
         if session.host_session_ref is None:
             raise SessionOperatorContractError("the prepared session has no host reference")
-        status = await operator.start_session(
-            StartSessionRequest(
-                session_id=session.id,
-                adapter_kind=session.adapter_kind,
-                host_session_ref=session.host_session_ref,
-                capability_sha256=session.capability_sha256,
+        try:
+            status = await operator.start_session(
+                StartSessionRequest(
+                    session_id=session.id,
+                    adapter_kind=session.adapter_kind,
+                    host_session_ref=session.host_session_ref,
+                    capability_sha256=session.capability_sha256,
+                )
             )
-        )
+        except Exception:
+            await self._compensate_failed_activation(operator, session, "start_session_failed")
+            raise
         if status.session_id != session.id:
+            await self._compensate_failed_activation(
+                operator, session, "start_session_contract_invalid"
+            )
             raise SessionOperatorContractError("start_session answered another session")
         if not status.alive:
             await self._fail_session(session.id, "start_session_not_alive")
@@ -1678,16 +1811,37 @@ class SessionService:
         await self._fail_session(session.id, reason)
         if session.host_session_ref is None:
             return
+        await self._interrupt_host_quietly(operator, session.id, session.host_session_ref, reason)
+
+    @staticmethod
+    async def _interrupt_host_quietly(
+        operator: AgenticOperatorPort, session_id: UUID, host_session_ref: str, reason: str
+    ) -> None:
+        """Best-effort stop of a host object this process may not even know (M2)."""
         try:
             await operator.interrupt_session(
                 InterruptSessionRequest(
-                    session_id=session.id,
-                    host_session_ref=session.host_session_ref,
+                    session_id=session_id,
+                    host_session_ref=host_session_ref,
                     reason=reason,
                 )
             )
         except WorkspaceAgentError:
             return
+
+    async def _flush_releases(self, releases: Sequence[TaskSessionRelease]) -> None:
+        """Request host teardown after the DB commit; never under a lock.
+
+        A service built without a wired host runtime treats the effect as
+        unconfirmed and records the ``lost_unreconciled`` marker: the host is
+        never silently assumed stopped.
+        """
+        if not releases:
+            return
+        flusher = self._release_host
+        if flusher is None:
+            flusher = HostSessionReleaseService(uow_factory=self._uow_factory, host=None).flush
+        await flusher(releases)
 
     async def _deliver_secret(self, prepared: PreparedAgentSession, idempotency_key: str) -> None:
         """Hand the secret to the host agent; the browser never receives it."""
@@ -2012,6 +2166,7 @@ def _now(clock: Callable[[], datetime], value: datetime | None) -> datetime:
 
 
 __all__ = [
+    "AgentSessionMutationUnitOfWork",
     "AgentSessionSecretDeliveryPort",
     "DeliveredInstructionV1",
     "EnqueuedInstructionV1",
@@ -2030,6 +2185,7 @@ __all__ = [
     "SessionNotFoundError",
     "SessionOperatorContractError",
     "SessionOperatorUnavailableError",
+    "SessionReleaseFlusher",
     "SessionResumeUnavailableError",
     "SessionSecret",
     "SessionSecretDeliveryError",
@@ -2038,4 +2194,6 @@ __all__ = [
     "SessionStartFailedError",
     "SessionStateConflictError",
     "SessionUnitOfWork",
+    "host_release_event_key",
+    "mark_host_release_unconfirmed",
 ]

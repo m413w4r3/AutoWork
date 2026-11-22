@@ -37,7 +37,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import TracebackType
-from typing import Any, Literal, Protocol, Self
+from typing import Any, Literal, Protocol, Self, cast
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -45,8 +45,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from cti_app.application.agent_session_verification import SessionSecretDeriver
 from cti_app.application.agentic_sessions import (
     AgentSessionSecretDeliveryPort,
+    HostSessionReleaseService,
     NoteInstructionResolution,
     SessionError,
+    SessionReleaseFlusher,
     SessionService,
     SessionUnitOfWork,
 )
@@ -74,6 +76,7 @@ from cti_app.application.investigation_persistence import (
 from cti_app.application.investigation_tasks import (
     InvestigationTaskService,
     TaskSessionOutcome,
+    TaskSessionRelease,
 )
 from cti_app.application.persistence import (
     AnalystDecisionRepository,
@@ -398,10 +401,19 @@ class TransferUnitOfWork(Protocol):
 
 
 class _EngineSessionPort:
-    """Adapts the session repository to the task engine's narrow lease seam."""
+    """Adapts the session repository to the task engine's narrow lease seam.
 
-    def __init__(self, repository: AgentSessionRepository) -> None:
+    A lease release closes the session row inside the transfer transaction and
+    buffers the host teardown for a post-commit flush (B2).
+    """
+
+    def __init__(
+        self,
+        repository: AgentSessionRepository,
+        releases: list[TaskSessionRelease] | None = None,
+    ) -> None:
         self._repository = repository
+        self._releases = releases
 
     async def is_active_session(
         self, *, session_id: UUID, investigation_id: UUID, task_id: UUID
@@ -426,6 +438,16 @@ class _EngineSessionPort:
             outcome=outcome.value,
             reason=reason,
         )
+        if self._releases is not None:
+            self._releases.append(
+                TaskSessionRelease(
+                    session_id=session_id,
+                    investigation_id=investigation_id,
+                    task_id=task_id,
+                    outcome=outcome,
+                    reason=reason,
+                )
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -468,6 +490,7 @@ class InvestigationTransferService:
         secret_delivery: AgentSessionSecretDeliveryPort | None = None,
         deriver: SessionSecretDeriver | None = None,
         disclosure: Callable[[UUID], Awaitable[None]] | None = None,
+        release_host: SessionReleaseFlusher | None = None,
         cli_network_mode: str = "isolated_egress",
         task_limits: TaskLimits = TASK_LIMIT_DEFAULTS,
         clock: Callable[[], datetime] | None = None,
@@ -478,6 +501,7 @@ class InvestigationTransferService:
         self._secret_delivery = secret_delivery
         self._deriver = deriver
         self._disclosure = disclosure
+        self._release_host = release_host
         self._cli_network_mode = cli_network_mode
         self._task_limits = task_limits
         self._clock = clock or (lambda: datetime.now(UTC))
@@ -834,11 +858,12 @@ class InvestigationTransferService:
         now: datetime,
     ) -> InvestigationTaskV1:
         """Move the task to ``assigned`` for the destination through the engine."""
+        releases: list[TaskSessionRelease] = []
         async with self._uow_factory() as uow:
             engine = InvestigationTaskService(
                 tasks=uow.investigation_tasks,
                 decisions=uow.analyst_decisions,
-                sessions=_EngineSessionPort(uow.agent_sessions),
+                sessions=_EngineSessionPort(uow.agent_sessions, releases),
                 limits=self._task_limits,
             )
             current = await uow.investigation_tasks.get(task.id)
@@ -921,7 +946,22 @@ class InvestigationTransferService:
                 )
             _require_assignment(current, destination.task)
             await uow.commit()
-            return current
+        # The blocking transition committed: only now may the old session's
+        # host process be stopped (B2), outside every lock.
+        await self._flush_host_releases(releases)
+        return current
+
+    async def _flush_host_releases(self, releases: Sequence[TaskSessionRelease]) -> None:
+        """Post-commit host teardown; an unconfirmed effect is marked, never lost."""
+        if not releases:
+            return
+        flusher = self._release_host
+        if flusher is None:
+            flusher = HostSessionReleaseService(
+                uow_factory=cast(Callable[[], SessionUnitOfWork], self._uow_factory),
+                host=None,
+            ).flush
+        await flusher(releases)
 
     async def _create_handoff(
         self,
@@ -1054,6 +1094,7 @@ class InvestigationTransferService:
             operator=self._operator,
             secret_delivery=self._secret_delivery,
             disclosure=self._disclosure,
+            release_host=self._release_host,
             cli_network_mode=self._cli_network_mode,
             task_limits=self._task_limits,
             clock=self._clock,

@@ -10,6 +10,7 @@ the append-only trigger refuses an UPDATE.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
@@ -26,10 +27,15 @@ from cti_app.application.agent_session_verifier import VerifiedAgentSession
 from cti_app.application.agentic_tool_broker import AgenticToolBroker
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.investigation_task_events import TaskEventType
+from cti_app.application.investigation_tasks import (
+    InvestigationTaskService,
+    RepositoryTaskSessionPort,
+)
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.work_contributions import (
     IMPORTED_SUPPORTED_LIMITATION,
     ContributionAuthority,
+    ContributionLeaseAuthorityError,
     WorkContributionService,
 )
 from cti_app.application.workspace_agent import (
@@ -48,6 +54,7 @@ from cti_app.domain.investigation_task import (
     ResultVerificationStatus,
     TaskActor,
     TaskActorKind,
+    TaskLimits,
     TaskPriority,
     TaskStatus,
 )
@@ -234,12 +241,14 @@ async def test_agent_contribution_import_via_broker_persists_event(
             await uow.workspace_bindings.add_if_absent(binding)
             await uow.investigation_tasks.add(task)
             await uow.agent_sessions.add(session_row)
+            # The lease boundary is the database clock, so acquire it "now"
+            # rather than at the fixed fixture timestamp of the row.
             leased = await uow.investigation_tasks.acquire_lease(
                 task.id,
                 expected_status_version=task.status_version,
                 lease_id=lease_id,
                 lease_session_id=session_id,
-                now=NOW,
+                now=datetime.now(UTC),
                 ttl_seconds=3600,
             )
             assert leased is not None
@@ -323,6 +332,161 @@ async def test_agent_contribution_import_via_broker_persists_event(
         assert [event.event_type for event in events] == [TaskEventType.CONTRIBUTION_IMPORTED]
         assert events[0].lease_fence == leased.lease_fence
         assert events[0].payload["contribution_id"] == str(row.id)
+    finally:
+        await engine.dispose()
+
+
+class _BlockingWorkspaceAgent:
+    """Holds the UDS content read open so a cancel can commit in between."""
+
+    def __init__(self, content: WorkspaceContentV1) -> None:
+        self.content = content
+        self.reading = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def read_content(self, workspace_id: str, *, path: str) -> WorkspaceContentV1:
+        self.reading.set()
+        await self.release.wait()
+        return self.content
+
+
+async def test_contribution_import_refused_when_a_cancel_commits_between_read_and_persist(
+    migrated_postgres_url: str, tmp_path: Path
+) -> None:
+    """BLOCKER 2: the fence is revalidated in the persisting transaction."""
+    engine = create_postgres_engine(migrated_postgres_url)
+    session_factory = create_session_factory(engine)
+    try:
+        investigation = await _make_investigation(session_factory)
+        workspace_id = "ws-" + uuid4().hex
+        binding = WorkspaceBindingV1(
+            workspace_id=workspace_id,
+            investigation_id=investigation.id,
+            subject_id=investigation.subject_id,
+            delivery_code="IR202611",
+            article_slug="bluemoon-cn",
+            synthesis_sha256="a" * 64,
+            created_at=NOW,
+        )
+        session_id = uuid4()
+        task = _assigned_task(investigation.id)
+        lease_id = uuid4()
+        session_row, _secret = _session_row(
+            investigation.id,
+            replace(
+                task,
+                lease_id=lease_id,
+                lease_session_id=session_id,
+                lease_fence=task.lease_fence + 1,
+                lease_expires_at=NOW + timedelta(hours=1),
+                heartbeat_at=NOW,
+            ),
+            session_id=session_id,
+        )
+        note_path = f"notes/agents/{task.id}/analyse.md"
+        note_bytes = b"# Note agent\n\nHypothese non verifiee.\n"
+        revision = _revision(workspace_id, note_path, note_bytes)
+        revision = WorkspaceFileRevisionV1(
+            workspace_id=workspace_id,
+            revision_id=revision.revision_id,
+            path=revision.path,
+            sha256=revision.sha256,
+            size=revision.size,
+            mode=revision.mode,
+            mtime_ns=revision.mtime_ns,
+            observed_at=revision.observed_at,
+            origin="agent",
+            task_id=task.id,
+        )
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            await uow.workspace_bindings.add_if_absent(binding)
+            await uow.investigation_tasks.add(task)
+            await uow.agent_sessions.add(session_row)
+            leased = await uow.investigation_tasks.acquire_lease(
+                task.id,
+                expected_status_version=task.status_version,
+                lease_id=lease_id,
+                lease_session_id=session_id,
+                now=NOW,
+                ttl_seconds=3600,
+            )
+            assert leased is not None
+            await uow.workspace_file_revisions.append_if_absent(revision)
+            await uow.commit()
+
+        agent = _BlockingWorkspaceAgent(
+            WorkspaceContentV1(
+                content=note_bytes,
+                sha256=revision.sha256,
+                size=len(note_bytes),
+                mtime_ns=revision.mtime_ns,
+            )
+        )
+        service = WorkContributionService(
+            uow_factory=lambda: SqlAlchemyUnitOfWork(session_factory),
+            workspace_agent=agent,
+            artifact_store=ProductionArtifactStore(
+                BlobCatalogService(
+                    FilesystemBlobStore(tmp_path / "interleave-blobs"),
+                    lambda: SqlAlchemyUnitOfWork(session_factory),
+                )
+            ),
+            article_snapshots=_ArticleSnapshots(),
+            max_contribution_bytes=16 * 1024 * 1024,
+            clock=lambda: NOW,
+        )
+        authority = ContributionAuthority(
+            origin=WorkContributionOrigin.AGENT,
+            actor_id=OPERATOR_ID,
+            task_id=task.id,
+            lease_fence=leased.lease_fence,
+            session_id=session_id,
+        )
+        importing = asyncio.create_task(
+            service.import_revision(
+                investigation.id,
+                workspace_id=workspace_id,
+                workspace_revision_id=revision.revision_id,
+                declaration=ContributionDeclarationV1(
+                    category=WorkContributionCategory.WORK_CONTRIBUTION
+                ),
+                authority=authority,
+                idempotency_key="interleaved-agent-import",
+            )
+        )
+        await asyncio.wait_for(agent.reading.wait(), timeout=10)
+
+        async def cancel() -> None:
+            async with SqlAlchemyUnitOfWork(session_factory) as uow:
+                engine_service = InvestigationTaskService(
+                    tasks=uow.investigation_tasks,
+                    decisions=uow.analyst_decisions,
+                    sessions=RepositoryTaskSessionPort(uow.agent_sessions),
+                    limits=TaskLimits(),
+                )
+                await engine_service.cancel(
+                    task_id=task.id,
+                    actor=TaskActor(kind=TaskActorKind.HUMAN, actor_id="analyst:test"),
+                    expected_status_version=leased.status_version,
+                    idempotency_key="cancel-between-read-and-persist",
+                    reason="stop the agent",
+                    now=NOW,
+                )
+                await uow.commit()
+
+        # The cancel commits while the import is between its UDS read and the
+        # persistence transaction; it must not block on the import.
+        await asyncio.wait_for(cancel(), timeout=10)
+        agent.release.set()
+        with pytest.raises(ContributionLeaseAuthorityError) as refused:
+            await asyncio.wait_for(importing, timeout=10)
+        assert refused.value.details["code"] == "lease_fence_stale"
+
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            rows = await uow.work_contributions.list_for_investigation(investigation.id)
+            events = await uow.investigation_tasks.list_events(task.id)
+        assert rows == (), "no canonical contribution may survive a superseded lease"
+        assert [event.event_type for event in events] != [TaskEventType.CONTRIBUTION_IMPORTED]
     finally:
         await engine.dispose()
 

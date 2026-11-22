@@ -630,6 +630,39 @@ def _session_for_lost(
     )
 
 
+def _ready_session(
+    harness: _Harness,
+    task: InvestigationTaskV1,
+    handoff_id: UUID,
+    *,
+    session_id: UUID | None = None,
+) -> AgentSessionV1:
+    """A row a crash left ``ready`` without a lease (open_session phase 2/3)."""
+    session_id = session_id or uuid4()
+    nonce = b"r" * 32
+    capabilities = harness.operator.capabilities
+    return AgentSessionV1(
+        id=session_id,
+        investigation_id=harness.investigation_id,
+        task_id=task.id,
+        adapter_kind=OperatorAdapterKind.CODEX_CLI,
+        state=AgentSessionState.READY,
+        state_version=2,
+        capability_probe=capabilities.to_payload(),
+        capability_sha256=capabilities.capability_sha256,
+        probed_at=capabilities.probed_at,
+        auth_secret_nonce=nonce,
+        auth_secret_hash=hashlib.sha256(nonce).hexdigest(),
+        auth_secret_issued_at=NOW,
+        opened_at=NOW,
+        idempotency_key=f"crashed-{session_id}",
+        created_at=NOW,
+        updated_at=NOW,
+        host_session_ref=f"host-{session_id}",
+        handoff_id=handoff_id,
+    )
+
+
 def _signed(
     secret_hex: str,
     *,
@@ -1455,6 +1488,134 @@ async def test_allowed_envelope_still_opens_the_session() -> None:
     prepared = await harness.open(task=task)
     assert prepared.session.state is AgentSessionState.RUNNING
     assert len(harness.operator.started) == 1
+
+
+async def test_live_instruction_delivery_is_regated_by_the_disclosure_gate() -> None:
+    """R03b M1: a revoke after the opening stops the next host delivery."""
+    harness = _Harness()
+    task = await harness.seed_task()
+    prepared = await harness.open(task=task)
+    stored = await harness.sessions.get(prepared.session.id)
+    assert stored is not None
+    idle = await harness.sessions.update_state(
+        stored.with_state(AgentSessionState.AWAITING_INSTRUCTION, now=NOW),
+        expected_state_version=stored.state_version,
+    )
+    assert idle is not None
+    harness.seed_envelope(external_llm_allowed=False)
+
+    with pytest.raises(SessionExternalDisclosureDeniedError) as exc_info:
+        await harness.service.enqueue_instruction(
+            harness.investigation_id,
+            prepared.session.id,
+            text="This must not reach the provider.",
+            actor=HUMAN_ACTOR,
+            idempotency_key="instruction-after-revoke",
+        )
+    assert exc_info.value.details == {"reason": "external_llm_not_allowed"}
+    assert harness.operator.instructions == []
+    assert await harness.sessions.list_instructions(prepared.session.id) == ()
+
+
+async def test_start_session_exception_marks_the_session_failed_and_stops_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BLOCKER 1(a): an adapter exception is never a silent orphan."""
+    harness = _Harness()
+    task = await harness.seed_task()
+    handoff = await harness.add_handoff(task)
+
+    async def explode(_request: StartSessionRequest) -> SessionProcessStatusV1:
+        raise WorkspaceLocalUnavailableError("host start failed")
+
+    monkeypatch.setattr(harness.operator, "start_session", explode)
+    with pytest.raises(WorkspaceLocalUnavailableError):
+        await harness.open(handoff=handoff, task=task, idempotency_key="start-explodes")
+
+    sessions = await harness.sessions.list_for_task(task.id)
+    assert len(sessions) == 1
+    assert sessions[0].state is AgentSessionState.FAILED
+    assert harness.operator.interrupted, "the possibly-running host object must be stopped"
+    assert sessions[0].host_session_ref == harness.operator.interrupted[0].host_session_ref
+
+
+async def test_crash_between_open_phases_leaves_a_failed_session_and_a_reopen_works(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BLOCKER 1: the durable ``failed`` marker frees the one-active-session index."""
+    harness = _Harness()
+    task = await harness.seed_task()
+    handoff = await harness.add_handoff(task)
+
+    async def crash(_session: AgentSessionV1, _timestamp: datetime) -> AgentSessionV1:
+        raise RuntimeError("crash between phases")
+
+    monkeypatch.setattr(harness.service, "_transition_prepared", crash)
+    with pytest.raises(RuntimeError):
+        await harness.open(handoff=handoff, task=task, idempotency_key="crash-open")
+    monkeypatch.undo()
+
+    sessions = await harness.sessions.list_for_task(task.id)
+    assert len(sessions) == 1
+    assert sessions[0].state is AgentSessionState.FAILED
+    assert harness.operator.interrupted
+
+    reopened = await harness.open(handoff=handoff, task=task, idempotency_key="reopen-after-crash")
+    assert reopened.session.state is AgentSessionState.RUNNING
+    persisted = await harness.sessions.get(sessions[0].id)
+    assert persisted is not None and persisted.state is AgentSessionState.FAILED
+
+
+async def test_human_close_route_frees_an_orphaned_ready_session() -> None:
+    """BLOCKER 1(c): the human escape hatch is mounted and frees the task."""
+    harness = _Harness()
+    task = await harness.seed_task()
+    handoff = await harness.add_handoff(task)
+    orphan = _ready_session(harness, task, UUID(handoff.handoff_id))
+    await harness.sessions.add(orphan)
+    app = _api_app(harness, LocalIdentityProvider("dev-analyst"))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        closed = await client.post(
+            f"/api/investigations/{harness.investigation_id}/agent-sessions/{orphan.id}/close",
+            json={"reason": "orphaned provisioning session"},
+        )
+        assert closed.status_code == 200, closed.text
+        assert closed.json()["state"] == "closed"
+
+        reopened = await client.post(
+            f"/api/investigations/{harness.investigation_id}/agent-sessions",
+            headers={"Idempotency-Key": "open-after-human-close"},
+            json={
+                "task_id": str(task.id),
+                "adapter_kind": "codex_cli",
+                "handoff_id": handoff.handoff_id,
+                "executable": EXECUTABLE,
+            },
+        )
+        assert reopened.status_code == 200, reopened.text
+        assert reopened.json()["session"]["state"] == "running"
+
+    # The close ran without a wired host runtime: the effect is marked, not silent.
+    stored = await harness.sessions.get(orphan.id)
+    assert stored is not None
+    assert stored.reconciliation_outcome() is SessionReconcileOutcome.LOST_UNRECONCILED
+
+
+async def test_close_route_refuses_an_operator_client_identity() -> None:
+    harness = _Harness()
+    task = await harness.seed_task()
+    handoff = await harness.add_handoff(task)
+    orphan = _ready_session(harness, task, UUID(handoff.handoff_id))
+    await harness.sessions.add(orphan)
+    app = _api_app(harness, _OperatorClientIdentity())
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        refused = await client.post(
+            f"/api/investigations/{harness.investigation_id}/agent-sessions/{orphan.id}/close",
+            json={"reason": "not a human"},
+        )
+    assert refused.status_code == 403
+    assert refused.json()["detail"]["code"] == "verified_human_operator_required"
 
 
 # -------------------------------------------------- network isolation (R03 B1)

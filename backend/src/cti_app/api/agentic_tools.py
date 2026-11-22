@@ -41,6 +41,10 @@ from cti_app.application.agentic_note_tools import (
     AgenticNoteCaptureService,
     NoteCaptureUnitOfWork,
 )
+from cti_app.application.agentic_sessions import (
+    HostSessionReleaseService,
+    SessionUnitOfWork,
+)
 from cti_app.application.agentic_tool_broker import (
     AgenticBrokerError,
     AgenticToolBroker,
@@ -201,6 +205,15 @@ def _note_service(request: Request, agent: WorkspaceAgentPort) -> AgenticNoteCap
     )
 
 
+def _release_service(request: Request) -> HostSessionReleaseService:
+    """Host teardown after a brokered ``task.submit_result`` commits (B2)."""
+    return HostSessionReleaseService(
+        uow_factory=cast(Callable[[], SessionUnitOfWork], _uow_factory(request)),
+        host=getattr(request.app.state, "host_sessions", None),
+        wait_seconds=_settings(request).m24_host_release_wait_seconds,
+    )
+
+
 def _operator_error(
     exc: AgenticBrokerError | OperatorToolInvocationError | TaskCommandError | HandoffError,
 ) -> Any:
@@ -249,6 +262,7 @@ async def call_agentic_tool(
                 notes=_note_service(request, agent),
                 task_limits=_settings(request).task_limits(),
                 commit=cast(Callable[[], Any], commit) if callable(commit) else None,
+                release_host=_release_service(request).flush,
             )
             try:
                 result = await broker.invoke(

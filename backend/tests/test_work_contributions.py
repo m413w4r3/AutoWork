@@ -28,6 +28,7 @@ from cti_app.application.investigation_governance import (
     SampleQualificationService,
 )
 from cti_app.application.investigation_persistence import (
+    InMemoryAgentSessionRepository,
     InMemoryEvidenceObservationRepository,
     InMemoryFindingRepository,
     InMemoryInvestigationTaskRepository,
@@ -48,6 +49,13 @@ from cti_app.application.workspace_agent import (
     WorkspaceFileRevisionV1,
     WorkspaceHashMismatchError,
     workspace_revision_id,
+)
+from cti_app.domain.agentic_operator import (
+    AgentSessionState,
+    AgentSessionV1,
+    OperatorAdapterKind,
+    OperatorCapabilitiesV1,
+    OperatorProbeCommand,
 )
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
 from cti_app.domain.investigation import (
@@ -93,6 +101,29 @@ INVESTIGATION_ID = uuid4()
 FILE_SHA = "a" * 64
 SAMPLE_SHA = "b" * 64
 OTHER_SAMPLE_SHA = "c" * 64
+
+
+def _capabilities() -> OperatorCapabilitiesV1:
+    return OperatorCapabilitiesV1(
+        adapter_kind=OperatorAdapterKind.CODEX_CLI,
+        executable="/usr/local/bin/codex",
+        version="codex-cli 1.2.3",
+        modes=("exec",),
+        supports_resume=True,
+        supports_structured_output=True,
+        supports_non_interactive=True,
+        supports_stop=True,
+        permission_modes=("workspace-write",),
+        probed_at=NOW,
+        probes=(
+            OperatorProbeCommand(
+                argv=("/usr/local/bin/codex", "--help"),
+                exit_code=0,
+                stdout_sha256="a" * 64,
+                advertised_modes=("exec", "resume", "workspace-write"),
+            ),
+        ),
+    )
 
 
 class _BlobRepository:
@@ -165,6 +196,7 @@ class _ContributionUnitOfWork:
         self.investigation_findings = harness.findings
         self.sample_associations = harness.associations
         self.investigation_tasks = harness.tasks
+        self.agent_sessions = harness.sessions
         self.commits = 0
 
     async def __aenter__(self) -> _ContributionUnitOfWork:
@@ -218,7 +250,9 @@ class _Harness:
         self.observations = InMemoryEvidenceObservationRepository()
         self.findings = InMemoryFindingRepository()
         self.associations = InMemorySampleAssociationRepository()
-        self.tasks = InMemoryInvestigationTaskRepository()
+        self.tasks = InMemoryInvestigationTaskRepository(clock=lambda: NOW)
+        self.sessions = InMemoryAgentSessionRepository()
+        self.last_lease_session_id: UUID | None = None
         self.blobs = _BlobRepository()
         self.artifact_store = _ArtifactStore(self.blobs)
         self.snapshots = _ArticleSnapshots()
@@ -329,6 +363,9 @@ class _Harness:
         task_id: UUID | None = None,
         lease: bool = False,
         lease_expires_at: datetime | None = None,
+        session_id: UUID | None = None,
+        fence: int = 1,
+        status: TaskStatus = TaskStatus.RUNNING,
     ) -> InvestigationTaskV1:
         values: dict[str, Any] = {
             "id": task_id or uuid4(),
@@ -338,7 +375,7 @@ class _Harness:
             "question": "Which network gate is used?",
             "objective": "Identify the first-stage C2 gate.",
             "priority": TaskPriority.HIGH,
-            "status": TaskStatus.RUNNING,
+            "status": status,
             "status_version": 2,
             "result_verification_status": ResultVerificationStatus.UNVERIFIED,
             "created_by": TaskActor(kind=TaskActorKind.HUMAN, actor_id="analyst:test"),
@@ -348,14 +385,50 @@ class _Harness:
             "assigned_actor_id": "codex:operator-1",
         }
         if lease:
+            session_id = session_id or uuid4()
+            self.last_lease_session_id = session_id
             values.update(
                 lease_id=uuid4(),
-                lease_session_id=uuid4(),
-                lease_fence=1,
+                lease_session_id=session_id,
+                lease_fence=fence,
                 lease_expires_at=lease_expires_at or NOW + timedelta(seconds=180),
                 heartbeat_at=NOW,
             )
         return await self.tasks.add(InvestigationTaskV1(**values))
+
+    async def add_agent_session(
+        self,
+        task: InvestigationTaskV1,
+        *,
+        session_id: UUID | None = None,
+        state: AgentSessionState = AgentSessionState.RUNNING,
+    ) -> UUID:
+        """The active session row the agent authority claims (D7/D3)."""
+        assert task.lease_session_id is not None
+        session_id = session_id or task.lease_session_id
+        session = AgentSessionV1(
+            id=session_id,
+            investigation_id=task.investigation_id,
+            task_id=task.id,
+            adapter_kind=OperatorAdapterKind.CODEX_CLI,
+            state=state,
+            state_version=2,
+            capability_probe=_capabilities().to_payload(),
+            capability_sha256=_capabilities().capability_sha256,
+            probed_at=NOW,
+            auth_secret_nonce=b"s" * 32,
+            auth_secret_hash=hashlib.sha256(b"s" * 32).hexdigest(),
+            auth_secret_issued_at=NOW,
+            opened_at=NOW,
+            idempotency_key=f"session-{session_id}",
+            created_at=NOW,
+            updated_at=NOW,
+            host_session_ref=f"host-{session_id}",
+            task_lease_id=task.lease_id,
+            task_lease_fence=task.lease_fence,
+        )
+        stored, _created = await self.sessions.add(session)
+        return stored.id
 
 
 def _observation_declaration(
@@ -907,6 +980,7 @@ async def test_agent_import_validates_task_lease_fence() -> None:
     harness = _Harness()
     await harness.bind()
     task = await harness.add_task(lease=True)
+    session_id = await harness.add_agent_session(task)
     revision = await harness.add_revision(
         f"notes/agents/{task.id}/result.md", b"# Result\n", origin="agent", task_id=task.id
     )
@@ -920,6 +994,7 @@ async def test_agent_import_validates_task_lease_fence() -> None:
             actor_id="codex:operator-1",
             task_id=task.id,
             lease_fence=1,
+            session_id=session_id,
         ),
     )
     assert imported.origin is WorkContributionOrigin.AGENT
@@ -940,6 +1015,7 @@ async def test_agent_import_validates_task_lease_fence() -> None:
                 actor_id="codex:operator-1",
                 task_id=task.id,
                 lease_fence=2,
+                session_id=session_id,
             ),
         )
     assert getattr(exc_info.value, "details", {}).get("code") == "lease_fence_stale"
@@ -960,6 +1036,7 @@ async def test_agent_import_validates_task_lease_fence() -> None:
             actor_id="codex:operator-1",
             task_id=task.id,
             lease_fence=1,
+            session_id=session_id,
         ),
     )
     assert rejected.import_status is WorkContributionImportStatus.REJECTED

@@ -22,6 +22,7 @@ import pytest
 
 from cti_app.application.investigation_persistence import (
     AgentSessionRepository,
+    InMemoryAgentSessionRepository,
     InMemoryInvestigationTaskRepository,
     InvestigationTaskRepository,
 )
@@ -34,6 +35,7 @@ from cti_app.application.investigation_task_events import (
 )
 from cti_app.application.investigation_task_sweep import (
     InvestigationTaskSweeper,
+    recover_orphan_agent_sessions,
     run_expired_lease_sweep,
 )
 from cti_app.application.investigation_tasks import (
@@ -52,6 +54,13 @@ from cti_app.application.investigation_tasks import (
     TaskSessionRelease,
 )
 from cti_app.config import Settings
+from cti_app.domain.agentic_operator import (
+    AgentSessionState,
+    AgentSessionV1,
+    OperatorAdapterKind,
+    OperatorCapabilitiesV1,
+    OperatorProbeCommand,
+)
 from cti_app.domain.editorial import (
     AnalystDecision,
     AnalystDecisionTargetType,
@@ -1016,6 +1025,212 @@ def test_sweep_runner_commits_before_flushing_the_host_release() -> None:
         assert stored is not None
         assert stored.status is TaskStatus.BLOCKED
         assert stored.blocked_reason is BlockedReason.LEASE_EXPIRED
+
+    asyncio.run(scenario())
+
+
+def _agent_session_row(
+    task: InvestigationTaskV1,
+    *,
+    state: AgentSessionState,
+    created_at: datetime,
+    session_id: UUID | None = None,
+    closed_at: datetime | None = None,
+    close_reason: str | None = None,
+) -> AgentSessionV1:
+    session_id = session_id or uuid4()
+    capabilities = OperatorCapabilitiesV1(
+        adapter_kind=OperatorAdapterKind.CODEX_CLI,
+        executable="/usr/local/bin/codex",
+        version="codex-cli 1.2.3",
+        modes=("exec",),
+        supports_resume=True,
+        supports_structured_output=True,
+        supports_non_interactive=True,
+        supports_stop=True,
+        permission_modes=("workspace-write",),
+        probed_at=NOW,
+        probes=(
+            OperatorProbeCommand(
+                argv=("/usr/local/bin/codex", "--help"),
+                exit_code=0,
+                stdout_sha256="a" * 64,
+                advertised_modes=("exec", "resume", "workspace-write"),
+            ),
+        ),
+    )
+    return AgentSessionV1(
+        id=session_id,
+        investigation_id=task.investigation_id,
+        task_id=task.id,
+        adapter_kind=OperatorAdapterKind.CODEX_CLI,
+        state=state,
+        state_version=2,
+        capability_probe=capabilities.to_payload(),
+        capability_sha256=capabilities.capability_sha256,
+        probed_at=NOW,
+        auth_secret_nonce=b"s" * 32,
+        auth_secret_hash="a" * 64,
+        auth_secret_issued_at=NOW,
+        opened_at=created_at,
+        idempotency_key=f"orphan-{session_id}",
+        created_at=created_at,
+        updated_at=created_at,
+        host_session_ref=f"host-{session_id}",
+        closed_at=closed_at,
+        close_reason=close_reason,
+    )
+
+
+def test_orphan_session_recovery_fails_the_row_and_flushes_the_host_release() -> None:
+    """BLOCKER 1(b): a crash-orphaned session never blocks its task forever."""
+
+    async def scenario() -> None:
+        clock_now = NOW + timedelta(minutes=30)
+        repository = InMemoryInvestigationTaskRepository(clock=lambda: clock_now)
+        task = await _seeded(
+            repository,
+            status=TaskStatus.ASSIGNED,
+            investigation_id=uuid4(),
+            assigned_actor_kind=TaskActorKind.OPERATOR,
+            assigned_actor_id=OPERATOR.actor_id,
+        )
+        sessions = InMemoryAgentSessionRepository()
+        orphan = _agent_session_row(task, state=AgentSessionState.PROVISIONING, created_at=NOW)
+        await sessions.add(orphan)
+        terminal = _agent_session_row(
+            task,
+            state=AgentSessionState.CLOSED,
+            created_at=NOW,
+            closed_at=NOW,
+            close_reason="submitted",
+        )
+        await sessions.add(terminal)
+
+        class _Uow:
+            def __init__(self) -> None:
+                self.investigation_tasks: InvestigationTaskRepository = repository
+                self.agent_sessions = cast(AgentSessionRepository, sessions)
+
+            async def __aenter__(self) -> _Uow:
+                return self
+
+            async def __aexit__(self, *_args: object) -> None:
+                return None
+
+            async def commit(self) -> None:
+                return None
+
+        class _Source:
+            async def list_orphan_sessions(
+                self, *, grace_seconds: int, limit: int
+            ) -> tuple[AgentSessionV1, ...]:
+                rows = await sessions.list_for_task(task.id)
+                return tuple(
+                    row
+                    for row in rows
+                    if row.state in (AgentSessionState.PROVISIONING, AgentSessionState.READY)
+                    and row.task_lease_id is None
+                )
+
+            async def list_pending_host_release_sessions(
+                self, *, grace_seconds: int, limit: int
+            ) -> tuple[AgentSessionV1, ...]:
+                rows = await sessions.list_for_task(task.id)
+                return tuple(row for row in rows if row.is_terminal)
+
+        flushed: list[Sequence[TaskSessionRelease]] = []
+
+        async def flush(items: Sequence[TaskSessionRelease]) -> None:
+            flushed.append(tuple(items))
+
+        recovered, pending = await recover_orphan_agent_sessions(
+            source=_Source(),
+            uow_factory=lambda: _Uow(),
+            flush_releases=flush,
+            grace_seconds=60,
+            batch_size=10,
+        )
+        assert recovered == 1
+        stored = await sessions.get(orphan.id)
+        assert stored is not None
+        assert stored.state is AgentSessionState.FAILED
+        assert stored.close_reason == "orphaned_no_lease"
+        assert flushed[0][0].session_id == orphan.id
+        assert flushed[0][0].outcome is TaskSessionOutcome.LOST
+        assert flushed[0][0].reason == "orphaned_no_lease"
+        # The recorder writes no confirmation event, so the just-failed row is
+        # still "pending" for the second step (at-least-once until confirmed).
+        assert {release.session_id for release in flushed[1]} == {orphan.id, terminal.id}
+        assert pending == 2
+
+        # Idempotent: the failed row is never failed again.
+        again = await recover_orphan_agent_sessions(
+            source=_Source(),
+            uow_factory=lambda: _Uow(),
+            flush_releases=flush,
+            grace_seconds=60,
+            batch_size=10,
+        )
+        assert again == (0, 2)
+        still = await sessions.get(orphan.id)
+        assert still is not None and still.state is AgentSessionState.FAILED
+
+    asyncio.run(scenario())
+
+
+def test_orphan_recovery_respects_the_grace_period() -> None:
+    async def scenario() -> None:
+        clock_now = NOW + timedelta(minutes=1)
+        repository = InMemoryInvestigationTaskRepository(clock=lambda: clock_now)
+        task = await _seeded(
+            repository,
+            status=TaskStatus.ASSIGNED,
+            investigation_id=uuid4(),
+            assigned_actor_kind=TaskActorKind.OPERATOR,
+            assigned_actor_id=OPERATOR.actor_id,
+        )
+        sessions = InMemoryAgentSessionRepository()
+        young = _agent_session_row(task, state=AgentSessionState.READY, created_at=NOW)
+        await sessions.add(young)
+
+        class _Uow:
+            def __init__(self) -> None:
+                self.investigation_tasks: InvestigationTaskRepository = repository
+                self.agent_sessions = cast(AgentSessionRepository, sessions)
+
+            async def __aenter__(self) -> _Uow:
+                return self
+
+            async def __aexit__(self, *_args: object) -> None:
+                return None
+
+            async def commit(self) -> None:
+                return None
+
+        class _Source:
+            async def list_orphan_sessions(
+                self, *, grace_seconds: int, limit: int
+            ) -> tuple[AgentSessionV1, ...]:
+                return (young,)
+
+            async def list_pending_host_release_sessions(
+                self, *, grace_seconds: int, limit: int
+            ) -> tuple[AgentSessionV1, ...]:
+                return ()
+
+        async def flush(_items: Sequence[TaskSessionRelease]) -> None:
+            raise AssertionError("an in-flight session younger than the grace is not touched")
+
+        assert await recover_orphan_agent_sessions(
+            source=_Source(),
+            uow_factory=lambda: _Uow(),
+            flush_releases=flush,
+            grace_seconds=3600,
+            batch_size=10,
+        ) == (0, 0)
+        stored = await sessions.get(young.id)
+        assert stored is not None and stored.state is AgentSessionState.READY
 
     asyncio.run(scenario())
 
