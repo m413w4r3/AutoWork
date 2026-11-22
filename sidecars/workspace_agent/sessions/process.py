@@ -20,6 +20,7 @@ import os
 import shutil
 import signal
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,12 +34,18 @@ MIN_PGID = 2
 
 @dataclass(frozen=True)
 class LaunchPlan:
-    """A fixed, supervisor-built launch; clients never supply argv or binary."""
+    """A fixed, supervisor-built launch; clients never supply argv or binary.
+
+    ``stdin_data`` is a one-shot prompt for one-shot CLIs (Codex ``exec``): it is
+    fed before the pipe is closed, so a live-instruction write fails and queues
+    instead of corrupting the prompt stream. ``None`` keeps the pipe open.
+    """
 
     argv: tuple[str, ...]
     env: dict[str, str]
     cwd: Path
     uses_bwrap: bool = False
+    stdin_data: bytes | None = None
 
 
 @dataclass
@@ -66,6 +73,8 @@ def spawn(plan: LaunchPlan) -> ManagedProcess:
         close_fds=True,
         bufsize=0,
     )
+    if plan.stdin_data is not None:
+        _feed_stdin(process, plan.stdin_data)
     pid = process.pid
     pgid = os.getpgid(pid)
     ticks = proc_start_ticks(pid)
@@ -75,6 +84,27 @@ def spawn(plan: LaunchPlan) -> ManagedProcess:
         terminate_group(pgid, grace_seconds=0.0)
         raise OSError("cannot read the child process start ticks")
     return ManagedProcess(process=process, run=0, pid=pid, pgid=pgid, start_ticks=ticks)
+
+
+def _feed_stdin(process: subprocess.Popen[bytes], data: bytes) -> None:
+    """Feed a one-shot prompt off-thread (a large prompt must not block spawn)."""
+
+    def _write() -> None:
+        stream = process.stdin
+        if stream is None:
+            return
+        try:
+            stream.write(data)
+            stream.flush()
+        except (OSError, ValueError):
+            pass
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    threading.Thread(target=_write, name="session-stdin", daemon=True).start()
 
 
 def close_pipes(process: subprocess.Popen[bytes]) -> None:
@@ -171,11 +201,16 @@ def build_bwrap_argv(
     config_directory: Path,
     work_directory: Path,
     bwrap: Path | None = None,
+    extra_ro_binds: tuple[tuple[Path, Path], ...] = (),
+    extra_rw_binds: tuple[tuple[Path, Path], ...] = (),
 ) -> list[str]:
     """The reasoning-session bwrap profile (§3): namespaces, no netns, ro binds.
 
     This builder is the registration seam for the Codex/Claude profiles (H4/H5);
-    the ``fake`` profile launches directly and never uses it.
+    the ``fake`` profile launches directly and never uses it. ``extra_ro_binds``
+    and ``extra_rw_binds`` are ``(source, target)`` pairs for the per-session
+    skills exposure and private HOME, so the closed profile stays the only
+    place that decides what the model may see.
     """
     executable = str(bwrap if bwrap is not None else default_bwrap_binary())
     command = [
@@ -184,6 +219,14 @@ def build_bwrap_argv(
         "--unshare-ipc",
         "--unshare-uts",
         "--die-with-parent",
+        # The new tmpfs root comes first: session paths may live under /tmp,
+        # and a later --tmpfs /tmp would hide mounts created before it.
+        "--tmpfs",
+        "/tmp",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
         "--ro-bind",
         "/usr",
         "/usr",
@@ -194,9 +237,12 @@ def build_bwrap_argv(
     for path in workspace_binds:
         command.extend(("--ro-bind", str(path), str(path)))
     command.extend(("--ro-bind", str(ipc_directory), str(ipc_directory)))
+    for source, target in extra_ro_binds:
+        command.extend(("--ro-bind", str(source), str(target)))
+    for source, target in extra_rw_binds:
+        command.extend(("--bind", str(source), str(target)))
     command.extend(("--bind", str(scratch_directory), str(scratch_directory)))
     command.extend(("--bind", str(config_directory), str(config_directory)))
-    command.extend(("--tmpfs", "/tmp", "--proc", "/proc", "--dev", "/dev"))
     command.extend(("--chdir", str(work_directory), "--", *argv))
     return command
 

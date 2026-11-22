@@ -174,6 +174,8 @@ class LaunchContext:
     run: int
     resume: bool
     fake_scenario: str
+    workspace_directory: Path | None = None
+    skills_directory: Path | None = None
 
 
 class SessionProfile(Protocol):
@@ -317,7 +319,13 @@ class ProfileRegistry:
 
 
 def default_profiles() -> ProfileRegistry:
-    return ProfileRegistry((FakeProfile(),))
+    # Local import: the adapters import this module, so the registration hook
+    # must run only after the supervisor module is fully loaded.
+    from . import adapters
+
+    registry = ProfileRegistry((FakeProfile(),))
+    adapters.register_profiles(registry)
+    return registry
 
 
 # ---------------------------------------------------------------------------
@@ -1110,6 +1118,14 @@ class SessionSupervisor:
             self._workspaces.get_workspace(request.workspace_id)
             skills = self._load_skills(request.skill_names)
             probe = profile.probe(now=self._now())
+            if profile.requires_sandbox and probe.confinement.get("bwrap_ok") is not True:
+                # The file check above cannot prove user namespaces; the real
+                # probe records bwrap_ok/bwrap_reason and prepare fails closed.
+                reason = probe.confinement.get("bwrap_reason")
+                raise ConfinementUnavailableError(
+                    request.adapter_kind,
+                    reason=reason if isinstance(reason, str) else None,
+                )
             prompt_bytes = self._build_prompt(request, skills)
             if len(prompt_bytes) > MAX_PROMPT_BYTES:
                 raise SessionRequestError("skill_names", "prompt_too_large")
@@ -1382,6 +1398,7 @@ class SessionSupervisor:
     ) -> dict[str, object]:
         record = handle.record
         run_number = record.current_run + 1
+        descriptor = self._workspaces.get_workspace(record.workspace_id)
         context = LaunchContext(
             session_id=record.session_id,
             record=record,
@@ -1395,6 +1412,8 @@ class SessionSupervisor:
             run=run_number,
             resume=resume,
             fake_scenario=self._config.fake_scenario,
+            workspace_directory=Path(descriptor.host_path),
+            skills_directory=self._config.skills_root,
         )
         plan = profile.build_launch_plan(context)
         managed = process.spawn(plan)

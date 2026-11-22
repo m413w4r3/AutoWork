@@ -128,10 +128,11 @@ class ConfinementUnavailableError(SessionError):
     code = ErrorCode.CONFINEMENT_UNAVAILABLE
     status = 503
 
-    def __init__(self, adapter_kind: str) -> None:
-        super().__init__(
-            "the confinement profile is unavailable", details={"adapter_kind": adapter_kind}
-        )
+    def __init__(self, adapter_kind: str, *, reason: str | None = None) -> None:
+        details: dict[str, object] = {"adapter_kind": adapter_kind}
+        if reason:
+            details["reason"] = reason
+        super().__init__("the confinement profile is unavailable", details=details)
 
 
 class CapabilityUnavailableError(SessionError):
