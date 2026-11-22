@@ -113,6 +113,23 @@ class PublicationSectionKind(StrEnum):
     OTHER = "other"
 
 
+_BRIEF_OVERVIEW_HEADING_KEYS = frozenset({"vue d'ensemble", "overview"})
+
+
+def is_overview_section(kind: PublicationSectionKind | str | None, heading: str | None) -> bool:
+    """Return whether a section is merged into a BRIEF lead.
+
+    The brief publication builder merges the typed overview kind and the two
+    historical overview headings. The workspace projection uses this same
+    definition to order ``after_lead`` elements after the merged block.
+    """
+    normalized_heading = " ".join((heading or "").casefold().replace(chr(0x2019), "'").split())
+    return normalized_heading in _BRIEF_OVERVIEW_HEADING_KEYS or kind in (
+        PublicationSectionKind.OVERVIEW,
+        PublicationSectionKind.OVERVIEW.value,
+    )
+
+
 _PUBLICATION_EVIDENCE_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 

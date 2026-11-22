@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
 from uuid import UUID
 
 from cti_app.application.production_brief_synthesis import (
@@ -44,9 +47,10 @@ from cti_app.domain.production_synthesis import (
 )
 from cti_app.domain.publication import (
     PublicationAssemblyErrorCode,
-    PublicationSectionKind,
+    PublicationParagraphV1,
     PublicationSectionV1,
     PublicationTimelineEntryV1,
+    is_overview_section,
 )
 from cti_app.domain.publication_document import (
     PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
@@ -71,6 +75,121 @@ from cti_app.domain.semantic_annotation import (
 BRIEF_ASSEMBLY_POLICY_VERSION = "brief-assembly-v4-m19-publication-events"
 
 
+@dataclass(frozen=True, slots=True)
+class BriefPublicationAnchorMap:
+    """Where each synthesis paragraph lands in the merged brief publication body.
+
+    Values are ``(paragraph_kind, section_index, paragraph_index)`` in the
+    publication document. Lead paragraphs keep their identity and are not
+    stored. A missing section-paragraph key means the merge collapsed the
+    paragraph into an ambiguous duplicate; callers must refuse that anchor
+    rather than guess.
+    """
+
+    section_paragraphs: Mapping[tuple[int, int], tuple[str, int | None, int]]
+    synthesis_lead_count: int
+
+    def resolve(
+        self,
+        *,
+        paragraph_kind: str,
+        section_index: int | None,
+        paragraph_index: int,
+    ) -> tuple[str, int | None, int] | None:
+        """Map one synthesis paragraph identity into the publication body."""
+        if paragraph_kind == "lead":
+            if 0 <= paragraph_index < self.synthesis_lead_count:
+                return ("lead", None, paragraph_index)
+            return None
+        if paragraph_kind != "section" or section_index is None:
+            return None
+        return self.section_paragraphs.get((section_index, paragraph_index))
+
+
+def _brief_paragraph_fingerprint(text: str) -> str:
+    return " ".join(text.casefold().split())
+
+
+def merge_brief_narrative_sections(
+    *,
+    lead: tuple[PublicationParagraphV1, ...],
+    sections: tuple[PublicationSectionV1, ...],
+) -> tuple[
+    tuple[PublicationParagraphV1, ...],
+    tuple[PublicationSectionV1, ...],
+    BriefPublicationAnchorMap,
+]:
+    """Merge overview sections into the lead exactly once, with their anchor map.
+
+    This is the single authority for the BRIEF projection: the publication body
+    and the placement resolver both consume its output, so a synthesis paragraph
+    can never be rendered in a body position that resolution does not know.
+    """
+    merged_lead = list(lead)
+    lead_fingerprints = {_brief_paragraph_fingerprint(item.text) for item in merged_lead}
+    lead_indices_by_fingerprint: dict[str, list[int]] = {}
+    for index, item in enumerate(merged_lead):
+        lead_indices_by_fingerprint.setdefault(_brief_paragraph_fingerprint(item.text), []).append(
+            index
+        )
+    anchor_map: dict[tuple[int, int], tuple[str, int | None, int]] = {}
+    merged_sections: list[PublicationSectionV1] = []
+    for section_index, section in enumerate(sections):
+        if is_overview_section(section.kind, section.heading):
+            for paragraph_index, paragraph in enumerate(section.paragraphs):
+                fingerprint = _brief_paragraph_fingerprint(paragraph.text)
+                target: tuple[str, int | None, int] | None
+                if fingerprint not in lead_fingerprints:
+                    merged_lead.append(paragraph)
+                    lead_fingerprints.add(fingerprint)
+                    lead_indices_by_fingerprint.setdefault(fingerprint, []).append(
+                        len(merged_lead) - 1
+                    )
+                    target = ("lead", None, len(merged_lead) - 1)
+                else:
+                    indices = lead_indices_by_fingerprint.get(fingerprint, [])
+                    target = ("lead", None, indices[0]) if len(indices) == 1 else None
+                if target is not None:
+                    anchor_map[(section_index, paragraph_index)] = target
+            continue
+        kept: list[PublicationParagraphV1] = []
+        kept_source_indices: list[int] = []
+        for paragraph_index, paragraph in enumerate(section.paragraphs):
+            fingerprint = _brief_paragraph_fingerprint(paragraph.text)
+            if fingerprint in lead_fingerprints:
+                indices = lead_indices_by_fingerprint.get(fingerprint, [])
+                if len(indices) == 1:
+                    anchor_map[(section_index, paragraph_index)] = ("lead", None, indices[0])
+                continue
+            kept.append(paragraph)
+            kept_source_indices.append(paragraph_index)
+        if kept:
+            publication_section_index = len(merged_sections)
+            merged_sections.append(
+                PublicationSectionV1(
+                    kind=section.kind,
+                    heading=section.heading,
+                    paragraphs=tuple(kept),
+                )
+            )
+            for publication_paragraph_index, source_paragraph_index in enumerate(
+                kept_source_indices
+            ):
+                anchor_map[(section_index, source_paragraph_index)] = (
+                    "section",
+                    publication_section_index,
+                    publication_paragraph_index,
+                )
+    return (
+        tuple(merged_lead),
+        tuple(merged_sections),
+        BriefPublicationAnchorMap(
+            section_paragraphs=MappingProxyType(dict(anchor_map)),
+            synthesis_lead_count=len(lead),
+        ),
+    )
+
+
 def build_brief_publication_document_v5(
     *,
     snapshot: ProductionInputSnapshot,
@@ -81,6 +200,27 @@ def build_brief_publication_document_v5(
     editorial_enrichment: EditorialEnrichmentV1 | None = None,
 ) -> PublicationDocumentV5:
     """Project a brief with optional, evidence-validated editorial enrichment."""
+    document, _anchor_map = build_brief_publication_document_v5_with_anchor_map(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        relevance_projection=relevance_projection,
+        synthesis=synthesis,
+        editorial_enrichment=editorial_enrichment,
+    )
+    return document
+
+
+def build_brief_publication_document_v5_with_anchor_map(
+    *,
+    snapshot: ProductionInputSnapshot,
+    references: ProductionReferenceCorpusV1,
+    extraction: ProductionExtractionV1,
+    relevance_projection: RelevanceProjectionV1 | None,
+    synthesis: ProductionSynthesisV1,
+    editorial_enrichment: EditorialEnrichmentV1 | None = None,
+) -> tuple[PublicationDocumentV5, BriefPublicationAnchorMap]:
+    """Project a brief and return the synthesis-to-publication anchor map."""
     if relevance_projection is None:
         raise PublicationAssemblyValidationError(
             PublicationAssemblyErrorCode.INPUTS_MISMATCH,
@@ -185,33 +325,10 @@ def build_brief_publication_document_v5(
         else ()
     )
 
-    lead = list(narrative.lead)
-    sections: list[PublicationSectionV1] = []
-    lead_fingerprints = {" ".join(item.text.casefold().split()) for item in lead}
-    for section in narrative.sections:
-        heading_key = " ".join(section.heading.casefold().replace("\u2019", "'").split())
-        paragraphs = tuple(
-            paragraph
-            for paragraph in section.paragraphs
-            if " ".join(paragraph.text.casefold().split()) not in lead_fingerprints
-        )
-        if heading_key in {"vue d'ensemble", "overview"} or (
-            section.kind is PublicationSectionKind.OVERVIEW
-        ):
-            for paragraph in paragraphs:
-                fingerprint = " ".join(paragraph.text.casefold().split())
-                if fingerprint not in lead_fingerprints:
-                    lead.append(paragraph)
-                    lead_fingerprints.add(fingerprint)
-            continue
-        if paragraphs:
-            sections.append(
-                PublicationSectionV1(
-                    kind=section.kind,
-                    heading=section.heading,
-                    paragraphs=paragraphs,
-                )
-            )
+    lead, sections, anchor_map = merge_brief_narrative_sections(
+        lead=narrative.lead,
+        sections=narrative.sections,
+    )
 
     full_narrative = _project_synthesis_publication(
         extraction=extraction,
@@ -290,10 +407,13 @@ def build_brief_publication_document_v5(
             ),
         ),
     )
-    return PublicationDocumentV5(
-        document=document,
-        semantic_text=semantic_text,
-        references=ordered_references,
+    return (
+        PublicationDocumentV5(
+            document=document,
+            semantic_text=semantic_text,
+            references=ordered_references,
+        ),
+        anchor_map,
     )
 
 

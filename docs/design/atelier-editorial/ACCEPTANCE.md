@@ -92,19 +92,34 @@ cd frontend && pnpm exec playwright test --config playwright.editorial.config.ts
 - **Mobile.** The workshop is desktop-only by decision (ADR-0010 D9); no mobile
   criterion is claimed.
 
-## Residual defect found by F5 (not fixed here)
+## Defect found by F5 and fixed in F5b
 
 - **BRIEF overview merge loses `after_paragraph` enrichments anchored to an
   overview paragraph.** `brief_publication_builder` merges the OVERVIEW section
-  into `document.lead`. `typst_rendering` derives the insertion key from the
+  into `document.lead`. `typst_rendering` derived the insertion key from the
   synthesis anchor (`section-0-paragraph-N`), while the merged paragraph is
-  emitted as `lead-paragraph-N`; the element is silently absent from the PDF and
-  `after_lead` elements move to the end of the body. Reproduced while building
-  this oracle with an OVERVIEW section; the acceptance fixture uses a TECHNICAL
-  section so the chain tests the supported structure. A correct fix needs a
-  contract decision on how publication-merged paragraph anchors map to
-  synthesis anchor identities (planner/publication schema), so it is reported
-  for arbitration instead of patched under F5.
+  emitted as `lead-paragraph-N`; the element could be silently absent from the
+  PDF or inserted after a different section's paragraph, and `after_lead`
+  elements were ordered before the overview block in the workshop snapshot.
+
+  Fixed by `merge_brief_narrative_sections` in
+  `backend/src/cti_app/application/brief_publication_builder.py`: the single
+  merge authority now returns the synthesis-paragraph-to-publication-body map
+  consumed by `PublicationAssemblyService`, so `resolved_placements` carry the
+  merged publication identity (`/lead/N` or the re-indexed
+  `/sections/S/paragraphs/P`). The workshop projection uses the same overview
+  definition to place `after_lead` elements after the merged block; a BRIEF
+  placement whose anchor cannot be mapped, or whose resolved anchor is never
+  emitted, now refuses the assembly/render (`editorial_anchor_stale`) instead
+  of dropping the element. ARTICLE behavior, the publication schemas and
+  historical artifacts/hashes are unchanged.
+
+  Proven by `backend/tests/test_editorial_brief_overview_anchor_parity.py::test_brief_overview_anchors_render_after_their_paragraphs`
+  (snapshot order, resolved placement order and real-Typst PDF order agree),
+  `::test_brief_ambiguous_merged_anchor_is_refused_not_dropped` (assembly
+  refusal) and `::test_brief_unemitted_resolved_placement_raises` (render
+  refusal). The PG acceptance chain keeps its TECHNICAL-section fixture and
+  still passes (`test_acceptance_chain_postgres`, 10 passed).
 
 ## Production defect found and fixed by F5
 

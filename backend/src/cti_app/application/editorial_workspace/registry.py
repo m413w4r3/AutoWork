@@ -47,6 +47,7 @@ from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionTarget,
     TargetedEditorialRevisionTargetKind,
 )
+from cti_app.domain.publication import is_overview_section
 from cti_app.domain.publication_kind import PublicationKind
 
 # Compatibility seam for callers of the former canonical resolver.
@@ -691,6 +692,45 @@ def _enrichment_placement(
     )
 
 
+def _after_lead_boundary(
+    *,
+    synthesis_entries: Sequence[BlockRegistryEntry],
+    synthesis: Mapping[str, Any],
+    publication_kind: PublicationKind | None,
+) -> int:
+    """Insertion index for ``after_lead`` elements in the workshop projection.
+
+    The brief publication builder merges every overview section into the lead,
+    so a brief places ``after_lead`` elements after the last merged overview
+    section. Other publication kinds keep the historical boundary before the
+    first section heading.
+    """
+    legacy_boundary = next(
+        (index for index, entry in enumerate(synthesis_entries) if entry.kind == "section_heading"),
+        len(synthesis_entries),
+    )
+    if publication_kind is not PublicationKind.BRIEF:
+        return legacy_boundary
+    sections = synthesis.get("sections")
+    if not isinstance(sections, list):
+        return legacy_boundary
+    last_overview_index: int | None = None
+    for section_index, section in enumerate(sections):
+        if not isinstance(section, Mapping):
+            continue
+        if is_overview_section(section.get("kind"), section.get("heading")):
+            last_overview_index = section_index
+    if last_overview_index is None:
+        return legacy_boundary
+    overview_prefix = f"/sections/{last_overview_index}/"
+    overview_entry_indices = [
+        index
+        for index, entry in enumerate(synthesis_entries)
+        if entry.structural_pointer.startswith(overview_prefix)
+    ]
+    return max(overview_entry_indices) + 1 if overview_entry_indices else legacy_boundary
+
+
 def project_blocks(
     *,
     entries: Sequence[BlockRegistryEntry],
@@ -907,13 +947,10 @@ def project_blocks(
         section_index: int | None = None
         stale_anchor = False
         if placement_kind == "after_lead":
-            boundary = next(
-                (
-                    index
-                    for index, candidate in enumerate(synthesis_entries)
-                    if candidate.kind == "section_heading"
-                ),
-                len(synthesis_entries),
+            boundary = _after_lead_boundary(
+                synthesis_entries=synthesis_entries,
+                synthesis=synthesis,
+                publication_kind=record.publication_kind if record is not None else None,
             )
             placement_rank = 0
         elif placement_kind == "after_section":

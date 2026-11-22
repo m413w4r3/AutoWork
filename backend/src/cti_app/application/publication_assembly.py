@@ -10,7 +10,9 @@ from uuid import UUID, uuid4
 
 from cti_app.application.brief_publication_builder import (
     BRIEF_ASSEMBLY_POLICY_VERSION,
+    BriefPublicationAnchorMap,
     build_brief_publication_document_v5,
+    build_brief_publication_document_v5_with_anchor_map,
     wrap_publication_document_v7,
 )
 from cti_app.application.diagram_compilation import (
@@ -138,6 +140,7 @@ def _resolve_editorial_placements(
     synthesis: ProductionSynthesisV1,
     enrichment: EditorialEnrichmentV1,
     enrichment_artifact_id: UUID | None,
+    brief_anchor_map: BriefPublicationAnchorMap | None = None,
 ) -> tuple[ResolvedPublicationPlacementV1, ...]:
     if record is None or (
         record.subject_id != run.subject_id
@@ -187,6 +190,25 @@ def _resolve_editorial_placements(
             anchor_block_id = UUID(str(placement["anchor_block_id"]))
             anchor = resolve_paragraph_anchor(record, anchor_block_id, synthesis=synthesis_payload)
             element_key = str(item["key"])
+            if brief_anchor_map is None:
+                paragraph_kind: str = anchor.paragraph_kind
+                section_index = anchor.section_index
+                paragraph_index = anchor.paragraph_index
+                anchor_pointer = anchor.structural_pointer
+            else:
+                target = brief_anchor_map.resolve(
+                    paragraph_kind=anchor.paragraph_kind,
+                    section_index=anchor.section_index,
+                    paragraph_index=anchor.paragraph_index,
+                )
+                if target is None:
+                    raise ValueError("brief publication anchor is not mapped")
+                paragraph_kind, section_index, paragraph_index = target
+                anchor_pointer = (
+                    f"/lead/{paragraph_index}"
+                    if paragraph_kind == "lead"
+                    else f"/sections/{section_index}/paragraphs/{paragraph_index}"
+                )
             placements.append(
                 ResolvedPublicationPlacementV1(
                     element_kind=entry.kind.value,
@@ -197,11 +219,11 @@ def _resolve_editorial_placements(
                         )
                     ],
                     anchor_block_id=anchor.block_id,
-                    anchor_pointer=anchor.structural_pointer,
+                    anchor_pointer=anchor_pointer,
                     anchor_canonical_position=anchor.canonical_position,
-                    paragraph_kind=anchor.paragraph_kind,
-                    section_index=anchor.section_index,
-                    paragraph_index=anchor.paragraph_index,
+                    paragraph_kind=paragraph_kind,
+                    section_index=section_index,
+                    paragraph_index=paragraph_index,
                 )
             )
         except (EditorialWorkspaceError, KeyError, IndexError, TypeError, ValueError) as exc:
@@ -221,11 +243,26 @@ def _resolve_editorial_placements(
             PublicationAssemblyErrorCode.EDITORIAL_ANCHOR_STALE,
             "editorial_anchor_stale",
         )
+    if brief_anchor_map is None:
+        return tuple(
+            sorted(
+                placements,
+                key=lambda item: (
+                    item.anchor_canonical_position,
+                    item.element_position,
+                    item.element_key,
+                ),
+            )
+        )
+    # The merged brief body orders anchors by their publication position, so the
+    # resolved order matches the shared snapshot/PDF order even after merging.
     return tuple(
         sorted(
             placements,
             key=lambda item: (
-                item.anchor_canonical_position,
+                0 if item.paragraph_kind == "lead" else 1,
+                item.section_index if item.section_index is not None else -1,
+                item.paragraph_index,
                 item.element_position,
                 item.element_key,
             ),
@@ -332,6 +369,10 @@ class PublicationAssemblyService:
                     PublicationAssemblyErrorCode.INPUTS_MISMATCH,
                     "Brief assembly requires a relevance projection",
                 )
+            # Placement resolution hashes the exact pinned enrichment, while the
+            # projected document may carry refreshed diagram assets. Keep the
+            # canonical enrichment for the registry check and the anchor map.
+            pinned_editorial_enrichment = editorial_enrichment
             if editorial_enrichment is not None:
                 if (editorial_enrichment_artifact_id is None) != (
                     editorial_enrichment_artifact_input_hash is None
@@ -343,14 +384,6 @@ class PublicationAssemblyService:
                 validate_editorial_enrichment(
                     editorial_enrichment, extraction=extraction, synthesis=synthesis
                 )
-                if _has_after_paragraph(editorial_enrichment):
-                    resolved_placements = _resolve_editorial_placements(
-                        record=workspace_snapshot_record,
-                        run=run,
-                        synthesis=synthesis,
-                        enrichment=editorial_enrichment,
-                        enrichment_artifact_id=editorial_enrichment_artifact_id,
-                    )
                 if editorial_enrichment.production_input_hash != snapshot.input_hash:
                     raise PublicationAssemblyValidationError(
                         PublicationAssemblyErrorCode.INPUTS_MISMATCH,
@@ -360,7 +393,7 @@ class PublicationAssemblyService:
                     editorial_enrichment,
                     production_run_id=run.id,
                 )
-            base_document = build_brief_publication_document_v5(
+            base_document, brief_anchor_map = build_brief_publication_document_v5_with_anchor_map(
                 snapshot=snapshot,
                 references=references,
                 extraction=extraction,
@@ -368,6 +401,17 @@ class PublicationAssemblyService:
                 synthesis=synthesis,
                 editorial_enrichment=editorial_enrichment,
             )
+            if pinned_editorial_enrichment is not None and _has_after_paragraph(
+                pinned_editorial_enrichment
+            ):
+                resolved_placements = _resolve_editorial_placements(
+                    record=workspace_snapshot_record,
+                    run=run,
+                    synthesis=synthesis,
+                    enrichment=pinned_editorial_enrichment,
+                    enrichment_artifact_id=editorial_enrichment_artifact_id,
+                    brief_anchor_map=brief_anchor_map,
+                )
             if editorial_enrichment is not None and not (
                 base_document.document.tables
                 or base_document.document.diagrams

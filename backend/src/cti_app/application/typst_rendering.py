@@ -2581,13 +2581,14 @@ def project_publication_to_typst_model(
         tuple[EnrichmentPlacementKind, int | None],
         list[tuple[EnrichmentElementRef, dict[str, Any]]],
     ] = {}
-    rich_after_paragraph: dict[str, list[tuple[int, str, dict[str, Any]]]] = {}
+    rich_after_paragraph: dict[str, list[tuple[int, str, str, dict[str, Any]]]] = {}
     rich_order_entries: list[EnrichmentOrderEntry] = []
     resolved_v9_placements = (
         {(item.element_kind, item.element_key): item for item in publication_v9.resolved_placements}
         if publication_v9 is not None
         else {}
     )
+    pending_v9_placements = set(resolved_v9_placements)
 
     def media_ref(
         *,
@@ -2639,7 +2640,7 @@ def project_publication_to_typst_model(
                 )
             )
             rich_after_paragraph.setdefault(anchor, []).append(
-                (resolved.element_position, resolved.element_key, block)
+                (resolved.element_position, resolved.element_key, element_kind, block)
             )
             return
         if kind is EnrichmentPlacementKind.AFTER_PARAGRAPH:
@@ -2929,12 +2930,11 @@ def project_publication_to_typst_model(
                 **({"semantic_spans": spans} if spans is not None else {}),
             }
         )
-        body_blocks.extend(
-            block
-            for _position, _element_key, block in sorted(
-                rich_after_paragraph.get(anchor, ()), key=lambda item: item[:2]
-            )
-        )
+        for _position, element_key, element_kind, block in sorted(
+            rich_after_paragraph.get(anchor, ()), key=lambda item: item[:2]
+        ):
+            pending_v9_placements.discard((element_kind, element_key))
+            body_blocks.append(block)
         body_blocks.extend(notes_by_anchor.get(anchor, ()))
 
     body_blocks: list[dict[str, Any]] = []
@@ -2986,6 +2986,10 @@ def project_publication_to_typst_model(
             )
         body_blocks.extend(ordered_rich(EnrichmentPlacementKind.AFTER_SECTION, section_index))
     body_blocks.extend(ordered_rich(EnrichmentPlacementKind.END, None))
+    if brief_document and pending_v9_placements:
+        # A resolved anchor that no rendered paragraph carries would silently
+        # lose the element; a brief must refuse the render instead.
+        raise ValueError("editorial_anchor_stale")
 
     figure_number = 0
     for block in (*reference_blocks, *body_blocks):
