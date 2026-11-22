@@ -52,6 +52,12 @@ from cti_app.domain.publication_kind import PublicationKind
 # Compatibility seam for callers of the former canonical resolver.
 build_targeted_revision_target_catalog = synthesis_targets.build_targeted_revision_target_catalog
 
+# Bounded inspector projection: an oversized diagram is omitted rather than
+# truncated so the workshop never renders a partial comparison.
+_MAX_PROJECTED_DIAGRAM_NODES = 64
+_MAX_PROJECTED_DIAGRAM_EDGES = 96
+_MAX_PROJECTED_DIAGRAM_GROUPS = 16
+
 
 @dataclass(frozen=True, slots=True)
 class WorkspaceSnapshotRecord:
@@ -699,6 +705,7 @@ def project_blocks(
     allow_operations: bool = True,
     allow_figure_insertion: bool = False,
     catalog_figure_ids: Mapping[UUID, str] | None = None,
+    catalog_figure_captions: Mapping[UUID, str | None] | None = None,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
     blocks: list[dict[str, object]] = []
     enrichments: list[dict[str, object]] = []
@@ -745,8 +752,18 @@ def project_blocks(
             else None
         )
         structured_figure = (
-            _project_structured_figure(value, catalog_figure_ids=catalog_figure_ids)
+            _project_structured_figure(
+                value,
+                catalog_figure_ids=catalog_figure_ids,
+                catalog_figure_captions=catalog_figure_captions,
+            )
             if entry.kind is EditorialBlockKind.FIGURE
+            and entry.source_stage is EditorialSourceStage.EDITORIAL_ENRICHMENT
+            else None
+        )
+        structured_diagram = (
+            _project_structured_diagram(value)
+            if entry.kind is EditorialBlockKind.DIAGRAM
             and entry.source_stage is EditorialSourceStage.EDITORIAL_ENRICHMENT
             else None
         )
@@ -826,6 +843,7 @@ def project_blocks(
             "table": structured_table,
             "chart": structured_chart,
             "figure": structured_figure,
+            "diagram": structured_diagram,
             "revision_target": {
                 "block_id": str(entry.block_id),
                 "legacy_target_id": legacy_target_id,
@@ -1120,10 +1138,116 @@ def _project_structured_chart(value: Any) -> dict[str, object] | None:
     }
 
 
+def _project_structured_diagram(value: Any) -> dict[str, object] | None:
+    """Bounded diagram projection for the workshop inspector.
+
+    Only the composition fields the analyst compares are exposed; evidence
+    handles stay on the block, and no compiled asset is fetched here.
+    """
+    if not isinstance(value, Mapping):
+        return None
+    nodes = value.get("nodes")
+    edges = value.get("edges")
+    groups = value.get("groups")
+    placement = value.get("placement")
+    if (
+        not isinstance(value.get("key"), str)
+        or not isinstance(value.get("title"), str)
+        or not isinstance(value.get("direction"), str)
+        or not isinstance(nodes, list)
+        or not isinstance(edges, list)
+        or not isinstance(groups, list)
+        or not isinstance(placement, Mapping)
+        or not isinstance(placement.get("kind"), str)
+    ):
+        return None
+    if (
+        len(nodes) > _MAX_PROJECTED_DIAGRAM_NODES
+        or len(edges) > _MAX_PROJECTED_DIAGRAM_EDGES
+        or len(groups) > _MAX_PROJECTED_DIAGRAM_GROUPS
+    ):
+        return None
+    placement_kind = placement["kind"]
+    if placement_kind not in {
+        "after_paragraph",
+        "after_lead",
+        "after_timeline",
+        "after_section",
+        "end",
+    }:
+        return None
+    anchor_block_id = placement.get("anchor_block_id")
+    if not isinstance(anchor_block_id, str):
+        anchor_block_id = None
+    if placement_kind == "after_paragraph" and anchor_block_id is None:
+        return None
+    projected_nodes: list[dict[str, object]] = []
+    for node in nodes:
+        if (
+            not isinstance(node, Mapping)
+            or not isinstance(node.get("node_id"), str)
+            or not isinstance(node.get("label"), str)
+        ):
+            return None
+        projected_nodes.append(
+            {
+                "node_id": node["node_id"],
+                "label": node["label"],
+                "role": node.get("role") if isinstance(node.get("role"), str) else None,
+            }
+        )
+    projected_edges: list[dict[str, object]] = []
+    for edge in edges:
+        if (
+            not isinstance(edge, Mapping)
+            or not isinstance(edge.get("source_node_id"), str)
+            or not isinstance(edge.get("target_node_id"), str)
+        ):
+            return None
+        projected_edges.append(
+            {
+                "source_node_id": edge["source_node_id"],
+                "target_node_id": edge["target_node_id"],
+                "label": edge.get("label") if isinstance(edge.get("label"), str) else None,
+            }
+        )
+    projected_groups: list[dict[str, object]] = []
+    for group in groups:
+        if (
+            not isinstance(group, Mapping)
+            or not isinstance(group.get("group_id"), str)
+            or not isinstance(group.get("label"), str)
+            or not isinstance(group.get("node_ids"), list)
+            or not all(isinstance(item, str) for item in group["node_ids"])
+        ):
+            return None
+        projected_groups.append(
+            {
+                "group_id": group["group_id"],
+                "label": group["label"],
+                "node_ids": list(group["node_ids"]),
+            }
+        )
+    return {
+        "key": value["key"],
+        "kind": value.get("kind") if isinstance(value.get("kind"), str) else None,
+        "title": value["title"],
+        "caption": value.get("caption") if isinstance(value.get("caption"), str) else None,
+        "direction": value["direction"],
+        "profile": value.get("profile") if isinstance(value.get("profile"), str) else None,
+        "nodes": projected_nodes,
+        "edges": projected_edges,
+        "groups": projected_groups,
+        "anchor_block_id": anchor_block_id,
+        "placement": placement_kind,
+    }
+
+
 def _project_structured_figure(
     value: Any,
     *,
     catalog_figure_ids: Mapping[UUID, str] | None = None,
+    catalog_figure_captions: Mapping[UUID, str | None] | None = None,
 ) -> dict[str, object] | None:
     if not isinstance(value, Mapping):
         return None
@@ -1169,6 +1293,11 @@ def _project_structured_figure(
         "catalog_figure_id": (
             catalog_figure_ids.get(canonical_figure_id)
             if catalog_figure_ids is not None and canonical_figure_id is not None
+            else None
+        ),
+        "original_caption": (
+            catalog_figure_captions.get(canonical_figure_id)
+            if catalog_figure_captions is not None and canonical_figure_id is not None
             else None
         ),
         "caption": value["caption"],

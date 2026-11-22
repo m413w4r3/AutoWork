@@ -336,6 +336,7 @@ class EditorialWorkspaceService:
         figure_catalog_page: EditorialFigureCatalogPage | None = None
         figure_catalog_run_id: UUID | None = None
         catalog_figure_ids: dict[UUID, str] = {}
+        catalog_figure_captions: dict[UUID, str | None] = {}
         if uow is None and self._figure_catalog_service is not None:
             from cti_app.application.editorial_figure_catalog import EditorialFigureCatalogError
 
@@ -348,12 +349,20 @@ class EditorialWorkspaceService:
                 )
                 (
                     figure_catalog_run_id,
-                    catalog_figure_ids,
-                ) = await self._figure_catalog_service.source_figure_catalog_ids(subject_id)
+                    catalog_figure_items,
+                ) = await self._figure_catalog_service.source_figure_catalog_figures(subject_id)
+                catalog_figure_ids = {
+                    source_id: item.figure_id for source_id, item in catalog_figure_items.items()
+                }
+                catalog_figure_captions = {
+                    source_id: item.original_caption
+                    for source_id, item in catalog_figure_items.items()
+                }
             except EditorialFigureCatalogError:
                 figure_catalog_page = None
                 figure_catalog_run_id = None
                 catalog_figure_ids = {}
+                catalog_figure_captions = {}
 
         async with self._uow_scope(uow) as uow:
             subject = await uow.subjects.get(subject_id)
@@ -366,6 +375,7 @@ class EditorialWorkspaceService:
                 raise EditorialWorkspaceError("production_run_missing")
             if figure_catalog_run_id != run.id:
                 catalog_figure_ids = {}
+                catalog_figure_captions = {}
             synthesis_artifact = await uow.production_artifacts.get_current_for_revision(
                 run.id, ProductionArtifactStage.SYNTHESIS.value
             )
@@ -569,6 +579,7 @@ class EditorialWorkspaceService:
                 allow_operations=kind is not None,
                 allow_figure_insertion=kind is not None and figure_inventory_available,
                 catalog_figure_ids=catalog_figure_ids,
+                catalog_figure_captions=catalog_figure_captions,
             )
             if read_only_reason is not None:
                 reason = read_only_reason.value
