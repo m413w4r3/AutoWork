@@ -1016,6 +1016,58 @@ const f3cScreenshotDirectory = resolve(
   "../.autowork-runs/shots-f3c",
 );
 
+test("E20 — déplacement depuis l’onglet Visuels: panneau inspecteur, ancrage et confirmation", async ({
+  page,
+}) => {
+  const captures = await installRoutes(page, {
+    kind: "article",
+    withIntegratedFigure: true,
+  });
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.goto(`/subjects/${subjectId}/editor`);
+  const figureBlock = page.locator(
+    `.editorial-document__block[data-block-id="${figureBlockId}"]`,
+  );
+  await figureBlock.click();
+  await page.getByRole("tab", { name: "Visuels" }).click();
+
+  const figureItem = page.locator(
+    '.editorial-visuals__item[data-kind="figure"]',
+  );
+  await figureItem.getByRole("button", { name: "Déplacer" }).click();
+  const panel = page.getByRole("region", { name: "Déplacer le visuel" });
+  await expect(panel).toBeVisible();
+  await expect(panel.getByText(/Emplacement actuel : après «/)).toBeVisible();
+
+  const anchorChoice = panel.getByRole("radio", {
+    name: /Paragraphe suivant conservé/,
+  });
+  await anchorChoice.focus();
+  await page.keyboard.press("Space");
+  await expect(anchorChoice).toBeChecked();
+  await expect(panel.getByText(/Emplacement prévu : après «/)).toBeVisible();
+
+  const confirm = panel.getByRole("button", {
+    name: "Enregistrer l’emplacement",
+  });
+  await expect(confirm).toBeEnabled();
+  await confirm.focus();
+  await page.keyboard.press("Enter");
+
+  await expect
+    .poll(() => captures.enrichmentRevisions.length)
+    .toBeGreaterThan(0);
+  expect(captures.enrichmentRevisions.at(-1)).toMatchObject({
+    snapshot_id: "13131313-1313-4313-8313-131313131313",
+    operation: "move_enrichment_element",
+    element_kind: "figure",
+    element_key: elementKey,
+    anchor_block_id: secondParagraphId,
+  });
+  await expect(page.getByText(/Emplacement enregistré · v\d+/)).toBeVisible();
+  expect(captures.unexpected).toEqual([]);
+});
+
 test("F3-C — captures desktop de l’atelier connecté (1024, 1280, 1440, 1920)", async ({
   page,
 }) => {

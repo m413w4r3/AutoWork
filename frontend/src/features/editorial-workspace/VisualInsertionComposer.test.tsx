@@ -185,6 +185,13 @@ describe("VisualInsertionComposer", () => {
     const table = within(menu).getByRole("menuitem", { name: "Tableau" });
     const chart = within(menu).getByRole("menuitem", { name: "Graphique" });
 
+    // The authorised generation chain exposes exactly table, chart and
+    // archived figures; no diagram entry is offered.
+    expect(
+      within(menu).getByRole("menuitem", { name: "Image issue des sources" }),
+    ).toBeVisible();
+    expect(within(menu).queryByRole("menuitem", { name: /Schéma/ })).toBeNull();
+
     expect(trigger).toHaveAttribute("aria-controls", menu.id);
     expect(table).toHaveFocus();
     fireEvent.keyDown(table, { key: "ArrowDown" });
