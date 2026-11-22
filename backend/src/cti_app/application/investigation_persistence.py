@@ -34,6 +34,7 @@ from cti_app.domain.investigation import (
     ToolInvocation,
 )
 from cti_app.domain.investigation_experiment import InvestigationExperimentV1
+from cti_app.domain.investigation_handoff import HandoffActor, InvestigationHandoffV1
 from cti_app.domain.investigation_plan import (
     InvestigationPlanHead,
     InvestigationPlanVersion,
@@ -51,6 +52,36 @@ if TYPE_CHECKING:
 
 class VersionConflictError(RuntimeError):
     """Raised when a compare-and-swap append does not match the current version."""
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class HandoffRecord:
+    """One persisted handoff row: the domain content plus its append identity.
+
+    ``idempotency_key``/``request_sha256`` and ``created_by`` are row metadata,
+    not handoff content: the V1 payload stays exactly the D5 contract, while a
+    replayed key is recognised by the canonical request hash (ADR-0011 M6).
+    """
+
+    handoff: InvestigationHandoffV1
+    idempotency_key: str
+    request_sha256: str
+    created_by: HandoffActor
+    predecessor_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.handoff, InvestigationHandoffV1):
+            raise TypeError("handoff must use InvestigationHandoffV1")
+        if not isinstance(self.created_by, HandoffActor):
+            raise TypeError("created_by must use HandoffActor")
+        if not self.idempotency_key.strip():
+            raise ValueError("idempotency_key must not be empty")
+        if len(self.request_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in self.request_sha256
+        ):
+            raise ValueError("request_sha256 must be a lowercase SHA-256")
+        if self.predecessor_id is not None and not self.predecessor_id.strip():
+            raise ValueError("predecessor_id must not be empty")
 
 
 class ToolInvocationRepository(Protocol):
@@ -386,6 +417,31 @@ class InvestigationTaskRepository(Protocol):
     async def advance_event_sequence(self, task_id: UUID) -> int: ...
 
     async def add_event(self, event: TaskEvent) -> TaskEvent: ...
+
+
+class InvestigationHandoffRepository(Protocol):
+    """Append-only handoffs with per-task versions and idempotency (D5/M6).
+
+    ``(task_id, version)`` and ``(task_id, idempotency_key)`` are unique in the
+    database; the application service locks the task row before allocating a
+    version, so concurrent creates of one task serialise.
+    """
+
+    async def get(self, handoff_id: UUID) -> HandoffRecord | None: ...
+
+    async def get_by_idempotency(
+        self, task_id: UUID, idempotency_key: str
+    ) -> HandoffRecord | None: ...
+
+    async def get_by_version(self, task_id: UUID, version: int) -> HandoffRecord | None: ...
+
+    async def latest_for_task(self, task_id: UUID) -> HandoffRecord | None: ...
+
+    async def list_for_investigation(
+        self, investigation_id: UUID, *, task_id: UUID | None = None
+    ) -> tuple[HandoffRecord, ...]: ...
+
+    async def append_if_absent(self, record: HandoffRecord) -> tuple[HandoffRecord, bool]: ...
 
 
 def _copy_budget(budget: InvestigationBudget) -> InvestigationBudget:
@@ -1366,17 +1422,100 @@ class InMemoryInvestigationTaskRepository:
             return event
 
 
+class InMemoryInvestigationHandoffRepository:
+    """In-memory port fake sharing the SQL repository's observable rules."""
+
+    def __init__(self) -> None:
+        self._items: dict[UUID, HandoffRecord] = {}
+        self._lock = asyncio.Lock()
+
+    @staticmethod
+    def _handoff_id(record: HandoffRecord) -> UUID:
+        return UUID(record.handoff.handoff_id)
+
+    async def get(self, handoff_id: UUID) -> HandoffRecord | None:
+        return self._items.get(handoff_id)
+
+    async def get_by_idempotency(self, task_id: UUID, idempotency_key: str) -> HandoffRecord | None:
+        return next(
+            (
+                record
+                for record in self._items.values()
+                if record.handoff.task_id == str(task_id)
+                and record.idempotency_key == idempotency_key
+            ),
+            None,
+        )
+
+    async def get_by_version(self, task_id: UUID, version: int) -> HandoffRecord | None:
+        return next(
+            (
+                record
+                for record in self._items.values()
+                if record.handoff.task_id == str(task_id) and record.handoff.version == version
+            ),
+            None,
+        )
+
+    async def latest_for_task(self, task_id: UUID) -> HandoffRecord | None:
+        matching = [
+            record for record in self._items.values() if record.handoff.task_id == str(task_id)
+        ]
+        if not matching:
+            return None
+        return max(matching, key=lambda record: record.handoff.version)
+
+    async def list_for_investigation(
+        self, investigation_id: UUID, *, task_id: UUID | None = None
+    ) -> tuple[HandoffRecord, ...]:
+        return tuple(
+            sorted(
+                (
+                    record
+                    for record in self._items.values()
+                    if record.handoff.investigation_id == str(investigation_id)
+                    and (task_id is None or record.handoff.task_id == str(task_id))
+                ),
+                key=lambda record: (
+                    record.handoff.created_at,
+                    record.handoff.version,
+                    record.handoff.handoff_id,
+                ),
+            )
+        )
+
+    async def append_if_absent(self, record: HandoffRecord) -> tuple[HandoffRecord, bool]:
+        async with self._lock:
+            for existing in self._items.values():
+                if existing.handoff.task_id != record.handoff.task_id:
+                    continue
+                if (
+                    existing.handoff.version == record.handoff.version
+                    or existing.idempotency_key == record.idempotency_key
+                ):
+                    raise VersionConflictError(
+                        "Handoff task version or idempotency key is already used"
+                    )
+            handoff_id = self._handoff_id(record)
+            if handoff_id in self._items:
+                raise VersionConflictError("Handoff id is already used")
+            self._items[handoff_id] = record
+            return record, True
+
+
 __all__ = [
     "AnalystOpinionRepository",
     "DetectionCandidateRepository",
     "EvidenceObservationRepository",
     "FindingRepository",
+    "HandoffRecord",
     "InMemoryAnalystOpinionRepository",
     "InMemoryDetectionCandidateRepository",
     "InMemoryEvidenceObservationRepository",
     "InMemoryFindingRepository",
     "InMemoryInvestigationBudgetRepository",
     "InMemoryInvestigationEnvelopeRepository",
+    "InMemoryInvestigationHandoffRepository",
     "InMemoryInvestigationPlanRepository",
     "InMemoryInvestigationTaskRepository",
     "InMemorySampleAssociationRepository",
@@ -1388,6 +1527,7 @@ __all__ = [
     "InvestigationBudgetRepository",
     "InvestigationBudgetSnapshot",
     "InvestigationEnvelopeRepository",
+    "InvestigationHandoffRepository",
     "InvestigationPlanRepository",
     "InvestigationTaskRepository",
     "SampleAssociationRepository",

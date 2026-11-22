@@ -54,7 +54,7 @@ from tests.integration.edition_codes import reserve_edition_code
 pytestmark = pytest.mark.integration
 
 PREVIOUS = "0020_investigation_plans"
-HEAD = "0021_investigation_tasks"
+HEAD = "0022_investigation_handoffs"
 TASK_TABLES = {
     "investigation_tasks",
     "investigation_task_dependencies",

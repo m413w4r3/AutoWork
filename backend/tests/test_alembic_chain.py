@@ -35,6 +35,7 @@ EXPECTED_CHAIN = (
     "0019_workspace_bindings",
     "0020_investigation_plans",
     "0021_investigation_tasks",
+    "0022_investigation_handoffs",
 )
 
 BAR_CHART_MIGRATION = importlib.import_module(
@@ -182,7 +183,7 @@ def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
     revision_ids = [script.revision for script in revisions]
 
     assert scripts.get_heads() == [scripts.get_current_head()]
-    assert scripts.get_current_head() == "0021_investigation_tasks"
+    assert scripts.get_current_head() == "0022_investigation_handoffs"
     assert all(revision_id for revision_id in revision_ids)
     assert {revision_id for revision_id in revision_ids if len(revision_id) > 32} == {
         "0009_acquisition_strategy_attempts",
@@ -217,4 +218,5 @@ def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
         "0019_workspace_bindings": "0018_editorial_enrichment_element_operations",
         "0020_investigation_plans": "0019_workspace_bindings",
         "0021_investigation_tasks": "0020_investigation_plans",
+        "0022_investigation_handoffs": "0021_investigation_tasks",
     }

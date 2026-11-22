@@ -115,6 +115,7 @@ def test_schema_uses_a_frozen_baseline_and_additive_c2_revision() -> None:
         "0019_workspace_bindings.py",
         "0020_investigation_plans.py",
         "0021_investigation_tasks.py",
+        "0022_investigation_handoffs.py",
     ]
 
 

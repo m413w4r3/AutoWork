@@ -49,6 +49,12 @@ EXPECTED_REPOSITORIES = {
         ports.InMemoryInvestigationTaskRepository,
         uow_module.SqlAlchemyInvestigationTaskRepository,
     ),
+    # Lot 05A follows 04B1 in the total migration order.
+    "investigation_handoffs": (
+        ports.InvestigationHandoffRepository,
+        ports.InMemoryInvestigationHandoffRepository,
+        uow_module.SqlAlchemyInvestigationHandoffRepository,
+    ),
 }
 
 
