@@ -22,6 +22,7 @@ from cti_app.application.investigation_persistence import (
     WorkspaceBindingRepository,
     WorkspaceFileEventRepository,
     WorkspaceFileRevisionRepository,
+    WorkspaceNoteAnnotationRepository,
     WorkspaceSyncCursorRepository,
 )
 from cti_app.application.investigation_persistence import (
@@ -112,6 +113,9 @@ from cti_app.infrastructure.database.models import (
 )
 from cti_app.infrastructure.database.models import (
     work_contributions as _work_contribution_models,  # noqa: F401
+)
+from cti_app.infrastructure.database.models import (
+    workspace_note_annotations as _workspace_note_annotation_models,  # noqa: F401
 )
 from cti_app.infrastructure.database.repositories.agent_sessions import (
     SqlAlchemyAgentSessionRepository,
@@ -283,6 +287,9 @@ from cti_app.infrastructure.database.repositories.workspace import (
     SqlAlchemyWorkspaceFileRevisionRepository,
     SqlAlchemyWorkspaceSyncCursorRepository,
 )
+from cti_app.infrastructure.database.repositories.workspace_note_annotations import (
+    SqlAlchemyWorkspaceNoteAnnotationRepository,
+)
 
 
 class SqlAlchemyUnitOfWork:
@@ -354,6 +361,7 @@ class SqlAlchemyUnitOfWork:
     agent_sessions: AgentSessionRepository
     work_contributions: WorkContributionRepository
     investigation_note_proposals: NoteProposalRepository
+    workspace_note_annotations: WorkspaceNoteAnnotationRepository
     production_runs: ProductionRunRepository
     production_routing_decisions: ProductionRoutingDecisionRepository
     editorial_workspace_snapshots: EditorialWorkspaceSnapshotRepository
@@ -468,6 +476,9 @@ class SqlAlchemyUnitOfWork:
         self.agent_sessions = SqlAlchemyAgentSessionRepository(self._session)
         self.work_contributions = SqlAlchemyWorkContributionRepository(self._session)
         self.investigation_note_proposals = SqlAlchemyNoteProposalRepository(self._session)
+        self.workspace_note_annotations = SqlAlchemyWorkspaceNoteAnnotationRepository(
+            self._session
+        )
         self.production_runs = SqlAlchemyProductionRunRepository(self._session)
         self.production_routing_decisions = SqlAlchemyProductionRoutingDecisionRepository(
             self._session

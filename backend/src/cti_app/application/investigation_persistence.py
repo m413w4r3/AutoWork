@@ -57,6 +57,7 @@ from cti_app.domain.work_contribution import (
     WorkContributionImportStatus,
     WorkContributionV1,
 )
+from cti_app.domain.workspace_note_annotation import WorkspaceNoteAnnotationV1
 
 if TYPE_CHECKING:
     from cti_app.application.workspace_agent import (
@@ -261,6 +262,33 @@ class NoteProposalRepository(Protocol):
     async def update_if_version(
         self, proposal: NoteProposalV1, *, expected_status_version: int
     ) -> NoteProposalV1 | None: ...
+
+
+class WorkspaceNoteAnnotationRepository(Protocol):
+    """Append-only human note annotations (ADR-0011 D6).
+
+    ``append_if_absent`` returns the stored row for a replay of the same
+    idempotency key and refuses a key reused for a different action.  No
+    update or delete exists: current state is derived by ordering.
+    """
+
+    async def get(self, annotation_id: UUID) -> WorkspaceNoteAnnotationV1 | None: ...
+
+    async def get_by_idempotency(
+        self, investigation_id: UUID, idempotency_key: str
+    ) -> WorkspaceNoteAnnotationV1 | None: ...
+
+    async def list_for_path(
+        self, investigation_id: UUID, file_relpath: str
+    ) -> tuple[WorkspaceNoteAnnotationV1, ...]: ...
+
+    async def list_for_revision(
+        self, workspace_id: str, revision_id: str
+    ) -> tuple[WorkspaceNoteAnnotationV1, ...]: ...
+
+    async def append_if_absent(
+        self, annotation: WorkspaceNoteAnnotationV1
+    ) -> tuple[WorkspaceNoteAnnotationV1, bool]: ...
 
 
 class DetectionCandidateRepository(Protocol):
@@ -1091,6 +1119,96 @@ class InMemoryNoteProposalRepository:
                 raise ValueError("A note proposal update must retain its investigation")
             self._items[proposal.id] = proposal
             return proposal
+
+
+def same_workspace_note_annotation_request(
+    stored: WorkspaceNoteAnnotationV1, candidate: WorkspaceNoteAnnotationV1
+) -> bool:
+    """Compare the identity a replayed idempotency key commits to."""
+    return (
+        stored.workspace_id == candidate.workspace_id
+        and stored.revision_id == candidate.revision_id
+        and stored.file_relpath == candidate.file_relpath
+        and stored.kind is candidate.kind
+        and stored.actor_kind is candidate.actor_kind
+        and stored.actor_id == candidate.actor_id
+        and stored.target_task_id == candidate.target_task_id
+        and stored.ioc_value == candidate.ioc_value
+        and stored.ioc_type is candidate.ioc_type
+        and stored.target_sample_id == candidate.target_sample_id
+        and stored.detail == candidate.detail
+    )
+
+
+class InMemoryWorkspaceNoteAnnotationRepository:
+    """In-memory port fake sharing the append-only and idempotency rules."""
+
+    def __init__(self) -> None:
+        self._items: dict[UUID, WorkspaceNoteAnnotationV1] = {}
+        self._lock = asyncio.Lock()
+
+    async def get(self, annotation_id: UUID) -> WorkspaceNoteAnnotationV1 | None:
+        return self._items.get(annotation_id)
+
+    async def get_by_idempotency(
+        self, investigation_id: UUID, idempotency_key: str
+    ) -> WorkspaceNoteAnnotationV1 | None:
+        return next(
+            (
+                item
+                for item in self._items.values()
+                if item.investigation_id == investigation_id
+                and item.idempotency_key == idempotency_key
+            ),
+            None,
+        )
+
+    async def list_for_path(
+        self, investigation_id: UUID, file_relpath: str
+    ) -> tuple[WorkspaceNoteAnnotationV1, ...]:
+        return tuple(
+            sorted(
+                (
+                    item
+                    for item in self._items.values()
+                    if item.investigation_id == investigation_id
+                    and item.file_relpath == file_relpath
+                ),
+                key=lambda item: (item.created_at, str(item.id)),
+            )
+        )
+
+    async def list_for_revision(
+        self, workspace_id: str, revision_id: str
+    ) -> tuple[WorkspaceNoteAnnotationV1, ...]:
+        return tuple(
+            sorted(
+                (
+                    item
+                    for item in self._items.values()
+                    if item.workspace_id == workspace_id and item.revision_id == revision_id
+                ),
+                key=lambda item: (item.created_at, str(item.id)),
+            )
+        )
+
+    async def append_if_absent(
+        self, annotation: WorkspaceNoteAnnotationV1
+    ) -> tuple[WorkspaceNoteAnnotationV1, bool]:
+        async with self._lock:
+            existing_key = await self.get_by_idempotency(
+                annotation.investigation_id, annotation.idempotency_key
+            )
+            if existing_key is not None:
+                if not same_workspace_note_annotation_request(existing_key, annotation):
+                    raise VersionConflictError(
+                        "Note annotation idempotency key records a different action"
+                    )
+                return existing_key, False
+            if annotation.id in self._items:
+                raise VersionConflictError("Note annotation id is already used")
+            self._items[annotation.id] = annotation
+            return annotation, True
 
 
 class InMemoryDetectionCandidateRepository:
@@ -2068,6 +2186,7 @@ __all__ = [
     "InMemoryWorkspaceBindingRepository",
     "InMemoryWorkspaceFileEventRepository",
     "InMemoryWorkspaceFileRevisionRepository",
+    "InMemoryWorkspaceNoteAnnotationRepository",
     "InMemoryWorkspaceSyncCursorRepository",
     "InvestigationBudgetRepository",
     "InvestigationBudgetSnapshot",
@@ -2083,7 +2202,9 @@ __all__ = [
     "WorkspaceBindingRepository",
     "WorkspaceFileEventRepository",
     "WorkspaceFileRevisionRepository",
+    "WorkspaceNoteAnnotationRepository",
     "WorkspaceSyncCursorRepository",
     "same_note_proposal_request",
     "same_work_contribution_request",
+    "same_workspace_note_annotation_request",
 ]

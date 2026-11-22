@@ -73,6 +73,12 @@ EXPECTED_REPOSITORIES = {
         ports.InMemoryNoteProposalRepository,
         uow_module.SqlAlchemyNoteProposalRepository,
     ),
+    # M24-WS2 (notes) follows 08B in the total migration order.
+    "workspace_note_annotations": (
+        ports.WorkspaceNoteAnnotationRepository,
+        ports.InMemoryWorkspaceNoteAnnotationRepository,
+        uow_module.SqlAlchemyWorkspaceNoteAnnotationRepository,
+    ),
 }
 
 
