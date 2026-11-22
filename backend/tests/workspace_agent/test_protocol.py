@@ -5,9 +5,9 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
-from tests.workspace_agent.conftest import REPOSITORY_ROOT  # noqa: F401  (sys.path insert)
-
 from sidecars.workspace_agent import protocol
+
+from tests.workspace_agent.conftest import REPOSITORY_ROOT  # noqa: F401  (sys.path insert)
 
 EXPECTED_ERROR_CODES = {
     "invalid_request",
