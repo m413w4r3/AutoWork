@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import SourceCandidate, SourceRole
+from cti_app.domain.investigation import InvestigationExecutionMode
 from cti_app.domain.model_runs import ModelSubmissionState
 from cti_app.domain.production_references import (
     ProductionSourceCriticality,
@@ -1380,6 +1381,40 @@ class ProductionReuseInvalidation:
             raise ValueError("occurred_at must be timezone-aware")
 
 
+class ProseAuthority(StrEnum):
+    """Immutable authority over publishable prose (ADR-0011 D4).
+
+    ``legacy`` preserves the deprecated pre-M24 behaviour for investigations
+    that already existed.  ``bridge_only`` requires verified Bridge provenance
+    for every publishable writer and is fixed when the investigation row is
+    inserted; it is never a request-time downgrade target.
+    """
+
+    LEGACY = "legacy"
+    BRIDGE_ONLY = "bridge_only"
+
+
+class ProseAuthorityModeError(ValueError):
+    """Typed refusal for the forbidden ``bridge_only`` + ``BRIDGE_LED`` pair."""
+
+    code = "bridge_only_requires_operator_led"
+
+
+def require_prose_authority_mode(
+    prose_authority: ProseAuthority, execution_mode: InvestigationExecutionMode
+) -> None:
+    """Refuse a Bridge-led loop on an investigation whose prose is Bridge-only."""
+    if not isinstance(prose_authority, ProseAuthority):
+        raise TypeError("prose_authority must use ProseAuthority")
+    if not isinstance(execution_mode, InvestigationExecutionMode):
+        raise TypeError("execution_mode must use InvestigationExecutionMode")
+    if (
+        prose_authority is ProseAuthority.BRIDGE_ONLY
+        and execution_mode is not InvestigationExecutionMode.OPERATOR_LED
+    ):
+        raise ProseAuthorityModeError("A bridge_only investigation requires operator_led execution")
+
+
 @dataclass(slots=True, kw_only=True)
 class AnalystInvestigation:
     production_run_id: UUID
@@ -1394,12 +1429,15 @@ class AnalystInvestigation:
     pivot_conversation_id: UUID | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    prose_authority: ProseAuthority = ProseAuthority.LEGACY
     id: UUID = field(default_factory=uuid4)
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     version: int = 1
 
     def __post_init__(self) -> None:
+        if not isinstance(self.prose_authority, ProseAuthority):
+            raise TypeError("prose_authority must use ProseAuthority")
         if self.version < 1 or self.cycle_number < 1:
             raise ValueError("version and cycle_number must be >= 1")
         if (self.input_pack_blob_id is None) != (self.input_sha256 is None):

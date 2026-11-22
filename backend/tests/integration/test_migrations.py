@@ -74,6 +74,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     external_effects,
     invariants,
     investigation,
+    investigation_coordination,
     jobs,
     model_execution,
     osint_open_policy,
@@ -162,8 +163,10 @@ INVESTIGATION_TABLES = frozenset(
         "investigation_budget_reservations",
         "investigation_budget_reservation_amounts",
         "investigation_working_states",
-        "investigation_experiment_heads",
         "investigation_experiments",
+        "investigation_experiment_heads",
+        "investigation_plans",
+        "investigation_plan_versions",
         "osint_open_policies",
         "osint_open_policy_events",
         "osint_open_inheritances",
@@ -325,6 +328,18 @@ EXPECTED_TRIGGERS: dict[tuple[str, str], str] = {
     ): "reject_investigation_experiment_mutation",
     ("analyst_decisions", "trg_analyst_decisions_append_only"): "reject_evidence_mutation",
     ("analyst_input_packs", "trg_analyst_input_packs_append_only"): "reject_evidence_mutation",
+    (
+        "investigation_plan_versions",
+        "trg_investigation_plan_versions_append_only",
+    ): "reject_investigation_plan_version_mutation",
+    (
+        "investigation_plan_versions",
+        "trg_investigation_plan_versions_no_truncate",
+    ): "reject_investigation_plan_version_mutation",
+    (
+        "analyst_investigations",
+        "trg_analyst_investigations_prose_authority_immutable",
+    ): "reject_analyst_investigation_prose_authority_mutation",
     ("collection_attempts", "trg_collection_attempts_append_only"): "reject_evidence_mutation",
     ("derived_artifacts", "trg_derived_artifacts_append_only"): "reject_evidence_mutation",
     ("claims", "trg_claims_append_only"): "reject_evidence_mutation",
@@ -1197,7 +1212,7 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     command.upgrade(config, "head")
     command.current(config)
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert _head_revision() == "0019_workspace_bindings"
+    assert _head_revision() == "0020_investigation_plans"
     assert asyncio.run(_alembic_version_column_length(temporary_postgres_url)) == 64
 
     collection_attempt_columns = asyncio.run(
@@ -1565,7 +1580,7 @@ def test_frozen_collection_attempt_baseline_precedes_acquisition_additions(
 
     command.upgrade(config, "head")
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert _head_revision() == "0019_workspace_bindings"
+    assert _head_revision() == "0020_investigation_plans"
     final_schema = asyncio.run(_database_snapshot(temporary_postgres_url))["collection_attempts"]
     table = Base.metadata.tables["collection_attempts"]
     assert final_schema["columns"] == _expected_columns(table)
@@ -1795,6 +1810,8 @@ def test_migration_up_and_down_on_temporary_postgres(temporary_postgres_url: str
             "workspace_file_revisions",
             "workspace_file_events",
             "workspace_sync_cursors",
+            "investigation_plans",
+            "investigation_plan_versions",
         }
     )
     at_0004 = asyncio.run(_database_snapshot(temporary_postgres_url))

@@ -66,11 +66,13 @@ ANALYST_INVESTIGATION_STAGE_VALUES_SQL = (
 ANALYST_DECISION_VALUES_SQL = (
     "'member_validate', 'member_reject', 'feature_validate', 'feature_reject', "
     "'pivot_approve', 'pivot_reject', 'note_approve', 'note_changes_requested', "
-    "'detection_approve', 'detection_reject'"
+    "'detection_approve', 'detection_reject', 'plan_accept', 'plan_reject'"
 )
 ANALYST_DECISION_TARGET_VALUES_SQL = (
-    "'member', 'feature', 'tool', 'invariant', 'pivot', 'corpus', 'detection', 'note'"
+    "'member', 'feature', 'tool', 'invariant', 'pivot', 'corpus', 'detection', 'note', "
+    "'plan_version'"
 )
+PROSE_AUTHORITY_VALUES_SQL = "'legacy', 'bridge_only'"
 SAMPLE_ACQUISITION_REASON_VALUES_SQL = "'seed', 'hit_review'"
 SAMPLE_ACQUISITION_OUTCOME_VALUES_SQL = "'success', 'error'"
 SAMPLE_ACQUISITION_HASH_FAMILY_VALUES_SQL = "'md5', 'sha1', 'sha256'"
@@ -383,6 +385,10 @@ class AnalystInvestigationRow(Base):
             "AND input_sha256 ~ '^[0-9a-f]{64}$')",
             name="ck_analyst_investigation_input_sha256",
         ),
+        CheckConstraint(
+            f"prose_authority IN ({PROSE_AUTHORITY_VALUES_SQL})",
+            name="ck_analyst_investigation_prose_authority",
+        ),
         Index("ix_analyst_investigations_subject_status", "subject_id", "status"),
     )
 
@@ -421,6 +427,11 @@ class AnalystInvestigationRow(Base):
     consumed_vt_read_units: Mapped[int] = mapped_column(nullable=False)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Fixed at INSERT by the sole row builder; a BEFORE UPDATE OF trigger
+    # refuses any later change.
+    prose_authority: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default=text("'legacy'")
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     version: Mapped[int] = mapped_column(nullable=False)
