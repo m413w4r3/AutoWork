@@ -52,6 +52,7 @@ class AgentConfig:
     root: Path
     socket_dir: Path
     group: int | None = None
+    analysis_gid: int | None = None
     poll_interval_ms: int = 1000
     stability_window_ms: int = 400
     log_level: str = "INFO"
