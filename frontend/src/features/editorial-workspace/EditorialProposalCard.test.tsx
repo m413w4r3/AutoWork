@@ -803,4 +803,43 @@ describe("EditorialProposalCard text proposal contract", () => {
       expect(onStateChange).toHaveBeenCalledWith("proposal-text", "proposed"),
     );
   });
+
+  it("keeps the stale decision commands visible and disabled with the reason", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          new Response(JSON.stringify({ ...textProposal, state: "stale" }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+        ),
+      ),
+    );
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <EditorialProposalCard
+          subjectId="subject-1"
+          occurrenceId="occurrence-1"
+          proposalId="proposal-text"
+        />
+      </QueryClientProvider>,
+    );
+
+    const accept = await screen.findByRole("button", { name: "Accepter" });
+    expect(accept).toHaveAttribute("aria-disabled", "true");
+    const reject = screen.getByRole("button", { name: "Rejeter" });
+    expect(reject).toBeDisabled();
+    const reason = screen.getByText(
+      /Cette proposition repose sur une version qui a changé/,
+    );
+    expect(reason).toBeVisible();
+    expect(accept.closest(".editorial-proposal-card__actions")).toHaveAttribute(
+      "aria-describedby",
+      reason.id,
+    );
+  });
 });

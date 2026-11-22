@@ -1784,6 +1784,13 @@ main:has(> .editorial-route-state) > .app-header {
     white-space: nowrap;
   }
 
+  /* The clipped search must not stay in the tab order while the rail is
+     collapsed; visibility:hidden removes it from focus without masking the
+     draft badges that share the clipped spans. */
+  .editorial-outline__search {
+    visibility: hidden;
+  }
+
   .editorial-workspace__outline-column:not([data-panel-open="true"])
     .editorial-outline__item
     > span {
@@ -1855,6 +1862,7 @@ main:has(> .editorial-route-state) > .app-header {
     width: auto;
     height: auto;
     clip: auto;
+    visibility: visible;
     white-space: normal;
   }
 
@@ -2270,6 +2278,14 @@ main:has(> .editorial-route-state) > .app-header {
   padding: 0.9rem;
   border: 1px solid var(--editorial-divider);
   border-radius: 0.55rem;
+  background: var(--editorial-panel);
+}
+
+.editorial-figure-insertion__header {
+  position: sticky;
+  z-index: 2;
+  top: 0;
+  padding-bottom: 0.45rem;
   background: var(--editorial-panel);
 }
 
@@ -3045,16 +3061,20 @@ main:has(> .editorial-route-state) > .app-header {
   scroll-margin-top: 6.5rem;
 }
 
+/* The bar participates in the block's own layout: it is rendered after the
+   block content and therefore can never cover or intercept the next block,
+   including when its actions wrap onto two rows at 1024–1280 px. */
 .editorial-block-actions--block {
-  position: absolute;
+  position: relative;
   z-index: 8;
-  top: 100%;
-  right: 0.5rem;
   display: flex;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   align-items: center;
+  justify-content: flex-end;
   gap: 0.3rem;
-  margin: -0.35rem 0 0;
+  width: fit-content;
+  max-width: 100%;
+  margin: 0.35rem 0 0 auto;
   padding: 0.15rem 0.3rem;
   border: 1px solid var(--editorial-divider);
   border-radius: 0.55rem;
@@ -3166,6 +3186,20 @@ main:has(> .editorial-route-state) > .app-header {
   background: var(--editorial-white);
 }
 
+/* Keep the five inspector tabs on one row at 1024–1439 px instead of leaving
+   « Historique » alone on a second line. Labels stay complete and untruncated. */
+@media (min-width: 1024px) and (max-width: 1439px) {
+  .editorial-inspector-tabs {
+    gap: 0.1rem;
+    margin: 0.6rem 0;
+  }
+
+  .editorial-inspector-tab {
+    padding: 0.35rem 0.3rem;
+    font-size: 0.74rem;
+  }
+}
+
 .editorial-inspector-tab:focus-visible,
 .editorial-inspector-panel:focus-visible {
   outline: 3px solid var(--editorial-focus-ring);
@@ -3174,6 +3208,47 @@ main:has(> .editorial-route-state) > .app-header {
 
 .editorial-inspector-panel[hidden] {
   display: none;
+}
+
+/* Keeps asynchronous announcements in the accessibility tree even when the
+   Discussion tab that owns the visible status is hidden. */
+.editorial-visually-hidden {
+  position: absolute;
+  overflow: hidden;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  border: 0;
+  margin: -1px;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+}
+
+/* Inline discard confirmation shared by the gallery and the replace dialog.
+   No native window.confirm: the decision stays keyboard reachable. */
+.editorial-close-confirmation {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+  margin: 0.75rem 1.25rem 0;
+  padding: 0.75rem 0.9rem;
+  border: 1px solid var(--editorial-warning);
+  border-radius: 0.55rem;
+  background: var(--editorial-white);
+}
+
+.editorial-close-confirmation p {
+  flex: 1 1 100%;
+  margin: 0;
+  color: var(--editorial-ink);
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+
+.editorial-close-confirmation:focus-within {
+  outline: 3px solid var(--editorial-focus-ring);
+  outline-offset: 2px;
 }
 
 .editorial-inspector__reason {
@@ -3568,6 +3643,9 @@ main:has(> .editorial-route-state) > .app-header {
 }
 
 .editorial-gallery-replace__header {
+  position: sticky;
+  z-index: 3;
+  top: 0;
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
@@ -3951,9 +4029,10 @@ button.editorial-visuals__target:focus-visible {
 
 /* Visual element actions (F3-A): selectable visuals, caption/move/reorder/remove. */
 .visual-action-bar {
-  /* A selected figure can expose up to eight actions; at 1024px the bar must
-     wrap inside the document column instead of running under the plan rail. */
-  max-width: calc(100% - 1rem);
+  /* A selected figure can expose up to eight actions; at 1024px the in-flow bar
+     wraps inside the block instead of running under the plan rail or over the
+     next block. */
+  max-width: 100%;
   flex-wrap: wrap;
   justify-content: flex-end;
   row-gap: 0.25rem;
@@ -4123,6 +4202,12 @@ button.editorial-visuals__target:focus-visible {
 }
 
 .visual-move-banner {
+  /* The banner stays below the persistent top bar while the operator scrolls
+     the document to choose an anchor, so the focused move target never leaves
+     the viewport. */
+  position: sticky;
+  z-index: 12;
+  top: var(--editorial-topbar-height);
   margin: 0 0 1.25rem;
   padding: 0.9rem 1rem;
   border: 2px solid var(--editorial-brand);
@@ -4130,7 +4215,7 @@ button.editorial-visuals__target:focus-visible {
   background: var(--editorial-outline-selected);
 }
 
-.visual-move-banner:focus-visible {
+.visual-move-banner:focus {
   outline: 3px solid var(--editorial-focus-ring);
   outline-offset: 2px;
 }

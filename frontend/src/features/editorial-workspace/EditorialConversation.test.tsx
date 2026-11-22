@@ -1300,4 +1300,85 @@ describe("EditorialConversation", () => {
     expect(key).toHaveBeenCalledTimes(1);
     expect(await screen.findByText("Session précédente · 1")).toBeVisible();
   });
+
+  it("uses the mission proposal label even when create_table is allowed", async () => {
+    renderConversation(
+      {
+        kind: "open",
+        thread_id: "thread-1",
+        origin: binding,
+        current: binding,
+        binding_state: "valid",
+        previous_sessions: [],
+        bridge_status: "ready",
+        event_sequence: 0,
+        timeline: [],
+        etag: '"thread-ready"',
+      },
+      vi.fn(),
+      ["create_table"],
+    );
+    expect(
+      await screen.findByRole("button", { name: "Générer une proposition" }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("button", { name: "Demander au Bridge" }),
+    ).toBeNull();
+  });
+
+  it("announces an asynchronous reply outside a hidden Discussion panel", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() =>
+        Promise.resolve(
+          threadResponse({
+            kind: "open",
+            thread_id: "thread-1",
+            origin: binding,
+            current: binding,
+            binding_state: "valid",
+            previous_sessions: [],
+            bridge_status: "reply_available",
+            event_sequence: 1,
+            timeline: [],
+            etag: '"thread-reply"',
+          }),
+        ),
+      ),
+    );
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, refetchInterval: false } },
+    });
+    const view = render(
+      <QueryClientProvider client={client}>
+        <div hidden>
+          <EditorialConversation
+            subjectId={binding.subject_id}
+            occurrenceId={binding.occurrence_id}
+            snapshotId="snapshot-1"
+            targetLabel="Paragraphe synthétique"
+            allowedOperations={["rewrite_paragraph"]}
+            onChangeTarget={() => undefined}
+            discussionVisible={false}
+          />
+        </div>
+      </QueryClientProvider>,
+    );
+
+    const announcement = await screen.findByTestId(
+      "editorial-bridge-status-live",
+    );
+    expect(announcement).toHaveTextContent(
+      "Une réponse est disponible dans ce fil. Consultez-la avant toute décision.",
+    );
+    expect(announcement).toHaveAttribute("aria-live", "polite");
+    expect(announcement).toHaveClass("editorial-visually-hidden");
+    expect(announcement.closest("[hidden]")).toBeNull();
+    expect(view.container.contains(announcement)).toBe(false);
+    expect(
+      screen.queryByText(
+        "Une réponse est disponible dans ce fil. Consultez-la avant toute décision.",
+      ),
+    ).toBe(announcement);
+  });
 });

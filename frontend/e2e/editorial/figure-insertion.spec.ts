@@ -743,7 +743,7 @@ test("shows the server refusal when a stale BRIEF snapshot would add a fourth fi
   await page.getByRole("button", { name: "Ajouter après" }).click();
   await page.getByRole("menuitem", { name: "Image issue des sources" }).click();
   await expect(
-    page.getByText(/Figures intégrées : 3\/3/).first(),
+    page.getByText(/Capacité du document : 3\/3 figures intégrées/).first(),
   ).toBeVisible();
   expect(proposalRequests).toHaveLength(1);
   expect(unexpectedRequests).toEqual([]);

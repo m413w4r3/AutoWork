@@ -65,6 +65,7 @@ const figureIds = {
   a2: "40000000-0000-4000-8000-000000000002",
   b1: "40000000-0000-4000-8000-000000000003",
   b2: "40000000-0000-4000-8000-000000000004",
+  a3: "40000000-0000-4000-8000-000000000005",
 } as const;
 const sourceA = "50000000-0000-4000-8000-000000000001";
 const sourceB = "50000000-0000-4000-8000-000000000002";
@@ -642,6 +643,16 @@ const catalog: EditorialFigureCatalogItem[] = [
     false,
     "La licence de cette figure ne permet pas son intégration.",
   ),
+  // A fourth *selectable* figure proves the BRIEF selection cap itself
+  // disables the next checkbox, independently of licence exclusions.
+  catalogItem(
+    figureIds.a3,
+    "Plan annoté des échanges",
+    sourceA,
+    "Rapport public synthétique",
+    "available",
+    true,
+  ),
 ];
 
 /* ------------------------------------------------------------------ */
@@ -1157,6 +1168,46 @@ async function pageViolations(page: Page): Promise<string[]> {
         }
       }
     }
+    for (const bar of Array.from(
+      document.querySelectorAll(".editorial-block-actions--block"),
+    ).filter(visible)) {
+      const block = bar.closest(".editorial-document__block");
+      const nextBlock = block ? block.nextElementSibling : null;
+      if (!block || !nextBlock) continue;
+      const blockRect = block.getBoundingClientRect();
+      const barRect = bar.getBoundingClientRect();
+      const nextRect = nextBlock.getBoundingClientRect();
+      if (
+        barRect.bottom > blockRect.bottom + 1 ||
+        barRect.left < blockRect.left - 1 ||
+        barRect.right > blockRect.right + 1
+      ) {
+        violations.push(
+          "barre d’actions hors de son bloc: " +
+            Math.round(barRect.left) +
+            "→" +
+            Math.round(barRect.right) +
+            " / " +
+            Math.round(barRect.top) +
+            "→" +
+            Math.round(barRect.bottom),
+        );
+      }
+      const overlapWidth =
+        Math.min(barRect.right, nextRect.right) -
+        Math.max(barRect.left, nextRect.left);
+      const overlapHeight =
+        Math.min(barRect.bottom, nextRect.bottom) -
+        Math.max(barRect.top, nextRect.top);
+      if (overlapWidth > 1 && overlapHeight > 1) {
+        violations.push(
+          "barre d’actions recouvre le bloc suivant: chevauchement " +
+            Math.round(overlapWidth) +
+            "×" +
+            Math.round(overlapHeight),
+        );
+      }
+    }
     const main = document.querySelector("main");
     const mainText = main ? main.innerText : "";
     if (/\\bundefined\\b|\\[object/i.test(mainText)) {
@@ -1185,8 +1236,11 @@ async function pageViolations(page: Page): Promise<string[]> {
 
 const paragraphSelector = `.editorial-document__block[data-block-id="${paragraphId}"]`;
 const secondParagraphSelector = `.editorial-document__block[data-block-id="${secondParagraphId}"]`;
+const headingSelector = `.editorial-document__block[data-block-id="${headingId}"]`;
+const leadSelector = `.editorial-document__block[data-block-id="${leadId}"]`;
 const chartSelector = `.editorial-document__block[data-element-key="${CHART_KEY}"]`;
 const figureASelector = `.editorial-document__block[data-element-key="${FIGURE_A_KEY}"]`;
+const figureBSelector = `.editorial-document__block[data-element-key="${FIGURE_B_KEY}"]`;
 
 async function selectParagraph(page: Page): Promise<void> {
   const paragraph = page.locator(paragraphSelector);
@@ -1452,7 +1506,7 @@ const STATES: MatrixState[] = [
         page.getByRole("tablist", { name: "Panneaux de l’inspecteur" }),
       ).toBeVisible();
       await expect(
-        page.getByRole("tab", { name: "Discussion Bridge" }),
+        page.getByRole("tab", { name: "Discussion" }),
       ).toHaveAttribute("aria-selected", "true");
     },
   },
@@ -1468,11 +1522,16 @@ const STATES: MatrixState[] = [
         .first();
       await expect(card).toBeVisible();
       await card.getByText("Preuves utilisées").click();
+      // The INDEX requires the field comparison rows (title, caption, unit,
+      // axes); align on them rather than on the point values lower in the card.
       await alignInScrollContainer(
         inspectorColumn(page),
-        card.locator(".visual-proposal-diff__points"),
+        card.locator(".visual-proposal-diff__fields"),
         8,
       );
+      await expect(
+        card.locator(".visual-proposal-diff__fields"),
+      ).toBeInViewport({ ratio: 0.5 });
     },
     expect: async (page) => {
       const card = page
@@ -1494,6 +1553,10 @@ const STATES: MatrixState[] = [
       await expect(
         card.getByText("Valeur proposée ·", { exact: false }).first(),
       ).toBeVisible();
+      await expect(card.locator(".visual-proposal-diff__field")).toHaveCount(5);
+      await expect(
+        card.locator(".visual-proposal-diff__field[data-changed='true']"),
+      ).toHaveCount(2);
       await expect(
         card
           .locator(".visual-proposal-diff__evidence code")
@@ -1538,7 +1601,38 @@ const STATES: MatrixState[] = [
           .click();
         const panel = page.locator(".gallery-selection");
         await expect(panel).toBeVisible();
-        await panel.scrollIntoViewIfNeeded();
+        // Put the whole insertion panel just below the top bar, then scroll
+        // its own content to the actions; the sticky header stays visible.
+        const insertion = page.locator(".editorial-figure-insertion");
+        await expect(insertion).toBeVisible();
+        await page.evaluate(`(() => {
+          const element = document.querySelector('.editorial-figure-insertion');
+          if (!element) return;
+          const topbar = parseFloat(
+            getComputedStyle(document.documentElement).getPropertyValue(
+              '--editorial-topbar-height',
+            ),
+          ) || 84;
+          const rect = element.getBoundingClientRect();
+          window.scrollBy(0, rect.top - topbar - 8);
+        })()`);
+        await insertion.evaluate((element) => {
+          const node = element as unknown as {
+            scrollTop: number;
+            scrollHeight: number;
+          };
+          node.scrollTop = node.scrollHeight;
+        });
+        await expect(
+          insertion.getByRole("heading", {
+            name: "Intégrer des images sources",
+          }),
+        ).toBeInViewport();
+        await expect(
+          insertion.getByRole("button", {
+            name: "Intégrer les images sélectionnées",
+          }),
+        ).toBeInViewport();
       },
       expect: async (page) => {
         const panel = page.locator(".gallery-selection");
@@ -1588,6 +1682,14 @@ const STATES: MatrixState[] = [
         name: "Remplacer l’image intégrée",
       });
       await expect(
+        dialog.getByRole("heading", { name: "Remplacer l’image intégrée" }),
+      ).toBeInViewport();
+      await expect(
+        dialog.getByRole("button", {
+          name: "Fermer le remplacement d’image",
+        }),
+      ).toBeInViewport();
+      await expect(
         dialog.getByRole("heading", { name: "Image actuelle" }),
       ).toBeVisible();
       await expect(
@@ -1621,6 +1723,9 @@ const STATES: MatrixState[] = [
         page.getByRole("heading", { name: "Choisir un nouvel emplacement" }),
       ).toBeVisible();
       await expect(
+        page.getByRole("region", { name: "Déplacement du visuel" }),
+      ).toBeInViewport();
+      await expect(
         page.getByText("Cliquez un paragraphe", { exact: false }),
       ).toBeVisible();
     },
@@ -1642,6 +1747,11 @@ const STATES: MatrixState[] = [
       await expect(preview).toBeVisible();
       await expect(preview).toContainText("Insertion prévue : après «");
       await preview.scrollIntoViewIfNeeded();
+      // The sticky move banner must remain visible alongside the preview.
+      await expect(
+        page.getByRole("region", { name: "Déplacement du visuel" }),
+      ).toBeInViewport();
+      await expect(preview).toBeInViewport();
     },
     expect: async (page) => {
       await expect(
@@ -1694,9 +1804,11 @@ const STATES: MatrixState[] = [
       await expect(
         page.getByText(conflictMessage, { exact: true }),
       ).toBeVisible();
+      // The INDEX requires the disabled decision buttons *and* the conflict
+      // message; align on the actions so both fit in the capture.
       await alignInScrollContainer(
         inspectorColumn(page),
-        card.locator(".editorial-proposal-card__recovery"),
+        card.locator(".editorial-proposal-card__actions"),
         8,
       );
     },
@@ -1705,11 +1817,23 @@ const STATES: MatrixState[] = [
         .getByRole("article", { name: "Proposition éditoriale" })
         .first();
       await expect(
+        card.getByRole("button", { name: "Accepter", exact: true }),
+      ).toBeInViewport();
+      await expect(
+        card.getByRole("button", { name: "Rejeter", exact: true }),
+      ).toBeInViewport();
+      await expect(
+        page.getByText(conflictMessage, { exact: true }),
+      ).toBeInViewport();
+      await expect(
         card.getByRole("button", { name: "Comparer à nouveau" }),
       ).toBeVisible();
       await expect(
         card.getByRole("button", { name: "Accepter", exact: true }),
       ).toHaveAttribute("aria-disabled", "true");
+      await expect(
+        card.getByRole("button", { name: "Rejeter", exact: true }),
+      ).toBeDisabled();
     },
   },
   {
@@ -1770,14 +1894,19 @@ const STATES: MatrixState[] = [
           .check();
       }
       await expect(gallery.getByText("3 images sélectionnées")).toBeVisible();
-      await expect(
-        gallery.getByText(
-          /Une brève ne peut contenir plus de trois figures intégrées/,
-        ),
-      ).toBeVisible();
-      await gallery
-        .getByText(/Une brève ne peut contenir plus de trois figures intégrées/)
-        .scrollIntoViewIfNeeded();
+      const limitNote = gallery.getByText(
+        /Sélection : 3\/3 — le plafond de sélection est atteint/,
+      );
+      await expect(limitNote).toBeVisible();
+      const cappedCheckbox = gallery.getByRole("checkbox", {
+        name: "Sélectionner Plan annoté des échanges",
+      });
+      await expect(cappedCheckbox).toBeDisabled();
+      const describedBy = await cappedCheckbox.getAttribute("aria-describedby");
+      const limitId = await limitNote.getAttribute("id");
+      expect(limitId).toBeTruthy();
+      expect(describedBy?.split(" ")).toContain(limitId);
+      await limitNote.scrollIntoViewIfNeeded();
     },
     expect: async (page) => {
       const gallery = page.getByRole("dialog", {
@@ -1788,7 +1917,14 @@ const STATES: MatrixState[] = [
           name: "Sélectionner Capture de configuration",
         }),
       ).toBeDisabled();
-      await expect(gallery.getByText(/Figures intégrées : 0\/3/)).toBeVisible();
+      await expect(
+        gallery.getByText(/Capacité du document : 0\/3 figures intégrées/),
+      ).toBeVisible();
+      await expect(
+        gallery.getByText(
+          /Sélection : 3\/3 — le plafond de sélection est atteint/,
+        ),
+      ).toBeInViewport();
     },
   },
   {
@@ -1801,6 +1937,11 @@ const STATES: MatrixState[] = [
       await expect(
         page.getByRole("list", { name: "Éléments visuels du document" }),
       ).toBeVisible();
+      // Bring the archive-gallery entry above the inspector fold so the
+      // capture actually shows it.
+      await page
+        .getByRole("button", { name: "Ouvrir la galerie des images archivées" })
+        .scrollIntoViewIfNeeded();
     },
     expect: async (page) => {
       const list = page.getByRole("list", {
@@ -1814,7 +1955,7 @@ const STATES: MatrixState[] = [
         page.getByRole("button", {
           name: "Ouvrir la galerie des images archivées",
         }),
-      ).toBeVisible();
+      ).toBeInViewport();
     },
   },
   {
@@ -1971,4 +2112,171 @@ test("F6-A — matrice de captures UX desktop (19 états × 4 largeurs)", async 
     captured,
     `captures manquantes: ${expectedPrimary + expectedSecondary - captured.length}`,
   ).toHaveLength(expectedPrimary + expectedSecondary);
+});
+
+/* ------------------------------------------------------------------ */
+/* F6-C targeted regressions                                           */
+/* ------------------------------------------------------------------ */
+
+test("F6-C — la barre d’actions ne recouvre pas le bloc suivant", async ({
+  page,
+}) => {
+  test.setTimeout(240_000);
+  const figureBytes = await readFile(
+    new URL("./fixtures/figure-gallery-thumbnail.jpg", import.meta.url),
+  );
+  await installSyntheticRoutes(page, {}, figureBytes);
+
+  for (const width of [1024, 1280, 1920]) {
+    const height = width === 1920 ? 1080 : 900;
+    await page.setViewportSize({ width, height });
+    await page.goto(`/subjects/${subjectId}/editor`);
+    await expect(page.locator(".editorial-workspace")).toBeVisible({
+      timeout: 20_000,
+    });
+
+    // One-row bar: the section heading exposes Discuter / ···.
+    const heading = page.locator(headingSelector);
+    const lead = page.locator(leadSelector);
+    await heading.click();
+    const headingBar = heading.getByRole("toolbar");
+    await expect(headingBar).toBeVisible();
+    const headingBarBox = await headingBar.boundingBox();
+    const leadBox = await lead.boundingBox();
+    expect(headingBarBox, `barre absente @${width}`).not.toBeNull();
+    expect(leadBox, `chapeau absent @${width}`).not.toBeNull();
+    if (!headingBarBox || !leadBox) continue;
+    expect(
+      headingBarBox.y + headingBarBox.height,
+      `la barre recouvre le chapeau @${width}`,
+    ).toBeLessThanOrEqual(leadBox.y + 1);
+
+    // A click on the first line of the following one-line paragraph must select
+    // that paragraph; Playwright fails if the bar intercepts the pointer.
+    await lead.click({ position: { x: 24, y: 12 } });
+    await expect(lead).toHaveAttribute("data-selected", "true");
+    await expect(heading).toHaveAttribute("data-selected", "false");
+
+    // Wrapped two-row bar: the chart exposes eight actions.
+    const chart = page.locator(chartSelector);
+    await chart.click();
+    const chartBar = chart.getByRole("toolbar");
+    await expect(chartBar).toBeVisible();
+    const chartBarBox = await chartBar.boundingBox();
+    const chartBlockBox = await chart.boundingBox();
+    const figureBox = await page.locator(figureASelector).boundingBox();
+    expect(chartBarBox, `barre visuelle absente @${width}`).not.toBeNull();
+    expect(chartBlockBox).not.toBeNull();
+    expect(figureBox).not.toBeNull();
+    if (!chartBarBox || !chartBlockBox || !figureBox) continue;
+    expect(
+      chartBarBox.y + chartBarBox.height,
+      `la barre visuelle dépasse son bloc @${width}`,
+    ).toBeLessThanOrEqual(chartBlockBox.y + chartBlockBox.height + 1);
+    expect(
+      chartBarBox.y + chartBarBox.height,
+      `la barre visuelle recouvre la figure suivante @${width}`,
+    ).toBeLessThanOrEqual(figureBox.y + 1);
+    if (width === 1024) {
+      const firstButton = await chartBar
+        .locator(":scope > .button")
+        .first()
+        .boundingBox();
+      const lastButton = await chartBar
+        .locator(":scope > .button")
+        .last()
+        .boundingBox();
+      expect(firstButton).not.toBeNull();
+      expect(lastButton).not.toBeNull();
+      if (firstButton && lastButton) {
+        expect(
+          lastButton.y,
+          "la barre visuelle doit occuper deux lignes à 1024 px",
+        ).toBeGreaterThan(firstButton.y + 1);
+      }
+    }
+
+    // The following figure block stays clickable while the chart is selected.
+    const figureA = page.locator(figureASelector);
+    await figureA.click({ position: { x: 24, y: 12 } });
+    await expect(figureA).toHaveAttribute("data-selected", "true");
+    await expect(chart).toHaveAttribute("data-selected", "false");
+  }
+});
+
+test("F6-C — le focus du mode déplacement reste dans le viewport", async ({
+  page,
+}) => {
+  test.setTimeout(120_000);
+  const figureBytes = await readFile(
+    new URL("./fixtures/figure-gallery-thumbnail.jpg", import.meta.url),
+  );
+  await page.setViewportSize({ width: 1024, height: 800 });
+  await installSyntheticRoutes(page, {}, figureBytes);
+  await page.goto(`/subjects/${subjectId}/editor`);
+  await expect(page.locator(".editorial-workspace")).toBeVisible({
+    timeout: 20_000,
+  });
+
+  // Start from a visual positioned below the initial fold.
+  const figure = page.locator(figureBSelector);
+  await figure.scrollIntoViewIfNeeded();
+  await expect(figure).toBeInViewport();
+  const scrollY = Number(await page.evaluate("window.scrollY"));
+  expect(
+    scrollY,
+    "le visuel de départ doit être sous le pli initial",
+  ).toBeGreaterThan(0);
+
+  await figure.click();
+  const moveButton = figure.getByRole("button", {
+    name: "Déplacer",
+    exact: true,
+  });
+  await expect(moveButton).toBeVisible();
+  await moveButton.click();
+
+  const banner = page.getByRole("region", {
+    name: "Déplacement du visuel",
+  });
+  await expect(banner).toBeFocused();
+  await expect(banner).toBeInViewport({ ratio: 0.5 });
+
+  const topbarBox = await page.locator(".editorial-topbar").boundingBox();
+  const bannerBox = await banner.boundingBox();
+  expect(topbarBox).not.toBeNull();
+  expect(bannerBox).not.toBeNull();
+  if (topbarBox && bannerBox) {
+    expect(
+      bannerBox.y,
+      "le bandeau ne doit pas être masqué par la barre supérieure",
+    ).toBeGreaterThanOrEqual(topbarBox.y + topbarBox.height - 1);
+  }
+
+  const outlineJson = await page.evaluate(
+    `(() => {
+       const element = document.querySelector('.visual-move-banner');
+       if (!element) return null;
+       const style = window.getComputedStyle(element);
+       return JSON.stringify({
+         width: style.outlineWidth,
+         style: style.outlineStyle,
+       });
+     })()`,
+  );
+  const outline =
+    typeof outlineJson === "string"
+      ? (JSON.parse(outlineJson) as { width: string; style: string })
+      : null;
+  expect(
+    outline,
+    "bandeau introuvable pour le contrôle de focus",
+  ).not.toBeNull();
+  if (outline) {
+    expect(
+      Number.parseFloat(outline.width),
+      "anneau de focus visible sur le bandeau",
+    ).toBeGreaterThanOrEqual(3);
+    expect(outline.style).not.toBe("none");
+  }
 });

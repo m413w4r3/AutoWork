@@ -868,7 +868,7 @@ test("E15 — plafond BRIEF expliqué et quatrième sélection bloquée", async 
   });
   await expect(
     gallery.getByText(
-      /Figures intégrées : 0\/3 · Capacité restante : 3 figures sur 3/,
+      /Capacité du document : 0\/3 figures intégrées · 3 places restantes/,
     ),
   ).toBeVisible();
   for (const name of [
@@ -887,9 +887,7 @@ test("E15 — plafond BRIEF expliqué et quatrième sélection bloquée", async 
     }),
   ).toBeDisabled();
   await expect(
-    gallery.getByText(
-      /Une brève ne peut contenir plus de trois figures intégrées/,
-    ),
+    gallery.getByText(/Sélection : 3\/3 — le plafond de sélection est atteint/),
   ).toBeVisible();
   await expectNoHorizontalOverflow(page);
   await page.screenshot({
@@ -910,7 +908,7 @@ test("E15 — ARTICLE sans plafond de figures", async ({ page }) => {
   const gallery = page.getByRole("dialog", {
     name: "Galerie d’images sources",
   });
-  await expect(gallery.getByText(/Capacité restante/)).toHaveCount(0);
+  await expect(gallery.getByText(/Capacité du document/)).toHaveCount(0);
   const fourth = gallery.getByRole("checkbox", {
     name: "Sélectionner Capture de configuration",
   });
@@ -1185,6 +1183,11 @@ test("F3-C — captures desktop de l’atelier connecté (1024, 1280, 1440, 1920
     await replaceDialog
       .getByRole("button", { name: "Fermer le remplacement d’image" })
       .click();
+    // A chosen replacement makes the dialog dirty: the close is confirmed.
+    await replaceDialog
+      .getByRole("button", { name: "Fermer sans enregistrer" })
+      .click();
+    await expect(replaceDialog).toHaveCount(0);
 
     const figureItem = page.locator(
       '.editorial-visuals__item[data-kind="figure"]',

@@ -31,6 +31,13 @@ const STATUS_LABELS: Record<EditorialFigureStatus, string> = {
   unverified: "Figure non vérifiée",
 };
 
+/** One status label: « Déjà intégrée » already carries the reused-figure fact. */
+function figureStatusLabel(item: EditorialFigureCatalogItem): string {
+  const label = STATUS_LABELS[item.status];
+  if (!item.already_used || item.status === "already_integrated") return label;
+  return `${label} · Déjà utilisée`;
+}
+
 export interface SourceFigureGalleryProps {
   subjectId: string;
   onClose?: () => void;
@@ -73,14 +80,20 @@ export function SourceFigureGallery({
     EditorialFigureCatalogItem[]
   >([]);
   const [previewFigureId, setPreviewFigureId] = useState<string | null>(null);
+  const [confirmClose, setConfirmClose] = useState(false);
   const [failedThumbnails, setFailedThumbnails] = useState<Set<string>>(
     () => new Set(),
   );
   const [previewImageFailed, setPreviewImageFailed] = useState(false);
+  const keepSelectionRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     if (previewFigureId) previewHeadingRef.current?.focus();
   }, [previewFigureId]);
+
+  useEffect(() => {
+    if (confirmClose) keepSelectionRef.current?.focus();
+  }, [confirmClose]);
 
   useEffect(() => {
     if (variant !== "dialog") return;
@@ -200,11 +213,23 @@ export function SourceFigureGallery({
   const limitExplanation =
     mode === "single" || selectionLimit === undefined
       ? null
-      : selectionLimit === 0 || limitReached
-        ? "Une brève ne peut contenir plus de trois figures intégrées. Le plafond est atteint : désélectionnez une image pour en choisir une autre."
-        : `Cette insertion peut ajouter jusqu’à ${selectionLimit} figure${selectionLimit > 1 ? "s" : ""}.`;
+      : limitReached
+        ? `Sélection : ${selectedCount}/${selectionLimit} — le plafond de sélection est atteint. Désélectionnez une image pour en choisir une autre.`
+        : `Sélection : ${selectedCount}/${selectionLimit} · cette insertion peut encore ajouter ${selectionLimit - selectedCount} figure${selectionLimit - selectedCount > 1 ? "s" : ""}.`;
 
-  const close = () => onClose?.();
+  // A dialog-owned implicit selection is lost when the dialog closes without
+  // integrating it; controlled galleries keep the parent's selection.
+  const discardableSelection =
+    variant === "dialog" && !controlledSelection && currentSelection.length > 0;
+  const closeNow = () => onClose?.();
+  const requestClose = () => {
+    if (discardableSelection && !confirmClose) {
+      setConfirmClose(true);
+      return;
+    }
+    closeNow();
+  };
+  const dismissCloseConfirmation = () => setConfirmClose(false);
   const preview = previewQuery.data;
 
   const content = (
@@ -219,13 +244,43 @@ export function SourceFigureGallery({
             ref={closeButtonRef}
             className="button button--secondary"
             type="button"
-            onClick={close}
+            onClick={requestClose}
             aria-label="Fermer la galerie d’images sources"
           >
             Fermer
           </button>
         ) : null}
       </header>
+
+      {confirmClose ? (
+        <div
+          className="editorial-close-confirmation"
+          role="alert"
+          aria-label="Confirmer la fermeture de la galerie"
+        >
+          <p>
+            Fermer la galerie sans intégrer la sélection ?{" "}
+            {figureSelectionLabel(selectedCount)} ser
+            {selectedCount > 1 ? "ont" : "a"} perdue
+            {selectedCount > 1 ? "s" : ""}.
+          </p>
+          <button
+            ref={keepSelectionRef}
+            className="button"
+            type="button"
+            onClick={dismissCloseConfirmation}
+          >
+            Continuer la sélection
+          </button>
+          <button
+            className="button button--secondary"
+            type="button"
+            onClick={closeNow}
+          >
+            Fermer sans enregistrer
+          </button>
+        </div>
+      ) : null}
 
       <div className="editorial-figure-gallery__toolbar">
         <label>
@@ -360,8 +415,7 @@ export function SourceFigureGallery({
                         <p
                           className={`editorial-figure-status editorial-figure-status--${item.status}`}
                         >
-                          {STATUS_LABELS[item.status]}
-                          {item.already_used ? " · Déjà utilisée" : ""}
+                          {figureStatusLabel(item)}
                         </p>
                         {exclusionReason ? (
                           <p
@@ -471,7 +525,7 @@ export function SourceFigureGallery({
                     <p
                       className={`editorial-figure-status editorial-figure-status--${preview.status}`}
                     >
-                      {STATUS_LABELS[preview.status]}
+                      {figureStatusLabel(preview)}
                     </p>
                     {figureExclusionReason(preview) ? (
                       <p>{figureExclusionReason(preview)}</p>
@@ -524,13 +578,18 @@ export function SourceFigureGallery({
       aria-modal="true"
       onCancel={(event) => {
         event.preventDefault();
-        close();
+        if (confirmClose) dismissCloseConfirmation();
+        else requestClose();
       }}
       onKeyDown={(event) => {
-        if (event.key === "Escape") close();
+        if (event.key !== "Escape") return;
+        if (confirmClose) dismissCloseConfirmation();
+        else requestClose();
       }}
       onClick={(event) => {
-        if (event.target === event.currentTarget) close();
+        if (event.target !== event.currentTarget) return;
+        if (confirmClose) dismissCloseConfirmation();
+        else requestClose();
       }}
     >
       {content}

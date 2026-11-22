@@ -26,6 +26,8 @@ interface EditorialConversationProps {
   onProposalPromptApplied?: () => void;
   onChangeTarget: () => void;
   onPendingProposalsChange?: (pending: boolean) => void;
+  /** False while another inspector tab hides the Discussion panel. */
+  discussionVisible?: boolean;
 }
 
 export function EditorialConversation({
@@ -38,6 +40,7 @@ export function EditorialConversation({
   onProposalPromptApplied,
   onChangeTarget,
   onPendingProposalsChange,
+  discussionVisible = true,
 }: EditorialConversationProps) {
   const drafts = useEditorialConversationDrafts(occurrenceId);
   const visualContext = useVisualWorkspaceContext();
@@ -153,6 +156,7 @@ export function EditorialConversation({
       <EditorialConversationStatus
         data={lifecycle.threadQuery.data}
         isPending={lifecycle.threadQuery.isPending}
+        announceInPortal={!discussionVisible}
         queryErrorMessage={
           lifecycle.threadQuery.isError
             ? lifecycle.threadQuery.error.message
@@ -228,11 +232,6 @@ export function EditorialConversation({
                   operation === "rewrite_paragraph" ||
                   operation === "create_table",
               )
-            }
-            proposalLabel={
-              allowedOperations.includes("create_table")
-                ? "Demander au Bridge"
-                : undefined
             }
             controlsLocked={lifecycle.controlsLocked}
             hasQueryError={lifecycle.threadQuery.isError}
