@@ -15,12 +15,15 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 from sidecars.workspace_agent.sessions import fake_cli as fake_cli_module
+from sidecars.workspace_agent.sessions.state import SecretUnavailableError
 from sidecars.workspace_agent.sessions.supervisor import (
+    AF_UNIX_SUN_PATH_MAX,
+    IPC_DIRECTORY,
+    SESSION_SOCKET_FILE_NAME,
     FakeProfile,
     PrepareSessionRequest,
     ProfileRegistry,
@@ -30,7 +33,7 @@ from sidecars.workspace_agent.sessions.supervisor import (
     StartSessionRequest,
 )
 
-from tests.workspace_agent.conftest import REPOSITORY_ROOT
+from tests.workspace_agent.conftest import REPOSITORY_ROOT, short_socket_base
 from tests.workspace_agent.sessions_support import (
     CLOSE_KEY,
     FAKE_CLI_PATH,
@@ -58,16 +61,6 @@ from tests.workspace_agent.sessions_support import (
     write_fake_script,
 )
 from tests.workspace_agent.w3_support import make_scan_environment
-
-
-@pytest.fixture
-def session_base() -> Iterator[Path]:
-    """A short base under ``/tmp`` so the per-session UDS path fits 108 bytes."""
-    path = Path(tempfile.mkdtemp(prefix="m24h1-"))
-    try:
-        yield path
-    finally:
-        shutil.rmtree(path, ignore_errors=True)
 
 
 def _prepare(client, running, workspace_id: str, **kwargs: object):
@@ -714,3 +707,68 @@ def test_fake_cli_module_is_standalone_and_deterministic() -> None:
     )
     assert completed.returncode == 0, completed.stderr
     assert time.monotonic() - started < 30
+
+
+def test_short_socket_base_ignores_a_polluted_process_tempdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A leaked ``tempfile.gettempdir()`` cache must never move a test socket."""
+    polluted = tmp_path / ("nested-" * 12)
+    polluted.mkdir()
+    monkeypatch.setenv("TMPDIR", str(polluted))
+    monkeypatch.setattr(tempfile, "tempdir", str(polluted))
+    base = short_socket_base("m24-polluted-")
+    try:
+        assert not base.is_relative_to(polluted)
+        socket_path = (
+            base / "run" / "sessions" / SESSION_ID / IPC_DIRECTORY / SESSION_SOCKET_FILE_NAME
+        )
+        assert len(os.fsencode(socket_path)) <= AF_UNIX_SUN_PATH_MAX, socket_path
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_sidecar_prepares_a_session_under_a_polluted_process_tempdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reproduce the CI leak: a long leaked TMPDIR must not break the sidecar."""
+    polluted = tmp_path / ("nested-" * 12)
+    polluted.mkdir()
+    monkeypatch.setenv("TMPDIR", str(polluted))
+    monkeypatch.setattr(tempfile, "tempdir", str(polluted))
+    base = short_socket_base("m24-polluted-")
+    try:
+        with running_session_agent(base) as running, running.client() as client:
+            workspace_id = running.ensure_workspace(client)
+            prepared = post_session(
+                client, running, "/v1/sessions", prepare_payload(workspace_id), PREPARE_KEY
+            )
+            assert prepared.status_code == 200, prepared.text
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_prepare_fails_closed_when_the_session_socket_path_is_too_long(
+    session_base: Path,
+) -> None:
+    environment = make_scan_environment(session_base)
+    config = SessionSupervisorConfig(
+        runtime_root=session_base / ("d" * 120),
+        workspace_root=environment.root,
+    )
+    supervisor = SessionSupervisor(
+        config,
+        workspaces=environment.manager,
+        scans=environment.service(),
+        profiles=ProfileRegistry((FakeProfile(),)),
+    )
+    try:
+        request = PrepareSessionRequest.from_payload(prepare_payload(environment.workspace_id))
+        with pytest.raises(SecretUnavailableError) as excinfo:
+            supervisor.prepare(
+                request, idempotency_key="m24-h1-prepare-long-1", body_sha256="a" * 64
+            )
+        assert excinfo.value.details == {"reason": "session_socket_path_too_long"}
+        assert not (config.session_root / SESSION_ID).exists()
+    finally:
+        supervisor.stop()

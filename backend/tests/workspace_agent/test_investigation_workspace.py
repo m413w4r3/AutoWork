@@ -324,10 +324,12 @@ async def _local_agent(root: Path, runtime_dir: Path) -> AsyncIterator[Workspace
         await asyncio.to_thread(thread.join, 15)
 
 
-async def test_sync_resyncs_after_a_generation_change(tmp_path: Path) -> None:
+async def test_sync_resyncs_after_a_generation_change(
+    tmp_path: Path, socket_runtime_dir: Path
+) -> None:
     root = tmp_path / "workspaces"
     root.mkdir()
-    runtime_dir = tmp_path / "run"
+    runtime_dir = socket_runtime_dir
     store = make_chain(subject_slug="bluemoon-cn")
     client = HttpWorkspaceAgentClient(
         socket_path=str(runtime_dir / "workspace-agent.sock"),

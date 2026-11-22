@@ -76,6 +76,9 @@ IPC_DIRECTORY = "ipc"
 STATE_FILE_MODE = 0o600
 PRIVATE_DIRECTORY_MODE = 0o700
 
+# Linux ``sockaddr_un.sun_path`` holds 108 bytes including the trailing NUL.
+AF_UNIX_SUN_PATH_MAX = 107
+
 PROBE_VERSION = "fake-cli-1"
 FAKE_HELP_DIGEST = hashlib.sha256(b"autowork-fake-cli --help v1\n").hexdigest()
 MAX_PROMPT_BYTES = 256 * 1024
@@ -1222,6 +1225,13 @@ class SessionSupervisor:
             prompt_sha256 = hashlib.sha256(prompt_bytes).hexdigest()
             now = self._now()
             session_directory = self._config.session_root / request.session_id
+            if (
+                len(os.fsencode(session_directory / IPC_DIRECTORY / SESSION_SOCKET_FILE_NAME))
+                > AF_UNIX_SUN_PATH_MAX
+            ):
+                # Fail closed with an explicit reason rather than an opaque
+                # bind OSError after the session layout was created.
+                raise SecretUnavailableError(reason="session_socket_path_too_long")
             self._create_session_layout(session_directory)
             try:
                 self._write_bytes(session_directory / PROMPT_FILE_NAME, prompt_bytes)

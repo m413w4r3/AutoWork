@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Iterator
 from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -367,10 +368,32 @@ def test_preview_without_eligible_findings_has_no_empty_or_invented_ioc_section(
     assert "f" * 64 not in str(model.content_sections)
 
 
+@pytest.fixture
+def typst_tmpdir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Path]:
+    """Give the renders a dedicated TMPDIR and never leak the cached global.
+
+    ``tempfile.gettempdir()`` caches its first answer for the whole pytest
+    process. Clearing the cache around only one render is not enough: a later
+    render re-caches this pytest tmp directory while TMPDIR is still patched,
+    and every following test then creates AF_UNIX sockets under a path that
+    overflows ``sun_path`` (108 bytes).
+    """
+    repository_tmp = tmp_path / ".tmp-typst-w17"
+    repository_tmp.mkdir(parents=True, exist_ok=True)
+    previous = tempfile.tempdir
+    monkeypatch.setenv("TMPDIR", str(repository_tmp))
+    tempfile.tempdir = None
+    try:
+        yield repository_tmp
+    finally:
+        tempfile.tempdir = previous
+
+
 @pytest.mark.asyncio
 async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    typst_tmpdir: Path,
 ) -> None:
     """Documented fixture: source report says alpha.example; local DNS adds one limited clue."""
     typst_binary = os.environ.get("TYPST_BINARY", "typst")
@@ -405,11 +428,7 @@ async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
     assert findings[0].observation_refs == (observations[0].id,)
 
     template_root, font_root, fonts_lock = typst_bundle_paths()
-    repository_tmp = tmp_path / ".tmp-typst-w17"
-    repository_tmp.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setenv("TMPDIR", str(repository_tmp))
     monkeypatch.setenv("AUTOWORK_LOTC_PREVIEW_PATH", str(tmp_path / "w17-draft-preview.pdf"))
-    tempfile.tempdir = None
     service = PublicationRenderService(
         uow_factory=cast(Any, object()),
         artifact_store=cast(Any, object()),
@@ -420,10 +439,7 @@ async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
         font_bundle_root=font_root,
         typst_fonts_lock_path=fonts_lock,
     )
-    try:
-        draft_render = await service.render_draft_preview(document, opinion, synthesis)
-    finally:
-        tempfile.tempdir = None
+    draft_render = await service.render_draft_preview(document, opinion, synthesis)
 
     compiled = draft_render.compiled_document
     expected_sha256 = hashlib.sha256(compiled.content).hexdigest()

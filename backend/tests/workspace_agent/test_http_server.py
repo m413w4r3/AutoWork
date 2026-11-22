@@ -236,12 +236,11 @@ def test_group_or_other_writable_runtime_dir_is_refused(tmp_path: Path) -> None:
 
 
 def test_foreign_runtime_dir_needs_the_explicit_flag(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, socket_runtime_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "workspaces"
     root.mkdir()
-    runtime_dir = tmp_path / "run"
-    runtime_dir.mkdir()
+    runtime_dir = socket_runtime_dir
     os.chmod(runtime_dir, 0o750)
     foreign_uid = os.geteuid() + 1
     monkeypatch.setattr(os, "geteuid", lambda: foreign_uid)
@@ -271,11 +270,12 @@ def test_existing_non_socket_path_is_never_deleted(tmp_path: Path) -> None:
     assert placeholder.read_text() == "not a socket"
 
 
-def test_stale_socket_path_is_replaced_and_removed_on_stop(tmp_path: Path) -> None:
+def test_stale_socket_path_is_replaced_and_removed_on_stop(
+    tmp_path: Path, socket_runtime_dir: Path
+) -> None:
     root = tmp_path / "workspaces"
     root.mkdir()
-    runtime_dir = tmp_path / "run"
-    runtime_dir.mkdir()
+    runtime_dir = socket_runtime_dir
     os.chmod(runtime_dir, 0o750)
     socket_path = runtime_dir / SOCKET_FILE_NAME
     stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -292,10 +292,10 @@ def test_stale_socket_path_is_replaced_and_removed_on_stop(tmp_path: Path) -> No
     assert not os.path.exists(socket_path)
 
 
-def test_second_instance_exits_73(tmp_path: Path) -> None:
+def test_second_instance_exits_73(tmp_path: Path, socket_runtime_dir: Path) -> None:
     root = tmp_path / "workspaces"
     root.mkdir()
-    runtime_dir = tmp_path / "run"
+    runtime_dir = socket_runtime_dir
     env = agent_environment()
     argv = agent_argv(root, runtime_dir)
     first = subprocess.Popen(
