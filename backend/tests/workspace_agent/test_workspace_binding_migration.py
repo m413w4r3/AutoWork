@@ -29,6 +29,10 @@ WORKSPACE_TABLES = (
     "workspace_sync_cursors",
 )
 
+# Migration 0021 adds the deferred revision -> task foreign key (ADR-0011 D2/E9)
+# once ``investigation_tasks`` exists; it is not part of 0019's declaration.
+LATER_CONSTRAINT_NAMES = frozenset({"fk_workspace_file_revisions_task"})
+
 
 def _normalize_default(value: object) -> str | None:
     if value is None:
@@ -91,7 +95,7 @@ def test_orm_tables_match_the_migration_declaration() -> None:
             constraint.name
             for constraint in orm_table.constraints
             if not isinstance(constraint, sa.PrimaryKeyConstraint)
-        } == {
+        } - LATER_CONSTRAINT_NAMES == {
             constraint.name
             for constraint in migration_table.constraints
             if not isinstance(constraint, sa.PrimaryKeyConstraint)

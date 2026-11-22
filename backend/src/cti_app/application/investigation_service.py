@@ -154,6 +154,7 @@ from cti_app.domain.investigation import (
     NoveltyClass,
     TLPLevel,
     ToolInvocation,
+    ToolInvocationActorKind,
     ToolInvocationStatus,
     canonical_json_bytes,
     thaw_json,
@@ -1631,9 +1632,17 @@ class InvestigationService:
         purpose: str,
         operation_key: str,
         actor_id: str | None = None,
+        task_id: UUID | None = None,
+        actor_kind: ToolInvocationActorKind | None = None,
         check_stop_before_dispatch: bool = True,
     ) -> tuple[ToolInvocation, ToolResult, tuple[UUID, ...], bool]:
-        """Persist budget and RUNNING invocation before using the shared dispatcher."""
+        """Persist budget and RUNNING invocation before using the shared dispatcher.
+
+        ``task_id``/``actor_kind``/``actor_id`` record M24 execution attribution
+        (ADR-0011 E4).  ``actor_id`` is written on the invocation only when an
+        actor kind is supplied, so legacy operator callers that pass an actor
+        for the execution context keep an unattributed journal row.
+        """
         registered = self._registry.get(tool_name, schema_version)
         definition = registered[0] if registered else None
         requested_cost = thaw_json(definition.cost_model) if definition is not None else {}
@@ -1776,6 +1785,9 @@ class InvestigationService:
             passive_read_retry_trusted=passive_read_retry_trusted,
             purpose=purpose,
             reserved_budget=requested_cost,
+            task_id=task_id,
+            actor_kind=actor_kind,
+            actor_id=actor_id if actor_kind is not None else None,
         )
         invocation = await self._invocations.add_if_absent(invocation)
         if tool_name in _VT_COORDINATED_READ_TOOLS:

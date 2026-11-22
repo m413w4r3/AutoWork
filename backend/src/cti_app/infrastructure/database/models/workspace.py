@@ -2,8 +2,8 @@
 
 Metadata only: the canonical store never receives workspace bytes through these
 tables. ``workspace_file_revisions`` is uniquely identified per file, so the
-same revision id on another path is a different record; ``task_id`` has no FK
-yet (added by a later migration when ``investigation_tasks`` exists).
+same revision id on another path is a different record; ``task_id`` gains its
+FK to ``investigation_tasks`` in migration 0021, once that table exists.
 """
 
 from datetime import datetime
@@ -117,7 +117,15 @@ class WorkspaceFileRevisionRow(Base):
     mtime_ns: Mapped[int] = mapped_column(BigInteger, nullable=False)
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     origin: Mapped[str] = mapped_column(String(16), nullable=False)
-    task_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    task_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey(
+            "investigation_tasks.id",
+            name="fk_workspace_file_revisions_task",
+            ondelete="RESTRICT",
+        ),
+        nullable=True,
+    )
     supersedes_revision_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 

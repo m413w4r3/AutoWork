@@ -66,11 +66,12 @@ ANALYST_INVESTIGATION_STAGE_VALUES_SQL = (
 ANALYST_DECISION_VALUES_SQL = (
     "'member_validate', 'member_reject', 'feature_validate', 'feature_reject', "
     "'pivot_approve', 'pivot_reject', 'note_approve', 'note_changes_requested', "
-    "'detection_approve', 'detection_reject', 'plan_accept', 'plan_reject'"
+    "'detection_approve', 'detection_reject', 'plan_accept', 'plan_reject', "
+    "'task_result_accept', 'task_result_changes_requested'"
 )
 ANALYST_DECISION_TARGET_VALUES_SQL = (
     "'member', 'feature', 'tool', 'invariant', 'pivot', 'corpus', 'detection', 'note', "
-    "'plan_version'"
+    "'plan_version', 'task'"
 )
 PROSE_AUTHORITY_VALUES_SQL = "'legacy', 'bridge_only'"
 SAMPLE_ACQUISITION_REASON_VALUES_SQL = "'seed', 'hit_review'"

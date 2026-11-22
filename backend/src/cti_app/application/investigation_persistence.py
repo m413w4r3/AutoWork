@@ -9,8 +9,8 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Protocol
 from uuid import UUID
 
@@ -22,6 +22,7 @@ from cti_app.application.context_pagination import (
     make_keyset_page,
     order_keyset_items,
 )
+from cti_app.application.investigation_task_events import TaskEvent
 from cti_app.domain.analyst_opinion import AnalystOpinionV1, validate_analyst_opinion_rebase
 from cti_app.domain.investigation import (
     DetectionCandidateVersion,
@@ -37,6 +38,7 @@ from cti_app.domain.investigation_plan import (
     InvestigationPlanHead,
     InvestigationPlanVersion,
 )
+from cti_app.domain.investigation_task import InvestigationTaskV1, TaskStatus
 
 if TYPE_CHECKING:
     from cti_app.application.workspace_agent import (
@@ -306,6 +308,84 @@ class InvestigationPlanRepository(Protocol):
         *,
         expected_current_version: int | None,
     ) -> tuple[InvestigationPlanVersion, bool]: ...
+
+
+class InvestigationTaskRepository(Protocol):
+    """Durable tasks, append-only dependencies and the event journal (D3).
+
+    ``lock_task`` plus ``advance_event_sequence`` make
+    :func:`~cti_app.application.investigation_task_events.append_task_event`
+    the sole writer of ``event_sequence``; ``update_status`` is the business
+    status CAS and never writes it.  Lease primitives live here because lot
+    04B2 owns the engine, not the schema.
+    """
+
+    async def lock_investigation(self, investigation_id: UUID) -> None: ...
+
+    async def get(self, task_id: UUID) -> InvestigationTaskV1 | None: ...
+
+    async def get_by_task_key(
+        self, investigation_id: UUID, task_key: str
+    ) -> InvestigationTaskV1 | None: ...
+
+    async def list_for_investigation(
+        self, investigation_id: UUID
+    ) -> tuple[InvestigationTaskV1, ...]: ...
+
+    async def list_children(self, parent_task_id: UUID) -> tuple[InvestigationTaskV1, ...]: ...
+
+    async def list_dependencies(self, task_id: UUID) -> tuple[UUID, ...]: ...
+
+    async def list_dependents(self, depends_on_task_id: UUID) -> tuple[UUID, ...]: ...
+
+    async def get_event(self, task_id: UUID, idempotency_key: str) -> TaskEvent | None: ...
+
+    async def list_events(self, task_id: UUID) -> tuple[TaskEvent, ...]: ...
+
+    async def lock_task(self, task_id: UUID) -> InvestigationTaskV1 | None: ...
+
+    async def add(self, task: InvestigationTaskV1) -> InvestigationTaskV1: ...
+
+    async def add_dependency(
+        self,
+        *,
+        investigation_id: UUID,
+        task_id: UUID,
+        depends_on_task_id: UUID,
+    ) -> None: ...
+
+    async def update_status(
+        self,
+        task: InvestigationTaskV1,
+        *,
+        expected_status_version: int,
+        expected_status: TaskStatus,
+    ) -> InvestigationTaskV1 | None: ...
+
+    async def acquire_lease(
+        self,
+        task_id: UUID,
+        *,
+        expected_status_version: int,
+        lease_id: UUID,
+        lease_session_id: UUID,
+        now: datetime,
+        ttl_seconds: int,
+    ) -> InvestigationTaskV1 | None: ...
+
+    async def renew_lease(
+        self,
+        task_id: UUID,
+        *,
+        expected_status_version: int,
+        expected_lease_fence: int,
+        now: datetime,
+        ttl_seconds: int,
+    ) -> InvestigationTaskV1 | None: ...
+
+    async def advance_event_sequence(self, task_id: UUID) -> int: ...
+
+    async def add_event(self, event: TaskEvent) -> TaskEvent: ...
 
 
 def _copy_budget(budget: InvestigationBudget) -> InvestigationBudget:
@@ -1060,6 +1140,232 @@ class InMemoryInvestigationPlanRepository:
             return version, True
 
 
+class InMemoryInvestigationTaskRepository:
+    """In-memory port fake sharing the SQL repository's observable rules."""
+
+    def __init__(self) -> None:
+        self._tasks: dict[UUID, InvestigationTaskV1] = {}
+        self._dependencies: set[tuple[UUID, UUID]] = set()
+        self._events: list[TaskEvent] = []
+        self._lock = asyncio.Lock()
+
+    async def lock_investigation(self, investigation_id: UUID) -> None:
+        return None
+
+    async def get(self, task_id: UUID) -> InvestigationTaskV1 | None:
+        return self._tasks.get(task_id)
+
+    async def get_by_task_key(
+        self, investigation_id: UUID, task_key: str
+    ) -> InvestigationTaskV1 | None:
+        return next(
+            (
+                task
+                for task in self._tasks.values()
+                if task.investigation_id == investigation_id and task.task_key == task_key
+            ),
+            None,
+        )
+
+    async def list_for_investigation(
+        self, investigation_id: UUID
+    ) -> tuple[InvestigationTaskV1, ...]:
+        return tuple(
+            sorted(
+                (
+                    task
+                    for task in self._tasks.values()
+                    if task.investigation_id == investigation_id
+                ),
+                key=lambda task: (task.created_at, str(task.id)),
+            )
+        )
+
+    async def list_children(self, parent_task_id: UUID) -> tuple[InvestigationTaskV1, ...]:
+        return tuple(
+            sorted(
+                (task for task in self._tasks.values() if task.parent_task_id == parent_task_id),
+                key=lambda task: (task.created_at, str(task.id)),
+            )
+        )
+
+    async def list_dependencies(self, task_id: UUID) -> tuple[UUID, ...]:
+        return tuple(
+            sorted(depends_on for task, depends_on in self._dependencies if task == task_id)
+        )
+
+    async def list_dependents(self, depends_on_task_id: UUID) -> tuple[UUID, ...]:
+        return tuple(
+            sorted(
+                task for task, depends_on in self._dependencies if depends_on == depends_on_task_id
+            )
+        )
+
+    async def get_event(self, task_id: UUID, idempotency_key: str) -> TaskEvent | None:
+        return next(
+            (
+                event
+                for event in self._events
+                if event.task_id == task_id and event.idempotency_key == idempotency_key
+            ),
+            None,
+        )
+
+    async def list_events(self, task_id: UUID) -> tuple[TaskEvent, ...]:
+        return tuple(
+            sorted(
+                (event for event in self._events if event.task_id == task_id),
+                key=lambda event: event.sequence,
+            )
+        )
+
+    async def lock_task(self, task_id: UUID) -> InvestigationTaskV1 | None:
+        return self._tasks.get(task_id)
+
+    async def add(self, task: InvestigationTaskV1) -> InvestigationTaskV1:
+        async with self._lock:
+            existing = await self.get_by_task_key(task.investigation_id, task.task_key)
+            if existing is not None:
+                if existing != task:
+                    raise VersionConflictError("Task key already materialised a different task")
+                return existing
+            if task.id in self._tasks:
+                raise VersionConflictError("Task id is already used")
+            self._tasks[task.id] = task
+            return task
+
+    async def add_dependency(
+        self,
+        *,
+        investigation_id: UUID,
+        task_id: UUID,
+        depends_on_task_id: UUID,
+    ) -> None:
+        if task_id == depends_on_task_id:
+            raise ValueError("A task cannot depend on itself")
+        task = self._tasks.get(task_id)
+        dependency = self._tasks.get(depends_on_task_id)
+        if (
+            task is None
+            or task.investigation_id != investigation_id
+            or dependency is None
+            or dependency.investigation_id != investigation_id
+        ):
+            raise VersionConflictError("A dependency must join two tasks of one investigation")
+        async with self._lock:
+            self._dependencies.add((task_id, depends_on_task_id))
+
+    async def update_status(
+        self,
+        task: InvestigationTaskV1,
+        *,
+        expected_status_version: int,
+        expected_status: TaskStatus,
+    ) -> InvestigationTaskV1 | None:
+        if task.status_version != expected_status_version + 1:
+            raise ValueError("A status change increments status_version exactly once")
+        if task.status is expected_status:
+            raise ValueError("A status change must change the status")
+        async with self._lock:
+            current = self._tasks.get(task.id)
+            if (
+                current is None
+                or current.status_version != expected_status_version
+                or current.status is not expected_status
+            ):
+                return None
+            self._tasks[task.id] = task
+            return task
+
+    async def acquire_lease(
+        self,
+        task_id: UUID,
+        *,
+        expected_status_version: int,
+        lease_id: UUID,
+        lease_session_id: UUID,
+        now: datetime,
+        ttl_seconds: int,
+    ) -> InvestigationTaskV1 | None:
+        if ttl_seconds < 1:
+            raise ValueError("ttl_seconds must be >= 1")
+        async with self._lock:
+            current = self._tasks.get(task_id)
+            if (
+                current is None
+                or current.status_version != expected_status_version
+                or current.status is not TaskStatus.ASSIGNED
+            ):
+                return None
+            updated = replace(
+                current,
+                status=TaskStatus.RUNNING,
+                status_version=current.status_version + 1,
+                lease_id=lease_id,
+                lease_session_id=lease_session_id,
+                lease_fence=current.lease_fence + 1,
+                lease_expires_at=now + timedelta(seconds=ttl_seconds),
+                heartbeat_at=now,
+                updated_at=now,
+            )
+            self._tasks[task_id] = updated
+            return updated
+
+    async def renew_lease(
+        self,
+        task_id: UUID,
+        *,
+        expected_status_version: int,
+        expected_lease_fence: int,
+        now: datetime,
+        ttl_seconds: int,
+    ) -> InvestigationTaskV1 | None:
+        if ttl_seconds < 1:
+            raise ValueError("ttl_seconds must be >= 1")
+        async with self._lock:
+            current = self._tasks.get(task_id)
+            if (
+                current is None
+                or current.status not in (TaskStatus.RUNNING, TaskStatus.AWAITING_INPUT)
+                or current.status_version != expected_status_version
+                or current.lease_fence != expected_lease_fence
+                or current.lease_expires_at is None
+                or current.lease_expires_at <= now
+            ):
+                return None
+            updated = replace(
+                current,
+                heartbeat_at=now,
+                lease_expires_at=now + timedelta(seconds=ttl_seconds),
+                updated_at=now,
+            )
+            self._tasks[task_id] = updated
+            return updated
+
+    async def advance_event_sequence(self, task_id: UUID) -> int:
+        async with self._lock:
+            current = self._tasks.get(task_id)
+            if current is None:
+                raise VersionConflictError("Task disappeared before event append")
+            updated = replace(current, event_sequence=current.event_sequence + 1)
+            self._tasks[task_id] = updated
+            return updated.event_sequence
+
+    async def add_event(self, event: TaskEvent) -> TaskEvent:
+        async with self._lock:
+            if any(
+                existing.task_id == event.task_id
+                and (
+                    existing.sequence == event.sequence
+                    or existing.idempotency_key == event.idempotency_key
+                )
+                for existing in self._events
+            ):
+                raise VersionConflictError("Task event sequence or idempotency key is already used")
+            self._events.append(event)
+            return event
+
+
 __all__ = [
     "AnalystOpinionRepository",
     "DetectionCandidateRepository",
@@ -1072,6 +1378,7 @@ __all__ = [
     "InMemoryInvestigationBudgetRepository",
     "InMemoryInvestigationEnvelopeRepository",
     "InMemoryInvestigationPlanRepository",
+    "InMemoryInvestigationTaskRepository",
     "InMemorySampleAssociationRepository",
     "InMemoryToolInvocationRepository",
     "InMemoryWorkspaceBindingRepository",
@@ -1082,6 +1389,7 @@ __all__ = [
     "InvestigationBudgetSnapshot",
     "InvestigationEnvelopeRepository",
     "InvestigationPlanRepository",
+    "InvestigationTaskRepository",
     "SampleAssociationRepository",
     "ToolInvocationRepository",
     "VersionConflictError",

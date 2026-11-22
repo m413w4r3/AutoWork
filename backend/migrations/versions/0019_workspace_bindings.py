@@ -309,7 +309,14 @@ def _schema_mismatches(bind: Any, table: sa.Table) -> list[str]:
     actual_constraints = _actual_constraint_signature(inspector, table.name)
     for signature in sorted(expected_constraints - actual_constraints, key=repr):
         mismatches.append(f"constraint {signature[1]}: expected {signature}, actual absent")
+    # 0021 adds ``workspace_file_revisions.task_id -> investigation_tasks.id``
+    # (ADR-0011 D2/E9) after the task table exists.  Accept that later additive
+    # object so re-running the chain over a newer schema still recognises 0019's
+    # own shape; every other extra still fails the preflight.
+    later_constraints = {"fk_workspace_file_revisions_task"}
     for signature in sorted(actual_constraints - expected_constraints, key=repr):
+        if signature[1] in later_constraints:
+            continue
         mismatches.append(f"constraint {signature[1]}: expected absent, actual {signature}")
 
     expected_indexes = {
