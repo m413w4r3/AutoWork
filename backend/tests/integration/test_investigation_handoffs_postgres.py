@@ -45,13 +45,14 @@ from cti_app.infrastructure.database.session import (
     create_session_factory,
 )
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
+from tests.integration.alembic_head import current_head
 from tests.integration.conftest import _alembic_config
 from tests.integration.edition_codes import reserve_edition_code
 
 pytestmark = pytest.mark.integration
 
 PREVIOUS = "0021_investigation_tasks"
-HEAD = "0024_work_contributions"
+HEAD = current_head()
 HANDOFF_TABLE = "investigation_handoffs"
 NOW = datetime(2026, 11, 22, 12, 0, tzinfo=UTC)
 HUMAN_ACTOR = HandoffActor(kind=HandoffActorKind.HUMAN, actor_id="analyst:test")

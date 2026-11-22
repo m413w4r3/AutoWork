@@ -66,13 +66,14 @@ from cti_app.infrastructure.database.session import (
     create_session_factory,
 )
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
+from tests.integration.alembic_head import current_head
 from tests.integration.conftest import _alembic_config
 from tests.integration.edition_codes import reserve_edition_code
 
 pytestmark = pytest.mark.integration
 
 PREVIOUS = "0020_investigation_plans"
-HEAD = "0024_work_contributions"
+HEAD = current_head()
 CONTRIBUTIONS_REVISION = "0024_work_contributions"
 TASK_TABLES = {
     "investigation_tasks",
@@ -1118,7 +1119,9 @@ def test_work_contribution_migration_preflight_and_downgrade_guard(
 ) -> None:
     """0024 accepts its shape, refuses a partial one and never drops used rows."""
     config = _alembic_config(temporary_postgres_url)
-    command.upgrade(config, "head")
+    # Stop at the revision under test: a later head's own downgrade would run (and be rolled
+    # back with the whole transaction) before 0024's guard is reached.
+    command.upgrade(config, CONTRIBUTIONS_REVISION)
 
     async def seed_row() -> None:
         engine = create_postgres_engine(temporary_postgres_url)

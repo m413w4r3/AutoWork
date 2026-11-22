@@ -56,13 +56,14 @@ from cti_app.infrastructure.database.session import (
     create_session_factory,
 )
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
+from tests.integration.alembic_head import current_head
 from tests.integration.conftest import _alembic_config
 from tests.integration.edition_codes import reserve_edition_code
 
 pytestmark = pytest.mark.integration
 
 PREVIOUS = "0022_investigation_handoffs"
-HEAD = "0024_work_contributions"
+HEAD = current_head()
 SESSIONS = "agent_sessions"
 INSTRUCTIONS = "agent_session_instructions"
 NOW = datetime(2026, 11, 22, 12, 0, tzinfo=UTC)

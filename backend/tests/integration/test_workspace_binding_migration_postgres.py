@@ -18,6 +18,7 @@ from cti_app.infrastructure.database.session import (
     create_session_factory,
 )
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
+from tests.integration.alembic_head import current_head
 from tests.integration.conftest import _alembic_config
 from tests.integration.test_workspace_agent_persistence_postgres import (
     binding_for,
@@ -26,7 +27,7 @@ from tests.integration.test_workspace_agent_persistence_postgres import (
 
 pytestmark = pytest.mark.integration
 
-CURRENT_HEAD = "0024_work_contributions"
+CURRENT_HEAD = current_head()
 PREVIOUS = "0018_editorial_enrichment_element_operations"
 WORKSPACE_TABLES = {
     "workspace_bindings",
