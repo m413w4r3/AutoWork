@@ -9,17 +9,6 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from tests.workspace_agent.conftest import (
-    REPOSITORY_ROOT,
-    RunningAgent,
-    agent_argv,
-    agent_environment,
-    raw_http_request,
-    response_json,
-    response_status,
-    wait_for_health,
-)
-
 from sidecars.workspace_agent import protocol
 from sidecars.workspace_agent.agent import (
     SOCKET_FILE_NAME,
@@ -34,6 +23,17 @@ from sidecars.workspace_agent.auth import (
     read_token_file,
 )
 from sidecars.workspace_agent.http_server import SocketPathError
+
+from tests.workspace_agent.conftest import (
+    REPOSITORY_ROOT,
+    RunningAgent,
+    agent_argv,
+    agent_environment,
+    raw_http_request,
+    response_json,
+    response_status,
+    wait_for_health,
+)
 
 VALID_WORKSPACE_ID = "ws-" + "a" * 32
 
@@ -84,7 +84,8 @@ def test_bearer_scheme_is_case_insensitive(uds_client, agent_server: RunningAgen
         "/v1/workspaces",
         headers={"Authorization": f"bearer {agent_server.token}"},
     )
-    assert response.status_code == 501
+    assert response.status_code == 200
+    assert response.json()["workspaces"] == []
 
 
 def test_sessions_routes_are_reserved_and_typed(uds_client, agent_server: RunningAgent) -> None:
@@ -96,8 +97,6 @@ def test_sessions_routes_are_reserved_and_typed(uds_client, agent_server: Runnin
 @pytest.mark.parametrize(
     "path",
     [
-        "/v1/workspaces",
-        f"/v1/workspaces/{VALID_WORKSPACE_ID}",
         f"/v1/workspaces/{VALID_WORKSPACE_ID}/files",
         f"/v1/workspaces/{VALID_WORKSPACE_ID}/events",
         f"/v1/workspaces/{VALID_WORKSPACE_ID}/base-samples/{'b' * 64}",
@@ -161,13 +160,13 @@ def test_post_requires_a_valid_idempotency_key(uds_client, agent_server: Running
     assert response.json()["error"] == "invalid_request"
 
 
-def test_post_with_idempotency_key_reaches_the_skeleton_handler(
+def test_post_with_idempotency_key_reaches_the_ensure_handler(
     uds_client, agent_server: RunningAgent
 ) -> None:
     headers = {**agent_server.auth_headers, "Idempotency-Key": "m24-w1-key-0001"}
     response = uds_client.post("/v1/workspaces/ensure", headers=headers, content=b"{}")
-    assert response.status_code == 501
-    assert response.json()["error"] == "not_implemented"
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_request"
 
 
 def test_oversized_json_body_is_refused_with_413(agent_server: RunningAgent) -> None:
