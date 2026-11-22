@@ -34,6 +34,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     retrohunt,
     selection,
     source_media,
+    workspace,
 )
 from cti_app.infrastructure.database.models.base import Base
 
@@ -82,6 +83,14 @@ _EDITORIAL_PROPOSAL_TABLES = frozenset(
     }
 )
 _EDITORIAL_DRAFT_TABLES = frozenset({"editorial_drafts"})
+_WORKSPACE_TABLES = frozenset(
+    {
+        "workspace_bindings",
+        "workspace_file_revisions",
+        "workspace_file_events",
+        "workspace_sync_cursors",
+    }
+)
 _ROUTING_RUN_COLUMNS = frozenset({"routing_decision_id"})
 _COLLECTION_ATTEMPT_ADDITIONS = frozenset(
     {
@@ -132,6 +141,7 @@ def _metadata_for_frozen_baseline() -> MetaData:
             or source_table.name in _EDITORIAL_BRIDGE_GENERATION_SLOT_TABLES
             or source_table.name in _EDITORIAL_PROPOSAL_TABLES
             or source_table.name in _EDITORIAL_DRAFT_TABLES
+            or source_table.name in _WORKSPACE_TABLES
         ):
             continue
         table = source_table.to_metadata(metadata)

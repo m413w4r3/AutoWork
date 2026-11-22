@@ -14,6 +14,10 @@ from cti_app.application.investigation_persistence import (
     InvestigationEnvelopeRepository,
     SampleAssociationRepository,
     ToolInvocationRepository,
+    WorkspaceBindingRepository,
+    WorkspaceFileEventRepository,
+    WorkspaceFileRevisionRepository,
+    WorkspaceSyncCursorRepository,
 )
 from cti_app.application.investigation_persistence import (
     DetectionCandidateRepository as InvestigationDetectionCandidateRepository,
@@ -1242,6 +1246,10 @@ class UnitOfWork(Protocol):
     osint_open_policies: Any
     investigation_budgets: InvestigationBudgetRepository
     investigation_states: InvestigationStateRepository
+    workspace_bindings: WorkspaceBindingRepository
+    workspace_file_revisions: WorkspaceFileRevisionRepository
+    workspace_file_events: WorkspaceFileEventRepository
+    workspace_sync_cursors: WorkspaceSyncCursorRepository
     # Defined further down in this module.
     production_runs: ProductionRunRepository
     production_routing_decisions: ProductionRoutingDecisionRepository

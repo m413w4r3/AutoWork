@@ -112,6 +112,7 @@ def test_schema_uses_a_frozen_baseline_and_additive_c2_revision() -> None:
         "0016_editorial_drafts.py",
         "0017_editorial_proposal_bar_chart_operation.py",
         "0018_editorial_enrichment_element_operations.py",
+        "0019_workspace_bindings.py",
     ]
 
 
