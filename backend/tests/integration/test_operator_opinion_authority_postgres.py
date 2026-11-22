@@ -186,7 +186,7 @@ async def test_bridge_only_opinion_authority_is_enforced_on_postgres(
     synthesis_bytes = ProductionArtifactStore.canonical_json_bytes(
         production_synthesis_to_json(synthesis)
     )
-    observation_bytes = b"harmless integration observation evidence"
+    observation_bytes = b"bridge-only authority integration observation evidence"
     suffix = uuid4().hex
     edition = Edition(
         country=f"Opinion authority {suffix}",
