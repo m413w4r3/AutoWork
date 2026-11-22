@@ -21,7 +21,7 @@ from cti_app.application.production_artifact_store import ProductionArtifactStor
 from cti_app.config import Settings
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
 from cti_app.domain.classification import TLP
-from cti_app.domain.editorial_proposal import EditorialProposalOrigin
+from cti_app.domain.editorial_proposal import EditorialProposalOrigin, EditorialProposalState
 from cti_app.domain.entities import SourceDocument
 from cti_app.domain.production import (
     ProductionArtifact,
@@ -59,6 +59,7 @@ async def _ready_for_production_route(
     uow_factory: UnitOfWorkFactory,
     *,
     article_base: bool = False,
+    duplicate_paragraphs: bool = False,
 ) -> tuple[Any, FastAPI, _NoModelCalls]:
     # `_seed` intentionally does not persist these production inputs. Add the
     # rows needed by the real policy adapter and use IDs returned by the blob
@@ -68,6 +69,7 @@ async def _ready_for_production_route(
         proposal_count=0,
         seed_discovery_lineage=True,
         article_base=article_base,
+        duplicate_paragraphs=duplicate_paragraphs,
     )
     extraction_bytes = ProductionArtifactStore.canonical_json_bytes(
         production_extraction_to_json(seeded.extraction)
@@ -423,4 +425,213 @@ async def test_manual_edit_concurrent_base_fence_has_one_winner(
     assert winner.json()["artifact_version"] == 2
     assert stale.json()["detail"]["code"] == "manual_edit_stale"
     assert "Actualisez" in stale.json()["detail"]["message"]
+    assert model_gateway.calls == []
+
+
+@pytest.mark.asyncio
+async def test_manual_edit_rewrites_the_second_of_two_equal_paragraphs_independently(
+    uow_factory: UnitOfWorkFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # E04: two equal paragraphs in one section share content id and parent
+    # hash. The occurrence ordinal selects the n-th equal paragraph, so each
+    # block keeps an independent canonical edit.
+    monkeypatch.setattr(
+        api_main,
+        "get_settings",
+        lambda: Settings(
+            _env_file=None,
+            app_env="development",
+            api_bind_host="127.0.0.1",
+        ),
+    )
+    seeded, app, model_gateway = await _ready_for_production_route(
+        uow_factory, article_base=True, duplicate_paragraphs=True
+    )
+    monkeypatch.setattr(
+        editorial_workspace_api,
+        "get_settings",
+        lambda: Settings(_env_file=None, editorial_proposal_accept_enabled=True),
+    )
+    monkeypatch.setattr(editorial_workspace_api, "_proposal_impact_consumer_wired", lambda: True)
+    before_payload = production_synthesis_to_json(seeded.synthesis)
+    assert [item["text"] for item in before_payload["sections"][0]["paragraphs"]] == [
+        "Victimologie : Synthetic victims.",
+        "Arsenal : Synthetic tool.",
+        "Arsenal : Synthetic tool.",
+    ]
+    second_revision = "Arsenal : Synthetic tool, reworded as the second occurrence."
+    first_revision = "Arsenal : Synthetic tool, reworded as the first occurrence."
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
+    ) as client:
+        snapshot = await _snapshot(client, seeded.subject.id)
+        paragraphs = [block for block in snapshot["blocks"] if block["kind"] == "paragraph"]
+        assert [block["position"] for block in paragraphs] == [0, 1, 2]
+        first_equal, second_equal = paragraphs[1], paragraphs[2]
+        for block in (first_equal, second_equal):
+            assert block["allowed_operations"] == ["rewrite_paragraph", "delete_paragraph"]
+            assert block["revision_target"]["legacy_target_id"] is None
+        assert first_equal["before_hash"] == second_equal["before_hash"]
+
+        second_response = await client.post(
+            _manual_path(seeded.subject.id, UUID(second_equal["block_id"])),
+            headers={"Idempotency-Key": f"manual-{uuid4().hex}"},
+            json={
+                "snapshot_id": snapshot["snapshot_id"],
+                "operation": "rewrite_paragraph",
+                "text": second_revision,
+            },
+        )
+        assert second_response.status_code == 200, second_response.text
+        assert second_response.json()["artifact_version"] == 2
+        refreshed = await _snapshot(client, seeded.subject.id)
+        first_response = await client.post(
+            _manual_path(seeded.subject.id, UUID(first_equal["block_id"])),
+            headers={"Idempotency-Key": f"manual-{uuid4().hex}"},
+            json={
+                "snapshot_id": refreshed["snapshot_id"],
+                "operation": "rewrite_paragraph",
+                "text": first_revision,
+            },
+        )
+        assert first_response.status_code == 200, first_response.text
+        assert first_response.json()["artifact_version"] == 3
+
+    async with uow_factory() as uow:
+        artifacts = list(await uow.production_artifacts.list_for_run(seeded.run.id))
+        current = await uow.production_artifacts.get_current_for_revision(
+            seeded.run.id, ProductionArtifactStage.SYNTHESIS.value
+        )
+    synthesis_versions = sorted(
+        artifact.version
+        for artifact in artifacts
+        if artifact.stage is ProductionArtifactStage.SYNTHESIS
+    )
+    assert synthesis_versions == [1, 2, 3]
+    assert current is not None and current.version == 3
+    assert current.canonical_blob_id is not None
+    revised_payload = await app.state.production_artifact_store.read_json(current.canonical_blob_id)
+    assert revised_payload["sections"][0]["paragraphs"] == [
+        before_payload["sections"][0]["paragraphs"][0],
+        {
+            "text": first_revision,
+            "evidence_refs": before_payload["sections"][0]["paragraphs"][1]["evidence_refs"],
+        },
+        {
+            "text": second_revision,
+            "evidence_refs": before_payload["sections"][0]["paragraphs"][2]["evidence_refs"],
+        },
+    ]
+    assert revised_payload["lead"] == before_payload["lead"]
+    assert revised_payload["title"] == before_payload["title"]
+    assert model_gateway.calls == []
+
+
+@pytest.mark.asyncio
+async def test_stale_equal_paragraph_ordinal_is_a_conflict_without_overwrite(
+    uow_factory: UnitOfWorkFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A proposal prepared against the second equal paragraph must not be
+    # adopted after a concurrent change of the same artifact: the pin fence
+    # refuses it and the concurrent canonical state is preserved.
+    from starlette.requests import Request
+
+    from cti_app.application.editorial_proposal_adoption import (
+        EditorialProposalAdoptionError,
+    )
+    from cti_app.domain.editorial_proposal import ManualPatch, ManualTextPatch
+    from cti_app.domain.production_editorial_revision import (
+        TargetedEditorialRevisionOperation,
+    )
+
+    monkeypatch.setattr(
+        api_main,
+        "get_settings",
+        lambda: Settings(
+            _env_file=None,
+            app_env="development",
+            api_bind_host="127.0.0.1",
+        ),
+    )
+    seeded, app, model_gateway = await _ready_for_production_route(
+        uow_factory, article_base=True, duplicate_paragraphs=True
+    )
+    monkeypatch.setattr(
+        editorial_workspace_api,
+        "get_settings",
+        lambda: Settings(_env_file=None, editorial_proposal_accept_enabled=True),
+    )
+    monkeypatch.setattr(editorial_workspace_api, "_proposal_impact_consumer_wired", lambda: True)
+    request = Request({"type": "http", "app": app, "headers": [], "method": "POST", "path": "/"})
+    actor_id = uuid5(NAMESPACE_URL, "autowork-actor:dev-analyst")
+    concurrent_revision = "Arsenal : Synthetic tool, reworded concurrently."
+    stale_revision = "Arsenal : Synthetic tool, reworded by the stale proposal."
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
+    ) as client:
+        snapshot = await _snapshot(client, seeded.subject.id)
+        paragraphs = [block for block in snapshot["blocks"] if block["kind"] == "paragraph"]
+        first_equal, second_equal = paragraphs[1], paragraphs[2]
+        proposal = await editorial_workspace_api._manual_proposal_service(
+            request
+        ).prepare_manual_patch(
+            subject_id=seeded.subject.id,
+            snapshot_id=UUID(snapshot["snapshot_id"]),
+            occurrence_id=UUID(second_equal["block_id"]),
+            actor_id=actor_id,
+            idempotency_key=f"manual-{uuid4().hex}",
+            patch=ManualPatch(
+                typed_patch=ManualTextPatch(
+                    TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH,
+                    stale_revision,
+                )
+            ),
+        )
+        assert proposal.state.value == "proposed"
+        concurrent = await client.post(
+            _manual_path(seeded.subject.id, UUID(first_equal["block_id"])),
+            headers={"Idempotency-Key": f"manual-{uuid4().hex}"},
+            json={
+                "snapshot_id": snapshot["snapshot_id"],
+                "operation": "rewrite_paragraph",
+                "text": concurrent_revision,
+            },
+        )
+        assert concurrent.status_code == 200, concurrent.text
+        assert concurrent.json()["artifact_version"] == 2
+
+    adoption = editorial_workspace_api._proposal_adoption_service(request)
+    with pytest.raises(EditorialProposalAdoptionError) as conflict:
+        await adoption.adopt(
+            seeded.subject.id,
+            UUID(second_equal["block_id"]),
+            proposal.id,
+            actor_id=actor_id,
+            expected_state_version=proposal.state_version,
+            patch_sha256=proposal.patch_sha256 or "",
+            idempotency_key=f"manual-accept-{uuid4().hex}",
+        )
+    # The concurrent acceptance marks proposals fenced on changed pins STALE;
+    # the adoption then refuses the stale ordinal/proposal without writing.
+    assert conflict.value.code == "proposal_state_conflict"
+
+    async with uow_factory() as uow:
+        stored = await uow.editorial_proposals.get_for_occurrence(
+            seeded.subject.id,
+            UUID(second_equal["block_id"]),
+            proposal.id,
+        )
+        current = await uow.production_artifacts.get_current_for_revision(
+            seeded.run.id, ProductionArtifactStage.SYNTHESIS.value
+        )
+    assert stored is not None and stored.state is EditorialProposalState.STALE
+    assert current is not None and current.version == 2
+    assert current.canonical_blob_id is not None
+    revised_payload = await app.state.production_artifact_store.read_json(current.canonical_blob_id)
+    assert revised_payload["sections"][0]["paragraphs"][1]["text"] == concurrent_revision
+    assert revised_payload["sections"][0]["paragraphs"][2]["text"] == "Arsenal : Synthetic tool."
     assert model_gateway.calls == []

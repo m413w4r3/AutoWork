@@ -17,7 +17,8 @@ import {
  * frontend client and the real routes fails loudly.
  *
  * The launcher publishes the synthetic fixture state under
- * `/api/editorial-browser/state`: six paragraphs, one archived table and four
+ * `/api/editorial-browser/state`: eight paragraphs (its last two are equal for
+ * the E04 flow), one archived table and four
  * archived figures (three integrated through the real manual routes, one left
  * available for replacement).
  */
@@ -268,15 +269,16 @@ test("real-backend smoke: the seeded PostgreSQL workspace renders in the browser
     snapshot.blocks.filter((block) =>
       ["paragraph", "lead_paragraph"].includes(block.kind),
     ),
-  ).toHaveLength(6);
+  ).toHaveLength(8);
   expectNoModelOrBridgeCall(capture);
 });
 
 // Ordering contract: this suite shares ONE seeded workspace. A canonical
-// synthesis rewrite (E01/E01b) changes the evidence-pack hash the visual
+// synthesis rewrite (E01/E01b/E04) changes the evidence-pack hash the visual
 // revision loader fences against the base enrichment artifact, so the visual
 // element revisions (E10-E13) must run first. The seed is rebuilt per suite,
-// not per test.
+// not per test. E04 edits one paragraph of the equal pair appended to the
+// seeded section, so it can run after the other synthesis rewrites.
 test("E10 moving a figure after another paragraph persists and marks the PDF stale", async ({
   page,
 }) => {
@@ -596,4 +598,83 @@ test("E01b the lead paragraph can be edited from the document action bar", async
     snapshot.blocks.find((candidate) => candidate.block_id === lead.block_id)
       ?.text,
   ).toBe(revised);
+});
+
+test("E04 — deux paragraphes identiques modifiés indépendamment", async ({
+  page,
+}) => {
+  const capture = captureNetwork(page);
+  const state = await browserState(page);
+  const duplicateText = "Acceptance duplicate paragraph.";
+  const duplicates = state.paragraphs.filter(
+    (paragraph) => paragraph.text === duplicateText,
+  );
+  expect(
+    duplicates,
+    "the launcher must seed two equal paragraphs in the same section",
+  ).toHaveLength(2);
+  const [first, second] = duplicates;
+  expect(first.block_id).not.toBe(second.block_id);
+  const revised = `${duplicateText} Synthetic second-occurrence revision.`;
+
+  const snapshotBefore = await getSnapshot(page, state.subject_id);
+  const duplicateBlocks = snapshotBefore.blocks.filter((block) =>
+    duplicates.some((duplicate) => duplicate.block_id === block.block_id),
+  );
+  expect(duplicateBlocks.map((block) => block.text)).toEqual([
+    duplicateText,
+    duplicateText,
+  ]);
+  for (const block of duplicateBlocks) {
+    expect(
+      block.allowed_operations,
+      "both equal occurrences must advertise an independent text edit",
+    ).toContain("rewrite_paragraph");
+  }
+
+  await openEditor(page, state.subject_id);
+  const block = page.locator(
+    `.editorial-document__block[data-block-id="${second.block_id}"]`,
+  );
+  await block.click();
+  await expect(block).toHaveAttribute("data-selected", "true");
+  const toolbar = page.getByRole("toolbar", { name: /Actions du bloc/ });
+  await toolbar.getByRole("button", { name: "Modifier" }).click();
+  const editor = page.getByRole("textbox", { name: "Texte du bloc" });
+  await expect(editor).toBeFocused();
+  await editor.fill(revised);
+  await page.getByRole("button", { name: "Enregistrer", exact: true }).click();
+
+  await expectOperationResponses(
+    capture,
+    /\/editor\/blocks\/[^/]+\/manual-edit$/,
+  );
+  await expect(page.getByText(/Enregistré · v\d+/)).toBeVisible();
+  expectNoModelOrBridgeCall(capture);
+
+  await page.reload();
+  await expect(page.locator(".editorial-document")).toBeVisible();
+  const snapshotAfter = await getSnapshot(page, state.subject_id);
+  const persistedFirst = snapshotAfter.blocks.find(
+    (candidate) => candidate.block_id === first.block_id,
+  );
+  const persistedSecond = snapshotAfter.blocks.find(
+    (candidate) => candidate.block_id === second.block_id,
+  );
+  expect(
+    persistedFirst?.text,
+    "editing the second equal paragraph must leave the first byte-identical",
+  ).toBe(duplicateText);
+  expect(persistedSecond?.text).toBe(revised);
+
+  await expect(
+    page.locator(
+      `.editorial-document__block[data-block-id="${first.block_id}"]`,
+    ),
+  ).toContainText(duplicateText);
+  await expect(
+    page.locator(
+      `.editorial-document__block[data-block-id="${second.block_id}"]`,
+    ),
+  ).toContainText(revised);
 });

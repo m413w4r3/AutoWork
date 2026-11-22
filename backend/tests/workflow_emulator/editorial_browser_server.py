@@ -14,7 +14,8 @@ No live provider is reachable from this process:
 * the launcher refuses to boot without an explicit fake-provider attestation and
   a loopback PostgreSQL DSN.
 
-The seeded document is the F5 acceptance fixture: six paragraphs, one archived
+The seeded document is the F5 acceptance fixture: eight paragraphs (the last
+two section paragraphs are equal for the E04 flow), one archived
 table and four archived figures. The fixture routes to BRIEF because the same
 builder's ARTICLE routing does not also reshape the synthesis into the ARTICLE
 overview outline; visual revisions are identical under both kinds and a BRIEF
@@ -262,9 +263,9 @@ async def _seed_figures(
     ) as client:
         snapshot = await _snapshot(client, subject_id)
         paragraphs = _paragraphs(snapshot)
-        if len(paragraphs) != 6:
+        if len(paragraphs) != 8:
             raise RuntimeError(
-                f"the acceptance fixture must expose six paragraphs, found {len(paragraphs)}"
+                f"the acceptance fixture must expose eight paragraphs, found {len(paragraphs)}"
             )
         # The acceptance builder archives exactly four figures in source order.
         # The catalog keeps that order; names come from the synthetic HTML alt

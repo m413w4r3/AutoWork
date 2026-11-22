@@ -311,6 +311,18 @@ class TargetedEditorialRevisionTargetRequest(BaseModel):
     element_kind: EditorialEnrichmentElementKind | None = None
     element_key: StrictStr | None = Field(default=None, max_length=128)
     placement: TargetedEditorialRevisionPlacementRequest | None = None
+    # Optional occurrence disambiguator, only meaningful for equal paragraphs
+    # in one parent. Omitted by historical clients and persisted targets.
+    occurrence_ordinal: StrictInt | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _occurrence_ordinal_on_paragraphs_only(self) -> TargetedEditorialRevisionTargetRequest:
+        if self.occurrence_ordinal is not None and self.kind not in {
+            TargetedEditorialRevisionTargetKind.LEAD_PARAGRAPH,
+            TargetedEditorialRevisionTargetKind.SECTION_PARAGRAPH,
+        }:
+            raise ValueError("occurrence_ordinal is only valid for paragraph targets")
+        return self
 
 
 class TargetedEditorialRevisionPlacementRequest(BaseModel):
@@ -3467,6 +3479,7 @@ def _targeted_revision_domain_request(
                 if payload.target.placement is not None
                 else None
             ),
+            occurrence_ordinal=payload.target.occurrence_ordinal,
         ),
         operation=payload.operation,
         instruction=payload.instruction,

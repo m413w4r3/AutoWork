@@ -556,7 +556,7 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                 operation=operation.value,
             )
             if (
-                resolved.legacy_target_id != proposal.target_id
+                resolved.target_id != proposal.target_id
                 or resolved.before_hash != proposal.before_hash
                 or patch.get("target") != resolved.target.to_json()
             ):

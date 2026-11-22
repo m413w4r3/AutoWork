@@ -673,7 +673,7 @@ async def test_acceptance_chain_postgres(
             for block in snapshot["blocks"]
             if block["kind"] in {"paragraph", "lead_paragraph"}
         ]
-        assert len(paragraphs) == 6
+        assert len(paragraphs) == 8
         paragraph_ids = [str(block["block_id"]) for block in paragraphs]
         assert _element_keys(snapshot) == ["synthetic_table"]
         assert snapshot["enrichment_version"] == 2

@@ -413,6 +413,7 @@ async def _seed(
     article_base: bool = False,
     bar_chart_facts: bool = False,
     persist_real_revision_inputs: bool = False,
+    duplicate_paragraphs: bool = False,
 ) -> _Seeded:
     blob_store = _MemoryBlobStore()
     edition = Edition(
@@ -625,29 +626,31 @@ async def _seed(
         )
         revision_inputs_persisted = True
     evidence_ref = extraction_evidence_refs_v1(extraction)[0]
-    base_sections = (
-        (
+    if article_base:
+        third_text = (
+            "Arsenal : Synthetic tool."
+            if duplicate_paragraphs
+            else "Objectif principal : Synthetic activity."
+        )
+        base_sections = (
             SynthesisSectionV1(
                 SynthesisSectionKind.OVERVIEW,
                 "Vue d'ensemble",
                 (
                     SynthesisParagraphV1("Victimologie : Synthetic victims.", (evidence_ref,)),
                     SynthesisParagraphV1("Arsenal : Synthetic tool.", (evidence_ref,)),
-                    SynthesisParagraphV1(
-                        "Objectif principal : Synthetic activity.", (evidence_ref,)
-                    ),
+                    SynthesisParagraphV1(third_text, (evidence_ref,)),
                 ),
             ),
         )
-        if article_base
-        else (
+    else:
+        base_sections = (
             SynthesisSectionV1(
                 SynthesisSectionKind.OVERVIEW,
                 "Synthetic observations",
                 (SynthesisParagraphV1("A synthetic section claim.", (evidence_ref,)),),
             ),
         )
-    )
     base_synthesis = ProductionSynthesisV1(
         schema_version=PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
         subject_id=subject.id,

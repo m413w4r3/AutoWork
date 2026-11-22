@@ -198,10 +198,22 @@ class TargetedEditorialRevisionTarget:
     element_kind: EditorialEnrichmentElementKind | None = None
     element_key: str | None = None
     placement: TargetedEditorialRevisionPlacement | None = None
+    occurrence_ordinal: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, TargetedEditorialRevisionTargetKind):
             raise ValueError("targeted_editorial_revision_target_kind_invalid")
+        if self.occurrence_ordinal is not None:
+            # Optional disambiguator for equal paragraphs in one parent. It is
+            # only carried when the content id is not unique so every historical
+            # target keeps its exact serialization and `target_id` hash.
+            if type(self.occurrence_ordinal) is not int or self.occurrence_ordinal < 0:
+                raise ValueError("targeted_editorial_revision_occurrence_ordinal_invalid")
+            if self.kind not in {
+                TargetedEditorialRevisionTargetKind.LEAD_PARAGRAPH,
+                TargetedEditorialRevisionTargetKind.SECTION_PARAGRAPH,
+            }:
+                raise ValueError("targeted_editorial_revision_occurrence_ordinal_invalid")
         if not isinstance(self.stable_ids, tuple) or any(
             not isinstance(value, str) or _SHA256.fullmatch(value) is None
             for value in self.stable_ids
@@ -309,6 +321,8 @@ class TargetedEditorialRevisionTarget:
                     "placement": self.placement.to_json() if self.placement is not None else None,
                 }
             )
+        if self.occurrence_ordinal is not None:
+            payload["occurrence_ordinal"] = self.occurrence_ordinal
         return payload
 
 

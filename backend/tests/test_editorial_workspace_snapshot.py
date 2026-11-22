@@ -536,22 +536,34 @@ def test_duplicate_paragraphs_resolve_to_distinct_canonical_paths() -> None:
     assert (second_canonical.parent_index, second_canonical.indexes) == (1, (0,))
 
 
-def test_identical_paragraphs_in_one_section_are_not_fabricated_as_targets() -> None:
-    # Identical content has no unique typed identity: the snapshot must not
-    # advertise a text edit the full-payload resolver will refuse, but the
-    # block-id anchored insertions stay available and projection does not crash.
+def test_identical_paragraphs_in_one_section_get_distinct_occurrence_targets() -> None:
+    # Equal content in one section keeps two independent typed targets: the
+    # optional occurrence ordinal disambiguates the n-th equal paragraph, so
+    # both blocks advertise their text operations instead of the former
+    # fail-closed snapshot.
     content = _synthesis((_paragraph("same body"), _paragraph("same body")))
     entries = _paragraph_entries(content)
     paragraphs = [item for item in entries if item.kind == "paragraph"]
 
+    first, second = (
+        resolve_workspace_target(
+            entry=entry,
+            canonical_content=content,
+            operation="rewrite_paragraph",
+        )
+        for entry in paragraphs
+    )
+    assert first.target != second.target
+    assert first.target.occurrence_ordinal == 0
+    assert second.target.occurrence_ordinal == 1
+    assert first.path != second.path
+    assert first.legacy_target_id is None and second.legacy_target_id is None
+    assert first.before_hash == second.before_hash
     for entry in paragraphs:
-        with pytest.raises(EditorialIdentityAmbiguousError):
-            resolve_workspace_target(
-                entry=entry,
-                canonical_content=content,
-                operation="rewrite_paragraph",
-            )
-        assert allowed_operations(entry, content) == ()
+        assert allowed_operations(entry, content) == (
+            "rewrite_paragraph",
+            "delete_paragraph",
+        )
         assert "create_table" in allowed_operations(entry, content, allow_table_insertion=True)
 
     blocks, _enrichments, _outline = project_blocks(
@@ -561,7 +573,10 @@ def test_identical_paragraphs_in_one_section_are_not_fabricated_as_targets() -> 
     )
     projected = [block for block in blocks if block["kind"] == "paragraph"]
     assert len(projected) == 2
-    assert all(block["allowed_operations"] == [] for block in projected)
+    assert all(
+        block["allowed_operations"] == ["rewrite_paragraph", "delete_paragraph"]
+        for block in projected
+    )
     assert all(
         block["revision_target"]
         == {

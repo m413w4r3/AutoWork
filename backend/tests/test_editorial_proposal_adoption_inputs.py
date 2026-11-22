@@ -469,6 +469,7 @@ async def test_production_di_exercises_synthesis_and_enrichment_inputs_without_e
         "resolve_workspace_target",
         lambda **_kwargs: SimpleNamespace(
             legacy_target_id="synthetic-target",
+            target_id="synthetic-target",
             before_hash="e" * 64,
             target=synthesis_target,
             path="/title",

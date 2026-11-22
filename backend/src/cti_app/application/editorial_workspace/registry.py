@@ -110,6 +110,16 @@ class ResolvedWorkspaceTarget:
     target: TargetedEditorialRevisionTarget
     legacy_target_id: str | None
 
+    @property
+    def target_id(self) -> str:
+        """Content id of the exact typed target the resolver just built.
+
+        Equal to `legacy_target_id` for historical unique targets; for a
+        duplicate paragraph it carries the occurrence ordinal instead of the
+        missing legacy catalog id.
+        """
+        return canonical_content_sha256(self.target.to_json())
+
 
 @dataclass(frozen=True, slots=True)
 class ResolvedParagraphAnchor:
@@ -308,6 +318,53 @@ def _entry_target_identity(
     raise EditorialIdentityAmbiguousError("editorial_identity_ambiguous")
 
 
+def _entry_occurrence_ordinal(
+    entry: BlockRegistryEntry,
+    canonical_content: Mapping[str, Any],
+) -> int | None:
+    """Rank of this paragraph among equal paragraphs of the same parent.
+
+    `None` when the content id is unique in its parent, so historical targets
+    and their `target_id` hashes stay byte-identical.
+    """
+    if entry.kind is EditorialBlockKind.LEAD_PARAGRAPH:
+        tokens = _pointer_tokens(entry.structural_pointer)
+        if len(tokens) != 2:
+            raise EditorialIdentityAmbiguousError("editorial_identity_ambiguous")
+        raw_container = canonical_content.get("lead")
+        container: Sequence[Any] = raw_container if isinstance(raw_container, list) else ()
+        raw_index = tokens[1]
+    elif entry.kind is EditorialBlockKind.PARAGRAPH:
+        tokens = _pointer_tokens(entry.structural_pointer)
+        try:
+            if len(tokens) != 4 or tokens[2] != "paragraphs":
+                raise EditorialIdentityAmbiguousError("editorial_identity_ambiguous")
+            raw_container = read_pointer(canonical_content, f"/sections/{tokens[1]}/paragraphs")
+        except (IndexError, KeyError, TypeError, ValueError) as exc:
+            raise EditorialIdentityAmbiguousError("editorial_identity_ambiguous") from exc
+        if not isinstance(raw_container, list):
+            raise EditorialIdentityAmbiguousError("editorial_identity_ambiguous")
+        container = raw_container
+        raw_index = tokens[3]
+    else:
+        return None
+    try:
+        pointer_index = int(raw_index)
+        matches = [
+            index
+            for index, paragraph in enumerate(container)
+            if isinstance(paragraph, Mapping)
+            and canonical_content_sha256(paragraph) == entry.content_sha256
+        ]
+    except (IndexError, KeyError, TypeError, ValueError) as exc:
+        raise EditorialIdentityAmbiguousError("editorial_identity_ambiguous") from exc
+    if len(matches) <= 1:
+        return None
+    if pointer_index not in matches:
+        raise EditorialIdentityAmbiguousError("editorial_identity_ambiguous")
+    return matches.index(pointer_index)
+
+
 def _target_for_entry(
     entry: BlockRegistryEntry,
     canonical_content: Mapping[str, Any],
@@ -321,6 +378,7 @@ def _target_for_entry(
     if expected_kind is None:
         raise EditorialIdentityAmbiguousError("editorial_identity_ambiguous")
     expected_stable_ids, expected_parent_id = _entry_target_identity(entry, canonical_content)
+    expected_ordinal = _entry_occurrence_ordinal(entry, canonical_content)
     catalog = build_targeted_revision_target_catalog(
         ProductionArtifactStage.SYNTHESIS.value,
         canonical_content,
@@ -338,17 +396,30 @@ def _target_for_entry(
         parent_id = raw_target.get("parent_id")
         if (str(parent_id) if parent_id is not None else None) != expected_parent_id:
             continue
+        raw_ordinal = raw_target.get("occurrence_ordinal")
+        if type(raw_ordinal) is not int:
+            if raw_ordinal is not None:
+                continue
+            parsed_ordinal: int | None = None
+        else:
+            if raw_ordinal < 0:
+                continue
+            parsed_ordinal = raw_ordinal
+        if parsed_ordinal != expected_ordinal:
+            continue
         matching.append(option)
     if len(matching) != 1:
         raise EditorialIdentityAmbiguousError("editorial_identity_ambiguous")
     option = matching[0]
     target_data = cast(Mapping[str, Any], option["target"])
+    target_ordinal = target_data.get("occurrence_ordinal")
     resolved_target = TargetedEditorialRevisionTarget(
         kind=TargetedEditorialRevisionTargetKind(str(target_data["kind"])),
         stable_ids=tuple(str(item) for item in target_data.get("stable_ids", [])),
         parent_id=(str(target_data["parent_id"]) if target_data.get("parent_id") else None),
         anchor_id=(str(target_data["anchor_id"]) if target_data.get("anchor_id") else None),
         insert_after=bool(target_data.get("insert_after", False)),
+        occurrence_ordinal=target_ordinal if type(target_ordinal) is int else None,
     )
     operations = tuple(str(item) for item in option.get("operations", []))
     legacy_matches = [

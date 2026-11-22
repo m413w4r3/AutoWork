@@ -292,14 +292,12 @@ class EditorialWorkspaceService:
             canonical_content=synthesis,
             operation=operation,
         )
-        if resolved.legacy_target_id is None:
-            raise EditorialWorkspaceError("editorial_identity_ambiguous")
         return EditorialRevisionTargetResolution(
             record=record,
             occurrence=occurrence,
             canonical_content=synthesis,
             target=resolved.target,
-            target_id=resolved.legacy_target_id,
+            target_id=resolved.target_id,
             before_hash=resolved.before_hash,
         )
 

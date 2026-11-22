@@ -1,10 +1,11 @@
 """Fixture wiring for the M23 F5 chained acceptance oracle.
 
-The acceptance chain needs a *complete* production run: a six-paragraph
-synthesis, a confirmed subject IOC when the routed publication is an ARTICLE,
-four distinct archived figures, the references/relevance artifacts, an adopted
-routing decision and a READY run so the real publication assembly and the real
-Typst renderer can run through the HTTP routes.
+The acceptance chain needs a *complete* production run: an eight-paragraph
+synthesis (its last two section paragraphs are equal), a confirmed subject IOC
+when the routed publication is an ARTICLE, four distinct archived figures, the
+references/relevance artifacts, an adopted routing decision and a READY run so
+the real publication assembly and the real Typst renderer can run through the
+HTTP routes.
 
 The shared editorial integration seeds stop short of that (two paragraphs, at
 most three archived figures, a BRIEF-only routing assertion), so this module
@@ -158,21 +159,27 @@ def _local_archived_figure_assets(count: int) -> tuple[tuple[str, bytes], ...]:
 
 
 def _rich_synthesis(synthesis: Any, evidence_ref: Any) -> Any:
-    """Six body paragraphs: two lead paragraphs then one four-paragraph section.
+    """Eight body paragraphs: two lead then one six-paragraph section.
 
-    The title must change too: the workspace registry preserves the block ID of
-    an unchanged title across a synthesis revision, while the acceptance seed
-    later bootstraps the registry from the new version. A title identical to the
-    base version would make those two registries disagree on the title
-    occurrence ID, and the enrichment evidence-pack hash includes it.
+    The last two section paragraphs are byte-identical so the E04 occurrence
+    flow can edit one without touching its equal sibling. The title must change
+    too: the workspace registry preserves the block ID of an unchanged title
+    across a synthesis revision, while the acceptance seed later bootstraps the
+    registry from the new version. A title identical to the base version would
+    make those two registries disagree on the title occurrence ID, and the
+    enrichment evidence-pack hash includes it.
     """
     lead = (
         SynthesisParagraphV1("Acceptance lead paragraph one.", (evidence_ref,)),
         SynthesisParagraphV1("Acceptance lead paragraph two.", (evidence_ref,)),
     )
-    paragraphs = tuple(
-        SynthesisParagraphV1(f"Acceptance section paragraph {number}.", (evidence_ref,))
-        for number in ("three", "four", "five", "six")
+    paragraphs = (
+        *(
+            SynthesisParagraphV1(f"Acceptance section paragraph {number}.", (evidence_ref,))
+            for number in ("three", "four", "five", "six")
+        ),
+        SynthesisParagraphV1("Acceptance duplicate paragraph.", (evidence_ref,)),
+        SynthesisParagraphV1("Acceptance duplicate paragraph.", (evidence_ref,)),
     )
     sections = (
         SynthesisSectionV1(
@@ -237,7 +244,7 @@ async def _seed_acceptance_artifacts(
 
     This is intentionally a local copy: the shared helper caps archived figures
     at three and fixes the two-paragraph synthesis, while the acceptance chain
-    needs four archived figures and six paragraphs.
+    needs four archived figures and eight paragraphs including one equal pair.
     """
     seeded = await _seed(
         uow_factory,

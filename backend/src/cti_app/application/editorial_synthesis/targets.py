@@ -139,9 +139,8 @@ def build_targeted_revision_target_catalog(
                 for paragraph in paragraphs
                 if isinstance(paragraph, Mapping)
             ]
-            unique_paragraph_ids = {
-                identity for identity, count in Counter(paragraph_ids).items() if count == 1
-            }
+            paragraph_counts = Counter(paragraph_ids)
+            paragraph_ordinals: dict[str, int] = {}
             options.append(
                 option(
                     label=f"Section · {heading}",
@@ -167,8 +166,10 @@ def build_targeted_revision_target_catalog(
                 if not isinstance(paragraph, Mapping):
                     continue
                 paragraph_id = _paragraph_id(paragraph)
-                if paragraph_id not in unique_paragraph_ids:
-                    continue
+                occurrence_ordinal: int | None = None
+                if paragraph_counts[paragraph_id] > 1:
+                    occurrence_ordinal = paragraph_ordinals.get(paragraph_id, 0)
+                    paragraph_ordinals[paragraph_id] = occurrence_ordinal + 1
                 text = str(paragraph.get("text", ""))
                 options.append(
                     option(
@@ -177,6 +178,7 @@ def build_targeted_revision_target_catalog(
                             kind=TargetedEditorialRevisionTargetKind.SECTION_PARAGRAPH,
                             stable_ids=(paragraph_id,),
                             parent_id=section_id,
+                            occurrence_ordinal=occurrence_ordinal,
                         ),
                         operations=(
                             TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH,
@@ -189,19 +191,24 @@ def build_targeted_revision_target_catalog(
         lead_ids = [
             _paragraph_id(paragraph) for paragraph in lead if isinstance(paragraph, Mapping)
         ]
-        unique_lead_ids = {identity for identity, count in Counter(lead_ids).items() if count == 1}
+        lead_counts = Counter(lead_ids)
+        lead_ordinals: dict[str, int] = {}
         for paragraph in lead:
             if not isinstance(paragraph, Mapping):
                 continue
-            if _paragraph_id(paragraph) not in unique_lead_ids:
-                continue
+            lead_id = _paragraph_id(paragraph)
+            occurrence_ordinal = None
+            if lead_counts[lead_id] > 1:
+                occurrence_ordinal = lead_ordinals.get(lead_id, 0)
+                lead_ordinals[lead_id] = occurrence_ordinal + 1
             text = str(paragraph.get("text", ""))
             options.append(
                 option(
                     label=f"Paragraphe du chapeau · {text[:100]}",
                     target=TargetedEditorialRevisionTarget(
                         kind=lead_target,
-                        stable_ids=(_paragraph_id(paragraph),),
+                        stable_ids=(lead_id,),
+                        occurrence_ordinal=occurrence_ordinal,
                     ),
                     operations=(
                         TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH,
@@ -321,6 +328,11 @@ def _indexed_unique(
     return result
 
 
+def _ordinal_suffix(target: TargetedEditorialRevisionTarget) -> str:
+    """Annotate a path that would otherwise name several equal paragraphs."""
+    return "" if target.occurrence_ordinal is None else f"#{target.occurrence_ordinal}"
+
+
 def _target_path(
     target: TargetedEditorialRevisionTarget,
     operation: TargetedEditorialRevisionOperation | None = None,
@@ -333,7 +345,7 @@ def _target_path(
             return f"synthesis.lead.{relation}[{target.anchor_id}]"
         return "synthesis.lead"
     if target.kind is TargetedEditorialRevisionTargetKind.LEAD_PARAGRAPH:
-        return f"synthesis.lead[{target.stable_ids[0]}]"
+        return f"synthesis.lead[{target.stable_ids[0]}]{_ordinal_suffix(target)}"
     if target.kind is TargetedEditorialRevisionTargetKind.SECTIONS:
         if target.stable_ids:
             return f"synthesis.sections[{','.join(target.stable_ids)}]"
@@ -351,7 +363,42 @@ def _target_path(
             return f"synthesis.section[{target.stable_ids[0]}]{suffix}"
         return f"synthesis.section[{target.stable_ids[0]}]"
     assert target.kind is TargetedEditorialRevisionTargetKind.SECTION_PARAGRAPH
-    return f"synthesis.section[{target.parent_id}].paragraph[{target.stable_ids[0]}]"
+    return (
+        f"synthesis.section[{target.parent_id}].paragraph"
+        f"[{target.stable_ids[0]}]{_ordinal_suffix(target)}"
+    )
+
+
+def _paragraph_index_for_target(
+    paragraphs: Sequence[Mapping[str, Any]],
+    target: TargetedEditorialRevisionTarget,
+    *,
+    label: str,
+) -> int:
+    """Resolve one paragraph by content id, optionally by equal-occurrence rank.
+
+    Without an ordinal the targeted content id must be unique inside its
+    parent: the historical ambiguity refusal is preserved byte-for-byte for
+    the equal paragraphs themselves. An ordinal picks the n-th equal paragraph
+    and refuses rather than falling back when a concurrent change removed it,
+    so a stale ordinal can never overwrite its sibling. A neighbour whose own
+    content id is unique stays resolvable, as it was before equal paragraphs
+    existed upstream.
+    """
+    matches = [
+        index
+        for index, paragraph in enumerate(paragraphs)
+        if isinstance(paragraph, Mapping) and _paragraph_id(paragraph) == target.stable_ids[0]
+    ]
+    if not matches:
+        raise ValueError("targeted_synthesis_revision_target_missing")
+    if target.occurrence_ordinal is None:
+        if len(matches) > 1:
+            raise ValueError(f"targeted_synthesis_revision_ambiguous_{label}")
+        return matches[0]
+    if target.occurrence_ordinal >= len(matches):
+        raise ValueError("targeted_synthesis_revision_target_missing")
+    return matches[target.occurrence_ordinal]
 
 
 def _resolve_target(
@@ -410,10 +457,7 @@ def _resolve_target(
             or target.parent_id is not None
         ):
             raise ValueError("targeted_synthesis_revision_target_action_mismatch")
-        lead_ids = _indexed_unique(lead, _paragraph_id, label="lead_paragraph")
-        index = lead_ids.get(target.stable_ids[0])
-        if index is None:
-            raise ValueError("targeted_synthesis_revision_target_missing")
+        index = _paragraph_index_for_target(lead, target, label="lead_paragraph")
         return _ResolvedTarget(path, before_hash(lead[index]), indexes=(index,))
     if target.kind is TargetedEditorialRevisionTargetKind.SECTIONS:
         if operation not in {
@@ -494,10 +538,7 @@ def _resolve_target(
         paragraphs = sections[section_index].get("paragraphs")
         if not isinstance(paragraphs, list):
             raise ValueError("targeted_synthesis_revision_base_invalid")
-        paragraph_ids = _indexed_unique(paragraphs, _paragraph_id, label="section_paragraph")
-        paragraph_index = paragraph_ids.get(target.stable_ids[0])
-        if paragraph_index is None:
-            raise ValueError("targeted_synthesis_revision_target_missing")
+        paragraph_index = _paragraph_index_for_target(paragraphs, target, label="section_paragraph")
         return _ResolvedTarget(
             path,
             before_hash(paragraphs[paragraph_index]),
