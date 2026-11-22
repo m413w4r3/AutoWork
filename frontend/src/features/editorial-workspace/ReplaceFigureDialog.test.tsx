@@ -1,5 +1,11 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, within } from "@testing-library/react";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -533,7 +539,7 @@ describe("ReplaceFigureDialog", () => {
     });
     expect(
       await within(dialog).findByText(
-        /Figures intégrées : 1\/3 · Capacité restante : 2 figures sur 3\. Le remplacement conserve ce total\./,
+        /Capacité du document : 1\/3 figures intégrées · 2 places restantes\. Le remplacement conserve ce total\./,
       ),
     ).toBeVisible();
     first.unmount();
@@ -542,7 +548,42 @@ describe("ReplaceFigureDialog", () => {
     const articleDialog = await screen.findByRole("dialog", {
       name: "Remplacer l’image intégrée",
     });
-    expect(within(articleDialog).queryByText(/Capacité restante/)).toBeNull();
+    expect(
+      within(articleDialog).queryByText(/Capacité du document/),
+    ).toBeNull();
+  });
+
+  it("confirms before closing with a pending replacement selection", async () => {
+    const user = userEvent.setup();
+    installFetch();
+    const onClose = vi.fn();
+    renderDialog({ onClose });
+
+    const dialog = await screen.findByRole("dialog", {
+      name: "Remplacer l’image intégrée",
+    });
+    await user.click(
+      await within(dialog).findByRole("radio", {
+        name: "Choisir Carte de remplacement",
+      }),
+    );
+
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    expect(onClose).not.toHaveBeenCalled();
+    expect(
+      within(dialog).getByText(/Fermer le remplacement sans l’appliquer/),
+    ).toBeVisible();
+    const keep = within(dialog).getByRole("button", {
+      name: "Continuer le remplacement",
+    });
+    await waitFor(() => expect(keep).toHaveFocus());
+
+    await user.click(
+      within(dialog).getByRole("button", {
+        name: "Fermer sans enregistrer",
+      }),
+    );
+    expect(onClose).toHaveBeenCalledOnce();
   });
 });
 

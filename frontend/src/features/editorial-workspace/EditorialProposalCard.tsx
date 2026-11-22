@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useId } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { ApiError } from "../../api/editions";
@@ -406,6 +406,7 @@ export function EditorialProposalCard({
 }: EditorialProposalCardProps) {
   const queryClient = useQueryClient();
   const visualContext = useVisualWorkspaceContext();
+  const staleReasonId = useId();
   const proposalQueryKey = editorialWorkspaceQueryKeys.proposal(
     subjectId,
     occurrenceId,
@@ -566,6 +567,7 @@ export function EditorialProposalCard({
     acceptMutation.error instanceof ApiError &&
     acceptMutation.error.status === 409;
   const recoverableProposal = proposal.state === "stale" || acceptanceConflict;
+  const staleProposal = proposal.state === "stale";
   const acceptanceComplete =
     proposal.state === "accepted" || acceptMutation.isSuccess;
   const decisionPending = acceptMutation.isPending || rejectMutation.isPending;
@@ -679,12 +681,18 @@ export function EditorialProposalCard({
           </ul>
         </details>
       ) : null}
-      {proposal.state === "proposed" || proposal.state === "accepted" ? (
-        <div className="editorial-proposal-card__actions">
+      {proposal.state === "proposed" ||
+      proposal.state === "accepted" ||
+      staleProposal ? (
+        <div
+          className="editorial-proposal-card__actions"
+          aria-describedby={staleProposal ? staleReasonId : undefined}
+        >
           <button
             className="editorial-proposal-card__accept"
             type="button"
             aria-disabled={
+              staleProposal ||
               acceptanceComplete ||
               acceptanceConflict ||
               decisionPending ||
@@ -693,6 +701,7 @@ export function EditorialProposalCard({
             disabled={decisionPending}
             onClick={() => {
               if (
+                staleProposal ||
                 acceptanceComplete ||
                 acceptanceConflict ||
                 decisionPending ||
@@ -703,19 +712,29 @@ export function EditorialProposalCard({
               acceptMutation.mutate();
             }}
           >
-            {acceptanceComplete
-              ? "Acceptée"
-              : acceptMutation.isPending
-                ? "Acceptation en cours…"
-                : "Accepter"}
+            {staleProposal
+              ? "Accepter"
+              : acceptanceComplete
+                ? "Acceptée"
+                : acceptMutation.isPending
+                  ? "Acceptation en cours…"
+                  : "Accepter"}
           </button>
-          {proposal.state === "proposed" ? (
+          {proposal.state === "proposed" || staleProposal ? (
             <button
               className="editorial-proposal-card__reject"
               type="button"
               onClick={() => rejectMutation.mutate()}
               disabled={
-                decisionPending || acceptanceConflict || !proposal.patch_sha256
+                staleProposal ||
+                decisionPending ||
+                acceptanceConflict ||
+                !proposal.patch_sha256
+              }
+              title={
+                staleProposal
+                  ? "Une proposition périmée ne peut plus être rejetée ; comparez-la à nouveau."
+                  : undefined
               }
             >
               Rejeter
@@ -777,7 +796,7 @@ export function EditorialProposalCard({
       {recoverableProposal ? (
         <div className="editorial-proposal-card__recovery">
           {acceptanceConflict || proposal.state === "stale" ? (
-            <p role="alert" aria-live="polite">
+            <p role="alert" aria-live="polite" id={staleReasonId}>
               {acceptanceConflict
                 ? acceptMutation.error.message
                 : "Cette proposition repose sur une version qui a changé. Elle n’a pas été appliquée. Actualisez le document, puis comparez et formulez une nouvelle proposition."}

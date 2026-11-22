@@ -343,9 +343,12 @@ export function EditorialWorkspaceLayout({
         focus === "inspector"
           ? ".visual-move-panel input[type='search']"
           : ".visual-move-banner";
-      document
-        .querySelector<HTMLElement>(selector)
-        ?.focus({ preventScroll: true });
+      const target = document.querySelector<HTMLElement>(selector);
+      if (!target) return;
+      target.focus({ preventScroll: true });
+      // The visual can sit far below its move banner: bring the focused target
+      // into view without jumping the document to the top.
+      target.scrollIntoView({ block: "nearest", inline: "nearest" });
     });
   };
 

@@ -33,7 +33,7 @@ export type InspectorTab =
   "discussion" | "modifier" | "visuels" | "sources" | "historique";
 
 const TABS: { id: InspectorTab; label: string }[] = [
-  { id: "discussion", label: "Discussion Bridge" },
+  { id: "discussion", label: "Discussion" },
   { id: "modifier", label: "Modifier" },
   { id: "visuels", label: "Visuels" },
   { id: "sources", label: "Sources" },
@@ -435,6 +435,7 @@ export function EditorialInspector({
                 onProposalPromptApplied={onProposalPromptApplied}
                 onChangeTarget={onChangeTarget}
                 onPendingProposalsChange={onPendingProposalsChange}
+                discussionVisible={activeTab === "discussion"}
               />
             </div>
 

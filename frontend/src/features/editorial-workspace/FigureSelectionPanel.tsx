@@ -67,9 +67,11 @@ export function FigureSelectionPanel({
 
       {publicationKind === "brief" ? (
         <p className="gallery-selection__limit" role="note">
-          Figures intégrées : {existingFigureCount}/3 · Capacité restante :{" "}
-          {remainingCapacity ?? 0} figure
-          {(remainingCapacity ?? 0) > 1 ? "s" : ""} sur 3.
+          Capacité du document : {existingFigureCount}/3 figures intégrées ·{" "}
+          {(remainingCapacity ?? 0) === 0
+            ? "aucune place restante"
+            : `${remainingCapacity ?? 0} place${(remainingCapacity ?? 0) > 1 ? "s" : ""} restante${(remainingCapacity ?? 0) > 1 ? "s" : ""}`}
+          .
           {remainingCapacity === 0
             ? " Le plafond de trois figures est atteint : aucune image supplémentaire ne peut être intégrée."
             : null}

@@ -441,13 +441,15 @@ describe("FigureInsertionPanel", () => {
       name: "Galerie d’images sources",
     });
     expect(
-      await within(gallery).findByText(/Capacité restante : 1 figure sur 3/),
+      await within(gallery).findByText(
+        /Capacité du document : 2\/3 figures intégrées · 1 place restante/,
+      ),
     ).toBeVisible();
     await within(gallery).findByRole("checkbox", {
       name: "Sélectionner Carte des échanges",
     });
     expect(
-      screen.getAllByText(/Figures intégrées : 2\/3/).length,
+      screen.getAllByText(/2\/3 figures intégrées/).length,
     ).toBeGreaterThan(0);
   });
 
@@ -479,7 +481,7 @@ describe("FigureInsertionPanel", () => {
     ).toBeDisabled();
     expect(
       within(gallery).getByText(
-        /Une brève ne peut contenir plus de trois figures intégrées\./,
+        /Sélection : 0\/0 — le plafond de sélection est atteint/,
       ),
     ).toBeVisible();
     expect(

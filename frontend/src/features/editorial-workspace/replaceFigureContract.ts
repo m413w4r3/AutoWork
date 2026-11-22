@@ -131,6 +131,10 @@ export function briefFigureCapacity(
 /**
  * Shared BRIEF counter for the gallery, the selection panel and the replace
  * dialog. `null` for ARTICLE: no cap is ever assumed there.
+ *
+ * The note describes the *document* capacity only. The selection cap is
+ * reported separately, so « places restantes » can never contradict
+ * « plafond de sélection atteint ».
  */
 export function briefFigureCapacityNote(
   snapshot: EditorialWorkspaceSnapshot,
@@ -138,7 +142,11 @@ export function briefFigureCapacityNote(
   const remaining = briefFigureCapacity(snapshot);
   if (remaining === null) return null;
   const integrated = integratedFigureCount(snapshot);
-  return `Figures intégrées : ${integrated}/${BRIEF_FIGURE_LIMIT} · Capacité restante : ${remaining} figure${remaining > 1 ? "s" : ""} sur ${BRIEF_FIGURE_LIMIT}.`;
+  const remainingLabel =
+    remaining === 0
+      ? "aucune place restante"
+      : `${remaining} place${remaining > 1 ? "s" : ""} restante${remaining > 1 ? "s" : ""}`;
+  return `Capacité du document : ${integrated}/${BRIEF_FIGURE_LIMIT} figures intégrées · ${remainingLabel}.`;
 }
 
 function visualBlocks(

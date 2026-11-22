@@ -72,7 +72,13 @@ export function ReplaceFigureDialog({
   const [caption, setCaption] = useState(target.currentFigure.caption ?? "");
   const [error, setError] = useState<ReplaceFigureErrorInfo | null>(null);
   const [accepted, setAccepted] = useState(false);
+  const [confirmClose, setConfirmClose] = useState(false);
+  const keepEditingRef = useRef<HTMLButtonElement>(null);
   const queryClient = useQueryClient();
+
+  useEffect(() => {
+    if (confirmClose) keepEditingRef.current?.focus();
+  }, [confirmClose]);
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -175,7 +181,6 @@ export function ReplaceFigureDialog({
     },
   });
 
-  const close = () => onClose();
   const captionInvalid = caption.trim().length === 0;
   const capacityNote = briefFigureCapacityNote(snapshot);
   const canConfirm =
@@ -183,6 +188,21 @@ export function ReplaceFigureDialog({
     !captionInvalid &&
     !replacementMutation.isPending &&
     !accepted;
+  // Selecting a replacement or editing the caption commits nothing until the
+  // explicit replace action; closing silently would discard that work.
+  const discardableChanges =
+    !accepted &&
+    (selected !== null ||
+      caption.trim() !== (target.currentFigure.caption ?? "").trim());
+  const closeNow = () => onClose();
+  const requestClose = () => {
+    if (discardableChanges && !confirmClose) {
+      setConfirmClose(true);
+      return;
+    }
+    closeNow();
+  };
+  const dismissCloseConfirmation = () => setConfirmClose(false);
 
   const figureId = target.currentFigure.catalog_figure_id ?? null;
 
@@ -194,13 +214,18 @@ export function ReplaceFigureDialog({
       aria-modal="true"
       onCancel={(event) => {
         event.preventDefault();
-        close();
+        if (confirmClose) dismissCloseConfirmation();
+        else requestClose();
       }}
       onKeyDown={(event) => {
-        if (event.key === "Escape") close();
+        if (event.key !== "Escape") return;
+        if (confirmClose) dismissCloseConfirmation();
+        else requestClose();
       }}
       onClick={(event) => {
-        if (event.target === event.currentTarget) close();
+        if (event.target !== event.currentTarget) return;
+        if (confirmClose) dismissCloseConfirmation();
+        else requestClose();
       }}
     >
       <div className="editorial-gallery-replace__layout">
@@ -219,12 +244,40 @@ export function ReplaceFigureDialog({
             ref={closeButtonRef}
             className="button button--secondary"
             type="button"
-            onClick={close}
+            onClick={requestClose}
             aria-label="Fermer le remplacement d’image"
           >
             Fermer
           </button>
         </header>
+
+        {confirmClose ? (
+          <div
+            className="editorial-close-confirmation"
+            role="alert"
+            aria-label="Confirmer la fermeture du remplacement"
+          >
+            <p>
+              Fermer le remplacement sans l’appliquer ? La sélection et la
+              légende modifiée seront perdues.
+            </p>
+            <button
+              ref={keepEditingRef}
+              className="button"
+              type="button"
+              onClick={dismissCloseConfirmation}
+            >
+              Continuer le remplacement
+            </button>
+            <button
+              className="button button--secondary"
+              type="button"
+              onClick={closeNow}
+            >
+              Fermer sans enregistrer
+            </button>
+          </div>
+        ) : null}
 
         <div className="editorial-gallery-replace__body">
           <div className="editorial-gallery-replace__picker">

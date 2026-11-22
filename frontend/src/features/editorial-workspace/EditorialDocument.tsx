@@ -436,8 +436,12 @@ export function EditorialDocument({
 }: EditorialDocumentProps) {
   const [hoveredBlockId, setHoveredBlockId] = useState<string | null>(null);
   const [focusedBlockId, setFocusedBlockId] = useState<string | null>(null);
+  // The selected block keeps its in-flow action bar while the pointer travels
+  // to another block, so clicking that next block cannot be displaced by a
+  // hover-triggered layout change. Focus then hover still reveal the actions
+  // when no block is selected.
   const actionBlockId =
-    hoveredBlockId ?? focusedBlockId ?? selectedBlockId ?? null;
+    selectedBlockId ?? focusedBlockId ?? hoveredBlockId ?? null;
   const moveElement = moveState
     ? (snapshot.blocks.find(
         (block) => block.block_id === moveState.elementBlockId,

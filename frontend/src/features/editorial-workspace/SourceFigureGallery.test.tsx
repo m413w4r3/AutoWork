@@ -195,9 +195,11 @@ describe("SourceFigureGallery", () => {
     );
     expect(exclusionReason).toBeVisible();
     expect(ineligible).toHaveAttribute("aria-describedby", exclusionReason.id);
-    expect(
-      within(dialog).getByText("Déjà intégrée · Déjà utilisée"),
-    ).toBeVisible();
+    const integratedStatus = within(dialog).getByText("Déjà intégrée", {
+      selector: ".editorial-figure-status",
+    });
+    expect(integratedStatus).toBeVisible();
+    expect(integratedStatus).not.toHaveTextContent("Déjà utilisée");
 
     await user.click(available);
     expect(within(dialog).getByText("1 image sélectionnée")).toBeVisible();
@@ -327,7 +329,7 @@ describe("SourceFigureGallery", () => {
     });
     expect(
       within(dialog).getByText(
-        "Cette insertion peut ajouter jusqu’à 1 figure.",
+        "Sélection : 0/1 · cette insertion peut encore ajouter 1 figure.",
       ),
     ).toBeVisible();
     await user.click(first);
@@ -338,9 +340,57 @@ describe("SourceFigureGallery", () => {
     ).toBeDisabled();
     expect(
       within(dialog).getByText(
-        /Une brève ne peut contenir plus de trois figures intégrées/,
+        /Sélection : 1\/1 — le plafond de sélection est atteint/,
       ),
     ).toBeVisible();
     expect(within(dialog).getByText("1 image sélectionnée")).toBeVisible();
+  });
+
+  it("confirms before discarding a dialog-owned selection", async () => {
+    const user = userEvent.setup();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() =>
+        Promise.resolve(
+          new Response(JSON.stringify(catalog), {
+            headers: { "Content-Type": "application/json" },
+          }),
+        ),
+      ),
+    );
+    const onClose = vi.fn();
+    renderGallery(onClose);
+
+    const dialog = await screen.findByRole("dialog", {
+      name: "Galerie d’images sources",
+    });
+    await user.click(
+      await within(dialog).findByRole("checkbox", {
+        name: "Sélectionner Carte réseau originale",
+      }),
+    );
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    expect(onClose).not.toHaveBeenCalled();
+    expect(
+      within(dialog).getByText(/Fermer la galerie sans intégrer la sélection/),
+    ).toBeVisible();
+    const keep = within(dialog).getByRole("button", {
+      name: "Continuer la sélection",
+    });
+    await waitFor(() => expect(keep).toHaveFocus());
+
+    await user.click(keep);
+    expect(
+      within(dialog).queryByText(
+        /Fermer la galerie sans intégrer la sélection/,
+      ),
+    ).toBeNull();
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    await user.click(
+      within(dialog).getByRole("button", {
+        name: "Fermer sans enregistrer",
+      }),
+    );
+    expect(onClose).toHaveBeenCalledOnce();
   });
 });

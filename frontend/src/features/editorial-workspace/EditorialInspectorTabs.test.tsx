@@ -153,15 +153,16 @@ describe("EditorialInspector tabs", () => {
     renderInspector();
     const tabs = screen.getAllByRole("tab");
     expect(tabs.map((tab) => tab.textContent)).toEqual([
-      "Discussion Bridge",
+      "Discussion",
       "Modifier",
       "Visuels",
       "Sources",
       "Historique",
     ]);
-    expect(
-      screen.getByRole("tab", { name: "Discussion Bridge" }),
-    ).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: "Discussion" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
     expect(screen.getByTestId("conversation-panel")).toBeVisible();
     expect(screen.queryByTestId("history-panel")).not.toBeInTheDocument();
   });
@@ -173,7 +174,7 @@ describe("EditorialInspector tabs", () => {
     expect(
       screen.getByRole("heading", { name: "Sources et preuves" }),
     ).toBeVisible();
-    fireEvent.click(screen.getByRole("tab", { name: "Discussion Bridge" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Discussion" }));
     expect(screen.getByTestId("conversation-panel")).toBeVisible();
   });
 
@@ -210,19 +211,19 @@ describe("EditorialInspector tabs", () => {
       name: "Panneaux de l’inspecteur",
     });
     expect(
-      within(tablist).getByRole("tab", { name: "Discussion Bridge" }),
+      within(tablist).getByRole("tab", { name: "Discussion" }),
     ).toBeVisible();
     fireEvent.click(screen.getByRole("tab", { name: "Visuels" }));
     expect(screen.getByRole("button", { name: "Ajouter après" })).toBeVisible();
     expect(
-      within(tablist).getByRole("tab", { name: "Discussion Bridge" }),
+      within(tablist).getByRole("tab", { name: "Discussion" }),
     ).toBeVisible();
   });
 
   it("supports ArrowRight/Home/End keyboard tab navigation", () => {
     renderInspector();
     const discussionTab = screen.getByRole("tab", {
-      name: "Discussion Bridge",
+      name: "Discussion",
     });
     discussionTab.focus();
     fireEvent.keyDown(discussionTab, { key: "ArrowRight" });

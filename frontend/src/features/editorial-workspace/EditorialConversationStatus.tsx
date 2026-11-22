@@ -1,3 +1,6 @@
+import { useEffect, useState } from "react";
+import { createPortal } from "react-dom";
+
 import type { EditorialThreadRead } from "../../api/editorialWorkspace";
 
 interface ReconcileStatus {
@@ -25,6 +28,33 @@ interface EditorialConversationStatusProps {
   startSession: StartSessionStatus;
   onReconcile: () => void;
   onStartSession: () => void;
+  /** True when the Discussion tab is hidden by another inspector tab. */
+  announceInPortal?: boolean;
+}
+
+/**
+ * Renders the bridge-status live region at the document root so an
+ * asynchronous reply is still announced while the Discussion panel itself is
+ * `display: none` (inactive tab).
+ */
+function BridgeStatusAnnouncement({ text }: { text: string }) {
+  const [container, setContainer] = useState<HTMLElement | null>(null);
+  useEffect(() => {
+    setContainer(document.body);
+  }, []);
+  if (!container) return null;
+  return createPortal(
+    <p
+      className="editorial-visually-hidden"
+      role="status"
+      aria-live="polite"
+      aria-atomic="true"
+      data-testid="editorial-bridge-status-live"
+    >
+      {text}
+    </p>,
+    container,
+  );
 }
 
 const bridgeLabels: Record<EditorialThreadRead["bridge_status"], string> = {
@@ -51,7 +81,10 @@ export function EditorialConversationStatus({
   startSession,
   onReconcile,
   onStartSession,
+  announceInPortal = false,
 }: EditorialConversationStatusProps) {
+  const bridgeStatusText =
+    data && data.kind !== "unopened" ? bridgeLabels[data.bridge_status] : null;
   return (
     <>
       {isPending ? <p role="status">Chargement de la discussion…</p> : null}
@@ -73,9 +106,11 @@ export function EditorialConversationStatus({
               Version de référence du fil : v{data.origin.artifact_version}
             </p>
           ) : null}
-          <p role="status" aria-live="polite" aria-atomic="true">
-            {bridgeLabels[data.bridge_status]}
-          </p>
+          {!announceInPortal ? (
+            <p role="status" aria-live="polite" aria-atomic="true">
+              {bridgeStatusText}
+            </p>
+          ) : null}
           {data.bridge_status === "reconciliation_required" ? (
             <button
               className="editorial-conversation__reconcile"
@@ -137,6 +172,9 @@ export function EditorialConversationStatus({
             </ul>
           ) : null}
         </>
+      ) : null}
+      {bridgeStatusText && announceInPortal ? (
+        <BridgeStatusAnnouncement text={bridgeStatusText} />
       ) : null}
     </>
   );

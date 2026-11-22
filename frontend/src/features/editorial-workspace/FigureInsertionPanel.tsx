@@ -12,8 +12,8 @@ import { EditorialProposalCard } from "./EditorialProposalCard";
 import { FigureSelectionPanel } from "./FigureSelectionPanel";
 import { SourceFigureGallery } from "./SourceFigureGallery";
 import {
-  BRIEF_FIGURE_LIMIT,
   briefFigureCapacity,
+  briefFigureCapacityNote,
   defaultFigureCaption,
   figureSelectionLabel,
   integratedFigureCount,
@@ -102,10 +102,7 @@ export function FigureInsertionPanel({
   } | null>(null);
   const existingFigureCount = integratedFigureCount(snapshot);
   const remainingCapacity = briefFigureCapacity(snapshot);
-  const capacityNote =
-    snapshot.publication_kind === "brief"
-      ? `Figures intégrées : ${existingFigureCount}/${BRIEF_FIGURE_LIMIT} · Capacité restante : ${remainingCapacity ?? 0} figure${(remainingCapacity ?? 0) > 1 ? "s" : ""} sur ${BRIEF_FIGURE_LIMIT}.`
-      : undefined;
+  const capacityNote = briefFigureCapacityNote(snapshot) ?? undefined;
 
   const resetDraftFeedback = () => {
     proposalRequestRef.current = null;

@@ -411,6 +411,13 @@ test("shows a recoverable French conflict without leaving the selected thread", 
   await expect(
     page.getByRole("button", { name: "Générer une proposition" }),
   ).toBeEnabled();
-  await expect(card.getByRole("button", { name: "Accepter" })).toHaveCount(0);
+  // A stale proposal keeps its decision commands visible and named, but both
+  // are disabled with the explicit stale reason.
+  const staleAccept = card.getByRole("button", { name: "Accepter" });
+  await expect(staleAccept).toHaveAttribute("aria-disabled", "true");
+  await expect(card.getByRole("button", { name: "Rejeter" })).toBeDisabled();
+  await expect(
+    card.getByText(/Cette proposition repose sur une version qui a changé/),
+  ).toBeVisible();
   expect(unexpectedRequests).toEqual([]);
 });
