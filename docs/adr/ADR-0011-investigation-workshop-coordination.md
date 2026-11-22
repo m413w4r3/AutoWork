@@ -264,10 +264,10 @@ Lots — un seul implémenteur par lot ; chemins autorisés, révision, dépenda
 | A01 | création idempotente, manifeste jamais réécrit | 02 | `tests/workspace_agent/test_ensure.py::test_ensure_is_idempotent_and_never_rewrites_the_manifest` |
 | A02 | refresh recrée les dossiers sans perdre le contenu humain | 02 | `tests/workspace_agent/test_ensure.py::test_refresh_recreates_missing_directories_and_keeps_human_content` |
 | A03 | aucun échappement (symlink/traversal/rename concurrent) | 02 | `tests/workspace_agent/test_paths.py::test_symlink_swapped_between_stat_and_open_never_escapes` |
-| A04 | watcher + reconcile + restart scan, jamais de fichier mi-écrit | 02 | `tests/workspace_agent/test_sync.py::test_a04_watcher_reconcile_and_restart_scan` |
-| A05 | révision stable par (path, sha256) ; mtime seul ne crée rien | 02 | `tests/workspace_agent/test_revisions.py::test_a05_revision_id_stable_per_path_and_sha` |
-| A06 | conflit : deux versions, diff, décision conservée | 02 | `tests/workspace_agent/test_sync.py::test_a06_conflict_keeps_both_versions_and_records_decision` |
-| A07 | agent absent : 503 fail-closed, UI bloquée, jamais de file | 02 | `tests/test_workspace_agent_client.py::test_workspace_unavailable_fails_closed` |
+| A04 | watcher + reconcile + restart scan, jamais de fichier mi-écrit | 02 | `tests/workspace_agent/test_scan.py::test_mid_write_file_is_not_imported_until_stable`, `tests/workspace_agent/test_restart_scan.py::test_restart_reuses_generation_revision_ids_and_events` |
+| A05 | révision stable par (path, sha256) ; mtime seul ne crée rien | 02 | `tests/workspace_agent/test_scan.py::test_mtime_only_change_does_not_mint_a_revision`, `tests/workspace_agent/test_events.py::test_revision_and_event_ids_are_deterministic_pure_functions` |
+| A06 | conflit : deux versions, diff, décision conservée | 02 | `tests/workspace_agent/test_conflicts.py::test_a_cas_conflict_keeps_both_versions_and_never_touches_the_live_file`, `tests/workspace_agent/test_conflicts.py::test_replaying_the_conflict_key_returns_the_same_conflict_and_file` |
+| A07 | agent absent : 503 fail-closed, UI bloquée, jamais de file | 02 | `tests/workspace_agent/test_workspace_agent_client.py::test_workspace_unavailable_fails_closed`, `tests/workspace_agent/test_workspace_agent_client.py::test_missing_socket_is_unavailable_and_never_queues` |
 | B01 | synthèse et hash épinglés avant création du workspace | 03A | `tests/test_investigation_bootstrap.py::test_b01_synthesis_pinned_before_workspace` |
 | B02 | inventaire IOC seeds ≠ découverts (hash, IP, domaine, URL) | 03A | `tests/test_investigation_bootstrap.py::test_b02_ioc_inventory_separates_seeds_from_discovered` |
 | B03 | échantillons en quarantaine et associations source | 03A | `tests/test_investigation_bootstrap.py::test_b03_quarantined_samples_keep_source_associations` |
@@ -288,8 +288,8 @@ Lots — un seul implémenteur par lot ; chemins autorisés, révision, dépenda
 | D02 | démarrage de session lié tâche+passation, une seule active | 05B1 | `tests/test_agent_sessions.py::test_concurrent_session_start_single_active` |
 | D03 | acquisition du bail : fence+1, opérateur `running` | 04B2 | `tests/test_investigation_tasks.py::test_transition_matrix_allows_only_declared_actors` |
 | D04 | broker : attribution `task_id`/`agent_session_id`, fence courant | 05B2 | `tests/test_agentic_tool_broker.py::test_broker_delegates_invocation_journal_and_attributes_task_session` |
-| D05 | instruction mi-session persistée si l’agent est occupé | 05B1 | `tests/test_agent_sessions.py::test_instruction_is_queued_while_agent_busy` |
-| D06 | interruption : versions conservées, effets déjà partis réconciliés | 05B1 | `tests/test_agent_sessions.py::test_interrupt_preserves_versions_and_reconciles_effects` |
+| D05 | instruction mi-session persistée si l’agent est occupé | 05B1 | `tests/test_agent_sessions.py::test_instruction_is_queued_while_agent_busy_and_acked_signed` |
+| D06 | interruption : versions conservées, effets déjà partis réconciliés | 05B1 | `tests/acceptance/test_acceptance_gaps.py::test_d06_interrupt_keeps_persisted_versions_and_reconciles_sent_effects`, `tests/workspace_agent/test_codex_profile.py::test_codex_profile_interrupt_kills_process_group`, `tests/test_investigation_transfers.py::test_interrupted_codex_handoff_keeps_analyses`, `tests/test_agentic_tool_broker.py::test_broker_replays_same_client_key_without_second_dispatch`, `tests/test_agentic_tool_broker.py::test_broker_never_resubmits_ambiguous_advisor_consult` |
 | D07 | session perdue : réconciliation typée, aucune relance auto | 05B1 | `tests/test_agent_sessions.py::test_reconcile_outcomes_never_auto_relaunch` |
 | D08 | transfert Codex→Claude par passation versionnée + freshness | 05A | `tests/test_investigation_handoffs.py::test_freshness_diff_lists_changed_note_and_evidence` |
 | D09 | agent expiré : aucune écriture tâche/résultat/contribution/broker | 05B2 | `tests/test_agentic_tool_broker.py::test_broker_refuses_missing_or_stale_lease` |
