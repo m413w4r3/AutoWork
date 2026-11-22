@@ -43,11 +43,16 @@ from cti_app.application.agentic_sessions import (
     AgentSessionSecretDeliveryPort,
     PreparedAgentSession,
     SessionError,
+    SessionRuntimeUnavailableError,
     SessionService,
     SessionUnitOfWork,
 )
 from cti_app.application.investigation_handoffs import HandoffError
 from cti_app.application.investigation_tasks import TaskCommandError
+from cti_app.application.investigation_transfers import (
+    TransferUnitOfWork,
+    WorkspaceNoteCatalog,
+)
 from cti_app.config import Settings, get_settings
 from cti_app.domain.agentic_operator import OperatorAdapterKind
 from cti_app.domain.investigation_task import TaskActor, TaskActorKind
@@ -62,6 +67,9 @@ class OpenAgentSessionRequest(BaseModel):
     adapter_kind: OperatorAdapterKind
     handoff_id: UUID
     executable: str = Field(min_length=1, max_length=4096)
+    # The human's model alias choice; the canonical context provider validates
+    # it, and the host wire bounds it.
+    model: str | None = Field(default=None, max_length=128)
 
 
 class InstructionRequest(BaseModel):
@@ -72,6 +80,7 @@ class InstructionRequest(BaseModel):
     action: Literal["enqueue", "ack"]
     text: str | None = Field(default=None, max_length=65536)
     instruction_ids: tuple[UUID, ...] = ()
+    note_refs: tuple[str, ...] = Field(default=(), max_length=32)
 
     @model_validator(mode="after")
     def _validate_action_shape(self) -> InstructionRequest:
@@ -85,6 +94,8 @@ class InstructionRequest(BaseModel):
                 raise ValueError("ack does not carry instruction text")
             if not self.instruction_ids:
                 raise ValueError("ack requires at least one instruction id")
+            if self.note_refs:
+                raise ValueError("ack does not carry note references")
         return self
 
 
@@ -122,12 +133,22 @@ def _secret_delivery(request: Request) -> AgentSessionSecretDeliveryPort | None:
 
 
 def _service(request: Request) -> SessionService:
+    runtime = getattr(request.app.state, "agent_session_runtime", None)
+    if runtime is not None and not getattr(runtime, "available", True):
+        # The orchestrator mounted an explicit fail-closed runtime: the host
+        # workspace agent or the canonical UoW is unavailable.
+        raise SessionRuntimeUnavailableError(
+            "agent sessions are unavailable: "
+            f"{getattr(runtime, 'unavailable_reason', 'runtime_unavailable')}"
+        )
     uow_factory = cast(Callable[[], SessionUnitOfWork], _uow_factory(request))
+    transfer_factory = cast(Callable[[], TransferUnitOfWork], _uow_factory(request))
     return SessionService(
         uow_factory=uow_factory,
         deriver=_deriver(request),
         operator=_operator_port(request),
         secret_delivery=_secret_delivery(request),
+        note_resolver=WorkspaceNoteCatalog(uow_factory=transfer_factory),
         task_limits=_settings(request).task_limits(),
     )
 
@@ -284,6 +305,7 @@ async def open_agent_session(
             executable=body.executable,
             actor=actor,
             idempotency_key=idempotency_key,
+            model=body.model,
         )
     except (SessionError, HandoffError, TaskCommandError) as exc:
         raise _session_http_error(exc) from exc
@@ -320,16 +342,17 @@ async def send_instruction(
         if not idempotency_key:
             raise _http_error(422, "idempotency_key_required")
         try:
-            instruction = await _service(request).enqueue_instruction(
+            enqueued = await _service(request).enqueue_instruction_with_notes(
                 investigation_id,
                 session_id,
                 text=cast(str, body.text),
                 actor=actor,
                 idempotency_key=idempotency_key,
+                note_refs=body.note_refs,
             )
         except SessionError as exc:
             raise _session_http_error(exc) from exc
-        return instruction.to_payload()
+        return enqueued.to_payload()
     verified = await _verified_operator_call(
         request,
         investigation_id=investigation_id,
@@ -338,7 +361,7 @@ async def send_instruction(
     )
     actor = await _operator_actor(request, verified)
     try:
-        acknowledged = await _service(request).acknowledge_instructions(
+        acknowledged = await _service(request).acknowledge_instructions_with_notes(
             investigation_id,
             session_id,
             instruction_ids=body.instruction_ids,

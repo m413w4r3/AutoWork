@@ -443,6 +443,10 @@ class PrepareSessionRequest(_WireModel):
     adapter_kind: OperatorAdapterKind
     handoff_id: UUID
     capability_sha256: str
+    # The alias the verified human chose at open (D7/§6).  It is a request
+    # input, never a probed capability: an adapter passes it to the host
+    # context provider, which validates it against the canonical context.
+    model: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
 
     @field_validator("capability_sha256")
     @classmethod

@@ -29,11 +29,11 @@ new session after an unresumable loss must present a new handoff.
 from __future__ import annotations
 
 import secrets
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from types import TracebackType
-from typing import Protocol, Self
+from typing import Any, Protocol, Self
 from uuid import UUID, uuid4
 
 from cti_app.application.agent_session_verification import (
@@ -161,6 +161,13 @@ class SessionOperatorUnavailableError(SessionError):
     status_code = 503
 
 
+class SessionRuntimeUnavailableError(SessionError):
+    """The host runtime was mounted unavailable (no socket, token or UoW)."""
+
+    code = "agent_sessions_unavailable"
+    status_code = 503
+
+
 class SessionOperatorContractError(SessionError):
     """An adapter returned a result that does not answer the request."""
 
@@ -185,6 +192,87 @@ class SessionSecretDeliveryError(SessionError):
 
     code = "agent_session_secret_delivery_failed"
     status_code = 502
+
+
+class NoteInstructionUnavailableError(SessionError):
+    """A note-referenced instruction arrived without a canonical note resolver."""
+
+    code = "note_refs_unavailable"
+    status_code = 503
+
+
+@dataclass(frozen=True, slots=True)
+class NoteInstructionResolution:
+    """One instruction text with its canonical note refs and delivery diff.
+
+    ``queued_text`` is what the persistent queue records (the human's text plus
+    the exact revision ids/SHA-256 resolved at send time).  ``delivery_text``
+    adds the visible diff a note changed after queueing; it is the text handed
+    to the host when the instruction is actually delivered.  Both are prose and
+    stay out of ``repr``.
+    """
+
+    queued_text: str = field(repr=False)
+    delivery_text: str = field(repr=False)
+    note_diffs: tuple[Mapping[str, str], ...] = ()
+
+
+class InstructionNoteResolver(Protocol):
+    """Resolve canonical note revisions for a note-referenced instruction."""
+
+    async def prepare(
+        self, *, investigation_id: UUID, text: str, note_refs: Sequence[str]
+    ) -> NoteInstructionResolution: ...
+
+    async def refresh(self, *, investigation_id: UUID, text: str) -> NoteInstructionResolution: ...
+
+
+@dataclass(frozen=True, slots=True)
+class EnqueuedInstructionV1:
+    """The queue view the human needs: position and any delivery-time diff."""
+
+    instruction: AgentSessionInstructionV1
+    queue_position: int
+    delivered_live: bool
+    note_diffs: tuple[Mapping[str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.instruction, AgentSessionInstructionV1):
+            raise TypeError("instruction must use AgentSessionInstructionV1")
+        if isinstance(self.queue_position, bool) or not isinstance(self.queue_position, int):
+            raise TypeError("queue_position must be an integer")
+        if self.queue_position < 0:
+            raise ValueError("queue_position is zero (delivered) or one-based")
+        if not isinstance(self.delivered_live, bool):
+            raise TypeError("delivered_live must be a boolean")
+
+    def to_payload(self) -> dict[str, Any]:
+        payload = self.instruction.to_payload()
+        payload["queue_position"] = self.queue_position
+        payload["delivered_live"] = self.delivered_live
+        payload["note_diffs"] = [dict(item) for item in self.note_diffs]
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveredInstructionV1:
+    """One acknowledged instruction plus the text an operator actually receives."""
+
+    instruction: AgentSessionInstructionV1
+    delivery_text: str = field(repr=False)
+    note_diffs: tuple[Mapping[str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.instruction, AgentSessionInstructionV1):
+            raise TypeError("instruction must use AgentSessionInstructionV1")
+        if not isinstance(self.delivery_text, str):
+            raise TypeError("delivery_text must be a string")
+
+    def to_payload(self) -> dict[str, Any]:
+        payload = self.instruction.to_payload()
+        payload["delivery_text"] = self.delivery_text
+        payload["note_diffs"] = [dict(item) for item in self.note_diffs]
+        return payload
 
 
 class SessionUnitOfWork(Protocol):
@@ -338,6 +426,7 @@ class _PrepareRequest:
     adapter_kind: OperatorAdapterKind
     handoff_id: UUID
     executable: str
+    model: str | None = None
 
 
 class SessionService:
@@ -350,6 +439,7 @@ class SessionService:
         deriver: SessionSecretDeriver | None,
         operator: AgenticOperatorPort | None = None,
         secret_delivery: AgentSessionSecretDeliveryPort | None = None,
+        note_resolver: InstructionNoteResolver | None = None,
         task_limits: TaskLimits = TASK_LIMIT_DEFAULTS,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -357,6 +447,7 @@ class SessionService:
         self._deriver = deriver
         self._operator = operator
         self._secret_delivery = secret_delivery
+        self._note_resolver = note_resolver
         self._task_limits = task_limits
         self._clock = clock or (lambda: datetime.now(UTC))
 
@@ -372,6 +463,7 @@ class SessionService:
         executable: str,
         actor: TaskActor,
         idempotency_key: str,
+        model: str | None = None,
         now: datetime | None = None,
     ) -> PreparedAgentSession:
         """Create the durable session in ``provisioning``/``ready`` and issue
@@ -383,6 +475,7 @@ class SessionService:
             adapter_kind=adapter_kind,
             handoff_id=handoff_id,
             executable=executable,
+            model=model,
         )
         key = _idempotency_key(idempotency_key)
         timestamp = _now(self._clock, now)
@@ -415,18 +508,22 @@ class SessionService:
         executable: str,
         actor: TaskActor,
         idempotency_key: str,
+        model: str | None = None,
         now: datetime | None = None,
     ) -> PreparedAgentSession:
-        """The human "open a session" action: prepare and start in one UoW.
+        """The human "open a session" action: prepare, deliver, start.
 
         A stale handoff (D5) refuses before anything is persisted, so a failed
         open never leaves an active ``provisioning`` session blocking the task.
+        The order is the host contract's: the one-shot secret delivery *is* the
+        supervisor prepare (SESSION-RUNNER §6), so start can only follow it.
         """
         request = _PrepareRequest(
             task_id=task_id,
             adapter_kind=adapter_kind,
             handoff_id=handoff_id,
             executable=executable,
+            model=model,
         )
         key = _idempotency_key(idempotency_key)
         timestamp = _now(self._clock, now)
@@ -437,6 +534,9 @@ class SessionService:
             task = await self._locked_task(uow, investigation_id, task_id)
             existing = await uow.agent_sessions.get_by_idempotency(task.id, key)
             if existing is not None:
+                # A replay re-derives the same secret and re-delivers it; the
+                # host refuses a second, different hand-off.  It never starts
+                # anything: a concurrent identical open already did.
                 replayed = self._replay_prepare(existing, request, deriver)
                 await self._deliver_secret(replayed, key)
                 await uow.commit()
@@ -444,15 +544,14 @@ class SessionService:
             session, secret, created = await self._prepare_locked(
                 uow, investigation_id, task, request, operator, deriver, key, timestamp
             )
-            # A concurrent identical open already started its own session; a
-            # replay never relaunches anything.
+            prepared = PreparedAgentSession(session=session, secret=secret)
+            await self._deliver_secret(prepared, key)
             started = (
                 await self._start_locked(uow, session, task, operator, timestamp)
                 if created
                 else session
             )
             prepared = PreparedAgentSession(session=started, secret=secret)
-            await self._deliver_secret(prepared, key)
             await uow.commit()
             return prepared
 
@@ -515,6 +614,7 @@ class SessionService:
         text: str,
         actor: TaskActor,
         idempotency_key: str,
+        note_refs: Sequence[str] = (),
         now: datetime | None = None,
     ) -> AgentSessionInstructionV1:
         """Persist one human instruction; deliver it only to an idle session.
@@ -522,9 +622,49 @@ class SessionService:
         A busy (``running``) agent keeps the instruction queued; the operator
         acknowledges it through its signed route when it consumes the queue.
         """
+        enqueued = await self.enqueue_instruction_with_notes(
+            investigation_id,
+            session_id,
+            text=text,
+            actor=actor,
+            idempotency_key=idempotency_key,
+            note_refs=note_refs,
+            now=now,
+        )
+        return enqueued.instruction
+
+    async def enqueue_instruction_with_notes(
+        self,
+        investigation_id: UUID,
+        session_id: UUID,
+        *,
+        text: str,
+        actor: TaskActor,
+        idempotency_key: str,
+        note_refs: Sequence[str] = (),
+        now: datetime | None = None,
+    ) -> EnqueuedInstructionV1:
+        """Queue an instruction and resolve its canonical note refs at send time.
+
+        ``note_refs`` are workspace paths under ``notes/humaines``.  The
+        resolver records the LATEST ``(revision_id, sha256)`` for each path in
+        the persistent instruction text, so the queue itself carries exact
+        refs.  Delivery happens only to an explicitly idle
+        (``awaiting_instruction``) session, never to a session whose technical
+        state is unknown; a note modified after queueing is reported as a
+        visible diff appended to the delivered text.
+        """
         key = _idempotency_key(idempotency_key)
         timestamp = _now(self._clock, now)
         self._require_human(actor)
+        resolution: NoteInstructionResolution | None = None
+        composed_text = text.strip()
+        if note_refs:
+            resolver = self._require_note_resolver()
+            resolution = await resolver.prepare(
+                investigation_id=investigation_id, text=text, note_refs=note_refs
+            )
+            composed_text = resolution.queued_text
         async with self._uow_factory() as uow:
             session = await self._session_for(uow, investigation_id, session_id)
             if session.state not in (
@@ -540,8 +680,8 @@ class SessionService:
                 task_id=session.task_id,
                 session_id=session.id,
                 idempotency_key=key,
-                text=text,
-                text_sha256=instruction_text_sha256(text.strip()),
+                text=composed_text,
+                text_sha256=instruction_text_sha256(composed_text),
                 state=InstructionState.QUEUED,
                 created_by_kind=actor.kind.value,
                 created_by_id=actor.actor_id,
@@ -554,20 +694,33 @@ class SessionService:
             except VersionConflictError as exc:
                 raise SessionIdempotencyConflictError(str(exc)) from exc
             if not created:
-                return stored
+                return EnqueuedInstructionV1(
+                    instruction=stored,
+                    queue_position=await _queue_position(uow, session.id, stored),
+                    delivered_live=False,
+                )
             delivered = stored
+            delivered_live = False
+            note_diffs: tuple[Mapping[str, str], ...] = ()
             if (
                 session.state is AgentSessionState.AWAITING_INSTRUCTION
                 and self._operator is not None
                 and session.host_session_ref is not None
             ):
+                delivery_text = stored.text
+                if resolution is not None:
+                    refreshed = await self._require_note_resolver().refresh(
+                        investigation_id=investigation_id, text=stored.text
+                    )
+                    delivery_text = refreshed.delivery_text
+                    note_diffs = refreshed.note_diffs
                 receipt = await self._operator.send_instruction(
                     SendInstructionRequest(
                         session_id=session.id,
                         host_session_ref=session.host_session_ref,
                         instruction_id=stored.id,
-                        instruction_sha256=stored.text_sha256,
-                        text=stored.text,
+                        instruction_sha256=instruction_text_sha256(delivery_text),
+                        text=delivery_text,
                         idempotency_key=stored.idempotency_key,
                     )
                 )
@@ -582,8 +735,15 @@ class SessionService:
                     await self._persist(
                         uow, session.with_state(AgentSessionState.RUNNING, now=timestamp)
                     )
+                    delivered_live = True
+            queue_position = await _queue_position(uow, session.id, delivered)
             await uow.commit()
-            return delivered
+            return EnqueuedInstructionV1(
+                instruction=delivered,
+                queue_position=queue_position,
+                delivered_live=delivered_live,
+                note_diffs=note_diffs,
+            )
 
     async def acknowledge_instructions(
         self,
@@ -628,6 +788,43 @@ class SessionService:
                 )
             await uow.commit()
             return tuple(acknowledged)
+
+    async def acknowledge_instructions_with_notes(
+        self,
+        investigation_id: UUID,
+        session_id: UUID,
+        *,
+        instruction_ids: Sequence[UUID],
+        actor: TaskActor,
+        now: datetime | None = None,
+    ) -> tuple[DeliveredInstructionV1, ...]:
+        """Acknowledge and report the note diff visible at delivery time."""
+        acknowledged = await self.acknowledge_instructions(
+            investigation_id,
+            session_id,
+            instruction_ids=instruction_ids,
+            actor=actor,
+            now=now,
+        )
+        resolver = self._note_resolver
+        views: list[DeliveredInstructionV1] = []
+        for instruction in acknowledged:
+            if resolver is None:
+                views.append(
+                    DeliveredInstructionV1(instruction=instruction, delivery_text=instruction.text)
+                )
+                continue
+            refreshed = await resolver.refresh(
+                investigation_id=investigation_id, text=instruction.text
+            )
+            views.append(
+                DeliveredInstructionV1(
+                    instruction=instruction,
+                    delivery_text=refreshed.delivery_text,
+                    note_diffs=refreshed.note_diffs,
+                )
+            )
+        return tuple(views)
 
     # ------------------------------------------------------------- lifecycle
 
@@ -768,6 +965,40 @@ class SessionService:
         timestamp = _now(self._clock, now)
         self._require_operator_actor(actor)
         operator = self._require_operator()
+        return await self._reconcile_locked(
+            investigation_id, session_id, operator=operator, timestamp=timestamp
+        )
+
+    async def reconcile_for_transfer(
+        self,
+        investigation_id: UUID,
+        session_id: UUID,
+        *,
+        actor: TaskActor,
+        now: datetime | None = None,
+    ) -> AgentSessionV1:
+        """Human-initiated reconciliation inside a transfer (ADR-0011 D3).
+
+        A transfer must learn whether an old host process is alive before it
+        releases the lease; the operation is technical (it records the host
+        answer and relaunches nothing), but the decision to transfer is the
+        verified human's, so this seam admits only that actor.
+        """
+        timestamp = _now(self._clock, now)
+        self._require_human(actor)
+        operator = self._require_operator()
+        return await self._reconcile_locked(
+            investigation_id, session_id, operator=operator, timestamp=timestamp
+        )
+
+    async def _reconcile_locked(
+        self,
+        investigation_id: UUID,
+        session_id: UUID,
+        *,
+        operator: AgenticOperatorPort,
+        timestamp: datetime,
+    ) -> AgentSessionV1:
         async with self._uow_factory() as uow:
             session = await self._session_for(uow, investigation_id, session_id)
             if not session.is_active:
@@ -954,6 +1185,7 @@ class SessionService:
                 adapter_kind=request.adapter_kind,
                 handoff_id=request.handoff_id,
                 capability_sha256=capabilities.capability_sha256,
+                model=request.model,
             )
         )
         if (
@@ -1244,6 +1476,13 @@ class SessionService:
             )
         return self._operator
 
+    def _require_note_resolver(self) -> InstructionNoteResolver:
+        if self._note_resolver is None:
+            raise NoteInstructionUnavailableError(
+                "no canonical note resolver is wired; note-referenced instructions are unavailable"
+            )
+        return self._note_resolver
+
     async def _require_current_task_lease(
         self, uow: SessionUnitOfWork, session: AgentSessionV1, now: datetime
     ) -> None:
@@ -1279,6 +1518,24 @@ def _previous_instruction_state(state: InstructionState) -> InstructionState:
     )
 
 
+async def _queue_position(
+    uow: SessionUnitOfWork,
+    session_id: UUID,
+    instruction: AgentSessionInstructionV1,
+) -> int:
+    """One-based position among still-queued instructions (0 once delivered)."""
+    if instruction.state is not InstructionState.QUEUED:
+        return 0
+    instructions = await uow.agent_sessions.list_instructions(session_id)
+    earlier_queued = 0
+    for item in instructions:
+        if item.id == instruction.id:
+            return earlier_queued + 1
+        if item.state is InstructionState.QUEUED:
+            earlier_queued += 1
+    return 0
+
+
 def _idempotency_key(value: object) -> str:
     if not isinstance(value, str) or not value.strip():
         raise SessionError("Idempotency-Key must be a non-empty string")
@@ -1296,6 +1553,11 @@ def _now(clock: Callable[[], datetime], value: datetime | None) -> datetime:
 
 __all__ = [
     "AgentSessionSecretDeliveryPort",
+    "DeliveredInstructionV1",
+    "EnqueuedInstructionV1",
+    "InstructionNoteResolver",
+    "NoteInstructionResolution",
+    "NoteInstructionUnavailableError",
     "PreparedAgentSession",
     "SessionCasConflictError",
     "SessionConflictError",
