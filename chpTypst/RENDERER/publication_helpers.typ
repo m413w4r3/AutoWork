@@ -1033,7 +1033,7 @@
       #render-opinion-references(evidence-refs, reference-scope: reference-scope)
     ]
   ]
-  if panel { noteAnalyste(content) } else { content }
+  if panel { noteAnalyste(content, breakable: true) } else { content }
 }
 
 #let render-body-block(
@@ -1060,7 +1060,7 @@
       #if paragraph-gap > 0pt [#v(paragraph-gap)]
     ]
   } else if item.type == "analyst_observation" {
-    block(above: 10pt, below: 8pt)[
+    block(above: 10pt, below: 8pt, breakable: true)[
       #render-analyst-observation(
         item,
         reference-scope: reference-scope,

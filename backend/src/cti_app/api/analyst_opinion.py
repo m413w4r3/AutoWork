@@ -730,7 +730,7 @@ async def preview_opinion_pdf(
         media_type="application/pdf",
         headers={
             "Content-Disposition": (
-                f'attachment; filename="opinion-{preview.opinion_id}-v'
+                f'inline; filename="opinion-{preview.opinion_id}-v'
                 f'{preview.opinion_version}-draft.pdf"'
             ),
             "X-PDF-SHA256": preview.sha256,

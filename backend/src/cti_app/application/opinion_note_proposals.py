@@ -48,6 +48,7 @@ from cti_app.domain.opinion_note_proposal import (
     NoteProposalV1,
     NoteTargetBlockType,
     anchor_target_block_type,
+    note_draft_text_from_sentences,
 )
 
 _ADVISOR_TOOL_NAME = "advisor.consult"
@@ -263,7 +264,7 @@ def _block_text(block: Mapping[str, Any]) -> str | None:
         if not isinstance(text, str):
             return None
         texts.append(text)
-    return " ".join(texts)
+    return note_draft_text_from_sentences(texts)
 
 
 class OpinionNoteProposalService:

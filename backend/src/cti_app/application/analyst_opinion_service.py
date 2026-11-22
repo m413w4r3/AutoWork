@@ -74,6 +74,7 @@ from cti_app.domain.opinion_note_proposal import (
     NoteProposalAcceptanceV1,
     NoteProposalConsultationType,
     NoteProposalStatus,
+    note_draft_text_from_sentences,
     note_proposal_note_id,
 )
 from cti_app.domain.production import (
@@ -87,7 +88,7 @@ from cti_app.domain.protocol_model import ProtocolDiagramKind
 from cti_app.domain.publication_document import (
     publication_document_article_v5_body,
     publication_document_from_json,
-    publication_document_text_anchors,
+    publication_renderable_body_anchors,
     serialize_publication_document,
 )
 
@@ -1307,12 +1308,12 @@ class AnalystOpinionService:
             base_document_v5 = publication_document_article_v5_body(base_document)
             if base_document_v5 is None:
                 raise OpinionError(OpinionErrorCode.BASE_INVALID)
-            anchors = publication_document_text_anchors(
-                base_document_v5.document,
-                references=base_document_v5.references,
-            )
+            anchors = publication_renderable_body_anchors(base_document_v5.document)
             if proposal.anchor not in anchors:
-                raise OpinionError(OpinionErrorCode.INVALID_OBSERVATION_ANCHOR)
+                raise OpinionError(
+                    OpinionErrorCode.INVALID_OBSERVATION_ANCHOR,
+                    message="The anchor is not a paragraph rendered in the article body",
+                )
 
             existing_note = next(
                 (item for item in base_notes if item.anchor == proposal.anchor), None
@@ -1780,15 +1781,15 @@ class AnalystOpinionService:
             base_document_v5 = publication_document_article_v5_body(base_document)
             if base_document_v5 is None:
                 raise OpinionError(OpinionErrorCode.BASE_INVALID)
-            anchors = publication_document_text_anchors(
-                base_document_v5.document,
-                references=base_document_v5.references,
-            )
+            anchors = publication_renderable_body_anchors(base_document_v5.document)
             if any(
                 note.anchor not in anchors or not note.anchor.startswith(("lead:", "section:"))
                 for note in opinion.observations
             ):
-                raise OpinionError(OpinionErrorCode.INVALID_OBSERVATION_ANCHOR)
+                raise OpinionError(
+                    OpinionErrorCode.INVALID_OBSERVATION_ANCHOR,
+                    message="The anchor is not a paragraph rendered in the article body",
+                )
 
     async def require_bridge_only_provenance(
         self,
@@ -2109,11 +2110,28 @@ class AnalystOpinionService:
                         and call.get("advisor_status") == "succeeded"
                     )
                 )
-                and hashlib.sha256(" ".join(sentence_texts).encode("utf-8")).hexdigest()
-                == source_text_sha256
+                and AnalystOpinionService._sentence_text_matches_source(
+                    sentence_texts, source_text_sha256
+                )
             ):
                 return True
         return False
+
+    @staticmethod
+    def _sentence_text_matches_source(sentence_texts: list[str], source_text_sha256: str) -> bool:
+        """Match the stored note text, retaining the pre-R07 space-only join.
+
+        R07 preserves newline boundaries already present in stored sentence
+        texts.  Notes materialised before that fix used ``" ".join`` and must
+        keep verifying against their immutable Bridge call.
+        """
+        materialised = note_draft_text_from_sentences(sentence_texts)
+        if hashlib.sha256(materialised.encode("utf-8")).hexdigest() == source_text_sha256:
+            return True
+        legacy = " ".join(sentence_texts)
+        return legacy != materialised and (
+            hashlib.sha256(legacy.encode("utf-8")).hexdigest() == source_text_sha256
+        )
 
     @staticmethod
     def _bridge_call_reviews_text(

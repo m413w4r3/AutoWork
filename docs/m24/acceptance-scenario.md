@@ -52,12 +52,12 @@ Journal d'un run PASS (`-s`) :
 | 13 | Transfert vers Claude Code par passation versionnée | transfert + handoff v2 + sidecar H1 | fake Claude CLI | destination `operator:claude_code`, Claude `running` ; Codex terminal (`stopped` ou `lost` selon la course de réconciliation, jamais adopté) |
 | 14 | Claude approfondit une vérification | broker signé + `vt.file_report` | fake VT | invocation attribuée à la session Claude, nouvelle observation |
 | 15 | Import observations/findings | `WorkContributionService` + `EvidenceRecorder` + `FindingService` | — | observation `workspace_import` ; finding importé `inconclusive` (jamais auto-`supported`) |
-| 16 | Bridge rédige deux Notes à deux ancres | `advisor.consult` + propositions de notes | fake Bridge | 2 propositions matérialisées à `lead:0001` et `section:0:paragraph:0001` |
+| 16 | Bridge rédige deux Notes à deux ancres | `advisor.consult` + propositions de notes | fake Bridge | l'ancre dédupliquée `section:0:paragraph:0001` est refusée `invalid_note_anchor` ; 2 propositions matérialisées à `lead:0001` et `section:1:paragraph:0001` |
 | 17 | Acceptation par version/hash | `accept_note_proposal` + porte D4 + décision `note_approve` | — | note A acceptée v1 ; la 2e proposition pinnée sur la version vide est refusée `409 stale_note_proposal`, re-demandée sur v1 puis acceptée v2 |
 | 18 | L'humain demande une correction | proposition de note pinée sur v2 | fake Bridge | proposition de correction matérialisée sur `lead:0001`, base v2/SHA |
 | 19 | Bridge révise, l'humain accepte | porte D4 + versions d'avis | fake Bridge | avis v3 ; les deux notes restent à leurs ancres, texte A révisé |
-| 20 | Vrai PDF Typst | `preview.pdf` + Typst 0.15.1 | — | `%PDF-1.7`, 377 232 octets, `X-PDF-Lineage` avec SHA d'avis et compilateur |
-| 21 | Notes aux deux ancres, références résolvables | `pdftotext` + `verify_opinion_citations` | — | les deux marqueurs de note sont dans le PDF ; violations de citation = 0 |
+| 20 | Vrai PDF Typst | `preview.pdf` + Typst 0.15.1 | — | `%PDF-1.7`, `Content-Disposition: inline` (aperçu iframe), `X-PDF-Lineage` avec SHA d'avis et compilateur |
+| 21 | Notes aux deux ancres, références résolvables | `pdftotext` + `verify_opinion_citations` | — | chaque note suit immédiatement son paragraphe d'ancre et précède le paragraphe suivant ; violations de citation = 0 |
 | 22 | Interruption | service de session + superviseur H1 | fake Claude CLI | session `stopped`, compteurs d'artefacts inchangés |
 | 23 | Reprise sans perte | service de session + superviseur H1 | fake Claude CLI | `ready`, 2 runs hôte, tous les artefacts conservés |
 | 24 | Audit final | timeline + findings + enveloppe + échantillons | — | Bridge non-preuve, aucune observation consultative citée, aucun G3 automatique, G2 humain et `bridge_only` conservés |
@@ -86,6 +86,14 @@ Journal d'un run PASS (`-s`) :
    secret observé une fois, corrigé côté fixture).
 5. **Pas de réseau** : le faux VT utilise `httpx.MockTransport` pour le
    téléchargement ; aucun adaptateur HTTP réel n'est instancié pour Bridge/LLM.
+6. **Ancres de Notes** : la proposition et l'acceptation n'acceptent que les
+   ancres de paragraphes que la projection lecteur rend réellement
+   (`publication_renderable_body_anchors`, source unique partagée avec le
+   renderer Typst). Un paragraphe de section dupliquant le lead — et, sur un
+   article à « Vue d'ensemble » extraite, la section 0 — est refusé
+   `invalid_note_anchor` au lieu d'être silencieusement déplacé en note de fin.
+   L'étape 20 sert en outre l'aperçu en `Content-Disposition: inline` pour
+   l'iframe du cockpit.
 
 ## Commandes exécutées
 
