@@ -58,6 +58,7 @@ tmp/
 
 # Sensitive or unsafe material must never be versioned
 samples/
+!/frontend/src/features/investigation/samples/
 quarantine/
 malware/
 evidence-packs/
