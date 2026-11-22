@@ -1,0 +1,674 @@
+"""M24-05 H4 oracles: the Codex profile argv/env/config, resume gate, no invented flags.
+
+Every test is offline and rootless. The fake ``codex`` fixture answers the real
+preflight surface by replaying the captured ``codex-cli 0.163.0`` help text and
+runs a deterministic scripted turn; the stub ``bwrap`` executes the inner argv
+without creating namespaces. The stub is named and hashed inside the probe
+record, so a mocked sandbox is explicit and never silent. No model, auth file,
+login or network call is made.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import shutil
+import stat
+import tempfile
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+from sidecars.workspace_agent.sessions import supervisor as sessions
+from sidecars.workspace_agent.sessions.adapters.codex import (
+    MAX_EVENT_DETAIL_CHARS,
+    CodexProfile,
+    parse_event_line,
+    read_final_message,
+    supervisor_event_kind,
+)
+from sidecars.workspace_agent.sessions.adapters.preamble import SYSTEM_PREAMBLE
+from sidecars.workspace_agent.sessions.logs import EventKind
+from sidecars.workspace_agent.sessions.state import (
+    BudgetSpec,
+    CapabilityUnavailableError,
+    ConfinementUnavailableError,
+    HandoffRef,
+    ResumeUnavailableError,
+    SessionRecord,
+    SessionState,
+)
+
+from tests.workspace_agent.sessions_support import (
+    HANDOFF_ID,
+    INVESTIGATION_ID,
+    PREPARE_KEY,
+    SESSION_ID,
+    START_KEY,
+    TASK_ID,
+    get_session,
+    post_session,
+    prepare_payload,
+    proc_alive,
+    running_session_agent,
+    session_events,
+    wait_for_process_gone,
+    wait_for_state,
+)
+from tests.workspace_agent.w3_support import ARTICLE_SLUG, DELIVERY_CODE
+
+FIXTURES = Path(__file__).with_name("fixtures")
+CODEX_HELP_FIXTURE = FIXTURES / "codex_help_0_163_0.txt"
+FAKE_CODEX_SOURCE = FIXTURES / "fake_codex.py"
+WORKSPACE_ID = "ws-" + "1" * 32
+MANIFEST_KEY = "m24-h4-manifest-0001"
+RESUME_KEY = "m24-h4-resume-0001"
+INTERRUPT_KEY = "m24-h4-interrupt-0001"
+COLLECT_KEY = "m24-h4-collect-0001"
+EXPECTED_ENV_KEYS = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "TMPDIR",
+        "LANG",
+        "LC_ALL",
+        "CODEX_HOME",
+        "AUTOWORK_SESSION_ID",
+        "AUTOWORK_SESSION_SOCKET",
+        "AUTOWORK_BACKEND_URL",
+    }
+)
+
+
+@pytest.fixture
+def session_base() -> Iterator[Path]:
+    """A short base under ``/tmp`` so the per-session UDS path fits 108 bytes."""
+    path = Path(tempfile.mkdtemp(prefix="m24h4-"))
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Fixtures: the fake codex executable and the explicit bwrap stub
+# ---------------------------------------------------------------------------
+
+
+def _install_fake_codex(base: Path, *, omit_flags: tuple[str, ...] = ()) -> Path:
+    """Install the deterministic ``codex`` stand-in with the real help fixture."""
+    bin_dir = base / "fake-codex-bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    target = bin_dir / "codex"
+    shutil.copyfile(FAKE_CODEX_SOURCE, target)
+    shutil.copyfile(CODEX_HELP_FIXTURE, bin_dir / CODEX_HELP_FIXTURE.name)
+    target.chmod(0o755)
+    mode_path = bin_dir / "fake-codex-mode.json"
+    if omit_flags:
+        mode_path.write_text(json.dumps({"omit_flags": list(omit_flags)}), encoding="utf-8")
+    elif mode_path.exists():
+        mode_path.unlink()
+    return target
+
+
+def _install_stub_bwrap(base: Path) -> Path:
+    """A named stand-in that records its argv and execs the inner argv; it creates no namespaces."""
+    path = base / "fake-bwrap.sh"
+    path.write_text(
+        "#!/bin/sh\n"
+        "# Deterministic bwrap stand-in: record the mount options, exec the inner argv.\n"
+        'log="$(dirname "$0")/fake-bwrap-invocations.log"\n'
+        '{ printf \'%s\\n\' "$@" >> "$log"; printf -- \'---\\n\' >> "$log"; }\n'
+        'while [ "$#" -gt 0 ]; do\n'
+        '  if [ "$1" = "--" ]; then shift; exec "$@"; fi\n'
+        "  shift\n"
+        "done\n"
+        "exit 64\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
+def _bwrap_invocations(base: Path) -> list[list[str]]:
+    log = base / "fake-bwrap-invocations.log"
+    if not log.exists():
+        return []
+    entries: list[list[str]] = []
+    current: list[str] = []
+    for line in log.read_text(encoding="utf-8").splitlines():
+        if line == "---":
+            entries.append(current)
+            current = []
+        else:
+            current.append(line)
+    return entries
+
+
+def _fixture_section(command: str) -> str:
+    """Return the captured ``$ codex <command>`` help section verbatim."""
+    marker = f"$ codex {command}\n"
+    text = CODEX_HELP_FIXTURE.read_text(encoding="utf-8")
+    start = text.index(marker) + len(marker)
+    following = text.find("\n$ codex ", start)
+    return text[start:] if following < 0 else text[start : following + 1]
+
+
+def _flags_in(text: str) -> set[str]:
+    """Extract flag tokens from one captured ``--help`` section."""
+    tokens: set[str] = set()
+    for word in text.replace(",", " ").split():
+        candidate = word.rstrip(".,")
+        if candidate.startswith("--") and candidate[2:3].isalpha():
+            tokens.add(candidate)
+        elif len(candidate) == 2 and candidate.startswith("-") and candidate[1:2].isalpha():
+            tokens.add(candidate)
+    return tokens
+
+
+def _session_record(*, model: str | None = "fake-model") -> SessionRecord:
+    return SessionRecord(
+        session_id=SESSION_ID,
+        adapter_kind="codex",
+        workspace_id=WORKSPACE_ID,
+        investigation_id=INVESTIGATION_ID,
+        task_id=TASK_ID,
+        handoff=HandoffRef(handoff_id=HANDOFF_ID, version=3, sha256="b" * 64),
+        lease_fence=7,
+        allowed_workspace_paths=("notes/humaines", "results"),
+        skill_names=(),
+        model=model,
+        prompt_sha256="a" * 64,
+        capability_sha256="c" * 64,
+        confinement={},
+        budgets=BudgetSpec(wall_seconds=30, max_output_bytes=1_048_576, max_instructions=8),
+        state=SessionState.READY,
+        state_version=1,
+        generation=1,
+    )
+
+
+def _make_context(base: Path, *, resume: bool = False) -> sessions.LaunchContext:
+    session_directory = base / "run" / "sessions" / SESSION_ID
+    for name in ("ipc", "scratch", "scratch/work", "home", "config", "cache", "tmp"):
+        (session_directory / name).mkdir(parents=True, exist_ok=True)
+    brief = {
+        "schema": "autowork-session-brief.v1",
+        "session_id": SESSION_ID,
+        "task_id": TASK_ID,
+        "handoff": {"handoff_id": HANDOFF_ID, "version": 3, "sha256": "b" * 64},
+        "output_conventions": "notes/ and result.md",
+    }
+    prompt_path = session_directory / "prompt.json"
+    prompt_path.write_text(json.dumps(brief, separators=(",", ":")), encoding="utf-8")
+    (session_directory / "config" / "shim.py").write_text("# shim placeholder\n", encoding="utf-8")
+    workspace_directory = base / "workspaces" / DELIVERY_CODE / ARTICLE_SLUG
+    (workspace_directory / "notes" / "humaines").mkdir(parents=True, exist_ok=True)
+    (workspace_directory / "results").mkdir(parents=True, exist_ok=True)
+    return sessions.LaunchContext(
+        session_id=SESSION_ID,
+        record=_session_record(),
+        session_directory=session_directory,
+        scratch_directory=session_directory / "scratch",
+        work_directory=session_directory / "scratch" / "work",
+        home_directory=session_directory / "home",
+        config_directory=session_directory / "config",
+        ipc_socket_path=session_directory / "ipc" / "shim.sock",
+        prompt_path=prompt_path,
+        run=1,
+        resume=resume,
+        fake_scenario="success",
+        workspace_directory=workspace_directory,
+        skills_directory=None,
+    )
+
+
+def _after_bwrap_separator(argv: tuple[str, ...]) -> list[str]:
+    return list(argv[argv.index("--") + 1 :])
+
+
+def _argv_flags(argv: list[str]) -> set[str]:
+    return {token for token in argv if token.startswith("-") and token != "-"}
+
+
+# ---------------------------------------------------------------------------
+# Red oracles named by the H4 lot
+# ---------------------------------------------------------------------------
+
+
+def test_codex_argv_uses_probed_modes_only(tmp_path: Path) -> None:
+    fake = _install_fake_codex(tmp_path)
+    stub = _install_stub_bwrap(tmp_path)
+    profile = CodexProfile(binary=fake, bwrap=stub)
+    probe = profile.probe(now="2026-11-22T00:00:00Z")
+    assert probe.adapter_kind == "codex"
+    assert probe.version == "0.163.0"
+    assert probe.flags.non_interactive is True
+    assert probe.flags.json_events is True
+    assert probe.flags.resume is False  # resume re-arming is UNPROVEN by default
+    assert probe.flags.streaming_stdin is False
+    assert probe.flags.mcp_per_invocation is False
+
+    context = _make_context(tmp_path)
+    plan = profile.build_launch_plan(context)
+    assert plan.uses_bwrap is True
+    cli = _after_bwrap_separator(plan.argv)
+    assert cli[0] == str(fake.resolve())
+    assert cli[:2] == [str(fake.resolve()), "exec"]
+    assert "resume" not in cli
+    assert "--json" in cli
+    assert "--ephemeral" in cli  # the conservative no-persistence default
+    assert "-C" in cli
+    assert "--add-dir" not in cli
+    assert "-s" not in cli
+    assert cli[-1] == "-"  # prompt is read from the supervisor-fed stdin
+    exec_flags = _flags_in(_fixture_section("exec --help"))
+    assert _argv_flags(cli) <= exec_flags, sorted(_argv_flags(cli) - exec_flags)
+
+    # A binary that does not print every required flag is refused before argv exists.
+    reduced = _install_fake_codex(tmp_path / "reduced", omit_flags=("--json",))
+    with pytest.raises(CapabilityUnavailableError):
+        CodexProfile(binary=reduced, bwrap=stub).probe(now="2026-11-22T00:00:00Z")
+
+
+def test_codex_resume_never_relaunches_without_probe(
+    session_base: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _install_fake_codex(session_base)
+    stub = _install_stub_bwrap(session_base)
+    profile = CodexProfile(binary=fake, bwrap=stub)
+    context = _make_context(tmp_path, resume=True)
+    with pytest.raises(ResumeUnavailableError):
+        profile.build_launch_plan(context)
+
+    monkeypatch.setenv("AUTOWORK_CODEX_BINARY", str(fake))
+    monkeypatch.setenv("AUTOWORK_CODEX_BWRAP", str(stub))
+    monkeypatch.delenv("AUTOWORK_CODEX_RESUME_PROVEN", raising=False)
+    with running_session_agent(session_base) as running, running.client() as client:
+        workspace_id = running.ensure_workspace(client)
+        prepared = _prepare_codex(client, running, workspace_id)
+        assert prepared.status_code == 200, prepared.text
+        assert _post_manifest(client, running).status_code == 200
+        _write_scenario(running, {"outcome": "success", "final_message": "first turn"})
+        started = post_session(client, running, f"/v1/sessions/{SESSION_ID}/start", {}, START_KEY)
+        assert started.status_code == 200, started.text
+        wait_for_state(client, running, "stopped")
+
+        response = post_session(
+            client,
+            running,
+            f"/v1/sessions/{SESSION_ID}/resume",
+            {"reason": "no probe"},
+            RESUME_KEY,
+        )
+        assert response.status_code == 409, response.text
+        assert response.json()["error"] == "resume_unavailable"
+        status = get_session(client, running, f"/v1/sessions/{SESSION_ID}").json()
+        assert status["state"] == "stopped"
+        assert len(status["runs"]) == 1
+
+
+def test_resume_unprints_no_invented_flags(tmp_path: Path) -> None:
+    fake = _install_fake_codex(tmp_path)
+    stub = _install_stub_bwrap(tmp_path)
+    profile = CodexProfile(binary=fake, bwrap=stub, resume_proven=True)
+    probe = profile.probe(now="2026-11-22T00:00:00Z")
+    assert probe.flags.resume is True
+
+    exec_plan = profile.build_launch_plan(_make_context(tmp_path))
+    resume_plan = profile.build_launch_plan(_make_context(tmp_path, resume=True))
+    exec_cli = _after_bwrap_separator(exec_plan.argv)
+    resume_cli = _after_bwrap_separator(resume_plan.argv)
+    assert "--ephemeral" not in exec_cli  # a resumable session must persist
+    assert resume_cli[:3] == [str(fake.resolve()), "exec", "resume"]
+    assert "--last" in resume_cli
+    assert "-C" not in resume_cli  # `exec resume --help` does not print -C/--cd
+    assert resume_cli[-1] == "-"
+    exec_flags = _flags_in(_fixture_section("exec --help"))
+    resume_flags = _flags_in(_fixture_section("exec resume --help"))
+    assert _argv_flags(exec_cli) <= exec_flags, sorted(_argv_flags(exec_cli) - exec_flags)
+    assert _argv_flags(resume_cli) <= resume_flags, sorted(_argv_flags(resume_cli) - resume_flags)
+
+
+# ---------------------------------------------------------------------------
+# Profile contract details
+# ---------------------------------------------------------------------------
+
+
+def test_codex_probe_records_unproven_capabilities(tmp_path: Path) -> None:
+    fake = _install_fake_codex(tmp_path)
+    stub = _install_stub_bwrap(tmp_path)
+    profile = CodexProfile(binary=fake, bwrap=stub)
+    probe = profile.probe(now="2026-11-22T00:00:00Z")
+    capabilities = probe.confinement["capabilities"]
+    assert isinstance(capabilities, dict)
+    assert capabilities["output_last_message_flag"]["proven"] is True
+    for name in (
+        "mcp_config_toml_schema",
+        "mcp_exec_tool_exposure",
+        "jsonl_event_schema",
+        "final_message_content",
+        "provider_credentials",
+        "resume_rearming",
+        "live_instruction",
+        "cli_interrupt",
+    ):
+        assert capabilities[name]["proven"] is False, name
+    assert probe.confinement["bwrap_ok"] is True
+    assert probe.confinement["netns"] is False
+    # The stub is named by hash: the mocked sandbox is never silent.
+    assert probe.confinement["bwrap_sha256"] == hashlib.sha256(stub.read_bytes()).hexdigest()
+    # probed_at varies but the capability digest is stable for the same facts,
+    # which the backend compares between its probe and the host prepare.
+    later = profile.probe(now="2026-11-22T01:02:03Z")
+    assert later.probe_sha256 == probe.probe_sha256
+
+
+def test_codex_prepare_fails_closed_without_bwrap(
+    session_base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _install_fake_codex(session_base)
+    monkeypatch.setenv("AUTOWORK_CODEX_BINARY", str(fake))
+    monkeypatch.setenv("AUTOWORK_CODEX_BWRAP", str(session_base / "missing-bwrap"))
+    with running_session_agent(session_base) as running, running.client() as client:
+        workspace_id = running.ensure_workspace(client)
+        response = _prepare_codex(client, running, workspace_id)
+        assert response.status_code == 503, response.text
+        payload = response.json()
+        assert payload["error"] == "confinement_unavailable"
+        assert payload["details"]["reason"]
+        assert not running.session_dir().exists()
+
+
+def test_codex_env_is_closed_and_credentials_stay_private(tmp_path: Path) -> None:
+    fake = _install_fake_codex(tmp_path)
+    stub = _install_stub_bwrap(tmp_path)
+    auth_source = tmp_path / "auth-source.json"
+    auth_source.write_text('{"token": "synthetic-provider-token"}\n', encoding="utf-8")
+    profile = CodexProfile(binary=fake, bwrap=stub, auth_file=auth_source)
+    context = _make_context(tmp_path)
+    plan = profile.build_launch_plan(context)
+
+    assert set(plan.env) == EXPECTED_ENV_KEYS
+    assert plan.env["CODEX_HOME"] == str(context.config_directory / "codex")
+    assert plan.env["HOME"] == str(context.home_directory)
+    joined = "\0".join(plan.argv) + "\0" + "\0".join(plan.env.values())
+    assert plan.stdin_data is not None
+    joined += "\0" + plan.stdin_data.decode("utf-8")
+    assert "synthetic-provider-token" not in joined
+
+    auth_copy = context.config_directory / "codex" / "auth.json"
+    assert auth_copy.read_bytes() == auth_source.read_bytes()
+    assert stat.S_IMODE(auth_copy.stat().st_mode) == 0o600
+    config_toml = (context.config_directory / "codex" / "config.toml").read_text(encoding="utf-8")
+    assert "[mcp_servers.autowork]" in config_toml
+    assert str(context.config_directory / "shim.py") in config_toml
+    assert "AUTOWORK_SESSION_SOCKET" in config_toml
+    assert "--ignore-user-config" not in _after_bwrap_separator(plan.argv)
+
+
+def test_codex_prompt_carries_preamble_and_handoff_reference(tmp_path: Path) -> None:
+    fake = _install_fake_codex(tmp_path)
+    stub = _install_stub_bwrap(tmp_path)
+    profile = CodexProfile(binary=fake, bwrap=stub)
+    context = _make_context(tmp_path)
+    plan = profile.build_launch_plan(context)
+    assert plan.stdin_data is not None
+    prompt = plan.stdin_data.decode("utf-8")
+    assert prompt.startswith(SYSTEM_PREAMBLE)
+    assert HANDOFF_ID in prompt
+    assert "version=3" in prompt
+    assert "G2/G3" in prompt
+    assert "untrusted" in prompt.lower()
+
+    handoff = context.config_directory / "handoff.json"
+    handoff.write_text('{"objective": "synthetic"}\n', encoding="utf-8")
+    with_handoff = profile.build_launch_plan(context)
+    assert with_handoff.stdin_data is not None
+    assert "config/handoff.json" in with_handoff.stdin_data.decode("utf-8")
+
+
+def test_codex_fails_closed_when_bwrap_is_unavailable(tmp_path: Path) -> None:
+    fake = _install_fake_codex(tmp_path)
+    missing = tmp_path / "missing-bwrap"
+    profile = CodexProfile(binary=fake, bwrap=missing)
+    probe = profile.probe(now="2026-11-22T00:00:00Z")
+    assert probe.confinement["bwrap_ok"] is False
+    assert isinstance(probe.confinement["bwrap_reason"], str)
+    with pytest.raises(ConfinementUnavailableError) as raised:
+        profile.build_launch_plan(_make_context(tmp_path))
+    assert raised.value.details.get("reason")
+
+
+def test_codex_event_parser_is_tolerant_and_bounded() -> None:
+    event = parse_event_line(b'{"type": "turn.completed", "usage": {"input_tokens": 3}}\n')
+    assert event is not None
+    assert event.kind == "turn.completed"
+    assert supervisor_event_kind(event) == EventKind.OUTPUT_CHUNK
+    assert parse_event_line(b"not json at all\n") is None
+    assert parse_event_line(b"[1, 2, 3]\n") is None
+    assert parse_event_line(b"   \n") is None
+
+    oversized = json.dumps({"type": "item.completed", "text": "x" * 200_000}).encode()
+    bounded = parse_event_line(oversized)
+    assert bounded is not None
+    assert len(bounded.detail) <= MAX_EVENT_DETAIL_CHARS
+
+
+def test_read_final_message_refuses_links_and_oversize(tmp_path: Path) -> None:
+    final = tmp_path / "final-message.txt"
+    final.write_text("codex final message", encoding="utf-8")
+    assert read_final_message(final) == "codex final message"
+    link = tmp_path / "link.txt"
+    link.symlink_to(final)
+    assert read_final_message(link) is None
+    assert read_final_message(tmp_path / "absent.txt") is None
+    final.write_text("x" * 32, encoding="utf-8")
+    assert read_final_message(final, limit=8) is None
+
+
+# ---------------------------------------------------------------------------
+# End-to-end through the H1 supervisor (fake codex + explicit bwrap stub)
+# ---------------------------------------------------------------------------
+
+
+def test_codex_profile_lifecycle_through_supervisor(
+    session_base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _install_fake_codex(session_base)
+    stub = _install_stub_bwrap(session_base)
+    monkeypatch.setenv("AUTOWORK_CODEX_BINARY", str(fake))
+    monkeypatch.setenv("AUTOWORK_CODEX_BWRAP", str(stub))
+    monkeypatch.delenv("AUTOWORK_CODEX_AUTH_FILE", raising=False)
+    monkeypatch.delenv("AUTOWORK_CODEX_RESUME_PROVEN", raising=False)
+    with running_session_agent(session_base) as running, running.client() as client:
+        workspace_id = running.ensure_workspace(client)
+        prepared = _prepare_codex(client, running, workspace_id)
+        assert prepared.status_code == 200, prepared.text
+        body = prepared.json()
+        confinement = body["confinement"]
+        assert confinement["profile"] == "bwrap-reasoning-session"
+        assert confinement["bwrap_ok"] is True
+        assert confinement["bwrap_sha256"] == hashlib.sha256(stub.read_bytes()).hexdigest()
+        assert _post_manifest(client, running).status_code == 200
+        _write_scenario(
+            running,
+            {
+                "outcome": "success",
+                "final_message": "codex fake final message",
+                "note_text": "# agent note\n\nsynthetic\n",
+            },
+        )
+
+        started = post_session(client, running, f"/v1/sessions/{SESSION_ID}/start", {}, START_KEY)
+        assert started.status_code == 200, started.text
+        status = wait_for_state(client, running, "stopped")
+        assert status["exit"] == {"code": 0, "signal": None}
+        assert len(status["runs"]) == 1
+
+        observation = _last_observation(running)
+        argv = observation["argv"]
+        assert isinstance(argv, list)
+        # The stub execs the inner argv, so the CLI sees exactly the profile argv.
+        cli = [str(item) for item in argv]
+        assert cli[:2] == [str(fake.resolve()), "exec"]
+        assert "--ephemeral" in cli
+        stdin_bytes = observation["stdin_bytes"]
+        assert isinstance(stdin_bytes, int) and stdin_bytes >= len(SYSTEM_PREAMBLE)
+        assert observation["mode"] == "exec"
+        invocations = _bwrap_invocations(session_base)
+        launched = [entry for entry in invocations if "exec" in entry and "--json" in entry]
+        assert len(launched) == 1, invocations
+        assert "--unshare-pid" in launched[0]
+        assert "--unshare-net" not in launched[0]
+        assert "--dangerously-bypass-approvals-and-sandbox" in launched[0]
+
+        final_path = running.session_dir() / "scratch" / "work" / "final-message.txt"
+        assert read_final_message(final_path) == "codex fake final message"
+
+        collected = post_session(
+            client,
+            running,
+            f"/v1/sessions/{SESSION_ID}/collect",
+            {"capture": True},
+            COLLECT_KEY,
+        )
+        assert collected.status_code == 200, collected.text
+        result = collected.json()
+        assert f"notes/agents/{TASK_ID}/agent-note.md" in result["captured_notes"]
+        paths = {item["path"] for item in result["files"]}
+        assert f"results/sessions/{SESSION_ID}/result.md" in paths
+        kinds = [event["kind"] for event in session_events(client, running)]
+        assert "process_started" in kinds
+        assert "process_exited" in kinds
+
+
+def test_codex_profile_interrupt_kills_process_group(
+    session_base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _install_fake_codex(session_base)
+    stub = _install_stub_bwrap(session_base)
+    monkeypatch.setenv("AUTOWORK_CODEX_BINARY", str(fake))
+    monkeypatch.setenv("AUTOWORK_CODEX_BWRAP", str(stub))
+    with running_session_agent(session_base) as running, running.client() as client:
+        workspace_id = running.ensure_workspace(client)
+        assert _prepare_codex(client, running, workspace_id).status_code == 200
+        assert _post_manifest(client, running).status_code == 200
+        _write_scenario(running, {"outcome": "hang"})
+        started = post_session(client, running, f"/v1/sessions/{SESSION_ID}/start", {}, START_KEY)
+        assert started.status_code == 200, started.text
+        running_status = wait_for_state(client, running, "running")
+        pid = running_status["runs"][0]["pid"]
+        assert isinstance(pid, int) and proc_alive(pid)
+
+        interrupted = post_session(
+            client,
+            running,
+            f"/v1/sessions/{SESSION_ID}/interrupt",
+            {"reason": "qualification"},
+            INTERRUPT_KEY,
+        )
+        assert interrupted.status_code == 200, interrupted.text
+        status = wait_for_state(client, running, "stopped")
+        assert status["exit"]["signal"] in {15, 9}
+        wait_for_process_gone(pid)
+
+
+def test_codex_profile_resume_runs_only_when_proven(
+    session_base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _install_fake_codex(session_base)
+    stub = _install_stub_bwrap(session_base)
+    monkeypatch.setenv("AUTOWORK_CODEX_BINARY", str(fake))
+    monkeypatch.setenv("AUTOWORK_CODEX_BWRAP", str(stub))
+    monkeypatch.setenv("AUTOWORK_CODEX_RESUME_PROVEN", "1")
+    with running_session_agent(session_base) as running, running.client() as client:
+        workspace_id = running.ensure_workspace(client)
+        assert _prepare_codex(client, running, workspace_id).status_code == 200
+        assert _post_manifest(client, running).status_code == 200
+        _write_scenario(running, {"outcome": "success", "final_message": "turn"})
+        started = post_session(client, running, f"/v1/sessions/{SESSION_ID}/start", {}, START_KEY)
+        assert started.status_code == 200, started.text
+        wait_for_state(client, running, "stopped")
+
+        resumed = post_session(
+            client,
+            running,
+            f"/v1/sessions/{SESSION_ID}/resume",
+            {"reason": "proven"},
+            RESUME_KEY,
+        )
+        assert resumed.status_code == 200, resumed.text
+        assert resumed.json()["run"] == 2
+        status = wait_for_state(client, running, "stopped")
+        assert len(status["runs"]) == 2
+        observations = _all_observations(running)
+        assert len(observations) == 2
+        first, second = observations
+        first_argv = first["argv"]
+        assert isinstance(first_argv, list)
+        assert "--ephemeral" not in first_argv
+        second_argv = second["argv"]
+        assert isinstance(second_argv, list)
+        resume_cli = [str(item) for item in second_argv]
+        assert resume_cli[:3] == [str(fake.resolve()), "exec", "resume"]
+        assert "--last" in resume_cli
+
+
+# ---------------------------------------------------------------------------
+# HTTP helpers for the Codex adapter kind
+# ---------------------------------------------------------------------------
+
+
+def _prepare_codex(client, running, workspace_id: str):
+    payload = prepare_payload(workspace_id, adapter_kind="codex")
+    return post_session(client, running, "/v1/sessions", payload, PREPARE_KEY)
+
+
+def _post_manifest(client, running):
+    tool = {
+        "mcp_name": "autowork_task_heartbeat",
+        "broker_name": "task.heartbeat",
+        "schema_version": "1",
+        "input_schema": {"type": "object"},
+        "effect": "read",
+        "cost": "0",
+        "capability": None,
+    }
+    digest = hashlib.sha256(
+        json.dumps({"tools": [tool]}, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return post_session(
+        client,
+        running,
+        f"/v1/sessions/{SESSION_ID}/tool-manifest",
+        {"manifest_sha256": digest, "tools": [tool]},
+        MANIFEST_KEY,
+    )
+
+
+def _write_scenario(running, scenario: dict[str, object], *, session_id: str = SESSION_ID) -> Path:
+    path = Path(running.session_dir(session_id) / "scratch" / "work" / "fake-codex-scenario.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(scenario, separators=(",", ":")), encoding="utf-8")
+    return path
+
+
+def _all_observations(running, *, session_id: str = SESSION_ID) -> list[dict[str, object]]:
+    path = running.session_dir(session_id) / "scratch" / "work" / "fake-codex-observations.jsonl"
+    if not path.exists():
+        return []
+    entries: list[dict[str, object]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        value = json.loads(line)
+        if isinstance(value, dict):
+            entries.append({str(key): item for key, item in value.items()})
+    return entries
+
+
+def _last_observation(running, *, session_id: str = SESSION_ID) -> dict[str, object]:
+    entries = _all_observations(running, session_id=session_id)
+    assert entries, "the fake codex wrote no observation"
+    return entries[-1]
