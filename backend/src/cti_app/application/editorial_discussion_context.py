@@ -16,9 +16,12 @@ from cti_app.application.editorial_conversation_turns import (
 )
 from cti_app.application.editorial_thread_common import decode_thread_request
 from cti_app.application.editorial_threads import EditorialThreadApplicationError
+from cti_app.application.editorial_visual_revision import VisualRevisionContext
 from cti_app.application.editorial_workspace import EditorialWorkspaceService
 from cti_app.application.editorial_workspace.registry import (
+    WorkspaceOccurrenceResolution,
     bar_chart_insertion_preparation_ready,
+    read_pointer,
     revision_target_path,
     table_insertion_preparation_ready,
 )
@@ -45,12 +48,23 @@ from cti_app.domain.editorial_thread import (
 )
 from cti_app.domain.model_runs import EDITORIAL_DISCUSSION_PROMPT_ID
 from cti_app.domain.production import (
+    ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
+    ProductionInputSnapshot,
+)
+from cti_app.domain.production_editorial_enrichment import (
+    MAX_BAR_CHART_POINTS,
+    EditorialEnrichmentElementKind,
+    editorial_enrichment_from_json,
 )
 from cti_app.domain.production_editorial_revision import TargetedEditorialRevisionOperation
-from cti_app.domain.production_extraction import production_extraction_from_json
+from cti_app.domain.production_extraction import (
+    ProductionExtractionV1,
+    production_extraction_from_json,
+)
 from cti_app.domain.production_relevance import (
+    RelevanceProjectionV1,
     relevance_projection_from_json,
     validate_relevance_projection_lineage,
 )
@@ -245,10 +259,15 @@ class EditorialDiscussionContextBuilder:
             raise EditorialThreadApplicationError("editorial_context_unavailable") from None
         stage = getattr(resolution.entry, "source_stage", None)
         stage_value = getattr(stage, "value", stage)
+        pinned_artifact_id: object
+        pinned_version: object
+        pinned_sha256: object
         if stage_value == "editorial_enrichment":
             pinned_artifact_id = snapshot_view.get("enrichment_artifact_id")
             pinned_version = snapshot_view.get("enrichment_version")
-            pinned_sha256 = snapshot_view.get("enrichment_canonical_sha256")
+            # The public snapshot DTO pins the enrichment artifact identity but
+            # not its canonical hash; the resolution carries the exact hash.
+            pinned_sha256 = resolution.canonical_sha256
         else:
             pinned_artifact_id = snapshot_view.get("synthesis_artifact_id")
             pinned_version = snapshot_view.get("synthesis_version")
@@ -305,6 +324,12 @@ class EditorialDiscussionContextBuilder:
             offered_operations
             & TargetedEditorialRevisionOperation.paragraph_enrichment_insertion_values()
         )
+        element_kind = _enrichment_element_kind(stage_value, target.get("kind"))
+        element_visual_operations = (
+            offered_operations & _visual_element_operation_values()
+            if element_kind is not None
+            else set()
+        )
         proposal_target_path = (
             revision_target_path(resolution.entry) if resolution.entry is not None else None
         )
@@ -334,6 +359,15 @@ class EditorialDiscussionContextBuilder:
                 )
                 else None
             )
+            if (
+                synthesis_artifact is None
+                and run is not None
+                and element_kind is not None
+                and element_visual_operations
+            ):
+                synthesis_artifact = await uow.production_artifacts.get_current(
+                    run.id, ProductionArtifactStage.SYNTHESIS.value
+                )
             extraction_artifact = (
                 await uow.production_artifacts.get_current(
                     run.id, ProductionArtifactStage.EXTRACTION.value
@@ -352,7 +386,8 @@ class EditorialDiscussionContextBuilder:
                 await uow.production_artifacts.get_current(
                     run.id, ProductionArtifactStage.EDITORIAL_ENRICHMENT.value
                 )
-                if run is not None and paragraph_enrichment_insertions
+                if run is not None
+                and (paragraph_enrichment_insertions or element_visual_operations)
                 else None
             )
             current_subject = await uow.subjects.get(origin.subject_id)
@@ -506,6 +541,22 @@ class EditorialDiscussionContextBuilder:
 
         enrichment_proposal_context: Mapping[str, object] | None = None
         enrichment_admitted: list[EditorialEvidenceEntry] | None = None
+        if element_kind is not None and element_visual_operations:
+            enrichment_proposal_context, enrichment_admitted = await _element_proposal_context(
+                element_kind=element_kind,
+                target=target,
+                occurrence_id=origin.occurrence_id,
+                resolution=resolution,
+                proposal_target_path=proposal_target_path,
+                pinned_sha256=pinned_sha256,
+                run_id=run.id,
+                production_snapshot=production_snapshot,
+                extraction=extraction,
+                projection=projection,
+                synthesis_artifact=synthesis_artifact,
+                enrichment_artifact=enrichment_artifact,
+                artifact_store=self._artifact_store,
+            )
         can_check_paragraph_enrichment = (
             stage_value == "synthesis"
             and kind in {"paragraph", "lead_paragraph"}
@@ -685,6 +736,12 @@ class EditorialDiscussionContextBuilder:
                 if base.proposal_enrichment_context is not None
                 else None
             ),
+            "proposal_current_element": (
+                base.proposal_enrichment_context.get("current_element")
+                if base.proposal_enrichment_context is not None
+                and base.proposal_enrichment_context.get("mode") == "element"
+                else None
+            ),
         }
         context_sha256 = hashlib.sha256(
             json.dumps(
@@ -742,6 +799,251 @@ class EditorialDiscussionContextBuilder:
         return body
 
 
+_MAX_CURRENT_DIAGRAM_NODES = 64
+_MAX_CURRENT_DIAGRAM_EDGES = 96
+_MAX_CURRENT_DIAGRAM_GROUPS = 16
+
+
+def _enrichment_element_kind(
+    stage: str | None, kind_value: object
+) -> EditorialEnrichmentElementKind | None:
+    """Typed element family for one enrichment occurrence, never from its text."""
+    if stage != "editorial_enrichment" or not isinstance(kind_value, str):
+        return None
+    try:
+        return EditorialEnrichmentElementKind(kind_value)
+    except ValueError:
+        return None
+
+
+def _visual_element_operation_values() -> set[str]:
+    """Bridge-offered visual corrections; move/reorder/replace/remove stay manual."""
+    return {
+        TargetedEditorialRevisionOperation.REWRITE_CHART.value,
+        TargetedEditorialRevisionOperation.REWRITE_DIAGRAM.value,
+        TargetedEditorialRevisionOperation.UPDATE_VISUAL_CAPTION.value,
+    }
+
+
+async def _element_proposal_context(
+    *,
+    element_kind: EditorialEnrichmentElementKind,
+    target: EditorialWorkspaceBlock,
+    occurrence_id: UUID,
+    resolution: WorkspaceOccurrenceResolution,
+    proposal_target_path: str | None,
+    pinned_sha256: object,
+    run_id: UUID,
+    production_snapshot: ProductionInputSnapshot,
+    extraction: ProductionExtractionV1,
+    projection: RelevanceProjectionV1 | None,
+    synthesis_artifact: ProductionArtifact | None,
+    enrichment_artifact: ProductionArtifact | None,
+    artifact_store: ProductionArtifactStore,
+) -> tuple[Mapping[str, object] | None, list[EditorialEvidenceEntry] | None]:
+    """Build the pinned element context a Bridge visual correction may edit.
+
+    The element identity is the registry occurrence's structural pointer; the
+    bounded projection carries composition fields only, never asset bytes or
+    evidence text beyond the authorized enrichment dossier.
+    """
+    record = resolution.record
+    if (
+        resolution.entry is None
+        or resolution.entry.block_id != occurrence_id
+        or resolution.entry not in record.block_registry
+        or record.enrichment_canonical_sha256 is None
+        or synthesis_artifact is None
+        or synthesis_artifact.status is not ProductionArtifactStatus.VERIFIED
+        or synthesis_artifact.canonical_blob_id is None
+        or synthesis_artifact.production_run_id != record.production_run_id
+        or synthesis_artifact.subject_id != record.subject_id
+        or synthesis_artifact.id != record.synthesis_artifact_id
+        or synthesis_artifact.version != record.synthesis_version
+        or synthesis_artifact.input_hash != record.synthesis_input_hash
+        or enrichment_artifact is None
+        or enrichment_artifact.status is not ProductionArtifactStatus.VERIFIED
+        or enrichment_artifact.canonical_blob_id is None
+        or enrichment_artifact.production_run_id != record.production_run_id
+        or enrichment_artifact.subject_id != record.subject_id
+        or enrichment_artifact.id != resolution.artifact_id
+        or enrichment_artifact.version != resolution.artifact_version
+        or enrichment_artifact.input_hash != record.enrichment_input_hash
+    ):
+        return None, None
+    try:
+        synthesis = production_synthesis_from_json(
+            await artifact_store.read_json(synthesis_artifact.canonical_blob_id)
+        )
+        enrichment_bytes = await artifact_store.read_bytes(enrichment_artifact.canonical_blob_id)
+        enrichment_digest = hashlib.sha256(enrichment_bytes).hexdigest()
+        if (
+            enrichment_digest != pinned_sha256
+            or enrichment_digest != record.enrichment_canonical_sha256
+        ):
+            raise ValueError("enrichment_bytes_mismatch")
+        enrichment_payload = json.loads(enrichment_bytes)
+        if not isinstance(enrichment_payload, dict):
+            raise ValueError("enrichment_payload_invalid")
+        base_enrichment = editorial_enrichment_from_json(enrichment_payload)
+        element_payload = read_pointer(enrichment_payload, resolution.entry.structural_pointer)
+        if not isinstance(element_payload, Mapping):
+            raise ValueError("element_payload_invalid")
+        element_key = element_payload.get("key")
+        if not isinstance(element_key, str) or not element_key.strip():
+            raise ValueError("element_key_invalid")
+        evidence_pack = build_editorial_enrichment_evidence_pack(
+            production_snapshot,
+            extraction,
+            synthesis,
+            projection,
+            workspace_record=record,
+        )
+        visual_context = VisualRevisionContext(
+            base_enrichment=base_enrichment,
+            evidence_pack=evidence_pack,
+            extraction=extraction,
+            synthesis=synthesis,
+            figure_catalog=(),
+            registered_anchor_ids=evidence_pack.registered_anchor_ids,
+            production_run_id=run_id,
+            publication_kind=record.publication_kind,
+        )
+        admitted: list[EditorialEvidenceEntry] = [
+            {"handle": str(item["handle"]), "payload": _object_mapping(item)}
+            for item in (*evidence_pack.narrative_evidence, *evidence_pack.technical_evidence)
+            if isinstance(item.get("handle"), str)
+        ]
+        return (
+            {
+                "mode": "element",
+                "element_kind": element_kind.value,
+                "element_key": element_key,
+                "current_element": _current_element_projection(
+                    element_kind,
+                    element_payload,
+                    figure_block=target.get("figure"),
+                ),
+                "target_path": proposal_target_path,
+                "entry": resolution.entry,
+                "base_content": enrichment_payload,
+                "base_artifact_id": enrichment_artifact.id,
+                "base_artifact_version": enrichment_artifact.version,
+                "base_input_hash": enrichment_artifact.input_hash,
+                "base_canonical_sha256": record.enrichment_canonical_sha256,
+                "base_pin_hash": record.workspace_pin_hash,
+                "routing_decision_hash": record.routing_decision_hash,
+                "production_run_id": run_id,
+                "evidence_pack": evidence_pack,
+                "extraction": extraction,
+                "synthesis": synthesis,
+                "figure_catalog": (),
+                "visual_context": visual_context,
+            },
+            admitted,
+        )
+    except Exception:
+        return None, None
+
+
+def _current_element_projection(
+    kind: EditorialEnrichmentElementKind,
+    element: Mapping[str, object],
+    *,
+    figure_block: object = None,
+) -> dict[str, object]:
+    """Bounded composition fields of one existing element (no bytes, no evidence)."""
+    projection: dict[str, object] = {
+        "kind": kind.value,
+        "key": str(element.get("key")),
+        "title": _bounded_text(element.get("title")),
+        "caption": _bounded_text(element.get("caption")),
+    }
+    if kind is EditorialEnrichmentElementKind.CHART:
+        projection.update(
+            {
+                "chart_kind": _bounded_text(element.get("kind")),
+                "unit": _bounded_text(element.get("unit")),
+                "category_axis_label": _bounded_text(element.get("category_axis_label")),
+                "value_axis_label": _bounded_text(element.get("value_axis_label")),
+                "points": [
+                    {
+                        "label": str(point["label"]),
+                        "series": _bounded_text(point.get("series")),
+                        "value": _bounded_text(point.get("value")),
+                        "unit": _bounded_text(element.get("unit")),
+                    }
+                    for point in _mapping_items(element.get("points"))[:MAX_BAR_CHART_POINTS]
+                    if isinstance(point.get("label"), str)
+                ],
+            }
+        )
+    elif kind is EditorialEnrichmentElementKind.DIAGRAM:
+        projection.update(
+            {
+                "direction": _bounded_text(element.get("direction")),
+                "profile": _bounded_text(element.get("profile")),
+                "nodes": [
+                    {
+                        "node_id": str(node["node_id"]),
+                        "label": str(node["label"]),
+                        "role": _bounded_text(node.get("role")),
+                    }
+                    for node in _mapping_items(element.get("nodes"))[:_MAX_CURRENT_DIAGRAM_NODES]
+                    if isinstance(node.get("node_id"), str) and isinstance(node.get("label"), str)
+                ],
+                "edges": [
+                    {
+                        "source_node_id": str(edge["source_node_id"]),
+                        "target_node_id": str(edge["target_node_id"]),
+                        "label": _bounded_text(edge.get("label")),
+                        "relation_type": _bounded_text(edge.get("relation_type")),
+                        "direction": _bounded_text(edge.get("direction")),
+                    }
+                    for edge in _mapping_items(element.get("edges"))[:_MAX_CURRENT_DIAGRAM_EDGES]
+                    if isinstance(edge.get("source_node_id"), str)
+                    and isinstance(edge.get("target_node_id"), str)
+                ],
+                "groups": [
+                    {
+                        "group_id": str(group["group_id"]),
+                        "label": str(group["label"]),
+                        "node_ids": _string_items(group.get("node_ids")),
+                    }
+                    for group in _mapping_items(element.get("groups"))[:_MAX_CURRENT_DIAGRAM_GROUPS]
+                    if isinstance(group.get("group_id"), str)
+                    and isinstance(group.get("label"), str)
+                ],
+            }
+        )
+    elif kind is EditorialEnrichmentElementKind.FIGURE:
+        original_caption = (
+            figure_block.get("original_caption") if isinstance(figure_block, Mapping) else None
+        )
+        projection["original_caption"] = _bounded_text(original_caption)
+    return projection
+
+
+def _mapping_items(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    return [
+        {str(key): item_value for key, item_value in item.items()}
+        for item in value
+        if isinstance(item, Mapping)
+    ]
+
+
+def _bounded_text(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _string_items(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]
+
+
 def _workspace_blocks(value: object) -> list[EditorialWorkspaceBlock | object]:
     if not isinstance(value, list):
         raise EditorialThreadApplicationError("editorial_context_unavailable")
@@ -761,6 +1063,18 @@ def _supported_proposal_operations(
     bar_chart_validation_ready: bool = False,
     include_manual_source_figure: bool = False,
 ) -> tuple[str, ...]:
+    if stage == "editorial_enrichment":
+        if not enrichment_validation_ready:
+            return ()
+        element_operations: list[str] = []
+        rewrite_operation = _element_rewrite_operation(block_kind)
+        if rewrite_operation is not None and rewrite_operation in offered_operations:
+            element_operations.append(rewrite_operation)
+        if TargetedEditorialRevisionOperation.UPDATE_VISUAL_CAPTION.value in offered_operations:
+            element_operations.append(
+                TargetedEditorialRevisionOperation.UPDATE_VISUAL_CAPTION.value
+            )
+        return tuple(element_operations)
     if stage != "synthesis":
         return ()
     if block_kind == "title" and "rewrite_title" in offered_operations:
@@ -781,6 +1095,14 @@ def _supported_proposal_operations(
             operations.append("create_source_figure")
         return tuple(operations)
     return ()
+
+
+def _element_rewrite_operation(block_kind: str) -> str | None:
+    if block_kind == EditorialEnrichmentElementKind.CHART.value:
+        return TargetedEditorialRevisionOperation.REWRITE_CHART.value
+    if block_kind == EditorialEnrichmentElementKind.DIAGRAM.value:
+        return TargetedEditorialRevisionOperation.REWRITE_DIAGRAM.value
+    return None
 
 
 def _object_mapping(value: Mapping[str, object]) -> dict[str, object]:

@@ -57,6 +57,8 @@ from cti_app.application.editorial_text_policy import (
     editorial_patch_text_violation as _editorial_patch_text_violation,
 )
 from cti_app.application.editorial_visual_revision import (
+    VISUAL_REVISION_ERROR_CODES,
+    VisualRevisionContext,
     VisualRevisionContextLoader,
     VisualRevisionRejected,
     plan_visual_revision,
@@ -75,6 +77,9 @@ from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_editorial_enrichment import (
     ChartProposalV1,
+    DiagramProposalV1,
+    EditorialEnrichmentEvidencePackV1,
+    EditorialEnrichmentProposalControlError,
     EditorialEnrichmentProposalV1,
     EditorialEnrichmentStageErrorCode,
     TableProposalV1,
@@ -93,6 +98,9 @@ from cti_app.domain.editorial_enrichment_patch import (
     VISUAL_REVISION_PATCH_SCHEMA_VERSION,
     MoveEnrichmentElementPatch,
     ReorderEnrichmentElementsPatch,
+    ReviseChartPatch,
+    ReviseDiagramPatch,
+    UpdateVisualCaptionPatch,
     VisualRevisionPatch,
     visual_patch_element_kind,
     visual_patch_to_json,
@@ -116,6 +124,7 @@ from cti_app.domain.editorial_proposal import (
 )
 from cti_app.domain.editorial_thread import EditorialThreadEventKind
 from cti_app.domain.editorial_workspace import (
+    BlockRegistryEntry,
     EditorialBlockKind,
     EditorialReadOnlyError,
     EditorialSourceStage,
@@ -131,8 +140,13 @@ from cti_app.domain.production_editorial_enrichment import (
     MAX_BAR_CHART_ADJUSTED_EXPONENT,
     MAX_BAR_CHART_SIGNIFICANT_DIGITS,
     ChartKind,
+    ChartPointV1,
     ChartSpecV1,
+    DiagramEdgeV1,
+    DiagramGroupV1,
+    DiagramNodeV1,
     DiagramSpecV1,
+    EditorialAnalyticPurposeV1,
     EditorialEnrichmentElementKind,
     EditorialEnrichmentV1,
     EnrichmentElementRef,
@@ -156,9 +170,11 @@ from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionTarget,
     TargetedEditorialRevisionTargetKind,
 )
+from cti_app.domain.production_extraction import ProductionExtractionV1
 from cti_app.domain.production_synthesis import (
     EvidenceKind,
     ExtractionEvidenceRefV1,
+    ProductionSynthesisV1,
     production_synthesis_from_json,
     production_synthesis_to_json,
 )
@@ -207,6 +223,383 @@ def _parse_editorial_patch_payload(value: str, *, exact_chart_numbers: bool = Fa
     if exact_chart_numbers:
         return json.loads(value, parse_float=Decimal, parse_int=Decimal)
     return json.loads(value)
+
+
+_VISUAL_PROPOSAL_OPERATION_VALUES = frozenset(
+    {
+        TargetedEditorialRevisionOperation.REWRITE_CHART.value,
+        TargetedEditorialRevisionOperation.REWRITE_DIAGRAM.value,
+        TargetedEditorialRevisionOperation.UPDATE_VISUAL_CAPTION.value,
+    }
+)
+# Codes the model may carry in a REFUSAL block for a visual revision. The
+# planner already owns this closed set; the parser only has to accept it.
+_VISUAL_MODEL_REFUSAL_CODES = frozenset({"revision_not_applicable", *VISUAL_REVISION_ERROR_CODES})
+# Every code a visual proposal may persist as a refused outcome. Wire parser
+# reason codes are bounded here so a malformed Bridge answer never becomes a
+# free-form diagnostic.
+_VISUAL_REFUSAL_CODES = frozenset(
+    {
+        *_VISUAL_MODEL_REFUSAL_CODES,
+        "revision_wire_invalid",
+        "revision_wire_duplicate_block",
+        "revision_wire_duplicate_end",
+        "revision_wire_data_after_end",
+        "revision_wire_marker_invalid",
+        "revision_wire_unexpected_text",
+        "revision_wire_end_missing",
+        "revision_wire_refusal_shape_invalid",
+        "revision_refusal_code_invalid",
+        "revision_refusal_reason_missing",
+        "revision_wire_missing_block",
+        "revision_wire_shape_invalid",
+        "revision_wire_action_invalid",
+        "revision_wire_hash_invalid",
+        "revision_wire_rationale_missing",
+        "revision_wire_after_invalid",
+        "revision_wire_after_shape_invalid",
+        "proposal_operation_unsupported",
+        "proposal_target_mismatch",
+        "proposal_base_stale",
+    }
+)
+_FENCED_AFTER_JSON = re.compile(r"```(?:json)?[ \t]*\n?(?P<body>.*?)\n?[ \t]*```", re.DOTALL)
+_CAPTION_LINE = re.compile(r"^\s*CAPTION\s*:\s*(?P<value>.*)$", re.IGNORECASE | re.MULTILINE)
+
+
+class _VisualProposalRefused(Exception):
+    """A visual Bridge answer is unusable; persisted as a closed refusal."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code if code in _VISUAL_REFUSAL_CODES else "enrichment_revision_patch_invalid"
+        super().__init__(self.code)
+
+
+def _visual_wire_refusal_code(reason_code: str) -> str:
+    return reason_code if reason_code in _VISUAL_REFUSAL_CODES else "revision_wire_invalid"
+
+
+def _after_json_text(value: str) -> str:
+    """Strip one Markdown JSON fence, keeping the fenced body when present."""
+    match = _FENCED_AFTER_JSON.search(value)
+    return (match.group("body") if match is not None else value).strip()
+
+
+def _parse_visual_json_after(value: str, *, exact_numbers: bool) -> Any:
+    try:
+        return _parse_editorial_patch_payload(
+            _after_json_text(value), exact_chart_numbers=exact_numbers
+        )
+    except (TypeError, ValueError):
+        raise _VisualProposalRefused("revision_wire_after_invalid") from None
+
+
+def _parse_visual_caption_after(value: str) -> str | None:
+    text = _after_json_text(value)
+    if text.startswith("{"):
+        try:
+            raw = json.loads(text)
+        except (TypeError, ValueError):
+            raw = None
+        if isinstance(raw, Mapping) and "caption" in raw:
+            caption = raw.get("caption")
+            if caption is not None and not isinstance(caption, str):
+                raise _VisualProposalRefused("revision_wire_after_invalid")
+            return caption
+    match = _CAPTION_LINE.search(text)
+    if match is None:
+        raise _VisualProposalRefused("revision_wire_after_invalid")
+    return match.group("value").strip() or None
+
+
+def _resolved_visual_refs(
+    handles: tuple[str, ...],
+    evidence_pack: EditorialEnrichmentEvidencePackV1,
+    *,
+    unknown_code: str,
+) -> tuple[ExtractionEvidenceRefV1, ...]:
+    references: dict[ExtractionEvidenceRefV1, None] = {}
+    for handle in handles:
+        try:
+            references[evidence_pack.resolve_handle(handle)] = None
+        except EditorialEnrichmentProposalControlError:
+            raise _VisualProposalRefused(unknown_code) from None
+    return tuple(references)
+
+
+def _canonical_visual_placement(placement: Any) -> EnrichmentPlacementV1:
+    return EnrichmentPlacementV1(
+        placement.kind,
+        section_index=placement.section_index,
+        anchor_block_id=placement.anchor_block_id,
+    )
+
+
+def _canonical_visual_purpose(
+    purpose: Any,
+    evidence_pack: EditorialEnrichmentEvidencePackV1,
+    *,
+    unknown_code: str,
+) -> EditorialAnalyticPurposeV1:
+    return EditorialAnalyticPurposeV1(
+        question=purpose.question,
+        available_data=purpose.available_data,
+        comprehension_gain=purpose.comprehension_gain,
+        scope=purpose.scope,
+        evidence_refs=_resolved_visual_refs(
+            purpose.evidence_handles, evidence_pack, unknown_code=unknown_code
+        ),
+        knowledge_limits=purpose.knowledge_limits,
+        placement_reason=purpose.placement_reason,
+    )
+
+
+def _chart_spec_from_visual_proposal(
+    chart: ChartProposalV1,
+    evidence_pack: EditorialEnrichmentEvidencePackV1,
+) -> ChartSpecV1:
+    """Resolve one proposal chart's handles into canonical references.
+
+    Only structural conversion happens here; the planner remains the single
+    semantic validator (value/unit proof, text policy, placement, no-op).
+    """
+    try:
+        return ChartSpecV1(
+            key=chart.key,
+            kind=chart.kind,
+            title=chart.title,
+            caption=chart.caption,
+            placement=_canonical_visual_placement(chart.placement),
+            purpose=_canonical_visual_purpose(
+                chart.purpose, evidence_pack, unknown_code="bar_chart_insufficient_data"
+            ),
+            points=tuple(
+                ChartPointV1(
+                    label=point.label,
+                    date=point.date,
+                    series=point.series,
+                    evidence_refs=_resolved_visual_refs(
+                        point.evidence_handles,
+                        evidence_pack,
+                        unknown_code="bar_chart_insufficient_data",
+                    ),
+                    value=point.value,
+                )
+                for point in chart.points
+            ),
+            category_axis_label=chart.category_axis_label,
+            value_axis_label=chart.value_axis_label,
+            unit=chart.unit,
+        )
+    except (TypeError, ValueError):
+        raise _VisualProposalRefused("enrichment_revision_patch_invalid") from None
+
+
+def _diagram_spec_from_visual_proposal(
+    diagram: DiagramProposalV1,
+    evidence_pack: EditorialEnrichmentEvidencePackV1,
+) -> DiagramSpecV1:
+    """Resolve one proposal diagram's handles; the planner validates the rest."""
+    unknown_code = "enrichment_revision_patch_invalid"
+    try:
+        return DiagramSpecV1(
+            key=diagram.key,
+            kind=diagram.kind,
+            title=diagram.title,
+            caption=diagram.caption,
+            direction=diagram.direction,
+            nodes=tuple(
+                DiagramNodeV1(
+                    node.node_id,
+                    node.label,
+                    _resolved_visual_refs(
+                        node.evidence_handles, evidence_pack, unknown_code=unknown_code
+                    ),
+                    role=node.role,
+                )
+                for node in diagram.nodes
+            ),
+            edges=tuple(
+                DiagramEdgeV1(
+                    edge.source_node_id,
+                    edge.target_node_id,
+                    edge.label,
+                    _resolved_visual_refs(
+                        edge.evidence_handles, evidence_pack, unknown_code=unknown_code
+                    ),
+                    relation_type=edge.relation_type,
+                    direction=edge.direction,
+                )
+                for edge in diagram.edges
+            ),
+            groups=tuple(
+                DiagramGroupV1(group.group_id, group.label, tuple(group.node_ids))
+                for group in diagram.groups
+            ),
+            placement=_canonical_visual_placement(diagram.placement),
+            purpose=_canonical_visual_purpose(
+                diagram.purpose, evidence_pack, unknown_code=unknown_code
+            ),
+            profile=diagram.profile,
+        )
+    except (TypeError, ValueError):
+        raise _VisualProposalRefused(unknown_code) from None
+
+
+def _single_visual_proposal_element(
+    raw: object,
+    *,
+    element_kind: EditorialEnrichmentElementKind,
+    element_key: str,
+    evidence_pack: EditorialEnrichmentEvidencePackV1,
+) -> ChartSpecV1 | DiagramSpecV1:
+    """Convert one one-element proposal wire into its canonical typed spec."""
+    if not isinstance(raw, Mapping):
+        raise _VisualProposalRefused("revision_wire_after_invalid")
+    try:
+        proposal = EditorialEnrichmentProposalV1.model_validate(raw)
+    except (TypeError, ValueError):
+        raise _VisualProposalRefused("revision_wire_after_shape_invalid") from None
+    if proposal.annotations or proposal.resource_needs:
+        raise _VisualProposalRefused("enrichment_revision_patch_invalid")
+    if element_kind is EditorialEnrichmentElementKind.CHART:
+        if len(proposal.charts) != 1 or proposal.tables or proposal.diagrams or proposal.figures:
+            raise _VisualProposalRefused("revision_wire_after_shape_invalid")
+        chart = proposal.charts[0]
+        if chart.key != element_key:
+            raise _VisualProposalRefused("enrichment_revision_patch_invalid")
+        return _chart_spec_from_visual_proposal(chart, evidence_pack)
+    if element_kind is EditorialEnrichmentElementKind.DIAGRAM:
+        if len(proposal.diagrams) != 1 or proposal.tables or proposal.charts or proposal.figures:
+            raise _VisualProposalRefused("revision_wire_after_shape_invalid")
+        diagram = proposal.diagrams[0]
+        if diagram.key != element_key:
+            raise _VisualProposalRefused("enrichment_revision_patch_invalid")
+        return _diagram_spec_from_visual_proposal(diagram, evidence_pack)
+    raise _VisualProposalRefused("enrichment_revision_patch_invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class _ThreadVisualRevisionParse:
+    operation: TargetedEditorialRevisionOperation
+    patch: VisualRevisionPatch | None = None
+    refusal_code: str | None = None
+    rationale: str = ""
+
+
+def _parse_thread_visual_revision(
+    raw_response: str,
+    *,
+    allowed_operations: set[str],
+    element_kind: EditorialEnrichmentElementKind,
+    element_key: str,
+    before_hash: str,
+    target_path: str | None,
+    base_canonical_sha256: str,
+    evidence_pack: EditorialEnrichmentEvidencePackV1,
+) -> _ThreadVisualRevisionParse:
+    fallback = next(
+        (
+            operation
+            for operation in TargetedEditorialRevisionOperation
+            if operation.value in _VISUAL_PROPOSAL_OPERATION_VALUES
+            and operation.value in allowed_operations
+        ),
+        None,
+    )
+    if fallback is None:
+        return _ThreadVisualRevisionParse(
+            TargetedEditorialRevisionOperation.UPDATE_VISUAL_CAPTION,
+            refusal_code="proposal_operation_unsupported",
+        )
+    try:
+        parsed = parse_wire_patch(raw_response, allowed_refusal_codes=_VISUAL_MODEL_REFUSAL_CODES)
+    except TargetedSynthesisRevisionValidationError as error:
+        return _ThreadVisualRevisionParse(
+            fallback, refusal_code=_visual_wire_refusal_code(error.reason_code)
+        )
+    if parsed.refusal_code is not None:
+        return _ThreadVisualRevisionParse(
+            fallback, refusal_code=_visual_wire_refusal_code(parsed.refusal_code)
+        )
+    operation = parsed.action
+    if (
+        operation.value not in _VISUAL_PROPOSAL_OPERATION_VALUES
+        or operation.value not in allowed_operations
+    ):
+        return _ThreadVisualRevisionParse(operation, refusal_code="proposal_operation_unsupported")
+    if parsed.base_artifact_hash != base_canonical_sha256:
+        return _ThreadVisualRevisionParse(operation, refusal_code="proposal_base_stale")
+    if target_path is None or parsed.target != target_path:
+        return _ThreadVisualRevisionParse(operation, refusal_code="proposal_target_mismatch")
+    if parsed.before_hash != before_hash:
+        return _ThreadVisualRevisionParse(operation, refusal_code="proposal_base_stale")
+    try:
+        if operation is TargetedEditorialRevisionOperation.UPDATE_VISUAL_CAPTION:
+            typed_patch: VisualRevisionPatch = UpdateVisualCaptionPatch(
+                element_kind=element_kind,
+                element_key=element_key,
+                caption=_parse_visual_caption_after(parsed.after),
+            )
+        elif operation is TargetedEditorialRevisionOperation.REWRITE_CHART:
+            chart_spec = _single_visual_proposal_element(
+                _parse_visual_json_after(parsed.after, exact_numbers=True),
+                element_kind=element_kind,
+                element_key=element_key,
+                evidence_pack=evidence_pack,
+            )
+            assert isinstance(chart_spec, ChartSpecV1)
+            typed_patch = ReviseChartPatch(element_key=element_key, chart=chart_spec)
+        else:
+            diagram_spec = _single_visual_proposal_element(
+                _parse_visual_json_after(parsed.after, exact_numbers=False),
+                element_kind=element_kind,
+                element_key=element_key,
+                evidence_pack=evidence_pack,
+            )
+            assert isinstance(diagram_spec, DiagramSpecV1)
+            typed_patch = ReviseDiagramPatch(element_key=element_key, diagram=diagram_spec)
+    except _VisualProposalRefused as refusal:
+        return _ThreadVisualRevisionParse(operation, refusal_code=refusal.code)
+    except ValueError:
+        return _ThreadVisualRevisionParse(
+            operation, refusal_code="enrichment_revision_patch_invalid"
+        )
+    return _ThreadVisualRevisionParse(operation, typed_patch, rationale=parsed.rationale)
+
+
+def _thread_turn_request_identity(
+    *,
+    thread_id: UUID,
+    model_turn_id: UUID,
+    model_run_id: UUID,
+    raw_response: str,
+    snapshot_id: UUID,
+    occurrence_id: UUID,
+) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "thread_id": str(thread_id),
+                "turn_id": str(model_turn_id),
+                "model_run_id": str(model_run_id),
+                "response_sha256": hashlib.sha256(raw_response.encode("utf-8")).hexdigest(),
+                "snapshot_id": str(snapshot_id),
+                "occurrence_id": str(occurrence_id),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class _ThreadRefusalEvent:
+    """Pre-uploaded refused-event body, appended atomically with its proposal."""
+
+    blob_id: UUID
+    payload_sha256: str
+    code: str
 
 
 class EditorialTableDiagnosticReason(StrEnum):
@@ -1335,9 +1728,23 @@ class EditorialProposalService:
             TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH.value,
             TargetedEditorialRevisionOperation.CREATE_TABLE.value,
             TargetedEditorialRevisionOperation.CREATE_BAR_CHART.value,
+            *_VISUAL_PROPOSAL_OPERATION_VALUES,
         }
         if not allowed_operations <= supported_operations:
             raise EditorialProposalApplicationError("proposal_operation_unsupported")
+        if (
+            context.proposal_enrichment_context is not None
+            and context.proposal_enrichment_context.get("mode") == "element"
+        ):
+            return await self._prepare_thread_element_revision(
+                thread_id=thread_id,
+                actor_id=actor_id,
+                model_run_id=model_run_id,
+                model_turn_id=model_turn_id,
+                instruction=instruction,
+                raw_response=raw_response,
+                context=context,
+            )
         fallback_operation = None
         for value in context.proposal_operations:
             try:
@@ -1420,20 +1827,14 @@ class EditorialProposalService:
             or not isinstance(base_content, Mapping)
         ):
             raise EditorialProposalApplicationError("proposal_base_unavailable")
-        request_identity = hashlib.sha256(
-            json.dumps(
-                {
-                    "thread_id": str(thread_id),
-                    "turn_id": str(model_turn_id),
-                    "model_run_id": str(model_run_id),
-                    "response_sha256": hashlib.sha256(raw_response.encode("utf-8")).hexdigest(),
-                    "snapshot_id": str(context.proposal_snapshot_id),
-                    "occurrence_id": str(origin.occurrence_id),
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
+        request_identity = _thread_turn_request_identity(
+            thread_id=thread_id,
+            model_turn_id=model_turn_id,
+            model_run_id=model_run_id,
+            raw_response=raw_response,
+            snapshot_id=context.proposal_snapshot_id,
+            occurrence_id=origin.occurrence_id,
+        )
         preparation = EditorialProposalPreparation(
             subject_id=origin.subject_id,
             production_run_id=origin.production_run_id,
@@ -1463,6 +1864,229 @@ class EditorialProposalService:
             enrichment_context=table_context if is_enrichment_insertion else None,
         )
         return await self.prepare_bridge_result(preparation)
+
+    async def _prepare_thread_element_revision(
+        self,
+        *,
+        thread_id: UUID,
+        actor_id: UUID,
+        model_run_id: UUID,
+        model_turn_id: UUID,
+        instruction: str,
+        raw_response: str,
+        context: EditorialDiscussionContext,
+    ) -> EditorialProposal:
+        """Prepare one Bridge visual correction through the shared planner.
+
+        The registry occurrence supplies the element identity, the thread
+        context supplies the exact pinned artifacts, and ``plan_visual_revision``
+        is the only semantic validator. Refusals persist a closed code and an
+        explicit thread event without any canonical write.
+        """
+        element_context = context.proposal_enrichment_context
+        artifact_store = self._artifact_store
+        if (
+            self._workspace_service is None
+            or artifact_store is None
+            or context.proposal_snapshot_id is None
+            or element_context is None
+            or element_context.get("mode") != "element"
+        ):
+            raise EditorialProposalApplicationError("proposal_workspace_unavailable")
+        entry = element_context.get("entry")
+        base_content = element_context.get("base_content")
+        visual_context = element_context.get("visual_context")
+        evidence_pack = element_context.get("evidence_pack")
+        extraction = element_context.get("extraction")
+        synthesis = element_context.get("synthesis")
+        element_key = element_context.get("element_key")
+        base_canonical_sha256 = element_context.get("base_canonical_sha256")
+        target_path = element_context.get("target_path")
+        base_artifact_id = element_context.get("base_artifact_id")
+        base_artifact_version = element_context.get("base_artifact_version")
+        base_input_hash = element_context.get("base_input_hash")
+        base_pin_hash = element_context.get("base_pin_hash")
+        routing_decision_hash = element_context.get("routing_decision_hash")
+        try:
+            element_kind = EditorialEnrichmentElementKind(str(element_context.get("element_kind")))
+        except ValueError:
+            raise EditorialProposalApplicationError("proposal_patch_invalid") from None
+        if (
+            not isinstance(entry, BlockRegistryEntry)
+            or not isinstance(base_content, Mapping)
+            or not isinstance(visual_context, VisualRevisionContext)
+            or not isinstance(evidence_pack, EditorialEnrichmentEvidencePackV1)
+            or not isinstance(extraction, ProductionExtractionV1)
+            or not isinstance(synthesis, ProductionSynthesisV1)
+            or not isinstance(element_key, str)
+            or not element_key
+            or not isinstance(base_canonical_sha256, str)
+            or not isinstance(base_artifact_id, UUID)
+            or not isinstance(base_artifact_version, int)
+            or not isinstance(base_input_hash, str)
+            or not isinstance(base_pin_hash, str)
+            or (target_path is not None and not isinstance(target_path, str))
+            or (routing_decision_hash is not None and not isinstance(routing_decision_hash, str))
+        ):
+            raise EditorialProposalApplicationError("proposal_patch_invalid")
+        async with self._uow_factory() as uow:
+            thread_record = await uow.editorial_threads.get(thread_id)
+        if thread_record is None or thread_record.thread.origin.subject_id is None:
+            raise EditorialProposalApplicationError("proposal_not_found")
+        origin = thread_record.thread.origin
+        try:
+            resolved = resolve_enrichment_element_target(
+                entry=entry,
+                enrichment=base_content,
+                operation=next(
+                    value
+                    for value in _VISUAL_PROPOSAL_OPERATION_VALUES
+                    if value in set(context.proposal_operations)
+                ),
+            )
+        except (EditorialWorkspaceError, ValueError, StopIteration):
+            raise EditorialProposalApplicationError("enrichment_element_not_found") from None
+        parsed = _parse_thread_visual_revision(
+            raw_response,
+            allowed_operations=set(context.proposal_operations),
+            element_kind=element_kind,
+            element_key=element_key,
+            before_hash=resolved.before_hash,
+            target_path=target_path,
+            base_canonical_sha256=base_canonical_sha256,
+            evidence_pack=evidence_pack,
+        )
+        request_identity = _thread_turn_request_identity(
+            thread_id=thread_id,
+            model_turn_id=model_turn_id,
+            model_run_id=model_run_id,
+            raw_response=raw_response,
+            snapshot_id=context.proposal_snapshot_id,
+            occurrence_id=origin.occurrence_id,
+        )
+        target_id = hashlib.sha256(
+            ProductionArtifactStore.canonical_json_bytes(resolved.target.to_json())
+        ).hexdigest()
+        preparation = EditorialProposalPreparation(
+            subject_id=origin.subject_id,
+            production_run_id=origin.production_run_id,
+            snapshot_id=context.proposal_snapshot_id,
+            occurrence_id=origin.occurrence_id,
+            thread_id=thread_id,
+            base_artifact_id=base_artifact_id,
+            base_artifact_version=base_artifact_version,
+            base_input_hash=base_input_hash,
+            base_canonical_sha256=base_canonical_sha256,
+            base_pin_hash=base_pin_hash,
+            routing_decision_hash=routing_decision_hash,
+            target_id=target_id,
+            target=resolved.target,
+            operation=parsed.operation,
+            before_hash=resolved.before_hash,
+            base_content=base_content,
+            raw_response=raw_response,
+            model_run_id=model_run_id,
+            model_turn_id=model_turn_id,
+            actor_id=actor_id,
+            idempotency_key=f"editorial-proposal-turn-{model_turn_id}",
+            request_sha256=request_identity,
+            instruction=instruction,
+            requester="bridge",
+            origin=EditorialProposalOrigin.BRIDGE_DRAFT,
+        )
+
+        async def refuse(
+            code: str, diagnostics: Mapping[str, object] | None = None
+        ) -> EditorialProposal:
+            body = ProductionArtifactStore.canonical_json_bytes(
+                {"outcome": "refused", "code": code}
+            )
+            blob_id = await artifact_store.put_bytes(
+                body,
+                bucket="editorial-thread-events",
+                mime_type="text/plain; charset=utf-8",
+            )
+            refusal_event = _ThreadRefusalEvent(
+                blob_id=blob_id,
+                payload_sha256=hashlib.sha256(body).hexdigest(),
+                code=code,
+            )
+            return await self._persist_prepared_result(
+                preparation,
+                encoded_patch=None,
+                descriptor=None,
+                state=EditorialProposalState.REFUSED,
+                kind=EditorialProposalEventKind.REFUSED,
+                diagnostics={**dict(diagnostics or {}), "code": code},
+                refusal_event=refusal_event,
+            )
+
+        if parsed.patch is None:
+            return await refuse(parsed.refusal_code or "enrichment_revision_patch_invalid")
+        try:
+            plan = plan_visual_revision(visual_context, parsed.patch)
+        except VisualRevisionRejected as error:
+            return await refuse(error.code, error.diagnostics)
+        compiled_chart_asset: dict[str, object] | None = None
+        candidate_enrichment = plan.revised_enrichment
+        if plan.compile_chart is not None:
+            compiled_chart_asset, candidate_enrichment = await self._compile_revised_chart(
+                chart=plan.compile_chart,
+                element_key=plan.compile_chart.key,
+                revised_enrichment=candidate_enrichment,
+                production_run_id=origin.production_run_id,
+            )
+        diagram_preview: dict[str, object] | None = None
+        if plan.materialize_diagram is not None:
+            diagram_preview = await self._compile_diagram_preview(plan.materialize_diagram)
+        patch_payload: dict[str, object] = {
+            "schema_version": VISUAL_REVISION_PATCH_SCHEMA_VERSION,
+            "operation": parsed.operation.value,
+            "target": resolved.target.to_json(),
+            "target_id": target_id,
+            "occurrence_id": str(origin.occurrence_id),
+            "before_hash": resolved.before_hash,
+            "visual_patch": visual_patch_to_json(parsed.patch),
+            "rationale": parsed.rationale,
+        }
+        if compiled_chart_asset is not None:
+            patch_payload["compiled_chart_asset"] = compiled_chart_asset
+        candidate_payload = editorial_enrichment_to_json(candidate_enrichment)
+        preview_details = dict(plan.preview)
+        if diagram_preview is not None:
+            preview_details["diagram"] = diagram_preview
+        if compiled_chart_asset is not None:
+            preview_details["chart_asset"] = {
+                "asset_id": compiled_chart_asset["asset_id"],
+                "sha256": compiled_chart_asset["sha256"],
+            }
+        diagnostics: dict[str, object] = {
+            "preview": preview_details,
+            "canonical_candidate_sha256": hashlib.sha256(
+                ProductionArtifactStore.canonical_json_bytes(candidate_payload)
+            ).hexdigest(),
+        }
+        encoded_patch = ProductionArtifactStore.canonical_json_bytes(patch_payload)
+        if len(encoded_patch) > _MAX_PATCH_BYTES:
+            raise EditorialProposalApplicationError("proposal_patch_too_large")
+        descriptor = await self._upload_and_verify_patch(encoded_patch)
+        try:
+            while True:
+                try:
+                    return await self._persist_prepared_result(
+                        preparation,
+                        encoded_patch=encoded_patch,
+                        descriptor=descriptor,
+                        state=EditorialProposalState.PROPOSED,
+                        kind=EditorialProposalEventKind.PREPARED,
+                        diagnostics=diagnostics,
+                    )
+                except _ProposalPatchBlobMissing:
+                    descriptor = await self._upload_and_verify_patch(encoded_patch)
+        except Exception:
+            if descriptor is not None:
+                await self._best_effort_orphan_cleanup(descriptor)
+            raise
 
     async def prepare_bridge_result(
         self, preparation: EditorialProposalPreparation
@@ -3012,6 +3636,7 @@ class EditorialProposalService:
         state: EditorialProposalState,
         kind: EditorialProposalEventKind,
         diagnostics: dict[str, object],
+        refusal_event: _ThreadRefusalEvent | None = None,
     ) -> EditorialProposal:
         async with self._uow_factory() as uow:
             await uow.editorial_proposals.lock_adoption_for_run(preparation.production_run_id)
@@ -3038,6 +3663,12 @@ class EditorialProposalService:
                     raise EditorialProposalConflict("proposal_idempotency_conflict")
                 if existing.origin is EditorialProposalOrigin.BRIDGE_DRAFT:
                     await self._append_thread_reference(uow, existing)
+                if (
+                    refusal_event is not None
+                    and existing.origin is EditorialProposalOrigin.BRIDGE_DRAFT
+                    and existing.state is EditorialProposalState.REFUSED
+                ):
+                    await self._append_refusal_event(uow, existing, refusal_event)
                 await uow.commit()
                 return existing
 
@@ -3118,8 +3749,37 @@ class EditorialProposalService:
                 raise EditorialProposalConflict("proposal_idempotency_conflict")
             if stored.origin is EditorialProposalOrigin.BRIDGE_DRAFT:
                 await self._append_thread_reference(uow, stored)
+            if (
+                refusal_event is not None
+                and stored.origin is EditorialProposalOrigin.BRIDGE_DRAFT
+                and stored.state is EditorialProposalState.REFUSED
+            ):
+                await self._append_refusal_event(uow, stored, refusal_event)
             await uow.commit()
             return stored
+
+    @staticmethod
+    async def _append_refusal_event(
+        uow: UnitOfWork,
+        proposal: EditorialProposal,
+        refusal_event: _ThreadRefusalEvent,
+    ) -> None:
+        """Expose the closed refusal code on the append-only thread timeline."""
+        if proposal.thread_id is None or proposal.model_turn_id is None:
+            raise EditorialProposalApplicationError("proposal_bridge_origin_invalid")
+        await uow.editorial_threads.append_event(
+            thread_id=proposal.thread_id,
+            kind=EditorialThreadEventKind.REFUSED,
+            actor_id=None,
+            idempotency_key=f"proposal-refused:{proposal.id}",
+            request_sha256=hashlib.sha256(
+                f"editorial-proposal-refused:{proposal.id}:{refusal_event.code}".encode()
+            ).hexdigest(),
+            payload_blob_ref=refusal_event.blob_id,
+            payload_sha256=refusal_event.payload_sha256,
+            proposal_id=proposal.id,
+            model_turn_id=proposal.model_turn_id,
+        )
 
     @staticmethod
     async def _append_thread_reference(uow: UnitOfWork, proposal: EditorialProposal) -> None:

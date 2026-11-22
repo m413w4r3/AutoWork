@@ -47,7 +47,7 @@ if TYPE_CHECKING:
     from cti_app.domain.production_synthesis import ExtractionEvidenceRefV1
     from cti_app.domain.publication_kind import PublicationKind
 
-EDITORIAL_DISCUSSION_PROMPT_VERSION = "5"
+EDITORIAL_DISCUSSION_PROMPT_VERSION = "6"
 
 
 class EditorialDiscussionObjective(StrEnum):
@@ -119,16 +119,33 @@ def _editorial_discussion_data(
         "current_instruction": message,
     }
     if objective is EditorialDiscussionObjective.PROPOSAL:
+        enrichment_context = context.proposal_enrichment_context
+        element_kind = (
+            enrichment_context.get("element_kind")
+            if enrichment_context is not None and enrichment_context.get("mode") == "element"
+            else None
+        )
         data["proposal_contract"] = {
             "target": context.proposal_target_path,
             "allowed_operations": list(context.proposal_operations),
             "before_hash": context.proposal_before_hash,
             "base_artifact_hash": context.proposal_base_sha256,
             "anchor_block_id": (
-                str(context.proposal_enrichment_context.get("anchor_block_id"))
-                if context.proposal_enrichment_context is not None
-                and context.proposal_enrichment_context.get("anchor_block_id") is not None
+                str(enrichment_context.get("anchor_block_id"))
+                if enrichment_context is not None
+                and enrichment_context.get("anchor_block_id") is not None
                 else None
+            ),
+            **(
+                {
+                    "element": {
+                        "kind": element_kind,
+                        "key": enrichment_context.get("element_key"),
+                    },
+                    "current_element": enrichment_context.get("current_element"),
+                }
+                if element_kind is not None and enrichment_context is not None
+                else {}
             ),
         }
     return data
@@ -175,6 +192,37 @@ def _editorial_discussion_prompt(
             if "create_bar_chart" in context.proposal_operations
             else ""
         )
+        rewrite_chart_instructions = (
+            " Pour rewrite_chart, AFTER doit être un objet JSON EditorialEnrichmentProposalV1 "
+            "avec exactement un graphique kind=bar, aucun tableau/diagramme/annotation/figure/"
+            "resource_need, et la même key et le même placement que current_element. Le titre, "
+            "les libellés de séries, les libellés d'axes et l'ordre des points peuvent changer. "
+            "Chaque value doit être un nombre fini recopié EXACTEMENT depuis les preuves admises; "
+            "la value et l'unité doivent apparaître dans le même enregistrement FACT/EVENT cité. "
+            "Ne calculez, n'arrondissez et n'inventez aucune valeur ni unité. Sinon refusez avec "
+            "le marqueur REFUSAL et le code bar_chart_insufficient_data."
+            if "rewrite_chart" in context.proposal_operations
+            else ""
+        )
+        rewrite_diagram_instructions = (
+            " Pour rewrite_diagram, AFTER doit être un objet JSON EditorialEnrichmentProposalV1 "
+            "avec exactement un diagramme, aucun tableau/graphique/annotation/figure/"
+            "resource_need, et la même key et le même placement que current_element. Seuls les "
+            "nœuds, arêtes, groupes, le profil et leur présentation peuvent changer; n'inventez "
+            "aucune entité, relation ni séquence, et citez les handles admis. Sinon refusez avec "
+            "le code revision_not_applicable."
+            if "rewrite_diagram" in context.proposal_operations
+            else ""
+        )
+        visual_caption_instructions = (
+            ' Pour update_visual_caption, AFTER doit être {"caption": "..."} ou une seule '
+            "ligne CAPTION: ...; seulement le texte de légende, sans balisage. Pour une figure, "
+            "ne revendiquez jamais ce que l'image montre au-delà de la légende archivée autorisée "
+            "et des métadonnées de current_element; une légende de figure reste non vide et "
+            "limitée à 500 caractères. Sinon refusez avec le code revision_not_applicable."
+            if "update_visual_caption" in context.proposal_operations
+            else ""
+        )
         instructions = (
             "EDITORIAL PROPOSAL — TYPED PATCH ONLY\n"
             "Répondez uniquement par un patch éditorial typé au format à marqueurs ci-dessous, "
@@ -183,9 +231,13 @@ def _editorial_discussion_prompt(
             "recopiez exactement la cible et les deux empreintes fournies. Si aucune opération "
             "sûre ne convient, répondez avec le marqueur REFUSAL et le code "
             "revision_not_applicable. Pour un patch, utilisez exactement TARGET, ACTION, "
-            "BASE_ARTIFACT_HASH, BEFORE_HASH, AFTER et RATIONALE, chacun dans son bloc @@."
+            "BASE_ARTIFACT_HASH, BEFORE_HASH, AFTER et RATIONALE, chacun dans son bloc @@. "
+            "AFTER peut être entouré d'un bloc ```json; le texte hors bloc est ignoré."
             + table_instructions
             + bar_chart_instructions
+            + rewrite_chart_instructions
+            + rewrite_diagram_instructions
+            + visual_caption_instructions
             + "\n\n"
         )
     else:

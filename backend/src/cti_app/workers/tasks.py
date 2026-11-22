@@ -262,6 +262,7 @@ async def _execute_editorial_thread_job(job_id: UUID) -> int | None:
                 workspace_service=workspace_service,
                 chart_compiler=AnalyticChartRenderer(),
                 media_asset_store=MediaAssetStore(artifact_store, uow_factory),
+                diagram_preview_compiler=D2DiagramCompiler(),
             ),
         )
         return await worker.process(job_id)

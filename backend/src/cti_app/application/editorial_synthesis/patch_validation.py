@@ -54,9 +54,18 @@ class _WirePatch:
     after: str
     rationale: str
     refusal: TargetedEditorialRevisionRefusal | None = None
+    # Closed code carried by a tolerant refusal. The synthesis path keeps the
+    # typed ``refusal`` object; visual revisions accept the planner's own
+    # closed codes (for example ``bar_chart_insufficient_data``) here.
+    refusal_code: str | None = None
 
 
-def _parse_wire_patch(raw_text: str, *, strict: bool = False) -> _WirePatch:
+def _parse_wire_patch(
+    raw_text: str,
+    *,
+    strict: bool = False,
+    allowed_refusal_codes: frozenset[str] = frozenset(),
+) -> _WirePatch:
     if not isinstance(raw_text, str):
         raise TargetedSynthesisRevisionValidationError("revision_wire_invalid")
     blocks: dict[str, list[str]] = {}
@@ -102,11 +111,25 @@ def _parse_wire_patch(raw_text: str, *, strict: bool = False) -> _WirePatch:
             if separator:
                 values[key.strip().casefold()] = value.strip()
         code = values.get("code", raw.splitlines()[0].strip() if raw else "")
-        if code != TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE.value:
+        not_applicable = code == TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE.value
+        if not not_applicable and code not in allowed_refusal_codes:
             raise TargetedSynthesisRevisionValidationError("revision_refusal_code_invalid")
         reason = values.get("reason", "").strip()
-        if not reason:
+        if not reason and (strict or not allowed_refusal_codes):
             raise TargetedSynthesisRevisionValidationError("revision_refusal_reason_missing")
+        typed_refusal = (
+            TargetedEditorialRevisionRefusal(
+                code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
+                recommended_restart_stage=None,
+                reason=reason or "Bridge declined the revision.",
+                refusal_reason=TargetedEditorialRevisionRefusalReason.MODEL_DECLINED,
+                next_safe_action=(
+                    "Reformulate the instruction or add supporting evidence via source extension."
+                ),
+            )
+            if not_applicable
+            else None
+        )
         return _WirePatch(
             target="",
             action=TargetedEditorialRevisionOperation.REWRITE_TITLE,
@@ -114,15 +137,8 @@ def _parse_wire_patch(raw_text: str, *, strict: bool = False) -> _WirePatch:
             before_hash="",
             after="",
             rationale="",
-            refusal=TargetedEditorialRevisionRefusal(
-                code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
-                recommended_restart_stage=None,
-                reason=reason,
-                refusal_reason=TargetedEditorialRevisionRefusalReason.MODEL_DECLINED,
-                next_safe_action=(
-                    "Reformulate the instruction or add supporting evidence via source extension."
-                ),
-            ),
+            refusal=typed_refusal,
+            refusal_code=code,
         )
     required = {"TARGET", "ACTION", "BASE_ARTIFACT_HASH", "BEFORE_HASH", "AFTER", "RATIONALE"}
     if not required <= set(blocks):
