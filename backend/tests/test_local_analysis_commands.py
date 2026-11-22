@@ -108,6 +108,30 @@ def _pe_fixture() -> bytes:
     return bytes(dos_header) + b"PE\0\0" + coff_header
 
 
+# The end-to-end analysis tests below execute real catalogued tools, which the
+# runner only allows under bubblewrap filesystem confinement. CI runners ship
+# bwrap and unshare but deny user namespaces, so real tool output can only be
+# asserted where the production probe grants confinement. This gate is that
+# production probe (never a CI/runner variable); the refusal path is asserted
+# by test_unavailable_confinement_probe_refuses_execution_without_degraded_mode.
+_CONFINEMENT_PROBE_SECONDS = 0.2
+_CONFINEMENT_DETECTION = local_runner_module._detect_network_namespace(_CONFINEMENT_PROBE_SECONDS)
+_FILESYSTEM_CONFINEMENT_AVAILABLE = (
+    _CONFINEMENT_DETECTION.status is NetworkIsolationStatus.BWRAP_NET
+)
+_CONFINEMENT_PROBE_REASONS = (
+    ", ".join(reason.value for reason in _CONFINEMENT_DETECTION.reasons) or "none recorded"
+)
+_REQUIRES_FILESYSTEM_CONFINEMENT = pytest.mark.skipif(
+    not _FILESYSTEM_CONFINEMENT_AVAILABLE,
+    reason=(
+        "requires the production bubblewrap filesystem-confinement probe, which "
+        f"this host refuses ({_CONFINEMENT_DETECTION.status.value}: "
+        f"{_CONFINEMENT_PROBE_REASONS})"
+    ),
+)
+
+
 def test_bubblewrap_is_preferred_and_reports_filesystem_confinement(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -330,6 +354,59 @@ async def test_required_filesystem_confinement_refuses_execution_when_unavailabl
 
 
 @pytest.mark.asyncio
+async def test_unavailable_confinement_probe_refuses_execution_without_degraded_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # CI runners install bwrap and unshare but deny user namespaces; the probe,
+    # not binary presence, must decide. With the default requirement of
+    # filesystem confinement the run is refused, never degraded to seccomp-only.
+    marker = tmp_path / "tool-executed"
+    tool = tmp_path / "file"
+    tool.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "--version" ]; then printf \'fake-file 1.0\\n\'; exit 0; fi\n'
+        f"touch '{marker}'\n",
+        encoding="utf-8",
+    )
+    tool.chmod(0o755)
+    monkeypatch.setattr(
+        local_runner_module.shutil,
+        "which",
+        lambda name: f"/test/{name}" if name in {"bwrap", "unshare"} else None,
+    )
+    monkeypatch.setattr(
+        local_runner_module,
+        "_probe_bwrap_namespace",
+        lambda *_args: NamespaceFailureReason.BWRAP_USERNS_REFUSED_BY_KERNEL,
+    )
+    monkeypatch.setattr(local_runner_module, "_probe_namespace", lambda *_args: False)
+    local_runner_module._detect_network_namespace.cache_clear()
+    try:
+        payload = b"safe"
+        samples = _Samples(payload)
+        catalog = LocalCommandCatalog(
+            specs=(default_local_command_specs()[0],), which=lambda _: str(tool)
+        )
+        runner = LocalCommandRunner(network_sandbox_probe_seconds=_CONFINEMENT_PROBE_SECONDS)
+        service = LocalCommandService(samples, runner, catalog, enabled=True)
+
+        result = await service.run(LocalCommandId.FILE, _sha256(payload))
+
+        assert runner.filesystem_confined is False
+        assert runner.namespace_status is NetworkIsolationStatus.SECCOMP_ONLY
+        assert runner.namespace_reasons == (
+            NamespaceFailureReason.BWRAP_USERNS_REFUSED_BY_KERNEL,
+            NamespaceFailureReason.UNSHARE_PROBE_FAILED,
+        )
+        assert result.status is LocalCommandStatus.UNAVAILABLE
+        assert result.detail_code == "filesystem_confinement_unavailable"
+        assert samples.reads == 1
+        assert not marker.exists()
+    finally:
+        local_runner_module._detect_network_namespace.cache_clear()
+
+
+@pytest.mark.asyncio
 async def test_extraction_specs_require_filesystem_confinement_and_skip_version_execution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -387,10 +464,16 @@ async def test_extraction_specs_require_filesystem_confinement_and_skip_version_
 
 
 @pytest.mark.asyncio
+@_REQUIRES_FILESYSTEM_CONFINEMENT
 async def test_catalogued_commands_read_synthetic_elf_with_bounded_output() -> None:
     payload = _elf_fixture()
     samples = _Samples(payload)
-    runner = LocalCommandRunner(network_sandbox_probe_seconds=0.2)
+    runner = LocalCommandRunner(network_sandbox_probe_seconds=_CONFINEMENT_PROBE_SECONDS)
+    assert runner.filesystem_confined, (
+        "the collection-time probe granted bwrap confinement but this runner is "
+        f"not confined ({runner.namespace_reasons}); refusals are asserted by "
+        "test_unavailable_confinement_probe_refuses_execution_without_degraded_mode"
+    )
     catalog = LocalCommandCatalog(
         timeout_seconds=5,
         max_output_bytes=32_768,
@@ -540,6 +623,7 @@ async def test_sample_hash_mismatch_and_missing_binary_are_local_results() -> No
 
 
 @pytest.mark.asyncio
+@_REQUIRES_FILESYSTEM_CONFINEMENT
 async def test_metacharacters_in_sample_strings_are_inert_and_filenames_are_fixed(
     tmp_path: Path,
 ) -> None:
@@ -550,9 +634,15 @@ async def test_metacharacters_in_sample_strings_are_inert_and_filenames_are_fixe
         "1234567890123456789012345678901234567890"
     ).encode()
     catalog = LocalCommandCatalog(max_output_bytes=4096)
+    runner = LocalCommandRunner(network_sandbox_probe_seconds=_CONFINEMENT_PROBE_SECONDS)
+    assert runner.filesystem_confined, (
+        "the collection-time probe granted bwrap confinement but this runner is "
+        f"not confined ({runner.namespace_reasons}); refusals are asserted by "
+        "test_unavailable_confinement_probe_refuses_execution_without_degraded_mode"
+    )
     service = LocalCommandService(
         _Samples(payload),
-        LocalCommandRunner(network_sandbox_probe_seconds=0.2),
+        runner,
         catalog,
         enabled=True,
     )
