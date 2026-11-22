@@ -3125,6 +3125,15 @@ main:has(> .editorial-route-state) > .app-header {
   width: min(34rem, calc(100vw - 3rem));
 }
 
+@media (min-width: 1024px) and (max-width: 1279px) {
+  /* The block action bar is anchored to the block's right edge. At 1024px a
+     34rem insertion popover would start left of the document column and cover
+     the plan rail; cap it by viewport share so it stays inside the column. */
+  .editorial-block-actions--block .editorial-visual-insertion__panel {
+    width: min(34rem, 45vw);
+  }
+}
+
 .editorial-inspector-tabs {
   display: flex;
   flex-wrap: wrap;
