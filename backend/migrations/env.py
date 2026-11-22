@@ -23,6 +23,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     external_effects,
     invariants,
     investigation,
+    investigation_coordination,
     jobs,
     media_assets,
     model_execution,
@@ -91,6 +92,17 @@ _WORKSPACE_TABLES = frozenset(
         "workspace_sync_cursors",
     }
 )
+_INVESTIGATION_PLAN_TABLES = frozenset({"investigation_plans", "investigation_plan_versions"})
+_PROSE_AUTHORITY_COLUMN = "prose_authority"
+_PROSE_AUTHORITY_CHECK = "ck_analyst_investigation_prose_authority"
+_BASELINE_DECISION_TYPE_VALUES = (
+    "'member_validate', 'member_reject', 'feature_validate', 'feature_reject', "
+    "'pivot_approve', 'pivot_reject', 'note_approve', 'note_changes_requested', "
+    "'detection_approve', 'detection_reject'"
+)
+_BASELINE_DECISION_TARGET_VALUES = (
+    "'member', 'feature', 'tool', 'invariant', 'pivot', 'corpus', 'detection', 'note'"
+)
 _ROUTING_RUN_COLUMNS = frozenset({"routing_decision_id"})
 _COLLECTION_ATTEMPT_ADDITIONS = frozenset(
     {
@@ -142,6 +154,7 @@ def _metadata_for_frozen_baseline() -> MetaData:
             or source_table.name in _EDITORIAL_PROPOSAL_TABLES
             or source_table.name in _EDITORIAL_DRAFT_TABLES
             or source_table.name in _WORKSPACE_TABLES
+            or source_table.name in _INVESTIGATION_PLAN_TABLES
         ):
             continue
         table = source_table.to_metadata(metadata)
@@ -248,6 +261,33 @@ def _metadata_for_frozen_baseline() -> MetaData:
             for column_name in _EDITORIAL_THREAD_TURN_COLUMNS:
                 if column_name in table.c:
                     table._columns.remove(table.c[column_name])
+        if table.name == "analyst_investigations":
+            for constraint in tuple(table.constraints):
+                if constraint.name == _PROSE_AUTHORITY_CHECK or any(
+                    column.name == _PROSE_AUTHORITY_COLUMN
+                    for column in getattr(constraint, "columns", ())
+                ):
+                    table.constraints.discard(constraint)
+            if _PROSE_AUTHORITY_COLUMN in table.c:
+                table._columns.remove(table.c[_PROSE_AUTHORITY_COLUMN])
+        if table.name == "analyst_decisions":
+            for constraint in tuple(table.constraints):
+                if constraint.name == "ck_analyst_decisions_type":
+                    table.constraints.discard(constraint)
+                    table.append_constraint(
+                        CheckConstraint(
+                            f"decision_type IN ({_BASELINE_DECISION_TYPE_VALUES})",
+                            name="ck_analyst_decisions_type",
+                        )
+                    )
+                elif constraint.name == "ck_analyst_decisions_target":
+                    table.constraints.discard(constraint)
+                    table.append_constraint(
+                        CheckConstraint(
+                            f"target_type IN ({_BASELINE_DECISION_TARGET_VALUES})",
+                            name="ck_analyst_decisions_target",
+                        )
+                    )
     return metadata
 
 

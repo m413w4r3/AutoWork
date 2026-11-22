@@ -37,6 +37,12 @@ EXPECTED_REPOSITORIES = {
         ports.InMemoryWorkspaceSyncCursorRepository,
         uow_module.SqlAlchemyWorkspaceSyncCursorRepository,
     ),
+    # Lot 04A1 follows the workspace repositories in the total migration order.
+    "investigation_plans": (
+        ports.InvestigationPlanRepository,
+        ports.InMemoryInvestigationPlanRepository,
+        uow_module.SqlAlchemyInvestigationPlanRepository,
+    ),
 }
 
 

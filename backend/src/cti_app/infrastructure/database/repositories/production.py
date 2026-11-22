@@ -1569,6 +1569,9 @@ def _analyst_investigation_row(value: AnalystInvestigation) -> AnalystInvestigat
         subject_id=value.subject_id,
         synthesis_artifact_id=value.synthesis_artifact_id,
         created_at=value.created_at,
+        # prose_authority is fixed at INSERT: the row builder is its only
+        # writer and _analyst_investigation_values never updates it.
+        prose_authority=value.prose_authority.value,
         **_analyst_investigation_values(value),
     )
 
@@ -1578,6 +1581,7 @@ def _analyst_investigation_from_row(row: AnalystInvestigationRow) -> AnalystInve
         AnalystInvestigationStage,
         AnalystInvestigationStatus,
         LoopBudget,
+        ProseAuthority,
     )
 
     return AnalystInvestigation(
@@ -1604,6 +1608,7 @@ def _analyst_investigation_from_row(row: AnalystInvestigationRow) -> AnalystInve
         ),
         started_at=row.started_at,
         finished_at=row.finished_at,
+        prose_authority=ProseAuthority(row.prose_authority),
         created_at=row.created_at,
         updated_at=row.updated_at,
         version=row.version,

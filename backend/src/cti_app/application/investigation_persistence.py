@@ -33,6 +33,10 @@ from cti_app.domain.investigation import (
     ToolInvocation,
 )
 from cti_app.domain.investigation_experiment import InvestigationExperimentV1
+from cti_app.domain.investigation_plan import (
+    InvestigationPlanHead,
+    InvestigationPlanVersion,
+)
 
 if TYPE_CHECKING:
     from cti_app.application.workspace_agent import (
@@ -275,6 +279,33 @@ class WorkspaceSyncCursorRepository(Protocol):
     async def get(self, workspace_id: str) -> WorkspaceSyncCursorV1 | None: ...
 
     async def save(self, cursor: WorkspaceSyncCursorV1) -> WorkspaceSyncCursorV1: ...
+
+
+class InvestigationPlanRepository(Protocol):
+    """Append-only plan versions plus the compare-and-swap head (ADR-0011 D1)."""
+
+    async def get_head(self, investigation_id: UUID) -> InvestigationPlanHead | None: ...
+
+    async def get_version(self, plan_version_id: UUID) -> InvestigationPlanVersion | None: ...
+
+    async def get_by_version(
+        self, investigation_id: UUID, version: int
+    ) -> InvestigationPlanVersion | None: ...
+
+    async def get_by_source(
+        self, source_invocation_id: UUID, source_observation_id: UUID
+    ) -> InvestigationPlanVersion | None: ...
+
+    async def list_for_investigation(
+        self, investigation_id: UUID
+    ) -> tuple[InvestigationPlanVersion, ...]: ...
+
+    async def create_version(
+        self,
+        version: InvestigationPlanVersion,
+        *,
+        expected_current_version: int | None,
+    ) -> tuple[InvestigationPlanVersion, bool]: ...
 
 
 def _copy_budget(budget: InvestigationBudget) -> InvestigationBudget:
@@ -932,6 +963,103 @@ class InMemoryWorkspaceSyncCursorRepository:
             return cursor
 
 
+class InMemoryInvestigationPlanRepository:
+    def __init__(self) -> None:
+        self._heads: dict[UUID, InvestigationPlanHead] = {}
+        self._items: dict[UUID, InvestigationPlanVersion] = {}
+        self._lock = asyncio.Lock()
+
+    async def get_head(self, investigation_id: UUID) -> InvestigationPlanHead | None:
+        return self._heads.get(investigation_id)
+
+    async def get_version(self, plan_version_id: UUID) -> InvestigationPlanVersion | None:
+        return self._items.get(plan_version_id)
+
+    async def get_by_version(
+        self, investigation_id: UUID, version: int
+    ) -> InvestigationPlanVersion | None:
+        return next(
+            (
+                item
+                for item in self._items.values()
+                if item.investigation_id == investigation_id and item.version == version
+            ),
+            None,
+        )
+
+    async def get_by_source(
+        self, source_invocation_id: UUID, source_observation_id: UUID
+    ) -> InvestigationPlanVersion | None:
+        return next(
+            (
+                item
+                for item in self._items.values()
+                if item.source_invocation_id == source_invocation_id
+                and item.source_observation_id == source_observation_id
+            ),
+            None,
+        )
+
+    async def list_for_investigation(
+        self, investigation_id: UUID
+    ) -> tuple[InvestigationPlanVersion, ...]:
+        return tuple(
+            sorted(
+                (
+                    item
+                    for item in self._items.values()
+                    if item.investigation_id == investigation_id
+                ),
+                key=lambda item: item.version,
+            )
+        )
+
+    async def create_version(
+        self,
+        version: InvestigationPlanVersion,
+        *,
+        expected_current_version: int | None,
+    ) -> tuple[InvestigationPlanVersion, bool]:
+        async with self._lock:
+            if any(
+                item.investigation_id == version.investigation_id
+                and item.version == version.version
+                for item in self._items.values()
+            ):
+                raise VersionConflictError("Plan version already exists")
+            if any(
+                item.source_invocation_id == version.source_invocation_id
+                and item.source_observation_id == version.source_observation_id
+                for item in self._items.values()
+            ):
+                raise VersionConflictError("Plan version source already produced a version")
+            head = self._heads.get(version.investigation_id)
+            if expected_current_version is None:
+                if head is not None or version.version != 1:
+                    raise VersionConflictError("A first plan version must be v1")
+                self._heads[version.investigation_id] = InvestigationPlanHead(
+                    investigation_id=version.investigation_id,
+                    current_version=1,
+                    created_at=version.created_at,
+                    updated_at=version.created_at,
+                )
+            else:
+                if (
+                    head is None
+                    or head.current_version != expected_current_version
+                    or version.version != expected_current_version + 1
+                ):
+                    raise VersionConflictError("Plan current version changed")
+                self._heads[version.investigation_id] = InvestigationPlanHead(
+                    investigation_id=version.investigation_id,
+                    current_version=version.version,
+                    created_at=head.created_at,
+                    updated_at=version.created_at,
+                )
+            self._items[version.id] = version
+            return version, True
+
+
 __all__ = [
     "AnalystOpinionRepository",
     "DetectionCandidateRepository",
@@ -943,6 +1071,7 @@ __all__ = [
     "InMemoryFindingRepository",
     "InMemoryInvestigationBudgetRepository",
     "InMemoryInvestigationEnvelopeRepository",
+    "InMemoryInvestigationPlanRepository",
     "InMemorySampleAssociationRepository",
     "InMemoryToolInvocationRepository",
     "InMemoryWorkspaceBindingRepository",
@@ -952,6 +1081,7 @@ __all__ = [
     "InvestigationBudgetRepository",
     "InvestigationBudgetSnapshot",
     "InvestigationEnvelopeRepository",
+    "InvestigationPlanRepository",
     "SampleAssociationRepository",
     "ToolInvocationRepository",
     "VersionConflictError",

@@ -175,6 +175,9 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
     ProductionRun,
+    ProseAuthority,
+    ProseAuthorityModeError,
+    require_prose_authority_mode,
 )
 from cti_app.domain.protocol_model import ProtocolModelV1
 from cti_app.domain.retrohunt import RETROHUNT_MAX_SUBMISSIONS_PER_SUBJECT
@@ -1005,6 +1008,16 @@ async def start_investigation(
         investigation = await uow.analyst_investigations.get_for_run(run.id)
         if investigation is None or investigation.synthesis_artifact_id != artifact.id:
             raise _http_error(409, "investigation_handoff_missing")
+        prose_authority = getattr(investigation, "prose_authority", ProseAuthority.LEGACY)
+        if not isinstance(prose_authority, ProseAuthority):
+            prose_authority = ProseAuthority(prose_authority)
+        try:
+            require_prose_authority_mode(
+                prose_authority,
+                payload.execution_mode or InvestigationExecutionMode.BRIDGE_LED,
+            )
+        except ProseAuthorityModeError as exc:
+            raise _http_error(422, exc.code) from exc
         try:
             snapshot = await composition_factory.article_snapshots.resolve(artifact.id)
         except (ValueError, KeyError) as exc:

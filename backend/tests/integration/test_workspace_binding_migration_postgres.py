@@ -26,7 +26,7 @@ from tests.integration.test_workspace_agent_persistence_postgres import (
 
 pytestmark = pytest.mark.integration
 
-HEAD = "0019_workspace_bindings"
+CURRENT_HEAD = "0020_investigation_plans"
 PREVIOUS = "0018_editorial_enrichment_element_operations"
 WORKSPACE_TABLES = {
     "workspace_bindings",
@@ -85,7 +85,7 @@ def test_workspace_migration_creates_tables_and_refuses_used_downgrade(
     config = _alembic_config(temporary_postgres_url)
     command.upgrade(config, "head")
     assert WORKSPACE_TABLES <= _table_names(temporary_postgres_url)
-    assert _alembic_version(temporary_postgres_url) == HEAD
+    assert _alembic_version(temporary_postgres_url) == CURRENT_HEAD
 
     command.downgrade(config, PREVIOUS)
     assert not WORKSPACE_TABLES & _table_names(temporary_postgres_url)
@@ -95,7 +95,7 @@ def test_workspace_migration_creates_tables_and_refuses_used_downgrade(
     asyncio.run(_insert_bound_workspace(temporary_postgres_url))
     with pytest.raises(RuntimeError, match="refusing to downgrade"):
         command.downgrade(config, PREVIOUS)
-    assert _alembic_version(temporary_postgres_url) == HEAD
+    assert _alembic_version(temporary_postgres_url) == CURRENT_HEAD
     assert WORKSPACE_TABLES <= _table_names(temporary_postgres_url)
 
 
@@ -107,7 +107,7 @@ def test_workspace_migration_accepts_an_already_conforming_shape(
     command.stamp(config, PREVIOUS)
     command.upgrade(config, "head")
     assert WORKSPACE_TABLES <= _table_names(temporary_postgres_url)
-    assert _alembic_version(temporary_postgres_url) == HEAD
+    assert _alembic_version(temporary_postgres_url) == CURRENT_HEAD
 
 
 def test_workspace_migration_rejects_a_partial_workspace_shape(

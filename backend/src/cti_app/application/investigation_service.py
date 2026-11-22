@@ -172,6 +172,8 @@ from cti_app.domain.production import (
     AnalystInvestigationStatus,
     ProductionArtifact,
     ProductionRun,
+    ProseAuthority,
+    require_prose_authority_mode,
 )
 from cti_app.domain.virustotal import VirusTotalObjectType
 
@@ -658,6 +660,11 @@ class InvestigationService:
         investigation = await self._investigations.get(handoff.investigation_id)
         if investigation is None or investigation.synthesis_artifact_id != synthesis.id:
             raise ValueError("Post-synthesis handoff does not point to the requested synthesis")
+        resolved_mode = execution_mode or InvestigationExecutionMode.BRIDGE_LED
+        prose_authority = getattr(investigation, "prose_authority", ProseAuthority.LEGACY)
+        if not isinstance(prose_authority, ProseAuthority):
+            prose_authority = ProseAuthority(prose_authority)
+        require_prose_authority_mode(prose_authority, resolved_mode)
         existing_state = await self._states.get(investigation.id)
         if existing_state is not None:
             if execution_mode is not None and existing_state.execution_mode is not execution_mode:
@@ -686,7 +693,7 @@ class InvestigationService:
             hypotheses=hypotheses,
             base_publication_artifact_id=snapshot.base_publication_artifact_id,
             base_publication_sha256=snapshot.base_publication_sha256,
-            execution_mode=execution_mode or InvestigationExecutionMode.BRIDGE_LED,
+            execution_mode=resolved_mode,
         )
         await self._states.save_if_version(state, expected_version=None)
         if investigation.status is AnalystInvestigationStatus.QUEUED:

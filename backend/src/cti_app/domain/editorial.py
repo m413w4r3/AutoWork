@@ -32,6 +32,8 @@ class AnalystDecisionType(StrEnum):
     NOTE_CHANGES_REQUESTED = "note_changes_requested"
     DETECTION_APPROVE = "detection_approve"
     DETECTION_REJECT = "detection_reject"
+    PLAN_ACCEPT = "plan_accept"
+    PLAN_REJECT = "plan_reject"
 
 
 class AnalystDecisionTargetType(StrEnum):
@@ -43,6 +45,7 @@ class AnalystDecisionTargetType(StrEnum):
     CORPUS = "corpus"
     DETECTION = "detection"
     NOTE = "note"
+    PLAN_VERSION = "plan_version"
 
 
 @dataclass(frozen=True, slots=True)
