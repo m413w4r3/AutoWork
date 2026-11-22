@@ -26,6 +26,17 @@ EXPECTED_ERROR_CODES = {
     "cursor_expired",
     "not_implemented",
     "internal_error",
+    # M24-05 session supervisor (SESSION-RUNNER.md §6).
+    "session_not_found",
+    "session_state_conflict",
+    "session_busy",
+    "confinement_unavailable",
+    "capability_unavailable",
+    "resume_unavailable",
+    "idempotency_conflict",
+    "budget_exceeded",
+    "manifest_missing",
+    "secret_unavailable",
 }
 
 

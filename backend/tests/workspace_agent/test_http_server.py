@@ -88,10 +88,11 @@ def test_bearer_scheme_is_case_insensitive(uds_client, agent_server: RunningAgen
     assert response.json()["workspaces"] == []
 
 
-def test_sessions_routes_are_reserved_and_typed(uds_client, agent_server: RunningAgent) -> None:
+def test_unknown_sessions_route_is_a_typed_404(uds_client, agent_server: RunningAgent) -> None:
+    """The reserved namespace is implemented; an unknown subpath is a typed 404."""
     response = uds_client.get("/v1/sessions/anything", headers=agent_server.auth_headers)
     assert response.status_code == 404
-    assert response.json()["error"] == "not_implemented"
+    assert response.json()["error"] == "invalid_request"
 
 
 @pytest.mark.parametrize(

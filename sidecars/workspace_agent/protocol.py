@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 
 PROTOCOL_VERSION = "workspace-agent.v1"
+SESSIONS_PROTOCOL_VERSION = "workspace-agent.sessions.v1"
 HTTP_VERSION = "HTTP/1.1"
 
 JSON_BODY_LIMIT = 64 * 1024
@@ -45,6 +46,17 @@ class ErrorCode(StrEnum):
     CURSOR_EXPIRED = "cursor_expired"
     NOT_IMPLEMENTED = "not_implemented"
     INTERNAL_ERROR = "internal_error"
+    # M24-05 host session supervisor (SESSION-RUNNER.md §6).
+    SESSION_NOT_FOUND = "session_not_found"
+    SESSION_STATE_CONFLICT = "session_state_conflict"
+    SESSION_BUSY = "session_busy"
+    CONFINEMENT_UNAVAILABLE = "confinement_unavailable"
+    CAPABILITY_UNAVAILABLE = "capability_unavailable"
+    RESUME_UNAVAILABLE = "resume_unavailable"
+    IDEMPOTENCY_CONFLICT = "idempotency_conflict"
+    BUDGET_EXCEEDED = "budget_exceeded"
+    MANIFEST_MISSING = "manifest_missing"
+    SECRET_UNAVAILABLE = "secret_unavailable"
 
 
 class ProtocolError(ValueError):
