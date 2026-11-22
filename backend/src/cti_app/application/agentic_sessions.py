@@ -1545,7 +1545,9 @@ class SessionService:
             await uow.investigation_tasks.lock_investigation(investigation_id)
             session = await self._session_for(uow, investigation_id, session_id)
             task = await self._locked_task(uow, investigation_id, session.task_id)
-            return await self._start_engine_locked(uow, session, task, timestamp)
+            running = await self._start_engine_locked(uow, session, task, timestamp)
+            await uow.commit()
+            return running
 
     async def _start_engine_locked(
         self,
