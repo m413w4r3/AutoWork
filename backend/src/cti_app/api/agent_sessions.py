@@ -245,6 +245,27 @@ async def list_agent_sessions(
     return [session.to_payload() for session in sessions]
 
 
+def _require_authenticated_identity_mode(request: Request) -> None:
+    """Refuse to open an agent session while any local process is treated as the human.
+
+    In the local identity mode the loopback API trusts every caller as the verified
+    human, so a host CLI could approve G3 or publish by calling the human routes
+    directly. Sessions therefore require token-authenticated identities (the CLI
+    sandbox never receives the operator token) unless explicitly overridden.
+    """
+    provider = getattr(request.app.state, "identity_provider", None)
+    if provider is None or getattr(provider, "mode", None) != "local":
+        return
+    if _settings(request).agent_sessions_allow_local_identity:
+        return
+    raise _http_error(
+        403,
+        "agent_sessions_require_authenticated_identity",
+        "Agent sessions need token-authenticated operator identities; the local "
+        "identity mode would let a host process act as the human.",
+    )
+
+
 @router.post("/{investigation_id}/agent-sessions")
 async def open_agent_session(
     investigation_id: UUID,
@@ -253,6 +274,7 @@ async def open_agent_session(
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=255)],
 ) -> dict[str, Any]:
     actor = await _human_actor(request)
+    _require_authenticated_identity_mode(request)
     try:
         prepared = await _service(request).open_session(
             investigation_id,

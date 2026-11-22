@@ -1,5 +1,5 @@
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -12,6 +12,7 @@ from starlette.responses import Response
 
 from cti_app.api import publication_runtime
 from cti_app.api.agent_sessions import router as agent_sessions_router
+from cti_app.api.agentic_tools import router as agentic_tools_router
 from cti_app.api.analyst_opinion import router as analyst_opinion_router
 from cti_app.api.collection import router as collection_router
 from cti_app.api.detection import router as detection_router
@@ -82,6 +83,7 @@ from cti_app.application.editions import EditionService
 from cti_app.application.goodware import GoodwareService
 from cti_app.application.identity import (
     PROTECTED_APP_ENVIRONMENTS,
+    Identity,
     IdentityScope,
     LocalIdentityProvider,
     StaticTokenIdentityProvider,
@@ -654,6 +656,16 @@ def create_app() -> FastAPI:
         provider = request.app.state.identity_provider
         if isinstance(provider, StaticTokenIdentityProvider):
             identity = provider.identity_for_authorization(request.headers.get("authorization"))
+            if identity is None and _agent_signed_route(
+                request.method, request.url.path, request.headers
+            ):
+                # ADR-0011 D7: the host tool shim holds no operator token. The route
+                # itself verifies the per-session HMAC; this request carries no human
+                # and no operator-client authority.
+                request.state.identity = Identity(
+                    actor_id="agent-session-unverified", scopes=frozenset()
+                )
+                return await call_next(request)
             if identity is None:
                 return JSONResponse(
                     status_code=401,
@@ -786,6 +798,7 @@ def create_app() -> FastAPI:
     application.include_router(investigation_handoffs_router)
     application.include_router(investigation_tasks_router)
     application.include_router(agent_sessions_router)
+    application.include_router(agentic_tools_router)
     application.include_router(osint_policy_router)
     application.include_router(investigation_captures_router)
     application.include_router(investigation_captures_legacy_router)
@@ -803,6 +816,40 @@ def create_app() -> FastAPI:
     application.include_router(analyst_opinion_router)
     application.include_router(workspace_agent_router)
     return application
+
+
+def _agent_signed_route(method: str, path: str, headers: Mapping[str, str]) -> bool:
+    """True for the exact POST routes the per-session tool shim signs (ADR-0011 D7)."""
+    if not headers.get("x-autowork-agent-session") or not headers.get("x-autowork-agent-signature"):
+        return False
+    parts = path.strip("/").split("/")
+    if len(parts) < 4 or parts[:2] != ["api", "investigations"]:
+        return False
+    try:
+        UUID(parts[2])
+    except ValueError:
+        return False
+    rest = parts[3:]
+    if method == "POST" and rest == ["handoffs"]:
+        return True
+    if (
+        method == "POST"
+        and len(rest) == 3
+        and rest[0] == "agent-sessions"
+        and rest[2] == "tool-calls"
+    ):
+        return _is_uuid(rest[1])
+    if method == "POST" and len(rest) == 3 and rest[0] == "tasks" and rest[2] == "commands":
+        return _is_uuid(rest[1])
+    return False
+
+
+def _is_uuid(value: str) -> bool:
+    try:
+        UUID(value)
+    except ValueError:
+        return False
+    return True
 
 
 def _operator_client_route_allowed(method: str, path: str) -> bool:

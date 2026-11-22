@@ -1043,7 +1043,11 @@ def _api_app(harness: _Harness, provider: Any) -> FastAPI:
     application = FastAPI()
     application.include_router(agent_sessions_router)
     application.state.uow_factory = lambda: harness.uow
-    application.state.settings = Settings(m24_agent_session_key=SESSION_KEY)
+    # The harness drives a local-identity "human"; the production guard that refuses agent
+    # sessions under the local identity mode has its own oracle (test_agent_identity_boundary).
+    application.state.settings = Settings(
+        m24_agent_session_key=SESSION_KEY, agent_sessions_allow_local_identity=True
+    )
     application.state.agentic_operator_port = harness.operator
     application.state.agent_session_secret_delivery = harness.secret_delivery
     application.state.identity_provider = provider

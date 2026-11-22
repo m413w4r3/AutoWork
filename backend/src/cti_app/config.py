@@ -71,6 +71,11 @@ class Settings(BaseSettings):
     # M24-05B1/D7: 32-byte server key that derives each agent-session secret
     # from the stored nonce.  Absent means agent sessions are fail-closed (503).
     m24_agent_session_key: SecretStr | None = None
+    # M24 security boundary: in the local (loopback, unauthenticated) identity mode every
+    # local process is "the human". An agent CLI is an untrusted local process, so agent
+    # sessions are refused unless the API runs with token-authenticated identities.
+    # Setting this to true is an explicit, unsafe opt-in for isolated development only.
+    agent_sessions_allow_local_identity: bool = False
 
     @field_validator("m24_agent_session_key")
     @classmethod
