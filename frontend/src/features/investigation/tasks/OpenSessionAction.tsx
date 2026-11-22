@@ -6,9 +6,12 @@
  * carries the probe's own `executable` echo, the current handoff and no
  * invented model alias. Every refusal is rendered with its typed French
  * reason; a failed probe hides the action instead of offering a dead end.
+ *
+ * The action's own eligibility disappears once the session exists or the task
+ * moves to `running`, so the action unmounts right after a success. The
+ * human-visible feedback is therefore owned by the caller (the stable task
+ * card or operator panel), never by this transient component.
  */
-
-import { useState } from "react";
 
 import {
   useAgentSessionCapabilities,
@@ -24,26 +27,30 @@ import {
   type SessionLaunchTarget,
 } from "./sessionLaunch";
 
+export interface OpenSessionFeedback {
+  kind: "success" | "error";
+  text: string;
+}
+
 export interface OpenSessionActionProps {
   investigationId: string;
   target: SessionLaunchTarget;
+  /** Rendered by the stable parent so it survives this action's unmounting. */
+  onFeedback: (feedback: OpenSessionFeedback) => void;
 }
 
 export function OpenSessionAction({
   investigationId,
   target,
+  onFeedback,
 }: OpenSessionActionProps) {
   const capabilities = useAgentSessionCapabilities(target.capability);
   const open = useOpenAgentSession(investigationId);
-  const [message, setMessage] = useState<string | null>(null);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const label = openSessionLabel(target.adapterKind);
 
   function openSession() {
     const view = capabilities.data;
     if (view === undefined) return;
-    setMessage(null);
-    setErrorMessage(null);
     open.mutate(
       {
         task_id: target.taskId,
@@ -56,12 +63,16 @@ export function OpenSessionAction({
       },
       {
         onSuccess: () => {
-          setMessage(
-            `${label} : session ouverte ; la tâche passe en cours et l’opérateur apparaît dans le panneau.`,
-          );
+          onFeedback({
+            kind: "success",
+            text: `${label} : session ouverte ; la tâche passe en cours et l’opérateur apparaît dans le panneau.`,
+          });
         },
         onError: (error) => {
-          setErrorMessage(describeSessionRefusal(toWorkshopApiError(error)));
+          onFeedback({
+            kind: "error",
+            text: describeSessionRefusal(toWorkshopApiError(error)),
+          });
         },
       },
     );
@@ -103,16 +114,6 @@ export function OpenSessionAction({
       >
         {open.isPending ? "Ouverture de la session…" : label}
       </button>
-      {message === null ? null : (
-        <p role="status" className="m24-message">
-          {message}
-        </p>
-      )}
-      {errorMessage === null ? null : (
-        <p role="alert" className="error-message">
-          {errorMessage}
-        </p>
-      )}
     </div>
   );
 }
