@@ -601,7 +601,8 @@ async def test_broker_refuses_expired_lease_mid_call() -> None:
     tasks._tasks[task.id] = _replace_task(
         task,
         heartbeat_at=NOW - timedelta(seconds=400),
-        lease_expires_at=datetime.now(UTC) - timedelta(seconds=1),
+        # The broker under test runs on the frozen NOW clock, so expire the lease on it too.
+        lease_expires_at=NOW - timedelta(seconds=1),
     )
     with pytest.raises(AgenticLeaseRefusedError):
         await broker.invoke(
