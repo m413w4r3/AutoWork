@@ -1,0 +1,307 @@
+/* M24 "Plan et tâches" cockpit — scoped styles, desktop layout. */
+
+.m24-plan-tasks {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.m24-plan-tasks__columns {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(320px, 2fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+.m24-plan-tasks__main,
+.m24-plan-tasks__side {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  min-width: 0;
+}
+
+.m24-card {
+  padding: 1.1rem 1.2rem;
+  border: 1px solid #dce4de;
+  border-radius: 1rem;
+  background: #fff;
+}
+
+.m24-card h3,
+.m24-card h4,
+.m24-card h5,
+.m24-card h6 {
+  margin-top: 0;
+}
+
+.m24-muted {
+  color: #5d6b62;
+  font-size: 0.86rem;
+}
+
+.m24-warning {
+  padding: 0.65rem 0.8rem;
+  border-radius: 0.6rem;
+  background: #fdf3d7;
+  color: #6b5116;
+  font-size: 0.86rem;
+}
+
+.m24-message {
+  padding: 0.65rem 0.8rem;
+  border-radius: 0.6rem;
+  background: #eaf5ee;
+  color: #1f5737;
+  font-size: 0.86rem;
+}
+
+.m24-badge {
+  display: inline-block;
+  padding: 0.15rem 0.55rem;
+  border-radius: 999px;
+  background: #eef3ef;
+  color: #33463b;
+  font-size: 0.74rem;
+  white-space: nowrap;
+}
+
+.m24-badge--advisory {
+  background: #fdf3d7;
+  color: #6b5116;
+}
+
+.m24-badge--evidence {
+  background: #dcefe3;
+  color: #1f5737;
+}
+
+.m24-badge--muted {
+  background: #f0f0ee;
+  color: #5d6b62;
+}
+
+.m24-badge--running {
+  background: #e3edfa;
+  color: #1f4874;
+}
+
+.m24-badge--awaiting_review {
+  background: #fdf3d7;
+  color: #6b5116;
+}
+
+.m24-badge--completed {
+  background: #dcefe3;
+  color: #1f5737;
+}
+
+.m24-badge--failed,
+.m24-badge--blocked {
+  background: #fcefeb;
+  color: #8b443c;
+}
+
+.m24-metadata {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 0.35rem 1rem;
+  margin: 0.5rem 0;
+}
+
+.m24-metadata dt {
+  color: #5d6b62;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.m24-metadata dd {
+  margin: 0;
+  font-size: 0.88rem;
+  overflow-wrap: anywhere;
+}
+
+.m24-metadata--refs {
+  grid-template-columns: 1fr;
+  border-top: 1px dashed #dce4de;
+  padding-top: 0.5rem;
+}
+
+.m24-task-list,
+.m24-operator-list,
+.m24-timeline,
+.m24-plan-versions,
+.m24-leads,
+.m24-consultations,
+.m24-events,
+.m24-subtasks {
+  list-style: none;
+  padding: 0;
+  margin: 0.6rem 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.m24-events,
+.m24-subtasks {
+  gap: 0.3rem;
+  font-size: 0.84rem;
+}
+
+.m24-task-card,
+.m24-operator,
+.m24-timeline__item,
+.m24-lead {
+  padding: 0.9rem 1rem;
+  border: 1px solid #e3e9e4;
+  border-radius: 0.8rem;
+  background: #fbfcfb;
+}
+
+.m24-task-card:focus-visible,
+.m24-action:focus-visible,
+.m24-version:focus-visible {
+  outline: 3px solid #2f6fb3;
+  outline-offset: 2px;
+}
+
+.m24-task-card__header,
+.m24-operator__header,
+.m24-timeline__heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.m24-task-card__actions,
+.m24-inline-form__buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0.6rem 0;
+}
+
+.m24-action {
+  padding: 0.4rem 0.8rem;
+  border: 1px solid #28704b;
+  border-radius: 0.55rem;
+  background: #28704b;
+  color: #fff;
+  font-size: 0.84rem;
+  cursor: pointer;
+}
+
+.m24-action:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.m24-action--quiet {
+  background: #fff;
+  color: #28503b;
+}
+
+.m24-inline-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin: 0.6rem 0;
+  padding: 0.7rem 0.8rem;
+  border: 1px dashed #c9d6cd;
+  border-radius: 0.7rem;
+  background: #fdfdfc;
+}
+
+.m24-inline-form textarea,
+.m24-inline-form input[type="search"],
+.m24-filters input,
+.m24-filters select {
+  font: inherit;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid #c9d6cd;
+  border-radius: 0.45rem;
+  background: #fff;
+}
+
+.m24-radio,
+.m24-confirm {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45rem;
+  font-size: 0.86rem;
+}
+
+.m24-filters {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+  gap: 0.6rem;
+  margin: 0.6rem 0;
+}
+
+.m24-filters label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.82rem;
+}
+
+.m24-plan-versions li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.m24-plan-versions p {
+  flex-basis: 100%;
+  margin: 0;
+}
+
+.m24-version {
+  padding: 0.4rem 0.8rem;
+  border: 1px solid #c9d6cd;
+  border-radius: 0.55rem;
+  background: #fff;
+  font: inherit;
+  font-size: 0.84rem;
+  cursor: pointer;
+}
+
+.m24-version--selected {
+  border-color: #28704b;
+  box-shadow: inset 0 0 0 1px #28704b;
+}
+
+.m24-advisory {
+  padding: 0.7rem 0.8rem;
+  border-radius: 0.7rem;
+  background: #fdf9ec;
+  border: 1px solid #ecdfb4;
+  font-size: 0.86rem;
+}
+
+.m24-task-card__results,
+.m24-operator__logs {
+  margin-top: 0.7rem;
+  padding-top: 0.6rem;
+  border-top: 1px dashed #dce4de;
+}
+
+.m24-ledger {
+  margin-top: 0.8rem;
+  font-size: 0.86rem;
+}
+
+.m24-ledger summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+@media (max-width: 1100px) {
+  .m24-plan-tasks__columns {
+    grid-template-columns: 1fr;
+  }
+}
