@@ -3,11 +3,13 @@ import type { KeyboardEvent } from "react";
 
 import {
   editorialFigureThumbnailUrl,
+  type EditorialEnrichmentElementRef,
   type EditorialWorkspaceBlock,
   type EditorialWorkspaceFigure,
   type EditorialWorkspaceSnapshot,
 } from "../../api/editorialWorkspace";
 import { BLOCK_KIND_LABELS } from "./blockKindLabels";
+import { CaptionEditor } from "./CaptionEditor";
 import { InlineTextEditor } from "./InlineTextEditor";
 import type { InlineTextEditorProps } from "./InlineTextEditor";
 import {
@@ -16,6 +18,15 @@ import {
 } from "./insertionOperations";
 import { ManualBarChartPreview } from "./ManualBarChartPreview";
 import { manualEditOperationFor } from "./manualEditOperation";
+import { MoveProvisionalPreview, MoveModeBanner } from "./MoveElementMode";
+import { ReorderElements } from "./ReorderElements";
+import { VisualActionBar } from "./VisualActionBar";
+import {
+  isVisualElementBlock,
+  visualElementAnchorId,
+  visualElementIdentity,
+  visualElementsSharingAnchor,
+} from "./visualElementOperations";
 import { VisualInsertionComposer } from "./VisualInsertionComposer";
 
 function EditorialSourceFigure({
@@ -78,6 +89,13 @@ function EditorialSourceFigure({
   );
 }
 
+export interface DocumentMoveState {
+  elementBlockId: string;
+  draftAnchorId: string | null;
+  error: string | null;
+  saving: boolean;
+}
+
 interface EditorialDocumentProps {
   snapshot: EditorialWorkspaceSnapshot;
   selectedBlockId: string | null;
@@ -96,6 +114,27 @@ interface EditorialDocumentProps {
   onOpenHistory?: (blockId: string) => void;
   onAskBridge?: (instruction: string) => void;
   onRefresh?: () => void;
+  captionEditingBlockId?: string | null;
+  moveState?: DocumentMoveState | null;
+  reorderBlockId?: string | null;
+  visualSaving?: boolean;
+  visualError?: string | null;
+  onStartCaption?: (blockId: string) => void;
+  onSaveCaption?: (blockId: string, caption: string | null) => Promise<void>;
+  onCancelCaption?: () => void;
+  onStartMove?: (blockId: string) => void;
+  onChooseMoveAnchor?: (anchorBlockId: string) => void;
+  onConfirmMove?: () => void;
+  onCancelMove?: () => void;
+  onStartReorder?: (blockId: string) => void;
+  onSaveReorder?: (
+    blockId: string,
+    order: EditorialEnrichmentElementRef[],
+  ) => Promise<void>;
+  onCancelReorder?: () => void;
+  onRequestRemove?: (blockId: string) => void;
+  onRequestReplace?: (blockId: string) => void;
+  onAskBridgeVisual?: (blockId: string) => void;
 }
 
 function blockLabel(block: EditorialWorkspaceBlock): string {
@@ -376,23 +415,86 @@ export function EditorialDocument({
   onOpenHistory,
   onAskBridge,
   onRefresh,
+  captionEditingBlockId = null,
+  moveState = null,
+  reorderBlockId = null,
+  visualSaving = false,
+  visualError = null,
+  onStartCaption,
+  onSaveCaption,
+  onCancelCaption,
+  onStartMove,
+  onChooseMoveAnchor,
+  onConfirmMove,
+  onCancelMove,
+  onStartReorder,
+  onSaveReorder,
+  onCancelReorder,
+  onRequestRemove,
+  onRequestReplace,
+  onAskBridgeVisual,
 }: EditorialDocumentProps) {
   const [hoveredBlockId, setHoveredBlockId] = useState<string | null>(null);
   const [focusedBlockId, setFocusedBlockId] = useState<string | null>(null);
   const actionBlockId =
     hoveredBlockId ?? focusedBlockId ?? selectedBlockId ?? null;
+  const moveElement = moveState
+    ? (snapshot.blocks.find(
+        (block) => block.block_id === moveState.elementBlockId,
+      ) ?? null)
+    : null;
+  const moveCurrentAnchorId = moveElement
+    ? visualElementAnchorId(moveElement)
+    : null;
+  const moveDraftAnchor =
+    moveState?.draftAnchorId !== null && moveState?.draftAnchorId !== undefined
+      ? (snapshot.blocks.find(
+          (block) => block.block_id === moveState.draftAnchorId,
+        ) ?? null)
+      : null;
+  const moveCurrentAnchor =
+    moveCurrentAnchorId !== null
+      ? (snapshot.blocks.find(
+          (block) => block.block_id === moveCurrentAnchorId,
+        ) ?? null)
+      : null;
 
   return (
     <article className="editorial-document" aria-label="Document éditorial">
+      {moveState && moveElement ? (
+        <MoveModeBanner
+          element={moveElement}
+          currentAnchorText={moveCurrentAnchor?.text ?? null}
+          draftAnchor={moveDraftAnchor}
+          error={moveState.error}
+          saving={moveState.saving}
+          onCancel={() => onCancelMove?.()}
+        />
+      ) : null}
       {snapshot.blocks.map((block) => {
         const selected = selectedBlockId === block.block_id;
         const editing = editingBlockId === block.block_id;
+        const editingCaption = captionEditingBlockId === block.block_id;
+        const visual = isVisualElementBlock(block);
+        const identity = visualElementIdentity(block);
         const hasDraft = Object.prototype.hasOwnProperty.call(
           drafts,
           block.block_id,
         );
         const draft = drafts[block.block_id];
         const staleDraft = staleDraftIds.has(block.block_id);
+        const isMoveAnchorCandidate = Boolean(
+          moveState &&
+          !moveState.saving &&
+          (block.kind === "paragraph" || block.kind === "lead_paragraph") &&
+          block.revision_status === "ready",
+        );
+        const isCurrentMoveAnchor =
+          isMoveAnchorCandidate && block.block_id === moveCurrentAnchorId;
+        const reorderAnchorId =
+          visual && reorderBlockId === block.block_id
+            ? visualElementAnchorId(block)
+            : null;
         return (
           <div
             key={block.block_id}
@@ -401,10 +503,15 @@ export function EditorialDocument({
             aria-label={`${BLOCK_KIND_LABELS[block.kind]}${block.text ? ` : ${block.text}` : ""}`}
             aria-keyshortcuts="Enter Space"
             aria-current={selected ? "true" : undefined}
+            aria-disabled={isCurrentMoveAnchor ? "true" : undefined}
             tabIndex={0}
             data-block-id={block.block_id}
             data-selected={selected}
             data-kind={block.kind}
+            data-visual={visual || undefined}
+            data-element-kind={identity?.kind}
+            data-element-key={identity?.key}
+            data-move-target={isMoveAnchorCandidate || undefined}
             onMouseEnter={() => setHoveredBlockId(block.block_id)}
             onMouseLeave={() =>
               setHoveredBlockId((current) =>
@@ -431,16 +538,38 @@ export function EditorialDocument({
               ) {
                 return;
               }
+              if (isMoveAnchorCandidate) {
+                onChooseMoveAnchor?.(block.block_id);
+                return;
+              }
               onSelectBlock(block.block_id);
             }}
             onKeyDown={(event: KeyboardEvent<HTMLDivElement>) => {
               if (event.target !== event.currentTarget) return;
               if (event.key !== "Enter" && event.key !== " ") return;
               event.preventDefault();
+              if (isMoveAnchorCandidate) {
+                onChooseMoveAnchor?.(block.block_id);
+                return;
+              }
               onSelectBlock(block.block_id);
             }}
           >
-            {editing ? (
+            {editingCaption && visual ? (
+              <CaptionEditor
+                block={block}
+                onSave={(caption) =>
+                  onSaveCaption
+                    ? onSaveCaption(block.block_id, caption)
+                    : Promise.reject(
+                        new Error(
+                          "L’enregistrement de la légende est indisponible.",
+                        ),
+                      )
+                }
+                onCancel={() => onCancelCaption?.()}
+              />
+            ) : editing ? (
               <InlineTextEditor
                 blockId={block.block_id}
                 value={draft ?? block.text ?? ""}
@@ -453,6 +582,41 @@ export function EditorialDocument({
             ) : (
               blockContent(snapshot.subject_id, block)
             )}
+            {isMoveAnchorCandidate ? (
+              <p className="visual-move-target-hint">
+                {isCurrentMoveAnchor
+                  ? "Emplacement actuel du visuel — choisissez un autre paragraphe."
+                  : moveState?.draftAnchorId === block.block_id
+                    ? "Emplacement prévu pour le visuel."
+                    : "Choisir comme emplacement (Entrée)."}
+              </p>
+            ) : null}
+            {moveState &&
+            moveElement &&
+            moveState.draftAnchorId === block.block_id ? (
+              <MoveProvisionalPreview
+                element={moveElement}
+                anchor={block}
+                saving={moveState.saving}
+                samePosition={block.block_id === moveCurrentAnchorId}
+                error={moveState.error}
+                onConfirm={() => onConfirmMove?.()}
+                onCancel={() => onCancelMove?.()}
+              />
+            ) : null}
+            {visual && reorderAnchorId && onSaveReorder ? (
+              <ReorderElements
+                anchorBlockId={reorderAnchorId}
+                elements={visualElementsSharingAnchor(
+                  snapshot,
+                  reorderAnchorId,
+                )}
+                saving={visualSaving}
+                error={visualError}
+                onSave={(order) => void onSaveReorder(block.block_id, order)}
+                onCancel={() => onCancelReorder?.()}
+              />
+            ) : null}
             {hasDraft && !editing ? (
               <div className="editorial-document__draft-actions">
                 <span className="editorial-local-draft-label">
@@ -480,7 +644,32 @@ export function EditorialDocument({
                 Bloc sélectionné
               </span>
             ) : null}
-            {!editing && actionBlockId === block.block_id ? (
+            {!editing &&
+            !editingCaption &&
+            !moveState &&
+            reorderBlockId !== block.block_id &&
+            visual &&
+            actionBlockId === block.block_id ? (
+              <VisualActionBar
+                block={block}
+                readOnly={readOnly}
+                canDiscuss={snapshot.capabilities.can_discuss}
+                onEditCaption={onStartCaption}
+                onAskBridge={onAskBridgeVisual}
+                onStartMove={onStartMove}
+                onStartReorder={onStartReorder}
+                onRequestReplace={onRequestReplace}
+                onRequestRemove={onRequestRemove}
+                onOpenSources={onOpenSources}
+                onOpenHistory={onOpenHistory}
+              />
+            ) : null}
+            {!editing &&
+            !editingCaption &&
+            !moveState &&
+            reorderBlockId !== block.block_id &&
+            !visual &&
+            actionBlockId === block.block_id ? (
               <BlockActionBar
                 snapshot={snapshot}
                 block={block}

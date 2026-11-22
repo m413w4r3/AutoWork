@@ -5,6 +5,7 @@ import { ApiError } from "../../api/editions";
 import {
   acceptEditorialProposal,
   getEditorialProposal,
+  isVisualRevisionProposalPatch,
   rejectEditorialProposal,
   editorialFigureThumbnailUrl,
   type EditorialManualSourceFigurePatchReference,
@@ -17,6 +18,12 @@ import {
 import { editorialWorkspaceQueryKeys } from "./editorialWorkspaceQueries";
 import { EditorialDiffView } from "./EditorialDiffView";
 import { ManualBarChartPreview } from "./ManualBarChartPreview";
+import { VisualProposalDiff } from "./VisualProposalDiff";
+import {
+  visualElementsSharingAnchor,
+  visualPatchTarget,
+} from "./visualElementOperations";
+import { useVisualWorkspaceContext } from "./visualWorkspaceContext";
 
 interface EditorialProposalCardProps {
   subjectId: string;
@@ -57,6 +64,15 @@ function focusDocumentBlock(occurrenceId: string) {
     ),
   ).find((candidate) => candidate.dataset.blockId === occurrenceId);
   block?.focus({ preventScroll: true });
+}
+
+function proposalWarnings(diagnostics: Record<string, unknown>): string[] {
+  const warnings = diagnostics.warnings;
+  return Array.isArray(warnings)
+    ? warnings.filter(
+        (warning): warning is string => typeof warning === "string",
+      )
+    : [];
 }
 
 function tableFromPatch(
@@ -389,6 +405,7 @@ export function EditorialProposalCard({
   onStateChange,
 }: EditorialProposalCardProps) {
   const queryClient = useQueryClient();
+  const visualContext = useVisualWorkspaceContext();
   const proposalQueryKey = editorialWorkspaceQueryKeys.proposal(
     subjectId,
     occurrenceId,
@@ -407,6 +424,12 @@ export function EditorialProposalCard({
     await Promise.all([
       queryClient.invalidateQueries({
         queryKey: editorialWorkspaceQueryKeys.snapshot(subjectId),
+      }),
+      queryClient.invalidateQueries({
+        queryKey: ["editorial-pdf-status", subjectId],
+      }),
+      queryClient.invalidateQueries({
+        queryKey: ["editorial-composition-status", subjectId],
       }),
       queryClient.invalidateQueries({
         queryKey: editorialWorkspaceQueryKeys.threadsForOccurrence(
@@ -446,7 +469,20 @@ export function EditorialProposalCard({
             : current,
       );
       await invalidateDecisionContext();
-      focusDocumentBlock(occurrenceId);
+      const patch = proposalQuery.data?.patch;
+      const visualTarget =
+        patch && isVisualRevisionProposalPatch(patch)
+          ? visualPatchTarget(patch.visual_patch)
+          : null;
+      if (visualTarget && visualContext) {
+        visualContext.restoreElementSelection(
+          visualTarget.kind,
+          visualTarget.key,
+          occurrenceId,
+        );
+      } else {
+        focusDocumentBlock(occurrenceId);
+      }
     },
   });
   const rejectMutation = useMutation({
@@ -485,10 +521,46 @@ export function EditorialProposalCard({
   }
 
   const proposal = proposalQuery.data;
-  const proposedText = proposal.patch?.after;
-  const tableProposal = tableFromPatch(proposal.patch);
-  const barChartProposal = barChartFromPatch(proposal.patch);
-  const sourceFigureProposal = sourceFiguresFromPatch(proposal.patch);
+  const patchDocument = proposal.patch;
+  const visualProposal = isVisualRevisionProposalPatch(patchDocument)
+    ? patchDocument
+    : null;
+  const visualPatch = visualProposal?.visual_patch ?? null;
+  const textPatch = isVisualRevisionProposalPatch(patchDocument)
+    ? null
+    : patchDocument;
+  const proposedText = textPatch?.after;
+  const tableProposal = tableFromPatch(textPatch);
+  const barChartProposal = barChartFromPatch(textPatch);
+  const sourceFigureProposal = sourceFiguresFromPatch(textPatch);
+  const visualTarget = visualPatch ? visualPatchTarget(visualPatch) : null;
+  const visualSnapshot = visualContext?.snapshot ?? null;
+  const currentElement =
+    visualTarget && visualSnapshot
+      ? (visualSnapshot.blocks.find(
+          (block) =>
+            block.element_kind === visualTarget.kind &&
+            block.element_key === visualTarget.key,
+        ) ?? null)
+      : null;
+  const currentGroup =
+    visualPatch?.kind === "reorder_enrichment_elements" && visualSnapshot
+      ? visualElementsSharingAnchor(visualSnapshot, visualPatch.anchor_block_id)
+      : [];
+  const anchorLabel = (blockId: string) =>
+    visualContext?.anchorLabel(blockId) ?? null;
+  const diagnosticsWarnings = proposalWarnings(proposal.diagnostics);
+  const visualWarnings =
+    visualPatch?.kind === "move_enrichment_element"
+      ? [
+          ...diagnosticsWarnings,
+          ...(anchorLabel(visualPatch.anchor_block_id) === null
+            ? [
+                "Le paragraphe d’ancrage proposé n’est plus présent dans cette version. La proposition ne peut pas être acceptée en l’état.",
+              ]
+            : []),
+        ]
+      : diagnosticsWarnings;
   const acceptanceConflict =
     acceptMutation.isError &&
     acceptMutation.error instanceof ApiError &&
@@ -524,17 +596,25 @@ export function EditorialProposalCard({
       {proposal.origin === "manual_patch" ? (
         <p className="editorial-proposal-card__origin">Modification manuelle</p>
       ) : null}
-      {tableProposal ? (
+      {visualProposal ? (
+        <VisualProposalDiff
+          patch={visualProposal}
+          currentElement={currentElement}
+          currentGroup={currentGroup}
+          anchorLabel={anchorLabel}
+          warnings={visualWarnings}
+        />
+      ) : tableProposal ? (
         <TableProposalComparison
           table={tableProposal}
           anchorText={anchorText}
-          evidenceRefs={proposal.patch?.evidence_refs}
+          evidenceRefs={textPatch?.evidence_refs}
         />
       ) : barChartProposal ? (
         <BarChartProposalComparison
           chart={barChartProposal}
           anchorText={anchorText}
-          evidenceRefs={proposal.patch?.evidence_refs}
+          evidenceRefs={textPatch?.evidence_refs}
         />
       ) : sourceFigureProposal ? (
         <SourceFigureProposalComparison
@@ -581,11 +661,12 @@ export function EditorialProposalCard({
       {!tableProposal &&
       !barChartProposal &&
       !sourceFigureProposal &&
-      (proposal.patch?.evidence_refs?.length ?? 0) > 0 ? (
+      !visualProposal &&
+      (textPatch?.evidence_refs?.length ?? 0) > 0 ? (
         <details className="editorial-proposal-card__text-evidence">
           <summary>Preuves concernées</summary>
           <ul>
-            {proposal.patch?.evidence_refs?.map((reference, index) => (
+            {textPatch?.evidence_refs?.map((reference, index) => (
               <li
                 key={`${reference.source_document_id}-${reference.evidence_key}-${index}`}
               >
@@ -739,9 +820,14 @@ export function EditorialProposalCard({
             Ancre · {barChartProposal.anchor_block_id ?? "non renseignée"}
           </p>
         ) : null}
-        {proposal.patch?.enrichment_patch ? (
+        {textPatch?.enrichment_patch ? (
           <pre aria-label="Patch éditorial typé">
-            {JSON.stringify(proposal.patch.enrichment_patch, null, 2)}
+            {JSON.stringify(textPatch.enrichment_patch, null, 2)}
+          </pre>
+        ) : null}
+        {visualProposal ? (
+          <pre aria-label="Révision visuelle typée">
+            {JSON.stringify(visualProposal.visual_patch, null, 2)}
           </pre>
         ) : null}
         <dl>

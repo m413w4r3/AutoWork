@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ReactNode } from "react";
 
 import { ApiError } from "../../api/editions";
 import type {
   EditorialCompositionStatusView,
+  EditorialEnrichmentElementRef,
   EditorialPdfStatusView,
   EditorialWorkspaceBlock,
   EditorialWorkspaceSnapshot,
@@ -10,6 +12,7 @@ import type {
 import { Link } from "../../routing";
 import { editorialReadOnlyReasonText } from "../publication/publicationReadOnly";
 import { EditorialDocument } from "./EditorialDocument";
+import type { DocumentMoveState } from "./EditorialDocument";
 import type { EditorialDraftController } from "./EditorialDrafts";
 import type { InlineTextEditorProps } from "./InlineTextEditor";
 import { EditorialInspector } from "./EditorialInspector";
@@ -17,9 +20,25 @@ import type { InspectorTab } from "./EditorialInspector";
 import { manualEditOperationFor } from "./manualEditOperation";
 import { EditorialOutline } from "./EditorialOutline";
 import { EditorialServerDraftStatus } from "./EditorialServerDraftStatus";
+import { RemoveElementDialog } from "./RemoveElementDialog";
 import { SourceFigureGallery } from "./SourceFigureGallery";
 import { EditorialTopBar } from "./EditorialTopBar";
 import { EditorialHistory } from "./EditorialHistory";
+import { useManualVisualRevision } from "./useManualVisualRevision";
+import {
+  visualElementAnchorId,
+  visualElementIdentity,
+  visualElementTitle,
+} from "./visualElementOperations";
+import type { VisualElementIdentity } from "./visualElementOperations";
+import { VisualWorkspaceProvider } from "./VisualWorkspaceContext";
+import { anchorLabelFromSnapshot } from "./visualWorkspaceContext";
+
+export interface VisualReplaceRequest {
+  elementKey: string;
+  blockId: string;
+  close: () => void;
+}
 
 interface EditorialWorkspaceLayoutProps {
   subjectId: string;
@@ -38,6 +57,11 @@ interface EditorialWorkspaceLayoutProps {
   onRefreshPdfStatus?: () => void;
   onRegeneratePdf?: () => void;
   onSave?: InlineTextEditorProps["onSave"];
+  /**
+   * Slot owned by the source-figure gallery task: receives a replacement
+   * request for one figure element and must expose its own close control.
+   */
+  renderReplaceSlot?: (request: VisualReplaceRequest) => ReactNode;
 }
 
 type OpenPanel = "outline" | "inspector" | null;
@@ -79,6 +103,7 @@ export function EditorialWorkspaceLayout({
   onRefreshPdfStatus,
   onRegeneratePdf,
   onSave,
+  renderReplaceSlot,
 }: EditorialWorkspaceLayoutProps) {
   const [openPanel, setOpenPanel] = useState<OpenPanel>(null);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -94,6 +119,29 @@ export function EditorialWorkspaceLayout({
   const [manualSaving, setManualSaving] = useState(false);
   const [manualConflict, setManualConflict] = useState(false);
   const [pendingProposal, setPendingProposal] = useState(false);
+  const [captionEditingBlockId, setCaptionEditingBlockId] = useState<
+    string | null
+  >(null);
+  const [moveState, setMoveState] = useState<DocumentMoveState | null>(null);
+  const [reorderBlockId, setReorderBlockId] = useState<string | null>(null);
+  const [removeBlockId, setRemoveBlockId] = useState<string | null>(null);
+  const [removeError, setRemoveError] = useState<string | null>(null);
+  const [visualError, setVisualError] = useState<string | null>(null);
+  const [visualAnnouncement, setVisualAnnouncement] = useState<{
+    key: string;
+    text: string;
+  } | null>(null);
+  const [replaceRequest, setReplaceRequest] = useState<{
+    elementKey: string;
+    blockId: string;
+  } | null>(null);
+  const [selectionRestoreTick, setSelectionRestoreTick] = useState(0);
+  const pendingElementSelectionRef = useRef<{
+    identity: VisualElementIdentity;
+    previousBlockId: string;
+  } | null>(null);
+  const manualVisual = useManualVisualRevision(subjectId);
+  const visualSaving = manualVisual.isPending;
   const overlayOpenerRef = useRef<HTMLElement | null>(null);
   const historyOpenerRef = useRef<HTMLButtonElement | null>(null);
   const leaveConfirmedRef = useRef(false);
@@ -146,9 +194,327 @@ export function EditorialWorkspaceLayout({
     );
 
   const selectBlock = (blockId: string) => {
-    if (blockId !== selectedBlockId) setEditingBlockId(null);
+    if (blockId !== selectedBlockId) {
+      setEditingBlockId(null);
+      setCaptionEditingBlockId(null);
+      setMoveState(null);
+      setReorderBlockId(null);
+      setVisualError(null);
+    }
     onSelectBlock(blockId);
   };
+
+  const announceVisual = (text: string) => {
+    setVisualAnnouncement({ key: crypto.randomUUID(), text });
+  };
+
+  const visualFailureMessage = (error: unknown, fallback: string) =>
+    error instanceof Error ? error.message : fallback;
+
+  const restoreElementSelection = useCallback(
+    (
+      kind: VisualElementIdentity["kind"],
+      key: string,
+      previousBlockId = "",
+    ) => {
+      pendingElementSelectionRef.current = {
+        identity: { kind, key },
+        previousBlockId,
+      };
+      // The snapshot may already be refreshed when a proposal card accepts:
+      // bump the tick so the restore effect re-evaluates the current blocks.
+      setSelectionRestoreTick((tick) => tick + 1);
+    },
+    [],
+  );
+
+  const requestReplaceElement = useCallback(
+    (elementKey: string, blockId: string) => {
+      setReplaceRequest({ elementKey, blockId });
+    },
+    [],
+  );
+
+  useEffect(() => {
+    const pending = pendingElementSelectionRef.current;
+    if (!pending) return;
+    const match = ordered.find(
+      (block) =>
+        block.element_kind === pending.identity.kind &&
+        block.element_key === pending.identity.key,
+    );
+    if (!match) return;
+    // Before the refreshed snapshot arrives the old occurrence still matches;
+    // selecting it would defeat the identity-based restore.
+    if (match.block_id === pending.previousBlockId) return;
+    pendingElementSelectionRef.current = null;
+    onSelectBlock(match.block_id);
+    setCaptionEditingBlockId(null);
+    setMoveState(null);
+    setReorderBlockId(null);
+    setVisualError(null);
+    window.requestAnimationFrame(() => {
+      const element = document.querySelector<HTMLElement>(
+        `.editorial-document__block[data-block-id="${CSS.escape(match.block_id)}"]`,
+      );
+      element?.focus({ preventScroll: true });
+      element?.scrollIntoView?.({ block: "nearest" });
+    });
+  }, [onSelectBlock, ordered, selectionRestoreTick]);
+
+  const startCaptionEditing = (blockId: string) => {
+    if (readOnly) return;
+    selectBlock(blockId);
+    setMoveState(null);
+    setReorderBlockId(null);
+    setVisualError(null);
+    setCaptionEditingBlockId(blockId);
+  };
+
+  const saveCaption = async (blockId: string, caption: string | null) => {
+    const block = ordered.find((candidate) => candidate.block_id === blockId);
+    const identity = block ? visualElementIdentity(block) : null;
+    if (!block || !identity) {
+      throw new Error("Ce visuel n’existe plus dans cette version.");
+    }
+    pendingElementSelectionRef.current = {
+      identity,
+      previousBlockId: block.block_id,
+    };
+    try {
+      const result = await manualVisual.mutateAsync({
+        occurrenceId: block.block_id,
+        revision: {
+          snapshot_id: snapshot.snapshot_id,
+          operation: "update_visual_caption",
+          element_kind: identity.kind,
+          element_key: identity.key,
+          caption,
+        },
+      });
+      setCaptionEditingBlockId(null);
+      announceVisual(
+        `Légende enregistrée · v${result.acceptance.artifact_version}`,
+      );
+    } catch (error) {
+      pendingElementSelectionRef.current = null;
+      throw error;
+    }
+  };
+
+  const startMove = (blockId: string) => {
+    if (readOnly) return;
+    const block = ordered.find((candidate) => candidate.block_id === blockId);
+    if (!block || !visualElementIdentity(block)) return;
+    selectBlock(blockId);
+    setCaptionEditingBlockId(null);
+    setReorderBlockId(null);
+    setVisualError(null);
+    setMoveState({
+      elementBlockId: blockId,
+      draftAnchorId: null,
+      error: null,
+      saving: false,
+    });
+    window.requestAnimationFrame(() => {
+      document
+        .querySelector<HTMLElement>(".visual-move-banner")
+        ?.focus({ preventScroll: true });
+    });
+  };
+
+  const chooseMoveAnchor = (anchorBlockId: string) => {
+    setMoveState((current) =>
+      current
+        ? {
+            ...current,
+            draftAnchorId: anchorBlockId,
+            error:
+              anchorBlockId === current.draftAnchorId ? current.error : null,
+          }
+        : current,
+    );
+  };
+
+  const cancelMove = () => {
+    setMoveState((current) => (current && !current.saving ? null : current));
+  };
+
+  const confirmMove = async () => {
+    const current = moveState;
+    if (!current || current.saving) return;
+    const block = ordered.find(
+      (candidate) => candidate.block_id === current.elementBlockId,
+    );
+    const identity = block ? visualElementIdentity(block) : null;
+    if (!block || !identity) {
+      setMoveState({
+        ...current,
+        error: "Ce visuel n’existe plus dans cette version.",
+      });
+      return;
+    }
+    if (!current.draftAnchorId) {
+      setMoveState({
+        ...current,
+        error: "Choisissez un paragraphe de destination.",
+      });
+      return;
+    }
+    if (current.draftAnchorId === visualElementAnchorId(block)) {
+      setMoveState({
+        ...current,
+        error:
+          "Le visuel est déjà placé après ce paragraphe. Choisissez un autre paragraphe.",
+      });
+      return;
+    }
+    pendingElementSelectionRef.current = {
+      identity,
+      previousBlockId: block.block_id,
+    };
+    setMoveState({ ...current, saving: true, error: null });
+    try {
+      const result = await manualVisual.mutateAsync({
+        occurrenceId: block.block_id,
+        revision: {
+          snapshot_id: snapshot.snapshot_id,
+          operation: "move_enrichment_element",
+          element_kind: identity.kind,
+          element_key: identity.key,
+          anchor_block_id: current.draftAnchorId,
+        },
+      });
+      setMoveState(null);
+      announceVisual(
+        `Emplacement enregistré · v${result.acceptance.artifact_version}`,
+      );
+    } catch (error) {
+      pendingElementSelectionRef.current = null;
+      setMoveState({
+        ...current,
+        saving: false,
+        error: visualFailureMessage(
+          error,
+          "L’emplacement n’a pas pu être enregistré.",
+        ),
+      });
+    }
+  };
+
+  const startReorder = (blockId: string) => {
+    if (readOnly) return;
+    const block = ordered.find((candidate) => candidate.block_id === blockId);
+    if (!block || !visualElementIdentity(block)) return;
+    selectBlock(blockId);
+    setCaptionEditingBlockId(null);
+    setMoveState(null);
+    setVisualError(null);
+    setReorderBlockId(blockId);
+  };
+
+  const saveReorder = async (
+    blockId: string,
+    order: EditorialEnrichmentElementRef[],
+  ) => {
+    const block = ordered.find((candidate) => candidate.block_id === blockId);
+    const identity = block ? visualElementIdentity(block) : null;
+    const anchorBlockId = block ? visualElementAnchorId(block) : null;
+    if (!block || !identity || !anchorBlockId) {
+      setVisualError("Ce visuel n’a pas de paragraphe d’ancrage disponible.");
+      return;
+    }
+    pendingElementSelectionRef.current = {
+      identity,
+      previousBlockId: block.block_id,
+    };
+    setVisualError(null);
+    try {
+      const result = await manualVisual.mutateAsync({
+        occurrenceId: anchorBlockId,
+        revision: {
+          snapshot_id: snapshot.snapshot_id,
+          operation: "reorder_enrichment_elements",
+          anchor_block_id: anchorBlockId,
+          order,
+        },
+      });
+      setReorderBlockId(null);
+      announceVisual(
+        `Ordre enregistré · v${result.acceptance.artifact_version}`,
+      );
+    } catch (error) {
+      pendingElementSelectionRef.current = null;
+      setVisualError(
+        visualFailureMessage(error, "L’ordre n’a pas pu être enregistré."),
+      );
+    }
+  };
+
+  const requestRemove = (blockId: string) => {
+    if (readOnly) return;
+    selectBlock(blockId);
+    setRemoveError(null);
+    setRemoveBlockId(blockId);
+  };
+
+  const confirmRemove = async () => {
+    const block = removeBlockId
+      ? ordered.find((candidate) => candidate.block_id === removeBlockId)
+      : null;
+    const identity = block ? visualElementIdentity(block) : null;
+    if (!block || !identity) {
+      setRemoveError("Ce visuel n’existe plus dans cette version.");
+      return;
+    }
+    setRemoveError(null);
+    try {
+      const result = await manualVisual.mutateAsync({
+        occurrenceId: block.block_id,
+        revision: {
+          snapshot_id: snapshot.snapshot_id,
+          operation: "remove_enrichment_element",
+          element_kind: identity.kind,
+          element_key: identity.key,
+        },
+      });
+      setRemoveBlockId(null);
+      announceVisual(
+        `Visuel retiré du document · v${result.acceptance.artifact_version}. Il reste dans les sources archivées et dans l’historique.`,
+      );
+    } catch (error) {
+      setRemoveError(
+        visualFailureMessage(error, "Le visuel n’a pas pu être retiré."),
+      );
+    }
+  };
+
+  const requestReplace = (blockId: string) => {
+    if (readOnly) return;
+    const block = ordered.find((candidate) => candidate.block_id === blockId);
+    const identity = block ? visualElementIdentity(block) : null;
+    if (!identity) return;
+    setReplaceRequest({ elementKey: identity.key, blockId });
+  };
+
+  const visualWorkspaceValue = useMemo(
+    () => ({
+      snapshot,
+      readOnly,
+      restoreElementSelection,
+      requestReplaceElement,
+      replaceRequest,
+      anchorLabel: (blockId: string) =>
+        anchorLabelFromSnapshot(snapshot, blockId),
+    }),
+    [
+      snapshot,
+      readOnly,
+      restoreElementSelection,
+      requestReplaceElement,
+      replaceRequest,
+    ],
+  );
 
   const startEditing = (blockId: string) => {
     const block = ordered.find((candidate) => candidate.block_id === blockId);
@@ -309,6 +675,18 @@ export function EditorialWorkspaceLayout({
         closeHistory();
         return;
       }
+      if (removeBlockId) return;
+      if (moveState) {
+        event.preventDefault();
+        if (!moveState.saving) setMoveState(null);
+        return;
+      }
+      if (reorderBlockId) {
+        event.preventDefault();
+        setReorderBlockId(null);
+        setVisualError(null);
+        return;
+      }
       setOpenPanel(null);
       setMenuOpen(false);
       setTechnicalOpen(false);
@@ -323,7 +701,7 @@ export function EditorialWorkspaceLayout({
     };
     window.addEventListener("keydown", closeTransientUi);
     return () => window.removeEventListener("keydown", closeTransientUi);
-  }, [closeHistory, historyOpen]);
+  }, [closeHistory, historyOpen, moveState, removeBlockId, reorderBlockId]);
 
   const selectFromOutline = (blockId: string) => {
     selectBlock(blockId);
@@ -408,193 +786,286 @@ export function EditorialWorkspaceLayout({
   };
 
   return (
-    <section
-      className="editorial-workspace"
-      aria-labelledby="editorial-workspace-heading"
-    >
-      <EditorialTopBar
-        subjectId={subjectId}
-        snapshot={snapshot}
-        pdfStatus={pdfStatus}
-        pdfStatusUnavailable={pdfStatusUnavailable}
-        pdfRegenerationPending={pdfRegenerationPending}
-        pdfRegenerationError={pdfRegenerationError}
-        compositionStatus={compositionStatus}
-        stale={stale}
-        hasLocalDrafts={localDrafts.hasDrafts}
-        hasStaleLocalDrafts={localDrafts.hasStaleDrafts}
-        readOnlyReason={readOnlyReason}
-        manualEditSaving={manualSaving}
-        manualEditConflict={manualConflict}
-        pendingProposal={pendingProposal}
-        menuOpen={menuOpen}
-        technicalOpen={technicalOpen}
-        onToggleMenu={toggleMenu}
-        onOpenTechnicalDetails={openTechnicalDetails}
-        onTechnicalOpenChange={setTechnicalOpen}
-        onRefresh={onRefresh}
-        onRefreshPdfStatus={onRefreshPdfStatus}
-        onRegeneratePdf={onRegeneratePdf}
-        onOpenHistory={openHistory}
-        onNavigateAway={allowNavigationAway}
-      />
-
-      {historyOpen ? (
-        <EditorialHistory
+    <VisualWorkspaceProvider value={visualWorkspaceValue}>
+      <section
+        className="editorial-workspace"
+        aria-labelledby="editorial-workspace-heading"
+      >
+        <EditorialTopBar
           subjectId={subjectId}
-          onClose={closeHistory}
-          onOpenThread={openHistoryThread}
+          snapshot={snapshot}
+          pdfStatus={pdfStatus}
+          pdfStatusUnavailable={pdfStatusUnavailable}
+          pdfRegenerationPending={pdfRegenerationPending}
+          pdfRegenerationError={pdfRegenerationError}
+          compositionStatus={compositionStatus}
+          stale={stale}
+          hasLocalDrafts={localDrafts.hasDrafts}
+          hasStaleLocalDrafts={localDrafts.hasStaleDrafts}
+          readOnlyReason={readOnlyReason}
+          manualEditSaving={manualSaving}
+          manualEditConflict={manualConflict}
+          pendingProposal={pendingProposal}
+          menuOpen={menuOpen}
+          technicalOpen={technicalOpen}
+          onToggleMenu={toggleMenu}
+          onOpenTechnicalDetails={openTechnicalDetails}
+          onTechnicalOpenChange={setTechnicalOpen}
+          onRefresh={onRefresh}
+          onRefreshPdfStatus={onRefreshPdfStatus}
+          onRegeneratePdf={onRegeneratePdf}
+          onOpenHistory={openHistory}
+          onNavigateAway={allowNavigationAway}
         />
-      ) : null}
 
-      <EditorialServerDraftStatus
-        subjectId={subjectId}
-        occurrenceId={selectedBlock?.block_id ?? null}
-        snapshotId={snapshot.snapshot_id}
-        localDraftText={localDraftText}
-        onRecover={(text) => {
-          if (selectedBlock) onLocalDraftChange(selectedBlock.block_id, text);
-        }}
-      />
+        {historyOpen ? (
+          <EditorialHistory
+            subjectId={subjectId}
+            onClose={closeHistory}
+            onOpenThread={openHistoryThread}
+          />
+        ) : null}
 
-      {readOnly ? (
-        <div className="editorial-readonly-banner" role="note">
-          <strong>
-            {readOnlyReason === "historical_version"
-              ? "Version historique — lecture seule"
-              : "Atelier en lecture seule"}
-          </strong>
-          <p>{editorialReadOnlyReasonText(readOnlyReason)}</p>
-          {readOnlyReason === "historical_version" ? (
-            <Link to={workspacePath}>Revenir à la version courante</Link>
-          ) : null}
-        </div>
-      ) : null}
-      <div className="editorial-workspace__controls">
-        <button
-          className="button button--secondary editorial-workspace__outline-toggle"
-          type="button"
-          aria-controls="editorial-workspace-outline-panel"
-          aria-expanded={openPanel === "outline"}
-          onClick={(event) => {
-            if (openPanel === "outline") {
-              overlayOpenerRef.current = null;
-              setOpenPanel(null);
-              return;
-            }
-            overlayOpenerRef.current = event.currentTarget;
-            setMenuOpen(false);
-            setOpenPanel("outline");
+        {visualAnnouncement ? (
+          <p
+            key={visualAnnouncement.key}
+            className="visual-action-status"
+            role="status"
+            aria-live="polite"
+          >
+            {visualAnnouncement.text}
+          </p>
+        ) : null}
+
+        <EditorialServerDraftStatus
+          subjectId={subjectId}
+          occurrenceId={selectedBlock?.block_id ?? null}
+          snapshotId={snapshot.snapshot_id}
+          localDraftText={localDraftText}
+          onRecover={(text) => {
+            if (selectedBlock) onLocalDraftChange(selectedBlock.block_id, text);
           }}
-        >
-          Plan
-        </button>
-        <button
-          className="button button--secondary editorial-workspace__inspector-toggle"
-          type="button"
-          aria-controls="editorial-workspace-inspector-panel"
-          aria-expanded={openPanel === "inspector"}
-          onClick={(event) => {
-            if (openPanel === "inspector") {
-              overlayOpenerRef.current = null;
-              setOpenPanel(null);
-              return;
-            }
-            overlayOpenerRef.current = event.currentTarget;
-            setMenuOpen(false);
-            setOpenPanel("inspector");
-          }}
-        >
-          Inspecteur
-        </button>
-      </div>
-
-      {openPanel ? (
-        <button
-          className="editorial-workspace__scrim"
-          type="button"
-          aria-label="Fermer le panneau"
-          data-panel={openPanel}
-          onClick={closeActiveOverlay}
         />
-      ) : null}
-      <div className="editorial-workspace__grid">
-        <div
-          id="editorial-workspace-outline-panel"
-          className="editorial-workspace__outline-column"
-          data-panel-open={openPanel === "outline"}
-        >
-          <EditorialOutline
-            blocks={snapshot.blocks}
-            outline={snapshot.document_outline}
-            selectedBlockId={selectedBlockId}
-            activeSectionId={activeSectionId}
-            drafts={localDrafts.drafts}
-            staleDraftIds={localDrafts.staleDraftIds}
-            onSelectBlock={selectFromOutline}
-            onResumeDraft={resumeDraft}
-            onCancelDraft={cancelDraft}
-          />
-        </div>
-        <div className="editorial-document-column">
-          <EditorialDocument
-            snapshot={snapshot}
-            selectedBlockId={selectedBlockId}
-            drafts={localDrafts.drafts}
-            staleDraftIds={localDrafts.staleDraftIds}
-            editingBlockId={editingBlockId}
-            onSelectBlock={selectBlock}
-            onDraftChange={updateDraft}
-            onResumeDraft={resumeDraft}
-            onCancelDraft={cancelDraft}
-            onSave={onSave ? saveDraft : undefined}
-            readOnly={readOnly}
-            onStartEditing={startEditing}
-            onDiscuss={discussBlock}
-            onOpenSources={openSourcesForBlock}
-            onOpenHistory={openHistoryForBlock}
-            onAskBridge={setBridgeProposalPrompt}
-            onRefresh={onRefresh}
-          />
-        </div>
-        <div
-          id="editorial-workspace-inspector-panel"
-          className="editorial-workspace__inspector-column"
-          data-panel-open={openPanel === "inspector"}
-        >
-          <EditorialInspector
-            subjectId={snapshot.subject_id}
-            snapshot={snapshot}
-            block={selectedBlock}
-            sectionTitle={sectionTitle}
-            readOnly={readOnly}
-            isEditing={editingBlockId === selectedBlock?.block_id}
-            localDraftText={localDraftText}
-            activeTab={inspectorTab}
-            focusComposerRequest={focusComposerRequest}
-            proposalPrompt={bridgeProposalPrompt}
-            onProposalPromptApplied={() => setBridgeProposalPrompt(null)}
-            onLocalDraftChange={(text) => {
-              if (selectedBlock)
-                onLocalDraftChange(selectedBlock.block_id, text);
+
+        {readOnly ? (
+          <div className="editorial-readonly-banner" role="note">
+            <strong>
+              {readOnlyReason === "historical_version"
+                ? "Version historique — lecture seule"
+                : "Atelier en lecture seule"}
+            </strong>
+            <p>{editorialReadOnlyReasonText(readOnlyReason)}</p>
+            {readOnlyReason === "historical_version" ? (
+              <Link to={workspacePath}>Revenir à la version courante</Link>
+            ) : null}
+          </div>
+        ) : null}
+        <div className="editorial-workspace__controls">
+          <button
+            className="button button--secondary editorial-workspace__outline-toggle"
+            type="button"
+            aria-controls="editorial-workspace-outline-panel"
+            aria-expanded={openPanel === "outline"}
+            onClick={(event) => {
+              if (openPanel === "outline") {
+                overlayOpenerRef.current = null;
+                setOpenPanel(null);
+                return;
+              }
+              overlayOpenerRef.current = event.currentTarget;
+              setMenuOpen(false);
+              setOpenPanel("outline");
             }}
-            onStartEditing={startEditing}
-            onRefresh={onRefresh}
-            onOpenFigureGallery={() => setFigureGalleryOpen(true)}
-            onBackToDocument={closeActiveOverlay}
-            onChangeTarget={returnToTargetChoice}
-            onTabChange={setInspectorTab}
-            onOpenHistoryThread={openHistoryThread}
-            onPendingProposalsChange={setPendingProposal}
-          />
+          >
+            Plan
+          </button>
+          <button
+            className="button button--secondary editorial-workspace__inspector-toggle"
+            type="button"
+            aria-controls="editorial-workspace-inspector-panel"
+            aria-expanded={openPanel === "inspector"}
+            onClick={(event) => {
+              if (openPanel === "inspector") {
+                overlayOpenerRef.current = null;
+                setOpenPanel(null);
+                return;
+              }
+              overlayOpenerRef.current = event.currentTarget;
+              setMenuOpen(false);
+              setOpenPanel("inspector");
+            }}
+          >
+            Inspecteur
+          </button>
         </div>
-      </div>
-      {figureGalleryOpen ? (
-        <SourceFigureGallery
-          subjectId={subjectId}
-          onClose={() => setFigureGalleryOpen(false)}
-        />
-      ) : null}
-    </section>
+
+        {openPanel ? (
+          <button
+            className="editorial-workspace__scrim"
+            type="button"
+            aria-label="Fermer le panneau"
+            data-panel={openPanel}
+            onClick={closeActiveOverlay}
+          />
+        ) : null}
+        <div className="editorial-workspace__grid">
+          <div
+            id="editorial-workspace-outline-panel"
+            className="editorial-workspace__outline-column"
+            data-panel-open={openPanel === "outline"}
+          >
+            <EditorialOutline
+              blocks={snapshot.blocks}
+              outline={snapshot.document_outline}
+              selectedBlockId={selectedBlockId}
+              activeSectionId={activeSectionId}
+              drafts={localDrafts.drafts}
+              staleDraftIds={localDrafts.staleDraftIds}
+              onSelectBlock={selectFromOutline}
+              onResumeDraft={resumeDraft}
+              onCancelDraft={cancelDraft}
+            />
+          </div>
+          <div className="editorial-document-column">
+            <EditorialDocument
+              snapshot={snapshot}
+              selectedBlockId={selectedBlockId}
+              drafts={localDrafts.drafts}
+              staleDraftIds={localDrafts.staleDraftIds}
+              editingBlockId={editingBlockId}
+              onSelectBlock={selectBlock}
+              onDraftChange={updateDraft}
+              onResumeDraft={resumeDraft}
+              onCancelDraft={cancelDraft}
+              onSave={onSave ? saveDraft : undefined}
+              readOnly={readOnly}
+              onStartEditing={startEditing}
+              onDiscuss={discussBlock}
+              onOpenSources={openSourcesForBlock}
+              onOpenHistory={openHistoryForBlock}
+              onAskBridge={setBridgeProposalPrompt}
+              onRefresh={onRefresh}
+              captionEditingBlockId={captionEditingBlockId}
+              moveState={moveState}
+              reorderBlockId={reorderBlockId}
+              visualSaving={visualSaving}
+              visualError={visualError}
+              onStartCaption={startCaptionEditing}
+              onSaveCaption={saveCaption}
+              onCancelCaption={() => setCaptionEditingBlockId(null)}
+              onStartMove={startMove}
+              onChooseMoveAnchor={chooseMoveAnchor}
+              onConfirmMove={() => void confirmMove()}
+              onCancelMove={cancelMove}
+              onStartReorder={startReorder}
+              onSaveReorder={saveReorder}
+              onCancelReorder={() => {
+                setReorderBlockId(null);
+                setVisualError(null);
+              }}
+              onRequestRemove={requestRemove}
+              onRequestReplace={requestReplace}
+              onAskBridgeVisual={discussBlock}
+            />
+          </div>
+          <div
+            id="editorial-workspace-inspector-panel"
+            className="editorial-workspace__inspector-column"
+            data-panel-open={openPanel === "inspector"}
+          >
+            <EditorialInspector
+              subjectId={snapshot.subject_id}
+              snapshot={snapshot}
+              block={selectedBlock}
+              sectionTitle={sectionTitle}
+              readOnly={readOnly}
+              isEditing={editingBlockId === selectedBlock?.block_id}
+              localDraftText={localDraftText}
+              activeTab={inspectorTab}
+              focusComposerRequest={focusComposerRequest}
+              proposalPrompt={bridgeProposalPrompt}
+              onProposalPromptApplied={() => setBridgeProposalPrompt(null)}
+              onLocalDraftChange={(text) => {
+                if (selectedBlock)
+                  onLocalDraftChange(selectedBlock.block_id, text);
+              }}
+              onStartEditing={startEditing}
+              onRefresh={onRefresh}
+              onOpenFigureGallery={() => setFigureGalleryOpen(true)}
+              onBackToDocument={closeActiveOverlay}
+              onChangeTarget={returnToTargetChoice}
+              onTabChange={setInspectorTab}
+              onOpenHistoryThread={openHistoryThread}
+              onPendingProposalsChange={setPendingProposal}
+            />
+          </div>
+        </div>
+        {figureGalleryOpen ? (
+          <SourceFigureGallery
+            subjectId={subjectId}
+            onClose={() => setFigureGalleryOpen(false)}
+          />
+        ) : null}
+        {replaceRequest
+          ? renderReplaceSlot
+            ? renderReplaceSlot({
+                elementKey: replaceRequest.elementKey,
+                blockId: replaceRequest.blockId,
+                close: () => setReplaceRequest(null),
+              })
+            : (() => {
+                const replaceBlock =
+                  ordered.find(
+                    (block) => block.block_id === replaceRequest.blockId,
+                  ) ?? null;
+                if (!replaceBlock) return null;
+                return (
+                  <section
+                    className="visual-replace-slot"
+                    role="region"
+                    aria-label="Remplacement de la figure"
+                  >
+                    <p>
+                      Remplacement de la figure ·{" "}
+                      {visualElementTitle(replaceBlock)}
+                    </p>
+                    <p>
+                      La galerie des sources fournit la figure de remplacement.
+                      Le nouvel élément conserve son emplacement, sa clé et son
+                      ordre jusqu’à l’adoption.
+                    </p>
+                    <button
+                      className="button button--secondary"
+                      type="button"
+                      onClick={() => setReplaceRequest(null)}
+                    >
+                      Fermer
+                    </button>
+                  </section>
+                );
+              })()
+          : null}
+        {removeBlockId
+          ? (() => {
+              const removeBlock = ordered.find(
+                (block) => block.block_id === removeBlockId,
+              );
+              return removeBlock ? (
+                <RemoveElementDialog
+                  block={removeBlock}
+                  saving={visualSaving}
+                  error={removeError}
+                  onConfirm={() => void confirmRemove()}
+                  onCancel={() => {
+                    if (visualSaving) return;
+                    setRemoveBlockId(null);
+                    setRemoveError(null);
+                  }}
+                />
+              ) : null;
+            })()
+          : null}
+      </section>
+    </VisualWorkspaceProvider>
   );
 }
