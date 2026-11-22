@@ -10,6 +10,11 @@ import type {
 } from "../../api/editorialWorkspace";
 import { EditorialInspector } from "./EditorialInspector";
 import type { InspectorTab } from "./EditorialInspector";
+import { VisualWorkspaceProvider } from "./VisualWorkspaceContext";
+import type {
+  VisualWorkspaceActions,
+  VisualWorkspaceContextValue,
+} from "./visualWorkspaceContext";
 
 vi.mock("./EditorialConversation", () => ({
   EditorialConversation: () => <div data-testid="conversation-panel" />,
@@ -269,6 +274,59 @@ function renderVisualsTab(
   );
 }
 
+function workspaceValue(
+  overrides: Partial<VisualWorkspaceContextValue> = {},
+): VisualWorkspaceContextValue {
+  return {
+    snapshot,
+    readOnly: false,
+    restoreElementSelection: vi.fn(),
+    anchorLabel: () => null,
+    visualActions: {
+      selectBlock: vi.fn(),
+      requestReplace: vi.fn(),
+      requestRemove: vi.fn(),
+      requestCaption: vi.fn(),
+      requestMove: vi.fn(),
+    },
+    visualMove: null,
+    chooseMoveAnchor: vi.fn(),
+    confirmMove: vi.fn(),
+    cancelMove: vi.fn(),
+    ...overrides,
+  };
+}
+
+function renderVisualsTabInWorkspace(value: VisualWorkspaceContextValue) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false, gcTime: 0 } },
+  });
+  return render(
+    <QueryClientProvider client={client}>
+      <VisualWorkspaceProvider value={value}>
+        <EditorialInspector
+          subjectId={SUBJECT_ID}
+          snapshot={snapshot}
+          block={snapshot.blocks[0] ?? null}
+          sectionTitle="Contexte"
+          readOnly={false}
+          isEditing={false}
+          localDraftText=""
+          onLocalDraftChange={vi.fn()}
+          onOpenFigureGallery={vi.fn()}
+          onStartEditing={vi.fn()}
+          onRefresh={vi.fn()}
+          onBackToDocument={vi.fn()}
+          onChangeTarget={vi.fn()}
+          activeTab="visuels"
+          onTabChange={vi.fn()}
+          onOpenHistoryThread={vi.fn()}
+        />
+      </VisualWorkspaceProvider>
+    </QueryClientProvider>,
+  );
+}
+
 afterEach(() => {
   vi.unstubAllGlobals();
 });
@@ -346,6 +404,77 @@ describe("EditorialInspector Visuels tab", () => {
     expect(onRequestCaption).toHaveBeenCalledWith("adopted_source_figure_aaaa");
     await user.click(screen.getByRole("button", { name: "Déplacer" }));
     expect(onRequestMove).toHaveBeenCalledWith("adopted_source_figure_aaaa");
+  });
+
+  it("routes every Visuels action through the shared workspace context", async () => {
+    installFetch();
+    const user = userEvent.setup();
+    const actions: VisualWorkspaceActions = {
+      selectBlock: vi.fn(),
+      requestReplace: vi.fn(),
+      requestRemove: vi.fn(),
+      requestCaption: vi.fn(),
+      requestMove: vi.fn(),
+    };
+    renderVisualsTabInWorkspace(workspaceValue({ visualActions: actions }));
+
+    await user.click(
+      screen.getByRole("button", {
+        name: "Sélectionner Figure : Légende de la figure remplaçable",
+      }),
+    );
+    expect(actions.selectBlock).toHaveBeenCalledWith(FIGURE_A_ID);
+
+    await user.click(screen.getByRole("button", { name: "Remplacer" }));
+    expect(actions.requestReplace).toHaveBeenCalledWith(
+      "adopted_source_figure_aaaa",
+    );
+
+    await user.click(screen.getAllByRole("button", { name: "Retirer" })[0]!);
+    expect(actions.requestRemove).toHaveBeenCalledWith(
+      "adopted_source_figure_aaaa",
+    );
+
+    await user.click(
+      screen.getByRole("button", { name: "Modifier la légende" }),
+    );
+    expect(actions.requestCaption).toHaveBeenCalledWith(
+      "adopted_source_figure_aaaa",
+    );
+
+    await user.click(screen.getByRole("button", { name: "Déplacer" }));
+    expect(actions.requestMove).toHaveBeenCalledWith(
+      "adopted_source_figure_aaaa",
+    );
+  });
+
+  it("mounts the shared inspector move panel while a visual is moving", async () => {
+    const user = userEvent.setup();
+    const cancelMove = vi.fn();
+    renderVisualsTabInWorkspace(
+      workspaceValue({
+        visualMove: {
+          elementBlockId: FIGURE_A_ID,
+          draftAnchorId: null,
+          saving: false,
+          error: null,
+        },
+        cancelMove,
+      }),
+    );
+
+    const panel = screen.getByRole("region", {
+      name: "Déplacer le visuel",
+    });
+    expect(panel).toBeVisible();
+    expect(
+      within(panel).getByRole("heading", {
+        name: "Déplacer Légende de la figure remplaçable",
+      }),
+    ).toBeVisible();
+    expect(within(panel).getByText(/Emplacement prévu :/)).toBeVisible();
+    await user.click(within(panel).getByRole("button", { name: "Annuler" }));
+    expect(cancelMove).toHaveBeenCalledTimes(1);
   });
 
   it("opens the archived image gallery and seeds the insertion from the selection", async () => {

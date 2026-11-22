@@ -3697,6 +3697,16 @@ main:has(> .editorial-route-state) > .app-header {
   overflow-wrap: anywhere;
 }
 
+.editorial-gallery-replace__capacity {
+  padding: 0.4rem 0.55rem;
+  border-radius: 0.35rem;
+  background: var(--editorial-page);
+  color: var(--editorial-ink);
+  font-size: 0.76rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
 .editorial-gallery-replace__archive-note {
   color: var(--editorial-muted);
   font-size: 0.76rem;
@@ -3931,6 +3941,15 @@ button.editorial-visuals__target:focus-visible {
 }
 
 /* Visual element actions (F3-A): selectable visuals, caption/move/reorder/remove. */
+.visual-action-bar {
+  /* A selected figure can expose up to eight actions; at 1024px the bar must
+     wrap inside the document column instead of running under the plan rail. */
+  max-width: calc(100% - 1rem);
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  row-gap: 0.25rem;
+}
+
 .visual-action-bar__readonly {
   flex: 1 1 100%;
   margin: 0;
@@ -4588,21 +4607,6 @@ button.editorial-visuals__target:focus-visible {
   padding-left: 1.2rem;
   color: var(--editorial-ink);
   font-size: 0.85rem;
-}
-
-.visual-replace-slot {
-  margin: 0.75rem auto;
-  width: min(100% - 2rem, 96rem);
-  padding: 0.8rem 1rem;
-  border: 1px solid var(--editorial-divider-strong);
-  border-radius: 0.55rem;
-  background: var(--editorial-panel);
-}
-
-.visual-replace-slot p {
-  margin: 0.3rem 0;
-  color: var(--editorial-ink);
-  font-size: 0.88rem;
 }
 
 @media (prefers-reduced-motion: reduce) {

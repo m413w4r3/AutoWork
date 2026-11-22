@@ -12,6 +12,7 @@ import {
 import { editorialWorkspaceQueryKeys } from "./editorialWorkspaceQueries";
 import { SourceFigureGallery } from "./SourceFigureGallery";
 import {
+  briefFigureCapacityNote,
   figureSourceLabel,
   replaceFigureErrorInfo,
   type ReplaceFigureDialogProps,
@@ -85,7 +86,18 @@ export function ReplaceFigureDialog({
     closeButtonRef.current?.focus();
     return () => {
       if (dialog.open && typeof dialog.close === "function") dialog.close();
-      openerRef.current?.focus();
+      const opener = openerRef.current;
+      window.requestAnimationFrame(() => {
+        if (opener?.isConnected) {
+          opener.focus({ preventScroll: true });
+          return;
+        }
+        document
+          .querySelector<HTMLElement>(
+            '.editorial-document__block[data-selected="true"]',
+          )
+          ?.focus({ preventScroll: true });
+      });
     };
   }, []);
 
@@ -165,6 +177,7 @@ export function ReplaceFigureDialog({
 
   const close = () => onClose();
   const captionInvalid = caption.trim().length === 0;
+  const capacityNote = briefFigureCapacityNote(snapshot);
   const canConfirm =
     selected !== null &&
     !captionInvalid &&
@@ -298,6 +311,11 @@ export function ReplaceFigureDialog({
                   ? `Emplacement conservé · après « ${target.anchorText} »`
                   : "Emplacement conservé · paragraphe d’ancrage inchangé"}
               </p>
+              {capacityNote ? (
+                <p className="editorial-gallery-replace__capacity" role="note">
+                  {capacityNote} Le remplacement conserve ce total.
+                </p>
+              ) : null}
               <p className="editorial-gallery-replace__archive-note">
                 {ARCHIVE_UNTOUCHED_MESSAGE}
               </p>

@@ -9,6 +9,7 @@ import type {
 import { EditorialConversation } from "./EditorialConversation";
 import { EditorialHistory } from "./EditorialHistory";
 import { FigureInsertionPanel } from "./FigureInsertionPanel";
+import { MoveElementPanel } from "./MoveElementMode";
 import { ReplaceFigureDialog } from "./ReplaceFigureDialog";
 import { SourceFigureGallery } from "./SourceFigureGallery";
 import { VisualInsertionComposer } from "./VisualInsertionComposer";
@@ -20,12 +21,13 @@ import {
 import { manualEditUnavailableReason } from "./manualEditOperation";
 import {
   briefFigureCapacity,
+  briefFigureCapacityNote,
   figureSelectionLabel,
-  integratedFigureCount,
   resolveReplaceFigureTarget,
   type ReplaceFigureTarget,
   type VisualActionCallbacks,
 } from "./replaceFigureContract";
+import { useVisualWorkspaceContext } from "./visualWorkspaceContext";
 
 export type InspectorTab =
   "discussion" | "modifier" | "visuels" | "sources" | "historique";
@@ -248,6 +250,24 @@ export function EditorialInspector({
   onRequestCaption,
   onRequestMove,
 }: EditorialInspectorProps) {
+  const visualContext = useVisualWorkspaceContext();
+  const workspaceActions = visualContext?.visualActions ?? null;
+  // The workspace provider supplies the single implementation of every visual
+  // action. Standalone renders (unit tests, legacy routes) keep the props.
+  const selectBlock = onSelectBlock ?? workspaceActions?.selectBlock;
+  const requestReplaceHandler =
+    onRequestReplace ?? workspaceActions?.requestReplace;
+  const requestRemoveHandler =
+    onRequestRemove ?? workspaceActions?.requestRemove;
+  const requestCaptionHandler =
+    onRequestCaption ?? workspaceActions?.requestCaption;
+  const requestMoveHandler = onRequestMove ?? workspaceActions?.requestMove;
+  const visualMove = visualContext?.visualMove ?? null;
+  const moveElement = visualMove
+    ? (snapshot.blocks.find(
+        (candidate) => candidate.block_id === visualMove.elementBlockId,
+      ) ?? null)
+    : null;
   const tabRefs = useRef(new Map<InspectorTab, HTMLButtonElement>());
   const [draftEditorBlockId, setDraftEditorBlockId] = useState<string | null>(
     null,
@@ -275,7 +295,7 @@ export function EditorialInspector({
     : "Sélectionnez un bloc pour préparer une insertion.";
   const visuals = documentVisuals(snapshot);
   const briefCapacity = briefFigureCapacity(snapshot);
-  const integratedFigures = integratedFigureCount(snapshot);
+  const briefCapacityNote = briefFigureCapacityNote(snapshot);
   const canInsertArchivedFigures = Boolean(
     block &&
     !readOnly &&
@@ -334,8 +354,8 @@ export function EditorialInspector({
   const requestReplace = (visualBlock: EditorialWorkspaceBlock) => {
     const elementKey = visualBlock.element_key;
     if (!elementKey) return;
-    if (onRequestReplace) {
-      onRequestReplace(elementKey);
+    if (requestReplaceHandler) {
+      requestReplaceHandler(elementKey);
       return;
     }
     const target = resolveReplaceFigureTarget(snapshot, elementKey);
@@ -517,7 +537,7 @@ export function EditorialInspector({
                         const canRemove = Boolean(
                           !readOnly &&
                           elementKey &&
-                          onRequestRemove &&
+                          requestRemoveHandler &&
                           operations.some((operation) =>
                             operation.startsWith("delete_"),
                           ),
@@ -525,13 +545,13 @@ export function EditorialInspector({
                         const canCaption = Boolean(
                           !readOnly &&
                           elementKey &&
-                          onRequestCaption &&
+                          requestCaptionHandler &&
                           operations.includes("update_visual_caption"),
                         );
                         const canMove = Boolean(
                           !readOnly &&
                           elementKey &&
-                          onRequestMove &&
+                          requestMoveHandler &&
                           operations.includes("move_enrichment_element"),
                         );
                         return (
@@ -540,12 +560,12 @@ export function EditorialInspector({
                             className="editorial-visuals__item"
                             data-kind={visual.kind}
                           >
-                            {onSelectBlock ? (
+                            {selectBlock ? (
                               <button
                                 className="editorial-visuals__target"
                                 type="button"
                                 aria-label={`Sélectionner ${BLOCK_KIND_LABELS[visual.kind]} : ${caption}`}
-                                onClick={() => onSelectBlock(visual.block_id)}
+                                onClick={() => selectBlock(visual.block_id)}
                               >
                                 <span className="editorial-visuals__kind">
                                   {BLOCK_KIND_LABELS[visual.kind]}
@@ -586,7 +606,7 @@ export function EditorialInspector({
                                     className="button button--secondary"
                                     type="button"
                                     onClick={() =>
-                                      onRequestCaption?.(elementKey ?? "")
+                                      requestCaptionHandler?.(elementKey ?? "")
                                     }
                                   >
                                     Modifier la légende
@@ -597,7 +617,7 @@ export function EditorialInspector({
                                     className="button button--secondary"
                                     type="button"
                                     onClick={() =>
-                                      onRequestMove?.(elementKey ?? "")
+                                      requestMoveHandler?.(elementKey ?? "")
                                     }
                                   >
                                     Déplacer
@@ -608,7 +628,7 @@ export function EditorialInspector({
                                     className="button button--secondary"
                                     type="button"
                                     onClick={() =>
-                                      onRequestRemove?.(elementKey ?? "")
+                                      requestRemoveHandler?.(elementKey ?? "")
                                     }
                                   >
                                     Retirer
@@ -622,6 +642,19 @@ export function EditorialInspector({
                     </ol>
                   )}
                 </section>
+
+                {visualContext && visualMove && moveElement ? (
+                  <MoveElementPanel
+                    snapshot={snapshot}
+                    element={moveElement}
+                    draftAnchorId={visualMove.draftAnchorId}
+                    saving={visualMove.saving}
+                    error={visualMove.error}
+                    onChooseAnchor={visualContext.chooseMoveAnchor}
+                    onConfirm={visualContext.confirmMove}
+                    onCancel={visualContext.cancelMove}
+                  />
+                ) : null}
 
                 <section
                   className="editorial-visuals__archive"
@@ -775,11 +808,7 @@ export function EditorialInspector({
           selectedFigures={archivedSelection}
           onSelectionChange={setArchivedSelection}
           selectionLimit={briefCapacity ?? undefined}
-          capacityNote={
-            snapshot.publication_kind === "brief"
-              ? `Figures intégrées : ${integratedFigures}/3 · Capacité restante : ${briefCapacity ?? 0} figure${(briefCapacity ?? 0) > 1 ? "s" : ""} sur 3.`
-              : undefined
-          }
+          capacityNote={briefCapacityNote ?? undefined}
         />
       ) : null}
 

@@ -128,6 +128,19 @@ export function briefFigureCapacity(
   return Math.max(0, BRIEF_FIGURE_LIMIT - integratedFigureCount(snapshot));
 }
 
+/**
+ * Shared BRIEF counter for the gallery, the selection panel and the replace
+ * dialog. `null` for ARTICLE: no cap is ever assumed there.
+ */
+export function briefFigureCapacityNote(
+  snapshot: EditorialWorkspaceSnapshot,
+): string | null {
+  const remaining = briefFigureCapacity(snapshot);
+  if (remaining === null) return null;
+  const integrated = integratedFigureCount(snapshot);
+  return `Figures intégrées : ${integrated}/${BRIEF_FIGURE_LIMIT} · Capacité restante : ${remaining} figure${remaining > 1 ? "s" : ""} sur ${BRIEF_FIGURE_LIMIT}.`;
+}
+
 function visualBlocks(
   snapshot: EditorialWorkspaceSnapshot,
 ): EditorialWorkspaceBlock[] {

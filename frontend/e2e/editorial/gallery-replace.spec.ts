@@ -30,6 +30,8 @@ const screenshotDirectory = resolve(
 const anchorId = "11111111-1111-4111-8111-111111111111";
 const secondParagraphId = "22222222-2222-4222-8222-222222222222";
 const figureBlockId = "33333333-3333-4333-8333-333333333333";
+const chartBlockId = "37373737-3737-4737-8737-373737373737";
+const chartKey = "chart-volume-1";
 const elementKey = "adopted_source_figure_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const sourceA = "44444444-4444-4444-8444-444444444444";
 const sourceB = "55555555-5555-4555-8555-555555555555";
@@ -193,9 +195,51 @@ function integratedFigureBlock(position: number): EditorialWorkspaceBlock {
   };
 }
 
+function chartWorkspaceBlock(position: number): EditorialWorkspaceBlock {
+  return {
+    block_id: chartBlockId,
+    kind: "chart",
+    parent_block_id: null,
+    position,
+    text: "Graphique des volumes observés",
+    evidence_refs: [],
+    chart: {
+      key: chartKey,
+      kind: "bar",
+      title: "Graphique des volumes observés",
+      caption: "Volumes observés dans les sources synthétiques.",
+      legend: ["Série A"],
+      category_axis_label: "Catégorie",
+      value_axis_label: "Valeur",
+      unit: "unité",
+      points: [
+        {
+          label: "Catégorie 1",
+          value: "12",
+          evidence_refs: [],
+        },
+      ],
+      anchor_block_id: anchorId,
+    },
+    revision_target: { block_id: chartBlockId, legacy_target_id: null },
+    before_hash: "f".repeat(64),
+    allowed_operations: [
+      "rewrite_chart",
+      "update_visual_caption",
+      "move_enrichment_element",
+      "delete_chart",
+    ],
+    revision_status: "ready",
+    element_kind: "chart",
+    element_key: chartKey,
+    caption: "Volumes observés dans les sources synthétiques.",
+  };
+}
+
 function createSnapshot(
   kind: "article" | "brief",
   withIntegratedFigure: boolean,
+  withChart = false,
 ): EditorialWorkspaceSnapshot {
   const blocks: EditorialWorkspaceBlock[] = [
     paragraphBlock(anchorId, 0, anchorText, [
@@ -205,6 +249,7 @@ function createSnapshot(
     ]),
   ];
   if (withIntegratedFigure) blocks.push(integratedFigureBlock(1));
+  if (withChart) blocks.push(chartWorkspaceBlock(blocks.length));
   blocks.push(
     paragraphBlock(
       secondParagraphId,
@@ -363,7 +408,11 @@ async function fulfillCatalog(route: Route, url: URL): Promise<void> {
 
 async function installRoutes(
   page: Page,
-  options: { kind?: "article" | "brief"; withIntegratedFigure?: boolean } = {},
+  options: {
+    kind?: "article" | "brief";
+    withIntegratedFigure?: boolean;
+    withChart?: boolean;
+  } = {},
 ): Promise<Captures> {
   const image = await readFile(
     new URL("./fixtures/figure-gallery-thumbnail.jpg", import.meta.url),
@@ -377,6 +426,7 @@ async function installRoutes(
   const snapshot = createSnapshot(
     options.kind ?? "article",
     options.withIntegratedFigure ?? false,
+    options.withChart ?? false,
   );
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
@@ -734,7 +784,12 @@ test("E12 — remplacement comparé, confirmé par une seule révision typée", 
     path: resolve(screenshotDirectory, "E12-onglet-visuels-1280x900.png"),
   });
   await page.setViewportSize({ width: 1440, height: 1000 });
-  await page.getByRole("button", { name: "Remplacer" }).click();
+  // The selected figure also shows its document action bar; this scenario is
+  // the inspector-list path, so the request must come from the Visuels tab.
+  await page
+    .getByLabel("Inspecteur éditorial")
+    .getByRole("button", { name: "Remplacer" })
+    .click();
 
   const dialog = page.getByRole("dialog", {
     name: "Remplacer l’image intégrée",
@@ -902,7 +957,10 @@ test("E19 — sélection de galerie et remplacement au clavier, aperçu sans per
   await expect(figureBlock).toHaveAttribute("data-selected", "true");
   await page.getByRole("tab", { name: "Visuels" }).focus();
   await page.keyboard.press("Enter");
-  await page.getByRole("button", { name: "Remplacer" }).focus();
+  await page
+    .getByLabel("Inspecteur éditorial")
+    .getByRole("button", { name: "Remplacer" })
+    .focus();
   await page.keyboard.press("Enter");
 
   const dialog = page.getByRole("dialog", {
@@ -951,4 +1009,130 @@ test("E19 — sélection de galerie et remplacement au clavier, aperçu sans per
     figure_id: figureIds.a2,
   });
   expect(captures.unexpected).toEqual([]);
+});
+
+const f3cScreenshotDirectory = resolve(
+  process.cwd(),
+  "../.autowork-runs/shots-f3c",
+);
+
+test("F3-C — captures desktop de l’atelier connecté (1024, 1280, 1440, 1920)", async ({
+  page,
+}) => {
+  await installRoutes(page, {
+    kind: "article",
+    withIntegratedFigure: true,
+    withChart: true,
+  });
+  await mkdir(f3cScreenshotDirectory, { recursive: true });
+  const figureBlock = page.locator(
+    `.editorial-document__block[data-block-id="${figureBlockId}"]`,
+  );
+  const inspector = page.getByLabel("Inspecteur éditorial");
+  const sizes = [
+    [1024, 900],
+    [1280, 900],
+    [1440, 1000],
+    [1920, 1080],
+  ] as const;
+
+  for (const [width, height] of sizes) {
+    await page.setViewportSize({ width, height });
+    await page.goto(`/subjects/${subjectId}/editor`);
+    await figureBlock.click();
+    await expect(figureBlock).toHaveAttribute("data-selected", "true");
+    await page.getByRole("tab", { name: "Visuels" }).click();
+    await expect(
+      page.getByRole("list", { name: "Éléments visuels du document" }),
+    ).toBeVisible();
+    await expectNoHorizontalOverflow(page);
+    await page.screenshot({
+      path: resolve(
+        f3cScreenshotDirectory,
+        `visuels-liste-${width}x${height}.png`,
+      ),
+    });
+
+    await page
+      .getByRole("button", {
+        name: "Ouvrir la galerie des images archivées",
+      })
+      .click();
+    const gallery = page.getByRole("dialog", {
+      name: "Galerie d’images sources",
+    });
+    await expect(gallery).toBeVisible();
+    await expectNoHorizontalOverflow(page);
+    await page.screenshot({
+      path: resolve(
+        f3cScreenshotDirectory,
+        `visuels-galerie-${width}x${height}.png`,
+      ),
+    });
+    await gallery
+      .getByRole("button", { name: "Fermer la galerie d’images sources" })
+      .click();
+
+    await inspector.getByRole("button", { name: "Remplacer" }).click();
+    const replaceDialog = page.getByRole("dialog", {
+      name: "Remplacer l’image intégrée",
+    });
+    await expect(replaceDialog).toBeVisible();
+    await replaceDialog
+      .getByRole("radio", { name: "Choisir Carte des flux réseau" })
+      .check();
+    await expect(
+      replaceDialog.getByRole("region", { name: "Comparaison des images" }),
+    ).toContainText("Emplacement conservé");
+    await replaceDialog
+      .getByRole("region", { name: "Comparaison des images" })
+      .scrollIntoViewIfNeeded();
+    await expectNoHorizontalOverflow(page);
+    await page.screenshot({
+      path: resolve(
+        f3cScreenshotDirectory,
+        `remplacement-comparaison-${width}x${height}.png`,
+      ),
+    });
+    await replaceDialog
+      .getByRole("button", { name: "Fermer le remplacement d’image" })
+      .click();
+
+    const figureItem = page.locator(
+      '.editorial-visuals__item[data-kind="figure"]',
+    );
+    await figureItem.getByRole("button", { name: "Déplacer" }).click();
+    const movePanel = page.getByRole("region", {
+      name: "Déplacer le visuel",
+    });
+    await expect(movePanel).toBeVisible();
+    await movePanel.scrollIntoViewIfNeeded();
+    await expectNoHorizontalOverflow(page);
+    await page.screenshot({
+      path: resolve(
+        f3cScreenshotDirectory,
+        `panneau-deplacement-${width}x${height}.png`,
+      ),
+    });
+    await movePanel.getByRole("button", { name: "Annuler" }).click();
+    await expect(movePanel).toHaveCount(0);
+
+    const chartBlock = page.locator(
+      `.editorial-document__block[data-element-key="${chartKey}"]`,
+    );
+    await chartBlock.click();
+    await expect(chartBlock).toHaveAttribute("data-selected", "true");
+    const chartActions = page.getByRole("toolbar", {
+      name: "Actions du visuel : Graphique des volumes observés",
+    });
+    await expect(chartActions).toBeVisible();
+    await chartActions.scrollIntoViewIfNeeded();
+    await expectNoHorizontalOverflow(page);
+    await page.screenshot({
+      path: resolve(
+        f3cScreenshotDirectory,
+        `document-graphique-${width}x${height}.png`,
+      ),
+    });
+  }
 });

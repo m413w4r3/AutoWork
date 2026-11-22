@@ -6,9 +6,26 @@ import type {
 } from "../../api/editorialWorkspace";
 import { paragraphExcerpt } from "./visualElementOperations";
 
-export interface VisualReplaceRequestState {
-  elementKey: string;
-  blockId: string;
+/** Workspace-owned visual actions exposed to the inspector `Visuels` tab. */
+export interface VisualWorkspaceActions {
+  /** Select the visual block in the document. */
+  selectBlock: (blockId: string) => void;
+  /** Route a replacement request through the workspace replace host. */
+  requestReplace: (elementKey: string) => void;
+  /** Open the shared removal confirmation for one visual element. */
+  requestRemove: (elementKey: string) => void;
+  /** Start the inline caption revision for one visual element. */
+  requestCaption: (elementKey: string) => void;
+  /** Enter the shared move mode for one visual element. */
+  requestMove: (elementKey: string) => void;
+}
+
+/** Active in-document move draft, mirrored by the inspector move panel. */
+export interface VisualMoveState {
+  elementBlockId: string;
+  draftAnchorId: string | null;
+  saving: boolean;
+  error: string | null;
 }
 
 export interface VisualWorkspaceContextValue {
@@ -20,12 +37,15 @@ export interface VisualWorkspaceContextValue {
     key: string,
     previousBlockId?: string,
   ) => void;
-  /** Hand a figure replacement request to the gallery owner. */
-  requestReplaceElement: (elementKey: string, blockId: string) => void;
-  /** Pending replacement request, consumed by the gallery slot. */
-  replaceRequest: VisualReplaceRequestState | null;
   /** Readable excerpt of one paragraph anchor, for proposal comparisons. */
   anchorLabel: (blockId: string) => string | null;
+  /** Single action bus reused by the document action bar and the list. */
+  visualActions: VisualWorkspaceActions;
+  /** Non-null while one visual is being moved. */
+  visualMove: VisualMoveState | null;
+  chooseMoveAnchor: (anchorBlockId: string) => void;
+  confirmMove: () => void;
+  cancelMove: () => void;
 }
 
 export const VisualWorkspaceContext =

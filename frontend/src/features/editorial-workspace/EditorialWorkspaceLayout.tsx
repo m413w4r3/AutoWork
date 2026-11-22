@@ -1,5 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { ApiError } from "../../api/editions";
 import type {
@@ -25,20 +24,17 @@ import { SourceFigureGallery } from "./SourceFigureGallery";
 import { EditorialTopBar } from "./EditorialTopBar";
 import { EditorialHistory } from "./EditorialHistory";
 import { useManualVisualRevision } from "./useManualVisualRevision";
+import { useReplaceFigureFlow } from "./useReplaceFigureFlow";
 import {
   visualElementAnchorId,
   visualElementIdentity,
-  visualElementTitle,
 } from "./visualElementOperations";
 import type { VisualElementIdentity } from "./visualElementOperations";
 import { VisualWorkspaceProvider } from "./VisualWorkspaceContext";
-import { anchorLabelFromSnapshot } from "./visualWorkspaceContext";
-
-export interface VisualReplaceRequest {
-  elementKey: string;
-  blockId: string;
-  close: () => void;
-}
+import {
+  anchorLabelFromSnapshot,
+  type VisualWorkspaceActions,
+} from "./visualWorkspaceContext";
 
 interface EditorialWorkspaceLayoutProps {
   subjectId: string;
@@ -57,11 +53,6 @@ interface EditorialWorkspaceLayoutProps {
   onRefreshPdfStatus?: () => void;
   onRegeneratePdf?: () => void;
   onSave?: InlineTextEditorProps["onSave"];
-  /**
-   * Slot owned by the source-figure gallery task: receives a replacement
-   * request for one figure element and must expose its own close control.
-   */
-  renderReplaceSlot?: (request: VisualReplaceRequest) => ReactNode;
 }
 
 type OpenPanel = "outline" | "inspector" | null;
@@ -103,7 +94,6 @@ export function EditorialWorkspaceLayout({
   onRefreshPdfStatus,
   onRegeneratePdf,
   onSave,
-  renderReplaceSlot,
 }: EditorialWorkspaceLayoutProps) {
   const [openPanel, setOpenPanel] = useState<OpenPanel>(null);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -131,10 +121,6 @@ export function EditorialWorkspaceLayout({
     key: string;
     text: string;
   } | null>(null);
-  const [replaceRequest, setReplaceRequest] = useState<{
-    elementKey: string;
-    blockId: string;
-  } | null>(null);
   const [selectionRestoreTick, setSelectionRestoreTick] = useState(0);
   const pendingElementSelectionRef = useRef<{
     identity: VisualElementIdentity;
@@ -144,6 +130,8 @@ export function EditorialWorkspaceLayout({
   const visualSaving = manualVisual.isPending;
   const overlayOpenerRef = useRef<HTMLElement | null>(null);
   const historyOpenerRef = useRef<HTMLButtonElement | null>(null);
+  const moveOpenerRef = useRef<HTMLElement | null>(null);
+  const captionOpenerRef = useRef<HTMLElement | null>(null);
   const leaveConfirmedRef = useRef(false);
   const linkedThreadHandledRef = useRef(false);
   // The snapshot's `blocks` array is already the server-resolved document
@@ -228,12 +216,11 @@ export function EditorialWorkspaceLayout({
     [],
   );
 
-  const requestReplaceElement = useCallback(
-    (elementKey: string, blockId: string) => {
-      setReplaceRequest({ elementKey, blockId });
-    },
-    [],
-  );
+  const replaceFlow = useReplaceFigureFlow(subjectId, snapshot, {
+    onRefresh,
+    onAccepted: (target) =>
+      restoreElementSelection("figure", target.elementKey, target.blockId),
+  });
 
   useEffect(() => {
     const pending = pendingElementSelectionRef.current;
@@ -264,11 +251,39 @@ export function EditorialWorkspaceLayout({
 
   const startCaptionEditing = (blockId: string) => {
     if (readOnly) return;
+    captionOpenerRef.current =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
     selectBlock(blockId);
     setMoveState(null);
     setReorderBlockId(null);
     setVisualError(null);
     setCaptionEditingBlockId(blockId);
+    window.requestAnimationFrame(() => {
+      document
+        .querySelector<HTMLElement>(
+          `.editorial-document__block[data-block-id="${CSS.escape(blockId)}"]`,
+        )
+        ?.scrollIntoView?.({ block: "nearest" });
+    });
+  };
+
+  const closeCaptionEditing = (blockId: string) => {
+    setCaptionEditingBlockId(null);
+    const opener = captionOpenerRef.current;
+    captionOpenerRef.current = null;
+    window.requestAnimationFrame(() => {
+      if (opener?.isConnected) {
+        opener.focus({ preventScroll: true });
+        return;
+      }
+      document
+        .querySelector<HTMLElement>(
+          `.editorial-document__block[data-block-id="${CSS.escape(blockId)}"]`,
+        )
+        ?.focus({ preventScroll: true });
+    });
   };
 
   const saveCaption = async (blockId: string, caption: string | null) => {
@@ -292,7 +307,7 @@ export function EditorialWorkspaceLayout({
           caption,
         },
       });
-      setCaptionEditingBlockId(null);
+      closeCaptionEditing(block.block_id);
       announceVisual(
         `Légende enregistrée · v${result.acceptance.artifact_version}`,
       );
@@ -302,10 +317,17 @@ export function EditorialWorkspaceLayout({
     }
   };
 
-  const startMove = (blockId: string) => {
+  const startMove = (
+    blockId: string,
+    focus: "document" | "inspector" = "document",
+  ) => {
     if (readOnly) return;
     const block = ordered.find((candidate) => candidate.block_id === blockId);
     if (!block || !visualElementIdentity(block)) return;
+    moveOpenerRef.current =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
     selectBlock(blockId);
     setCaptionEditingBlockId(null);
     setReorderBlockId(null);
@@ -317,8 +339,12 @@ export function EditorialWorkspaceLayout({
       saving: false,
     });
     window.requestAnimationFrame(() => {
+      const selector =
+        focus === "inspector"
+          ? ".visual-move-panel input[type='search']"
+          : ".visual-move-banner";
       document
-        .querySelector<HTMLElement>(".visual-move-banner")
+        .querySelector<HTMLElement>(selector)
         ?.focus({ preventScroll: true });
     });
   };
@@ -336,9 +362,23 @@ export function EditorialWorkspaceLayout({
     );
   };
 
-  const cancelMove = () => {
-    setMoveState((current) => (current && !current.saving ? null : current));
-  };
+  const cancelMove = useCallback(() => {
+    if (moveState?.saving) return;
+    setMoveState(null);
+    const opener = moveOpenerRef.current;
+    moveOpenerRef.current = null;
+    window.requestAnimationFrame(() => {
+      if (opener?.isConnected) {
+        opener.focus({ preventScroll: true });
+        return;
+      }
+      document
+        .querySelector<HTMLElement>(
+          ".editorial-document__block[data-selected='true']",
+        )
+        ?.focus({ preventScroll: true });
+    });
+  }, [moveState]);
 
   const confirmMove = async () => {
     const current = moveState;
@@ -389,6 +429,14 @@ export function EditorialWorkspaceLayout({
       announceVisual(
         `Emplacement enregistré · v${result.acceptance.artifact_version}`,
       );
+      window.requestAnimationFrame(() => {
+        if (document.activeElement !== document.body) return;
+        document
+          .querySelector<HTMLElement>(
+            `.editorial-document__block[data-block-id="${CSS.escape(block.block_id)}"]`,
+          )
+          ?.focus({ preventScroll: true });
+      });
     } catch (error) {
       pendingElementSelectionRef.current = null;
       setMoveState({
@@ -494,27 +542,48 @@ export function EditorialWorkspaceLayout({
     const block = ordered.find((candidate) => candidate.block_id === blockId);
     const identity = block ? visualElementIdentity(block) : null;
     if (!identity) return;
-    setReplaceRequest({ elementKey: identity.key, blockId });
+    replaceFlow.requestReplace(identity.key);
   };
 
-  const visualWorkspaceValue = useMemo(
-    () => ({
-      snapshot,
-      readOnly,
-      restoreElementSelection,
-      requestReplaceElement,
-      replaceRequest,
-      anchorLabel: (blockId: string) =>
-        anchorLabelFromSnapshot(snapshot, blockId),
-    }),
-    [
-      snapshot,
-      readOnly,
-      restoreElementSelection,
-      requestReplaceElement,
-      replaceRequest,
-    ],
-  );
+  const blockByElementKey = (elementKey: string) =>
+    ordered.find(
+      (block) =>
+        block.element_key === elementKey &&
+        visualElementIdentity(block) !== null,
+    ) ?? null;
+
+  const visualActions: VisualWorkspaceActions = {
+    selectBlock,
+    requestReplace: (elementKey) => {
+      const block = blockByElementKey(elementKey);
+      if (block) requestReplace(block.block_id);
+    },
+    requestRemove: (elementKey) => {
+      const block = blockByElementKey(elementKey);
+      if (block) requestRemove(block.block_id);
+    },
+    requestCaption: (elementKey) => {
+      const block = blockByElementKey(elementKey);
+      if (block) startCaptionEditing(block.block_id);
+    },
+    requestMove: (elementKey) => {
+      const block = blockByElementKey(elementKey);
+      if (block) startMove(block.block_id, "inspector");
+    },
+  };
+
+  const visualWorkspaceValue = {
+    snapshot,
+    readOnly,
+    restoreElementSelection,
+    anchorLabel: (blockId: string) =>
+      anchorLabelFromSnapshot(snapshot, blockId),
+    visualActions,
+    visualMove: moveState,
+    chooseMoveAnchor,
+    confirmMove: () => void confirmMove(),
+    cancelMove,
+  };
 
   const startEditing = (blockId: string) => {
     const block = ordered.find((candidate) => candidate.block_id === blockId);
@@ -678,7 +747,7 @@ export function EditorialWorkspaceLayout({
       if (removeBlockId) return;
       if (moveState) {
         event.preventDefault();
-        if (!moveState.saving) setMoveState(null);
+        cancelMove();
         return;
       }
       if (reorderBlockId) {
@@ -701,7 +770,14 @@ export function EditorialWorkspaceLayout({
     };
     window.addEventListener("keydown", closeTransientUi);
     return () => window.removeEventListener("keydown", closeTransientUi);
-  }, [closeHistory, historyOpen, moveState, removeBlockId, reorderBlockId]);
+  }, [
+    closeHistory,
+    historyOpen,
+    moveState,
+    removeBlockId,
+    reorderBlockId,
+    cancelMove,
+  ]);
 
   const selectFromOutline = (blockId: string) => {
     selectBlock(blockId);
@@ -952,7 +1028,11 @@ export function EditorialWorkspaceLayout({
               visualError={visualError}
               onStartCaption={startCaptionEditing}
               onSaveCaption={saveCaption}
-              onCancelCaption={() => setCaptionEditingBlockId(null)}
+              onCancelCaption={() =>
+                closeCaptionEditing(
+                  captionEditingBlockId ?? selectedBlockId ?? "",
+                )
+              }
               onStartMove={startMove}
               onChooseMoveAnchor={chooseMoveAnchor}
               onConfirmMove={() => void confirmMove()}
@@ -1006,45 +1086,12 @@ export function EditorialWorkspaceLayout({
             onClose={() => setFigureGalleryOpen(false)}
           />
         ) : null}
-        {replaceRequest
-          ? renderReplaceSlot
-            ? renderReplaceSlot({
-                elementKey: replaceRequest.elementKey,
-                blockId: replaceRequest.blockId,
-                close: () => setReplaceRequest(null),
-              })
-            : (() => {
-                const replaceBlock =
-                  ordered.find(
-                    (block) => block.block_id === replaceRequest.blockId,
-                  ) ?? null;
-                if (!replaceBlock) return null;
-                return (
-                  <section
-                    className="visual-replace-slot"
-                    role="region"
-                    aria-label="Remplacement de la figure"
-                  >
-                    <p>
-                      Remplacement de la figure ·{" "}
-                      {visualElementTitle(replaceBlock)}
-                    </p>
-                    <p>
-                      La galerie des sources fournit la figure de remplacement.
-                      Le nouvel élément conserve son emplacement, sa clé et son
-                      ordre jusqu’à l’adoption.
-                    </p>
-                    <button
-                      className="button button--secondary"
-                      type="button"
-                      onClick={() => setReplaceRequest(null)}
-                    >
-                      Fermer
-                    </button>
-                  </section>
-                );
-              })()
-          : null}
+        {replaceFlow.unresolvedError ? (
+          <p className="visual-action-status" role="alert">
+            {replaceFlow.unresolvedError}
+          </p>
+        ) : null}
+        {replaceFlow.dialog}
         {removeBlockId
           ? (() => {
               const removeBlock = ordered.find(
