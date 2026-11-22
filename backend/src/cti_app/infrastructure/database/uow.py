@@ -11,6 +11,7 @@ from cti_app.application.investigation_persistence import (
     InvestigationBudgetRepository,
     InvestigationEnvelopeRepository,
     InvestigationExperimentRepository,
+    InvestigationHandoffRepository,
     InvestigationPlanRepository,
     InvestigationTaskRepository,
     SampleAssociationRepository,
@@ -194,6 +195,9 @@ from cti_app.infrastructure.database.repositories.investigation import (
 from cti_app.infrastructure.database.repositories.investigation_coordination import (
     SqlAlchemyInvestigationPlanRepository,
 )
+from cti_app.infrastructure.database.repositories.investigation_handoffs import (
+    SqlAlchemyInvestigationHandoffRepository,
+)
 from cti_app.infrastructure.database.repositories.investigation_tasks import (
     SqlAlchemyInvestigationTaskRepository,
 )
@@ -328,6 +332,7 @@ class SqlAlchemyUnitOfWork:
     workspace_sync_cursors: WorkspaceSyncCursorRepository
     investigation_plans: InvestigationPlanRepository
     investigation_tasks: InvestigationTaskRepository
+    investigation_handoffs: InvestigationHandoffRepository
     production_runs: ProductionRunRepository
     production_routing_decisions: ProductionRoutingDecisionRepository
     editorial_workspace_snapshots: EditorialWorkspaceSnapshotRepository
@@ -438,6 +443,7 @@ class SqlAlchemyUnitOfWork:
         self.workspace_sync_cursors = SqlAlchemyWorkspaceSyncCursorRepository(self._session)
         self.investigation_plans = SqlAlchemyInvestigationPlanRepository(self._session)
         self.investigation_tasks = SqlAlchemyInvestigationTaskRepository(self._session)
+        self.investigation_handoffs = SqlAlchemyInvestigationHandoffRepository(self._session)
         self.production_runs = SqlAlchemyProductionRunRepository(self._session)
         self.production_routing_decisions = SqlAlchemyProductionRoutingDecisionRepository(
             self._session

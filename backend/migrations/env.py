@@ -24,6 +24,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     invariants,
     investigation,
     investigation_coordination,
+    investigation_handoffs,
     investigation_tasks,
     jobs,
     media_assets,
@@ -101,6 +102,7 @@ _INVESTIGATION_TASK_TABLES = frozenset(
         "investigation_task_events",
     }
 )
+_INVESTIGATION_HANDOFF_TABLES = frozenset({"investigation_handoffs"})
 _TOOL_INVOCATION_ATTRIBUTION_COLUMNS = frozenset({"task_id", "actor_kind", "actor_id"})
 _TOOL_INVOCATION_ATTRIBUTION_CHECKS = frozenset(
     {"ck_tool_invocations_actor_kind", "ck_tool_invocations_actor_pair"}
@@ -168,6 +170,7 @@ def _metadata_for_frozen_baseline() -> MetaData:
             or source_table.name in _WORKSPACE_TABLES
             or source_table.name in _INVESTIGATION_PLAN_TABLES
             or source_table.name in _INVESTIGATION_TASK_TABLES
+            or source_table.name in _INVESTIGATION_HANDOFF_TABLES
         ):
             continue
         table = source_table.to_metadata(metadata)

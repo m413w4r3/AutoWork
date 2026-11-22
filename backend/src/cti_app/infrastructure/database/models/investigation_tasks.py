@@ -214,7 +214,18 @@ class InvestigationTaskRow(Base):
         DateTime(timezone=True), nullable=True
     )
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    handoff_ref: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    # The foreign key to ``investigation_handoffs`` is added by 0022: the
+    # handoff table does not exist yet when 0021 runs.
+    handoff_ref: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey(
+            "investigation_handoffs.id",
+            name="fk_investigation_tasks_handoff",
+            ondelete="RESTRICT",
+            use_alter=True,
+        ),
+        nullable=True,
+    )
     result_refs: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
     event_sequence: Mapped[int] = mapped_column(
         BigInteger, nullable=False, server_default=text("0")

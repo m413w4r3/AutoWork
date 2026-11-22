@@ -12,6 +12,7 @@ from cti_app.application.investigation_persistence import (
     FindingRepository,
     InvestigationBudgetRepository,
     InvestigationEnvelopeRepository,
+    InvestigationHandoffRepository,
     InvestigationPlanRepository,
     InvestigationTaskRepository,
     SampleAssociationRepository,
@@ -1254,6 +1255,7 @@ class UnitOfWork(Protocol):
     workspace_sync_cursors: WorkspaceSyncCursorRepository
     investigation_plans: InvestigationPlanRepository
     investigation_tasks: InvestigationTaskRepository
+    investigation_handoffs: InvestigationHandoffRepository
     # Defined further down in this module.
     production_runs: ProductionRunRepository
     production_routing_decisions: ProductionRoutingDecisionRepository
