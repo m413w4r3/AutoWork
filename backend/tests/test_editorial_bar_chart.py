@@ -240,6 +240,46 @@ def test_manual_validator_code_does_not_expose_user_keys() -> None:
     )
 
 
+def test_shared_value_unit_proof_is_exact_and_record_scoped() -> None:
+    """The production/manual/revision paths share one exact same-record check."""
+    from cti_app.application.production_editorial_enrichment import (
+        bar_chart_record_documents_value_and_unit,
+    )
+
+    alpha_ref = _reference()
+    entries = {
+        alpha_ref: {
+            "value": "Alpha: 0.10000000000000001 endpoints",
+            "evidence_quote": "The report records 0.10000000000000001 endpoints for Alpha.",
+        }
+    }
+    record = entries[alpha_ref]
+    assert bar_chart_record_documents_value_and_unit(
+        record, value=Decimal("0.10000000000000001"), unit="endpoints"
+    )
+    # No rounding: the rounded display value is not the documented number.
+    assert not bar_chart_record_documents_value_and_unit(
+        record, value=Decimal("0.1"), unit="endpoints"
+    )
+    # The unit must be documented by the same record, not merely by the chart.
+    assert not bar_chart_record_documents_value_and_unit(
+        record, value=Decimal("0.1"), unit="samples"
+    )
+    # The manual create path keeps its narrower field selection.
+    assert bar_chart_record_documents_value_and_unit(
+        record,
+        value=Decimal("0.10000000000000001"),
+        unit="endpoints",
+        text_fields=("value", "evidence_quote"),
+    )
+    assert not bar_chart_record_documents_value_and_unit(
+        {"context": "0.10000000000000001 endpoints"},
+        value=Decimal("0.10000000000000001"),
+        unit="endpoints",
+        text_fields=("value", "evidence_quote"),
+    )
+
+
 def test_bar_chart_json_parsing_preserves_exact_decimal_values() -> None:
     from cti_app.application.editorial_proposals import (
         _parse_editorial_patch_payload,

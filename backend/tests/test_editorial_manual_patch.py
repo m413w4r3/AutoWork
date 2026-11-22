@@ -856,6 +856,9 @@ async def test_visual_revision_preparation_fails_closed_without_pinned_loader() 
             idempotency_key="visual-preparation-key-002",
             patch=ReviseChartPatch(element_key="chart_one", chart=chart),
         )
-    assert unsupported.value.code == "enrichment_revision_unsupported_operation"
+    # F2-03b implements the chart variant, so without a pinned loader the
+    # service fails closed on its unavailable dependencies instead of the
+    # former unsupported-operation placeholder.
+    assert unsupported.value.code == "proposal_base_unavailable"
     assert setup.repository.records == []
     assert setup.blob_bytes == {}

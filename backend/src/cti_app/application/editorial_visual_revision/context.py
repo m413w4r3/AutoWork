@@ -18,7 +18,10 @@ from cti_app.domain.production_editorial_enrichment import (
     EnrichmentElementRef,
 )
 from cti_app.domain.production_extraction import ProductionExtractionV1
-from cti_app.domain.production_synthesis import ProductionSynthesisV1
+from cti_app.domain.production_synthesis import (
+    ExtractionEvidenceRefV1,
+    ProductionSynthesisV1,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +112,8 @@ VISUAL_REVISION_ERROR_CODES: frozenset[str] = frozenset(
         "enrichment_order_group_unsupported",
         "enrichment_revision_no_change",
         "enrichment_revision_unsupported_operation",
+        "bar_chart_insufficient_data",
+        "bar_chart_value_not_evidenced",
         "editorial_caption_text_violation",
         "editorial_anchor_stale",
         "proposal_base_stale",
@@ -116,6 +121,26 @@ VISUAL_REVISION_ERROR_CODES: frozenset[str] = frozenset(
         "editorial_read_only",
     }
 )
+
+
+def patch_invalid(reason_code: str, **diagnostics: object) -> VisualRevisionRejected:
+    """Build the closed-union refusal shared by every element-revision variant."""
+    return VisualRevisionRejected(
+        "enrichment_revision_patch_invalid",
+        {"reason_code": reason_code, **diagnostics},
+    )
+
+
+def admitted_evidence_refs(ctx: VisualRevisionContext) -> frozenset[ExtractionEvidenceRefV1]:
+    """Refs currently admitted for this artifact, or a typed refusal.
+
+    A revision may only cite records admitted under the current TLP/revocation
+    policy; without the pack the planner cannot make that claim and refuses
+    instead of trusting the patch.
+    """
+    if ctx.evidence_pack is None:
+        raise patch_invalid("evidence_pack_unavailable")
+    return frozenset(ctx.evidence_pack._handle_to_ref.values())
 
 
 def visual_preview_payload(

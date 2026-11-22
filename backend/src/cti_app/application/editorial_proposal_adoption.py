@@ -111,6 +111,7 @@ from cti_app.domain.production import (
     ProductionInputSnapshot,
 )
 from cti_app.domain.production_editorial_enrichment import (
+    DiagramSpecV1,
     EditorialEnrichmentElementKind,
     EditorialEnrichmentV1,
     ResolvedSourceFigureV1,
@@ -238,6 +239,7 @@ class EnrichmentCandidateInputs:
     metadata_extra: Mapping[str, Any] | None = None
     resource_search_enabled: bool = False
     diagram_materializer: DiagramMaterializer | None = None
+    diagram_materialization: DiagramSpecV1 | None = None
     compiled_chart_asset: Mapping[str, object] | None = None
 
 
@@ -706,7 +708,17 @@ class EditorialProposalAdoptionService:
                     synthesis=enrichment_inputs.synthesis,
                     input_hash=enrichment_inputs.input_hash,
                     artifact_id=enrichment_inputs.artifact_id,
+                    diagram_materialization=enrichment_inputs.diagram_materialization,
                 )
+                if enrichment_candidate.diagram_materialization is not None:
+                    if enrichment_inputs.diagram_materializer is None:
+                        raise EditorialProposalAdoptionError(
+                            "editorial_enrichment_diagram_materializer_unavailable"
+                        )
+                    enrichment_candidate = await materialize_candidate_diagrams(
+                        enrichment_candidate,
+                        materializer=enrichment_inputs.diagram_materializer,
+                    )
             except EditorialProposalAdoptionError:
                 raise
             except Exception as error:

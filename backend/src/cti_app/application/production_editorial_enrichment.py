@@ -6254,6 +6254,56 @@ def _all_refs_for_handles(
     return tuple(pack.resolve_handle(handle) for handle in handles)
 
 
+def bar_chart_record_documents_value_and_unit(
+    payload: Mapping[str, Any],
+    *,
+    value: Decimal,
+    unit: str | None,
+    text_fields: tuple[str, ...] | None = None,
+) -> bool:
+    """True when one admitted FACT/EVENT record proves the exact value and unit.
+
+    Production, manual and typed-revision charts share this check so a displayed
+    number and its unit are always documented by the *same* record, without
+    rounding: the observed token is parsed as a Decimal and compared exactly.
+    ``text_fields`` keeps the manual create path's narrower field selection;
+    ``None`` reads every nested string of the record (the production policy).
+    """
+    texts = (
+        tuple(_string_values(payload))
+        if text_fields is None
+        else tuple(
+            text for field_name in text_fields if isinstance((text := payload.get(field_name)), str)
+        )
+    )
+    value_is_documented = False
+    unit_is_documented = False
+    for text in texts:
+        if bar_chart_evidence_contains_unit(unit or "", text):
+            unit_is_documented = True
+        for match in _BAR_VALUE_TOKEN_RE.finditer(text):
+            try:
+                observed_value = Decimal(match.group())
+            except InvalidOperation:
+                continue
+            if observed_value.is_finite() and observed_value == value:
+                value_is_documented = True
+    return value_is_documented and unit_is_documented
+
+
+def editorial_technical_support(
+    entries: Mapping[ExtractionEvidenceRefV1, Mapping[str, Any]],
+) -> dict[tuple[str, str], set[ExtractionEvidenceRefV1]]:
+    """Index every technical literal of the extraction to the records citing it."""
+    technical_support: dict[tuple[str, str], set[ExtractionEvidenceRefV1]] = defaultdict(set)
+    for ref, payload in entries.items():
+        for value in _string_values(payload):
+            for literal in _technical_literals(value):
+                for alias in _technical_literal_aliases(literal):
+                    technical_support[alias].add(ref)
+    return dict(technical_support)
+
+
 def _validate_grounded_editorial_text(
     value: str,
     refs: tuple[ExtractionEvidenceRefV1, ...],
@@ -6512,15 +6562,7 @@ def validate_editorial_enrichment_proposal(
             EditorialEnrichmentStageErrorCode.UNKNOWN_EVIDENCE,
             message="evidence_pack_contains_refs_missing_from_extraction",
         )
-    technical_support_mutable: dict[tuple[str, str], set[ExtractionEvidenceRefV1]] = defaultdict(
-        set
-    )
-    for ref, payload in entries.items():
-        for value in _string_values(payload):
-            for literal in _technical_literals(value):
-                for alias in _technical_literal_aliases(literal):
-                    technical_support_mutable[alias].add(ref)
-    technical_support = dict(technical_support_mutable)
+    technical_support = editorial_technical_support(entries)
     section_count = len(synthesis.sections)
     paragraph_text_by_anchor = semantic_annotation_anchor_texts(synthesis)
     annotations: list[SemanticAnnotationProposalV1] = []
@@ -6800,27 +6842,13 @@ def validate_editorial_enrichment_proposal(
                         EditorialEnrichmentStageErrorCode.UNKNOWN_TECHNICAL_VALUE,
                         message="bar_chart_value_not_finite",
                     )
-                value_and_unit_share_evidence = False
-                for ref in refs:
-                    if ref.kind not in {EvidenceKind.FACT, EvidenceKind.EVENT}:
-                        continue
-                    payload = entries[ref]
-                    texts = tuple(_string_values(payload))
-                    value_is_documented = False
-                    unit_is_documented = False
-                    for text in texts:
-                        if bar_chart_evidence_contains_unit(chart.unit or "", text):
-                            unit_is_documented = True
-                        for match in _BAR_VALUE_TOKEN_RE.finditer(text):
-                            try:
-                                observed_value = Decimal(match.group())
-                            except InvalidOperation:
-                                continue
-                            if observed_value.is_finite() and observed_value == point.value:
-                                value_is_documented = True
-                    if value_is_documented and unit_is_documented:
-                        value_and_unit_share_evidence = True
-                        break
+                value_and_unit_share_evidence = any(
+                    bar_chart_record_documents_value_and_unit(
+                        entries[ref], value=point.value, unit=chart.unit
+                    )
+                    for ref in refs
+                    if ref.kind in {EvidenceKind.FACT, EvidenceKind.EVENT}
+                )
                 if not value_and_unit_share_evidence:
                     raise EditorialEnrichmentProposalControlError(
                         EditorialEnrichmentStageErrorCode.UNKNOWN_TECHNICAL_VALUE,

@@ -556,11 +556,7 @@ def test_reorder_rejections() -> None:
 
 def test_unimplemented_slice_variants_reject_explicitly() -> None:
     ctx = _context()
-    chart = _timeline_chart()
-    diagram = _diagram()
     variants = (
-        ReviseChartPatch(element_key="chart_one", chart=replace(chart, key="chart_one")),
-        ReviseDiagramPatch(element_key="diagram_one", diagram=replace(diagram, key="diagram_one")),
         ReplaceSourceFigurePatch(
             element_key="figure_one", figure_id=UUID("44444444-4444-4444-8444-444444444444")
         ),
@@ -572,6 +568,23 @@ def test_unimplemented_slice_variants_reject_explicitly() -> None:
         with pytest.raises(VisualRevisionRejected) as exc_info:
             plan_visual_revision(ctx, variant)
         assert exc_info.value.code == "enrichment_revision_unsupported_operation"
+
+
+def test_chart_and_diagram_variants_are_implemented() -> None:
+    # The F2-03b variants reject their own invalid targets with typed codes
+    # instead of the placeholder unsupported-operation code.
+    ctx = _context()
+    with pytest.raises(VisualRevisionRejected) as chart_error:
+        plan_visual_revision(
+            ctx, ReviseChartPatch(element_key="chart_one", chart=_timeline_chart())
+        )
+    assert chart_error.value.code == "enrichment_element_kind_mismatch"
+    with pytest.raises(VisualRevisionRejected) as diagram_error:
+        plan_visual_revision(
+            ctx,
+            ReviseDiagramPatch(element_key="diagram_one", diagram=_diagram()),
+        )
+    assert diagram_error.value.code == "enrichment_revision_no_change"
 
 
 def test_patch_codec_round_trips_implemented_variants_and_rejects_the_rest() -> None:
@@ -592,14 +605,22 @@ def test_patch_codec_round_trips_implemented_variants_and_rejects_the_rest() -> 
             EnrichmentElementRef(EditorialEnrichmentElementKind.TABLE, "table_one"),
         ),
     )
-    for patch in (caption, move, reorder):
+    revise_chart = ReviseChartPatch(element_key="chart_one", chart=_timeline_chart())
+    revise_diagram = ReviseDiagramPatch(element_key="diagram_one", diagram=_diagram())
+    for patch in (caption, move, reorder, revise_chart, revise_diagram):
         assert visual_patch_from_json(visual_patch_to_json(patch)) == patch
     with pytest.raises(NotImplementedForSlice):
-        visual_patch_to_json(ReviseChartPatch(element_key="chart_one", chart=_timeline_chart()))
+        visual_patch_to_json(
+            ReplaceSourceFigurePatch(
+                element_key="figure_one", figure_id=UUID("44444444-4444-4444-8444-444444444444")
+            )
+        )
     with pytest.raises(NotImplementedForSlice):
-        visual_patch_from_json({"kind": "revise_chart"})
+        visual_patch_from_json({"kind": "replace_source_figure"})
     with pytest.raises(EditorialEnrichmentPatchError):
         visual_patch_from_json({"kind": "update_visual_caption"})
+    with pytest.raises(EditorialEnrichmentPatchError):
+        visual_patch_from_json({"kind": "revise_chart", "element_key": "chart_one"})
 
 
 def test_project_blocks_exposes_element_fields_order_and_reorder_operations() -> None:

@@ -1894,5 +1894,7 @@ async def test_prepare_visual_revision_maps_planner_rejections_to_typed_errors()
             idempotency_key="visual-unsupported-key-01",
             patch=ReviseChartPatch(element_key="chart_one", chart=_timeline_chart()),
         )
-    assert unsupported.value.code == "enrichment_revision_unsupported_operation"
+    # F2-03b implements the chart variant; the fixture's base chart is a
+    # timeline chart, so the typed refusal is the BAR-only kind check.
+    assert unsupported.value.code == "enrichment_element_kind_mismatch"
     assert setup.repository.records == []

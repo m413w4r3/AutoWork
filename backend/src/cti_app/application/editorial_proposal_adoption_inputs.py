@@ -48,6 +48,7 @@ from cti_app.application.editorial_visual_revision import (
     VisualRevisionContext,
     VisualRevisionRejected,
     plan_visual_revision,
+    replace_element,
 )
 from cti_app.application.editorial_workspace.registry import (
     WorkspaceOccurrenceResolution,
@@ -80,9 +81,12 @@ from cti_app.domain.editorial_enrichment_patch import (
     EditorialEnrichmentPatchError,
     MoveEnrichmentElementPatch,
     ReorderEnrichmentElementsPatch,
+    ReviseChartPatch,
+    ReviseDiagramPatch,
     UnsupportedEnrichmentRevisionOperation,
     UpdateVisualCaptionPatch,
     enrichment_order_group_hash,
+    visual_patch_element_kind,
     visual_patch_from_json,
 )
 from cti_app.domain.editorial_figure_keys import adopted_source_figure_key
@@ -105,8 +109,10 @@ from cti_app.domain.production import (
 from cti_app.domain.production_editorial_enrichment import (
     EDITORIAL_ENRICHMENT_V9_POLICY_VERSION,
     ChartKind,
+    ChartSpecV1,
     EditorialEnrichmentElementKind,
     EditorialEnrichmentV1,
+    EnrichmentElementRef,
     EnrichmentPlacementKind,
     EnrichmentPlacementV1,
     SourceFigureCandidateV1,
@@ -413,16 +419,18 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
         self._resource_search_enabled = resource_search_enabled
         self._prepared: dict[UUID, _PreparedInputs] = {}
 
-    async def _verify_bar_chart_asset(
+    async def _verify_compiled_chart(
         self,
         *,
-        proposal_patch: Mapping[str, Any],
-        candidate: EditorialEnrichmentV1,
-        operation: TargetedEditorialRevisionOperation,
-    ) -> tuple[EditorialEnrichmentV1, Mapping[str, object] | None]:
-        if operation is not TargetedEditorialRevisionOperation.CREATE_BAR_CHART:
-            return candidate, None
-        raw_manifest = proposal_patch.get("compiled_chart_asset")
+        chart: ChartSpecV1,
+        raw_manifest: Any,
+    ) -> tuple[UUID, Mapping[str, object]]:
+        """Recompile one BAR chart and compare it to the prepared manifest.
+
+        Adoption never trusts the stored preview: a deterministic recompile
+        under the same pinned compiler must reproduce the exact SVG the prepare
+        step content-addressed, otherwise the proposal is refused.
+        """
         required = {
             "asset_id",
             "sha256",
@@ -437,8 +445,7 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
         except (TypeError, ValueError):
             raise EditorialProposalAdoptionError("proposal_patch_invalid") from None
         if (
-            len(candidate.charts) != 1
-            or candidate.charts[0].kind is not ChartKind.BAR
+            chart.kind is not ChartKind.BAR
             or not isinstance(raw_manifest.get("sha256"), str)
             or re.fullmatch(r"[0-9a-f]{64}", str(raw_manifest["sha256"])) is None
             or any(
@@ -451,7 +458,6 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
         compiler = getattr(self._enrichment_loader, "_chart_compiler", None)
         if media_store is None or compiler is None:
             raise EditorialProposalAdoptionError("editorial_enrichment_chart_render_failed")
-        chart = candidate.charts[0]
         try:
             compiled = await compiler.compile(chart)
             manifest = await media_store.get(asset_id)
@@ -472,8 +478,25 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
             or compiled.media_bytes != content
         ):
             raise EditorialProposalAdoptionError("proposal_patch_invalid")
-        compiled_chart = replace(chart, compiled_asset_id=asset_id)
-        return replace(candidate, charts=(compiled_chart,)), dict(raw_manifest)
+        return asset_id, dict(raw_manifest)
+
+    async def _verify_bar_chart_asset(
+        self,
+        *,
+        proposal_patch: Mapping[str, Any],
+        candidate: EditorialEnrichmentV1,
+        operation: TargetedEditorialRevisionOperation,
+    ) -> tuple[EditorialEnrichmentV1, Mapping[str, object] | None]:
+        if operation is not TargetedEditorialRevisionOperation.CREATE_BAR_CHART:
+            return candidate, None
+        if len(candidate.charts) != 1:
+            raise EditorialProposalAdoptionError("proposal_patch_invalid")
+        asset_id, manifest = await self._verify_compiled_chart(
+            chart=candidate.charts[0],
+            raw_manifest=proposal_patch.get("compiled_chart_asset"),
+        )
+        compiled_chart = replace(candidate.charts[0], compiled_asset_id=asset_id)
+        return replace(candidate, charts=(compiled_chart,)), manifest
 
     async def synthesis_inputs(
         self,
@@ -1065,10 +1088,21 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
         validate_targeted_request(request)
         entry = resolution.entry
         if target.kind is TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT:
-            if not isinstance(typed_patch, (UpdateVisualCaptionPatch, MoveEnrichmentElementPatch)):
-                raise EditorialProposalAdoptionError("proposal_target_mismatch")
+            try:
+                element_kind = visual_patch_element_kind(typed_patch)
+            except ValueError:
+                raise EditorialProposalAdoptionError("proposal_patch_invalid") from None
             if (
-                target.element_kind is not typed_patch.element_kind
+                not isinstance(
+                    typed_patch,
+                    (
+                        UpdateVisualCaptionPatch,
+                        MoveEnrichmentElementPatch,
+                        ReviseChartPatch,
+                        ReviseDiagramPatch,
+                    ),
+                )
+                or target.element_kind is not element_kind
                 or target.element_key != typed_patch.element_key
             ):
                 raise EditorialProposalAdoptionError("proposal_target_mismatch")
@@ -1128,7 +1162,20 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
             plan = plan_visual_revision(context, typed_patch)
         except VisualRevisionRejected as error:
             raise EditorialProposalAdoptionError(error.code) from None
-        revised_payload = editorial_enrichment_to_json(plan.revised_enrichment)
+        revised_enrichment = plan.revised_enrichment
+        if plan.compile_chart is not None:
+            if target.element_key is None:
+                raise EditorialProposalAdoptionError("proposal_target_mismatch")
+            asset_id, _manifest = await self._verify_compiled_chart(
+                chart=plan.compile_chart,
+                raw_manifest=patch.get("compiled_chart_asset"),
+            )
+            revised_enrichment = replace_element(
+                revised_enrichment,
+                EnrichmentElementRef(EditorialEnrichmentElementKind.CHART, target.element_key),
+                replace(plan.compile_chart, compiled_asset_id=asset_id),
+            )
+        revised_payload = editorial_enrichment_to_json(revised_enrichment)
         return EnrichmentCandidateInputs(
             base_payload=base_payload,
             base_enrichment=base_enrichment,
@@ -1141,7 +1188,7 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
             input_hash=fence.input_hash,
             artifact_id=uuid4(),
             figure_catalog=fence.figure_catalog,
-            revised_enrichment=plan.revised_enrichment,
+            revised_enrichment=revised_enrichment,
             registry_lineage=self._enrichment_lineage(resolution, base_payload, revised_payload),
             is_create=False,
             is_delete=False,
@@ -1157,6 +1204,7 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                     diagram, run_id=run.id
                 )
             ),
+            diagram_materialization=plan.materialize_diagram,
         )
 
     async def revalidate_evidence_policy_and_thread(

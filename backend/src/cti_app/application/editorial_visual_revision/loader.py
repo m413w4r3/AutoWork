@@ -69,6 +69,15 @@ class VisualRevisionContextLoader:
         self._enrichment_loader = enrichment_loader
         self._enrichment_revision_service = enrichment_revision_service
 
+    @property
+    def diagram_preview_compiler(self) -> Any | None:
+        """Compiler used for non-canonical diagram previews, when configured.
+
+        Prepare never renders arbitrary code: it only asks this pinned compiler
+        for the deterministic PNG preview of a typed ``DiagramSpecV1``.
+        """
+        return getattr(self._enrichment_loader, "_diagram_compiler", None)
+
     async def load(
         self,
         *,

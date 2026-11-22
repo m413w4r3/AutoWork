@@ -528,13 +528,19 @@ def build_candidate_from_revised_enrichment(
     synthesis: ProductionSynthesisV1,
     input_hash: str,
     artifact_id: UUID,
+    diagram_materialization: DiagramSpecV1 | None = None,
 ) -> EditorialEnrichmentCandidate:
     """Prepare canonical bytes from a planner-validated complete enrichment.
 
-    Visual revisions (caption/move/reorder and the later chart/diagram/figure
-    variants) are planned on the whole artifact rather than through the legacy
+    Visual revisions (caption/move/reorder and chart/diagram/figure variants)
+    are planned on the whole artifact rather than through the legacy
     one-element wire patch. The base bytes and hashes are rechecked here so the
     caller's earlier read cannot be reused across a changed artifact.
+
+    ``diagram_materialization`` requests a deterministic recompile before
+    persistence (the caller runs :func:`materialize_candidate_diagrams` with
+    its pinned D2 compiler and media store); the candidate keeps validating the
+    uncompiled planner output until then.
     """
     if base_artifact.canonical_blob_id is None:
         raise EditorialEnrichmentRevisionConflictError(
@@ -574,6 +580,7 @@ def build_candidate_from_revised_enrichment(
         after_element=None,
         outcome=EditorialEnrichmentRevisionOutcome.REVISED,
         resource_need=None,
+        diagram_materialization=diagram_materialization,
     )
 
 
