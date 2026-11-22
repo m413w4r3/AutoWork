@@ -33,7 +33,16 @@ describe("manualEditOperationFor", () => {
     );
   });
 
-  it("maps the lead paragraph to rewrite_lead, not rewrite_paragraph", () => {
+  it("derives the lead paragraph operation from the server advertisement", () => {
+    // The real backend advertises the paragraph-level rewrite for a lead
+    // paragraph; the whole-chapeau rewrite_lead has no block occurrence.
+    expect(
+      manualEditOperationFor(
+        block("lead_paragraph", ["rewrite_paragraph", "delete_paragraph"]),
+      ),
+    ).toBe("rewrite_paragraph");
+    // If a server ever advertises rewrite_lead for a block, the contract is the
+    // advertised operation, never the block kind.
     expect(
       manualEditOperationFor(
         block("lead_paragraph", ["rewrite_lead", "insert_paragraph"]),
@@ -59,13 +68,58 @@ describe("manualEditOperationFor", () => {
     ).toBeNull();
   });
 
-  it("returns null when the server does not allow the exact operation", () => {
+  it("returns null when the server advertises no manual text operation", () => {
     expect(manualEditOperationFor(block("title", []))).toBeNull();
     expect(manualEditOperationFor(block("lead_paragraph", []))).toBeNull();
     expect(
-      manualEditOperationFor(block("paragraph", ["rewrite_lead"])),
+      manualEditOperationFor(block("paragraph", ["rewrite_section"])),
+    ).toBeNull();
+    expect(
+      manualEditOperationFor(
+        block("paragraph", ["delete_paragraph", "create_table"]),
+      ),
     ).toBeNull();
   });
+
+  // Drift guard: these operation lists mirror the real targeted revision
+  // catalog pinned by backend tests/test_editorial_workspace_capabilities.py.
+  it.each([
+    ["title", ["rewrite_title"], "rewrite_title"],
+    [
+      "lead_paragraph",
+      ["rewrite_paragraph", "delete_paragraph"],
+      "rewrite_paragraph",
+    ],
+    [
+      "paragraph",
+      [
+        "rewrite_paragraph",
+        "delete_paragraph",
+        "create_table",
+        "create_bar_chart",
+        "create_source_figure",
+      ],
+      "rewrite_paragraph",
+    ],
+    [
+      "section_heading",
+      [
+        "rewrite_section",
+        "delete_section",
+        "split_section",
+        "rename_section",
+        "insert_paragraph",
+      ],
+      null,
+    ],
+  ] as const)(
+    "handles the operation set the server advertises for %s",
+    (kind, operations, expected) => {
+      expect(manualEditOperationFor(block(kind, [...operations]))).toBe(
+        expected,
+      );
+    },
+  );
 
   it("returns null for a block without text", () => {
     expect(

@@ -29,6 +29,7 @@ from cti_app.domain.production import (
     ProductionArtifactStatus,
 )
 from cti_app.domain.production_extraction import production_extraction_to_json
+from cti_app.domain.production_synthesis import production_synthesis_to_json
 from tests.integration.editorial.test_proposal_adoption_postgres import _seed
 from tests.test_publication_kind_resolution import _brief_v8_payload
 
@@ -56,6 +57,8 @@ class _NoModelCalls:
 
 async def _ready_for_production_route(
     uow_factory: UnitOfWorkFactory,
+    *,
+    article_base: bool = False,
 ) -> tuple[Any, FastAPI, _NoModelCalls]:
     # `_seed` intentionally does not persist these production inputs. Add the
     # rows needed by the real policy adapter and use IDs returned by the blob
@@ -64,6 +67,7 @@ async def _ready_for_production_route(
         uow_factory,
         proposal_count=0,
         seed_discovery_lineage=True,
+        article_base=article_base,
     )
     extraction_bytes = ProductionArtifactStore.canonical_json_bytes(
         production_extraction_to_json(seeded.extraction)
@@ -279,6 +283,89 @@ async def test_manual_edit_real_route_persists_replays_and_refuses_unsupported_v
     assert unsupported.status_code == 422
     assert unsupported.json()["detail"]["code"] == "manual_edit_new_fact_unadmitted"
     assert "Cette nouvelle valeur technique" in unsupported.json()["detail"]["message"]
+    assert model_gateway.calls == []
+
+
+@pytest.mark.asyncio
+async def test_manual_edit_rewrites_one_paragraph_of_a_multi_paragraph_section(
+    uow_factory: UnitOfWorkFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression for M23 R2 defect D2: the typed target used to be built on a
+    # payload reduced to the selected occurrence, so a paragraph in a section
+    # with several paragraphs carried a one-paragraph section hash as
+    # `parent_id` and the adoption writer refused it (503 manual_edit_unavailable
+    # through the route). The acceptance must bump exactly one synthesis version
+    # and leave every other paragraph byte-identical.
+    monkeypatch.setattr(
+        api_main,
+        "get_settings",
+        lambda: Settings(
+            _env_file=None,
+            app_env="development",
+            api_bind_host="127.0.0.1",
+        ),
+    )
+    seeded, app, model_gateway = await _ready_for_production_route(uow_factory, article_base=True)
+    monkeypatch.setattr(
+        editorial_workspace_api,
+        "get_settings",
+        lambda: Settings(_env_file=None, editorial_proposal_accept_enabled=True),
+    )
+    monkeypatch.setattr(editorial_workspace_api, "_proposal_impact_consumer_wired", lambda: True)
+    revised_text = "Arsenal : Synthetic tool, reworded for the integration oracle."
+    before_payload = production_synthesis_to_json(seeded.synthesis)
+    assert len(before_payload["sections"][0]["paragraphs"]) == 3
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
+    ) as client:
+        snapshot = await _snapshot(client, seeded.subject.id)
+        paragraphs = [block for block in snapshot["blocks"] if block["kind"] == "paragraph"]
+        assert [block["position"] for block in paragraphs] == [0, 1, 2]
+        target = paragraphs[1]
+        assert target["allowed_operations"] == ["rewrite_paragraph", "delete_paragraph"]
+        response = await client.post(
+            _manual_path(seeded.subject.id, UUID(target["block_id"])),
+            headers={"Idempotency-Key": f"manual-{uuid4().hex}"},
+            json={
+                "snapshot_id": snapshot["snapshot_id"],
+                "operation": "rewrite_paragraph",
+                "text": revised_text,
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["state"] == "accepted"
+        assert response.json()["artifact_version"] == 2
+        refreshed = await _snapshot(client, seeded.subject.id)
+        persisted = next(
+            block for block in refreshed["blocks"] if block["block_id"] == target["block_id"]
+        )
+        assert persisted["text"] == revised_text
+
+    async with uow_factory() as uow:
+        artifacts = list(await uow.production_artifacts.list_for_run(seeded.run.id))
+        current = await uow.production_artifacts.get_current_for_revision(
+            seeded.run.id, ProductionArtifactStage.SYNTHESIS.value
+        )
+    synthesis_versions = sorted(
+        artifact.version
+        for artifact in artifacts
+        if artifact.stage is ProductionArtifactStage.SYNTHESIS
+    )
+    assert synthesis_versions == [1, 2]
+    assert current is not None and current.version == 2
+    assert current.canonical_blob_id is not None
+    revised_payload = await app.state.production_artifact_store.read_json(current.canonical_blob_id)
+
+    assert revised_payload["sections"][0]["paragraphs"][1]["text"] == revised_text
+    for index in (0, 2):
+        assert (
+            revised_payload["sections"][0]["paragraphs"][index]
+            == before_payload["sections"][0]["paragraphs"][index]
+        )
+    assert revised_payload["lead"] == before_payload["lead"]
+    assert revised_payload["title"] == before_payload["title"]
     assert model_gateway.calls == []
 
 

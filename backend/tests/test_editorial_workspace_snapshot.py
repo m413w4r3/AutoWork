@@ -10,8 +10,10 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from cti_app.application.editorial_synthesis.targets import resolve_target
 from cti_app.application.editorial_workspace.registry import (
     WorkspaceSnapshotRecord,
+    allowed_operations,
     project_blocks,
     registry_hash,
     resolve_paragraph_anchor,
@@ -32,9 +34,13 @@ from cti_app.domain.editorial_workspace import (
     EditorialSourceStage,
     EditorialWorkspaceError,
     bootstrap_block_registry,
+    canonical_content_sha256,
     workspace_pin_hash,
 )
 from cti_app.domain.production import ProductionArtifactStatus
+from cti_app.domain.production_editorial_revision import (
+    TargetedEditorialRevisionOperation,
+)
 from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.publication_render import PublicationRender
 from cti_app.domain.typst_render import TypstRenderFormat, TypstRenderStatus
@@ -397,15 +403,111 @@ def test_snapshot_rejects_artifact_pointer_change_between_reads(
     asyncio.run(exercise())
 
 
-def test_duplicate_paragraphs_resolve_to_distinct_canonical_paths() -> None:
-    artifact_id = uuid4()
-    content = _synthesis((_paragraph("same"), _paragraph("same")))
-    entries = bootstrap_block_registry(
-        artifact_id=artifact_id,
+def _paragraph_entries(
+    content: dict[str, object],
+) -> tuple[BlockRegistryEntry, ...]:
+    return bootstrap_block_registry(
+        artifact_id=uuid4(),
         canonical_sha256="9" * 64,
         source_stage="synthesis",
         canonical_content=content,
     )
+
+
+@pytest.mark.parametrize(
+    ("pointer", "operation"),
+    (
+        ("/sections/0/paragraphs/0", "rewrite_paragraph"),
+        ("/sections/0/paragraphs/1", "rewrite_paragraph"),
+        ("/sections/0/paragraphs/1", "delete_paragraph"),
+        ("/sections/0/paragraphs/2", "rewrite_paragraph"),
+        ("/sections/0/heading", "rename_section"),
+        ("/sections/0/heading", "rewrite_section"),
+        ("/lead/0", "rewrite_paragraph"),
+        ("/title", "rewrite_title"),
+    ),
+)
+def test_registered_target_resolves_against_the_full_synthesis(
+    pointer: str, operation: str
+) -> None:
+    # Regression: the typed target used to be built on a payload reduced to the
+    # selected occurrence, so a paragraph in a multi-paragraph section carried
+    # the hash of a one-paragraph section as `parent_id`. Prepare and adoption
+    # resolve the same target against the *full* synthesis and rejected it.
+    content = _synthesis(
+        (_paragraph("first body"), _paragraph("target body"), _paragraph("third body"))
+    )
+    entries = _paragraph_entries(content)
+    entry = next(item for item in entries if item.structural_pointer == pointer)
+
+    resolved = resolve_workspace_target(
+        entry=entry,
+        canonical_content=content,
+        operation=operation,
+    )
+    canonical = resolve_target(
+        content,
+        resolved.target,
+        TargetedEditorialRevisionOperation(operation),
+    )
+
+    assert canonical.path
+    assert canonical.before_hash == resolved.before_hash
+
+
+def test_multi_paragraph_section_target_keeps_the_full_section_parent() -> None:
+    content = _synthesis(
+        (_paragraph("first body"), _paragraph("target body"), _paragraph("third body"))
+    )
+    entries = _paragraph_entries(content)
+    target_entry = next(
+        item for item in entries if item.structural_pointer == "/sections/0/paragraphs/1"
+    )
+    section = content["sections"][0]
+    assert isinstance(section, dict)
+
+    resolved = resolve_workspace_target(
+        entry=target_entry,
+        canonical_content=content,
+        operation="rewrite_paragraph",
+    )
+    canonical = resolve_target(
+        content,
+        resolved.target,
+        TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH,
+    )
+
+    assert resolved.target.parent_id == canonical_content_sha256(section)
+    assert resolved.target.stable_ids == (target_entry.content_sha256,)
+    assert canonical.parent_index == 0
+    assert canonical.indexes == (1,)
+    assert canonical.before_hash == target_entry.content_sha256
+
+
+def test_duplicate_paragraphs_resolve_to_distinct_canonical_paths() -> None:
+    # The same content in two sections keeps two usable targets: the section
+    # parent hash disambiguates them on the full payload, while the paragraph
+    # content id (and therefore `before_hash`) stays equal.
+    content: dict[str, object] = {
+        "schema_version": "2",
+        "title": "Synthetic title",
+        "lead": [{"text": "Synthetic lead", "evidence_refs": []}],
+        "sections": [
+            {
+                "kind": "narrative",
+                "heading": "First heading",
+                "paragraphs": [_paragraph("same body")],
+            },
+            {
+                "kind": "narrative",
+                "heading": "Second heading",
+                "paragraphs": [_paragraph("same body")],
+            },
+        ],
+        "timeline": [],
+        "source_notes": [],
+    }
+    entries = _paragraph_entries(content)
     paragraphs = [item for item in entries if item.kind == "paragraph"]
 
     first = resolve_workspace_target(
@@ -421,8 +523,53 @@ def test_duplicate_paragraphs_resolve_to_distinct_canonical_paths() -> None:
 
     assert first.block_id != second.block_id
     assert first.path == "synthesis/sections/0/paragraphs/0"
-    assert second.path == "synthesis/sections/0/paragraphs/1"
+    assert second.path == "synthesis/sections/1/paragraphs/0"
     assert first.before_hash == second.before_hash
+    assert first.target != second.target
+    first_canonical = resolve_target(
+        content, first.target, TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH
+    )
+    second_canonical = resolve_target(
+        content, second.target, TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH
+    )
+    assert (first_canonical.parent_index, first_canonical.indexes) == (0, (0,))
+    assert (second_canonical.parent_index, second_canonical.indexes) == (1, (0,))
+
+
+def test_identical_paragraphs_in_one_section_are_not_fabricated_as_targets() -> None:
+    # Identical content has no unique typed identity: the snapshot must not
+    # advertise a text edit the full-payload resolver will refuse, but the
+    # block-id anchored insertions stay available and projection does not crash.
+    content = _synthesis((_paragraph("same body"), _paragraph("same body")))
+    entries = _paragraph_entries(content)
+    paragraphs = [item for item in entries if item.kind == "paragraph"]
+
+    for entry in paragraphs:
+        with pytest.raises(EditorialIdentityAmbiguousError):
+            resolve_workspace_target(
+                entry=entry,
+                canonical_content=content,
+                operation="rewrite_paragraph",
+            )
+        assert allowed_operations(entry, content) == ()
+        assert "create_table" in allowed_operations(entry, content, allow_table_insertion=True)
+
+    blocks, _enrichments, _outline = project_blocks(
+        entries=entries,
+        synthesis=content,
+        enrichment=None,
+    )
+    projected = [block for block in blocks if block["kind"] == "paragraph"]
+    assert len(projected) == 2
+    assert all(block["allowed_operations"] == [] for block in projected)
+    assert all(
+        block["revision_target"]
+        == {
+            "block_id": block["block_id"],
+            "legacy_target_id": None,
+        }
+        for block in projected
+    )
 
 
 def test_enrichment_projection_preserves_pinned_legacy_placement() -> None:

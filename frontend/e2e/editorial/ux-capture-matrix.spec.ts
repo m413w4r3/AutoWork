@@ -236,7 +236,7 @@ function makeSnapshot(config: ScenarioConfig): EditorialWorkspaceSnapshot {
       allowed_operations: ["rename_section", "discuss"],
     }),
     block(leadId, "lead_paragraph", 2, "Chapeau synthétique de l’article.", {
-      allowed_operations: ["rewrite_lead"],
+      allowed_operations: ["rewrite_paragraph", "delete_paragraph"],
     }),
     block(paragraphId, "paragraph", 3, paragraphText, {
       evidence_refs: [
@@ -1986,6 +1986,38 @@ const STATES: MatrixState[] = [
 /* Matrix test                                                         */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Measure an element only once its box is identical on two consecutive
+ * animation frames. Webfonts and archived figure thumbnails can settle after
+ * the first paint, so measuring immediately after `toBeVisible()` made the
+ * F6-C overlap assertions flaky under load. The assertions themselves are
+ * unchanged; only the measurement waits for a stable layout.
+ */
+async function stableBoundingBox(
+  locator: Locator,
+): Promise<{ x: number; y: number; width: number; height: number } | null> {
+  const signature = (box: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  }) => `${box.x},${box.y},${box.width},${box.height}`;
+  await expect
+    .poll(
+      async () => {
+        const first = await locator.boundingBox();
+        if (first === null) return "missing";
+        await locator.page().waitForTimeout(50);
+        const second = await locator.boundingBox();
+        if (second === null) return "missing";
+        return signature(first) === signature(second) ? "stable" : "moving";
+      },
+      { timeout: 5_000 },
+    )
+    .toBe("stable");
+  return locator.boundingBox();
+}
+
 test("F6-A — matrice de captures UX desktop (19 états × 4 largeurs)", async ({
   page,
 }) => {
@@ -2141,8 +2173,8 @@ test("F6-C — la barre d’actions ne recouvre pas le bloc suivant", async ({
     await heading.click();
     const headingBar = heading.getByRole("toolbar");
     await expect(headingBar).toBeVisible();
-    const headingBarBox = await headingBar.boundingBox();
-    const leadBox = await lead.boundingBox();
+    const headingBarBox = await stableBoundingBox(headingBar);
+    const leadBox = await stableBoundingBox(lead);
     expect(headingBarBox, `barre absente @${width}`).not.toBeNull();
     expect(leadBox, `chapeau absent @${width}`).not.toBeNull();
     if (!headingBarBox || !leadBox) continue;
@@ -2162,9 +2194,9 @@ test("F6-C — la barre d’actions ne recouvre pas le bloc suivant", async ({
     await chart.click();
     const chartBar = chart.getByRole("toolbar");
     await expect(chartBar).toBeVisible();
-    const chartBarBox = await chartBar.boundingBox();
-    const chartBlockBox = await chart.boundingBox();
-    const figureBox = await page.locator(figureASelector).boundingBox();
+    const chartBarBox = await stableBoundingBox(chartBar);
+    const chartBlockBox = await stableBoundingBox(chart);
+    const figureBox = await stableBoundingBox(page.locator(figureASelector));
     expect(chartBarBox, `barre visuelle absente @${width}`).not.toBeNull();
     expect(chartBlockBox).not.toBeNull();
     expect(figureBox).not.toBeNull();
@@ -2178,14 +2210,12 @@ test("F6-C — la barre d’actions ne recouvre pas le bloc suivant", async ({
       `la barre visuelle recouvre la figure suivante @${width}`,
     ).toBeLessThanOrEqual(figureBox.y + 1);
     if (width === 1024) {
-      const firstButton = await chartBar
-        .locator(":scope > .button")
-        .first()
-        .boundingBox();
-      const lastButton = await chartBar
-        .locator(":scope > .button")
-        .last()
-        .boundingBox();
+      const firstButton = await stableBoundingBox(
+        chartBar.locator(":scope > .button").first(),
+      );
+      const lastButton = await stableBoundingBox(
+        chartBar.locator(":scope > .button").last(),
+      );
       expect(firstButton).not.toBeNull();
       expect(lastButton).not.toBeNull();
       if (firstButton && lastButton) {

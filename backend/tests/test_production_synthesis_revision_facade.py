@@ -139,7 +139,7 @@ def test_synthesis_target_resolution_uses_registry_occurrence(
 ) -> None:
     from cti_app.application.editorial_synthesis import targets
 
-    content = _synthesis((_paragraph("same paragraph"), _paragraph("same paragraph")))
+    content = _synthesis((_paragraph("first paragraph"), _paragraph("second paragraph")))
     entries = bootstrap_block_registry(
         artifact_id=uuid4(),
         canonical_sha256=canonical_content_sha256(content),
@@ -172,6 +172,12 @@ def test_synthesis_target_resolution_uses_registry_occurrence(
     assert first.block_id != second.block_id
     assert first.path == "synthesis/sections/0/paragraphs/0"
     assert second.path == "synthesis/sections/0/paragraphs/1"
-    assert first.before_hash == second.before_hash
+    assert first.before_hash != second.before_hash
     assert len(resolved_inputs) == 2
-    assert all(len(payload["sections"][0]["paragraphs"]) == 1 for payload in resolved_inputs)
+    # The target must be resolved against the full synthesis the prepare and
+    # adoption writers use, never against a payload reduced to the occurrence:
+    # a reduced section rewrote `parent_id` and made the persisted target
+    # unresolvable (M23 R2 defect D2).
+    assert all(len(payload["sections"][0]["paragraphs"]) == 2 for payload in resolved_inputs)
+    for payload, target in zip(resolved_inputs, (first.target, second.target), strict=True):
+        assert target.parent_id == canonical_content_sha256(payload["sections"][0])

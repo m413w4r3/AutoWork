@@ -193,14 +193,14 @@ describe("EditorialWorkspacePage manual editing", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("saves the lead paragraph with the canonical rewrite_lead operation", async () => {
+  it("saves the lead paragraph with the server-advertised rewrite_paragraph operation", async () => {
     const user = userEvent.setup();
     const leadSnapshot = createSnapshot("Synthetic lead paragraph.", 1, "none");
     leadSnapshot.blocks = [
       {
         ...leadSnapshot.blocks[0]!,
         kind: "lead_paragraph",
-        allowed_operations: ["rewrite_lead"],
+        allowed_operations: ["rewrite_paragraph", "delete_paragraph"],
       },
     ];
     const manualRequests: { url: string; body: Record<string, unknown> }[] = [];
@@ -277,7 +277,7 @@ describe("EditorialWorkspacePage manual editing", () => {
     await waitFor(() => expect(manualRequests).toHaveLength(1));
     expect(manualRequests[0]?.body).toEqual({
       snapshot_id: "ffffffff-ffff-4fff-8fff-ffffffffffff",
-      operation: "rewrite_lead",
+      operation: "rewrite_paragraph",
       text: "Synthetic edited lead paragraph.",
     });
   });

@@ -281,53 +281,64 @@ def read_pointer(content: Any, pointer: str) -> Any:
     return current
 
 
-def _copy_with_selected_occurrence(
-    content: Mapping[str, Any], entry: BlockRegistryEntry
-) -> dict[str, Any]:
-    copied = cast(dict[str, Any], json.loads(json.dumps(content)))
-    tokens = _pointer_tokens(entry.structural_pointer)
-    if entry.kind == "title":
-        return copied
-    if tokens[0] == "lead":
-        selected_index = int(tokens[1])
-        copied["lead"] = [copied["lead"][selected_index]]
-        return copied
-    if tokens[0] != "sections":
-        return copied
-    section_index = int(tokens[1])
-    selected_section = copied["sections"][section_index]
-    copied["sections"] = [selected_section]
-    if entry.kind == "paragraph":
-        paragraph_index = int(tokens[3])
-        selected_section["paragraphs"] = [selected_section["paragraphs"][paragraph_index]]
-    return copied
+def _entry_target_identity(
+    entry: BlockRegistryEntry,
+    canonical_content: Mapping[str, Any],
+) -> tuple[tuple[str, ...], str | None]:
+    """Return the exact target identity advertised by the full canonical payload.
+
+    Prepare, adoption and Bridge all resolve a typed target against the full
+    synthesis. Reducing the payload to the selected occurrence here would rewrite
+    a section's ``parent_id`` into the hash of a one-paragraph section, so a
+    paragraph target could never be resolved once persisted.
+    """
+    if entry.kind is EditorialBlockKind.TITLE:
+        return (), None
+    if entry.kind is EditorialBlockKind.LEAD_PARAGRAPH:
+        return (entry.content_sha256,), None
+    try:
+        tokens = _pointer_tokens(entry.structural_pointer)
+        section = read_pointer(canonical_content, f"/sections/{tokens[1]}")
+        if entry.kind is EditorialBlockKind.SECTION_HEADING:
+            return (canonical_content_sha256(section),), None
+        if entry.kind is EditorialBlockKind.PARAGRAPH:
+            return (entry.content_sha256,), canonical_content_sha256(section)
+    except (IndexError, KeyError, TypeError, ValueError) as exc:
+        raise EditorialIdentityAmbiguousError("editorial_identity_ambiguous") from exc
+    raise EditorialIdentityAmbiguousError("editorial_identity_ambiguous")
 
 
 def _target_for_entry(
     entry: BlockRegistryEntry,
     canonical_content: Mapping[str, Any],
 ) -> tuple[TargetedEditorialRevisionTarget, tuple[str, ...], str | None]:
-    reduced = _copy_with_selected_occurrence(canonical_content, entry)
-    catalog = build_targeted_revision_target_catalog(
-        ProductionArtifactStage.SYNTHESIS.value,
-        reduced,
-    )
-    matching: list[dict[str, Any]] = []
     expected_kind = {
         "title": TargetedEditorialRevisionTargetKind.TITLE.value,
         "lead_paragraph": TargetedEditorialRevisionTargetKind.LEAD_PARAGRAPH.value,
         "section_heading": TargetedEditorialRevisionTargetKind.SECTION.value,
         "paragraph": TargetedEditorialRevisionTargetKind.SECTION_PARAGRAPH.value,
     }.get(entry.kind)
+    if expected_kind is None:
+        raise EditorialIdentityAmbiguousError("editorial_identity_ambiguous")
+    expected_stable_ids, expected_parent_id = _entry_target_identity(entry, canonical_content)
+    catalog = build_targeted_revision_target_catalog(
+        ProductionArtifactStage.SYNTHESIS.value,
+        canonical_content,
+    )
+    matching: list[dict[str, Any]] = []
     for option in catalog:
         raw_target = option.get("target")
         if not isinstance(raw_target, Mapping) or raw_target.get("kind") != expected_kind:
             continue
         stable_ids = raw_target.get("stable_ids", [])
-        if entry.kind in {"title", "section_heading"} or (
-            isinstance(stable_ids, list) and entry.content_sha256 in stable_ids
-        ):
-            matching.append(option)
+        if not isinstance(stable_ids, list):
+            continue
+        if tuple(str(item) for item in stable_ids) != expected_stable_ids:
+            continue
+        parent_id = raw_target.get("parent_id")
+        if (str(parent_id) if parent_id is not None else None) != expected_parent_id:
+            continue
+        matching.append(option)
     if len(matching) != 1:
         raise EditorialIdentityAmbiguousError("editorial_identity_ambiguous")
     option = matching[0]
@@ -342,10 +353,7 @@ def _target_for_entry(
     operations = tuple(str(item) for item in option.get("operations", []))
     legacy_matches = [
         candidate
-        for candidate in build_targeted_revision_target_catalog(
-            ProductionArtifactStage.SYNTHESIS.value,
-            canonical_content,
-        )
+        for candidate in catalog
         if _is_legacy_catalog_target_for_entry(
             candidate.get("target"), entry, canonical_content, expected_kind
         )
@@ -450,7 +458,13 @@ def allowed_operations(
         return operations
     if entry.source_stage != "synthesis":
         return ()
-    _, operations, _legacy_target_id = _target_for_entry(entry, canonical_content)
+    try:
+        _, operations, _legacy_target_id = _target_for_entry(entry, canonical_content)
+    except EditorialIdentityAmbiguousError:
+        # Duplicate content has no unique typed target: advertise no text write
+        # instead of a control the resolver would refuse. Insertions stay
+        # available below because they anchor on the block id.
+        operations = ()
     if allow_table_insertion and entry.kind in {
         EditorialBlockKind.LEAD_PARAGRAPH,
         EditorialBlockKind.PARAGRAPH,
@@ -534,7 +548,6 @@ def resolve_workspace_target(
     try:
         typed_operation = TargetedEditorialRevisionOperation(operation)
         target, operations, legacy_target_id = _target_for_entry(entry, canonical_content)
-        reduced_content = _copy_with_selected_occurrence(canonical_content, entry)
     except (TypeError, ValueError) as exc:
         raise EditorialBlockMissingError("editorial_block_missing") from exc
     paragraph_enrichment_element_kind = typed_operation.paragraph_enrichment_element_kind
@@ -564,7 +577,7 @@ def resolve_workspace_target(
             canonical_content_sha256(table_target.to_json()),
         )
     try:
-        resolved = resolve_canonical_target(reduced_content, target, typed_operation)
+        resolved = resolve_canonical_target(canonical_content, target, typed_operation)
     except ValueError as exc:
         if "ambiguous" in str(exc):
             raise EditorialIdentityAmbiguousError("editorial_identity_ambiguous") from exc
@@ -866,11 +879,16 @@ def project_blocks(
                 legacy_target_id = None
         before_hash = entry.content_sha256
         if operations and entry.source_stage is EditorialSourceStage.SYNTHESIS:
-            before_hash = resolve_workspace_target(
-                entry=entry,
-                canonical_content=synthesis,
-                operation=operations[0],
-            ).before_hash
+            try:
+                before_hash = resolve_workspace_target(
+                    entry=entry,
+                    canonical_content=synthesis,
+                    operation=operations[0],
+                ).before_hash
+            except EditorialIdentityAmbiguousError:
+                # Duplicate content elsewhere in the occurrence makes the target
+                # ambiguous on the full payload: do not advertise a dead control.
+                operations = ()
         block: dict[str, object] = {
             "block_id": str(entry.block_id),
             "kind": entry.kind,

@@ -8,6 +8,7 @@ resolver and the block predicates before the API-level wiring tests.
 from __future__ import annotations
 
 from dataclasses import replace
+from uuid import uuid4
 
 import pytest
 
@@ -19,6 +20,8 @@ from cti_app.application.editorial_workspace.capabilities import (
     manual_edit_anchor_ready,
     resolve_editorial_capabilities,
 )
+from cti_app.application.editorial_workspace.registry import project_blocks
+from cti_app.domain.editorial_workspace import bootstrap_block_registry
 
 
 def _wired_facts() -> EditorialCapabilityFacts:
@@ -125,6 +128,76 @@ def test_manual_edit_anchor_requires_an_actionable_editable_block() -> None:
     assert manual_edit_anchor_ready(no_text) is False
     assert manual_edit_anchor_ready(no_before_hash) is False
     assert manual_edit_anchor_ready(stale_revision) is False
+
+
+def test_manual_edit_anchor_reads_the_server_advertisement_not_the_block_kind() -> None:
+    # The real lead paragraph is a `lead_paragraph` block whose advertised write
+    # is the paragraph-level rewrite; the whole-chapeau `rewrite_lead` has no
+    # block occurrence. The capability must follow the advertisement.
+    real_lead = _block("lead_paragraph", ["rewrite_paragraph", "delete_paragraph"])
+    assert manual_edit_anchor_ready([real_lead]) is True
+    # Kind alone (or an unrelated kind) never makes the action available.
+    assert manual_edit_anchor_ready([_block("lead_paragraph", ["insert_paragraph"])]) is False
+    assert (
+        manual_edit_anchor_ready([_block("synthetic_textual_kind", ["rewrite_paragraph"])]) is True
+    )
+
+
+def test_the_snapshot_advertises_the_manual_operation_the_ui_derives() -> None:
+    # Backend half of the drift guard: the frontend vitest pins the same
+    # per-kind operation lists (manualEditOperation.test.ts). A change to the
+    # targeted revision catalog must update both sides.
+    content: dict[str, object] = {
+        "schema_version": "2",
+        "title": "Synthetic title",
+        "lead": [{"text": "Synthetic lead", "evidence_refs": []}],
+        "sections": [
+            {
+                "kind": "narrative",
+                "heading": "Synthetic heading",
+                "paragraphs": [
+                    {"text": "Synthetic one", "evidence_refs": []},
+                    {"text": "Synthetic two", "evidence_refs": []},
+                ],
+            }
+        ],
+        "timeline": [],
+        "source_notes": [],
+    }
+    entries = bootstrap_block_registry(
+        artifact_id=uuid4(),
+        canonical_sha256="9" * 64,
+        source_stage="synthesis",
+        canonical_content=content,
+    )
+    blocks, _enrichments, _outline = project_blocks(
+        entries=entries,
+        synthesis=content,
+        enrichment=None,
+    )
+    operations_by_kind: dict[str, list[str]] = {}
+    for block in blocks:
+        kind = str(block["kind"])
+        operations = block["allowed_operations"]
+        assert isinstance(operations, list)
+        operations_by_kind.setdefault(kind, operations)  # documents the first occurrence
+        if kind == "paragraph":
+            assert operations == ["rewrite_paragraph", "delete_paragraph"]
+
+    assert operations_by_kind["title"] == ["rewrite_title"]
+    assert operations_by_kind["lead_paragraph"] == [
+        "rewrite_paragraph",
+        "delete_paragraph",
+    ]
+    assert operations_by_kind["section_heading"] == [
+        "rewrite_section",
+        "delete_section",
+        "split_section",
+        "rename_section",
+        "insert_paragraph",
+    ]
+    assert all("rewrite_lead" not in operations for operations in operations_by_kind.values())
+    assert manual_edit_anchor_ready(blocks) is True
 
 
 def test_insertion_anchor_requires_a_real_create_operation() -> None:

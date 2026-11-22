@@ -468,14 +468,16 @@ test("E01 edit and save canonically without a Bridge call and mark the PDF stale
   expect(capture.unexpected).toEqual([]);
 });
 
-test("E01b the lead paragraph saves through rewrite_lead", async ({ page }) => {
+test("E01b the lead paragraph saves through the advertised rewrite_paragraph", async ({
+  page,
+}) => {
   let snapshot = makeSnapshot({
     blocks: [
       makeBlock({
         blockId: firstBlockId,
         kind: "lead_paragraph",
         text: "Synthetic lead before editing.",
-        allowedOperations: ["rewrite_lead"],
+        allowedOperations: ["rewrite_paragraph", "delete_paragraph"],
       }),
     ],
   });
@@ -488,7 +490,7 @@ test("E01b the lead paragraph saves through rewrite_lead", async ({ page }) => {
             blockId: firstBlockId,
             kind: "lead_paragraph",
             text: String(body.text),
-            allowedOperations: ["rewrite_lead"],
+            allowedOperations: ["rewrite_paragraph", "delete_paragraph"],
             beforeHash: nextSha,
           }),
         ],
@@ -520,7 +522,7 @@ test("E01b the lead paragraph saves through rewrite_lead", async ({ page }) => {
     "Synthetic lead after editing.",
   );
   expect(capture.manualEditBodies[0]).toMatchObject({
-    operation: "rewrite_lead",
+    operation: "rewrite_paragraph",
     text: "Synthetic lead after editing.",
   });
   expect(capture.unexpected).toEqual([]);

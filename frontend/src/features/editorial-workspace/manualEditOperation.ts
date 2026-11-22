@@ -1,38 +1,38 @@
 import type { EditorialWorkspaceBlock } from "../../api/editorialWorkspace";
 
+const MANUAL_TEXT_OPERATIONS = [
+  "rewrite_title",
+  "rewrite_lead",
+  "rewrite_paragraph",
+] as const;
+
 export type EditorialManualTextOperation =
-  "rewrite_title" | "rewrite_lead" | "rewrite_paragraph";
+  (typeof MANUAL_TEXT_OPERATIONS)[number];
 
 type ManualEditBlock = Pick<
   EditorialWorkspaceBlock,
-  "kind" | "text" | "allowed_operations"
+  "text" | "allowed_operations"
 >;
+
+function isManualTextOperation(
+  value: string,
+): value is EditorialManualTextOperation {
+  return (MANUAL_TEXT_OPERATIONS as readonly string[]).includes(value);
+}
 
 /**
  * The single authority mapping a snapshot block to the canonical manual-edit
- * operation. Keep it in one place: the save path and every enable/disable
- * decision must agree, otherwise a control can be shown but the save fails.
+ * operation. The server advertises the accepted operation per block in
+ * `allowed_operations`; never guess it from the kind (a lead paragraph is a
+ * `rewrite_paragraph` target, not the whole-chapeau `rewrite_lead`). Keep this
+ * in one place: the save path and every enable/disable decision must agree,
+ * otherwise a control is shown but the save fails.
  */
 export function manualEditOperationFor(
   block: ManualEditBlock,
 ): EditorialManualTextOperation | null {
   if (block.text === null) return null;
-  switch (block.kind) {
-    case "title":
-      return block.allowed_operations.includes("rewrite_title")
-        ? "rewrite_title"
-        : null;
-    case "lead_paragraph":
-      return block.allowed_operations.includes("rewrite_lead")
-        ? "rewrite_lead"
-        : null;
-    case "paragraph":
-      return block.allowed_operations.includes("rewrite_paragraph")
-        ? "rewrite_paragraph"
-        : null;
-    default:
-      return null;
-  }
+  return block.allowed_operations.find(isManualTextOperation) ?? null;
 }
 
 export function manualEditUnavailableReason({

@@ -22,11 +22,13 @@ INSERTION_OPERATIONS: frozenset[str] = frozenset(
     }
 )
 
-_MANUAL_EDIT_OPERATION_BY_KIND: Mapping[str, str] = {
-    "title": "rewrite_title",
-    "lead_paragraph": "rewrite_lead",
-    "paragraph": "rewrite_paragraph",
-}
+# The server advertises the manual text operation per block in
+# ``allowed_operations``; the frontend derives its save action from the same
+# list. Never guess the operation from the block kind: a lead paragraph is
+# rewritten through ``rewrite_paragraph``, not the whole-chapeau ``rewrite_lead``.
+MANUAL_TEXT_OPERATIONS: frozenset[str] = frozenset(
+    {"rewrite_title", "rewrite_lead", "rewrite_paragraph"}
+)
 
 _INSERTION_ANCHOR_KINDS = frozenset({"paragraph", "lead_paragraph"})
 
@@ -86,16 +88,13 @@ def _allowed_operations(block: Mapping[str, object]) -> Sequence[str]:
 
 
 def manual_edit_anchor_ready(blocks: Sequence[Mapping[str, object]]) -> bool:
-    """Return whether one block exposes a manual text operation the route accepts."""
+    """Return whether one block advertises a manual text operation the route accepts."""
     for block in blocks:
-        kind = block.get("kind")
-        operation = _MANUAL_EDIT_OPERATION_BY_KIND.get(kind) if isinstance(kind, str) else None
         if (
-            operation is not None
-            and isinstance(block.get("text"), str)
+            isinstance(block.get("text"), str)
             and block.get("before_hash") is not None
             and block.get("revision_status") == "ready"
-            and operation in _allowed_operations(block)
+            and MANUAL_TEXT_OPERATIONS.intersection(_allowed_operations(block))
         ):
             return True
     return False

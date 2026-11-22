@@ -86,7 +86,8 @@ const snapshot: EditorialWorkspaceSnapshot = {
       "rename_section",
     ]),
     block(leadId, "lead_paragraph", "Chapeau synthétique de l’article.", 2, [
-      "rewrite_lead",
+      "rewrite_paragraph",
+      "delete_paragraph",
     ]),
     block(
       paragraphId,

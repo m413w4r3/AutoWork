@@ -272,86 +272,11 @@ test("real-backend smoke: the seeded PostgreSQL workspace renders in the browser
   expectNoModelOrBridgeCall(capture);
 });
 
-test("E01 inline edit of a paragraph is saved canonically and survives a reload", async ({
-  page,
-}) => {
-  const capture = captureNetwork(page);
-  const state = await browserState(page);
-  const paragraph = state.paragraphs[2];
-  const revised = `${paragraph.text} Synthetic report revision.`;
-  await openEditor(page, state.subject_id);
-
-  const block = paragraphBlockByText(page, paragraph.text);
-  await block.click();
-  await expect(block).toHaveAttribute("data-selected", "true");
-  const toolbar = page.getByRole("toolbar", { name: /Actions du bloc/ });
-  await toolbar.getByRole("button", { name: "Modifier" }).click();
-  const editor = page.getByRole("textbox", { name: "Texte du bloc" });
-  await expect(editor).toBeFocused();
-  await editor.fill(revised);
-  await page.getByRole("button", { name: "Enregistrer", exact: true }).click();
-
-  await expectOperationResponses(
-    capture,
-    /\/editor\/blocks\/[^/]+\/manual-edit$/,
-  );
-  await expect(page.getByText(/Enregistré · v\d+/)).toBeVisible();
-  await expectPdfStale(page);
-  await page.reload();
-  await expect(page.locator(".editorial-document")).toBeVisible();
-  await expect(
-    page
-      .locator(".editorial-document__block")
-      .filter({ hasText: revised })
-      .first(),
-  ).toBeVisible();
-
-  expectNoModelOrBridgeCall(capture);
-  const snapshot = await getSnapshot(page, state.subject_id);
-  const persisted = snapshot.blocks.find(
-    (candidate) => candidate.block_id === paragraph.block_id,
-  );
-  expect(persisted?.text).toBe(revised);
-  const pdf = await page.request.get(
-    `/api/subjects/${encodeURIComponent(state.subject_id)}/editor/pdf`,
-  );
-  expect(pdf.status()).toBe(200);
-  expect(((await pdf.json()) as { status: string }).status).toBe("STALE");
-});
-
-test("E01b the lead paragraph can be edited from the document action bar", async ({
-  page,
-}) => {
-  const capture = captureNetwork(page);
-  const state = await browserState(page);
-  const lead = state.paragraphs[0];
-  const revised = `${lead.text} Synthetic report revision.`;
-  await openEditor(page, state.subject_id);
-
-  const block = page
-    .locator('.editorial-document__block[data-kind="lead_paragraph"]')
-    .filter({ hasText: lead.text })
-    .first();
-  await block.click();
-  const toolbar = page.getByRole("toolbar", { name: /Actions du bloc/ });
-  await toolbar.getByRole("button", { name: "Modifier" }).click();
-  const editor = page.getByRole("textbox", { name: "Texte du bloc" });
-  await editor.fill(revised);
-  await page.getByRole("button", { name: "Enregistrer", exact: true }).click();
-
-  await expectOperationResponses(
-    capture,
-    /\/editor\/blocks\/[^/]+\/manual-edit$/,
-  );
-  await expect(page.getByText(/Enregistré · v\d+/)).toBeVisible();
-  expectNoModelOrBridgeCall(capture);
-  const snapshot = await getSnapshot(page, state.subject_id);
-  expect(
-    snapshot.blocks.find((candidate) => candidate.block_id === lead.block_id)
-      ?.text,
-  ).toBe(revised);
-});
-
+// Ordering contract: this suite shares ONE seeded workspace. A canonical
+// synthesis rewrite (E01/E01b) changes the evidence-pack hash the visual
+// revision loader fences against the base enrichment artifact, so the visual
+// element revisions (E10-E13) must run first. The seed is rebuilt per suite,
+// not per test.
 test("E10 moving a figure after another paragraph persists and marks the PDF stale", async ({
   page,
 }) => {
@@ -591,4 +516,84 @@ test("E13 removing a figure asks for confirmation and keeps its archive entry", 
     available.map((item) => item.original_name),
     "the removed figure archive entry must stay listed",
   ).toContain(target.original_name);
+});
+
+test("E01 inline edit of a paragraph is saved canonically and survives a reload", async ({
+  page,
+}) => {
+  const capture = captureNetwork(page);
+  const state = await browserState(page);
+  const paragraph = state.paragraphs[2];
+  const revised = `${paragraph.text} Synthetic report revision.`;
+  await openEditor(page, state.subject_id);
+
+  const block = paragraphBlockByText(page, paragraph.text);
+  await block.click();
+  await expect(block).toHaveAttribute("data-selected", "true");
+  const toolbar = page.getByRole("toolbar", { name: /Actions du bloc/ });
+  await toolbar.getByRole("button", { name: "Modifier" }).click();
+  const editor = page.getByRole("textbox", { name: "Texte du bloc" });
+  await expect(editor).toBeFocused();
+  await editor.fill(revised);
+  await page.getByRole("button", { name: "Enregistrer", exact: true }).click();
+
+  await expectOperationResponses(
+    capture,
+    /\/editor\/blocks\/[^/]+\/manual-edit$/,
+  );
+  await expect(page.getByText(/Enregistré · v\d+/)).toBeVisible();
+  await expectPdfStale(page);
+  await page.reload();
+  await expect(page.locator(".editorial-document")).toBeVisible();
+  await expect(
+    page
+      .locator(".editorial-document__block")
+      .filter({ hasText: revised })
+      .first(),
+  ).toBeVisible();
+
+  expectNoModelOrBridgeCall(capture);
+  const snapshot = await getSnapshot(page, state.subject_id);
+  const persisted = snapshot.blocks.find(
+    (candidate) => candidate.block_id === paragraph.block_id,
+  );
+  expect(persisted?.text).toBe(revised);
+  const pdf = await page.request.get(
+    `/api/subjects/${encodeURIComponent(state.subject_id)}/editor/pdf`,
+  );
+  expect(pdf.status()).toBe(200);
+  expect(((await pdf.json()) as { status: string }).status).toBe("STALE");
+});
+
+test("E01b the lead paragraph can be edited from the document action bar", async ({
+  page,
+}) => {
+  const capture = captureNetwork(page);
+  const state = await browserState(page);
+  const lead = state.paragraphs[0];
+  const revised = `${lead.text} Synthetic report revision.`;
+  await openEditor(page, state.subject_id);
+
+  const block = page
+    .locator('.editorial-document__block[data-kind="lead_paragraph"]')
+    .filter({ hasText: lead.text })
+    .first();
+  await block.click();
+  const toolbar = page.getByRole("toolbar", { name: /Actions du bloc/ });
+  await toolbar.getByRole("button", { name: "Modifier" }).click();
+  const editor = page.getByRole("textbox", { name: "Texte du bloc" });
+  await editor.fill(revised);
+  await page.getByRole("button", { name: "Enregistrer", exact: true }).click();
+
+  await expectOperationResponses(
+    capture,
+    /\/editor\/blocks\/[^/]+\/manual-edit$/,
+  );
+  await expect(page.getByText(/Enregistré · v\d+/)).toBeVisible();
+  expectNoModelOrBridgeCall(capture);
+  const snapshot = await getSnapshot(page, state.subject_id);
+  expect(
+    snapshot.blocks.find((candidate) => candidate.block_id === lead.block_id)
+      ?.text,
+  ).toBe(revised);
 });
