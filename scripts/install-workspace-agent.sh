@@ -15,8 +15,8 @@
 
 set -euo pipefail
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-repository_root=$(CDPATH= cd -- "$script_dir/.." && pwd -P)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+repository_root=$(CDPATH='' cd -- "$script_dir/.." && pwd -P)
 unit_template="$repository_root/infra/systemd/autowork-workspace-agent.service"
 unit_name="autowork-workspace-agent.service"
 group_name="autowork-workspace"
