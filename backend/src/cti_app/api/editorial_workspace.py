@@ -551,7 +551,10 @@ class EditorialWorkspaceBarChart(BaseModel):
     value_axis_label: str
     unit: str
     points: list[EditorialWorkspaceBarChartPoint]
-    anchor_block_id: UUID
+    # Only ``after_paragraph`` placements carry an anchor; legacy enrichments
+    # (and the model-driven stage) may place a chart after the lead, a section,
+    # the timeline or at the end, where the snapshot projects ``None``.
+    anchor_block_id: UUID | None
 
 
 class EditorialWorkspaceFigure(BaseModel):
