@@ -234,7 +234,10 @@ async def test_local_typst_fixture_is_parsed_and_rasterizes_reproducibly(tmp_pat
     assert inspection.page_count == 2
     assert inspection.encrypted is False
     assert inspection.page_width_points == pytest.approx(595.276)
-    assert any("Suspects object is wrong type" in warning for warning in inspection.parser_warnings)
+    # Poppler <= 24 reports a benign MarkInfo /Suspects type diagnostic for this
+    # valid Typst fixture; Poppler 26 parses it silently. Any other parser
+    # warning would mean the fixture or the inspection plumbing regressed.
+    assert all("Suspects object is wrong type" in warning for warning in inspection.parser_warnings)
     assert inspection.page_word_counts[0] > 0
     assert inspection.page_word_counts[1] == 0
     assert PopplerSubprocess._non_embedded_fonts(

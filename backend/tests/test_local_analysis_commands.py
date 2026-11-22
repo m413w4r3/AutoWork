@@ -206,6 +206,55 @@ def test_bwrap_probe_measures_network_and_filesystem_restrictions(
     assert options["pass_fds"] == (int(command[command.index("--seccomp") + 1]),)
 
 
+def test_bwrap_probe_binds_an_interpreter_outside_the_sandbox_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # CI runs the backend from a uv-managed Python under ~/.local/share/uv,
+    # outside the /usr, /lib and /lib64 roots bubblewrap exposes. The probe
+    # must bind that interpreter read-only or bwrap fails with execvp ENOENT
+    # before it can measure anything.
+    prefix = tmp_path / "uv-managed-python"
+    interpreter = prefix / "bin" / "python3.12"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text("", encoding="utf-8")
+    interpreter.chmod(0o755)
+    filter_path = tmp_path / "filter"
+    filter_path.write_bytes(b"synthetic filter handle")
+    calls: list[list[str]] = []
+
+    def run(command: list[str], **_kwargs: object) -> object:
+        calls.append(command)
+        return type("Completed", (), {"returncode": 0})()
+
+    monkeypatch.setattr(
+        local_runner_module,
+        "_network_seccomp_filter_file",
+        lambda: filter_path.open("rb"),
+    )
+    monkeypatch.setattr(local_runner_module.subprocess, "run", run)
+    monkeypatch.setattr(sys, "_base_executable", str(interpreter))
+    monkeypatch.setattr(sys, "base_prefix", str(prefix))
+
+    reason = local_runner_module._probe_bwrap_namespace(
+        "/test/bwrap", {"PATH": "/usr/bin:/bin"}, 0.5
+    )
+
+    assert reason is None
+    assert len(calls) == 1
+    command = calls[0]
+    delimiter = command.index("--")
+    assert command[delimiter + 1] == str(interpreter)
+    bind_pairs = [
+        (command[index + 1], command[index + 2])
+        for index, item in enumerate(command[:-2])
+        if item == "--ro-bind"
+    ]
+    resolved_prefix = str(prefix.resolve())
+    assert (resolved_prefix, resolved_prefix) in bind_pairs
+    # Interpreters already exposed through /usr need no extra bind.
+    assert local_runner_module._probe_interpreter_binds("/usr/bin/python3.12") == ()
+
+
 def test_bwrap_probe_reports_kernel_user_namespace_refusal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -380,6 +429,7 @@ async def test_catalogued_commands_read_synthetic_elf_with_bounded_output() -> N
             }, (
                 command_id,
                 repr(result.archive_record()),
+                runner.namespace_reasons,
             )
             assert len(result.output.encode()) <= capability.spec.max_output_bytes
             assert result.duration_seconds <= capability.spec.timeout_seconds + 1
