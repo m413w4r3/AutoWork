@@ -1,0 +1,170 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import {
+  agentSessionsKeys,
+  enqueueAgentInstruction,
+  getAgentSession,
+  interruptAgentSession,
+  listAgentSessions,
+  openAgentSession,
+  resumeAgentSession,
+} from "./agentSessions";
+import {
+  bodyOf,
+  errorResponse,
+  headersOf,
+  installFetch,
+  jsonResponse,
+  lastRequest,
+} from "./testSupport";
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+describe("agent session reads", () => {
+  it("lists sessions with the optional task filter and reads one", async () => {
+    const recorder = installFetch(() => jsonResponse({}));
+
+    await listAgentSessions("inv-1");
+    expect(lastRequest(recorder).url).toBe(
+      "/api/investigations/inv-1/agent-sessions",
+    );
+    expect(lastRequest(recorder).init?.method).toBe("GET");
+
+    await listAgentSessions("inv-1", "task-1");
+    expect(lastRequest(recorder).url).toBe(
+      "/api/investigations/inv-1/agent-sessions?task_id=task-1",
+    );
+
+    await getAgentSession("inv-1", "session-2");
+    expect(lastRequest(recorder).url).toBe(
+      "/api/investigations/inv-1/agent-sessions/session-2",
+    );
+  });
+});
+
+describe("agent session human actions", () => {
+  it("opens a session with Idempotency-Key", async () => {
+    const recorder = installFetch(() => jsonResponse({ session: {} }));
+
+    await openAgentSession(
+      "inv-1",
+      {
+        task_id: "task-1",
+        adapter_kind: "claude_code",
+        handoff_id: "handoff-3",
+        executable: "/usr/local/bin/claude",
+        model: "claude-sonnet-5-5",
+      },
+      "idem-session-open-1",
+    );
+
+    const request = lastRequest(recorder);
+    expect(request.url).toBe("/api/investigations/inv-1/agent-sessions");
+    expect(request.init?.method).toBe("POST");
+    expect(headersOf(request.init)["Idempotency-Key"]).toBe(
+      "idem-session-open-1",
+    );
+    expect(bodyOf(request.init)).toEqual({
+      task_id: "task-1",
+      adapter_kind: "claude_code",
+      handoff_id: "handoff-3",
+      executable: "/usr/local/bin/claude",
+      model: "claude-sonnet-5-5",
+    });
+  });
+
+  it("enqueues a human instruction with note references", async () => {
+    const recorder = installFetch(() => jsonResponse({ queue_position: 1 }));
+
+    await enqueueAgentInstruction(
+      "inv-1",
+      "session-2",
+      { text: "Vérifie les IOC", note_refs: ["notes/humaines/x.md"] },
+      "idem-instruction-1",
+    );
+
+    const request = lastRequest(recorder);
+    expect(request.url).toBe(
+      "/api/investigations/inv-1/agent-sessions/session-2/instructions",
+    );
+    expect(headersOf(request.init)["Idempotency-Key"]).toBe(
+      "idem-instruction-1",
+    );
+    expect(bodyOf(request.init)).toEqual({
+      action: "enqueue",
+      text: "Vérifie les IOC",
+      note_refs: ["notes/humaines/x.md"],
+    });
+  });
+
+  it("interrupts with a reason and resumes without a body", async () => {
+    const recorder = installFetch(() => jsonResponse({}));
+
+    await interruptAgentSession("inv-1", "session-2", "Changement de plan");
+    expect(lastRequest(recorder).url).toBe(
+      "/api/investigations/inv-1/agent-sessions/session-2/interrupt",
+    );
+    expect(bodyOf(lastRequest(recorder).init)).toEqual({
+      reason: "Changement de plan",
+    });
+    expect(headersOf(lastRequest(recorder).init)).toEqual({
+      "Content-Type": "application/json",
+    });
+
+    await resumeAgentSession("inv-1", "session-2");
+    expect(lastRequest(recorder).url).toBe(
+      "/api/investigations/inv-1/agent-sessions/session-2/resume",
+    );
+    expect(lastRequest(recorder).init?.body).toBeUndefined();
+    expect(headersOf(lastRequest(recorder).init)).toEqual({});
+  });
+
+  it("parses the typed active-session conflict", async () => {
+    installFetch(() => errorResponse(409, "active_session_exists"));
+
+    await expect(
+      openAgentSession(
+        "inv-1",
+        {
+          task_id: "task-1",
+          adapter_kind: "codex_cli",
+          handoff_id: "handoff-3",
+          executable: "/usr/local/bin/codex",
+        },
+        "idem-session-open-2",
+      ),
+    ).rejects.toMatchObject({ status: 409, code: "active_session_exists" });
+  });
+});
+
+describe("agent session query keys", () => {
+  it("keeps stable keys with and without a task filter", () => {
+    expect(agentSessionsKeys.all("inv-1")).toEqual([
+      "investigation",
+      "inv-1",
+      "agent-sessions",
+    ]);
+    expect(agentSessionsKeys.list("inv-1")).toEqual([
+      "investigation",
+      "inv-1",
+      "agent-sessions",
+      "list",
+      "",
+    ]);
+    expect(agentSessionsKeys.list("inv-1", "task-1")).toEqual([
+      "investigation",
+      "inv-1",
+      "agent-sessions",
+      "list",
+      "task-1",
+    ]);
+    expect(agentSessionsKeys.detail("inv-1", "session-2")).toEqual([
+      "investigation",
+      "inv-1",
+      "agent-sessions",
+      "session-2",
+    ]);
+  });
+});
