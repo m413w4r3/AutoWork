@@ -21,6 +21,10 @@ from cti_app.domain.production_editorial_enrichment import (
     EditorialEnrichmentV1,
     EnrichmentElementRef,
     EnrichmentPlacementV1,
+    chart_spec_from_json,
+    chart_spec_to_json,
+    diagram_spec_from_json,
+    diagram_spec_to_json,
     enrichment_element_order,
     enrichment_order_rank,
 )
@@ -94,6 +98,10 @@ class ReviseDiagramPatch:
             raise ValueError("Diagram revision requires a DiagramSpecV1")
         if self.diagram.key != self.element_key:
             raise ValueError("Diagram revision target key mismatch")
+        if self.diagram.profile is not None and self.diagram.purpose is None:
+            # Every canonical profiled diagram also carries its analytic
+            # purpose; refusing here keeps the persisted patch codec total.
+            raise ValueError("Diagram revision profile requires an analytic purpose")
 
     @property
     def operation(self) -> TargetedEditorialRevisionOperation:
@@ -227,10 +235,13 @@ VISUAL_REVISION_OPERATIONS: frozenset[TargetedEditorialRevisionOperation] = froz
     }
 )
 
-# Operations whose apply logic is implemented; chart/diagram revision still
-# rejects explicitly until F2-03b replaces its placeholder branch.
+# Every declared variant has an implemented planner after F2-03b and F2-03c.
+# A variant added by a later slice is listed here only once its apply logic
+# lands, so the placeholder refusal below can never be reached silently.
 IMPLEMENTED_VISUAL_REVISION_OPERATIONS: frozenset[TargetedEditorialRevisionOperation] = frozenset(
     {
+        TargetedEditorialRevisionOperation.REWRITE_CHART,
+        TargetedEditorialRevisionOperation.REWRITE_DIAGRAM,
         TargetedEditorialRevisionOperation.UPDATE_VISUAL_CAPTION,
         TargetedEditorialRevisionOperation.MOVE_ENRICHMENT_ELEMENT,
         TargetedEditorialRevisionOperation.REORDER_ENRICHMENT_ELEMENTS,
@@ -241,6 +252,28 @@ IMPLEMENTED_VISUAL_REVISION_OPERATIONS: frozenset[TargetedEditorialRevisionOpera
         TargetedEditorialRevisionOperation.DELETE_SOURCE_FIGURE,
     }
 )
+
+
+def visual_patch_element_kind(
+    patch: VisualRevisionPatch,
+) -> EditorialEnrichmentElementKind:
+    """The enrichment family one typed patch targets (chart/diagram or declared)."""
+    if isinstance(patch, ReviseChartPatch):
+        return EditorialEnrichmentElementKind.CHART
+    if isinstance(patch, ReviseDiagramPatch):
+        return EditorialEnrichmentElementKind.DIAGRAM
+    if isinstance(
+        patch,
+        (
+            UpdateVisualCaptionPatch,
+            MoveEnrichmentElementPatch,
+            RemoveEnrichmentElementPatch,
+        ),
+    ):
+        return patch.element_kind
+    if isinstance(patch, ReplaceSourceFigurePatch):
+        return EditorialEnrichmentElementKind.FIGURE
+    raise ValueError("Visual revision patch has no element kind")
 
 
 def enrichment_order_group_hash(
@@ -276,7 +309,12 @@ def enrichment_order_group_hash(
 
 
 def visual_patch_to_json(patch: VisualRevisionPatch) -> dict[str, Any]:
-    """Return the persisted, non-canonical wire form of one typed patch."""
+    """Return the persisted, non-canonical wire form of one typed patch.
+
+    ``compiled_asset_id`` is deliberately omitted: a revised chart or diagram
+    is recompiled at prepare and again at adoption, so a copied asset identity
+    can never be mistaken for the revision's output.
+    """
     if isinstance(patch, UpdateVisualCaptionPatch):
         return {
             "kind": "update_visual_caption",
@@ -296,6 +334,18 @@ def visual_patch_to_json(patch: VisualRevisionPatch) -> dict[str, Any]:
             "kind": "reorder_enrichment_elements",
             "anchor_block_id": str(patch.anchor_block_id),
             "order": [{"kind": item.kind.value, "key": item.key} for item in patch.order],
+        }
+    if isinstance(patch, ReviseChartPatch):
+        chart = chart_spec_to_json(patch.chart)
+        chart.pop("compiled_asset_id", None)
+        return {"kind": "revise_chart", "element_key": patch.element_key, "chart": chart}
+    if isinstance(patch, ReviseDiagramPatch):
+        diagram = diagram_spec_to_json(patch.diagram)
+        diagram.pop("compiled_asset_id", None)
+        return {
+            "kind": "revise_diagram",
+            "element_key": patch.element_key,
+            "diagram": diagram,
         }
     if isinstance(patch, ReplaceSourceFigurePatch):
         return {
@@ -318,8 +368,8 @@ def visual_patch_to_json(patch: VisualRevisionPatch) -> dict[str, Any]:
 def visual_patch_from_json(raw: Any) -> VisualRevisionPatch:
     """Reparse one persisted patch blob into the same closed union.
 
-    Chart, diagram, figure-replacement and removal variants reject explicitly;
-    the later slices fill their codecs in without widening this module's shape.
+    Every declared variant round-trips; an unknown wire kind rejects
+    explicitly instead of being silently ignored.
     """
     if not isinstance(raw, dict):
         raise EditorialEnrichmentPatchError("Visual revision patch must be an object")
@@ -350,6 +400,16 @@ def visual_patch_from_json(raw: Any) -> VisualRevisionPatch:
                     )
                     for item in raw_order
                 ),
+            )
+        if kind == "revise_chart":
+            return ReviseChartPatch(
+                element_key=str(raw["element_key"]),
+                chart=chart_spec_from_json(raw["chart"]),
+            )
+        if kind == "revise_diagram":
+            return ReviseDiagramPatch(
+                element_key=str(raw["element_key"]),
+                diagram=diagram_spec_from_json(raw["diagram"]),
             )
         if kind == "replace_source_figure":
             return ReplaceSourceFigurePatch(

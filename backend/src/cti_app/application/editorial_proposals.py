@@ -60,6 +60,7 @@ from cti_app.application.editorial_visual_revision import (
     VisualRevisionContextLoader,
     VisualRevisionRejected,
     plan_visual_revision,
+    replace_element,
 )
 from cti_app.application.editorial_workspace.registry import (
     WorkspaceOccurrenceResolution,
@@ -77,6 +78,7 @@ from cti_app.application.production_editorial_enrichment import (
     EditorialEnrichmentProposalV1,
     EditorialEnrichmentStageErrorCode,
     TableProposalV1,
+    bar_chart_record_documents_value_and_unit,
     validate_editorial_enrichment,
 )
 from cti_app.application.production_synthesis import (
@@ -90,11 +92,9 @@ from cti_app.domain.editorial_enrichment_patch import (
     IMPLEMENTED_VISUAL_REVISION_OPERATIONS,
     VISUAL_REVISION_PATCH_SCHEMA_VERSION,
     MoveEnrichmentElementPatch,
-    RemoveEnrichmentElementPatch,
     ReorderEnrichmentElementsPatch,
-    ReplaceSourceFigurePatch,
-    UpdateVisualCaptionPatch,
     VisualRevisionPatch,
+    visual_patch_element_kind,
     visual_patch_to_json,
 )
 from cti_app.domain.editorial_figure_keys import adopted_source_figure_key
@@ -132,14 +132,16 @@ from cti_app.domain.production_editorial_enrichment import (
     MAX_BAR_CHART_SIGNIFICANT_DIGITS,
     ChartKind,
     ChartSpecV1,
+    DiagramSpecV1,
     EditorialEnrichmentElementKind,
+    EditorialEnrichmentV1,
+    EnrichmentElementRef,
     EnrichmentPlacementKind,
     EnrichmentPlacementV1,
     SourceFigureCandidateV1,
     SourceFigureDecision,
     SourceFigureInclusionStatus,
     TableSpecV1,
-    bar_chart_evidence_contains_unit,
     editorial_enrichment_from_json,
     editorial_enrichment_to_json,
     normalize_analytic_question,
@@ -166,7 +168,6 @@ _PATCH_BUCKET = "editorial-proposal-patches"
 _IDEMPOTENCY_KEY = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MAX_PATCH_BYTES = 256 * 1024
-_BAR_NUMBER_TOKEN = re.compile(r"(?<![\w.])[-+]?(?:\d+(?:\.\d+)?|\.\d+)(?![\w.])")
 _CLOSED_EDITORIAL_VALIDATOR_CODES = frozenset(
     {
         *(code.value for code in EditorialEnrichmentStageErrorCode),
@@ -412,28 +413,17 @@ def _validate_bar_chart_evidence(
             payload = evidence_entries.get(reference)
             if payload is None:
                 continue
-            value_is_documented = False
-            unit_is_documented = False
             value_fields = (
                 ("value", "evidence_quote")
                 if reference.kind is EvidenceKind.FACT
                 else ("text", "evidence_quote")
             )
-            for field_name in value_fields:
-                text_value = payload.get(field_name)
-                if not isinstance(text_value, str):
-                    continue
-                unit_is_documented = unit_is_documented or bar_chart_evidence_contains_unit(
-                    chart.unit or "", text_value
-                )
-                for match in _BAR_NUMBER_TOKEN.finditer(text_value):
-                    try:
-                        observed = Decimal(match.group())
-                    except InvalidOperation:
-                        continue
-                    if observed.is_finite() and observed == point.value:
-                        value_is_documented = True
-            if value_is_documented and unit_is_documented:
+            if bar_chart_record_documents_value_and_unit(
+                payload,
+                value=point.value,
+                unit=chart.unit,
+                text_fields=value_fields,
+            ):
                 value_and_unit_share_evidence = True
                 break
         if not value_and_unit_share_evidence:
@@ -1308,6 +1298,7 @@ class EditorialProposalService:
         media_asset_store: MediaAssetStore | None = None,
         figure_catalog_service: Any | None = None,
         visual_revision_loader: VisualRevisionContextLoader | None = None,
+        diagram_preview_compiler: Any | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._blob_store = blob_store
@@ -1318,6 +1309,9 @@ class EditorialProposalService:
         self._media_asset_store = media_asset_store
         self._figure_catalog_service = figure_catalog_service
         self._visual_revision_loader = visual_revision_loader
+        self._diagram_preview_compiler = diagram_preview_compiler or getattr(
+            visual_revision_loader, "diagram_preview_compiler", None
+        )
 
     async def prepare_thread_turn(
         self,
@@ -1572,30 +1566,24 @@ class EditorialProposalService:
             target = resolved.target
             before_hash = resolved.before_hash
         else:
-            if not isinstance(
-                patch,
-                (
-                    UpdateVisualCaptionPatch,
-                    MoveEnrichmentElementPatch,
-                    ReplaceSourceFigurePatch,
-                    RemoveEnrichmentElementPatch,
-                ),
-            ):
+            try:
+                element_kind = visual_patch_element_kind(patch)
+            except ValueError:
                 raise _visual_revision_failure(
                     VisualRevisionRejected(
-                        "enrichment_revision_unsupported_operation",
+                        "enrichment_revision_patch_invalid",
                         {"variant": type(patch).__name__},
                     )
-                )
+                ) from None
             if (
                 entry.source_stage is not EditorialSourceStage.EDITORIAL_ENRICHMENT
-                or entry.kind.value != patch.element_kind.value
+                or entry.kind.value != element_kind.value
                 or entry.block_id != occurrence_id
             ):
                 raise _visual_revision_failure(
                     VisualRevisionRejected(
                         "enrichment_element_kind_mismatch",
-                        {"element_kind": patch.element_kind.value},
+                        {"element_kind": element_kind.value},
                     )
                 )
             try:
@@ -1625,6 +1613,18 @@ class EditorialProposalService:
             plan = plan_visual_revision(loaded.context, patch)
         except VisualRevisionRejected as error:
             raise _visual_revision_failure(error) from None
+        candidate_enrichment = plan.revised_enrichment
+        compiled_chart_asset: dict[str, object] | None = None
+        if plan.compile_chart is not None:
+            compiled_chart_asset, candidate_enrichment = await self._compile_revised_chart(
+                chart=plan.compile_chart,
+                element_key=plan.compile_chart.key,
+                revised_enrichment=candidate_enrichment,
+                production_run_id=loaded.production_run_id,
+            )
+        diagram_preview: dict[str, object] | None = None
+        if plan.materialize_diagram is not None:
+            diagram_preview = await self._compile_diagram_preview(plan.materialize_diagram)
         patch_payload: dict[str, object] = {
             "schema_version": VISUAL_REVISION_PATCH_SCHEMA_VERSION,
             "operation": operation.value,
@@ -1635,9 +1635,19 @@ class EditorialProposalService:
             "visual_patch": visual_patch_to_json(patch),
             "rationale": "Révision visuelle manuelle validée par l’analyste.",  # noqa: RUF001
         }
-        candidate_payload = editorial_enrichment_to_json(plan.revised_enrichment)
+        if compiled_chart_asset is not None:
+            patch_payload["compiled_chart_asset"] = compiled_chart_asset
+        candidate_payload = editorial_enrichment_to_json(candidate_enrichment)
+        preview_details = dict(plan.preview)
+        if diagram_preview is not None:
+            preview_details["diagram"] = diagram_preview
+        if compiled_chart_asset is not None:
+            preview_details["chart_asset"] = {
+                "asset_id": compiled_chart_asset["asset_id"],
+                "sha256": compiled_chart_asset["sha256"],
+            }
         diagnostics: dict[str, object] = {
-            "preview": plan.preview,
+            "preview": preview_details,
             "canonical_candidate_sha256": hashlib.sha256(
                 ProductionArtifactStore.canonical_json_bytes(candidate_payload)
             ).hexdigest(),
@@ -1690,6 +1700,85 @@ class EditorialProposalService:
             if descriptor is not None:
                 await self._best_effort_orphan_cleanup(descriptor)
             raise
+
+    async def _compile_revised_chart(
+        self,
+        *,
+        chart: ChartSpecV1,
+        element_key: str,
+        revised_enrichment: EditorialEnrichmentV1,
+        production_run_id: UUID,
+    ) -> tuple[dict[str, object], EditorialEnrichmentV1]:
+        """Compile the preview SVG and return the element with its new asset id.
+
+        The manifest is persisted with the proposal so adoption can recompile
+        the same typed spec and prove byte equality under the run lock; the
+        canonical artifact is untouched at prepare.
+        """
+        if self._chart_compiler is None or self._media_asset_store is None:
+            raise EditorialProposalApplicationError("proposal_workspace_unavailable")
+        batch = await compile_and_store_charts(
+            (chart,),
+            compiler=self._chart_compiler,
+            media_asset_store=self._media_asset_store,
+            production_run_id=production_run_id,
+        )
+        if batch.rejections or len(batch.charts) != 1 or batch.charts[0].compiled_asset_id is None:
+            raise EditorialProposalApplicationError(
+                "editorial_enrichment_chart_render_failed",
+                validator_code="bar_chart_local_compilation_failed",
+            )
+        compiled = batch.charts[0]
+        asset_id = compiled.compiled_asset_id
+        assert asset_id is not None
+        manifest = await self._media_asset_store.get(asset_id)
+        if manifest is None:
+            raise EditorialProposalApplicationError(
+                "editorial_enrichment_chart_render_failed",
+                validator_code="bar_chart_media_manifest_missing",
+            )
+        revised = replace_element(
+            revised_enrichment,
+            EnrichmentElementRef(EditorialEnrichmentElementKind.CHART, element_key),
+            compiled,
+        )
+        return (
+            {
+                "asset_id": str(manifest.asset_id),
+                "sha256": manifest.sha256,
+                "compiler_name": str(manifest.compiler_name),
+                "compiler_version": str(manifest.compiler_version),
+                "policy_version": manifest.policy_version,
+            },
+            revised,
+        )
+
+    async def _compile_diagram_preview(self, diagram: DiagramSpecV1) -> dict[str, object]:
+        """Compile the non-canonical PNG preview of a typed revised diagram."""
+        compiler = self._diagram_preview_compiler
+        if compiler is None:
+            raise EditorialProposalApplicationError("proposal_workspace_unavailable")
+        try:
+            preview = await compiler.compile_preview(diagram)
+        except Exception:
+            raise EditorialProposalApplicationError(
+                "editorial_enrichment_diagram_render_failed",
+                validator_code="diagram_preview_compilation_failed",
+            ) from None
+        if preview.diagram_key != diagram.key:
+            raise EditorialProposalApplicationError(
+                "editorial_enrichment_diagram_render_failed",
+                validator_code="diagram_preview_identity_mismatch",
+            )
+        return {
+            "media_type": preview.media_type,
+            "media_sha256": preview.media_sha256,
+            "byte_size": len(preview.media_bytes),
+            "source_sha256": preview.source_sha256,
+            "compiler": preview.compiler,
+            "compiler_version": preview.compiler_version,
+            "compiler_policy_version": preview.compiler_policy_version,
+        }
 
     async def prepare_manual_patch(
         self,

@@ -1647,6 +1647,53 @@ def _chart_to_json(
     return payload
 
 
+def chart_spec_to_json(chart: ChartSpecV1) -> dict[str, Any]:
+    """Serialize one complete chart specification, including quantitative fields.
+
+    The visual-revision patch codec persists this exact form so a revision
+    reparsed at adoption keeps decimal strings, evidence references and
+    presentation fields byte-identical.
+    """
+    if not isinstance(chart, ChartSpecV1):
+        raise ValueError("Expected a ChartSpecV1")
+    return _chart_to_json(chart, include_quantitative=True, include_group_order=True)
+
+
+def chart_spec_from_json(raw: Any) -> ChartSpecV1:
+    """Parse the persisted chart form produced by :func:`chart_spec_to_json`."""
+    return _chart_from_json(raw, schema_version=EDITORIAL_ENRICHMENT_MAX_SCHEMA_VERSION)
+
+
+def diagram_spec_to_json(diagram: DiagramSpecV1) -> dict[str, Any]:
+    """Serialize one complete diagram specification for a typed patch."""
+    if not isinstance(diagram, DiagramSpecV1):
+        raise ValueError("Expected a DiagramSpecV1")
+    return _diagram_to_json(
+        diagram,
+        include_analytic=diagram.purpose is not None,
+        include_roles=True,
+        include_profile=diagram.profile is not None,
+        include_group_order=True,
+    )
+
+
+def diagram_spec_from_json(raw: Any) -> DiagramSpecV1:
+    """Parse the persisted diagram form produced by :func:`diagram_spec_to_json`."""
+    if not isinstance(raw, Mapping):
+        raise ValueError("Editorial diagram has missing or extra fields")
+    has_purpose = "purpose" in raw
+    has_profile = "profile" in raw
+    if has_profile and not has_purpose:
+        raise ValueError("Editorial diagram profile requires its analytic purpose")
+    return _diagram_from_json(
+        raw,
+        require_analytic=has_purpose,
+        require_roles=True,
+        require_profile=has_profile,
+        allow_group_order=True,
+    )
+
+
 def diagram_node_to_json(node: DiagramNodeV1, *, include_role: bool = True) -> dict[str, Any]:
     payload = {
         "node_id": node.node_id,
