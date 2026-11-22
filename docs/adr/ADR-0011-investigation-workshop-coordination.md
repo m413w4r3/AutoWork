@@ -33,7 +33,7 @@ Chaque type de décision a un seul propriétaire canonique ; les autres objets l
 
 `TaskEvent` (table `investigation_task_events`) est le journal append-only du statut métier ; il référence la décision humaine par `analyst_decision_id`, sans la remplacer. `jobs`/`job_events` restent réservés aux workers (`…/models/jobs.py:23,70`) : une session Codex/Claude est un processus hôte, pas un job Dramatiq. `investigation_working_states` reste l’état compact de la boucle Bridge, sans tâche, bail ni dépendance.
 
-### D2 — Persistance et chaîne Alembic 0019–0025
+### D2 — Persistance et chaîne Alembic 0019–0026
 
 Tête actuelle `0018_editorial_enrichment_element_operations` (`backend/migrations/versions/0018_editorial_enrichment_element_operations.py:16`). Chaîne **linéaire et additive**, un seul écrivain de migration par lot :
 
@@ -46,8 +46,9 @@ Tête actuelle `0018_editorial_enrichment_element_operations` (`backend/migratio
 | `0023_agent_sessions` | 05B1 | `agent_sessions`, FK `investigation_tasks.lease_session_id`, `tool_invocations.agent_session_id`, check de paire d’attribution |
 | `0024_work_contributions` | 07 | `work_contributions` |
 | `0025_opinion_note_proposals` | 08B | `investigation_note_proposals` |
+| `0026_workspace_note_annotations` | WS2 | `workspace_note_annotations` (append-only, UPDATE/DELETE/TRUNCATE refusés ; jamais une seconde source de preuve) |
 
-Chaque migration prévalide l’état attendu, échoue avant DDL sur un état partiel et refuse le downgrade tant que des lignes utilisent les colonnes ou valeurs ajoutées (ADR-0007, `0018`). La tête passe à `0025_opinion_note_proposals` ; `tests/test_alembic_chain.py` (tête actuelle assertée `:182`) liste les sept révisions.
+Chaque migration prévalide l’état attendu, échoue avant DDL sur un état partiel et refuse le downgrade tant que des lignes utilisent les colonnes ou valeurs ajoutées (ADR-0007, `0018`). La tête passe à `0026_workspace_note_annotations` ; `tests/test_alembic_chain.py` liste les huit révisions (amendement 2026-11-22).
 
 **Espace de travail (0019, M24-02).** Le contrat normatif est `docs/design/investigation-workshop/WORKSPACE-AGENT.md` §5–6 ; il n’existe qu’à partir de `m24/integration` @ `279d4c72` et est absent de `33891bf8` : son merge précède le lot 02 (E11). Sa phrase « DDL owned by M24-07 » est **superseded** : les quatre tables sont créées par M24-02 en `0019`, avant tout agrégat qui les référence. `workspace_bindings(workspace_id text pk, investigation_id uuid not null unique fk analyst_investigations RESTRICT, subject_id uuid not null, delivery_code text not null, article_slug text not null, synthesis_sha256 char(64) not null, created_at timestamptz not null, unique (workspace_id, investigation_id))` — aucune colonne de chemin hôte absolu en base. `workspace_file_revisions(workspace_id text fk, revision_id text, path text, sha256 char(64), size bigint, mode text, mtime_ns bigint, observed_at timestamptz, origin text, task_id uuid null, supersedes_revision_id text null)` : identité **par fichier**, `revision_id = "rev-" + sha256(workspace_id.encode("utf-8") + b"\x00" + path.encode("utf-8") + b"\x00" + content_sha256.encode("ascii")).hexdigest()[:32]` (WORKSPACE-AGENT §6 ; E10), PK `(workspace_id, revision_id)`, unique `(workspace_id, revision_id, path)` pour la FK composite de D6 ; métadonnées seules, aucun octet ; la FK `task_id` est ajoutée par `0021` (04B1) en `ALTER TABLE`, la table des tâches n’existant pas en `0019` (E9). `workspace_file_events` unique `(workspace_id, event_id)` avec `import_status` ; `workspace_sync_cursors(workspace_id, generation, cursor)`.
 
@@ -389,6 +390,19 @@ Risques résiduels : l’agent hôte reste une frontière de confiance locale (s
 | E14 (DAG) | Appliqué : « 03A après 01+02 ». | DAG |
 
 Aucun autre désaccord : les 27 findings B1–B10/M1–M14/P2–P4 et les remarques de DAG/§7 sont acceptés et résolus ci-dessus ; les citations erronées de la révision 1 sont corrigées dans le Contexte.
+
+## Amendement d'implémentation (2026-11-22, orchestrateur #2)
+
+Cet amendement consigne l'état réellement implémenté sur `m24/integration` ; il ne change aucune décision D1–D10 sauf mention explicite.
+
+- **Lots ajoutés après D10** : WS1 (`application/investigation_workspace.py`, `api/investigation_workspace.py` : ensure/sync/export/fichiers/note humaine/conflits via `AnalystDecision workspace_conflict_resolve`), WS2 (`0026`, `application/workspace_notes.py`, `api/investigation_workspace_notes.py` : annotations, relecture Bridge, continuation agent, tâche de vérification, conversion en observations proposée), X1 (ouverture de session, transferts, instructions), UI-API + 09A–09E + e2e (11), acceptation 10-M/10-S.
+- **D8 — lectures opérateur (décision)** : les agents ne lisent PAS l'API par GET signés. Leur contexte passe par la passation versionnée et le contexte de session ; seuls les POST signés D7 exacts (`tool-calls`, `instructions`, `commands`, `handoffs`) contournent le jeton. Les mentions « lectures de son enquête » de D8 valent pour le client opérateur legacy, pas pour les sessions agentiques M24.
+- **D3 — sweeper** : `InvestigationTaskSweeper` est planifié (`workers/scheduler.py`, `M24_TASK_SWEEP_INTERVAL_SECONDS`) ; la libération d'un bail (cancel/block/fail/submit/expiration) interrompt puis ferme la session hôte après commit (jamais sous verrou, jamais de relance ; effet non confirmé marqué `lost_unreconciled`).
+- **D7 — ouverture de session** : protocole en trois phases courtes (ligne `provisioning` commitée → effets hôte hors verrou → transaction de bail + miroir RUNNING), ordre de verrous unique advisory-enquête puis ligne de tâche.
+- **D6/D7 — catalogue agent** : `analysis.run_script`, `note.capture` et `contribution.import` sont des outils du broker signé et du shim ; `contribution.import` porte `task_id`/`lease_fence` de la session et réutilise le seul writer 07.
+- **D4 — ancres** : un ensemble unique d'ancres « rendables » (`publication_renderable_body_anchors`) sert la validation (proposition, acceptation, opérateur, aperçu) ET le rendu ; une ancre non rendable est refusée (`invalid_note_anchor`, `invalid_observation_anchor`).
+- **Portes ajoutées par revue** : `external_llm_allowed`/TLP à l'ouverture de session ; mode réseau fail-closed des CLI réels (voir SESSION-RUNNER.md).
+- **Résiduel non prouvé** : spike H0 hôte (schéma de clés MCP Codex, resume/stream-json Claude, jeu de fichiers d'identifiants, profil bwrap CLI, egress fournisseur seul) ; capacité VT réelle download/PCAP ; Notes avec tableaux/figures M23 (non supporté : texte seulement) ; chronologie sans passations/contributions/sessions.
 
 ## Questions ouvertes à trancher par l’humain
 
