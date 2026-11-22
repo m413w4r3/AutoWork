@@ -37,6 +37,10 @@ from cti_app.application.agent_session_verifier import (
     VerifiedAgentSession,
     parse_agent_session_headers,
 )
+from cti_app.application.agentic_note_tools import (
+    AgenticNoteCaptureService,
+    NoteCaptureUnitOfWork,
+)
 from cti_app.application.agentic_tool_broker import (
     AgenticBrokerError,
     AgenticToolBroker,
@@ -44,7 +48,13 @@ from cti_app.application.agentic_tool_broker import (
 from cti_app.application.investigation_handoffs import HandoffError, InvestigationHandoffService
 from cti_app.application.investigation_tasks import TaskCommandError
 from cti_app.application.operator_tool_invocation import OperatorToolInvocationError
+from cti_app.application.work_contributions import (
+    WorkContributionService,
+    WorkContributionUnitOfWork,
+)
+from cti_app.application.workspace_agent import WorkspaceAgentPort
 from cti_app.config import Settings, get_settings
+from cti_app.infrastructure.workspace_agent import HttpWorkspaceAgentClient
 
 router = APIRouter(prefix="/api/investigations", tags=["agentic-tools"])
 
@@ -152,6 +162,45 @@ def _composition_factory(request: Request) -> Any:
     return factory
 
 
+def _workspace_agent(request: Request) -> tuple[WorkspaceAgentPort, bool]:
+    """The injected host agent, or the configured UDS client (closed if ours)."""
+    injected = getattr(request.app.state, "workspace_agent_port", None)
+    if injected is not None:
+        return cast(WorkspaceAgentPort, injected), False
+    settings = _settings(request)
+    return (
+        HttpWorkspaceAgentClient(
+            socket_path=settings.workspace_agent_socket or None,
+            token_file=settings.workspace_agent_token_file or None,
+        ),
+        True,
+    )
+
+
+def _contribution_service(
+    request: Request, factory: Any, agent: WorkspaceAgentPort
+) -> WorkContributionService | None:
+    """The single M24-07 import writer, when the composition exposes its stores."""
+    artifact_store = getattr(factory, "artifact_store", None)
+    article_snapshots = getattr(factory, "article_snapshots", None)
+    if artifact_store is None or article_snapshots is None:
+        return None
+    return WorkContributionService(
+        uow_factory=cast(Callable[[], WorkContributionUnitOfWork], _uow_factory(request)),
+        workspace_agent=agent,
+        artifact_store=artifact_store,
+        article_snapshots=article_snapshots,
+        max_contribution_bytes=_settings(request).task_limits().max_contribution_bytes,
+    )
+
+
+def _note_service(request: Request, agent: WorkspaceAgentPort) -> AgenticNoteCaptureService:
+    return AgenticNoteCaptureService(
+        uow_factory=cast(Callable[[], NoteCaptureUnitOfWork], _uow_factory(request)),
+        workspace_agent=agent,
+    )
+
+
 def _operator_error(
     exc: AgenticBrokerError | OperatorToolInvocationError | TaskCommandError | HandoffError,
 ) -> Any:
@@ -184,33 +233,41 @@ async def call_agentic_tool(
         investigation = await uow.analyst_investigations.get(investigation_id)
         if investigation is None:
             raise _http_error(404, "investigation_not_found")
-        composition = _composition_factory(request).build(uow, investigation_id, operator_mode=True)
+        factory = _composition_factory(request)
+        composition = factory.build(uow, investigation_id, operator_mode=True)
         handoffs = InvestigationHandoffService(uow_factory=cast(Any, _uow_factory(request)))
         commit = getattr(uow, "commit", None)
-        broker = AgenticToolBroker(
-            investigation_id=investigation_id,
-            prose_authority=investigation.prose_authority,
-            uow=cast(Any, uow),
-            invocations=composition.operator_tool_invocations,
-            handoffs=handoffs,
-            task_limits=_settings(request).task_limits(),
-            commit=cast(Callable[[], Any], commit) if callable(commit) else None,
-        )
+        agent, should_close = _workspace_agent(request)
         try:
-            result = await broker.invoke(
-                session=verified,
-                tool_name=payload.tool_name,
-                schema_version=payload.schema_version,
-                arguments=payload.arguments,
-                client_idempotency_key=idempotency_key,
+            broker = AgenticToolBroker(
+                investigation_id=investigation_id,
+                prose_authority=investigation.prose_authority,
+                uow=cast(Any, uow),
+                invocations=composition.operator_tool_invocations,
+                handoffs=handoffs,
+                contributions=_contribution_service(request, factory, agent),
+                notes=_note_service(request, agent),
+                task_limits=_settings(request).task_limits(),
+                commit=cast(Callable[[], Any], commit) if callable(commit) else None,
             )
-        except (
-            AgenticBrokerError,
-            OperatorToolInvocationError,
-            TaskCommandError,
-            HandoffError,
-        ) as exc:
-            raise _operator_error(exc) from exc
+            try:
+                result = await broker.invoke(
+                    session=verified,
+                    tool_name=payload.tool_name,
+                    schema_version=payload.schema_version,
+                    arguments=payload.arguments,
+                    client_idempotency_key=idempotency_key,
+                )
+            except (
+                AgenticBrokerError,
+                OperatorToolInvocationError,
+                TaskCommandError,
+                HandoffError,
+            ) as exc:
+                raise _operator_error(exc) from exc
+        finally:
+            if should_close:
+                await agent.aclose()
     return AgenticToolCallResponse(
         investigation_id=result.investigation_id,
         session_id=result.session_id,

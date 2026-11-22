@@ -35,12 +35,18 @@ from cti_app.application.agent_session_verifier import (
     build_agent_session_message,
     session_secret_hash,
 )
+from cti_app.application.agentic_note_tools import (
+    AgenticNoteCaptureService,
+    NoteCaptureError,
+)
 from cti_app.application.agentic_tool_broker import (
+    AGENTIC_CONTRIBUTION_TOOL,
     AGENTIC_TOOL_NAMES,
     BRIDGE_CONSULT_ALIAS,
     AgenticArgumentsInvalidError,
     AgenticBindingRefusedError,
     AgenticLeaseRefusedError,
+    AgenticNoteCaptureRefusedError,
     AgenticProseAuthorityRequiredError,
     AgenticSessionInactiveError,
     AgenticToolBroker,
@@ -52,8 +58,18 @@ from cti_app.application.investigation_handoffs import InvestigationHandoffServi
 from cti_app.application.investigation_persistence import (
     InMemoryAgentSessionRepository,
     InMemoryInvestigationTaskRepository,
+    InMemoryWorkspaceBindingRepository,
 )
+from cti_app.application.investigation_task_events import TaskEventType
+from cti_app.application.investigation_tools import ToolEffect
 from cti_app.application.operator_tool_invocation import OperatorToolInvocationError
+from cti_app.application.workspace_agent import (
+    OriginKind,
+    RevisionV1,
+    WorkspaceBindingV1,
+    WriteResultV1,
+    workspace_revision_id,
+)
 from cti_app.config import Settings
 from cti_app.domain.agentic_operator import (
     AgentSessionState,
@@ -63,6 +79,7 @@ from cti_app.domain.agentic_operator import (
     OperatorProbeCommand,
 )
 from cti_app.domain.investigation import (
+    BudgetDimension,
     InvestigationExecutionMode,
     ToolInvocation,
     ToolInvocationActorKind,
@@ -78,6 +95,7 @@ from cti_app.domain.investigation_task import (
     TaskStatus,
 )
 from cti_app.domain.production import ProseAuthority
+from cti_app.domain.work_contribution import WorkContributionOrigin
 from tests.test_investigation_service import _Fixture
 from tests.test_operator_tool_invocation import _service
 
@@ -937,3 +955,358 @@ async def test_broker_refuses_an_inactive_or_unbound_session_row() -> None:
 
     assert refused.value.code == "agent_session_inactive"
     assert await _invocations(fixture) == ()
+
+
+# ------------------------------------------------- FIX-T catalogue completion
+
+
+class _ContributionBrokerUnitOfWork:
+    """The stores the broker needs for an agent contribution import."""
+
+    def __init__(
+        self,
+        tasks: InMemoryInvestigationTaskRepository,
+        sessions: InMemoryAgentSessionRepository,
+    ) -> None:
+        self.investigation_tasks = tasks
+        self.agent_sessions = sessions
+        self.commit_count = 0
+
+    async def __aenter__(self) -> _ContributionBrokerUnitOfWork:
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    async def commit(self) -> None:
+        self.commit_count += 1
+
+
+class _NoteUnitOfWork:
+    def __init__(self, bindings: InMemoryWorkspaceBindingRepository) -> None:
+        self.workspace_bindings = bindings
+
+    async def __aenter__(self) -> _NoteUnitOfWork:
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+
+class _RecordingWorkspaceAgent:
+    def __init__(self) -> None:
+        self.puts: list[dict[str, Any]] = []
+
+    async def put_file(
+        self,
+        workspace_id: str,
+        *,
+        path: str,
+        content: bytes,
+        expected_sha256: str,
+        origin: str,
+        task_id: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> WriteResultV1:
+        self.puts.append(
+            {
+                "route": "files",
+                "workspace_id": workspace_id,
+                "path": path,
+                "content": content,
+                "expected_sha256": expected_sha256,
+                "origin": origin,
+                "task_id": task_id,
+                "idempotency_key": idempotency_key,
+            }
+        )
+        return _write_result(workspace_id, path, content, origin, task_id)
+
+    async def put_generated(
+        self,
+        workspace_id: str,
+        *,
+        path: str,
+        content: bytes,
+        expected_sha256: str,
+        generated_by: str,
+        source_sha256: str,
+        task_id: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> WriteResultV1:
+        self.puts.append(
+            {
+                "route": "generated",
+                "workspace_id": workspace_id,
+                "path": path,
+                "content": content,
+                "expected_sha256": expected_sha256,
+                "generated_by": generated_by,
+                "source_sha256": source_sha256,
+                "task_id": task_id,
+                "idempotency_key": idempotency_key,
+            }
+        )
+        return _write_result(workspace_id, path, content, "system", task_id)
+
+
+def _write_result(
+    workspace_id: str, path: str, content: bytes, origin: OriginKind, task_id: str | None
+) -> WriteResultV1:
+    sha256 = hashlib.sha256(content).hexdigest()
+    return WriteResultV1(
+        revision=RevisionV1(
+            revision_id=workspace_revision_id(workspace_id=workspace_id, path=path, sha256=sha256),
+            path=path,
+            sha256=sha256,
+            size=len(content),
+            observed_at=NOW,
+            origin=origin,
+            task_id=task_id,
+        ),
+        created=True,
+        already_present=False,
+        conflict=False,
+    )
+
+
+def test_fix_t_tools_are_in_the_closed_agentic_catalogue() -> None:
+    assert {
+        "analysis.run_script",
+        "note.capture",
+        AGENTIC_CONTRIBUTION_TOOL,
+    } <= AGENTIC_TOOL_NAMES
+
+
+def test_shim_run_script_schema_matches_the_backend_tool_definition() -> None:
+    from cti_app.application.confined_scripts import build_run_script_tool_definition
+
+    repository_root = Path(__file__).resolve().parents[2]
+    if str(repository_root) not in sys.path:
+        sys.path.insert(0, str(repository_root))
+    from sidecars.workspace_agent.sessions import catalog
+
+    spec = catalog.by_mcp_name()["autowork_analysis_run_script"]
+    shim_properties = set(spec.input_schema["properties"]) - {"investigation_id"}
+    backend_properties = set(
+        build_run_script_tool_definition(Settings(_env_file=None)).input_schema["properties"]
+    )
+    assert shim_properties == backend_properties
+
+
+@pytest.mark.asyncio
+async def test_broker_runs_confined_script_with_task_session_attribution() -> None:
+    fixture = _Fixture(
+        responses=[],
+        external_allowed=True,
+        tools=(
+            (
+                "analysis.run_script",
+                "analysis",
+                ToolEffect.LOCAL_COMPUTE,
+                "analysis.exec",
+                {BudgetDimension.TOOL_SECONDS: 1},
+            ),
+        ),
+    )
+    await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
+    tasks = InMemoryInvestigationTaskRepository()
+    sessions = InMemoryAgentSessionRepository()
+    task, session_id, _secret = await _seed_agent_session(fixture, tasks, sessions)
+    broker, _uow = _broker(fixture, tasks, sessions)
+
+    result = await broker.invoke(
+        session=_verified(session_id, fixture.investigation_id, task),
+        tool_name="analysis.run_script",
+        schema_version="1",
+        arguments={"query": "print('confined')"},
+        client_idempotency_key="run-script-1",
+    )
+
+    assert result.status == ToolInvocationStatus.SUCCEEDED.value
+    assert fixture.tools["analysis.run_script"].calls == [{"query": "print('confined')"}]
+    rows = await _invocations(fixture)
+    assert len(rows) == 1
+    assert rows[0].task_id == task.id
+    assert rows[0].agent_session_id == session_id
+    assert rows[0].actor_id == OPERATOR_ID
+
+
+@pytest.mark.asyncio
+async def test_broker_contribution_import_attributes_task_fence_and_emits_event() -> None:
+    from tests.test_work_contributions import _Harness
+
+    harness = _Harness()
+    await harness.bind()
+    session_id = uuid4()
+    task = _running_task(harness.investigation_id, session_id)
+    await harness.tasks.add(task)
+    session_row, _secret = _session_row(harness.investigation_id, task, session_id=session_id)
+    sessions = InMemoryAgentSessionRepository()
+    await sessions.add(session_row)
+    revision = await harness.add_revision(
+        f"notes/agents/{task.id}/analyse.md",
+        b"# Note agent\n\nHypothese non verifiee.\n",
+        origin="agent",
+        task_id=task.id,
+    )
+    uow = _ContributionBrokerUnitOfWork(harness.tasks, sessions)
+    broker = AgenticToolBroker(
+        investigation_id=harness.investigation_id,
+        prose_authority=ProseAuthority.BRIDGE_ONLY,
+        uow=cast(Any, uow),
+        invocations=None,
+        handoffs=None,
+        contributions=harness.service,
+        notes=None,
+        clock=lambda: NOW,
+        commit=uow.commit,
+    )
+    session = _verified(session_id, harness.investigation_id, task)
+    arguments = {
+        "workspace_id": harness.workspace_id,
+        "workspace_revision_id": revision.revision_id,
+        "category": "work_contribution",
+    }
+
+    result = await broker.invoke(
+        session=session,
+        tool_name=AGENTIC_CONTRIBUTION_TOOL,
+        schema_version="1",
+        arguments=arguments,
+        client_idempotency_key="contribution-1",
+    )
+
+    assert result.status == "imported"
+    assert result.output["origin"] == WorkContributionOrigin.AGENT.value
+    assert result.output["task_id"] == str(task.id)
+    assert result.output["lease_fence"] == task.lease_fence
+    assert result.output["citable_as_evidence"] is False
+    rows = await harness.contributions.list_for_investigation(harness.investigation_id)
+    assert len(rows) == 1
+    events = await harness.tasks.list_events(task.id)
+    assert [event.event_type for event in events] == [TaskEventType.CONTRIBUTION_IMPORTED]
+    assert events[0].lease_fence == task.lease_fence
+    assert events[0].actor.kind is TaskActorKind.OPERATOR
+    assert events[0].payload["contribution_id"] == str(result.output["id"])
+    assert events[0].payload["lease_fence"] == task.lease_fence
+
+    replay = await broker.invoke(
+        session=session,
+        tool_name=AGENTIC_CONTRIBUTION_TOOL,
+        schema_version="1",
+        arguments=arguments,
+        client_idempotency_key="contribution-1",
+    )
+
+    assert replay.output["id"] == result.output["id"]
+    assert replay.idempotent_replay is True
+    assert len(await harness.tasks.list_events(task.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_broker_note_capture_publishes_agent_note_under_task_subtree() -> None:
+    fixture = _fixture()
+    await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
+    tasks = InMemoryInvestigationTaskRepository()
+    sessions = InMemoryAgentSessionRepository()
+    task, session_id, _secret = await _seed_agent_session(fixture, tasks, sessions)
+    bindings = InMemoryWorkspaceBindingRepository()
+    workspace_id = "ws-" + uuid4().hex
+    await bindings.add_if_absent(
+        WorkspaceBindingV1(
+            workspace_id=workspace_id,
+            investigation_id=fixture.investigation_id,
+            subject_id=uuid4(),
+            delivery_code="IR202611",
+            article_slug="bluemoon-cn",
+            synthesis_sha256="d" * 64,
+            created_at=NOW,
+        )
+    )
+    agent = _RecordingWorkspaceAgent()
+    notes = AgenticNoteCaptureService(
+        uow_factory=lambda: _NoteUnitOfWork(bindings),
+        workspace_agent=agent,
+    )
+    uow = _BrokerUnitOfWork(fixture, tasks, sessions)
+    broker = AgenticToolBroker(
+        investigation_id=fixture.investigation_id,
+        prose_authority=ProseAuthority.BRIDGE_ONLY,
+        uow=uow,
+        invocations=_service(fixture),
+        handoffs=None,
+        contributions=None,
+        notes=notes,
+        clock=lambda: NOW,
+        commit=uow.commit,
+    )
+    session = _verified(session_id, fixture.investigation_id, task)
+
+    note = await broker.invoke(
+        session=session,
+        tool_name="note.capture",
+        schema_version="1",
+        arguments={"relpath": "analyse/first.md", "text": "# Note agent\n"},
+        client_idempotency_key="note-1",
+    )
+    result_file = await broker.invoke(
+        session=session,
+        tool_name="note.capture",
+        schema_version="1",
+        arguments={
+            "target": "result",
+            "relpath": "summary.md",
+            "text": "# Resultat\n",
+        },
+        client_idempotency_key="note-2",
+    )
+
+    assert note.status == "captured"
+    assert note.output["path"] == f"notes/agents/{task.id}/analyse/first.md"
+    assert note.output["evidence"] is False
+    assert result_file.output["path"] == "results/summary.md"
+    files_call, generated_call = agent.puts
+    assert files_call["origin"] == "agent"
+    assert files_call["task_id"] == str(task.id)
+    assert files_call["workspace_id"] == workspace_id
+    assert files_call["path"] == f"notes/agents/{task.id}/analyse/first.md"
+    assert generated_call["generated_by"] == f"session:{session_id}"
+    assert generated_call["source_sha256"] == hashlib.sha256(b"# Resultat\n").hexdigest()
+
+    with pytest.raises(AgenticNoteCaptureRefusedError) as refused:
+        await broker.invoke(
+            session=session,
+            tool_name="note.capture",
+            schema_version="1",
+            arguments={"relpath": "../escape.md", "text": "x"},
+            client_idempotency_key="note-3",
+        )
+    assert refused.value.code == "note_path_invalid"
+    assert len(agent.puts) == 2
+
+
+@pytest.mark.asyncio
+async def test_note_capture_service_refuses_a_foreign_bound_workspace() -> None:
+    bindings = InMemoryWorkspaceBindingRepository()
+    agent = _RecordingWorkspaceAgent()
+    service = AgenticNoteCaptureService(
+        uow_factory=lambda: _NoteUnitOfWork(bindings),
+        workspace_agent=agent,
+    )
+
+    with pytest.raises(NoteCaptureError) as refused:
+        await service.capture(
+            uuid4(),
+            task_id=uuid4(),
+            session_id=uuid4(),
+            target="note",
+            relpath="x.md",
+            text="x",
+            expected_sha256="new",
+            idempotency_key="note:test",
+        )
+
+    assert refused.value.code == "workspace_not_bound"
+    assert refused.value.status_code == 409
+    assert agent.puts == []

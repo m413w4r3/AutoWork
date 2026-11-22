@@ -18,7 +18,14 @@ instead of introducing a second journal, budget or evidence pipeline:
   ``task_id``/``agent_session_id``/operator attribution on the
   ``tool_invocations`` row;
 * ``task.heartbeat``/``task.submit_result`` map onto the task engine and
-  ``handoff.submit`` onto the handoff service, for this session's task only.
+  ``handoff.submit`` onto the handoff service, for this session's task only;
+* ``analysis.run_script`` is a registry tool like VT/Shodan: the attested
+  worker capability (``analysis.exec``) and G2/budgets stay authoritative;
+* ``contribution.import`` reuses the M24-07 import service with an
+  ``origin='agent'`` authority derived from the verified session and the locked
+  task row, then appends the ``contribution_imported`` task event;
+* ``note.capture`` publishes the agent's own note/result through the host
+  workspace layer (origin ``agent`` + task header), never as evidence.
 
 An ambiguous ``advisor.consult`` is never resubmitted here: the underlying
 service's reconciliation refusal is propagated unchanged.
@@ -26,13 +33,21 @@ service's reconciliation refusal is propagated unchanged.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
 from uuid import UUID
 
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
 from cti_app.application.agent_session_verifier import VerifiedAgentSession
+from cti_app.application.agentic_note_tools import (
+    NOTE_CAPTURE_TOOL,
+    AgenticNoteCaptureService,
+    NoteCaptureError,
+)
 from cti_app.application.investigation_handoffs import (
     HandoffCreateRequest,
     InvestigationHandoffService,
@@ -42,6 +57,12 @@ from cti_app.application.investigation_persistence import (
     InvestigationTaskRepository,
 )
 from cti_app.application.investigation_state import InvestigationStateRepository
+from cti_app.application.investigation_task_events import (
+    TaskEvent,
+    TaskEventDraft,
+    TaskEventType,
+    append_task_event,
+)
 from cti_app.application.investigation_tasks import (
     InvestigationTaskService,
     TaskSessionOutcome,
@@ -51,7 +72,18 @@ from cti_app.application.operator_tool_invocation import (
     OperatorToolInvocationService,
 )
 from cti_app.application.persistence import AnalystDecisionRepository
-from cti_app.domain.investigation import ToolInvocationActorKind
+from cti_app.application.work_contributions import (
+    ContributionAuthority,
+    WorkContributionError,
+    WorkContributionService,
+)
+from cti_app.application.workspace_agent import WorkspaceAgentError
+from cti_app.domain.investigation import (
+    FindingAssessment,
+    FindingKind,
+    NoveltyClass,
+    ToolInvocationActorKind,
+)
 from cti_app.domain.investigation_handoff import HandoffActor, HandoffActorKind
 from cti_app.domain.investigation_task import (
     TASK_LIMIT_DEFAULTS,
@@ -62,6 +94,16 @@ from cti_app.domain.investigation_task import (
     TaskStatus,
 )
 from cti_app.domain.production import ProseAuthority
+from cti_app.domain.work_contribution import (
+    ContributionDeclarationV1,
+    FindingDeclarationV1,
+    ObservationDeclarationV1,
+    WorkContributionCategory,
+    WorkContributionMethod,
+    WorkContributionObjectType,
+    WorkContributionOrigin,
+    WorkContributionV1,
+)
 
 #: Registry-backed tools the host shim catalogue can request (see
 #: ``sidecars/workspace_agent/sessions/catalog.py``; the cross-contract test
@@ -70,6 +112,7 @@ from cti_app.domain.production import ProseAuthority
 AGENTIC_REGISTRY_TOOLS: frozenset[str] = frozenset(
     {
         "advisor.consult",
+        "analysis.run_script",
         "vt.file_report",
         "vt.object_report",
         "vt.relationships",
@@ -87,8 +130,11 @@ AGENTIC_REGISTRY_TOOLS: frozenset[str] = frozenset(
 )
 AGENTIC_TASK_TOOLS: frozenset[str] = frozenset({"task.heartbeat", "task.submit_result"})
 AGENTIC_HANDOFF_TOOL = "handoff.submit"
+AGENTIC_CONTRIBUTION_TOOL = "contribution.import"
 AGENTIC_TOOL_NAMES: frozenset[str] = (
-    AGENTIC_REGISTRY_TOOLS | AGENTIC_TASK_TOOLS | {AGENTIC_HANDOFF_TOOL}
+    AGENTIC_REGISTRY_TOOLS
+    | AGENTIC_TASK_TOOLS
+    | {AGENTIC_HANDOFF_TOOL, AGENTIC_CONTRIBUTION_TOOL, NOTE_CAPTURE_TOOL}
 )
 BRIDGE_CONSULT_ALIAS = "bridge.consult"
 OPINION_TOOL_NAMES: frozenset[str] = frozenset(
@@ -144,6 +190,149 @@ class AgenticSessionInactiveError(AgenticBrokerError):
 class AgenticArgumentsInvalidError(AgenticBrokerError):
     code = "agentic_tool_arguments_invalid"
     status_code = 422
+
+
+class AgenticContributionRefusedError(AgenticBrokerError):
+    """The M24-07 import service refused the brokered contribution."""
+
+    code = "work_contribution_invalid"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        status_code: int | None = None,
+        details: Mapping[str, str] | None = None,
+    ) -> None:
+        if code is not None:
+            self.code = code
+        if status_code is not None:
+            self.status_code = status_code
+        super().__init__(message, details=dict(details or {}))
+
+
+class AgenticNoteCaptureRefusedError(AgenticBrokerError):
+    """``note.capture`` refused or the host workspace agent failed."""
+
+    code = "note_capture_refused"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        status_code: int | None = None,
+        details: Mapping[str, str] | None = None,
+    ) -> None:
+        if code is not None:
+            self.code = code
+        if status_code is not None:
+            self.status_code = status_code
+        super().__init__(message, details=dict(details or {}))
+
+
+class _ContributionObservationArguments(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    object_type: WorkContributionObjectType
+    method: WorkContributionMethod
+    object_id: str = Field(min_length=1, max_length=512)
+    tool: str = Field(min_length=1, max_length=128)
+    tool_version: str = Field(min_length=1, max_length=64)
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    limitations: tuple[str, ...] = ()
+    observed_at: datetime | None = None
+
+
+class _ContributionFindingArguments(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: FindingKind
+    assessment: FindingAssessment
+    statement: str = Field(min_length=1)
+    observation_refs: tuple[UUID, ...] = ()
+    claim_refs: tuple[str, ...] = ()
+    novelty: NoveltyClass | None = None
+    scope: str = ""
+    limitations: tuple[str, ...] = ()
+    proposed_sample_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+
+class AgenticContributionImportArguments(BaseModel):
+    """The closed ``contribution.import`` payload (M24-07 request minus authority).
+
+    ``origin``, ``author_actor_id``, ``task_id`` and ``lease_fence`` are never
+    accepted from the agent: the broker derives them from the verified session
+    and the locked task row so an agent cannot claim another task's lease.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    workspace_id: str = Field(pattern=r"^ws-[0-9a-f]{32}$")
+    workspace_revision_id: str = Field(pattern=r"^rev-[0-9a-f]{32}$")
+    category: WorkContributionCategory = WorkContributionCategory.WORK_CONTRIBUTION
+    observation: _ContributionObservationArguments | None = None
+    finding: _ContributionFindingArguments | None = None
+
+    @model_validator(mode="after")
+    def _validate_category_shape(self) -> AgenticContributionImportArguments:
+        if self.category is WorkContributionCategory.WORK_CONTRIBUTION:
+            if self.observation is not None or self.finding is not None:
+                raise ValueError("a work contribution declares no observation or finding")
+            return self
+        if self.category is WorkContributionCategory.OBSERVATION:
+            if self.observation is None or self.finding is not None:
+                raise ValueError("an observation import requires exactly one observation")
+            return self
+        if self.finding is None or self.observation is not None:
+            raise ValueError("a finding import requires exactly one finding")
+        return self
+
+    def declaration(self) -> ContributionDeclarationV1:
+        observation = (
+            ObservationDeclarationV1(
+                object_type=self.observation.object_type,
+                method=self.observation.method,
+                object_id=self.observation.object_id,
+                tool=self.observation.tool,
+                tool_version=self.observation.tool_version,
+                parameters=self.observation.parameters,
+                limitations=self.observation.limitations,
+                observed_at=self.observation.observed_at,
+            )
+            if self.observation is not None
+            else None
+        )
+        finding = (
+            FindingDeclarationV1(
+                kind=self.finding.kind,
+                assessment=self.finding.assessment,
+                statement=self.finding.statement,
+                observation_refs=self.finding.observation_refs,
+                claim_refs=self.finding.claim_refs,
+                novelty=self.finding.novelty,
+                scope=self.finding.scope,
+                limitations=self.finding.limitations,
+                proposed_sample_sha256=self.finding.proposed_sample_sha256,
+            )
+            if self.finding is not None
+            else None
+        )
+        return ContributionDeclarationV1(
+            category=self.category, observation=observation, finding=finding
+        )
+
+
+class AgenticNoteCaptureArguments(BaseModel):
+    """The closed ``note.capture`` payload; the backend builds the full path."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    target: str = Field(default="note", pattern=r"^(?:note|result)$")
+    relpath: str = Field(min_length=1, max_length=1024)
+    text: str = Field(min_length=1)
+    expected_sha256: str = Field(default="new", pattern=r"^(?:new|[0-9a-f]{64})$")
 
 
 class AgenticBrokerUnavailableError(AgenticBrokerError):
@@ -256,6 +445,8 @@ class AgenticToolBroker:
         uow: AgenticBrokerUnitOfWork,
         invocations: OperatorToolInvocationService | None,
         handoffs: InvestigationHandoffService | None,
+        contributions: WorkContributionService | None = None,
+        notes: AgenticNoteCaptureService | None = None,
         task_limits: TaskLimits = TASK_LIMIT_DEFAULTS,
         clock: Callable[[], datetime] | None = None,
         commit: Callable[[], Awaitable[None]] | None = None,
@@ -269,6 +460,8 @@ class AgenticToolBroker:
         self._uow = uow
         self._invocations = invocations
         self._handoffs = handoffs
+        self._contributions = contributions
+        self._notes = notes
         self._task_limits = task_limits
         self._clock = clock or (lambda: datetime.now(UTC))
         self._commit = commit
@@ -332,6 +525,22 @@ class AgenticToolBroker:
                 session=session,
                 task=task,
                 operator_id=operator_id,
+                arguments=arguments,
+                idempotency_key=key,
+            )
+        if canonical_tool == AGENTIC_CONTRIBUTION_TOOL:
+            return await self._contribution(
+                session=session,
+                task=task,
+                operator_id=operator_id,
+                arguments=arguments,
+                idempotency_key=key,
+                now=timestamp,
+            )
+        if canonical_tool == NOTE_CAPTURE_TOOL:
+            return await self._note_capture(
+                session=session,
+                task=task,
                 arguments=arguments,
                 idempotency_key=key,
             )
@@ -537,6 +746,211 @@ class AgenticToolBroker:
             output=record.handoff.to_payload(),
         )
 
+    # ------------------------------------------------------ contribution path
+
+    async def _contribution(
+        self,
+        *,
+        session: VerifiedAgentSession,
+        task: InvestigationTaskV1,
+        operator_id: str,
+        arguments: Mapping[str, Any],
+        idempotency_key: str,
+        now: datetime,
+    ) -> AgenticToolResult:
+        """Import one revision through the M24-07 writer under this task's lease.
+
+        ``origin``, the actor, ``task_id`` and ``lease_fence`` are derived from
+        the verified session and the locked task row; the agent payload cannot
+        claim them.  Every terminal import of this agent's row appends the
+        ``contribution_imported`` task event (D3), including a rejected one and
+        its typed ``validation_error_code``, so the append-only journal records
+        the writing task and the fence the row carried.
+        """
+        if self._contributions is None:
+            raise AgenticBrokerUnavailableError("the contribution import service is not wired")
+        self._require_bound_arguments(arguments, task=task)
+        payload = {
+            name: value
+            for name, value in arguments.items()
+            if name not in {"investigation_id", "task_id"}
+        }
+        try:
+            request = AgenticContributionImportArguments.model_validate(payload)
+            declaration = request.declaration()
+        except ValueError as exc:
+            raise AgenticArgumentsInvalidError(f"invalid contribution payload: {exc}") from None
+        authority = ContributionAuthority(
+            origin=WorkContributionOrigin.AGENT,
+            actor_id=operator_id,
+            task_id=task.id,
+            lease_fence=task.lease_fence,
+        )
+        try:
+            contribution = await self._contributions.import_revision(
+                self._investigation_id,
+                workspace_id=request.workspace_id,
+                workspace_revision_id=request.workspace_revision_id,
+                declaration=declaration,
+                authority=authority,
+                idempotency_key=_bound_effect_key("contribution", idempotency_key),
+            )
+        except WorkContributionError as exc:
+            raise AgenticContributionRefusedError(
+                str(exc),
+                code=exc.code,
+                status_code=exc.status_code,
+                details={str(name): str(value) for name, value in exc.details.items()},
+            ) from exc
+        event, created = await self._append_contribution_event(
+            contribution, task=task, operator_id=operator_id, now=now
+        )
+        if self._commit is not None:
+            await self._commit()
+        output = dict(contribution.to_payload())
+        output["event_id"] = str(event.id) if event is not None else None
+        output["event_created"] = created
+        return AgenticToolResult(
+            investigation_id=self._investigation_id,
+            session_id=session.session_id,
+            task_id=task.id,
+            tool_name=AGENTIC_CONTRIBUTION_TOOL,
+            status=contribution.import_status.value,
+            idempotent_replay=event is None or not created,
+            output=output,
+        )
+
+    async def _append_contribution_event(
+        self,
+        contribution: WorkContributionV1,
+        *,
+        task: InvestigationTaskV1,
+        operator_id: str,
+        now: datetime,
+    ) -> tuple[TaskEvent | None, bool]:
+        """Append ``contribution_imported`` once for this agent's own row.
+
+        A row already imported by another actor (host watcher or another task)
+        is returned unchanged but must not be journaled as this task's import.
+        """
+        if (
+            contribution.origin is not WorkContributionOrigin.AGENT
+            or contribution.task_id != task.id
+        ):
+            return None, False
+        return await append_task_event(
+            self._uow.investigation_tasks,
+            TaskEventDraft(
+                investigation_id=self._investigation_id,
+                task_id=task.id,
+                event_type=TaskEventType.CONTRIBUTION_IMPORTED,
+                actor=TaskActor(kind=TaskActorKind.OPERATOR, actor_id=operator_id),
+                idempotency_key=f"contribution:{contribution.id}",
+                payload={
+                    "contribution_id": str(contribution.id),
+                    "category": contribution.category.value,
+                    "import_status": contribution.import_status.value,
+                    "origin": contribution.origin.value,
+                    "workspace_id": contribution.workspace_id,
+                    "workspace_revision_id": contribution.workspace_revision_id,
+                    "file_relpath": contribution.file_relpath,
+                    "file_sha256": contribution.file_sha256,
+                    "task_id": str(contribution.task_id),
+                    "lease_fence": contribution.lease_fence,
+                    "observation_id": (
+                        str(contribution.observation_id)
+                        if contribution.observation_id is not None
+                        else None
+                    ),
+                    "finding_id": (
+                        str(contribution.finding_id)
+                        if contribution.finding_id is not None
+                        else None
+                    ),
+                    "sample_association_id": (
+                        str(contribution.sample_association_id)
+                        if contribution.sample_association_id is not None
+                        else None
+                    ),
+                    "validation_error_code": (
+                        contribution.validation_error_code.value
+                        if contribution.validation_error_code is not None
+                        else None
+                    ),
+                },
+            ),
+            occurred_at=now,
+        )
+
+    # ------------------------------------------------------- note capture path
+
+    async def _note_capture(
+        self,
+        *,
+        session: VerifiedAgentSession,
+        task: InvestigationTaskV1,
+        arguments: Mapping[str, Any],
+        idempotency_key: str,
+    ) -> AgenticToolResult:
+        """Publish one agent note/result through the host workspace layer.
+
+        The write is origin ``agent`` with this task's header (or
+        ``generated_by=session:<id>`` for ``results/``); it is a workspace
+        revision, never evidence.
+        """
+        if self._notes is None:
+            raise AgenticBrokerUnavailableError("the note capture service is not wired")
+        self._require_bound_arguments(arguments, task=task)
+        payload = {
+            name: value
+            for name, value in arguments.items()
+            if name not in {"investigation_id", "task_id"}
+        }
+        try:
+            request = AgenticNoteCaptureArguments.model_validate(payload)
+        except ValueError as exc:
+            raise AgenticArgumentsInvalidError(f"invalid note capture payload: {exc}") from None
+        try:
+            result = await self._notes.capture(
+                self._investigation_id,
+                task_id=task.id,
+                session_id=session.session_id,
+                target=request.target,
+                relpath=request.relpath,
+                text=request.text,
+                expected_sha256=request.expected_sha256,
+                idempotency_key=_bound_effect_key("note", idempotency_key),
+            )
+        except NoteCaptureError as exc:
+            raise AgenticNoteCaptureRefusedError(
+                str(exc),
+                code=exc.code,
+                status_code=exc.status_code,
+                details={str(name): str(value) for name, value in exc.details.items()},
+            ) from exc
+        except WorkspaceAgentError as exc:
+            raise AgenticNoteCaptureRefusedError(
+                str(exc), code=exc.code, status_code=exc.http_status
+            ) from exc
+        return AgenticToolResult(
+            investigation_id=self._investigation_id,
+            session_id=session.session_id,
+            task_id=task.id,
+            tool_name=NOTE_CAPTURE_TOOL,
+            status="captured",
+            idempotent_replay=False,
+            output={
+                "target": result.target,
+                "path": result.path,
+                "revision_id": result.revision_id,
+                "sha256": result.sha256,
+                "size": result.size,
+                "created": result.created,
+                "already_present": result.already_present,
+                "evidence": False,
+            },
+        )
+
     # ---------------------------------------------------------------- helpers
 
     @staticmethod
@@ -563,6 +977,17 @@ class AgenticToolBroker:
                 raise AgenticBindingRefusedError("the tool arguments target another investigation")
 
 
+def _bound_effect_key(prefix: str, bound_key: str) -> str:
+    """A <=128-char effect idempotency key derived from the D7-bound broker key.
+
+    The M24-07 import key and the workspace-agent key are bounded to 128
+    characters while the broker's own ``agent:<session>:<task>:<fence>:<client>``
+    identity is longer; hashing keeps the same session/task/fence binding.
+    """
+    digest = hashlib.sha256(bound_key.encode("ascii")).hexdigest()
+    return f"{prefix}:{digest}"
+
+
 def _required_int(arguments: Mapping[str, Any], name: str, *, minimum: int) -> int:
     value = arguments.get(name)
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
@@ -571,6 +996,7 @@ def _required_int(arguments: Mapping[str, Any], name: str, *, minimum: int) -> i
 
 
 __all__ = [
+    "AGENTIC_CONTRIBUTION_TOOL",
     "AGENTIC_HANDOFF_TOOL",
     "AGENTIC_IDEMPOTENCY_MAX_LENGTH",
     "AGENTIC_IDEMPOTENCY_PREFIX",
@@ -583,8 +1009,12 @@ __all__ = [
     "AgenticBindingRefusedError",
     "AgenticBrokerError",
     "AgenticBrokerUnavailableError",
+    "AgenticContributionImportArguments",
+    "AgenticContributionRefusedError",
     "AgenticInvestigationNotStartedError",
     "AgenticLeaseRefusedError",
+    "AgenticNoteCaptureArguments",
+    "AgenticNoteCaptureRefusedError",
     "AgenticProseAuthorityRequiredError",
     "AgenticSessionInactiveError",
     "AgenticToolBroker",

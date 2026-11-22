@@ -587,6 +587,89 @@ async def test_capture_artifact_is_the_canonical_input() -> None:
 
 
 @pytest.mark.asyncio
+async def test_foreign_capture_artifact_is_refused_before_dispatch() -> None:
+    fixture = await _script_fixture()
+    capture = b"\xd4\xc3\xb2\xa1" + b"another-investigation-capture"
+    sha256 = hashlib.sha256(capture).hexdigest()
+    blob = FakeBlob(
+        uuid4(), FakeBlobDescriptor("network-captures-quarantine", sha256, len(capture))
+    )
+    fixture.database.blobs[blob.id] = blob
+    fixture.artifact_store.payloads[blob.id] = capture
+    other = make_investigation()
+    fixture.database.investigations[other.id] = other
+    await make_evidence_recorder(fixture.database).record_existing_blob(
+        investigation_id=other.id,
+        kind=EvidenceKind.OTHER,
+        blob_id=blob.id,
+        sha256=sha256,
+        source="network.quarantine",
+        source_version="network.quarantine.v1",
+        object_type="network_capture",
+        object_id=sha256,
+        limitations=(),
+        idempotency_key="confined-script-foreign-capture",
+    )
+
+    result = await fixture.service.run(
+        _request(fixture, _SAFE_SCRIPT, sample_sha256=None, capture_artifact_id=blob.id)
+    )
+
+    assert result.status is ToolInvocationStatus.POLICY_DENIED
+    assert result.reason == "script_input_not_associated"
+    assert result.executed is False
+    assert fixture.harness.jobs.submissions == 0
+
+
+@pytest.mark.asyncio
+async def test_unassociated_capture_blob_is_refused_before_dispatch() -> None:
+    fixture = await _script_fixture()
+    capture = b"\xd4\xc3\xb2\xa1" + b"no-observation-capture"
+    sha256 = hashlib.sha256(capture).hexdigest()
+    blob = FakeBlob(
+        uuid4(), FakeBlobDescriptor("network-captures-quarantine", sha256, len(capture))
+    )
+    fixture.database.blobs[blob.id] = blob
+    fixture.artifact_store.payloads[blob.id] = capture
+
+    result = await fixture.service.run(
+        _request(fixture, _SAFE_SCRIPT, sample_sha256=None, capture_artifact_id=blob.id)
+    )
+
+    assert result.status is ToolInvocationStatus.POLICY_DENIED
+    assert result.reason == "script_input_not_associated"
+
+
+@pytest.mark.asyncio
+async def test_non_capture_blob_is_refused_even_with_an_observation() -> None:
+    fixture = await _script_fixture()
+    note = b"# note, not a capture\n"
+    sha256 = hashlib.sha256(note).hexdigest()
+    blob = FakeBlob(uuid4(), FakeBlobDescriptor("work-contributions", sha256, len(note)))
+    fixture.database.blobs[blob.id] = blob
+    fixture.artifact_store.payloads[blob.id] = note
+    await make_evidence_recorder(fixture.database).record_existing_blob(
+        investigation_id=fixture.investigation_id,
+        kind=EvidenceKind.OTHER,
+        blob_id=blob.id,
+        sha256=sha256,
+        source="network.quarantine",
+        source_version="network.quarantine.v1",
+        object_type="network_capture",
+        object_id=sha256,
+        limitations=(),
+        idempotency_key="confined-script-non-capture-blob",
+    )
+
+    result = await fixture.service.run(
+        _request(fixture, _SAFE_SCRIPT, sample_sha256=None, capture_artifact_id=blob.id)
+    )
+
+    assert result.status is ToolInvocationStatus.POLICY_DENIED
+    assert result.reason == "script_input_not_associated"
+
+
+@pytest.mark.asyncio
 async def test_replay_does_not_reexecute() -> None:
     fixture = await _script_fixture()
     request = _request(fixture, _SAFE_SCRIPT)

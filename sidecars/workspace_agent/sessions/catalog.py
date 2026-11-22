@@ -64,6 +64,15 @@ _SAFE_TEXT_PATTERN = (
     r"(?!.*[\x00-\x1f\x7f])[\s\S]*$"
 )
 _SAFE_TOKEN_PATTERN = r"^[A-Za-z0-9._:-]+$"
+# A workspace-relative note path: no absolute path, no empty/dot/dot-dot
+# component, no backslash and no control character.  The backend re-validates
+# the full path; this copy refuses before any signed request leaves the shim.
+_SAFE_RELPATH_PATTERN = (
+    r"^(?!.*\\)"
+    r"(?!\.\.?/)(?!.*/\.\.?(?:/|$))"
+    r"(?!.*[\x00-\x1f\x7f])"
+    r"[^/]+(?:/[^/]+)*$"
+)
 
 _BROKER_TOOL_TIMEOUT_SECONDS = 600.0
 _BRIDGE_TIMEOUT_SECONDS = 1800.0
@@ -369,6 +378,9 @@ def _broker_tool(
     description: str,
     properties: Mapping[str, Any],
     required: Sequence[str],
+    *,
+    timeout_seconds: float = _BROKER_TOOL_TIMEOUT_SECONDS,
+    max_arguments_bytes: int = MAX_ARGUMENTS_BYTES,
 ) -> ToolSpec:
     return ToolSpec(
         mcp_name="autowork_" + broker_name.replace(".", "_"),
@@ -381,8 +393,145 @@ def _broker_tool(
         path_template=BROKER_TOOL_PATH,
         path_params=("investigation_id",),
         body_kind="broker",
-        timeout_seconds=_BROKER_TOOL_TIMEOUT_SECONDS,
+        timeout_seconds=timeout_seconds,
+        max_arguments_bytes=max_arguments_bytes,
     )
+
+
+def _observation_declaration() -> dict[str, Any]:
+    return _object(
+        {
+            "object_type": _string(enum=("sample", "file", "host", "ip", "domain", "url")),
+            "method": _string(
+                enum=(
+                    "hash",
+                    "static_analysis",
+                    "string_extraction",
+                    "yara_scan",
+                    "dynamic_behaviour",
+                    "network_capture_analysis",
+                    "dns_query",
+                    "http_request",
+                    "negative_check",
+                )
+            ),
+            "object_id": _string(min_length=1, max_length=512),
+            "tool": _string(min_length=1, max_length=128),
+            "tool_version": _string(min_length=1, max_length=64),
+            "parameters": _object({}, additional=True),
+            "limitations": _array(_string(min_length=1, max_length=64_000), max_items=8),
+            "observed_at": _string(min_length=1, max_length=64, pattern=_NO_CONTROL_PATTERN),
+        },
+        ("object_type", "method", "object_id", "tool", "tool_version"),
+    )
+
+
+def _finding_declaration() -> dict[str, Any]:
+    return _object(
+        {
+            "kind": _string(
+                enum=(
+                    "new_sample",
+                    "infection_chain",
+                    "capability",
+                    "network_behaviour",
+                    "claim_verification",
+                    "detection",
+                )
+            ),
+            "assessment": _string(enum=("supported", "refuted", "qualified", "inconclusive")),
+            "statement": _string(min_length=1, max_length=65_536),
+            "observation_refs": _array(_uuid(), max_items=128, unique=True),
+            "claim_refs": _array(
+                _string(min_length=1, max_length=128, pattern=_NO_CONTROL_PATTERN),
+                max_items=64,
+                unique=True,
+            ),
+            "novelty": _string(
+                enum=(
+                    "new_to_article",
+                    "already_documented_but_new_detail",
+                    "claim_correction",
+                    "not_confirmed",
+                )
+            ),
+            "scope": _string(max_length=16_384),
+            "limitations": _array(_string(min_length=1, max_length=64_000), max_items=32),
+            "proposed_sample_sha256": _string(
+                min_length=64, max_length=64, pattern=_SHA256_PATTERN
+            ),
+        },
+        ("kind", "assessment", "statement"),
+    )
+
+
+_NOTE_CAPTURE = _broker_tool(
+    "note.capture",
+    (
+        "Publish one agent note (notes/agents/<task_id>/) or one generated result "
+        "(results/) through the host workspace layer. The write is never evidence."
+    ),
+    {
+        "target": _string(enum=("note", "result")),
+        "relpath": _string(min_length=1, max_length=512, pattern=_SAFE_RELPATH_PATTERN),
+        "text": _string(min_length=1, max_length=1_048_576),
+        "expected_sha256": _string(pattern=r"^(?:new|[0-9a-f]{64})$"),
+    },
+    ("relpath", "text"),
+    timeout_seconds=_COMMAND_TIMEOUT_SECONDS,
+    max_arguments_bytes=MAX_FRAME_BYTES,
+)
+
+
+_CONTRIBUTION_IMPORT = _broker_tool(
+    "contribution.import",
+    (
+        "Import one bound workspace revision as a work contribution, observation "
+        "or finding through the single M24-07 writer. Origin, task and lease "
+        "fence are bound to the signed session; imported findings are never "
+        "auto-supported and a new sample stays a candidate until human G3."
+    ),
+    {
+        "workspace_id": _string(pattern=r"^ws-[0-9a-f]{32}$"),
+        "workspace_revision_id": _string(pattern=r"^rev-[0-9a-f]{32}$"),
+        "category": _string(enum=("work_contribution", "observation", "finding")),
+        "observation": _observation_declaration(),
+        "finding": _finding_declaration(),
+    },
+    ("workspace_id", "workspace_revision_id"),
+    timeout_seconds=_COMMAND_TIMEOUT_SECONDS,
+)
+
+
+_RUN_SCRIPT = _broker_tool(
+    "analysis.run_script",
+    (
+        "Run one python3-only agent script in the attested analysis worker: one "
+        "canonical sample/capture input read-only, no network, bounded resources, "
+        "archived outputs. The output is an observation, never a finding."
+    ),
+    {
+        "script": _string(min_length=1, max_length=1_048_576),
+        "interpreter": _string(enum=("python3",)),
+        "sample_sha256": _string(min_length=64, max_length=64, pattern=_SHA256_PATTERN),
+        "capture_artifact_id": _uuid(),
+        "limits": _object(
+            {
+                "wall_seconds": {"type": "number", "minimum": 60, "maximum": 300},
+                "cpu_seconds": _integer(minimum=30, maximum=120),
+                "memory_bytes": _integer(minimum=256 * 1024 * 1024, maximum=1024 * 1024 * 1024),
+                "file_size_bytes": _integer(minimum=1024 * 1024, maximum=16 * 1024 * 1024),
+                "scratch_max_files": _integer(minimum=1, maximum=512),
+                "scratch_max_bytes": _integer(minimum=1024 * 1024, maximum=64 * 1024 * 1024),
+                "stdout_max_bytes": _integer(minimum=1024, maximum=1024 * 1024),
+                "stderr_max_bytes": _integer(minimum=1024, maximum=1024 * 1024),
+                "max_processes": _integer(minimum=1, maximum=128),
+            }
+        ),
+    },
+    ("script", "interpreter"),
+    max_arguments_bytes=MAX_FRAME_BYTES,
+)
 
 
 # The static broker catalogue. A tool that is absent here is not callable at
@@ -527,6 +676,9 @@ _BROKER_CATALOGUE: tuple[ToolSpec, ...] = (
         },
         ("query", "justification", "evidence_refs"),
     ),
+    _RUN_SCRIPT,
+    _NOTE_CAPTURE,
+    _CONTRIBUTION_IMPORT,
 )
 
 
