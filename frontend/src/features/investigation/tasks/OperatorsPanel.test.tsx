@@ -139,6 +139,36 @@ describe("OperatorsPanel", () => {
     );
   });
 
+  it("masque la reprise d’une session quand la tâche est terminale", async () => {
+    installFetch(({ url, init }) => {
+      const method = init?.method ?? "GET";
+      if (url.endsWith("/agent-sessions") && method === "GET") {
+        return jsonResponse([makeSession({ state: "lost" })]);
+      }
+      if (url.endsWith("/tasks") && method === "GET") {
+        return jsonResponse(
+          taskPage(
+            makeTask({
+              status: "completed",
+              assigned_actor_kind: "operator",
+              assigned_actor_id: "operator:codex_cli",
+            }),
+          ),
+        );
+      }
+      return errorResponse(500, "unexpected_request");
+    });
+
+    renderPanel();
+
+    expect(
+      await screen.findByText(/Reprise masquée : la tâche est terminée/),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Reprendre la session" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("affiche l’état agent absent quand les sessions sont indisponibles", async () => {
     installFetch(({ url, init }) => {
       const method = init?.method ?? "GET";

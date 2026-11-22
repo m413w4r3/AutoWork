@@ -14,6 +14,7 @@ import { toWorkshopApiError } from "../api/client";
 import { useTasks } from "../api/tasks";
 import type { TaskPriority, TaskStatus } from "../api/types";
 import { useWorkspaceStatus } from "../api/workspace";
+import { AVAILABILITY_LABELS } from "../workspace/workspaceLabels";
 import { TASK_PRIORITY_LABELS, TASK_STATUS_LABELS } from "./labels";
 import { TaskCard } from "./TaskCard";
 
@@ -96,8 +97,10 @@ export function TaskWorkspace({
       ) : (
         <p role="alert" className="error-message">
           Workspace local indisponible (
-          {workspace.data?.availability_code ?? "unavailable"}) : les
-          attributions, transferts et notes sont masqués.
+          {workspace.data === undefined
+            ? "indisponible"
+            : AVAILABILITY_LABELS[workspace.data.availability_code]}
+          ) : les attributions, transferts et notes sont masqués.
         </p>
       )}
 

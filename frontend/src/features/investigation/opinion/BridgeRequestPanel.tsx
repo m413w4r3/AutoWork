@@ -166,7 +166,10 @@ export function BridgeRequestPanel({
         {ANCHOR_EXAMPLES}.{" "}
         {targetType === null
           ? "Ancre invalide."
-          : `Espace d’ancrage : ${TARGET_BLOCK_LABELS[targetType]}.`}
+          : `Espace d’ancrage : ${TARGET_BLOCK_LABELS[targetType]}.`}{" "}
+        Le contrat n’expose aucune lecture des <code>publication_anchors</code>{" "}
+        : la liste ci-dessus reprend les ancres déjà présentes dans l’avis, et
+        la saisie libre reste validée côté serveur à la soumission.
       </p>
 
       <label htmlFor="opinion-note-block">Bloc de l’avis visé</label>

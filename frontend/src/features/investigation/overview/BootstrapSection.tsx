@@ -22,6 +22,11 @@ import {
   WorkshopTypedErrorState,
 } from "../shell/WorkshopStates";
 import {
+  DOWNLOAD_STATUS_LABELS,
+  INVOCATION_STATUS_LABELS,
+  labelOf,
+} from "../samples/samplesLabels";
+import {
   COVERAGE_KIND_LABELS,
   IOC_KIND_LABELS,
   PLAN_STATE_LABELS,
@@ -307,11 +312,16 @@ function SnapshotIoc({ ioc }: { ioc: BootstrapSnapshotIocV1 }) {
         {ioc.origin === "seed" ? "graine" : "découvert"}
       </p>
       <p>
-        Statut {ioc.status}
+        Statut {INVOCATION_STATUS_LABELS[ioc.status]}
         {ioc.reason ? ` · ${REASON_LABELS[ioc.reason]}` : ""} ·{" "}
         {formatCount(ioc.operations.length)} opération(s) ·{" "}
         {formatCount(ioc.association_ids.length)} association(s)
-        {ioc.download ? ` · téléchargement ${ioc.download.status}` : ""}
+        {ioc.download
+          ? ` · téléchargement ${labelOf(
+              DOWNLOAD_STATUS_LABELS,
+              ioc.download.status,
+            )}`
+          : ""}
       </p>
     </li>
   );

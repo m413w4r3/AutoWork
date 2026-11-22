@@ -9,6 +9,7 @@ import {
   BLOCK_ORDER,
   NOTE_RELATION_LABELS,
   NOTE_STATE_LABELS,
+  OPINION_STATUS_LABELS,
   PROTOCOL_FIGURE_LABELS,
   QUALIFICATION_LABELS,
   shortHash,
@@ -37,9 +38,9 @@ export function OpinionPreview({
     <section className="job-card" aria-labelledby="opinion-render-heading">
       <h3 id="opinion-render-heading">Aperçu du rendu de l’avis courant</h3>
       <p>
-        Version {opinion.version} · {opinion.status} · SHA-256{" "}
-        <code>{opinion.content_sha256}</code>. L’aperçu PDF réel est rendu par
-        le serveur avec les tableaux, graphiques, figures, légendes et
+        Version {opinion.version} · {OPINION_STATUS_LABELS[opinion.status]} ·
+        SHA-256 <code>{opinion.content_sha256}</code>. L’aperçu PDF réel est
+        rendu par le serveur avec les tableaux, graphiques, figures, légendes et
         placements de l’article.
       </p>
 

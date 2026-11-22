@@ -5,6 +5,7 @@ import type {
   NoteTargetBlockType,
   ProseOpinionBlockType,
 } from "../api/opinionProposals";
+import type { OpinionVersionV1 } from "./types";
 
 export const BLOCK_LABELS: Record<ProseOpinionBlockType, string> = {
   key_findings: "Apports de l’enquête",
@@ -38,6 +39,13 @@ export const NOTE_RELATION_LABELS: Record<AnalystObservationRelation, string> =
     refutes: "Réfute",
     qualifies: "Nuance",
     unresolved: "Sans relation tranchée",
+  };
+
+export const OPINION_STATUS_LABELS: Record<OpinionVersionV1["status"], string> =
+  {
+    draft: "Brouillon",
+    approved: "Approuvé",
+    rejected: "Refusé",
   };
 
 export const PROPOSAL_STATUS_LABELS: Record<NoteProposalStatus, string> = {

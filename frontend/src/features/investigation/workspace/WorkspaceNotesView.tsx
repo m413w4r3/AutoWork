@@ -26,19 +26,11 @@ import {
   formatTimestamp,
   isHumanNotePath,
   labelOf,
-  workshopErrorText,
 } from "./workspaceLabels";
+import { WorkshopErrorNotice } from "../shell/WorkshopErrorNotice";
 import "./workspace.css";
 
 const DEFAULT_NOTE_PATH = "notes/humaines/";
-
-function ErrorNotice({ label, error }: { label: string; error: unknown }) {
-  return (
-    <p className="error-message" role="alert">
-      {workshopErrorText(error, label)}
-    </p>
-  );
-}
 
 function Counts({ counts }: { counts: WorkspaceCountsV1 }) {
   const entries: Array<[string, number]> = [
@@ -163,7 +155,7 @@ export function WorkspaceNotesView({
   }
   if (status.error !== null) {
     return (
-      <ErrorNotice
+      <WorkshopErrorNotice
         label="Le statut du workspace n’a pas pu être lu."
         error={status.error}
       />
@@ -175,17 +167,19 @@ export function WorkspaceNotesView({
   const agentStatus = agent.data?.status;
   const agentDown =
     agentStatus === "unavailable" || agentStatus === "unconfigured";
+  // Writing requires a *proven* available agent: a pending or failed probe is
+  // not evidence of availability (m5).
+  const agentAvailable = agentStatus === "available";
   const availabilityCode = current.availability_code;
   const localUnavailable =
     availabilityCode === "unavailable" ||
     availabilityCode === "unconfigured" ||
     agentDown;
   const isBound = current.workspace_state === "bound";
-  const canWrite =
-    isBound && current.workspace_available && agentDown === false;
+  const canWrite = isBound && current.workspace_available && agentAvailable;
   const canEnsure =
     isBound === false &&
-    agentDown === false &&
+    agentAvailable &&
     (availabilityCode === "not_bound" || availabilityCode === "available");
   const logicalPath =
     current.binding !== null
@@ -204,7 +198,11 @@ export function WorkspaceNotesView({
     current.availability_reason ??
     (agentDown
       ? "L’agent hôte ne répond pas."
-      : "Le workspace n’est pas disponible.");
+      : agent.isPending
+        ? "La disponibilité de l’agent n’est pas encore prouvée."
+        : agent.error !== null
+          ? "L’état de l’agent est inconnu (lecture en échec)."
+          : "Le workspace n’est pas disponible.");
 
   const normalizedDraftPath = noteDraftPath.trim();
   const expectedSha =
@@ -355,7 +353,7 @@ export function WorkspaceNotesView({
           ) : null}
         </div>
         {ensure.error !== null ? (
-          <ErrorNotice
+          <WorkshopErrorNotice
             label="La création du workspace a échoué."
             error={ensure.error}
           />
@@ -375,14 +373,14 @@ export function WorkspaceNotesView({
           </p>
         ) : null}
         {sync.error !== null ? (
-          <ErrorNotice
+          <WorkshopErrorNotice
             label="La synchronisation a échoué."
             error={sync.error}
           />
         ) : null}
         {sync.data === undefined ? null : <SyncReport report={sync.data} />}
         {exportRun.error !== null ? (
-          <ErrorNotice
+          <WorkshopErrorNotice
             label="L’export du workspace a échoué."
             error={exportRun.error}
           />
@@ -479,7 +477,7 @@ export function WorkspaceNotesView({
             <p role="status">Chargement de la note {notePath}…</p>
           ) : null}
           {note.error !== null ? (
-            <ErrorNotice
+            <WorkshopErrorNotice
               label="La vue de la note n’a pas pu être lue."
               error={note.error}
             />

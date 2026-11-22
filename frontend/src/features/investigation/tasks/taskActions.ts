@@ -9,8 +9,11 @@
  * `request_input`, `resume`) are deliberately absent: the browser sends human
  * commands only.
  *
- * "Demander un avis à Bridge" and "Demander une rédaction" are not listed:
- * the frozen API client exposes no task-scoped consultation or drafting route.
+ * "Demander un avis à Bridge" and "Demander une rédaction" are not listed.
+ * `POST …/note-proposals` does accept an optional `task_id`, but it is an
+ * opinion-anchored drafting route: it also requires a validated article
+ * anchor, a target block and the working-state CAS, and it is exposed by the
+ * « Note de l'analyste » view. There is no task-scoped consultation route.
  */
 
 import type { AgentSessionView } from "../api/agentSessions";

@@ -381,6 +381,25 @@ describe("InvestigationTab", () => {
     ).toBeDisabled();
   });
 
+  it("ouvre l’enquête existante sans relancer un start legacy", async () => {
+    const user = userEvent.setup();
+    const { calls } = renderInvestigation(
+      makeInvestigation({ status: "running" }),
+    );
+
+    const open = await screen.findByRole("button", {
+      name: "Ouvrir l’enquête sur cette version",
+    });
+    await user.click(open);
+
+    expect(
+      await screen.findByRole("heading", {
+        name: `Enquête ${INVESTIGATION_ID}`,
+      }),
+    ).toBeInTheDocument();
+    expect(calls.some((call) => call.init?.method === "POST")).toBe(false);
+  });
+
   it("affiche l’état awaiting_review", async () => {
     renderInvestigation(
       makeInvestigation({
