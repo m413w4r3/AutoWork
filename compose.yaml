@@ -182,6 +182,10 @@ services:
       COLLECTION_PLAYWRIGHT_SIDECAR_URL: ${COLLECTION_PLAYWRIGHT_SIDECAR_URL:-}
       COLLECTION_BROWSER_CONTROL_SOCKET: ${COLLECTION_BROWSER_CONTROL_SOCKET:-}
       COLLECTION_BROWSER_NAVIGATION_ENABLED: ${COLLECTION_BROWSER_NAVIGATION_ENABLED:-false}
+      # Host workspace agent (M24-02): AF_UNIX socket and per-start token,
+      # mounted read-only below. Never the workspace tree.
+      WORKSPACE_AGENT_SOCKET: /run/workspace-agent/workspace-agent.sock
+      WORKSPACE_AGENT_TOKEN_FILE: /run/workspace-agent/auth-token
       PDF_MAX_DOCUMENT_BYTES: ${PDF_MAX_DOCUMENT_BYTES:-26214400}
       PDF_MAX_PAGES: ${PDF_MAX_PAGES:-200}
       PDF_PARSE_TIMEOUT_SECONDS: ${PDF_PARSE_TIMEOUT_SECONDS:-15}
@@ -298,6 +302,9 @@ services:
       - ./var/diagnostics:/var/diagnostics
       - ./var/pdf-inspections:/var/cache/autowork/pdf-inspections
       - browser-control:/run/browser:ro
+      # Runtime socket directory of the host workspace agent; :ro still permits
+      # UDS connect and forbids backend-side create/unlink (acquirer precedent).
+      - ${AUTOWORK_WORKSPACE_SOCKET_DIR:-./var/run/workspace-agent}:/run/workspace-agent:ro
     ports:
       - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
     extra_hosts:

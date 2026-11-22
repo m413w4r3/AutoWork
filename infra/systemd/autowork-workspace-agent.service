@@ -1,0 +1,24 @@
+# systemd --user unit for the AutoWork host workspace agent.
+# This template is rendered by scripts/install-workspace-agent.sh, which
+# substitutes the repository-path placeholder below with the checkout path.
+# Do not edit the installed copy under ~/.config/systemd/user; edit this
+# template instead.
+[Unit]
+Description=AutoWork host workspace agent (AF_UNIX, stdlib)
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3.12 -m sidecars.workspace_agent --root %h/work/autowork --socket-dir %t/autowork-workspace --group autowork-workspace
+Environment=PYTHONPATH=@AUTOWORK_REPOSITORY_ROOT@
+RuntimeDirectory=autowork-workspace
+RuntimeDirectoryMode=0750
+UMask=0007
+Restart=on-failure
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/work/autowork %t/autowork-workspace
+
+[Install]
+WantedBy=default.target
