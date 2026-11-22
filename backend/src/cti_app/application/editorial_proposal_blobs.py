@@ -19,6 +19,7 @@ from cti_app.application.editorial_synthesis.candidate import SynthesisCandidate
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import MAX_ARTIFACT_BYTES
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
+from cti_app.domain.editorial_enrichment_patch import VISUAL_REVISION_PATCH_SCHEMA_VERSION
 from cti_app.domain.editorial_proposal import EditorialProposal
 
 PATCH_BUCKET = "editorial-proposal-patches"
@@ -67,7 +68,8 @@ class EditorialProposalBlobManager:
             raise EditorialProposalBlobError("proposal_patch_unavailable") from None
         if (
             not isinstance(patch, dict)
-            or patch.get("schema_version") != "editorial-patch-v1"
+            or patch.get("schema_version")
+            not in {"editorial-patch-v1", VISUAL_REVISION_PATCH_SCHEMA_VERSION}
             or patch.get("operation") != proposal.operation
             or patch.get("occurrence_id") != str(proposal.occurrence_id)
             or patch.get("target_id") != proposal.target_id

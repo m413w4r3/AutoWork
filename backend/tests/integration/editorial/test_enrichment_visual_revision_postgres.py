@@ -30,6 +30,7 @@ from cti_app.application.editorial_proposal_adoption_inputs import (
 )
 from cti_app.application.editorial_proposals import EditorialProposalService
 from cti_app.application.editorial_visual_revision import VisualRevisionContextLoader
+from cti_app.application.editorial_workspace.registry import registry_hash
 from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_editorial_enrichment import (
@@ -52,6 +53,7 @@ from cti_app.domain.editorial_enrichment_patch import (
 from cti_app.domain.editorial_proposal import EditorialProposalState
 from cti_app.domain.editorial_workspace import (
     EditorialBlockKind,
+    EditorialSourceStage,
     bootstrap_block_registry,
 )
 from cti_app.domain.production import ProductionArtifactStage
@@ -206,6 +208,74 @@ async def _read_enrichment(app: Any, uow_factory: Any, run_id: UUID) -> tuple[An
     return artifact, payload
 
 
+async def _seed_ready_workspace_snapshot(
+    *,
+    workspace_service: Any,
+    uow_factory: Any,
+    artifact_store: Any,
+    subject_id: UUID,
+) -> None:
+    """Persist the pinned registry a first post-enrichment snapshot produces.
+
+    The shared route seed leaves a synthesis-only workspace snapshot behind.
+    When the workshop later reconciles the manually seeded enrichment artifact
+    against it, the whole imported stage is conservatively marked
+    ``needs_review`` because there is no lineage to compare. A real first
+    snapshot taken after both pinned stages exist bootstraps every occurrence
+    READY (``EditorialWorkspaceService._load_current`` with no previous record),
+    and that is the state manual visual revisions require. Compute the exact
+    pins with the service itself, then append the bootstrap registry unchanged.
+    """
+    async with uow_factory() as uow:
+        computed = await workspace_service.snapshot_record_in_uow(uow, subject_id)
+    # The context manager rolls the reconciled preview record back uncommitted.
+    assert computed.enrichment_artifact_id is not None
+    assert computed.enrichment_canonical_sha256 is not None
+    async with uow_factory() as uow:
+        synthesis_artifact = await uow.production_artifacts.get(computed.synthesis_artifact_id)
+        enrichment_artifact = await uow.production_artifacts.get(computed.enrichment_artifact_id)
+    assert synthesis_artifact is not None and synthesis_artifact.canonical_blob_id is not None
+    assert enrichment_artifact is not None and enrichment_artifact.canonical_blob_id is not None
+    synthesis_payload = await artifact_store.read_json(synthesis_artifact.canonical_blob_id)
+    enrichment_payload = await artifact_store.read_json(enrichment_artifact.canonical_blob_id)
+    entries = (
+        *bootstrap_block_registry(
+            artifact_id=synthesis_artifact.id,
+            canonical_sha256=computed.synthesis_canonical_sha256,
+            source_stage=EditorialSourceStage.SYNTHESIS,
+            canonical_content=synthesis_payload,
+        ),
+        *bootstrap_block_registry(
+            artifact_id=enrichment_artifact.id,
+            canonical_sha256=computed.enrichment_canonical_sha256,
+            source_stage=EditorialSourceStage.EDITORIAL_ENRICHMENT,
+            canonical_content=enrichment_payload,
+        ),
+    )
+    record = replace(
+        computed,
+        snapshot_id=uuid4(),
+        block_registry=entries,
+        registry_hash=registry_hash(entries),
+    )
+    async with uow_factory() as uow:
+        await uow.editorial_workspace_snapshots.append_if_absent(record)
+        await uow.commit()
+
+
+async def _visual_revision_services(
+    app: Any, uow_factory: Any, subject_id: UUID
+) -> tuple[Any, EditorialProposalService, EditorialProposalAdoptionService]:
+    workspace_service, proposal_service, adoption_service = _visual_services(app, uow_factory)
+    await _seed_ready_workspace_snapshot(
+        workspace_service=workspace_service,
+        uow_factory=uow_factory,
+        artifact_store=app.state.production_artifact_store,
+        subject_id=subject_id,
+    )
+    return workspace_service, proposal_service, adoption_service
+
+
 async def _adopt(
     service: EditorialProposalAdoptionService,
     proposal: Any,
@@ -278,7 +348,14 @@ async def _create_table_proposal(
                     {
                         "cells": ["Synthetic finding", "Synthetic test context."],
                         "evidence_refs": [evidence_ref],
-                    }
+                    },
+                    {
+                        "cells": [
+                            "Synthetic finding",
+                            "The synthetic report records this finding.",
+                        ],
+                        "evidence_refs": [evidence_ref],
+                    },
                 ],
                 "purpose": {
                     "question": question,
@@ -365,13 +442,15 @@ async def test_caption_adoption_works_for_article_and_brief(
         base_table_placement_factory=_lead_anchor_placement,
         publication_kind=publication_kind,
     )
-    workspace_service, proposal_service, adoption_service = _visual_services(app, uow_factory)
+    workspace_service, proposal_service, adoption_service = await _visual_revision_services(
+        app, uow_factory, seeded.subject.id
+    )
     snapshot = await workspace_service.snapshot(seeded.subject.id)
     assert snapshot["publication_kind"] == expected
     table = _enrichment_block(snapshot, kind="table")
     proposal = await proposal_service.prepare_visual_revision(
         subject_id=seeded.subject.id,
-        snapshot_id=snapshot["snapshot_id"],
+        snapshot_id=UUID(snapshot["snapshot_id"]),
         occurrence_id=UUID(table["block_id"]),
         actor_id=seeded.actor_id,
         idempotency_key=f"visual-caption-{uuid4().hex}",
@@ -405,7 +484,9 @@ async def test_caption_only_change_preserves_figure_archive_and_original_caption
         base_table_placement_factory=_lead_anchor_placement,
         source_figure_count=1,
     )
-    workspace_service, proposal_service, adoption_service = _visual_services(app, uow_factory)
+    workspace_service, proposal_service, adoption_service = await _visual_revision_services(
+        app, uow_factory, seeded.subject.id
+    )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
     ) as client:
@@ -433,7 +514,7 @@ async def test_caption_only_change_preserves_figure_archive_and_original_caption
         archived_sha256 = base_figure.resolved_figure.sha256
         proposal = await proposal_service.prepare_visual_revision(
             subject_id=seeded.subject.id,
-            snapshot_id=snapshot["snapshot_id"],
+            snapshot_id=UUID(snapshot["snapshot_id"]),
             occurrence_id=UUID(figure["block_id"]),
             actor_id=seeded.actor_id,
             idempotency_key=f"visual-figure-caption-{uuid4().hex}",
@@ -483,7 +564,9 @@ async def test_move_changes_only_placement_and_records_history_and_impact(
     seeded, app, model_gateway, _content = await _ready_for_manual_table_route(
         uow_factory, base_table_placement_factory=_lead_anchor_placement
     )
-    workspace_service, proposal_service, adoption_service = _visual_services(app, uow_factory)
+    workspace_service, proposal_service, adoption_service = await _visual_revision_services(
+        app, uow_factory, seeded.subject.id
+    )
     snapshot = await workspace_service.snapshot(seeded.subject.id)
     table = _enrichment_block(snapshot, kind="table")
     destination = _paragraph_block(snapshot, position=1)
@@ -491,7 +574,7 @@ async def test_move_changes_only_placement_and_records_history_and_impact(
     base_table = editorial_enrichment_from_json(base_payload).tables[0]
     proposal = await proposal_service.prepare_visual_revision(
         subject_id=seeded.subject.id,
-        snapshot_id=snapshot["snapshot_id"],
+        snapshot_id=UUID(snapshot["snapshot_id"]),
         occurrence_id=UUID(table["block_id"]),
         actor_id=seeded.actor_id,
         idempotency_key=f"visual-move-{uuid4().hex}",
@@ -543,13 +626,15 @@ async def test_move_vs_concurrent_edit_has_exactly_one_winner(
     seeded, app, _model_gateway, _content = await _ready_for_manual_table_route(
         uow_factory, base_table_placement_factory=_lead_anchor_placement
     )
-    workspace_service, proposal_service, adoption_service = _visual_services(app, uow_factory)
+    workspace_service, proposal_service, adoption_service = await _visual_revision_services(
+        app, uow_factory, seeded.subject.id
+    )
     snapshot = await workspace_service.snapshot(seeded.subject.id)
     table = _enrichment_block(snapshot, kind="table")
     destination = _paragraph_block(snapshot, position=1)
     move = await proposal_service.prepare_visual_revision(
         subject_id=seeded.subject.id,
-        snapshot_id=snapshot["snapshot_id"],
+        snapshot_id=UUID(snapshot["snapshot_id"]),
         occurrence_id=UUID(table["block_id"]),
         actor_id=seeded.actor_id,
         idempotency_key=f"visual-move-race-{uuid4().hex}",
@@ -561,7 +646,7 @@ async def test_move_vs_concurrent_edit_has_exactly_one_winner(
     )
     caption = await proposal_service.prepare_visual_revision(
         subject_id=seeded.subject.id,
-        snapshot_id=snapshot["snapshot_id"],
+        snapshot_id=UUID(snapshot["snapshot_id"]),
         occurrence_id=UUID(table["block_id"]),
         actor_id=seeded.actor_id,
         idempotency_key=f"visual-caption-race-{uuid4().hex}",
@@ -583,7 +668,15 @@ async def test_move_vs_concurrent_edit_has_exactly_one_winner(
     assert len(failures) == 1
     loss = failures[0]
     assert isinstance(loss, EditorialProposalAdoptionError)
-    assert loss.code in {"proposal_stale", "proposal_base_stale"}
+    # A concurrent winner stales the sibling inside its own transaction, so
+    # the loser already observes a terminal state under the lock; the shared
+    # adoption contract reports that as proposal_state_conflict (same 409 /
+    # manual_edit_stale mapping, see test_proposal_accept_exposure_postgres).
+    assert loss.code in {
+        "proposal_stale",
+        "proposal_base_stale",
+        "proposal_state_conflict",
+    }
     async with uow_factory() as uow:
         artifacts = await uow.production_artifacts.list_for_run(seeded.run.id)
         proposals = [
@@ -627,7 +720,9 @@ async def test_reorder_permutation_under_lock_and_reorder_vs_create_one_winner(
         "kind": evidence.kind.value,
         "evidence_key": evidence.evidence_key,
     }
-    workspace_service, proposal_service, adoption_service = _visual_services(app, uow_factory)
+    workspace_service, proposal_service, adoption_service = await _visual_revision_services(
+        app, uow_factory, seeded.subject.id
+    )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
     ) as client:
@@ -666,7 +761,7 @@ async def test_reorder_permutation_under_lock_and_reorder_vs_create_one_winner(
         keys = [block["element_key"] for block in group]
         proposal = await proposal_service.prepare_visual_revision(
             subject_id=seeded.subject.id,
-            snapshot_id=snapshot["snapshot_id"],
+            snapshot_id=UUID(snapshot["snapshot_id"]),
             occurrence_id=anchor_id,
             actor_id=seeded.actor_id,
             idempotency_key=f"visual-reorder-{uuid4().hex}",
@@ -713,7 +808,15 @@ async def test_reorder_permutation_under_lock_and_reorder_vs_create_one_winner(
     assert len(failures) == 1
     loss = failures[0]
     assert isinstance(loss, EditorialProposalAdoptionError)
-    assert loss.code in {"proposal_stale", "proposal_base_stale"}
+    # A concurrent winner stales the sibling inside its own transaction, so
+    # the loser already observes a terminal state under the lock; the shared
+    # adoption contract reports that as proposal_state_conflict (same 409 /
+    # manual_edit_stale mapping, see test_proposal_accept_exposure_postgres).
+    assert loss.code in {
+        "proposal_stale",
+        "proposal_base_stale",
+        "proposal_state_conflict",
+    }
     async with uow_factory() as uow:
         artifacts = await uow.production_artifacts.list_for_run(seeded.run.id)
     versions = [
@@ -756,12 +859,14 @@ async def test_adoption_replay_is_idempotent(
     seeded, app, _model_gateway, _content = await _ready_for_manual_table_route(
         uow_factory, base_table_placement_factory=_lead_anchor_placement
     )
-    workspace_service, proposal_service, adoption_service = _visual_services(app, uow_factory)
+    workspace_service, proposal_service, adoption_service = await _visual_revision_services(
+        app, uow_factory, seeded.subject.id
+    )
     snapshot = await workspace_service.snapshot(seeded.subject.id)
     table = _enrichment_block(snapshot, kind="table")
     proposal = await proposal_service.prepare_visual_revision(
         subject_id=seeded.subject.id,
-        snapshot_id=snapshot["snapshot_id"],
+        snapshot_id=UUID(snapshot["snapshot_id"]),
         occurrence_id=UUID(table["block_id"]),
         actor_id=seeded.actor_id,
         idempotency_key=f"visual-replay-{uuid4().hex}",
@@ -795,14 +900,16 @@ async def test_stale_proposal_cannot_be_accepted_and_reject_leaves_canonical_unc
     seeded, app, _model_gateway, _content = await _ready_for_manual_table_route(
         uow_factory, base_table_placement_factory=_lead_anchor_placement
     )
-    workspace_service, proposal_service, adoption_service = _visual_services(app, uow_factory)
+    workspace_service, proposal_service, adoption_service = await _visual_revision_services(
+        app, uow_factory, seeded.subject.id
+    )
     snapshot = await workspace_service.snapshot(seeded.subject.id)
     table = _enrichment_block(snapshot, kind="table")
     destination = _paragraph_block(snapshot, position=1)
     base_version, base_payload = await _read_enrichment(app, uow_factory, seeded.run.id)
     rejectable = await proposal_service.prepare_visual_revision(
         subject_id=seeded.subject.id,
-        snapshot_id=snapshot["snapshot_id"],
+        snapshot_id=UUID(snapshot["snapshot_id"]),
         occurrence_id=UUID(table["block_id"]),
         actor_id=seeded.actor_id,
         idempotency_key=f"visual-reject-caption-{uuid4().hex}",
@@ -831,7 +938,7 @@ async def test_stale_proposal_cannot_be_accepted_and_reject_leaves_canonical_unc
 
     caption = await proposal_service.prepare_visual_revision(
         subject_id=seeded.subject.id,
-        snapshot_id=snapshot["snapshot_id"],
+        snapshot_id=UUID(snapshot["snapshot_id"]),
         occurrence_id=UUID(table["block_id"]),
         actor_id=seeded.actor_id,
         idempotency_key=f"visual-stale-caption-{uuid4().hex}",
@@ -843,7 +950,7 @@ async def test_stale_proposal_cannot_be_accepted_and_reject_leaves_canonical_unc
     )
     move = await proposal_service.prepare_visual_revision(
         subject_id=seeded.subject.id,
-        snapshot_id=snapshot["snapshot_id"],
+        snapshot_id=UUID(snapshot["snapshot_id"]),
         occurrence_id=UUID(table["block_id"]),
         actor_id=seeded.actor_id,
         idempotency_key=f"visual-stale-move-{uuid4().hex}",
@@ -858,7 +965,11 @@ async def test_stale_proposal_cannot_be_accepted_and_reject_leaves_canonical_unc
         await _adopt(
             adoption_service, caption, actor_id=seeded.actor_id, key=f"adopt-{uuid4().hex}"
         )
-    assert stale.value.code in {"proposal_stale", "proposal_base_stale"}
+    assert stale.value.code in {
+        "proposal_stale",
+        "proposal_base_stale",
+        "proposal_state_conflict",
+    }
     async with uow_factory() as uow:
         stored_caption = await uow.editorial_proposals.get_for_occurrence(
             seeded.subject.id, caption.occurrence_id, caption.id
