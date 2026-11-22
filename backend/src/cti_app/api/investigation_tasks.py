@@ -25,12 +25,13 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import datetime
-from typing import Annotated, Any, Literal, cast
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Header, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
+from cti_app.api.agentic_tools import require_signed_agent_session
 from cti_app.api.investigation import (
     _http_error,
     _identity,
@@ -38,13 +39,12 @@ from cti_app.api.investigation import (
     _require_verified_human_operator,
     _uow_factory,
 )
-from cti_app.application.agent_session_verifier import (
-    AgentSessionBinding,
-    AgentSessionVerifier,
-    RefusingAgentSessionVerifier,
-)
+from cti_app.application.agent_session_verifier import VerifiedAgentSession
 from cti_app.application.identity import IdentityScope
-from cti_app.application.investigation_persistence import InvestigationTaskRepository
+from cti_app.application.investigation_persistence import (
+    AgentSessionRepository,
+    InvestigationTaskRepository,
+)
 from cti_app.application.investigation_task_events import TaskEvent, TaskEventType
 from cti_app.application.investigation_tasks import (
     InvestigationTaskService,
@@ -281,31 +281,34 @@ def _event_view(event: TaskEvent) -> TaskEventView:
     )
 
 
-def _session_verifier(request: Request) -> AgentSessionVerifier:
-    verifier = getattr(request.app.state, "agent_session_verifier", None)
-    if verifier is None:
-        return RefusingAgentSessionVerifier()
-    return cast(AgentSessionVerifier, verifier)
+_LEASE_COMMANDS = frozenset({"heartbeat", "request_input", "submit", "resume", "block", "fail"})
 
 
 class _VerifiedSessionPort:
-    """``TaskSessionPort`` over the 04B3 verifier seam.
+    """``TaskSessionPort`` for the session the route already verified.
 
-    Lot 05B1 replaces this adapter with the ``agent_sessions`` repository; the
-    engine only needs an honest "active and bound to this task" answer, which
-    the verifier already gives.
+    The D7 gate in :func:`_task_actor` established that this exact session is
+    active and bound to the task; the engine only needs that answer plus the
+    durable outcome write when a lease is released.
     """
 
-    def __init__(self, verifier: AgentSessionVerifier) -> None:
-        self._verifier = verifier
+    def __init__(
+        self,
+        verified: VerifiedAgentSession | None,
+        sessions: AgentSessionRepository | None,
+    ) -> None:
+        self._verified = verified
+        self._sessions = sessions
 
     async def is_active_session(
         self, *, session_id: UUID, investigation_id: UUID, task_id: UUID
     ) -> bool:
-        binding = await self._verifier.verify(
-            session_id=session_id, investigation_id=investigation_id
+        return (
+            self._verified is not None
+            and session_id == self._verified.session_id
+            and investigation_id == self._verified.investigation_id
+            and task_id == self._verified.task_id
         )
-        return binding is not None and binding.task_id in (None, task_id)
 
     async def close_session(
         self,
@@ -316,50 +319,66 @@ class _VerifiedSessionPort:
         outcome: TaskSessionOutcome,
         reason: str,
     ) -> None:
-        # No agent-session aggregate exists before lot 05B1; the release is
-        # carried by the task event and the lease fence, not persisted here.
-        del session_id, investigation_id, task_id, outcome, reason
+        if self._sessions is None:
+            return
+        await self._sessions.close_session(
+            session_id=session_id,
+            investigation_id=investigation_id,
+            task_id=task_id,
+            outcome=outcome.value,
+            reason=reason,
+        )
 
 
 def _task_service(uow: UnitOfWork, request: Request) -> InvestigationTaskService:
     return InvestigationTaskService(
         tasks=uow.investigation_tasks,
         decisions=uow.analyst_decisions,
-        sessions=_VerifiedSessionPort(_session_verifier(request)),
+        sessions=_VerifiedSessionPort(
+            _verified_session(request), getattr(uow, "agent_sessions", None)
+        ),
         limits=_settings(request).task_limits(),
     )
 
 
-async def _task_actor(request: Request, investigation_id: UUID) -> TaskActor:
-    """Resolve the caller without ever trusting a body-supplied identity."""
+async def _task_actor(
+    request: Request,
+    investigation_id: UUID,
+    *,
+    task_id: UUID | None = None,
+    require_current_lease: bool = False,
+) -> TaskActor:
+    """Resolve the caller without ever trusting a body-supplied identity.
+
+    A request carrying the D7 session header is always an operator request,
+    whatever bearer identity reached the middleware; the signature is the
+    only thing that admits it.  The shared ``OPERATOR_CLIENT`` token alone is
+    refused on every M24 command route.
+    """
+    if request.headers.get("x-autowork-agent-session"):
+        verified = await require_signed_agent_session(
+            request,
+            investigation_id=investigation_id,
+            task_id=task_id,
+            require_current_lease=require_current_lease,
+        )
+        request.state.verified_agent_session = verified
+        return TaskActor(kind=TaskActorKind.OPERATOR, actor_id=verified.operator_id)
     identity = await _identity(request)
     if identity.has_scope(IdentityScope.OPERATOR_CLIENT):
-        raw_session = request.headers.get("X-AutoWork-Agent-Session")
-        if not raw_session:
-            raise _http_error(403, "agent_session_required")
-        try:
-            session_id = UUID(raw_session)
-        except ValueError:
-            raise _http_error(403, "agent_session_required") from None
-        binding = await _session_verifier(request).verify(
-            session_id=session_id, investigation_id=investigation_id
-        )
-        if binding is None:
-            raise _http_error(403, "agent_session_unverified")
-        request.state.agent_session_binding = binding
-        return TaskActor(kind=TaskActorKind.OPERATOR, actor_id=binding.operator_id)
+        raise _http_error(403, "agent_session_required")
     await _require_verified_human_operator(request)
     return TaskActor(kind=TaskActorKind.HUMAN, actor_id=identity.actor_id)
 
 
-def _binding(request: Request) -> AgentSessionBinding | None:
-    binding = getattr(request.state, "agent_session_binding", None)
-    return binding if isinstance(binding, AgentSessionBinding) else None
+def _verified_session(request: Request) -> VerifiedAgentSession | None:
+    value = getattr(request.state, "verified_agent_session", None)
+    return value if isinstance(value, VerifiedAgentSession) else None
 
 
 def _require_bound_task(request: Request, task_id: UUID) -> None:
-    binding = _binding(request)
-    if binding is not None and binding.task_id is not None and binding.task_id != task_id:
+    verified = _verified_session(request)
+    if verified is not None and verified.task_id != task_id:
         raise _http_error(403, "agent_session_mismatch")
 
 
@@ -427,7 +446,7 @@ async def _run_command(
     payload: TaskCommandRequest,
     *,
     actor: TaskActor,
-    binding: AgentSessionBinding | None,
+    verified: VerifiedAgentSession | None,
     idempotency_key: str,
 ) -> TaskCommandResult:
     command = payload.command
@@ -459,7 +478,7 @@ async def _run_command(
             idempotency_key=idempotency_key,
         )
     if command == "start":
-        session_id = binding.session_id if binding is not None else None
+        session_id = verified.session_id if verified is not None else None
         return await service.start(
             task_id=task.id,
             actor=actor,
@@ -588,15 +607,15 @@ async def create_task(
     request: Request,
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=255)],
 ) -> TaskCommandResponse:
-    actor = await _task_actor(request, investigation_id)
-    binding = _binding(request)
+    actor = await _task_actor(request, investigation_id, require_current_lease=True)
+    verified = _verified_session(request)
     if actor.kind is TaskActorKind.OPERATOR:
         # An operator only opens a proposed subtask of its own running task:
         # the session must be bound to the parent, and the engine refuses a
         # parent that is not assigned to this operator.
-        if payload.parent_task_id is None or binding is None:
+        if payload.parent_task_id is None or verified is None:
             raise _http_error(403, "agent_session_mismatch")
-        if binding.task_id != payload.parent_task_id:
+        if verified.task_id != payload.parent_task_id:
             raise _http_error(403, "agent_session_mismatch")
     async with _uow_factory(request)() as uow:
         await _require_investigation(uow, investigation_id)
@@ -638,7 +657,11 @@ async def run_task_command(
     request: Request,
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=255)],
 ) -> TaskCommandResponse:
-    actor = await _task_actor(request, investigation_id)
+    actor = await _task_actor(
+        request,
+        investigation_id,
+        require_current_lease=payload.command in _LEASE_COMMANDS,
+    )
     _require_bound_task(request, task_id)
     async with _uow_factory(request)() as uow:
         await _require_investigation(uow, investigation_id)
@@ -649,7 +672,7 @@ async def run_task_command(
                 task,
                 payload,
                 actor=actor,
-                binding=_binding(request),
+                verified=_verified_session(request),
                 idempotency_key=idempotency_key,
             )
         except TaskCommandError as exc:

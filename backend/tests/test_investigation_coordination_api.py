@@ -12,7 +12,7 @@ import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import FastAPI
 
@@ -22,7 +22,11 @@ from cti_app.application.agent_session_verifier import (
     AgentSessionBinding,
     InMemoryAgentSessionVerifier,
 )
-from cti_app.application.identity import Identity, IdentityScope, LocalIdentityProvider
+from cti_app.application.identity import (
+    Identity,
+    IdentityScope,
+    LocalIdentityProvider,
+)
 from cti_app.application.investigation_persistence import (
     InMemoryEvidenceObservationRepository,
     InMemoryInvestigationPlanRepository,
@@ -32,6 +36,7 @@ from cti_app.application.investigation_persistence import (
 from cti_app.config import Settings
 from cti_app.domain.classification import TLP
 from cti_app.domain.editorial import AnalystDecision
+from cti_app.domain.investigation import ToolInvocationStatus
 from cti_app.domain.investigation_task import (
     InvestigationTaskV1,
     ResultVerificationStatus,
@@ -379,17 +384,23 @@ def _seed_task(
     return task
 
 
-def _binding(task_id: UUID | None) -> AgentSessionBinding:
+def _binding(task_id: UUID, *, lease_current: bool = True) -> AgentSessionBinding:
     return AgentSessionBinding(
         session_id=TASK_SESSION_ID,
         investigation_id=TASK_INVESTIGATION_ID,
         task_id=task_id,
         operator_id=TASK_OPERATOR_ID,
+        lease_current=lease_current,
     )
 
 
 def _operator_headers() -> dict[str, str]:
-    return {"X-AutoWork-Agent-Session": str(TASK_SESSION_ID)}
+    """The three D7 headers; the in-memory fake ignores the signature value."""
+    return {
+        "X-AutoWork-Agent-Session": str(TASK_SESSION_ID),
+        "X-AutoWork-Agent-Timestamp": str(int(datetime.now(UTC).timestamp())),
+        "X-AutoWork-Agent-Signature": "v1=" + "a" * 64,
+    }
 
 
 def _command_body(command: str) -> dict[str, object]:
@@ -407,8 +418,10 @@ def _command_body(command: str) -> dict[str, object]:
 
 
 def test_agent_session_binding_header_required() -> None:
-    app = _TaskClient(verifier=InMemoryAgentSessionVerifier([_binding(None)]), human=False)
-    _seed_task(app.uow)
+    verifier = InMemoryAgentSessionVerifier()
+    app = _TaskClient(verifier=verifier, human=False)
+    task = _seed_task(app.uow)
+    verifier.bind(_binding(task.id))
 
     missing = app.client.get(f"/api/investigations/{TASK_INVESTIGATION_ID}/tasks")
     assert missing.status_code == 403, missing.text
@@ -421,15 +434,15 @@ def test_agent_session_binding_header_required() -> None:
     assert malformed.status_code == 403
     assert malformed.json()["detail"]["code"] == "agent_session_required"
 
-    # No verifier is configured: the fail-closed default refuses the token.
+    # No server key is configured: D7 is fail-closed with the typed 503.
     fail_closed = _TaskClient(human=False)
     _seed_task(fail_closed.uow)
     unverified = fail_closed.client.get(
         f"/api/investigations/{TASK_INVESTIGATION_ID}/tasks",
         headers=_operator_headers(),
     )
-    assert unverified.status_code == 403, unverified.text
-    assert unverified.json()["detail"]["code"] == "agent_session_unverified"
+    assert unverified.status_code == 503, unverified.text
+    assert unverified.json()["detail"]["code"] == "agent_sessions_unavailable"
 
     accepted = app.client.get(
         f"/api/investigations/{TASK_INVESTIGATION_ID}/tasks",
@@ -452,7 +465,7 @@ def test_operator_client_token_alone_refused_on_every_command_route() -> None:
         assert refused.status_code == 403, (command, refused.text)
         assert refused.json()["detail"]["code"] == "agent_session_required", command
 
-    # A header the fail-closed default cannot verify is refused as well.
+    # A session the fail-closed default cannot verify is refused as well.
     fail_closed = _TaskClient(human=False)
     fail_closed_task = _seed_task(fail_closed.uow)
     fail_closed_url = (
@@ -467,8 +480,8 @@ def test_operator_client_token_alone_refused_on_every_command_route() -> None:
                 **_operator_headers(),
             },
         )
-        assert refused.status_code == 403, (command, refused.text)
-        assert refused.json()["detail"]["code"] == "agent_session_unverified", command
+        assert refused.status_code == 503, (command, refused.text)
+        assert refused.json()["detail"]["code"] == "agent_sessions_unavailable", command
 
 
 def test_operator_cannot_assign_or_accept_tasks() -> None:
@@ -651,7 +664,7 @@ def test_human_and_operator_complete_a_task_through_the_api() -> None:
 
 
 def test_operator_reads_are_scoped_to_its_tasks() -> None:
-    verifier = InMemoryAgentSessionVerifier([_binding(None)])
+    verifier = InMemoryAgentSessionVerifier()
     app = _TaskClient(verifier=verifier, human=False)
     own = _seed_task(
         app.uow,
@@ -660,6 +673,7 @@ def test_operator_reads_are_scoped_to_its_tasks() -> None:
         assigned_actor_id=TASK_OPERATOR_ID,
     )
     other = _seed_task(app.uow, task_key="lead-2")
+    verifier.bind(_binding(own.id))
 
     listed = app.client.get(
         f"/api/investigations/{TASK_INVESTIGATION_ID}/tasks", headers=_operator_headers()
@@ -672,7 +686,9 @@ def test_operator_reads_are_scoped_to_its_tasks() -> None:
         headers=_operator_headers(),
     )
     assert denied.status_code == 403, denied.text
-    assert denied.json()["detail"]["code"] == "operator_task_scope_denied"
+    # D7 binds the session to one task: reading another task is refused before
+    # the operator task-scope projection can even run.
+    assert denied.json()["detail"]["code"] == "agent_session_mismatch"
 
 
 def test_task_api_requires_idempotency_and_expected_version() -> None:
@@ -700,7 +716,7 @@ def test_task_api_requires_idempotency_and_expected_version() -> None:
 
 
 def test_operator_session_is_bound_to_its_task() -> None:
-    verifier = InMemoryAgentSessionVerifier([_binding(None)])
+    verifier = InMemoryAgentSessionVerifier()
     app = _TaskClient(verifier=verifier, human=False)
     own = _seed_task(
         app.uow,
@@ -721,7 +737,7 @@ def test_operator_session_is_bound_to_its_task() -> None:
 
 
 def test_operator_creates_only_its_own_proposed_subtask() -> None:
-    verifier = InMemoryAgentSessionVerifier([_binding(None)])
+    verifier = InMemoryAgentSessionVerifier()
     app = _TaskClient(verifier=verifier, human=False)
     parent = _seed_task(
         app.uow,
@@ -754,3 +770,113 @@ def test_operator_creates_only_its_own_proposed_subtask() -> None:
     assert body["parent_task_id"] == str(parent.id)
     assert body["created_by"]["actor_kind"] == "operator"
     assert body["created_by"]["actor_id"] == TASK_OPERATOR_ID
+
+
+# ---------------------------------------------------------------------------
+# M24-05B2 — the legacy operator tool route on a bridge_only investigation.
+# ---------------------------------------------------------------------------
+
+
+class _LegacyToolInvocations:
+    """Records the invocation the legacy route would perform."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def invoke(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        return SimpleNamespace(
+            investigation_id=INVESTIGATION_ID,
+            working_state_version=1,
+            working_state_sha256="b" * 64,
+            error_code=None,
+            job_id=None,
+            idempotent_replay=False,
+            output={},
+            invocation=SimpleNamespace(
+                id=uuid4(),
+                tool_name=kwargs["tool_name"],
+                schema_version=kwargs["schema_version"],
+                status=ToolInvocationStatus.SUCCEEDED,
+                version=1,
+                response_refs=(),
+            ),
+        )
+
+
+class _LegacyToolFactory:
+    def __init__(self) -> None:
+        self.invocations = _LegacyToolInvocations()
+
+    def build(self, _uow: Any, _investigation_id: UUID, *, operator_mode: bool = False) -> Any:
+        del operator_mode
+        return SimpleNamespace(operator_tool_invocations=self.invocations)
+
+
+def _bridge_only_legacy_client() -> tuple[Any, _LegacyToolFactory]:
+    store = _Store()
+    store.investigations[INVESTIGATION_ID].prose_authority = ProseAuthority.BRIDGE_ONLY
+    factory = _LegacyToolFactory()
+    client, _store = _client(store=store, factory=factory)
+    client.app.state.identity_provider = _OperatorClientIdentity()
+    return client, factory
+
+
+def test_legacy_opinion_route_requires_session_for_bridge_only() -> None:
+    client, factory = _bridge_only_legacy_client()
+    body = {
+        "schema_version": "1",
+        "arguments": {"query": "synthetic"},
+        "purpose": "legacy operator tool probe",
+        "expected_version": 1,
+    }
+
+    token_alone = client.post(
+        f"/api/investigations/{INVESTIGATION_ID}/operator/tools/opinion.revise",
+        json=body,
+        headers={"Idempotency-Key": "legacy-token-alone"},
+    )
+    assert token_alone.status_code == 403, token_alone.text
+    assert token_alone.json()["detail"]["code"] == "agent_session_required"
+    assert factory.invocations.calls == []
+
+    # A signed session passes the D7 gate; D4 still owns the prose refusal.
+    client.app.state.agent_session_verifier = InMemoryAgentSessionVerifier(
+        [
+            AgentSessionBinding(
+                session_id=TASK_SESSION_ID,
+                investigation_id=INVESTIGATION_ID,
+                task_id=uuid4(),
+                operator_id=TASK_OPERATOR_ID,
+            )
+        ]
+    )
+    signed = client.post(
+        f"/api/investigations/{INVESTIGATION_ID}/operator/tools/opinion.revise",
+        json=body,
+        headers={"Idempotency-Key": "legacy-signed", **_operator_headers()},
+    )
+    assert signed.status_code == 200, signed.text
+    assert len(factory.invocations.calls) == 1
+    assert factory.invocations.calls[0]["actor_id"] == "operator:operator-client"
+
+
+def test_legacy_operator_route_is_unchanged_for_legacy_investigations() -> None:
+    store = _Store()
+    factory = _LegacyToolFactory()
+    client, _store = _client(store=store, factory=factory)
+    client.app.state.identity_provider = _OperatorClientIdentity()
+
+    accepted = client.post(
+        f"/api/investigations/{INVESTIGATION_ID}/operator/tools/vt.file_report",
+        json={
+            "schema_version": "1",
+            "arguments": {"query": "synthetic"},
+            "purpose": "legacy behaviour probe",
+            "expected_version": 1,
+        },
+        headers={"Idempotency-Key": "legacy-unchanged"},
+    )
+
+    assert accepted.status_code == 200, accepted.text
+    assert len(factory.invocations.calls) == 1

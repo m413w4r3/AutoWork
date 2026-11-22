@@ -1,76 +1,492 @@
-"""Session-authentication seam for the M24 operator routes (ADR-0011 D7).
+"""The single D7 agent-session authentication port (ADR-0011 D7/B6).
 
-Lot 05B1 owns ``agent_sessions``, the per-session HMAC secret and the real
-verifier.  The 04B3 task routes must already bind an operator call to a
-verified session, so this module defines only the narrow port they call:
+History: lot 04B3 introduced a narrow fail-closed seam for the task routes and
+lot 05B1 added the real HMAC verifier in a second module named
+``agent_session_verification``.  Both names now resolve to this module, which
+is the only definition site:
 
-* :class:`AgentSessionVerifier` turns the ``X-AutoWork-Agent-Session`` header
-  into a :class:`AgentSessionBinding` (session, investigation, task, operator
-  attribution) or refuses it.
-* :class:`RefusingAgentSessionVerifier` is the fail-closed default: until
-  05B1 lands there is no way to authenticate an operator, so every operator
-  call is refused instead of being attributed to the shared
-  ``OPERATOR_CLIENT`` token.
-* :class:`InMemoryAgentSessionVerifier` is the test fake.
+* :class:`AgentSessionVerifier` is the port every M24 operator route calls.
+  It verifies the three D7 headers against the session secret, then requires an
+  active session bound to the route's investigation (and task), and, for a
+  write, a still-current task lease.
+* :class:`HmacAgentSessionVerifier` is the real implementation.  The session
+  secret is derived server-side from ``M24_AGENT_SESSION_KEY`` and the stored
+  nonce, so nothing secret is ever persisted.
+* :class:`RefusingAgentSessionVerifier` is the fail-closed default: without a
+  configured server key every operator call is refused with the typed
+  ``503 agent_sessions_unavailable``.
+* :class:`InMemoryAgentSessionVerifier` is the test fake and never takes part
+  in a production wiring.
 
-The HMAC signature headers (``X-AutoWork-Agent-Timestamp`` /
-``X-AutoWork-Agent-Signature``) and the ``M24_AGENT_SESSION_KEY`` belong to
-05B1; the port accepts to be composed with them without changing the routes.
+Message (ADR-0011 D7)::
+
+    method \\0 path+query \\0 session_id \\0 sha256(body) \\0 idempotency_key \\0 timestamp
+
+with ``v1=<hex>`` HMAC-SHA256, ``compare_digest`` and a ±300 s timestamp
+window.  ``agent_session_verification`` remains as a compatibility re-export.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+import hashlib
+import hmac
+import re
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from threading import Lock
+from types import TracebackType
 from typing import Protocol
 from uuid import UUID
 
+from cti_app.application.investigation_persistence import (
+    AgentSessionRepository,
+    InvestigationTaskRepository,
+)
+from cti_app.domain.agentic_operator import (
+    AGENT_SESSION_SECRET_NONCE_BYTES,
+    OperatorAdapterKind,
+)
+from cti_app.domain.investigation_task import (
+    InvestigationTaskV1,
+    TaskActorKind,
+    TaskStatus,
+)
+
+SESSION_SECRET_CONTEXT = b"autowork-agent-session.v1\0"
+AGENT_SESSION_SIGNATURE_VERSION = "v1"
+AGENT_SESSION_TIMESTAMP_SKEW_SECONDS = 300
+AGENT_SESSION_KEY_BYTES = 32
+
+_SIGNATURE_PATTERN = re.compile(r"^v1=([0-9a-f]{64})$")
+_SAFE_PATH_SEGMENT = re.compile(r"^[!-~]*$")
+
+
+class AgentSessionVerificationError(ValueError):
+    """Base refusal for a session-authenticated request, HTTP-stable."""
+
+    code = "agent_session_required"
+    status_code = 403
+
+    def __init__(self, message: str, *, details: dict[str, str] | None = None) -> None:
+        self.details = details or {}
+        super().__init__(message)
+
+
+class AgentSessionsUnavailableError(AgentSessionVerificationError):
+    """The server key is absent: agent sessions are fail-closed (D7)."""
+
+    code = "agent_sessions_unavailable"
+    status_code = 503
+
+
+class AgentSessionRequiredError(AgentSessionVerificationError):
+    """The three D7 headers are not all present and well formed."""
+
+    code = "agent_session_required"
+
+
+class AgentSessionSignatureError(AgentSessionVerificationError):
+    """The HMAC, timestamp or session secret does not verify."""
+
+    code = "agent_session_signature_invalid"
+
+
+class AgentSessionInactiveError(AgentSessionVerificationError):
+    """The session exists but is not in an active technical state."""
+
+    code = "agent_session_inactive"
+    status_code = 409
+
+
+class AgentSessionBindingError(AgentSessionVerificationError):
+    """The session is not bound to the route's investigation or task."""
+
+    code = "agent_session_binding_mismatch"
+
+
+class AgentSessionLeaseError(AgentSessionVerificationError):
+    """A write arrives with a stale or superseded task lease fence."""
+
+    code = "agent_session_lease_stale"
+    status_code = 409
+
+
+def session_secret_hex(secret: bytes) -> str:
+    if not isinstance(secret, bytes) or len(secret) != hashlib.sha256().digest_size:
+        raise ValueError("a session secret is a 32-byte HMAC output")
+    return secret.hex()
+
+
+def session_secret_hash(secret: bytes) -> str:
+    return hashlib.sha256(secret).hexdigest()
+
+
+def _session_key_bytes(key: object) -> bytes:
+    if isinstance(key, str):
+        raw = key.encode("utf-8")
+    elif isinstance(key, bytes):
+        raw = key
+    else:
+        secret_value = getattr(key, "get_secret_value", None)
+        if not callable(secret_value):
+            raise TypeError("M24_AGENT_SESSION_KEY must be a string, bytes or SecretStr")
+        raw = str(secret_value()).encode("utf-8")
+    if len(raw) != AGENT_SESSION_KEY_BYTES:
+        raise ValueError("M24_AGENT_SESSION_KEY must be exactly 32 bytes")
+    return raw
+
+
+class SessionSecretDeriver(Protocol):
+    """Derives one session secret from the server key and the stored nonce."""
+
+    def derive(self, *, session_id: UUID, nonce: bytes) -> bytes: ...
+
+
+class HmacSessionSecretDeriver:
+    """``HMAC-SHA256(key, "autowork-agent-session.v1\\0" + session_id + "\\0" + nonce)``."""
+
+    def __init__(self, key: object) -> None:
+        raw = _session_key_bytes(key)
+        self._key = raw
+        self._lock = Lock()
+
+    def derive(self, *, session_id: UUID, nonce: bytes) -> bytes:
+        if not isinstance(session_id, UUID):
+            raise TypeError("session_id must be a UUID")
+        if not isinstance(nonce, bytes) or len(nonce) != AGENT_SESSION_SECRET_NONCE_BYTES:
+            raise ValueError("nonce must be 32 bytes")
+        message = SESSION_SECRET_CONTEXT + str(session_id).encode("ascii") + b"\0" + nonce
+        with self._lock:
+            return hmac.new(self._key, message, hashlib.sha256).digest()
+
+
+def build_agent_session_message(
+    *,
+    method: str,
+    path_and_query: str,
+    session_id: UUID,
+    body: bytes,
+    idempotency_key: str | None,
+    timestamp: str,
+) -> bytes:
+    """The exact D7 message a host operator signs and the server recomputes."""
+    if not isinstance(method, str) or not method.strip():
+        raise ValueError("method must be a non-empty HTTP method")
+    if not isinstance(path_and_query, str) or not path_and_query.startswith("/"):
+        raise ValueError("path_and_query must start with '/'")
+    if not _SAFE_PATH_SEGMENT.fullmatch(path_and_query):
+        raise ValueError("path_and_query must be printable ASCII without spaces")
+    if not isinstance(session_id, UUID):
+        raise TypeError("session_id must be a UUID")
+    if not isinstance(body, bytes):
+        raise TypeError("body must be raw bytes")
+    if not isinstance(timestamp, str) or not timestamp.isascii() or not timestamp.isdecimal():
+        raise ValueError("timestamp must be a decimal unix timestamp")
+    key = "" if idempotency_key is None else idempotency_key
+    if not isinstance(key, str):
+        raise TypeError("idempotency_key must be a string or None")
+    return b"\0".join(
+        (
+            method.strip().upper().encode("ascii"),
+            path_and_query.encode("ascii"),
+            str(session_id).encode("ascii"),
+            hashlib.sha256(body).hexdigest().encode("ascii"),
+            key.encode("utf-8"),
+            timestamp.encode("ascii"),
+        )
+    )
+
+
+def parse_agent_session_headers(
+    headers: Mapping[str, str], *, now: datetime | None = None
+) -> tuple[UUID, str, str]:
+    """Return ``(session_id, timestamp, signature_hex)`` or raise a typed 403."""
+    session_header = headers.get("x-autowork-agent-session")
+    timestamp_header = headers.get("x-autowork-agent-timestamp")
+    signature_header = headers.get("x-autowork-agent-signature")
+    if not session_header or not timestamp_header or not signature_header:
+        raise AgentSessionRequiredError(
+            "X-AutoWork-Agent-Session, -Timestamp and -Signature are all required"
+        )
+    try:
+        session_id = UUID(session_header.strip())
+    except (TypeError, ValueError) as exc:
+        raise AgentSessionSignatureError("the agent session header is not a UUID") from exc
+    if str(session_id) != session_header.strip():
+        raise AgentSessionSignatureError("the agent session header is not a canonical UUID")
+    timestamp = timestamp_header.strip()
+    if not timestamp.isascii() or not timestamp.isdecimal():
+        raise AgentSessionSignatureError("the agent timestamp is not a decimal unix time")
+    if len(timestamp) > 12:
+        raise AgentSessionSignatureError("the agent timestamp is out of range")
+    match = _SIGNATURE_PATTERN.fullmatch(signature_header.strip())
+    if match is None:
+        raise AgentSessionSignatureError("the agent signature is not v1=<64 hex>")
+    current = now if now is not None else datetime.now(UTC)
+    if current.tzinfo is None or current.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    try:
+        signed_at = int(timestamp)
+    except ValueError as exc:  # pragma: no cover - decimal digits were already checked
+        raise AgentSessionSignatureError("the agent timestamp is invalid") from exc
+    if abs(current.timestamp() - signed_at) > AGENT_SESSION_TIMESTAMP_SKEW_SECONDS:
+        raise AgentSessionSignatureError("the agent timestamp is outside the ±300 s window")
+    return session_id, timestamp, match.group(1)
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class AgentSessionBinding:
-    """A server-derived, active session bound to one task of an investigation.
-
-    ``operator_id`` is the attribution the task engine compares with
-    ``investigation_tasks.assigned_actor_id``; it is never taken from a
-    request body.
-    """
+class VerifiedAgentSession:
+    """A verified session and the exact operator attribution it may act with."""
 
     session_id: UUID
     investigation_id: UUID
-    task_id: UUID | None
+    task_id: UUID
+    adapter_kind: OperatorAdapterKind
     operator_id: str
+    task_lease_fence: int | None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.session_id, UUID):
-            raise TypeError("session_id must be a UUID")
-        if not isinstance(self.investigation_id, UUID):
-            raise TypeError("investigation_id must be a UUID")
-        if self.task_id is not None and not isinstance(self.task_id, UUID):
-            raise TypeError("task_id must be a UUID or None")
         if not isinstance(self.operator_id, str) or not self.operator_id.strip():
             raise ValueError("operator_id must not be empty")
 
 
-class AgentSessionVerifier(Protocol):
-    """Resolve a session header to its binding, or ``None`` when unverified."""
+class AgentSessionVerificationUnitOfWork(Protocol):
+    agent_sessions: AgentSessionRepository
+    investigation_tasks: InvestigationTaskRepository
 
-    async def verify(
-        self, *, session_id: UUID, investigation_id: UUID
-    ) -> AgentSessionBinding | None: ...
+    async def __aenter__(self) -> AgentSessionVerificationUnitOfWork: ...
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None: ...
+
+
+class AgentSessionVerifier(Protocol):
+    """The single session-verification port mounted by every M24 operator route."""
+
+    @property
+    def available(self) -> bool: ...
+
+    async def verify_session_request(
+        self,
+        *,
+        method: str,
+        path_and_query: str,
+        session_id: UUID,
+        timestamp: str,
+        signature: str,
+        body: bytes,
+        idempotency_key: str | None,
+        investigation_id: UUID,
+        task_id: UUID | None = None,
+        require_current_lease: bool = False,
+        now: datetime | None = None,
+    ) -> VerifiedAgentSession: ...
+
+
+class AgentSessionBinding:
+    """Test-only description of one session a fake verifier accepts.
+
+    Production code never builds this type: :class:`HmacAgentSessionVerifier`
+    returns a :class:`VerifiedAgentSession` derived from the database.
+    """
+
+    def __init__(
+        self,
+        *,
+        session_id: UUID,
+        investigation_id: UUID,
+        task_id: UUID,
+        operator_id: str,
+        adapter_kind: OperatorAdapterKind = OperatorAdapterKind.CODEX_CLI,
+        task_lease_fence: int | None = 1,
+        active: bool = True,
+        lease_current: bool = True,
+    ) -> None:
+        if not isinstance(session_id, UUID):
+            raise TypeError("session_id must be a UUID")
+        if not isinstance(investigation_id, UUID):
+            raise TypeError("investigation_id must be a UUID")
+        if not isinstance(task_id, UUID):
+            raise TypeError("task_id must be a UUID")
+        if not isinstance(operator_id, str) or not operator_id.strip():
+            raise ValueError("operator_id must not be empty")
+        self.session_id = session_id
+        self.investigation_id = investigation_id
+        self.task_id = task_id
+        self.operator_id = operator_id
+        self.adapter_kind = adapter_kind
+        self.task_lease_fence = task_lease_fence
+        self.active = active
+        self.lease_current = lease_current
+
+
+class HmacAgentSessionVerifier:
+    """Real D7 verifier: derives the secret from the nonce, then checks everything.
+
+    ``deriver is None`` means ``M24_AGENT_SESSION_KEY`` is absent; every call
+    raises :class:`AgentSessionsUnavailableError` (fail-closed, never admits a
+    request because the key is missing).
+    """
+
+    def __init__(
+        self,
+        *,
+        uow_factory: Callable[[], AgentSessionVerificationUnitOfWork],
+        deriver: SessionSecretDeriver | None,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        self._uow_factory = uow_factory
+        self._deriver = deriver
+        self._clock = clock or (lambda: datetime.now(UTC))
+
+    @property
+    def available(self) -> bool:
+        return self._deriver is not None
+
+    async def verify_session_request(
+        self,
+        *,
+        method: str,
+        path_and_query: str,
+        session_id: UUID,
+        timestamp: str,
+        signature: str,
+        body: bytes,
+        idempotency_key: str | None,
+        investigation_id: UUID,
+        task_id: UUID | None = None,
+        require_current_lease: bool = False,
+        now: datetime | None = None,
+    ) -> VerifiedAgentSession:
+        if self._deriver is None:
+            raise AgentSessionsUnavailableError(
+                "M24_AGENT_SESSION_KEY is not configured; agent sessions are disabled"
+            )
+        current = now if now is not None else self._clock()
+        if not isinstance(timestamp, str) or not timestamp.isascii() or not timestamp.isdecimal():
+            raise AgentSessionSignatureError("the agent timestamp is not a decimal unix time")
+        if len(timestamp) > 12:
+            raise AgentSessionSignatureError("the agent timestamp is out of range")
+        if abs(current.timestamp() - int(timestamp)) > AGENT_SESSION_TIMESTAMP_SKEW_SECONDS:
+            raise AgentSessionSignatureError("the agent timestamp is outside the ±300 s window")
+        supplied = signature[3:] if signature.startswith("v1=") else signature
+        if not re.fullmatch(r"[0-9a-f]{64}", supplied):
+            raise AgentSessionSignatureError("the agent signature is not a 64-hex digest")
+        message = build_agent_session_message(
+            method=method,
+            path_and_query=path_and_query,
+            session_id=session_id,
+            body=body,
+            idempotency_key=idempotency_key,
+            timestamp=timestamp,
+        )
+        async with self._uow_factory() as uow:
+            session = await uow.agent_sessions.get(session_id)
+            if session is None:
+                # Do not distinguish an unknown session from a bad signature.
+                raise AgentSessionSignatureError("the agent session does not verify")
+            secret = self._deriver.derive(session_id=session.id, nonce=session.auth_secret_nonce)
+            if not hmac.compare_digest(session_secret_hash(secret), session.auth_secret_hash):
+                raise AgentSessionSignatureError("the agent session does not verify")
+            expected = hmac.new(secret, message, hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(expected, supplied):
+                raise AgentSessionSignatureError("the agent session does not verify")
+            if session.investigation_id != investigation_id:
+                raise AgentSessionBindingError("the session belongs to another investigation")
+            if task_id is not None and session.task_id != task_id:
+                raise AgentSessionBindingError("the session belongs to another task")
+            if not session.is_active:
+                raise AgentSessionInactiveError(
+                    f"the agent session is {session.state.value}, not active"
+                )
+            task = await uow.investigation_tasks.get(session.task_id)
+            if task is None:
+                raise AgentSessionBindingError("the bound task no longer exists")
+            if task.investigation_id != investigation_id:
+                raise AgentSessionBindingError("the bound task belongs to another investigation")
+            if (
+                task.assigned_actor_kind is not TaskActorKind.OPERATOR
+                or task.assigned_actor_id is None
+            ):
+                raise AgentSessionBindingError("the bound task is not assigned to an operator")
+            if require_current_lease:
+                self._require_current_lease(task, session.id, session.task_lease_fence, current)
+            return VerifiedAgentSession(
+                session_id=session.id,
+                investigation_id=session.investigation_id,
+                task_id=session.task_id,
+                adapter_kind=session.adapter_kind,
+                operator_id=task.assigned_actor_id,
+                task_lease_fence=session.task_lease_fence,
+            )
+
+    @staticmethod
+    def _require_current_lease(
+        task: InvestigationTaskV1,
+        session_id: UUID,
+        session_fence: int | None,
+        now: datetime,
+    ) -> None:
+        # ``session_id`` is the verified session that must own the lease; the
+        # three facts that must all agree follow.
+        if (
+            session_fence is None
+            or task.lease_session_id != session_id
+            or task.lease_fence != session_fence
+            or task.lease_expires_at is None
+            or task.lease_expires_at <= now
+            or task.status not in (TaskStatus.RUNNING, TaskStatus.AWAITING_INPUT)
+        ):
+            raise AgentSessionLeaseError("the task lease is expired or superseded")
 
 
 class RefusingAgentSessionVerifier:
-    """Fail-closed default used until lot 05B1 provides session secrets."""
+    """Fail-closed default used when no server key or verifier is wired."""
 
-    async def verify(
-        self, *, session_id: UUID, investigation_id: UUID
-    ) -> AgentSessionBinding | None:
-        del session_id, investigation_id
-        return None
+    available = False
+
+    async def verify_session_request(
+        self,
+        *,
+        method: str,
+        path_and_query: str,
+        session_id: UUID,
+        timestamp: str,
+        signature: str,
+        body: bytes,
+        idempotency_key: str | None,
+        investigation_id: UUID,
+        task_id: UUID | None = None,
+        require_current_lease: bool = False,
+        now: datetime | None = None,
+    ) -> VerifiedAgentSession:
+        del (
+            method,
+            path_and_query,
+            session_id,
+            timestamp,
+            signature,
+            body,
+            idempotency_key,
+            investigation_id,
+            task_id,
+            require_current_lease,
+            now,
+        )
+        raise AgentSessionsUnavailableError(
+            "M24_AGENT_SESSION_KEY is not configured; agent sessions are disabled"
+        )
 
 
 class InMemoryAgentSessionVerifier:
-    """Test fake: only explicitly bound sessions verify."""
+    """Test fake: only explicitly bound sessions verify; no cryptography."""
+
+    available = True
 
     def __init__(self, bindings: Iterable[AgentSessionBinding] = ()) -> None:
         self._bindings: dict[UUID, AgentSessionBinding] = {
@@ -80,18 +496,64 @@ class InMemoryAgentSessionVerifier:
     def bind(self, binding: AgentSessionBinding) -> None:
         self._bindings[binding.session_id] = binding
 
-    async def verify(
-        self, *, session_id: UUID, investigation_id: UUID
-    ) -> AgentSessionBinding | None:
+    async def verify_session_request(
+        self,
+        *,
+        method: str,
+        path_and_query: str,
+        session_id: UUID,
+        timestamp: str,
+        signature: str,
+        body: bytes,
+        idempotency_key: str | None,
+        investigation_id: UUID,
+        task_id: UUID | None = None,
+        require_current_lease: bool = False,
+        now: datetime | None = None,
+    ) -> VerifiedAgentSession:
+        del method, path_and_query, body, idempotency_key, timestamp, signature, now
         binding = self._bindings.get(session_id)
         if binding is None or binding.investigation_id != investigation_id:
-            return None
-        return binding
+            raise AgentSessionSignatureError("the agent session does not verify")
+        if task_id is not None and binding.task_id != task_id:
+            raise AgentSessionBindingError("the session belongs to another task")
+        if not binding.active:
+            raise AgentSessionInactiveError("the agent session is not active")
+        if require_current_lease and not binding.lease_current:
+            raise AgentSessionLeaseError("the task lease is expired or superseded")
+        return VerifiedAgentSession(
+            session_id=binding.session_id,
+            investigation_id=binding.investigation_id,
+            task_id=binding.task_id,
+            adapter_kind=binding.adapter_kind,
+            operator_id=binding.operator_id,
+            task_lease_fence=binding.task_lease_fence,
+        )
 
 
 __all__ = [
+    "AGENT_SESSION_KEY_BYTES",
+    "AGENT_SESSION_SIGNATURE_VERSION",
+    "AGENT_SESSION_TIMESTAMP_SKEW_SECONDS",
+    "SESSION_SECRET_CONTEXT",
     "AgentSessionBinding",
+    "AgentSessionBindingError",
+    "AgentSessionInactiveError",
+    "AgentSessionLeaseError",
+    "AgentSessionRequiredError",
+    "AgentSessionSignatureError",
+    "AgentSessionVerificationError",
+    "AgentSessionVerificationUnitOfWork",
     "AgentSessionVerifier",
+    "AgentSessionsUnavailableError",
+    "HmacAgentSessionVerifier",
+    "HmacSessionSecretDeriver",
     "InMemoryAgentSessionVerifier",
     "RefusingAgentSessionVerifier",
+    "SessionSecretDeriver",
+    "VerifiedAgentSession",
+    "build_agent_session_message",
+    "parse_agent_session_headers",
+    "session_secret_hash",
+    "session_secret_hex",
 ]

@@ -1142,6 +1142,9 @@ class OperatorToolInvocationService:
         idempotency_key: str,
         actor_id: str | None = None,
         requester_actor_kind: ToolInvocationActorKind | None = None,
+        task_id: UUID | None = None,
+        agent_session_id: UUID | None = None,
+        idempotency_scope: str | None = None,
     ) -> OperatorToolInvocationResult:
         if not 1 <= len(idempotency_key) <= 255:
             raise OperatorToolInvocationError("idempotency_key_invalid", 422)
@@ -1151,6 +1154,13 @@ class OperatorToolInvocationService:
             raise TypeError("requester_actor_kind must use ToolInvocationActorKind")
         if requester_actor_kind is not None and (actor_id is None or not actor_id.strip()):
             raise OperatorToolInvocationError("requester_actor_id_required", 422)
+        if (task_id is None) != (agent_session_id is None):
+            # ADR-0011 D2/E4: the agentic attribution is a cumulative pair.
+            raise OperatorToolInvocationError("invocation_attribution_invalid", 422)
+        if idempotency_scope is not None and (
+            not isinstance(idempotency_scope, str) or not idempotency_scope.strip()
+        ):
+            raise OperatorToolInvocationError("idempotency_scope_invalid", 422)
         schema_version = self._canonical_schema_version(tool_name, schema_version)
         try:
             trace, _human_purpose = split_advisor_trace_purpose(
@@ -1163,7 +1173,13 @@ class OperatorToolInvocationService:
                     "schema_version": schema_version,
                     "arguments": arguments,
                     "purpose": purpose,
-                    "expected_version": expected_version,
+                    # An agentic session has no analyst-supplied working-state
+                    # CAS: its bound D7 key is the replay identity.  Replacing
+                    # only the mutable version keeps any changed body (tool,
+                    # schema, arguments, purpose) a genuine 409 conflict.
+                    "expected_version": (
+                        expected_version if idempotency_scope is None else idempotency_scope
+                    ),
                 }
             )
         except (TypeError, ValueError):
@@ -1199,6 +1215,8 @@ class OperatorToolInvocationService:
                     trace=trace,
                     actor_id=actor_id,
                     requester_actor_kind=requester_actor_kind,
+                    task_id=task_id,
+                    agent_session_id=agent_session_id,
                 )
 
     def _canonical_schema_version(self, tool_name: str, schema_version: str) -> str:
@@ -1332,6 +1350,8 @@ class OperatorToolInvocationService:
         trace: Mapping[str, Any] | None,
         actor_id: str | None,
         requester_actor_kind: ToolInvocationActorKind | None,
+        task_id: UUID | None = None,
+        agent_session_id: UUID | None = None,
     ) -> OperatorToolInvocationResult:
         state = await self._states.get(self._investigation_id)
         if state is None:
@@ -1783,6 +1803,8 @@ class OperatorToolInvocationService:
                 operation_key=operation_key,
                 actor_id=actor_id,
                 actor_kind=requester_actor_kind,
+                task_id=task_id,
+                agent_session_id=agent_session_id,
                 check_stop_before_dispatch=False,
             )
             if advisor_disclosure_denied:

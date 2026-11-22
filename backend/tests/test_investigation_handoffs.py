@@ -715,4 +715,4 @@ async def test_handoff_api_serves_verified_humans_and_leaves_operator_seam() -> 
             headers={"Idempotency-Key": "api-key-operator"},
         )
         assert refused.status_code == 403, refused.text
-        assert refused.json()["detail"]["code"] == "operator_session_required"
+        assert refused.json()["detail"]["code"] == "agent_session_required"
