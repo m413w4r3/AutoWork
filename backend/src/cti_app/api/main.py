@@ -42,6 +42,7 @@ from cti_app.api.investigation_rule_corpus import router as investigation_rule_c
 from cti_app.api.investigation_tasks import router as investigation_tasks_router
 from cti_app.api.jobs import router as jobs_router
 from cti_app.api.model_conversations import router as model_conversations_router
+from cti_app.api.opinion_note_proposals import router as opinion_note_proposals_router
 from cti_app.api.osint_policy import router as osint_policy_router
 from cti_app.api.pdf_inspection import router as pdf_inspection_router
 from cti_app.api.production import router as production_router
@@ -805,6 +806,7 @@ def create_app() -> FastAPI:
     application.include_router(investigation_tasks_router)
     application.include_router(agent_sessions_router)
     application.include_router(agentic_tools_router)
+    application.include_router(opinion_note_proposals_router)
     application.include_router(osint_policy_router)
     application.include_router(investigation_captures_router)
     application.include_router(investigation_captures_legacy_router)
