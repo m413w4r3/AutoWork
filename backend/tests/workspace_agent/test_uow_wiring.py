@@ -61,6 +61,12 @@ EXPECTED_REPOSITORIES = {
         ports.InMemoryAgentSessionRepository,
         uow_module.SqlAlchemyAgentSessionRepository,
     ),
+    # Lot 07 follows 05B1 in the total migration order.
+    "work_contributions": (
+        ports.WorkContributionRepository,
+        ports.InMemoryWorkContributionRepository,
+        uow_module.SqlAlchemyWorkContributionRepository,
+    ),
 }
 
 

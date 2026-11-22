@@ -48,6 +48,11 @@ from cti_app.domain.investigation_plan import (
     InvestigationPlanVersion,
 )
 from cti_app.domain.investigation_task import InvestigationTaskV1, TaskStatus
+from cti_app.domain.work_contribution import (
+    WorkContributionCategory,
+    WorkContributionImportStatus,
+    WorkContributionV1,
+)
 
 if TYPE_CHECKING:
     from cti_app.application.workspace_agent import (
@@ -191,6 +196,39 @@ class SampleAssociationRepository(Protocol):
     async def link_sample(
         self, association_id: UUID, sample_id: UUID, *, expected_sha256: str
     ) -> None: ...
+
+
+class WorkContributionRepository(Protocol):
+    """Append-only contribution rows (ADR-0011 D2/D6).
+
+    ``append_if_absent`` returns the stored row for a replay of the same
+    idempotency key or of the same non-rejected workspace revision, and
+    refuses a key reused for different content.  A rejected row is terminal
+    and never blocks a new attempt with a new key.
+    """
+
+    async def get(self, contribution_id: UUID) -> WorkContributionV1 | None: ...
+
+    async def get_by_idempotency(
+        self, investigation_id: UUID, idempotency_key: str
+    ) -> WorkContributionV1 | None: ...
+
+    async def get_non_rejected_for_revision(
+        self, workspace_id: str, workspace_revision_id: str
+    ) -> WorkContributionV1 | None: ...
+
+    async def list_for_investigation(
+        self,
+        investigation_id: UUID,
+        *,
+        category: WorkContributionCategory | None = None,
+        import_status: WorkContributionImportStatus | None = None,
+        workspace_id: str | None = None,
+    ) -> tuple[WorkContributionV1, ...]: ...
+
+    async def append_if_absent(
+        self, contribution: WorkContributionV1
+    ) -> tuple[WorkContributionV1, bool]: ...
 
 
 class DetectionCandidateRepository(Protocol):
@@ -829,6 +867,108 @@ class InMemorySampleAssociationRepository:
                 raise ValueError("Sample association versions must retain sample identity")
             self._items[association.id] = association
             return association
+
+
+class InMemoryWorkContributionRepository:
+    """In-memory port fake sharing the two D2 uniqueness rules.
+
+    One idempotency key per investigation and one non-rejected import per
+    workspace revision; rows are immutable once stored.
+    """
+
+    def __init__(self) -> None:
+        self._items: dict[UUID, WorkContributionV1] = {}
+        self._lock = asyncio.Lock()
+
+    async def get(self, contribution_id: UUID) -> WorkContributionV1 | None:
+        return self._items.get(contribution_id)
+
+    async def get_by_idempotency(
+        self, investigation_id: UUID, idempotency_key: str
+    ) -> WorkContributionV1 | None:
+        return next(
+            (
+                item
+                for item in self._items.values()
+                if item.investigation_id == investigation_id
+                and item.idempotency_key == idempotency_key
+            ),
+            None,
+        )
+
+    async def get_non_rejected_for_revision(
+        self, workspace_id: str, workspace_revision_id: str
+    ) -> WorkContributionV1 | None:
+        return next(
+            (
+                item
+                for item in self._items.values()
+                if item.workspace_id == workspace_id
+                and item.workspace_revision_id == workspace_revision_id
+                and item.import_status is not WorkContributionImportStatus.REJECTED
+            ),
+            None,
+        )
+
+    async def list_for_investigation(
+        self,
+        investigation_id: UUID,
+        *,
+        category: WorkContributionCategory | None = None,
+        import_status: WorkContributionImportStatus | None = None,
+        workspace_id: str | None = None,
+    ) -> tuple[WorkContributionV1, ...]:
+        return tuple(
+            sorted(
+                (
+                    item
+                    for item in self._items.values()
+                    if item.investigation_id == investigation_id
+                    and (category is None or item.category is category)
+                    and (import_status is None or item.import_status is import_status)
+                    and (workspace_id is None or item.workspace_id == workspace_id)
+                ),
+                key=lambda item: (item.created_at, str(item.id)),
+            )
+        )
+
+    async def append_if_absent(
+        self, contribution: WorkContributionV1
+    ) -> tuple[WorkContributionV1, bool]:
+        async with self._lock:
+            existing_key = await self.get_by_idempotency(
+                contribution.investigation_id, contribution.idempotency_key
+            )
+            if existing_key is not None:
+                if not same_work_contribution_request(existing_key, contribution):
+                    raise VersionConflictError(
+                        "Work contribution idempotency key records a different request"
+                    )
+                return existing_key, False
+            if contribution.import_status is not WorkContributionImportStatus.REJECTED:
+                existing_revision = await self.get_non_rejected_for_revision(
+                    contribution.workspace_id, contribution.workspace_revision_id
+                )
+                if existing_revision is not None:
+                    return existing_revision, False
+            if contribution.id in self._items:
+                raise VersionConflictError("Work contribution id is already used")
+            self._items[contribution.id] = contribution
+            return contribution, True
+
+
+def same_work_contribution_request(
+    stored: WorkContributionV1, candidate: WorkContributionV1
+) -> bool:
+    """Compare the identity a replayed idempotency key commits to."""
+    return (
+        stored.workspace_id == candidate.workspace_id
+        and stored.workspace_revision_id == candidate.workspace_revision_id
+        and stored.category is candidate.category
+        and stored.origin is candidate.origin
+        and stored.file_sha256 == candidate.file_sha256
+        and stored.task_id == candidate.task_id
+    )
 
 
 class InMemoryDetectionCandidateRepository:
@@ -1801,6 +1941,7 @@ __all__ = [
     "InMemoryInvestigationTaskRepository",
     "InMemorySampleAssociationRepository",
     "InMemoryToolInvocationRepository",
+    "InMemoryWorkContributionRepository",
     "InMemoryWorkspaceBindingRepository",
     "InMemoryWorkspaceFileEventRepository",
     "InMemoryWorkspaceFileRevisionRepository",
@@ -1814,8 +1955,10 @@ __all__ = [
     "SampleAssociationRepository",
     "ToolInvocationRepository",
     "VersionConflictError",
+    "WorkContributionRepository",
     "WorkspaceBindingRepository",
     "WorkspaceFileEventRepository",
     "WorkspaceFileRevisionRepository",
     "WorkspaceSyncCursorRepository",
+    "same_work_contribution_request",
 ]

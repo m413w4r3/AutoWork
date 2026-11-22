@@ -17,6 +17,7 @@ from cti_app.application.investigation_persistence import (
     InvestigationTaskRepository,
     SampleAssociationRepository,
     ToolInvocationRepository,
+    WorkContributionRepository,
     WorkspaceBindingRepository,
     WorkspaceFileEventRepository,
     WorkspaceFileRevisionRepository,
@@ -104,6 +105,9 @@ from cti_app.application.persistence import (
 from cti_app.application.production_read_model import BatchStatusReadRepository
 from cti_app.infrastructure.database.models import (
     osint_open_policy as _osint_open_policy_models,  # noqa: F401
+)
+from cti_app.infrastructure.database.models import (
+    work_contributions as _work_contribution_models,  # noqa: F401
 )
 from cti_app.infrastructure.database.repositories.agent_sessions import (
     SqlAlchemyAgentSessionRepository,
@@ -263,6 +267,9 @@ from cti_app.infrastructure.database.repositories.selection import (
 from cti_app.infrastructure.database.repositories.source_media import (
     SqlAlchemySourceMediaRepository,
 )
+from cti_app.infrastructure.database.repositories.work_contributions import (
+    SqlAlchemyWorkContributionRepository,
+)
 from cti_app.infrastructure.database.repositories.workspace import (
     SqlAlchemyWorkspaceBindingRepository,
     SqlAlchemyWorkspaceFileEventRepository,
@@ -338,6 +345,7 @@ class SqlAlchemyUnitOfWork:
     investigation_tasks: InvestigationTaskRepository
     investigation_handoffs: InvestigationHandoffRepository
     agent_sessions: AgentSessionRepository
+    work_contributions: WorkContributionRepository
     production_runs: ProductionRunRepository
     production_routing_decisions: ProductionRoutingDecisionRepository
     editorial_workspace_snapshots: EditorialWorkspaceSnapshotRepository
@@ -450,6 +458,7 @@ class SqlAlchemyUnitOfWork:
         self.investigation_tasks = SqlAlchemyInvestigationTaskRepository(self._session)
         self.investigation_handoffs = SqlAlchemyInvestigationHandoffRepository(self._session)
         self.agent_sessions = SqlAlchemyAgentSessionRepository(self._session)
+        self.work_contributions = SqlAlchemyWorkContributionRepository(self._session)
         self.production_runs = SqlAlchemyProductionRunRepository(self._session)
         self.production_routing_decisions = SqlAlchemyProductionRoutingDecisionRepository(
             self._session

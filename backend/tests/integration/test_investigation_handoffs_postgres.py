@@ -51,7 +51,7 @@ from tests.integration.edition_codes import reserve_edition_code
 pytestmark = pytest.mark.integration
 
 PREVIOUS = "0021_investigation_tasks"
-HEAD = "0023_agent_sessions"
+HEAD = "0024_work_contributions"
 HANDOFF_TABLE = "investigation_handoffs"
 NOW = datetime(2026, 11, 22, 12, 0, tzinfo=UTC)
 HUMAN_ACTOR = HandoffActor(kind=HandoffActorKind.HUMAN, actor_id="analyst:test")
