@@ -246,7 +246,16 @@ class HostCapabilityFlagsV1(_HostResponseModel):
 class HostConfinementV1(_HostResponseModel):
     profile: str = Field(min_length=1, max_length=64)
     bwrap_ok: bool
-    netns: Literal[False]
+    netns: bool = False
+    # R03 B1: what the host actually attested for the reasoning-session network.
+    network_mode: Literal["isolated_egress", "host_network_unsafe"] | None = None
+    loopback_isolated: bool = False
+    reason: str | None = Field(default=None, max_length=512)
+    bwrap_reason: str | None = Field(default=None, max_length=512)
+    network_reason: str | None = Field(default=None, max_length=512)
+    mocked: bool = False
+    bwrap_sha256: str = ""
+    capabilities: Mapping[str, JsonValue] = Field(default_factory=dict)
 
 
 class HostCapabilityProbeV1(_HostResponseModel):
@@ -304,6 +313,8 @@ class HostPrepareSessionRequestV1(_HostWireModel):
     skill_names: tuple[str, ...] = Field(max_length=HOST_MAX_SKILLS)
     budgets: HostBudgetV1
     model: str | None = Field(default=None, pattern=_MODEL_PATTERN)
+    # R03 B1: the backend's configured CLI network mode; the host must meet it.
+    network_mode: Literal["isolated_egress", "host_network_unsafe"] = "isolated_egress"
     auth_secret: str = Field(max_length=128, repr=False)
 
     @field_validator("allowed_workspace_paths")
@@ -613,6 +624,7 @@ class HostSessionPreparationV1(_HostWireModel):
     skill_names: tuple[str, ...] = Field(max_length=HOST_MAX_SKILLS)
     budgets: HostBudgetV1
     model: str | None = Field(default=None, pattern=_MODEL_PATTERN)
+    network_mode: Literal["isolated_egress", "host_network_unsafe"] = "isolated_egress"
     expected_probe_sha256: str
 
     @field_validator("allowed_workspace_paths")
@@ -646,6 +658,7 @@ class HostSessionPreparationV1(_HostWireModel):
             skill_names=self.skill_names,
             budgets=self.budgets,
             model=self.model,
+            network_mode=self.network_mode,
             auth_secret=auth_secret_b64,
         )
 

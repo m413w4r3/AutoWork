@@ -184,12 +184,19 @@ class ConfinementProbe:
     ok: bool
     reason: str
     mocked: bool = False
+    network_mode: str | None = None
+    loopback_isolated: bool = False
+    netns: bool = False
+    network_reason: str | None = None
 
     def to_wire(self) -> dict[str, object]:
         return {
             "profile": "bwrap-claude",
             "bwrap_ok": self.ok,
-            "netns": False,
+            "netns": self.netns,
+            "network_mode": self.network_mode,
+            "loopback_isolated": self.loopback_isolated,
+            "network_reason": self.network_reason,
             "reason": self.reason,
             "mocked": self.mocked,
         }
@@ -227,6 +234,16 @@ def _probe_digest(payload: Mapping[str, object]) -> str:
 
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _environment_path(name: str) -> Path | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    if not path.is_absolute():
+        raise ValueError(f"{name} must be an absolute path")
+    return path
 
 
 def _capabilities(*, resume_proven: bool) -> tuple[ProvenCapability, ...]:
@@ -550,7 +567,11 @@ class ClaudeProfile:
         mcp_python: Path | str | None = None,
         probe_timeout_seconds: float = PROBE_TIMEOUT_SECONDS,
         confinement_probe: Callable[[], ConfinementProbe] | None = None,
+        network_mode: str = process.NETWORK_MODE_ISOLATED_EGRESS,
+        network_probe: Callable[[], process.NetworkIsolationAttestation] | None = None,
     ) -> None:
+        if network_mode not in process.CLI_NETWORK_MODES:
+            raise ValueError("network_mode must be isolated_egress or host_network_unsafe")
         self._binary = None if binary is None else Path(binary)
         self._bwrap_binary = None if bwrap_binary is None else Path(bwrap_binary)
         self._resume_proven = bool(resume_proven)
@@ -558,8 +579,36 @@ class ClaudeProfile:
         self._mcp_python = None if mcp_python is None else Path(mcp_python)
         self._probe_timeout_seconds = float(probe_timeout_seconds)
         self._confinement_probe = confinement_probe
+        self._network_mode = network_mode
+        self._network_probe = network_probe
+        self._network_attestation_cache: process.NetworkIsolationAttestation | None = None
         self._last_probe: ClaudeCapabilityProbe | None = None
         self._binary_digest_cache: dict[tuple[str, int, int, int], str] = {}
+
+    @classmethod
+    def from_environment(cls) -> ClaudeProfile:
+        """Build the profile from the deployment's explicit host knobs."""
+        resume = os.environ.get("AUTOWORK_CLAUDE_RESUME_PROVEN", "").strip() == "1"
+        return cls(
+            binary=_environment_path("AUTOWORK_CLAUDE_BINARY"),
+            bwrap_binary=_environment_path("AUTOWORK_CLAUDE_BWRAP"),
+            resume_proven=resume,
+            network_mode=process.network_mode_from_environment(),
+        )
+
+    def _network_attestation(self) -> process.NetworkIsolationAttestation:
+        """The cached R03 B1 loopback-isolation proof (host only, no network)."""
+        if self._network_mode != process.NETWORK_MODE_ISOLATED_EGRESS:
+            return process.NetworkIsolationAttestation(
+                False,
+                "explicit host_network_unsafe override",
+                process.NETWORK_MODE_HOST_NETWORK_UNSAFE,
+                False,
+            )
+        if self._network_attestation_cache is None:
+            probe = self._network_probe or process.network_isolation_attestation
+            self._network_attestation_cache = probe()
+        return self._network_attestation_cache
 
     # -- probe -------------------------------------------------------------
 
@@ -633,14 +682,39 @@ class ClaudeProfile:
 
     def _probe_confinement(self) -> ConfinementProbe:
         if self._confinement_probe is not None:
-            return self._confinement_probe()
+            probe = self._confinement_probe()
+            if probe.network_mode is not None:
+                return probe
+            # An injected probe keeps its own bwrap facts; the configured network
+            # mode and its attestation stay honest (a test must opt in explicitly).
+            return ConfinementProbe(
+                ok=probe.ok,
+                reason=probe.reason,
+                mocked=probe.mocked,
+                network_mode=self._network_mode,
+                loopback_isolated=False,
+                netns=self._network_mode == process.NETWORK_MODE_ISOLATED_EGRESS,
+                network_reason="an injected confinement probe did not attest the network",
+            )
         candidate = self._bwrap_path()
+        network = self._network_attestation()
         if candidate.is_file():
             return ConfinementProbe(
                 ok=True,
                 reason=("bwrap binary present; namespace creation remains a host-spike (H0) check"),
+                network_mode=self._network_mode,
+                loopback_isolated=network.ok,
+                netns=self._network_mode == process.NETWORK_MODE_ISOLATED_EGRESS,
+                network_reason=network.reason,
             )
-        return ConfinementProbe(ok=False, reason="bwrap binary missing")
+        return ConfinementProbe(
+            ok=False,
+            reason="bwrap binary missing",
+            network_mode=self._network_mode,
+            loopback_isolated=False,
+            netns=self._network_mode == process.NETWORK_MODE_ISOLATED_EGRESS,
+            network_reason="the bwrap binary is missing",
+        )
 
     def _bwrap_path(self) -> Path:
         if self._bwrap_binary is not None:
@@ -740,12 +814,14 @@ class ClaudeProfile:
             config_directory=context.config_directory,
             work_directory=context.work_directory,
             bwrap=self._bwrap_path(),
+            network_mode=context.network_mode,
         )
         return process.LaunchPlan(
             argv=tuple(bwrap_argv),
             env=self._environment(context),
             cwd=context.work_directory,
             uses_bwrap=True,
+            network_mode=context.network_mode,
         )
 
     def _read_prompt(self, context: LaunchContext) -> bytes:

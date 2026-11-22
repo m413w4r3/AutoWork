@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import stat
 import tempfile
@@ -19,6 +20,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from sidecars.workspace_agent.sessions import process
 from sidecars.workspace_agent.sessions import supervisor as sessions
 from sidecars.workspace_agent.sessions.adapters.codex import (
     MAX_EVENT_DETAIL_CHARS,
@@ -90,6 +92,24 @@ def session_base() -> Iterator[Path]:
         yield path
     finally:
         shutil.rmtree(path, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def _attested_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub the real host loopback attestation; its own oracle proves it separately.
+
+    The profile tests run against a named bwrap stand-in that creates no
+    namespaces, so the real bwrap+slirp4netns probe cannot apply.  The
+    attestation function is replaced at the module seam, never through a
+    production environment flag.
+    """
+    monkeypatch.setattr(
+        process,
+        "network_isolation_attestation",
+        lambda **kwargs: process.NetworkIsolationAttestation(
+            True, "test attestation", "isolated_egress", True
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +305,7 @@ def test_codex_resume_never_relaunches_without_probe(
 
     monkeypatch.setenv("AUTOWORK_CODEX_BINARY", str(fake))
     monkeypatch.setenv("AUTOWORK_CODEX_BWRAP", str(stub))
+    monkeypatch.setenv("AGENT_SESSIONS_CLI_NETWORK_MODE", "host_network_unsafe")
     monkeypatch.delenv("AUTOWORK_CODEX_RESUME_PROVEN", raising=False)
     with running_session_agent(session_base) as running, running.client() as client:
         workspace_id = running.ensure_workspace(client)
@@ -357,7 +378,12 @@ def test_codex_probe_records_unproven_capabilities(tmp_path: Path) -> None:
     ):
         assert capabilities[name]["proven"] is False, name
     assert probe.confinement["bwrap_ok"] is True
-    assert probe.confinement["netns"] is False
+    # R03 B1: the profile requests its own network namespace and the host must
+    # attest the loopback isolation; the stand-in cannot, so the test seam above
+    # supplies the attestation.
+    assert probe.confinement["netns"] is True
+    assert probe.confinement["network_mode"] == "isolated_egress"
+    assert probe.confinement["loopback_isolated"] is True
     # The stub is named by hash: the mocked sandbox is never silent.
     assert probe.confinement["bwrap_sha256"] == hashlib.sha256(stub.read_bytes()).hexdigest()
     # probed_at varies but the capability digest is stable for the same facts,
@@ -481,6 +507,7 @@ def test_codex_profile_lifecycle_through_supervisor(
     stub = _install_stub_bwrap(session_base)
     monkeypatch.setenv("AUTOWORK_CODEX_BINARY", str(fake))
     monkeypatch.setenv("AUTOWORK_CODEX_BWRAP", str(stub))
+    monkeypatch.setenv("AGENT_SESSIONS_CLI_NETWORK_MODE", "host_network_unsafe")
     monkeypatch.delenv("AUTOWORK_CODEX_AUTH_FILE", raising=False)
     monkeypatch.delenv("AUTOWORK_CODEX_RESUME_PROVEN", raising=False)
     with running_session_agent(session_base) as running, running.client() as client:
@@ -522,6 +549,9 @@ def test_codex_profile_lifecycle_through_supervisor(
         launched = [entry for entry in invocations if "exec" in entry and "--json" in entry]
         assert len(launched) == 1, invocations
         assert "--unshare-pid" in launched[0]
+        # The lifecycle tests run under the explicit dev override because the
+        # named bwrap stand-in cannot create a network namespace; the isolated
+        # profile has its own argv oracle above and a real host attestation test.
         assert "--unshare-net" not in launched[0]
         assert "--dangerously-bypass-approvals-and-sandbox" in launched[0]
 
@@ -552,6 +582,7 @@ def test_codex_profile_interrupt_kills_process_group(
     stub = _install_stub_bwrap(session_base)
     monkeypatch.setenv("AUTOWORK_CODEX_BINARY", str(fake))
     monkeypatch.setenv("AUTOWORK_CODEX_BWRAP", str(stub))
+    monkeypatch.setenv("AGENT_SESSIONS_CLI_NETWORK_MODE", "host_network_unsafe")
     with running_session_agent(session_base) as running, running.client() as client:
         workspace_id = running.ensure_workspace(client)
         assert _prepare_codex(client, running, workspace_id).status_code == 200
@@ -583,6 +614,7 @@ def test_codex_profile_resume_runs_only_when_proven(
     stub = _install_stub_bwrap(session_base)
     monkeypatch.setenv("AUTOWORK_CODEX_BINARY", str(fake))
     monkeypatch.setenv("AUTOWORK_CODEX_BWRAP", str(stub))
+    monkeypatch.setenv("AGENT_SESSIONS_CLI_NETWORK_MODE", "host_network_unsafe")
     monkeypatch.setenv("AUTOWORK_CODEX_RESUME_PROVEN", "1")
     with running_session_agent(session_base) as running, running.client() as client:
         workspace_id = running.ensure_workspace(client)
@@ -623,7 +655,11 @@ def test_codex_profile_resume_runs_only_when_proven(
 
 
 def _prepare_codex(client, running, workspace_id: str):
-    payload = prepare_payload(workspace_id, adapter_kind="codex")
+    network_mode = (
+        os.environ.get("AGENT_SESSIONS_CLI_NETWORK_MODE", "isolated_egress").strip()
+        or "isolated_egress"
+    )
+    payload = prepare_payload(workspace_id, adapter_kind="codex", network_mode=network_mode)
     return post_session(client, running, "/v1/sessions", payload, PREPARE_KEY)
 
 

@@ -42,6 +42,7 @@ from cti_app.domain.agentic_operator import (
     InterruptSessionResultV1,
     OperatorAdapterKind,
     OperatorCapabilitiesV1,
+    OperatorConfinementV1,
     OperatorProbeCommand,
     OperatorResultsV1,
     PreparedOperatorSessionV1,
@@ -213,6 +214,11 @@ async def _seed_handoff(
     return UUID(record.handoff.handoff_id)
 
 
+async def _allow_disclosure(investigation_id: UUID) -> None:
+    """This schema/race oracle is not about the disclosure gate."""
+    return None
+
+
 def _capabilities() -> OperatorCapabilitiesV1:
     return OperatorCapabilitiesV1(
         adapter_kind=OperatorAdapterKind.CODEX_CLI,
@@ -224,6 +230,13 @@ def _capabilities() -> OperatorCapabilitiesV1:
         supports_non_interactive=True,
         supports_stop=True,
         permission_modes=("workspace-write",),
+        confinement=OperatorConfinementV1(
+            profile="bwrap-reasoning-session",
+            bwrap_ok=True,
+            netns=True,
+            network_mode="isolated_egress",
+            loopback_isolated=True,
+        ),
         probed_at=NOW,
         probes=(
             OperatorProbeCommand(
@@ -705,6 +718,7 @@ def test_open_session_holds_no_lock_during_the_host_start(
                 deriver=HmacSessionSecretDeriver("0123456789abcdef0123456789abcdef"),
                 operator=operator,
                 secret_delivery=_SecretDelivery(),
+                disclosure=_allow_disclosure,
                 task_limits=TaskLimits(),
                 clock=lambda: NOW,
             )

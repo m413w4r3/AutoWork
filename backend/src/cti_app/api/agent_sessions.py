@@ -17,18 +17,23 @@ secret exactly once; every other representation omits it.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, cast
 from uuid import UUID
 
-from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi import APIRouter, Header, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from cti_app.api.investigation import (
+    _composition_factory,
     _http_error,
     _require_verified_human_operator,
     _uow_factory,
+)
+from cti_app.application.agent_session_disclosure import (
+    SessionDisclosureUnitOfWork,
+    build_session_disclosure_gate,
 )
 from cti_app.application.agent_session_verification import (
     AgentSessionVerificationError,
@@ -52,6 +57,10 @@ from cti_app.application.investigation_tasks import TaskCommandError
 from cti_app.application.investigation_transfers import (
     TransferUnitOfWork,
     WorkspaceNoteCatalog,
+)
+from cti_app.application.workspace_agent import (
+    WORKSPACE_LOCAL_UNAVAILABLE,
+    WorkspaceAgentError,
 )
 from cti_app.config import Settings, get_settings
 from cti_app.domain.agentic_operator import OperatorAdapterKind
@@ -132,6 +141,26 @@ def _secret_delivery(request: Request) -> AgentSessionSecretDeliveryPort | None:
     )
 
 
+def _disclosure_gate(request: Request) -> Callable[[UUID], Awaitable[None]]:
+    """The canonical G2/TLP gate (R03 B2); unavailable runtime refuses, never opens.
+
+    The composition is resolved when a session is actually opened, so read-only
+    routes never require it and a missing runtime still fails closed.
+    """
+
+    async def require_external_disclosure(investigation_id: UUID) -> None:
+        composition = _composition_factory(request)
+        gate = build_session_disclosure_gate(
+            uow_factory=cast(Callable[[], SessionDisclosureUnitOfWork], _uow_factory(request)),
+            article_snapshots=composition.article_snapshots,
+            settings=_settings(request),
+            effective_policy_for=composition.osint_open_policy_service.effective_for_investigation,
+        )
+        await gate(investigation_id)
+
+    return require_external_disclosure
+
+
 def _service(request: Request) -> SessionService:
     runtime = getattr(request.app.state, "agent_session_runtime", None)
     if runtime is not None and not getattr(runtime, "available", True):
@@ -143,13 +172,16 @@ def _service(request: Request) -> SessionService:
         )
     uow_factory = cast(Callable[[], SessionUnitOfWork], _uow_factory(request))
     transfer_factory = cast(Callable[[], TransferUnitOfWork], _uow_factory(request))
+    settings = _settings(request)
     return SessionService(
         uow_factory=uow_factory,
         deriver=_deriver(request),
         operator=_operator_port(request),
         secret_delivery=_secret_delivery(request),
         note_resolver=WorkspaceNoteCatalog(uow_factory=transfer_factory),
-        task_limits=_settings(request).task_limits(),
+        disclosure=_disclosure_gate(request),
+        cli_network_mode=settings.agent_sessions_cli_network_mode,
+        task_limits=settings.task_limits(),
     )
 
 
@@ -244,6 +276,56 @@ async def _operator_actor(request: Request, verified: VerifiedAgentSession) -> T
 def _session_response(prepared: PreparedAgentSession) -> dict[str, Any]:
     """Public session fields only; the secret went to the host agent (D7)."""
     return {"session": prepared.session.to_payload()}
+
+
+@router.get("/agent-sessions/capabilities")
+async def agent_session_capabilities(
+    request: Request,
+    adapter_kind: OperatorAdapterKind,
+    executable: Annotated[str, Query(min_length=1, max_length=4096)],
+) -> dict[str, Any]:
+    """Read-only real capability probe for the cockpit (R03 B3, human only).
+
+    The host resolves and probes its own configured binary; the recorded
+    ``executable`` is the value the human would pass to open a session.  No
+    secret, no authentication path and no probe argv leaves the backend.
+    """
+    await _require_verified_human_operator(request)
+    try:
+        capabilities = await _service(request).probe_session_capabilities(
+            adapter_kind, executable=executable
+        )
+    except SessionError as exc:
+        raise _session_http_error(exc) from exc
+    except WorkspaceAgentError as exc:
+        if exc.code == WORKSPACE_LOCAL_UNAVAILABLE:
+            raise _http_error(503, WORKSPACE_LOCAL_UNAVAILABLE, str(exc)) from exc
+        raise _http_error(exc.http_status, exc.code, str(exc)) from exc
+    confinement = capabilities.confinement
+    return {
+        "adapter_kind": capabilities.adapter_kind.value,
+        "executable": capabilities.executable,
+        "available": True,
+        "version": capabilities.version,
+        "capability_sha256": capabilities.capability_sha256,
+        "probed_at": capabilities.probed_at.isoformat(),
+        "supports_resume": capabilities.supports_resume,
+        "supports_structured_output": capabilities.supports_structured_output,
+        "supports_non_interactive": capabilities.supports_non_interactive,
+        "modes": list(capabilities.modes),
+        "permission_modes": list(capabilities.permission_modes),
+        "confinement": (
+            None
+            if confinement is None
+            else {
+                "profile": confinement.profile,
+                "bwrap_ok": confinement.bwrap_ok,
+                "netns": confinement.netns,
+                "network_mode": confinement.network_mode,
+                "loopback_isolated": confinement.loopback_isolated,
+            }
+        ),
+    }
 
 
 @router.get("/{investigation_id}/agent-sessions")

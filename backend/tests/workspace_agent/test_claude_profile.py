@@ -72,7 +72,12 @@ def _profile(
         resume_proven=resume_proven,
         mcp_python=mcp_python,
         confinement_probe=lambda: ConfinementProbe(
-            ok=True, reason="mocked: userns unavailable in unit tests", mocked=True
+            ok=True,
+            reason="mocked: userns unavailable in unit tests",
+            mocked=True,
+            network_mode="isolated_egress",
+            loopback_isolated=True,
+            netns=True,
         ),
     )
     return profile, binary
@@ -262,7 +267,10 @@ def test_claude_probe_is_real_hash_checked_and_bounded(tmp_path: Path) -> None:
     assert wire["confinement"] == {
         "profile": "bwrap-claude",
         "bwrap_ok": True,
-        "netns": False,
+        "netns": True,
+        "network_mode": "isolated_egress",
+        "loopback_isolated": True,
+        "network_reason": None,
         "reason": "mocked: userns unavailable in unit tests",
         "mocked": True,
     }
@@ -302,7 +310,11 @@ def test_claude_bwrap_fails_closed_without_the_binary(tmp_path: Path) -> None:
     profile = ClaudeProfile(binary=binary, bwrap_binary=tmp_path / "missing-bwrap")
     probe = profile.probe(now=PROBED_AT)
     assert probe.confinement["bwrap_ok"] is False
-    assert probe.confinement["netns"] is False
+    # The profile still requests its own network namespace; without bwrap it
+    # cannot attest the loopback isolation, so the backend fails closed.
+    assert probe.confinement["netns"] is True
+    assert probe.confinement["network_mode"] == "isolated_egress"
+    assert probe.confinement["loopback_isolated"] is False
     assert probe.confinement["reason"] == "bwrap binary missing"
     assert str(tmp_path) not in str(probe.confinement["reason"])  # no host path on the wire
     with pytest.raises(ConfinementUnavailableError):

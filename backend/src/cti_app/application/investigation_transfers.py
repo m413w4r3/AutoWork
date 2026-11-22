@@ -33,7 +33,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import TracebackType
@@ -61,6 +61,7 @@ from cti_app.application.investigation_persistence import (
     EvidenceObservationRepository,
     FindingRepository,
     HandoffRecord,
+    InvestigationEnvelopeRepository,
     InvestigationHandoffRepository,
     InvestigationPlanRepository,
     InvestigationTaskRepository,
@@ -381,6 +382,7 @@ class TransferUnitOfWork(Protocol):
     workspace_sync_cursors: WorkspaceSyncCursorRepository
     evidence_observations: EvidenceObservationRepository
     investigation_findings: FindingRepository
+    investigation_envelopes: InvestigationEnvelopeRepository
     tool_invocations: ToolInvocationRepository
 
     async def __aenter__(self) -> Self: ...
@@ -465,6 +467,8 @@ class InvestigationTransferService:
         operator: AgenticOperatorPort | None = None,
         secret_delivery: AgentSessionSecretDeliveryPort | None = None,
         deriver: SessionSecretDeriver | None = None,
+        disclosure: Callable[[UUID], Awaitable[None]] | None = None,
+        cli_network_mode: str = "isolated_egress",
         task_limits: TaskLimits = TASK_LIMIT_DEFAULTS,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -473,6 +477,8 @@ class InvestigationTransferService:
         self._operator = operator
         self._secret_delivery = secret_delivery
         self._deriver = deriver
+        self._disclosure = disclosure
+        self._cli_network_mode = cli_network_mode
         self._task_limits = task_limits
         self._clock = clock or (lambda: datetime.now(UTC))
         self._ingest = WorkspaceIngestService(uow_factory=self._workspace_uow)
@@ -1047,6 +1053,8 @@ class InvestigationTransferService:
             deriver=self._deriver,
             operator=self._operator,
             secret_delivery=self._secret_delivery,
+            disclosure=self._disclosure,
+            cli_network_mode=self._cli_network_mode,
             task_limits=self._task_limits,
             clock=self._clock,
         )

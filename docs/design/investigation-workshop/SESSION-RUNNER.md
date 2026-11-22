@@ -19,7 +19,7 @@ Operator facts: `.autowork-runs/m24/00-inventory-host-frontend.md` §A/§B.
 | Where the supervisor lives | New subpackage `sidecars/workspace_agent/sessions/`, same process, same AF_UNIX socket, same bearer token as the workspace agent; `/v1/sessions/**` stops returning 404 (`sidecars/workspace_agent/http_server.py:192-193,314-316`). Stdlib only, like the rest (WORKSPACE-AGENT:28). |
 | Session runtime location | `${XDG_RUNTIME_DIR}/autowork-workspace/sessions/<session_id>/` (0750 dir, 0600 files), **never** in the workspace. The workspace receives only captured notes/results through the existing file routes. |
 | Session secret | Derived by the backend (ADR D7:189). It transits the UDS once in `POST /v1/sessions`, is held in supervisor memory only (never disk), and is handed once over a per-session 0600 UDS socket to the shim process. Never in argv, env, config file, workspace, prompt or log. |
-| Reasoning session | The CLI runs inside a user-level `bwrap` sandbox **without `--unshare-net`** (it needs the provider): allowlisted read-only binds, rw scratch, scrubbed env, per-session `HOME`/`CODEX_HOME`/`CLAUDE_CONFIG_DIR`, cwd = session scratch. Fail-closed if `bwrap` cannot create namespaces. |
+| Reasoning session | The CLI runs inside a user-level `bwrap` sandbox in its **own network namespace** (`--unshare-net`) with a slirp4netns gateway that has `--disable-host-loopback`; allowlisted read-only binds, rw scratch, scrubbed env, per-session `HOME`/`CODEX_HOME`/`CLAUDE_CONFIG_DIR`, cwd = session scratch. The mode is the closed `AGENT_SESSIONS_CLI_NETWORK_MODE` (`isolated_egress` default; `host_network_unsafe` is an explicit dev override). Fail-closed if `bwrap`, `slirp4netns` or the loopback attestation is unavailable. |
 | Technical execution | Agent-written scripts run **only** through the attested `analysis-worker` via a new typed broker tool `analysis.run_script` (H3). Host `bwrap` is never the script boundary; no arbitrary shell is ever exposed to the model. |
 | What the CLI can call | Only the generated MCP tool catalogue served by the shim: the broker tools allowed for this session, `bridge.consult` (mapped to `advisor.consult`), `task.heartbeat`, `task.submit_result`, `handoff.submit`, `note.capture`. No generic shell, HTTP, URL or path passthrough. |
 | Who talks to the backend | Only the shim, a separate per-session process signed with the ADR D7 HMAC. The workspace-agent service still opens no outbound connection (WORKSPACE-AGENT:11-13); the shim is a distinct narrow client, not a second agent. |
@@ -43,7 +43,7 @@ browser ──HTTP──> backend container
 host: autowork-workspace-agent  ── /v1/sessions/** ──┐
         │ workspace tree, watcher, files              │
         └─ sessions/supervisor: state, bwrap profile ─┤
-             ├─ bwrap (no netns) ─ CLI process group  │
+             ├─ bwrap (netns + slirp4netns) ─ CLI process group  │
              │      └─ MCP stdio ─ shim (separate) ────┼── signed HTTP ─> backend
              │             └─ per-session UDS ────────┘   /api/investigations/... routes
              └─ bounded logs, scratch, state (runtime dir)
@@ -92,15 +92,59 @@ in the prompt brief. Native skill discovery is not trusted: Claude's flags are `
 `--setting-sources`, `--strict-mcp-config`; Codex runs with `--ignore-rules` and no AGENTS.md in
 its cwd.
 
-**Honest limits without root.** (a) Provider-only egress cannot be enforced: the CLI shares the
-host network, so a model with a shell can reach arbitrary internet hosts. Controls are the G2
-`external_llm_allowed`/disclosure envelope and the absence of AutoWork secrets, not a firewall.
-(b) Same-uid processes can signal each other and read world-readable files; `PR_SET_DUMPABLE=0`
-on the shim blocks ptrace/procfs memory reads (idiom `analysis_subprocess.py:116-121`), not
-signals. (c) No cgroup quota: CLI memory is an `RLIMIT_AS`/wall-clock budget, scratch size is
-polled, not kernel-quota'd. (d) A malicious CLI binary is out of scope; the probe records
-version/help hashes. (e) If user namespaces are unavailable, `prepare` returns
+**Honest limits (FIX-S revision).** (a) Egress is not provider-only: the sandbox's slirp4netns
+gateway reaches arbitrary internet hosts. It *cannot* reach the host loopback
+(`--disable-host-loopback` also refuses the `10.0.2.2` gateway alias), so the Vite proxy that
+injects `OPERATOR_API_TOKEN`, the published PostgreSQL/MinIO ports and every other host-local
+service are unreachable even though the model has a shell; the real host attestation proves that
+refusal before the first session. (b) Same-uid processes can signal each other and read
+world-readable files; `PR_SET_DUMPABLE=0` on the shim blocks ptrace/procfs memory reads (idiom
+`analysis_subprocess.py:116-121`), not signals. (c) No cgroup quota: CLI memory is an
+`RLIMIT_AS`/wall-clock budget, scratch size is polled, not kernel-quota'd. (d) A malicious CLI
+binary is out of scope; the probe records version/help hashes. (e) If user namespaces, `bwrap`,
+`slirp4netns` or the loopback attestation are unavailable, `prepare` returns
 `confinement_unavailable`; there is no unconfined fallback.
+
+## 3bis. Security — network isolation and disclosure gates (FIX-S, R03 B1/B2)
+
+**Network mode (closed).** `AGENT_SESSIONS_CLI_NETWORK_MODE` is read by BOTH the backend and the
+host supervisor and takes exactly two values:
+
+* `isolated_egress` (default): the CLI runs under `bwrap --unshare-net`; the supervisor reads
+  bwrap's `--info-fd` child pid, starts `slirp4netns --configure --disable-host-loopback` in that
+  network namespace, waits for its ready fd and only then releases bwrap's `--block-fd`. The
+  backend refuses the probe (`agent_session_network_isolation_unavailable`) unless the host
+  attested `network_mode=isolated_egress`, `netns=true` and `loopback_isolated=true`. The host
+  repeats the check, verifies the request's mode equals its own, and returns
+  `confinement_unavailable` if the loopback attestation did not succeed.
+* `host_network_unsafe`: explicit development override; the CLI shares the host network. The
+  host must attest that same mode for the backend to open a session, so a deployment that forgot
+  the override fails closed instead of silently sharing the network.
+
+The supervisor validates the mode and tool presence at startup, runs the real loopback
+attestation once per profile (a host helper binds `127.0.0.1`; the sandbox attempts to reach it;
+success requires a refusal, no accepted connection and a real `tap0`), and caches it. The CLI
+environment is a closed literal and `spawn` additionally rejects any key in
+`FORBIDDEN_CLI_ENV_KEYS`/`_TOKEN|_SECRET|_PASSWORD|_API_KEY`, so `OPERATOR_API_TOKEN`,
+`M24_AGENT_SESSION_KEY` and provider/store credentials can never reach the CLI.
+
+**External disclosure (B2).** Opening a session (prepare/open/start/resume) first runs the
+canonical gate in `application/agent_session_disclosure.py`: materialized G2 envelope, not
+revoked by an `AnalystDecision`, an active OSINT policy binding when inherited,
+`external_llm_allowed` on BOTH the snapshot and the envelope, source/envelope TLP at or below
+the approved bound and neither RED, and the configured advisor disclosure profile. It reuses
+`InvestigationService.external_llm_allowed`, `g2_envelope_authorization_state`,
+`osint_effective_policy_authorizes_binding` and `AdvisorDisclosurePolicy`; it creates no second
+policy. A refusal is `403 agent_session_external_llm_not_allowed` with a stable reason, before
+any host call, session row, secret or workspace bind. A service built without the gate refuses
+(`gate_unavailable`), never opens. The same gate is wired on the transfer path.
+
+**NOT PROVEN (H0 spike).** The real CLI accepting our argv/MCP config, the provider account and
+first model turn, live resume ids, the real stream-json behaviours, and the deployment's
+`bwrap`/`slirp4netns` availability in the intended systemd user unit remain host-spike items.
+The attestation proves *this* host's kernel behaviour (VERIFIED locally: host loopback and
+`10.0.2.2` refused, `tap0` present); it does not prove provider connectivity or that a model
+with a shell cannot abuse its own provider credential.
 
 ## 4. Technical execution: confined agent scripts
 

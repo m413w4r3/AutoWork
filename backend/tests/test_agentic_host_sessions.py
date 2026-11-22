@@ -437,8 +437,10 @@ async def test_port_maps_one_to_one_to_session_wire(tmp_path: Path) -> None:
         "skill_names",
         "budgets",
         "model",
+        "network_mode",
         "auth_secret",
     }
+    assert prepare_body["network_mode"] == "isolated_egress"
 
 
 async def test_wire_rejects_unknown_fields_absolute_paths_and_oversized_bodies(
