@@ -147,6 +147,10 @@ class SqlAlchemyAnalystDecisionRepository:
                 details=details,
             )
         )
+        # Sessions run with autoflush=False; a decision appended in the same UoW
+        # as a row that references it (e.g. investigation_task_events
+        # .analyst_decision_id) must reach the database before that insert.
+        await self._session.flush()
 
     async def list_for_investigation(self, investigation_id: UUID) -> Sequence[AnalystDecision]:
         query = (
