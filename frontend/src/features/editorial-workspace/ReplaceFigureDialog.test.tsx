@@ -259,9 +259,11 @@ function renderDialog(
     onClose?: () => void;
     onAccepted?: (elementKey: string) => void;
     onRefresh?: () => void;
+    snapshot?: EditorialWorkspaceSnapshot;
   } = {},
 ) {
-  const target = resolveReplaceFigureTarget(snapshot, ELEMENT_KEY);
+  const activeSnapshot = options.snapshot ?? snapshot;
+  const target = resolveReplaceFigureTarget(activeSnapshot, ELEMENT_KEY);
   if (!target) throw new Error("Synthetic replacement target must resolve");
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, gcTime: 0 } },
@@ -270,7 +272,7 @@ function renderDialog(
     <QueryClientProvider client={client}>
       <ReplaceFigureDialog
         subjectId={SUBJECT_ID}
-        snapshot={snapshot}
+        snapshot={activeSnapshot}
         target={target}
         onClose={options.onClose ?? vi.fn()}
         onAccepted={options.onAccepted}
@@ -518,6 +520,29 @@ describe("ReplaceFigureDialog", () => {
     expect(
       within(dialog).getByRole("region", { name: "Comparaison des images" }),
     ).toBeVisible();
+  });
+
+  it("shows the shared BRIEF counter and never invents a cap for ARTICLE", async () => {
+    installFetch();
+    const first = renderDialog({
+      snapshot: { ...snapshot, publication_kind: "brief" },
+    });
+
+    const dialog = await screen.findByRole("dialog", {
+      name: "Remplacer l’image intégrée",
+    });
+    expect(
+      await within(dialog).findByText(
+        /Figures intégrées : 1\/3 · Capacité restante : 2 figures sur 3\. Le remplacement conserve ce total\./,
+      ),
+    ).toBeVisible();
+    first.unmount();
+
+    renderDialog();
+    const articleDialog = await screen.findByRole("dialog", {
+      name: "Remplacer l’image intégrée",
+    });
+    expect(within(articleDialog).queryByText(/Capacité restante/)).toBeNull();
   });
 });
 
