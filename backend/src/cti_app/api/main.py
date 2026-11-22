@@ -32,6 +32,7 @@ from cti_app.api.investigation_captures import (
 from cti_app.api.investigation_captures import (
     router as investigation_captures_router,
 )
+from cti_app.api.investigation_contributions import router as investigation_contributions_router
 from cti_app.api.investigation_handoffs import router as investigation_handoffs_router
 from cti_app.api.investigation_plans import router as investigation_plans_router
 from cti_app.api.investigation_rule_corpus import router as investigation_rule_corpus_router
@@ -796,6 +797,7 @@ def create_app() -> FastAPI:
     application.include_router(investigation_bootstrap_router)
     application.include_router(investigation_plans_router)
     application.include_router(investigation_handoffs_router)
+    application.include_router(investigation_contributions_router)
     application.include_router(investigation_tasks_router)
     application.include_router(agent_sessions_router)
     application.include_router(agentic_tools_router)
