@@ -6,6 +6,14 @@ import { EditorialConversationTimeline } from "./EditorialConversationTimeline";
 import { EditorialProposalCard } from "./EditorialProposalCard";
 import { useEditorialConversationDrafts } from "./useEditorialConversationDrafts";
 import { useEditorialThreadLifecycle } from "./useEditorialThreadLifecycle";
+import {
+  isVisualElementBlock,
+  visualBridgeOperation,
+  visualElementKindLabel,
+  visualElementTitle,
+} from "./visualElementOperations";
+import { visualInstructionChips } from "./visualInstructionChips";
+import { useVisualWorkspaceContext } from "./visualWorkspaceContext";
 import type { EditorialProposalState } from "../../api/editorialWorkspace";
 
 interface EditorialConversationProps {
@@ -32,6 +40,21 @@ export function EditorialConversation({
   onPendingProposalsChange,
 }: EditorialConversationProps) {
   const drafts = useEditorialConversationDrafts(occurrenceId);
+  const visualContext = useVisualWorkspaceContext();
+  const currentBlock =
+    visualContext?.snapshot.blocks.find(
+      (block) => block.block_id === occurrenceId,
+    ) ?? null;
+  const visualBlock =
+    currentBlock && isVisualElementBlock(currentBlock) ? currentBlock : null;
+  const visualKind = visualBlock?.element_kind ?? null;
+  const canProposeVisual = Boolean(
+    visualKind && allowedOperations.includes(visualBridgeOperation(visualKind)),
+  );
+  const discussionTargetLabel =
+    visualBlock && visualKind
+      ? `${visualElementTitle(visualBlock)} — ${visualElementKindLabel(visualBlock)}`
+      : targetLabel;
   const [proposalStates, setProposalStates] = useState<
     Record<string, EditorialProposalState>
   >({});
@@ -117,7 +140,7 @@ export function EditorialConversation({
       <h3 id="editorial-conversation-heading">Discussion</h3>
       <div className="editorial-conversation__target">
         <p className="editorial-conversation__target-label">
-          Discussion sur : {targetLabel}
+          Discussion sur : {discussionTargetLabel}
         </p>
         <button
           className="editorial-conversation__change-target"
@@ -155,7 +178,7 @@ export function EditorialConversation({
               occurrenceId={occurrenceId}
               proposalId={proposalId}
               referenceOrdinal={index + 1}
-              anchorText={targetLabel}
+              anchorText={discussionTargetLabel}
               onRequestVariant={
                 lifecycle.canCompose ? requestVariant : undefined
               }
@@ -165,44 +188,77 @@ export function EditorialConversation({
         </div>
       ) : null}
       {lifecycle.canCompose ? (
-        <EditorialConversationComposer
-          draft={drafts.draft}
-          active={lifecycle.active}
-          canPropose={allowedOperations.some(
-            (operation) =>
-              operation === "rewrite_title" ||
-              operation === "rewrite_paragraph" ||
-              operation === "create_table",
-          )}
-          proposalLabel={
-            allowedOperations.includes("create_table")
-              ? "Demander au Bridge"
-              : undefined
-          }
-          controlsLocked={lifecycle.controlsLocked}
-          hasQueryError={lifecycle.threadQuery.isError}
-          sendPending={lifecycle.sendState.isPending}
-          sendSuccess={lifecycle.sendState.isSuccess}
-          sendKind={lifecycle.submissionKind}
-          sendErrorMessage={
-            lifecycle.sendState.isError
-              ? lifecycle.sendState.errorMessage
-              : null
-          }
-          submissionBelongsToCurrentTarget={
-            lifecycle.submissionBelongsToCurrentTarget
-          }
-          composerRef={composerRef}
-          onDraftChange={(value) => {
-            drafts.setDraft(value);
-            lifecycle.clearSendResult();
-          }}
-          onSuggestion={(value) => {
-            drafts.setDraft(value);
-            composerRef.current?.focus();
-          }}
-          onSubmit={submitMessage}
-        />
+        <>
+          {visualKind && canProposeVisual ? (
+            <div
+              className="visual-instruction-chips"
+              role="group"
+              aria-label="Consignes de correction du visuel"
+            >
+              <p className="visual-instruction-chips__help">
+                Consignes de correction : elles préremplissent le message
+                modifiable et n’envoient rien.
+              </p>
+              <div className="visual-instruction-chips__list">
+                {visualInstructionChips(visualKind).map((chip) => (
+                  <button
+                    key={chip.label}
+                    type="button"
+                    disabled={lifecycle.controlsLocked || lifecycle.active}
+                    onClick={() => {
+                      drafts.setDraft(chip.instruction);
+                      lifecycle.clearSendResult();
+                      composerRef.current?.focus({ preventScroll: true });
+                    }}
+                  >
+                    {chip.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : null}
+          <EditorialConversationComposer
+            draft={drafts.draft}
+            active={lifecycle.active}
+            canPropose={
+              canProposeVisual ||
+              allowedOperations.some(
+                (operation) =>
+                  operation === "rewrite_title" ||
+                  operation === "rewrite_paragraph" ||
+                  operation === "create_table",
+              )
+            }
+            proposalLabel={
+              allowedOperations.includes("create_table")
+                ? "Demander au Bridge"
+                : undefined
+            }
+            controlsLocked={lifecycle.controlsLocked}
+            hasQueryError={lifecycle.threadQuery.isError}
+            sendPending={lifecycle.sendState.isPending}
+            sendSuccess={lifecycle.sendState.isSuccess}
+            sendKind={lifecycle.submissionKind}
+            sendErrorMessage={
+              lifecycle.sendState.isError
+                ? lifecycle.sendState.errorMessage
+                : null
+            }
+            submissionBelongsToCurrentTarget={
+              lifecycle.submissionBelongsToCurrentTarget
+            }
+            composerRef={composerRef}
+            onDraftChange={(value) => {
+              drafts.setDraft(value);
+              lifecycle.clearSendResult();
+            }}
+            onSuggestion={(value) => {
+              drafts.setDraft(value);
+              composerRef.current?.focus();
+            }}
+            onSubmit={submitMessage}
+          />
+        </>
       ) : null}
     </section>
   );

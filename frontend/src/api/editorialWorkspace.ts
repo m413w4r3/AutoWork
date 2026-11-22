@@ -575,6 +575,27 @@ export type EditorialVisualRevisionPatch =
       kind: "reorder_enrichment_elements";
       anchor_block_id: string;
       order: EditorialEnrichmentElementRef[];
+    }
+  | {
+      kind: "replace_source_figure";
+      element_key: string;
+      figure_id: string;
+      caption: string | null;
+    }
+  | {
+      kind: "remove_enrichment_element";
+      element_kind: EditorialEnrichmentElementKind;
+      element_key: string;
+    }
+  | {
+      kind: "revise_chart";
+      element_key: string;
+      chart: Record<string, unknown>;
+    }
+  | {
+      kind: "revise_diagram";
+      element_key: string;
+      diagram: Record<string, unknown>;
     };
 
 export interface EditorialVisualRevisionProposalPatch {
@@ -590,6 +611,21 @@ export interface EditorialVisualRevisionProposalPatch {
 
 export type EditorialProposalPatchDocument =
   EditorialProposalPatch | EditorialVisualRevisionProposalPatch;
+
+/**
+ * Narrow a proposal patch to the persisted visual-revision document. The
+ * backend serializes visual patches with a `visual_patch` member and the
+ * `editorial-enrichment-visual-patch-v1` schema marker.
+ */
+export function isVisualRevisionProposalPatch(
+  patch: EditorialProposalPatchDocument | null,
+): patch is EditorialVisualRevisionProposalPatch {
+  return (
+    patch !== null &&
+    patch.schema_version === "editorial-enrichment-visual-patch-v1" &&
+    "visual_patch" in patch
+  );
+}
 
 /** Proposal read returned by the generic enrichment revision endpoint. */
 export interface EditorialVisualRevisionProposalRead extends Omit<
@@ -845,7 +881,7 @@ export interface EditorialProposalRead {
   base_canonical_sha256: string;
   base_text: string | null;
   patch_sha256: string | null;
-  patch: EditorialProposalPatch | null;
+  patch: EditorialProposalPatchDocument | null;
   diagnostics: Record<string, unknown>;
   created_at: string;
 }
