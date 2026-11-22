@@ -32,7 +32,7 @@ on its branch). Inside ``sessions/supervisor.default_profiles()``, add a
     return ProfileRegistry((FakeProfile(), ClaudeProfile()))
 
 The provider-neutral authority-limits preamble comes from
-``adapters/claude_preamble.py`` (the H5 stand-in for H4's shared preamble).
+``adapters/preamble.py`` shared with the Codex profile.
 """
 
 from __future__ import annotations
@@ -62,7 +62,7 @@ from ..state import (
     atomic_write_json,
 )
 from ..supervisor import CapabilityProbe, LaunchContext, ProbeFlags
-from .claude_preamble import AUTHORITY_LIMITS_PREAMBLE
+from .preamble import SYSTEM_PREAMBLE
 
 ADAPTER_KIND = "claude"
 DEFAULT_MAX_BUDGET_USD = "1.00"
@@ -825,7 +825,7 @@ class ClaudeProfile:
         # --restricted keeps file tools confined to cwd + --add-dir.
         scratch = context.scratch_directory
         return (
-            AUTHORITY_LIMITS_PREAMBLE
+            SYSTEM_PREAMBLE
             + "\nOutput paths: write the final result to "
             + f"{scratch}/result.md (or {scratch}/final.md) and working notes "
             + f"under {scratch}/notes/. Those are the only task output "
