@@ -151,18 +151,19 @@ function renderInspector(
 describe("EditorialInspector tabs", () => {
   it("renders the five contract tabs and defaults to the Bridge discussion", () => {
     renderInspector();
-    const tabs = screen.getAllByRole("tab");
-    expect(tabs.map((tab) => tab.textContent)).toEqual([
-      "Discussion",
+    expect(screen.getAllByRole("tab")).toHaveLength(5);
+    for (const name of [
+      "Discussion Bridge",
       "Modifier",
       "Visuels",
       "Sources",
       "Historique",
-    ]);
-    expect(screen.getByRole("tab", { name: "Discussion" })).toHaveAttribute(
-      "aria-selected",
-      "true",
-    );
+    ]) {
+      expect(screen.getByRole("tab", { name })).toBeVisible();
+    }
+    expect(
+      screen.getByRole("tab", { name: "Discussion Bridge" }),
+    ).toHaveAttribute("aria-selected", "true");
     expect(screen.getByTestId("conversation-panel")).toBeVisible();
     expect(screen.queryByTestId("history-panel")).not.toBeInTheDocument();
   });
@@ -174,7 +175,7 @@ describe("EditorialInspector tabs", () => {
     expect(
       screen.getByRole("heading", { name: "Sources et preuves" }),
     ).toBeVisible();
-    fireEvent.click(screen.getByRole("tab", { name: "Discussion" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Discussion Bridge" }));
     expect(screen.getByTestId("conversation-panel")).toBeVisible();
   });
 
@@ -211,19 +212,19 @@ describe("EditorialInspector tabs", () => {
       name: "Panneaux de l’inspecteur",
     });
     expect(
-      within(tablist).getByRole("tab", { name: "Discussion" }),
+      within(tablist).getByRole("tab", { name: "Discussion Bridge" }),
     ).toBeVisible();
     fireEvent.click(screen.getByRole("tab", { name: "Visuels" }));
     expect(screen.getByRole("button", { name: "Ajouter après" })).toBeVisible();
     expect(
-      within(tablist).getByRole("tab", { name: "Discussion" }),
+      within(tablist).getByRole("tab", { name: "Discussion Bridge" }),
     ).toBeVisible();
   });
 
   it("supports ArrowRight/Home/End keyboard tab navigation", () => {
     renderInspector();
     const discussionTab = screen.getByRole("tab", {
-      name: "Discussion",
+      name: "Discussion Bridge",
     });
     discussionTab.focus();
     fireEvent.keyDown(discussionTab, { key: "ArrowRight" });

@@ -1,4 +1,5 @@
 import { ApiError } from "../../api/editions";
+import { editorialRefusalMessage } from "../../api/editorialRefusalCopy";
 import type {
   EditorialFigureCatalogItem,
   EditorialWorkspaceBlock,
@@ -267,7 +268,10 @@ export function replaceFigureErrorInfo(error: unknown): ReplaceFigureErrorInfo {
       code,
       message:
         REPLACE_FIGURE_ERROR_MESSAGES[code] ??
-        "L’image n’a pas pu être remplacée. Vérifiez la sélection, puis réessayez.",
+        editorialRefusalMessage(
+          code,
+          "L’image n’a pas pu être remplacée. Vérifiez la sélection, puis réessayez.",
+        ),
       refresh: REPLACE_FIGURE_REFRESH_CODES.has(code) || error.status === 409,
     };
   }

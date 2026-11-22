@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
@@ -7,8 +7,10 @@ import {
   ANCHOR_ONE_ID,
   ANCHOR_TWO_ID,
   CHART_BLOCK_ID,
+  DIAGRAM_BLOCK_ID,
   FIGURE_A_BLOCK_ID,
   chartBlock,
+  diagramBlock,
   figureBlock,
   paragraphBlock,
   visualSnapshot,
@@ -217,6 +219,46 @@ describe("EditorialDocument visual blocks", () => {
     expect(screen.getByText(/Ordre prévu :/)).toHaveTextContent(
       "1. Titre actuel du graphique",
     );
+  });
+
+  it("renders a readable diagram summary and keeps the diagram selectable", async () => {
+    const user = userEvent.setup();
+    const props = handlers();
+    render(
+      <EditorialDocument
+        snapshot={visualSnapshot({
+          blocks: [heading, paragraphOne, diagramBlock()],
+        })}
+        selectedBlockId={null}
+        drafts={{}}
+        staleDraftIds={new Set()}
+        editingBlockId={null}
+        {...props}
+      />,
+    );
+
+    const summary = screen.getByRole("region", {
+      name: "Diagramme : Titre du diagramme",
+    });
+    expect(
+      within(summary).getByRole("heading", { name: "Titre du diagramme" }),
+    ).toBeVisible();
+    expect(within(summary).getByText("Légende du diagramme")).toBeVisible();
+    expect(
+      within(summary).getByRole("list", { name: "Nœuds du diagramme" }),
+    ).toHaveTextContent("Nœud 1");
+    expect(
+      within(summary).getByRole("list", { name: "Relations du diagramme" }),
+    ).toHaveTextContent("Nœud 1 → Nœud 2");
+
+    const element = document.querySelector<HTMLElement>(
+      `[data-block-id="${DIAGRAM_BLOCK_ID}"]`,
+    );
+    expect(element).toHaveAttribute("data-element-kind", "diagram");
+    expect(element).toHaveAttribute("data-element-key", "diagram-a");
+    if (!element) throw new Error("diagram block missing");
+    await user.click(element);
+    expect(props.onSelectBlock).toHaveBeenCalledWith(DIAGRAM_BLOCK_ID);
   });
 
   it("hides revision actions in read-only mode while keeping the block selectable", () => {

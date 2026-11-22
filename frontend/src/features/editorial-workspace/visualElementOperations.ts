@@ -113,6 +113,87 @@ interface OperationSource {
   allowed_operations: readonly string[];
 }
 
+/**
+ * Truthful mutating capabilities of one snapshot. `manual_edit` covers every
+ * manual typed revision (prepare + adopt); `can_discuss` covers Bridge entries;
+ * `can_add_enrichment` covers manual insertions. A control whose capability is
+ * false is never rendered: `allowed_operations` alone is not a promise that the
+ * mounted application can execute the operation.
+ */
+export interface VisualCapabilityFlags {
+  read_only: boolean;
+  manual_edit: boolean;
+  can_discuss: boolean;
+}
+
+export interface VisualOperationAvailability {
+  caption: boolean;
+  move: boolean;
+  reorder: boolean;
+  replace: boolean;
+  remove: boolean;
+  bridge: boolean;
+}
+
+type VisualOperationSource = OperationSource & {
+  element_kind?: EditorialEnrichmentElementKind | null;
+};
+
+/**
+ * Resolve every visual control from the snapshot's allowed operations *and*
+ * its truthful capabilities. Single source of truth for the document action
+ * bar, the inspector list, the move panel and the replace entry.
+ */
+export function visualOperationAvailability(
+  block: VisualOperationSource,
+  capabilities: Pick<
+    VisualCapabilityFlags,
+    "read_only" | "manual_edit" | "can_discuss"
+  >,
+): VisualOperationAvailability {
+  const writable = !capabilities.read_only && capabilities.manual_edit;
+  return {
+    caption: writable && canEditVisualCaption(block),
+    move: writable && canMoveVisualElement(block),
+    reorder: writable && canReorderVisualElements(block),
+    replace: writable && canReplaceVisualElement(block),
+    remove: writable && canRemoveVisualElement(block),
+    bridge:
+      !capabilities.read_only &&
+      capabilities.can_discuss &&
+      canRequestVisualBridgeCorrection(block),
+  };
+}
+
+/** Precise reason when manual visual revisions are unavailable. */
+export function visualMutationUnavailableReason(
+  capabilities: Pick<VisualCapabilityFlags, "read_only" | "manual_edit">,
+): string | null {
+  if (capabilities.read_only) {
+    return "Lecture seule : les révisions de ce visuel sont indisponibles.";
+  }
+  if (!capabilities.manual_edit) {
+    return "La préparation des révisions visuelles n’est pas activée pour cet atelier. Aucune modification n’est possible.";
+  }
+  return null;
+}
+
+/** Capability flags read from one snapshot, including the implicit read-only kind. */
+export function visualCapabilityFlags(
+  snapshot: Pick<
+    EditorialWorkspaceSnapshot,
+    "capabilities" | "publication_kind"
+  >,
+): VisualCapabilityFlags {
+  return {
+    read_only:
+      snapshot.capabilities.read_only_reason != null ||
+      snapshot.publication_kind === null,
+    manual_edit: snapshot.capabilities.manual_edit,
+    can_discuss: snapshot.capabilities.can_discuss,
+  };
+}
+
 export function canEditVisualCaption(block: OperationSource): boolean {
   return block.allowed_operations.includes("update_visual_caption");
 }

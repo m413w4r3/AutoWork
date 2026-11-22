@@ -7,7 +7,7 @@ import type {
 } from "../../api/editorialWorkspace";
 import { BarChartInsertionPanel } from "./BarChartInsertionPanel";
 import { FigureInsertionPanel } from "./FigureInsertionPanel";
-import { supportsInsertionAfter } from "./insertionOperations";
+import { canInsertAfter as canInsertAfterCapability } from "./insertionOperations";
 import { TableInsertionPanel } from "./TableInsertionPanel";
 
 interface VisualInsertionComposerProps {
@@ -34,10 +34,10 @@ export function VisualInsertionComposer({
   const [editorMode, setEditorMode] = useState<
     "table" | "chart" | "figure" | null
   >(null);
-  const canInsertAfter =
-    !readOnly &&
-    snapshot.capabilities.can_add_enrichment &&
-    supportsInsertionAfter(block);
+  const canInsertAfter = canInsertAfterCapability(block, {
+    read_only: readOnly,
+    can_add_enrichment: snapshot.capabilities.can_add_enrichment,
+  });
   const canCreateTable =
     canInsertAfter && block.allowed_operations.includes("create_table");
   const canCreateBarChart =

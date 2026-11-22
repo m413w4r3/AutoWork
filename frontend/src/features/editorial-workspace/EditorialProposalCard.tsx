@@ -2,6 +2,7 @@ import { useEffect, useId } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { ApiError } from "../../api/editions";
+import { editorialRefusalMessage } from "../../api/editorialRefusalCopy";
 import {
   acceptEditorialProposal,
   getEditorialProposal,
@@ -11,7 +12,6 @@ import {
   type EditorialManualSourceFigurePatchReference,
   type EditorialProposalPatch,
   type EditorialProposalRead,
-  type EditorialProposalRefusalCode,
   type EditorialProposalState,
   type EditorialTableProposal,
 } from "../../api/editorialWorkspace";
@@ -45,16 +45,8 @@ const stateLabels: Record<EditorialProposalState, string> = {
   stale: "Périmée",
 };
 
-const refusalLabels: Record<EditorialProposalRefusalCode, string> = {
-  revision_not_applicable:
-    "Les données disponibles ne permettent pas de proposer cette révision.",
-};
-
 function refusalLabel(code: unknown): string {
-  if (code === "revision_not_applicable") {
-    return refusalLabels[code];
-  }
-  return "Le Bridge n’a pas produit de proposition exploitable.";
+  return editorialRefusalMessage(code);
 }
 
 function focusDocumentBlock(occurrenceId: string) {

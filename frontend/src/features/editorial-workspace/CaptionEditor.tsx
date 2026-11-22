@@ -173,10 +173,16 @@ export function CaptionEditor({ block, onSave, onCancel }: CaptionEditorProps) {
       )}
       <p
         className="visual-caption-editor__status"
-        role={error ? "alert" : "status"}
-        aria-live={error ? "assertive" : "polite"}
+        role="status"
+        aria-live="polite"
       >
-        {error ?? (saving ? "Enregistrement de la légende…" : "")}
+        {error ? (
+          <strong role="alert" aria-live="assertive">
+            {error}
+          </strong>
+        ) : saving ? (
+          "Enregistrement de la légende…"
+        ) : null}
       </p>
       <p className="visual-caption-editor__shortcuts">
         Ctrl/Cmd+S enregistre, Échap annule. La légende d’origine reste

@@ -7,6 +7,10 @@ import {
   type ReplaceFigureFlow,
   type ReplaceFigureTarget,
 } from "./replaceFigureContract";
+import {
+  visualCapabilityFlags,
+  visualMutationUnavailableReason,
+} from "./visualElementOperations";
 
 export interface ReplaceFigureFlowState extends ReplaceFigureFlow {
   /** Dialog node to render once a request has been made. */
@@ -37,6 +41,14 @@ export function useReplaceFigureFlow(
 
   const requestReplace = useCallback(
     (elementKey: string) => {
+      const unavailable = visualMutationUnavailableReason(
+        visualCapabilityFlags(snapshot),
+      );
+      if (unavailable) {
+        setTarget(null);
+        setUnresolvedError(unavailable);
+        return;
+      }
       const resolved = resolveReplaceFigureTarget(snapshot, elementKey);
       if (!resolved) {
         setTarget(null);

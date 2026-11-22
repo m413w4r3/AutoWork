@@ -14,10 +14,7 @@ import { ReplaceFigureDialog } from "./ReplaceFigureDialog";
 import { SourceFigureGallery } from "./SourceFigureGallery";
 import { VisualInsertionComposer } from "./VisualInsertionComposer";
 import { BLOCK_KIND_LABELS } from "./blockKindLabels";
-import {
-  isInsertionAnchor,
-  supportsInsertionAfter,
-} from "./insertionOperations";
+import { insertionUnavailableReason } from "./insertionOperations";
 import { manualEditUnavailableReason } from "./manualEditOperation";
 import {
   briefFigureCapacity,
@@ -28,12 +25,19 @@ import {
   type VisualActionCallbacks,
 } from "./replaceFigureContract";
 import { useVisualWorkspaceContext } from "./visualWorkspaceContext";
+import {
+  visualCapabilityFlags,
+  visualElementAnchorId,
+  visualElementTitle,
+  visualMutationUnavailableReason,
+  visualOperationAvailability,
+} from "./visualElementOperations";
 
 export type InspectorTab =
   "discussion" | "modifier" | "visuels" | "sources" | "historique";
 
-const TABS: { id: InspectorTab; label: string }[] = [
-  { id: "discussion", label: "Discussion" },
+const TABS: { id: InspectorTab; label: string; compactLabel?: string }[] = [
+  { id: "discussion", label: "Discussion Bridge", compactLabel: "Discussion" },
   { id: "modifier", label: "Modifier" },
   { id: "visuels", label: "Visuels" },
   { id: "sources", label: "Sources" },
@@ -103,68 +107,11 @@ function EvidenceReference({
   );
 }
 
-function insertionUnavailableReason({
-  block,
-  readOnly,
-  canAddEnrichment,
-}: {
-  block: EditorialWorkspaceBlock;
-  readOnly: boolean;
-  canAddEnrichment: boolean;
-}): string | null {
-  if (readOnly) {
-    return "L’atelier est en lecture seule : aucune insertion ne peut être préparée.";
-  }
-  if (!canAddEnrichment) {
-    return "La préparation d’insertions n’est pas activée pour cet atelier.";
-  }
-  if (!isInsertionAnchor(block)) {
-    return "Seuls un paragraphe ou le chapeau peuvent recevoir une insertion après eux.";
-  }
-  if (!supportsInsertionAfter(block)) {
-    return "Aucune insertion après ce bloc n’est autorisée par l’instantané serveur.";
-  }
-  return null;
-}
-
 function excerpt(text: string, maxLength = 90): string {
   const normalized = text.trim();
   return normalized.length > maxLength
     ? `${normalized.slice(0, maxLength - 1).trimEnd()}…`
     : normalized;
-}
-
-function visualCaption(block: EditorialWorkspaceBlock): string {
-  if (block.kind === "figure") {
-    return (
-      block.figure?.caption ?? block.caption ?? block.text ?? "Sans légende"
-    );
-  }
-  if (block.kind === "chart") {
-    return block.chart?.title ?? block.caption ?? "Sans titre";
-  }
-  if (block.kind === "table") {
-    return block.table?.title ?? block.caption ?? "Sans titre";
-  }
-  if (block.kind === "diagram") {
-    return block.diagram?.title ?? block.caption ?? "Sans titre";
-  }
-  return block.text ?? "Sans légende";
-}
-
-function visualAnchorBlockId(block: EditorialWorkspaceBlock): string | null {
-  switch (block.kind) {
-    case "figure":
-      return block.figure?.anchor_block_id ?? null;
-    case "chart":
-      return block.chart?.anchor_block_id ?? null;
-    case "table":
-      return block.table?.anchor_block_id ?? null;
-    case "diagram":
-      return block.diagram?.anchor_block_id ?? null;
-    default:
-      return null;
-  }
 }
 
 function visualPlacement(
@@ -192,7 +139,7 @@ function visualPositionLabel(
   block: EditorialWorkspaceBlock,
   snapshot: EditorialWorkspaceSnapshot,
 ): string {
-  const anchorBlockId = visualAnchorBlockId(block);
+  const anchorBlockId = visualElementAnchorId(block);
   if (anchorBlockId) {
     const anchor = snapshot.blocks.find(
       (candidate) => candidate.block_id === anchorBlockId,
@@ -286,21 +233,25 @@ export function EditorialInspector({
     readOnly,
     manualEditEnabled: snapshot.capabilities.manual_edit,
   });
+  const capabilityFlags = visualCapabilityFlags(snapshot);
   const insertionReason = block
-    ? insertionUnavailableReason({
-        block,
-        readOnly,
-        canAddEnrichment: snapshot.capabilities.can_add_enrichment,
+    ? insertionUnavailableReason(block, {
+        read_only: readOnly,
+        can_add_enrichment: snapshot.capabilities.can_add_enrichment,
       })
     : "Sélectionnez un bloc pour préparer une insertion.";
+  const visualMutationReason = readOnly
+    ? null
+    : visualMutationUnavailableReason(capabilityFlags);
   const visuals = documentVisuals(snapshot);
   const briefCapacity = briefFigureCapacity(snapshot);
   const briefCapacityNote = briefFigureCapacityNote(snapshot);
   const canInsertArchivedFigures = Boolean(
     block &&
-    !readOnly &&
-    snapshot.capabilities.can_add_enrichment &&
-    isInsertionAnchor(block) &&
+    insertionUnavailableReason(block, {
+      read_only: readOnly,
+      can_add_enrichment: snapshot.capabilities.can_add_enrichment,
+    }) === null &&
     block.allowed_operations.includes("create_source_figure"),
   );
 
@@ -413,7 +364,21 @@ export function EditorialInspector({
                   onClick={() => onTabChange(tab.id)}
                   onKeyDown={(event) => handleTabKeyDown(event, index)}
                 >
-                  {tab.label}
+                  {tab.compactLabel ? (
+                    <>
+                      <span className="editorial-inspector-tab__label">
+                        {tab.label}
+                      </span>
+                      <span
+                        className="editorial-inspector-tab__compact"
+                        aria-hidden="true"
+                      >
+                        {tab.compactLabel}
+                      </span>
+                    </>
+                  ) : (
+                    tab.label
+                  )}
                 </button>
               ))}
             </div>
@@ -516,6 +481,11 @@ export function EditorialInspector({
                   <h3 id="editorial-visuals-document-heading">
                     Éléments visuels du document
                   </h3>
+                  {visualMutationReason ? (
+                    <p className="editorial-inspector__reason" role="note">
+                      {visualMutationReason}
+                    </p>
+                  ) : null}
                   {visuals.length === 0 ? (
                     <p className="editorial-visuals__empty">
                       Ce document ne contient encore aucun élément visuel.
@@ -526,34 +496,29 @@ export function EditorialInspector({
                       aria-label="Éléments visuels du document"
                     >
                       {visuals.map((visual) => {
-                        const caption = visualCaption(visual);
+                        const caption = visualElementTitle(visual);
                         const elementKey = visual.element_key;
-                        const operations = visual.allowed_operations;
+                        const availability = visualOperationAvailability(
+                          visual,
+                          capabilityFlags,
+                        );
+                        // The inspector keeps a local dialog fallback, so a
+                        // missing workspace handler is not a capability gate.
                         const canReplace = Boolean(
-                          !readOnly &&
-                          visual.kind === "figure" &&
-                          elementKey &&
-                          operations.includes("replace_source_figure"),
+                          availability.replace && elementKey,
                         );
                         const canRemove = Boolean(
-                          !readOnly &&
+                          availability.remove &&
                           elementKey &&
-                          requestRemoveHandler &&
-                          operations.some((operation) =>
-                            operation.startsWith("delete_"),
-                          ),
+                          requestRemoveHandler,
                         );
                         const canCaption = Boolean(
-                          !readOnly &&
+                          availability.caption &&
                           elementKey &&
-                          requestCaptionHandler &&
-                          operations.includes("update_visual_caption"),
+                          requestCaptionHandler,
                         );
                         const canMove = Boolean(
-                          !readOnly &&
-                          elementKey &&
-                          requestMoveHandler &&
-                          operations.includes("move_enrichment_element"),
+                          availability.move && elementKey && requestMoveHandler,
                         );
                         return (
                           <li
@@ -648,6 +613,7 @@ export function EditorialInspector({
                   <MoveElementPanel
                     snapshot={snapshot}
                     element={moveElement}
+                    readOnly={visualContext.readOnly}
                     draftAnchorId={visualMove.draftAnchorId}
                     saving={visualMove.saving}
                     error={visualMove.error}

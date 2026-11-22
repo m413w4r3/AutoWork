@@ -101,7 +101,7 @@ const snapshot: EditorialWorkspaceSnapshot = {
   capabilities: {
     can_discuss: false,
     can_preview_revision: false,
-    manual_edit: false,
+    manual_edit: true,
     can_add_enrichment: false,
     can_preview_pdf: false,
     can_regenerate_pdf: false,
@@ -246,6 +246,10 @@ function installFetch(
         }
         captured.acceptBodies.push(JSON.parse(init.body) as unknown);
         return Promise.resolve(acceptResponse());
+      }
+      if (method === "GET" && url.includes("/proposals/")) {
+        // A state conflict is reconciled by re-reading the proposal.
+        return Promise.resolve(response(proposalRead()));
       }
       throw new Error(`Unexpected request ${method} ${url}`);
     }),
@@ -551,6 +555,33 @@ describe("ReplaceFigureDialog", () => {
     expect(
       within(articleDialog).queryByText(/Capacité du document/),
     ).toBeNull();
+  });
+
+  it("disables the replacement when the snapshot reports manual_edit=false", async () => {
+    const user = userEvent.setup();
+    const captured = installFetch();
+    renderDialog({
+      snapshot: {
+        ...snapshot,
+        capabilities: { ...snapshot.capabilities, manual_edit: false },
+      },
+    });
+
+    const dialog = await screen.findByRole("dialog", {
+      name: "Remplacer l’image intégrée",
+    });
+    await user.click(
+      await within(dialog).findByRole("radio", {
+        name: "Choisir Carte de remplacement",
+      }),
+    );
+    expect(
+      within(dialog).getByRole("button", { name: "Remplacer l’image" }),
+    ).toBeDisabled();
+    expect(within(dialog).getByRole("note")).toHaveTextContent(
+      "La préparation des révisions visuelles n’est pas activée pour cet atelier.",
+    );
+    expect(captured.prepareBodies).toEqual([]);
   });
 
   it("confirms before closing with a pending replacement selection", async () => {

@@ -430,7 +430,7 @@ describe("VisualInsertionComposer bar chart", () => {
                 detail: {
                   code: "bar_chart_insufficient_data",
                   message:
-                    "Aucun graphique quantitatif vérifiable ne peut être créé à partir des preuves actuelles. Un tableau descriptif peut être proposé à la place.",
+                    "Les preuves admises ne contiennent pas assez de données quantitatives pour construire un graphique. Un tableau descriptif peut être proposé.",
                 },
               }),
               { status: 422, headers: { "Content-Type": "application/json" } },
@@ -448,7 +448,7 @@ describe("VisualInsertionComposer bar chart", () => {
     fireEvent.click(screen.getByRole("button", { name: "Proposer" }));
 
     const refusal =
-      "Aucun graphique quantitatif vérifiable ne peut être créé à partir des preuves actuelles. Un tableau descriptif peut être proposé à la place.";
+      "Les preuves admises ne contiennent pas assez de données quantitatives pour construire un graphique. Un tableau descriptif peut être proposé.";
     expect(await screen.findByRole("alert")).toHaveTextContent(refusal);
     fireEvent.click(
       screen.getByRole("button", { name: "Proposer un tableau à la place" }),

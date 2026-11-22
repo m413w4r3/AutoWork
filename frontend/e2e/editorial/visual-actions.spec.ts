@@ -3,6 +3,8 @@ import { expect, test, type Page } from "@playwright/test";
 import {
   chartCorrectionProposal,
   CHART_KEY,
+  DIAGRAM_KEY,
+  diagramCorrectionProposal,
   FIGURE_A_KEY,
   FIGURE_B_KEY,
   installVisualEditorialStubs,
@@ -366,6 +368,99 @@ test("E17 — rejecting a visual proposal leaves the canonical chart unchanged",
   );
   expect(fixture.chartTitle).toBe("Titre initial du graphique");
   expect(capture.enrichmentRevisions).toEqual([]);
+  expect(capture.unexpectedRequests).toEqual([]);
+});
+
+test("Visuels — no mutation control is rendered when manual_edit is false", async ({
+  page,
+}) => {
+  const fixture = new VisualEditorialFixture();
+  fixture.manualEdit = false;
+  const capture = await installVisualEditorialStubs(page, fixture);
+  await openFixture(page, fixture);
+  await selectVisual(page, CHART_KEY);
+
+  const toolbar = page.getByRole("toolbar", {
+    name: "Actions du visuel : Titre initial du graphique",
+  });
+  await expect(toolbar).toBeVisible();
+  for (const name of [
+    "Modifier la légende",
+    "Déplacer",
+    "Réorganiser",
+    "Remplacer",
+    "Retirer",
+  ]) {
+    await expect(toolbar.getByRole("button", { name })).toHaveCount(0);
+  }
+  await expect(
+    toolbar.getByRole("button", { name: "Demander à Bridge" }),
+  ).toBeVisible();
+  await expect(toolbar.getByRole("note")).toContainText(
+    "La préparation des révisions visuelles n’est pas activée pour cet atelier.",
+  );
+  expect(capture.enrichmentRevisions).toEqual([]);
+  expect(capture.unexpectedRequests).toEqual([]);
+});
+
+test("E08 — correction d’un diagramme par proposition", async ({ page }) => {
+  const fixture = new VisualEditorialFixture();
+  const capture = await installVisualEditorialStubs(page, fixture, {
+    threadProposal: diagramCorrectionProposal(),
+  });
+  await openFixture(page, fixture);
+  await selectVisual(page, DIAGRAM_KEY);
+
+  // The workshop renders a readable structured summary of the diagram.
+  const summary = page.getByRole("region", {
+    name: "Diagramme : Diagramme de synthèse",
+  });
+  await expect(summary).toBeVisible();
+  await expect(
+    summary.getByText("Légende initiale du diagramme"),
+  ).toBeVisible();
+  await expect(
+    summary.getByRole("list", { name: "Nœuds du diagramme" }),
+  ).toContainText("Nœud initial");
+  await expect(
+    summary.getByRole("list", { name: "Relations du diagramme" }),
+  ).toContainText("Nœud initial → Nœud final");
+
+  // The caption action stays a distinct manual entry; an unchanged caption
+  // closes without any request.
+  await page.getByRole("button", { name: "Modifier la légende" }).click();
+  await expect(
+    page.getByRole("textbox", { name: "Légende éditoriale" }),
+  ).toHaveValue("Légende initiale du diagramme");
+  await page.keyboard.press("Escape");
+  await expect(
+    page.getByRole("textbox", { name: "Légende éditoriale" }),
+  ).toHaveCount(0);
+
+  // The Bridge correction entry exposes the typed structure diff.
+  await page.getByRole("button", { name: "Demander à Bridge" }).click();
+  await expect(
+    page.getByText("Discussion sur : Diagramme de synthèse — Diagramme"),
+  ).toBeVisible();
+  const card = page
+    .getByRole("article", { name: "Proposition éditoriale" })
+    .first();
+  await expect(card).toBeVisible();
+  await expect(
+    card.getByRole("region", { name: "Comparaison du diagramme" }),
+  ).toBeVisible();
+  await expect(card).toContainText("Nœud corrigé après revue");
+  await expect(card.getByText("Preuves du diagramme")).toBeVisible();
+
+  await card.getByRole("button", { name: "Accepter" }).click();
+  await expect(card.getByRole("button", { name: "Acceptée" })).toBeVisible();
+  await expect(blockByElementKey(page, DIAGRAM_KEY)).toContainText(
+    "Nœud corrigé après revue",
+  );
+  await expect(blockByElementKey(page, DIAGRAM_KEY)).toHaveCount(1);
+  await expect(page.getByText("PDF obsolète")).toBeVisible();
+  expect(capture.enrichmentRevisions).toEqual([]);
+  expect(capture.bridgeEntries).toBe(0);
   expect(capture.unexpectedRequests).toEqual([]);
 });
 

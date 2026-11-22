@@ -1506,7 +1506,7 @@ const STATES: MatrixState[] = [
         page.getByRole("tablist", { name: "Panneaux de l’inspecteur" }),
       ).toBeVisible();
       await expect(
-        page.getByRole("tab", { name: "Discussion" }),
+        page.getByRole("tab", { name: "Discussion Bridge" }),
       ).toHaveAttribute("aria-selected", "true");
     },
   },

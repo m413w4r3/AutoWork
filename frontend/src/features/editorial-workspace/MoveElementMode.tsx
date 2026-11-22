@@ -9,6 +9,7 @@ import {
   visualElementAnchorId,
   visualElementKindLabel,
   visualElementTitle,
+  visualMutationUnavailableReason,
 } from "./visualElementOperations";
 
 interface MoveModeBannerProps {
@@ -165,6 +166,7 @@ export function MoveProvisionalPreview({
 interface MoveElementPanelProps {
   snapshot: EditorialWorkspaceSnapshot;
   element: EditorialWorkspaceBlock;
+  readOnly: boolean;
   draftAnchorId: string | null;
   saving: boolean;
   error: string | null;
@@ -181,6 +183,7 @@ interface MoveElementPanelProps {
 export function MoveElementPanel({
   snapshot,
   element,
+  readOnly,
   draftAnchorId,
   saving,
   error,
@@ -188,6 +191,10 @@ export function MoveElementPanel({
   onConfirm,
   onCancel,
 }: MoveElementPanelProps) {
+  const mutationReason = visualMutationUnavailableReason({
+    read_only: readOnly,
+    manual_edit: snapshot.capabilities.manual_edit,
+  });
   const [query, setQuery] = useState("");
   const [sectionId, setSectionId] = useState<string>("all");
   const currentAnchorId = visualElementAnchorId(element);
@@ -220,6 +227,27 @@ export function MoveElementPanel({
     : undefined;
   const samePosition =
     draftAnchorId !== null && draftAnchorId === currentAnchorId;
+
+  if (mutationReason) {
+    return (
+      <section className="visual-move-panel" aria-label="Déplacer le visuel">
+        <h3>Déplacer {visualElementTitle(element)}</h3>
+        <p className="editorial-inspector__reason" role="note">
+          {mutationReason}
+        </p>
+        <div className="visual-move-panel__actions">
+          <button
+            className="button button--secondary"
+            type="button"
+            disabled={saving}
+            onClick={onCancel}
+          >
+            Annuler
+          </button>
+        </div>
+      </section>
+    );
+  }
 
   return (
     <section className="visual-move-panel" aria-label="Déplacer le visuel">

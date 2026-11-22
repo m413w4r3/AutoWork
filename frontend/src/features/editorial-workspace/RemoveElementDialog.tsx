@@ -24,9 +24,10 @@ function focusableElements(container: HTMLElement): HTMLElement[] {
 }
 
 /**
- * Modal confirmation for removing one visual element from the document. The
- * archived source, its blob and the history are out of scope: the dialog says
- * so explicitly and no native confirm/alert is used.
+ * Modal confirmation for removing one visual element from the document. It
+ * uses the same native `<dialog>` technique as the replace dialog and the
+ * gallery; the archived source, its blob and the history are out of scope and
+ * are named explicitly. No native confirm/alert is used.
  */
 export function RemoveElementDialog({
   block,
@@ -35,22 +36,27 @@ export function RemoveElementDialog({
   onConfirm,
   onCancel,
 }: RemoveElementDialogProps) {
-  const dialogRef = useRef<HTMLDivElement>(null);
+  const dialogRef = useRef<HTMLDialogElement>(null);
   const cancelRef = useRef<HTMLButtonElement>(null);
   const openerRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
     openerRef.current =
       document.activeElement instanceof HTMLElement
         ? document.activeElement
         : null;
+    if (typeof dialog.showModal === "function") dialog.showModal();
+    else dialog.setAttribute("open", "");
     cancelRef.current?.focus({ preventScroll: true });
     return () => {
+      if (dialog.open && typeof dialog.close === "function") dialog.close();
       openerRef.current?.focus?.({ preventScroll: true });
     };
   }, []);
 
-  const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+  const handleKeyDown = (event: KeyboardEvent<HTMLDialogElement>) => {
     if (event.key === "Escape") {
       event.preventDefault();
       event.stopPropagation();
@@ -76,7 +82,7 @@ export function RemoveElementDialog({
 
   return (
     <div className="visual-dialog-scrim">
-      <div
+      <dialog
         ref={dialogRef}
         className="visual-remove-dialog"
         role="dialog"
@@ -84,6 +90,10 @@ export function RemoveElementDialog({
         aria-labelledby="visual-remove-dialog-title"
         aria-describedby="visual-remove-dialog-description"
         onKeyDown={handleKeyDown}
+        onCancel={(event) => {
+          event.preventDefault();
+          if (!saving) onCancel();
+        }}
       >
         <h3 id="visual-remove-dialog-title">Retirer ce visuel du document ?</h3>
         <p id="visual-remove-dialog-description">
@@ -124,7 +134,7 @@ export function RemoveElementDialog({
         >
           {saving ? "Retrait du visuel en cours." : ""}
         </p>
-      </div>
+      </dialog>
     </div>
   );
 }
