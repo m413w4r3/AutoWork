@@ -182,6 +182,10 @@ class _MemoryDecisionSession:
     def add(self, row: Any) -> None:
         self.rows.append(row)
 
+    async def flush(self) -> None:
+        # The decision repository flushes so dependants (task events) see the row (04B2).
+        return None
+
 
 @pytest.mark.asyncio
 async def test_structured_retrohunt_authorization_round_trips_and_legacy_missing_is_denied():

@@ -38,6 +38,7 @@ NOW = datetime(2026, 11, 22, 12, 0, tzinfo=UTC)
 SHA = "a" * 64
 INVESTIGATION_ID = UUID("00000000-0000-0000-0000-000000000501")
 TASK_ID = UUID("00000000-0000-0000-0000-000000000502")
+SESSION_ID = UUID("00000000-0000-0000-0000-000000000503")
 
 
 class _PayloadStore:
@@ -94,6 +95,7 @@ async def _seed_consultation(
     request_actor: ToolInvocationActorKind | None = ToolInvocationActorKind.HUMAN,
     requester_id: str | None = "analyst:test",
     task_id: UUID | None = TASK_ID,
+    agent_session_id: UUID | None = SESSION_ID,
     investigation_id: UUID = INVESTIGATION_ID,
 ) -> ToolInvocation:
     call_blob_id = uuid4()
@@ -138,6 +140,7 @@ async def _seed_consultation(
         actor_kind=request_actor,
         actor_id=requester_id if request_actor is not None else None,
         task_id=task_id,
+        agent_session_id=agent_session_id,
         created_at=NOW,
         updated_at=NOW,
     )
@@ -224,7 +227,8 @@ async def test_ledger_reads_advisor_observations_and_parse_status() -> None:
     assert entry.requester_actor_kind is ToolInvocationActorKind.HUMAN
     assert entry.requester_actor_id == "analyst:test"
     assert entry.task_id == TASK_ID
-    assert entry.agent_session_id is None
+    # Task attribution is only valid together with its agent session (ADR-0011 M9).
+    assert entry.agent_session_id == SESSION_ID
     assert entry.output_sha256 == SHA
     assert entry.response_observation_id is not None
     assert entry.parse_status is ConsultationParseStatus.PARTIALLY_PARSED
