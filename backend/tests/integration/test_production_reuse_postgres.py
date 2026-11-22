@@ -1670,14 +1670,26 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
     await production.start_run(run_b.id)
     await production.advance_stage(run_b.id)
 
-    class SentinelModelGateway:
-        async def execute(self, *args: object, **kwargs: object) -> object:
-            del args, kwargs
-            raise AssertionError("model must not be called on reuse hit")
-
+    # T-M5-21/ADR-0010: the enrichment prompt pins run-scoped paragraph block
+    # ids (`anchor_block_id`), so its functional identity differs between two
+    # runs even when the synthesis bytes are identical and inter-run reuse is
+    # explicitly not exact.  The four upstream costly stages must still reuse
+    # without any model call; the enrichment stage is the one sanctioned call.
+    reuse_adapter = _CountingRetryModelAdapter()
+    reuse_gateway = ModelGateway(
+        ModelRouter(
+            openai_research=reuse_adapter,
+            openai_structured=reuse_adapter,
+            openai_drafting=reuse_adapter,
+            qwen=reuse_adapter,
+            fake=reuse_adapter,
+        ),
+        uow_factory,
+        BlobModelOutputStore(catalog),
+    )
     orchestrator = ProductionWorkflowOrchestrator(
         uow_factory,
-        model_gateway=SentinelModelGateway(),  # type: ignore[arg-type]
+        model_gateway=reuse_gateway,
         artifact_store=store,
     )
     for stage in (
@@ -1688,6 +1700,7 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
     ):
         result = await orchestrator.execute_stage(run_b.id, stage)
         assert result["status"] == "reused"
+        assert reuse_adapter.calls == []
         if stage is not ProductionStage.SYNTHESIS:
             await production.advance_stage(run_b.id)
 
@@ -1696,6 +1709,12 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
         run_b.id, ProductionStage.EDITORIAL_ENRICHMENT
     )
     assert enrichment_result["status"] == "success"
+    assert enrichment_result["reused"] is False
+    assert [
+        call.prompt_template_id
+        for call in reuse_adapter.calls
+        if call.prompt_template_id == "production-editorial-enrichment"
+    ] == ["production-editorial-enrichment"]
     await production.advance_stage(run_b.id)
     assembly_result = await orchestrator.execute_stage(run_b.id, ProductionStage.ASSEMBLY)
     assert assembly_result["status"] == "success"
@@ -1955,9 +1974,9 @@ async def test_two_article_cached_edition_is_sequential_and_uses_new_publication
         )
         for label in ("A", "B")
     ]
-    store = ProductionArtifactStore(
-        BlobCatalogService(FilesystemBlobStore(tmp_path / "blobs"), uow_factory)
-    )
+    blob_store = FilesystemBlobStore(tmp_path / "blobs")
+    catalog = BlobCatalogService(blob_store, uow_factory)
+    store = ProductionArtifactStore(catalog)
     async with uow_factory() as uow:
         await uow.editions.add_if_absent(edition)
         for subject in subjects:
@@ -2023,19 +2042,25 @@ async def test_two_article_cached_edition_is_sequential_and_uses_new_publication
     ]
     second_id = batch_items[1].production_run_id
 
-    class SentinelModelGateway:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        async def execute(self, *args: object, **kwargs: object) -> object:
-            del args, kwargs
-            self.calls += 1
-            raise AssertionError("no model call expected during cached edition smoke")
-
-    sentinel = SentinelModelGateway()
+    # T-M5-21/ADR-0010: the enrichment prompt pins run-scoped paragraph block
+    # ids, so inter-run enrichment reuse is explicitly not exact.  The cached
+    # edition still reuses all four upstream costly stages without a model
+    # call; each article pays exactly one enrichment draft.
+    enrichment_adapter = _CountingRetryModelAdapter()
+    enrichment_gateway = ModelGateway(
+        ModelRouter(
+            openai_research=enrichment_adapter,
+            openai_structured=enrichment_adapter,
+            openai_drafting=enrichment_adapter,
+            qwen=enrichment_adapter,
+            fake=enrichment_adapter,
+        ),
+        uow_factory,
+        BlobModelOutputStore(catalog),
+    )
     orchestrator = ProductionWorkflowOrchestrator(
         uow_factory,
-        model_gateway=sentinel,  # type: ignore[arg-type]
+        model_gateway=enrichment_gateway,
         artifact_store=store,
     )
     cached_results: list[dict[str, object]] = []
@@ -2043,6 +2068,7 @@ async def test_two_article_cached_edition_is_sequential_and_uses_new_publication
 
     async def execute_cached(run_id: UUID) -> None:
         await SubjectProductionService(uow_factory).advance_stage(run_id)
+        calls_before = len(enrichment_adapter.calls)
         for stage in (
             ProductionStage.REFERENCES,
             ProductionStage.EXTRACTION,
@@ -2052,14 +2078,29 @@ async def test_two_article_cached_edition_is_sequential_and_uses_new_publication
             result = await orchestrator.execute_stage(run_id, stage)
             cached_results.append(result)
             assert result["status"] == "reused", (stage, result)
+            assert len(enrichment_adapter.calls) == calls_before
             if stage is not ProductionStage.SYNTHESIS:
                 await SubjectProductionService(uow_factory).advance_stage(run_id)
         await SubjectProductionService(uow_factory).advance_stage(run_id)
+        enrichment_drafts = sum(
+            1
+            for call in enrichment_adapter.calls
+            if call.prompt_template_id == "production-editorial-enrichment"
+        )
         enrichment_result = await orchestrator.execute_stage(
             run_id, ProductionStage.EDITORIAL_ENRICHMENT
         )
         enrichment_results.append(enrichment_result)
         assert enrichment_result["status"] == "success"
+        assert enrichment_result["reused"] is False
+        assert (
+            sum(
+                1
+                for call in enrichment_adapter.calls
+                if call.prompt_template_id == "production-editorial-enrichment"
+            )
+            == enrichment_drafts + 1
+        )
         await SubjectProductionService(uow_factory).advance_stage(run_id)
         assembly_result = await orchestrator.execute_stage(run_id, ProductionStage.ASSEMBLY)
         assert assembly_result["status"] == "success"
@@ -2073,7 +2114,11 @@ async def test_two_article_cached_edition_is_sequential_and_uses_new_publication
     assert await batch_service.on_subject_terminal(batch.id, second.id) is None
     assert len(cached_results) == 8
     assert len(enrichment_results) == 2
-    assert sentinel.calls == 0
+    assert [
+        call.prompt_template_id
+        for call in enrichment_adapter.calls
+        if call.prompt_template_id == "production-editorial-enrichment"
+    ] == ["production-editorial-enrichment", "production-editorial-enrichment"]
 
     target_publications = []
     target_artifact_sets = []
