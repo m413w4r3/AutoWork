@@ -644,15 +644,24 @@ class InvestigationService:
         agenda: InvestigationAgenda | None = None,
         hypotheses: tuple[Hypothesis, ...] = (),
         execution_mode: InvestigationExecutionMode | None = None,
+        prose_authority: ProseAuthority = ProseAuthority.LEGACY,
         uow: Any | None = None,
     ) -> InvestigationWorkingState:
-        """Create/reuse the post-synthesis investigation and its version-one state."""
+        """Create/reuse the post-synthesis investigation and its version-one state.
+
+        ``prose_authority`` is fixed when the handoff inserts the investigation
+        row (ADR-0011 D4): every existing caller keeps ``legacy`` while the M24
+        workshop path requests ``bridge_only`` explicitly.
+        """
+        resolved_mode = execution_mode or InvestigationExecutionMode.BRIDGE_LED
+        require_prose_authority_mode(prose_authority, resolved_mode)
         handoff = await self._post_synthesis.ensure_for_verified_synthesis(
             run=run,
             synthesis=synthesis,
             extraction_artifacts=tuple(extraction_artifacts),
             extraction_items=tuple(extraction_items),
             policy=policy,
+            prose_authority=prose_authority,
             uow=uow,
         )
         if handoff is None:
@@ -660,11 +669,10 @@ class InvestigationService:
         investigation = await self._investigations.get(handoff.investigation_id)
         if investigation is None or investigation.synthesis_artifact_id != synthesis.id:
             raise ValueError("Post-synthesis handoff does not point to the requested synthesis")
-        resolved_mode = execution_mode or InvestigationExecutionMode.BRIDGE_LED
-        prose_authority = getattr(investigation, "prose_authority", ProseAuthority.LEGACY)
-        if not isinstance(prose_authority, ProseAuthority):
-            prose_authority = ProseAuthority(prose_authority)
-        require_prose_authority_mode(prose_authority, resolved_mode)
+        persisted_authority = getattr(investigation, "prose_authority", ProseAuthority.LEGACY)
+        if not isinstance(persisted_authority, ProseAuthority):
+            persisted_authority = ProseAuthority(persisted_authority)
+        require_prose_authority_mode(persisted_authority, resolved_mode)
         existing_state = await self._states.get(investigation.id)
         if existing_state is not None:
             if execution_mode is not None and existing_state.execution_mode is not execution_mode:

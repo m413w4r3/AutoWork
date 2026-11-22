@@ -25,7 +25,40 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
     ProductionRun,
+    ProseAuthority,
 )
+
+
+class ProseAuthorityConflictError(ValueError):
+    """An existing investigation cannot be re-ensured under another authority.
+
+    ``prose_authority`` is fixed when the investigation row is inserted
+    (ADR-0011 D4); re-ensuring an existing row with a different value is a
+    typed refusal, never a silent keep or flip.
+    """
+
+    code = "prose_authority_conflict"
+
+    def __init__(self, *, existing: ProseAuthority, requested: ProseAuthority) -> None:
+        self.existing = existing
+        self.requested = requested
+        super().__init__(
+            "Investigation prose_authority is immutable: "
+            f"persisted {existing.value}, requested {requested.value}"
+        )
+
+
+def require_prose_authority_match(
+    investigation: AnalystInvestigation, prose_authority: ProseAuthority
+) -> None:
+    """Require an existing investigation to carry the requested prose authority."""
+    if not isinstance(prose_authority, ProseAuthority):
+        raise TypeError("prose_authority must use ProseAuthority")
+    existing = getattr(investigation, "prose_authority", ProseAuthority.LEGACY)
+    if not isinstance(existing, ProseAuthority):
+        existing = ProseAuthority(existing)
+    if existing is not prose_authority:
+        raise ProseAuthorityConflictError(existing=existing, requested=prose_authority)
 
 
 def loop_budget_from_settings(settings: Any) -> LoopBudget:
@@ -154,10 +187,13 @@ class AnalystPostSynthesisService:
         extraction_artifacts: Iterable[ProductionArtifact],
         extraction_items: Iterable[Any],
         policy: AnalystHandoffPolicy,
+        prose_authority: ProseAuthority = ProseAuthority.LEGACY,
         uow: ProductionUnitOfWork | None = None,
     ) -> AnalystHandoffResult | None:
         if run.research_date is None:
             raise ValueError("Analyst input pack requires frozen research_date")
+        if not isinstance(prose_authority, ProseAuthority):
+            raise TypeError("prose_authority must use ProseAuthority")
 
         if uow is not None:
             return await self._ensure_in_uow(
@@ -167,6 +203,7 @@ class AnalystPostSynthesisService:
                 extraction_artifacts=tuple(extraction_artifacts),
                 extraction_items=_extraction_items(extraction_items),
                 policy=policy,
+                prose_authority=prose_authority,
             )
 
         async with self._uow_factory() as transaction:
@@ -177,6 +214,7 @@ class AnalystPostSynthesisService:
                 extraction_artifacts=tuple(extraction_artifacts),
                 extraction_items=_extraction_items(extraction_items),
                 policy=policy,
+                prose_authority=prose_authority,
             )
             await transaction.commit()
             return result
@@ -190,11 +228,13 @@ class AnalystPostSynthesisService:
         extraction_artifacts: tuple[ProductionArtifact, ...],
         extraction_items: list[dict[str, Any]],
         policy: AnalystHandoffPolicy,
+        prose_authority: ProseAuthority = ProseAuthority.LEGACY,
     ) -> AnalystHandoffResult:
         if run.research_date is None:
             raise ValueError("Analyst input pack requires frozen research_date")
         existing = await uow.analyst_investigations.get_for_run(run.id)
         if existing is not None:
+            require_prose_authority_match(existing, prose_authority)
             persisted_pack = await uow.analyst_input_packs.get_for_investigation(existing.id)
             if (
                 persisted_pack is None
@@ -218,6 +258,7 @@ class AnalystPostSynthesisService:
         investigation = AnalystInvestigation.from_verified_synthesis(
             synthesis=synthesis,
             budget=self._loop_budget_factory(),
+            prose_authority=prose_authority,
         )
         pack = build_analyst_input_pack_v1(
             run=run,
