@@ -476,9 +476,7 @@ class SqlAlchemyUnitOfWork:
         self.agent_sessions = SqlAlchemyAgentSessionRepository(self._session)
         self.work_contributions = SqlAlchemyWorkContributionRepository(self._session)
         self.investigation_note_proposals = SqlAlchemyNoteProposalRepository(self._session)
-        self.workspace_note_annotations = SqlAlchemyWorkspaceNoteAnnotationRepository(
-            self._session
-        )
+        self.workspace_note_annotations = SqlAlchemyWorkspaceNoteAnnotationRepository(self._session)
         self.production_runs = SqlAlchemyProductionRunRepository(self._session)
         self.production_routing_decisions = SqlAlchemyProductionRoutingDecisionRepository(
             self._session
