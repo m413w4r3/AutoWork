@@ -23,10 +23,15 @@ heartbeat that wins the row first leaves the sweep a clean no-op.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable, Sequence
+from types import TracebackType
+from typing import Protocol, Self
 from uuid import UUID
 
-from cti_app.application.investigation_persistence import InvestigationTaskRepository
+from cti_app.application.investigation_persistence import (
+    AgentSessionRepository,
+    InvestigationTaskRepository,
+)
 from cti_app.application.investigation_task_events import (
     TaskEventDraft,
     TaskEventType,
@@ -35,14 +40,70 @@ from cti_app.application.investigation_task_events import (
 from cti_app.application.investigation_tasks import (
     LEASE_HELD_STATUSES,
     SYSTEM_TASK_ACTOR,
+    RepositoryTaskSessionPort,
     TaskCommandResult,
     TaskSessionOutcome,
     TaskSessionPort,
+    TaskSessionRelease,
 )
 from cti_app.domain.investigation_task import (
     BlockedReason,
     TaskStatus,
 )
+
+
+class ExpiredLeaseSource(Protocol):
+    """The one global read the scheduler needs; no second task aggregate."""
+
+    async def list_expired_lease_investigation_ids(self, *, limit: int) -> tuple[UUID, ...]: ...
+
+
+class SweepUnitOfWork(Protocol):
+    """The sweep's narrow UoW seam (task + session repositories, one commit)."""
+
+    investigation_tasks: InvestigationTaskRepository
+    agent_sessions: AgentSessionRepository
+
+    async def __aenter__(self) -> Self: ...
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None: ...
+
+    async def commit(self) -> None: ...
+
+
+async def run_expired_lease_sweep(
+    *,
+    source: ExpiredLeaseSource,
+    uow_factory: Callable[[], SweepUnitOfWork],
+    flush_releases: Callable[[Sequence[TaskSessionRelease]], Awaitable[None]],
+    batch_size: int,
+) -> int:
+    """Sweep every candidate investigation, one short transaction each.
+
+    Each investigation commits its status/event/session-row changes before the
+    host release is flushed, so the host socket is never used while the
+    advisory or task-row lock is held (B2/B3).  A candidate that a concurrent
+    heartbeat revived is a clean no-op and is not counted.
+    """
+    candidates = await source.list_expired_lease_investigation_ids(limit=batch_size)
+    swept = 0
+    for investigation_id in candidates:
+        releases: list[TaskSessionRelease] = []
+        async with uow_factory() as uow:
+            sweeper = InvestigationTaskSweeper(
+                tasks=uow.investigation_tasks,
+                sessions=RepositoryTaskSessionPort(uow.agent_sessions, releases),
+            )
+            results = await sweeper.sweep_investigation(investigation_id)
+            await uow.commit()
+        swept += len(results)
+        await flush_releases(releases)
+    return swept
 
 
 class InvestigationTaskSweeper:
@@ -142,4 +203,9 @@ class InvestigationTaskSweeper:
         return TaskCommandResult(task=current if current is not None else written, event=event)
 
 
-__all__ = ["InvestigationTaskSweeper"]
+__all__ = [
+    "ExpiredLeaseSource",
+    "InvestigationTaskSweeper",
+    "SweepUnitOfWork",
+    "run_expired_lease_sweep",
+]

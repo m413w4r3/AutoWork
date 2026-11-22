@@ -28,8 +28,11 @@ new session after an unresumable loss must present a new handoff.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import secrets
-from collections.abc import Callable, Mapping, Sequence
+import time
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from types import TracebackType
@@ -41,6 +44,12 @@ from cti_app.application.agent_session_verification import (
     SessionSecretDeriver,
     session_secret_hash,
     session_secret_hex,
+)
+from cti_app.application.agentic_host_sessions import (
+    HostReasonRequestV1,
+    HostSessionNotFoundError,
+    HostSessionsPort,
+    HostSessionStateConflictError,
 )
 from cti_app.application.investigation_handoffs import (
     HandoffTaskStaleError,
@@ -56,11 +65,13 @@ from cti_app.application.investigation_persistence import (
 from cti_app.application.investigation_tasks import (
     InvestigationTaskService,
     TaskSessionOutcome,
+    TaskSessionRelease,
 )
 from cti_app.application.persistence import (
     AnalystDecisionRepository,
     AnalystInvestigationRepository,
 )
+from cti_app.application.workspace_agent import WorkspaceAgentError
 from cti_app.domain.agentic_operator import (
     AGENT_SESSION_SECRET_NONCE_BYTES,
     RECONCILE_OUTCOMES_RESUMABLE,
@@ -86,6 +97,7 @@ from cti_app.domain.agentic_operator import (
     StartSessionRequest,
     instruction_text_sha256,
 )
+from cti_app.domain.investigation import canonical_json_bytes
 from cti_app.domain.investigation_task import (
     TASK_LIMIT_DEFAULTS,
     InvestigationTaskV1,
@@ -388,8 +400,13 @@ class PreparedAgentSession:
 class _EngineSessionPort:
     """Adapts the session repository to lot 04B2's ``TaskSessionPort`` seam."""
 
-    def __init__(self, repository: AgentSessionRepository) -> None:
+    def __init__(
+        self,
+        repository: AgentSessionRepository,
+        releases: list[TaskSessionRelease] | None = None,
+    ) -> None:
         self._repository = repository
+        self._releases = releases
 
     async def is_active_session(
         self, *, session_id: UUID, investigation_id: UUID, task_id: UUID
@@ -416,6 +433,161 @@ class _EngineSessionPort:
             outcome=outcome.value,
             reason=reason,
         )
+        if self._releases is not None:
+            self._releases.append(
+                TaskSessionRelease(
+                    session_id=session_id,
+                    investigation_id=investigation_id,
+                    task_id=task_id,
+                    outcome=outcome,
+                    reason=reason,
+                )
+            )
+
+
+_HOST_CLOSABLE_STATES = frozenset({"ready", "stopped", "lost", "failed", "closed"})
+_HOST_RELEASE_POLL_SECONDS = 0.2
+
+
+class HostSessionReleaseService:
+    """Request host teardown for sessions the DB already released (B2).
+
+    Protocol: the command transaction never talks to the host.  It closes the
+    ``agent_sessions`` row (idempotent CAS) and buffers a
+    :class:`TaskSessionRelease`; the caller flushes this service **after its
+    commit**, so no advisory lock, row lock or pool transaction is held across
+    the UDS call.  A missing host runtime, an unreachable socket or a host that
+    refuses to stop is recorded on the session as a D7 ``lost_unreconciled``
+    reconciliation marker — never silently swallowed and never retried as a
+    relaunch.  The host ``close``/``interrupt`` keys are deterministic, so a
+    retry of the same release replays host-side.
+    """
+
+    def __init__(
+        self,
+        *,
+        uow_factory: Callable[[], SessionUnitOfWork],
+        host: HostSessionsPort | None,
+        clock: Callable[[], datetime] | None = None,
+        monotonic: Callable[[], float] | None = None,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
+        wait_seconds: float = 5.0,
+    ) -> None:
+        self._uow_factory = uow_factory
+        self._host = host
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self._monotonic = monotonic or time.monotonic
+        self._sleep = sleep or asyncio.sleep
+        self._wait_seconds = max(0.0, wait_seconds)
+
+    async def flush(self, releases: Iterable[TaskSessionRelease]) -> None:
+        """Best-effort host teardown; never raises for a host-side failure."""
+        seen: set[UUID] = set()
+        for release in releases:
+            if release.session_id in seen:
+                continue
+            seen.add(release.session_id)
+            await self._release(release)
+
+    async def _release(self, release: TaskSessionRelease) -> None:
+        async with self._uow_factory() as uow:
+            session = await uow.agent_sessions.get(release.session_id)
+        if session is None or session.host_session_ref is None:
+            # No host object was ever prepared for this row: nothing to stop.
+            return
+        host = self._host
+        if host is None:
+            await self._mark_unconfirmed(session, "host runtime is not wired")
+            return
+        unconfirmed = await self._close_host(host, session, release.reason)
+        if unconfirmed is not None:
+            await self._mark_unconfirmed(session, unconfirmed)
+
+    async def _close_host(
+        self, host: HostSessionsPort, session: AgentSessionV1, reason: str
+    ) -> str | None:
+        """Return a reason when the host teardown is unconfirmed."""
+        wire_reason = f"task lease released: {reason}".strip()
+        try:
+            await host.close_session(
+                session.id,
+                HostReasonRequestV1(reason=wire_reason),
+                idempotency_key=_host_release_key("close", session.id),
+            )
+            return None
+        except HostSessionNotFoundError:
+            return None
+        except HostSessionStateConflictError:
+            pass
+        except WorkspaceAgentError as exc:
+            return f"host close failed ({type(exc).__name__})"
+        try:
+            await host.interrupt_session(
+                session.id,
+                HostReasonRequestV1(reason=wire_reason),
+                idempotency_key=_host_release_key("interrupt", session.id),
+            )
+        except HostSessionNotFoundError:
+            return None
+        except WorkspaceAgentError as exc:
+            return f"host interrupt failed ({type(exc).__name__})"
+        deadline = self._monotonic() + self._wait_seconds
+        while True:
+            try:
+                status = await host.get_session_status(session.id)
+            except HostSessionNotFoundError:
+                return None
+            except WorkspaceAgentError as exc:
+                return f"host status failed ({type(exc).__name__})"
+            if status.state in _HOST_CLOSABLE_STATES:
+                break
+            if self._monotonic() >= deadline:
+                return "the host process did not stop after the interrupt"
+            await self._sleep(_HOST_RELEASE_POLL_SECONDS)
+        try:
+            await host.close_session(
+                session.id,
+                HostReasonRequestV1(reason=wire_reason),
+                idempotency_key=_host_release_key("close", session.id),
+            )
+        except HostSessionNotFoundError:
+            return None
+        except WorkspaceAgentError as exc:
+            return f"host close after interrupt failed ({type(exc).__name__})"
+        return None
+
+    async def _mark_unconfirmed(self, session: AgentSessionV1, detail: str) -> None:
+        """Persist a ``lost_unreconciled`` marker without overwriting a real one."""
+        now = self._clock()
+        payload = {
+            "outcome": SessionReconcileOutcome.LOST_UNRECONCILED.value,
+            "detail": f"host release unconfirmed: {detail}",
+            "observed_at": now.isoformat(),
+            "session_id": str(session.id),
+        }
+        digest = hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+        async with self._uow_factory() as uow:
+            current = await uow.agent_sessions.get(session.id)
+            if current is None or current.reconciliation is not None or current.is_active:
+                # A still-active row belongs to a live lease path; a terminal
+                # or stopped row may carry the transport marker.  An existing
+                # typed D7 outcome is never overwritten.
+                return
+            marked = current.with_reconciliation(payload, digest, now=now)
+            if (
+                await uow.agent_sessions.update_state(
+                    marked, expected_state_version=current.state_version
+                )
+                is None
+            ):
+                # A concurrent writer recorded its own typed outcome; that is
+                # stronger than this transport marker.
+                return
+            await uow.commit()
+
+
+def _host_release_key(action: str, session_id: UUID) -> str:
+    return f"task-release.{action}.{session_id}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -469,6 +641,13 @@ class SessionService:
         """Create the durable session in ``provisioning``/``ready`` and issue
         the secret.  The adapter is probed (real facts only) and asked to
         prepare its host session; a replay never probes a second host session.
+
+        Lock protocol (B3/M1): the probe is a read-only host call made before
+        any transaction; the row is committed in ``provisioning`` under the
+        advisory-then-task-row order; only then are the host prepare and the
+        one-shot secret delivery performed, outside every lock.  A failure
+        after the row exists marks the session ``failed`` (the durable marker)
+        instead of rolling back into an untracked host process.
         """
         request = _PrepareRequest(
             task_id=task_id,
@@ -482,21 +661,21 @@ class SessionService:
         self._require_human(actor)
         deriver = self._require_deriver()
         operator = self._require_operator()
-        async with self._uow_factory() as uow:
-            task = await self._locked_task(uow, investigation_id, task_id)
-            existing = await uow.agent_sessions.get_by_idempotency(task.id, key)
-            if existing is not None:
-                prepared = self._replay_prepare(existing, request, deriver)
-                await self._deliver_secret(prepared, key)
-                await uow.commit()
-                return prepared
-            session, secret, _created = await self._prepare_locked(
-                uow, investigation_id, task, request, operator, deriver, key, timestamp
-            )
-            prepared = PreparedAgentSession(session=session, secret=secret)
-            await self._deliver_secret(prepared, key)
-            await uow.commit()
-            return prepared
+        replayed = await self._existing_prepared(investigation_id, request, deriver, key)
+        if replayed is not None:
+            # A replay never probes or prepares a second host session.
+            await self._deliver_secret(replayed, key)
+            return replayed
+        capabilities = await self._probe(operator, adapter_kind, executable)
+        provisioned, created = await self._provision(
+            investigation_id, request, capabilities, deriver, key, timestamp
+        )
+        if not created:
+            await self._deliver_secret(provisioned, key)
+            return provisioned
+        prepared = await self._prepare_host(operator, provisioned, request, key, timestamp)
+        session = await self._transition_prepared(prepared.session, timestamp)
+        return PreparedAgentSession(session=session, secret=prepared.secret)
 
     async def open_session(
         self,
@@ -517,6 +696,11 @@ class SessionService:
         open never leaves an active ``provisioning`` session blocking the task.
         The order is the host contract's: the one-shot secret delivery *is* the
         supervisor prepare (SESSION-RUNNER §6), so start can only follow it.
+        Every host call happens outside the advisory/row locks (B3): the
+        session row is committed ``provisioning``/``ready`` first, then the
+        host is prepared and started, then a short transaction acquires the D3
+        lease.  A failed activation compensates through ``failed`` + interrupt,
+        never by leaving a runnable session without a lease.
         """
         request = _PrepareRequest(
             task_id=task_id,
@@ -530,30 +714,25 @@ class SessionService:
         self._require_human(actor)
         deriver = self._require_deriver()
         operator = self._require_operator()
-        async with self._uow_factory() as uow:
-            task = await self._locked_task(uow, investigation_id, task_id)
-            existing = await uow.agent_sessions.get_by_idempotency(task.id, key)
-            if existing is not None:
-                # A replay re-derives the same secret and re-delivers it; the
-                # host refuses a second, different hand-off.  It never starts
-                # anything: a concurrent identical open already did.
-                replayed = self._replay_prepare(existing, request, deriver)
-                await self._deliver_secret(replayed, key)
-                await uow.commit()
-                return replayed
-            session, secret, created = await self._prepare_locked(
-                uow, investigation_id, task, request, operator, deriver, key, timestamp
-            )
-            prepared = PreparedAgentSession(session=session, secret=secret)
-            await self._deliver_secret(prepared, key)
-            started = (
-                await self._start_locked(uow, session, task, operator, timestamp)
-                if created
-                else session
-            )
-            prepared = PreparedAgentSession(session=started, secret=secret)
-            await uow.commit()
-            return prepared
+        replayed = await self._existing_prepared(investigation_id, request, deriver, key)
+        if replayed is not None:
+            # A replay re-derives the same secret and re-delivers it; the host
+            # refuses a second, different hand-off.  It never starts anything:
+            # a concurrent identical open already did.
+            await self._deliver_secret(replayed, key)
+            return replayed
+        capabilities = await self._probe(operator, adapter_kind, executable)
+        provisioned, created = await self._provision(
+            investigation_id, request, capabilities, deriver, key, timestamp
+        )
+        if not created:
+            await self._deliver_secret(provisioned, key)
+            return provisioned
+        prepared = await self._prepare_host(operator, provisioned, request, key, timestamp)
+        ready = await self._transition_prepared(prepared.session, timestamp)
+        prepared = PreparedAgentSession(session=ready, secret=prepared.secret)
+        await self._host_start(operator, ready, timestamp)
+        return await self._activate_prepared(operator, investigation_id, prepared, timestamp)
 
     # ----------------------------------------------------------------- start
 
@@ -569,17 +748,25 @@ class SessionService:
 
         The task engine is the only writer of the business status and lease;
         this method supplies the session id it requires and records the
-        acquired lease pair on the session.
+        acquired lease pair on the session.  Validation, host start and lease
+        acquisition are three separate short phases: the host call runs with no
+        lock held, and a failed lease acquisition compensates the host run.
         """
         self._require_human(actor)
         operator = self._require_operator()
         timestamp = _now(self._clock, now)
         async with self._uow_factory() as uow:
+            await uow.investigation_tasks.lock_investigation(investigation_id)
             session = await self._session_for(uow, investigation_id, session_id)
             task = await self._locked_task(uow, investigation_id, session.task_id)
-            started = await self._start_locked(uow, session, task, operator, timestamp)
+            await self._require_startable_locked(uow, session, task)
             await uow.commit()
-            return started
+        await self._host_start(operator, session, timestamp)
+        try:
+            return await self._activate_lease(investigation_id, session_id, timestamp)
+        except Exception:
+            await self._compensate_failed_activation(operator, session, "lease_activation_failed")
+            raise
 
     # ------------------------------------------------------------------ read
 
@@ -1160,100 +1347,166 @@ class SessionService:
 
     # ---------------------------------------------------------------- helpers
 
-    async def _prepare_locked(
+    async def _existing_prepared(
         self,
-        uow: SessionUnitOfWork,
         investigation_id: UUID,
-        task: InvestigationTaskV1,
         request: _PrepareRequest,
-        operator: AgenticOperatorPort,
+        deriver: SessionSecretDeriver,
+        key: str,
+    ) -> PreparedAgentSession | None:
+        """Cheap unlocked replay lookup so a replay never probes the host again.
+
+        The authoritative replay check remains inside ``_provision`` under the
+        advisory/task lock; this one only avoids a second capability probe.
+        """
+        async with self._uow_factory() as uow:
+            existing = await uow.agent_sessions.get_by_idempotency(request.task_id, key)
+        if existing is None or existing.investigation_id != investigation_id:
+            return None
+        return self._replay_prepare(existing, request, deriver)
+
+    async def _provision(
+        self,
+        investigation_id: UUID,
+        request: _PrepareRequest,
+        capabilities: OperatorCapabilitiesV1,
         deriver: SessionSecretDeriver,
         key: str,
         timestamp: datetime,
-    ) -> tuple[AgentSessionV1, SessionSecret, bool]:
-        self._require_task_assignment(task)
-        handoff = await self._handoff_for(uow, investigation_id, task, request.handoff_id)
-        assert_startable(handoff.handoff, task)
-        await self._require_unclaimed_handoff(uow, task, request.handoff_id)
-        capabilities = await self._probe(operator, request.adapter_kind, request.executable)
-        session_id = uuid4()
-        prepared = await operator.prepare_session(
-            PrepareSessionRequest(
-                session_id=session_id,
+    ) -> tuple[PreparedAgentSession, bool]:
+        """Commit the durable ``provisioning`` row under advisory-then-row locks.
+
+        This is the only part of prepare that holds locks; the host probe has
+        already happened outside them, and no host object is created here.
+        """
+        async with self._uow_factory() as uow:
+            await uow.investigation_tasks.lock_investigation(investigation_id)
+            task = await self._locked_task(uow, investigation_id, request.task_id)
+            existing = await uow.agent_sessions.get_by_idempotency(task.id, key)
+            if existing is not None:
+                prepared = self._replay_prepare(existing, request, deriver)
+                await uow.commit()
+                return prepared, False
+            self._require_task_assignment(task)
+            handoff = await self._handoff_for(uow, investigation_id, task, request.handoff_id)
+            assert_startable(handoff.handoff, task)
+            await self._require_unclaimed_handoff(uow, task, request.handoff_id)
+            session_id = uuid4()
+            nonce = secrets.token_bytes(AGENT_SESSION_SECRET_NONCE_BYTES)
+            secret = deriver.derive(session_id=session_id, nonce=nonce)
+            session = AgentSessionV1(
+                id=session_id,
                 investigation_id=investigation_id,
                 task_id=task.id,
                 adapter_kind=request.adapter_kind,
-                handoff_id=request.handoff_id,
+                state=AgentSessionState.PROVISIONING,
+                state_version=1,
+                capability_probe=capabilities.to_payload(),
                 capability_sha256=capabilities.capability_sha256,
-                model=request.model,
+                probed_at=capabilities.probed_at,
+                auth_secret_nonce=nonce,
+                auth_secret_hash=session_secret_hash(secret),
+                auth_secret_issued_at=timestamp,
+                opened_at=timestamp,
+                idempotency_key=key,
+                created_at=timestamp,
+                updated_at=timestamp,
+                host_session_ref=None,
+                handoff_id=request.handoff_id,
             )
-        )
-        if (
-            prepared.session_id != session_id
-            or prepared.investigation_id != investigation_id
-            or prepared.task_id != task.id
-            or prepared.adapter_kind is not request.adapter_kind
-            or prepared.capabilities.capability_sha256 != capabilities.capability_sha256
-        ):
-            raise SessionOperatorContractError(
-                "prepare_session answered a different session or capability probe"
-            )
-        nonce = secrets.token_bytes(AGENT_SESSION_SECRET_NONCE_BYTES)
-        secret = deriver.derive(session_id=session_id, nonce=nonce)
-        session = AgentSessionV1(
-            id=session_id,
-            investigation_id=investigation_id,
-            task_id=task.id,
-            adapter_kind=request.adapter_kind,
-            state=AgentSessionState.PROVISIONING,
-            state_version=1,
-            capability_probe=capabilities.to_payload(),
-            capability_sha256=capabilities.capability_sha256,
-            probed_at=capabilities.probed_at,
-            auth_secret_nonce=nonce,
-            auth_secret_hash=session_secret_hash(secret),
-            auth_secret_issued_at=timestamp,
-            opened_at=timestamp,
-            idempotency_key=key,
-            created_at=timestamp,
-            updated_at=timestamp,
-            host_session_ref=prepared.host_session_ref,
-            handoff_id=request.handoff_id,
-        )
-        try:
-            stored, created = await uow.agent_sessions.add(session)
-        except VersionConflictError as exc:
-            raise SessionConflictError(str(exc)) from exc
-        if not created:
-            return self._replay_session(stored, request, deriver)
-        ready = await self._persist(uow, stored.with_state(AgentSessionState.READY, now=timestamp))
-        return ready, SessionSecret.from_bytes(secret), True
+            try:
+                stored, created = await uow.agent_sessions.add(session)
+            except VersionConflictError as exc:
+                raise SessionConflictError(str(exc)) from exc
+            if not created:
+                prepared = self._replay_prepare(stored, request, deriver)
+                await uow.commit()
+                return prepared, False
+            await uow.commit()
+            return PreparedAgentSession(
+                session=stored, secret=SessionSecret.from_bytes(secret)
+            ), True
 
-    async def _start_locked(
+    async def _prepare_host(
         self,
-        uow: SessionUnitOfWork,
-        session: AgentSessionV1,
-        task: InvestigationTaskV1,
         operator: AgenticOperatorPort,
+        prepared: PreparedAgentSession,
+        request: _PrepareRequest,
+        key: str,
         timestamp: datetime,
+    ) -> PreparedAgentSession:
+        """Host prepare + one-shot secret delivery, with no lock held."""
+        session = prepared.session
+        try:
+            host = await operator.prepare_session(
+                PrepareSessionRequest(
+                    session_id=session.id,
+                    investigation_id=session.investigation_id,
+                    task_id=session.task_id,
+                    adapter_kind=request.adapter_kind,
+                    handoff_id=request.handoff_id,
+                    capability_sha256=session.capability_sha256,
+                    model=request.model,
+                )
+            )
+            if (
+                host.session_id != session.id
+                or host.investigation_id != session.investigation_id
+                or host.task_id != session.task_id
+                or host.adapter_kind is not request.adapter_kind
+                or host.capabilities.capability_sha256 != session.capability_sha256
+            ):
+                raise SessionOperatorContractError(
+                    "prepare_session answered a different session or capability probe"
+                )
+            recorded = await self._record_host_ref(session, host.host_session_ref)
+            prepared = PreparedAgentSession(session=recorded, secret=prepared.secret)
+            await self._deliver_secret(prepared, key)
+            return prepared
+        except Exception:
+            await self._fail_session(session.id, "prepare_failed_before_start")
+            raise
+
+    async def _record_host_ref(
+        self, session: AgentSessionV1, host_session_ref: str
     ) -> AgentSessionV1:
-        if session.state not in (AgentSessionState.PROVISIONING, AgentSessionState.READY):
-            raise SessionStateConflictError(f"a {session.state.value} session cannot be started")
+        async with self._uow_factory() as uow:
+            current = await uow.agent_sessions.get(session.id)
+            if current is None:
+                raise SessionNotFoundError(f"agent session {session.id} does not exist")
+            if current.is_terminal:
+                raise SessionStateConflictError(
+                    f"a {current.state.value} session cannot record a host reference"
+                )
+            return await self._commit_session(
+                uow, current.with_host_session_ref(host_session_ref, now=self._clock())
+            )
+
+    async def _transition_prepared(
+        self, session: AgentSessionV1, timestamp: datetime
+    ) -> AgentSessionV1:
+        """PROVISIONING -> READY in one short advisory-then-row transaction."""
+        async with self._uow_factory() as uow:
+            await uow.investigation_tasks.lock_investigation(session.investigation_id)
+            current = await uow.agent_sessions.get(session.id)
+            if current is None:
+                raise SessionNotFoundError(f"agent session {session.id} does not exist")
+            if current.state is AgentSessionState.READY:
+                return current
+            if current.state is not AgentSessionState.PROVISIONING:
+                raise SessionStateConflictError(
+                    f"a {current.state.value} session cannot become ready"
+                )
+            return await self._commit_session(
+                uow, current.with_state(AgentSessionState.READY, now=timestamp)
+            )
+
+    async def _host_start(
+        self, operator: AgenticOperatorPort, session: AgentSessionV1, timestamp: datetime
+    ) -> None:
+        """Start the host run with no lock held; a dead run is durably failed."""
         if session.host_session_ref is None:
             raise SessionOperatorContractError("the prepared session has no host reference")
-        self._require_task_assignment(task)
-        assigned_actor_id = task.assigned_actor_id
-        if assigned_actor_id is None:  # pragma: no cover - checked just above
-            raise SessionForbiddenError("the task is not assigned to an operator")
-        if session.handoff_id is not None:
-            handoff = await uow.investigation_handoffs.get(session.handoff_id)
-            if handoff is None:
-                raise HandoffTaskStaleError("the session handoff no longer exists")
-            assert_startable(handoff.handoff, task)
-        if session.state is AgentSessionState.PROVISIONING:
-            session = await self._persist(
-                uow, session.with_state(AgentSessionState.READY, now=timestamp)
-            )
         status = await operator.start_session(
             StartSessionRequest(
                 session_id=session.id,
@@ -1265,16 +1518,50 @@ class SessionService:
         if status.session_id != session.id:
             raise SessionOperatorContractError("start_session answered another session")
         if not status.alive:
-            await self._persist(
-                uow,
-                session.with_state(
-                    AgentSessionState.FAILED,
-                    now=timestamp,
-                    close_reason="start_session_not_alive",
-                ),
-            )
-            await uow.commit()
+            await self._fail_session(session.id, "start_session_not_alive")
             raise SessionStartFailedError(f"the adapter did not keep session {session.id} alive")
+
+    async def _activate_prepared(
+        self,
+        operator: AgenticOperatorPort,
+        investigation_id: UUID,
+        prepared: PreparedAgentSession,
+        timestamp: datetime,
+    ) -> PreparedAgentSession:
+        try:
+            session = await self._activate_lease(investigation_id, prepared.session.id, timestamp)
+        except Exception:
+            await self._compensate_failed_activation(
+                operator, prepared.session, "lease_activation_failed"
+            )
+            raise
+        return PreparedAgentSession(session=session, secret=prepared.secret)
+
+    async def _activate_lease(
+        self, investigation_id: UUID, session_id: UUID, timestamp: datetime
+    ) -> AgentSessionV1:
+        """Short transaction: D3 lease acquisition + session RUNNING mirror."""
+        async with self._uow_factory() as uow:
+            await uow.investigation_tasks.lock_investigation(investigation_id)
+            session = await self._session_for(uow, investigation_id, session_id)
+            task = await self._locked_task(uow, investigation_id, session.task_id)
+            return await self._start_engine_locked(uow, session, task, timestamp)
+
+    async def _start_engine_locked(
+        self,
+        uow: SessionUnitOfWork,
+        session: AgentSessionV1,
+        task: InvestigationTaskV1,
+        timestamp: datetime,
+    ) -> AgentSessionV1:
+        await self._require_startable_locked(uow, session, task)
+        assigned_actor_id = task.assigned_actor_id
+        if assigned_actor_id is None:  # pragma: no cover - checked just above
+            raise SessionForbiddenError("the task is not assigned to an operator")
+        if session.state is AgentSessionState.PROVISIONING:
+            session = await self._persist(
+                uow, session.with_state(AgentSessionState.READY, now=timestamp)
+            )
         engine = InvestigationTaskService(
             tasks=uow.investigation_tasks,
             decisions=uow.analyst_decisions,
@@ -1298,6 +1585,69 @@ class SessionService:
             uow,
             session.with_task_lease(running.task.lease_id, running.task.lease_fence, now=timestamp),
         )
+
+    async def _require_startable_locked(
+        self,
+        uow: SessionUnitOfWork,
+        session: AgentSessionV1,
+        task: InvestigationTaskV1,
+    ) -> None:
+        if session.state not in (AgentSessionState.PROVISIONING, AgentSessionState.READY):
+            raise SessionStateConflictError(f"a {session.state.value} session cannot be started")
+        if session.host_session_ref is None:
+            raise SessionOperatorContractError("the prepared session has no host reference")
+        self._require_task_assignment(task)
+        if task.assigned_actor_id is None:  # pragma: no cover - checked just above
+            raise SessionForbiddenError("the task is not assigned to an operator")
+        if session.handoff_id is not None:
+            handoff = await uow.investigation_handoffs.get(session.handoff_id)
+            if handoff is None:
+                raise HandoffTaskStaleError("the session handoff no longer exists")
+            assert_startable(handoff.handoff, task)
+
+    async def _fail_session(self, session_id: UUID, reason: str) -> None:
+        """Durably mark an unleased prepared/running session ``failed``."""
+        async with self._uow_factory() as uow:
+            current = await uow.agent_sessions.get(session_id)
+            if current is None or current.is_terminal or current.task_lease_id is not None:
+                return
+            if current.state not in (
+                AgentSessionState.PROVISIONING,
+                AgentSessionState.READY,
+            ):
+                return
+            failed = current.with_state(
+                AgentSessionState.FAILED, now=self._clock(), close_reason=reason
+            )
+            stored = await uow.agent_sessions.update_state(
+                failed, expected_state_version=current.state_version
+            )
+            if stored is not None:
+                await uow.commit()
+
+    async def _compensate_failed_activation(
+        self, operator: AgenticOperatorPort, session: AgentSessionV1, reason: str
+    ) -> None:
+        """Stop a host run whose lease never committed; never relaunch it.
+
+        The ``failed`` row is written first and is the durable marker; the
+        interrupt is best effort because the host process may already be gone
+        or the adapter may not be prepared in this process (M2).  A lost
+        effect is visible in ``agent_sessions``/``reconciliation``, not silent.
+        """
+        await self._fail_session(session.id, reason)
+        if session.host_session_ref is None:
+            return
+        try:
+            await operator.interrupt_session(
+                InterruptSessionRequest(
+                    session_id=session.id,
+                    host_session_ref=session.host_session_ref,
+                    reason=reason,
+                )
+            )
+        except WorkspaceAgentError:
+            return
 
     async def _deliver_secret(self, prepared: PreparedAgentSession, idempotency_key: str) -> None:
         """Hand the secret to the host agent; the browser never receives it."""
@@ -1323,6 +1673,13 @@ class SessionService:
             raise SessionSecretDeliveryError(
                 "the host agent did not accept the session secret"
             ) from exc
+
+    async def _commit_session(
+        self, uow: SessionUnitOfWork, session: AgentSessionV1
+    ) -> AgentSessionV1:
+        stored = await self._persist(uow, session)
+        await uow.commit()
+        return stored
 
     async def _persist(self, uow: SessionUnitOfWork, session: AgentSessionV1) -> AgentSessionV1:
         expected = session.state_version - 1
@@ -1555,6 +1912,7 @@ __all__ = [
     "AgentSessionSecretDeliveryPort",
     "DeliveredInstructionV1",
     "EnqueuedInstructionV1",
+    "HostSessionReleaseService",
     "InstructionNoteResolver",
     "NoteInstructionResolution",
     "NoteInstructionUnavailableError",

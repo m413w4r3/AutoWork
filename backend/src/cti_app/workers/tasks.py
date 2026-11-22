@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import cast
 from uuid import UUID
@@ -6,7 +7,12 @@ from uuid import UUID
 import dramatiq
 import httpx
 from minio import Minio
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cti_app.application.agentic_sessions import (
+    HostSessionReleaseService,
+    SessionUnitOfWork,
+)
 from cti_app.application.analyst_vt_enrichment import VirusTotalSeedEnrichmentService
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.confined_analysis import CONFINED_ANALYSIS_JOB_KIND
@@ -43,6 +49,10 @@ from cti_app.application.editorial_revision_impact import (
 )
 from cti_app.application.investigation_jobs import (
     make_investigation_runner,
+)
+from cti_app.application.investigation_task_sweep import (
+    ExpiredLeaseSource,
+    run_expired_lease_sweep,
 )
 from cti_app.application.jobs import (
     JobExecutor,
@@ -199,6 +209,17 @@ def sweep_expired_editorial_drafts() -> None:
     deleted_count = asyncio.run(_sweep_expired_editorial_drafts())
     if deleted_count == EDITORIAL_DRAFT_PURGE_BATCH_SIZE:
         sweep_expired_editorial_drafts.send_with_options(delay=1_000)
+
+
+@dramatiq.actor(max_retries=0)
+def sweep_expired_investigation_leases() -> None:
+    """System sweep for M24 task leases (ADR-0011 D3, B1).
+
+    The DB release (status/event/session row) commits per investigation; only
+    then is the host teardown requested.  A missing or unresponsive host agent
+    leaves a ``lost_unreconciled`` marker instead of blocking the release.
+    """
+    asyncio.run(_sweep_expired_investigation_leases())
 
 
 @dramatiq.actor(max_retries=0)
@@ -620,6 +641,46 @@ async def _recover_abandoned_jobs() -> list[tuple[UUID, str]]:
         recovered.extend((job_id, EDITORIAL_THREAD_JOB_KIND) for job_id in editorial_jobs)
         return recovered
     finally:
+        await engine.dispose()
+
+
+class _SqlExpiredLeaseSource:
+    """Opens one short session per enumeration; the repository owns no state."""
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self._session_factory = session_factory
+
+    async def list_expired_lease_investigation_ids(self, *, limit: int) -> tuple[UUID, ...]:
+        async with SqlAlchemyUnitOfWork(self._session_factory) as uow:
+            return await cast(
+                ExpiredLeaseSource, uow.investigation_tasks
+            ).list_expired_lease_investigation_ids(limit=limit)
+
+
+async def _sweep_expired_investigation_leases() -> int:
+    from cti_app.infrastructure.agentic.wiring import build_agentic_operator_ports
+
+    settings = get_settings()
+    engine = create_postgres_engine(settings.postgres_dsn)
+    session_factory = create_session_factory(engine)
+    ports = build_agentic_operator_ports(settings)
+    release_service = HostSessionReleaseService(
+        uow_factory=cast(
+            Callable[[], SessionUnitOfWork],
+            lambda: SqlAlchemyUnitOfWork(session_factory),
+        ),
+        host=ports.host_sessions,
+        wait_seconds=settings.m24_host_release_wait_seconds,
+    )
+    try:
+        return await run_expired_lease_sweep(
+            source=_SqlExpiredLeaseSource(session_factory),
+            uow_factory=lambda: SqlAlchemyUnitOfWork(session_factory),
+            flush_releases=release_service.flush,
+            batch_size=settings.m24_task_sweep_batch_size,
+        )
+    finally:
+        await ports.aclose()
         await engine.dispose()
 
 

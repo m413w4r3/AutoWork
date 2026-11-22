@@ -267,6 +267,27 @@ class SqlAlchemyInvestigationTaskRepository:
         )
         return tuple(_event_from_row(row) for row in rows)
 
+    async def list_expired_lease_investigation_ids(self, *, limit: int) -> tuple[UUID, ...]:
+        """Investigations the D3 sweep must visit, chosen by the database clock.
+
+        The ``(status, lease_expires_at)`` index covers this query; the sweep
+        re-locks and re-checks every task, so a stale candidate is a no-op.
+        """
+        rows = await self._session.scalars(
+            select(InvestigationTaskRow.investigation_id)
+            .where(
+                InvestigationTaskRow.status.in_(
+                    (TaskStatus.RUNNING.value, TaskStatus.AWAITING_INPUT.value)
+                ),
+                InvestigationTaskRow.lease_expires_at.is_not(None),
+                InvestigationTaskRow.lease_expires_at <= func.statement_timestamp(),
+            )
+            .distinct()
+            .order_by(InvestigationTaskRow.investigation_id)
+            .limit(limit)
+        )
+        return tuple(rows)
+
     async def lock_task(self, task_id: UUID) -> InvestigationTaskV1 | None:
         row = await self._session.scalar(
             select(InvestigationTaskRow)
@@ -368,9 +389,16 @@ class SqlAlchemyInvestigationTaskRepository:
         now: datetime,
         ttl_seconds: int,
     ) -> InvestigationTaskV1 | None:
-        """Assigned -> running for an operator, bumping the fence atomically."""
+        """Assigned -> running for an operator, bumping the fence atomically.
+
+        The lease is born on the *database* clock (M5): the caller's ``now``
+        only satisfies the shared interface and never decides an expiry, so a
+        skewed process clock cannot mint an already-expired lease or extend
+        one beyond the TTL.
+        """
         if ttl_seconds < 1:
             raise ValueError("ttl_seconds must be >= 1")
+        database_now = func.statement_timestamp()
         result = await self._session.execute(
             update(InvestigationTaskRow)
             .where(
@@ -384,9 +412,9 @@ class SqlAlchemyInvestigationTaskRepository:
                 lease_id=lease_id,
                 lease_session_id=lease_session_id,
                 lease_fence=InvestigationTaskRow.lease_fence + 1,
-                lease_expires_at=now + timedelta(seconds=ttl_seconds),
-                heartbeat_at=now,
-                updated_at=now,
+                lease_expires_at=database_now + timedelta(seconds=ttl_seconds),
+                heartbeat_at=database_now,
+                updated_at=database_now,
             )
             .returning(InvestigationTaskRow)
             .execution_options(populate_existing=True, synchronize_session=False)

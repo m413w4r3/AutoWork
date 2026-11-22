@@ -134,19 +134,43 @@ class _DecisionRepository:
         )
 
 
+class _LockOrderRepository:
+    """Records the advisory/row lock order and the transaction it ran in."""
+
+    def __init__(self, inner: InMemoryInvestigationTaskRepository, harness: _Harness) -> None:
+        self._inner = inner
+        self._harness = harness
+
+    async def lock_investigation(self, investigation_id: UUID) -> None:
+        self._harness.current_locks.append("advisory")
+
+    async def lock_task(self, task_id: UUID) -> InvestigationTaskV1 | None:
+        self._harness.current_locks.append("row")
+        return await self._inner.lock_task(task_id)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
 class _FakeUnitOfWork:
     def __init__(self, harness: _Harness) -> None:
+        self._harness = harness
         self.analyst_investigations: AnalystInvestigationRepository = harness.investigations
         self.analyst_decisions: AnalystDecisionRepository = harness.decisions
-        self.investigation_tasks: InvestigationTaskRepository = harness.tasks
+        self.investigation_tasks: InvestigationTaskRepository = harness.repository
         self.investigation_handoffs: InvestigationHandoffRepository = harness.handoffs
         self.agent_sessions: AgentSessionRepository = harness.sessions
 
     async def __aenter__(self) -> _FakeUnitOfWork:
+        self._harness.transaction_depth += 1
+        self._harness.current_locks = []
         return self
 
     async def __aexit__(self, *_args: object) -> None:
-        return None
+        self._harness.transaction_depth -= 1
+        if self._harness.current_locks:
+            self._harness.lock_transactions.append(self._harness.current_locks)
+        self._harness.current_locks = []
 
     async def commit(self) -> None:
         return None
@@ -197,12 +221,19 @@ class _FakeOperator:
         self.instruction_outcome = InstructionDeliveryOutcome.ACCEPTED
         self.reconcile_outcome = SessionReconcileOutcome.SESSION_ALIVE
         self.resume_result: ResumeSessionResultV1 | None = None
+        self.observer: _Harness | None = None
+
+    def _observe(self, call: str) -> None:
+        if self.observer is not None:
+            self.observer.host_calls.append((call, self.observer.transaction_depth))
 
     async def probe_capabilities(self, request: ProbeCapabilitiesRequest) -> OperatorCapabilitiesV1:
+        self._observe("probe")
         self.probed.append(request)
         return self.capabilities
 
     async def prepare_session(self, request: PrepareSessionRequest) -> PreparedOperatorSessionV1:
+        self._observe("prepare")
         self.prepared.append(request)
         return PreparedOperatorSessionV1(
             session_id=request.session_id,
@@ -215,6 +246,7 @@ class _FakeOperator:
         )
 
     async def start_session(self, request: StartSessionRequest) -> SessionProcessStatusV1:
+        self._observe("start")
         self.order.append("start")
         self.started.append(request)
         return SessionProcessStatusV1(
@@ -251,6 +283,7 @@ class _FakeOperator:
         )
 
     async def interrupt_session(self, request: InterruptSessionRequest) -> InterruptSessionResultV1:
+        self._observe("interrupt")
         self.interrupted.append(request)
         return InterruptSessionResultV1(
             session_id=request.session_id, stopped=True, observed_at=NOW
@@ -299,6 +332,7 @@ class _FakeSecretDelivery:
     def __init__(self, order: list[str] | None = None) -> None:
         self.order = order if order is not None else []
         self.deliveries: list[dict[str, Any]] = []
+        self.observer: _Harness | None = None
 
     async def deliver_session_secret(
         self,
@@ -311,6 +345,8 @@ class _FakeSecretDelivery:
         secret: SessionSecret,
         idempotency_key: str,
     ) -> None:
+        if self.observer is not None:
+            self.observer.host_calls.append(("secret", self.observer.transaction_depth))
         self.order.append("secret")
         self.deliveries.append(
             {
@@ -348,13 +384,21 @@ class _Harness:
         self.sessions = InMemoryAgentSessionRepository()
         self.investigations = _InvestigationRepository(self.investigation_id)
         self.decisions = _DecisionRepository()
+        self.lock_transactions: list[list[str]] = []
+        self.current_locks: list[str] = []
+        self.host_calls: list[tuple[str, int]] = []
+        self.transaction_depth = 0
+        self.repository = _LockOrderRepository(self.tasks, self)
         self.uow = _FakeUnitOfWork(self)
         self.order: list[str] = []
         self.operator = _FakeOperator(self.order)
+        self.operator.observer = self
         self.deriver = HmacSessionSecretDeriver(key) if key is not None else None
         self.secret_delivery: AgentSessionSecretDeliveryPort | None = (
             _FakeSecretDelivery(self.order) if with_secret_delivery else None
         )
+        if isinstance(self.secret_delivery, _FakeSecretDelivery):
+            self.secret_delivery.observer = self
         self.service = SessionService(
             uow_factory=lambda: self.uow,
             deriver=self.deriver,
@@ -601,6 +645,56 @@ async def test_open_session_delivers_the_secret_before_the_adapter_start() -> No
     # SESSION-RUNNER §6: the host prepare IS the one-shot secret hand-off, so
     # start_session may only follow a successful delivery.
     assert harness.order == ["secret", "start"]
+
+
+async def test_session_locks_are_advisory_then_row_and_host_calls_run_outside() -> None:
+    """B3: no row lock before the investigation advisory, no host call under one."""
+    harness = _Harness()
+    task = await harness.seed_task()
+    await harness.open(task=task)
+
+    assert harness.lock_transactions, "the session start must use the task locks"
+    # B3: in every transaction that locks the task row, the investigation
+    # advisory lock is already held.  The event append may re-lock the row in
+    # the same transaction, so row locks are not one-per-advisory.
+    for transaction in harness.lock_transactions:
+        if "row" in transaction:
+            assert transaction[0] == "advisory", transaction
+    assert sum(t.count("advisory") for t in harness.lock_transactions) >= 3
+    # probe, host prepare, secret delivery and host start all ran between
+    # transactions (depth 0); a nested call would record 1 or more.
+    assert [name for name, _depth in harness.host_calls] == [
+        "probe",
+        "prepare",
+        "secret",
+        "start",
+    ]
+    assert all(depth == 0 for _name, depth in harness.host_calls)
+
+
+async def test_session_start_validates_under_lock_then_starts_the_host_unlocked() -> None:
+    harness = _Harness()
+    task = await harness.seed_task()
+    handoff = await harness.add_handoff(task)
+    prepared = await harness.service.prepare(
+        harness.investigation_id,
+        task_id=task.id,
+        adapter_kind=OperatorAdapterKind.CODEX_CLI,
+        handoff_id=UUID(handoff.handoff_id),
+        executable=EXECUTABLE,
+        actor=HUMAN_ACTOR,
+        idempotency_key="prepare-then-start",
+    )
+    harness.host_calls.clear()
+    harness.lock_transactions.clear()
+    await harness.service.start(harness.investigation_id, prepared.session.id, actor=HUMAN_ACTOR)
+    assert [name for name, _depth in harness.host_calls] == ["start"]
+    assert harness.host_calls[0][1] == 0
+    locked = [tx for tx in harness.lock_transactions if tx]
+    assert locked[0][0] == "advisory"
+    for transaction in locked:
+        if "row" in transaction:
+            assert transaction[0] == "advisory", transaction
 
 
 async def test_secret_never_appears_in_repr_logs_or_payloads() -> None:

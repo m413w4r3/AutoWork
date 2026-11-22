@@ -55,6 +55,7 @@ from typing import Any, Protocol
 from uuid import UUID, uuid4, uuid5
 
 from cti_app.application.investigation_persistence import (
+    AgentSessionRepository,
     InvestigationTaskRepository,
     VersionConflictError,
 )
@@ -200,6 +201,77 @@ class TaskSessionPort(Protocol):
         outcome: TaskSessionOutcome,
         reason: str,
     ) -> None: ...
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class TaskSessionRelease:
+    """A durable DB release whose host teardown still has to be requested.
+
+    The engine writes this only after the session row was closed in the
+    command transaction; callers flush it *after* their commit so no advisory
+    or row lock is held while the host socket is used (B3/M1).  The request is
+    idempotent host-side (deterministic key) and never relaunches anything.
+    """
+
+    session_id: UUID
+    investigation_id: UUID
+    task_id: UUID
+    outcome: TaskSessionOutcome
+    reason: str
+
+
+class RepositoryTaskSessionPort:
+    """``TaskSessionPort`` over the 05B1 repository, buffering host releases.
+
+    The actual close is the same CAS the engine always used; the host request
+    is deliberately not sent here because this runs inside the task command
+    transaction (locks held).  Callers that pass ``releases`` flush the buffer
+    after committing.
+    """
+
+    def __init__(
+        self,
+        repository: AgentSessionRepository,
+        releases: list[TaskSessionRelease] | None = None,
+    ) -> None:
+        self._repository = repository
+        self._releases = releases
+
+    async def is_active_session(
+        self, *, session_id: UUID, investigation_id: UUID, task_id: UUID
+    ) -> bool:
+        return await self._repository.is_active_session(
+            session_id=session_id,
+            investigation_id=investigation_id,
+            task_id=task_id,
+        )
+
+    async def close_session(
+        self,
+        *,
+        session_id: UUID,
+        investigation_id: UUID,
+        task_id: UUID,
+        outcome: TaskSessionOutcome,
+        reason: str,
+    ) -> None:
+        await self._repository.close_session(
+            session_id=session_id,
+            investigation_id=investigation_id,
+            task_id=task_id,
+            outcome=outcome.value,
+            reason=reason,
+        )
+        if self._releases is not None:
+            self._releases.append(
+                TaskSessionRelease(
+                    session_id=session_id,
+                    investigation_id=investigation_id,
+                    task_id=task_id,
+                    outcome=outcome,
+                    reason=reason,
+                )
+            )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1948,6 +2020,7 @@ __all__ = [
     "ACTIVE_TASK_STATUSES",
     "SYSTEM_TASK_ACTOR",
     "InvestigationTaskService",
+    "RepositoryTaskSessionPort",
     "StaleTaskVersionError",
     "TaskCommandError",
     "TaskCommandResult",
@@ -1963,5 +2036,6 @@ __all__ = [
     "TaskSessionInactiveError",
     "TaskSessionOutcome",
     "TaskSessionPort",
+    "TaskSessionRelease",
     "TaskTransitionNotAllowedError",
 ]

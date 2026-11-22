@@ -13,12 +13,18 @@ in-memory repository because ``append_task_event`` is the sole writer of
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
 
-from cti_app.application.investigation_persistence import InMemoryInvestigationTaskRepository
+from cti_app.application.investigation_persistence import (
+    AgentSessionRepository,
+    InMemoryInvestigationTaskRepository,
+    InvestigationTaskRepository,
+)
 from cti_app.application.investigation_task_events import (
     TaskEventConflictError,
     TaskEventDraft,
@@ -26,7 +32,10 @@ from cti_app.application.investigation_task_events import (
     TaskNotFoundError,
     append_task_event,
 )
-from cti_app.application.investigation_task_sweep import InvestigationTaskSweeper
+from cti_app.application.investigation_task_sweep import (
+    InvestigationTaskSweeper,
+    run_expired_lease_sweep,
+)
 from cti_app.application.investigation_tasks import (
     InvestigationTaskService,
     StaleTaskVersionError,
@@ -40,6 +49,7 @@ from cti_app.application.investigation_tasks import (
     TaskPermissionError,
     TaskSessionInactiveError,
     TaskSessionOutcome,
+    TaskSessionRelease,
 )
 from cti_app.config import Settings
 from cti_app.domain.editorial import (
@@ -921,6 +931,91 @@ def test_sweep_covers_awaiting_input() -> None:
         stored = await repository.get(seeded.id)
         assert stored is not None
         assert stored.event_sequence == 3
+
+    asyncio.run(scenario())
+
+
+def test_sweep_runner_commits_before_flushing_the_host_release() -> None:
+    """B1/B2: the scheduler runner sweeps, commits, then asks the host to stop."""
+
+    async def scenario() -> None:
+        repository = InMemoryInvestigationTaskRepository(clock=lambda: NOW + timedelta(seconds=181))
+        session_id = uuid4()
+        seeded = await _seeded(
+            repository,
+            status=TaskStatus.ASSIGNED,
+            assigned_actor_kind=TaskActorKind.OPERATOR,
+            assigned_actor_id=OPERATOR.actor_id,
+        )
+        service = _task_service(repository, sessions=_SessionRecorder(active=(session_id,)))
+        started = await service.start(
+            task_id=seeded.id,
+            actor=OPERATOR,
+            expected_status_version=1,
+            idempotency_key="start",
+            session_id=session_id,
+            now=NOW,
+        )
+        await service.request_input(
+            task_id=seeded.id,
+            actor=OPERATOR,
+            expected_status_version=started.task.status_version,
+            lease_fence=started.task.lease_fence,
+            idempotency_key="request-input",
+            now=NOW + timedelta(seconds=10),
+        )
+
+        class _AgentSessions:
+            def __init__(self) -> None:
+                self.closed: list[dict[str, object]] = []
+
+            async def close_session(self, **values: object) -> None:
+                self.closed.append(values)
+
+        class _Uow:
+            def __init__(self) -> None:
+                self.investigation_tasks: InvestigationTaskRepository = repository
+                self.agent_sessions = cast(AgentSessionRepository, agent_sessions)
+                self.committed = False
+
+            async def __aenter__(self) -> _Uow:
+                return self
+
+            async def __aexit__(self, *_args: object) -> None:
+                return None
+
+            async def commit(self) -> None:
+                self.committed = True
+
+        class _Source:
+            async def list_expired_lease_investigation_ids(self, *, limit: int) -> tuple[UUID, ...]:
+                assert limit == 5
+                return (seeded.investigation_id,)
+
+        agent_sessions = _AgentSessions()
+        releases: list[TaskSessionRelease] = []
+        uow = _Uow()
+
+        async def flush(items: Sequence[TaskSessionRelease]) -> None:
+            assert uow.committed is True, "the DB release must commit before the host call"
+            assert agent_sessions.closed, "the session row must be released before teardown"
+            releases.extend(items)
+
+        swept = await run_expired_lease_sweep(
+            source=_Source(),
+            uow_factory=lambda: uow,
+            flush_releases=flush,
+            batch_size=5,
+        )
+        assert swept == 1
+        assert len(releases) == 1
+        assert releases[0].session_id == session_id
+        assert releases[0].outcome is TaskSessionOutcome.LOST
+        assert releases[0].reason == "lease_expired"
+        stored = await repository.get(seeded.id)
+        assert stored is not None
+        assert stored.status is TaskStatus.BLOCKED
+        assert stored.blocked_reason is BlockedReason.LEASE_EXPIRED
 
     asyncio.run(scenario())
 

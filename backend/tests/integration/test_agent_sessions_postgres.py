@@ -19,17 +19,43 @@ from alembic import command
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cti_app.application.agent_session_verification import HmacSessionSecretDeriver
+from cti_app.application.agentic_sessions import SessionSecret, SessionService
 from cti_app.application.investigation_handoffs import (
     HandoffCreateRequest,
+    HandoffTaskStaleError,
     InvestigationHandoffService,
 )
 from cti_app.application.investigation_persistence import VersionConflictError
+from cti_app.application.investigation_tasks import (
+    InvestigationTaskService,
+    RepositoryTaskSessionPort,
+    TaskCommandError,
+)
 from cti_app.domain.agentic_operator import (
     AgentSessionState,
     AgentSessionV1,
+    CollectResultsRequest,
+    HandoffRequestReceiptV1,
+    InstructionReceiptV1,
+    InterruptSessionRequest,
+    InterruptSessionResultV1,
     OperatorAdapterKind,
     OperatorCapabilitiesV1,
     OperatorProbeCommand,
+    OperatorResultsV1,
+    PreparedOperatorSessionV1,
+    PrepareSessionRequest,
+    ProbeCapabilitiesRequest,
+    ReconcileSessionRequest,
+    RequestHandoffRequest,
+    ResumeSessionRequest,
+    ResumeSessionResultV1,
+    SendInstructionRequest,
+    SessionProcessStatusV1,
+    SessionReconciliationV1,
+    SessionStatusRequest,
+    StartSessionRequest,
 )
 from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition
@@ -40,6 +66,7 @@ from cti_app.domain.investigation_task import (
     ResultVerificationStatus,
     TaskActor,
     TaskActorKind,
+    TaskLimits,
     TaskPriority,
     TaskStatus,
 )
@@ -555,3 +582,182 @@ def test_agent_session_migration_accepts_conforming_and_rejects_partial(
     with pytest.raises(RuntimeError, match="preflight rejected"):
         command.upgrade(config, "head")
     assert _alembic_version(temporary_postgres_url) == PREVIOUS
+
+
+class _BlockingOperator:
+    """A real port fake whose start blocks until the test releases it."""
+
+    adapter_kind = OperatorAdapterKind.CODEX_CLI
+
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.interrupted: list[UUID] = []
+
+    async def probe_capabilities(self, request: ProbeCapabilitiesRequest) -> OperatorCapabilitiesV1:
+        return _capabilities()
+
+    async def prepare_session(self, request: PrepareSessionRequest) -> PreparedOperatorSessionV1:
+        return PreparedOperatorSessionV1(
+            session_id=request.session_id,
+            investigation_id=request.investigation_id,
+            task_id=request.task_id,
+            adapter_kind=request.adapter_kind,
+            host_session_ref=f"host-{request.session_id}",
+            capabilities=_capabilities(),
+            prepared_at=NOW,
+        )
+
+    async def start_session(self, request: StartSessionRequest) -> SessionProcessStatusV1:
+        self.entered.set()
+        await self.release.wait()
+        return SessionProcessStatusV1(
+            session_id=request.session_id,
+            host_session_ref=request.host_session_ref,
+            alive=True,
+            last_activity_at=NOW,
+            observed_at=NOW,
+        )
+
+    async def interrupt_session(self, request: InterruptSessionRequest) -> InterruptSessionResultV1:
+        self.interrupted.append(request.session_id)
+        return InterruptSessionResultV1(
+            session_id=request.session_id, stopped=False, observed_at=NOW
+        )
+
+    async def get_session_status(self, request: SessionStatusRequest) -> SessionProcessStatusV1:
+        raise AssertionError("the interleaving test never polls the adapter")
+
+    async def send_instruction(self, request: SendInstructionRequest) -> InstructionReceiptV1:
+        raise AssertionError("the interleaving test never sends an instruction")
+
+    async def request_handoff(self, request: RequestHandoffRequest) -> HandoffRequestReceiptV1:
+        raise AssertionError("the interleaving test never requests a handoff")
+
+    async def resume_session(self, request: ResumeSessionRequest) -> ResumeSessionResultV1:
+        raise AssertionError("the interleaving test never resumes")
+
+    async def collect_results(self, request: CollectResultsRequest) -> OperatorResultsV1:
+        raise AssertionError("the interleaving test never collects")
+
+    async def reconcile_session(self, request: ReconcileSessionRequest) -> SessionReconciliationV1:
+        raise AssertionError("the interleaving test never reconciles")
+
+
+class _SecretDelivery:
+    def __init__(self) -> None:
+        self.delivered: list[UUID] = []
+
+    async def deliver_session_secret(
+        self,
+        *,
+        session_id: UUID,
+        investigation_id: UUID,
+        task_id: UUID,
+        adapter_kind: OperatorAdapterKind,
+        host_session_ref: str,
+        secret: SessionSecret,
+        idempotency_key: str,
+    ) -> None:
+        self.delivered.append(session_id)
+
+
+def test_open_session_holds_no_lock_during_the_host_start(
+    temporary_postgres_url: str,
+) -> None:
+    """B3 interleaving: a human cancel wins while the host start is in flight.
+
+    Before the lock-order fix, ``open_session`` held the task row across the
+    adapter call, so this cancel blocked (and could deadlock against the
+    advisory lock).  The fix commits the provisioning row first, starts the
+    host without locks, then acquires the lease in a second short transaction.
+    """
+    command.upgrade(_alembic_config(temporary_postgres_url), "head")
+
+    async def run() -> None:
+        engine = create_postgres_engine(temporary_postgres_url)
+        try:
+            factory = create_session_factory(engine)
+            investigation = await _seed_investigation(factory)
+            task = await _seed_task(factory, investigation.id, task_key="lead-interleave")
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                engine_service = InvestigationTaskService(
+                    tasks=uow.investigation_tasks,
+                    decisions=uow.analyst_decisions,
+                    sessions=RepositoryTaskSessionPort(uow.agent_sessions),
+                    limits=TaskLimits(),
+                )
+                assigned = await engine_service.assign(
+                    task_id=task.id,
+                    actor=TaskActor(kind=TaskActorKind.HUMAN, actor_id="analyst:test"),
+                    target=TaskActor(kind=TaskActorKind.OPERATOR, actor_id="codex:operator-1"),
+                    expected_status_version=1,
+                    idempotency_key="assign-interleave",
+                    now=NOW,
+                )
+                await uow.commit()
+            assert assigned.task.status is TaskStatus.ASSIGNED
+            handoff_id = await _seed_handoff(factory, investigation.id, task.id)
+
+            operator = _BlockingOperator()
+            service = SessionService(
+                uow_factory=lambda: SqlAlchemyUnitOfWork(factory),
+                deriver=HmacSessionSecretDeriver("0123456789abcdef0123456789abcdef"),
+                operator=operator,
+                secret_delivery=_SecretDelivery(),
+                task_limits=TaskLimits(),
+                clock=lambda: NOW,
+            )
+            opening = asyncio.create_task(
+                service.open_session(
+                    investigation.id,
+                    task_id=task.id,
+                    adapter_kind=OperatorAdapterKind.CODEX_CLI,
+                    handoff_id=handoff_id,
+                    executable="/usr/local/bin/codex",
+                    actor=TaskActor(kind=TaskActorKind.HUMAN, actor_id="analyst:test"),
+                    idempotency_key="open-interleave",
+                    now=NOW,
+                )
+            )
+            await asyncio.wait_for(operator.entered.wait(), timeout=10)
+
+            async def cancel() -> None:
+                async with SqlAlchemyUnitOfWork(factory) as uow:
+                    cancel_service = InvestigationTaskService(
+                        tasks=uow.investigation_tasks,
+                        decisions=uow.analyst_decisions,
+                        sessions=RepositoryTaskSessionPort(uow.agent_sessions),
+                        limits=TaskLimits(),
+                    )
+                    await cancel_service.cancel(
+                        task_id=task.id,
+                        actor=TaskActor(kind=TaskActorKind.HUMAN, actor_id="analyst:test"),
+                        expected_status_version=assigned.task.status_version,
+                        idempotency_key="cancel-interleave",
+                        reason="stop now",
+                        now=NOW,
+                    )
+                    await uow.commit()
+
+            # The host start is still blocked: cancel must not wait for it.
+            assert not operator.release.is_set()
+            await asyncio.wait_for(cancel(), timeout=10)
+            assert not opening.done()
+
+            operator.release.set()
+            with pytest.raises((TaskCommandError, HandoffTaskStaleError)):
+                await asyncio.wait_for(opening, timeout=10)
+            assert operator.interrupted, "the failed activation must stop the host run"
+
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                stored = await uow.investigation_tasks.get(task.id)
+                assert stored is not None
+                assert stored.status is TaskStatus.CANCELLED
+                sessions = await uow.agent_sessions.list_for_task(task.id)
+                assert len(sessions) == 1
+                assert sessions[0].state is AgentSessionState.FAILED
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
