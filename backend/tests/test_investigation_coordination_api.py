@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -33,6 +34,7 @@ from cti_app.application.investigation_persistence import (
     InMemoryInvestigationTaskRepository,
     InMemoryToolInvocationRepository,
 )
+from cti_app.application.workspace_agent import WorkspaceLocalUnavailableError
 from cti_app.config import Settings
 from cti_app.domain.classification import TLP
 from cti_app.domain.editorial import AnalystDecision
@@ -880,3 +882,37 @@ def test_legacy_operator_route_is_unchanged_for_legacy_investigations() -> None:
 
     assert accepted.status_code == 200, accepted.text
     assert len(factory.invocations.calls) == 1
+
+
+class _UnavailableWorkspaceService:
+    async def ensure_workspace(
+        self, investigation_id: UUID, *, verified_synthesis_sha256: str | None = None
+    ) -> None:
+        del investigation_id, verified_synthesis_sha256
+        raise WorkspaceLocalUnavailableError()
+
+
+def test_workspace_unavailable_never_fails_a_workshop_start(caplog) -> None:
+    client, store = _client()
+    store.investigations[INVESTIGATION_ID].prose_authority = ProseAuthority.BRIDGE_ONLY
+    client.app.state.investigation_workspace_service = _UnavailableWorkspaceService()
+
+    with caplog.at_level(logging.WARNING, logger="cti_app.api.investigation"):
+        accepted = client.post(
+            f"/api/subjects/{SUBJECT_ID}/investigations",
+            json={
+                **_start_body(),
+                "creation_profile": "m24_workshop",
+                "execution_mode": "operator_led",
+            },
+        )
+
+    assert accepted.status_code == 200, accepted.text
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "workspace_ensure_failed" in message
+        and str(INVESTIGATION_ID) in message
+        and "workspace_local_unavailable" in message
+        for message in messages
+    )
+    assert all("Analyst workspace note" not in message for message in messages)

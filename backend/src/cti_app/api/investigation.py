@@ -129,6 +129,7 @@ from cti_app.application.research_context_builder import (
     blocked_capabilities_from_history,
     current_tool_readiness_block,
 )
+from cti_app.application.workspace_agent import WorkspaceAgentError
 from cti_app.domain.analyst_opinion import AnalystOpinionV1
 from cti_app.domain.investigation import (
     BudgetDimension,
@@ -1097,12 +1098,46 @@ async def start_investigation(
             raise _http_error(409, "investigation_version_conflict") from exc
         except ValueError as exc:
             raise _http_error(409, "investigation_start_conflict", str(exc)) from exc
+    if payload.creation_profile == "m24_workshop":
+        # ADR-0011 D2: the host workspace is provisioned at start, best effort.
+        # A missing local agent must never fail the investigation itself.
+        await _ensure_workshop_workspace(request, investigation.id, snapshot.synthesis_sha256)
     await _dispatch(request, job)
     return InvestigationActionResponse(
         investigation=view,
         job_id=job.id,
         idempotent_replay=replay,
     )
+
+
+async def _ensure_workshop_workspace(
+    request: Request, investigation_id: UUID, synthesis_sha256: str
+) -> None:
+    """Best-effort workspace creation for ``creation_profile='m24_workshop'``.
+
+    Failures are logged by investigation id and typed code only: no host path,
+    note text or exception message ever reaches the log, and the start route's
+    response is unaffected.
+    """
+    from cti_app.api.investigation_workspace import workspace_service_scope
+    from cti_app.application.investigation_workspace import WorkspaceServiceError
+
+    try:
+        async with workspace_service_scope(request) as service:
+            await service.ensure_workspace(
+                investigation_id, verified_synthesis_sha256=synthesis_sha256
+            )
+    except (WorkspaceServiceError, WorkspaceAgentError) as exc:
+        _logger.warning(
+            "workspace_ensure_failed investigation_id=%s code=%s",
+            investigation_id,
+            exc.code,
+        )
+    except Exception:
+        _logger.warning(
+            "workspace_ensure_failed investigation_id=%s code=workspace_ensure_internal_error",
+            investigation_id,
+        )
 
 
 async def _ensure_handoff_if_missing(
