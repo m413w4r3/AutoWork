@@ -480,10 +480,11 @@ def start_agent(root: Path, runtime_dir: Path) -> LiveAgent:
 
 
 @contextmanager
-def live_agent(tmp_path: Path) -> Iterator[LiveAgent]:
+def live_agent(tmp_path: Path, runtime_dir: Path) -> Iterator[LiveAgent]:
+    """Start one agent; the workspace root may be long but the socket dir may not."""
     root = tmp_path / "workspaces"
     root.mkdir()
-    running = start_agent(root, tmp_path / "run")
+    running = start_agent(root, runtime_dir)
     try:
         yield running
     finally:
@@ -647,8 +648,10 @@ async def test_ingest_treats_a_reobserved_revision_and_event_as_a_replay() -> No
 # -- real client <-> real server end to end -----------------------------------
 
 
-async def test_e2e_disk_note_is_ingested_with_its_golden_identity(tmp_path: Path) -> None:
-    with live_agent(tmp_path) as running:
+async def test_e2e_disk_note_is_ingested_with_its_golden_identity(
+    tmp_path: Path, socket_runtime_dir: Path
+) -> None:
+    with live_agent(tmp_path, socket_runtime_dir) as running:
         client = make_client(running)
         try:
             request = ensure_request()
@@ -737,9 +740,9 @@ async def test_e2e_disk_note_is_ingested_with_its_golden_identity(tmp_path: Path
 
 
 async def test_e2e_conflict_copy_generated_export_and_read_only_sample(
-    tmp_path: Path,
+    tmp_path: Path, socket_runtime_dir: Path
 ) -> None:
-    with live_agent(tmp_path) as running:
+    with live_agent(tmp_path, socket_runtime_dir) as running:
         client = make_client(running)
         try:
             workspace_id = (await client.ensure_workspace(ensure_request())).workspace_id
@@ -850,11 +853,11 @@ async def test_e2e_conflict_copy_generated_export_and_read_only_sample(
 
 
 async def test_e2e_restart_reuses_revisions_replays_events_and_rotates_token(
-    tmp_path: Path,
+    tmp_path: Path, socket_runtime_dir: Path
 ) -> None:
     root = tmp_path / "workspaces"
     root.mkdir()
-    runtime_dir = tmp_path / "run"
+    runtime_dir = socket_runtime_dir
     first = start_agent(root, runtime_dir)
     client = make_client(first)
     request = ensure_request()
@@ -927,10 +930,12 @@ async def test_e2e_restart_reuses_revisions_replays_events_and_rotates_token(
         first.shutdown()
 
 
-async def test_e2e_projection_loss_forces_a_resync_then_converges(tmp_path: Path) -> None:
+async def test_e2e_projection_loss_forces_a_resync_then_converges(
+    tmp_path: Path, socket_runtime_dir: Path
+) -> None:
     root = tmp_path / "workspaces"
     root.mkdir()
-    runtime_dir = tmp_path / "run"
+    runtime_dir = socket_runtime_dir
     first = start_agent(root, runtime_dir)
     client = make_client(first)
     request = ensure_request()

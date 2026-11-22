@@ -9,12 +9,7 @@ workspace files or HTTP response bodies.
 from __future__ import annotations
 
 import json
-import shutil
-import tempfile
-from collections.abc import Iterator
 from pathlib import Path
-
-import pytest
 
 from tests.workspace_agent.sessions_support import (
     COLLECT_KEY,
@@ -37,16 +32,6 @@ from tests.workspace_agent.sessions_support import (
     workspace_files_containing,
     write_fake_script,
 )
-
-
-@pytest.fixture
-def session_base() -> Iterator[Path]:
-    """A short base under ``/tmp`` so the per-session UDS path fits 108 bytes."""
-    path = Path(tempfile.mkdtemp(prefix="m24h1-"))
-    try:
-        yield path
-    finally:
-        shutil.rmtree(path, ignore_errors=True)
 
 
 def _prepare(client, running, workspace_id: str):

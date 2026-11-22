@@ -15,8 +15,6 @@ import json
 import os
 import shutil
 import stat
-import tempfile
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -82,16 +80,6 @@ EXPECTED_ENV_KEYS = frozenset(
         "AUTOWORK_BACKEND_URL",
     }
 )
-
-
-@pytest.fixture
-def session_base() -> Iterator[Path]:
-    """A short base under ``/tmp`` so the per-session UDS path fits 108 bytes."""
-    path = Path(tempfile.mkdtemp(prefix="m24h4-"))
-    try:
-        yield path
-    finally:
-        shutil.rmtree(path, ignore_errors=True)
 
 
 @pytest.fixture(autouse=True)

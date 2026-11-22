@@ -186,8 +186,9 @@ class SecretUnavailableError(SessionError):
     code = ErrorCode.SECRET_UNAVAILABLE
     status = 409
 
-    def __init__(self) -> None:
-        super().__init__("the session secret handoff cannot be armed")
+    def __init__(self, *, reason: str | None = None) -> None:
+        details: dict[str, object] = {} if reason is None else {"reason": reason}
+        super().__init__("the session secret handoff cannot be armed", details=details)
 
 
 class CursorExpiredError(SessionError):

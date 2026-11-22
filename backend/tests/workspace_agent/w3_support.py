@@ -163,10 +163,14 @@ class RunningScanAgent:
 
 
 @contextmanager
-def running_scan_agent(tmp_path: Path) -> Iterator[RunningScanAgent]:
+def running_scan_agent(tmp_path: Path, runtime_dir: Path) -> Iterator[RunningScanAgent]:
+    """Start a scanning agent whose socket lives in the caller's short runtime dir.
+
+    ``tmp_path`` may be arbitrarily long (pytest basetemp, caller TMPDIR); only
+    the AF_UNIX runtime directory has to stay short, so the caller provides it.
+    """
     root = tmp_path / "workspaces"
     root.mkdir()
-    runtime_dir = tmp_path / "run"
     agent = WorkspaceAgent(
         AgentConfig(
             root=root,

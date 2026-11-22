@@ -11,9 +11,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
-import tempfile
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -73,16 +70,6 @@ def _bwrap_prepare_gate(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setattr(session_process, "bwrap_available", lambda: True)
     monkeypatch.setattr(session_process, "slirp_available", lambda: True)
-
-
-@pytest.fixture
-def session_base() -> Iterator[Path]:
-    """A short base under ``/tmp`` so the per-session UDS path fits 108 bytes."""
-    path = Path(tempfile.mkdtemp(prefix="m24h5-"))
-    try:
-        yield path
-    finally:
-        shutil.rmtree(path, ignore_errors=True)
 
 
 def _build_supervisor(

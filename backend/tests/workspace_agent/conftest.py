@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Iterator
@@ -33,6 +35,11 @@ from sidecars.workspace_agent.agent import (  # noqa: E402
     WorkspaceAgent,
 )
 from sidecars.workspace_agent.auth import TOKEN_FILE_NAME, read_token_file  # noqa: E402
+from sidecars.workspace_agent.sessions.supervisor import (  # noqa: E402
+    AF_UNIX_SUN_PATH_MAX,
+    IPC_DIRECTORY,
+    SESSION_SOCKET_FILE_NAME,
+)
 
 from tests.workspace_agent.w3_support import (  # noqa: E402
     RunningScanAgent,
@@ -42,6 +49,55 @@ from tests.workspace_agent.w3_support import (  # noqa: E402
 )
 
 BASE_URL = "http://workspace-agent"
+
+# A test socket path must fit regardless of the caller's TMPDIR or pytest basetemp.
+SESSION_ID_BYTES = 36  # fixed-width UUID on the session wire
+SESSION_SOCKET_RESERVE = (
+    1 + SESSION_ID_BYTES + len(f"/{IPC_DIRECTORY}/") + len(SESSION_SOCKET_FILE_NAME)
+)
+SOCKET_ROOT = Path("/tmp")
+
+
+def short_socket_base(prefix: str, *, reserve: int = SESSION_SOCKET_RESERVE) -> Path:
+    """Create a fresh test base under a fixed short root, never the caller's TMPDIR.
+
+    ``tempfile.mkdtemp()`` follows ``tempfile.gettempdir()``, which caches one
+    directory for the whole pytest process: a long or polluted TMPDIR makes
+    every later AF_UNIX bind fail with an opaque ``workspace agent did not
+    become ready`` timeout. Tests must not depend on their environment.
+    """
+    path = Path(tempfile.mkdtemp(prefix=prefix, dir=SOCKET_ROOT))
+    length = len(os.fsencode(path))
+    if length + reserve > AF_UNIX_SUN_PATH_MAX:
+        shutil.rmtree(path, ignore_errors=True)
+        pytest.fail(
+            f"test socket base {path!r} is {length} bytes and leaves less than "
+            f"{reserve} bytes for the AF_UNIX path (limit {AF_UNIX_SUN_PATH_MAX})"
+        )
+    return path
+
+
+@pytest.fixture
+def socket_runtime_dir() -> Iterator[Path]:
+    """A short runtime directory for an in-process or subprocess agent socket."""
+    path = short_socket_base("m24-run-", reserve=1 + len(SOCKET_FILE_NAME))
+    # The production contract is a 0750 runtime directory; mkdtemp creates 0700
+    # and the agent never chmods an existing directory.
+    os.chmod(path, 0o750)
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+@pytest.fixture
+def session_base() -> Iterator[Path]:
+    """A short base so the per-session IPC socket path always fits 108 bytes."""
+    path = short_socket_base("m24h1-")
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 @dataclass(frozen=True)
@@ -69,10 +125,10 @@ class RunningAgent:
 
 
 @pytest.fixture
-def agent_server(tmp_path: Path) -> Iterator[RunningAgent]:
+def agent_server(tmp_path: Path, socket_runtime_dir: Path) -> Iterator[RunningAgent]:
     root = tmp_path / "workspaces"
     root.mkdir()
-    runtime_dir = tmp_path / "run"
+    runtime_dir = socket_runtime_dir
     agent = WorkspaceAgent(
         AgentConfig(
             root=root,
@@ -184,9 +240,9 @@ def scan_environment(tmp_path: Path) -> ScanEnvironment:
 
 
 @pytest.fixture
-def scanning_agent(tmp_path: Path) -> Iterator[RunningScanAgent]:
+def scanning_agent(tmp_path: Path, socket_runtime_dir: Path) -> Iterator[RunningScanAgent]:
     """A live agent whose zero stability window imports files on the first scan."""
-    with running_scan_agent(tmp_path) as running:
+    with running_scan_agent(tmp_path, socket_runtime_dir) as running:
         yield running
 
 
