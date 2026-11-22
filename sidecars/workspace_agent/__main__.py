@@ -83,6 +83,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="group name or gid for the socket and token",
     )
     parser.add_argument(
+        "--analysis-gid",
+        default=os.environ.get("AUTOWORK_WORKSPACE_ANALYSIS_GID") or None,
+        help="group name or gid allowed to read materialized base samples",
+    )
+    parser.add_argument(
         "--poll-interval-ms",
         type=_positive_int,
         default=DEFAULT_POLL_INTERVAL_MS,
@@ -128,6 +133,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             root=Path(args.root).expanduser().resolve(),
             socket_dir=socket_dir,
             group=resolve_group(args.group),
+            analysis_gid=resolve_group(args.analysis_gid),
             poll_interval_ms=args.poll_interval_ms,
             stability_window_ms=args.stability_window_ms,
             log_level=args.log_level,

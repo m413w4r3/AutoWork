@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
-from . import paths, protocol, workspace
+from . import paths, protocol, samples, workspace
 from .auth import verify_bearer
 
 if TYPE_CHECKING:
@@ -36,6 +36,7 @@ SOCKET_UMASK = 0o007
 REQUEST_TIMEOUT_SECONDS = 60.0
 REQUEST_ID_HEADER = "X-Request-Id"
 UNKNOWN_ROUTE = "<unknown>"
+RAW_BODY_CHUNK_SIZE = 1024 * 1024
 
 _WS = "/v1/workspaces"
 _WID = r"ws-[0-9a-f]{32}"
@@ -121,6 +122,19 @@ class Route:
         return f"{method} {self.template}"
 
 
+@dataclass(frozen=True)
+class RawFileResponse:
+    """A streamed raw body; the request handler owns and closes ``fd``."""
+
+    status: int
+    fd: int
+    size: int
+    content_type: str = "application/octet-stream"
+
+
+DispatchResult = tuple[int, dict[str, object]] | RawFileResponse
+
+
 class SocketPathError(RuntimeError):
     """The socket path exists but is not a socket, or cannot be secured."""
 
@@ -196,6 +210,7 @@ class WorkspaceAgentRequestHandler(BaseHTTPRequestHandler):
         payload: dict[str, object] = protocol.error_envelope(
             protocol.ErrorCode.INTERNAL_ERROR, "internal error"
         )
+        raw_response: RawFileResponse | None = None
         try:
             path = self._request_path()
             if path is None:
@@ -207,7 +222,12 @@ class WorkspaceAgentRequestHandler(BaseHTTPRequestHandler):
                 route = match_route(method, path)
                 if route is not None:
                     route_label = route.label(method)
-                status, payload = self._dispatch(method, path, route)
+                result = self._dispatch(method, path, route)
+                if isinstance(result, RawFileResponse):
+                    raw_response = result
+                    status = result.status
+                else:
+                    status, payload = result
         except _RequestRejected as exc:
             status, payload = exc.status, exc.envelope
         except Exception as exc:
@@ -219,7 +239,10 @@ class WorkspaceAgentRequestHandler(BaseHTTPRequestHandler):
             )
             status = 500
             payload = protocol.error_envelope(protocol.ErrorCode.INTERNAL_ERROR, "internal error")
-        self._respond(status, payload, request_id, head=method == "HEAD")
+        if raw_response is not None:
+            self._respond_raw(raw_response, request_id, head=method == "HEAD")
+        else:
+            self._respond(status, payload, request_id, head=method == "HEAD")
         LOGGER.info(
             "request_id=%s route=%s workspace_id=%s status=%d duration_ms=%d",
             request_id,
@@ -235,9 +258,7 @@ class WorkspaceAgentRequestHandler(BaseHTTPRequestHandler):
         except ValueError:
             return None
 
-    def _dispatch(
-        self, method: str, path: str, route: Route | None
-    ) -> tuple[int, dict[str, object]]:
+    def _dispatch(self, method: str, path: str, route: Route | None) -> DispatchResult:
         if route is not None and route.kind is RouteKind.HEALTH:
             return 200, self._agent().health_payload()
         if path != "/v1" and not path.startswith("/v1/"):
@@ -254,9 +275,7 @@ class WorkspaceAgentRequestHandler(BaseHTTPRequestHandler):
             )
         return self._dispatch_workspace(method, path, route)
 
-    def _dispatch_workspace(
-        self, method: str, path: str, route: Route
-    ) -> tuple[int, dict[str, object]]:
+    def _dispatch_workspace(self, method: str, path: str, route: Route) -> DispatchResult:
         declared_length: int | None = None
         if method in {"POST", "PUT", "PATCH"}:
             declared_length = self._declared_content_length()
@@ -278,6 +297,8 @@ class WorkspaceAgentRequestHandler(BaseHTTPRequestHandler):
                     "missing or invalid Idempotency-Key",
                 )
         try:
+            if route.template == "/v1/workspaces/{workspace_id}/base-samples/{sha256}":
+                return self._dispatch_base_sample(method, path, declared_length)
             if method == "POST" and route.template == "/v1/workspaces/ensure":
                 assert declared_length is not None
                 return self._handle_ensure(declared_length)
@@ -305,6 +326,29 @@ class WorkspaceAgentRequestHandler(BaseHTTPRequestHandler):
         descriptor = self._agent().workspaces.ensure(request)
         status = 201 if descriptor.created else 200
         return status, self._workspace_payload(descriptor)
+
+    def _dispatch_base_sample(
+        self, method: str, path: str, declared_length: int | None
+    ) -> DispatchResult:
+        parts = path.split("/")
+        workspace_id = parts[3]
+        sha256 = parts[5]
+        manager = self._agent().workspaces
+        descriptor = manager.get_workspace(workspace_id)
+        if method == "POST":
+            assert declared_length is not None
+            materialization = samples.materialize_sample(
+                root=manager.root,
+                descriptor=descriptor,
+                sha256=sha256,
+                source=self.rfile,
+                declared_length=declared_length,
+                analysis_gid=self._agent().config.analysis_gid,
+            )
+            status = 200 if materialization.already_present else 201
+            return status, materialization.as_payload()
+        opened = samples.open_sample(root=manager.root, descriptor=descriptor, sha256=sha256)
+        return RawFileResponse(status=200, fd=opened.fd, size=opened.size)
 
     def _read_body(self, declared_length: int) -> bytes:
         try:
@@ -412,6 +456,28 @@ class WorkspaceAgentRequestHandler(BaseHTTPRequestHandler):
         except OSError:
             pass  # the peer vanished; the connection is closed below
         finally:
+            self.close_connection = True
+
+    def _respond_raw(self, response: RawFileResponse, request_id: str, *, head: bool) -> None:
+        try:
+            self.send_response(response.status)
+            self.send_header("Content-Type", response.content_type)
+            self.send_header("Content-Length", str(response.size))
+            self.send_header("Connection", "close")
+            self.send_header(REQUEST_ID_HEADER, request_id)
+            self.end_headers()
+            if not head:
+                remaining = response.size
+                while remaining > 0:
+                    chunk = os.read(response.fd, min(remaining, RAW_BODY_CHUNK_SIZE))
+                    if not chunk:
+                        break  # the entry shrank: Content-Length cannot be honoured
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except OSError:
+            pass  # the peer vanished; the connection is closed below
+        finally:
+            os.close(response.fd)
             self.close_connection = True
 
     def send_error(self, code: int, message: str | None = None, explain: str | None = None) -> None:
