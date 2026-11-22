@@ -37,6 +37,9 @@ EXECUTABLE_BITS = 0o111
 TEMP_FILE_PREFIX = "."
 TEMP_FILE_SUFFIX = ".tmp"
 BASE_SAMPLES_DIRECTORY = "base_samples"
+MAX_KNOWN_REVISIONS = 100
+IDEMPOTENCY_RETENTION_NS = 24 * 60 * 60 * 1_000_000_000
+IDEMPOTENCY_MAX_KEYS = 1000
 
 POLICY_GENERATED: frozenset[str] = frozenset(
     {index.POLICY_GENERATED_IMMUTABLE, index.POLICY_READ_ONLY}
@@ -141,6 +144,32 @@ class FilesPage:
     generation: int
     files: tuple[index.FileState, ...]
     next_page_token: str | None
+
+
+@dataclass(frozen=True)
+class RevisionRecord:
+    """``RevisionV1``: one revision the local projections know about (§4, §6)."""
+
+    revision_id: str
+    path: str
+    sha256: str
+    size: int
+    observed_at: str
+    origin: str
+    task_id: str | None
+    supersedes_revision_id: str | None
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "revision_id": self.revision_id,
+            "path": self.path,
+            "sha256": self.sha256,
+            "size": self.size,
+            "observed_at": self.observed_at,
+            "origin": self.origin,
+            "task_id": self.task_id,
+            "supersedes_revision_id": self.supersedes_revision_id,
+        }
 
 
 @dataclass(frozen=True)
@@ -291,6 +320,25 @@ class WorkspaceScanService:
     ) -> EventsPage:
         return self._scanner(workspace_id).events(after=after, limit=limit, generation=generation)
 
+    def known_revisions(
+        self,
+        workspace_id: str,
+        path: str,
+        *,
+        limit: int = MAX_KNOWN_REVISIONS,
+    ) -> tuple[RevisionRecord, ...]:
+        """Bounded revision history of one path from the local projections."""
+        if limit < 1:
+            raise ValueError("the revision limit must be positive")
+        scanner = self._scanner(workspace_id)
+        with scanner.lock:
+            scanner._scan_if_unloaded_locked()
+            return scanner._known_revisions_locked(path, limit=limit)
+
+    def write_transaction(self, workspace_id: str) -> WorkspaceWriteTransaction:
+        """Hold the per-workspace lock across a CAS decision and its projection update."""
+        return WorkspaceWriteTransaction(self._scanner(workspace_id))
+
     def _scanner(self, workspace_id: str) -> _WorkspaceScanner:
         if workspace.WORKSPACE_ID_PATTERN.fullmatch(workspace_id) is None:
             raise workspace.WorkspaceNotFoundError(workspace_id)
@@ -398,6 +446,240 @@ class _WorkspaceScanner:
                 oldest_retained=sync.log.oldest_retained,
                 resync_required=False,
             )
+
+    # -- API write transactions ---------------------------------------------
+
+    def _begin_transaction_locked(self) -> None:
+        self.lock.acquire()
+        try:
+            self._scan_if_unloaded_locked()
+        except BaseException:
+            self.lock.release()
+            raise
+
+    def _indexed_state_locked(self, path: str) -> index.FileState | None:
+        return self._index.files.get(path)
+
+    def _replay_idempotent_locked(
+        self, key: str, *, now_ns: int
+    ) -> tuple[int, dict[str, object]] | None:
+        entry = self._sync_state.idempotency.get(key)
+        if not isinstance(entry, dict):
+            return None
+        at_ns = entry.get("at_ns")
+        status = entry.get("status")
+        body = entry.get("body")
+        if isinstance(at_ns, bool) or not isinstance(at_ns, int):
+            return None
+        if now_ns - at_ns > IDEMPOTENCY_RETENTION_NS:
+            return None
+        if isinstance(status, bool) or not isinstance(status, int):
+            return None
+        if not isinstance(body, dict):
+            return None
+        return status, {str(key_name): value for key_name, value in body.items()}
+
+    def _remember_idempotent_locked(
+        self, key: str, status: int, body: Mapping[str, object], *, now_ns: int
+    ) -> None:
+        retained: dict[str, object] = {}
+        for existing_key, raw_entry in self._sync_state.idempotency.items():
+            if not isinstance(raw_entry, dict):
+                continue
+            at_ns = raw_entry.get("at_ns")
+            if isinstance(at_ns, bool) or not isinstance(at_ns, int):
+                continue
+            if now_ns - at_ns > IDEMPOTENCY_RETENTION_NS:
+                continue
+            retained[str(existing_key)] = raw_entry
+        retained[key] = {"at_ns": now_ns, "status": status, "body": dict(body)}
+        while len(retained) > IDEMPOTENCY_MAX_KEYS:
+            expired = min(retained, key=lambda name: _idempotency_at_ns(retained[name]))
+            del retained[expired]
+        self._sync_state.idempotency = retained
+        self._dirty = True
+
+    def _record_write_locked(
+        self,
+        *,
+        path: str,
+        sha256: str,
+        size: int,
+        mtime_ns: int,
+        mode: int,
+        dev: int,
+        ino: int,
+        origin: str,
+        task_id: str | None,
+        previous_revision_id: str | None,
+        created: bool,
+        observed_at: str,
+    ) -> RevisionRecord:
+        revision_id = events.revision_id_for(self.workspace_id, path, sha256)
+        state = index.FileState(
+            path=path,
+            revision_id=revision_id,
+            sha256=sha256,
+            size=size,
+            mtime_ns=mtime_ns,
+            mode=mode,
+            origin=origin,
+            observed_at=observed_at,
+            policy_class=index.policy_class_for(path),
+            task_id=task_id,
+        )
+        self._index.files[path] = state
+        self._pending.pop(path, None)
+        self._pending_deletions.pop(path, None)
+        self._inodes[path] = (dev, ino)
+        kind = events.EventKind.FILE_CREATED if created else events.EventKind.FILE_MODIFIED
+        self._sync_state.log.append(
+            event_id=events.event_id_for(
+                self.workspace_id, path, previous_revision_id, revision_id, kind
+            ),
+            kind=kind,
+            path=path,
+            observed_at=observed_at,
+            policy_class=state.policy_class,
+            revision_id=revision_id,
+            previous_revision_id=previous_revision_id,
+            sha256=sha256,
+            size=size,
+            origin=origin,
+            task_id=task_id,
+        )
+        self._dirty = True
+        return RevisionRecord(
+            revision_id=revision_id,
+            path=path,
+            sha256=sha256,
+            size=size,
+            observed_at=observed_at,
+            origin=origin,
+            task_id=task_id,
+            supersedes_revision_id=previous_revision_id,
+        )
+
+    def _record_conflict_locked(
+        self,
+        *,
+        path: str,
+        proposed_sha256: str,
+        proposed_size: int,
+        current_sha256: str | None,
+        conflict_id: str,
+        conflict_path: str,
+        origin: str,
+        task_id: str | None,
+        observed_at: str,
+    ) -> None:
+        state = self._index.files.get(path)
+        if current_sha256 is not None:
+            # The live bytes are authoritative for the transition, even when the
+            # index has not observed a human edit yet.
+            previous_revision_id = events.revision_id_for(self.workspace_id, path, current_sha256)
+        elif state is not None:
+            previous_revision_id = state.revision_id
+        else:
+            previous_revision_id = None
+        revision_id = events.revision_id_for(self.workspace_id, path, proposed_sha256)
+        event_id = events.event_id_for(
+            self.workspace_id,
+            path,
+            previous_revision_id,
+            revision_id,
+            events.EventKind.CONFLICT_CREATED,
+        )
+        # A second key proposing the same bytes against the same current revision
+        # reuses the conflict file; the event is appended once.
+        if not any(existing.event_id == event_id for existing in self._sync_state.log.retained):
+            self._sync_state.log.append(
+                event_id=event_id,
+                kind=events.EventKind.CONFLICT_CREATED,
+                path=path,
+                observed_at=observed_at,
+                policy_class=index.policy_class_for(path),
+                revision_id=revision_id,
+                previous_revision_id=previous_revision_id,
+                sha256=proposed_sha256,
+                size=proposed_size,
+                origin=origin,
+                task_id=task_id,
+            )
+        entry: dict[str, object] = {
+            "conflict_id": conflict_id,
+            "path": path,
+            "conflict_path": conflict_path,
+            "current_sha256": current_sha256,
+            "proposed_sha256": proposed_sha256,
+            "origin": origin,
+            "task_id": task_id,
+            "observed_at": observed_at,
+        }
+        known = any(
+            existing.get("conflict_id") == conflict_id for existing in self._sync_state.conflicts
+        )
+        if not known:
+            self._sync_state.conflicts.append(entry)
+        self._dirty = True
+
+    def _known_revisions_locked(self, path: str, *, limit: int) -> tuple[RevisionRecord, ...]:
+        seen: set[str] = set()
+        records: list[RevisionRecord] = []
+        for event in reversed(self._sync_state.log.retained):
+            if event.path != path or event.revision_id is None:
+                continue
+            if event.sha256 is None or event.size is None:
+                continue
+            if event.revision_id in seen:
+                continue
+            seen.add(event.revision_id)
+            records.append(
+                RevisionRecord(
+                    revision_id=event.revision_id,
+                    path=event.path,
+                    sha256=event.sha256,
+                    size=event.size,
+                    observed_at=event.observed_at,
+                    origin=event.origin,
+                    task_id=event.task_id,
+                    supersedes_revision_id=event.previous_revision_id,
+                )
+            )
+            if len(records) == limit:
+                return tuple(records)
+        state = self._index.files.get(path)
+        if (
+            state is not None
+            and state.revision_id is not None
+            and state.sha256 is not None
+            and state.revision_id not in seen
+        ):
+            records.insert(
+                0,
+                RevisionRecord(
+                    revision_id=state.revision_id,
+                    path=state.path,
+                    sha256=state.sha256,
+                    size=state.size,
+                    observed_at=state.observed_at,
+                    origin=state.origin,
+                    task_id=state.task_id,
+                    supersedes_revision_id=None,
+                ),
+            )
+        return tuple(records[:limit])
+
+    def _flush_locked(self) -> None:
+        workspace_fd = self._open_workspace_directory()
+        try:
+            autowork_fd = self._open_autowork_directory(workspace_fd)
+            try:
+                self._write_projections(autowork_fd)
+            finally:
+                os.close(autowork_fd)
+        finally:
+            os.close(workspace_fd)
 
     @property
     def _index(self) -> index.FileIndex:
@@ -1072,6 +1354,115 @@ class _WorkspaceScanner:
             used_targets.add(target)
             pairs[old_path] = target
         return pairs
+
+
+class WorkspaceWriteTransaction:
+    """One API write holding the per-workspace lock (design §6-§7).
+
+    The caller performs its CAS decision and file publication while the lock is
+    held, records the revision/conflict through this object, and flushes the
+    projections before it responds. All ``*_locked`` scanner calls below assume
+    the lock acquired by ``__enter__``.
+    """
+
+    def __init__(self, scanner: _WorkspaceScanner) -> None:
+        self._scanner = scanner
+
+    def __enter__(self) -> WorkspaceWriteTransaction:
+        self._scanner._begin_transaction_locked()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self._scanner.lock.release()
+
+    def wall_ns(self) -> int:
+        return self._scanner._clock.wall_ns()
+
+    def observed_at(self) -> str:
+        return format_rfc3339_utc(self._scanner._clock.now())
+
+    def replay(self, key: str, *, now_ns: int) -> tuple[int, dict[str, object]] | None:
+        return self._scanner._replay_idempotent_locked(key, now_ns=now_ns)
+
+    def indexed_state(self, path: str) -> index.FileState | None:
+        return self._scanner._indexed_state_locked(path)
+
+    def record(
+        self,
+        *,
+        path: str,
+        sha256: str,
+        size: int,
+        mtime_ns: int,
+        mode: int,
+        dev: int,
+        ino: int,
+        origin: str,
+        task_id: str | None,
+        previous_revision_id: str | None,
+        created: bool,
+        observed_at: str,
+    ) -> RevisionRecord:
+        return self._scanner._record_write_locked(
+            path=path,
+            sha256=sha256,
+            size=size,
+            mtime_ns=mtime_ns,
+            mode=mode,
+            dev=dev,
+            ino=ino,
+            origin=origin,
+            task_id=task_id,
+            previous_revision_id=previous_revision_id,
+            created=created,
+            observed_at=observed_at,
+        )
+
+    def record_conflict(
+        self,
+        *,
+        path: str,
+        proposed_sha256: str,
+        proposed_size: int,
+        current_sha256: str | None,
+        conflict_id: str,
+        conflict_path: str,
+        origin: str,
+        task_id: str | None,
+        observed_at: str,
+    ) -> None:
+        self._scanner._record_conflict_locked(
+            path=path,
+            proposed_sha256=proposed_sha256,
+            proposed_size=proposed_size,
+            current_sha256=current_sha256,
+            conflict_id=conflict_id,
+            conflict_path=conflict_path,
+            origin=origin,
+            task_id=task_id,
+            observed_at=observed_at,
+        )
+
+    def remember(
+        self,
+        key: str,
+        status: int,
+        body: Mapping[str, object],
+        *,
+        now_ns: int,
+    ) -> None:
+        self._scanner._remember_idempotent_locked(key, status, body, now_ns=now_ns)
+
+    def flush(self) -> None:
+        self._scanner._flush_locked()
+
+
+def _idempotency_at_ns(entry: object) -> int:
+    if isinstance(entry, dict):
+        value = entry.get("at_ns")
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return 0
 
 
 def _manifest_text(manifest: Mapping[str, object], field_name: str) -> str:

@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlsplit
 
-from . import paths, protocol, samples, workspace
+from . import files, paths, policies, protocol, samples, workspace
 from .auth import verify_bearer
 
 if TYPE_CHECKING:
@@ -47,6 +47,14 @@ _SCAN_ROUTE_TEMPLATES: frozenset[str] = frozenset(
         "/v1/workspaces/{workspace_id}/snapshot",
         "/v1/workspaces/{workspace_id}/events",
         "/v1/workspaces/{workspace_id}/files",
+    }
+)
+_FILE_ROUTE_TEMPLATES: frozenset[str] = frozenset(
+    {
+        "/v1/workspaces/{workspace_id}/files/content",
+        "/v1/workspaces/{workspace_id}/files/revisions",
+        "/v1/workspaces/{workspace_id}/files",
+        "/v1/workspaces/{workspace_id}/generated",
     }
 )
 
@@ -132,12 +140,18 @@ class Route:
 
 @dataclass(frozen=True)
 class RawFileResponse:
-    """A streamed raw body; the request handler owns and closes ``fd``."""
+    """A raw body, streamed from ``fd`` or carried in ``body``, plus headers.
+
+    The request handler owns and closes ``fd`` when one is supplied; a bounded
+    in-memory body (file content reads) carries its own ETag/observation headers.
+    """
 
     status: int
-    fd: int
+    fd: int | None
     size: int
     content_type: str = "application/octet-stream"
+    body: bytes | None = None
+    headers: tuple[tuple[str, str], ...] = ()
 
 
 DispatchResult = tuple[int, dict[str, object]] | RawFileResponse
@@ -328,6 +342,9 @@ class WorkspaceAgentRequestHandler(BaseHTTPRequestHandler):
         if indexed_response is not None:
             return indexed_response
         try:
+            file_response = self._dispatch_file_routes(method, path, route, declared_length)
+            if file_response is not None:
+                return file_response
             if route.template == "/v1/workspaces/{workspace_id}/base-samples/{sha256}":
                 return self._dispatch_base_sample(method, path, declared_length)
             if method == "POST" and route.template == "/v1/workspaces/ensure":
@@ -481,6 +498,86 @@ class WorkspaceAgentRequestHandler(BaseHTTPRequestHandler):
             raise _RequestRejected(exc.status, exc.code, exc.message, details=exc.details) from exc
         return None
 
+    def _dispatch_file_routes(
+        self, method: str, path: str, route: Route, declared_length: int | None
+    ) -> DispatchResult | None:
+        """Serve the content read, revision list and CAS write surface owned by W4."""
+        if route.template not in _FILE_ROUTE_TEMPLATES:
+            return None
+        workspace_id = _workspace_id_from_path(path)
+        manager = self._agent().workspaces
+        if method == "GET" and route.template == "/v1/workspaces/{workspace_id}/files/content":
+            file_path = self._required_file_path()
+            descriptor = manager.get_workspace(workspace_id)
+            content = files.read_content(root=manager.root, descriptor=descriptor, path=file_path)
+            return RawFileResponse(
+                status=200,
+                fd=None,
+                size=content.size,
+                body=content.body,
+                headers=(
+                    ("ETag", f'"sha256:{content.sha256}"'),
+                    ("X-Autowork-Sha256", content.sha256),
+                    ("X-Autowork-Mtime-Ns", str(content.mtime_ns)),
+                    ("X-Autowork-Size", str(content.size)),
+                ),
+            )
+        if method == "GET" and route.template == "/v1/workspaces/{workspace_id}/files/revisions":
+            file_path = self._required_file_path()
+            manager.get_workspace(workspace_id)
+            revisions = files.read_revisions(
+                scans=self._agent().scans, workspace_id=workspace_id, path=file_path
+            )
+            return 200, {"revisions": [revision.to_wire() for revision in revisions]}
+        if method == "PUT":
+            assert declared_length is not None
+            file_path = self._required_file_path()
+            descriptor = manager.get_workspace(workspace_id)
+            write_route = (
+                policies.WriteRoute.FILES
+                if route.template == "/v1/workspaces/{workspace_id}/files"
+                else policies.WriteRoute.GENERATED
+            )
+            outcome = files.write_file(
+                root=manager.root,
+                descriptor=descriptor,
+                scans=self._agent().scans,
+                route=write_route,
+                path=file_path,
+                expected_sha256=self._single_header(files.EXPECTED_SHA256_HEADER),
+                origin=self._single_header(files.ORIGIN_HEADER),
+                task_id=self._single_header(files.TASK_ID_HEADER),
+                generated_by=self._single_header(files.GENERATED_BY_HEADER),
+                source_sha256=self._single_header(files.SOURCE_SHA256_HEADER),
+                source=self.rfile,
+                declared_length=declared_length,
+                idempotency_key=self.headers.get(protocol.IDEMPOTENCY_KEY_HEADER) or "",
+            )
+            return outcome.status, outcome.body
+        return None
+
+    def _required_file_path(self) -> str:
+        parameters = self._query_parameters({"path"})
+        if "path" not in parameters:
+            raise _RequestRejected(
+                400,
+                protocol.ErrorCode.INVALID_REQUEST,
+                "path query parameter is required",
+                details={"parameter": "path"},
+            )
+        return parameters["path"]
+
+    def _single_header(self, name: str) -> str | None:
+        values = self.headers.get_all(name) or []
+        if len(values) > 1:
+            raise _RequestRejected(
+                400,
+                protocol.ErrorCode.INVALID_REQUEST,
+                "repeated request header",
+                details={"header": name},
+            )
+        return values[0] if values else None
+
     def _scan_full_flag(self, raw: bytes) -> bool:
         if not raw:
             return False
@@ -611,19 +708,25 @@ class WorkspaceAgentRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(response.size))
             self.send_header("Connection", "close")
             self.send_header(REQUEST_ID_HEADER, request_id)
+            for name, value in response.headers:
+                self.send_header(name, value)
             self.end_headers()
             if not head:
-                remaining = response.size
-                while remaining > 0:
-                    chunk = os.read(response.fd, min(remaining, RAW_BODY_CHUNK_SIZE))
-                    if not chunk:
-                        break  # the entry shrank: Content-Length cannot be honoured
-                    self.wfile.write(chunk)
-                    remaining -= len(chunk)
+                if response.body is not None:
+                    self.wfile.write(response.body)
+                elif response.fd is not None:
+                    remaining = response.size
+                    while remaining > 0:
+                        chunk = os.read(response.fd, min(remaining, RAW_BODY_CHUNK_SIZE))
+                        if not chunk:
+                            break  # the entry shrank: Content-Length cannot be honoured
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
         except OSError:
             pass  # the peer vanished; the connection is closed below
         finally:
-            os.close(response.fd)
+            if response.fd is not None:
+                os.close(response.fd)
             self.close_connection = True
 
     def send_error(self, code: int, message: str | None = None, explain: str | None = None) -> None:
