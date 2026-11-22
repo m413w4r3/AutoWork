@@ -44,7 +44,10 @@ import {
   taskActionLabel,
   type TaskActionId,
 } from "./taskActions";
-import { OpenSessionAction } from "./OpenSessionAction";
+import {
+  OpenSessionAction,
+  type OpenSessionFeedback,
+} from "./OpenSessionAction";
 import { sessionLaunchTarget } from "./sessionLaunch";
 
 type TransferDestination = "human" | "codex_cli" | "claude_code";
@@ -145,6 +148,17 @@ export function TaskCard({
   function finish(text: string) {
     setMessage(text);
     setErrorMessage(null);
+  }
+
+  // The opening action disappears once the session exists or the task is
+  // `running`; its feedback stays on this card, which survives both refetches.
+  function showOpenSessionFeedback(feedback: OpenSessionFeedback) {
+    if (feedback.kind === "success") {
+      finish(feedback.text);
+      return;
+    }
+    setMessage(null);
+    setErrorMessage(feedback.text);
   }
 
   function handleMutationError(error: unknown) {
@@ -499,6 +513,7 @@ export function TaskCard({
           <OpenSessionAction
             investigationId={investigationId}
             target={launchTarget}
+            onFeedback={showOpenSessionFeedback}
           />
         </div>
       )}

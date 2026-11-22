@@ -240,6 +240,58 @@ describe("TaskCard session launch", () => {
     expect(await screen.findByText(/session ouverte/)).toBeInTheDocument();
   });
 
+  it("garde le message d’ouverture quand la tâche passe en cours", async () => {
+    const user = userEvent.setup();
+    installFetch(({ url, init }) => {
+      const method = init?.method ?? "GET";
+      if (url.includes("/agent-sessions/capabilities")) {
+        return jsonResponse(sessionCapabilities());
+      }
+      if (url.endsWith("/agent-sessions") && method === "POST") {
+        return jsonResponse({ session: makeSession() });
+      }
+      return errorResponse(500, "unexpected_request");
+    });
+
+    const assigned = assignedOperatorTask();
+    const { rerender } = renderCard(assigned);
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Ouvrir la session Codex CLI",
+      }),
+    );
+    expect(
+      await screen.findByText(/session ouverte ; la tâche passe en cours/),
+    ).toBeInTheDocument();
+
+    // The refetch that follows the opening turns the task `running` and
+    // exposes its session. The opening action unmounts; its feedback must stay
+    // on the card, which survives the refetch.
+    const running = makeTask({
+      status: "running",
+      status_version: assigned.status_version + 1,
+      assigned_actor_kind: "operator",
+      assigned_actor_id: "operator:codex_cli",
+      handoff_ref: HANDOFF_ID,
+    });
+    rerender(
+      <TaskCard
+        investigationId={INVESTIGATION_ID}
+        task={running}
+        allTasks={[running]}
+        sessions={[makeSession()]}
+        workspaceAvailable={true}
+      />,
+    );
+
+    expect(
+      screen.getByText(/session ouverte ; la tâche passe en cours/),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Ouvrir la session Codex CLI" }),
+    ).toBeNull();
+  });
+
   it("hides the action with the typed reason when the host probe fails", async () => {
     installFetch(({ url }) =>
       url.includes("/agent-sessions/capabilities")

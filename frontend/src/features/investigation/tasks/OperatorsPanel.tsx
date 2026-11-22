@@ -33,7 +33,10 @@ import {
   TASK_STATUS_LABELS,
   VERIFICATION_LABELS,
 } from "./labels";
-import { OpenSessionAction } from "./OpenSessionAction";
+import {
+  OpenSessionAction,
+  type OpenSessionFeedback,
+} from "./OpenSessionAction";
 import { sessionLaunchTarget, type SessionLaunchTarget } from "./sessionLaunch";
 import {
   ACTIVE_SESSION_STATES,
@@ -359,6 +362,11 @@ export function OperatorsPanel({
 }) {
   const sessions = useAgentSessions(investigationId);
   const tasks = useTasks(investigationId);
+  // A successful opening removes the task from "sans session" and mounts the
+  // session row, so the feedback is kept here, outside that disappearing list.
+  const [openFeedback, setOpenFeedback] = useState<OpenSessionFeedback | null>(
+    null,
+  );
   const taskById = new Map<string, TaskView>(
     (tasks.data?.items ?? []).map((task) => [task.id, task]),
   );
@@ -397,6 +405,17 @@ export function OperatorsPanel({
         déduit d’un adaptateur présumé.
       </p>
 
+      {openFeedback?.kind === "success" ? (
+        <p role="status" className="m24-message">
+          {openFeedback.text}
+        </p>
+      ) : null}
+      {openFeedback?.kind === "error" ? (
+        <p role="alert" className="error-message">
+          {openFeedback.text}
+        </p>
+      ) : null}
+
       {openable.length === 0 ? null : (
         <section aria-labelledby="m24-operators-pending">
           <h4 id="m24-operators-pending">
@@ -419,6 +438,12 @@ export function OperatorsPanel({
                 <OpenSessionAction
                   investigationId={investigationId}
                   target={target}
+                  onFeedback={(feedback) =>
+                    setOpenFeedback({
+                      ...feedback,
+                      text: `${task.title} — ${feedback.text}`,
+                    })
+                  }
                 />
               </li>
             ))}
