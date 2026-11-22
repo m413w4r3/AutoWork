@@ -1,0 +1,1 @@
+export { OpinionNotesView } from "./OpinionNotesView";
