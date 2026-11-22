@@ -66,7 +66,7 @@ from tests.integration.edition_codes import reserve_edition_code
 pytestmark = pytest.mark.integration
 
 PREVIOUS = "0019_workspace_bindings"
-HEAD = "0022_investigation_handoffs"
+HEAD = "0023_agent_sessions"
 PLAN_TABLES = {"investigation_plans", "investigation_plan_versions"}
 NOW = datetime(2026, 11, 22, 12, 0, tzinfo=UTC)
 SHA_A = "a" * 64

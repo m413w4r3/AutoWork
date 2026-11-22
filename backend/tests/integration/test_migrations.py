@@ -45,6 +45,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     Integer,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -52,7 +53,7 @@ from sqlalchemy import (
     inspect,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import BYTEA, JSONB
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -429,6 +430,8 @@ def _type_category(sa_type: Any) -> str:
         return f"array<{_type_category(sa_type.item_type)}>"
     if isinstance(sa_type, JSONB):
         return "jsonb"
+    if isinstance(sa_type, (LargeBinary, BYTEA)):
+        return "bytea"
     if isinstance(sa_type, Uuid):
         return "uuid"
     if isinstance(sa_type, DateTime):
@@ -1238,7 +1241,7 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     command.upgrade(config, "head")
     command.current(config)
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert _head_revision() == "0022_investigation_handoffs"
+    assert _head_revision() == "0023_agent_sessions"
     assert asyncio.run(_alembic_version_column_length(temporary_postgres_url)) == 64
 
     collection_attempt_columns = asyncio.run(
@@ -1606,7 +1609,7 @@ def test_frozen_collection_attempt_baseline_precedes_acquisition_additions(
 
     command.upgrade(config, "head")
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert _head_revision() == "0022_investigation_handoffs"
+    assert _head_revision() == "0023_agent_sessions"
     final_schema = asyncio.run(_database_snapshot(temporary_postgres_url))["collection_attempts"]
     table = Base.metadata.tables["collection_attempts"]
     assert final_schema["columns"] == _expected_columns(table)
@@ -1842,6 +1845,8 @@ def test_migration_up_and_down_on_temporary_postgres(temporary_postgres_url: str
             "investigation_task_dependencies",
             "investigation_task_events",
             "investigation_handoffs",
+            "agent_sessions",
+            "agent_session_instructions",
         }
     )
     at_0004 = asyncio.run(_database_snapshot(temporary_postgres_url))

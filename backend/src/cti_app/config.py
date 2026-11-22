@@ -68,6 +68,20 @@ class Settings(BaseSettings):
     api_bind_host: str = "127.0.0.1"
     operator_api_token: SecretStr | None = None
     operator_client_api_token: SecretStr | None = None
+    # M24-05B1/D7: 32-byte server key that derives each agent-session secret
+    # from the stored nonce.  Absent means agent sessions are fail-closed (503).
+    m24_agent_session_key: SecretStr | None = None
+
+    @field_validator("m24_agent_session_key")
+    @classmethod
+    def _validate_m24_agent_session_key(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None:
+            return None
+        raw = value.get_secret_value()
+        if len(raw.encode("utf-8")) != 32:
+            raise ValueError("M24_AGENT_SESSION_KEY must be exactly 32 bytes (32 ASCII characters)")
+        return value
+
     log_level: str = "INFO"
     postgres_dsn: str = "postgresql+asyncpg://cti_app:local-postgres-only@postgres:5432/cti_app"
     redis_url: str = "redis://redis:6379/0"

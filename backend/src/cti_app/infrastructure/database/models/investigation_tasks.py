@@ -208,7 +208,18 @@ class InvestigationTaskRow(Base):
     assigned_actor_kind: Mapped[str | None] = mapped_column(String(16), nullable=True)
     assigned_actor_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     lease_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
-    lease_session_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    # The foreign key to ``agent_sessions`` is added by 0023: the session table
+    # does not exist yet when 0021 runs.
+    lease_session_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey(
+            "agent_sessions.id",
+            name="fk_investigation_tasks_lease_session",
+            ondelete="RESTRICT",
+            use_alter=True,
+        ),
+        nullable=True,
+    )
     lease_fence: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
     lease_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True

@@ -55,6 +55,12 @@ EXPECTED_REPOSITORIES = {
         ports.InMemoryInvestigationHandoffRepository,
         uow_module.SqlAlchemyInvestigationHandoffRepository,
     ),
+    # Lot 05B1 follows 05A in the total migration order.
+    "agent_sessions": (
+        ports.AgentSessionRepository,
+        ports.InMemoryAgentSessionRepository,
+        uow_module.SqlAlchemyAgentSessionRepository,
+    ),
 }
 
 

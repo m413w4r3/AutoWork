@@ -7,6 +7,7 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from cti_app.infrastructure.database.models import (  # noqa: F401
+    agent_sessions,
     bridge_generation_slots,
     collection,
     core,
@@ -103,10 +104,13 @@ _INVESTIGATION_TASK_TABLES = frozenset(
     }
 )
 _INVESTIGATION_HANDOFF_TABLES = frozenset({"investigation_handoffs"})
+_AGENT_SESSION_TABLES = frozenset({"agent_sessions", "agent_session_instructions"})
 _TOOL_INVOCATION_ATTRIBUTION_COLUMNS = frozenset({"task_id", "actor_kind", "actor_id"})
 _TOOL_INVOCATION_ATTRIBUTION_CHECKS = frozenset(
     {"ck_tool_invocations_actor_kind", "ck_tool_invocations_actor_pair"}
 )
+_TOOL_INVOCATION_AGENT_SESSION_COLUMNS = frozenset({"agent_session_id"})
+_TOOL_INVOCATION_AGENT_SESSION_CHECKS = frozenset({"ck_tool_invocations_agent_session_pair"})
 _PROSE_AUTHORITY_COLUMN = "prose_authority"
 _PROSE_AUTHORITY_CHECK = "ck_analyst_investigation_prose_authority"
 _BASELINE_DECISION_TYPE_VALUES = (
@@ -171,6 +175,7 @@ def _metadata_for_frozen_baseline() -> MetaData:
             or source_table.name in _INVESTIGATION_PLAN_TABLES
             or source_table.name in _INVESTIGATION_TASK_TABLES
             or source_table.name in _INVESTIGATION_HANDOFF_TABLES
+            or source_table.name in _AGENT_SESSION_TABLES
         ):
             continue
         table = source_table.to_metadata(metadata)
@@ -288,21 +293,38 @@ def _metadata_for_frozen_baseline() -> MetaData:
                 table._columns.remove(table.c[_PROSE_AUTHORITY_COLUMN])
         if table.name == "tool_invocations":
             # 0021 adds execution attribution; the frozen 0001 shape predates it.
+            # 0023 adds the agent-session attribution pair for the same reason.
             for constraint in tuple(table.constraints):
-                if constraint.name in _TOOL_INVOCATION_ATTRIBUTION_CHECKS or any(
-                    column.name in _TOOL_INVOCATION_ATTRIBUTION_COLUMNS
-                    for column in getattr(constraint, "columns", ())
+                if (
+                    constraint.name
+                    in _TOOL_INVOCATION_ATTRIBUTION_CHECKS | _TOOL_INVOCATION_AGENT_SESSION_CHECKS
+                    or any(
+                        column.name
+                        in _TOOL_INVOCATION_ATTRIBUTION_COLUMNS
+                        | _TOOL_INVOCATION_AGENT_SESSION_COLUMNS
+                        for column in getattr(constraint, "columns", ())
+                    )
                 ):
                     table.constraints.discard(constraint)
             for foreign_key in tuple(table.foreign_keys):
                 if (
                     foreign_key.parent is not None
-                    and foreign_key.parent.name in _TOOL_INVOCATION_ATTRIBUTION_COLUMNS
+                    and foreign_key.parent.name
+                    in _TOOL_INVOCATION_ATTRIBUTION_COLUMNS | _TOOL_INVOCATION_AGENT_SESSION_COLUMNS
                 ):
                     table.foreign_keys.discard(foreign_key)
                     if foreign_key.constraint is not None:
                         table.constraints.discard(foreign_key.constraint)
-            for column_name in _TOOL_INVOCATION_ATTRIBUTION_COLUMNS:
+            for index in tuple(table.indexes):
+                if any(
+                    column.name
+                    in _TOOL_INVOCATION_ATTRIBUTION_COLUMNS | _TOOL_INVOCATION_AGENT_SESSION_COLUMNS
+                    for column in index.columns
+                ):
+                    table.indexes.discard(index)
+            for column_name in (
+                _TOOL_INVOCATION_ATTRIBUTION_COLUMNS | _TOOL_INVOCATION_AGENT_SESSION_COLUMNS
+            ):
                 if column_name in table.c:
                     table._columns.remove(table.c[column_name])
         if table.name == "analyst_decisions":

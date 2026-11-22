@@ -35,6 +35,13 @@ from cti_app.application.investigation_tasks import (
     TaskSessionOutcome,
     TaskSessionPort,
 )
+from cti_app.domain.agentic_operator import (
+    AgentSessionState,
+    AgentSessionV1,
+    OperatorAdapterKind,
+    OperatorCapabilitiesV1,
+    OperatorProbeCommand,
+)
 from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition
 from cti_app.domain.editorial import AnalystDecisionTargetType, AnalystDecisionType
@@ -139,6 +146,58 @@ async def _seed_investigation(
     return investigation
 
 
+SHA_A = "a" * 64
+
+
+async def _create_agent_session(
+    session_factory: async_sessionmaker[AsyncSession],
+    investigation_id: UUID,
+    task_id: UUID,
+    session_id: UUID,
+) -> AgentSessionV1:
+    """0023's task lease FK requires a real session row for the fixture lease."""
+    capabilities = OperatorCapabilitiesV1(
+        adapter_kind=OperatorAdapterKind.CODEX_CLI,
+        executable="/usr/local/bin/codex",
+        version="codex-cli 1.2.3",
+        modes=("exec",),
+        supports_resume=True,
+        permission_modes=("workspace-write",),
+        probed_at=NOW,
+        probes=(
+            OperatorProbeCommand(
+                argv=("/usr/local/bin/codex", "--help"),
+                exit_code=0,
+                stdout_sha256=SHA_A,
+                advertised_modes=("exec", "workspace-write"),
+            ),
+        ),
+    )
+    session = AgentSessionV1(
+        id=session_id,
+        investigation_id=investigation_id,
+        task_id=task_id,
+        adapter_kind=OperatorAdapterKind.CODEX_CLI,
+        state=AgentSessionState.RUNNING,
+        state_version=1,
+        capability_probe=capabilities.to_payload(),
+        capability_sha256=capabilities.capability_sha256,
+        probed_at=capabilities.probed_at,
+        auth_secret_nonce=b"n" * 32,
+        auth_secret_hash=SHA_A,
+        auth_secret_issued_at=NOW,
+        opened_at=NOW,
+        idempotency_key=f"engine-session-{session_id}",
+        created_at=NOW,
+        updated_at=NOW,
+        host_session_ref=f"host-{session_id}",
+    )
+    async with SqlAlchemyUnitOfWork(session_factory) as uow:
+        stored, _created = await uow.agent_sessions.add(session)
+        await uow.commit()
+    return stored
+
+
 async def _create_task(
     session_factory: async_sessionmaker[AsyncSession],
     investigation_id: UUID,
@@ -171,18 +230,38 @@ async def _create_task(
         "assigned_actor_kind": assigned_actor_kind,
         "assigned_actor_id": assigned_actor_id,
     }
-    if lease:
-        values.update(
-            lease_id=uuid4(),
-            lease_session_id=lease_session_id or uuid4(),
-            lease_fence=1,
-            lease_expires_at=NOW + timedelta(seconds=180),
-            heartbeat_at=NOW,
-        )
     task = InvestigationTaskV1(**values)
     async with SqlAlchemyUnitOfWork(session_factory) as uow:
         created = await uow.investigation_tasks.add(task)
         await uow.commit()
+    if lease:
+        # 0023 adds ``fk_investigation_tasks_lease_session``: the session row
+        # must exist before the task can name it.  The task is inserted
+        # operator-assigned and RUNNING without a lease, then the fixture lease
+        # is set once the session exists, keeping status_version at 1.
+        session_id = lease_session_id or uuid4()
+        await _create_agent_session(session_factory, investigation_id, created.id, session_id)
+        async with session_factory() as session:
+            await session.execute(
+                sa.text(
+                    "UPDATE investigation_tasks SET lease_id = :lease_id, "
+                    "lease_session_id = :session_id, lease_fence = 1, "
+                    "lease_expires_at = :expires_at, heartbeat_at = :heartbeat "
+                    "WHERE id = :task_id"
+                ),
+                {
+                    "lease_id": uuid4(),
+                    "session_id": session_id,
+                    "expires_at": NOW + timedelta(seconds=180),
+                    "heartbeat": NOW,
+                    "task_id": created.id,
+                },
+            )
+            await session.commit()
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            refreshed = await uow.investigation_tasks.get(created.id)
+        assert refreshed is not None
+        return refreshed
     return created
 
 

@@ -23,6 +23,14 @@ from cti_app.application.context_pagination import (
     order_keyset_items,
 )
 from cti_app.application.investigation_task_events import TaskEvent
+from cti_app.domain.agentic_operator import (
+    ACTIVE_AGENT_SESSION_STATES,
+    SESSION_STATE_TRANSITIONS,
+    AgentSessionInstructionV1,
+    AgentSessionState,
+    AgentSessionV1,
+    InstructionState,
+)
 from cti_app.domain.analyst_opinion import AnalystOpinionV1, validate_analyst_opinion_rebase
 from cti_app.domain.investigation import (
     DetectionCandidateVersion,
@@ -446,6 +454,69 @@ class InvestigationHandoffRepository(Protocol):
     ) -> tuple[HandoffRecord, ...]: ...
 
     async def append_if_absent(self, record: HandoffRecord) -> tuple[HandoffRecord, bool]: ...
+
+
+class AgentSessionRepository(Protocol):
+    """Durable technical sessions and their persisted instruction queue (D7).
+
+    ``add`` is the partial-unique race guard: one active session per task and
+    one ``(task_id, idempotency_key)`` row.  ``update_state`` is the
+    ``state_version`` CAS.  ``is_active_session``/``close_session`` are the
+    narrow seam lot 04B2's engine consumes as ``TaskSessionPort``.
+    """
+
+    async def get(self, session_id: UUID) -> AgentSessionV1 | None: ...
+
+    async def get_by_idempotency(
+        self, task_id: UUID, idempotency_key: str
+    ) -> AgentSessionV1 | None: ...
+
+    async def list_for_investigation(
+        self, investigation_id: UUID, *, task_id: UUID | None = None
+    ) -> tuple[AgentSessionV1, ...]: ...
+
+    async def list_for_task(self, task_id: UUID) -> tuple[AgentSessionV1, ...]: ...
+
+    async def add(self, session: AgentSessionV1) -> tuple[AgentSessionV1, bool]: ...
+
+    async def update_state(
+        self, session: AgentSessionV1, *, expected_state_version: int
+    ) -> AgentSessionV1 | None: ...
+
+    async def is_active_session(
+        self, *, session_id: UUID, investigation_id: UUID, task_id: UUID
+    ) -> bool: ...
+
+    async def close_session(
+        self,
+        *,
+        session_id: UUID,
+        investigation_id: UUID,
+        task_id: UUID,
+        outcome: str,
+        reason: str,
+    ) -> None: ...
+
+    async def add_instruction(
+        self, instruction: AgentSessionInstructionV1
+    ) -> tuple[AgentSessionInstructionV1, bool]: ...
+
+    async def get_instruction(self, instruction_id: UUID) -> AgentSessionInstructionV1 | None: ...
+
+    async def get_instruction_by_idempotency(
+        self, session_id: UUID, idempotency_key: str
+    ) -> AgentSessionInstructionV1 | None: ...
+
+    async def list_instructions(
+        self, session_id: UUID
+    ) -> tuple[AgentSessionInstructionV1, ...]: ...
+
+    async def update_instruction(
+        self,
+        instruction: AgentSessionInstructionV1,
+        *,
+        expected_state: InstructionState,
+    ) -> AgentSessionInstructionV1 | None: ...
 
 
 def _copy_budget(budget: InvestigationBudget) -> InvestigationBudget:
@@ -1515,12 +1586,210 @@ class InMemoryInvestigationHandoffRepository:
             return record, True
 
 
+class InMemoryAgentSessionRepository:
+    """In-memory port fake sharing the SQL repository's observable rules.
+
+    It enforces the two D2 uniqueness rules (one active session per task, one
+    idempotency key per task) and the instruction queue's idempotency, so the
+    service tests race the same invariants the database enforces.
+    """
+
+    def __init__(self) -> None:
+        self._sessions: dict[UUID, AgentSessionV1] = {}
+        self._instructions: dict[UUID, AgentSessionInstructionV1] = {}
+        self._lock = asyncio.Lock()
+
+    async def get(self, session_id: UUID) -> AgentSessionV1 | None:
+        return self._sessions.get(session_id)
+
+    async def get_by_idempotency(
+        self, task_id: UUID, idempotency_key: str
+    ) -> AgentSessionV1 | None:
+        return next(
+            (
+                session
+                for session in self._sessions.values()
+                if session.task_id == task_id and session.idempotency_key == idempotency_key
+            ),
+            None,
+        )
+
+    async def list_for_investigation(
+        self, investigation_id: UUID, *, task_id: UUID | None = None
+    ) -> tuple[AgentSessionV1, ...]:
+        return tuple(
+            sorted(
+                (
+                    session
+                    for session in self._sessions.values()
+                    if session.investigation_id == investigation_id
+                    and (task_id is None or session.task_id == task_id)
+                ),
+                key=lambda session: (session.created_at, str(session.id)),
+            )
+        )
+
+    async def list_for_task(self, task_id: UUID) -> tuple[AgentSessionV1, ...]:
+        return tuple(
+            sorted(
+                (session for session in self._sessions.values() if session.task_id == task_id),
+                key=lambda session: (session.created_at, str(session.id)),
+            )
+        )
+
+    async def add(self, session: AgentSessionV1) -> tuple[AgentSessionV1, bool]:
+        async with self._lock:
+            for existing in self._sessions.values():
+                if (
+                    existing.task_id == session.task_id
+                    and existing.idempotency_key == session.idempotency_key
+                ):
+                    if (
+                        existing.adapter_kind is not session.adapter_kind
+                        or existing.handoff_id != session.handoff_id
+                        or existing.capability_sha256 != session.capability_sha256
+                    ):
+                        raise VersionConflictError(
+                            "Agent session idempotency key records a different request"
+                        )
+                    return existing, False
+                if existing.task_id == session.task_id and existing.is_active and session.is_active:
+                    raise VersionConflictError("The task already has an active agent session")
+                if (
+                    session.host_session_ref is not None
+                    and existing.host_session_ref == session.host_session_ref
+                ):
+                    raise VersionConflictError("The host session reference is already used")
+            if session.id in self._sessions:
+                raise VersionConflictError("Agent session id is already used")
+            self._sessions[session.id] = session
+            return session, True
+
+    async def update_state(
+        self, session: AgentSessionV1, *, expected_state_version: int
+    ) -> AgentSessionV1 | None:
+        if session.state_version != expected_state_version + 1:
+            raise ValueError("A session update increments state_version exactly once")
+        async with self._lock:
+            current = self._sessions.get(session.id)
+            if current is None or current.state_version != expected_state_version:
+                return None
+            self._sessions[session.id] = session
+            return session
+
+    async def is_active_session(
+        self, *, session_id: UUID, investigation_id: UUID, task_id: UUID
+    ) -> bool:
+        session = self._sessions.get(session_id)
+        return (
+            session is not None
+            and session.investigation_id == investigation_id
+            and session.task_id == task_id
+            and session.state in ACTIVE_AGENT_SESSION_STATES
+        )
+
+    async def close_session(
+        self,
+        *,
+        session_id: UUID,
+        investigation_id: UUID,
+        task_id: UUID,
+        outcome: str,
+        reason: str,
+    ) -> None:
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if (
+                session is None
+                or session.investigation_id != investigation_id
+                or session.task_id != task_id
+            ):
+                raise VersionConflictError("The task lease names no bound agent session")
+            if session.is_terminal or session.state is AgentSessionState.LOST:
+                return
+            target = AgentSessionState.CLOSED if outcome == "closed" else AgentSessionState.LOST
+            if target not in SESSION_STATE_TRANSITIONS[session.state]:
+                self._sessions[session_id] = replace(
+                    session,
+                    state=AgentSessionState.LOST,
+                    state_version=session.state_version + 1,
+                    close_reason=reason,
+                    updated_at=session.updated_at,
+                )
+                return
+            self._sessions[session_id] = session.with_state(
+                target, now=session.updated_at, close_reason=reason
+            )
+
+    async def add_instruction(
+        self, instruction: AgentSessionInstructionV1
+    ) -> tuple[AgentSessionInstructionV1, bool]:
+        async with self._lock:
+            for existing in self._instructions.values():
+                if (
+                    existing.session_id == instruction.session_id
+                    and existing.idempotency_key == instruction.idempotency_key
+                ):
+                    if existing.text_sha256 != instruction.text_sha256:
+                        raise VersionConflictError(
+                            "Instruction idempotency key records a different body"
+                        )
+                    return existing, False
+            if instruction.id in self._instructions:
+                raise VersionConflictError("Instruction id is already used")
+            self._instructions[instruction.id] = instruction
+            return instruction, True
+
+    async def get_instruction(self, instruction_id: UUID) -> AgentSessionInstructionV1 | None:
+        return self._instructions.get(instruction_id)
+
+    async def get_instruction_by_idempotency(
+        self, session_id: UUID, idempotency_key: str
+    ) -> AgentSessionInstructionV1 | None:
+        return next(
+            (
+                instruction
+                for instruction in self._instructions.values()
+                if instruction.session_id == session_id
+                and instruction.idempotency_key == idempotency_key
+            ),
+            None,
+        )
+
+    async def list_instructions(self, session_id: UUID) -> tuple[AgentSessionInstructionV1, ...]:
+        return tuple(
+            sorted(
+                (
+                    instruction
+                    for instruction in self._instructions.values()
+                    if instruction.session_id == session_id
+                ),
+                key=lambda instruction: (instruction.queued_at, str(instruction.id)),
+            )
+        )
+
+    async def update_instruction(
+        self,
+        instruction: AgentSessionInstructionV1,
+        *,
+        expected_state: InstructionState,
+    ) -> AgentSessionInstructionV1 | None:
+        async with self._lock:
+            current = self._instructions.get(instruction.id)
+            if current is None or current.state is not expected_state:
+                return None
+            self._instructions[instruction.id] = instruction
+            return instruction
+
+
 __all__ = [
+    "AgentSessionRepository",
     "AnalystOpinionRepository",
     "DetectionCandidateRepository",
     "EvidenceObservationRepository",
     "FindingRepository",
     "HandoffRecord",
+    "InMemoryAgentSessionRepository",
     "InMemoryAnalystOpinionRepository",
     "InMemoryDetectionCandidateRepository",
     "InMemoryEvidenceObservationRepository",

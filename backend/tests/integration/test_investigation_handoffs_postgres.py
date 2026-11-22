@@ -51,7 +51,7 @@ from tests.integration.edition_codes import reserve_edition_code
 pytestmark = pytest.mark.integration
 
 PREVIOUS = "0021_investigation_tasks"
-HEAD = "0022_investigation_handoffs"
+HEAD = "0023_agent_sessions"
 HANDOFF_TABLE = "investigation_handoffs"
 NOW = datetime(2026, 11, 22, 12, 0, tzinfo=UTC)
 HUMAN_ACTOR = HandoffActor(kind=HandoffActorKind.HUMAN, actor_id="analyst:test")
@@ -262,14 +262,16 @@ def test_handoff_versions_are_append_only_and_idempotent(
 
     assert asyncio.run(attempt(f"UPDATE {HANDOFF_TABLE} SET version = version + 1")) == "55000"
     assert asyncio.run(attempt(f"DELETE FROM {HANDOFF_TABLE}")) == "55000"
-    # ``investigation_tasks.handoff_ref`` makes PostgreSQL refuse a bare
-    # TRUNCATE before the trigger is even reached (0A000).  Drop the foreign
-    # key inside the failing transaction to exercise the installed
-    # BEFORE TRUNCATE guard itself; the rollback restores the key.
+    # ``investigation_tasks.handoff_ref`` and ``agent_sessions.handoff_id``
+    # make PostgreSQL refuse a bare TRUNCATE before the trigger is even
+    # reached (0A000).  Drop both foreign keys inside the failing transaction
+    # to exercise the installed BEFORE TRUNCATE guard itself; the rollback
+    # restores them.
     assert (
         asyncio.run(
             attempt(
                 "ALTER TABLE investigation_tasks DROP CONSTRAINT fk_investigation_tasks_handoff",
+                "ALTER TABLE agent_sessions DROP CONSTRAINT fk_agent_sessions_handoff",
                 f"TRUNCATE {HANDOFF_TABLE}",
             )
         )
@@ -309,6 +311,10 @@ def test_handoff_migration_rejects_a_partial_shape(
                         "ALTER TABLE investigation_tasks "
                         "DROP CONSTRAINT fk_investigation_tasks_handoff"
                     )
+                )
+                # 0023 adds this second reference to the handoff table.
+                await connection.execute(
+                    sa.text("ALTER TABLE agent_sessions DROP CONSTRAINT fk_agent_sessions_handoff")
                 )
                 await connection.execute(sa.text(f"DROP TABLE {HANDOFF_TABLE}"))
         finally:
