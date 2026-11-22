@@ -21,7 +21,7 @@ from enum import StrEnum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from . import paths, protocol, samples, workspace
 from .auth import verify_bearer
@@ -41,6 +41,14 @@ RAW_BODY_CHUNK_SIZE = 1024 * 1024
 _WS = "/v1/workspaces"
 _WID = r"ws-[0-9a-f]{32}"
 _SHA256 = r"[0-9a-f]{64}"
+_SCAN_ROUTE_TEMPLATES: frozenset[str] = frozenset(
+    {
+        "/v1/workspaces/{workspace_id}/scan",
+        "/v1/workspaces/{workspace_id}/snapshot",
+        "/v1/workspaces/{workspace_id}/events",
+        "/v1/workspaces/{workspace_id}/files",
+    }
+)
 
 # method, path pattern, route template, request body limit (None = no body)
 _WORKSPACE_ROUTES: tuple[tuple[str, str, str, int | None], ...] = (
@@ -175,6 +183,26 @@ def match_route(method: str, path: str) -> Route | None:
     return None
 
 
+def _workspace_id_from_path(path: str) -> str:
+    """Extract the workspace id of a matched ``/v1/workspaces/{wid}/…`` route."""
+    return path.split("/")[3]
+
+
+def _optional_int(parameters: Mapping[str, str], name: str) -> int | None:
+    text = parameters.get(name)
+    if text is None:
+        return None
+    try:
+        return int(text, 10)
+    except ValueError as exc:
+        raise _RequestRejected(
+            400,
+            protocol.ErrorCode.INVALID_REQUEST,
+            "query parameter must be an integer",
+            details={"parameter": name},
+        ) from exc
+
+
 class WorkspaceAgentRequestHandler(BaseHTTPRequestHandler):
     protocol_version = protocol.HTTP_VERSION
     server_version = "AutoWorkWorkspaceAgent/1"
@@ -296,6 +324,9 @@ class WorkspaceAgentRequestHandler(BaseHTTPRequestHandler):
                     protocol.ErrorCode.INVALID_REQUEST,
                     "missing or invalid Idempotency-Key",
                 )
+        indexed_response = self._dispatch_scan_routes(method, path, route, declared_length)
+        if indexed_response is not None:
+            return indexed_response
         try:
             if route.template == "/v1/workspaces/{workspace_id}/base-samples/{sha256}":
                 return self._dispatch_base_sample(method, path, declared_length)
@@ -385,6 +416,121 @@ class WorkspaceAgentRequestHandler(BaseHTTPRequestHandler):
                 for summary in self._agent().workspaces.list_workspaces()
             ]
         }
+
+    def _dispatch_scan_routes(
+        self, method: str, path: str, route: Route, declared_length: int | None
+    ) -> tuple[int, dict[str, object]] | None:
+        """Serve the scan/snapshot/events/files-list surface owned by W3."""
+        if route.template not in _SCAN_ROUTE_TEMPLATES:
+            return None
+        service = self._agent().scans
+        try:
+            workspace_id = _workspace_id_from_path(path)
+            if method == "POST" and route.template == "/v1/workspaces/{workspace_id}/scan":
+                assert declared_length is not None
+                full = self._scan_full_flag(self._read_body(declared_length))
+                result = service.scan(workspace_id, full=full)
+                return 200, {
+                    "generation": result.generation,
+                    "latest_cursor": result.latest_cursor,
+                    "emitted": result.emitted,
+                    "policy_violations": result.policy_violations,
+                }
+            if method == "GET" and route.template == "/v1/workspaces/{workspace_id}/snapshot":
+                parameters = self._query_parameters({"page_token", "limit"})
+                page = service.snapshot(
+                    workspace_id,
+                    page_token=parameters.get("page_token"),
+                    limit=_optional_int(parameters, "limit"),
+                )
+                return 200, {
+                    "generation": page.generation,
+                    "files": [state.to_wire() for state in page.files],
+                    "next_page_token": page.next_page_token,
+                }
+            if method == "GET" and route.template == "/v1/workspaces/{workspace_id}/events":
+                parameters = self._query_parameters({"after", "limit", "generation"})
+                after = _optional_int(parameters, "after")
+                events_page = service.events(
+                    workspace_id,
+                    after=0 if after is None else after,
+                    limit=_optional_int(parameters, "limit"),
+                    generation=_optional_int(parameters, "generation"),
+                )
+                return 200, {
+                    "generation": events_page.generation,
+                    "events": [event.to_wire() for event in events_page.events],
+                    "next_cursor": events_page.next_cursor,
+                    "oldest_retained": events_page.oldest_retained,
+                    "resync_required": events_page.resync_required,
+                }
+            if method == "GET" and route.template == "/v1/workspaces/{workspace_id}/files":
+                parameters = self._query_parameters({"prefix", "page_token", "limit"})
+                files_page = service.files(
+                    workspace_id,
+                    prefix=parameters.get("prefix"),
+                    page_token=parameters.get("page_token"),
+                    limit=_optional_int(parameters, "limit"),
+                )
+                return 200, {
+                    "generation": files_page.generation,
+                    "files": [state.to_wire() for state in files_page.files],
+                    "next_page_token": files_page.next_page_token,
+                }
+        except (workspace.WorkspaceError, paths.WorkspacePathError) as exc:
+            raise _RequestRejected(exc.status, exc.code, exc.message, details=exc.details) from exc
+        return None
+
+    def _scan_full_flag(self, raw: bytes) -> bool:
+        if not raw:
+            return False
+        try:
+            payload = protocol.decode_json_object(raw)
+        except protocol.ProtocolError as exc:
+            raise _RequestRejected(
+                400, protocol.ErrorCode.INVALID_REQUEST, "malformed JSON body"
+            ) from exc
+        unknown = sorted(set(payload) - {"full"})
+        if unknown:
+            raise _RequestRejected(
+                400,
+                protocol.ErrorCode.INVALID_REQUEST,
+                "unknown request field",
+                details={"field": unknown[0]},
+            )
+        value = payload.get("full", False)
+        if not isinstance(value, bool):
+            raise _RequestRejected(
+                400,
+                protocol.ErrorCode.INVALID_REQUEST,
+                "full must be a boolean",
+                details={"field": "full"},
+            )
+        return value
+
+    def _query_parameters(self, allowed: set[str]) -> dict[str, str]:
+        query = urlsplit(self.path).query
+        if not query:
+            return {}
+        parsed = parse_qs(query, keep_blank_values=True)
+        parameters: dict[str, str] = {}
+        for name, values in parsed.items():
+            if name not in allowed:
+                raise _RequestRejected(
+                    400,
+                    protocol.ErrorCode.INVALID_REQUEST,
+                    "unknown query parameter",
+                    details={"parameter": name},
+                )
+            if len(values) != 1:
+                raise _RequestRejected(
+                    400,
+                    protocol.ErrorCode.INVALID_REQUEST,
+                    "repeated query parameter",
+                    details={"parameter": name},
+                )
+            parameters[name] = values[0]
+        return parameters
 
     def _declared_content_length(self) -> int:
         if self.headers.get("Transfer-Encoding") is not None:

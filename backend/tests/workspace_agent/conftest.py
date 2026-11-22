@@ -34,6 +34,13 @@ from sidecars.workspace_agent.agent import (  # noqa: E402
 )
 from sidecars.workspace_agent.auth import TOKEN_FILE_NAME, read_token_file  # noqa: E402
 
+from tests.workspace_agent.w3_support import (  # noqa: E402
+    RunningScanAgent,
+    ScanEnvironment,
+    make_scan_environment,
+    running_scan_agent,
+)
+
 BASE_URL = "http://workspace-agent"
 
 
@@ -168,3 +175,25 @@ def agent_argv(root: Path, runtime_dir: Path) -> list[str]:
         "--log-level",
         "WARNING",
     ]
+
+
+@pytest.fixture
+def scan_environment(tmp_path: Path) -> ScanEnvironment:
+    """A real ensured workspace plus an injected deterministic clock."""
+    return make_scan_environment(tmp_path)
+
+
+@pytest.fixture
+def scanning_agent(tmp_path: Path) -> Iterator[RunningScanAgent]:
+    """A live agent whose zero stability window imports files on the first scan."""
+    with running_scan_agent(tmp_path) as running:
+        yield running
+
+
+@pytest.fixture
+def scanning_client(scanning_agent: RunningScanAgent) -> Iterator[httpx.Client]:
+    transport = httpx.HTTPTransport(uds=str(scanning_agent.socket_path), retries=0)
+    with httpx.Client(
+        base_url=BASE_URL, transport=transport, timeout=30.0, trust_env=False
+    ) as client:
+        yield client
