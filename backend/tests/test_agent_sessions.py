@@ -26,6 +26,7 @@ from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
 
 from cti_app.api.agent_sessions import router as agent_sessions_router
+from cti_app.application.agent_session_disclosure import build_session_disclosure_gate
 from cti_app.application.agent_session_verification import (
     AgentSessionBindingError,
     AgentSessionLeaseError,
@@ -39,6 +40,8 @@ from cti_app.application.agentic_sessions import (
     AgentSessionSecretDeliveryPort,
     PreparedAgentSession,
     SessionConflictError,
+    SessionExternalDisclosureDeniedError,
+    SessionNetworkIsolationUnavailableError,
     SessionNewHandoffRequiredError,
     SessionResumeUnavailableError,
     SessionSecret,
@@ -60,6 +63,7 @@ from cti_app.application.persistence import (
     AnalystDecisionRepository,
     AnalystInvestigationRepository,
 )
+from cti_app.application.workspace_agent import WorkspaceLocalUnavailableError
 from cti_app.config import Settings
 from cti_app.domain.agentic_operator import (
     AgentSessionState,
@@ -72,6 +76,7 @@ from cti_app.domain.agentic_operator import (
     InterruptSessionResultV1,
     OperatorAdapterKind,
     OperatorCapabilitiesV1,
+    OperatorConfinementV1,
     OperatorProbeCommand,
     OperatorResultsV1,
     PreparedOperatorSessionV1,
@@ -88,7 +93,14 @@ from cti_app.domain.agentic_operator import (
     SessionStatusRequest,
     StartSessionRequest,
 )
-from cti_app.domain.investigation import ToolInvocation
+from cti_app.domain.investigation import (
+    DisclosureBounds,
+    EnvelopeAuthorityKind,
+    InvestigationBudget,
+    InvestigationEnvelope,
+    TLPLevel,
+    ToolInvocation,
+)
 from cti_app.domain.investigation_handoff import (
     HandoffActor,
     HandoffActorKind,
@@ -115,10 +127,24 @@ INVESTIGATION_ID = uuid4()
 
 class _InvestigationRepository:
     def __init__(self, investigation_id: UUID) -> None:
-        self._investigation = SimpleNamespace(id=investigation_id)
+        self._investigation = SimpleNamespace(
+            id=investigation_id,
+            subject_id=uuid4(),
+            synthesis_artifact_id=uuid4(),
+        )
 
     async def get(self, investigation_id: UUID) -> Any:
         return self._investigation if investigation_id == self._investigation.id else None
+
+
+class _EnvelopeRepository:
+    """The canonical G2 envelope the disclosure gate reads."""
+
+    def __init__(self) -> None:
+        self.items: dict[UUID, Any] = {}
+
+    async def get(self, investigation_id: UUID) -> Any:
+        return self.items.get(investigation_id)
 
 
 class _DecisionRepository:
@@ -157,6 +183,7 @@ class _FakeUnitOfWork:
         self._harness = harness
         self.analyst_investigations: AnalystInvestigationRepository = harness.investigations
         self.analyst_decisions: AnalystDecisionRepository = harness.decisions
+        self.investigation_envelopes: Any = harness.envelopes
         self.investigation_tasks: InvestigationTaskRepository = harness.repository
         self.investigation_handoffs: InvestigationHandoffRepository = harness.handoffs
         self.agent_sessions: AgentSessionRepository = harness.sessions
@@ -177,7 +204,9 @@ class _FakeUnitOfWork:
 
 
 def _capabilities(
-    *, adapter_kind: OperatorAdapterKind = OperatorAdapterKind.CODEX_CLI
+    *,
+    adapter_kind: OperatorAdapterKind = OperatorAdapterKind.CODEX_CLI,
+    confinement: OperatorConfinementV1 | None = None,
 ) -> OperatorCapabilitiesV1:
     return OperatorCapabilitiesV1(
         adapter_kind=adapter_kind,
@@ -189,6 +218,14 @@ def _capabilities(
         supports_non_interactive=True,
         supports_stop=True,
         permission_modes=("workspace-write",),
+        confinement=confinement
+        or OperatorConfinementV1(
+            profile="bwrap-reasoning-session",
+            bwrap_ok=True,
+            netns=True,
+            network_mode="isolated_egress",
+            loopback_isolated=True,
+        ),
         probed_at=NOW,
         probes=(
             OperatorProbeCommand(
@@ -371,6 +408,19 @@ class _FakeSecretDelivery:
         return cast(str, matches[-1])
 
 
+class _ArticleSnapshots:
+    """The canonical snapshot facts the disclosure gate reads (no evidence bytes)."""
+
+    def __init__(self, harness: _Harness) -> None:
+        self._harness = harness
+
+    async def resolve(self, synthesis_artifact_id: UUID) -> Any:
+        return SimpleNamespace(
+            tlp=self._harness.snapshot_tlp,
+            external_llm_allowed=self._harness.snapshot_external_llm_allowed,
+        )
+
+
 class _Harness:
     def __init__(
         self,
@@ -384,6 +434,9 @@ class _Harness:
         self.sessions = InMemoryAgentSessionRepository()
         self.investigations = _InvestigationRepository(self.investigation_id)
         self.decisions = _DecisionRepository()
+        self.envelopes = _EnvelopeRepository()
+        self.snapshot_tlp = "clear"
+        self.snapshot_external_llm_allowed = True
         self.lock_transactions: list[list[str]] = []
         self.current_locks: list[str] = []
         self.host_calls: list[tuple[str, int]] = []
@@ -399,14 +452,46 @@ class _Harness:
         )
         if isinstance(self.secret_delivery, _FakeSecretDelivery):
             self.secret_delivery.observer = self
+        self.disclosure = build_session_disclosure_gate(
+            uow_factory=lambda: self.uow,
+            article_snapshots=_ArticleSnapshots(self),
+            settings=Settings(advisor_disclosure_profile="standard"),
+        )
+        self.seed_envelope()
         self.service = SessionService(
             uow_factory=lambda: self.uow,
             deriver=self.deriver,
             operator=self.operator,
             secret_delivery=self.secret_delivery,
+            disclosure=self.disclosure,
+            cli_network_mode="isolated_egress",
             clock=lambda: NOW,
         )
         self.fake_delivery = self.secret_delivery
+
+    def seed_envelope(
+        self,
+        *,
+        tlp: TLPLevel | None = TLPLevel.CLEAR,
+        external_llm_allowed: bool = True,
+        authority_kind: EnvelopeAuthorityKind = EnvelopeAuthorityKind.HUMAN_G2,
+    ) -> InvestigationEnvelope:
+        envelope = InvestigationEnvelope(
+            investigation_id=self.investigation_id,
+            allowed_providers=("bridge",),
+            budget=InvestigationBudget(limits={}),
+            acquire_hits_allowed=False,
+            disclosure=DisclosureBounds(
+                tlp=tlp,
+                do_not_submit=False,
+                external_llm_allowed=external_llm_allowed,
+            ),
+            approval_decision_id=uuid4(),
+            approval_actor_id="analyst:test",
+            authority_kind=authority_kind,
+        )
+        self.envelopes.items[self.investigation_id] = envelope
+        return envelope
 
     async def seed_task(
         self,
@@ -1147,6 +1232,26 @@ class _OperatorClientIdentity:
         )
 
 
+class _OsintPolicyService:
+    async def effective_for_investigation(self, investigation_id: UUID) -> Any:
+        return None
+
+
+class _CompositionFactory:
+    """The minimal canonical composition the disclosure gate and probe need."""
+
+    def __init__(self, harness: _Harness) -> None:
+        self._harness = harness
+
+    @property
+    def article_snapshots(self) -> _ArticleSnapshots:
+        return _ArticleSnapshots(self._harness)
+
+    @property
+    def osint_open_policy_service(self) -> _OsintPolicyService:
+        return _OsintPolicyService()
+
+
 def _api_app(harness: _Harness, provider: Any) -> FastAPI:
     application = FastAPI()
     application.include_router(agent_sessions_router)
@@ -1159,6 +1264,7 @@ def _api_app(harness: _Harness, provider: Any) -> FastAPI:
     application.state.agentic_operator_port = harness.operator
     application.state.agent_session_secret_delivery = harness.secret_delivery
     application.state.identity_provider = provider
+    application.state.investigation_composition_factory = _CompositionFactory(harness)
     return application
 
 
@@ -1267,3 +1373,224 @@ async def test_signed_route_rejects_a_bad_signature() -> None:
         )
     assert refused.status_code == 403
     assert refused.json()["detail"]["code"] == "agent_session_signature_invalid"
+
+
+# --------------------------------------------------- disclosure gate (R03 B2)
+
+
+async def test_open_refused_when_external_llm_disallowed_without_host_call() -> None:
+    harness = _Harness()
+    task = await harness.seed_task()
+    handoff = await harness.add_handoff(task)
+    harness.seed_envelope(external_llm_allowed=False)
+
+    with pytest.raises(SessionExternalDisclosureDeniedError) as exc_info:
+        await harness.service.open_session(
+            harness.investigation_id,
+            task_id=task.id,
+            adapter_kind=OperatorAdapterKind.CODEX_CLI,
+            handoff_id=UUID(handoff.handoff_id),
+            executable=EXECUTABLE,
+            actor=HUMAN_ACTOR,
+            idempotency_key="open-disclosure-denied",
+        )
+    assert exc_info.value.code == "agent_session_external_llm_not_allowed"
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.details == {"reason": "external_llm_not_allowed"}
+    # No host probe, no host prepare/start, no session row and no secret.
+    assert harness.operator.probed == []
+    assert harness.operator.prepared == []
+    assert harness.operator.started == []
+    assert await harness.sessions.list_for_task(task.id) == ()
+    assert harness.fake_delivery is not None
+    assert harness.fake_delivery.deliveries == []
+
+
+async def test_open_refused_when_tlp_is_red() -> None:
+    harness = _Harness()
+    task = await harness.seed_task()
+    handoff = await harness.add_handoff(task)
+    harness.seed_envelope(tlp=TLPLevel.RED)
+
+    with pytest.raises(SessionExternalDisclosureDeniedError) as exc_info:
+        await harness.service.open_session(
+            harness.investigation_id,
+            task_id=task.id,
+            adapter_kind=OperatorAdapterKind.CODEX_CLI,
+            handoff_id=UUID(handoff.handoff_id),
+            executable=EXECUTABLE,
+            actor=HUMAN_ACTOR,
+            idempotency_key="open-tlp-red",
+        )
+    assert exc_info.value.details == {"reason": "external_llm_not_allowed"}
+    assert harness.operator.probed == []
+    assert harness.operator.prepared == []
+    assert await harness.sessions.list_for_task(task.id) == ()
+
+
+async def test_open_refused_when_envelope_is_absent() -> None:
+    harness = _Harness()
+    harness.envelopes.items.clear()
+    task = await harness.seed_task()
+    handoff = await harness.add_handoff(task)
+
+    with pytest.raises(SessionExternalDisclosureDeniedError) as exc_info:
+        await harness.service.open_session(
+            harness.investigation_id,
+            task_id=task.id,
+            adapter_kind=OperatorAdapterKind.CODEX_CLI,
+            handoff_id=UUID(handoff.handoff_id),
+            executable=EXECUTABLE,
+            actor=HUMAN_ACTOR,
+            idempotency_key="open-no-envelope",
+        )
+    assert exc_info.value.details == {"reason": "envelope_absent"}
+    assert harness.operator.probed == []
+    assert await harness.sessions.list_for_task(task.id) == ()
+
+
+async def test_allowed_envelope_still_opens_the_session() -> None:
+    harness = _Harness()
+    task = await harness.seed_task()
+    prepared = await harness.open(task=task)
+    assert prepared.session.state is AgentSessionState.RUNNING
+    assert len(harness.operator.started) == 1
+
+
+# -------------------------------------------------- network isolation (R03 B1)
+
+
+async def test_unattested_network_mode_refuses_before_any_host_prepare() -> None:
+    harness = _Harness()
+    task = await harness.seed_task()
+    handoff = await harness.add_handoff(task)
+    harness.operator.capabilities = harness.operator.capabilities.model_copy(
+        update={"confinement": None}
+    )
+
+    with pytest.raises(SessionNetworkIsolationUnavailableError) as exc_info:
+        await harness.service.open_session(
+            harness.investigation_id,
+            task_id=task.id,
+            adapter_kind=OperatorAdapterKind.CODEX_CLI,
+            handoff_id=UUID(handoff.handoff_id),
+            executable=EXECUTABLE,
+            actor=HUMAN_ACTOR,
+            idempotency_key="open-no-attestation",
+        )
+    assert exc_info.value.code == "agent_session_network_isolation_unavailable"
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.details == {"reason": "attestation_absent"}
+    assert [call for call, _ in harness.host_calls] == ["probe"]
+    assert harness.operator.prepared == []
+    assert harness.operator.started == []
+    assert await harness.sessions.list_for_task(task.id) == ()
+
+
+async def test_host_network_unsafe_requires_the_host_to_attest_the_same_mode() -> None:
+    harness = _Harness()
+    task = await harness.seed_task()
+    handoff = await harness.add_handoff(task)
+    unsafe_caps = _capabilities(
+        confinement=OperatorConfinementV1(
+            profile="bwrap-reasoning-session",
+            bwrap_ok=True,
+            netns=False,
+            network_mode="host_network_unsafe",
+            loopback_isolated=False,
+        )
+    )
+
+    service = SessionService(
+        uow_factory=lambda: harness.uow,
+        deriver=harness.deriver,
+        operator=harness.operator,
+        secret_delivery=harness.secret_delivery,
+        disclosure=harness.disclosure,
+        cli_network_mode="host_network_unsafe",
+        clock=lambda: NOW,
+    )
+    harness.operator.capabilities = unsafe_caps
+    prepared = await service.open_session(
+        harness.investigation_id,
+        task_id=task.id,
+        adapter_kind=OperatorAdapterKind.CODEX_CLI,
+        handoff_id=UUID(handoff.handoff_id),
+        executable=EXECUTABLE,
+        actor=HUMAN_ACTOR,
+        idempotency_key="open-unsafe-override",
+    )
+    assert prepared.session.state is AgentSessionState.RUNNING
+
+    # The backend in its fail-closed mode still refuses the same host facts.
+    refused_harness = _Harness()
+    task = await refused_harness.seed_task()
+    handoff = await refused_harness.add_handoff(task)
+    refused_harness.operator.capabilities = unsafe_caps
+    with pytest.raises(SessionNetworkIsolationUnavailableError) as exc_info:
+        await refused_harness.service.open_session(
+            refused_harness.investigation_id,
+            task_id=task.id,
+            adapter_kind=OperatorAdapterKind.CODEX_CLI,
+            handoff_id=UUID(handoff.handoff_id),
+            executable=EXECUTABLE,
+            actor=HUMAN_ACTOR,
+            idempotency_key="open-unsafe-refused",
+        )
+    assert exc_info.value.details["reason"] == "loopback_not_isolated"
+    assert refused_harness.operator.prepared == []
+
+
+# --------------------------------------------------- capabilities route (B3)
+
+
+async def test_capabilities_route_is_human_only_and_returns_probe_facts() -> None:
+    harness = _Harness()
+    app = _api_app(harness, LocalIdentityProvider("dev-analyst"))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            "/api/investigations/agent-sessions/capabilities",
+            params={"adapter_kind": "codex_cli", "executable": EXECUTABLE},
+        )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["adapter_kind"] == "codex_cli"
+    assert body["executable"] == EXECUTABLE
+    assert body["available"] is True
+    assert body["supports_resume"] is True
+    assert body["modes"] == ["exec", "apply"]
+    assert len(body["capability_sha256"]) == 64
+    assert body["confinement"]["network_mode"] == "isolated_egress"
+    assert body["confinement"]["loopback_isolated"] is True
+    assert "secret" not in response.text.lower()
+
+    operator_client_app = _api_app(harness, _OperatorClientIdentity())
+    async with AsyncClient(
+        transport=ASGITransport(app=operator_client_app), base_url="http://test"
+    ) as client:
+        refused = await client.get(
+            "/api/investigations/agent-sessions/capabilities",
+            params={"adapter_kind": "codex_cli", "executable": EXECUTABLE},
+        )
+    assert refused.status_code == 403
+    assert refused.json()["detail"]["code"] == "verified_human_operator_required"
+
+
+async def test_capabilities_route_maps_an_unreachable_host_to_workspace_local_unavailable() -> None:
+    harness = _Harness()
+    app = _api_app(harness, LocalIdentityProvider("dev-analyst"))
+
+    class _UnreachableOperator(_FakeOperator):
+        async def probe_capabilities(
+            self, request: ProbeCapabilitiesRequest
+        ) -> OperatorCapabilitiesV1:
+            raise WorkspaceLocalUnavailableError("workspace agent is unreachable")
+
+    app.state.agentic_operator_port = _UnreachableOperator()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            "/api/investigations/agent-sessions/capabilities",
+            params={"adapter_kind": "codex_cli", "executable": EXECUTABLE},
+        )
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "workspace_local_unavailable"

@@ -16,8 +16,10 @@ checked against it. Everything the help cannot prove is carried as an explicit
   copy is 0600 inside the private CODEX_HOME and never appears in argv, env,
   the prompt or logs.
 
-The CLI runs inside the H1 reasoning-session bwrap profile without a network
-namespace; the launch fails closed when the non-destructive bwrap probe fails.
+The CLI runs inside the H1 reasoning-session bwrap profile in its own network
+namespace behind a slirp4netns gateway that cannot reach the host loopback; the
+launch fails closed when the non-destructive bwrap probe or the loopback
+attestation fails.  The fake profile is never sandboxed.
 Normative source: ``docs/design/investigation-workshop/SESSION-RUNNER.md``
 §3, §7, §8, §10.
 """
@@ -34,6 +36,7 @@ import stat
 import subprocess
 import threading
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -191,15 +194,22 @@ class CodexProfile:
         auth_file: Path | None = None,
         resume_proven: bool = False,
         probe_timeout_seconds: float = PROBE_TIMEOUT_SECONDS,
+        network_mode: str = process.NETWORK_MODE_ISOLATED_EGRESS,
+        network_probe: Callable[[], process.NetworkIsolationAttestation] | None = None,
     ) -> None:
         for name, value in (("binary", binary), ("bwrap", bwrap), ("auth_file", auth_file)):
             if value is not None and not Path(value).is_absolute():
                 raise ValueError(f"{name} must be an absolute path")
+        if network_mode not in process.CLI_NETWORK_MODES:
+            raise ValueError("network_mode must be isolated_egress or host_network_unsafe")
         self._binary = None if binary is None else Path(binary)
         self._bwrap = None if bwrap is None else Path(bwrap)
         self._auth_file = None if auth_file is None else Path(auth_file)
         self._resume_proven = resume_proven
         self._probe_timeout_seconds = probe_timeout_seconds
+        self._network_mode = network_mode
+        self._network_probe = network_probe
+        self._network_attestation_cache: process.NetworkIsolationAttestation | None = None
         self._lock = threading.Lock()
         self._facts_cache: CodexFacts | None = None
 
@@ -212,7 +222,23 @@ class CodexProfile:
             bwrap=_environment_path("AUTOWORK_CODEX_BWRAP"),
             auth_file=_environment_path("AUTOWORK_CODEX_AUTH_FILE"),
             resume_proven=resume,
+            network_mode=process.network_mode_from_environment(),
         )
+
+    def _network_attestation(self) -> process.NetworkIsolationAttestation:
+        """The cached R03 B1 loopback-isolation proof (host only, no network)."""
+        if self._network_mode != process.NETWORK_MODE_ISOLATED_EGRESS:
+            return process.NetworkIsolationAttestation(
+                False,
+                "explicit host_network_unsafe override",
+                process.NETWORK_MODE_HOST_NETWORK_UNSAFE,
+                False,
+            )
+        with self._lock:
+            if self._network_attestation_cache is None:
+                probe = self._network_probe or process.network_isolation_attestation
+                self._network_attestation_cache = probe()
+            return self._network_attestation_cache
 
     # -- probe -------------------------------------------------------------
 
@@ -228,12 +254,16 @@ class CodexProfile:
             os_sandbox=True,
         )
         capabilities = self._capability_table(facts)
+        network = self._network_attestation()
         confinement: dict[str, object] = {
             "profile": CONFINEMENT_PROFILE,
             "bwrap_ok": facts.sandbox.ok,
             "bwrap_reason": facts.sandbox.reason,
             "bwrap_sha256": facts.sandbox.bwrap_sha256 or "",
-            "netns": False,
+            "netns": self._network_mode == process.NETWORK_MODE_ISOLATED_EGRESS,
+            "network_mode": self._network_mode,
+            "loopback_isolated": network.ok,
+            "network_reason": network.reason,
             "capabilities": capabilities,
         }
         payload: dict[str, object] = {
@@ -451,7 +481,8 @@ class CodexProfile:
             )
         return SandboxProbe(
             True,
-            "bwrap created the reasoning-session namespaces without a network namespace",
+            "bwrap created the reasoning-session namespaces; the network profile is "
+            "attested separately (loopback isolation or fail-closed)",
             bwrap_sha256,
         )
 
@@ -487,6 +518,7 @@ class CodexProfile:
             bwrap=bwrap,
             extra_ro_binds=self._runtime_binds(facts.binary_path) + self._skills_binds(context),
             extra_rw_binds=((context.home_directory, context.home_directory),),
+            network_mode=context.network_mode,
         )
         env = {
             "PATH": _sandbox_path(),
@@ -506,6 +538,7 @@ class CodexProfile:
             env=env,
             cwd=context.work_directory,
             uses_bwrap=True,
+            network_mode=context.network_mode,
             stdin_data=self._compose_prompt(context),
         )
 

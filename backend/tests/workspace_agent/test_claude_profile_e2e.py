@@ -72,6 +72,7 @@ def _bwrap_prepare_gate(monkeypatch: pytest.MonkeyPatch) -> None:
     the capability wire.
     """
     monkeypatch.setattr(session_process, "bwrap_available", lambda: True)
+    monkeypatch.setattr(session_process, "slirp_available", lambda: True)
 
 
 @pytest.fixture
@@ -95,13 +96,23 @@ def _build_supervisor(
         workspace_root=environment.root,
         interrupt_grace_seconds=0.2,
         watchdog_poll_seconds=0.05,
+        # The named fake bwrap cannot create namespaces or speak the
+        # --info-fd/--block-fd protocol, so this lifecycle harness uses the
+        # explicit dev override; the isolated launch has its own host oracle.
+        cli_network_mode="host_network_unsafe",
     )
     profile = ClaudeProfile(
         binary=write_fake_claude(session_base / "bin"),
         bwrap_binary=write_fake_bwrap(session_base / "bin"),
         resume_proven=resume_proven,
+        network_mode="host_network_unsafe",
         confinement_probe=lambda: ConfinementProbe(
-            ok=True, reason=MOCKED_BWRAP_REASON, mocked=True
+            ok=True,
+            reason=MOCKED_BWRAP_REASON,
+            mocked=True,
+            network_mode="host_network_unsafe",
+            loopback_isolated=False,
+            netns=False,
         ),
     )
     supervisor = SessionSupervisor(
@@ -116,7 +127,12 @@ def _build_supervisor(
 def _prepare(supervisor: SessionSupervisor, workspace_id: str) -> dict[str, object]:
     body = supervisor.prepare(
         PrepareSessionRequest.from_payload(
-            prepare_payload(workspace_id, adapter_kind="claude", session_id=SESSION_ID)
+            prepare_payload(
+                workspace_id,
+                adapter_kind="claude",
+                session_id=SESSION_ID,
+                network_mode="host_network_unsafe",
+            )
         ),
         idempotency_key="m24-h5-prepare-0001",
         body_sha256="a" * 64,
@@ -189,6 +205,7 @@ def test_claude_session_lifecycle_stream_events_and_collect(session_base: Path) 
         assert capabilities["flags"]["resume"] is False
         assert capabilities["confinement"]["mocked"] is True
         assert capabilities["confinement"]["netns"] is False
+        assert capabilities["confinement"]["network_mode"] == "host_network_unsafe"
         entries = {entry["name"]: entry for entry in capabilities["capabilities"]}
         assert entries["stream_json_live_instructions"]["proven"] is False
         assert capabilities["host_spike"]

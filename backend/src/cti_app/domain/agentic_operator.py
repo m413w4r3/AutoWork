@@ -327,6 +327,23 @@ class OperatorProbeCommand(_WireModel):
         return _unique_modes(value, "advertised_modes")
 
 
+class OperatorConfinementV1(_WireModel):
+    """What the host actually attested for the reasoning-session sandbox.
+
+    ``network_mode`` is ``None`` only for a profile that does not run a real CLI
+    (the fake test profile); a real provider session must attest
+    ``isolated_egress`` with ``loopback_isolated`` and a real network namespace
+    before the backend will open it (R03 B1).
+    """
+
+    profile: str = Field(min_length=1, max_length=64)
+    bwrap_ok: bool
+    netns: bool = False
+    network_mode: Literal["isolated_egress", "host_network_unsafe"] | None = None
+    loopback_isolated: bool = False
+    reason: str | None = Field(default=None, max_length=512)
+
+
 class OperatorCapabilitiesV1(_WireModel):
     """Probed capability facts, never invented flags (ADR-0011 D7, D01).
 
@@ -346,6 +363,7 @@ class OperatorCapabilitiesV1(_WireModel):
     supports_non_interactive: bool = False
     supports_stop: bool = False
     permission_modes: tuple[str, ...] = ()
+    confinement: OperatorConfinementV1 | None = None
     probed_at: datetime
     probes: tuple[OperatorProbeCommand, ...] = Field(min_length=1)
     capability_sha256: str = ""

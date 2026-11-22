@@ -55,6 +55,7 @@ from cti_app.domain.agentic_operator import (
     InterruptSessionResultV1,
     OperatorAdapterKind,
     OperatorCapabilitiesV1,
+    OperatorConfinementV1,
     OperatorProbeCommand,
     OperatorResultItemV1,
     OperatorResultsV1,
@@ -174,11 +175,15 @@ class HostOperatorAdapter:
         host: HostSessionsPort,
         preparations: HostSessionPreparationRegistry,
         context: HostSessionContextProvider | None = None,
+        network_mode: Literal["isolated_egress", "host_network_unsafe"] = "isolated_egress",
         clock: Callable[[], datetime] | None = None,
     ) -> None:
+        if network_mode not in {"isolated_egress", "host_network_unsafe"}:
+            raise ValueError("network_mode must be isolated_egress or host_network_unsafe")
         self._host = host
         self._preparations = preparations
         self._context = context
+        self._network_mode = network_mode
         self._clock = clock or (lambda: datetime.now(UTC))
         self._facts: ProbedHostFacts | None = None
 
@@ -234,6 +239,7 @@ class HostOperatorAdapter:
             skill_names=context.skill_names,
             budgets=context.budgets,
             model=context.model,
+            network_mode=self._network_mode,
             expected_probe_sha256=facts.probe_sha256,
         )
         self._preparations.register(
@@ -504,6 +510,18 @@ def capabilities_from_probe(
         # The host wire has no CLI stop flag; interrupt is a supervisor signal.
         supports_stop=False,
         permission_modes=(),
+        confinement=OperatorConfinementV1(
+            profile=wire.confinement.profile,
+            bwrap_ok=wire.confinement.bwrap_ok,
+            netns=wire.confinement.netns,
+            network_mode=wire.confinement.network_mode,
+            loopback_isolated=wire.confinement.loopback_isolated,
+            reason=(
+                wire.confinement.network_reason
+                or wire.confinement.reason
+                or wire.confinement.bwrap_reason
+            ),
+        ),
         probed_at=wire.probed_at,
         probes=(probe,),
     )

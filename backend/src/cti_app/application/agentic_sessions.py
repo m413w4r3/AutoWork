@@ -58,6 +58,7 @@ from cti_app.application.investigation_handoffs import (
 from cti_app.application.investigation_persistence import (
     AgentSessionRepository,
     HandoffRecord,
+    InvestigationEnvelopeRepository,
     InvestigationHandoffRepository,
     InvestigationTaskRepository,
     VersionConflictError,
@@ -106,6 +107,8 @@ from cti_app.domain.investigation_task import (
     TaskLimits,
     TaskStatus,
 )
+
+_CLI_NETWORK_MODES = frozenset({"isolated_egress", "host_network_unsafe"})
 
 
 class SessionError(ValueError):
@@ -185,6 +188,20 @@ class SessionOperatorContractError(SessionError):
 
     code = "agentic_operator_contract_invalid"
     status_code = 502
+
+
+class SessionExternalDisclosureDeniedError(SessionError):
+    """The investigation's G2/TLP disclosure policy refuses an operator session (R03 B2)."""
+
+    code = "agent_session_external_llm_not_allowed"
+    status_code = 403
+
+
+class SessionNetworkIsolationUnavailableError(SessionError):
+    """No real CLI session may run without an attested loopback isolation (R03 B1)."""
+
+    code = "agent_session_network_isolation_unavailable"
+    status_code = 503
 
 
 class SessionStartFailedError(SessionError):
@@ -292,6 +309,7 @@ class SessionUnitOfWork(Protocol):
 
     analyst_investigations: AnalystInvestigationRepository
     analyst_decisions: AnalystDecisionRepository
+    investigation_envelopes: InvestigationEnvelopeRepository
     investigation_tasks: InvestigationTaskRepository
     investigation_handoffs: InvestigationHandoffRepository
     agent_sessions: AgentSessionRepository
@@ -612,14 +630,20 @@ class SessionService:
         operator: AgenticOperatorPort | None = None,
         secret_delivery: AgentSessionSecretDeliveryPort | None = None,
         note_resolver: InstructionNoteResolver | None = None,
+        disclosure: Callable[[UUID], Awaitable[None]] | None = None,
+        cli_network_mode: str = "isolated_egress",
         task_limits: TaskLimits = TASK_LIMIT_DEFAULTS,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
+        if cli_network_mode not in _CLI_NETWORK_MODES:
+            raise ValueError("cli_network_mode must be isolated_egress or host_network_unsafe")
         self._uow_factory = uow_factory
         self._deriver = deriver
         self._operator = operator
         self._secret_delivery = secret_delivery
         self._note_resolver = note_resolver
+        self._disclosure = disclosure
+        self._cli_network_mode = cli_network_mode
         self._task_limits = task_limits
         self._clock = clock or (lambda: datetime.now(UTC))
 
@@ -661,12 +685,17 @@ class SessionService:
         self._require_human(actor)
         deriver = self._require_deriver()
         operator = self._require_operator()
+        await self._require_external_disclosure(investigation_id)
         replayed = await self._existing_prepared(investigation_id, request, deriver, key)
         if replayed is not None:
             # A replay never probes or prepares a second host session.
+            self._require_network_attestation(
+                replayed.session.adapter_kind, replayed.session.capabilities()
+            )
             await self._deliver_secret(replayed, key)
             return replayed
         capabilities = await self._probe(operator, adapter_kind, executable)
+        self._require_network_attestation(adapter_kind, capabilities)
         provisioned, created = await self._provision(
             investigation_id, request, capabilities, deriver, key, timestamp
         )
@@ -714,14 +743,19 @@ class SessionService:
         self._require_human(actor)
         deriver = self._require_deriver()
         operator = self._require_operator()
+        await self._require_external_disclosure(investigation_id)
         replayed = await self._existing_prepared(investigation_id, request, deriver, key)
         if replayed is not None:
             # A replay re-derives the same secret and re-delivers it; the host
             # refuses a second, different hand-off.  It never starts anything:
             # a concurrent identical open already did.
+            self._require_network_attestation(
+                replayed.session.adapter_kind, replayed.session.capabilities()
+            )
             await self._deliver_secret(replayed, key)
             return replayed
         capabilities = await self._probe(operator, adapter_kind, executable)
+        self._require_network_attestation(adapter_kind, capabilities)
         provisioned, created = await self._provision(
             investigation_id, request, capabilities, deriver, key, timestamp
         )
@@ -755,9 +789,11 @@ class SessionService:
         self._require_human(actor)
         operator = self._require_operator()
         timestamp = _now(self._clock, now)
+        await self._require_external_disclosure(investigation_id)
         async with self._uow_factory() as uow:
             await uow.investigation_tasks.lock_investigation(investigation_id)
             session = await self._session_for(uow, investigation_id, session_id)
+            self._require_network_attestation(session.adapter_kind, session.capabilities())
             task = await self._locked_task(uow, investigation_id, session.task_id)
             await self._require_startable_locked(uow, session, task)
             await uow.commit()
@@ -1082,8 +1118,10 @@ class SessionService:
         timestamp = _now(self._clock, now)
         self._require_human(actor)
         operator = self._require_operator()
+        await self._require_external_disclosure(investigation_id)
         async with self._uow_factory() as uow:
             session = await self._session_for(uow, investigation_id, session_id)
+            self._require_network_attestation(session.adapter_kind, session.capabilities())
             if session.state not in RESUMABLE_AGENT_SESSION_STATES:
                 raise SessionStateConflictError(f"a {session.state.value} session is not resumable")
             outcome = session.reconciliation_outcome()
@@ -1818,6 +1856,69 @@ class SessionService:
     def _require_task_assignment(task: InvestigationTaskV1) -> None:
         if task.assigned_actor_kind is not TaskActorKind.OPERATOR or task.assigned_actor_id is None:
             raise SessionForbiddenError("an agent session requires a task assigned to an operator")
+
+    async def probe_session_capabilities(
+        self, adapter_kind: OperatorAdapterKind, *, executable: str
+    ) -> OperatorCapabilitiesV1:
+        """The read-only capability probe the cockpit uses (no session, no secret)."""
+        operator = self._require_operator()
+        capabilities = await self._probe(operator, adapter_kind, executable)
+        self._require_network_attestation(adapter_kind, capabilities)
+        return capabilities
+
+    async def _require_external_disclosure(self, investigation_id: UUID) -> None:
+        """R03 B2: the canonical G2/TLP gate, before every host call and row write."""
+        gate = self._disclosure
+        if gate is None:
+            # A service built without the canonical gate must never open a
+            # session that can disclose evidence to an external provider.
+            raise SessionExternalDisclosureDeniedError(
+                "no canonical external-disclosure gate is wired; operator sessions are refused",
+                details={"reason": "gate_unavailable"},
+            )
+        await gate(investigation_id)
+
+    def _require_network_attestation(
+        self, adapter_kind: OperatorAdapterKind, capabilities: OperatorCapabilitiesV1
+    ) -> None:
+        """R03 B1: a real CLI session needs the attested loopback isolation.
+
+        ``host_network_unsafe`` is an explicit development override; even then
+        the host must have attested that same mode, so a deployment that forgot
+        the override still fails closed instead of silently sharing the host
+        network.
+        """
+        if capabilities.adapter_kind is not adapter_kind:
+            raise SessionOperatorContractError("the capability probe names another adapter")
+        confinement = capabilities.confinement
+        if self._cli_network_mode == "host_network_unsafe":
+            if confinement is not None and confinement.network_mode not in (
+                None,
+                "host_network_unsafe",
+            ):
+                raise SessionNetworkIsolationUnavailableError(
+                    "the host attested an isolated network while the backend is in its explicit "
+                    "host_network_unsafe override",
+                    details={"reason": "network_mode_mismatch"},
+                )
+            return
+        if confinement is None:
+            raise SessionNetworkIsolationUnavailableError(
+                "the host did not attest a CLI network mode; refusing the real session",
+                details={"reason": "attestation_absent"},
+            )
+        if (
+            confinement.network_mode != "isolated_egress"
+            or not confinement.loopback_isolated
+            or not confinement.netns
+        ):
+            raise SessionNetworkIsolationUnavailableError(
+                "the host CLI sandbox is not attested loopback-isolated; refusing the real session",
+                details={
+                    "reason": "loopback_not_isolated",
+                    "network_mode": str(confinement.network_mode),
+                },
+            )
 
     def _require_deriver(self) -> SessionSecretDeriver:
         if self._deriver is None:

@@ -76,6 +76,15 @@ class Settings(BaseSettings):
     # sessions are refused unless the API runs with token-authenticated identities.
     # Setting this to true is an explicit, unsafe opt-in for isolated development only.
     agent_sessions_allow_local_identity: bool = False
+    # M24 security boundary (R03 B1): a real operator CLI runs in its own network
+    # namespace with a slirp4netns gateway that cannot reach the host loopback, so
+    # the Vite proxy and the published PostgreSQL/MinIO ports are unreachable even
+    # though the model has a shell. The host supervisor attests the same mode at
+    # startup and refuses a real session it cannot isolate. ``host_network_unsafe``
+    # is an explicit development override (the CLI shares the host network).
+    agent_sessions_cli_network_mode: Literal["isolated_egress", "host_network_unsafe"] = (
+        "isolated_egress"
+    )
 
     @field_validator("m24_agent_session_key")
     @classmethod

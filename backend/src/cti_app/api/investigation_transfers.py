@@ -21,9 +21,14 @@ from uuid import UUID
 from fastapi import APIRouter, Header, HTTPException, Request
 
 from cti_app.api.investigation import (
+    _composition_factory,
     _http_error,
     _require_verified_human_operator,
     _uow_factory,
+)
+from cti_app.application.agent_session_disclosure import (
+    SessionDisclosureUnitOfWork,
+    build_session_disclosure_gate,
 )
 from cti_app.application.agent_session_verification import (
     HmacSessionSecretDeriver,
@@ -86,12 +91,21 @@ def _secret_delivery(request: Request) -> AgentSessionSecretDeliveryPort | None:
 def _service(request: Request, workspace_agent: WorkspaceAgentPort) -> InvestigationTransferService:
     factory = cast(Callable[[], TransferUnitOfWork], _uow_factory(request))
     settings = _settings(request)
+    composition = _composition_factory(request)
+    disclosure = build_session_disclosure_gate(
+        uow_factory=cast(Callable[[], SessionDisclosureUnitOfWork], factory),
+        article_snapshots=composition.article_snapshots,
+        settings=settings,
+        effective_policy_for=composition.osint_open_policy_service.effective_for_investigation,
+    )
     return InvestigationTransferService(
         uow_factory=factory,
         workspace_agent=workspace_agent,
         operator=_operator_port(request),
         secret_delivery=_secret_delivery(request),
         deriver=_deriver(settings),
+        disclosure=disclosure,
+        cli_network_mode=settings.agent_sessions_cli_network_mode,
         task_limits=settings.task_limits(),
     )
 

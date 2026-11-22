@@ -174,6 +174,7 @@ class LaunchContext:
     run: int
     resume: bool
     fake_scenario: str
+    network_mode: str = process.NETWORK_MODE_ISOLATED_EGRESS
     workspace_directory: Path | None = None
     skills_directory: Path | None = None
 
@@ -347,6 +348,7 @@ class PrepareSessionRequest:
     budgets: BudgetSpec
     model: str | None
     auth_secret: bytes = field(repr=False)
+    network_mode: str = process.NETWORK_MODE_ISOLATED_EGRESS
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> PrepareSessionRequest:
@@ -365,7 +367,7 @@ class PrepareSessionRequest:
                 "budgets",
                 "auth_secret",
             ),
-            ("model",),
+            ("model", "network_mode"),
         )
         session_id = session_state.require_uuid(payload["session_id"], "session_id")
         adapter_kind = session_state.require_str(
@@ -415,6 +417,11 @@ class PrepareSessionRequest:
             if MODEL_PATTERN.fullmatch(model) is None:
                 raise SessionRequestError("model", "invalid")
         secret = session_state.decode_session_secret(payload["auth_secret"])
+        network_mode = payload.get("network_mode")
+        if network_mode is None:
+            network_mode = process.NETWORK_MODE_ISOLATED_EGRESS
+        if not isinstance(network_mode, str) or network_mode not in process.CLI_NETWORK_MODES:
+            raise SessionRequestError("network_mode", "invalid")
         return cls(
             session_id=session_id,
             adapter_kind=adapter_kind,
@@ -427,6 +434,7 @@ class PrepareSessionRequest:
             skill_names=skill_names,
             budgets=budgets,
             model=model,
+            network_mode=str(network_mode),
             auth_secret=secret,
         )
 
@@ -841,16 +849,33 @@ class SessionSupervisorConfig:
     skills_root: Path | None = None
     page_limit: int = logs.DEFAULT_PAGE_LIMIT
     allow_foreign_runtime_dir: bool = False
+    # R03 B1: the closed CLI network mode, read from AGENT_SESSIONS_CLI_NETWORK_MODE
+    # and verified against the backend's value on every prepare.
+    cli_network_mode: str = process.NETWORK_MODE_ISOLATED_EGRESS
 
     @property
     def session_root(self) -> Path:
         return self.runtime_root / SESSION_RUNTIME_DIRECTORY
+
+    def network_startup_reason(self) -> str | None:
+        """Startup check: a real CLI session needs its isolation tools present."""
+        if self.cli_network_mode == process.NETWORK_MODE_HOST_NETWORK_UNSAFE:
+            return None
+        if not process.bwrap_available():
+            return "bwrap binary missing"
+        if not process.slirp_available():
+            return "slirp4netns binary missing"
+        return None
 
     def validate(self) -> None:
         runtime = self.runtime_root.resolve()
         workspace = self.workspace_root.resolve()
         if runtime == workspace or runtime.is_relative_to(workspace):
             raise SessionConfigError("the session runtime directory is inside the workspace tree")
+        if self.cli_network_mode not in process.CLI_NETWORK_MODES:
+            raise SessionConfigError(
+                "AGENT_SESSIONS_CLI_NETWORK_MODE must be isolated_egress or host_network_unsafe"
+            )
         if self.interrupt_grace_seconds < 0:
             raise SessionConfigError("the interrupt grace period is negative")
         if self.log_ring_bytes < 1 or self.log_ring_entries < 1 or self.event_ring_entries < 1:
@@ -880,7 +905,19 @@ def config_from_agent(agent: WorkspaceAgent) -> SessionSupervisorConfig:
         fake_scenario=os.environ.get("AUTOWORK_FAKE_CLI_SCENARIO", DEFAULT_FAKE_SCENARIO),
         skills_root=Path(skills_root_text) if skills_root_text else DEFAULT_SKILLS_ROOT,
         allow_foreign_runtime_dir=agent.config.allow_foreign_runtime_dir,
+        cli_network_mode=_env_network_mode(),
     )
+
+
+def _env_network_mode() -> str:
+    value = os.environ.get("AGENT_SESSIONS_CLI_NETWORK_MODE", "").strip()
+    if not value:
+        return process.NETWORK_MODE_ISOLATED_EGRESS
+    if value not in process.CLI_NETWORK_MODES:
+        raise SessionConfigError(
+            "AGENT_SESSIONS_CLI_NETWORK_MODE must be isolated_egress or host_network_unsafe"
+        )
+    return value
 
 
 def _env_int(name: str, default: int, minimum: int) -> int:
@@ -923,6 +960,19 @@ class SessionSupervisor:
         self._lock = threading.RLock()
         self._idempotency = IdempotencyStore(self._clock)
         self._stopped = threading.Event()
+        # Startup check (R03 B1): the closed mode and its tools are verified
+        # before any real session may be prepared; fake profiles stay usable.
+        self._network_startup_reason = config.network_startup_reason()
+        if config.cli_network_mode == process.NETWORK_MODE_HOST_NETWORK_UNSAFE:
+            LOGGER.warning(
+                "AGENT_SESSIONS_CLI_NETWORK_MODE=host_network_unsafe: operator CLI sessions "
+                "share the host network and can reach host loopback services; development only"
+            )
+        if self._network_startup_reason is not None:
+            LOGGER.error(
+                "isolated CLI network unavailable; real sessions will fail closed: %s",
+                self._network_startup_reason,
+            )
         self._prepare_session_root()
         self._reconcile_existing()
 
@@ -946,6 +996,7 @@ class SessionSupervisor:
                         managed.process.wait(timeout=5)
                     except Exception:
                         pass
+                    process.stop_network(managed)
                     handle.managed = None
                 broker, handle.broker = handle.broker, None
                 if broker is not None:
@@ -1113,6 +1164,16 @@ class SessionSupervisor:
                 existing = self._sessions[request.session_id]
                 raise SessionStateConflictError(str(existing.record.state), "prepare")
             profile = self._profiles.get(request.adapter_kind)
+            if request.network_mode != self._config.cli_network_mode:
+                # Both sides must agree: the backend never asks for a weaker
+                # isolation than the host is configured to provide.
+                raise ConfinementUnavailableError(
+                    request.adapter_kind, reason="cli network mode mismatch"
+                )
+            if profile.requires_sandbox and self._network_startup_reason is not None:
+                raise ConfinementUnavailableError(
+                    request.adapter_kind, reason=self._network_startup_reason
+                )
             if profile.requires_sandbox and not process.bwrap_available():
                 raise ConfinementUnavailableError(request.adapter_kind)
             self._workspaces.get_workspace(request.workspace_id)
@@ -1125,6 +1186,20 @@ class SessionSupervisor:
                 raise ConfinementUnavailableError(
                     request.adapter_kind,
                     reason=reason if isinstance(reason, str) else None,
+                )
+            if profile.requires_sandbox and request.network_mode != probe.confinement.get(
+                "network_mode"
+            ):
+                raise ConfinementUnavailableError(
+                    request.adapter_kind, reason="cli network mode not attested"
+                )
+            if (
+                profile.requires_sandbox
+                and request.network_mode == process.NETWORK_MODE_ISOLATED_EGRESS
+                and probe.confinement.get("loopback_isolated") is not True
+            ):
+                raise ConfinementUnavailableError(
+                    request.adapter_kind, reason="host loopback isolation not attested"
                 )
             prompt_bytes = self._build_prompt(request, skills)
             if len(prompt_bytes) > MAX_PROMPT_BYTES:
@@ -1412,11 +1487,15 @@ class SessionSupervisor:
             run=run_number,
             resume=resume,
             fake_scenario=self._config.fake_scenario,
+            network_mode=self._config.cli_network_mode,
             workspace_directory=Path(descriptor.host_path),
             skills_directory=self._config.skills_root,
         )
         plan = profile.build_launch_plan(context)
-        managed = process.spawn(plan)
+        try:
+            managed = process.spawn(plan)
+        except process.NetworkIsolationUnavailable as exc:
+            raise ConfinementUnavailableError(record.adapter_kind, reason=str(exc)) from exc
         managed.run = run_number
         now = self._now()
         previous = record.state
@@ -1466,6 +1545,7 @@ class SessionSupervisor:
                 managed.process.wait(timeout=5)
             except Exception:
                 pass
+            process.stop_network(managed)
             process.close_pipes(managed.process)
             handle.managed = None
             record.state = SessionState.FAILED
@@ -1652,6 +1732,7 @@ class SessionSupervisor:
         record.exit = exit_record
         record.budgets_used.wall_seconds = max(0.0, time.monotonic() - handle.started_monotonic)
         handle.managed = None
+        process.stop_network(managed)
         if record.state is SessionState.INTERRUPT_REQUESTED:
             record.state = SessionState.STOPPED
             record.outcome = "interrupted"
@@ -2193,6 +2274,7 @@ class SessionSupervisor:
                     managed.process.wait(timeout=5)
                 except Exception:
                     pass
+                process.stop_network(managed)
                 handle.managed = None
             broker, handle.broker = handle.broker, None
             if broker is not None:

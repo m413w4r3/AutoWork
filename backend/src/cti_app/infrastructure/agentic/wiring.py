@@ -205,12 +205,21 @@ def build_agentic_operator_ports(
         transport=transport,
     )
     preparations = HostSessionPreparationRegistry()
+    network_mode = settings.agent_sessions_cli_network_mode
     adapters: dict[OperatorAdapterKind, HostOperatorAdapter] = {
         OperatorAdapterKind.CODEX_CLI: CodexCliOperatorAdapter(
-            host=host, preparations=preparations, context=context_provider, clock=clock
+            host=host,
+            preparations=preparations,
+            context=context_provider,
+            network_mode=network_mode,
+            clock=clock,
         ),
         OperatorAdapterKind.CLAUDE_CODE: ClaudeCodeOperatorAdapter(
-            host=host, preparations=preparations, context=context_provider, clock=clock
+            host=host,
+            preparations=preparations,
+            context=context_provider,
+            network_mode=network_mode,
+            clock=clock,
         ),
     }
     return AgenticOperatorPorts(

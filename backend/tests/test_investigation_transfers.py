@@ -53,6 +53,7 @@ from cti_app.application.investigation_persistence import (
     InMemoryWorkspaceFileEventRepository,
     InMemoryWorkspaceFileRevisionRepository,
     InMemoryWorkspaceSyncCursorRepository,
+    InvestigationEnvelopeRepository,
     InvestigationHandoffRepository,
     InvestigationPlanRepository,
     InvestigationTaskRepository,
@@ -98,6 +99,7 @@ from cti_app.domain.agentic_operator import (
     InterruptSessionResultV1,
     OperatorAdapterKind,
     OperatorCapabilitiesV1,
+    OperatorConfinementV1,
     OperatorProbeCommand,
     OperatorResultsV1,
     PreparedOperatorSessionV1,
@@ -160,9 +162,40 @@ CODEX_ID = "operator:codex_cli"
 CLAUDE_ID = "operator:claude_code"
 
 
+class _ArticleSnapshots:
+    async def resolve(self, synthesis_artifact_id: UUID) -> Any:
+        return SimpleNamespace(tlp="clear", external_llm_allowed=True)
+
+
+class _OsintPolicyService:
+    async def effective_for_investigation(self, investigation_id: UUID) -> Any:
+        return None
+
+
+class _CompositionFactory:
+    """The minimal canonical composition the disclosure gate reads."""
+
+    @property
+    def article_snapshots(self) -> _ArticleSnapshots:
+        return _ArticleSnapshots()
+
+    @property
+    def osint_open_policy_service(self) -> _OsintPolicyService:
+        return _OsintPolicyService()
+
+
+async def _allow_disclosure(investigation_id: UUID) -> None:
+    """The transfer tests exercise the flow; the gate has its own oracles."""
+    return None
+
+
 class _InvestigationRepository:
     def __init__(self, investigation_id: UUID) -> None:
-        self._investigation = SimpleNamespace(id=investigation_id)
+        self._investigation = SimpleNamespace(
+            id=investigation_id,
+            subject_id=uuid4(),
+            synthesis_artifact_id=uuid4(),
+        )
 
     async def get(self, investigation_id: UUID) -> Any:
         return self._investigation if investigation_id == self._investigation.id else None
@@ -286,6 +319,13 @@ def _capabilities(
         supports_non_interactive=True,
         supports_stop=False,
         permission_modes=("workspace-write",),
+        confinement=OperatorConfinementV1(
+            profile="bwrap-reasoning-session",
+            bwrap_ok=True,
+            netns=True,
+            network_mode="isolated_egress",
+            loopback_isolated=True,
+        ),
         probed_at=NOW,
         probes=(
             OperatorProbeCommand(
@@ -431,7 +471,7 @@ class _FakeUnitOfWork:
         self.evidence_observations: EvidenceObservationRepository = harness.observations
         self.investigation_findings: FindingRepository = harness.findings
         self.tool_invocations: ToolInvocationRepository = harness.invocations
-        self.investigation_envelopes = harness.envelopes
+        self.investigation_envelopes: InvestigationEnvelopeRepository = harness.envelopes
 
     async def __aenter__(self) -> _FakeUnitOfWork:
         return self
@@ -469,6 +509,7 @@ class _Harness:
             deriver=self.deriver,
             operator=self.operator,
             secret_delivery=self.delivery,
+            disclosure=_allow_disclosure,
             clock=lambda: NOW,
         )
         self.handoffs_service = InvestigationHandoffService(
@@ -480,6 +521,7 @@ class _Harness:
             operator=self.operator,
             secret_delivery=self.delivery,
             deriver=self.deriver,
+            disclosure=_allow_disclosure,
             clock=lambda: NOW,
         )
         self.notes = WorkspaceNoteCatalog(uow_factory=lambda: self.uow)
@@ -1224,6 +1266,8 @@ async def _real_ports(running: RunningSessionAgent, harness: _Harness):
         deriver=harness.deriver,
         operator=ports.operator,
         secret_delivery=ports.secret_delivery,
+        disclosure=_allow_disclosure,
+        cli_network_mode=settings.agent_sessions_cli_network_mode,
         clock=lambda: NOW,
     )
     return settings, ports, workspace_agent, sessions
@@ -1277,6 +1321,8 @@ async def _real_sidecar_transfer(running: RunningSessionAgent, workspace_id: str
         operator=ports.operator,
         secret_delivery=ports.secret_delivery,
         deriver=harness.deriver,
+        disclosure=_allow_disclosure,
+        cli_network_mode="host_network_unsafe",
         clock=lambda: NOW,
     )
     try:
@@ -1472,6 +1518,9 @@ def _start_sidecar(monkeypatch: pytest.MonkeyPatch) -> None:
         lambda: ProfileRegistry((_FakeCodexProfile(), _FakeClaudeProfile())),
     )
     monkeypatch.setenv("AUTOWORK_FAKE_CLI_SCENARIO", "hang")
+    # The fake supervisor profiles do not run bwrap: both sides use the
+    # explicit dev override, exactly as a host without isolation tools would.
+    monkeypatch.setenv("AGENT_SESSIONS_CLI_NETWORK_MODE", "host_network_unsafe")
 
 
 def test_real_sidecar_transfer_interrupts_codex_and_opens_a_claude_session(
@@ -1538,6 +1587,7 @@ async def test_transfer_route_is_human_only_and_accepts_notes_on_instruction() -
     task = await harness.seed_task()
     harness.workspace.add_revision(path=NOTE_PATH, sha256="c" * 64)
 
+    await harness.approve_envelope()
     app = FastAPI()
     app.include_router(transfers_router)
     app.include_router(sessions_router)
@@ -1547,6 +1597,7 @@ async def test_transfer_route_is_human_only_and_accepts_notes_on_instruction() -
     app.state.workspace_agent_port = harness.workspace
     app.state.agentic_operator_port = harness.operator
     app.state.agent_session_secret_delivery = harness.delivery
+    app.state.investigation_composition_factory = _CompositionFactory()
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         transferred = await client.post(

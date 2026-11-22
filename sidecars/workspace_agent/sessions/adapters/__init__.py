@@ -20,4 +20,4 @@ if TYPE_CHECKING:
 def register_profiles(registry: ProfileRegistry) -> None:
     """Register every provider profile this build may launch."""
     registry.register(CodexProfile.from_environment())
-    registry.register(ClaudeProfile())
+    registry.register(ClaudeProfile.from_environment())
