@@ -26,7 +26,7 @@ from tests.integration.test_workspace_agent_persistence_postgres import (
 
 pytestmark = pytest.mark.integration
 
-CURRENT_HEAD = "0023_agent_sessions"
+CURRENT_HEAD = "0024_work_contributions"
 PREVIOUS = "0018_editorial_enrichment_element_operations"
 WORKSPACE_TABLES = {
     "workspace_bindings",
@@ -124,6 +124,7 @@ def test_workspace_migration_rejects_a_partial_workspace_shape(
         try:
             async with engine.begin() as connection:
                 for table_name in (
+                    "work_contributions",
                     "workspace_sync_cursors",
                     "workspace_file_events",
                     "workspace_file_revisions",

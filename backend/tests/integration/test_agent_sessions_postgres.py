@@ -62,7 +62,7 @@ from tests.integration.edition_codes import reserve_edition_code
 pytestmark = pytest.mark.integration
 
 PREVIOUS = "0022_investigation_handoffs"
-HEAD = "0023_agent_sessions"
+HEAD = "0024_work_contributions"
 SESSIONS = "agent_sessions"
 INSTRUCTIONS = "agent_session_instructions"
 NOW = datetime(2026, 11, 22, 12, 0, tzinfo=UTC)
