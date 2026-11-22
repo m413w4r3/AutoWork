@@ -12,7 +12,9 @@ import {
   type InvestigationView,
 } from "../../api/investigation";
 import { useInvestigationActivity } from "../../api/investigationOperator";
+import { useWorkspaceStatus } from "./api/workspace";
 import { InvestigationLabViews } from "./InvestigationLabViews";
+import { WorkshopCockpit } from "./shell/WorkshopCockpit";
 
 const HASH_PATTERN = /^[0-9a-f]{64}$/;
 
@@ -234,6 +236,11 @@ function InvestigationDetail({
   actionError: Error | null;
 }) {
   const activityQuery = useInvestigationActivity(investigation.id);
+  // Discriminant M24 : la création `creation_profile='m24_workshop'` lie le
+  // workspace au démarrage (ADR-0011 D2) ; une enquête legacy reste non liée et
+  // conserve le laboratoire de preuve historique.
+  const workspaceQuery = useWorkspaceStatus(investigation.id);
+  const workshopActive = workspaceQuery.data?.workspace_state === "bound";
   const latest = activityQuery.data?.investigation;
   const currentStatus = latest?.status ?? investigation.status;
   const currentStopReason = latest
@@ -302,11 +309,18 @@ function InvestigationDetail({
           </button>
         ) : null}
       </div>
-      <InvestigationLabViews
-        investigation={investigation}
-        editionId={editionId}
-        showG2Prompt={currentStopReason === "permission_required"}
-      />
+      {workshopActive ? (
+        <WorkshopCockpit
+          investigationId={investigation.id}
+          subjectId={investigation.subject_id}
+        />
+      ) : (
+        <InvestigationLabViews
+          investigation={investigation}
+          editionId={editionId}
+          showG2Prompt={currentStopReason === "permission_required"}
+        />
+      )}
     </section>
   );
 }
