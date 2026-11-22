@@ -5,6 +5,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { WorkshopCockpit } from "./WorkshopCockpit";
 
+// The four lot views are covered by their own suites: the shell test only
+// proves navigation and mounting, so each view is replaced by a stub heading.
+vi.mock("../plan", () => ({
+  PlanTasksView: () => <h3>Plan et tâches</h3>,
+}));
+vi.mock("../samples", () => ({
+  SamplesResultsView: () => <h3>Échantillons et résultats</h3>,
+}));
+vi.mock("../workspace", () => ({
+  WorkspaceNotesView: () => <h3>Workspace et notes</h3>,
+}));
+vi.mock("../opinion", () => ({
+  OpinionNotesView: () => <h3>Note de l’analyste</h3>,
+}));
+
 const INVESTIGATION_ID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
 const SUBJECT_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const PATH = "/subjects/subject-1";
@@ -63,7 +78,6 @@ describe("WorkshopCockpit", () => {
       await screen.findByRole("heading", { name: "Plan et tâches" }),
     ).toBeInTheDocument();
     expect(screen.getByRole("tabpanel")).toBeInTheDocument();
-    expect(screen.getByText("Vue en cours d’implémentation.")).toBeTruthy();
   });
 
   it("navigue dans le tablist aux flèches, Home et End", async () => {

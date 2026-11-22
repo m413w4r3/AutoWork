@@ -205,6 +205,7 @@ function makeInvestigation(): InvestigationView {
     production_run_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
     synthesis_artifact_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
     synthesis_sha256: "1".repeat(64),
+    prose_authority: "bridge_only",
     status: "running",
     version: 7,
     stop_reason: null,
