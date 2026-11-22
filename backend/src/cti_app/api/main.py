@@ -23,6 +23,7 @@ from cti_app.api.editorial_workspace import router as editorial_workspace_router
 from cti_app.api.fusion import fusion_router
 from cti_app.api.health import router as health_router
 from cti_app.api.investigation import router as investigation_router
+from cti_app.api.investigation_bootstrap import router as investigation_bootstrap_router
 from cti_app.api.investigation_captures import (
     legacy_router as investigation_captures_legacy_router,
 )
@@ -776,6 +777,7 @@ def create_app() -> FastAPI:
     application.include_router(collection_router)
     application.include_router(model_conversations_router)
     application.include_router(investigation_router)
+    application.include_router(investigation_bootstrap_router)
     application.include_router(osint_policy_router)
     application.include_router(investigation_captures_router)
     application.include_router(investigation_captures_legacy_router)
