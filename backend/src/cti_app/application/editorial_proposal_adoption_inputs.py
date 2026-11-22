@@ -113,6 +113,7 @@ from cti_app.domain.production_editorial_enrichment import (
     SourceFigureDecision,
     SourceFigureInclusionStatus,
     editorial_enrichment_from_json,
+    editorial_enrichment_to_json,
 )
 from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionMode,
@@ -1127,6 +1128,7 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
             plan = plan_visual_revision(context, typed_patch)
         except VisualRevisionRejected as error:
             raise EditorialProposalAdoptionError(error.code) from None
+        revised_payload = editorial_enrichment_to_json(plan.revised_enrichment)
         return EnrichmentCandidateInputs(
             base_payload=base_payload,
             base_enrichment=base_enrichment,
@@ -1140,6 +1142,7 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
             artifact_id=uuid4(),
             figure_catalog=fence.figure_catalog,
             revised_enrichment=plan.revised_enrichment,
+            registry_lineage=self._enrichment_lineage(resolution, base_payload, revised_payload),
             is_create=False,
             is_delete=False,
             evidence_pack_hash=fence.evidence_pack_hash,
