@@ -1,0 +1,15 @@
+{
+  "revision": {
+    "revision_id": "rev-18629bee4b79f1d011d8df9e32d9b949",
+    "path": "notes/humaines/premier-constat.md",
+    "sha256": "2f8730ce568c194c9ab5313368370981b0e422b100dbcb4db23be3093c2a5939",
+    "size": 34,
+    "observed_at": "2026-11-22T12:00:00Z",
+    "origin": "ui",
+    "task_id": null,
+    "supersedes_revision_id": null
+  },
+  "created": true,
+  "already_present": false,
+  "conflict": false
+}

@@ -1,0 +1,18 @@
+{
+  "workspace_id": "ws-78593a79e6cef517466c70b66fcf25eb",
+  "host_path": "/synthetic/workspaces/IR2609/bluemoon-cn",
+  "created": true,
+  "manifest": {
+    "schema": "autowork-workspace-manifest.v1",
+    "workspace_id": "ws-78593a79e6cef517466c70b66fcf25eb",
+    "delivery_code": "IR2609",
+    "article_slug": "bluemoon-cn",
+    "subject_id": "3f6f2c1a-8a1e-4b7c-9d2f-1a2b3c4d5e6f",
+    "investigation_id": "9b8a7c6d-5e4f-4a3b-8c2d-1e0f2a3b4c5d",
+    "synthesis_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "created_at": "2026-11-22T12:00:00Z",
+    "created_by": "autowork-workspace-agent",
+    "layout_version": 1,
+    "identity_sha256": "300626f363455ae89d75728b59062f58242a83e98643a8e8235f7eefd440803b"
+  }
+}
