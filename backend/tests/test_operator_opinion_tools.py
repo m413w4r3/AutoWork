@@ -33,7 +33,9 @@ class OpinionService:
     async def get_draft(self, investigation_id):
         return AnalystOpinionDraftView(self.current, (self.current,), ())
 
-    async def revise(self, opinion_id, expected_version, edits, actor, *, expected_sha256):
+    async def revise(
+        self, opinion_id, expected_version, edits, actor, *, expected_sha256, writer_kind=None
+    ):
         self.revision = (opinion_id, expected_version, edits, actor, expected_sha256)
         self.current = SimpleNamespace(
             **{

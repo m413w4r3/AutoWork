@@ -625,6 +625,29 @@ class EvidenceObservation:
         object.__setattr__(self, "limitations", tuple(self.limitations))
 
 
+_ADVISORY_OBSERVATION_SOURCES = frozenset(
+    {"advisor.consult", "advisor.consult.response", "advisor.reparse"}
+)
+_ADVISORY_OBSERVATION_OBJECT_TYPES = frozenset({"advisor_call", "advisor_response_received"})
+
+
+def is_advisory_observation(observation: EvidenceObservation) -> bool:
+    """Return whether an observation carries Bridge advice rather than evidence.
+
+    Advisory material (ADR-0011 D4/E1) is readable in the consultation ledger
+    and context, but it is never canonical evidence: it may not be cited as a
+    finding ``observation_ref`` or an opinion ``evidence_ref``.
+    """
+    return (
+        (
+            observation.source in _ADVISORY_OBSERVATION_SOURCES
+            and observation.object_type in _ADVISORY_OBSERVATION_OBJECT_TYPES
+        )
+        or observation.source.startswith("advisor.")
+        or observation.object_type.startswith("advisor_")
+    )
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class InvestigationFinding:
     investigation_id: UUID
@@ -988,6 +1011,7 @@ __all__ = [
     "canonical_json_bytes",
     "freeze_json",
     "investigation_budget_from_loop_budget",
+    "is_advisory_observation",
     "thaw_json",
     "tool_operation_key",
 ]

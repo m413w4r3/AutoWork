@@ -15,6 +15,7 @@ from typing import Any, Literal, Protocol
 from uuid import UUID, uuid5
 
 from cti_app.application.analyst_handoff import AnalystHandoffPolicy, AnalystPostSynthesisService
+from cti_app.application.analyst_opinion_service import require_bridge_only_provenance
 from cti_app.application.article_novelty import (
     ArticleNoveltyService,
     NoveltyCandidate,
@@ -115,6 +116,7 @@ from cti_app.domain.analyst_opinion import (
     AnalystOpinionStatus,
     AnalystOpinionV1,
     OpinionBlock,
+    OpinionWriterKind,
     investigation_opinion_id,
     opinion_blocks_with_observations,
     verify_opinion_citations,
@@ -157,6 +159,7 @@ from cti_app.domain.investigation import (
     ToolInvocationActorKind,
     ToolInvocationStatus,
     canonical_json_bytes,
+    is_advisory_observation,
     thaw_json,
     tool_operation_key,
 )
@@ -4263,18 +4266,36 @@ class InvestigationService:
                 deduplicated += 1
                 continue
             raw_refs = tuple(proposal.observation_refs)
-            observation_refs = await self._valid_observation_refs(investigation_id, raw_refs)
+            evidence_ref_candidates: list[UUID] = []
+            advisory_refs: list[UUID] = []
+            for ref in raw_refs:
+                item = await self._observations.get(ref)
+                if (
+                    item is not None
+                    and item.investigation_id == investigation_id
+                    and is_advisory_observation(item)
+                ):
+                    advisory_refs.append(ref)
+                else:
+                    evidence_ref_candidates.append(ref)
+            observation_refs = await self._valid_observation_refs(
+                investigation_id, tuple(evidence_ref_candidates)
+            )
             evidence_items = []
             for ref in observation_refs:
                 item = await self._observations.get(ref)
                 if item is not None:
                     evidence_items.append(item)
             evidence_observations = tuple(evidence_items)
-            invalid_observations = len(observation_refs) != len(raw_refs)
+            invalid_observations = len(observation_refs) != len(raw_refs) or bool(advisory_refs)
             claim_refs = tuple(ref for ref in proposal.claim_refs if ref in known_claims)
             invalid_claims = len(claim_refs) != len(proposal.claim_refs)
             assessment = proposal.assessment
             limitations = list(proposal.limitations)
+            if advisory_refs:
+                limitations.append(
+                    "Backend excluded advisory Bridge observations from finding evidence."
+                )
             subject_ref = _normalize_subject_ref(proposal.subject_ref)
             if (
                 assessment is FindingAssessment.INCONCLUSIVE
@@ -4401,11 +4422,17 @@ class InvestigationService:
         delta: Any | None,
         valid_anchors: frozenset[str] = frozenset(),
     ) -> tuple[bool, tuple[str, ...]]:
-        if (
-            delta is None
-            or state.base_publication_artifact_id is None
-            or state.base_publication_sha256 is None
-        ):
+        if delta is None:
+            return False, ()
+        # The internal loop is a Bridge-led writer: a bridge_only investigation
+        # refuses it categorically before any opinion version can be written.
+        investigation = await self._require_investigation(investigation_id)
+        await require_bridge_only_provenance(
+            investigation,
+            None,
+            writer_kind=OpinionWriterKind.BRIDGE_LED,
+        )
+        if state.base_publication_artifact_id is None or state.base_publication_sha256 is None:
             return False, ()
         opinion_id = investigation_opinion_id(investigation_id)
         current = await self._opinions.get(opinion_id)
