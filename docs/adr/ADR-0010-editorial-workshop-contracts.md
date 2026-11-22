@@ -75,6 +75,8 @@ Cet amendement enregistre les décisions livrées par la mission 23. Il précise
 
 Sept variantes forment l’union fermée `VisualRevisionPatch` : `ReviseChartPatch` (`rewrite_chart`), `ReviseDiagramPatch` (`rewrite_diagram`), `UpdateVisualCaptionPatch` (`update_visual_caption`), `MoveEnrichmentElementPatch` (`move_enrichment_element`), `ReorderEnrichmentElementsPatch` (`reorder_enrichment_elements`), `ReplaceSourceFigurePatch` (`replace_source_figure`) et `RemoveEnrichmentElementPatch` (`delete_table`, `delete_diagram`, `delete_chart` ou `delete_source_figure` selon le kind). Chaque variante nomme l’élément exact qu’elle modifie ; un kind de wire inconnu est refusé, jamais ignoré.
 
+La cible typée de révision porte en outre un `occurrence_ordinal` additif et optionnel, utilisé uniquement pour distinguer deux paragraphes de contenu identique dans une même section ; la sérialisation et le `target_id` des cibles historiques restent identiques octet pour octet.
+
 La validation et l’application passent par une seule fonction, `plan_visual_revision` (`application/editorial_visual_revision/`), utilisée par la préparation manuelle, la préparation Bridge et l’adoption. Une seule route générique les expose : `POST /api/subjects/{subject_id}/editor/blocks/{occurrence_id}/enrichment-revisions`, avec `Idempotency-Key` obligatoire et une union discriminée sur `operation`. Le patch persisté est non canonique ; l’adoption le relit, le réinterprète dans la même union et réexécute le même planificateur sous le verrou du run. L’écrivain d’adoption de D2 reste l’unique écrivain d’une proposition acceptée.
 
 ### A2 — Ordre canonique des éléments, schéma V11 et migration 0018
@@ -105,17 +107,22 @@ Les opérations d’élément sont annoncées par élément dans `allowed_operat
 
 Un fil ouvert sur un élément d’enrichissement peut proposer uniquement `rewrite_chart`, `rewrite_diagram` et `update_visual_caption`. Les déplacements, réorganisations, remplacements et retraits sont manuels uniquement. Aucun éditeur manuel de graphique ou de diagramme n’est livré : leur correction passe par Bridge ; l’atelier ne rend pas l’image du diagramme et l’opérateur travaille depuis le titre, le diff structurel de la proposition et le PDF.
 
-`revise_diagram` conserve la clé, le placement et l’ordre explicite, refuse un patch sans changement et recompile le diagramme avec le compilateur D2 épinglé. Un nœud ou une arête ne peut être ajouté que si ses références de preuve étaient déjà admises pour ce diagramme (`diagram_evidence_not_previously_admitted` sinon) ; les preuves du purpose analytique sont préservées et doivent rester utilisées par le graphe. La route manuelle ne transporte pas `relation_type` : le traducteur force `FACTUAL` et une direction par défaut, tandis que le parseur Bridge préserve `relation_type` et `direction`. L’adoption recompile sous verrou ; si le binaire D2 installé ne correspond pas à la version épinglée, la compilation refuse (`diagram_compiler_version_mismatch`) au lieu de modifier l’asset silencieusement. L’ancien asset compilé reste référencé par la version antérieure de l’artefact.
+`revise_diagram` conserve la clé, le placement et l’ordre explicite, refuse un patch sans changement et recompile le diagramme avec le compilateur D2 épinglé. Un nœud ou une arête ne peut être ajouté que si ses références de preuve étaient déjà admises pour ce diagramme (`diagram_evidence_not_previously_admitted` sinon) ; les preuves du purpose analytique sont préservées et doivent rester utilisées par le graphe. La route manuelle transporte `relation_type` et `direction` optionnels : une valeur omise prend le défaut `FACTUAL`, et une direction omise est dérivée du type de relation (`COMPARISON` → `UNDIRECTED`, sinon `DIRECTED`) ; le parseur Bridge préserve les deux champs. L’adoption recompile sous verrou ; si le binaire D2 installé ne correspond pas à la version épinglée, la compilation refuse (`diagram_compiler_version_mismatch`) au lieu de modifier l’asset silencieusement. L’ancien asset compilé reste référencé par la version antérieure de l’artefact.
 
 ### A7 — Risques résiduels acceptés en M23
 
-- `application/editorial_proposals.py` reste un monolithe d’environ 5 300 lignes (5 267 au 2026-11-22), non contracté.
-- Dette de seam `PinnedEnrichmentInputs` (S-03/S-04) : les nouveaux modules atteignent des attributs privés de service et des chaînes `getattr`, et la séquence de chargement épinglé comme la persistance de préparation visuelle restent dupliquées. Un seam public typé reste à extraire.
-- Aucune preuve de transport Bridge réel : tous les chemins Bridge sont exercés avec des doubles fournisseur.
-- Les e2e UI tournent sur une API stubbée ; le smoke real-backend-lite (`frontend/e2e-real/editorial/workspace_real.spec.ts`) existe mais exige une attestation d’environnement explicite et n’est pas exécuté par la configuration Playwright éditoriale standard.
-- Un BRIEF V9 historique dont les `resolved_placements` portent des coordonnées synthèse refuse le rendu (`editorial_anchor_stale`) jusqu’à réassemblage.
+- `application/editorial_proposals.py` reste un monolithe de 5 353 lignes au HEAD intégré, non contracté.
+- Dette de seam `PinnedEnrichmentInputs` (S-03/S-04) : le chargeur de révisions visuelles, l’adoption et le contexte de discussion atteignent des attributs privés de service et des chaînes `getattr`, y compris l’import d’une classe privée ; la séquence de chargement épinglé et le bloc de préparation/persistance d’une proposition visuelle restent dupliqués. Un seam public typé reste à extraire.
+- Validation de forme dupliquée (S-02 résiduel) : les constantes de domaine sont partagées, mais la logique de validation de forme des requêtes visuelles duplique encore les invariants du codec strict.
+- SEC F5 (mineur) : la route legacy pilotée par modèle accepte encore `operation=update_visual_caption` ; le contrat « aucun appel modèle » de la route typée peut donc être contourné par le libellé, et une cible `ENRICHMENT_ORDER` y déclenche une erreur serveur plutôt qu’un refus typé.
+- SEC F7 (mineur) : la route d’acceptation traduit `editorial_read_only` en 409 alors que la route de préparation visuelle le traduit en 403 ; même refus, statut différent, le code restant résolu côté interface.
+- Aucune preuve de transport Bridge réel : tous les chemins Bridge sont exercés avec des doubles fournisseur, et aucun appel de fournisseur live n’a été effectué ni autorisé.
+- Les e2e UI standard tournent sur une API stubbée. Le smoke real-backend-lite (`frontend/e2e-real/editorial/workspace_real.spec.ts`) est exécuté par `make test-editorial-browser` et en CI contre PostgreSQL réel, l’application FastAPI réelle, un provider factice et un stockage de blobs en mémoire ; ses huit tests (rendu du workspace amorcé, E01/E01b/E04/E10–E13) sont verts au HEAD intégré et ne couvrent pas le tour de proposition Bridge.
+- L’audit axe n’a pas été réalisé ; les comportements clavier et focus sont couverts par des tests, pas par un audit automatisé.
+- Les revues indépendantes ont été menées par des sessions indépendantes à contexte neuf du modèle DeepSeek Flash max, le quota GPT-6 Luna étant épuisé jusqu’au 2026-11-23 11:48 ; une revue indépendante en lecture seule du résultat intégré par Luna xhigh reste recommandée avant toute release.
+- Un BRIEF V9 historique dont les `resolved_placements` portent des coordonnées synthèse refuse le rendu (`editorial_anchor_stale`) jusqu’à réassemblage ; les placements `after_section` d’un BRIEF dont les sections sont réindexées par la fusion overview ne sont pas remappés, seuls les ancres `after_paragraph` et `after_lead` suivant la carte de fusion.
 - La réutilisation inter-run d’enrichissement n’est pas exacte : les ancres sont scopées au run, les quatre étapes amont coûteuses sont réutilisées sans appel modèle, et chaque run paie un appel d’enrichissement.
-- La correction graphique/diagramme est réservée à Bridge et l’audit axe n’a pas été réalisé.
+- La correction graphique/diagramme est réservée à Bridge : aucun éditeur manuel de graphique ou de diagramme n’est livré, la route manuelle `revise_diagram` n’est pas exposée dans l’interface, et le diagramme n’est pas rendu dans l’atelier.
 
 ## Écarts et risques résiduels connus
 
@@ -127,7 +134,7 @@ Un fil ouvert sur un élément d’enrichissement peut proposer uniquement `rewr
 - Heuristique de kind V4–V6 : résolveur legacy ADR-0008 (D1/D5).
 - Audit axe non réalisé (risque accepté).
 - Curseur d’historique non signé (filtrage par sujet intact).
-- Dette et limites introduites par M23 (monolithe, seam épinglé, transport Bridge non prouvé, e2e stubbée, BRIEF V9, réutilisation non exacte, limites graphique/diagramme) : voir Amendement M23 §A7.
+- Dette et limites introduites par M23 (monolithe, seam épinglé, validation de forme dupliquée, transport Bridge non prouvé, e2e standard stubbée et smoke real-backend limité, BRIEF V9 et placements `after_section`, réutilisation non exacte, limites graphique/diagramme, audit axe, statuts SEC F5/F7) : voir Amendement M23 §A7.
 
 ## Options rejetées
 

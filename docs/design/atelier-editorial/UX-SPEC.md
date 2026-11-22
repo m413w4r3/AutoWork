@@ -104,7 +104,7 @@ Les deux types utilisent le même atelier, les mêmes états et la même navigat
 
 ### Onglets et priorité
 
-Onglets : « Discussion », « Modifier », « Visuels », « Sources », « Historique ». L’insertion vit dans l’onglet « Visuels » (« Ajouter après ce bloc »). La Discussion prend la priorité d’affichage dès qu’un fil est actif pour le bloc : sélectionner un autre onglet n’archive ni ne remplace le fil, et revenir au bloc le restaure. Lors d’une réponse asynchrone, ne pas détourner le focus ni remplacer un autre onglet. L’en-tête indique « Discussion sur : [début du paragraphe] » (ou le titre du bloc) et « Changer de cible ».
+Onglets : « Discussion Bridge » (libellé compact « Discussion » sous 1280 px), « Modifier », « Visuels », « Sources », « Historique ». L’insertion vit dans l’onglet « Visuels » (« Ajouter après ce bloc »). La Discussion prend la priorité d’affichage dès qu’un fil est actif pour le bloc : sélectionner un autre onglet n’archive ni ne remplace le fil, et revenir au bloc le restaure. Lors d’une réponse asynchrone, ne pas détourner le focus ni remplacer un autre onglet. L’en-tête indique « Discussion sur : [début du paragraphe] » (ou le titre du bloc) et « Changer de cible ».
 
 L’historique est chronologique et différencie messages utilisateur, réponses Bridge, propositions, décisions et refus de preuve. Il rappelle la version de référence d’un fil conservé. Le contexte envoyé est celui du bloc, de sa section, des preuves admises, des passages adjacents utiles, du fil et des règles éditoriales ; jamais tout le sujet par défaut. Les sorties et messages ne deviennent pas des preuves.
 
