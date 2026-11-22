@@ -30,6 +30,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     jobs,
     media_assets,
     model_execution,
+    opinion_note_proposals,
     osint_open_policy,
     production,
     production_routing,
@@ -107,6 +108,7 @@ _INVESTIGATION_TASK_TABLES = frozenset(
 _INVESTIGATION_HANDOFF_TABLES = frozenset({"investigation_handoffs"})
 _AGENT_SESSION_TABLES = frozenset({"agent_sessions", "agent_session_instructions"})
 _WORK_CONTRIBUTION_TABLES = frozenset({"work_contributions"})
+_NOTE_PROPOSAL_TABLES = frozenset({"investigation_note_proposals"})
 _TOOL_INVOCATION_ATTRIBUTION_COLUMNS = frozenset({"task_id", "actor_kind", "actor_id"})
 _TOOL_INVOCATION_ATTRIBUTION_CHECKS = frozenset(
     {"ck_tool_invocations_actor_kind", "ck_tool_invocations_actor_pair"}
@@ -179,6 +181,7 @@ def _metadata_for_frozen_baseline() -> MetaData:
             or source_table.name in _INVESTIGATION_HANDOFF_TABLES
             or source_table.name in _AGENT_SESSION_TABLES
             or source_table.name in _WORK_CONTRIBUTION_TABLES
+            or source_table.name in _NOTE_PROPOSAL_TABLES
         ):
             continue
         table = source_table.to_metadata(metadata)

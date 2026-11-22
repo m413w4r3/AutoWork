@@ -118,6 +118,7 @@ def test_schema_uses_a_frozen_baseline_and_additive_c2_revision() -> None:
         "0022_investigation_handoffs.py",
         "0023_agent_sessions.py",
         "0024_work_contributions.py",
+        "0025_opinion_note_proposals.py",
     ]
 
 

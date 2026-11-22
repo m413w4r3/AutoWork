@@ -15,6 +15,7 @@ from cti_app.application.investigation_persistence import (
     InvestigationHandoffRepository,
     InvestigationPlanRepository,
     InvestigationTaskRepository,
+    NoteProposalRepository,
     SampleAssociationRepository,
     ToolInvocationRepository,
     WorkContributionRepository,
@@ -103,6 +104,9 @@ from cti_app.application.persistence import (
     VirusTotalObservationRepository,
 )
 from cti_app.application.production_read_model import BatchStatusReadRepository
+from cti_app.infrastructure.database.models import (
+    opinion_note_proposals as _opinion_note_proposal_models,  # noqa: F401
+)
 from cti_app.infrastructure.database.models import (
     osint_open_policy as _osint_open_policy_models,  # noqa: F401
 )
@@ -223,6 +227,9 @@ from cti_app.infrastructure.database.repositories.model_conversations import (
 from cti_app.infrastructure.database.repositories.model_runs import (
     SqlAlchemyModelOutputRejectionRepository,
     SqlAlchemyModelRunRepository,
+)
+from cti_app.infrastructure.database.repositories.opinion_note_proposals import (
+    SqlAlchemyNoteProposalRepository,
 )
 from cti_app.infrastructure.database.repositories.osint_open_policy import (
     SqlAlchemyOsintOpenPolicyRepository,
@@ -346,6 +353,7 @@ class SqlAlchemyUnitOfWork:
     investigation_handoffs: InvestigationHandoffRepository
     agent_sessions: AgentSessionRepository
     work_contributions: WorkContributionRepository
+    investigation_note_proposals: NoteProposalRepository
     production_runs: ProductionRunRepository
     production_routing_decisions: ProductionRoutingDecisionRepository
     editorial_workspace_snapshots: EditorialWorkspaceSnapshotRepository
@@ -459,6 +467,7 @@ class SqlAlchemyUnitOfWork:
         self.investigation_handoffs = SqlAlchemyInvestigationHandoffRepository(self._session)
         self.agent_sessions = SqlAlchemyAgentSessionRepository(self._session)
         self.work_contributions = SqlAlchemyWorkContributionRepository(self._session)
+        self.investigation_note_proposals = SqlAlchemyNoteProposalRepository(self._session)
         self.production_runs = SqlAlchemyProductionRunRepository(self._session)
         self.production_routing_decisions = SqlAlchemyProductionRoutingDecisionRepository(
             self._session

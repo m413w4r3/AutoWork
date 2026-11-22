@@ -67,6 +67,12 @@ EXPECTED_REPOSITORIES = {
         ports.InMemoryWorkContributionRepository,
         uow_module.SqlAlchemyWorkContributionRepository,
     ),
+    # Lot 08B follows 07 in the total migration order.
+    "investigation_note_proposals": (
+        ports.NoteProposalRepository,
+        ports.InMemoryNoteProposalRepository,
+        uow_module.SqlAlchemyNoteProposalRepository,
+    ),
 }
 
 

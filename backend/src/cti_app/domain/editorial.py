@@ -36,6 +36,7 @@ class AnalystDecisionType(StrEnum):
     PLAN_REJECT = "plan_reject"
     TASK_RESULT_ACCEPT = "task_result_accept"
     TASK_RESULT_CHANGES_REQUESTED = "task_result_changes_requested"
+    WORKSPACE_CONFLICT_RESOLVE = "workspace_conflict_resolve"
 
 
 class AnalystDecisionTargetType(StrEnum):
@@ -49,6 +50,7 @@ class AnalystDecisionTargetType(StrEnum):
     NOTE = "note"
     PLAN_VERSION = "plan_version"
     TASK = "task"
+    WORKSPACE_CONFLICT = "workspace_conflict"
 
 
 @dataclass(frozen=True, slots=True)

@@ -33,8 +33,11 @@ def test_enums_and_sql_values_aligned() -> None:
     assert "plan_version" in target_types
     assert {"task_result_accept", "task_result_changes_requested"} <= decision_types
     assert "task" in target_types
-    assert len(decision_types) == 14
-    assert len(target_types) == 10
+    # 0025 adds the workspace-conflict resolution decision for the later lot.
+    assert "workspace_conflict_resolve" in decision_types
+    assert "workspace_conflict" in target_types
+    assert len(decision_types) == 15
+    assert len(target_types) == 11
 
     # Existing values are preserved: M24 is additive for legacy decisions.
     assert {
