@@ -1,0 +1,62 @@
+{
+  "schema": "autowork-session-signing.v1",
+  "scheme": "v1=HMAC-SHA256(secret, method\\0path+query\\0session_id\\0sha256(body)\\0idempotency_key\\0timestamp)",
+  "note": "Synthetic test-only secret. method is the exact HTTP method, path+query is the exact request target, body is UTF-8 text, timestamp is decimal unix seconds, and the six fields join with a single NUL; no trailing NUL. The test recomputes each vector with the Python hmac stdlib independently of the shim.",
+  "vectors": [
+    {
+      "name": "adr_d7_canonical",
+      "secret_b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "method": "POST",
+      "path_and_query": "/api/investigations/3f6f2c1a-8a1e-4b7c-9d2f-1a2b3c4d5e6f/agent-sessions/5d3f0a6e-7c2b-4b8f-9a1d-2e4c6b8a0f13/tool-calls",
+      "session_id": "5d3f0a6e-7c2b-4b8f-9a1d-2e4c6b8a0f13",
+      "body": "{\"arguments\":{\"consultation_type\":\"pivot_strategy\",\"question\":\"synthetic\"},\"schema_version\":\"advisor-consult.v1\",\"tool_name\":\"advisor.consult\"}",
+      "idempotency_key": "0000000000000000000000000000000000000000000000000000000000000000",
+      "timestamp": 1763800000,
+      "expected_signature": "v1=cbcf64f48f344c69b7f80da3b74a513806145a7c890d7c6888174bb5050200c4"
+    },
+    {
+      "name": "empty_body",
+      "secret_b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "method": "GET",
+      "path_and_query": "/health?probe=1",
+      "session_id": "5d3f0a6e-7c2b-4b8f-9a1d-2e4c6b8a0f13",
+      "body": "",
+      "idempotency_key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timestamp": 1763800001,
+      "expected_signature": "v1=d080e9e9fcd35b520cccf43dbec261f0f3d8877d6d20409360f3bf1bea9dd925"
+    },
+    {
+      "name": "query_string",
+      "secret_b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "method": "POST",
+      "path_and_query": "/api/investigations/3f6f2c1a-8a1e-4b7c-9d2f-1a2b3c4d5e6f/tasks/a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d/commands?after=1&limit=2",
+      "session_id": "5d3f0a6e-7c2b-4b8f-9a1d-2e4c6b8a0f13",
+      "body": "{\"command\":\"heartbeat\",\"expected_status_version\":7,\"lease_fence\":3}",
+      "idempotency_key": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "timestamp": 1763800002,
+      "expected_signature": "v1=5fcc1cdfdd7ee85d0eeab1e83f13da03cf72bc7d9bc8b1b6c2d7e3b5b835eb5b"
+    },
+    {
+      "name": "utf8_body",
+      "secret_b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "method": "POST",
+      "path_and_query": "/api/investigations/3f6f2c1a-8a1e-4b7c-9d2f-1a2b3c4d5e6f/handoffs",
+      "session_id": "5d3f0a6e-7c2b-4b8f-9a1d-2e4c6b8a0f13",
+      "body": "{\"next_action\":\"Vérifier la hypothèse nº 2 — données synthétiques\",\"task_id\":\"a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d\"}",
+      "idempotency_key": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "timestamp": 1763800003,
+      "expected_signature": "v1=b3e11dcadec5c5e737a2735ae2ba4852c36ee310d19779ac596380deb755bfac"
+    },
+    {
+      "name": "heartbeat_command",
+      "secret_b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "method": "POST",
+      "path_and_query": "/api/investigations/3f6f2c1a-8a1e-4b7c-9d2f-1a2b3c4d5e6f/tasks/a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d/commands",
+      "session_id": "5d3f0a6e-7c2b-4b8f-9a1d-2e4c6b8a0f13",
+      "body": "{\"command\":\"heartbeat\",\"expected_status_version\":4,\"lease_fence\":11}",
+      "idempotency_key": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "timestamp": 1763800004,
+      "expected_signature": "v1=45ad9414cb6bcd9941caaf5f56745b75974fb9a2927c74cedc9ec2b0520b95fa"
+    }
+  ]
+}
