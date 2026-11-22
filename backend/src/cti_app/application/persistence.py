@@ -23,6 +23,7 @@ from cti_app.application.investigation_persistence import (
     WorkspaceBindingRepository,
     WorkspaceFileEventRepository,
     WorkspaceFileRevisionRepository,
+    WorkspaceNoteAnnotationRepository,
     WorkspaceSyncCursorRepository,
 )
 from cti_app.application.investigation_persistence import (
@@ -1262,6 +1263,7 @@ class UnitOfWork(Protocol):
     agent_sessions: AgentSessionRepository
     work_contributions: WorkContributionRepository
     investigation_note_proposals: NoteProposalRepository
+    workspace_note_annotations: WorkspaceNoteAnnotationRepository
     # Defined further down in this module.
     production_runs: ProductionRunRepository
     production_routing_decisions: ProductionRoutingDecisionRepository
