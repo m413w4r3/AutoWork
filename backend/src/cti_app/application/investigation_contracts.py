@@ -273,6 +273,8 @@ AdvisorConsultationType = Literal[
     "draft_text",
     "suricata_draft",
     "figure_plan",
+    "interpretation",
+    "critique",
 ]
 
 
