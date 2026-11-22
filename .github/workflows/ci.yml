@@ -226,6 +226,8 @@ jobs:
         run: make test-workflow-browser
       - name: Workflow J2 — investigation, human repin and real PDF
         run: make test-workflow-browser-investigation
+      - name: Editorial M23 — workshop browser smoke with real PostgreSQL
+        run: make test-editorial-browser
       - name: Upload W10/J2 browser report and trace
         if: failure()
         uses: actions/upload-artifact@v4
