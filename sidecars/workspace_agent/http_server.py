@@ -15,6 +15,7 @@ import socket
 import stat
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -22,7 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
-from . import protocol
+from . import paths, protocol, workspace
 from .auth import verify_bearer
 
 if TYPE_CHECKING:
@@ -125,15 +126,27 @@ class SocketPathError(RuntimeError):
 
 
 class _RequestRejected(Exception):
-    def __init__(self, status: int, code: protocol.ErrorCode, message: str) -> None:
+    def __init__(
+        self,
+        status: int,
+        code: protocol.ErrorCode,
+        message: str,
+        *,
+        retryable: bool = False,
+        details: Mapping[str, object] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status = status
         self.code = code
         self.message = message
+        self.retryable = retryable
+        self.details = details
 
     @property
     def envelope(self) -> dict[str, object]:
-        return protocol.error_envelope(self.code, self.message)
+        return protocol.error_envelope(
+            self.code, self.message, retryable=self.retryable, details=self.details
+        )
 
 
 def match_route(method: str, path: str) -> Route | None:
@@ -239,16 +252,18 @@ class WorkspaceAgentRequestHandler(BaseHTTPRequestHandler):
             return 404, protocol.error_envelope(
                 protocol.ErrorCode.NOT_IMPLEMENTED, "sessions are reserved"
             )
-        return self._dispatch_workspace(method, route)
+        return self._dispatch_workspace(method, path, route)
 
-    def _dispatch_workspace(self, method: str, route: Route) -> tuple[int, dict[str, object]]:
-        # W1 implements protocol framing only; operations arrive in W2-W5.
+    def _dispatch_workspace(
+        self, method: str, path: str, route: Route
+    ) -> tuple[int, dict[str, object]]:
+        declared_length: int | None = None
         if method in {"POST", "PUT", "PATCH"}:
-            declared = self._declared_content_length()
+            declared_length = self._declared_content_length()
             limit = route.body_limit
             if limit is None:
                 limit = protocol.JSON_BODY_LIMIT
-            if declared > limit:
+            if declared_length > limit:
                 raise _RequestRejected(
                     413,
                     protocol.ErrorCode.SIZE_LIMIT,
@@ -262,9 +277,70 @@ class WorkspaceAgentRequestHandler(BaseHTTPRequestHandler):
                     protocol.ErrorCode.INVALID_REQUEST,
                     "missing or invalid Idempotency-Key",
                 )
+        try:
+            if method == "POST" and route.template == "/v1/workspaces/ensure":
+                assert declared_length is not None
+                return self._handle_ensure(declared_length)
+            if method == "GET" and route.template == "/v1/workspaces":
+                return 200, self._workspace_list_payload()
+            if method == "GET" and route.template == "/v1/workspaces/{workspace_id}":
+                workspace_id = path.rsplit("/", 1)[-1]
+                descriptor = self._agent().workspaces.get_workspace(workspace_id)
+                return 200, self._workspace_payload(descriptor)
+        except (workspace.WorkspaceError, paths.WorkspacePathError) as exc:
+            raise _RequestRejected(exc.status, exc.code, exc.message, details=exc.details) from exc
         return 501, protocol.error_envelope(
             protocol.ErrorCode.NOT_IMPLEMENTED, "operation not implemented yet"
         )
+
+    def _handle_ensure(self, declared_length: int) -> tuple[int, dict[str, object]]:
+        raw = self._read_body(declared_length)
+        try:
+            payload = protocol.decode_json_object(raw)
+        except protocol.ProtocolError as exc:
+            raise _RequestRejected(
+                400, protocol.ErrorCode.INVALID_REQUEST, "malformed JSON body"
+            ) from exc
+        request = workspace.EnsureWorkspaceRequest.from_mapping(payload)
+        descriptor = self._agent().workspaces.ensure(request)
+        status = 201 if descriptor.created else 200
+        return status, self._workspace_payload(descriptor)
+
+    def _read_body(self, declared_length: int) -> bytes:
+        try:
+            body = self.rfile.read(declared_length)
+        except OSError as exc:
+            raise _RequestRejected(
+                400, protocol.ErrorCode.INVALID_REQUEST, "request body cannot be read"
+            ) from exc
+        if len(body) != declared_length:
+            raise _RequestRejected(
+                400, protocol.ErrorCode.INVALID_REQUEST, "truncated request body"
+            )
+        return body
+
+    @staticmethod
+    def _workspace_payload(descriptor: workspace.WorkspaceDescriptor) -> dict[str, object]:
+        return {
+            "workspace_id": descriptor.workspace_id,
+            "host_path": descriptor.host_path,
+            "created": descriptor.created,
+            "manifest": dict(descriptor.manifest),
+        }
+
+    def _workspace_list_payload(self) -> dict[str, object]:
+        return {
+            "workspaces": [
+                {
+                    "workspace_id": summary.workspace_id,
+                    "delivery_code": summary.delivery_code,
+                    "article_slug": summary.article_slug,
+                    "host_path": summary.host_path,
+                    "generation": summary.generation,
+                }
+                for summary in self._agent().workspaces.list_workspaces()
+            ]
+        }
 
     def _declared_content_length(self) -> int:
         if self.headers.get("Transfer-Encoding") is not None:

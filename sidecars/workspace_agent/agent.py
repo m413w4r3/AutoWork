@@ -21,6 +21,7 @@ from pathlib import Path
 from .auth import generate_token, rotate_token_file
 from .http_server import WorkspaceAgentHTTPServer
 from .protocol import PROTOCOL_VERSION, format_rfc3339_utc
+from .workspace import WorkspaceManager
 
 LOGGER = logging.getLogger("autowork.workspace_agent")
 
@@ -150,6 +151,7 @@ class WorkspaceAgent:
         self.started_at = format_rfc3339_utc(datetime.now(UTC))
         self.token: str | None = None
         self.runtime_dir: Path | None = None
+        self.workspaces = WorkspaceManager(config.root)
         self._lock = InstanceLock(config.socket_dir / LOCK_FILE_NAME)
         self._server: WorkspaceAgentHTTPServer | None = None
         self._ready = threading.Event()

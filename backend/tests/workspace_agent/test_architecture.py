@@ -25,6 +25,7 @@ ALLOWED_IMPORTS = frozenset(
         "enum",
         "fcntl",
         "grp",
+        "hashlib",
         "hmac",
         "http",
         "json",
@@ -40,6 +41,7 @@ ALLOWED_IMPORTS = frozenset(
         "threading",
         "time",
         "typing",
+        "unicodedata",
         "urllib",
         "uuid",
     }
