@@ -48,6 +48,10 @@ from cti_app.domain.investigation_plan import (
     InvestigationPlanVersion,
 )
 from cti_app.domain.investigation_task import InvestigationTaskV1, TaskStatus
+from cti_app.domain.opinion_note_proposal import (
+    NoteProposalStatus,
+    NoteProposalV1,
+)
 from cti_app.domain.work_contribution import (
     WorkContributionCategory,
     WorkContributionImportStatus,
@@ -229,6 +233,34 @@ class WorkContributionRepository(Protocol):
     async def append_if_absent(
         self, contribution: WorkContributionV1
     ) -> tuple[WorkContributionV1, bool]: ...
+
+
+class NoteProposalRepository(Protocol):
+    """Non-canonical Bridge note proposals (ADR-0011 D2/D4).
+
+    ``append_if_absent`` returns the stored row for a replay of the same
+    idempotency key and refuses a key reused for a different request.  Every
+    later transition is a compare-and-swap on ``status_version``.
+    """
+
+    async def get(self, proposal_id: UUID) -> NoteProposalV1 | None: ...
+
+    async def get_by_idempotency(
+        self, investigation_id: UUID, idempotency_key: str
+    ) -> NoteProposalV1 | None: ...
+
+    async def list_for_investigation(
+        self,
+        investigation_id: UUID,
+        *,
+        status: NoteProposalStatus | None = None,
+    ) -> tuple[NoteProposalV1, ...]: ...
+
+    async def append_if_absent(self, proposal: NoteProposalV1) -> tuple[NoteProposalV1, bool]: ...
+
+    async def update_if_version(
+        self, proposal: NoteProposalV1, *, expected_status_version: int
+    ) -> NoteProposalV1 | None: ...
 
 
 class DetectionCandidateRepository(Protocol):
@@ -969,6 +1001,96 @@ def same_work_contribution_request(
         and stored.file_sha256 == candidate.file_sha256
         and stored.task_id == candidate.task_id
     )
+
+
+def same_note_proposal_request(stored: NoteProposalV1, candidate: NoteProposalV1) -> bool:
+    """Compare the identity a replayed idempotency key commits to."""
+    return (
+        stored.anchor == candidate.anchor
+        and stored.target_block_type is candidate.target_block_type
+        and stored.bridge_block_type is candidate.bridge_block_type
+        and stored.consultation_type is candidate.consultation_type
+        and stored.base_note_id == candidate.base_note_id
+        and stored.note_state is candidate.note_state
+        and stored.note_relation is candidate.note_relation
+        and stored.cited_finding_refs == candidate.cited_finding_refs
+        and stored.cited_observation_refs == candidate.cited_observation_refs
+        and stored.base_opinion_version == candidate.base_opinion_version
+        and stored.base_opinion_sha256 == candidate.base_opinion_sha256
+        and stored.task_id == candidate.task_id
+    )
+
+
+class InMemoryNoteProposalRepository:
+    """In-memory port fake sharing the idempotency and CAS rules."""
+
+    def __init__(self) -> None:
+        self._items: dict[UUID, NoteProposalV1] = {}
+        self._lock = asyncio.Lock()
+
+    async def get(self, proposal_id: UUID) -> NoteProposalV1 | None:
+        return self._items.get(proposal_id)
+
+    async def get_by_idempotency(
+        self, investigation_id: UUID, idempotency_key: str
+    ) -> NoteProposalV1 | None:
+        return next(
+            (
+                item
+                for item in self._items.values()
+                if item.investigation_id == investigation_id
+                and item.idempotency_key == idempotency_key
+            ),
+            None,
+        )
+
+    async def list_for_investigation(
+        self,
+        investigation_id: UUID,
+        *,
+        status: NoteProposalStatus | None = None,
+    ) -> tuple[NoteProposalV1, ...]:
+        return tuple(
+            sorted(
+                (
+                    item
+                    for item in self._items.values()
+                    if item.investigation_id == investigation_id
+                    and (status is None or item.status is status)
+                ),
+                key=lambda item: (item.created_at, str(item.id)),
+            )
+        )
+
+    async def append_if_absent(self, proposal: NoteProposalV1) -> tuple[NoteProposalV1, bool]:
+        async with self._lock:
+            existing_key = await self.get_by_idempotency(
+                proposal.investigation_id, proposal.idempotency_key
+            )
+            if existing_key is not None:
+                if not same_note_proposal_request(existing_key, proposal):
+                    raise VersionConflictError(
+                        "Note proposal idempotency key records a different request"
+                    )
+                return existing_key, False
+            if proposal.id in self._items:
+                raise VersionConflictError("Note proposal id is already used")
+            self._items[proposal.id] = proposal
+            return proposal, True
+
+    async def update_if_version(
+        self, proposal: NoteProposalV1, *, expected_status_version: int
+    ) -> NoteProposalV1 | None:
+        async with self._lock:
+            current = self._items.get(proposal.id)
+            if current is None or current.status_version != expected_status_version:
+                return None
+            if proposal.status_version != expected_status_version + 1:
+                raise ValueError("A note proposal update must advance one status version")
+            if current.investigation_id != proposal.investigation_id:
+                raise ValueError("A note proposal update must retain its investigation")
+            self._items[proposal.id] = proposal
+            return proposal
 
 
 class InMemoryDetectionCandidateRepository:
@@ -1939,6 +2061,7 @@ __all__ = [
     "InMemoryInvestigationHandoffRepository",
     "InMemoryInvestigationPlanRepository",
     "InMemoryInvestigationTaskRepository",
+    "InMemoryNoteProposalRepository",
     "InMemorySampleAssociationRepository",
     "InMemoryToolInvocationRepository",
     "InMemoryWorkContributionRepository",
@@ -1952,6 +2075,7 @@ __all__ = [
     "InvestigationHandoffRepository",
     "InvestigationPlanRepository",
     "InvestigationTaskRepository",
+    "NoteProposalRepository",
     "SampleAssociationRepository",
     "ToolInvocationRepository",
     "VersionConflictError",
@@ -1960,5 +2084,6 @@ __all__ = [
     "WorkspaceFileEventRepository",
     "WorkspaceFileRevisionRepository",
     "WorkspaceSyncCursorRepository",
+    "same_note_proposal_request",
     "same_work_contribution_request",
 ]

@@ -16,6 +16,7 @@ from cti_app.application.investigation_persistence import (
     InvestigationHandoffRepository,
     InvestigationPlanRepository,
     InvestigationTaskRepository,
+    NoteProposalRepository,
     SampleAssociationRepository,
     ToolInvocationRepository,
     WorkContributionRepository,
@@ -1260,6 +1261,7 @@ class UnitOfWork(Protocol):
     investigation_handoffs: InvestigationHandoffRepository
     agent_sessions: AgentSessionRepository
     work_contributions: WorkContributionRepository
+    investigation_note_proposals: NoteProposalRepository
     # Defined further down in this module.
     production_runs: ProductionRunRepository
     production_routing_decisions: ProductionRoutingDecisionRepository

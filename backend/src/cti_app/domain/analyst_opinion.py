@@ -177,6 +177,7 @@ class OpinionWriterKind(StrEnum):
 
     HUMAN = "human"
     SYSTEM = "system"
+    SYSTEM_FROM_BRIDGE = "system_from_bridge"
     OPERATOR_TOOL = "operator_tool"
     BRIDGE_LED = "bridge_led"
 

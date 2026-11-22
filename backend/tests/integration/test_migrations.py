@@ -80,6 +80,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     investigation_tasks,
     jobs,
     model_execution,
+    opinion_note_proposals,
     osint_open_policy,
     production,
     production_routing,
@@ -1250,7 +1251,7 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     command.upgrade(config, "head")
     command.current(config)
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert _head_revision() == "0024_work_contributions"
+    assert _head_revision() == "0025_opinion_note_proposals"
     assert asyncio.run(_alembic_version_column_length(temporary_postgres_url)) == 64
 
     collection_attempt_columns = asyncio.run(
@@ -1618,7 +1619,7 @@ def test_frozen_collection_attempt_baseline_precedes_acquisition_additions(
 
     command.upgrade(config, "head")
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert _head_revision() == "0024_work_contributions"
+    assert _head_revision() == "0025_opinion_note_proposals"
     final_schema = asyncio.run(_database_snapshot(temporary_postgres_url))["collection_attempts"]
     table = Base.metadata.tables["collection_attempts"]
     assert final_schema["columns"] == _expected_columns(table)
@@ -1857,6 +1858,7 @@ def test_migration_up_and_down_on_temporary_postgres(temporary_postgres_url: str
             "agent_sessions",
             "agent_session_instructions",
             "work_contributions",
+            "investigation_note_proposals",
         }
     )
     at_0004 = asyncio.run(_database_snapshot(temporary_postgres_url))

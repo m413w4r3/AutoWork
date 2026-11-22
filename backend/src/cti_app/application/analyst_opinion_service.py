@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Awaitable, Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any, Protocol, cast
 from uuid import UUID, uuid5
@@ -70,6 +70,12 @@ from cti_app.domain.investigation import (
     ToolInvocationStatus,
     is_advisory_observation,
 )
+from cti_app.domain.opinion_note_proposal import (
+    NoteProposalAcceptanceV1,
+    NoteProposalConsultationType,
+    NoteProposalStatus,
+    note_proposal_note_id,
+)
 from cti_app.domain.production import (
     AnalystInvestigation,
     ProductionArtifact,
@@ -87,6 +93,8 @@ from cti_app.domain.publication_document import (
 
 _OPINION_NAMESPACE = UUID("f141ae8e-999c-4a7f-b07d-5ffb0bd7b86d")
 _DECISION_NAMESPACE = UUID("6fd4bf30-7369-4c64-9bf4-d5bd17c67ce2")
+_NOTE_PROPOSAL_DECISION_NAMESPACE = UUID("c7f0a2e4-5b3d-5a61-9e2f-47d8b0c6f193")
+_NOTE_ACCEPTANCE_AUTHOR = "system:note-acceptance"
 _OPERATOR_NOTE_NAMESPACE = UUID("a6088d45-c437-4d6c-9d7b-0cc75a789410")
 OPERATOR_OPINION_SCHEMA_VERSION = "operator-opinion.v1"
 _OPERATOR_BLOCK_TYPES = tuple(
@@ -161,6 +169,9 @@ class OpinionErrorCode(StrEnum):
     BRIDGE_AUTHORSHIP_REQUIRED = "bridge_authorship_required"
     BRIDGE_PROSE_FORBIDDEN = "bridge_prose_forbidden"
     BRIDGE_MODIFIED_PROSE_FORBIDDEN = "bridge_modified_prose_forbidden"
+    NOTE_PROPOSAL_NOT_FOUND = "note_proposal_not_found"
+    STALE_NOTE_PROPOSAL = "stale_note_proposal"
+    BRIDGE_PROVENANCE_INVALID = "bridge_provenance_invalid"
 
 
 class OpinionError(ValueError):
@@ -1016,6 +1027,415 @@ class AnalystOpinionService:
             )
             await uow.commit()
             return saved
+
+    async def accept_note_proposal(
+        self,
+        investigation_id: UUID,
+        proposal_id: UUID,
+        *,
+        expected_status_version: int,
+        expected_base_version: int | None,
+        expected_base_sha256: str | None,
+        actor: str,
+        reason: str,
+        correlation_id: str = "",
+        idempotency_key: str = "",
+    ) -> NoteProposalAcceptanceV1:
+        """Write the stored Bridge note text into a new canonical opinion version.
+
+        ADR-0011 D4/E7: the human is recorded only as the accepter
+        (``note_approve`` targeting ``note``); the opinion version is written by
+        the system writer from the persisted ``advisor_response_received`` text
+        byte for byte, through the same ``require_bridge_only_provenance`` gate
+        as every other writer.  An acceptance never calls Bridge.
+        """
+        actor_id = self._require_actor(actor)
+        self._require_reason(reason)
+        operation = idempotency_key.strip() or f"{proposal_id}:{expected_status_version}"
+        decision_id = uuid5(
+            _NOTE_PROPOSAL_DECISION_NAMESPACE,
+            f"{investigation_id}:{proposal_id}:note_accept:{operation}",
+        )
+        async with self._uow_factory() as uow:
+            investigation = await uow.analyst_investigations.get(investigation_id)
+            if investigation is None:
+                raise OpinionError(OpinionErrorCode.INVESTIGATION_NOT_FOUND)
+            proposal = await uow.investigation_note_proposals.get(proposal_id)
+            if proposal is None or proposal.investigation_id != investigation_id:
+                raise OpinionError(OpinionErrorCode.NOTE_PROPOSAL_NOT_FOUND)
+
+            decisions = await uow.analyst_decisions.list_for_investigation(investigation_id)
+            prior = next((item for item in decisions if item.id == decision_id), None)
+            if prior is not None:
+                details = prior.details if isinstance(prior.details, Mapping) else {}
+                accepted_version = details.get("opinion_version")
+                if (
+                    prior.decision_type is not AnalystDecisionType.NOTE_APPROVE
+                    or prior.target_type is not AnalystDecisionTargetType.NOTE
+                    or details.get("proposal_id") != str(proposal_id)
+                    or not isinstance(accepted_version, int)
+                    or isinstance(accepted_version, bool)
+                ):
+                    raise OpinionError(OpinionErrorCode.IDEMPOTENCY_CONFLICT)
+                accepted = await uow.analyst_opinions.get(
+                    proposal.opinion_id, version=accepted_version
+                )
+                if accepted is None:
+                    raise OpinionError(OpinionErrorCode.STALE_NOTE_PROPOSAL)
+                return NoteProposalAcceptanceV1(proposal, accepted, prior, True)
+
+            if proposal.status is NoteProposalStatus.ACCEPTED:
+                raise OpinionError(OpinionErrorCode.STALE_NOTE_PROPOSAL)
+            if proposal.status is not NoteProposalStatus.PROPOSED:
+                raise OpinionError(
+                    OpinionErrorCode.STALE_NOTE_PROPOSAL
+                    if proposal.status is NoteProposalStatus.STALE
+                    else OpinionErrorCode.INVALID_STATE
+                )
+            if proposal.status_version != expected_status_version:
+                raise OpinionError(OpinionErrorCode.STALE_NOTE_PROPOSAL)
+            if (
+                proposal.base_opinion_version,
+                proposal.base_opinion_sha256,
+            ) != (expected_base_version, expected_base_sha256):
+                raise OpinionError(OpinionErrorCode.STALE_NOTE_PROPOSAL)
+            if not proposal.materialised:
+                raise OpinionError(
+                    OpinionErrorCode.BRIDGE_PROVENANCE_INVALID,
+                    message=(
+                        "The note proposal has no stored Bridge answer yet; an acceptance "
+                        "never creates its own text."
+                    ),
+                )
+            proposed_text = proposal.proposed_text
+            proposed_text_sha256 = proposal.proposed_text_sha256
+            bridge_invocation_id = proposal.bridge_invocation_id
+            bridge_output_sha256 = proposal.bridge_output_sha256
+            bridge_response_observation_id = proposal.bridge_response_observation_id
+            if (
+                proposed_text is None
+                or proposed_text_sha256 is None
+                or bridge_invocation_id is None
+                or bridge_output_sha256 is None
+                or bridge_response_observation_id is None
+            ):
+                raise OpinionError(OpinionErrorCode.BRIDGE_PROVENANCE_INVALID)
+
+            head = await uow.analyst_opinions.get(proposal.opinion_id)
+            base_matches = (
+                head is None
+                and proposal.base_opinion_version is None
+                and proposal.base_opinion_sha256 is None
+            ) or (
+                head is not None
+                and proposal.base_opinion_version == head.version
+                and proposal.base_opinion_sha256 == head.content_sha256
+            )
+            if not base_matches:
+                await uow.investigation_note_proposals.update_if_version(
+                    proposal.with_status(NoteProposalStatus.STALE),
+                    expected_status_version=proposal.status_version,
+                )
+                await uow.commit()
+                raise OpinionError(
+                    OpinionErrorCode.STALE_NOTE_PROPOSAL,
+                    message="The opinion head moved after the drafting request.",
+                )
+
+            response_observation_id = proposal.bridge_response_observation_id
+            if response_observation_id is None:
+                raise OpinionError(OpinionErrorCode.BRIDGE_PROVENANCE_INVALID)
+            response_observation = await uow.evidence_observations.get(response_observation_id)
+            tool_invocation = (
+                await uow.tool_invocations.get(proposal.tool_invocation_id)
+                if proposal.tool_invocation_id is not None
+                else None
+            )
+            if (
+                response_observation is None
+                or response_observation.investigation_id != investigation_id
+                or response_observation.source != "advisor.consult.response"
+                or response_observation.object_type != "advisor_response_received"
+                or tool_invocation is None
+                or tool_invocation.investigation_id != investigation_id
+                or tool_invocation.tool_name != "advisor.consult"
+                or response_observation.id not in tool_invocation.response_refs
+            ):
+                raise OpinionError(
+                    OpinionErrorCode.BRIDGE_PROVENANCE_INVALID,
+                    message=(
+                        "The proposal is not backed by the persisted Bridge response "
+                        "of this investigation."
+                    ),
+                )
+            try:
+                raw_link = await self._artifact_store.read_bytes(
+                    response_observation.blob_id, max_bytes=None
+                )
+            except ProductionReuseStorageUnavailableError:
+                raise
+            except (OSError, TypeError, ValueError) as exc:
+                raise OpinionError(OpinionErrorCode.BRIDGE_PROVENANCE_INVALID) from exc
+            if hashlib.sha256(raw_link).hexdigest() != response_observation.sha256:
+                raise OpinionError(OpinionErrorCode.BRIDGE_PROVENANCE_INVALID)
+            try:
+                link_payload = json.loads(raw_link)
+            except (ValueError, TypeError) as exc:
+                raise OpinionError(OpinionErrorCode.BRIDGE_PROVENANCE_INVALID) from exc
+            raw_blob_value = (
+                link_payload.get("raw_response_blob_id")
+                if isinstance(link_payload, Mapping)
+                else None
+            )
+            if (
+                not isinstance(link_payload, Mapping)
+                or link_payload.get("schema") != "operator-advisor-response-link.v1"
+                or link_payload.get("stage") != "response_received"
+                or link_payload.get("raw_response_sha256") != proposal.bridge_output_sha256
+                or not isinstance(raw_blob_value, str)
+            ):
+                raise OpinionError(OpinionErrorCode.BRIDGE_PROVENANCE_INVALID)
+            try:
+                raw_response = await self._artifact_store.read_bytes(
+                    UUID(raw_blob_value), max_bytes=None
+                )
+            except ProductionReuseStorageUnavailableError:
+                raise
+            except (OSError, TypeError, ValueError) as exc:
+                raise OpinionError(OpinionErrorCode.BRIDGE_PROVENANCE_INVALID) from exc
+            if hashlib.sha256(raw_response).hexdigest() != proposal.bridge_output_sha256:
+                raise OpinionError(OpinionErrorCode.BRIDGE_PROVENANCE_INVALID)
+            try:
+                raw_response.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise OpinionError(OpinionErrorCode.BRIDGE_PROVENANCE_INVALID) from exc
+
+            # The D4 draft reference names the persisted advisor_call
+            # observation of the consultation, while the proposal stores the
+            # advisor_response_received observation.  Re-derive the call
+            # identity from the persisted invocation, never from the request.
+            call_observation_ids: list[UUID] = []
+            for observation in await uow.evidence_observations.list_for_investigation(
+                investigation_id
+            ):
+                if (
+                    observation.source != "advisor.consult"
+                    or observation.object_type != "advisor_call"
+                    or observation.id == response_observation.id
+                ):
+                    continue
+                try:
+                    raw_call = await self._artifact_store.read_bytes(
+                        observation.blob_id, max_bytes=None
+                    )
+                except ProductionReuseStorageUnavailableError:
+                    raise
+                except (KeyError, OSError, TypeError, ValueError):
+                    continue
+                if hashlib.sha256(raw_call).hexdigest() != observation.sha256:
+                    continue
+                try:
+                    call_payload = json.loads(raw_call)
+                except (ValueError, TypeError):
+                    continue
+                if (
+                    isinstance(call_payload, Mapping)
+                    and call_payload.get("schema") == "operator-advisor-call.v1"
+                    and call_payload.get("bridge_invocation_id") == proposal.bridge_invocation_id
+                ):
+                    call_observation_ids.append(observation.id)
+            if (
+                proposal.consultation_type is NoteProposalConsultationType.DRAFT_TEXT
+                and len(call_observation_ids) != 1
+            ):
+                raise OpinionError(OpinionErrorCode.BRIDGE_PROVENANCE_INVALID)
+            source_observation_id = call_observation_ids[0] if call_observation_ids else None
+
+            if head is None:
+                base_artifact, base_sha256, synthesis_sha256 = await self._resolve_base(
+                    uow, investigation
+                )
+                synthesis_artifact_id = investigation.synthesis_artifact_id
+                base_blocks: tuple[OpinionBlock, ...] = ()
+                base_notes: tuple[AnalystObservationV1, ...] = ()
+                base_materials: tuple[ImplantMaterialEditorialV1, ...] = ()
+                base_material_section: OpinionBlock | None = None
+                unresolved: tuple[str, ...] = ()
+                figures: tuple[OpinionProtocolFigureV1, ...] = ()
+                expected_version = 0
+                opinion_id = proposal.opinion_id
+            else:
+                if head.status is AnalystOpinionStatus.APPROVED:
+                    raise OpinionError(OpinionErrorCode.INVALID_STATE)
+                head_base_artifact = await uow.production_artifacts.get(
+                    head.base_publication_artifact_id
+                )
+                if (
+                    head_base_artifact is None
+                    or head_base_artifact.canonical_blob_id is None
+                    or head_base_artifact.id != head.base_publication_artifact_id
+                ):
+                    raise OpinionError(OpinionErrorCode.BASE_INVALID)
+                base_artifact = head_base_artifact
+                base_sha256 = head.base_publication_sha256
+                synthesis_artifact_id = head.synthesis_artifact_id
+                synthesis_sha256 = head.synthesis_sha256
+                base_blocks = head.blocks
+                base_notes = head.observations
+                base_materials = head.implant_materials
+                base_material_section = head.implant_materials_section
+                unresolved = head.unresolved_points
+                figures = head.protocol_figures
+                expected_version = head.version
+                opinion_id = head.id
+
+            base_blob_id = base_artifact.canonical_blob_id
+            if base_blob_id is None:
+                raise OpinionError(OpinionErrorCode.BASE_INVALID)
+            try:
+                base_bytes = await self._artifact_store.read_bytes(base_blob_id, max_bytes=None)
+            except ProductionReuseStorageUnavailableError:
+                raise
+            except (OSError, TypeError, ValueError) as exc:
+                raise OpinionError(OpinionErrorCode.BASE_INVALID) from exc
+            if hashlib.sha256(base_bytes).hexdigest() != base_sha256:
+                raise OpinionError(OpinionErrorCode.BASE_INVALID)
+            try:
+                base_document = publication_document_from_json(json.loads(base_bytes))
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise OpinionError(OpinionErrorCode.BASE_INVALID) from exc
+            base_document_v5 = publication_document_article_v5_body(base_document)
+            if base_document_v5 is None:
+                raise OpinionError(OpinionErrorCode.BASE_INVALID)
+            anchors = publication_document_text_anchors(
+                base_document_v5.document,
+                references=base_document_v5.references,
+            )
+            if proposal.anchor not in anchors:
+                raise OpinionError(OpinionErrorCode.INVALID_OBSERVATION_ANCHOR)
+
+            existing_note = next(
+                (item for item in base_notes if item.anchor == proposal.anchor), None
+            )
+            if proposal.consultation_type is NoteProposalConsultationType.DRAFT_TEXT:
+                target_note_id = note_proposal_note_id(proposal.id)
+                note = AnalystObservationV1(
+                    id=target_note_id,
+                    anchor=proposal.anchor,
+                    text=proposed_text,
+                    state=proposal.note_state,
+                    relation=proposal.note_relation,
+                    finding_refs=proposal.cited_finding_refs,
+                    evidence_refs=proposal.cited_observation_refs,
+                    bridge_block_type=proposal.bridge_block_type,
+                    bridge_draft_ref=BridgeDraftReferenceV1(
+                        invocation_id=bridge_invocation_id,
+                        text_sha256=proposed_text_sha256,
+                        source_observation_id=source_observation_id,
+                    ),
+                )
+                notes = (
+                    *(item for item in base_notes if item.anchor != proposal.anchor),
+                    note,
+                )
+            else:
+                if (
+                    existing_note is None
+                    or existing_note.id != proposal.base_note_id
+                    or existing_note.text != proposed_text
+                    or hashlib.sha256(existing_note.text.encode("utf-8")).hexdigest()
+                    != proposed_text_sha256
+                    or existing_note.bridge_draft_ref is None
+                ):
+                    raise OpinionError(OpinionErrorCode.STALE_NOTE_PROPOSAL)
+                target_note_id = existing_note.id
+                note = replace(
+                    existing_note,
+                    bridge_review_ref=BridgeReviewReferenceV1(
+                        invocation_id=bridge_invocation_id,
+                        output_sha256=bridge_output_sha256,
+                        reviewed_text_sha256=proposed_text_sha256,
+                    ),
+                )
+                notes = tuple(note if item.id == existing_note.id else item for item in base_notes)
+            blocks = opinion_blocks_with_implant_materials(
+                opinion_blocks_with_observations(base_blocks, notes),
+                base_materials,
+                section=base_material_section,
+            )
+            candidate = AnalystOpinionV1(
+                id=opinion_id,
+                version=expected_version + 1,
+                investigation_id=investigation_id,
+                synthesis_artifact_id=synthesis_artifact_id,
+                synthesis_sha256=synthesis_sha256,
+                base_publication_artifact_id=base_artifact.id,
+                base_publication_sha256=base_sha256,
+                blocks=blocks,
+                unresolved_points=unresolved,
+                protocol_figures=figures,
+                author_id=_NOTE_ACCEPTANCE_AUTHOR,
+                status=AnalystOpinionStatus.DRAFT,
+            )
+            try:
+                await self._validate_bridge_provenance(uow, candidate)
+            except OpinionError as exc:
+                if exc.code in {
+                    OpinionErrorCode.INVALID_SELECTION,
+                    OpinionErrorCode.REVIEW_TEXT_STALE,
+                }:
+                    raise OpinionError(
+                        OpinionErrorCode.BRIDGE_PROVENANCE_INVALID,
+                        message=str(exc),
+                    ) from exc
+                raise
+            await self.require_bridge_only_provenance(
+                uow, candidate, writer_kind=OpinionWriterKind.SYSTEM_FROM_BRIDGE
+            )
+            await self._validate_citations(uow, candidate)
+            try:
+                saved = await uow.analyst_opinions.append_version(
+                    candidate, expected_version=expected_version
+                )
+            except Exception as exc:
+                if type(exc).__name__ in {"VersionConflictError", "IntegrityError"}:
+                    raise OpinionError(OpinionErrorCode.STALE_NOTE_PROPOSAL) from exc
+                raise
+            decision = AnalystDecision(
+                id=decision_id,
+                investigation_id=investigation_id,
+                decision_type=AnalystDecisionType.NOTE_APPROVE,
+                target_type=AnalystDecisionTargetType.NOTE,
+                target_id=target_note_id,
+                actor_id=actor_id,
+                reason=reason,
+                correlation_id=(correlation_id.strip() or f"note_accept:{proposal_id}:{operation}")[
+                    :128
+                ],
+                details={
+                    "proposal_id": str(proposal.id),
+                    "opinion_id": str(saved.id),
+                    "opinion_version": saved.version,
+                    "opinion_sha256": saved.content_sha256,
+                    "proposed_text_sha256": proposal.proposed_text_sha256,
+                    "bridge_invocation_id": proposal.bridge_invocation_id,
+                    "bridge_response_observation_id": str(proposal.bridge_response_observation_id),
+                    "anchor": proposal.anchor,
+                },
+            )
+            await uow.analyst_decisions.append(decision)
+            updated_proposal = await uow.investigation_note_proposals.update_if_version(
+                proposal.with_status(
+                    NoteProposalStatus.ACCEPTED,
+                    accepted_opinion_version=saved.version,
+                    analyst_decision_id=decision_id,
+                ),
+                expected_status_version=proposal.status_version,
+            )
+            if updated_proposal is None:
+                raise OpinionError(OpinionErrorCode.STALE_NOTE_PROPOSAL)
+            await uow.commit()
+            return NoteProposalAcceptanceV1(updated_proposal, saved, decision, False)
 
     async def _compose_blocks(
         self,
