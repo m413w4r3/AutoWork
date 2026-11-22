@@ -24,6 +24,7 @@ function makeInvestigation(
     synthesis_artifact_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
     synthesis_sha256: "a".repeat(64),
     status: "running",
+    prose_authority: "legacy",
     version: 3,
     stop_reason: null,
     agenda: [],

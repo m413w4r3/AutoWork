@@ -156,6 +156,38 @@ def test_legacy_investigation_keeps_bridge_led_behaviour() -> None:
     assert accepted.json()["investigation"]["execution_mode"] == "bridge_led"
 
 
+def test_investigation_view_exposes_legacy_prose_authority_by_default() -> None:
+    client, _store = _client()
+
+    accepted = client.post(f"/api/subjects/{SUBJECT_ID}/investigations", json=_start_body())
+
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["investigation"]["prose_authority"] == "legacy"
+    detail = client.get(f"/api/investigations/{INVESTIGATION_ID}")
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["prose_authority"] == "legacy"
+
+
+def test_investigation_view_exposes_bridge_only_for_the_workshop() -> None:
+    client, store = _client()
+    store.investigations[INVESTIGATION_ID].prose_authority = ProseAuthority.BRIDGE_ONLY
+
+    accepted = client.post(
+        f"/api/subjects/{SUBJECT_ID}/investigations",
+        json={
+            **_start_body(),
+            "creation_profile": "m24_workshop",
+            "execution_mode": "operator_led",
+        },
+    )
+
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["investigation"]["prose_authority"] == "bridge_only"
+    detail = client.get(f"/api/investigations/{INVESTIGATION_ID}")
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["prose_authority"] == "bridge_only"
+
+
 def test_workshop_creation_requests_bridge_only_from_the_handoff(monkeypatch) -> None:
     store = _Store()
     store.investigations.clear()

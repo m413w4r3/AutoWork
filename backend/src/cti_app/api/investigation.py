@@ -791,6 +791,7 @@ class InvestigationView(BaseModel):
     synthesis_sha256: str
     status: AnalystInvestigationStatus
     execution_mode: InvestigationExecutionMode
+    prose_authority: ProseAuthority
     version: int
     stop_reason: StopReason | None
     agenda: list[AgendaItemView]
@@ -3474,6 +3475,9 @@ async def _investigation_view(
 ) -> InvestigationView:
     investigation, current_state = await _require_working_state(uow, investigation_id)
     state = state or current_state
+    prose_authority = getattr(investigation, "prose_authority", ProseAuthority.LEGACY)
+    if not isinstance(prose_authority, ProseAuthority):
+        prose_authority = ProseAuthority(prose_authority)
     envelope = await uow.investigation_envelopes.get(investigation_id)
     snapshot = await composition.tool_dependencies.article_snapshots.resolve(
         investigation.synthesis_artifact_id
@@ -3556,6 +3560,7 @@ async def _investigation_view(
         synthesis_sha256=snapshot.synthesis_sha256,
         status=investigation.status,
         execution_mode=state.execution_mode,
+        prose_authority=prose_authority,
         version=state.version,
         stop_reason=state.stop_reason,
         agenda=[

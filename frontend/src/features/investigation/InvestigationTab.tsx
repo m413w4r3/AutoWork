@@ -12,7 +12,6 @@ import {
   type InvestigationView,
 } from "../../api/investigation";
 import { useInvestigationActivity } from "../../api/investigationOperator";
-import { useWorkspaceStatus } from "./api/workspace";
 import { InvestigationLabViews } from "./InvestigationLabViews";
 import { WorkshopCockpit } from "./shell/WorkshopCockpit";
 
@@ -35,6 +34,7 @@ export function InvestigationTab({
   });
   const investigationsQuery = useSubjectInvestigations(subjectId);
   const launch = useStartInvestigation(subjectId);
+  const workshopLaunch = useStartInvestigation(subjectId);
   const exactSynthesis =
     synthesisQuery.data?.status === "verified" &&
     synthesisQuery.data.canonical_sha256 &&
@@ -61,6 +61,19 @@ export function InvestigationTab({
       production_run_id: exactSynthesis.production_run_id,
       synthesis_artifact_id: exactSynthesis.artifact_id,
       synthesis_sha256: exactSynthesis.canonical_sha256,
+    });
+    setSelectedInvestigationId(result.investigation.id);
+  }
+
+  async function startWorkshop() {
+    if (!exactSynthesis?.production_run_id || !exactSynthesis.canonical_sha256)
+      return;
+    const result = await workshopLaunch.mutateAsync({
+      production_run_id: exactSynthesis.production_run_id,
+      synthesis_artifact_id: exactSynthesis.artifact_id,
+      synthesis_sha256: exactSynthesis.canonical_sha256,
+      creation_profile: "m24_workshop",
+      execution_mode: "operator_led",
     });
     setSelectedInvestigationId(result.investigation.id);
   }
@@ -128,18 +141,39 @@ export function InvestigationTab({
                 SHA-256 canonique exact.
               </p>
             ) : null}
-            <button
-              type="button"
-              className="button button--secondary"
-              disabled={!exactSynthesis || launch.isPending}
-              onClick={() => void startExactSynthesis()}
-            >
-              {launch.isPending
-                ? "Lancement…"
-                : existingForExactSynthesis
-                  ? "Ouvrir l’enquête sur cette version"
-                  : "Investiguer cette version exacte"}
-            </button>
+            <div>
+              <button
+                type="button"
+                className="button button--secondary"
+                disabled={!exactSynthesis || launch.isPending}
+                onClick={() => void startExactSynthesis()}
+              >
+                {launch.isPending
+                  ? "Lancement…"
+                  : existingForExactSynthesis
+                    ? "Ouvrir l’enquête sur cette version"
+                    : "Investiguer cette version exacte"}
+              </button>{" "}
+              <button
+                type="button"
+                className="button"
+                disabled={
+                  !exactSynthesis ||
+                  workshopLaunch.isPending ||
+                  Boolean(existingForExactSynthesis)
+                }
+                onClick={() => void startWorkshop()}
+              >
+                {workshopLaunch.isPending
+                  ? "Lancement de l’atelier…"
+                  : "Lancer l’atelier d’investigation"}
+              </button>
+            </div>
+            <p>
+              Atelier M24 : workspace local, Bridge rédacteur unique et
+              opérateurs agentiques. Une seule enquête peut exister par version
+              de synthèse.
+            </p>
           </>
         ) : (
           <p>Aucune synthèse disponible.</p>
@@ -147,6 +181,11 @@ export function InvestigationTab({
         {launch.error ? (
           <p className="error-message" role="alert">
             {launch.error.message}
+          </p>
+        ) : null}
+        {workshopLaunch.error ? (
+          <p className="error-message" role="alert">
+            {workshopLaunch.error.message}
           </p>
         ) : null}
       </section>
@@ -236,11 +275,10 @@ function InvestigationDetail({
   actionError: Error | null;
 }) {
   const activityQuery = useInvestigationActivity(investigation.id);
-  // Discriminant M24 : la création `creation_profile='m24_workshop'` lie le
-  // workspace au démarrage (ADR-0011 D2) ; une enquête legacy reste non liée et
-  // conserve le laboratoire de preuve historique.
-  const workspaceQuery = useWorkspaceStatus(investigation.id);
-  const workshopActive = workspaceQuery.data?.workspace_state === "bound";
+  // Discriminant M24 explicite : `creation_profile='m24_workshop'` fixe
+  // `prose_authority='bridge_only'` à l'INSERT (ADR-0011 D4). Le binding du
+  // workspace n'est qu'un état best-effort au démarrage, jamais le discriminant.
+  const workshopActive = investigation.prose_authority === "bridge_only";
   const latest = activityQuery.data?.investigation;
   const currentStatus = latest?.status ?? investigation.status;
   const currentStopReason = latest

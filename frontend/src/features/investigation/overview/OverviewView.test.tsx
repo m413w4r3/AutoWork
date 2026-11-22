@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -10,7 +10,10 @@ import type {
   BootstrapSnapshotV1,
   IOCInventoryV1,
 } from "../api/bootstrap";
-import type { WorkspaceStatusV1 } from "../api/workspace";
+import type {
+  WorkspaceEnsureResultV1,
+  WorkspaceStatusV1,
+} from "../api/workspace";
 import type { WorkspaceAgentStatusResponse } from "../api/workspaceAgent";
 import { OverviewView } from "./OverviewView";
 
@@ -25,6 +28,7 @@ const CORRELATION_ID = "11111111-1111-4111-8111-111111111111";
 const URLS = {
   agent: "/api/workspace-agent/status",
   workspace: `/api/investigations/${INVESTIGATION_ID}/workspace`,
+  ensure: `/api/investigations/${INVESTIGATION_ID}/workspace/ensure`,
   inventory: `/api/investigations/${INVESTIGATION_ID}/bootstrap/inventory`,
   snapshot: `/api/investigations/${INVESTIGATION_ID}/bootstrap/snapshot`,
   proposal: `/api/investigations/${INVESTIGATION_ID}/bootstrap/envelope-proposal`,
@@ -69,6 +73,27 @@ function makeWorkspace(
     },
     lastly_observed_at: null,
     ...overrides,
+  };
+}
+
+function makeUnboundWorkspace(): WorkspaceStatusV1 {
+  return makeWorkspace({
+    workspace_state: "unbound",
+    workspace_available: false,
+    availability_code: "not_bound",
+    binding: null,
+    generation: null,
+    cursor: null,
+  });
+}
+
+function makeEnsureResult(): WorkspaceEnsureResultV1 {
+  const workspace = makeWorkspace();
+  if (workspace.binding === null) throw new Error("bound workspace expected");
+  return {
+    binding: workspace.binding,
+    binding_created: true,
+    workspace_created: true,
   };
 }
 
@@ -289,6 +314,8 @@ function createFetch(options: FetchOptions) {
       return Promise.resolve(
         Response.json(options.workspace ?? makeWorkspace()),
       );
+    if (url === URLS.ensure && init?.method === "POST")
+      return Promise.resolve(Response.json(makeEnsureResult()));
     if (url === URLS.inventory)
       return Promise.resolve(
         Response.json(options.inventory ?? makeInventory()),
@@ -334,17 +361,10 @@ afterEach(() => {
 describe("OverviewView", () => {
   it("bloque l’approbation quand le workspace est absent", async () => {
     const { calls } = renderOverview({
-      workspace: makeWorkspace({
-        workspace_state: "unbound",
-        workspace_available: false,
-        availability_code: "not_bound",
-        binding: null,
-        generation: null,
-        cursor: null,
-      }),
+      workspace: makeUnboundWorkspace(),
     });
 
-    expect(await screen.findByText("Workspace local absent")).toBeTruthy();
+    expect(await screen.findByText("Workspace local à créer")).toBeTruthy();
     const approveButton = await screen.findByRole("button", {
       name: /Approuver l’enveloppe/,
     });
@@ -357,6 +377,37 @@ describe("OverviewView", () => {
     expect(calls.filter((call) => call.init?.method === "POST")).toHaveLength(
       0,
     );
+  });
+
+  it("crée le workspace local depuis la vue d’ensemble quand l’agent hôte est présent", async () => {
+    const user = userEvent.setup();
+    const { calls } = renderOverview({
+      workspace: makeUnboundWorkspace(),
+    });
+
+    await user.click(
+      await screen.findByRole("button", { name: "Créer le workspace" }),
+    );
+
+    await waitFor(() => {
+      expect(
+        calls.some(
+          (call) => call.url === URLS.ensure && call.init?.method === "POST",
+        ),
+      ).toBe(true);
+    });
+  });
+
+  it("ne propose pas de créer le workspace quand l’agent hôte est absent", async () => {
+    renderOverview({
+      agent: makeAgent({ status: "unavailable" }),
+      workspace: makeUnboundWorkspace(),
+    });
+
+    expect(await screen.findByText("Workspace local absent")).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: "Créer le workspace" }),
+    ).toBeNull();
   });
 
   it("envoie la requête d’approbation G2 avec l’empreinte et l’idempotence", async () => {

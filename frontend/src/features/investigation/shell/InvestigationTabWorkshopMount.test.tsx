@@ -13,7 +13,9 @@ const SYNTHESIS_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 const INVESTIGATION_ID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
 const SHA256 = "a".repeat(64);
 
-function makeInvestigation(): InvestigationView {
+function makeInvestigation(
+  proseAuthority: InvestigationView["prose_authority"],
+): InvestigationView {
   return {
     id: INVESTIGATION_ID,
     subject_id: SUBJECT_ID,
@@ -21,6 +23,7 @@ function makeInvestigation(): InvestigationView {
     synthesis_artifact_id: SYNTHESIS_ID,
     synthesis_sha256: SHA256,
     status: "running",
+    prose_authority: proseAuthority,
     version: 1,
     stop_reason: null,
     agenda: [],
@@ -99,11 +102,14 @@ function urlOf(input: RequestInfo | URL): string {
   return input.url;
 }
 
-function renderTab(workspaceState: "bound" | "unbound") {
+function renderTab(
+  workspaceState: "bound" | "unbound",
+  proseAuthority: InvestigationView["prose_authority"],
+) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, refetchInterval: false } },
   });
-  const view = makeInvestigation();
+  const view = makeInvestigation(proseAuthority);
   const fetchMock = vi.fn((input: RequestInfo | URL) => {
     const url = urlOf(input);
     if (url === `/api/subjects/${SUBJECT_ID}/production/artifacts/synthesis`) {
@@ -200,8 +206,8 @@ function renderTab(workspaceState: "bound" | "unbound") {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("InvestigationTab — montage du cockpit", () => {
-  it("monte le cockpit M24 quand le workspace est lié", async () => {
-    renderTab("bound");
+  it("monte le cockpit M24 quand l’enquête est bridge_only, même sans workspace lié", async () => {
+    renderTab("unbound", "bridge_only");
 
     expect(
       await screen.findByRole("tab", { name: "Vue d’ensemble" }),
@@ -214,8 +220,8 @@ describe("InvestigationTab — montage du cockpit", () => {
     ).toBeNull();
   });
 
-  it("conserve le laboratoire legacy quand le workspace n’est pas lié", async () => {
-    renderTab("unbound");
+  it("conserve le laboratoire legacy pour une enquête legacy même quand le workspace est lié", async () => {
+    renderTab("bound", "legacy");
 
     expect(
       await screen.findByRole("region", { name: "Laboratoire de preuve" }),
