@@ -82,6 +82,7 @@ from cti_app.application.editorial_threads import (
     EditorialThreadService,
     EditorialThreadSessionStartResult,
 )
+from cti_app.application.editorial_visual_revision import VisualRevisionContextLoader
 from cti_app.application.editorial_workspace import EditorialWorkspaceService
 from cti_app.application.editorial_workspace.capabilities import (
     EditorialCapabilities,
@@ -104,6 +105,12 @@ from cti_app.application.production_synthesis import ProductionSynthesisService
 from cti_app.application.source_figure_inventory import MAX_SOURCE_FIGURES
 from cti_app.config import Settings, get_settings
 from cti_app.domain.collection import CollectionState
+from cti_app.domain.editorial_enrichment_patch import (
+    MoveEnrichmentElementPatch,
+    ReorderEnrichmentElementsPatch,
+    UpdateVisualCaptionPatch,
+    VisualRevisionPatch,
+)
 from cti_app.domain.editorial_proposal import EditorialProposalConflict
 from cti_app.domain.editorial_thread import EditorialThreadEventKind
 from cti_app.domain.editorial_workspace import EditorialWorkspaceError
@@ -112,7 +119,14 @@ from cti_app.domain.production_editorial_enrichment import (
     ChartKind,
     ChartPointV1,
     ChartSpecV1,
+    DiagramNodeRole,
+    DiagramProfile,
+    DiagramRelationDirection,
     EditorialAnalyticPurposeV1,
+    EditorialEnrichmentElementKind,
+    EnrichmentDiagramDirection,
+    EnrichmentDiagramKind,
+    EnrichmentElementRef,
     EnrichmentPlacementKind,
     EnrichmentPlacementV1,
     EnrichmentTableKind,
@@ -204,6 +218,7 @@ class EditorialWorkspaceRoute(APIRoute):
             is_manual_table_proposal = self.path_format.endswith("/table-proposals")
             is_manual_bar_chart_proposal = self.path_format.endswith("/bar-chart-proposals")
             is_manual_source_figure_proposal = self.path_format.endswith("/figure-proposals")
+            is_enrichment_revision = self.path_format.endswith("/enrichment-revisions")
             is_draft = self.path_format.endswith("/draft")
             is_figure_catalog = "/editor/figures" in self.path_format
             if (
@@ -212,6 +227,7 @@ class EditorialWorkspaceRoute(APIRoute):
                 or is_manual_table_proposal
                 or is_manual_bar_chart_proposal
                 or is_manual_source_figure_proposal
+                or is_enrichment_revision
             ):
                 try:
                     enabled = get_settings().editorial_proposal_accept_enabled
@@ -235,6 +251,7 @@ class EditorialWorkspaceRoute(APIRoute):
                 or is_manual_table_proposal
                 or is_manual_bar_chart_proposal
                 or is_manual_source_figure_proposal
+                or is_enrichment_revision
             ):
                 raw_length = request.headers.get("content-length")
                 if raw_length is not None:
@@ -304,6 +321,24 @@ class EditorialWorkspaceRoute(APIRoute):
                             "detail": {
                                 "code": code,
                                 "message": message,
+                            }
+                        },
+                    )
+                elif is_enrichment_revision:
+                    logger.warning(
+                        "enrichment_revision_rejected code=%s reason=%s subject_id=%s "
+                        "occurrence_id=%s",
+                        "enrichment_revision_patch_invalid",
+                        "schema:request_invalid",
+                        request.path_params.get("subject_id", "unknown"),
+                        request.path_params.get("occurrence_id", "unknown"),
+                    )
+                    response = JSONResponse(
+                        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                        content={
+                            "detail": {
+                                "code": "enrichment_revision_patch_invalid",
+                                "message": _ERROR_MESSAGES["enrichment_revision_patch_invalid"],
                             }
                         },
                     )
@@ -531,6 +566,47 @@ class EditorialWorkspaceFigure(BaseModel):
     page: int | None = Field(default=None, ge=1)
     section: str | None
     catalog_figure_id: UUID | None = None
+    original_caption: str | None = None
+
+
+class EditorialWorkspaceDiagramNode(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: str
+    label: str
+    role: str | None = None
+
+
+class EditorialWorkspaceDiagramEdge(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_node_id: str
+    target_node_id: str
+    label: str | None = None
+
+
+class EditorialWorkspaceDiagramGroup(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    group_id: str
+    label: str
+    node_ids: list[str]
+
+
+class EditorialWorkspaceDiagram(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    key: str
+    kind: str | None = None
+    title: str
+    caption: str | None = None
+    direction: str
+    profile: str | None = None
+    nodes: list[EditorialWorkspaceDiagramNode]
+    edges: list[EditorialWorkspaceDiagramEdge]
+    groups: list[EditorialWorkspaceDiagramGroup]
+    anchor_block_id: UUID | None
+    placement: Literal["after_paragraph", "after_lead", "after_timeline", "after_section", "end"]
 
 
 class EditorialWorkspaceBlock(BaseModel):
@@ -554,6 +630,7 @@ class EditorialWorkspaceBlock(BaseModel):
     table: EditorialWorkspaceTable | None = None
     chart: EditorialWorkspaceBarChart | None = None
     figure: EditorialWorkspaceFigure | None = None
+    diagram: EditorialWorkspaceDiagram | None = None
     revision_target: EditorialWorkspaceRevisionTarget
     before_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     allowed_operations: list[str]
@@ -1135,6 +1212,223 @@ class EditorialManualBarChartProposalRequest(BaseModel):
     chart: EditorialBarChartDraftRequest
 
 
+class EditorialEnrichmentRevisionElementRefRequest(BaseModel):
+    """Opaque reference to one enrichment element inside a reorder group."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: EditorialEnrichmentElementKind
+    key: str = Field(min_length=1, max_length=128)
+
+
+class EditorialVisualChartPointRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    label: str = Field(min_length=1, max_length=500)
+    series: str = Field(min_length=1, max_length=120)
+    value: Decimal | None = None
+    date: str | None = Field(default=None, max_length=64)
+    evidence_refs: list[EditorialTableEvidenceReferenceRequest] = Field(min_length=1, max_length=8)
+
+    @field_validator("value")
+    @classmethod
+    def _bounded_finite_value(cls, value: Decimal | None) -> Decimal | None:
+        if value is None:
+            return value
+        if not value.is_finite():
+            raise ValueError("Visual chart values must be finite")
+        normalized = value.normalize() if value else Decimal(0)
+        if len(normalized.as_tuple().digits) > 18 or abs(normalized.adjusted()) > 12:
+            raise ValueError("Visual chart value exceeds the supported numeric bounds")
+        return value
+
+
+class EditorialVisualChartRequest(BaseModel):
+    """Replacement chart body; placement and compiled asset stay server-owned."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: str = Field(min_length=1, max_length=128)
+    kind: ChartKind
+    title: str = Field(min_length=1, max_length=1000)
+    caption: str | None = Field(default=None, max_length=2000)
+    category_axis_label: str | None = Field(default=None, max_length=120)
+    value_axis_label: str | None = Field(default=None, max_length=120)
+    unit: str | None = Field(default=None, max_length=120)
+    points: list[EditorialVisualChartPointRequest] = Field(min_length=1, max_length=24)
+    purpose: EditorialTablePurposeRequest
+
+    @model_validator(mode="after")
+    def _chart_shape(self) -> EditorialVisualChartRequest:
+        if self.kind is ChartKind.TIMELINE:
+            if any(point.date is None or point.value is not None for point in self.points):
+                raise ValueError("Timeline points require a date and no value")
+            if any(
+                label is not None
+                for label in (
+                    self.category_axis_label,
+                    self.value_axis_label,
+                    self.unit,
+                )
+            ):
+                raise ValueError("Timeline chart axes are not supported")
+            return self
+        if len(self.points) < 2 or any(
+            point.value is None or point.date is not None for point in self.points
+        ):
+            raise ValueError("Bar chart points require a value and no date")
+        if any(
+            label is None for label in (self.category_axis_label, self.value_axis_label, self.unit)
+        ):
+            raise ValueError("Bar chart axis labels and unit are required")
+        if len({point.series for point in self.points}) > 6:
+            raise ValueError("Visual chart series limit exceeded")
+        if len({point.label.casefold() for point in self.points}) != len(self.points):
+            raise ValueError("Visual chart labels must be unique")
+        return self
+
+
+class EditorialVisualDiagramNodeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: str = Field(min_length=1, max_length=128)
+    label: str = Field(min_length=1, max_length=500)
+    role: DiagramNodeRole = DiagramNodeRole.UNKNOWN
+    evidence_refs: list[EditorialTableEvidenceReferenceRequest] = Field(
+        default_factory=list, max_length=8
+    )
+
+
+class EditorialVisualDiagramEdgeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_node_id: str = Field(min_length=1, max_length=128)
+    target_node_id: str = Field(min_length=1, max_length=128)
+    label: str | None = Field(default=None, max_length=500)
+    direction: DiagramRelationDirection | None = None
+    evidence_refs: list[EditorialTableEvidenceReferenceRequest] = Field(
+        default_factory=list, max_length=8
+    )
+
+
+class EditorialVisualDiagramGroupRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    group_id: str = Field(min_length=1, max_length=128)
+    label: str = Field(min_length=1, max_length=500)
+    node_ids: list[str] = Field(min_length=1, max_length=64)
+
+
+class EditorialVisualDiagramRequest(BaseModel):
+    """Replacement diagram body; placement and compiled asset stay server-owned."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: str = Field(min_length=1, max_length=128)
+    kind: EnrichmentDiagramKind
+    title: str = Field(min_length=1, max_length=1000)
+    caption: str | None = Field(default=None, max_length=2000)
+    direction: EnrichmentDiagramDirection
+    profile: DiagramProfile | None = None
+    nodes: list[EditorialVisualDiagramNodeRequest] = Field(min_length=1, max_length=64)
+    edges: list[EditorialVisualDiagramEdgeRequest] = Field(default_factory=list, max_length=96)
+    groups: list[EditorialVisualDiagramGroupRequest] = Field(default_factory=list, max_length=16)
+    purpose: EditorialTablePurposeRequest
+
+
+class EditorialEnrichmentRevisionRequestBase(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    snapshot_id: UUID
+
+
+class EditorialVisualCaptionRevisionRequest(EditorialEnrichmentRevisionRequestBase):
+    operation: Literal["update_visual_caption"]
+    element_kind: EditorialEnrichmentElementKind
+    element_key: str = Field(min_length=1, max_length=128)
+    caption: str | None = Field(default=None, max_length=2000)
+
+
+class EditorialMoveEnrichmentElementRevisionRequest(EditorialEnrichmentRevisionRequestBase):
+    operation: Literal["move_enrichment_element"]
+    element_kind: EditorialEnrichmentElementKind
+    element_key: str = Field(min_length=1, max_length=128)
+    anchor_block_id: UUID
+
+
+class EditorialReorderEnrichmentElementsRevisionRequest(EditorialEnrichmentRevisionRequestBase):
+    operation: Literal["reorder_enrichment_elements"]
+    anchor_block_id: UUID
+    order: list[EditorialEnrichmentRevisionElementRefRequest] = Field(min_length=2, max_length=64)
+
+    @model_validator(mode="after")
+    def _order_members_are_unique(self) -> EditorialReorderEnrichmentElementsRevisionRequest:
+        if len({(item.kind, item.key) for item in self.order}) != len(self.order):
+            raise ValueError("Enrichment revision order must not repeat an element")
+        return self
+
+
+class EditorialReplaceSourceFigureRevisionRequest(EditorialEnrichmentRevisionRequestBase):
+    operation: Literal["replace_source_figure"]
+    element_key: str = Field(min_length=1, max_length=128)
+    figure_id: UUID
+    caption: str | None = Field(default=None, max_length=500)
+
+
+class EditorialRemoveEnrichmentElementRevisionRequest(EditorialEnrichmentRevisionRequestBase):
+    operation: Literal["remove_enrichment_element"]
+    element_kind: EditorialEnrichmentElementKind
+    element_key: str = Field(min_length=1, max_length=128)
+
+
+class EditorialReviseChartRevisionRequest(EditorialEnrichmentRevisionRequestBase):
+    operation: Literal["revise_chart"]
+    element_key: str = Field(min_length=1, max_length=128)
+    chart: EditorialVisualChartRequest
+
+    @model_validator(mode="after")
+    def _chart_target_matches(self) -> EditorialReviseChartRevisionRequest:
+        if self.chart.key != self.element_key:
+            raise ValueError("Chart revision target key mismatch")
+        return self
+
+
+class EditorialReviseDiagramRevisionRequest(EditorialEnrichmentRevisionRequestBase):
+    operation: Literal["revise_diagram"]
+    element_key: str = Field(min_length=1, max_length=128)
+    diagram: EditorialVisualDiagramRequest
+
+    @model_validator(mode="after")
+    def _diagram_target_matches(self) -> EditorialReviseDiagramRevisionRequest:
+        if self.diagram.key != self.element_key:
+            raise ValueError("Diagram revision target key mismatch")
+        return self
+
+
+EditorialEnrichmentRevisionRequest = Annotated[
+    EditorialVisualCaptionRevisionRequest
+    | EditorialMoveEnrichmentElementRevisionRequest
+    | EditorialReorderEnrichmentElementsRevisionRequest
+    | EditorialReplaceSourceFigureRevisionRequest
+    | EditorialRemoveEnrichmentElementRevisionRequest
+    | EditorialReviseChartRevisionRequest
+    | EditorialReviseDiagramRevisionRequest,
+    Field(discriminator="operation"),
+]
+
+# Variants whose shared planner branch lands in F2-03b/F2-03c. Their request
+# schema is fixed now; the route refuses them with a typed 422 instead of
+# forwarding a patch the planner cannot apply.
+_UNIMPLEMENTED_VISUAL_REVISION_OPERATIONS = frozenset(
+    {
+        "revise_chart",
+        "revise_diagram",
+        "replace_source_figure",
+        "remove_enrichment_element",
+    }
+)
+
+
 class EditorialProposalAcceptView(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1314,6 +1608,34 @@ _ERROR_MESSAGES = {
     ),
     "bar_chart_insufficient_data": BAR_CHART_INSUFFICIENT_DATA_MESSAGE,
     "bar_chart_value_not_evidenced": BAR_CHART_INSUFFICIENT_DATA_MESSAGE,
+    "enrichment_revision_patch_invalid": (
+        "La révision visuelle est invalide. Vérifiez les champs, puis réessayez."
+    ),
+    "enrichment_element_not_found": "Cet élément enrichi n'existe plus dans cette version.",
+    "enrichment_element_kind_mismatch": (
+        "Le type de cet élément enrichi ne correspond pas à la révision demandée."
+    ),
+    "enrichment_target_stale": (
+        "Cet élément enrichi a changé. Rechargez l'atelier avant de réessayer."
+    ),
+    "enrichment_placement_changed": ("L'emplacement de cet élément a changé. Rechargez l'atelier."),
+    "enrichment_caption_invalid": ("La légende proposée ne respecte pas les règles de l'atelier."),
+    "enrichment_move_anchor_invalid": "Le paragraphe de destination est invalide.",
+    "enrichment_order_invalid": (
+        "L'ordre demandé ne correspond pas aux éléments de ce paragraphe."
+    ),
+    "enrichment_order_group_unsupported": ("Ce groupe d'éléments ne peut pas être réordonné."),
+    "enrichment_revision_no_change": (
+        "La révision ne modifie rien. Aucune nouvelle version n'a été créée."
+    ),
+    "enrichment_revision_unsupported_operation": (
+        "Cette opération de révision visuelle n'est pas encore disponible."
+    ),
+    "editorial_caption_text_violation": (
+        "La légende contient un format ou un balisage non autorisé."
+    ),
+    "editorial_figure_not_changed": "La figure sélectionnée est déjà celle de cet élément.",
+    "proposal_patch_too_large": "La révision visuelle dépasse la taille autorisée.",
     "manual_edit_unavailable": "La modification manuelle est temporairement indisponible.",
     "accept_not_enabled": "L'acceptation des propositions est désactivée.",
     "editorial_proposal_accept_unavailable": (
@@ -1743,6 +2065,57 @@ def _proposal_adoption_service(request: Request) -> EditorialProposalAdoptionSer
     )
 
 
+def _visual_revision_context_loader(
+    request: Request,
+    *,
+    uow_factory: UnitOfWorkFactory,
+    artifact_store: ProductionArtifactStore,
+    workspace_service: EditorialWorkspaceService,
+) -> VisualRevisionContextLoader:
+    """Build the pinned-artifact loader shared by the enrichment revision route.
+
+    The loader only reads pinned artifacts: it receives the same request-scoped
+    repositories, media store and revision fence the adoption writer uses, so a
+    prepared visual revision is resolved against exactly the state the app
+    lifespan published on `app.state`.
+    """
+    model_gateway = getattr(request.app.state, "model_gateway", None)
+    runtime = publication_runtime_for_request(request)
+    render_service = (
+        runtime.render_service
+        if runtime is not None
+        else getattr(request.app.state, "publication_render_service", None)
+    )
+    enrichment_writer = EditorialEnrichmentService(uow_factory, artifact_store)
+    enrichment_loader = ProductionEditorialEnrichmentService(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        model_gateway=cast(Any, model_gateway),
+        editorial_enrichment_service=enrichment_writer,
+        media_asset_store=_media_asset_store_for_request(
+            request, artifact_store=artifact_store, uow_factory=uow_factory
+        ),
+        diagram_compiler=D2DiagramCompiler(),
+        chart_compiler=AnalyticChartRenderer(),
+        source_media_archiver=getattr(
+            _collection_service_for_request(request), "source_media_archiver", None
+        ),
+        resource_search_enabled=get_settings().production_editorial_resource_search_enabled,
+    )
+    enrichment_revision = ProductionEditorialEnrichmentRevisionService(
+        enrichment_service=enrichment_loader,
+        persistence_service=enrichment_writer,
+        publication_render_service=cast(Any, render_service),
+    )
+    return VisualRevisionContextLoader(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        workspace_service=workspace_service,
+        enrichment_loader=enrichment_loader,
+        enrichment_revision_service=enrichment_revision,
+    )
+
+
 def _manual_proposal_service(request: Request) -> EditorialProposalService:
     uow_factory = getattr(request.app.state, "uow_factory", None)
     artifact_store = _production_artifact_store_for_request(request)
@@ -1778,6 +2151,12 @@ def _manual_proposal_service(request: Request) -> EditorialProposalService:
         ),
         media_asset_store=_media_asset_store_for_request(
             request, artifact_store=artifact_store, uow_factory=uow_factory
+        ),
+        visual_revision_loader=_visual_revision_context_loader(
+            request,
+            uow_factory=uow_factory,
+            artifact_store=artifact_store,
+            workspace_service=workspace_service,
         ),
     )
 
@@ -3370,6 +3749,241 @@ async def prepare_manual_editorial_bar_chart_proposal(
             status_code=response_status,
             detail={"code": code, "message": message},
         ) from None
+
+
+_VISUAL_REVISION_CONFLICT_CODES = frozenset(
+    {
+        "enrichment_target_stale",
+        "editorial_anchor_stale",
+        "proposal_base_stale",
+        "proposal_state_conflict",
+        "proposal_idempotency_conflict",
+        "editorial_snapshot_stale",
+        "editorial_registry_conflict",
+    }
+)
+_VISUAL_REVISION_NOT_FOUND_CODES = frozenset({"proposal_not_found", "editorial_block_missing"})
+_VISUAL_REVISION_UNAVAILABLE_CODES = frozenset(
+    {
+        "proposal_base_unavailable",
+        "proposal_workspace_unavailable",
+        "proposal_patch_unavailable",
+        "proposal_patch_storage_unavailable",
+        "manual_edit_unavailable",
+    }
+)
+
+
+def _enrichment_revision_status(code: str) -> int:
+    if code in {"idempotency_key_required", "idempotency_key_invalid"}:
+        return status.HTTP_400_BAD_REQUEST
+    if code in _VISUAL_REVISION_CONFLICT_CODES:
+        return status.HTTP_409_CONFLICT
+    if code == "editorial_read_only":
+        return status.HTTP_403_FORBIDDEN
+    if code in _VISUAL_REVISION_NOT_FOUND_CODES:
+        return status.HTTP_404_NOT_FOUND
+    if code in {"manual_edit_request_too_large", "proposal_patch_too_large"}:
+        return status.HTTP_413_CONTENT_TOO_LARGE
+    if code in _VISUAL_REVISION_UNAVAILABLE_CODES:
+        return status.HTTP_503_SERVICE_UNAVAILABLE
+    return status.HTTP_422_UNPROCESSABLE_CONTENT
+
+
+def _visual_revision_patch_from_request(
+    payload: EditorialEnrichmentRevisionRequest,
+) -> VisualRevisionPatch:
+    """Translate one typed request variant into the closed domain union.
+
+    The four variants whose planner branch is still in flight never reach this
+    function: the route refuses them with `enrichment_revision_unsupported_operation`.
+    """
+    if isinstance(payload, EditorialVisualCaptionRevisionRequest):
+        return UpdateVisualCaptionPatch(
+            element_kind=payload.element_kind,
+            element_key=payload.element_key,
+            caption=payload.caption,
+        )
+    if isinstance(payload, EditorialMoveEnrichmentElementRevisionRequest):
+        return MoveEnrichmentElementPatch(
+            element_kind=payload.element_kind,
+            element_key=payload.element_key,
+            anchor_block_id=payload.anchor_block_id,
+        )
+    if isinstance(payload, EditorialReorderEnrichmentElementsRevisionRequest):
+        return ReorderEnrichmentElementsPatch(
+            anchor_block_id=payload.anchor_block_id,
+            order=tuple(EnrichmentElementRef(item.kind, item.key) for item in payload.order),
+        )
+    raise HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        detail={
+            "code": "enrichment_revision_unsupported_operation",
+            "message": _ERROR_MESSAGES["enrichment_revision_unsupported_operation"],
+        },
+    )
+
+
+def _log_enrichment_revision_rejection(
+    *,
+    code: str,
+    reason: str | None,
+    diagnostics: Mapping[str, object] | None,
+    subject_id: UUID,
+    occurrence_id: UUID,
+) -> None:
+    """Log closed codes only: never captions, block text or evidence text."""
+    safe_reason = (
+        reason
+        if reason is not None
+        and re.fullmatch(r"[a-z][a-z0-9_]*(?::[a-z][a-z0-9_]*)?", reason) is not None
+        else "not_applicable"
+    )
+    logger.warning(
+        "enrichment_revision_rejected code=%s reason=%s diagnostic_keys=%s "
+        "subject_id=%s occurrence_id=%s",
+        code,
+        safe_reason,
+        ",".join(sorted(diagnostics)) if diagnostics else "none",
+        subject_id,
+        occurrence_id,
+    )
+
+
+@router.post(
+    "/subjects/{subject_id}/editor/blocks/{occurrence_id}/enrichment-revisions",
+    response_model=EditorialProposalView,
+)
+async def prepare_enrichment_revision(
+    subject_id: UUID,
+    occurrence_id: UUID,
+    request: Request,
+    payload: EditorialEnrichmentRevisionRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> EditorialProposalView:
+    if idempotency_key is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "idempotency_key_required",
+                "message": _ERROR_MESSAGES["idempotency_key_required"],
+            },
+        )
+    if not is_valid_editorial_idempotency_key(idempotency_key):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "idempotency_key_invalid",
+                "message": _ERROR_MESSAGES["idempotency_key_invalid"],
+            },
+        )
+    if not _proposal_impact_consumer_wired():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "manual_edit_unavailable",
+                "message": _ERROR_MESSAGES["manual_edit_unavailable"],
+            },
+        )
+    actor_id = await _thread_actor_id(request)
+    if payload.operation in _UNIMPLEMENTED_VISUAL_REVISION_OPERATIONS:
+        _log_enrichment_revision_rejection(
+            code="enrichment_revision_unsupported_operation",
+            reason=f"operation:{payload.operation}",
+            diagnostics=None,
+            subject_id=subject_id,
+            occurrence_id=occurrence_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "code": "enrichment_revision_unsupported_operation",
+                "message": _ERROR_MESSAGES["enrichment_revision_unsupported_operation"],
+            },
+        )
+    try:
+        patch = _visual_revision_patch_from_request(payload)
+        service = _manual_proposal_service(request)
+        proposal = await service.prepare_visual_revision(
+            subject_id=subject_id,
+            snapshot_id=payload.snapshot_id,
+            occurrence_id=occurrence_id,
+            actor_id=actor_id,
+            idempotency_key=idempotency_key,
+            patch=patch,
+        )
+        if proposal.patch_sha256 is None:
+            raise EditorialProposalApplicationError("proposal_patch_invalid")
+        view = await service.inspect(
+            subject_id,
+            occurrence_id,
+            proposal.id,
+            workspace_service=_service(request),
+        )
+        return EditorialProposalView.model_validate(view, from_attributes=True)
+    except HTTPException:
+        raise
+    except EditorialProposalConflict as error:
+        _log_enrichment_revision_rejection(
+            code="proposal_idempotency_conflict",
+            reason=None,
+            diagnostics=None,
+            subject_id=subject_id,
+            occurrence_id=occurrence_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "proposal_idempotency_conflict",
+                "message": _ERROR_MESSAGES["proposal_idempotency_conflict"],
+            },
+        ) from error
+    except EditorialProposalApplicationError as error:
+        code = error.code
+        _log_enrichment_revision_rejection(
+            code=code,
+            reason=error.reason,
+            diagnostics=error.diagnostics,
+            subject_id=subject_id,
+            occurrence_id=occurrence_id,
+        )
+        response_status = _enrichment_revision_status(code)
+        if response_status == status.HTTP_503_SERVICE_UNAVAILABLE:
+            code = "manual_edit_unavailable"
+        raise HTTPException(
+            status_code=response_status,
+            detail={
+                "code": code,
+                "message": _ERROR_MESSAGES.get(
+                    code, "La révision visuelle a été refusée. Rechargez l'atelier."
+                ),
+            },
+        ) from error
+    except Exception as error:
+        trace = traceback.extract_tb(error.__traceback__)
+        origin_frame = trace[-1] if trace else None
+        origin = (
+            f"{origin_frame.filename.rsplit('/', 1)[-1]}:{origin_frame.lineno}:{origin_frame.name}"
+            if origin_frame is not None
+            else "unavailable"
+        )
+        logger.warning(
+            "enrichment_revision_rejected code=%s reason=%s exception_class=%s origin=%s "
+            "subject_id=%s occurrence_id=%s",
+            "enrichment_revision_unexpected",
+            "not_applicable",
+            type(error).__name__,
+            origin,
+            subject_id,
+            occurrence_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "manual_edit_unavailable",
+                "message": _ERROR_MESSAGES["manual_edit_unavailable"],
+            },
+        ) from error
 
 
 @router.post(

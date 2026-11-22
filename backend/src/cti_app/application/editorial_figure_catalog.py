@@ -453,6 +453,20 @@ class EditorialFigureCatalogService:
             item._source_figure_id: item.figure_id for item in items if item._run_id == run_id
         }
 
+    async def source_figure_catalog_figures(
+        self, subject_id: UUID
+    ) -> tuple[UUID | None, dict[UUID, EditorialFigureCatalogItem]]:
+        """Map canonical source figure IDs to current catalogue items.
+
+        One cached inventory read supplies both the opaque handle and the
+        archived original caption the workshop compares against.
+        """
+        items = await self._load_current(subject_id)
+        if not items:
+            return None, {}
+        run_id = items[0]._run_id
+        return run_id, {item._source_figure_id: item for item in items if item._run_id == run_id}
+
     async def resolve_for_insertion(
         self, *, subject_id: UUID, figure_id: UUID
     ) -> EditorialFigureCatalogItem:

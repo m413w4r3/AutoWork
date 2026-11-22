@@ -171,9 +171,16 @@ def test_snapshot_passes_current_catalog_figure_ids_to_registry_projection(
             assert limit == 1
             return SimpleNamespace(items=(), available_count=0)
 
-        async def source_figure_catalog_ids(self, subject_id: UUID) -> tuple[UUID, dict[UUID, str]]:
+        async def source_figure_catalog_figures(
+            self, subject_id: UUID
+        ) -> tuple[UUID, dict[UUID, SimpleNamespace]]:
             assert subject_id == service_subject_id
-            return run_id, {source_figure_id: expected_id}
+            return run_id, {
+                source_figure_id: SimpleNamespace(
+                    figure_id=expected_id,
+                    original_caption="Synthetic original caption",
+                )
+            }
 
     service_subject_id = subject_id
     service._figure_catalog_service = _Catalog()
@@ -185,6 +192,9 @@ def test_snapshot_passes_current_catalog_figure_ids_to_registry_projection(
     assert project_blocks_spy.call_args is not None
     assert project_blocks_spy.call_args.kwargs["catalog_figure_ids"] == {
         source_figure_id: expected_id
+    }
+    assert project_blocks_spy.call_args.kwargs["catalog_figure_captions"] == {
+        source_figure_id: "Synthetic original caption"
     }
 
 
