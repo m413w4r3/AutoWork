@@ -97,8 +97,6 @@ def test_sessions_routes_are_reserved_and_typed(uds_client, agent_server: Runnin
 @pytest.mark.parametrize(
     "path",
     [
-        f"/v1/workspaces/{VALID_WORKSPACE_ID}/files",
-        f"/v1/workspaces/{VALID_WORKSPACE_ID}/events",
         f"/v1/workspaces/{VALID_WORKSPACE_ID}/base-samples/{'b' * 64}",
     ],
 )

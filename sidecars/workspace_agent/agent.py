@@ -21,6 +21,7 @@ from pathlib import Path
 from .auth import generate_token, rotate_token_file
 from .http_server import WorkspaceAgentHTTPServer
 from .protocol import PROTOCOL_VERSION, format_rfc3339_utc
+from .scan import WorkspaceScanService
 from .workspace import WorkspaceManager
 
 LOGGER = logging.getLogger("autowork.workspace_agent")
@@ -33,6 +34,7 @@ LOCK_FILE_NAME = "agent.lock"
 LOCK_FILE_MODE = 0o640
 EXIT_SECOND_INSTANCE = 73
 SERVE_POLL_SECONDS = 0.25
+SCAN_THREAD_JOIN_SECONDS = 30.0
 
 
 class AgentStartupError(RuntimeError):
@@ -152,8 +154,15 @@ class WorkspaceAgent:
         self.token: str | None = None
         self.runtime_dir: Path | None = None
         self.workspaces = WorkspaceManager(config.root)
+        self.scans = WorkspaceScanService(
+            self.workspaces,
+            poll_interval_ms=config.poll_interval_ms,
+            stability_window_ms=config.stability_window_ms,
+        )
         self._lock = InstanceLock(config.socket_dir / LOCK_FILE_NAME)
         self._server: WorkspaceAgentHTTPServer | None = None
+        self._scan_stop = threading.Event()
+        self._scan_thread: threading.Thread | None = None
         self._ready = threading.Event()
 
     @property
@@ -173,6 +182,7 @@ class WorkspaceAgent:
             self.token = None
             self._lock.release()
             raise
+        self._start_scan_thread()
         self._ready.set()
         LOGGER.info("workspace agent ready instance_id=%s", self.instance_id)
 
@@ -189,6 +199,7 @@ class WorkspaceAgent:
             self.stop()
 
     def stop(self) -> None:
+        self._stop_scan_thread()
         server, self._server = self._server, None
         if server is not None:
             server.server_close()
@@ -196,6 +207,40 @@ class WorkspaceAgent:
         self._ready.clear()
         self.token = None
         LOGGER.info("workspace agent stopped instance_id=%s", self.instance_id)
+
+    def _start_scan_thread(self) -> None:
+        self._scan_stop.clear()
+        thread = threading.Thread(target=self._scan_loop, name="workspace-scan", daemon=True)
+        self._scan_thread = thread
+        thread.start()
+
+    def _stop_scan_thread(self) -> None:
+        self._scan_stop.set()
+        thread, self._scan_thread = self._scan_thread, None
+        if thread is not None:
+            thread.join(timeout=SCAN_THREAD_JOIN_SECONDS)
+
+    def _scan_loop(self) -> None:
+        """Poll every workspace on ``--poll-interval-ms`` until stopped."""
+        interval = self.scans.poll_interval_seconds
+        while not self._scan_stop.is_set():
+            try:
+                summaries = self.workspaces.list_workspaces()
+            except Exception as exc:
+                LOGGER.warning("workspace discovery failed error=%s", type(exc).__name__)
+                summaries = []
+            for summary in summaries:
+                if self._scan_stop.is_set():
+                    break
+                try:
+                    self.scans.scan(summary.workspace_id)
+                except Exception as exc:
+                    LOGGER.warning(
+                        "workspace scan failed workspace_id=%s error=%s",
+                        summary.workspace_id,
+                        type(exc).__name__,
+                    )
+            self._scan_stop.wait(interval)
 
     def wait_ready(self, timeout: float) -> bool:
         return self._ready.wait(timeout)
