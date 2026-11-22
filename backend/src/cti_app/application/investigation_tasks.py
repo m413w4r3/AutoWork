@@ -15,8 +15,11 @@ superseded lease refuses every such write with a typed ``lease_expired`` /
 running operator lease.  The heartbeat is a single conditional UPDATE through
 ``renew_lease`` (``status IN ('running','awaiting_input') AND
 status_version = :expected AND lease_fence = :fence AND lease_expires_at >
-:now``); zero rows is a typed 409 and a late heartbeat never resurrects a
-lease.  ``append_task_event`` remains the sole writer of ``event_sequence``:
+statement_timestamp()``); the lease boundary and the new lease values come from
+the database clock, so zero rows is a typed 409 and a late heartbeat never
+resurrects a lease.  The ``lease_renewed`` event is timestamped with the
+database ``heartbeat_at``.  ``append_task_event`` remains the sole writer of
+``event_sequence``:
 a status command advances ``status_version`` and then ``event_sequence``, a
 non-status event advances only ``event_sequence`` and carries the current
 ``status_version``.
@@ -969,7 +972,6 @@ class InvestigationTaskService:
             task.id,
             expected_status_version=task.status_version,
             expected_lease_fence=lease_fence,
-            now=timestamp,
             ttl_seconds=self._limits.lease_seconds,
         )
         if renewed is None:
@@ -985,7 +987,9 @@ class InvestigationTaskService:
             to_status=None,
             payload=payload,
         )
-        event, _ = await append_task_event(self._tasks, draft, occurred_at=timestamp)
+        # The renewal event records the database heartbeat, not the caller
+        # clock, so the journal and the lease agree on when the lease moved.
+        event, _ = await append_task_event(self._tasks, draft, occurred_at=renewed.heartbeat_at)
         return TaskCommandResult(task=await self._current_task(renewed.id, renewed), event=event)
 
     # ---------------------------------------------------------------- running

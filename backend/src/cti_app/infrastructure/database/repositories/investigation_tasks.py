@@ -14,6 +14,12 @@ composes them without owning schema code:
   expired lease (M1).
 * Dependencies and events are append-only by database trigger.
 
+The heartbeat boundary is the *database* clock: the expiry predicate and the
+new ``heartbeat_at``/``lease_expires_at`` values are evaluated with
+``statement_timestamp()`` inside the UPDATE, so a process clock that drifts
+from PostgreSQL cannot renew a dead lease or refuse a live one.
+``database_now`` exposes that same clock to the system sweep.
+
 ``update_status`` never writes ``event_sequence``: only
 ``advance_event_sequence`` does, and only inside ``append_task_event``.
 """
@@ -24,7 +30,7 @@ from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select, text, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -394,12 +400,19 @@ class SqlAlchemyInvestigationTaskRepository:
         *,
         expected_status_version: int,
         expected_lease_fence: int,
-        now: datetime,
         ttl_seconds: int,
     ) -> InvestigationTaskV1 | None:
-        """Conditional heartbeat for ``running``/``awaiting_input`` (D3 M1)."""
+        """Conditional heartbeat for ``running``/``awaiting_input`` (D3 M1).
+
+        Every time value comes from ``statement_timestamp()``: the expiry
+        predicate, ``heartbeat_at``, ``lease_expires_at`` and ``updated_at``.
+        No caller clock participates, so a late heartbeat cannot resurrect a
+        lease PostgreSQL already considers expired and a skewed application
+        clock cannot resurrect one either.
+        """
         if ttl_seconds < 1:
             raise ValueError("ttl_seconds must be >= 1")
+        database_now = func.statement_timestamp()
         result = await self._session.execute(
             update(InvestigationTaskRow)
             .where(
@@ -409,18 +422,25 @@ class SqlAlchemyInvestigationTaskRepository:
                 ),
                 InvestigationTaskRow.status_version == expected_status_version,
                 InvestigationTaskRow.lease_fence == expected_lease_fence,
-                InvestigationTaskRow.lease_expires_at > now,
+                InvestigationTaskRow.lease_expires_at > database_now,
             )
             .values(
-                heartbeat_at=now,
-                lease_expires_at=now + timedelta(seconds=ttl_seconds),
-                updated_at=now,
+                heartbeat_at=database_now,
+                lease_expires_at=database_now + timedelta(seconds=ttl_seconds),
+                updated_at=database_now,
             )
             .returning(InvestigationTaskRow)
             .execution_options(populate_existing=True, synchronize_session=False)
         )
         row = result.scalar_one_or_none()
         return _task_from_row(row) if row is not None else None
+
+    async def database_now(self) -> datetime:
+        """The database clock shared by the lease predicates (D3 M1)."""
+        value = await self._session.scalar(select(func.statement_timestamp()))
+        if not isinstance(value, datetime):
+            raise RuntimeError("PostgreSQL did not return a statement timestamp")
+        return value
 
     async def advance_event_sequence(self, task_id: UUID) -> int:
         """The only writer of ``event_sequence`` (D3 M4)."""

@@ -727,31 +727,54 @@ def test_task_repository_acquires_and_renews_lease_with_fence(
                 assert running.lease is not None
                 await uow.commit()
 
-            renewed_at = NOW + timedelta(seconds=60)
+            # The heartbeat boundary is the database clock, so pin the lease
+            # relative to it instead of to the process timestamp used above.
+            async with factory() as session:
+                await session.execute(
+                    sa.text(
+                        "UPDATE investigation_tasks SET lease_expires_at = "
+                        "statement_timestamp() + interval '1 hour' WHERE id = :task_id"
+                    ),
+                    {"task_id": task.id},
+                )
+                await session.commit()
+
             async with SqlAlchemyUnitOfWork(factory) as uow:
                 renewed = await uow.investigation_tasks.renew_lease(
                     task.id,
                     expected_status_version=running.status_version,
                     expected_lease_fence=running.lease_fence,
-                    now=renewed_at,
                     ttl_seconds=180,
                 )
                 assert renewed is not None
                 assert renewed.status_version == running.status_version
-                assert renewed.heartbeat_at == renewed_at
+                assert renewed.heartbeat_at is not None
+                database_now = await uow.investigation_tasks.database_now()
+                assert abs((database_now - renewed.heartbeat_at).total_seconds()) < 60
                 stale = await uow.investigation_tasks.renew_lease(
                     task.id,
                     expected_status_version=running.status_version,
                     expected_lease_fence=running.lease_fence - 1,
-                    now=renewed_at,
                     ttl_seconds=180,
                 )
                 assert stale is None
+                await uow.commit()
+
+            async with factory() as session:
+                await session.execute(
+                    sa.text(
+                        "UPDATE investigation_tasks SET lease_expires_at = "
+                        "statement_timestamp() - interval '1 millisecond' WHERE id = :task_id"
+                    ),
+                    {"task_id": task.id},
+                )
+                await session.commit()
+
+            async with SqlAlchemyUnitOfWork(factory) as uow:
                 expired = await uow.investigation_tasks.renew_lease(
                     task.id,
                     expected_status_version=running.status_version,
                     expected_lease_fence=running.lease_fence,
-                    now=renewed_at + timedelta(seconds=180),
                     ttl_seconds=180,
                 )
                 assert expired is None

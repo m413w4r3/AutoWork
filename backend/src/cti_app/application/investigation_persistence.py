@@ -10,7 +10,7 @@ import asyncio
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Protocol
 from uuid import UUID
 
@@ -317,7 +317,10 @@ class InvestigationTaskRepository(Protocol):
     :func:`~cti_app.application.investigation_task_events.append_task_event`
     the sole writer of ``event_sequence``; ``update_status`` is the business
     status CAS and never writes it.  Lease primitives live here because lot
-    04B2 owns the engine, not the schema.
+    04B2 owns the engine, not the schema.  A durable repository evaluates the
+    ``renew_lease`` boundary with its own database clock; ``database_now``
+    exposes that clock to the system sweep.  The in-memory fake carries an
+    injectable clock instead.
     """
 
     async def lock_investigation(self, investigation_id: UUID) -> None: ...
@@ -379,9 +382,10 @@ class InvestigationTaskRepository(Protocol):
         *,
         expected_status_version: int,
         expected_lease_fence: int,
-        now: datetime,
         ttl_seconds: int,
     ) -> InvestigationTaskV1 | None: ...
+
+    async def database_now(self) -> datetime: ...
 
     async def advance_event_sequence(self, task_id: UUID) -> int: ...
 
@@ -1141,13 +1145,18 @@ class InMemoryInvestigationPlanRepository:
 
 
 class InMemoryInvestigationTaskRepository:
-    """In-memory port fake sharing the SQL repository's observable rules."""
+    """In-memory port fake sharing the SQL repository's observable rules.
 
-    def __init__(self) -> None:
+    ``clock`` stands in for PostgreSQL's ``statement_timestamp()``: the fake
+    has no database, so tests inject the time the lease predicates see.
+    """
+
+    def __init__(self, *, clock: Callable[[], datetime] | None = None) -> None:
         self._tasks: dict[UUID, InvestigationTaskV1] = {}
         self._dependencies: set[tuple[UUID, UUID]] = set()
         self._events: list[TaskEvent] = []
         self._lock = asyncio.Lock()
+        self._clock: Callable[[], datetime] = clock or (lambda: datetime.now(UTC))
 
     async def lock_investigation(self, investigation_id: UUID) -> None:
         return None
@@ -1317,11 +1326,11 @@ class InMemoryInvestigationTaskRepository:
         *,
         expected_status_version: int,
         expected_lease_fence: int,
-        now: datetime,
         ttl_seconds: int,
     ) -> InvestigationTaskV1 | None:
         if ttl_seconds < 1:
             raise ValueError("ttl_seconds must be >= 1")
+        now = self._clock()
         async with self._lock:
             current = self._tasks.get(task_id)
             if (
@@ -1341,6 +1350,9 @@ class InMemoryInvestigationTaskRepository:
             )
             self._tasks[task_id] = updated
             return updated
+
+    async def database_now(self) -> datetime:
+        return self._clock()
 
     async def advance_event_sequence(self, task_id: UUID) -> int:
         async with self._lock:
