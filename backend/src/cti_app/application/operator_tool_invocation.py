@@ -80,6 +80,7 @@ from cti_app.domain.investigation import (
     FrameworkPreSubmissionProof,
     InvestigationExecutionMode,
     ToolInvocation,
+    ToolInvocationActorKind,
     ToolInvocationStatus,
     canonical_json_bytes,
 )
@@ -1140,9 +1141,16 @@ class OperatorToolInvocationService:
         expected_sha256: str | None = None,
         idempotency_key: str,
         actor_id: str | None = None,
+        requester_actor_kind: ToolInvocationActorKind | None = None,
     ) -> OperatorToolInvocationResult:
         if not 1 <= len(idempotency_key) <= 255:
             raise OperatorToolInvocationError("idempotency_key_invalid", 422)
+        if requester_actor_kind is not None and not isinstance(
+            requester_actor_kind, ToolInvocationActorKind
+        ):
+            raise TypeError("requester_actor_kind must use ToolInvocationActorKind")
+        if requester_actor_kind is not None and (actor_id is None or not actor_id.strip()):
+            raise OperatorToolInvocationError("requester_actor_id_required", 422)
         schema_version = self._canonical_schema_version(tool_name, schema_version)
         try:
             trace, _human_purpose = split_advisor_trace_purpose(
@@ -1190,6 +1198,7 @@ class OperatorToolInvocationService:
                     operation_key=operation_key,
                     trace=trace,
                     actor_id=actor_id,
+                    requester_actor_kind=requester_actor_kind,
                 )
 
     def _canonical_schema_version(self, tool_name: str, schema_version: str) -> str:
@@ -1322,6 +1331,7 @@ class OperatorToolInvocationService:
         operation_key: str,
         trace: Mapping[str, Any] | None,
         actor_id: str | None,
+        requester_actor_kind: ToolInvocationActorKind | None,
     ) -> OperatorToolInvocationResult:
         state = await self._states.get(self._investigation_id)
         if state is None:
@@ -1772,6 +1782,7 @@ class OperatorToolInvocationService:
                 purpose=record_purpose,
                 operation_key=operation_key,
                 actor_id=actor_id,
+                actor_kind=requester_actor_kind,
                 check_stop_before_dispatch=False,
             )
             if advisor_disclosure_denied:

@@ -160,6 +160,40 @@ ADVISOR_RESPONSE_SCHEMA = ADVISOR_RESPONSE_SCHEMA_V2
 _TYPED_CONSULTATION_TYPES = frozenset(
     {"draft_text", "review_text", "yara_draft", "suricata_draft", "figure_plan"}
 )
+# ADR-0011 D9: interpretation/critique are accepted untyped consultations.
+ACCEPTED_CONSULTATION_TYPES = frozenset(
+    {
+        "plan_investigation",
+        "pivot_strategy",
+        "yara_draft",
+        "review_text",
+        "draft_text",
+        "suricata_draft",
+        "figure_plan",
+        "interpretation",
+        "critique",
+    }
+)
+_OPTIONAL_FIELD_CONSULTATIONS: Mapping[str, frozenset[str]] = {
+    "opinion_id": frozenset({"review_text"}),
+    "opinion_version": frozenset({"review_text"}),
+    "form": frozenset({"draft_text", "review_text"}),
+    "anchor": frozenset({"draft_text", "review_text"}),
+    "block_type": frozenset({"draft_text", "review_text"}),
+    "assertions": frozenset({"draft_text"}),
+    "finding_refs": frozenset({"figure_plan", "interpretation", "critique"}),
+}
+
+
+def _supported_optional_fields(consultation_type: str) -> frozenset[str]:
+    """The editorial fields a consultation type may target (D9)."""
+    return frozenset(
+        field
+        for field, supported_types in _OPTIONAL_FIELD_CONSULTATIONS.items()
+        if consultation_type in supported_types
+    )
+
+
 MAX_ADVISOR_TOOL_SECONDS = 3_600
 # Verify each complete quarantine blob; there is no sample-fragment byte cap.
 # Keep and strengthen the prior admission floor by deriving it from the Bridge
@@ -757,15 +791,7 @@ class InvestigationAdvisorTool:
             if not isinstance(raw_consultation_type, str):
                 raise _AdvisorInputValidationError("consultation_type_required")
             consultation_type = raw_consultation_type
-            if consultation_type not in {
-                "plan_investigation",
-                "pivot_strategy",
-                "yara_draft",
-                "review_text",
-                "draft_text",
-                "suricata_draft",
-                "figure_plan",
-            }:
+            if consultation_type not in ACCEPTED_CONSULTATION_TYPES:
                 raise _AdvisorInputValidationError("consultation_type_unsupported")
             arguments = dict(arguments)
             ignored_inputs: list[dict[str, Any]] = []
@@ -886,16 +912,7 @@ class InvestigationAdvisorTool:
                         {"field": field, "reason": reason},
                     )
                     arguments.pop(field, None)
-            optional_field_consultations = {
-                "opinion_id": {"review_text"},
-                "opinion_version": {"review_text"},
-                "form": {"draft_text", "review_text"},
-                "anchor": {"draft_text", "review_text"},
-                "block_type": {"draft_text", "review_text"},
-                "assertions": {"draft_text"},
-                "finding_refs": {"figure_plan"},
-            }
-            for field, supported_types in optional_field_consultations.items():
+            for field, supported_types in _OPTIONAL_FIELD_CONSULTATIONS.items():
                 if field in arguments and consultation_type not in supported_types:
                     self._append_ignored_advisor_input(
                         context.idempotency_key,

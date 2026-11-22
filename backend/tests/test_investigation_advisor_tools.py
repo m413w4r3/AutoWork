@@ -11,7 +11,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, get_args
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
@@ -44,7 +44,11 @@ from cti_app.application.investigation_advisor_tools import (
     _truncate_context_text,
     register_investigation_advisor_tool,
 )
-from cti_app.application.investigation_contracts import ArticleClaimV1, ArticleContextV1
+from cti_app.application.investigation_contracts import (
+    AdvisorConsultationType,
+    ArticleClaimV1,
+    ArticleContextV1,
+)
 from cti_app.application.investigation_tools import (
     InMemoryToolRegistry,
     RegistryToolDispatcher,
@@ -13112,3 +13116,27 @@ async def test_plan_dossier_metrics_do_not_grow_with_historical_subject_samples(
         "blob_reads", 0
     )
     assert persisted_provenance["dossier_manifest"] == list(provenance["dossier_manifest"])
+
+
+def test_new_advisory_types_have_no_editorial_target() -> None:
+    """``interpretation``/``critique`` are accepted untyped consultations (D9).
+
+    They carry a question and observation/finding references only: no editorial
+    target, no ``opinion_id``, no publishable text.  The typed consultation set
+    and the optional editorial fields must both exclude them.
+    """
+    new_types = {"interpretation", "critique"}
+    assert new_types <= set(get_args(AdvisorConsultationType))
+    assert new_types <= advisor_tools_module.ACCEPTED_CONSULTATION_TYPES
+    assert not new_types & advisor_tools_module._TYPED_CONSULTATION_TYPES
+    editorial_fields = {
+        "opinion_id",
+        "opinion_version",
+        "form",
+        "anchor",
+        "block_type",
+        "assertions",
+    }
+    for consultation_type in sorted(new_types):
+        supported = advisor_tools_module._supported_optional_fields(consultation_type)
+        assert not supported & editorial_fields
