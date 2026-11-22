@@ -27,6 +27,7 @@ from cti_app.application.agentic_host_sessions import (
     HostSessionContractError,
 )
 from cti_app.application.agentic_sessions import AgentSessionSecretDeliveryPort
+from cti_app.application.host_session_context import CanonicalHostSessionContextProvider
 from cti_app.config import Settings
 from cti_app.domain.agentic_operator import (
     AgenticOperatorPort,
@@ -129,6 +130,7 @@ class AgenticOperatorPorts:
     secret_delivery: AgentSessionSecretDeliveryPort | None
     host_sessions: HttpHostSessionsClient | None
     adapters: Mapping[OperatorAdapterKind, HostOperatorAdapter] = field(default_factory=dict)
+    unavailable_reason: str | None = None
 
     @property
     def available(self) -> bool:
@@ -137,6 +139,52 @@ class AgenticOperatorPorts:
     async def aclose(self) -> None:
         if self.host_sessions is not None:
             await self.host_sessions.aclose()
+
+
+def build_session_runtime(
+    app_state: object,
+    settings: Settings,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+    clock: Callable[[], datetime] | None = None,
+) -> AgenticOperatorPorts:
+    """Build the mountable session runtime, or a fail-closed empty set.
+
+    The orchestrator calls this from the lifespan and mounts the three members
+    on ``app.state`` (``agentic_operator_port``, ``agent_session_secret_delivery``
+    and ``host_sessions``); it also mounts ``agent_session_runtime`` itself so a
+    route can report the typed unavailable reason.  The canonical context
+    provider needs the lifespan's ``uow_factory``; without it, or without a
+    configured host workspace agent, no adapter is invented (D7 fail-closed).
+    """
+    socket_path = settings.workspace_agent_socket.strip()
+    token_file = settings.workspace_agent_token_file.strip()
+    if not socket_path or not token_file:
+        return AgenticOperatorPorts(
+            operator=None,
+            secret_delivery=None,
+            host_sessions=None,
+            unavailable_reason="workspace_agent_unconfigured",
+        )
+    uow_factory = getattr(app_state, "uow_factory", None)
+    if uow_factory is None:
+        return AgenticOperatorPorts(
+            operator=None,
+            secret_delivery=None,
+            host_sessions=None,
+            unavailable_reason="canonical_uow_unavailable",
+        )
+    context_provider = CanonicalHostSessionContextProvider(
+        uow_factory=uow_factory,
+        settings=settings,
+        clock=clock,
+    )
+    return build_agentic_operator_ports(
+        settings,
+        context_provider=context_provider,
+        transport=transport,
+        clock=clock,
+    )
 
 
 def build_agentic_operator_ports(
@@ -173,4 +221,9 @@ def build_agentic_operator_ports(
     )
 
 
-__all__ = ["AgenticOperatorPorts", "DispatchingOperatorPort", "build_agentic_operator_ports"]
+__all__ = [
+    "AgenticOperatorPorts",
+    "DispatchingOperatorPort",
+    "build_agentic_operator_ports",
+    "build_session_runtime",
+]

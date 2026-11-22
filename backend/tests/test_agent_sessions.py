@@ -183,8 +183,9 @@ class _FakeOperator:
 
     adapter_kind = OperatorAdapterKind.CODEX_CLI
 
-    def __init__(self) -> None:
+    def __init__(self, order: list[str] | None = None) -> None:
         self.capabilities = _capabilities()
+        self.order = order if order is not None else []
         self.probed: list[ProbeCapabilitiesRequest] = []
         self.prepared: list[PrepareSessionRequest] = []
         self.started: list[StartSessionRequest] = []
@@ -214,6 +215,7 @@ class _FakeOperator:
         )
 
     async def start_session(self, request: StartSessionRequest) -> SessionProcessStatusV1:
+        self.order.append("start")
         self.started.append(request)
         return SessionProcessStatusV1(
             session_id=request.session_id,
@@ -294,7 +296,8 @@ class _FakeOperator:
 class _FakeSecretDelivery:
     """Captures the one-time secret the backend would send over the host socket."""
 
-    def __init__(self) -> None:
+    def __init__(self, order: list[str] | None = None) -> None:
+        self.order = order if order is not None else []
         self.deliveries: list[dict[str, Any]] = []
 
     async def deliver_session_secret(
@@ -308,6 +311,7 @@ class _FakeSecretDelivery:
         secret: SessionSecret,
         idempotency_key: str,
     ) -> None:
+        self.order.append("secret")
         self.deliveries.append(
             {
                 "session_id": session_id,
@@ -345,10 +349,11 @@ class _Harness:
         self.investigations = _InvestigationRepository(self.investigation_id)
         self.decisions = _DecisionRepository()
         self.uow = _FakeUnitOfWork(self)
-        self.operator = _FakeOperator()
+        self.order: list[str] = []
+        self.operator = _FakeOperator(self.order)
         self.deriver = HmacSessionSecretDeriver(key) if key is not None else None
         self.secret_delivery: AgentSessionSecretDeliveryPort | None = (
-            _FakeSecretDelivery() if with_secret_delivery else None
+            _FakeSecretDelivery(self.order) if with_secret_delivery else None
         )
         self.service = SessionService(
             uow_factory=lambda: self.uow,
@@ -587,6 +592,15 @@ async def test_prepare_replay_rederives_same_secret_without_reprobing() -> None:
     assert second.secret.reveal() == first.secret.reveal()
     assert len(harness.operator.probed) == 1
     assert len(harness.operator.prepared) == 1
+
+
+async def test_open_session_delivers_the_secret_before_the_adapter_start() -> None:
+    harness = _Harness()
+    task = await harness.seed_task()
+    await harness.open(task=task)
+    # SESSION-RUNNER §6: the host prepare IS the one-shot secret hand-off, so
+    # start_session may only follow a successful delivery.
+    assert harness.order == ["secret", "start"]
 
 
 async def test_secret_never_appears_in_repr_logs_or_payloads() -> None:

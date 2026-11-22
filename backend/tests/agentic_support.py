@@ -144,6 +144,8 @@ class FixedContextProvider:
         investigation_id: UUID,
         task_id: UUID,
         adapter_kind: OperatorAdapterKind,
+        handoff_id: UUID,
+        requested_model: str | None = None,
     ) -> HostSessionContextV1:
         self.requests.append(
             {
@@ -151,6 +153,8 @@ class FixedContextProvider:
                 "investigation_id": investigation_id,
                 "task_id": task_id,
                 "adapter_kind": adapter_kind,
+                "handoff_id": handoff_id,
+                "requested_model": requested_model,
             }
         )
         return self.value

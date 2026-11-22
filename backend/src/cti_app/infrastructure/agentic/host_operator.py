@@ -261,6 +261,8 @@ class HostOperatorAdapter:
             investigation_id=request.investigation_id,
             task_id=request.task_id,
             adapter_kind=request.adapter_kind,
+            handoff_id=request.handoff_id,
+            requested_model=request.model,
         )
 
     # -- lifecycle ---------------------------------------------------------

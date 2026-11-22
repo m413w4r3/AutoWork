@@ -682,7 +682,13 @@ class HostSessionContextV1(_HostWireModel):
 
 
 class HostSessionContextProvider(Protocol):
-    """Resolves the host-only coordinates for one 05B1 prepare request."""
+    """Resolves the host-only coordinates for one 05B1 prepare request.
+
+    ``handoff_id`` is the handoff the session will start from; the provider
+    resolves its canonical version and SHA-256 instead of trusting the caller.
+    ``requested_model`` is the alias the verified human chose at open; the
+    provider validates it and the host contract bounds it.
+    """
 
     async def host_session_context(
         self,
@@ -691,6 +697,8 @@ class HostSessionContextProvider(Protocol):
         investigation_id: UUID,
         task_id: UUID,
         adapter_kind: OperatorAdapterKind,
+        handoff_id: UUID,
+        requested_model: str | None = None,
     ) -> HostSessionContextV1: ...
 
 
