@@ -20,6 +20,13 @@ from alembic import command
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cti_app.domain.agentic_operator import (
+    AgentSessionState,
+    AgentSessionV1,
+    OperatorAdapterKind,
+    OperatorCapabilitiesV1,
+    OperatorProbeCommand,
+)
 from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition
 from cti_app.domain.editorial import (
@@ -54,7 +61,7 @@ from tests.integration.edition_codes import reserve_edition_code
 pytestmark = pytest.mark.integration
 
 PREVIOUS = "0020_investigation_plans"
-HEAD = "0022_investigation_handoffs"
+HEAD = "0023_agent_sessions"
 TASK_TABLES = {
     "investigation_tasks",
     "investigation_task_dependencies",
@@ -138,6 +145,53 @@ async def _seed_investigation(
         await uow.analyst_investigations.add(investigation)
         await uow.commit()
     return investigation
+
+
+async def _create_agent_session(
+    session_factory: async_sessionmaker[AsyncSession],
+    investigation_id: UUID,
+    task_id: UUID,
+    session_id: UUID,
+) -> None:
+    capabilities = OperatorCapabilitiesV1(
+        adapter_kind=OperatorAdapterKind.CODEX_CLI,
+        executable="/usr/local/bin/codex",
+        version="codex-cli 1.2.3",
+        modes=("exec",),
+        supports_resume=True,
+        permission_modes=("workspace-write",),
+        probed_at=NOW,
+        probes=(
+            OperatorProbeCommand(
+                argv=("/usr/local/bin/codex", "--help"),
+                exit_code=0,
+                stdout_sha256=SHA_A,
+                advertised_modes=("exec", "workspace-write"),
+            ),
+        ),
+    )
+    session = AgentSessionV1(
+        id=session_id,
+        investigation_id=investigation_id,
+        task_id=task_id,
+        adapter_kind=OperatorAdapterKind.CODEX_CLI,
+        state=AgentSessionState.READY,
+        state_version=1,
+        capability_probe=capabilities.to_payload(),
+        capability_sha256=capabilities.capability_sha256,
+        probed_at=capabilities.probed_at,
+        auth_secret_nonce=b"n" * 32,
+        auth_secret_hash=SHA_A,
+        auth_secret_issued_at=NOW,
+        opened_at=NOW,
+        idempotency_key=f"lease-session-{session_id}",
+        created_at=NOW,
+        updated_at=NOW,
+        host_session_ref=f"host-{session_id}",
+    )
+    async with SqlAlchemyUnitOfWork(session_factory) as uow:
+        await uow.agent_sessions.add(session)
+        await uow.commit()
 
 
 async def _create_task(
@@ -387,10 +441,13 @@ def test_tool_invocation_task_attribution_columns(
             factory = create_session_factory(engine)
             investigation = await _seed_investigation(factory)
             task = await _create_task(factory, investigation.id)
+            session_id = uuid4()
+            await _create_agent_session(factory, investigation.id, task.id, session_id)
             base = {
                 "id": uuid4(),
                 "investigation_id": investigation.id,
                 "task_id": task.id,
+                "agent_session_id": session_id,
                 "operation_key": f"attribution-{uuid4()}",
                 "now": NOW,
             }
@@ -398,11 +455,12 @@ def test_tool_invocation_task_attribution_columns(
                 "INSERT INTO tool_invocations "
                 "(id, investigation_id, operation_key, tool_name, schema_version, "
                 "normalized_parameters, purpose, status, reserved_budget, consumed_budget, "
-                "response_refs, created_at, updated_at, version, task_id, actor_kind, actor_id) "
+                "response_refs, created_at, updated_at, version, task_id, actor_kind, "
+                "actor_id, agent_session_id) "
                 "VALUES (:id, :investigation_id, :operation_key, 'vt.file_report', "
                 "'vt-file-report.v1', '{}'::jsonb, 'Attribution oracle', 'pending', "
                 "'{}'::jsonb, '{}'::jsonb, '[]'::jsonb, :now, :now, 1, :task_id, "
-                ":actor_kind, :actor_id)"
+                ":actor_kind, :actor_id, :agent_session_id)"
             )
             await _execute(
                 factory,
@@ -712,6 +770,7 @@ def test_task_repository_acquires_and_renews_lease_with_fence(
                 assigned_actor_id="operator:test",
             )
             lease_session_id = uuid4()
+            await _create_agent_session(factory, investigation.id, task.id, lease_session_id)
             async with SqlAlchemyUnitOfWork(factory) as uow:
                 running = await uow.investigation_tasks.acquire_lease(
                     task.id,
@@ -789,3 +848,89 @@ def test_decision_check_definition_lists_task_values(
     assert target_values == {item.value for item in AnalystDecisionTargetType}
     assert {"plan_accept", "plan_reject", "task_result_accept"} <= decision_values
     assert {"plan_version", "task"} <= target_values
+
+
+def test_tool_invocation_attribution_pair_check(temporary_postgres_url: str) -> None:
+    """The cumulative 0023 pair: an agentic invocation carries task and session."""
+    config = _alembic_config(temporary_postgres_url)
+    command.upgrade(config, "head")
+
+    async def exercise() -> None:
+        engine = create_postgres_engine(temporary_postgres_url)
+        try:
+            factory = create_session_factory(engine)
+            investigation = await _seed_investigation(factory)
+            task = await _create_task(factory, investigation.id)
+            insert = (
+                "INSERT INTO tool_invocations "
+                "(id, investigation_id, operation_key, tool_name, schema_version, "
+                "normalized_parameters, purpose, status, reserved_budget, consumed_budget, "
+                "response_refs, created_at, updated_at, version, task_id, actor_kind, "
+                "actor_id, agent_session_id) "
+                "VALUES (:id, :investigation_id, :operation_key, 'vt.file_report', "
+                "'vt-file-report.v1', '{}'::jsonb, 'Attribution pair oracle', 'pending', "
+                "'{}'::jsonb, '{}'::jsonb, '[]'::jsonb, :now, :now, 1, :task_id, "
+                ":actor_kind, :actor_id, :agent_session_id)"
+            )
+            base: dict[str, object] = {
+                "investigation_id": investigation.id,
+                "now": NOW,
+                "actor_kind": "operator",
+                "actor_id": "operator:test",
+            }
+            await _expect_violation(
+                factory,
+                insert,
+                {
+                    **base,
+                    "id": uuid4(),
+                    "operation_key": f"task-only-{uuid4()}",
+                    "task_id": task.id,
+                    "agent_session_id": None,
+                },
+                sqlstate="23514",
+            )
+            await _expect_violation(
+                factory,
+                insert,
+                {
+                    **base,
+                    "id": uuid4(),
+                    "operation_key": f"session-only-{uuid4()}",
+                    "task_id": None,
+                    "agent_session_id": uuid4(),
+                },
+                sqlstate="23514",
+            )
+            await _expect_violation(
+                factory,
+                insert,
+                {
+                    **base,
+                    "id": uuid4(),
+                    "operation_key": f"unknown-session-{uuid4()}",
+                    "task_id": task.id,
+                    "agent_session_id": uuid4(),
+                },
+                sqlstate="23503",
+            )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(exercise())
+
+    async def check_definition() -> str:
+        engine = create_postgres_engine(temporary_postgres_url)
+        try:
+            async with engine.connect() as connection:
+                checks = await connection.run_sync(
+                    lambda sync: sa.inspect(sync).get_check_constraints("tool_invocations")
+                )
+        finally:
+            await engine.dispose()
+        definitions = {
+            check["name"]: str(check["sqltext"]) for check in checks if check.get("name")
+        }
+        return "".join(definitions["ck_tool_invocations_agent_session_pair"].lower().split())
+
+    assert asyncio.run(check_definition()) == "(task_idisnull)=(agent_session_idisnull)"

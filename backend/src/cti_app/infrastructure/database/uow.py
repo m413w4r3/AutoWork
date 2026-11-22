@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cti_app.application.edition_review import EditionReviewReadRepository
 from cti_app.application.investigation_persistence import (
+    AgentSessionRepository,
     AnalystOpinionRepository,
     EvidenceObservationRepository,
     FindingRepository,
@@ -103,6 +104,9 @@ from cti_app.application.persistence import (
 from cti_app.application.production_read_model import BatchStatusReadRepository
 from cti_app.infrastructure.database.models import (
     osint_open_policy as _osint_open_policy_models,  # noqa: F401
+)
+from cti_app.infrastructure.database.repositories.agent_sessions import (
+    SqlAlchemyAgentSessionRepository,
 )
 from cti_app.infrastructure.database.repositories.bridge_generation_slots import (
     SqlAlchemyBridgeGenerationSlotRepository,
@@ -333,6 +337,7 @@ class SqlAlchemyUnitOfWork:
     investigation_plans: InvestigationPlanRepository
     investigation_tasks: InvestigationTaskRepository
     investigation_handoffs: InvestigationHandoffRepository
+    agent_sessions: AgentSessionRepository
     production_runs: ProductionRunRepository
     production_routing_decisions: ProductionRoutingDecisionRepository
     editorial_workspace_snapshots: EditorialWorkspaceSnapshotRepository
@@ -444,6 +449,7 @@ class SqlAlchemyUnitOfWork:
         self.investigation_plans = SqlAlchemyInvestigationPlanRepository(self._session)
         self.investigation_tasks = SqlAlchemyInvestigationTaskRepository(self._session)
         self.investigation_handoffs = SqlAlchemyInvestigationHandoffRepository(self._session)
+        self.agent_sessions = SqlAlchemyAgentSessionRepository(self._session)
         self.production_runs = SqlAlchemyProductionRunRepository(self._session)
         self.production_routing_decisions = SqlAlchemyProductionRoutingDecisionRepository(
             self._session

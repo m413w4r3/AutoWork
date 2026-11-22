@@ -87,8 +87,13 @@ class ToolInvocationRow(Base):
             "(actor_kind IS NULL) = (actor_id IS NULL)",
             name="ck_tool_invocations_actor_pair",
         ),
+        CheckConstraint(
+            "(task_id IS NULL) = (agent_session_id IS NULL)",
+            name="ck_tool_invocations_agent_session_pair",
+        ),
         Index("ix_tool_invocations_investigation", "investigation_id", "created_at", "id"),
         Index("ix_tool_invocations_status", "status", "updated_at"),
+        Index("ix_tool_invocations_task_created", "task_id", "created_at"),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
@@ -114,6 +119,15 @@ class ToolInvocationRow(Base):
     )
     actor_kind: Mapped[str | None] = mapped_column(String(16), nullable=True)
     actor_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    agent_session_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey(
+            "agent_sessions.id",
+            name="fk_tool_invocations_agent_session",
+            ondelete="RESTRICT",
+        ),
+        nullable=True,
+    )
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     reserved_budget: Mapped[dict[str, int]] = mapped_column(JSONB, nullable=False)
     consumed_budget: Mapped[dict[str, int]] = mapped_column(JSONB, nullable=False)

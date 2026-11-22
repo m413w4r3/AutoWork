@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Protocol, Self
 from uuid import UUID
 
 from cti_app.application.investigation_persistence import (
+    AgentSessionRepository,
     AnalystOpinionRepository,
     EvidenceObservationRepository,
     FindingRepository,
@@ -1256,6 +1257,7 @@ class UnitOfWork(Protocol):
     investigation_plans: InvestigationPlanRepository
     investigation_tasks: InvestigationTaskRepository
     investigation_handoffs: InvestigationHandoffRepository
+    agent_sessions: AgentSessionRepository
     # Defined further down in this module.
     production_runs: ProductionRunRepository
     production_routing_decisions: ProductionRoutingDecisionRepository

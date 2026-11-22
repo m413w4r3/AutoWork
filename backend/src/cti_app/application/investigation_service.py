@@ -1633,15 +1633,17 @@ class InvestigationService:
         operation_key: str,
         actor_id: str | None = None,
         task_id: UUID | None = None,
+        agent_session_id: UUID | None = None,
         actor_kind: ToolInvocationActorKind | None = None,
         check_stop_before_dispatch: bool = True,
     ) -> tuple[ToolInvocation, ToolResult, tuple[UUID, ...], bool]:
         """Persist budget and RUNNING invocation before using the shared dispatcher.
 
         ``task_id``/``actor_kind``/``actor_id`` record M24 execution attribution
-        (ADR-0011 E4).  ``actor_id`` is written on the invocation only when an
-        actor kind is supplied, so legacy operator callers that pass an actor
-        for the execution context keep an unattributed journal row.
+        (ADR-0011 E4), and ``agent_session_id`` follows ``task_id`` as the
+        cumulative pair (D2/M9).  ``actor_id`` is written on the invocation only
+        when an actor kind is supplied, so legacy operator callers that pass an
+        actor for the execution context keep an unattributed journal row.
         """
         registered = self._registry.get(tool_name, schema_version)
         definition = registered[0] if registered else None
@@ -1786,6 +1788,7 @@ class InvestigationService:
             purpose=purpose,
             reserved_budget=requested_cost,
             task_id=task_id,
+            agent_session_id=agent_session_id,
             actor_kind=actor_kind,
             actor_id=actor_id if actor_kind is not None else None,
         )

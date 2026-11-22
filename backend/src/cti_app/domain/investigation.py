@@ -496,6 +496,7 @@ class ToolInvocation:
     passive_read_retry_trusted: bool | None = None
     response_refs: tuple[UUID, ...] = ()
     task_id: UUID | None = None
+    agent_session_id: UUID | None = None
     actor_kind: ToolInvocationActorKind | None = None
     actor_id: str | None = None
     id: UUID = field(default_factory=uuid4)
@@ -525,6 +526,12 @@ class ToolInvocation:
         object.__setattr__(self, "consumed_budget", _budget_values(self.consumed_budget))
         if self.task_id is not None and not isinstance(self.task_id, UUID):
             raise TypeError("task_id must be a UUID or None")
+        if self.agent_session_id is not None and not isinstance(self.agent_session_id, UUID):
+            raise TypeError("agent_session_id must be a UUID or None")
+        if (self.task_id is None) != (self.agent_session_id is None):
+            raise ValueError(
+                "agentic invocation attribution requires task_id and agent_session_id together"
+            )
         if self.actor_kind is not None and not isinstance(self.actor_kind, ToolInvocationActorKind):
             raise TypeError("actor_kind must use ToolInvocationActorKind")
         if (self.actor_kind is None) != (self.actor_id is None):
