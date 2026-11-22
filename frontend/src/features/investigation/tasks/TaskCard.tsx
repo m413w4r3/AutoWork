@@ -189,11 +189,23 @@ export function TaskCard({
     const expected_status_version = task.status_version;
     const options = {
       onSuccess: (result: TransferResult) => {
-        const target =
-          destination === "human" ? "vous" : ADAPTER_LABELS[destination];
-        finish(
-          `Tâche transférée à ${target} ; passation v${result.handoff.version} créée.`,
-        );
+        const version = result.handoff.version;
+        if (destination === "human") {
+          finish(`Tâche transférée à vous ; passation v${version} créée.`);
+          return;
+        }
+        const target = ADAPTER_LABELS[destination];
+        // `open_session: false` : l’attribution ne démarre aucun agent. Le
+        // contrat n’expose aucune lecture du probe de capacités, donc
+        // l’exécutable requis par `open_session: true` ne peut pas être
+        // inventé côté navigateur.
+        if (result.session === null || result.session === undefined) {
+          finish(
+            `Passation v${version} créée pour ${target} — aucune session ouverte. Le contrat n’expose pas l’exécutable sondé requis pour ouvrir la session depuis ce cockpit.`,
+          );
+        } else {
+          finish(`Session ${target} ouverte ; passation v${version} créée.`);
+        }
       },
       onError: handleMutationError,
     };
@@ -368,6 +380,13 @@ export function TaskCard({
           <dd>{assignmentLabel(task)}</dd>
         </div>
         <div>
+          <dt>Clé / identifiant</dt>
+          <dd>
+            <code>{task.task_key}</code> ·{" "}
+            <code title={task.id}>{task.id.slice(0, 8)}…</code>
+          </dd>
+        </div>
+        <div>
           <dt>Vérification du résultat</dt>
           <dd>{VERIFICATION_LABELS[task.result_verification_status]}</dd>
         </div>
@@ -464,6 +483,11 @@ export function TaskCard({
           </button>
         ))}
       </div>
+      <p className="m24-muted">
+        Les attributions et transferts créent une passation versionnée ; aucune
+        session Codex / Claude Code n’est ouverte par cette action tant que le
+        contrat n’expose pas l’exécutable sondé requis.
+      </p>
 
       {message === null ? null : (
         <p role="status" className="m24-message">
@@ -597,7 +621,14 @@ export function TaskCard({
           className="m24-task-card__results"
           aria-label="Résultats de la tâche"
         >
-          <h5>Résultats soumis</h5>
+          <h5>
+            Résultats soumis <span className="m24-badge">Non preuve</span>
+          </h5>
+          <p className="m24-muted">
+            Références déclarées par l’exécutant : elles ne constituent pas une
+            observation canonique. Seules les contributions importées puis
+            vérifiées font foi.
+          </p>
           {task.result_refs.length === 0 ? (
             <p>Aucun résultat soumis.</p>
           ) : (

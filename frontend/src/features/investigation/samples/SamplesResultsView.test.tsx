@@ -3,6 +3,7 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import type { InvestigationView } from "../../../api/investigation";
 import type {
   BootstrapPlanV1,
   BootstrapSnapshotV1,
@@ -10,6 +11,7 @@ import type {
   WorkContributionView,
 } from "../api";
 import {
+  bodyOf,
   createTestQueryClient,
   errorResponse,
   headersOf,
@@ -268,6 +270,82 @@ const contributions = [
   },
 ] satisfies WorkContributionView[];
 
+const investigation = {
+  id: "inv-1",
+  subject_id: "subject-1",
+  production_run_id: "run-1",
+  synthesis_artifact_id: "artifact-1",
+  synthesis_sha256: SHA_A,
+  status: "running",
+  prose_authority: "bridge_only",
+  version: 1,
+  stop_reason: null,
+  agenda: [],
+  hypotheses: [],
+  findings: [],
+  observations: [
+    {
+      id: "observation-1",
+      kind: "binary_analysis",
+      sha256: SHA_C,
+      source: "analysis-worker",
+      source_version: "1",
+      observed_at: "2026-11-20T11:30:00Z",
+      object_type: "binary",
+      object_id: "sample-1",
+      limitations: [],
+      invocation_ref: null,
+    },
+  ],
+  sample_associations: [],
+  opinion_draft: null,
+  budget: {
+    bridge_turns: { limit: 8, consumed: 0, reserved: 0, remaining: 8 },
+    vt_units: { limit: 10, consumed: 0, reserved: 0, remaining: 10 },
+    shodan_credits: { limit: 5, consumed: 0, reserved: 0, remaining: 5 },
+    downloads: { limit: 2, consumed: 0, reserved: 0, remaining: 2 },
+    tool_seconds: { limit: 120, consumed: 0, reserved: 0, remaining: 120 },
+    context_tokens: {
+      limit: 20_000,
+      consumed: 0,
+      reserved: 0,
+      remaining: 20_000,
+    },
+    context_bytes: {
+      limit: 100_000,
+      consumed: 0,
+      reserved: 0,
+      remaining: 100_000,
+    },
+  },
+  blocked_decisions: [],
+  available_tools: [],
+  unavailable_tools: [],
+  unavailable_tool_reasons: {},
+  envelope_approved: false,
+  allowed_providers: [],
+  acquire_hits_allowed: false,
+} satisfies InvestigationView;
+
+const sampleDetail = {
+  id: "assoc-1",
+  sample_sha256: SHA_B,
+  origin: "vt_pivot",
+  qualification: "candidate",
+  related_sample_sha256: [],
+  version: 1,
+  changes: [],
+} as const;
+
+const qualificationResponse = {
+  association: {
+    ...sampleDetail,
+    qualification: "confirmed",
+    version: 2,
+  },
+  idempotent_replay: false,
+} as const;
+
 function baseHandler(plan: BootstrapPlanV1) {
   return (request: RecordedRequest): Response => {
     const { url } = request;
@@ -276,6 +354,11 @@ function baseHandler(plan: BootstrapPlanV1) {
     if (url.endsWith("/bootstrap/snapshot")) return jsonResponse(snapshot);
     if (url.endsWith("/bootstrap/run")) return jsonResponse(snapshot);
     if (url.endsWith("/contributions")) return jsonResponse(contributions);
+    if (url === "/api/investigations/inv-1") return jsonResponse(investigation);
+    if (url.endsWith("/samples")) return jsonResponse([sampleDetail]);
+    if (url.endsWith("/samples/assoc-1/qualify")) {
+      return jsonResponse(qualificationResponse);
+    }
     return errorResponse(404, "not_found");
   };
 }
@@ -381,6 +464,61 @@ describe("SamplesResultsView", () => {
     );
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent("bootstrap_state_unavailable");
+  });
+
+  it("qualifie un échantillon en G3 avec CAS, motif et observation de l’enquête", async () => {
+    const recorder = renderView(baseHandler(readyPlan));
+    const user = userEvent.setup();
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "Qualification G3 des échantillons",
+      }),
+    ).toBeInTheDocument();
+    await screen.findByLabelText(/Décision G3 pour/);
+    await user.selectOptions(
+      screen.getByLabelText(/Décision G3 pour/),
+      "confirmed",
+    );
+    await user.type(
+      screen.getByLabelText(/Motif de la décision/),
+      "Le binaire est confirmé par l’observation de l’enquête.",
+    );
+    await user.selectOptions(
+      screen.getByLabelText(/Observations de la même enquête/),
+      ["observation-1"],
+    );
+    await user.click(screen.getByLabelText(/Je confirme cette décision G3/));
+    const submit = screen.getByRole("button", {
+      name: "Enregistrer la décision G3",
+    });
+    expect(submit).toBeEnabled();
+    await user.click(submit);
+
+    const call = recorder.calls.find((item) =>
+      item.url.endsWith("/samples/assoc-1/qualify"),
+    );
+    expect(call).toBeDefined();
+    expect(call?.init?.method).toBe("POST");
+    const payload = bodyOf(call?.init);
+    expect(payload).toMatchObject({
+      expected_version: 1,
+      qualification: "confirmed",
+      reason: "Le binaire est confirmé par l’observation de l’enquête.",
+      evidence_refs: ["observation-1"],
+    });
+    if (typeof payload !== "object" || payload === null) {
+      throw new Error("qualification request body expected");
+    }
+    expect((payload as Record<string, unknown>).correlation_id).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+    expect(headersOf(call?.init)["Idempotency-Key"]).toMatch(
+      /^[A-Za-z0-9._:-]{8,128}$/,
+    );
+    expect(
+      await screen.findByText(/Décision G3 enregistrée/),
+    ).toBeInTheDocument();
   });
 
   it("traite l’absence de snapshot comme un état vide, pas comme une erreur", async () => {

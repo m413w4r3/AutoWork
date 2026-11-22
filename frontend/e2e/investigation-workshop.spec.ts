@@ -299,6 +299,38 @@ test("plan et tâches : acceptation, action absente et CAS périmé", async ({
   await capture(page, "02-plan-et-taches");
 });
 
+test("ouvre une enquête existante sans relancer un start legacy", async ({
+  page,
+}) => {
+  const api = createWorkshopApi({ existingInvestigation: true });
+  await api.install(page);
+  await page.goto(`/subjects/${api.ids.subject}`);
+  await page
+    .getByRole("button", { name: "Enquête / Avis de l’analyste" })
+    .click();
+
+  const open = page.getByRole("button", {
+    name: "Ouvrir l’enquête sur cette version",
+  });
+  await expect(open).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Lancer l’atelier d’investigation" }),
+  ).toBeDisabled();
+  await open.click();
+
+  await expect(
+    page.getByRole("tablist", { name: "Vues du cockpit d’enquête" }),
+  ).toBeVisible();
+  expect(
+    api.requests.filter(
+      (request) =>
+        request.method === "POST" &&
+        request.path === `/api/subjects/${api.ids.subject}/investigations`,
+    ),
+  ).toEqual([]);
+  expect(api.unhandled).toEqual([]);
+});
+
 test("échantillons et résultats : inventaire, statuts et candidats jusqu’à G3", async ({
   page,
 }) => {
@@ -346,6 +378,114 @@ test("échantillons et résultats : inventaire, statuts et candidats jusqu’à 
   await capture(page, "03-echantillons-et-resultats");
 });
 
+test("échantillons : qualification G3 motivée avec observation de l’enquête", async ({
+  page,
+}) => {
+  const api = createWorkshopApi();
+  await launchWorkshop(page, api);
+  await openView(page, "Échantillons et résultats");
+
+  await expect(
+    page.getByRole("heading", { name: "Qualification G3 des échantillons" }),
+  ).toBeVisible();
+  await page.getByLabel(/Décision G3 pour/).selectOption("confirmed");
+  await page
+    .getByLabel(/Motif de la décision/)
+    .fill("Le binaire est confirmé par l’observation de l’enquête.");
+  await page
+    .getByLabel(/Observations de la même enquête/)
+    .selectOption(api.ids.observation);
+  await page.getByLabel(/Je confirme cette décision G3/).check();
+  const submit = page.getByRole("button", {
+    name: "Enregistrer la décision G3",
+  });
+  await expect(submit).toBeEnabled();
+  await submit.click();
+
+  await expect(page.getByText(/Décision G3 enregistrée/)).toBeVisible();
+  const qualify = api.requests.find(
+    (request) =>
+      request.method === "POST" &&
+      request.path ===
+        `/api/investigations/${api.ids.investigation}/samples/${api.ids.association}/qualify`,
+  );
+  expect(qualify?.body).toMatchObject({
+    expected_version: 1,
+    qualification: "confirmed",
+    reason: "Le binaire est confirmé par l’observation de l’enquête.",
+    evidence_refs: [api.ids.observation],
+    correlation_id: expect.stringMatching(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    ),
+  });
+  expect(qualify?.idempotencyKey).toBeTruthy();
+  expect(api.unhandled).toEqual([]);
+});
+
+test("attribution : passation honnête, aucune session ouverte", async ({
+  page,
+}) => {
+  const api = createWorkshopApi({ transferOutcome: "success" });
+  await launchWorkshop(page, api);
+  await openView(page, "Plan et tâches");
+  await page.getByLabel(/Je confirme l’acceptation de cette version/).check();
+  await page
+    .getByRole("button", { name: "Accepter le plan et créer les tâches" })
+    .click();
+
+  const readyCard = page
+    .getByRole("article")
+    .filter({ hasText: "Vérifier le domaine C2" });
+  await expect(readyCard).toBeVisible();
+  await expect(
+    readyCard.getByText(
+      /Les attributions et transferts créent une passation versionnée/,
+    ),
+  ).toBeVisible();
+  await readyCard.getByRole("button", { name: "Attribuer à Codex" }).click();
+
+  await expect(
+    page.getByText(
+      /Passation v1 créée pour Codex CLI — aucune session ouverte/,
+    ),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Ouvrir la session" }),
+  ).toHaveCount(0);
+  expect(
+    api.requests.filter(
+      (request) =>
+        request.method === "POST" &&
+        request.path ===
+          `/api/investigations/${api.ids.investigation}/agent-sessions`,
+    ),
+  ).toEqual([]);
+
+  const transfer = api.requests.find(
+    (request) =>
+      request.method === "POST" &&
+      request.path.endsWith(`/tasks/${api.ids.taskReady}/transfer`),
+  );
+  expect(transfer?.body).toMatchObject({
+    to_actor_kind: "operator",
+    to_adapter_kind: "codex_cli",
+    open_session: false,
+    expected_status_version: 1,
+  });
+  expect(transfer?.idempotencyKey).toBeTruthy();
+
+  await openView(page, "Workspace et notes");
+  await page
+    .getByRole("button", { name: /notes\/humaines\/hypothese\.md/ })
+    .click();
+  await expect(
+    page.getByLabel("Lier à une tâche").locator("option", {
+      hasText: "lead-a · Vérifier le domaine C2",
+    }),
+  ).toHaveCount(1);
+  expect(api.unhandled).toEqual([]);
+});
+
 test("workspace et notes : arborescence, note non vérifiée et résolution de conflit", async ({
   page,
 }) => {
@@ -366,6 +506,39 @@ test("workspace et notes : arborescence, note non vérifiée et résolution de c
   await expect(
     page.getByText(/Un fichier local n’est pas une preuve canonique/),
   ).toBeVisible();
+
+  // M6 : aucune session active dans ce scénario, l’instruction agent est
+  // proposée avec une raison explicite et reste désactivée.
+  await expect(
+    page.getByText(
+      /Action indisponible : aucune session active pour cette tâche/,
+    ),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Demander à l’agent de continuer" }),
+  ).toBeDisabled();
+
+  // M1 : la relecture Bridge utilise la version d’état de travail lue.
+  await page
+    .getByLabel("Question à Bridge sur cette note")
+    .fill("La note est-elle cohérente avec l’observation ?");
+  await page
+    .getByRole("button", { name: "Demander à Bridge de relire" })
+    .click();
+  await expect(page.getByText(/Relecture Bridge demandée/)).toBeVisible();
+  const bridge = api.requests.find(
+    (request) =>
+      request.method === "POST" &&
+      request.path ===
+        `/api/investigations/${api.ids.investigation}/workspace/notes/revision-2/ask-bridge`,
+  );
+  expect(bridge?.body).toMatchObject({
+    consultation_type: "interpretation",
+    question: "La note est-elle cohérente avec l’observation ?",
+    expected_working_state_version: 5,
+  });
+  expect(bridge?.idempotencyKey).toBeTruthy();
+  await expect(page.getByText(/avis consultatif — non preuve/)).toBeVisible();
 
   await expect(
     page.getByRole("heading", { name: "Conflits", exact: true }),

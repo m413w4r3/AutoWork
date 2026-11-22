@@ -1,16 +1,26 @@
 import { useId, useState, type FormEvent } from "react";
 
+import { useInvestigationSamples } from "../../../api/investigationGovernance";
 import {
+  useAgentSessions,
   useAnnotateWorkspaceNote,
   useAskAgentToContinueFromNote,
+  useAskBridgeToReviewNote,
   useProposeNoteObservationConversion,
+  useTasks,
+  type AskBridgeRequestV1,
   type NoteAskAgentRequestV1,
   type NoteContributionMethod,
   type NoteContributionObjectType,
   type NoteIocType,
   type NoteObservationProposalRequestV1,
   type NoteViewResponseV1,
+  type TaskView,
 } from "../api";
+import { useInvestigationWorkingState } from "../opinion/queries";
+import { SAMPLE_QUALIFICATION_LABELS } from "../samples/samplesLabels";
+import { TASK_STATUS_LABELS } from "../tasks/labels";
+import { ACTIVE_SESSION_STATES, sessionForTask } from "../tasks/taskActions";
 import {
   ANNOTATION_KIND_LABELS,
   CONTRIBUTION_CATEGORY_LABELS,
@@ -62,10 +72,26 @@ export function NoteDetailPanel({
     revisionId,
     notePath,
   );
+  const askBridge = useAskBridgeToReviewNote(
+    investigationId,
+    revisionId,
+    notePath,
+  );
   const proposal = useProposeNoteObservationConversion(
     investigationId,
     revisionId,
   );
+  // The M4 selectors read the existing lists instead of asking the analyst to
+  // paste opaque UUIDs. The working state is the CAS source for the Bridge
+  // review (M1); the session list proves whether an agent can be asked (M6).
+  const tasksQuery = useTasks(investigationId);
+  const samplesQuery = useInvestigationSamples(investigationId);
+  const sessionsQuery = useAgentSessions(investigationId);
+  const activityQuery = useInvestigationWorkingState(investigationId);
+  const tasks = tasksQuery.data?.items ?? [];
+  const samples = samplesQuery.data ?? [];
+  const workingStateVersion =
+    activityQuery.data?.working_state?.version ?? null;
 
   const [taskId, setTaskId] = useState("");
   const [iocType, setIocType] = useState<NoteIocType>("domain");
@@ -77,12 +103,37 @@ export function NoteDetailPanel({
   const selectedAgentTask = note.linked_task_ids.includes(agentTaskId)
     ? agentTaskId
     : defaultAgentTask;
+  const [bridgeConsultationType, setBridgeConsultationType] = useState<
+    "interpretation" | "critique"
+  >("interpretation");
+  const [bridgeQuestion, setBridgeQuestion] = useState("");
   const [proposalObjectType, setProposalObjectType] =
     useState<NoteContributionObjectType>("domain");
   const [proposalMethod, setProposalMethod] =
     useState<NoteContributionMethod>("dns_query");
   const [proposalTool, setProposalTool] = useState("");
   const [proposalObjectId, setProposalObjectId] = useState("");
+
+  const agentSession = sessionForTask(
+    sessionsQuery.data ?? [],
+    selectedAgentTask,
+  );
+  const agentSessionActive =
+    agentSession !== null && ACTIVE_SESSION_STATES.has(agentSession.state);
+
+  function taskLabel(id: string): string {
+    const task: TaskView | undefined = tasks.find((item) => item.id === id);
+    return task === undefined
+      ? `${id.slice(0, 8)}…`
+      : `${task.task_key} · ${task.title} · ${TASK_STATUS_LABELS[task.status]}`;
+  }
+
+  function sampleLabel(id: string): string {
+    const sample = samples.find((item) => item.id === id);
+    return sample === undefined
+      ? `${id.slice(0, 8)}…`
+      : `${sample.sample_sha256.slice(0, 12)}… · ${SAMPLE_QUALIFICATION_LABELS[sample.qualification]}`;
+  }
 
   function submitTask(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -113,11 +164,27 @@ export function NoteDetailPanel({
     event.preventDefault();
     const question = agentQuestion.trim();
     if (question === "" || selectedAgentTask === "") return;
+    if (!agentSessionActive || agentSession === null) return;
     const input: NoteAskAgentRequestV1 = {
       task_id: selectedAgentTask,
+      session_id: agentSession.id,
       question,
     };
     askAgent.mutate(input);
+  }
+
+  function submitBridge(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const question = bridgeQuestion.trim();
+    if (question === "" || workingStateVersion === null) return;
+    const input: AskBridgeRequestV1 = {
+      consultation_type: bridgeConsultationType,
+      question,
+      expected_working_state_version: workingStateVersion,
+    };
+    askBridge.mutate(input, {
+      onSuccess: () => setBridgeQuestion(""),
+    });
   }
 
   function submitProposal(event: FormEvent<HTMLFormElement>) {
@@ -234,7 +301,7 @@ export function NoteDetailPanel({
           Tâches :{" "}
           {note.linked_task_ids.length === 0
             ? "aucune"
-            : note.linked_task_ids.join(", ")}
+            : note.linked_task_ids.map(taskLabel).join(", ")}
         </li>
         <li>
           IOC :{" "}
@@ -248,7 +315,7 @@ export function NoteDetailPanel({
           Échantillons :{" "}
           {note.linked_sample_ids.length === 0
             ? "aucun"
-            : note.linked_sample_ids.join(", ")}
+            : note.linked_sample_ids.map(sampleLabel).join(", ")}
         </li>
         <li>
           Auteurs attribués :{" "}
@@ -276,12 +343,34 @@ export function NoteDetailPanel({
       <div className="workspace-notes__forms">
         <form className="workspace-notes__form" onSubmit={submitTask}>
           <label htmlFor={`${baseId}-task`}>Lier à une tâche</label>
-          <input
+          <select
             id={`${baseId}-task`}
             value={taskId}
             onChange={(event) => setTaskId(event.target.value)}
-            placeholder="identifiant de tâche"
-          />
+            disabled={tasksQuery.isPending || tasks.length === 0}
+          >
+            <option value="">
+              {tasksQuery.isPending
+                ? "Chargement des tâches…"
+                : tasks.length === 0
+                  ? "Aucune tâche dans cette enquête"
+                  : "Sélectionner une tâche"}
+            </option>
+            {tasks.map((task) => (
+              <option key={task.id} value={task.id}>
+                {task.task_key} · {task.title} ·{" "}
+                {TASK_STATUS_LABELS[task.status]} · {task.id.slice(0, 8)}
+              </option>
+            ))}
+          </select>
+          {tasksQuery.error !== null ? (
+            <p className="workspace-notes__meta">
+              {workshopErrorText(
+                tasksQuery.error,
+                "La liste des tâches est indisponible.",
+              )}
+            </p>
+          ) : null}
           <button
             className="button button--secondary"
             type="submit"
@@ -322,12 +411,35 @@ export function NoteDetailPanel({
         </form>
         <form className="workspace-notes__form" onSubmit={submitSample}>
           <label htmlFor={`${baseId}-sample`}>Lier un échantillon</label>
-          <input
+          <select
             id={`${baseId}-sample`}
             value={sampleId}
             onChange={(event) => setSampleId(event.target.value)}
-            placeholder="identifiant d’échantillon"
-          />
+            disabled={samplesQuery.isPending || samples.length === 0}
+          >
+            <option value="">
+              {samplesQuery.isPending
+                ? "Chargement des échantillons…"
+                : samples.length === 0
+                  ? "Aucun échantillon associé"
+                  : "Sélectionner un échantillon"}
+            </option>
+            {samples.map((sample) => (
+              <option key={sample.id} value={sample.id}>
+                {sample.sample_sha256.slice(0, 12)}… ·{" "}
+                {SAMPLE_QUALIFICATION_LABELS[sample.qualification]} ·{" "}
+                {sample.id.slice(0, 8)}
+              </option>
+            ))}
+          </select>
+          {samplesQuery.error !== null ? (
+            <p className="workspace-notes__meta">
+              {workshopErrorText(
+                samplesQuery.error,
+                "La liste des échantillons est indisponible.",
+              )}
+            </p>
+          ) : null}
           <button
             className="button button--secondary"
             type="submit"
@@ -360,13 +472,13 @@ export function NoteDetailPanel({
               </time>
               {entry.target_task_id === null
                 ? ""
-                : ` · tâche ${entry.target_task_id}`}
+                : ` · tâche ${taskLabel(entry.target_task_id)}`}
               {entry.ioc_value === null
                 ? ""
                 : ` · IOC ${entry.ioc_type ?? ""} ${entry.ioc_value}`}
               {entry.target_sample_id === null
                 ? ""
-                : ` · échantillon ${entry.target_sample_id}`}
+                : ` · échantillon ${sampleLabel(entry.target_sample_id)}`}
               {entry.detail === null ? "" : ` · ${entry.detail}`}
             </li>
           ))}
@@ -389,7 +501,7 @@ export function NoteDetailPanel({
           >
             {note.linked_task_ids.map((id) => (
               <option key={id} value={id}>
-                {id}
+                {taskLabel(id)}
               </option>
             ))}
           </select>
@@ -398,11 +510,33 @@ export function NoteDetailPanel({
             id={`${baseId}-agent-question`}
             value={agentQuestion}
             onChange={(event) => setAgentQuestion(event.target.value)}
+            disabled={!agentSessionActive}
           />
+          {sessionsQuery.isPending ? (
+            <p role="status" className="workspace-notes__meta">
+              Vérification de la session active…
+            </p>
+          ) : !agentSessionActive ? (
+            <p className="workspace-notes__hint" role="note">
+              Action indisponible : aucune session active pour cette tâche. Une
+              instruction exige une session agent active ; l’attribution crée
+              une passation, pas une session.
+            </p>
+          ) : (
+            <p className="workspace-notes__meta">
+              Session active <code>{agentSession.id.slice(0, 8)}…</code> (
+              {agentSession.state}) — l’instruction sera mise en file
+              persistante.
+            </p>
+          )}
           <button
             className="button"
             type="submit"
-            disabled={askAgent.isPending || agentQuestion.trim() === ""}
+            disabled={
+              !agentSessionActive ||
+              askAgent.isPending ||
+              agentQuestion.trim() === ""
+            }
           >
             {askAgent.isPending
               ? "Instruction en cours d’envoi…"
@@ -428,14 +562,88 @@ export function NoteDetailPanel({
       )}
 
       <h4>Demander à Bridge de relire</h4>
-      <div className="workspace-notes__unavailable">
-        <p>
-          Action indisponible : le client API figé n’expose pas la version
-          d’état de travail requise (<code>expected_working_state_version</code>
-          ). Aucune demande Bridge n’est envoyée et aucune provenance n’est
-          inventée.
+      <p className="workspace-notes__meta">
+        Relecture consultative Bridge (avis, non preuve) soumise à G2/TLP et à
+        la version CAS de l’état de travail. Aucune provenance n’est inventée ni
+        promue en observation canonique.
+      </p>
+      {activityQuery.isPending ? (
+        <p role="status">Chargement de la version de l’état de travail…</p>
+      ) : activityQuery.error !== null ? (
+        <p className="workspace-notes__blocked" role="status">
+          {workshopErrorText(
+            activityQuery.error,
+            "La version de l’état de travail est indisponible.",
+          )}{" "}
+          La demande Bridge reste désactivée.
         </p>
-      </div>
+      ) : workingStateVersion === null ? (
+        <p className="workspace-notes__blocked" role="status">
+          L’enquête n’expose pas encore de version d’état de travail (
+          <code>expected_working_state_version</code>) : la demande Bridge reste
+          désactivée.
+        </p>
+      ) : (
+        <form className="workspace-notes__form" onSubmit={submitBridge}>
+          <label htmlFor={`${baseId}-bridge-type`}>
+            Type de consultation Bridge
+          </label>
+          <select
+            id={`${baseId}-bridge-type`}
+            value={bridgeConsultationType}
+            onChange={(event) => {
+              const value = event.currentTarget.value;
+              if (value === "interpretation" || value === "critique") {
+                setBridgeConsultationType(value);
+              }
+            }}
+          >
+            <option value="interpretation">Interprétation</option>
+            <option value="critique">Critique</option>
+          </select>
+          <label htmlFor={`${baseId}-bridge-question`}>
+            Question à Bridge sur cette note
+          </label>
+          <textarea
+            id={`${baseId}-bridge-question`}
+            value={bridgeQuestion}
+            onChange={(event) => setBridgeQuestion(event.target.value)}
+          />
+          <p className="workspace-notes__meta">
+            Version CAS envoyée : <code>{workingStateVersion}</code> · la
+            réponse reste consultative et non probante.
+          </p>
+          <button
+            className="button"
+            type="submit"
+            disabled={askBridge.isPending || bridgeQuestion.trim() === ""}
+          >
+            {askBridge.isPending
+              ? "Demande Bridge en cours…"
+              : "Demander à Bridge de relire"}
+          </button>
+        </form>
+      )}
+      {askBridge.error !== null ? (
+        <p className="error-message" role="alert">
+          {workshopErrorText(
+            askBridge.error,
+            "La relecture Bridge a été refusée.",
+          )}
+        </p>
+      ) : null}
+      {askBridge.data === undefined ? null : (
+        <p role="status">
+          Relecture Bridge demandée · invocation{" "}
+          <code>{askBridge.data.invocation_id}</code> · statut{" "}
+          {labelOf(INVOCATION_STATUS_LABELS, askBridge.data.invocation_status)}
+          {askBridge.data.pending ? " · réponse en attente" : ""} ·{" "}
+          {askBridge.data.advisory_only
+            ? "avis consultatif — non preuve"
+            : "nature consultative à vérifier"}
+          .
+        </p>
+      )}
 
       <h4>Proposer la conversion en observations vérifiables</h4>
       <form className="workspace-notes__form" onSubmit={submitProposal}>

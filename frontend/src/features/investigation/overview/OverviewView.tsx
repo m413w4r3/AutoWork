@@ -20,6 +20,7 @@ import {
   WorkshopSyncingState,
   WorkshopTypedErrorState,
 } from "../shell/WorkshopStates";
+import { formatTimestamp } from "../tasks/labels";
 import { BootstrapSection } from "./BootstrapSection";
 import { EnvelopeSection } from "./EnvelopeSection";
 import {
@@ -231,7 +232,7 @@ function WorkspaceStatusPanel({
         <dd>
           {workspace.lastly_observed_at ? (
             <time dateTime={workspace.lastly_observed_at}>
-              {workspace.lastly_observed_at}
+              {formatTimestamp(workspace.lastly_observed_at)}
             </time>
           ) : (
             "Aucune"

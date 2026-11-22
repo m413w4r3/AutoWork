@@ -27,12 +27,23 @@ import {
   type PlanParseStatus,
 } from "../api/plans";
 import { useTasks } from "../api/tasks";
+import { CONSULTATION_LABELS } from "../opinion/labels";
+import { WorkshopLongOperationState } from "../shell/WorkshopStates";
+import { INVOCATION_STATUS_LABELS, labelOf } from "../samples/samplesLabels";
 import {
+  TASK_STATUS_LABELS,
   formatTimestamp,
   listOrPlaceholder,
   orPlaceholder,
   shortSha,
 } from "../tasks/labels";
+
+const RECONCILIATION_STATE_LABELS: Record<string, string> = {
+  not_required: "Non requise",
+  required: "Requise",
+  recorded: "Enregistrée",
+  terminal: "Terminale",
+};
 
 type LeadFieldKey = Exclude<keyof InvestigationLeadV1, "lead_id">;
 
@@ -282,10 +293,10 @@ export function PlanPanel({ investigationId }: { investigationId: string }) {
           </button>
         </div>
         {requestMutation.isPending ? (
-          <p role="status" className="m24-muted">
-            Opération longue : Bridge peut mettre plusieurs minutes à répondre ;
-            la demande reste soumise à G2 et à la divulgation externe.
-          </p>
+          <WorkshopLongOperationState
+            label="Demande de plan à Bridge en cours"
+            detail="Opération longue : Bridge peut mettre plusieurs minutes à répondre ; la demande reste soumise à G2 et à la divulgation externe."
+          />
         ) : null}
       </div>
 
@@ -499,7 +510,7 @@ export function PlanPanel({ investigationId }: { investigationId: string }) {
               <ul>
                 {acceptResult.tasks.map((task) => (
                   <li key={task.task_id}>
-                    {task.title} — {task.status}
+                    {task.title} — {labelOf(TASK_STATUS_LABELS, task.status)}
                     {task.created ? " (créée)" : " (déjà présente)"}
                   </li>
                 ))}
@@ -528,8 +539,13 @@ export function PlanPanel({ investigationId }: { investigationId: string }) {
             {consultations.data.consultations.map((consultation) => (
               <li key={consultation.invocation_id}>
                 <p>
-                  <strong>{consultation.consultation_type}</strong> ·{" "}
-                  {consultation.invocation_status} ·{" "}
+                  <strong>
+                    {labelOf(
+                      CONSULTATION_LABELS,
+                      consultation.consultation_type,
+                    )}
+                  </strong>{" "}
+                  · {INVOCATION_STATUS_LABELS[consultation.invocation_status]} ·{" "}
                   {parseStatusLabel(consultation.parse_status)} ·{" "}
                   {formatTimestamp(consultation.created_at)}
                 </p>
@@ -539,7 +555,11 @@ export function PlanPanel({ investigationId }: { investigationId: string }) {
                     : "Consultation non étiquetée consultative (à vérifier)"}
                   {consultation.usable ? " · texte exploitable" : ""}
                   {consultation.readable ? " · texte lisible" : ""} ·
-                  réconciliation : {consultation.reconciliation_state}
+                  réconciliation :{" "}
+                  {labelOf(
+                    RECONCILIATION_STATE_LABELS,
+                    consultation.reconciliation_state,
+                  )}
                 </p>
               </li>
             ))}

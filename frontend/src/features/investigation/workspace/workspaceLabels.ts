@@ -6,7 +6,6 @@
  * path is handled by this module (the browser only reads the API).
  */
 
-import { isWorkshopApiError } from "../api";
 import type {
   ConflictChoice,
   ExportAction,
@@ -26,9 +25,10 @@ import type {
   WorkspacePolicyClass,
 } from "../api";
 
+/** Agent availability as such: the workspace state has its own labels. */
 export const AGENT_STATUS_LABELS: Record<WorkspaceAgentStatus, string> = {
   available: "Agent workspace disponible",
-  unavailable: "Workspace local indisponible",
+  unavailable: "Agent workspace indisponible",
   unconfigured: "Agent workspace non configuré",
 };
 
@@ -211,13 +211,8 @@ export function formatBytes(size: number): string {
   return `${(size / (1024 * 1024)).toFixed(1)} Mio`;
 }
 
-export function workshopErrorText(error: unknown, fallback: string): string {
-  if (isWorkshopApiError(error)) return `${fallback} (${error.code})`;
-  if (error instanceof Error && error.message !== "") {
-    return `${fallback} ${error.message}`;
-  }
-  return fallback;
-}
+/** Single implementation shared with the samples lot. */
+export { workshopErrorText } from "../shell/stateText";
 
 /** The only path family the UI writes: a human Markdown note. */
 export function isHumanNotePath(path: string): boolean {

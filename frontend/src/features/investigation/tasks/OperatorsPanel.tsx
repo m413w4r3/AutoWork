@@ -19,6 +19,7 @@ import {
 } from "../api/agentSessions";
 import { toWorkshopApiError } from "../api/client";
 import { useTaskEvents, useTasks, type TaskView } from "../api/tasks";
+import type { TaskStatus } from "../api/types";
 import { describeTaskError } from "./errors";
 import {
   ADAPTER_LABELS,
@@ -33,6 +34,12 @@ import {
   VERIFICATION_LABELS,
 } from "./labels";
 import { ACTIVE_SESSION_STATES, RESUMABLE_SESSION_STATES } from "./taskActions";
+
+const TERMINAL_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>([
+  "completed",
+  "cancelled",
+  "failed",
+]);
 
 function SessionRow({
   investigationId,
@@ -64,6 +71,8 @@ function SessionRow({
   const interruptible =
     session.state === "running" || session.state === "awaiting_instruction";
   const resumable = RESUMABLE_SESSION_STATES.has(session.state);
+  const taskTerminal =
+    task !== undefined && TERMINAL_TASK_STATUSES.has(task.status);
   const durationEnd =
     session.closed_at ?? (active ? null : session.last_activity_at);
   const blocker =
@@ -273,7 +282,7 @@ function SessionRow({
         </div>
       ) : null}
 
-      {resumable ? (
+      {resumable && !taskTerminal ? (
         <div className="m24-inline-form__buttons">
           <button
             type="button"
@@ -284,6 +293,12 @@ function SessionRow({
             Reprendre la session
           </button>
         </div>
+      ) : null}
+      {resumable && taskTerminal ? (
+        <p className="m24-muted" role="note">
+          Reprise masquée : la tâche est terminée. Une nouvelle session exige
+          une nouvelle passation.
+        </p>
       ) : null}
 
       <div className="m24-inline-form__buttons">

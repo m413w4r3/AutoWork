@@ -6,7 +6,6 @@
  * instead of leaking a raw enum to the analyst.
  */
 
-import { isWorkshopApiError } from "../api";
 import type {
   BootstrapCoverageKind,
   BootstrapIocKind,
@@ -173,13 +172,8 @@ export function formatTimestamp(value: string): string {
   return value.replace("T", " ").replace(/\.\d+/, "").replace(/Z$/, " UTC");
 }
 
-export function workshopErrorText(error: unknown, fallback: string): string {
-  if (isWorkshopApiError(error)) return `${fallback} (${error.code})`;
-  if (error instanceof Error && error.message !== "") {
-    return `${fallback} ${error.message}`;
-  }
-  return fallback;
-}
+/** Single implementation shared with the workspace lot. */
+export { workshopErrorText } from "../shell/stateText";
 
 /** Human reading of one VT operation, including partial and negative results. */
 export function operationOutcomeLabel(status: ToolInvocationStatus): string {

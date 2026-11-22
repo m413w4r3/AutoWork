@@ -17,6 +17,7 @@ import type {
   InvestigationView,
 } from "../../src/api/investigation";
 import type { InvestigationActivityPage } from "../../src/api/investigationOperator";
+import type { InvestigationSampleDetail } from "../../src/api/investigationGovernance";
 import type {
   BootstrapEnvelopeApprovalV1,
   BootstrapEnvelopeProposalV1,
@@ -24,6 +25,7 @@ import type {
   BootstrapSnapshotV1,
   IOCInventoryV1,
 } from "../../src/features/investigation/api/bootstrap";
+import type { SampleQualification } from "../../src/features/investigation/api/types";
 import type { WorkContributionView } from "../../src/features/investigation/api/contributions";
 import type {
   NoteAcceptanceViewV1,
@@ -50,7 +52,10 @@ import type {
   WorkspaceFileViewV1,
   WorkspaceStatusV1,
 } from "../../src/features/investigation/api/workspace";
-import type { NoteViewResponseV1 } from "../../src/features/investigation/api/workspaceNotes";
+import type {
+  NoteBridgeReviewResponseV1,
+  NoteViewResponseV1,
+} from "../../src/features/investigation/api/workspaceNotes";
 import type {
   AnalystNoteV1,
   OpinionReadPayloadV1,
@@ -120,6 +125,10 @@ export interface WorkshopApiOptions {
   workspaceState?: "bound" | "unbound";
   /** The note proposal is already superseded by a newer opinion version. */
   staleProposal?: boolean;
+  /** The exact synthesis already has an investigation before any POST. */
+  existingInvestigation?: boolean;
+  /** A human transfer either hits a stale CAS or creates a handoff. */
+  transferOutcome?: "stale" | "success";
 }
 
 const FINDING: InvestigationFinding = {
@@ -474,7 +483,9 @@ function conflictResolution(
   };
 }
 
-function inventory(): IOCInventoryV1 {
+function inventory(
+  qualification: SampleQualification = "candidate",
+): IOCInventoryV1 {
   return {
     schema_version: "vt-bootstrap-inventory.v1",
     generated_at: "2026-11-22T09:00:00Z",
@@ -508,8 +519,8 @@ function inventory(): IOCInventoryV1 {
             association_id: ids.association,
             sample_sha256: SHA.sample,
             origin: "seed",
-            qualification: "candidate",
-            version: 1,
+            qualification,
+            version: qualification === "candidate" ? 1 : 2,
           },
         ],
         quarantined: [
@@ -518,7 +529,7 @@ function inventory(): IOCInventoryV1 {
             sha256: SHA.sample,
             state: "quarantined",
             association_id: ids.association,
-            qualification: "candidate",
+            qualification,
           },
         ],
         limitations: ["Pas de rapport de comportement."],
@@ -548,6 +559,34 @@ function inventory(): IOCInventoryV1 {
     },
     limitations: [],
   };
+}
+
+function sampleDetails(
+  qualification: SampleQualification = "candidate",
+): InvestigationSampleDetail[] {
+  return [
+    {
+      id: ids.association,
+      sample_sha256: SHA.sample,
+      origin: "seed",
+      qualification,
+      related_sample_sha256: [SHA.synthesis],
+      version: qualification === "candidate" ? 1 : 2,
+      changes:
+        qualification === "candidate"
+          ? []
+          : [
+              {
+                from_qualification: "candidate",
+                to_qualification: qualification,
+                actor_kind: "human",
+                actor_id: "dev-analyst",
+                reason: "Décision G3 de test.",
+                changed_at: "2026-11-22T10:10:00Z",
+              },
+            ],
+    },
+  ];
 }
 
 function bootstrapPlan(): BootstrapPlanV1 {
@@ -1153,11 +1192,14 @@ function conflictChoice(
 export function createWorkshopApi(options: WorkshopApiOptions = {}) {
   const agentStatus = options.agentStatus ?? "available";
   const staleProposal = options.staleProposal === true;
+  const existingInvestigation = options.existingInvestigation === true;
+  const transferOutcome = options.transferOutcome ?? "stale";
   const requests: RecordedRequest[] = [];
   const unhandled: string[] = [];
-  let started = false;
+  let started = existingInvestigation;
   let workspaceBound = (options.workspaceState ?? "bound") === "bound";
   let envelopeApproved = false;
+  let sampleQualification: SampleQualification = "candidate";
   let tasks: TaskView[] = [];
   let conflictResolved = false;
 
@@ -1257,6 +1299,24 @@ export function createWorkshopApi(options: WorkshopApiOptions = {}) {
     if (path === inv("/activity") && method === "GET") {
       return fulfill(route, activity());
     }
+    if (path === inv("/samples") && method === "GET") {
+      return fulfill(route, sampleDetails(sampleQualification));
+    }
+    if (
+      path.startsWith(inv("/samples/")) &&
+      path.endsWith("/qualify") &&
+      method === "POST"
+    ) {
+      const payload = asRecord(body);
+      const qualification = payload.qualification;
+      if (typeof qualification === "string") {
+        sampleQualification = qualification as SampleQualification;
+      }
+      return fulfill(route, {
+        association: sampleDetails(sampleQualification)[0],
+        idempotent_replay: false,
+      });
+    }
 
     if (path === inv("/workspace") && method === "GET") {
       if (agentStatus !== "available") {
@@ -1330,9 +1390,28 @@ export function createWorkshopApi(options: WorkshopApiOptions = {}) {
       }
       return fulfill(route, noteView());
     }
+    if (
+      path.startsWith(inv("/workspace/notes/")) &&
+      path.endsWith("/ask-bridge") &&
+      method === "POST"
+    ) {
+      const review: NoteBridgeReviewResponseV1 = {
+        investigation_id: ids.investigation,
+        note_revision_id: "revision-2",
+        note_sha256: SHA.note,
+        consultation_type: "interpretation",
+        invocation_id: ids.bridgeInvocation,
+        invocation_status: "pending",
+        pending: true,
+        idempotent_replay: false,
+        advisory_only: true,
+        is_evidence: false,
+      };
+      return fulfill(route, review);
+    }
 
     if (path === inv("/bootstrap/inventory") && method === "GET") {
-      return fulfill(route, inventory());
+      return fulfill(route, inventory(sampleQualification));
     }
     if (path === inv("/bootstrap/plan") && method === "GET") {
       return fulfill(route, bootstrapPlan());
@@ -1386,14 +1465,90 @@ export function createWorkshopApi(options: WorkshopApiOptions = {}) {
       path.endsWith("/transfer") &&
       method === "POST"
     ) {
-      // The browser sends the exact task status_version; this scenario always
-      // exercises the typed stale-CAS refusal.
-      return fail(
-        route,
-        409,
-        "stale_task_version",
-        "La tâche a changé depuis son chargement.",
+      if (transferOutcome === "stale") {
+        // The browser sends the exact task status_version; this scenario
+        // exercises the typed stale-CAS refusal.
+        return fail(
+          route,
+          409,
+          "stale_task_version",
+          "La tâche a changé depuis son chargement.",
+        );
+      }
+      const transferTaskId = path.slice(
+        inv("/tasks/").length,
+        -"/transfer".length,
       );
+      const task = tasks.find((item) => item.id === transferTaskId);
+      const post = asRecord(body);
+      const adapterKind =
+        typeof post.to_adapter_kind === "string"
+          ? post.to_adapter_kind
+          : "codex_cli";
+      return fulfill(route, {
+        task: {
+          id: transferTaskId,
+          investigation_id: ids.investigation,
+          task_key: task?.task_key ?? "lead-a",
+          status: "assigned",
+          status_version: 2,
+          lease_fence: 0,
+          assigned_actor_kind: "operator",
+          assigned_actor_id: `operator:${adapterKind}`,
+          result_verification_status: "unverified",
+          updated_at: "2026-11-22T10:10:00Z",
+        },
+        destination: {
+          actor_kind: "operator",
+          actor_id: `operator:${adapterKind}`,
+        },
+        sync: null,
+        handoff: {
+          schema_version: "investigation-handoff.v1",
+          handoff_id: ids.decision,
+          investigation_id: ids.investigation,
+          task_id: transferTaskId,
+          version: 1,
+          created_at: "2026-11-22T10:10:00Z",
+          from_actor: { kind: "human", actor_id: "dev-analyst" },
+          to_actor: {
+            kind: "operator",
+            actor_id: `operator:${adapterKind}`,
+          },
+          task: {
+            status: "assigned",
+            status_version: 1,
+            question: task?.question ?? "",
+            objective: task?.objective ?? "",
+            expected_outputs: task?.expected_outputs ?? [],
+            assigned_actor_kind: null,
+            assigned_actor_id: null,
+          },
+          plan: null,
+          work: {
+            hypotheses: [],
+            attempts: [],
+            established_results: [],
+            partial_results: [],
+            negative_results: [],
+            limits: [],
+          },
+          refs: {
+            observations: [],
+            findings: [],
+            decisions: [],
+            consultations: [],
+          },
+          files: [],
+          next_action: "Poursuivre la tâche transférée.",
+          freshness_refs: [],
+        },
+        previous_handoff_id: null,
+        previous_handoff_version: null,
+        previous_freshness: null,
+        session: null,
+        replayed: false,
+      });
     }
     if (
       path.startsWith(inv("/tasks/")) &&

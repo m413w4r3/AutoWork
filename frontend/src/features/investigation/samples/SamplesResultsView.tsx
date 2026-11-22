@@ -39,8 +39,10 @@ import {
   formatTimestamp,
   labelOf,
   operationOutcomeLabel,
-  workshopErrorText,
 } from "./samplesLabels";
+import { WorkshopErrorNotice } from "../shell/WorkshopErrorNotice";
+import { WorkshopLongOperationState } from "../shell/WorkshopStates";
+import { SampleQualificationPanel } from "./SampleQualificationPanel";
 import "./samples.css";
 
 const CHIP_KINDS: Record<WorkContributionCategory, string> = {
@@ -48,14 +50,6 @@ const CHIP_KINDS: Record<WorkContributionCategory, string> = {
   observation: "Observation — référence canonique",
   finding: "Finding — vérification humaine requise",
 };
-
-function ErrorNotice({ label, error }: { label: string; error: unknown }) {
-  return (
-    <p className="error-message" role="alert">
-      {workshopErrorText(error, label)}
-    </p>
-  );
-}
 
 interface SampleRow {
   key: string;
@@ -65,6 +59,7 @@ interface SampleRow {
   qualification: SampleQualification | null;
   state: SampleState | null;
   associationId: string | null;
+  sampleId: string | null;
   version: number | null;
   download: BootstrapDownloadOutcomeV1 | null;
 }
@@ -103,6 +98,7 @@ function buildSampleRows(
         qualification: association.qualification,
         state: quarantined?.state ?? null,
         associationId: association.association_id,
+        sampleId: quarantined?.sample_id ?? null,
         version: association.version,
         download,
       });
@@ -127,6 +123,7 @@ function buildSampleRows(
         qualification: sample.qualification,
         state: sample.state,
         associationId: sample.association_id,
+        sampleId: sample.sample_id,
         version: null,
         download,
       });
@@ -317,6 +314,23 @@ function AcquisitionSection({
                 <tr key={row.key}>
                   <td>
                     <code>{row.sha256}</code>
+                    {row.associationId === null ? null : (
+                      <div className="samples-results__meta">
+                        association{" "}
+                        <code title={row.associationId}>
+                          {row.associationId.slice(0, 8)}…
+                        </code>
+                        {row.sampleId === null ? null : (
+                          <>
+                            {" "}
+                            · échantillon{" "}
+                            <code title={row.sampleId}>
+                              {row.sampleId.slice(0, 8)}…
+                            </code>
+                          </>
+                        )}
+                      </div>
+                    )}
                   </td>
                   <td>
                     {IOC_KIND_LABELS[row.ioc.kind]} ·{" "}
@@ -779,7 +793,7 @@ export function SamplesResultsView({
           <p role="status">Chargement du plan de collecte…</p>
         ) : null}
         {plan.error !== null ? (
-          <ErrorNotice
+          <WorkshopErrorNotice
             label="Le plan de collecte n’a pas pu être lu."
             error={plan.error}
           />
@@ -810,13 +824,16 @@ export function SamplesResultsView({
           </p>
         ) : null}
         {run.isPending ? (
-          <p role="status">
-            Collecte VT en cours — opération longue, les résultats partiels
-            restent visibles ci-dessous.
-          </p>
+          <WorkshopLongOperationState
+            label="Collecte VT en cours"
+            detail="Opération longue : les résultats partiels restent visibles ci-dessous."
+          />
         ) : null}
         {run.error !== null ? (
-          <ErrorNotice label="La collecte VT a échoué." error={run.error} />
+          <WorkshopErrorNotice
+            label="La collecte VT a échoué."
+            error={run.error}
+          />
         ) : null}
       </section>
 
@@ -824,7 +841,7 @@ export function SamplesResultsView({
         <p role="status">Chargement de l’inventaire IOC…</p>
       ) : null}
       {inventory.error !== null ? (
-        <ErrorNotice
+        <WorkshopErrorNotice
           label="L’inventaire IOC n’a pas pu être lu."
           error={inventory.error}
         />
@@ -839,11 +856,13 @@ export function SamplesResultsView({
         </>
       )}
 
+      <SampleQualificationPanel investigationId={investigationId} />
+
       {snapshot.isPending ? (
         <p role="status">Chargement des rapports VT…</p>
       ) : null}
       {snapshot.error !== null && !snapshotMissing ? (
-        <ErrorNotice
+        <WorkshopErrorNotice
           label="Les rapports VT n’ont pas pu être lus."
           error={snapshot.error}
         />
@@ -857,7 +876,7 @@ export function SamplesResultsView({
         <p role="status">Chargement des contributions…</p>
       ) : null}
       {contributions.error !== null ? (
-        <ErrorNotice
+        <WorkshopErrorNotice
           label="Les contributions n’ont pas pu être lues."
           error={contributions.error}
         />

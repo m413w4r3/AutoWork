@@ -285,6 +285,130 @@ const noteViewWithoutTask = {
   linked_task_ids: [],
 } satisfies NoteViewResponseV1;
 
+const taskFixture = {
+  id: "task-1",
+  investigation_id: "inv-1",
+  task_key: "lead-a",
+  plan_version_id: null,
+  parent_task_id: null,
+  depth: 0,
+  title: "Vérifier le domaine",
+  question: "Le domaine est-il un C2 ?",
+  objective: "Confirmer le rôle du domaine.",
+  priority: "high",
+  claim_refs: [],
+  evidence_refs: [],
+  sample_refs: [],
+  required_capabilities: [],
+  allowed_workspace_paths: [],
+  execution_policy: {},
+  expected_outputs: [],
+  status: "ready",
+  status_version: 1,
+  result_verification_status: "unverified",
+  blocked_reason: null,
+  assigned_actor_kind: null,
+  assigned_actor_id: null,
+  lease_id: null,
+  lease_session_id: null,
+  lease_fence: 0,
+  lease_expires_at: null,
+  heartbeat_at: null,
+  handoff_ref: null,
+  result_refs: [],
+  event_sequence: 1,
+  created_by: { actor_kind: "system", actor_id: "plan_accept" },
+  created_at: "2026-11-20T09:00:00Z",
+  updated_at: "2026-11-20T09:00:00Z",
+} as const;
+
+const activityFixture = {
+  schema_version: "investigation-activity.v1",
+  investigation: {
+    id: "inv-1",
+    subject_id: "subject-1",
+    production_run_id: "run-1",
+    synthesis_artifact_id: "synthesis-1",
+    synthesis_sha256: SHA_A,
+    status: "running",
+    version: 1,
+    stop_reason: null,
+    execution_mode: "operator_led",
+  },
+  operator: {
+    principal: null,
+    model: null,
+    effort: null,
+    active_subagent_count: null,
+    metadata_source: "unavailable_in_autowork",
+  },
+  working_state: {
+    version: 5,
+    turn_index: 2,
+    stop_reason: null,
+    hypothesis_count: 1,
+    open_hypothesis_count: 0,
+  },
+  last_activity_at: "2026-11-20T12:00:00Z",
+  last_activity_source: "investigation",
+  active_backend_job_count: 0,
+  budget: null,
+  timeline: [],
+  next_cursor: null,
+  has_more: false,
+  blockers: [],
+  counts: { inconclusive_findings: 0 },
+  generated_at: "2026-11-20T12:01:00Z",
+} as const;
+
+const sampleFixture = {
+  id: "assoc-1",
+  sample_sha256: SHA_B,
+  origin: "vt_pivot",
+  qualification: "candidate",
+  related_sample_sha256: [],
+  version: 1,
+  changes: [],
+} as const;
+
+const activeSessionFixture = {
+  id: "session-1",
+  investigation_id: "inv-1",
+  task_id: "task-1",
+  adapter_kind: "codex_cli",
+  state: "running",
+  state_version: 1,
+  host_session_ref: "host-1",
+  handoff_id: null,
+  capability_sha256: SHA_A,
+  probed_at: "2026-11-20T09:00:00Z",
+  task_lease_id: null,
+  task_lease_fence: 0,
+  checkpoint_ref: null,
+  checkpoint_sha256: null,
+  reconciliation: null,
+  reconciliation_sha256: null,
+  last_activity_at: "2026-11-20T12:00:00Z",
+  opened_at: "2026-11-20T09:00:00Z",
+  closed_at: null,
+  close_reason: null,
+  created_at: "2026-11-20T09:00:00Z",
+  updated_at: "2026-11-20T12:00:00Z",
+} as const;
+
+const bridgeReviewFixture = {
+  investigation_id: "inv-1",
+  note_revision_id: "revision-2",
+  note_sha256: SHA_B,
+  consultation_type: "interpretation",
+  invocation_id: "invocation-1",
+  invocation_status: "pending",
+  pending: true,
+  idempotent_replay: false,
+  advisory_only: true,
+  is_evidence: false,
+} as const;
+
 const writeResult = {
   investigation_id: "inv-1",
   workspace_id: "ws-1",
@@ -328,11 +452,13 @@ interface HandlerOptions {
   status?: WorkspaceStatusV1;
   agentStatus?: "available" | "unavailable" | "unconfigured";
   note?: NoteViewResponseV1;
+  sessions?: "active" | "none";
 }
 
 function makeHandler(options: HandlerOptions = {}) {
   const status = options.status ?? availableStatus;
   const agentStatus = options.agentStatus ?? "available";
+  const sessions = options.sessions ?? "active";
   const files = status.workspace_available ? fileList : unavailableFileList;
   const conflicts = status.workspace_available
     ? conflictList
@@ -343,6 +469,15 @@ function makeHandler(options: HandlerOptions = {}) {
     if (url === "/api/workspace-agent/status") {
       return jsonResponse({ status: agentStatus, instance_id: "instance-1" });
     }
+    if (url.includes("/activity")) return jsonResponse(activityFixture);
+    if (url.endsWith("/tasks")) {
+      return jsonResponse({ items: [taskFixture], total: 1 });
+    }
+    if (url.endsWith("/samples")) return jsonResponse([sampleFixture]);
+    if (url.endsWith("/agent-sessions")) {
+      return jsonResponse(sessions === "active" ? [activeSessionFixture] : []);
+    }
+    if (url.includes("/ask-bridge")) return jsonResponse(bridgeReviewFixture);
     if (url.endsWith("/workspace")) return jsonResponse(status);
     if (url.includes("/workspace/files/content"))
       return jsonResponse(noteContent);
@@ -451,14 +586,19 @@ describe("WorkspaceNotesView", () => {
     expect(
       screen.getByText("Note de travail — non probante"),
     ).toBeInTheDocument();
+    expect(await screen.findByText(/Session active/)).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Demander à l’agent de continuer" }),
+      screen.getByRole("button", {
+        name: "Demander à l’agent de continuer",
+      }),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(
-        /le client API figé n’expose pas la version d’état de travail requise/,
-      ),
+      screen.getByRole("button", { name: "Demander à Bridge de relire" }),
     ).toBeInTheDocument();
+    expect(screen.getByText(/Version CAS envoyée :/)).toHaveTextContent("5");
+    expect(
+      screen.queryByText(/le client API figé n’expose pas la version d’état/),
+    ).not.toBeInTheDocument();
     expect(
       recorder.calls.some(
         (call) =>
@@ -466,6 +606,59 @@ describe("WorkspaceNotesView", () => {
           call.url.includes("hypothese.md"),
       ),
     ).toBe(true);
+  });
+
+  it("envoie la relecture Bridge avec la version CAS de l’état de travail", async () => {
+    const recorder = renderView(makeHandler());
+    const user = userEvent.setup();
+    await user.click(
+      await screen.findByRole("button", {
+        name: /notes\/humaines\/hypothese\.md/,
+      }),
+    );
+    await user.type(
+      await screen.findByLabelText("Question à Bridge sur cette note"),
+      "La note est-elle cohérente avec l’observation ?",
+    );
+    await user.click(
+      screen.getByRole("button", { name: "Demander à Bridge de relire" }),
+    );
+
+    await waitFor(() => {
+      expect(
+        recorder.calls.some((call) => call.url.includes("/ask-bridge")),
+      ).toBe(true);
+    });
+    const call = recorder.calls.find((item) =>
+      item.url.includes("/ask-bridge"),
+    );
+    expect(bodyOf(call?.init)).toEqual({
+      consultation_type: "interpretation",
+      question: "La note est-elle cohérente avec l’observation ?",
+      expected_working_state_version: 5,
+    });
+    expect(headersOf(call?.init)["Idempotency-Key"]).toMatch(
+      /^[A-Za-z0-9._:-]{8,128}$/,
+    );
+    expect(await screen.findByText(/Relecture Bridge demandée/)).toBeVisible();
+  });
+
+  it("conditionne l’instruction agent à une session active", async () => {
+    renderView(makeHandler({ sessions: "none" }));
+    await userEvent.setup().click(
+      await screen.findByRole("button", {
+        name: /notes\/humaines\/hypothese\.md/,
+      }),
+    );
+
+    expect(
+      await screen.findByText(
+        /Action indisponible : aucune session active pour cette tâche/,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Demander à l’agent de continuer" }),
+    ).toBeDisabled();
   });
 
   it("masque l’action agent quand aucune tâche n’est liée à la note", async () => {

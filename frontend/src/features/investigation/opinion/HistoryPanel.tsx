@@ -1,7 +1,14 @@
 import { useState } from "react";
 
+import { WorkshopReadOnlyState } from "../shell/WorkshopStates";
+import { formatTimestamp } from "../tasks/labels";
 import { groupNotesByAnchor } from "./anchor";
-import { BLOCK_LABELS, BLOCK_ORDER, shortHash } from "./labels";
+import {
+  BLOCK_LABELS,
+  BLOCK_ORDER,
+  OPINION_STATUS_LABELS,
+  shortHash,
+} from "./labels";
 import type { OpinionVersionV1 } from "./types";
 
 export function HistoryPanel({ history }: { history: OpinionVersionV1[] }) {
@@ -31,7 +38,8 @@ export function HistoryPanel({ history }: { history: OpinionVersionV1[] }) {
       >
         {history.map((item) => (
           <option key={`${item.id}-${item.version}`} value={item.id}>
-            v{item.version} · {item.status} · {shortHash(item.content_sha256)}
+            v{item.version} · {OPINION_STATUS_LABELS[item.status]} ·{" "}
+            {shortHash(item.content_sha256)}
           </option>
         ))}
       </select>
@@ -42,16 +50,14 @@ export function HistoryPanel({ history }: { history: OpinionVersionV1[] }) {
           aria-readonly="true"
         >
           <h4>
-            Lecture seule · version {selected.version} · {selected.status}
+            Lecture seule · version {selected.version} ·{" "}
+            {OPINION_STATUS_LABELS[selected.status]}
           </h4>
           <p>
             SHA-256 <code>{selected.content_sha256}</code> · créée le{" "}
-            {selected.created_at}
+            {formatTimestamp(selected.created_at)}
           </p>
-          <p>
-            Cette version ne peut être ni modifiée, ni approuvée, ni publiée
-            depuis cet aperçu historique.
-          </p>
+          <WorkshopReadOnlyState reason="Cette version antérieure ne peut être ni modifiée, ni approuvée, ni publiée depuis cet aperçu historique." />
 
           <div>
             <h5>Blocs</h5>

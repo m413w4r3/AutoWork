@@ -146,7 +146,16 @@ export function InvestigationTab({
                 type="button"
                 className="button button--secondary"
                 disabled={!exactSynthesis || launch.isPending}
-                onClick={() => void startExactSynthesis()}
+                onClick={() => {
+                  if (existingForExactSynthesis !== undefined) {
+                    // Une enquête existe déjà pour cette synthèse exacte : la
+                    // sélectionner ne mute rien. Un nouveau start legacy serait
+                    // refusé par le serveur (`prose_authority_conflict`).
+                    setSelectedInvestigationId(existingForExactSynthesis.id);
+                    return;
+                  }
+                  void startExactSynthesis();
+                }}
               >
                 {launch.isPending
                   ? "Lancement…"
