@@ -1,6 +1,6 @@
 # Mission 22 — atelier éditorial : tickets M1–M8
 
-**Base vérifiée :** `ac436333` (`m22/integration`). **État :** M1–M7 sont intégrés, à l’exception de T-M7-27 et T-M7-29 ; T-M8-30 et T-M8-31 sont intégrés comme tests de contrat ; T-M8-32 et le gate final ne sont pas réalisés. ADR-0010 reste `Proposed`. Les contrats et l’état courant sont détaillés dans [ARCHITECTURE.md](ARCHITECTURE.md).
+**Base historique vérifiée :** `ac436333` (`m22/integration`). **État M23 (2026-11-22) :** les tickets M1–M8 sont livrés, y compris T-M7-27 et T-M7-29 ; T-M8-32 reste PARTIAL (gate final non prononcé) ; la matrice UX et la chaîne d’acceptation sont livrées ; la tête Alembic est `0018_editorial_enrichment_element_operations`, une seule tête ; ADR-0010 est `Accepted` (2026-11-21, amendé le 2026-11-22). Les lots M23 F0–F6 et la remédiation R1 sont détaillés dans « M23 closure ». Les contrats et l’état courant sont détaillés dans [ARCHITECTURE.md](ARCHITECTURE.md).
 
 **SHA de merge repérés par `git log --grep` :** T-M3-15b fusionné dans T-M3-15c (`b74eab88`) ; T-M7-26 backend (`1904a035`) ; T-M7-28 (`e0758a07`) ; T-M8-30 (`4eb5e13f`) ; T-M8-31 (`82f0a5f6`). Les autres tickets livrés figurent dans la base `ac436333`, mais aucun SHA de merge dédié n’a été retrouvé par recherche de leur identifiant.
 
@@ -29,11 +29,11 @@
 
 **Décisions de livraison additionnelles:** appliquer DECISIONS D7 en plus de D1–D6; les garde-fous, l’inventaire/cutover et les oracles ci-dessous sont obligatoires avant les décisions canoniques.
 
-**D9 et écarts à retenir :** les routes legacy `revise` restent des écrivains directs et appellent `EditorialRevisionEffects` dans leur UOW ; elles ne deviennent pas des façades `prepare + accept` et ne créent pas de propositions/ModelRun factices. T-M8-30/31 vérifient les contrats de ces chemins. La décision utilisateur rend l’atelier desktop-only : UX-19 est abandonné et aucun critère mobile ne s’applique. L’acceptation est disponible après T-M3-17. T-M7-28 et les tests de contrat M8 ont été intégrés alors que T-M7-27/29 restaient ouverts ; cela ne clôt pas le gate final. Écarts de livraison encore ouverts : T-M6-25 n’expose pas le retrait/remplacement de figure ; T-M7-27 et T-M7-29 ne sont pas livrés ; l’audit axe n’a pas été réalisé ; T-M8-31 ne crée plus de snapshot append-only lors d’une lecture de prévisualisation, mais conserve le chemin d’écriture canonique.
+**D9 et écarts à retenir :** les routes legacy `revise` restent des écrivains directs et appellent `EditorialRevisionEffects` dans leur UOW ; elles ne deviennent pas des façades `prepare + accept` et ne créent pas de propositions/ModelRun factices. T-M8-30/31 vérifient les contrats de ces chemins. La décision utilisateur rend l’atelier desktop-only : UX-19 est abandonné et aucun critère mobile ne s’applique. L’acceptation est disponible après T-M3-17. M23 livre T-M7-27, T-M7-29, le retrait/remplacement de figure et la matrice d’acceptation ; les écarts restants sont le gating de capacité des actions visuelles, le réordonnancement hors `after_paragraph`, l’absence de rendu du diagramme dans l’atelier, la correction graphique/diagramme réservée à Bridge et l’audit axe non réalisé. T-M8-31 ne crée plus de snapshot append-only lors d’une lecture de prévisualisation, mais conserve le chemin d’écriture canonique.
 
 **Règle Alembic — D8/D8b, tête unique:** `0001_baseline` reste gelée; toute DDL est additive après la tête intégrée. D8 autorise chaque ticket DDL à modifier, en plus de ses chemins propres, uniquement `backend/migrations/env.py` (import du nouveau module de modèles), `backend/tests/integration/test_migrations.py` (tête et modules de modèles), `backend/tests/test_alembic_chain.py` (tête et chaîne) et `backend/tests/test_architecture_production_lineage.py` (liste des fichiers de migration). D8b autorise aussi dans `env.py` l’exclusion de la nouvelle table de la métadonnée baseline gelée (`frozenset` post-baseline et condition de `_metadata_for_frozen_baseline`) et dans `test_migrations.py` les attentes de tables, triggers et fonctions ajoutés. Toute nouvelle migration doit réussir `alembic upgrade head` sur base vide; oracle: `make test-integration INTEGRATION_TEST_PATH=tests/integration/test_migrations.py` plus le test éditorial concerné. Préflight: objet absent ou exactement conforme; état partiel/non conforme: échec avant DDL. Conserver les gardes de downgrade selon ADR-0007.
 
-**Chaîne intégrée à HEAD :** `0011_editorial_workspace_snapshots` → `0012_editorial_threads` → `0013_bridge_generation_slots` → `0014_editorial_proposals` → `0015_editorial_proposal_impacts` → `0016_editorial_drafts` → `0017_editorial_proposal_bar_chart_operation`. La tête Alembic vérifiée est `0017_editorial_proposal_bar_chart_operation`, sans branche concurrente. Rôles : snapshot/registre ; fils et conversations ; slot Bridge ; propositions ; outbox d’impacts ; brouillons serveur ; opération `create_bar_chart` dans le CHECK des propositions. `0001_baseline` reste gelée.
+**Chaîne intégrée à HEAD :** `0011_editorial_workspace_snapshots` → `0012_editorial_threads` → `0013_bridge_generation_slots` → `0014_editorial_proposals` → `0015_editorial_proposal_impacts` → `0016_editorial_drafts` → `0017_editorial_proposal_bar_chart_operation` → `0018_editorial_enrichment_element_operations`. La tête Alembic vérifiée est `0018_editorial_enrichment_element_operations`, sans branche concurrente. Rôles : snapshot/registre ; fils et conversations ; slot Bridge ; propositions ; outbox d’impacts ; brouillons serveur ; opération `create_bar_chart` dans le CHECK des propositions ; opérations `update_visual_caption`, `move_enrichment_element` et `reorder_enrichment_elements` dans le même CHECK. `0001_baseline` reste gelée.
 
 ## M1 — socle
 
@@ -371,7 +371,7 @@
 - **Taille:** L.
 
 ### T-M6-25 — Intégrer plusieurs figures avec provenance
-- **Statut à ac436333 :** DONE avec écarts : retrait/remplacement non exposés ; rehash des blobs via le chargeur partagé ; provenance source affichée ; assainissement SVG à l’ingestion reste au pipeline M19.
+- **Statut à ac436333 :** DONE avec écarts : retrait/remplacement non exposés à cette base (M23 les expose depuis par la route générique de révision visuelle) ; rehash des blobs via le chargeur partagé ; provenance source affichée ; assainissement SVG à l’ingestion reste au pipeline M19.
 - **Comportement:** cocher plusieurs figures éligibles, régler légendes/ordre/ancre et les intégrer via proposition; aucune génération Bridge.
 - **Depends-on / parallélisme:** T-M6-24; même composer/adoption/render files.
 - **Chemins autorisés:** backend/src/cti_app/application/editorial_proposals.py; backend/src/cti_app/application/editorial_proposal_adoption.py; backend/tests/test_editorial_figure_adoption.py; frontend/src/features/editorial-workspace/{SourceFigureGallery.tsx,VisualInsertionComposer.tsx,EditorialDocument.tsx}; frontend/e2e/editorial/figure-insertion.spec.ts.
@@ -397,7 +397,7 @@
 - **Taille:** L.
 
 ### T-M7-27 — Versions V4–V8 en lecture historique
-- **Statut à ac436333 :** NON LIVRÉ : vue historique dédiée V4–V8 en lecture seule et ses tests ne sont pas présents.
+- **Statut :** DONE (M23) : vue historique dédiée V4–V8 en lecture seule livrée (route d’artefact de publication, `read_only_reason`, `legacy-read-only.spec.ts`, oracle PostgreSQL `test_legacy_read_only_postgres_keeps_artifact_bytes_and_versions`) ; le SHA canonique reste inchangé.
 - **Comportement:** l’utilisateur ouvre une ancienne publication explicitement en lecture seule; l’octet canonique et son SHA restent inchangés.
 - **Depends-on / parallélisme:** T-M7-26; composants historiques partagés avec workspace, donc séquentiel.
 - **Chemins autorisés:** backend/src/cti_app/domain/publication_document.py; backend/src/cti_app/api/editorial_workspace.py; backend/tests/test_editorial_legacy_read_only.py; frontend/src/api/production.ts; frontend/src/features/publication/PublicationDocumentView.tsx; frontend/src/features/editorial-workspace/{EditorialWorkspacePage.tsx,EditorialWorkspacePage.test.tsx}.
@@ -412,7 +412,7 @@
 - **Statut à ac436333 :** DONE (desktop-only, livré sans T-M7-27 ; merge e0758a07 ; audit axe non réalisé, risque accepté).
 - **Comportement:** actions usuelles sont utilisables au clavier et sans hover sur l’interface desktop, sans perdre cible, brouillon ni position.
 - **Depends-on / parallélisme:** T-M7-27; styles/composants éditoriaux partagés.
-- **Chemins autorisés:** frontend/src/features/editorial-workspace/{EditorialWorkspaceLayout.tsx,EditorialInspector.tsx,EditorialDocument.tsx,EditorialConversation.tsx,EditorialProposalCard.tsx,InlineTextEditor.tsx,SourceFigureGallery.tsx}; frontend/e2e/editorial/keyboard-focus.spec.ts.
+- **Chemins autorisés:** frontend/src/features/editorial-workspace/{EditorialWorkspaceLayout.tsx,EditorialInspector.tsx,EditorialDocument.tsx,EditorialConversation.tsx,EditorialProposalCard.tsx,InlineTextEditor.tsx,SourceFigureGallery.tsx}; frontend/e2e/editorial/keyboard.spec.ts.
 - **Tests rouges d’abord:** test_keyboard_select_edit_compare_decide_and_restore_focus; test_async_reply_does_not_steal_focus.
 - **Acceptation:** commandes Tab/flèches/Échap/Ctrl-S/Cmd-Entrée selon contexte; aria-live sans déplacer focus; focus visible; reduced-motion; axe WCAG 2.2 AA.
 - **UX:** UX-18.
@@ -421,7 +421,7 @@
 - **Taille:** M.
 
 ### T-M7-29 — Captures Playwright pour revue visuelle
-- **Statut à ac436333 :** NON LIVRÉ : visual-review.spec.ts et captures Playwright dédiées ne sont pas présentes.
+- **Statut :** DONE (M23) : `frontend/e2e/editorial/visual-review.spec.ts` (`test_visual_review_captures_desktop_and_states`) et la matrice de captures desktop `ux-capture-matrix.spec.ts` (19 états × 4 largeurs) sont livrés ; la revue visuelle indépendante a eu lieu et ses deux défauts MAJOR ont été corrigés en F6-C.
 - **Comportement:** reviewers peuvent inspecter captures cohérentes de l’application réelle aux tailles desktop et états éditoriaux requis.
 - **Depends-on / parallélisme:** T-M7-28; dernier ticket visuel avant M8.
 - **Chemins autorisés:** frontend/e2e/editorial/visual-review.spec.ts; frontend/playwright.editorial.config.ts; frontend/test-results/editorial-workspace/ (artefacts générés, non suivis).
@@ -459,12 +459,12 @@
 - **Taille:** L.
 
 ### T-M8-32 — Gate final et couverture complète UX-01…UX-20
-- **Statut à ac436333 :** NON RÉALISÉ : gate final, exécution/revue de matrice et acceptation des captures/PDF restent à faire.
+- **Statut :** PARTIAL (M23) : la matrice exécutable UX-01…UX-20, la chaîne PG+Typst E01–E22 et `ACCEPTANCE.md` sont livrées ; le gating de capacité des actions visuelles, le réordonnancement hors `after_paragraph`, le rendu du diagramme dans l’atelier et l’audit axe restent ouverts ; le gate final n’est pas prononcé.
 - **Comportement:** une livraison peut être déclarée complète seulement quand chaque scénario UX actif (UX-01..UX-18 et UX-20) est relié à un test e2e ou integration, UX-19 est marqué abandonné, les lots sont revus et les rendus visuels/PDF acceptés.
 - **Depends-on / parallélisme:** T-M8-30 et T-M8-31; gate terminal.
 - **Chemins autorisés:** backend/tests/integration/editorial/; backend/tests/test_editorial_*; frontend/e2e/editorial/; docs/design/atelier-editorial/TICKETS.md (matrice et noms de test uniquement).
 - **Tests rouges d’abord:** test_editorial_ux_matrix_has_all_twenty_scenarios (aucun UX-xx sans test existant); test_article_brief_editorial_replay_matrix (oracles fake, versions et pins stables).
-- **Acceptation:** chaque scénario actif ci-dessous possède un test exécuté et un résultat; UX-19 reste explicitement abandonné; orchestrateur exécute lui-même `make test-backend PYTEST_ARGS=…`, `make lint-backend`, `make typecheck-backend` et `make test-integration` via Docker; lancer `cd frontend && pnpm test --run`, `cd frontend && pnpm lint`, `cd frontend && pnpm typecheck`, `cd frontend && pnpm build`, Playwright et tests real-Typst selon les tickets; vérifier l’écart D7.B1 formalisé dans ADR-0010/ARCHITECTURE. ADR-0010 reste Proposé jusqu’à la décision d’acceptation de l’orchestrateur en M8; DECISIONS D1–D7 reste autoritatif jusque-là hors de cet écart explicitement signalé. Revue séparée standards/spec/sécurité-provenance; aucune preuve de replay présentée comme test transport live.
+- **Acceptation:** chaque scénario actif ci-dessous possède un test exécuté et un résultat; UX-19 reste explicitement abandonné; orchestrateur exécute lui-même `make test-backend PYTEST_ARGS=…`, `make lint-backend`, `make typecheck-backend` et `make test-integration` via Docker; lancer `cd frontend && pnpm test --run`, `cd frontend && pnpm lint`, `cd frontend && pnpm typecheck`, `cd frontend && pnpm build`, Playwright et tests real-Typst selon les tickets; vérifier l’écart D7.B1 formalisé dans ADR-0010/ARCHITECTURE. ADR-0010 est `Accepted` depuis le 2026-11-21 (amendement M23 du 2026-11-22); DECISIONS D1–D7 reste autoritatif hors de l’écart D7.B1 explicitement signalé. Revue séparée standards/spec/sécurité-provenance; aucune preuve de replay présentée comme test transport live.
 - **UX:** UX-01..UX-20, avec UX-19 abandonné, matrice ci-dessous.
 - **Reviewers:** Standards + Spec + sécurité-provenance + revue visuelle finale.
 - **Stop:** scénario sans test e2e/integration, provider live requis, review PDF/capture manquante, ou toute migration en tête concurrente.
@@ -496,3 +496,18 @@ Matrice exécutable vérifiée par `backend/tests/test_editorial_ux_matrix.py::t
 | UX-18 | `frontend/e2e/editorial/keyboard.spec.ts::test_keyboard_select_edit_compare_decide_and_restore_focus`; `frontend/e2e/editorial/keyboard.spec.ts::test_async_reply_does_not_steal_focus` |
 | UX-19 | **Abandonné (D9)** — UI desktop-only ; aucun test, critère ni capture mobile. |
 | UX-20 | `frontend/e2e/editorial/legacy-read-only.spec.ts::opens a V4 publication as desktop read-only history`; `backend/tests/integration/editorial/test_legacy_read_only_postgres.py::test_legacy_read_only_postgres_keeps_artifact_bytes_and_versions`; `backend/tests/test_editorial_legacy_read_only.py::test_explicitly_historical_v8_has_a_stable_read_only_reason`; `backend/tests/test_editorial_legacy_read_only.py::test_v4_to_v8_exact_readers_have_no_write_capabilities`; `backend/tests/test_editorial_legacy_read_only.py::test_current_v8_snapshot_does_not_rewrite_canonical_sha` |
+
+## M23 closure — 2026-11-22
+
+État des lots livrés sur `m23/integration` (tête Alembic `0018_editorial_enrichment_element_operations`, ADR-0010 `Accepted` et amendé). Les statuts sont DONE ou PARTIAL.
+
+| Lot | Périmètre livré | Statut | Notes honnêtes |
+|---|---|---|---|
+| F0 | Fondations : configuration Playwright éditoriale séparée, workflows de test, tests de réutilisation inter-run | DONE | La suite real-backend-lite reste conditionnelle (variables d’environnement et attestation) et hors de la configuration Playwright éditoriale standard. |
+| F1 | Contrat UX texte desktop : barre d’actions dans le flux du bloc, onglets de l’inspecteur, états de la barre haute, brouillons, édition du chapeau | DONE | Les actions « Discuter » et « Ajouter après » dépendent des capacités serveur fail-closed. |
+| F2 | Révisions visuelles typées : ordre canonique et schéma V11 `group_order`, migration 0018, planificateur unique, révisions graphique/diagramme, remplacement/retrait de figure, route générique, propositions Bridge | DONE | Limites de `revise_diagram` (relation_type forcé sur la route manuelle) et correction graphique/diagramme réservée à Bridge : voir ADR-0010 A6. |
+| F3 | UI des révisions visuelles : barre d’actions, onglet « Visuels », galerie multi-sélection, remplacement de figure, déplacement et réorganisation | DONE | Aucun éditeur manuel de graphique ou de diagramme ; le diagramme n’est pas rendu dans l’atelier. |
+| F4 | — | PARTIAL | Aucun lot F4 distinct n’apparaît dans l’historique d’intégration et aucun périmètre propre n’est identifié à cette base ; le périmètre d’acceptation a été porté par F5. |
+| F5 | Acceptation : chaîne PG+Typst E01–E22, `ACCEPTANCE.md`, parité des ancres BRIEF overview, correctif du snapshot pour un graphique non-paragraphe | DONE | Les preuves UI restent sur API stubbée ; le transport Bridge réel n’est pas exercé. |
+| F6 | Revue UX : matrice de captures desktop, revue indépendante, remédiation F6-C | PARTIAL | Les deux défauts MAJOR de la revue sont corrigés ; des finitions MINOR restent ouvertes (retour de focus après réorganisation ou fermeture d’aperçu, recherche du rail replié, action « Intégrer » parfois sous la ligne de flottaison). |
+| R1 | Remédiation après revue : correctifs backend, frontend, e2e real-backend (en cours) et alignement documentaire | PARTIAL | Cet alignement documentaire et l’amendement ADR-0010 font partie de R1 ; le gating de capacité des actions visuelles, le réordonnancement hors `after_paragraph`, le rendu du diagramme et l’audit axe restent ouverts. |

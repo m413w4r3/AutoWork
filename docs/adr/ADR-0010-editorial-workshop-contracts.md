@@ -1,6 +1,6 @@
 # ADR-0010 — Contrats de l’atelier éditorial interactif
 
-Statut : Accepted — 2026-11-21. Créé le 2026-11-18, précisé le 2026-11-20, implémenté en M1–M8, revu, gates verts ; l’orchestrateur a accepté l’ADR le 2026-11-21.
+Statut : Accepted — 2026-11-21 ; amendé le 2026-11-22 (M23, voir « Amendement M23 »). Créé le 2026-11-18, précisé le 2026-11-20, implémenté en M1–M8, revu, gates verts ; l’orchestrateur a accepté l’ADR le 2026-11-21.
 
 ## Contexte
 
@@ -30,7 +30,7 @@ Le placement ajouté est `after_paragraph` avec `anchor_block_id` obligatoire, r
 
 ### D6 — Persistance additive
 
-Toute persistance suit la tête Alembic courante, `0017_editorial_proposal_bar_chart_operation`. Les migrations 0011–0017 sont additives (détail dans les Conséquences) ; `0001_baseline`, les blobs historiques et leurs hashes restent intacts. Prévalider les objets préexistants ; état partiel ou non conforme : échec avant DDL. Protéger le downgrade selon ADR-0007.
+Toute persistance suit la tête Alembic courante, `0018_editorial_enrichment_element_operations` (D6 amendée par M23 ; voir A2 et les Conséquences). Les migrations 0011–0018 sont additives ; `0001_baseline`, les blobs historiques et leurs hashes restent intacts. Prévalider les objets préexistants ; état partiel ou non conforme : échec avant DDL. Protéger le downgrade selon ADR-0007.
 
 ### D7 — Résolutions M0
 
@@ -57,20 +57,69 @@ D9 amende D7.B1 et formalise la décision T-M3-15 (cutover simplifié). Les écr
 
 Le registre latéral, l’agrégat, le fil et les outboxes portent identité, décision et reprise. Les reassemblages suivent les nouvelles versions ; les compositions gardent leurs pins jusqu’à action explicite. Le lease singleton de `bridge_generation_slots` sérialise les générations Bridge lancées par l’atelier éditorial avec fencing; il ne limite pas les autres consommateurs de Bridge et ne prouve pas une règle globale côté Bridge. Les écritures legacy directes et l’adoption partagent le verrou de run et les effets registre/stale; seule l’adoption écrit l’outbox d’impact d’une proposition.
 
-Migrations livrées, chaîne linéaire et tête unique `0017_editorial_proposal_bar_chart_operation` : `0011_editorial_workspace_snapshots` (instantanés épinglés, registre append-only), `0012_editorial_threads` (fils, événements, jobs), `0013_bridge_generation_slots` (lease de génération avec fencing), `0014_editorial_proposals` (propositions, ModelRuns, événements), `0015_editorial_proposal_impacts` (outbox d’impacts), `0016_editorial_drafts` (brouillons serveur), `0017_editorial_proposal_bar_chart_operation` (CHECK des opérations étendu à `create_bar_chart`). `0001_baseline` et les blobs historiques restent inchangés.
+Migrations livrées à la décision initiale, en chaîne linéaire : `0011_editorial_workspace_snapshots` (instantanés épinglés, registre append-only), `0012_editorial_threads` (fils, événements, jobs), `0013_bridge_generation_slots` (lease de génération avec fencing), `0014_editorial_proposals` (propositions, ModelRuns, événements), `0015_editorial_proposal_impacts` (outbox d’impacts), `0016_editorial_drafts` (brouillons serveur), `0017_editorial_proposal_bar_chart_operation` (CHECK des opérations étendu à `create_bar_chart`). L’amendement M23 porte la tête à `0018_editorial_enrichment_element_operations` (voir A2) ; `0001_baseline` et les blobs historiques restent inchangés.
 
-Opérations ajoutées : placement `after_paragraph` avec `anchor_block_id`, et opérations `create_table`, `create_bar_chart`, `create_source_figure`.
+Opérations ajoutées à la décision initiale : placement `after_paragraph` avec `anchor_block_id`, et opérations `create_table`, `create_bar_chart`, `create_source_figure`. L’amendement M23 ajoute les sept révisions visuelles typées décrites en A1.
 
 Garde serveur unique `editorial_read_only` : `resolve_revision_target` et l’adoption refusent une écriture sur une cible en lecture seule, avec recontrôle sous verrou avant l’écriture adoptante. Les lectures, le rejet et l’historique restent permis.
 
-Versions vérifiées à la tête (`ARCHITECTURE.md` §6) : schéma d’enrichissement V10, politique V14 (`evidence-backed-bar-charts`), prompt V23, parser V17, document de publication V10, données Typst V42–V44 (renderer v23), SVG `editorial-chart-svg-v2-bar-data` (renderer 2.0), politique de rendu V15.
+Versions vérifiées à la tête (`ARCHITECTURE.md` §6) : schéma d’enrichissement V10, ou V11 lorsqu’un `group_order` explicite existe (politique `editorial-enrichment-v15-element-order`), politique V14 (`evidence-backed-bar-charts`), prompt V23, parser V17, document de publication V10, données Typst V42–V44 (renderer v23), SVG `editorial-chart-svg-v2-bar-data` (renderer 2.0), politique de rendu V15.
 
 La route `POST /subjects/{subject_id}/editor/threads/{occurrence_id}/proposals/{proposal_id}/accept` est exposée (`editorial_proposal_accept_enabled`, défaut vrai) et l’action UI « Accepter » est disponible.
+
+## Amendement M23 — 2026-11-22
+
+Cet amendement enregistre les décisions livrées par la mission 23. Il précise D6 et les conséquences ; D1–D5 et D7–D9 restent inchangées.
+
+### A1 — Révisions visuelles typées
+
+Sept variantes forment l’union fermée `VisualRevisionPatch` : `ReviseChartPatch` (`rewrite_chart`), `ReviseDiagramPatch` (`rewrite_diagram`), `UpdateVisualCaptionPatch` (`update_visual_caption`), `MoveEnrichmentElementPatch` (`move_enrichment_element`), `ReorderEnrichmentElementsPatch` (`reorder_enrichment_elements`), `ReplaceSourceFigurePatch` (`replace_source_figure`) et `RemoveEnrichmentElementPatch` (`delete_table`, `delete_diagram`, `delete_chart` ou `delete_source_figure` selon le kind). Chaque variante nomme l’élément exact qu’elle modifie ; un kind de wire inconnu est refusé, jamais ignoré.
+
+La validation et l’application passent par une seule fonction, `plan_visual_revision` (`application/editorial_visual_revision/`), utilisée par la préparation manuelle, la préparation Bridge et l’adoption. Une seule route générique les expose : `POST /api/subjects/{subject_id}/editor/blocks/{occurrence_id}/enrichment-revisions`, avec `Idempotency-Key` obligatoire et une union discriminée sur `operation`. Le patch persisté est non canonique ; l’adoption le relit, le réinterprète dans la même union et réexécute le même planificateur sous le verrou du run. L’écrivain d’adoption de D2 reste l’unique écrivain d’une proposition acceptée.
+
+### A2 — Ordre canonique des éléments, schéma V11 et migration 0018
+
+`enrichment_element_order` et `enrichment_order_rank` (`domain/production_editorial_enrichment.py`) sont l’unique autorité d’ordre, consommée par la projection du snapshot, l’assemblage de publication (`resolved_placements`) et le rendu Typst. Pour un artefact antérieur au schéma V11, ou pour un groupe sans `group_order`, l’ordre PDF historique est reproduit : `after_paragraph` par index de famille puis clé ; autres placements par rang de famille puis index puis clé. Le champ `order` des figures n’est consulté à aucun schéma : l’atelier, le snapshot et le PDF partagent donc le même ordre.
+
+Le schéma d’enrichissement V11 ajoute un `group_order` entier optionnel par élément (politique `editorial-enrichment-v15-element-order`). Il n’est écrit que si un ordre explicite existe : une réorganisation, ou une création/déplacement dans un groupe déjà ordonné. Seuls les groupes `after_paragraph` sont réorganisables ; une réorganisation normalise le groupe en `0..n-1`, un déplacement efface le `group_order` de l’élément déplacé et un retrait conserve les positions et ordres des autres membres.
+
+La migration `0018_editorial_enrichment_element_operations` est la tête Alembic courante. Elle ne fait qu’étendre le CHECK `ck_editorial_proposals_operation` avec `update_visual_caption`, `move_enrichment_element` et `reorder_enrichment_elements` ; elle prévalide l’état ancien/nouveau, refuse le downgrade tant que des lignes utilisent les nouvelles opérations et laisse `0001_baseline` intacte.
+
+### A3 — Sémantique de remplacement et de retrait
+
+Un remplacement de figure est appliqué en place : même clé, même placement, même ordre explicite, une seule nouvelle version d’artefact. La figure de remplacement est résolue à nouveau depuis le catalogue autorisé à la préparation et à l’adoption ; l’ancienne version d’artefact conserve la référence à l’ancienne image, les blobs et l’inventaire archivés restent intacts, et l’entrée d’archive remplacée redevient sélectionnable dans le candidat courant. Les `figure_decisions` sont mises à jour et le plafond BRIEF de trois figures reste appliqué.
+
+Un retrait supprime l’élément de sa famille uniquement : les autres éléments gardent leur position de liste et leur `group_order`, les annotations de l’élément sont retirées, et les médias, l’inventaire et les preuves sources ne sont pas modifiés. La trace de décision de la figure retirée est supprimée du nouvel artefact ; les versions antérieures conservent l’historique. L’adoption produit une seule nouvelle version et l’outbox d’impact invalide les rendus dérivés.
+
+### A4 — Ancres BRIEF et fusion overview
+
+`merge_brief_narrative_sections` (`application/brief_publication_builder.py`) est l’unique autorité de fusion des sections overview dans le corps BRIEF : elle produit la carte ancre synthèse → corps publié, consommée à la fois par le corps de publication et par le résolveur de placement. La projection de l’atelier applique la même définition de section overview pour placer les éléments `after_lead` après le bloc fusionné. Une ancre non mappable ou un placement résolu jamais émis refuse l’assemblage ou le rendu (`editorial_anchor_stale`) au lieu de déplacer ou de supprimer silencieusement l’élément.
+
+### A5 — Capacités sincères
+
+Les capacités du snapshot (`can_discuss`, `can_preview_revision`, `manual_edit`, `can_add_enrichment`) sont calculées fail-closed à partir du câblage réel : routes, runtime de discussion, aperçu de révision, écrivain d’adoption et consommateur d’impact disponibles, et au moins un bloc actionnable. Une dépendance absente éteint l’action au lieu d’afficher un contrôle mort.
+
+Les opérations d’élément sont annoncées par élément dans `allowed_operations` : tableau `rewrite_table`/`delete_table`/`update_visual_caption`/`move_enrichment_element` ; graphique `rewrite_chart`/`delete_chart`/`update_visual_caption`/`move_enrichment_element` ; diagramme `rewrite_diagram`/`delete_diagram`/`update_visual_caption`/`move_enrichment_element` ; figure `replace_source_figure`/`delete_source_figure`/`update_visual_caption`/`move_enrichment_element`. Les contrôles visuels restent en outre bornés par `read_only` et par ces opérations ; aucune capacité distincte de révision visuelle n’est exposée. La route de réorganisation ne résout qu’un groupe `after_paragraph` ancré sur un paragraphe ou le chapeau.
+
+### A6 — Portée Bridge et limites de `revise_diagram`
+
+Un fil ouvert sur un élément d’enrichissement peut proposer uniquement `rewrite_chart`, `rewrite_diagram` et `update_visual_caption`. Les déplacements, réorganisations, remplacements et retraits sont manuels uniquement. Aucun éditeur manuel de graphique ou de diagramme n’est livré : leur correction passe par Bridge ; l’atelier ne rend pas l’image du diagramme et l’opérateur travaille depuis le titre, le diff structurel de la proposition et le PDF.
+
+`revise_diagram` conserve la clé, le placement et l’ordre explicite, refuse un patch sans changement et recompile le diagramme avec le compilateur D2 épinglé. Un nœud ou une arête ne peut être ajouté que si ses références de preuve étaient déjà admises pour ce diagramme (`diagram_evidence_not_previously_admitted` sinon) ; les preuves du purpose analytique sont préservées et doivent rester utilisées par le graphe. La route manuelle ne transporte pas `relation_type` : le traducteur force `FACTUAL` et une direction par défaut, tandis que le parseur Bridge préserve `relation_type` et `direction`. L’adoption recompile sous verrou ; si le binaire D2 installé ne correspond pas à la version épinglée, la compilation refuse (`diagram_compiler_version_mismatch`) au lieu de modifier l’asset silencieusement. L’ancien asset compilé reste référencé par la version antérieure de l’artefact.
+
+### A7 — Risques résiduels acceptés en M23
+
+- `application/editorial_proposals.py` reste un monolithe d’environ 5 300 lignes (5 267 au 2026-11-22), non contracté.
+- Dette de seam `PinnedEnrichmentInputs` (S-03/S-04) : les nouveaux modules atteignent des attributs privés de service et des chaînes `getattr`, et la séquence de chargement épinglé comme la persistance de préparation visuelle restent dupliquées. Un seam public typé reste à extraire.
+- Aucune preuve de transport Bridge réel : tous les chemins Bridge sont exercés avec des doubles fournisseur.
+- Les e2e UI tournent sur une API stubbée ; le smoke real-backend-lite (`frontend/e2e-real/editorial/workspace_real.spec.ts`) existe mais exige une attestation d’environnement explicite et n’est pas exécuté par la configuration Playwright éditoriale standard.
+- Un BRIEF V9 historique dont les `resolved_placements` portent des coordonnées synthèse refuse le rendu (`editorial_anchor_stale`) jusqu’à réassemblage.
+- La réutilisation inter-run d’enrichissement n’est pas exacte : les ancres sont scopées au run, les quatre étapes amont coûteuses sont réutilisées sans appel modèle, et chaque run paie un appel d’enrichissement.
+- La correction graphique/diagramme est réservée à Bridge et l’audit axe n’a pas été réalisé.
 
 ## Écarts et risques résiduels connus
 
 - Routes legacy `revise`/`restore` de `api/production.py` non gardées par `editorial_read_only` (écrivains legacy admis par D9).
-- Retrait et remplacement de figure non exposés dans l’interface actuelle.
 - Re-hash des blobs d’inventaire non refait : le chargeur partagé legacy reste utilisé.
 - URL canonique de source exposée en lecture comme provenance.
 - SVG non assaini à l’ingestion (pipeline legacy M19), assaini seulement à l’aperçu.
@@ -78,10 +127,7 @@ La route `POST /subjects/{subject_id}/editor/threads/{occurrence_id}/proposals/{
 - Heuristique de kind V4–V6 : résolveur legacy ADR-0008 (D1/D5).
 - Audit axe non réalisé (risque accepté).
 - Curseur d’historique non signé (filtrage par sujet intact).
-- `editorial_proposals.py` ~4,1 k lignes non contracté (4 183 lignes).
-- mypy : erreurs préexistantes hors diff.
-- Bundle JS ~771 kB (build local ; 771 451 octets).
-- Réutilisation inter-run d’enrichissement non exacte (V10, appels modèle possibles).
+- Dette et limites introduites par M23 (monolithe, seam épinglé, transport Bridge non prouvé, e2e stubbée, BRIEF V9, réutilisation non exacte, limites graphique/diagramme) : voir Amendement M23 §A7.
 
 ## Options rejetées
 

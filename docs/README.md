@@ -1,6 +1,6 @@
 # AutoWork — documentation authority index
 
-Updated for coding agents, 2026-10-23. This index is **navigation and
+Updated for coding agents, 2026-11-22. This index is **navigation and
 precedence**, not an assertion that every historical statement or currently
 deployed environment was revalidated. Review actual code, schemas, runtime
 capabilities, migration state and tests before asserting operational behavior.
@@ -41,6 +41,7 @@ observations are canonical only in their authorized application stores.
 | Repository module ownership | [`../backend/src/cti_app/infrastructure/database/repositories/AGENTS.md`](../backend/src/cti_app/infrastructure/database/repositories/AGENTS.md) | ACTIVE_AUTHORITATIVE (scoped) |
 | Frozen baseline / additive C2 migration | [`adr/ADR-0007-frozen-baseline-and-c2-migration.md`](adr/ADR-0007-frozen-baseline-and-c2-migration.md) | ACTIVE_AUTHORITATIVE |
 | Optional BRIEF Editorial Enrichment | [`adr/ADR-0009-brief-editorial-enrichment.md`](adr/ADR-0009-brief-editorial-enrichment.md) | ACTIVE_AUTHORITATIVE (amends ADR-0008 point 4) |
+| Editorial workshop contracts | [`adr/ADR-0010-editorial-workshop-contracts.md`](adr/ADR-0010-editorial-workshop-contracts.md) | ACTIVE_AUTHORITATIVE (Accepted 2026-11-21; amended 2026-11-22) |
 | Exact DB DDL | [`../backend/migrations/versions/0001_baseline.py`](../backend/migrations/versions/0001_baseline.py) and [`0002_c2_experiments.py`](../backend/migrations/versions/0002_c2_experiments.py) | VERSIONED_CODE; inspect before any change |
 
 `0001_baseline` is frozen. `0002_c2_experiments` is additive and handles only
@@ -62,6 +63,7 @@ separate approval and state/backup preflight.
 | Coding orchestration | [`operations/paseo-agent-orchestration.md`](operations/paseo-agent-orchestration.md) | ACTIVE_REFERENCE (recommended setup, not verified host config) |
 | Source collection | [`source_collection_and_evidence.md`](source_collection_and_evidence.md) | ACTIVE_REFERENCE; older workflow statements may be historical |
 | M16 acquisition engine | [`m16/ACQUISITION_ENGINE.md`](m16/ACQUISITION_ENGINE.md) | ACTIVE_REFERENCE; verify configuration and deployment capabilities against code |
+| Editorial workshop design and acceptance | [`design/atelier-editorial/ARCHITECTURE.md`](design/atelier-editorial/ARCHITECTURE.md), [`TICKETS.md`](design/atelier-editorial/TICKETS.md), [`UX-SPEC.md`](design/atelier-editorial/UX-SPEC.md), [`GLOSSARY.md`](design/atelier-editorial/GLOSSARY.md), [`ACCEPTANCE.md`](design/atelier-editorial/ACCEPTANCE.md) | ACTIVE_REFERENCE; `ACCEPTANCE.md` is the M23 traceability target checked by `backend/tests/test_editorial_acceptance_traceability.py` |
 | Other accepted ADRs | [`adr/`](adr/) | ACTIVE_REFERENCE unless expressly superseded; dated decisions must be interpreted in sequence |
 
 ## Historical documents and intentional deletions
