@@ -367,6 +367,9 @@ def _raise_opinion_error(exc: OpinionError) -> None:
         OpinionErrorCode.BASE_IDENTITY_MISMATCH: status.HTTP_409_CONFLICT,
         OpinionErrorCode.SYNTHESIS_IDENTITY_MISMATCH: status.HTTP_409_CONFLICT,
         OpinionErrorCode.IDEMPOTENCY_CONFLICT: status.HTTP_409_CONFLICT,
+        OpinionErrorCode.BRIDGE_AUTHORSHIP_REQUIRED: status.HTTP_422_UNPROCESSABLE_CONTENT,
+        OpinionErrorCode.BRIDGE_PROSE_FORBIDDEN: status.HTTP_422_UNPROCESSABLE_CONTENT,
+        OpinionErrorCode.BRIDGE_MODIFIED_PROSE_FORBIDDEN: status.HTTP_422_UNPROCESSABLE_CONTENT,
     }[exc.code]
     detail: dict[str, Any] = {"code": exc.code.value}
     if str(exc) != exc.code.value:
@@ -834,6 +837,8 @@ async def approve_opinion(
             idempotency_key=key,
             bridge_drafting_gap_acknowledged=payload.bridge_drafting_gap_acknowledged,
         )
+    except ProductionReuseStorageUnavailableError as exc:
+        _raise_opinion_storage_unavailable(exc)
     except OpinionError as exc:
         _raise_opinion_error(exc)
     return {
@@ -861,6 +866,8 @@ async def request_opinion_changes(
             correlation_id=get_correlation_id(),
             idempotency_key=key,
         )
+    except ProductionReuseStorageUnavailableError as exc:
+        _raise_opinion_storage_unavailable(exc)
     except OpinionError as exc:
         _raise_opinion_error(exc)
     return {"opinion": _opinion_payload(opinion), "changes_requested": True}

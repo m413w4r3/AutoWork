@@ -38,6 +38,7 @@ from cti_app.domain.investigation import (
     NoveltyClass,
     ToolInvocationStatus,
     canonical_json_bytes,
+    is_advisory_observation,
 )
 
 _FINDING_NAMESPACE = UUID("d89458ef-e8cf-4e8e-8291-bc76f0fd3150")
@@ -90,7 +91,9 @@ class OperatorFindingToolAdapter:
         except (TypeError, ValueError) as exc:
             message = str(exc).casefold()
             code = (
-                "finding_observation_not_found"
+                "advisory_observation_not_evidence"
+                if "advisory" in message
+                else "finding_observation_not_found"
                 if "observation" in message and "does not exist" in message
                 else "finding_observation_investigation_mismatch"
                 if "another investigation" in message
@@ -796,6 +799,11 @@ class FindingService:
                 raise ValueError(f"Observation {ref} does not exist")
             if observation.investigation_id != investigation_id:
                 raise ValueError(f"Observation {ref} belongs to another investigation")
+            if is_advisory_observation(observation):
+                raise ValueError(
+                    f"Observation {ref} is advisory Bridge material and cannot be cited "
+                    "as finding evidence"
+                )
             if ref not in result:
                 result.append(ref)
         return tuple(result)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol, cast
@@ -47,6 +47,7 @@ from cti_app.domain.analyst_opinion import (
     OpinionBlockType,
     OpinionClaimQualification,
     OpinionProtocolFigureV1,
+    OpinionWriterKind,
     opinion_blocks_with_implant_materials,
     opinion_blocks_with_observations,
     opinion_bridge_drafting_summary,
@@ -67,12 +68,14 @@ from cti_app.domain.investigation import (
     NoveltyClass,
     TLPLevel,
     ToolInvocationStatus,
+    is_advisory_observation,
 )
 from cti_app.domain.production import (
     AnalystInvestigation,
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
+    ProseAuthority,
 )
 from cti_app.domain.protocol_model import ProtocolDiagramKind
 from cti_app.domain.publication_document import (
@@ -155,6 +158,9 @@ class OpinionErrorCode(StrEnum):
     PROTOCOL_FIGURES_INVALID = "invalid_protocol_figures"
     PROTOCOL_FIGURES_NOT_IN_INVESTIGATION = "protocol_figures_not_in_investigation"
     PROTOCOL_FIGURES_UNAVAILABLE = "protocol_figures_unavailable"
+    BRIDGE_AUTHORSHIP_REQUIRED = "bridge_authorship_required"
+    BRIDGE_PROSE_FORBIDDEN = "bridge_prose_forbidden"
+    BRIDGE_MODIFIED_PROSE_FORBIDDEN = "bridge_modified_prose_forbidden"
 
 
 class OpinionError(ValueError):
@@ -181,6 +187,85 @@ class _OperatorOpinionInputError(ValueError):
         self.code = code
         self.field_path = field_path
         super().__init__(f"{code}: {field_path}")
+
+
+_PROJECTION_BLOCK_TYPES = frozenset(
+    {OpinionBlockType.ANALYST_OBSERVATIONS, OpinionBlockType.IMPLANT_MATERIALS}
+)
+
+
+def _require_bridge_provenanced_text(*, draft_ref: BridgeDraftReferenceV1 | None) -> None:
+    """Require one publishable text to be the exact text a Bridge draft produced."""
+    if draft_ref is None:
+        raise OpinionError(
+            OpinionErrorCode.BRIDGE_AUTHORSHIP_REQUIRED,
+            message=(
+                "bridge_only publishable prose requires a persisted Bridge draft "
+                "reference; Bridge authorship must be proven, not declared."
+            ),
+        )
+    if draft_ref.operator_modified:
+        raise OpinionError(
+            OpinionErrorCode.BRIDGE_MODIFIED_PROSE_FORBIDDEN,
+            message="Prose modified after Bridge is forbidden in a bridge_only investigation.",
+        )
+
+
+def _require_complete_bridge_provenance(opinion: AnalystOpinionV1) -> None:
+    """Reject every publishable text or limit that is not Bridge-provenanced."""
+    for block in opinion.blocks:
+        if block.block_type in _PROJECTION_BLOCK_TYPES:
+            continue
+        _require_bridge_provenanced_text(draft_ref=block.bridge_draft_ref)
+    for note in opinion.observations:
+        _require_bridge_provenanced_text(draft_ref=note.bridge_draft_ref)
+    material_section = opinion.implant_materials_section
+    if material_section is not None and material_section.text.strip():
+        _require_bridge_provenanced_text(draft_ref=material_section.bridge_draft_ref)
+    if opinion.unresolved_points:
+        raise OpinionError(
+            OpinionErrorCode.BRIDGE_PROSE_FORBIDDEN,
+            message=(
+                "unresolved_points must be empty in a bridge_only investigation; report "
+                "Bridge limits through a provenanced block or note instead."
+            ),
+        )
+
+
+async def require_bridge_only_provenance(
+    investigation: AnalystInvestigation,
+    opinion: AnalystOpinionV1 | None,
+    *,
+    writer_kind: OpinionWriterKind,
+    verify_bridge_provenance: Callable[[], Awaitable[None]] | None = None,
+) -> None:
+    """The single ADR-0011 D4 prose-authority gate for opinion-version writers.
+
+    ``legacy`` investigations retain the deprecated behaviour and this gate does
+    nothing.  In ``bridge_only`` an operator-tool or Bridge-led writer can never
+    author opinion prose, and a human or system writer must present exact
+    Bridge-provenanced text only; the persisted consultation is then re-verified
+    by ``verify_bridge_provenance``.
+    """
+    authority = investigation.prose_authority
+    if not isinstance(authority, ProseAuthority):
+        authority = ProseAuthority(authority)
+    if authority is not ProseAuthority.BRIDGE_ONLY:
+        return
+    if writer_kind in {OpinionWriterKind.OPERATOR_TOOL, OpinionWriterKind.BRIDGE_LED}:
+        raise OpinionError(
+            OpinionErrorCode.BRIDGE_AUTHORSHIP_REQUIRED,
+            message=(
+                f"A {writer_kind.value} writer cannot author opinion prose in a "
+                "bridge_only investigation."
+            ),
+        )
+    if opinion is None:
+        raise TypeError("A human or system opinion writer requires the opinion being written")
+    _require_complete_bridge_provenance(opinion)
+    if verify_bridge_provenance is None:
+        raise TypeError("bridge_only provenance verification requires the persisted observations")
+    await verify_bridge_provenance()
 
 
 class ClaimKnowledgeView(Protocol):
@@ -357,6 +442,7 @@ class AnalystOpinionService:
         protocol_figures: tuple[OpinionProtocolFigureV1, ...] | None = None,
         draft_blocks: tuple[OpinionBlock, ...] | None = None,
         implant_materials: tuple[ImplantMaterialEditorialV1, ...] | None = None,
+        writer_kind: OpinionWriterKind = OpinionWriterKind.HUMAN,
     ) -> AnalystOpinionV1:
         normalized = self._normalize_selection(selection)
         opinion_id = uuid5(_OPINION_NAMESPACE, str(investigation_id))
@@ -455,6 +541,7 @@ class AnalystOpinionService:
             ):
                 return current
             await self._validate_bridge_provenance(uow, opinion)
+            await self.require_bridge_only_provenance(uow, opinion, writer_kind=writer_kind)
             await self._validate_citations(uow, opinion)
             appended = await uow.analyst_opinions.append_version(
                 opinion, expected_version=current.version if current else 0
@@ -470,6 +557,7 @@ class AnalystOpinionService:
         actor: str,
         *,
         expected_sha256: str | None = None,
+        writer_kind: OpinionWriterKind = OpinionWriterKind.HUMAN,
     ) -> AnalystOpinionV1:
         actor_id = self._require_actor(actor)
         revision = (
@@ -542,6 +630,7 @@ class AnalystOpinionService:
                 status=AnalystOpinionStatus.DRAFT,
             )
             await self._validate_bridge_provenance(uow, candidate)
+            await self.require_bridge_only_provenance(uow, candidate, writer_kind=writer_kind)
             await self._validate_citations(uow, candidate)
             try:
                 result = await uow.analyst_opinions.append_version(
@@ -749,6 +838,7 @@ class AnalystOpinionService:
                 bridge_drafting_gap_acknowledged=current.bridge_drafting_gap_acknowledged,
             )
             await self._validate_bridge_provenance(uow, rebased)
+            await self.require_bridge_only_provenance(uow, rebased)
             await self._validate_citations(uow, rebased)
             try:
                 appended = await uow.analyst_opinions.append_rebased_version(
@@ -833,6 +923,9 @@ class AnalystOpinionService:
                     bool(drafting["requires_acknowledgement"]) and gap_acknowledged
                 ),
             )
+            # Re-run the strict provenance check on the full rendered content
+            # immediately before the approval version is written.
+            await self.require_bridge_only_provenance(uow, approved)
             await self._validate_citations(uow, approved)
             try:
                 saved = await uow.analyst_opinions.append_version(
@@ -908,6 +1001,7 @@ class AnalystOpinionService:
                 reviewer_id=actor_id,
                 status=AnalystOpinionStatus.REJECTED,
             )
+            await self.require_bridge_only_provenance(uow, rejected)
             saved = await uow.analyst_opinions.append_version(rejected, expected_version=version)
             await self._append_decision(
                 uow,
@@ -1186,6 +1280,9 @@ class AnalystOpinionService:
         violations = verify_opinion_citations(opinion, findings, observations)
         finding_by_id = {item.id: item for item in findings}
         observation_by_id = {item.id: item for item in observations}
+        advisory_observation_ids = {
+            item.id for item in observations if is_advisory_observation(item)
+        }
         material_observation_refs = {
             item.evidence_observation_id for item in opinion.implant_materials
         }
@@ -1196,6 +1293,7 @@ class AnalystOpinionService:
                 for index, item in enumerate(opinion.implant_materials)
                 if (observation := observation_by_id.get(item.evidence_observation_id)) is None
                 or observation.investigation_id != opinion.investigation_id
+                or item.evidence_observation_id in advisory_observation_ids
             ),
             None,
         )
@@ -1223,14 +1321,25 @@ class AnalystOpinionService:
             field_path = None
             if invalid_material_index is not None:
                 invalid_item = opinion.implant_materials[invalid_material_index]
+                material_is_advisory = (
+                    invalid_item.evidence_observation_id in advisory_observation_ids
+                )
                 citation_violations = (
                     *violations,
                     CitationViolation(
-                        CitationViolationCode.OBSERVATION_NOT_FOUND,
+                        (
+                            CitationViolationCode.ADVISORY_OBSERVATION_NOT_EVIDENCE
+                            if material_is_advisory
+                            else CitationViolationCode.OBSERVATION_NOT_FOUND
+                        ),
                         OpinionBlockType.IMPLANT_MATERIALS,
                         invalid_item.evidence_observation_id,
-                        "The cited implant-material observation does not exist "
-                        "in this investigation.",
+                        (
+                            "Bridge advisory material cannot be cited as evidence."
+                            if material_is_advisory
+                            else "The cited implant-material observation does not exist "
+                            "in this investigation."
+                        ),
                     ),
                 )
                 field_path = f"implant_materials[{invalid_material_index}].evidence_observation_id"
@@ -1260,6 +1369,28 @@ class AnalystOpinionService:
                 for note in opinion.observations
             ):
                 raise OpinionError(OpinionErrorCode.INVALID_OBSERVATION_ANCHOR)
+
+    async def require_bridge_only_provenance(
+        self,
+        uow: UnitOfWork,
+        opinion: AnalystOpinionV1,
+        *,
+        writer_kind: OpinionWriterKind = OpinionWriterKind.HUMAN,
+    ) -> None:
+        """Apply the single ADR-0011 D4 prose-authority gate to one writer.
+
+        Delegates to the module-level predicate so every writer, including the
+        internal investigation loop, is checked by exactly one rule.
+        """
+        investigation = await uow.analyst_investigations.get(opinion.investigation_id)
+        if investigation is None:
+            raise OpinionError(OpinionErrorCode.INVESTIGATION_NOT_FOUND)
+        await require_bridge_only_provenance(
+            investigation,
+            opinion,
+            writer_kind=writer_kind,
+            verify_bridge_provenance=lambda: self._validate_bridge_provenance(uow, opinion),
+        )
 
     async def _validate_bridge_provenance(self, uow: UnitOfWork, opinion: AnalystOpinionV1) -> None:
         requested: list[
@@ -2005,6 +2136,20 @@ class OperatorOpinionToolAdapter:
         self, arguments: Mapping[str, Any], context: ToolExecutionContext
     ) -> ToolResult:
         action = str(arguments["action"])
+        get_investigation = getattr(self._investigations, "get", None)
+        investigation = (
+            await get_investigation(context.investigation_id)
+            if callable(get_investigation)
+            else None
+        )
+        if investigation is not None:
+            authority = getattr(investigation, "prose_authority", ProseAuthority.LEGACY)
+            if not isinstance(authority, ProseAuthority):
+                authority = ProseAuthority(authority)
+            if authority is ProseAuthority.BRIDGE_ONLY:
+                # Server-side authority refusal (ADR-0011 D4): an operator tool is
+                # never a prose author, regardless of which client token calls it.
+                return _operator_opinion_failure(OpinionErrorCode.BRIDGE_AUTHORSHIP_REQUIRED.value)
         try:
             if action == "compose":
                 return await self._compose(arguments, context)
@@ -2076,6 +2221,7 @@ class OperatorOpinionToolAdapter:
             protocol_figures=protocol_figures,
             draft_blocks=draft_blocks,
             implant_materials=materials,
+            writer_kind=OpinionWriterKind.OPERATOR_TOOL,
         )
         return _operator_opinion_result(
             opinion,
@@ -2118,6 +2264,7 @@ class OperatorOpinionToolAdapter:
             edits,
             "operator:claude-client",
             expected_sha256=str(arguments["expected_opinion_sha256"]),
+            writer_kind=OpinionWriterKind.OPERATOR_TOOL,
         )
         return _operator_opinion_result(
             opinion,
@@ -2211,6 +2358,7 @@ class OperatorOpinionToolAdapter:
             ),
             "operator:claude-client",
             expected_sha256=current.content_sha256,
+            writer_kind=OpinionWriterKind.OPERATOR_TOOL,
         )
         return _operator_opinion_result(opinion, message="Anchored note saved in the draft.")
 
@@ -2714,4 +2862,5 @@ __all__ = [
     "OpinionErrorCode",
     "OpinionRevisionEdits",
     "register_operator_opinion_tools",
+    "require_bridge_only_provenance",
 ]

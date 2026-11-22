@@ -17,6 +17,7 @@ from cti_app.domain.investigation import (
     FindingAssessment,
     InvestigationFinding,
     canonical_json_bytes,
+    is_advisory_observation,
 )
 from cti_app.domain.network_protocol import StreamDirection
 from cti_app.domain.protocol_model import (
@@ -166,9 +167,24 @@ class AnalystOpinionStatus(StrEnum):
     REJECTED = "rejected"
 
 
+class OpinionWriterKind(StrEnum):
+    """Server-side origin of an opinion-version write (ADR-0011 D4).
+
+    Only ``HUMAN`` and ``SYSTEM`` writers may ever contribute publishable prose
+    to a ``bridge_only`` investigation, and only through Bridge provenance.
+    ``OPERATOR_TOOL`` and ``BRIDGE_LED`` are refused categorically there.
+    """
+
+    HUMAN = "human"
+    SYSTEM = "system"
+    OPERATOR_TOOL = "operator_tool"
+    BRIDGE_LED = "bridge_led"
+
+
 class CitationViolationCode(StrEnum):
     FINDING_NOT_FOUND = "finding_not_found"
     OBSERVATION_NOT_FOUND = "observation_not_found"
+    ADVISORY_OBSERVATION_NOT_EVIDENCE = "advisory_observation_not_evidence"
     FACT_WITHOUT_SUPPORTED_FINDING = "fact_without_supported_finding"
     SUPPORTED_FINDING_WITHOUT_OBSERVATION = "supported_finding_without_observation"
     OBSERVATION_NOT_SUPPORTED = "analyst_observation_not_supported"
@@ -1366,7 +1382,12 @@ def verify_opinion_citations(
 ) -> tuple[CitationViolation, ...]:
     """Check all references and require strong factual blocks to cite supported evidence."""
     finding_by_id = {finding.id: finding for finding in findings}
-    observation_ids = {observation.id for observation in observations}
+    advisory_ids = {
+        observation.id for observation in observations if is_advisory_observation(observation)
+    }
+    observation_ids = {
+        observation.id for observation in observations if observation.id not in advisory_ids
+    }
     violations: list[CitationViolation] = []
     for block in opinion.blocks:
         if block.block_type in {
@@ -1389,7 +1410,16 @@ def verify_opinion_citations(
             else:
                 referenced_findings.append(finding)
         for evidence_ref in block.evidence_refs:
-            if evidence_ref not in observation_ids:
+            if evidence_ref in advisory_ids:
+                violations.append(
+                    CitationViolation(
+                        CitationViolationCode.ADVISORY_OBSERVATION_NOT_EVIDENCE,
+                        block.block_type,
+                        evidence_ref,
+                        "Bridge advisory material cannot be cited as evidence.",
+                    )
+                )
+            elif evidence_ref not in observation_ids:
                 violations.append(
                     CitationViolation(
                         CitationViolationCode.OBSERVATION_NOT_FOUND,
@@ -1444,7 +1474,16 @@ def verify_opinion_citations(
             else:
                 note_referenced_findings.append(finding)
         for evidence_ref in note.evidence_refs:
-            if evidence_ref not in observation_ids:
+            if evidence_ref in advisory_ids:
+                violations.append(
+                    CitationViolation(
+                        CitationViolationCode.ADVISORY_OBSERVATION_NOT_EVIDENCE,
+                        OpinionBlockType.KEY_FINDINGS,
+                        evidence_ref,
+                        "Bridge advisory material cannot be cited as analyst-observation evidence.",
+                    )
+                )
+            elif evidence_ref not in observation_ids:
                 violations.append(
                     CitationViolation(
                         CitationViolationCode.OBSERVATION_NOT_FOUND,
@@ -1485,6 +1524,7 @@ __all__ = [
     "OpinionClaimQualification",
     "OpinionProtocolFieldEvidenceV1",
     "OpinionProtocolFigureV1",
+    "OpinionWriterKind",
     "missing_opinion_annex_references",
     "opinion_bridge_drafting_summary",
     "opinion_internal_text_markers",
