@@ -89,11 +89,12 @@ Les actions principales sont « Modifier », « Discuter », « Ajouter après �
 | Chapeau (lead) | « Modifier », « Discuter », « Sources », « Comparer » | Historique ; autres opérations déclarées. |
 | Intertitre (heading) | « Renommer », « Discuter », « Sources », « Historique » | Déplacer ou supprimer uniquement si proposés par les capacités ; l’identité de section est conservée. |
 | Paragraphe | « Modifier », « Discuter », « Ajouter après », « Sources » | « Supprimer », « Scinder », « Déplacer », « Historique » uniquement si l’opération est permise et prise en charge. |
-| Tableau | « Sélectionner », « Modifier » (structure/cellules si permis), « Sources » | « Historique », retrait/déplacement si opérations permises ; « Ajouter après » si disponible. |
-| Graphique | « Sources », « Modifier les libellés ou la présentation » si permis | « Historique », retrait/déplacement si opérations permises ; ajout après si disponible. |
-| Figure | « Sources », légende si modifiable, provenance | « Historique », « Remplacer » ou « Retirer » seulement via opération versionnée autorisée. |
+| Tableau | « Modifier la légende », « Sources » | « Demander à Bridge », « Déplacer », « Réorganiser » (groupe `after_paragraph` d’au moins deux membres), « Retirer », « Historique » si l’opération est permise. |
+| Graphique | « Modifier la légende », « Demander à Bridge », « Sources » | « Déplacer », « Réorganiser » (groupe `after_paragraph` d’au moins deux membres), « Retirer », « Historique » si l’opération est permise. Aucun éditeur manuel de valeurs : la correction passe par Bridge. |
+| Figure | « Modifier la légende », « Sources », provenance | « Remplacer », « Retirer », « Déplacer », « Réorganiser » (groupe `after_paragraph` d’au moins deux membres), « Historique » uniquement via opération versionnée autorisée. |
+| Diagramme | « Modifier la légende », « Demander à Bridge », « Sources » | « Déplacer », « Réorganiser » (groupe `after_paragraph` d’au moins deux membres), « Retirer », « Historique » si l’opération est permise. Aucun éditeur manuel : la correction passe par Bridge. |
 
-Pour un diagramme présent, montrer la provenance et l’historique, puis n’exposer que les opérations déclarées pour son kind. L’atelier ne déduit jamais une capacité à partir du texte ni d’un contrôle client.
+Pour un diagramme présent, montrer la provenance et l’historique, puis n’exposer que les opérations déclarées pour son kind. L’atelier n’affiche pas l’image du diagramme : l’opérateur travaille depuis son titre, le diff structurel de la proposition et le PDF. L’atelier ne déduit jamais une capacité à partir du texte ni d’un contrôle client.
 
 ### ARTICLE et BRIEF
 
@@ -103,7 +104,7 @@ Les deux types utilisent le même atelier, les mêmes états et la même navigat
 
 ### Onglets et priorité
 
-Onglets : « Discussion », « Modification directe », « Insertion », « Sources et preuves », « Historique ». La Discussion prend la priorité d’affichage dès qu’un fil est actif pour le bloc : sélectionner un autre onglet n’archive ni ne remplace le fil, et revenir au bloc le restaure. Lors d’une réponse asynchrone, ne pas détourner le focus ni remplacer un autre onglet. L’en-tête indique « Discussion sur : [début du paragraphe] » (ou le titre du bloc) et « Changer de cible ».
+Onglets : « Discussion », « Modifier », « Visuels », « Sources », « Historique ». L’insertion vit dans l’onglet « Visuels » (« Ajouter après ce bloc »). La Discussion prend la priorité d’affichage dès qu’un fil est actif pour le bloc : sélectionner un autre onglet n’archive ni ne remplace le fil, et revenir au bloc le restaure. Lors d’une réponse asynchrone, ne pas détourner le focus ni remplacer un autre onglet. L’en-tête indique « Discussion sur : [début du paragraphe] » (ou le titre du bloc) et « Changer de cible ».
 
 L’historique est chronologique et différencie messages utilisateur, réponses Bridge, propositions, décisions et refus de preuve. Il rappelle la version de référence d’un fil conservé. Le contexte envoyé est celui du bloc, de sa section, des preuves admises, des passages adjacents utiles, du fil et des règles éditoriales ; jamais tout le sujet par défaut. Les sorties et messages ne deviennent pas des preuves.
 
@@ -159,7 +160,7 @@ Budget = nombre maximal de clics sur les commandes ; saisie, chargement et répo
 - « Comparaison » montre « Version actuelle » et « Proposition » côte à côte sur grand écran; dans l’implantation desktop intermédiaire, les panneaux peuvent s’empiler si la largeur restante l’exige. Le paragraphe complet reste lisible ; la justification et les preuves sont accessibles près de la proposition.
 - « Différences » affiche ajouts et suppressions dans le texte, au niveau du paragraphe ; jamais un diff JSON. Marqueurs, libellés (« Ajouté », « Supprimé ») et couleur distinguent les changements, même en monochrome ou lecteur d’écran.
 - Les deux vues comparent la même cible et la même proposition sélectionnée. Les variantes précédentes sont navigables dans le fil ; choisir « la deuxième » rattache explicitement la référence à la proposition correspondante.
-- Les commandes « Accepter », « Rejeter », « Demander une variante » et « Consulter les preuves » restent visibles et nommées. Accepter ne rappelle pas le modèle ; une proposition stale ne peut pas être acceptée.
+- Les commandes « Accepter », « Rejeter » et « Demander une variante » restent visibles et nommées ; les preuves sont accessibles dans le dépliant « Preuves associées » de la carte. Accepter ne rappelle pas le modèle ; une proposition stale ne peut pas être acceptée.
 
 ## 8. Galerie des figures
 
