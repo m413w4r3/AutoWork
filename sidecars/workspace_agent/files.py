@@ -201,8 +201,14 @@ def write_file(
     source: ByteSource,
     declared_length: int,
     idempotency_key: str,
+    hooks: paths.WalkHooks | None = None,
 ) -> WriteOutcome:
-    """Publish one API write under its route policy and CAS preconditions."""
+    """Publish one API write under its route policy and CAS preconditions.
+
+    ``hooks`` is the deterministic §5.4 FS seam used by the race tests to swap a
+    path component between the directory open and the inode re-check; production
+    callers pass ``None``.
+    """
     components = paths.validate_relative_path(path)
     policies.require_route_access(route, path)
     validated_origin = _require_origin(route, origin)
@@ -221,7 +227,7 @@ def write_file(
 
     workspace_fd = _open_workspace_directory(root, descriptor)
     try:
-        parent_fd = _open_parent(workspace_fd, components)
+        parent_fd = _open_parent(workspace_fd, components, hooks=hooks)
         try:
             temporary = _stream_to_temporary(parent_fd, components[-1], source, declared_length)
             try:
@@ -570,7 +576,7 @@ def _write_result(
         "revision": revision.to_wire(),
         "created": created,
         "already_present": already_present,
-        "conflict": None,
+        "conflict": False,
     }
 
 
@@ -593,8 +599,10 @@ def _open_workspace_directory(root: Path, descriptor: workspace.WorkspaceDescrip
         os.close(root_fd)
 
 
-def _open_parent(workspace_fd: int, components: tuple[str, ...]) -> int:
-    return paths.open_directory_chain(workspace_fd, components[:-1], create=False)
+def _open_parent(
+    workspace_fd: int, components: tuple[str, ...], *, hooks: paths.WalkHooks | None = None
+) -> int:
+    return paths.open_directory_chain(workspace_fd, components[:-1], create=False, hooks=hooks)
 
 
 def _manifest_component(descriptor: workspace.WorkspaceDescriptor, field: str) -> str:

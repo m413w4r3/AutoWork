@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import uuid
 from collections.abc import Mapping
@@ -39,6 +40,7 @@ POLICY_CLASSES: frozenset[str] = frozenset(
 ORIGIN_FILESYSTEM = "filesystem"
 ORIGINS: frozenset[str] = frozenset({ORIGIN_FILESYSTEM, "ui", "agent", "system"})
 
+MODE_PATTERN = re.compile(r"^[0-7]{4}$")
 FILE_STATE_FIELDS: tuple[str, ...] = (
     "path",
     "revision_id",
@@ -130,14 +132,9 @@ class FileState:
         if not isinstance(policy_class, str) or policy_class not in POLICY_CLASSES:
             raise ProjectionError("unknown file-state policy class")
         mode_text = payload["mode"]
-        if not isinstance(mode_text, str):
-            raise ProjectionError("file-state mode is not a string")
-        try:
-            mode = int(mode_text, 8)
-        except ValueError as exc:
-            raise ProjectionError("file-state mode is not octal") from exc
-        if not 0 <= mode <= 0o7777:
-            raise ProjectionError("file-state mode is out of range")
+        if not isinstance(mode_text, str) or MODE_PATTERN.fullmatch(mode_text) is None:
+            raise ProjectionError("file-state mode is not a four-digit octal string")
+        mode = int(mode_text, 8)
         path = payload["path"]
         if not isinstance(path, str):
             raise ProjectionError("file-state path is not a string")

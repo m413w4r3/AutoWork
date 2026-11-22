@@ -1,0 +1,12 @@
+{
+  "error": "cursor_expired",
+  "message": "event cursor expired; resynchronise from a snapshot",
+  "retryable": false,
+  "details": {
+    "resync_required": true,
+    "generation": 3,
+    "oldest_retained": 7,
+    "last_seq": 7,
+    "after": 0
+  }
+}

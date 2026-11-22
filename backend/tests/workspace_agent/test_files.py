@@ -195,7 +195,7 @@ def test_put_creates_an_editable_file_and_serves_its_raw_bytes(
     assert isinstance(revision, dict)
     assert payload["created"] is True
     assert payload["already_present"] is False
-    assert payload["conflict"] is None
+    assert payload["conflict"] is False
     assert revision["revision_id"] == expected_revision(workspace_id, path, content)
     assert revision["path"] == path
     assert revision["sha256"] == sha256_of(content)

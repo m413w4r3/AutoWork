@@ -1,0 +1,16 @@
+{
+  "event_id": "evt-cb7b042c9854496118d9705c69b4c8a6",
+  "seq": 7,
+  "generation": 3,
+  "kind": "file_created",
+  "path": "notes/humaines/premier-constat.md",
+  "previous_path": null,
+  "revision_id": "rev-18629bee4b79f1d011d8df9e32d9b949",
+  "previous_revision_id": null,
+  "sha256": "2f8730ce568c194c9ab5313368370981b0e422b100dbcb4db23be3093c2a5939",
+  "size": 34,
+  "origin": "filesystem",
+  "task_id": null,
+  "observed_at": "2026-11-22T12:00:00Z",
+  "policy_class": "human_editable"
+}

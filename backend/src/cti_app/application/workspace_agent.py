@@ -36,6 +36,7 @@ ARTICLE_SLUG_PATTERN = r"^[a-z0-9]+(?:-[a-z0-9]+)*$"
 WORKSPACE_ID_PATTERN = r"^ws-[0-9a-f]{32}$"
 SHA256_PATTERN = r"^[0-9a-f]{64}$"
 REVISION_ID_PATTERN = r"^rev-[0-9a-f]{32}$"
+MODE_PATTERN = r"^[0-7]{4}$"
 IDEMPOTENCY_KEY_PATTERN = r"^[A-Za-z0-9._:-]{8,128}$"
 
 OriginKind = Literal["filesystem", "ui", "agent", "system"]
@@ -288,7 +289,7 @@ class FileStateV1(_WireModel):
     revision_id: str | None = Field(default=None, pattern=REVISION_ID_PATTERN)
     sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
     size: int = Field(ge=0)
-    mode: str = Field(min_length=1)
+    mode: str = Field(pattern=MODE_PATTERN)
     mtime_ns: int = Field(ge=0)
     origin: OriginKind
     observed_at: datetime
@@ -550,7 +551,7 @@ class WorkspaceFileRevisionV1(_WireModel):
     path: str = Field(min_length=1)
     sha256: str = Field(pattern=SHA256_PATTERN)
     size: int = Field(ge=0)
-    mode: str = Field(min_length=1)
+    mode: str = Field(pattern=MODE_PATTERN)
     mtime_ns: int = Field(ge=0)
     observed_at: datetime
     origin: OriginKind
@@ -666,6 +667,42 @@ def _canonical_event(workspace_id: str, event: EventV1) -> WorkspaceFileEventV1:
     )
 
 
+def _same_event_identity(stored: WorkspaceFileEventV1, observed: WorkspaceFileEventV1) -> bool:
+    """Compare what an event id commits to, ignoring observation metadata.
+
+    ``event_id`` derives from workspace, path, both revision ids and kind; a
+    projection rebuild legitimately re-reports the same transition with a fresh
+    ``observed_at``, ``origin``, ``seq`` or ``generation`` after re-scanning the
+    disk. The canonical row wins on replay (WORKSPACE-AGENT §6).
+    """
+    return (
+        stored.workspace_id == observed.workspace_id
+        and stored.event_id == observed.event_id
+        and stored.kind == observed.kind
+        and stored.path == observed.path
+        and stored.previous_revision_id == observed.previous_revision_id
+        and stored.revision_id == observed.revision_id
+    )
+
+
+def _same_revision_identity(
+    stored: WorkspaceFileRevisionV1, observed: WorkspaceFileRevisionV1
+) -> bool:
+    """Compare what a revision id commits to, ignoring observation metadata.
+
+    ``revision_id`` derives from ``(workspace, path, content)`` only; ``mode``,
+    ``mtime_ns`` and ``observed_at`` belong to one observation and may drift
+    when a rebuilt projection is rescanned. The canonical row wins on replay.
+    """
+    return (
+        stored.workspace_id == observed.workspace_id
+        and stored.revision_id == observed.revision_id
+        and stored.path == observed.path
+        and stored.sha256 == observed.sha256
+        and stored.size == observed.size
+    )
+
+
 def _canonical_revision(workspace_id: str, state: FileStateV1) -> WorkspaceFileRevisionV1 | None:
     """Build a revision row when the snapshot exposes a complete identity.
 
@@ -726,9 +763,14 @@ class WorkspaceIngestService:
             for event in page.events:
                 if event.generation != page.generation:
                     raise WorkspaceIngestError("event generation differs from its page")
-                _, created = await uow.workspace_file_events.append_if_absent(
-                    _canonical_event(workspace_id, event)
-                )
+                canonical = _canonical_event(workspace_id, event)
+                stored_event = await uow.workspace_file_events.get(workspace_id, canonical.event_id)
+                if stored_event is not None:
+                    if not _same_event_identity(stored_event, canonical):
+                        raise WorkspaceIngestError("an event id identifies a different transition")
+                    existing += 1
+                    continue
+                _, created = await uow.workspace_file_events.append_if_absent(canonical)
                 if created:
                     inserted += 1
                 else:
@@ -785,6 +827,15 @@ class WorkspaceIngestService:
             for state in page.files:
                 revision = _canonical_revision(workspace_id, state)
                 if revision is None:
+                    continue
+                stored_revision = await uow.workspace_file_revisions.get(
+                    workspace_id, revision.revision_id
+                )
+                if stored_revision is not None:
+                    if not _same_revision_identity(stored_revision, revision):
+                        raise WorkspaceIngestError(
+                            "a revision id identifies a different workspace file"
+                        )
                     continue
                 _, created = await uow.workspace_file_revisions.append_if_absent(revision)
                 if created:
