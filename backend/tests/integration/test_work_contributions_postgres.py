@@ -11,7 +11,8 @@ the append-only trigger refuses an UPDATE.
 from __future__ import annotations
 
 import hashlib
-from datetime import UTC, date, datetime
+from dataclasses import replace
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -21,7 +22,10 @@ import sqlalchemy as sa
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cti_app.application.agent_session_verifier import VerifiedAgentSession
+from cti_app.application.agentic_tool_broker import AgenticToolBroker
 from cti_app.application.blobs import BlobCatalogService
+from cti_app.application.investigation_task_events import TaskEventType
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.work_contributions import (
     IMPORTED_SUPPORTED_LIMITATION,
@@ -34,16 +38,26 @@ from cti_app.application.workspace_agent import (
     WorkspaceFileRevisionV1,
     workspace_revision_id,
 )
+from cti_app.domain.agentic_operator import OperatorAdapterKind
 from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition
 from cti_app.domain.entities import Subject
 from cti_app.domain.investigation import EvidenceKind, FindingAssessment, FindingKind
+from cti_app.domain.investigation_task import (
+    InvestigationTaskV1,
+    ResultVerificationStatus,
+    TaskActor,
+    TaskActorKind,
+    TaskPriority,
+    TaskStatus,
+)
 from cti_app.domain.production import (
     AnalystInvestigation,
     LoopBudget,
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionRun,
+    ProseAuthority,
 )
 from cti_app.domain.work_contribution import (
     ContributionDeclarationV1,
@@ -62,6 +76,7 @@ from cti_app.infrastructure.database.session import (
 )
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 from tests.integration.edition_codes import reserve_edition_code
+from tests.test_agentic_tool_broker import OPERATOR_ID, _session_row
 
 pytestmark = pytest.mark.integration
 
@@ -142,6 +157,174 @@ def _revision(workspace_id: str, path: str, content: bytes) -> WorkspaceFileRevi
         observed_at=NOW,
         origin="filesystem",
     )
+
+
+def _assigned_task(investigation_id: UUID) -> InvestigationTaskV1:
+    """An operator-assigned task before its lease exists (FK order in Postgres)."""
+    return InvestigationTaskV1(
+        investigation_id=investigation_id,
+        task_key=f"lead-{uuid4().hex[:8]}",
+        title="Inspect the loader",
+        question="Which gate contacts the C2?",
+        objective="Identify the second-stage downloader.",
+        priority=TaskPriority.HIGH,
+        status=TaskStatus.ASSIGNED,
+        status_version=2,
+        result_verification_status=ResultVerificationStatus.UNVERIFIED,
+        created_by=TaskActor(kind=TaskActorKind.HUMAN, actor_id="analyst:test"),
+        created_at=NOW,
+        updated_at=NOW,
+        assigned_actor_kind=TaskActorKind.OPERATOR,
+        assigned_actor_id=OPERATOR_ID,
+    )
+
+
+async def test_agent_contribution_import_via_broker_persists_event(
+    migrated_postgres_url: str, tmp_path: Path
+) -> None:
+    engine = create_postgres_engine(migrated_postgres_url)
+    session_factory = create_session_factory(engine)
+    try:
+        investigation = await _make_investigation(session_factory)
+        workspace_id = "ws-" + uuid4().hex
+        binding = WorkspaceBindingV1(
+            workspace_id=workspace_id,
+            investigation_id=investigation.id,
+            subject_id=investigation.subject_id,
+            delivery_code="IR202611",
+            article_slug="bluemoon-cn",
+            synthesis_sha256="a" * 64,
+            created_at=NOW,
+        )
+        session_id = uuid4()
+        task = _assigned_task(investigation.id)
+        # The task lease_session FK and the session task_lease pair are
+        # circular, so the session row is built with the lease it will receive
+        # and the lease is acquired once both rows exist.
+        lease_id = uuid4()
+        expected_fence = task.lease_fence + 1
+        session_row, _secret = _session_row(
+            investigation.id,
+            replace(
+                task,
+                lease_id=lease_id,
+                lease_session_id=session_id,
+                lease_fence=expected_fence,
+                lease_expires_at=NOW + timedelta(hours=1),
+                heartbeat_at=NOW,
+            ),
+            session_id=session_id,
+        )
+        note_path = f"notes/agents/{task.id}/analyse.md"
+        note_bytes = b"# Note agent\n\nHypothese non verifiee.\n"
+        revision = _revision(workspace_id, note_path, note_bytes)
+        revision = WorkspaceFileRevisionV1(
+            workspace_id=workspace_id,
+            revision_id=revision.revision_id,
+            path=revision.path,
+            sha256=revision.sha256,
+            size=revision.size,
+            mode=revision.mode,
+            mtime_ns=revision.mtime_ns,
+            observed_at=revision.observed_at,
+            origin="agent",
+            task_id=task.id,
+        )
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            await uow.workspace_bindings.add_if_absent(binding)
+            await uow.investigation_tasks.add(task)
+            await uow.agent_sessions.add(session_row)
+            leased = await uow.investigation_tasks.acquire_lease(
+                task.id,
+                expected_status_version=task.status_version,
+                lease_id=lease_id,
+                lease_session_id=session_id,
+                now=NOW,
+                ttl_seconds=3600,
+            )
+            assert leased is not None
+            await uow.workspace_file_revisions.append_if_absent(revision)
+            await uow.commit()
+        agent = _WorkspaceAgent()
+        agent.contents[(workspace_id, note_path)] = WorkspaceContentV1(
+            content=note_bytes,
+            sha256=revision.sha256,
+            size=len(note_bytes),
+            mtime_ns=revision.mtime_ns,
+        )
+        service = WorkContributionService(
+            uow_factory=lambda: SqlAlchemyUnitOfWork(session_factory),
+            workspace_agent=agent,
+            artifact_store=ProductionArtifactStore(
+                BlobCatalogService(
+                    FilesystemBlobStore(tmp_path / "agent-contribution-blobs"),
+                    lambda: SqlAlchemyUnitOfWork(session_factory),
+                )
+            ),
+            article_snapshots=_ArticleSnapshots(),
+            max_contribution_bytes=16 * 1024 * 1024,
+            clock=lambda: NOW,
+        )
+        verified = VerifiedAgentSession(
+            session_id=session_id,
+            investigation_id=investigation.id,
+            task_id=task.id,
+            adapter_kind=OperatorAdapterKind.CODEX_CLI,
+            operator_id=OPERATOR_ID,
+            task_lease_fence=leased.lease_fence,
+        )
+        arguments = {
+            "workspace_id": workspace_id,
+            "workspace_revision_id": revision.revision_id,
+            "category": "work_contribution",
+        }
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            broker = AgenticToolBroker(
+                investigation_id=investigation.id,
+                prose_authority=ProseAuthority.BRIDGE_ONLY,
+                uow=uow,
+                invocations=None,
+                handoffs=None,
+                contributions=service,
+                notes=None,
+                clock=lambda: NOW,
+                commit=uow.commit,
+            )
+            result = await broker.invoke(
+                session=verified,
+                tool_name="contribution.import",
+                schema_version="1",
+                arguments=arguments,
+                client_idempotency_key="pg-agent-contribution-1",
+            )
+            replay = await broker.invoke(
+                session=verified,
+                tool_name="contribution.import",
+                schema_version="1",
+                arguments=arguments,
+                client_idempotency_key="pg-agent-contribution-1",
+            )
+
+        assert result.status == "imported"
+        assert result.output["origin"] == "agent"
+        assert result.output["task_id"] == str(task.id)
+        assert result.output["lease_fence"] == leased.lease_fence
+        assert result.output["validation_error_code"] is None
+        assert replay.output["id"] == result.output["id"]
+
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            row = await uow.work_contributions.get(UUID(result.output["id"]))
+            events = await uow.investigation_tasks.list_events(task.id)
+        assert row is not None
+        assert row.origin.value == "agent"
+        assert row.task_id == task.id
+        assert row.lease_fence == leased.lease_fence
+        assert row.origin_actor_id == OPERATOR_ID
+        assert [event.event_type for event in events] == [TaskEventType.CONTRIBUTION_IMPORTED]
+        assert events[0].lease_fence == leased.lease_fence
+        assert events[0].payload["contribution_id"] == str(row.id)
+    finally:
+        await engine.dispose()
 
 
 async def test_work_contribution_import_chain_persists_real_rows(

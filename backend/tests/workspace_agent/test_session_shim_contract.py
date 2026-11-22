@@ -296,6 +296,90 @@ def test_submit_result_and_handoff_use_their_fixed_routes() -> None:
     }
 
 
+def test_fix_t_tools_use_the_broker_route_with_closed_bodies() -> None:
+    transport = RecordingTransport()
+    server = _server(transport)
+    run_script = server.handle_message(
+        _tools_call(
+            "autowork_analysis_run_script",
+            {
+                "investigation_id": support.INVESTIGATION_ID,
+                "script": "print('confined')",
+                "interpreter": "python3",
+            },
+            request_id=1,
+        )
+    )
+    note = server.handle_message(
+        _tools_call(
+            "autowork_note_capture",
+            {
+                "investigation_id": support.INVESTIGATION_ID,
+                "relpath": "analyse/first.md",
+                "text": "# Note agent\n",
+            },
+            request_id=2,
+        )
+    )
+    contribution = server.handle_message(
+        _tools_call(
+            "autowork_contribution_import",
+            {
+                "investigation_id": support.INVESTIGATION_ID,
+                "workspace_id": "ws-" + "a" * 32,
+                "workspace_revision_id": "rev-" + "b" * 32,
+                "category": "work_contribution",
+            },
+            request_id=3,
+        )
+    )
+    assert run_script is not None and note is not None and contribution is not None
+    assert len(transport.calls) == 3
+    bodies = [json.loads(cast(bytes, call["body"]).decode("utf-8")) for call in transport.calls]
+    assert all(
+        call["path"]
+        == (
+            f"/api/investigations/{support.INVESTIGATION_ID}"
+            f"/agent-sessions/{support.SESSION_ID}/tool-calls"
+        )
+        for call in transport.calls
+    )
+    assert bodies[0]["tool_name"] == "analysis.run_script"
+    assert bodies[0]["arguments"] == {
+        "script": "print('confined')",
+        "interpreter": "python3",
+    }
+    assert bodies[1]["tool_name"] == "note.capture"
+    assert bodies[1]["arguments"] == {
+        "relpath": "analyse/first.md",
+        "text": "# Note agent\n",
+    }
+    assert bodies[2]["tool_name"] == "contribution.import"
+    assert bodies[2]["arguments"] == {
+        "workspace_id": "ws-" + "a" * 32,
+        "workspace_revision_id": "rev-" + "b" * 32,
+        "category": "work_contribution",
+    }
+
+    for relpath in ("../escape.md", "/absolute.md", "a/./b.md", "a/../b.md", "a\\b.md"):
+        refused = server.handle_message(
+            _tools_call(
+                "autowork_note_capture",
+                {
+                    "investigation_id": support.INVESTIGATION_ID,
+                    "relpath": relpath,
+                    "text": "x",
+                },
+                request_id=4,
+            )
+        )
+        assert refused is not None
+        error = cast(dict[str, object], refused["error"])
+        assert error["code"] == -32602
+        assert cast(dict[str, object], error["data"])["code"] == "invalid_arguments"
+    assert len(transport.calls) == 3
+
+
 SCHEMA_CASES: tuple[tuple[str, dict[str, object], str, str], ...] = (
     (
         "autowork_bridge_consult",

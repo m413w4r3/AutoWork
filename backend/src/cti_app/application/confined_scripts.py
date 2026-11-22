@@ -61,6 +61,8 @@ from cti_app.domain.investigation import (
 CONFINED_SCRIPT_TOOL = "analysis.run_script"
 CONFINED_SCRIPT_CAPABILITY = "analysis.exec"
 CONFINED_SCRIPT_SCHEMA_VERSION = "1"
+_NETWORK_CAPTURE_BUCKET = "network-captures-quarantine"
+_VT_SANDBOX_PCAP_SOURCE_VERSION = "vt-sandbox-pcap.v1"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _SCRIPT_PREVIEW_CHARS = 16_000
@@ -508,6 +510,32 @@ class ConfinedScriptService:
                 assert request.capture_artifact_id is not None
                 blob = await uow.blobs.get(request.capture_artifact_id)
                 if blob is None:
+                    return "script_input_not_associated"
+                # ADR-0011 H3: exactly one *canonical* capture of this
+                # investigation, never an arbitrary blob the caller happens to
+                # know the UUID of.  This mirrors the worker's own pre-dispatch
+                # check (``workers/confined_analysis.py`` capture branch) so an
+                # unassociated or non-capture blob is refused before a job is
+                # queued.
+                if blob.descriptor.logical_bucket != _NETWORK_CAPTURE_BUCKET:
+                    return "script_input_not_associated"
+                observations = await uow.evidence_observations.list_for_investigation(
+                    request.investigation_id
+                )
+                if not any(
+                    observation.blob_id == blob.id
+                    and observation.sha256 == blob.descriptor.sha256
+                    and observation.object_type == "network_capture"
+                    and observation.object_id == blob.descriptor.sha256
+                    and (
+                        observation.source == "network.quarantine"
+                        or (
+                            observation.source == "VirusTotal"
+                            and observation.source_version == _VT_SANDBOX_PCAP_SOURCE_VERSION
+                        )
+                    )
+                    for observation in observations
+                ):
                     return "script_input_not_associated"
                 return (
                     "capture",
