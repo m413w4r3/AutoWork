@@ -31,6 +31,11 @@ jobs:
         working-directory: backend
     steps:
       - uses: actions/checkout@v4
+        with:
+          # test_typst_chp_parity compares the current renderer with the
+          # publication_helpers.typ committed as b421f486; the default
+          # depth-1 clone does not contain that baseline object.
+          fetch-depth: 0
       - name: Install Poppler, TShark and bubblewrap for render and network workbench tests
         run: |
           sudo apt-get update

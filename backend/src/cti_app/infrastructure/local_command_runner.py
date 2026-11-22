@@ -52,6 +52,7 @@ _PRIVATE_KEY_BLOCK = re.compile(
     re.IGNORECASE,
 )
 _DEFAULT_MAX_SAMPLE_BYTES = 200 * 1024 * 1024
+_BWRAP_PASSTHROUGH_ROOTS = (Path("/usr"), Path("/lib"), Path("/lib64"))
 _FAILED_NAMESPACE_LAUNCHERS: set[tuple[str, str]] = set()
 _FAILED_NAMESPACE_LAUNCHER_REASONS: dict[tuple[str, str], NamespaceFailureReason] = {}
 _NAMESPACE_LAUNCHERS_LOCK = threading.Lock()
@@ -758,14 +759,16 @@ def _probe_bwrap_namespace(
             rule_path = directory / "rules.yar"
             rule_path.write_text("rule probe { condition: true }\n", encoding="ascii")
             rule_path.chmod(0o400)
+            interpreter = getattr(sys, "_base_executable", None) or sys.executable
             with _network_seccomp_filter_file() as filter_file:
                 seccomp_fd = filter_file.fileno()
                 command = _bwrap_command(
                     executable,
-                    [getattr(sys, "_base_executable", None) or sys.executable, "-c", probe_program],
+                    [interpreter, "-c", probe_program],
                     sample_path,
                     rule_path,
                     seccomp_fd=seccomp_fd,
+                    extra_binds=_probe_interpreter_binds(interpreter),
                 )
                 result = subprocess.run(
                     command,
@@ -858,6 +861,35 @@ def _probe_namespace(
     return result.returncode == 0
 
 
+def _bwrap_passthrough(path: str | Path) -> bool:
+    """Whether _bwrap_command exposes ``path`` inside its mount set unchanged."""
+    candidate = Path(path)
+    resolved = candidate.resolve()
+    return any(
+        candidate.is_relative_to(root) or resolved.is_relative_to(root)
+        for root in _BWRAP_PASSTHROUGH_ROOTS
+        if root.exists()
+    )
+
+
+def _probe_interpreter_binds(interpreter: str) -> tuple[tuple[str, str], ...]:
+    """Read-only binds that make the bwrap probe interpreter executable.
+
+    The sandbox exposes /usr, /lib and /lib64 only. A venv based on a
+    uv-managed (or otherwise non-system) interpreter lives outside those
+    roots, so bwrap would fail with execvp ENOENT before the probe could
+    measure anything. Bind that interpreter's base prefix read-only for the
+    probe only; the probe still proves host /etc and root are absent.
+    """
+    if _bwrap_passthrough(interpreter):
+        return ()
+    prefix = Path(sys.base_prefix).resolve()
+    if prefix != Path("/") and not _bwrap_passthrough(prefix):
+        return ((str(prefix), str(prefix)),)
+    directory = Path(interpreter).resolve().parent
+    return ((str(directory), str(directory)),)
+
+
 def _bwrap_command(
     executable: str,
     argv: list[str],
@@ -865,6 +897,7 @@ def _bwrap_command(
     rule_path: Path | None,
     *,
     seccomp_fd: int,
+    extra_binds: tuple[tuple[str, str], ...] = (),
 ) -> list[str]:
     command = [
         executable,
@@ -882,6 +915,8 @@ def _bwrap_command(
     for system_path in ("/lib", "/lib64"):
         if Path(system_path).exists():
             command.extend(("--ro-bind", system_path, system_path))
+    for source, target in extra_binds:
+        command.extend(("--ro-bind", source, target))
     command.extend(("--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"))
     command.extend(("--dir", "/analysis", "--ro-bind", str(sample_path), "/analysis/sample.bin"))
     if rule_path is not None:
