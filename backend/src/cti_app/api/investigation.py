@@ -22,9 +22,11 @@ from cti_app.application.advisor_checkpoint import derive_advisor_consult_status
 from cti_app.application.analyst_handoff import (
     AnalystHandoffPolicy,
     AnalystPostSynthesisService,
+    ProseAuthorityConflictError,
     analyst_handoff_policy_from_sources,
     current_verified_extraction_inputs,
     loop_budget_from_settings,
+    require_prose_authority_match,
 )
 from cti_app.application.blob_storage import BlobReadLimitExceededError
 from cti_app.application.bridge_investigator import (
@@ -195,6 +197,9 @@ _SIMILARITY_BUCKET = "investigation-sample-similarity"
 _PROTOCOL_MODEL_BUCKET = "network-protocol-models"
 
 
+CreationProfile = Literal["legacy", "m24_workshop"]
+
+
 class InvestigationStartRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -202,6 +207,7 @@ class InvestigationStartRequest(BaseModel):
     synthesis_artifact_id: UUID
     synthesis_sha256: str = Field(pattern=_SHA256)
     execution_mode: InvestigationExecutionMode | None = None
+    creation_profile: CreationProfile | None = None
 
 
 class InvestigationActionRequest(BaseModel):
@@ -994,8 +1000,16 @@ async def start_investigation(
     uow_factory = _uow_factory(request)
     composition_factory = _composition_factory(request)
     identity = await _identity(request)
+    requested_prose_authority = _requested_prose_authority(payload)
+    try:
+        require_prose_authority_mode(
+            requested_prose_authority,
+            payload.execution_mode or InvestigationExecutionMode.BRIDGE_LED,
+        )
+    except ProseAuthorityModeError as exc:
+        raise _http_error(422, exc.code) from exc
     extraction_artifacts, extraction_items = await _ensure_handoff_if_missing(
-        request, subject_id, payload
+        request, subject_id, payload, prose_authority=requested_prose_authority
     )
     async with uow_factory() as uow:
         run = await uow.production_runs.get(payload.production_run_id)
@@ -1008,12 +1022,16 @@ async def start_investigation(
         investigation = await uow.analyst_investigations.get_for_run(run.id)
         if investigation is None or investigation.synthesis_artifact_id != artifact.id:
             raise _http_error(409, "investigation_handoff_missing")
-        prose_authority = getattr(investigation, "prose_authority", ProseAuthority.LEGACY)
-        if not isinstance(prose_authority, ProseAuthority):
-            prose_authority = ProseAuthority(prose_authority)
+        try:
+            require_prose_authority_match(investigation, requested_prose_authority)
+        except ProseAuthorityConflictError as exc:
+            raise _http_error(409, exc.code, str(exc)) from exc
+        persisted_prose_authority = getattr(investigation, "prose_authority", ProseAuthority.LEGACY)
+        if not isinstance(persisted_prose_authority, ProseAuthority):
+            persisted_prose_authority = ProseAuthority(persisted_prose_authority)
         try:
             require_prose_authority_mode(
-                prose_authority,
+                persisted_prose_authority,
                 payload.execution_mode or InvestigationExecutionMode.BRIDGE_LED,
             )
         except ProseAuthorityModeError as exc:
@@ -1055,6 +1073,7 @@ async def start_investigation(
                 ),
                 envelope=envelope,
                 execution_mode=payload.execution_mode,
+                prose_authority=requested_prose_authority,
                 uow=uow,
             )
             job, replay = await _submit_run_job(
@@ -1090,12 +1109,16 @@ async def _ensure_handoff_if_missing(
     request: Request,
     subject_id: UUID,
     payload: InvestigationStartRequest,
+    *,
+    prose_authority: ProseAuthority,
 ) -> tuple[tuple[ProductionArtifact, ...], tuple[Any, ...]]:
     """Create the canonical post-synthesis handoff before resolving article context.
 
     The article snapshot adapter intentionally requires an existing input pack. The
     HTTP start route is also the entry point that may create that pack, so this
-    model-free bootstrap runs in its own committed transaction first.
+    model-free bootstrap runs in its own committed transaction first. A new
+    investigation is inserted with the requested immutable ``prose_authority``;
+    an existing one must already carry it.
     """
     uow_factory = _uow_factory(request)
     factory = _composition_factory(request)
@@ -1111,6 +1134,10 @@ async def _ensure_handoff_if_missing(
         if existing is not None:
             if existing.synthesis_artifact_id != artifact.id:
                 raise _http_error(409, "investigation_handoff_mismatch")
+            try:
+                require_prose_authority_match(existing, prose_authority)
+            except ProseAuthorityConflictError as exc:
+                raise _http_error(409, exc.code, str(exc)) from exc
             return await current_verified_extraction_inputs(
                 uow=uow,
                 run=run,
@@ -1164,12 +1191,27 @@ async def _ensure_handoff_if_missing(
                 extraction_artifacts=extraction_artifacts,
                 extraction_items=extraction_items,
                 policy=policy,
+                prose_authority=prose_authority,
                 uow=uow,
             )
             await uow.commit()
+        except ProseAuthorityConflictError as exc:
+            raise _http_error(409, exc.code, str(exc)) from exc
         except ValueError as exc:
             raise _http_error(409, "investigation_handoff_conflict", str(exc)) from exc
         return extraction_artifacts, extraction_items
+
+
+def _requested_prose_authority(payload: InvestigationStartRequest) -> ProseAuthority:
+    """Map the explicit creation profile to the immutable prose authority.
+
+    An absent profile preserves the deprecated ``legacy`` behaviour for every
+    existing caller; only ``m24_workshop`` requests an M24 investigation, whose
+    prose authority is then fixed at INSERT (ADR-0011 D4).
+    """
+    if payload.creation_profile == "m24_workshop":
+        return ProseAuthority.BRIDGE_ONLY
+    return ProseAuthority.LEGACY
 
 
 @router.get("/investigations/{investigation_id}", response_model=InvestigationView)
