@@ -26,7 +26,7 @@ from tests.integration.test_workspace_agent_persistence_postgres import (
 
 pytestmark = pytest.mark.integration
 
-CURRENT_HEAD = "0020_investigation_plans"
+CURRENT_HEAD = "0021_investigation_tasks"
 PREVIOUS = "0018_editorial_enrichment_element_operations"
 WORKSPACE_TABLES = {
     "workspace_bindings",

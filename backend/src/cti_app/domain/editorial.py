@@ -34,6 +34,8 @@ class AnalystDecisionType(StrEnum):
     DETECTION_REJECT = "detection_reject"
     PLAN_ACCEPT = "plan_accept"
     PLAN_REJECT = "plan_reject"
+    TASK_RESULT_ACCEPT = "task_result_accept"
+    TASK_RESULT_CHANGES_REQUESTED = "task_result_changes_requested"
 
 
 class AnalystDecisionTargetType(StrEnum):
@@ -46,6 +48,7 @@ class AnalystDecisionTargetType(StrEnum):
     DETECTION = "detection"
     NOTE = "note"
     PLAN_VERSION = "plan_version"
+    TASK = "task"
 
 
 @dataclass(frozen=True, slots=True)

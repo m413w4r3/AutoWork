@@ -75,6 +75,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     invariants,
     investigation,
     investigation_coordination,
+    investigation_tasks,
     jobs,
     model_execution,
     osint_open_policy,
@@ -340,6 +341,22 @@ EXPECTED_TRIGGERS: dict[tuple[str, str], str] = {
         "analyst_investigations",
         "trg_analyst_investigations_prose_authority_immutable",
     ): "reject_analyst_investigation_prose_authority_mutation",
+    (
+        "investigation_task_events",
+        "trg_investigation_task_events_append_only",
+    ): "reject_investigation_task_event_mutation",
+    (
+        "investigation_task_events",
+        "trg_investigation_task_events_no_truncate",
+    ): "reject_investigation_task_event_mutation",
+    (
+        "investigation_task_dependencies",
+        "trg_investigation_task_dependencies_append_only",
+    ): "reject_investigation_task_dependency_mutation",
+    (
+        "investigation_task_dependencies",
+        "trg_investigation_task_dependencies_no_truncate",
+    ): "reject_investigation_task_dependency_mutation",
     ("collection_attempts", "trg_collection_attempts_append_only"): "reject_evidence_mutation",
     ("derived_artifacts", "trg_derived_artifacts_append_only"): "reject_evidence_mutation",
     ("claims", "trg_claims_append_only"): "reject_evidence_mutation",
@@ -1212,7 +1229,7 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     command.upgrade(config, "head")
     command.current(config)
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert _head_revision() == "0020_investigation_plans"
+    assert _head_revision() == "0021_investigation_tasks"
     assert asyncio.run(_alembic_version_column_length(temporary_postgres_url)) == 64
 
     collection_attempt_columns = asyncio.run(
@@ -1580,7 +1597,7 @@ def test_frozen_collection_attempt_baseline_precedes_acquisition_additions(
 
     command.upgrade(config, "head")
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert _head_revision() == "0020_investigation_plans"
+    assert _head_revision() == "0021_investigation_tasks"
     final_schema = asyncio.run(_database_snapshot(temporary_postgres_url))["collection_attempts"]
     table = Base.metadata.tables["collection_attempts"]
     assert final_schema["columns"] == _expected_columns(table)
@@ -1812,6 +1829,9 @@ def test_migration_up_and_down_on_temporary_postgres(temporary_postgres_url: str
             "workspace_sync_cursors",
             "investigation_plans",
             "investigation_plan_versions",
+            "investigation_tasks",
+            "investigation_task_dependencies",
+            "investigation_task_events",
         }
     )
     at_0004 = asyncio.run(_database_snapshot(temporary_postgres_url))

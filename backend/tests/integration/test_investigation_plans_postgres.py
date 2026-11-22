@@ -66,7 +66,7 @@ from tests.integration.edition_codes import reserve_edition_code
 pytestmark = pytest.mark.integration
 
 PREVIOUS = "0019_workspace_bindings"
-HEAD = "0020_investigation_plans"
+HEAD = "0021_investigation_tasks"
 PLAN_TABLES = {"investigation_plans", "investigation_plan_versions"}
 NOW = datetime(2026, 11, 22, 12, 0, tzinfo=UTC)
 SHA_A = "a" * 64
@@ -347,6 +347,14 @@ def test_plan_migration_rejects_a_partial_plan_shape(
         engine = create_postgres_engine(temporary_postgres_url)
         try:
             async with engine.begin() as connection:
+                # 0021 adds investigation_tasks.plan_version_id -> plan versions;
+                # detach it so this 0020 partial-shape fixture can drop the table.
+                await connection.execute(
+                    sa.text(
+                        "ALTER TABLE investigation_tasks "
+                        "DROP CONSTRAINT fk_investigation_tasks_plan_version"
+                    )
+                )
                 await connection.execute(sa.text("DROP TABLE investigation_plan_versions"))
         finally:
             await engine.dispose()
@@ -451,7 +459,10 @@ def test_plan_versions_and_prose_authority_are_immutable_at_head(
                     )
                 await session.rollback()
             async with factory() as session:
-                with pytest.raises(DBAPIError, match="append-only"):
+                # 0021's investigation_tasks.plan_version_id foreign key makes a
+                # bare TRUNCATE fail at the FK check before the append-only
+                # trigger; either way the table cannot be truncated.
+                with pytest.raises(DBAPIError, match=r"append-only|cannot truncate"):
                     await session.execute(sa.text("TRUNCATE investigation_plan_versions"))
                 await session.rollback()
             async with factory() as session:

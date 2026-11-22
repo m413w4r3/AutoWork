@@ -24,6 +24,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     invariants,
     investigation,
     investigation_coordination,
+    investigation_tasks,
     jobs,
     media_assets,
     model_execution,
@@ -93,6 +94,17 @@ _WORKSPACE_TABLES = frozenset(
     }
 )
 _INVESTIGATION_PLAN_TABLES = frozenset({"investigation_plans", "investigation_plan_versions"})
+_INVESTIGATION_TASK_TABLES = frozenset(
+    {
+        "investigation_tasks",
+        "investigation_task_dependencies",
+        "investigation_task_events",
+    }
+)
+_TOOL_INVOCATION_ATTRIBUTION_COLUMNS = frozenset({"task_id", "actor_kind", "actor_id"})
+_TOOL_INVOCATION_ATTRIBUTION_CHECKS = frozenset(
+    {"ck_tool_invocations_actor_kind", "ck_tool_invocations_actor_pair"}
+)
 _PROSE_AUTHORITY_COLUMN = "prose_authority"
 _PROSE_AUTHORITY_CHECK = "ck_analyst_investigation_prose_authority"
 _BASELINE_DECISION_TYPE_VALUES = (
@@ -155,6 +167,7 @@ def _metadata_for_frozen_baseline() -> MetaData:
             or source_table.name in _EDITORIAL_DRAFT_TABLES
             or source_table.name in _WORKSPACE_TABLES
             or source_table.name in _INVESTIGATION_PLAN_TABLES
+            or source_table.name in _INVESTIGATION_TASK_TABLES
         ):
             continue
         table = source_table.to_metadata(metadata)
@@ -270,6 +283,25 @@ def _metadata_for_frozen_baseline() -> MetaData:
                     table.constraints.discard(constraint)
             if _PROSE_AUTHORITY_COLUMN in table.c:
                 table._columns.remove(table.c[_PROSE_AUTHORITY_COLUMN])
+        if table.name == "tool_invocations":
+            # 0021 adds execution attribution; the frozen 0001 shape predates it.
+            for constraint in tuple(table.constraints):
+                if constraint.name in _TOOL_INVOCATION_ATTRIBUTION_CHECKS or any(
+                    column.name in _TOOL_INVOCATION_ATTRIBUTION_COLUMNS
+                    for column in getattr(constraint, "columns", ())
+                ):
+                    table.constraints.discard(constraint)
+            for foreign_key in tuple(table.foreign_keys):
+                if (
+                    foreign_key.parent is not None
+                    and foreign_key.parent.name in _TOOL_INVOCATION_ATTRIBUTION_COLUMNS
+                ):
+                    table.foreign_keys.discard(foreign_key)
+                    if foreign_key.constraint is not None:
+                        table.constraints.discard(foreign_key.constraint)
+            for column_name in _TOOL_INVOCATION_ATTRIBUTION_COLUMNS:
+                if column_name in table.c:
+                    table._columns.remove(table.c[column_name])
         if table.name == "analyst_decisions":
             for constraint in tuple(table.constraints):
                 if constraint.name == "ck_analyst_decisions_type":

@@ -529,17 +529,34 @@ def _decision_check_values(
 
 
 def _decision_mismatches(inspector: sa.Inspector, *, expected: str) -> list[str]:
+    """Compare the decision CHECK sets with the expected revision state.
+
+    A later additive revision (0021 adds the task decision surface) may extend
+    these CHECK sets: an already-conforming, newer shape must still be accepted
+    without DDL, so the "new" form is a required subset.  The pre-0020 form is
+    compared exactly because downgrades restore it verbatim.
+    """
     mismatches: list[str] = []
     expected_decisions = _NEW_DECISION_SET if expected == "new" else _OLD_DECISION_SET
     expected_targets = _NEW_TARGET_SET if expected == "new" else _OLD_TARGET_SET
     observed_decisions = _decision_check_values(inspector, _DECISION_TYPE_CHECK, target=False)
     observed_targets = _decision_check_values(inspector, _DECISION_TARGET_CHECK, target=True)
-    if observed_decisions != expected_decisions:
+    decisions_match = (
+        observed_decisions is not None and expected_decisions <= observed_decisions
+        if expected == "new"
+        else observed_decisions == expected_decisions
+    )
+    targets_match = (
+        observed_targets is not None and expected_targets <= observed_targets
+        if expected == "new"
+        else observed_targets == expected_targets
+    )
+    if not decisions_match:
         mismatches.append(
             f"constraint {_DECISION_TYPE_CHECK}: expected {sorted(expected_decisions)}, "
             f"actual {sorted(observed_decisions) if observed_decisions else observed_decisions}"
         )
-    if observed_targets != expected_targets:
+    if not targets_match:
         mismatches.append(
             f"constraint {_DECISION_TARGET_CHECK}: expected {sorted(expected_targets)}, "
             f"actual {sorted(observed_targets) if observed_targets else observed_targets}"

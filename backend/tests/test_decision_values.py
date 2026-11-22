@@ -28,11 +28,13 @@ def test_enums_and_sql_values_aligned() -> None:
     assert decision_types == {item.value for item in AnalystDecisionType}
     assert target_types == {item.value for item in AnalystDecisionTargetType}
 
-    # 0020 adds exactly the plan decision surface; 0021 will add the task one.
+    # 0020 adds the plan decision surface; 0021 adds the task one.
     assert {"plan_accept", "plan_reject"} <= decision_types
     assert "plan_version" in target_types
-    assert len(decision_types) == 12
-    assert len(target_types) == 9
+    assert {"task_result_accept", "task_result_changes_requested"} <= decision_types
+    assert "task" in target_types
+    assert len(decision_types) == 14
+    assert len(target_types) == 10
 
     # Existing values are preserved: M24 is additive for legacy decisions.
     assert {

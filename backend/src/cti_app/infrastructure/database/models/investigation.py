@@ -27,6 +27,7 @@ TOOL_INVOCATION_STATUS_VALUES_SQL = (
     "'pending', 'running', 'succeeded', 'empty', 'unavailable', 'policy_denied', "
     "'needs_review', 'failed', 'partial'"
 )
+TOOL_INVOCATION_ACTOR_KIND_VALUES_SQL = "'human', 'operator'"
 EVIDENCE_KIND_VALUES_SQL = (
     "'vt_file_report', 'vt_relationship', 'vt_behaviour', 'shodan_observation', "
     "'binary_analysis', 'binary_string', 'yara_match', 'negative_result', 'claim_source', 'other'"
@@ -78,6 +79,14 @@ class ToolInvocationRow(Base):
             "jsonb_typeof(response_refs) = 'array'",
             name="ck_tool_invocations_response_refs_array",
         ),
+        CheckConstraint(
+            f"actor_kind IN ({TOOL_INVOCATION_ACTOR_KIND_VALUES_SQL})",
+            name="ck_tool_invocations_actor_kind",
+        ),
+        CheckConstraint(
+            "(actor_kind IS NULL) = (actor_id IS NULL)",
+            name="ck_tool_invocations_actor_pair",
+        ),
         Index("ix_tool_invocations_investigation", "investigation_id", "created_at", "id"),
         Index("ix_tool_invocations_status", "status", "updated_at"),
     )
@@ -94,6 +103,17 @@ class ToolInvocationRow(Base):
     normalized_parameters: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     passive_read_retry_trusted: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     purpose: Mapped[str] = mapped_column(Text, nullable=False)
+    task_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey(
+            "investigation_tasks.id",
+            name="fk_tool_invocations_task",
+            ondelete="RESTRICT",
+        ),
+        nullable=True,
+    )
+    actor_kind: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    actor_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     reserved_budget: Mapped[dict[str, int]] = mapped_column(JSONB, nullable=False)
     consumed_budget: Mapped[dict[str, int]] = mapped_column(JSONB, nullable=False)

@@ -27,6 +27,19 @@ class ToolInvocationStatus(StrEnum):
     PARTIAL = "partial"
 
 
+class ToolInvocationActorKind(StrEnum):
+    """Execution attribution accepted on a tool invocation (ADR-0011 E4).
+
+    ``system`` is a task actor but never an invocation author: system work
+    (sweeps, dependency promotion) writes task events, not tool calls.  Bridge
+    is not an actor either; its consultations are attributed to the human or
+    operator that requested them.
+    """
+
+    HUMAN = "human"
+    OPERATOR = "operator"
+
+
 class InvocationReconciliationOutcome(StrEnum):
     EXECUTED_WITH_RESULT = "executed_with_result"
     EXECUTED_EMPTY_RESPONSE = "executed_empty_response"
@@ -482,6 +495,9 @@ class ToolInvocation:
     consumed_budget: Mapping[BudgetDimension, int] = field(default_factory=dict)
     passive_read_retry_trusted: bool | None = None
     response_refs: tuple[UUID, ...] = ()
+    task_id: UUID | None = None
+    actor_kind: ToolInvocationActorKind | None = None
+    actor_id: str | None = None
     id: UUID = field(default_factory=uuid4)
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -507,6 +523,16 @@ class ToolInvocation:
         object.__setattr__(self, "normalized_parameters", freeze_json(self.normalized_parameters))
         object.__setattr__(self, "reserved_budget", _budget_values(self.reserved_budget))
         object.__setattr__(self, "consumed_budget", _budget_values(self.consumed_budget))
+        if self.task_id is not None and not isinstance(self.task_id, UUID):
+            raise TypeError("task_id must be a UUID or None")
+        if self.actor_kind is not None and not isinstance(self.actor_kind, ToolInvocationActorKind):
+            raise TypeError("actor_kind must use ToolInvocationActorKind")
+        if (self.actor_kind is None) != (self.actor_id is None):
+            raise ValueError("invocation attribution requires both actor_kind and actor_id")
+        if self.actor_id is not None and (
+            not isinstance(self.actor_id, str) or not self.actor_id.strip()
+        ):
+            raise ValueError("actor_id must not be empty")
         if self.version < 1:
             raise ValueError("version must be >= 1")
         _aware(self.created_at, "created_at")
