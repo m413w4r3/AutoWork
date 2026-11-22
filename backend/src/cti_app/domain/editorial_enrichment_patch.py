@@ -172,6 +172,10 @@ class ReplaceSourceFigurePatch:
         _caption(self.caption)
 
     @property
+    def element_kind(self) -> EditorialEnrichmentElementKind:
+        return EditorialEnrichmentElementKind.FIGURE
+
+    @property
     def operation(self) -> TargetedEditorialRevisionOperation:
         return TargetedEditorialRevisionOperation.REPLACE_SOURCE_FIGURE
 
@@ -223,13 +227,18 @@ VISUAL_REVISION_OPERATIONS: frozenset[TargetedEditorialRevisionOperation] = froz
     }
 )
 
-# Operations implemented by this slice; the others reject explicitly until
-# F2-03b/F2-03c replace their placeholder branch.
+# Operations whose apply logic is implemented; chart/diagram revision still
+# rejects explicitly until F2-03b replaces its placeholder branch.
 IMPLEMENTED_VISUAL_REVISION_OPERATIONS: frozenset[TargetedEditorialRevisionOperation] = frozenset(
     {
         TargetedEditorialRevisionOperation.UPDATE_VISUAL_CAPTION,
         TargetedEditorialRevisionOperation.MOVE_ENRICHMENT_ELEMENT,
         TargetedEditorialRevisionOperation.REORDER_ENRICHMENT_ELEMENTS,
+        TargetedEditorialRevisionOperation.REPLACE_SOURCE_FIGURE,
+        TargetedEditorialRevisionOperation.DELETE_TABLE,
+        TargetedEditorialRevisionOperation.DELETE_DIAGRAM,
+        TargetedEditorialRevisionOperation.DELETE_CHART,
+        TargetedEditorialRevisionOperation.DELETE_SOURCE_FIGURE,
     }
 )
 
@@ -288,6 +297,19 @@ def visual_patch_to_json(patch: VisualRevisionPatch) -> dict[str, Any]:
             "anchor_block_id": str(patch.anchor_block_id),
             "order": [{"kind": item.kind.value, "key": item.key} for item in patch.order],
         }
+    if isinstance(patch, ReplaceSourceFigurePatch):
+        return {
+            "kind": "replace_source_figure",
+            "element_key": patch.element_key,
+            "figure_id": str(patch.figure_id),
+            "caption": patch.caption,
+        }
+    if isinstance(patch, RemoveEnrichmentElementPatch):
+        return {
+            "kind": "remove_enrichment_element",
+            "element_kind": patch.element_kind.value,
+            "element_key": patch.element_key,
+        }
     raise NotImplementedForSlice(
         f"{type(patch).__name__} persistence is implemented by a later M23 slice"
     )
@@ -328,6 +350,17 @@ def visual_patch_from_json(raw: Any) -> VisualRevisionPatch:
                     )
                     for item in raw_order
                 ),
+            )
+        if kind == "replace_source_figure":
+            return ReplaceSourceFigurePatch(
+                element_key=str(raw["element_key"]),
+                figure_id=UUID(str(raw["figure_id"])),
+                caption=(str(raw["caption"]) if raw.get("caption") is not None else None),
+            )
+        if kind == "remove_enrichment_element":
+            return RemoveEnrichmentElementPatch(
+                element_kind=EditorialEnrichmentElementKind(str(raw["element_kind"])),
+                element_key=str(raw["element_key"]),
             )
     except (KeyError, TypeError, ValueError) as exc:
         raise EditorialEnrichmentPatchError(f"Visual revision patch is invalid: {exc}") from None

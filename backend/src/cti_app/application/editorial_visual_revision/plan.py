@@ -14,7 +14,9 @@ from cti_app.domain.editorial_enrichment_patch import (
 )
 
 from .context import VisualRevisionContext, VisualRevisionPlan, VisualRevisionRejected
+from .figure_ops import plan_replace_source_figure
 from .placement_ops import plan_caption_update, plan_move, plan_reorder
+from .remove_ops import plan_remove_enrichment_element
 
 
 def plan_visual_revision(
@@ -36,18 +38,14 @@ def plan_visual_revision(
         return plan_move(ctx, patch)
     if isinstance(patch, ReorderEnrichmentElementsPatch):
         return plan_reorder(ctx, patch)
-    if isinstance(
-        patch,
-        (
-            ReviseChartPatch,
-            ReviseDiagramPatch,
-            ReplaceSourceFigurePatch,
-            RemoveEnrichmentElementPatch,
-        ),
-    ):
+    if isinstance(patch, ReplaceSourceFigurePatch):
+        return plan_replace_source_figure(ctx, patch)
+    if isinstance(patch, RemoveEnrichmentElementPatch):
+        return plan_remove_enrichment_element(ctx, patch)
+    if isinstance(patch, (ReviseChartPatch, ReviseDiagramPatch)):
         raise VisualRevisionRejected(
             "enrichment_revision_unsupported_operation",
-            {"variant": type(patch).__name__, "slice": "F2-03b/F2-03c"},
+            {"variant": type(patch).__name__, "slice": "F2-03b"},
         )
     raise VisualRevisionRejected(
         "enrichment_revision_patch_invalid",

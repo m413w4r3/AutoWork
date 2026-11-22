@@ -79,7 +79,9 @@ from cti_app.domain.editorial_enrichment_patch import (
     IMPLEMENTED_VISUAL_REVISION_OPERATIONS,
     EditorialEnrichmentPatchError,
     MoveEnrichmentElementPatch,
+    RemoveEnrichmentElementPatch,
     ReorderEnrichmentElementsPatch,
+    ReplaceSourceFigurePatch,
     UnsupportedEnrichmentRevisionOperation,
     UpdateVisualCaptionPatch,
     enrichment_order_group_hash,
@@ -148,6 +150,7 @@ class _PreparedInputs:
     stage: ProductionArtifactStage
     base_enrichment: EditorialEnrichmentV1 | None = None
     synthesis: Any | None = None
+    planned_visual_enrichment: EditorialEnrichmentV1 | None = None
 
 
 _ACTIVE_SOURCE_STATES = frozenset(
@@ -755,6 +758,7 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                     stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
                     base_enrichment=base_enrichment,
                     synthesis=synthesis,
+                    planned_visual_enrichment=return_inputs.revised_enrichment,
                 )
                 return return_inputs
             if (
@@ -1065,7 +1069,15 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
         validate_targeted_request(request)
         entry = resolution.entry
         if target.kind is TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT:
-            if not isinstance(typed_patch, (UpdateVisualCaptionPatch, MoveEnrichmentElementPatch)):
+            if not isinstance(
+                typed_patch,
+                (
+                    UpdateVisualCaptionPatch,
+                    MoveEnrichmentElementPatch,
+                    ReplaceSourceFigurePatch,
+                    RemoveEnrichmentElementPatch,
+                ),
+            ):
                 raise EditorialProposalAdoptionError("proposal_target_mismatch")
             if (
                 target.element_kind is not typed_patch.element_kind
@@ -1123,6 +1135,8 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
             synthesis=synthesis,
             figure_catalog=tuple(fence.figure_catalog),
             registered_anchor_ids=fence.evidence_pack.registered_anchor_ids,
+            production_run_id=proposal.production_run_id,
+            publication_kind=resolution.record.publication_kind,
         )
         try:
             plan = plan_visual_revision(context, typed_patch)
@@ -1386,6 +1400,83 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
                 raise
             except (EditorialFigureCatalogError, EditorialEnrichmentValidationError, ValueError):
                 raise EditorialProposalAdoptionError("editorial_figure_not_eligible") from None
+        if getattr(proposal, "operation", None) == (
+            TargetedEditorialRevisionOperation.REPLACE_SOURCE_FIGURE.value
+        ):
+            await self._revalidate_figure_replacement(
+                uow, proposal, patch, prepared=prepared, record=record
+            )
+
+    async def _revalidate_figure_replacement(
+        self,
+        uow: Any,
+        proposal: EditorialProposal,
+        patch: Mapping[str, Any],
+        *,
+        prepared: _PreparedInputs,
+        record: Any,
+    ) -> None:
+        """Re-resolve the replacement figure from a fresh archive read under the lock.
+
+        The candidate was planned from a fence read before the run guard. A
+        figure revoked or changed in between must refuse here, before the
+        caller's UOW commits any canonical write; the artifact CAS alone cannot
+        observe source-archive changes.
+        """
+        if prepared.stage is not ProductionArtifactStage.EDITORIAL_ENRICHMENT:
+            raise EditorialProposalAdoptionError("proposal_target_mismatch")
+        if (
+            prepared.base_enrichment is None
+            or prepared.synthesis is None
+            or prepared.planned_visual_enrichment is None
+            or not isinstance(prepared.evidence_pack, EditorialEnrichmentEvidencePackV1)
+        ):
+            raise EditorialProposalAdoptionError("proposal_base_unavailable")
+        try:
+            typed_patch = visual_patch_from_json(patch.get("visual_patch"))
+        except EditorialEnrichmentPatchError:
+            raise EditorialProposalAdoptionError("proposal_patch_invalid") from None
+        if not isinstance(typed_patch, ReplaceSourceFigurePatch):
+            raise EditorialProposalAdoptionError("proposal_patch_invalid")
+        try:
+            source_media_archiver = (
+                self._enrichment_revision_service._enrichment._source_media_archiver
+            )
+            if source_media_archiver is not None:
+                from cti_app.application.production_enrichment_revision import (
+                    _StoredSourceMediaArchiver,
+                )
+
+                source_media_archiver = _StoredSourceMediaArchiver(
+                    self._uow_factory, source_media_archiver
+                )
+            inventory = await load_archived_source_figure_inventory(
+                subject_id=proposal.subject_id,
+                extraction_sources=prepared.extraction.sources,
+                source_document_repository=uow.source_documents,
+                blob_repository=uow.blobs,
+                artifact_store=self._enrichment_revision_service._enrichment._artifact_store,
+                media_archiver=source_media_archiver,
+            )
+            current_catalog = build_editorial_figure_catalog(prepared.extraction, inventory)
+        except (EditorialFigureCatalogError, ValueError):
+            raise EditorialProposalAdoptionError("figure_catalog_unavailable") from None
+        context = VisualRevisionContext(
+            base_enrichment=prepared.base_enrichment,
+            evidence_pack=prepared.evidence_pack,
+            extraction=prepared.extraction,
+            synthesis=prepared.synthesis,
+            figure_catalog=current_catalog,
+            registered_anchor_ids=prepared.evidence_pack.registered_anchor_ids,
+            production_run_id=proposal.production_run_id,
+            publication_kind=record.publication_kind,
+        )
+        try:
+            replanned = plan_visual_revision(context, typed_patch)
+        except VisualRevisionRejected as error:
+            raise EditorialProposalAdoptionError(error.code) from None
+        if replanned.revised_enrichment != prepared.planned_visual_enrichment:
+            raise EditorialProposalAdoptionError("editorial_figure_not_eligible")
 
     async def _load_base_context(
         self,

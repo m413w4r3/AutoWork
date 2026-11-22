@@ -19,6 +19,7 @@ from cti_app.domain.production_editorial_enrichment import (
 )
 from cti_app.domain.production_extraction import ProductionExtractionV1
 from cti_app.domain.production_synthesis import ProductionSynthesisV1
+from cti_app.domain.publication_kind import PublicationKind
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +32,11 @@ class VisualRevisionContext:
     synthesis: ProductionSynthesisV1
     figure_catalog: tuple[EditorialFigureCatalogEntry, ...] = ()
     registered_anchor_ids: frozenset[UUID] | None = None
+    # Run-scoped catalogue identity and the explicit publication kind are
+    # required by figure replacement: opaque handles are derived from
+    # ``(subject, run, figure)`` and the BRIEF ceiling depends on the kind.
+    production_run_id: UUID | None = None
+    publication_kind: PublicationKind | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.base_enrichment, EditorialEnrichmentV1):
@@ -52,6 +58,12 @@ class VisualRevisionContext:
             or any(not isinstance(anchor_id, UUID) for anchor_id in self.registered_anchor_ids)
         ):
             raise ValueError("Visual revision registered anchors are invalid")
+        if self.production_run_id is not None and not isinstance(self.production_run_id, UUID):
+            raise ValueError("Visual revision production run identity is invalid")
+        if self.publication_kind is not None and not isinstance(
+            self.publication_kind, PublicationKind
+        ):
+            raise ValueError("Visual revision publication kind is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +123,12 @@ VISUAL_REVISION_ERROR_CODES: frozenset[str] = frozenset(
         "enrichment_revision_unsupported_operation",
         "editorial_caption_text_violation",
         "editorial_anchor_stale",
+        "editorial_figure_not_found",
+        "editorial_figure_not_eligible",
+        "editorial_figure_not_changed",
+        "brief_figure_limit_exceeded",
+        "source_figure_inventory_limit_exceeded",
+        "figure_catalog_unavailable",
         "proposal_base_stale",
         "proposal_base_unavailable",
         "editorial_read_only",

@@ -561,12 +561,6 @@ def test_unimplemented_slice_variants_reject_explicitly() -> None:
     variants = (
         ReviseChartPatch(element_key="chart_one", chart=replace(chart, key="chart_one")),
         ReviseDiagramPatch(element_key="diagram_one", diagram=replace(diagram, key="diagram_one")),
-        ReplaceSourceFigurePatch(
-            element_key="figure_one", figure_id=UUID("44444444-4444-4444-8444-444444444444")
-        ),
-        RemoveEnrichmentElementPatch(
-            element_kind=EditorialEnrichmentElementKind.TABLE, element_key="table_one"
-        ),
     )
     for variant in variants:
         with pytest.raises(VisualRevisionRejected) as exc_info:
@@ -592,7 +586,13 @@ def test_patch_codec_round_trips_implemented_variants_and_rejects_the_rest() -> 
             EnrichmentElementRef(EditorialEnrichmentElementKind.TABLE, "table_one"),
         ),
     )
-    for patch in (caption, move, reorder):
+    replace_figure = ReplaceSourceFigurePatch(
+        element_key="figure_one", figure_id=UUID("44444444-4444-4444-8444-444444444444")
+    )
+    remove_element = RemoveEnrichmentElementPatch(
+        element_kind=EditorialEnrichmentElementKind.TABLE, element_key="table_one"
+    )
+    for patch in (caption, move, reorder, replace_figure, remove_element):
         assert visual_patch_from_json(visual_patch_to_json(patch)) == patch
     with pytest.raises(NotImplementedForSlice):
         visual_patch_to_json(ReviseChartPatch(element_key="chart_one", chart=_timeline_chart()))

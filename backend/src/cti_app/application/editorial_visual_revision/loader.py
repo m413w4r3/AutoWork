@@ -225,6 +225,8 @@ class VisualRevisionContextLoader:
             synthesis=synthesis,
             figure_catalog=tuple(fence.figure_catalog),
             registered_anchor_ids=fence.evidence_pack.registered_anchor_ids,
+            production_run_id=record.production_run_id,
+            publication_kind=record.publication_kind,
         )
         return VisualRevisionPreparation(
             context=context,

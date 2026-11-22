@@ -90,7 +90,9 @@ from cti_app.domain.editorial_enrichment_patch import (
     IMPLEMENTED_VISUAL_REVISION_OPERATIONS,
     VISUAL_REVISION_PATCH_SCHEMA_VERSION,
     MoveEnrichmentElementPatch,
+    RemoveEnrichmentElementPatch,
     ReorderEnrichmentElementsPatch,
+    ReplaceSourceFigurePatch,
     UpdateVisualCaptionPatch,
     VisualRevisionPatch,
     visual_patch_to_json,
@@ -1570,7 +1572,15 @@ class EditorialProposalService:
             target = resolved.target
             before_hash = resolved.before_hash
         else:
-            if not isinstance(patch, (UpdateVisualCaptionPatch, MoveEnrichmentElementPatch)):
+            if not isinstance(
+                patch,
+                (
+                    UpdateVisualCaptionPatch,
+                    MoveEnrichmentElementPatch,
+                    ReplaceSourceFigurePatch,
+                    RemoveEnrichmentElementPatch,
+                ),
+            ):
                 raise _visual_revision_failure(
                     VisualRevisionRejected(
                         "enrichment_revision_unsupported_operation",
