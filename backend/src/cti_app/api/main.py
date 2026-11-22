@@ -41,6 +41,7 @@ from cti_app.api.selection import selection_router
 from cti_app.api.subject_content import router as subject_content_router
 from cti_app.api.subjects import router as subjects_router
 from cti_app.api.typst_input_inspection import router as typst_input_inspection_router
+from cti_app.api.workspace_agent import router as workspace_agent_router
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.collection_review import CollectionReviewService
 from cti_app.application.diagnostics import DiagnosticsLog
@@ -790,6 +791,7 @@ def create_app() -> FastAPI:
     application.include_router(subject_content_router)
     application.include_router(detection_router)
     application.include_router(analyst_opinion_router)
+    application.include_router(workspace_agent_router)
     return application
 
 
