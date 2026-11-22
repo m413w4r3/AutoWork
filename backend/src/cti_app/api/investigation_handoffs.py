@@ -3,14 +3,11 @@
 The orchestrator owns ``api/main.py``; this module only exports ``router`` and
 never registers itself.
 
-Actor seam: D8 admits a verified human and, later, the *owning operator* of a
-task.  Session signature verification arrives with lot 05B1, so every route
-here currently accepts only a verified human actor.  A caller presenting the
-shared ``OPERATOR_CLIENT`` token is refused with the typed, documented code
-``operator_session_required`` instead of being silently admitted: 05B1 replaces
-that refusal with its D7 session gate.  The service already enforces the
-owning-operator rule for handoff creation, so wiring the session actor later
-does not widen this route.
+Actor seam: D8 admits a verified human and the *owning operator* of a task.
+An operator request is authenticated only by the D7 session signature (lot
+05B2 reconciliation of the 05B1 gate); the shared ``OPERATOR_CLIENT`` token
+alone is refused with the typed ``403 agent_session_required``.  The service
+still enforces the owning-operator rule for handoff creation.
 """
 
 from __future__ import annotations
@@ -21,13 +18,14 @@ from uuid import UUID
 
 from fastapi import APIRouter, Header, HTTPException, Request
 
+from cti_app.api.agentic_tools import require_signed_agent_session
 from cti_app.api.investigation import (
     _http_error,
     _identity,
     _require_verified_human_operator,
     _uow_factory,
 )
-from cti_app.application.identity import Identity, IdentityScope
+from cti_app.application.identity import IdentityScope
 from cti_app.application.investigation_handoffs import (
     HandoffCreateRequest,
     HandoffError,
@@ -53,21 +51,34 @@ def _handoff_http_error(exc: HandoffError) -> HTTPException:
     )
 
 
-async def _require_handoff_actor(request: Request) -> Identity:
-    """Verified human now; 05B1 replaces the operator refusal with D7 auth."""
+async def _handoff_actor(
+    request: Request,
+    investigation_id: UUID,
+    *,
+    task_id: UUID | None = None,
+    require_current_lease: bool = False,
+) -> HandoffActor:
+    """Verified human, or the D7-signed owning operator of the task."""
+    if request.headers.get("x-autowork-agent-session"):
+        verified = await require_signed_agent_session(
+            request,
+            investigation_id=investigation_id,
+            task_id=task_id,
+            require_current_lease=require_current_lease,
+        )
+        return HandoffActor(kind=HandoffActorKind.OPERATOR, actor_id=verified.operator_id)
     identity = await _identity(request)
-    if identity.has_scope(IdentityScope.OPERATOR_CLIENT) or not identity.has_scope(
-        IdentityScope.HUMAN_OPERATOR
-    ):
-        raise _http_error(403, "operator_session_required")
-    return cast(Identity, await _require_verified_human_operator(request))
+    if identity.has_scope(IdentityScope.OPERATOR_CLIENT):
+        raise _http_error(403, "agent_session_required")
+    verified_human = await _require_verified_human_operator(request)
+    return HandoffActor(kind=HandoffActorKind.HUMAN, actor_id=verified_human.actor_id)
 
 
 @router.get("/{investigation_id}/handoffs")
 async def list_handoffs(
     investigation_id: UUID, request: Request, task_id: UUID | None = None
 ) -> list[dict[str, Any]]:
-    await _require_handoff_actor(request)
+    await _handoff_actor(request, investigation_id)
     try:
         records = await _service(request).list(investigation_id, task_id=task_id)
     except HandoffError as exc:
@@ -82,8 +93,12 @@ async def create_handoff(
     request: Request,
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=255)],
 ) -> dict[str, Any]:
-    identity = await _require_handoff_actor(request)
-    actor = HandoffActor(kind=HandoffActorKind.HUMAN, actor_id=identity.actor_id)
+    actor = await _handoff_actor(
+        request,
+        investigation_id,
+        task_id=body.task_id,
+        require_current_lease=True,
+    )
     try:
         record = await _service(request).create(
             investigation_id,
@@ -98,7 +113,7 @@ async def create_handoff(
 
 @router.get("/{investigation_id}/handoffs/{handoff_id}")
 async def get_handoff(investigation_id: UUID, handoff_id: UUID, request: Request) -> dict[str, Any]:
-    await _require_handoff_actor(request)
+    await _handoff_actor(request, investigation_id)
     try:
         record = await _service(request).get(investigation_id, handoff_id)
     except HandoffError as exc:
@@ -110,7 +125,7 @@ async def get_handoff(investigation_id: UUID, handoff_id: UUID, request: Request
 async def get_handoff_freshness(
     investigation_id: UUID, handoff_id: UUID, request: Request
 ) -> dict[str, Any]:
-    await _require_handoff_actor(request)
+    await _handoff_actor(request, investigation_id)
     try:
         report = await _service(request).freshness(investigation_id, handoff_id)
     except HandoffError as exc:

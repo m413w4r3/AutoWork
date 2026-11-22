@@ -1836,11 +1836,20 @@ async def invoke_investigation_operator_tool(
     request: Request,
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=255)],
 ) -> OperatorToolInvocationApiResponseV1:
-    identity = await _require_operator_client(request)
     async with _uow_factory(request)() as uow:
         investigation = await uow.analyst_investigations.get(investigation_id)
         if investigation is None:
             raise _http_error(404, "investigation_not_found")
+        identity = await _require_operator_client(
+            request,
+            bridge_only_investigation_id=(
+                investigation_id
+                # In-memory test repositories may omit the field; absence is
+                # the legacy authority, exactly like a pre-M24 row.
+                if getattr(investigation, "prose_authority", None) is ProseAuthority.BRIDGE_ONLY
+                else None
+            ),
+        )
         composition = _composition_factory(request).build(uow, investigation_id, operator_mode=True)
         try:
             result = await composition.operator_tool_invocations.invoke(
@@ -4583,10 +4592,28 @@ async def _identity(request: Request) -> Any:
     return await provider.current()
 
 
-async def _require_operator_client(request: Request) -> Any:
+async def _require_operator_client(
+    request: Request, *, bridge_only_investigation_id: UUID | None = None
+) -> Any:
+    """The shared operator-token scope, plus the D7 gate on bridge_only.
+
+    ADR-0011 D7/E8: on a ``bridge_only`` investigation the shared
+    ``OPERATOR_CLIENT`` token alone cannot call the legacy operator tool route;
+    a verified per-session signature is required.  Legacy investigations keep
+    their historical behaviour.  The import is local to avoid a module cycle
+    (``api.agentic_tools`` imports this module's helpers).
+    """
     identity = await _identity(request)
     if not identity.has_scope(IdentityScope.OPERATOR_CLIENT):
         raise _http_error(403, "operator_client_scope_required")
+    if bridge_only_investigation_id is not None:
+        from cti_app.api.agentic_tools import require_signed_agent_session
+
+        await require_signed_agent_session(
+            request,
+            investigation_id=bridge_only_investigation_id,
+            require_current_lease=True,
+        )
     return identity
 
 
