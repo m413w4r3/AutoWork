@@ -1068,6 +1068,42 @@ test("E20 — déplacement depuis l’onglet Visuels: panneau inspecteur, ancrag
   expect(captures.unexpected).toEqual([]);
 });
 
+test("E21 — fermer le remplacement ou le déplacement rend le focus au contrôle d’origine", async ({
+  page,
+}) => {
+  await installRoutes(page, {
+    kind: "article",
+    withIntegratedFigure: true,
+  });
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.goto(`/subjects/${subjectId}/editor`);
+  await page
+    .locator(`.editorial-document__block[data-block-id="${figureBlockId}"]`)
+    .click();
+  await page.getByRole("tab", { name: "Visuels" }).click();
+  const figureItem = page.locator(
+    '.editorial-visuals__item[data-kind="figure"]',
+  );
+
+  const replaceButton = figureItem.getByRole("button", { name: "Remplacer" });
+  await replaceButton.click();
+  const dialog = page.getByRole("dialog", {
+    name: "Remplacer l’image intégrée",
+  });
+  await expect(dialog).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+  await expect(replaceButton).toBeFocused();
+
+  const moveButton = figureItem.getByRole("button", { name: "Déplacer" });
+  await moveButton.click();
+  const panel = page.getByRole("region", { name: "Déplacer le visuel" });
+  await expect(panel).toBeVisible();
+  await panel.getByRole("button", { name: "Annuler" }).click();
+  await expect(panel).toHaveCount(0);
+  await expect(moveButton).toBeFocused();
+});
+
 test("F3-C — captures desktop de l’atelier connecté (1024, 1280, 1440, 1920)", async ({
   page,
 }) => {
