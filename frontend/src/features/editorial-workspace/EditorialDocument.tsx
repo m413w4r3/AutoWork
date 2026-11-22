@@ -10,6 +10,10 @@ import {
 import { BLOCK_KIND_LABELS } from "./blockKindLabels";
 import { InlineTextEditor } from "./InlineTextEditor";
 import type { InlineTextEditorProps } from "./InlineTextEditor";
+import {
+  INSERTION_OPERATIONS,
+  supportsInsertionAfter,
+} from "./insertionOperations";
 import { ManualBarChartPreview } from "./ManualBarChartPreview";
 import { manualEditOperationFor } from "./manualEditOperation";
 import { VisualInsertionComposer } from "./VisualInsertionComposer";
@@ -94,13 +98,6 @@ interface EditorialDocumentProps {
   onRefresh?: () => void;
 }
 
-const INSERTION_OPERATIONS = [
-  "insert_after",
-  "create_table",
-  "create_bar_chart",
-  "create_source_figure",
-];
-
 function blockLabel(block: EditorialWorkspaceBlock): string {
   const text = block.text?.trim();
   const excerpt =
@@ -147,8 +144,7 @@ function BlockActionBar({
   const canInsertAfter = Boolean(
     !readOnly &&
     snapshot.capabilities.can_add_enrichment &&
-    (block.kind === "paragraph" || block.kind === "lead_paragraph") &&
-    block.allowed_operations.includes("insert_after"),
+    supportsInsertionAfter(block),
   );
   const canViewSources = Boolean(
     block.evidence_refs.length > 0 && onOpenSources,

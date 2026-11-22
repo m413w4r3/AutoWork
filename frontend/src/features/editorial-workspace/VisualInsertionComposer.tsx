@@ -7,6 +7,7 @@ import type {
 } from "../../api/editorialWorkspace";
 import { BarChartInsertionPanel } from "./BarChartInsertionPanel";
 import { FigureInsertionPanel } from "./FigureInsertionPanel";
+import { supportsInsertionAfter } from "./insertionOperations";
 import { TableInsertionPanel } from "./TableInsertionPanel";
 
 interface VisualInsertionComposerProps {
@@ -16,10 +17,6 @@ interface VisualInsertionComposerProps {
   readOnly: boolean;
   onAskBridge?: (instruction: string) => void;
   onRefresh?: () => void;
-}
-
-function isParagraphAnchor(block: EditorialWorkspaceBlock): boolean {
-  return block.kind === "paragraph" || block.kind === "lead_paragraph";
 }
 
 export function VisualInsertionComposer({
@@ -40,8 +37,7 @@ export function VisualInsertionComposer({
   const canInsertAfter =
     !readOnly &&
     snapshot.capabilities.can_add_enrichment &&
-    block.allowed_operations.includes("insert_after") &&
-    isParagraphAnchor(block);
+    supportsInsertionAfter(block);
   const canCreateTable =
     canInsertAfter && block.allowed_operations.includes("create_table");
   const canCreateBarChart =

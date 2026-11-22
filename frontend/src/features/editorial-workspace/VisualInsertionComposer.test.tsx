@@ -451,6 +451,36 @@ describe("VisualInsertionComposer", () => {
     ).toBe(false);
   });
 
+  it("opens the insertion flow from the real backend create operations", async () => {
+    // The real snapshot emits create_table, never a generic insert_after.
+    const realBackendAnchor = {
+      ...anchor,
+      allowed_operations: ["rewrite_paragraph", "create_table"],
+    };
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: 0 } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <VisualInsertionComposer
+          subjectId="subject-1"
+          snapshot={snapshot}
+          block={realBackendAnchor}
+          readOnly={false}
+        />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Ajouter après" }));
+    const tableMenuItem = screen.getByRole("menuitem", { name: "Tableau" });
+    expect(tableMenuItem).not.toBeDisabled();
+    fireEvent.click(tableMenuItem);
+
+    expect(
+      await screen.findByRole("region", { name: "Créer un tableau" }),
+    ).toBeVisible();
+  });
+
   it("requires the server create_table capability before opening the table flow", async () => {
     const noTableOperation = {
       ...anchor,

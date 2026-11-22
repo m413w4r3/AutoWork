@@ -83,6 +83,13 @@ from cti_app.application.editorial_threads import (
     EditorialThreadSessionStartResult,
 )
 from cti_app.application.editorial_workspace import EditorialWorkspaceService
+from cti_app.application.editorial_workspace.capabilities import (
+    EditorialCapabilities,
+    EditorialCapabilityFacts,
+    insertion_anchor_ready,
+    manual_edit_anchor_ready,
+    resolve_editorial_capabilities,
+)
 from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
@@ -1345,51 +1352,101 @@ def _manual_edit_too_large_response() -> JSONResponse:
     )
 
 
-def _manual_edit_capability_enabled(request: Request, payload: Mapping[str, object]) -> bool:
-    capabilities = payload.get("capabilities")
-    if isinstance(capabilities, Mapping) and capabilities.get("read_only_reason") is not None:
+def _editorial_thread_routes_wired() -> bool:
+    """Return whether the mounted thread service exposes the read/send lifecycle."""
+    return all(
+        callable(getattr(EditorialThreadService, name, None))
+        for name in ("read", "send_message", "reconcile")
+    )
+
+
+def _editorial_thread_worker_wired() -> bool:
+    """Return whether the durable message job has an importable worker dispatcher."""
+    try:
+        from cti_app.workers.editorial_threads import EditorialThreadWorker
+        from cti_app.workers.tasks import execute_editorial_thread_job
+    except Exception:
         return False
+    return callable(EditorialThreadWorker) and callable(
+        getattr(execute_editorial_thread_job, "send", None)
+    )
+
+
+def _editorial_thread_runtime_wired(request: Request) -> bool:
+    """Return whether this app can persist and dispatch an editorial message."""
+    try:
+        conversations = getattr(request.app.state, "model_conversation_service", None)
+        if conversations is None or not callable(getattr(conversations, "get_or_create", None)):
+            return False
+        return _editorial_thread_worker_wired()
+    except Exception:
+        return False
+
+
+def _proposal_capability_path_wired(request: Request) -> bool:
+    """Reuse the accept gate and the two writers the mutating routes construct."""
     try:
         if not get_settings().editorial_proposal_accept_enabled:
             return False
         if not _proposal_impact_consumer_wired():
             return False
-        if payload.get("publication_kind") not in {"article", "brief"}:
-            return False
-        if not isinstance(payload.get("production_run_id"), str):
-            return False
         adoption_service = _proposal_adoption_service(request)
         proposal_service = _manual_proposal_service(request)
-        if not callable(getattr(adoption_service, "adopt", None)):
-            return False
-        if not callable(getattr(proposal_service, "prepare_manual_patch", None)):
-            return False
-        blocks = payload.get("blocks")
-        if not isinstance(blocks, list):
-            return False
-        return any(
-            isinstance(block, Mapping)
-            and isinstance(block.get("text"), str)
-            and block.get("before_hash") is not None
-            and block.get("revision_status") == "ready"
-            and (
-                (
-                    block.get("kind") == "title"
-                    and "rewrite_title" in block.get("allowed_operations", [])
-                )
-                or (
-                    block.get("kind") == "lead_paragraph"
-                    and "rewrite_lead" in block.get("allowed_operations", [])
-                )
-                or (
-                    block.get("kind") == "paragraph"
-                    and "rewrite_paragraph" in block.get("allowed_operations", [])
-                )
-            )
-            for block in blocks
+        return callable(getattr(adoption_service, "adopt", None)) and callable(
+            getattr(proposal_service, "prepare_manual_patch", None)
         )
     except Exception:
         return False
+
+
+def _revision_preview_path_wired(request: Request) -> bool:
+    """Return whether a `propose` turn can prepare and display a revision.
+
+    The propose route is the thread entry with `kind="propose"`, gated by the
+    unique adoption writer; the worker then calls `prepare_thread_turn` and the
+    persisted proposal card is the revision preview.
+    """
+    try:
+        adoption_service = _proposal_adoption_service(request)
+        return callable(getattr(adoption_service, "adopt", None)) and callable(
+            getattr(EditorialProposalService, "prepare_thread_turn", None)
+        )
+    except Exception:
+        return False
+
+
+def _editorial_capabilities(
+    request: Request, payload: Mapping[str, object]
+) -> EditorialCapabilities:
+    """Resolve the four mutating capabilities from the snapshot and live wiring."""
+    capabilities = payload.get("capabilities")
+    read_only = (
+        isinstance(capabilities, Mapping) and capabilities.get("read_only_reason") is not None
+    )
+    publication_kind_known = payload.get("publication_kind") in {"article", "brief"}
+    production_run_known = isinstance(payload.get("production_run_id"), str)
+    blocks = payload.get("blocks")
+    block_list = (
+        [block for block in blocks if isinstance(block, Mapping)]
+        if isinstance(blocks, list)
+        else []
+    )
+    writable = publication_kind_known and production_run_known and not read_only
+    return resolve_editorial_capabilities(
+        EditorialCapabilityFacts(
+            publication_kind_known=publication_kind_known,
+            production_run_known=production_run_known,
+            read_only=read_only,
+            discussion_routes_wired=(_editorial_thread_routes_wired() if writable else False),
+            discussion_runtime_wired=(
+                _editorial_thread_runtime_wired(request) if writable else False
+            ),
+            revision_preview_wired=(_revision_preview_path_wired(request) if writable else False),
+            proposal_path_wired=(_proposal_capability_path_wired(request) if writable else False),
+            manual_edit_anchor_ready=manual_edit_anchor_ready(block_list),
+            insertion_anchor_ready=insertion_anchor_ready(block_list),
+        )
+    )
 
 
 def _service(request: Request) -> EditorialWorkspaceService:
@@ -1872,7 +1929,13 @@ async def get_editorial_workspace_snapshot(
         _raise_workspace_error(error)
     capabilities = payload.get("capabilities")
     if isinstance(capabilities, dict):
-        capabilities["manual_edit"] = _manual_edit_capability_enabled(request, payload)
+        resolved = _editorial_capabilities(request, payload)
+        capabilities.update(
+            can_discuss=resolved.can_discuss,
+            can_preview_revision=resolved.can_preview_revision,
+            manual_edit=resolved.manual_edit,
+            can_add_enrichment=resolved.can_add_enrichment,
+        )
     return EditorialWorkspaceSnapshotView.model_validate(payload)
 
 

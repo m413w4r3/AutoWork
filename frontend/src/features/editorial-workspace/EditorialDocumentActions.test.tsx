@@ -90,9 +90,11 @@ const snapshot: EditorialWorkspaceSnapshot = {
 function renderDocument({
   selectedBlockId = null,
   readOnly = false,
+  workspaceSnapshot = snapshot,
 }: {
   selectedBlockId?: string | null;
   readOnly?: boolean;
+  workspaceSnapshot?: EditorialWorkspaceSnapshot;
 } = {}) {
   const onSelectBlock = vi.fn<(blockId: string) => void>();
   const onStartEditing = vi.fn<(blockId: string) => void>();
@@ -105,7 +107,7 @@ function renderDocument({
   render(
     <QueryClientProvider client={client}>
       <EditorialDocument
-        snapshot={snapshot}
+        snapshot={workspaceSnapshot}
         selectedBlockId={selectedBlockId}
         drafts={{}}
         staleDraftIds={new Set()}
@@ -137,6 +139,21 @@ function blockElement(blockId: string): HTMLElement {
   );
   if (!element) throw new Error(`Missing block ${blockId}`);
   return element;
+}
+
+function withParagraphOperations(
+  operations: string[],
+  capabilities: EditorialWorkspaceSnapshot["capabilities"] = snapshot.capabilities,
+): EditorialWorkspaceSnapshot {
+  return {
+    ...snapshot,
+    blocks: snapshot.blocks.map((block) =>
+      block.block_id === paragraphId
+        ? { ...block, allowed_operations: operations }
+        : block,
+    ),
+    capabilities,
+  };
 }
 
 describe("EditorialDocument block action bar", () => {
@@ -209,5 +226,51 @@ describe("EditorialDocument block action bar", () => {
     fireEvent.click(screen.getByRole("button", { name: "Historique" }));
     expect(callbacks.onOpenHistory).toHaveBeenCalledWith(paragraphId);
     expect(blockElement(paragraphId)).toHaveAttribute("data-selected", "true");
+  });
+
+  it("offers Discuter and Ajouter après from the real backend create operations", () => {
+    // The real snapshot lists create_table/create_bar_chart/create_source_figure
+    // and never a generic insert_after marker.
+    const callbacks = renderDocument({
+      selectedBlockId: paragraphId,
+      workspaceSnapshot: withParagraphOperations([
+        "rewrite_paragraph",
+        "create_table",
+      ]),
+    });
+
+    const bar = screen.getByRole("toolbar", { name: /Actions du bloc/i });
+    fireEvent.click(within(bar).getByRole("button", { name: "Discuter" }));
+    expect(callbacks.onDiscuss).toHaveBeenCalledWith(paragraphId);
+    expect(
+      within(bar).getByRole("button", { name: "Ajouter après" }),
+    ).toBeVisible();
+  });
+
+  it("hides every gated action when the server capabilities are false", () => {
+    renderDocument({
+      selectedBlockId: paragraphId,
+      workspaceSnapshot: withParagraphOperations(
+        ["rewrite_paragraph", "create_table"],
+        {
+          ...snapshot.capabilities,
+          can_discuss: false,
+          manual_edit: false,
+          can_add_enrichment: false,
+        },
+      ),
+    });
+
+    const bar = screen.getByRole("toolbar", { name: /Actions du bloc/i });
+    expect(
+      within(bar).queryByRole("button", { name: "Modifier" }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(bar).queryByRole("button", { name: "Discuter" }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(bar).queryByRole("button", { name: "Ajouter après" }),
+    ).not.toBeInTheDocument();
+    expect(within(bar).getByRole("button", { name: "Sources" })).toBeVisible();
   });
 });
