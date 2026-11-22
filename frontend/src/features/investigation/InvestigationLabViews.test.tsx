@@ -52,6 +52,7 @@ const investigation: InvestigationView = {
   synthesis_artifact_id: "55555555-5555-4555-8555-555555555555",
   synthesis_sha256: "c".repeat(64),
   status: "completed",
+  prose_authority: "legacy",
   version: 7,
   stop_reason: null,
   agenda: [],

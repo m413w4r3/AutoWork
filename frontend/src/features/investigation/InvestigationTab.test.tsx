@@ -43,6 +43,7 @@ function makeInvestigation(
     synthesis_artifact_id: SYNTHESIS_ID,
     synthesis_sha256: SHA256,
     status: "queued",
+    prose_authority: "legacy",
     version: 1,
     stop_reason: null,
     agenda: [],
@@ -336,6 +337,30 @@ describe("InvestigationTab", () => {
     ).toBeTruthy();
   });
 
+  it("lance l’atelier M24 avec le profil explicite et operator_led", async () => {
+    const user = userEvent.setup();
+    const { calls } = renderInvestigation(null);
+
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Lancer l’atelier d’investigation",
+      }),
+    );
+
+    const post = calls.find((call) => call.init?.method === "POST");
+    expect(post?.url).toBe(`/api/subjects/${SUBJECT_ID}/investigations`);
+    expect(requestBody(post?.init)).toEqual({
+      production_run_id: RUN_ID,
+      synthesis_artifact_id: SYNTHESIS_ID,
+      synthesis_sha256: SHA256,
+      creation_profile: "m24_workshop",
+      execution_mode: "operator_led",
+    });
+    expect(
+      new Headers(post?.init?.headers).get("Idempotency-Key"),
+    ).toBeTruthy();
+  });
+
   it("montre l’enquête en cours et permet de l’interrompre", async () => {
     renderInvestigation(makeInvestigation({ status: "running" }));
 
@@ -351,6 +376,9 @@ describe("InvestigationTab", () => {
     expect(
       screen.getByRole("button", { name: "Interrompre l’enquête" }),
     ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Lancer l’atelier d’investigation" }),
+    ).toBeDisabled();
   });
 
   it("affiche l’état awaiting_review", async () => {

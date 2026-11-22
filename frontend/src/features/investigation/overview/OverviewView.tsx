@@ -6,7 +6,11 @@
  */
 
 import { toWorkshopApiError } from "../api/client";
-import { useWorkspaceStatus, type WorkspaceStatusV1 } from "../api/workspace";
+import {
+  useEnsureWorkspace,
+  useWorkspaceStatus,
+  type WorkspaceStatusV1,
+} from "../api/workspace";
 import { useWorkspaceAgentStatus } from "../api/workspaceAgent";
 import {
   WorkspaceUnavailableState,
@@ -33,8 +37,10 @@ export function OverviewView({
 }) {
   const agentQuery = useWorkspaceAgentStatus();
   const workspaceQuery = useWorkspaceStatus(investigationId);
+  const ensureWorkspace = useEnsureWorkspace(investigationId);
   const workspace = workspaceQuery.data;
   const workspaceReady = workspace?.workspace_state === "bound";
+  const agentAvailable = agentQuery.data?.status === "available";
 
   return (
     <section
@@ -57,6 +63,10 @@ export function OverviewView({
         <WorkspaceStatusPanel
           query={workspaceQuery}
           workspace={workspace ?? null}
+          agentAvailable={agentAvailable}
+          ensurePending={ensureWorkspace.isPending}
+          ensureError={ensureWorkspace.error}
+          onEnsure={() => ensureWorkspace.mutate()}
         />
       </section>
 
@@ -136,9 +146,17 @@ function AgentStatusPanel({
 function WorkspaceStatusPanel({
   query,
   workspace,
+  agentAvailable,
+  ensurePending,
+  ensureError,
+  onEnsure,
 }: {
   query: ReturnType<typeof useWorkspaceStatus>;
   workspace: WorkspaceStatusV1 | null;
+  agentAvailable: boolean;
+  ensurePending: boolean;
+  ensureError: Error | null;
+  onEnsure: () => void;
 }) {
   if (query.isPending)
     return <WorkshopLoadingState label="Chargement du workspace local…" />;
@@ -152,7 +170,22 @@ function WorkspaceStatusPanel({
     );
   if (!workspace) return null;
   if (workspace.workspace_state !== "bound") {
-    return <WorkspaceUnavailableState absent />;
+    if (!agentAvailable) return <WorkspaceUnavailableState absent />;
+    return (
+      <>
+        <WorkspaceUnavailableState
+          absent
+          onCreate={onEnsure}
+          createPending={ensurePending}
+        />
+        {ensureError ? (
+          <WorkshopTypedErrorState
+            error={toWorkshopApiError(ensureError)}
+            title="Création du workspace refusée"
+          />
+        ) : null}
+      </>
+    );
   }
   if (!workspace.workspace_available) {
     return (

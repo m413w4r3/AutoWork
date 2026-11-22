@@ -197,14 +197,25 @@ export function WorkshopConflictState({
 export function WorkspaceUnavailableState({
   reason,
   absent = false,
+  onCreate,
+  createPending = false,
 }: {
   reason?: string | null;
   absent?: boolean;
+  onCreate?: () => void;
+  createPending?: boolean;
 }) {
+  const creatable = absent && onCreate !== undefined;
   return (
     <WorkshopStateBanner
       tone="warning"
-      title={absent ? "Workspace local absent" : "Workspace local indisponible"}
+      title={
+        creatable
+          ? "Workspace local à créer"
+          : absent
+            ? "Workspace local absent"
+            : "Workspace local indisponible"
+      }
     >
       <p>
         {absent
@@ -212,6 +223,16 @@ export function WorkspaceUnavailableState({
           : "L’agent hôte ne répond pas ou le workspace n’est pas monté. Les écritures ne sont pas mises en file hors ligne."}
       </p>
       {reason ? <p>{reason}</p> : null}
+      {creatable ? (
+        <button
+          type="button"
+          className="button"
+          disabled={createPending}
+          onClick={onCreate}
+        >
+          {createPending ? "Création…" : "Créer le workspace"}
+        </button>
+      ) : null}
     </WorkshopStateBanner>
   );
 }

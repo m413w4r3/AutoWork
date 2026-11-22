@@ -9,6 +9,12 @@ export type AnalystInvestigationStatus =
   | "failed"
   | "cancelled";
 
+/** ADR-0011 D4: immutable authority over publishable prose. */
+export type ProseAuthority = "legacy" | "bridge_only";
+
+/** ADR-0011 D2/D4: `m24_workshop` requests a Bridge-only workshop. */
+export type InvestigationCreationProfile = "legacy" | "m24_workshop";
+
 export type InvestigationStopReason =
   | "agent_finished"
   | "budget_exhausted"
@@ -181,6 +187,7 @@ export interface InvestigationView {
   synthesis_artifact_id: string;
   synthesis_sha256: string;
   status: AnalystInvestigationStatus;
+  prose_authority: ProseAuthority;
   version: number;
   stop_reason: InvestigationStopReason | null;
   agenda: InvestigationAgendaItem[];
@@ -223,6 +230,8 @@ export interface InvestigationStartInput {
   production_run_id: string;
   synthesis_artifact_id: string;
   synthesis_sha256: string;
+  execution_mode?: "bridge_led" | "operator_led";
+  creation_profile?: InvestigationCreationProfile;
 }
 
 export interface InvestigationActionInput {
