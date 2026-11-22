@@ -258,6 +258,12 @@ class Settings(BaseSettings):
     m24_task_max_running_per_session: int = Field(default=1, ge=1)
     m24_task_lease_seconds: int = Field(default=180, ge=30, le=3600)
     m24_max_contribution_bytes: int = Field(default=16 * 1024 * 1024, gt=0)
+    # Lease sweep (ADR-0011 D3): the scheduler enqueues the sweep at most once
+    # per interval; a batch bounds one worker run.  A failed host release is
+    # recorded for reconciliation, never retried as a relaunch.
+    m24_task_sweep_interval_seconds: float = Field(default=30.0, gt=1, le=3600)
+    m24_task_sweep_batch_size: int = Field(default=100, ge=1, le=1000)
+    m24_host_release_wait_seconds: float = Field(default=5.0, ge=0, le=60)
     collection_syndication_domains: str = ""
     collection_exact_title_search_endpoint: str = ""
     collection_official_newsletter_archive_endpoint: str = ""

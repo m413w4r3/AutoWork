@@ -23,9 +23,9 @@ applies the D3 matrix, the lease and the CAS and appends the task event.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Header, Query, Request
@@ -40,6 +40,10 @@ from cti_app.api.investigation import (
     _uow_factory,
 )
 from cti_app.application.agent_session_verifier import VerifiedAgentSession
+from cti_app.application.agentic_sessions import (
+    HostSessionReleaseService,
+    SessionUnitOfWork,
+)
 from cti_app.application.identity import IdentityScope
 from cti_app.application.investigation_persistence import (
     AgentSessionRepository,
@@ -51,6 +55,7 @@ from cti_app.application.investigation_tasks import (
     TaskCommandError,
     TaskCommandResult,
     TaskSessionOutcome,
+    TaskSessionRelease,
 )
 from cti_app.application.investigation_timeline import (
     InvestigationTimelineService,
@@ -60,6 +65,7 @@ from cti_app.application.investigation_timeline import (
 )
 from cti_app.application.persistence import UnitOfWork
 from cti_app.config import Settings, get_settings
+from cti_app.domain.agentic_operator import AgentSessionState, AgentSessionStateError
 from cti_app.domain.investigation import thaw_json
 from cti_app.domain.investigation_task import (
     BlockedReason,
@@ -296,9 +302,11 @@ class _VerifiedSessionPort:
         self,
         verified: VerifiedAgentSession | None,
         sessions: AgentSessionRepository | None,
+        releases: list[TaskSessionRelease] | None = None,
     ) -> None:
         self._verified = verified
         self._sessions = sessions
+        self._releases = releases
 
     async def is_active_session(
         self, *, session_id: UUID, investigation_id: UUID, task_id: UUID
@@ -328,16 +336,40 @@ class _VerifiedSessionPort:
             outcome=outcome.value,
             reason=reason,
         )
+        if self._releases is not None:
+            self._releases.append(
+                TaskSessionRelease(
+                    session_id=session_id,
+                    investigation_id=investigation_id,
+                    task_id=task_id,
+                    outcome=outcome,
+                    reason=reason,
+                )
+            )
 
 
-def _task_service(uow: UnitOfWork, request: Request) -> InvestigationTaskService:
-    return InvestigationTaskService(
+def _task_service(
+    uow: UnitOfWork, request: Request
+) -> tuple[InvestigationTaskService, list[TaskSessionRelease]]:
+    """The per-request engine plus the host releases its commit must flush."""
+    releases: list[TaskSessionRelease] = []
+    service = InvestigationTaskService(
         tasks=uow.investigation_tasks,
         decisions=uow.analyst_decisions,
         sessions=_VerifiedSessionPort(
-            _verified_session(request), getattr(uow, "agent_sessions", None)
+            _verified_session(request), getattr(uow, "agent_sessions", None), releases
         ),
         limits=_settings(request).task_limits(),
+    )
+    return service, releases
+
+
+def _release_service(request: Request) -> HostSessionReleaseService:
+    """Host teardown after commit: no DB lock is held during the UDS call."""
+    return HostSessionReleaseService(
+        uow_factory=cast(Callable[[], SessionUnitOfWork], _uow_factory(request)),
+        host=getattr(request.app.state, "host_sessions", None),
+        wait_seconds=_settings(request).m24_host_release_wait_seconds,
     )
 
 
@@ -440,11 +472,51 @@ def _required_blocked_reason(payload: TaskCommandRequest) -> BlockedReason:
     return payload.blocked_reason
 
 
+async def _record_session_lease(
+    uow: UnitOfWork,
+    verified: VerifiedAgentSession,
+    task: InvestigationTaskV1,
+) -> None:
+    """Mirror the D3 lease on the session the generic ``start`` route used (M3).
+
+    Without this write, an operator ``start`` through ``/tasks/{id}/commands``
+    leaves ``agent_sessions.task_lease_*`` null and the broker refuses every
+    later call.  It runs in the command transaction, so a mirror failure rolls
+    the start back instead of leaving a task running with an unusable session.
+    """
+    sessions = getattr(uow, "agent_sessions", None)
+    if sessions is None or task.lease_id is None or task.lease_fence < 1:
+        return
+    current = await sessions.get(verified.session_id)
+    if (
+        current is None
+        or current.investigation_id != verified.investigation_id
+        or current.task_id != task.id
+        or verified.task_id != task.id
+    ):
+        raise _http_error(409, "agent_session_inactive")
+    if current.task_lease_id == task.lease_id and current.task_lease_fence == task.lease_fence:
+        return
+    if current.state is AgentSessionState.READY:
+        ready = current.with_state(AgentSessionState.RUNNING, now=task.updated_at)
+        stored = await sessions.update_state(ready, expected_state_version=current.state_version)
+        if stored is None:
+            raise _http_error(409, "agent_session_changed")
+        current = stored
+    try:
+        mirrored = current.with_task_lease(task.lease_id, task.lease_fence, now=task.updated_at)
+    except AgentSessionStateError as exc:
+        raise _http_error(409, "agent_session_changed", str(exc)) from exc
+    if await sessions.update_state(mirrored, expected_state_version=current.state_version) is None:
+        raise _http_error(409, "agent_session_changed")
+
+
 async def _run_command(
     service: InvestigationTaskService,
     task: InvestigationTaskV1,
     payload: TaskCommandRequest,
     *,
+    uow: UnitOfWork,
     actor: TaskActor,
     verified: VerifiedAgentSession | None,
     idempotency_key: str,
@@ -479,13 +551,16 @@ async def _run_command(
         )
     if command == "start":
         session_id = verified.session_id if verified is not None else None
-        return await service.start(
+        started = await service.start(
             task_id=task.id,
             actor=actor,
             expected_status_version=expected,
             idempotency_key=idempotency_key,
             session_id=session_id,
         )
+        if verified is not None:
+            await _record_session_lease(uow, verified, started.task)
+        return started
     if command == "heartbeat":
         return await service.heartbeat(
             task_id=task.id,
@@ -619,8 +694,9 @@ async def create_task(
             raise _http_error(403, "agent_session_mismatch")
     async with _uow_factory(request)() as uow:
         await _require_investigation(uow, investigation_id)
+        service, _releases = _task_service(uow, request)
         try:
-            result = await _task_service(uow, request).create_task(
+            result = await service.create_task(
                 investigation_id=investigation_id,
                 actor=actor,
                 idempotency_key=idempotency_key,
@@ -663,14 +739,17 @@ async def run_task_command(
         require_current_lease=payload.command in _LEASE_COMMANDS,
     )
     _require_bound_task(request, task_id)
+    releases: list[TaskSessionRelease] = []
     async with _uow_factory(request)() as uow:
         await _require_investigation(uow, investigation_id)
         task = await _require_task(uow.investigation_tasks, investigation_id, task_id)
+        service, releases = _task_service(uow, request)
         try:
             result = await _run_command(
-                _task_service(uow, request),
+                service,
                 task,
                 payload,
+                uow=uow,
                 actor=actor,
                 verified=_verified_session(request),
                 idempotency_key=idempotency_key,
@@ -678,6 +757,11 @@ async def run_task_command(
         except TaskCommandError as exc:
             raise _command_error(exc) from exc
         await uow.commit()
+    if releases:
+        # The transaction and its locks are released; only now may the host be
+        # stopped (B2).  A host failure is recorded on the session, never
+        # raised to the caller who already committed the lease release.
+        await _release_service(request).flush(releases)
     return TaskCommandResponse(
         task=_task_view(result.task),
         event=_event_view(result.event) if result.event is not None else None,
