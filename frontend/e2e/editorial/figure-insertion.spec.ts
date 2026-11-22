@@ -562,9 +562,11 @@ test("intègre deux figures après le paragraphe, les compare puis les accepte d
     })
     .fill("Schéma de l’infrastructure observée");
   await expect(
-    page.getByText(
-      `Après le paragraphe sélectionné : ${"Paragraphe courant où les images seront ajoutées."}`,
-    ),
+    page
+      .getByText(
+        `Emplacement · après « ${"Paragraphe courant où les images seront ajoutées."} »`,
+      )
+      .first(),
   ).toBeVisible();
   await page
     .getByRole("button", { name: "Intégrer les images sélectionnées" })
@@ -734,7 +736,15 @@ test("shows the server refusal when a stale BRIEF snapshot would add a fourth fi
       .getByText("Une brève ne peut contenir plus de trois figures intégrées."),
   ).toBeVisible();
   await page.getByRole("button", { name: "Actualiser l’atelier" }).click();
-  await expect(page.getByText("Figures intégrées : 3/3.")).toBeVisible();
+  await page.mouse.move(0, 0);
+  await page
+    .locator(`.editorial-document__block[data-block-id="${anchorId}"]`)
+    .click();
+  await page.getByRole("button", { name: "Ajouter après" }).click();
+  await page.getByRole("menuitem", { name: "Image issue des sources" }).click();
+  await expect(
+    page.getByText(/Figures intégrées : 3\/3/).first(),
+  ).toBeVisible();
   expect(proposalRequests).toHaveLength(1);
   expect(unexpectedRequests).toEqual([]);
 });
