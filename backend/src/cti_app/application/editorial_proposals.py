@@ -960,6 +960,36 @@ def _visual_revision_request_sha256(
     return hashlib.sha256(ProductionArtifactStore.canonical_json_bytes(identity)).hexdigest()
 
 
+def _bind_visual_revision_base_placement(
+    enrichment: EditorialEnrichmentV1,
+    patch: VisualRevisionPatch,
+) -> VisualRevisionPatch:
+    """Bind the server-owned placement of a chart/diagram revision to the base.
+
+    The manual request body carries no placement: a visual revision never moves
+    its element (move is a separate variant), so the exact pinned placement is
+    authoritative. Binding here, once the base is loaded, keeps prepare, the
+    persisted patch and adoption's replan on the same typed value; the planner
+    still validates every other field against the same base element.
+    """
+    if isinstance(patch, ReviseChartPatch):
+        base_chart = next(
+            (chart for chart in enrichment.charts if chart.key == patch.element_key), None
+        )
+        if base_chart is None:
+            return patch
+        return replace(patch, chart=replace(patch.chart, placement=base_chart.placement))
+    if isinstance(patch, ReviseDiagramPatch):
+        base_diagram = next(
+            (diagram for diagram in enrichment.diagrams if diagram.key == patch.element_key),
+            None,
+        )
+        if base_diagram is None:
+            return patch
+        return replace(patch, diagram=replace(patch.diagram, placement=base_diagram.placement))
+    return patch
+
+
 def _visual_revision_failure(
     error: VisualRevisionRejected,
 ) -> EditorialProposalApplicationError:
@@ -2167,6 +2197,7 @@ class EditorialProposalService:
             )
         except VisualRevisionRejected as error:
             raise _visual_revision_failure(error) from None
+        patch = _bind_visual_revision_base_placement(loaded.context.base_enrichment, patch)
         entry = loaded.entry
         base_payload = editorial_enrichment_to_json(loaded.context.base_enrichment)
         if isinstance(patch, ReorderEnrichmentElementsPatch):

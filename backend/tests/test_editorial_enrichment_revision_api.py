@@ -24,16 +24,20 @@ from starlette.requests import Request
 
 from cti_app.api import editorial_workspace as editorial_workspace_api
 from cti_app.application.blob_storage import BlobStore
+from cti_app.application.editorial_figure_catalog import opaque_figure_id
 from cti_app.application.editorial_proposals import (
     EditorialProposalApplicationError,
     EditorialProposalService,
 )
 from cti_app.application.editorial_visual_revision import (
+    VisualRevisionContext,
     VisualRevisionContextLoader,
     VisualRevisionPreparation,
 )
 from cti_app.application.editorial_workspace.registry import resolve_occurrence
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_editorial_enrichment import EditorialFigureCatalogEntry
+from cti_app.application.source_figure_inventory import SourceFigureCatalogMetadata
 from cti_app.config import Settings
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
 from cti_app.domain.editorial_proposal import (
@@ -48,10 +52,31 @@ from cti_app.domain.editorial_workspace import (
 )
 from cti_app.domain.production import ProductionArtifact, ProductionArtifactStage
 from cti_app.domain.production_editorial_enrichment import (
+    ChartSpecV1,
+    DiagramSpecV1,
     EditorialEnrichmentElementKind,
+    ResolvedSourceFigureV1,
+    SourceFigureCandidateV1,
+    SourceFigureDecision,
+    SourceFigureInclusionStatus,
+    SourceFigureLocatorV1,
     editorial_enrichment_to_json,
+    source_figure_id,
 )
-from cti_app.domain.production_synthesis import production_synthesis_to_json
+from cti_app.domain.production_synthesis import (
+    ExtractionEvidenceRefV1,
+    extraction_evidence_refs_v1,
+    production_synthesis_to_json,
+)
+from tests.editorial_visual_revision_support import (
+    anchored,
+    bar_chart,
+    enrichment_with,
+    evidence_pack,
+    flow_diagram,
+    quantitative_extraction,
+    quantitative_synthesis,
+)
 from tests.test_editorial_visual_revision import ANCHOR_A, ANCHOR_B, _context
 
 _ENRICHMENT_INPUT_HASH = "2" * 64
@@ -262,10 +287,48 @@ class _RefusingLoader:
         )
 
 
+class _FakeDiagramPreviewCompiler:
+    """Deterministic non-canonical preview; the real D2 compiler is PG-tested."""
+
+    async def compile_preview(self, diagram: DiagramSpecV1) -> SimpleNamespace:
+        return SimpleNamespace(
+            diagram_key=diagram.key,
+            media_type="image/png",
+            media_sha256="d" * 64,
+            media_bytes=b"synthetic-diagram-preview",
+            source_sha256="e" * 64,
+            compiler="synthetic-d2",
+            compiler_version="1",
+            compiler_policy_version="synthetic",
+        )
+
+
+class _MemoryMediaAssetStore:
+    """Chart preview manifests without the canonical media-asset repository."""
+
+    def __init__(self) -> None:
+        self.manifests: dict[UUID, SimpleNamespace] = {}
+
+    async def store_chart(self, compiled: Any, *, source: str) -> SimpleNamespace:
+        manifest = SimpleNamespace(
+            asset_id=uuid4(),
+            sha256=hashlib.sha256(compiled.media_bytes).hexdigest(),
+            compiler_name=compiled.compiler,
+            compiler_version=compiled.compiler_version,
+            policy_version=compiled.compiler_policy_version,
+        )
+        self.manifests[manifest.asset_id] = manifest
+        return manifest
+
+    async def get(self, asset_id: UUID) -> SimpleNamespace | None:
+        return self.manifests.get(asset_id)
+
+
 class _FakeVisualLoader:
     def __init__(self, preparation: VisualRevisionPreparation) -> None:
         self.preparation = preparation
         self.read_only_reason: object | None = None
+        self.diagram_preview_compiler = _FakeDiagramPreviewCompiler()
 
     async def load(
         self, *, subject_id: UUID, snapshot_id: UUID, occurrence_id: UUID
@@ -300,9 +363,10 @@ def _visual_stack(
     *,
     actor_id: UUID | None = None,
     read_only: bool = False,
+    context: VisualRevisionContext | None = None,
 ) -> SimpleNamespace:
     actor = actor_id or uuid4()
-    context = _context()
+    context = context if context is not None else _context()
     enrichment_payload = editorial_enrichment_to_json(context.base_enrichment)
     synthesis_payload = production_synthesis_to_json(context.synthesis)
     enrichment_sha256 = hashlib.sha256(
@@ -330,7 +394,8 @@ def _visual_stack(
         canonical_content=enrichment_payload,
     )
     table_entry = next(
-        entry for entry in enrichment_entries if entry.kind is EditorialBlockKind.TABLE
+        (entry for entry in enrichment_entries if entry.kind is EditorialBlockKind.TABLE),
+        None,
     )
     # Reorder targets the paragraph anchor occurrence itself; pin the first
     # synthesis paragraph to the anchor identity the enrichment references.
@@ -388,9 +453,9 @@ def _visual_stack(
         )
 
     loaders = {
-        table_entry.block_id: _FakeVisualLoader(preparation_for(table_entry)),
-        paragraph_entry.block_id: _FakeVisualLoader(preparation_for(paragraph_entry)),
+        entry.block_id: _FakeVisualLoader(preparation_for(entry)) for entry in enrichment_entries
     }
+    loaders[paragraph_entry.block_id] = _FakeVisualLoader(preparation_for(paragraph_entry))
 
     async def resolve(subject: UUID, occurrence_id: UUID) -> Any:
         if subject != subject_id:
@@ -435,27 +500,38 @@ def _visual_stack(
         service = real_factory(request)
         # The real factory constructs the production loader from app state; the
         # pinned-artifact read itself is replaced by a typed in-memory
-        # preparation keyed by the occurrence under revision.
+        # preparation keyed by the occurrence under revision. Chart compilation
+        # keeps the real deterministic renderer; only its media manifest store
+        # and the external D2 preview compiler are in-memory here.
         assert isinstance(service._visual_revision_loader, VisualRevisionContextLoader)
         occurrence_id = occurrence_holder["value"]
         service._visual_revision_loader = loaders.get(occurrence_id) or _RefusingLoader()
+        service._diagram_preview_compiler = _FakeDiagramPreviewCompiler()
+        service._media_asset_store = _MemoryMediaAssetStore()
         return service
 
     monkeypatch.setattr(
         editorial_workspace_api, "_manual_proposal_service", factory_with_occurrence
     )
+
+    def block_id_for(kind: EditorialBlockKind) -> UUID:
+        return next(entry.block_id for entry in enrichment_entries if entry.kind is kind)
+
     return SimpleNamespace(
         app=app,
         subject_id=subject_id,
         snapshot_id=snapshot_id,
-        table_block_id=table_entry.block_id,
+        table_block_id=table_entry.block_id if table_entry is not None else None,
         paragraph_block_id=paragraph_entry.block_id,
-        table_key=context.base_enrichment.tables[0].key,
+        table_key=(
+            context.base_enrichment.tables[0].key if context.base_enrichment.tables else None
+        ),
         actor_id=actor,
         repository=repository,
         blob_store=blob_store,
         occurrence_holder=occurrence_holder,
         context=context,
+        block_id_for=block_id_for,
     )
 
 
@@ -484,93 +560,218 @@ def _caption_body(snapshot_id: UUID, table_key: str, caption: str) -> dict[str, 
     }
 
 
-def _purpose_body() -> dict[str, object]:
-    reference = {
-        "source_document_id": str(uuid4()),
-        "kind": "fact",
-        "evidence_key": hashlib.sha256(b"synthetic-visual-revision-evidence").hexdigest(),
-    }
+def _evidence_ref_body(reference: ExtractionEvidenceRefV1) -> dict[str, str]:
     return {
-        "question": "Which synthetic value is documented?",
-        "available_data": "The synthetic extraction records the value.",
-        "comprehension_gain": "Compare the value with its source.",
-        "scope": "Only the synthetic evidence.",
-        "evidence_refs": [reference],
-        "knowledge_limits": "No other value is documented.",
-        "placement_reason": "Keep the visual after its paragraph.",
+        "source_document_id": str(reference.source_document_id),
+        "kind": reference.kind.value,
+        "evidence_key": reference.evidence_key,
     }
 
 
-def _chart_body(snapshot_id: UUID, key: str) -> dict[str, object]:
-    reference = {
-        "source_document_id": str(uuid4()),
-        "kind": "fact",
-        "evidence_key": hashlib.sha256(b"synthetic-chart-evidence").hexdigest(),
+def _purpose_body(evidence_refs: tuple[ExtractionEvidenceRefV1, ...]) -> dict[str, object]:
+    return {
+        "question": "Which synthetic endpoint count is documented?",
+        "available_data": "The synthetic extraction records the exact documented counts.",
+        "comprehension_gain": "The comparison exposes the documented difference.",
+        "scope": "Only the synthetic records cited here.",
+        "evidence_refs": [_evidence_ref_body(reference) for reference in evidence_refs],
+        "knowledge_limits": "No unreported value is inferred.",
+        "placement_reason": "Keep the visual after its anchor paragraph.",
     }
+
+
+def _context_with_chart() -> tuple[VisualRevisionContext, ChartSpecV1]:
+    extraction, refs = quantitative_extraction()
+    synthesis = quantitative_synthesis(extraction)
+    chart = bar_chart(refs=refs)
+    context = VisualRevisionContext(
+        base_enrichment=enrichment_with(
+            extraction=extraction, synthesis=synthesis, charts=(chart,)
+        ),
+        evidence_pack=evidence_pack(tuple(extraction_evidence_refs_v1(extraction))),
+        extraction=extraction,
+        synthesis=synthesis,
+        registered_anchor_ids=frozenset({ANCHOR_A, ANCHOR_B}),
+        production_run_id=uuid4(),
+    )
+    return context, chart
+
+
+def _chart_body(
+    snapshot_id: UUID,
+    chart: ChartSpecV1,
+    *,
+    labels: tuple[str, str],
+    second_value: str,
+) -> dict[str, object]:
+    first, second = chart.points
     return {
         "snapshot_id": str(snapshot_id),
         "operation": "revise_chart",
-        "element_key": key,
+        "element_key": chart.key,
         "chart": {
-            "key": key,
-            "kind": "bar",
-            "title": "Synthetic chart",
-            "caption": "Synthetic chart caption",
-            "category_axis_label": "Step",
-            "value_axis_label": "Count",
-            "unit": "hosts",
+            "key": chart.key,
+            "kind": chart.kind.value,
+            "title": "Revised documented endpoint counts",
+            "caption": chart.caption,
+            "category_axis_label": chart.category_axis_label,
+            "value_axis_label": chart.value_axis_label,
+            "unit": chart.unit,
             "points": [
                 {
-                    "label": "First",
-                    "series": "Observed",
-                    "value": "1",
-                    "evidence_refs": [reference],
+                    "label": labels[0],
+                    "series": first.series,
+                    "value": format(first.value, "f") if first.value is not None else None,
+                    "evidence_refs": [
+                        _evidence_ref_body(reference) for reference in first.evidence_refs
+                    ],
                 },
                 {
-                    "label": "Second",
-                    "series": "Observed",
-                    "value": "2",
-                    "evidence_refs": [reference],
+                    "label": labels[1],
+                    "series": second.series,
+                    "value": second_value,
+                    "evidence_refs": [
+                        _evidence_ref_body(reference) for reference in second.evidence_refs
+                    ],
                 },
             ],
-            "purpose": _purpose_body(),
+            "purpose": _purpose_body(
+                tuple(reference for point in chart.points for reference in point.evidence_refs)
+            ),
         },
     }
 
 
-def _diagram_body(snapshot_id: UUID, key: str) -> dict[str, object]:
-    reference = {
-        "source_document_id": str(uuid4()),
-        "kind": "fact",
-        "evidence_key": hashlib.sha256(b"synthetic-diagram-evidence").hexdigest(),
-    }
+def _context_with_diagram() -> tuple[VisualRevisionContext, DiagramSpecV1]:
+    extraction, refs = quantitative_extraction()
+    synthesis = quantitative_synthesis(extraction)
+    diagram = flow_diagram(refs=refs)
+    context = VisualRevisionContext(
+        base_enrichment=enrichment_with(
+            extraction=extraction, synthesis=synthesis, diagrams=(diagram,)
+        ),
+        evidence_pack=evidence_pack(tuple(extraction_evidence_refs_v1(extraction))),
+        extraction=extraction,
+        synthesis=synthesis,
+        registered_anchor_ids=frozenset({ANCHOR_A, ANCHOR_B}),
+        production_run_id=uuid4(),
+    )
+    return context, diagram
+
+
+def _diagram_body(
+    snapshot_id: UUID,
+    diagram: DiagramSpecV1,
+    *,
+    title: str,
+    edges: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    assert diagram.purpose is not None
+    purpose_refs = diagram.purpose.evidence_refs
     return {
         "snapshot_id": str(snapshot_id),
         "operation": "revise_diagram",
-        "element_key": key,
+        "element_key": diagram.key,
         "diagram": {
-            "key": key,
-            "kind": "infection_chain",
-            "title": "Synthetic diagram",
-            "caption": "Synthetic diagram caption",
-            "direction": "left_to_right",
-            "profile": "flow",
+            "key": diagram.key,
+            "kind": diagram.kind.value,
+            "title": title,
+            "caption": diagram.caption,
+            "direction": diagram.direction.value,
+            "profile": diagram.profile.value if diagram.profile is not None else None,
             "nodes": [
-                {"node_id": "loader", "label": "Loader", "evidence_refs": [reference]},
-                {"node_id": "payload", "label": "Payload", "evidence_refs": [reference]},
-            ],
-            "edges": [
                 {
-                    "source_node_id": "loader",
-                    "target_node_id": "payload",
-                    "label": "loads",
-                    "evidence_refs": [reference],
+                    "node_id": node.node_id,
+                    "label": node.label,
+                    "role": node.role.value,
+                    "evidence_refs": [
+                        _evidence_ref_body(reference) for reference in node.evidence_refs
+                    ],
                 }
+                for node in diagram.nodes
             ],
+            "edges": (
+                edges
+                if edges is not None
+                else [
+                    {
+                        "source_node_id": edge.source_node_id,
+                        "target_node_id": edge.target_node_id,
+                        "label": edge.label,
+                        "direction": edge.direction.value if edge.direction is not None else None,
+                        "evidence_refs": [
+                            _evidence_ref_body(reference) for reference in edge.evidence_refs
+                        ],
+                    }
+                    for edge in diagram.edges
+                ]
+            ),
             "groups": [],
-            "purpose": _purpose_body(),
+            "purpose": _purpose_body(purpose_refs),
         },
     }
+
+
+def _context_with_replaceable_figure() -> tuple[VisualRevisionContext, UUID]:
+    """A base figure without a resolved archive plus one selectable catalogue entry."""
+    extraction, _refs = quantitative_extraction()
+    synthesis = quantitative_synthesis(extraction)
+    source = extraction.sources[0]
+    run_id = uuid4()
+    base_figure = SourceFigureCandidateV1(
+        key="figure_one",
+        source_document_id=source.source_document_id,
+        source_url=source.canonical_url,
+        caption="Synthetic source figure caption",
+        provenance="Figure 1 from the synthetic report",
+        locator=SourceFigureLocatorV1(page=1),
+        inclusion_status=SourceFigureInclusionStatus.PROPOSED,
+        placement=anchored(),
+    )
+    sha256 = "f" * 64
+    locator = SourceFigureLocatorV1(page=2)
+    resolved = ResolvedSourceFigureV1(
+        figure_id=source_figure_id(
+            source_document_id=source.source_document_id,
+            sha256=sha256,
+            source=source.canonical_url,
+            locator=locator,
+        ),
+        blob_id=uuid4(),
+        sha256=sha256,
+        mime_type="image/png",
+        byte_size=128,
+        source_document_id=source.source_document_id,
+        source=source.canonical_url,
+        provenance="Figure 2 from the synthetic report",
+        locator=locator,
+        decision=SourceFigureDecision.ACCEPTED,
+        decision_reason="Synthetic accepted archive figure",
+    )
+    context = VisualRevisionContext(
+        base_enrichment=replace(
+            enrichment_with(extraction=extraction, synthesis=synthesis),
+            source_figures=(base_figure,),
+        ),
+        evidence_pack=evidence_pack(tuple(extraction_evidence_refs_v1(extraction))),
+        extraction=extraction,
+        synthesis=synthesis,
+        registered_anchor_ids=frozenset({ANCHOR_A, ANCHOR_B}),
+        figure_catalog=(
+            EditorialFigureCatalogEntry(
+                handle="F002",
+                source_role="body",
+                editorial_role="illustration",
+                figure=resolved,
+                metadata=SourceFigureCatalogMetadata(width=640, height=480),
+            ),
+        ),
+        production_run_id=run_id,
+    )
+    public_figure_id = UUID(
+        opaque_figure_id(context.base_enrichment.subject_id, run_id, resolved.figure_id)
+    )
+    return context, public_figure_id
 
 
 # ---------------------------------------------------------------------------
@@ -655,50 +856,260 @@ async def test_enrichment_revision_requires_a_valid_idempotency_key(
 
 
 # ---------------------------------------------------------------------------
-# Unimplemented planner branches: schema is fixed, refusal is a clean 422
+# Typed variants: every planner branch reachable through the real route
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_unimplemented_visual_revisions_return_typed_422(
+async def test_revise_chart_route_prepares_a_label_correction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _enable_route(monkeypatch)
-    snapshot_id, subject_id, occurrence_id = uuid4(), uuid4(), uuid4()
-    app = FastAPI()
-    app.include_router(editorial_workspace_api.router)
-    app.state.identity_provider = _IdentityProvider(uuid4())
-    bodies = (
-        _chart_body(snapshot_id, "chart_one"),
-        _diagram_body(snapshot_id, "diagram_one"),
-        {
-            "snapshot_id": str(snapshot_id),
-            "operation": "replace_source_figure",
-            "element_key": "figure_one",
-            "figure_id": str(uuid4()),
-            "caption": "Synthetic replacement caption",
-        },
-        {
-            "snapshot_id": str(snapshot_id),
-            "operation": "remove_enrichment_element",
-            "element_kind": "figure",
-            "element_key": "figure_one",
-        },
+    context, chart = _context_with_chart()
+    stack = _visual_stack(monkeypatch, context=context)
+    occurrence_id = stack.block_id_for(EditorialBlockKind.CHART)
+    stack.occurrence_holder["value"] = occurrence_id
+    body = _chart_body(
+        stack.snapshot_id,
+        chart,
+        labels=("Alpha (revised)", "Beta (revised)"),
+        second_value="18",
     )
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://editorial.test"
+        transport=httpx.ASGITransport(app=stack.app), base_url="http://editorial.test"
     ) as client:
-        for body in bodies:
-            response = await _post(
-                client, subject_id, occurrence_id, body, key=f"unsupported-{uuid4().hex}"
-            )
-            assert response.status_code == 422, response.text
-            assert response.json()["detail"]["code"] == (
-                "enrichment_revision_unsupported_operation"
-            )
-            assert response.json()["detail"]["message"] == (
-                "Cette opération de révision visuelle n'est pas encore disponible."
-            )
+        response = await _post(client, stack.subject_id, occurrence_id, body)
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["operation"] == "rewrite_chart"
+    assert payload["origin"] == "manual_patch"
+    assert payload["state"] == "proposed"
+    visual_patch = payload["patch"]["visual_patch"]
+    assert visual_patch["kind"] == "revise_chart"
+    assert visual_patch["element_key"] == chart.key
+    assert visual_patch["chart"]["key"] == chart.key
+    assert [point["label"] for point in visual_patch["chart"]["points"]] == [
+        "Alpha (revised)",
+        "Beta (revised)",
+    ]
+    # The request carries no placement: the server-bound value is the base one.
+    assert visual_patch["chart"]["placement"]["kind"] == "after_paragraph"
+    preview = payload["diagnostics"]["preview"]
+    assert preview["operation"] == "rewrite_chart"
+    assert preview["point_count"] == 2
+    assert "chart_asset" in preview
+    assert len(stack.repository.records) == 1
+    assert stack.repository.records[0].model_run_id is None
+    assert stack.repository.records[0].state is EditorialProposalState.PROPOSED
+
+
+@pytest.mark.asyncio
+async def test_revise_chart_route_refuses_an_unevidenced_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_route(monkeypatch)
+    context, chart = _context_with_chart()
+    stack = _visual_stack(monkeypatch, context=context)
+    occurrence_id = stack.block_id_for(EditorialBlockKind.CHART)
+    stack.occurrence_holder["value"] = occurrence_id
+    # The Beta FACT documents exactly "18 endpoints"; 99 is not re-proved.
+    body = _chart_body(
+        stack.snapshot_id,
+        chart,
+        labels=("Alpha", "Beta"),
+        second_value="99",
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=stack.app), base_url="http://editorial.test"
+    ) as client:
+        response = await _post(client, stack.subject_id, occurrence_id, body)
+
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["code"] == "bar_chart_value_not_evidenced"
+    assert response.json()["detail"]["message"] == (
+        "Aucun graphique quantitatif vérifiable ne peut être créé à partir des preuves "
+        "actuelles. Un tableau descriptif peut être proposé à la place."
+    )
+    assert stack.repository.records == []
+
+
+@pytest.mark.asyncio
+async def test_revise_diagram_route_prepares_a_title_correction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_route(monkeypatch)
+    context, diagram = _context_with_diagram()
+    stack = _visual_stack(monkeypatch, context=context)
+    occurrence_id = stack.block_id_for(EditorialBlockKind.DIAGRAM)
+    stack.occurrence_holder["value"] = occurrence_id
+    body = _diagram_body(stack.snapshot_id, diagram, title="Revised documented infection flow")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=stack.app), base_url="http://editorial.test"
+    ) as client:
+        response = await _post(client, stack.subject_id, occurrence_id, body)
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["operation"] == "rewrite_diagram"
+    visual_patch = payload["patch"]["visual_patch"]
+    assert visual_patch["kind"] == "revise_diagram"
+    assert visual_patch["diagram"]["title"] == "Revised documented infection flow"
+    assert visual_patch["diagram"]["placement"]["kind"] == "end"
+    preview = payload["diagnostics"]["preview"]
+    assert preview["operation"] == "rewrite_diagram"
+    assert preview["diagram"]["media_type"] == "image/png"
+    assert stack.repository.records[0].model_run_id is None
+
+
+@pytest.mark.asyncio
+async def test_revise_diagram_route_maps_a_structurally_invalid_body_to_422(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_route(monkeypatch)
+    context, diagram = _context_with_diagram()
+    stack = _visual_stack(monkeypatch, context=context)
+    occurrence_id = stack.block_id_for(EditorialBlockKind.DIAGRAM)
+    stack.occurrence_holder["value"] = occurrence_id
+    # A non-protocol diagram requires at least one edge; the strict codec
+    # refuses the body and the route reports a typed, stable 422.
+    body = _diagram_body(stack.snapshot_id, diagram, title=diagram.title, edges=[])
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=stack.app), base_url="http://editorial.test"
+    ) as client:
+        response = await _post(client, stack.subject_id, occurrence_id, body)
+
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["code"] == "enrichment_revision_patch_invalid"
+    assert response.json()["detail"]["message"] == (
+        "La révision visuelle est invalide. Vérifiez les champs, puis réessayez."
+    )
+    assert stack.repository.records == []
+
+
+@pytest.mark.asyncio
+async def test_replace_source_figure_route_prepares_an_opaque_catalog_figure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_route(monkeypatch)
+    context, public_figure_id = _context_with_replaceable_figure()
+    stack = _visual_stack(monkeypatch, context=context)
+    occurrence_id = stack.block_id_for(EditorialBlockKind.FIGURE)
+    stack.occurrence_holder["value"] = occurrence_id
+    body = {
+        "snapshot_id": str(stack.snapshot_id),
+        "operation": "replace_source_figure",
+        "element_key": "figure_one",
+        "figure_id": str(public_figure_id),
+        "caption": "Synthetic replacement caption",
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=stack.app), base_url="http://editorial.test"
+    ) as client:
+        response = await _post(client, stack.subject_id, occurrence_id, body)
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["operation"] == "replace_source_figure"
+    visual_patch = payload["patch"]["visual_patch"]
+    assert visual_patch == {
+        "kind": "replace_source_figure",
+        "element_key": "figure_one",
+        "figure_id": str(public_figure_id),
+        "caption": "Synthetic replacement caption",
+    }
+    preview = payload["diagnostics"]["preview"]
+    assert preview["element_kind"] == "figure"
+    assert preview["figure_handle"] == "F002"
+    assert preview["previous_figure_id"] is None
+    assert stack.repository.records[0].model_run_id is None
+
+
+@pytest.mark.asyncio
+async def test_replace_source_figure_route_refuses_an_unknown_catalog_figure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_route(monkeypatch)
+    context, _public_figure_id = _context_with_replaceable_figure()
+    stack = _visual_stack(monkeypatch, context=context)
+    occurrence_id = stack.block_id_for(EditorialBlockKind.FIGURE)
+    stack.occurrence_holder["value"] = occurrence_id
+    body = {
+        "snapshot_id": str(stack.snapshot_id),
+        "operation": "replace_source_figure",
+        "element_key": "figure_one",
+        "figure_id": str(uuid4()),
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=stack.app), base_url="http://editorial.test"
+    ) as client:
+        response = await _post(client, stack.subject_id, occurrence_id, body)
+
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["code"] == "editorial_figure_not_found"
+    assert response.json()["detail"]["message"] == (
+        "Cette figure n'est plus disponible dans l'inventaire."
+    )
+    assert stack.repository.records == []
+
+
+@pytest.mark.asyncio
+async def test_remove_enrichment_element_route_prepares_a_typed_removal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_route(monkeypatch)
+    context = _context()
+    stack = _visual_stack(monkeypatch, context=context)
+    occurrence_id = stack.block_id_for(EditorialBlockKind.TABLE)
+    stack.occurrence_holder["value"] = occurrence_id
+    body = {
+        "snapshot_id": str(stack.snapshot_id),
+        "operation": "remove_enrichment_element",
+        "element_kind": "table",
+        "element_key": stack.table_key,
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=stack.app), base_url="http://editorial.test"
+    ) as client:
+        response = await _post(client, stack.subject_id, occurrence_id, body)
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["operation"] == "delete_table"
+    assert payload["patch"]["visual_patch"] == {
+        "kind": "remove_enrichment_element",
+        "element_kind": "table",
+        "element_key": stack.table_key,
+    }
+    preview = payload["diagnostics"]["preview"]
+    assert preview["operation"] == "delete_table"
+    assert preview["element_kind"] == "table"
+    assert stack.repository.records[0].model_run_id is None
+
+
+@pytest.mark.asyncio
+async def test_remove_enrichment_element_route_refuses_a_missing_element(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_route(monkeypatch)
+    context = _context()
+    stack = _visual_stack(monkeypatch, context=context)
+    occurrence_id = stack.block_id_for(EditorialBlockKind.TABLE)
+    stack.occurrence_holder["value"] = occurrence_id
+    body = {
+        "snapshot_id": str(stack.snapshot_id),
+        "operation": "remove_enrichment_element",
+        "element_kind": "table",
+        "element_key": "table_missing",
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=stack.app), base_url="http://editorial.test"
+    ) as client:
+        response = await _post(client, stack.subject_id, occurrence_id, body)
+
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["code"] == "enrichment_element_not_found"
+    assert stack.repository.records == []
 
 
 # ---------------------------------------------------------------------------

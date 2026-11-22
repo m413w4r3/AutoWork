@@ -58,10 +58,6 @@ function recordArray(value: unknown): Record<string, unknown>[] {
   return Array.isArray(value) ? value.filter(isRecord) : [];
 }
 
-function toRecord(value: object): Record<string, unknown> {
-  return { ...value };
-}
-
 function paragraphNumber(anchorBlockId: string): number | null {
   const match = /^paragraph-(\d+)-v\d+$/.exec(anchorBlockId);
   return match ? Number(match[1]) : null;
@@ -370,13 +366,35 @@ export class VisualEditorialFixture {
         return {
           kind: "revise_chart",
           element_key: revision.element_key,
-          chart: toRecord(revision.chart),
+          chart: {
+            ...revision.chart,
+            caption: revision.chart.caption ?? null,
+            placement: {
+              kind: "after_paragraph",
+              section_index: null,
+              anchor_block_id: this.anchorBlockIdFor(
+                revision.element_key as ElementKey,
+              ),
+            },
+          },
         };
       case "revise_diagram":
         return {
           kind: "revise_diagram",
           element_key: revision.element_key,
-          diagram: toRecord(revision.diagram),
+          diagram: {
+            ...revision.diagram,
+            caption: revision.diagram.caption ?? null,
+            placement: {
+              kind: "after_paragraph",
+              section_index: null,
+              anchor_block_id: this.anchorBlockIdFor(
+                revision.element_key as ElementKey,
+              ),
+            },
+            edges: revision.diagram.edges ?? [],
+            groups: revision.diagram.groups ?? [],
+          },
         };
     }
   }
@@ -546,6 +564,20 @@ export function chartCorrectionProposal(): VisualProposalRecord {
         kind: "bar",
         title: "Titre corrigé après revue",
         caption: "Légende corrigée après revue",
+        placement: {
+          kind: "after_paragraph",
+          section_index: null,
+          anchor_block_id: "paragraph-2-v0",
+        },
+        purpose: {
+          question: "Que montrent les événements observés ?",
+          available_data: "Deux catégories étayées par les sources.",
+          comprehension_gain: "Compare les volumes observés.",
+          scope: "Périmètre synthétique de la revue.",
+          evidence_refs: [],
+          knowledge_limits: "Limites synthétiques connues.",
+          placement_reason: "Après le paragraphe deux.",
+        },
         category_axis_label: "Catégories",
         value_axis_label: "Valeurs",
         unit: "événements",

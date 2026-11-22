@@ -557,6 +557,51 @@ export interface EditorialEnrichmentProposalPatch {
   [key: string]: unknown;
 }
 
+/** Persisted placement of one visual revision element (server-bound to the base). */
+export interface EditorialVisualRevisionPlacement {
+  kind:
+    | "after_paragraph"
+    | "after_lead"
+    | "after_timeline"
+    | "after_section"
+    | "end";
+  section_index: number | null;
+  anchor_block_id?: string | null;
+}
+
+/** Persisted replacement chart body, parsed by the backend strict codec. */
+export interface EditorialVisualRevisionChartPatch {
+  key: string;
+  kind: "bar" | "timeline";
+  title: string;
+  caption: string | null;
+  placement: EditorialVisualRevisionPlacement;
+  purpose: EditorialVisualPurposeInput;
+  points: EditorialVisualChartPointInput[];
+  category_axis_label?: string | null;
+  value_axis_label?: string | null;
+  unit?: string | null;
+  group_order?: number | null;
+}
+
+/** Persisted replacement diagram body, parsed by the backend strict codec. */
+export interface EditorialVisualRevisionDiagramPatch {
+  key: string;
+  kind: EditorialDiagramKind;
+  title: string;
+  caption: string | null;
+  direction: EditorialDiagramDirection;
+  profile?: EditorialDiagramProfile | null;
+  placement: EditorialVisualRevisionPlacement;
+  purpose?: EditorialVisualPurposeInput;
+  nodes: EditorialVisualDiagramNodeInput[];
+  edges: Array<
+    EditorialVisualDiagramEdgeInput & { relation_type?: string | null }
+  >;
+  groups: EditorialVisualDiagramGroupInput[];
+  group_order?: number | null;
+}
+
 /** Persisted, non-canonical payload of one typed visual revision proposal. */
 export type EditorialVisualRevisionPatch =
   | {
@@ -577,6 +622,16 @@ export type EditorialVisualRevisionPatch =
       order: EditorialEnrichmentElementRef[];
     }
   | {
+      kind: "revise_chart";
+      element_key: string;
+      chart: EditorialVisualRevisionChartPatch;
+    }
+  | {
+      kind: "revise_diagram";
+      element_key: string;
+      diagram: EditorialVisualRevisionDiagramPatch;
+    }
+  | {
       kind: "replace_source_figure";
       element_key: string;
       figure_id: string;
@@ -586,16 +641,6 @@ export type EditorialVisualRevisionPatch =
       kind: "remove_enrichment_element";
       element_kind: EditorialEnrichmentElementKind;
       element_key: string;
-    }
-  | {
-      kind: "revise_chart";
-      element_key: string;
-      chart: Record<string, unknown>;
-    }
-  | {
-      kind: "revise_diagram";
-      element_key: string;
-      diagram: Record<string, unknown>;
     };
 
 export interface EditorialVisualRevisionProposalPatch {
@@ -946,6 +991,7 @@ const ERROR_MESSAGES: Record<string, string> = {
     "Le contenu de cette proposition est temporairement indisponible.",
   proposal_patch_hash_mismatch:
     "Le contenu vérifié de cette proposition ne correspond plus.",
+  proposal_patch_invalid: "Le contenu de cette proposition est invalide.",
   proposal_base_unavailable:
     "Le texte de référence de cette proposition est indisponible.",
   proposal_base_hash_mismatch:

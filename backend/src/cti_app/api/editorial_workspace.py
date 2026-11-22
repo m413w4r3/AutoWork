@@ -107,7 +107,11 @@ from cti_app.config import Settings, get_settings
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.editorial_enrichment_patch import (
     MoveEnrichmentElementPatch,
+    RemoveEnrichmentElementPatch,
     ReorderEnrichmentElementsPatch,
+    ReplaceSourceFigurePatch,
+    ReviseChartPatch,
+    ReviseDiagramPatch,
     UpdateVisualCaptionPatch,
     VisualRevisionPatch,
 )
@@ -122,6 +126,8 @@ from cti_app.domain.production_editorial_enrichment import (
     DiagramNodeRole,
     DiagramProfile,
     DiagramRelationDirection,
+    DiagramRelationType,
+    DiagramSpecV1,
     EditorialAnalyticPurposeV1,
     EditorialEnrichmentElementKind,
     EnrichmentDiagramDirection,
@@ -133,6 +139,8 @@ from cti_app.domain.production_editorial_enrichment import (
     TableColumnV1,
     TableRowV1,
     TableSpecV1,
+    chart_spec_from_json,
+    diagram_spec_from_json,
 )
 from cti_app.domain.production_synthesis import EvidenceKind, ExtractionEvidenceRefV1
 from cti_app.domain.publication_kind import PublicationKind
@@ -1416,17 +1424,11 @@ EditorialEnrichmentRevisionRequest = Annotated[
     Field(discriminator="operation"),
 ]
 
-# Variants whose shared planner branch lands in F2-03b/F2-03c. Their request
-# schema is fixed now; the route refuses them with a typed 422 instead of
-# forwarding a patch the planner cannot apply.
-_UNIMPLEMENTED_VISUAL_REVISION_OPERATIONS = frozenset(
-    {
-        "revise_chart",
-        "revise_diagram",
-        "replace_source_figure",
-        "remove_enrichment_element",
-    }
-)
+# A visual revision never moves its element. The request body deliberately
+# carries no placement, so the translator supplies this server-owned marker and
+# the proposal service rebinds it to the exact pinned base placement before the
+# shared planner runs (and before the patch is persisted for adoption).
+_SERVER_OWNED_VISUAL_PLACEMENT: dict[str, object] = {"kind": "end", "section_index": None}
 
 
 class EditorialProposalAcceptView(BaseModel):
@@ -1560,6 +1562,7 @@ _ERROR_MESSAGES = {
         "Le contenu de cette proposition est temporairement indisponible."
     ),
     "proposal_patch_hash_mismatch": ("Le contenu vérifié de cette proposition ne correspond plus."),
+    "proposal_patch_invalid": "Le contenu de cette proposition est invalide.",
     "proposal_base_unavailable": "Le texte de référence de cette proposition est indisponible.",
     "proposal_base_hash_mismatch": "Le texte de référence ne correspond plus à son empreinte.",
     "proposal_state_conflict": "La proposition a changé. Actualisez-la avant de décider.",
@@ -3790,13 +3793,143 @@ def _enrichment_revision_status(code: str) -> int:
     return status.HTTP_422_UNPROCESSABLE_CONTENT
 
 
+def _visual_revision_evidence_ref(
+    reference: EditorialTableEvidenceReferenceRequest,
+) -> dict[str, str]:
+    """One strict evidence reference in its canonical wire form."""
+    return {
+        "source_document_id": str(reference.source_document_id),
+        "kind": reference.kind.value,
+        "evidence_key": reference.evidence_key,
+    }
+
+
+def _visual_revision_purpose(purpose: EditorialTablePurposeRequest) -> dict[str, object]:
+    return {
+        "question": purpose.question,
+        "available_data": purpose.available_data,
+        "comprehension_gain": purpose.comprehension_gain,
+        "scope": purpose.scope,
+        "evidence_refs": [
+            _visual_revision_evidence_ref(reference) for reference in purpose.evidence_refs
+        ],
+        "knowledge_limits": purpose.knowledge_limits,
+        "placement_reason": purpose.placement_reason,
+    }
+
+
+def _visual_revision_chart_spec(chart: EditorialVisualChartRequest) -> ChartSpecV1:
+    """Parse a replacement chart body with the canonical strict codec.
+
+    The persisted patch must reparse byte-identically at adoption, so the wire
+    form is the same one ``chart_spec_to_json`` produces. Placement stays
+    server-owned (see ``_SERVER_OWNED_VISUAL_PLACEMENT``).
+    """
+    points: list[dict[str, object]] = []
+    for point in chart.points:
+        evidence_refs = [
+            _visual_revision_evidence_ref(reference) for reference in point.evidence_refs
+        ]
+        if chart.kind is ChartKind.BAR:
+            if point.value is None:
+                raise ValueError("Bar chart revision point value is missing")
+            points.append(
+                {
+                    "label": point.label,
+                    "value": format(point.value, "f"),
+                    "series": point.series,
+                    "evidence_refs": evidence_refs,
+                }
+            )
+        else:
+            points.append(
+                {
+                    "label": point.label,
+                    "date": point.date,
+                    "series": point.series,
+                    "evidence_refs": evidence_refs,
+                }
+            )
+    payload: dict[str, object] = {
+        "key": chart.key,
+        "kind": chart.kind.value,
+        "title": chart.title,
+        "caption": chart.caption,
+        "placement": dict(_SERVER_OWNED_VISUAL_PLACEMENT),
+        "purpose": _visual_revision_purpose(chart.purpose),
+        "points": points,
+    }
+    if chart.kind is ChartKind.BAR:
+        payload["category_axis_label"] = chart.category_axis_label
+        payload["value_axis_label"] = chart.value_axis_label
+        payload["unit"] = chart.unit
+    return chart_spec_from_json(payload)
+
+
+def _visual_revision_diagram_spec(diagram: EditorialVisualDiagramRequest) -> DiagramSpecV1:
+    """Parse a replacement diagram body with the canonical strict codec.
+
+    The profiled/analytic key sets are exhaustive, so a profiled diagram always
+    carries an explicit edge relation type and direction; an unprofiled one
+    keeps the factual default and no direction key.
+    """
+    profiled = diagram.profile is not None
+    edges: list[dict[str, object]] = []
+    for edge in diagram.edges:
+        edge_payload: dict[str, object] = {
+            "source_node_id": edge.source_node_id,
+            "target_node_id": edge.target_node_id,
+            "label": edge.label,
+            "evidence_refs": [
+                _visual_revision_evidence_ref(reference) for reference in edge.evidence_refs
+            ],
+            "relation_type": DiagramRelationType.FACTUAL.value,
+        }
+        if profiled:
+            edge_payload["direction"] = (edge.direction or DiagramRelationDirection.DIRECTED).value
+        edges.append(edge_payload)
+    payload: dict[str, object] = {
+        "key": diagram.key,
+        "kind": diagram.kind.value,
+        "title": diagram.title,
+        "caption": diagram.caption,
+        "direction": diagram.direction.value,
+        "nodes": [
+            {
+                "node_id": node.node_id,
+                "label": node.label,
+                "role": node.role.value,
+                "evidence_refs": [
+                    _visual_revision_evidence_ref(reference) for reference in node.evidence_refs
+                ],
+            }
+            for node in diagram.nodes
+        ],
+        "edges": edges,
+        "groups": [
+            {
+                "group_id": group.group_id,
+                "label": group.label,
+                "node_ids": list(group.node_ids),
+            }
+            for group in diagram.groups
+        ],
+        "placement": dict(_SERVER_OWNED_VISUAL_PLACEMENT),
+        "purpose": _visual_revision_purpose(diagram.purpose),
+    }
+    if profiled:
+        assert diagram.profile is not None
+        payload["profile"] = diagram.profile.value
+    return diagram_spec_from_json(payload)
+
+
 def _visual_revision_patch_from_request(
     payload: EditorialEnrichmentRevisionRequest,
 ) -> VisualRevisionPatch:
     """Translate one typed request variant into the closed domain union.
 
-    The four variants whose planner branch is still in flight never reach this
-    function: the route refuses them with `enrichment_revision_unsupported_operation`.
+    A request the strict codecs cannot represent raises ``ValueError``; the
+    route turns that into a typed 422 instead of a generic failure.
     """
     if isinstance(payload, EditorialVisualCaptionRevisionRequest):
         return UpdateVisualCaptionPatch(
@@ -3815,13 +3948,28 @@ def _visual_revision_patch_from_request(
             anchor_block_id=payload.anchor_block_id,
             order=tuple(EnrichmentElementRef(item.kind, item.key) for item in payload.order),
         )
-    raise HTTPException(
-        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-        detail={
-            "code": "enrichment_revision_unsupported_operation",
-            "message": _ERROR_MESSAGES["enrichment_revision_unsupported_operation"],
-        },
-    )
+    if isinstance(payload, EditorialReviseChartRevisionRequest):
+        return ReviseChartPatch(
+            element_key=payload.element_key,
+            chart=_visual_revision_chart_spec(payload.chart),
+        )
+    if isinstance(payload, EditorialReviseDiagramRevisionRequest):
+        return ReviseDiagramPatch(
+            element_key=payload.element_key,
+            diagram=_visual_revision_diagram_spec(payload.diagram),
+        )
+    if isinstance(payload, EditorialReplaceSourceFigureRevisionRequest):
+        return ReplaceSourceFigurePatch(
+            element_key=payload.element_key,
+            figure_id=payload.figure_id,
+            caption=payload.caption,
+        )
+    if isinstance(payload, EditorialRemoveEnrichmentElementRevisionRequest):
+        return RemoveEnrichmentElementPatch(
+            element_kind=payload.element_kind,
+            element_key=payload.element_key,
+        )
+    raise ValueError("Unsupported visual revision request variant")
 
 
 def _log_enrichment_revision_rejection(
@@ -3886,10 +4034,12 @@ async def prepare_enrichment_revision(
             },
         )
     actor_id = await _thread_actor_id(request)
-    if payload.operation in _UNIMPLEMENTED_VISUAL_REVISION_OPERATIONS:
+    try:
+        patch = _visual_revision_patch_from_request(payload)
+    except (KeyError, TypeError, ValueError):
         _log_enrichment_revision_rejection(
-            code="enrichment_revision_unsupported_operation",
-            reason=f"operation:{payload.operation}",
+            code="enrichment_revision_patch_invalid",
+            reason=f"translation:{payload.operation}",
             diagnostics=None,
             subject_id=subject_id,
             occurrence_id=occurrence_id,
@@ -3897,12 +4047,11 @@ async def prepare_enrichment_revision(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail={
-                "code": "enrichment_revision_unsupported_operation",
-                "message": _ERROR_MESSAGES["enrichment_revision_unsupported_operation"],
+                "code": "enrichment_revision_patch_invalid",
+                "message": _ERROR_MESSAGES["enrichment_revision_patch_invalid"],
             },
-        )
+        ) from None
     try:
-        patch = _visual_revision_patch_from_request(payload)
         service = _manual_proposal_service(request)
         proposal = await service.prepare_visual_revision(
             subject_id=subject_id,

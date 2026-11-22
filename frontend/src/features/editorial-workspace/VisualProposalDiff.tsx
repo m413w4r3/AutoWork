@@ -1,5 +1,7 @@
 import type {
   EditorialEvidenceReference,
+  EditorialVisualRevisionChartPatch,
+  EditorialVisualRevisionDiagramPatch,
   EditorialVisualRevisionProposalPatch,
   EditorialWorkspaceBlock,
 } from "../../api/editorialWorkspace";
@@ -18,20 +20,6 @@ interface VisualProposalDiffProps {
   warnings: readonly string[];
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function text(value: unknown): string | null {
-  return typeof value === "string" && value.trim().length > 0
-    ? value.trim()
-    : null;
-}
-
-function records(value: unknown): Record<string, unknown>[] {
-  return Array.isArray(value) ? value.filter(isRecord) : [];
-}
-
 interface PointSummary {
   label: string;
   series: string;
@@ -48,61 +36,26 @@ interface ChartSummary {
   evidenceRefs: EditorialEvidenceReference[];
 }
 
-function evidenceReference(value: unknown): EditorialEvidenceReference | null {
-  if (
-    !isRecord(value) ||
-    typeof value.source_document_id !== "string" ||
-    typeof value.kind !== "string" ||
-    typeof value.evidence_key !== "string"
-  ) {
-    return null;
-  }
-  const kind = value.kind;
-  if (
-    kind !== "fact" &&
-    kind !== "event" &&
-    kind !== "source_metadata" &&
-    kind !== "indicator" &&
-    kind !== "rule" &&
-    kind !== "uncertainty"
-  ) {
-    return null;
-  }
-  return {
-    source_document_id: value.source_document_id,
-    kind,
-    evidence_key: value.evidence_key,
-  };
-}
-
-function chartSummary(raw: Record<string, unknown>): ChartSummary {
+function chartSummary(chart: EditorialVisualRevisionChartPatch): ChartSummary {
   const evidenceRefs = new Map<string, EditorialEvidenceReference>();
-  const points = records(raw.points).flatMap((point) => {
-    const label = text(point.label) ?? "";
-    const series = text(point.series) ?? "";
-    const value =
-      typeof point.value === "string"
-        ? point.value
-        : typeof point.date === "string"
-          ? point.date
-          : "";
-    for (const reference of records(point.evidence_refs)) {
-      const parsed = evidenceReference(reference);
-      if (parsed) {
-        evidenceRefs.set(
-          `${parsed.source_document_id}:${parsed.kind}:${parsed.evidence_key}`,
-          parsed,
-        );
-      }
+  const points = chart.points.flatMap((point) => {
+    const label = point.label.trim();
+    const series = point.series.trim();
+    const value = point.value ?? point.date ?? "";
+    for (const reference of point.evidence_refs) {
+      evidenceRefs.set(
+        `${reference.source_document_id}:${reference.kind}:${reference.evidence_key}`,
+        reference,
+      );
     }
     return label || value ? [{ label, series, value }] : [];
   });
   return {
-    title: text(raw.title) ?? "",
-    caption: text(raw.caption),
-    categoryAxisLabel: text(raw.category_axis_label) ?? "",
-    valueAxisLabel: text(raw.value_axis_label) ?? "",
-    unit: text(raw.unit) ?? "",
+    title: chart.title,
+    caption: chart.caption,
+    categoryAxisLabel: chart.category_axis_label ?? "",
+    valueAxisLabel: chart.value_axis_label ?? "",
+    unit: chart.unit ?? "",
     points,
     evidenceRefs: [...evidenceRefs.values()],
   };
@@ -116,33 +69,29 @@ interface DiagramSummary {
   edges: { id: string; label: string }[];
 }
 
-function diagramSummary(raw: Record<string, unknown>): DiagramSummary {
+function diagramSummary(
+  diagram: EditorialVisualRevisionDiagramPatch,
+): DiagramSummary {
   const nodeLabels = new Map<string, string>();
-  const nodes = records(raw.nodes).flatMap((node) => {
-    const id = text(node.node_id);
-    if (!id) return [];
-    const label = text(node.label) ?? id;
-    nodeLabels.set(id, label);
-    return [{ id, label }];
+  const nodes = diagram.nodes.map((node) => {
+    nodeLabels.set(node.node_id, node.label);
+    return { id: node.node_id, label: node.label };
   });
-  const edges = records(raw.edges).flatMap((edge) => {
-    const source = text(edge.source_node_id);
-    const target = text(edge.target_node_id);
-    if (!source || !target) return [];
-    const sourceLabel = nodeLabels.get(source) ?? source;
-    const targetLabel = nodeLabels.get(target) ?? target;
-    const label = text(edge.label);
-    return [
-      {
-        id: `${source}->${target}`,
-        label: `${sourceLabel} → ${targetLabel}${label ? ` (${label})` : ""}`,
-      },
-    ];
+  const edges = diagram.edges.map((edge) => {
+    const sourceLabel =
+      nodeLabels.get(edge.source_node_id) ?? edge.source_node_id;
+    const targetLabel =
+      nodeLabels.get(edge.target_node_id) ?? edge.target_node_id;
+    const label = edge.label ?? null;
+    return {
+      id: `${edge.source_node_id}->${edge.target_node_id}`,
+      label: `${sourceLabel} → ${targetLabel}${label ? ` (${label})` : ""}`,
+    };
   });
   return {
-    title: text(raw.title) ?? "",
-    caption: text(raw.caption),
-    direction: text(raw.direction) ?? "",
+    title: diagram.title,
+    caption: diagram.caption,
+    direction: diagram.direction,
     nodes,
     edges,
   };
