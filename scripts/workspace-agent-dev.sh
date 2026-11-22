@@ -6,8 +6,8 @@
 
 set -euo pipefail
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-repository_root=$(CDPATH= cd -- "$script_dir/.." && pwd -P)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+repository_root=$(CDPATH='' cd -- "$script_dir/.." && pwd -P)
 socket_dir=${AUTOWORK_WORKSPACE_SOCKET_DIR:-"$repository_root/var/run/workspace-agent"}
 workspace_root=${AUTOWORK_WORKSPACE_ROOT:-"$repository_root/var/workspace-agent-root"}
 python_bin=${AUTOWORK_PYTHON:-/usr/bin/python3.12}
