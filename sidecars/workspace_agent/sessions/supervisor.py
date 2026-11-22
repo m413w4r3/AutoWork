@@ -1,0 +1,2388 @@
+"""Host session supervisor: profiles, lifecycle, reconciliation, capture, secret.
+
+One supervisor lives inside the workspace agent process and serves
+``/v1/sessions/**`` on the same AF_UNIX socket and bearer token. It launches
+only closed ``SessionProfile`` registrations (H1 ships the deterministic
+``fake`` profile); a client never supplies a binary, argv, environment or host
+path. All runtime state, logs and the per-session IPC socket live under
+``<runtime>/sessions/<session_id>/`` and never inside a workspace.
+
+Normative source: ``docs/design/investigation-workshop/SESSION-RUNNER.md`` §5-§6.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import logging
+import os
+import re
+import shutil
+import signal
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from collections import deque
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING, BinaryIO, Protocol
+
+from .. import files, paths, policies, protocol, scan, workspace
+from ..scan import Clock, SystemClock
+from . import logs, process
+from . import state as session_state
+from .state import (
+    ACTIVE_STATES,
+    BudgetExceededError,
+    BudgetSpec,
+    CapabilityUnavailableError,
+    ConfinementUnavailableError,
+    ExitRecord,
+    HandoffRef,
+    IdempotencyConflictError,
+    ManifestMissingError,
+    ResumeUnavailableError,
+    RunRecord,
+    SecretUnavailableError,
+    SessionBusyError,
+    SessionError,
+    SessionNotFoundError,
+    SessionRecord,
+    SessionRequestError,
+    SessionState,
+    SessionStateConflictError,
+)
+
+if TYPE_CHECKING:
+    from ..agent import WorkspaceAgent
+
+LOGGER = logging.getLogger("autowork.workspace_agent.sessions")
+
+SESSION_RUNTIME_DIRECTORY = "sessions"
+SESSION_SOCKET_FILE_NAME = "shim.sock"
+PROMPT_FILE_NAME = "prompt.json"
+FAKE_SCRIPT_FILE_NAME = "fake-script.json"
+FAKE_OUTPUT_FILE_NAME = "fake-output.json"
+SCRATCH_DIRECTORY = "scratch"
+WORK_DIRECTORY = "work"
+IPC_DIRECTORY = "ipc"
+STATE_FILE_MODE = 0o600
+PRIVATE_DIRECTORY_MODE = 0o700
+
+PROBE_VERSION = "fake-cli-1"
+FAKE_HELP_DIGEST = hashlib.sha256(b"autowork-fake-cli --help v1\n").hexdigest()
+MAX_PROMPT_BYTES = 256 * 1024
+MAX_SKILL_BYTES = 64 * 1024
+MAX_INSTRUCTION_BYTES = 32 * 1024
+MAX_RUN_PROMPT_BYTES = 32 * 1024
+MAX_REASON_BYTES = 256
+MAX_MANIFEST_BYTES = 512 * 1024
+MAX_MANIFEST_TOOLS = 512
+MAX_CAPTURE_NOTE_BYTES = 1024 * 1024
+MAX_CAPTURE_TOTAL_BYTES = 4 * 1024 * 1024
+IDEMPOTENCY_RETENTION_NS = 24 * 60 * 60 * 1_000_000_000
+IDEMPOTENCY_MAX_KEYS = 1000
+CAPTURE_ID_SAFE = re.compile(r"[^A-Za-z0-9._:-]+")
+MODEL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
+ADAPTER_KIND_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+WORKSPACE_ID_PATTERN = re.compile(r"^ws-[0-9a-f]{32}$")
+TOOL_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_.]{0,63}$")
+SESSION_PROTOCOL = protocol.SESSIONS_PROTOCOL_VERSION
+DEFAULT_SKILLS_ROOT = Path(__file__).resolve().parents[3] / ".agents" / "skills"
+DEFAULT_FAKE_SCENARIO = "success"
+
+
+class SessionConfigError(RuntimeError):
+    """The supervisor cannot be configured safely (fatal at agent start)."""
+
+
+# ---------------------------------------------------------------------------
+# Profiles: the only processes the supervisor may launch
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ProbeFlags:
+    non_interactive: bool
+    json_events: bool
+    structured_output: bool
+    resume: bool
+    streaming_stdin: bool
+    mcp_per_invocation: bool
+    os_sandbox: bool
+
+    def to_wire(self) -> dict[str, bool]:
+        return {
+            "non_interactive": self.non_interactive,
+            "json_events": self.json_events,
+            "structured_output": self.structured_output,
+            "resume": self.resume,
+            "streaming_stdin": self.streaming_stdin,
+            "mcp_per_invocation": self.mcp_per_invocation,
+            "os_sandbox": self.os_sandbox,
+        }
+
+
+@dataclass(frozen=True)
+class CapabilityProbe:
+    adapter_kind: str
+    version: str
+    binary_sha256: str
+    help_sha256: str
+    flags: ProbeFlags
+    confinement: dict[str, object]
+    probed_at: str
+    probe_sha256: str
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "protocol": SESSION_PROTOCOL,
+            "adapter_kind": self.adapter_kind,
+            "version": self.version,
+            "binary_sha256": self.binary_sha256,
+            "help_sha256": self.help_sha256,
+            "flags": self.flags.to_wire(),
+            "confinement": dict(self.confinement),
+            "probed_at": self.probed_at,
+            "probe_sha256": self.probe_sha256,
+        }
+
+
+def _probe_digest(payload: Mapping[str, object]) -> str:
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+@dataclass(frozen=True)
+class LaunchContext:
+    session_id: str
+    record: SessionRecord
+    session_directory: Path
+    scratch_directory: Path
+    work_directory: Path
+    home_directory: Path
+    config_directory: Path
+    ipc_socket_path: Path
+    prompt_path: Path
+    run: int
+    resume: bool
+    fake_scenario: str
+
+
+class SessionProfile(Protocol):
+    """A closed process profile; H4/H5 register the real CLI adapters."""
+
+    adapter_kind: str
+    requires_sandbox: bool
+    requires_manifest: bool
+
+    def probe(self, *, now: str) -> CapabilityProbe: ...
+
+    def build_launch_plan(self, context: LaunchContext) -> process.LaunchPlan: ...
+
+
+class FakeProfile:
+    """Deterministic scripted process used to prove lifecycle and wire only."""
+
+    adapter_kind = "fake"
+    requires_sandbox = False
+    requires_manifest = False
+
+    def __init__(self, *, supports_resume: bool = False) -> None:
+        self._supports_resume = supports_resume
+
+    def probe(self, *, now: str) -> CapabilityProbe:
+        try:
+            binary_sha256 = hashlib.sha256(_fake_cli_path().read_bytes()).hexdigest()
+        except OSError as exc:
+            raise CapabilityUnavailableError(self.adapter_kind) from exc
+        flags = ProbeFlags(
+            non_interactive=True,
+            json_events=True,
+            structured_output=True,
+            resume=self._supports_resume,
+            streaming_stdin=True,
+            mcp_per_invocation=False,
+            os_sandbox=False,
+        )
+        confinement: dict[str, object] = {
+            "profile": "fake-direct",
+            "bwrap_ok": False,
+            "netns": False,
+        }
+        payload: dict[str, object] = {
+            "adapter_kind": self.adapter_kind,
+            "version": PROBE_VERSION,
+            "binary_sha256": binary_sha256,
+            "help_sha256": FAKE_HELP_DIGEST,
+            "flags": flags.to_wire(),
+            "confinement": confinement,
+            "probed_at": now,
+        }
+        return CapabilityProbe(
+            adapter_kind=self.adapter_kind,
+            version=PROBE_VERSION,
+            binary_sha256=binary_sha256,
+            help_sha256=FAKE_HELP_DIGEST,
+            flags=flags,
+            confinement=confinement,
+            probed_at=now,
+            probe_sha256=_probe_digest(payload),
+        )
+
+    def build_launch_plan(self, context: LaunchContext) -> process.LaunchPlan:
+        session_dir = context.session_directory
+        argv: list[str] = [
+            sys.executable,
+            "-B",
+            str(_fake_cli_path()),
+            "--session-id",
+            context.session_id,
+            "--run",
+            str(context.run),
+            "--scenario",
+            context.fake_scenario,
+            "--output-file",
+            str(context.work_directory / FAKE_OUTPUT_FILE_NAME),
+            "--prompt-file",
+            str(context.prompt_path),
+        ]
+        script_path = session_dir / FAKE_SCRIPT_FILE_NAME
+        if script_path.is_file():
+            argv.extend(("--script", str(script_path)))
+        if context.resume:
+            argv.append("--resume")
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(context.home_directory),
+            "XDG_CONFIG_HOME": str(context.config_directory),
+            "XDG_CACHE_HOME": str(context.session_directory / "cache"),
+            "TMPDIR": str(context.session_directory / "tmp"),
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "AUTOWORK_SESSION_ID": context.session_id,
+            "AUTOWORK_SESSION_SOCKET": str(context.ipc_socket_path),
+            "AUTOWORK_BACKEND_URL": "http://127.0.0.1:8000",
+            "AUTOWORK_FAKE_CLI_SCENARIO": context.fake_scenario,
+        }
+        if script_path.is_file():
+            env["AUTOWORK_FAKE_CLI_SCRIPT"] = str(script_path)
+        return process.LaunchPlan(
+            argv=tuple(argv),
+            env=env,
+            cwd=context.work_directory,
+            uses_bwrap=False,
+        )
+
+
+def _fake_cli_path() -> Path:
+    return Path(__file__).with_name("fake_cli.py")
+
+
+class ProfileRegistry:
+    """Closed adapter-kind -> profile mapping; unregistered kinds are refused."""
+
+    def __init__(self, profiles: Sequence[SessionProfile] = ()) -> None:
+        self._profiles: dict[str, SessionProfile] = {}
+        for profile in profiles:
+            self.register(profile)
+
+    def register(self, profile: SessionProfile) -> None:
+        if not ADAPTER_KIND_PATTERN.fullmatch(profile.adapter_kind):
+            raise SessionConfigError("invalid adapter kind")
+        if profile.adapter_kind in self._profiles:
+            raise SessionConfigError("duplicate adapter kind")
+        self._profiles[profile.adapter_kind] = profile
+
+    def get(self, adapter_kind: object) -> SessionProfile:
+        if (
+            not isinstance(adapter_kind, str)
+            or ADAPTER_KIND_PATTERN.fullmatch(adapter_kind) is None
+        ):
+            raise CapabilityUnavailableError(str(adapter_kind))
+        profile = self._profiles.get(adapter_kind)
+        if profile is None:
+            raise CapabilityUnavailableError(adapter_kind)
+        return profile
+
+    def probe(self, adapter_kind: object, *, now: str) -> CapabilityProbe:
+        return self.get(adapter_kind).probe(now=now)
+
+
+def default_profiles() -> ProfileRegistry:
+    return ProfileRegistry((FakeProfile(),))
+
+
+# ---------------------------------------------------------------------------
+# Typed request payloads (§6)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PrepareSessionRequest:
+    session_id: str
+    adapter_kind: str
+    workspace_id: str
+    investigation_id: str
+    task_id: str
+    handoff: HandoffRef
+    lease_fence: int
+    allowed_workspace_paths: tuple[str, ...]
+    skill_names: tuple[str, ...]
+    budgets: BudgetSpec
+    model: str | None
+    auth_secret: bytes = field(repr=False)
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> PrepareSessionRequest:
+        session_state.require_fields(
+            payload,
+            (
+                "session_id",
+                "adapter_kind",
+                "workspace_id",
+                "investigation_id",
+                "task_id",
+                "handoff",
+                "lease_fence",
+                "allowed_workspace_paths",
+                "skill_names",
+                "budgets",
+                "auth_secret",
+            ),
+            ("model",),
+        )
+        session_id = session_state.require_uuid(payload["session_id"], "session_id")
+        adapter_kind = session_state.require_str(
+            payload["adapter_kind"], "adapter_kind", maximum=32
+        )
+        if ADAPTER_KIND_PATTERN.fullmatch(adapter_kind) is None:
+            raise SessionRequestError("adapter_kind", "invalid")
+        workspace_id = session_state.require_str(
+            payload["workspace_id"], "workspace_id", maximum=35
+        )
+        if WORKSPACE_ID_PATTERN.fullmatch(workspace_id) is None:
+            raise SessionRequestError("workspace_id", "invalid")
+        investigation_id = session_state.require_uuid(
+            payload["investigation_id"], "investigation_id"
+        )
+        task_id = session_state.require_uuid(payload["task_id"], "task_id")
+        handoff = HandoffRef.from_payload(payload["handoff"])
+        lease_fence = session_state.require_int(payload["lease_fence"], "lease_fence", minimum=0)
+        allowed = session_state.require_str_tuple(
+            payload["allowed_workspace_paths"], "allowed_workspace_paths"
+        )
+        for entry in allowed:
+            try:
+                if "/" not in entry:
+                    if entry not in paths.ALLOWED_TOP_LEVEL_DIRECTORIES:
+                        raise SessionRequestError("allowed_workspace_paths", "top_level")
+                else:
+                    paths.validate_relative_path(entry)
+            except paths.WorkspacePathError as exc:
+                reason = exc.details.get("reason")
+                raise SessionRequestError(
+                    "allowed_workspace_paths",
+                    reason if isinstance(reason, str) else "invalid",
+                ) from exc
+        skill_names = session_state.require_str_tuple(
+            payload["skill_names"], "skill_names", maximum=session_state.MAX_SKILLS
+        )
+        for name in skill_names:
+            if session_state.SKILL_NAME_PATTERN.fullmatch(name) is None:
+                raise SessionRequestError("skill_names", "invalid")
+        budgets = BudgetSpec.from_payload(payload["budgets"])
+        model_value = payload.get("model")
+        if model_value is None:
+            model: str | None = None
+        else:
+            model = session_state.require_str(model_value, "model", maximum=128)
+            if MODEL_PATTERN.fullmatch(model) is None:
+                raise SessionRequestError("model", "invalid")
+        secret = session_state.decode_session_secret(payload["auth_secret"])
+        return cls(
+            session_id=session_id,
+            adapter_kind=adapter_kind,
+            workspace_id=workspace_id,
+            investigation_id=investigation_id,
+            task_id=task_id,
+            handoff=handoff,
+            lease_fence=lease_fence,
+            allowed_workspace_paths=allowed,
+            skill_names=skill_names,
+            budgets=budgets,
+            model=model,
+            auth_secret=secret,
+        )
+
+
+@dataclass(frozen=True)
+class StartSessionRequest:
+    run_prompt: str | None = None
+    instruction_id: str | None = None
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> StartSessionRequest:
+        session_state.require_fields(payload, (), ("run_prompt", "instruction_id"))
+        run_prompt = payload.get("run_prompt")
+        if run_prompt is not None:
+            run_prompt = session_state.require_str(
+                run_prompt, "run_prompt", maximum=MAX_RUN_PROMPT_BYTES
+            )
+        instruction_id = payload.get("instruction_id")
+        if instruction_id is not None:
+            instruction_id = session_state.require_uuid(instruction_id, "instruction_id")
+        return cls(run_prompt=run_prompt, instruction_id=instruction_id)
+
+
+@dataclass(frozen=True)
+class InstructionRequest:
+    instruction_id: str
+    text: str
+    sha256: str
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> InstructionRequest:
+        session_state.require_fields(payload, ("instruction_id", "text", "sha256"), ())
+        instruction_id = session_state.require_uuid(payload["instruction_id"], "instruction_id")
+        text = session_state.require_str(payload["text"], "text", maximum=MAX_INSTRUCTION_BYTES)
+        if text == "":
+            raise SessionRequestError("text", "empty")
+        sha256 = session_state.require_sha256(payload["sha256"], "sha256")
+        if hashlib.sha256(text.encode("utf-8")).hexdigest() != sha256:
+            raise SessionRequestError("sha256", "mismatch")
+        return cls(instruction_id=instruction_id, text=text, sha256=sha256)
+
+
+@dataclass(frozen=True)
+class ReasonRequest:
+    reason: str
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> ReasonRequest:
+        session_state.require_fields(payload, ("reason",), ())
+        return cls(
+            reason=session_state.require_str(payload["reason"], "reason", maximum=MAX_REASON_BYTES)
+        )
+
+
+@dataclass(frozen=True)
+class ResumeRequest:
+    reason: str
+    instruction_id: str | None = None
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> ResumeRequest:
+        session_state.require_fields(payload, ("reason",), ("instruction_id",))
+        reason = session_state.require_str(payload["reason"], "reason", maximum=MAX_REASON_BYTES)
+        instruction_id = payload.get("instruction_id")
+        if instruction_id is not None:
+            instruction_id = session_state.require_uuid(instruction_id, "instruction_id")
+        return cls(reason=reason, instruction_id=instruction_id)
+
+
+@dataclass(frozen=True)
+class ReconcileRequest:
+    observed_exit: dict[str, object] | None = None
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> ReconcileRequest:
+        session_state.require_fields(payload, (), ("observed_exit",))
+        value = payload.get("observed_exit")
+        if value is None:
+            return cls()
+        entry = session_state.require_object(value, "observed_exit")
+        session_state.require_fields(entry, (), ("code", "signal"))
+        for name in ("code", "signal"):
+            if name in entry and entry[name] is not None:
+                session_state.require_int(entry[name], f"observed_exit.{name}", minimum=0)
+        return cls(observed_exit=entry)
+
+
+@dataclass(frozen=True)
+class CollectRequest:
+    capture: bool
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> CollectRequest:
+        session_state.require_fields(payload, ("capture",), ())
+        return cls(capture=session_state.require_bool(payload["capture"], "capture"))
+
+
+@dataclass(frozen=True)
+class ToolManifestRequest:
+    manifest_sha256: str
+    tools: tuple[dict[str, object], ...]
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> ToolManifestRequest:
+        session_state.require_fields(payload, ("manifest_sha256", "tools"), ())
+        manifest_sha256 = session_state.require_sha256(
+            payload["manifest_sha256"], "manifest_sha256"
+        )
+        raw_tools = payload["tools"]
+        if not isinstance(raw_tools, list) or len(raw_tools) > MAX_MANIFEST_TOOLS:
+            raise SessionRequestError("tools", "list_required")
+        tools: list[dict[str, object]] = []
+        for raw in raw_tools:
+            entry = session_state.require_object(raw, "tools")
+            session_state.require_fields(
+                entry,
+                (
+                    "mcp_name",
+                    "broker_name",
+                    "schema_version",
+                    "input_schema",
+                    "effect",
+                    "cost",
+                    "capability",
+                ),
+                (),
+            )
+            mcp_name = session_state.require_str(entry["mcp_name"], "tools.mcp_name", maximum=64)
+            if TOOL_NAME_PATTERN.fullmatch(mcp_name) is None:
+                raise SessionRequestError("tools.mcp_name", "invalid")
+            broker_name = session_state.require_str(
+                entry["broker_name"], "tools.broker_name", maximum=64
+            )
+            if TOOL_NAME_PATTERN.fullmatch(broker_name) is None:
+                raise SessionRequestError("tools.broker_name", "invalid")
+            session_state.require_str(entry["schema_version"], "tools.schema_version", maximum=32)
+            session_state.require_object(entry["input_schema"], "tools.input_schema")
+            session_state.require_str(entry["effect"], "tools.effect", maximum=32)
+            session_state.require_str(entry["cost"], "tools.cost", maximum=64)
+            capability = entry["capability"]
+            if capability is not None:
+                session_state.require_str(capability, "tools.capability", maximum=64)
+            tools.append(entry)
+        digest = _probe_digest({"tools": tools})
+        if digest != manifest_sha256:
+            raise SessionRequestError("manifest_sha256", "mismatch")
+        return cls(manifest_sha256=manifest_sha256, tools=tuple(tools))
+
+
+# ---------------------------------------------------------------------------
+# Idempotency store and secret handoff
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _StoredResponse:
+    request_sha256: str
+    status: int
+    body: dict[str, object]
+    at_ns: int
+
+
+class IdempotencyStore:
+    """In-memory replay of POST responses for 24 h (SESSION-RUNNER §6)."""
+
+    def __init__(self, clock: Clock, *, retention_ns: int = IDEMPOTENCY_RETENTION_NS) -> None:
+        self._clock = clock
+        self._retention_ns = retention_ns
+        self._entries: dict[tuple[str, str], _StoredResponse] = {}
+        self._lock = threading.Lock()
+
+    def replay(
+        self, scope: str, key: str, request_sha256: str
+    ) -> tuple[int, dict[str, object]] | None:
+        with self._lock:
+            self._purge_locked()
+            entry = self._entries.get((scope, key))
+            if entry is None:
+                return None
+            if entry.request_sha256 != request_sha256:
+                raise IdempotencyConflictError(key)
+            return entry.status, _copy_body(entry.body)
+
+    def remember(
+        self,
+        scope: str,
+        key: str,
+        request_sha256: str,
+        status: int,
+        body: Mapping[str, object],
+    ) -> None:
+        with self._lock:
+            self._purge_locked()
+            self._entries[(scope, key)] = _StoredResponse(
+                request_sha256=request_sha256,
+                status=status,
+                body=_copy_body(body),
+                at_ns=self._clock.wall_ns(),
+            )
+            while len(self._entries) > IDEMPOTENCY_MAX_KEYS:
+                oldest = min(self._entries, key=lambda item: self._entries[item].at_ns)
+                del self._entries[oldest]
+
+    def _purge_locked(self) -> None:
+        now_ns = self._clock.wall_ns()
+        expired = [
+            item
+            for item, entry in self._entries.items()
+            if now_ns - entry.at_ns > self._retention_ns
+        ]
+        for item in expired:
+            del self._entries[item]
+
+
+class SecretBroker:
+    """One-shot per-session AF_UNIX secret handoff to the shim process (§3/§7).
+
+    The listener is a 0600 AF_UNIX socket owned by the runtime dir. The peer uid
+    must equal the supervisor uid; the secret is written once, zeroed from
+    memory, and the socket is unlinked. No payload is ever logged.
+    """
+
+    def __init__(
+        self, socket_path: Path, session_id: str, secret: bytes, *, log: logging.Logger
+    ) -> None:
+        self.socket_path = socket_path
+        self.session_id = session_id
+        self._secret = bytearray(secret)
+        self._log = log
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._delivered = False
+        self._listener: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+
+    @property
+    def delivered(self) -> bool:
+        return self._delivered
+
+    def start(self) -> None:
+        self.socket_path.parent.mkdir(mode=PRIVATE_DIRECTORY_MODE, parents=False, exist_ok=True)
+        try:
+            info = self.socket_path.lstat()
+        except FileNotFoundError:
+            info = None
+        if info is not None:
+            if not stat.S_ISSOCK(info.st_mode):
+                raise OSError("session IPC path exists and is not a socket")
+            self.socket_path.unlink()
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            listener.bind(str(self.socket_path))
+            os.chmod(self.socket_path, 0o600)
+            listener.listen(1)
+            listener.settimeout(0.2)
+        except OSError:
+            listener.close()
+            raise
+        self._listener = listener
+        self._thread = threading.Thread(target=self._serve, name="session-secret", daemon=True)
+        self._thread.start()
+
+    def _serve(self) -> None:
+        listener = self._listener
+        if listener is None:
+            return
+        while not self._stop.is_set():
+            try:
+                connection, _ = listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            try:
+                if _peer_uid(connection) != os.geteuid():
+                    self._log.warning("session secret handoff refused a foreign peer")
+                    continue
+                with self._lock:
+                    if self._delivered or not self._secret:
+                        continue
+                    frame = (
+                        json.dumps(
+                            {
+                                "schema": "autowork-session-secret.v1",
+                                "session_id": self.session_id,
+                                "secret": _b64(self._secret),
+                            },
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                        + b"\n"
+                    )
+                    connection.sendall(frame)
+                    self._secret[:] = bytes(len(self._secret))
+                    self._secret = bytearray()
+                    self._delivered = True
+                self._shutdown()
+                return
+            except OSError:
+                self._log.warning("session secret handoff failed")
+            finally:
+                try:
+                    connection.close()
+                except OSError:
+                    pass
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._shutdown()
+        thread = self._thread
+        self._thread = None
+        if thread is not None:
+            thread.join(timeout=5)
+
+    def _shutdown(self) -> None:
+        listener, self._listener = self._listener, None
+        if listener is not None:
+            try:
+                listener.close()
+            except OSError:
+                pass
+        try:
+            info = self.socket_path.lstat()
+        except FileNotFoundError:
+            return
+        if stat.S_ISSOCK(info.st_mode):
+            try:
+                self.socket_path.unlink()
+            except OSError:
+                pass
+
+    def wipe(self) -> None:
+        with self._lock:
+            self._secret[:] = bytes(len(self._secret))
+            self._secret = bytearray()
+
+
+def _peer_uid(connection: socket.socket) -> int:
+    raw = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+    _pid, uid, _gid = struct.unpack("3i", raw)
+    return uid
+
+
+def _b64(value: bytearray) -> str:
+    return base64.b64encode(bytes(value)).decode("ascii")
+
+
+# ---------------------------------------------------------------------------
+# In-memory session handle
+# ---------------------------------------------------------------------------
+
+
+class _Session:
+    def __init__(
+        self,
+        *,
+        directory: Path,
+        record: SessionRecord,
+        log_ring: logs.LogRing,
+        event_ring: logs.EventRing,
+    ) -> None:
+        self.directory = directory
+        self.record = record
+        self.logs = log_ring
+        self.events = event_ring
+        self.lock = threading.RLock()
+        self.secret: bytearray | None = None
+        self.broker: SecretBroker | None = None
+        self.manifest: dict[str, object] | None = None
+        self.instructions: dict[str, dict[str, object]] = {}
+        self.queue: deque[dict[str, object]] = deque()
+        self.managed: process.ManagedProcess | None = None
+        self.threads: list[threading.Thread] = []
+        self.budget_killed: str | None = None
+        self.last_output_monotonic = time.monotonic()
+        self.started_monotonic = time.monotonic()
+
+    @property
+    def scratch(self) -> Path:
+        return self.directory / SCRATCH_DIRECTORY
+
+    @property
+    def work(self) -> Path:
+        return self.scratch / WORK_DIRECTORY
+
+    @property
+    def prompt_path(self) -> Path:
+        return self.directory / PROMPT_FILE_NAME
+
+    @property
+    def socket_path(self) -> Path:
+        return self.directory / IPC_DIRECTORY / SESSION_SOCKET_FILE_NAME
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SessionSupervisorConfig:
+    runtime_root: Path
+    workspace_root: Path
+    interrupt_grace_seconds: float = 10.0
+    log_ring_bytes: int = logs.LOG_RING_MAX_BYTES
+    log_ring_entries: int = logs.LOG_RING_MAX_ENTRIES
+    event_ring_entries: int = logs.EVENT_RING_MAX_ENTRIES
+    line_max_bytes: int = logs.LINE_MAX_BYTES
+    watchdog_poll_seconds: float = 0.25
+    scratch_bytes_limit: int = 64 * 1024 * 1024
+    no_output_timeout_seconds: float | None = None
+    fake_scenario: str = DEFAULT_FAKE_SCENARIO
+    skills_root: Path | None = None
+    page_limit: int = logs.DEFAULT_PAGE_LIMIT
+    allow_foreign_runtime_dir: bool = False
+
+    @property
+    def session_root(self) -> Path:
+        return self.runtime_root / SESSION_RUNTIME_DIRECTORY
+
+    def validate(self) -> None:
+        runtime = self.runtime_root.resolve()
+        workspace = self.workspace_root.resolve()
+        if runtime == workspace or runtime.is_relative_to(workspace):
+            raise SessionConfigError("the session runtime directory is inside the workspace tree")
+        if self.interrupt_grace_seconds < 0:
+            raise SessionConfigError("the interrupt grace period is negative")
+        if self.log_ring_bytes < 1 or self.log_ring_entries < 1 or self.event_ring_entries < 1:
+            raise SessionConfigError("session ring limits must be positive")
+        if not 1 <= self.page_limit <= logs.MAX_PAGE_LIMIT:
+            raise SessionConfigError("the session page limit is out of range")
+
+
+def config_from_agent(agent: WorkspaceAgent) -> SessionSupervisorConfig:
+    """Build the H1 supervisor config from the agent paths and test env knobs."""
+    runtime_root = agent.config.socket_dir
+    skills_root_text = os.environ.get("AUTOWORK_SESSIONS_SKILLS_ROOT", "").strip()
+    return SessionSupervisorConfig(
+        runtime_root=runtime_root,
+        workspace_root=agent.config.root,
+        interrupt_grace_seconds=_env_int("AUTOWORK_SESSIONS_INTERRUPT_GRACE_MS", 10_000, 0) / 1000,
+        log_ring_bytes=_env_int("AUTOWORK_SESSIONS_LOG_RING_BYTES", logs.LOG_RING_MAX_BYTES, 1),
+        log_ring_entries=_env_int(
+            "AUTOWORK_SESSIONS_LOG_RING_ENTRIES", logs.LOG_RING_MAX_ENTRIES, 1
+        ),
+        event_ring_entries=_env_int(
+            "AUTOWORK_SESSIONS_EVENT_RING_ENTRIES", logs.EVENT_RING_MAX_ENTRIES, 1
+        ),
+        line_max_bytes=_env_int("AUTOWORK_SESSIONS_LINE_MAX_BYTES", logs.LINE_MAX_BYTES, 64),
+        watchdog_poll_seconds=_env_int("AUTOWORK_SESSIONS_WATCHDOG_MS", 250, 5) / 1000,
+        scratch_bytes_limit=_env_int("AUTOWORK_SESSIONS_SCRATCH_BYTES", 64 * 1024 * 1024, 1),
+        fake_scenario=os.environ.get("AUTOWORK_FAKE_CLI_SCENARIO", DEFAULT_FAKE_SCENARIO),
+        skills_root=Path(skills_root_text) if skills_root_text else DEFAULT_SKILLS_ROOT,
+        allow_foreign_runtime_dir=agent.config.allow_foreign_runtime_dir,
+    )
+
+
+def _env_int(name: str, default: int, minimum: int) -> int:
+    text = os.environ.get(name)
+    if text is None or text == "":
+        return default
+    try:
+        value = int(text, 10)
+    except ValueError as exc:
+        raise SessionConfigError(f"{name} must be an integer") from exc
+    if value < minimum:
+        raise SessionConfigError(f"{name} is below its minimum")
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Supervisor
+# ---------------------------------------------------------------------------
+
+
+class SessionSupervisor:
+    """Session lifecycle, process control, logs, reconciliation and capture."""
+
+    def __init__(
+        self,
+        config: SessionSupervisorConfig,
+        *,
+        workspaces: workspace.WorkspaceManager,
+        scans: scan.WorkspaceScanService,
+        clock: Clock | None = None,
+        profiles: ProfileRegistry | None = None,
+    ) -> None:
+        config.validate()
+        self._config = config
+        self._workspaces = workspaces
+        self._scans = scans
+        self._clock: Clock = SystemClock() if clock is None else clock
+        self._profiles = default_profiles() if profiles is None else profiles
+        self._sessions: dict[str, _Session] = {}
+        self._lock = threading.RLock()
+        self._idempotency = IdempotencyStore(self._clock)
+        self._stopped = threading.Event()
+        self._prepare_session_root()
+        self._reconcile_existing()
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def stop(self) -> None:
+        """Stop supervising: kill every group without recording a clean exit.
+
+        This deliberately mimics a parent death: the next supervisor must
+        reconcile the still-active sessions ``lost`` and never adopt them.
+        """
+        self._stopped.set()
+        with self._lock:
+            handles = list(self._sessions.values())
+        for handle in handles:
+            with handle.lock:
+                managed = handle.managed
+                if managed is not None:
+                    process.signal_group(managed.pgid, signal.SIGKILL)
+                    try:
+                        managed.process.wait(timeout=5)
+                    except Exception:
+                        pass
+                    handle.managed = None
+                broker, handle.broker = handle.broker, None
+                if broker is not None:
+                    broker.stop()
+                if handle.secret is not None:
+                    handle.secret[:] = bytes(len(handle.secret))
+                    handle.secret = None
+            for thread in list(handle.threads):
+                if thread.name.startswith(("session-stdout", "session-stderr", "session-monitor")):
+                    thread.join(timeout=5)
+
+    def _prepare_session_root(self) -> None:
+        root = self._config.session_root
+        try:
+            root.mkdir(mode=PRIVATE_DIRECTORY_MODE, parents=True, exist_ok=True)
+            info = root.lstat()
+        except OSError as exc:
+            raise SessionConfigError("the session runtime directory cannot be created") from exc
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            raise SessionConfigError("the session runtime directory is not a real directory")
+        if info.st_uid != os.geteuid() and not self._config.allow_foreign_runtime_dir:
+            raise SessionConfigError("the session runtime directory is owned by another user")
+        os.chmod(root, 0o750)
+
+    # -- restart reconciliation (§5 exact) ---------------------------------
+
+    def _reconcile_existing(self) -> None:
+        root = self._config.session_root
+        try:
+            entries = sorted(root.iterdir())
+        except OSError as exc:
+            raise SessionConfigError("the session runtime directory cannot be read") from exc
+        for entry in entries:
+            name = entry.name
+            if session_state.SESSION_ID_PATTERN.fullmatch(name) is None:
+                continue
+            try:
+                info = entry.lstat()
+            except OSError:
+                continue
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                continue
+            try:
+                self._load_and_reconcile(entry)
+            except Exception as exc:  # a corrupt session must never block startup
+                LOGGER.warning(
+                    "session state ignored session_id=%s error=%s", name, type(exc).__name__
+                )
+
+    def _load_and_reconcile(self, directory: Path) -> None:
+        payload = session_state.read_json(directory / session_state.STATE_FILE_NAME)
+        record = SessionRecord.from_payload(payload)
+        log_records, log_last = logs.load_ring_records(
+            directory / logs.LOG_RING_FILE_NAME,
+            max_bytes=self._config.log_ring_bytes,
+            max_entries=self._config.log_ring_entries,
+        )
+        event_records, event_last = logs.load_ring_records(
+            directory / logs.EVENT_RING_FILE_NAME,
+            max_bytes=logs.EVENT_RING_MAX_BYTES,
+            max_entries=self._config.event_ring_entries,
+        )
+        handle = _Session(
+            directory=directory,
+            record=record,
+            log_ring=logs.LogRing(
+                directory / logs.LOG_RING_FILE_NAME,
+                generation=record.generation,
+                max_bytes=self._config.log_ring_bytes,
+                max_entries=self._config.log_ring_entries,
+                records=log_records,
+                last_seq=max(record.log_seq, log_last),
+            ),
+            event_ring=logs.EventRing(
+                directory / logs.EVENT_RING_FILE_NAME,
+                generation=record.generation,
+                max_entries=self._config.event_ring_entries,
+                records=event_records,
+                last_seq=max(record.event_seq, event_last),
+            ),
+        )
+        handle.last_output_monotonic = time.monotonic()
+        if record.state in ACTIVE_STATES:
+            self._reconcile_active(handle)
+        with self._lock:
+            self._sessions[record.session_id] = handle
+
+    def _reconcile_active(self, handle: _Session) -> None:
+        record = handle.record
+        now = self._now()
+        old_generation = record.generation
+        record.generation = old_generation + 1
+        handle.events.advance_generation(record.generation, drop_older=True)
+        handle.logs.advance_generation(record.generation, drop_older=False)
+        run = record.runs[-1] if record.runs else None
+        alive = bool(
+            run and run.pid is not None and process.process_alive(run.pid, run.start_ticks)
+        )
+        exit_record = record.exit
+        if exit_record is None and run is not None:
+            exit_record = _read_exit_file(handle.directory, run.run)
+        if alive and run is not None and run.pgid is not None:
+            # No adoption: kill any survivor group before marking the session lost.
+            process.signal_group(run.pgid, signal.SIGKILL)
+            outcome = "lost_with_handoff"
+            record.state = SessionState.LOST
+            run.state = "lost"
+            run.ended_at = now
+        elif exit_record is not None:
+            outcome = "terminated_clean"
+            record.state = SessionState.STOPPED
+            record.exit = exit_record
+            record.stopped_at = now
+            if run is not None:
+                run.state = "exited"
+                run.ended_at = exit_record.at
+                run.exit = exit_record
+        else:
+            outcome = "lost_with_handoff"
+            record.state = SessionState.LOST
+            if run is not None:
+                run.state = "lost"
+                run.ended_at = now
+        if record.state not in ACTIVE_STATES:
+            record.state_version += 1
+        record.updated_at = now
+        record.last_activity_at = now
+        evidence: dict[str, object] = {
+            "outcome": outcome,
+            "last_event_seq": handle.events.last_seq,
+            "exit": None if exit_record is None else _exit_wire(exit_record),
+            "process_start_ticks": None if run is None else run.start_ticks,
+        }
+        record.reconciliation = evidence
+        handle.events.append_event(
+            kind=logs.EventKind.RECONCILE_COMPLETED,
+            at=now,
+            payload={
+                "outcome": outcome,
+                "exit": evidence["exit"],
+                "process_start_ticks": evidence["process_start_ticks"],
+            },
+        )
+        self._persist(handle)
+
+    # -- capabilities ------------------------------------------------------
+
+    @property
+    def page_limit(self) -> int:
+        return self._config.page_limit
+
+    def capabilities(self, adapter_kind: object) -> dict[str, object]:
+        return self._profiles.probe(adapter_kind, now=self._now()).to_wire()
+
+    # -- prepare -----------------------------------------------------------
+
+    def prepare(
+        self, request: PrepareSessionRequest, *, idempotency_key: str, body_sha256: str
+    ) -> dict[str, object]:
+        with self._lock:
+            replay = self._idempotency.replay("prepare", idempotency_key, body_sha256)
+            if replay is not None:
+                return replay[1]
+            if request.session_id in self._sessions:
+                existing = self._sessions[request.session_id]
+                raise SessionStateConflictError(str(existing.record.state), "prepare")
+            profile = self._profiles.get(request.adapter_kind)
+            if profile.requires_sandbox and not process.bwrap_available():
+                raise ConfinementUnavailableError(request.adapter_kind)
+            self._workspaces.get_workspace(request.workspace_id)
+            skills = self._load_skills(request.skill_names)
+            probe = profile.probe(now=self._now())
+            prompt_bytes = self._build_prompt(request, skills)
+            if len(prompt_bytes) > MAX_PROMPT_BYTES:
+                raise SessionRequestError("skill_names", "prompt_too_large")
+            prompt_sha256 = hashlib.sha256(prompt_bytes).hexdigest()
+            now = self._now()
+            session_directory = self._config.session_root / request.session_id
+            self._create_session_layout(session_directory)
+            try:
+                self._write_bytes(session_directory / PROMPT_FILE_NAME, prompt_bytes)
+                record = SessionRecord(
+                    session_id=request.session_id,
+                    adapter_kind=request.adapter_kind,
+                    workspace_id=request.workspace_id,
+                    investigation_id=request.investigation_id,
+                    task_id=request.task_id,
+                    handoff=request.handoff,
+                    lease_fence=request.lease_fence,
+                    allowed_workspace_paths=request.allowed_workspace_paths,
+                    skill_names=request.skill_names,
+                    model=request.model,
+                    prompt_sha256=prompt_sha256,
+                    capability_sha256=probe.probe_sha256,
+                    confinement=dict(probe.confinement),
+                    budgets=request.budgets,
+                    state=SessionState.READY,
+                    state_version=1,
+                    generation=1,
+                    created_at=now,
+                    updated_at=now,
+                    last_activity_at=now,
+                )
+                handle = _Session(
+                    directory=session_directory,
+                    record=record,
+                    log_ring=logs.LogRing(
+                        session_directory / logs.LOG_RING_FILE_NAME,
+                        generation=record.generation,
+                        max_bytes=self._config.log_ring_bytes,
+                        max_entries=self._config.log_ring_entries,
+                    ),
+                    event_ring=logs.EventRing(
+                        session_directory / logs.EVENT_RING_FILE_NAME,
+                        generation=record.generation,
+                        max_entries=self._config.event_ring_entries,
+                    ),
+                )
+                self._persist(handle)
+                broker = SecretBroker(
+                    handle.socket_path,
+                    request.session_id,
+                    request.auth_secret,
+                    log=LOGGER,
+                )
+                try:
+                    broker.start()
+                except OSError as exc:
+                    raise SecretUnavailableError() from exc
+                handle.broker = broker
+                handle.secret = bytearray(request.auth_secret)
+                self._sessions[request.session_id] = handle
+            except BaseException:
+                shutil.rmtree(session_directory, ignore_errors=True)
+                raise
+            body: dict[str, object] = {
+                "session_id": request.session_id,
+                "state": str(SessionState.READY),
+                "state_version": 1,
+                "capability_sha256": probe.probe_sha256,
+                "confinement": dict(probe.confinement),
+                "prompt_sha256": prompt_sha256,
+            }
+            self._idempotency.remember("prepare", idempotency_key, body_sha256, 200, body)
+            return body
+
+    def _create_session_layout(self, directory: Path) -> None:
+        try:
+            os.mkdir(directory, session_state.SESSION_DIR_MODE)
+        except FileExistsError as exc:
+            raise SessionStateConflictError(str(SessionState.READY), "prepare") from exc
+        os.chmod(directory, session_state.SESSION_DIR_MODE)
+        for name, mode in (
+            (IPC_DIRECTORY, PRIVATE_DIRECTORY_MODE),
+            (SCRATCH_DIRECTORY, PRIVATE_DIRECTORY_MODE),
+            (f"{SCRATCH_DIRECTORY}/{WORK_DIRECTORY}", PRIVATE_DIRECTORY_MODE),
+            ("home", PRIVATE_DIRECTORY_MODE),
+            ("config", PRIVATE_DIRECTORY_MODE),
+            ("cache", PRIVATE_DIRECTORY_MODE),
+            ("tmp", PRIVATE_DIRECTORY_MODE),
+        ):
+            path = directory / name
+            os.mkdir(path, mode)
+            os.chmod(path, mode)
+
+    def _build_prompt(
+        self, request: PrepareSessionRequest, skills: Sequence[dict[str, object]]
+    ) -> bytes:
+        brief: dict[str, object] = {
+            "schema": "autowork-session-brief.v1",
+            "session_id": request.session_id,
+            "adapter_kind": request.adapter_kind,
+            "workspace_id": request.workspace_id,
+            "investigation_id": request.investigation_id,
+            "task_id": request.task_id,
+            "handoff": request.handoff.to_payload(),
+            "lease_fence": request.lease_fence,
+            "allowed_workspace_paths": list(request.allowed_workspace_paths),
+            "skill_names": list(request.skill_names),
+            "skills": [dict(skill) for skill in skills],
+            "budgets": request.budgets.to_payload(),
+            "tool_rules": (
+                "Only the generated MCP tool catalogue is callable; there is no shell, "
+                "HTTP, URL or arbitrary path passthrough."
+            ),
+            "output_conventions": (
+                "Write working notes under notes/ and the final result as result.md or final.md."
+            ),
+            "stop_conditions": (
+                "Stop when the task result is complete, when a budget is reached, or when "
+                "an instruction is rejected."
+            ),
+        }
+        if request.model is not None:
+            brief["model"] = request.model
+        return json.dumps(brief, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
+            "utf-8"
+        )
+
+    def _load_skills(self, names: Sequence[str]) -> list[dict[str, object]]:
+        if not names:
+            return []
+        root = self._config.skills_root
+        if root is None:
+            raise SessionRequestError("skill_names", "unavailable")
+        try:
+            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError as exc:
+            raise SessionRequestError("skill_names", "unavailable") from exc
+        loaded: list[dict[str, object]] = []
+        total = 0
+        truncated = False
+        try:
+            for name in names:
+                if session_state.SKILL_NAME_PATTERN.fullmatch(name) is None:
+                    raise SessionRequestError("skill_names", "invalid")
+                try:
+                    name_fd = os.open(
+                        name,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=root_fd,
+                    )
+                except OSError as exc:
+                    raise SessionRequestError("skill_names", "unavailable") from exc
+                try:
+                    fd = os.open(
+                        "SKILL.md", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=name_fd
+                    )
+                except OSError as exc:
+                    raise SessionRequestError("skill_names", "unavailable") from exc
+                finally:
+                    os.close(name_fd)
+                try:
+                    info = os.fstat(fd)
+                    if not stat.S_ISREG(info.st_mode):
+                        raise SessionRequestError("skill_names", "unavailable")
+                    remaining = MAX_SKILL_BYTES - total
+                    if remaining <= 0:
+                        truncated = True
+                        break
+                    chunks: list[bytes] = []
+                    while remaining > 0:
+                        chunk = os.read(fd, remaining)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        remaining -= len(chunk)
+                    data = b"".join(chunks)
+                    if len(data) < info.st_size:
+                        truncated = True
+                finally:
+                    os.close(fd)
+                text = data.decode("utf-8", errors="replace")
+                total += len(data)
+                loaded.append(
+                    {
+                        "name": name,
+                        "sha256": hashlib.sha256(data).hexdigest(),
+                        "text": text,
+                    }
+                )
+        finally:
+            os.close(root_fd)
+        if truncated and loaded:
+            loaded[-1]["truncated"] = True
+        return loaded
+
+    # -- start / resume ----------------------------------------------------
+
+    def start(
+        self,
+        session_id: str,
+        request: StartSessionRequest,
+        *,
+        idempotency_key: str,
+        body_sha256: str,
+    ) -> dict[str, object]:
+        handle = self._handle(session_id)
+        with handle.lock:
+            scope = f"{session_id}:start"
+            replay = self._idempotency.replay(scope, idempotency_key, body_sha256)
+            if replay is not None:
+                return replay[1]
+            record = handle.record
+            if record.state in {
+                SessionState.RUNNING,
+                SessionState.INTERRUPT_REQUESTED,
+                SessionState.AWAITING_INSTRUCTION,
+                SessionState.PROVISIONING,
+                SessionState.RECONCILING,
+            }:
+                raise SessionBusyError(session_id)
+            if record.state in {
+                SessionState.LOST,
+                SessionState.CLOSED,
+                SessionState.FAILED,
+            }:
+                raise SessionStateConflictError(str(record.state), "start")
+            profile = self._profiles.get(record.adapter_kind)
+            if profile.requires_manifest and handle.manifest is None:
+                raise ManifestMissingError()
+            body = self._launch(handle, profile, resume=False, run_prompt=request.run_prompt)
+            self._idempotency.remember(scope, idempotency_key, body_sha256, 200, body)
+            return body
+
+    def resume(
+        self,
+        session_id: str,
+        request: ResumeRequest,
+        *,
+        idempotency_key: str,
+        body_sha256: str,
+    ) -> dict[str, object]:
+        handle = self._handle(session_id)
+        with handle.lock:
+            scope = f"{session_id}:resume"
+            replay = self._idempotency.replay(scope, idempotency_key, body_sha256)
+            if replay is not None:
+                return replay[1]
+            record = handle.record
+            profile = self._profiles.get(record.adapter_kind)
+            probe = profile.probe(now=self._now())
+            if not probe.flags.resume:
+                raise ResumeUnavailableError(record.adapter_kind)
+            if record.state not in {
+                SessionState.STOPPED,
+                SessionState.AWAITING_INSTRUCTION,
+                SessionState.LOST,
+            }:
+                raise SessionStateConflictError(str(record.state), "resume")
+            body = self._launch(handle, profile, resume=True, run_prompt=None)
+            self._idempotency.remember(scope, idempotency_key, body_sha256, 200, body)
+            return body
+
+    def _launch(
+        self,
+        handle: _Session,
+        profile: SessionProfile,
+        *,
+        resume: bool,
+        run_prompt: str | None,
+    ) -> dict[str, object]:
+        record = handle.record
+        run_number = record.current_run + 1
+        context = LaunchContext(
+            session_id=record.session_id,
+            record=record,
+            session_directory=handle.directory,
+            scratch_directory=handle.scratch,
+            work_directory=handle.work,
+            home_directory=handle.directory / "home",
+            config_directory=handle.directory / "config",
+            ipc_socket_path=handle.socket_path,
+            prompt_path=handle.prompt_path,
+            run=run_number,
+            resume=resume,
+            fake_scenario=self._config.fake_scenario,
+        )
+        plan = profile.build_launch_plan(context)
+        managed = process.spawn(plan)
+        managed.run = run_number
+        now = self._now()
+        previous = record.state
+        run = RunRecord(
+            run=run_number,
+            state="running",
+            pid=managed.pid,
+            pgid=managed.pgid,
+            start_ticks=managed.start_ticks,
+            started_at=now,
+            log_start=handle.logs.last_seq + 1,
+        )
+        record.runs.append(run)
+        record.exit = None
+        record.outcome = None
+        record.state = SessionState.RUNNING
+        record.state_version += 1
+        record.updated_at = now
+        record.last_activity_at = now
+        handle.managed = managed
+        handle.budget_killed = None
+        handle.started_monotonic = time.monotonic()
+        handle.last_output_monotonic = time.monotonic()
+        handle.events.append_event(
+            kind=logs.EventKind.STATE_CHANGED,
+            at=now,
+            payload={
+                "from": str(previous),
+                "to": str(SessionState.RUNNING),
+                "state_version": record.state_version,
+                "reason": "resume" if resume else "start",
+            },
+        )
+        handle.events.append_event(
+            kind=logs.EventKind.PROCESS_STARTED,
+            at=now,
+            payload={"run": run_number, "resumed": resume},
+        )
+        try:
+            self._persist(handle)
+            self._start_workers(handle, managed)
+        except BaseException:
+            # Never leave a spawned group unmanaged when the host fails to
+            # record or supervise it.
+            process.signal_group(managed.pgid, signal.SIGKILL)
+            try:
+                managed.process.wait(timeout=5)
+            except Exception:
+                pass
+            process.close_pipes(managed.process)
+            handle.managed = None
+            record.state = SessionState.FAILED
+            record.outcome = "failed"
+            record.updated_at = self._now()
+            try:
+                self._persist(handle)
+            except Exception:
+                pass
+            raise
+        if run_prompt is not None:
+            self._write_stdin(
+                handle,
+                {"type": "run_prompt", "text": run_prompt},
+            )
+        self._drain_queue(handle)
+        return {
+            "session_id": record.session_id,
+            "state": str(SessionState.RUNNING),
+            "state_version": record.state_version,
+            "run": run_number,
+            "log_cursor": handle.logs.last_seq,
+        }
+
+    def _start_workers(self, handle: _Session, managed: process.ManagedProcess) -> None:
+        assert managed.process.stdout is not None
+        assert managed.process.stderr is not None
+        threads = [
+            threading.Thread(
+                target=self._reader_loop,
+                args=(handle, managed, "stdout", managed.process.stdout),
+                name="session-stdout",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=self._reader_loop,
+                args=(handle, managed, "stderr", managed.process.stderr),
+                name="session-stderr",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=self._monitor_loop,
+                args=(handle, managed),
+                name="session-monitor",
+                daemon=True,
+            ),
+        ]
+        handle.threads.extend(threads)
+        for thread in threads:
+            thread.start()
+
+    # -- process output and exit ------------------------------------------
+
+    def _replacements(self, handle: _Session) -> tuple[tuple[str, str], ...]:
+        return (
+            (str(handle.directory), "<session-runtime>"),
+            (str(self._config.runtime_root), "<runtime>"),
+            (str(self._config.workspace_root), "<workspace-root>"),
+        )
+
+    def _reader_loop(
+        self,
+        handle: _Session,
+        managed: process.ManagedProcess,
+        stream_name: str,
+        stream: BinaryIO,
+    ) -> None:
+        fileno = stream.fileno()
+        carry = b""
+        while True:
+            try:
+                chunk = os.read(fileno, 65536)
+            except (OSError, ValueError):
+                break
+            if not chunk:
+                break
+            carry += chunk
+            while b"\n" in carry:
+                line, _, carry = carry.partition(b"\n")
+                self._append_log(handle, stream_name, line)
+            if len(carry) > self._config.line_max_bytes * 2:
+                self._append_log(handle, stream_name, carry)
+                carry = b""
+            with handle.lock:
+                handle.events.append_event(
+                    kind=logs.EventKind.OUTPUT_CHUNK,
+                    at=self._now(),
+                    payload={"stream": stream_name, "bytes": len(chunk)},
+                )
+            self._check_output_budget(handle)
+        if carry:
+            self._append_log(handle, stream_name, carry)
+
+    def _append_log(self, handle: _Session, stream_name: str, raw: bytes) -> None:
+        text, truncated = logs.sanitize_line(
+            raw,
+            line_max_bytes=self._config.line_max_bytes,
+            replacements=self._replacements(handle),
+        )
+        with handle.lock:
+            handle.logs.append_line(stream=stream_name, text=text, truncated=truncated)
+            handle.record.budgets_used.output_bytes += len(raw)
+            handle.record.last_activity_at = self._now()
+            handle.last_output_monotonic = time.monotonic()
+
+    def _check_output_budget(self, handle: _Session) -> None:
+        with handle.lock:
+            if handle.budget_killed is not None:
+                return
+            if handle.record.budgets_used.output_bytes <= handle.record.budgets.max_output_bytes:
+                return
+            handle.budget_killed = "output"
+            handle.events.append_event(
+                kind=logs.EventKind.BUDGET_LIMIT_REACHED,
+                at=self._now(),
+                payload={"budget": "output"},
+            )
+            managed = handle.managed
+        if managed is not None:
+            process.signal_group(managed.pgid, signal.SIGKILL)
+
+    def _monitor_loop(self, handle: _Session, managed: process.ManagedProcess) -> None:
+        while True:
+            if self._stopped.is_set():
+                return
+            try:
+                code = managed.process.wait(timeout=self._config.watchdog_poll_seconds)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            if self._stopped.is_set():
+                return
+            with handle.lock:
+                if handle.managed is not managed:
+                    return
+                if handle.budget_killed is None:
+                    elapsed = time.monotonic() - handle.started_monotonic
+                    quiet_limit = self._config.no_output_timeout_seconds
+                    if quiet_limit is None:
+                        quiet_limit = float(handle.record.budgets.wall_seconds)
+                    if elapsed > handle.record.budgets.wall_seconds:
+                        handle.budget_killed = "wall"
+                    elif time.monotonic() - handle.last_output_monotonic > quiet_limit:
+                        handle.budget_killed = "no_output"
+                    elif _directory_size(handle.scratch) > self._config.scratch_bytes_limit:
+                        handle.budget_killed = "scratch"
+                    if handle.budget_killed is not None:
+                        handle.events.append_event(
+                            kind=logs.EventKind.BUDGET_LIMIT_REACHED,
+                            at=self._now(),
+                            payload={"budget": handle.budget_killed},
+                        )
+                        process.signal_group(managed.pgid, signal.SIGKILL)
+        if self._stopped.is_set():
+            return
+        for thread in list(handle.threads):
+            if thread.name.startswith(("session-stdout", "session-stderr")):
+                thread.join(timeout=2)
+        with handle.lock:
+            if handle.managed is not managed:
+                return
+            self._finalize_exit(handle, managed, code)
+
+    def _finalize_exit(self, handle: _Session, managed: process.ManagedProcess, code: int) -> None:
+        if self._stopped.is_set():
+            # The supervisor is shutting down: never record a clean exit, so
+            # the next supervisor reconciles this session lost (no adoption).
+            handle.managed = None
+            return
+        record = handle.record
+        now = self._now()
+        exit_record = ExitRecord(
+            run=managed.run,
+            code=code if code >= 0 else None,
+            signal=-code if code < 0 else None,
+            at=now,
+        )
+        self._write_exit_file(handle.directory, exit_record)
+        run = record.runs[-1] if record.runs else None
+        if run is not None:
+            run.state = "exited"
+            run.ended_at = now
+            run.exit = exit_record
+        record.exit = exit_record
+        record.budgets_used.wall_seconds = max(0.0, time.monotonic() - handle.started_monotonic)
+        handle.managed = None
+        if record.state is SessionState.INTERRUPT_REQUESTED:
+            record.state = SessionState.STOPPED
+            record.outcome = "interrupted"
+        elif handle.budget_killed is not None:
+            record.state = SessionState.STOPPED
+            record.outcome = "budget_exceeded"
+        elif code == 0:
+            record.state = SessionState.STOPPED
+            record.outcome = "success"
+        else:
+            record.state = SessionState.FAILED
+            record.outcome = "failed"
+        record.state_version += 1
+        record.updated_at = now
+        record.last_activity_at = now
+        record.stopped_at = now
+        handle.events.append_event(
+            kind=logs.EventKind.PROCESS_EXITED,
+            at=now,
+            payload={"run": managed.run, "exit": _exit_wire(exit_record)},
+        )
+        self._persist(handle)
+
+    def _write_exit_file(self, directory: Path, exit_record: ExitRecord) -> None:
+        try:
+            session_state.atomic_write_json(
+                directory / f"exit-{exit_record.run}.json", exit_record.to_payload()
+            )
+        except SessionError:
+            LOGGER.warning("session exit file cannot be written session_run=%d", exit_record.run)
+
+    # -- status / events / logs -------------------------------------------
+
+    def status(self, session_id: str) -> dict[str, object]:
+        handle = self._handle(session_id)
+        with handle.lock:
+            record = handle.record
+            return {
+                "state": str(record.state),
+                "state_version": record.state_version,
+                "adapter_kind": record.adapter_kind,
+                "runs": [run.to_payload() for run in record.runs],
+                "budgets_used": record.budgets_used.to_payload(),
+                "last_activity_at": record.last_activity_at,
+                "exit": None if record.exit is None else _exit_wire(record.exit),
+                "log_cursor": handle.logs.last_seq,
+                "checkpoint_sha256": record.checkpoint_sha256,
+            }
+
+    def events(
+        self, session_id: str, *, after: int, generation: int | None, limit: int
+    ) -> dict[str, object]:
+        handle = self._handle(session_id)
+        page = handle.events.page(after, limit, generation)
+        return {
+            "generation": page.generation,
+            "events": [event.to_wire() for event in page.events],
+            "next_cursor": page.next_cursor,
+            "oldest_retained": page.oldest_retained,
+            "resync_required": page.resync_required,
+        }
+
+    def log_page(self, session_id: str, *, after: int, limit: int) -> dict[str, object]:
+        handle = self._handle(session_id)
+        page = handle.logs.page(after, limit)
+        return {
+            "lines": [line.to_wire() for line in page.lines],
+            "next_cursor": page.next_cursor,
+        }
+
+    # -- instructions ------------------------------------------------------
+
+    def instruction(
+        self,
+        session_id: str,
+        request: InstructionRequest,
+        *,
+        idempotency_key: str,
+        body_sha256: str,
+    ) -> dict[str, object]:
+        handle = self._handle(session_id)
+        with handle.lock:
+            scope = f"{session_id}:instruction"
+            replay = self._idempotency.replay(scope, idempotency_key, body_sha256)
+            if replay is not None:
+                return replay[1]
+            record = handle.record
+            if record.state in {SessionState.CLOSED, SessionState.LOST}:
+                raise SessionStateConflictError(str(record.state), "instruction")
+            existing = handle.instructions.get(request.instruction_id)
+            if existing is not None:
+                if existing.get("sha256") != request.sha256:
+                    raise IdempotencyConflictError(idempotency_key)
+                stored = existing.get("response")
+                if not isinstance(stored, dict):
+                    raise SessionError("the stored instruction response is unreadable")
+                body = {str(key): value for key, value in stored.items()}
+                self._idempotency.remember(scope, idempotency_key, body_sha256, 200, body)
+                return body
+            if record.budgets_used.instructions >= record.budgets.max_instructions:
+                raise BudgetExceededError("instructions")
+            accepted = handle.events.append_event(
+                kind=logs.EventKind.INSTRUCTION_ACCEPTED,
+                at=self._now(),
+                payload={
+                    "instruction_id": request.instruction_id,
+                    "sha256": request.sha256,
+                },
+            )
+            record.budgets_used.instructions += 1
+            record.last_activity_at = accepted.at
+            frame = {
+                "instruction_id": request.instruction_id,
+                "text": request.text,
+                "sha256": request.sha256,
+            }
+            delivered = "queued"
+            if record.state is SessionState.RUNNING and self._write_stdin(handle, frame):
+                delivered = "live"
+                handle.events.append_event(
+                    kind=logs.EventKind.INSTRUCTION_DELIVERED,
+                    at=self._now(),
+                    payload={"instruction_id": request.instruction_id, "mode": "live"},
+                )
+            else:
+                handle.queue.append(frame)
+            body: dict[str, object] = {
+                "accepted": True,
+                "delivered": delivered,
+                "cursor": accepted.seq,
+            }
+            handle.instructions[request.instruction_id] = {
+                "sha256": request.sha256,
+                "seq": accepted.seq,
+                "response": dict(body),
+            }
+            self._persist(handle)
+            self._idempotency.remember(scope, idempotency_key, body_sha256, 200, body)
+            return body
+
+    def _drain_queue(self, handle: _Session) -> None:
+        while handle.queue:
+            frame = handle.queue.popleft()
+            if self._write_stdin(handle, frame):
+                instruction_id = frame.get("instruction_id")
+                handle.events.append_event(
+                    kind=logs.EventKind.INSTRUCTION_DELIVERED,
+                    at=self._now(),
+                    payload={
+                        "instruction_id": instruction_id,
+                        "mode": "live",
+                    },
+                )
+            else:
+                handle.queue.appendleft(frame)
+                break
+
+    def _write_stdin(self, handle: _Session, frame: Mapping[str, object]) -> bool:
+        managed = handle.managed
+        if managed is None or managed.process.stdin is None:
+            return False
+        try:
+            line = json.dumps(dict(frame), separators=(",", ":")).encode("utf-8") + b"\n"
+            managed.process.stdin.write(line)
+            managed.process.stdin.flush()
+        except (OSError, ValueError):
+            return False
+        return True
+
+    # -- interrupt / reconcile / collect / close ---------------------------
+
+    def interrupt(
+        self,
+        session_id: str,
+        request: ReasonRequest,
+        *,
+        idempotency_key: str,
+        body_sha256: str,
+    ) -> dict[str, object]:
+        handle = self._handle(session_id)
+        with handle.lock:
+            scope = f"{session_id}:interrupt"
+            replay = self._idempotency.replay(scope, idempotency_key, body_sha256)
+            if replay is not None:
+                return replay[1]
+            record = handle.record
+            if record.state not in {
+                SessionState.RUNNING,
+                SessionState.AWAITING_INSTRUCTION,
+                SessionState.INTERRUPT_REQUESTED,
+            }:
+                raise SessionStateConflictError(str(record.state), "interrupt")
+            managed = handle.managed
+            signal_sent = False
+            if managed is not None and process.process_alive(managed.pid, managed.start_ticks):
+                signal_sent = process.signal_group(managed.pgid, signal.SIGTERM)
+            if record.state is not SessionState.INTERRUPT_REQUESTED:
+                previous = record.state
+                record.state = SessionState.INTERRUPT_REQUESTED
+                record.state_version += 1
+                record.updated_at = self._now()
+                record.last_activity_at = record.updated_at
+                handle.events.append_event(
+                    kind=logs.EventKind.STATE_CHANGED,
+                    at=record.updated_at,
+                    payload={
+                        "from": str(previous),
+                        "to": str(SessionState.INTERRUPT_REQUESTED),
+                        "state_version": record.state_version,
+                        "reason": request.reason,
+                    },
+                )
+                self._persist(handle)
+            body: dict[str, object] = {
+                "state": str(SessionState.INTERRUPT_REQUESTED),
+                "signal_sent": signal_sent,
+            }
+            self._idempotency.remember(scope, idempotency_key, body_sha256, 200, body)
+            if signal_sent and managed is not None:
+                thread = threading.Thread(
+                    target=self._escalate_interrupt,
+                    args=(handle, managed),
+                    name="session-interrupt-escalation",
+                    daemon=True,
+                )
+                handle.threads.append(thread)
+                thread.start()
+            return body
+
+    def _escalate_interrupt(self, handle: _Session, managed: process.ManagedProcess) -> None:
+        time.sleep(self._config.interrupt_grace_seconds)
+        with handle.lock:
+            if handle.managed is not managed:
+                return
+            if handle.record.state is not SessionState.INTERRUPT_REQUESTED:
+                return
+            if process.process_alive(managed.pid, managed.start_ticks):
+                process.signal_group(managed.pgid, signal.SIGKILL)
+
+    def reconcile(
+        self,
+        session_id: str,
+        request: ReconcileRequest,
+        *,
+        idempotency_key: str,
+        body_sha256: str,
+    ) -> dict[str, object]:
+        handle = self._handle(session_id)
+        with handle.lock:
+            scope = f"{session_id}:reconcile"
+            replay = self._idempotency.replay(scope, idempotency_key, body_sha256)
+            if replay is not None:
+                return replay[1]
+            record = handle.record
+            outcome = self._reconcile_outcome(handle)
+            run = record.runs[-1] if record.runs else None
+            body: dict[str, object] = {
+                "outcome": outcome,
+                "evidence": {
+                    "last_event_seq": handle.events.last_seq,
+                    "exit": None if record.exit is None else _exit_wire(record.exit),
+                    "process_start_ticks": None if run is None else run.start_ticks,
+                },
+            }
+            self._idempotency.remember(scope, idempotency_key, body_sha256, 200, body)
+            return body
+
+    def _reconcile_outcome(self, handle: _Session) -> str:
+        record = handle.record
+        managed = handle.managed
+        if managed is not None and process.process_alive(managed.pid, managed.start_ticks):
+            return "session_alive"
+        if record.state is SessionState.LOST:
+            return "lost_with_handoff"
+        if record.state is SessionState.FAILED and record.exit is None:
+            return "lost_unreconciled"
+        return "terminated_clean"
+
+    def collect(
+        self,
+        session_id: str,
+        request: CollectRequest,
+        *,
+        idempotency_key: str,
+        body_sha256: str,
+    ) -> dict[str, object]:
+        handle = self._handle(session_id)
+        with handle.lock:
+            scope = f"{session_id}:collect"
+            replay = self._idempotency.replay(scope, idempotency_key, body_sha256)
+            if replay is not None:
+                return replay[1]
+            record = handle.record
+            if record.state in {
+                SessionState.RUNNING,
+                SessionState.INTERRUPT_REQUESTED,
+                SessionState.AWAITING_INSTRUCTION,
+            }:
+                raise SessionStateConflictError(str(record.state), "collect")
+            captured: list[dict[str, object]] = []
+            captured_notes: list[str] = []
+            if request.capture:
+                captured, captured_notes = self._capture(handle)
+            final_message, fake_outcome = self._fake_output(handle)
+            final_message_sha256 = (
+                None
+                if final_message is None or record.exit is None or record.exit.code != 0
+                else hashlib.sha256(final_message.encode("utf-8")).hexdigest()
+            )
+            run = record.runs[-1] if record.runs else None
+            outcome = record.outcome
+            if outcome is None and fake_outcome in {
+                "success",
+                "failed",
+                "interrupted",
+                "budget_exceeded",
+            }:
+                outcome = fake_outcome
+            body: dict[str, object] = {
+                "outcome": outcome if outcome is not None else _result_outcome(record),
+                "exit": None if record.exit is None else _exit_wire(record.exit),
+                "final_message_sha256": final_message_sha256,
+                "files": captured,
+                "log_range": {
+                    "cursor_from": 0 if run is None else run.log_start,
+                    "cursor_to": handle.logs.last_seq,
+                },
+                "captured_notes": captured_notes,
+                "collected_at": self._now(),
+            }
+            checkpoint = hashlib.sha256(
+                json.dumps(
+                    {
+                        "state": str(record.state),
+                        "last_event_seq": handle.events.last_seq,
+                        "exit": body["exit"],
+                        "files": [
+                            {"path": item["path"], "sha256": item["sha256"]} for item in captured
+                        ],
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            record.checkpoint_sha256 = checkpoint
+            handle.events.append_event(
+                kind=logs.EventKind.CAPTURE_COMPLETED,
+                at=self._now(),
+                payload={"files": len(captured), "checkpoint_sha256": checkpoint},
+            )
+            self._persist(handle)
+            self._idempotency.remember(scope, idempotency_key, body_sha256, 200, body)
+            return body
+
+    def _capture(self, handle: _Session) -> tuple[list[dict[str, object]], list[str]]:
+        record = handle.record
+        workspace_descriptor = self._workspaces.get_workspace(record.workspace_id)
+        entries: list[tuple[str, str, bytes]] = []
+        total = 0
+        notes_root = handle.scratch / "notes"
+        if notes_root.is_dir():
+            for directory, subdirectories, names in os.walk(notes_root, followlinks=False):
+                subdirectories.sort()
+                for name in sorted(names):
+                    source = Path(directory) / name
+                    try:
+                        info = source.lstat()
+                    except OSError:
+                        continue
+                    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                        continue
+                    relative = source.relative_to(notes_root).as_posix()
+                    destination = f"notes/agents/{record.task_id}/{relative}"
+                    data = self._read_capture_file(source)
+                    total += len(data)
+                    if len(data) > MAX_CAPTURE_NOTE_BYTES or total > MAX_CAPTURE_TOTAL_BYTES:
+                        raise BudgetExceededError("capture")
+                    entries.append((destination, "notes", data))
+        for name in ("result.md", "final.md"):
+            source = handle.scratch / name
+            try:
+                info = source.lstat()
+            except OSError:
+                continue
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                continue
+            data = self._read_capture_file(source)
+            total += len(data)
+            if len(data) > MAX_CAPTURE_NOTE_BYTES or total > MAX_CAPTURE_TOTAL_BYTES:
+                raise BudgetExceededError("capture")
+            destination = f"results/sessions/{record.session_id}/{name}"
+            entries.append((destination, "results", data))
+        captured: list[dict[str, object]] = []
+        captured_notes: list[str] = []
+        for index, (destination, kind, data) in enumerate(entries):
+            self._ensure_capture_parent(workspace_descriptor, tuple(destination.split("/")[:-1]))
+            if kind == "notes":
+                outcome = files.write_file(
+                    root=self._config.workspace_root,
+                    descriptor=workspace_descriptor,
+                    scans=self._scans,
+                    route=policies.WriteRoute.FILES,
+                    path=destination,
+                    expected_sha256=record.captured.get(destination, "new"),
+                    origin="agent",
+                    task_id=record.task_id,
+                    generated_by=None,
+                    source_sha256=None,
+                    source=_BytesSource(data),
+                    declared_length=len(data),
+                    idempotency_key=_capture_key(record.session_id, record.current_run, index),
+                )
+            else:
+                outcome = files.write_file(
+                    root=self._config.workspace_root,
+                    descriptor=workspace_descriptor,
+                    scans=self._scans,
+                    route=policies.WriteRoute.GENERATED,
+                    path=destination,
+                    expected_sha256="new",
+                    origin="system",
+                    task_id=record.task_id,
+                    generated_by=f"session:{record.session_id}",
+                    source_sha256=hashlib.sha256(data).hexdigest(),
+                    source=_BytesSource(data),
+                    declared_length=len(data),
+                    idempotency_key=_capture_key(record.session_id, record.current_run, index),
+                )
+            if outcome.status == 409:
+                # A human changed the destination: the new bytes live in the
+                # conflict copy, the live file is untouched and never replayed
+                # as if the capture had replaced it.
+                details = outcome.body.get("details")
+                proposal = details if isinstance(details, dict) else {}
+                conflict_path = proposal.get("conflict_path")
+                proposed_sha256 = proposal.get("proposed_sha256")
+                captured.append(
+                    {
+                        "path": conflict_path if isinstance(conflict_path, str) else destination,
+                        "sha256": (
+                            proposed_sha256
+                            if isinstance(proposed_sha256, str)
+                            else hashlib.sha256(data).hexdigest()
+                        ),
+                    }
+                )
+                continue
+            revision = outcome.body.get("revision")
+            sha256 = revision.get("sha256") if isinstance(revision, dict) else None
+            if not isinstance(sha256, str):
+                sha256 = hashlib.sha256(data).hexdigest()
+            record.captured[destination] = sha256
+            if kind == "notes":
+                captured_notes.append(destination)
+            captured.append({"path": destination, "sha256": sha256})
+        return captured, captured_notes
+
+    def _ensure_capture_parent(
+        self, descriptor: workspace.WorkspaceDescriptor, components: tuple[str, ...]
+    ) -> None:
+        """Create the dynamic capture parent (dirfd, 0700), never inside `.autowork`."""
+        try:
+            root_fd = paths.open_pinned_root(self._config.workspace_root)
+        except paths.PathResolutionError as exc:
+            raise workspace.WorkspaceNotFoundError(descriptor.workspace_id) from exc
+        try:
+            workspace_fd = paths.open_directory_chain(
+                root_fd,
+                (
+                    _manifest_component(descriptor, "delivery_code"),
+                    _manifest_component(descriptor, "article_slug"),
+                ),
+                create=False,
+            )
+            try:
+                parent_fd = paths.open_directory_chain(
+                    workspace_fd, components, create=True, mode=0o700
+                )
+                os.close(parent_fd)
+            finally:
+                os.close(workspace_fd)
+        finally:
+            os.close(root_fd)
+
+    def _read_capture_file(self, path: Path) -> bytes:
+        data = _read_regular_file(path, MAX_CAPTURE_NOTE_BYTES)
+        if data is None:
+            raise BudgetExceededError("capture")
+        return data
+
+    def _fake_output(self, handle: _Session) -> tuple[str | None, str | None]:
+        """Return ``(final_message, outcome)`` from the fake CLI output, if any."""
+        path = handle.work / FAKE_OUTPUT_FILE_NAME
+        data = _read_regular_file(path, 64 * 1024)
+        if data is None:
+            return None, None
+        try:
+            value = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None, None
+        if not isinstance(value, dict):
+            return None, None
+        message = value.get("final_message")
+        outcome = value.get("outcome")
+        return (
+            message if isinstance(message, str) else None,
+            outcome if isinstance(outcome, str) else None,
+        )
+
+    def close(
+        self,
+        session_id: str,
+        request: ReasonRequest,
+        *,
+        idempotency_key: str,
+        body_sha256: str,
+    ) -> dict[str, object]:
+        handle = self._handle(session_id)
+        with handle.lock:
+            scope = f"{session_id}:close"
+            replay = self._idempotency.replay(scope, idempotency_key, body_sha256)
+            if replay is not None:
+                return replay[1]
+            record = handle.record
+            if record.state is SessionState.CLOSED:
+                return {"state": str(SessionState.CLOSED)}
+            if record.state in {
+                SessionState.RUNNING,
+                SessionState.INTERRUPT_REQUESTED,
+                SessionState.AWAITING_INSTRUCTION,
+                SessionState.PROVISIONING,
+                SessionState.RECONCILING,
+            }:
+                raise SessionStateConflictError(str(record.state), "close")
+            managed = handle.managed
+            if managed is not None:
+                process.signal_group(managed.pgid, signal.SIGKILL)
+                try:
+                    managed.process.wait(timeout=5)
+                except Exception:
+                    pass
+                handle.managed = None
+            broker, handle.broker = handle.broker, None
+            if broker is not None:
+                broker.stop()
+            if handle.secret is not None:
+                handle.secret[:] = bytes(len(handle.secret))
+                handle.secret = None
+            shutil.rmtree(handle.scratch, ignore_errors=True)
+            try:
+                os.unlink(handle.prompt_path)
+            except OSError:
+                pass
+            now = self._now()
+            previous = record.state
+            record.state = SessionState.CLOSED
+            record.state_version += 1
+            record.close_reason = request.reason
+            record.updated_at = now
+            record.last_activity_at = now
+            record.stopped_at = record.stopped_at or now
+            handle.events.append_event(
+                kind=logs.EventKind.STATE_CHANGED,
+                at=now,
+                payload={
+                    "from": str(previous),
+                    "to": str(SessionState.CLOSED),
+                    "state_version": record.state_version,
+                    "reason": request.reason,
+                },
+            )
+            self._persist(handle)
+            body = {"state": str(SessionState.CLOSED)}
+            self._idempotency.remember(scope, idempotency_key, body_sha256, 200, body)
+            return body
+
+    # -- manifest ----------------------------------------------------------
+
+    def tool_manifest(
+        self,
+        session_id: str,
+        request: ToolManifestRequest,
+        *,
+        idempotency_key: str,
+        body_sha256: str,
+    ) -> dict[str, object]:
+        handle = self._handle(session_id)
+        with handle.lock:
+            scope = f"{session_id}:manifest"
+            replay = self._idempotency.replay(scope, idempotency_key, body_sha256)
+            if replay is not None:
+                return replay[1]
+            if handle.record.state in {SessionState.LOST, SessionState.CLOSED}:
+                raise SessionStateConflictError(str(handle.record.state), "tool_manifest")
+            handle.manifest = {
+                "manifest_sha256": request.manifest_sha256,
+                "tools": list(request.tools),
+            }
+            handle.record.manifest_sha256 = request.manifest_sha256
+            self._persist(handle)
+            body = {"accepted": True, "manifest_sha256": request.manifest_sha256}
+            self._idempotency.remember(scope, idempotency_key, body_sha256, 200, body)
+            return body
+
+    # -- helpers -----------------------------------------------------------
+
+    def _handle(self, session_id: str) -> _Session:
+        if session_state.SESSION_ID_PATTERN.fullmatch(session_id) is None:
+            raise SessionNotFoundError(session_id)
+        with self._lock:
+            handle = self._sessions.get(session_id)
+        if handle is None:
+            raise SessionNotFoundError(session_id)
+        return handle
+
+    def _persist(self, handle: _Session) -> None:
+        handle.record.log_seq = handle.logs.last_seq
+        handle.record.event_seq = handle.events.last_seq
+        session_state.atomic_write_json(
+            handle.directory / session_state.STATE_FILE_NAME, handle.record.to_payload()
+        )
+
+    def _now(self) -> str:
+        return protocol.format_rfc3339_utc(self._clock.now())
+
+    def _write_bytes(self, path: Path, data: bytes) -> None:
+        parent_fd = os.open(
+            path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        )
+        temporary = f".{path.name}.{uuid.uuid4().hex}{session_state.TEMP_FILE_SUFFIX}"
+        try:
+            fd = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                STATE_FILE_MODE,
+                dir_fd=parent_fd,
+            )
+            try:
+                os.fchmod(fd, STATE_FILE_MODE)
+                view = memoryview(data)
+                while view:
+                    written = os.write(fd, view)
+                    view = view[written:]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.rename(temporary, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+
+
+class _BytesSource:
+    """A bounded in-memory byte source for ``files.write_file``."""
+
+    def __init__(self, data: bytes) -> None:
+        self._view = memoryview(data)
+
+    def read(self, size: int, /) -> bytes:
+        chunk = bytes(self._view[:size])
+        self._view = self._view[size:]
+        return chunk
+
+
+def _read_exit_file(directory: Path, run: int) -> ExitRecord | None:
+    try:
+        payload = session_state.read_json(directory / f"exit-{run}.json")
+        return ExitRecord.from_payload(payload)
+    except Exception:
+        return None
+
+
+def _read_regular_file(path: Path, limit: int) -> bytes | None:
+    """Read at most ``limit`` bytes of a regular file; ``None`` on refusal/oversize."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            return None
+        chunks: list[bytes] = []
+        remaining = limit
+        while remaining > 0:
+            chunk = os.read(fd, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    finally:
+        os.close(fd)
+    return b"".join(chunks)
+
+
+def _capture_key(session_id: str, run: int, index: int) -> str:
+    raw = f"sess-{session_id}-{run}-{index}"
+    return CAPTURE_ID_SAFE.sub("-", raw)[:128]
+
+
+def _manifest_component(descriptor: workspace.WorkspaceDescriptor, field_name: str) -> str:
+    value = descriptor.manifest.get(field_name)
+    if not isinstance(value, str):
+        raise SessionError("workspace manifest is not usable")
+    return value
+
+
+def _exit_wire(exit_record: ExitRecord) -> dict[str, object]:
+    return {"code": exit_record.code, "signal": exit_record.signal}
+
+
+def _result_outcome(record: SessionRecord) -> str:
+    if record.outcome is not None:
+        return record.outcome
+    if record.state is SessionState.STOPPED:
+        return "success"
+    if record.state is SessionState.LOST:
+        return "lost"
+    if record.state is SessionState.FAILED:
+        return "failed"
+    return str(record.state)
+
+
+def _directory_size(root: Path, *, limit: int = 64 * 1024 * 1024) -> int:
+    total = 0
+    try:
+        for directory, _, names in os.walk(root, followlinks=False):
+            for name in names:
+                try:
+                    info = (Path(directory) / name).lstat()
+                except OSError:
+                    continue
+                if stat.S_ISREG(info.st_mode):
+                    total += info.st_size
+                    if total > limit:
+                        return total
+    except OSError:
+        return total
+    return total
+
+
+def _copy_body(body: Mapping[str, object]) -> dict[str, object]:
+    value = json.loads(json.dumps(body))
+    assert isinstance(value, dict)
+    return {str(key): item for key, item in value.items()}
+
+
+def build_session_supervisor(agent: WorkspaceAgent) -> SessionSupervisor:
+    return SessionSupervisor(
+        config_from_agent(agent),
+        workspaces=agent.workspaces,
+        scans=agent.scans,
+    )

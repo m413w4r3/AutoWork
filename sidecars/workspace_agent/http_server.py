@@ -2,12 +2,14 @@
 
 The listener is a ``ThreadingHTTPServer`` bound to an AF_UNIX socket only. Every
 response carries ``Content-Length``; request bodies must declare theirs (411
-``length_required`` otherwise). Unknown routes answer a typed 404 envelope and
-the reserved ``/v1/sessions/**`` surface answers 404 ``not_implemented``.
+``length_required`` otherwise). Unknown routes answer a typed 404 envelope.
+The ``/v1/sessions/**`` namespace is served by the in-process session supervisor
+(SESSION-RUNNER.md §5-§6), not by the workspace routes.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -25,6 +27,8 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import files, paths, policies, protocol, samples, workspace
 from .auth import verify_bearer
+from .sessions import state as session_state
+from .sessions import supervisor as sessions
 
 if TYPE_CHECKING:
     from .agent import WorkspaceAgent
@@ -41,6 +45,74 @@ RAW_BODY_CHUNK_SIZE = 1024 * 1024
 _WS = "/v1/workspaces"
 _WID = r"ws-[0-9a-f]{32}"
 _SHA256 = r"[0-9a-f]{64}"
+_SESSIONS = "/v1/sessions"
+_SESSION_ID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+_TOOL_MANIFEST_LIMIT = protocol.JSON_BODY_LIMIT * 8
+_SESSION_ROUTES: tuple[tuple[str, str, str, int | None], ...] = (
+    ("GET", rf"{_SESSIONS}/capabilities", "/v1/sessions/capabilities", None),
+    ("POST", rf"{_SESSIONS}", "/v1/sessions", protocol.JSON_BODY_LIMIT),
+    ("GET", rf"{_SESSIONS}/{_SESSION_ID}", "/v1/sessions/{session_id}", None),
+    (
+        "POST",
+        rf"{_SESSIONS}/{_SESSION_ID}/tool-manifest",
+        "/v1/sessions/{session_id}/tool-manifest",
+        _TOOL_MANIFEST_LIMIT,
+    ),
+    (
+        "POST",
+        rf"{_SESSIONS}/{_SESSION_ID}/start",
+        "/v1/sessions/{session_id}/start",
+        protocol.JSON_BODY_LIMIT,
+    ),
+    (
+        "GET",
+        rf"{_SESSIONS}/{_SESSION_ID}/events",
+        "/v1/sessions/{session_id}/events",
+        None,
+    ),
+    (
+        "GET",
+        rf"{_SESSIONS}/{_SESSION_ID}/logs",
+        "/v1/sessions/{session_id}/logs",
+        None,
+    ),
+    (
+        "POST",
+        rf"{_SESSIONS}/{_SESSION_ID}/instructions",
+        "/v1/sessions/{session_id}/instructions",
+        protocol.JSON_BODY_LIMIT,
+    ),
+    (
+        "POST",
+        rf"{_SESSIONS}/{_SESSION_ID}/interrupt",
+        "/v1/sessions/{session_id}/interrupt",
+        protocol.JSON_BODY_LIMIT,
+    ),
+    (
+        "POST",
+        rf"{_SESSIONS}/{_SESSION_ID}/resume",
+        "/v1/sessions/{session_id}/resume",
+        protocol.JSON_BODY_LIMIT,
+    ),
+    (
+        "POST",
+        rf"{_SESSIONS}/{_SESSION_ID}/reconcile",
+        "/v1/sessions/{session_id}/reconcile",
+        protocol.JSON_BODY_LIMIT,
+    ),
+    (
+        "POST",
+        rf"{_SESSIONS}/{_SESSION_ID}/collect",
+        "/v1/sessions/{session_id}/collect",
+        protocol.JSON_BODY_LIMIT,
+    ),
+    (
+        "POST",
+        rf"{_SESSIONS}/{_SESSION_ID}/close",
+        "/v1/sessions/{session_id}/close",
+        protocol.JSON_BODY_LIMIT,
+    ),
+)
 _SCAN_ROUTE_TEMPLATES: frozenset[str] = frozenset(
     {
         "/v1/workspaces/{workspace_id}/scan",
@@ -202,6 +274,14 @@ def _workspace_id_from_path(path: str) -> str:
     return path.split("/")[3]
 
 
+def match_session_route(method: str, path: str) -> tuple[str, int | None] | None:
+    """Return the session route template and body limit, or ``None``."""
+    for route_method, pattern, template, body_limit in _SESSION_ROUTES:
+        if method == route_method and re.fullmatch(pattern, path):
+            return template, body_limit
+    return None
+
+
 def _optional_int(parameters: Mapping[str, str], name: str) -> int | None:
     text = parameters.get(name)
     if text is None:
@@ -215,6 +295,20 @@ def _optional_int(parameters: Mapping[str, str], name: str) -> int | None:
             "query parameter must be an integer",
             details={"parameter": name},
         ) from exc
+
+
+def _page_limit(parameters: Mapping[str, str], default: int) -> int:
+    value = _optional_int(parameters, "limit")
+    if value is None:
+        return default
+    if value < 1 or value > protocol.MAX_PAGE_SIZE * 2:
+        raise _RequestRejected(
+            400,
+            protocol.ErrorCode.INVALID_REQUEST,
+            "query parameter is out of range",
+            details={"parameter": "limit"},
+        )
+    return value
 
 
 class WorkspaceAgentRequestHandler(BaseHTTPRequestHandler):
@@ -312,9 +406,7 @@ class WorkspaceAgentRequestHandler(BaseHTTPRequestHandler):
         if route is None:
             return 404, protocol.error_envelope(protocol.ErrorCode.INVALID_REQUEST, "unknown route")
         if route.kind is RouteKind.SESSIONS:
-            return 404, protocol.error_envelope(
-                protocol.ErrorCode.NOT_IMPLEMENTED, "sessions are reserved"
-            )
+            return self._dispatch_sessions(method, path)
         return self._dispatch_workspace(method, path, route)
 
     def _dispatch_workspace(self, method: str, path: str, route: Route) -> DispatchResult:
@@ -361,6 +453,140 @@ class WorkspaceAgentRequestHandler(BaseHTTPRequestHandler):
         return 501, protocol.error_envelope(
             protocol.ErrorCode.NOT_IMPLEMENTED, "operation not implemented yet"
         )
+
+    def _dispatch_sessions(self, method: str, path: str) -> DispatchResult:
+        """Serve ``/v1/sessions/**`` through the in-process session supervisor."""
+        matched = match_session_route(method, path)
+        if matched is None:
+            raise _RequestRejected(404, protocol.ErrorCode.INVALID_REQUEST, "unknown route")
+        template, body_limit = matched
+        supervisor = self._sessions()
+        idempotency_key = ""
+        body_sha256 = ""
+        payload: dict[str, object] = {}
+        if method == "POST":
+            declared_length = self._declared_content_length()
+            limit = protocol.JSON_BODY_LIMIT if body_limit is None else body_limit
+            if declared_length > limit:
+                raise _RequestRejected(
+                    413, protocol.ErrorCode.SIZE_LIMIT, "request body exceeds the route limit"
+                )
+            header_key = self.headers.get(protocol.IDEMPOTENCY_KEY_HEADER)
+            if not protocol.is_valid_idempotency_key(header_key):
+                raise _RequestRejected(
+                    400,
+                    protocol.ErrorCode.INVALID_REQUEST,
+                    "missing or invalid Idempotency-Key",
+                )
+            assert header_key is not None
+            idempotency_key = header_key
+            raw = self._read_body(declared_length) if declared_length else b""
+            body_sha256 = hashlib.sha256(raw).hexdigest()
+            if raw:
+                try:
+                    payload = protocol.decode_json_object(raw, limit=limit)
+                except protocol.ProtocolError as exc:
+                    raise _RequestRejected(
+                        400, protocol.ErrorCode.INVALID_REQUEST, "malformed JSON body"
+                    ) from exc
+        try:
+            if template == "/v1/sessions/capabilities":
+                parameters = self._query_parameters({"adapter_kind"})
+                if "adapter_kind" not in parameters:
+                    raise _RequestRejected(
+                        400,
+                        protocol.ErrorCode.INVALID_REQUEST,
+                        "adapter_kind query parameter is required",
+                        details={"parameter": "adapter_kind"},
+                    )
+                return 200, supervisor.capabilities(parameters["adapter_kind"])
+            if template == "/v1/sessions":
+                request = sessions.PrepareSessionRequest.from_payload(payload)
+                return 200, supervisor.prepare(
+                    request, idempotency_key=idempotency_key, body_sha256=body_sha256
+                )
+            session_id = path.split("/")[3]
+            if template.endswith("/tool-manifest"):
+                return 200, supervisor.tool_manifest(
+                    session_id,
+                    sessions.ToolManifestRequest.from_payload(payload),
+                    idempotency_key=idempotency_key,
+                    body_sha256=body_sha256,
+                )
+            if template.endswith("/start"):
+                return 200, supervisor.start(
+                    session_id,
+                    sessions.StartSessionRequest.from_payload(payload),
+                    idempotency_key=idempotency_key,
+                    body_sha256=body_sha256,
+                )
+            if template.endswith("/instructions"):
+                return 200, supervisor.instruction(
+                    session_id,
+                    sessions.InstructionRequest.from_payload(payload),
+                    idempotency_key=idempotency_key,
+                    body_sha256=body_sha256,
+                )
+            if template.endswith("/interrupt"):
+                return 200, supervisor.interrupt(
+                    session_id,
+                    sessions.ReasonRequest.from_payload(payload),
+                    idempotency_key=idempotency_key,
+                    body_sha256=body_sha256,
+                )
+            if template.endswith("/resume"):
+                return 200, supervisor.resume(
+                    session_id,
+                    sessions.ResumeRequest.from_payload(payload),
+                    idempotency_key=idempotency_key,
+                    body_sha256=body_sha256,
+                )
+            if template.endswith("/reconcile"):
+                return 200, supervisor.reconcile(
+                    session_id,
+                    sessions.ReconcileRequest.from_payload(payload),
+                    idempotency_key=idempotency_key,
+                    body_sha256=body_sha256,
+                )
+            if template.endswith("/collect"):
+                return 200, supervisor.collect(
+                    session_id,
+                    sessions.CollectRequest.from_payload(payload),
+                    idempotency_key=idempotency_key,
+                    body_sha256=body_sha256,
+                )
+            if template.endswith("/close"):
+                return 200, supervisor.close(
+                    session_id,
+                    sessions.ReasonRequest.from_payload(payload),
+                    idempotency_key=idempotency_key,
+                    body_sha256=body_sha256,
+                )
+            if template.endswith("/events"):
+                parameters = self._query_parameters({"after", "generation", "limit"})
+                after = _optional_int(parameters, "after")
+                generation = _optional_int(parameters, "generation")
+                limit = _page_limit(parameters, supervisor.page_limit)
+                return 200, supervisor.events(
+                    session_id,
+                    after=0 if after is None else after,
+                    generation=generation,
+                    limit=limit,
+                )
+            if template.endswith("/logs"):
+                parameters = self._query_parameters({"after", "limit"})
+                after = _optional_int(parameters, "after")
+                limit = _page_limit(parameters, supervisor.page_limit)
+                return 200, supervisor.log_page(
+                    session_id, after=0 if after is None else after, limit=limit
+                )
+            return 200, supervisor.status(session_id)
+        except (
+            session_state.SessionError,
+            workspace.WorkspaceError,
+            paths.WorkspacePathError,
+        ) as exc:
+            raise _RequestRejected(exc.status, exc.code, exc.message, details=exc.details) from exc
 
     def _handle_ensure(self, declared_length: int) -> tuple[int, dict[str, object]]:
         raw = self._read_body(declared_length)
@@ -670,6 +896,11 @@ class WorkspaceAgentRequestHandler(BaseHTTPRequestHandler):
         assert isinstance(server, WorkspaceAgentHTTPServer)
         return server.agent
 
+    def _sessions(self) -> sessions.SessionSupervisor:
+        server = self.server
+        assert isinstance(server, WorkspaceAgentHTTPServer)
+        return server.session_supervisor
+
     def _respond(
         self,
         status: int,
@@ -767,6 +998,12 @@ class WorkspaceAgentHTTPServer(ThreadingHTTPServer):
             super().server_close()
             self._unlink_socket_path()
             raise SocketPathError("cannot secure the workspace agent socket") from exc
+        try:
+            self.session_supervisor = sessions.build_session_supervisor(agent)
+        except Exception:
+            super().server_close()
+            self._unlink_socket_path()
+            raise
 
     @staticmethod
     def _prepare_socket_path(socket_path: Path) -> None:
@@ -779,6 +1016,9 @@ class WorkspaceAgentHTTPServer(ThreadingHTTPServer):
         socket_path.unlink()
 
     def server_close(self) -> None:
+        supervisor = getattr(self, "session_supervisor", None)
+        if supervisor is not None:
+            supervisor.stop()
         super().server_close()
         self._unlink_socket_path()
 
