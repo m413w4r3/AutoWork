@@ -125,6 +125,8 @@ def test_workspace_migration_rejects_a_partial_workspace_shape(
         try:
             async with engine.begin() as connection:
                 for table_name in (
+                    # 0026 added an FK onto workspace_file_revisions.
+                    "workspace_note_annotations",
                     "work_contributions",
                     "workspace_sync_cursors",
                     "workspace_file_events",
