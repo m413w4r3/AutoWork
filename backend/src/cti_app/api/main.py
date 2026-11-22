@@ -11,6 +11,7 @@ from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import Response
 
 from cti_app.api import publication_runtime
+from cti_app.api.agent_sessions import router as agent_sessions_router
 from cti_app.api.analyst_opinion import router as analyst_opinion_router
 from cti_app.api.collection import router as collection_router
 from cti_app.api.detection import router as detection_router
@@ -784,6 +785,7 @@ def create_app() -> FastAPI:
     application.include_router(investigation_plans_router)
     application.include_router(investigation_handoffs_router)
     application.include_router(investigation_tasks_router)
+    application.include_router(agent_sessions_router)
     application.include_router(osint_policy_router)
     application.include_router(investigation_captures_router)
     application.include_router(investigation_captures_legacy_router)
