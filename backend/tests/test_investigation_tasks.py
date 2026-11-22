@@ -26,6 +26,27 @@ from cti_app.application.investigation_task_events import (
     TaskNotFoundError,
     append_task_event,
 )
+from cti_app.application.investigation_task_sweep import InvestigationTaskSweeper
+from cti_app.application.investigation_tasks import (
+    InvestigationTaskService,
+    StaleTaskVersionError,
+    TaskCommandError,
+    TaskDependencyError,
+    TaskIdempotencyConflictError,
+    TaskKeyConflictError,
+    TaskLeaseExpiredError,
+    TaskLeaseFenceError,
+    TaskLimitExceededError,
+    TaskPermissionError,
+    TaskSessionInactiveError,
+    TaskSessionOutcome,
+)
+from cti_app.config import Settings
+from cti_app.domain.editorial import (
+    AnalystDecision,
+    AnalystDecisionTargetType,
+    AnalystDecisionType,
+)
 from cti_app.domain.investigation_task import (
     TASK_LIMIT_DEFAULTS,
     BlockedReason,
@@ -162,6 +183,106 @@ def _lease(*, fence: int = 1) -> TaskLease:
     )
 
 
+HUMAN = TaskActor(kind=TaskActorKind.HUMAN, actor_id="analyst:test")
+OPERATOR = TaskActor(kind=TaskActorKind.OPERATOR, actor_id="operator:test")
+
+
+class _SessionRecorder:
+    """In-memory ``TaskSessionPort`` fake; sessions are 05B1's aggregate."""
+
+    def __init__(self, *, active: tuple[UUID, ...] = ()) -> None:
+        self.active = set(active)
+        self.closed: list[tuple[UUID, UUID, TaskSessionOutcome, str]] = []
+
+    async def is_active_session(
+        self, *, session_id: UUID, investigation_id: UUID, task_id: UUID
+    ) -> bool:
+        return session_id in self.active
+
+    async def close_session(
+        self,
+        *,
+        session_id: UUID,
+        investigation_id: UUID,
+        task_id: UUID,
+        outcome: TaskSessionOutcome,
+        reason: str,
+    ) -> None:
+        self.closed.append((session_id, task_id, outcome, reason))
+        self.active.discard(session_id)
+
+
+class _DecisionRecorder:
+    """In-memory ``AnalystDecisionRepository`` fake."""
+
+    def __init__(self) -> None:
+        self.decisions: list[AnalystDecision] = []
+
+    async def append(self, decision: AnalystDecision) -> None:
+        self.decisions.append(decision)
+
+    async def list_for_investigation(self, investigation_id: UUID) -> list[AnalystDecision]:
+        return [
+            decision for decision in self.decisions if decision.investigation_id == investigation_id
+        ]
+
+
+def _task_service(
+    repository: InMemoryInvestigationTaskRepository,
+    *,
+    sessions: _SessionRecorder | None = None,
+    decisions: _DecisionRecorder | None = None,
+    limits: TaskLimits | None = None,
+) -> InvestigationTaskService:
+    return InvestigationTaskService(
+        tasks=repository,
+        decisions=decisions if decisions is not None else _DecisionRecorder(),
+        sessions=sessions if sessions is not None else _SessionRecorder(),
+        limits=limits if limits is not None else TaskLimits(),
+    )
+
+
+async def _seeded(
+    repository: InMemoryInvestigationTaskRepository,
+    *,
+    status: TaskStatus = TaskStatus.READY,
+    investigation_id: UUID | None = None,
+    **overrides: object,
+) -> InvestigationTaskV1:
+    task = _task(
+        status=status,
+        investigation_id=investigation_id if investigation_id is not None else uuid4(),
+        **overrides,
+    )
+    return await repository.add(task)
+
+
+async def _running_operator_task(
+    repository: InMemoryInvestigationTaskRepository,
+    *,
+    session_id: UUID,
+    now: datetime = NOW,
+) -> InvestigationTaskV1:
+    """Seed an assigned operator task and start it through the engine."""
+    task = await _seeded(
+        repository,
+        status=TaskStatus.ASSIGNED,
+        investigation_id=uuid4(),
+        assigned_actor_kind=TaskActorKind.OPERATOR,
+        assigned_actor_id=OPERATOR.actor_id,
+    )
+    service = _task_service(repository, sessions=_SessionRecorder(active=(session_id,)))
+    started = await service.start(
+        task_id=task.id,
+        actor=OPERATOR,
+        expected_status_version=task.status_version,
+        idempotency_key=f"start:{task.id}",
+        session_id=session_id,
+        now=now,
+    )
+    return started.task
+
+
 def test_transition_matrix_allows_only_declared_actors() -> None:
     context = _satisfied_context()
     for from_status in TaskStatus:
@@ -295,6 +416,65 @@ def test_human_can_take_start_and_submit_task() -> None:
     task = task.with_status(TaskStatus.COMPLETED, now=NOW)
     assert task.result_verification_status is ResultVerificationStatus.ACCEPTED
     assert task.is_terminal
+
+    async def engine_scenario() -> None:
+        repository = InMemoryInvestigationTaskRepository()
+        decisions = _DecisionRecorder()
+        seeded = _task(status=TaskStatus.READY, investigation_id=uuid4())
+        await repository.add(seeded)
+        service = _task_service(repository, decisions=decisions)
+
+        assigned = await service.assign(
+            task_id=seeded.id,
+            actor=HUMAN,
+            target=HUMAN,
+            expected_status_version=1,
+            idempotency_key="assign-1",
+            now=NOW,
+        )
+        assert assigned.task.status is TaskStatus.ASSIGNED
+        assert assigned.task.assigned_actor_id == HUMAN.actor_id
+        assert assigned.task.lease is None
+
+        started = await service.start(
+            task_id=seeded.id,
+            actor=HUMAN,
+            expected_status_version=2,
+            idempotency_key="start-1",
+            now=NOW + timedelta(seconds=10),
+        )
+        assert started.task.status is TaskStatus.RUNNING
+        assert started.task.lease is None
+
+        submitted = await service.submit(
+            task_id=seeded.id,
+            actor=HUMAN,
+            expected_status_version=3,
+            idempotency_key="submit-1",
+            now=NOW + timedelta(seconds=20),
+        )
+        assert submitted.task.status is TaskStatus.AWAITING_REVIEW
+        assert submitted.task.result_verification_status is ResultVerificationStatus.PENDING_REVIEW
+
+        accepted = await service.accept_result(
+            task_id=seeded.id,
+            actor=HUMAN,
+            expected_status_version=4,
+            idempotency_key="accept-1",
+            reason="result verified against the observations",
+            now=NOW + timedelta(seconds=30),
+        )
+        assert accepted.task.status is TaskStatus.COMPLETED
+        assert accepted.task.result_verification_status is ResultVerificationStatus.ACCEPTED
+        assert accepted.event is not None
+        assert len(decisions.decisions) == 1
+        decision = decisions.decisions[0]
+        assert decision.decision_type is AnalystDecisionType.TASK_RESULT_ACCEPT
+        assert decision.target_type is AnalystDecisionTargetType.TASK
+        assert decision.target_id == seeded.id
+        assert accepted.event.analyst_decision_id == decision.id
+
+    asyncio.run(engine_scenario())
 
 
 def test_awaiting_review_exit_forces_rejected() -> None:
@@ -498,5 +678,868 @@ def test_task_event_idempotency_is_scoped_per_task() -> None:
                 ),
                 occurred_at=NOW,
             )
+
+    asyncio.run(scenario())
+
+
+async def _complete_human_task(
+    service: InvestigationTaskService,
+    task: InvestigationTaskV1,
+    *,
+    prefix: str,
+    now: datetime = NOW,
+) -> InvestigationTaskV1:
+    version = task.status_version
+    await service.assign(
+        task_id=task.id,
+        actor=HUMAN,
+        target=HUMAN,
+        expected_status_version=version,
+        idempotency_key=f"{prefix}:assign",
+        now=now,
+    )
+    await service.start(
+        task_id=task.id,
+        actor=HUMAN,
+        expected_status_version=version + 1,
+        idempotency_key=f"{prefix}:start",
+        now=now,
+    )
+    await service.submit(
+        task_id=task.id,
+        actor=HUMAN,
+        expected_status_version=version + 2,
+        idempotency_key=f"{prefix}:submit",
+        now=now,
+    )
+    accepted = await service.accept_result(
+        task_id=task.id,
+        actor=HUMAN,
+        expected_status_version=version + 3,
+        idempotency_key=f"{prefix}:accept",
+        reason=f"{prefix} result verified",
+        now=now,
+    )
+    return accepted.task
+
+
+def test_cas_conflict_returns_stale_task_version() -> None:
+    async def scenario() -> None:
+        repository = InMemoryInvestigationTaskRepository()
+        task = await _seeded(repository)
+        service = _task_service(repository)
+
+        assigned = await service.assign(
+            task_id=task.id,
+            actor=HUMAN,
+            target=HUMAN,
+            expected_status_version=1,
+            idempotency_key="assign",
+            now=NOW,
+        )
+        assert assigned.task.status_version == 2
+
+        with pytest.raises(StaleTaskVersionError) as stale:
+            await service.release(
+                task_id=task.id,
+                actor=HUMAN,
+                expected_status_version=1,
+                idempotency_key="release-stale",
+                now=NOW,
+            )
+        assert stale.value.code == "stale_task_version"
+        stored = await repository.get(task.id)
+        assert stored is not None
+        assert stored.status is TaskStatus.ASSIGNED
+        assert stored.status_version == 2
+        assert stored.event_sequence == 1
+
+        released = await service.release(
+            task_id=task.id,
+            actor=HUMAN,
+            expected_status_version=2,
+            idempotency_key="release",
+            now=NOW,
+        )
+        assert released.task.status is TaskStatus.READY
+        assert released.task.assigned_actor_id is None
+
+    asyncio.run(scenario())
+
+
+def test_heartbeat_at_expiry_cannot_resurrect_lease() -> None:
+    async def scenario() -> None:
+        repository = InMemoryInvestigationTaskRepository()
+        session_id = uuid4()
+        task = await _running_operator_task(repository, session_id=session_id)
+        assert task.status is TaskStatus.RUNNING
+        assert task.lease_fence == 1
+        assert task.lease_expires_at == NOW + timedelta(seconds=180)
+        assert task.event_sequence == 1
+        service = _task_service(repository)
+
+        with pytest.raises(TaskLeaseExpiredError) as expired:
+            await service.heartbeat(
+                task_id=task.id,
+                actor=OPERATOR,
+                expected_status_version=task.status_version,
+                lease_fence=1,
+                idempotency_key="late-heartbeat",
+                now=NOW + timedelta(seconds=180),
+            )
+        assert expired.value.code == "lease_expired"
+        stored = await repository.get(task.id)
+        assert stored is not None
+        assert stored.status is TaskStatus.RUNNING
+        assert stored.status_version == task.status_version
+        assert stored.event_sequence == 1
+        assert stored.lease_expires_at == task.lease_expires_at
+
+        with pytest.raises(TaskLeaseFenceError) as stale_fence:
+            await service.heartbeat(
+                task_id=task.id,
+                actor=OPERATOR,
+                expected_status_version=task.status_version,
+                lease_fence=2,
+                idempotency_key="wrong-fence",
+                now=NOW,
+            )
+        assert stale_fence.value.code == "stale_fence"
+
+    asyncio.run(scenario())
+
+
+def test_heartbeat_appends_event_single_sequence_writer() -> None:
+    async def scenario() -> None:
+        repository = InMemoryInvestigationTaskRepository()
+        session_id = uuid4()
+        started = await _running_operator_task(repository, session_id=session_id)
+        service = _task_service(repository)
+
+        first = await service.heartbeat(
+            task_id=started.id,
+            actor=OPERATOR,
+            expected_status_version=started.status_version,
+            lease_fence=started.lease_fence,
+            idempotency_key="heartbeat-1",
+            now=NOW + timedelta(seconds=30),
+        )
+        assert first.task.status_version == started.status_version
+        assert first.task.event_sequence == 2
+        assert first.event is not None
+        assert first.event.event_type is TaskEventType.LEASE_RENEWED
+        assert first.event.status_version == started.status_version
+
+        second = await service.heartbeat(
+            task_id=started.id,
+            actor=OPERATOR,
+            expected_status_version=started.status_version,
+            lease_fence=started.lease_fence,
+            idempotency_key="heartbeat-2",
+            now=NOW + timedelta(seconds=60),
+        )
+        assert second.task.event_sequence == 3
+
+        replayed = await service.heartbeat(
+            task_id=started.id,
+            actor=OPERATOR,
+            expected_status_version=started.status_version,
+            lease_fence=started.lease_fence,
+            idempotency_key="heartbeat-1",
+            now=NOW + timedelta(seconds=90),
+        )
+        assert replayed.replayed is True
+        assert replayed.event is not None
+        assert replayed.event.id == first.event.id
+
+        stored = await repository.get(started.id)
+        assert stored is not None
+        assert stored.event_sequence == 3
+        assert stored.status_version == started.status_version
+        events = await repository.list_events(started.id)
+        assert [event.sequence for event in events] == [1, 2, 3]
+        assert [event.event_type for event in events] == [
+            TaskEventType.LEASE_ACQUIRED,
+            TaskEventType.LEASE_RENEWED,
+            TaskEventType.LEASE_RENEWED,
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_sweep_covers_awaiting_input() -> None:
+    async def scenario() -> None:
+        repository = InMemoryInvestigationTaskRepository()
+        session_id = uuid4()
+        sessions = _SessionRecorder(active=(session_id,))
+        seeded = await _seeded(
+            repository,
+            status=TaskStatus.ASSIGNED,
+            assigned_actor_kind=TaskActorKind.OPERATOR,
+            assigned_actor_id=OPERATOR.actor_id,
+        )
+        service = _task_service(repository, sessions=sessions)
+        started = await service.start(
+            task_id=seeded.id,
+            actor=OPERATOR,
+            expected_status_version=1,
+            idempotency_key="start",
+            session_id=session_id,
+            now=NOW,
+        )
+        awaiting = await service.request_input(
+            task_id=seeded.id,
+            actor=OPERATOR,
+            expected_status_version=started.task.status_version,
+            lease_fence=started.task.lease_fence,
+            idempotency_key="request-input",
+            now=NOW + timedelta(seconds=10),
+        )
+        assert awaiting.task.status is TaskStatus.AWAITING_INPUT
+        assert awaiting.task.lease_fence == 1
+        assert awaiting.task.lease_expires_at == NOW + timedelta(seconds=180)
+
+        sweeper = InvestigationTaskSweeper(tasks=repository, sessions=sessions)
+        swept = await sweeper.sweep_investigation(
+            seeded.investigation_id, now=NOW + timedelta(seconds=181)
+        )
+        assert len(swept) == 1
+        blocked = swept[0].task
+        assert blocked.status is TaskStatus.BLOCKED
+        assert blocked.blocked_reason is BlockedReason.LEASE_EXPIRED
+        assert blocked.lease is None
+        assert blocked.lease_fence == 2
+        assert swept[0].event is not None
+        assert swept[0].event.event_type is TaskEventType.LEASE_EXPIRED
+        assert swept[0].event.idempotency_key == (
+            f"sweep:{seeded.id}:awaiting_input:{awaiting.task.status_version}"
+        )
+        assert sessions.closed == [
+            (session_id, seeded.id, TaskSessionOutcome.LOST, "lease_expired")
+        ]
+
+        again = await sweeper.sweep_investigation(
+            seeded.investigation_id, now=NOW + timedelta(seconds=200)
+        )
+        assert again == ()
+        stored = await repository.get(seeded.id)
+        assert stored is not None
+        assert stored.event_sequence == 3
+
+    asyncio.run(scenario())
+
+
+def test_awaiting_review_to_failed_sets_rejected() -> None:
+    async def scenario() -> None:
+        repository = InMemoryInvestigationTaskRepository()
+        task = await _seeded(repository)
+        service = _task_service(repository)
+        await service.assign(
+            task_id=task.id,
+            actor=HUMAN,
+            target=HUMAN,
+            expected_status_version=1,
+            idempotency_key="assign",
+            now=NOW,
+        )
+        await service.start(
+            task_id=task.id,
+            actor=HUMAN,
+            expected_status_version=2,
+            idempotency_key="start",
+            now=NOW,
+        )
+        submitted = await service.submit(
+            task_id=task.id,
+            actor=HUMAN,
+            expected_status_version=3,
+            idempotency_key="submit",
+            now=NOW,
+        )
+        assert submitted.task.result_verification_status is ResultVerificationStatus.PENDING_REVIEW
+
+        failed = await service.fail(
+            task_id=task.id,
+            actor=HUMAN,
+            expected_status_version=4,
+            idempotency_key="fail",
+            reason="the result cannot be verified",
+            now=NOW,
+        )
+        assert failed.task.status is TaskStatus.FAILED
+        assert failed.task.result_verification_status is ResultVerificationStatus.REJECTED
+        assert failed.task.is_terminal
+        assert failed.task.lease is None
+
+    asyncio.run(scenario())
+
+
+def test_task_idempotency_scoped_per_task() -> None:
+    async def scenario() -> None:
+        repository = InMemoryInvestigationTaskRepository()
+        service = _task_service(repository)
+        investigation_id = uuid4()
+
+        created = await service.create_task(
+            investigation_id=investigation_id,
+            actor=HUMAN,
+            idempotency_key="create-1",
+            task_key="lead-a",
+            title="Inspect the loader",
+            now=NOW,
+        )
+        assert created.event is not None
+        replay_created = await service.create_task(
+            investigation_id=investigation_id,
+            actor=HUMAN,
+            idempotency_key="create-1",
+            task_key="lead-a",
+            title="Inspect the loader",
+            now=NOW + timedelta(seconds=5),
+        )
+        assert replay_created.replayed is True
+        assert replay_created.event is not None
+        assert replay_created.event.id == created.event.id
+        stored = await repository.get(created.task.id)
+        assert stored is not None
+        assert stored.event_sequence == 1
+
+        with pytest.raises(TaskIdempotencyConflictError):
+            await service.create_task(
+                investigation_id=investigation_id,
+                actor=HUMAN,
+                idempotency_key="create-1",
+                task_key="lead-a",
+                title="A different body",
+                now=NOW,
+            )
+        with pytest.raises(TaskKeyConflictError):
+            await service.create_task(
+                investigation_id=investigation_id,
+                actor=HUMAN,
+                idempotency_key="create-2",
+                task_key="lead-a",
+                title="A different body",
+                now=NOW,
+            )
+        replay_by_key = await service.create_task(
+            investigation_id=investigation_id,
+            actor=HUMAN,
+            idempotency_key="create-3",
+            task_key="lead-a",
+            title="Inspect the loader",
+            now=NOW,
+        )
+        assert replay_by_key.task.id == created.task.id
+        assert replay_by_key.event is not None
+        assert replay_by_key.event.id == created.event.id
+
+        first = await _seeded(repository, investigation_id=investigation_id)
+        second = await _seeded(repository, investigation_id=investigation_id)
+        assigned_first = await service.assign(
+            task_id=first.id,
+            actor=HUMAN,
+            target=HUMAN,
+            expected_status_version=1,
+            idempotency_key="shared-key",
+            now=NOW,
+        )
+        assigned_second = await service.assign(
+            task_id=second.id,
+            actor=HUMAN,
+            target=HUMAN,
+            expected_status_version=1,
+            idempotency_key="shared-key",
+            now=NOW,
+        )
+        assert assigned_first.event is not None
+        assert assigned_second.event is not None
+        assert assigned_first.event.id != assigned_second.event.id
+
+        replayed = await service.assign(
+            task_id=first.id,
+            actor=HUMAN,
+            target=HUMAN,
+            expected_status_version=1,
+            idempotency_key="shared-key",
+            now=NOW + timedelta(seconds=5),
+        )
+        assert replayed.replayed is True
+        assert replayed.event is not None
+        assert replayed.event.id == assigned_first.event.id
+        stored_first = await repository.get(first.id)
+        assert stored_first is not None
+        assert stored_first.status_version == 2
+        assert stored_first.event_sequence == 1
+
+        with pytest.raises(TaskIdempotencyConflictError):
+            await service.assign(
+                task_id=first.id,
+                actor=HUMAN,
+                target=OPERATOR,
+                expected_status_version=1,
+                idempotency_key="shared-key",
+                now=NOW,
+            )
+
+    asyncio.run(scenario())
+
+
+def test_dependency_cycle_serialized_by_advisory_lock() -> None:
+    async def scenario() -> None:
+        repository = InMemoryInvestigationTaskRepository()
+        service = _task_service(repository)
+        investigation_id = uuid4()
+        first = await _seeded(
+            repository, status=TaskStatus.PROPOSED, investigation_id=investigation_id
+        )
+        second = await _seeded(
+            repository, status=TaskStatus.PROPOSED, investigation_id=investigation_id
+        )
+        third = await _seeded(
+            repository, status=TaskStatus.PROPOSED, investigation_id=investigation_id
+        )
+
+        created = await service.add_dependency(
+            task_id=first.id, depends_on_task_id=second.id, actor=HUMAN
+        )
+        assert created.created is True
+        repeated = await service.add_dependency(
+            task_id=first.id, depends_on_task_id=second.id, actor=HUMAN
+        )
+        assert repeated.created is False
+        await service.add_dependency(task_id=second.id, depends_on_task_id=third.id, actor=HUMAN)
+
+        with pytest.raises(TaskDependencyError) as cycle:
+            await service.add_dependency(task_id=third.id, depends_on_task_id=first.id, actor=HUMAN)
+        assert cycle.value.code == "task_dependency_invalid"
+        with pytest.raises(TaskDependencyError):
+            await service.add_dependency(task_id=first.id, depends_on_task_id=first.id, actor=HUMAN)
+        assert await repository.list_dependencies(first.id) == (second.id,)
+        assert await repository.list_dependencies(third.id) == ()
+
+    asyncio.run(scenario())
+
+
+def test_proposed_task_promoted_when_dependency_completes() -> None:
+    async def scenario() -> None:
+        repository = InMemoryInvestigationTaskRepository()
+        service = _task_service(repository)
+        investigation_id = uuid4()
+        dependent = await _seeded(
+            repository, status=TaskStatus.PROPOSED, investigation_id=investigation_id
+        )
+        first = await _seeded(repository, investigation_id=investigation_id)
+        last = await _seeded(repository, investigation_id=investigation_id)
+        await service.add_dependency(task_id=dependent.id, depends_on_task_id=first.id, actor=HUMAN)
+        await service.add_dependency(task_id=dependent.id, depends_on_task_id=last.id, actor=HUMAN)
+
+        await _complete_human_task(service, first, prefix="first")
+        stored = await repository.get(dependent.id)
+        assert stored is not None
+        assert stored.status is TaskStatus.PROPOSED
+        assert await repository.list_events(dependent.id) == ()
+
+        await _complete_human_task(service, last, prefix="last")
+        stored = await repository.get(dependent.id)
+        assert stored is not None
+        assert stored.status is TaskStatus.READY
+        assert stored.blocked_reason is None
+        events = await repository.list_events(dependent.id)
+        assert len(events) == 1
+        promotion = events[0]
+        assert promotion.event_type is TaskEventType.STATUS_CHANGED
+        assert promotion.actor.kind is TaskActorKind.SYSTEM
+        assert promotion.from_status is TaskStatus.PROPOSED
+        assert promotion.to_status is TaskStatus.READY
+        assert promotion.idempotency_key == f"dep:{last.id}:{dependent.id}:1"
+
+    asyncio.run(scenario())
+
+
+def test_dependency_unsatisfiable_blocks_dependent() -> None:
+    async def scenario() -> None:
+        repository = InMemoryInvestigationTaskRepository()
+        service = _task_service(repository)
+        investigation_id = uuid4()
+        dependent = await _seeded(
+            repository, status=TaskStatus.PROPOSED, investigation_id=investigation_id
+        )
+        prerequisite = await _seeded(
+            repository, status=TaskStatus.READY, investigation_id=investigation_id
+        )
+        await service.add_dependency(
+            task_id=dependent.id, depends_on_task_id=prerequisite.id, actor=HUMAN
+        )
+
+        cancelled = await service.cancel(
+            task_id=prerequisite.id,
+            actor=HUMAN,
+            expected_status_version=1,
+            idempotency_key="cancel-prerequisite",
+            reason="the lead is obsolete",
+            now=NOW,
+        )
+        assert cancelled.task.status is TaskStatus.CANCELLED
+
+        stored = await repository.get(dependent.id)
+        assert stored is not None
+        assert stored.status is TaskStatus.BLOCKED
+        assert stored.blocked_reason is BlockedReason.DEPENDENCY
+        events = await repository.list_events(dependent.id)
+        assert len(events) == 1
+        assert events[0].actor.kind is TaskActorKind.SYSTEM
+        assert events[0].to_status is TaskStatus.BLOCKED
+        assert events[0].idempotency_key == f"dep:{prerequisite.id}:{dependent.id}:1"
+
+        promoted = await service.promote(
+            task_id=dependent.id,
+            actor=HUMAN,
+            expected_status_version=2,
+            idempotency_key="manual-unblock",
+            now=NOW,
+        )
+        assert promoted.task.status is TaskStatus.READY
+
+    asyncio.run(scenario())
+
+
+def test_subtask_depth_capability_and_path_subset_enforced() -> None:
+    async def scenario() -> None:
+        repository = InMemoryInvestigationTaskRepository()
+        service = _task_service(repository, limits=TaskLimits(max_children=1))
+        investigation_id = uuid4()
+        parent = await service.create_task(
+            investigation_id=investigation_id,
+            actor=HUMAN,
+            idempotency_key="parent",
+            task_key="parent",
+            title="Parent lead",
+            required_capabilities=("vt", "bridge"),
+            allowed_workspace_paths=("notes/agents/", "samples/"),
+            now=NOW,
+        )
+        assert parent.task.depth == 0
+
+        child = await service.create_task(
+            investigation_id=investigation_id,
+            actor=HUMAN,
+            idempotency_key="child",
+            task_key="child",
+            title="Child lead",
+            parent_task_id=parent.task.id,
+            required_capabilities=("vt",),
+            allowed_workspace_paths=("notes/agents/child/",),
+            now=NOW,
+        )
+        assert child.task.status is TaskStatus.PROPOSED
+        assert child.task.depth == 1
+        assert child.task.parent_task_id == parent.task.id
+
+        with pytest.raises(TaskPermissionError):
+            await service.create_task(
+                investigation_id=investigation_id,
+                actor=HUMAN,
+                idempotency_key="capability-escalation",
+                task_key="capability-escalation",
+                title="Escalated",
+                parent_task_id=parent.task.id,
+                required_capabilities=("vt", "publish"),
+                now=NOW,
+            )
+        with pytest.raises(TaskPermissionError):
+            await service.create_task(
+                investigation_id=investigation_id,
+                actor=HUMAN,
+                idempotency_key="path-escalation",
+                task_key="path-escalation",
+                title="Escalated",
+                parent_task_id=parent.task.id,
+                allowed_workspace_paths=("secrets/",),
+                now=NOW,
+            )
+        with pytest.raises(TaskCommandError):
+            await service.create_task(
+                investigation_id=investigation_id,
+                actor=HUMAN,
+                idempotency_key="path-traversal",
+                task_key="path-traversal",
+                title="Traversal",
+                parent_task_id=parent.task.id,
+                allowed_workspace_paths=("../escape/",),
+                now=NOW,
+            )
+        with pytest.raises(TaskLimitExceededError):
+            await service.create_task(
+                investigation_id=investigation_id,
+                actor=HUMAN,
+                idempotency_key="second-child",
+                task_key="second-child",
+                title="Second child",
+                parent_task_id=parent.task.id,
+                now=NOW,
+            )
+
+        second = await service.create_task(
+            investigation_id=investigation_id,
+            actor=HUMAN,
+            idempotency_key="depth-2",
+            task_key="depth-2",
+            title="Depth two",
+            parent_task_id=child.task.id,
+            required_capabilities=("vt",),
+            allowed_workspace_paths=("notes/agents/child/next/",),
+            now=NOW,
+        )
+        third = await service.create_task(
+            investigation_id=investigation_id,
+            actor=HUMAN,
+            idempotency_key="depth-3",
+            task_key="depth-3",
+            title="Depth three",
+            parent_task_id=second.task.id,
+            required_capabilities=("vt",),
+            allowed_workspace_paths=("notes/agents/child/next/leaf/",),
+            now=NOW,
+        )
+        assert third.task.depth == 3
+        with pytest.raises(TaskLimitExceededError):
+            await service.create_task(
+                investigation_id=investigation_id,
+                actor=HUMAN,
+                idempotency_key="depth-4",
+                task_key="depth-4",
+                title="Depth four",
+                parent_task_id=third.task.id,
+                required_capabilities=("vt",),
+                allowed_workspace_paths=("notes/agents/child/next/leaf/more/",),
+                now=NOW,
+            )
+
+        human_parent = await _seeded(
+            repository,
+            status=TaskStatus.ASSIGNED,
+            investigation_id=investigation_id,
+            assigned_actor_kind=TaskActorKind.HUMAN,
+            assigned_actor_id=HUMAN.actor_id,
+        )
+        with pytest.raises(TaskPermissionError):
+            await service.create_task(
+                investigation_id=investigation_id,
+                actor=OPERATOR,
+                idempotency_key="operator-subtask",
+                task_key="operator-subtask",
+                title="Operator subtask",
+                parent_task_id=human_parent.id,
+                now=NOW,
+            )
+        with pytest.raises(TaskPermissionError):
+            await service.create_task(
+                investigation_id=investigation_id,
+                actor=OPERATOR,
+                idempotency_key="operator-top-level",
+                task_key="operator-top-level",
+                title="Operator top level",
+                now=NOW,
+            )
+
+    asyncio.run(scenario())
+
+
+def test_settings_task_limits_read_adr_env_names() -> None:
+    defaults = Settings(_env_file=None)
+    assert defaults.task_limits() == TASK_LIMIT_DEFAULTS
+    overridden = Settings(
+        _env_file=None,
+        m24_task_lease_seconds=45,
+        m24_task_max_deps=4,
+        m24_task_max_depth=2,
+    )
+    limits = overridden.task_limits()
+    assert limits.lease_seconds == 45
+    assert limits.max_dependencies == 4
+    assert limits.max_depth == 2
+
+
+def test_operator_lease_lifecycle_keeps_and_closes_its_session() -> None:
+    async def scenario() -> None:
+        repository = InMemoryInvestigationTaskRepository()
+        sessions = _SessionRecorder()
+        seeded = await _seeded(
+            repository,
+            status=TaskStatus.ASSIGNED,
+            assigned_actor_kind=TaskActorKind.OPERATOR,
+            assigned_actor_id=OPERATOR.actor_id,
+        )
+        service = _task_service(repository, sessions=sessions)
+
+        with pytest.raises(TaskSessionInactiveError):
+            await service.start(
+                task_id=seeded.id,
+                actor=OPERATOR,
+                expected_status_version=1,
+                idempotency_key="start-without-session",
+                session_id=uuid4(),
+                now=NOW,
+            )
+
+        session_id = uuid4()
+        sessions.active.add(session_id)
+        started = await service.start(
+            task_id=seeded.id,
+            actor=OPERATOR,
+            expected_status_version=1,
+            idempotency_key="start",
+            session_id=session_id,
+            now=NOW,
+        )
+        assert started.task.lease is not None
+        awaiting = await service.request_input(
+            task_id=seeded.id,
+            actor=OPERATOR,
+            expected_status_version=2,
+            lease_fence=1,
+            idempotency_key="request-input",
+            now=NOW + timedelta(seconds=10),
+        )
+        assert awaiting.task.status is TaskStatus.AWAITING_INPUT
+        assert awaiting.task.lease is not None
+
+        resumed = await service.resume(
+            task_id=seeded.id,
+            actor=OPERATOR,
+            expected_status_version=3,
+            lease_fence=1,
+            idempotency_key="resume",
+            now=NOW + timedelta(seconds=20),
+        )
+        assert resumed.task.status is TaskStatus.RUNNING
+        assert resumed.task.lease_fence == 1
+        assert resumed.task.lease is not None
+
+        submitted = await service.submit(
+            task_id=seeded.id,
+            actor=OPERATOR,
+            expected_status_version=4,
+            lease_fence=1,
+            idempotency_key="submit",
+            result_refs=({"kind": "observation", "id": str(uuid4())},),
+            now=NOW + timedelta(seconds=30),
+        )
+        assert submitted.task.status is TaskStatus.AWAITING_REVIEW
+        assert submitted.task.result_verification_status is ResultVerificationStatus.PENDING_REVIEW
+        assert submitted.task.lease is None
+        assert submitted.task.lease_fence == 2
+        assert submitted.task.result_refs[0]["kind"] == "observation"
+        assert sessions.closed == [(session_id, seeded.id, TaskSessionOutcome.CLOSED, "submitted")]
+
+    asyncio.run(scenario())
+
+
+def test_request_changes_rejects_verification_and_clears_assignment() -> None:
+    async def scenario() -> None:
+        repository = InMemoryInvestigationTaskRepository()
+        decisions = _DecisionRecorder()
+        seeded = await _seeded(repository)
+        service = _task_service(repository, decisions=decisions)
+        submitted = await service.assign(
+            task_id=seeded.id,
+            actor=HUMAN,
+            target=HUMAN,
+            expected_status_version=1,
+            idempotency_key="assign",
+            now=NOW,
+        )
+        await service.start(
+            task_id=seeded.id,
+            actor=HUMAN,
+            expected_status_version=submitted.task.status_version,
+            idempotency_key="start",
+            now=NOW,
+        )
+        awaiting = await service.submit(
+            task_id=seeded.id,
+            actor=HUMAN,
+            expected_status_version=3,
+            idempotency_key="submit",
+            now=NOW,
+        )
+        assert awaiting.task.assigned_actor_id == HUMAN.actor_id
+
+        changed = await service.request_changes(
+            task_id=seeded.id,
+            actor=HUMAN,
+            expected_status_version=4,
+            idempotency_key="changes",
+            reason="the second stage is not evidenced",
+            now=NOW,
+        )
+        assert changed.task.status is TaskStatus.READY
+        assert changed.task.result_verification_status is ResultVerificationStatus.REJECTED
+        assert changed.task.assigned_actor_kind is None
+        assert changed.task.assigned_actor_id is None
+        assert len(decisions.decisions) == 1
+        decision = decisions.decisions[0]
+        assert decision.decision_type is AnalystDecisionType.TASK_RESULT_CHANGES_REQUESTED
+        assert changed.event is not None
+        assert changed.event.analyst_decision_id == decision.id
+
+    asyncio.run(scenario())
+
+
+def test_human_unblock_and_reassign_paths() -> None:
+    async def scenario() -> None:
+        repository = InMemoryInvestigationTaskRepository()
+        service = _task_service(repository)
+        investigation_id = uuid4()
+        blocked = await _seeded(
+            repository,
+            status=TaskStatus.BLOCKED,
+            investigation_id=investigation_id,
+            blocked_reason=BlockedReason.CAPABILITY,
+        )
+        unblocked = await service.unblock(
+            task_id=blocked.id,
+            actor=HUMAN,
+            expected_status_version=1,
+            idempotency_key="unblock",
+            now=NOW,
+        )
+        assert unblocked.task.status is TaskStatus.READY
+        assert unblocked.task.blocked_reason is None
+
+        dependency_blocked = await _seeded(
+            repository,
+            status=TaskStatus.BLOCKED,
+            investigation_id=investigation_id,
+            blocked_reason=BlockedReason.LEASE_EXPIRED,
+            lease_fence=2,
+        )
+        reassigned = await service.reassign(
+            task_id=dependency_blocked.id,
+            actor=HUMAN,
+            target=OPERATOR,
+            expected_status_version=1,
+            idempotency_key="reassign",
+            now=NOW,
+        )
+        assert reassigned.task.status is TaskStatus.ASSIGNED
+        assert reassigned.task.assigned_actor_kind is TaskActorKind.OPERATOR
+        assert reassigned.task.assigned_actor_id == OPERATOR.actor_id
+        assert reassigned.task.blocked_reason is None
+        assert reassigned.task.lease is None
+
+        session_id = uuid4()
+        sessions = _SessionRecorder(active=(session_id,))
+        restarted = await _task_service(repository, sessions=sessions).start(
+            task_id=dependency_blocked.id,
+            actor=OPERATOR,
+            expected_status_version=2,
+            idempotency_key="restart",
+            session_id=session_id,
+            now=NOW,
+        )
+        assert restarted.task.status is TaskStatus.RUNNING
+        assert restarted.task.lease_fence == 3
 
     asyncio.run(scenario())

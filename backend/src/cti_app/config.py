@@ -8,6 +8,8 @@ from typing import Literal
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from cti_app.domain.investigation_task import TaskLimits
+
 _HOST_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", re.ASCII)
 VIRUSTOTAL_DOWNLOAD_REQUIRED_CDN_HOST = "vtsamples.commondatastorage.googleapis.com"
 DOTNET_ANALYSIS_DEFAULT_ADDRESS_SPACE_LIMIT_BYTES = 8 * 1024**3
@@ -228,6 +230,15 @@ class Settings(BaseSettings):
     # workspace action (fail closed); the status route reports "unconfigured".
     workspace_agent_socket: str = ""
     workspace_agent_token_file: str = ""
+    # Investigation task engine (M24-04B2, ADR-0011 D3). Defaults mirror
+    # domain.investigation_task.TaskLimits; the service enforces them.
+    m24_task_max_depth: int = Field(default=3, ge=0)
+    m24_task_max_children: int = Field(default=20, ge=0)
+    m24_task_max_deps: int = Field(default=16, ge=0)
+    m24_task_max_active_per_investigation: int = Field(default=8, ge=1)
+    m24_task_max_running_per_session: int = Field(default=1, ge=1)
+    m24_task_lease_seconds: int = Field(default=180, ge=30, le=3600)
+    m24_max_contribution_bytes: int = Field(default=16 * 1024 * 1024, gt=0)
     collection_syndication_domains: str = ""
     collection_exact_title_search_endpoint: str = ""
     collection_official_newsletter_archive_endpoint: str = ""
@@ -396,6 +407,18 @@ class Settings(BaseSettings):
     def virustotal_retrohunt_proxy_allowed_hosts(self) -> str:
         """Compatibility sentinel; endpoint trust is validated by the v3 client."""
         return "www.virustotal.com"
+
+    def task_limits(self) -> TaskLimits:
+        """The M24 task-engine limits, read from their ADR-0011 D3 env names."""
+        return TaskLimits(
+            max_depth=self.m24_task_max_depth,
+            max_children=self.m24_task_max_children,
+            max_dependencies=self.m24_task_max_deps,
+            max_active_per_investigation=self.m24_task_max_active_per_investigation,
+            max_running_per_session=self.m24_task_max_running_per_session,
+            lease_seconds=self.m24_task_lease_seconds,
+            max_contribution_bytes=self.m24_max_contribution_bytes,
+        )
 
     # Shodan exposes only passive, indexed observations through this port.
     # Each capability and the API key are opt-in; their presence never
