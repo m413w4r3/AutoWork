@@ -44,6 +44,8 @@ import {
   taskActionLabel,
   type TaskActionId,
 } from "./taskActions";
+import { OpenSessionAction } from "./OpenSessionAction";
+import { sessionLaunchTarget } from "./sessionLaunch";
 
 type TransferDestination = "human" | "codex_cli" | "claude_code";
 type SimpleCommand = "start" | "release" | "submit" | "unblock";
@@ -125,6 +127,9 @@ export function TaskCard({
     workspaceAvailable,
     sessions,
   });
+  // An operator assignment without any active or resumable session: the
+  // handoff exists, so the cockpit may offer an explicit session opening.
+  const launchTarget = session === null ? sessionLaunchTarget(task) : null;
   const subtasks = allTasks.filter((item) => item.parent_task_id === task.id);
   const parent =
     task.parent_task_id === null
@@ -195,13 +200,12 @@ export function TaskCard({
           return;
         }
         const target = ADAPTER_LABELS[destination];
-        // `open_session: false` : l’attribution ne démarre aucun agent. Le
-        // contrat n’expose aucune lecture du probe de capacités, donc
-        // l’exécutable requis par `open_session: true` ne peut pas être
-        // inventé côté navigateur.
+        // `open_session: false` : l’attribution ne démarre aucun agent. La
+        // session s’ouvre par l’action explicite rendue plus bas, seulement si
+        // le sondage des capacités atteste le confinement isolé.
         if (result.session === null || result.session === undefined) {
           finish(
-            `Passation v${version} créée pour ${target} — aucune session ouverte. Le contrat n’expose pas l’exécutable sondé requis pour ouvrir la session depuis ce cockpit.`,
+            `Passation v${version} créée pour ${target} — aucune session ouverte pour l’instant.`,
           );
         } else {
           finish(`Session ${target} ouverte ; passation v${version} créée.`);
@@ -484,10 +488,20 @@ export function TaskCard({
         ))}
       </div>
       <p className="m24-muted">
-        Les attributions et transferts créent une passation versionnée ; aucune
-        session Codex / Claude Code n’est ouverte par cette action tant que le
-        contrat n’expose pas l’exécutable sondé requis.
+        Les attributions et transferts créent une passation versionnée ; la
+        session Codex / Claude Code s’ouvre ensuite par une action explicite,
+        uniquement si le sondage des capacités atteste le confinement isolé du
+        CLI. L’attribution seule ne démarre aucun agent.
       </p>
+
+      {launchTarget === null ? null : (
+        <div className="m24-task-card__session-launch">
+          <OpenSessionAction
+            investigationId={investigationId}
+            target={launchTarget}
+          />
+        </div>
+      )}
 
       {message === null ? null : (
         <p role="status" className="m24-message">

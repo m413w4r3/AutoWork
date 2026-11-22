@@ -33,7 +33,13 @@ import {
   TASK_STATUS_LABELS,
   VERIFICATION_LABELS,
 } from "./labels";
-import { ACTIVE_SESSION_STATES, RESUMABLE_SESSION_STATES } from "./taskActions";
+import { OpenSessionAction } from "./OpenSessionAction";
+import { sessionLaunchTarget, type SessionLaunchTarget } from "./sessionLaunch";
+import {
+  ACTIVE_SESSION_STATES,
+  RESUMABLE_SESSION_STATES,
+  sessionForTask,
+} from "./taskActions";
 
 const TERMINAL_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>([
   "completed",
@@ -363,6 +369,21 @@ export function OperatorsPanel({
   const resumable = items.filter((session) =>
     RESUMABLE_SESSION_STATES.has(session.state),
   );
+  // Assigned operator tasks whose handoff exists but which have no active or
+  // resumable session: the explicit session opening belongs here as well as on
+  // the task card.
+  const openable = (tasks.data?.items ?? [])
+    .map((task) => ({
+      task,
+      target:
+        sessionForTask(items, task.id) === null
+          ? sessionLaunchTarget(task)
+          : null,
+    }))
+    .filter(
+      (entry): entry is { task: TaskView; target: SessionLaunchTarget } =>
+        entry.target !== null,
+    );
   const sessionError = sessions.isError
     ? toWorkshopApiError(sessions.error)
     : null;
@@ -375,6 +396,35 @@ export function OperatorsPanel({
         (reprise, checkpoint) sont celles que le serveur expose ; rien n’est
         déduit d’un adaptateur présumé.
       </p>
+
+      {openable.length === 0 ? null : (
+        <section aria-labelledby="m24-operators-pending">
+          <h4 id="m24-operators-pending">
+            Tâches attribuées sans session ({openable.length})
+          </h4>
+          <p className="m24-muted">
+            L’attribution crée une passation, pas une session. Ici, une session
+            est proposée uniquement lorsque le sondage réel des capacités
+            atteste le confinement isolé du CLI.
+          </p>
+          <ul className="m24-operator-list">
+            {openable.map(({ task, target }) => (
+              <li className="m24-operator" key={task.id}>
+                <header className="m24-operator__header">
+                  <h5>
+                    {ADAPTER_LABELS[target.adapterKind]} · {task.title}
+                  </h5>
+                  <span className="m24-badge">Attribuée</span>
+                </header>
+                <OpenSessionAction
+                  investigationId={investigationId}
+                  target={target}
+                />
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
 
       {sessions.isPending ? (
         <p role="status">Chargement des sessions…</p>
