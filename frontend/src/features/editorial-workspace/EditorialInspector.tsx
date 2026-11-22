@@ -9,6 +9,10 @@ import { EditorialConversation } from "./EditorialConversation";
 import { EditorialHistory } from "./EditorialHistory";
 import { VisualInsertionComposer } from "./VisualInsertionComposer";
 import { BLOCK_KIND_LABELS } from "./blockKindLabels";
+import {
+  isInsertionAnchor,
+  supportsInsertionAfter,
+} from "./insertionOperations";
 import { manualEditUnavailableReason } from "./manualEditOperation";
 
 export type InspectorTab =
@@ -93,10 +97,10 @@ function insertionUnavailableReason({
   if (!canAddEnrichment) {
     return "La préparation d’insertions n’est pas activée pour cet atelier.";
   }
-  if (block.kind !== "paragraph" && block.kind !== "lead_paragraph") {
+  if (!isInsertionAnchor(block)) {
     return "Seuls un paragraphe ou le chapeau peuvent recevoir une insertion après eux.";
   }
-  if (!block.allowed_operations.includes("insert_after")) {
+  if (!supportsInsertionAfter(block)) {
     return "Aucune insertion après ce bloc n’est autorisée par l’instantané serveur.";
   }
   return null;

@@ -20,6 +20,12 @@ from cti_app.application.editorial_legacy_read_only import (
     EditorialLegacyReadOnlyReason,
     current_editorial_read_only_reason,
 )
+from cti_app.application.editorial_workspace.capabilities import (
+    EditorialCapabilityFacts,
+    insertion_anchor_ready,
+    manual_edit_anchor_ready,
+    resolve_editorial_capabilities,
+)
 from cti_app.application.editorial_workspace.registry import (
     WorkspaceOccurrenceResolution,
     WorkspaceSnapshotRecord,
@@ -634,6 +640,18 @@ class EditorialWorkspaceService:
                 render=publication_render,
                 publication_stale=publication_stale,
             )
+            # The service only knows document facts. Request wiring (Bridge worker,
+            # accept writer, thread routes) is overlaid by the HTTP route with the
+            # same resolver; without it every mutating capability is fail-closed.
+            capabilities = resolve_editorial_capabilities(
+                EditorialCapabilityFacts(
+                    publication_kind_known=kind is not None,
+                    production_run_known=True,
+                    read_only=read_only_reason is not None,
+                    manual_edit_anchor_ready=manual_edit_anchor_ready(blocks),
+                    insertion_anchor_ready=insertion_anchor_ready(blocks),
+                )
+            )
             result: dict[str, object] = {
                 "subject_id": str(subject.id),
                 "production_run_id": str(run.id),
@@ -658,10 +676,10 @@ class EditorialWorkspaceService:
                 "enrichments": enrichments,
                 "document_outline": outline,
                 "capabilities": {
-                    "can_discuss": False,
-                    "can_preview_revision": False,
-                    "manual_edit": False,
-                    "can_add_enrichment": False,
+                    "can_discuss": capabilities.can_discuss,
+                    "can_preview_revision": capabilities.can_preview_revision,
+                    "manual_edit": capabilities.manual_edit,
+                    "can_add_enrichment": capabilities.can_add_enrichment,
                     "can_preview_pdf": (
                         read_only_reason is None and pdf_preview.status.value == "READY"
                     ),
