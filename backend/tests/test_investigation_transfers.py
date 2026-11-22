@@ -16,7 +16,7 @@ import shutil
 import sys
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -66,6 +66,7 @@ from cti_app.application.investigation_persistence import (
 from cti_app.application.investigation_persistence import (
     HandoffRecord as PersistedHandoffRecord,
 )
+from cti_app.application.investigation_tasks import TaskSessionRelease
 from cti_app.application.investigation_transfers import (
     InvestigationTransferService,
     NoteReferenceError,
@@ -515,6 +516,7 @@ class _Harness:
         self.handoffs_service = InvestigationHandoffService(
             uow_factory=lambda: self.uow, clock=lambda: NOW
         )
+        self.host_releases: list[list[TaskSessionRelease]] = []
         self.transfers = InvestigationTransferService(
             uow_factory=lambda: self.uow,
             workspace_agent=cast(WorkspaceAgentPort, self.workspace),
@@ -522,6 +524,7 @@ class _Harness:
             secret_delivery=self.delivery,
             deriver=self.deriver,
             disclosure=_allow_disclosure,
+            release_host=self._release_host,
             clock=lambda: NOW,
         )
         self.notes = WorkspaceNoteCatalog(uow_factory=lambda: self.uow)
@@ -531,8 +534,12 @@ class _Harness:
             operator=self.operator,
             secret_delivery=self.delivery,
             note_resolver=self.notes,
+            disclosure=_allow_disclosure,
             clock=lambda: NOW,
         )
+
+    async def _release_host(self, releases: Sequence[TaskSessionRelease]) -> None:
+        self.host_releases.append(list(releases))
 
     async def bind_workspace(self, *, workspace_id: str = WORKSPACE_ID) -> None:
         await self.bindings.add_if_absent(
@@ -1021,6 +1028,10 @@ async def test_lost_session_is_reconciled_and_never_relaunched() -> None:
     assert [event.event_type.value for event in events] == ["status_changed", "assigned"]
     assert events[0].to_status is TaskStatus.BLOCKED
     assert events[1].to_status is TaskStatus.ASSIGNED
+    # B2: the blocking transition released the lease and committed the closed
+    # session before the host teardown was requested.
+    assert harness.host_releases, "a blocking transfer must flush its host release"
+    assert harness.host_releases[0][0].session_id == session_id
 
 
 # --------------------------------------------------------------------- A05
@@ -1404,6 +1415,7 @@ async def _real_sidecar_instruction(running: RunningSessionAgent, workspace_id: 
         operator=ports.operator,
         secret_delivery=ports.secret_delivery,
         note_resolver=harness.notes,
+        disclosure=_allow_disclosure,
         clock=lambda: NOW,
     )
     try:

@@ -51,7 +51,9 @@ from cti_app.application.investigation_jobs import (
     make_investigation_runner,
 )
 from cti_app.application.investigation_task_sweep import (
+    AgentSessionRecoverySource,
     ExpiredLeaseSource,
+    recover_orphan_agent_sessions,
     run_expired_lease_sweep,
 )
 from cti_app.application.jobs import (
@@ -80,6 +82,7 @@ from cti_app.config import (
     Settings,
     get_settings,
 )
+from cti_app.domain.agentic_operator import AgentSessionV1
 from cti_app.domain.jobs import INVESTIGATION_RUN_JOB_KIND, JobStatus
 from cti_app.domain.production_pipeline import production_stages
 from cti_app.infrastructure.analytic_chart_renderer import AnalyticChartRenderer
@@ -213,11 +216,14 @@ def sweep_expired_editorial_drafts() -> None:
 
 @dramatiq.actor(max_retries=0)
 def sweep_expired_investigation_leases() -> None:
-    """System sweep for M24 task leases (ADR-0011 D3, B1).
+    """System sweep for M24 task leases and crashed sessions (ADR-0011 D3, B1).
 
     The DB release (status/event/session row) commits per investigation; only
     then is the host teardown requested.  A missing or unresponsive host agent
     leaves a ``lost_unreconciled`` marker instead of blocking the release.
+    The same run fails unleased ``provisioning``/``ready`` sessions past the
+    grace and re-requests host teardown for terminal sessions whose release was
+    never confirmed (a crash between commit and flush).  It never relaunches.
     """
     asyncio.run(_sweep_expired_investigation_leases())
 
@@ -657,6 +663,29 @@ class _SqlExpiredLeaseSource:
             ).list_expired_lease_investigation_ids(limit=limit)
 
 
+class _SqlAgentSessionRecoverySource:
+    """The two global session-recovery reads, both bounded by the DB clock."""
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self._session_factory = session_factory
+
+    async def list_orphan_sessions(
+        self, *, grace_seconds: int, limit: int
+    ) -> tuple[AgentSessionV1, ...]:
+        async with SqlAlchemyUnitOfWork(self._session_factory) as uow:
+            return await cast(AgentSessionRecoverySource, uow.agent_sessions).list_orphan_sessions(
+                grace_seconds=grace_seconds, limit=limit
+            )
+
+    async def list_pending_host_release_sessions(
+        self, *, grace_seconds: int, limit: int
+    ) -> tuple[AgentSessionV1, ...]:
+        async with SqlAlchemyUnitOfWork(self._session_factory) as uow:
+            return await cast(
+                AgentSessionRecoverySource, uow.agent_sessions
+            ).list_pending_host_release_sessions(grace_seconds=grace_seconds, limit=limit)
+
+
 async def _sweep_expired_investigation_leases() -> int:
     from cti_app.infrastructure.agentic.wiring import build_agentic_operator_ports
 
@@ -673,12 +702,22 @@ async def _sweep_expired_investigation_leases() -> int:
         wait_seconds=settings.m24_host_release_wait_seconds,
     )
     try:
-        return await run_expired_lease_sweep(
+        swept = await run_expired_lease_sweep(
             source=_SqlExpiredLeaseSource(session_factory),
             uow_factory=lambda: SqlAlchemyUnitOfWork(session_factory),
             flush_releases=release_service.flush,
             batch_size=settings.m24_task_sweep_batch_size,
         )
+        # Same sweep actor: recover sessions a crash left without a lease or
+        # without a confirmed host teardown.  Never relaunches a CLI.
+        await recover_orphan_agent_sessions(
+            source=_SqlAgentSessionRecoverySource(session_factory),
+            uow_factory=lambda: SqlAlchemyUnitOfWork(session_factory),
+            flush_releases=release_service.flush,
+            grace_seconds=settings.m24_orphan_session_grace_seconds,
+            batch_size=settings.m24_task_sweep_batch_size,
+        )
+        return swept
     finally:
         await ports.aclose()
         await engine.dispose()

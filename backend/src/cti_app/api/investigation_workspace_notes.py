@@ -26,6 +26,7 @@ from uuid import UUID
 from fastapi import APIRouter, Header, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from cti_app.api.agent_sessions import _disclosure_gate
 from cti_app.api.investigation import (
     _composition_factory,
     _http_error,
@@ -390,6 +391,9 @@ class _SessionInstructionPort:
                 AgenticOperatorPort | None,
                 getattr(self._request.app.state, "agentic_operator_port", None),
             ),
+            # R03b M1: the note continuation can be delivered live to the CLI,
+            # so it must pass the same canonical G2/TLP disclosure gate.
+            disclosure=_disclosure_gate(self._request),
             task_limits=_settings(self._request).task_limits(),
         )
         instruction: AgentSessionInstructionV1 = await service.enqueue_instruction(

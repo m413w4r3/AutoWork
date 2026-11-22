@@ -139,6 +139,46 @@ policy. A refusal is `403 agent_session_external_llm_not_allowed` with a stable 
 any host call, session row, secret or workspace bind. A service built without the gate refuses
 (`gate_unavailable`), never opens. The same gate is wired on the transfer path.
 
+**Instruction delivery (R03b M1).** The same gate is re-run when a queued human
+instruction may be delivered live to an idle CLI (`enqueue_instruction_with_notes`
+before `send_instruction`, including the note-continuation port): a TLP change,
+an `external_llm_allowed=false` update or a revocation after the opening stops
+the next delivery before any host effect. Transport-only host calls (interrupt,
+reconcile, collect, release) are not gated because they carry no new evidence.
+
+**Reliability (FIX-C2).**
+* A crash/exception between the three `open_session` phases can never leave an
+  unopenable task: `prepare`/`start_session` failures durably mark the session
+  `failed` and interrupt the host object; the sweep additionally fails any
+  `provisioning`/`ready` session without a lease older than
+  `M24_ORPHAN_SESSION_GRACE_SECONDS` (default 900 s, DB clock, never a
+  relaunch).
+* A human can release an unleased session through
+  `POST /api/investigations/{id}/agent-sessions/{sid}/close`; a session the
+  current task lease still owns is refused there (the task command closes it).
+* Every lease/pre-lease release requests host teardown **after** its commit.
+  A confirmed teardown appends the durable `host-release:<session_id>`
+  `session_state_changed` task event; the same sweep re-requests teardown for a
+  terminal session with a host reference and no such event, and records
+  `lost_unreconciled` when the host cannot confirm — never silently assumed
+  stopped.
+* `contribution.import` revalidates the session/lease/fence inside the
+  persisting transaction under the advisory-then-task-row order, and writes
+  `contribution_imported` in that same transaction; a cancel or sweep that
+  committed between the workspace read and the write is a typed refusal with
+  no canonical row.
+
+**Known gap (not implemented — R5 M4).** The instruction queue is write-only.
+No production path writes `awaiting_instruction`, `enqueue_instruction`
+accepts a `running` session and returns `delivered_live=false`, there is no
+signed pull/list route for `queued` instructions (only operator ack by ids),
+and `request_input` does not change the session state. A human instruction on a
+busy session is therefore persisted but never drained; it is only re-delivered
+if the session later becomes `awaiting_instruction` (no such transition exists
+today), and it otherwise remains undelivered until the lease expires and the
+sweep blocks the task. Fixing this requires a producer for
+`awaiting_instruction` and a signed pull (or an explicit re-delivery) path.
+
 **NOT PROVEN (H0 spike).** The real CLI accepting our argv/MCP config, the provider account and
 first model turn, live resume ids, the real stream-json behaviours, and the deployment's
 `bwrap`/`slirp4netns` availability in the intended systemd user unit remain host-spike items.

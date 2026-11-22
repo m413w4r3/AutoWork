@@ -34,7 +34,11 @@ from cti_app.application.agent_session_verification import (
     HmacSessionSecretDeriver,
     SessionSecretDeriver,
 )
-from cti_app.application.agentic_sessions import AgentSessionSecretDeliveryPort
+from cti_app.application.agentic_sessions import (
+    AgentSessionSecretDeliveryPort,
+    HostSessionReleaseService,
+    SessionUnitOfWork,
+)
 from cti_app.application.investigation_transfers import (
     InvestigationTransferService,
     TransferError,
@@ -98,6 +102,11 @@ def _service(request: Request, workspace_agent: WorkspaceAgentPort) -> Investiga
         settings=settings,
         effective_policy_for=composition.osint_open_policy_service.effective_for_investigation,
     )
+    release_service = HostSessionReleaseService(
+        uow_factory=cast(Callable[[], SessionUnitOfWork], factory),
+        host=getattr(request.app.state, "host_sessions", None),
+        wait_seconds=settings.m24_host_release_wait_seconds,
+    )
     return InvestigationTransferService(
         uow_factory=factory,
         workspace_agent=workspace_agent,
@@ -105,6 +114,7 @@ def _service(request: Request, workspace_agent: WorkspaceAgentPort) -> Investiga
         secret_delivery=_secret_delivery(request),
         deriver=_deriver(settings),
         disclosure=disclosure,
+        release_host=release_service.flush,
         cli_network_mode=settings.agent_sessions_cli_network_mode,
         task_limits=settings.task_limits(),
     )

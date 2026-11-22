@@ -17,7 +17,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import Float, String, cast, func, literal, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -36,6 +36,13 @@ from cti_app.infrastructure.database.models.agent_sessions import (
     AgentSessionInstructionRow,
     AgentSessionRow,
 )
+from cti_app.infrastructure.database.models.investigation_tasks import (
+    InvestigationTaskEventRow,
+)
+
+_TERMINAL_SESSION_STATES = ("closed", "lost", "failed")
+_ORPHAN_SESSION_STATES = ("provisioning", "ready")
+_HOST_RELEASE_EVENT_PREFIX = "host-release:"
 
 _CLOSE_OUTCOME_STATES = {"closed": AgentSessionState.CLOSED, "lost": AgentSessionState.LOST}
 
@@ -219,6 +226,66 @@ class SqlAlchemyAgentSessionRepository:
             select(AgentSessionRow)
             .where(AgentSessionRow.task_id == task_id)
             .order_by(AgentSessionRow.created_at, AgentSessionRow.id)
+        )
+        return tuple(_session_from_row(row) for row in rows)
+
+    async def list_orphan_sessions(
+        self, *, grace_seconds: int, limit: int
+    ) -> tuple[AgentSessionV1, ...]:
+        """Sessions a crash left ``provisioning``/``ready`` without any lease.
+
+        The age boundary is the database clock (``statement_timestamp()``), so
+        a skewed backend clock cannot fail a legitimately in-flight open.
+        """
+        cutoff = func.statement_timestamp() - func.make_interval(
+            0, 0, 0, 0, 0, 0, cast(grace_seconds, Float)
+        )
+        rows = await self._session.scalars(
+            select(AgentSessionRow)
+            .where(
+                AgentSessionRow.state.in_(_ORPHAN_SESSION_STATES),
+                AgentSessionRow.task_lease_id.is_(None),
+                AgentSessionRow.created_at <= cutoff,
+            )
+            .order_by(AgentSessionRow.created_at, AgentSessionRow.id)
+            .limit(limit)
+        )
+        return tuple(_session_from_row(row) for row in rows)
+
+    async def list_pending_host_release_sessions(
+        self, *, grace_seconds: int, limit: int
+    ) -> tuple[AgentSessionV1, ...]:
+        """Terminal sessions whose host teardown has no durable confirmation.
+
+        ``host-release:<session_id>`` is appended by the release service once
+        the host stopped; without it the effect is pending (crash between the
+        DB commit and the flush).  An already marked ``reconciliation`` is a
+        recorded outcome and is never retried automatically.
+        """
+        cutoff = func.statement_timestamp() - func.make_interval(
+            0, 0, 0, 0, 0, 0, cast(grace_seconds, Float)
+        )
+        confirmed = (
+            select(InvestigationTaskEventRow.id)
+            .where(
+                InvestigationTaskEventRow.task_id == AgentSessionRow.task_id,
+                InvestigationTaskEventRow.idempotency_key
+                == literal(_HOST_RELEASE_EVENT_PREFIX) + cast(AgentSessionRow.id, String),
+            )
+            .exists()
+        )
+        rows = await self._session.scalars(
+            select(AgentSessionRow)
+            .where(
+                AgentSessionRow.state.in_(_TERMINAL_SESSION_STATES),
+                AgentSessionRow.host_session_ref.is_not(None),
+                AgentSessionRow.reconciliation.is_(None),
+                AgentSessionRow.closed_at.is_not(None),
+                AgentSessionRow.closed_at <= cutoff,
+                ~confirmed,
+            )
+            .order_by(AgentSessionRow.closed_at, AgentSessionRow.id)
+            .limit(limit)
         )
         return tuple(_session_from_row(row) for row in rows)
 

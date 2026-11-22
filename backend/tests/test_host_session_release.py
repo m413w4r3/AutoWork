@@ -24,7 +24,11 @@ from cti_app.application.agentic_host_sessions import (
     HostSessionStatusV1,
 )
 from cti_app.application.agentic_sessions import HostSessionReleaseService, SessionUnitOfWork
-from cti_app.application.investigation_persistence import InMemoryAgentSessionRepository
+from cti_app.application.investigation_persistence import (
+    InMemoryAgentSessionRepository,
+    InMemoryInvestigationTaskRepository,
+)
+from cti_app.application.investigation_task_events import TaskEventType
 from cti_app.application.investigation_tasks import TaskSessionOutcome, TaskSessionRelease
 from cti_app.application.workspace_agent import WorkspaceLocalUnavailableError
 from cti_app.domain.agentic_operator import (
@@ -34,6 +38,14 @@ from cti_app.domain.agentic_operator import (
     OperatorCapabilitiesV1,
     OperatorProbeCommand,
     SessionReconcileOutcome,
+)
+from cti_app.domain.investigation_task import (
+    InvestigationTaskV1,
+    ResultVerificationStatus,
+    TaskActor,
+    TaskActorKind,
+    TaskPriority,
+    TaskStatus,
 )
 
 NOW = datetime(2026, 11, 22, 12, 0, tzinfo=UTC)
@@ -65,8 +77,13 @@ def _capabilities() -> OperatorCapabilitiesV1:
 
 
 class _Uow:
-    def __init__(self, sessions: InMemoryAgentSessionRepository) -> None:
+    def __init__(
+        self,
+        sessions: InMemoryAgentSessionRepository,
+        tasks: InMemoryInvestigationTaskRepository | None = None,
+    ) -> None:
         self.agent_sessions = sessions
+        self.investigation_tasks = tasks or InMemoryInvestigationTaskRepository()
         self.commits = 0
 
     async def __aenter__(self) -> _Uow:
@@ -200,9 +217,10 @@ def _service(
     host: _Host | None,
     *,
     wait_seconds: float = 0.0,
+    tasks: InMemoryInvestigationTaskRepository | None = None,
 ):
     return HostSessionReleaseService(
-        uow_factory=cast(Callable[[], SessionUnitOfWork], lambda: _Uow(sessions)),
+        uow_factory=cast(Callable[[], SessionUnitOfWork], lambda: _Uow(sessions, tasks)),
         host=cast(HostSessionsPort, host) if host is not None else None,
         wait_seconds=wait_seconds,
         sleep=lambda _seconds: _noop(),
@@ -303,5 +321,45 @@ async def test_session_without_host_reference_has_nothing_to_stop() -> None:
     await _service(sessions, host).flush([_release(session)])
 
     assert host.calls == []
+    stored = await sessions.get(session.id)
+    assert stored is not None and stored.reconciliation is None
+
+
+async def test_confirmed_release_appends_one_durable_confirmation_event() -> None:
+    """MAJOR 3: a crash between commit and flush must remain detectable."""
+    sessions = InMemoryAgentSessionRepository()
+    session = await _closed_session(sessions)
+    tasks = InMemoryInvestigationTaskRepository()
+    await tasks.add(
+        InvestigationTaskV1(
+            id=session.task_id,
+            investigation_id=session.investigation_id,
+            task_key="lead-release",
+            title="Inspect the loader",
+            question="",
+            objective="",
+            priority=TaskPriority.NORMAL,
+            status=TaskStatus.RUNNING,
+            status_version=3,
+            result_verification_status=ResultVerificationStatus.UNVERIFIED,
+            created_by=TaskActor(kind=TaskActorKind.HUMAN, actor_id="analyst:test"),
+            created_at=NOW,
+            updated_at=NOW,
+            assigned_actor_kind=TaskActorKind.OPERATOR,
+            assigned_actor_id="codex:operator-1",
+        )
+    )
+    host = _Host()
+
+    await _service(sessions, host, tasks=tasks).flush([_release(session)])
+
+    events = await tasks.list_events(session.task_id)
+    assert [event.event_type for event in events] == [TaskEventType.SESSION_STATE_CHANGED]
+    assert events[0].idempotency_key == f"host-release:{session.id}"
+    assert events[0].payload["action"] == "host_session_released"
+
+    # An API flush and the sweep recovery may both replay the same release.
+    await _service(sessions, host, tasks=tasks).flush([_release(session)])
+    assert len(await tasks.list_events(session.task_id)) == 1
     stored = await sessions.get(session.id)
     assert stored is not None and stored.reconciliation is None

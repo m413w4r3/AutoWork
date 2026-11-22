@@ -24,6 +24,7 @@ heartbeat that wins the row first leaves the sweep a clean no-op.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Iterable, Sequence
+from datetime import timedelta
 from types import TracebackType
 from typing import Protocol, Self
 from uuid import UUID
@@ -46,16 +47,31 @@ from cti_app.application.investigation_tasks import (
     TaskSessionPort,
     TaskSessionRelease,
 )
+from cti_app.domain.agentic_operator import AgentSessionState, AgentSessionV1
 from cti_app.domain.investigation_task import (
     BlockedReason,
     TaskStatus,
 )
+
+_ORPHAN_SESSION_STATES = frozenset({AgentSessionState.PROVISIONING, AgentSessionState.READY})
 
 
 class ExpiredLeaseSource(Protocol):
     """The one global read the scheduler needs; no second task aggregate."""
 
     async def list_expired_lease_investigation_ids(self, *, limit: int) -> tuple[UUID, ...]: ...
+
+
+class AgentSessionRecoverySource(Protocol):
+    """Global candidate reads for the two session-recovery steps (DB clock)."""
+
+    async def list_orphan_sessions(
+        self, *, grace_seconds: int, limit: int
+    ) -> tuple[AgentSessionV1, ...]: ...
+
+    async def list_pending_host_release_sessions(
+        self, *, grace_seconds: int, limit: int
+    ) -> tuple[AgentSessionV1, ...]: ...
 
 
 class SweepUnitOfWork(Protocol):
@@ -104,6 +120,101 @@ async def run_expired_lease_sweep(
         swept += len(results)
         await flush_releases(releases)
     return swept
+
+
+async def recover_orphan_agent_sessions(
+    *,
+    source: AgentSessionRecoverySource,
+    uow_factory: Callable[[], SweepUnitOfWork],
+    flush_releases: Callable[[Sequence[TaskSessionRelease]], Awaitable[None]],
+    grace_seconds: int,
+    batch_size: int,
+) -> tuple[int, int]:
+    """Recover sessions a crash left without a lease or without host teardown.
+
+    Step 1 (orphans): a session committed ``provisioning``/``ready`` whose
+    ``open_session`` died before the lease acquisition blocks every later open
+    of its task through the one-active-session index.  Past the configured
+    grace the sweep marks it ``failed`` (durable marker) and asks the host to
+    stop it — never to relaunch it.
+
+    Step 2 (pending releases): a terminal session whose host reference has no
+    ``host-release:<id>`` journal event either crashed between commit and the
+    host flush, or was released before this marker existed.  The host request
+    is idempotent and never starts anything.
+
+    Step 1 re-reads every candidate under the advisory-then-task-row lock
+    order and both steps use the database clock; a concurrent command or an
+    in-flight ``open_session`` younger than the grace is a clean no-op.  Step 2
+    only replays an idempotent host request and journals its confirmation.
+    """
+    orphans = await source.list_orphan_sessions(grace_seconds=grace_seconds, limit=batch_size)
+    releases: list[TaskSessionRelease] = []
+    for candidate in orphans:
+        release = await _fail_orphan_session(uow_factory, candidate, grace_seconds=grace_seconds)
+        if release is not None:
+            releases.append(release)
+    if releases:
+        await flush_releases(releases)
+
+    pending = await source.list_pending_host_release_sessions(
+        grace_seconds=grace_seconds, limit=batch_size
+    )
+    if pending:
+        await flush_releases(
+            [
+                TaskSessionRelease(
+                    session_id=session.id,
+                    investigation_id=session.investigation_id,
+                    task_id=session.task_id,
+                    outcome=(
+                        TaskSessionOutcome.CLOSED
+                        if session.state is AgentSessionState.CLOSED
+                        else TaskSessionOutcome.LOST
+                    ),
+                    reason="host_release_recovery",
+                )
+                for session in pending
+            ]
+        )
+    return len(releases), len(pending)
+
+
+async def _fail_orphan_session(
+    uow_factory: Callable[[], SweepUnitOfWork],
+    candidate: AgentSessionV1,
+    *,
+    grace_seconds: int,
+) -> TaskSessionRelease | None:
+    async with uow_factory() as uow:
+        await uow.investigation_tasks.lock_investigation(candidate.investigation_id)
+        task = await uow.investigation_tasks.lock_task(candidate.task_id)
+        if task is None or task.investigation_id != candidate.investigation_id:
+            return None
+        current = await uow.agent_sessions.get(candidate.id)
+        if current is None or current.is_terminal:
+            return None
+        if current.state not in _ORPHAN_SESSION_STATES or current.task_lease_id is not None:
+            return None
+        now = await uow.investigation_tasks.database_now()
+        if current.created_at > now - timedelta(seconds=grace_seconds):
+            return None
+        failed = current.with_state(
+            AgentSessionState.FAILED, now=now, close_reason="orphaned_no_lease"
+        )
+        stored = await uow.agent_sessions.update_state(
+            failed, expected_state_version=current.state_version
+        )
+        if stored is None:
+            return None
+        await uow.commit()
+        return TaskSessionRelease(
+            session_id=stored.id,
+            investigation_id=stored.investigation_id,
+            task_id=stored.task_id,
+            outcome=TaskSessionOutcome.LOST,
+            reason="orphaned_no_lease",
+        )
 
 
 class InvestigationTaskSweeper:
@@ -204,8 +315,10 @@ class InvestigationTaskSweeper:
 
 
 __all__ = [
+    "AgentSessionRecoverySource",
     "ExpiredLeaseSource",
     "InvestigationTaskSweeper",
     "SweepUnitOfWork",
+    "recover_orphan_agent_sessions",
     "run_expired_lease_sweep",
 ]

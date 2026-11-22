@@ -273,6 +273,11 @@ class Settings(BaseSettings):
     m24_task_sweep_interval_seconds: float = Field(default=30.0, gt=1, le=3600)
     m24_task_sweep_batch_size: int = Field(default=100, ge=1, le=1000)
     m24_host_release_wait_seconds: float = Field(default=5.0, ge=0, le=60)
+    # A session left ``provisioning``/``ready`` without a task lease for longer
+    # than this grace is unrecoverable (a crash between open_session phases):
+    # the sweep marks it ``failed`` and stops its host process.  The default is
+    # deliberately larger than any legitimate prepare/start/deliver window.
+    m24_orphan_session_grace_seconds: int = Field(default=900, ge=30, le=86400)
     collection_syndication_domains: str = ""
     collection_exact_title_search_endpoint: str = ""
     collection_official_newsletter_archive_endpoint: str = ""
