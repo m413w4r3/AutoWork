@@ -24,11 +24,9 @@ from cti_app.domain.editorial_enrichment_patch import (
     visual_patch_from_json,
     visual_patch_to_json,
 )
-from cti_app.domain.editorial_enrichment_patch import (
-    enrichment_order_group_hash as domain_group_hash,
-)
 from cti_app.domain.production_editorial_enrichment import (
     EDITORIAL_ENRICHMENT_MAX_SCHEMA_VERSION,
+    EDITORIAL_ENRICHMENT_V8_CURRENT_POLICY_VERSION,
     EDITORIAL_ENRICHMENT_V11_POLICY_VERSION,
     ChartKind,
     ChartPointV1,
@@ -690,15 +688,18 @@ def test_patch_codec_round_trips_implemented_variants_and_rejects_the_rest() -> 
         visual_patch_from_json({"kind": "update_visual_caption"})
     with pytest.raises(EditorialEnrichmentPatchError):
         visual_patch_from_json({"kind": "revise_chart", "element_key": "chart_one"})
+    with pytest.raises(EditorialEnrichmentPatchError) as unknown:
+        visual_patch_from_json({"kind": "future_visual_patch"})
+    # An unknown wire kind is a corrupted patch, not an unsupported slice.
+    assert unknown.value.code == "enrichment_revision_patch_invalid"
 
 
-def test_project_blocks_exposes_element_fields_order_and_reorder_operations() -> None:
+def _project_enrichment_blocks(enrichment_for_anchor):
+    """Project an enrichment built for the first synthesis paragraph."""
     from cti_app.application.editorial_workspace.registry import (
         WorkspaceSnapshotRecord,
         project_blocks,
         registry_hash,
-        resolve_enrichment_element_target,
-        resolve_enrichment_order_target,
     )
     from cti_app.application.production_artifact_store import ProductionArtifactStore
     from cti_app.domain.editorial_workspace import bootstrap_block_registry
@@ -718,24 +719,7 @@ def test_project_blocks_exposes_element_fields_order_and_reorder_operations() ->
         canonical_content=synthesis_payload,
     )
     anchor_entry = next(entry for entry in synthesis_entries if entry.kind == "paragraph")
-    enrichment = replace(
-        _base_enrichment(),
-        tables=(
-            _table(
-                "table_one",
-                _anchor(anchor_entry.block_id),
-                "Which first command is documented?",
-            ),
-            _table(
-                "table_two",
-                _anchor(anchor_entry.block_id),
-                "Which second command is documented?",
-            ),
-        ),
-        charts=(),
-        diagrams=(),
-        source_figures=(),
-    )
+    enrichment = enrichment_for_anchor(anchor_entry.block_id)
     enrichment_payload = editorial_enrichment_to_json(enrichment)
     enrichment_artifact_id = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
     enrichment_entries = bootstrap_block_registry(
@@ -776,6 +760,38 @@ def test_project_blocks_exposes_element_fields_order_and_reorder_operations() ->
         enrichment=enrichment_payload,
         record=record,
     )
+    return enrichment_payload, entries, enrichments, anchor_entry
+
+
+def test_project_blocks_exposes_element_fields_order_and_reorder_operations() -> None:
+    from cti_app.application.editorial_workspace.registry import (
+        resolve_enrichment_element_target,
+        resolve_enrichment_order_target,
+    )
+
+    def two_table_enrichment(anchor_block_id: UUID):
+        return replace(
+            _base_enrichment(),
+            tables=(
+                _table(
+                    "table_one",
+                    _anchor(anchor_block_id),
+                    "Which first command is documented?",
+                ),
+                _table(
+                    "table_two",
+                    _anchor(anchor_block_id),
+                    "Which second command is documented?",
+                ),
+            ),
+            charts=(),
+            diagrams=(),
+            source_figures=(),
+        )
+
+    enrichment_payload, entries, enrichments, anchor_entry = _project_enrichment_blocks(
+        two_table_enrichment
+    )
 
     assert [block["element_key"] for block in enrichments] == ["table_one", "table_two"]
     assert [block["order"] for block in enrichments] == [0, 1]
@@ -789,9 +805,7 @@ def test_project_blocks_exposes_element_fields_order_and_reorder_operations() ->
             "move_enrichment_element",
             "reorder_enrichment_elements",
         } <= set(allowed)
-    table_entry = next(
-        entry for entry in enrichment_entries if entry.structural_pointer == "/tables/0"
-    )
+    table_entry = next(entry for entry in entries if entry.structural_pointer == "/tables/0")
     resolved = resolve_enrichment_element_target(
         entry=table_entry, enrichment=enrichment_payload, operation="update_visual_caption"
     )
@@ -803,15 +817,101 @@ def test_project_blocks_exposes_element_fields_order_and_reorder_operations() ->
         operation="reorder_enrichment_elements",
     )
     assert order_target.before_hash == enrichment_order_group_hash(
-        enrichment, _anchor(anchor_entry.block_id)
+        two_table_enrichment(anchor_entry.block_id), _anchor(anchor_entry.block_id)
     )
 
 
-def test_group_hash_is_shared_with_the_domain_helper() -> None:
-    enrichment = _base_enrichment()
-    assert enrichment_order_group_hash(enrichment, _anchor()) == domain_group_hash(
-        enrichment, _anchor()
+def test_reorder_is_advertised_only_for_after_paragraph_groups() -> None:
+    after_lead = EnrichmentPlacementV1(EnrichmentPlacementKind.AFTER_LEAD)
+    at_end = EnrichmentPlacementV1(EnrichmentPlacementKind.END)
+
+    def two_non_paragraph_groups(_anchor_block_id: UUID):
+        return replace(
+            _base_enrichment(),
+            tables=(
+                _table("lead_one", after_lead, "Which lead command is documented first?"),
+                _table("lead_two", after_lead, "Which lead command is documented second?"),
+                _table("end_one", at_end, "Which final command is documented first?"),
+                _table("end_two", at_end, "Which final command is documented second?"),
+            ),
+            charts=(),
+            diagrams=(),
+            source_figures=(),
+        )
+
+    _payload, _entries, enrichments, _anchor_entry = _project_enrichment_blocks(
+        two_non_paragraph_groups
     )
-    payload = editorial_enrichment_to_json(enrichment)
-    assert payload["schema_version"] == 10
-    assert "group_order" not in payload["tables"][0]
+
+    by_key = {block["element_key"]: block for block in enrichments}
+    assert set(by_key) == {"lead_one", "lead_two", "end_one", "end_two"}
+    for key in by_key:
+        allowed = by_key[key]["allowed_operations"]
+        assert isinstance(allowed, list)
+        assert "reorder_enrichment_elements" not in allowed
+        # The same group still supports the per-element operations.
+        assert "update_visual_caption" in allowed
+        assert "move_enrichment_element" in allowed
+
+
+def test_group_hash_fences_the_exact_ordered_group_membership() -> None:
+    from cti_app.domain.editorial_workspace import canonical_content_sha256
+
+    def grouped(first_order: int, second_order: int):
+        return replace(
+            _base_enrichment(schema_version=11),
+            tables=(
+                replace(
+                    _table("table_one", _anchor(), "Which first command is documented?"),
+                    group_order=first_order,
+                ),
+                replace(
+                    _table("table_two", _anchor(), "Which second command is documented?"),
+                    group_order=second_order,
+                ),
+            ),
+            charts=(),
+            diagrams=(),
+            source_figures=(),
+        )
+
+    ordered = grouped(0, 1)
+    reversed_group = grouped(1, 0)
+    expected = canonical_content_sha256(
+        [
+            {"kind": "table", "key": "table_one", "order": 0},
+            {"kind": "table", "key": "table_two", "order": 1},
+        ]
+    )
+
+    assert enrichment_order_group_hash(ordered, _anchor()) == expected
+    assert enrichment_order_group_hash(reversed_group, _anchor()) != expected
+    payload = editorial_enrichment_to_json(ordered)
+    assert payload["schema_version"] == 11
+    assert payload["tables"][0]["group_order"] == 0
+
+
+def test_canonical_invariant_value_error_is_a_typed_patch_refusal() -> None:
+    """A planner domain ValueError is a closed refusal, never an internal 503."""
+    figure = replace(_figure(), placement=EnrichmentPlacementV1(EnrichmentPlacementKind.END))
+    base = replace(
+        _base_enrichment(),
+        schema_version=8,
+        enrichment_policy_version=EDITORIAL_ENRICHMENT_V8_CURRENT_POLICY_VERSION,
+        tables=(),
+        charts=(),
+        diagrams=(),
+        source_figures=(figure,),
+    )
+    ctx = _context(base)
+    patch = MoveEnrichmentElementPatch(
+        element_kind=EditorialEnrichmentElementKind.FIGURE,
+        element_key="figure_one",
+        anchor_block_id=ANCHOR_A,
+    )
+
+    with pytest.raises(VisualRevisionRejected) as caught:
+        plan_visual_revision(ctx, patch)
+
+    assert caught.value.code == "enrichment_revision_patch_invalid"
+    assert caught.value.diagnostics["reason_code"] == "canonical_invariant"

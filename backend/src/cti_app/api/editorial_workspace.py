@@ -120,6 +120,18 @@ from cti_app.domain.editorial_thread import EditorialThreadEventKind
 from cti_app.domain.editorial_workspace import EditorialWorkspaceError
 from cti_app.domain.production_editorial_enrichment import (
     BAR_CHART_INSUFFICIENT_DATA_MESSAGE,
+    MAX_BAR_CHART_ADJUSTED_EXPONENT,
+    MAX_BAR_CHART_POINTS,
+    MAX_BAR_CHART_SERIES,
+    MAX_BAR_CHART_SIGNIFICANT_DIGITS,
+    MAX_DIAGRAM_CAPTION_CHARS,
+    MAX_DIAGRAM_EDGES,
+    MAX_DIAGRAM_GROUP_MEMBERS,
+    MAX_DIAGRAM_GROUPS,
+    MAX_DIAGRAM_ID_CHARS,
+    MAX_DIAGRAM_LABEL_CHARS,
+    MAX_DIAGRAM_NODES,
+    MAX_DIAGRAM_TITLE_CHARS,
     ChartKind,
     ChartPointV1,
     ChartSpecV1,
@@ -1185,7 +1197,10 @@ class EditorialBarChartPointRequest(BaseModel):
         if not value.is_finite():
             raise ValueError("Bar chart values must be finite")
         normalized = value.normalize() if value else Decimal(0)
-        if len(normalized.as_tuple().digits) > 18 or abs(normalized.adjusted()) > 12:
+        if (
+            len(normalized.as_tuple().digits) > MAX_BAR_CHART_SIGNIFICANT_DIGITS
+            or abs(normalized.adjusted()) > MAX_BAR_CHART_ADJUSTED_EXPONENT
+        ):
             raise ValueError("Bar chart value exceeds the supported numeric bounds")
         return value
 
@@ -1199,14 +1214,16 @@ class EditorialBarChartDraftRequest(BaseModel):
     category_axis_label: str = Field(min_length=1, max_length=120)
     value_axis_label: str = Field(min_length=1, max_length=120)
     unit: str = Field(min_length=1, max_length=120)
-    points: list[EditorialBarChartPointRequest] = Field(min_length=2, max_length=24)
+    points: list[EditorialBarChartPointRequest] = Field(
+        min_length=2, max_length=MAX_BAR_CHART_POINTS
+    )
     purpose: EditorialTablePurposeRequest
 
     @model_validator(mode="after")
     def _bar_chart_shape(self) -> EditorialBarChartDraftRequest:
         if any(not point.value.is_finite() for point in self.points):
             raise ValueError("Bar chart values must be finite")
-        if len({point.series for point in self.points}) > 6:
+        if len({point.series for point in self.points}) > MAX_BAR_CHART_SERIES:
             raise ValueError("Bar chart series limit exceeded")
         if len({point.label.casefold() for point in self.points}) != len(self.points):
             raise ValueError("Bar chart labels must be unique")
@@ -1249,7 +1266,10 @@ class EditorialVisualChartPointRequest(BaseModel):
         if not value.is_finite():
             raise ValueError("Visual chart values must be finite")
         normalized = value.normalize() if value else Decimal(0)
-        if len(normalized.as_tuple().digits) > 18 or abs(normalized.adjusted()) > 12:
+        if (
+            len(normalized.as_tuple().digits) > MAX_BAR_CHART_SIGNIFICANT_DIGITS
+            or abs(normalized.adjusted()) > MAX_BAR_CHART_ADJUSTED_EXPONENT
+        ):
             raise ValueError("Visual chart value exceeds the supported numeric bounds")
         return value
 
@@ -1266,7 +1286,9 @@ class EditorialVisualChartRequest(BaseModel):
     category_axis_label: str | None = Field(default=None, max_length=120)
     value_axis_label: str | None = Field(default=None, max_length=120)
     unit: str | None = Field(default=None, max_length=120)
-    points: list[EditorialVisualChartPointRequest] = Field(min_length=1, max_length=24)
+    points: list[EditorialVisualChartPointRequest] = Field(
+        min_length=1, max_length=MAX_BAR_CHART_POINTS
+    )
     purpose: EditorialTablePurposeRequest
 
     @model_validator(mode="after")
@@ -1292,7 +1314,7 @@ class EditorialVisualChartRequest(BaseModel):
             label is None for label in (self.category_axis_label, self.value_axis_label, self.unit)
         ):
             raise ValueError("Bar chart axis labels and unit are required")
-        if len({point.series for point in self.points}) > 6:
+        if len({point.series for point in self.points}) > MAX_BAR_CHART_SERIES:
             raise ValueError("Visual chart series limit exceeded")
         if len({point.label.casefold() for point in self.points}) != len(self.points):
             raise ValueError("Visual chart labels must be unique")
@@ -1302,8 +1324,8 @@ class EditorialVisualChartRequest(BaseModel):
 class EditorialVisualDiagramNodeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    node_id: str = Field(min_length=1, max_length=128)
-    label: str = Field(min_length=1, max_length=500)
+    node_id: str = Field(min_length=1, max_length=MAX_DIAGRAM_ID_CHARS)
+    label: str = Field(min_length=1, max_length=MAX_DIAGRAM_LABEL_CHARS)
     role: DiagramNodeRole = DiagramNodeRole.UNKNOWN
     evidence_refs: list[EditorialTableEvidenceReferenceRequest] = Field(
         default_factory=list, max_length=8
@@ -1313,9 +1335,13 @@ class EditorialVisualDiagramNodeRequest(BaseModel):
 class EditorialVisualDiagramEdgeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    source_node_id: str = Field(min_length=1, max_length=128)
-    target_node_id: str = Field(min_length=1, max_length=128)
-    label: str | None = Field(default=None, max_length=500)
+    source_node_id: str = Field(min_length=1, max_length=MAX_DIAGRAM_ID_CHARS)
+    target_node_id: str = Field(min_length=1, max_length=MAX_DIAGRAM_ID_CHARS)
+    label: str | None = Field(default=None, max_length=MAX_DIAGRAM_LABEL_CHARS)
+    # Omitted relation/direction keep the canonical defaults (the domain
+    # derives direction from the relation type); a protocol or comparison
+    # diagram therefore keeps its semantics instead of being forced factual.
+    relation_type: DiagramRelationType | None = None
     direction: DiagramRelationDirection | None = None
     evidence_refs: list[EditorialTableEvidenceReferenceRequest] = Field(
         default_factory=list, max_length=8
@@ -1325,9 +1351,9 @@ class EditorialVisualDiagramEdgeRequest(BaseModel):
 class EditorialVisualDiagramGroupRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    group_id: str = Field(min_length=1, max_length=128)
-    label: str = Field(min_length=1, max_length=500)
-    node_ids: list[str] = Field(min_length=1, max_length=64)
+    group_id: str = Field(min_length=1, max_length=MAX_DIAGRAM_ID_CHARS)
+    label: str = Field(min_length=1, max_length=MAX_DIAGRAM_LABEL_CHARS)
+    node_ids: list[str] = Field(min_length=1, max_length=MAX_DIAGRAM_GROUP_MEMBERS)
 
 
 class EditorialVisualDiagramRequest(BaseModel):
@@ -1335,15 +1361,21 @@ class EditorialVisualDiagramRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    key: str = Field(min_length=1, max_length=128)
+    key: str = Field(min_length=1, max_length=MAX_DIAGRAM_ID_CHARS)
     kind: EnrichmentDiagramKind
-    title: str = Field(min_length=1, max_length=1000)
-    caption: str | None = Field(default=None, max_length=2000)
+    title: str = Field(min_length=1, max_length=MAX_DIAGRAM_TITLE_CHARS)
+    caption: str | None = Field(default=None, max_length=MAX_DIAGRAM_CAPTION_CHARS)
     direction: EnrichmentDiagramDirection
     profile: DiagramProfile | None = None
-    nodes: list[EditorialVisualDiagramNodeRequest] = Field(min_length=1, max_length=64)
-    edges: list[EditorialVisualDiagramEdgeRequest] = Field(default_factory=list, max_length=96)
-    groups: list[EditorialVisualDiagramGroupRequest] = Field(default_factory=list, max_length=16)
+    nodes: list[EditorialVisualDiagramNodeRequest] = Field(
+        min_length=1, max_length=MAX_DIAGRAM_NODES
+    )
+    edges: list[EditorialVisualDiagramEdgeRequest] = Field(
+        default_factory=list, max_length=MAX_DIAGRAM_EDGES
+    )
+    groups: list[EditorialVisualDiagramGroupRequest] = Field(
+        default_factory=list, max_length=MAX_DIAGRAM_GROUPS
+    )
     purpose: EditorialTablePurposeRequest
 
 
@@ -1620,6 +1652,9 @@ _ERROR_MESSAGES = {
     "enrichment_element_not_found": "Cet élément enrichi n'existe plus dans cette version.",
     "enrichment_element_kind_mismatch": (
         "Le type de cet élément enrichi ne correspond pas à la révision demandée."
+    ),
+    "enrichment_target_mismatch": (
+        "L'élément ciblé ne correspond pas à l'élément de cette occurrence."
     ),
     "enrichment_target_stale": (
         "Cet élément enrichi a changé. Rechargez l'atelier avant de réessayer."
@@ -3872,13 +3907,15 @@ def _visual_revision_chart_spec(chart: EditorialVisualChartRequest) -> ChartSpec
 def _visual_revision_diagram_spec(diagram: EditorialVisualDiagramRequest) -> DiagramSpecV1:
     """Parse a replacement diagram body with the canonical strict codec.
 
-    The profiled/analytic key sets are exhaustive, so a profiled diagram always
-    carries an explicit edge relation type and direction; an unprofiled one
-    keeps the factual default and no direction key.
+    An omitted relation type keeps the factual default; an omitted direction is
+    derived by the domain from the relation type (comparison edges are
+    undirected, every other relation is directed). A protocol or comparison
+    revision therefore never has its edge semantics silently rewritten.
     """
     profiled = diagram.profile is not None
     edges: list[dict[str, object]] = []
     for edge in diagram.edges:
+        relation_type = edge.relation_type or DiagramRelationType.FACTUAL
         edge_payload: dict[str, object] = {
             "source_node_id": edge.source_node_id,
             "target_node_id": edge.target_node_id,
@@ -3886,10 +3923,18 @@ def _visual_revision_diagram_spec(diagram: EditorialVisualDiagramRequest) -> Dia
             "evidence_refs": [
                 _visual_revision_evidence_ref(reference) for reference in edge.evidence_refs
             ],
-            "relation_type": DiagramRelationType.FACTUAL.value,
+            "relation_type": relation_type.value,
         }
         if profiled:
-            edge_payload["direction"] = (edge.direction or DiagramRelationDirection.DIRECTED).value
+            # The profiled wire requires an explicit direction. Omission keeps
+            # the canonical rule: a comparison edge is undirected, every other
+            # relation type is directed.
+            direction = edge.direction or (
+                DiagramRelationDirection.UNDIRECTED
+                if relation_type is DiagramRelationType.COMPARISON
+                else DiagramRelationDirection.DIRECTED
+            )
+            edge_payload["direction"] = direction.value
         edges.append(edge_payload)
     payload: dict[str, object] = {
         "key": diagram.key,

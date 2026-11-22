@@ -23,7 +23,10 @@ from cti_app.application.editorial_discussion_context import (
 from cti_app.application.editorial_proposal_adoption import (
     EditorialProposalAdoptionError,
 )
-from cti_app.application.editorial_proposals import EditorialProposalService
+from cti_app.application.editorial_proposals import (
+    EditorialProposalApplicationError,
+    EditorialProposalService,
+)
 from cti_app.application.editorial_threads import EditorialThreadService
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.production_editorial_enrichment import (
@@ -33,7 +36,11 @@ from cti_app.application.production_synthesis import _all_evidence_entries
 from cti_app.domain.editorial_enrichment_patch import UpdateVisualCaptionPatch
 from cti_app.domain.editorial_proposal import EditorialProposalState
 from cti_app.domain.editorial_thread import EditorialThreadEventKind
-from cti_app.domain.production import ProductionArtifactStage
+from cti_app.domain.production import (
+    ProductionArtifact,
+    ProductionArtifactStage,
+    ProductionArtifactStatus,
+)
 from cti_app.domain.production_editorial_enrichment import (
     EditorialEnrichmentElementKind,
     editorial_enrichment_from_json,
@@ -837,3 +844,105 @@ async def test_bridge_stale_visual_proposal_cannot_be_accepted(
     enrichment = editorial_enrichment_from_json(payload)
     assert enrichment.charts[0].caption == "Légende gagnante manuelle."
     assert await _enrichment_versions(uow_factory, seeded.run.id) == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_bridge_element_turn_in_a_read_only_context_persists_nothing(
+    uow_factory: Any,
+    migrated_postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Bridge element branch applies the manual read-only guard."""
+    (
+        seeded,
+        app,
+        _model_gateway,
+        workspace_service,
+        proposal_service,
+        _adoption_service,
+    ) = await _ready_artifact(uow_factory, monkeypatch)
+    snapshot = await workspace_service.snapshot(seeded.subject.id)
+    chart_block = _enrichment_block(snapshot, kind="chart")
+    target, base_hash, before_hash, _handles, _payload = await _wire_inputs(
+        app=app,
+        uow_factory=uow_factory,
+        seeded=seeded,
+        block_id=UUID(chart_block["block_id"]),
+    )
+    raw_response = _wire(
+        target=target,
+        action="update_visual_caption",
+        base_hash=base_hash,
+        before_hash=before_hash,
+        after="CAPTION: Légende refusée en lecture seule.",
+    )
+    prepared, thread_id, model_run_id, turn_id = await _open_proposal_turn(
+        app=app,
+        uow_factory=uow_factory,
+        migrated_postgres_url=migrated_postgres_url,
+        workspace_service=workspace_service,
+        subject_id=seeded.subject.id,
+        run_id=seeded.run.id,
+        occurrence_id=UUID(chart_block["block_id"]),
+        actor_id=seeded.actor_id,
+        instruction="Corrige la légende.",
+        raw_response=raw_response,
+    )
+
+    # Turn the current snapshot read-only without touching the pinned
+    # synthesis/enrichment registry: an unreadable current publication makes
+    # the publication kind unknown.
+    async with uow_factory() as uow:
+        publications = [
+            artifact
+            for artifact in await uow.production_artifacts.list_for_run(seeded.run.id)
+            if artifact.stage is ProductionArtifactStage.PUBLICATION
+        ]
+    next_version = max((artifact.version for artifact in publications), default=0) + 1
+    blob_id, _sha256 = await app.state.production_artifact_store.put_canonical_json(
+        {"schema_version": "999", "synthetic": "unreadable current publication"},
+        bucket="production-artifacts-canonical",
+    )
+    async with uow_factory() as uow:
+        await uow.production_artifacts.append(
+            ProductionArtifact(
+                production_run_id=seeded.run.id,
+                subject_id=seeded.subject.id,
+                stage=ProductionArtifactStage.PUBLICATION,
+                version=next_version,
+                status=ProductionArtifactStatus.VERIFIED,
+                input_hash="9" * 64,
+                canonical_blob_id=blob_id,
+            )
+        )
+        await uow.commit()
+    read_only_snapshot = await workspace_service.snapshot(seeded.subject.id)
+    assert read_only_snapshot["capabilities"]["read_only_reason"] == "publication_kind_unknown"
+
+    with pytest.raises(EditorialProposalApplicationError) as refusal:
+        await _prepare(
+            proposal_service=proposal_service,
+            prepared=prepared,
+            thread_id=thread_id,
+            model_run_id=model_run_id,
+            turn_id=turn_id,
+            raw_response=raw_response,
+        )
+
+    assert refusal.value.code == "editorial_read_only"
+    assert refusal.value.reason == "publication_kind_unknown"
+    async with uow_factory() as uow:
+        proposals = await uow.editorial_proposals.list_for_subject(
+            seeded.subject.id,
+            occurrence_id=UUID(chart_block["block_id"]),
+            before=None,
+            limit=10,
+        )
+    assert not [item for item in proposals if item.thread_id == thread_id]
+    _record, events = await _thread_events(uow_factory, thread_id)
+    assert not [
+        event
+        for event in events
+        if event.kind in {EditorialThreadEventKind.PROPOSAL, EditorialThreadEventKind.REFUSED}
+    ]
+    assert await _enrichment_versions(uow_factory, seeded.run.id) == [1, 2]

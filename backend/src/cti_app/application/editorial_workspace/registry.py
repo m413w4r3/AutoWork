@@ -1041,10 +1041,15 @@ def project_blocks(
         if element_ref in order_rank:
             block["order"] = order_rank[element_ref]
         entry = entry_by_block[block_id]
+        placement = placement_by_block[block_id]
         if (
             allow_operations
             and entry.revision_status is EditorialRevisionStatus.READY
-            and group_sizes[placement_by_block[block_id]] >= 2
+            # Only the after_paragraph placement group is addressable by the
+            # reorder request (a paragraph anchor); advertising it elsewhere
+            # would offer an operation the resolver cannot target.
+            and placement.kind is EnrichmentPlacementKind.AFTER_PARAGRAPH
+            and group_sizes[placement] >= 2
         ):
             block_operations = block.get("allowed_operations")
             if isinstance(block_operations, list):

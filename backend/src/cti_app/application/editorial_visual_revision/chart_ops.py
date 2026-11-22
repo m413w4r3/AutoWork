@@ -103,6 +103,27 @@ def _check_text_policy(
                     field=f"point.{index}.{field_name}",
                     diagnostic_code=str(error.diagnostic_code or error.code.value),
                 ) from None
+    # Axis labels and the unit are displayed text with no evidence of their
+    # own: the production create path validates them, and a revision must not
+    # be a back door for markup, URLs or ungrounded technical literals.
+    for field_name, axis_value in (
+        ("category_axis_label", chart.category_axis_label),
+        ("value_axis_label", chart.value_axis_label),
+        ("unit", chart.unit),
+    ):
+        if axis_value is None:
+            continue
+        try:
+            _validate_ungrounded_editorial_text(
+                axis_value, context=f"chart:{chart.key}:{field_name}"
+            )
+        except EditorialEnrichmentProposalControlError as error:
+            raise patch_invalid(
+                "bar_chart_text_policy_violation",
+                element_key=chart.key,
+                field=field_name,
+                diagnostic_code=str(error.diagnostic_code or error.code.value),
+            ) from None
 
 
 def _check_evidence(

@@ -638,6 +638,107 @@ def test_enrichment_target_parser_accepts_element_and_order_targets() -> None:
     assert parsed.placement.anchor_block_id == anchor_block_id
 
 
+def _visual_adoption_probe() -> tuple[
+    ProductionEditorialProposalAdoptionInputs,
+    SimpleNamespace,
+    SimpleNamespace,
+    TargetedEditorialRevisionTarget,
+]:
+    subject_id, artifact_id = uuid4(), uuid4()
+    base_artifact = SimpleNamespace(id=artifact_id, version=1, input_hash="1" * 64)
+    proposal = SimpleNamespace(
+        subject_id=subject_id,
+        base_artifact_id=artifact_id,
+        base_artifact_version=1,
+        base_input_hash="1" * 64,
+        base_canonical_sha256="2" * 64,
+        actor_id=uuid4(),
+        before_hash="3" * 64,
+    )
+    target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT,
+        element_kind=EditorialEnrichmentElementKind.TABLE,
+        element_key="table_one",
+    )
+    inputs = ProductionEditorialProposalAdoptionInputs(
+        uow_factory=cast(Any, None),
+        artifact_store=cast(Any, None),
+        workspace_service=cast(Any, None),
+        synthesis_loader=cast(Any, None),
+        enrichment_loader=cast(Any, None),
+        enrichment_revision_service=cast(Any, None),
+    )
+    return inputs, proposal, base_artifact, target
+
+
+async def _call_visual_adoption(
+    inputs: ProductionEditorialProposalAdoptionInputs,
+    *,
+    proposal: SimpleNamespace,
+    base_artifact: SimpleNamespace,
+    target: TargetedEditorialRevisionTarget,
+    patch: dict[str, object],
+) -> Any:
+    return await inputs._visual_revision_inputs(
+        proposal=proposal,
+        patch=patch,
+        resolution=SimpleNamespace(entry=None),
+        run=cast(Any, None),
+        snapshot=cast(Any, None),
+        extraction=cast(Any, None),
+        synthesis=cast(Any, None),
+        access_policy=cast(Any, None),
+        fence=cast(Any, None),
+        base_artifact=base_artifact,
+        base_payload={},
+        base_enrichment=cast(Any, None),
+        target=target,
+        operation=TargetedEditorialRevisionOperation.UPDATE_VISUAL_CAPTION,
+        projection=cast(Any, None),
+    )
+
+
+@pytest.mark.asyncio
+async def test_visual_adoption_refuses_a_patch_for_another_element() -> None:
+    """Adoption keeps refusing a prepare patch whose key is another element."""
+    inputs, proposal, base_artifact, target = _visual_adoption_probe()
+
+    with pytest.raises(EditorialProposalAdoptionError) as caught:
+        await _call_visual_adoption(
+            inputs,
+            proposal=proposal,
+            base_artifact=base_artifact,
+            target=target,
+            patch={
+                "visual_patch": {
+                    "kind": "update_visual_caption",
+                    "element_kind": "table",
+                    "element_key": "table_two",
+                    "caption": "Synthetic caption.",
+                }
+            },
+        )
+
+    assert caught.value.code == "proposal_target_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_visual_adoption_maps_an_unknown_patch_kind_to_patch_invalid() -> None:
+    """An unknown wire kind is a corrupted patch, not a 'later slice'."""
+    inputs, proposal, base_artifact, target = _visual_adoption_probe()
+
+    with pytest.raises(EditorialProposalAdoptionError) as caught:
+        await _call_visual_adoption(
+            inputs,
+            proposal=proposal,
+            base_artifact=base_artifact,
+            target=target,
+            patch={"visual_patch": {"kind": "future_visual_patch"}},
+        )
+
+    assert caught.value.code == "proposal_patch_invalid"
+
+
 @pytest.mark.parametrize(
     "raw",
     (

@@ -85,7 +85,6 @@ from cti_app.domain.editorial_enrichment_patch import (
     ReplaceSourceFigurePatch,
     ReviseChartPatch,
     ReviseDiagramPatch,
-    UnsupportedEnrichmentRevisionOperation,
     UpdateVisualCaptionPatch,
     enrichment_order_group_hash,
     visual_patch_element_kind,
@@ -1068,10 +1067,6 @@ class ProductionEditorialProposalAdoptionInputs(EditorialProposalAdoptionInputs)
     ) -> EnrichmentCandidateInputs:
         try:
             typed_patch = visual_patch_from_json(patch.get("visual_patch"))
-        except UnsupportedEnrichmentRevisionOperation:
-            raise EditorialProposalAdoptionError(
-                "enrichment_revision_unsupported_operation"
-            ) from None
         except EditorialEnrichmentPatchError:
             raise EditorialProposalAdoptionError("proposal_patch_invalid") from None
         if typed_patch.operation is not operation:

@@ -53,6 +53,10 @@ from cti_app.domain.editorial_workspace import (
 from cti_app.domain.production import ProductionArtifact, ProductionArtifactStage
 from cti_app.domain.production_editorial_enrichment import (
     ChartSpecV1,
+    DiagramEdgeV1,
+    DiagramProfile,
+    DiagramRelationDirection,
+    DiagramRelationType,
     DiagramSpecV1,
     EditorialEnrichmentElementKind,
     ResolvedSourceFigureV1,
@@ -642,10 +646,12 @@ def _chart_body(
     }
 
 
-def _context_with_diagram() -> tuple[VisualRevisionContext, DiagramSpecV1]:
+def _context_with_diagram(
+    diagram: DiagramSpecV1 | None = None,
+) -> tuple[VisualRevisionContext, DiagramSpecV1]:
     extraction, refs = quantitative_extraction()
     synthesis = quantitative_synthesis(extraction)
-    diagram = flow_diagram(refs=refs)
+    diagram = flow_diagram(refs=refs) if diagram is None else diagram
     context = VisualRevisionContext(
         base_enrichment=enrichment_with(
             extraction=extraction, synthesis=synthesis, diagrams=(diagram,)
@@ -988,6 +994,64 @@ async def test_revise_diagram_route_maps_a_structurally_invalid_body_to_422(
 
 
 @pytest.mark.asyncio
+async def test_revise_diagram_route_preserves_the_protocol_relation_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A protocol edge keeps its semantics instead of being forced factual."""
+    _enable_route(monkeypatch)
+    _extraction_value, refs = quantitative_extraction()
+    protocol_diagram = replace(
+        flow_diagram(refs=refs),
+        profile=DiagramProfile.PROTOCOL_SEQUENCE,
+        edges=(
+            DiagramEdgeV1(
+                "loader",
+                "payload",
+                "loads",
+                (),
+                relation_type=DiagramRelationType.PROTOCOL_FACTUAL,
+                direction=DiagramRelationDirection.DIRECTED,
+            ),
+        ),
+    )
+    context, diagram = _context_with_diagram(protocol_diagram)
+    stack = _visual_stack(monkeypatch, context=context)
+    occurrence_id = stack.block_id_for(EditorialBlockKind.DIAGRAM)
+    stack.occurrence_holder["value"] = occurrence_id
+    body = _diagram_body(
+        stack.snapshot_id,
+        diagram,
+        title="Revised protocol sequence",
+        edges=[
+            {
+                "source_node_id": "loader",
+                "target_node_id": "payload",
+                "label": "loads",
+                "relation_type": "protocol_factual",
+                "evidence_refs": [],
+            }
+        ],
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=stack.app), base_url="http://editorial.test"
+    ) as client:
+        response = await _post(client, stack.subject_id, occurrence_id, body)
+
+    assert response.status_code == 200, response.text
+    visual_patch = response.json()["patch"]["visual_patch"]
+    assert visual_patch["diagram"]["edges"] == [
+        {
+            "source_node_id": "loader",
+            "target_node_id": "payload",
+            "label": "loads",
+            "relation_type": "protocol_factual",
+            "direction": "directed",
+            "evidence_refs": [],
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_replace_source_figure_route_prepares_an_opaque_catalog_figure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1112,6 +1176,30 @@ async def test_remove_enrichment_element_route_refuses_a_missing_element(
     assert stack.repository.records == []
 
 
+@pytest.mark.asyncio
+async def test_element_key_from_another_occurrence_is_refused_without_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The occurrence's element key is authoritative, not the caller's."""
+    _enable_route(monkeypatch)
+    stack = _visual_stack(monkeypatch)
+    stack.occurrence_holder["value"] = stack.table_block_id
+    other_key = stack.context.base_enrichment.tables[1].key
+    assert other_key != stack.table_key
+    body = _caption_body(stack.snapshot_id, other_key, "Nouvelle légende synthétique")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=stack.app), base_url="http://editorial.test"
+    ) as client:
+        response = await _post(client, stack.subject_id, stack.table_block_id, body)
+
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"] == {
+        "code": "enrichment_target_mismatch",
+        "message": "L'élément ciblé ne correspond pas à l'élément de cette occurrence.",
+    }
+    assert stack.repository.records == []
+
+
 # ---------------------------------------------------------------------------
 # Closed error table (direct handler call with the real message map)
 # ---------------------------------------------------------------------------
@@ -1124,6 +1212,7 @@ async def test_remove_enrichment_element_route_refuses_a_missing_element(
         ("enrichment_revision_patch_invalid", 422, "enrichment_revision_patch_invalid"),
         ("enrichment_element_not_found", 422, "enrichment_element_not_found"),
         ("enrichment_element_kind_mismatch", 422, "enrichment_element_kind_mismatch"),
+        ("enrichment_target_mismatch", 422, "enrichment_target_mismatch"),
         ("enrichment_caption_invalid", 422, "enrichment_caption_invalid"),
         ("enrichment_move_anchor_invalid", 422, "enrichment_move_anchor_invalid"),
         ("enrichment_order_invalid", 422, "enrichment_order_invalid"),
@@ -1581,6 +1670,35 @@ def test_openapi_exposes_the_generic_route_and_block_fields() -> None:
         "chart",
         "figure",
     } <= set(block_properties)
+    # A chart placed after the lead, a section or the end has no paragraph
+    # anchor; the OpenAPI contract must keep the nullable field explicit.
+    chart_anchor = schema["components"]["schemas"]["EditorialWorkspaceBarChart"]["properties"][
+        "anchor_block_id"
+    ]
+    assert {"type": "null"} in chart_anchor.get("anyOf", [])
+    # Request-shape bounds come from the domain constants (single source).
+    from cti_app.domain.production_editorial_enrichment import (
+        MAX_BAR_CHART_POINTS,
+        MAX_DIAGRAM_EDGES,
+        MAX_DIAGRAM_NODES,
+    )
+
+    components = schema["components"]["schemas"]
+    assert (
+        components["EditorialVisualChartRequest"]["properties"]["points"]["maxItems"]
+        == MAX_BAR_CHART_POINTS
+    )
+    assert (
+        components["EditorialVisualDiagramRequest"]["properties"]["nodes"]["maxItems"]
+        == MAX_DIAGRAM_NODES
+    )
+    assert (
+        components["EditorialVisualDiagramRequest"]["properties"]["edges"]["maxItems"]
+        == MAX_DIAGRAM_EDGES
+    )
+    assert {"relation_type", "direction"} <= set(
+        components["EditorialVisualDiagramEdgeRequest"]["properties"]
+    )
     request_schema = route["post"]["requestBody"]["content"]["application/json"]["schema"]
     assert request_schema["discriminator"]["propertyName"] == "operation"
     serialized = json.dumps(request_schema)

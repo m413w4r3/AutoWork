@@ -33,20 +33,31 @@ def plan_visual_revision(
     """
     if not isinstance(ctx, VisualRevisionContext):
         raise ValueError("Expected a VisualRevisionContext")
-    if isinstance(patch, UpdateVisualCaptionPatch):
-        return plan_caption_update(ctx, patch)
-    if isinstance(patch, MoveEnrichmentElementPatch):
-        return plan_move(ctx, patch)
-    if isinstance(patch, ReorderEnrichmentElementsPatch):
-        return plan_reorder(ctx, patch)
-    if isinstance(patch, ReviseChartPatch):
-        return plan_chart_revision(ctx, patch)
-    if isinstance(patch, ReviseDiagramPatch):
-        return plan_diagram_revision(ctx, patch)
-    if isinstance(patch, ReplaceSourceFigurePatch):
-        return plan_replace_source_figure(ctx, patch)
-    if isinstance(patch, RemoveEnrichmentElementPatch):
-        return plan_remove_enrichment_element(ctx, patch)
+    try:
+        if isinstance(patch, UpdateVisualCaptionPatch):
+            return plan_caption_update(ctx, patch)
+        if isinstance(patch, MoveEnrichmentElementPatch):
+            return plan_move(ctx, patch)
+        if isinstance(patch, ReorderEnrichmentElementsPatch):
+            return plan_reorder(ctx, patch)
+        if isinstance(patch, ReviseChartPatch):
+            return plan_chart_revision(ctx, patch)
+        if isinstance(patch, ReviseDiagramPatch):
+            return plan_diagram_revision(ctx, patch)
+        if isinstance(patch, ReplaceSourceFigurePatch):
+            return plan_replace_source_figure(ctx, patch)
+        if isinstance(patch, RemoveEnrichmentElementPatch):
+            return plan_remove_enrichment_element(ctx, patch)
+    except VisualRevisionRejected:
+        raise
+    except ValueError:
+        # The canonical codecs and cross-artifact validators raise ValueError
+        # when a domain invariant fails. It is a closed refusal of the supplied
+        # patch, never an internal 503.
+        raise VisualRevisionRejected(
+            "enrichment_revision_patch_invalid",
+            {"variant": type(patch).__name__, "reason_code": "canonical_invariant"},
+        ) from None
     raise VisualRevisionRejected(
         "enrichment_revision_patch_invalid",
         {"variant": type(patch).__name__},

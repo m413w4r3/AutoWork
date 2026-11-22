@@ -1944,8 +1944,7 @@ def test_proposal_pins_match_reorder_uses_synthesis_anchor_and_enrichment_base()
     assert not _proposal_pins_match(enrichment_proposal, enrichment_resolution)
 
 
-@pytest.mark.asyncio
-async def test_visual_revision_candidate_is_the_complete_planner_output() -> None:
+def _visual_candidate_fixture() -> SimpleNamespace:
     from cti_app.application.editorial_proposal_adoption import EnrichmentCandidateInputs
     from cti_app.application.editorial_visual_revision import plan_visual_revision
     from cti_app.application.editorial_workspace.registry import resolve_occurrence
@@ -2109,24 +2108,68 @@ async def test_visual_revision_candidate_is_the_complete_planner_output() -> Non
         synthesis_writer=cast(Any, object()),
         enrichment_writer=cast(Any, object()),
     )
-
-    plan = await service._build_candidate(
-        ProductionArtifactStage.EDITORIAL_ENRICHMENT,
-        proposal,
-        patch_payload,
+    return SimpleNamespace(
+        service=service,
+        proposal=proposal,
+        patch_payload=patch_payload,
         base_artifact=base_artifact,
         base_payload=base_payload,
         base_bytes=base_bytes,
+        base_sha256=base_sha256,
         resolution=resolution,
+        revised=revised,
+        editorial_enrichment_to_json=editorial_enrichment_to_json,
     )
 
-    assert plan.candidate.enrichment == revised.revised_enrichment
-    assert plan.candidate.canonical_payload == editorial_enrichment_to_json(
-        revised.revised_enrichment
+
+async def _build_visual_candidate(fixture: SimpleNamespace) -> Any:
+    return await fixture.service._build_candidate(
+        ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+        fixture.proposal,
+        fixture.patch_payload,
+        base_artifact=fixture.base_artifact,
+        base_payload=fixture.base_payload,
+        base_bytes=fixture.base_bytes,
+        resolution=fixture.resolution,
+    )
+
+
+@pytest.mark.asyncio
+async def test_visual_revision_candidate_is_the_complete_planner_output() -> None:
+    fixture = _visual_candidate_fixture()
+
+    plan = await _build_visual_candidate(fixture)
+
+    assert plan.candidate.enrichment == fixture.revised.revised_enrichment
+    assert plan.candidate.canonical_payload == fixture.editorial_enrichment_to_json(
+        fixture.revised.revised_enrichment
     )
     assert (
         plan.candidate.canonical_sha256
         == hashlib.sha256(plan.candidate.canonical_bytes).hexdigest()
     )
-    assert plan.candidate.base_canonical_sha256 == base_sha256
-    assert plan.inputs.revised_enrichment == revised.revised_enrichment
+    assert plan.candidate.base_canonical_sha256 == fixture.base_sha256
+    assert plan.inputs.revised_enrichment == fixture.revised.revised_enrichment
+
+
+@pytest.mark.asyncio
+async def test_visual_stale_base_conflict_maps_to_the_closed_accept_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cti_app.application import editorial_proposal_adoption as adoption_module
+    from cti_app.application.production_editorial_enrichment import (
+        EditorialEnrichmentRevisionConflictError,
+    )
+
+    fixture = _visual_candidate_fixture()
+
+    def stale_base(**_kwargs: Any) -> Any:
+        raise EditorialEnrichmentRevisionConflictError("synthetic stale base")
+
+    monkeypatch.setattr(adoption_module, "build_candidate_from_revised_enrichment", stale_base)
+
+    with pytest.raises(EditorialProposalAdoptionError) as caught:
+        await _build_visual_candidate(fixture)
+
+    assert caught.value.code == "proposal_base_stale"
+    assert caught.value.reason == "fence:stale_base"

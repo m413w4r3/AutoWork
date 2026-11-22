@@ -2,8 +2,7 @@
 
 Every variant names the exact element it changes; the wire form is persisted in
 an editorial proposal patch blob and reparsed by adoption before the same pure
-planner is applied under the run fence. Variants whose apply logic belongs to a
-later slice are declared here so the union stays closed, and reject explicitly
+planner is applied under the run fence. An unknown wire kind rejects explicitly
 instead of being silently ignored.
 """
 
@@ -38,14 +37,6 @@ class EditorialEnrichmentPatchError(ValueError):
     """A persisted or supplied visual revision patch violates its closed contract."""
 
     code = "enrichment_revision_patch_invalid"
-
-
-class UnsupportedEnrichmentRevisionOperation(EditorialEnrichmentPatchError):
-    code = "enrichment_revision_unsupported_operation"
-
-
-class NotImplementedForSlice(UnsupportedEnrichmentRevisionOperation):
-    """Declared variant whose apply logic lands in a later M23 slice."""
 
 
 def _element_key(value: Any, label: str) -> str:
@@ -220,24 +211,9 @@ VisualRevisionPatch = (
     | RemoveEnrichmentElementPatch
 )
 
-VISUAL_REVISION_OPERATIONS: frozenset[TargetedEditorialRevisionOperation] = frozenset(
-    {
-        TargetedEditorialRevisionOperation.REWRITE_CHART,
-        TargetedEditorialRevisionOperation.REWRITE_DIAGRAM,
-        TargetedEditorialRevisionOperation.UPDATE_VISUAL_CAPTION,
-        TargetedEditorialRevisionOperation.MOVE_ENRICHMENT_ELEMENT,
-        TargetedEditorialRevisionOperation.REORDER_ENRICHMENT_ELEMENTS,
-        TargetedEditorialRevisionOperation.REPLACE_SOURCE_FIGURE,
-        TargetedEditorialRevisionOperation.DELETE_TABLE,
-        TargetedEditorialRevisionOperation.DELETE_DIAGRAM,
-        TargetedEditorialRevisionOperation.DELETE_CHART,
-        TargetedEditorialRevisionOperation.DELETE_SOURCE_FIGURE,
-    }
-)
-
-# Every declared variant has an implemented planner after F2-03b and F2-03c.
-# A variant added by a later slice is listed here only once its apply logic
-# lands, so the placeholder refusal below can never be reached silently.
+# The operations owning a typed visual-revision planner. Adoption uses this set
+# to route a proposal to the visual candidate builder instead of the legacy
+# element-patch writer; a new variant must be added here with its planner.
 IMPLEMENTED_VISUAL_REVISION_OPERATIONS: frozenset[TargetedEditorialRevisionOperation] = frozenset(
     {
         TargetedEditorialRevisionOperation.REWRITE_CHART,
@@ -360,9 +336,7 @@ def visual_patch_to_json(patch: VisualRevisionPatch) -> dict[str, Any]:
             "element_kind": patch.element_kind.value,
             "element_key": patch.element_key,
         }
-    raise NotImplementedForSlice(
-        f"{type(patch).__name__} persistence is implemented by a later M23 slice"
-    )
+    raise EditorialEnrichmentPatchError(f"Unsupported visual revision patch {type(patch).__name__}")
 
 
 def visual_patch_from_json(raw: Any) -> VisualRevisionPatch:
@@ -424,4 +398,4 @@ def visual_patch_from_json(raw: Any) -> VisualRevisionPatch:
             )
     except (KeyError, TypeError, ValueError) as exc:
         raise EditorialEnrichmentPatchError(f"Visual revision patch is invalid: {exc}") from None
-    raise NotImplementedForSlice(f"Visual revision patch kind {kind!r} is not implemented yet")
+    raise EditorialEnrichmentPatchError(f"Visual revision patch kind {kind!r} is unknown")

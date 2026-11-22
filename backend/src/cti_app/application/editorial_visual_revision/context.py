@@ -109,8 +109,7 @@ class VisualRevisionRejected(ValueError):
         super().__init__(code)
 
 
-# Closed error codes for the implemented variants (F2-DESIGN §2.3). The
-# unsupported-operation code is the explicit placeholder for F2-03b/F2-03c.
+# Closed error codes for the implemented variants (F2-DESIGN §2.3).
 VISUAL_REVISION_ERROR_CODES: frozenset[str] = frozenset(
     {
         "enrichment_revision_patch_invalid",

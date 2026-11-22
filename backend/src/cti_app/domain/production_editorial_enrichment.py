@@ -55,6 +55,17 @@ MAX_BAR_CHART_POINTS = 24
 MAX_BAR_CHART_SERIES = 6
 MAX_BAR_CHART_SIGNIFICANT_DIGITS = 18
 MAX_BAR_CHART_ADJUSTED_EXPONENT = 12
+# Display bounds shared by the manual request DTO and the Bridge wire
+# conversion. They are enforced when a revision is admitted, never when a
+# historical artifact is read, so an existing payload always stays readable.
+MAX_DIAGRAM_NODES = 64
+MAX_DIAGRAM_EDGES = 96
+MAX_DIAGRAM_GROUPS = 16
+MAX_DIAGRAM_GROUP_MEMBERS = 64
+MAX_DIAGRAM_ID_CHARS = 128
+MAX_DIAGRAM_LABEL_CHARS = 500
+MAX_DIAGRAM_TITLE_CHARS = 1000
+MAX_DIAGRAM_CAPTION_CHARS = 2000
 EDITORIAL_FIGURE_DECISION_POLICY_VERSION = "editorial-figure-selection-v3-source-context"
 EDITORIAL_RESOURCE_PROPOSAL_POLICY_VERSION = "editorial-resource-proposal-v1"
 

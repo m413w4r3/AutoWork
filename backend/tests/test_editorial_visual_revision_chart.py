@@ -99,6 +99,63 @@ def test_label_only_revision_is_accepted_without_new_evidence() -> None:
     assert plan.preview["element_key"] == base.key
 
 
+@pytest.mark.parametrize("field", ("category_axis_label", "value_axis_label"))
+def test_axis_labels_follow_the_editorial_text_policy(field: str) -> None:
+    context, base, _refs = _fixture()
+    revised = replace(base, **{field: "<b>Documented count</b>"})
+    error = _reject(
+        "enrichment_revision_patch_invalid",
+        lambda: plan_visual_revision(
+            context, ReviseChartPatch(element_key=base.key, chart=revised)
+        ),
+    )
+    assert error.diagnostics["reason_code"] == "bar_chart_text_policy_violation"
+    assert error.diagnostics["field"] == field
+    assert error.diagnostics["diagnostic_code"] == "plain_text_violation"
+
+
+def test_unit_follows_the_editorial_text_policy_after_same_record_proof() -> None:
+    unit = "http://example.invalid/endpoints"
+    alpha_fact = f"Alpha: 12 {unit}"
+    beta_fact = f"Beta: 20 {unit}"
+    context, base, refs = _fixture(
+        extra_facts=(
+            (alpha_fact, f"The revised report records Alpha with 12 {unit}."),
+            (beta_fact, f"The revised report records Beta with 20 {unit}."),
+        )
+    )
+    revised = replace(
+        base,
+        unit=unit,
+        points=(
+            replace(
+                base.points[0],
+                value=Decimal("12"),
+                evidence_refs=(refs[alpha_fact],),
+            ),
+            replace(
+                base.points[1],
+                value=Decimal("20"),
+                evidence_refs=(refs[beta_fact],),
+            ),
+        ),
+        purpose=replace(
+            base.purpose,
+            evidence_refs=(refs[alpha_fact], refs[beta_fact]),
+        ),
+    )
+
+    error = _reject(
+        "enrichment_revision_patch_invalid",
+        lambda: plan_visual_revision(
+            context, ReviseChartPatch(element_key=base.key, chart=revised)
+        ),
+    )
+
+    assert error.diagnostics["reason_code"] == "bar_chart_text_policy_violation"
+    assert error.diagnostics["field"] == "unit"
+
+
 def test_value_change_proven_by_a_fresh_admitted_record_is_accepted() -> None:
     context, base, refs = _fixture(
         extra_facts=(("Beta: 20 endpoints", "The revised report records Beta with 20 endpoints."),)

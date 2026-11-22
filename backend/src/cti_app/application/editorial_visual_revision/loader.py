@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from cti_app.application.editorial_workspace.registry import WorkspaceSnapshotRecord
-from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_artifact_store import (
+    ProductionArtifactStore,
+    ProductionReuseStorageUnavailableError,
+)
 from cti_app.application.production_editorial_enrichment import (
     EditorialEnrichmentRevisionConflictError,
+    EditorialEnrichmentValidationError,
     ProductionEditorialEnrichmentService,
+    _EditorialEnrichmentInputControl,
 )
 from cti_app.application.production_enrichment_revision import (
     ProductionEditorialEnrichmentRevisionService,
@@ -33,7 +41,20 @@ from cti_app.domain.production_editorial_enrichment import (
 
 from .context import VisualRevisionContext, VisualRevisionRejected
 
+logger = logging.getLogger(__name__)
+
 _RESOLUTION_ARTIFACT_MISMATCH = "resolution:artifact_mismatch"
+# Expected failures of the pinned read path. Anything else (AttributeError,
+# KeyError, AssertionError, a refactor-induced NameError) is a programming
+# error and must surface instead of becoming a silent 503 refusal.
+_EXPECTED_LOAD_ERRORS = (
+    ProductionReuseStorageUnavailableError,
+    EditorialEnrichmentValidationError,
+    _EditorialEnrichmentInputControl,
+    SQLAlchemyError,
+    TypeError,
+    ValueError,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,7 +144,13 @@ class VisualRevisionContextLoader:
             raise VisualRevisionRejected(
                 "proposal_base_stale", {"reason": "base:input_fence"}
             ) from None
-        except Exception:
+        except _EXPECTED_LOAD_ERRORS as error:
+            # Closed code + exception class only: never payload text.
+            logger.warning(
+                "visual_revision_base_unavailable code=%s exception_class=%s",
+                "base:load_dependency",
+                type(error).__name__,
+            )
             raise VisualRevisionRejected("proposal_base_unavailable", {}) from None
 
     async def _load_pinned(

@@ -30,8 +30,10 @@ from cti_app.application.editorial_discussion_context import (
     _current_element_projection,
     _supported_proposal_operations,
 )
+from cti_app.application.editorial_legacy_read_only import EditorialLegacyReadOnlyReason
 from cti_app.application.editorial_proposals import (
     _VISUAL_MODEL_REFUSAL_CODES,
+    EditorialProposalApplicationError,
     EditorialProposalService,
     _parse_thread_visual_revision,
 )
@@ -240,7 +242,16 @@ def _thread_binding() -> EditorialThreadBinding:
     )
 
 
-def _service_with_capture(monkeypatch: pytest.MonkeyPatch):
+def _workspace_service(*, read_only_reason: object | None = None) -> SimpleNamespace:
+    async def resolve_occurrence(_subject_id: UUID, _occurrence_id: UUID) -> SimpleNamespace:
+        return SimpleNamespace(read_only_reason=read_only_reason)
+
+    return SimpleNamespace(resolve_occurrence=resolve_occurrence)
+
+
+def _service_with_capture(
+    monkeypatch: pytest.MonkeyPatch, *, read_only_reason: object | None = None
+):
     store = _FakeArtifactStore()
     binding = _thread_binding()
     record = SimpleNamespace(thread=SimpleNamespace(origin=binding))
@@ -255,7 +266,7 @@ def _service_with_capture(monkeypatch: pytest.MonkeyPatch):
     service = EditorialProposalService(
         uow_factory=uow_factory,
         artifact_store=store,
-        workspace_service=object(),
+        workspace_service=_workspace_service(read_only_reason=read_only_reason),
     )
     captured: dict[str, object] = {}
 
@@ -463,6 +474,132 @@ def _diagram_after(*, diagram, handles, node_label: str) -> str:
     return "```json\n" + json.dumps(payload) + "\n```"
 
 
+def _oversized_diagram_after(*, diagram, handles, node_count: int, label: str) -> str:
+    """A structurally valid diagram proposal that exceeds one display bound."""
+    body = _diagram_after(diagram=diagram, handles=handles, node_label="Alpha")
+    prefix = "```json\n"
+    payload = json.loads(body[len(prefix) : -len("\n```")])
+    alpha_handle = handles[diagram.nodes[0].evidence_refs[0]]
+    payload["diagrams"][0]["nodes"] = [
+        {
+            "node_id": f"node_{index:03d}",
+            "label": label if index == 0 else f"Node {index}",
+            "role": "unknown",
+            "evidence_handles": [alpha_handle],
+        }
+        for index in range(node_count)
+    ]
+    payload["diagrams"][0]["edges"] = [
+        {
+            "source_node_id": "node_000",
+            "target_node_id": "node_001",
+            "label": "loads",
+            "relation_type": "factual",
+            "direction": "directed",
+            "evidence_handles": [alpha_handle],
+        }
+    ]
+    return prefix + json.dumps(payload) + "\n```"
+
+
+async def test_oversized_bridge_diagram_is_refused_before_conversion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extraction, _refs, synthesis, _chart, diagram, _enrichment, context, payload, handles = (
+        _fixture(EditorialEnrichmentElementKind.DIAGRAM)
+    )
+    entry = _entry(kind=EditorialBlockKind.DIAGRAM, pointer="/diagrams/0", payload=payload)
+    element_context = _element_context(
+        kind=EditorialEnrichmentElementKind.DIAGRAM,
+        entry=entry,
+        payload=payload,
+        context=context,
+        extraction=extraction,
+        synthesis=synthesis,
+        handles=handles,
+        element_key=diagram.key,
+    )
+    service, captured, _store, _binding = _service_with_capture(monkeypatch)
+    response = _wire(
+        target=f"synthesis{entry.structural_pointer}",
+        action="rewrite_diagram",
+        before_hash=entry.content_sha256,
+        after=_oversized_diagram_after(
+            diagram=diagram,
+            handles=handles,
+            node_count=65,
+            label="Alpha",
+        ),
+    )
+
+    proposal = await service.prepare_thread_turn(
+        thread_id=uuid4(),
+        actor_id=_ACTOR_ID,
+        model_run_id=_MODEL_RUN_ID,
+        model_turn_id=_MODEL_TURN_ID,
+        instruction="Corrige ce diagramme.",
+        raw_response=response,
+        context=_context(
+            element_context=element_context,
+            entry=entry,
+            operations=("rewrite_diagram", "update_visual_caption"),
+        ),
+    )
+
+    assert proposal.state is EditorialProposalState.REFUSED
+    assert captured["encoded_patch"] is None
+    assert captured["refusal_event"].code == "enrichment_revision_patch_invalid"
+
+
+async def test_bridge_diagram_label_over_the_display_bound_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extraction, _refs, synthesis, _chart, diagram, _enrichment, context, payload, handles = (
+        _fixture(EditorialEnrichmentElementKind.DIAGRAM)
+    )
+    entry = _entry(kind=EditorialBlockKind.DIAGRAM, pointer="/diagrams/0", payload=payload)
+    element_context = _element_context(
+        kind=EditorialEnrichmentElementKind.DIAGRAM,
+        entry=entry,
+        payload=payload,
+        context=context,
+        extraction=extraction,
+        synthesis=synthesis,
+        handles=handles,
+        element_key=diagram.key,
+    )
+    service, captured, _store, _binding = _service_with_capture(monkeypatch)
+    response = _wire(
+        target=f"synthesis{entry.structural_pointer}",
+        action="rewrite_diagram",
+        before_hash=entry.content_sha256,
+        after=_oversized_diagram_after(
+            diagram=diagram,
+            handles=handles,
+            node_count=2,
+            label="A" * 501,
+        ),
+    )
+
+    proposal = await service.prepare_thread_turn(
+        thread_id=uuid4(),
+        actor_id=_ACTOR_ID,
+        model_run_id=_MODEL_RUN_ID,
+        model_turn_id=_MODEL_TURN_ID,
+        instruction="Corrige ce diagramme.",
+        raw_response=response,
+        context=_context(
+            element_context=element_context,
+            entry=entry,
+            operations=("rewrite_diagram", "update_visual_caption"),
+        ),
+    )
+
+    assert proposal.state is EditorialProposalState.REFUSED
+    assert captured["encoded_patch"] is None
+    assert captured["refusal_event"].code == "enrichment_revision_patch_invalid"
+
+
 async def test_caption_correction_is_prepared_as_a_typed_visual_patch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -520,6 +657,109 @@ async def test_caption_correction_is_prepared_as_a_typed_visual_patch(
     encoded = bytes(captured["encoded_patch"]).decode("utf-8")
     assert "Synthetic quantitative fixture" not in encoded
     assert "The synthetic report records Alpha with 12 endpoints." not in encoded
+
+
+async def test_read_only_context_refuses_before_any_proposal_or_thread_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extraction, _refs, synthesis, chart, _diagram, _enrichment, context, payload, handles = (
+        _fixture(EditorialEnrichmentElementKind.CHART)
+    )
+    entry = _entry(kind=EditorialBlockKind.CHART, pointer="/charts/0", payload=payload)
+    element_context = _element_context(
+        kind=EditorialEnrichmentElementKind.CHART,
+        entry=entry,
+        payload=payload,
+        context=context,
+        extraction=extraction,
+        synthesis=synthesis,
+        handles=handles,
+        element_key=chart.key,
+    )
+    service, captured, store, _binding = _service_with_capture(
+        monkeypatch,
+        read_only_reason=EditorialLegacyReadOnlyReason.FORMAT_NOT_EDITABLE,
+    )
+    response = _wire(
+        target=f"synthesis{entry.structural_pointer}",
+        action="update_visual_caption",
+        before_hash=entry.content_sha256,
+        after="CAPTION: Légende refusée en lecture seule.",
+    )
+
+    with pytest.raises(EditorialProposalApplicationError) as caught:
+        await service.prepare_thread_turn(
+            thread_id=uuid4(),
+            actor_id=_ACTOR_ID,
+            model_run_id=_MODEL_RUN_ID,
+            model_turn_id=_MODEL_TURN_ID,
+            instruction="Corrige la légende.",
+            raw_response=response,
+            context=_context(
+                element_context=element_context,
+                entry=entry,
+                operations=("rewrite_chart", "update_visual_caption"),
+            ),
+        )
+
+    assert caught.value.code == "editorial_read_only"
+    assert caught.value.reason == "format_not_editable"
+    # Neither a proposal row nor a thread refusal event was persisted.
+    assert captured == {}
+    assert store.payloads == {}
+
+
+async def test_target_witness_operation_is_deterministic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The resolver witness follows the enum order, not the frozenset hash seed."""
+    from cti_app.application import editorial_proposals as editorial_proposals_module
+
+    extraction, _refs, synthesis, chart, _diagram, _enrichment, context, payload, handles = (
+        _fixture(EditorialEnrichmentElementKind.CHART)
+    )
+    entry = _entry(kind=EditorialBlockKind.CHART, pointer="/charts/0", payload=payload)
+    element_context = _element_context(
+        kind=EditorialEnrichmentElementKind.CHART,
+        entry=entry,
+        payload=payload,
+        context=context,
+        extraction=extraction,
+        synthesis=synthesis,
+        handles=handles,
+        element_key=chart.key,
+    )
+    real_resolver = editorial_proposals_module.resolve_enrichment_element_target
+    seen: dict[str, str] = {}
+
+    def capture(**kwargs):
+        seen["operation"] = kwargs["operation"]
+        return real_resolver(**kwargs)
+
+    monkeypatch.setattr(editorial_proposals_module, "resolve_enrichment_element_target", capture)
+    service, _captured, _store, _binding = _service_with_capture(monkeypatch)
+    response = _wire(
+        target=f"synthesis{entry.structural_pointer}",
+        action="update_visual_caption",
+        before_hash=entry.content_sha256,
+        after="CAPTION: Légende déterministe.",
+    )
+
+    await service.prepare_thread_turn(
+        thread_id=uuid4(),
+        actor_id=_ACTOR_ID,
+        model_run_id=_MODEL_RUN_ID,
+        model_turn_id=_MODEL_TURN_ID,
+        instruction="Corrige la légende.",
+        raw_response=response,
+        context=_context(
+            element_context=element_context,
+            entry=entry,
+            operations=("rewrite_chart", "update_visual_caption"),
+        ),
+    )
+
+    assert seen["operation"] == "rewrite_chart"
 
 
 async def test_chart_label_correction_keeps_one_chart_and_is_evidenced(

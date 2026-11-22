@@ -85,6 +85,7 @@ from cti_app.application.production_artifact_store import (
 )
 from cti_app.application.production_editorial_enrichment import (
     EditorialEnrichmentEvidencePackV1,
+    EditorialEnrichmentRevisionConflictError,
     ResourceNeedProposalV1,
 )
 from cti_app.application.production_stages import EditorialEnrichmentService, SynthesisService
@@ -721,6 +722,13 @@ class EditorialProposalAdoptionService:
                     )
             except EditorialProposalAdoptionError:
                 raise
+            except EditorialEnrichmentRevisionConflictError:
+                # A base blob that changed between prepare and adoption is a
+                # stale fence, not an internal error code: keep the closed
+                # accept-code contract.
+                raise EditorialProposalAdoptionError(
+                    "proposal_base_stale", reason="fence:stale_base"
+                ) from None
             except Exception as error:
                 code = getattr(error, "reason_code", None) or getattr(error, "code", None)
                 raise EditorialProposalAdoptionError(

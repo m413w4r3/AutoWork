@@ -2,8 +2,7 @@
 
 Public surface: ``VisualRevisionContext``, ``VisualRevisionPlan``,
 ``VisualRevisionRejected`` and ``plan_visual_revision``. Prepare and adoption
-both cross this seam; later slices add variant modules without widening the
-interface.
+both cross this seam; variant modules are internal to the planner.
 """
 
 from .context import (

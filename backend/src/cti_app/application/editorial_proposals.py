@@ -139,6 +139,14 @@ from cti_app.domain.production_editorial_enrichment import (
     EDITORIAL_ENRICHMENT_V9_POLICY_VERSION,
     MAX_BAR_CHART_ADJUSTED_EXPONENT,
     MAX_BAR_CHART_SIGNIFICANT_DIGITS,
+    MAX_DIAGRAM_CAPTION_CHARS,
+    MAX_DIAGRAM_EDGES,
+    MAX_DIAGRAM_GROUP_MEMBERS,
+    MAX_DIAGRAM_GROUPS,
+    MAX_DIAGRAM_ID_CHARS,
+    MAX_DIAGRAM_LABEL_CHARS,
+    MAX_DIAGRAM_NODES,
+    MAX_DIAGRAM_TITLE_CHARS,
     ChartKind,
     ChartPointV1,
     ChartSpecV1,
@@ -395,12 +403,51 @@ def _chart_spec_from_visual_proposal(
         raise _VisualProposalRefused("enrichment_revision_patch_invalid") from None
 
 
+def _bound_bridge_diagram(diagram: DiagramProposalV1) -> None:
+    """Refuse an oversize Bridge diagram before any typed construction.
+
+    Bridge output is untrusted: the manual request already caps the same shape,
+    so the wire conversion applies the shared domain limits before the planner
+    spends CPU on it.
+    """
+
+    def refuse() -> None:
+        raise _VisualProposalRefused("enrichment_revision_patch_invalid")
+
+    if (
+        len(diagram.nodes) > MAX_DIAGRAM_NODES
+        or len(diagram.edges) > MAX_DIAGRAM_EDGES
+        or len(diagram.groups) > MAX_DIAGRAM_GROUPS
+        or len(diagram.title) > MAX_DIAGRAM_TITLE_CHARS
+        or (diagram.caption is not None and len(diagram.caption) > MAX_DIAGRAM_CAPTION_CHARS)
+    ):
+        refuse()
+    for node in diagram.nodes:
+        if len(node.node_id) > MAX_DIAGRAM_ID_CHARS or len(node.label) > MAX_DIAGRAM_LABEL_CHARS:
+            refuse()
+    for edge in diagram.edges:
+        if (
+            len(edge.source_node_id) > MAX_DIAGRAM_ID_CHARS
+            or len(edge.target_node_id) > MAX_DIAGRAM_ID_CHARS
+            or (edge.label is not None and len(edge.label) > MAX_DIAGRAM_LABEL_CHARS)
+        ):
+            refuse()
+    for group in diagram.groups:
+        if (
+            len(group.group_id) > MAX_DIAGRAM_ID_CHARS
+            or len(group.label) > MAX_DIAGRAM_LABEL_CHARS
+            or len(group.node_ids) > MAX_DIAGRAM_GROUP_MEMBERS
+        ):
+            refuse()
+
+
 def _diagram_spec_from_visual_proposal(
     diagram: DiagramProposalV1,
     evidence_pack: EditorialEnrichmentEvidencePackV1,
 ) -> DiagramSpecV1:
     """Resolve one proposal diagram's handles; the planner validates the rest."""
     unknown_code = "enrichment_revision_patch_invalid"
+    _bound_bridge_diagram(diagram)
     try:
         return DiagramSpecV1(
             key=diagram.key,
@@ -988,6 +1035,20 @@ def _bind_visual_revision_base_placement(
             return patch
         return replace(patch, diagram=replace(patch.diagram, placement=base_diagram.placement))
     return patch
+
+
+def _enrichment_element_keys(
+    enrichment: EditorialEnrichmentV1,
+    kind: EditorialEnrichmentElementKind,
+) -> frozenset[str]:
+    """The element keys of one family in the pinned base enrichment."""
+    if kind is EditorialEnrichmentElementKind.TABLE:
+        return frozenset(table.key for table in enrichment.tables)
+    if kind is EditorialEnrichmentElementKind.CHART:
+        return frozenset(chart.key for chart in enrichment.charts)
+    if kind is EditorialEnrichmentElementKind.DIAGRAM:
+        return frozenset(diagram.key for diagram in enrichment.diagrams)
+    return frozenset(figure.key for figure in enrichment.source_figures)
 
 
 def _visual_revision_failure(
@@ -1964,15 +2025,24 @@ class EditorialProposalService:
         if thread_record is None or thread_record.thread.origin.subject_id is None:
             raise EditorialProposalApplicationError("proposal_not_found")
         origin = thread_record.thread.origin
+        # The element branch persists a proposal and a thread event even when
+        # its patch is later refused, so it must apply the same read-only policy
+        # as the manual branch before any write. The text branch gets the same
+        # refusal through ``resolve_revision_target``.
+        await self._refuse_read_only_context(origin.subject_id, origin.occurrence_id)
         try:
+            # Enum order makes the witness operation deterministic; every
+            # offered visual operation resolves the same occurrence element.
+            operation_value = next(
+                operation.value
+                for operation in TargetedEditorialRevisionOperation
+                if operation.value in _VISUAL_PROPOSAL_OPERATION_VALUES
+                and operation.value in set(context.proposal_operations)
+            )
             resolved = resolve_enrichment_element_target(
                 entry=entry,
                 enrichment=base_content,
-                operation=next(
-                    value
-                    for value in _VISUAL_PROPOSAL_OPERATION_VALUES
-                    if value in set(context.proposal_operations)
-                ),
+                operation=operation_value,
             )
         except (EditorialWorkspaceError, ValueError, StopIteration):
             raise EditorialProposalApplicationError("enrichment_element_not_found") from None
@@ -2163,13 +2233,6 @@ class EditorialProposalService:
         if not _IDEMPOTENCY_KEY.fullmatch(idempotency_key):
             raise EditorialProposalApplicationError("idempotency_key_invalid")
         operation = patch.operation
-        if operation not in IMPLEMENTED_VISUAL_REVISION_OPERATIONS:
-            raise _visual_revision_failure(
-                VisualRevisionRejected(
-                    "enrichment_revision_unsupported_operation",
-                    {"variant": type(patch).__name__, "slice": "F2-03b/F2-03c"},
-                )
-            )
         if self._workspace_service is None or self._visual_revision_loader is None:
             raise EditorialProposalApplicationError("proposal_base_unavailable")
         preparation_key = _manual_idempotency_key("prepare", idempotency_key)
@@ -2251,6 +2314,29 @@ class EditorialProposalService:
                 raise _visual_revision_failure(
                     VisualRevisionRejected("enrichment_element_not_found", {})
                 ) from None
+            # The occurrence's registry pointer is the only authority for the
+            # element identity; a same-family key from another occurrence would
+            # make the review card and the adoption target diverge.
+            if (
+                resolved.target.element_kind is not element_kind
+                or resolved.target.element_key != patch.element_key
+            ):
+                known_keys = _enrichment_element_keys(loaded.context.base_enrichment, element_kind)
+                if patch.element_key not in known_keys:
+                    # Backward-compatible closed code for a key that exists
+                    # nowhere in the artifact.
+                    raise _visual_revision_failure(
+                        VisualRevisionRejected("enrichment_element_not_found", {})
+                    )
+                raise _visual_revision_failure(
+                    VisualRevisionRejected(
+                        "enrichment_target_mismatch",
+                        {
+                            "element_kind": element_kind.value,
+                            "element_key": resolved.target.element_key,
+                        },
+                    )
+                )
             target = resolved.target
             before_hash = resolved.before_hash
             if isinstance(patch, MoveEnrichmentElementPatch):
