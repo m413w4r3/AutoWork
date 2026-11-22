@@ -27,6 +27,7 @@ from cti_app.application.confined_analysis import (
     ConfinedAnalysisExecutionPort,
     ConfinedAnalysisFamilyStatus,
 )
+from cti_app.application.evidence_recorder import EvidenceRecorder
 from cti_app.application.external_effects import ExternalEffectCoordinator
 from cti_app.application.goodware import GoodwareMeasurementService
 from cti_app.application.identity import LocalIdentityProvider
@@ -36,6 +37,7 @@ from cti_app.application.investigation_composition import (
     OptionalInvestigationToolPorts,
 )
 from cti_app.application.investigation_rule_tools import QuarantineRuleCorpusBytes
+from cti_app.application.investigation_tools import ToolRegistry
 from cti_app.application.local_analysis import (
     GhidraAnalysisPort,
     LocalCommandCatalog,
@@ -1086,6 +1088,33 @@ def _bridge_turn_transport_configured(settings: Settings) -> bool:
         forced_adapter == "auto" and research_route == "chatgpt_bridge"
     )
     return transport_configured and route_uses_bridge
+
+
+def register_confined_script_tool(
+    registry: ToolRegistry,
+    *,
+    execution: ConfinedAnalysisExecutionPort | None,
+    uow_factory: UnitOfWorkFactory,
+    artifact_store: ProductionArtifactStore,
+    recorder: EvidenceRecorder,
+    settings: Settings,
+) -> bool:
+    """Register the typed ``analysis.run_script`` broker adapter.
+
+    Registration is an infrastructure concern; the adapter, contracts and
+    capability service live in ``application.confined_scripts`` and are imported
+    lazily so this module keeps its assembly role without a cycle.
+    """
+    from cti_app.application.confined_scripts import register_run_script_tool
+
+    return register_run_script_tool(
+        registry,
+        execution=execution,
+        uow_factory=uow_factory,
+        archive=artifact_store,
+        recorder=recorder,
+        settings=settings,
+    )
 
 
 def describe_tool_inventory(

@@ -119,6 +119,16 @@ _WORKER_RESOURCE_LIMIT_FIELDS = (
     "dotnet_analysis_address_space_limit_bytes",
     "apk_analysis_address_space_limit_bytes",
     "analysis_apk_timeout_seconds",
+    "analysis_script_max_source_bytes",
+    "analysis_script_wall_timeout_seconds",
+    "analysis_script_cpu_seconds",
+    "analysis_script_memory_bytes",
+    "analysis_script_file_size_bytes",
+    "analysis_script_scratch_max_files",
+    "analysis_script_scratch_max_bytes",
+    "analysis_script_stdout_max_bytes",
+    "analysis_script_stderr_max_bytes",
+    "analysis_script_max_processes",
 )
 
 

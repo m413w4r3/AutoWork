@@ -15,6 +15,7 @@ from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.confined_analysis import (
     CONFINED_ANALYSIS_JOB_KIND,
     CONFINED_ANALYSIS_RESULT_SCHEMA,
+    CONFINED_ANALYSIS_SCRIPT_RESOURCE_LIMIT_FIELDS,
     CONFINED_ANALYSIS_WORKER_RESOURCE_LIMIT_FIELDS,
     CONFINED_ANALYSIS_WORKER_RESOURCE_LIMIT_MAXIMUMS,
     CONFINED_ANALYSIS_WORKER_RESOURCE_LIMIT_MINIMUMS,
@@ -26,6 +27,8 @@ from cti_app.application.confined_analysis import (
     ConfinedAnalysisResult,
     ConfinedAnalysisTool,
     ConfinedAnalysisWorkerAttestation,
+    ConfinedScriptJobSpec,
+    ConfinedScriptSpec,
     create_confined_analysis_job_registry,
     deterministic_confined_analysis_key,
 )
@@ -138,7 +141,12 @@ class DramatiqConfinedAnalysisExecutionPort(ConfinedAnalysisExecutionPort):
             return self._unavailable(request, operation_key, reason)
         if not self.available:
             return self._unavailable(request, operation_key, self.available_reason)
-        if request.timeout_seconds > self._settings.analysis_worker_job_timeout_seconds:
+        # A script request carries the worker job budget (wall + grace); the
+        # operator-visible budget is the script wall limit itself.
+        budget_seconds = (
+            request.script.wall_seconds if request.script is not None else request.timeout_seconds
+        )
+        if budget_seconds > self._settings.analysis_worker_job_timeout_seconds:
             return ConfinedAnalysisResult(
                 ToolInvocationStatus.POLICY_DENIED,
                 operation_key,
@@ -154,6 +162,16 @@ class DramatiqConfinedAnalysisExecutionPort(ConfinedAnalysisExecutionPort):
                 request.sha256,
                 available_reason="analysis_output_budget_exceeded",
             )
+        if request.tool is ConfinedAnalysisTool.SCRIPT:
+            denied = _script_limit_denial(request.script, self._attestation.resource_limits)
+            if denied is not None:
+                return ConfinedAnalysisResult(
+                    ToolInvocationStatus.POLICY_DENIED,
+                    operation_key,
+                    request.artifact_id,
+                    request.sha256,
+                    available_reason=denied,
+                )
 
         parameters = ConfinedAnalysisJobParameters(
             investigation_id=request.investigation_id,
@@ -168,6 +186,11 @@ class DramatiqConfinedAnalysisExecutionPort(ConfinedAnalysisExecutionPort):
             max_output_bytes=request.max_output_bytes,
             arguments=request.arguments,
             analysis_parameters=dict(request.analysis_parameters),
+            script=(
+                ConfinedScriptJobSpec.from_spec(request.script)
+                if request.script is not None
+                else None
+            ),
         )
         try:
             job = await self._job_service.submit(
@@ -392,6 +415,7 @@ def _attestation_from_response(raw: bytes, settings: Settings) -> ConfinedAnalys
         dependencies_ready=dependencies_ready,
         supported_families=supported,
         settings=settings,
+        resource_limits=resource_limits,
     )
     return ConfinedAnalysisWorkerAttestation(
         reachable=True,
@@ -428,6 +452,8 @@ def _attestation_from_response(raw: bytes, settings: Settings) -> ConfinedAnalys
                 "jadx",
                 "jadx_zip_sha256",
                 "jadx_jre_version",
+                "script_interpreter",
+                "script_sandbox",
             }
             or key.startswith("mwcp_parser:")
         },
@@ -445,10 +471,21 @@ def _attestation_from_response(raw: bytes, settings: Settings) -> ConfinedAnalys
 
 
 def _parse_worker_resource_limits(raw: Any) -> dict[str, int | float] | None:
-    if not isinstance(raw, dict) or set(raw) != set(CONFINED_ANALYSIS_WORKER_RESOURCE_LIMIT_FIELDS):
+    """Validate attested maxima; tolerate a pre-script worker for other tools.
+
+    Adding a worker capability must not invalidate every pre-existing family on
+    a rolling deployment. The historical fields stay mandatory, unknown fields
+    are rejected, and a missing script field only makes the script family
+    unavailable (``analysis_script_limits_unattested``).
+    """
+    all_fields = set(CONFINED_ANALYSIS_WORKER_RESOURCE_LIMIT_FIELDS)
+    legacy_fields = all_fields - set(CONFINED_ANALYSIS_SCRIPT_RESOURCE_LIMIT_FIELDS)
+    if not isinstance(raw, dict) or not set(raw) <= all_fields or not legacy_fields <= set(raw):
         return None
     limits: dict[str, int | float] = {}
     for name, maximum in CONFINED_ANALYSIS_WORKER_RESOURCE_LIMIT_MAXIMUMS.items():
+        if name not in raw:
+            continue
         value = raw[name]
         minimum = CONFINED_ANALYSIS_WORKER_RESOURCE_LIMIT_MINIMUMS.get(name, 0)
         if name in CONFINED_ANALYSIS_WORKER_RESOURCE_LIMIT_TIMEOUT_FIELDS:
@@ -471,6 +508,7 @@ def _family_statuses(
     dependencies_ready: bool,
     supported_families: frozenset[str],
     settings: Settings,
+    resource_limits: Mapping[str, int | float] | None = None,
 ) -> dict[str, ConfinedAnalysisFamilyStatus]:
     static_version = versions.get("static")
     capa_version = versions.get("capa")
@@ -617,6 +655,22 @@ def _family_statuses(
     archive_tools = status(
         "archive_tools", versions.get("local_7z"), settings.analysis_local_7z_expected_version
     )
+    script = status(
+        "script",
+        versions.get("script_interpreter"),
+        settings.analysis_script_expected_python_version,
+    )
+    script_sandbox = _safe_version(versions.get("script_sandbox"))
+    if script.available and script_sandbox not in {"bwrap", "seccomp"}:
+        script = ConfinedAnalysisFamilyStatus(
+            "script", False, script.version, "script_confinement_unavailable"
+        )
+    if script.available and not CONFINED_ANALYSIS_SCRIPT_RESOURCE_LIMIT_FIELDS <= set(
+        resource_limits or {}
+    ):
+        script = ConfinedAnalysisFamilyStatus(
+            "script", False, script.version, "analysis_script_limits_unattested"
+        )
     sample = ConfinedAnalysisFamilyStatus(
         "sample_analysis",
         "sample_analysis" in supported_families
@@ -657,8 +711,40 @@ def _family_statuses(
             sample,
             dotnet,
             apk,
+            script,
         )
     }
+
+
+_SCRIPT_LIMIT_ATTESTATION_NAMES: Mapping[str, str] = {
+    "wall_seconds": "analysis_script_wall_timeout_seconds",
+    "cpu_limit_seconds": "analysis_script_cpu_seconds",
+    "memory_limit_bytes": "analysis_script_memory_bytes",
+    "file_size_limit_bytes": "analysis_script_file_size_bytes",
+    "scratch_max_files": "analysis_script_scratch_max_files",
+    "scratch_max_bytes": "analysis_script_scratch_max_bytes",
+    "stdout_max_bytes": "analysis_script_stdout_max_bytes",
+    "stderr_max_bytes": "analysis_script_stderr_max_bytes",
+    "max_processes": "analysis_script_max_processes",
+}
+
+
+def _script_limit_denial(
+    spec: ConfinedScriptSpec | None,
+    resource_limits: Mapping[str, int | float] | None,
+) -> str | None:
+    """Validate request limits against the worker's attested maxima."""
+    if spec is None:
+        return "script_spec_required"
+    limits = resource_limits or {}
+    if not CONFINED_ANALYSIS_SCRIPT_RESOURCE_LIMIT_FIELDS <= set(limits):
+        return "analysis_script_limits_unattested"
+    for request_name, attestation_name in _SCRIPT_LIMIT_ATTESTATION_NAMES.items():
+        attested = limits[attestation_name]
+        requested = getattr(spec, request_name)
+        if float(requested) > float(attested):
+            return "analysis_script_limit_exceeded"
+    return None
 
 
 def _unavailable_families(reason: str) -> dict[str, ConfinedAnalysisFamilyStatus]:
@@ -678,6 +764,7 @@ def _unavailable_families(reason: str) -> dict[str, ConfinedAnalysisFamilyStatus
         "sample_analysis",
         "dotnet",
         "apk",
+        "script",
     )
     return {
         name: ConfinedAnalysisFamilyStatus(name, False, available_reason=reason) for name in names

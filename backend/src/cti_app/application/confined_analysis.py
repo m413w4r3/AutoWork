@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -9,7 +10,7 @@ from enum import StrEnum
 from typing import Any, Protocol
 from uuid import UUID
 
-from pydantic import ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from cti_app.application.jobs import JobExecutionContext, JobHandler, JobParameters, JobRegistry
 from cti_app.domain.investigation import ToolInvocationStatus
@@ -21,6 +22,35 @@ from cti_app.domain.local_analysis import (
 
 CONFINED_ANALYSIS_JOB_KIND = "sample.confined_analysis.v1"
 CONFINED_ANALYSIS_RESULT_SCHEMA = "confined-analysis-result.v2"
+CONFINED_SCRIPT_SOURCE_BUCKET = "confined-script-sources"
+CONFINED_SCRIPT_OUTPUTS_BUCKET = "confined-script-outputs"
+CONFINED_SCRIPT_SOURCE_MIME = "text/x-python"
+CONFINED_SCRIPT_ARCHIVE_MIME = "application/gzip"
+CONFINED_SCRIPT_MAX_ARCHIVE_FILES = 32
+CONFINED_SCRIPT_JOB_GRACE_SECONDS = 15.0
+CONFINED_SCRIPT_INTERPRETERS: Mapping[str, str] = {"python3": "python3"}
+CONFINED_SCRIPT_WALL_SECONDS_RANGE = (60.0, 300.0)
+CONFINED_SCRIPT_CPU_SECONDS_RANGE = (30, 120)
+CONFINED_SCRIPT_MEMORY_BYTES_RANGE = (256 * 1024 * 1024, 1024 * 1024 * 1024)
+CONFINED_SCRIPT_FILE_SIZE_BYTES_RANGE = (1024 * 1024, 16 * 1024 * 1024)
+CONFINED_SCRIPT_SCRATCH_MAX_FILES_RANGE = (1, 512)
+CONFINED_SCRIPT_SCRATCH_MAX_BYTES_RANGE = (4096, 64 * 1024 * 1024)
+CONFINED_SCRIPT_STREAM_MAX_BYTES_RANGE = (1024, 1024 * 1024)
+CONFINED_SCRIPT_MAX_PROCESSES_RANGE = (1, 128)
+CONFINED_ANALYSIS_SCRIPT_RESOURCE_LIMIT_FIELDS = frozenset(
+    {
+        "analysis_script_max_source_bytes",
+        "analysis_script_wall_timeout_seconds",
+        "analysis_script_cpu_seconds",
+        "analysis_script_memory_bytes",
+        "analysis_script_file_size_bytes",
+        "analysis_script_scratch_max_files",
+        "analysis_script_scratch_max_bytes",
+        "analysis_script_stdout_max_bytes",
+        "analysis_script_stderr_max_bytes",
+        "analysis_script_max_processes",
+    }
+)
 CONFINED_ANALYSIS_WORKER_RESOURCE_LIMIT_MAXIMUMS: Mapping[str, int | float] = {
     "analysis_max_sample_bytes": 1 << 40,
     "analysis_string_min_length": 1024,
@@ -47,11 +77,22 @@ CONFINED_ANALYSIS_WORKER_RESOURCE_LIMIT_MAXIMUMS: Mapping[str, int | float] = {
     "dotnet_analysis_address_space_limit_bytes": 32 * 1024**3,
     "apk_analysis_address_space_limit_bytes": 32 * 1024**3,
     "analysis_apk_timeout_seconds": 120.0,
+    "analysis_script_max_source_bytes": 1024 * 1024,
+    "analysis_script_wall_timeout_seconds": 300.0,
+    "analysis_script_cpu_seconds": 120,
+    "analysis_script_memory_bytes": 1024 * 1024 * 1024,
+    "analysis_script_file_size_bytes": 16 * 1024 * 1024,
+    "analysis_script_scratch_max_files": 512,
+    "analysis_script_scratch_max_bytes": 64 * 1024 * 1024,
+    "analysis_script_stdout_max_bytes": 1024 * 1024,
+    "analysis_script_stderr_max_bytes": 1024 * 1024,
+    "analysis_script_max_processes": 128,
 }
 CONFINED_ANALYSIS_WORKER_RESOURCE_LIMIT_MINIMUMS: Mapping[str, int] = {
     "local_analysis_memory_limit_bytes": 64 * 1024 * 1024,
     "dotnet_analysis_address_space_limit_bytes": 8 * 1024**3,
     "apk_analysis_address_space_limit_bytes": 8 * 1024**3,
+    "analysis_script_memory_bytes": 256 * 1024 * 1024,
 }
 CONFINED_ANALYSIS_WORKER_RESOURCE_LIMIT_FIELDS = tuple(
     CONFINED_ANALYSIS_WORKER_RESOURCE_LIMIT_MAXIMUMS
@@ -65,6 +106,7 @@ CONFINED_ANALYSIS_WORKER_RESOURCE_LIMIT_TIMEOUT_FIELDS = frozenset(
         "local_analysis_timeout_seconds",
         "analysis_suricata_timeout_seconds",
         "analysis_apk_timeout_seconds",
+        "analysis_script_wall_timeout_seconds",
     }
 )
 ARCHIVE_MEMBER_TRANSFER_BUCKET_PREFIX = "archive-member"
@@ -94,12 +136,15 @@ class ConfinedAnalysisTool(StrEnum):
     SURICATA_REPLAY = "suricata_replay"
     DOTNET_ILSPY = "dotnet_ilspy"
     APK_JADX = "apk_jadx"
+    SCRIPT = "script"
 
 
 class ConfinedAnalysisArtifactKind(StrEnum):
     SAMPLE = "sample"
     CAPTURE = "capture"
     CORPUS_SAMPLE = "corpus_sample"
+    # Labels the content-addressed script source; never the canonical input kind.
+    SCRIPT = "script"
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +168,66 @@ class ConfinedAnalysisWorkerAttestation:
 
 
 @dataclass(frozen=True, slots=True)
+class ConfinedScriptSpec:
+    """Closed execution contract for one agent-authored script.
+
+    The script source is content-addressed and archived before dispatch; the
+    canonical input is a separate sample or capture artifact handled by the
+    ordinary confined-analysis input resolution.
+    """
+
+    script_blob_id: UUID
+    script_sha256: str
+    interpreter: str
+    wall_seconds: float
+    cpu_limit_seconds: int
+    memory_limit_bytes: int
+    file_size_limit_bytes: int
+    scratch_max_files: int
+    scratch_max_bytes: int
+    stdout_max_bytes: int
+    stderr_max_bytes: int
+    max_processes: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.script_blob_id, UUID):
+            raise ValueError("script blob identity must be a UUID")
+        if not _SHA256.fullmatch(self.script_sha256):
+            raise ValueError("script sha256 must be a lowercase SHA-256")
+        if self.interpreter not in CONFINED_SCRIPT_INTERPRETERS:
+            raise ValueError("script interpreter is not allowlisted")
+        _bounded_float(self.wall_seconds, *CONFINED_SCRIPT_WALL_SECONDS_RANGE)
+        _bounded_int(self.cpu_limit_seconds, *CONFINED_SCRIPT_CPU_SECONDS_RANGE)
+        _bounded_int(self.memory_limit_bytes, *CONFINED_SCRIPT_MEMORY_BYTES_RANGE)
+        _bounded_int(self.file_size_limit_bytes, *CONFINED_SCRIPT_FILE_SIZE_BYTES_RANGE)
+        _bounded_int(self.scratch_max_files, *CONFINED_SCRIPT_SCRATCH_MAX_FILES_RANGE)
+        _bounded_int(self.scratch_max_bytes, *CONFINED_SCRIPT_SCRATCH_MAX_BYTES_RANGE)
+        _bounded_int(self.stdout_max_bytes, *CONFINED_SCRIPT_STREAM_MAX_BYTES_RANGE)
+        _bounded_int(self.stderr_max_bytes, *CONFINED_SCRIPT_STREAM_MAX_BYTES_RANGE)
+        _bounded_int(self.max_processes, *CONFINED_SCRIPT_MAX_PROCESSES_RANGE)
+
+    def limits(self) -> Mapping[str, int | float]:
+        return {
+            "wall_seconds": self.wall_seconds,
+            "cpu_limit_seconds": self.cpu_limit_seconds,
+            "memory_limit_bytes": self.memory_limit_bytes,
+            "file_size_limit_bytes": self.file_size_limit_bytes,
+            "scratch_max_files": self.scratch_max_files,
+            "scratch_max_bytes": self.scratch_max_bytes,
+            "stdout_max_bytes": self.stdout_max_bytes,
+            "stderr_max_bytes": self.stderr_max_bytes,
+            "max_processes": self.max_processes,
+        }
+
+    def canonical_payload(self) -> Mapping[str, Any]:
+        return {
+            "script_sha256": self.script_sha256,
+            "interpreter": self.interpreter,
+            **{key: value for key, value in sorted(self.limits().items())},
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ConfinedAnalysisRequest:
     investigation_id: UUID
     artifact_id: UUID
@@ -135,12 +240,31 @@ class ConfinedAnalysisRequest:
     sample_id: UUID | None = None
     arguments: tuple[str, ...] = ()
     analysis_parameters: Mapping[str, str] = field(default_factory=dict)
+    script: ConfinedScriptSpec | None = None
 
     def __post_init__(self) -> None:
         if not _SHA256.fullmatch(self.sha256):
             raise ValueError("sha256 must be a lowercase SHA-256")
         if self.timeout_seconds <= 0 or self.max_output_bytes <= 0:
             raise ValueError("analysis budgets must be positive")
+        if self.artifact_kind is ConfinedAnalysisArtifactKind.SCRIPT:
+            raise ValueError("a script source is never the canonical analysis input")
+        if self.tool is ConfinedAnalysisTool.SCRIPT:
+            if self.script is None:
+                raise ValueError("script execution requires a closed script specification")
+            if self.arguments or self.analysis_parameters:
+                raise ValueError("script execution accepts no free arguments or parameters")
+            if self.artifact_kind not in {
+                ConfinedAnalysisArtifactKind.SAMPLE,
+                ConfinedAnalysisArtifactKind.CAPTURE,
+            }:
+                raise ValueError("script execution requires one canonical sample or capture")
+            if self.timeout_seconds < (
+                self.script.wall_seconds + CONFINED_SCRIPT_JOB_GRACE_SECONDS
+            ):
+                raise ValueError("script job budget must cover the wall limit and grace")
+        elif self.script is not None:
+            raise ValueError("only the script tool accepts a script specification")
         if self.artifact_kind is ConfinedAnalysisArtifactKind.SAMPLE and (
             self.association_id is None or self.sample_id is None
         ):
@@ -150,6 +274,7 @@ class ConfinedAnalysisRequest:
             ConfinedAnalysisTool.CAPINFOS,
             ConfinedAnalysisTool.SURICATA_VALIDATE_RULES,
             ConfinedAnalysisTool.SURICATA_REPLAY,
+            ConfinedAnalysisTool.SCRIPT,
         }:
             raise ValueError("capture artifacts support only offline network tools")
         if len(self.arguments) > 128 or any(
@@ -627,6 +752,52 @@ def confined_analysis_operation_cache_identity(
     }
 
 
+class ConfinedScriptJobSpec(BaseModel):
+    """Durable JSON form of :class:`ConfinedScriptSpec`; no script bytes."""
+
+    model_config = ConfigDict(extra="forbid", strict=False)
+
+    script_blob_id: UUID
+    script_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    interpreter: str = Field(min_length=1, max_length=64)
+    wall_seconds: float = Field(ge=60, le=300)
+    cpu_limit_seconds: int = Field(ge=30, le=120)
+    memory_limit_bytes: int = Field(ge=256 * 1024 * 1024, le=1024 * 1024 * 1024)
+    file_size_limit_bytes: int = Field(ge=1024 * 1024, le=16 * 1024 * 1024)
+    scratch_max_files: int = Field(ge=1, le=512)
+    scratch_max_bytes: int = Field(ge=4096, le=64 * 1024 * 1024)
+    stdout_max_bytes: int = Field(ge=1024, le=1024 * 1024)
+    stderr_max_bytes: int = Field(ge=1024, le=1024 * 1024)
+    max_processes: int = Field(ge=1, le=128)
+
+    def to_spec(self) -> ConfinedScriptSpec:
+        return ConfinedScriptSpec(
+            script_blob_id=self.script_blob_id,
+            script_sha256=self.script_sha256,
+            interpreter=self.interpreter,
+            wall_seconds=self.wall_seconds,
+            cpu_limit_seconds=self.cpu_limit_seconds,
+            memory_limit_bytes=self.memory_limit_bytes,
+            file_size_limit_bytes=self.file_size_limit_bytes,
+            scratch_max_files=self.scratch_max_files,
+            scratch_max_bytes=self.scratch_max_bytes,
+            stdout_max_bytes=self.stdout_max_bytes,
+            stderr_max_bytes=self.stderr_max_bytes,
+            max_processes=self.max_processes,
+        )
+
+    @classmethod
+    def from_spec(cls, spec: ConfinedScriptSpec) -> ConfinedScriptJobSpec:
+        return cls(
+            **{
+                "script_blob_id": spec.script_blob_id,
+                "script_sha256": spec.script_sha256,
+                "interpreter": spec.interpreter,
+                **spec.limits(),
+            }
+        )
+
+
 class ConfinedAnalysisJobParameters(JobParameters):
     # Durable job rows are JSON. This contract deliberately accepts their JSON
     # UUID/enumeration forms when the worker validates the persisted payload.
@@ -644,6 +815,32 @@ class ConfinedAnalysisJobParameters(JobParameters):
     sample_id: UUID | None = None
     arguments: tuple[str, ...] = Field(default=(), max_length=128)
     analysis_parameters: dict[str, str] = Field(default_factory=dict, max_length=12)
+    script: ConfinedScriptJobSpec | None = None
+
+    @model_validator(mode="after")
+    def _validate_script_contract(self) -> ConfinedAnalysisJobParameters:
+        if self.tool is ConfinedAnalysisTool.SCRIPT:
+            if self.script is None:
+                raise ValueError("script execution requires a script specification")
+            if self.script.interpreter not in CONFINED_SCRIPT_INTERPRETERS:
+                raise ValueError("script interpreter is not allowlisted")
+            if self.arguments or self.analysis_parameters:
+                raise ValueError("script execution accepts no free arguments or parameters")
+            if self.artifact_kind not in {
+                ConfinedAnalysisArtifactKind.SAMPLE,
+                ConfinedAnalysisArtifactKind.CAPTURE,
+            }:
+                raise ValueError("script execution requires one canonical sample or capture")
+            if self.timeout_seconds < (
+                self.script.wall_seconds + CONFINED_SCRIPT_JOB_GRACE_SECONDS
+            ):
+                raise ValueError("script job budget must cover the wall limit and grace")
+        elif self.script is not None:
+            raise ValueError("only the script tool accepts a script specification")
+        return self
+
+    def validated_script(self) -> ConfinedScriptSpec | None:
+        return self.script.to_spec() if self.script is not None else None
 
 
 def create_confined_analysis_job_registry(handler: JobHandler | None = None) -> JobRegistry:
@@ -690,6 +887,11 @@ def deterministic_confined_analysis_key(
     if request.tool is ConfinedAnalysisTool.APK_JADX:
         payload["timeout_seconds"] = request.timeout_seconds
         payload["max_output_bytes"] = request.max_output_bytes
+    if request.script is not None:
+        # The script blob is content-addressed: its SHA-256, not a storage id,
+        # is the reproducible identity. The result cap changes truncation.
+        payload["script"] = request.script.canonical_payload()
+        payload["max_output_bytes"] = request.max_output_bytes
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return f"confined-analysis:{hashlib.sha256(encoded).hexdigest()}"
 
@@ -701,3 +903,18 @@ def _bounded_decimal(value: str, minimum: int, maximum: int) -> bool:
         and value.isdecimal()
         and minimum <= int(value) <= maximum
     )
+
+
+def _bounded_int(value: int, minimum: int, maximum: int) -> None:
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise ValueError("bounded integer is outside its closed range")
+
+
+def _bounded_float(value: float, minimum: float, maximum: float) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not math.isfinite(float(value))
+        or not minimum <= float(value) <= maximum
+    ):
+        raise ValueError("bounded number is outside its closed range")
