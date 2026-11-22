@@ -37,6 +37,12 @@ HANDOFFS = f"/api/investigations/{INVESTIGATION}/handoffs"
         ("POST", BROKER, SIGNED_HEADERS, True),
         ("POST", TASK_COMMAND, SIGNED_HEADERS, True),
         ("POST", HANDOFFS, SIGNED_HEADERS, True),
+        (
+            "POST",
+            f"/api/investigations/{INVESTIGATION}/agent-sessions/{SESSION}/instructions",
+            SIGNED_HEADERS,
+            True,
+        ),
         ("POST", BROKER, {}, False),
         ("POST", BROKER, {"x-autowork-agent-session": SESSION}, False),
         ("GET", BROKER, SIGNED_HEADERS, False),

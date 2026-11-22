@@ -40,6 +40,7 @@ from cti_app.api.investigation_handoffs import router as investigation_handoffs_
 from cti_app.api.investigation_plans import router as investigation_plans_router
 from cti_app.api.investigation_rule_corpus import router as investigation_rule_corpus_router
 from cti_app.api.investigation_tasks import router as investigation_tasks_router
+from cti_app.api.investigation_transfers import router as investigation_transfers_router
 from cti_app.api.jobs import router as jobs_router
 from cti_app.api.model_conversations import router as model_conversations_router
 from cti_app.api.opinion_note_proposals import router as opinion_note_proposals_router
@@ -125,6 +126,7 @@ from cti_app.application.virustotal import VirusTotalCapabilities, VirusTotalRou
 from cti_app.application.virustotal_persistence import VirusTotalObservationService
 from cti_app.application.workspace import SubjectWorkspaceMaterializer
 from cti_app.config import get_settings
+from cti_app.infrastructure.agentic.wiring import build_session_runtime
 from cti_app.infrastructure.analytic_chart_renderer import AnalyticChartRenderer
 from cti_app.infrastructure.blob_storage.minio import MinioBlobStore
 from cti_app.infrastructure.collection_runtime import create_subject_collection_service
@@ -610,7 +612,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         production_artifact_store,
     )
     app.state.edition_release_rematerializer = edition_release_rematerializer
+    # M24: host session runtime (fail closed when the workspace agent is unconfigured).
+    agent_session_runtime = build_session_runtime(app.state, settings)
+    app.state.agent_session_runtime = agent_session_runtime
+    app.state.agentic_operator_port = agent_session_runtime.operator
+    app.state.agent_session_secret_delivery = agent_session_runtime.secret_delivery
+    app.state.host_sessions = agent_session_runtime.host_sessions
     yield
+    await agent_session_runtime.aclose()
     await readiness.close()
     if vt_direct_client is not None:
         await vt_direct_client.aclose()
@@ -804,6 +813,7 @@ def create_app() -> FastAPI:
     application.include_router(investigation_handoffs_router)
     application.include_router(investigation_contributions_router)
     application.include_router(investigation_tasks_router)
+    application.include_router(investigation_transfers_router)
     application.include_router(agent_sessions_router)
     application.include_router(agentic_tools_router)
     application.include_router(opinion_note_proposals_router)
@@ -844,7 +854,7 @@ def _agent_signed_route(method: str, path: str, headers: Mapping[str, str]) -> b
         method == "POST"
         and len(rest) == 3
         and rest[0] == "agent-sessions"
-        and rest[2] == "tool-calls"
+        and rest[2] in {"tool-calls", "instructions"}
     ):
         return _is_uuid(rest[1])
     if method == "POST" and len(rest) == 3 and rest[0] == "tasks" and rest[2] == "commands":
