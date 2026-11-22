@@ -5,6 +5,7 @@ import {
   editorialFigureThumbnailUrl,
   type EditorialEnrichmentElementRef,
   type EditorialWorkspaceBlock,
+  type EditorialWorkspaceDiagram,
   type EditorialWorkspaceFigure,
   type EditorialWorkspaceSnapshot,
 } from "../../api/editorialWorkspace";
@@ -14,7 +15,7 @@ import { InlineTextEditor } from "./InlineTextEditor";
 import type { InlineTextEditorProps } from "./InlineTextEditor";
 import {
   INSERTION_OPERATIONS,
-  supportsInsertionAfter,
+  canInsertAfter as canInsertAfterCapability,
 } from "./insertionOperations";
 import { ManualBarChartPreview } from "./ManualBarChartPreview";
 import { manualEditOperationFor } from "./manualEditOperation";
@@ -23,6 +24,7 @@ import { ReorderElements } from "./ReorderElements";
 import { VisualActionBar } from "./VisualActionBar";
 import {
   isVisualElementBlock,
+  visualCapabilityFlags,
   visualElementAnchorId,
   visualElementIdentity,
   visualElementsSharingAnchor,
@@ -180,11 +182,10 @@ function BlockActionBar({
     block.text !== null &&
     onDiscuss,
   );
-  const canInsertAfter = Boolean(
-    !readOnly &&
-    snapshot.capabilities.can_add_enrichment &&
-    supportsInsertionAfter(block),
-  );
+  const canInsertAfter = canInsertAfterCapability(block, {
+    read_only: readOnly,
+    can_add_enrichment: snapshot.capabilities.can_add_enrichment,
+  });
   const canViewSources = Boolean(
     block.evidence_refs.length > 0 && onOpenSources,
   );
@@ -282,6 +283,78 @@ function BlockActionBar({
   );
 }
 
+/**
+ * Readable, non-canonical summary of one diagram. The workshop has no diagram
+ * editor: the operator compares this structure with the proposed structure
+ * diff and corrects the diagram through a typed Bridge proposal.
+ */
+function EditorialDiagramSummary({
+  diagram,
+}: {
+  diagram: EditorialWorkspaceDiagram;
+}) {
+  const labels = new Map(
+    diagram.nodes.map((node) => [node.node_id, node.label]),
+  );
+  return (
+    <section
+      className="editorial-document__chart editorial-document__diagram"
+      aria-label={`Diagramme : ${diagram.title}`}
+    >
+      <h3>{diagram.title}</h3>
+      {diagram.caption ? (
+        <p className="editorial-document__diagram-caption">{diagram.caption}</p>
+      ) : null}
+      {diagram.groups.length > 0 ? (
+        <p className="editorial-document__diagram-groups">
+          Groupes · {diagram.groups.map((group) => group.label).join(" · ")}
+        </p>
+      ) : null}
+      <div className="editorial-document__diagram-structure">
+        <h4>Structure du diagramme</h4>
+        <div>
+          <h5>Nœuds</h5>
+          {diagram.nodes.length === 0 ? (
+            <p>Aucun nœud.</p>
+          ) : (
+            <ul aria-label="Nœuds du diagramme">
+              {diagram.nodes.map((node) => (
+                <li key={node.node_id}>
+                  {node.label}
+                  {node.role ? ` · ${node.role}` : null}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+        <div>
+          <h5>Relations</h5>
+          {diagram.edges.length === 0 ? (
+            <p>Aucune relation.</p>
+          ) : (
+            <ul aria-label="Relations du diagramme">
+              {diagram.edges.map((edge, index) => {
+                const source =
+                  labels.get(edge.source_node_id) ?? edge.source_node_id;
+                const target =
+                  labels.get(edge.target_node_id) ?? edge.target_node_id;
+                return (
+                  <li
+                    key={`${edge.source_node_id}-${edge.target_node_id}-${index}`}
+                  >
+                    {source} → {target}
+                    {edge.label ? ` (${edge.label})` : null}
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function blockContent(
   subjectId: string,
   block: EditorialWorkspaceSnapshot["blocks"][number],
@@ -321,6 +394,9 @@ function blockContent(
         />
       </section>
     );
+  }
+  if (block.kind === "diagram" && block.diagram) {
+    return <EditorialDiagramSummary diagram={block.diagram} />;
   }
   if (block.kind === "table" && block.table) {
     return (
@@ -507,7 +583,6 @@ export function EditorialDocument({
             aria-label={`${BLOCK_KIND_LABELS[block.kind]}${block.text ? ` : ${block.text}` : ""}`}
             aria-keyshortcuts="Enter Space"
             aria-current={selected ? "true" : undefined}
-            aria-disabled={isCurrentMoveAnchor ? "true" : undefined}
             tabIndex={0}
             data-block-id={block.block_id}
             data-selected={selected}
@@ -656,8 +731,10 @@ export function EditorialDocument({
             actionBlockId === block.block_id ? (
               <VisualActionBar
                 block={block}
-                readOnly={readOnly}
-                canDiscuss={snapshot.capabilities.can_discuss}
+                capabilities={{
+                  ...visualCapabilityFlags(snapshot),
+                  read_only: readOnly,
+                }}
                 onEditCaption={onStartCaption}
                 onAskBridge={onAskBridgeVisual}
                 onStartMove={onStartMove}

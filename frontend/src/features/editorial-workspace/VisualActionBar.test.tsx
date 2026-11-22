@@ -2,6 +2,7 @@ import { render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { VisualActionBar } from "./VisualActionBar";
+import type { VisualCapabilityFlags } from "./visualElementOperations";
 import { chartBlock, figureBlock, visualBlock } from "./visualTestFixtures";
 
 function callbacks() {
@@ -17,6 +18,17 @@ function callbacks() {
   };
 }
 
+function capabilities(
+  overrides: Partial<VisualCapabilityFlags> = {},
+): VisualCapabilityFlags {
+  return {
+    read_only: false,
+    manual_edit: true,
+    can_discuss: true,
+    ...overrides,
+  };
+}
+
 describe("VisualActionBar", () => {
   it("renders only the actions the snapshot allows", () => {
     const handlers = callbacks();
@@ -26,8 +38,7 @@ describe("VisualActionBar", () => {
     render(
       <VisualActionBar
         block={block}
-        readOnly={false}
-        canDiscuss
+        capabilities={capabilities()}
         {...handlers}
       />,
     );
@@ -67,8 +78,7 @@ describe("VisualActionBar", () => {
     render(
       <VisualActionBar
         block={block}
-        readOnly={false}
-        canDiscuss
+        capabilities={capabilities()}
         {...handlers}
       />,
     );
@@ -82,6 +92,40 @@ describe("VisualActionBar", () => {
     expect(screen.getByRole("button", { name: "Sources" })).toBeVisible();
   });
 
+  it("hides every manual mutation when manual_edit is false and says why", () => {
+    const handlers = callbacks();
+    const figure = figureBlock({
+      blockId: "figure-block",
+      elementKey: "figure-a",
+      caption: "Figure A",
+      order: 0,
+    });
+    render(
+      <VisualActionBar
+        block={figure}
+        capabilities={capabilities({ manual_edit: false })}
+        {...handlers}
+      />,
+    );
+
+    for (const name of [
+      "Modifier la légende",
+      "Déplacer",
+      "Réorganiser",
+      "Remplacer",
+      "Retirer",
+    ]) {
+      expect(screen.queryByRole("button", { name })).not.toBeInTheDocument();
+    }
+    // Bridge is governed by its own truthful capability.
+    expect(
+      screen.getByRole("button", { name: "Demander à Bridge" }),
+    ).toBeVisible();
+    expect(screen.getByRole("note")).toHaveTextContent(
+      "La préparation des révisions visuelles n’est pas activée pour cet atelier.",
+    );
+  });
+
   it("exposes Remplacer only for an allowed figure and keeps read-only mode honest", () => {
     const handlers = callbacks();
     const figure = figureBlock({
@@ -93,15 +137,18 @@ describe("VisualActionBar", () => {
     const { rerender } = render(
       <VisualActionBar
         block={figure}
-        readOnly={false}
-        canDiscuss
+        capabilities={capabilities()}
         {...handlers}
       />,
     );
     expect(screen.getByRole("button", { name: "Remplacer" })).toBeEnabled();
 
     rerender(
-      <VisualActionBar block={figure} readOnly canDiscuss {...handlers} />,
+      <VisualActionBar
+        block={figure}
+        capabilities={capabilities({ read_only: true })}
+        {...handlers}
+      />,
     );
     expect(
       screen.queryByRole("button", { name: "Modifier la légende" }),
@@ -120,8 +167,7 @@ describe("VisualActionBar", () => {
     render(
       <VisualActionBar
         block={chartBlock()}
-        readOnly={false}
-        canDiscuss={false}
+        capabilities={capabilities({ can_discuss: false })}
         {...callbacks()}
       />,
     );

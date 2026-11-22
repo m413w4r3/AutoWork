@@ -1,4 +1,8 @@
 import { ApiError } from "./editions";
+import {
+  EDITORIAL_REFUSAL_MESSAGES,
+  type EditorialRefusalCode,
+} from "./editorialRefusalCopy";
 import type { EditorialReadOnlyReason } from "./editorialReadOnly";
 
 export type EditorialPublicationKind = "article" | "brief";
@@ -114,7 +118,8 @@ export interface EditorialWorkspaceBarChart {
   value_axis_label: string;
   unit: string;
   points: EditorialWorkspaceBarChartPoint[];
-  anchor_block_id: string;
+  /** Null when the chart sits after the lead, a timeline or at the end. */
+  anchor_block_id: string | null;
 }
 
 export interface EditorialWorkspaceFigure {
@@ -444,7 +449,7 @@ export type EditorialProposalState =
   | "rejected"
   | "stale";
 
-export type EditorialProposalRefusalCode = "revision_not_applicable";
+export type EditorialProposalRefusalCode = EditorialRefusalCode;
 
 export type EditorialProposalOperation =
   | "rewrite_title"
@@ -595,9 +600,7 @@ export interface EditorialVisualRevisionDiagramPatch {
   placement: EditorialVisualRevisionPlacement;
   purpose?: EditorialVisualPurposeInput;
   nodes: EditorialVisualDiagramNodeInput[];
-  edges: Array<
-    EditorialVisualDiagramEdgeInput & { relation_type?: string | null }
-  >;
+  edges: EditorialVisualDiagramEdgeInput[];
   groups: EditorialVisualDiagramGroupInput[];
   group_order?: number | null;
 }
@@ -793,6 +796,13 @@ export type EditorialDiagramNodeRole =
 
 export type EditorialDiagramRelationDirection = "directed" | "undirected";
 
+export type EditorialDiagramRelationType =
+  | "factual"
+  | "inference"
+  | "comparison"
+  | "protocol_factual"
+  | "protocol_inference";
+
 export type EditorialDiagramProfile =
   | "flow"
   | "architecture"
@@ -822,6 +832,8 @@ export interface EditorialVisualDiagramEdgeInput {
   source_node_id: string;
   target_node_id: string;
   label?: string | null;
+  /** Optional; the backend keeps the base relation when omitted (manual route). */
+  relation_type?: EditorialDiagramRelationType | null;
   direction?: EditorialDiagramRelationDirection | null;
   evidence_refs?: EditorialEvidenceReference[];
 }
@@ -957,6 +969,7 @@ const EDITORIAL_THREAD_TRANSPORT_UNCERTAIN_MESSAGE =
   "L’état de votre envoi est incertain. Consultez le fil avant de continuer.";
 
 const ERROR_MESSAGES: Record<string, string> = {
+  ...EDITORIAL_REFUSAL_MESSAGES,
   publication_kind_unresolved:
     "Le type de publication est indéterminé. L’atelier reste en lecture seule.",
   editorial_history_cursor_invalid:
@@ -975,8 +988,6 @@ const ERROR_MESSAGES: Record<string, string> = {
   editorial_block_missing: "Ce bloc n’existe plus dans cette version.",
   editorial_before_hash_mismatch:
     "Ce bloc a changé. Rechargez l’atelier avant de réessayer.",
-  editorial_anchor_stale:
-    "Le paragraphe d’ancrage a changé ou a été supprimé. Actualisez l’atelier, puis choisissez un paragraphe disponible.",
   editorial_registry_conflict:
     "La continuité de ce bloc ne peut pas être prouvée. Une revue est nécessaire.",
   thread_not_found: "Discussion introuvable.",
@@ -992,14 +1003,10 @@ const ERROR_MESSAGES: Record<string, string> = {
   proposal_patch_hash_mismatch:
     "Le contenu vérifié de cette proposition ne correspond plus.",
   proposal_patch_invalid: "Le contenu de cette proposition est invalide.",
-  proposal_base_unavailable:
-    "Le texte de référence de cette proposition est indisponible.",
   proposal_base_hash_mismatch:
     "Le texte de référence ne correspond plus à son empreinte.",
   proposal_state_conflict:
     "La proposition a changé. Actualisez-la avant de décider.",
-  proposal_base_stale:
-    "Cette proposition repose sur une version qui a changé. Elle n’a pas été appliquée. Actualisez le document, puis comparez et formulez une nouvelle proposition.",
   manual_edit_no_change:
     "Le texte n’a pas changé. Aucune nouvelle version n’a été créée.",
   manual_edit_stale:
@@ -1012,49 +1019,10 @@ const ERROR_MESSAGES: Record<string, string> = {
     "Le tableau est incomplet ou incohérent. Vérifiez les intitulés, les cellules et les preuves de chaque ligne.",
   manual_bar_chart_request_invalid:
     "La requête de graphique à barres est invalide. Vérifiez les points, les valeurs et les preuves citées.",
-  bar_chart_insufficient_data:
-    "Aucun graphique quantitatif vérifiable ne peut être créé à partir des preuves actuelles. Un tableau descriptif peut être proposé à la place.",
-  bar_chart_value_not_evidenced:
-    "Aucun graphique quantitatif vérifiable ne peut être créé à partir des preuves actuelles. Un tableau descriptif peut être proposé à la place.",
   manual_table_analytic_question_duplicate:
     "Une question analytique équivalente existe déjà. Modifiez la consigne du tableau avant de proposer une nouvelle insertion.",
-  enrichment_revision_patch_invalid:
-    "La révision visuelle est invalide. Vérifiez les champs, puis réessayez.",
-  enrichment_element_not_found:
-    "Cet élément enrichi n’existe plus dans cette version.",
-  enrichment_element_kind_mismatch:
-    "Le type de cet élément enrichi ne correspond pas à la révision demandée.",
-  enrichment_target_stale:
-    "Cet élément enrichi a changé. Rechargez l’atelier avant de réessayer.",
-  enrichment_placement_changed:
-    "L’emplacement de cet élément a changé. Rechargez l’atelier.",
-  enrichment_caption_invalid:
-    "La légende proposée ne respecte pas les règles de l’atelier.",
-  enrichment_move_anchor_invalid: "Le paragraphe de destination est invalide.",
-  enrichment_order_invalid:
-    "L’ordre demandé ne correspond pas aux éléments de ce paragraphe.",
-  enrichment_order_group_unsupported:
-    "Ce groupe d’éléments ne peut pas être réordonné.",
-  enrichment_revision_no_change:
-    "La révision ne modifie rien. Aucune nouvelle version n’a été créée.",
-  enrichment_revision_unsupported_operation:
-    "Cette opération de révision visuelle n’est pas encore disponible.",
-  editorial_caption_text_violation:
-    "La légende contient un format ou un balisage non autorisé.",
-  editorial_figure_not_changed:
-    "La figure sélectionnée est déjà celle de cet élément.",
-  editorial_figure_not_eligible:
-    "Cette figure archivée ne peut pas être intégrée.",
-  editorial_figure_not_found:
-    "Cette figure n’est plus disponible dans l’inventaire.",
-  brief_figure_limit_exceeded:
-    "Une brève ne peut contenir plus de trois figures intégrées.",
-  source_figure_inventory_limit_exceeded:
-    "Le nombre de figures dépasse la limite de l’inventaire archivé.",
   manual_edit_request_too_large:
     "Le tableau dépasse la taille autorisée. Réduisez son contenu avant de réessayer.",
-  proposal_operation_unsupported:
-    "Cette insertion n’est pas autorisée pour le paragraphe sélectionné. Actualisez l’atelier.",
   proposal_target_mismatch:
     "La cible de cette insertion a changé. Actualisez l’atelier et recommencez.",
   manual_edit_request_invalid: "La requête de modification est invalide.",
@@ -1309,6 +1277,7 @@ export function acceptEditorialProposal(
   occurrenceId: string,
   proposalId: string,
   decision: { expected_state_version: number; patch_sha256: string },
+  idempotencyKey: string = crypto.randomUUID(),
 ): Promise<EditorialProposalAcceptResult> {
   return request<EditorialProposalAcceptResult>(
     `/api/subjects/${encodeURIComponent(subjectId)}/editor/threads/${encodeURIComponent(occurrenceId)}/proposals/${encodeURIComponent(proposalId)}/accept`,
@@ -1316,7 +1285,7 @@ export function acceptEditorialProposal(
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Idempotency-Key": crypto.randomUUID(),
+        "Idempotency-Key": idempotencyKey,
       },
       body: JSON.stringify(decision),
     },

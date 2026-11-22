@@ -143,7 +143,7 @@ describe("useManualVisualRevision", () => {
     const outcome = await result.current.mutateAsync(revisionInput);
 
     expect(outcome.proposal.id).toBe(proposal.id);
-    expect(outcome.acceptance.artifact_version).toBe(2);
+    expect(outcome.acceptance?.artifact_version).toBe(2);
     expect(calls.map((call) => call.method)).toEqual(["POST", "POST"]);
     expect(calls[0]?.url).toBe(
       `/api/subjects/${VISUAL_SUBJECT_ID}/editor/blocks/${CHART_BLOCK_ID}/enrichment-revisions`,
@@ -159,7 +159,63 @@ describe("useManualVisualRevision", () => {
     });
   });
 
-  it("reuses the same prepare key after an acceptance failure", async () => {
+  it("treats an already accepted proposal as success after a lost accept response", async () => {
+    installFetch(() => jsonResponse({ ...proposal, state: "accepted" }));
+    const { result } = renderHook(
+      () => useManualVisualRevision(VISUAL_SUBJECT_ID),
+      { wrapper },
+    );
+
+    const outcome = await result.current.mutateAsync(revisionInput);
+
+    expect(outcome.proposal.state).toBe("accepted");
+    expect(outcome.acceptance).toBeNull();
+    expect(calls.map((call) => call.method)).toEqual(["POST"]);
+    expect(calls[0]?.url).toContain("/enrichment-revisions");
+  });
+
+  it("reconciles a state conflict by re-reading an accepted proposal", async () => {
+    installFetch((call) => {
+      if (call.url.endsWith("/accept")) {
+        return jsonResponse(
+          {
+            detail: {
+              code: "proposal_state_conflict",
+              message:
+                "La proposition a changé. Actualisez-la avant de décider.",
+            },
+          },
+          409,
+        );
+      }
+      if (call.method === "GET" && call.url.includes("/proposals/")) {
+        return jsonResponse({
+          ...proposal,
+          state: "accepted",
+          state_version: 2,
+        });
+      }
+      return jsonResponse(proposal);
+    });
+    const { result } = renderHook(
+      () => useManualVisualRevision(VISUAL_SUBJECT_ID),
+      { wrapper },
+    );
+
+    const outcome = await result.current.mutateAsync(revisionInput);
+
+    expect(outcome.proposal.state).toBe("accepted");
+    expect(outcome.acceptance).toBeNull();
+    expect(calls.map((call) => call.method)).toEqual(["POST", "POST", "GET"]);
+    // The accept decision keeps a stable idempotency key.
+    const acceptCalls = calls.filter((call) => call.url.endsWith("/accept"));
+    expect(acceptCalls).toHaveLength(1);
+    expect(acceptCalls[0]?.headers["idempotency-key"]).toMatch(
+      /^[0-9a-f-]{36}$/,
+    );
+  });
+
+  it("reuses the same prepare and accept keys after an acceptance failure", async () => {
     installFetch((call) => {
       if (call.url.endsWith("/accept")) {
         return jsonResponse(
@@ -184,6 +240,11 @@ describe("useManualVisualRevision", () => {
     expect(prepareCalls).toHaveLength(2);
     expect(prepareCalls[0]?.headers["idempotency-key"]).toBe(
       prepareCalls[1]?.headers["idempotency-key"],
+    );
+    const acceptCalls = calls.filter((call) => call.url.endsWith("/accept"));
+    expect(acceptCalls).toHaveLength(2);
+    expect(acceptCalls[0]?.headers["idempotency-key"]).toBe(
+      acceptCalls[1]?.headers["idempotency-key"],
     );
   });
 });

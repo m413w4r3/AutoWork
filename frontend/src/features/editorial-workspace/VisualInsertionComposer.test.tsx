@@ -684,4 +684,31 @@ describe("VisualInsertionComposer", () => {
       screen.queryByRole("region", { name: "Intégrer des images sources" }),
     ).not.toBeInTheDocument();
   });
+
+  it("renders no insertion control when can_add_enrichment is false", () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <VisualInsertionComposer
+          subjectId="subject-1"
+          snapshot={{
+            ...snapshot,
+            capabilities: {
+              ...snapshot.capabilities,
+              can_add_enrichment: false,
+            },
+          }}
+          block={anchor}
+          readOnly={false}
+        />
+      </QueryClientProvider>,
+    );
+
+    expect(
+      screen.queryByRole("button", { name: "Ajouter après" }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
 });

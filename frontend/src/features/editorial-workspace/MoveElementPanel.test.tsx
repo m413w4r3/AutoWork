@@ -50,6 +50,7 @@ function renderPanel(
     <MoveElementPanel
       snapshot={snapshot}
       element={chartBlock()}
+      readOnly={false}
       draftAnchorId={overrides.draftAnchorId ?? null}
       saving={false}
       error={null}
@@ -96,5 +97,36 @@ describe("MoveElementPanel", () => {
       screen.getByRole("button", { name: "Enregistrer l’emplacement" }),
     );
     expect(onConfirm).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders no anchor control when manual_edit is false", () => {
+    const mutable = visualSnapshot({
+      blocks: [heading, paragraphOne, paragraphTwo, chartBlock()],
+    });
+    render(
+      <MoveElementPanel
+        snapshot={{
+          ...mutable,
+          capabilities: { ...mutable.capabilities, manual_edit: false },
+        }}
+        element={chartBlock()}
+        readOnly={false}
+        draftAnchorId={null}
+        saving={false}
+        error={null}
+        onChooseAnchor={vi.fn()}
+        onConfirm={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    );
+    expect(
+      screen.queryByRole("radio", { name: /Paragraphe un/ }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Enregistrer l’emplacement" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("note")).toHaveTextContent(
+      "La préparation des révisions visuelles n’est pas activée pour cet atelier.",
+    );
   });
 });

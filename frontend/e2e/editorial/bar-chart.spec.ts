@@ -38,7 +38,7 @@ const proposalPath = `${threadPath}/proposals/${proposalId}`;
 const chartProposalPath = `/api/subjects/${subjectId}/editor/blocks/${anchorId}/bar-chart-proposals`;
 const acceptPath = `${proposalPath}/accept`;
 const insufficientDataMessage =
-  "Aucun graphique quantitatif vérifiable ne peut être créé à partir des preuves actuelles. Un tableau descriptif peut être proposé à la place.";
+  "Les preuves admises ne contiennent pas assez de données quantitatives pour construire un graphique. Un tableau descriptif peut être proposé.";
 
 function createSnapshot(withChart: boolean): EditorialWorkspaceSnapshot {
   const paragraphs = paragraphIds.map((blockId, index) => ({

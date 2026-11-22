@@ -158,11 +158,33 @@ describe("VisualProposalDiff", () => {
             direction: "left_to_right",
             placement: { kind: "after_paragraph", section_index: null },
             nodes: [
-              { node_id: "n1", label: "Nœud 1 corrigé" },
+              {
+                node_id: "n1",
+                label: "Nœud 1 corrigé",
+                evidence_refs: [
+                  {
+                    source_document_id: "source-1",
+                    kind: "fact",
+                    evidence_key: "fact-1",
+                  },
+                ],
+              },
               { node_id: "n3", label: "Nœud 3" },
             ],
             edges: [
-              { source_node_id: "n1", target_node_id: "n3", label: "appelle" },
+              {
+                source_node_id: "n1",
+                target_node_id: "n3",
+                label: "appelle",
+                relation_type: "factual",
+                evidence_refs: [
+                  {
+                    source_document_id: "source-1",
+                    kind: "fact",
+                    evidence_key: "fact-1",
+                  },
+                ],
+              },
             ],
             groups: [],
           },
@@ -182,6 +204,8 @@ describe("VisualProposalDiff", () => {
     expect(screen.getByText("Nœud 2")).toBeVisible();
     expect(screen.getAllByText("Ajouté").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Retiré").length).toBeGreaterThan(0);
+    expect(screen.getByText("Preuves du diagramme")).toBeVisible();
+    expect(screen.getByText("fact-1")).toBeInTheDocument();
   });
 
   it("shows current and proposed anchors for a move and flags an unknown anchor", () => {

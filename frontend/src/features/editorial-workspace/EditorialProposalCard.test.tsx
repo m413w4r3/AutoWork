@@ -317,6 +317,62 @@ describe("EditorialProposalCard", () => {
     ).toBeNull();
   });
 
+  it("shows the precise no-proof refusal instead of generic copy", async () => {
+    const proposal = {
+      id: "proposal-unproven-chart",
+      subject_id: "subject-1",
+      production_run_id: "run-1",
+      occurrence_id: "occurrence-1",
+      thread_id: "thread-1",
+      state: "refused",
+      state_version: 1,
+      operation: "rewrite_chart",
+      base_artifact_id: "artifact-1",
+      base_artifact_version: 4,
+      base_canonical_sha256: "a".repeat(64),
+      base_text: null,
+      patch_sha256: null,
+      patch: null,
+      diagnostics: { code: "bar_chart_value_not_evidenced" },
+      created_at: "2026-11-19T12:00:00Z",
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          new Response(JSON.stringify(proposal), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+        ),
+      ),
+    );
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    render(
+      <QueryClientProvider client={client}>
+        <EditorialProposalCard
+          subjectId="subject-1"
+          occurrenceId="occurrence-1"
+          proposalId="proposal-unproven-chart"
+        />
+      </QueryClientProvider>,
+    );
+
+    expect(
+      await screen.findByText(
+        "Une valeur du graphique n’est pas étayée par un enregistrement de preuve admis. Aucun graphique quantitatif ne peut être proposé.",
+      ),
+    ).toBeVisible();
+    expect(
+      screen.queryByText(
+        "Le Bridge n’a pas produit de proposition exploitable.",
+      ),
+    ).toBeNull();
+  });
+
   it("rejects a proposal with its state version and patch hash", async () => {
     const proposal = {
       id: "proposal-reject",

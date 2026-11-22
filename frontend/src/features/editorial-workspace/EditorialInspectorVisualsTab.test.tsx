@@ -161,7 +161,7 @@ const snapshot: EditorialWorkspaceSnapshot = {
   capabilities: {
     can_discuss: false,
     can_preview_revision: false,
-    manual_edit: false,
+    manual_edit: true,
     can_add_enrichment: true,
     can_preview_pdf: false,
     can_regenerate_pdf: false,
@@ -243,6 +243,7 @@ function renderVisualsTab(
     onRequestCaption?: (elementKey: string) => void;
     onRequestMove?: (elementKey: string) => void;
     onRefresh?: () => void;
+    snapshot?: EditorialWorkspaceSnapshot;
   } = {},
 ) {
   const client = new QueryClient({
@@ -253,7 +254,7 @@ function renderVisualsTab(
     <QueryClientProvider client={client}>
       <EditorialInspector
         subjectId={SUBJECT_ID}
-        snapshot={snapshot}
+        snapshot={overrides.snapshot ?? snapshot}
         block={snapshot.blocks[0] ?? null}
         sectionTitle="Contexte"
         readOnly={false}
@@ -475,6 +476,32 @@ describe("EditorialInspector Visuels tab", () => {
     expect(within(panel).getByText(/Emplacement prévu :/)).toBeVisible();
     await user.click(within(panel).getByRole("button", { name: "Annuler" }));
     expect(cancelMove).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders no manual visual action when the snapshot reports manual_edit=false", () => {
+    renderVisualsTab({
+      snapshot: {
+        ...snapshot,
+        capabilities: { ...snapshot.capabilities, manual_edit: false },
+      },
+    });
+
+    // The visuals stay listed and selectable, but every manual mutation is
+    // absent instead of rendered as a dead control.
+    expect(
+      screen.getByRole("list", { name: "Éléments visuels du document" }),
+    ).toBeVisible();
+    for (const name of [
+      "Remplacer",
+      "Retirer",
+      "Modifier la légende",
+      "Déplacer",
+    ]) {
+      expect(screen.queryByRole("button", { name })).not.toBeInTheDocument();
+    }
+    expect(screen.getByRole("note")).toHaveTextContent(
+      "La préparation des révisions visuelles n’est pas activée pour cet atelier.",
+    );
   });
 
   it("opens the archived image gallery and seeds the insertion from the selection", async () => {

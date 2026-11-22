@@ -2828,6 +2828,60 @@ main:has(> .editorial-route-state) > .app-header {
   padding-top: 0.25rem;
 }
 
+/* Readable, non-canonical diagram summary: the workshop renders the structure
+   (title, caption, nodes, relations) instead of an opaque placeholder. */
+.editorial-document__diagram {
+  display: grid;
+  gap: 0.55rem;
+  padding: 0.75rem;
+  border: 1px solid var(--editorial-divider);
+  border-radius: 0.45rem;
+  background: var(--editorial-panel);
+}
+
+.editorial-document__diagram h3 {
+  margin: 0;
+  font-family: Georgia, serif;
+  font-size: 1.1rem;
+}
+
+.editorial-document__diagram-caption,
+.editorial-document__diagram-groups {
+  margin: 0;
+  color: var(--editorial-muted);
+  font-size: 0.88rem;
+}
+
+.editorial-document__diagram-structure {
+  display: grid;
+  gap: 0.5rem;
+  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+  min-width: 0;
+}
+
+.editorial-document__diagram-structure h4 {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: 0.9rem;
+}
+
+.editorial-document__diagram-structure h5 {
+  margin: 0 0 0.25rem;
+  color: var(--editorial-muted);
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.editorial-document__diagram-structure ul {
+  display: grid;
+  gap: 0.25rem;
+  margin: 0;
+  padding-left: 1.2rem;
+  overflow-wrap: anywhere;
+  font-size: 0.88rem;
+}
+
 .editorial-proposal-card__chart-comparison {
   display: grid;
   gap: 0.55rem;
@@ -3197,6 +3251,42 @@ main:has(> .editorial-route-state) > .app-header {
   .editorial-inspector-tab {
     padding: 0.35rem 0.3rem;
     font-size: 0.74rem;
+  }
+}
+
+/* At >=1440 px the lateral inspector column is narrower than the 1024–1439
+   layout, so the five full labels cannot share one row. A deliberate 3+2 grid
+   keeps every label complete and never leaves « Historique » alone. */
+@media (min-width: 1440px) {
+  .editorial-inspector-tabs {
+    display: grid;
+    grid-template-columns: repeat(3, max-content);
+    justify-content: start;
+  }
+}
+
+/* The first tab keeps its full contract name « Discussion Bridge » for assistive
+   technology at every width. Below 1280 px the visual label is abbreviated so
+   the five tabs stay on one row without an orphan « Historique ». */
+.editorial-inspector-tab__compact {
+  display: none;
+}
+
+@media (max-width: 1279px) {
+  .editorial-inspector-tab__label {
+    position: absolute;
+    overflow: hidden;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    border: 0;
+    margin: -1px;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+  }
+
+  .editorial-inspector-tab__compact {
+    display: inline;
   }
 }
 

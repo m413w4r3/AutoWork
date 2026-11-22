@@ -67,17 +67,31 @@ interface DiagramSummary {
   direction: string;
   nodes: { id: string; label: string }[];
   edges: { id: string; label: string }[];
+  evidenceRefs: EditorialEvidenceReference[];
 }
 
 function diagramSummary(
   diagram: EditorialVisualRevisionDiagramPatch,
 ): DiagramSummary {
   const nodeLabels = new Map<string, string>();
+  const evidenceRefs = new Map<string, EditorialEvidenceReference>();
+  const collectEvidence = (
+    references: EditorialEvidenceReference[] | undefined,
+  ) => {
+    for (const reference of references ?? []) {
+      evidenceRefs.set(
+        `${reference.source_document_id}:${reference.kind}:${reference.evidence_key}`,
+        reference,
+      );
+    }
+  };
   const nodes = diagram.nodes.map((node) => {
     nodeLabels.set(node.node_id, node.label);
+    collectEvidence(node.evidence_refs);
     return { id: node.node_id, label: node.label };
   });
   const edges = diagram.edges.map((edge) => {
+    collectEvidence(edge.evidence_refs);
     const sourceLabel =
       nodeLabels.get(edge.source_node_id) ?? edge.source_node_id;
     const targetLabel =
@@ -94,6 +108,7 @@ function diagramSummary(
     direction: diagram.direction,
     nodes,
     edges,
+    evidenceRefs: [...evidenceRefs.values()],
   };
 }
 
@@ -348,6 +363,23 @@ function DiagramProposalComparison({
         }
         proposed={new Map(diagram.edges.map((edge) => [edge.id, edge.label]))}
       />
+      {diagram.evidenceRefs.length > 0 ? (
+        <details className="visual-proposal-diff__evidence">
+          <summary>Preuves du diagramme</summary>
+          <ul>
+            {diagram.evidenceRefs.map((reference) => (
+              <li
+                key={`${reference.source_document_id}-${reference.kind}-${reference.evidence_key}`}
+              >
+                <span>
+                  Source {reference.source_document_id} · {reference.kind}
+                </span>
+                <code>{reference.evidence_key}</code>
+              </li>
+            ))}
+          </ul>
+        </details>
+      ) : null}
     </section>
   );
 }

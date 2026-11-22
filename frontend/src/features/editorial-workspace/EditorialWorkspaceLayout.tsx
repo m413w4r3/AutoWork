@@ -143,6 +143,9 @@ export function EditorialWorkspaceLayout({
     snapshot.capabilities.read_only_reason ??
     (snapshot.publication_kind === null ? "publication_kind_unknown" : null);
   const readOnly = readOnlyReason !== null;
+  // Manual visual revisions prepare and adopt typed proposals: they are only
+  // available when the snapshot truthfully reports the manual proposal path.
+  const visualWritable = !readOnly && snapshot.capabilities.manual_edit;
   const stale = snapshot.blocks.some(
     (block) => block.revision_status === "stale",
   );
@@ -195,6 +198,15 @@ export function EditorialWorkspaceLayout({
   const announceVisual = (text: string) => {
     setVisualAnnouncement({ key: crypto.randomUUID(), text });
   };
+
+  // A replayed (already accepted) revision has no new adoption result; the
+  // announcement stays truthful instead of inventing a version number.
+  const revisionSuffix = (result: {
+    acceptance: { artifact_version: number } | null;
+  }): string =>
+    result.acceptance
+      ? ` · v${result.acceptance.artifact_version}`
+      : " · modification déjà appliquée";
 
   const visualFailureMessage = (error: unknown, fallback: string) =>
     error instanceof Error ? error.message : fallback;
@@ -250,7 +262,7 @@ export function EditorialWorkspaceLayout({
   }, [onSelectBlock, ordered, selectionRestoreTick]);
 
   const startCaptionEditing = (blockId: string) => {
-    if (readOnly) return;
+    if (!visualWritable) return;
     captionOpenerRef.current =
       document.activeElement instanceof HTMLElement
         ? document.activeElement
@@ -308,9 +320,7 @@ export function EditorialWorkspaceLayout({
         },
       });
       closeCaptionEditing(block.block_id);
-      announceVisual(
-        `Légende enregistrée · v${result.acceptance.artifact_version}`,
-      );
+      announceVisual(`Légende enregistrée${revisionSuffix(result)}`);
     } catch (error) {
       pendingElementSelectionRef.current = null;
       throw error;
@@ -321,7 +331,7 @@ export function EditorialWorkspaceLayout({
     blockId: string,
     focus: "document" | "inspector" = "document",
   ) => {
-    if (readOnly) return;
+    if (!visualWritable) return;
     const block = ordered.find((candidate) => candidate.block_id === blockId);
     if (!block || !visualElementIdentity(block)) return;
     moveOpenerRef.current =
@@ -429,9 +439,7 @@ export function EditorialWorkspaceLayout({
         },
       });
       setMoveState(null);
-      announceVisual(
-        `Emplacement enregistré · v${result.acceptance.artifact_version}`,
-      );
+      announceVisual(`Emplacement enregistré${revisionSuffix(result)}`);
       window.requestAnimationFrame(() => {
         if (document.activeElement !== document.body) return;
         document
@@ -454,7 +462,7 @@ export function EditorialWorkspaceLayout({
   };
 
   const startReorder = (blockId: string) => {
-    if (readOnly) return;
+    if (!visualWritable) return;
     const block = ordered.find((candidate) => candidate.block_id === blockId);
     if (!block || !visualElementIdentity(block)) return;
     selectBlock(blockId);
@@ -491,9 +499,7 @@ export function EditorialWorkspaceLayout({
         },
       });
       setReorderBlockId(null);
-      announceVisual(
-        `Ordre enregistré · v${result.acceptance.artifact_version}`,
-      );
+      announceVisual(`Ordre enregistré${revisionSuffix(result)}`);
     } catch (error) {
       pendingElementSelectionRef.current = null;
       setVisualError(
@@ -503,7 +509,7 @@ export function EditorialWorkspaceLayout({
   };
 
   const requestRemove = (blockId: string) => {
-    if (readOnly) return;
+    if (!visualWritable) return;
     selectBlock(blockId);
     setRemoveError(null);
     setRemoveBlockId(blockId);
@@ -531,7 +537,7 @@ export function EditorialWorkspaceLayout({
       });
       setRemoveBlockId(null);
       announceVisual(
-        `Visuel retiré du document · v${result.acceptance.artifact_version}. Il reste dans les sources archivées et dans l’historique.`,
+        `Visuel retiré du document${revisionSuffix(result)}. Il reste dans les sources archivées et dans l’historique.`,
       );
     } catch (error) {
       setRemoveError(
@@ -541,7 +547,7 @@ export function EditorialWorkspaceLayout({
   };
 
   const requestReplace = (blockId: string) => {
-    if (readOnly) return;
+    if (!visualWritable) return;
     const block = ordered.find((candidate) => candidate.block_id === blockId);
     const identity = block ? visualElementIdentity(block) : null;
     if (!identity) return;

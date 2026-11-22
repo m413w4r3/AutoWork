@@ -2,6 +2,7 @@ import { useMutation } from "@tanstack/react-query";
 import { useRef, useState } from "react";
 
 import { ApiError } from "../../api/editions";
+import { editorialRefusalMessage } from "../../api/editorialRefusalCopy";
 import {
   createManualEditorialSourceFigureProposal,
   type EditorialFigureCatalogItem,
@@ -65,7 +66,10 @@ function figureError(error: Error): { message: string; refresh: boolean } {
   return {
     message:
       FIGURE_ERROR_MESSAGES[error.code] ??
-      "Les images n’ont pas pu être intégrées. Vérifiez la sélection et réessayez.",
+      editorialRefusalMessage(
+        error.code,
+        "Les images n’ont pas pu être intégrées. Vérifiez la sélection et réessayez.",
+      ),
     refresh: error.status === 409,
   };
 }

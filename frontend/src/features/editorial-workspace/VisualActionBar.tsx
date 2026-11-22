@@ -1,18 +1,14 @@
 import type { EditorialWorkspaceBlock } from "../../api/editorialWorkspace";
 import {
-  canEditVisualCaption,
-  canMoveVisualElement,
-  canRemoveVisualElement,
-  canReorderVisualElements,
-  canReplaceVisualElement,
-  canRequestVisualBridgeCorrection,
   visualElementTitle,
+  visualMutationUnavailableReason,
+  visualOperationAvailability,
+  type VisualCapabilityFlags,
 } from "./visualElementOperations";
 
 interface VisualActionBarProps {
   block: EditorialWorkspaceBlock;
-  readOnly: boolean;
-  canDiscuss: boolean;
+  capabilities: VisualCapabilityFlags;
   onEditCaption?: (blockId: string) => void;
   onAskBridge?: (blockId: string) => void;
   onStartMove?: (blockId: string) => void;
@@ -25,13 +21,13 @@ interface VisualActionBarProps {
 
 /**
  * Stable action bar of one selected visual element. Every rendered button maps
- * to an operation the server snapshot actually allows; unavailable actions are
- * absent rather than dead.
+ * to an operation the server snapshot allows *and* to a truthful capability:
+ * manual mutations need `manual_edit`, Bridge entries need `can_discuss`, and
+ * an unwired proposal path never renders a dead control.
  */
 export function VisualActionBar({
   block,
-  readOnly,
-  canDiscuss,
+  capabilities,
   onEditCaption,
   onAskBridge,
   onStartMove,
@@ -42,20 +38,15 @@ export function VisualActionBar({
   onOpenHistory,
 }: VisualActionBarProps) {
   const title = visualElementTitle(block);
-  const canCaption = !readOnly && canEditVisualCaption(block) && onEditCaption;
-  const canBridge =
-    !readOnly &&
-    canDiscuss &&
-    canRequestVisualBridgeCorrection(block) &&
-    onAskBridge;
-  const canMove = !readOnly && canMoveVisualElement(block) && onStartMove;
-  const canReorder =
-    !readOnly && canReorderVisualElements(block) && onStartReorder;
-  const canReplace =
-    !readOnly && canReplaceVisualElement(block) && onRequestReplace;
-  const canRemove =
-    !readOnly && canRemoveVisualElement(block) && onRequestRemove;
+  const availability = visualOperationAvailability(block, capabilities);
+  const canCaption = availability.caption && onEditCaption;
+  const canBridge = availability.bridge && onAskBridge;
+  const canMove = availability.move && onStartMove;
+  const canReorder = availability.reorder && onStartReorder;
+  const canReplace = availability.replace && onRequestReplace;
+  const canRemove = availability.remove && onRequestRemove;
   const canViewSources = block.evidence_refs.length > 0 && onOpenSources;
+  const mutationReason = visualMutationUnavailableReason(capabilities);
 
   if (
     !canCaption &&
@@ -67,7 +58,19 @@ export function VisualActionBar({
     !canViewSources &&
     !onOpenHistory
   ) {
-    return null;
+    return mutationReason || capabilities.read_only ? (
+      <div
+        className="editorial-block-actions editorial-block-actions--block visual-action-bar"
+        role="toolbar"
+        aria-label={`Actions du visuel : ${title}`}
+        data-element-kind={block.element_kind ?? undefined}
+        data-element-key={block.element_key ?? undefined}
+      >
+        <p className="visual-action-bar__readonly" role="note">
+          {mutationReason}
+        </p>
+      </div>
+    ) : null;
   }
 
   return (
@@ -151,9 +154,9 @@ export function VisualActionBar({
           Historique
         </button>
       ) : null}
-      {readOnly ? (
+      {mutationReason ? (
         <p className="visual-action-bar__readonly" role="note">
-          Lecture seule : les révisions de ce visuel sont indisponibles.
+          {mutationReason}
         </p>
       ) : null}
     </div>

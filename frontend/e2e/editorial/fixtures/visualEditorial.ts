@@ -93,6 +93,8 @@ export class VisualEditorialFixture {
   removed = new Set<ElementKey>();
   readOnly = false;
   canDiscuss = true;
+  /** Truthful manual proposal path capability (`manual_edit`). */
+  manualEdit = true;
 
   paragraphBlockId(index: number): string {
     return `paragraph-${index}-v${this.version}`;
@@ -303,7 +305,7 @@ export class VisualEditorialFixture {
       capabilities: {
         can_discuss: this.canDiscuss,
         can_preview_revision: false,
-        manual_edit: !this.readOnly,
+        manual_edit: !this.readOnly && this.manualEdit,
         can_add_enrichment: false,
         can_preview_pdf: false,
         can_regenerate_pdf: false,
@@ -483,6 +485,12 @@ export interface VisualApiCapture {
   bridgeEntries: number;
 }
 
+function proposalElementKey(
+  patch: EditorialVisualRevisionPatch,
+): string | null {
+  return "element_key" in patch ? patch.element_key : null;
+}
+
 function proposalView(
   record: VisualProposalRecord,
   occurrenceId: string,
@@ -608,6 +616,77 @@ export function chartCorrectionProposal(): VisualProposalRecord {
   };
 }
 
+export function diagramCorrectionProposal(): VisualProposalRecord {
+  return {
+    id: "proposal-diagram-correction",
+    patch: {
+      kind: "revise_diagram",
+      element_key: DIAGRAM_KEY,
+      diagram: {
+        key: DIAGRAM_KEY,
+        kind: "network_flow",
+        title: "Diagramme de synthèse",
+        caption: "Légende corrigée du diagramme",
+        direction: "left_to_right",
+        profile: null,
+        placement: {
+          kind: "after_paragraph",
+          section_index: null,
+          anchor_block_id: "paragraph-5-v0",
+        },
+        purpose: {
+          question: "Quel chemin suit l’activité observée ?",
+          available_data: "Deux nœuds reliés par une relation étayée.",
+          comprehension_gain: "Rend la chaîne d’activité lisible.",
+          scope: "Périmètre synthétique du diagramme.",
+          evidence_refs: [],
+          knowledge_limits: "Limites synthétiques connues.",
+          placement_reason: "Après le paragraphe cinq.",
+        },
+        nodes: [
+          {
+            node_id: "n1",
+            label: "Nœud corrigé après revue",
+            role: "actor",
+            evidence_refs: [
+              {
+                source_document_id: "source-1",
+                kind: "fact",
+                evidence_key: "fact-1",
+              },
+            ],
+          },
+          {
+            node_id: "n2",
+            label: "Nœud final",
+            role: "unknown",
+            evidence_refs: [],
+          },
+        ],
+        edges: [
+          {
+            source_node_id: "n1",
+            target_node_id: "n2",
+            label: "contacte",
+            relation_type: "factual",
+            direction: "directed",
+            evidence_refs: [
+              {
+                source_document_id: "source-1",
+                kind: "fact",
+                evidence_key: "fact-1",
+              },
+            ],
+          },
+        ],
+        groups: [],
+      },
+    },
+    state: "proposed",
+    stateVersion: 1,
+  };
+}
+
 export async function installVisualEditorialStubs(
   page: Page,
   fixture: VisualEditorialFixture,
@@ -637,7 +716,14 @@ export async function installVisualEditorialStubs(
       canonical_sha256: VISUAL_CANONICAL_SHA,
     };
     const threadProposal = options.threadProposal;
-    if (threadProposal && occurrenceId.includes(`chart-${CHART_KEY}`)) {
+    const threadElementKey = threadProposal
+      ? proposalElementKey(threadProposal.patch)
+      : null;
+    if (
+      threadProposal &&
+      threadElementKey &&
+      occurrenceId.includes(threadElementKey)
+    ) {
       return {
         kind: "open",
         thread_id: VISUAL_THREAD_ID,

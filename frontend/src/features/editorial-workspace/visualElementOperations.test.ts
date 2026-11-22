@@ -19,6 +19,8 @@ import {
   visualElementRefs,
   visualElementsSharingAnchor,
   visualElementTitle,
+  visualMutationUnavailableReason,
+  visualOperationAvailability,
   visualRemoveOperation,
 } from "./visualElementOperations";
 
@@ -174,11 +176,80 @@ describe("visualElementOperations", () => {
     expect(canRequestVisualBridgeCorrection(readOnly)).toBe(false);
   });
 
+  it("requires the truthful capabilities in addition to allowed_operations", () => {
+    const capabilities = {
+      read_only: false,
+      manual_edit: true,
+      can_discuss: true,
+    };
+    expect(visualOperationAvailability(chart, capabilities)).toEqual({
+      caption: true,
+      move: true,
+      reorder: true,
+      replace: false,
+      remove: true,
+      bridge: true,
+    });
+
+    expect(
+      visualOperationAvailability(chart, {
+        ...capabilities,
+        manual_edit: false,
+      }),
+    ).toEqual({
+      caption: false,
+      move: false,
+      reorder: false,
+      replace: false,
+      remove: false,
+      bridge: true,
+    });
+
+    expect(
+      visualOperationAvailability(chart, {
+        ...capabilities,
+        can_discuss: false,
+      }).bridge,
+    ).toBe(false);
+
+    expect(
+      visualOperationAvailability(chart, {
+        ...capabilities,
+        read_only: true,
+      }),
+    ).toEqual({
+      caption: false,
+      move: false,
+      reorder: false,
+      replace: false,
+      remove: false,
+      bridge: false,
+    });
+
+    expect(visualMutationUnavailableReason(capabilities)).toBeNull();
+    expect(
+      visualMutationUnavailableReason({
+        read_only: false,
+        manual_edit: false,
+      }),
+    ).toContain("n’est pas activée");
+    expect(
+      visualMutationUnavailableReason({ read_only: true, manual_edit: false }),
+    ).toContain("Lecture seule");
+  });
+
   it("reads the anchor from the typed projection and a readable title", () => {
     expect(visualElementAnchorId(chart)).toBe("anchor-1");
     expect(visualElementAnchorId(figureA)).toBe("anchor-1");
     expect(visualElementTitle(chart)).toBe("Synthetic chart");
     expect(visualElementTitle(figureA)).toBe("Figure A");
+
+    // `after_lead`/`end` charts truthfully expose no paragraph anchor.
+    const leadChart: EditorialWorkspaceBlock = {
+      ...chart,
+      chart: chart.chart ? { ...chart.chart, anchor_block_id: null } : null,
+    };
+    expect(visualElementAnchorId(leadChart)).toBeNull();
   });
 
   it("lists only ready elements sharing the anchor in canonical order", () => {

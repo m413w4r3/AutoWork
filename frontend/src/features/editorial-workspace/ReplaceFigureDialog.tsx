@@ -3,13 +3,11 @@ import { useEffect, useId, useRef, useState } from "react";
 
 import { ApiError } from "../../api/editions";
 import {
-  acceptEditorialProposal,
   editorialFigureThumbnailUrl,
-  prepareEnrichmentRevision,
   type EditorialFigureCatalogItem,
-  type EditorialVisualRevisionProposalRead,
 } from "../../api/editorialWorkspace";
 import { editorialWorkspaceQueryKeys } from "./editorialWorkspaceQueries";
+import { prepareAndAcceptVisualRevision } from "./manualVisualRevision";
 import { SourceFigureGallery } from "./SourceFigureGallery";
 import {
   briefFigureCapacityNote,
@@ -18,6 +16,10 @@ import {
   type ReplaceFigureDialogProps,
   type ReplaceFigureErrorInfo,
 } from "./replaceFigureContract";
+import {
+  visualCapabilityFlags,
+  visualMutationUnavailableReason,
+} from "./visualElementOperations";
 
 const ARCHIVE_UNTOUCHED_MESSAGE =
   "L’archive d’origine n’est pas modifiée : la figure remplacée reste conservée dans l’inventaire.";
@@ -63,9 +65,11 @@ export function ReplaceFigureDialog({
   const openerRef = useRef<HTMLElement | null>(null);
   const headingId = useId();
   const captionId = useId();
-  const idempotencyRef = useRef<{ key: string; signature: string } | null>(
-    null,
-  );
+  const idempotencyRef = useRef<{
+    key: string;
+    acceptKey: string;
+    signature: string;
+  } | null>(null);
   const [selected, setSelected] = useState<EditorialFigureCatalogItem | null>(
     null,
   );
@@ -140,27 +144,23 @@ export function ReplaceFigureDialog({
       const signature = JSON.stringify(revision);
       let request = idempotencyRef.current;
       if (!request || request.signature !== signature) {
-        request = { key: crypto.randomUUID(), signature };
+        request = {
+          key: crypto.randomUUID(),
+          acceptKey: crypto.randomUUID(),
+          signature,
+        };
         idempotencyRef.current = request;
       }
-      const proposal: EditorialVisualRevisionProposalRead =
-        await prepareEnrichmentRevision(
-          subjectId,
-          target.blockId,
-          request.key,
-          revision,
-        );
-      if (proposal.state === "accepted") return proposal;
-      if (!proposal.patch_sha256) {
-        throw new Error(
-          "L’empreinte du patch de remplacement est indisponible.",
-        );
-      }
-      await acceptEditorialProposal(subjectId, target.blockId, proposal.id, {
-        expected_state_version: proposal.state_version,
-        patch_sha256: proposal.patch_sha256,
-      });
-      return proposal;
+      const outcome = await prepareAndAcceptVisualRevision(
+        subjectId,
+        target.blockId,
+        revision,
+        {
+          prepareIdempotencyKey: request.key,
+          acceptIdempotencyKey: request.acceptKey,
+        },
+      );
+      return outcome.proposal;
     },
     onSuccess: async () => {
       idempotencyRef.current = null;
@@ -183,11 +183,15 @@ export function ReplaceFigureDialog({
 
   const captionInvalid = caption.trim().length === 0;
   const capacityNote = briefFigureCapacityNote(snapshot);
+  const mutationReason = visualMutationUnavailableReason(
+    visualCapabilityFlags(snapshot),
+  );
   const canConfirm =
     selected !== null &&
     !captionInvalid &&
     !replacementMutation.isPending &&
-    !accepted;
+    !accepted &&
+    mutationReason === null;
   // Selecting a replacement or editing the caption commits nothing until the
   // explicit replace action; closing silently would discard that work.
   const discardableChanges =
@@ -442,6 +446,12 @@ export function ReplaceFigureDialog({
                         {ARCHIVE_UNTOUCHED_MESSAGE}
                       </p>
                     </>
+                  ) : null}
+
+                  {mutationReason ? (
+                    <p className="editorial-gallery-replace__hint" role="note">
+                      {mutationReason}
+                    </p>
                   ) : null}
 
                   <div className="editorial-gallery-replace__actions">
