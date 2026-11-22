@@ -811,7 +811,7 @@ def test_heartbeat_at_expiry_cannot_resurrect_lease() -> None:
 
 def test_heartbeat_appends_event_single_sequence_writer() -> None:
     async def scenario() -> None:
-        repository = InMemoryInvestigationTaskRepository()
+        repository = InMemoryInvestigationTaskRepository(clock=lambda: NOW)
         session_id = uuid4()
         started = await _running_operator_task(repository, session_id=session_id)
         service = _task_service(repository)
@@ -869,7 +869,7 @@ def test_heartbeat_appends_event_single_sequence_writer() -> None:
 
 def test_sweep_covers_awaiting_input() -> None:
     async def scenario() -> None:
-        repository = InMemoryInvestigationTaskRepository()
+        repository = InMemoryInvestigationTaskRepository(clock=lambda: NOW + timedelta(seconds=181))
         session_id = uuid4()
         sessions = _SessionRecorder(active=(session_id,))
         seeded = await _seeded(
@@ -900,9 +900,7 @@ def test_sweep_covers_awaiting_input() -> None:
         assert awaiting.task.lease_expires_at == NOW + timedelta(seconds=180)
 
         sweeper = InvestigationTaskSweeper(tasks=repository, sessions=sessions)
-        swept = await sweeper.sweep_investigation(
-            seeded.investigation_id, now=NOW + timedelta(seconds=181)
-        )
+        swept = await sweeper.sweep_investigation(seeded.investigation_id)
         assert len(swept) == 1
         blocked = swept[0].task
         assert blocked.status is TaskStatus.BLOCKED
@@ -918,9 +916,7 @@ def test_sweep_covers_awaiting_input() -> None:
             (session_id, seeded.id, TaskSessionOutcome.LOST, "lease_expired")
         ]
 
-        again = await sweeper.sweep_investigation(
-            seeded.investigation_id, now=NOW + timedelta(seconds=200)
-        )
+        again = await sweeper.sweep_investigation(seeded.investigation_id)
         assert again == ()
         stored = await repository.get(seeded.id)
         assert stored is not None

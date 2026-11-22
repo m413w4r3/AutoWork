@@ -7,6 +7,11 @@ and the linked session is reported ``lost``.  Without this path an agent that
 disappeared would leave a task occupied forever, so ``awaiting_input`` is swept
 exactly like ``running`` (E6).
 
+The expiry boundary is the *database* clock: ``database_now()`` is the same
+``statement_timestamp()`` the heartbeat predicate uses, read again after the
+task row is locked so the authoritative comparison cannot be decided by a
+drifting process clock.  The in-memory fake supplies that clock itself.
+
 The transition goes through the same D3 primitives as a command: the
 investigation advisory lock serialises sweeps with dependency work, the task
 row is locked, the status write is a ``status_version`` CAS and the event is
@@ -14,16 +19,11 @@ appended through ``append_task_event`` (the sole ``event_sequence`` writer).
 The event key is deterministic — ``sweep:<task_id>:<from_status>:<status_version>``
 — so a retried sweep cannot apply twice, and a concurrent human command or
 heartbeat that wins the row first leaves the sweep a clean no-op.
-
-``now`` defaults to the process clock.  A scheduler should pass the database's
-``statement_timestamp()`` so the expiry boundary is evaluated against the same
-clock the heartbeat predicate uses.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import UTC, datetime
 from uuid import UUID
 
 from cti_app.application.investigation_persistence import InvestigationTaskRepository
@@ -45,14 +45,6 @@ from cti_app.domain.investigation_task import (
 )
 
 
-def _now(value: datetime | None) -> datetime:
-    if value is None:
-        return datetime.now(UTC)
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError("now must be timezone-aware")
-    return value
-
-
 class InvestigationTaskSweeper:
     """Block tasks whose lease expired without a heartbeat."""
 
@@ -65,47 +57,48 @@ class InvestigationTaskSweeper:
         self._tasks = tasks
         self._sessions = sessions
 
-    async def sweep(
-        self, investigation_ids: Iterable[UUID], *, now: datetime | None = None
-    ) -> tuple[TaskCommandResult, ...]:
+    async def sweep(self, investigation_ids: Iterable[UUID]) -> tuple[TaskCommandResult, ...]:
         """Sweep several investigations; each is serialised independently.
 
         A global enumeration of investigations belongs to the scheduler wiring;
         this service only needs the candidate ids, so it never invents a second
         query over the investigation aggregate.
         """
-        timestamp = _now(now)
         swept: list[TaskCommandResult] = []
         for investigation_id in investigation_ids:
-            swept.extend(await self.sweep_investigation(investigation_id, now=timestamp))
+            swept.extend(await self.sweep_investigation(investigation_id))
         return tuple(swept)
 
-    async def sweep_investigation(
-        self, investigation_id: UUID, *, now: datetime | None = None
-    ) -> tuple[TaskCommandResult, ...]:
-        timestamp = _now(now)
+    async def sweep_investigation(self, investigation_id: UUID) -> tuple[TaskCommandResult, ...]:
         swept: list[TaskCommandResult] = []
         await self._tasks.lock_investigation(investigation_id)
-        for candidate in await self._tasks.list_for_investigation(investigation_id):
+        candidates = await self._tasks.list_for_investigation(investigation_id)
+        if not any(candidate.status in LEASE_HELD_STATUSES for candidate in candidates):
+            return ()
+        timestamp = await self._tasks.database_now()
+        for candidate in candidates:
             if candidate.status not in LEASE_HELD_STATUSES:
                 continue
             if candidate.lease_expires_at is None or candidate.lease_expires_at > timestamp:
                 continue
-            result = await self._expire(candidate.id, now=timestamp)
+            result = await self._expire(candidate.id)
             if result is not None:
                 swept.append(result)
         return tuple(swept)
 
-    async def _expire(self, task_id: UUID, *, now: datetime) -> TaskCommandResult | None:
+    async def _expire(self, task_id: UUID) -> TaskCommandResult | None:
         task = await self._tasks.lock_task(task_id)
         if task is None:
             return None
         if (
             task.status not in LEASE_HELD_STATUSES
             or task.lease_expires_at is None
-            or task.lease_expires_at > now
             or task.lease_session_id is None
         ):
+            return None
+        # The row is locked now; this is the authoritative boundary read.
+        now = await self._tasks.database_now()
+        if task.lease_expires_at > now:
             return None
         key = f"sweep:{task.id}:{task.status.value}:{task.status_version}"
         draft = TaskEventDraft(

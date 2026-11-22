@@ -22,6 +22,8 @@ from alembic import command
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cti_app.application.investigation_persistence import InvestigationTaskRepository
+from cti_app.application.investigation_task_events import TaskEventType
+from cti_app.application.investigation_task_sweep import InvestigationTaskSweeper
 from cti_app.application.investigation_tasks import (
     InvestigationTaskService,
     StaleTaskVersionError,
@@ -38,6 +40,7 @@ from cti_app.domain.editions import Edition
 from cti_app.domain.editorial import AnalystDecisionTargetType, AnalystDecisionType
 from cti_app.domain.entities import Subject
 from cti_app.domain.investigation_task import (
+    BlockedReason,
     InvestigationTaskV1,
     ResultVerificationStatus,
     TaskActor,
@@ -332,6 +335,9 @@ def test_heartbeat_expiry_boundary_uses_database_clock(
                 )
                 await session.commit()
             db_now = await _db_now(factory)
+            # The caller clock is deliberately a day behind PostgreSQL.  The
+            # heartbeat may not use it: a live database lease must renew and
+            # the new lease values must come from the database clock.
             async with SqlAlchemyUnitOfWork(factory) as uow:
                 renewed = await _service(uow, sessions).heartbeat(
                     task_id=task.id,
@@ -339,11 +345,14 @@ def test_heartbeat_expiry_boundary_uses_database_clock(
                     expected_status_version=task.status_version,
                     lease_fence=1,
                     idempotency_key="heartbeat-before-expiry",
-                    now=db_now,
+                    now=db_now - timedelta(days=1),
                 )
                 await uow.commit()
             assert renewed.task.lease_expires_at is not None
-            assert renewed.task.lease_expires_at > db_now
+            assert renewed.task.heartbeat_at is not None
+            assert renewed.task.heartbeat_at != db_now - timedelta(days=1)
+            assert (renewed.task.heartbeat_at - db_now).total_seconds() < 60
+            assert renewed.task.lease_expires_at > renewed.task.heartbeat_at
 
             async with factory() as session:
                 await session.execute(
@@ -354,7 +363,9 @@ def test_heartbeat_expiry_boundary_uses_database_clock(
                     {"task_id": task.id},
                 )
                 await session.commit()
-            expired_now = await _db_now(factory)
+            # Same trick in the other direction: the caller still believes the
+            # lease is live, but the database boundary already passed, so the
+            # conditional UPDATE must match zero rows.
             async with SqlAlchemyUnitOfWork(factory) as uow:
                 with pytest.raises(TaskLeaseExpiredError) as expired:
                     await _service(uow, sessions).heartbeat(
@@ -363,7 +374,7 @@ def test_heartbeat_expiry_boundary_uses_database_clock(
                         expected_status_version=task.status_version,
                         lease_fence=1,
                         idempotency_key="heartbeat-after-expiry",
-                        now=expired_now,
+                        now=db_now - timedelta(days=1),
                     )
                 assert expired.value.code == "lease_expired"
                 await uow.rollback()
@@ -380,6 +391,100 @@ def test_heartbeat_expiry_boundary_uses_database_clock(
                     )
                 assert stale.value.code == "stale_fence"
                 await uow.rollback()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(exercise())
+
+
+def test_concurrent_heartbeat_and_sweep_refuse_a_database_expired_lease(
+    temporary_postgres_url: str,
+) -> None:
+    """Two real transactions race after the database lease boundary passed.
+
+    The heartbeat still carries a caller timestamp captured before expiry; the
+    old predicate would have renewed the lease from it.  Here the conditional
+    UPDATE and the sweep both read PostgreSQL time, so neither revives it.
+    """
+    config = _alembic_config(temporary_postgres_url)
+    command.upgrade(config, "head")
+
+    async def exercise() -> None:
+        engine = create_postgres_engine(temporary_postgres_url)
+        try:
+            factory = create_session_factory(engine)
+            investigation = await _seed_investigation(factory)
+            session_id = uuid4()
+            task = await _create_task(
+                factory,
+                investigation.id,
+                status=TaskStatus.RUNNING,
+                assigned_actor_kind=TaskActorKind.OPERATOR,
+                assigned_actor_id=OPERATOR.actor_id,
+                lease=True,
+                lease_session_id=session_id,
+            )
+            sessions = _SessionPort(active=(session_id,))
+            async with factory() as session:
+                await session.execute(
+                    sa.text(
+                        "UPDATE investigation_tasks SET lease_expires_at = "
+                        "statement_timestamp() + interval '200 milliseconds' "
+                        "WHERE id = :task_id"
+                    ),
+                    {"task_id": task.id},
+                )
+                await session.commit()
+            caller_now = await _db_now(factory)
+            async with factory() as session:
+                db_expiry = await session.scalar(
+                    sa.text("SELECT lease_expires_at FROM investigation_tasks WHERE id = :task_id"),
+                    {"task_id": task.id},
+                )
+            assert isinstance(db_expiry, datetime)
+            assert caller_now < db_expiry
+            await asyncio.sleep(0.3)
+
+            async def heartbeat() -> TaskCommandResult:
+                async with SqlAlchemyUnitOfWork(factory) as uow:
+                    result = await _service(uow, sessions).heartbeat(
+                        task_id=task.id,
+                        actor=OPERATOR,
+                        expected_status_version=task.status_version,
+                        lease_fence=1,
+                        idempotency_key="concurrent-heartbeat",
+                        now=caller_now,
+                    )
+                    await uow.commit()
+                    return result
+
+            async def sweep() -> tuple[TaskCommandResult, ...]:
+                async with SqlAlchemyUnitOfWork(factory) as uow:
+                    sweeper = InvestigationTaskSweeper(
+                        tasks=uow.investigation_tasks, sessions=sessions
+                    )
+                    results = await sweeper.sweep_investigation(investigation.id)
+                    await uow.commit()
+                    return results
+
+            heartbeat_result, swept = await asyncio.gather(
+                heartbeat(), sweep(), return_exceptions=True
+            )
+            assert isinstance(heartbeat_result, TaskLeaseExpiredError)
+            assert not isinstance(swept, BaseException)
+            assert len(swept) == 1
+            assert swept[0].task.status is TaskStatus.BLOCKED
+            assert swept[0].task.blocked_reason is BlockedReason.LEASE_EXPIRED
+            assert swept[0].task.lease is None
+
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                stored = await uow.investigation_tasks.get(task.id)
+                assert stored is not None
+                assert stored.status is TaskStatus.BLOCKED
+                assert stored.lease is None
+                assert stored.lease_fence == 2
+                events = await uow.investigation_tasks.list_events(task.id)
+            assert [event.event_type for event in events] == [TaskEventType.LEASE_EXPIRED]
         finally:
             await engine.dispose()
 
@@ -474,6 +579,18 @@ def test_concurrent_heartbeats_keep_one_sequence_per_task(
                 lease_session_id=session_id,
             )
             sessions = _SessionPort(active=(session_id,))
+            # The heartbeat boundary is PostgreSQL time; keep the lease live
+            # relative to it instead of to the fixture's process timestamp.
+            async with factory() as session:
+                await session.execute(
+                    sa.text(
+                        "UPDATE investigation_tasks SET lease_expires_at = "
+                        "statement_timestamp() + interval '1 hour' WHERE id = :task_id"
+                    ),
+                    {"task_id": task.id},
+                )
+                await session.commit()
+            db_now = await _db_now(factory)
 
             async def heartbeat(key: str) -> TaskCommandResult:
                 async with SqlAlchemyUnitOfWork(factory) as uow:
@@ -483,7 +600,7 @@ def test_concurrent_heartbeats_keep_one_sequence_per_task(
                         expected_status_version=1,
                         lease_fence=1,
                         idempotency_key=key,
-                        now=NOW,
+                        now=db_now,
                     )
                     await uow.commit()
                     return result
