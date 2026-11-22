@@ -223,6 +223,11 @@ class Settings(BaseSettings):
     collection_fallback_endpoint_enabled: bool = True
     collection_browser_navigation_enabled: bool = False
     collection_browser_control_socket: str = ""
+    # Host workspace agent (M24-02): AF_UNIX socket and per-start bearer token
+    # file mounted read-only into the backend container. Empty disables every
+    # workspace action (fail closed); the status route reports "unconfigured".
+    workspace_agent_socket: str = ""
+    workspace_agent_token_file: str = ""
     collection_syndication_domains: str = ""
     collection_exact_title_search_endpoint: str = ""
     collection_official_newsletter_archive_endpoint: str = ""

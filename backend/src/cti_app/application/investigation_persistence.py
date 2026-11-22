@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 from uuid import UUID
 
 from cti_app.application.context_pagination import (
@@ -33,6 +33,14 @@ from cti_app.domain.investigation import (
     ToolInvocation,
 )
 from cti_app.domain.investigation_experiment import InvestigationExperimentV1
+
+if TYPE_CHECKING:
+    from cti_app.application.workspace_agent import (
+        WorkspaceBindingV1,
+        WorkspaceFileEventV1,
+        WorkspaceFileRevisionV1,
+        WorkspaceSyncCursorV1,
+    )
 
 
 class VersionConflictError(RuntimeError):
@@ -225,6 +233,48 @@ class InvestigationBudgetRepository(Protocol):
         *,
         expected_version: int | None,
     ) -> InvestigationBudgetSnapshot: ...
+
+
+class WorkspaceBindingRepository(Protocol):
+    """Canonical workspace-to-investigation binding (ADR-0011 D2)."""
+
+    async def get(self, workspace_id: str) -> WorkspaceBindingV1 | None: ...
+
+    async def get_for_investigation(self, investigation_id: UUID) -> WorkspaceBindingV1 | None: ...
+
+    async def add_if_absent(
+        self, binding: WorkspaceBindingV1
+    ) -> tuple[WorkspaceBindingV1, bool]: ...
+
+
+class WorkspaceFileRevisionRepository(Protocol):
+    """Per-file revision metadata; no bytes ever enter this table."""
+
+    async def get(self, workspace_id: str, revision_id: str) -> WorkspaceFileRevisionV1 | None: ...
+
+    async def list_for_workspace(
+        self, workspace_id: str
+    ) -> tuple[WorkspaceFileRevisionV1, ...]: ...
+
+    async def append_if_absent(
+        self, revision: WorkspaceFileRevisionV1
+    ) -> tuple[WorkspaceFileRevisionV1, bool]: ...
+
+
+class WorkspaceFileEventRepository(Protocol):
+    async def get(self, workspace_id: str, event_id: str) -> WorkspaceFileEventV1 | None: ...
+
+    async def list_for_workspace(self, workspace_id: str) -> tuple[WorkspaceFileEventV1, ...]: ...
+
+    async def append_if_absent(
+        self, event: WorkspaceFileEventV1
+    ) -> tuple[WorkspaceFileEventV1, bool]: ...
+
+
+class WorkspaceSyncCursorRepository(Protocol):
+    async def get(self, workspace_id: str) -> WorkspaceSyncCursorV1 | None: ...
+
+    async def save(self, cursor: WorkspaceSyncCursorV1) -> WorkspaceSyncCursorV1: ...
 
 
 def _copy_budget(budget: InvestigationBudget) -> InvestigationBudget:
@@ -759,6 +809,129 @@ class InMemoryInvestigationBudgetRepository:
             )
 
 
+class InMemoryWorkspaceBindingRepository:
+    def __init__(self) -> None:
+        self._items: dict[str, WorkspaceBindingV1] = {}
+        self._lock = asyncio.Lock()
+
+    async def get(self, workspace_id: str) -> WorkspaceBindingV1 | None:
+        return self._items.get(workspace_id)
+
+    async def get_for_investigation(self, investigation_id: UUID) -> WorkspaceBindingV1 | None:
+        return next(
+            (item for item in self._items.values() if item.investigation_id == investigation_id),
+            None,
+        )
+
+    async def add_if_absent(self, binding: WorkspaceBindingV1) -> tuple[WorkspaceBindingV1, bool]:
+        async with self._lock:
+            existing = self._items.get(binding.workspace_id)
+            if existing is not None:
+                if existing != binding:
+                    raise ValueError(
+                        "A workspace id cannot identify a different investigation binding"
+                    )
+                return existing, False
+            if any(
+                item.investigation_id == binding.investigation_id for item in self._items.values()
+            ):
+                raise ValueError("An investigation can bind only one workspace")
+            self._items[binding.workspace_id] = binding
+            return binding, True
+
+
+class InMemoryWorkspaceFileRevisionRepository:
+    def __init__(self) -> None:
+        self._items: dict[tuple[str, str], WorkspaceFileRevisionV1] = {}
+        self._lock = asyncio.Lock()
+
+    async def get(self, workspace_id: str, revision_id: str) -> WorkspaceFileRevisionV1 | None:
+        return self._items.get((workspace_id, revision_id))
+
+    async def list_for_workspace(self, workspace_id: str) -> tuple[WorkspaceFileRevisionV1, ...]:
+        return tuple(
+            sorted(
+                (
+                    item
+                    for (item_workspace_id, _), item in self._items.items()
+                    if item_workspace_id == workspace_id
+                ),
+                key=lambda item: (item.path, item.observed_at, item.revision_id),
+            )
+        )
+
+    async def append_if_absent(
+        self, revision: WorkspaceFileRevisionV1
+    ) -> tuple[WorkspaceFileRevisionV1, bool]:
+        async with self._lock:
+            existing = self._items.get((revision.workspace_id, revision.revision_id))
+            if existing is not None:
+                if existing != revision:
+                    raise ValueError("A revision id cannot identify a different workspace file")
+                return existing, False
+            self._items[(revision.workspace_id, revision.revision_id)] = revision
+            return revision, True
+
+
+class InMemoryWorkspaceFileEventRepository:
+    def __init__(self) -> None:
+        self._items: dict[tuple[str, str], WorkspaceFileEventV1] = {}
+        self._lock = asyncio.Lock()
+
+    async def get(self, workspace_id: str, event_id: str) -> WorkspaceFileEventV1 | None:
+        return self._items.get((workspace_id, event_id))
+
+    async def list_for_workspace(self, workspace_id: str) -> tuple[WorkspaceFileEventV1, ...]:
+        return tuple(
+            sorted(
+                (
+                    item
+                    for (item_workspace_id, _), item in self._items.items()
+                    if item_workspace_id == workspace_id
+                ),
+                key=lambda item: (item.generation, item.seq, item.event_id),
+            )
+        )
+
+    async def append_if_absent(
+        self, event: WorkspaceFileEventV1
+    ) -> tuple[WorkspaceFileEventV1, bool]:
+        async with self._lock:
+            existing = self._items.get((event.workspace_id, event.event_id))
+            if existing is not None:
+                if existing != event:
+                    raise ValueError("An event id cannot identify different event content")
+                return existing, False
+            if any(
+                item.workspace_id == event.workspace_id
+                and item.generation == event.generation
+                and item.seq == event.seq
+                for item in self._items.values()
+            ):
+                raise ValueError("An event sequence cannot identify a different event id")
+            self._items[(event.workspace_id, event.event_id)] = event
+            return event, True
+
+
+class InMemoryWorkspaceSyncCursorRepository:
+    def __init__(self) -> None:
+        self._items: dict[str, WorkspaceSyncCursorV1] = {}
+        self._lock = asyncio.Lock()
+
+    async def get(self, workspace_id: str) -> WorkspaceSyncCursorV1 | None:
+        return self._items.get(workspace_id)
+
+    async def save(self, cursor: WorkspaceSyncCursorV1) -> WorkspaceSyncCursorV1:
+        async with self._lock:
+            current = self._items.get(cursor.workspace_id)
+            if current is not None and (
+                current.generation == cursor.generation and current.cursor >= cursor.cursor
+            ):
+                return current
+            self._items[cursor.workspace_id] = cursor
+            return cursor
+
+
 __all__ = [
     "AnalystOpinionRepository",
     "DetectionCandidateRepository",
@@ -772,10 +945,18 @@ __all__ = [
     "InMemoryInvestigationEnvelopeRepository",
     "InMemorySampleAssociationRepository",
     "InMemoryToolInvocationRepository",
+    "InMemoryWorkspaceBindingRepository",
+    "InMemoryWorkspaceFileEventRepository",
+    "InMemoryWorkspaceFileRevisionRepository",
+    "InMemoryWorkspaceSyncCursorRepository",
     "InvestigationBudgetRepository",
     "InvestigationBudgetSnapshot",
     "InvestigationEnvelopeRepository",
     "SampleAssociationRepository",
     "ToolInvocationRepository",
     "VersionConflictError",
+    "WorkspaceBindingRepository",
+    "WorkspaceFileEventRepository",
+    "WorkspaceFileRevisionRepository",
+    "WorkspaceSyncCursorRepository",
 ]

@@ -13,6 +13,10 @@ from cti_app.application.investigation_persistence import (
     InvestigationExperimentRepository,
     SampleAssociationRepository,
     ToolInvocationRepository,
+    WorkspaceBindingRepository,
+    WorkspaceFileEventRepository,
+    WorkspaceFileRevisionRepository,
+    WorkspaceSyncCursorRepository,
 )
 from cti_app.application.investigation_persistence import (
     DetectionCandidateRepository as InvestigationDetectionCandidateRepository,
@@ -243,6 +247,12 @@ from cti_app.infrastructure.database.repositories.selection import (
 from cti_app.infrastructure.database.repositories.source_media import (
     SqlAlchemySourceMediaRepository,
 )
+from cti_app.infrastructure.database.repositories.workspace import (
+    SqlAlchemyWorkspaceBindingRepository,
+    SqlAlchemyWorkspaceFileEventRepository,
+    SqlAlchemyWorkspaceFileRevisionRepository,
+    SqlAlchemyWorkspaceSyncCursorRepository,
+)
 
 
 class SqlAlchemyUnitOfWork:
@@ -304,6 +314,10 @@ class SqlAlchemyUnitOfWork:
     investigation_envelopes: InvestigationEnvelopeRepository
     investigation_budgets: InvestigationBudgetRepository
     investigation_states: InvestigationStateRepository
+    workspace_bindings: WorkspaceBindingRepository
+    workspace_file_revisions: WorkspaceFileRevisionRepository
+    workspace_file_events: WorkspaceFileEventRepository
+    workspace_sync_cursors: WorkspaceSyncCursorRepository
     production_runs: ProductionRunRepository
     production_routing_decisions: ProductionRoutingDecisionRepository
     editorial_workspace_snapshots: EditorialWorkspaceSnapshotRepository
@@ -408,6 +422,10 @@ class SqlAlchemyUnitOfWork:
         self.investigation_envelopes = SqlAlchemyInvestigationEnvelopeRepository(self._session)
         self.investigation_budgets = SqlAlchemyInvestigationBudgetRepository(self._session)
         self.investigation_states = SqlAlchemyInvestigationStateRepository(self._session)
+        self.workspace_bindings = SqlAlchemyWorkspaceBindingRepository(self._session)
+        self.workspace_file_revisions = SqlAlchemyWorkspaceFileRevisionRepository(self._session)
+        self.workspace_file_events = SqlAlchemyWorkspaceFileEventRepository(self._session)
+        self.workspace_sync_cursors = SqlAlchemyWorkspaceSyncCursorRepository(self._session)
         self.production_runs = SqlAlchemyProductionRunRepository(self._session)
         self.production_routing_decisions = SqlAlchemyProductionRoutingDecisionRepository(
             self._session
