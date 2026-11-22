@@ -101,12 +101,13 @@ def test_sessions_routes_are_reserved_and_typed(uds_client, agent_server: Runnin
         f"/v1/workspaces/{VALID_WORKSPACE_ID}/files/revisions?path=notes/humaines/a.md",
     ],
 )
-def test_workspace_routes_are_not_implemented_in_the_skeleton(
+def test_workspace_file_read_routes_dispatch_for_an_unknown_workspace(
     uds_client, agent_server: RunningAgent, path: str
 ) -> None:
+    """W4 implements these routes; an unknown workspace is a typed 404, never 501."""
     response = uds_client.get(path, headers=agent_server.auth_headers)
-    assert response.status_code == 501
-    assert response.json()["error"] == "not_implemented"
+    assert response.status_code == 404
+    assert response.json()["error"] == "workspace_not_found"
 
 
 def test_unknown_v1_route_is_a_typed_404(uds_client, agent_server: RunningAgent) -> None:
