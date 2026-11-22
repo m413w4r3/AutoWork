@@ -11,9 +11,15 @@ import {
   jsonResponse,
   wrapperFor,
 } from "../api/testSupport";
+import type { AgentSessionView } from "../api/agentSessions";
 import { TaskCard } from "./TaskCard";
 import { TaskWorkspace } from "./TaskWorkspace";
-import { INVESTIGATION_ID, makeTask } from "./testFixtures";
+import {
+  HANDOFF_ID,
+  INVESTIGATION_ID,
+  makeSession,
+  makeTask,
+} from "./testFixtures";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -22,17 +28,50 @@ afterEach(() => {
 function renderCard(
   task = makeTask(),
   workspaceAvailable: boolean | null = true,
+  sessions: AgentSessionView[] = [],
 ) {
   return render(
     <TaskCard
       investigationId={INVESTIGATION_ID}
       task={task}
       allTasks={[task]}
-      sessions={[]}
+      sessions={sessions}
       workspaceAvailable={workspaceAvailable}
     />,
     { wrapper: wrapperFor(createTestQueryClient()) },
   );
+}
+
+function sessionCapabilities() {
+  return {
+    adapter_kind: "codex_cli",
+    executable: "codex",
+    available: true,
+    version: "codex-cli 0.163.0",
+    capability_sha256: "a".repeat(64),
+    probed_at: "2026-11-22T10:05:00Z",
+    supports_resume: true,
+    supports_structured_output: true,
+    supports_non_interactive: true,
+    modes: ["non_interactive"],
+    permission_modes: [],
+    confinement: {
+      profile: "bwrap-loopback",
+      bwrap_ok: true,
+      netns: true,
+      network_mode: "isolated_egress",
+      loopback_isolated: true,
+    },
+  };
+}
+
+function assignedOperatorTask() {
+  return makeTask({
+    status: "assigned",
+    assigned_actor_kind: "operator",
+    assigned_actor_id: "operator:codex_cli",
+    handoff_ref: HANDOFF_ID,
+  });
 }
 
 function workspaceStatus() {
@@ -151,6 +190,107 @@ describe("TaskCard CAS", () => {
       /version obsolète/,
     );
     expect(await screen.findByText(/version 3/)).toBeInTheDocument();
+  });
+});
+
+describe("TaskCard session launch", () => {
+  it("opens the probed session with the capability executable and no free model", async () => {
+    const user = userEvent.setup();
+    const recorder = installFetch(({ url, init }) => {
+      const method = init?.method ?? "GET";
+      if (url.includes("/agent-sessions/capabilities")) {
+        return jsonResponse(sessionCapabilities());
+      }
+      if (url.endsWith("/agent-sessions") && method === "POST") {
+        return jsonResponse({ session: makeSession() });
+      }
+      return errorResponse(500, "unexpected_request");
+    });
+
+    renderCard(assignedOperatorTask());
+
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Ouvrir la session Codex CLI",
+      }),
+    );
+
+    await waitFor(() =>
+      expect(
+        recorder.calls.some(
+          (call) =>
+            call.url.endsWith("/agent-sessions") &&
+            call.init?.method === "POST",
+        ),
+      ).toBe(true),
+    );
+    const request = recorder.calls.find(
+      (call) =>
+        call.url.endsWith("/agent-sessions") && call.init?.method === "POST",
+    );
+    if (request === undefined) throw new Error("open request was not sent");
+    expect(bodyOf(request.init)).toEqual({
+      task_id: assignedOperatorTask().id,
+      adapter_kind: "codex_cli",
+      handoff_id: HANDOFF_ID,
+      executable: "codex",
+      model: null,
+    });
+    expect(headersOf(request.init)["Idempotency-Key"]).toBeTruthy();
+    expect(await screen.findByText(/session ouverte/)).toBeInTheDocument();
+  });
+
+  it("hides the action with the typed reason when the host probe fails", async () => {
+    installFetch(({ url }) =>
+      url.includes("/agent-sessions/capabilities")
+        ? errorResponse(503, "workspace_local_unavailable")
+        : errorResponse(500, "unexpected_request"),
+    );
+
+    renderCard(assignedOperatorTask());
+
+    expect(
+      await screen.findByText(
+        /Ouverture de session masquée : Agent hôte absent/,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Ouvrir la session Codex CLI" }),
+    ).toBeNull();
+  });
+
+  it("renders the typed external-disclosure refusal", async () => {
+    const user = userEvent.setup();
+    installFetch(({ url, init }) => {
+      if (url.includes("/agent-sessions/capabilities")) {
+        return jsonResponse(sessionCapabilities());
+      }
+      if (url.endsWith("/agent-sessions") && init?.method === "POST") {
+        return errorResponse(403, "agent_session_external_llm_not_allowed");
+      }
+      return errorResponse(500, "unexpected_request");
+    });
+
+    renderCard(assignedOperatorTask());
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Ouvrir la session Codex CLI",
+      }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      /Divulgation externe refusée/,
+    );
+  });
+
+  it("does not offer an opening when a session already exists", () => {
+    installFetch(() => errorResponse(500, "unexpected_request"));
+
+    renderCard(assignedOperatorTask(), true, [makeSession()]);
+
+    expect(
+      screen.queryByRole("button", { name: "Ouvrir la session Codex CLI" }),
+    ).toBeNull();
   });
 });
 

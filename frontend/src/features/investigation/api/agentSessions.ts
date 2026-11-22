@@ -2,7 +2,8 @@
  * Operator session reads and the human actions of `api/agent_sessions.py`
  * (M24-05B1). Only the browser-safe half lives here.
  *
- * Exposed: list/get, open, enqueue a human instruction, interrupt, resume.
+ * Exposed: list/get, the read-only capability probe, open, enqueue a human
+ * instruction, interrupt, resume.
  * The D7-HMAC-only routes (`reconcile`, `collect`, the `ack` instruction
  * action and `tool-calls`) are deliberately absent — their secret never
  * reaches the browser. `POST /agent-sessions` returns the public session
@@ -44,6 +45,8 @@ export type AgentSessionErrorCode =
   | "agentic_operator_unavailable"
   | "agentic_operator_contract_invalid"
   | "agent_session_start_failed"
+  | "agent_session_external_llm_not_allowed"
+  | "agent_session_network_isolation_unavailable"
   | "agent_session_secret_delivery_unavailable"
   | "agent_session_secret_delivery_failed"
   | "note_refs_unavailable"
@@ -97,11 +100,57 @@ export interface OpenAgentSessionInput {
   adapter_kind: OperatorAdapterKind;
   handoff_id: Uuid;
   executable: string;
-  model?: string;
+  /** The Pydantic field is `str | None`; `null` means "canonical default". */
+  model?: string | null;
 }
 
 export interface OpenAgentSessionResponse {
   session: AgentSessionView;
+}
+
+/**
+ * `GET /api/investigations/agent-sessions/capabilities` payload
+ * (`api/agent_sessions.py::agent_session_capabilities`). The route only
+ * answers 200 after a real host probe, so `available` is always true there;
+ * the unavailable cases are typed 5xx refusals, never an `available: false`.
+ */
+export interface AgentSessionConfinementView {
+  profile: string;
+  bwrap_ok: boolean;
+  netns: boolean;
+  network_mode: "isolated_egress" | "host_network_unsafe" | null;
+  loopback_isolated: boolean;
+}
+
+export interface AgentSessionCapabilitiesView {
+  adapter_kind: OperatorAdapterKind;
+  executable: string;
+  available: boolean;
+  version: string;
+  capability_sha256: string;
+  probed_at: IsoTimestamp;
+  supports_resume: boolean;
+  supports_structured_output: boolean;
+  supports_non_interactive: boolean;
+  modes: string[];
+  permission_modes: string[];
+  confinement: AgentSessionConfinementView | null;
+}
+
+/** Refusals of the read-only probe, in addition to `CommonErrorCode`. */
+export type AgentSessionCapabilitiesErrorCode =
+  | CommonErrorCode
+  | "agent_session_invalid"
+  | "agent_session_network_isolation_unavailable"
+  | "agentic_operator_unavailable"
+  | "agentic_operator_contract_invalid"
+  | "workspace_agent_error"
+  | "workspace_local_unavailable";
+
+/** What the probe needs: one adapter and the executable the host resolves. */
+export interface AgentSessionCapabilityTarget {
+  adapterKind: OperatorAdapterKind;
+  executable: string;
 }
 
 export interface AgentInstructionInput {
@@ -134,6 +183,13 @@ export const agentSessionsKeys = {
     [...agentSessionsKeys.all(investigationId), "list", taskId ?? ""] as const,
   detail: (investigationId: string, sessionId: string) =>
     [...agentSessionsKeys.all(investigationId), sessionId] as const,
+  /**
+   * The probe is not investigation-scoped (`/api/investigations/agent-sessions/
+   * capabilities`); its key deliberately sits outside every
+   * `["investigation", <id>, …]` prefix.
+   */
+  capabilities: (adapterKind: OperatorAdapterKind, executable: string) =>
+    ["agent-sessions", "capabilities", adapterKind, executable] as const,
 };
 
 export function listAgentSessions(
@@ -158,6 +214,24 @@ export function getAgentSession(
       investigationId,
       `/agent-sessions/${encodeURIComponent(sessionId)}`,
     ),
+    signal,
+  );
+}
+
+/**
+ * Read-only, human-gated probe of the host CLI. `executable` is the value the
+ * human would pass to open a session; the response echoes it and nothing is
+ * executed by the browser. A host that cannot prove its loopback isolation
+ * answers a typed 503 instead of a capabilities payload.
+ */
+export function getAgentSessionCapabilities(
+  adapterKind: OperatorAdapterKind,
+  executable: string,
+  signal?: AbortSignal,
+): Promise<AgentSessionCapabilitiesView> {
+  return getJson<AgentSessionCapabilitiesView>(
+    "/api/investigations/agent-sessions/capabilities" +
+      queryString({ adapter_kind: adapterKind, executable }),
     signal,
   );
 }
@@ -253,6 +327,35 @@ export function useAgentSession(
     queryFn: ({ signal }) =>
       getAgentSession(investigationId, sessionId, signal),
     enabled: options.enabled ?? (investigationId !== "" && sessionId !== ""),
+  });
+}
+
+/**
+ * Real capability probe of one adapter/executable pair. `target === null`
+ * disables the query; the placeholder key never collides with an enabled one
+ * because `enabled` is false. The probe is a live host read with no cache
+ * contract, so callers treat every mount as a fresh observation.
+ */
+export function useAgentSessionCapabilities(
+  target: AgentSessionCapabilityTarget | null,
+  options: { enabled?: boolean } = {},
+) {
+  return useQuery({
+    queryKey: agentSessionsKeys.capabilities(
+      target?.adapterKind ?? "codex_cli",
+      target?.executable ?? "",
+    ),
+    queryFn: ({ signal }) => {
+      if (target === null) {
+        throw new Error("agent session capability target is required");
+      }
+      return getAgentSessionCapabilities(
+        target.adapterKind,
+        target.executable,
+        signal,
+      );
+    },
+    enabled: options.enabled ?? target !== null,
   });
 }
 

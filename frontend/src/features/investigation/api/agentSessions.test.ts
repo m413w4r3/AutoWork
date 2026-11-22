@@ -4,6 +4,7 @@ import {
   agentSessionsKeys,
   enqueueAgentInstruction,
   getAgentSession,
+  getAgentSessionCapabilities,
   interruptAgentSession,
   listAgentSessions,
   openAgentSession,
@@ -41,6 +42,60 @@ describe("agent session reads", () => {
     expect(lastRequest(recorder).url).toBe(
       "/api/investigations/inv-1/agent-sessions/session-2",
     );
+  });
+
+  it("probes capabilities with the adapter and the executable only", async () => {
+    const recorder = installFetch(() =>
+      jsonResponse({
+        adapter_kind: "codex_cli",
+        executable: "codex",
+        available: true,
+        version: "codex-cli 0.163.0",
+        capability_sha256: "a".repeat(64),
+        probed_at: "2026-11-22T10:05:00Z",
+        supports_resume: true,
+        supports_structured_output: true,
+        supports_non_interactive: true,
+        modes: ["non_interactive"],
+        permission_modes: [],
+        confinement: {
+          profile: "bwrap-loopback",
+          bwrap_ok: true,
+          netns: true,
+          network_mode: "isolated_egress",
+          loopback_isolated: true,
+        },
+      }),
+    );
+
+    const capabilities = await getAgentSessionCapabilities(
+      "codex_cli",
+      "codex",
+    );
+
+    expect(lastRequest(recorder).url).toBe(
+      "/api/investigations/agent-sessions/capabilities?adapter_kind=codex_cli&executable=codex",
+    );
+    expect(lastRequest(recorder).init?.method).toBe("GET");
+    expect(capabilities.confinement?.network_mode).toBe("isolated_egress");
+    expect(capabilities.available).toBe(true);
+  });
+
+  it("keeps the typed refusal of an unattested confinement", async () => {
+    installFetch(() =>
+      errorResponse(
+        503,
+        "agent_session_network_isolation_unavailable",
+        "the host CLI sandbox is not attested loopback-isolated",
+      ),
+    );
+
+    await expect(
+      getAgentSessionCapabilities("claude_code", "claude"),
+    ).rejects.toMatchObject({
+      status: 503,
+      code: "agent_session_network_isolation_unavailable",
+    });
   });
 });
 
@@ -165,6 +220,12 @@ describe("agent session query keys", () => {
       "inv-1",
       "agent-sessions",
       "session-2",
+    ]);
+    expect(agentSessionsKeys.capabilities("codex_cli", "codex")).toEqual([
+      "agent-sessions",
+      "capabilities",
+      "codex_cli",
+      "codex",
     ]);
   });
 });

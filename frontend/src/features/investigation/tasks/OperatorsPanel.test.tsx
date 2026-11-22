@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -13,6 +13,7 @@ import {
 } from "../api/testSupport";
 import { OperatorsPanel } from "./OperatorsPanel";
 import {
+  HANDOFF_ID,
   INVESTIGATION_ID,
   makeSession,
   makeTask,
@@ -167,6 +168,91 @@ describe("OperatorsPanel", () => {
     expect(
       screen.queryByRole("button", { name: "Reprendre la session" }),
     ).not.toBeInTheDocument();
+  });
+
+  it("propose l’ouverture explicite d’une tâche attribuée sans session", async () => {
+    const user = userEvent.setup();
+    const recorder = installFetch(({ url, init }) => {
+      const method = init?.method ?? "GET";
+      if (url.includes("/agent-sessions/capabilities")) {
+        return jsonResponse({
+          adapter_kind: "codex_cli",
+          executable: "codex",
+          available: true,
+          version: "codex-cli 0.163.0",
+          capability_sha256: "a".repeat(64),
+          probed_at: "2026-11-22T10:05:00Z",
+          supports_resume: true,
+          supports_structured_output: true,
+          supports_non_interactive: true,
+          modes: ["non_interactive"],
+          permission_modes: [],
+          confinement: {
+            profile: "bwrap-loopback",
+            bwrap_ok: true,
+            netns: true,
+            network_mode: "isolated_egress",
+            loopback_isolated: true,
+          },
+        });
+      }
+      if (url.endsWith("/agent-sessions") && method === "GET") {
+        return jsonResponse([]);
+      }
+      if (url.endsWith("/agent-sessions") && method === "POST") {
+        return jsonResponse({ session: makeSession() });
+      }
+      if (url.endsWith("/tasks") && method === "GET") {
+        return jsonResponse(
+          taskPage(
+            makeTask({
+              status: "assigned",
+              assigned_actor_kind: "operator",
+              assigned_actor_id: "operator:codex_cli",
+              handoff_ref: HANDOFF_ID,
+            }),
+          ),
+        );
+      }
+      return errorResponse(500, "unexpected_request");
+    });
+
+    renderPanel();
+
+    expect(
+      await screen.findByRole("heading", {
+        name: /Tâches attribuées sans session \(1\)/,
+      }),
+    ).toBeInTheDocument();
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Ouvrir la session Codex CLI",
+      }),
+    );
+
+    await waitFor(() =>
+      expect(
+        recorder.calls.some(
+          (call) =>
+            call.url.endsWith("/agent-sessions") &&
+            call.init?.method === "POST",
+        ),
+      ).toBe(true),
+    );
+    const request = recorder.calls.find(
+      (call) =>
+        call.url.endsWith("/agent-sessions") && call.init?.method === "POST",
+    );
+    if (request === undefined) throw new Error("open request was not sent");
+    expect(bodyOf(request.init)).toMatchObject({
+      task_id: TASK_ID,
+      adapter_kind: "codex_cli",
+      handoff_id: HANDOFF_ID,
+      executable: "codex",
+      model: null,
+    });
+    expect(headersOf(request.init)["Idempotency-Key"]).toBeTruthy();
+    expect(await screen.findByText(/session ouverte/)).toBeInTheDocument();
   });
 
   it("affiche l’état agent absent quand les sessions sont indisponibles", async () => {

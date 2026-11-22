@@ -25,8 +25,12 @@ import type {
   BootstrapSnapshotV1,
   IOCInventoryV1,
 } from "../../src/features/investigation/api/bootstrap";
-import type { SampleQualification } from "../../src/features/investigation/api/types";
+import type {
+  OperatorAdapterKind,
+  SampleQualification,
+} from "../../src/features/investigation/api/types";
 import type { WorkContributionView } from "../../src/features/investigation/api/contributions";
+import type { AgentSessionView } from "../../src/features/investigation/api/agentSessions";
 import type {
   NoteAcceptanceViewV1,
   NoteProposalDiffViewV1,
@@ -82,6 +86,7 @@ const ids = {
   noteSection: "b2b2b2b2-b2b2-42b2-82b2-b2b2b2b2b2b2",
   association: "c1c1c1c1-c1c1-41c1-81c1-c1c1c1c1c1c1",
   sample: "d1d1d1d1-d1d1-41d1-81d1-d1d1d1d1d1d1",
+  session: "e2e2e2e2-e2e2-42e2-82e2-e2e2e2e2e2e2",
   bridgeInvocation: "e1e1e1e1-e1e1-41e1-81e1-e1e1e1e1e1e1",
   approvalDecision: "f1f1f1f1-f1f1-41f1-81f1-f1f1f1f1f1f1",
   snapshot: "f2f2f2f2-f2f2-42f2-82f2-f2f2f2f2f2f2",
@@ -129,6 +134,13 @@ export interface WorkshopApiOptions {
   existingInvestigation?: boolean;
   /** A human transfer either hits a stale CAS or creates a handoff. */
   transferOutcome?: "stale" | "success";
+  /**
+   * Host capability probe outcome: a real attested confinement, an unattested
+   * confinement (200 with a non-isolated host mode), or an absent host (503).
+   */
+  capabilitiesState?: "attested" | "unconfined" | "host_unavailable";
+  /** The human open action is either accepted or refused by G2/TLP. */
+  openSessionOutcome?: "success" | "external_llm_refused";
 }
 
 const FINDING: InvestigationFinding = {
@@ -951,6 +963,72 @@ function taskPage(tasks: TaskView[]): TaskPageView {
   return { items: tasks, total: tasks.length };
 }
 
+function capabilitiesPayload(
+  adapterKind: OperatorAdapterKind,
+  executable: string,
+  unconfined: boolean,
+) {
+  return {
+    adapter_kind: adapterKind,
+    executable,
+    available: true,
+    version: adapterKind === "codex_cli" ? "codex-cli 0.163.0" : "2.1.284",
+    capability_sha256: "a".repeat(64),
+    probed_at: "2026-11-22T10:05:00Z",
+    supports_resume: true,
+    supports_structured_output: true,
+    supports_non_interactive: true,
+    modes: ["non_interactive"],
+    permission_modes: [],
+    confinement: unconfined
+      ? {
+          profile: "host-network",
+          bwrap_ok: true,
+          netns: false,
+          network_mode: "host_network_unsafe",
+          loopback_isolated: false,
+        }
+      : {
+          profile: "bwrap-loopback",
+          bwrap_ok: true,
+          netns: true,
+          network_mode: "isolated_egress",
+          loopback_isolated: true,
+        },
+  };
+}
+
+function openedSession(
+  task: TaskView,
+  adapterKind: OperatorAdapterKind,
+  handoffId: string,
+): AgentSessionView {
+  return {
+    id: ids.session,
+    investigation_id: ids.investigation,
+    task_id: task.id,
+    adapter_kind: adapterKind,
+    state: "running",
+    state_version: 2,
+    host_session_ref: "host-session-e2e",
+    handoff_id: handoffId,
+    capability_sha256: "a".repeat(64),
+    probed_at: "2026-11-22T10:05:00Z",
+    task_lease_id: "cdcdcdcd-cdcd-4cdc-8cdc-cdcdcdcdcdcd",
+    task_lease_fence: 1,
+    checkpoint_ref: null,
+    checkpoint_sha256: null,
+    reconciliation: null,
+    reconciliation_sha256: null,
+    last_activity_at: "2026-11-22T10:06:00Z",
+    opened_at: "2026-11-22T10:05:00Z",
+    closed_at: null,
+    close_reason: null,
+    created_at: "2026-11-22T10:05:00Z",
+    updated_at: "2026-11-22T10:06:00Z",
+  };
+}
+
 function consultations(): ConsultationLedgerV1 {
   return { investigation_id: ids.investigation, consultations: [] };
 }
@@ -1194,6 +1272,8 @@ export function createWorkshopApi(options: WorkshopApiOptions = {}) {
   const staleProposal = options.staleProposal === true;
   const existingInvestigation = options.existingInvestigation === true;
   const transferOutcome = options.transferOutcome ?? "stale";
+  const capabilitiesState = options.capabilitiesState ?? "attested";
+  const openSessionOutcome = options.openSessionOutcome ?? "success";
   const requests: RecordedRequest[] = [];
   const unhandled: string[] = [];
   let started = existingInvestigation;
@@ -1201,6 +1281,7 @@ export function createWorkshopApi(options: WorkshopApiOptions = {}) {
   let envelopeApproved = false;
   let sampleQualification: SampleQualification = "candidate";
   let tasks: TaskView[] = [];
+  let sessions: AgentSessionView[] = [];
   let conflictResolved = false;
 
   const inv = (suffix: string) =>
@@ -1450,8 +1531,67 @@ export function createWorkshopApi(options: WorkshopApiOptions = {}) {
     if (path === inv("/timeline") && method === "GET") {
       return fulfill(route, { items: [], next_cursor: null, has_more: false });
     }
+    if (
+      path === "/api/investigations/agent-sessions/capabilities" &&
+      method === "GET"
+    ) {
+      if (capabilitiesState === "host_unavailable") {
+        return fail(
+          route,
+          503,
+          "workspace_local_unavailable",
+          "L’agent hôte ne répond pas : le sondage des capacités est impossible.",
+        );
+      }
+      const adapterKind = (url.searchParams.get("adapter_kind") ??
+        "codex_cli") as OperatorAdapterKind;
+      const executable = url.searchParams.get("executable") ?? "codex";
+      return fulfill(
+        route,
+        capabilitiesPayload(
+          adapterKind,
+          executable,
+          capabilitiesState === "unconfined",
+        ),
+      );
+    }
     if (path === inv("/agent-sessions") && method === "GET") {
-      return fulfill(route, []);
+      return fulfill(route, sessions);
+    }
+    if (path === inv("/agent-sessions") && method === "POST") {
+      if (openSessionOutcome === "external_llm_refused") {
+        return fail(
+          route,
+          403,
+          "agent_session_external_llm_not_allowed",
+          "La politique G2/TLP de cette enquête n’autorise pas une session externe.",
+        );
+      }
+      const post = asRecord(body);
+      const taskId = typeof post.task_id === "string" ? post.task_id : "";
+      const adapterKind = (
+        typeof post.adapter_kind === "string" ? post.adapter_kind : "codex_cli"
+      ) as OperatorAdapterKind;
+      const handoffId =
+        typeof post.handoff_id === "string" ? post.handoff_id : ids.decision;
+      const task = tasks.find((item) => item.id === taskId);
+      if (task === undefined) {
+        return fail(route, 404, "task_not_found");
+      }
+      const session = openedSession(task, adapterKind, handoffId);
+      sessions = [...sessions, session];
+      tasks = tasks.map((item) =>
+        item.id === task.id
+          ? {
+              ...item,
+              status: "running",
+              status_version: item.status_version + 1,
+              handoff_ref: handoffId,
+              updated_at: "2026-11-22T10:06:00Z",
+            }
+          : item,
+      );
+      return fulfill(route, { session });
     }
     if (
       path.startsWith(inv("/tasks/")) &&
@@ -1485,6 +1625,24 @@ export function createWorkshopApi(options: WorkshopApiOptions = {}) {
         typeof post.to_adapter_kind === "string"
           ? post.to_adapter_kind
           : "codex_cli";
+      const humanDestination = post.to_actor_kind === "human";
+      const destinationKind = humanDestination ? "human" : "operator";
+      const destinationActorId = humanDestination
+        ? "human:dev-analyst"
+        : `operator:${adapterKind}`;
+      tasks = tasks.map((item) =>
+        item.id === transferTaskId
+          ? {
+              ...item,
+              status: "assigned",
+              status_version: item.status_version + 1,
+              assigned_actor_kind: destinationKind,
+              assigned_actor_id: destinationActorId,
+              handoff_ref: ids.decision,
+              updated_at: "2026-11-22T10:10:00Z",
+            }
+          : item,
+      );
       return fulfill(route, {
         task: {
           id: transferTaskId,
@@ -1493,14 +1651,14 @@ export function createWorkshopApi(options: WorkshopApiOptions = {}) {
           status: "assigned",
           status_version: 2,
           lease_fence: 0,
-          assigned_actor_kind: "operator",
-          assigned_actor_id: `operator:${adapterKind}`,
+          assigned_actor_kind: destinationKind,
+          assigned_actor_id: destinationActorId,
           result_verification_status: "unverified",
           updated_at: "2026-11-22T10:10:00Z",
         },
         destination: {
-          actor_kind: "operator",
-          actor_id: `operator:${adapterKind}`,
+          actor_kind: destinationKind,
+          actor_id: destinationActorId,
         },
         sync: null,
         handoff: {
@@ -1512,8 +1670,8 @@ export function createWorkshopApi(options: WorkshopApiOptions = {}) {
           created_at: "2026-11-22T10:10:00Z",
           from_actor: { kind: "human", actor_id: "dev-analyst" },
           to_actor: {
-            kind: "operator",
-            actor_id: `operator:${adapterKind}`,
+            kind: destinationKind,
+            actor_id: destinationActorId,
           },
           task: {
             status: "assigned",

@@ -422,10 +422,13 @@ test("échantillons : qualification G3 motivée avec observation de l’enquête
   expect(api.unhandled).toEqual([]);
 });
 
-test("attribution : passation honnête, aucune session ouverte", async ({
+test("attribution : passation honnête, ouverture masquée sans agent hôte", async ({
   page,
 }) => {
-  const api = createWorkshopApi({ transferOutcome: "success" });
+  const api = createWorkshopApi({
+    transferOutcome: "success",
+    capabilitiesState: "host_unavailable",
+  });
   await launchWorkshop(page, api);
   await openView(page, "Plan et tâches");
   await page.getByLabel(/Je confirme l’acceptation de cette version/).check();
@@ -446,12 +449,15 @@ test("attribution : passation honnête, aucune session ouverte", async ({
 
   await expect(
     page.getByText(
-      /Passation v1 créée pour Codex CLI — aucune session ouverte/,
+      /Passation v1 créée pour Codex CLI — aucune session ouverte pour l’instant/,
     ),
   ).toBeVisible();
   await expect(
-    page.getByRole("button", { name: "Ouvrir la session" }),
+    readyCard.getByRole("button", { name: "Ouvrir la session Codex CLI" }),
   ).toHaveCount(0);
+  await expect(
+    readyCard.getByText(/Ouverture de session masquée : Agent hôte absent/),
+  ).toBeVisible();
   expect(
     api.requests.filter(
       (request) =>
@@ -483,6 +489,91 @@ test("attribution : passation honnête, aucune session ouverte", async ({
       hasText: "lead-a · Vérifier le domaine C2",
     }),
   ).toHaveCount(1);
+  expect(api.unhandled).toEqual([]);
+});
+
+test("attribution puis ouverture explicite de la session Codex", async ({
+  page,
+}) => {
+  const api = createWorkshopApi({ transferOutcome: "success" });
+  await launchWorkshop(page, api);
+  await openView(page, "Plan et tâches");
+  await page.getByLabel(/Je confirme l’acceptation de cette version/).check();
+  await page
+    .getByRole("button", { name: "Accepter le plan et créer les tâches" })
+    .click();
+
+  const readyCard = page
+    .getByRole("article")
+    .filter({ hasText: "Vérifier le domaine C2" });
+  await readyCard.getByRole("button", { name: "Attribuer à Codex" }).click();
+
+  const openButton = readyCard.getByRole("button", {
+    name: "Ouvrir la session Codex CLI",
+  });
+  await expect(openButton).toBeVisible();
+  await openButton.click();
+
+  await expect(
+    readyCard.getByText(/session ouverte ; la tâche passe en cours/),
+  ).toBeVisible();
+  const open = api.requests.find(
+    (request) =>
+      request.method === "POST" &&
+      request.path ===
+        `/api/investigations/${api.ids.investigation}/agent-sessions`,
+  );
+  expect(open?.body).toEqual({
+    task_id: api.ids.taskReady,
+    adapter_kind: "codex_cli",
+    handoff_id: api.ids.decision,
+    executable: "codex",
+    model: null,
+  });
+  expect(open?.idempotencyKey).toBeTruthy();
+
+  await expect(
+    page.getByText("Codex CLI · Vérifier le domaine C2"),
+  ).toBeVisible();
+  await expect(page.getByText("En cours").first()).toBeVisible();
+  await expect(page.getByText("Aucun opérateur actif.")).toHaveCount(0);
+  expect(api.unhandled).toEqual([]);
+});
+
+test("ouverture de session refusée par la divulgation externe", async ({
+  page,
+}) => {
+  const api = createWorkshopApi({
+    transferOutcome: "success",
+    openSessionOutcome: "external_llm_refused",
+  });
+  await launchWorkshop(page, api);
+  await openView(page, "Plan et tâches");
+  await page.getByLabel(/Je confirme l’acceptation de cette version/).check();
+  await page
+    .getByRole("button", { name: "Accepter le plan et créer les tâches" })
+    .click();
+
+  const readyCard = page
+    .getByRole("article")
+    .filter({ hasText: "Vérifier le domaine C2" });
+  await readyCard.getByRole("button", { name: "Attribuer à Codex" }).click();
+  await readyCard
+    .getByRole("button", { name: "Ouvrir la session Codex CLI" })
+    .click();
+
+  await expect(readyCard.getByRole("alert")).toContainText(
+    /Divulgation externe refusée/,
+  );
+  await expect(page.getByText("Aucun opérateur actif.")).toBeVisible();
+  expect(
+    api.requests.filter(
+      (request) =>
+        request.method === "POST" &&
+        request.path ===
+          `/api/investigations/${api.ids.investigation}/agent-sessions`,
+    ),
+  ).toHaveLength(1);
   expect(api.unhandled).toEqual([]);
 });
 
