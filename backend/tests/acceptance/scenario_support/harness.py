@@ -122,6 +122,10 @@ HUMAN_TOKEN = "m24-acceptance-human-token-0123456789abcdef"
 SESSION_KEY = "0123456789abcdef0123456789abcdef"
 TYPST_BINARY = os.environ.get("TYPST_BINARY", "typst")
 FIXED_NOW = datetime(2026, 11, 22, 12, 0, tzinfo=UTC)
+ANALYSIS_SECTION_PARAGRAPH = (
+    "ANALYSIS-PARAGRAPH: le second etage synthetique est decrit dans ce paragraphe."
+)
+TAIL_SECTION_PARAGRAPH = "TAIL-PARAGRAPH: portee synthetique finale de l'article."
 PLAN_TEXT_TEMPLATE = """## Lead 1 - Verifier le chargeur synthetique
 Identifiant: lead-loader
 Objectif: confirmer le second etage depuis les octets synthetiques.
@@ -417,10 +421,30 @@ async def seed_article(
         heading="Vue d'ensemble",
         paragraphs=(PublicationParagraphV1(text=lead.text, evidence_refs=lead.evidence_refs),),
     )
+    analysis_section = PublicationSectionV1(
+        kind=PublicationSectionKind.TECHNICAL,
+        heading="Analyse synthetique",
+        paragraphs=(
+            PublicationParagraphV1(
+                text=ANALYSIS_SECTION_PARAGRAPH,
+                evidence_refs=lead.evidence_refs,
+            ),
+        ),
+    )
+    tail_section = PublicationSectionV1(
+        kind=PublicationSectionKind.TECHNICAL,
+        heading="Portee synthetique",
+        paragraphs=(
+            PublicationParagraphV1(
+                text=TAIL_SECTION_PARAGRAPH,
+                evidence_refs=lead.evidence_refs,
+            ),
+        ),
+    )
     document = replace(
         base_v5.document,
         subject_id=subject.id,
-        sections=(overview_section,),
+        sections=(overview_section, analysis_section, tail_section),
     )
     preserved_semantics = tuple(
         paragraph
@@ -431,13 +455,26 @@ async def seed_article(
         anchor="section:0:paragraph:0001",
         spans=(SemanticTextSpanV1(role=SemanticRole.TEXT, text=lead.text),),
     )
+    analysis_semantics = SemanticParagraphV1(
+        anchor="section:1:paragraph:0001",
+        spans=(SemanticTextSpanV1(role=SemanticRole.TEXT, text=ANALYSIS_SECTION_PARAGRAPH),),
+    )
+    tail_semantics = SemanticParagraphV1(
+        anchor="section:2:paragraph:0001",
+        spans=(SemanticTextSpanV1(role=SemanticRole.TEXT, text=TAIL_SECTION_PARAGRAPH),),
+    )
     base_v5 = replace(
         base_v5,
         document=document,
         semantic_text=SemanticTextV1(
             schema_version=base_v5.semantic_text.schema_version,
             policy_version=base_v5.semantic_text.policy_version,
-            paragraphs=(*preserved_semantics, overview_semantics),
+            paragraphs=(
+                *preserved_semantics,
+                overview_semantics,
+                analysis_semantics,
+                tail_semantics,
+            ),
         ),
     )
     publication_bytes = ProductionArtifactStore.canonical_json_bytes(

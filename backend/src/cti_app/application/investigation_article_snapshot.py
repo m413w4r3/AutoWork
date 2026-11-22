@@ -39,7 +39,7 @@ from cti_app.domain.publication_document import (
     PublicationDocumentV7,
     PublicationDocumentV8,
     publication_document_from_json,
-    publication_document_text_anchors,
+    publication_renderable_body_anchors,
 )
 from cti_app.domain.publication_kind import PublicationKind
 
@@ -297,22 +297,14 @@ class ProductionArticleSnapshotAdapter:
         elif isinstance(document, PublicationDocumentV5):
             publication = document
         elif isinstance(document, PublicationDocumentV4):
-            anchors = publication_document_text_anchors(document)
+            anchors = publication_renderable_body_anchors(document)
             publication = None
         else:  # pragma: no cover - exhaustive union guard
             return ()
         if publication is not None:
-            anchors = publication_document_text_anchors(
-                publication.document,
-                references=publication.references,
-            )
-        paragraph_anchors = {
-            anchor: text
-            for anchor, text in anchors.items()
-            if re.fullmatch(r"lead:\d{4}|section:\d+:paragraph:\d{4}", anchor)
-        }
+            anchors = publication_renderable_body_anchors(publication.document)
         result = []
-        for anchor, text in sorted(paragraph_anchors.items())[:MAX_CONTEXT_PUBLICATION_ANCHORS]:
+        for anchor, text in sorted(anchors.items())[:MAX_CONTEXT_PUBLICATION_ANCHORS]:
             excerpt = " ".join(text.split())[:160].rstrip()
             if excerpt:
                 result.append(PublicationAnchorV1(anchor=anchor, excerpt=excerpt))

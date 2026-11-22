@@ -92,6 +92,8 @@ from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.rule_workbench import RuleValidationStatus
 from cti_app.domain.semantic_annotation import (
     SemanticTextV1,
+    lead_paragraph_anchor,
+    section_paragraph_anchor,
     semantic_text_from_json,
     semantic_text_to_json,
 )
@@ -1265,6 +1267,49 @@ def publication_document_text_anchors(
         result[f"figure:{figure.key}:caption"] = figure.caption
         result[f"figure:{figure.key}:provenance"] = figure.provenance
     return result
+
+
+def publication_renderable_body_anchors(
+    document: PublicationDocumentV4,
+    *,
+    render_duplicate_paragraphs: bool = False,
+) -> dict[str, str]:
+    """Return the article paragraph anchors the reader projection emits.
+
+    The Typst projection renders every lead paragraph, then section paragraphs,
+    with two deliberate legacy exclusions that validation must mirror exactly:
+
+    * a section paragraph whose normalized text equals a lead paragraph is not
+      emitted (the overview often restates the lead);
+    * when the canonical ``Vue d'ensemble`` section is extracted into the
+      article overview fields, section 0 is not emitted as body paragraphs.
+
+    V9/V10 placements resolve against explicit paragraph anchors and render
+    every section paragraph, so ``render_duplicate_paragraphs=True`` disables
+    both exclusions.  Analyst notes must anchor on this exact set: any other
+    text anchor has no anchor target in the body.
+    """
+    if not isinstance(document, PublicationDocumentV4):
+        raise ValueError("Renderable body anchors require a validated V4 document")
+    lead_fingerprints = (
+        set()
+        if render_duplicate_paragraphs
+        else {" ".join(item.text.casefold().split()) for item in document.lead}
+    )
+    anchors = {
+        lead_paragraph_anchor(index): item.text for index, item in enumerate(document.lead, start=1)
+    }
+    has_overview = (
+        not render_duplicate_paragraphs and extract_article_overview(document.sections) is not None
+    )
+    for section_index, section in enumerate(document.sections):
+        if has_overview and section_index == 0 and is_article_overview_heading(section.heading):
+            continue
+        for paragraph_index, paragraph in enumerate(section.paragraphs, start=1):
+            if " ".join(paragraph.text.casefold().split()) in lead_fingerprints:
+                continue
+            anchors[section_paragraph_anchor(section_index, paragraph_index)] = paragraph.text
+    return anchors
 
 
 def order_publication_references(
@@ -4156,6 +4201,7 @@ __all__ = [
     "publication_document_v9_to_json",
     "publication_document_v10_from_json",
     "publication_document_v10_to_json",
+    "publication_renderable_body_anchors",
     "select_article_timeline_key_events_v1",
     "select_publication_timeline_key_events_v2",
     "select_publication_timeline_key_events_v3",

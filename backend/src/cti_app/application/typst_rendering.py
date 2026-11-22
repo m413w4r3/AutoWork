@@ -102,6 +102,7 @@ from cti_app.domain.publication_document import (
     is_article_overview_heading,
     publication_document_text_anchors,
     publication_document_v5_sha256,
+    publication_renderable_body_anchors,
     select_publication_timeline_key_events_v2,
     select_publication_timeline_key_events_v3,
 )
@@ -1486,14 +1487,15 @@ def publication_content_section_types(
 
     rendered_opinion = publication_v6.rendered_opinion if publication_v6 is not None else None
     attached_figure_ids = {item.asset_id for item in opinion.protocol_figures} if opinion else set()
-    body_anchor_names = {
-        *(lead_paragraph_anchor(index) for index, _ in enumerate(document.lead, start=1))
-    }
-    lead_fingerprints = {" ".join(item.text.casefold().split()) for item in document.lead}
-    for section_index, section in enumerate(document.sections):
-        for paragraph_index, paragraph in enumerate(section.paragraphs, start=1):
-            if " ".join(paragraph.text.casefold().split()) not in lead_fingerprints:
-                body_anchor_names.add(section_paragraph_anchor(section_index, paragraph_index))
+    publication_v9 = (
+        value if isinstance(value, (PublicationDocumentV9, PublicationDocumentV10)) else None
+    )
+    body_anchor_names = set(
+        publication_renderable_body_anchors(
+            document,
+            render_duplicate_paragraphs=publication_v9 is not None,
+        )
+    )
     has_unanchored_observations = bool(
         opinion is not None
         and any(item.anchor not in body_anchor_names for item in opinion.observations)
@@ -1711,10 +1713,7 @@ class TypstDraftPreviewDocument:
             raise ValueError("Draft preview infrastructure graph is not pinned to its V5 opinion")
         if publication_document_v5_sha256(self.base_publication) != expected_body_sha256:
             raise ValueError("Draft opinion does not identify this exact V5 publication")
-        anchors = publication_document_text_anchors(
-            self.base_publication.document,
-            references=self.base_publication.references,
-        )
+        anchors = publication_renderable_body_anchors(self.base_publication.document)
         if any(
             item.anchor not in anchors or not item.anchor.startswith(("lead:", "section:"))
             for item in self.analyst_opinion.observations
@@ -2864,23 +2863,10 @@ def project_publication_to_typst_model(
             references.append(reference)
         return references
 
-    lead_fingerprints = (
-        set()
-        if publication_v9 is not None
-        else {" ".join(lead_paragraph.text.casefold().split()) for lead_paragraph in document.lead}
+    body_anchor_texts = publication_renderable_body_anchors(
+        document,
+        render_duplicate_paragraphs=publication_v9 is not None,
     )
-    body_anchor_texts = {
-        lead_paragraph_anchor(index): lead_paragraph.text
-        for index, lead_paragraph in enumerate(document.lead, start=1)
-    }
-    for section_index, publication_section in enumerate(document.sections):
-        for paragraph_index, paragraph in enumerate(publication_section.paragraphs, start=1):
-            if publication_v9 is not None or (
-                " ".join(paragraph.text.casefold().split()) not in lead_fingerprints
-            ):
-                body_anchor_texts[section_paragraph_anchor(section_index, paragraph_index)] = (
-                    paragraph.text
-                )
 
     notes_by_anchor: dict[str, list[dict[str, Any]]] = {}
     unanchored_observations: list[dict[str, Any]] = []
@@ -2973,8 +2959,7 @@ def project_publication_to_typst_model(
         paragraph_blocks = [
             (paragraph_index, paragraph)
             for paragraph_index, paragraph in enumerate(publication_section.paragraphs, start=1)
-            if publication_v9 is not None
-            or " ".join(paragraph.text.casefold().split()) not in lead_fingerprints
+            if section_paragraph_anchor(section_index, paragraph_index) in body_anchor_texts
         ]
         if publication_section.heading and paragraph_blocks:
             display_heading, _heading_spans = project_text("", publication_section.heading)

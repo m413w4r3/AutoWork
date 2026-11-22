@@ -39,6 +39,8 @@ from cti_app.domain.investigation import (
 )
 from cti_app.domain.production import ProseAuthority
 from tests.acceptance.scenario_support.harness import (
+    ANALYSIS_SECTION_PARAGRAPH,
+    TAIL_SECTION_PARAGRAPH,
     RunningScenarioAgent,
     ScenarioApplication,
     ScenarioMaterial,
@@ -62,7 +64,10 @@ NOTE_PATH = "notes/humaines/analyste-note.md"
 OBSERVATION_NOTE_PATH = "notes/humaines/claude-observation.md"
 FINDING_NOTE_PATH = "notes/humaines/claude-verification.md"
 NOTE_A_ANCHOR = "lead:0001"
-NOTE_B_ANCHOR = "section:0:paragraph:0001"
+NOTE_B_ANCHOR = "section:1:paragraph:0001"
+# The overview restates the lead: the reader projection drops it, so a note may
+# not anchor there even though the raw text-anchor space contains it.
+DEDUPLICATED_ANCHOR = "section:0:paragraph:0001"
 NOTE_A_TEXT = "NOTE-ALPHA-ANCRAGE: le chargeur synthetique contacte le domaine de commande."
 NOTE_A_REVISED = (
     "NOTE-ALPHA-ANCRAGE-REVISE: le chargeur synthetique contacte le domaine de commande "
@@ -903,6 +908,26 @@ class ScenarioJourney:
         finding_id = self.state.imported_finding_id
         observation_id = self.state.imported_observation_id
         assert finding_id is not None and observation_id is not None
+        state = await self._operator_state(client)
+        refused = await self._human(
+            client,
+            "POST",
+            f"/api/investigations/{self.state.investigation_id}/note-proposals",
+            json={
+                "anchor": DEDUPLICATED_ANCHOR,
+                "target_block_type": "section",
+                "bridge_block_type": "key_findings",
+                "consultation_type": "draft_text",
+                "finding_refs": [str(finding_id)],
+                "observation_refs": [str(self.state.claude_vt_observation_id)],
+                "task_id": str(self.state.loader_task_id),
+                "expected_working_state_version": state["working_state_version"],
+                "expected_working_state_sha256": state["working_state_sha256"],
+            },
+            headers={"Idempotency-Key": "m24-acceptance-note-deduplicated-refused"},
+        )
+        assert refused.status_code == 422, refused.text
+        assert refused.json()["detail"]["code"] == "invalid_note_anchor", refused.json()
         drafts = (
             (NOTE_A_ANCHOR, "lead", NOTE_A_TEXT, "m24-acceptance-note-a"),
             (NOTE_B_ANCHOR, "section", NOTE_B_TEXT, "m24-acceptance-note-b"),
@@ -953,7 +978,9 @@ class ScenarioJourney:
         assert NOTE_A_ANCHOR != NOTE_B_ANCHOR
         self.journal.record(
             "step_16_bridge_drafts_two_notes",
-            f"two Bridge notes materialised at {NOTE_A_ANCHOR} and {NOTE_B_ANCHOR}",
+            f"the deduplicated anchor {DEDUPLICATED_ANCHOR} was refused "
+            f"invalid_note_anchor; two Bridge notes materialised at {NOTE_A_ANCHOR} "
+            f"and {NOTE_B_ANCHOR}",
         )
 
     async def step_17_human_accepts_both_drafts(self, client: Any) -> None:
@@ -1207,6 +1234,7 @@ class ScenarioJourney:
         )
         assert response.status_code == 200, response.text[:2000]
         assert response.headers["content-type"].startswith("application/pdf")
+        assert response.headers["content-disposition"].startswith("inline;"), response.headers
         assert response.content.startswith(b"%PDF-1.7"), response.content[:16]
         pdf_sha = response.headers["x-pdf-sha256"]
         assert len(pdf_sha) == 64
@@ -1237,6 +1265,24 @@ class ScenarioJourney:
         normalized = " ".join(extracted.stdout.split())
         assert "NOTE-ALPHA-ANCRAGE-REVISE" in normalized, normalized[:2000]
         assert "NOTE-BETA-ANCRAGE" in normalized, normalized[:2000]
+        # Placement, not mere presence: each note must follow exactly the
+        # paragraph it anchors on, before the next article paragraph.
+        lead_position = normalized.index("Example finding.")
+        note_a_position = normalized.index("NOTE-ALPHA-ANCRAGE-REVISE")
+        anchor_position = normalized.index(ANALYSIS_SECTION_PARAGRAPH)
+        note_b_position = normalized.index("NOTE-BETA-ANCRAGE")
+        tail_position = normalized.index(TAIL_SECTION_PARAGRAPH)
+        assert (
+            lead_position < note_a_position < anchor_position < note_b_position < tail_position
+        ), (
+            lead_position,
+            note_a_position,
+            anchor_position,
+            note_b_position,
+            tail_position,
+            normalized[:3000],
+        )
+        assert normalized.count("NOTE-BETA-ANCRAGE") == 1
         draft = await self._opinion(client)
         anchors = {note["anchor"] for note in draft["observations"]}
         assert anchors == {NOTE_A_ANCHOR, NOTE_B_ANCHOR}
@@ -1253,7 +1299,8 @@ class ScenarioJourney:
         assert violations == (), violations
         self.journal.record(
             "step_21_notes_at_two_anchors",
-            "two note anchors rendered in the real PDF; every citation resolves canonically",
+            "each note is printed immediately after its anchor paragraph in the real PDF; "
+            "every citation resolves canonically",
         )
 
     async def step_22_interrupt_claude_session(self, client: Any) -> None:

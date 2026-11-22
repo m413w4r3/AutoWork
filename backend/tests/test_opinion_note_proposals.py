@@ -90,7 +90,7 @@ def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def base_v5_with_section() -> Any:
+def base_v5_with_section(section_paragraph: str | None = None) -> Any:
     """The shared publication fixture with one section anchor available."""
     from cti_app.application.publication_builder import (
         SemanticAnnotator,
@@ -116,7 +116,11 @@ def base_v5_with_section() -> Any:
                 heading="Campagne",
                 paragraphs=(
                     PublicationParagraphV1(
-                        text="Le paragraphe de section décrit la campagne observée.",
+                        text=(
+                            section_paragraph
+                            if section_paragraph is not None
+                            else "Le paragraphe de section décrit la campagne observée."
+                        ),
                         evidence_refs=(
                             PublicationEvidenceRefV1(
                                 source_document_id=UUID("00000000-0000-0000-0000-000000000002"),
@@ -214,9 +218,9 @@ class _Uow:
 
 
 class _Fixture:
-    def __init__(self) -> None:
+    def __init__(self, *, section_paragraph: str | None = None) -> None:
         harness = make_opinion_harness()
-        self._extend_base_with_section(harness)
+        self._extend_base_with_section(harness, section_paragraph)
         self.harness = harness
         self.observations = _ObservationRepository((harness.observation,))
         self.invocations = InMemoryToolInvocationRepository()
@@ -239,8 +243,10 @@ class _Fixture:
         )
 
     @staticmethod
-    def _extend_base_with_section(harness: OpinionHarness) -> None:
-        extended = base_v5_with_section()
+    def _extend_base_with_section(
+        harness: OpinionHarness, section_paragraph: str | None = None
+    ) -> None:
+        extended = base_v5_with_section(section_paragraph)
         base_bytes = ProductionArtifactStore.canonical_json_bytes(
             serialize_publication_document(extended)
         )
@@ -304,6 +310,7 @@ class _ScriptedAdvisor:
         fixture: _Fixture,
         *,
         text: str | dict[str, str] = "Texte rédigé par Bridge pour la note ciblée.",
+        sentence_texts: tuple[str, ...] | None = None,
         anchored_text: str | None = None,
         response: bool = True,
         advisor_status: str = "succeeded",
@@ -313,6 +320,7 @@ class _ScriptedAdvisor:
     ) -> None:
         self.fixture = fixture
         self.text = text
+        self.sentence_texts = sentence_texts
         self.anchored_text = anchored_text
         self.response = response
         self.advisor_status = advisor_status
@@ -353,7 +361,12 @@ class _ScriptedAdvisor:
                     "form": "analyst_note",
                     "anchor": request.anchor,
                     "usable": self.usable,
-                    "sentences": [{"text": text}],
+                    "sentences": [
+                        {"text": value}
+                        for value in (
+                            self.sentence_texts if self.sentence_texts is not None else (text,)
+                        )
+                    ],
                 }
             ],
             "bridge_provenance": {
@@ -558,6 +571,70 @@ def test_note_acceptance_uses_stored_bridge_text_and_human_decision() -> None:
         assert acceptance.proposal.status is NoteProposalStatus.ACCEPTED
         assert acceptance.proposal.accepted_opinion_version == 1
         assert acceptance.proposal.analyst_decision_id == acceptance.decision.id
+
+    _run(scenario())
+
+
+def test_bridge_sentences_preserve_stored_paragraph_and_list_breaks() -> None:
+    """R07 M2: sentence transport must not flatten stored paragraph/list breaks."""
+    fixture = _Fixture()
+    sentence_texts = (
+        "Premier paragraphe de la note.\n",
+        "\nDeuxieme paragraphe de la note.",
+        "- premier point\n- second point",
+    )
+    expected = (
+        "Premier paragraphe de la note.\n\nDeuxieme paragraphe de la note. "
+        "- premier point\n- second point"
+    )
+
+    async def scenario() -> None:
+        advisor = fixture.advisor(sentence_texts=sentence_texts)
+        proposal = _materialised_proposal(fixture, await fixture.request(advisor))
+        assert proposal.proposed_text == expected
+        assert "\n\n" in proposal.proposed_text
+        assert "- premier point\n- second point" in proposal.proposed_text
+        acceptance = await fixture.accept(proposal)
+        note = acceptance.opinion.observations[0]
+        assert note.text == expected
+        assert note.bridge_draft_ref is not None
+        assert note.bridge_draft_ref.text_sha256 == _sha256(expected.encode("utf-8"))
+
+    _run(scenario())
+
+
+def test_legacy_space_joined_bridge_note_still_verifies() -> None:
+    """R07 M2 keeps pre-fix notes verifiable against their immutable Bridge call."""
+    sentences = ["Premier paragraphe de la note.\n", "\nDeuxieme paragraphe de la note."]
+    materialised = "Premier paragraphe de la note.\n\nDeuxieme paragraphe de la note."
+    legacy = "Premier paragraphe de la note.\n \nDeuxieme paragraphe de la note."
+
+    assert AnalystOpinionService._sentence_text_matches_source(
+        sentences, _sha256(materialised.encode("utf-8"))
+    )
+    assert AnalystOpinionService._sentence_text_matches_source(
+        sentences, _sha256(legacy.encode("utf-8"))
+    )
+    assert not AnalystOpinionService._sentence_text_matches_source(sentences, "0" * 64)
+
+
+def test_acceptance_refuses_a_deduplicated_section_anchor() -> None:
+    """R07 B1: an anchor the renderer drops cannot enter the canonical opinion."""
+    fixture = _Fixture(section_paragraph=_base_v5().document.lead[0].text)
+
+    async def scenario() -> None:
+        advisor = fixture.advisor(text="Note sur un paragraphe non rendu.")
+        proposal = _materialised_proposal(
+            fixture,
+            await fixture.request(
+                advisor,
+                anchor=SECTION_ANCHOR,
+                target_block_type=NoteTargetBlockType.SECTION,
+            ),
+        )
+        with pytest.raises(OpinionError) as refused:
+            await fixture.accept(proposal)
+        assert refused.value.code is OpinionErrorCode.INVALID_OBSERVATION_ANCHOR
 
     _run(scenario())
 

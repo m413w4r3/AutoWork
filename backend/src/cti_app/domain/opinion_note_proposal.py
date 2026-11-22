@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -85,6 +86,26 @@ def note_proposal_note_id(proposal_id: UUID) -> UUID:
     if not isinstance(proposal_id, UUID):
         raise TypeError("A note proposal identity must be a UUID")
     return uuid5(_NOTE_PROPOSAL_NOTE_NAMESPACE, str(proposal_id))
+
+
+def note_draft_text_from_sentences(sentence_texts: Sequence[str]) -> str:
+    """Join Bridge sentence texts without flattening stored paragraph breaks.
+
+    Sentence texts are stored verbatim.  Ordinary sentences keep the historical
+    single-space join (so existing note texts and their SHA-256 do not change),
+    but a boundary that already carries a newline is joined as-is: a stored
+    paragraph break (``\\n\\n``) or a list line therefore survives byte for byte.
+    This exact function materialises the proposal text and recomputes the
+    acceptance provenance hash.
+    """
+    if not sentence_texts:
+        return ""
+    result = sentence_texts[0]
+    for text in sentence_texts[1:]:
+        if not result.endswith(("\n", "\r")) and not text.startswith(("\n", "\r")):
+            result += " "
+        result += text
+    return result
 
 
 def _validate_sha256(value: str, name: str) -> None:
@@ -394,5 +415,6 @@ __all__ = [
     "NoteProposalV1",
     "NoteTargetBlockType",
     "anchor_target_block_type",
+    "note_draft_text_from_sentences",
     "note_proposal_note_id",
 ]
