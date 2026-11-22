@@ -2,18 +2,24 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import gzip
 import hashlib
 import importlib.metadata
+import io
 import json
 import math
 import os
 import re
 import shutil
+import stat
 import subprocess
+import sys
+import tarfile
 import tempfile
 import time
 import zipfile
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -25,9 +31,14 @@ from cti_app.application.code_features import CodeFeatureService
 from cti_app.application.confined_analysis import (
     CONFINED_ANALYSIS_RESULT_SCHEMA,
     CONFINED_ANALYSIS_WORKER_RESOURCE_LIMIT_FIELDS,
+    CONFINED_SCRIPT_ARCHIVE_MIME,
+    CONFINED_SCRIPT_INTERPRETERS,
+    CONFINED_SCRIPT_MAX_ARCHIVE_FILES,
+    CONFINED_SCRIPT_OUTPUTS_BUCKET,
     ConfinedAnalysisArtifactKind,
     ConfinedAnalysisJobParameters,
     ConfinedAnalysisTool,
+    ConfinedScriptSpec,
     archive_member_transfer_bucket,
     validate_archive_tool_request,
 )
@@ -52,12 +63,14 @@ from cti_app.domain.rule_workbench import YaraExecutionStatus, detect_file_forma
 from cti_app.infrastructure.analysis_subprocess import (
     AnalysisSubprocessStatus,
     run_analysis_subprocess,
+    set_process_dumpable,
 )
 from cti_app.infrastructure.capa import CapaRunner, parse_capa_output, ruleset_manifest
 from cti_app.infrastructure.confined_suricata import validate_suricata_rule_source
 from cti_app.infrastructure.floss_adapter import _parse_floss_payload
 from cti_app.infrastructure.jadx import jadx_provenance
 from cti_app.infrastructure.pcap_reader import PcapReaderError, read_capture
+from cti_app.infrastructure.seccomp_network import network_seccomp_filter_program
 from cti_app.infrastructure.smda import SmdaAdapter
 from cti_app.infrastructure.static_analysis import StaticFeatureExtractor, build_packing_signals
 from cti_app.infrastructure.yara_runner import IsolatedYaraRunner, YaraRunnerLimits
@@ -139,6 +152,10 @@ async def execute_confined_analysis_job(
 ) -> str:
     """Verify canonical input identity, run one closed operation, and persist its proof."""
     async with asyncio.timeout(parameters.timeout_seconds):
+        if parameters.tool is ConfinedAnalysisTool.SCRIPT:
+            # Raises before any canonical lookup or execution when the durable
+            # payload does not carry a valid closed script contract.
+            parameters.validated_script()
         if parameters.tool is ConfinedAnalysisTool.LOCAL_COMMAND:
             _validate_local_command_arguments(
                 parameters.arguments,
@@ -187,6 +204,7 @@ async def execute_confined_analysis_job(
                 ConfinedAnalysisTool.CAPINFOS,
                 ConfinedAnalysisTool.SURICATA_VALIDATE_RULES,
                 ConfinedAnalysisTool.SURICATA_REPLAY,
+                ConfinedAnalysisTool.SCRIPT,
             }
         ):
             raise ConfinedAnalysisArtifactMismatch("analysis_tool_requires_sample_artifact")
@@ -415,6 +433,8 @@ async def _execute_tool(
         )
     if tool is ConfinedAnalysisTool.LOCAL_COMMAND:
         return await _run_local_command(parameters, payload, settings)
+    if tool is ConfinedAnalysisTool.SCRIPT:
+        return await _run_script(parameters, payload, blobs=blobs, settings=settings)
     if tool is ConfinedAnalysisTool.ZIP_MEMBERS:
         return await run_zip_members(
             payload,
@@ -463,6 +483,630 @@ async def _execute_tool(
     }:
         return await _run_suricata(parameters, payload, blobs=blobs, settings=settings)
     return {"status": "UNAVAILABLE", "available_reason": "analysis_tool_unavailable"}
+
+
+@dataclass(frozen=True, slots=True)
+class ScriptSandboxCapability:
+    """Result of an explicit, executed probe of the script confinement stack."""
+
+    kind: str | None
+    detail: str
+
+
+_SCRIPT_NETWORK_PROBE = (
+    "import socket, sys\ntry:\n    socket.socket()\nexcept OSError:\n    sys.exit(0)\nsys.exit(7)\n"
+)
+_SCRIPT_PYTHON_VERSION = re.compile(r"^Python ([0-9]+\.[0-9]+\.[0-9]+)$")
+_SCRIPT_STREAM_INTERNAL_NAMES = frozenset({"stdout.txt", "stderr.txt"})
+
+
+def _interpreter_readonly_binds(interpreter: str) -> tuple[tuple[str, str], ...]:
+    """Binds needed when the allowlisted interpreter lives outside /usr."""
+    resolved = Path(interpreter).resolve()
+    if resolved.is_relative_to("/usr"):
+        return ()
+    prefix = Path(sys.base_prefix).resolve()
+    if prefix != Path("/") and not prefix.is_relative_to("/usr"):
+        return ((str(prefix), str(prefix)),)
+    return ((str(resolved.parent), str(resolved.parent)),)
+
+
+def _bwrap_prefix(interpreter: str) -> list[str] | None:
+    executable = shutil.which("bwrap")
+    if executable is None:
+        return None
+    command = [
+        executable,
+        "--unshare-net",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--die-with-parent",
+        "--ro-bind",
+        "/usr",
+        "/usr",
+    ]
+    for system_path in ("/lib", "/lib64", "/lib32"):
+        if Path(system_path).exists():
+            command.extend(("--ro-bind", system_path, system_path))
+    for source, target in _interpreter_readonly_binds(interpreter):
+        command.extend(("--ro-bind", source, target))
+    return command
+
+
+def _probe_bwrap_script_sandbox(interpreter: str) -> bool:
+    prefix = _bwrap_prefix(interpreter)
+    if prefix is None:
+        return False
+    with tempfile.TemporaryFile(mode="w+b") as filter_file:
+        filter_file.write(network_seccomp_filter_program())
+        filter_file.flush()
+        filter_file.seek(0)
+        file_descriptor = filter_file.fileno()
+        command = [
+            *prefix,
+            "--dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--tmpfs",
+            "/tmp",
+            "--chdir",
+            "/tmp",
+            "--seccomp",
+            str(file_descriptor),
+            "--",
+            interpreter,
+            "-I",
+            "-c",
+            _SCRIPT_NETWORK_PROBE,
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+                pass_fds=(file_descriptor,),
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+    return completed.returncode == 0
+
+
+def _probe_seccomp_script_sandbox(interpreter: str) -> bool:
+    from cti_app.infrastructure.seccomp_network import install_network_seccomp_filter
+
+    try:
+        completed = subprocess.run(
+            [interpreter, "-I", "-c", _SCRIPT_NETWORK_PROBE],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+            preexec_fn=install_network_seccomp_filter,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0
+
+
+def probe_script_sandbox() -> ScriptSandboxCapability:
+    """Prove which confinement stack can actually run a network-denied script.
+
+    ``bwrap`` proves namespace filesystem isolation and network denial in one
+    execution. Without it, the seccomp filter alone still denies network calls;
+    the analysis-worker container supplies the filesystem boundary in that
+    deployment. No path returns a capability that was not executed. The probe
+    runs again before each script because host user namespaces can refuse
+    namespace creation transiently; a failed probe selects the seccomp-only
+    profile instead of launching a less confined process silently.
+    """
+    interpreter = shutil.which("python3")
+    if interpreter is None:
+        return ScriptSandboxCapability(None, "python3_interpreter_absent")
+    if _probe_bwrap_script_sandbox(interpreter):
+        return ScriptSandboxCapability("bwrap", "namespaces_and_seccomp_network_denied")
+    if _probe_seccomp_script_sandbox(interpreter):
+        return ScriptSandboxCapability("seccomp", "seccomp_network_denied_container_filesystem")
+    return ScriptSandboxCapability(None, "network_confinement_probe_failed")
+
+
+@functools.cache
+def _attested_script_sandbox_kind() -> str | None:
+    """Sandbox kind for the worker probe payload; execution re-probes fresh."""
+    return probe_script_sandbox().kind
+
+
+@functools.cache
+def _python_interpreter_version(interpreter: str) -> str | None:
+    try:
+        completed = subprocess.run(
+            [interpreter, "--version"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=3,
+            env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = _SCRIPT_PYTHON_VERSION.match((completed.stdout + completed.stderr).strip())
+    return match.group(1) if completed.returncode == 0 and match else None
+
+
+def _sha256_file(path: Path) -> str | None:
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(64 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def _bwrap_script_argv(
+    interpreter: str,
+    script_path: Path,
+    input_path: Path,
+    scratch: Path,
+    *,
+    seccomp_descriptor: int,
+) -> list[str] | None:
+    prefix = _bwrap_prefix(interpreter)
+    if prefix is None:
+        return None
+    return [
+        *prefix,
+        "--dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--tmpfs",
+        "/tmp",
+        "--dir",
+        "/analysis",
+        "--ro-bind",
+        str(script_path),
+        "/analysis/script.py",
+        "--dir",
+        "/analysis/input",
+        "--ro-bind",
+        str(input_path),
+        "/analysis/input/input.bin",
+        "--dir",
+        "/analysis/work",
+        "--bind",
+        str(scratch),
+        "/analysis/work",
+        "--seccomp",
+        str(seccomp_descriptor),
+        "--chdir",
+        "/analysis/work",
+        "--",
+        interpreter,
+        "-I",
+        "-u",
+        "/analysis/script.py",
+    ]
+
+
+@dataclass(frozen=True, slots=True)
+class _ScriptLaunch:
+    argv: tuple[str, ...]
+    pass_fds: tuple[int, ...]
+    deny_network: bool
+    cwd: Path | None
+    environment: Mapping[str, str]
+    logical_argv: tuple[str, ...]
+    seccomp_file: Any | None
+
+
+def _script_environment(input_path: str, scratch_path: str) -> dict[str, str]:
+    return {
+        "PATH": "/usr/bin:/bin",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "HOME": scratch_path,
+        "TMPDIR": scratch_path,
+        "AUTOWORK_SCRIPT_INPUT": input_path,
+        "AUTOWORK_SCRIPT_SCRATCH": scratch_path,
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONNOUSERSITE": "1",
+    }
+
+
+def _build_script_launch(
+    mode: str,
+    interpreter: str,
+    script_path: Path,
+    input_path: Path,
+    scratch: Path,
+) -> _ScriptLaunch | None:
+    if mode == "bwrap":
+        seccomp_file = tempfile.TemporaryFile(mode="w+b")
+        try:
+            seccomp_file.write(network_seccomp_filter_program())
+            seccomp_file.flush()
+            seccomp_file.seek(0)
+            descriptor = seccomp_file.fileno()
+            argv = _bwrap_script_argv(
+                interpreter,
+                script_path,
+                input_path,
+                scratch,
+                seccomp_descriptor=descriptor,
+            )
+        except BaseException:
+            seccomp_file.close()
+            raise
+        if argv is None:
+            seccomp_file.close()
+            return None
+        return _ScriptLaunch(
+            argv=tuple(argv),
+            pass_fds=(descriptor,),
+            deny_network=False,
+            cwd=None,
+            environment=_script_environment("/analysis/input/input.bin", "/analysis/work"),
+            logical_argv=("python3", "-I", "-u", "/analysis/script.py"),
+            seccomp_file=seccomp_file,
+        )
+    return _ScriptLaunch(
+        argv=(interpreter, "-I", "-u", str(script_path)),
+        pass_fds=(),
+        deny_network=True,
+        cwd=scratch,
+        environment=_script_environment(str(input_path), str(scratch)),
+        logical_argv=("python3", "-I", "-u", "<script>"),
+        seccomp_file=None,
+    )
+
+
+def _redacted_script_stream(
+    content: bytes, *, stream_limit: int, preview_limit: int
+) -> tuple[str, bool, str, int]:
+    """Return (preview, measured_truncated, full_redacted, measured_bytes)."""
+    measured = len(content)
+    truncated = measured > stream_limit
+    bounded = content[:stream_limit]
+    full_redacted = sanitize_evidence_text(
+        bounded.decode("utf-8", "replace"), max_chars=stream_limit + 1
+    )
+    preview = sanitize_evidence_text(full_redacted, max_chars=preview_limit)
+    return preview, truncated, full_redacted, measured
+
+
+def _read_nofollow(path: Path, *, remaining: int) -> bytes | None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return None
+    try:
+        chunks: list[bytes] = []
+        left = remaining
+        while left > 0:
+            chunk = os.read(descriptor, min(64 * 1024, left))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            left -= len(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _archive_script_outputs(
+    scratch: Path,
+    *,
+    stdout_text: str,
+    stderr_text: str,
+    raw_budget: int,
+    max_files: int,
+) -> tuple[bytes, list[dict[str, Any]], list[str], bool]:
+    """Build a deterministic gzip tar of regular scratch outputs, never symlinks."""
+    files: dict[str, bytes] = {}
+    symlinks: list[str] = []
+    truncated = False
+    total = 0
+    for directory, dirnames, filenames in os.walk(scratch, followlinks=False):
+        base = Path(directory)
+        kept_directories: list[str] = []
+        for name in sorted(dirnames):
+            candidate = base / name
+            if candidate.is_symlink():
+                symlinks.append(candidate.relative_to(scratch).as_posix())
+            else:
+                kept_directories.append(name)
+        dirnames[:] = kept_directories
+        for name in sorted(filenames):
+            candidate = base / name
+            relative = candidate.relative_to(scratch).as_posix()
+            try:
+                stat_result = candidate.lstat()
+            except OSError:
+                continue
+            if stat.S_ISLNK(stat_result.st_mode):
+                symlinks.append(relative)
+                continue
+            if not stat.S_ISREG(stat_result.st_mode):
+                continue
+            if relative in _SCRIPT_STREAM_INTERNAL_NAMES:
+                truncated = True
+                continue
+            if len(files) >= max_files or total >= raw_budget:
+                truncated = True
+                continue
+            content = _read_nofollow(candidate, remaining=raw_budget - total)
+            if content is None:
+                continue
+            if len(content) < stat_result.st_size:
+                truncated = True
+            files[relative] = content
+            total += len(content)
+    for name, text in (("stdout.txt", stdout_text), ("stderr.txt", stderr_text)):
+        if text:
+            files[name] = text.encode("utf-8")
+    tar_buffer = io.BytesIO()
+    with tarfile.open(fileobj=tar_buffer, mode="w", format=tarfile.PAX_FORMAT) as archive:
+        for name, content in sorted(files.items()):
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            info.mtime = 0
+            info.uid = info.gid = 0
+            info.uname = info.gname = ""
+            info.mode = 0o600
+            archive.addfile(info, io.BytesIO(content))
+    compressed = io.BytesIO()
+    with gzip.GzipFile(fileobj=compressed, filename="", mode="wb", mtime=0) as stream:
+        stream.write(tar_buffer.getvalue())
+    output_files = [
+        {
+            "path": name,
+            "size_bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        }
+        for name, content in sorted(files.items())
+        if name not in _SCRIPT_STREAM_INTERNAL_NAMES
+    ]
+    return compressed.getvalue(), output_files, sorted(symlinks), truncated
+
+
+def _script_status(status: AnalysisSubprocessStatus, stderr: bytes) -> tuple[str, str | None]:
+    if status is AnalysisSubprocessStatus.FAILED_TO_START:
+        return "UNAVAILABLE", "script_confinement_unavailable"
+    if status is AnalysisSubprocessStatus.TIMED_OUT:
+        return "TIMED_OUT", "script_timed_out"
+    if status is AnalysisSubprocessStatus.OUTPUT_LIMIT:
+        return "OUTPUT_LIMIT", "script_output_limit"
+    if status is AnalysisSubprocessStatus.DIRECTORY_LIMIT:
+        return "DIRECTORY_LIMIT", "script_scratch_quota_exceeded"
+    if status is AnalysisSubprocessStatus.PROCESS_LIMIT:
+        return "PROCESS_LIMIT", "script_process_limit_exceeded"
+    if status is AnalysisSubprocessStatus.NON_ZERO_EXIT:
+        if stderr.lstrip().startswith(b"bwrap:"):
+            return "UNAVAILABLE", "script_sandbox_failed"
+        return "NON_ZERO_EXIT", "script_exit_non_zero"
+    return "SUCCEEDED", None
+
+
+_SCRIPT_LIMIT_SETTINGS: tuple[tuple[str, str], ...] = (
+    ("wall_seconds", "analysis_script_wall_timeout_seconds"),
+    ("cpu_limit_seconds", "analysis_script_cpu_seconds"),
+    ("memory_limit_bytes", "analysis_script_memory_bytes"),
+    ("file_size_limit_bytes", "analysis_script_file_size_bytes"),
+    ("scratch_max_files", "analysis_script_scratch_max_files"),
+    ("scratch_max_bytes", "analysis_script_scratch_max_bytes"),
+    ("stdout_max_bytes", "analysis_script_stdout_max_bytes"),
+    ("stderr_max_bytes", "analysis_script_stderr_max_bytes"),
+    ("max_processes", "analysis_script_max_processes"),
+)
+
+
+def _script_limits_exceed_settings(spec: ConfinedScriptSpec, settings: Settings) -> bool:
+    return any(
+        float(getattr(spec, request_name)) > float(getattr(settings, setting_name))
+        for request_name, setting_name in _SCRIPT_LIMIT_SETTINGS
+    )
+
+
+async def _run_script(
+    parameters: ConfinedAnalysisJobParameters,
+    payload: bytes,
+    *,
+    blobs: BlobCatalogService,
+    settings: Settings,
+) -> dict[str, Any]:
+    spec = parameters.validated_script()
+    if spec is None:
+        return {"status": "POLICY_DENIED", "available_reason": "script_spec_required"}
+    if spec.interpreter not in CONFINED_SCRIPT_INTERPRETERS:
+        return {"status": "POLICY_DENIED", "available_reason": "script_interpreter_not_allowed"}
+    if _script_limits_exceed_settings(spec, settings):
+        return {"status": "POLICY_DENIED", "available_reason": "analysis_script_limit_exceeded"}
+    input_sha256 = hashlib.sha256(payload).hexdigest()
+    if input_sha256 != parameters.artifact_sha256:
+        raise ConfinedAnalysisArtifactMismatch("script_input_hash_mismatch")
+    try:
+        script_source = await blobs.read(
+            spec.script_blob_id, max_bytes=settings.analysis_script_max_source_bytes
+        )
+    except ValueError:
+        return {"status": "POLICY_DENIED", "available_reason": "script_source_too_large"}
+    except Exception:
+        return {"status": "UNAVAILABLE", "available_reason": "script_source_unavailable"}
+    if hashlib.sha256(script_source).hexdigest() != spec.script_sha256:
+        raise ConfinedAnalysisArtifactMismatch("script_source_hash_mismatch")
+    if len(script_source) > settings.analysis_script_max_source_bytes:
+        return {"status": "POLICY_DENIED", "available_reason": "script_source_too_large"}
+    if b"\x00" in script_source:
+        return {"status": "POLICY_DENIED", "available_reason": "script_source_invalid"}
+    interpreter = shutil.which(spec.interpreter)
+    if interpreter is None:
+        return {"status": "UNAVAILABLE", "available_reason": "script_interpreter_unavailable"}
+    sandbox = probe_script_sandbox()
+    if sandbox.kind is None:
+        return {
+            "status": "UNAVAILABLE",
+            "available_reason": "script_confinement_unavailable",
+            "sandbox_detail": sandbox.detail,
+        }
+    # The worker process holds store credentials. Make its procfs data
+    # non-dumpable to the same-UID child before it can inspect /proc/<ppid>.
+    set_process_dumpable(0)
+    interpreter_version = _python_interpreter_version(interpreter)
+    started = time.monotonic()
+    with tempfile.TemporaryDirectory(prefix="cti-confined-script-") as root_name:
+        root = Path(root_name)
+        input_directory = root / "input"
+        input_directory.mkdir(mode=0o700)
+        input_path = input_directory / "input.bin"
+        input_path.write_bytes(payload)
+        input_path.chmod(0o400)
+        input_directory.chmod(0o500)
+        script_path = root / "script.py"
+        script_path.write_bytes(script_source)
+        script_path.chmod(0o400)
+        scratch = root / "work"
+        scratch.mkdir(mode=0o700)
+        if _sha256_file(input_path) != input_sha256:
+            return {"status": "FAILED", "available_reason": "script_input_mutated"}
+
+        async def execute_launch(launch: _ScriptLaunch) -> Any:
+            try:
+                return await run_analysis_subprocess(
+                    launch.argv,
+                    timeout_seconds=spec.wall_seconds,
+                    output_limit=max(spec.stdout_max_bytes, spec.stderr_max_bytes),
+                    environment=dict(launch.environment),
+                    memory_limit_bytes=spec.memory_limit_bytes,
+                    deny_network=launch.deny_network,
+                    directory_limit_path=scratch,
+                    directory_max_bytes=spec.scratch_max_bytes,
+                    directory_max_files=spec.scratch_max_files,
+                    cpu_limit_seconds=spec.cpu_limit_seconds,
+                    file_size_limit_bytes=spec.file_size_limit_bytes,
+                    process_limit=spec.max_processes,
+                    pass_fds=launch.pass_fds,
+                    cwd=launch.cwd,
+                    sample_usage=True,
+                )
+            finally:
+                if launch.seccomp_file is not None:
+                    launch.seccomp_file.close()
+
+        launch = _build_script_launch(sandbox.kind, interpreter, script_path, input_path, scratch)
+        if launch is None:
+            return {
+                "status": "UNAVAILABLE",
+                "available_reason": "script_confinement_unavailable",
+            }
+        # No silent downgrade: if the probed sandbox fails to launch, the
+        # result is a typed confinement failure. Re-executing under a weaker
+        # profile could duplicate a partially started script.
+        execution = await execute_launch(launch)
+        duration = max(0.0, time.monotonic() - started)
+        input_modified = _sha256_file(input_path) != input_sha256
+        status_name, detail_code = _script_status(execution.status, execution.stderr)
+        if input_modified:
+            status_name, detail_code = "FAILED", "script_input_mutated"
+        preview_limit = max(
+            1024,
+            min(parameters.max_output_bytes // 8, 256 * 1024, spec.stdout_max_bytes),
+        )
+        stderr_preview_limit = max(
+            1024,
+            min(parameters.max_output_bytes // 8, 256 * 1024, spec.stderr_max_bytes),
+        )
+        stdout_preview, stdout_truncated, stdout_full, stdout_bytes = _redacted_script_stream(
+            execution.stdout,
+            stream_limit=spec.stdout_max_bytes,
+            preview_limit=preview_limit,
+        )
+        stderr_preview, stderr_truncated, stderr_full, stderr_bytes = _redacted_script_stream(
+            execution.stderr,
+            stream_limit=spec.stderr_max_bytes,
+            preview_limit=stderr_preview_limit,
+        )
+        outputs_blob_id: str | None = None
+        outputs_sha256: str | None = None
+        outputs_size_bytes: int | None = None
+        output_files: list[dict[str, Any]] = []
+        symlinks_skipped: list[str] = []
+        outputs_truncated = False
+        if status_name != "FAILED" and status_name != "UNAVAILABLE":
+            archive_bytes, output_files, symlinks_skipped, outputs_truncated = (
+                _archive_script_outputs(
+                    scratch,
+                    stdout_text=stdout_full,
+                    stderr_text=stderr_full,
+                    raw_budget=min(
+                        spec.scratch_max_bytes, settings.analysis_script_scratch_max_bytes
+                    ),
+                    max_files=min(CONFINED_SCRIPT_MAX_ARCHIVE_FILES, spec.scratch_max_files),
+                )
+            )
+            archive_sha256 = hashlib.sha256(archive_bytes).hexdigest()
+            output_blob = await blobs.ingest(
+                BytesIO(archive_bytes),
+                logical_bucket=CONFINED_SCRIPT_OUTPUTS_BUCKET,
+                mime_type=CONFINED_SCRIPT_ARCHIVE_MIME,
+            )
+            if (
+                output_blob.descriptor.sha256 != archive_sha256
+                or output_blob.descriptor.size != len(archive_bytes)
+            ):
+                raise RuntimeError("script_output_archive_hash_mismatch")
+            outputs_blob_id = str(output_blob.id)
+            outputs_sha256 = archive_sha256
+            outputs_size_bytes = len(archive_bytes)
+        usage = execution.usage
+        return {
+            "status": status_name,
+            "detail_code": detail_code,
+            "sandbox": sandbox.kind,
+            "sandbox_detail": sandbox.detail,
+            "interpreter": spec.interpreter,
+            "interpreter_version": interpreter_version,
+            "logical_argv": list(launch.logical_argv),
+            "script_artifact_kind": ConfinedAnalysisArtifactKind.SCRIPT.value,
+            "script_blob_id": str(spec.script_blob_id),
+            "script_sha256": spec.script_sha256,
+            "script_size_bytes": len(script_source),
+            "input_kind": parameters.artifact_kind.value,
+            "input_sha256": input_sha256,
+            "input_size_bytes": len(payload),
+            "input_modified": input_modified,
+            "exit_code": execution.exit_code,
+            "duration_seconds": round(duration, 6),
+            "resource_usage": {
+                "peak_rss_bytes": usage.peak_rss_bytes if usage is not None else None,
+                "peak_process_count": usage.peak_process_count if usage is not None else None,
+                "cpu_seconds": usage.cpu_seconds if usage is not None else None,
+                "source": "procfs_process_group_sample",
+            },
+            "limits": dict(spec.limits()),
+            "stdout": stdout_preview,
+            "stderr": stderr_preview,
+            "stdout_truncated": stdout_truncated or execution.stdout_truncated,
+            "stderr_truncated": stderr_truncated or execution.stderr_truncated,
+            "stdout_bytes": stdout_bytes,
+            "stderr_bytes": stderr_bytes,
+            "outputs_blob_id": outputs_blob_id,
+            "outputs_sha256": outputs_sha256,
+            "outputs_size_bytes": outputs_size_bytes,
+            "outputs_truncated": outputs_truncated,
+            "output_files": output_files,
+            "symlinks_skipped": symlinks_skipped,
+        }
 
 
 async def _run_static(
@@ -2177,6 +2821,35 @@ def _reduce_result(result: Mapping[str, Any]) -> dict[str, Any]:
             "event_counts",
             "engine_stats",
             "invalid_eve_lines",
+            "sandbox",
+            "sandbox_detail",
+            "interpreter",
+            "interpreter_version",
+            "logical_argv",
+            "script_artifact_kind",
+            "script_blob_id",
+            "script_sha256",
+            "script_size_bytes",
+            "input_kind",
+            "input_sha256",
+            "input_size_bytes",
+            "input_modified",
+            "exit_code",
+            "duration_seconds",
+            "resource_usage",
+            "limits",
+            "stdout",
+            "stderr",
+            "stdout_truncated",
+            "stderr_truncated",
+            "stdout_bytes",
+            "stderr_bytes",
+            "outputs_blob_id",
+            "outputs_sha256",
+            "outputs_size_bytes",
+            "outputs_truncated",
+            "output_files",
+            "symlinks_skipped",
         }
     }
 
@@ -2229,6 +2902,7 @@ def build_analysis_worker_probe_payload(settings: Settings) -> dict[str, Any]:
     jadx_attestation = jadx_provenance(
         address_space_limit_bytes=settings.apk_analysis_address_space_limit_bytes
     )
+    python3 = shutil.which("python3")
     versions = {
         "static": "autowork-static-v1"
         if _distribution_version("pefile") and _distribution_version("pyelftools")
@@ -2268,6 +2942,8 @@ def build_analysis_worker_probe_payload(settings: Settings) -> dict[str, Any]:
         ),
         "mwcp": _distribution_version("mwcp"),
         "yara": _distribution_version("yara-python"),
+        "script_interpreter": _python_interpreter_version(python3) if python3 else None,
+        "script_sandbox": _attested_script_sandbox_kind(),
     }
     registered_mwcp_parsers = _registered_mwcp_parsers(os.environ.get("ANALYSIS_MWCP_PARSER_DIR"))
     for parser_id, parser_version in sorted(settings.mwcp_parser_versions.items()):
@@ -2300,6 +2976,7 @@ def build_analysis_worker_probe_payload(settings: Settings) -> dict[str, Any]:
             "yara",
             "dotnet",
             "apk",
+            "script",
         ],
         "versions": versions,
         "resource_limits": {

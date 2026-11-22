@@ -28,6 +28,10 @@ from cti_app.application.bridge_investigator import (
 )
 from cti_app.application.code_features import CodeFeatureService
 from cti_app.application.confined_analysis import ConfinedAnalysisExecutionPort
+from cti_app.application.confined_scripts import (
+    CONFINED_SCRIPT_CAPABILITY,
+    CONFINED_SCRIPT_TOOL,
+)
 from cti_app.application.detection_review_service import DetectionReviewService
 from cti_app.application.evidence_recorder import EvidenceRecorder, ProductionEvidenceRecorder
 from cti_app.application.goodware import GoodwareMeasurementService
@@ -254,6 +258,7 @@ OPTIONAL_TOOL_NAMES = (
     "archive.extract_member",
     "sample.set_qualification",
     "local.run_command",
+    CONFINED_SCRIPT_TOOL,
     "ghidra.list_functions",
     "ghidra.list_imports",
     "ghidra.xrefs",
@@ -288,6 +293,13 @@ OPTIONAL_TOOL_NAMES = (
     *DOTNET_TOOL_NAMES,
     *APK_TOOL_NAMES,
     NATIVE_TOOL_NAME,
+)
+_CONFINEMENT_UNAVAILABLE_REASONS = frozenset(
+    {
+        "analysis_worker_isolation_unattested",
+        "script_confinement_unavailable",
+        "script_sandbox_failed",
+    }
 )
 FAMILY_CAPABILITY_KEYS = frozenset(
     {
@@ -1539,6 +1551,20 @@ def build_investigation_composition(
             local_caps.discard("local.run_command")
         enabled.update(local_caps)
 
+    from cti_app.infrastructure.investigation_runtime_ports import (
+        register_confined_script_tool,
+    )
+
+    if register_confined_script_tool(
+        registry,
+        execution=dependencies.confined_analysis_execution,
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        recorder=recorder,
+        settings=settings,
+    ):
+        enabled.add(CONFINED_SCRIPT_CAPABILITY)
+
     _register_similarity_tool_family(
         registry,
         dependencies=dependencies,
@@ -1832,6 +1858,17 @@ def _unavailable_tool_reasons(
                 if not settings.local_analysis_enabled
                 else worker_reason("local_command", "local_command_unavailable")
             )
+        elif name == CONFINED_SCRIPT_TOOL:
+            if execution is None:
+                reason = "analysis_worker_disabled_by_configuration"
+            elif not execution.available:
+                reason = (
+                    "confinement_unavailable"
+                    if execution.available_reason in _CONFINEMENT_UNAVAILABLE_REASONS
+                    else execution.available_reason or "confinement_unavailable"
+                )
+            else:
+                reason = worker_reason("script", "analysis_script_unavailable")
         elif name.startswith("rule."):
             if not settings.rule_workbench_enabled:
                 reason = "rule_workbench_disabled"

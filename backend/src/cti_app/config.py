@@ -476,6 +476,28 @@ class Settings(BaseSettings):
         le=APK_ANALYSIS_MAX_ADDRESS_SPACE_LIMIT_BYTES,
     )
     analysis_apk_timeout_seconds: float = Field(default=90.0, gt=0, le=120)
+    # Agent-authored scripts run only in the attested analysis worker. These are
+    # the worker maxima a request may select from; the request always carries its
+    # own lower-or-equal limits, which are part of the operation key.
+    analysis_script_max_source_bytes: int = Field(default=256 * 1024, ge=1024, le=1024 * 1024)
+    analysis_script_wall_timeout_seconds: float = Field(default=300.0, ge=60, le=300)
+    analysis_script_cpu_seconds: int = Field(default=120, ge=30, le=120)
+    analysis_script_memory_bytes: int = Field(
+        default=1024 * 1024 * 1024, ge=256 * 1024 * 1024, le=1024 * 1024 * 1024
+    )
+    analysis_script_file_size_bytes: int = Field(
+        default=16 * 1024 * 1024, ge=1024 * 1024, le=16 * 1024 * 1024
+    )
+    analysis_script_scratch_max_files: int = Field(default=512, ge=1, le=512)
+    analysis_script_scratch_max_bytes: int = Field(
+        default=64 * 1024 * 1024, ge=4096, le=64 * 1024 * 1024
+    )
+    analysis_script_stdout_max_bytes: int = Field(default=1024 * 1024, ge=1024, le=1024 * 1024)
+    analysis_script_stderr_max_bytes: int = Field(default=1024 * 1024, ge=1024, le=1024 * 1024)
+    analysis_script_max_processes: int = Field(default=64, ge=1, le=128)
+    analysis_script_expected_python_version: str | None = Field(
+        default=None, min_length=1, max_length=64
+    )
     local_analysis_file_size_limit_bytes: int = Field(
         default=1 * 1024 * 1024, ge=4096, le=100 * 1024 * 1024
     )
