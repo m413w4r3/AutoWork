@@ -17,6 +17,7 @@ import { SourceFigureGallery } from "./SourceFigureGallery";
 
 const SUBJECT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const AVAILABLE_ID = "11111111-1111-4111-8111-111111111111";
+const SECOND_AVAILABLE_ID = "99999999-9999-4999-8999-999999999999";
 const INELIGIBLE_ID = "22222222-2222-4222-8222-222222222222";
 const USED_ID = "55555555-5555-4555-8555-555555555555";
 
@@ -38,6 +39,28 @@ const catalog: EditorialFigureCatalogPage = {
       context_after: "Le texte qui suit la carte.",
       width: 800,
       height: 450,
+      mime_type: "image/png",
+      status: "available",
+      selectable: true,
+      exclusion_reason: null,
+      already_used: false,
+    },
+    {
+      figure_id: SECOND_AVAILABLE_ID,
+      original_name: "Schéma du réseau",
+      original_caption: "Topologie observée.",
+      alt_text: "Schéma de réseau synthétique",
+      source: {
+        source_id: "33333333-3333-4333-8333-333333333333",
+        title: "Rapport publié",
+        url: "https://source.example/report",
+      },
+      page: 5,
+      section: "Infrastructure",
+      context_before: null,
+      context_after: null,
+      width: 640,
+      height: 360,
       mime_type: "image/png",
       status: "available",
       selectable: true,
@@ -96,8 +119,8 @@ const catalog: EditorialFigureCatalogPage = {
       url: "https://source.example/report",
     },
   ],
-  total: 3,
-  available_count: 1,
+  total: 4,
+  available_count: 2,
   offset: 0,
   limit: 30,
 };
@@ -107,14 +130,21 @@ const preview: EditorialFigurePreview = {
   preview_image_url: `/api/subjects/${SUBJECT_ID}/editor/figures/${AVAILABLE_ID}/preview/image`,
 };
 
-function renderGallery(onClose = vi.fn()) {
+function renderGallery(
+  onClose = vi.fn(),
+  props: Partial<Parameters<typeof SourceFigureGallery>[0]> = {},
+) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, gcTime: 0 } },
   });
   return render(
     <QueryClientProvider client={client}>
       <button type="button">Images sources</button>
-      <SourceFigureGallery subjectId={SUBJECT_ID} onClose={onClose} />
+      <SourceFigureGallery
+        subjectId={SUBJECT_ID}
+        onClose={onClose}
+        {...props}
+      />
     </QueryClientProvider>,
   );
 }
@@ -205,5 +235,112 @@ describe("SourceFigureGallery", () => {
     });
     fireEvent.keyDown(dialog, { key: "Escape" });
     await waitFor(() => expect(onClose).toHaveBeenCalledOnce());
+  });
+
+  it("marks excluded figures with a readable reason and never a source UUID", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() =>
+        Promise.resolve(
+          new Response(JSON.stringify(catalog), {
+            headers: { "Content-Type": "application/json" },
+          }),
+        ),
+      ),
+    );
+    renderGallery();
+
+    const dialog = await screen.findByRole("dialog", {
+      name: "Galerie d’images sources",
+    });
+    expect(
+      await within(dialog).findByText(
+        "Cette figure est déjà intégrée au document.",
+      ),
+    ).toBeVisible();
+    expect(
+      within(dialog).getAllByText("Source archivée").length,
+    ).toBeGreaterThan(0);
+    expect(
+      within(dialog).queryByText(/44444444-4444-4444-8444-444444444444/),
+    ).toBeNull();
+  });
+
+  it("uses a single radio selection in replacement mode", async () => {
+    const user = userEvent.setup();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() =>
+        Promise.resolve(
+          new Response(JSON.stringify(catalog), {
+            headers: { "Content-Type": "application/json" },
+          }),
+        ),
+      ),
+    );
+    const onSelectionChange = vi.fn();
+    renderGallery(vi.fn(), {
+      mode: "single",
+      variant: "embedded",
+      heading: "Choisir une image de remplacement",
+      selectedFigures: [],
+      onSelectionChange,
+    });
+
+    const first = await screen.findByRole("radio", {
+      name: "Choisir Carte réseau originale",
+    });
+    const second = screen.getByRole("radio", {
+      name: "Choisir Schéma du réseau",
+    });
+    await user.click(first);
+    await user.click(second);
+    expect(onSelectionChange).toHaveBeenLastCalledWith([
+      expect.objectContaining({ figure_id: SECOND_AVAILABLE_ID }),
+    ]);
+    expect(
+      screen.queryByRole("checkbox", {
+        name: "Sélectionner Carte réseau originale",
+      }),
+    ).toBeNull();
+  });
+
+  it("blocks a selection beyond the remaining capacity and explains why", async () => {
+    const user = userEvent.setup();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() =>
+        Promise.resolve(
+          new Response(JSON.stringify(catalog), {
+            headers: { "Content-Type": "application/json" },
+          }),
+        ),
+      ),
+    );
+    renderGallery(vi.fn(), { selectionLimit: 1 });
+
+    const dialog = await screen.findByRole("dialog", {
+      name: "Galerie d’images sources",
+    });
+    const first = await within(dialog).findByRole("checkbox", {
+      name: "Sélectionner Carte réseau originale",
+    });
+    expect(
+      within(dialog).getByText(
+        "Cette insertion peut ajouter jusqu’à 1 figure.",
+      ),
+    ).toBeVisible();
+    await user.click(first);
+    expect(
+      within(dialog).getByRole("checkbox", {
+        name: "Sélectionner Schéma du réseau",
+      }),
+    ).toBeDisabled();
+    expect(
+      within(dialog).getByText(
+        /Une brève ne peut contenir plus de trois figures intégrées/,
+      ),
+    ).toBeVisible();
+    expect(within(dialog).getByText("1 image sélectionnée")).toBeVisible();
   });
 });

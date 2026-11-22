@@ -302,6 +302,15 @@ describe("FigureInsertionPanel", () => {
     const secondCaption = screen.getByRole("textbox", {
       name: "Légende éditoriale pour Schéma du réseau",
     });
+    expect(
+      screen.getByText("Légende d’origine · Légende Carte des échanges"),
+    ).toBeVisible();
+    expect(
+      screen.getAllByText(
+        "Emplacement · après « Paragraphe d’ancrage synthétique. »",
+      ).length,
+    ).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: "Annuler" })).toBeVisible();
     await user.clear(firstCaption);
     await user.type(firstCaption, "Légende éditoriale une");
     await user.clear(secondCaption);
@@ -329,6 +338,117 @@ describe("FigureInsertionPanel", () => {
     expect(
       screen.getByText("Figures archivées sélectionnées manuellement."),
     ).toBeVisible();
+  });
+
+  it("previews the ordered selection in the document and reorders with the keyboard", async () => {
+    const user = userEvent.setup();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url;
+        if (
+          url.includes("/editor/figures?") &&
+          (!init?.method || init.method === "GET")
+        ) {
+          return Promise.resolve(
+            response({
+              items,
+              sources: [],
+              total: items.length,
+              available_count: 2,
+              offset: 0,
+              limit: 30,
+            }),
+          );
+        }
+        throw new Error(`Unexpected request ${url}`);
+      }),
+    );
+    renderPanel();
+
+    const gallery = await screen.findByRole("dialog", {
+      name: "Galerie d’images sources",
+    });
+    await user.click(
+      await within(gallery).findByRole("checkbox", {
+        name: "Sélectionner Carte des échanges",
+      }),
+    );
+    await user.click(
+      within(gallery).getByRole("checkbox", {
+        name: "Sélectionner Schéma du réseau",
+      }),
+    );
+    await user.click(
+      within(gallery).getByRole("button", {
+        name: "Fermer la galerie d’images sources",
+      }),
+    );
+
+    const orderList = screen.getByRole("list", {
+      name: "Images sélectionnées dans l’ordre d’insertion",
+    });
+    expect(within(orderList).getAllByRole("listitem")[0]).toHaveTextContent(
+      "Carte des échanges",
+    );
+    screen.getByRole("button", { name: "Monter Schéma du réseau" }).focus();
+    await user.keyboard("{Enter}");
+    expect(within(orderList).getAllByRole("listitem")[0]).toHaveTextContent(
+      "Schéma du réseau",
+    );
+
+    await user.click(
+      screen.getByRole("button", {
+        name: "Prévisualiser dans le document",
+      }),
+    );
+    const preview = screen.getByRole("region", {
+      name: "Prévisualisation dans le document",
+    });
+    expect(within(preview).getAllByRole("listitem")[0]).toHaveTextContent(
+      "Légende Schéma du réseau",
+    );
+    expect(within(preview).getByText("Légende Schéma du réseau")).toBeVisible();
+    expect(
+      within(preview).getByText("Légende Carte des échanges"),
+    ).toBeVisible();
+  });
+
+  it("shows the remaining BRIEF capacity and blocks overflow with an explanation", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() =>
+        Promise.resolve(
+          response({
+            items,
+            sources: [],
+            total: items.length,
+            available_count: 2,
+            offset: 0,
+            limit: 30,
+          }),
+        ),
+      ),
+    );
+    renderPanel(workspaceSnapshot("brief", 2));
+
+    const gallery = await screen.findByRole("dialog", {
+      name: "Galerie d’images sources",
+    });
+    expect(
+      await within(gallery).findByText(/Capacité restante : 1 figure sur 3/),
+    ).toBeVisible();
+    await within(gallery).findByRole("checkbox", {
+      name: "Sélectionner Carte des échanges",
+    });
+    expect(
+      screen.getAllByText(/Figures intégrées : 2\/3/).length,
+    ).toBeGreaterThan(0);
   });
 
   it("disables figure selection once a BRIEF already contains three figures", async () => {

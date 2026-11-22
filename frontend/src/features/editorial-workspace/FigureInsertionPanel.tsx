@@ -9,12 +9,16 @@ import {
   type EditorialWorkspaceSnapshot,
 } from "../../api/editorialWorkspace";
 import { EditorialProposalCard } from "./EditorialProposalCard";
+import { FigureSelectionPanel } from "./FigureSelectionPanel";
 import { SourceFigureGallery } from "./SourceFigureGallery";
-
-interface FigureSelectionDraft {
-  item: EditorialFigureCatalogItem;
-  caption: string;
-}
+import {
+  BRIEF_FIGURE_LIMIT,
+  briefFigureCapacity,
+  defaultFigureCaption,
+  figureSelectionLabel,
+  integratedFigureCount,
+  type FigureSelectionDraft,
+} from "./replaceFigureContract";
 
 interface FigureInsertionPanelProps {
   subjectId: string;
@@ -23,6 +27,8 @@ interface FigureInsertionPanelProps {
   canCreateFigure: boolean;
   onClose: () => void;
   onRefresh: () => void;
+  initialSelectedFigures?: EditorialFigureCatalogItem[];
+  initialGalleryOpen?: boolean;
 }
 
 const BRIEF_FIGURE_LIMIT_MESSAGE =
@@ -64,16 +70,6 @@ function figureError(error: Error): { message: string; refresh: boolean } {
   };
 }
 
-function defaultCaption(item: EditorialFigureCatalogItem): string {
-  return item.original_caption?.trim() || item.original_name;
-}
-
-function integratedFigureCount(snapshot: EditorialWorkspaceSnapshot): number {
-  return snapshot.blocks.filter(
-    (block) => block.kind === "figure" && block.figure?.status === "included",
-  ).length;
-}
-
 export function FigureInsertionPanel({
   subjectId,
   snapshot,
@@ -81,11 +77,19 @@ export function FigureInsertionPanel({
   canCreateFigure,
   onClose,
   onRefresh,
+  initialSelectedFigures,
+  initialGalleryOpen = true,
 }: FigureInsertionPanelProps) {
-  const [galleryOpen, setGalleryOpen] = useState(true);
+  const [galleryOpen, setGalleryOpen] = useState(initialGalleryOpen);
+  const [previewOpen, setPreviewOpen] = useState(false);
   const [selectedFigures, setSelectedFigures] = useState<
     FigureSelectionDraft[]
-  >([]);
+  >(() =>
+    (initialSelectedFigures ?? []).map((item) => ({
+      item,
+      caption: defaultFigureCaption(item),
+    })),
+  );
   const [proposalId, setProposalId] = useState<string | null>(null);
   const [requestError, setRequestError] = useState<{
     message: string;
@@ -97,9 +101,10 @@ export function FigureInsertionPanel({
     signature: string;
   } | null>(null);
   const existingFigureCount = integratedFigureCount(snapshot);
-  const selectionLimit =
+  const remainingCapacity = briefFigureCapacity(snapshot);
+  const capacityNote =
     snapshot.publication_kind === "brief"
-      ? Math.max(0, 3 - existingFigureCount)
+      ? `Figures intégrées : ${existingFigureCount}/${BRIEF_FIGURE_LIMIT} · Capacité restante : ${remainingCapacity ?? 0} figure${(remainingCapacity ?? 0) > 1 ? "s" : ""} sur ${BRIEF_FIGURE_LIMIT}.`
       : undefined;
 
   const resetDraftFeedback = () => {
@@ -117,7 +122,7 @@ export function FigureInsertionPanel({
         (item) =>
           previous.get(item.figure_id) ?? {
             item,
-            caption: defaultCaption(item),
+            caption: defaultFigureCaption(item),
           },
       );
     });
@@ -169,10 +174,16 @@ export function FigureInsertionPanel({
     },
   });
 
+  const captionsComplete = selectedFigures.every(
+    (selection) => selection.caption.trim().length > 0,
+  );
+  const overflowsCapacity =
+    remainingCapacity !== null && selectedFigures.length > remainingCapacity;
   const canSubmit =
     canCreateFigure &&
     selectedFigures.length > 0 &&
-    selectedFigures.every((selection) => selection.caption.trim().length > 0) &&
+    captionsComplete &&
+    !overflowsCapacity &&
     !proposalMutation.isPending;
 
   const updateCaption = (figureId: string, caption: string) => {
@@ -208,126 +219,61 @@ export function FigureInsertionPanel({
 
   return (
     <section
-      className="editorial-figure-insertion"
+      className="editorial-visual-insertion__panel editorial-figure-insertion"
       role="region"
       aria-label="Intégrer des images sources"
     >
       <header className="editorial-figure-insertion__header">
         <div>
           <h3>Intégrer des images sources</h3>
-          <p>{selectedFigures.length} images sélectionnées</p>
+          <p>{figureSelectionLabel(selectedFigures.length)}</p>
         </div>
         <button
+          ref={galleryButtonRef}
           className="button button--secondary"
           type="button"
-          onClick={onClose}
+          aria-haspopup="dialog"
+          onClick={() => setGalleryOpen(true)}
         >
-          Fermer l’insertion
+          {selectedFigures.length > 0
+            ? "Modifier la sélection dans la galerie"
+            : "Choisir dans la galerie d’images sources"}
         </button>
       </header>
-
-      <button
-        ref={galleryButtonRef}
-        className="button button--secondary"
-        type="button"
-        aria-haspopup="dialog"
-        onClick={() => setGalleryOpen(true)}
-      >
-        {selectedFigures.length > 0
-          ? "Modifier la sélection dans la galerie"
-          : "Choisir dans la galerie d’images sources"}
-      </button>
       {galleryOpen ? (
         <SourceFigureGallery
           subjectId={subjectId}
           onClose={() => setGalleryOpen(false)}
           selectedFigures={selectedFigures.map((selection) => selection.item)}
           onSelectionChange={updateSelection}
-          selectionLimit={selectionLimit}
+          selectionLimit={remainingCapacity ?? undefined}
+          capacityNote={capacityNote}
           initialFocusRef={galleryButtonRef}
         />
       ) : null}
 
-      {snapshot.publication_kind === "brief" ? (
-        <p className="editorial-figure-insertion__limit" role="note">
-          {BRIEF_FIGURE_LIMIT_MESSAGE} Figures intégrées : {existingFigureCount}
-          /3.
-        </p>
-      ) : null}
-
-      <section
-        className="editorial-figure-insertion__selection"
-        aria-labelledby="editorial-figure-selection-heading"
-      >
-        <h4 id="editorial-figure-selection-heading">
-          Sélection de figures ({selectedFigures.length})
-        </h4>
-        {selectedFigures.length === 0 ? (
-          <p>
-            Aucune image sélectionnée. Choisissez des figures éligibles dans la
-            galerie.
-          </p>
-        ) : (
-          <ol>
-            {selectedFigures.map(({ item, caption }, index) => (
-              <li key={item.figure_id}>
-                <div className="editorial-figure-insertion__figure-heading">
-                  <span>{item.original_name}</span>
-                  <div>
-                    <button
-                      className="button button--secondary"
-                      type="button"
-                      disabled={index === 0}
-                      aria-label={`Monter ${item.original_name}`}
-                      onClick={() => moveFigure(index, -1)}
-                    >
-                      Monter
-                    </button>
-                    <button
-                      className="button button--secondary"
-                      type="button"
-                      disabled={index === selectedFigures.length - 1}
-                      aria-label={`Descendre ${item.original_name}`}
-                      onClick={() => moveFigure(index, 1)}
-                    >
-                      Descendre
-                    </button>
-                    <button
-                      className="button button--secondary"
-                      type="button"
-                      aria-label={`Retirer ${item.original_name}`}
-                      onClick={() => removeFigure(item.figure_id)}
-                    >
-                      Retirer
-                    </button>
-                  </div>
-                </div>
-                <label className="editorial-figure-insertion__caption">
-                  <span>Légende éditoriale pour {item.original_name}</span>
-                  <input
-                    value={caption}
-                    maxLength={500}
-                    required
-                    onChange={(event) =>
-                      updateCaption(item.figure_id, event.currentTarget.value)
-                    }
-                  />
-                </label>
-                <p className="editorial-figure-insertion__source">
-                  {item.source.title ?? `Source ${item.source.source_id}`}
-                  {item.width && item.height
-                    ? ` · ${item.width} × ${item.height} px`
-                    : ""}
-                </p>
-              </li>
-            ))}
-          </ol>
-        )}
-        <p className="editorial-figure-insertion__placement">
-          <strong>Emplacement · </strong>
-          Après le paragraphe sélectionné : {block.text ?? "Paragraphe courant"}
-        </p>
-      </section>
+      <FigureSelectionPanel
+        subjectId={subjectId}
+        selections={selectedFigures}
+        anchorText={block.text?.trim() || null}
+        publicationKind={snapshot.publication_kind}
+        existingFigureCount={existingFigureCount}
+        remainingCapacity={remainingCapacity}
+        previewOpen={previewOpen}
+        pending={proposalMutation.isPending}
+        onCaptionChange={updateCaption}
+        onMove={moveFigure}
+        onRemove={removeFigure}
+        onTogglePreview={() => setPreviewOpen((open) => !open)}
+        onCancel={onClose}
+        onIntegrate={() => {
+          if (!canSubmit) return;
+          setProposalId(null);
+          setRequestError(null);
+          proposalMutation.mutate();
+        }}
+        canIntegrate={canSubmit}
+      />
 
       {requestError ? (
         <div className="editorial-figure-insertion__error" role="alert">
@@ -352,21 +298,6 @@ export function FigureInsertionPanel({
           ) : null}
         </div>
       ) : null}
-      <button
-        className="button editorial-figure-insertion__submit"
-        type="button"
-        disabled={!canSubmit}
-        onClick={() => {
-          if (!canSubmit) return;
-          setProposalId(null);
-          setRequestError(null);
-          proposalMutation.mutate();
-        }}
-      >
-        {proposalMutation.isPending
-          ? "Préparation de la proposition…"
-          : "Intégrer les images sélectionnées"}
-      </button>
       {proposalId ? (
         <div className="editorial-figure-insertion__proposal">
           <EditorialProposalCard
