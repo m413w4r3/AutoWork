@@ -259,7 +259,7 @@ class _CachedFakeProfile(FakeProfile):  # type: ignore[misc]
     """
 
     def __init__(self) -> None:
-        super().__init__(supports_resume=True)
+        super().__init__(supports_resume=True, simulate_network_attestation=True)
         self._cached_probe: Any = None
 
     def probe(self, *, now: str) -> Any:

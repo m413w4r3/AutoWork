@@ -134,3 +134,7 @@ Résultat observé : `All checks passed!`, `3 files already formatted`,
 
 Aucun code applicatif, migration, routeur ou autre fichier de
 `backend/tests/acceptance/` n'a été modifié.
+
+## Attestation réseau simulée (FIX-S)
+
+Depuis la porte « CLI network mode » (R3-B1), le backend refuse d'ouvrir une session dont l'hôte n'atteste pas `network_mode=isolated_egress` + `loopback_isolated`. Le profil CLI factice du scénario (`FakeProfile(simulate_network_attestation=True)`) **simule** cette attestation : l'étape 08 prouve le câblage de la porte, jamais une isolation réseau réelle (celle-ci est vérifiée séparément par `tests/workspace_agent/test_sessions_network.py` et reste non prouvée avec un vrai CLI : spike H0).

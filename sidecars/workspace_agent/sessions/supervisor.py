@@ -198,8 +198,14 @@ class FakeProfile:
     requires_sandbox = False
     requires_manifest = False
 
-    def __init__(self, *, supports_resume: bool = False) -> None:
+    def __init__(
+        self, *, supports_resume: bool = False, simulate_network_attestation: bool = False
+    ) -> None:
         self._supports_resume = supports_resume
+        # Test-only: pretend the host attested an isolated egress namespace so a
+        # real backend gate can be exercised against the scripted process.  It
+        # proves the wire, never a real network isolation.
+        self._simulate_network_attestation = simulate_network_attestation
 
     def probe(self, *, now: str) -> CapabilityProbe:
         try:
@@ -220,6 +226,15 @@ class FakeProfile:
             "bwrap_ok": False,
             "netns": False,
         }
+        if self._simulate_network_attestation:
+            confinement.update(
+                {
+                    "netns": True,
+                    "network_mode": process.NETWORK_MODE_ISOLATED_EGRESS,
+                    "loopback_isolated": True,
+                    "network_reason": "simulated_by_fake_profile",
+                }
+            )
         payload: dict[str, object] = {
             "adapter_kind": self.adapter_kind,
             "version": PROBE_VERSION,
