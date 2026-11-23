@@ -227,6 +227,12 @@ converti en `delivery_unknown` après `M24_INSTRUCTION_DELIVERY_GRACE_SECONDS` (
 | absence prouvée (hôte vivant, ni événement ni registre) | `delivery_unknown → queued` | nouvel essai possible, même texte |
 | hôte redémarré / session perdue | `delivery_unknown` ou `queued`, `host_session_lost` | jamais de run sur session perdue |
 | annulation pendant `delivering` | refusée | attendre la résolution puis annuler |
+
+Après une réconciliation par journal (phase C manquée), le diff de notes n’est persisté que si le
+texte recalculé depuis les révisions canoniques courantes redonne le `delivery_sha256` réservé en
+phase A ; sinon la ligne reste `delivered` (preuve hôte) avec `delivery_note_diffs` absent et le
+pull expose `delivery_text_verified=false` — le backend ne fabrique jamais un texte qu’il ne peut
+pas prouver (R4-F5).
 ### 3.6 Ack, notes, passation
 - **Ack** : deux outils MCP fixes au catalogue shim, mappés sur la route POST déjà autorisée
   (`api/main.py:859-865`) : `instruction.pending` → `{action:"pull"}` (instructions `delivered`

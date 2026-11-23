@@ -652,6 +652,27 @@ class InstructionDeliveryService:
             raise _AttemptRefused("instruction_text_exceeds_host_bound")
         return delivered_text, note_diffs
 
+    async def _proven_note_diffs(
+        self, instruction: AgentSessionInstructionV1
+    ) -> tuple[Mapping[str, Any], ...] | None:
+        """Rebuild the delivery diff only when it provably matches the reserved SHA.
+
+        A journal-proven attempt reconciled after the fact never saw its phase
+        C.  Recomputing the delivered text from the current canonical notes is
+        the only way to persist the diff, so it is kept only when that text
+        hashes to the SHA reserved in phase A; otherwise the pull must report
+        the text as unverified rather than fabricate one (R4-F5).
+        """
+        if instruction.delivery_sha256 is None:
+            return None
+        try:
+            rebuilt_text, note_diffs = await self._delivered_text(instruction)
+        except (_AttemptRefused, SessionError):
+            return None
+        if instruction_text_sha256(rebuilt_text) != instruction.delivery_sha256:
+            return None
+        return note_diffs
+
     async def _sync_awaiting_instruction(
         self, session: AgentSessionV1, now: datetime
     ) -> AgentSessionV1 | None:
@@ -877,7 +898,15 @@ class InstructionDeliveryService:
         return converted
 
     async def _reconcile_unknown_attempts(self, now: datetime, *, limit: int) -> tuple[int, int]:
-        """Prove an ambiguous attempt delivered, absent, or leave it unknown."""
+        """Prove an ambiguous attempt delivered, absent, or leave it unknown.
+
+        A journal-proven delivery rebuilds the delivered text from the current
+        canonical note revisions and persists its diff only when the rebuilt
+        text hashes to the reserved ``delivery_sha256``: the pull then
+        reconstructs exactly what the run received.  When the notes moved (or
+        cannot be resolved) the diff stays absent and the pull reports
+        ``delivery_text_verified=false`` instead of inventing a text (R4-F5).
+        """
         host = self._require_host()
         pending = await self._list_pending(limit)
         delivered = 0
@@ -896,7 +925,7 @@ class InstructionDeliveryService:
                     now=now,
                     delivery_mode=_event_delivery_mode(proof),
                     delivery_sha256=instruction.delivery_sha256,
-                    delivery_note_diffs=None,
+                    delivery_note_diffs=await self._proven_note_diffs(instruction),
                 )
                 if await self._replace_attempt(
                     instruction, marked, InstructionState.DELIVERY_UNKNOWN

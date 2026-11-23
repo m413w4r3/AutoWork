@@ -858,6 +858,152 @@ async def test_lease_expired_on_the_database_clock_between_phases_is_unknown() -
     assert stored.delivered_at is None
 
 
+# -------------------------------------------------- reconciliation text (R4-F5)
+
+
+async def test_journal_reconciliation_rebuilds_the_delivered_text_with_notes() -> None:
+    """R4-F5: a journal-proven delivery keeps the exact delivered text and diff."""
+    harness = _Harness()
+    session = await harness.seed_session(state=AgentSessionState.RUNNING)
+    diff = {
+        "path": "notes/humaines/piste.md",
+        "queued_revision_id": "rev-1",
+        "queued_sha256": "1" * 64,
+        "current_revision_id": "rev-2",
+        "current_sha256": "2" * 64,
+    }
+    delivery_text = (
+        "Follow the note.\n[notes modifiées depuis la mise en file]\n"
+        "- notes/humaines/piste.md: rev-1 -> rev-2"
+    )
+    harness.notes.diffs = (diff,)
+    harness.notes.delivery_text = delivery_text
+    queued = await harness.enqueue(
+        session,
+        text="Follow the note.",
+        key="i-reconcile-note",
+        note_refs=("notes/humaines/piste.md",),
+    )
+    assert queued.instruction.state is InstructionState.QUEUED
+
+    harness.host.status_state = "awaiting_instruction"
+    harness.host.send_error = WorkspaceLocalUnavailableError("host timed out")
+    unknown = await harness.delivery.drain_once()
+    assert unknown.unknown == 1
+    ambiguous = await harness.instruction(queued.instruction.id)
+    assert ambiguous.state is InstructionState.DELIVERY_UNKNOWN
+    assert ambiguous.delivery_note_diffs is None
+    assert ambiguous.delivery_sha256 == instruction_text_sha256(delivery_text)
+
+    # The host journal proves the delivery of exactly that text.
+    harness.host.send_error = None
+    harness.host.events = [
+        HostSessionEventV1(
+            seq=1,
+            kind="instruction_delivered",
+            at=NOW,
+            payload={
+                "instruction_id": str(ambiguous.id),
+                "sha256": ambiguous.delivery_sha256,
+                "mode": "next_run",
+            },
+        )
+    ]
+    harness.clock.advance(GRACE_SECONDS + 1)
+    reconciled = await harness.delivery.drain_once()
+    assert reconciled.reconciled_delivered == 1
+    proven = await harness.instruction(queued.instruction.id)
+    assert proven.state is InstructionState.DELIVERED
+    assert proven.delivery_note_diffs is not None
+    assert dict(proven.delivery_note_diffs[0]) == diff
+
+    operator = TaskActor(kind=TaskActorKind.OPERATOR, actor_id="codex:operator-1")
+    pending = await harness.service.pull_delivered_instructions(
+        INVESTIGATION_ID, session.id, actor=operator
+    )
+    assert len(pending) == 1
+    assert pending[0].delivery_text == delivery_text
+    assert pending[0].delivery_text_verified is True
+
+
+async def test_journal_reconciliation_leaves_moved_notes_unverified_not_invented() -> None:
+    """R4-F5 limit: when the notes moved again, the pull says unverified.
+
+    The journal proves the host accepted *some* text with the reserved SHA;
+    the backend cannot reconstruct it from note revisions that changed since,
+    so no diff is invented and the pull exposes ``delivery_text_verified``
+    false rather than claiming a text it cannot prove.
+    """
+    harness = _Harness()
+    session = await harness.seed_session(state=AgentSessionState.RUNNING)
+    harness.notes.diffs = (
+        {
+            "path": "notes/humaines/piste.md",
+            "queued_revision_id": "rev-1",
+            "queued_sha256": "1" * 64,
+            "current_revision_id": "rev-2",
+            "current_sha256": "2" * 64,
+        },
+    )
+    harness.notes.delivery_text = (
+        "Follow the note.\n[notes modifiées depuis la mise en file]\n"
+        "- notes/humaines/piste.md: rev-1 -> rev-2"
+    )
+    queued = await harness.enqueue(
+        session,
+        text="Follow the note.",
+        key="i-reconcile-moved",
+        note_refs=("notes/humaines/piste.md",),
+    )
+    harness.host.status_state = "awaiting_instruction"
+    harness.host.send_error = WorkspaceLocalUnavailableError("host timed out")
+    await harness.delivery.drain_once()
+    ambiguous = await harness.instruction(queued.instruction.id)
+    assert ambiguous.state is InstructionState.DELIVERY_UNKNOWN
+
+    # The note moved again before the journal could be reconciled.
+    harness.notes.diffs = (
+        {
+            "path": "notes/humaines/piste.md",
+            "queued_revision_id": "rev-1",
+            "queued_sha256": "1" * 64,
+            "current_revision_id": "rev-3",
+            "current_sha256": "3" * 64,
+        },
+    )
+    harness.notes.delivery_text = (
+        "Follow the note.\n[notes modifiées depuis la mise en file]\n"
+        "- notes/humaines/piste.md: rev-1 -> rev-3"
+    )
+    harness.host.send_error = None
+    harness.host.events = [
+        HostSessionEventV1(
+            seq=1,
+            kind="instruction_delivered",
+            at=NOW,
+            payload={
+                "instruction_id": str(ambiguous.id),
+                "sha256": ambiguous.delivery_sha256,
+                "mode": "next_run",
+            },
+        )
+    ]
+    harness.clock.advance(GRACE_SECONDS + 1)
+    reconciled = await harness.delivery.drain_once()
+    assert reconciled.reconciled_delivered == 1
+    proven = await harness.instruction(queued.instruction.id)
+    assert proven.state is InstructionState.DELIVERED
+    assert proven.delivery_note_diffs is None
+
+    operator = TaskActor(kind=TaskActorKind.OPERATOR, actor_id="codex:operator-1")
+    pending = await harness.service.pull_delivered_instructions(
+        INVESTIGATION_ID, session.id, actor=operator
+    )
+    assert len(pending) == 1
+    assert pending[0].delivery_text == "Follow the note."
+    assert pending[0].delivery_text_verified is False
+
+
 # ---------------------------------------------------------- phase C re-checks
 
 
