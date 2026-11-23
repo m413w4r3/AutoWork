@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import Float, String, cast, func, literal, select, update
+from sqlalchemy import Float, String, case, cast, func, literal, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -530,6 +530,63 @@ class SqlAlchemyAgentSessionRepository:
                 ),
             )
             .order_by(
+                AgentSessionInstructionRow.queued_at,
+                AgentSessionInstructionRow.id,
+            )
+            .limit(limit)
+        )
+        return tuple(_instruction_from_row(row) for row in rows)
+
+    async def list_delivery_candidates(
+        self, *, limit: int, after_session_id: UUID | None
+    ) -> tuple[AgentSessionInstructionV1, ...]:
+        """Return one oldest queued instruction per active session in rotation order.
+
+        Ranking before applying the batch limit prevents a deep queue in one
+        session from filling the candidate window. The service cursor advances
+        through session IDs between passes, so every active queued session is
+        selected within at most ``ceil(active_session_count / limit)`` passes.
+        """
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        ranked = (
+            select(
+                AgentSessionInstructionRow.id.label("instruction_id"),
+                AgentSessionInstructionRow.session_id.label("session_id"),
+                func.row_number()
+                .over(
+                    partition_by=AgentSessionInstructionRow.session_id,
+                    order_by=(
+                        AgentSessionInstructionRow.queued_at,
+                        AgentSessionInstructionRow.id,
+                    ),
+                )
+                .label("session_rank"),
+            )
+            .join(
+                AgentSessionRow,
+                AgentSessionRow.id == AgentSessionInstructionRow.session_id,
+            )
+            .where(
+                AgentSessionInstructionRow.state == InstructionState.QUEUED.value,
+                AgentSessionRow.state.in_(
+                    tuple(state.value for state in ACTIVE_AGENT_SESSION_STATES)
+                ),
+            )
+            .subquery()
+        )
+        rotation_order = (
+            case((ranked.c.session_id > after_session_id, 0), else_=1)
+            if after_session_id is not None
+            else literal(0)
+        )
+        rows = await self._session.scalars(
+            select(AgentSessionInstructionRow)
+            .join(ranked, ranked.c.instruction_id == AgentSessionInstructionRow.id)
+            .where(ranked.c.session_rank == 1)
+            .order_by(
+                rotation_order,
+                ranked.c.session_id,
                 AgentSessionInstructionRow.queued_at,
                 AgentSessionInstructionRow.id,
             )
