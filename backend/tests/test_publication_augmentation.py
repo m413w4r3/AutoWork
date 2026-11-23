@@ -4,10 +4,16 @@ import hashlib
 import json
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any
 from uuid import UUID
 
 import pytest
 
+from cti_app.application.opinion_note_proposals import (
+    NoteContentBlockContextV1,
+    note_article_element_facts,
+    validate_note_content_blocks,
+)
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.publication_augmentation import (
     PublicationAugmentationArtifactService,
@@ -20,9 +26,16 @@ from cti_app.application.typst_rendering import (
     project_publication_to_typst_model,
 )
 from cti_app.domain.analyst_opinion import (
+    AnalystObservationRelation,
+    AnalystObservationState,
+    AnalystObservationV1,
     AnalystOpinionStatus,
+    AnalystOpinionV1,
+    ArticleElementNoteBlockV1,
+    NoteArticleElementKind,
     OpinionBlockType,
     OpinionClaimQualification,
+    opinion_blocks_with_observations,
 )
 from cti_app.domain.production import (
     ProductionArtifact,
@@ -31,7 +44,16 @@ from cti_app.domain.production import (
 )
 from cti_app.domain.publication_document import (
     PublicationDocumentV5,
+    PublicationDocumentV9,
+    PublicationDocumentV10,
+    publication_document_from_json,
+    publication_element_sha256,
     serialize_publication_document,
+)
+from tests.test_opinion_note_proposals import (
+    LEAD_ANCHOR,
+    _after_paragraph_table,
+    _v9_publication_with_elements,
 )
 from tests.test_publication_document_v6 import _approved_opinion, _base_v5
 
@@ -417,3 +439,190 @@ async def test_artifact_service_appends_a_linked_version_without_changing_the_v5
             ProductionArtifactStage.EDITORIAL_ENRICHMENT,
         )
     } == editorial_identity_before
+
+
+# ---------------------------------------------------------------------------
+# R3-F1 — a resolved V9/V10 base stays resolved through opinion augmentation
+# ---------------------------------------------------------------------------
+
+
+def _envelope_sha256(document: Any) -> str:
+    return hashlib.sha256(
+        ProductionArtifactStore.canonical_json_bytes(serialize_publication_document(document))
+    ).hexdigest()
+
+
+def _resolved_envelope(
+    document_class: type[PublicationDocumentV9] | type[PublicationDocumentV10],
+) -> tuple[PublicationDocumentV9 | PublicationDocumentV10, Any]:
+    v9, base = _v9_publication_with_elements(tables=(_after_paragraph_table(),))
+    if document_class is PublicationDocumentV9:
+        return v9, base
+    return (
+        PublicationDocumentV10(
+            base_publication=v9.base_publication,
+            article_format=v9.article_format,
+            registry_hash=v9.registry_hash,
+            synthesis_canonical_sha256=v9.synthesis_canonical_sha256,
+            enrichment_canonical_sha256=v9.enrichment_canonical_sha256,
+            resolved_placements=v9.resolved_placements,
+        ),
+        base,
+    )
+
+
+def _article_element_block(base: Any) -> ArticleElementNoteBlockV1:
+    published = base.document.tables[0]
+    return ArticleElementNoteBlockV1(
+        kind=NoteArticleElementKind.TABLE,
+        element_key=published.key,
+        element_sha256=publication_element_sha256(base.document, kind="table", key=published.key),
+        anchor=LEAD_ANCHOR,
+    )
+
+
+def _opinion_pinned_to(
+    base: Any,
+    document: Any,
+    block: ArticleElementNoteBlockV1,
+) -> tuple[AnalystOpinionV1, Any]:
+    """Build an approved opinion carrying one article_element note on a resolved base."""
+    opinion, citation_context = _approved_opinion(base)
+    note = AnalystObservationV1(
+        id=UUID(int=9301),
+        anchor=LEAD_ANCHOR,
+        text="NOTE-RESOLVED-BASE",
+        state=AnalystObservationState.UNRESOLVED,
+        relation=AnalystObservationRelation.UNRESOLVED,
+        content_blocks=(block,),
+    )
+    base_sha256 = _envelope_sha256(document)
+    return (
+        replace(
+            opinion,
+            base_publication_sha256=base_sha256,
+            blocks=opinion_blocks_with_observations(opinion.blocks, (note,)),
+            content_sha256="",
+        ),
+        replace(citation_context, base_publication_sha256=base_sha256),
+    )
+
+
+@pytest.mark.parametrize("document_class", (PublicationDocumentV9, PublicationDocumentV10))
+def test_augmentation_preserves_the_resolved_envelope(document_class: Any) -> None:
+    """A V9/V10 base keeps its pins and placements in the augmented publication."""
+    document, base = _resolved_envelope(document_class)
+    opinion, citation_context = _opinion_pinned_to(base, document, _article_element_block(base))
+
+    augmented = augment_publication_with_opinion(document, opinion, citation_context)
+
+    assert type(augmented) is document_class
+    assert augmented.registry_hash == document.registry_hash
+    assert augmented.synthesis_canonical_sha256 == document.synthesis_canonical_sha256
+    assert augmented.enrichment_canonical_sha256 == document.enrichment_canonical_sha256
+    assert augmented.resolved_placements == document.resolved_placements
+    assert augmented.article_format == document.article_format
+    assert augmented.base_publication.base_publication.base_publication == base
+    parsed = publication_document_from_json(serialize_publication_document(augmented))
+    assert type(parsed) is document_class
+    assert parsed.resolved_placements == document.resolved_placements
+    # The resolved augmentation is renderable; the plain-V8 downcast was not.
+    project_publication_to_typst_model(augmented)
+
+
+def test_note_article_element_accepted_on_v9_stays_valid_after_augmentation() -> None:
+    """The accepted note block still resolves against the augmented publication."""
+    v9, base = _resolved_envelope(PublicationDocumentV9)
+    block = _article_element_block(base)
+    opinion, citation_context = _opinion_pinned_to(base, v9, block)
+
+    resolved_context = NoteContentBlockContextV1(
+        investigation_id=opinion.investigation_id,
+        anchor=LEAD_ANCHOR,
+        elements=note_article_element_facts(v9),
+        observations={},
+        blobs={},
+        protocol_figures=(),
+    )
+    (resolved,) = validate_note_content_blocks((block,), resolved_context)
+    assert resolved.anchor == LEAD_ANCHOR
+    assert resolved.element_sha256 == block.element_sha256
+
+    augmented = augment_publication_with_opinion(v9, opinion, citation_context)
+
+    assert type(augmented) is PublicationDocumentV9
+    augmented_context = replace(resolved_context, elements=note_article_element_facts(augmented))
+    assert [(fact.kind, fact.key, fact.anchor) for fact in augmented_context.elements] == [
+        ("table", block.element_key, LEAD_ANCHOR)
+    ]
+    (resolved_after,) = validate_note_content_blocks((block,), augmented_context)
+    assert resolved_after == resolved
+
+
+@pytest.mark.asyncio
+async def test_artifact_service_persists_a_resolved_v9_augmentation() -> None:
+    """The publication service stores the augmented V9, not a bare V8."""
+    document, base = _resolved_envelope(PublicationDocumentV9)
+    opinion, citation_context = _opinion_pinned_to(base, document, _article_element_block(base))
+    synthesis_bytes = b"verified canonical synthesis"
+    opinion = replace(
+        opinion,
+        synthesis_sha256=hashlib.sha256(synthesis_bytes).hexdigest(),
+        bridge_drafting_gap_acknowledged=True,
+        content_sha256="",
+    )
+    run_id = UUID(int=9311)
+    base_blob_id = UUID(int=9312)
+    synthesis_blob_id = UUID(int=9313)
+    base_payload = serialize_publication_document(document)
+    base_bytes = ProductionArtifactStore.canonical_json_bytes(base_payload)
+    assert hashlib.sha256(base_bytes).hexdigest() == citation_context.base_publication_sha256
+    blobs = {base_blob_id: base_bytes, synthesis_blob_id: synthesis_bytes}
+    base_artifact = ProductionArtifact(
+        id=citation_context.base_publication_artifact_id,
+        production_run_id=run_id,
+        subject_id=base.subject_id,
+        stage=ProductionArtifactStage.PUBLICATION,
+        version=1,
+        input_hash=hashlib.sha256(base_bytes).hexdigest(),
+        canonical_blob_id=base_blob_id,
+    )
+    synthesis_artifact = ProductionArtifact(
+        id=opinion.synthesis_artifact_id,
+        production_run_id=run_id,
+        subject_id=base.subject_id,
+        stage=ProductionArtifactStage.SYNTHESIS,
+        version=1,
+        input_hash="d" * 64,
+        canonical_blob_id=synthesis_blob_id,
+    )
+    repository = _ArtifactRepository((base_artifact, synthesis_artifact))
+    investigation = SimpleNamespace(
+        production_run_id=run_id,
+        subject_id=base.subject_id,
+        synthesis_artifact_id=opinion.synthesis_artifact_id,
+    )
+    uow = _AugmentationUow(repository, investigation)
+    store = _AugmentationStore(blobs)
+    preview = _PreviewRenderer()
+    service = PublicationAugmentationArtifactService(
+        uow_factory=lambda: uow,
+        artifact_store=store,  # type: ignore[arg-type]
+        preview_renderer=preview,
+    )
+
+    publication = await service.publish(
+        base_publication_artifact_id=base_artifact.id,
+        opinion=opinion,
+        citation_context=citation_context,
+    )
+
+    stored = publication_document_from_json(json.loads(blobs[publication.canonical_blob_id]))
+    assert type(stored) is PublicationDocumentV9
+    assert stored.resolved_placements == document.resolved_placements
+    assert stored.registry_hash == document.registry_hash
+    assert stored.synthesis_canonical_sha256 == document.synthesis_canonical_sha256
+    assert stored.enrichment_canonical_sha256 == document.enrichment_canonical_sha256
+    assert stored.base_publication.base_publication.analyst_opinion is not None
+    assert uow.committed is True
+    assert preview.artifact_ids == [publication.id]

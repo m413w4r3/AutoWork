@@ -44,6 +44,8 @@ from cti_app.domain.publication_document import (
     PublicationDocumentV6ValidationError,
     PublicationDocumentV7,
     PublicationDocumentV8,
+    PublicationDocumentV9,
+    PublicationDocumentV10,
     publication_document_article_v5_body,
     publication_document_from_json,
     publication_document_v5_sha256,
@@ -123,15 +125,31 @@ _BLOCK_ORDER = {kind: index for index, kind in enumerate(OpinionBlockType)}
 
 def augment_publication_with_opinion(
     base_publication_document: (
-        PublicationDocumentV5 | PublicationDocumentV7 | PublicationDocumentV8
+        PublicationDocumentV5
+        | PublicationDocumentV7
+        | PublicationDocumentV8
+        | PublicationDocumentV9
+        | PublicationDocumentV10
     ),
     opinion: AnalystOpinionV1,
     citation_context: OpinionCitationContext,
     *,
     infrastructure_graph: InvestigationGraph | None = None,
     detection: PublicationDetectionV1 | None = None,
-) -> PublicationDocumentV6 | PublicationDocumentV7 | PublicationDocumentV8:
-    """Return a V6 wrapper while preserving V7 routing and any V8 article format."""
+) -> (
+    PublicationDocumentV6
+    | PublicationDocumentV7
+    | PublicationDocumentV8
+    | PublicationDocumentV9
+    | PublicationDocumentV10
+):
+    """Return the same envelope class while preserving its routing and resolutions.
+
+    A V9/V10 base keeps its registry/synthesis/enrichment pins and its resolved
+    placements: the augmented V6 wraps the exact same V5 body, so the resolved
+    article anchors still describe it and an ``article_element`` note stays
+    publishable.
+    """
     routed_v8 = (
         base_publication_document
         if isinstance(base_publication_document, PublicationDocumentV8)
@@ -279,6 +297,24 @@ def augment_publication_with_opinion(
             routing_policy_version=routed_v7.routing_policy_version,
         )
         if routed_v8 is not None:
+            if isinstance(routed_v8, PublicationDocumentV10):
+                return PublicationDocumentV10(
+                    base_publication=wrapped_v7,
+                    article_format=routed_v8.article_format,
+                    registry_hash=routed_v8.registry_hash,
+                    synthesis_canonical_sha256=routed_v8.synthesis_canonical_sha256,
+                    enrichment_canonical_sha256=routed_v8.enrichment_canonical_sha256,
+                    resolved_placements=routed_v8.resolved_placements,
+                )
+            if isinstance(routed_v8, PublicationDocumentV9):
+                return PublicationDocumentV9(
+                    base_publication=wrapped_v7,
+                    article_format=routed_v8.article_format,
+                    registry_hash=routed_v8.registry_hash,
+                    synthesis_canonical_sha256=routed_v8.synthesis_canonical_sha256,
+                    enrichment_canonical_sha256=routed_v8.enrichment_canonical_sha256,
+                    resolved_placements=routed_v8.resolved_placements,
+                )
             return PublicationDocumentV8(
                 base_publication=wrapped_v7,
                 article_format=routed_v8.article_format,

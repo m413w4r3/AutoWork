@@ -514,7 +514,7 @@ class DetectionReviewService:
             document = parse_publication_document(payload)
         except (KeyError, TypeError, ValueError):
             raise DetectionReviewError(DetectionReviewErrorCode.ARTICLE_BASE_UNAVAILABLE) from None
-        if document.schema_version not in {"4", "5", "6", "7", "8"}:
+        if document.schema_version not in {"4", "5", "6", "7", "8", "9", "10"}:
             raise DetectionReviewError(DetectionReviewErrorCode.ARTICLE_BASE_UNAVAILABLE)
         publication_v7 = (
             document.base_publication

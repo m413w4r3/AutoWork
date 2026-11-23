@@ -4,6 +4,14 @@ The orchestrator owns ``api/main.py``: this module only exports ``router``.
 The catalog is a human-only read: it resolves the opinion's pinned publication
 base when an opinion exists, else the current verified base, and returns the
 exact anchor space the reader renders plus the M23 elements placed in it.
+
+Element schema (additive, R1-F4): every element carries ``proposable`` and
+``refusal_reason``.  The server computes both from the same facts and rules as
+the note-block validator, so a consumer can hide an element the proposal would
+be refused for (``note_chart_without_evidence``, ``note_figure_source_missing``,
+``note_block_ref_stale`` for an unresolved ``after_paragraph`` anchor).  The
+frontend filtering that consumes these flags is a separate later lot; older
+clients may ignore them.
 """
 
 from __future__ import annotations
@@ -48,6 +56,8 @@ class ArticleElementViewV1(BaseModel):
     caption: str | None
     element_sha256: str
     anchor: str | None
+    proposable: bool
+    refusal_reason: str | None
 
 
 class ArticleAnchorCatalogViewV1(BaseModel):
@@ -114,6 +124,8 @@ async def get_article_anchors(
                 caption=item.caption,
                 element_sha256=item.element_sha256,
                 anchor=item.anchor,
+                proposable=item.proposable,
+                refusal_reason=item.refusal_reason,
             )
             for item in catalog.elements
         ],

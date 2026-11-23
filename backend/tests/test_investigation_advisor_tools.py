@@ -13222,7 +13222,7 @@ async def test_task_context_is_bounded_in_dossier() -> None:
     )
     # The context is transmitted as non-evidence task context.
     assert f"task_id={task_id}" in prompt
-    assert "Contexte de la tâche d\\u2019enquête (non probant)" in prompt
+    assert "Contexte de la tâche d\u2019enquête (non probant)" in prompt
     assert "CONTEXTE DE TÂCHE" in prompt
     assert "human_contributions (non promues en preuve):" in prompt
     assert str(contribution_id) in prompt

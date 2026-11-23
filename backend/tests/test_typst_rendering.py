@@ -20,7 +20,9 @@ from pypdf import PdfReader
 
 from cti_app.application import typst_rendering as typst_rendering_module
 from cti_app.application.opinion_note_proposals import (
+    NoteContentBlockContextV1,
     note_article_element_facts,
+    validate_note_content_blocks,
 )
 from cti_app.application.protocol_diagram_projection import PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION
 from cti_app.application.publication_augmentation import (
@@ -2725,14 +2727,10 @@ def _note_v9_with_opinion(
             do_not_submit=False,
         ),
     )
-    return PublicationDocumentV9(
-        base_publication=augmented.base_publication,  # type: ignore[arg-type]
-        article_format=augmented.article_format,  # type: ignore[arg-type]
-        registry_hash=v9.registry_hash,
-        synthesis_canonical_sha256=v9.synthesis_canonical_sha256,
-        enrichment_canonical_sha256=v9.enrichment_canonical_sha256,
-        resolved_placements=v9.resolved_placements,
-    )
+    # The augmentation itself must preserve the resolved V9 envelope; rebuilding
+    # one here would hide the production defect instead of proving the path.
+    assert type(augmented) is PublicationDocumentV9
+    return augmented
 
 
 def test_note_content_blocks_render_with_provenance() -> None:
@@ -2902,13 +2900,13 @@ def test_note_chart_without_evidence_refused() -> None:
     assert note_block["blocks"][0]["reference_label"] == (f"Figure 1 — {published_chart.title}")
 
 
-def test_load_note_block_render_context_reads_only_cited_code_blobs() -> None:
+def test_load_note_block_render_context_reads_only_cited_observations() -> None:
     """The published render path reads exactly the observations its blocks cite."""
     from cti_app.application.publication_rendering import load_note_block_render_context
 
     raw = b"cited bytes"
     publication = _base_v5()
-    observation = EvidenceObservation(
+    cited_code = EvidenceObservation(
         investigation_id=uuid4(),
         kind=ObservationEvidenceKind.BINARY_ANALYSIS,
         blob_id=uuid4(),
@@ -2919,13 +2917,39 @@ def test_load_note_block_render_context_reads_only_cited_code_blobs() -> None:
         object_type="native_analysis",
         object_id="cited.bin",
     )
-    block = CanonicalCodeNoteBlockV1(
-        observation_id=observation.id,
-        blob_sha256=observation.sha256,
+    cited_ioc = EvidenceObservation(
+        investigation_id=cited_code.investigation_id,
+        kind=ObservationEvidenceKind.OTHER,
+        blob_id=uuid4(),
+        sha256="6" * 64,
+        source="vt",
+        source_version="fixture.v1",
+        observed_at=datetime.now(UTC),
+        object_type="ip",
+        object_id="192.0.2.44",
+    )
+    uncited = EvidenceObservation(
+        investigation_id=cited_code.investigation_id,
+        kind=ObservationEvidenceKind.OTHER,
+        blob_id=uuid4(),
+        sha256="7" * 64,
+        source="shodan",
+        source_version="fixture.v1",
+        observed_at=datetime.now(UTC),
+        object_type="ip",
+        object_id="192.0.2.45",
+    )
+    code_block = CanonicalCodeNoteBlockV1(
+        observation_id=cited_code.id,
+        blob_sha256=cited_code.sha256,
         offset=0,
         length=len(raw),
         excerpt_sha256=hashlib.sha256(raw).hexdigest(),
         language="text",
+    )
+    ioc_block = IocTableNoteBlockV1(
+        observation_ids=(cited_ioc.id,),
+        title=note_ioc_table_title(1),
     )
     note = AnalystObservationV1(
         id=UUID(int=8822),
@@ -2933,10 +2957,10 @@ def test_load_note_block_render_context_reads_only_cited_code_blobs() -> None:
         text="NOTE-CONTEXT-FIXTURE",
         state=AnalystObservationState.UNRESOLVED,
         relation=AnalystObservationRelation.UNRESOLVED,
-        content_blocks=(block,),
+        content_blocks=(code_block, ioc_block),
     )
     opinion = AnalystOpinionV1(
-        investigation_id=observation.investigation_id,
+        investigation_id=cited_code.investigation_id,
         synthesis_artifact_id=uuid4(),
         synthesis_sha256="5" * 64,
         base_publication_artifact_id=uuid4(),
@@ -2956,11 +2980,16 @@ def test_load_note_block_render_context_reads_only_cited_code_blobs() -> None:
 
     class _Uow:
         def __init__(self) -> None:
-            self.evidence_observations = SimpleNamespace(list_for_investigation=self._list)
+            self.requested: list[UUID] = []
+            self.evidence_observations = SimpleNamespace(get=self._get)
 
-        async def _list(self, investigation_id: UUID) -> list[EvidenceObservation]:
-            assert investigation_id == observation.investigation_id
-            return [observation]
+        async def _get(self, observation_id: UUID) -> EvidenceObservation | None:
+            self.requested.append(observation_id)
+            return {
+                cited_code.id: cited_code,
+                cited_ioc.id: cited_ioc,
+                uncited.id: uncited,
+            }.get(observation_id)
 
         async def __aenter__(self) -> _Uow:
             return self
@@ -2976,10 +3005,11 @@ def test_load_note_block_render_context_reads_only_cited_code_blobs() -> None:
             self.reads.append(blob_id)
             return raw
 
+    uow = _Uow()
     store = _Store()
     context = asyncio.run(
         load_note_block_render_context(
-            uow_factory=cast(Any, lambda: _Uow()),
+            uow_factory=cast(Any, lambda: uow),
             artifact_store=cast(Any, store),
             opinion=opinion,
             base_document=publication,
@@ -2987,16 +3017,19 @@ def test_load_note_block_render_context_reads_only_cited_code_blobs() -> None:
     )
 
     assert context is not None
-    assert context.observations == (observation,)
-    assert context.blobs == {observation.id: raw}
-    assert store.reads == [observation.blob_id]
+    assert {item.id for item in context.observations} == {cited_code.id, cited_ioc.id}
+    assert context.blobs == {cited_code.id: raw}
+    assert set(uow.requested) == {cited_code.id, cited_ioc.id}
+    assert uncited.id not in uow.requested
+    assert store.reads == [cited_code.blob_id]
     blockedless = replace(
         opinion, blocks=opinion_blocks_with_observations((), ()), content_sha256=""
     )
+    unbounded_uow = _Uow()
     assert (
         asyncio.run(
             load_note_block_render_context(
-                uow_factory=cast(Any, lambda: _Uow()),
+                uow_factory=cast(Any, lambda: unbounded_uow),
                 artifact_store=cast(Any, store),
                 opinion=blockedless,
                 base_document=publication,
@@ -3004,6 +3037,7 @@ def test_load_note_block_render_context_reads_only_cited_code_blobs() -> None:
         )
         is None
     )
+    assert unbounded_uow.requested == []
 
 
 def test_note_stale_block_ref_refused() -> None:
@@ -3037,6 +3071,110 @@ def test_note_stale_block_ref_refused() -> None:
     with pytest.raises(NoteContentBlockRenderError) as failure:
         project_publication_to_typst_model(document)
     assert failure.value.code == "note_block_ref_stale"
+
+
+def test_real_typst_note_article_element_cross_reference_without_duplication(
+    tmp_path: Path,
+) -> None:
+    """End to end: a V9 article_element note is accepted, augmented and compiled.
+
+    The note references the element rendered at its article placement; the PDF
+    must carry the deterministic cross-reference and only one copy of the
+    element itself.
+    """
+    binary = os.environ.get("TYPST_BINARY") or str(
+        Path.home() / ".local" / "share" / "autowork-tools" / "typst"
+    )
+    if shutil.which(binary) is None and not Path(binary).is_file():
+        pytest.skip("pinned Typst 0.15.1 is unavailable")
+    version = subprocess.run(
+        (binary, "--version"), capture_output=True, check=True, text=True, timeout=10
+    ).stdout.strip()
+    assert version.startswith("typst 0.15.1"), version
+
+    table = _after_paragraph_table()
+    v9, base, _extraction = _note_block_v9(tables=(table,))
+    investigation_id = uuid4()
+    published_table = base.document.tables[0]
+    block = ArticleElementNoteBlockV1(
+        kind=NoteArticleElementKind.TABLE,
+        element_key=published_table.key,
+        element_sha256=publication_element_sha256(
+            base.document, kind="table", key=published_table.key
+        ),
+        anchor=_NOTE_BLOCK_ANCHOR,
+    )
+    # The acceptance path validates the block against the pinned V9 facts.
+    context = NoteContentBlockContextV1(
+        investigation_id=investigation_id,
+        anchor=_NOTE_BLOCK_ANCHOR,
+        elements=note_article_element_facts(v9),
+        observations={},
+        blobs={},
+        protocol_figures=(),
+    )
+    (resolved,) = validate_note_content_blocks((block,), context)
+    assert resolved.anchor == _NOTE_BLOCK_ANCHOR
+
+    note = AnalystObservationV1(
+        id=UUID(int=8831),
+        anchor=_NOTE_BLOCK_ANCHOR,
+        text="NOTE-TABLE-CROSS-REFERENCE",
+        state=AnalystObservationState.UNRESOLVED,
+        relation=AnalystObservationRelation.UNRESOLVED,
+        content_blocks=(block,),
+    )
+    document = _note_v9_with_opinion(
+        v9,
+        notes=(note,),
+        observations=(),
+        investigation_id=investigation_id,
+    )
+    # The publication is the augmented artifact itself, never a rebuilt V9.
+    assert type(document) is PublicationDocumentV9
+    assert document.resolved_placements == v9.resolved_placements
+
+    bundle = load_template_bundle(Path(__file__).resolve().parents[2] / "chpTypst")
+    render_context = NoteBlockRenderContext(element_facts=note_article_element_facts(document))
+    rendered = TypstRenderer().render(
+        document,
+        bundle,
+        document_label="Note article element — publication V9",
+        note_block_context=render_context,
+    )
+    workspace = tmp_path / "workspace"
+    for template_file in bundle.files:
+        destination = workspace / template_file.relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(template_file.content)
+    render_data_path = workspace / rendered.render_data_relative_path
+    render_data_path.parent.mkdir(parents=True, exist_ok=True)
+    render_data_path.write_bytes(rendered.render_data_bytes)
+
+    repository_root = Path(__file__).resolve().parents[2]
+    font_root = Path(os.environ.get("FONT_BUNDLE_ROOT", str(repository_root / "chpTypst")))
+    font_snapshot = load_font_bundle_snapshot(
+        font_root, repository_root / "infra" / "typst-fonts.lock"
+    )
+    font_paths = materialize_font_bundle(font_snapshot, tmp_path / "fonts")
+    compiled = asyncio.run(
+        TypstSubprocessCompiler(binary=binary).compile(
+            TypstCompileRequest(
+                workspace_root=workspace,
+                entrypoint_relative_path=rendered.entrypoint_relative_path,
+                font_paths=font_paths,
+            )
+        )
+    )
+
+    pdf = PdfReader(io.BytesIO(compiled.content), strict=True)
+    assert pdf.pages
+    compact_text = "".join("".join((page.extract_text() or "").split()) for page in pdf.pages)
+    assert "NOTE-TABLE-CROSS-REFERENCE" in compact_text
+    # The deterministic cross-reference names the element at its placement.
+    assert "".join(f"Tableau — {published_table.title}".split()) in compact_text
+    # The note references the element; it never duplicates its row data.
+    assert compact_text.count("-enc") == 1
 
 
 def test_note_protocol_figure_references_the_opinion_annex() -> None:

@@ -19,6 +19,12 @@ from httpx import ASGITransport
 
 from cti_app.api.investigation_article import router as article_anchors_router
 from cti_app.application.identity import LocalIdentityProvider
+from cti_app.application.opinion_note_proposals import (
+    NoteArticleElementFactV1,
+    NoteProposalErrorCode,
+    note_article_element_facts,
+    note_article_element_refusal,
+)
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.publication_builder import (
     build_article_format_v1,
@@ -193,10 +199,25 @@ def test_anchor_route_lists_after_paragraph_elements_only_when_resolved() -> Non
     )
 
     # A legacy V5 cannot resolve an explicit paragraph anchor: the element is
-    # not rendered, so the catalog must not offer it.
+    # not rendered, so the catalog reports it as non-proposable with the code
+    # the block validator would raise.
     _install_base(harness, base)
+    published = base.document.tables[0]
     legacy = client.get(_path(harness)).json()
-    assert legacy["elements"] == []
+    assert legacy["elements"] == [
+        {
+            "kind": "table",
+            "key": published.key,
+            "title": published.title,
+            "caption": published.caption,
+            "element_sha256": publication_element_sha256(
+                base.document, kind="table", key=published.key
+            ),
+            "anchor": None,
+            "proposable": False,
+            "refusal_reason": "note_block_ref_stale",
+        }
+    ]
 
     v9 = PublicationDocumentV9(
         base_publication=PublicationDocumentV7(
@@ -225,7 +246,6 @@ def test_anchor_route_lists_after_paragraph_elements_only_when_resolved() -> Non
     )
     _install_base(harness, v9)
     resolved = client.get(_path(harness)).json()
-    published = base.document.tables[0]
 
     assert resolved["elements"] == [
         {
@@ -237,12 +257,60 @@ def test_anchor_route_lists_after_paragraph_elements_only_when_resolved() -> Non
                 base.document, kind="table", key=published.key
             ),
             "anchor": "lead:0001",
+            "proposable": True,
+            "refusal_reason": None,
         }
     ]
+    # The route offers exactly the facts the block validator resolves against.
+    assert [
+        (
+            item["kind"],
+            item["key"],
+            item["element_sha256"],
+            item["anchor"],
+        )
+        for item in resolved["elements"]
+    ] == [
+        (fact.kind, fact.key, fact.element_sha256, fact.anchor)
+        for fact in note_article_element_facts(v9)
+    ]
+
+
+def _element_fact(**overrides: Any) -> NoteArticleElementFactV1:
+    fact = NoteArticleElementFactV1(
+        kind="table",
+        key="observed-commands",
+        element_sha256="a" * 64,
+        anchor="lead:0001",
+        evidence_ref_count=1,
+        source_document_known=True,
+        title="Observed commands",
+        caption=None,
+    )
+    return replace(fact, **overrides)
+
+
+def test_element_proposability_matches_the_block_validator_rules() -> None:
+    assert note_article_element_refusal(_element_fact()) is None
+    assert (
+        note_article_element_refusal(_element_fact(anchor=None))
+        is NoteProposalErrorCode.NOTE_BLOCK_REF_STALE
+    )
+    assert (
+        note_article_element_refusal(_element_fact(kind="chart", evidence_ref_count=0))
+        is NoteProposalErrorCode.NOTE_CHART_WITHOUT_EVIDENCE
+    )
+    assert (
+        note_article_element_refusal(_element_fact(kind="figure", source_document_known=False))
+        is NoteProposalErrorCode.NOTE_FIGURE_SOURCE_MISSING
+    )
+    assert note_article_element_refusal(_element_fact(kind="chart")) is None
+    assert note_article_element_refusal(_element_fact(kind="figure")) is None
 
 
 __all__ = [
     "test_anchor_route_lists_after_paragraph_elements_only_when_resolved",
     "test_anchor_route_prefers_the_pinned_opinion_base",
     "test_anchor_route_returns_exact_base_identity",
+    "test_element_proposability_matches_the_block_validator_rules",
 ]

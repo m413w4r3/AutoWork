@@ -795,7 +795,7 @@ def build_advisor_dossier(
                     kind="context",
                     identifier=f"task-context:{task_identifier}",
                     sha256=hashlib.sha256(task_body.encode("utf-8")).hexdigest(),
-                    label="Contexte de la tâche d\\u2019enquête (non probant)",
+                    label="Contexte de la tâche d\u2019enquête (non probant)",
                     body=task_body,
                     score=1,
                     origin="task_context_summary",

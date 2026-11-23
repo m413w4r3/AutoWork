@@ -887,7 +887,7 @@ def _embedded_v5_payload(payload: Any) -> dict[str, Any] | None:
         schema_version = payload.get("schema_version")
         if schema_version == "5":
             return payload
-        if schema_version not in {"6", "7", "8"}:
+        if schema_version not in {"6", "7", "8", "9", "10"}:
             return None
         base = payload.get("base_publication")
         if not isinstance(base, dict):
@@ -905,7 +905,7 @@ def _embedded_v5_bytes(content: bytes) -> bytes | None:
         v5_payload = _embedded_v5_payload(payload)
         if v5_payload is None or serialize_publication_document(envelope) != payload:
             return None
-        if payload.get("schema_version") in {"7", "8"} and (
+        if payload.get("schema_version") in {"7", "8", "9", "10"} and (
             publication_document_article_v5_body(envelope) is None
         ):
             return None
@@ -934,7 +934,7 @@ def _load_canonical_v5(
         v5_payload = _embedded_v5_payload(payload)
         if v5_payload is None:
             raise ValueError("Publication correction requires a V5 body")
-        if payload.get("schema_version") in {"7", "8"} and (
+        if payload.get("schema_version") in {"7", "8", "9", "10"} and (
             publication_document_article_v5_body(envelope) is None
         ):
             raise ValueError("Publication correction requires an article V5 body")
