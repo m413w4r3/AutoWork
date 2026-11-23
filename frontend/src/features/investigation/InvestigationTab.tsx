@@ -14,6 +14,7 @@ import {
 import { useInvestigationActivity } from "../../api/investigationOperator";
 import { InvestigationLabViews } from "./InvestigationLabViews";
 import { WorkshopCockpit } from "./shell/WorkshopCockpit";
+import { shortSha } from "./tasks/labels";
 
 const HASH_PATTERN = /^[0-9a-f]{64}$/;
 
@@ -51,6 +52,10 @@ export function InvestigationTab({
   const investigationId =
     selectedInvestigationId ?? existingForExactSynthesis?.id ?? null;
   const investigationQuery = useInvestigation(investigationId);
+  // The workshop cockpit must be reachable without scrolling: once a workshop
+  // investigation is selected, fold the launch/list cards above it.
+  const workshopActive =
+    investigationQuery.data?.prose_authority === "bridge_only";
   const resume = useResumeInvestigation();
   const interrupt = useInterruptInvestigation();
 
@@ -84,152 +89,160 @@ export function InvestigationTab({
       aria-labelledby="investigation-tab-heading"
     >
       <h2 id="investigation-tab-heading">Enquête / Avis de l’analyste</h2>
-      <section
-        className="job-card"
-        aria-labelledby="investigation-target-heading"
-      >
-        <h3 id="investigation-target-heading">Synthèse exacte à investiguer</h3>
-        {synthesisQuery.isPending ? (
-          <p role="status">Chargement de la synthèse vérifiée…</p>
-        ) : synthesisQuery.isError ? (
-          synthesisQuery.error instanceof ApiError &&
-          synthesisQuery.error.status === 404 ? (
-            <div className="empty-state">
-              <p>Aucune synthèse disponible pour ce sujet.</p>
-              <a href={`/editions/${encodeURIComponent(editionId)}/production`}>
-                Ouvrir le pipeline de production
-              </a>
-            </div>
-          ) : (
-            <p className="error-message" role="alert">
-              La synthèse ne peut pas être chargée :{" "}
-              {synthesisQuery.error.message}
-            </p>
-          )
-        ) : synthesisQuery.data ? (
-          <>
-            <dl>
-              <div>
-                <dt>Production run</dt>
-                <dd>
-                  {synthesisQuery.data.production_run_id ?? "Non renseigné"}
-                </dd>
+      <details className="investigation-source-fold" open={!workshopActive}>
+        <summary>Synthèse et enquêtes du sujet</summary>
+        <section
+          className="job-card"
+          aria-labelledby="investigation-target-heading"
+        >
+          <h3 id="investigation-target-heading">
+            Synthèse exacte à investiguer
+          </h3>
+          {synthesisQuery.isPending ? (
+            <p role="status">Chargement de la synthèse vérifiée…</p>
+          ) : synthesisQuery.isError ? (
+            synthesisQuery.error instanceof ApiError &&
+            synthesisQuery.error.status === 404 ? (
+              <div className="empty-state">
+                <p>Aucune synthèse disponible pour ce sujet.</p>
+                <a
+                  href={`/editions/${encodeURIComponent(editionId)}/production`}
+                >
+                  Ouvrir le pipeline de production
+                </a>
               </div>
-              <div>
-                <dt>Artefact de synthèse</dt>
-                <dd>
-                  {synthesisQuery.data.artifact_id} · version{" "}
-                  {synthesisQuery.data.version}
-                </dd>
-              </div>
-              <div>
-                <dt>SHA-256 canonique</dt>
-                <dd>
-                  <code>
-                    {synthesisQuery.data.canonical_sha256 ?? "Indisponible"}
-                  </code>
-                </dd>
-              </div>
-              <div>
-                <dt>État de vérification</dt>
-                <dd>{synthesisQuery.data.status}</dd>
-              </div>
-            </dl>
-            {!exactSynthesis ? (
-              <p className="verification-warning" role="note">
-                Lancer une enquête exige un run, un artefact vérifié et son
-                SHA-256 canonique exact.
+            ) : (
+              <p className="error-message" role="alert">
+                La synthèse ne peut pas être chargée :{" "}
+                {synthesisQuery.error.message}
               </p>
-            ) : null}
-            <div>
-              <button
-                type="button"
-                className="button button--secondary"
-                disabled={!exactSynthesis || launch.isPending}
-                onClick={() => {
-                  if (existingForExactSynthesis !== undefined) {
-                    // Une enquête existe déjà pour cette synthèse exacte : la
-                    // sélectionner ne mute rien. Un nouveau start legacy serait
-                    // refusé par le serveur (`prose_authority_conflict`).
-                    setSelectedInvestigationId(existingForExactSynthesis.id);
-                    return;
-                  }
-                  void startExactSynthesis();
-                }}
-              >
-                {launch.isPending
-                  ? "Lancement…"
-                  : existingForExactSynthesis
-                    ? "Ouvrir l’enquête sur cette version"
-                    : "Investiguer cette version exacte"}
-              </button>{" "}
-              <button
-                type="button"
-                className="button"
-                disabled={
-                  !exactSynthesis ||
-                  workshopLaunch.isPending ||
-                  Boolean(existingForExactSynthesis)
-                }
-                onClick={() => void startWorkshop()}
-              >
-                {workshopLaunch.isPending
-                  ? "Lancement de l’atelier…"
-                  : "Lancer l’atelier d’investigation"}
-              </button>
-            </div>
-            <p>
-              Atelier M24 : workspace local, Bridge rédacteur unique et
-              opérateurs agentiques. Une seule enquête peut exister par version
-              de synthèse.
-            </p>
-          </>
-        ) : (
-          <p>Aucune synthèse disponible.</p>
-        )}
-        {launch.error ? (
-          <p className="error-message" role="alert">
-            {launch.error.message}
-          </p>
-        ) : null}
-        {workshopLaunch.error ? (
-          <p className="error-message" role="alert">
-            {workshopLaunch.error.message}
-          </p>
-        ) : null}
-      </section>
-
-      <section
-        className="job-card"
-        aria-labelledby="investigation-list-heading"
-      >
-        <h3 id="investigation-list-heading">Enquêtes du sujet</h3>
-        {investigationsQuery.isPending ? (
-          <p role="status">Chargement des enquêtes…</p>
-        ) : investigationsQuery.isError ? (
-          <p className="error-message" role="alert">
-            La liste des enquêtes est inaccessible :{" "}
-            {investigationsQuery.error.message}
-          </p>
-        ) : investigationsQuery.data.length === 0 ? (
-          <p>Aucune enquête n’a encore été lancée.</p>
-        ) : (
-          <ul>
-            {investigationsQuery.data.map((item) => (
-              <li key={item.id}>
+            )
+          ) : synthesisQuery.data ? (
+            <>
+              <dl>
+                <div>
+                  <dt>Production run</dt>
+                  <dd>
+                    {synthesisQuery.data.production_run_id ?? "Non renseigné"}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Artefact de synthèse</dt>
+                  <dd>
+                    {synthesisQuery.data.artifact_id} · version{" "}
+                    {synthesisQuery.data.version}
+                  </dd>
+                </div>
+                <div>
+                  <dt>SHA-256 canonique</dt>
+                  <dd>
+                    <code>
+                      {synthesisQuery.data.canonical_sha256 ?? "Indisponible"}
+                    </code>
+                  </dd>
+                </div>
+                <div>
+                  <dt>État de vérification</dt>
+                  <dd>{synthesisQuery.data.status}</dd>
+                </div>
+              </dl>
+              {!exactSynthesis ? (
+                <p className="verification-warning" role="note">
+                  Lancer une enquête exige un run, un artefact vérifié et son
+                  SHA-256 canonique exact.
+                </p>
+              ) : null}
+              <div>
                 <button
                   type="button"
-                  aria-pressed={investigationId === item.id}
-                  onClick={() => setSelectedInvestigationId(item.id)}
+                  className="button button--secondary"
+                  disabled={!exactSynthesis || launch.isPending}
+                  onClick={() => {
+                    if (existingForExactSynthesis !== undefined) {
+                      // Une enquête existe déjà pour cette synthèse exacte : la
+                      // sélectionner ne mute rien. Un nouveau start legacy serait
+                      // refusé par le serveur (`prose_authority_conflict`).
+                      setSelectedInvestigationId(existingForExactSynthesis.id);
+                      return;
+                    }
+                    void startExactSynthesis();
+                  }}
                 >
-                  {statusLabel(item)} · run {item.production_run_id} · synthèse{" "}
-                  {item.synthesis_artifact_id} · version {item.version}
+                  {launch.isPending
+                    ? "Lancement…"
+                    : existingForExactSynthesis
+                      ? "Ouvrir l’enquête sur cette version"
+                      : "Investiguer cette version exacte"}
+                </button>{" "}
+                <button
+                  type="button"
+                  className="button"
+                  disabled={
+                    !exactSynthesis ||
+                    workshopLaunch.isPending ||
+                    Boolean(existingForExactSynthesis)
+                  }
+                  onClick={() => void startWorkshop()}
+                >
+                  {workshopLaunch.isPending
+                    ? "Lancement de l’atelier…"
+                    : "Lancer l’atelier d’investigation"}
                 </button>
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
+              </div>
+              <p>
+                Atelier M24 : workspace local, Bridge rédacteur unique et
+                opérateurs agentiques. Une seule enquête peut exister par
+                version de synthèse.
+              </p>
+            </>
+          ) : (
+            <p>Aucune synthèse disponible.</p>
+          )}
+          {launch.error ? (
+            <p className="error-message" role="alert">
+              {launch.error.message}
+            </p>
+          ) : null}
+          {workshopLaunch.error ? (
+            <p className="error-message" role="alert">
+              {workshopLaunch.error.message}
+            </p>
+          ) : null}
+        </section>
+
+        <section
+          className="job-card"
+          aria-labelledby="investigation-list-heading"
+        >
+          <h3 id="investigation-list-heading">Enquêtes du sujet</h3>
+          {investigationsQuery.isPending ? (
+            <p role="status">Chargement des enquêtes…</p>
+          ) : investigationsQuery.isError ? (
+            <p className="error-message" role="alert">
+              La liste des enquêtes est inaccessible :{" "}
+              {investigationsQuery.error.message}
+            </p>
+          ) : investigationsQuery.data.length === 0 ? (
+            <p>Aucune enquête n’a encore été lancée.</p>
+          ) : (
+            <ul>
+              {investigationsQuery.data.map((item) => (
+                <li key={item.id}>
+                  <button
+                    type="button"
+                    aria-pressed={investigationId === item.id}
+                    onClick={() => setSelectedInvestigationId(item.id)}
+                  >
+                    {statusLabel(item)} · run {item.production_run_id} ·
+                    synthèse {item.synthesis_artifact_id} · version{" "}
+                    {item.version}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      </details>
 
       {investigationId ? (
         investigationQuery.isPending ? (
@@ -308,18 +321,62 @@ function InvestigationDetail({
     <section aria-labelledby="investigation-detail-heading">
       <header className="job-card__heading">
         <div>
-          <h2 id="investigation-detail-heading">Enquête {investigation.id}</h2>
-          <p>
-            {statusLabel({
-              status: currentStatus,
-              stop_reason: currentStopReason,
-            })}{" "}
-            · version CAS {currentVersion} · run{" "}
-            {investigation.production_run_id} · synthèse{" "}
-            {investigation.synthesis_artifact_id} · SHA-256{" "}
-            <code>{investigation.synthesis_sha256}</code>
-          </p>
-          <p>Décisions attribuées à l’identité authentifiée côté serveur.</p>
+          <h2 id="investigation-detail-heading">
+            Enquête{" "}
+            <code title={investigation.id} className="m24-id-ref">
+              {workshopActive ? shortSha(investigation.id) : investigation.id}
+            </code>
+            {workshopActive ? (
+              <>
+                {" "}
+                ·{" "}
+                {statusLabel({
+                  status: currentStatus,
+                  stop_reason: currentStopReason,
+                })}{" "}
+                ·{" "}
+                <span title="Version de l’état de travail (CAS)">
+                  version de l’état {currentVersion}
+                </span>
+              </>
+            ) : null}
+          </h2>
+          {workshopActive ? (
+            <details className="investigation-identity-details">
+              <summary>Identité technique de l’enquête</summary>
+              <p>
+                run {investigation.production_run_id} · synthèse{" "}
+                {investigation.synthesis_artifact_id} · SHA-256{" "}
+                <code title={investigation.synthesis_sha256}>
+                  {shortSha(investigation.synthesis_sha256)}
+                </code>
+              </p>
+              <p>
+                Décisions attribuées à l’identité authentifiée côté serveur.
+              </p>
+            </details>
+          ) : (
+            <>
+              <p>
+                {statusLabel({
+                  status: currentStatus,
+                  stop_reason: currentStopReason,
+                })}{" "}
+                ·{" "}
+                <span title="Version de l’état de travail (CAS)">
+                  version de l’état {currentVersion}
+                </span>{" "}
+                · run {investigation.production_run_id} · synthèse{" "}
+                {investigation.synthesis_artifact_id} · SHA-256{" "}
+                <code title={investigation.synthesis_sha256}>
+                  {investigation.synthesis_sha256}
+                </code>
+              </p>
+              <p>
+                Décisions attribuées à l’identité authentifiée côté serveur.
+              </p>
+            </>
+          )}
         </div>
       </header>
       {currentStopReason === "model_unavailable" ? (

@@ -69,6 +69,18 @@ async function openView(page: Page, name: string) {
   await page.getByRole("tab", { name }).click();
 }
 
+/** Open the folded launch/list cards without toggling a possibly open fold. */
+async function expandSourceSections(page: Page) {
+  await page.getByText("Synthèse et enquêtes du sujet").evaluate((summary) => {
+    const details = (
+      summary as unknown as {
+        parentElement: { open: boolean } | null;
+      }
+    ).parentElement;
+    if (details !== null) details.open = true;
+  });
+}
+
 test("lance l’atelier M24 et navigue les cinq vues au clavier", async ({
   page,
 }) => {
@@ -135,6 +147,35 @@ test("lance l’atelier M24 et navigue les cinq vues au clavier", async ({
     "aria-labelledby",
     "workshop-tab-opinion",
   );
+});
+
+test("cockpit : la tablist est visible sans défilement à 1280×800", async ({
+  page,
+}) => {
+  const api = createWorkshopApi();
+  await launchWorkshop(page, api);
+
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.evaluate("window.scrollTo(0, 0)");
+  const tablist = page.getByRole("tablist", {
+    name: "Vues du cockpit d’enquête",
+  });
+  const box = await tablist.boundingBox();
+  expect(box).not.toBeNull();
+  expect(box?.y ?? Number.NEGATIVE_INFINITY).toBeGreaterThanOrEqual(0);
+  expect((box?.y ?? 0) + (box?.height ?? 0)).toBeLessThanOrEqual(800);
+
+  // The launch/list cards above the cockpit are folded, not removed.
+  await expect(page.getByText("Synthèse et enquêtes du sujet")).toBeVisible();
+  for (const label of [
+    "Vue d’ensemble",
+    "Plan et tâches",
+    "Échantillons et résultats",
+    "Workspace et notes",
+    "Note de l’analyste",
+  ]) {
+    await expect(tablist.getByRole("tab", { name: label })).toBeVisible();
+  }
 });
 
 test("vue d’ensemble : agent hôte absent, workspace indisponible et G2 bloqué", async ({
@@ -258,6 +299,9 @@ test("vue d’ensemble : extension puis révocation G2 de l’enveloppe approuv�
   await page
     .getByRole("button", { name: "Enquête / Avis de l’analyste" })
     .click();
+  // The launch/list cards are folded once a workshop investigation is
+  // selected (R5-F5); expand them to reach the explicit open action.
+  await expandSourceSections(page);
   await page
     .getByRole("button", { name: "Ouvrir l’enquête sur cette version" })
     .click();
@@ -548,6 +592,7 @@ test("ouvre une enquête existante sans relancer un start legacy", async ({
   await page
     .getByRole("button", { name: "Enquête / Avis de l’analyste" })
     .click();
+  await expandSourceSections(page);
 
   const open = page.getByRole("button", {
     name: "Ouvrir l’enquête sur cette version",
@@ -775,7 +820,8 @@ test("attribution puis ouverture explicite de la session Codex", async ({
   await expect(
     page.getByText("Codex CLI · Vérifier le domaine C2"),
   ).toBeVisible();
-  await expect(page.getByText("En cours").first()).toBeVisible();
+  const operators = page.getByRole("region", { name: "Opérateurs actifs" });
+  await expect(operators.getByText("En cours").first()).toBeVisible();
   await expect(page.getByText("Aucun opérateur actif.")).toHaveCount(0);
   expect(api.unhandled).toEqual([]);
 });

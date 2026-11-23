@@ -5,11 +5,29 @@
 }
 
 .workshop-tablist {
+  position: sticky;
+  top: 0;
+  z-index: 10;
   display: flex;
   flex-wrap: wrap;
   gap: 0.5rem;
+  padding-top: 0.5rem;
   padding-bottom: 0.5rem;
   border-bottom: 1px solid #dce4de;
+  background: #eef2ed;
+}
+
+/* Folded launch/list cards above the workshop cockpit (InvestigationTab). */
+.investigation-source-fold {
+  margin-bottom: 1rem;
+}
+
+.investigation-source-fold > summary,
+.investigation-identity-details > summary {
+  cursor: pointer;
+  color: #405249;
+  font-size: 0.85rem;
+  font-weight: 700;
 }
 
 .workshop-tab {

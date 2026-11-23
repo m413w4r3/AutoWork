@@ -372,7 +372,9 @@ describe("InvestigationTab", () => {
         name: `Enquête ${INVESTIGATION_ID}`,
       }),
     ).toBeInTheDocument();
-    expect(screen.getByText(/En cours · version CAS 1/)).toBeInTheDocument();
+    expect(
+      screen.getByTitle("Version de l’état de travail (CAS)"),
+    ).toHaveTextContent("version de l’état 1");
     expect(
       screen.getByRole("button", { name: "Interrompre l’enquête" }),
     ).toBeInTheDocument();
