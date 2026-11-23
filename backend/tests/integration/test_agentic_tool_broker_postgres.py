@@ -17,6 +17,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, cast
@@ -31,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cti_app.api.agentic_tools import router as agentic_tools_router
 from cti_app.application.agent_session_verifier import (
+    HmacAgentSessionVerifier,
     HmacSessionSecretDeriver,
     build_agent_session_message,
     session_secret_hash,
@@ -89,12 +91,11 @@ pytestmark = pytest.mark.integration
 
 SESSION_KEY = "m" * 32
 OPERATOR_ID = "codex:operator-1"
-NOW = datetime.now(UTC)
 TOOL_NAME = "sample.analyze"
 SCHEMA_VERSION = "1"
 
 
-def _capabilities() -> OperatorCapabilitiesV1:
+def _capabilities(now: datetime) -> OperatorCapabilitiesV1:
     return OperatorCapabilitiesV1(
         adapter_kind=OperatorAdapterKind.CODEX_CLI,
         executable="/usr/local/bin/codex",
@@ -105,7 +106,7 @@ def _capabilities() -> OperatorCapabilitiesV1:
         supports_non_interactive=True,
         supports_stop=True,
         permission_modes=("workspace-write",),
-        probed_at=NOW,
+        probed_at=now,
         probes=(
             OperatorProbeCommand(
                 argv=("/usr/local/bin/codex", "--help"),
@@ -127,12 +128,17 @@ async def _seed(
     reference each other, so the task is inserted without a lease, the session
     is inserted against it, then the lease columns are bound by SQL.
     """
+    # Lease timestamps are anchored when the test runs, not when pytest
+    # collected the module: the signed routes and the repositories compare the
+    # lease against the real clock, and a full-suite collection can precede
+    # this test by much longer than the 180 s lease TTL.
+    now = datetime.now(UTC)
     suffix = uuid4().hex
     session_id = uuid4()
     lease_id = uuid4()
     nonce = b"s" * 32
     secret = HmacSessionSecretDeriver(SESSION_KEY).derive(session_id=session_id, nonce=nonce)
-    capabilities = _capabilities()
+    capabilities = _capabilities(now)
     edition = Edition(
         country=f"Broker fixture {suffix}",
         country_code=reserve_edition_code(),
@@ -178,8 +184,8 @@ async def _seed(
             status_version=3,
             result_verification_status=ResultVerificationStatus.UNVERIFIED,
             created_by=TaskActor(kind=TaskActorKind.HUMAN, actor_id="analyst:test"),
-            created_at=NOW - timedelta(minutes=5),
-            updated_at=NOW,
+            created_at=now - timedelta(minutes=5),
+            updated_at=now,
             assigned_actor_kind=TaskActorKind.OPERATOR,
             assigned_actor_id=OPERATOR_ID,
             lease_fence=1,
@@ -199,11 +205,11 @@ async def _seed(
             probed_at=capabilities.probed_at,
             auth_secret_nonce=nonce,
             auth_secret_hash=session_secret_hash(secret),
-            auth_secret_issued_at=NOW,
-            opened_at=NOW,
+            auth_secret_issued_at=now,
+            opened_at=now,
             idempotency_key=f"session-{session_id}",
-            created_at=NOW,
-            updated_at=NOW,
+            created_at=now,
+            updated_at=now,
             host_session_ref=f"host-{session_id}",
         )
         await uow.agent_sessions.add(session_row)
@@ -236,8 +242,8 @@ async def _seed(
                 {
                     "lease_id": lease_id,
                     "session_id": session_id,
-                    "expires_at": NOW + timedelta(seconds=180),
-                    "heartbeat": NOW,
+                    "expires_at": now + timedelta(seconds=180),
+                    "heartbeat": now,
                     "task_id": stored_task.id,
                 },
             )
@@ -247,7 +253,7 @@ async def _seed(
         bound = await uow.agent_sessions.get(session_id)
         assert bound is not None
         await uow.agent_sessions.update_state(
-            bound.with_task_lease(lease_id, 1, now=NOW), expected_state_version=bound.state_version
+            bound.with_task_lease(lease_id, 1, now=now), expected_state_version=bound.state_version
         )
         await uow.commit()
     return investigation.id, stored_task.id, session_id, secret
@@ -382,12 +388,20 @@ class _CompositionFactory:
         return SimpleNamespace(operator_tool_invocations=service)
 
 
-def _app(uow_factory: Any) -> FastAPI:
+def _app(uow_factory: Any, *, verifier_clock: Callable[[], datetime] | None = None) -> FastAPI:
     app = FastAPI()
     app.include_router(agentic_tools_router)
     app.state.uow_factory = uow_factory
     app.state.settings = Settings(_env_file=None, m24_agent_session_key=SESSION_KEY)
     app.state.investigation_composition_factory = _CompositionFactory()
+    if verifier_clock is not None:
+        # Time-boundary oracles pin the D7 verifier clock instead of racing the
+        # wall clock; the route honours a mounted verifier over its default.
+        app.state.agent_session_verifier = HmacAgentSessionVerifier(
+            uow_factory=uow_factory,
+            deriver=HmacSessionSecretDeriver(SESSION_KEY),
+            clock=verifier_clock,
+        )
     return app
 
 
@@ -472,6 +486,7 @@ async def test_expired_lease_race_refuses_before_any_invocation(
     investigation_id, task_id, session_id, secret = await _seed(
         session_factory, migrated_postgres_url
     )
+    now = datetime.now(UTC)
     engine = create_postgres_engine(migrated_postgres_url)
     try:
         # The signature is still valid; the lease expires before the call is
@@ -483,8 +498,8 @@ async def test_expired_lease_race_refuses_before_any_invocation(
                     "lease_expires_at = :expires_at WHERE id = :task_id"
                 ),
                 {
-                    "heartbeat": NOW - timedelta(seconds=400),
-                    "expires_at": NOW - timedelta(seconds=1),
+                    "heartbeat": now - timedelta(seconds=400),
+                    "expires_at": now - timedelta(seconds=1),
                     "task_id": task_id,
                 },
             )
@@ -496,6 +511,55 @@ async def test_expired_lease_race_refuses_before_any_invocation(
         investigation_id=investigation_id,
         session_id=session_id,
         idempotency_key="mcp-expired-lease",
+    )
+
+    async with httpx.AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        refused = await client.post(path, content=body, headers=headers)
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "agent_session_lease_stale"
+    async with uow_factory() as uow:
+        assert await uow.tool_invocations.list_for_investigation(investigation_id) == ()
+
+
+@pytest.mark.asyncio
+async def test_lease_deadline_equal_to_the_verifier_clock_is_refused(
+    uow_factory: Any, migrated_postgres_url: str
+) -> None:
+    """The lease boundary is inclusive: at the deadline the call is stale.
+
+    The verifier clock is pinned to the stored deadline, so this is a pure
+    boundary oracle and never depends on how long the suite took to get here.
+    """
+    session_factory = uow_factory.session_factory
+    investigation_id, task_id, session_id, secret = await _seed(
+        session_factory, migrated_postgres_url
+    )
+    deadline = datetime.now(UTC)
+    engine = create_postgres_engine(migrated_postgres_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                sa.text(
+                    "UPDATE investigation_tasks SET heartbeat_at = :heartbeat, "
+                    "lease_expires_at = :expires_at WHERE id = :task_id"
+                ),
+                {
+                    "heartbeat": deadline - timedelta(seconds=60),
+                    "expires_at": deadline,
+                    "task_id": task_id,
+                },
+            )
+    finally:
+        await engine.dispose()
+    app = _app(uow_factory, verifier_clock=lambda: deadline)
+    path, body, headers = _signed(
+        secret,
+        investigation_id=investigation_id,
+        session_id=session_id,
+        idempotency_key="mcp-deadline-lease",
     )
 
     async with httpx.AsyncClient(
