@@ -335,9 +335,19 @@ attestation; P = live provider, requires separate authorization — not run here
 5. **Claude's own proxy/agent-proxy handling** may rewrite `HTTPS_PROXY` for subprocesses
    (strings mention an agent-proxy relay and `HTTPS_PROXY` diagnostics); H0 must prove the
    outer proxy is the effective one.
-6. **Same-uid secret race** at each run's startup remains: the CLI could connect to the
-   one-shot socket before the shim. `PR_SET_DUMPABLE=0`, the ro `ipc/` bind and startup
-   before the first model turn reduce but do not eliminate it.
+6. **D7 secret readable by the sandboxed CLI — accepted and bounded, never resolved.**
+   The CLI launches the shim itself and can read `AUTOWORK_SESSION_SOCKET` from its own
+   environment (`adapters/codex.py:529-541`, `adapters/claude.py:916-929`), so the order
+   is under its control: it can connect to the per-run one-shot socket before the shim
+   and receive the complete `autowork-session-secret.v1` frame (R2-F1, VERIFIED). This
+   is not a narrow startup race and `PR_SET_DUMPABLE=0` / the ro `ipc/` bind only reduce
+   the blast radius. What the secret grants is exactly the session's own authority: the
+   relay exposes a closed catalogue of three fixed routes with closed headers, and the
+   backend revalidates HMAC D7, the active session, the task binding and the current
+   lease; the secret is destroyed at close and revocation and re-armed per run. The
+   compensating control is that the secret must never be persisted: `collect` refuses
+   agent content carrying it (raw, hex, base64, or a ≥16-byte aligned fragment) and
+   revokes the session with `secret_exposure_detected`.
 7. **Revocation latency for open tunnels**: the backend is authoritative, but a lease
    expiry the host has not yet been told about does not instantly close an active tunnel.
    A local lease deadline (passed in `PrepareSessionV1`) would tighten this; today the
@@ -355,3 +365,9 @@ attestation; P = live provider, requires separate authorization — not run here
 12. **Redirects and CDN answers**: a provider redirect to a new hostname requires that
     hostname in the allowlist, otherwise the model call fails; H0 must record the full
     redirect set actually used.
+13. **The D7 secret is readable by the sandboxed CLI (item 6); this residual risk is
+    accepted and bounded, not fixed.** The design does not hide the secret from a CLI
+    that spawns the shim; it bounds what the secret can do, destroys it at
+    close/revocation, re-arms it per run, and refuses to persist agent content that
+    carries it. Any reviewer must keep treating this residue as open unless the shim is
+    moved host-side.

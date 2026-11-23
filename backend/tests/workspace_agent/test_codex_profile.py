@@ -42,6 +42,11 @@ from sidecars.workspace_agent.sessions.state import (
     SessionState,
 )
 
+from cti_app.application.agentic_host_sessions import (
+    HostCapabilityProbeV1,
+    HostPreparedSessionV1,
+    HostSessionStatusV1,
+)
 from tests.workspace_agent import claude_profile_support
 from tests.workspace_agent.sessions_support import (
     HANDOFF_ID,
@@ -565,10 +570,26 @@ def test_codex_prompt_carries_preamble_and_handoff_reference(tmp_path: Path) -> 
     assert "untrusted" in prompt.lower()
 
     handoff = context.config_directory / "handoff.json"
-    handoff.write_text('{"objective": "synthetic"}\n', encoding="utf-8")
+    content = b'{"objective": "synthetic"}\n'
+    handoff.write_bytes(content)
+    context.record.handoff = HandoffRef(
+        handoff_id=HANDOFF_ID, version=3, sha256=hashlib.sha256(content).hexdigest()
+    )
     with_handoff = profile.build_launch_plan(context)
     assert with_handoff.stdin_data is not None
-    assert "config/handoff.json" in with_handoff.stdin_data.decode("utf-8")
+    received = with_handoff.stdin_data.decode("utf-8")
+    assert "config/handoff.json" in received
+    assert hashlib.sha256(content).hexdigest() in received
+
+    # F10: ``config/`` is writable from the sandbox.  A file that does not
+    # match the versioned handoff sha256 is omitted and never quoted.
+    handoff.write_bytes(b'{"objective": "tampered by a previous run"}\n')
+    mismatched = profile.build_launch_plan(context)
+    assert mismatched.stdin_data is not None
+    received = mismatched.stdin_data.decode("utf-8")
+    assert "handoff content mismatch, omitted" in received
+    assert "tampered by a previous run" not in received
+    assert "The versioned handoff content is provided read-only" not in received
 
 
 def test_codex_fails_closed_when_bwrap_is_unavailable(tmp_path: Path) -> None:
@@ -688,6 +709,64 @@ def test_codex_profile_lifecycle_through_supervisor(
         kinds = [event["kind"] for event in session_events(client, running)]
         assert "process_started" in kinds
         assert "process_exited" in kinds
+
+
+def test_codex_cli_wire_kind_selects_the_codex_profile_and_egress(
+    session_base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F5: the backend's exact ``OperatorAdapterKind`` value reaches the profile.
+
+    The host resolves ``codex_cli`` once at the entry point, records/selects
+    the canonical ``codex`` profile and its egress allowlist, and echoes the
+    wire name in the probe/status responses the backend validates.
+    """
+    fake = _install_fake_codex(session_base)
+    stub = _install_stub_bwrap(session_base)
+    monkeypatch.setenv("AUTOWORK_CODEX_BINARY", str(fake))
+    monkeypatch.setenv("AUTOWORK_CODEX_BWRAP", str(stub))
+    monkeypatch.delenv("AUTOWORK_CODEX_AUTH_FILE", raising=False)
+    monkeypatch.delenv("AUTOWORK_CODEX_RESUME_PROVEN", raising=False)
+    with running_session_agent(session_base) as running, running.client() as client:
+        workspace_id = running.ensure_workspace(client)
+        probe = get_session(client, running, "/v1/sessions/capabilities", adapter_kind="codex_cli")
+        assert probe.status_code == 200, probe.text
+        wire = probe.json()
+        assert wire["adapter_kind"] == "codex_cli"
+        HostCapabilityProbeV1.model_validate_json(probe.content)
+
+        prepared = post_session(
+            client,
+            running,
+            "/v1/sessions",
+            prepare_payload(workspace_id, adapter_kind="codex_cli", network_mode="isolated_egress"),
+            "m24-r2fixa-prepare-codex-1",
+        )
+        assert prepared.status_code == 200, prepared.text
+        HostPreparedSessionV1.model_validate_json(prepared.content)
+        assert prepared.json()["confinement"]["profile"] == "bwrap-reasoning-session"
+
+        status = get_session(client, running, f"/v1/sessions/{SESSION_ID}")
+        assert status.status_code == 200, status.text
+        body = status.json()
+        assert body["adapter_kind"] == "codex_cli"
+        HostSessionStatusV1.model_validate_json(status.content)
+
+        # Record, profile and egress allowlist are canonical: the fixture
+        # egress profile declares only "codex", so a wire-named load would
+        # have refused prepare with confinement_unavailable.
+        persisted = json.loads((running.session_dir() / "state.json").read_text(encoding="utf-8"))
+        assert persisted["adapter_kind"] == "codex"
+
+        # Only the two closed aliases exist; a canonical name still works for
+        # direct host callers, and anything else stays refused.
+        canonical = get_session(client, running, "/v1/sessions/capabilities", adapter_kind="codex")
+        assert canonical.status_code == 200
+        assert canonical.json()["adapter_kind"] == "codex"
+        unknown = get_session(
+            client, running, "/v1/sessions/capabilities", adapter_kind="codex_cli_v2"
+        )
+        assert unknown.status_code == 409
+        assert unknown.json()["error"] == "capability_unavailable"
 
 
 def test_codex_profile_interrupt_kills_process_group(
