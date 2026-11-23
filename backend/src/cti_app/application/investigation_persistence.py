@@ -642,6 +642,12 @@ class AgentSessionRepository(Protocol):
         """
         ...
 
+    async def list_delivery_candidates(
+        self, *, limit: int, after_session_id: UUID | None
+    ) -> tuple[AgentSessionInstructionV1, ...]:
+        """Return the oldest queued instruction for each active session in rotation order."""
+        ...
+
     async def list_stale_delivering(
         self, *, attempted_before: datetime, limit: int
     ) -> tuple[AgentSessionInstructionV1, ...]:
@@ -2292,6 +2298,35 @@ class InMemoryAgentSessionRepository:
             key=lambda instruction: (instruction.queued_at, str(instruction.id)),
         )
         return tuple(pending[:limit])
+
+    async def list_delivery_candidates(
+        self, *, limit: int, after_session_id: UUID | None
+    ) -> tuple[AgentSessionInstructionV1, ...]:
+        """Pick one oldest queued row per active session, rotating by session id."""
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        oldest_by_session: dict[UUID, AgentSessionInstructionV1] = {}
+        for instruction in self._instructions.values():
+            session = self._sessions.get(instruction.session_id)
+            if (
+                instruction.state is not InstructionState.QUEUED
+                or session is None
+                or session.state not in ACTIVE_AGENT_SESSION_STATES
+            ):
+                continue
+            current = oldest_by_session.get(instruction.session_id)
+            if current is None or (instruction.queued_at, instruction.id.int) < (
+                current.queued_at,
+                current.id.int,
+            ):
+                oldest_by_session[instruction.session_id] = instruction
+
+        session_ids = sorted(oldest_by_session, key=lambda session_id: session_id.int)
+        if after_session_id is not None:
+            session_ids = [
+                session_id for session_id in session_ids if session_id.int > after_session_id.int
+            ] + [session_id for session_id in session_ids if session_id.int <= after_session_id.int]
+        return tuple(oldest_by_session[session_id] for session_id in session_ids[:limit])
 
     async def list_stale_delivering(
         self, *, attempted_before: datetime, limit: int

@@ -533,6 +533,97 @@ async def test_two_instructions_deliver_in_order_with_their_own_ids() -> None:
     assert harness.host.send_calls[1]["request"].text == "Second: trace the socket."
 
 
+async def test_delivery_round_robin_serves_sparse_session_within_two_passes() -> None:
+    """A deep queue in one session cannot occupy every bounded drain pass."""
+    harness = _Harness()
+    first_session = await harness.seed_session(state=AgentSessionState.RUNNING)
+    second_session = await harness.seed_session(state=AgentSessionState.RUNNING)
+    # Put the busy queue first under the old global (queued_at, id) scan and
+    # first in the new deterministic UUID rotation as well.
+    busy, sparse = sorted((first_session, second_session), key=lambda item: item.id.int)
+    busy_instructions = [
+        await harness.seed_queued_instruction(
+            busy,
+            text=f"Busy instruction {index}",
+            key=f"i-busy-{index}",
+            queued_at=NOW - timedelta(seconds=10 - index),
+        )
+        for index in range(5)
+    ]
+    sparse_instruction = await harness.seed_queued_instruction(
+        sparse, text="Sparse instruction", key="i-sparse", queued_at=NOW
+    )
+    delivery = InstructionDeliveryService(
+        uow_factory=harness.uow_factory,
+        host=harness.host,
+        notes=harness.notes,
+        disclosure=harness.disclosure,
+        clock=harness.clock,
+        grace_seconds=GRACE_SECONDS,
+        batch_size=1,
+    )
+
+    first_pass = await delivery.drain_once(now=NOW)
+    second_pass = await delivery.drain_once(now=NOW)
+
+    assert first_pass.scanned == second_pass.scanned == 1
+    assert first_pass.delivered == second_pass.delivered == 1
+    assert [call["session_id"] for call in harness.host.send_calls] == [busy.id, sparse.id]
+    assert [call["request"].instruction_id for call in harness.host.send_calls] == [
+        busy_instructions[0].id,
+        sparse_instruction.id,
+    ]
+    assert (await harness.instruction(sparse_instruction.id)).state is InstructionState.DELIVERED
+
+    replay = await delivery.deliver_instruction(sparse_instruction.id, now=NOW)
+    assert replay.outcome is InstructionAttemptOutcome.DEFERRED
+    assert len(harness.host.send_calls) == 2
+
+    third_pass = await delivery.drain_once(now=NOW)
+    assert third_pass.delivered == 1
+    assert harness.host.send_calls[2]["session_id"] == busy.id
+    assert harness.host.send_calls[2]["request"].instruction_id == busy_instructions[1].id
+
+
+async def test_delivery_below_batch_limit_still_selects_one_oldest_per_session() -> None:
+    harness = _Harness()
+    first_session = await harness.seed_session(state=AgentSessionState.RUNNING)
+    second_session = await harness.seed_session(state=AgentSessionState.RUNNING)
+    busy, sparse = sorted((first_session, second_session), key=lambda item: item.id.int)
+    oldest = await harness.seed_queued_instruction(
+        busy, text="Oldest", key="i-under-limit-oldest", queued_at=NOW
+    )
+    later = await harness.seed_queued_instruction(
+        busy,
+        text="Later",
+        key="i-under-limit-later",
+        queued_at=NOW + timedelta(seconds=1),
+    )
+    other = await harness.seed_queued_instruction(
+        sparse, text="Other session", key="i-under-limit-other", queued_at=NOW
+    )
+    delivery = InstructionDeliveryService(
+        uow_factory=harness.uow_factory,
+        host=harness.host,
+        notes=harness.notes,
+        disclosure=harness.disclosure,
+        clock=harness.clock,
+        grace_seconds=GRACE_SECONDS,
+        batch_size=3,
+    )
+
+    report = await delivery.drain_once(now=NOW)
+
+    assert report.scanned == 2
+    assert report.delivered == 2
+    assert [call["session_id"] for call in harness.host.send_calls] == [busy.id, sparse.id]
+    assert [call["request"].instruction_id for call in harness.host.send_calls] == [
+        oldest.id,
+        other.id,
+    ]
+    assert (await harness.instruction(later.id)).state is InstructionState.QUEUED
+
+
 # ------------------------------------------------------------------- INS-04
 
 

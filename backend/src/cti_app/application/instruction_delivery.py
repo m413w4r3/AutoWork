@@ -33,6 +33,7 @@ stable reason codes.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from collections.abc import Callable, Mapping
@@ -351,6 +352,10 @@ class InstructionDeliveryService:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._grace_seconds = grace_seconds
         self._batch_size = batch_size
+        # The lifespan-mounted service is process-scoped; this volatile cursor
+        # needs no schema state and is coordinated across concurrent drain calls.
+        self._last_delivery_session_id: UUID | None = None
+        self._candidate_lock = asyncio.Lock()
 
     # ---------------------------------------------------------------- public
 
@@ -1035,16 +1040,22 @@ class InstructionDeliveryService:
         return timestamp
 
     async def _list_delivery_candidates(self, limit: int) -> tuple[AgentSessionInstructionV1, ...]:
-        """Only ``queued`` rows of active sessions can ever be delivered.
+        """Select one oldest queued row per active session in round-robin order.
 
-        Ambiguous or in-flight rows get their own reconciliation queries; if
-        they shared this bounded batch, 50 unresolvable rows would starve
-        every live instruction behind them (R4-F2 residual).
+        The short lock coordinates concurrent drain calls in this service
+        instance. It protects only the in-memory cursor and bounded database
+        read; host status and delivery I/O remain outside this selection step.
+        Ambiguous or in-flight rows use their own reconciliation queries.
         """
-        async with self._uow_factory() as uow:
-            return await uow.agent_sessions.list_pending_instructions(
-                limit=limit, states=(InstructionState.QUEUED,)
-            )
+        async with self._candidate_lock:
+            async with self._uow_factory() as uow:
+                pending = await uow.agent_sessions.list_delivery_candidates(
+                    limit=limit,
+                    after_session_id=self._last_delivery_session_id,
+                )
+            if pending:
+                self._last_delivery_session_id = pending[-1].session_id
+            return pending
 
     async def _load_instruction(self, instruction_id: UUID) -> AgentSessionInstructionV1 | None:
         async with self._uow_factory() as uow:

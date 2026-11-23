@@ -142,17 +142,23 @@ transition depuis un terminal.
 **Déclencheurs.** (a) `enqueue` : commit `queued`, puis tentative inline best-effort si l’état
 backend est déjà `awaiting_instruction` (INS-01). (b) Boucle de fond toutes les
 `M24_INSTRUCTION_DRAIN_INTERVAL_SECONDS` (défaut 10 s, 2–300), lot
-`M24_INSTRUCTION_DRAIN_BATCH_SIZE` (défaut 50), verrou consultatif de transaction
-`pg_try_advisory_xact_lock(hashtextextended('m24.instruction-drain',0))`. Elle réconcilie
+`M24_INSTRUCTION_DRAIN_BATCH_SIZE` (défaut 50), verrou consultatif de session
+`pg_try_advisory_lock(hashtextextended('m24.instruction-drain',0))` tenu sur une connexion dédiée.
+Elle réconcilie
 d’abord les `delivering` périmés et `delivery_unknown` — requêtes dédiées sur **toutes** les
 sessions, car une tentative d’une session devenue terminale doit encore se résoudre (R4B-F1/F2)
-— puis draine les `queued` par `(queued_at,id)`. La réconciliation `delivery_unknown` lit
+— puis sélectionne les `queued` par rotation circulaire des sessions actives. Pour chaque
+session, le dépôt retient sa plus ancienne instruction selon `(queued_at,id)` ; la borne du lot
+porte sur les sessions distinctes, et le curseur en mémoire du service reprend après la dernière
+session sélectionnée au passage précédent. Une file profonde ne peut donc pas remplir plusieurs
+places du même lot ni repousser indéfiniment une autre session. Aucun état de curseur n’est ajouté
+au schéma. La réconciliation `delivery_unknown` lit
 **deux lots bornés indépendants**, sessions actives puis sessions terminales : un lot unique
 plus-ancien-d’abord laisserait 50 lignes terminales inconcluables affamer indéfiniment une
 ligne plus récente d’une session vivante (R4C-F1). Candidat de **livraison** = session active
 portant une instruction `queued` uniquement : une ligne `delivering|delivery_unknown` n’est
 jamais livrable et ne doit pas occuper le lot borné (R4-F2 résiduel). L’index partiel §4 reste
-utilisé.
+utilisé pour filtrer les instructions `queued`.
 
 **Par session, une instruction :**
 1. `host.get_session_status(session_id)` via le client brut (pas les `ProbedHostFacts` en
