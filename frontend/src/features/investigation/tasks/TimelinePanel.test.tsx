@@ -252,9 +252,7 @@ describe("TimelinePanel", () => {
     const session = screen.getByText(
       "Session Codex CLI · Attente d’instruction",
     );
-    const instruction = screen.getByText(
-      "Instruction humaine · En file (agent occupé)",
-    );
+    const instruction = screen.getByText("Instruction humaine · En file");
     // The raw B7 tokens remain readable as titles.
     expect(screen.getByTitle("handoff:v2:human->operator")).toBeInTheDocument();
     expect(
@@ -334,7 +332,7 @@ describe("TimelinePanel", () => {
     );
 
     expect(
-      screen.getByText("Instruction humaine · En file (agent occupé)"),
+      screen.getByText("Instruction humaine · En file"),
     ).toBeInTheDocument();
     expect(screen.queryByText("Passation v2 · Humain → Opérateur")).toBeNull();
     expect(screen.queryByText("Finding importé")).toBeNull();

@@ -68,8 +68,8 @@ export const SESSION_STATE_LABELS: Record<AgentSessionState, string> = {
   running: "En cours",
   awaiting_instruction: "Attente d’instruction",
   interrupt_requested: "Interruption demandée",
-  stopped: "Arrêtée",
-  lost: "Perdue",
+  stopped: "Session interrompue",
+  lost: "Session perdue",
   reconciling: "Réconciliation",
   closed: "Fermée",
   failed: "Échouée",
@@ -80,13 +80,16 @@ export const INSTRUCTION_JOURNAL_STATE_LABELS: Record<
   InstructionState,
   string
 > = {
-  queued: "En file (agent occupé)",
-  delivering: "Livraison en cours",
+  queued: "En file",
+  delivering: "Envoi en cours",
   delivered: "Transmise",
   acknowledged: "Acquittée",
-  delivery_unknown: "Livraison inconnue",
+  delivery_unknown: "Livraison incertaine",
   cancelled: "Annulée",
 };
+
+/** Local mutation state only; it is not a persisted instruction API state. */
+export const INSTRUCTION_SUBMISSION_PENDING_LABEL = "En attente d’envoi";
 
 export const HANDOFF_FRESHNESS_LABELS: Record<HandoffFreshnessState, string> = {
   fresh: "À jour",

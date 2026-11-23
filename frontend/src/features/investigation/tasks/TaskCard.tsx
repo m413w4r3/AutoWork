@@ -877,6 +877,12 @@ export function TaskCard({
                     taskId={task.id}
                     task={task}
                     sessionContext={sessions}
+                    onViewResults={() => changeSubview("results")}
+                    onTransfer={
+                      taskActions.includes("transfer")
+                        ? () => onAction("transfer")
+                        : undefined
+                    }
                   />
                   <TaskBridgePanel
                     investigationId={investigationId}

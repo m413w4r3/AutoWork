@@ -571,6 +571,9 @@ export function useEnqueueAgentInstruction(
         queryKey: agentSessionsKeys.detail(investigationId, sessionId),
       });
       void queryClient.invalidateQueries({
+        queryKey: agentSessionsKeys.summary(investigationId, sessionId),
+      });
+      void queryClient.invalidateQueries({
         queryKey: agentSessionsKeys.list(investigationId),
       });
     },
