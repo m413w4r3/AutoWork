@@ -343,8 +343,9 @@ SCENARIOS: Final[tuple[Scenario, ...]] = (
         "05B1",
         "unit",
         (
-            "tests/test_agent_sessions.py::"
-            "test_instruction_is_queued_while_agent_busy_and_acked_signed",
+            "tests/test_instruction_delivery.py::"
+            "test_running_session_defers_then_delivers_once_at_receive_point",
+            "tests/test_agent_sessions.py::test_ack_of_queued_instruction_is_refused",
         ),
     ),
     Scenario(

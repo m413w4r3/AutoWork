@@ -1803,15 +1803,18 @@ async def test_b12_download_provider_404_stays_not_found_and_is_distinguished() 
 
 
 @pytest.mark.asyncio
-async def test_b13_local_route_failure_on_a_read_is_needs_review_never_success() -> None:
+async def test_b13_local_route_failure_on_a_read_is_unavailable_never_success() -> None:
+    # The route is refused before any provider request (the dispatcher effect
+    # counter is zero), so the invocation records an exact pre-send refusal:
+    # unavailable, never a success and never an ambiguous ``needs_review``.
     harness = _harness()
     harness.vt.errors["file_report"] = VirusTotalRouteUnavailableError("no route configured")
 
     snapshot = await harness.run(idempotency_key="read-route-unavailable")
 
     report = _snapshot_operations(snapshot)["vt.file_report"]
-    assert report.status is ToolInvocationStatus.NEEDS_REVIEW
-    assert report.reason is BootstrapReason.NEEDS_REVIEW
+    assert report.status is ToolInvocationStatus.UNAVAILABLE
+    assert report.reason is BootstrapReason.CAPABILITY_ABSENT
     # A failed read never becomes evidence: the download stays pending.
     download = _snapshot_operations(snapshot)["vt.download_sample"]
     assert download.status is ToolInvocationStatus.PENDING

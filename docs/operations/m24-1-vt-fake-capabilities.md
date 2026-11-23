@@ -61,7 +61,7 @@ manquants. Un défaut réel de vocabulaire a été démontré et corrigé
 | `test_investigation_bootstrap.py::test_b11_five_hashes_three_available_two_unavailable_with_domains_and_ips` | scénario 5/3/2 + IP/domaines + partiel | 9 seeds ; 5 `vt.file_report` ; 4 `vt.object_report` ; 3 downloads quarantaine vérifiés ; 2 downloads route 404 `route_unavailable`, sans échantillon ni association liée ; 38 relations `PARTIAL` avec curseur ; export complet 5 fichiers + manifeste |
 | `…::test_b12_download_route_404_is_route_unavailable_not_a_missing_file` | refus de téléchargement | 404 de route proxy ⇒ op FAILED, code `virustotal_download_route_not_found`, raison `route_unavailable` (jamais « fichier absent »), lot continue |
 | `…::test_b12_download_provider_404_stays_not_found_and_is_distinguished` | refus de téléchargement | 404 d'origine fournisseur ⇒ `not_found`, code `virustotal_download_file_not_found` : la distinction route/fichier est conservée |
-| `…::test_b13_local_route_failure_on_a_read_is_needs_review_never_success` | route indisponible sur lecture | `VirusTotalRouteUnavailableError` ⇒ invocation `NEEDS_REVIEW`, aucun succès inventé, download laissé en attente |
+| `…::test_b13_local_route_failure_on_a_read_is_unavailable_never_success` | route indisponible sur lecture | `VirusTotalRouteUnavailableError` avant tout envoi ⇒ refus exact `UNAVAILABLE`/`capability_absent` (preuve pré-envoi E2E-ABC), aucun succès inventé, download laissé en attente |
 | `…::test_b14_bootstrap_capabilities_from_settings_are_route_scoped` | plafonds configurables | parité avec `virustotal_capabilities_from_settings` ; flags sans route proxy, ou download sans hôte CDN, ne deviennent jamais des capabilities |
 | `…::test_b14_planned_coverage_exposes_capability_and_route_limits` | visibilité | plan : download `route_status=UNVERIFIED` ; coverage `route_unverified`/`route_unavailable`/`capability_absent`/`deferred` selon l'état PCAP |
 | `test_bootstrap_envelope.py::test_settings_caps_and_download_route_are_visible_in_the_proposal` | visibilité | `costs.caps` = plafonds settings ; limite effective plafonnée par l'inventaire avec sa source ; `route_status` + limitation `route_unavailable` visibles |
@@ -97,10 +97,11 @@ Trois notions distinctes, volontairement non fusionnées :
 2. **Capability/route locales indisponibles** — `VirusTotalRouteUnavailableError`
    ou capability désactivée sont rendues par l'adaptateur en
    `UNAVAILABLE`/`capability_unavailable`, sans aucune requête
-   (`investigation_vt_tools.py:656-669`). Pour une lecture passive rattachée à
-   un effet externe, `InvestigationService` requalifie l'échec non prouvé en
-   `NEEDS_REVIEW` (`investigation_service.py:2347-2389`) : c'est ce que pin
-   B13. Le lot ne prétend donc jamais une lecture réussie.
+   (`investigation_vt_tools.py:656-669`). Depuis E2E-ABC, un refus prouvé
+   AVANT tout envoi (compteur d'effets du dispatcher à zéro) est enregistré
+   comme refus exact `UNAVAILABLE` ; seul un échec non prouvé pré-envoi reste
+   `NEEDS_REVIEW` (`investigation_service.py:2347-2389`). B13 pin le refus
+   exact. Le lot ne prétend donc jamais une lecture réussie.
 3. **Échec de la route de téléchargement** — l'acquisition distingue
    l'origine 404 : proxy (`virustotal_download_route_not_found`), fournisseur
    (`virustotal_download_file_not_found`), CDN signé
