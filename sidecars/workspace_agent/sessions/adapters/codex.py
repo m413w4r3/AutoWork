@@ -189,6 +189,9 @@ class CodexProfile:
     adapter_kind = ADAPTER_KIND
     requires_sandbox = True
     requires_manifest = True
+    # D4/ID-5: ``_compose_prompt`` appends the bounded instruction block, so a
+    # fresh ``--ephemeral`` run can carry a delivered instruction.
+    supports_instruction_block = True
 
     def __init__(
         self,
@@ -253,6 +256,9 @@ class CodexProfile:
             streaming_stdin=False,
             mcp_per_invocation=False,
             os_sandbox=True,
+            # A fresh (non-resumed) non-interactive run is the proven Codex
+            # mode; the instruction block rides its prompt.
+            next_run_instruction=self.supports_instruction_block,
         )
         capabilities = self._capability_table(facts)
         network = self._network_attestation()

@@ -11,39 +11,61 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import shutil
+import sys
+import tempfile
+import time
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
 
+import httpx
 import pytest
 import sqlalchemy as sa
+from fastapi import FastAPI
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cti_app.api.agent_sessions import router as agent_sessions_router
 from cti_app.application.agent_session_disclosure import SessionDisclosurePreRead
+from cti_app.application.agent_session_verifier import (
+    HmacSessionSecretDeriver,
+    session_secret_hash,
+)
 from cti_app.application.agentic_host_sessions import (
     HostBudgetUsageV1,
     HostInstructionResultV1,
+    HostReasonRequestV1,
     HostSessionEventsPageV1,
     HostSessionStatusV1,
 )
-from cti_app.application.agentic_sessions import NoteInstructionResolution
+from cti_app.application.agentic_sessions import (
+    NoteInstructionResolution,
+    SessionSecret,
+    SessionService,
+)
 from cti_app.application.instruction_delivery import (
     INSTRUCTION_DRAIN_LOCK_KEY,
     InstructionDeliveryService,
 )
 from cti_app.application.investigation_persistence import VersionConflictError
+from cti_app.config import Settings
 from cti_app.domain.agentic_operator import (
     AgentSessionInstructionV1,
     AgentSessionState,
     AgentSessionV1,
     InstructionDeliveryMode,
     InstructionState,
+    InterruptSessionRequest,
     OperatorAdapterKind,
     OperatorCapabilitiesV1,
     OperatorConfinementV1,
     OperatorProbeCommand,
+    PrepareSessionRequest,
+    ProbeCapabilitiesRequest,
+    StartSessionRequest,
     instruction_text_sha256,
 )
 from cti_app.domain.classification import TLP
@@ -64,12 +86,38 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionRun,
 )
+from cti_app.infrastructure.agentic.host_operator import host_idempotency_key
+from cti_app.infrastructure.agentic.wiring import build_agentic_operator_ports
 from cti_app.infrastructure.database.session import (
     create_postgres_engine,
     create_session_factory,
 )
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 from tests.integration.edition_codes import reserve_edition_code
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from sidecars.workspace_agent.auth import TOKEN_FILE_NAME  # noqa: E402
+from sidecars.workspace_agent.sessions import supervisor as sessions_supervisor  # noqa: E402
+from sidecars.workspace_agent.sessions.supervisor import (  # noqa: E402
+    FakeProfile,
+    ProfileRegistry,
+)
+
+from tests.agentic_support import FixedContextProvider, context  # noqa: E402
+from tests.workspace_agent.session_shim_support import (  # noqa: E402
+    FakeBackend,
+    ShimHarness,
+    shim_environment,
+)
+from tests.workspace_agent.sessions_support import (  # noqa: E402
+    fake_script,
+    read_observations,
+    running_session_agent,
+    write_fake_script,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -579,3 +627,429 @@ def test_0027_accepts_delivery_transitions_and_rejects_invalid_combos(
             await engine.dispose()
 
     asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# WIRE-1 end-to-end: real sidecar receive point -> real drain -> real shim ack
+# ---------------------------------------------------------------------------
+
+RECEIVE_POINT_TEXT = "Reprends la verification du chargeur synthetique."
+RECEIVE_POINT_KEY = "pg-wire1-receive-point"
+SESSION_KEY = "k" * 32
+SESSION_NONCE = b"r" * 32
+
+
+class _CachedFakeCodexProfile(FakeProfile):  # type: ignore[misc]
+    """A real adapter kind backed by the deterministic fake CLI.
+
+    Probe facts are cached like the production profiles cache theirs: the
+    probe recorded before prepare and the one the secret hand-off re-reads
+    must carry the same ``probe_sha256``.
+    """
+
+    adapter_kind = "codex_cli"
+    requires_manifest = True
+
+    def __init__(self) -> None:
+        super().__init__(supports_resume=True, simulate_network_attestation=True)
+        self._cached_probe: Any = None
+
+    def probe(self, *, now: str) -> Any:
+        if self._cached_probe is None:
+            self._cached_probe = super().probe(now=now)
+        return self._cached_probe
+
+
+def _instruction_script(*, long_running: bool) -> dict[str, object]:
+    steps: list[dict[str, object]] = [
+        {"op": "emit", "event": {"type": "started"}},
+        {"op": "write", "path": "notes/finding.md", "text": "# synthetic finding\n"},
+        {"op": "write", "path": "result.md", "text": "synthetic result\n"},
+    ]
+    if long_running:
+        # Keep the next run (and its relay) alive while the real shim pulls and
+        # acknowledges; the test interrupts it explicitly.
+        steps.append({"op": "sleep", "seconds": 10.0})
+    steps.append({"op": "exit", "code": 0})
+    return fake_script(steps)
+
+
+async def _wait_host_state(
+    host: Any, session_id: UUID, state: str, *, timeout_seconds: float = 20.0
+) -> Any:
+    deadline = time.monotonic() + timeout_seconds
+    last: Any = None
+    while time.monotonic() < deadline:
+        last = await host.get_session_status(session_id)
+        if last.state == state:
+            return last
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"host session did not reach {state}: {last!r}")
+
+
+async def _wait_until_async(predicate: Any, *, timeout_seconds: float = 15.0) -> Any:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        value = predicate()
+        if value:
+            return value
+        await asyncio.sleep(0.02)
+    raise AssertionError("condition not met before the deadline")
+
+
+async def _seed_receive_point_session(
+    session_factory: async_sessionmaker[AsyncSession],
+    investigation_id: UUID,
+    *,
+    session_id: UUID,
+    capabilities: OperatorCapabilitiesV1,
+    auth_nonce: bytes,
+    auth_secret_hash: str,
+) -> UUID:
+    """One running task, one imported lease and the awaiting session row."""
+
+    task_id = uuid4()
+    lease_id = uuid4()
+    task = InvestigationTaskV1(
+        id=task_id,
+        investigation_id=investigation_id,
+        task_key=f"lead-{uuid4().hex[:10]}",
+        title="Inspect the loader",
+        question="Which network gate does the loader use?",
+        objective="Identify the first-stage C2 gate.",
+        priority=TaskPriority.HIGH,
+        status=TaskStatus.RUNNING,
+        status_version=2,
+        result_verification_status=ResultVerificationStatus.UNVERIFIED,
+        created_by=HUMAN_ACTOR,
+        created_at=NOW,
+        updated_at=NOW,
+        assigned_actor_kind=TaskActorKind.OPERATOR,
+        assigned_actor_id="codex:operator-1",
+    )
+    async with SqlAlchemyUnitOfWork(session_factory) as uow:
+        await uow.investigation_tasks.add(task)
+        await uow.commit()
+    session = AgentSessionV1(
+        id=session_id,
+        investigation_id=investigation_id,
+        task_id=task_id,
+        adapter_kind=OperatorAdapterKind.CODEX_CLI,
+        state=AgentSessionState.AWAITING_INSTRUCTION,
+        state_version=2,
+        capability_probe=capabilities.to_payload(),
+        capability_sha256=capabilities.capability_sha256,
+        probed_at=capabilities.probed_at,
+        auth_secret_nonce=auth_nonce,
+        auth_secret_hash=auth_secret_hash,
+        auth_secret_issued_at=NOW,
+        opened_at=NOW,
+        idempotency_key=f"session-{session_id}",
+        created_at=NOW,
+        updated_at=NOW,
+        host_session_ref=str(session_id),
+        handoff_id=None,
+        task_lease_id=lease_id,
+        task_lease_fence=1,
+    )
+    async with SqlAlchemyUnitOfWork(session_factory) as uow:
+        await uow.agent_sessions.add(session)
+        await uow.commit()
+    # The signed ack route validates the lease against the real clock, while
+    # the drain uses the fixed test clock: one expiry must satisfy both.
+    lease_expires_at = max(datetime.now(UTC), NOW) + timedelta(minutes=30)
+    async with session_factory() as db:
+        await db.execute(
+            sa.text(
+                "UPDATE investigation_tasks SET lease_id = :lease_id, "
+                "lease_session_id = :session_id, lease_fence = 1, heartbeat_at = :heartbeat, "
+                "lease_expires_at = :expires WHERE id = :task_id"
+            ),
+            {
+                "lease_id": lease_id,
+                "session_id": session_id,
+                "heartbeat": NOW,
+                "expires": lease_expires_at,
+                "task_id": task_id,
+            },
+        )
+        await db.commit()
+    return task_id
+
+
+def test_receive_point_drains_the_next_run_and_acknowledges_via_the_real_shim(
+    migrated_postgres_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WIRE-1: real sidecar + real drain + real shim, one continuous chain.
+
+    A real workspace agent runs the fake CLI profile.  A clean run end is the
+    host receive point; the backend enqueues through ``SessionService`` and the
+    real ``InstructionDeliveryService`` drains it against the real host client.
+    The host then proves ``instruction_delivered`` (id + SHA) and the fake CLI
+    records the exact block (id + SHA).  The real shim pulls and acknowledges
+    through the real relay to a loopback recorder; the recorder's exact signed
+    request is replayed into the real FastAPI route, which marks the row
+    ``acknowledged`` in PostgreSQL.  Only the HTTP hop between the relay and
+    the in-process app is replayed, because the app is not served on a socket.
+    """
+
+    base = Path(tempfile.mkdtemp(prefix="m24recv-", dir="/tmp"))
+    try:
+        monkeypatch.setattr(
+            sessions_supervisor,
+            "default_profiles",
+            lambda: ProfileRegistry((_CachedFakeCodexProfile(),)),
+        )
+        with FakeBackend() as backend:
+            monkeypatch.setenv("AGENT_SESSIONS_BROKER_BACKEND_URL", backend.url)
+            with running_session_agent(base) as running, running.client() as client:
+                workspace_id = running.ensure_workspace(client)
+                asyncio.run(
+                    _receive_point_flow(migrated_postgres_url, running, backend, workspace_id)
+                )
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+async def _receive_point_flow(
+    migrated_postgres_url: str,
+    running: Any,
+    backend: FakeBackend,
+    workspace_id: str,
+) -> None:
+    engine = create_postgres_engine(migrated_postgres_url)
+    try:
+        factory = create_session_factory(engine)
+        settings = Settings(
+            _env_file=None,
+            m24_agent_session_key=SESSION_KEY,
+            workspace_agent_socket=str(running.socket_path),
+            workspace_agent_token_file=str(running.runtime_dir / TOKEN_FILE_NAME),
+        )
+        ports = build_agentic_operator_ports(
+            settings,
+            context_provider=FixedContextProvider(context(workspace_id=workspace_id)),
+            clock=lambda: NOW,
+        )
+        operator = ports.operator
+        delivery = ports.secret_delivery
+        host = ports.host_sessions
+        assert operator is not None and delivery is not None and host is not None
+        try:
+            capabilities = await operator.probe_capabilities(
+                ProbeCapabilitiesRequest(
+                    adapter_kind=OperatorAdapterKind.CODEX_CLI, executable=EXECUTABLE
+                )
+            )
+            # WIRE-1: the real host advertises the next-run capability.
+            assert capabilities.supports_next_run_instruction is True
+            investigation = await _seed_investigation(factory)
+            session_id = uuid4()
+            task_id = uuid4()
+            prepared = await operator.prepare_session(
+                PrepareSessionRequest(
+                    session_id=session_id,
+                    investigation_id=investigation.id,
+                    task_id=task_id,
+                    adapter_kind=OperatorAdapterKind.CODEX_CLI,
+                    handoff_id=uuid4(),
+                    capability_sha256=capabilities.capability_sha256,
+                )
+            )
+            secret = HmacSessionSecretDeriver(SESSION_KEY).derive(
+                session_id=session_id, nonce=SESSION_NONCE
+            )
+            await delivery.deliver_session_secret(
+                session_id=session_id,
+                investigation_id=investigation.id,
+                task_id=task_id,
+                adapter_kind=OperatorAdapterKind.CODEX_CLI,
+                host_session_ref=prepared.host_session_ref,
+                secret=SessionSecret.from_bytes(secret),
+                idempotency_key="pg-wire1-secret",
+            )
+            # Production order: the closed manifest follows the secret hand-off
+            # and precedes any run (the profile requires one).
+            await operator.set_tool_manifest(
+                session_id,
+                host_session_ref=prepared.host_session_ref,
+                capability_sha256=capabilities.capability_sha256,
+            )
+            write_fake_script(
+                running, _instruction_script(long_running=False), session_id=str(session_id)
+            )
+            started = await operator.start_session(
+                StartSessionRequest(
+                    session_id=session_id,
+                    adapter_kind=OperatorAdapterKind.CODEX_CLI,
+                    host_session_ref=prepared.host_session_ref,
+                    capability_sha256=capabilities.capability_sha256,
+                )
+            )
+            assert started.alive is True
+            await _wait_host_state(host, session_id, "awaiting_instruction")
+
+            await _seed_receive_point_session(
+                factory,
+                investigation.id,
+                session_id=session_id,
+                capabilities=capabilities,
+                auth_nonce=SESSION_NONCE,
+                auth_secret_hash=session_secret_hash(secret),
+            )
+
+            async def _allow_disclosure(_investigation_id: UUID) -> None:
+                return None
+
+            service = SessionService(
+                uow_factory=lambda: SqlAlchemyUnitOfWork(factory),
+                deriver=None,
+                operator=None,
+                disclosure=_allow_disclosure,
+                clock=lambda: NOW,
+            )
+            enqueued = await service.enqueue_instruction(
+                investigation.id,
+                session_id,
+                text=RECEIVE_POINT_TEXT,
+                actor=HUMAN_ACTOR,
+                idempotency_key=RECEIVE_POINT_KEY,
+            )
+            assert enqueued.state is InstructionState.QUEUED
+
+            # The next run lingers so the real shim can reach the relay.
+            write_fake_script(
+                running, _instruction_script(long_running=True), session_id=str(session_id)
+            )
+            drainer = InstructionDeliveryService(
+                uow_factory=lambda: SqlAlchemyUnitOfWork(factory),
+                host=host,
+                notes=None,
+                disclosure=_AllowDisclosure(),
+                clock=lambda: NOW,
+                grace_seconds=GRACE_SECONDS,
+            )
+            report = await drainer.drain_once()
+            assert report.delivered == 1, report
+
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                stored = await uow.agent_sessions.get_instruction(enqueued.id)
+                session_row = await uow.agent_sessions.get(session_id)
+            assert stored is not None and session_row is not None
+            assert stored.state is InstructionState.DELIVERED
+            assert stored.delivery_mode is InstructionDeliveryMode.NEXT_RUN
+            assert stored.delivery_sha256 == instruction_text_sha256(RECEIVE_POINT_TEXT)
+            assert session_row.state is AgentSessionState.RUNNING
+            await _wait_host_state(host, session_id, "running")
+
+            events = await host.get_events(session_id, after=0, limit=200)
+            delivered_events = [
+                event for event in events.events if event.kind == "instruction_delivered"
+            ]
+            assert len(delivered_events) == 1, delivered_events
+            assert delivered_events[0].payload == {
+                "instruction_id": str(stored.id),
+                "sha256": stored.delivery_sha256,
+                "mode": "next_run",
+                "run": 2,
+            }
+
+            seen = await _wait_until_async(
+                lambda: read_observations(running, str(session_id)).get("instruction")
+            )
+            assert isinstance(seen, dict)
+            assert seen["instruction_id"] == str(stored.id)
+            assert seen["sha256"] == stored.delivery_sha256
+            assert seen["text_sha256"] == stored.delivery_sha256
+
+            # The real shim signs the two fixed operator actions and sends them
+            # through the real relay; the recorder keeps the exact wire bytes.
+            broker_socket = running.session_dir(str(session_id)) / "ipc" / "broker.sock"
+            await _wait_until_async(lambda: broker_socket.is_socket())
+            harness = ShimHarness(secret=secret, session_id=str(session_id))
+            environment = shim_environment(
+                base=harness.base,
+                socket_path=harness.socket_path,
+                backend_url="http://127.0.0.1:1",
+                session_id=str(session_id),
+            )
+            del environment["AUTOWORK_BACKEND_URL"]
+            environment["AUTOWORK_BROKER_SOCKET"] = str(broker_socket)
+            harness.environment = environment
+            with harness as shim:
+                shim.initialize()
+                shim.call_tool(
+                    "autowork_instruction_pending",
+                    {"investigation_id": str(investigation.id)},
+                )
+                shim.call_tool(
+                    "autowork_instruction_ack",
+                    {
+                        "investigation_id": str(investigation.id),
+                        "instruction_ids": [str(stored.id)],
+                    },
+                )
+            recorded = backend.requests
+            assert len(recorded) == 2, recorded
+            assert recorded[0].json_body() == {"action": "pull"}
+            assert recorded[1].json_body() == {
+                "action": "ack",
+                "instruction_ids": [str(stored.id)],
+            }
+
+            # Replay the shim's exact signed requests into the real route.  The
+            # app is bound to the same PostgreSQL unit of work and the same
+            # session key the shim signed with.
+            app = FastAPI()
+            app.include_router(agent_sessions_router)
+            app.state.uow_factory = lambda: SqlAlchemyUnitOfWork(factory)
+            app.state.settings = settings
+
+            async def replay(record: Any) -> httpx.Response:
+                headers = {
+                    name: value
+                    for name, value in record.headers.items()
+                    if name.lower() != "content-length"
+                }
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://test"
+                ) as api:
+                    return await api.request(
+                        record.method, record.path, content=record.body, headers=headers
+                    )
+
+            pulled = await replay(recorded[0])
+            assert pulled.status_code == 200, pulled.text
+            pulled_rows = pulled.json()
+            assert [row["id"] for row in pulled_rows] == [str(stored.id)]
+            assert pulled_rows[0]["delivery_text"] == RECEIVE_POINT_TEXT
+            assert pulled_rows[0]["state"] == "delivered"
+
+            acknowledged = await replay(recorded[1])
+            assert acknowledged.status_code == 200, acknowledged.text
+            assert acknowledged.json()[0]["state"] == "acknowledged"
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                final = await uow.agent_sessions.get_instruction(stored.id)
+            assert final is not None and final.state is InstructionState.ACKNOWLEDGED
+
+            interrupted = await operator.interrupt_session(
+                InterruptSessionRequest(
+                    session_id=session_id,
+                    host_session_ref=prepared.host_session_ref,
+                    reason="wire-1 receive point complete",
+                )
+            )
+            assert interrupted.stopped is True
+            await _wait_host_state(host, session_id, "stopped")
+            closed = await host.close_session(
+                session_id,
+                HostReasonRequestV1(reason="wire-1 receive point complete"),
+                idempotency_key=host_idempotency_key(
+                    "close", session_id, "wire-1 receive point complete"
+                ),
+            )
+            assert closed.state == "closed"
+        finally:
+            await ports.aclose()
+    finally:
+        await engine.dispose()

@@ -359,6 +359,7 @@ class _FakeOperator:
         self.reconciled: list[ReconcileSessionRequest] = []
         self.resumed: list[ResumeSessionRequest] = []
         self.instructions: list[SendInstructionRequest] = []
+        self.manifests: list[tuple[UUID, str, str]] = []
         self.reconcile_outcome = SessionReconcileOutcome.SESSION_ALIVE
         self.interrupt_stopped = True
         self.started_refs: dict[UUID, str] = {}
@@ -393,6 +394,11 @@ class _FakeOperator:
             last_activity_at=NOW,
             observed_at=NOW,
         )
+
+    async def set_tool_manifest(
+        self, session_id: UUID, *, host_session_ref: str, capability_sha256: str
+    ) -> None:
+        self.manifests.append((session_id, host_session_ref, capability_sha256))
 
     async def get_session_status(self, request: SessionStatusRequest) -> SessionProcessStatusV1:
         return SessionProcessStatusV1(

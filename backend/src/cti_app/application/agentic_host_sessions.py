@@ -228,6 +228,11 @@ class HostCapabilityFlagsV1(_HostResponseModel):
     streaming_stdin: bool
     mcp_per_invocation: bool
     os_sandbox: bool
+    # F3-D §3.4: the host can start a fresh next run carrying a delivered
+    # instruction's text.  The field is additive (backend first): an older
+    # host that never announces it keeps validating, and the flag stays false
+    # so no instruction is ever delivered on an unproven capability.
+    next_run_instruction: bool = False
 
     def proven_modes(self) -> tuple[str, ...]:
         """The probed flag names that are true, in contract order."""

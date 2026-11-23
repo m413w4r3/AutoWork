@@ -16,6 +16,7 @@ the single ``POST /v1/sessions`` that carries the secret.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -45,7 +46,10 @@ from cti_app.application.agentic_host_sessions import (
     HostSessionStateConflictError,
     HostStartedSessionV1,
     HostStartSessionRequestV1,
+    HostToolManifestEntryV1,
+    HostToolManifestRequestV1,
 )
+from cti_app.application.agentic_tool_broker import AGENTIC_TOOL_NAMES
 from cti_app.domain.agentic_operator import (
     CollectResultsRequest,
     HandoffRequestReceiptV1,
@@ -164,6 +168,79 @@ class HostSessionPreparationRegistry:
         )
 
 
+#: The closed tool manifest the backend posts to a session's supervisor.
+#: ``(mcp_name, broker_name, schema_version, effect, cost)`` rows mirror the
+#: shim catalogue (``sidecars/workspace_agent/sessions/catalog.py``) and the
+#: broker's accepted names (``agentic_tool_broker.AGENTIC_TOOL_NAMES``); a
+#: backend test asserts both equalities, so this table can never silently
+#: widen the operator surface.  ``effect``/``cost`` are descriptive bounds of
+#: the wire contract today: the relay authorizes on ``broker_name`` only and
+#: the broker revalidates every argument.  No row claims a capability, so a G2
+#: grant cannot be inferred from its mere presence here.
+_AGENT_SESSION_TOOL_ROWS: tuple[tuple[str, str, str, str, str], ...] = (
+    (
+        "autowork_bridge_consult",
+        "advisor.consult",
+        "advisor-consult.v1",
+        "external_read",
+        "provider",
+    ),
+    ("autowork_task_heartbeat", "task.heartbeat", "1", "write", "none"),
+    ("autowork_task_submit_result", "task.submit_result", "1", "write", "none"),
+    ("autowork_handoff_submit", "handoff.submit", "investigation-handoff.v1", "write", "none"),
+    ("autowork_vt_file_report", "vt.file_report", "1", "external_read", "provider"),
+    ("autowork_vt_object_report", "vt.object_report", "1", "external_read", "provider"),
+    ("autowork_vt_relationships", "vt.relationships", "1", "external_read", "provider"),
+    ("autowork_vt_intelligence_search", "vt.intelligence_search", "1", "external_read", "provider"),
+    ("autowork_vt_behaviour", "vt.behaviour", "1", "external_read", "provider"),
+    ("autowork_vt_behaviour_pcap", "vt.behaviour_pcap", "1", "external_read", "provider"),
+    ("autowork_vt_download_sample", "vt.download_sample", "1", "acquire", "provider"),
+    ("autowork_sample_analyze", "sample.analyze", "1", "local_compute", "worker"),
+    ("autowork_archive_extract_member", "archive.extract_member", "1", "local_compute", "worker"),
+    ("autowork_shodan_host", "shodan.host", "1", "external_read", "provider"),
+    ("autowork_shodan_domain", "shodan.domain", "1", "external_read", "provider"),
+    ("autowork_shodan_count", "shodan.count", "1", "external_read", "provider"),
+    ("autowork_shodan_search", "shodan.search", "1", "external_read", "provider"),
+    ("autowork_analysis_run_script", "analysis.run_script", "1", "local_compute", "worker"),
+    ("autowork_note_capture", "note.capture", "1", "write", "none"),
+    ("autowork_contribution_import", "contribution.import", "1", "write", "none"),
+)
+
+
+def agent_session_tool_manifest() -> HostToolManifestRequestV1:
+    """The exact manifest, digest included, a supervisor must accept before start.
+
+    The digest is the supervisor's canonical form (``json.dumps`` sorted keys,
+    compact separators) over ``{"tools": [...]}``; a different digest is a
+    contract error, never silently stored.
+    """
+    declared = {row[1] for row in _AGENT_SESSION_TOOL_ROWS}
+    if declared != set(AGENTIC_TOOL_NAMES):
+        # Fail closed: a manifest that does not cover the broker's accepted
+        # names would refuse legitimate tools, and one that names others would
+        # drift beyond the broker's authority.
+        raise HostSessionContractError(
+            "the session tool manifest does not match the agentic broker catalogue"
+        )
+    tools = tuple(
+        HostToolManifestEntryV1(
+            mcp_name=mcp_name,
+            broker_name=broker_name,
+            schema_version=schema_version,
+            input_schema={"type": "object"},
+            effect=effect,
+            cost=cost,
+            capability=None,
+        )
+        for mcp_name, broker_name, schema_version, effect, cost in _AGENT_SESSION_TOOL_ROWS
+    )
+    payload = {"tools": [tool.model_dump(mode="json") for tool in tools]}
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return HostToolManifestRequestV1(manifest_sha256=digest, tools=tools)
+
+
 class HostOperatorAdapter:
     """Base for the two provider adapters; subclasses set only their kind."""
 
@@ -272,6 +349,29 @@ class HostOperatorAdapter:
         )
 
     # -- lifecycle ---------------------------------------------------------
+
+    async def set_tool_manifest(
+        self, session_id: UUID, *, host_session_ref: str, capability_sha256: str
+    ) -> None:
+        """Post the session's closed tool manifest; start stays refuse-without-it.
+
+        Idempotent by derivation: the same session always sends the same
+        manifest and key, so a resume replays the accepted response instead of
+        storing a second one.  A refusal or a digest mismatch is a contract
+        error, so an activation can never proceed to ``start`` without it.
+        """
+        self._require_ref(session_id, host_session_ref)
+        self._require_facts(capability_sha256)
+        request = agent_session_tool_manifest()
+        accepted = await self._host.set_tool_manifest(
+            session_id,
+            request,
+            idempotency_key=host_idempotency_key("manifest", session_id),
+        )
+        if not accepted.accepted or accepted.manifest_sha256 != request.manifest_sha256:
+            raise HostSessionContractError(
+                "the supervisor did not accept the session tool manifest"
+            )
 
     async def start_session(self, request: StartSessionRequest) -> SessionProcessStatusV1:
         self._require_ref(request.session_id, request.host_session_ref)
@@ -507,6 +607,9 @@ def capabilities_from_probe(
         supports_resume=wire.flags.resume,
         supports_structured_output=wire.flags.structured_output,
         supports_non_interactive=wire.flags.non_interactive,
+        # F3-D §3.4: the flag the instruction drain requires before any host
+        # effect; an older host that does not send it keeps the queue intact.
+        supports_next_run_instruction=wire.flags.next_run_instruction,
         # The host wire has no CLI stop flag; interrupt is a supervisor signal.
         supports_stop=False,
         permission_modes=(),

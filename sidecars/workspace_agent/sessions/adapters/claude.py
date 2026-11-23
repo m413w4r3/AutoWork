@@ -558,6 +558,9 @@ class ClaudeProfile:
     adapter_kind = ADAPTER_KIND
     requires_sandbox = True
     requires_manifest = True
+    # D4/ID-5: the positional prompt carries the bounded instruction block, so
+    # a fresh print-mode run can carry a delivered instruction.
+    supports_instruction_block = True
 
     def __init__(
         self,
@@ -634,6 +637,9 @@ class ClaudeProfile:
             streaming_stdin=False,
             mcp_per_invocation={"--mcp-config", "--strict-mcp-config"} <= flags,
             os_sandbox=False,
+            # A fresh print-mode run is the proven Claude mode; the instruction
+            # block rides the positional prompt.
+            next_run_instruction=self.supports_instruction_block,
         )
         capabilities = _capabilities(resume_proven=self._resume_proven)
         binary_sha256 = self._binary_digest(binary)

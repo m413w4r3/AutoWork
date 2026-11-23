@@ -15,11 +15,13 @@ import json
 import logging
 import re
 import shutil
+import socket
 import sys
 import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import cast
 from uuid import UUID
 
 import httpx
@@ -28,6 +30,7 @@ from pydantic import ValidationError
 
 from cti_app.application.agentic_host_sessions import (
     HOST_RESPONSE_LIMIT,
+    HostCapabilityProbeV1,
     HostCapabilityUnavailableError,
     HostCapturedFileV1,
     HostCollectRequestV1,
@@ -73,6 +76,8 @@ from cti_app.domain.agentic_operator import (
 from cti_app.infrastructure.agentic.host_operator import (
     HostOperatorAdapter,
     HostSessionPreparationRegistry,
+    agent_session_tool_manifest,
+    capabilities_from_probe,
     host_idempotency_key,
 )
 from cti_app.infrastructure.agentic.host_sessions import HttpHostSessionsClient
@@ -108,6 +113,9 @@ from sidecars.workspace_agent.sessions.supervisor import (  # noqa: E402
     ProfileRegistry,
 )
 
+from tests.workspace_agent.session_shim_support import (  # noqa: E402
+    FakeBackend,
+)
 from tests.workspace_agent.sessions_support import (  # noqa: E402
     RunningSessionAgent,
     fake_script,
@@ -726,12 +734,115 @@ def test_infrastructure_agentic_contains_no_argv_flag_or_home_path_literals() ->
             assert match is None, f"{path.name} contains a {label}: {match.group(0)!r}"
 
 
+def test_next_run_instruction_flag_is_additive_and_mapped() -> None:
+    # An older host that never sends the flag still validates (backend first)
+    # and the capability payload keeps its stored SHA (ID-1 omitted the false
+    # flag from the canonical payload).
+    legacy_payload = probe_wire().model_dump(mode="json")
+    del legacy_payload["flags"]["next_run_instruction"]
+    # The real client validates the host's JSON bytes (strict models parse the
+    # ISO timestamp in JSON mode only), so replay an actual older host body.
+    legacy = HostCapabilityProbeV1.model_validate_json(json.dumps(legacy_payload))
+    assert legacy.flags.next_run_instruction is False
+    legacy_capabilities = capabilities_from_probe(
+        legacy, adapter_kind=OperatorAdapterKind.CODEX_CLI, executable="codex-cli"
+    )
+    assert legacy_capabilities.supports_next_run_instruction is False
+    assert "supports_next_run_instruction" not in legacy_capabilities.payload()
+
+    advertised = HostCapabilityProbeV1.model_validate_json(
+        json.dumps(probe_wire(flags={"next_run_instruction": True}).model_dump(mode="json"))
+    )
+    capabilities = capabilities_from_probe(
+        advertised, adapter_kind=OperatorAdapterKind.CODEX_CLI, executable="codex-cli"
+    )
+    assert capabilities.supports_next_run_instruction is True
+    assert capabilities.payload()["supports_next_run_instruction"] is True
+
+
+def _tool_target() -> str:
+    return f"/api/investigations/{INVESTIGATION_ID}/agent-sessions/{SESSION_ID}/tool-calls"
+
+
+def _tool_body(tool_name: str) -> dict[str, object]:
+    return {
+        "tool_name": tool_name,
+        "schema_version": "1",
+        "arguments": {
+            "investigation_id": str(INVESTIGATION_ID),
+            "task_id": str(TASK_ID),
+            "expected_status_version": 2,
+            "lease_fence": 0,
+            "nonce": f"m24h0-{tool_name}-nonce",
+            "hash": "a" * 64,
+        },
+    }
+
+
+def _relay_http_call(
+    socket_path: Path,
+    *,
+    body: dict[str, object],
+    idempotency_key: str,
+    timeout: float = 10.0,
+) -> tuple[int, dict[str, object]]:
+    """One raw broker-relay connection; the relay owns signing in production."""
+
+    payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
+    headers = [
+        ("Content-Type", "application/json"),
+        ("Accept", "application/json"),
+        ("User-Agent", "autowork-relay-contract/1"),
+        ("Content-Length", str(len(payload))),
+        ("Idempotency-Key", idempotency_key),
+        ("X-AutoWork-Agent-Session", str(SESSION_ID)),
+        ("X-AutoWork-Agent-Timestamp", "1763800000"),
+        ("X-AutoWork-Agent-Signature", "v1=" + "ab" * 32),
+    ]
+    request = f"POST {_tool_target()} HTTP/1.1\r\n".encode("ascii")
+    request += b"".join(f"{name}: {value}\r\n".encode("ascii") for name, value in headers)
+    request += b"\r\n" + payload
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(timeout)
+        connection.connect(str(socket_path))
+        connection.sendall(request)
+        chunks: list[bytes] = []
+        while True:
+            chunk = connection.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    raw = b"".join(chunks)
+    head, separator, response_body = raw.partition(b"\r\n\r\n")
+    assert separator, raw[:200]
+    status = int(head.split(b"\r\n")[0].split(b" ")[1])
+    reply = json.loads(response_body)
+    assert isinstance(reply, dict), reply
+    return status, reply
+
+
+def _manifest_with_tools(names: set[str]) -> HostToolManifestRequestV1:
+    production = agent_session_tool_manifest()
+    tools = tuple(tool for tool in production.tools if tool.broker_name in names)
+    assert {tool.broker_name for tool in tools} == names
+    payload = {"tools": [tool.model_dump(mode="json") for tool in tools]}
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return HostToolManifestRequestV1(manifest_sha256=digest, tools=tools)
+
+
 # ``sidecars.*`` is an untyped boundary for mypy (pyproject override), so the
 # FakeProfile base is ``Any``; the subclass only binds the adapter kind.
 class _FakeCodexProfile(FakeProfile):  # type: ignore[misc]
-    """The H1 fake profile registered under the backend's adapter kind."""
+    """The H1 fake profile registered under the backend's adapter kind.
+
+    ``requires_manifest`` is set like a real profile so the real-supervisor
+    tests prove the manifest the backend posts is what lets the run start.
+    """
 
     adapter_kind = "codex_cli"
+    requires_manifest = True
 
 
 def test_real_host_supervisor_contract_flow(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -757,6 +868,176 @@ def test_real_host_supervisor_contract_flow(monkeypatch: pytest.MonkeyPatch) -> 
             asyncio.run(_real_contract_flow(ports, running))
     finally:
         shutil.rmtree(base, ignore_errors=True)
+
+
+def test_real_host_enforces_the_manifest_the_backend_posts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WIRE-1 E2E: the backend-posted manifest is what bounds the relay.
+
+    A real workspace agent owns the supervisor and the broker relay; the real
+    adapter posts the closed manifest over the UDS client.  The relay then
+    forwards a catalogue tool to a loopback fake backend, refuses a catalogue
+    tool the accepted manifest omits, and accepts it again once the production
+    manifest is re-posted.  No CLI provider and no real network are involved.
+    """
+
+    base = Path(tempfile.mkdtemp(prefix="m24lm-"))
+    try:
+        monkeypatch.setattr(
+            supervisor_module,
+            "default_profiles",
+            lambda: ProfileRegistry((_FakeCodexProfile(),)),
+        )
+        with FakeBackend() as backend:
+            # The supervisor forwards relay calls to this loopback fake; the
+            # CLI environment never contains the URL.
+            monkeypatch.setenv("AGENT_SESSIONS_BROKER_BACKEND_URL", backend.url)
+            with running_session_agent(base) as running, running.client() as client:
+                workspace_id = running.ensure_workspace(client)
+                settings = Settings(
+                    _env_file=None,
+                    workspace_agent_socket=str(running.socket_path),
+                    workspace_agent_token_file=str(running.runtime_dir / TOKEN_FILE_NAME),
+                )
+                ports = build_agentic_operator_ports(
+                    settings,
+                    context_provider=FixedContextProvider(context(workspace_id=workspace_id)),
+                    clock=lambda: NOW,
+                )
+                asyncio.run(_manifest_relay_flow(ports, running, backend))
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+async def _manifest_relay_flow(
+    ports: AgenticOperatorPorts, running: RunningSessionAgent, backend: FakeBackend
+) -> None:
+    operator = ports.operator
+    delivery = ports.secret_delivery
+    host = ports.host_sessions
+    assert operator is not None and delivery is not None and host is not None
+    try:
+        capabilities = await operator.probe_capabilities(
+            ProbeCapabilitiesRequest(
+                adapter_kind=OperatorAdapterKind.CODEX_CLI, executable="codex-cli"
+            )
+        )
+        prepared = await operator.prepare_session(_prepare_request(capabilities.capability_sha256))
+        await delivery.deliver_session_secret(
+            session_id=SESSION_ID,
+            investigation_id=INVESTIGATION_ID,
+            task_id=TASK_ID,
+            adapter_kind=OperatorAdapterKind.CODEX_CLI,
+            host_session_ref=prepared.host_session_ref,
+            secret=SessionSecret(SECRET_HEX),
+            idempotency_key=_PREPARE_KEY,
+        )
+        # WIRE-1 production sequence: the closed manifest is posted after the
+        # secret hand-off and before any run; the profile requires it, so this
+        # call is what lets the run start.
+        await operator.set_tool_manifest(
+            SESSION_ID,
+            host_session_ref=prepared.host_session_ref,
+            capability_sha256=capabilities.capability_sha256,
+        )
+        write_fake_script(
+            running,
+            fake_script(
+                [
+                    {"op": "emit", "event": {"type": "started"}},
+                    {"op": "write", "path": "notes/finding.md", "text": "# note\n"},
+                    {"op": "write", "path": "result.md", "text": "result\n"},
+                    # Keep the run (and its relay listener) alive while the raw
+                    # relay calls below are made; it then exits cleanly.
+                    {"op": "sleep", "seconds": 10.0},
+                    {"op": "exit", "code": 0},
+                ],
+                final_message="manifest relay final",
+            ),
+            session_id=str(SESSION_ID),
+        )
+        started = await operator.start_session(
+            StartSessionRequest(
+                session_id=SESSION_ID,
+                adapter_kind=OperatorAdapterKind.CODEX_CLI,
+                host_session_ref=prepared.host_session_ref,
+                capability_sha256=capabilities.capability_sha256,
+            )
+        )
+        assert started.alive is True
+        scratch = running.session_dir() / "scratch"
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if (scratch / "result.md").is_file():
+                break
+            await asyncio.sleep(0.02)
+        else:
+            pytest.fail("the fake profile did not write its scratch files")
+        broker_socket = running.session_dir() / "ipc" / "broker.sock"
+
+        # A catalogue broker tool covered by the accepted manifest passes the
+        # relay and reaches the fixed loopback backend.
+        status, reply = _relay_http_call(
+            broker_socket,
+            body=_tool_body("vt.file_report"),
+            idempotency_key="m24h0-relay-0001",
+        )
+        assert status == 200, reply
+        calls = backend.requests
+        assert len(calls) == 1
+        assert calls[0].method == "POST"
+        assert calls[0].path == _tool_target()
+        assert calls[0].json_body() == _tool_body("vt.file_report")
+
+        # A catalogue tool the accepted manifest omits is refused before any
+        # forward: the relay never widens beyond the closed manifest.
+        await host.set_tool_manifest(
+            SESSION_ID,
+            _manifest_with_tools({"vt.file_report"}),
+            idempotency_key=host_idempotency_key("manifest", SESSION_ID, "reduced"),
+        )
+        status, reply = _relay_http_call(
+            broker_socket,
+            body=_tool_body("shodan.host"),
+            idempotency_key="m24h0-relay-0002",
+        )
+        assert status == 403, reply
+        assert reply["error"] == "relay_operation_not_allowed"
+        assert cast(dict[str, object], reply["details"])["reason"] == "tool_not_in_manifest"
+        assert len(backend.requests) == 1
+
+        # Re-posting the production manifest restores the exact tool surface.
+        await host.set_tool_manifest(
+            SESSION_ID,
+            agent_session_tool_manifest(),
+            idempotency_key=host_idempotency_key("manifest", SESSION_ID, "restore"),
+        )
+        status, reply = _relay_http_call(
+            broker_socket,
+            body=_tool_body("shodan.host"),
+            idempotency_key="m24h0-relay-0003",
+        )
+        assert status == 200, reply
+        assert len(backend.requests) == 2
+
+        interrupted = await operator.interrupt_session(
+            InterruptSessionRequest(
+                session_id=SESSION_ID,
+                host_session_ref=prepared.host_session_ref,
+                reason="manifest relay contract complete",
+            )
+        )
+        assert interrupted.stopped is True
+        await _wait_for_terminal(ports)
+        closed = await host.close_session(
+            SESSION_ID,
+            HostReasonRequestV1(reason="manifest relay complete"),
+            idempotency_key=host_idempotency_key("close", SESSION_ID, "manifest relay complete"),
+        )
+        assert closed.state == "closed"
+    finally:
+        await ports.aclose()
 
 
 async def _wait_for_terminal(ports: AgenticOperatorPorts) -> None:
@@ -806,6 +1087,13 @@ async def _real_contract_flow(ports: AgenticOperatorPorts, running: RunningSessi
             secret=SessionSecret(SECRET_HEX),
             idempotency_key=_PREPARE_KEY,
         )
+        # WIRE-1: the backend posts the closed tool manifest after the secret
+        # hand-off and before any run; the profile requires it, like a real one.
+        await operator.set_tool_manifest(
+            SESSION_ID,
+            host_session_ref=prepared.host_session_ref,
+            capability_sha256=capabilities.capability_sha256,
+        )
         write_fake_script(
             running,
             fake_script(
@@ -814,7 +1102,7 @@ async def _real_contract_flow(ports: AgenticOperatorPorts, running: RunningSessi
                     {"op": "write", "path": "notes/finding.md", "text": "# note\n"},
                     {"op": "write", "path": "result.md", "text": "result\n"},
                     {"op": "write", "path": "final.md", "text": "final\n"},
-                    {"op": "hang"},
+                    {"op": "exit", "code": 0},
                 ],
                 final_message="real contract final",
             ),
@@ -850,6 +1138,20 @@ async def _real_contract_flow(ports: AgenticOperatorPorts, running: RunningSessi
         assert {"process_started", "state_changed"} <= {event.kind for event in events.events}
         logs = await host.get_logs(SESSION_ID, after=0, limit=100)
         assert all(not line.text.startswith("/") for line in logs.lines)
+
+        # ID-4: a clean run end is the technical receive point, so the
+        # instruction is delivered only there (a RUNNING session is refused).
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if (await host.get_session_status(SESSION_ID)).state == "awaiting_instruction":
+                break
+            await asyncio.sleep(0.02)
+        else:
+            pytest.fail("the fake profile did not reach the instruction receive point")
+        idle = await operator.get_session_status(
+            SessionStatusRequest(session_id=SESSION_ID, host_session_ref=prepared.host_session_ref)
+        )
+        assert idle.alive is True
 
         instruction_text = "focus on the loader"
         receipt = await operator.send_instruction(

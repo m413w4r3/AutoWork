@@ -80,6 +80,7 @@ DEFAULT_MODES: dict[str, bool] = {
     "streaming_stdin": False,
     "mcp_per_invocation": False,
     "os_sandbox": False,
+    "next_run_instruction": False,
 }
 
 
@@ -181,6 +182,9 @@ class FakeHostSessionsPort:
         self.resume_error = resume_error
         self.calls: list[tuple[str, dict[str, object]]] = []
         self.prepare_requests: list[HostPrepareSessionRequestV1] = []
+        self.manifest_requests: list[HostToolManifestRequestV1] = []
+        #: Set to answer a manifest digest other than the request's own.
+        self.manifest_sha256_override: str | None = None
 
     def names(self) -> list[str]:
         return [name for name, _ in self.calls]
@@ -318,7 +322,11 @@ class FakeHostSessionsPort:
         idempotency_key: str,
     ) -> HostToolManifestAcceptedV1:
         self.calls.append(("set_tool_manifest", {"session_id": session_id}))
-        return HostToolManifestAcceptedV1(accepted=True, manifest_sha256=request.manifest_sha256)
+        self.manifest_requests.append(request)
+        return HostToolManifestAcceptedV1(
+            accepted=True,
+            manifest_sha256=self.manifest_sha256_override or request.manifest_sha256,
+        )
 
 
 def status_wire(
