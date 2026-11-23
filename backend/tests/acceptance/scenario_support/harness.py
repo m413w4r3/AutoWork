@@ -278,10 +278,16 @@ class _FakeClaudeProfile(_CachedFakeProfile):
     adapter_kind = "claude_code"
 
 
-def install_fake_cli_profiles(monkeypatch: Any) -> None:
-    """Register the H1 fake profile for both backend adapter kinds, hanging."""
+def install_fake_cli_profiles(monkeypatch: Any, *, scenario: str = "hang") -> None:
+    """Register the H1 fake profile for both backend adapter kinds.
 
-    monkeypatch.setenv("AUTOWORK_FAKE_CLI_SCENARIO", "hang")
+    The acceptance scenario keeps a hanging run so its explicit session actions
+    own the lifecycle.  The browser journey asks for ``success``: a clean run
+    end is the host's technical receive point, which the instruction-delivery
+    drain needs to deliver a queued instruction without a human interrupt.
+    """
+
+    monkeypatch.setenv("AUTOWORK_FAKE_CLI_SCENARIO", scenario)
     monkeypatch.setattr(
         supervisor_module,
         "default_profiles",
@@ -391,8 +397,15 @@ async def seed_article(
     uow_factory: Any,
     artifact_store: ProductionArtifactStore,
     material: ScenarioMaterial,
+    duplicate_analysis_paragraph: bool = False,
 ) -> SeededArticle:
-    """Persist one verified synthetic ARTICLE, its extraction and routing."""
+    """Persist one verified synthetic ARTICLE, its extraction and routing.
+
+    ``duplicate_analysis_paragraph`` appends the tail paragraph to the analysis
+    section, so two rendered anchors share the exact same text.  The browser
+    journey uses it to prove the canonical anchor selector exposes real
+    multiple occurrences; the acceptance scenario keeps the default document.
+    """
     token = uuid4().hex
     source_document_id = uuid4()
     edition = Edition(
@@ -421,15 +434,23 @@ async def seed_article(
         heading="Vue d'ensemble",
         paragraphs=(PublicationParagraphV1(text=lead.text, evidence_refs=lead.evidence_refs),),
     )
+    analysis_paragraphs = [
+        PublicationParagraphV1(
+            text=ANALYSIS_SECTION_PARAGRAPH,
+            evidence_refs=lead.evidence_refs,
+        )
+    ]
+    if duplicate_analysis_paragraph:
+        analysis_paragraphs.append(
+            PublicationParagraphV1(
+                text=TAIL_SECTION_PARAGRAPH,
+                evidence_refs=lead.evidence_refs,
+            )
+        )
     analysis_section = PublicationSectionV1(
         kind=PublicationSectionKind.TECHNICAL,
         heading="Analyse synthetique",
-        paragraphs=(
-            PublicationParagraphV1(
-                text=ANALYSIS_SECTION_PARAGRAPH,
-                evidence_refs=lead.evidence_refs,
-            ),
-        ),
+        paragraphs=tuple(analysis_paragraphs),
     )
     tail_section = PublicationSectionV1(
         kind=PublicationSectionKind.TECHNICAL,
@@ -459,6 +480,14 @@ async def seed_article(
         anchor="section:1:paragraph:0001",
         spans=(SemanticTextSpanV1(role=SemanticRole.TEXT, text=ANALYSIS_SECTION_PARAGRAPH),),
     )
+    semantic_paragraphs = [overview_semantics, analysis_semantics]
+    if duplicate_analysis_paragraph:
+        semantic_paragraphs.append(
+            SemanticParagraphV1(
+                anchor="section:1:paragraph:0002",
+                spans=(SemanticTextSpanV1(role=SemanticRole.TEXT, text=TAIL_SECTION_PARAGRAPH),),
+            )
+        )
     tail_semantics = SemanticParagraphV1(
         anchor="section:2:paragraph:0001",
         spans=(SemanticTextSpanV1(role=SemanticRole.TEXT, text=TAIL_SECTION_PARAGRAPH),),
@@ -471,8 +500,7 @@ async def seed_article(
             policy_version=base_v5.semantic_text.policy_version,
             paragraphs=(
                 *preserved_semantics,
-                overview_semantics,
-                analysis_semantics,
+                *semantic_paragraphs,
                 tail_semantics,
             ),
         ),

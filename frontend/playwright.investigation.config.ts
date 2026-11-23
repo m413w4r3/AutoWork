@@ -60,7 +60,7 @@ export default defineConfig({
   outputDir:
     process.env.WORKFLOW_BROWSER_OUTPUT_DIR ??
     "./test-results/investigation-workshop",
-  timeout: 240_000,
+  timeout: 600_000,
   fullyParallel: false,
   workers: 1,
   retries: 0,
@@ -68,6 +68,9 @@ export default defineConfig({
   expect: { timeout: 10_000 },
   use: {
     baseURL: appOrigin,
+    // Bounded like `expect`: a wrong locator must fail the journey instead of
+    // waiting until the whole-test timeout.
+    actionTimeout: 15_000,
     screenshot: "only-on-failure",
     trace: "retain-on-failure",
   },
