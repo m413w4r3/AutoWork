@@ -20,9 +20,11 @@ status words only, never analyst prose), navigation ``refs`` and an
 ``evidence`` boolean.  Only canonical observations are ``evidence: true``;
 Bridge advice, plans, invocations and events are ``evidence: false``.
 
-Work contributions (lot 07) and handoffs (lot 05A) do not exist yet: their
-tables are not referenced here.  They plug in through :class:`TimelineSource`
-without touching the union below.
+Handoffs (lot 05A), work contributions (lot 07), agent sessions and their
+persisted human instruction queue (lots 05B1/D05) plug in through
+:class:`TimelineSource` without touching the union below.  They are
+append-only projections and never evidence: a contribution that imported an
+observation leaves the canonical observation as its own ``observation`` item.
 """
 
 from __future__ import annotations
@@ -39,13 +41,21 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 from cti_app.application.investigation_persistence import (
+    AgentSessionRepository,
     EvidenceObservationRepository,
+    HandoffRecord,
+    InvestigationHandoffRepository,
     InvestigationPlanRepository,
     InvestigationTaskRepository,
     ToolInvocationRepository,
+    WorkContributionRepository,
 )
 from cti_app.application.investigation_task_events import TaskEvent
 from cti_app.application.persistence import AnalystDecisionRepository
+from cti_app.domain.agentic_operator import (
+    AgentSessionInstructionV1,
+    AgentSessionV1,
+)
 from cti_app.domain.editorial import (
     AnalystDecision,
     AnalystDecisionTargetType,
@@ -57,6 +67,10 @@ from cti_app.domain.investigation import (
 )
 from cti_app.domain.investigation_plan import InvestigationPlanVersion
 from cti_app.domain.investigation_task import TaskActorKind
+from cti_app.domain.work_contribution import (
+    WorkContributionOrigin,
+    WorkContributionV1,
+)
 
 _TIMELINE_SECTION = "timeline"
 _ADVISOR_TOOL_NAME = "advisor.consult"
@@ -71,6 +85,10 @@ class TimelineItemType(StrEnum):
     BRIDGE_CONSULTATION = "bridge_consultation"
     TOOL_INVOCATION = "tool_invocation"
     PLAN_VERSION = "plan_version"
+    HANDOFF = "handoff"
+    CONTRIBUTION = "contribution"
+    AGENT_SESSION = "agent_session"
+    INSTRUCTION = "instruction"
 
 
 class TimelineActorKind(StrEnum):
@@ -316,6 +334,175 @@ def _plan_item(
     )
 
 
+def _handoff_item(record: HandoffRecord) -> TimelineItemV1:
+    handoff = record.handoff
+    refs = {
+        "handoff_id": handoff.handoff_id,
+        "task_id": handoff.task_id,
+        "version": str(handoff.version),
+        "sha256": handoff.content_sha256,
+    }
+    if record.predecessor_id is not None:
+        refs["predecessor_id"] = record.predecessor_id
+    return TimelineItemV1(
+        item_type=TimelineItemType.HANDOFF,
+        object_id=UUID(handoff.handoff_id),
+        occurred_at=handoff.created_at,
+        task_id=UUID(handoff.task_id),
+        actor_kind=TimelineActorKind(record.created_by.kind.value),
+        actor_id=record.created_by.actor_id,
+        summary=(
+            f"handoff:v{handoff.version}:"
+            f"{handoff.from_actor.kind.value}->{handoff.to_actor.kind.value}"
+        ),
+        evidence=False,
+        refs=refs,
+    )
+
+
+_CONTRIBUTION_ACTORS = {
+    WorkContributionOrigin.HUMAN: TimelineActorKind.HUMAN,
+    WorkContributionOrigin.AGENT: TimelineActorKind.OPERATOR,
+    WorkContributionOrigin.HOST: TimelineActorKind.SYSTEM,
+}
+
+
+def _contribution_item(contribution: WorkContributionV1) -> TimelineItemV1:
+    refs = {
+        "contribution_id": str(contribution.id),
+        "workspace_id": contribution.workspace_id,
+        "workspace_revision_id": contribution.workspace_revision_id,
+        "file_relpath": contribution.file_relpath,
+        "file_sha256": contribution.file_sha256,
+    }
+    if contribution.observation_id is not None:
+        refs["observation_id"] = str(contribution.observation_id)
+    if contribution.finding_id is not None:
+        refs["finding_id"] = str(contribution.finding_id)
+    if contribution.validation_error_code is not None:
+        refs["validation_error_code"] = contribution.validation_error_code.value
+    return TimelineItemV1(
+        item_type=TimelineItemType.CONTRIBUTION,
+        object_id=contribution.id,
+        occurred_at=contribution.observed_at,
+        task_id=contribution.task_id,
+        actor_kind=_CONTRIBUTION_ACTORS[contribution.origin],
+        actor_id=contribution.origin_actor_id or contribution.origin.value,
+        summary=f"contribution:{contribution.category.value}:{contribution.import_status.value}",
+        evidence=False,
+        refs=refs,
+    )
+
+
+def _agent_session_item(session: AgentSessionV1) -> TimelineItemV1:
+    """A technical session; authentication material never enters the item."""
+    refs = {
+        "session_id": str(session.id),
+        "task_id": str(session.task_id),
+        "adapter_kind": session.adapter_kind.value,
+        "state": session.state.value,
+        "state_version": str(session.state_version),
+    }
+    if session.handoff_id is not None:
+        refs["handoff_id"] = str(session.handoff_id)
+    return TimelineItemV1(
+        item_type=TimelineItemType.AGENT_SESSION,
+        object_id=session.id,
+        occurred_at=session.opened_at,
+        task_id=session.task_id,
+        actor_kind=TimelineActorKind.SYSTEM,
+        actor_id=session.adapter_kind.value,
+        summary=f"agent_session:{session.adapter_kind.value}:{session.state.value}",
+        evidence=False,
+        refs=refs,
+    )
+
+
+def _instruction_item(instruction: AgentSessionInstructionV1) -> TimelineItemV1:
+    """One persisted human instruction with its text SHA-256.
+
+    The terse timeline keeps identifiers, hashes and state only; the human
+    text is read through the B6 session summary, and ``delivery_token`` never
+    leaves the row.
+    """
+    refs = {
+        "instruction_id": str(instruction.id),
+        "session_id": str(instruction.session_id),
+        "text_sha256": instruction.text_sha256,
+        "delivery_attempts": str(instruction.delivery_attempts),
+    }
+    if instruction.delivery_mode is not None:
+        refs["delivery_mode"] = instruction.delivery_mode.value
+    if instruction.delivery_sha256 is not None:
+        refs["delivery_sha256"] = instruction.delivery_sha256
+    return TimelineItemV1(
+        item_type=TimelineItemType.INSTRUCTION,
+        object_id=instruction.id,
+        occurred_at=instruction.queued_at,
+        task_id=instruction.task_id,
+        actor_kind=TimelineActorKind(instruction.created_by_kind),
+        actor_id=instruction.created_by_id,
+        summary=f"instruction:{instruction.state.value}",
+        evidence=False,
+        refs=refs,
+    )
+
+
+class HandoffTimelineSource:
+    """Project persisted handoffs (lot 05A) as non-evidence items."""
+
+    def __init__(self, handoffs: InvestigationHandoffRepository) -> None:
+        self._handoffs = handoffs
+
+    async def items(self, investigation_id: UUID) -> tuple[TimelineItemV1, ...]:
+        return tuple(
+            _handoff_item(record)
+            for record in await self._handoffs.list_for_investigation(investigation_id)
+        )
+
+
+class ContributionTimelineSource:
+    """Project append-only work contributions (lot 07) as non-evidence items."""
+
+    def __init__(self, contributions: WorkContributionRepository) -> None:
+        self._contributions = contributions
+
+    async def items(self, investigation_id: UUID) -> tuple[TimelineItemV1, ...]:
+        return tuple(
+            _contribution_item(contribution)
+            for contribution in await self._contributions.list_for_investigation(investigation_id)
+        )
+
+
+class AgentSessionTimelineSource:
+    """Project technical agent sessions as non-evidence items."""
+
+    def __init__(self, sessions: AgentSessionRepository) -> None:
+        self._sessions = sessions
+
+    async def items(self, investigation_id: UUID) -> tuple[TimelineItemV1, ...]:
+        return tuple(
+            _agent_session_item(session)
+            for session in await self._sessions.list_for_investigation(investigation_id)
+        )
+
+
+class InstructionTimelineSource:
+    """Project the persisted per-session human instruction queue."""
+
+    def __init__(self, sessions: AgentSessionRepository) -> None:
+        self._sessions = sessions
+
+    async def items(self, investigation_id: UUID) -> tuple[TimelineItemV1, ...]:
+        items: list[TimelineItemV1] = []
+        for session in await self._sessions.list_for_investigation(investigation_id):
+            items.extend(
+                _instruction_item(instruction)
+                for instruction in await self._sessions.list_instructions(session.id)
+            )
+        return tuple(items)
+
+
 class InvestigationTimelineService:
     """Project the canonical records of one investigation into one page."""
 
@@ -432,6 +619,10 @@ class InvestigationTimelineService:
 
 
 __all__ = [
+    "AgentSessionTimelineSource",
+    "ContributionTimelineSource",
+    "HandoffTimelineSource",
+    "InstructionTimelineSource",
     "InvestigationTimelineService",
     "TimelineActorKind",
     "TimelineItemType",
