@@ -1,10 +1,10 @@
 """PostgreSQL oracles for the M24.1 instruction delivery drain (lot ID-2).
 
 Disposable migrated database only.  Proves the real compare-and-swap
-reservation under two concurrent drainers, the transaction-scoped advisory lock
-the lifespan tick uses, and that migration 0027's delivery columns/CHECKs/FKs
-accept the phase transitions the service writes (and reject an invalid
-combination).
+reservation under two concurrent drainers, the session-level advisory lock the
+lifespan tick uses (mutual exclusion without an idle transaction), and that
+migration 0027's delivery columns/CHECKs/FKs accept the phase transitions the
+service writes (and reject an invalid combination).
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cti_app.api.agent_sessions import router as agent_sessions_router
+from cti_app.api.main import _instruction_drain_tick_lock
 from cti_app.application.agent_session_disclosure import SessionDisclosurePreRead
 from cti_app.application.agent_session_verifier import (
     HmacSessionSecretDeriver,
@@ -46,10 +47,7 @@ from cti_app.application.agentic_sessions import (
     SessionSecret,
     SessionService,
 )
-from cti_app.application.instruction_delivery import (
-    INSTRUCTION_DRAIN_LOCK_KEY,
-    InstructionDeliveryService,
-)
+from cti_app.application.instruction_delivery import InstructionDeliveryService
 from cti_app.application.investigation_persistence import VersionConflictError
 from cti_app.config import Settings
 from cti_app.domain.agentic_operator import (
@@ -461,28 +459,39 @@ def test_two_concurrent_drainers_reserve_once_and_call_host_once(
     asyncio.run(run())
 
 
-def test_instruction_drain_advisory_lock_is_transaction_scoped(
+def test_instruction_drain_lock_excludes_without_an_idle_transaction(
     migrated_postgres_url: str,
 ) -> None:
-    statement = sa.text(
-        "SELECT pg_try_advisory_xact_lock(hashtextextended(CAST(:lock_key AS text), 0))"
-    )
-    params = {"lock_key": INSTRUCTION_DRAIN_LOCK_KEY}
+    """F3: the drain tick excludes other drainers but holds no transaction.
+
+    The lock is session-level on one dedicated connection and released
+    explicitly: while the holder performs the batch's host I/O, its PostgreSQL
+    session must be ``idle``, not ``idle in transaction``.
+    """
 
     async def run() -> None:
         engine = create_postgres_engine(migrated_postgres_url)
         try:
             factory = create_session_factory(engine)
-            async with factory() as holder:
-                async with holder.begin():
-                    assert bool(await holder.scalar(statement, params)) is True
-                    async with factory() as contender:
-                        async with contender.begin():
-                            assert bool(await contender.scalar(statement, params)) is False
-                # The scope ends with the holder's transaction.
-                async with factory() as after:
-                    async with after.begin():
-                        assert bool(await after.scalar(statement, params)) is True
+            async with _instruction_drain_tick_lock(factory) as granted:
+                assert granted is True
+                # A second drainer is excluded while the first holds the tick.
+                async with _instruction_drain_tick_lock(factory) as contender:
+                    assert contender is False
+                async with engine.connect() as observer:
+                    holder_state = await observer.scalar(
+                        sa.text(
+                            "SELECT activity.state FROM pg_locks AS locks "
+                            "JOIN pg_stat_activity AS activity "
+                            "ON activity.pid = locks.pid "
+                            "WHERE locks.locktype = 'advisory' "
+                            "AND locks.granted AND locks.objsubid = 1"
+                        )
+                    )
+                assert holder_state == "idle"
+            # The explicit unlock ends with the tick.
+            async with _instruction_drain_tick_lock(factory) as after:
+                assert after is True
         finally:
             await engine.dispose()
 
