@@ -58,6 +58,7 @@ PROBE_PYTHON = "/usr/bin/python3"
 ENTRYPOINT_FILE_NAME = "entrypoint.py"
 EGRESS_SOCKET_FILE_NAME = "egress.sock"
 ATTESTATION_PROBE_TIMEOUT_SECONDS = 10.0
+SPAWN_ANCHOR_TIMEOUT_SECONDS = 30.0
 ATTESTATION_DIRECTORY_PREFIX = "autowork-netns-attest-"
 AF_UNIX_PATH_MAX_BYTES = 107  # sockaddr_un.sun_path is 108 bytes including the NUL
 ATTESTATION_ENV = {
@@ -253,8 +254,46 @@ def spawn(plan: LaunchPlan) -> ManagedProcess:
     return _spawn_direct(plan)
 
 
+def _popen_with_anchor(argv: Sequence[str], **kwargs: object) -> subprocess.Popen[bytes]:
+    """Start ``argv`` from a thread that lives exactly as long as the child.
+
+    ``bwrap --die-with-parent`` (and the fake CLI's parity) ask the kernel for
+    ``PR_SET_PDEATHSIG(SIGKILL)``; Linux ties that death signal to the *thread*
+    that forked the child.  The supervisor serves ``POST /start`` from a
+    short-lived HTTP handler thread, so spawning there killed every long-running
+    sandbox a few seconds after the response was written (H0 host spike,
+    2026-11-23: SIGKILL at ~4 s with no caller-side signal).  The anchor thread
+    outlives the child, so only a real supervisor death tears the tree down.
+    """
+    ready = threading.Event()
+    outcome: dict[str, object] = {}
+
+    def anchor() -> None:
+        try:
+            child = subprocess.Popen(argv, **kwargs)  # type: ignore[arg-type]
+        except BaseException as exc:  # re-raised in the caller thread
+            outcome["error"] = exc
+            ready.set()
+            return
+        outcome["process"] = child
+        ready.set()
+        # Keep this thread (the child's parent) alive until the run ends.
+        child.wait()
+
+    threading.Thread(target=anchor, name="session-spawn-anchor", daemon=True).start()
+    if not ready.wait(timeout=SPAWN_ANCHOR_TIMEOUT_SECONDS):
+        raise OSError("the sandbox did not start")
+    error = outcome.get("error")
+    if isinstance(error, BaseException):
+        raise error
+    child = outcome.get("process")
+    if not isinstance(child, subprocess.Popen):
+        raise OSError("the sandbox did not start")
+    return child
+
+
 def _spawn_direct(plan: LaunchPlan) -> ManagedProcess:
-    process = subprocess.Popen(
+    process = _popen_with_anchor(
         plan.argv,
         cwd=plan.cwd,
         env=plan.env,
@@ -322,7 +361,7 @@ def _spawn_isolated(plan: LaunchPlan) -> ManagedProcess:
         raise NetworkIsolationUnavailable("the isolated launch names no egress proxy socket")
     argv = isolated_entry_argv(plan.argv, egress_socket_path=egress_socket)
     try:
-        process = subprocess.Popen(
+        process = _popen_with_anchor(
             argv,
             cwd=plan.cwd,
             env=plan.env,
