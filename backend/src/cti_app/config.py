@@ -84,6 +84,13 @@ class Settings(BaseSettings):
     # mode: the former ``host_network_unsafe`` development override was removed
     # (M24.1 CFG-1), and an old environment value fails startup explicitly.
     agent_sessions_cli_network_mode: Literal["isolated_egress"] = "isolated_egress"
+    # M24.1 ID-2: the backend-owned instruction drain (F3-D §3.3). The loop is
+    # disabled when no host session runtime is configured; the grace window is
+    # how long a ``delivering`` reservation may stay unresolved before it is
+    # treated as an ambiguous attempt.
+    m24_instruction_drain_interval_seconds: float = Field(default=10.0, ge=2, le=300)
+    m24_instruction_drain_batch_size: int = Field(default=50, ge=1, le=1000)
+    m24_instruction_delivery_grace_seconds: int = Field(default=120, ge=1, le=86400)
 
     @field_validator("agent_sessions_cli_network_mode", mode="before")
     @classmethod

@@ -30,13 +30,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import secrets
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from types import TracebackType
-from typing import Any, Protocol, Self
+from typing import TYPE_CHECKING, Any, Protocol, Self
 from uuid import UUID, uuid4
 
 from cti_app.application.agent_session_verification import (
@@ -90,7 +91,6 @@ from cti_app.domain.agentic_operator import (
     AgentSessionState,
     AgentSessionV1,
     CollectResultsRequest,
-    InstructionDeliveryOutcome,
     InstructionState,
     InterruptSessionRequest,
     OperatorAdapterKind,
@@ -100,7 +100,6 @@ from cti_app.domain.agentic_operator import (
     ProbeCapabilitiesRequest,
     ReconcileSessionRequest,
     ResumeSessionRequest,
-    SendInstructionRequest,
     SessionReconcileOutcome,
     SessionReconciliationV1,
     StartSessionRequest,
@@ -115,6 +114,11 @@ from cti_app.domain.investigation_task import (
     TaskLimits,
     TaskStatus,
 )
+
+if TYPE_CHECKING:
+    from cti_app.application.instruction_delivery import InstructionDeliveryService
+
+logger = logging.getLogger(__name__)
 
 
 class SessionError(ValueError):
@@ -702,6 +706,7 @@ class SessionService:
         note_resolver: InstructionNoteResolver | None = None,
         disclosure: Callable[[UUID], Awaitable[None]] | None = None,
         release_host: SessionReleaseFlusher | None = None,
+        instruction_delivery: InstructionDeliveryService | None = None,
         cli_network_mode: str = "isolated_egress",
         task_limits: TaskLimits = TASK_LIMIT_DEFAULTS,
         clock: Callable[[], datetime] | None = None,
@@ -715,6 +720,7 @@ class SessionService:
         self._note_resolver = note_resolver
         self._disclosure = disclosure
         self._release_host = release_host
+        self._instruction_delivery = instruction_delivery
         self._task_limits = task_limits
         self._clock = clock or (lambda: datetime.now(UTC))
 
@@ -957,28 +963,28 @@ class SessionService:
         ``note_refs`` are workspace paths under ``notes/humaines``.  The
         resolver records the LATEST ``(revision_id, sha256)`` for each path in
         the persistent instruction text, so the queue itself carries exact
-        refs.  Delivery happens only to an explicitly idle
-        (``awaiting_instruction``) session, never to a session whose technical
-        state is unknown; a note modified after queueing is reported as a
-        visible diff appended to the delivered text.
+        refs.  The ``queued`` row is committed before any host effect (D1); an
+        idle (``awaiting_instruction``) session then gets one best-effort inline
+        drain, while a busy one keeps the instruction queued for the background
+        drain.  A note modified after queueing is reported as a visible diff
+        appended to the delivered text (INS-05).
         """
         key = _idempotency_key(idempotency_key)
         timestamp = _now(self._clock, now)
         self._require_human(actor)
         # R03b M1: the disclosure gate binds every delivery to the external
         # provider, not only the session opening.  This instruction may be
-        # delivered live to an idle CLI, and a revoke/TLP change after the
-        # opening must stop it (B2).  Queueing alone has no host effect, but
-        # the gate runs first so the decision cannot drift before delivery.
+        # delivered to an idle CLI, and a revoke/TLP change after the opening
+        # must stop it (B2).  Queueing alone has no host effect, but the gate
+        # runs first so the decision cannot drift before delivery.
         await self._require_external_disclosure(investigation_id)
-        resolution: NoteInstructionResolution | None = None
         composed_text = text.strip()
         if note_refs:
             resolver = self._require_note_resolver()
-            resolution = await resolver.prepare(
+            prepared = await resolver.prepare(
                 investigation_id=investigation_id, text=text, note_refs=note_refs
             )
-            composed_text = resolution.queued_text
+            composed_text = prepared.queued_text
         async with self._uow_factory() as uow:
             session = await self._session_for(uow, investigation_id, session_id)
             if session.state not in (
@@ -1007,57 +1013,39 @@ class SessionService:
                 stored, created = await uow.agent_sessions.add_instruction(instruction)
             except VersionConflictError as exc:
                 raise SessionIdempotencyConflictError(str(exc)) from exc
-            if not created:
-                return EnqueuedInstructionV1(
-                    instruction=stored,
-                    queue_position=await _queue_position(uow, session.id, stored),
-                    delivered_live=False,
+            if created:
+                # D1: the queued row is durable before any host call.
+                await uow.commit()
+            idle = session.state is AgentSessionState.AWAITING_INSTRUCTION
+        # D3: the inline drain is best effort and runs after the commit, with
+        # no transaction or lock held.  It re-checks every mutable fact itself,
+        # so a revoke or a state change since the gate above still refuses.
+        if (
+            idle
+            and self._instruction_delivery is not None
+            and stored.state is InstructionState.QUEUED
+        ):
+            try:
+                await self._instruction_delivery.deliver_instruction(stored.id)
+            except Exception as exc:  # never fail an already-committed enqueue
+                logger.warning(
+                    "inline instruction delivery failed",
+                    extra={
+                        "event": "m24.instruction_delivery.inline_failed",
+                        "instruction_id": str(stored.id),
+                        "error_type": type(exc).__name__,
+                    },
                 )
-            delivered = stored
-            delivered_live = False
-            note_diffs: tuple[Mapping[str, str], ...] = ()
-            if (
-                session.state is AgentSessionState.AWAITING_INSTRUCTION
-                and self._operator is not None
-                and session.host_session_ref is not None
-            ):
-                delivery_text = stored.text
-                if resolution is not None:
-                    refreshed = await self._require_note_resolver().refresh(
-                        investigation_id=investigation_id, text=stored.text
-                    )
-                    delivery_text = refreshed.delivery_text
-                    note_diffs = refreshed.note_diffs
-                receipt = await self._operator.send_instruction(
-                    SendInstructionRequest(
-                        session_id=session.id,
-                        host_session_ref=session.host_session_ref,
-                        instruction_id=stored.id,
-                        instruction_sha256=instruction_text_sha256(delivery_text),
-                        text=delivery_text,
-                        idempotency_key=stored.idempotency_key,
-                    )
-                )
-                if receipt.session_id != session.id or receipt.instruction_id != stored.id:
-                    raise SessionOperatorContractError(
-                        "send_instruction answered a different instruction"
-                    )
-                if receipt.outcome is InstructionDeliveryOutcome.ACCEPTED:
-                    delivered = await self._persist_instruction(
-                        uow, stored.with_state(InstructionState.DELIVERED, now=timestamp)
-                    )
-                    await self._persist(
-                        uow, session.with_state(AgentSessionState.RUNNING, now=timestamp)
-                    )
-                    delivered_live = True
-            queue_position = await _queue_position(uow, session.id, delivered)
-            await uow.commit()
-            return EnqueuedInstructionV1(
-                instruction=delivered,
-                queue_position=queue_position,
-                delivered_live=delivered_live,
-                note_diffs=note_diffs,
-            )
+        async with self._uow_factory() as uow:
+            final = await uow.agent_sessions.get_instruction(stored.id) or stored
+            queue_position = await _queue_position(uow, session.id, final)
+        return EnqueuedInstructionV1(
+            instruction=final,
+            queue_position=queue_position,
+            delivered_live=final.state
+            in (InstructionState.DELIVERED, InstructionState.ACKNOWLEDGED),
+            note_diffs=tuple(final.delivery_note_diffs or ()),
+        )
 
     async def acknowledge_instructions(
         self,
