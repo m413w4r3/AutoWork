@@ -2146,7 +2146,7 @@ def _technical_ioc_annex(
 
         projected["display_mode"] = "technical-annex-v1"
         projected["reference_range"] = (
-            f"[{next_reference - len(reference_rows)}]–[{next_reference - 1}]"
+            f"[{next_reference - len(reference_rows)}]\u2013[{next_reference - 1}]"
         )
         projected["reference_table"] = {
             "column_count": 3,
