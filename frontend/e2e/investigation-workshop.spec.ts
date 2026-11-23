@@ -21,6 +21,14 @@ test.describe.configure({ timeout: 45_000 });
 
 const SHOTS = join(process.cwd(), "test-results", "workshop-cockpit");
 
+/** The node tsconfig has no DOM lib; element evaluates use this local shape. */
+interface Box {
+  width: number;
+  height: number;
+  top: number;
+  left: number;
+}
+
 test.beforeEach(async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.emulateMedia({ reducedMotion: "reduce" });
@@ -352,14 +360,28 @@ test("plan et tâches : acceptation, action absente et CAS périmé", async ({
 
   const timeline = page.getByRole("region", { name: "Chronologie commune" });
   const entries = [
-    ["handoff:v1:human->operator", "Passation"],
-    ["contribution:finding:imported", "Contribution"],
-    ["agent_session:codex_cli:running", "Session d’agent"],
-    ["instruction:queued", "Instruction humaine"],
+    [
+      "Passation v1 · Humain → Opérateur",
+      "Passation",
+      "handoff:v1:human->operator",
+    ],
+    ["Finding importé", "Contribution", "contribution:finding:imported"],
+    [
+      "Session Codex CLI · En cours",
+      "Session d’agent",
+      "agent_session:codex_cli:running",
+    ],
+    [
+      "Instruction humaine · En file (agent occupé)",
+      "Instruction humaine",
+      "instruction:queued",
+    ],
   ] as const;
-  for (const [summary, label] of entries) {
-    const entry = timeline.getByRole("listitem").filter({ hasText: summary });
+  for (const [sentence, label, raw] of entries) {
+    const entry = timeline.getByRole("listitem").filter({ hasText: sentence });
     await expect(entry.getByText(label, { exact: true })).toBeVisible();
+    // The raw projection token stays readable as the item title.
+    await expect(entry.getByTitle(raw)).toHaveText(sentence);
   }
   await expect(
     timeline.getByText("Non probant — élément de travail"),
@@ -367,8 +389,12 @@ test("plan et tâches : acceptation, action absente et CAS périmé", async ({
   await expect(timeline.getByText("Preuve canonique")).toHaveCount(1);
 
   await page.getByLabel(/Type d’événement/).selectOption("instruction");
-  await expect(timeline.getByText("instruction:queued")).toBeVisible();
-  await expect(timeline.getByText("handoff:v1:human->operator")).toHaveCount(0);
+  await expect(
+    timeline.getByText("Instruction humaine · En file (agent occupé)"),
+  ).toBeVisible();
+  await expect(
+    timeline.getByText("Passation v1 · Humain → Opérateur"),
+  ).toHaveCount(0);
   await page.getByLabel(/Type d’événement/).selectOption("all");
 
   await page.getByLabel(/Je confirme l’acceptation de cette version/).check();
@@ -1114,35 +1140,32 @@ test("note de l’analyste : aucune largeur ne déborde aux trois résolutions",
     { width: 1920, height: 1080 },
   ]) {
     await page.setViewportSize(viewport);
-    await page.evaluate(() => window.scrollTo(0, 0));
-    const metrics = await page.evaluate(() => {
-      const root = document.documentElement;
-      const main = document.querySelector("main");
-      const card = document.querySelector(
-        "section.job-card.opinion-notes",
-      );
-      return {
-        clientWidth: root.clientWidth,
-        scrollWidth: root.scrollWidth,
-        mainWidth:
-          main === null ? null : main.getBoundingClientRect().width,
-        cardWidth:
-          card === null ? null : card.getBoundingClientRect().width,
-      };
-    });
-    expect(metrics.clientWidth, `${viewport.width}px client width`).toBe(
+    await page.evaluate("window.scrollTo(0, 0)");
+    // The node tsconfig has no DOM lib; these evaluate calls stay strings and
+    // locator bounding boxes carry the layout numbers.
+    const clientWidth = await page.evaluate<number>(
+      "document.documentElement.clientWidth",
+    );
+    const scrollWidth = await page.evaluate<number>(
+      "document.documentElement.scrollWidth",
+    );
+    const mainBox = await page.locator("main").boundingBox();
+    const cardBox = await page
+      .locator("section.job-card.opinion-notes")
+      .boundingBox();
+    expect(clientWidth, `${viewport.width}px client width`).toBe(
       viewport.width,
     );
     expect(
-      metrics.scrollWidth,
+      scrollWidth,
       `${viewport.width}px document scroll width`,
-    ).toBeLessThanOrEqual(metrics.clientWidth);
-    expect(metrics.mainWidth).not.toBeNull();
-    expect(metrics.cardWidth).not.toBeNull();
+    ).toBeLessThanOrEqual(clientWidth);
+    expect(mainBox).not.toBeNull();
+    expect(cardBox).not.toBeNull();
     expect(
-      metrics.cardWidth ?? Number.POSITIVE_INFINITY,
+      cardBox?.width ?? Number.POSITIVE_INFINITY,
       `${viewport.width}px opinion card width`,
-    ).toBeLessThanOrEqual((metrics.mainWidth ?? 0) + 1);
+    ).toBeLessThanOrEqual((mainBox?.width ?? 0) + 1);
   }
 });
 
@@ -1153,26 +1176,34 @@ test("cases à cocher et radios : le contrôle reste collé au libellé", async 
   await launchWorkshop(page, api);
 
   const inlineChoices = async () =>
-    page.evaluate(() =>
-      [...document.querySelectorAll("label")]
-        .filter((label) =>
-          label.querySelector("input[type='checkbox'], input[type='radio']"),
-        )
-        .map((label) => {
-          const input = label.querySelector(
+    page
+      .locator(
+        "label:has(> input[type='checkbox']), label:has(> input[type='radio'])",
+      )
+      .evaluateAll((labels) =>
+        labels.map((label) => {
+          const element = label as unknown as {
+            querySelector(selector: string): {
+              getBoundingClientRect(): Box;
+            } | null;
+            getBoundingClientRect(): Box;
+            textContent: string | null;
+          };
+          const input = element.querySelector(
             "input[type='checkbox'], input[type='radio']",
-          ) as HTMLElement;
-          const labelRect = label.getBoundingClientRect();
+          );
+          if (input === null) throw new Error("label without control");
+          const labelRect = element.getBoundingClientRect();
           const inputRect = input.getBoundingClientRect();
           return {
-            text: (label.textContent ?? "").trim().slice(0, 48),
+            text: (element.textContent ?? "").trim().slice(0, 48),
             inputWidth: Math.round(inputRect.width),
             inputHeight: Math.round(inputRect.height),
             offsetFromLabel: Math.round(inputRect.left - labelRect.left),
             topFromLabel: Math.round(inputRect.top - labelRect.top),
           };
         }),
-    );
+      );
 
   // Another view (G2 envelope approval confirmation) uses the same inline
   // pattern and must not regress either.
@@ -1195,8 +1226,15 @@ test("cases à cocher et radios : le contrôle reste collé au libellé", async 
     .filter({ hasText: "J’ai examiné le texte stocké" });
   await expect(acceptance.getByRole("checkbox")).toBeVisible();
   const acceptanceMetrics = await acceptance.evaluate((label) => {
-    const input = label.querySelector("input[type='checkbox']") as HTMLElement;
-    const labelRect = label.getBoundingClientRect();
+    const element = label as unknown as {
+      querySelector(selector: string): {
+        getBoundingClientRect(): Box;
+      } | null;
+      getBoundingClientRect(): Box;
+    };
+    const input = element.querySelector("input[type='checkbox']");
+    if (input === null) throw new Error("missing acceptance checkbox");
+    const labelRect = element.getBoundingClientRect();
     const inputRect = input.getBoundingClientRect();
     return {
       inputWidth: Math.round(inputRect.width),

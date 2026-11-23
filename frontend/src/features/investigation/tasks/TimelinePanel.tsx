@@ -26,6 +26,7 @@ import {
   TIMELINE_ACTOR_LABELS,
   TIMELINE_TYPE_LABELS,
 } from "./labels";
+import { timelineSummaryLabel } from "./timelinePresentation";
 
 const TYPE_OPTIONS = Object.entries(TIMELINE_TYPE_LABELS) as Array<
   [TimelineItemType, string]
@@ -101,6 +102,8 @@ function itemMatchesText(item: TimelineItemV1, needle: string): boolean {
   if (needle === "") return true;
   const haystack = [
     item.summary,
+    // The visible sentence must be searchable, not only the raw token.
+    timelineSummaryLabel(item),
     item.object_id,
     item.actor_id ?? "",
     ...Object.entries(item.refs).flatMap(([key, value]) => [key, value]),
@@ -252,7 +255,7 @@ export function TimelinePanel({
                   <span className="m24-badge m24-badge--muted">Non-preuve</span>
                 )}
               </div>
-              <p>{item.summary}</p>
+              <p title={item.summary}>{timelineSummaryLabel(item)}</p>
               <dl className="m24-metadata m24-metadata--refs">
                 <div>
                   <dt>Objet</dt>
