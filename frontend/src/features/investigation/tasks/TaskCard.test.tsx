@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -17,7 +17,9 @@ import { TaskWorkspace } from "./TaskWorkspace";
 import {
   HANDOFF_ID,
   INVESTIGATION_ID,
+  TASK_ID,
   makeSession,
+  makeSummary,
   makeTask,
 } from "./testFixtures";
 
@@ -98,6 +100,31 @@ function workspaceStatus() {
   };
 }
 
+function renderWorkspace(
+  tasks: ReturnType<typeof makeTask>[],
+  timelineItems: unknown[] = [],
+  sessionItems: AgentSessionView[] = [],
+) {
+  installFetch(({ url }) => {
+    if (url.endsWith("/tasks"))
+      return jsonResponse({ items: tasks, total: tasks.length });
+    if (url.endsWith("/agent-sessions")) return jsonResponse(sessionItems);
+    if (url.endsWith("/workspace")) return jsonResponse(workspaceStatus());
+    if (url.includes("/timeline"))
+      return jsonResponse({
+        items: timelineItems,
+        next_cursor: null,
+        has_more: false,
+      });
+    if (url.includes("/events"))
+      return jsonResponse({ items: [], next_cursor: null, has_more: false });
+    return errorResponse(500, "unexpected_request");
+  });
+  return render(<TaskWorkspace investigationId={INVESTIGATION_ID} />, {
+    wrapper: wrapperFor(createTestQueryClient()),
+  });
+}
+
 describe("TaskCard actions", () => {
   it("n’affiche aucune action non exécutable sur une tâche terminale", () => {
     const completed = makeTask({
@@ -128,7 +155,8 @@ describe("TaskCard actions", () => {
     expect(screen.queryByText(/operator:codex_cli/)).toBeNull();
   });
 
-  it("n’affiche pas les attributions quand le workspace n’est pas prouvé", () => {
+  it("masque les attributions sans workspace et demande une confirmation d’annulation dans Plus d’actions", async () => {
+    const user = userEvent.setup();
     renderCard(makeTask(), null);
 
     expect(
@@ -139,29 +167,59 @@ describe("TaskCard actions", () => {
     ).toBeNull();
     expect(
       screen.getByRole("button", { name: "Annuler la tâche" }),
-    ).toBeEnabled();
+    ).not.toBeVisible();
+    await user.click(
+      screen.getByText("Plus d’actions", { selector: "summary" }),
+    );
+    await user.click(screen.getByRole("button", { name: "Annuler la tâche" }));
+    expect(
+      screen.getByLabelText("Motif d’annulation de la tâche (obligatoire)"),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Confirmer" })).toBeDisabled();
   });
 
-  it("n’offre les actions de session que si une session réelle les permet", () => {
+  it("place l’interruption de session dans Plus d’actions du contexte Agent", async () => {
+    const user = userEvent.setup();
     renderCard(
       makeTask({
         status: "running",
         assigned_actor_kind: "operator",
         assigned_actor_id: "operator:codex_cli",
       }),
+      true,
+      [makeSession()],
     );
 
-    const interruptTask = screen.getByRole("button", {
+    const interruptTask = screen.queryByRole("button", {
       name: "Interrompre la tâche",
     });
-    expect(interruptTask).toBeEnabled();
-    expect(interruptTask).toHaveClass("m24-action--danger");
+    expect(interruptTask).not.toBeVisible();
+    await user.click(screen.getByRole("tab", { name: "Agent et messages" }));
+    const agentContext = screen.getByRole("region", {
+      name: "Contexte agent de la tâche",
+    });
+    const sessionInterrupt = within(agentContext).queryByRole("button", {
+      name: "Interrompre la session",
+    });
+    expect(sessionInterrupt).not.toBeVisible();
+    await user.click(
+      within(agentContext).getByText("Plus d’actions", { selector: "summary" }),
+    );
+    await user.click(
+      within(agentContext).getByRole("button", {
+        name: "Interrompre la session",
+      }),
+    );
     expect(
-      screen.queryByRole("button", { name: "Interrompre la session" }),
-    ).toBeNull();
+      within(agentContext).getByLabelText(
+        "Motif d’interruption de la session (obligatoire)",
+      ),
+    ).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "Reprendre la session" }),
-    ).toBeNull();
+      within(agentContext).getByRole("button", {
+        name: "Confirmer l’interruption de la session",
+      }),
+    ).toBeDisabled();
   });
 });
 
@@ -221,6 +279,7 @@ describe("TaskCard session launch", () => {
     });
 
     renderCard(assignedOperatorTask());
+    await user.click(screen.getByRole("tab", { name: "Agent et messages" }));
 
     await user.click(
       await screen.findByRole("button", {
@@ -268,6 +327,7 @@ describe("TaskCard session launch", () => {
 
     const assigned = assignedOperatorTask();
     const { rerender } = renderCard(assigned);
+    await user.click(screen.getByRole("tab", { name: "Agent et messages" }));
     await user.click(
       await screen.findByRole("button", {
         name: "Ouvrir la session Codex CLI",
@@ -306,6 +366,7 @@ describe("TaskCard session launch", () => {
   });
 
   it("hides the action with the typed reason when the host probe fails", async () => {
+    const user = userEvent.setup();
     installFetch(({ url }) =>
       url.includes("/agent-sessions/capabilities")
         ? errorResponse(503, "workspace_local_unavailable")
@@ -313,6 +374,7 @@ describe("TaskCard session launch", () => {
     );
 
     renderCard(assignedOperatorTask());
+    await user.click(screen.getByRole("tab", { name: "Agent et messages" }));
 
     expect(
       await screen.findByText(
@@ -337,6 +399,7 @@ describe("TaskCard session launch", () => {
     });
 
     renderCard(assignedOperatorTask());
+    await user.click(screen.getByRole("tab", { name: "Agent et messages" }));
     await user.click(
       await screen.findByRole("button", {
         name: "Ouvrir la session Codex CLI",
@@ -383,6 +446,7 @@ describe("TaskCard Bridge entry point", () => {
     });
 
     renderCard();
+    await user.click(screen.getByRole("tab", { name: "Agent et messages" }));
 
     const toggle = screen.getByRole("button", { name: "Demander à Bridge" });
     expect(toggle).toHaveAttribute("aria-expanded", "false");
@@ -438,5 +502,323 @@ describe("TaskCard keyboard", () => {
       expected_status_version: 2,
     });
     expect(headersOf(request.init)["Idempotency-Key"]).toBeTruthy();
+  });
+});
+
+describe("TaskWorkspace list and selection", () => {
+  it("keeps status, priority, actor and text filters", async () => {
+    const user = userEvent.setup();
+    const matching = makeTask({
+      title: "Distinguer le C2 principal",
+      status: "running",
+      priority: "high",
+      assigned_actor_kind: "operator",
+      assigned_actor_id: "operator:codex_cli",
+    });
+    const other = makeTask({
+      id: "55555555-5555-4555-8555-555555555555",
+      task_key: "lead-2",
+      title: "Vérifier un domaine secondaire",
+      status: "ready",
+      priority: "low",
+      assigned_actor_kind: "human",
+      assigned_actor_id: "human:analyst",
+    });
+    renderWorkspace([other, matching]);
+
+    await user.selectOptions(screen.getByLabelText("Statut"), "running");
+    await user.selectOptions(screen.getByLabelText("Priorité"), "high");
+    await user.selectOptions(screen.getByLabelText("Assignation"), "operator");
+    await user.type(screen.getByRole("searchbox", { name: "Recherche" }), "C2");
+
+    const list = await screen.findByRole("list", { name: "Liste des tâches" });
+    expect(
+      within(list).getByText("Distinguer le C2 principal"),
+    ).toBeInTheDocument();
+    expect(
+      within(list).queryByText("Vérifier un domaine secondaire"),
+    ).toBeNull();
+  });
+
+  it("restores URL selection, preserves other params, supports Back and keyboard arrows", async () => {
+    const user = userEvent.setup();
+    const first = makeTask({
+      title: "Première tâche",
+      id: TASK_ID,
+      status: "ready",
+    });
+    const second = makeTask({
+      title: "Deuxième tâche",
+      id: "55555555-5555-4555-8555-555555555555",
+      task_key: "lead-2",
+      status: "completed",
+      updated_at: "2026-11-22T11:00:00Z",
+    });
+    window.history.replaceState(
+      {},
+      "",
+      `/?edition=E2&vue=plan&task=${second.id}`,
+    );
+    renderWorkspace([first, second]);
+
+    const list = await screen.findByRole("list", { name: "Liste des tâches" });
+    const rows = () =>
+      Array.from(
+        list.querySelectorAll<HTMLButtonElement>("button[aria-pressed]"),
+      );
+    await waitFor(() =>
+      expect(
+        rows().find((row) => row.textContent?.includes("Deuxième tâche")),
+      ).toHaveAttribute("aria-pressed", "true"),
+    );
+    expect(window.location.search).toContain("edition=E2");
+    expect(window.location.search).toContain("vue=plan");
+
+    const firstRow = rows().find((row) =>
+      row.textContent?.includes("Première tâche"),
+    );
+    if (firstRow === undefined) throw new Error("first row was not rendered");
+    await user.click(firstRow);
+    expect(firstRow).toHaveAttribute("aria-pressed", "true");
+    expect(window.location.search).toContain(`task=${first.id}`);
+    await user.keyboard("{ArrowDown}");
+    expect(
+      rows().find((row) => row.textContent?.includes("Deuxième tâche")),
+    ).toHaveAttribute("aria-pressed", "true");
+    expect(window.location.search).toContain(`task=${second.id}`);
+
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+    window.history.back();
+    await waitFor(() =>
+      expect(
+        rows().find((row) => row.textContent?.includes("Première tâche")),
+      ).toHaveAttribute("aria-pressed", "true"),
+    );
+  });
+
+  it("discards an unknown URL task and selects the default task", async () => {
+    const missingId = "99999999-9999-4999-8999-999999999999";
+    const task = makeTask();
+    window.history.replaceState({}, "", `/?vue=plan&task=${missingId}`);
+    renderWorkspace([task]);
+
+    expect(
+      await screen.findByText(/tâche indiquée dans l’URL est introuvable/i),
+    ).toBeInTheDocument();
+    const list = screen.getByRole("list", { name: "Liste des tâches" });
+    expect(
+      within(list).getByRole("button", { name: /Vérifier le domaine C2/ }),
+    ).toHaveAttribute("aria-pressed", "true");
+    expect(new URL(window.location.href).searchParams.has("task")).toBe(false);
+    expect(screen.queryByText(missingId)).toBeNull();
+  });
+
+  it("sorts 30 synthetic tasks and mounts only one detailed card without showing UUIDs in rows", async () => {
+    const statuses = [
+      ...Array.from({ length: 6 }, () => "completed" as const),
+      ...Array.from({ length: 6 }, () => "blocked" as const),
+      ...Array.from({ length: 6 }, () => "ready" as const),
+      ...Array.from({ length: 6 }, () => "running" as const),
+      ...Array.from({ length: 6 }, () => "awaiting_review" as const),
+    ];
+    const tasks = statuses.map((status, index) =>
+      makeTask({
+        id:
+          index === 0
+            ? TASK_ID
+            : `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+        task_key: `lead-${index}`,
+        title: `Tâche synthétique ${index}`,
+        status,
+        blocked_reason: status === "blocked" ? "dependency" : null,
+        result_refs:
+          status === "awaiting_review" ? [{ result: "pending" }] : [],
+        priority: index % 2 === 0 ? "low" : "critical",
+      }),
+    );
+    const { container } = renderWorkspace(tasks);
+
+    const list = await screen.findByRole("list", { name: "Liste des tâches" });
+    const rowButtons = Array.from(
+      list.querySelectorAll<HTMLButtonElement>("button[aria-pressed]"),
+    );
+    expect(rowButtons).toHaveLength(30);
+    expect(rowButtons[0]?.textContent).toContain("En revue");
+    expect(rowButtons[6]?.textContent).toContain("En cours");
+    expect(rowButtons[12]?.textContent).toContain("Prête");
+    expect(rowButtons[18]?.textContent).toContain("Bloquée");
+    expect(rowButtons[24]?.textContent).toContain("Terminée");
+    expect(container.querySelectorAll("article.m24-task-card")).toHaveLength(1);
+    expect(list.textContent).not.toContain(TASK_ID);
+  });
+
+  it("opens result details directly from the row", async () => {
+    const user = userEvent.setup();
+    const task = makeTask({
+      status: "awaiting_review",
+      result_refs: [{ source_url: "https://example.test/report" }],
+    });
+    renderWorkspace(
+      [task],
+      [
+        {
+          item_type: "contribution",
+          object_id: "contribution-1",
+          occurred_at: "2026-11-22T11:00:00Z",
+          task_id: task.id,
+          actor_kind: "operator",
+          actor_id: "codex",
+          summary: "Finding importé",
+          evidence: false,
+          refs: {
+            finding_id: "finding-1",
+            source_url: "https://example.test/source",
+          },
+          linked_event_ids: [],
+          linked_observation_ids: [],
+        },
+      ],
+    );
+
+    await user.click(
+      await screen.findByRole("button", {
+        name: `Voir les résultats de ${task.title}`,
+      }),
+    );
+    expect(
+      screen.getByRole("tab", { name: "Résultats et preuves" }),
+    ).toHaveAttribute("aria-selected", "true");
+    expect(
+      screen
+        .getAllByRole("link", { name: "Ouvrir la source" })
+        .some(
+          (link) => link.getAttribute("href") === "https://example.test/report",
+        ),
+    ).toBe(true);
+    expect(
+      await screen.findByText("Contribution agentique non vérifiée"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("finding-1")).toBeInTheDocument();
+    expect(screen.queryByText("Contribution confirmée")).toBeNull();
+  });
+
+  it("provides shortcuts to pending decisions and active agent sessions", async () => {
+    const user = userEvent.setup();
+    const decision = makeTask({
+      title: "Décision à prendre",
+      status: "awaiting_review",
+      result_refs: [{ result: "pending" }],
+    });
+    const active = makeTask({
+      id: "55555555-5555-4555-8555-555555555555",
+      task_key: "lead-2",
+      title: "Session en cours",
+      status: "running",
+      assigned_actor_kind: "operator",
+      assigned_actor_id: "operator:codex_cli",
+    });
+    renderWorkspace(
+      [active, decision],
+      [],
+      [makeSession({ task_id: active.id })],
+    );
+
+    await user.click(
+      await screen.findByRole("button", { name: "Nouvelles décisions (1)" }),
+    );
+    expect(
+      screen.getByRole("tab", { name: "Résultats et preuves" }),
+    ).toHaveAttribute("aria-selected", "true");
+    await user.click(
+      screen.getByRole("button", { name: "Sessions actives (1)" }),
+    );
+    expect(
+      screen.getByRole("tab", { name: "Agent et messages" }),
+    ).toHaveAttribute("aria-selected", "true");
+    expect(
+      screen.getByRole("heading", { name: "Session en cours" }),
+    ).toBeInTheDocument();
+  });
+});
+
+describe("TaskCard detail subviews and agent messages", () => {
+  it("provides Résumé, Résultats, Agent et messages, and Historique tabs", async () => {
+    const user = userEvent.setup();
+    installFetch(({ url }) => {
+      if (url.includes("/timeline"))
+        return jsonResponse({ items: [], next_cursor: null, has_more: false });
+      if (url.includes("/events"))
+        return jsonResponse({ items: [], next_cursor: null, has_more: false });
+      if (url.endsWith("/summary")) return jsonResponse(makeSummary());
+      return errorResponse(500, "unexpected_request");
+    });
+    renderCard();
+
+    expect(screen.getByRole("tablist")).toBeInTheDocument();
+    const tabs = screen.getAllByRole("tab");
+    expect(tabs.map((tab) => tab.textContent)).toEqual([
+      "Résumé",
+      "Résultats et preuves",
+      "Agent et messages",
+      "Historique",
+    ]);
+    for (const tab of tabs) {
+      expect(
+        document.getElementById(tab.getAttribute("aria-controls") ?? ""),
+      ).toHaveAttribute("role", "tabpanel");
+    }
+    await user.click(screen.getByRole("tab", { name: "Résultats et preuves" }));
+    expect(screen.getByText("Résultat déclaré")).toBeInTheDocument();
+    await user.click(screen.getByRole("tab", { name: "Agent et messages" }));
+    expect(
+      screen.getByRole("heading", { name: "Contexte agent de la tâche" }),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole("tab", { name: "Historique" }));
+    expect(
+      await screen.findByRole("heading", { name: "Historique de la tâche" }),
+    ).toBeInTheDocument();
+  });
+
+  it("sends an instruction from the selected task’s Agent et messages detail", async () => {
+    const user = userEvent.setup();
+    const task = makeTask({
+      status: "running",
+      assigned_actor_kind: "operator",
+      assigned_actor_id: "operator:codex_cli",
+    });
+    const session = makeSession();
+    const recorder = installFetch(({ url, init }) => {
+      if (url.endsWith("/summary")) return jsonResponse(makeSummary());
+      if (url.endsWith("/instructions") && init?.method === "POST") {
+        return jsonResponse({
+          state: "queued",
+          queue_position: 1,
+          delivered_live: false,
+        });
+      }
+      return errorResponse(500, "unexpected_request");
+    });
+    renderCard(task, true, [session]);
+    await user.click(screen.getByRole("tab", { name: "Agent et messages" }));
+    await user.type(
+      screen.getByLabelText(/Instruction en cours de session/),
+      "Vérifie la source liée au finding.",
+    );
+    await user.click(
+      screen.getByRole("button", { name: "Envoyer l’instruction" }),
+    );
+
+    expect(
+      await screen.findByText(/mise en file persistante \(position 1\)/),
+    ).toBeInTheDocument();
+    const request = recorder.calls.find((call) =>
+      call.url.endsWith("/instructions"),
+    );
+    expect(request).toBeDefined();
+    if (request === undefined)
+      throw new Error("agent instruction was not sent");
+    expect(bodyOf(request.init)).toMatchObject({
+      text: "Vérifie la source liée au finding.",
+    });
   });
 });

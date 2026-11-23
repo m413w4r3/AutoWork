@@ -8,19 +8,18 @@
  * states it, instead of silently retrying.
  */
 
-import { useId, useState } from "react";
+import { useId, useRef, useState } from "react";
+import type { KeyboardEvent } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 
 import { toWorkshopApiError } from "../api/client";
-import {
-  useInterruptAgentSession,
-  useResumeAgentSession,
-  type AgentSessionView,
-} from "../api/agentSessions";
+import type { AgentSessionView } from "../api/agentSessions";
 import {
   tasksKeys,
   useRunTaskCommand,
   useTaskEvents,
+  useTimeline,
+  type TimelineItemV1,
   type TaskView,
 } from "../api/tasks";
 import { useTransferTask, type TransferResult } from "../api/transfers";
@@ -38,44 +37,135 @@ import {
   TASK_PRIORITY_LABELS,
   TASK_STATUS_LABELS,
   VERIFICATION_LABELS,
+  TIMELINE_TYPE_LABELS,
 } from "./labels";
 import {
-  sessionForTask,
   taskActionAvailability,
   taskActionLabel,
   type TaskActionId,
 } from "./taskActions";
-import {
-  OpenSessionAction,
-  type OpenSessionFeedback,
-} from "./OpenSessionAction";
-import { sessionLaunchTarget } from "./sessionLaunch";
 import { TaskBridgePanel } from "./TaskBridgePanel";
+import { OperatorsPanel } from "./OperatorsPanel";
+import { TimelinePanel } from "./TimelinePanel";
 
 type TransferDestination = "human" | "codex_cli" | "claude_code";
 type SimpleCommand = "start" | "release" | "submit" | "unblock";
-type ReasonAction =
-  "interrupt_task" | "accept_result" | "request_changes" | "interrupt_session";
+type ReasonAction = "interrupt_task" | "accept_result" | "request_changes";
+
+export type TaskCardSubview = "summary" | "results" | "agent" | "history";
+
+const TASK_SUBVIEWS: ReadonlyArray<{ id: TaskCardSubview; label: string }> = [
+  { id: "summary", label: "Résumé" },
+  { id: "results", label: "Résultats et preuves" },
+  { id: "agent", label: "Agent et messages" },
+  { id: "history", label: "Historique" },
+];
 
 /** Destructive actions carry the danger variant, apart from the primary ones. */
 const DESTRUCTIVE_ACTIONS: ReadonlySet<TaskActionId> = new Set<TaskActionId>([
   "interrupt_task",
-  "interrupt_session",
 ]);
 
 const REASON_LABELS: Record<ReasonAction, string> = {
-  interrupt_task: "Motif d’interruption (obligatoire)",
+  interrupt_task: "Motif d’interruption de la tâche (obligatoire)",
   accept_result: "Motif d’acceptation (obligatoire)",
   request_changes: "Modifications demandées (obligatoire)",
-  interrupt_session: "Motif d’interruption de la session (obligatoire)",
 };
 
 const REASON_DONE: Record<ReasonAction, string> = {
   interrupt_task: "Interruption enregistrée.",
   accept_result: "Résultat accepté ; la tâche est terminée.",
   request_changes: "Modifications demandées ; la tâche repasse prête.",
-  interrupt_session: "Interruption de session demandée.",
 };
+
+function policyValue(
+  task: TaskView,
+  keys: readonly string[],
+): string | string[] | null {
+  for (const key of keys) {
+    const value = task.execution_policy[key];
+    if (typeof value === "string" && value.trim() !== "") return value;
+    if (Array.isArray(value)) {
+      const strings = value.filter(
+        (item): item is string => typeof item === "string",
+      );
+      if (strings.length > 0) return strings;
+    }
+  }
+  return null;
+}
+
+function PolicyValue({ value }: { value: string | string[] | null }) {
+  if (value === null) return <>Non renseigné</>;
+  if (Array.isArray(value))
+    return (
+      <>
+        {value.map((item, index) => (
+          <span key={`${item}-${index}`}>
+            {index === 0 ? "" : " · "}
+            {item}
+          </span>
+        ))}
+      </>
+    );
+  return <>{value}</>;
+}
+
+function safeSourceUrl(value: unknown): value is string {
+  return typeof value === "string" && /^https?:\/\//i.test(value);
+}
+
+function ResultEvidence({ item }: { item: TimelineItemV1 }) {
+  const status = item.evidence
+    ? "Preuve canonique"
+    : item.item_type === "contribution"
+      ? "Contribution agentique non vérifiée"
+      : item.item_type === "bridge_consultation"
+        ? "Avis Bridge — non probant"
+        : "Élément de travail — non probant";
+  return (
+    <li className="m24-result-evidence">
+      <div className="m24-task-card__header">
+        <time dateTime={item.occurred_at}>
+          {formatTimestamp(item.occurred_at)}
+        </time>
+        <span className="m24-badge">
+          {TIMELINE_TYPE_LABELS[item.item_type]}
+        </span>
+        <span
+          className={
+            item.evidence
+              ? "m24-badge m24-badge--evidence"
+              : "m24-badge m24-badge--muted"
+          }
+        >
+          {status}
+        </span>
+      </div>
+      <p>{item.summary}</p>
+      {Object.entries(item.refs).length === 0 ? null : (
+        <dl className="m24-metadata m24-metadata--refs">
+          {Object.entries(item.refs)
+            .filter(([key]) => key !== "task_id")
+            .map(([key, value]) => (
+              <div key={`${item.object_id}-${key}`}>
+                <dt>{key.replaceAll("_", " ")}</dt>
+                <dd>
+                  {safeSourceUrl(value) ? (
+                    <a href={value} target="_blank" rel="noreferrer">
+                      Ouvrir la source
+                    </a>
+                  ) : (
+                    <code>{value}</code>
+                  )}
+                </dd>
+              </div>
+            ))}
+        </dl>
+      )}
+    </li>
+  );
+}
 
 function notePathFor(task: TaskView): string {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -98,6 +188,9 @@ export interface TaskCardProps {
   allTasks: readonly TaskView[];
   sessions: readonly AgentSessionView[];
   workspaceAvailable: boolean | null;
+  activeSubview?: TaskCardSubview;
+  onSubviewChange?: (subview: TaskCardSubview) => void;
+  onTaskSelect?: (taskId: string) => void;
 }
 
 export function TaskCard({
@@ -106,24 +199,33 @@ export function TaskCard({
   allTasks,
   sessions,
   workspaceAvailable,
+  activeSubview,
+  onSubviewChange,
+  onTaskSelect,
 }: TaskCardProps) {
   const baseId = useId();
+  const tabRefs = useRef(new Map<TaskCardSubview, HTMLButtonElement>());
   const queryClient = useQueryClient();
   const command = useRunTaskCommand(investigationId, task.id);
   const transfer = useTransferTask(investigationId, task.id);
   const note = useWriteWorkspaceNote(investigationId);
-  const session = sessionForTask(sessions, task.id);
-  const interrupt = useInterruptAgentSession(
-    investigationId,
-    session?.id ?? "",
-  );
-  const resume = useResumeAgentSession(investigationId, session?.id ?? "");
-  const [resultsOpen, setResultsOpen] = useState(false);
+  const [internalSubview, setInternalSubview] =
+    useState<TaskCardSubview>("summary");
+  const currentSubview = activeSubview ?? internalSubview;
+  const changeSubview = (subview: TaskCardSubview) => {
+    setInternalSubview(subview);
+    onSubviewChange?.(subview);
+  };
   const events = useTaskEvents(
     investigationId,
     task.id,
     { limit: 20 },
-    { enabled: resultsOpen },
+    { enabled: currentSubview === "results" },
+  );
+  const timeline = useTimeline(
+    investigationId,
+    { limit: 50 },
+    { enabled: currentSubview === "results" },
   );
   const [message, setMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -140,35 +242,19 @@ export function TaskCard({
     workspaceAvailable,
     sessions,
   });
-  // An operator assignment without any active or resumable session: the
-  // handoff exists, so the cockpit may offer an explicit session opening.
-  const launchTarget = session === null ? sessionLaunchTarget(task) : null;
+  const taskActions = actions.filter(
+    (action) => action !== "interrupt_session" && action !== "resume_session",
+  );
   const subtasks = allTasks.filter((item) => item.parent_task_id === task.id);
   const parent =
     task.parent_task_id === null
       ? undefined
       : allTasks.find((item) => item.id === task.parent_task_id);
-  const busy =
-    command.isPending ||
-    transfer.isPending ||
-    note.isPending ||
-    interrupt.isPending ||
-    resume.isPending;
+  const busy = command.isPending || transfer.isPending || note.isPending;
 
   function finish(text: string) {
     setMessage(text);
     setErrorMessage(null);
-  }
-
-  // The opening action disappears once the session exists or the task is
-  // `running`; its feedback stays on this card, which survives both refetches.
-  function showOpenSessionFeedback(feedback: OpenSessionFeedback) {
-    if (feedback.kind === "success") {
-      finish(feedback.text);
-      return;
-    }
-    setMessage(null);
-    setErrorMessage(feedback.text);
   }
 
   function handleMutationError(error: unknown) {
@@ -274,7 +360,13 @@ export function TaskCard({
     const expected_status_version = task.status_version;
     const options = {
       onSuccess: () => {
-        finish(REASON_DONE[reasonAction]);
+        finish(
+          reasonAction === "interrupt_task" &&
+            task.status !== "running" &&
+            task.status !== "awaiting_input"
+            ? "Annulation de la tâche enregistrée."
+            : REASON_DONE[reasonAction],
+        );
         setReasonAction(null);
         setReasonText("");
       },
@@ -290,13 +382,11 @@ export function TaskCard({
         { command: "accept_result", expected_status_version, reason },
         options,
       );
-    } else if (reasonAction === "request_changes") {
+    } else {
       command.mutate(
         { command: "request_changes", expected_status_version, reason },
         options,
       );
-    } else if (session !== null) {
-      interrupt.mutate(reason, options);
     }
   }
 
@@ -316,15 +406,6 @@ export function TaskCard({
         onError: handleMutationError,
       },
     );
-  }
-
-  function resumeSession() {
-    setMessage(null);
-    setErrorMessage(null);
-    resume.mutate(undefined, {
-      onSuccess: () => finish("Session reprise par l’adaptateur."),
-      onError: handleMutationError,
-    });
   }
 
   function onAction(action: TaskActionId) {
@@ -355,19 +436,13 @@ export function TaskCard({
         runSimple("submit", "Résultat soumis pour revue humaine.");
         return;
       case "examine_results":
-        setResultsOpen((open) => !open);
+        changeSubview("results");
         return;
       case "accept_result":
         openReason("accept_result");
         return;
       case "request_changes":
         openReason("request_changes");
-        return;
-      case "interrupt_session":
-        openReason("interrupt_session");
-        return;
-      case "resume_session":
-        resumeSession();
         return;
       case "interrupt_task":
         openReason("interrupt_task");
@@ -377,6 +452,40 @@ export function TaskCard({
         return;
     }
   }
+
+  function tabPanelId(subview: TaskCardSubview) {
+    return `${baseId}-${subview}-panel`;
+  }
+
+  function handleTabKeyDown(
+    event: KeyboardEvent<HTMLButtonElement>,
+    index: number,
+  ) {
+    let nextIndex: number | null = null;
+    if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+      nextIndex = (index + 1) % TASK_SUBVIEWS.length;
+    } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+      nextIndex = (index - 1 + TASK_SUBVIEWS.length) % TASK_SUBVIEWS.length;
+    } else if (event.key === "Home") {
+      nextIndex = 0;
+    } else if (event.key === "End") {
+      nextIndex = TASK_SUBVIEWS.length - 1;
+    }
+    if (nextIndex === null) return;
+    event.preventDefault();
+    const next = TASK_SUBVIEWS[nextIndex];
+    if (next === undefined) return;
+    changeSubview(next.id);
+    tabRefs.current.get(next.id)?.focus();
+  }
+
+  const resultItems = (timeline.data?.items ?? []).filter(
+    (item) =>
+      item.task_id === task.id &&
+      ["tool_invocation", "observation", "contribution"].includes(
+        item.item_type,
+      ),
+  );
 
   return (
     <article
@@ -390,149 +499,403 @@ export function TaskCard({
         <span className={`m24-badge m24-badge--${task.status}`}>
           {TASK_STATUS_LABELS[task.status]}
         </span>
+        <span className="m24-muted">{assignmentLabel(task)}</span>
       </header>
 
-      <dl className="m24-metadata">
-        <div>
-          <dt>Statut</dt>
-          <dd>
-            {TASK_STATUS_LABELS[task.status]} · version {task.status_version}
-          </dd>
-        </div>
-        <div>
-          <dt>Priorité</dt>
-          <dd>{TASK_PRIORITY_LABELS[task.priority]}</dd>
-        </div>
-        <div>
-          <dt>Assignation</dt>
-          <dd>{assignmentLabel(task)}</dd>
-        </div>
-        <div>
-          <dt>Clé / identifiant</dt>
-          <dd>
-            <code>{task.task_key}</code> ·{" "}
-            <code title={task.id}>{task.id.slice(0, 8)}…</code>
-          </dd>
-        </div>
-        <div>
-          <dt>Vérification du résultat</dt>
-          <dd>{VERIFICATION_LABELS[task.result_verification_status]}</dd>
-        </div>
-        <div>
-          <dt>Expiration du bail</dt>
-          <dd>{formatTimestamp(task.lease_expires_at)}</dd>
-        </div>
-        {task.blocked_reason === null ? null : (
-          <div>
-            <dt>Blocage</dt>
-            <dd>{BLOCKED_REASON_LABELS[task.blocked_reason]}</dd>
-          </div>
-        )}
-      </dl>
-
-      <p>
-        <strong>Question :</strong> {orPlaceholder(task.question)}
-      </p>
-      <p>
-        <strong>Objectif :</strong> {orPlaceholder(task.objective)}
-      </p>
-
-      <dl className="m24-metadata m24-metadata--refs">
-        <div>
-          <dt>Claims</dt>
-          <dd>{listOrPlaceholder(task.claim_refs)}</dd>
-        </div>
-        <div>
-          <dt>Preuves de départ</dt>
-          <dd>{listOrPlaceholder(task.evidence_refs)}</dd>
-        </div>
-        <div>
-          <dt>Échantillons</dt>
-          <dd>{listOrPlaceholder(task.sample_refs)}</dd>
-        </div>
-        <div>
-          <dt>Capacités requises</dt>
-          <dd>{listOrPlaceholder(task.required_capabilities)}</dd>
-        </div>
-        <div>
-          <dt>Sorties attendues</dt>
-          <dd>{listOrPlaceholder(task.expected_outputs)}</dd>
-        </div>
-      </dl>
-
-      {parent === undefined ? null : (
+      <div className="m24-task-card__prompt">
         <p>
-          Sous-tâche de{" "}
-          <a href={`#task-${parent.id}`}>
-            {parent.title} ({TASK_STATUS_LABELS[parent.status]})
-          </a>
+          <strong>Question :</strong> {orPlaceholder(task.question)}
         </p>
-      )}
-      {subtasks.length === 0 ? null : (
-        <section aria-label="Sous-tâches">
-          <h5>Sous-tâches</h5>
-          <ul className="m24-subtasks">
-            {subtasks.map((subtask) => (
-              <li key={subtask.id}>
-                <a href={`#task-${subtask.id}`}>{subtask.title}</a>{" "}
-                <span className="m24-badge">
-                  {TASK_STATUS_LABELS[subtask.status]}
-                </span>
-              </li>
-            ))}
-          </ul>
-        </section>
-      )}
+        <p>
+          <strong>Objectif :</strong> {orPlaceholder(task.objective)}
+        </p>
+      </div>
 
       <div
         className="m24-task-card__actions"
         role="group"
         aria-label={`Actions pour ${task.title}`}
       >
-        {actions.map((action) => (
-          <button
-            key={action}
-            type="button"
-            className={
-              DESTRUCTIVE_ACTIONS.has(action)
-                ? "m24-action m24-action--danger"
-                : "m24-action"
-            }
-            onClick={() => onAction(action)}
-            disabled={busy}
-            aria-expanded={
-              action === "examine_results" ? resultsOpen : undefined
-            }
-            title={
-              action === "resume_task"
-                ? "Remettre une tâche bloquée en état prêt."
-                : action === "resume_session"
-                  ? "Reprendre la session de l’agent si l’adaptateur le prouve."
+        {taskActions
+          .filter((action) => !DESTRUCTIVE_ACTIONS.has(action))
+          .map((action) => (
+            <button
+              key={action}
+              type="button"
+              className="m24-action"
+              onClick={() => onAction(action)}
+              disabled={busy}
+              title={
+                action === "resume_task"
+                  ? "Remettre une tâche bloquée en état prêt."
                   : undefined
-            }
-          >
-            {taskActionLabel(action, task)}
-          </button>
-        ))}
+              }
+            >
+              {taskActionLabel(action, task)}
+            </button>
+          ))}
       </div>
       <p className="m24-muted">
         Les attributions et transferts créent une passation versionnée ; la
-        session Codex / Claude Code s’ouvre ensuite par une action explicite,
-        uniquement si le sondage des capacités atteste le confinement isolé du
-        CLI. L’attribution seule ne démarre aucun agent.
+        session Codex / Claude Code ne s’ouvre que si le sondage de capacités
+        atteste le confinement isolé du CLI.
       </p>
 
-      <TaskBridgePanel investigationId={investigationId} task={task} />
+      {taskActions.some((action) => DESTRUCTIVE_ACTIONS.has(action)) ? (
+        <details className="m24-more-actions">
+          <summary>Plus d’actions</summary>
+          <div
+            className="m24-task-card__actions"
+            role="group"
+            aria-label={`Actions secondaires pour ${task.title}`}
+          >
+            {taskActions
+              .filter((action) => DESTRUCTIVE_ACTIONS.has(action))
+              .map((action) => (
+                <button
+                  key={action}
+                  type="button"
+                  className="m24-action m24-action--danger"
+                  onClick={() => onAction(action)}
+                  disabled={busy}
+                >
+                  {taskActionLabel(action, task)}
+                </button>
+              ))}
+          </div>
+        </details>
+      ) : null}
 
-      {launchTarget === null ? null : (
-        <div className="m24-task-card__session-launch">
-          <OpenSessionAction
-            investigationId={investigationId}
-            target={launchTarget}
-            onFeedback={showOpenSessionFeedback}
-          />
-        </div>
-      )}
+      <div
+        className="m24-task-card__tablist"
+        role="tablist"
+        aria-label={`Vues de ${task.title}`}
+      >
+        {TASK_SUBVIEWS.map((subview, index) => (
+          <button
+            key={subview.id}
+            ref={(element) => {
+              if (element) tabRefs.current.set(subview.id, element);
+              else tabRefs.current.delete(subview.id);
+            }}
+            id={`${baseId}-${subview.id}-tab`}
+            type="button"
+            role="tab"
+            aria-selected={currentSubview === subview.id}
+            aria-controls={tabPanelId(subview.id)}
+            tabIndex={currentSubview === subview.id ? 0 : -1}
+            className={
+              currentSubview === subview.id
+                ? "m24-task-tab m24-task-tab--active"
+                : "m24-task-tab"
+            }
+            onClick={() => changeSubview(subview.id)}
+            onKeyDown={(event) => handleTabKeyDown(event, index)}
+          >
+            {subview.label}
+          </button>
+        ))}
+      </div>
+
+      {TASK_SUBVIEWS.map((subview) => (
+        <section
+          key={subview.id}
+          id={tabPanelId(subview.id)}
+          role="tabpanel"
+          aria-labelledby={`${baseId}-${subview.id}-tab`}
+          tabIndex={0}
+          hidden={currentSubview !== subview.id}
+          className="m24-task-card__view"
+        >
+          {currentSubview === subview.id ? (
+            <>
+              {subview.id === "summary" ? (
+                <>
+                  <dl className="m24-metadata">
+                    <div>
+                      <dt>Statut</dt>
+                      <dd>
+                        {TASK_STATUS_LABELS[task.status]} · version{" "}
+                        {task.status_version}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Priorité</dt>
+                      <dd>{TASK_PRIORITY_LABELS[task.priority]}</dd>
+                    </div>
+                    <div>
+                      <dt>Vérification du résultat</dt>
+                      <dd>
+                        {VERIFICATION_LABELS[task.result_verification_status]}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Expiration du bail</dt>
+                      <dd>{formatTimestamp(task.lease_expires_at)}</dd>
+                    </div>
+                    <div>
+                      <dt>Clé de tâche</dt>
+                      <dd>
+                        <code>{task.task_key}</code>
+                      </dd>
+                    </div>
+                    {task.blocked_reason === null ? null : (
+                      <div>
+                        <dt>Blocage</dt>
+                        <dd>{BLOCKED_REASON_LABELS[task.blocked_reason]}</dd>
+                      </div>
+                    )}
+                  </dl>
+                  <dl className="m24-metadata m24-metadata--refs">
+                    <div>
+                      <dt>Contexte</dt>
+                      <dd>
+                        <PolicyValue
+                          value={policyValue(task, [
+                            "context",
+                            "cti_justification",
+                            "interest",
+                          ])}
+                        />
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Limites</dt>
+                      <dd>
+                        <PolicyValue value={policyValue(task, ["limits"])} />
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Critères de conclusion</dt>
+                      <dd>
+                        <PolicyValue
+                          value={policyValue(task, ["conclusion_criteria"])}
+                        />
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Préconditions</dt>
+                      <dd>
+                        {listOrPlaceholder(
+                          Array.isArray(task.execution_policy.preconditions)
+                            ? task.execution_policy.preconditions.filter(
+                                (item): item is string =>
+                                  typeof item === "string",
+                              )
+                            : [],
+                        )}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Claims</dt>
+                      <dd>{listOrPlaceholder(task.claim_refs)}</dd>
+                    </div>
+                    <div>
+                      <dt>Preuves de départ</dt>
+                      <dd>{listOrPlaceholder(task.evidence_refs)}</dd>
+                    </div>
+                    <div>
+                      <dt>Échantillons</dt>
+                      <dd>{listOrPlaceholder(task.sample_refs)}</dd>
+                    </div>
+                    <div>
+                      <dt>Capacités requises</dt>
+                      <dd>{listOrPlaceholder(task.required_capabilities)}</dd>
+                    </div>
+                    <div>
+                      <dt>Chemins autorisés</dt>
+                      <dd>{listOrPlaceholder(task.allowed_workspace_paths)}</dd>
+                    </div>
+                    <div>
+                      <dt>Sorties attendues</dt>
+                      <dd>{listOrPlaceholder(task.expected_outputs)}</dd>
+                    </div>
+                  </dl>
+                  {parent === undefined ? null : (
+                    <p>
+                      Sous-tâche de{" "}
+                      <a
+                        href={`#task-${parent.id}`}
+                        onClick={(event) => {
+                          if (onTaskSelect !== undefined) {
+                            event.preventDefault();
+                            onTaskSelect(parent.id);
+                          }
+                        }}
+                      >
+                        {parent.title} ({TASK_STATUS_LABELS[parent.status]})
+                      </a>
+                    </p>
+                  )}
+                  {subtasks.length === 0 ? null : (
+                    <section aria-label="Sous-tâches">
+                      <h5>Sous-tâches</h5>
+                      <ul className="m24-subtasks">
+                        {subtasks.map((subtask) => (
+                          <li key={subtask.id}>
+                            <a
+                              href={`#task-${subtask.id}`}
+                              onClick={(event) => {
+                                if (onTaskSelect !== undefined) {
+                                  event.preventDefault();
+                                  onTaskSelect(subtask.id);
+                                }
+                              }}
+                            >
+                              {subtask.title}
+                            </a>{" "}
+                            <span className="m24-badge">
+                              {TASK_STATUS_LABELS[subtask.status]}
+                            </span>
+                          </li>
+                        ))}
+                      </ul>
+                    </section>
+                  )}
+                </>
+              ) : null}
+
+              {subview.id === "results" ? (
+                <section
+                  className="m24-task-card__results"
+                  aria-label="Résultats et preuves"
+                >
+                  <h5>
+                    Résultat déclaré{" "}
+                    <span className="m24-badge m24-badge--muted">
+                      Non probant avant vérification
+                    </span>
+                  </h5>
+                  <p>
+                    État de vérification :{" "}
+                    <strong>
+                      {VERIFICATION_LABELS[task.result_verification_status]}
+                    </strong>
+                  </p>
+                  {task.result_refs.length === 0 ? (
+                    <p>Aucun résultat soumis.</p>
+                  ) : (
+                    <ul>
+                      {task.result_refs.map((reference, index) => (
+                        <li key={`${task.task_key}-result-${index}`}>
+                          {Object.entries(reference)
+                            .filter(([key]) => key !== "task_id")
+                            .map(([key, value]) => (
+                              <span
+                                key={`${index}-${key}`}
+                                className="m24-result-ref"
+                              >
+                                <strong>{key.replaceAll("_", " ")} :</strong>{" "}
+                                {safeSourceUrl(value) ? (
+                                  <a
+                                    href={value}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                  >
+                                    Ouvrir la source
+                                  </a>
+                                ) : (
+                                  <code>
+                                    {typeof value === "string"
+                                      ? value
+                                      : JSON.stringify(value)}
+                                  </code>
+                                )}
+                              </span>
+                            ))}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  <h5>Analyses, observations et contributions liées</h5>
+                  {timeline.isPending ? (
+                    <p role="status">Chargement des résultats liés…</p>
+                  ) : timeline.isError ? (
+                    <p role="alert" className="error-message">
+                      Éléments liés indisponibles :{" "}
+                      {toWorkshopApiError(timeline.error).code}.
+                    </p>
+                  ) : resultItems.length === 0 ? (
+                    <p>
+                      Aucune analyse, observation ou contribution liée dans la
+                      chronologie disponible.
+                    </p>
+                  ) : (
+                    <ul className="m24-result-evidence-list">
+                      {resultItems.map((item) => (
+                        <ResultEvidence
+                          key={`${item.item_type}-${item.object_id}`}
+                          item={item}
+                        />
+                      ))}
+                    </ul>
+                  )}
+                  <h5>Événements récents</h5>
+                  {events.isPending ? (
+                    <p role="status">Chargement du journal…</p>
+                  ) : events.isError ? (
+                    <p role="alert" className="error-message">
+                      Journal indisponible :{" "}
+                      {toWorkshopApiError(events.error).code}
+                    </p>
+                  ) : events.data.items.length === 0 ? (
+                    <p>Aucun événement de tâche.</p>
+                  ) : (
+                    <ol className="m24-events">
+                      {events.data.items.map((event) => (
+                        <li key={event.id}>
+                          <time dateTime={event.occurred_at}>
+                            {formatTimestamp(event.occurred_at)}
+                          </time>{" "}
+                          <span className="m24-badge">
+                            {TASK_EVENT_LABELS[event.event_type]}
+                          </span>{" "}
+                          {event.from_status === null ||
+                          event.to_status === null
+                            ? null
+                            : `(${TASK_STATUS_LABELS[event.from_status]} → ${TASK_STATUS_LABELS[event.to_status]}) `}
+                          <span>
+                            {TASK_ACTOR_LABELS[event.actor.actor_kind]}
+                          </span>
+                          {event.actor.actor_id === "" ? null : (
+                            <span>
+                              {" "}
+                              · {actorRefLabel(event.actor.actor_id)}
+                            </span>
+                          )}
+                        </li>
+                      ))}
+                    </ol>
+                  )}
+                </section>
+              ) : null}
+
+              {subview.id === "agent" ? (
+                <div className="m24-task-agent-context">
+                  <OperatorsPanel
+                    investigationId={investigationId}
+                    taskId={task.id}
+                    task={task}
+                    sessionContext={sessions}
+                  />
+                  <TaskBridgePanel
+                    investigationId={investigationId}
+                    task={task}
+                  />
+                </div>
+              ) : null}
+
+              {subview.id === "history" ? (
+                <TimelinePanel
+                  investigationId={investigationId}
+                  taskId={task.id}
+                  title="Historique de la tâche"
+                />
+              ) : null}
+            </>
+          ) : null}
+        </section>
+      ))}
 
       {message === null ? null : (
         <p role="status" className="m24-message">
@@ -548,7 +911,11 @@ export function TaskCard({
       {reasonAction === null ? null : (
         <div className="m24-inline-form">
           <label htmlFor={`${baseId}-reason`}>
-            {REASON_LABELS[reasonAction]}
+            {reasonAction === "interrupt_task" &&
+            task.status !== "running" &&
+            task.status !== "awaiting_input"
+              ? "Motif d’annulation de la tâche (obligatoire)"
+              : REASON_LABELS[reasonAction]}
           </label>
           <textarea
             id={`${baseId}-reason`}
@@ -661,63 +1028,6 @@ export function TaskCard({
             </button>
           </div>
         </div>
-      ) : null}
-
-      {resultsOpen ? (
-        <section
-          className="m24-task-card__results"
-          aria-label="Résultats de la tâche"
-        >
-          <h5>
-            Résultats soumis <span className="m24-badge">Non probant</span>
-          </h5>
-          <p className="m24-muted">
-            Références déclarées par l’exécutant : elles ne constituent pas une
-            observation canonique. Seules les contributions importées puis
-            vérifiées font foi.
-          </p>
-          {task.result_refs.length === 0 ? (
-            <p>Aucun résultat soumis.</p>
-          ) : (
-            <ul>
-              {task.result_refs.map((reference, index) => (
-                <li key={`${task.id}-result-${index}`}>
-                  <code>{JSON.stringify(reference)}</code>
-                </li>
-              ))}
-            </ul>
-          )}
-          <h5>Journal borné (20 derniers événements, non probant)</h5>
-          {events.isPending ? (
-            <p role="status">Chargement du journal…</p>
-          ) : events.isError ? (
-            <p role="alert" className="error-message">
-              Journal indisponible : {toWorkshopApiError(events.error).code}
-            </p>
-          ) : events.data.items.length === 0 ? (
-            <p>Aucun événement de tâche.</p>
-          ) : (
-            <ol className="m24-events">
-              {events.data.items.map((event) => (
-                <li key={event.id}>
-                  <time dateTime={event.occurred_at}>
-                    {formatTimestamp(event.occurred_at)}
-                  </time>{" "}
-                  <span className="m24-badge">
-                    {TASK_EVENT_LABELS[event.event_type]}
-                  </span>{" "}
-                  {event.from_status === null || event.to_status === null
-                    ? null
-                    : `(${TASK_STATUS_LABELS[event.from_status]} → ${TASK_STATUS_LABELS[event.to_status]}) `}
-                  <span>{TASK_ACTOR_LABELS[event.actor.actor_kind]}</span>
-                  {event.actor.actor_id === "" ? null : (
-                    <span> · {actorRefLabel(event.actor.actor_id)}</span>
-                  )}
-                </li>
-              ))}
-            </ol>
-          )}
-        </section>
       ) : null}
     </article>
   );

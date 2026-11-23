@@ -16,7 +16,7 @@ afterEach(() => {
 });
 
 describe("PlanTasksView", () => {
-  it("assemble le plan, les tâches, les opérateurs et la chronologie", async () => {
+  it("assemble le plan, le poste de travail et l’activité globale repliable", async () => {
     installFetch(({ url }) => {
       if (url.endsWith(`/api/investigations/${INVESTIGATION_ID}`)) {
         return jsonResponse({ version: 1 });
@@ -79,10 +79,13 @@ describe("PlanTasksView", () => {
       screen.getByRole("heading", { name: "Tâches", level: 3 }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("heading", { name: "Opérateurs actifs", level: 3 }),
+      screen.getByText("Activité globale", { selector: "summary" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("heading", { name: "Chronologie commune", level: 3 }),
+      screen.queryByRole("heading", { name: "Opérateurs actifs" }),
+    ).toBeNull();
+    expect(
+      screen.getByRole("region", { name: "Détail de la tâche sélectionnée" }),
     ).toBeInTheDocument();
     expect(
       await screen.findByText(/Aucun plan pour cette enquête/),
