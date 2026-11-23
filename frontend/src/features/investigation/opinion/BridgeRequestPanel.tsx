@@ -38,6 +38,19 @@ function toggle(list: string[], id: string): string[] {
   return list.includes(id) ? list.filter((item) => item !== id) : [...list, id];
 }
 
+/**
+ * F1 task-card links open this view as
+ * `?vue=opinion&task_id=<id>&bridge_intent=draft_text|review_text`.
+ * Only these two values are canonical; anything else falls back to drafting.
+ */
+function bridgeIntentFromParam(value: string | null): DraftingIntent {
+  return value === "review_text" ? "verifier" : "rediger";
+}
+
+function searchParam(name: string): string | null {
+  return new URL(window.location.href).searchParams.get(name);
+}
+
 export function BridgeRequestPanel({
   investigationId,
   opinion,
@@ -69,7 +82,12 @@ export function BridgeRequestPanel({
 }) {
   const queryClient = useQueryClient();
   const request = useRequestNoteProposal(investigationId);
-  const [intent, setIntent] = useState<DraftingIntent>("rediger");
+  // A task-card link pre-fills the request; the URL is read once at mount so a
+  // later manual change is never overwritten.
+  const [requestedTaskId] = useState(() => searchParam("task_id") ?? "");
+  const [intent, setIntent] = useState<DraftingIntent>(() =>
+    bridgeIntentFromParam(searchParam("bridge_intent")),
+  );
   const [findingRefs, setFindingRefs] = useState<string[]>([]);
   const [observationRefs, setObservationRefs] = useState<string[]>([]);
   const [taskId, setTaskId] = useState("");
@@ -84,10 +102,23 @@ export function BridgeRequestPanel({
   const selectedIntent = getDraftingIntent(intent);
 
   useEffect(() => {
-    if (selectedIntent.requiresCurrentBridgeNote && !reviewAvailable) {
+    if (requestedTaskId === "" || taskId !== "") return;
+    if (tasks.some((task) => task.id === requestedTaskId)) {
+      setTaskId(requestedTaskId);
+    }
+  }, [requestedTaskId, taskId, tasks]);
+
+  useEffect(() => {
+    // The anchor is selected asynchronously; until one is chosen the note
+    // existence is unknown, so a requested review intent is not discarded.
+    if (
+      selectedIntent.requiresCurrentBridgeNote &&
+      !reviewAvailable &&
+      anchor !== ""
+    ) {
       setIntent("rediger");
     }
-  }, [reviewAvailable, selectedIntent.requiresCurrentBridgeNote]);
+  }, [anchor, reviewAvailable, selectedIntent.requiresCurrentBridgeNote]);
 
   const sourcesMissing =
     noteState !== "unresolved" &&

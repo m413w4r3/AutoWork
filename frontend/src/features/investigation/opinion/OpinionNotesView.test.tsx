@@ -587,6 +587,7 @@ async function openProposalReview() {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  window.history.replaceState({}, "", "/");
 });
 
 describe("OpinionNotesView — notes Bridge par ancre", () => {
@@ -903,5 +904,56 @@ describe("OpinionNotesView — notes Bridge par ancre", () => {
     expect(
       await screen.findByText(/Réépinglage requis dans la composition/),
     ).toBeInTheDocument();
+  });
+
+  it("pré-remplit la tâche et l’intention de rédaction depuis un lien de carte tâche", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState(
+      {},
+      "",
+      `/?vue=opinion&task_id=${TASK_ID}&bridge_intent=draft_text`,
+    );
+    const { calls } = renderView();
+
+    expect(
+      await screen.findByRole("combobox", {
+        name: "Tâche liée (facultatif)",
+      }),
+    ).toHaveValue(TASK_ID);
+    expect(screen.getByRole("radio", { name: "Rédiger" })).toBeChecked();
+
+    const submit = screen.getByRole("button", { name: "Demander à Bridge" });
+    await waitFor(() => expect(submit).toBeEnabled());
+    await user.click(submit);
+
+    await waitFor(() => {
+      const request = calls.find(
+        (call) =>
+          call.url ===
+            `/api/investigations/${INVESTIGATION_ID}/note-proposals` &&
+          call.init?.method === "POST",
+      );
+      expect(request).toBeDefined();
+      expect(bodyOf(request?.init)).toMatchObject({
+        task_id: TASK_ID,
+        consultation_type: "draft_text",
+      });
+    });
+  });
+
+  it("présélectionne la vérification depuis un lien review_text", async () => {
+    window.history.replaceState(
+      {},
+      "",
+      `/?vue=opinion&task_id=${TASK_ID}&bridge_intent=review_text`,
+    );
+    renderView();
+
+    const review = await screen.findByRole("radio", { name: "Vérifier" });
+    await waitFor(() => expect(review).toBeChecked());
+    expect(
+      screen.getByRole("combobox", { name: "Tâche liée (facultatif)" }),
+    ).toHaveValue(TASK_ID);
+    expect(screen.getByRole("radio", { name: "Rédiger" })).not.toBeChecked();
   });
 });
