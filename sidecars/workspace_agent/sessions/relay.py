@@ -80,6 +80,7 @@ _SPECS_BY_BROKER: dict[str, catalog.ToolSpec] = {
 }
 _TASK_COMMAND_TIMEOUT_SECONDS = _SPECS_BY_BROKER["task.heartbeat"].timeout_seconds
 _HANDOFF_TIMEOUT_SECONDS = _SPECS_BY_BROKER["handoff.submit"].timeout_seconds
+_INSTRUCTION_TIMEOUT_SECONDS = _SPECS_BY_BROKER["instruction.pending"].timeout_seconds
 
 
 def _route_pattern(template: str, names: Collection[str]) -> re.Pattern[str]:
@@ -92,7 +93,16 @@ def _route_pattern(template: str, names: Collection[str]) -> re.Pattern[str]:
 _BROKER_ROUTE = _route_pattern(catalog.BROKER_TOOL_PATH, ("investigation_id", "session_id"))
 _TASK_ROUTE = _route_pattern(catalog.TASK_COMMAND_PATH, ("investigation_id", "task_id"))
 _HANDOFF_ROUTE = _route_pattern(catalog.HANDOFF_PATH, ("investigation_id",))
+_INSTRUCTIONS_ROUTE = _route_pattern(catalog.INSTRUCTIONS_PATH, ("investigation_id", "session_id"))
 _ALLOWED_TASK_COMMANDS: frozenset[str] = frozenset({"heartbeat", "submit"})
+# The only operator actions on the session instructions route. ``enqueue`` and
+# ``cancel`` are human actions and never leave the shim.
+_ALLOWED_INSTRUCTION_ACTIONS: frozenset[str] = frozenset({"pull", "ack"})
+_MAX_INSTRUCTION_IDS = 32
+# An ack body is 32 UUIDs at most; pull carries only the action. This bound is
+# far below the global 1 MiB request limit for a route with no free text.
+INSTRUCTION_BODY_LIMIT_BYTES = 16 * 1024
+_INSTRUCTION_ID_PATTERN = re.compile(rf"^{_UUID}$")
 
 
 class RelayErrorCode(StrEnum):
@@ -413,6 +423,7 @@ class _OperationKind(StrEnum):
     BROKER_TOOL = "broker_tool"
     TASK_COMMAND = "task_command"
     HANDOFF = "handoff"
+    INSTRUCTIONS = "instructions"
 
 
 @dataclass(frozen=True)
@@ -867,6 +878,11 @@ class BrokerRelay:
         if handoff is not None:
             self._require_route_id(handoff, "investigation_id", self._binding.investigation_id)
             return _Operation(_OperationKind.HANDOFF, catalog.HANDOFF_PATH)
+        instructions = _INSTRUCTIONS_ROUTE.fullmatch(target)
+        if instructions is not None:
+            self._require_route_id(instructions, "investigation_id", self._binding.investigation_id)
+            self._require_route_id(instructions, "session_id", self._binding.session_id)
+            return _Operation(_OperationKind.INSTRUCTIONS, catalog.INSTRUCTIONS_PATH)
         raise RelayRejection.operation_not_allowed("route_not_allowed")
 
     @staticmethod
@@ -907,10 +923,44 @@ class BrokerRelay:
             if payload.get("command") not in _ALLOWED_TASK_COMMANDS:
                 raise RelayRejection.operation_not_allowed("command_not_allowed")
             return None
+        if operation.kind is _OperationKind.INSTRUCTIONS:
+            if len(body) > INSTRUCTION_BODY_LIMIT_BYTES:
+                raise RelayRejection.too_large()
+            self._validate_instruction_body(payload)
+            return None
         task_id = payload.get("task_id")
         if not isinstance(task_id, str) or task_id != self._binding.task_id:
             raise RelayRejection.binding_mismatch("task_id")
         return None
+
+    @staticmethod
+    def _validate_instruction_body(payload: Mapping[str, object]) -> None:
+        """Only the two operator actions, with a strict bounded body shape."""
+        action = payload.get("action")
+        if not isinstance(action, str) or action not in _ALLOWED_INSTRUCTION_ACTIONS:
+            raise RelayRejection.operation_not_allowed("action_not_allowed")
+        if action == "pull":
+            if set(payload) != {"action"}:
+                raise RelayRejection.operation_not_allowed("body_shape_invalid")
+            return
+        if set(payload) != {"action", "instruction_ids"}:
+            raise RelayRejection.operation_not_allowed("body_shape_invalid")
+        instruction_ids = payload.get("instruction_ids")
+        if (
+            not isinstance(instruction_ids, list)
+            or not 1 <= len(instruction_ids) <= _MAX_INSTRUCTION_IDS
+        ):
+            raise RelayRejection.operation_not_allowed("instruction_ids_invalid")
+        validated: list[str] = []
+        for instruction_id in instruction_ids:
+            if (
+                not isinstance(instruction_id, str)
+                or _INSTRUCTION_ID_PATTERN.fullmatch(instruction_id) is None
+            ):
+                raise RelayRejection.operation_not_allowed("instruction_ids_invalid")
+            validated.append(instruction_id)
+        if len(set(validated)) != len(validated):
+            raise RelayRejection.operation_not_allowed("duplicate_instruction_ids")
 
     def _manifest_tools(self) -> frozenset[str] | None:
         try:
@@ -930,6 +980,8 @@ class BrokerRelay:
             return tool.timeout_seconds
         if operation.kind is _OperationKind.HANDOFF:
             return _HANDOFF_TIMEOUT_SECONDS
+        if operation.kind is _OperationKind.INSTRUCTIONS:
+            return _INSTRUCTION_TIMEOUT_SECONDS
         return _TASK_COMMAND_TIMEOUT_SECONDS
 
     def _forward(self, request: _Request, timeout: float) -> RelayResponse:
@@ -1022,6 +1074,7 @@ def _decode_json_object(body: bytes) -> dict[str, object]:
 
 __all__ = [
     "HEADER_BLOCK_LIMIT_BYTES",
+    "INSTRUCTION_BODY_LIMIT_BYTES",
     "MAX_CONCURRENT_CONNECTIONS",
     "REQUEST_BODY_LIMIT_BYTES",
     "REQUEST_LINE_LIMIT_BYTES",

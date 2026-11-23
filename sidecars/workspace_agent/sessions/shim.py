@@ -112,12 +112,15 @@ RELAY_NOT_SENT_CODES = frozenset(
 # Relay failures whose backend effect is ambiguous. ``relay_response_too_large``
 # means the backend executed but the shim never saw the result.
 RELAY_AMBIGUOUS_CODES = frozenset({"relay_backend_outcome_unknown", "relay_response_too_large"})
-# An identical deliberate replay is advertised only for the two task commands
-# whose catalogue description promises recorded-command replay on the same D7
-# idempotency key. Every other tool stays False by default: the shim cannot
-# prove the backend key covers the effect, and ``advisor.consult`` ambiguity
-# must be reconciled, never resubmitted.
-IDEMPOTENT_REPLAY_TOOLS = frozenset({"task.heartbeat", "task.submit_result"})
+# An identical deliberate replay is advertised only for tools whose backend
+# accepts it: the two task commands replay a recorded command on the same D7
+# idempotency key, an ``instruction.ack`` replay returns the same acknowledged
+# row, and ``instruction.pending`` is a read. Every other tool stays False by
+# default: the shim cannot prove the backend key covers the effect, and
+# ``advisor.consult`` ambiguity must be reconciled, never resubmitted.
+IDEMPOTENT_REPLAY_TOOLS = frozenset(
+    {"task.heartbeat", "task.submit_result", "instruction.pending", "instruction.ack"}
+)
 
 PARSE_ERROR = -32700
 INVALID_REQUEST = -32600

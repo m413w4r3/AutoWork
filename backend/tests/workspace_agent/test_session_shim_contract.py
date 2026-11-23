@@ -296,6 +296,103 @@ def test_submit_result_and_handoff_use_their_fixed_routes() -> None:
     }
 
 
+def test_instruction_tools_are_fixed_pull_and_ack() -> None:
+    """Exactly two fixed instruction tools; no URL/path/method/header knob."""
+    instruction_specs = [
+        spec for spec in catalog.CATALOGUE if spec.broker_name.startswith("instruction.")
+    ]
+    assert [spec.mcp_name for spec in instruction_specs] == [
+        "autowork_instruction_pending",
+        "autowork_instruction_ack",
+    ]
+    pending, ack = instruction_specs
+    for spec, expected_properties in (
+        (pending, {"investigation_id"}),
+        (ack, {"investigation_id", "instruction_ids"}),
+    ):
+        assert spec.method == "POST"
+        assert spec.path_template == catalog.INSTRUCTIONS_PATH
+        assert spec.path_params == ("investigation_id",)
+        assert spec.body_kind == "instruction"
+        assert spec.timeout_seconds == 120.0
+        schema = spec.input_schema
+        assert schema["type"] == "object"
+        assert schema["additionalProperties"] is False
+        properties = cast(dict[str, object], schema["properties"])
+        assert set(properties) == expected_properties
+        assert set(cast(list[str], schema["required"])) == expected_properties
+    ack_properties = cast(dict[str, object], ack.input_schema["properties"])
+    ids_schema = cast(dict[str, object], ack_properties["instruction_ids"])
+    assert ids_schema["type"] == "array"
+    assert ids_schema["minItems"] == 1
+    assert ids_schema["maxItems"] == 32
+    assert ids_schema["uniqueItems"] is True
+    assert cast(dict[str, object], ids_schema["items"])["pattern"] == (
+        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    )
+    for spec in instruction_specs:
+        forbidden = set(cast(dict[str, object], spec.input_schema["properties"])) & {
+            "url",
+            "uri",
+            "method",
+            "path",
+            "headers",
+            "proxy",
+        }
+        assert forbidden == set()
+
+
+def test_instruction_tools_build_fixed_bodies_and_paths() -> None:
+    transport = RecordingTransport()
+    server = _server(transport)
+    first_id = "12345678-1234-4abc-8def-1234567890ab"
+    second_id = "abcdef12-3456-4abc-9def-abcdef123456"
+    pending = server.handle_message(
+        _tools_call(
+            "autowork_instruction_pending",
+            {"investigation_id": support.INVESTIGATION_ID},
+            request_id=1,
+        )
+    )
+    ack = server.handle_message(
+        _tools_call(
+            "autowork_instruction_ack",
+            {
+                "investigation_id": support.INVESTIGATION_ID,
+                "instruction_ids": [first_id, second_id],
+            },
+            request_id=2,
+        )
+    )
+    assert pending is not None and ack is not None
+    assert len(transport.calls) == 2
+    expected_path = catalog.INSTRUCTIONS_PATH.format(
+        investigation_id=support.INVESTIGATION_ID, session_id=support.SESSION_ID
+    )
+    for call in transport.calls:
+        assert call["method"] == "POST"
+        assert call["path"] == expected_path
+        assert call["timeout"] == 120.0
+    assert json.loads(cast(bytes, transport.calls[0]["body"]).decode("utf-8")) == {"action": "pull"}
+    assert json.loads(cast(bytes, transport.calls[1]["body"]).decode("utf-8")) == {
+        "action": "ack",
+        "instruction_ids": [first_id, second_id],
+    }
+    pending_headers = cast(dict[str, str], transport.calls[0]["headers"])
+    ack_headers = cast(dict[str, str], transport.calls[1]["headers"])
+    assert pending_headers["Idempotency-Key"] == support.expected_client_key(
+        support.SESSION_ID, "instruction.pending", {"investigation_id": support.INVESTIGATION_ID}
+    )
+    assert ack_headers["Idempotency-Key"] == support.expected_client_key(
+        support.SESSION_ID,
+        "instruction.ack",
+        {
+            "investigation_id": support.INVESTIGATION_ID,
+            "instruction_ids": [first_id, second_id],
+        },
+    )
+
+
 def test_fix_t_tools_use_the_broker_route_with_closed_bodies() -> None:
     transport = RecordingTransport()
     server = _server(transport)
@@ -448,6 +545,64 @@ SCHEMA_CASES: tuple[tuple[str, dict[str, object], str, str], ...] = (
         "to_actor.kind",
         "enum",
     ),
+    (
+        "autowork_instruction_pending",
+        {
+            "investigation_id": support.INVESTIGATION_ID,
+            "url": "http://example.invalid/",
+        },
+        "url",
+        "additional_property",
+    ),
+    (
+        "autowork_instruction_ack",
+        {
+            "investigation_id": support.INVESTIGATION_ID,
+            "instruction_ids": [],
+        },
+        "instruction_ids",
+        "min_items",
+    ),
+    (
+        "autowork_instruction_ack",
+        {
+            "investigation_id": support.INVESTIGATION_ID,
+            "instruction_ids": [f"{index:08x}-1234-4abc-8def-1234567890ab" for index in range(33)],
+        },
+        "instruction_ids",
+        "max_items",
+    ),
+    (
+        "autowork_instruction_ack",
+        {
+            "investigation_id": support.INVESTIGATION_ID,
+            "instruction_ids": ["not-a-uuid"],
+        },
+        "instruction_ids[0]",
+        "pattern",
+    ),
+    (
+        "autowork_instruction_ack",
+        {
+            "investigation_id": support.INVESTIGATION_ID,
+            "instruction_ids": [
+                "12345678-1234-4abc-8def-1234567890ab",
+                "12345678-1234-4abc-8def-1234567890ab",
+            ],
+        },
+        "instruction_ids",
+        "unique_items",
+    ),
+    (
+        "autowork_instruction_ack",
+        {
+            "investigation_id": support.INVESTIGATION_ID,
+            "instruction_ids": ["12345678-1234-4abc-8def-1234567890ab"],
+            "tool_name": "advisor.consult",
+        },
+        "tool_name",
+        "additional_property",
+    ),
 )
 
 
@@ -506,6 +661,8 @@ def test_tools_list_is_the_closed_catalogue() -> None:
     assert names == [spec.mcp_name for spec in catalog.CATALOGUE]
     assert len(names) == len(set(names))
     assert "autowork_bridge_consult" in names
+    assert "autowork_instruction_pending" in names
+    assert "autowork_instruction_ack" in names
     for tool in tools:
         assert tool["inputSchema"]["type"] == "object"
         assert tool["inputSchema"]["additionalProperties"] is False
