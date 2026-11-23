@@ -14,8 +14,8 @@ import {
 } from "../../api/investigation";
 import { useInvestigationActivity } from "../../api/investigationOperator";
 import { InvestigationLabViews } from "./InvestigationLabViews";
-import { useWorkspaceStatus } from "./api/workspace";
 import { WORKSPACE_AVAILABILITY_LABELS } from "./overview/overviewPresentation";
+import { usePendingDecisions } from "./overview/usePendingDecisions";
 import { WorkshopCockpit } from "./shell/WorkshopCockpit";
 import { formatTimestamp, shortSha } from "./tasks/labels";
 
@@ -32,17 +32,11 @@ export function InvestigationTab({
   subjectId,
   editionId,
   articleTitle,
-  pendingDecisionCount,
 }: {
   subjectId: string;
   editionId: string;
   /** The article title from the parent subject page, when available. */
   articleTitle?: string;
-  /**
-   * Reserved for a canonical pending-decision count. The current investigation
-   * and activity responses do not expose that count yet.
-   */
-  pendingDecisionCount?: number;
 }) {
   const [selectedInvestigationId, setSelectedInvestigationId] = useState<
     string | null
@@ -278,7 +272,6 @@ export function InvestigationTab({
             investigation={investigationQuery.data}
             editionId={editionId}
             articleTitle={articleTitle ?? "Article de l’enquête"}
-            pendingDecisionCount={pendingDecisionCount}
             onResume={(expectedVersion) =>
               resume.mutate({
                 investigationId,
@@ -309,7 +302,6 @@ function InvestigationDetail({
   investigation,
   editionId,
   articleTitle,
-  pendingDecisionCount,
   onResume,
   onInterrupt,
   actionPending,
@@ -318,7 +310,6 @@ function InvestigationDetail({
   investigation: InvestigationView;
   editionId: string;
   articleTitle: string;
-  pendingDecisionCount?: number;
   onResume: (expectedVersion: number) => void;
   onInterrupt: (expectedVersion: number) => void;
   actionPending: boolean;
@@ -330,10 +321,12 @@ function InvestigationDetail({
   // workspace n'est qu'un état best-effort au démarrage, jamais le discriminant.
   const workshopActive = investigation.prose_authority === "bridge_only";
   const latest = activityQuery.data?.investigation;
-  // Shares the status query key/cache already consumed by OverviewView.
-  const workspaceQuery = useWorkspaceStatus(investigation.id, {
+  const pendingDecisions = usePendingDecisions(investigation.id, {
     enabled: workshopActive,
+    workspaceViewsAvailable: workshopActive,
   });
+  const workspaceQuery = pendingDecisions.workspaceQuery;
+  const pendingDecisionCount = pendingDecisions.pendingDecisionCount;
   const currentStatus = latest?.status ?? investigation.status;
   const currentStopReason = latest
     ? latest.stop_reason
