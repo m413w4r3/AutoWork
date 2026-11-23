@@ -16,9 +16,11 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
+import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport
 
+from cti_app.api import investigation_plans as plans_api
 from cti_app.api.investigation_plans import router as plans_router
 from cti_app.application.identity import LocalIdentityProvider
 from cti_app.application.investigation_persistence import (
@@ -27,6 +29,7 @@ from cti_app.application.investigation_persistence import (
     InMemoryInvestigationTaskRepository,
     InMemoryToolInvocationRepository,
     InMemoryWorkContributionRepository,
+    VersionConflictError,
 )
 from cti_app.application.investigation_plan_materialization import plan_task_key
 from cti_app.application.investigation_plans import InvestigationPlanService
@@ -796,6 +799,33 @@ def test_plan_materialize_from_persisted_invocation_is_idempotent() -> None:
     detail = client.get(f"/api/investigations/{INVESTIGATION_ID}/plans/{body['plan_version_id']}")
     assert detail.status_code == 200, detail.text
     assert detail.json()["content"]["leads"][0]["title"] == "Vérifier le chargeur"
+
+
+def test_plan_materialize_returns_409_when_the_head_races(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R4-F6: a concurrent materialization loses the head CAS and gets 409.
+
+    ``request_plan`` already maps the same conflict to ``plan_version_conflict``;
+    ``materialize_plan`` must do the same instead of letting the CAS
+    ``VersionConflictError`` escape as a 500.
+    """
+    client, store, _factory = _client()
+    invocation, _response = asyncio.run(_seed_advisor_exchange(store))
+
+    async def conflicting_head(**_kwargs: Any) -> Any:
+        raise VersionConflictError("Plan current version changed")
+
+    monkeypatch.setattr(plans_api, "_plan_from_invocation", conflicting_head)
+
+    response = client.post(
+        f"/api/investigations/{INVESTIGATION_ID}/plans",
+        json={"source_invocation_id": str(invocation.id)},
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "plan_version_conflict"
+    assert asyncio.run(store.plans.list_for_investigation(INVESTIGATION_ID)) == ()
 
 
 def test_plan_accept_refuses_stale_version() -> None:

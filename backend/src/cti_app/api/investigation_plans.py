@@ -564,12 +564,17 @@ async def materialize_plan(
                     created=False,
                 )
         observations = await uow.evidence_observations.list_for_investigation(investigation_id)
-        version, _plan_status, _missing, _advisor = await _plan_from_invocation(
-            uow=uow,
-            invocation=invocation,
-            observations=observations,
-            artifact_store=factory.artifact_store,
-        )
+        try:
+            version, _plan_status, _missing, _advisor = await _plan_from_invocation(
+                uow=uow,
+                invocation=invocation,
+                observations=observations,
+                artifact_store=factory.artifact_store,
+            )
+        except VersionConflictError as exc:
+            # A concurrent materialization (or a plan request) won the head
+            # CAS; the replay of this call will return its version.
+            raise _http_error(409, "plan_version_conflict") from exc
         if version is None:
             raise _http_error(
                 422,
