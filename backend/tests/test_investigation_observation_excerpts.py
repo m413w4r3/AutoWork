@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
@@ -18,10 +20,17 @@ from cti_app.domain.analyst_opinion import CanonicalCodeNoteBlockV1
 from cti_app.domain.opinion_note_proposal import NoteTargetBlockType
 from tests.test_opinion_note_proposals import (
     LEAD_ANCHOR,
-    _append_observation,
     _Fixture,
     _sha256,
 )
+from tests.test_opinion_note_proposals import (
+    _append_observation as _append_observation_sync,
+)
+
+
+async def _append_observation(fixture: _Fixture, raw: bytes, **kwargs: Any) -> Any:
+    """The shared fixture helper drives its own loop; run it off this one."""
+    return await asyncio.to_thread(_append_observation_sync, fixture, raw, **kwargs)
 
 
 def _app(fixture: _Fixture) -> FastAPI:
@@ -42,7 +51,7 @@ def _path(fixture: _Fixture, observation_id: UUID) -> str:
 async def test_excerpt_text_and_hex_share_canonical_code_verification() -> None:
     fixture = _Fixture()
     raw = b"prefix call\ntail"
-    observation = _append_observation(fixture, raw)
+    observation = await _append_observation(fixture, raw)
     path = _path(fixture, observation.id)
     async with httpx.AsyncClient(
         transport=ASGITransport(app=_app(fixture)), base_url="http://test"
@@ -93,7 +102,7 @@ async def test_excerpt_text_and_hex_share_canonical_code_verification() -> None:
 @pytest.mark.asyncio
 async def test_excerpt_rejects_unsafe_text_and_binary_remains_available_as_hex() -> None:
     fixture = _Fixture()
-    observation = _append_observation(fixture, b"\x00\xffA")
+    observation = await _append_observation(fixture, b"\x00\xffA")
     path = _path(fixture, observation.id)
     async with httpx.AsyncClient(
         transport=ASGITransport(app=_app(fixture)), base_url="http://test"
@@ -111,7 +120,7 @@ async def test_excerpt_rejects_unsafe_text_and_binary_remains_available_as_hex()
 @pytest.mark.asyncio
 async def test_excerpt_rejects_oversized_range_and_out_of_bounds_offset() -> None:
     fixture = _Fixture()
-    observation = _append_observation(fixture, b"small")
+    observation = await _append_observation(fixture, b"small")
     path = _path(fixture, observation.id)
     async with httpx.AsyncClient(
         transport=ASGITransport(app=_app(fixture)), base_url="http://test"
@@ -127,12 +136,12 @@ async def test_excerpt_rejects_oversized_range_and_out_of_bounds_offset() -> Non
 @pytest.mark.asyncio
 async def test_excerpt_hides_cross_investigation_observations_and_unavailable_blobs() -> None:
     fixture = _Fixture()
-    foreign = _append_observation(
+    foreign = await _append_observation(
         fixture,
         b"foreign",
         investigation_id=uuid4(),
     )
-    missing = _append_observation(fixture, b"missing")
+    missing = await _append_observation(fixture, b"missing")
     del fixture.harness.store.blobs[missing.blob_id]
     path_foreign = _path(fixture, foreign.id)
     path_missing = _path(fixture, missing.id)
@@ -155,7 +164,7 @@ async def test_excerpt_hides_cross_investigation_observations_and_unavailable_bl
 @pytest.mark.asyncio
 async def test_excerpt_rejects_observation_blob_over_shared_source_limit() -> None:
     fixture = _Fixture()
-    observation = _append_observation(fixture, b"x" * (MAX_CANONICAL_CODE_SOURCE_BYTES + 1))
+    observation = await _append_observation(fixture, b"x" * (MAX_CANONICAL_CODE_SOURCE_BYTES + 1))
     async with httpx.AsyncClient(
         transport=ASGITransport(app=_app(fixture)), base_url="http://test"
     ) as client:
