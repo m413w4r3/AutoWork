@@ -1005,6 +1005,48 @@
   )
 }
 
+#let render-note-provenance(note-block) = {
+  let parts = note-block.at("provenance", default: ())
+  if parts.len() > 0 [
+    #block(width: 100%, above: 2pt)[
+      #set par(justify: false)
+      #for part in parts [
+        #if part.at("technical", default: false) [
+          #text(font: code-font-families, size: 7pt, fill: grey)[
+            #publication-display-text(part.at("display", default: part.text))
+          ]
+        ] else [
+          #text(size: 7pt, fill: grey)[#part.text]
+        ]
+      ]
+    ]
+  ]
+}
+
+// Note blocks are deterministic references: the article element itself stays
+// rendered at its article placement, and the note never duplicates its data.
+#let render-note-block(note-block) = {
+  let block-type = note-block.block_type
+  let body = if block-type == "article_element" or block-type == "protocol_figure" [
+    #block(above: 3pt, width: 100%)[
+      #text(size: 8pt, style: "italic")[#note-block.reference_label]
+    ]
+  ] else if block-type == "canonical_code" [
+    #block(above: 3pt, width: 100%)[
+      #semantic-technical-code-block(note-block.code_lines)
+    ]
+  ] else if block-type == "ioc_table" [
+    #block(above: 4pt, width: 100%)[
+      #text(size: 9pt, weight: "bold")[#note-block.title]
+      #v(2pt)
+      #render-opinion-pipe-table(note-block.pipe_table)
+    ]
+  ] else {
+    panic("unsupported note content block type: " + str(block-type))
+  }
+  body + render-note-provenance(note-block)
+}
+
 #let render-analyst-observation(
   item,
   reference-scope: "",
@@ -1014,6 +1056,7 @@
 ) = {
   let finding-refs = item.at("finding_refs", default: ())
   let evidence-refs = item.at("evidence_refs", default: ())
+  let blocks = item.at("blocks", default: ())
   let should-show-internal-references = (
     show-internal-references
     and not analyst-opinion-style
@@ -1025,6 +1068,9 @@
       item.text,
       analyst-opinion-style: analyst-opinion-style,
     )
+    #if blocks.len() > 0 [
+      #for block in blocks [#render-note-block(block)]
+    ]
     #if should-show-internal-references [
       #v(3pt)
       #text(size: 7pt, fill: grey)[Références : ]

@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 from cti_app.application.diagram_compilation import CompiledDiagram
 from cti_app.application.investigation_figures import build_investigation_graph_figure
 from cti_app.application.media_assets import MediaAssetStore
+from cti_app.application.opinion_note_proposals import note_article_element_facts
 from cti_app.application.persistence import PublicationRenderUnitOfWorkFactory
 from cti_app.application.production_artifact_store import (
     ProductionArtifactStore,
@@ -52,6 +53,7 @@ from cti_app.application.typst_render_output import (
     read_verified_render_pdf,
 )
 from cti_app.application.typst_rendering import (
+    NoteBlockRenderContext,
     TemplateBundleInvalidError,
     TypstDraftPreviewDocument,
     TypstMediaRef,
@@ -60,7 +62,7 @@ from cti_app.application.typst_rendering import (
     TypstTemplateBundle,
     load_template_bundle,
 )
-from cti_app.domain.analyst_opinion import AnalystOpinionV1
+from cti_app.domain.analyst_opinion import AnalystOpinionV1, CanonicalCodeNoteBlockV1
 from cti_app.domain.editorial import AnalystDecisionTargetType, AnalystDecisionType
 from cti_app.domain.investigation import EvidenceObservation, InvestigationFinding
 from cti_app.domain.investigation_graph import InvestigationGraph
@@ -275,6 +277,47 @@ class _PreparedDraftPreview:
     lineage: dict[str, Any]
 
 
+async def load_note_block_render_context(
+    *,
+    uow_factory: PublicationRenderUnitOfWorkFactory,
+    artifact_store: ProductionArtifactStore,
+    opinion: AnalystOpinionV1,
+    base_document: CanonicalPublicationDocument,
+) -> NoteBlockRenderContext | None:
+    """Read exactly the canonical facts an opinion's note blocks cite."""
+    if not any(item.content_blocks for item in opinion.observations):
+        return None
+    async with uow_factory() as uow:
+        evidence_observations = getattr(uow, "evidence_observations", None)
+        list_for_investigation = getattr(evidence_observations, "list_for_investigation", None)
+        observations = (
+            tuple(await list_for_investigation(opinion.investigation_id))
+            if callable(list_for_investigation)
+            else ()
+        )
+    blob_ids_by_observation = {item.id: item.blob_id for item in observations}
+    blobs: dict[UUID, bytes] = {}
+    for observation in opinion.observations:
+        for block in observation.content_blocks:
+            if not isinstance(block, CanonicalCodeNoteBlockV1):
+                continue
+            blob_id = blob_ids_by_observation.get(block.observation_id)
+            if blob_id is None:
+                continue
+            try:
+                blobs[block.observation_id] = await artifact_store.read_bytes(
+                    blob_id, max_bytes=None
+                )
+            except (KeyError, OSError, TypeError, ValueError):
+                # The projection refuses the stale reference instead of guessing.
+                continue
+    return NoteBlockRenderContext(
+        observations=observations,
+        blobs=blobs,
+        element_facts=note_article_element_facts(base_document),
+    )
+
+
 class PublicationRenderService:
     def __init__(
         self,
@@ -337,6 +380,7 @@ class PublicationRenderService:
         infrastructure_graph: InvestigationGraph | None = None,
         findings: tuple[InvestigationFinding, ...] = (),
         evidence_observations: tuple[EvidenceObservation, ...] = (),
+        note_block_context: NoteBlockRenderContext | None = None,
     ) -> DraftPublicationRender:
         """Compile an ephemeral, watermarked draft without creating render state."""
         prepared = self._prepare_draft_preview(
@@ -352,10 +396,14 @@ class PublicationRenderService:
             evidence_observations=evidence_observations,
         )
         try:
+            render_kwargs: dict[str, Any] = {}
+            if note_block_context is not None:
+                render_kwargs["note_block_context"] = note_block_context
             render_source = self._renderer.render(
                 prepared.projection,
                 prepared.template_bundle,
                 document_label=prepared.identity_label,
+                **render_kwargs,
             )
             render_source = with_publication_lineage(
                 render_source,
@@ -396,6 +444,7 @@ class PublicationRenderService:
         infrastructure_graph: InvestigationGraph | None = None,
         findings: tuple[InvestigationFinding, ...] = (),
         evidence_observations: tuple[EvidenceObservation, ...] = (),
+        note_block_context: NoteBlockRenderContext | None = None,
     ) -> tuple[CanonicalPublicationDocument, dict[str, Any]]:
         """Build canonical publication and preview inputs without compiling a PDF."""
         prepared = self._prepare_draft_preview(
@@ -411,10 +460,14 @@ class PublicationRenderService:
             evidence_observations=evidence_observations,
         )
         try:
+            build_kwargs: dict[str, Any] = {}
+            if note_block_context is not None:
+                build_kwargs["note_block_context"] = note_block_context
             publication_document, render_data = self._renderer.build_draft_preview_inputs(
                 prepared.projection,
                 prepared.template_bundle,
                 document_label=prepared.identity_label,
+                **build_kwargs,
             )
             return publication_document, with_publication_lineage_data(
                 render_data,
@@ -904,6 +957,18 @@ class PublicationRenderService:
                                 "V6 reviewer provenance does not match its NOTE_APPROVE decision"
                             )
 
+        note_block_context: NoteBlockRenderContext | None = None
+        if is_augmented_publication:
+            assert publication_v6 is not None
+            opinion = publication_v6.analyst_opinion
+            if opinion is not None:
+                note_block_context = await load_note_block_render_context(
+                    uow_factory=self._uow_factory,
+                    artifact_store=self._artifact_store,
+                    opinion=opinion,
+                    base_document=document,
+                )
+
         publication_content_sha256 = hashlib.sha256(
             ProductionArtifactStore.canonical_json_bytes(serialize_publication_document(document))
         ).hexdigest()
@@ -1086,6 +1151,11 @@ class PublicationRenderService:
 
         def build_source() -> TypstRenderSource:
             try:
+                render_kwargs: dict[str, Any] = {}
+                if graph_media_ref is not None:
+                    render_kwargs["infrastructure_graph_media_ref"] = graph_media_ref
+                if note_block_context is not None:
+                    render_kwargs["note_block_context"] = note_block_context
                 source = self._renderer.render(
                     document,
                     template_bundle,
@@ -1096,11 +1166,7 @@ class PublicationRenderService:
                         if isinstance(artifact.metadata.get("brief_assembly_policy_version"), str)
                         else None
                     ),
-                    **(
-                        {"infrastructure_graph_media_ref": graph_media_ref}
-                        if graph_media_ref is not None
-                        else {}
-                    ),
+                    **render_kwargs,
                 )
                 return with_publication_lineage(
                     source,

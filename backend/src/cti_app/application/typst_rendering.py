@@ -6,8 +6,8 @@ import hashlib
 import ipaddress
 import json
 import re
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import date
 from difflib import SequenceMatcher
 from pathlib import Path, PurePosixPath
@@ -20,6 +20,18 @@ from cti_app.application.investigation_figures import (
     build_investigation_chain_figure,
     build_investigation_graph_figure,
     build_publication_timeline_figure,
+)
+from cti_app.application.opinion_note_proposals import (
+    NoteArticleElementFactV1,
+    NoteContentBlockContextV1,
+    NoteObservationFactV1,
+    NoteProposalError,
+    ResolvedArticleElementBlockV1,
+    ResolvedCanonicalCodeBlockV1,
+    ResolvedIocTableBlockV1,
+    ResolvedProtocolFigureBlockV1,
+    note_article_element_facts,
+    validate_note_content_blocks,
 )
 from cti_app.application.pdf_mapping import MAPPING_RENDERER_VERSION, target_descriptor
 from cti_app.application.production_normalization import (
@@ -60,6 +72,7 @@ from cti_app.domain.investigation import (
     FindingKind,
     InvestigationFinding,
     NoveltyClass,
+    is_advisory_observation,
     logical_finding_id_by_version,
 )
 from cti_app.domain.investigation_graph import InvestigationGraph, InvestigationGraphNodeKind
@@ -1631,6 +1644,36 @@ class TypstMediaRef:
     media_path: str
 
 
+class NoteContentBlockRenderError(ValueError):
+    """A typed refusal to render one note content block from canonical state."""
+
+    def __init__(self, code: str, message: str | None = None) -> None:
+        self.code = code
+        super().__init__(f"{code}: {message}" if message else code)
+
+
+@dataclass(frozen=True, slots=True)
+class NoteBlockRenderContext:
+    """Canonical facts a note content block needs beyond the rendered document.
+
+    A ``canonical_code`` excerpt is sliced from its observation blob and an
+    ``ioc_table`` row comes from the canonical observation identity; neither is
+    present in the publication document, so the renderer receives exactly the
+    facts its blocks cite.  ``element_facts`` lets a draft preview resolve the
+    pinned V9/V10 element anchors even though it renders the V5 body.
+    """
+
+    observations: tuple[EvidenceObservation, ...] = ()
+    blobs: Mapping[UUID, bytes] = field(default_factory=dict)
+    element_facts: tuple[NoteArticleElementFactV1, ...] | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "observations", tuple(self.observations))
+        object.__setattr__(self, "blobs", dict(self.blobs))
+        if self.element_facts is not None:
+            object.__setattr__(self, "element_facts", tuple(self.element_facts))
+
+
 @dataclass(frozen=True, slots=True)
 class TypstRenderSource:
     source_bytes: bytes
@@ -1942,6 +1985,239 @@ def _opinion_pipe_table(value: str) -> dict[str, Any] | None:
     }
 
 
+_NOTE_ELEMENT_KIND_LABELS: dict[str, str] = {
+    "table": "Tableau",
+    "chart": "Graphique",
+    "diagram": "Schéma",
+    "figure": "Figure",
+}
+_NOTE_IOC_COLUMNS = ("Observation", "Type", "Valeur", "Source", "Observé le", "Empreinte")
+_NOTE_IOC_COLUMN_WEIGHTS = (1.6, 0.9, 1.8, 1.2, 1.1, 2.6)
+
+
+def _note_display_part(text: str, *, technical: bool) -> dict[str, Any]:
+    """One deterministic provenance segment; technical values stay exact."""
+    return {
+        "text": text,
+        "technical": technical,
+        "display": (
+            _breakable_typst_display_text(text, interval=8, break_at_technical_separators=True)
+            if technical
+            else {"text": text}
+        ),
+    }
+
+
+def _note_cell(value: str, *, technical: bool) -> dict[str, Any]:
+    return {
+        "segments": [
+            {
+                "text": value,
+                "code": technical,
+                "display": _breakable_typst_display_text(
+                    value, interval=12, break_at_technical_separators=True
+                ),
+            }
+        ],
+        "text": value,
+    }
+
+
+def _note_ioc_pipe_table(block: ResolvedIocTableBlockV1) -> dict[str, Any]:
+    """Build the existing opinion pipe-table from canonical observation identities."""
+    return {
+        "column_count": len(_NOTE_IOC_COLUMNS),
+        "column_weights": list(_NOTE_IOC_COLUMN_WEIGHTS),
+        "alignment": ["left"] * len(_NOTE_IOC_COLUMNS),
+        "header": [_note_cell(label, technical=False) for label in _NOTE_IOC_COLUMNS],
+        "rows": [
+            [
+                _note_cell(str(row.observation_id), technical=True),
+                _note_cell(row.object_type, technical=False),
+                _note_cell(row.object_id, technical=True),
+                _note_cell(row.source, technical=True),
+                _note_cell(row.observed_at, technical=False),
+                _note_cell(row.blob_sha256, technical=True),
+            ]
+            for row in block.rows
+        ],
+    }
+
+
+def _note_block_render_data(block: Any) -> dict[str, Any]:
+    """Project one resolved block; captions stay deterministic (no human prose)."""
+    if isinstance(block, ResolvedArticleElementBlockV1):
+        return {
+            "block_type": "article_element",
+            "kind": block.kind.value,
+            "kind_label": _NOTE_ELEMENT_KIND_LABELS[block.kind.value],
+            "element_key": block.element_key,
+            "element_sha256": block.element_sha256,
+            "anchor": block.anchor,
+            "element_text": block.title or block.caption,
+            "provenance": [
+                _note_display_part("Référence d'article — ", technical=False),
+                _note_display_part(_NOTE_ELEMENT_KIND_LABELS[block.kind.value], technical=False),
+                _note_display_part(" — empreinte ", technical=False),
+                _note_display_part(block.element_sha256, technical=True),
+                _note_display_part(" — ancre ", technical=False),
+                _note_display_part(block.anchor, technical=True),
+            ],
+        }
+    if isinstance(block, ResolvedCanonicalCodeBlockV1):
+        return {
+            "block_type": "canonical_code",
+            "language": block.language,
+            "excerpt": block.excerpt,
+            "code_lines": [
+                _breakable_typst_display_text(line, interval=8, break_at_technical_separators=True)
+                for line in block.excerpt.split("\n")
+            ],
+            "provenance": [
+                _note_display_part("Observation ", technical=False),
+                _note_display_part(block.observation_source, technical=True),
+                _note_display_part(" — ", technical=False),
+                _note_display_part(block.observation_object_type, technical=True),
+                _note_display_part(" ", technical=False),
+                _note_display_part(block.observation_object_id, technical=True),
+                _note_display_part(" — blob SHA-256 ", technical=False),
+                _note_display_part(block.blob_sha256, technical=True),
+                _note_display_part(" — octets ", technical=False),
+                _note_display_part(
+                    f"{block.offset}-{block.offset + block.length}", technical=False
+                ),
+                _note_display_part(" — extrait SHA-256 ", technical=False),
+                _note_display_part(block.excerpt_sha256, technical=True),
+            ],
+        }
+    if isinstance(block, ResolvedIocTableBlockV1):
+        return {
+            "block_type": "ioc_table",
+            "title": block.title,
+            "pipe_table": _note_ioc_pipe_table(block),
+            "provenance": [
+                _note_display_part("Observations canoniques de cette enquête : ", technical=False),
+                _note_display_part(str(len(block.rows)), technical=False),
+                _note_display_part(
+                    " — lignes construites par identité d'observation, empreintes vérifiées.",
+                    technical=False,
+                ),
+            ],
+        }
+    if isinstance(block, ResolvedProtocolFigureBlockV1):
+        return {
+            "block_type": "protocol_figure",
+            "kind": block.kind.value,
+            "kind_label": _PROTOCOL_FIGURE_TITLES[block.kind.value],
+            "asset_sha256": block.asset_sha256,
+            "caption": block.caption,
+            "provenance": [
+                _note_display_part(
+                    "Figure de protocole rendue en annexe — empreinte ", technical=False
+                ),
+                _note_display_part(block.asset_sha256, technical=True),
+            ],
+        }
+    raise NoteContentBlockRenderError(
+        "invalid_note_content_block", "The note content block type is unsupported"
+    )
+
+
+def _note_content_blocks_render_data(
+    *,
+    opinion: AnalystOpinionV1,
+    base_document: CanonicalPublicationDocument,
+    observations: Sequence[EvidenceObservation],
+    blobs: Mapping[UUID, bytes],
+    element_facts: tuple[NoteArticleElementFactV1, ...] | None,
+) -> dict[UUID, list[dict[str, Any]]]:
+    """Resolve every note block through the single B5a validator, then project it.
+
+    A stale or foreign reference refuses the whole render before compilation;
+    there is no partial or silent rendering of note blocks.
+    """
+    observation_facts = {
+        observation.id: NoteObservationFactV1(
+            observation_id=observation.id,
+            blob_sha256=observation.sha256,
+            object_type=observation.object_type,
+            object_id=observation.object_id,
+            source=observation.source,
+            observed_at=observation.observed_at,
+            in_investigation=observation.investigation_id == opinion.investigation_id,
+            advisory=is_advisory_observation(observation),
+        )
+        for observation in observations
+    }
+    facts = (
+        element_facts if element_facts is not None else note_article_element_facts(base_document)
+    )
+    rendered: dict[UUID, list[dict[str, Any]]] = {}
+    for note in opinion.observations:
+        if not note.content_blocks:
+            continue
+        context = NoteContentBlockContextV1(
+            investigation_id=opinion.investigation_id,
+            anchor=note.anchor,
+            elements=facts,
+            observations=observation_facts,
+            blobs=blobs,
+            protocol_figures=opinion.protocol_figures,
+        )
+        try:
+            resolved = validate_note_content_blocks(note.content_blocks, context)
+        except NoteProposalError as exc:
+            raise NoteContentBlockRenderError(exc.code.value, str(exc)) from exc
+        rendered[note.id] = [_note_block_render_data(block) for block in resolved]
+    return rendered
+
+
+def _finalize_note_block_references(
+    notes: Sequence[dict[str, Any]],
+    *,
+    element_blocks: Mapping[tuple[str, str], Mapping[str, Any]],
+    protocol_figures: Sequence[Mapping[str, Any]],
+) -> None:
+    """Attach the article placement number/label once figure numbering is known."""
+    protocol_by_key = {str(item.get("key")): item for item in protocol_figures}
+    for note in notes:
+        for block in note.get("blocks", ()):
+            block_type = block.get("block_type")
+            if block_type == "article_element":
+                element = element_blocks.get((block["kind"], block["element_key"]))
+                if element is None:
+                    raise NoteContentBlockRenderError(
+                        "note_block_ref_stale",
+                        "The referenced article element is not rendered in the article body",
+                    )
+                element_text = block.get("element_text")
+                if block["kind"] == "table":
+                    block["reference_label"] = "Tableau" + (
+                        f" — {element_text}" if element_text else ""
+                    )
+                    continue
+                figure_number = element.get("figure_number")
+                if not isinstance(figure_number, int):
+                    raise NoteContentBlockRenderError(
+                        "note_block_ref_stale",
+                        "The referenced article element carries no rendered figure number",
+                    )
+                block["reference_label"] = f"Figure {figure_number}" + (
+                    f" — {element_text}" if element_text else ""
+                )
+            elif block_type == "protocol_figure":
+                figure = protocol_by_key.get(f"protocol-{block['kind']}")
+                figure_number = figure.get("figure_number") if figure is not None else None
+                if not isinstance(figure_number, int):
+                    raise NoteContentBlockRenderError(
+                        "note_block_ref_stale",
+                        "The referenced protocol figure is not rendered in the opinion annex",
+                    )
+                block["reference_label"] = (
+                    f"Figure {figure_number} — {block['kind_label']}, en annexe"
+                )
+
+
 def _bounded_ioc_context(value: str, limit: int = 320) -> str:
     cleaned = re.sub(r"^\[UNTRUSTED ARTICLE OR TOOL DATA\]\s*", "", value.strip())
     cleaned = re.sub(r"\s*\[END UNTRUSTED DATA\]\s*$", "", cleaned)
@@ -2151,6 +2427,7 @@ class TypstRenderer:
         target_artifact_identities: Mapping[str, Mapping[str, Any]] | None = None,
         infrastructure_graph_media_ref: TypstMediaRef | None = None,
         brief_timeline_policy_version: str | None = None,
+        note_block_context: NoteBlockRenderContext | None = None,
     ) -> TypstRenderSource:
         return self._render_with_data(
             document,
@@ -2159,6 +2436,7 @@ class TypstRenderer:
             target_artifact_identities=target_artifact_identities,
             infrastructure_graph_media_ref=infrastructure_graph_media_ref,
             brief_timeline_policy_version=brief_timeline_policy_version,
+            note_block_context=note_block_context,
         )[0]
 
     def build_draft_preview_inputs(
@@ -2167,12 +2445,14 @@ class TypstRenderer:
         template_bundle: TypstTemplateBundle,
         *,
         document_label: str,
+        note_block_context: NoteBlockRenderContext | None = None,
     ) -> tuple[PublicationDocumentV5, dict[str, Any]]:
         """Return the canonical base document and Typst render data without compiling."""
         _render_source, render_data = self._render_with_data(
             document,
             template_bundle,
             document_label=document_label,
+            note_block_context=note_block_context,
         )
         return document.base_publication, render_data
 
@@ -2185,6 +2465,7 @@ class TypstRenderer:
         target_artifact_identities: Mapping[str, Mapping[str, Any]] | None = None,
         infrastructure_graph_media_ref: TypstMediaRef | None = None,
         brief_timeline_policy_version: str | None = None,
+        note_block_context: NoteBlockRenderContext | None = None,
     ) -> tuple[TypstRenderSource, dict[str, Any]]:
         """Project a publication using its exact service-supplied nature and identity label."""
         if not isinstance(document_label, str) or not document_label.strip():
@@ -2211,6 +2492,7 @@ class TypstRenderer:
                 else is_brief(document)
             ),
             brief_timeline_policy_version=brief_timeline_policy_version,
+            note_block_context=note_block_context,
         )
         target_descriptors: tuple[dict[str, Any], ...] = ()
         unmapped: tuple[dict[str, Any], ...] = ()
@@ -2418,6 +2700,7 @@ def project_publication_to_typst_model(
     infrastructure_graph_media_ref: TypstMediaRef | None = None,
     include_brief_chronology: bool = False,
     brief_timeline_policy_version: str | None = None,
+    note_block_context: NoteBlockRenderContext | None = None,
 ) -> TypstPublicationModelV2:
     """Project a canonical publication while keeping semantic content as data."""
     draft_preview = value if isinstance(value, TypstDraftPreviewDocument) else None
@@ -2578,6 +2861,7 @@ def project_publication_to_typst_model(
         list[tuple[EnrichmentElementRef, dict[str, Any]]],
     ] = {}
     rich_after_paragraph: dict[str, list[tuple[int, str, str, dict[str, Any]]]] = {}
+    element_blocks_by_key: dict[tuple[str, str], dict[str, Any]] = {}
     rich_order_entries: list[EnrichmentOrderEntry] = []
     resolved_v9_placements = (
         {(item.element_kind, item.element_key): item for item in publication_v9.resolved_placements}
@@ -2659,6 +2943,7 @@ def project_publication_to_typst_model(
 
     for table_index, table in enumerate(document.tables):
         block = _table_block(table)
+        element_blocks_by_key[("table", table.key)] = block
         rich_block(block, "semantic_title", f"table:{table.key}:title", table.title)
         if table.caption is not None:
             rich_block(block, "semantic_caption", f"table:{table.key}:caption", table.caption)
@@ -2703,6 +2988,7 @@ def project_publication_to_typst_model(
         )
     for diagram_index, diagram in enumerate(document.diagrams):
         block = _diagram_block(diagram, media_ref)
+        element_blocks_by_key[("diagram", diagram.key)] = block
         rich_block(block, "semantic_title", f"diagram:{diagram.key}:title", diagram.title)
         if diagram.caption is not None:
             rich_block(block, "semantic_caption", f"diagram:{diagram.key}:caption", diagram.caption)
@@ -2717,6 +3003,7 @@ def project_publication_to_typst_model(
         )
     for chart_index, chart in enumerate(document.charts):
         block = _chart_block(chart, media_ref)
+        element_blocks_by_key[("chart", chart.key)] = block
         rich_block(block, "semantic_title", f"chart:{chart.key}:title", chart.title)
         if chart.caption is not None:
             rich_block(block, "semantic_caption", f"chart:{chart.key}:caption", chart.caption)
@@ -2738,6 +3025,7 @@ def project_publication_to_typst_model(
                 f"{figure.source_document_id}"
             )
         block = _figure_block(figure, source, media_ref)
+        element_blocks_by_key[("figure", figure.key)] = block
         rich_block(block, "semantic_caption", f"figure:{figure.key}:caption", figure.caption)
         source_note = (
             _reader_facing_figure_source(figure, source)
@@ -2868,6 +3156,27 @@ def project_publication_to_typst_model(
 
     notes_by_anchor: dict[str, list[dict[str, Any]]] = {}
     unanchored_observations: list[dict[str, Any]] = []
+    notes_with_content_blocks: list[dict[str, Any]] = []
+    note_blocks_by_id: dict[UUID, list[dict[str, Any]]] = {}
+    if opinion is not None and any(item.content_blocks for item in opinion.observations):
+        context_observations = (
+            note_block_context.observations
+            if note_block_context is not None and note_block_context.observations
+            else draft_preview.evidence_observations
+            if draft_preview is not None
+            else ()
+        )
+        note_blocks_by_id = _note_content_blocks_render_data(
+            opinion=opinion,
+            base_document=(
+                value.base_publication if isinstance(value, TypstDraftPreviewDocument) else value
+            ),
+            observations=context_observations,
+            blobs=note_block_context.blobs if note_block_context is not None else {},
+            element_facts=(
+                note_block_context.element_facts if note_block_context is not None else None
+            ),
+        )
     if opinion is not None:
         for observation in opinion.observations:
             if not observation.text.strip():
@@ -2888,6 +3197,10 @@ def project_publication_to_typst_model(
                     f"Note ancrée {observation.anchor}", "evidence", observation.evidence_refs
                 ),
             }
+            blocks = note_blocks_by_id.get(observation.id)
+            if blocks:
+                note["blocks"] = blocks
+                notes_with_content_blocks.append(note)
             anchor_text = body_anchor_texts.get(observation.anchor)
             if anchor_text is None:
                 note["unanchored"] = True
@@ -4274,6 +4587,16 @@ def project_publication_to_typst_model(
             or visible_opinion_figures
         ):
             projected_opinion_section = None
+    if notes_with_content_blocks:
+        _finalize_note_block_references(
+            notes_with_content_blocks,
+            element_blocks=element_blocks_by_key,
+            protocol_figures=(
+                projected_opinion_section.get("protocol_figures", ())
+                if projected_opinion_section is not None
+                else ()
+            ),
+        )
     if projected_opinion_section is not None:
         content_sections.append(projected_opinion_section)
     implant_material_rows: list[dict[str, Any]] = []

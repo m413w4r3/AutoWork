@@ -13,13 +13,17 @@ from cti_app.application.analyst_opinion_service import OpinionError, OpinionErr
 from cti_app.application.investigation_graph_source import InvestigationGraphSource
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.application.publication_rendering import DraftPublicationRender
+from cti_app.application.publication_rendering import (
+    DraftPublicationRender,
+    load_note_block_render_context,
+)
 from cti_app.application.publication_title import (
     TitleCorrectionProof,
     publication_title_matches_synthesis,
     resolve_title_correction_proof,
 )
 from cti_app.application.typst_compilation import CompiledTypstDocument
+from cti_app.application.typst_rendering import NoteBlockRenderContext
 from cti_app.domain.analyst_opinion import (
     AnalystOpinionStatus,
     AnalystOpinionV1,
@@ -62,6 +66,7 @@ class DraftOpinionPdfRenderer(Protocol):
         base_publication_identity: dict[str, Any],
         base_publication_artifact: ProductionArtifact | None = None,
         title_proof: TitleCorrectionProof | None = None,
+        note_block_context: NoteBlockRenderContext | None = None,
     ) -> DraftPublicationRender | CompiledTypstDocument: ...
 
 
@@ -79,6 +84,7 @@ class DraftOpinionRenderInputBuilder(Protocol):
         base_publication_identity: dict[str, Any],
         base_publication_artifact: ProductionArtifact | None = None,
         title_proof: TitleCorrectionProof | None = None,
+        note_block_context: NoteBlockRenderContext | None = None,
     ) -> tuple[CanonicalPublicationDocument, dict[str, Any]]: ...
 
 
@@ -288,6 +294,13 @@ class AnalystOpinionPreviewService:
                 content_sha256="",
             )
 
+        note_block_context = await load_note_block_render_context(
+            uow_factory=self._uow_factory,
+            artifact_store=self._artifact_store,
+            opinion=render_opinion,
+            base_document=document,
+        )
+
         renderer_kwargs: dict[str, Any] = {}
         if document is not base_document_v5:
             renderer_kwargs["base_publication_body_sha256"] = publication_document_v5_sha256(
@@ -320,6 +333,8 @@ class AnalystOpinionPreviewService:
             preview_kwargs["title_proof"] = title_proof
         if infrastructure_graph is not None:
             preview_kwargs["infrastructure_graph"] = infrastructure_graph
+        if note_block_context is not None:
+            preview_kwargs["note_block_context"] = note_block_context
         if build_render_inputs:
             builder = cast(DraftOpinionRenderInputBuilder, self._renderer)
             return await builder.build_draft_preview_inputs(

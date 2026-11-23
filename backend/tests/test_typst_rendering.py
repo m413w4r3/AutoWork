@@ -9,18 +9,24 @@ import shutil
 import struct
 import subprocess
 from dataclasses import replace
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
 from pypdf import PdfReader
 
 from cti_app.application import typst_rendering as typst_rendering_module
+from cti_app.application.opinion_note_proposals import (
+    note_article_element_facts,
+)
 from cti_app.application.protocol_diagram_projection import PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION
-from cti_app.application.publication_augmentation import augment_publication_with_opinion
+from cti_app.application.publication_augmentation import (
+    OpinionCitationContext,
+    augment_publication_with_opinion,
+)
 from cti_app.application.publication_builder import (
     build_article_format_v1,
     build_publication_document_v5,
@@ -40,6 +46,8 @@ from cti_app.application.typst_rendering import (
     _IOC_RELEVANCE_REASON_LABELS,
     _IOC_SOURCE_ROLE_LABELS,
     _NOVELTY_CLASS_LABELS,
+    NoteBlockRenderContext,
+    NoteContentBlockRenderError,
     TemplateBundleInvalidError,
     TypstDraftPreviewDocument,
     TypstRenderer,
@@ -63,18 +71,33 @@ from cti_app.domain.analyst_opinion import (
     AnalystObservationV1,
     AnalystOpinionStatus,
     AnalystOpinionV1,
+    ArticleElementNoteBlockV1,
     BridgeDraftReferenceV1,
+    CanonicalCodeNoteBlockV1,
     ImplantMaterialEditorialV1,
     ImplantMaterialType,
+    IocTableNoteBlockV1,
+    NoteArticleElementKind,
     OpinionBlock,
     OpinionBlockType,
+    OpinionClaimQualification,
     OpinionProtocolFigureV1,
+    ProtocolFigureNoteBlockV1,
+    note_ioc_table_title,
     opinion_blocks_with_implant_materials,
     opinion_blocks_with_observations,
 )
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.editorial_figure_keys import ADOPTED_SOURCE_FIGURE_KEY_PREFIX
-from cti_app.domain.investigation import FindingAssessment, FindingKind, NoveltyClass
+from cti_app.domain.investigation import (
+    EvidenceKind as ObservationEvidenceKind,
+)
+from cti_app.domain.investigation import (
+    EvidenceObservation,
+    FindingAssessment,
+    FindingKind,
+    NoveltyClass,
+)
 from cti_app.domain.media_assets import MediaAssetKind, media_asset_id
 from cti_app.domain.production import ProductionEvidenceBasis
 from cti_app.domain.production_editorial_enrichment import (
@@ -124,6 +147,7 @@ from cti_app.domain.publication_document import (
     publication_document_from_json,
     publication_document_text_anchors,
     publication_document_v5_sha256,
+    publication_element_sha256,
     serialize_publication_document,
 )
 from cti_app.domain.publication_kind import PublicationKind
@@ -138,7 +162,11 @@ from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 from tests.editorial_enrichment_support import build_empty_editorial_enrichment
 from tests.test_publication_builder_v4 import (
     _canonical_inputs,
+    _enrichment_with,
     _frontmatter_v6_case,
+)
+from tests.test_publication_builder_v4 import (
+    _chart as _enrichment_chart,
 )
 from tests.test_publication_builder_v4 import (
     _table as _enrichment_table,
@@ -2553,3 +2581,750 @@ def test_table_column_weights_are_deterministic_bounded_and_content_sensitive() 
     assert narrow_weights == _table_column_weights(narrow)
     assert all(0.8 <= weight <= 2.4 for weight in wide_weights)
     assert wide_weights[1] > wide_weights[0]
+
+
+# ---------------------------------------------------------------------------
+# F4-D B5b — Typst rendering of note content blocks
+# ---------------------------------------------------------------------------
+
+_NOTE_BLOCK_ANCHOR_ID = UUID(int=8801)
+_NOTE_BLOCK_ANCHOR = "lead:0001"
+
+
+def _note_block_v9(
+    *,
+    tables: tuple = (),
+    charts: tuple = (),
+) -> tuple[PublicationDocumentV9, PublicationDocumentV5, object]:
+    """Build a V9 article whose after-paragraph elements resolve to lead:0001."""
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    enrichment = _enrichment_with(
+        extraction=extraction,
+        synthesis=synthesis,
+        tables=tables,
+        charts=charts,
+    )
+    base = build_publication_document_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+    placements: list[ResolvedPublicationPlacementV1] = []
+    position = 0
+    for kind, elements in (
+        ("table", base.document.tables),
+        ("chart", base.document.charts),
+        ("diagram", base.document.diagrams),
+        ("figure", base.document.figures),
+    ):
+        for element in elements:
+            if element.placement.kind is EnrichmentPlacementKind.AFTER_PARAGRAPH:
+                placements.append(
+                    ResolvedPublicationPlacementV1(
+                        element_kind=kind,
+                        element_key=element.key,
+                        element_position=position,
+                        anchor_block_id=_NOTE_BLOCK_ANCHOR_ID,
+                        anchor_pointer="/lead/0",
+                        anchor_canonical_position=0,
+                        paragraph_kind="lead",
+                        section_index=None,
+                        paragraph_index=0,
+                    )
+                )
+            position += 1
+    v9 = PublicationDocumentV9(
+        base_publication=PublicationDocumentV7(
+            base_publication=_v6(base),
+            publication_kind=PublicationKind.ARTICLE,
+            routing_decision_hash="a" * 64,
+            routing_policy_version="routing-policy-v1",
+        ),
+        article_format=build_article_format_v1(base, extraction),
+        registry_hash="b" * 64,
+        synthesis_canonical_sha256="c" * 64,
+        enrichment_canonical_sha256="d" * 64,
+        resolved_placements=tuple(placements),
+    )
+    return v9, base, extraction
+
+
+def _after_paragraph_table(key: str = "note-linked-table"):
+    _, _, extraction, _ = _canonical_inputs()
+    return replace(
+        _enrichment_table(extraction_evidence_refs_v1(extraction)[0], key=key),
+        placement=EnrichmentPlacementV1(
+            EnrichmentPlacementKind.AFTER_PARAGRAPH,
+            anchor_block_id=_NOTE_BLOCK_ANCHOR_ID,
+        ),
+    )
+
+
+def _after_paragraph_chart(key: str = "note-linked-chart"):
+    _, _, extraction, _ = _canonical_inputs()
+    return replace(
+        _enrichment_chart(extraction_evidence_refs_v1(extraction)[0]),
+        key=key,
+        placement=EnrichmentPlacementV1(
+            EnrichmentPlacementKind.AFTER_PARAGRAPH,
+            anchor_block_id=_NOTE_BLOCK_ANCHOR_ID,
+        ),
+    )
+
+
+def _note_v9_with_opinion(
+    v9: PublicationDocumentV9,
+    *,
+    notes: tuple[AnalystObservationV1, ...],
+    observations: tuple[EvidenceObservation, ...],
+    investigation_id: UUID,
+) -> PublicationDocumentV9:
+    base_sha256 = hashlib.sha256(
+        json.dumps(
+            serialize_publication_document(v9),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    artifact_id = uuid4()
+    opinion = AnalystOpinionV1(
+        investigation_id=investigation_id,
+        synthesis_artifact_id=uuid4(),
+        synthesis_sha256="1" * 64,
+        base_publication_artifact_id=artifact_id,
+        base_publication_sha256=base_sha256,
+        blocks=opinion_blocks_with_observations(
+            (
+                OpinionBlock(
+                    OpinionBlockType.KEY_FINDINGS,
+                    "Constat de démonstration.",
+                    qualification=OpinionClaimQualification.HYPOTHESIS,
+                ),
+            ),
+            notes,
+        ),
+        author_id="fixture-analyst",
+        reviewer_id="fixture-reviewer",
+        status=AnalystOpinionStatus.APPROVED,
+    )
+    augmented = augment_publication_with_opinion(
+        v9,
+        opinion,
+        OpinionCitationContext(
+            base_publication_artifact_id=artifact_id,
+            base_publication_sha256=base_sha256,
+            investigation_id=investigation_id,
+            approver_id="fixture-approver",
+            findings=(),
+            observations=observations,
+            tlp_violation=False,
+            do_not_submit=False,
+        ),
+    )
+    return PublicationDocumentV9(
+        base_publication=augmented.base_publication,  # type: ignore[arg-type]
+        article_format=augmented.article_format,  # type: ignore[arg-type]
+        registry_hash=v9.registry_hash,
+        synthesis_canonical_sha256=v9.synthesis_canonical_sha256,
+        enrichment_canonical_sha256=v9.enrichment_canonical_sha256,
+        resolved_placements=v9.resolved_placements,
+    )
+
+
+def test_note_content_blocks_render_with_provenance() -> None:
+    """B5b: refs resolve in notes_by_anchor; elements are referenced, never copied."""
+    table = _after_paragraph_table()
+    v9, base, _extraction = _note_block_v9(tables=(table,))
+    investigation_id = uuid4()
+    published_table = base.document.tables[0]
+    element_sha256 = publication_element_sha256(
+        base.document, kind="table", key=published_table.key
+    )
+    evidence = EvidenceObservation(
+        investigation_id=investigation_id,
+        kind=ObservationEvidenceKind.OTHER,
+        blob_id=uuid4(),
+        sha256="e" * 64,
+        source="vt",
+        source_version="fixture.v1",
+        observed_at=datetime.now(UTC),
+        object_type="file",
+        object_id="note-sample.bin",
+    )
+    note = AnalystObservationV1(
+        id=UUID(int=8811),
+        anchor=_NOTE_BLOCK_ANCHOR,
+        text="NOTE-TABLE-CROSS-REFERENCE",
+        state=AnalystObservationState.UNRESOLVED,
+        relation=AnalystObservationRelation.UNRESOLVED,
+        content_blocks=(
+            ArticleElementNoteBlockV1(
+                kind=NoteArticleElementKind.TABLE,
+                element_key=published_table.key,
+                element_sha256=element_sha256,
+                anchor=_NOTE_BLOCK_ANCHOR,
+            ),
+            IocTableNoteBlockV1(
+                observation_ids=(evidence.id,),
+                title=note_ioc_table_title(1),
+            ),
+        ),
+    )
+    document = _note_v9_with_opinion(
+        v9,
+        notes=(note,),
+        observations=(evidence,),
+        investigation_id=investigation_id,
+    )
+
+    model = project_publication_to_typst_model(
+        document,
+        note_block_context=NoteBlockRenderContext(observations=(evidence,)),
+    )
+    synthesis = next(item for item in model.content_sections if item["type"] == "synthesis")
+    blocks = synthesis["blocks"]
+    note_block = next(
+        item for item in blocks if item.get("type") == "analyst_observation" and item.get("blocks")
+    )
+    assert note_block["text"] == "NOTE-TABLE-CROSS-REFERENCE"
+    rendered_blocks = note_block["blocks"]
+    assert [block["block_type"] for block in rendered_blocks] == [
+        "article_element",
+        "ioc_table",
+    ]
+
+    reference = rendered_blocks[0]
+    assert reference["kind"] == "table"
+    assert reference["element_key"] == published_table.key
+    assert reference["reference_label"] == f"Tableau — {published_table.title}"
+    reference_provenance = "".join(part["text"] for part in reference["provenance"])
+    assert element_sha256 in reference_provenance
+    assert _NOTE_BLOCK_ANCHOR in reference_provenance
+
+    ioc = rendered_blocks[1]
+    assert ioc["title"] == note_ioc_table_title(1)
+    assert [cell["text"] for cell in ioc["pipe_table"]["header"]] == [
+        "Observation",
+        "Type",
+        "Valeur",
+        "Source",
+        "Observé le",
+        "Empreinte",
+    ]
+    (row,) = ioc["pipe_table"]["rows"]
+    assert [cell["text"] for cell in row] == [
+        str(evidence.id),
+        "file",
+        "note-sample.bin",
+        "vt",
+        evidence.observed_at.isoformat(),
+        evidence.sha256,
+    ]
+    ioc_provenance = "".join(part["text"] for part in ioc["provenance"])
+    assert "Observations canoniques de cette enquête : 1" in ioc_provenance
+
+    # The element is rendered at its article placement only; the note references it.
+    assert (
+        sum(
+            1
+            for item in blocks
+            if item.get("type") == "table" and item.get("key") == published_table.key
+        )
+        == 1
+    )
+    table_position = next(
+        index
+        for index, item in enumerate(blocks)
+        if item.get("type") == "table" and item.get("key") == published_table.key
+    )
+    note_position = blocks.index(note_block)
+    assert table_position < note_position
+    facts = note_article_element_facts(document)
+    assert [(fact.kind, fact.key, fact.anchor) for fact in facts] == [
+        ("table", published_table.key, _NOTE_BLOCK_ANCHOR)
+    ]
+
+
+def test_note_chart_without_evidence_refused() -> None:
+    """B5b: a chart whose points carry no evidence is refused before compilation."""
+    chart = _after_paragraph_chart()
+    v9, base, _extraction = _note_block_v9(charts=(chart,))
+    investigation_id = uuid4()
+    published_chart = base.document.charts[0]
+    facts = note_article_element_facts(v9)
+    (chart_fact,) = facts
+    assert chart_fact.kind == "chart"
+    unevidenced_fact = replace(chart_fact, evidence_ref_count=0)
+    note = AnalystObservationV1(
+        id=UUID(int=8812),
+        anchor=_NOTE_BLOCK_ANCHOR,
+        text="NOTE-CHART-REFERENCE",
+        state=AnalystObservationState.UNRESOLVED,
+        relation=AnalystObservationRelation.UNRESOLVED,
+        content_blocks=(
+            ArticleElementNoteBlockV1(
+                kind=NoteArticleElementKind.CHART,
+                element_key=published_chart.key,
+                element_sha256=chart_fact.element_sha256,
+                anchor=_NOTE_BLOCK_ANCHOR,
+            ),
+        ),
+    )
+    document = _note_v9_with_opinion(
+        v9,
+        notes=(note,),
+        observations=(),
+        investigation_id=investigation_id,
+    )
+
+    with pytest.raises(NoteContentBlockRenderError) as failure:
+        project_publication_to_typst_model(
+            document,
+            note_block_context=NoteBlockRenderContext(element_facts=(unevidenced_fact,)),
+        )
+    assert failure.value.code == "note_chart_without_evidence"
+
+    # The same block renders its deterministic cross-reference when evidenced.
+    model = project_publication_to_typst_model(
+        document,
+        note_block_context=NoteBlockRenderContext(element_facts=(chart_fact,)),
+    )
+    synthesis = next(item for item in model.content_sections if item["type"] == "synthesis")
+    note_block = next(
+        item
+        for item in synthesis["blocks"]
+        if item.get("type") == "analyst_observation" and item.get("blocks")
+    )
+    assert note_block["blocks"][0]["reference_label"] == (f"Figure 1 — {published_chart.title}")
+
+
+def test_load_note_block_render_context_reads_only_cited_code_blobs() -> None:
+    """The published render path reads exactly the observations its blocks cite."""
+    from cti_app.application.publication_rendering import load_note_block_render_context
+
+    raw = b"cited bytes"
+    publication = _base_v5()
+    observation = EvidenceObservation(
+        investigation_id=uuid4(),
+        kind=ObservationEvidenceKind.BINARY_ANALYSIS,
+        blob_id=uuid4(),
+        sha256=hashlib.sha256(raw).hexdigest(),
+        source="native_analysis",
+        source_version="fixture.v1",
+        observed_at=datetime.now(UTC),
+        object_type="native_analysis",
+        object_id="cited.bin",
+    )
+    block = CanonicalCodeNoteBlockV1(
+        observation_id=observation.id,
+        blob_sha256=observation.sha256,
+        offset=0,
+        length=len(raw),
+        excerpt_sha256=hashlib.sha256(raw).hexdigest(),
+        language="text",
+    )
+    note = AnalystObservationV1(
+        id=UUID(int=8822),
+        anchor=_NOTE_BLOCK_ANCHOR,
+        text="NOTE-CONTEXT-FIXTURE",
+        state=AnalystObservationState.UNRESOLVED,
+        relation=AnalystObservationRelation.UNRESOLVED,
+        content_blocks=(block,),
+    )
+    opinion = AnalystOpinionV1(
+        investigation_id=observation.investigation_id,
+        synthesis_artifact_id=uuid4(),
+        synthesis_sha256="5" * 64,
+        base_publication_artifact_id=uuid4(),
+        base_publication_sha256=publication_document_v5_sha256(publication),
+        blocks=opinion_blocks_with_observations(
+            (
+                OpinionBlock(
+                    OpinionBlockType.KEY_FINDINGS,
+                    "Constat de démonstration.",
+                    qualification=OpinionClaimQualification.HYPOTHESIS,
+                ),
+            ),
+            (note,),
+        ),
+        author_id="fixture-analyst",
+    )
+
+    class _Uow:
+        def __init__(self) -> None:
+            self.evidence_observations = SimpleNamespace(list_for_investigation=self._list)
+
+        async def _list(self, investigation_id: UUID) -> list[EvidenceObservation]:
+            assert investigation_id == observation.investigation_id
+            return [observation]
+
+        async def __aenter__(self) -> _Uow:
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+    class _Store:
+        def __init__(self) -> None:
+            self.reads: list[UUID] = []
+
+        async def read_bytes(self, blob_id: UUID, *, max_bytes: int | None = None) -> bytes:
+            self.reads.append(blob_id)
+            return raw
+
+    store = _Store()
+    context = asyncio.run(
+        load_note_block_render_context(
+            uow_factory=cast(Any, lambda: _Uow()),
+            artifact_store=cast(Any, store),
+            opinion=opinion,
+            base_document=publication,
+        )
+    )
+
+    assert context is not None
+    assert context.observations == (observation,)
+    assert context.blobs == {observation.id: raw}
+    assert store.reads == [observation.blob_id]
+    blockedless = replace(
+        opinion, blocks=opinion_blocks_with_observations((), ()), content_sha256=""
+    )
+    assert (
+        asyncio.run(
+            load_note_block_render_context(
+                uow_factory=cast(Any, lambda: _Uow()),
+                artifact_store=cast(Any, store),
+                opinion=blockedless,
+                base_document=publication,
+            )
+        )
+        is None
+    )
+
+
+def test_note_stale_block_ref_refused() -> None:
+    """B5b: an element hash that no longer matches the rendered article is stale."""
+    table = _after_paragraph_table()
+    v9, base, _extraction = _note_block_v9(tables=(table,))
+    investigation_id = uuid4()
+    published_table = base.document.tables[0]
+    note = AnalystObservationV1(
+        id=UUID(int=8818),
+        anchor=_NOTE_BLOCK_ANCHOR,
+        text="NOTE-STALE-REFERENCE",
+        state=AnalystObservationState.UNRESOLVED,
+        relation=AnalystObservationRelation.UNRESOLVED,
+        content_blocks=(
+            ArticleElementNoteBlockV1(
+                kind=NoteArticleElementKind.TABLE,
+                element_key=published_table.key,
+                element_sha256="0" * 64,
+                anchor=_NOTE_BLOCK_ANCHOR,
+            ),
+        ),
+    )
+    document = _note_v9_with_opinion(
+        v9,
+        notes=(note,),
+        observations=(),
+        investigation_id=investigation_id,
+    )
+
+    with pytest.raises(NoteContentBlockRenderError) as failure:
+        project_publication_to_typst_model(document)
+    assert failure.value.code == "note_block_ref_stale"
+
+
+def test_note_protocol_figure_references_the_opinion_annex() -> None:
+    """B5b: protocol figures stay in the opinion annex; the note cross-references one."""
+    protocol_figures = tuple(
+        OpinionProtocolFigureV1(
+            kind=kind,
+            model_sha256="a" * 64,
+            spec_sha256="b" * 64,
+            asset_id=UUID(int=8820 + index),
+            asset_sha256="c" * 64,
+            preview_sha256="d" * 64,
+            pin_sha256="e" * 64,
+            compiler_name="d2",
+            compiler_version="0.6.9",
+            compiler_policy_version=PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION,
+            caption="Vue de protocole de démonstration.",
+        )
+        for index, kind in enumerate(
+            (
+                ProtocolDiagramKind.SEQUENCE,
+                ProtocolDiagramKind.STATE_MACHINE,
+                ProtocolDiagramKind.MESSAGE_FORMAT,
+            )
+        )
+    )
+    publication = _base_v5()
+    note = AnalystObservationV1(
+        id=UUID(int=8821),
+        anchor=_NOTE_BLOCK_ANCHOR,
+        text="NOTE-PROTOCOL-REFERENCE",
+        state=AnalystObservationState.UNRESOLVED,
+        relation=AnalystObservationRelation.UNRESOLVED,
+        content_blocks=(
+            ProtocolFigureNoteBlockV1(
+                kind=ProtocolDiagramKind.SEQUENCE,
+                asset_sha256="c" * 64,
+            ),
+        ),
+    )
+    opinion = AnalystOpinionV1(
+        investigation_id=uuid4(),
+        synthesis_artifact_id=uuid4(),
+        synthesis_sha256="4" * 64,
+        base_publication_artifact_id=uuid4(),
+        base_publication_sha256=publication_document_v5_sha256(publication),
+        blocks=opinion_blocks_with_observations(
+            (
+                OpinionBlock(
+                    OpinionBlockType.KEY_FINDINGS,
+                    "Constat de démonstration.",
+                    qualification=OpinionClaimQualification.HYPOTHESIS,
+                ),
+            ),
+            (note,),
+        ),
+        author_id="fixture-analyst",
+        protocol_figures=protocol_figures,
+    )
+    model = project_publication_to_typst_model(
+        TypstDraftPreviewDocument(base_publication=publication, analyst_opinion=opinion)
+    )
+    synthesis = next(item for item in model.content_sections if item["type"] == "synthesis")
+    note_block = next(
+        item
+        for item in synthesis["blocks"]
+        if item.get("type") == "analyst_observation" and item.get("blocks")
+    )
+    (reference,) = note_block["blocks"]
+    assert reference["block_type"] == "protocol_figure"
+    assert reference["reference_label"] == ("Figure 1 — Séquence réseau du protocole, en annexe")
+    provenance = "".join(part["text"] for part in reference["provenance"])
+    assert "c" * 64 in provenance
+    opinion_section = next(
+        item for item in model.content_sections if item["type"] == "analyst_opinion"
+    )
+    assert [figure["key"] for figure in opinion_section["protocol_figures"]] == [
+        "protocol-sequence",
+        "protocol-state_machine",
+        "protocol-message_format",
+    ]
+
+
+def test_note_without_content_blocks_renders_byte_identically(tmp_path: Path) -> None:
+    """B5b: a v1 note without blocks keeps the exact pre-B5b render-data bytes."""
+    publication = _base_v5()
+    note = AnalystObservationV1(
+        id=UUID(int=8814),
+        anchor=_NOTE_BLOCK_ANCHOR,
+        text="NOTE-SANS-BLOCS",
+        state=AnalystObservationState.UNRESOLVED,
+        relation=AnalystObservationRelation.UNRESOLVED,
+    )
+    opinion = AnalystOpinionV1(
+        investigation_id=UUID(int=8815),
+        synthesis_artifact_id=UUID(int=8816),
+        synthesis_sha256="3" * 64,
+        base_publication_artifact_id=UUID(int=8817),
+        base_publication_sha256=publication_document_v5_sha256(publication),
+        blocks=opinion_blocks_with_observations(
+            (
+                OpinionBlock(
+                    OpinionBlockType.KEY_FINDINGS,
+                    "Constat de démonstration.",
+                    qualification=OpinionClaimQualification.HYPOTHESIS,
+                ),
+            ),
+            (note,),
+        ),
+        author_id="fixture-analyst",
+    )
+    preview = TypstDraftPreviewDocument(base_publication=publication, analyst_opinion=opinion)
+    renderer, bundle = _renderer(tmp_path)
+
+    rendered = _render(renderer, preview, bundle)
+    data = json.loads(rendered.render_data_bytes)
+    synthesis = next(item for item in data["content_sections"] if item["type"] == "synthesis")
+    projected_note = next(
+        item for item in synthesis["blocks"] if item["type"] == "analyst_observation"
+    )
+
+    # No key, no empty list: the v1 projection stays byte-identical to 6821f826.
+    assert "blocks" not in projected_note
+    assert hashlib.sha256(rendered.render_data_bytes).hexdigest() == (
+        "15ad059ddd079267dfd5aa4cc6ec5f6cc6da2b2f6c0c9a13818448aa79344ca3"
+    )
+
+
+def test_note_code_ref_exact_bytes(tmp_path: Path) -> None:
+    """B5b: code bytes are sliced from the observation blob, never supplied text."""
+    raw = b"xxCreateFileWyy"
+    excerpt = raw[2:13]
+    publication = _base_v5()
+    observation = EvidenceObservation(
+        investigation_id=uuid4(),
+        kind=ObservationEvidenceKind.BINARY_ANALYSIS,
+        blob_id=uuid4(),
+        sha256=hashlib.sha256(raw).hexdigest(),
+        source="native_analysis",
+        source_version="fixture.v1",
+        observed_at=datetime.now(UTC),
+        object_type="native_analysis",
+        object_id="note-code-sample.bin",
+    )
+    block = CanonicalCodeNoteBlockV1(
+        observation_id=observation.id,
+        blob_sha256=observation.sha256,
+        offset=2,
+        length=len(excerpt),
+        excerpt_sha256=hashlib.sha256(excerpt).hexdigest(),
+        language="c",
+    )
+    ioc_observation = EvidenceObservation(
+        investigation_id=observation.investigation_id,
+        kind=ObservationEvidenceKind.SHODAN_OBSERVATION,
+        blob_id=uuid4(),
+        sha256="f" * 64,
+        source="shodan",
+        source_version="fixture.v1",
+        observed_at=datetime.now(UTC),
+        object_type="ip",
+        object_id="192.0.2.10",
+    )
+    ioc_block = IocTableNoteBlockV1(
+        observation_ids=(ioc_observation.id,),
+        title=note_ioc_table_title(1),
+    )
+    note = AnalystObservationV1(
+        id=UUID(int=8813),
+        anchor=_NOTE_BLOCK_ANCHOR,
+        text="NOTE-CODE-FIXTURE-ALPHA",
+        state=AnalystObservationState.UNRESOLVED,
+        relation=AnalystObservationRelation.UNRESOLVED,
+        content_blocks=(block, ioc_block),
+    )
+    opinion = AnalystOpinionV1(
+        investigation_id=observation.investigation_id,
+        synthesis_artifact_id=uuid4(),
+        synthesis_sha256="2" * 64,
+        base_publication_artifact_id=uuid4(),
+        base_publication_sha256=publication_document_v5_sha256(publication),
+        blocks=opinion_blocks_with_observations(
+            (
+                OpinionBlock(
+                    OpinionBlockType.KEY_FINDINGS,
+                    "Constat de démonstration.",
+                    qualification=OpinionClaimQualification.HYPOTHESIS,
+                ),
+            ),
+            (note,),
+        ),
+        author_id="fixture-analyst",
+    )
+    preview = TypstDraftPreviewDocument(
+        base_publication=publication,
+        analyst_opinion=opinion,
+    )
+    context = NoteBlockRenderContext(
+        observations=(observation, ioc_observation),
+        blobs={observation.id: raw},
+    )
+    model = project_publication_to_typst_model(preview, note_block_context=context)
+    synthesis = next(item for item in model.content_sections if item["type"] == "synthesis")
+    note_block = next(
+        item
+        for item in synthesis["blocks"]
+        if item.get("type") == "analyst_observation" and item.get("blocks")
+    )
+    assert [item["block_type"] for item in note_block["blocks"]] == [
+        "canonical_code",
+        "ioc_table",
+    ]
+    code_block = note_block["blocks"][0]
+    assert code_block["excerpt"] == "CreateFileW"
+    assert "".join(line["text"] for line in code_block["code_lines"]) == "CreateFileW"
+    provenance = "".join(part["text"] for part in code_block["provenance"])
+    assert observation.sha256 in provenance
+    assert hashlib.sha256(excerpt).hexdigest() in provenance
+    assert "octets 2-13" in provenance
+    assert "native_analysis" in provenance
+
+    # A missing or divergent blob refuses the whole note, never a partial render.
+    for stale_blobs in ({}, {observation.id: b"tampered bytes"}):
+        with pytest.raises(NoteContentBlockRenderError) as failure:
+            project_publication_to_typst_model(
+                preview,
+                note_block_context=NoteBlockRenderContext(
+                    observations=(observation,), blobs=stale_blobs
+                ),
+            )
+        assert failure.value.code == "note_code_ref_stale"
+
+    binary = os.environ.get("TYPST_BINARY") or str(
+        Path.home() / ".local" / "share" / "autowork-tools" / "typst"
+    )
+    if shutil.which(binary) is None and not Path(binary).is_file():
+        pytest.skip("pinned Typst 0.15.1 is unavailable")
+    version = subprocess.run(
+        (binary, "--version"), capture_output=True, check=True, text=True, timeout=10
+    ).stdout.strip()
+    assert version.startswith("typst 0.15.1"), version
+
+    repository_root = Path(__file__).resolve().parents[2]
+    template_root = repository_root / "chpTypst"
+    bundle = load_template_bundle(template_root)
+    rendered = TypstRenderer().render(
+        preview,
+        bundle,
+        document_label="Note code fixture",
+        note_block_context=context,
+    )
+    workspace = tmp_path / "workspace"
+    for template_file in bundle.files:
+        destination = workspace / template_file.relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(template_file.content)
+    render_data_path = workspace / rendered.render_data_relative_path
+    render_data_path.parent.mkdir(parents=True, exist_ok=True)
+    render_data_path.write_bytes(rendered.render_data_bytes)
+    font_root = Path(os.environ.get("FONT_BUNDLE_ROOT", str(template_root)))
+    fonts_lock = Path(
+        os.environ.get(
+            "TYPST_FONTS_LOCK_FILE",
+            str(repository_root / "infra" / "typst-fonts.lock"),
+        )
+    )
+    font_snapshot = load_font_bundle_snapshot(font_root, fonts_lock)
+    font_paths = materialize_font_bundle(font_snapshot, tmp_path / "fonts")
+    compiled = asyncio.run(
+        TypstSubprocessCompiler(binary=binary).compile(
+            TypstCompileRequest(
+                workspace_root=workspace,
+                entrypoint_relative_path=rendered.entrypoint_relative_path,
+                font_paths=font_paths,
+            )
+        )
+    )
+    assert compiled.media_type == "application/pdf"
+    pdf = PdfReader(io.BytesIO(compiled.content), strict=True)
+    assert pdf.pages
+    pdf_text = " ".join((page.extract_text() or "") for page in pdf.pages)
+    compact = "".join(pdf_text.split())
+    anchor_text = "".join(publication.document.lead[0].text.split())
+    assert "NOTE-CODE-FIXTURE-ALPHA" in compact
+    assert "CreateFileW" in compact
+    assert "TableauIOC(1)" in compact
+    assert "192.0.2.10" in compact
+    assert observation.sha256[:32] in compact
+    assert compact.index(anchor_text) < compact.index("NOTE-CODE-FIXTURE-ALPHA")
+    assert compact.index("NOTE-CODE-FIXTURE-ALPHA") < compact.index("CreateFileW")
+    assert compact.index("CreateFileW") < compact.index("TableauIOC(1)")
