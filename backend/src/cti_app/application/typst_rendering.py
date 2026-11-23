@@ -2106,9 +2106,13 @@ def _technical_ioc_annex(
 
         reference_rows: list[list[dict[str, Any]]] = []
         for row in rows:
-            if not isinstance(row, list) or len(row) != 6 or any(
-                not isinstance(cell, dict) or not isinstance(cell.get("text"), str)
-                for cell in row
+            if (
+                not isinstance(row, list)
+                or len(row) != 6
+                or any(
+                    not isinstance(cell, dict) or not isinstance(cell.get("text"), str)
+                    for cell in row
+                )
             ):
                 raise TemplateBundleInvalidError("IOC note table has an invalid canonical row")
             observation_id, object_type, object_id, source, observed_at, fingerprint = (

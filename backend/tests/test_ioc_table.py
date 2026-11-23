@@ -641,26 +641,30 @@ def test_note_ioc_table_identifiers_do_not_overlap_in_edition_pdf(tmp_path: Path
 def _large_note_ioc_preview() -> tuple[TypstDraftPreviewDocument, tuple[str, ...]]:
     base = _base_v5()
     investigation_id = UUID(int=820000)
-    values = [
-        (
-            "md5",
-            hashlib.md5(f"synthetic md5 IOC {index}".encode(), usedforsecurity=False).hexdigest(),
-        )
-        for index in range(1, 13)
-    ] + [
-        ("sha1", hashlib.sha1(f"synthetic sha1 IOC {index}".encode()).hexdigest())
-        for index in range(13, 25)
-    ] + [
-        ("sha256", hashlib.sha256(f"synthetic sha256 IOC {index}".encode()).hexdigest())
-        for index in range(25, 37)
-    ]
+    values = (
+        [
+            (
+                "md5",
+                hashlib.md5(
+                    f"synthetic md5 IOC {index}".encode(), usedforsecurity=False
+                ).hexdigest(),
+            )
+            for index in range(1, 13)
+        ]
+        + [
+            ("sha1", hashlib.sha1(f"synthetic sha1 IOC {index}".encode()).hexdigest())
+            for index in range(13, 25)
+        ]
+        + [
+            ("sha256", hashlib.sha256(f"synthetic sha256 IOC {index}".encode()).hexdigest())
+            for index in range(25, 37)
+        ]
+    )
     values.append(
         (
             "url",
             "https://cdn.example.invalid/"
-            + "/".join(
-                ("segment-" + chr(96 + index) * 38) for index in range(1, 5)
-            )
+            + "/".join(("segment-" + chr(96 + index) * 38) for index in range(1, 5))
             + "/payload.bin?download=1&campaign=long-path-test",
         )
     )
@@ -696,8 +700,7 @@ def _large_note_ioc_preview() -> tuple[TypstDraftPreviewDocument, tuple[str, ...
     )
     expected_hash_lengths = {"md5": 32, "sha1": 40, "sha256": 64}
     assert all(
-        len(value) == expected_hash_lengths[object_type]
-        and re.fullmatch(r"[0-9a-f]+", value)
+        len(value) == expected_hash_lengths[object_type] and re.fullmatch(r"[0-9a-f]+", value)
         for object_type, value in values
         if object_type in expected_hash_lengths
     )
@@ -724,9 +727,7 @@ def _large_note_ioc_preview() -> tuple[TypstDraftPreviewDocument, tuple[str, ...
     )
     anchor = next(
         item
-        for item in publication_document_text_anchors(
-            base.document, references=base.references
-        )
+        for item in publication_document_text_anchors(base.document, references=base.references)
         if item.startswith("lead:")
     )
     note = AnalystObservationV1(
