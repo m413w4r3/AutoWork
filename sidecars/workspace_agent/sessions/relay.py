@@ -250,6 +250,10 @@ class BackendTransport(Protocol):
         timeout: float,
     ) -> RelayResponse: ...
 
+    def cancel(self) -> None:
+        """Abort every in-flight request, if the transport can still reach it."""
+        ...
+
 
 @dataclass(frozen=True)
 class SessionBinding:
@@ -314,6 +318,28 @@ class HttpBackendTransport:
         self._target = target
         self._max_response_bytes = max_response_bytes
         self._clock = time.monotonic if clock is None else clock
+        self._lock = threading.Lock()
+        self._active: set[http.client.HTTPConnection] = set()
+
+    def cancel(self) -> None:
+        """Shut down the sockets of the requests currently talking to the backend.
+
+        HTTP cannot unsend an effect the backend already applied; closing the
+        socket only stops a response that has not arrived yet.  The backend
+        revalidates the session and lease on its side, so this bounds exposure
+        without pretending the request never happened.
+        """
+
+        with self._lock:
+            connections = tuple(self._active)
+        for connection in connections:
+            connection_socket = connection.sock
+            if connection_socket is None:
+                continue
+            try:
+                connection_socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
     def send(
         self,
@@ -328,6 +354,8 @@ class HttpBackendTransport:
         connection = http.client.HTTPConnection(
             self._target.host, self._target.port, timeout=timeout
         )
+        with self._lock:
+            self._active.add(connection)
         try:
             try:
                 connection.request(method, path, body=body, headers=dict(headers))
@@ -376,6 +404,8 @@ class HttpBackendTransport:
                 body=bytes(kept),
             )
         finally:
+            with self._lock:
+                self._active.discard(connection)
             connection.close()
 
 
@@ -548,9 +578,13 @@ class BrokerRelay:
             self._thread.start()
 
     def revoke(self) -> None:
-        """Refuse every further request and abort in-flight connections."""
+        """Refuse every further request and abort in-flight requests."""
         with self._lifecycle_lock:
             self._revoked = True
+        # Stop the backend request before dropping the client socket: HTTP
+        # cannot unsend an effect already applied, but the socket close keeps
+        # an ``advisor.consult``-style call from completing after revocation.
+        self._transport.cancel()
         self._abort_connections()
 
     def close(self) -> None:
@@ -570,6 +604,7 @@ class BrokerRelay:
                 pass
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=2)
+        self._transport.cancel()
         self._abort_connections()
         self._unlink_socket()
 
@@ -693,16 +728,16 @@ class BrokerRelay:
                 tool = self._validate_body(operation, request.body)
                 if not self._session_active():
                     raise RelayRejection.session_inactive()
-                response = self._forward(request, self._operation_timeout(operation, tool))
-                self._write_response(connection, response)
             except RelayRejection as rejection:
                 self._write_error(connection, rejection)
+                return
             except TimeoutError:
                 self._write_error(connection, RelayRejection.timeout(outcome_unknown=False))
+                return
             except _PeerClosed:
-                pass
+                return
             except OSError:
-                pass
+                return
             except Exception:
                 # Boundary: a defect must never leak a traceback or payload.
                 self._log.warning(
@@ -710,6 +745,33 @@ class BrokerRelay:
                     self._binding.session_id,
                     route_label,
                 )
+                return
+            # The request is fully validated and is now forwarded: from here a
+            # lost response is an ambiguous outcome and may never be reported
+            # as ``not_sent``.
+            try:
+                response = self._forward(request, self._operation_timeout(operation, tool))
+            except RelayRejection as rejection:
+                self._write_error(connection, rejection)
+                return
+            except TimeoutError:
+                self._write_error(connection, RelayRejection.timeout(outcome_unknown=True))
+                return
+            except Exception:
+                self._log.warning(
+                    "relay_internal_error session=%s method=POST route=%s",
+                    self._binding.session_id,
+                    route_label,
+                )
+                return
+            try:
+                self._write_response(connection, response)
+            except TimeoutError:
+                # Writing the response timed out after the backend had already
+                # answered: the outcome is unknown, never "not sent".
+                self._write_error(connection, RelayRejection.timeout(outcome_unknown=True))
+            except OSError:
+                pass
         finally:
             self._log.info(
                 "relay_request session=%s method=POST route=%s",
@@ -909,12 +971,16 @@ class BrokerRelay:
         payload = json.dumps(
             rejection.envelope(), separators=(",", ":"), ensure_ascii=False
         ).encode("utf-8")
-        self._write_http(
-            connection,
-            rejection.status,
-            [("Content-Type", "application/json")],
-            payload,
-        )
+        try:
+            self._write_http(
+                connection,
+                rejection.status,
+                [("Content-Type", "application/json")],
+                payload,
+            )
+        except OSError:
+            # A slow or closed client does not change the recorded decision.
+            pass
 
     @staticmethod
     def _write_http(
@@ -931,6 +997,10 @@ class BrokerRelay:
         payload = ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1") + body
         try:
             connection.sendall(payload)
+        except TimeoutError:
+            # The caller decides whether a timed-out write is ambiguous; an
+            # error envelope write itself is simply abandoned.
+            raise
         except OSError:
             pass
 

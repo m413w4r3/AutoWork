@@ -139,6 +139,19 @@ def open_client(proxy: egress.EgressProxy, *, timeout: float = 5.0) -> socket.so
     return connection
 
 
+def open_client_eventually(proxy: egress.EgressProxy, *, timeout: float = 10.0) -> socket.socket:
+    """Retry a full accept backlog; a bounded proxy may refuse briefly."""
+
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return open_client(proxy)
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.005)
+
+
 def connect_request(authority: str = ALLOWED_AUTHORITY, *, headers: bytes = b"") -> bytes:
     encoded = authority.encode("utf-8")
     return b"CONNECT " + encoded + b" HTTP/1.1\r\nHost: " + encoded + b"\r\n" + headers + b"\r\n"
@@ -207,6 +220,15 @@ def wait_for_log(
         if len(lines) >= count or time.monotonic() >= deadline:
             return lines
         time.sleep(0.01)
+
+
+def wait_until(predicate: Callable[[], bool], *, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.01)
+    raise AssertionError("condition not met within the timeout")
 
 
 def exchange(
@@ -776,6 +798,8 @@ def test_production_bounds_are_the_designed_ones() -> None:
     assert egress.RESOLVE_TIMEOUT_SECONDS == 5.0
     assert egress.TUNNEL_IDLE_TIMEOUT_SECONDS == 600.0
     assert egress.MAX_CONCURRENT_TUNNELS == 8
+    assert egress.MAX_CONCURRENT_CONNECTIONS == 16
+    assert egress.MAX_CONCURRENT_RESOLVERS == egress.MAX_CONCURRENT_TUNNELS
     assert egress.MAX_CONNECT_REQUEST_BYTES == 8 * 1024
     assert egress.TUNNEL_BUFFER_BYTES == 64 * 1024
     assert egress.EGRESS_LOG_MAX_BYTES == 2 * 1024 * 1024
@@ -884,6 +908,162 @@ def test_concurrent_tunnel_limit_is_eight(
             client.close()
 
 
+# -- F3: same-process resource ceilings are applied before validation --------
+
+
+def test_connections_over_the_simultaneous_cap_are_refused_without_a_thread(
+    proxy_factory: Callable[..., egress.EgressProxy], short_dir: Path
+) -> None:
+    proxy = proxy_factory(request_timeout_seconds=5.0)
+    idle = [open_client(proxy) for _ in range(egress.MAX_CONCURRENT_CONNECTIONS)]
+    try:
+        wait_until(lambda: proxy.active_connections == egress.MAX_CONCURRENT_CONNECTIONS)
+        baseline = threading.active_count()
+        with open_client(proxy) as overflow:
+            overflow.sendall(connect_request())
+            status, body, _leftover = read_response(overflow)
+        assert status == 503
+        assert body.strip() == b"too_many_connections"
+        # The refusal came from the accept loop, not from a fresh worker.
+        assert threading.active_count() <= baseline + 1
+        assert wait_for_log(short_dir)[-1]["reason"] == "too_many_connections"
+    finally:
+        for connection in idle:
+            connection.close()
+
+
+def test_idle_connection_flood_keeps_threads_bounded_and_later_connects_pass(
+    proxy_factory: Callable[..., egress.EgressProxy],
+) -> None:
+    proxy = proxy_factory(request_timeout_seconds=0.5)
+    baseline = threading.active_count()
+    peak = baseline
+    clients: list[socket.socket] = []
+    try:
+        for _ in range(400):
+            clients.append(open_client_eventually(proxy))
+            peak = max(peak, threading.active_count())
+    finally:
+        for connection in clients:
+            connection.close()
+    assert len(clients) == 400
+    assert peak <= baseline + egress.MAX_CONCURRENT_CONNECTIONS + 3
+    # Once the flood is gone, a legitimate CONNECT is served normally.
+    wait_until(lambda: proxy.active_connections == 0)
+    with open_client(proxy) as client:
+        client.sendall(connect_request())
+        status, _body, _leftover = read_response(client)
+    assert status == 200
+
+
+def test_resolver_threads_are_bounded_and_refused_with_resolver_busy(
+    proxy_factory: Callable[..., egress.EgressProxy],
+) -> None:
+    release = threading.Event()
+    calls: list[str] = []
+
+    def blocking(host: str, port: int) -> list[egress.ResolvedAddress]:
+        calls.append(host)
+        release.wait(10)
+        return [resolved(PUBLIC_V4, port)]
+
+    proxy = proxy_factory(
+        resolver=blocking,
+        resolve_timeout_seconds=0.05,
+        request_timeout_seconds=2.0,
+    )
+    try:
+        # Every timed-out resolution leaves a non-cancellable thread behind;
+        # once the ceiling is reached the proxy refuses instead of piling up.
+        for _ in range(egress.MAX_CONCURRENT_RESOLVERS):
+            with open_client(proxy) as client:
+                client.sendall(connect_request())
+                status, body, _leftover = read_response(client)
+            assert status == 502
+            assert body.strip() == b"resolution_timeout"
+        assert len(calls) == egress.MAX_CONCURRENT_RESOLVERS
+        with open_client(proxy) as client:
+            client.sendall(connect_request())
+            status, body, _leftover = read_response(client)
+        assert status == 503
+        assert body.strip() == b"resolver_busy"
+        assert len(calls) == egress.MAX_CONCURRENT_RESOLVERS
+    finally:
+        release.set()
+
+
+# -- F11: CONNECT requires HTTP/1.1 -----------------------------------------
+
+
+def test_connect_requires_http_1_1(
+    proxy_factory: Callable[..., egress.EgressProxy], short_dir: Path
+) -> None:
+    proxy = proxy_factory()
+    with open_client(proxy) as client:
+        client.sendall(connect_request().replace(b"HTTP/1.1", b"HTTP/1.0", 1))
+        status, body, _leftover = read_response(client)
+    assert status == 400
+    assert body.strip() == b"invalid_request"
+    lines = wait_for_log(short_dir)
+    assert lines[-1]["reason"] == "invalid_request"
+    assert lines[-1]["host"] == ""
+
+
+# -- F6: an unvalidated authority is never echoed into the journal ---------
+
+
+@pytest.mark.parametrize(
+    ("authority", "code"),
+    [
+        ("api.openai.com/sk-live-SECRET:443", "invalid_authority"),
+        ("api.openai.com/sk-live-SECRET?token=1:443", "invalid_authority"),
+        ("api.openai.com:80", "port_not_allowed"),
+    ],
+)
+def test_rejected_authority_never_logs_its_path_query_or_token(
+    proxy_factory: Callable[..., egress.EgressProxy],
+    short_dir: Path,
+    authority: str,
+    code: str,
+) -> None:
+    proxy = proxy_factory()
+    with open_client(proxy) as client:
+        client.sendall(connect_request(authority))
+        status, body, _leftover = read_response(client)
+    assert status == 400
+    assert body.strip() == code.encode()
+    lines = wait_for_log(short_dir)
+    assert lines[-1]["reason"] == code
+    assert lines[-1]["host"] == ""
+    assert "SECRET" not in (short_dir / "egress-0.log").read_text()
+
+
+# -- F4: log compaction is amortised, never a rewrite per append ------------
+
+
+def test_log_compaction_is_amortised_and_the_high_water_bound_holds(
+    short_dir: Path,
+) -> None:
+    path = short_dir / "ring.log"
+    log = egress._EgressLog(path, max_bytes=8 * 1024)
+    high = 8 * 1024 + 8 * 1024 // 4
+    rewrites: list[int] = []
+    original = log._rewrite
+
+    def counting_rewrite() -> None:
+        rewrites.append(1)
+        original()
+
+    log._rewrite = counting_rewrite  # type: ignore[method-assign]
+    for index in range(500):
+        log.append({"n": index, "pad": "x" * 100})
+        assert path.stat().st_size <= high
+    assert 1 <= len(rewrites) <= 60
+    lines = [json.loads(line) for line in path.read_text().splitlines()]
+    assert lines[-1]["n"] == 499
+    assert stat.S_IMODE(os.lstat(path).st_mode) == 0o600
+
+
 # -- socket and log hygiene -------------------------------------------------
 
 
@@ -949,16 +1129,22 @@ def test_egress_log_never_carries_secrets_ips_or_extra_fields(
         datetime.fromisoformat(str(line["at"]))
     malformed = [line for line in lines if line["reason"] == "invalid_authority"]
     assert malformed
-    assert malformed[0]["host"] == "api.openai.com@evil.com:443"
+    # An authority that failed validation is never echoed into the log.
+    assert malformed[0]["host"] == ""
+    assert "evil.com" not in text
 
 
 def test_log_ring_prunes_whole_lines_and_stays_0600(short_dir: Path) -> None:
-    log = egress._EgressLog(short_dir / "ring.log", max_bytes=40)
+    max_bytes = 40
+    high_bytes = max_bytes + max_bytes // 4
+    log = egress._EgressLog(short_dir / "ring.log", max_bytes=max_bytes)
     for index in range(10):
         log.append({"n": index})
     path = short_dir / "ring.log"
     lines = path.read_text().splitlines()
     assert 0 < len(lines) < 10
     assert json.loads(lines[-1])["n"] == 9
-    assert sum(len(line) + 1 for line in lines) <= 40
+    # The hard bound is the documented 1.25x high-water mark: the file is
+    # compacted back to ``max_bytes`` only when it crosses that threshold.
+    assert sum(len(line) + 1 for line in lines) <= high_bytes
     assert stat.S_IMODE(os.lstat(path).st_mode) == 0o600

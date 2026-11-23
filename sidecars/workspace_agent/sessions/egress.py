@@ -36,11 +36,16 @@ fail-closed and ordered (design §5):
 8. bytes are piped untouched until EOF in either direction with 64 KiB
    buffers; there is no TLS interception and no certificate substitution;
 9. exactly one bounded JSONL line per decided CONNECT is appended to
-   ``egress.log`` (0600, 2 MiB ring).  It carries
-   ``{at, session_id, adapter_kind, host, port, decision, reason, family}``
-   and never a URL, path, header, token, body or resolved-IP list.  A
-   malformed authority is logged as ``invalid_authority`` with a
-   control-stripped 64-character prefix.
+   ``egress.log`` (0600, 2 MiB ring with a 1.25x high-water compaction).  It
+   carries ``{at, session_id, adapter_kind, host, port, decision, reason,
+   family}`` and never a URL, path, header, token, body or resolved-IP list.
+   An authority that fails validation is logged with an empty ``host``.
+
+At most ``MAX_CONCURRENT_CONNECTIONS`` client connections (being read,
+validated or tunnelled) are handled at once; beyond that the proxy answers
+503 and closes without starting a worker thread.  Resolution threads cannot be
+cancelled, so at most ``MAX_CONCURRENT_RESOLVERS`` may be in flight and a
+later CONNECT is refused with the stable ``resolver_busy`` code.
 
 ``revoke()`` refuses new CONNECTs and closes open tunnels immediately;
 ``close()`` also unlinks the socket.  The transport is thread-based: the
@@ -79,10 +84,14 @@ CONNECT_TIMEOUT_SECONDS = 10.0
 RESOLVE_TIMEOUT_SECONDS = 5.0
 TUNNEL_IDLE_TIMEOUT_SECONDS = 600.0
 MAX_CONCURRENT_TUNNELS = 8
+# Connections are counted from accept until the worker finishes, so this
+# ceiling covers CONNECTs still being read or validated as well as tunnels.
+MAX_CONCURRENT_CONNECTIONS = 16
+# A timed-out resolver call cannot be killed; cap the abandoned threads.
+MAX_CONCURRENT_RESOLVERS = MAX_CONCURRENT_TUNNELS
 MAX_CONNECT_REQUEST_BYTES = 8 * 1024
 TUNNEL_BUFFER_BYTES = 64 * 1024
 MAX_HOSTNAME_LENGTH = 253
-MAX_AUTHORITY_LOG_PREFIX = 64
 MAX_PROFILE_HOSTS = 64
 AF_UNIX_PATH_MAX_BYTES = 107  # sockaddr_un.sun_path is 108 bytes including the NUL
 CLOSE_JOIN_SECONDS = 5.0
@@ -424,6 +433,9 @@ class EgressProxy:
         self._listener: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._client_threads: list[threading.Thread] = []
+        self._client_slots = threading.BoundedSemaphore(MAX_CONCURRENT_CONNECTIONS)
+        self._resolver_slots = threading.BoundedSemaphore(MAX_CONCURRENT_RESOLVERS)
+        self._active_clients = 0
         self._tunnels: set[_Tunnel] = set()
         self._active_tunnels = 0
         self._revoked = False
@@ -440,6 +452,11 @@ class EgressProxy:
     @property
     def session_id(self) -> str:
         return self._session_id
+
+    @property
+    def active_connections(self) -> int:
+        with self._lock:
+            return self._active_clients
 
     def start(self) -> None:
         """Bind the 0600 pathname listener and accept CONNECTs in a thread."""
@@ -466,7 +483,7 @@ class EgressProxy:
             try:
                 listener.bind(str(self._socket_path))
                 os.chmod(self._socket_path, EGRESS_SOCKET_MODE)
-                listener.listen(MAX_CONCURRENT_TUNNELS * 2)
+                listener.listen(MAX_CONCURRENT_CONNECTIONS * 2)
                 listener.settimeout(0.2)
             except OSError as exc:
                 listener.close()
@@ -536,9 +553,28 @@ class EgressProxy:
                 continue
             except OSError:
                 return
-            with self._lock:
-                if self._closed:
+            if not self._client_slots.acquire(blocking=False):
+                # Over the simultaneous-connection ceiling: refuse without
+                # starting a worker thread, so idle CONNECTs cannot exhaust the
+                # host process the way one thread per connection would.
+                try:
+                    connection.settimeout(0.1)
+                except OSError:
+                    pass
+                _respond(connection, 503, "too_many_connections")
+                self._log_event(DECISION_DENY, "too_many_connections", host="", port=0)
+                try:
                     connection.close()
+                except OSError:
+                    pass
+                continue
+            with self._lock:
+                if self._closed or self._stop.is_set():
+                    self._client_slots.release()
+                    try:
+                        connection.close()
+                    except OSError:
+                        pass
                     return
                 self._client_threads = [entry for entry in self._client_threads if entry.is_alive()]
                 thread = threading.Thread(
@@ -548,11 +584,21 @@ class EgressProxy:
                     daemon=True,
                 )
                 self._client_threads.append(thread)
-            thread.start()
+            try:
+                thread.start()
+            except BaseException:
+                self._client_slots.release()
+                try:
+                    connection.close()
+                except OSError:
+                    pass
+                raise
 
     # -- one CONNECT -------------------------------------------------------
 
     def _handle_client(self, connection: socket.socket) -> None:
+        with self._lock:
+            self._active_clients += 1
         tunnel: _Tunnel | None = None
         reserved = False
         try:
@@ -582,34 +628,24 @@ class EgressProxy:
             parts = request_line.split(" ")
             if len(parts) != 3 or not all(parts):
                 _respond(connection, 400, "invalid_request")
-                self._log_event(
-                    DECISION_DENY, "invalid_request", host=_authority_prefix(request_line), port=0
-                )
+                self._log_event(DECISION_DENY, "invalid_request", host="", port=0)
                 return
             method, authority, version = parts
             if method != "CONNECT":
                 _respond(connection, 405, "method_not_allowed")
                 self._log_event(DECISION_DENY, "method_not_allowed", host="", port=0)
                 return
-            if version not in ("HTTP/1.1", "HTTP/1.0"):
+            if version != "HTTP/1.1":
                 _respond(connection, 400, "invalid_request")
-                self._log_event(
-                    DECISION_DENY,
-                    "invalid_request",
-                    host=_authority_prefix(authority),
-                    port=0,
-                )
+                self._log_event(DECISION_DENY, "invalid_request", host="", port=0)
                 return
             try:
                 host, port = parse_authority(authority)
             except EgressRequestError as exc:
                 _respond(connection, 403 if exc.code == "ip_literal" else 400, exc.code)
-                self._log_event(
-                    DECISION_DENY,
-                    exc.code,
-                    host="" if exc.code == "ip_literal" else _authority_prefix(authority),
-                    port=0,
-                )
+                # Never echo a path, query or token from an unvalidated
+                # authority into the log (design §5).
+                self._log_event(DECISION_DENY, exc.code, host="", port=0)
                 return
             if host not in self._profile.hosts:
                 _respond(connection, 403, "host_not_allowed")
@@ -625,10 +661,13 @@ class EgressProxy:
                 return
             try:
                 addresses = _call_with_timeout(
-                    lambda: self._resolver(host, port), self._resolve_timeout_seconds
+                    lambda: self._resolver(host, port),
+                    self._resolve_timeout_seconds,
+                    slots=self._resolver_slots,
                 )
             except EgressRequestError as exc:
-                _respond(connection, 502, exc.code)
+                status = 503 if exc.code == "resolver_busy" else 502
+                _respond(connection, status, exc.code)
                 self._log_event(DECISION_DENY, exc.code, host=host, port=port)
                 return
             except Exception:
@@ -714,6 +753,11 @@ class EgressProxy:
                     connection.close()
                 except OSError:
                     pass
+            # Release the slot before dropping the counter so a test (or the
+            # accept loop) observing zero active clients also sees a free slot.
+            self._client_slots.release()
+            with self._lock:
+                self._active_clients -= 1
 
     # -- policy helpers ----------------------------------------------------
 
@@ -864,11 +908,18 @@ class _Tunnel:
 
 
 class _EgressLog:
-    """A bounded append-only JSONL ring: 0600, 2 MiB, whole-line pruning."""
+    """A bounded append-only JSONL ring: 0600, whole-line pruning.
+
+    Appends stay O(1) until the buffer reaches a 1.25x high-water mark; only
+    then is the whole file compacted back to ``max_bytes`` (never more than
+    one rewrite per quarter of the ring), so a fast-denied CONNECT loop cannot
+    turn every event into a full-file rewrite.
+    """
 
     def __init__(self, path: Path, *, max_bytes: int = EGRESS_LOG_MAX_BYTES) -> None:
         self._path = path
         self._max_bytes = max_bytes
+        self._high_bytes = max_bytes + max_bytes // 4
         self._lock = threading.Lock()
         self._lines: deque[bytes] = deque()
         self._total_bytes = 0
@@ -878,15 +929,13 @@ class _EgressLog:
         with self._lock:
             self._lines.append(line)
             self._total_bytes += len(line)
-            pruned = False
-            while self._total_bytes > self._max_bytes and len(self._lines) > 1:
-                self._total_bytes -= len(self._lines.popleft())
-                pruned = True
             try:
-                if pruned:
-                    self._rewrite()
-                else:
+                if self._total_bytes <= self._high_bytes:
                     self._append_line(line)
+                    return
+                while self._total_bytes > self._max_bytes and len(self._lines) > 1:
+                    self._total_bytes -= len(self._lines.popleft())
+                self._rewrite()
             except OSError:
                 # Losing an observability line never changes a policy decision.
                 pass
@@ -1020,21 +1069,25 @@ def _respond(connection: socket.socket, status: int, code: str) -> None:
         pass
 
 
-def _authority_prefix(raw: str) -> str:
-    """A control- and whitespace-stripped 64-character prefix for the log."""
-
-    cleaned = "".join(
-        character for character in raw if character.isprintable() and not character.isspace()
-    )
-    return cleaned[:MAX_AUTHORITY_LOG_PREFIX]
-
-
 def _utc_timestamp() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
-def _call_with_timeout[T](callback: Callable[[], T], timeout: float) -> T:
-    """Run one blocking resolver call under a wall-clock ceiling."""
+def _call_with_timeout[T](
+    callback: Callable[[], T],
+    timeout: float,
+    *,
+    slots: threading.BoundedSemaphore | None = None,
+) -> T:
+    """Run one blocking resolver call under a wall-clock ceiling.
+
+    A timed-out thread cannot be cancelled; ``slots`` keeps the number of
+    abandoned resolver threads bounded and caps a slot until the call really
+    returns.  With no free slot the CONNECT is refused with ``resolver_busy``.
+    """
+
+    if slots is not None and not slots.acquire(blocking=False):
+        raise EgressRequestError("resolver_busy")
 
     outcome: list[T] = []
     failure: list[BaseException] = []
@@ -1047,9 +1100,16 @@ def _call_with_timeout[T](callback: Callable[[], T], timeout: float) -> T:
             failure.append(exc)
         finally:
             done.set()
+            if slots is not None:
+                slots.release()
 
-    worker = threading.Thread(target=run, name="session-egress-resolve", daemon=True)
-    worker.start()
+    try:
+        worker = threading.Thread(target=run, name="session-egress-resolve", daemon=True)
+        worker.start()
+    except BaseException:
+        if slots is not None:
+            slots.release()
+        raise
     if not done.wait(timeout):
         raise EgressRequestError("resolution_timeout")
     if failure:
