@@ -114,7 +114,7 @@ describe("timelineSummaryLabel", () => {
       timelineSummaryLabel(
         item({ item_type: "instruction", summary: "instruction:queued" }),
       ),
-    ).toBe("Instruction humaine · En file (agent occupé)");
+    ).toBe("Instruction humaine · En file");
   });
 
   it("laisse le jeton brut intact quand il ne peut pas être traduit", () => {

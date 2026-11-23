@@ -1,6 +1,34 @@
 import { describe, expect, it } from "vitest";
 
-import { actorRefLabel } from "./labels";
+import type { AgentSessionState, InstructionState } from "../api/types";
+import {
+  actorRefLabel,
+  INSTRUCTION_JOURNAL_STATE_LABELS,
+  INSTRUCTION_SUBMISSION_PENDING_LABEL,
+  SESSION_STATE_LABELS,
+} from "./labels";
+
+const instructionStates: readonly [InstructionState, string][] = [
+  ["queued", "En file"],
+  ["delivering", "Envoi en cours"],
+  ["delivered", "Transmise"],
+  ["acknowledged", "Acquittée"],
+  ["delivery_unknown", "Livraison incertaine"],
+  ["cancelled", "Annulée"],
+];
+
+const sessionStates: readonly [AgentSessionState, string][] = [
+  ["provisioning", "Provisionnement"],
+  ["ready", "Prête"],
+  ["running", "En cours"],
+  ["awaiting_instruction", "Attente d’instruction"],
+  ["interrupt_requested", "Interruption demandée"],
+  ["stopped", "Session interrompue"],
+  ["lost", "Session perdue"],
+  ["reconciling", "Réconciliation"],
+  ["closed", "Fermée"],
+  ["failed", "Échouée"],
+];
 
 describe("actorRefLabel", () => {
   it("traduit un adaptateur opérateur et retire le préfixe de type", () => {
@@ -14,5 +42,19 @@ describe("actorRefLabel", () => {
     expect(actorRefLabel("analyst:test")).toBe("analyst:test");
     expect(actorRefLabel("virustotal")).toBe("virustotal");
     expect(actorRefLabel("operator:")).toBe("operator:");
+  });
+});
+
+describe("agent state labels", () => {
+  it.each(instructionStates)("maps instruction state %s", (state, label) => {
+    expect(INSTRUCTION_JOURNAL_STATE_LABELS[state]).toBe(label);
+  });
+
+  it.each(sessionStates)("maps session state %s", (state, label) => {
+    expect(SESSION_STATE_LABELS[state]).toBe(label);
+  });
+
+  it("labels the in-flight enqueue request as a local state", () => {
+    expect(INSTRUCTION_SUBMISSION_PENDING_LABEL).toBe("En attente d’envoi");
   });
 });

@@ -24,6 +24,7 @@ import {
   SESSION_ID,
   TASK_ID,
 } from "./testFixtures";
+import type { AgentSessionState, InstructionState } from "../api/types";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -38,6 +39,41 @@ function renderPanel() {
 function taskPage(task = makeTask()) {
   return { items: [task], total: 1 };
 }
+
+function renderSelectedSession(
+  summary = makeSummary(),
+  session = makeSession(),
+  task = makeTask(),
+) {
+  installFetch(({ url }) =>
+    url.endsWith("/summary")
+      ? jsonResponse(summary)
+      : errorResponse(500, "unexpected_request"),
+  );
+  return render(
+    <OperatorsPanel
+      investigationId={INVESTIGATION_ID}
+      taskId={task.id}
+      task={task}
+      sessionContext={[session]}
+    />,
+    { wrapper: wrapperFor(createTestQueryClient()) },
+  );
+}
+
+const instructionStateCases: readonly [InstructionState, string][] = [
+  ["queued", "En file"],
+  ["delivering", "Envoi en cours"],
+  ["delivered", "Transmise"],
+  ["acknowledged", "Acquittée"],
+  ["cancelled", "Annulée"],
+  ["delivery_unknown", "Livraison incertaine"],
+];
+
+const sessionStateCases: readonly [AgentSessionState, string][] = [
+  ["lost", "Session perdue"],
+  ["stopped", "Session interrompue"],
+];
 
 describe("OperatorsPanel", () => {
   it("scopes agent messages to the selected task and confirms session interruption separately", async () => {
@@ -80,28 +116,39 @@ describe("OperatorsPanel", () => {
       name: "Contexte agent de la tâche",
     });
     expect(
-      await within(context).findByText("Codex CLI · Vérifier le domaine C2"),
+      await within(context).findByRole("heading", {
+        name: "Codex CLI — En cours",
+      }),
     ).toBeInTheDocument();
     expect(within(context).queryByText(/Autre tâche/)).toBeNull();
-    expect(within(context).queryByText(selectedSession.task_id)).toBeNull();
+    expect(
+      within(context).getByText(selectedSession.task_id),
+    ).not.toBeVisible();
     await user.click(
-      within(context).getByText("Plus d’actions", { selector: "summary" }),
+      within(context).getByText("Interrompre la session", {
+        selector: "summary",
+      }),
     );
+    expect(
+      within(context).getByText(/Arrêt technique de la session/),
+    ).toBeInTheDocument();
     await user.click(
-      within(context).getByRole("button", { name: "Interrompre la session" }),
+      within(context).getByRole("button", {
+        name: "Confirmer l’arrêt technique",
+      }),
     );
     expect(recorder.calls.some((call) => call.url.endsWith("/interrupt"))).toBe(
       false,
     );
     await user.type(
       within(context).getByLabelText(
-        "Motif d’interruption de la session (obligatoire)",
+        "Motif d’arrêt de la session (obligatoire)",
       ),
       "Arrêt demandé par l’analyste",
     );
     await user.click(
       within(context).getByRole("button", {
-        name: "Confirmer l’interruption de la session",
+        name: "Confirmer l’arrêt de la session",
       }),
     );
 
@@ -164,15 +211,15 @@ describe("OperatorsPanel", () => {
 
     renderPanel();
 
-    await screen.findByText("Codex CLI · Vérifier le domaine C2");
-    const sessionHeader = screen
-      .getByText("Codex CLI · Vérifier le domaine C2")
-      .closest("header");
+    const sessionHeading = await screen.findByRole("heading", {
+      name: "Codex CLI — En cours",
+    });
+    const sessionHeader = sessionHeading.closest("header");
     expect(
       within(sessionHeader as HTMLElement).getByText("En cours"),
     ).toHaveClass("m24-badge--running");
     await user.type(
-      screen.getByLabelText(/Instruction en cours de session/),
+      screen.getByLabelText(/Instruction à envoyer/),
       "Priorise le PCAP.",
     );
     await user.click(
@@ -180,7 +227,7 @@ describe("OperatorsPanel", () => {
     );
 
     expect(
-      await screen.findByText(/mise en file persistante \(position 2\)/),
+      await screen.findByText(/en file persistante \(position 2\)/),
     ).toBeInTheDocument();
     const request = recorder.calls.find((call) =>
       call.url.endsWith("/instructions"),
@@ -459,6 +506,20 @@ describe("OperatorsPanel", () => {
 
     renderPanel();
 
+    expect(await screen.findByText("Instructions (1)")).toBeInTheDocument();
+    const technicalDetails = screen
+      .getByText("Détails techniques", { selector: "summary" })
+      .closest("details");
+    expect(technicalDetails).not.toHaveAttribute("open");
+    expect(screen.getByText(SESSION_ID)).not.toBeVisible();
+    expect(
+      within(screen.getByRole("region", { name: "Instructions" })).getByText(
+        "Confirme le protocole C2.",
+      ),
+    ).toBeInTheDocument();
+    await userEvent
+      .setup()
+      .click(screen.getByText("Détails techniques", { selector: "summary" }));
     expect(
       await screen.findByText("Opérations journalisées (2)"),
     ).toBeInTheDocument();
@@ -488,14 +549,14 @@ describe("OperatorsPanel", () => {
       .getByText("Dernière passation")
       .closest("section");
     expect(handoffSection).toHaveTextContent(/version 2/);
-    expect(handoffSection).toHaveTextContent(/bbbbbbbbbbbb…/);
+    expect(handoffSection).toHaveTextContent("b".repeat(64));
     expect(handoffSection).toHaveTextContent(/À jour/);
 
-    expect(screen.getByText("Instructions humaines (1)")).toBeInTheDocument();
-    expect(screen.getByText("Instruction en attente :")).toBeInTheDocument();
-    // Once as the pending instruction, once in the instruction history.
+    expect(screen.getByText("Instructions (1)")).toBeInTheDocument();
+    expect(screen.getByText("En file")).toBeInTheDocument();
+    // Once as the short default row, once with the full text in technical details.
     expect(screen.getAllByText("Confirme le protocole C2.")).toHaveLength(2);
-    expect(screen.getByText("eeeeeeeeeeee…")).toBeInTheDocument();
+    expect(screen.getByText("e".repeat(64))).toBeInTheDocument();
     expect(screen.queryByText(/Non exposé/)).not.toBeInTheDocument();
   });
 
@@ -541,12 +602,134 @@ describe("OperatorsPanel", () => {
 
     renderPanel();
 
+    expect(await screen.findByText("Instructions (2)")).toBeInTheDocument();
+    expect(screen.getByText("Envoi en cours")).toBeInTheDocument();
+    expect(screen.getByText("Livraison incertaine")).toBeInTheDocument();
+  });
+
+  it.each(instructionStateCases)(
+    "affiche l’état API d’instruction %s comme %s",
+    async (state, label) => {
+      const summary = makeSummary({
+        instructions: {
+          items: [
+            makeSummaryInstruction({
+              state,
+              queue_position: state === "queued" ? 1 : 0,
+              delivered_at:
+                state === "delivered" || state === "acknowledged"
+                  ? "2026-11-22T10:02:10Z"
+                  : null,
+              acknowledged_at:
+                state === "acknowledged" ? "2026-11-22T10:02:20Z" : null,
+              delivery_mode:
+                state === "delivered" || state === "acknowledged"
+                  ? "next_run"
+                  : null,
+            }),
+          ],
+          total: 1,
+          limit: 20,
+          truncated: false,
+        },
+      });
+
+      renderSelectedSession(summary);
+
+      expect(
+        await screen.findByText(label, { selector: "span.m24-badge" }),
+      ).toBeInTheDocument();
+    },
+  );
+
+  it.each(sessionStateCases)(
+    "affiche l’état API de session %s comme %s",
+    async (state, label) => {
+      renderSelectedSession(makeSummary(), makeSession({ state }));
+
+      expect(
+        await screen.findByRole("heading", {
+          name: `Codex CLI — ${label}`,
+        }),
+      ).toBeInTheDocument();
+    },
+  );
+
+  it("sépare une session ouverte du résultat encore absent de la tâche", async () => {
+    renderSelectedSession(
+      makeSummary(),
+      makeSession({ state: "running" }),
+      makeTask({ status: "running", result_refs: [] }),
+    );
+
     expect(
-      await screen.findByText("Instruction en attente :"),
+      await screen.findByRole("heading", { name: "Codex CLI — En cours" }),
     ).toBeInTheDocument();
-    // Once as the pending instruction, once in the instruction history.
-    expect(screen.getAllByText("Livraison en cours")).toHaveLength(2);
-    expect(screen.getByText("Livraison inconnue")).toBeInTheDocument();
+    expect(
+      screen.getByText("Dernier résultat", { selector: "dt" }).parentElement,
+    ).toHaveTextContent("Aucun résultat soumis");
+    expect(
+      screen.getByText("État de la tâche", { selector: "dt" }).parentElement,
+    ).toHaveTextContent("En cours");
+  });
+
+  it("montre une instruction transmise sans la marquer acquittée", async () => {
+    renderSelectedSession(
+      makeSummary({
+        instructions: {
+          items: [
+            makeSummaryInstruction({
+              state: "delivered",
+              delivered_at: "2026-11-22T10:02:10Z",
+              acknowledged_at: null,
+              delivery_mode: "next_run",
+            }),
+          ],
+          total: 1,
+          limit: 20,
+          truncated: false,
+        },
+      }),
+    );
+
+    expect(
+      await screen.findByText("Transmise", { selector: "span.m24-badge" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("Acquittée", { selector: "span.m24-badge" }),
+    ).toBeNull();
+    expect(screen.getByText(/prochaine exécution/)).toBeInTheDocument();
+  });
+
+  it("signale l’attente locale d’envoi pendant la requête d’enqueue", async () => {
+    const user = userEvent.setup();
+    installFetch(({ url, init }) => {
+      if (url.endsWith("/summary")) return jsonResponse(makeSummary());
+      if (url.endsWith("/instructions") && init?.method === "POST") {
+        return new Promise<Response>(() => {});
+      }
+      return errorResponse(500, "unexpected_request");
+    });
+
+    render(
+      <OperatorsPanel
+        investigationId={INVESTIGATION_ID}
+        taskId={TASK_ID}
+        task={makeTask({ status: "running" })}
+        sessionContext={[makeSession({ state: "running" })]}
+      />,
+      { wrapper: wrapperFor(createTestQueryClient()) },
+    );
+
+    await user.type(
+      screen.getByLabelText(/Instruction à envoyer/),
+      "Vérifie les sorties.",
+    );
+    await user.click(
+      screen.getByRole("button", { name: "Envoyer l’instruction" }),
+    );
+
+    expect(await screen.findByText("En attente d’envoi")).toBeInTheDocument();
   });
 
   it("affiche les états vides du résumé sans inventer de données", async () => {
@@ -567,6 +750,12 @@ describe("OperatorsPanel", () => {
     renderPanel();
 
     expect(
+      await screen.findByText("Aucune instruction humaine pour cette session."),
+    ).toBeInTheDocument();
+    await userEvent
+      .setup()
+      .click(screen.getByText("Détails techniques", { selector: "summary" }));
+    expect(
       await screen.findByText(
         "Aucune opération journalisée pour cette session.",
       ),
@@ -584,12 +773,6 @@ describe("OperatorsPanel", () => {
     ).toHaveTextContent("Aucun");
     expect(
       screen.getByText("Aucune passation liée à cette session."),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText("Aucune instruction en attente."),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText("Aucune instruction humaine pour cette session."),
     ).toBeInTheDocument();
   });
 
@@ -611,14 +794,14 @@ describe("OperatorsPanel", () => {
     renderPanel();
 
     expect(
-      await screen.findByText("Codex CLI · Vérifier le domaine C2"),
+      await screen.findByRole("heading", { name: "Codex CLI — En cours" }),
     ).toBeInTheDocument();
     expect(await screen.findByRole("alert")).toHaveTextContent(
       /Résumé de session indisponible — Agent absent/,
     );
   });
 
-  it("affiche l’attente du résumé de session", async () => {
+  it("affiche l’attente des instructions", async () => {
     installFetch(({ url, init }) => {
       const method = init?.method ?? "GET";
       if (url.endsWith("/agent-sessions") && method === "GET") {
@@ -636,7 +819,7 @@ describe("OperatorsPanel", () => {
     renderPanel();
 
     expect(
-      await screen.findByText("Chargement du résumé de session…"),
+      await screen.findByText("Chargement des instructions…"),
     ).toBeInTheDocument();
   });
 });

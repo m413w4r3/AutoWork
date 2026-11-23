@@ -33,7 +33,6 @@ import { useTaskEvents, useTasks, type TaskView } from "../api/tasks";
 import type {
   AgentSessionState,
   BudgetDimension,
-  InstructionState,
   TaskStatus,
 } from "../api/types";
 import { BUDGET_DIMENSION_LABELS } from "../overview/overviewPresentation";
@@ -48,6 +47,7 @@ import {
   formatTimestamp,
   HANDOFF_FRESHNESS_LABELS,
   INSTRUCTION_JOURNAL_STATE_LABELS,
+  INSTRUCTION_SUBMISSION_PENDING_LABEL,
   SESSION_STATE_LABELS,
   shortSha,
   TASK_ACTOR_LABELS,
@@ -81,10 +81,6 @@ const BUDGET_DIMENSIONS: readonly BudgetDimension[] = [
   "context_tokens",
   "context_bytes",
 ];
-
-/** A queued or in-flight instruction, as opposed to one already handled. */
-const PENDING_INSTRUCTION_STATES: ReadonlySet<InstructionState> =
-  new Set<InstructionState>(["queued", "delivering", "delivery_unknown"]);
 
 /** Same colour semantics as the task status badge (F12). */
 const SESSION_BADGE_VARIANTS: Record<AgentSessionState, string> = {
@@ -295,7 +291,7 @@ function HandoffBlock({
           <div>
             <dt>SHA-256</dt>
             <dd>
-              <code>{shortSha(handoff.sha256)}</code>
+              <code>{handoff.sha256}</code>
             </dd>
           </div>
           <div>
@@ -326,64 +322,38 @@ function InstructionBlock({
 }: {
   window: AgentSessionInstructionWindowView;
 }) {
-  const pending = window.items.find((instruction) =>
-    PENDING_INSTRUCTION_STATES.has(instruction.state),
-  );
   return (
-    <section aria-label="Instructions humaines">
-      <h6>Instructions humaines ({window.total})</h6>
-      {pending === undefined ? (
-        <p>Aucune instruction en attente.</p>
-      ) : (
-        <p className="m24-message">
-          <strong>Instruction en attente :</strong> {pending.text}{" "}
-          <span className="m24-badge">
-            {INSTRUCTION_JOURNAL_STATE_LABELS[pending.state]}
-          </span>{" "}
-          <span className="m24-muted">
-            {pending.queue_position === 0
-              ? null
-              : `position ${pending.queue_position} · `}
-            enfilée {formatTimestamp(pending.queued_at)}
-          </span>
-        </p>
-      )}
+    <section aria-label="Instructions">
+      <h6>Instructions ({window.total})</h6>
       {window.items.length === 0 ? (
         <p>Aucune instruction humaine pour cette session.</p>
       ) : (
-        <ol className="m24-events">
+        <ul className="m24-events">
           {window.items.map((instruction) => (
             <li key={instruction.instruction_id}>
-              <time dateTime={instruction.created_at}>
-                {formatTimestamp(instruction.created_at)}
-              </time>{" "}
+              {instruction.state === "acknowledged" ? (
+                <span aria-hidden="true">✓ </span>
+              ) : instruction.state === "queued" ||
+                instruction.state === "delivering" ? (
+                <span aria-hidden="true">… </span>
+              ) : null}
               <span className="m24-badge">
                 {INSTRUCTION_JOURNAL_STATE_LABELS[instruction.state]}
               </span>{" "}
-              {instruction.queue_position === 0 ? null : (
-                <span>position {instruction.queue_position} · </span>
-              )}
-              <code>{shortSha(instruction.text_sha256)}</code>{" "}
-              <span>{instruction.text}</span>
-              <span className="m24-muted">
-                {" — "}enfilée {formatTimestamp(instruction.queued_at)}
-                {instruction.delivered_at === null
-                  ? null
-                  : ` · transmise ${formatTimestamp(instruction.delivered_at)}`}
-                {instruction.acknowledged_at === null
-                  ? null
-                  : ` · acquittée ${formatTimestamp(instruction.acknowledged_at)}`}
-                {instruction.cancelled_at === null
-                  ? null
-                  : ` · annulée ${formatTimestamp(instruction.cancelled_at)}${
-                      instruction.cancel_reason === null
-                        ? ""
-                        : ` (${instruction.cancel_reason})`
-                    }`}
-              </span>
+              {instruction.state === "queued" &&
+              instruction.queue_position > 0 ? (
+                <span className="m24-muted">
+                  position {instruction.queue_position} ·{" "}
+                </span>
+              ) : null}
+              <span>{instructionPreview(instruction.text)}</span>
+              {instruction.state === "delivered" &&
+              instruction.delivery_mode === "next_run" ? (
+                <span className="m24-muted"> · prochaine exécution</span>
+              ) : null}
             </li>
           ))}
-        </ol>
+        </ul>
       )}
       {window.truncated ? (
         <p className="m24-muted">
@@ -395,6 +365,90 @@ function InstructionBlock({
   );
 }
 
+function instructionPreview(text: string): string {
+  const limit = 160;
+  return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`;
+}
+
+function InstructionTechnicalDetails({
+  window,
+}: {
+  window: AgentSessionInstructionWindowView;
+}) {
+  if (window.items.length === 0) return null;
+  return (
+    <section aria-label="Détails techniques des instructions">
+      <h6>Détails des instructions</h6>
+      <ol className="m24-events">
+        {window.items.map((instruction) => (
+          <li key={instruction.instruction_id}>
+            <p>{instruction.text}</p>
+            <dl className="m24-metadata">
+              <div>
+                <dt>SHA-256 du texte</dt>
+                <dd>
+                  <code>{instruction.text_sha256}</code>
+                </dd>
+              </div>
+              <div>
+                <dt>Créée</dt>
+                <dd>{formatTimestamp(instruction.created_at)}</dd>
+              </div>
+              <div>
+                <dt>Mise en file</dt>
+                <dd>{formatTimestamp(instruction.queued_at)}</dd>
+              </div>
+              {instruction.delivered_at === null ? null : (
+                <div>
+                  <dt>Transmise</dt>
+                  <dd>{formatTimestamp(instruction.delivered_at)}</dd>
+                </div>
+              )}
+              {instruction.acknowledged_at === null ? null : (
+                <div>
+                  <dt>Acquittée</dt>
+                  <dd>{formatTimestamp(instruction.acknowledged_at)}</dd>
+                </div>
+              )}
+              <div>
+                <dt>Tentatives de livraison</dt>
+                <dd>{instruction.delivery_attempts}</dd>
+              </div>
+              <div>
+                <dt>Mode de livraison</dt>
+                <dd>
+                  {instruction.delivery_mode === "live"
+                    ? "Session active"
+                    : instruction.delivery_mode === "next_run"
+                      ? "Prochaine exécution"
+                      : "Non renseigné"}
+                </dd>
+              </div>
+              {instruction.last_delivery_error === null ? null : (
+                <div>
+                  <dt>Dernière erreur de livraison</dt>
+                  <dd>{instruction.last_delivery_error}</dd>
+                </div>
+              )}
+              {instruction.cancelled_at === null ? null : (
+                <div>
+                  <dt>Annulée</dt>
+                  <dd>
+                    {formatTimestamp(instruction.cancelled_at)}
+                    {instruction.cancel_reason === null
+                      ? ""
+                      : ` · ${instruction.cancel_reason}`}
+                  </dd>
+                </div>
+              )}
+            </dl>
+          </li>
+        ))}
+      </ol>
+    </section>
+  );
+}
+
 /**
  * Human-only journal projection of one session. Loading, error and empty
  * states are explicit and in French; an absent field is shown as absent, not
@@ -402,32 +456,104 @@ function InstructionBlock({
  */
 function SessionSummary({
   investigationId,
-  sessionId,
+  session,
+  durationEnd,
+  blocker,
 }: {
   investigationId: string;
-  sessionId: string;
+  session: AgentSessionView;
+  durationEnd: string | null;
+  blocker: string;
 }) {
-  const summary = useAgentSessionSummary(investigationId, sessionId);
+  const summary = useAgentSessionSummary(investigationId, session.id);
   const error = summary.isError ? toWorkshopApiError(summary.error) : null;
   const data = summary.data;
   return (
     <section className="m24-operator__summary" aria-label="Résumé de session">
-      <h6>Résumé de session — dérivé du journal</h6>
       {error !== null ? (
         <p role="alert" className="error-message">
           Résumé de session indisponible — {describeTaskError(error)}
         </p>
       ) : data === undefined ? (
-        <p role="status">Chargement du résumé de session…</p>
+        <p role="status">Chargement des instructions…</p>
       ) : (
-        <>
-          <OperationList window={data.operations} />
-          <BudgetBlock budget={data.budget} />
-          <BrokerBlock broker={data.broker} />
-          <HandoffBlock handoff={data.handoff} />
-          <InstructionBlock window={data.instructions} />
-        </>
+        <InstructionBlock window={data.instructions} />
       )}
+      <details>
+        <summary>Détails techniques</summary>
+        <dl className="m24-metadata">
+          <div>
+            <dt>Identifiant de session</dt>
+            <dd>
+              <code>{session.id}</code>
+            </dd>
+          </div>
+          <div>
+            <dt>Référence de session hôte</dt>
+            <dd>{session.host_session_ref ?? "Aucune"}</dd>
+          </div>
+          <div>
+            <dt>Identifiant de tâche</dt>
+            <dd>
+              <code>{session.task_id}</code>
+            </dd>
+          </div>
+          <div>
+            <dt>Bail de tâche</dt>
+            <dd>{session.task_lease_id ?? "Aucun"}</dd>
+          </div>
+          <div>
+            <dt>Fence</dt>
+            <dd>{session.task_lease_fence ?? "Aucun"}</dd>
+          </div>
+          <div>
+            <dt>Digest des capacités</dt>
+            <dd>
+              <code>{session.capability_sha256}</code>
+            </dd>
+          </div>
+          <div>
+            <dt>Passation</dt>
+            <dd>{session.handoff_id ?? "Aucune"}</dd>
+          </div>
+          <div>
+            <dt>Checkpoint</dt>
+            <dd>{session.checkpoint_ref ?? "Aucun"}</dd>
+          </div>
+          <div>
+            <dt>Digest du checkpoint</dt>
+            <dd>
+              {session.checkpoint_sha256 === null ? (
+                "Aucun"
+              ) : (
+                <code>{session.checkpoint_sha256}</code>
+              )}
+            </dd>
+          </div>
+          <div>
+            <dt>Durée de session</dt>
+            <dd>{formatDuration(session.opened_at, durationEnd)}</dd>
+          </div>
+          <div>
+            <dt>Blocage ou motif d’arrêt</dt>
+            <dd>{blocker}</dd>
+          </div>
+        </dl>
+        {error !== null ? (
+          <p className="m24-muted">
+            Les journaux techniques sont indisponibles pour cette session.
+          </p>
+        ) : data === undefined ? null : (
+          <>
+            <h6>Résumé dérivé du journal</h6>
+            <OperationList window={data.operations} />
+            <BudgetBlock budget={data.budget} />
+            <BrokerBlock broker={data.broker} />
+            <HandoffBlock handoff={data.handoff} />
+            <InstructionTechnicalDetails window={data.instructions} />
+          </>
+        )}
+      </details>
     </section>
   );
 }
@@ -436,10 +562,14 @@ function SessionRow({
   investigationId,
   session,
   task,
+  onViewResults,
+  onTransfer,
 }: {
   investigationId: string;
   session: AgentSessionView;
   task: TaskView | undefined;
+  onViewResults?: () => void;
+  onTransfer?: () => void;
 }) {
   const baseId = useId();
   const enqueue = useEnqueueAgentInstruction(investigationId, session.id);
@@ -470,10 +600,12 @@ function SessionRow({
     task?.blocked_reason != null
       ? BLOCKED_REASON_LABELS[task.blocked_reason]
       : (session.close_reason ?? "Aucun");
-  const submitted =
-    task === undefined || task.result_refs.length === 0
-      ? "Aucun"
-      : `${task.result_refs.length} référence(s) · ${VERIFICATION_LABELS[task.result_verification_status]}`;
+  const lastResult =
+    task === undefined
+      ? "Tâche inconnue"
+      : task.result_refs.length === 0
+        ? "Aucun résultat soumis"
+        : `${task.result_refs.length} référence(s) · ${VERIFICATION_LABELS[task.result_verification_status]}`;
 
   function finish(text: string) {
     setMessage(text);
@@ -494,11 +626,15 @@ function SessionRow({
       { text },
       {
         onSuccess: (result) => {
-          finish(
-            result.delivered_live
-              ? "Instruction délivrée à la session."
-              : `Instruction mise en file persistante (position ${result.queue_position}).`,
-          );
+          const outcome =
+            result.state === "acknowledged"
+              ? "Instruction acquittée par la session."
+              : result.state === "delivered"
+                ? "Instruction transmise à la session."
+                : result.state === "queued"
+                  ? `Instruction en file persistante (position ${result.queue_position}).`
+                  : `Instruction : ${INSTRUCTION_JOURNAL_STATE_LABELS[result.state].toLowerCase()}.`;
+          finish(outcome);
           setInstruction("");
         },
         onError: handleError,
@@ -534,56 +670,37 @@ function SessionRow({
     <li className="m24-operator">
       <header className="m24-operator__header">
         <h5>
-          {ADAPTER_LABELS[session.adapter_kind]}
-          {task === undefined ? null : ` · ${task.title}`}
+          {ADAPTER_LABELS[session.adapter_kind]} —{" "}
+          <span className={sessionBadgeClass(session.state)}>
+            {SESSION_STATE_LABELS[session.state]}
+          </span>
         </h5>
-        <span className={sessionBadgeClass(session.state)}>
-          {SESSION_STATE_LABELS[session.state]}
-        </span>
       </header>
+      <p className="m24-muted">
+        Tâche : {task === undefined ? "Tâche inconnue" : task.title}
+      </p>
       <dl className="m24-metadata">
-        <div>
-          <dt>Fournisseur</dt>
-          <dd>{ADAPTER_LABELS[session.adapter_kind]}</dd>
-        </div>
-        <div>
-          <dt>Tâche</dt>
-          <dd>{task === undefined ? "Tâche inconnue" : task.title}</dd>
-        </div>
-        <div>
-          <dt>Statut</dt>
-          <dd>{SESSION_STATE_LABELS[session.state]}</dd>
-        </div>
-        <div>
-          <dt>Durée</dt>
-          <dd>{formatDuration(session.opened_at, durationEnd)}</dd>
-        </div>
         <div>
           <dt>Dernière activité</dt>
           <dd>{formatTimestamp(session.last_activity_at)}</dd>
         </div>
         <div>
-          <dt>Checkpoint</dt>
-          <dd>
-            {session.checkpoint_ref ?? "Aucun"}{" "}
-            {session.checkpoint_sha256 === null
-              ? null
-              : `(${shortSha(session.checkpoint_sha256)})`}
-          </dd>
+          <dt>Dernier résultat</dt>
+          <dd>{lastResult}</dd>
         </div>
-        <div>
-          <dt>Blocage</dt>
-          <dd>{blocker}</dd>
-        </div>
-        <div>
-          <dt>Résultat soumis</dt>
-          <dd>{submitted}</dd>
-        </div>
+        {task === undefined ? null : (
+          <div>
+            <dt>État de la tâche</dt>
+            <dd>{TASK_STATUS_LABELS[task.status]}</dd>
+          </div>
+        )}
       </dl>
 
       <SessionSummary
         investigationId={investigationId}
-        sessionId={session.id}
+        session={session}
+        durationEnd={durationEnd}
+        blocker={blocker}
       />
 
       {session.state === "lost" ? (
@@ -608,8 +725,7 @@ function SessionRow({
       {interruptible ? (
         <div className="m24-inline-form">
           <label htmlFor={`${baseId}-instruction`}>
-            Instruction en cours de session (mise en file persistante si l’agent
-            est occupé)
+            Instruction à envoyer (mise en file si la session est occupée)
           </label>
           <textarea
             id={`${baseId}-instruction`}
@@ -627,21 +743,51 @@ function SessionRow({
               Envoyer l’instruction
             </button>
           </div>
+          {enqueue.isPending ? (
+            <p role="status">{INSTRUCTION_SUBMISSION_PENDING_LABEL}</p>
+          ) : null}
+        </div>
+      ) : null}
+
+      <div className="m24-inline-form__buttons">
+        {onViewResults === undefined ? null : (
+          <button
+            type="button"
+            className="m24-action m24-action--quiet"
+            onClick={onViewResults}
+          >
+            Voir les sorties
+          </button>
+        )}
+        {onTransfer === undefined ? null : (
+          <button
+            type="button"
+            className="m24-action m24-action--quiet"
+            onClick={onTransfer}
+          >
+            Transférer
+          </button>
+        )}
+        {interruptible ? (
           <details className="m24-more-actions">
-            <summary>Plus d’actions</summary>
+            <summary>Interrompre la session</summary>
+            <p className="m24-muted">
+              Arrêt technique de la session. L’interruption métier de la tâche
+              se demande avec l’action « Interrompre la tâche ».
+            </p>
             {interruptOpen ? null : (
               <button
                 type="button"
                 className="m24-action m24-action--danger"
                 onClick={() => setInterruptOpen(true)}
               >
-                Interrompre la session
+                Confirmer l’arrêt technique
               </button>
             )}
             {interruptOpen ? (
               <div className="m24-inline-form">
                 <label htmlFor={`${baseId}-reason`}>
-                  Motif d’interruption de la session (obligatoire)
+                  Motif d’arrêt de la session (obligatoire)
                 </label>
                 <textarea
                   id={`${baseId}-reason`}
@@ -656,7 +802,7 @@ function SessionRow({
                     onClick={confirmInterrupt}
                     disabled={reason.trim() === "" || interrupt.isPending}
                   >
-                    Confirmer l’interruption de la session
+                    Confirmer l’arrêt de la session
                   </button>
                   <button
                     type="button"
@@ -669,8 +815,8 @@ function SessionRow({
               </div>
             ) : null}
           </details>
-        </div>
-      ) : null}
+        ) : null}
+      </div>
 
       {resumable && !taskTerminal ? (
         <div className="m24-inline-form__buttons">
@@ -741,11 +887,15 @@ export function OperatorsPanel({
   taskId,
   task: selectedTask,
   sessionContext,
+  onViewResults,
+  onTransfer,
 }: {
   investigationId: string;
   taskId?: string;
   task?: TaskView;
   sessionContext?: readonly AgentSessionView[];
+  onViewResults?: () => void;
+  onTransfer?: () => void;
 }) {
   const sessions = useAgentSessions(investigationId, undefined, {
     enabled: sessionContext === undefined,
@@ -807,7 +957,7 @@ export function OperatorsPanel({
       <p className="m24-muted">
         {taskId === undefined
           ? "Une session Codex CLI ou Claude Code par tâche. Les capacités affichées (reprise, checkpoint) sont celles que le serveur expose ; rien n’est déduit d’un adaptateur présumé."
-          : "Fournisseur, état de session, dernier événement et instructions de la tâche sélectionnée. Les capacités affichées viennent du serveur."}
+          : "Fournisseur, état de session, dernier résultat de la tâche et instructions. Les sorties et détails techniques restent accessibles."}
       </p>
 
       {openFeedback?.kind === "success" ? (
@@ -878,6 +1028,8 @@ export function OperatorsPanel({
               investigationId={investigationId}
               session={session}
               task={taskById.get(session.task_id)}
+              onViewResults={onViewResults}
+              onTransfer={onTransfer}
             />
           ))}
         </ul>
@@ -895,6 +1047,8 @@ export function OperatorsPanel({
                 investigationId={investigationId}
                 session={session}
                 task={taskById.get(session.task_id)}
+                onViewResults={onViewResults}
+                onTransfer={onTransfer}
               />
             ))}
           </ul>

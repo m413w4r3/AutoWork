@@ -178,7 +178,7 @@ describe("TaskCard actions", () => {
     expect(screen.getByRole("button", { name: "Confirmer" })).toBeDisabled();
   });
 
-  it("place l’interruption de session dans Plus d’actions du contexte Agent", async () => {
+  it("confirme l’arrêt technique de la session séparément de la tâche", async () => {
     const user = userEvent.setup();
     renderCard(
       makeTask({
@@ -199,27 +199,62 @@ describe("TaskCard actions", () => {
       name: "Contexte agent de la tâche",
     });
     const sessionInterrupt = within(agentContext).queryByRole("button", {
-      name: "Interrompre la session",
+      name: "Confirmer l’arrêt technique",
     });
     expect(sessionInterrupt).not.toBeVisible();
     await user.click(
-      within(agentContext).getByText("Plus d’actions", { selector: "summary" }),
+      within(agentContext).getByText("Interrompre la session", {
+        selector: "summary",
+      }),
     );
+    expect(
+      within(agentContext).getByText(/Arrêt technique de la session/),
+    ).toBeInTheDocument();
     await user.click(
       within(agentContext).getByRole("button", {
-        name: "Interrompre la session",
+        name: "Confirmer l’arrêt technique",
       }),
     );
     expect(
       within(agentContext).getByLabelText(
-        "Motif d’interruption de la session (obligatoire)",
+        "Motif d’arrêt de la session (obligatoire)",
       ),
     ).toBeInTheDocument();
     expect(
       within(agentContext).getByRole("button", {
-        name: "Confirmer l’interruption de la session",
+        name: "Confirmer l’arrêt de la session",
       }),
     ).toBeDisabled();
+  });
+
+  it("expose les sorties et le transfert depuis Agent et messages", async () => {
+    const user = userEvent.setup();
+    renderCard(
+      makeTask({
+        status: "running",
+        assigned_actor_kind: "operator",
+        assigned_actor_id: "operator:codex_cli",
+      }),
+      true,
+      [makeSession()],
+    );
+
+    await user.click(screen.getByRole("tab", { name: "Agent et messages" }));
+    const agentContext = screen.getByRole("region", {
+      name: "Contexte agent de la tâche",
+    });
+    await user.click(
+      within(agentContext).getByRole("button", { name: "Transférer" }),
+    );
+    expect(screen.getByText("Destination du transfert")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Annuler" }));
+    await user.click(
+      within(agentContext).getByRole("button", { name: "Voir les sorties" }),
+    );
+
+    expect(
+      screen.getByRole("tab", { name: "Résultats et preuves" }),
+    ).toHaveAttribute("aria-selected", "true");
   });
 });
 
@@ -801,7 +836,7 @@ describe("TaskCard detail subviews and agent messages", () => {
     renderCard(task, true, [session]);
     await user.click(screen.getByRole("tab", { name: "Agent et messages" }));
     await user.type(
-      screen.getByLabelText(/Instruction en cours de session/),
+      screen.getByLabelText(/Instruction à envoyer/),
       "Vérifie la source liée au finding.",
     );
     await user.click(
@@ -809,7 +844,7 @@ describe("TaskCard detail subviews and agent messages", () => {
     );
 
     expect(
-      await screen.findByText(/mise en file persistante \(position 1\)/),
+      await screen.findByText(/en file persistante \(position 1\)/),
     ).toBeInTheDocument();
     const request = recorder.calls.find((call) =>
       call.url.endsWith("/instructions"),

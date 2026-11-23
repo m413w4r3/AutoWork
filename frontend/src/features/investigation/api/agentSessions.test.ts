@@ -1,3 +1,4 @@
+import { renderHook, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -10,14 +11,17 @@ import {
   listAgentSessions,
   openAgentSession,
   resumeAgentSession,
+  useEnqueueAgentInstruction,
 } from "./agentSessions";
 import {
   bodyOf,
+  createTestQueryClient,
   errorResponse,
   headersOf,
   installFetch,
   jsonResponse,
   lastRequest,
+  wrapperFor,
 } from "./testSupport";
 
 afterEach(() => {
@@ -254,5 +258,44 @@ describe("agent session query keys", () => {
       "codex_cli",
       "codex",
     ]);
+  });
+});
+
+describe("instruction enqueue refresh", () => {
+  it("invalidates the session summary so delivery and acknowledgement update", async () => {
+    installFetch(() =>
+      jsonResponse({
+        id: "55555555-5555-4555-8555-555555555555",
+        investigation_id: "inv-1",
+        task_id: "task-1",
+        session_id: "session-2",
+        state: "queued",
+        text_sha256: "c".repeat(64),
+        queued_at: "2026-11-22T10:06:00Z",
+        delivered_at: null,
+        acknowledged_at: null,
+        created_by: { kind: "human", actor_id: "analyst:test" },
+        created_at: "2026-11-22T10:06:00Z",
+        updated_at: "2026-11-22T10:06:00Z",
+        queue_position: 1,
+        delivered_live: false,
+        note_diffs: [],
+      }),
+    );
+    const client = createTestQueryClient();
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const { result } = renderHook(
+      () => useEnqueueAgentInstruction("inv-1", "session-2"),
+      { wrapper: wrapperFor(client) },
+    );
+
+    result.current.mutate({ text: "Vérifie les sorties." });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(invalidate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        queryKey: agentSessionsKeys.summary("inv-1", "session-2"),
+      }),
+    );
   });
 });
