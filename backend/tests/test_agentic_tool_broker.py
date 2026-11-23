@@ -124,6 +124,7 @@ def _running_task(
     *,
     fence: int = 1,
     expires_at: datetime | None = None,
+    heartbeat_at: datetime | None = None,
 ) -> InvestigationTaskV1:
     return InvestigationTaskV1(
         investigation_id=investigation_id,
@@ -143,8 +144,11 @@ def _running_task(
         lease_id=uuid4(),
         lease_session_id=session_id,
         lease_fence=fence,
-        lease_expires_at=expires_at or NOW + timedelta(seconds=180),
-        heartbeat_at=NOW,
+        # The in-memory repository and the signed routes compare the lease
+        # against the real clock, so a module-import anchor would already be
+        # expired when the suite collects this module long before running it.
+        lease_expires_at=expires_at or datetime.now(UTC) + timedelta(seconds=180),
+        heartbeat_at=heartbeat_at or NOW,
     )
 
 
@@ -229,10 +233,17 @@ async def _seed_agent_session(
     *,
     fence: int = 1,
     expires_at: datetime | None = None,
+    heartbeat_at: datetime | None = None,
 ) -> tuple[InvestigationTaskV1, UUID, bytes]:
     """A running leased task plus its active session row and secret."""
     session_id = uuid4()
-    task = _running_task(fixture.investigation_id, session_id, fence=fence, expires_at=expires_at)
+    task = _running_task(
+        fixture.investigation_id,
+        session_id,
+        fence=fence,
+        expires_at=expires_at,
+        heartbeat_at=heartbeat_at,
+    )
     await tasks.add(task)
     row, secret = _session_row(fixture.investigation_id, task, session_id=session_id)
     await sessions.add(row)
@@ -634,6 +645,37 @@ async def test_broker_refuses_expired_lease_mid_call() -> None:
 
     assert len(await _invocations(fixture)) == 1
     assert fixture.tools["vt.file_report"].calls == [_ARGUMENTS]
+
+
+@pytest.mark.asyncio
+async def test_broker_refuses_a_lease_expiring_exactly_at_the_check() -> None:
+    """The deadline is inclusive: ``lease_expires_at == now`` is already stale."""
+    fixture = _fixture()
+    await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
+    tasks = InMemoryInvestigationTaskRepository()
+    sessions = InMemoryAgentSessionRepository()
+    # The broker under test runs on the frozen NOW clock, so pin the deadline on it.
+    task, session_id, _secret = await _seed_agent_session(
+        fixture,
+        tasks,
+        sessions,
+        expires_at=NOW,
+        heartbeat_at=NOW - timedelta(seconds=1),
+    )
+    broker, _uow = _broker(fixture, tasks, sessions)
+
+    with pytest.raises(AgenticLeaseRefusedError) as refused:
+        await broker.invoke(
+            session=_verified(session_id, fixture.investigation_id, task),
+            tool_name="vt.file_report",
+            schema_version="1",
+            arguments=_ARGUMENTS,
+            client_idempotency_key="boundary-expiry",
+        )
+
+    assert refused.value.code == "agent_session_lease_stale"
+    assert await _invocations(fixture) == ()
+    assert fixture.tools["vt.file_report"].calls == []
 
 
 # ------------------------------------------------------------ mapped services
