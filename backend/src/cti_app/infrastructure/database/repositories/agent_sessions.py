@@ -289,10 +289,18 @@ class SqlAlchemyAgentSessionRepository:
         the host stopped; without it the effect is pending (crash between the
         DB commit and the flush).  An already marked ``reconciliation`` is a
         recorded outcome and is never retried automatically.
+
+        The age boundary is ``COALESCE(closed_at, updated_at)``: the D7
+        domain (and the 0023 CHECK) sets ``closed_at`` exactly in
+        ``closed|failed``, so a ``lost`` session has none and its transition
+        time is ``updated_at``.  Filtering on ``closed_at`` alone silently
+        excluded every lost session from the teardown recovery, leaving its
+        CLI and provider credential alive after a crash (R4-F3).
         """
         cutoff = func.statement_timestamp() - func.make_interval(
             0, 0, 0, 0, 0, 0, cast(grace_seconds, Float)
         )
+        released_at = func.coalesce(AgentSessionRow.closed_at, AgentSessionRow.updated_at)
         confirmed = (
             select(InvestigationTaskEventRow.id)
             .where(
@@ -308,11 +316,10 @@ class SqlAlchemyAgentSessionRepository:
                 AgentSessionRow.state.in_(_TERMINAL_SESSION_STATES),
                 AgentSessionRow.host_session_ref.is_not(None),
                 AgentSessionRow.reconciliation.is_(None),
-                AgentSessionRow.closed_at.is_not(None),
-                AgentSessionRow.closed_at <= cutoff,
+                released_at <= cutoff,
                 ~confirmed,
             )
-            .order_by(AgentSessionRow.closed_at, AgentSessionRow.id)
+            .order_by(released_at, AgentSessionRow.id)
             .limit(limit)
         )
         return tuple(_session_from_row(row) for row in rows)

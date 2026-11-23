@@ -975,6 +975,133 @@ def test_crash_orphan_is_failed_and_the_task_becomes_openable(
     asyncio.run(run())
 
 
+def test_pending_host_release_repairs_a_lost_session(
+    temporary_postgres_url: str,
+) -> None:
+    """R4-F3: a ``lost`` session has ``closed_at`` NULL but must still be released.
+
+    The D7 domain and the 0023 CHECK set ``closed_at`` exactly in
+    ``closed|failed``; a ``lost`` session is terminal without it.  After a
+    backend crash between the session commit and the host flush, the sweep must
+    re-request teardown for that host reference too, or the CLI and its
+    provider credential can outlive their lease with no durable release.
+    """
+    command.upgrade(_alembic_config(temporary_postgres_url), "head")
+
+    async def run() -> None:
+        engine = create_postgres_engine(temporary_postgres_url)
+        try:
+            factory = create_session_factory(engine)
+            investigation = await _seed_investigation(factory)
+            task = await _seed_task(factory, investigation.id, task_key="lead-lost-release")
+            handoff_id = await _seed_handoff(factory, investigation.id, task.id)
+            old = NOW - timedelta(minutes=10)
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                db_now = await uow.investigation_tasks.database_now()
+                lost = replace(
+                    _session(
+                        investigation.id,
+                        task.id,
+                        handoff_id,
+                        idempotency_key="lost-release",
+                    ),
+                    state=AgentSessionState.LOST,
+                    close_reason="lease_expired",
+                    opened_at=old,
+                    created_at=old,
+                    updated_at=old,
+                )
+                closed = replace(
+                    _session(
+                        investigation.id,
+                        task.id,
+                        handoff_id,
+                        idempotency_key="closed-release",
+                    ),
+                    state=AgentSessionState.CLOSED,
+                    closed_at=old,
+                    opened_at=old,
+                    created_at=old,
+                    updated_at=old,
+                )
+                fresh = replace(
+                    _session(
+                        investigation.id,
+                        task.id,
+                        handoff_id,
+                        idempotency_key="fresh-lost-release",
+                    ),
+                    state=AgentSessionState.LOST,
+                    close_reason="lease_expired",
+                    opened_at=db_now,
+                    created_at=db_now,
+                    updated_at=db_now,
+                )
+                await uow.agent_sessions.add(lost)
+                await uow.agent_sessions.add(closed)
+                await uow.agent_sessions.add(fresh)
+                await uow.commit()
+
+            class _Source:
+                async def list_orphan_sessions(
+                    self, *, grace_seconds: int, limit: int
+                ) -> tuple[AgentSessionV1, ...]:
+                    async with factory() as db_session:
+                        return await SqlAlchemyAgentSessionRepository(
+                            db_session
+                        ).list_orphan_sessions(grace_seconds=grace_seconds, limit=limit)
+
+                async def list_pending_host_release_sessions(
+                    self, *, grace_seconds: int, limit: int
+                ) -> tuple[AgentSessionV1, ...]:
+                    async with factory() as db_session:
+                        return await SqlAlchemyAgentSessionRepository(
+                            db_session
+                        ).list_pending_host_release_sessions(
+                            grace_seconds=grace_seconds, limit=limit
+                        )
+
+            host = _ClosingHost()
+            releases = HostSessionReleaseService(
+                uow_factory=lambda: SqlAlchemyUnitOfWork(factory),
+                host=cast(HostSessionsPort, host),
+                wait_seconds=0.0,
+            )
+            recovered, pending = await recover_orphan_agent_sessions(
+                source=_Source(),
+                uow_factory=lambda: SqlAlchemyUnitOfWork(factory),
+                flush_releases=releases.flush,
+                grace_seconds=60,
+                batch_size=10,
+            )
+            assert recovered == 0
+            assert pending == 2, "the lost and the closed session both await teardown"
+            assert set(host.closed) == {lost.id, closed.id}
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                events = await uow.investigation_tasks.list_events(task.id)
+                stored_fresh = await uow.agent_sessions.get(fresh.id)
+            markers = {event.idempotency_key for event in events}
+            assert f"host-release:{lost.id}" in markers
+            assert f"host-release:{closed.id}" in markers
+            assert f"host-release:{fresh.id}" not in markers
+            assert stored_fresh is not None
+            assert stored_fresh.state is AgentSessionState.LOST
+
+            # The durable marker makes the next pass a clean no-op.
+            _, again = await recover_orphan_agent_sessions(
+                source=_Source(),
+                uow_factory=lambda: SqlAlchemyUnitOfWork(factory),
+                flush_releases=releases.flush,
+                grace_seconds=60,
+                batch_size=10,
+            )
+            assert again == 0
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
 def test_instruction_delivery_repository_cas_and_pending_listing(
     temporary_postgres_url: str,
 ) -> None:
