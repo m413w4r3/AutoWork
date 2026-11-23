@@ -1146,6 +1146,79 @@ test("note de l’analyste : aucune largeur ne déborde aux trois résolutions",
   }
 });
 
+test("cases à cocher et radios : le contrôle reste collé au libellé", async ({
+  page,
+}) => {
+  const api = createWorkshopApi();
+  await launchWorkshop(page, api);
+
+  const inlineChoices = async () =>
+    page.evaluate(() =>
+      [...document.querySelectorAll("label")]
+        .filter((label) =>
+          label.querySelector("input[type='checkbox'], input[type='radio']"),
+        )
+        .map((label) => {
+          const input = label.querySelector(
+            "input[type='checkbox'], input[type='radio']",
+          ) as HTMLElement;
+          const labelRect = label.getBoundingClientRect();
+          const inputRect = input.getBoundingClientRect();
+          return {
+            text: (label.textContent ?? "").trim().slice(0, 48),
+            inputWidth: Math.round(inputRect.width),
+            inputHeight: Math.round(inputRect.height),
+            offsetFromLabel: Math.round(inputRect.left - labelRect.left),
+            topFromLabel: Math.round(inputRect.top - labelRect.top),
+          };
+        }),
+    );
+
+  // Another view (G2 envelope approval confirmation) uses the same inline
+  // pattern and must not regress either.
+  const overviewChoices = await inlineChoices();
+  expect(overviewChoices.length).toBeGreaterThan(0);
+  for (const choice of overviewChoices) {
+    expect(choice.inputWidth, choice.text).toBeLessThanOrEqual(24);
+    expect(choice.inputHeight, choice.text).toBeLessThanOrEqual(24);
+    expect(choice.offsetFromLabel, choice.text).toBeLessThanOrEqual(4);
+  }
+
+  await openView(page, "Note de l’analyste");
+  await page.getByRole("button", { name: "Examiner la proposition" }).click();
+  await expect(
+    page.getByRole("region", { name: /Proposition ciblée/ }),
+  ).toBeVisible();
+
+  const acceptance = page
+    .locator("label")
+    .filter({ hasText: "J’ai examiné le texte stocké" });
+  await expect(acceptance.getByRole("checkbox")).toBeVisible();
+  const acceptanceMetrics = await acceptance.evaluate((label) => {
+    const input = label.querySelector("input[type='checkbox']") as HTMLElement;
+    const labelRect = label.getBoundingClientRect();
+    const inputRect = input.getBoundingClientRect();
+    return {
+      inputWidth: Math.round(inputRect.width),
+      inputHeight: Math.round(inputRect.height),
+      offsetFromLabel: Math.round(inputRect.left - labelRect.left),
+      topFromLabel: Math.round(inputRect.top - labelRect.top),
+    };
+  });
+  expect(acceptanceMetrics.inputWidth).toBeLessThanOrEqual(24);
+  expect(acceptanceMetrics.inputHeight).toBeLessThanOrEqual(24);
+  expect(acceptanceMetrics.offsetFromLabel).toBeLessThanOrEqual(4);
+  expect(acceptanceMetrics.topFromLabel).toBeLessThanOrEqual(4);
+
+  const opinionChoices = await inlineChoices();
+  expect(opinionChoices.length).toBeGreaterThanOrEqual(15);
+  for (const choice of opinionChoices) {
+    expect(choice.inputWidth, choice.text).toBeLessThanOrEqual(24);
+    expect(choice.inputHeight, choice.text).toBeLessThanOrEqual(24);
+    expect(choice.offsetFromLabel, choice.text).toBeLessThanOrEqual(4);
+  }
+});
+
 test("note de l’analyste : des blocs périmés bloquent l’acceptation", async ({
   page,
 }) => {
