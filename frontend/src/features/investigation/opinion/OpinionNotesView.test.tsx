@@ -8,6 +8,7 @@ import type {
   InvestigationView,
 } from "../../../api/investigation";
 import type { InvestigationActivityPage } from "../../../api/investigationOperator";
+import type { ArticleAnchorCatalogViewV1 } from "../api/articleAnchors";
 import type {
   NoteAcceptanceViewV1,
   NoteProposalDiffViewV1,
@@ -319,6 +320,33 @@ function makeTasks(): TaskPageView {
   };
 }
 
+function makeAnchorCatalog(): ArticleAnchorCatalogViewV1 {
+  return {
+    base_publication_artifact_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    base_publication_version: 3,
+    base_publication_sha256: BASE_HASH,
+    source: "pinned_opinion_base",
+    anchors: [
+      {
+        anchor: "lead:0001",
+        text: "Le chapô observe un service de commande.",
+        text_sha256: "d".repeat(64),
+        section_index: null,
+        paragraph_index: 0,
+      },
+      {
+        anchor: "section:2:paragraph:0007",
+        text: "La section documente une persistance.",
+        text_sha256: "e".repeat(64),
+        section_index: 2,
+        paragraph_index: 6,
+      },
+    ],
+    elements: [],
+    truncated: false,
+  };
+}
+
 function makeProposal(
   overrides: Partial<NoteProposalViewV1> = {},
 ): NoteProposalViewV1 {
@@ -344,6 +372,10 @@ function makeProposal(
     tool_invocation_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
     base_opinion_version: 3,
     base_opinion_sha256: CONTENT_HASH,
+    base_publication_artifact_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    base_publication_version: 3,
+    base_publication_sha256: BASE_HASH,
+    anchor_before_sha256: "d".repeat(64),
     status: "proposed",
     status_version: 4,
     accepted_opinion_version: null,
@@ -433,6 +465,9 @@ function renderView(options: RenderOptions = {}) {
     }
     if (url.startsWith(`/api/investigations/${INVESTIGATION_ID}/activity`)) {
       return jsonResponse(makeActivity());
+    }
+    if (url === `/api/investigations/${INVESTIGATION_ID}/article-anchors`) {
+      return jsonResponse(makeAnchorCatalog());
     }
     if (
       url.startsWith(`/api/investigations/${INVESTIGATION_ID}/note-proposals?`)
@@ -690,7 +725,7 @@ describe("OpinionNotesView — notes Bridge par ancre", () => {
 
   it("ne propose aucune saisie libre de texte éditorial et n’envoie que la question bornée", async () => {
     const user = userEvent.setup();
-    const { calls } = renderView();
+    const { calls, container } = renderView();
 
     await screen.findByRole("heading", {
       name: "Demander une proposition à Bridge",
@@ -700,6 +735,15 @@ describe("OpinionNotesView — notes Bridge par ancre", () => {
         name: /(texte|proposition).*(avis|note|bloc)/i,
       }),
     ).toBeNull();
+    expect(
+      await screen.findByRole("combobox", { name: "Ancre de publication" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Base de publication :/)).toBeInTheDocument();
+    expect(screen.queryByText(/n’expose aucune lecture des/)).toBeNull();
+    expect(container.querySelector("datalist")).toBeNull();
+    expect(
+      screen.getByText("Diagnostic — saisie manuelle d’ancre"),
+    ).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: /Enregistrer la révision/i }),
     ).toBeNull();
