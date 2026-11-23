@@ -10,6 +10,7 @@ oracles live in ``tests/integration/test_instruction_delivery_postgres.py``.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -190,6 +191,7 @@ class _FakeHost:
         self.events_error: Exception | None = None
         self.resync_required = False
         self.before_send: Any = None
+        self.after_send: Any = None
         self.unreachable: set[UUID] = set()
 
     async def get_session_status(self, session_id: UUID) -> HostSessionStatusV1:
@@ -217,6 +219,8 @@ class _FakeHost:
         self.send_calls.append(
             {"session_id": session_id, "request": request, "idempotency_key": idempotency_key}
         )
+        if self.after_send is not None:
+            await self.after_send()
         return HostInstructionResultV1(
             accepted=self.accepted, delivered=self.delivered, cursor=len(self.send_calls)
         )
@@ -585,6 +589,126 @@ async def test_delivery_round_robin_serves_sparse_session_within_two_passes() ->
     assert harness.host.send_calls[2]["request"].instruction_id == busy_instructions[1].id
 
 
+async def test_delivery_rotation_bounds_busy_queue_and_preserves_per_session_order() -> None:
+    harness = _Harness()
+    sessions = [await harness.seed_session(state=AgentSessionState.RUNNING) for _ in range(7)]
+    busy, *sparse = sorted(sessions, key=lambda item: item.id.int)
+    busy_instructions = [
+        await harness.seed_queued_instruction(
+            busy,
+            text=f"Busy instruction {index}",
+            key=f"rotation-busy-{index}",
+            queued_at=NOW + timedelta(seconds=index),
+        )
+        for index in range(5)
+    ]
+    sparse_instructions = [
+        await harness.seed_queued_instruction(
+            session,
+            text=f"Sparse instruction {index}",
+            key=f"rotation-sparse-{index}",
+            queued_at=NOW + timedelta(seconds=10 + index),
+        )
+        for index, session in enumerate(sparse)
+    ]
+    inactive = await harness.seed_session(state=AgentSessionState.STOPPED)
+    inactive_instruction = await harness.seed_queued_instruction(
+        inactive, text="Must stay queued", key="rotation-inactive"
+    )
+    delivery = InstructionDeliveryService(
+        uow_factory=harness.uow_factory,
+        host=harness.host,
+        notes=harness.notes,
+        disclosure=harness.disclosure,
+        clock=harness.clock,
+        grace_seconds=GRACE_SECONDS,
+        batch_size=3,
+    )
+
+    reports = [await delivery.drain_once(now=NOW) for _ in range(7)]
+    calls_by_pass: list[list[dict[str, Any]]] = []
+    offset = 0
+    for report in reports:
+        calls = harness.host.send_calls[offset : offset + report.delivered]
+        calls_by_pass.append(calls)
+        offset += report.delivered
+
+    assert [report.delivered for report in reports] == [3, 3, 2, 1, 1, 1, 0]
+    assert all(len({call["session_id"] for call in calls}) == len(calls) for calls in calls_by_pass)
+    first_three_passes = {call["session_id"] for calls in calls_by_pass[:3] for call in calls}
+    assert {session.id for session in sessions} <= first_three_passes
+    assert [
+        call["request"].instruction_id
+        for call in harness.host.send_calls
+        if call["session_id"] == busy.id
+    ] == [instruction.id for instruction in busy_instructions]
+    assert [
+        call["request"].instruction_id
+        for call in harness.host.send_calls
+        if call["session_id"] != busy.id
+    ] == [instruction.id for instruction in sparse_instructions]
+    assert (await harness.instruction(inactive_instruction.id)).state is InstructionState.QUEUED
+
+
+async def test_reconciling_session_does_not_receive_until_reconciliation_finishes() -> None:
+    harness = _Harness()
+    session = await harness.seed_session(state=AgentSessionState.RECONCILING)
+    instruction = await harness.seed_queued_instruction(
+        session, text="Wait for reconciliation", key="reconcile-delivery"
+    )
+    candidates = await harness.sessions.list_delivery_candidates(limit=1, after_session_id=None)
+    assert [candidate.id for candidate in candidates] == [instruction.id]
+
+    waiting = await harness.delivery.drain_once()
+
+    assert waiting.delivered == 0
+    assert harness.host.send_calls == []
+    assert (await harness.instruction(instruction.id)).state is InstructionState.QUEUED
+
+    reconciled = session.with_state(AgentSessionState.RUNNING, now=NOW)
+    assert (
+        await harness.sessions.update_state(
+            reconciled, expected_state_version=session.state_version
+        )
+        == reconciled
+    )
+    delivered = await harness.delivery.drain_once()
+
+    assert delivered.delivered == 1
+    assert [call["request"].instruction_id for call in harness.host.send_calls] == [instruction.id]
+
+
+async def test_delivery_service_restart_loses_cursor_without_losing_or_repeating_rows() -> None:
+    harness = _Harness()
+    sessions = [await harness.seed_session(state=AgentSessionState.RUNNING) for _ in range(2)]
+    instructions = [
+        await harness.seed_queued_instruction(
+            session, text=f"Restart instruction {index}", key=f"restart-{index}"
+        )
+        for index, session in enumerate(sessions)
+    ]
+    first = await harness.delivery.drain_once(limit=1)
+    restarted = InstructionDeliveryService(
+        uow_factory=harness.uow_factory,
+        host=harness.host,
+        notes=harness.notes,
+        disclosure=harness.disclosure,
+        clock=harness.clock,
+        grace_seconds=GRACE_SECONDS,
+        batch_size=1,
+    )
+
+    second = await restarted.drain_once()
+    replay = await restarted.drain_once()
+
+    assert first.delivered == second.delivered == 1
+    assert replay.scanned == 0
+    assert {call["request"].instruction_id for call in harness.host.send_calls} == {
+        instruction.id for instruction in instructions
+    }
+    assert len({call["request"].instruction_id for call in harness.host.send_calls}) == 2
+
+
 async def test_delivery_below_batch_limit_still_selects_one_oldest_per_session() -> None:
     harness = _Harness()
     first_session = await harness.seed_session(state=AgentSessionState.RUNNING)
@@ -777,6 +901,47 @@ async def test_revoked_disclosure_refuses_delivery_without_consuming() -> None:
     assert stored.last_delivery_error is not None
     assert stored.last_delivery_error.startswith("disclosure_denied:")
     assert "external_llm_not_allowed" in stored.last_delivery_error
+
+
+async def test_disclosure_revoked_during_host_io_leaves_delivery_unknown() -> None:
+    harness = _Harness()
+    session = await harness.seed_session(state=AgentSessionState.RUNNING)
+    queued = await harness.enqueue(session, text="Do not confirm after revoke.", key="i-7b")
+    harness.host.status_state = "awaiting_instruction"
+    host_effected = asyncio.Event()
+    release_response = asyncio.Event()
+
+    async def hold_response_after_host_effect() -> None:
+        host_effected.set()
+        await release_response.wait()
+
+    harness.host.after_send = hold_response_after_host_effect
+    delivering = asyncio.create_task(harness.delivery.drain_once())
+    await asyncio.wait_for(host_effected.wait(), timeout=10)
+    assert len(harness.host.send_calls) == 1
+
+    harness.envelope = replace(
+        harness.envelope,
+        disclosure=DisclosureBounds(
+            tlp=TLPLevel.CLEAR,
+            do_not_submit=False,
+            external_llm_allowed=False,
+        ),
+    )
+    release_response.set()
+    report = await asyncio.wait_for(delivering, timeout=10)
+
+    stored = await harness.instruction(queued.instruction.id)
+    assert report.unknown == 1
+    assert stored.state is InstructionState.DELIVERY_UNKNOWN
+    assert stored.last_delivery_error is not None
+    assert stored.last_delivery_error.startswith("disclosure_denied:")
+    assert stored.delivered_at is None
+    assert len(harness.host.send_calls) == 1
+
+    replay = await harness.delivery.drain_once()
+    assert replay.delivered == 0
+    assert len(harness.host.send_calls) == 1
 
 
 # ------------------------------------------------------------------- INS-08

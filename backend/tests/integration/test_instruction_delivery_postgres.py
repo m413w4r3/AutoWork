@@ -24,6 +24,7 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 import sqlalchemy as sa
+from alembic import command
 from fastapi import FastAPI
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -45,6 +46,7 @@ from cti_app.application.agentic_host_sessions import (
 )
 from cti_app.application.agentic_sessions import (
     NoteInstructionResolution,
+    SessionExternalDisclosureDeniedError,
     SessionSecret,
     SessionService,
 )
@@ -93,6 +95,7 @@ from cti_app.infrastructure.database.session import (
     create_session_factory,
 )
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
+from tests.integration.conftest import _alembic_config
 from tests.integration.edition_codes import reserve_edition_code
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
@@ -141,6 +144,17 @@ class _AllowDisclosure:
         return None
 
 
+class _RevocableDisclosure(_AllowDisclosure):
+    def __init__(self) -> None:
+        self.revoked = False
+
+    async def require(self, pre_read: SessionDisclosurePreRead, uow: Any) -> None:
+        if self.revoked:
+            raise SessionExternalDisclosureDeniedError(
+                "synthetic G2 revocation during host I/O", details={"reason": "revoked"}
+            )
+
+
 class _FakeNotes:
     async def prepare(
         self, *, investigation_id: UUID, text: str, note_refs: Any
@@ -157,6 +171,7 @@ class _FakeHost:
         self.status_calls = 0
         self.events: tuple[HostSessionEventV1, ...] = ()
         self.unreachable: set[UUID] = set()
+        self.after_send: Any = None
 
     async def get_session_status(self, session_id: UUID) -> HostSessionStatusV1:
         self.status_calls += 1
@@ -177,6 +192,8 @@ class _FakeHost:
         self.send_calls.append(
             {"session_id": session_id, "request": request, "idempotency_key": idempotency_key}
         )
+        if self.after_send is not None:
+            await self.after_send()
         return HostInstructionResultV1(
             accepted=True, delivered="queued", cursor=len(self.send_calls)
         )
@@ -378,7 +395,10 @@ async def _seed_instruction(
 
 
 def _delivery_service(
-    session_factory: async_sessionmaker[AsyncSession], host: _FakeHost
+    session_factory: async_sessionmaker[AsyncSession],
+    host: _FakeHost,
+    *,
+    batch_size: int = 32,
 ) -> InstructionDeliveryService:
     return InstructionDeliveryService(
         uow_factory=lambda: SqlAlchemyUnitOfWork(session_factory),
@@ -387,6 +407,7 @@ def _delivery_service(
         disclosure=_AllowDisclosure(),
         clock=lambda: NOW,
         grace_seconds=GRACE_SECONDS,
+        batch_size=batch_size,
     )
 
 
@@ -463,6 +484,229 @@ def test_two_concurrent_drainers_reserve_once_and_call_host_once(
             assert later.delivered == 1
             assert len(host.send_calls) == 2
             assert host.send_calls[1]["request"].instruction_id == second.id
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_postgres_delivery_rotation_matches_memory_fairness_and_survives_restart(
+    temporary_postgres_url: str,
+) -> None:
+    command.upgrade(_alembic_config(temporary_postgres_url), "head")
+
+    async def run() -> None:
+        engine = create_postgres_engine(temporary_postgres_url)
+        try:
+            factory = create_session_factory(engine)
+            investigation = await _seed_investigation(factory)
+            sessions = [await _seed_leased_session(factory, investigation.id) for _ in range(7)]
+            busy, *sparse = sorted(sessions, key=lambda item: item.id.int)
+            busy_instructions = [
+                await _seed_instruction(
+                    factory,
+                    busy,
+                    text=f"Busy instruction {index}",
+                    key=f"pg-rotation-busy-{index}",
+                    queued_at=NOW + timedelta(seconds=index),
+                )
+                for index in range(5)
+            ]
+            sparse_instructions = [
+                await _seed_instruction(
+                    factory,
+                    session,
+                    text=f"Sparse instruction {index}",
+                    key=f"pg-rotation-sparse-{index}",
+                    queued_at=NOW + timedelta(seconds=10 + index),
+                )
+                for index, session in enumerate(sparse)
+            ]
+            inactive = await _seed_leased_session(factory, investigation.id)
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                inactive_lost = inactive.with_state(
+                    AgentSessionState.LOST, now=NOW, close_reason="test_inactive"
+                )
+                assert await uow.agent_sessions.update_state(
+                    inactive_lost, expected_state_version=inactive.state_version
+                )
+                await uow.commit()
+            inactive_instruction = await _seed_instruction(
+                factory,
+                inactive_lost,
+                text="Must stay queued",
+                key="pg-rotation-inactive",
+            )
+            host = _FakeHost()
+            delivery = _delivery_service(factory, host, batch_size=3)
+
+            reports = [await delivery.drain_once(now=NOW) for _ in range(7)]
+            calls_by_pass: list[list[dict[str, Any]]] = []
+            offset = 0
+            for report in reports:
+                calls = host.send_calls[offset : offset + report.delivered]
+                calls_by_pass.append(calls)
+                offset += report.delivered
+
+            assert [report.delivered for report in reports] == [3, 3, 2, 1, 1, 1, 0]
+            assert all(
+                len({call["session_id"] for call in calls}) == len(calls) for calls in calls_by_pass
+            )
+            served_in_three = {call["session_id"] for calls in calls_by_pass[:3] for call in calls}
+            assert {session.id for session in sessions} <= served_in_three
+            assert [
+                call["request"].instruction_id
+                for call in host.send_calls
+                if call["session_id"] == busy.id
+            ] == [instruction.id for instruction in busy_instructions]
+            assert [
+                call["request"].instruction_id
+                for call in host.send_calls
+                if call["session_id"] != busy.id
+            ] == [instruction.id for instruction in sparse_instructions]
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                inactive_stored = await uow.agent_sessions.get_instruction(inactive_instruction.id)
+            assert inactive_stored is not None
+            assert inactive_stored.state is InstructionState.QUEUED
+
+            restart_sessions = [
+                await _seed_leased_session(factory, investigation.id) for _ in range(2)
+            ]
+            restart_instructions = [
+                await _seed_instruction(
+                    factory,
+                    session,
+                    text=f"Restart instruction {index}",
+                    key=f"pg-restart-{index}",
+                )
+                for index, session in enumerate(restart_sessions)
+            ]
+            before_restart = len(host.send_calls)
+            old_service = _delivery_service(factory, host, batch_size=1)
+            first = await old_service.drain_once(now=NOW)
+            restarted_service = _delivery_service(factory, host, batch_size=1)
+            second = await restarted_service.drain_once(now=NOW)
+            empty = await restarted_service.drain_once(now=NOW)
+            restarted_calls = host.send_calls[before_restart:]
+
+            assert first.delivered == second.delivered == 1
+            assert empty.scanned == 0
+            assert {call["request"].instruction_id for call in restarted_calls} == {
+                instruction.id for instruction in restart_instructions
+            }
+            assert len({call["request"].instruction_id for call in restarted_calls}) == 2
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_postgres_reconciling_session_waits_before_delivery_and_resumes_afterward(
+    temporary_postgres_url: str,
+) -> None:
+    command.upgrade(_alembic_config(temporary_postgres_url), "head")
+
+    async def run() -> None:
+        engine = create_postgres_engine(temporary_postgres_url)
+        try:
+            factory = create_session_factory(engine)
+            investigation = await _seed_investigation(factory)
+            session = await _seed_leased_session(factory, investigation.id)
+            reconciling = session.with_state(AgentSessionState.RECONCILING, now=NOW)
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                assert await uow.agent_sessions.update_state(
+                    reconciling, expected_state_version=session.state_version
+                )
+                await uow.commit()
+            instruction = await _seed_instruction(
+                factory,
+                reconciling,
+                text="Wait for the in-flight host operation",
+                key="pg-reconciling-delivery",
+            )
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                candidates = await uow.agent_sessions.list_delivery_candidates(
+                    limit=1, after_session_id=None
+                )
+            assert [candidate.id for candidate in candidates] == [instruction.id]
+
+            host = _FakeHost()
+            delivery = _delivery_service(factory, host, batch_size=1)
+            waiting = await delivery.drain_once(now=NOW)
+
+            assert waiting.delivered == 0
+            assert host.send_calls == []
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                still_queued = await uow.agent_sessions.get_instruction(instruction.id)
+            assert still_queued is not None
+            assert still_queued.state is InstructionState.QUEUED
+
+            running = reconciling.with_state(AgentSessionState.RUNNING, now=NOW)
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                assert await uow.agent_sessions.update_state(
+                    running, expected_state_version=reconciling.state_version
+                )
+                await uow.commit()
+            delivered = await delivery.drain_once(now=NOW)
+
+            assert delivered.delivered == 1
+            assert [call["request"].instruction_id for call in host.send_calls] == [instruction.id]
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_postgres_g2_revocation_during_host_io_keeps_delivery_unconfirmed(
+    temporary_postgres_url: str,
+) -> None:
+    command.upgrade(_alembic_config(temporary_postgres_url), "head")
+
+    async def run() -> None:
+        engine = create_postgres_engine(temporary_postgres_url)
+        try:
+            factory = create_session_factory(engine)
+            investigation = await _seed_investigation(factory)
+            session = await _seed_leased_session(factory, investigation.id)
+            instruction = await _seed_instruction(
+                factory, session, text="Do not confirm after revoke.", key="pg-g2-race"
+            )
+            host = _FakeHost()
+            host_effected = asyncio.Event()
+            release_response = asyncio.Event()
+
+            async def hold_response_after_host_effect() -> None:
+                host_effected.set()
+                await release_response.wait()
+
+            host.after_send = hold_response_after_host_effect
+            disclosure = _RevocableDisclosure()
+            delivery = InstructionDeliveryService(
+                uow_factory=lambda: SqlAlchemyUnitOfWork(factory),
+                host=host,
+                notes=_FakeNotes(),
+                disclosure=disclosure,
+                clock=lambda: NOW,
+                grace_seconds=GRACE_SECONDS,
+                batch_size=1,
+            )
+            attempt = asyncio.create_task(delivery.drain_once(now=NOW))
+            await asyncio.wait_for(host_effected.wait(), timeout=10)
+            assert len(host.send_calls) == 1
+            disclosure.revoked = True
+            release_response.set()
+            report = await asyncio.wait_for(attempt, timeout=10)
+
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                stored = await uow.agent_sessions.get_instruction(instruction.id)
+            assert stored is not None
+            assert report.unknown == 1
+            assert stored.state is InstructionState.DELIVERY_UNKNOWN
+            assert stored.delivered_at is None
+            assert stored.last_delivery_error == "disclosure_denied:revoked"
+            replay = await delivery.drain_once(now=NOW)
+            assert replay.delivered == 0
+            assert len(host.send_calls) == 1
         finally:
             await engine.dispose()
 

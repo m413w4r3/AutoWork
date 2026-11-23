@@ -20,6 +20,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from sidecars.workspace_agent.sessions import supervisor as sessions_supervisor
 from sidecars.workspace_agent.sessions.fake_cli import (
     SYNTHETIC_PROVIDER_CREDENTIAL,
     write_scratch,
@@ -303,7 +304,7 @@ def test_collect_fails_closed_when_a_credential_copy_cannot_be_read(
         assert CLAUDE_ACCESS_TOKEN not in json.dumps(body)
 
 
-def test_collect_manifest_ignores_nonoutputs_and_replay_preserves_import_provenance(
+def test_collect_manifest_replay_after_supervisor_restart_preserves_import_provenance(
     session_base: Path,
 ) -> None:
     """Only declared UTF-8 Markdown scratch outputs reach the versioned workspace."""
@@ -367,6 +368,12 @@ def test_collect_manifest_ignores_nonoutputs_and_replay_preserves_import_provena
         ) as retry_client:
             with pytest.raises(httpx.ReadTimeout, match="synthetic lost collect response"):
                 _collect(retry_client, running)
+            server = running.agent._server
+            assert server is not None
+            previous_supervisor = server.session_supervisor
+            previous_supervisor.stop()
+            server.session_supervisor = sessions_supervisor.build_session_supervisor(running.agent)
+
             replayed = _collect(retry_client, running)
             replayed_again = _collect(retry_client, running)
         assert replayed.status_code == 200, replayed.text

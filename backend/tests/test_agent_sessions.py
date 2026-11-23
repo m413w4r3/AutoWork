@@ -415,6 +415,7 @@ class _ControlledHostIoOperator(_FakeOperator):
         self.collect_both_entered = asyncio.Event()
         self.collect_release = asyncio.Event()
         self.reconcile_entered = asyncio.Event()
+        self.reconcile_both_entered = asyncio.Event()
         self.reconcile_release = asyncio.Event()
         self.block_collect = False
         self.block_reconcile = False
@@ -467,6 +468,8 @@ class _ControlledHostIoOperator(_FakeOperator):
     async def reconcile_session(self, request: ReconcileSessionRequest) -> SessionReconciliationV1:
         self._observe("reconcile")
         self.reconciled.append(request)
+        if len(self.reconciled) >= 2:
+            self.reconcile_both_entered.set()
         if self.block_reconcile:
             self.reconcile_entered.set()
             await self.reconcile_release.wait()
@@ -1294,6 +1297,101 @@ async def test_collect_timeout_after_effect_is_reconciled_then_replayed_idempote
     assert stored is not None and stored.checkpoint_sha256 == replayed.checkpoint_sha256
 
 
+async def test_collect_restarts_from_committed_intent_before_the_host_call() -> None:
+    harness = _Harness()
+    task = await harness.seed_task()
+    prepared = await harness.open(task=task)
+    operator = _ControlledHostIoOperator(harness)
+    harness.operator = operator
+    harness.service._operator = operator
+
+    intent = await harness.service._begin_host_io(
+        harness.investigation_id,
+        prepared.session.id,
+        timestamp=NOW,
+        operation="collect results",
+        allow_reconciliation_retry=False,
+        require_host_session_ref=True,
+    )
+
+    assert intent.session.state is AgentSessionState.RECONCILING
+    assert operator.collected == []
+    assert operator.reconciled == []
+    restarted = SessionService(
+        uow_factory=lambda: harness.uow,
+        deriver=harness.deriver,
+        operator=operator,
+        disclosure=harness.disclosure,
+        clock=lambda: NOW,
+    )
+    reconciled = await restarted.reconcile(
+        harness.investigation_id, prepared.session.id, actor=OPERATOR_ACTOR
+    )
+    result = await restarted.collect(
+        harness.investigation_id,
+        prepared.session.id,
+        actor=OPERATOR_ACTOR,
+        cursor="pre-host-crash-cursor",
+    )
+    replay = await restarted.collect(
+        harness.investigation_id,
+        prepared.session.id,
+        actor=OPERATOR_ACTOR,
+        cursor="pre-host-crash-cursor",
+    )
+
+    assert reconciled.state is AgentSessionState.RUNNING
+    assert operator.reconciled[0].idempotency_key == f"state-version:{intent.session.state_version}"
+    assert [request.cursor for request in operator.collected] == [
+        "pre-host-crash-cursor",
+        "pre-host-crash-cursor",
+    ]
+    assert result.checkpoint_sha256 == replay.checkpoint_sha256
+    assert operator.collect_effects == 1
+    stored = await harness.sessions.get(prepared.session.id)
+    assert stored is not None and stored.checkpoint_sha256 == result.checkpoint_sha256
+
+
+async def test_concurrent_collects_on_one_session_apply_only_the_winner() -> None:
+    harness = _Harness()
+    task = await harness.seed_task()
+    prepared = await harness.open(task=task)
+    operator = _ControlledHostIoOperator(harness)
+    operator.block_collect = True
+    harness.operator = operator
+    harness.service._operator = operator
+
+    first = asyncio.create_task(
+        harness.service.collect(
+            harness.investigation_id,
+            prepared.session.id,
+            actor=OPERATOR_ACTOR,
+            cursor="same-session-cursor",
+        )
+    )
+    await asyncio.wait_for(operator.collect_entered.wait(), timeout=10)
+    with pytest.raises(SessionStateConflictError, match="requires reconciliation"):
+        await harness.service.collect(
+            harness.investigation_id,
+            prepared.session.id,
+            actor=OPERATOR_ACTOR,
+            cursor="same-session-cursor",
+        )
+    assert len(operator.collected) == 1
+    pending = await harness.sessions.get(prepared.session.id)
+    assert pending is not None and pending.state is AgentSessionState.RECONCILING
+    assert pending.checkpoint_ref is None
+
+    operator.collect_release.set()
+    result = await asyncio.wait_for(first, timeout=10)
+
+    stored = await harness.sessions.get(prepared.session.id)
+    assert stored is not None and stored.state is AgentSessionState.RUNNING
+    assert stored.checkpoint_sha256 == result.checkpoint_sha256
+    assert operator.collect_effects == 1
+    assert len(operator.collected) == 1
+
+
 async def test_unavailable_collect_leaves_explicit_reconciliation_state() -> None:
     harness = _Harness()
     task = await harness.seed_task()
@@ -1354,6 +1452,45 @@ async def test_reconcile_timeout_replays_same_intent_key_and_new_attempt_gets_ne
     await restarted.reconcile(harness.investigation_id, prepared.session.id, actor=OPERATOR_ACTOR)
     assert operator.reconciled[2].idempotency_key != first_key
     assert operator.reconcile_effects == 2
+
+
+async def test_concurrent_reconcile_replays_one_intent_and_applies_once() -> None:
+    harness = _Harness()
+    task = await harness.seed_task()
+    prepared = await harness.open(task=task)
+    operator = _ControlledHostIoOperator(harness)
+    operator.block_reconcile = True
+    harness.operator = operator
+    harness.service._operator = operator
+
+    first = asyncio.create_task(
+        harness.service.reconcile(
+            harness.investigation_id, prepared.session.id, actor=OPERATOR_ACTOR
+        )
+    )
+    await asyncio.wait_for(operator.reconcile_entered.wait(), timeout=10)
+    second = asyncio.create_task(
+        harness.service.reconcile(
+            harness.investigation_id, prepared.session.id, actor=OPERATOR_ACTOR
+        )
+    )
+    await asyncio.wait_for(operator.reconcile_both_entered.wait(), timeout=10)
+    pending = await harness.sessions.get(prepared.session.id)
+    assert pending is not None and pending.state is AgentSessionState.RECONCILING
+    assert len({request.idempotency_key for request in operator.reconciled}) == 1
+
+    operator.reconcile_release.set()
+    results = await asyncio.gather(first, second, return_exceptions=True)
+
+    applied = [item for item in results if isinstance(item, AgentSessionV1)]
+    conflicts = [item for item in results if isinstance(item, SessionStateConflictError)]
+    assert len(applied) == len(conflicts) == 1
+    assert applied[0].state is AgentSessionState.RUNNING
+    assert operator.reconcile_effects == 1
+    stored = await harness.sessions.get(prepared.session.id)
+    assert stored is not None
+    assert stored.state is AgentSessionState.RUNNING
+    assert stored.state_version == prepared.session.state_version + 3
 
 
 async def test_two_active_sessions_can_wait_for_host_collection_together() -> None:
