@@ -555,9 +555,7 @@ def test_real_adapters_share_the_relay_transport_contract(
     synthetic_host_etc = tmp_path / "synthetic-host" / "etc"
     synthetic_host_etc.mkdir(parents=True)
     sentinel = "tailnet.r2b4.invalid"
-    (synthetic_host_etc / "hosts").write_text(
-        f"127.0.0.1 localhost {sentinel}\n", encoding="utf-8"
-    )
+    (synthetic_host_etc / "hosts").write_text(f"127.0.0.1 localhost {sentinel}\n", encoding="utf-8")
     (synthetic_host_etc / "resolv.conf").write_text(
         f"search {sentinel}\nnameserver 192.0.2.53\n", encoding="utf-8"
     )
@@ -576,7 +574,8 @@ def test_real_adapters_share_the_relay_transport_contract(
     assert all(pair in binds for pair in process.session_etc_ro_binds(session_etc))
     assert all(pair in binds for pair in process.tls_trust_anchor_binds())
     assert not any(
-        target in {
+        target
+        in {
             Path("/etc/ssl"),
             Path("/etc/ca-certificates"),
             Path("/etc/pki"),
