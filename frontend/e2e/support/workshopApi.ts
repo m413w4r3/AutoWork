@@ -30,6 +30,10 @@ import type {
 } from "../../src/features/investigation/api/bootstrap";
 import type { ArticleAnchorCatalogViewV1 } from "../../src/features/investigation/api/articleAnchors";
 import type {
+  NoteContentBlockV1,
+  ResolvedNoteContentBlockV1,
+} from "../../src/features/investigation/api/opinionProposals";
+import type {
   BudgetDimension,
   OperatorAdapterKind,
   SampleQualification,
@@ -159,6 +163,10 @@ export interface WorkshopApiOptions {
   capabilitiesState?: "attested" | "unconfined" | "host_unavailable";
   /** The human open action is either accepted or refused by G2/TLP. */
   openSessionOutcome?: "success" | "external_llm_refused";
+  /** Note content blocks of the preloaded proposal; `stale` refuses at read. */
+  contentBlocksState?: "valid" | "stale";
+  /** References preloaded on the proposal before any request (review flow). */
+  contentBlocks?: NoteContentBlockV1[];
 }
 
 const FINDING: InvestigationFinding = {
@@ -190,6 +198,26 @@ const OBSERVATION: InvestigationObservation = {
   limitations: [],
   invocation_ref: null,
 };
+
+/** M23 elements of the pinned publication; only same-anchor ones are referencable. */
+const ARTICLE_ELEMENTS = [
+  {
+    kind: "table" as const,
+    key: "table-commands",
+    title: "Commandes observées",
+    caption: "Commandes exécutées par l’échantillon.",
+    element_sha256: SHA.content,
+    anchor: "lead:0001",
+  },
+  {
+    kind: "figure" as const,
+    key: "figure-c2",
+    title: "Topologie C2",
+    caption: null,
+    element_sha256: SHA.note,
+    anchor: "section:2:paragraph:0007",
+  },
+] satisfies ArticleAnchorCatalogViewV1["elements"];
 
 const BUDGET = {
   bridge_turns: { limit: 8, consumed: 1, reserved: 0, remaining: 7 },
@@ -1418,6 +1446,21 @@ function opinionVersion(): OpinionVersionV1 {
     base_publication_artifact_id: ids.synthesis,
     base_publication_sha256: SHA.proposal,
     blocks,
+    protocol_figures: [
+      {
+        kind: "sequence",
+        model_sha256: SHA.content,
+        spec_sha256: SHA.note,
+        asset_id: ids.session,
+        asset_sha256: SHA.sample,
+        preview_sha256: SHA.proposal,
+        pin_sha256: SHA.proposed,
+        compiler_name: "typst",
+        compiler_version: "1",
+        compiler_policy_version: "1",
+        caption: "Séquence des échanges observée.",
+      },
+    ],
     unresolved_points: [],
     author_id: "system:opinion-writer",
     reviewer_id: null,
@@ -1507,12 +1550,15 @@ function articleAnchorCatalog(): ArticleAnchorCatalogViewV1 {
         paragraph_index: 2,
       },
     ],
-    elements: [],
+    elements: ARTICLE_ELEMENTS,
     truncated: false,
   };
 }
 
-function noteProposal(stale: boolean): NoteProposalViewV1 {
+function noteProposal(
+  stale: boolean,
+  contentBlocks: NoteContentBlockV1[] = [],
+): NoteProposalViewV1 {
   return {
     id: ids.proposal,
     investigation_id: ids.investigation,
@@ -1539,6 +1585,7 @@ function noteProposal(stale: boolean): NoteProposalViewV1 {
     base_publication_version: 3,
     base_publication_sha256: SHA.proposal,
     anchor_before_sha256: SHA.content,
+    content_blocks: contentBlocks,
     status: stale ? "stale" : "proposed",
     status_version: stale ? 5 : 4,
     accepted_opinion_version: null,
@@ -1550,8 +1597,56 @@ function noteProposal(stale: boolean): NoteProposalViewV1 {
   };
 }
 
-function proposalDiff(stale: boolean): NoteProposalDiffViewV1 {
-  const proposal = noteProposal(stale);
+/** Deterministic resolution of the requested references, like the server. */
+function resolveNoteBlocks(
+  blocks: NoteContentBlockV1[],
+): ResolvedNoteContentBlockV1[] {
+  return blocks.map((block) => {
+    switch (block.block_type) {
+      case "article_element": {
+        const element = ARTICLE_ELEMENTS.find(
+          (item) => item.kind === block.kind && item.key === block.element_key,
+        );
+        return {
+          ...block,
+          title: element?.title ?? null,
+          caption: element?.caption ?? null,
+        };
+      }
+      case "canonical_code":
+        return {
+          ...block,
+          excerpt: "cmd.exe /c whoami",
+          observation_source: OBSERVATION.source,
+          observation_object_type: OBSERVATION.object_type,
+          observation_object_id: OBSERVATION.object_id,
+        };
+      case "ioc_table":
+        return {
+          ...block,
+          rows: block.observation_ids.map((id) => ({
+            observation_id: id,
+            object_type: OBSERVATION.object_type,
+            object_id: OBSERVATION.object_id,
+            source: OBSERVATION.source,
+            observed_at: OBSERVATION.observed_at,
+            blob_sha256: OBSERVATION.sha256,
+          })),
+        };
+      case "protocol_figure":
+        return { ...block, caption: "Séquence des échanges observée." };
+    }
+  });
+}
+
+function proposalDiff(
+  stale: boolean,
+  contentBlocks: NoteContentBlockV1[] = [],
+  contentBlocksState: "valid" | "stale" = "valid",
+): NoteProposalDiffViewV1 {
+  const proposal = noteProposal(stale, contentBlocks);
+  const blocksStale =
+    contentBlocksState === "stale" && contentBlocks.length > 0;
   return {
     proposal,
     current_opinion_version: 3,
@@ -1565,17 +1660,24 @@ function proposalDiff(stale: boolean): NoteProposalDiffViewV1 {
     anchor_excerpt: "Extrait du chapô.",
     cited_finding_refs: proposal.cited_finding_refs,
     cited_observation_refs: proposal.cited_observation_refs,
+    content_blocks: contentBlocks,
+    resolved_content_blocks: blocksStale
+      ? []
+      : resolveNoteBlocks(contentBlocks),
+    content_blocks_valid: !blocksStale,
+    content_block_error: blocksStale ? "note_block_ref_stale" : null,
     limits: ["Limite signalée par Bridge."],
     stale,
-    accept_ready: !stale,
+    accept_ready: !stale && !blocksStale,
   };
 }
 
 function proposalRequestResponse(
   stale: boolean,
+  contentBlocks: NoteContentBlockV1[] = [],
 ): NoteProposalRequestResponseV1 {
   return {
-    proposal: noteProposal(stale),
+    proposal: noteProposal(stale, contentBlocks),
     invocation_id: ids.bridgeInvocation,
     invocation_status: "succeeded",
     idempotent_replay: false,
@@ -1583,8 +1685,11 @@ function proposalRequestResponse(
   };
 }
 
-function proposalAcceptance(stale: boolean): NoteAcceptanceViewV1 {
-  const proposal = noteProposal(stale);
+function proposalAcceptance(
+  stale: boolean,
+  contentBlocks: NoteContentBlockV1[] = [],
+): NoteAcceptanceViewV1 {
+  const proposal = noteProposal(stale, contentBlocks);
   return {
     proposal: {
       ...proposal,
@@ -1623,6 +1728,9 @@ export function createWorkshopApi(options: WorkshopApiOptions = {}) {
   const transferOutcome = options.transferOutcome ?? "stale";
   const capabilitiesState = options.capabilitiesState ?? "attested";
   const openSessionOutcome = options.openSessionOutcome ?? "success";
+  const contentBlocksState = options.contentBlocksState ?? "valid";
+  let requestedContentBlocks: NoteContentBlockV1[] =
+    options.contentBlocks ?? [];
   const requests: RecordedRequest[] = [];
   const unhandled: string[] = [];
   let started = existingInvestigation;
@@ -2192,25 +2300,43 @@ export function createWorkshopApi(options: WorkshopApiOptions = {}) {
     }
     if (path === inv("/note-proposals")) {
       if (method === "POST") {
-        return fulfill(route, proposalRequestResponse(staleProposal));
+        const sent = asRecord(body).content_blocks;
+        requestedContentBlocks = Array.isArray(sent)
+          ? (sent as NoteContentBlockV1[])
+          : [];
+        return fulfill(
+          route,
+          proposalRequestResponse(staleProposal, requestedContentBlocks),
+        );
       }
-      return fulfill(route, [noteProposal(staleProposal)]);
+      return fulfill(route, [
+        noteProposal(staleProposal, requestedContentBlocks),
+      ]);
     }
     if (path === inv(`/note-proposals/${ids.proposal}`) && method === "GET") {
-      return fulfill(route, proposalDiff(staleProposal));
+      return fulfill(
+        route,
+        proposalDiff(staleProposal, requestedContentBlocks, contentBlocksState),
+      );
     }
     if (
       path === inv(`/note-proposals/${ids.proposal}/accept`) &&
       method === "POST"
     ) {
-      return fulfill(route, proposalAcceptance(staleProposal));
+      return fulfill(
+        route,
+        proposalAcceptance(staleProposal, requestedContentBlocks),
+      );
     }
     if (
       path === inv(`/note-proposals/${ids.proposal}/reject`) &&
       method === "POST"
     ) {
       return fulfill(route, {
-        proposal: { ...noteProposal(staleProposal), status: "rejected" },
+        proposal: {
+          ...noteProposal(staleProposal, requestedContentBlocks),
+          status: "rejected",
+        },
       });
     }
 

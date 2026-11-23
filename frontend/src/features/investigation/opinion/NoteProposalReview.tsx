@@ -6,6 +6,7 @@ import type {
   InvestigationObservation,
 } from "../../../api/investigation";
 import { EditorialDiffView } from "../../editorial-workspace/EditorialDiffView";
+import { articleAnchorsKeys } from "../api/articleAnchors";
 import {
   useAcceptNoteProposal,
   useIngestNoteProposalResponse,
@@ -26,6 +27,7 @@ import {
   TARGET_BLOCK_LABELS,
   shortHash,
 } from "./labels";
+import { NoteContentBlocks } from "./NoteContentBlocks";
 import { opinionNotesKeys } from "./queries";
 import { ReferenceList } from "./ReferenceList";
 import { findingLabel, observationLabel } from "./references";
@@ -35,12 +37,14 @@ export function NoteProposalReview({
   proposalId,
   findings,
   observations,
+  subjectId,
   onClose,
 }: {
   investigationId: string;
   proposalId: string;
   findings: InvestigationFinding[];
   observations: InvestigationObservation[];
+  subjectId: string | null;
   onClose: () => void;
 }) {
   const queryClient = useQueryClient();
@@ -62,6 +66,11 @@ export function NoteProposalReview({
     });
     void queryClient.invalidateQueries({
       queryKey: opinionNotesKeys.detail(investigationId),
+    });
+    // Content-block references resolve against the pinned publication base; a
+    // stale reference may also mean the anchor catalog moved.
+    void queryClient.invalidateQueries({
+      queryKey: articleAnchorsKeys.all(investigationId),
     });
   }
 
@@ -156,6 +165,7 @@ export function NoteProposalReview({
   const proposal = diff.proposal;
   const acceptReady =
     diff.accept_ready &&
+    diff.content_blocks_valid &&
     !diff.stale &&
     proposal.materialised &&
     diff.proposed_text !== null;
@@ -300,6 +310,22 @@ export function NoteProposalReview({
         ) : null}
       </section>
 
+      <NoteContentBlocks
+        investigationId={investigationId}
+        anchor={diff.anchor}
+        observations={observations}
+        blocks={diff.content_blocks}
+        resolvedBlocks={diff.resolved_content_blocks}
+        contentBlockError={diff.content_block_error}
+        basePublication={{
+          artifactId: proposal.base_publication_artifact_id,
+          version: proposal.base_publication_version,
+          sha256: proposal.base_publication_sha256,
+        }}
+        subjectId={subjectId}
+        onReload={reload}
+      />
+
       <section aria-labelledby="opinion-proposal-references">
         <h4 id="opinion-proposal-references">Références et limites</h4>
         <ReferenceList
@@ -339,8 +365,9 @@ export function NoteProposalReview({
         )}
         <p>
           Ce rendu HTML montre le texte et son ancre. Les tableaux, graphiques,
-          figures, légendes et placements de l’article sont rendus par l’aperçu
-          PDF réel ci-dessous ; la proposition n’y entre qu’après acceptation.
+          figures, légendes et placements de l’article restent rendus à leur
+          placement d’article (aperçu PDF réel) ; les blocs de contenu ci-dessus
+          n’en sont que des références vérifiées, jamais une copie.
         </p>
       </section>
 
@@ -363,8 +390,9 @@ export function NoteProposalReview({
                 setPreviewAcknowledged(event.currentTarget.checked)
               }
             />{" "}
-            J’ai examiné le texte stocké, le diff et l’aperçu du rendu de la
-            proposition v{proposal.status_version} · SHA-256{" "}
+            J’ai examiné le texte stocké, le diff et l’aperçu du rendu, ainsi
+            que les blocs de contenu vérifiés, de la proposition v
+            {proposal.status_version} · SHA-256{" "}
             {shortHash(proposal.proposed_text_sha256)}.
           </label>
           <button

@@ -56,6 +56,8 @@ const MESSAGES: Record<string, string> = {
     "Une figure référencée n’a pas de source connue dans le document. Rechargez la proposition.",
   note_ioc_ref_unresolved:
     "Une référence IOC ne résout aucune observation de cette enquête. Rechargez la proposition.",
+  invalid_note_content_block:
+    "Un bloc de contenu est invalide ou d’un type inconnu. Rechargez la proposition ou retirez la référence.",
   invalid_note_target: "Le type de bloc cible ne correspond pas à l’ancre.",
   invalid_note_citation:
     "Une référence citée est invalide ou n’appartient pas à cette enquête.",
@@ -111,6 +113,11 @@ export function describeApiError(error: unknown): DescribedApiError {
     status: 0,
     message: MESSAGES.network_error ?? "Erreur inconnue.",
   };
+}
+
+/** Translate a typed server code already known to the note contracts. */
+export function describeErrorCode(code: string): string {
+  return MESSAGES[code] ?? code;
 }
 
 export function isStaleProposalError(error: unknown): boolean {

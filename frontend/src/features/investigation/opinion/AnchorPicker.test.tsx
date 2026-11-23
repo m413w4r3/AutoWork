@@ -125,6 +125,7 @@ function makeProposal(
     base_publication_version: 3,
     base_publication_sha256: BASE_SHA,
     anchor_before_sha256: "1".repeat(64),
+    content_blocks: [],
     status: "proposed",
     status_version: 1,
     accepted_opinion_version: null,
