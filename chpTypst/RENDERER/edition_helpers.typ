@@ -1,6 +1,6 @@
 #import "../UTILS/colors.typ": purple
 #import "../UTILS/helpers.typ": article-indexing, better-link, styled-table, tag
-#import "publication_helpers.typ": render-publication-body, render-target
+#import "publication_helpers.typ": render-publication-body, render-technical-ioc-annex, render-target
 
 #let has-text(value) = value != none and value != ""
 #let publication-reference-scope(publication) = "edition-article-" + str(publication.position) + "-"
@@ -122,5 +122,6 @@
   for publication in briefs {
     render-brief(publication)
   }
+  render-technical-ioc-annex(edition.at("technical_ioc_annex", default: ()))
 
 }

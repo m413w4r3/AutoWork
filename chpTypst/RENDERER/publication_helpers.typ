@@ -1039,12 +1039,56 @@
     #block(above: 4pt, width: 100%)[
       #text(size: 9pt, weight: "bold")[#note-block.title]
       #v(2pt)
-      #render-opinion-pipe-table(note-block.pipe_table)
+      // Persisted render-data without this marker keeps its original table layout.
+      #if note-block.at("display_mode", default: "") == "technical-annex-v1" [
+        #render-opinion-pipe-table(note-block.reference_table)
+        #text(size: 7pt, fill: grey)[Identifiants complets : #note-block.reference_range dans l'annexe technique.]
+      ] else [
+        #render-opinion-pipe-table(note-block.pipe_table)
+      ]
     ]
   ] else {
     panic("unsupported note content block type: " + str(block-type))
   }
   body + render-note-provenance(note-block)
+}
+
+#let render-technical-ioc-annex(entries) = {
+  if entries.len() > 0 [
+    #pagebreak()
+    #render-section-heading[Annexe technique — identifiants IOC]
+    #text(size: 8pt, fill: grey)[Les références renvoient aux tableaux IOC placés auprès de leurs Notes ancrées.]
+    #v(4pt)
+    #for entry in entries [
+      #block(
+        width: 100%,
+        above: 3pt,
+        below: 5pt,
+        fill: rgb("#F8FAFC"),
+        stroke: 0.4pt + rgb("#D0D5DD"),
+        inset: 6pt,
+        radius: 3pt,
+        breakable: true,
+      )[
+        #set par(justify: false, leading: 1.05em, spacing: 1pt)
+        #text(size: 8pt, weight: "bold", fill: accent)[#entry.reference · #entry.object_type]
+        #linebreak()
+        #text(size: 7pt, weight: "bold")[Valeur exacte : ]
+        #text(font: code-font-families, size: 8pt, hyphenate: false)[#publication-display-text(entry.object_id_display)]
+        #linebreak()
+        #text(size: 7pt, weight: "bold")[Observation : ]
+        #text(font: code-font-families, size: 7pt, hyphenate: false)[#publication-display-text(entry.observation_id_display)]
+        #linebreak()
+        #text(size: 7pt, weight: "bold")[Source : ]
+        #text(font: code-font-families, size: 7pt, hyphenate: false)[#publication-display-text(entry.source)]
+        #text(size: 7pt, weight: "bold")[ · Observé le : ]
+        #text(font: code-font-families, size: 7pt, hyphenate: false)[#publication-display-text(entry.observed_at)]
+        #linebreak()
+        #text(size: 7pt, weight: "bold")[SHA-256 de la preuve : ]
+        #text(font: code-font-families, size: 7pt, hyphenate: false)[#publication-display-text(entry.fingerprint_display)]
+      ]
+    ]
+  ]
 }
 
 #let render-analyst-observation(
@@ -1535,5 +1579,6 @@
       #v(10pt)
     ]
     #render-publication-body(publication)
+    #render-technical-ioc-annex(publication.at("technical_ioc_annex", default: ()))
   ]
 }

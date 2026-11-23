@@ -23,6 +23,7 @@ from cti_app.application.typst_rendering import (
     TypstRenderSource,
     TypstTemplateBundle,
     _breakable_typst_display_text,
+    _technical_ioc_annex,
     instrument_publication_targets,
     project_publication_to_typst_model,
 )
@@ -141,6 +142,7 @@ class EditionTypstRenderer:
         mapping_unmapped: list[dict[str, Any]] = []
         media_refs_by_id: dict[UUID, TypstMediaRef] = {}
         media_refang_iocs: set[tuple[ArtifactType, str, str]] = set()
+        technical_ioc_annex: list[dict[str, Any]] = []
         for classified in classify_edition_publications(document.publications):
             publication = classified.publication
             target_identities = (artifact_identities or {}).get(str(publication.subject_id))
@@ -169,6 +171,11 @@ class EditionTypstRenderer:
                 )
                 mapping_targets.extend(targets)
                 mapping_unmapped.extend(unmapped)
+            content_sections, publication_ioc_annex = _technical_ioc_annex(
+                model.content_sections,
+                first_reference=len(technical_ioc_annex) + 1,
+            )
+            technical_ioc_annex.extend(publication_ioc_annex)
             for media_ref in model.media_refs:
                 existing = media_refs_by_id.get(media_ref.asset_id)
                 if existing is not None and existing != media_ref:
@@ -185,7 +192,7 @@ class EditionTypstRenderer:
                 "number": classified.number,
                 "anchor": classified.anchor,
                 "file_ioc_count": project_publication_iocs(publication.document).counts["file"],
-                "content_sections": model.content_sections,
+                "content_sections": content_sections,
                 "article_format": model.article_format,
                 "article_overview": model.article_overview,
             }
@@ -207,6 +214,9 @@ class EditionTypstRenderer:
             "publications": publications,
             "file_ioc_count": sum(item["file_ioc_count"] for item in publications),
         }
+        if technical_ioc_annex:
+            render_data["technical_ioc_annex_version"] = 1
+            render_data["technical_ioc_annex"] = technical_ioc_annex
         if mapping_targets or mapping_unmapped:
             render_data["mapping_instrumentation_version"] = MAPPING_RENDERER_VERSION
         guard_publication_render_data(render_data)

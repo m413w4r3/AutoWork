@@ -637,6 +637,15 @@ def test_edition_note_blocks_render_with_provenance_in_render_data(tmp_path: Pat
         note_context.observations[1].observed_at.isoformat(),
         note_context.observations[1].sha256,
     ]
+    assert table_block["display_mode"] == "technical-annex-v1"
+    (reference_row,) = table_block["reference_table"]["rows"]
+    assert [cell["text"] for cell in reference_row] == ["[1]", "ip", "Shodan"]
+    (annex_row,) = data["technical_ioc_annex"]
+    assert annex_row["reference"] == "[1]"
+    assert annex_row["object_id"] == "192.0.2.10"
+    assert annex_row["observation_id"] == str(note_context.observations[1].id)
+    assert annex_row["fingerprint"] == note_context.observations[1].sha256
+    assert data["technical_ioc_annex_version"] == 1
     assert "Observations canoniques de cette enquête : 1" in "".join(
         part["text"] for part in table_block["provenance"]
     )
@@ -1310,7 +1319,7 @@ def test_shared_publication_projection_is_pure_and_complete(tmp_path: Path) -> N
 def test_repository_edition_manifest_snapshots_expected_assets() -> None:
     bundle = load_template_bundle(_CHP_TYPST_ROOT, manifest_name=_EDITION_MANIFEST)
 
-    assert bundle.template_version == ("chp-edition-v36-m21-opinion-render-m21-pdffix7-m21-format5")
+    assert bundle.template_version == "chp-edition-v37-m24-2-d3-ioc-annex"
     assert {file.relative_path for file in bundle.files} == {
         "RENDERER/edition.typ",
         "RENDERER/edition_helpers.typ",

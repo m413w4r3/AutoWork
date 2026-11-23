@@ -2063,6 +2063,108 @@ def _note_ioc_pipe_table(block: ResolvedIocTableBlockV1) -> dict[str, Any]:
     }
 
 
+def _short_ioc_source_label(source: str) -> str:
+    labels = {
+        "native_analysis": "Analyse native",
+        "urlhaus": "URLhaus",
+        "virustotal": "VirusTotal",
+    }
+    label = labels.get(source.casefold())
+    if label is None:
+        label = source.replace("_", " ").replace(".", " ").strip().title()
+    return label if len(label) <= 28 else label[:25].rstrip() + "…"
+
+
+def _technical_ioc_annex(
+    content_sections: list[dict[str, Any]], *, first_reference: int = 1
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Project exact note IOC rows into a numbered, end-of-document annex.
+
+    The canonical row remains in the render data and the reference table is a
+    separate presentation view. This keeps the source observation, exact IOC,
+    timestamp and evidence fingerprint available without squeezing them into
+    the anchored note table.
+    """
+    next_reference = first_reference
+    annex_rows: list[dict[str, Any]] = []
+
+    def visit(value: Any) -> Any:
+        nonlocal next_reference
+        if isinstance(value, list):
+            return [visit(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+
+        projected = {key: visit(item) for key, item in value.items()}
+        if value.get("block_type") != "ioc_table":
+            return projected
+
+        pipe_table = value.get("pipe_table")
+        rows = pipe_table.get("rows") if isinstance(pipe_table, dict) else None
+        if not isinstance(rows, list):
+            raise TemplateBundleInvalidError("IOC note table is missing its canonical rows")
+
+        reference_rows: list[list[dict[str, Any]]] = []
+        for row in rows:
+            if not isinstance(row, list) or len(row) != 6 or any(
+                not isinstance(cell, dict) or not isinstance(cell.get("text"), str)
+                for cell in row
+            ):
+                raise TemplateBundleInvalidError("IOC note table has an invalid canonical row")
+            observation_id, object_type, object_id, source, observed_at, fingerprint = (
+                cell["text"] for cell in row
+            )
+            reference = f"[{next_reference}]"
+            reference_rows.append(
+                [
+                    _note_cell(reference, technical=False),
+                    _note_cell(object_type, technical=False),
+                    _note_cell(_short_ioc_source_label(source), technical=False),
+                ]
+            )
+            annex_rows.append(
+                {
+                    "reference": reference,
+                    "object_type": object_type,
+                    "object_id": object_id,
+                    "object_id_display": _breakable_typst_display_text(
+                        object_id, interval=32, break_at_technical_separators=True
+                    ),
+                    "observation_id": observation_id,
+                    "observation_id_display": _breakable_typst_display_text(
+                        observation_id, interval=18, break_at_technical_separators=True
+                    ),
+                    "source": source,
+                    "observed_at": observed_at,
+                    "fingerprint": fingerprint,
+                    "fingerprint_display": _breakable_typst_display_text(
+                        fingerprint, interval=32, break_at_technical_separators=True
+                    ),
+                }
+            )
+            next_reference += 1
+
+        projected["display_mode"] = "technical-annex-v1"
+        projected["reference_range"] = (
+            f"[{next_reference - len(reference_rows)}]–[{next_reference - 1}]"
+        )
+        projected["reference_table"] = {
+            "column_count": 3,
+            "column_weights": [0.7, 1.0, 1.5],
+            "alignment": ["left", "left", "left"],
+            "header": [
+                _note_cell("Réf.", technical=False),
+                _note_cell("Type", technical=False),
+                _note_cell("Source", technical=False),
+            ],
+            "rows": reference_rows,
+        }
+        return projected
+
+    projected_sections = visit(content_sections)
+    return projected_sections, annex_rows
+
+
 def _note_block_render_data(block: Any) -> dict[str, Any]:
     """Project one resolved block; captions stay deterministic (no human prose)."""
     if isinstance(block, ResolvedArticleElementBlockV1):
@@ -2522,6 +2624,7 @@ class TypstRenderer:
                 article_title_identity=target_artifact_identities.get("article_title"),
                 enrichment_identity=target_artifact_identities.get("enrichment"),
             )
+        content_sections, technical_ioc_annex = _technical_ioc_annex(model.content_sections)
 
         normalized_document_label = document_label.strip()
         classification_document = (
@@ -2577,10 +2680,13 @@ class TypstRenderer:
             "brand_logo_available": any(
                 file.relative_path == "UTILS/chap.png" for file in template_bundle.files
             ),
-            "content_sections": model.content_sections,
+            "content_sections": content_sections,
             "article_format": model.article_format,
             "article_overview": model.article_overview,
         }
+        if technical_ioc_annex:
+            render_data["technical_ioc_annex_version"] = 1
+            render_data["technical_ioc_annex"] = technical_ioc_annex
         if article_title_target_id is not None:
             render_data["article_title_target_id"] = article_title_target_id
         if target_descriptors or unmapped:
