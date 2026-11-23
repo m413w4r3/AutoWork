@@ -12,7 +12,9 @@ import base64
 import hashlib
 import json
 import os
+import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
 from sidecars.workspace_agent.sessions import process as session_process
@@ -500,9 +502,21 @@ def test_claude_resume_is_refused_until_the_probe_proves_it(session_base: Path) 
 
 def test_claude_resume_roundtrip_through_the_supervisor_when_proven(
     session_base: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     environment = make_scan_environment(session_base)
     supervisor, config = _build_supervisor(session_base, environment, resume_proven=True)
+    run_exits = {run: threading.Event() for run in (1, 2)}
+    finalize_exit = SessionSupervisor._finalize_exit
+
+    def signal_run_exit(current: SessionSupervisor, handle: Any, managed: Any, code: int) -> None:
+        finalize_exit(current, handle, managed, code)
+        if handle.record.session_id == SESSION_ID:
+            event = run_exits.get(managed.run)
+            if event is not None:
+                event.set()
+
+    monkeypatch.setattr(SessionSupervisor, "_finalize_exit", signal_run_exit)
     try:
         _prepare(supervisor, environment.workspace_id)
         _accept_manifest(supervisor)
@@ -513,7 +527,8 @@ def test_claude_resume_roundtrip_through_the_supervisor_when_proven(
             idempotency_key="m24-h5-start-0004",
             body_sha256="b" * 64,
         )
-        _wait_state(supervisor, str(SessionState.AWAITING_INSTRUCTION))
+        assert run_exits[1].wait(20), "first Claude run did not finalize"
+        assert supervisor.status(SESSION_ID)["state"] == str(SessionState.AWAITING_INSTRUCTION)
         first = _observations(config)["parse"]
         assert isinstance(first, dict)
         assert first["session_id"] == SESSION_ID
@@ -528,7 +543,8 @@ def test_claude_resume_roundtrip_through_the_supervisor_when_proven(
         )
         assert resumed["state"] == "running"
         assert resumed["run"] == 2
-        _wait_state(supervisor, str(SessionState.AWAITING_INSTRUCTION))
+        assert run_exits[2].wait(20), "resumed Claude run did not finalize"
+        assert supervisor.status(SESSION_ID)["state"] == str(SessionState.AWAITING_INSTRUCTION)
         second = _observations(config)["parse"]
         assert isinstance(second, dict)
         assert second["resume"] == SESSION_ID

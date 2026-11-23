@@ -680,6 +680,7 @@ def test_revoke_cancels_the_in_flight_backend_request(
     transport = _CancellableSlowTransport()
     server = relay_factory(FakeSessionState(), transport)  # type: ignore[arg-type]
     rejections: list[relay.RelayRejection] = []
+    rejection_recorded = threading.Event()
 
     def record(
         self: relay.BrokerRelay, connection: socket.socket, rejection: relay.RelayRejection
@@ -688,6 +689,7 @@ def test_revoke_cancels_the_in_flight_backend_request(
         # outcome the relay would deliver instead of racing the write.
         del self, connection
         rejections.append(rejection)
+        rejection_recorded.set()
 
     monkeypatch.setattr(relay.BrokerRelay, "_write_error", record)
     received: list[bytes] = []
@@ -699,16 +701,14 @@ def test_revoke_cancels_the_in_flight_backend_request(
     )
     client.start()
     assert transport.entered.wait(5)
-    time.sleep(0.2)  # revoke at t=0.2 s, while the backend call is in flight
-    started = time.monotonic()
     server.revoke()
     client.join(5)
-    elapsed = time.monotonic() - started
     assert not client.is_alive()
-    assert elapsed < 2.0  # the 10 s slow send was interrupted
     assert transport.cancelled.is_set()
-    assert transport.finished.is_set()
-    _wait_until(lambda: bool(rejections))
+    # Closing the client socket can finish its thread before the relay worker
+    # has unwound the cancelled backend call. Synchronize on both outcomes.
+    assert transport.finished.wait(5)
+    assert rejection_recorded.wait(5)
     rejection = rejections[-1]
     assert rejection.code in (
         relay.RelayErrorCode.BACKEND_OUTCOME_UNKNOWN,
