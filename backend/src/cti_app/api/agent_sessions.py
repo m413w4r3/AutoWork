@@ -83,13 +83,20 @@ class OpenAgentSessionRequest(BaseModel):
 
 
 class InstructionRequest(BaseModel):
-    """Enqueue is a human action; ack is the owning operator's signed action."""
+    """Enqueue and cancel are human actions; pull and ack are the operator's.
+
+    The signed operator body carries no URL or path: pull names nothing, ack
+    lists at most 32 instruction ids and cancel names one instruction with its
+    bounded human reason (F3-D §3.6).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    action: Literal["enqueue", "ack"]
+    action: Literal["enqueue", "ack", "pull", "cancel"]
     text: str | None = Field(default=None, max_length=65536)
-    instruction_ids: tuple[UUID, ...] = ()
+    instruction_ids: tuple[UUID, ...] = Field(default=(), max_length=32)
+    instruction_id: UUID | None = None
+    reason: str | None = Field(default=None, max_length=4096)
     note_refs: tuple[str, ...] = Field(default=(), max_length=32)
 
     @model_validator(mode="after")
@@ -99,13 +106,43 @@ class InstructionRequest(BaseModel):
                 raise ValueError("enqueue requires a non-empty instruction text")
             if self.instruction_ids:
                 raise ValueError("enqueue does not acknowledge instruction ids")
-        else:
+            if self.instruction_id is not None:
+                raise ValueError("enqueue does not cancel one instruction")
+            if self.reason is not None:
+                raise ValueError("enqueue does not carry a cancellation reason")
+        elif self.action == "ack":
             if self.text is not None:
                 raise ValueError("ack does not carry instruction text")
             if not self.instruction_ids:
                 raise ValueError("ack requires at least one instruction id")
+            if self.instruction_id is not None:
+                raise ValueError("ack addresses instructions with instruction_ids")
+            if self.reason is not None:
+                raise ValueError("ack does not carry a cancellation reason")
             if self.note_refs:
                 raise ValueError("ack does not carry note references")
+        elif self.action == "cancel":
+            if self.instruction_id is None:
+                raise ValueError("cancel requires an instruction id")
+            if self.reason is None or not self.reason.strip():
+                raise ValueError("cancel requires a non-empty reason")
+            if self.text is not None:
+                raise ValueError("cancel does not carry instruction text")
+            if self.instruction_ids:
+                raise ValueError("cancel addresses one instruction")
+            if self.note_refs:
+                raise ValueError("cancel does not carry note references")
+        else:  # pull
+            if self.text is not None:
+                raise ValueError("pull does not carry instruction text")
+            if self.instruction_ids:
+                raise ValueError("pull does not acknowledge instruction ids")
+            if self.instruction_id is not None:
+                raise ValueError("pull does not address one instruction")
+            if self.reason is not None:
+                raise ValueError("pull does not carry a cancellation reason")
+            if self.note_refs:
+                raise ValueError("pull does not carry note references")
         return self
 
 
@@ -197,6 +234,9 @@ def _service(request: Request) -> SessionService:
         note_resolver=WorkspaceNoteCatalog(uow_factory=transfer_factory),
         disclosure=_disclosure_gate(request),
         release_host=_release_service(request).flush,
+        # ID-2 owns the backend drain; injecting it here lets an idle session's
+        # enqueue deliver inline, while a busy one stays for the background loop.
+        instruction_delivery=getattr(request.app.state, "instruction_delivery_service", None),
         cli_network_mode=settings.agent_sessions_cli_network_mode,
         task_limits=settings.task_limits(),
     )
@@ -452,15 +492,36 @@ async def send_instruction(
         except SessionError as exc:
             raise _session_http_error(exc) from exc
         return enqueued.to_payload()
+    if body.action == "cancel":
+        actor = await _human_actor(request)
+        try:
+            cancelled = await _service(request).cancel_instruction(
+                investigation_id,
+                session_id,
+                instruction_id=cast(UUID, body.instruction_id),
+                reason=cast(str, body.reason),
+                actor=actor,
+            )
+        except SessionError as exc:
+            raise _session_http_error(exc) from exc
+        return cancelled.to_payload()
+    # pull and ack are the owning operator's signed actions (D7); only the
+    # acknowledgement is a write, so only it requires the current lease.
     verified = await _verified_operator_call(
         request,
         investigation_id=investigation_id,
         session_id=session_id,
-        require_current_lease=True,
+        require_current_lease=body.action == "ack",
     )
     actor = await _operator_actor(request, verified)
     try:
-        acknowledged = await _service(request).acknowledge_instructions_with_notes(
+        service = _service(request)
+        if body.action == "pull":
+            pending = await service.pull_delivered_instructions(
+                investigation_id, session_id, actor=actor
+            )
+            return [view.to_payload() for view in pending]
+        acknowledged = await service.acknowledge_instructions_with_notes(
             investigation_id,
             session_id,
             instruction_ids=body.instruction_ids,
@@ -468,7 +529,7 @@ async def send_instruction(
         )
     except SessionError as exc:
         raise _session_http_error(exc) from exc
-    return [instruction.to_payload() for instruction in acknowledged]
+    return [view.to_payload() for view in acknowledged]
 
 
 @router.post("/{investigation_id}/agent-sessions/{session_id}/interrupt")

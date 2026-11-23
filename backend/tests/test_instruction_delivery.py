@@ -886,3 +886,59 @@ async def test_supervisor_restart_never_redelivers_or_loses_queue() -> None:
     assert (await harness.instruction(second.id)).state is InstructionState.DELIVERED
     assert len(harness.host.send_calls) == 1
     assert harness.host.send_calls[0]["request"].instruction_id == second.id
+
+
+# ------------------------------------------------------------ ID-3 ack seam
+
+
+async def test_delivery_then_pull_and_ack_report_the_persisted_delivery_text() -> None:
+    """ID-3: the operator pulls and acknowledges exactly what ID-2 persisted."""
+    harness = _Harness()
+    session = await harness.seed_session(state=AgentSessionState.AWAITING_INSTRUCTION)
+    diff = {
+        "path": "notes/humaines/piste.md",
+        "queued_revision_id": "rev-1",
+        "queued_sha256": "1" * 64,
+        "current_revision_id": "rev-2",
+        "current_sha256": "2" * 64,
+    }
+    delivery_text = (
+        "Follow the note.\n[notes modifiées depuis la mise en file]\n"
+        "- notes/humaines/piste.md: rev-1 -> rev-2"
+    )
+    harness.notes.diffs = (diff,)
+    harness.notes.delivery_text = delivery_text
+    enqueued = await harness.enqueue(
+        session,
+        text="Follow the note.",
+        key="i-ack",
+        note_refs=("notes/humaines/piste.md",),
+    )
+    assert enqueued.instruction.state is InstructionState.DELIVERED
+
+    operator = TaskActor(kind=TaskActorKind.OPERATOR, actor_id="codex:operator-1")
+    pending = await harness.service.pull_delivered_instructions(
+        INVESTIGATION_ID, session.id, actor=operator
+    )
+    assert len(pending) == 1
+    assert pending[0].instruction.id == enqueued.instruction.id
+    assert pending[0].delivery_text == delivery_text
+    assert pending[0].instruction.delivery_sha256 == instruction_text_sha256(delivery_text)
+    assert pending[0].delivery_text_verified is True
+
+    acknowledged = await harness.service.acknowledge_instructions_with_notes(
+        INVESTIGATION_ID,
+        session.id,
+        instruction_ids=(enqueued.instruction.id,),
+        actor=operator,
+    )
+    assert acknowledged[0].instruction.state is InstructionState.ACKNOWLEDGED
+    assert acknowledged[0].delivery_text == delivery_text
+    assert dict(acknowledged[0].note_diffs[0]) == diff
+
+    assert (
+        await harness.service.pull_delivered_instructions(
+            INVESTIGATION_ID, session.id, actor=operator
+        )
+        == ()
+    )

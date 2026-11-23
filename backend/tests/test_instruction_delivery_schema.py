@@ -123,6 +123,7 @@ def test_instruction_state_machine_matches_the_delivery_design() -> None:
         validate_instruction_transition(from_state, to_state)
 
     forbidden = (
+        (InstructionState.QUEUED, InstructionState.DELIVERED),
         (InstructionState.QUEUED, InstructionState.ACKNOWLEDGED),
         (InstructionState.DELIVERED, InstructionState.CANCELLED),
         (InstructionState.DELIVERED, InstructionState.QUEUED),
@@ -136,15 +137,10 @@ def test_instruction_state_machine_matches_the_delivery_design() -> None:
             validate_instruction_transition(from_state, to_state)
 
 
-def test_queued_to_delivered_stays_transitional_until_ack_is_rewritten() -> None:
-    """ID-3 removes this edge; the legacy signed ack route still promotes queued."""
-    validate_instruction_transition(InstructionState.QUEUED, InstructionState.DELIVERED)
-    delivered = _instruction().with_state(InstructionState.DELIVERED, now=LATER)
-    assert delivered.state is InstructionState.DELIVERED
-    assert delivered.delivered_at == LATER
-    assert delivered.delivery_mode is None
-    assert delivered.delivery_token is None
-    assert delivered.delivery_sha256 is None
+def test_queued_is_never_delivered_by_a_state_write() -> None:
+    """ID-3: only a proven host effect advances ``queued`` to ``delivered``."""
+    with pytest.raises(SessionTransitionError):
+        _instruction().with_state(InstructionState.DELIVERED, now=LATER)
 
 
 # --------------------------------------------------------------- invariants

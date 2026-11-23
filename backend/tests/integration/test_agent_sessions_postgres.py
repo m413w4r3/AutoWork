@@ -10,18 +10,26 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
+import json
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from typing import cast
 from uuid import UUID, uuid4
 
+import httpx
 import pytest
 import sqlalchemy as sa
 from alembic import command
+from fastapi import FastAPI
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from cti_app.application.agent_session_verification import HmacSessionSecretDeriver
+from cti_app.api.agent_sessions import router as agent_sessions_router
+from cti_app.application.agent_session_verification import (
+    HmacSessionSecretDeriver,
+    build_agent_session_message,
+)
 from cti_app.application.agentic_host_sessions import (
     HostBudgetUsageV1,
     HostCloseResultV1,
@@ -35,6 +43,7 @@ from cti_app.application.agentic_sessions import (
     SessionSecret,
     SessionService,
 )
+from cti_app.application.identity import LocalIdentityProvider
 from cti_app.application.investigation_handoffs import (
     HandoffCreateRequest,
     HandoffTaskStaleError,
@@ -47,6 +56,7 @@ from cti_app.application.investigation_tasks import (
     RepositoryTaskSessionPort,
     TaskCommandError,
 )
+from cti_app.config import Settings
 from cti_app.domain.agentic_operator import (
     AgentSessionInstructionV1,
     AgentSessionState,
@@ -117,6 +127,7 @@ HEAD = current_head()
 SESSIONS = "agent_sessions"
 INSTRUCTIONS = "agent_session_instructions"
 NOW = datetime(2026, 11, 22, 12, 0, tzinfo=UTC)
+HUMAN_ACTOR = TaskActor(kind=TaskActorKind.HUMAN, actor_id="analyst:test")
 
 
 def _table_names(database_url: str) -> set[str]:
@@ -1090,6 +1101,275 @@ def test_instruction_delivery_repository_cas_and_pending_listing(
                         reason="again",
                         now=NOW,
                     )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+# ------------------------------------------------ instruction actions route
+
+
+SESSION_KEY = "0123456789abcdef0123456789abcdef"
+
+
+async def _seed_route_session(
+    session_factory: async_sessionmaker[AsyncSession], investigation_id: UUID
+) -> tuple[AgentSessionV1, bytes]:
+    """One running task and an active session with a live lease and D7 secret."""
+    session_id = uuid4()
+    lease_id = uuid4()
+    nonce = b"r" * 32
+    secret = HmacSessionSecretDeriver(SESSION_KEY).derive(session_id=session_id, nonce=nonce)
+    task = InvestigationTaskV1(
+        id=uuid4(),
+        investigation_id=investigation_id,
+        task_key=f"lead-route-{uuid4().hex[:10]}",
+        title="Inspect the loader",
+        question="Which network gate does the loader use?",
+        objective="Identify the first-stage C2 gate.",
+        priority=TaskPriority.HIGH,
+        status=TaskStatus.RUNNING,
+        status_version=2,
+        result_verification_status=ResultVerificationStatus.UNVERIFIED,
+        created_by=HUMAN_ACTOR,
+        created_at=NOW,
+        updated_at=NOW,
+        assigned_actor_kind=TaskActorKind.OPERATOR,
+        assigned_actor_id="codex:operator-1",
+    )
+    async with SqlAlchemyUnitOfWork(session_factory) as uow:
+        await uow.investigation_tasks.add(task)
+        await uow.commit()
+    capabilities = _capabilities()
+    session = AgentSessionV1(
+        id=session_id,
+        investigation_id=investigation_id,
+        task_id=task.id,
+        adapter_kind=OperatorAdapterKind.CODEX_CLI,
+        state=AgentSessionState.AWAITING_INSTRUCTION,
+        state_version=2,
+        capability_probe=capabilities.to_payload(),
+        capability_sha256=capabilities.capability_sha256,
+        probed_at=capabilities.probed_at,
+        auth_secret_nonce=nonce,
+        auth_secret_hash=hashlib.sha256(secret).hexdigest(),
+        auth_secret_issued_at=NOW,
+        opened_at=NOW,
+        idempotency_key=f"session-{session_id}",
+        created_at=NOW,
+        updated_at=NOW,
+        host_session_ref=f"host-{session_id}",
+        handoff_id=None,
+        task_lease_id=lease_id,
+        task_lease_fence=1,
+    )
+    async with SqlAlchemyUnitOfWork(session_factory) as uow:
+        await uow.agent_sessions.add(session)
+        await uow.commit()
+    # The D7 verifier and the F2-C revalidation both read a live lease.
+    async with session_factory() as db:
+        await db.execute(
+            sa.text(
+                "UPDATE investigation_tasks SET lease_id = :lease_id, "
+                "lease_session_id = :session_id, lease_fence = 1, "
+                "heartbeat_at = now(), lease_expires_at = now() + interval '10 minutes' "
+                "WHERE id = :task_id"
+            ),
+            {"lease_id": lease_id, "session_id": session_id, "task_id": task.id},
+        )
+        await db.commit()
+    return session, secret
+
+
+async def _seed_instruction(
+    session_factory: async_sessionmaker[AsyncSession],
+    session: AgentSessionV1,
+    *,
+    text: str,
+    key: str,
+    queued_at: datetime = NOW,
+) -> AgentSessionInstructionV1:
+    instruction = AgentSessionInstructionV1(
+        investigation_id=session.investigation_id,
+        task_id=session.task_id,
+        session_id=session.id,
+        idempotency_key=key,
+        text=text,
+        text_sha256=instruction_text_sha256(text),
+        state=InstructionState.QUEUED,
+        created_by_kind="human",
+        created_by_id="analyst:test",
+        queued_at=queued_at,
+        created_at=queued_at,
+        updated_at=queued_at,
+    )
+    async with SqlAlchemyUnitOfWork(session_factory) as uow:
+        stored, created = await uow.agent_sessions.add_instruction(instruction)
+        assert created
+        await uow.commit()
+    return stored
+
+
+async def _seed_delivered_instruction(
+    session_factory: async_sessionmaker[AsyncSession],
+    session: AgentSessionV1,
+    *,
+    text: str,
+    key: str,
+) -> AgentSessionInstructionV1:
+    instruction = AgentSessionInstructionV1(
+        investigation_id=session.investigation_id,
+        task_id=session.task_id,
+        session_id=session.id,
+        idempotency_key=key,
+        text=text,
+        text_sha256=instruction_text_sha256(text),
+        state=InstructionState.DELIVERED,
+        created_by_kind="human",
+        created_by_id="analyst:test",
+        queued_at=NOW,
+        created_at=NOW,
+        updated_at=NOW,
+        delivered_at=NOW,
+        delivery_attempts=1,
+        delivery_token=uuid4(),
+        delivery_mode=InstructionDeliveryMode.NEXT_RUN,
+        delivery_sha256=instruction_text_sha256(text),
+    )
+    async with SqlAlchemyUnitOfWork(session_factory) as uow:
+        stored, created = await uow.agent_sessions.add_instruction(instruction)
+        assert created
+        await uow.commit()
+    return stored
+
+
+def _signed_route_request(
+    secret: bytes, *, path: str, session_id: UUID, payload: dict[str, object]
+) -> tuple[bytes, dict[str, str]]:
+    body = json.dumps(payload).encode()
+    timestamp_text = str(int(datetime.now(UTC).timestamp()))
+    message = build_agent_session_message(
+        method="POST",
+        path_and_query=path,
+        session_id=session_id,
+        body=body,
+        idempotency_key=None,
+        timestamp=timestamp_text,
+    )
+    signature = hmac.new(secret, message, hashlib.sha256).hexdigest()
+    return body, {
+        "content-type": "application/json",
+        "x-autowork-agent-session": str(session_id),
+        "x-autowork-agent-timestamp": timestamp_text,
+        "x-autowork-agent-signature": f"v1={signature}",
+    }
+
+
+def test_instruction_actions_route_on_postgres(migrated_postgres_url: str) -> None:
+    """The real route over PostgreSQL: human cancel, signed pull and strict ack."""
+
+    async def run() -> None:
+        engine = create_postgres_engine(migrated_postgres_url)
+        try:
+            factory = create_session_factory(engine)
+            investigation = await _seed_investigation(factory)
+            session, secret = await _seed_route_session(factory, investigation.id)
+            suffix = uuid4().hex[:8]
+            cancel_me = await _seed_instruction(
+                factory, session, text="Cancel me.", key=f"pg-route-cancel-{suffix}"
+            )
+            ack_me = await _seed_instruction(
+                factory,
+                session,
+                text="Ack me.",
+                key=f"pg-route-ack-{suffix}",
+                queued_at=NOW + timedelta(seconds=1),
+            )
+            delivered = await _seed_delivered_instruction(
+                factory, session, text="Delivered once.", key=f"pg-route-delivered-{suffix}"
+            )
+
+            application = FastAPI()
+            application.include_router(agent_sessions_router)
+            application.state.uow_factory = lambda: SqlAlchemyUnitOfWork(factory)
+            application.state.settings = Settings(
+                _env_file=None,
+                m24_agent_session_key=SESSION_KEY,
+                agent_sessions_allow_local_identity=True,
+            )
+            application.state.identity_provider = LocalIdentityProvider("analyst:test")
+            path = (
+                f"/api/investigations/{investigation.id}/agent-sessions/{session.id}/instructions"
+            )
+
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=application), base_url="http://test"
+            ) as client:
+                cancelled = await client.post(
+                    path,
+                    json={
+                        "action": "cancel",
+                        "instruction_id": str(cancel_me.id),
+                        "reason": "obsolete",
+                    },
+                )
+                assert cancelled.status_code == 200, cancelled.text
+                assert cancelled.json()["state"] == "cancelled"
+                assert cancelled.json()["cancel_reason"] == "obsolete"
+
+                body, headers = _signed_route_request(
+                    secret, path=path, session_id=session.id, payload={"action": "pull"}
+                )
+                pulled = await client.post(path, headers=headers, content=body)
+                assert pulled.status_code == 200, pulled.text
+                assert [item["id"] for item in pulled.json()] == [str(delivered.id)]
+                assert pulled.json()[0]["delivery_text"] == "Delivered once."
+                assert pulled.json()[0]["delivery_sha256"] == delivered.delivery_sha256
+                assert pulled.json()[0]["delivery_text_verified"] is True
+
+                body, headers = _signed_route_request(
+                    secret,
+                    path=path,
+                    session_id=session.id,
+                    payload={"action": "ack", "instruction_ids": [str(ack_me.id)]},
+                )
+                refused = await client.post(path, headers=headers, content=body)
+                assert refused.status_code == 409, refused.text
+                assert refused.json()["detail"]["code"] == "instruction_not_delivered"
+
+                body, headers = _signed_route_request(
+                    secret,
+                    path=path,
+                    session_id=session.id,
+                    payload={"action": "ack", "instruction_ids": [str(delivered.id)]},
+                )
+                acked = await client.post(path, headers=headers, content=body)
+                assert acked.status_code == 200, acked.text
+                assert acked.json()[0]["state"] == "acknowledged"
+                assert acked.json()[0]["acknowledged_at"] is not None
+
+                body, headers = _signed_route_request(
+                    secret, path=path, session_id=session.id, payload={"action": "pull"}
+                )
+                empty = await client.post(path, headers=headers, content=body)
+                assert empty.status_code == 200, empty.text
+                assert empty.json() == []
+
+            async with factory() as db:
+                rows = (
+                    await db.execute(
+                        sa.text(
+                            "SELECT id, state, cancel_reason FROM "
+                            "agent_session_instructions WHERE session_id = :session_id"
+                        ),
+                        {"session_id": session.id},
+                    )
+                ).all()
+            states = {row.id: row.state for row in rows}
+            assert states[cancel_me.id] == "cancelled"
+            assert states[ack_me.id] == "queued"
+            assert states[delivered.id] == "acknowledged"
         finally:
             await engine.dispose()
 
