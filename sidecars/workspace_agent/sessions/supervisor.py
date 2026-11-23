@@ -39,11 +39,13 @@ from . import egress, logs, process, relay, shim
 from . import state as session_state
 from .state import (
     ACTIVE_STATES,
+    CREDENTIAL_CLEANUP_REASON,
     SECRET_EXPOSURE_REASON,
     BudgetExceededError,
     BudgetSpec,
     CapabilityUnavailableError,
     ConfinementUnavailableError,
+    CredentialCleanupError,
     ExitRecord,
     HandoffRef,
     IdempotencyConflictError,
@@ -117,6 +119,18 @@ WIRE_ADAPTER_ALIASES: Mapping[str, str] = {"codex_cli": "codex", "claude_code": 
 HOST_ADAPTER_WIRE_NAMES: Mapping[str, str] = {"codex": "codex_cli", "claude": "claude_code"}
 # F2: an aligned secret fragment of at least 16 bytes is already a compromise.
 MIN_SECRET_FRAGMENT_BYTES = 16
+# R2B-1: the provider credential copies a CLI profile seeds into the disposable
+# session runtime (Claude's OAuth file, Codex's auth.json).  They are removed at
+# close, supervisor stop, interrupt and restart reconciliation; a copy the host
+# cannot remove fails the session instead of being silently reused.
+PROFILE_CREDENTIAL_COPY_PATHS: tuple[Path, ...] = (
+    Path("config/home/.claude/.credentials.json"),
+    Path("config/codex/auth.json"),
+)
+MAX_CREDENTIAL_COPY_BYTES = 1024 * 1024
+# R2B-2: string values under these token-ish JSON keys are provider credentials.
+# The window derivation is bounded so a pathological value cannot exhaust memory.
+MAX_CREDENTIAL_VALUE_BYTES = 4 * 1024
 DEFAULT_SKILLS_ROOT = Path(__file__).resolve().parents[3] / ".agents" / "skills"
 DEFAULT_FAKE_SCENARIO = "success"
 DEFAULT_BROKER_BACKEND_URL = "http://127.0.0.1:8000"
@@ -918,6 +932,162 @@ def _secret_log_forms(secret: bytes) -> tuple[str, ...]:
 
 
 # ---------------------------------------------------------------------------
+# Provider credential copies (R2B-1/R2B-2)
+# ---------------------------------------------------------------------------
+
+
+def _merge_forms(*groups: Sequence[bytes]) -> tuple[bytes, ...]:
+    merged: set[bytes] = set()
+    for group in groups:
+        merged.update(group)
+    return tuple(sorted(merged, key=len, reverse=True))
+
+
+def _credential_value_key(name: str) -> bool:
+    """Token-ish JSON keys whose string values are provider credentials."""
+    normalized = name.lower().replace("_", "").replace("-", "")
+    return normalized.endswith(("token", "apikey", "secret", "password"))
+
+
+def _append_credential_strings(value: object, values: list[str]) -> None:
+    if isinstance(value, str):
+        if value:
+            values.append(value)
+    elif isinstance(value, Mapping):
+        for item in value.values():
+            _append_credential_strings(item, values)
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for item in value:
+            _append_credential_strings(item, values)
+
+
+def _collect_credential_values(payload: object, values: list[str]) -> None:
+    """Collect the string values stored under token-ish keys, at any depth."""
+    if isinstance(payload, Mapping):
+        for key, value in payload.items():
+            if not isinstance(key, str):
+                continue
+            if _credential_value_key(key):
+                _append_credential_strings(value, values)
+            else:
+                _collect_credential_values(value, values)
+    elif isinstance(payload, Sequence) and not isinstance(payload, (str, bytes, bytearray)):
+        for item in payload:
+            _collect_credential_values(item, values)
+
+
+def _credential_value_forms(value: bytes) -> tuple[bytes, ...]:
+    """Raw, hex and standard/urlsafe base64 forms of one bounded credential value.
+
+    It reuses the F2 derivation so an aligned fragment — or a base64 encoding of
+    the whole value — is refused exactly like a fragment of the session secret.
+    """
+    return _secret_content_forms(value[:MAX_CREDENTIAL_VALUE_BYTES])
+
+
+def _credential_bytes_forms(data: bytes) -> tuple[bytes, ...]:
+    """Every forbidden form of one seeded credential copy (R2B-2)."""
+    try:
+        parsed = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        # An unexpected format must not silently disable the filter: treat the
+        # bounded file itself as one credential value.
+        return _credential_value_forms(data)
+    values: list[str] = []
+    _collect_credential_values(parsed, values)
+    forms: set[bytes] = set()
+    for value in values:
+        raw = value.encode("utf-8")
+        forms.update(_credential_value_forms(raw))
+        escaped = json.dumps(value)[1:-1].encode("utf-8")
+        if escaped != raw:
+            forms.update(_credential_value_forms(escaped))
+    return tuple(sorted(forms, key=len, reverse=True))
+
+
+def _credential_copy_forms(path: Path) -> tuple[bytes, ...]:
+    """Forbidden forms of one credential copy; the values never leave memory.
+
+    A copy that exists but cannot be inspected fails closed rather than
+    silently disabling the check.
+    """
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return ()
+    except OSError as exc:
+        raise SessionError("the session provider credential copy cannot be inspected") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise SessionError("the session provider credential copy is not a regular file")
+    data = _read_regular_file(path, MAX_CREDENTIAL_COPY_BYTES)
+    if data is None:
+        raise SessionError("the session provider credential copy cannot be read")
+    return _credential_bytes_forms(data)
+
+
+def _shred_credential_copy(path: Path) -> bool:
+    """Overwrite a credential copy then unlink it; ``True`` once it is gone."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    if stat.S_ISREG(info.st_mode):
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError:
+            fd = None
+        if fd is not None:
+            try:
+                try:
+                    os.fchmod(fd, 0o600)
+                    size = min(os.fstat(fd).st_size, MAX_CREDENTIAL_COPY_BYTES)
+                    zero = bytes(min(size, 65536))
+                    written = 0
+                    while written < size:
+                        chunk = zero[: size - written]
+                        if os.write(fd, chunk) != len(chunk):
+                            break
+                        written += len(chunk)
+                    os.fsync(fd)
+                except OSError:
+                    pass  # the overwrite is best effort; the unlink is required
+            finally:
+                os.close(fd)
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _remove_profile_credentials(directory: Path) -> tuple[tuple[bytes, ...], tuple[str, ...]]:
+    """Capture a session's credential forms, then shred and unlink every copy.
+
+    Returns ``(forms, failures)``.  A copy that cannot be inspected or removed
+    is a failure: without its values a later ``collect`` cannot recognise a
+    leak, and a surviving file must never be silently reused.
+    """
+    forms: set[bytes] = set()
+    failures: list[str] = []
+    for relative in PROFILE_CREDENTIAL_COPY_PATHS:
+        path = directory / relative
+        try:
+            forms.update(_credential_copy_forms(path))
+        except SessionError:
+            failures.append(relative.as_posix())
+        if not _shred_credential_copy(path):
+            failures.append(relative.as_posix())
+    return (
+        tuple(sorted(forms, key=len, reverse=True)),
+        tuple(dict.fromkeys(failures)),
+    )
+
+
+# ---------------------------------------------------------------------------
 # In-memory session handle
 # ---------------------------------------------------------------------------
 
@@ -1000,6 +1170,11 @@ class _Session:
         # F2: derived from the in-memory secret only; cleared whenever the
         # secret is wiped, never persisted.
         self.secret_forms: tuple[bytes, ...] = ()
+        # R2B-2: in-memory forms of the provider credentials a profile installed
+        # for this session; never persisted, never logged.  They survive a run
+        # end (and the copy's removal at interrupt) so a later collect still
+        # refuses agent content carrying them.
+        self.provider_credential_forms: tuple[bytes, ...] = ()
         self.broker: SecretBroker | None = None
         self.relay: relay.BrokerRelay | None = None
         self.egress: egress.EgressProxy | None = None
@@ -1241,6 +1416,14 @@ class SessionSupervisor:
                 # Close in-flight relay connections and provider tunnels, unlink
                 # both sockets and the one-shot secret, wipe the secret bytes.
                 self._stop_channels(handle, wipe_secret=True)
+                # R2B-1: shutting the supervisor down never leaves a seeded
+                # provider credential behind; a failure is recorded on the
+                # session (``failed`` + typed event) and logged, never raised
+                # from shutdown.
+                try:
+                    self._purge_provider_credentials(handle, operation="stop")
+                except SessionError:
+                    pass
             for thread in list(handle.threads):
                 if thread.name.startswith(("session-stdout", "session-stderr", "session-monitor")):
                     thread.join(timeout=5)
@@ -1474,12 +1657,22 @@ class SessionSupervisor:
             ),
         )
         handle.last_output_monotonic = time.monotonic()
+        # R2B-1: a crashed supervisor may have left the seeded provider
+        # credential on disk.  Capture its forms in memory (R2B-2) and destroy
+        # the copy before the session is reconciled; terminal sessions from an
+        # older build are swept as well.
+        forms, cleanup_failures = _remove_profile_credentials(directory)
+        handle.provider_credential_forms = _merge_forms(forms)
         if record.state in ACTIVE_STATES:
-            self._reconcile_active(handle)
+            self._reconcile_active(handle, credential_cleanup_failed=bool(cleanup_failures))
+        elif cleanup_failures:
+            self._fail_credential_cleanup(handle, "reconcile")
         with self._lock:
             self._sessions[record.session_id] = handle
 
-    def _reconcile_active(self, handle: _Session) -> None:
+    def _reconcile_active(
+        self, handle: _Session, *, credential_cleanup_failed: bool = False
+    ) -> None:
         record = handle.record
         now = self._now()
         old_generation = record.generation
@@ -1525,6 +1718,16 @@ class SessionSupervisor:
             if run is not None:
                 run.state = "lost"
                 run.ended_at = now
+        if credential_cleanup_failed:
+            # R2B-1: the credential copy survived the reconciliation sweep; the
+            # recovered record must refuse reuse rather than look merely lost.
+            record.state = SessionState.FAILED
+            record.outcome = CREDENTIAL_CLEANUP_REASON
+            LOGGER.error(
+                "session provider credential copy could not be removed "
+                "session_id=%s operation=reconcile",
+                record.session_id,
+            )
         if record.state not in ACTIVE_STATES:
             record.state_version += 1
         record.updated_at = now
@@ -1535,6 +1738,8 @@ class SessionSupervisor:
             "exit": None if exit_record is None else _exit_wire(exit_record),
             "process_start_ticks": None if run is None else run.start_ticks,
         }
+        if credential_cleanup_failed:
+            evidence["credential_cleanup_failed"] = True
         record.reconciliation = evidence
         handle.events.append_event(
             kind=logs.EventKind.RECONCILE_COMPLETED,
@@ -1543,6 +1748,7 @@ class SessionSupervisor:
                 "outcome": outcome,
                 "exit": evidence["exit"],
                 "process_start_ticks": evidence["process_start_ticks"],
+                **({"credential_cleanup_failed": True} if credential_cleanup_failed else {}),
             },
         )
         self._persist(handle)
@@ -2201,7 +2407,11 @@ class SessionSupervisor:
         record.budgets_used.wall_seconds = max(0.0, time.monotonic() - handle.started_monotonic)
         handle.managed = None
         previous = record.state
-        if record.state is SessionState.INTERRUPT_REQUESTED:
+        if record.state is SessionState.FAILED and record.outcome == CREDENTIAL_CLEANUP_REASON:
+            # The typed credential-cleanup failure outranks the run exit code:
+            # never report the session as reusable after a refused cleanup.
+            pass
+        elif record.state is SessionState.INTERRUPT_REQUESTED:
             record.state = SessionState.STOPPED
             record.outcome = "interrupted"
         elif handle.budget_killed is not None:
@@ -2450,6 +2660,9 @@ class SessionSupervisor:
                     },
                 )
                 self._stop_channels(handle, wipe_secret=False)
+                # R2B-1: an interrupt ends the run's access to the provider
+                # credential; a later start/resume seeds a fresh copy.
+                self._purge_provider_credentials(handle, operation="interrupt")
                 self._persist(handle)
                 # SESSION-RUNNER §6 fixes the interrupt receipt literal to
                 # ``interrupt_requested`` (the backend model is strict); the
@@ -2486,6 +2699,15 @@ class SessionSupervisor:
             # provider tunnel; close the one-shot secret socket.  The secret
             # bytes stay in memory so a later resume can re-arm a fresh one.
             self._stop_channels(handle, wipe_secret=False)
+            try:
+                # R2B-1: an interrupted run keeps no seeded credential copy.
+                self._purge_provider_credentials(handle, operation="interrupt")
+            except CredentialCleanupError:
+                # The session is failed and cannot be resumed; never leave the
+                # interrupted process alive behind a refused request.
+                if managed is not None:
+                    process.signal_group(managed.pgid, signal.SIGKILL)
+                raise
             body: dict[str, object] = {
                 "state": str(SessionState.INTERRUPT_REQUESTED),
                 "signal_sent": signal_sent,
@@ -2774,6 +2996,62 @@ class SessionSupervisor:
         )
         self._persist(handle)
 
+    # -- provider credential copies (R2B-1) --------------------------------
+
+    def _purge_provider_credentials(self, handle: _Session, *, operation: str) -> None:
+        """Shred and unlink the credential copies seeded for this session.
+
+        The values are captured in memory first so a later ``collect`` still
+        refuses agent content that carries them.  A copy that survives fails
+        the session with the typed reason and raises ``CredentialCleanupError``:
+        the host neither reports a clean close it cannot guarantee nor lets the
+        session be reused.
+        """
+        forms, failures = _remove_profile_credentials(handle.directory)
+        handle.provider_credential_forms = _merge_forms(handle.provider_credential_forms, forms)
+        if failures:
+            self._fail_credential_cleanup(handle, operation)
+            raise CredentialCleanupError(operation=operation)
+
+    def _fail_credential_cleanup(self, handle: _Session, operation: str) -> None:
+        """Record a surviving credential copy and refuse any later reuse."""
+        record = handle.record
+        now = self._now()
+        reason = CREDENTIAL_CLEANUP_REASON
+        LOGGER.error(
+            "session provider credential copy could not be removed session_id=%s operation=%s",
+            record.session_id,
+            operation,
+        )
+        previous = record.state
+        if previous is not SessionState.CLOSED:
+            record.state = SessionState.FAILED
+            record.outcome = reason
+            record.state_version += 1
+            record.updated_at = now
+            record.last_activity_at = now
+            record.stopped_at = record.stopped_at or now
+        handle.events.append_event(
+            kind=logs.EventKind.STATE_CHANGED,
+            at=now,
+            payload={
+                "from": str(previous),
+                "to": str(record.state),
+                "state_version": record.state_version,
+                "reason": reason,
+                "operation": operation,
+            },
+        )
+        try:
+            self._persist(handle)
+        except Exception:
+            # The cleanup failure is still raised/logged by the caller; a state
+            # write failure must not turn it into silence.
+            LOGGER.error(
+                "session credential cleanup failure could not be persisted session_id=%s",
+                record.session_id,
+            )
+
     def _ensure_capture_parent(
         self, descriptor: workspace.WorkspaceDescriptor, components: tuple[str, ...]
     ) -> None:
@@ -2867,6 +3145,10 @@ class SessionSupervisor:
                     os.unlink(path)
                 except OSError:
                     pass
+            # R2B-1: the seeded provider credential never outlives the session.
+            # A copy that cannot be removed fails this close (state ``failed``)
+            # instead of leaving a reusable credential behind a clean receipt.
+            self._purge_provider_credentials(handle, operation="close")
             now = self._now()
             previous = record.state
             record.state = SessionState.CLOSED

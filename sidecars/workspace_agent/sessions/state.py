@@ -41,6 +41,9 @@ MAX_SKILLS = 32
 MAX_SECRET_BYTES = 32
 # Typed reason recorded when agent content proves the secret left its socket.
 SECRET_EXPOSURE_REASON = "secret_exposure_detected"
+# Typed reason recorded when a seeded provider credential copy survives its
+# removal at close/stop/interrupt/restart reconciliation (R2B-1).
+CREDENTIAL_CLEANUP_REASON = "credential_cleanup_failed"
 MAX_BUDGET_WALL_SECONDS = 24 * 60 * 60
 MAX_BUDGET_OUTPUT_BYTES = 256 * 1024 * 1024
 MAX_BUDGET_INSTRUCTIONS = 10_000
@@ -229,6 +232,24 @@ class SecretExposureError(SessionError):
         super().__init__(
             "agent content contains the session secret",
             details={"reason": SECRET_EXPOSURE_REASON, "operation": operation},
+        )
+
+
+class CredentialCleanupError(SessionError):
+    """A seeded provider credential copy survives its removal (R2B-1).
+
+    The session is failed before this is raised: a host that cannot delete the
+    copy must neither present the session as cleanly closed nor let it be
+    reused.  Neither the message nor the details carry the credential values.
+    """
+
+    code = ErrorCode.INTERNAL_ERROR
+    status = 500
+
+    def __init__(self, *, operation: str) -> None:
+        super().__init__(
+            "the session provider credential copy cannot be removed",
+            details={"reason": CREDENTIAL_CLEANUP_REASON, "operation": operation},
         )
 
 
