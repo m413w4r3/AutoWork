@@ -103,7 +103,8 @@ Transport: HTTP/1.1 over `AF_UNIX`/`SOCK_STREAM`. One request per connection
 (`Connection: close`), `Content-Length` required, no chunked bodies, no
 `Expect: 100-continue`, no upgrade, no pipelining, no query string, max 8 concurrent
 connections per session. Request-line limit 2 KiB; header block 16 KiB; body 1 MiB
-(the catalogue's largest argument bound, `catalog.py:34-37,506-534`). Response body is
+(the catalogue's largest argument bound, `catalog.py:34-37,506-534`); the
+instructions route below is tighter (16 KiB). Response body is
 streamed to the shim with a 16 MiB ceiling; the shim applies the final tool-result cut
 (`shim.py:189-212,458-497`).
 
@@ -114,6 +115,12 @@ Allowed operations (all POST; `sid` = the session id this listener belongs to):
 | `/api/investigations/{iid}/agent-sessions/{sid}/tool-calls` | `tool_name` ∈ accepted manifest; `schema_version` string; `arguments` object | 120 s command tools, 600 s registry, 1800 s `advisor.consult` (`catalog.py:77-79`) |
 | `/api/investigations/{iid}/tasks/{tid}/commands` | `command` ∈ {`heartbeat`,`submit`}; `tid` = session task; `iid` = session investigation | 120 s |
 | `/api/investigations/{iid}/handoffs` | `task_id` = session task; `iid` = session investigation | 120 s |
+| `/api/investigations/{iid}/agent-sessions/{sid}/instructions` | `action` ∈ {`pull`,`ack`} only (`enqueue`/`cancel` are human actions, refused as `relay_operation_not_allowed`); `pull` carries `action` alone, `ack` carries `action` + 1–32 canonical UUIDs and no other key; no `tool_name`, no manifest lookup; body ≤ 16 KiB; `iid`/`sid` = the listener session | 120 s |
+
+The instructions row is the shim's `instruction.pending`/`instruction.ack` route
+(`INSTRUCTION-DELIVERY.md` §3.6): a fixed read and a fixed signed acknowledgement, both mapped
+to the backend `POST …/instructions` route that `api/main.py` already treats as a signed agent
+route. It adds no URL, path, method or header knob to the agent.
 
 Header whitelist forwarded verbatim: `Content-Type`, `Accept`, `Accept-Encoding`,
 `User-Agent`, `Content-Length`, `Idempotency-Key`, `X-AutoWork-Agent-Session`,

@@ -219,6 +219,14 @@ def _handoff_target(*, investigation_id: str = INVESTIGATION_ID) -> str:
     return str(catalog.HANDOFF_PATH.format(investigation_id=investigation_id))
 
 
+def _instruction_target(
+    *, investigation_id: str = INVESTIGATION_ID, session_id: str = SESSION_ID
+) -> str:
+    return str(
+        catalog.INSTRUCTIONS_PATH.format(investigation_id=investigation_id, session_id=session_id)
+    )
+
+
 def _signed_headers(
     *,
     session_id: str = SESSION_ID,
@@ -269,6 +277,13 @@ def _handoff_body(*, task_id: str = TASK_ID) -> bytes:
     return json.dumps(
         {"task_id": task_id, "next_action": "continue"}, separators=(",", ":")
     ).encode("utf-8")
+
+
+def _instruction_body(*, action: str = "pull", instruction_ids: object = None) -> bytes:
+    payload: dict[str, object] = {"action": action}
+    if instruction_ids is not None:
+        payload["instruction_ids"] = instruction_ids
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
 
 def _request_bytes(
@@ -1198,6 +1213,104 @@ def test_relay_forwards_task_commands_and_handoffs(
     assert status == 403
     assert cast(dict[str, object], payload["details"])["reason"] == "command_not_allowed"
     assert transport.call_count == 3
+
+
+def test_relay_forwards_the_operator_instruction_actions_byte_exact(
+    relay_factory: Callable[..., relay.BrokerRelay],
+) -> None:
+    transport = RecordingTransport()
+    # The instructions route is not a broker tool: no manifest is required.
+    server = relay_factory(FakeSessionState(tools=None), transport)
+    instruction_ids = [
+        "12345678-1234-4abc-8def-1234567890ab",
+        "abcdef12-3456-4abc-9def-abcdef123456",
+    ]
+    pull = _instruction_body()
+    ack = _instruction_body(action="ack", instruction_ids=instruction_ids)
+
+    assert _parse(_call(server.socket_path, target=_instruction_target(), body=pull)).status == 200
+    assert _parse(_call(server.socket_path, target=_instruction_target(), body=ack)).status == 200
+
+    assert transport.call_count == 2
+    assert [call.path for call in transport.calls] == [
+        _instruction_target(),
+        _instruction_target(),
+    ]
+    assert [call.body for call in transport.calls] == [pull, ack]
+    assert [call.timeout for call in transport.calls] == [120.0, 120.0]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        _instruction_body(action="enqueue"),
+        _instruction_body(action="cancel"),
+        _instruction_body(action="deliver"),
+        _instruction_body(action="pull", instruction_ids=[]),
+        _instruction_body(
+            action="ack",
+            instruction_ids=[f"{index:08x}-1234-4abc-8def-1234567890ab" for index in range(33)],
+        ),
+        _instruction_body(action="ack", instruction_ids=["not-a-uuid"]),
+        _instruction_body(
+            action="ack",
+            instruction_ids=[
+                "12345678-1234-4abc-8def-1234567890ab",
+                "12345678-1234-4abc-8def-1234567890ab",
+            ],
+        ),
+        _instruction_body(action="ack", instruction_ids="12345678-1234-4abc-8def-1234567890ab"),
+        _instruction_body(action="ack"),
+        b'{"action":"pull","tool_name":"vt.file_report"}',
+        b'{"action":"ack","instruction_ids":["12345678-1234-4abc-8def-1234567890ab"],"x":1}',
+        b"[]",
+    ],
+)
+def test_relay_refuses_human_or_malformed_instruction_bodies(
+    relay_factory: Callable[..., relay.BrokerRelay], body: bytes
+) -> None:
+    transport = RecordingTransport()
+    server = relay_factory(FakeSessionState(), transport)
+
+    status, payload = _error_of(_call(server.socket_path, target=_instruction_target(), body=body))
+
+    assert status == 403
+    assert payload["error"] == "relay_operation_not_allowed"
+    assert transport.call_count == 0
+
+
+def test_relay_bounds_the_instruction_body(
+    relay_factory: Callable[..., relay.BrokerRelay],
+) -> None:
+    transport = RecordingTransport()
+    server = relay_factory(FakeSessionState(), transport)
+    body = json.dumps(
+        {"action": "pull", "pad": "a" * relay.INSTRUCTION_BODY_LIMIT_BYTES},
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    status, payload = _error_of(_call(server.socket_path, target=_instruction_target(), body=body))
+
+    assert status == 413
+    assert payload["error"] == "relay_request_too_large"
+    assert transport.call_count == 0
+
+
+def test_relay_binds_the_instruction_route_to_the_session(
+    relay_factory: Callable[..., relay.BrokerRelay],
+) -> None:
+    transport = RecordingTransport()
+    server = relay_factory(FakeSessionState(), transport)
+    pull = _instruction_body()
+
+    for target in (
+        _instruction_target(investigation_id=OTHER_ID),
+        _instruction_target(session_id=OTHER_ID),
+    ):
+        status, payload = _error_of(_call(server.socket_path, target=target, body=pull))
+        assert status == 403
+        assert payload["error"] == "relay_binding_mismatch"
+    assert transport.call_count == 0
 
 
 @pytest.mark.parametrize(
