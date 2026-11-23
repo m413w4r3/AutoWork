@@ -89,6 +89,7 @@ from cti_app.application.persistence import (
 from cti_app.application.workspace_agent import WorkspaceAgentError
 from cti_app.domain.agentic_operator import (
     AGENT_SESSION_SECRET_NONCE_BYTES,
+    INSTRUCTION_MAX_TEXT_BYTES,
     RECONCILE_OUTCOMES_RESUMABLE,
     RESUMABLE_AGENT_SESSION_STATES,
     AgenticOperatorPort,
@@ -188,6 +189,18 @@ class SessionInstructionNotDeliveredError(SessionInstructionConflictError):
 
     code = "instruction_not_delivered"
     status_code = 409
+
+
+class SessionInstructionTextTooLongError(SessionError):
+    """The enqueued text exceeds the persisted-instruction byte bound (R4-F12).
+
+    The request model bounds *characters*; the domain and the queue bound
+    UTF-8 *bytes*.  Checking here keeps a multioctet body a typed 413 instead
+    of an uncaught domain ``ValueError`` (HTTP 500).
+    """
+
+    code = "instruction_text_too_long"
+    status_code = 413
 
 
 class SessionResumeUnavailableError(SessionError):
@@ -1101,6 +1114,14 @@ class SessionService:
                 investigation_id=investigation_id, text=text, note_refs=note_refs
             )
             composed_text = prepared.queued_text
+        # R4-F12: the API model bounds characters, the domain bounds UTF-8
+        # bytes.  Refuse the multioctet overflow here so it stays a typed 4xx
+        # instead of an uncaught domain ValueError (HTTP 500).
+        if len(composed_text.encode("utf-8")) > INSTRUCTION_MAX_TEXT_BYTES:
+            raise SessionInstructionTextTooLongError(
+                f"instruction text is bounded to {INSTRUCTION_MAX_TEXT_BYTES} bytes",
+                details={"limit_bytes": str(INSTRUCTION_MAX_TEXT_BYTES)},
+            )
         async with self._uow_factory() as uow:
             session = await self._session_for(uow, investigation_id, session_id)
             if session.state not in (
