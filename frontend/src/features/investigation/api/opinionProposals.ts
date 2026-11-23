@@ -11,6 +11,7 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
+import { investigationOperatorQueryKeys } from "../../../api/investigationOperator";
 import { plansKeys } from "./plans";
 import { tasksKeys } from "./tasks";
 import {
@@ -434,6 +435,16 @@ export function useRequestNoteProposal(investigationId: string) {
   return useMutation({
     mutationFn: (input: NoteProposalRequestV1) =>
       requestNoteProposal(investigationId, input, createIdempotencyKey()),
+    onSettled: () => {
+      // Every advisor consultation records an `operator_tool:` action on the
+      // investigation working state, which bumps its CAS version. The request
+      // panel pins that version, so it must reload it after each attempt —
+      // otherwise a second request from the same mounted view (for example the
+      // correction of a note just drafted) is refused `stale_working_state`.
+      void queryClient.invalidateQueries({
+        queryKey: investigationOperatorQueryKeys.activity(investigationId),
+      });
+    },
     onSuccess: () => {
       void queryClient.invalidateQueries({
         queryKey: opinionProposalsKeys.all(investigationId),

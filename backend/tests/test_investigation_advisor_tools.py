@@ -1664,6 +1664,33 @@ def test_advisor_schema_has_no_arbitrary_editorial_or_measurement_ceilings() -> 
     assert "multiple draft targets" in schema["units"]["description"]
 
 
+def test_advisor_registered_schema_accepts_task_scope_consultation_types() -> None:
+    """M24.1 B3: the task route exposes interpretation/critique; the schema must too."""
+    tool, _ = make_tool(investigation_id=uuid4(), transport=Transport(None))
+
+    class CaptureRegistry:
+        def __init__(self) -> None:
+            self.definitions: list[Any] = []
+
+        def register(self, definition: Any, adapter: Any) -> None:
+            self.definitions.append(definition)
+
+    registry = CaptureRegistry()
+    register_investigation_advisor_tool(registry, adapter=tool)
+    schema = thaw_json(registry.definitions[0].input_schema)
+    enum = schema["properties"]["consultation_type"]["enum"]
+    assert {"interpretation", "critique"} <= set(enum)
+    for consultation_type in ("interpretation", "critique"):
+        validate_json_schema(
+            {
+                "consultation_type": consultation_type,
+                "question": "Question synthetique de consultation de tache.",
+                "task_context": {"task_id": str(uuid4()), "title": "Synthetic task"},
+            },
+            schema,
+        )
+
+
 def test_advisor_registered_schema_accepts_canonical_editorial_assertion_refs() -> None:
     tool, _ = make_tool(investigation_id=uuid4(), transport=Transport(None))
 

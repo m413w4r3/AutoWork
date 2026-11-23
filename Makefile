@@ -645,7 +645,7 @@ test-editorial-browser: backend-sync frontend-sync ## Vérifie l'atelier éditor
 	echo "M23-editorial-browser / elapsed_seconds=$$((finished_at - started_at))"; \
 	exit "$$status"
 
-test-investigation-browser: backend-sync frontend-sync ## Parcours navigateur M24 réel (étapes 1-11) avec PostgreSQL jetable et fournisseurs factices
+test-investigation-browser: backend-sync frontend-sync ## Parcours navigateur M24 réel (étapes 1-24) avec PostgreSQL jetable et fournisseurs factices
 	@set -eu; \
 	owned_postgres=0; \
 	cleanup_postgres() { \

@@ -1,5 +1,7 @@
+import { renderHook, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { investigationOperatorQueryKeys } from "../../../api/investigationOperator";
 import {
   acceptNoteProposal,
   cancelNoteProposal,
@@ -9,14 +11,17 @@ import {
   opinionProposalsKeys,
   rejectNoteProposal,
   requestNoteProposal,
+  useRequestNoteProposal,
 } from "./opinionProposals";
 import {
   bodyOf,
+  createTestQueryClient,
   errorResponse,
   headersOf,
   installFetch,
   jsonResponse,
   lastRequest,
+  wrapperFor,
 } from "./testSupport";
 
 afterEach(() => {
@@ -196,5 +201,38 @@ describe("note proposal query keys", () => {
       "note-proposals",
       "proposal-2",
     ]);
+  });
+});
+
+describe("note proposal working-state refresh", () => {
+  it("reloads the activity version after a drafting request settles", async () => {
+    installFetch(() =>
+      jsonResponse({
+        proposal: { id: "proposal-1", status: "proposed" },
+        invocation_id: "invocation-1",
+        invocation_status: "succeeded",
+        idempotent_replay: false,
+        materialised: true,
+      }),
+    );
+    const client = createTestQueryClient();
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+
+    const { result } = renderHook(() => useRequestNoteProposal("inv-1"), {
+      wrapper: wrapperFor(client),
+    });
+    result.current.mutate({
+      anchor: "lead:0001",
+      target_block_type: "lead",
+      bridge_block_type: "key_findings",
+      expected_working_state_version: 7,
+    });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(invalidate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        queryKey: investigationOperatorQueryKeys.activity("inv-1"),
+      }),
+    );
   });
 });

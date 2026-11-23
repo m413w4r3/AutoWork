@@ -306,7 +306,9 @@ def install_fake_cli_profiles(
 ) -> None:
     """Register the H1 fake profile for the requested backend adapter kinds.
 
-    ``scenario`` selects the built-in fake CLI script (``hang`` by default);
+    ``scenario`` selects the built-in fake CLI script (``hang`` by default; the
+    browser journey asks for ``success`` so a clean run end is the host's
+    technical receive point and the instruction drain can deliver);
     ``script`` supplies a deterministic per-session JSON script instead.
     ``simulate_network_attestation=False`` models a host whose probe cannot
     attest the loopback-isolated egress namespace, so the backend must refuse.
@@ -435,8 +437,15 @@ async def seed_article(
     uow_factory: Any,
     artifact_store: ProductionArtifactStore,
     material: ScenarioMaterial,
+    duplicate_analysis_paragraph: bool = False,
 ) -> SeededArticle:
-    """Persist one verified synthetic ARTICLE, its extraction and routing."""
+    """Persist one verified synthetic ARTICLE, its extraction and routing.
+
+    ``duplicate_analysis_paragraph`` appends the tail paragraph to the analysis
+    section, so two rendered anchors share the exact same text.  The browser
+    journey uses it to prove the canonical anchor selector exposes real
+    multiple occurrences; the acceptance scenario keeps the default document.
+    """
     token = uuid4().hex
     source_document_id = uuid4()
     edition = Edition(
@@ -465,15 +474,23 @@ async def seed_article(
         heading="Vue d'ensemble",
         paragraphs=(PublicationParagraphV1(text=lead.text, evidence_refs=lead.evidence_refs),),
     )
+    analysis_paragraphs = [
+        PublicationParagraphV1(
+            text=ANALYSIS_SECTION_PARAGRAPH,
+            evidence_refs=lead.evidence_refs,
+        )
+    ]
+    if duplicate_analysis_paragraph:
+        analysis_paragraphs.append(
+            PublicationParagraphV1(
+                text=TAIL_SECTION_PARAGRAPH,
+                evidence_refs=lead.evidence_refs,
+            )
+        )
     analysis_section = PublicationSectionV1(
         kind=PublicationSectionKind.TECHNICAL,
         heading="Analyse synthetique",
-        paragraphs=(
-            PublicationParagraphV1(
-                text=ANALYSIS_SECTION_PARAGRAPH,
-                evidence_refs=lead.evidence_refs,
-            ),
-        ),
+        paragraphs=tuple(analysis_paragraphs),
     )
     tail_section = PublicationSectionV1(
         kind=PublicationSectionKind.TECHNICAL,
@@ -503,6 +520,14 @@ async def seed_article(
         anchor="section:1:paragraph:0001",
         spans=(SemanticTextSpanV1(role=SemanticRole.TEXT, text=ANALYSIS_SECTION_PARAGRAPH),),
     )
+    semantic_paragraphs = [overview_semantics, analysis_semantics]
+    if duplicate_analysis_paragraph:
+        semantic_paragraphs.append(
+            SemanticParagraphV1(
+                anchor="section:1:paragraph:0002",
+                spans=(SemanticTextSpanV1(role=SemanticRole.TEXT, text=TAIL_SECTION_PARAGRAPH),),
+            )
+        )
     tail_semantics = SemanticParagraphV1(
         anchor="section:2:paragraph:0001",
         spans=(SemanticTextSpanV1(role=SemanticRole.TEXT, text=TAIL_SECTION_PARAGRAPH),),
@@ -515,8 +540,7 @@ async def seed_article(
             policy_version=base_v5.semantic_text.policy_version,
             paragraphs=(
                 *preserved_semantics,
-                overview_semantics,
-                analysis_semantics,
+                *semantic_paragraphs,
                 tail_semantics,
             ),
         ),

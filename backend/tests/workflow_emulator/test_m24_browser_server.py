@@ -8,12 +8,16 @@ the published state must never carry the token.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
+from cti_app.application.agent_session_verifier import build_agent_session_message
 from tests.acceptance.scenario_support.harness import ScenarioMaterial
 from tests.workflow_emulator.m24_browser_server import (
     ATTESTATION_ENV,
@@ -22,6 +26,9 @@ from tests.workflow_emulator.m24_browser_server import (
     OPERATOR_TOKEN_ENV,
     BrowserState,
     _is_loopback_host,
+    _signed_action_request,
+    _signed_session_headers,
+    advisory_text_for,
     make_shutdown_handler,
     prompt_canonical_targets,
     prompt_consultation_type,
@@ -225,3 +232,101 @@ def test_two_paragraph_note_keeps_a_stored_paragraph_break() -> None:
 
     assert "\n\n" in text
     assert text.count("\n\n") == 1
+
+
+def test_correction_note_differs_and_keeps_one_paragraph_break() -> None:
+    from cti_app.domain.opinion_note_proposal import note_draft_text_from_sentences
+
+    first = note_draft_text_from_sentences([item["text"] for item in two_paragraph_note("U1")])
+    revised = note_draft_text_from_sentences(
+        [item["text"] for item in two_paragraph_note("U1", revised=True)]
+    )
+
+    assert revised != first
+    assert "corrigee" in revised.casefold()
+    assert revised.count("\n\n") == 1
+
+
+def test_signed_action_request_builds_the_tool_call_wire() -> None:
+    raw, key, kind = _signed_action_request(
+        {
+            "kind": "tool_call",
+            "tool_name": "task.submit_result",
+            "schema_version": "1",
+            "arguments": {"expected_status_version": 3},
+            "idempotency_key": "m24-browser-submit",
+        }
+    )
+
+    assert kind == "tool_call"
+    assert key == "m24-browser-submit"
+    assert json.loads(raw) == {
+        "tool_name": "task.submit_result",
+        "schema_version": "1",
+        "arguments": {"expected_status_version": 3},
+    }
+
+
+def test_signed_action_request_builds_the_instruction_ack_wire() -> None:
+    instruction_id = str(uuid4())
+    raw, key, kind = _signed_action_request(
+        {"kind": "instruction", "action": "ack", "instruction_ids": [instruction_id]}
+    )
+
+    assert kind == "instruction"
+    assert key is None
+    assert json.loads(raw) == {"action": "ack", "instruction_ids": [instruction_id]}
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        {"kind": "instruction", "action": "enqueue", "text": "x"},
+        {"kind": "instruction", "action": "ack", "instruction_ids": []},
+        {"kind": "tool_call", "tool_name": "x"},
+        {"kind": "other"},
+    ),
+)
+def test_signed_action_request_refuses_unknown_shapes(body: dict[str, Any]) -> None:
+    with pytest.raises(ValueError):
+        _signed_action_request(body)
+
+
+def test_advisory_text_declares_the_requested_consultation_type() -> None:
+    critique = advisory_text_for("critique")
+    interpretation = advisory_text_for("interpretation")
+
+    assert "TYPE: critique" in critique
+    assert "TYPE: pivot_strategy" not in critique
+    assert "TYPE: interpretation" in interpretation
+    assert "refs=E1" not in critique
+    assert "STATUS: succeeded" in critique
+
+
+def test_signed_session_headers_sign_the_exact_d7_message() -> None:
+    secret = b"s" * 32
+    session_id = uuid4()
+    path = f"/api/investigations/{uuid4()}/agent-sessions/{session_id}/instructions"
+    body = b'{"action":"pull"}'
+
+    headers = _signed_session_headers(
+        secret=secret,
+        session_id=session_id,
+        path_and_query=path,
+        body=body,
+        idempotency_key=None,
+    )
+    message = build_agent_session_message(
+        method="POST",
+        path_and_query=path,
+        session_id=session_id,
+        body=body,
+        idempotency_key=None,
+        timestamp=headers["X-AutoWork-Agent-Timestamp"],
+    )
+
+    assert headers["X-AutoWork-Agent-Session"] == str(session_id)
+    assert headers["X-AutoWork-Agent-Signature"] == (
+        "v1=" + hmac.new(secret, message, hashlib.sha256).hexdigest()
+    )
+    assert "Idempotency-Key" not in headers

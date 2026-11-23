@@ -14,8 +14,12 @@ This follows the M23 editorial browser-server pattern
 * VirusTotal, Bridge and the CLIs are deterministic fakes.  The Bridge double
   *answers by itself* from the prompt (plan, two-paragraph note draft, review,
   advisory), so the browser can drive the human journey without a test-side
-  queue.  No live provider, CLI, network call or real CTI data is involved;
-* Typst is the real pinned compiler, wired but only exercised by PDF steps.
+  queue.  A correction request (a prompt asking to fix the existing note) gets
+  a revised two-paragraph answer, which the journey uses to prove the
+  replacement proposal and its stale predecessor.  No live provider, CLI,
+  network call or real CTI data is involved;
+* Typst is the real pinned compiler; the journey renders and extracts a real
+  PDF preview.
 
 The launcher refuses to boot without the fake-provider attestation, a loopback
 PostgreSQL DSN and a synthetic operator token of at least 32 ASCII characters.
@@ -26,16 +30,24 @@ state route or the ready line.
 Control routes (loopback only, outside ``/api`` so they carry no operator
 token):
 
-* ``GET /api/m24-browser/state`` — seeded ids, material, fixture counters and
-  live PostgreSQL diagnostics for the browser spec (through the Vite proxy);
+* ``GET /api/m24-browser/state`` — seeded ids, material, fixture counters,
+  live PostgreSQL diagnostics and the host runs the browser spec asserts
+  against (through the Vite proxy);
 * ``POST /__m24_browser/drain-instructions`` — one real ID-2 instruction drain
   tick, because ``lifespan="off"`` disables the background loop;
+* ``POST /__m24_browser/signed-session-action`` — play the host shim for the
+  D7 signed routes (tool calls, instruction pull/ack).  The per-session secret
+  is derived **inside this process** from the acceptance key and the session
+  nonce; it is never returned, logged, traced or given to the browser.  The
+  spec only receives the real route's HTTP status and body;
 * ``POST /__m24_browser/shutdown`` — clean uvicorn stop.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import ipaddress
 import json
 import os
@@ -45,10 +57,12 @@ import tempfile
 from collections.abc import Awaitable, Callable
 from contextlib import ExitStack
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
+import httpx
 import uvicorn
 from fastapi import FastAPI
 from sqlalchemy.engine import make_url
@@ -59,6 +73,8 @@ from cti_app.application.agent_session_disclosure import (
     SessionDisclosureUnitOfWork,
     build_session_disclosure_checker,
 )
+from cti_app.application.agent_session_verifier import build_agent_session_message
+from cti_app.application.agentic_host_sessions import HostSessionsError
 from cti_app.application.bridge_investigator import (
     ScriptedTurnTransport,
     TurnSubmission,
@@ -75,7 +91,11 @@ from cti_app.application.jobs import JobService, create_job_registry
 from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.subject_content import SubjectContentService
 from cti_app.application.subjects import SubjectService
-from cti_app.application.workspace_agent import WorkspaceAgentPort
+from cti_app.application.workspace_agent import WorkspaceAgentError, WorkspaceAgentPort
+from cti_app.domain.analyst_opinion import (
+    investigation_opinion_id,
+    note_content_blocks_to_payload,
+)
 from cti_app.infrastructure.agentic.wiring import build_session_runtime
 from cti_app.infrastructure.database.session import (
     create_postgres_engine,
@@ -96,6 +116,7 @@ from tests.acceptance.scenario_support.harness import (
     plan_text,
     running_scenario_agent,
     seed_article,
+    session_secret,
 )
 from tests.integration.conftest import _alembic_config, _create_database, _drop_database
 from tests.workflow_emulator.investigation_support import composition_factory
@@ -260,17 +281,45 @@ def prompt_canonical_targets(prompt: str) -> list[dict[str, Any]]:
     return targets
 
 
-def two_paragraph_note(unit_label: str) -> list[dict[str, str]]:
-    """Two stored sentences whose boundary keeps a real paragraph break."""
-    return [
-        {"text": f"Reponse synthetique pour {unit_label} : premier fait verifie sur les octets."},
-        {
-            "text": (
-                f"\n\nSecond paragraphe synthetique pour {unit_label} : la continuite "
-                "du saut de paragraphe est conservee telle quelle."
-            )
-        },
-    ]
+def two_paragraph_note(unit_label: str, *, revised: bool = False) -> list[dict[str, str]]:
+    """One stored Bridge sentence that carries a real internal paragraph break.
+
+    ``revised`` answers a correction request: the text differs from the first
+    draft so the journey can prove a replacement proposal and its diff.  The
+    label is reduced to a short token: a UUID would wrap inside the rendered
+    PDF and make a placement assertion depend on line breaking.
+    """
+    token = re.sub(r"[^A-Za-z0-9]", "", unit_label)[:8] or "U1"
+    prefix = "Reponse synthetique corrigee" if revised else "Reponse synthetique"
+    first = f"{prefix} pour {token} : premier fait verifie sur les octets."
+    second = (
+        f"Second paragraphe synthetique pour {token} : la continuite "
+        "du saut de paragraphe est conservee telle quelle."
+        + (" Le texte a ete corrige apres revue humaine." if revised else "")
+    )
+    # One stored sentence carrying the internal break: the real response parser
+    # strips a sentence's outer whitespace, so a separate ``\n\n``-prefixed
+    # sentence would lose its break (and be dropped) instead of surviving.
+    return [{"text": f"{first}\n\n{second}"}]
+
+
+_CORRECTION_MARKER = "Corrige la note"
+
+
+def advisory_text_for(consultation_type: str) -> str:
+    """The canonical advisory wire, declared under the requested type.
+
+    The parser compares the wire's ``TYPE:`` header with the requested
+    consultation type; a fixed ``pivot_strategy`` header makes every critique
+    read as unparsed.  The demonstration ``refs=E1`` alias is dropped because
+    this journey cites no evidence alias it could resolve; an unresolved alias
+    downgrades the answer to ``partial`` and a critique must be provably
+    received and parsed.
+    """
+    text = advisory_consult_text().replace(" | refs=E1", "")
+    if consultation_type and f"TYPE: {consultation_type}" not in text:
+        text = text.replace("TYPE: pivot_strategy", f"TYPE: {consultation_type}", 1)
+    return text
 
 
 class AutoRespondingBridgeTransport(ScriptedTurnTransport):
@@ -312,6 +361,10 @@ class AutoRespondingBridgeTransport(ScriptedTurnTransport):
             if external_llm_allowed:
                 consultation_type = prompt_consultation_type(prompt)
                 self.consultation_types.append(consultation_type)
+                if consultation_type == "critique":
+                    # Keep a critique observably in flight so the cockpit's
+                    # "envoyée — en cours" state is provable before "reçue".
+                    await asyncio.sleep(0.75)
                 self._responses.append(
                     self._respond(consultation_type, prompt, investigation_id=investigation_id)
                 )
@@ -341,15 +394,25 @@ class AutoRespondingBridgeTransport(ScriptedTurnTransport):
             return self._submission(json.dumps(self._draft_payload(prompt)))
         if consultation_type == "review_text":
             return self._submission(json.dumps(self._review_payload(prompt)))
-        return self._submission(advisory_consult_text())
+        return self._submission(advisory_text_for(consultation_type))
 
     @staticmethod
     def _submission(output_text: str) -> TurnSubmission:
-        # The acceptance helper is untyped; its runtime contract is exact.
-        return cast(TurnSubmission, bridge_submission(output_text))
+        # The acceptance helper is untyped; its runtime contract is exact.  A
+        # note proposal may only materialise from a consultation that carries
+        # real conversation-turn provenance, including a Bridge invocation id.
+        return cast(
+            TurnSubmission,
+            bridge_submission(output_text, bridge_invocation_id=uuid4()),
+        )
 
     def _draft_payload(self, prompt: str) -> dict[str, Any]:
         targets = prompt_canonical_targets(prompt)
+        revised = _CORRECTION_MARKER in prompt
+        # The canonical unit id is the same fixed alias for every request; the
+        # prompt itself is unique per anchor and intent, so its digest gives
+        # each answer a stable short token the PDF assertions can locate.
+        note_token = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:8]
         blocks: list[dict[str, Any]] = []
         for index, target in enumerate(targets, start=1):
             unit_id = str(target.get("id") or target.get("unit_id") or f"U{index}")
@@ -359,7 +422,7 @@ class AutoRespondingBridgeTransport(ScriptedTurnTransport):
                     "block_type": target.get("block_type"),
                     "form": target.get("form", "analyst_note"),
                     "anchor": target.get("anchor"),
-                    "sentences": two_paragraph_note(unit_id),
+                    "sentences": two_paragraph_note(note_token, revised=revised),
                 }
             )
         if not blocks:
@@ -368,7 +431,7 @@ class AutoRespondingBridgeTransport(ScriptedTurnTransport):
                     "block_type": "key_findings",
                     "form": "body",
                     "anchor": None,
-                    "sentences": two_paragraph_note("U1"),
+                    "sentences": two_paragraph_note(note_token, revised=revised),
                 }
             ]
         return {
@@ -488,12 +551,21 @@ def _workspace_diagnostics(root: Path, delivery_code: str, article_slug: str) ->
     }
 
 
+def _isoformat(value: datetime | None) -> str | None:
+    return None if value is None else value.isoformat()
+
+
 async def _investigation_diagnostics(
     uow_factory: Callable[[], SqlAlchemyUnitOfWork],
     *,
     state: BrowserState,
+    host_sessions: Any | None = None,
 ) -> list[dict[str, Any]]:
-    """Live PostgreSQL projections the browser spec asserts against."""
+    """Live PostgreSQL projections the browser spec asserts against.
+
+    Only identities, states, hashes and timestamps are published: no operator
+    token, session secret, nonce or instruction body ever reaches this route.
+    """
     async with uow_factory() as uow:
         investigation = await uow.analyst_investigations.get_for_run(state.production_run_id)
         if investigation is None:
@@ -507,6 +579,31 @@ async def _investigation_diagnostics(
         sessions = await uow.agent_sessions.list_for_investigation(investigation.id)
         decisions = await uow.analyst_decisions.list_for_investigation(investigation.id)
         binding = await uow.workspace_bindings.get_for_investigation(investigation.id)
+        instructions: dict[str, list[dict[str, Any]]] = {}
+        for session in sessions:
+            rows = await uow.agent_sessions.list_instructions(session.id)
+            instructions[str(session.id)] = [
+                {
+                    "instruction_id": str(row.id),
+                    "state": row.state.value,
+                    "text_sha256": row.text_sha256,
+                    "queued_at": _isoformat(row.queued_at),
+                    "delivered_at": _isoformat(row.delivered_at),
+                    "acknowledged_at": _isoformat(row.acknowledged_at),
+                    "delivery_attempts": row.delivery_attempts,
+                    "delivery_mode": (
+                        None if row.delivery_mode is None else row.delivery_mode.value
+                    ),
+                    "last_delivery_error": row.last_delivery_error,
+                    "cancelled_at": _isoformat(row.cancelled_at),
+                    "cancel_reason": row.cancel_reason,
+                }
+                for row in rows
+            ]
+        proposals = await uow.investigation_note_proposals.list_for_investigation(investigation.id)
+        opinion = await uow.analyst_opinions.get(investigation_opinion_id(investigation.id))
+        contributions = await uow.work_contributions.list_for_investigation(investigation.id)
+        invocations = await uow.tool_invocations.list_for_investigation(investigation.id)
     workspace: dict[str, Any] | None = None
     if binding is not None:
         workspace = {
@@ -519,6 +616,26 @@ async def _investigation_diagnostics(
                 binding.article_slug,
             ),
         }
+    host_runs: dict[str, dict[str, Any] | None] = {}
+    if host_sessions is not None:
+        for session in sessions:
+            try:
+                status = await host_sessions.get_session_status(session.id)
+            except (HostSessionsError, WorkspaceAgentError):
+                host_runs[str(session.id)] = None
+            else:
+                host_runs[str(session.id)] = {
+                    "state": status.state,
+                    "runs": len(status.runs),
+                    "exit": (
+                        None
+                        if status.exit is None
+                        else {
+                            "code": status.exit.code,
+                            "signal": status.exit.signal,
+                        }
+                    ),
+                }
     return [
         {
             "id": str(investigation.id),
@@ -535,6 +652,12 @@ async def _investigation_diagnostics(
                 else investigation_state.stop_reason.value
             ),
             "envelope_version": None if envelope is None else envelope.version,
+            "envelope_allowed_providers": (
+                None if envelope is None else list(envelope.allowed_providers)
+            ),
+            "envelope_external_llm_allowed": (
+                None if envelope is None else envelope.disclosure.external_llm_allowed
+            ),
             "plan_count": len(plans),
             "current_plan_version": None if head is None else head.current_version,
             "task_count": len(tasks),
@@ -554,6 +677,8 @@ async def _investigation_diagnostics(
                         None if task.assigned_actor_kind is None else task.assigned_actor_kind.value
                     ),
                     "assigned_actor_id": task.assigned_actor_id,
+                    "result_verification_status": task.result_verification_status.value,
+                    "result_refs": [dict(reference) for reference in task.result_refs],
                     "lease_fence": task.lease_fence,
                     "lease_session_id": (
                         None if task.lease_session_id is None else str(task.lease_session_id)
@@ -579,8 +704,97 @@ async def _investigation_diagnostics(
                     "host_session_ref": session.host_session_ref,
                     "handoff_id": None if session.handoff_id is None else str(session.handoff_id),
                     "task_lease_fence": session.task_lease_fence,
+                    "host": host_runs.get(str(session.id)),
+                    "instructions": instructions.get(str(session.id), []),
                 }
                 for session in sessions
+            ],
+            "note_proposals": [
+                {
+                    "proposal_id": str(proposal.id),
+                    "anchor": proposal.anchor,
+                    "status": proposal.status.value,
+                    "status_version": proposal.status_version,
+                    "proposed_text": proposal.proposed_text,
+                    "proposed_text_sha256": proposal.proposed_text_sha256,
+                    "bridge_block_type": proposal.bridge_block_type.value,
+                    "target_block_type": proposal.target_block_type.value,
+                    "base_opinion_version": proposal.base_opinion_version,
+                    "base_opinion_sha256": proposal.base_opinion_sha256,
+                    "base_publication_artifact_id": (
+                        None
+                        if proposal.base_publication_artifact_id is None
+                        else str(proposal.base_publication_artifact_id)
+                    ),
+                    "base_publication_sha256": proposal.base_publication_sha256,
+                    "content_blocks": note_content_blocks_to_payload(proposal.content_blocks),
+                    "materialised": proposal.materialised,
+                    "task_id": None if proposal.task_id is None else str(proposal.task_id),
+                }
+                for proposal in proposals
+            ],
+            "opinion": (
+                None
+                if opinion is None
+                else {
+                    "opinion_id": str(opinion.id),
+                    "version": opinion.version,
+                    "content_sha256": opinion.content_sha256,
+                    "base_publication_sha256": opinion.base_publication_sha256,
+                    "observations": [
+                        {
+                            "note_id": str(note.id),
+                            "anchor": note.anchor,
+                            "text": note.text,
+                            "content_blocks": note_content_blocks_to_payload(note.content_blocks),
+                        }
+                        for note in opinion.observations
+                    ],
+                }
+            ),
+            "contributions": [
+                {
+                    "contribution_id": str(contribution.id),
+                    "category": contribution.category.value,
+                    "import_status": contribution.import_status.value,
+                    "file_relpath": contribution.file_relpath,
+                    "file_sha256": contribution.file_sha256,
+                    "observation_id": (
+                        None
+                        if contribution.observation_id is None
+                        else str(contribution.observation_id)
+                    ),
+                    "finding_id": (
+                        None if contribution.finding_id is None else str(contribution.finding_id)
+                    ),
+                }
+                for contribution in contributions
+            ],
+            # The tool-invocation journal is the PostgreSQL line behind every
+            # signed call and every human consultation; only attribution and
+            # status are published (never parameters or output text).
+            "tool_invocations": [
+                {
+                    "invocation_id": str(invocation.id),
+                    "tool_name": invocation.tool_name,
+                    "status": invocation.status.value,
+                    "task_id": None if invocation.task_id is None else str(invocation.task_id),
+                    "agent_session_id": (
+                        None
+                        if invocation.agent_session_id is None
+                        else str(invocation.agent_session_id)
+                    ),
+                    "context_task_id": (
+                        None
+                        if invocation.context_task_id is None
+                        else str(invocation.context_task_id)
+                    ),
+                    "actor_kind": (
+                        None if invocation.actor_kind is None else invocation.actor_kind.value
+                    ),
+                    "actor_id": invocation.actor_id,
+                }
+                for invocation in invocations
             ],
             "workspace": workspace,
         }
@@ -608,6 +822,93 @@ def _service_or_fail(value: Any, name: str) -> Any:
     return value
 
 
+def _signed_session_headers(
+    *,
+    secret: bytes,
+    session_id: UUID,
+    path_and_query: str,
+    body: bytes,
+    idempotency_key: str | None,
+) -> dict[str, str]:
+    """Build the exact D7 host-shim headers around a raw body.
+
+    The secret is a synthetic per-session value derived in this process; it is
+    never returned by a route, written to the state file or logged.
+    """
+    timestamp = str(int(datetime.now(UTC).timestamp()))
+    message = build_agent_session_message(
+        method="POST",
+        path_and_query=path_and_query,
+        session_id=session_id,
+        body=body,
+        idempotency_key=idempotency_key,
+        timestamp=timestamp,
+    )
+    headers = {
+        "Content-Type": "application/json",
+        "X-AutoWork-Agent-Session": str(session_id),
+        "X-AutoWork-Agent-Timestamp": timestamp,
+        "X-AutoWork-Agent-Signature": "v1=" + hmac.new(secret, message, hashlib.sha256).hexdigest(),
+    }
+    if idempotency_key is not None:
+        headers["Idempotency-Key"] = idempotency_key
+    return headers
+
+
+def _signed_action_request(
+    body: dict[str, Any],
+) -> tuple[str, str | None, str]:
+    """Resolve a control-body into the signed route body, key and kind.
+
+    Two kinds are exposed because the host shim calls two real routes with the
+    same D7 scheme: the brokered tool catalogue and the fixed pull/ack route.
+    Anything else is a test programming error and is refused before signing.
+    """
+    kind = body.get("kind")
+    if kind == "tool_call":
+        tool_name = body.get("tool_name")
+        schema_version = body.get("schema_version")
+        arguments = body.get("arguments", {})
+        idempotency_key = body.get("idempotency_key")
+        if (
+            not isinstance(tool_name, str)
+            or not tool_name
+            or not isinstance(schema_version, str)
+            or not schema_version
+            or not isinstance(arguments, dict)
+            or not isinstance(idempotency_key, str)
+            or not idempotency_key
+        ):
+            raise ValueError("tool_call requires tool_name, schema_version, arguments and a key")
+        payload: dict[str, Any] = {
+            "tool_name": tool_name,
+            "schema_version": schema_version,
+            "arguments": arguments,
+        }
+        return (
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            idempotency_key,
+            "tool_call",
+        )
+    if kind == "instruction":
+        action = body.get("action")
+        if action == "ack":
+            instruction_ids = body.get("instruction_ids")
+            if not isinstance(instruction_ids, list) or not instruction_ids:
+                raise ValueError("an ack requires a non-empty instruction_ids list")
+            payload = {"action": "ack", "instruction_ids": instruction_ids}
+        elif action == "pull":
+            payload = {"action": "pull"}
+        else:
+            raise ValueError("instruction action must be ack or pull")
+        return (
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            None,
+            "instruction",
+        )
+    raise ValueError("kind must be tool_call or instruction")
+
+
 def _install_routes(
     application: FastAPI,
     *,
@@ -619,6 +920,7 @@ def _install_routes(
     settings: Any,
     session_factory: Any,
     instruction_delivery: InstructionDeliveryService,
+    host_sessions: Any | None,
 ) -> None:
     @application.get("/api/health")
     async def health() -> dict[str, str]:
@@ -633,7 +935,9 @@ def _install_routes(
             "vt_download_calls": virus_total.download_calls,
             "vt_downloaded_hashes": list(virus_total.downloaded_hashes),
         }
-        payload["investigations"] = await _investigation_diagnostics(uow_factory, state=state)
+        payload["investigations"] = await _investigation_diagnostics(
+            uow_factory, state=state, host_sessions=host_sessions
+        )
         return payload
 
     @application.post("/__m24_browser/drain-instructions")
@@ -644,6 +948,40 @@ def _install_routes(
                 return {"granted": False, "drained": False}
             report = await delivery.drain_once(limit=settings.m24_instruction_drain_batch_size)
         return {"granted": True, "drained": True, **report.to_payload()}
+
+    @application.post("/__m24_browser/signed-session-action")
+    async def signed_session_action(body: dict[str, Any]) -> dict[str, Any]:
+        """Play the host shim for one D7 signed call without exposing the secret."""
+        try:
+            session_id = UUID(str(body.get("session_id")))
+            investigation_id = UUID(str(body.get("investigation_id")))
+            raw_body, idempotency_key, kind = _signed_action_request(body)
+        except (TypeError, ValueError) as exc:
+            return {"status_code": 422, "body": {"detail": str(exc)}}
+        secret = await session_secret(uow_factory, session_id)
+        if kind == "tool_call":
+            path = f"/api/investigations/{investigation_id}/agent-sessions/{session_id}/tool-calls"
+        else:
+            path = (
+                f"/api/investigations/{investigation_id}/agent-sessions/{session_id}/instructions"
+            )
+        headers = _signed_session_headers(
+            secret=secret,
+            session_id=session_id,
+            path_and_query=path,
+            body=raw_body.encode("utf-8"),
+            idempotency_key=idempotency_key,
+        )
+        asgi_transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(
+            transport=asgi_transport, base_url="http://m24-browser.internal"
+        ) as client:
+            response = await client.post(path, content=raw_body.encode("utf-8"), headers=headers)
+        try:
+            payload: Any = response.json()
+        except json.JSONDecodeError:
+            payload = {"text": response.text}
+        return {"status_code": response.status_code, "body": payload}
 
     @application.post("/__m24_browser/shutdown")
     async def request_shutdown() -> dict[str, str]:
@@ -743,8 +1081,10 @@ async def _serve() -> None:
                 return SqlAlchemyUnitOfWork(session_factory)
 
             # The H1 fake profiles must be registered before the sidecar's
-            # supervisor snapshots its registry at agent start.
-            install_fake_cli_profiles(patcher)
+            # supervisor snapshots its registry at agent start.  The ``success``
+            # scenario ends each run cleanly, which is the host's technical
+            # receive point for a queued session instruction (ID-2 drain).
+            install_fake_cli_profiles(patcher, scenario="success")
             agent = stack.enter_context(running_scenario_agent())
             if shutdown_requested.is_set():
                 return
@@ -810,6 +1150,9 @@ async def _serve() -> None:
                 uow_factory=uow_factory,
                 artifact_store=artifact_store,
                 material=material,
+                # Two rendered anchors share the tail text: the note journey
+                # proves the canonical selector exposes real occurrences.
+                duplicate_analysis_paragraph=True,
             )
             state = BrowserState(
                 subject_id=seeded.subject.id,
@@ -840,6 +1183,7 @@ async def _serve() -> None:
                 settings=settings,
                 session_factory=session_factory,
                 instruction_delivery=instruction_delivery,
+                host_sessions=session_runtime.host_sessions,
             )
 
             config = uvicorn.Config(
