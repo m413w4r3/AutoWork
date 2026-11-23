@@ -20,7 +20,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Self, cast
 from uuid import UUID, uuid4
 
 import httpx
@@ -106,12 +106,21 @@ OPERATOR_ID = "operator:test"
 _ARGUMENTS = {"query": "sample hash"}
 
 
+def _test_clock() -> datetime:
+    return NOW
+
+
 def _fixture(*, external_allowed: bool = True) -> _Fixture:
     return _Fixture(
         responses=[],
         external_allowed=external_allowed,
         tools=(("vt.file_report", "vt"),),
     )
+
+
+def _task_repository() -> InMemoryInvestigationTaskRepository:
+    """Use the same fixed test clock as the broker for lease checks."""
+    return InMemoryInvestigationTaskRepository(clock=_test_clock)
 
 
 def _advisor_fixture() -> _Fixture:
@@ -144,10 +153,9 @@ def _running_task(
         lease_id=uuid4(),
         lease_session_id=session_id,
         lease_fence=fence,
-        # The in-memory repository and the signed routes compare the lease
-        # against the real clock, so a module-import anchor would already be
-        # expired when the suite collects this module long before running it.
-        lease_expires_at=expires_at or datetime.now(UTC) + timedelta(seconds=180),
+        # Lease creation and broker/database revalidation share one injected
+        # clock, so test behavior does not depend on when pytest runs this file.
+        lease_expires_at=expires_at or NOW + timedelta(seconds=180),
         heartbeat_at=heartbeat_at or NOW,
     )
 
@@ -292,7 +300,7 @@ def _broker(
         invocations=_service(fixture),
         handoffs=handoffs,
         task_limits=TASK_LIMIT_DEFAULTS,
-        clock=lambda: NOW,
+        clock=_test_clock,
         commit=uow.commit,
     )
     return broker, uow
@@ -312,7 +320,7 @@ async def _invocations(fixture: _Fixture) -> tuple[ToolInvocation, ...]:
 async def test_broker_delegates_invocation_journal_and_attributes_task_session() -> None:
     fixture = _fixture()
     await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
-    tasks = InMemoryInvestigationTaskRepository()
+    tasks = _task_repository()
     sessions = InMemoryAgentSessionRepository()
     task, session_id, _secret = await _seed_agent_session(fixture, tasks, sessions)
     broker, _uow = _broker(fixture, tasks, sessions)
@@ -340,7 +348,7 @@ async def test_broker_delegates_invocation_journal_and_attributes_task_session()
 async def test_broker_refuses_missing_or_stale_lease() -> None:
     fixture = _fixture()
     await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
-    tasks = InMemoryInvestigationTaskRepository()
+    tasks = _task_repository()
     sessions = InMemoryAgentSessionRepository()
     task, session_id, _secret = await _seed_agent_session(fixture, tasks, sessions)
     broker, _uow = _broker(fixture, tasks, sessions)
@@ -419,7 +427,7 @@ def test_broker_key_includes_task_and_fence() -> None:
 async def test_broker_refuses_opinion_tools_server_side() -> None:
     fixture = _fixture()
     await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
-    tasks = InMemoryInvestigationTaskRepository()
+    tasks = _task_repository()
     sessions = InMemoryAgentSessionRepository()
     task, session_id, _secret = await _seed_agent_session(fixture, tasks, sessions)
     broker, _uow = _broker(fixture, tasks, sessions)
@@ -443,7 +451,7 @@ async def test_broker_refuses_opinion_tools_server_side() -> None:
 async def test_broker_refuses_tool_outside_catalogue() -> None:
     fixture = _fixture()
     await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
-    tasks = InMemoryInvestigationTaskRepository()
+    tasks = _task_repository()
     sessions = InMemoryAgentSessionRepository()
     task, session_id, _secret = await _seed_agent_session(fixture, tasks, sessions)
     broker, _uow = _broker(fixture, tasks, sessions)
@@ -466,7 +474,7 @@ async def test_broker_refuses_tool_outside_catalogue() -> None:
 async def test_broker_replays_same_client_key_without_second_dispatch() -> None:
     fixture = _fixture()
     await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
-    tasks = InMemoryInvestigationTaskRepository()
+    tasks = _task_repository()
     sessions = InMemoryAgentSessionRepository()
     task, session_id, _secret = await _seed_agent_session(fixture, tasks, sessions)
     broker, _uow = _broker(fixture, tasks, sessions)
@@ -495,10 +503,23 @@ async def test_broker_replays_same_client_key_without_second_dispatch() -> None:
 
 
 @pytest.mark.asyncio
-async def test_broker_changed_fence_cannot_replay_older_invocation() -> None:
+async def test_broker_changed_fence_cannot_replay_older_invocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DelayedWallClock(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> Self:
+            shifted = super().now(tz) + timedelta(minutes=11)
+            return cls.fromtimestamp(shifted.timestamp(), tz)
+
+    # Recreate a long delay between this module's import-time NOW and the
+    # broker's persisted revalidation without sleeping in the test.
+    monkeypatch.setattr("tests.test_agentic_tool_broker.datetime", DelayedWallClock)
+    monkeypatch.setattr("cti_app.application.investigation_persistence.datetime", DelayedWallClock)
+
     fixture = _fixture()
     await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
-    tasks = InMemoryInvestigationTaskRepository()
+    tasks = _task_repository()
     sessions = InMemoryAgentSessionRepository()
     task, session_id, _secret = await _seed_agent_session(fixture, tasks, sessions)
     broker, _uow = _broker(fixture, tasks, sessions)
@@ -537,7 +558,7 @@ async def test_broker_changed_fence_cannot_replay_older_invocation() -> None:
 async def test_broker_propagates_g2_refusal_without_provider_call() -> None:
     fixture = _fixture(external_allowed=False)
     await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
-    tasks = InMemoryInvestigationTaskRepository()
+    tasks = _task_repository()
     sessions = InMemoryAgentSessionRepository()
     task, session_id, _secret = await _seed_agent_session(fixture, tasks, sessions)
     broker, _uow = _broker(fixture, tasks, sessions)
@@ -561,7 +582,7 @@ async def test_broker_propagates_g2_refusal_without_provider_call() -> None:
 async def test_broker_never_resubmits_ambiguous_advisor_consult() -> None:
     fixture = _advisor_fixture()
     await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
-    tasks = InMemoryInvestigationTaskRepository()
+    tasks = _task_repository()
     sessions = InMemoryAgentSessionRepository()
     task, session_id, _secret = await _seed_agent_session(fixture, tasks, sessions)
     broker, _uow = _broker(fixture, tasks, sessions)
@@ -614,7 +635,7 @@ async def test_broker_never_resubmits_ambiguous_advisor_consult() -> None:
 async def test_broker_refuses_expired_lease_mid_call() -> None:
     fixture = _fixture()
     await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
-    tasks = InMemoryInvestigationTaskRepository()
+    tasks = _task_repository()
     sessions = InMemoryAgentSessionRepository()
     task, session_id, _secret = await _seed_agent_session(fixture, tasks, sessions)
     broker, _uow = _broker(fixture, tasks, sessions)
@@ -652,7 +673,7 @@ async def test_broker_refuses_a_lease_expiring_exactly_at_the_check() -> None:
     """The deadline is inclusive: ``lease_expires_at == now`` is already stale."""
     fixture = _fixture()
     await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
-    tasks = InMemoryInvestigationTaskRepository()
+    tasks = _task_repository()
     sessions = InMemoryAgentSessionRepository()
     # The broker under test runs on the frozen NOW clock, so pin the deadline on it.
     task, session_id, _secret = await _seed_agent_session(
@@ -685,7 +706,7 @@ async def test_broker_refuses_a_lease_expiring_exactly_at_the_check() -> None:
 async def test_broker_maps_task_commands_to_the_engine() -> None:
     fixture = _fixture()
     await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
-    tasks = InMemoryInvestigationTaskRepository()
+    tasks = _task_repository()
     sessions = InMemoryAgentSessionRepository()
     task, session_id, _secret = await _seed_agent_session(fixture, tasks, sessions)
     broker, uow = _broker(fixture, tasks, sessions)
@@ -730,7 +751,7 @@ async def test_broker_submit_result_flushes_the_host_release_after_commit() -> N
     """B2: the broker closes a leased session and must stop its host after commit."""
     fixture = _fixture()
     await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
-    tasks = InMemoryInvestigationTaskRepository()
+    tasks = _task_repository()
     sessions = InMemoryAgentSessionRepository()
     task, session_id, _secret = await _seed_agent_session(fixture, tasks, sessions)
     uow = _BrokerUnitOfWork(fixture, tasks, sessions)
@@ -752,7 +773,7 @@ async def test_broker_submit_result_flushes_the_host_release_after_commit() -> N
         invocations=_service(fixture),
         handoffs=None,
         task_limits=TASK_LIMIT_DEFAULTS,
-        clock=lambda: NOW,
+        clock=_test_clock,
         commit=commit,
         release_host=release,
     )
@@ -781,7 +802,7 @@ async def test_broker_submit_result_flushes_the_host_release_after_commit() -> N
 async def test_broker_maps_handoff_submit_to_the_session_task() -> None:
     fixture = _fixture()
     await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
-    tasks = InMemoryInvestigationTaskRepository()
+    tasks = _task_repository()
     sessions = InMemoryAgentSessionRepository()
     task, session_id, _secret = await _seed_agent_session(fixture, tasks, sessions)
 
@@ -829,7 +850,7 @@ async def test_broker_maps_handoff_submit_to_the_session_task() -> None:
 async def test_broker_refuses_handoff_for_another_task() -> None:
     fixture = _fixture()
     await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
-    tasks = InMemoryInvestigationTaskRepository()
+    tasks = _task_repository()
     sessions = InMemoryAgentSessionRepository()
     task, session_id, _secret = await _seed_agent_session(fixture, tasks, sessions)
     broker, _uow = _broker(fixture, tasks, sessions)
@@ -962,7 +983,7 @@ def _signed_headers(
 async def test_signed_tool_call_route_attributes_and_refuses_token_alone() -> None:
     fixture = _fixture()
     await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
-    tasks = InMemoryInvestigationTaskRepository()
+    tasks = _task_repository()
     sessions = InMemoryAgentSessionRepository()
     task = _running_task(fixture.investigation_id, uuid4())
     session_row, secret = _session_row(fixture.investigation_id, task)
@@ -1020,7 +1041,7 @@ async def test_signed_tool_call_route_attributes_and_refuses_token_alone() -> No
 async def test_tool_call_route_is_fail_closed_without_server_key() -> None:
     fixture = _fixture()
     await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
-    tasks = InMemoryInvestigationTaskRepository()
+    tasks = _task_repository()
     sessions = InMemoryAgentSessionRepository()
     task = _running_task(fixture.investigation_id, uuid4())
     session_row, secret = _session_row(fixture.investigation_id, task)
@@ -1061,7 +1082,7 @@ async def test_tool_call_route_is_fail_closed_without_server_key() -> None:
 async def test_broker_refuses_an_inactive_or_unbound_session_row() -> None:
     fixture = _fixture()
     await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
-    tasks = InMemoryInvestigationTaskRepository()
+    tasks = _task_repository()
     sessions = InMemoryAgentSessionRepository()
     session_id = uuid4()
     task = _running_task(fixture.investigation_id, session_id)
@@ -1235,7 +1256,7 @@ async def test_broker_runs_confined_script_with_task_session_attribution() -> No
         ),
     )
     await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
-    tasks = InMemoryInvestigationTaskRepository()
+    tasks = _task_repository()
     sessions = InMemoryAgentSessionRepository()
     task, session_id, _secret = await _seed_agent_session(fixture, tasks, sessions)
     broker, _uow = _broker(fixture, tasks, sessions)
@@ -1284,7 +1305,7 @@ async def test_broker_contribution_import_attributes_task_fence_and_emits_event(
         handoffs=None,
         contributions=harness.service,
         notes=None,
-        clock=lambda: NOW,
+        clock=_test_clock,
         commit=uow.commit,
     )
     session = _verified(session_id, harness.investigation_id, task)
@@ -1333,7 +1354,7 @@ async def test_broker_contribution_import_attributes_task_fence_and_emits_event(
 async def test_broker_note_capture_publishes_agent_note_under_task_subtree() -> None:
     fixture = _fixture()
     await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
-    tasks = InMemoryInvestigationTaskRepository()
+    tasks = _task_repository()
     sessions = InMemoryAgentSessionRepository()
     task, session_id, _secret = await _seed_agent_session(fixture, tasks, sessions)
     bindings = InMemoryWorkspaceBindingRepository()
@@ -1363,7 +1384,7 @@ async def test_broker_note_capture_publishes_agent_note_under_task_subtree() -> 
         handoffs=None,
         contributions=None,
         notes=notes,
-        clock=lambda: NOW,
+        clock=_test_clock,
         commit=uow.commit,
     )
     session = _verified(session_id, fixture.investigation_id, task)
