@@ -28,6 +28,7 @@ import type {
   BootstrapSnapshotV1,
   IOCInventoryV1,
 } from "../../src/features/investigation/api/bootstrap";
+import type { ArticleAnchorCatalogViewV1 } from "../../src/features/investigation/api/articleAnchors";
 import type {
   BudgetDimension,
   OperatorAdapterKind,
@@ -1469,6 +1470,48 @@ function opinionPayload(): OpinionReadPayloadV1 {
   };
 }
 
+/** Canonical anchor space the note picker reads; base matches the opinion pin. */
+function articleAnchorCatalog(): ArticleAnchorCatalogViewV1 {
+  return {
+    base_publication_artifact_id: ids.synthesis,
+    base_publication_version: 3,
+    base_publication_sha256: SHA.proposal,
+    source: "pinned_opinion_base",
+    anchors: [
+      {
+        anchor: "lead:0001",
+        text: "Le chapô observe un service de commande.",
+        text_sha256: SHA.content,
+        section_index: null,
+        paragraph_index: 0,
+      },
+      {
+        anchor: "section:2:paragraph:0007",
+        text: "La section documente une persistance.",
+        text_sha256: SHA.note,
+        section_index: 2,
+        paragraph_index: 6,
+      },
+      {
+        anchor: "lead:0002",
+        text: "Un paragraphe dupliqué pour prouver l’occurrence.",
+        text_sha256: SHA.proposed,
+        section_index: null,
+        paragraph_index: 1,
+      },
+      {
+        anchor: "lead:0003",
+        text: "Un paragraphe dupliqué pour prouver l’occurrence.",
+        text_sha256: SHA.proposed,
+        section_index: null,
+        paragraph_index: 2,
+      },
+    ],
+    elements: [],
+    truncated: false,
+  };
+}
+
 function noteProposal(stale: boolean): NoteProposalViewV1 {
   return {
     id: ids.proposal,
@@ -1492,6 +1535,10 @@ function noteProposal(stale: boolean): NoteProposalViewV1 {
     tool_invocation_id: ids.bridgeInvocation,
     base_opinion_version: 3,
     base_opinion_sha256: SHA.synthesis,
+    base_publication_artifact_id: ids.synthesis,
+    base_publication_version: 3,
+    base_publication_sha256: SHA.proposal,
+    anchor_before_sha256: SHA.content,
     status: stale ? "stale" : "proposed",
     status_version: stale ? 5 : 4,
     accepted_opinion_version: null,
@@ -2129,6 +2176,9 @@ export function createWorkshopApi(options: WorkshopApiOptions = {}) {
 
     if (path === inv("/opinion") && method === "GET") {
       return fulfill(route, opinionPayload());
+    }
+    if (path === inv("/article-anchors") && method === "GET") {
+      return fulfill(route, articleAnchorCatalog());
     }
     if (
       path === `/api/opinions/${ids.opinion}/preview.pdf` &&

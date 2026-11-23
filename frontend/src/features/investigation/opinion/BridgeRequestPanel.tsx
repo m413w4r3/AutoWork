@@ -1,9 +1,11 @@
+import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 
 import type {
   InvestigationFinding,
   InvestigationObservation,
 } from "../../../api/investigation";
+import { articleAnchorsKeys } from "../api/articleAnchors";
 import {
   useRequestNoteProposal,
   type AnalystObservationRelation,
@@ -12,8 +14,9 @@ import {
   type ProseOpinionBlockType,
 } from "../api/opinionProposals";
 import type { TaskView } from "../api/tasks";
+import { AnchorPicker } from "./AnchorPicker";
 import { ANCHOR_EXAMPLES, classifyAnchor } from "./anchor";
-import { describeApiError } from "./errors";
+import { describeApiError, isAnchorReloadError } from "./errors";
 import {
   DRAFTING_INTENTS,
   buildDraftingQuestion,
@@ -27,13 +30,25 @@ import {
   FINDING_KIND_LABELS,
   NOTE_RELATION_LABELS,
   NOTE_STATE_LABELS,
-  TARGET_BLOCK_LABELS,
   truncate,
 } from "./labels";
 import type { AnalystNoteV1, OpinionVersionV1 } from "./types";
 
 function toggle(list: string[], id: string): string[] {
   return list.includes(id) ? list.filter((item) => item !== id) : [...list, id];
+}
+
+/**
+ * F1 task-card links open this view as
+ * `?vue=opinion&task_id=<id>&bridge_intent=draft_text|review_text`.
+ * Only these two values are canonical; anything else falls back to drafting.
+ */
+function bridgeIntentFromParam(value: string | null): DraftingIntent {
+  return value === "review_text" ? "verifier" : "rediger";
+}
+
+function searchParam(name: string): string | null {
+  return new URL(window.location.href).searchParams.get(name);
 }
 
 export function BridgeRequestPanel({
@@ -65,8 +80,14 @@ export function BridgeRequestPanel({
   onBlockTypeChange: (blockType: ProseOpinionBlockType) => void;
   onRequested: (proposalId: string) => void;
 }) {
+  const queryClient = useQueryClient();
   const request = useRequestNoteProposal(investigationId);
-  const [intent, setIntent] = useState<DraftingIntent>("rediger");
+  // A task-card link pre-fills the request; the URL is read once at mount so a
+  // later manual change is never overwritten.
+  const [requestedTaskId] = useState(() => searchParam("task_id") ?? "");
+  const [intent, setIntent] = useState<DraftingIntent>(() =>
+    bridgeIntentFromParam(searchParam("bridge_intent")),
+  );
   const [findingRefs, setFindingRefs] = useState<string[]>([]);
   const [observationRefs, setObservationRefs] = useState<string[]>([]);
   const [taskId, setTaskId] = useState("");
@@ -81,10 +102,23 @@ export function BridgeRequestPanel({
   const selectedIntent = getDraftingIntent(intent);
 
   useEffect(() => {
-    if (selectedIntent.requiresCurrentBridgeNote && !reviewAvailable) {
+    if (requestedTaskId === "" || taskId !== "") return;
+    if (tasks.some((task) => task.id === requestedTaskId)) {
+      setTaskId(requestedTaskId);
+    }
+  }, [requestedTaskId, taskId, tasks]);
+
+  useEffect(() => {
+    // The anchor is selected asynchronously; until one is chosen the note
+    // existence is unknown, so a requested review intent is not discarded.
+    if (
+      selectedIntent.requiresCurrentBridgeNote &&
+      !reviewAvailable &&
+      anchor !== ""
+    ) {
       setIntent("rediger");
     }
-  }, [reviewAvailable, selectedIntent.requiresCurrentBridgeNote]);
+  }, [anchor, reviewAvailable, selectedIntent.requiresCurrentBridgeNote]);
 
   const sourcesMissing =
     noteState !== "unresolved" &&
@@ -138,7 +172,11 @@ export function BridgeRequestPanel({
     });
   }
 
-  const knownAnchors = [...new Set(notes.map((note) => note.anchor))];
+  function reloadAnchors() {
+    void queryClient.invalidateQueries({
+      queryKey: articleAnchorsKeys.all(investigationId),
+    });
+  }
 
   return (
     <section className="job-card" aria-labelledby="opinion-bridge-request">
@@ -149,28 +187,13 @@ export function BridgeRequestPanel({
         Bridge pourra être accepté, et uniquement par une décision humaine.
       </p>
 
-      <label htmlFor="opinion-note-anchor">Ancre cible</label>
-      <input
-        id="opinion-note-anchor"
-        list="opinion-note-anchor-options"
-        value={anchor}
-        onChange={(event) => onAnchorChange(event.currentTarget.value)}
-        aria-describedby="opinion-note-anchor-help"
+      <AnchorPicker
+        investigationId={investigationId}
+        anchor={anchor}
+        onAnchorChange={onAnchorChange}
+        notes={notes}
+        proposal={request.data?.proposal ?? null}
       />
-      <datalist id="opinion-note-anchor-options">
-        {knownAnchors.map((item) => (
-          <option key={item} value={item} />
-        ))}
-      </datalist>
-      <p id="opinion-note-anchor-help">
-        {ANCHOR_EXAMPLES}.{" "}
-        {targetType === null
-          ? "Ancre invalide."
-          : `Espace d’ancrage : ${TARGET_BLOCK_LABELS[targetType]}.`}{" "}
-        Le contrat n’expose aucune lecture des <code>publication_anchors</code>{" "}
-        : la liste ci-dessus reprend les ancres déjà présentes dans l’avis, et
-        la saisie libre reste validée côté serveur à la soumission.
-      </p>
 
       <label htmlFor="opinion-note-block">Bloc de l’avis visé</label>
       <select
@@ -310,11 +333,24 @@ export function BridgeRequestPanel({
         </p>
       ) : null}
       {request.isError ? (
-        <p className="error-message" role="alert">
-          Impossible de demander la proposition :{" "}
-          {describeApiError(request.error).message} · code :{" "}
-          {describeApiError(request.error).code}
-        </p>
+        <>
+          <p className="error-message" role="alert">
+            Impossible de demander la proposition :{" "}
+            {describeApiError(request.error).message} · code :{" "}
+            {describeApiError(request.error).code}
+          </p>
+          {isAnchorReloadError(request.error) ? (
+            <div className="verification-warning" role="alert">
+              <p>
+                L’ancre ou la base de publication a changé. Rechargez les ancres
+                avant de redemander une proposition.
+              </p>
+              <button type="button" onClick={reloadAnchors}>
+                Recharger les ancres
+              </button>
+            </div>
+          ) : null}
+        </>
       ) : null}
       {request.isPending ? (
         <p role="status" aria-live="polite">

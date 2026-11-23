@@ -37,11 +37,25 @@ const MESSAGES: Record<string, string> = {
   stale_version:
     "Version périmée : une version plus récente existe. Rechargement des données…",
   stale_base:
-    "La version de base de la proposition est périmée. Rechargement des données…",
+    "La base de publication a changé depuis la proposition. Rechargez les ancres et la proposition.",
   version_hash_mismatch:
     "La version et le hash ne correspondent pas à la proposition affichée.",
   invalid_note_anchor:
-    "Ancre invalide ou absente de l’article courant (lead:NNNN ou section:I:paragraph:NNNN).",
+    "Ancre invalide ou absente de la base de publication (lead:NNNN ou section:I:paragraph:NNNN). Rechargez les ancres.",
+  invalid_observation_anchor:
+    "Ancre absente de la base de publication épinglée de l’avis. Rechargez les ancres avant de redemander.",
+  note_anchor_text_changed:
+    "Le texte du paragraphe ciblé a changé depuis la proposition. Rechargez les ancres et la proposition.",
+  note_block_ref_stale:
+    "Un élément d’article référencé a changé (hash ou ancre). Rechargez les ancres et la proposition.",
+  note_code_ref_stale:
+    "Une référence de code ne correspond plus aux octets de l’observation. Rechargez la proposition.",
+  note_chart_without_evidence:
+    "Un graphique référencé ne porte pas de preuve. Rechargez la proposition et faites-la réviser.",
+  note_figure_source_missing:
+    "Une figure référencée n’a pas de source connue dans le document. Rechargez la proposition.",
+  note_ioc_ref_unresolved:
+    "Une référence IOC ne résout aucune observation de cette enquête. Rechargez la proposition.",
   invalid_note_target: "Le type de bloc cible ne correspond pas à l’ancre.",
   invalid_note_citation:
     "Une référence citée est invalide ou n’appartient pas à cette enquête.",
@@ -111,6 +125,23 @@ export function isStaleProposalError(error: unknown): boolean {
 
 export function isBridgeAcknowledgementError(error: unknown): boolean {
   return describeApiError(error).code === "bridge_drafting_ack_required";
+}
+
+/**
+ * Refusals that invalidate the displayed anchor space or its pinned base: the
+ * picker must be reloaded before another drafting request.
+ */
+const ANCHOR_RELOAD_CODES = new Set<string>([
+  "invalid_note_anchor",
+  "invalid_observation_anchor",
+  "note_anchor_text_changed",
+  "note_block_ref_stale",
+  "note_code_ref_stale",
+  "stale_base",
+]);
+
+export function isAnchorReloadError(error: unknown): boolean {
+  return ANCHOR_RELOAD_CODES.has(describeApiError(error).code);
 }
 
 /**

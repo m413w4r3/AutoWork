@@ -44,6 +44,13 @@ export type NoteProposalErrorCode =
   | CommonErrorCode
   | "note_proposal_not_found"
   | "invalid_note_anchor"
+  | "invalid_observation_anchor"
+  | "note_anchor_text_changed"
+  | "note_block_ref_stale"
+  | "note_code_ref_stale"
+  | "note_chart_without_evidence"
+  | "note_figure_source_missing"
+  | "note_ioc_ref_unresolved"
   | "invalid_note_target"
   | "invalid_note_citation"
   | "advisory_observation_not_evidence"
@@ -94,6 +101,11 @@ export interface NoteProposalViewV1 {
   tool_invocation_id: Uuid | null;
   base_opinion_version: number | null;
   base_opinion_sha256: string | null;
+  /** Exact publication base and paragraph text pinned by the request. */
+  base_publication_artifact_id: Uuid | null;
+  base_publication_version: number | null;
+  base_publication_sha256: string | null;
+  anchor_before_sha256: string | null;
   status: NoteProposalStatus;
   status_version: number;
   accepted_opinion_version: number | null;
