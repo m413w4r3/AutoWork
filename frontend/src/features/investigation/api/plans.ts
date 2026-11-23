@@ -110,6 +110,8 @@ export interface PlanRequestInput {
   expected_version: number;
   expected_sha256?: string;
   question?: string;
+  /** Optional bounded task context (migration 0028); never evidence. */
+  context_task_id?: Uuid;
 }
 
 export interface PlanRequestResponseV1 {
@@ -316,12 +318,22 @@ export function useConsultationLedger(
   });
 }
 
+export interface PlanRequestMutationVariables {
+  input: PlanRequestInput;
+  /** Supplied by the panel to freeze one key per request body. */
+  idempotencyKey?: string;
+}
+
 /** Invalidation: a new plan version appends to the list and the ledger. */
 export function useRequestPlan(investigationId: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (input: PlanRequestInput) =>
-      requestPlan(investigationId, input, createIdempotencyKey()),
+    mutationFn: ({ input, idempotencyKey }: PlanRequestMutationVariables) =>
+      requestPlan(
+        investigationId,
+        input,
+        idempotencyKey ?? createIdempotencyKey(),
+      ),
     onSuccess: () => {
       void queryClient.invalidateQueries({
         queryKey: plansKeys.all(investigationId),

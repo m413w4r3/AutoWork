@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -12,7 +12,7 @@ import {
   wrapperFor,
 } from "../api/testSupport";
 import { PlanPanel } from "./PlanPanel";
-import { INVESTIGATION_ID } from "../tasks/testFixtures";
+import { INVESTIGATION_ID, makeTask } from "../tasks/testFixtures";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -154,6 +154,138 @@ describe("PlanPanel request", () => {
       question: "Priorise le PCAP.",
     });
     expect(headersOf(request.init)["Idempotency-Key"]).toBeTruthy();
+  });
+});
+
+describe("PlanPanel task context", () => {
+  it("envoie la tâche choisie comme contexte et rejoue la même clé après un échec réseau", async () => {
+    const user = userEvent.setup();
+    const task = makeTask();
+    let submits = 0;
+    const recorder = installFetch(({ url, init }) => {
+      const method = init?.method ?? "GET";
+      if (url.endsWith(`/api/investigations/${INVESTIGATION_ID}`)) {
+        return jsonResponse({ version: 7 });
+      }
+      if (url.endsWith("/plans/request") && method === "POST") {
+        submits += 1;
+        if (submits === 1) throw new TypeError("Failed to fetch");
+        return jsonResponse({
+          investigation_id: INVESTIGATION_ID,
+          invocation_id: INVOCATION_ID,
+          invocation_status: "succeeded",
+          idempotent_replay: false,
+          advisor_parse_status: "parsed",
+          plan_parse_status: "parsed",
+          plan_version_id: PLAN_V2_ID,
+          plan_version: 2,
+          missing_fields: [],
+          advice_only: false,
+        });
+      }
+      if (url.endsWith("/plans")) {
+        return jsonResponse({ current_version: null, plans: [] });
+      }
+      if (url.endsWith("/consultations")) {
+        return jsonResponse({
+          investigation_id: INVESTIGATION_ID,
+          consultations: [],
+        });
+      }
+      if (url.endsWith("/tasks")) {
+        return jsonResponse({ items: [task], total: 1 });
+      }
+      return errorResponse(500, "unexpected_request");
+    });
+
+    renderPanel();
+
+    await screen.findByRole("option", {
+      name: `${task.task_key} · ${task.title}`,
+    });
+    await user.selectOptions(
+      screen.getByLabelText(/Tâche de contexte/),
+      task.id,
+    );
+    await user.type(
+      screen.getByLabelText(/Question facultative pour Bridge/),
+      "Réviser le plan pour cette tâche.",
+    );
+    await user.click(
+      screen.getByRole("button", { name: "Demander un plan à Bridge" }),
+    );
+
+    expect(await screen.findByText("État inconnu.")).toBeVisible();
+    await user.click(
+      screen.getByRole("button", { name: "Vérifier le registre" }),
+    );
+    await user.click(
+      screen.getByRole("button", { name: "Réessayer avec la même clé" }),
+    );
+
+    expect(
+      await screen.findByText(/Version 2 du plan enregistrée/),
+    ).toBeVisible();
+    const requests = recorder.calls.filter(
+      (call) =>
+        call.url.endsWith("/plans/request") && call.init?.method === "POST",
+    );
+    expect(requests).toHaveLength(2);
+    const first = requests[0];
+    const second = requests[1];
+    if (first === undefined || second === undefined) {
+      throw new Error("plan request was not sent twice");
+    }
+    expect(headersOf(first.init)["Idempotency-Key"]).toBeTruthy();
+    expect(headersOf(second.init)["Idempotency-Key"]).toBe(
+      headersOf(first.init)["Idempotency-Key"],
+    );
+    expect(bodyOf(second.init)).toEqual(bodyOf(first.init));
+    expect(bodyOf(first.init)).toEqual({
+      expected_version: 7,
+      question: "Réviser le plan pour cette tâche.",
+      context_task_id: task.id,
+    });
+  });
+
+  it("présélectionne la tâche de contexte quand le lien de la carte navigue", async () => {
+    const task = makeTask();
+    installFetch(({ url }) => {
+      if (url.endsWith(`/api/investigations/${INVESTIGATION_ID}`)) {
+        return jsonResponse({ version: 7 });
+      }
+      if (url.endsWith("/plans")) {
+        return jsonResponse({ current_version: null, plans: [] });
+      }
+      if (url.endsWith("/consultations")) {
+        return jsonResponse({
+          investigation_id: INVESTIGATION_ID,
+          consultations: [],
+        });
+      }
+      if (url.endsWith("/tasks")) {
+        return jsonResponse({ items: [task], total: 1 });
+      }
+      return errorResponse(500, "unexpected_request");
+    });
+
+    try {
+      renderPanel();
+      await screen.findByRole("option", {
+        name: `${task.task_key} · ${task.title}`,
+      });
+
+      window.history.pushState({}, "", `/?vue=plan&context_task_id=${task.id}`);
+      act(() => {
+        window.dispatchEvent(new PopStateEvent("popstate"));
+      });
+
+      await waitFor(() =>
+        expect(screen.getByLabelText(/Tâche de contexte/)).toHaveValue(task.id),
+      );
+    } finally {
+      window.history.pushState({}, "", "/");
+    }
   });
 });
 

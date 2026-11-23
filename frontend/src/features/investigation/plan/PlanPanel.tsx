@@ -8,14 +8,18 @@
  * stays an advisory answer and is labelled "avis, non preuve".
  */
 
-import { useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 
 import {
   investigationQueryKeys,
   useInvestigation,
 } from "../../../api/investigation";
-import { toWorkshopApiError, type WorkshopApiError } from "../api/client";
+import {
+  createIdempotencyKey,
+  toWorkshopApiError,
+  type WorkshopApiError,
+} from "../api/client";
 import {
   useAcceptPlan,
   useConsultationLedger,
@@ -25,6 +29,7 @@ import {
   useRequestPlan,
   type InvestigationLeadV1,
   type PlanParseStatus,
+  type PlanRequestInput,
 } from "../api/plans";
 import { useTasks } from "../api/tasks";
 import { CONSULTATION_LABELS } from "../opinion/labels";
@@ -131,6 +136,16 @@ export function PlanPanel({ investigationId }: { investigationId: string }) {
   const [reason, setReason] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [contextTaskId, setContextTaskId] = useState(
+    () =>
+      new URL(window.location.href).searchParams.get("context_task_id") ?? "",
+  );
+  const [unknownState, setUnknownState] = useState(false);
+  const frozenRequest = useRef<{
+    formSignature: string;
+    input: PlanRequestInput;
+    idempotencyKey: string;
+  } | null>(null);
 
   const currentPlan =
     plans.data?.plans.find((summary) => summary.current) ?? null;
@@ -153,6 +168,31 @@ export function PlanPanel({ investigationId }: { investigationId: string }) {
     linkedTasks.length === 0;
   const acceptDisabled = !canAccept || !confirmAccept || accept.isPending;
 
+  // A `context_task_id` query parameter comes from the task card link. Drop it
+  // once the task list proves the id unknown instead of sending a 404.
+  useEffect(() => {
+    if (contextTaskId === "" || tasks.data === undefined) return;
+    if (!tasks.data.items.some((task) => task.id === contextTaskId)) {
+      setContextTaskId("");
+    }
+  }, [contextTaskId, tasks.data]);
+
+  useEffect(() => {
+    if (tasks.isError) setContextTaskId("");
+  }, [tasks.isError]);
+
+  // The task card link navigates with `popstate` while this view may already
+  // be mounted; the URL parameter stays the source of truth for the link.
+  useEffect(() => {
+    const handlePopState = () => {
+      setContextTaskId(
+        new URL(window.location.href).searchParams.get("context_task_id") ?? "",
+      );
+    };
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, []);
+
   function fail(error: unknown) {
     const apiError = toWorkshopApiError(error);
     setMessage(null);
@@ -164,6 +204,27 @@ export function PlanPanel({ investigationId }: { investigationId: string }) {
     }
   }
 
+  function handleRequestError(error: unknown) {
+    const apiError = toWorkshopApiError(error);
+    fail(apiError);
+    if (apiError.code === "network_error" || apiError.status === 0) {
+      // The plan may have been persisted before the transport failed: keep the
+      // frozen body/key and let the human check the registry.
+      setUnknownState(true);
+      return;
+    }
+    // A typed refusal proves no version was written; the next attempt re-reads
+    // the working state and mints a new key.
+    setUnknownState(false);
+    frozenRequest.current = null;
+  }
+
+  function refreshRegistry() {
+    // A refreshed ledger cannot prove the row is this request's: keep the
+    // unknown state until a submission succeeds.
+    void consultations.refetch();
+  }
+
   function submitPlanRequest() {
     const version = investigation.data?.version;
     if (version === undefined) {
@@ -171,41 +232,69 @@ export function PlanPanel({ investigationId }: { investigationId: string }) {
       return;
     }
     const trimmed = question.trim();
+    // One key per frozen request body: an unchanged form replays the exact
+    // same operation after a network timeout instead of minting a new one.
+    const formSignature = JSON.stringify([trimmed, contextTaskId]);
+    let submission = frozenRequest.current;
+    if (submission === null || submission.formSignature !== formSignature) {
+      submission = {
+        formSignature,
+        input: {
+          expected_version: version,
+          ...(trimmed === "" ? {} : { question: trimmed }),
+          ...(contextTaskId === "" ? {} : { context_task_id: contextTaskId }),
+        },
+        idempotencyKey: createIdempotencyKey(),
+      };
+      frozenRequest.current = submission;
+    }
     setMessage(null);
     setErrorMessage(null);
     requestMutation.mutate(
-      {
-        expected_version: version,
-        ...(trimmed === "" ? {} : { question: trimmed }),
-      },
+      { input: submission.input, idempotencyKey: submission.idempotencyKey },
       {
         onSuccess: (response) => {
           accept.reset();
+          // The request is settled: the next explicit click is a new request
+          // and must mint a new key under the refreshed working state.
+          frozenRequest.current = null;
+          setUnknownState(false);
           if (response.plan_version_id !== null) {
             setSelectedId(response.plan_version_id);
           }
+          const requestedTaskId = submission.input.context_task_id;
+          const requestedTask =
+            requestedTaskId === undefined
+              ? undefined
+              : (tasks.data?.items ?? []).find(
+                  (task) => task.id === requestedTaskId,
+                );
+          const contextSuffix =
+            requestedTask === undefined
+              ? ""
+              : ` (tâche de contexte : ${requestedTask.task_key})`;
           if (response.invocation_status === "unavailable") {
             setMessage(
               "Bridge est indisponible : aucune version de plan n’a été créée.",
             );
           } else if (response.advice_only) {
             setMessage(
-              "Bridge a répondu par un avis non parsé : il reste consultatif (avis, non preuve).",
+              `Bridge a répondu par un avis non parsé : il reste consultatif (avis, non preuve)${contextSuffix}.`,
             );
           } else if (response.plan_version_id !== null) {
             setMessage(
-              `Version ${response.plan_version ?? ""} du plan enregistrée (${parseStatusLabel(response.plan_parse_status)}).`,
+              `Version ${response.plan_version ?? ""} du plan enregistrée (${parseStatusLabel(response.plan_parse_status)})${contextSuffix}.`,
             );
           } else {
             setMessage(
-              "Réponse Bridge reçue ; la version du plan peut être matérialisée.",
+              `Réponse Bridge reçue ; la version du plan peut être matérialisée${contextSuffix}.`,
             );
           }
           void queryClient.invalidateQueries({
             queryKey: investigationQueryKeys.detail(investigationId),
           });
         },
-        onError: fail,
+        onError: handleRequestError,
       },
     );
   }
@@ -273,10 +362,31 @@ export function PlanPanel({ investigationId }: { investigationId: string }) {
           rows={2}
           placeholder="Priorités, doutes, pistes à couvrir…"
         />
+        <label htmlFor={`${baseId}-context-task`}>
+          Tâche de contexte (facultative)
+        </label>
+        <select
+          id={`${baseId}-context-task`}
+          value={contextTaskId}
+          onChange={(event) => setContextTaskId(event.target.value)}
+          disabled={tasks.isPending}
+        >
+          <option value="">Aucune — demande générale</option>
+          {(tasks.data?.items ?? []).map((task) => (
+            <option key={task.id} value={task.id}>
+              {task.task_key} · {task.title}
+            </option>
+          ))}
+        </select>
+        <p className="m24-muted">
+          La tâche choisie est transmise comme contexte borné (références et
+          hash, jamais comme preuve) et lie l’invocation à cette tâche. Une
+          révision de plan ne change ni son statut ni son résultat.
+        </p>
         <p className="m24-muted">
           Version de l’état utilisée pour le CAS :{" "}
           {investigation.data?.version ?? "indisponible"}. La demande porte une
-          clé d’idempotence.
+          clé d’idempotence, conservée tant que ce formulaire reste identique.
         </p>
         <div className="m24-inline-form__buttons">
           <button
@@ -289,7 +399,9 @@ export function PlanPanel({ investigationId }: { investigationId: string }) {
           >
             {requestMutation.isPending
               ? "Demande en cours auprès de Bridge…"
-              : "Demander un plan à Bridge"}
+              : unknownState
+                ? "Réessayer avec la même clé"
+                : "Demander un plan à Bridge"}
           </button>
         </div>
         {requestMutation.isPending ? (
@@ -299,6 +411,27 @@ export function PlanPanel({ investigationId }: { investigationId: string }) {
           />
         ) : null}
       </div>
+
+      {unknownState ? (
+        <div className="m24-advisory" role="alert">
+          <p>
+            <strong>État inconnu.</strong> La demande précédente a peut-être été
+            reçue avant l’échec réseau. Vérifiez le registre avant de réessayer
+            ; un nouvel envoi du même formulaire réutilise la même clé
+            d’idempotence.
+          </p>
+          <div className="m24-inline-form__buttons">
+            <button
+              type="button"
+              className="m24-action m24-action--quiet"
+              onClick={refreshRegistry}
+              disabled={consultations.isFetching}
+            >
+              Vérifier le registre
+            </button>
+          </div>
+        </div>
+      ) : null}
 
       {investigation.isError ? (
         <p role="alert" className="error-message">

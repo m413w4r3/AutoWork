@@ -346,6 +346,47 @@ describe("TaskCard session launch", () => {
   });
 });
 
+describe("TaskCard Bridge entry point", () => {
+  it("ouvre le panneau Demander à Bridge sans envoyer de mutation", async () => {
+    const user = userEvent.setup();
+    const recorder = installFetch(({ url, init }) => {
+      const method = init?.method ?? "GET";
+      if (
+        url === `/api/investigations/${INVESTIGATION_ID}` &&
+        method === "GET"
+      ) {
+        return jsonResponse({ version: 5 });
+      }
+      if (
+        url.endsWith("/consultations?task_id=" + makeTask().id) &&
+        method === "GET"
+      ) {
+        return jsonResponse({
+          investigation_id: INVESTIGATION_ID,
+          consultations: [],
+        });
+      }
+      return errorResponse(500, "unexpected_request");
+    });
+
+    renderCard();
+
+    const toggle = screen.getByRole("button", { name: "Demander à Bridge" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByLabelText("Question pour Bridge")).toBeNull();
+
+    await user.click(toggle);
+
+    expect(await screen.findByLabelText("Question pour Bridge")).toBeVisible();
+    expect(
+      screen.getByText(/ni résultat de tâche, ni preuve, ni décision/),
+    ).toBeVisible();
+    expect(
+      recorder.calls.filter((call) => call.init?.method === "POST"),
+    ).toEqual([]);
+  });
+});
+
 describe("TaskCard keyboard", () => {
   it("déclenche une attribution au clavier avec CAS et idempotence", async () => {
     const user = userEvent.setup();

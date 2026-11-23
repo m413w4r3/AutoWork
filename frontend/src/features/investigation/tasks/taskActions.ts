@@ -13,7 +13,9 @@
  * `POST …/note-proposals` does accept an optional `task_id`, but it is an
  * opinion-anchored drafting route: it also requires a validated article
  * anchor, a target block and the working-state CAS, and it is exposed by the
- * « Note de l'analyste » view. There is no task-scoped consultation route.
+ * « Note de l'analyste » view. The task-scoped consultation entry point lives
+ * in `TaskBridgePanel` and stays outside this matrix: it never changes the
+ * task status or result.
  */
 
 import type { AgentSessionView } from "../api/agentSessions";
