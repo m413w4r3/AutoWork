@@ -5,11 +5,11 @@
  * fails the type check instead of rendering a raw snake_case token.
  */
 
-import type { AgentInstructionJournalState } from "../api/agentSessions";
 import type {
   AgentSessionState,
   BlockedReason,
   HandoffFreshnessState,
+  InstructionState,
   OperatorAdapterKind,
   ResultVerificationStatus,
   TaskActorKind,
@@ -75,9 +75,9 @@ export const SESSION_STATE_LABELS: Record<AgentSessionState, string> = {
   failed: "Échouée",
 };
 
-/** Full journal vocabulary of the session summary (B6), wider than enqueue. */
+/** Full instruction vocabulary of the session summary (B6). */
 export const INSTRUCTION_JOURNAL_STATE_LABELS: Record<
-  AgentInstructionJournalState,
+  InstructionState,
   string
 > = {
   queued: "En file (agent occupé)",

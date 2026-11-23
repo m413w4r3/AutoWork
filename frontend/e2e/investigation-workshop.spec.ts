@@ -994,9 +994,16 @@ test("note de l’analyste : blocs de contenu référencés puis vérifiés", as
   });
   await expect(requestButton).toBeEnabled();
 
-  await page
-    .getByLabel("Élément à référencer")
-    .selectOption("table:table-commands");
+  const elementSelect = page.getByLabel("Élément à référencer");
+  await expect(
+    elementSelect.getByRole("option", {
+      name: /Volume des commandes.*non proposable : graphique sans preuve/,
+    }),
+  ).toBeDisabled();
+  await expect(
+    page.getByText(/Un élément M23 de cette ancre est grisé/),
+  ).toBeVisible();
+  await elementSelect.selectOption("table:table-commands");
   await page.getByRole("button", { name: "Référencer cet élément" }).click();
 
   const ioc = page.getByRole("group", {

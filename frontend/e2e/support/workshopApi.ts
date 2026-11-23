@@ -199,7 +199,12 @@ const OBSERVATION: InvestigationObservation = {
   invocation_ref: null,
 };
 
-/** M23 elements of the pinned publication; only same-anchor ones are referencable. */
+/**
+ * M23 elements of the pinned publication; only same-anchor ones are
+ * referencable. The chart carries the server's own refusal verdict
+ * (`note_chart_without_evidence`), so the picker must show it disabled rather
+ * than offer it and let the request be rejected.
+ */
 const ARTICLE_ELEMENTS = [
   {
     kind: "table" as const,
@@ -208,6 +213,18 @@ const ARTICLE_ELEMENTS = [
     caption: "Commandes exécutées par l’échantillon.",
     element_sha256: SHA.content,
     anchor: "lead:0001",
+    proposable: true,
+    refusal_reason: null,
+  },
+  {
+    kind: "chart" as const,
+    key: "chart-volume",
+    title: "Volume des commandes",
+    caption: null,
+    element_sha256: SHA.proposed,
+    anchor: "lead:0001",
+    proposable: false,
+    refusal_reason: "note_chart_without_evidence",
   },
   {
     kind: "figure" as const,
@@ -216,6 +233,8 @@ const ARTICLE_ELEMENTS = [
     caption: null,
     element_sha256: SHA.note,
     anchor: "section:2:paragraph:0007",
+    proposable: true,
+    refusal_reason: null,
   },
 ] satisfies ArticleAnchorCatalogViewV1["elements"];
 

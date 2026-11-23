@@ -412,6 +412,56 @@ describe("OperatorsPanel", () => {
     expect(screen.queryByText(/Non exposé/)).not.toBeInTheDocument();
   });
 
+  it("traduit les états transitoires de livraison d’instruction", async () => {
+    const summary = makeSummary({
+      instructions: {
+        items: [
+          makeSummaryInstruction({
+            instruction_id: "99999999-9999-4999-8999-999999999999",
+            state: "delivering",
+            text: "Confirme le domaine C2.",
+            queue_position: 1,
+            delivered_at: null,
+            acknowledged_at: null,
+          }),
+          makeSummaryInstruction({
+            instruction_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            state: "delivery_unknown",
+            text: "Relève les IOC réseau.",
+            queue_position: 0,
+            delivered_at: null,
+            acknowledged_at: null,
+          }),
+        ],
+        total: 2,
+        limit: 20,
+        truncated: false,
+      },
+    });
+    installFetch(({ url, init }) => {
+      const method = init?.method ?? "GET";
+      if (url.endsWith("/agent-sessions") && method === "GET") {
+        return jsonResponse([makeSession()]);
+      }
+      if (url.endsWith("/tasks") && method === "GET") {
+        return jsonResponse(taskPage());
+      }
+      if (url.endsWith("/summary") && method === "GET") {
+        return jsonResponse(summary);
+      }
+      return errorResponse(500, "unexpected_request");
+    });
+
+    renderPanel();
+
+    expect(
+      await screen.findByText("Instruction en attente :"),
+    ).toBeInTheDocument();
+    // Once as the pending instruction, once in the instruction history.
+    expect(screen.getAllByText("Livraison en cours")).toHaveLength(2);
+    expect(screen.getByText("Livraison inconnue")).toBeInTheDocument();
+  });
+
   it("affiche les états vides du résumé sans inventer de données", async () => {
     installFetch(({ url, init }) => {
       const method = init?.method ?? "GET";

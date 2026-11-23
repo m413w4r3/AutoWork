@@ -119,8 +119,10 @@ function optionLabel(
  * Visual selector of the canonical publication anchors. The server stays the
  * only authority: the catalog is a read, every drafting request pins its base
  * and paragraph hash server-side, and an anchor that moved or disappeared is
- * refused with a typed code. The free-text field is a diagnostic escape hatch
- * behind `<details>`, never a suggested path.
+ * refused with a typed code. The catalog's element verdicts are surfaced
+ * beside the selected anchor so an element the note-block validator would
+ * refuse is never mistaken for an available block target. The free-text field
+ * is a diagnostic escape hatch behind `<details>`, never a suggested path.
  */
 export function AnchorPicker({
   investigationId,
@@ -152,11 +154,35 @@ export function AnchorPicker({
     () => new Set(notes.map((note) => note.anchor)),
     [notes],
   );
+  /**
+   * M23 elements the catalog places at each anchor, split by the server's
+   * note-block verdict: an anchor carrying only refused elements cannot
+   * support a block reference, so the choice is visible before drafting.
+   */
+  const elementCounts = useMemo(() => {
+    const counts = new Map<string, { proposable: number; refused: number }>();
+    for (const element of catalog?.elements ?? []) {
+      if (element.anchor === null) continue;
+      const entry = counts.get(element.anchor) ?? {
+        proposable: 0,
+        refused: 0,
+      };
+      if (element.proposable) {
+        entry.proposable += 1;
+      } else {
+        entry.refused += 1;
+      }
+      counts.set(element.anchor, entry);
+    }
+    return counts;
+  }, [catalog]);
 
   const selected =
     catalog?.anchors.find((item) => item.anchor === anchor) ?? null;
   const occurrence =
     selected === null ? undefined : occurrences.get(selected.anchor);
+  const selectedElements =
+    selected === null ? undefined : elementCounts.get(selected.anchor);
   const targetType = classifyAnchor(anchor);
   const missingFromCatalog =
     catalog !== null &&
@@ -256,6 +282,20 @@ export function AnchorPicker({
                   ) : null}
                   {targetType === null ? null : (
                     <li className="badge">{TARGET_BLOCK_LABELS[targetType]}</li>
+                  )}
+                  {selectedElements === undefined ||
+                  selectedElements.proposable === 0 ? null : (
+                    <li className="badge">
+                      {selectedElements.proposable} élément(s) M23
+                      référençable(s)
+                    </li>
+                  )}
+                  {selectedElements === undefined ||
+                  selectedElements.refused === 0 ? null : (
+                    <li className="badge badge--tlp-amber">
+                      {selectedElements.refused} élément(s) M23 non
+                      proposable(s)
+                    </li>
                   )}
                 </ul>
               </>

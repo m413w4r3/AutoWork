@@ -78,6 +78,17 @@ export const PROTOCOL_FIGURE_LABELS: Record<string, string> = {
   message_format: "Format des messages",
 };
 
+/**
+ * Note-block refusals the article-anchor catalog can carry before a request:
+ * an element that would be refused is shown disabled with this reason instead
+ * of being proposed and rejected later by the server.
+ */
+export const ARTICLE_ELEMENT_REFUSAL_LABELS: Record<string, string> = {
+  note_block_ref_stale: "élément non rendu à un paragraphe",
+  note_chart_without_evidence: "graphique sans preuve sur chaque point",
+  note_figure_source_missing: "figure sans document source connu",
+};
+
 export const FINDING_KIND_LABELS: Record<string, string> = {
   new_sample: "Nouvel échantillon",
   infection_chain: "Chaîne d’infection",

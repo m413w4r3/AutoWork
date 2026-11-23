@@ -30,6 +30,7 @@ import type {
 } from "../api/opinionProposals";
 import { describeApiError, describeErrorCode } from "./errors";
 import {
+  ARTICLE_ELEMENT_REFUSAL_LABELS,
   EVIDENCE_KIND_LABELS,
   PROTOCOL_FIGURE_LABELS,
   shortHash,
@@ -87,6 +88,12 @@ function elementLabel(element: ArticleElementViewV1): string {
     title,
     OPTION_TEXT_MAX,
   )}${caption} · SHA-256 ${shortHash(element.element_sha256)}`;
+}
+
+/** The server's typed refusal, translated; unknown codes stay readable. */
+function elementRefusalLabel(reason: string | null): string {
+  if (reason === null) return "élément non proposable";
+  return ARTICLE_ELEMENT_REFUSAL_LABELS[reason] ?? describeErrorCode(reason);
 }
 
 function parseInteger(value: string): number | null {
@@ -321,9 +328,14 @@ function ArticleElementSelector({
         : catalog.elements.filter((element) => element.anchor === anchor),
     [catalog, anchor],
   );
+  const proposableCount = elements.filter(
+    (element) => element.proposable,
+  ).length;
   const selected =
-    elements.find((element) => `${element.kind}:${element.key}` === choice) ??
-    null;
+    elements.find(
+      (element) =>
+        element.proposable && `${element.kind}:${element.key}` === choice,
+    ) ?? null;
   const duplicate =
     selected === null ? false : articleElementSelected(blocks, selected);
 
@@ -389,7 +401,7 @@ function ArticleElementSelector({
               </label>
               <select
                 id="note-content-block-element"
-                value={choice}
+                value={selected === null ? "" : choice}
                 onChange={(event) => setChoice(event.currentTarget.value)}
               >
                 <option value="">— Choisir un élément de l’article —</option>
@@ -397,8 +409,13 @@ function ArticleElementSelector({
                   <option
                     key={`${element.kind}:${element.key}`}
                     value={`${element.kind}:${element.key}`}
+                    disabled={!element.proposable}
                   >
-                    {elementLabel(element)}
+                    {element.proposable
+                      ? elementLabel(element)
+                      : `${elementLabel(element)} — non proposable : ${elementRefusalLabel(
+                          element.refusal_reason,
+                        )}`}
                   </option>
                 ))}
               </select>
@@ -413,6 +430,18 @@ function ArticleElementSelector({
               {duplicate ? (
                 <p role="note">
                   Cet élément est déjà référencé par cette proposition.
+                </p>
+              ) : null}
+              {elements.length > proposableCount ? (
+                <p role="note">
+                  {elements.length - proposableCount === 1
+                    ? "Un élément M23 de cette ancre est grisé"
+                    : `${elements.length - proposableCount} éléments M23 de cette ancre sont grisés`}{" "}
+                  : le serveur refuserait le bloc correspondant et la raison est
+                  indiquée dans la liste.{" "}
+                  {proposableCount === 0
+                    ? "Aucun élément de cette ancre n’est donc proposable comme bloc de Note."
+                    : null}
                 </p>
               ) : null}
             </>

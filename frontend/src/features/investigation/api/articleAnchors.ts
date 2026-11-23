@@ -26,7 +26,13 @@ export interface ArticleAnchorViewV1 {
   paragraph_index: number | null;
 }
 
-/** One M23 element rendered in the resolved base. */
+/**
+ * One M23 element of the resolved base with the server's own note-block
+ * verdict. `proposable` is false exactly when the note-block validator would
+ * refuse the element (`note_block_ref_stale`, `note_chart_without_evidence`,
+ * `note_figure_source_missing`), so the pickers never offer a block the
+ * server would reject.
+ */
 export interface ArticleElementViewV1 {
   kind: ArticleElementKind;
   key: string;
@@ -34,6 +40,8 @@ export interface ArticleElementViewV1 {
   caption: string | null;
   element_sha256: string;
   anchor: string | null;
+  proposable: boolean;
+  refusal_reason: string | null;
 }
 
 export interface ArticleAnchorCatalogViewV1 {

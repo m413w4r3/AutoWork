@@ -265,17 +265,12 @@ export interface AgentSessionHandoffSummaryView {
   freshness: AgentSessionHandoffFreshnessView | null;
 }
 
-/**
- * The journal vocabulary is wider than the enqueue response: a summary may
- * show the transient `delivering` / `delivery_unknown` states that the
- * human enqueue route never returns.
- */
-export type AgentInstructionJournalState =
-  InstructionState | "delivering" | "delivery_unknown";
-
 export interface AgentSessionInstructionView {
   instruction_id: Uuid;
-  state: AgentInstructionJournalState;
+  /** The journal carries the full domain vocabulary, including the
+   * transient `delivering` / `delivery_unknown` states the enqueue route
+   * never returns. */
+  state: InstructionState;
   text: string;
   text_sha256: string;
   /** 0 for an instruction that is no longer waiting in the queue. */
