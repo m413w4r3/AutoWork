@@ -208,6 +208,14 @@ test("vue d’ensemble : création du workspace puis approbation G2 explicite", 
     page.getByText(/Décision f1f1f1f1-f1f1-41f1-81f1-f1f1f1f1f1f1/),
   ).toBeVisible();
 
+  const lifecycle = page.getByRole("region", {
+    name: "Cycle de vie de l’enveloppe G2",
+  });
+  await expect(lifecycle).toBeVisible();
+  await expect(
+    lifecycle.getByRole("button", { name: "Étendre l’enveloppe" }),
+  ).toBeVisible();
+
   const approval = api.requests.find(
     (request) =>
       request.path ===
@@ -224,6 +232,106 @@ test("vue d’ensemble : création du workspace puis approbation G2 explicite", 
   expect(api.unhandled).toEqual([]);
 
   await capture(page, "01-vue-ensemble");
+});
+
+test("vue d’ensemble : extension puis révocation G2 de l’enveloppe approuvée", async ({
+  page,
+}) => {
+  const api = createWorkshopApi({
+    existingInvestigation: true,
+    envelopeApproved: true,
+  });
+  await api.install(page);
+  await page.goto(`/subjects/${api.ids.subject}`);
+  await page
+    .getByRole("button", { name: "Enquête / Avis de l’analyste" })
+    .click();
+  await page
+    .getByRole("button", { name: "Ouvrir l’enquête sur cette version" })
+    .click();
+
+  const lifecycle = page.getByRole("region", {
+    name: "Cycle de vie de l’enveloppe G2",
+  });
+  await expect(lifecycle).toBeVisible();
+  await expect(
+    lifecycle.getByText("Enveloppe G2 active — version 1"),
+  ).toBeVisible();
+  await expect(
+    lifecycle.getByRole("button", { name: /Approuver/ }),
+  ).toHaveCount(0);
+
+  const extendReason = "Budget VT supplémentaire pour la piste 2.";
+  await lifecycle.getByRole("button", { name: "Étendre l’enveloppe" }).click();
+  await lifecycle.getByLabel("Motif de l’extension").fill(extendReason);
+  await lifecycle.getByLabel(/Je confirme cette extension/).check();
+  await lifecycle
+    .getByRole("button", { name: "Confirmer l’extension" })
+    .click();
+  await expect(
+    lifecycle.getByText("Enveloppe étendue — version 2"),
+  ).toBeVisible();
+
+  const extension = api.requests.find(
+    (request) =>
+      request.method === "POST" &&
+      request.path ===
+        `/api/investigations/${api.ids.investigation}/envelope/extend`,
+  );
+  expect(extension?.body).toMatchObject({
+    expected_version: 1,
+    reason: extendReason,
+  });
+  expect(extension?.idempotencyKey).toBeTruthy();
+
+  const revokeTrigger = lifecycle.getByRole("button", {
+    name: "Révoquer l’enveloppe",
+  });
+  await revokeTrigger.click();
+  const dialog = page.getByRole("dialog", {
+    name: "Révoquer l’enveloppe G2 ?",
+  });
+  await expect(dialog).toBeVisible();
+  await expect(
+    dialog.getByLabel("Motif obligatoire de la révocation"),
+  ).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+  await expect(revokeTrigger).toBeFocused();
+
+  const revokeReason = "Les recherches externes sont terminées.";
+  await revokeTrigger.click();
+  await dialog
+    .getByLabel("Motif obligatoire de la révocation")
+    .fill(revokeReason);
+  await dialog.getByLabel(/Je confirme la révocation de l’enveloppe/).check();
+  await dialog.getByRole("button", { name: "Confirmer la révocation" }).click();
+
+  await expect(
+    lifecycle.getByText("Enveloppe révoquée — droits externes coupés"),
+  ).toBeVisible();
+  await expect(
+    lifecycle.getByRole("button", { name: /Approuver/ }),
+  ).toHaveCount(0);
+  await expect(
+    lifecycle.getByRole("button", { name: "Étendre l’enveloppe" }),
+  ).toHaveCount(0);
+  await expect(
+    lifecycle.getByRole("button", { name: "Révoquer l’enveloppe" }),
+  ).toHaveCount(0);
+
+  const revocation = api.requests.find(
+    (request) =>
+      request.method === "POST" &&
+      request.path ===
+        `/api/investigations/${api.ids.investigation}/envelope/revoke`,
+  );
+  expect(revocation?.body).toMatchObject({
+    expected_version: 2,
+    reason: revokeReason,
+  });
+  expect(revocation?.idempotencyKey).toBeTruthy();
+  expect(api.unhandled).toEqual([]);
 });
 
 test("plan et tâches : acceptation, action absente et CAS périmé", async ({

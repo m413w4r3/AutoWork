@@ -1,8 +1,9 @@
 /**
- * Vue d’ensemble du cockpit M24 : hôte hôte/workspace, bootstrap et enveloppe
- * G2 initiale. Aucune action n’est proposée hors de son droit réel : la
- * décision d’enveloppe dépend de l’état du workspace et de la proposition
- * courante.
+ * Vue d’ensemble du cockpit M24 : hôte hôte/workspace, bootstrap, enveloppe
+ * G2 initiale et cycle de vie de l’enveloppe approuvée. Aucune action n’est
+ * proposée hors de son droit réel : la décision d’enveloppe dépend de l’état
+ * du workspace et de la proposition courante ; l’extension et la révocation
+ * ne montent que pour une enveloppe approuvée.
  */
 
 import { toWorkshopApiError } from "../api/client";
@@ -22,6 +23,7 @@ import {
 } from "../shell/WorkshopStates";
 import { formatTimestamp } from "../tasks/labels";
 import { BootstrapSection } from "./BootstrapSection";
+import { EnvelopeLifecycleSection } from "./EnvelopeLifecycleSection";
 import { EnvelopeSection } from "./EnvelopeSection";
 import {
   AGENT_STATUS_LABELS,
@@ -78,6 +80,8 @@ export function OverviewView({
         workspaceReady={workspaceReady}
         workspaceBlockedReason={workspaceBlockedReason(workspaceQuery)}
       />
+
+      <EnvelopeLifecycleSection investigationId={investigationId} />
     </section>
   );
 }
