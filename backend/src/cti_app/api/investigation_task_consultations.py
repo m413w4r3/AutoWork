@@ -2,20 +2,22 @@
 
 A verified human asks Bridge to interpret, critique or propose pivots for one
 persisted task.  The route reuses the single ``advisor.consult`` path: it
-assembles a bounded, non-evidence ``task_context`` from the task and its human
-contributions, invokes the advisor tool exactly once with a human requester and
-``context_task_id`` (migration 0028), then projects the persisted ledger row.
-It never writes a task status, a task result, a proof or a decision.
+assembles and sanitises a bounded, non-evidence ``task_context`` from the task
+and its human contributions, invokes the advisor tool exactly once with a human
+requester and ``context_task_id`` (migration 0028), then projects the persisted
+ledger row.  It never writes a task status, a task result, a proof or a
+decision.
 
 The orchestrator owns ``api/main.py``: this module only exports ``router``.
-``assemble_task_context`` is shared with the optional ``context_task_id`` on
-``POST /plans/request`` so both routes send the same dossier.
+``application.investigation_task_context`` is shared with the optional
+``context_task_id`` on ``POST /plans/request`` so both routes send the same
+sanitised dossier.
 """
 
 from __future__ import annotations
 
 import hashlib
-from typing import Annotated, Any, Literal, cast
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Header, Request
@@ -27,26 +29,20 @@ from cti_app.api.investigation import (
     _require_verified_human_operator,
     _uow_factory,
 )
-from cti_app.application.investigation_advisor_tools import (
-    ADVISOR_SCHEMA_VERSION,
-    _sanitize_advisor_task_context,
-)
+from cti_app.application.investigation_advisor_tools import ADVISOR_SCHEMA_VERSION
 from cti_app.application.investigation_consultations import (
-    InvestigationConsultationLedger,
     InvestigationConsultationV1,
+    consultation_ledger,
 )
-from cti_app.application.investigation_persistence import (
-    EvidenceObservationRepository,
-    ToolInvocationRepository,
-    VersionConflictError,
-)
+from cti_app.application.investigation_persistence import VersionConflictError
 from cti_app.application.investigation_state import InvestigationStateVersionConflict
-from cti_app.application.operator_tool_invocation import OperatorToolInvocationError
-from cti_app.domain.investigation import (
-    ToolInvocationActorKind,
-    canonical_json_bytes,
+from cti_app.application.investigation_task_context import (
+    TaskContextError,
+    build_task_context,
+    task_context_arguments,
 )
-from cti_app.domain.investigation_task import InvestigationTaskV1
+from cti_app.application.operator_tool_invocation import OperatorToolInvocationError
+from cti_app.domain.investigation import ToolInvocationActorKind
 
 router = APIRouter(prefix="/api/investigations", tags=["investigation-task-consultations"])
 
@@ -85,116 +81,6 @@ def _invocation_idempotency_prefix(investigation_id: UUID, idempotency_key: str)
     return f"operator:{digest}:"
 
 
-def _ledger(uow: Any, factory: Any) -> InvestigationConsultationLedger:
-    return InvestigationConsultationLedger(
-        invocations=cast(ToolInvocationRepository, uow.tool_invocations),
-        observations=cast(EvidenceObservationRepository, uow.evidence_observations),
-        artifact_store=factory.artifact_store,
-        decisions=uow.analyst_decisions,
-    )
-
-
-async def _editorial_anchor(
-    factory: Any,
-    investigation: Any,
-    anchor: str,
-) -> dict[str, str]:
-    """Resolve one canonical publication anchor to its bounded excerpt.
-
-    The article snapshot exposes the renderable anchors with a bounded excerpt;
-    ``text_sha256`` identifies the exact excerpt transmitted to Bridge.
-    """
-    snapshot = await factory.article_snapshots.resolve(investigation.synthesis_artifact_id)
-    entry = next(
-        (item for item in snapshot.article.publication_anchors if item.anchor == anchor),
-        None,
-    )
-    if entry is None:
-        raise _http_error(
-            422,
-            "task_consultation_anchor_invalid",
-            "The requested anchor is not a renderable anchor of the current article",
-        )
-    excerpt = entry.excerpt
-    return {
-        "anchor": entry.anchor,
-        "excerpt": excerpt,
-        "text_sha256": hashlib.sha256(excerpt.encode("utf-8")).hexdigest(),
-    }
-
-
-def _task_contributions(contributions: Any, task_id: UUID) -> list[dict[str, str]]:
-    rows = [
-        {
-            "id": str(item.id),
-            "category": item.category.value,
-            "file_relpath": item.file_relpath,
-            "file_sha256": item.file_sha256,
-            "origin": item.origin.value,
-            "import_status": item.import_status.value,
-        }
-        for item in contributions
-        if item.task_id == task_id
-    ]
-    # The invocation payload is idempotent: keep the list order deterministic.
-    return sorted(rows, key=lambda row: (row["id"],))
-
-
-async def assemble_task_context(
-    *,
-    uow: Any,
-    task: InvestigationTaskV1,
-    factory: Any,
-    investigation: Any,
-    include_previous_consultation: bool = False,
-    anchor: str | None = None,
-    idempotency_prefix: str | None = None,
-) -> dict[str, Any]:
-    """Assemble the bounded non-evidence context of one human task request."""
-    contributions = await uow.work_contributions.list_for_investigation(task.investigation_id)
-    context: dict[str, Any] = {
-        "investigation_id": str(task.investigation_id),
-        "task_id": str(task.id),
-        "task_key": task.task_key,
-        "title": task.title,
-        "question": task.question,
-        "objective": task.objective,
-        "status": task.status.value,
-        "priority": task.priority.value,
-        "claim_refs": list(task.claim_refs),
-        "evidence_refs": list(task.evidence_refs),
-        "sample_refs": list(task.sample_refs),
-        "expected_outputs": list(task.expected_outputs),
-        "result_refs": [dict(item) for item in task.result_refs],
-        "human_contributions": _task_contributions(contributions, task.id),
-    }
-    if task.assigned_actor_kind is not None:
-        context["assigned_actor"] = {
-            "kind": task.assigned_actor_kind.value,
-            "actor_id": task.assigned_actor_id,
-        }
-    if include_previous_consultation:
-        entries = await _ledger(uow, factory).list_for_investigation(
-            task.investigation_id, context_task_id=task.id
-        )
-        prior = [
-            entry
-            for entry in entries
-            if idempotency_prefix is None or not entry.operation_key.startswith(idempotency_prefix)
-        ]
-        if prior:
-            last = prior[-1]
-            context["previous_consultation"] = {
-                "invocation_id": str(last.invocation_id),
-                "type": last.consultation_type,
-                "output_sha256": last.output_sha256,
-                "parse_status": last.parse_status.value,
-            }
-    if anchor is not None:
-        context["editorial_anchor"] = await _editorial_anchor(factory, investigation, anchor)
-    return context
-
-
 @router.post(
     "/{investigation_id}/tasks/{task_id}/consultations",
     response_model=TaskConsultationResponseV1,
@@ -222,27 +108,24 @@ async def request_task_consultation(
             # A consultation never revives a terminal task; it is only context.
             raise _http_error(422, "task_consultation_task_terminal")
         idempotency_prefix = _invocation_idempotency_prefix(investigation_id, idempotency_key)
-        task_context = await assemble_task_context(
-            uow=uow,
-            task=task,
-            factory=factory,
-            investigation=investigation,
-            include_previous_consultation=payload.include_previous_consultation,
-            anchor=payload.anchor,
-            idempotency_prefix=idempotency_prefix,
-        )
-        sanitized_task_context = _sanitize_advisor_task_context(
-            task_context, investigation_id=investigation_id, warnings=[]
-        )
-        if sanitized_task_context is None:
+        try:
+            task_context = await build_task_context(
+                uow=uow,
+                task=task,
+                factory=factory,
+                investigation=investigation,
+                include_previous_consultation=payload.include_previous_consultation,
+                anchor=payload.anchor,
+                idempotency_prefix=idempotency_prefix,
+            )
+        except TaskContextError as exc:
+            raise _http_error(422, exc.code) from exc
+        if task_context.context is None or task_context.sha256 is None:
             raise _http_error(422, "task_consultation_context_invalid")
-        task_context_sha256 = hashlib.sha256(
-            canonical_json_bytes(sanitized_task_context)
-        ).hexdigest()
         arguments = {
             "consultation_type": payload.consultation_type,
             "question": question,
-            "task_context": task_context,
+            **task_context_arguments(task_context),
         }
         composition = factory.build(uow, investigation_id, operator_mode=True)
         try:
@@ -262,7 +145,7 @@ async def request_task_consultation(
             raise _http_error(exc.status_code, exc.code, details=exc.details) from exc
         except (VersionConflictError, InvestigationStateVersionConflict) as exc:
             raise _http_error(409, "stale_working_state") from exc
-        entries = await _ledger(uow, factory).list_for_investigation(
+        entries = await consultation_ledger(uow, factory.artifact_store).list_for_investigation(
             investigation_id, context_task_id=task.id
         )
         entry = next(
@@ -276,9 +159,9 @@ async def request_task_consultation(
             invocation_id=invocation_result.invocation.id,
             invocation_status=invocation_result.invocation.status.value,
             context_task_id=task.id,
-            task_context_sha256=task_context_sha256,
+            task_context_sha256=task_context.sha256,
             consultation=entry,
         )
 
 
-__all__ = ["assemble_task_context", "router"]
+__all__ = ["router"]

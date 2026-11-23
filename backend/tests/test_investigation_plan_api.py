@@ -30,7 +30,11 @@ from cti_app.application.investigation_persistence import (
 )
 from cti_app.application.investigation_plan_materialization import plan_task_key
 from cti_app.application.investigation_plans import InvestigationPlanService
-from cti_app.application.operator_tool_invocation import OperatorToolInvocationResult
+from cti_app.application.operator_tool_invocation import (
+    OperatorToolInvocationError,
+    OperatorToolInvocationResult,
+    _require_safe_operator_payload,
+)
 from cti_app.config import Settings
 from cti_app.domain.editorial import (
     AnalystDecision,
@@ -160,6 +164,7 @@ async def _seed_advisor_exchange(
     actor_id: str | None = None,
     task_id: UUID | None = None,
     context_task_id: UUID | None = None,
+    normalized_parameters: dict[str, Any] | None = None,
 ) -> tuple[ToolInvocation, EvidenceObservation]:
     call_id = uuid4()
     response_id = uuid4()
@@ -214,7 +219,11 @@ async def _seed_advisor_exchange(
         operation_key=f"advisor-{uuid4()}",
         tool_name="advisor.consult",
         schema_version="advisor-consult.v1",
-        normalized_parameters={"consultation_type": consultation_type, "question": "plan"},
+        normalized_parameters=(
+            normalized_parameters
+            if normalized_parameters is not None
+            else {"consultation_type": consultation_type, "question": "plan"}
+        ),
         purpose="Ask Bridge for an investigation plan",
         status=status,
         response_refs=(call_id, response_id),
@@ -266,6 +275,16 @@ class _AdvisorInvocationService:
 
     async def invoke(self, **kwargs: Any) -> OperatorToolInvocationResult:
         self.calls.append(dict(kwargs))
+        # Mirror the production payload veto: the persisted invocation must
+        # never accept a credential-like argument.
+        try:
+            _require_safe_operator_payload(
+                {"arguments": dict(kwargs["arguments"]), "purpose": kwargs["purpose"]}
+            )
+        except ValueError:
+            raise OperatorToolInvocationError(
+                "operator_payload_invalid_or_sensitive", 422
+            ) from None
         idempotency_key = kwargs["idempotency_key"]
         existing = self._by_key.get(idempotency_key)
         if existing is not None:
@@ -285,6 +304,7 @@ class _AdvisorInvocationService:
             actor_kind=kwargs.get("requester_actor_kind"),
             actor_id=kwargs.get("actor_id"),
             context_task_id=kwargs.get("context_task_id"),
+            normalized_parameters=dict(kwargs["arguments"]),
         )
         self._by_key[idempotency_key] = invocation
         return OperatorToolInvocationResult(
@@ -400,14 +420,14 @@ def test_human_plan_request_uses_advisor_service_and_idempotency() -> None:
     assert [version.version for version in versions] == [1]
 
 
-def _seed_context_task(store: _Store) -> InvestigationTaskV1:
+def _seed_context_task(store: _Store, *, objective: str | None = None) -> InvestigationTaskV1:
     task = InvestigationTaskV1(
         id=uuid4(),
         investigation_id=INVESTIGATION_ID,
         task_key="lead-context",
         title="Analyser le chargeur",
         question="Quel chargeur produit le second étage ?",
-        objective="Confirmer la chaîne d'infection depuis les octets observés.",
+        objective=objective or "Confirmer la chaîne d'infection depuis les octets observés.",
         priority=TaskPriority.HIGH,
         status=TaskStatus.READY,
         status_version=1,
@@ -462,6 +482,37 @@ def test_plan_request_with_context_task_links_invocation() -> None:
     assert refused.status_code == 404, refused.text
     assert refused.json()["detail"]["code"] == "task_not_found"
     assert len(factory.invocations.calls) == 1
+
+
+def test_plan_request_omits_sensitive_task_context_with_warning() -> None:
+    """F1: the plan request carries the sanitised context, never the credential."""
+    client, store, factory = _client()
+    _seed_bootstrap_snapshot(store)
+    task = _seed_context_task(store, objective="api_key=ZZOPERATIONALSECRETZZ")
+    path = f"/api/investigations/{INVESTIGATION_ID}/plans/request"
+
+    response = client.post(
+        path,
+        json={"expected_version": 1, "context_task_id": str(task.id)},
+        headers={"Idempotency-Key": "plan-task-context-sensitive"},
+    )
+
+    assert response.status_code == 200, response.text
+    arguments = factory.invocations.calls[0]["arguments"]
+    assert b"ZZOPERATIONALSECRETZZ" not in canonical_json_bytes(dict(arguments))
+    assert b"ZZOPERATIONALSECRETZZ" not in canonical_json_bytes(arguments["task_context"])
+    assert "objective" not in arguments["task_context"]
+    assert arguments["task_context"]["task_key"] == task.task_key
+    assert any(
+        warning["code"] == "task_context_field_omitted_sensitive"
+        and warning["field"] == "task_context.objective"
+        for warning in arguments["task_context_warnings"]
+    )
+    invocation = asyncio.run(store.invocations.get(UUID(response.json()["invocation_id"])))
+    assert invocation is not None
+    assert b"ZZOPERATIONALSECRETZZ" not in canonical_json_bytes(
+        dict(invocation.normalized_parameters)
+    )
 
 
 def test_plan_accept_materializes_tasks_once() -> None:

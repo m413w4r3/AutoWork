@@ -27,7 +27,6 @@ from cti_app.api.investigation import (
     _require_verified_human_operator,
     _uow_factory,
 )
-from cti_app.api.investigation_task_consultations import assemble_task_context
 from cti_app.application.identity import IdentityScope
 from cti_app.application.investigation_advisor_tools import ADVISOR_SCHEMA_VERSION
 from cti_app.application.investigation_bootstrap import BOOTSTRAP_SNAPSHOT_OBJECT_TYPE
@@ -55,6 +54,11 @@ from cti_app.application.investigation_plans import (
     InvestigationPlanService,
 )
 from cti_app.application.investigation_state import InvestigationStateVersionConflict
+from cti_app.application.investigation_task_context import (
+    TaskContextError,
+    build_task_context,
+    task_context_arguments,
+)
 from cti_app.application.operator_tool_invocation import OperatorToolInvocationError
 from cti_app.domain.editorial import (
     AnalystDecision,
@@ -428,12 +432,18 @@ async def request_plan(
         if snapshot is not None:
             arguments["evidence_refs"] = [str(snapshot.id)]
         if context_task is not None:
-            arguments["task_context"] = await assemble_task_context(
-                uow=uow,
-                task=context_task,
-                factory=factory,
-                investigation=investigation,
-            )
+            # The invocation carries the sanitised context: the operator payload
+            # guard runs before any advisor-side sanitisation.
+            try:
+                task_context = await build_task_context(
+                    uow=uow,
+                    task=context_task,
+                    factory=factory,
+                    investigation=investigation,
+                )
+            except TaskContextError as exc:
+                raise _http_error(422, exc.code) from exc
+            arguments.update(task_context_arguments(task_context))
         composition = factory.build(uow, investigation_id, operator_mode=True)
         try:
             invocation_result = await composition.operator_tool_invocations.invoke(

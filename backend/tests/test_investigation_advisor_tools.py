@@ -13313,3 +13313,57 @@ async def test_task_context_never_carries_credentials() -> None:
         and item["code"] == "task_context_field_omitted"
         for item in warnings
     )
+
+
+@pytest.mark.asyncio
+async def test_precomputed_task_context_warnings_stay_observable() -> None:
+    """F1: a caller that sanitised the context keeps its omission warnings.
+
+    The human routes sanitise before invocation so the operator payload veto
+    accepts the request; the advisor must still report the omission and must
+    drop anything outside the fixed task-context warning vocabulary.
+    """
+    investigation_id = uuid4()
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text="Critique consultative fondée sur le dossier transmis.",
+        )
+    )
+    tool, _ = make_tool(investigation_id=investigation_id, transport=transport)
+    task_id = uuid4()
+    expected_warning = {
+        "field": "task_context.objective",
+        "code": "task_context_field_omitted_sensitive",
+        "detail_safe": "A task-context field contained credential-like material and was omitted.",
+    }
+    result = await tool.execute(
+        {
+            "consultation_type": "critique",
+            "question": "Critique la solidité des faits observés.",
+            "task_context": {
+                "investigation_id": str(investigation_id),
+                "task_id": str(task_id),
+                "task_key": "lead-chargeur",
+                "title": "Analyser le chargeur",
+                "status": "running",
+                "priority": "normal",
+            },
+            "task_context_warnings": [
+                expected_warning,
+                {
+                    "field": "not_a_task_field",
+                    "code": "task_context_field_invalid",
+                    "detail_safe": "A forged warning must be dropped.",
+                },
+            ],
+        },
+        make_context(investigation_id, key="operator:advisor:task-context-precomputed-warnings"),
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
+    warnings = result.output["input_warnings"]
+    assert expected_warning in warnings
+    assert not any(item["field"] == "not_a_task_field" for item in warnings)
+    prompt = transport.calls[0]["prompt"]
+    assert "Analyser le chargeur" in prompt
