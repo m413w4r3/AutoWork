@@ -29,6 +29,7 @@ from cti_app.api.editorial_workspace import router as editorial_workspace_router
 from cti_app.api.fusion import fusion_router
 from cti_app.api.health import router as health_router
 from cti_app.api.investigation import router as investigation_router
+from cti_app.api.investigation_article import router as investigation_article_router
 from cti_app.api.investigation_bootstrap import router as investigation_bootstrap_router
 from cti_app.api.investigation_bootstrap_envelope import (
     router as investigation_bootstrap_envelope_router,
@@ -927,6 +928,7 @@ def create_app() -> FastAPI:
     application.include_router(investigation_contributions_router)
     application.include_router(investigation_tasks_router)
     application.include_router(investigation_task_consultations_router)
+    application.include_router(investigation_article_router)
     application.include_router(investigation_transfers_router)
     application.include_router(agent_sessions_router)
     application.include_router(agentic_tools_router)
