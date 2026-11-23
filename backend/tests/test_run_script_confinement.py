@@ -17,9 +17,11 @@ from __future__ import annotations
 import ast
 import errno
 import hashlib
+import json
 import os
 import platform
 import socket
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -50,6 +52,8 @@ from cti_app.infrastructure.analysis_subprocess import (
     AnalysisSubprocessStatus,
     DescendantSupervision,
     LandlockPaths,
+    _read_supervisor_records,
+    _supervisor_argv,
     probe_confined_script_execution,
     run_analysis_subprocess,
     runtime_read_directories,
@@ -695,3 +699,107 @@ def test_production_probe_attests_the_full_confinement_stack() -> None:
         print(f"SKIP {reason}", file=sys.stderr)
         pytest.skip(reason)
     assert probe.detail == "landlock_seccomp_subreaper_verified"
+
+
+def test_supervisor_launcher_pins_the_parent_package_root(tmp_path: Path) -> None:
+    """The isolated supervisor must run the same ``cti_app`` tree as the parent.
+
+    ``python -I -m`` drops ``PYTHONPATH``, so a source checkout, a
+    source-mounted container or a stale baked image would otherwise spawn a
+    supervisor importing another copy of the package (M24.1 F2-B).
+    """
+    import cti_app
+
+    root = Path(cti_app.__file__).resolve().parent.parent
+    argv = _supervisor_argv(tmp_path / "supervisor.json", 7)
+    assert argv[0] == sys.executable
+    assert argv[1:3] == ["-I", "-c"]
+    assert argv[3].startswith("import sys; sys.path.insert(0, ")
+    assert repr(str(root)) in argv[3]
+    assert "from cti_app.infrastructure.confined_supervisor import main" in argv[3]
+    assert argv[4:] == [str(tmp_path / "supervisor.json"), "7"]
+
+
+def test_supervisor_launcher_runs_from_a_foreign_cwd_without_pythonpath(
+    tmp_path: Path,
+) -> None:
+    if not sys.platform.startswith("linux"):
+        pytest.skip("the confined supervisor requires Linux")
+    root = tmp_path / "run"
+    root.mkdir(mode=0o700)
+    scratch = root / "work"
+    scratch.mkdir(mode=0o700)
+    config = {
+        "execution_id": uuid4().hex,
+        "argv": [sys.executable, "-I", "-c", "print('isolated-child')"],
+        "cwd": str(scratch),
+        "env": {"PATH": "/usr/bin:/bin"},
+        "pass_fds": [],
+        "deny_network": False,
+        "limits": {
+            "memory_bytes": 256 * _MIB,
+            "cpu_seconds": 5,
+            "file_size_bytes": _MIB,
+            "nofile": 64,
+            "nproc": 512,
+        },
+        "filesystem": None,
+        "wall_deadline_seconds": 5.0,
+        "process_limit": 4,
+        "sweep_deadline_seconds": 3.0,
+    }
+    config_path = root / "supervisor.json"
+    config_path.write_text(json.dumps(config), encoding="ascii")
+    config_path.chmod(0o600)
+    status_read, status_write = os.pipe()
+    try:
+        process = subprocess.Popen(
+            _supervisor_argv(config_path, status_write),
+            cwd="/",
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin"},
+            pass_fds=(status_write,),
+            start_new_session=True,
+        )
+        os.close(status_write)
+        status_write = -1
+        stdout, stderr = process.communicate(timeout=15)
+        records = _read_supervisor_records(status_read)
+    finally:
+        if status_write >= 0:
+            os.close(status_write)
+        os.close(status_read)
+    assert process.returncode == 0, stderr.decode("utf-8", "replace")
+    result_record = next((record for record in records if record.get("event") == "result"), None)
+    assert result_record is not None, records
+    assert result_record.get("confinement_error") is None
+    assert result_record.get("exit_code") == 0
+    assert result_record.get("sweep_complete") is True
+    assert stdout == b"isolated-child\n"
+
+
+def test_probe_names_the_supervisor_exit_and_stderr_when_status_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A supervisor that cannot report must not leave a bare "missing" detail."""
+    if not sys.platform.startswith("linux"):
+        pytest.skip("the confined supervisor requires Linux")
+
+    def _failing_supervisor(_config: object, _status_fd: int) -> list[str]:
+        return [
+            sys.executable,
+            "-I",
+            "-c",
+            "import sys; sys.stderr.write('supervisor-import-boom'); raise SystemExit(3)",
+        ]
+
+    monkeypatch.setattr(
+        "cti_app.infrastructure.analysis_subprocess._supervisor_argv",
+        _failing_supervisor,
+    )
+    probe = probe_confined_script_execution(sys.executable, timeout_seconds=5.0)
+    assert probe.ok is False
+    assert probe.detail.startswith("probe_supervisor_status_missing:rc=3")
+    assert "supervisor-import-boom" in probe.detail

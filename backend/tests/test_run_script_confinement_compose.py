@@ -7,7 +7,9 @@ subreaper, Landlock and rlimit stack (M24.1 F2-A).
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+from typing import Any, cast
 
 import yaml
 
@@ -16,9 +18,9 @@ from cti_app.application.confined_analysis import CONFINED_SCRIPT_MAX_PROCESSES_
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _compose_document() -> dict:
+def _compose_document() -> dict[str, Any]:
     with (_REPOSITORY_ROOT / "compose.yaml").open(encoding="utf-8") as handle:
-        return yaml.safe_load(handle)
+        return cast("dict[str, Any]", yaml.safe_load(handle))
 
 
 def test_analysis_worker_keeps_the_script_platform_boundaries() -> None:
@@ -58,3 +60,35 @@ def test_worker_image_still_runs_as_the_unprivileged_uid() -> None:
     assert "useradd --system --uid 10001 analysis" in dockerfile
     assert "USER analysis" in dockerfile
     assert "USER root" not in dockerfile
+
+
+def test_container_verification_script_keeps_the_production_worker_options() -> None:
+    """The on-demand battery must run under the same container backstops (F2-B).
+
+    It runs ``docker run --rm`` only, so this is a static contract: the script
+    is allowed to exist for operators but CI never starts Docker.
+    """
+    script = _REPOSITORY_ROOT / "scripts" / "ops" / "verify_run_script_confinement_container.sh"
+    assert script.is_file()
+    assert os.access(script, os.X_OK)
+    text = script.read_text(encoding="utf-8")
+    assert text.startswith("#!/usr/bin/env bash")
+    assert "set -euo pipefail" in text
+    for option in (
+        "timeout 120 docker run --rm",
+        "--network none",
+        "--user 10001:10001",
+        "--read-only",
+        "--tmpfs /tmp:rw,noexec,nosuid,nodev,size=512m",
+        "--cap-drop ALL",
+        "--security-opt no-new-privileges:true",
+        "--pids-limit 128",
+        "--memory 2g",
+        "--cpus 2",
+        "--ulimit core=0",
+        "cti-bulletin-analysis-worker:latest",
+        "probe_confined_script_execution",
+        "probe_script_sandbox",
+        "final_proc_oracle",
+    ):
+        assert option in text, option
