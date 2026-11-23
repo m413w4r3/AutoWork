@@ -22,7 +22,10 @@ H0 list. The adapter never assumes them:
 * MCP config schema / shim tool exposure -> generated and strict, but a
   failure leaves no tools (fail closed, no fallback MCP server);
 * ``--bare`` auth and even ``--restricted`` file-tool behaviour -> host-spike
-  items; they cannot be exercised offline.
+  items; they cannot be exercised offline.  ``--bare`` accepts only an API key
+  and never reads OAuth (``--help``), so a session configured with the
+  operator's credential file omits it and seeds
+  ``$HOME/.claude/.credentials.json`` 0600 instead.
 
 Registration hook (one line, for the orchestrator; H4 owns ``adapters/__init__``
 on its branch). Inside ``sessions/supervisor.default_profiles()``, add a
@@ -68,6 +71,7 @@ ADAPTER_KIND = "claude"
 DEFAULT_MAX_BUDGET_USD = "1.00"
 MAX_PROMPT_ARGV_BYTES = 96 * 1024
 MAX_PROBE_OUTPUT_BYTES = 256 * 1024
+MAX_CREDENTIAL_BYTES = 1024 * 1024
 PROBE_TIMEOUT_SECONDS = 5.0
 MAX_STREAM_LINE_BYTES = 1024 * 1024
 MAX_FINAL_MESSAGE_BYTES = 256 * 1024
@@ -357,8 +361,10 @@ def _capabilities(*, resume_proven: bool) -> tuple[ProvenCapability, ...]:
                 "apiKeyHelper via --settings; the host credential set is unknown"
             ),
             conservative_behaviour=(
-                "the adapter fabricates no credential env or config; an auth "
-                "failure is a failed run (fail closed) that the host spike resolves"
+                "without an explicit credential file the adapter passes --bare "
+                "(no OAuth, fail closed on auth); with a seeded credential file "
+                "it omits --bare so the CLI can read its own login, keeps "
+                "--restricted and --strict-mcp-config, and never logs the file"
             ),
         ),
         ProvenCapability(
@@ -572,6 +578,7 @@ class ClaudeProfile:
         resume_proven: bool = False,
         max_budget_usd: str = DEFAULT_MAX_BUDGET_USD,
         mcp_python: Path | str | None = None,
+        credentials_file: Path | str | None = None,
         probe_timeout_seconds: float = PROBE_TIMEOUT_SECONDS,
         confinement_probe: Callable[[], ConfinementProbe] | None = None,
         network_mode: str = process.NETWORK_MODE_ISOLATED_EGRESS,
@@ -579,11 +586,14 @@ class ClaudeProfile:
     ) -> None:
         if network_mode not in process.CLI_NETWORK_MODES:
             raise ValueError("network_mode must be a closed CLI network mode")
+        if credentials_file is not None and not Path(credentials_file).is_absolute():
+            raise ValueError("credentials_file must be an absolute path")
         self._binary = None if binary is None else Path(binary)
         self._bwrap_binary = None if bwrap_binary is None else Path(bwrap_binary)
         self._resume_proven = bool(resume_proven)
         self._max_budget_usd = _validate_budget(max_budget_usd)
         self._mcp_python = None if mcp_python is None else Path(mcp_python)
+        self._credentials_file = None if credentials_file is None else Path(credentials_file)
         self._probe_timeout_seconds = float(probe_timeout_seconds)
         self._confinement_probe = confinement_probe
         self._network_mode = network_mode
@@ -599,6 +609,7 @@ class ClaudeProfile:
         return cls(
             binary=_environment_path("AUTOWORK_CLAUDE_BINARY"),
             bwrap_binary=_environment_path("AUTOWORK_CLAUDE_BWRAP"),
+            credentials_file=_environment_path("AUTOWORK_CLAUDE_CREDENTIALS_FILE"),
             resume_proven=resume,
             network_mode=process.network_mode_from_environment(),
         )
@@ -822,6 +833,7 @@ class ClaudeProfile:
             if total > MAX_PROMPT_ARGV_BYTES:
                 raise ClaudePromptUnavailableError(total, MAX_PROMPT_ARGV_BYTES)
         mcp_config_path = self._prepare_session_config(context)
+        self._install_credentials(context)
         argv = self._claude_argv(context, binary, prompt_text, mcp_config_path)
         bwrap_argv = process.build_bwrap_argv(
             tuple(argv),
@@ -887,17 +899,27 @@ class ClaudeProfile:
             "--disallowedTools",
             ",".join(DISALLOWED_TOOLS),
             "--restricted",
-            "--bare",
-            "--mcp-config",
-            str(mcp_config_path),
-            "--strict-mcp-config",
-            "--add-dir",
-            str(context.scratch_directory),
-            "--max-budget-usd",
-            self._max_budget_usd,
-            "--append-system-prompt",
-            self._system_prompt(context),
         ]
+        if self._credentials_file is None:
+            # ``--bare`` accepts only ANTHROPIC_API_KEY/apiKeyHelper and never
+            # reads OAuth (claude --help 2.1.284).  With a seeded credential
+            # file the profile must read it, so --bare is omitted; the
+            # private HOME, --restricted (user/project/local settings
+            # ignored) and --strict-mcp-config keep the closed surface.
+            argv.append("--bare")
+        argv.extend(
+            (
+                "--mcp-config",
+                str(mcp_config_path),
+                "--strict-mcp-config",
+                "--add-dir",
+                str(context.scratch_directory),
+                "--max-budget-usd",
+                self._max_budget_usd,
+                "--append-system-prompt",
+                self._system_prompt(context),
+            )
+        )
         model = context.record.model
         if model is not None:
             if MODEL_PATTERN.fullmatch(model) is None:
@@ -945,6 +967,50 @@ class ClaudeProfile:
             "AUTOWORK_SESSION_SOCKET": str(context.ipc_socket_path),
             BROKER_SOCKET_ENV: str(_broker_socket_path(context)),
         }
+
+    def _install_credentials(self, context: LaunchContext) -> None:
+        """Seed the private HOME with the user's OAuth credential file, 0600.
+
+        ``--bare`` never reads OAuth (``claude --help`` 2.1.284), so a session
+        that must use the CLI's own login omits it and reads the credentials
+        from ``$HOME/.claude/.credentials.json``.  This is the operator's
+        provider credential, not an AutoWork secret: it is copied 0600 into
+        the per-session runtime HOME, never put in argv/env/logs, and the
+        supervisor's disposable runtime is destroyed at close.  A token the
+        CLI refreshed on an earlier run of the same session is kept.
+        """
+        source = self._credentials_file
+        if source is None:
+            return
+        home = context.config_directory / "home"
+        _ensure_private_directory(home)
+        directory = home / ".claude"
+        _ensure_private_directory(directory)
+        target = directory / ".credentials.json"
+        if target.exists():
+            return
+        data = _read_credential_bytes(source)
+        if data is None:
+            raise CapabilityUnavailableError(ADAPTER_KIND)
+        try:
+            fd = os.open(
+                target,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+            )
+            try:
+                os.fchmod(fd, 0o600)
+                view = memoryview(data)
+                while view:
+                    written = os.write(fd, view)
+                    if written <= 0:
+                        raise OSError("the credential write made no progress")
+                    view = view[written:]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError as exc:
+            raise SessionError("the session credential cannot be installed") from exc
 
     def _readonly_binds(self, binary: Path) -> tuple[Path, ...]:
         candidates: list[Path] = []
@@ -1055,6 +1121,30 @@ def _broker_socket_path(context: LaunchContext) -> Path:
     supervisor binds is exactly what the sandboxed shim connects to.
     """
     return context.ipc_socket_path.parent / BROKER_SOCKET_FILE_NAME
+
+
+def _read_credential_bytes(path: Path) -> bytes | None:
+    """Read one regular credential file, never a symlink, bounded; no logging."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_CREDENTIAL_BYTES:
+            return None
+        chunks: list[bytes] = []
+        remaining = MAX_CREDENTIAL_BYTES
+        while remaining > 0:
+            chunk = os.read(fd, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    finally:
+        os.close(fd)
+    data = b"".join(chunks)
+    return data or None
 
 
 def _validate_budget(value: str) -> str:
