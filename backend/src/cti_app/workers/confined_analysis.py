@@ -62,7 +62,13 @@ from cti_app.domain.local_analysis import (
 from cti_app.domain.rule_workbench import YaraExecutionStatus, detect_file_format_magic
 from cti_app.infrastructure.analysis_subprocess import (
     AnalysisSubprocessStatus,
+    DescendantSupervision,
+    LandlockPaths,
+    probe_confined_script_execution,
     run_analysis_subprocess,
+    runtime_read_directories,
+    runtime_read_files,
+    runtime_write_files,
     set_process_dumpable,
 )
 from cti_app.infrastructure.capa import CapaRunner, parse_capa_output, ruleset_manifest
@@ -578,34 +584,23 @@ def _probe_bwrap_script_sandbox(interpreter: str) -> bool:
 
 
 def _probe_seccomp_script_sandbox(interpreter: str) -> bool:
-    from cti_app.infrastructure.seccomp_network import install_network_seccomp_filter
-
-    try:
-        completed = subprocess.run(
-            [interpreter, "-I", "-c", _SCRIPT_NETWORK_PROBE],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-            env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
-            preexec_fn=install_network_seccomp_filter,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return completed.returncode == 0
+    """Prove Landlock, the script seccomp filter and the subreaper end to end."""
+    return probe_confined_script_execution(interpreter).ok
 
 
 def probe_script_sandbox() -> ScriptSandboxCapability:
     """Prove which confinement stack can actually run a network-denied script.
 
     ``bwrap`` proves namespace filesystem isolation and network denial in one
-    execution. Without it, the seccomp filter alone still denies network calls;
-    the analysis-worker container supplies the filesystem boundary in that
-    deployment. No path returns a capability that was not executed. The probe
-    runs again before each script because host user namespaces can refuse
-    namespace creation transiently; a failed probe selects the seccomp-only
-    profile instead of launching a less confined process silently.
+    execution. Without it, the seccomp profile must prove Landlock (filesystem
+    reads/writes confined to the runtime roots, the canonical input and the
+    scratch; ``/proc`` denied), the script seccomp filter (network, signal,
+    namespace and tracing syscalls denied) and the subreaper descendant sweep
+    in one real execution; if any of those is unavailable the profile is
+    refused instead of running with a weaker boundary. No path returns a
+    capability that was not executed. The probe runs again before each script
+    because an unprivileged kernel feature can be refused transiently; a
+    failed probe selects a typed confinement refusal, never a silent downgrade.
     """
     interpreter = shutil.which("python3")
     if interpreter is None:
@@ -613,7 +608,9 @@ def probe_script_sandbox() -> ScriptSandboxCapability:
     if _probe_bwrap_script_sandbox(interpreter):
         return ScriptSandboxCapability("bwrap", "namespaces_and_seccomp_network_denied")
     if _probe_seccomp_script_sandbox(interpreter):
-        return ScriptSandboxCapability("seccomp", "seccomp_network_denied_container_filesystem")
+        return ScriptSandboxCapability(
+            "seccomp", "seccomp_landlock_subreaper_descendant_sweep_verified"
+        )
     return ScriptSandboxCapability(None, "network_confinement_probe_failed")
 
 
@@ -891,6 +888,8 @@ def _script_status(status: AnalysisSubprocessStatus, stderr: bytes) -> tuple[str
         return "DIRECTORY_LIMIT", "script_scratch_quota_exceeded"
     if status is AnalysisSubprocessStatus.PROCESS_LIMIT:
         return "PROCESS_LIMIT", "script_process_limit_exceeded"
+    if status is AnalysisSubprocessStatus.CONFINEMENT_VIOLATION:
+        return "FAILED", "script_confinement_violation"
     if status is AnalysisSubprocessStatus.NON_ZERO_EXIT:
         if stderr.lstrip().startswith(b"bwrap:"):
             return "UNAVAILABLE", "script_sandbox_failed"
@@ -981,6 +980,19 @@ async def _run_script(
             return {"status": "FAILED", "available_reason": "script_input_mutated"}
 
         async def execute_launch(launch: _ScriptLaunch) -> Any:
+            filesystem = None
+            if sandbox.kind == "seccomp":
+                filesystem = LandlockPaths(
+                    read_directories=runtime_read_directories(),
+                    read_files=runtime_read_files(script_path, input_path),
+                    write_directories=(scratch,),
+                    write_files=runtime_write_files(),
+                )
+            supervision = DescendantSupervision(
+                wall_deadline_seconds=spec.wall_seconds + 10.0,
+                process_limit=spec.max_processes,
+                filesystem=filesystem,
+            )
             try:
                 return await run_analysis_subprocess(
                     launch.argv,
@@ -998,6 +1010,7 @@ async def _run_script(
                     pass_fds=launch.pass_fds,
                     cwd=launch.cwd,
                     sample_usage=True,
+                    supervision=supervision,
                 )
             finally:
                 if launch.seccomp_file is not None:
@@ -1074,6 +1087,14 @@ async def _run_script(
             "detail_code": detail_code,
             "sandbox": sandbox.kind,
             "sandbox_detail": sandbox.detail,
+            "filesystem_confinement": (
+                "landlock" if sandbox.kind == "seccomp" else "bwrap_namespaces"
+            ),
+            "execution_id": execution.execution_id,
+            "sweep_complete": execution.sweep_complete,
+            "survivors": list(execution.survivors),
+            "descendants_killed": list(execution.descendants_killed),
+            "confinement_error": execution.confinement_error,
             "interpreter": spec.interpreter,
             "interpreter_version": interpreter_version,
             "logical_argv": list(launch.logical_argv),
@@ -2823,6 +2844,12 @@ def _reduce_result(result: Mapping[str, Any]) -> dict[str, Any]:
             "invalid_eve_lines",
             "sandbox",
             "sandbox_detail",
+            "filesystem_confinement",
+            "execution_id",
+            "sweep_complete",
+            "survivors",
+            "descendants_killed",
+            "confinement_error",
             "interpreter",
             "interpreter_version",
             "logical_argv",

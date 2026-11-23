@@ -442,6 +442,14 @@ services:
       - /tmp:rw,noexec,nosuid,nodev,size=512m
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
+    # Agent-authored scripts run behind the per-execution subreaper: kernel
+    # rlimits per script, Landlock read/write roots, a script-only seccomp
+    # filter and a bounded descendant sweep (analysis_subprocess.py,
+    # confined_supervisor.py). The container keeps the aggregate backstops:
+    # no core dumps, bounded pids, memory and CPUs, read-only rootfs, no
+    # capabilities and no egress network.
+    ulimits:
+      core: 0
     # This cgroup limit bounds aggregate resident memory. .NET and HotSpot
     # subprocesses also have fixed heap caps; their 8 GiB RLIMIT_AS only bounds
     # virtual address space. The worker /tmp tmpfs is limited to 512 MiB.
