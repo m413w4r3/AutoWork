@@ -379,6 +379,23 @@ class SqlAlchemyInvestigationTaskRepository:
         row = result.scalar_one_or_none()
         return _task_from_row(row) if row is not None else None
 
+    async def set_handoff_ref(self, task_id: UUID, handoff_id: UUID) -> InvestigationTaskV1 | None:
+        """Point the task at its current handoff; never a status CAS.
+
+        ``handoff_ref`` is row metadata: the D5 handoff row owns its own
+        immutability, so stamping the newest version changes neither the task
+        status/version nor its event journal.
+        """
+        result = await self._session.execute(
+            update(InvestigationTaskRow)
+            .where(InvestigationTaskRow.id == task_id)
+            .values(handoff_ref=handoff_id)
+            .returning(InvestigationTaskRow)
+            .execution_options(populate_existing=True, synchronize_session=False)
+        )
+        row = result.scalar_one_or_none()
+        return _task_from_row(row) if row is not None else None
+
     async def acquire_lease(
         self,
         task_id: UUID,
