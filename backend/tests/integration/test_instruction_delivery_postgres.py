@@ -656,6 +656,78 @@ def test_terminal_session_delivery_proof_is_still_extracted(
     asyncio.run(run())
 
 
+def test_terminal_unknown_rows_never_starve_a_live_reconciliation(
+    migrated_postgres_url: str,
+) -> None:
+    """R4C-F1: live and terminal unknown rows get separate reconciliation quotas.
+
+    Fifty unprovable ``delivery_unknown`` rows of lost sessions are the oldest,
+    so one shared oldest-first ``LIMIT`` never reaches the newer ambiguous row
+    of a live session: its journal proof is not read and its next ``queued``
+    instruction stays blocked.  Each population is bounded separately.
+    """
+
+    async def run() -> None:
+        engine = create_postgres_engine(migrated_postgres_url)
+        try:
+            factory = create_session_factory(engine)
+            investigation = await _seed_investigation(factory)
+            unknown_at = NOW - timedelta(seconds=600)
+            host = _FakeHost()
+            for index in range(50):
+                lost_session = await _seed_leased_session(factory, investigation.id)
+                host.unreachable.add(lost_session.id)
+                await _seed_delivery_unknown(
+                    factory,
+                    lost_session,
+                    text=f"unprovable instruction {index}",
+                    key=f"pg-lost-unknown-starve-{uuid4().hex[:8]}",
+                    at=unknown_at + timedelta(seconds=index),
+                )
+                async with SqlAlchemyUnitOfWork(factory) as uow:
+                    current = await uow.agent_sessions.get(lost_session.id)
+                    assert current is not None
+                    lost = current.with_state(AgentSessionState.LOST, now=NOW)
+                    stored = await uow.agent_sessions.update_state(
+                        lost, expected_state_version=current.state_version
+                    )
+                    assert stored is not None
+                    await uow.commit()
+            live = await _seed_leased_session(factory, investigation.id)
+            text = "Consumed by the live run."
+            live_unknown = await _seed_delivery_unknown(
+                factory,
+                live,
+                text=text,
+                key=f"pg-live-unknown-starve-{uuid4().hex[:8]}",
+                at=NOW - timedelta(seconds=GRACE_SECONDS + 1),
+            )
+            host.events = (
+                HostSessionEventV1(
+                    seq=1,
+                    kind="instruction_delivered",
+                    at=live_unknown.delivery_unknown_at or live_unknown.updated_at,
+                    payload={
+                        "instruction_id": str(live_unknown.id),
+                        "sha256": live_unknown.delivery_sha256,
+                        "mode": "next_run",
+                    },
+                ),
+            )
+
+            report = await _delivery_service(factory, host).drain_once()
+
+            assert report.reconciled_delivered == 1
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                proven = await uow.agent_sessions.get_instruction(live_unknown.id)
+            assert proven is not None
+            assert proven.state is InstructionState.DELIVERED
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
 def test_non_deliverable_unknown_rows_never_starve_the_delivery_batch(
     migrated_postgres_url: str,
 ) -> None:

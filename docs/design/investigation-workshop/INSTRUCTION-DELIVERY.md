@@ -146,7 +146,10 @@ backend est déjà `awaiting_instruction` (INS-01). (b) Boucle de fond toutes le
 `pg_try_advisory_xact_lock(hashtextextended('m24.instruction-drain',0))`. Elle réconcilie
 d’abord les `delivering` périmés et `delivery_unknown` — requêtes dédiées sur **toutes** les
 sessions, car une tentative d’une session devenue terminale doit encore se résoudre (R4B-F1/F2)
-— puis draine les `queued` par `(queued_at,id)`. Candidat de **livraison** = session active
+— puis draine les `queued` par `(queued_at,id)`. La réconciliation `delivery_unknown` lit
+**deux lots bornés indépendants**, sessions actives puis sessions terminales : un lot unique
+plus-ancien-d’abord laisserait 50 lignes terminales inconcluables affamer indéfiniment une
+ligne plus récente d’une session vivante (R4C-F1). Candidat de **livraison** = session active
 portant une instruction `queued` uniquement : une ligne `delivering|delivery_unknown` n’est
 jamais livrable et ne doit pas occuper le lot borné (R4-F2 résiduel). L’index partiel §4 reste
 utilisé.

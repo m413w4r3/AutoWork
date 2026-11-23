@@ -654,12 +654,18 @@ class AgentSessionRepository(Protocol):
         ...
 
     async def list_reconcilable_unknown(
-        self, *, unknown_before: datetime, limit: int
+        self,
+        *,
+        unknown_before: datetime,
+        limit: int,
+        session_active: bool | None = None,
     ) -> tuple[AgentSessionInstructionV1, ...]:
-        """``delivery_unknown`` rows older than the grace on ANY session (R4B-F2).
+        """``delivery_unknown`` rows older than the grace, oldest first (R4B-F2).
 
         The host journal can still prove a delivery after the session became
         terminal; reconciliation therefore never filters on session state.
+        ``session_active`` bounds the live and terminal populations separately
+        so unprovable terminal rows cannot starve a live row (R4C-F1).
         """
         ...
 
@@ -2303,9 +2309,17 @@ class InMemoryAgentSessionRepository:
         return tuple(stale[:limit])
 
     async def list_reconcilable_unknown(
-        self, *, unknown_before: datetime, limit: int
+        self,
+        *,
+        unknown_before: datetime,
+        limit: int,
+        session_active: bool | None = None,
     ) -> tuple[AgentSessionInstructionV1, ...]:
-        """Every session's ambiguous attempt is reconcilable after the grace."""
+        """Every session's ambiguous attempt is reconcilable after the grace.
+
+        ``session_active`` scopes the read to live or terminal sessions so the
+        caller can give each population its own bound (R4C-F1).
+        """
         if limit < 1:
             raise ValueError("limit must be >= 1")
         unknown = [
@@ -2313,9 +2327,17 @@ class InMemoryAgentSessionRepository:
             for instruction in self._instructions.values()
             if instruction.state is InstructionState.DELIVERY_UNKNOWN
             and _unknown_at(instruction) <= unknown_before
+            and (
+                session_active is None
+                or self._instruction_session_is_active(instruction) == session_active
+            )
         ]
         unknown.sort(key=lambda instruction: (_unknown_at(instruction), str(instruction.id)))
         return tuple(unknown[:limit])
+
+    def _instruction_session_is_active(self, instruction: AgentSessionInstructionV1) -> bool:
+        session = self._sessions.get(instruction.session_id)
+        return session is not None and session.state in ACTIVE_AGENT_SESSION_STATES
 
     async def update_instruction_delivery(
         self,

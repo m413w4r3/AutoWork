@@ -919,9 +919,17 @@ class InstructionDeliveryService:
         host = self._require_host()
         cutoff = now - timedelta(seconds=self._grace_seconds)
         async with self._uow_factory() as uow:
-            pending = await uow.agent_sessions.list_reconcilable_unknown(
-                unknown_before=cutoff, limit=limit
+            # The two populations get their own bounds, live sessions first:
+            # one oldest-first batch over every session lets 50 unprovable
+            # terminal rows (dead hosts after a supervisor restart) starve a
+            # newer ambiguous row of a live session for ever (R4C-F1).
+            active = await uow.agent_sessions.list_reconcilable_unknown(
+                unknown_before=cutoff, limit=limit, session_active=True
             )
+            terminal = await uow.agent_sessions.list_reconcilable_unknown(
+                unknown_before=cutoff, limit=limit, session_active=False
+            )
+        pending = (*active, *terminal)
         delivered = 0
         requeued = 0
         for instruction in pending:

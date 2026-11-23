@@ -565,13 +565,20 @@ class SqlAlchemyAgentSessionRepository:
         return tuple(_instruction_from_row(row) for row in rows)
 
     async def list_reconcilable_unknown(
-        self, *, unknown_before: datetime, limit: int
+        self,
+        *,
+        unknown_before: datetime,
+        limit: int,
+        session_active: bool | None = None,
     ) -> tuple[AgentSessionInstructionV1, ...]:
-        """Ambiguous attempts across ALL sessions, oldest first (R4B-F2).
+        """Ambiguous attempts across sessions, oldest first (R4B-F2).
 
         A terminal session can still have consumed the instruction: its host
         journal is the delivery proof, so reconciliation must not reuse the
-        active-session drain list.
+        active-session drain list.  ``session_active`` lets the caller read the
+        live and terminal populations with their own bounds: one oldest-first
+        batch over every session lets unprovable terminal rows starve a live
+        row for ever (R4C-F1).
         """
         if limit < 1:
             raise ValueError("limit must be >= 1")
@@ -579,14 +586,23 @@ class SqlAlchemyAgentSessionRepository:
             AgentSessionInstructionRow.delivery_unknown_at,
             AgentSessionInstructionRow.updated_at,
         )
-        rows = await self._session.scalars(
-            select(AgentSessionInstructionRow)
-            .where(
-                AgentSessionInstructionRow.state == InstructionState.DELIVERY_UNKNOWN.value,
-                unknown <= unknown_before,
+        statement = select(AgentSessionInstructionRow).where(
+            AgentSessionInstructionRow.state == InstructionState.DELIVERY_UNKNOWN.value,
+            unknown <= unknown_before,
+        )
+        if session_active is not None:
+            active_states = tuple(state.value for state in ACTIVE_AGENT_SESSION_STATES)
+            session_scope = (
+                AgentSessionRow.state.in_(active_states)
+                if session_active
+                else ~AgentSessionRow.state.in_(active_states)
             )
-            .order_by(unknown, AgentSessionInstructionRow.id)
-            .limit(limit)
+            statement = statement.join(
+                AgentSessionRow,
+                AgentSessionRow.id == AgentSessionInstructionRow.session_id,
+            ).where(session_scope)
+        rows = await self._session.scalars(
+            statement.order_by(unknown, AgentSessionInstructionRow.id).limit(limit)
         )
         return tuple(_instruction_from_row(row) for row in rows)
 
