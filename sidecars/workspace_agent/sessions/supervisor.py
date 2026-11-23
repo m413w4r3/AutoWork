@@ -2454,6 +2454,19 @@ class SessionSupervisor:
         else:
             record.state = SessionState.FAILED
             record.outcome = "failed"
+        if record.state in (SessionState.STOPPED, SessionState.FAILED) and (
+            record.outcome != CREDENTIAL_CLEANUP_REASON
+        ):
+            # R4-F9: an interrupted or failed CLI can rewrite its credential
+            # file while it shuts down, after the interrupt-time purge.  The
+            # process is gone and this outcome never reaches the reusable
+            # receive point, so purge again; a failed cleanup is recorded as
+            # the typed failure by ``_fail_credential_cleanup`` and must not
+            # abort the exit finalization.
+            try:
+                self._purge_provider_credentials(handle, operation=record.outcome or "exit")
+            except CredentialCleanupError:
+                pass
         # The run is over: the relay refuses (state gate) and both listeners,
         # in-flight connections/tunnels and the one-shot secret are torn down.
         # The in-memory secret stays for the next run's re-arm.

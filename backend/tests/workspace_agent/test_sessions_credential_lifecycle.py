@@ -32,6 +32,7 @@ from sidecars.workspace_agent.sessions.supervisor import (
 
 from tests.workspace_agent.sessions_support import (
     SESSION_ID,
+    fake_script,
     hang_script,
     prepare_payload,
     wait_until,
@@ -195,6 +196,38 @@ def test_interrupt_removes_the_seeded_credential_copies(
         idempotency_key="m24-r2b1-interrupt-0001",
         body_sha256="e" * 64,
     )
+
+    assert all(not path.exists() for path in planted)
+
+
+def test_failed_run_end_removes_a_surviving_credential_copy(
+    session_base: Path, scripted_supervisors: list[sessions_module.SessionSupervisor]
+) -> None:
+    """R4-F9: finalizing a terminal run purges copies left after shutdown.
+
+    An interrupted or failed CLI can rewrite its credential file while it
+    stops, after the interrupt-time purge.  Once the process is gone the
+    supervisor purges again for the outcomes that never reach the reuse
+    point, so no copy outlives a terminal run.
+    """
+    environment = make_scan_environment(session_base)
+    supervisor = _supervisor(session_base, environment)
+    scripted_supervisors.append(supervisor)
+    _prepare(supervisor, environment)
+    script = _session_dir(session_base) / "fake-script.json"
+    script.write_text(
+        json.dumps(fake_script([{"op": "crash", "code": 1}])), encoding="utf-8"
+    )
+    os.chmod(script, 0o600)
+    planted = _plant_credentials(session_base)
+    supervisor.start(
+        SESSION_ID,
+        StartSessionRequest(),
+        idempotency_key="m24-r2b1-start-0002",
+        body_sha256="b" * 64,
+    )
+
+    wait_until(lambda: supervisor.status(SESSION_ID)["state"] == "failed")
 
     assert all(not path.exists() for path in planted)
 
