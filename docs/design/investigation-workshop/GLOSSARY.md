@@ -92,6 +92,30 @@ _À éviter_ : flags supposés, matrice commerciale, promesse d’interface.
 **Réconciliation de session** : classification typée, après perte ou redémarrage, entre session vivante, arrêt propre, perte avec passation, perte non réconciliée et reprise disponible ou non.
 _À éviter_ : relance automatique, succès supposé, réessai aveugle.
 
+**Instruction de session** : texte humain borné déposé pour une session, persisté avec son SHA et ses références de notes ; il n'est ni preuve, ni résultat, ni décision.
+_À éviter_ : message de chat, prompt système, observation.
+
+**File d'instruction** : lignes non terminales d'une session, ordonnées par `(queued_at,id)` ; une ligne n'est jamais livrée à l'aveugle.
+_À éviter_ : file volatile de l'hôte, transcript de conversation.
+
+**Point de réception** (`awaiting_instruction`) : état technique de session produit par le superviseur quand un run finit proprement et que la session reste ouverte ; c'est le point où une instruction en file peut être livrée. Distinct du statut métier `awaiting_input`.
+_À éviter_ : `awaiting_input` métier, relance implicite, adoption d'un run perdu.
+
+**Livraison d'instruction** : remise d'une instruction de la file à l'hôte au point de réception, pilotée par le backend. États fermés : `queued`, `delivering`, `delivered`, `acknowledged`, `delivery_unknown`, `cancelled`.
+_À éviter_ : mise en file hôte comptée comme livraison, re-livraison aveugle, livraison poussée par l'hôte.
+
+**Essai de livraison** (`delivery_token`, `delivery_attempts`) : réservation CAS d'un seul drainer ; le jeton identifie l'essai en vol et n'est effacé qu'après un reçu prouvé ou un refus prouvé.
+_À éviter_ : verrou de session générique, essai non identifié, seconde réservation concurrente.
+
+**Reçu de livraison** (`delivered`, `delivery_mode`) : preuve que l'instruction a atteint l'hôte. En v1 le mode est `next_run` : un nouveau run est lancé avec le texte livré dans son prompt ; `delivery_sha256` et `delivery_note_diffs` fixent le texte exact. `live` est une optimisation future gatée par la sonde, jamais supposée.
+_À éviter_ : acceptation de file hôte, `outcome_unknown` promu en succès, mode `live` revendiqué sans preuve.
+
+**Livraison ambiguë** (`delivery_unknown`) : l'effet hôte n'est ni prouvé ni infirmé (timeout, transport, crash entre les phases) ; elle est réconciliée depuis l'événement hôte `instruction_delivered` (id + SHA) ou l'ack, sans renvoi, et ne retombe en `queued` que si un hôte vivant prouve l'absence de remise.
+_À éviter_ : nouvel essai immédiat, message perdu supposé, `delivering` éternel.
+
+**Acquittement d'instruction** (`acknowledged`) : accusé signé de l'opérateur (`instruction.ack`, 1 à 32 ids) après lecture ; terminal et idempotent. Il prouve une lecture déclarée par un processus autorisé, pas la compréhension ni le résultat technique.
+_À éviter_ : preuve CTI, succès de tâche, ack d'une instruction `queued`.
+
 **Passation** (`InvestigationHandoffV1`) : version immuable et hashée du contexte nécessaire au prochain acteur — objectif, hypothèses, tentatives, résultats, limites, fichiers utiles, références et prochaine action.
 _À éviter_ : transcription de conversation, copie d’octets, preuve, fichier de workspace.
 
@@ -150,3 +174,6 @@ _À éviter_ : édition humaine silencieuse, `bridge_authored` déclaré par le 
 | consultation et proposition de note comme synonymes | consultation Bridge (avis) ou proposition de note (texte éditorial en attente) |
 | provenance déclarée et provenance vérifiée | provenance Bridge vérifiée depuis l’observation persistée |
 | `legacy` et `bridge_only` comme préférences d’affichage | autorité de prose immuable de l’enquête |
+| instruction livrée et instruction acquittée | `delivered` (reçu hôte prouvé) ou `acknowledged` (accusé signé) |
+| `awaiting_input` et `awaiting_instruction` | statut métier de tâche ou point de réception technique de session |
+| file d’instruction et historique de livraison | `queued`/`delivering`/`delivery_unknown` (en cours) ou `delivered`/`acknowledged` (acquis) |

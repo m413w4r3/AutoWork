@@ -9,6 +9,19 @@ supervisor↔backend wire, and the provider profiles. Closes the gap between ADR
 analysis-worker capability registry itself (H3 below), cockpit UI (09). No production code here.
 PostgreSQL/MinIO remain canonical; host files, logs and model output are never evidence.
 
+**M24.1 revision (2026-11-23, DOC-1).** The delivered network model is
+[BROKER-RELAY-EGRESS.md](BROKER-RELAY-EGRESS.md) and supersedes every earlier slirp4netns
+statement of this document: `bwrap --unshare-net` only (interface `lo`, no route), a trusted
+in-sandbox entrypoint forwarder on `127.0.0.1:3128` byte-piping to the host CONNECT proxy over
+`ipc/egress.sock`, and the shim sending signed HTTP over the per-session `ipc/broker.sock`
+relay. `slirp4netns`, `--disable-host-loopback`, `host_network_unsafe` and
+`AUTOWORK_BACKEND_URL` are gone from every production path. The instruction-delivery
+"Known gap" of §3bis is replaced by [INSTRUCTION-DELIVERY.md](INSTRUCTION-DELIVERY.md),
+delivered as `0027_instruction_delivery`, `0028_task_context_consultations` and
+`application/instruction_delivery.py`. Claims below were re-read at `1c88ac5b` in
+`sessions/process.py`, `sessions/entrypoint.py`, `sessions/relay.py`, `sessions/egress.py`,
+`sessions/supervisor.py`, `sessions/shim.py` and both adapters.
+
 Terminology: [GLOSSARY.md](GLOSSARY.md). Workspace contract: [WORKSPACE-AGENT.md](WORKSPACE-AGENT.md).
 Operator facts: `.autowork-runs/m24/00-inventory-host-frontend.md` §A/§B.
 
@@ -18,11 +31,11 @@ Operator facts: `.autowork-runs/m24/00-inventory-host-frontend.md` §A/§B.
 |---|---|
 | Where the supervisor lives | New subpackage `sidecars/workspace_agent/sessions/`, same process, same AF_UNIX socket, same bearer token as the workspace agent; `/v1/sessions/**` stops returning 404 (`sidecars/workspace_agent/http_server.py:192-193,314-316`). Stdlib only, like the rest (WORKSPACE-AGENT:28). |
 | Session runtime location | `${XDG_RUNTIME_DIR}/autowork-workspace/sessions/<session_id>/` (0750 dir, 0600 files), **never** in the workspace. The workspace receives only captured notes/results through the existing file routes. |
-| Session secret | Derived by the backend (ADR D7:189). It transits the UDS once in `POST /v1/sessions`, is held in supervisor memory only (never disk), and is handed once over a per-session 0600 UDS socket to the shim process. Never in argv, env, config file, workspace, prompt or log. |
-| Reasoning session | The CLI runs inside a user-level `bwrap` sandbox in its **own network namespace** (`--unshare-net`) with a slirp4netns gateway that has `--disable-host-loopback`; allowlisted read-only binds, rw scratch, scrubbed env, per-session `HOME`/`CODEX_HOME`/`CLAUDE_CONFIG_DIR`, cwd = session scratch. The mode is the closed `AGENT_SESSIONS_CLI_NETWORK_MODE` (`isolated_egress` default; `host_network_unsafe` is an explicit dev override). Fail-closed if `bwrap`, `slirp4netns` or the loopback attestation is unavailable. |
+| Session secret | Derived by the backend (ADR D7:189). It transits the UDS once in `POST /v1/sessions`, is held in supervisor memory only (never disk), and is handed over a per-session 0600 UDS socket to the shim process; that one-shot socket is re-armed before every run from memory. Never in argv, env, config file, workspace, prompt or log. |
+| Reasoning session | The CLI runs inside a user-level `bwrap` sandbox in its **own network namespace** (`--unshare-net`, only `lo`, no route); allowlisted read-only binds, rw scratch, scrubbed env, per-session `HOME`/`CODEX_HOME`/`CLAUDE_CONFIG_DIR`, cwd = session scratch. Egress is provider-only: a trusted in-sandbox `entrypoint.py` forwarder byte-pipes to the host CONNECT proxy (`ipc/egress.sock`, per-adapter exact-host allowlist), and the broker path goes over the per-session `ipc/broker.sock` relay. `AGENT_SESSIONS_CLI_NETWORK_MODE` is the closed single value `isolated_egress`; `host_network_unsafe`, slirp4netns and `--disable-host-loopback` are removed. Fail-closed if `bwrap`, the entrypoint or the netns attestation is unavailable. |
 | Technical execution | Agent-written scripts run **only** through the attested `analysis-worker` via a new typed broker tool `analysis.run_script` (H3). Host `bwrap` is never the script boundary; no arbitrary shell is ever exposed to the model. |
-| What the CLI can call | Only the generated MCP tool catalogue served by the shim: the broker tools allowed for this session, `bridge.consult` (mapped to `advisor.consult`), `task.heartbeat`, `task.submit_result`, `handoff.submit`, `note.capture`. No generic shell, HTTP, URL or path passthrough. |
-| Who talks to the backend | Only the shim, a separate per-session process signed with the ADR D7 HMAC. The workspace-agent service still opens no outbound connection (WORKSPACE-AGENT:11-13); the shim is a distinct narrow client, not a second agent. |
+| What the CLI can call | Only the generated MCP tool catalogue served by the shim: the broker tools allowed for this session, `bridge.consult` (mapped to `advisor.consult`), `task.heartbeat`, `task.submit_result`, `handoff.submit`, `note.capture`, and the fixed `instruction.pending`/`instruction.ack` pair. No generic shell, HTTP, URL or path passthrough. |
+| Who talks to the backend | The shim signs with the ADR D7 HMAC and sends one HTTP/1.1 request per connection over the per-session `ipc/broker.sock`; the supervisor's relay (same workspace-agent process) forwards a closed route set byte-exact to a fixed loopback backend URL and never re-signs, never chooses a URL and follows no redirect. The sandboxed CLI has no backend URL and no direct outbound path; this relay loopback connection plus the provider CONNECT proxy are the only host egress exceptions (WORKSPACE-AGENT §1 amendment). |
 | Session model | One session = one or more **runs**. Claude prefers one long `-p --input-format stream-json` process; Codex `exec` is one-shot and instructions become `codex exec resume` runs. The business state stays ADR D2/D7's; the host mirrors it. |
 | Interrupt | SIGTERM to the run's process group, 10 s grace, SIGKILL; no CLI stop flag is required (none is printed for Codex; `claude stop` targets background sessions only). |
 | Resume | Only if the real probe (version/help) plus the host spike prove it. Otherwise `409 resume_unavailable`; backend closes the old session `lost` and starts a new one with a new handoff (ADR D7:187). Never auto-relaunch. |
@@ -39,16 +52,19 @@ browser ──HTTP──> backend container
                     │  application/agentic_sessions.py (05B1: state, secret, lease)
                     │  infrastructure/agentic/{host_sessions,codex_cli,claude_code}.py
                     │        httpx over AF_UNIX, bearer token (WORKSPACE-AGENT §3.4)
-                    ▼
+                    ▲
+                    │ loopback HTTP (fixed broker backend URL)
 host: autowork-workspace-agent  ── /v1/sessions/** ──┐
         │ workspace tree, watcher, files              │
         └─ sessions/supervisor: state, bwrap profile ─┤
-             ├─ bwrap (netns + slirp4netns) ─ CLI process group  │
-             │      └─ MCP stdio ─ shim (separate) ────┼── signed HTTP ─> backend
-             │             └─ per-session UDS ────────┘   /api/investigations/... routes
-             └─ bounded logs, scratch, state (runtime dir)
+             ├─ broker relay (ipc/broker.sock) ────────┘
+             ├─ egress CONNECT proxy (ipc/egress.sock) ── CONNECT (allowlist) ─> provider
+             └─ bwrap --unshare-net (only `lo`, no route)
+                  └─ entrypoint forwarder 127.0.0.1:3128 ──> ipc/egress.sock
+                     └─ CLI process group
+                          └─ MCP stdio ─ shim ──> ipc/broker.sock (signed HTTP, D7)
 
-agent script ── shim tool analysis.run_script ──> backend broker ──> analysis-worker (Docker)
+agent script ── shim tool analysis.run_script ──> ipc/broker.sock ──> backend broker ──> analysis-worker (Docker)
 ```
 
 Three boundaries: (1) the UDS + bearer token between backend and host agent; (2) `bwrap` between
@@ -58,32 +74,44 @@ No boundary is a prompt instruction.
 
 ## 3. Reasoning session: OS profile, secrets, skills
 
-**Sandbox.** Launch argv is `bwrap --unshare-pid --unshare-ipc --unshare-uts --die-with-parent`
-(no `--unshare-net`), with `--ro-bind /usr /usr`, conditional `/lib`, `/lib64`, the resolved CLI
-runtime prefixes, `--ro-bind` of each allowed workspace path, `--ro-bind` of the session IPC
-subdirectory (`<session>/ipc/`, which contains only `shim.sock`, never state or logs; connect over
-a read-only bind uses the acquirer precedent, WORKSPACE-AGENT:84-99),
-`--bind` of the session scratch and
-per-session config, `--tmpfs /tmp`, `--proc /proc`, `--dev /dev`, `--chdir <scratch>/work`.
+**Sandbox.** Launch argv is `bwrap --unshare-pid --unshare-ipc --unshare-uts --die-with-parent
+--unshare-net` with a tmpfs root, `--proc /proc`, `--dev /dev`, `--ro-bind /usr /usr`
+(conditional `/lib`, `/lib64`), the resolved CLI runtime prefixes, `--ro-bind` of each allowed
+workspace path, `--ro-bind` of the session IPC subdirectory (`<session>/ipc/`, which contains
+only `shim.sock`, `broker.sock` and `egress.sock`, never state or logs; connect over a read-only
+bind uses the acquirer precedent, WORKSPACE-AGENT:84-99), `--bind` of the session scratch and
+per-session config, and `--chdir <scratch>/work`. That namespace has only `lo` and no route:
+`spawn` first attests it (`entrypoint.py attest` in a fresh namespace with the same profile,
+cached per bwrap/entrypoint hash) and refuses `confinement_unavailable` otherwise. The adapter's
+CLI argv is wrapped by `entrypoint.py forward-and-exec`, which sets `PR_SET_PDEATHSIG`, starts
+the `127.0.0.1:3128` byte-pipe forwarder to `ipc/egress.sock`, and only then `exec`s the CLI.
 The same idiom already builds the analysis bwrap command
-(`backend/src/cti_app/infrastructure/local_command_runner.py:893-927`); the difference is that this
-profile must keep the provider network.
+(`backend/src/cti_app/infrastructure/local_command_runner.py:893-927`); here the only network
+path is the provider forwarder, never a route.
 
 **Environment (closed set).** `PATH`, `HOME=<session>/home`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`,
 `TMPDIR`, `LANG=C.UTF-8`, `LC_ALL=C.UTF-8`, `CODEX_HOME=<session>/codex` or
-`CLAUDE_CONFIG_DIR=<session>/claude`, `AUTOWORK_SESSION_ID`, `AUTOWORK_SESSION_SOCKET`,
-`AUTOWORK_BACKEND_URL=http://127.0.0.1:8000` (the published backend port,
-`00-inventory-host-frontend.md:93`). No DB DSN, MinIO key, VT/Bridge key, proxy or
-`OPERATOR_CLIENT` token. The env allowlist idiom exists for child tools
+`CLAUDE_CONFIG_DIR=<session>/claude`, `AUTOWORK_SESSION_ID`, `AUTOWORK_SESSION_SOCKET`
+(one-shot secret handoff only), `AUTOWORK_BROKER_SOCKET=<session>/ipc/broker.sock`
+(`sessions/adapters/codex.py:553-565`, `sessions/adapters/claude.py:966-979`). No backend URL
+is ever injected. The provider proxy variables (`HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`, their
+lowercase forms, and an empty `NO_PROXY`) are set exclusively by the trusted entrypoint inside
+the netns (`sessions/entrypoint.py:517-536`), not by the adapter. No DB DSN, MinIO key,
+VT/Bridge key or `OPERATOR_CLIENT` token. The env allowlist idiom exists for child tools
 (`.../analysis_subprocess.py:91-114`) but is reimplemented in the supervisor: it is a separate
-stdlib process and must not import backend code.
+stdlib process and must not import backend code. `spawn` additionally rejects any key in
+`FORBIDDEN_CLI_ENV_KEYS`/`_TOKEN|_SECRET|_PASSWORD|_API_KEY`.
 
 **Provider credentials.** The CLI needs the user's provider auth. `prepare` seeds the per-session
-config from an explicit credential allowlist (Codex `auth.json`; the Claude credential file(s),
-exact set proven by H0), copied 0600, deleted at `close`. This is the user's provider credential,
-not an AutoWork operational secret. Residual risk: Codex's own shell runs as the same uid inside
-the sandbox and can read its config; that is accepted for Codex (H0 decides whether its shell can
-be disabled) and is why Claude runs `--restricted`.
+config from an explicit credential allowlist, copied 0600: Codex `auth.json`, and Claude
+`~/.claude/.credentials.json` (H0 attested this file is sufficient in a private HOME and that
+`--bare` must be omitted because it never reads OAuth; `docs/operations/host-cli-spike-2026-11.md`
+§2–§3). This is the user's provider credential, not an AutoWork operational secret. Residual
+risk: Codex's own shell runs as the same uid inside the sandbox and can read its config; that is
+accepted for Codex (H0 did not prove a way to disable its shell) and is why Claude runs
+`--restricted`. `close` wipes the in-memory secret, both sockets and scratch, but it currently
+keeps `config/` and `home/`, so the seeded credential copy survives until the disposable runtime
+is destroyed: deleting it at close is an open H0 follow-up (§7.1 of the spike).
 
 **Skills.** `skill_names` arrives in `PrepareSessionV1` (derived from the task's capabilities).
 The supervisor walks `--skills-root` (default `<repo>/.agents/skills`), rejects symlinks/`..`,
@@ -92,39 +120,45 @@ in the prompt brief. Native skill discovery is not trusted: Claude's flags are `
 `--setting-sources`, `--strict-mcp-config`; Codex runs with `--ignore-rules` and no AGENTS.md in
 its cwd.
 
-**Honest limits (FIX-S revision).** (a) Egress is not provider-only: the sandbox's slirp4netns
-gateway reaches arbitrary internet hosts. It *cannot* reach the host loopback
-(`--disable-host-loopback` also refuses the `10.0.2.2` gateway alias), so the Vite proxy that
-injects `OPERATOR_API_TOKEN`, the published PostgreSQL/MinIO ports and every other host-local
-service are unreachable even though the model has a shell; the real host attestation proves that
-refusal before the first session. (b) Same-uid processes can signal each other and read
-world-readable files; `PR_SET_DUMPABLE=0` on the shim blocks ptrace/procfs memory reads (idiom
-`analysis_subprocess.py:116-121`), not signals. (c) No cgroup quota: CLI memory is an
+**Honest limits (FIX-S revision, M24.1 network model).** (a) Egress is provider-only, not
+network-wide: the netns has only `lo` and no route, so the LAN, Docker, the host loopback (the
+Vite proxy that injects `OPERATOR_API_TOKEN`, the published PostgreSQL/MinIO ports) and direct
+Internet connects all fail (`ENETUNREACH`/refused); the CLI's only provider path is the
+entrypoint forwarder to the host CONNECT proxy, which enforces a per-session exact-host
+allowlist, resolves once, validates every address and pins the IP. H0 attested this with real
+provider traffic for Codex 0.163.0 and Claude 2.1.284. (b) Same-uid processes can signal each
+other and read world-readable files; `PR_SET_DUMPABLE=0` on the shim blocks ptrace/procfs memory
+reads (idiom `analysis_subprocess.py:116-121`), not signals; the CLI can read its own
+environment, which is the accepted secret residue of §7. (c) No cgroup quota: CLI memory is an
 `RLIMIT_AS`/wall-clock budget, scratch size is polled, not kernel-quota'd. (d) A malicious CLI
 binary is out of scope; the probe records version/help hashes. (e) If user namespaces, `bwrap`,
-`slirp4netns` or the loopback attestation are unavailable, `prepare` returns
-`confinement_unavailable`; there is no unconfined fallback.
+the entrypoint or the netns attestation are unavailable, `prepare` returns
+`confinement_unavailable`; there is no unconfined fallback and no `host_network_unsafe` mode.
 
 ## 3bis. Security — network isolation and disclosure gates (FIX-S, R03 B1/B2)
 
 **Network mode (closed).** `AGENT_SESSIONS_CLI_NETWORK_MODE` is read by BOTH the backend and the
-host supervisor and takes exactly two values:
+host supervisor and accepts exactly one value: `isolated_egress`.
 
-* `isolated_egress` (default): the CLI runs under `bwrap --unshare-net`; the supervisor reads
-  bwrap's `--info-fd` child pid, starts `slirp4netns --configure --disable-host-loopback` in that
-  network namespace, waits for its ready fd and only then releases bwrap's `--block-fd`. The
-  backend refuses the probe (`agent_session_network_isolation_unavailable`) unless the host
-  attested `network_mode=isolated_egress`, `netns=true` and `loopback_isolated=true`. The host
-  repeats the check, verifies the request's mode equals its own, and returns
-  `confinement_unavailable` if the loopback attestation did not succeed.
-* `host_network_unsafe`: explicit development override; the CLI shares the host network. The
-  host must attest that same mode for the backend to open a session, so a deployment that forgot
-  the override fails closed instead of silently sharing the network.
+* `isolated_egress` (only): the CLI runs under `bwrap --unshare-net`; `spawn` runs
+  `entrypoint.py attest` in a fresh namespace with the same bwrap profile and accepts only
+  `if_nameindex() == ["lo"]`, `lo` UP|LOOPBACK, an empty IPv4 route table, only `::1` as IPv6
+  route, usable loopback bind/connect, a host-loopback helper that never accepts a connection,
+  and every non-loopback probe address failing with
+  `ENETUNREACH`/`EHOSTUNREACH`/`EPERM`/`EACCES`. The backend refuses the probe
+  (`agent_session_network_isolation_unavailable`) unless the host attested
+  `network_mode=isolated_egress`, `netns=true` and `loopback_isolated=true`. The host repeats the
+  check, verifies the request's mode equals its own, and returns `confinement_unavailable` if
+  the attestation did not succeed.
+* `host_network_unsafe` is **removed** (M24.1 CFG-1/LIFE-1): the backend field is
+  `Literal["isolated_egress"]` and rejects the old value at configuration load
+  (`backend/src/cti_app/config.py:82-104`), and the supervisor refuses it at startup
+  (`sessions/process.py:193-205`, `sessions/supervisor.py:1103-1165`). There is no degraded
+  mode.
 
-The supervisor validates the mode and tool presence at startup, runs the real loopback
-attestation once per profile (a host helper binds `127.0.0.1`; the sandbox attempts to reach it;
-success requires a refusal, no accepted connection and a real `tap0`), and caches it. The CLI
-environment is a closed literal and `spawn` additionally rejects any key in
+The supervisor runs the real netns attestation once per bwrap profile and caches it for the
+process lifetime; a changed bwrap or entrypoint hash invalidates it. The CLI environment is a
+closed literal and `spawn` additionally rejects any key in
 `FORBIDDEN_CLI_ENV_KEYS`/`_TOKEN|_SECRET|_PASSWORD|_API_KEY`, so `OPERATOR_API_TOKEN`,
 `M24_AGENT_SESSION_KEY` and provider/store credentials can never reach the CLI.
 
@@ -168,23 +202,26 @@ reconcile, collect, release) are not gated because they carry no new evidence.
   committed between the workspace read and the write is a typed refusal with
   no canonical row.
 
-**Known gap (not implemented — R5 M4).** The instruction queue is write-only.
-No production path writes `awaiting_instruction`, `enqueue_instruction`
-accepts a `running` session and returns `delivered_live=false`, there is no
-signed pull/list route for `queued` instructions (only operator ack by ids),
-and `request_input` does not change the session state. A human instruction on a
-busy session is therefore persisted but never drained; it is only re-delivered
-if the session later becomes `awaiting_instruction` (no such transition exists
-today), and it otherwise remains undelivered until the lease expires and the
-sweep blocks the task. Fixing this requires a producer for
-`awaiting_instruction` and a signed pull (or an explicit re-delivery) path.
+**Instruction delivery (delivered — F3-D, supersedes the former "Known gap").** The former
+write-only queue is implemented as designed in [INSTRUCTION-DELIVERY.md](INSTRUCTION-DELIVERY.md):
+migration `0027_instruction_delivery` (six typed states with `delivery_token`, attempts, mode,
+SHA and note diffs), `application/instruction_delivery.py` as the single delivery service used by
+the lifespan loop and the inline enqueue, the backend-owned background drain, a signed
+`pull`/`ack` shim route, and the host-side receive point `awaiting_instruction` whose
+`next_run` delivery starts a new run with the delivered text in its prompt. A transport
+outcome that is neither a proven receipt nor a proven refusal is `delivery_unknown` and is
+reconciled from the host event, never re-sent blindly. Oracles:
+`tests/test_instruction_delivery.py`, `tests/test_instruction_delivery_schema.py`,
+`tests/workspace_agent/test_sessions_instruction_delivery.py` and the shim contract tests.
 
-**NOT PROVEN (H0 spike).** The real CLI accepting our argv/MCP config, the provider account and
-first model turn, live resume ids, the real stream-json behaviours, and the deployment's
-`bwrap`/`slirp4netns` availability in the intended systemd user unit remain host-spike items.
-The attestation proves *this* host's kernel behaviour (VERIFIED locally: host loopback and
-`10.0.2.2` refused, `tap0` present); it does not prove provider connectivity or that a model
-with a shell cannot abuse its own provider credential.
+**H0 status (2026-11-23).** Real Codex 0.163.0 and Claude 2.1.284 accept our argv/MCP config,
+honour the entrypoint proxy and complete provider turns; the netns attestation and the
+negative-space matrix (host loopback/LAN/Docker unreachable, allowlist enforced) were replayed
+on this host (`docs/operations/host-cli-spike-2026-11.md`). Resume with a re-armed secret
+(Codex `exec resume`), live `stream-json` instructions, and bwrap availability in the intended
+systemd user unit remain UNPROVEN; both adapters still refuse resume by default. The attestation
+proves *this* host's kernel behaviour, not that a model with a shell cannot abuse its own
+provider credential.
 
 ## 4. Technical execution: confined agent scripts
 
@@ -234,9 +271,12 @@ tools remain and no shell fallback is offered.
 
 ## 5. Host supervisor: lifecycle, processes, logs, reconciliation
 
-**Package (ownership per §11).** `sessions/state.py` (persisted state), `process.py` (bwrap builder, setsid, killpg,
-exit capture), `logs.py` (ring, sanitization, cursor), `supervisor.py` (handlers, reconcile,
-per-session IPC and one-shot secret handoff), `adapters/{base,codex,claude}.py`, `shim.py` and
+**Package (ownership per §11).** `sessions/state.py` (persisted state), `process.py` (bwrap
+builder, netns attestation, setsid, killpg, exit capture), `entrypoint.py` (trusted in-sandbox
+attestation, provider forwarder and `exec` wrapper), `relay.py` (per-session broker UDS relay),
+`egress.py` (host CONNECT proxy with exact-host allowlist), `logs.py` (ring, sanitization,
+cursor), `supervisor.py` (handlers, reconcile, per-session IPC, relay/proxy lifecycle and the
+per-run re-armed one-shot secret handoff), `adapters/{base,codex,claude}.py`, `shim.py` and
 `catalog.py` (shim side), `fake_cli.py` (testing). `http_server.py` gains only the session
 dispatch; the workspace routes are unchanged.
 
@@ -320,31 +360,38 @@ backend can cite a checkpoint in `agent_sessions.checkpoint_ref` without copying
 session config at `prepare`; the supervisor writes and registers it, and the CLI (as MCP stdio
 requires) spawns it as an MCP server. Registration mechanisms:
 - Claude (VERIFIED flags): `--mcp-config '<json>'` + `--strict-mcp-config`; the JSON names the
-  command `/usr/bin/python3.12 <session>/shim.py`, env `AUTOWORK_SESSION_SOCKET`,
-  `AUTOWORK_SESSION_ID`, `AUTOWORK_BACKEND_URL`, and no secret
-  (`00-inventory-host-frontend.md:34,48`; re-verified `claude --help` 2026-11-22).
-- Codex (partially VERIFIED): `-c key=value` exists on `codex exec` and `exec resume` and
-  `~/.codex/config.toml` is the base config (`codex exec --help`, re-verified). A per-session
-  `CODEX_HOME` with a generated `config.toml` declaring `mcp_servers.autowork` is the primary
-  mechanism; `-c mcp_servers.*` is the fallback. The exact key schema and whether `exec` exposes
-  MCP tools are **UNPROVEN** and are H0's first gate. No prompt is run in the probe.
+  command `/usr/bin/python3.12 <session>/shim.py` and passes `AUTOWORK_SESSION_ID`,
+  `AUTOWORK_SESSION_SOCKET` and `AUTOWORK_BROKER_SOCKET` in its environment, with no secret and
+  no backend URL (`00-inventory-host-frontend.md:34,48`; H0 attested the
+  `mcp__autowork__*` round trip on 2.1.284).
+- Codex (H0-attested 2026-11-23): a per-session `CODEX_HOME/config.toml` declaring
+  `mcp_servers.autowork` (command, args and the broker/session env) is the primary mechanism and
+  loaded inside `codex exec`; H0 observed `mcp_tool_call` JSONL events for
+  `autowork_instruction_pending`/`ack` carrying valid D7 HMACs, and the relay refused an
+  unlisted `note.capture`. `-c mcp_servers.*` remains the documented fallback
+  (`docs/operations/host-cli-spike-2026-11.md` §2).
 
-**Secret flow.** The supervisor holds the secret in memory. At startup the shim connects to
-`<runtime>/sessions/<id>/ipc/shim.sock` (0600, peer uid checked), receives the secret **once**, sets
-`PR_SET_DUMPABLE=0`, and drops the socket. The model cannot read shim memory, but the CLI launches
-the shim itself and can read `AUTOWORK_SESSION_SOCKET` from its own environment, so it can connect
-before the shim and receive the frame: that is an **accepted and bounded residual risk, not a
-narrow race** (`BROKER-RELAY-EGRESS.md` §8.6). The secret grants exactly the session's own closed
-authority (relay catalogue; backend HMAC, lease and binding revalidation), is destroyed at
-close/revocation and re-armed per run, and `collect` refuses and revokes any agent content that
-carries it. The secret never appears in the MCP config, argv or env.
+**Secret flow.** The supervisor holds the secret in memory. Before every run it re-arms a fresh
+one-shot `<runtime>/sessions/<id>/ipc/shim.sock` (0600, peer uid checked); the shim connects,
+receives the secret **once**, sets `PR_SET_DUMPABLE=0`, and drops the socket. The CLI launches
+the shim itself and can read `AUTOWORK_SESSION_SOCKET` from its own environment, so it can
+connect before the shim and receive the frame: this is **accepted and bounded, and it is
+deterministic rather than a narrow race** (R2-F1 F1; `BROKER-RELAY-EGRESS.md` §8.6/§8.13). The
+secret grants exactly the session's own closed authority (relay catalogue; backend HMAC, lease
+and binding revalidation), is kept in memory across an interrupt so the next run can re-arm it,
+and is wiped at close, on restart cleanup or on detected exposure; `collect`
+refuses and fails the session with `secret_exposure_detected` if agent content carries the
+secret in raw, hex, base64/base64url or an aligned fragment of at least 16 bytes
+(`supervisor.py::_refuse_secret_exposure`). The secret never appears in the MCP config, argv or
+env.
 
 **Tool catalogue.** `tools/list` returns exactly the manifest, with MCP-safe names
 (`autowork_bridge_consult` ↔ broker `advisor.consult`; `autowork_<sanitized broker name>` for the
 rest). `tools/call` validates the JSON schema locally, maps to the fixed backend route, signs, and
 returns a bounded JSON result (256 KiB; `truncated` + refs beyond). Unknown tool or unknown
 argument → JSON-RPC error, no network call. Fixed tools: `task.heartbeat`, `task.submit_result`,
-`handoff.submit`, `note.capture`. There is no URL, path, method or header parameter anywhere.
+`handoff.submit`, `note.capture`, `instruction.pending`, `instruction.ack`. There is no URL,
+path, method or header parameter anywhere.
 
 **Signing.** ADR D7:189 exact scheme: `v1=<hex>` = HMAC-SHA256(secret,
 `method\0path+query\0session_id\0sha256(body)\0idempotency_key\0timestamp`), headers
@@ -353,10 +400,17 @@ argument → JSON-RPC error, no network call. Fixed tools: `task.heartbeat`, `ta
 replay (idempotent by design), a genuine retry varies an argument (e.g. `nonce`). Backend key is
 `agent:<session_id>:<task_id>:<lease_fence>:<client_key>` (ADR D7:191).
 
-**Backend routes called.** `POST /api/investigations/{id}/agent-sessions/{sid}/tool-calls` for
-broker tools (D8:203), `/tasks/{tid}/commands` for heartbeat/submit (D8:200), `/handoffs` (D8:201).
-Everything else is rejected locally. `bridge.consult` is just `advisor.consult`; an ambiguous
-consult returns `consultation_pending_reconciliation` and must not be resubmitted (D9).
+**Backend routes called.** The shim sends one signed HTTP/1.1 request per connection over
+`<session>/ipc/broker.sock`. The supervisor relay admits only `POST
+/api/investigations/{id}/agent-sessions/{sid}/tool-calls` for broker tools (D8:203),
+`/tasks/{tid}/commands` for heartbeat/submit (D8:200), `/handoffs` (D8:201), and
+`/agent-sessions/{sid}/instructions` with `action` `pull`/`ack` only (human `enqueue`/`cancel`
+are refused), then forwards the request byte-exact to `AGENT_SESSIONS_BROKER_BACKEND_URL`
+(loopback HTTP only; default `http://127.0.0.1:8000`). The relay never re-signs, never chooses
+a URL, follows no redirect and logs only method + route template + session id; the backend
+remains the authority on every call. Everything else is rejected locally. `bridge.consult` is
+just `advisor.consult`; an ambiguous consult returns `consultation_pending_reconciliation` and
+must not be resubmitted (D9).
 
 ## 8. Provider profiles and differences
 
@@ -430,8 +484,11 @@ and H5 own separate adapter files; B owns `infrastructure/agentic/**`.
 
 - Session namespace reserved and 404 today: `sidecars/workspace_agent/http_server.py:192-193,314-316`;
   contract `/v1/sessions/**` reserved (M24-05): `docs/design/investigation-workshop/WORKSPACE-AGENT.md:148`.
-- Workspace agent: no outbound, no listener beyond UDS, stdlib only, bearer token:
-  WORKSPACE-AGENT:11-13,28-31; auth `sidecars/workspace_agent/auth.py:87-97`; limits/idempotency
+- Workspace agent: no workspace push, no DB/MinIO/provider credential, stdlib only, bearer
+  token; its session supervisor alone opens loopback HTTP to the fixed relay backend target and
+  the provider CONNECT proxy (WORKSPACE-AGENT §1 amendment, M24.1):
+  `sessions/supervisor.py:1261-1410`, `sessions/relay.py`, `sessions/egress.py`; auth
+  `sidecars/workspace_agent/auth.py:87-97`; limits/idempotency
   `sidecars/workspace_agent/protocol.py:12-23`; enforcement `http_server.py:322-340`; cursor
   `sidecars/workspace_agent/events.py:21,151-240`.
 - Backend client/port to extend: `backend/src/cti_app/application/workspace_agent.py:446-531`;
@@ -458,8 +515,11 @@ and H5 own separate adapter files; B owns `infrastructure/agentic/**`.
   `codex-cli 0.163.0`, `claude 2.1.284`, `codex exec -c/--config`, `codex exec resume`,
   `claude --mcp-config/--strict-mcp-config/--session-id/--input-format/--restricted`.
 - Skills: `.claude/skills/autowork-*` are symlinks to `.agents/skills/autowork-*` (listed).
-- No agentic adapter or session code exists: `backend/src/cti_app/infrastructure/agentic/` absent;
-  `m24_agent_session_key` absent from `config.py` (05B1 adds it).
+- The delivered material is `sidecars/workspace_agent/sessions/**` (§5) plus the backend port
+  `backend/src/cti_app/application/agentic_host_sessions.py` and
+  `backend/src/cti_app/infrastructure/agentic/**`; the session secret key is
+  `config.m24_agent_session_key`. Instruction delivery per [INSTRUCTION-DELIVERY.md](INSTRUCTION-DELIVERY.md)
+  is `application/instruction_delivery.py` with migrations `0027`/`0028`.
 
 ## 13. Open questions for the human (max 5)
 

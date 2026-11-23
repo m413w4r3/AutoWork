@@ -11,6 +11,14 @@ Normative neighbours: [SESSION-RUNNER.md](SESSION-RUNNER.md) §3/§3bis/§7,
 Legend: **VERIFIED** = read or executed at this HEAD; **INFERRED** = follows from code or
 tool semantics but was not executed; **UNPROVEN** = host/CLI/provider fact for the H0 spike.
 
+**Implementation status (2026-11-23).** The target architecture of §3–§6 is delivered
+(`sessions/relay.py`, `sessions/egress.py`, `sessions/entrypoint.py`, the bwrap profile, the
+adapter env and the supervisor wiring; H0 attested real Codex/Claude sessions through it). The
+"verified current state" table of §1 is the **pre-change audit at base `1d52106f`**, kept as
+historical evidence: its slirp4netns/`host_network_unsafe`/`AUTOWORK_BACKEND_URL` rows no
+longer describe the code. Current behaviour is defined by the code and its tests; the R2-F1
+adversarial review records residual risks F1–F11.
+
 ## 1. Verified current state (and corrections to the M24 report)
 
 | Fact | Evidence | Verdict |

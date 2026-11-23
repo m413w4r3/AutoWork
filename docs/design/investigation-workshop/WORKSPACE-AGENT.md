@@ -8,9 +8,18 @@ PostgreSQL/MinIO remain canonical; nothing here promotes workspace files to evid
 
 ## 1. Invariants
 
-1. The agent owns the workspace tree, opens **no network listener** (AF_UNIX only) and **no
-   outbound connection** (no DB, MinIO or provider). Only the backend initiates calls; the
-   agent never pushes and holds no backend credential.
+1. The agent owns the workspace tree, opens **no network listener** (AF_UNIX only) and holds
+   no DB, MinIO or provider credential; it never pushes workspace state. Only the backend
+   initiates calls on the workspace routes.
+   **M24.1 session exception (normative):** inside the same `autowork-workspace-agent`
+   process, the session supervisor runs a per-session broker relay (`ipc/broker.sock`) that
+   forwards a closed signed-route set to a fixed loopback backend URL
+   (`AGENT_SESSIONS_BROKER_BACKEND_URL`, default `http://127.0.0.1:8000`), and a host CONNECT
+   proxy (`ipc/egress.sock`) that tunnels allowlisted provider hosts. Those loopback/provider
+   connections are made by the supervisor on behalf of the session; the sandboxed CLI agent
+   (`bwrap --unshare-net`, only `lo`, no route) has **no direct outbound connection** and never
+   holds a backend URL. See `sessions/relay.py`, `sessions/egress.py` and
+   [BROKER-RELAY-EGRESS.md](BROKER-RELAY-EGRESS.md) §3–§5.
 2. The backend container mounts **only the runtime socket directory**, never the workspace
    tree; the browser never touches the filesystem.
 3. Local files are observations, not evidence. Content becomes canonical only through
