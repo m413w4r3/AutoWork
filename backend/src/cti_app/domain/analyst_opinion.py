@@ -364,10 +364,246 @@ class OpinionBlock:
 _OPINION_ANCHOR = re.compile(r"^[a-z][a-z0-9:_-]{0,127}$")
 _INVESTIGATION_OPINION_NAMESPACE = UUID("f141ae8e-999c-4a7f-b07d-5ffb0bd7b86d")
 
+MAX_NOTE_CONTENT_BLOCKS = 32
+MAX_NOTE_IOC_OBSERVATIONS = 64
+_CODE_LANGUAGE = re.compile(r"^[a-z0-9][a-z0-9+.#_-]{0,31}$")
+
 
 def investigation_opinion_id(investigation_id: UUID) -> UUID:
     """Return the stable opinion identity shared by investigation readers and writers."""
     return uuid5(_INVESTIGATION_OPINION_NAMESPACE, str(investigation_id))
+
+
+class NoteContentBlockType(StrEnum):
+    """The closed union of typed content a Bridge-drafted note may reference."""
+
+    ARTICLE_ELEMENT = "article_element"
+    CANONICAL_CODE = "canonical_code"
+    IOC_TABLE = "ioc_table"
+    PROTOCOL_FIGURE = "protocol_figure"
+
+
+class NoteArticleElementKind(StrEnum):
+    TABLE = "table"
+    CHART = "chart"
+    FIGURE = "figure"
+    DIAGRAM = "diagram"
+
+
+def note_ioc_table_title(observation_count: int) -> str:
+    """The deterministic caption of an IOC table; never human prose."""
+    if isinstance(observation_count, bool) or not isinstance(observation_count, int):
+        raise ValueError("An IOC table observation count must be an integer")
+    if observation_count < 1 or observation_count > MAX_NOTE_IOC_OBSERVATIONS:
+        raise ValueError("An IOC table requires between 1 and 64 observations")
+    return f"Tableau IOC ({observation_count})"
+
+
+@dataclass(frozen=True, slots=True)
+class ArticleElementNoteBlockV1:
+    """Reference to one M23 element already rendered in the pinned article."""
+
+    kind: NoteArticleElementKind
+    element_key: str
+    element_sha256: str
+    anchor: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, NoteArticleElementKind):
+            raise TypeError("Note article-element kind is invalid")
+        if not isinstance(self.element_key, str) or not self.element_key.strip():
+            raise ValueError("Note article-element key must be non-empty text")
+        _validate_sha256(self.element_sha256, "element_sha256")
+        if not isinstance(self.anchor, str) or _OPINION_ANCHOR.fullmatch(self.anchor) is None:
+            raise ValueError("Note article-element anchor is invalid")
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "block_type": NoteContentBlockType.ARTICLE_ELEMENT.value,
+            "kind": self.kind.value,
+            "element_key": self.element_key,
+            "element_sha256": self.element_sha256,
+            "anchor": self.anchor,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalCodeNoteBlockV1:
+    """An exact byte range of one canonical observation blob, never supplied text."""
+
+    observation_id: UUID
+    blob_sha256: str
+    offset: int
+    length: int
+    excerpt_sha256: str
+    language: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.observation_id, UUID):
+            raise ValueError("Note code observation identity must be a UUID")
+        _validate_sha256(self.blob_sha256, "blob_sha256")
+        if isinstance(self.offset, bool) or not isinstance(self.offset, int) or self.offset < 0:
+            raise ValueError("Note code offset must be a non-negative integer")
+        if isinstance(self.length, bool) or not isinstance(self.length, int) or self.length < 1:
+            raise ValueError("Note code length must be a positive integer")
+        _validate_sha256(self.excerpt_sha256, "excerpt_sha256")
+        if not isinstance(self.language, str) or _CODE_LANGUAGE.fullmatch(self.language) is None:
+            raise ValueError("Note code language must be a short lowercase token")
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "block_type": NoteContentBlockType.CANONICAL_CODE.value,
+            "observation_id": str(self.observation_id),
+            "blob_sha256": self.blob_sha256,
+            "offset": self.offset,
+            "length": self.length,
+            "excerpt_sha256": self.excerpt_sha256,
+            "language": self.language,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class IocTableNoteBlockV1:
+    """A table whose rows are derived from canonical, non-advisory observations."""
+
+    observation_ids: tuple[UUID, ...]
+    title: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "observation_ids", tuple(self.observation_ids))
+        if not self.observation_ids:
+            raise ValueError("An IOC table requires at least one observation")
+        if len(self.observation_ids) > MAX_NOTE_IOC_OBSERVATIONS:
+            raise ValueError("An IOC table is limited to 64 observations")
+        if any(not isinstance(item, UUID) for item in self.observation_ids):
+            raise ValueError("IOC table observation identities must be UUIDs")
+        if len(set(self.observation_ids)) != len(self.observation_ids):
+            raise ValueError("IOC table observation identities must be unique")
+        expected_title = note_ioc_table_title(len(self.observation_ids))
+        if self.title != expected_title:
+            raise ValueError(f"An IOC table title is deterministic and must be {expected_title!r}")
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "block_type": NoteContentBlockType.IOC_TABLE.value,
+            "observation_ids": [str(item) for item in self.observation_ids],
+            "title": self.title,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ProtocolFigureNoteBlockV1:
+    """Reference to one protocol view carried by the opinion itself."""
+
+    kind: ProtocolDiagramKind
+    asset_sha256: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, ProtocolDiagramKind):
+            raise TypeError("Note protocol-figure kind is invalid")
+        _validate_sha256(self.asset_sha256, "asset_sha256")
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "block_type": NoteContentBlockType.PROTOCOL_FIGURE.value,
+            "kind": self.kind.value,
+            "asset_sha256": self.asset_sha256,
+        }
+
+
+NOTE_CONTENT_BLOCK_TYPES: tuple[type, ...] = (
+    ArticleElementNoteBlockV1,
+    CanonicalCodeNoteBlockV1,
+    IocTableNoteBlockV1,
+    ProtocolFigureNoteBlockV1,
+)
+
+NoteContentBlockV1 = (
+    ArticleElementNoteBlockV1
+    | CanonicalCodeNoteBlockV1
+    | IocTableNoteBlockV1
+    | ProtocolFigureNoteBlockV1
+)
+
+
+def note_content_block_from_payload(value: object) -> NoteContentBlockV1:
+    """Strictly parse one stored content block; unknown fields are refused."""
+    if not isinstance(value, Mapping):
+        raise ValueError("A note content block must be an object")
+    block_type = value.get("block_type")
+    if block_type == NoteContentBlockType.ARTICLE_ELEMENT.value:
+        expected = {"block_type", "kind", "element_key", "element_sha256", "anchor"}
+        if set(value) != expected:
+            raise ValueError("Article-element note block has missing or unknown fields")
+        return ArticleElementNoteBlockV1(
+            kind=NoteArticleElementKind(_payload_text(value, "kind")),
+            element_key=_payload_text(value, "element_key"),
+            element_sha256=_payload_text(value, "element_sha256"),
+            anchor=_payload_text(value, "anchor"),
+        )
+    if block_type == NoteContentBlockType.CANONICAL_CODE.value:
+        expected = {
+            "block_type",
+            "observation_id",
+            "blob_sha256",
+            "offset",
+            "length",
+            "excerpt_sha256",
+            "language",
+        }
+        if set(value) != expected:
+            raise ValueError("Canonical-code note block has missing or unknown fields")
+        offset = value["offset"]
+        length = value["length"]
+        if (
+            isinstance(offset, bool)
+            or not isinstance(offset, int)
+            or isinstance(length, bool)
+            or not isinstance(length, int)
+        ):
+            raise ValueError("Canonical-code note block offsets must be integers")
+        return CanonicalCodeNoteBlockV1(
+            observation_id=UUID(_payload_text(value, "observation_id")),
+            blob_sha256=_payload_text(value, "blob_sha256"),
+            offset=offset,
+            length=length,
+            excerpt_sha256=_payload_text(value, "excerpt_sha256"),
+            language=_payload_text(value, "language"),
+        )
+    if block_type == NoteContentBlockType.IOC_TABLE.value:
+        expected = {"block_type", "observation_ids", "title"}
+        if set(value) != expected:
+            raise ValueError("IOC-table note block has missing or unknown fields")
+        observation_ids = value["observation_ids"]
+        if not isinstance(observation_ids, (list, tuple)):
+            raise ValueError("IOC-table note block observation identities must be a list")
+        return IocTableNoteBlockV1(
+            observation_ids=tuple(UUID(str(item)) for item in observation_ids),
+            title=_payload_text(value, "title"),
+        )
+    if block_type == NoteContentBlockType.PROTOCOL_FIGURE.value:
+        expected = {"block_type", "kind", "asset_sha256"}
+        if set(value) != expected:
+            raise ValueError("Protocol-figure note block has missing or unknown fields")
+        return ProtocolFigureNoteBlockV1(
+            kind=ProtocolDiagramKind(_payload_text(value, "kind")),
+            asset_sha256=_payload_text(value, "asset_sha256"),
+        )
+    raise ValueError("Note content block type is unsupported")
+
+
+def note_content_blocks_from_payload(value: object) -> tuple[NoteContentBlockV1, ...]:
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("Note content blocks must be a list")
+    if len(value) > MAX_NOTE_CONTENT_BLOCKS:
+        raise ValueError("A note is limited to 32 content blocks")
+    return tuple(note_content_block_from_payload(item) for item in value)
+
+
+def note_content_blocks_to_payload(
+    blocks: Iterable[NoteContentBlockV1],
+) -> list[dict[str, object]]:
+    return [block.to_payload() for block in blocks]
 
 
 @dataclass(frozen=True, slots=True)
@@ -385,6 +621,7 @@ class AnalystObservationV1:
     bridge_block_type: OpinionBlockType | None = None
     bridge_draft_ref: BridgeDraftReferenceV1 | None = None
     bridge_review_ref: BridgeReviewReferenceV1 | None = None
+    content_blocks: tuple[NoteContentBlockV1, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, UUID):
@@ -430,6 +667,14 @@ class AnalystObservationV1:
                 raise ValueError("Bridge review reference does not match reviewed analyst note")
         object.__setattr__(self, "finding_refs", tuple(self.finding_refs))
         object.__setattr__(self, "evidence_refs", tuple(self.evidence_refs))
+        object.__setattr__(self, "content_blocks", tuple(self.content_blocks))
+        if len(self.content_blocks) > MAX_NOTE_CONTENT_BLOCKS:
+            raise ValueError("A note is limited to 32 content blocks")
+        for block in self.content_blocks:
+            if not isinstance(block, NOTE_CONTENT_BLOCK_TYPES):
+                raise TypeError("Note content block type is invalid")
+            if isinstance(block, ArticleElementNoteBlockV1) and block.anchor != self.anchor:
+                raise ValueError("A note article-element block must share the note anchor")
         if any(not isinstance(item, UUID) for item in self.finding_refs + self.evidence_refs):
             raise ValueError("Analyst observation references must be UUIDs")
         if len(set(self.finding_refs)) != len(self.finding_refs) or len(
@@ -465,6 +710,8 @@ class AnalystObservationV1:
             payload["bridge_review_ref"] = (
                 self.bridge_review_ref.to_payload() if self.bridge_review_ref is not None else None
             )
+        if self.content_blocks:
+            payload["content_blocks"] = note_content_blocks_to_payload(self.content_blocks)
         return payload
 
     @classmethod
@@ -487,6 +734,8 @@ class AnalystObservationV1:
         if not isinstance(value, Mapping) or frozenset(value) not in {
             frozenset(legacy_expected),
             frozenset(expected),
+            frozenset(legacy_expected | {"content_blocks"}),
+            frozenset(expected | {"content_blocks"}),
         }:
             raise ValueError("Analyst observation payload has missing or unknown fields")
         if any(
@@ -504,6 +753,7 @@ class AnalystObservationV1:
         bridge_authored = value.get("bridge_authored", False)
         raw_draft_ref = value.get("bridge_draft_ref")
         raw_review_ref = value.get("bridge_review_ref")
+        raw_content_blocks = value.get("content_blocks", [])
         return cls(
             id=UUID(value["id"]),
             anchor=value["anchor"],
@@ -520,6 +770,7 @@ class AnalystObservationV1:
             ),
             bridge_draft_ref=_draft_ref_from_payload(raw_draft_ref),
             bridge_review_ref=_review_ref_from_payload(raw_review_ref),
+            content_blocks=note_content_blocks_from_payload(raw_content_blocks),
         )
 
 
@@ -802,11 +1053,20 @@ class AnalystOpinionV1:
                 {"schema", "items"},
                 {"schema", "items", "bridge_block_refs"},
             )
-            or payload["schema"] != "analyst-observations.v1"
+            or payload["schema"] not in {"analyst-observations.v1", "analyst-observations.v2"}
             or not isinstance(payload["items"], list)
         ):
             raise ValueError("Opinion analyst-observation projection is unsupported")
-        result = tuple(AnalystObservationV1.from_payload(item) for item in payload["items"])
+        schema = payload["schema"]
+        raw_items = payload["items"]
+        if schema == "analyst-observations.v1":
+            if any(isinstance(item, Mapping) and "content_blocks" in item for item in raw_items):
+                raise ValueError("A v1 analyst-observation projection cannot carry content blocks")
+        elif any(
+            not isinstance(item, Mapping) or "content_blocks" not in item for item in raw_items
+        ):
+            raise ValueError("A v2 analyst-observation projection requires note content blocks")
+        result = tuple(AnalystObservationV1.from_payload(item) for item in raw_items)
         if len({item.id for item in result}) != len(result):
             raise ValueError("Opinion analyst-observation identities must be unique")
         if not result and not payload.get("bridge_block_refs"):
@@ -1101,9 +1361,17 @@ def opinion_blocks_with_observations(
     bridge_refs = _bridge_block_refs(ordinary_blocks)
     if not notes and not bridge_refs:
         return (*ordinary_blocks, *material_blocks)
+    carries_blocks = any(note.content_blocks for note in notes)
+    item_payloads = [item.to_payload() for item in notes]
+    if carries_blocks:
+        # Schema v2 carries ``content_blocks`` on every note, including the
+        # empty list, so a v2 reader never has to guess.  A block-less opinion
+        # keeps writing v1 so historical bytes and hashes are unchanged.
+        for item_payload in item_payloads:
+            item_payload.setdefault("content_blocks", [])
     payload = {
-        "schema": "analyst-observations.v1",
-        "items": [item.to_payload() for item in notes],
+        "schema": ("analyst-observations.v2" if carries_blocks else "analyst-observations.v1"),
+        "items": item_payloads,
     }
     if bridge_refs:
         payload["bridge_block_refs"] = bridge_refs
@@ -1511,22 +1779,34 @@ def verify_opinion_citations(
 
 
 __all__ = [
+    "NOTE_CONTENT_BLOCK_TYPES",
     "AnalystObservationRelation",
     "AnalystObservationState",
     "AnalystObservationV1",
     "AnalystOpinionStatus",
     "AnalystOpinionV1",
+    "ArticleElementNoteBlockV1",
     "BridgeDraftReferenceV1",
     "BridgeReviewReferenceV1",
+    "CanonicalCodeNoteBlockV1",
     "CitationViolation",
     "CitationViolationCode",
+    "IocTableNoteBlockV1",
+    "NoteArticleElementKind",
+    "NoteContentBlockType",
+    "NoteContentBlockV1",
     "OpinionBlock",
     "OpinionBlockType",
     "OpinionClaimQualification",
     "OpinionProtocolFieldEvidenceV1",
     "OpinionProtocolFigureV1",
     "OpinionWriterKind",
+    "ProtocolFigureNoteBlockV1",
     "missing_opinion_annex_references",
+    "note_content_block_from_payload",
+    "note_content_blocks_from_payload",
+    "note_content_blocks_to_payload",
+    "note_ioc_table_title",
     "opinion_bridge_drafting_summary",
     "opinion_internal_text_markers",
     "verify_opinion_citations",

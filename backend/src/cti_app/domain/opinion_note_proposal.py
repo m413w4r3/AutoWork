@@ -19,11 +19,14 @@ from enum import StrEnum
 from uuid import UUID, uuid5
 
 from cti_app.domain.analyst_opinion import (
+    NOTE_CONTENT_BLOCK_TYPES,
     AnalystObservationRelation,
     AnalystObservationState,
     AnalystOpinionV1,
+    NoteContentBlockV1,
     OpinionBlockType,
     investigation_opinion_id,
+    note_content_blocks_to_payload,
 )
 from cti_app.domain.editorial import AnalystDecision
 
@@ -145,6 +148,7 @@ class NoteProposalV1:
     base_publication_version: int | None = None
     base_publication_sha256: str | None = None
     anchor_before_sha256: str | None = None
+    content_blocks: tuple[NoteContentBlockV1, ...] = ()
     accepted_opinion_version: int | None = None
     analyst_decision_id: UUID | None = None
     created_at: datetime = field(default_factory=lambda: datetime.min.replace(tzinfo=UTC))
@@ -189,6 +193,14 @@ class NoteProposalV1:
             raise ValueError("Note proposal idempotency key must be non-empty")
         object.__setattr__(self, "cited_finding_refs", tuple(self.cited_finding_refs))
         object.__setattr__(self, "cited_observation_refs", tuple(self.cited_observation_refs))
+        object.__setattr__(self, "content_blocks", tuple(self.content_blocks))
+        if (
+            self.consultation_type is NoteProposalConsultationType.REVIEW_TEXT
+            and self.content_blocks
+        ):
+            raise ValueError("A review proposal cannot add note content blocks")
+        if any(not isinstance(block, NOTE_CONTENT_BLOCK_TYPES) for block in self.content_blocks):
+            raise TypeError("Note proposal content block type is invalid")
         if any(not isinstance(item, UUID) for item in self.cited_finding_refs) or any(
             not isinstance(item, UUID) for item in self.cited_observation_refs
         ):
@@ -356,6 +368,7 @@ class NoteProposalV1:
             base_publication_version=self.base_publication_version,
             base_publication_sha256=self.base_publication_sha256,
             anchor_before_sha256=self.anchor_before_sha256,
+            content_blocks=self.content_blocks,
             accepted_opinion_version=accepted_opinion_version,
             analyst_decision_id=analyst_decision_id,
             created_at=self.created_at,
@@ -431,6 +444,7 @@ class NoteProposalV1:
             "base_publication_version": self.base_publication_version,
             "base_publication_sha256": self.base_publication_sha256,
             "anchor_before_sha256": self.anchor_before_sha256,
+            "content_blocks": note_content_blocks_to_payload(self.content_blocks),
             "status": self.status.value,
             "status_version": self.status_version,
             "accepted_opinion_version": self.accepted_opinion_version,

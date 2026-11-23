@@ -10,6 +10,7 @@ outage that leaves the request pending and unacceptable.
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import replace
 from datetime import UTC, date, datetime
 from types import SimpleNamespace
@@ -39,7 +40,10 @@ from cti_app.application.production_artifact_store import ProductionArtifactStor
 from cti_app.domain.analyst_opinion import (
     AnalystObservationRelation,
     AnalystObservationState,
+    CanonicalCodeNoteBlockV1,
+    IocTableNoteBlockV1,
     OpinionBlockType,
+    note_ioc_table_title,
 )
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
 from cti_app.domain.classification import TLP
@@ -252,6 +256,7 @@ def _request_kwargs(
     base_version: int | None,
     base_sha256: str | None,
     key: str,
+    content_blocks: tuple[Any, ...] = (),
 ) -> dict[str, Any]:
     return {
         "anchor": anchor,
@@ -260,6 +265,7 @@ def _request_kwargs(
         "consultation_type": NoteProposalConsultationType.DRAFT_TEXT,
         "note_state": AnalystObservationState.UNRESOLVED,
         "note_relation": AnalystObservationRelation.UNRESOLVED,
+        "content_blocks": content_blocks,
         "base_opinion_version": base_version,
         "base_opinion_sha256": base_sha256,
         "task_id": None,
@@ -373,6 +379,7 @@ async def test_note_proposal_chain_on_postgres(migrated_postgres_url: str) -> No
         budget=LoopBudget(),
         prose_authority=ProseAuthority.BRIDGE_ONLY,
     )
+    code_excerpt = observation_bytes[5:20]
     observation = EvidenceObservation(
         investigation_id=investigation.id,
         kind=EvidenceKind.BINARY_ANALYSIS,
@@ -385,6 +392,18 @@ async def test_note_proposal_chain_on_postgres(migrated_postgres_url: str) -> No
         object_id=hashlib.sha256(b"harmless note-proposal identity").hexdigest(),
         limitations=("Static observation only.",),
     )
+    code_block = CanonicalCodeNoteBlockV1(
+        observation_id=observation.id,
+        blob_sha256=observation.sha256,
+        offset=5,
+        length=len(code_excerpt),
+        excerpt_sha256=hashlib.sha256(code_excerpt).hexdigest(),
+        language="text",
+    )
+    ioc_block = IocTableNoteBlockV1(
+        observation_ids=(observation.id,), title=note_ioc_table_title(1)
+    )
+    content_blocks = (code_block, ioc_block)
     finding = InvestigationFinding(
         investigation_id=investigation.id,
         kind=FindingKind.CAPABILITY,
@@ -431,8 +450,38 @@ async def test_note_proposal_chain_on_postgres(migrated_postgres_url: str) -> No
                 base_version=None,
                 base_sha256=None,
                 key="pg-request-1",
+                content_blocks=content_blocks,
             ),
         )
+        replay = await proposal_service.request(
+            investigation.id,
+            **_request_kwargs(
+                anchor=LEAD_ANCHOR,
+                target=NoteTargetBlockType.LEAD,
+                advisor=advisor,
+                base_version=None,
+                base_sha256=None,
+                key="pg-request-1",
+                content_blocks=content_blocks,
+            ),
+        )
+        assert replay.idempotent_replay is True
+        assert replay.proposal.id == first.proposal.id
+        assert replay.proposal.content_blocks == content_blocks
+        with pytest.raises(NoteProposalError) as conflict:
+            await proposal_service.request(
+                investigation.id,
+                **_request_kwargs(
+                    anchor=LEAD_ANCHOR,
+                    target=NoteTargetBlockType.LEAD,
+                    advisor=advisor,
+                    base_version=None,
+                    base_sha256=None,
+                    key="pg-request-1",
+                    content_blocks=(),
+                ),
+            )
+        assert conflict.value.code is NoteProposalErrorCode.IDEMPOTENCY_CONFLICT
         ingested = await proposal_service.ingest_response(
             investigation.id,
             first.proposal.id,
@@ -441,15 +490,39 @@ async def test_note_proposal_chain_on_postgres(migrated_postgres_url: str) -> No
         )
         assert ingested.materialised is True
         assert ingested.proposed_text == "Note initiale rédigée par Bridge."
+        assert ingested.content_blocks == content_blocks
         diff = await proposal_service.get(investigation.id, first.proposal.id)
         assert diff.accept_ready is True
+        assert diff.content_blocks_valid is True
         assert diff.proposal.proposed_text == "Note initiale rédigée par Bridge."
         assert diff.current_note_text is None
+        resolved_code, resolved_ioc = diff.resolved_content_blocks
+        assert resolved_code.to_payload()["excerpt"] == code_excerpt.decode("utf-8")
+        assert resolved_ioc.to_payload()["rows"] == [
+            {
+                "observation_id": str(observation.id),
+                "object_type": "sha256",
+                "object_id": observation.object_id,
+                "source": "fixture-static-analysis",
+                "observed_at": observation.observed_at.isoformat(),
+                "blob_sha256": observation.sha256,
+            }
+        ]
         first_acceptance = await _accept(
             opinion_service, investigation.id, ingested, key="pg-accept-1"
         )
         assert first_acceptance.opinion.version == 1
         assert len(first_acceptance.opinion.observations) == 1
+        async with uow_factory() as uow:
+            stored_v1 = await uow.analyst_opinions.get(first_acceptance.opinion.id, version=1)
+        assert stored_v1 is not None
+        assert stored_v1.observations[0].content_blocks == content_blocks
+        stored_projection = next(
+            block
+            for block in stored_v1.blocks
+            if block.block_type is OpinionBlockType.ANALYST_OBSERVATIONS
+        )
+        assert json.loads(stored_projection.text)["schema"] == "analyst-observations.v2"
 
         second = await proposal_service.request(
             investigation.id,

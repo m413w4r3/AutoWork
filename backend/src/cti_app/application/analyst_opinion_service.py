@@ -29,6 +29,10 @@ from cti_app.application.investigation_tools import (
     ToolRegistry,
     ToolResult,
 )
+from cti_app.application.opinion_note_proposals import (
+    NoteProposalError,
+    resolve_note_content_blocks,
+)
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import (
     ProductionArtifactStore,
@@ -178,6 +182,12 @@ class OpinionErrorCode(StrEnum):
     STALE_NOTE_PROPOSAL = "stale_note_proposal"
     NOTE_ANCHOR_TEXT_CHANGED = "note_anchor_text_changed"
     BRIDGE_PROVENANCE_INVALID = "bridge_provenance_invalid"
+    NOTE_CONTENT_BLOCK_INVALID = "invalid_note_content_block"
+    NOTE_BLOCK_REF_STALE = "note_block_ref_stale"
+    NOTE_CHART_WITHOUT_EVIDENCE = "note_chart_without_evidence"
+    NOTE_FIGURE_SOURCE_MISSING = "note_figure_source_missing"
+    NOTE_CODE_REF_STALE = "note_code_ref_stale"
+    NOTE_IOC_REF_UNRESOLVED = "note_ioc_ref_unresolved"
 
 
 class OpinionError(ValueError):
@@ -1336,6 +1346,22 @@ class AnalystOpinionService:
                     OpinionErrorCode.NOTE_ANCHOR_TEXT_CHANGED,
                     message="The anchored paragraph text changed after the drafting request.",
                 )
+            # F4-D B5a: every block reference is re-verified against the exact
+            # pinned publication base and the current canonical observations.
+            # An acceptance never materialises a stale or foreign reference.
+            if proposal.content_blocks:
+                try:
+                    await resolve_note_content_blocks(
+                        uow=uow,
+                        artifact_store=self._artifact_store,
+                        investigation_id=investigation_id,
+                        document=base_document,
+                        anchor=proposal.anchor,
+                        protocol_figures=figures,
+                        blocks=proposal.content_blocks,
+                    )
+                except NoteProposalError as exc:
+                    raise OpinionError(OpinionErrorCode(exc.code.value), message=str(exc)) from exc
 
             existing_note = next(
                 (item for item in base_notes if item.anchor == proposal.anchor), None
@@ -1356,6 +1382,7 @@ class AnalystOpinionService:
                         text_sha256=proposed_text_sha256,
                         source_observation_id=source_observation_id,
                     ),
+                    content_blocks=proposal.content_blocks,
                 )
                 notes = (
                     *(item for item in base_notes if item.anchor != proposal.anchor),

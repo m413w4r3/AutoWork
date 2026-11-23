@@ -28,7 +28,11 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from cti_app.domain.analyst_opinion import verify_opinion_citations
+from cti_app.domain.analyst_opinion import (
+    OpinionBlockType,
+    note_ioc_table_title,
+    verify_opinion_citations,
+)
 from cti_app.domain.editorial import AnalystDecisionType
 from cti_app.domain.entities import SampleState
 from cti_app.domain.investigation import (
@@ -948,22 +952,34 @@ class ScenarioJourney:
                     bridge_invocation_id=invocation_id,
                 )
             )
+            body: dict[str, Any] = {
+                "anchor": anchor,
+                "target_block_type": target_block_type,
+                "bridge_block_type": "key_findings",
+                "consultation_type": "draft_text",
+                "finding_refs": [str(finding_id)],
+                "observation_refs": [str(self.state.claude_vt_observation_id)],
+                "task_id": str(self.state.loader_task_id),
+                "expected_working_state_version": state["working_state_version"],
+                "expected_working_state_sha256": state["working_state_sha256"],
+            }
+            if anchor == NOTE_A_ANCHOR:
+                # B5a: an IOC table is a reference, never prose; its rows are
+                # derived from the canonical imported observation.
+                assert self.state.imported_observation_id is not None
+                body["content_blocks"] = [
+                    {
+                        "block_type": "ioc_table",
+                        "observation_ids": [str(self.state.imported_observation_id)],
+                        "title": note_ioc_table_title(1),
+                    }
+                ]
             response = _json(
                 await self._human(
                     client,
                     "POST",
                     f"/api/investigations/{self.state.investigation_id}/note-proposals",
-                    json={
-                        "anchor": anchor,
-                        "target_block_type": target_block_type,
-                        "bridge_block_type": "key_findings",
-                        "consultation_type": "draft_text",
-                        "finding_refs": [str(finding_id)],
-                        "observation_refs": [str(self.state.claude_vt_observation_id)],
-                        "task_id": str(self.state.loader_task_id),
-                        "expected_working_state_version": state["working_state_version"],
-                        "expected_working_state_sha256": state["working_state_sha256"],
-                    },
+                    json=body,
                     headers={"Idempotency-Key": key},
                 )
             )
@@ -973,6 +989,8 @@ class ScenarioJourney:
             assert proposal["proposed_text"] == text, proposal
             assert proposal["anchor"] == anchor
             assert proposal["bridge_invocation_id"] == str(invocation_id)
+            if anchor == NOTE_A_ANCHOR:
+                assert proposal["content_blocks"] == body["content_blocks"], proposal
             proposal_ids.append(UUID(proposal["id"]))
         self.state.proposal_a_id, self.state.proposal_b_id = proposal_ids
         assert NOTE_A_ANCHOR != NOTE_B_ANCHOR
@@ -1002,6 +1020,25 @@ class ScenarioJourney:
         assert accepted_a["opinion_version"] == 1, accepted_a
         assert accepted_a["opinion_sha256"]
         self.state.opinion_v1_sha = accepted_a["opinion_sha256"]
+        async with self.uow_factory() as uow:
+            accepted_v1 = await uow.analyst_opinions.get(
+                UUID(accepted_a["opinion_id"]), version=accepted_a["opinion_version"]
+            )
+        assert accepted_v1 is not None
+        note_a = next(item for item in accepted_v1.observations if item.anchor == NOTE_A_ANCHOR)
+        assert [block.to_payload() for block in note_a.content_blocks] == [
+            {
+                "block_type": "ioc_table",
+                "observation_ids": [str(self.state.imported_observation_id)],
+                "title": note_ioc_table_title(1),
+            }
+        ], note_a.content_blocks
+        observations_projection = next(
+            block
+            for block in accepted_v1.blocks
+            if block.block_type is OpinionBlockType.ANALYST_OBSERVATIONS
+        )
+        assert json.loads(observations_projection.text)["schema"] == ("analyst-observations.v2")
         # The second draft was pinned to the empty opinion: accepting it after A
         # must be refused as stale, never silently rebased.  The human asks
         # Bridge for the same note against the new head and accepts that one.
