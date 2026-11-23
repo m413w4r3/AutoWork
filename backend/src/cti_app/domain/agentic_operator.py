@@ -146,15 +146,12 @@ class InstructionDeliveryMode(StrEnum):
 
 
 # F3-D §3.2.  ``acknowledged``/``cancelled`` are terminal; ``delivered`` is
-# never cancelled and ``queued`` is never acknowledged directly.
-# ``queued -> delivered`` is the pre-0027 acknowledgement promotion the legacy
-# signed route still performs until ID-3 refuses it; it is the only
-# transitional edge and must disappear with that lot.
+# never cancelled and ``queued`` is neither delivered nor acknowledged
+# directly: only a proven host effect advances the queue to ``delivered``.
 INSTRUCTION_STATE_TRANSITIONS: Mapping[InstructionState, frozenset[InstructionState]] = {
     InstructionState.QUEUED: frozenset(
         {
             InstructionState.DELIVERING,
-            InstructionState.DELIVERED,
             InstructionState.CANCELLED,
         }
     ),

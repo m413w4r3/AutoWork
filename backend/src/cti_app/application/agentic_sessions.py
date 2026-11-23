@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import secrets
 import time
@@ -171,6 +172,13 @@ class SessionInstructionConflictError(SessionError):
     status_code = 409
 
 
+class SessionInstructionNotDeliveredError(SessionInstructionConflictError):
+    """Ack of an instruction no host effect ever delivered (F3-D §3.6)."""
+
+    code = "instruction_not_delivered"
+    status_code = 409
+
+
 class SessionResumeUnavailableError(SessionError):
     code = "resume_unavailable"
     status_code = 409
@@ -240,6 +248,12 @@ class NoteInstructionUnavailableError(SessionError):
     status_code = 503
 
 
+# F3-D §3.6: one signed ack and one pull response are both bounded.
+MAX_ACK_INSTRUCTION_IDS = 32
+MAX_PULL_INSTRUCTIONS = 32
+MAX_CANCEL_REASON_CHARS = 4096
+
+
 @dataclass(frozen=True, slots=True)
 class NoteInstructionResolution:
     """One instruction text with its canonical note refs and delivery diff.
@@ -295,22 +309,40 @@ class EnqueuedInstructionV1:
 
 @dataclass(frozen=True, slots=True)
 class DeliveredInstructionV1:
-    """One acknowledged instruction plus the text an operator actually receives."""
+    """One delivered instruction plus the exact text the operator received.
+
+    ``delivery_text`` is rebuilt from the persisted ``body`` and
+    ``delivery_note_diffs``; ``note_refs`` are the exact ``(path, revision_id,
+    sha256)`` refs recorded in that body.  ``delivery_text_verified`` reports
+    whether the rebuilt text matches the persisted ``delivery_sha256``; a row
+    promoted by a signed ack may carry a digest but no diff evidence, so its
+    rebuilt text stays visibly unverified instead of being invented.
+    """
 
     instruction: AgentSessionInstructionV1
     delivery_text: str = field(repr=False)
-    note_diffs: tuple[Mapping[str, str], ...] = ()
+    note_diffs: tuple[Mapping[str, Any], ...] = ()
+    note_refs: tuple[Mapping[str, str], ...] = ()
+    delivery_text_verified: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.instruction, AgentSessionInstructionV1):
             raise TypeError("instruction must use AgentSessionInstructionV1")
         if not isinstance(self.delivery_text, str):
             raise TypeError("delivery_text must be a string")
+        for name in ("note_diffs", "note_refs"):
+            items = getattr(self, name)
+            if not isinstance(items, tuple) or not all(isinstance(item, Mapping) for item in items):
+                raise TypeError(f"{name} must be a tuple of mappings")
+        if not isinstance(self.delivery_text_verified, bool):
+            raise TypeError("delivery_text_verified must be a boolean")
 
     def to_payload(self) -> dict[str, Any]:
         payload = self.instruction.to_payload()
         payload["delivery_text"] = self.delivery_text
         payload["note_diffs"] = [dict(item) for item in self.note_diffs]
+        payload["note_refs"] = [dict(item) for item in self.note_refs]
+        payload["delivery_text_verified"] = self.delivery_text_verified
         return payload
 
 
@@ -1056,16 +1088,29 @@ class SessionService:
         actor: TaskActor,
         now: datetime | None = None,
     ) -> tuple[AgentSessionInstructionV1, ...]:
-        """Operator-signed acknowledgement of consumed instructions."""
+        """Operator-signed acknowledgement of instructions it has consumed.
+
+        Only a proven delivery is acknowledged (F3-D §3.6).  ``delivering`` and
+        ``delivery_unknown`` are first promoted to ``delivered`` because the
+        signed acknowledgement itself proves the operator received the text;
+        the promotion is journalled and never invents a mode or a diff.  A
+        ``queued`` instruction was never handed to a host: acknowledging it
+        would forge the delivery proof, so it is refused with
+        ``instruction_not_delivered``.  Replaying an already acknowledged id
+        returns the same row.
+        """
         timestamp = _now(self._clock, now)
         self._require_operator_actor(actor)
-        if not instruction_ids:
-            raise SessionInstructionConflictError("no instruction id was supplied")
+        ids = _bounded_instruction_ids(instruction_ids)
         async with self._uow_factory() as uow:
+            await uow.investigation_tasks.lock_investigation(investigation_id)
             session = await self._session_for(uow, investigation_id, session_id)
-            await self._require_current_task_lease(uow, session, timestamp)
+            task = await uow.investigation_tasks.lock_task(session.task_id)
+            self._require_instruction_authority(
+                session, task, await uow.investigation_tasks.database_now()
+            )
             acknowledged: list[AgentSessionInstructionV1] = []
-            for instruction_id in instruction_ids:
+            for instruction_id in ids:
                 instruction = await uow.agent_sessions.get_instruction(instruction_id)
                 if instruction is None or instruction.session_id != session.id:
                     raise SessionInstructionConflictError(
@@ -1078,16 +1123,43 @@ class SessionService:
                     raise SessionInstructionConflictError(
                         "a cancelled instruction cannot be acknowledged"
                     )
+                if instruction.state is InstructionState.QUEUED:
+                    raise SessionInstructionNotDeliveredError(
+                        f"instruction {instruction.id} was never delivered to the session"
+                    )
                 current = instruction
-                if current.state is InstructionState.QUEUED:
-                    current = await self._persist_instruction(
-                        uow, current.with_state(InstructionState.DELIVERED, now=timestamp)
+                if current.state in (
+                    InstructionState.DELIVERING,
+                    InstructionState.DELIVERY_UNKNOWN,
+                ):
+                    current = await self._cas_instruction(
+                        uow,
+                        current.with_state(InstructionState.DELIVERED, now=timestamp),
+                        expected=current,
+                    )
+                    logger.info(
+                        "instruction acknowledged as delivered",
+                        extra={
+                            "event": "m24.instruction_delivery.ack_promoted",
+                            "instruction_id": str(current.id),
+                            "from_state": instruction.state.value,
+                        },
                     )
                 acknowledged.append(
-                    await self._persist_instruction(
-                        uow, current.with_state(InstructionState.ACKNOWLEDGED, now=timestamp)
+                    await self._cas_instruction(
+                        uow,
+                        current.with_state(InstructionState.ACKNOWLEDGED, now=timestamp),
+                        expected=current,
                     )
                 )
+            # F2-C: the authority that allows this write is re-read under the
+            # investigation advisory lock and the task row lock in the same
+            # transaction that persists the acknowledgements.
+            self._require_instruction_authority(
+                (await uow.agent_sessions.get(session.id)) or session,
+                await uow.investigation_tasks.lock_task(session.task_id),
+                await uow.investigation_tasks.database_now(),
+            )
             await uow.commit()
             return tuple(acknowledged)
 
@@ -1100,7 +1172,12 @@ class SessionService:
         actor: TaskActor,
         now: datetime | None = None,
     ) -> tuple[DeliveredInstructionV1, ...]:
-        """Acknowledge and report the note diff visible at delivery time."""
+        """Acknowledge and report the exact text the delivery handed over (D7).
+
+        The view is rebuilt from the persisted ``body`` and the delivery-time
+        note diffs, never from a fresh note read: a note changed after the
+        delivery must not rewrite what the operator actually consumed.
+        """
         acknowledged = await self.acknowledge_instructions(
             investigation_id,
             session_id,
@@ -1108,25 +1185,116 @@ class SessionService:
             actor=actor,
             now=now,
         )
-        resolver = self._note_resolver
-        views: list[DeliveredInstructionV1] = []
-        for instruction in acknowledged:
-            if resolver is None:
-                views.append(
-                    DeliveredInstructionV1(instruction=instruction, delivery_text=instruction.text)
-                )
+        return tuple(_delivered_view(instruction) for instruction in acknowledged)
+
+    async def pull_delivered_instructions(
+        self,
+        investigation_id: UUID,
+        session_id: UUID,
+        *,
+        actor: TaskActor,
+        limit: int = MAX_PULL_INSTRUCTIONS,
+    ) -> tuple[DeliveredInstructionV1, ...]:
+        """The session's delivered-but-unacknowledged instructions (F3-D §3.6).
+
+        The operator pulls exactly what a host delivery handed to it, in queue
+        order and bounded by ``limit``; ``acknowledged`` rows are history and
+        stay out of the pull.
+        """
+        self._require_operator_actor(actor)
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise TypeError("limit must be an integer")
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        capped = min(limit, MAX_PULL_INSTRUCTIONS)
+        async with self._uow_factory() as uow:
+            session = await self._session_for(uow, investigation_id, session_id)
+            instructions = await uow.agent_sessions.list_instructions(session.id)
+        pending: list[DeliveredInstructionV1] = []
+        for instruction in instructions:
+            if instruction.state is not InstructionState.DELIVERED:
                 continue
-            refreshed = await resolver.refresh(
-                investigation_id=investigation_id, text=instruction.text
-            )
-            views.append(
-                DeliveredInstructionV1(
-                    instruction=instruction,
-                    delivery_text=refreshed.delivery_text,
-                    note_diffs=refreshed.note_diffs,
+            pending.append(_delivered_view(instruction))
+            if len(pending) >= capped:
+                break
+        return tuple(pending)
+
+    async def cancel_instruction(
+        self,
+        investigation_id: UUID,
+        session_id: UUID,
+        *,
+        instruction_id: UUID,
+        reason: str,
+        actor: TaskActor,
+        now: datetime | None = None,
+    ) -> AgentSessionInstructionV1:
+        """Human-only cancellation of an instruction no host effect delivered.
+
+        ``queued`` and ``delivery_unknown`` are cancellable; a ``delivering``
+        attempt must resolve first (§3.5) and a proven delivery is history.
+        The human authority is the verified human identity, not the task
+        lease: a lost session's queue stays cleanable with a bounded visible
+        reason (G7).
+        """
+        timestamp = _now(self._clock, now)
+        self._require_human(actor)
+        if not isinstance(instruction_id, UUID):
+            raise TypeError("instruction_id must be a UUID")
+        bounded_reason = _bounded_cancel_reason(reason)
+        async with self._uow_factory() as uow:
+            await uow.investigation_tasks.lock_investigation(investigation_id)
+            session = await self._session_for(uow, investigation_id, session_id)
+            task = await uow.investigation_tasks.get(session.task_id)
+            if task is None or task.investigation_id != investigation_id:
+                raise SessionStateConflictError("the session task no longer exists")
+            instruction = await uow.agent_sessions.get_instruction(instruction_id)
+            if (
+                instruction is None
+                or instruction.session_id != session.id
+                or instruction.task_id != session.task_id
+            ):
+                raise SessionInstructionConflictError(
+                    "the instruction does not belong to this session"
                 )
-            )
-        return tuple(views)
+            if instruction.state is InstructionState.CANCELLED:
+                return instruction
+            if instruction.state is InstructionState.DELIVERING:
+                raise SessionInstructionConflictError(
+                    "a delivery attempt is in flight; wait for it to resolve",
+                    details={"reason": "delivery_in_flight"},
+                )
+            if instruction.state in (
+                InstructionState.DELIVERED,
+                InstructionState.ACKNOWLEDGED,
+            ):
+                raise SessionInstructionConflictError(
+                    "a delivered instruction is history and cannot be cancelled",
+                    details={"reason": "instruction_delivered"},
+                )
+            try:
+                cancelled = await uow.agent_sessions.cancel_instruction(
+                    instruction.id,
+                    expected_state=instruction.state,
+                    expected_delivery_token=instruction.delivery_token,
+                    reason=bounded_reason,
+                    now=timestamp,
+                )
+            except VersionConflictError as exc:
+                raise SessionInstructionConflictError(
+                    "the instruction changed concurrently"
+                ) from exc
+            # Re-read in the transaction that persists the cancellation: a
+            # concurrent reassignment must not rebind this instruction.
+            refreshed = await uow.agent_sessions.get_instruction(instruction.id)
+            if (
+                refreshed is None
+                or refreshed.session_id != session.id
+                or refreshed.task_id != session.task_id
+            ):
+                raise SessionInstructionConflictError("the instruction changed concurrently")
+            await uow.commit()
+            return cancelled
 
     # ------------------------------------------------------------- lifecycle
 
@@ -1867,14 +2035,22 @@ class SessionService:
             raise SessionCasConflictError("the agent session changed concurrently")
         return stored
 
-    async def _persist_instruction(
-        self, uow: SessionUnitOfWork, instruction: AgentSessionInstructionV1
+    async def _cas_instruction(
+        self,
+        uow: SessionUnitOfWork,
+        instruction: AgentSessionInstructionV1,
+        *,
+        expected: AgentSessionInstructionV1,
     ) -> AgentSessionInstructionV1:
-        previous = _previous_instruction_state(instruction.state)
-        stored = await uow.agent_sessions.update_instruction(instruction, expected_state=previous)
-        if stored is None:
-            raise SessionInstructionConflictError("the instruction changed concurrently")
-        return stored
+        """CAS one acknowledgement transition on (id, state, attempt token)."""
+        try:
+            return await uow.agent_sessions.update_instruction_delivery(
+                instruction,
+                expected_state=expected.state,
+                expected_delivery_token=expected.delivery_token,
+            )
+        except VersionConflictError as exc:
+            raise SessionInstructionConflictError("the instruction changed concurrently") from exc
 
     async def _probe(
         self,
@@ -2074,9 +2250,21 @@ class SessionService:
         self, uow: SessionUnitOfWork, session: AgentSessionV1, now: datetime
     ) -> None:
         task = await uow.investigation_tasks.get(session.task_id)
+        self._require_instruction_authority(session, task, now)
+
+    @staticmethod
+    def _require_instruction_authority(
+        session: AgentSessionV1 | None,
+        task: InvestigationTaskV1 | None,
+        now: datetime,
+    ) -> None:
+        """The operator write authority, re-read under the persisting locks (F2-C)."""
+        if session is None or not session.is_active:
+            raise SessionStateConflictError("the agent session is not active")
+        if task is None or task.investigation_id != session.investigation_id:
+            raise SessionStateConflictError("the session task no longer exists")
         if (
-            task is None
-            or session.task_lease_fence is None
+            session.task_lease_fence is None
             or task.lease_session_id != session.id
             or task.lease_fence != session.task_lease_fence
             or task.lease_expires_at is None
@@ -2095,14 +2283,116 @@ class SessionService:
             raise SessionOperatorContractError("reconcile_session answered another session")
 
 
-def _previous_instruction_state(state: InstructionState) -> InstructionState:
-    if state is InstructionState.DELIVERED:
-        return InstructionState.QUEUED
-    if state is InstructionState.ACKNOWLEDGED:
-        return InstructionState.DELIVERED
-    raise SessionInstructionConflictError(
-        "only delivery or acknowledgement advances an instruction"
+def _bounded_instruction_ids(values: Sequence[UUID]) -> tuple[UUID, ...]:
+    if not isinstance(values, Sequence):
+        raise TypeError("instruction_ids must be a sequence of UUIDs")
+    unique: list[UUID] = []
+    for value in values:
+        if not isinstance(value, UUID):
+            raise TypeError("instruction_ids must be UUIDs")
+        if value not in unique:
+            unique.append(value)
+    if not unique:
+        raise SessionInstructionConflictError("no instruction id was supplied")
+    if len(unique) > MAX_ACK_INSTRUCTION_IDS:
+        raise SessionInstructionConflictError(
+            f"at most {MAX_ACK_INSTRUCTION_IDS} instructions are acknowledged at once"
+        )
+    return tuple(unique)
+
+
+def _bounded_cancel_reason(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise SessionError("cancel_reason must be a non-empty string")
+    reason = value.strip()
+    if len(reason) > MAX_CANCEL_REASON_CHARS:
+        raise SessionError(f"cancel_reason is bounded to {MAX_CANCEL_REASON_CHARS} characters")
+    return reason
+
+
+def _delivered_view(instruction: AgentSessionInstructionV1) -> DeliveredInstructionV1:
+    """Build the operator view from the persisted delivery evidence (D7)."""
+    delivery_text, note_refs = _delivery_text(instruction)
+    verified = instruction.delivery_sha256 is None or (
+        instruction_text_sha256(delivery_text) == instruction.delivery_sha256
     )
+    return DeliveredInstructionV1(
+        instruction=instruction,
+        delivery_text=delivery_text,
+        note_diffs=tuple(instruction.delivery_note_diffs or ()),
+        note_refs=note_refs,
+        delivery_text_verified=verified,
+    )
+
+
+def _delivery_text(
+    instruction: AgentSessionInstructionV1,
+) -> tuple[str, tuple[Mapping[str, str], ...]]:
+    """Rebuild the exact text persisted as ``body + delivery_note_diffs``.
+
+    The diff block is the one ``WorkspaceNoteCatalog.refresh`` appended at
+    delivery time (F3-D §3.6).  The persisted diffs are authoritative: a note
+    changed again after the delivery never rewrites what was handed over, and
+    ``delivery_sha256`` lets the caller verify the rebuild.
+    """
+    body = instruction.text
+    diffs = instruction.delivery_note_diffs or ()
+    if not diffs:
+        text = body
+    else:
+        lines = ["", "[notes modifiées depuis la mise en file]"]
+        lines.extend(_note_diff_line(item) for item in diffs)
+        text = body + "\n".join(lines)
+    return text, _recorded_note_refs(body)
+
+
+def _note_diff_line(item: Mapping[str, Any]) -> str:
+    def _text(value: object) -> str:
+        return value if isinstance(value, str) else ""
+
+    current = _text(item.get("current_revision_id"))
+    return (
+        f"- {_text(item.get('path'))}: {_text(item.get('queued_revision_id'))} -> "
+        f"{current or 'révision absente'}"
+    )
+
+
+def _recorded_note_refs(text: str) -> tuple[Mapping[str, str], ...]:
+    """The exact ``(path, revision_id, sha256)`` refs recorded in the body."""
+    # Local import: investigation_transfers imports SessionService from here.
+    from cti_app.application.investigation_transfers import (
+        MAX_NOTE_REFS,
+        NOTE_BLOCK_BEGIN,
+        NOTE_BLOCK_END,
+    )
+
+    start = text.find(NOTE_BLOCK_BEGIN)
+    end = text.find(NOTE_BLOCK_END, start + len(NOTE_BLOCK_BEGIN))
+    if start < 0 or end < 0:
+        return ()
+    raw = text[start + len(NOTE_BLOCK_BEGIN) : end].strip()
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return ()
+    notes = payload.get("notes") if isinstance(payload, dict) else None
+    if not isinstance(notes, list):
+        return ()
+    refs: list[Mapping[str, str]] = []
+    for item in notes[:MAX_NOTE_REFS]:
+        if not isinstance(item, dict):
+            return ()
+        path = item.get("path")
+        revision_id = item.get("revision_id")
+        sha256 = item.get("sha256")
+        if (
+            not isinstance(path, str)
+            or not isinstance(revision_id, str)
+            or not isinstance(sha256, str)
+        ):
+            return ()
+        refs.append({"path": path, "revision_id": revision_id, "sha256": sha256})
+    return tuple(refs)
 
 
 async def _queue_position(
@@ -2139,6 +2429,9 @@ def _now(clock: Callable[[], datetime], value: datetime | None) -> datetime:
 
 
 __all__ = [
+    "MAX_ACK_INSTRUCTION_IDS",
+    "MAX_CANCEL_REASON_CHARS",
+    "MAX_PULL_INSTRUCTIONS",
     "AgentSessionMutationUnitOfWork",
     "AgentSessionSecretDeliveryPort",
     "DeliveredInstructionV1",
@@ -2154,6 +2447,7 @@ __all__ = [
     "SessionForbiddenError",
     "SessionIdempotencyConflictError",
     "SessionInstructionConflictError",
+    "SessionInstructionNotDeliveredError",
     "SessionNewHandoffRequiredError",
     "SessionNotFoundError",
     "SessionOperatorContractError",

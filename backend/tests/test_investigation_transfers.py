@@ -29,6 +29,7 @@ from pydantic import ValidationError
 from cti_app.application.agent_session_verification import HmacSessionSecretDeriver
 from cti_app.application.agentic_sessions import (
     EnqueuedInstructionV1,
+    SessionInstructionNotDeliveredError,
     SessionSecret,
     SessionService,
 )
@@ -90,12 +91,15 @@ from cti_app.application.workspace_agent import (
     workspace_revision_id,
 )
 from cti_app.domain.agentic_operator import (
+    AgentSessionInstructionV1,
     AgentSessionState,
     AgentSessionV1,
     CollectResultsRequest,
     HandoffRequestReceiptV1,
+    InstructionDeliveryMode,
     InstructionDeliveryOutcome,
     InstructionReceiptV1,
+    InstructionState,
     InterruptSessionRequest,
     InterruptSessionResultV1,
     OperatorAdapterKind,
@@ -116,6 +120,7 @@ from cti_app.domain.agentic_operator import (
     SessionReconciliationV1,
     SessionStatusRequest,
     StartSessionRequest,
+    instruction_text_sha256,
 )
 from cti_app.domain.editorial import (
     AnalystDecision,
@@ -1037,7 +1042,13 @@ async def test_lost_session_is_reconciled_and_never_relaunched() -> None:
 # --------------------------------------------------------------------- A05
 
 
-async def test_human_note_modified_mid_session_reaches_the_agent() -> None:
+async def test_human_note_modified_mid_session_stays_queued_until_delivery() -> None:
+    """ID-3: a queued instruction is never acknowledged; the diff is delivery-time.
+
+    The modified-note diff is persisted by the delivery drain at delivery time
+    (INS-05, ``test_instruction_delivery.py``); acknowledging the still-queued
+    row would forge that proof, so the strict ack refuses it.
+    """
     harness = await _scenario_harness()
     task = await harness.seed_task(
         status=TaskStatus.ASSIGNED,
@@ -1065,25 +1076,16 @@ async def test_human_note_modified_mid_session_reaches_the_agent() -> None:
     assert harness.operator.instructions == []
 
     second = await harness.add_revision(path=NOTE_PATH, sha256="7" * 64, observed_at=LATER)
-    acknowledged = await harness.instruction_service.acknowledge_instructions_with_notes(
-        INVESTIGATION_ID,
-        opened.id,
-        instruction_ids=(enqueued.instruction.id,),
-        actor=TaskActor(kind=TaskActorKind.OPERATOR, actor_id=CODEX_ID),
-    )
-    assert len(acknowledged) == 1
-    view = acknowledged[0]
-    assert view.note_diffs == (
-        {
-            "path": NOTE_PATH,
-            "queued_revision_id": first.revision_id,
-            "queued_sha256": first.sha256,
-            "current_revision_id": second.revision_id,
-            "current_sha256": second.sha256,
-        },
-    )
-    assert second.revision_id in view.delivery_text
-    assert "notes modifiées" in view.delivery_text
+    with pytest.raises(SessionInstructionNotDeliveredError):
+        await harness.instruction_service.acknowledge_instructions_with_notes(
+            INVESTIGATION_ID,
+            opened.id,
+            instruction_ids=(enqueued.instruction.id,),
+            actor=TaskActor(kind=TaskActorKind.OPERATOR, actor_id=CODEX_ID),
+        )
+    stored = await harness.sessions.get_instruction(enqueued.instruction.id)
+    assert stored is not None and stored.state is InstructionState.QUEUED
+    assert stored.text == enqueued.instruction.text
 
     # The same modification also reaches a new agent through the transfer handoff.
     result = await harness.transfers.transfer(
@@ -1098,6 +1100,67 @@ async def test_human_note_modified_mid_session_reaches_the_agent() -> None:
     )
     assert result.handoff.handoff.files[0].workspace_revision_id == second.revision_id
     assert result.handoff.handoff.files[0].workspace_revision_id != first.revision_id
+
+
+async def test_pull_rebuilds_the_exact_catalog_delivery_text() -> None:
+    """The pull view is byte-identical to what the real note catalog rendered."""
+    harness = await _scenario_harness()
+    task = await harness.seed_task(
+        status=TaskStatus.ASSIGNED,
+        status_version=2,
+        assigned_actor_kind=TaskActorKind.OPERATOR,
+        assigned_actor_id=CODEX_ID,
+    )
+    first = await harness.add_revision(path=NOTE_PATH, sha256="6" * 64, observed_at=NOW)
+    opened = await harness.open_session(task)
+    enqueued = await harness.instruction_service.enqueue_instruction_with_notes(
+        INVESTIGATION_ID,
+        opened.id,
+        text="Check the latest human note before pivoting.",
+        actor=HUMAN,
+        idempotency_key="instruction-parity",
+        note_refs=(NOTE_PATH,),
+    )
+    second = await harness.add_revision(path=NOTE_PATH, sha256="7" * 64, observed_at=LATER)
+    refreshed = await harness.notes.refresh(
+        investigation_id=INVESTIGATION_ID, text=enqueued.instruction.text
+    )
+    assert refreshed.note_diffs
+    assert second.revision_id in refreshed.delivery_text
+
+    delivered = AgentSessionInstructionV1(
+        investigation_id=INVESTIGATION_ID,
+        task_id=task.id,
+        session_id=opened.id,
+        idempotency_key="delivered-parity",
+        text=enqueued.instruction.text,
+        text_sha256=enqueued.instruction.text_sha256,
+        state=InstructionState.DELIVERED,
+        created_by_kind="human",
+        created_by_id="analyst:test",
+        queued_at=NOW,
+        created_at=NOW,
+        updated_at=NOW,
+        delivered_at=NOW,
+        delivery_attempts=1,
+        delivery_token=uuid4(),
+        delivery_mode=InstructionDeliveryMode.NEXT_RUN,
+        delivery_sha256=instruction_text_sha256(refreshed.delivery_text),
+        delivery_note_diffs=refreshed.note_diffs,
+    )
+    stored, created = await harness.sessions.add_instruction(delivered)
+    assert created
+
+    views = await harness.instruction_service.pull_delivered_instructions(
+        INVESTIGATION_ID,
+        opened.id,
+        actor=TaskActor(kind=TaskActorKind.OPERATOR, actor_id=CODEX_ID),
+    )
+    assert len(views) == 1
+    assert views[0].instruction.id == stored.id
+    assert views[0].delivery_text == refreshed.delivery_text
+    assert views[0].delivery_text_verified is True
+    assert views[0].note_refs[0]["revision_id"] == first.revision_id
 
 
 async def test_note_refs_must_stay_under_human_notes() -> None:
@@ -1471,16 +1534,17 @@ async def _real_sidecar_instruction(running: RunningSessionAgent, workspace_id: 
             if revision.sha256 == hashlib.sha256(second_text).hexdigest()
         ]
         assert len(second) == 1
-        acknowledged = await instruction_service.acknowledge_instructions_with_notes(
-            INVESTIGATION_ID,
-            codex.id,
-            instruction_ids=(enqueued.instruction.id,),
-            actor=TaskActor(kind=TaskActorKind.OPERATOR, actor_id=CODEX_ID),
-        )
-        assert len(acknowledged) == 1
-        assert acknowledged[0].note_diffs[0]["queued_revision_id"] == first[0].revision_id
-        assert acknowledged[0].note_diffs[0]["current_revision_id"] == second[0].revision_id
-        assert second[0].revision_id in acknowledged[0].delivery_text
+        # ID-3: the ack is proof-bound; a queued instruction is never acknowledged.
+        with pytest.raises(SessionInstructionNotDeliveredError):
+            await instruction_service.acknowledge_instructions_with_notes(
+                INVESTIGATION_ID,
+                codex.id,
+                instruction_ids=(enqueued.instruction.id,),
+                actor=TaskActor(kind=TaskActorKind.OPERATOR, actor_id=CODEX_ID),
+            )
+        stored = await harness.sessions.get_instruction(enqueued.instruction.id)
+        assert stored is not None and stored.state is InstructionState.QUEUED
+        assert first[0].revision_id in stored.text
         await sessions.interrupt(
             INVESTIGATION_ID, codex.id, reason="instruction test complete", actor=HUMAN
         )
@@ -1552,7 +1616,7 @@ def test_real_sidecar_transfer_interrupts_codex_and_opens_a_claude_session(
         shutil.rmtree(base, ignore_errors=True)
 
 
-def test_real_sidecar_instruction_reports_the_modified_human_note(
+def test_real_sidecar_ack_of_queued_instruction_is_refused(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     base = Path(tempfile.mkdtemp(prefix="m24-x1-instruction-"))

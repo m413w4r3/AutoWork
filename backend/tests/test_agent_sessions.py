@@ -14,6 +14,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
+import logging
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -37,16 +40,22 @@ from cti_app.application.agent_session_verification import (
     build_agent_session_message,
 )
 from cti_app.application.agentic_sessions import (
+    MAX_ACK_INSTRUCTION_IDS,
+    MAX_PULL_INSTRUCTIONS,
     AgentSessionSecretDeliveryPort,
     PreparedAgentSession,
     SessionConflictError,
     SessionExternalDisclosureDeniedError,
+    SessionForbiddenError,
+    SessionInstructionConflictError,
+    SessionInstructionNotDeliveredError,
     SessionNetworkIsolationUnavailableError,
     SessionNewHandoffRequiredError,
     SessionResumeUnavailableError,
     SessionSecret,
     SessionSecretDeliveryUnavailableError,
     SessionService,
+    SessionStateConflictError,
 )
 from cti_app.application.identity import Identity, IdentityScope, LocalIdentityProvider
 from cti_app.application.investigation_handoffs import HandoffTaskStaleError
@@ -66,12 +75,15 @@ from cti_app.application.persistence import (
 from cti_app.application.workspace_agent import WorkspaceLocalUnavailableError
 from cti_app.config import Settings
 from cti_app.domain.agentic_operator import (
+    AgentSessionInstructionV1,
     AgentSessionState,
     AgentSessionV1,
     CollectResultsRequest,
     HandoffRequestReceiptV1,
+    InstructionDeliveryMode,
     InstructionDeliveryOutcome,
     InstructionReceiptV1,
+    InstructionState,
     InterruptSessionRequest,
     InterruptSessionResultV1,
     OperatorAdapterKind,
@@ -92,6 +104,7 @@ from cti_app.domain.agentic_operator import (
     SessionReconciliationV1,
     SessionStatusRequest,
     StartSessionRequest,
+    instruction_text_sha256,
 )
 from cti_app.domain.investigation import (
     DisclosureBounds,
@@ -429,7 +442,9 @@ class _Harness:
         with_secret_delivery: bool = True,
     ) -> None:
         self.investigation_id = INVESTIGATION_ID
-        self.tasks = InMemoryInvestigationTaskRepository()
+        # The database clock stands in for PostgreSQL's statement_timestamp();
+        # the instruction write authority is compared against it.
+        self.tasks = InMemoryInvestigationTaskRepository(clock=lambda: NOW)
         self.handoffs = InMemoryInvestigationHandoffRepository()
         self.sessions = InMemoryAgentSessionRepository()
         self.investigations = _InvestigationRepository(self.investigation_id)
@@ -499,11 +514,12 @@ class _Harness:
         status: TaskStatus = TaskStatus.ASSIGNED,
         status_version: int = 2,
         task_id: UUID | None = None,
+        task_key: str = "lead-loader",
     ) -> InvestigationTaskV1:
         task = InvestigationTaskV1(
             id=task_id or uuid4(),
             investigation_id=self.investigation_id,
-            task_key="lead-loader",
+            task_key=task_key,
             title="Inspect the loader",
             question="Which network gate does the loader use?",
             objective="Identify the first-stage C2 gate.",
@@ -1198,7 +1214,63 @@ async def test_verifier_without_key_fails_closed() -> None:
 # --------------------------------------------------------------- instructions
 
 
-async def test_instruction_is_queued_while_agent_busy_and_acked_signed() -> None:
+async def _seed_instruction(
+    harness: _Harness,
+    session: AgentSessionV1,
+    *,
+    state: InstructionState = InstructionState.QUEUED,
+    text: str = "Check the second-stage gate.",
+    key: str | None = None,
+    queued_at: datetime = NOW,
+    delivery_sha256: str | None = None,
+    delivery_note_diffs: tuple[Mapping[str, Any], ...] | None = None,
+) -> AgentSessionInstructionV1:
+    """Persist one instruction directly in the state under test."""
+    token = (
+        uuid4()
+        if state
+        in (
+            InstructionState.DELIVERING,
+            InstructionState.DELIVERY_UNKNOWN,
+            InstructionState.DELIVERED,
+            InstructionState.ACKNOWLEDGED,
+        )
+        else None
+    )
+    proven = state in (InstructionState.DELIVERED, InstructionState.ACKNOWLEDGED)
+    if delivery_sha256 is None and (
+        proven or state in (InstructionState.DELIVERING, InstructionState.DELIVERY_UNKNOWN)
+    ):
+        delivery_sha256 = instruction_text_sha256(text)
+    instruction = AgentSessionInstructionV1(
+        investigation_id=session.investigation_id,
+        task_id=session.task_id,
+        session_id=session.id,
+        idempotency_key=key or f"seed-{uuid4()}",
+        text=text,
+        text_sha256=instruction_text_sha256(text),
+        state=state,
+        created_by_kind="human",
+        created_by_id="analyst:test",
+        queued_at=queued_at,
+        created_at=queued_at,
+        updated_at=queued_at,
+        delivered_at=queued_at if proven else None,
+        acknowledged_at=queued_at if state is InstructionState.ACKNOWLEDGED else None,
+        delivery_attempts=1 if token is not None else 0,
+        delivery_token=token,
+        delivery_mode=(InstructionDeliveryMode.NEXT_RUN if proven else None),
+        delivery_sha256=delivery_sha256,
+        delivery_note_diffs=delivery_note_diffs if proven else None,
+        delivery_unknown_at=(queued_at if state is InstructionState.DELIVERY_UNKNOWN else None),
+    )
+    stored, created = await harness.sessions.add_instruction(instruction)
+    assert created
+    return stored
+
+
+async def test_ack_of_queued_instruction_is_refused() -> None:
+    """F3-D « Ack »: an instruction no host effect delivered is never acknowledged."""
     harness = _Harness()
     task = await harness.seed_task()
     prepared = await harness.open(task=task)
@@ -1210,7 +1282,7 @@ async def test_instruction_is_queued_while_agent_busy_and_acked_signed() -> None
         actor=HUMAN_ACTOR,
         idempotency_key="instruction-1",
     )
-    assert queued.state.value == "queued"
+    assert queued.state is InstructionState.QUEUED
     assert harness.operator.instructions == []
     replayed = await harness.service.enqueue_instruction(
         harness.investigation_id,
@@ -1221,15 +1293,412 @@ async def test_instruction_is_queued_while_agent_busy_and_acked_signed() -> None
     )
     assert replayed.id == queued.id
 
+    with pytest.raises(SessionInstructionNotDeliveredError) as exc_info:
+        await harness.service.acknowledge_instructions(
+            harness.investigation_id,
+            prepared.session.id,
+            instruction_ids=(queued.id,),
+            actor=OPERATOR_ACTOR,
+        )
+    assert exc_info.value.code == "instruction_not_delivered"
+    assert exc_info.value.status_code == 409
+    stored = await harness.sessions.get_instruction(queued.id)
+    assert stored is not None and stored.state is InstructionState.QUEUED
+    assert harness.operator.instructions == []
+
+
+async def test_ack_of_a_delivered_instruction_is_idempotent() -> None:
+    harness, prepared = await _running_harness()
+    delivered = await _seed_instruction(harness, prepared.session, state=InstructionState.DELIVERED)
+
+    first = await harness.service.acknowledge_instructions(
+        harness.investigation_id,
+        prepared.session.id,
+        instruction_ids=(delivered.id,),
+        actor=OPERATOR_ACTOR,
+    )
+    assert first[0].state is InstructionState.ACKNOWLEDGED
+    assert first[0].acknowledged_at == NOW
+
+    replay = await harness.service.acknowledge_instructions(
+        harness.investigation_id,
+        prepared.session.id,
+        instruction_ids=(delivered.id, delivered.id),
+        actor=OPERATOR_ACTOR,
+    )
+    assert [item.id for item in replay] == [delivered.id]
+    assert replay[0].state is InstructionState.ACKNOWLEDGED
+    assert replay[0].acknowledged_at == NOW
+
+
+async def test_ack_promotes_in_flight_delivery_as_the_receipt(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="cti_app.application.agentic_sessions")
+    harness, prepared = await _running_harness()
+    delivering = await _seed_instruction(
+        harness,
+        prepared.session,
+        state=InstructionState.DELIVERING,
+        text="First probe.",
+        key="delivering-1",
+    )
+    unknown = await _seed_instruction(
+        harness,
+        prepared.session,
+        state=InstructionState.DELIVERY_UNKNOWN,
+        text="Second probe.",
+        key="unknown-1",
+        queued_at=NOW + timedelta(seconds=1),
+    )
+
     acknowledged = await harness.service.acknowledge_instructions(
         harness.investigation_id,
         prepared.session.id,
-        instruction_ids=(queued.id,),
+        instruction_ids=(delivering.id, unknown.id),
         actor=OPERATOR_ACTOR,
     )
-    assert acknowledged[0].state.value == "acknowledged"
-    assert acknowledged[0].delivered_at is not None
-    assert acknowledged[0].acknowledged_at is not None
+    assert [item.state for item in acknowledged] == [
+        InstructionState.ACKNOWLEDGED,
+        InstructionState.ACKNOWLEDGED,
+    ]
+    assert acknowledged[0].delivered_at == NOW
+    assert acknowledged[0].delivery_sha256 == instruction_text_sha256("First probe.")
+    assert acknowledged[1].delivery_unknown_at is None
+    events = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "m24.instruction_delivery.ack_promoted"
+    ]
+    assert {record.from_state for record in events} == {"delivering", "delivery_unknown"}
+
+
+async def test_ack_requires_the_operator_identity_and_never_crosses_sessions() -> None:
+    harness = _Harness()
+    task = await harness.seed_task()
+    prepared = await harness.open(task=task)
+    delivered = await _seed_instruction(harness, prepared.session, state=InstructionState.DELIVERED)
+
+    with pytest.raises(SessionForbiddenError):
+        await harness.service.acknowledge_instructions(
+            harness.investigation_id,
+            prepared.session.id,
+            instruction_ids=(delivered.id,),
+            actor=HUMAN_ACTOR,
+        )
+
+    other_harness = _Harness()
+    other_task = await other_harness.seed_task()
+    other_prepared = await other_harness.open(task=other_task)
+    foreign = await _seed_instruction(
+        other_harness, other_prepared.session, state=InstructionState.DELIVERED
+    )
+    with pytest.raises(SessionInstructionConflictError):
+        await harness.service.acknowledge_instructions(
+            harness.investigation_id,
+            prepared.session.id,
+            instruction_ids=(foreign.id,),
+            actor=OPERATOR_ACTOR,
+        )
+    stored = await other_harness.sessions.get_instruction(foreign.id)
+    assert stored is not None and stored.state is InstructionState.DELIVERED
+
+
+async def test_ack_refuses_a_revoked_lease_and_rolls_the_transaction_back() -> None:
+    """TOCTOU: a revocation between the read and the persisted CAS refuses."""
+    harness, prepared = await _running_harness()
+    delivered = await _seed_instruction(harness, prepared.session, state=InstructionState.DELIVERED)
+    revoke_on_cas = _RevokeLeaseOnCas(harness, prepared.session.task_id)
+    harness.uow.agent_sessions = revoke_on_cas  # type: ignore[assignment]
+
+    with pytest.raises(SessionStateConflictError):
+        await harness.service.acknowledge_instructions(
+            harness.investigation_id,
+            prepared.session.id,
+            instruction_ids=(delivered.id,),
+            actor=OPERATOR_ACTOR,
+        )
+    # PostgreSQL rolls the UoW back on the refusal; the fake asserts the raise
+    # happens after the first CAS and before the commit.
+    assert revoke_on_cas.cas_calls == 1
+
+
+class _RevokeLeaseOnCas:
+    """Revoke the task lease at the first instruction CAS (TOCTOU interleave)."""
+
+    def __init__(self, harness: _Harness, task_id: UUID) -> None:
+        self._harness = harness
+        self._task_id = task_id
+        self.cas_calls = 0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._harness.sessions, name)
+
+    async def update_instruction_delivery(
+        self,
+        instruction: AgentSessionInstructionV1,
+        *,
+        expected_state: InstructionState,
+        expected_delivery_token: UUID | None,
+    ) -> AgentSessionInstructionV1:
+        self.cas_calls += 1
+        if self.cas_calls == 1:
+            self._harness.expire_lease(self._task_id)
+        return await self._harness.sessions.update_instruction_delivery(
+            instruction,
+            expected_state=expected_state,
+            expected_delivery_token=expected_delivery_token,
+        )
+
+
+async def test_pull_returns_only_delivered_unacknowledged_in_queue_order() -> None:
+    harness, prepared = await _running_harness()
+    first = await _seed_instruction(
+        harness, prepared.session, state=InstructionState.DELIVERED, text="First."
+    )
+    second = await _seed_instruction(
+        harness,
+        prepared.session,
+        state=InstructionState.DELIVERED,
+        text="Second.",
+        key="second",
+        queued_at=NOW + timedelta(seconds=1),
+    )
+    await _seed_instruction(
+        harness,
+        prepared.session,
+        state=InstructionState.DELIVERED,
+        text="Acked.",
+        key="acked",
+        queued_at=NOW + timedelta(seconds=2),
+    )
+    # Acknowledged and still-queued rows never appear in the pull.
+    acked = await harness.sessions.get_instruction_by_idempotency(prepared.session.id, "acked")
+    assert acked is not None
+    await harness.service.acknowledge_instructions(
+        harness.investigation_id,
+        prepared.session.id,
+        instruction_ids=(acked.id,),
+        actor=OPERATOR_ACTOR,
+    )
+    await harness.service.enqueue_instruction(
+        harness.investigation_id,
+        prepared.session.id,
+        text="Queued.",
+        actor=HUMAN_ACTOR,
+        idempotency_key="queued",
+    )
+
+    pending = await harness.service.pull_delivered_instructions(
+        harness.investigation_id, prepared.session.id, actor=OPERATOR_ACTOR
+    )
+    assert [view.instruction.id for view in pending] == [first.id, second.id]
+    assert [view.delivery_text for view in pending] == ["First.", "Second."]
+    assert pending[0].delivery_text_verified is True
+
+    with pytest.raises(SessionForbiddenError):
+        await harness.service.pull_delivered_instructions(
+            harness.investigation_id, prepared.session.id, actor=HUMAN_ACTOR
+        )
+
+
+async def test_pull_rebuilds_the_delivered_text_from_body_and_diffs() -> None:
+    harness, prepared = await _running_harness()
+    body = "Follow the note.\n\n[autowork-workspace-notes v1]\n" + (
+        '{"notes":[{"path":"notes/humaines/piste.md","revision_id":"rev-1","sha256":"'
+        + "1" * 64
+        + '"}]}\n[/autowork-workspace-notes]'
+    )
+    diff = {
+        "path": "notes/humaines/piste.md",
+        "queued_revision_id": "rev-1",
+        "queued_sha256": "1" * 64,
+        "current_revision_id": "rev-2",
+        "current_sha256": "2" * 64,
+    }
+    delivered_text = (
+        body + "\n[notes modifiées depuis la mise en file]\n"
+        "- notes/humaines/piste.md: rev-1 -> rev-2"
+    )
+    delivered = await _seed_instruction(
+        harness,
+        prepared.session,
+        state=InstructionState.DELIVERED,
+        text=body,
+        delivery_sha256=instruction_text_sha256(delivered_text),
+        delivery_note_diffs=(diff,),
+    )
+    mismatched = await _seed_instruction(
+        harness,
+        prepared.session,
+        state=InstructionState.DELIVERED,
+        text="Plain.",
+        key="mismatched",
+        queued_at=NOW + timedelta(seconds=1),
+        delivery_sha256="f" * 64,
+    )
+
+    views = await harness.service.pull_delivered_instructions(
+        harness.investigation_id, prepared.session.id, actor=OPERATOR_ACTOR
+    )
+    assert [view.instruction.id for view in views] == [delivered.id, mismatched.id]
+    assert views[0].delivery_text == delivered_text
+    assert views[0].delivery_text_verified is True
+    assert views[0].note_refs == (
+        {
+            "path": "notes/humaines/piste.md",
+            "revision_id": "rev-1",
+            "sha256": "1" * 64,
+        },
+    )
+    assert dict(views[0].note_diffs[0]) == diff
+    assert views[1].delivery_text_verified is False
+
+
+async def test_pull_is_bounded() -> None:
+    harness, prepared = await _running_harness()
+    for index in range(MAX_PULL_INSTRUCTIONS + 3):
+        await _seed_instruction(
+            harness,
+            prepared.session,
+            state=InstructionState.DELIVERED,
+            text=f"Instruction {index}.",
+            key=f"bounded-{index}",
+            queued_at=NOW + timedelta(seconds=index),
+        )
+    pending = await harness.service.pull_delivered_instructions(
+        harness.investigation_id, prepared.session.id, actor=OPERATOR_ACTOR
+    )
+    assert len(pending) == MAX_PULL_INSTRUCTIONS
+    limited = await harness.service.pull_delivered_instructions(
+        harness.investigation_id, prepared.session.id, actor=OPERATOR_ACTOR, limit=3
+    )
+    assert [view.delivery_text for view in limited] == [
+        "Instruction 0.",
+        "Instruction 1.",
+        "Instruction 2.",
+    ]
+    with pytest.raises(ValueError):
+        await harness.service.pull_delivered_instructions(
+            harness.investigation_id, prepared.session.id, actor=OPERATOR_ACTOR, limit=0
+        )
+
+
+async def test_cancel_is_a_human_action_with_a_bounded_reason() -> None:
+    harness, prepared = await _running_harness()
+    queued = await _seed_instruction(harness, prepared.session)
+    unknown = await _seed_instruction(
+        harness,
+        prepared.session,
+        state=InstructionState.DELIVERY_UNKNOWN,
+        key="unknown",
+        queued_at=NOW + timedelta(seconds=1),
+    )
+
+    cancelled = await harness.service.cancel_instruction(
+        harness.investigation_id,
+        prepared.session.id,
+        instruction_id=queued.id,
+        reason="no longer relevant",
+        actor=HUMAN_ACTOR,
+    )
+    assert cancelled.state is InstructionState.CANCELLED
+    assert cancelled.cancel_reason == "no longer relevant"
+    assert cancelled.cancelled_at == NOW
+    assert cancelled.delivery_token is None
+
+    cancelled_unknown = await harness.service.cancel_instruction(
+        harness.investigation_id,
+        prepared.session.id,
+        instruction_id=unknown.id,
+        reason="attempt never resolved",
+        actor=HUMAN_ACTOR,
+    )
+    assert cancelled_unknown.state is InstructionState.CANCELLED
+    assert cancelled_unknown.delivery_token is None
+
+    replay = await harness.service.cancel_instruction(
+        harness.investigation_id,
+        prepared.session.id,
+        instruction_id=queued.id,
+        reason="replay",
+        actor=HUMAN_ACTOR,
+    )
+    assert replay.cancel_reason == "no longer relevant"
+
+    with pytest.raises(SessionForbiddenError):
+        await harness.service.cancel_instruction(
+            harness.investigation_id,
+            prepared.session.id,
+            instruction_id=unknown.id,
+            reason="operator cannot cancel",
+            actor=OPERATOR_ACTOR,
+        )
+    with pytest.raises(ValueError):
+        await harness.service.cancel_instruction(
+            harness.investigation_id,
+            prepared.session.id,
+            instruction_id=unknown.id,
+            reason="   ",
+            actor=HUMAN_ACTOR,
+        )
+    with pytest.raises(ValueError):
+        await harness.service.cancel_instruction(
+            harness.investigation_id,
+            prepared.session.id,
+            instruction_id=unknown.id,
+            reason="x" * 4097,
+            actor=HUMAN_ACTOR,
+        )
+
+
+async def test_cancel_refuses_in_flight_and_proven_states_and_other_sessions() -> None:
+    harness, prepared = await _running_harness()
+    delivering = await _seed_instruction(
+        harness, prepared.session, state=InstructionState.DELIVERING
+    )
+    delivered = await _seed_instruction(
+        harness,
+        prepared.session,
+        state=InstructionState.DELIVERED,
+        key="delivered",
+        queued_at=NOW + timedelta(seconds=1),
+    )
+    acknowledged = await _seed_instruction(
+        harness,
+        prepared.session,
+        state=InstructionState.ACKNOWLEDGED,
+        key="acknowledged",
+        queued_at=NOW + timedelta(seconds=2),
+    )
+    for instruction, reason in (
+        (delivering, "delivery_in_flight"),
+        (delivered, "instruction_delivered"),
+        (acknowledged, "instruction_delivered"),
+    ):
+        with pytest.raises(SessionInstructionConflictError) as exc_info:
+            await harness.service.cancel_instruction(
+                harness.investigation_id,
+                prepared.session.id,
+                instruction_id=instruction.id,
+                reason="stop it",
+                actor=HUMAN_ACTOR,
+            )
+        assert exc_info.value.details.get("reason") == reason
+
+    other = await harness.seed_task(task_id=uuid4(), task_key="lead-other")
+    other_session = _ready_session(harness, other, uuid4())
+    await harness.sessions.add(other_session)
+    with pytest.raises(SessionInstructionConflictError):
+        await harness.service.cancel_instruction(
+            harness.investigation_id,
+            other_session.id,
+            instruction_id=delivering.id,
+            reason="not mine",
+            actor=HUMAN_ACTOR,
+        )
+    stored = await harness.sessions.get_instruction(delivering.id)
+    assert stored is not None and stored.state is InstructionState.DELIVERING
 
 
 # --------------------------------------------------------------- attribution
@@ -1406,6 +1875,189 @@ async def test_signed_route_rejects_a_bad_signature() -> None:
         )
     assert refused.status_code == 403
     assert refused.json()["detail"]["code"] == "agent_session_signature_invalid"
+
+
+def _live_lease(harness: _Harness, task_id: UUID) -> None:
+    """The D7 verifier checks the lease on the real clock; the harness clock is fixed."""
+    task = harness.task_row(task_id)
+    horizon = datetime.now(UTC) + timedelta(minutes=10)
+    harness.tasks._tasks[task_id] = replace(
+        task, lease_expires_at=horizon, heartbeat_at=datetime.now(UTC)
+    )
+
+
+def _signed_instruction_request(
+    secret_hex: str,
+    *,
+    path: str,
+    session_id: UUID,
+    payload: dict[str, Any],
+) -> tuple[bytes, dict[str, str]]:
+    body = json.dumps(payload).encode()
+    timestamp, signature = _signed(
+        secret_hex,
+        method="POST",
+        path_and_query=path,
+        session_id=session_id,
+        body=body,
+        timestamp=datetime.now(UTC),
+    )
+    return body, {
+        "content-type": "application/json",
+        "x-autowork-agent-session": str(session_id),
+        "x-autowork-agent-timestamp": timestamp,
+        "x-autowork-agent-signature": signature,
+    }
+
+
+async def test_instruction_route_pull_ack_and_strict_ack_refusal() -> None:
+    harness, prepared = await _running_harness()
+    _live_lease(harness, prepared.session.task_id)
+    delivered = await _seed_instruction(harness, prepared.session, state=InstructionState.DELIVERED)
+    queued = await _seed_instruction(harness, prepared.session, key="queued")
+    app = _api_app(harness, _OperatorClientIdentity())
+    path = (
+        f"/api/investigations/{harness.investigation_id}"
+        f"/agent-sessions/{prepared.session.id}/instructions"
+    )
+    delivery = harness.fake_delivery
+    assert delivery is not None
+    secret = delivery.secret_for(prepared.session.id)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        # pull and ack are reachable only through the D7 signatures.
+        unsigned = await client.post(path, json={"action": "pull"})
+        assert unsigned.status_code == 403
+        foreign_path = (
+            f"/api/investigations/{harness.investigation_id}/agent-sessions/{uuid4()}/instructions"
+        )
+        body, headers = _signed_instruction_request(
+            secret, path=path, session_id=prepared.session.id, payload={"action": "pull"}
+        )
+        mismatched = await client.post(foreign_path, headers=headers, content=body)
+        assert mismatched.status_code == 403
+        assert mismatched.json()["detail"]["code"] == "agent_session_binding_mismatch"
+
+        body, headers = _signed_instruction_request(
+            secret, path=path, session_id=prepared.session.id, payload={"action": "pull"}
+        )
+        pulled = await client.post(path, headers=headers, content=body)
+        assert pulled.status_code == 200, pulled.text
+        assert [item["id"] for item in pulled.json()] == [str(delivered.id)]
+        assert pulled.json()[0]["delivery_text"] == delivered.text
+        assert pulled.json()[0]["delivery_sha256"] == delivered.delivery_sha256
+
+        body, headers = _signed_instruction_request(
+            secret,
+            path=path,
+            session_id=prepared.session.id,
+            payload={"action": "ack", "instruction_ids": [str(queued.id)]},
+        )
+        refused = await client.post(path, headers=headers, content=body)
+        assert refused.status_code == 409
+        assert refused.json()["detail"]["code"] == "instruction_not_delivered"
+
+        body, headers = _signed_instruction_request(
+            secret,
+            path=path,
+            session_id=prepared.session.id,
+            payload={"action": "ack", "instruction_ids": [str(delivered.id)]},
+        )
+        acked = await client.post(path, headers=headers, content=body)
+        assert acked.status_code == 200, acked.text
+        assert acked.json()[0]["state"] == "acknowledged"
+        assert acked.json()[0]["delivery_text_verified"] is True
+
+        body, headers = _signed_instruction_request(
+            secret, path=path, session_id=prepared.session.id, payload={"action": "pull"}
+        )
+        assert (await client.post(path, headers=headers, content=body)).json() == []
+
+
+async def test_instruction_route_cancel_is_human_only() -> None:
+    harness, prepared = await _running_harness()
+    queued = await _seed_instruction(harness, prepared.session)
+    path = (
+        f"/api/investigations/{harness.investigation_id}"
+        f"/agent-sessions/{prepared.session.id}/instructions"
+    )
+    payload = {
+        "action": "cancel",
+        "instruction_id": str(queued.id),
+        "reason": "superseded by the new brief",
+    }
+    human_app = _api_app(harness, LocalIdentityProvider("dev-analyst"))
+    async with AsyncClient(
+        transport=ASGITransport(app=human_app), base_url="http://test"
+    ) as client:
+        cancelled = await client.post(path, json=payload)
+        assert cancelled.status_code == 200, cancelled.text
+        assert cancelled.json()["state"] == "cancelled"
+        assert cancelled.json()["cancel_reason"] == "superseded by the new brief"
+
+    operator_app = _api_app(harness, _OperatorClientIdentity())
+    async with AsyncClient(
+        transport=ASGITransport(app=operator_app), base_url="http://test"
+    ) as client:
+        refused = await client.post(path, json=payload)
+        assert refused.status_code == 403
+        assert refused.json()["detail"]["code"] == "verified_human_operator_required"
+
+
+def test_instruction_request_shape_is_strict_per_action() -> None:
+    from cti_app.api.agent_sessions import InstructionRequest
+
+    with pytest.raises(ValidationError):
+        InstructionRequest.model_validate({"action": "pull", "text": "not allowed"})
+    with pytest.raises(ValidationError):
+        InstructionRequest.model_validate({"action": "ack", "instruction_ids": []})
+    with pytest.raises(ValidationError):
+        InstructionRequest.model_validate(
+            {"action": "ack", "instruction_ids": [str(uuid4())] * (MAX_ACK_INSTRUCTION_IDS + 1)}
+        )
+    with pytest.raises(ValidationError):
+        InstructionRequest.model_validate({"action": "cancel", "instruction_id": str(uuid4())})
+    with pytest.raises(ValidationError):
+        InstructionRequest.model_validate(
+            {"action": "enqueue", "text": "ok", "instruction_id": str(uuid4())}
+        )
+    with pytest.raises(ValidationError):
+        InstructionRequest.model_validate({"action": "unknown"})
+
+
+class _RecordingDelivery:
+    def __init__(self) -> None:
+        self.calls: list[UUID] = []
+
+    async def deliver_instruction(self, instruction_id: UUID) -> None:
+        self.calls.append(instruction_id)
+
+
+async def test_enqueue_route_wires_the_backend_drain() -> None:
+    harness = _Harness()
+    task = await harness.seed_task()
+    prepared = await harness.open(task=task)
+    stored = await harness.sessions.get(prepared.session.id)
+    assert stored is not None
+    await harness.sessions.update_state(
+        stored.with_state(AgentSessionState.AWAITING_INSTRUCTION, now=NOW),
+        expected_state_version=stored.state_version,
+    )
+    recorder = _RecordingDelivery()
+    app = _api_app(harness, LocalIdentityProvider("dev-analyst"))
+    app.state.instruction_delivery_service = recorder
+    path = (
+        f"/api/investigations/{harness.investigation_id}"
+        f"/agent-sessions/{prepared.session.id}/instructions"
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            path,
+            headers={"Idempotency-Key": "api-enqueue-drain"},
+            json={"action": "enqueue", "text": "Continue with the second stage."},
+        )
+        assert response.status_code == 200, response.text
+    assert recorder.calls == [UUID(response.json()["id"])]
 
 
 # --------------------------------------------------- disclosure gate (R03 B2)
