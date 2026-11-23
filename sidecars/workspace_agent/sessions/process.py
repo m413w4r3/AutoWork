@@ -59,6 +59,9 @@ ENTRYPOINT_FILE_NAME = "entrypoint.py"
 EGRESS_SOCKET_FILE_NAME = "egress.sock"
 ATTESTATION_PROBE_TIMEOUT_SECONDS = 10.0
 SPAWN_ANCHOR_TIMEOUT_SECONDS = 30.0
+# R2B-3: bound at import so a test seam replacing ``subprocess.Popen`` cannot
+# change how a handed-over child is recognised.
+_POPEN_TYPE = subprocess.Popen
 ATTESTATION_DIRECTORY_PREFIX = "autowork-netns-attest-"
 AF_UNIX_PATH_MAX_BYTES = 107  # sockaddr_un.sun_path is 108 bytes including the NUL
 ATTESTATION_ENV = {
@@ -264,32 +267,73 @@ def _popen_with_anchor(argv: Sequence[str], **kwargs: object) -> subprocess.Pope
     sandbox a few seconds after the response was written (H0 host spike,
     2026-11-23: SIGKILL at ~4 s with no caller-side signal).  The anchor thread
     outlives the child, so only a real supervisor death tears the tree down.
+
+    The caller may give up on ``SPAWN_ANCHOR_TIMEOUT_SECONDS`` while the
+    anchor's ``Popen`` is still pending.  The cancellation is published under a
+    lock, so exactly one side owns a late child: the anchor kills it if it sees
+    the cancellation first, otherwise the caller kills the handed-over child.
+    Either way the whole process group is signalled and reaped, and its pipes
+    are closed, before this function returns (R2B-3).
     """
     ready = threading.Event()
+    lock = threading.Lock()
     outcome: dict[str, object] = {}
+    cancelled = False
 
     def anchor() -> None:
+        nonlocal cancelled
         try:
             child = subprocess.Popen(argv, **kwargs)  # type: ignore[arg-type]
         except BaseException as exc:  # re-raised in the caller thread
-            outcome["error"] = exc
+            with lock:
+                if cancelled:
+                    ready.set()
+                    return
+                outcome["error"] = exc
             ready.set()
             return
-        outcome["process"] = child
+        with lock:
+            refused = cancelled
+            if not refused:
+                outcome["process"] = child
         ready.set()
+        if refused:
+            # The caller already refused the launch: this child was released
+            # too late and must never outlive the refusal.
+            _kill_refused_child(child)
+            return
         # Keep this thread (the child's parent) alive until the run ends.
         child.wait()
 
     threading.Thread(target=anchor, name="session-spawn-anchor", daemon=True).start()
     if not ready.wait(timeout=SPAWN_ANCHOR_TIMEOUT_SECONDS):
+        with lock:
+            cancelled = True
+            late = outcome.pop("process", None)
+        if isinstance(late, _POPEN_TYPE):
+            _kill_refused_child(late)
         raise OSError("the sandbox did not start")
     error = outcome.get("error")
     if isinstance(error, BaseException):
         raise error
     child = outcome.get("process")
-    if not isinstance(child, subprocess.Popen):
+    if not isinstance(child, _POPEN_TYPE):
         raise OSError("the sandbox did not start")
     return child
+
+
+def _kill_refused_child(child: subprocess.Popen[bytes]) -> None:
+    """Kill and reap a child whose launch the caller has already refused."""
+    try:
+        pgid = os.getpgid(child.pid)
+    except OSError:
+        pgid = child.pid
+    signal_group(pgid, signal.SIGKILL)
+    try:
+        child.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+    close_pipes(child)
 
 
 def _spawn_direct(plan: LaunchPlan) -> ManagedProcess:
