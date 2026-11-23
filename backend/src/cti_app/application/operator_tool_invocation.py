@@ -666,6 +666,83 @@ class OperatorToolInvocationResult:
     output: Mapping[str, Any]
 
 
+def operator_request_identity(
+    *,
+    investigation_id: UUID,
+    tool_name: str,
+    schema_version: str,
+    purpose: str,
+    expected_version: int | str,
+    idempotency_key: str,
+    arguments: Mapping[str, Any] | None = None,
+    request: Mapping[str, Any] | None = None,
+) -> tuple[str, str]:
+    """Derive the durable operation prefix and key of one invocable request.
+
+    ``request`` replaces the derived ``arguments`` in the replay fingerprint
+    when a route can identify its request before assembling them from mutable
+    state (a task context, the latest evidence snapshot).  An unchanged
+    request then replays its recorded operation even though the state it was
+    derived from moved; a changed request keeps its own key and conflicts with
+    the recorded one.
+    """
+    if (arguments is None) == (request is None):
+        raise TypeError("exactly one of arguments and request identifies the operation")
+    key_digest = hashlib.sha256(f"{investigation_id}\0{idempotency_key}".encode()).hexdigest()
+    operation_prefix = f"operator:{key_digest}:"
+    payload: dict[str, Any] = {
+        "tool_name": tool_name,
+        "schema_version": schema_version,
+        "purpose": purpose,
+        "expected_version": expected_version,
+    }
+    payload["arguments" if request is None else "request"] = (
+        arguments if request is None else request
+    )
+    digest = hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+    return operation_prefix, f"{operation_prefix}{digest}"
+
+
+async def recorded_request_invocation(
+    invocations: ToolInvocationRepository,
+    *,
+    investigation_id: UUID,
+    tool_name: str,
+    schema_version: str,
+    purpose: str,
+    expected_version: int | str,
+    idempotency_key: str,
+    request: Mapping[str, Any],
+) -> ToolInvocation | None:
+    """Return the invocation already recorded for this exact request, if any.
+
+    A human route whose arguments are rebuilt from mutable state (the task
+    status or contributions, the latest evidence snapshot) calls this before
+    assembling them: replay identity is a function of the request, never of
+    the state it was derived from.  A different request under the same
+    idempotency key stays an ``idempotency_conflict``.
+    """
+    operation_prefix, operation_key = operator_request_identity(
+        investigation_id=investigation_id,
+        tool_name=tool_name,
+        schema_version=schema_version,
+        purpose=purpose,
+        expected_version=expected_version,
+        idempotency_key=idempotency_key,
+        request=request,
+    )
+    key_taken = False
+    for existing in await invocations.list_for_investigation(investigation_id):
+        if not existing.operation_key.startswith(operation_prefix):
+            continue
+        if existing.operation_key == operation_key:
+            return existing
+        key_taken = True
+    if key_taken:
+        raise OperatorToolInvocationError("idempotency_conflict", 409)
+    return None
+
+
 def _disclosure_origin_labels(source: Any) -> dict[str, Any]:
     disclosure = getattr(source, "disclosure", source)
     tlp = getattr(disclosure, "tlp", getattr(source, "tlp", None))
@@ -1146,6 +1223,7 @@ class OperatorToolInvocationService:
         agent_session_id: UUID | None = None,
         context_task_id: UUID | None = None,
         idempotency_scope: str | None = None,
+        request_identity: Mapping[str, Any] | None = None,
     ) -> OperatorToolInvocationResult:
         if not 1 <= len(idempotency_key) <= 255:
             raise OperatorToolInvocationError("idempotency_key_invalid", 422)
@@ -1172,26 +1250,33 @@ class OperatorToolInvocationService:
             not isinstance(idempotency_scope, str) or not idempotency_scope.strip()
         ):
             raise OperatorToolInvocationError("idempotency_scope_invalid", 422)
+        if request_identity is not None and not isinstance(request_identity, Mapping):
+            raise OperatorToolInvocationError("operator_payload_invalid_or_sensitive", 422)
         schema_version = self._canonical_schema_version(tool_name, schema_version)
         try:
             trace, _human_purpose = split_advisor_trace_purpose(
                 purpose, tool_name=tool_name, allow_server_denied=False
             )
             _require_safe_operator_payload({"arguments": arguments, "purpose": purpose})
-            payload = canonical_json_bytes(
-                {
-                    "tool_name": tool_name,
-                    "schema_version": schema_version,
-                    "arguments": arguments,
-                    "purpose": purpose,
-                    # An agentic session has no analyst-supplied working-state
-                    # CAS: its bound D7 key is the replay identity.  Replacing
-                    # only the mutable version keeps any changed body (tool,
-                    # schema, arguments, purpose) a genuine 409 conflict.
-                    "expected_version": (
-                        expected_version if idempotency_scope is None else idempotency_scope
-                    ),
-                }
+            # A human route whose arguments are rebuilt from mutable state
+            # supplies the incoming request instead: the replay identity must
+            # cover the request, not the state it derives from.  The recorded
+            # parameters remain the full derived arguments.
+            operation_prefix, operation_key = operator_request_identity(
+                investigation_id=self._investigation_id,
+                tool_name=tool_name,
+                schema_version=schema_version,
+                purpose=purpose,
+                # An agentic session has no analyst-supplied working-state
+                # CAS: its bound D7 key is the replay identity.  Replacing
+                # only the mutable version keeps any changed body (tool,
+                # schema, arguments, purpose) a genuine 409 conflict.
+                expected_version=(
+                    expected_version if idempotency_scope is None else idempotency_scope
+                ),
+                idempotency_key=idempotency_key,
+                arguments=None if request_identity is not None else arguments,
+                request=request_identity,
             )
         except (TypeError, ValueError):
             raise OperatorToolInvocationError(
@@ -1205,12 +1290,6 @@ class OperatorToolInvocationService:
                 )
             except ValueError as exc:
                 raise OperatorToolInvocationError(str(exc), 422) from None
-        key_digest = hashlib.sha256(
-            f"{self._investigation_id}\0{idempotency_key}".encode()
-        ).hexdigest()
-        payload_digest = hashlib.sha256(payload).hexdigest()
-        operation_prefix = f"operator:{key_digest}:"
-        operation_key = f"{operation_prefix}{payload_digest}"
         lock = _ACTIVE_OPERATOR_INVOCATIONS.setdefault(operation_prefix, asyncio.Lock())
         async with lock:
             async with _lock_operation_prefix(self._invocations, operation_prefix):
@@ -1433,7 +1512,11 @@ class OperatorToolInvocationService:
             if item.operation_key.startswith(operation_prefix)
         )
         if prior:
-            existing = prior[0]
+            # Prefer this request's own row: a key reused by another operation
+            # is a conflict, but it must not shadow the recorded replay.
+            existing = next(
+                (item for item in prior if item.operation_key == operation_key), prior[0]
+            )
             if existing.operation_key != operation_key:
                 raise OperatorToolInvocationError("idempotency_conflict", 409)
             if existing.status in {ToolInvocationStatus.PENDING, ToolInvocationStatus.RUNNING}:
@@ -2758,4 +2841,6 @@ __all__ = [
     "OperatorToolInvocationError",
     "OperatorToolInvocationResult",
     "OperatorToolInvocationService",
+    "operator_request_identity",
+    "recorded_request_invocation",
 ]

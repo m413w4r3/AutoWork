@@ -59,7 +59,10 @@ from cti_app.application.investigation_task_context import (
     build_task_context,
     task_context_arguments,
 )
-from cti_app.application.operator_tool_invocation import OperatorToolInvocationError
+from cti_app.application.operator_tool_invocation import (
+    OperatorToolInvocationError,
+    recorded_request_invocation,
+)
 from cti_app.domain.editorial import (
     AnalystDecision,
     AnalystDecisionTargetType,
@@ -402,6 +405,25 @@ async def list_consultations(
         )
 
 
+def _plan_request_identity(payload: PlanRequestV1, question: str) -> dict[str, Any]:
+    """The replay identity of one plan request body, independent of evidence state.
+
+    The working-state version is already part of the invocation digest as the
+    CAS precondition; the latest bootstrap snapshot and the derived
+    ``task_context`` deliberately are not, so a replay of the same body returns
+    the recorded plan even after observations or the context task moved.
+    """
+    return {
+        "route": "investigation_plan_request",
+        "consultation_type": PLAN_CONSULTATION_TYPE,
+        "question": question,
+        "context_task_id": (
+            str(payload.context_task_id) if payload.context_task_id is not None else None
+        ),
+        "expected_sha256": payload.expected_sha256,
+    }
+
+
 @router.post(
     "/{investigation_id}/plans/request",
     response_model=PlanRequestResponseV1,
@@ -425,48 +447,73 @@ async def request_plan(
             context_task = await uow.investigation_tasks.get(payload.context_task_id)
             if context_task is None or context_task.investigation_id != investigation_id:
                 raise _http_error(404, "task_not_found")
-        arguments: dict[str, Any] = {
-            "consultation_type": PLAN_CONSULTATION_TYPE,
-            "question": (payload.question or "").strip() or _DEFAULT_PLAN_QUESTION,
-        }
-        if snapshot is not None:
-            arguments["evidence_refs"] = [str(snapshot.id)]
-        if context_task is not None:
-            # The invocation carries the sanitised context: the operator payload
-            # guard runs before any advisor-side sanitisation.
-            try:
-                task_context = await build_task_context(
-                    uow=uow,
-                    task=context_task,
-                    factory=factory,
-                    investigation=investigation,
-                )
-            except TaskContextError as exc:
-                raise _http_error(422, exc.code) from exc
-            arguments.update(task_context_arguments(task_context))
-        composition = factory.build(uow, investigation_id, operator_mode=True)
+        question = (payload.question or "").strip() or _DEFAULT_PLAN_QUESTION
+        request_identity = _plan_request_identity(payload, question)
         try:
-            invocation_result = await composition.operator_tool_invocations.invoke(
+            recorded = await recorded_request_invocation(
+                uow.tool_invocations,
+                investigation_id=investigation_id,
                 tool_name=_ADVISOR_TOOL_NAME,
                 schema_version=ADVISOR_SCHEMA_VERSION,
-                arguments=arguments,
                 purpose=_PLAN_REQUEST_PURPOSE,
                 expected_version=payload.expected_version,
-                expected_sha256=payload.expected_sha256,
                 idempotency_key=idempotency_key,
-                actor_id=identity.actor_id,
-                requester_actor_kind=ToolInvocationActorKind.HUMAN,
-                context_task_id=context_task.id if context_task is not None else None,
+                request=request_identity,
             )
         except OperatorToolInvocationError as exc:
             raise _http_error(exc.status_code, exc.code, details=exc.details) from exc
-        except (VersionConflictError, InvestigationStateVersionConflict) as exc:
-            raise _http_error(409, "stale_working_state") from exc
-        observations = await uow.evidence_observations.list_for_investigation(investigation_id)
+        replay = recorded is not None
+        if recorded is not None:
+            # A replay returns the recorded result before any evidence or
+            # context rebuild: the request, not the current state, owns it.
+            invocation = recorded
+        else:
+            arguments: dict[str, Any] = {
+                "consultation_type": PLAN_CONSULTATION_TYPE,
+                "question": question,
+            }
+            if snapshot is not None:
+                arguments["evidence_refs"] = [str(snapshot.id)]
+            if context_task is not None:
+                # The invocation carries the sanitised context: the operator payload
+                # guard runs before any advisor-side sanitisation.
+                try:
+                    task_context = await build_task_context(
+                        uow=uow,
+                        task=context_task,
+                        factory=factory,
+                        investigation=investigation,
+                    )
+                except TaskContextError as exc:
+                    raise _http_error(422, exc.code) from exc
+                arguments.update(task_context_arguments(task_context))
+            composition = factory.build(uow, investigation_id, operator_mode=True)
+            try:
+                invocation_result = await composition.operator_tool_invocations.invoke(
+                    tool_name=_ADVISOR_TOOL_NAME,
+                    schema_version=ADVISOR_SCHEMA_VERSION,
+                    arguments=arguments,
+                    purpose=_PLAN_REQUEST_PURPOSE,
+                    expected_version=payload.expected_version,
+                    expected_sha256=payload.expected_sha256,
+                    idempotency_key=idempotency_key,
+                    actor_id=identity.actor_id,
+                    requester_actor_kind=ToolInvocationActorKind.HUMAN,
+                    context_task_id=context_task.id if context_task is not None else None,
+                    request_identity=request_identity,
+                )
+            except OperatorToolInvocationError as exc:
+                raise _http_error(exc.status_code, exc.code, details=exc.details) from exc
+            except (VersionConflictError, InvestigationStateVersionConflict) as exc:
+                raise _http_error(409, "stale_working_state") from exc
+            invocation = invocation_result.invocation
+            replay = invocation_result.idempotent_replay
+            # The invocation just wrote its advisor observations.
+            observations = await uow.evidence_observations.list_for_investigation(investigation_id)
         try:
             version, plan_status, missing, advisor_status = await _plan_from_invocation(
                 uow=uow,
-                invocation=invocation_result.invocation,
+                invocation=invocation,
                 observations=observations,
                 artifact_store=factory.artifact_store,
             )
@@ -475,9 +522,9 @@ async def request_plan(
         await uow.commit()
         return PlanRequestResponseV1(
             investigation_id=investigation_id,
-            invocation_id=invocation_result.invocation.id,
-            invocation_status=invocation_result.invocation.status.value,
-            idempotent_replay=invocation_result.idempotent_replay,
+            invocation_id=invocation.id,
+            invocation_status=invocation.status.value,
+            idempotent_replay=replay,
             advisor_parse_status=advisor_status,
             plan_parse_status=plan_status,
             plan_version_id=version.id if version is not None else None,

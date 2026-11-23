@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
@@ -34,6 +34,7 @@ from cti_app.application.operator_tool_invocation import (
     OperatorToolInvocationError,
     OperatorToolInvocationResult,
     _require_safe_operator_payload,
+    operator_request_identity,
 )
 from cti_app.config import Settings
 from cti_app.domain.editorial import (
@@ -165,6 +166,7 @@ async def _seed_advisor_exchange(
     task_id: UUID | None = None,
     context_task_id: UUID | None = None,
     normalized_parameters: dict[str, Any] | None = None,
+    operation_key: str | None = None,
 ) -> tuple[ToolInvocation, EvidenceObservation]:
     call_id = uuid4()
     response_id = uuid4()
@@ -216,7 +218,7 @@ async def _seed_advisor_exchange(
     )
     invocation = ToolInvocation(
         investigation_id=INVESTIGATION_ID,
-        operation_key=f"advisor-{uuid4()}",
+        operation_key=operation_key or f"advisor-{uuid4()}",
         tool_name="advisor.consult",
         schema_version="advisor-consult.v1",
         normalized_parameters=(
@@ -286,8 +288,21 @@ class _AdvisorInvocationService:
                 "operator_payload_invalid_or_sensitive", 422
             ) from None
         idempotency_key = kwargs["idempotency_key"]
+        request_identity = kwargs.get("request_identity")
+        _, operation_key = operator_request_identity(
+            investigation_id=INVESTIGATION_ID,
+            tool_name=kwargs["tool_name"],
+            schema_version=kwargs["schema_version"],
+            purpose=kwargs["purpose"],
+            expected_version=kwargs["expected_version"],
+            idempotency_key=idempotency_key,
+            arguments=None if request_identity is not None else dict(kwargs["arguments"]),
+            request=request_identity,
+        )
         existing = self._by_key.get(idempotency_key)
         if existing is not None:
+            if existing.operation_key != operation_key:
+                raise OperatorToolInvocationError("idempotency_conflict", 409)
             return OperatorToolInvocationResult(
                 investigation_id=INVESTIGATION_ID,
                 working_state_version=kwargs["expected_version"],
@@ -305,6 +320,7 @@ class _AdvisorInvocationService:
             actor_id=kwargs.get("actor_id"),
             context_task_id=kwargs.get("context_task_id"),
             normalized_parameters=dict(kwargs["arguments"]),
+            operation_key=operation_key,
         )
         self._by_key[idempotency_key] = invocation
         return OperatorToolInvocationResult(
@@ -369,7 +385,7 @@ def _client(store: _Store | None = None) -> tuple[_SyncASGIClient, _Store, _Comp
     return _SyncASGIClient(app), store, factory
 
 
-def _seed_bootstrap_snapshot(store: _Store) -> EvidenceObservation:
+def _seed_bootstrap_snapshot(store: _Store, *, observed_at: datetime = NOW) -> EvidenceObservation:
     blob_id = uuid4()
     store.artifacts.payloads[blob_id] = {"schema": "vt-bootstrap-snapshot.v1"}
     observation = EvidenceObservation(
@@ -379,7 +395,7 @@ def _seed_bootstrap_snapshot(store: _Store) -> EvidenceObservation:
         sha256="e" * 64,
         source="investigation.bootstrap",
         source_version="vt-bootstrap-snapshot.v1",
-        observed_at=NOW,
+        observed_at=observed_at,
         object_type="investigation_bootstrap_snapshot",
         object_id="bootstrap",
     )
@@ -420,11 +436,13 @@ def test_human_plan_request_uses_advisor_service_and_idempotency() -> None:
     assert [version.version for version in versions] == [1]
 
 
-def _seed_context_task(store: _Store, *, objective: str | None = None) -> InvestigationTaskV1:
+def _seed_context_task(
+    store: _Store, *, objective: str | None = None, task_key: str = "lead-context"
+) -> InvestigationTaskV1:
     task = InvestigationTaskV1(
         id=uuid4(),
         investigation_id=INVESTIGATION_ID,
-        task_key="lead-context",
+        task_key=task_key,
         title="Analyser le chargeur",
         question="Quel chargeur produit le second étage ?",
         objective=objective or "Confirmer la chaîne d'infection depuis les octets observés.",
@@ -513,6 +531,98 @@ def test_plan_request_omits_sensitive_task_context_with_warning() -> None:
     assert b"ZZOPERATIONALSECRETZZ" not in canonical_json_bytes(
         dict(invocation.normalized_parameters)
     )
+
+
+def _move_context_task(
+    store: _Store, task: InvestigationTaskV1, *, status: TaskStatus
+) -> InvestigationTaskV1:
+    moved = task.with_status(status, now=NOW + timedelta(minutes=1))
+    stored = asyncio.run(
+        store.tasks.update_status(
+            moved, expected_status_version=task.status_version, expected_status=task.status
+        )
+    )
+    assert stored == moved
+    return moved
+
+
+def test_plan_request_replay_after_a_new_evidence_snapshot_returns_recorded_result() -> None:
+    """R3-F2: the latest snapshot is derived state, not part of the request."""
+    client, store, factory = _client()
+    _seed_bootstrap_snapshot(store)
+    path = f"/api/investigations/{INVESTIGATION_ID}/plans/request"
+    headers = {"Idempotency-Key": "plan-request-new-snapshot"}
+    body = {"expected_version": 1}
+
+    first = client.post(path, json=body, headers=headers)
+    assert first.status_code == 200, first.text
+    assert len(factory.invocations.calls[0]["arguments"]["evidence_refs"]) == 1
+
+    _seed_bootstrap_snapshot(store, observed_at=NOW + timedelta(minutes=1))
+
+    replay = client.post(path, json=body, headers=headers)
+
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["invocation_id"] == first.json()["invocation_id"]
+    assert replay.json()["plan_version_id"] == first.json()["plan_version_id"]
+    assert replay.json()["idempotent_replay"] is True
+    assert len(factory.invocations.calls) == 1
+    versions = asyncio.run(store.plans.list_for_investigation(INVESTIGATION_ID))
+    assert [version.version for version in versions] == [1]
+
+
+def test_plan_request_replay_after_context_task_mutation_returns_recorded_result() -> None:
+    """R3-F2: the request, not the moved context task, owns the replay."""
+    client, store, factory = _client()
+    _seed_bootstrap_snapshot(store)
+    task = _seed_context_task(store)
+    path = f"/api/investigations/{INVESTIGATION_ID}/plans/request"
+    headers = {"Idempotency-Key": "plan-task-replay"}
+    body = {"expected_version": 1, "context_task_id": str(task.id)}
+
+    first = client.post(path, json=body, headers=headers)
+    assert first.status_code == 200, first.text
+    assert factory.invocations.calls[0]["arguments"]["task_context"]["status"] == "ready"
+
+    _move_context_task(store, task, status=TaskStatus.RUNNING)
+
+    replay = client.post(path, json=body, headers=headers)
+
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["invocation_id"] == first.json()["invocation_id"]
+    assert replay.json()["plan_version_id"] == first.json()["plan_version_id"]
+    assert replay.json()["idempotent_replay"] is True
+    assert len(factory.invocations.calls) == 1
+    versions = asyncio.run(store.plans.list_for_investigation(INVESTIGATION_ID))
+    assert [version.version for version in versions] == [1]
+
+
+def test_plan_request_same_key_with_another_request_is_a_conflict() -> None:
+    client, store, factory = _client()
+    _seed_bootstrap_snapshot(store)
+    task = _seed_context_task(store)
+    other = _seed_context_task(store, task_key="lead-context-other")
+    path = f"/api/investigations/{INVESTIGATION_ID}/plans/request"
+    headers = {"Idempotency-Key": "plan-task-conflict"}
+
+    first = client.post(
+        path,
+        json={"expected_version": 1, "context_task_id": str(task.id)},
+        headers=headers,
+    )
+    assert first.status_code == 200, first.text
+
+    conflict = client.post(
+        path,
+        json={"expected_version": 1, "context_task_id": str(other.id)},
+        headers=headers,
+    )
+
+    assert conflict.status_code == 409, conflict.text
+    assert conflict.json()["detail"]["code"] == "idempotency_conflict"
+    assert len(factory.invocations.calls) == 1
+    versions = asyncio.run(store.plans.list_for_investigation(INVESTIGATION_ID))
+    assert [version.version for version in versions] == [1]
 
 
 def test_plan_accept_materializes_tasks_once() -> None:
