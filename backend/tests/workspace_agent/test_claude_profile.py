@@ -63,6 +63,7 @@ def _profile(
     resume_proven: bool = False,
     bwrap_binary: Path | None = None,
     mcp_python: Path | None = None,
+    credentials_file: Path | None = None,
 ) -> tuple[ClaudeProfile, Path]:
     binary = write_fake_claude(tmp_path / "bin")
     bwrap = write_fake_bwrap(tmp_path / "bin") if bwrap_binary is None else bwrap_binary
@@ -71,6 +72,7 @@ def _profile(
         bwrap_binary=bwrap,
         resume_proven=resume_proven,
         mcp_python=mcp_python,
+        credentials_file=credentials_file,
         confinement_probe=lambda: ConfinementProbe(
             ok=True,
             reason="mocked: userns unavailable in unit tests",
@@ -128,6 +130,8 @@ def test_claude_argv_uses_probed_modes_only(tmp_path: Path) -> None:
     assert context.scratch_directory == context.work_directory.parent
 
     # Modes the profile deliberately does not use (UNPROVEN or unnecessary).
+    # ``--allowedTools`` is used only for the closed MCP server allowance, not
+    # to re-enable a removed built-in (asserted in test_claude_restricted_tools_only).
     for absent in (
         "--input-format",
         "--resume",
@@ -135,7 +139,6 @@ def test_claude_argv_uses_probed_modes_only(tmp_path: Path) -> None:
         "--fork-session",
         "--json-schema",
         "--tools",
-        "--allowedTools",
         "--settings",
         "--setting-sources",
         "--safe-mode",
@@ -185,7 +188,12 @@ def test_claude_restricted_tools_only(tmp_path: Path) -> None:
     assert flag_value(argv, "--permission-prompts") == "none"
     denied = {item.strip() for item in flag_value(argv, "--disallowedTools").split(",")}
     assert {"Bash", "PowerShell", "REPL", "WebFetch"} <= denied
-    assert "--allowedTools" not in flags  # --restricted's removal must stand
+    # H0: dontAsk denied the MCP tools and the captured file writes; only the
+    # closed autowork server and the two confined file tools are allowed at
+    # the CLI layer (the relay still enforces the session manifest).
+    allowed = {item.strip() for item in flag_value(argv, "--allowedTools").split(",")}
+    assert allowed == {"mcp__autowork", "Write", "Edit"}
+    assert not allowed & {"Bash", "PowerShell", "REPL", "WebFetch", "Task", "Agent"}
     assert "--tools" not in flags
     assert "--dangerously-skip-permissions" not in flags
     assert flag_value(argv, "--add-dir") == str(context.scratch_directory)
@@ -204,6 +212,10 @@ def test_claude_restricted_tools_only(tmp_path: Path) -> None:
     assert shim_copy.is_relative_to(context.config_directory)
     assert (shim_copy.stat().st_mode & 0o777) == 0o700
     assert shim_copy.read_bytes() == (SESSIONS_PACKAGE / "shim.py").read_bytes()
+    # H0: the shim imports its catalogue as a sibling; both must be installed.
+    catalog_copy = context.config_directory / "catalog.py"
+    assert catalog_copy.read_bytes() == (SESSIONS_PACKAGE / "catalog.py").read_bytes()
+    assert (catalog_copy.stat().st_mode & 0o777) == 0o700
     assert sorted(server["env"]) == [
         "AUTOWORK_BROKER_SOCKET",
         "AUTOWORK_SESSION_ID",
@@ -219,6 +231,34 @@ def test_claude_restricted_tools_only(tmp_path: Path) -> None:
     assert (context.config_directory.stat().st_mode & 0o777) == 0o700
     assert (context.config_directory / "home").is_dir()
     assert (context.config_directory / "cache").is_dir()
+
+
+def test_claude_seeded_oauth_credential_omits_bare(tmp_path: Path) -> None:
+    """H0: ``--bare`` never reads OAuth, so a seeded credential file omits it.
+
+    The help text is explicit: bare mode accepts only ANTHROPIC_API_KEY or an
+    apiKeyHelper, and OAuth is never read.  The operator's own login therefore
+    requires the normal mode, narrowed by --restricted and
+    --strict-mcp-config; the copy is 0600 in the private HOME and never enters
+    argv, env or the MCP config.
+    """
+    source = tmp_path / "credentials-source.json"
+    synthetic = b'{"claudeAiOauth":{"accessToken":"synthetic-test-token"}}'
+    source.write_bytes(synthetic)
+    source.chmod(0o600)
+    profile, _binary = _profile(tmp_path, credentials_file=source)
+    context = make_launch_context(tmp_path / "claude")
+    plan = profile.build_launch_plan(context)
+    argv = claude_argv(plan.argv)
+    flags = claude_flags(argv)
+    assert "--bare" not in flags
+    assert "--restricted" in flags
+    assert "--strict-mcp-config" in flags
+    target = context.config_directory / "home" / ".claude" / ".credentials.json"
+    assert target.read_bytes() == synthetic
+    assert target.stat().st_mode & 0o777 == 0o600
+    produced = "\0".join((*plan.argv, *plan.env.keys(), *plan.env.values()))
+    assert "synthetic-test-token" not in produced
 
 
 def test_claude_uses_relay_socket_without_backend_url(tmp_path: Path) -> None:

@@ -645,6 +645,40 @@ def test_real_netns_cannot_reach_a_host_loopback_listener(tmp_path: Path) -> Non
         listener.close()
 
 
+def test_real_spawn_survives_a_short_lived_calling_thread(tmp_path: Path) -> None:
+    """H0 regression: bwrap's death signal follows the *spawning thread*.
+
+    The supervisor serves ``POST /start`` from a per-request thread.  A direct
+    ``Popen`` there left ``PR_SET_PDEATHSIG`` pointing at a thread that dies
+    when the response is written, and the real sandbox was SIGKILLed seconds
+    into every run with no caller-side signal.  ``spawn`` anchors the child to
+    a thread that lives as long as it; only supervisor death tears it down.
+    """
+    _require_real_netns()
+    plan = _isolated_plan(tmp_path, (process.PROBE_PYTHON, "-c", "import time; time.sleep(10)"))
+    captured: dict[str, process.ManagedProcess] = {}
+
+    def caller() -> None:
+        captured["managed"] = process.spawn(plan)
+        # bwrap has set its death signal well before this; the thread exit is
+        # exactly what used to kill the sandbox.
+        time.sleep(0.5)
+
+    thread = threading.Thread(target=caller)
+    thread.start()
+    thread.join()
+    managed = captured["managed"]
+    try:
+        time.sleep(0.5)
+        assert managed.process.poll() is None, (
+            "the sandbox was killed when its calling thread exited"
+        )
+    finally:
+        process.terminate_group(managed.pgid, grace_seconds=1.0)
+        managed.process.wait(timeout=10)
+        process.close_pipes(managed.process)
+
+
 def test_real_netns_route_is_independent_of_the_agent_environment(tmp_path: Path) -> None:
     _require_real_netns()
     code = (
