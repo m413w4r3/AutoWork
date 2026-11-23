@@ -802,6 +802,62 @@ async def test_dead_session_rows_never_fill_the_batch_and_starve_a_live_one() ->
     assert (await harness.instruction(queued.id)).state is InstructionState.DELIVERED
 
 
+# ----------------------------------------------------- database clock (R4-F4)
+
+
+class _DatabaseClockOffset:
+    """A task repository whose database clock runs ahead of the process clock."""
+
+    def __init__(self, inner: Any, offset: timedelta) -> None:
+        self._inner = inner
+        self._offset = offset
+
+    async def database_now(self) -> datetime:
+        return await self._inner.database_now() + self._offset
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+async def test_lease_expired_on_the_database_clock_is_refused() -> None:
+    """R4-F4: fencing reads the database clock, not the backend process clock."""
+    harness = _Harness()
+    session = await harness.seed_session(state=AgentSessionState.AWAITING_INSTRUCTION)
+    # The lease is still valid on the (slow) process clock but already expired
+    # in PostgreSQL, which stamped it.
+    harness.tasks = _DatabaseClockOffset(harness.tasks, timedelta(seconds=600))
+
+    enqueued = await harness.enqueue(session, text="db clock fence", key="i-db-clock")
+
+    assert enqueued.delivered_live is False
+    assert harness.host.send_calls == []
+    stored = await harness.instruction(enqueued.instruction.id)
+    assert stored.state is InstructionState.QUEUED
+    assert stored.delivery_attempts == 0
+    assert stored.last_delivery_error == "lease_expired"
+
+
+async def test_lease_expired_on_the_database_clock_between_phases_is_unknown() -> None:
+    """R4-F4: phase C re-checks the lease on the database clock too."""
+    harness = _Harness()
+    session = await harness.seed_session(state=AgentSessionState.RUNNING)
+    queued = await harness.seed_queued_instruction(session, text="late fence", key="i-db-clock-c")
+    harness.host.status_state = "awaiting_instruction"
+
+    async def skew_database_clock() -> None:
+        harness.tasks = _DatabaseClockOffset(harness.tasks, timedelta(seconds=600))
+
+    harness.host.before_send = skew_database_clock
+
+    result = await harness.delivery.deliver_instruction(queued.id)
+
+    assert result.outcome is InstructionAttemptOutcome.UNKNOWN
+    stored = await harness.instruction(queued.id)
+    assert stored.state is InstructionState.DELIVERY_UNKNOWN
+    assert stored.last_delivery_error == "lease_expired"
+    assert stored.delivered_at is None
+
+
 # ---------------------------------------------------------- phase C re-checks
 
 

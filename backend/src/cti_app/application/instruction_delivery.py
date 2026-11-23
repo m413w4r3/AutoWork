@@ -542,7 +542,11 @@ class InstructionDeliveryService:
                 current = await uow.agent_sessions.get_instruction(instruction.id)
                 if current is None or current.state is not InstructionState.QUEUED:
                     raise _Deferred
-                self._require_deliverable(current, session, task, now)
+                # Lease predicates run on the clock that stamped the lease, in
+                # this transaction: a skewed backend process clock must never
+                # deliver on an expired lease (R4-F4).
+                database_now = await uow.investigation_tasks.database_now()
+                self._require_deliverable(current, session, task, database_now)
                 await self._is_first_pending(uow, current)
                 if self._disclosure is None:
                     raise _AttemptRefused("disclosure_gate_unavailable")
@@ -579,7 +583,11 @@ class InstructionDeliveryService:
         task: InvestigationTaskV1 | None,
         now: datetime,
     ) -> None:
-        """Refuse or defer when the locked facts no longer allow an attempt."""
+        """Refuse or defer when the locked facts no longer allow an attempt.
+
+        ``now`` is the database clock read in the locking transaction: the
+        lease was stamped there, so only that clock fences it (R4-F4).
+        """
         if (
             session is None
             or session.investigation_id != current.investigation_id
@@ -687,7 +695,12 @@ class InstructionDeliveryService:
                 )
                 if current is None:
                     raise _Deferred
-                failure = await self._confirmation_error(uow, current, session, task, pre_read, now)
+                # The lease fence is re-checked on the database clock that
+                # stamped it, never on the backend process clock (R4-F4).
+                database_now = await uow.investigation_tasks.database_now()
+                failure = await self._confirmation_error(
+                    uow, current, session, task, pre_read, database_now
+                )
                 if failure is not None:
                     unknown = current.with_state(
                         InstructionState.DELIVERY_UNKNOWN,
@@ -736,7 +749,11 @@ class InstructionDeliveryService:
         pre_read: SessionDisclosurePreRead,
         now: datetime,
     ) -> str | None:
-        """Every mutable fact is re-read before ``delivered`` is persisted."""
+        """Every mutable fact is re-read before ``delivered`` is persisted.
+
+        ``now`` is the database clock read in this transaction: the lease was
+        stamped there, so only that clock fences it (R4-F4).
+        """
         if (
             session is None
             or session.investigation_id != current.investigation_id
