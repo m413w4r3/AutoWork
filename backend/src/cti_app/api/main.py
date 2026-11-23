@@ -207,26 +207,44 @@ _AUTH_EXEMPT_PATHS = frozenset(
 async def _instruction_drain_tick_lock(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> AsyncIterator[bool]:
-    """One transaction-scoped advisory lock per drain tick (F3-D §3.3).
+    """One session-level advisory lock per drain tick (F3-D §3.3).
 
     The lock only serialises drainers across backend replicas; it protects no
     row another backend path writes, so holding it for the tick is a pure
     coordination choice and cannot block business transactions.  The CAS
     reservation remains the authority: even a lockless second drainer can never
     deliver the same instruction twice.
+
+    The lock lives on one dedicated connection and is released explicitly, so
+    the drain tick never leaves an ``idle in transaction`` session open across
+    the host I/O of the batch.  That connection is the only owner of the lock:
+    an unlock failure invalidates it, because returning it to the pool with the
+    lock still held would leak the lock to an unrelated reader.
     """
-    async with session_factory() as session:
-        async with session.begin():
-            granted = bool(
-                await session.scalar(
-                    text(
-                        "SELECT pg_try_advisory_xact_lock("
-                        "hashtextextended(CAST(:lock_key AS text), 0))"
-                    ),
-                    {"lock_key": INSTRUCTION_DRAIN_LOCK_KEY},
-                )
-            )
+    engine = session_factory.kw["bind"]
+    lock_statement = text(
+        "SELECT pg_try_advisory_lock(hashtextextended(CAST(:lock_key AS text), 0))"
+    )
+    unlock_statement = text(
+        "SELECT pg_advisory_unlock(hashtextextended(CAST(:lock_key AS text), 0))"
+    )
+    lock_parameters = {"lock_key": INSTRUCTION_DRAIN_LOCK_KEY}
+    async with engine.connect() as connection:
+        granted = bool(await connection.scalar(lock_statement, lock_parameters))
+        # End the acquisition transaction; the session lock stays on this
+        # connection and is not released by commit.
+        await connection.commit()
+        try:
             yield granted
+        finally:
+            if granted:
+                try:
+                    await connection.scalar(unlock_statement, lock_parameters)
+                    await connection.commit()
+                except BaseException:
+                    with suppress(Exception):
+                        await connection.invalidate()
+                    raise
 
 
 async def _instruction_drain_loop(

@@ -4,12 +4,14 @@ The existing workspace-agent architecture test globs the package's top-level
 modules; this companion oracle covers ``sidecars/workspace_agent/sessions/``
 without widening the W1 allowlist. ``fake_cli.py`` and ``shim.py`` are allowed
 to call ``connect``: the fake CLI receives the per-session AF_UNIX secret, and
-the shim receives the same secret then signs fixed loopback HTTP requests (H2).
-``entrypoint.py`` is the trusted launch wrapper that runs only inside the
-bwrap ``--unshare-net`` namespace: it owns the ``127.0.0.1:3128`` provider
-forwarder (loopback must be usable, no other route exists) and probes
-unroutable destinations.  No other sessions module may name an INET socket
-family.
+the shim receives the same secret then signs its requests.  Production has one
+shim transport, the supervisor's AF_UNIX relay socket; the loopback HTTP
+transport is a test fixture selected only by the test-only
+``AUTOWORK_SHIM_TEST_BACKEND_URL``.  ``entrypoint.py`` is the trusted launch
+wrapper that runs only inside the bwrap ``--unshare-net`` namespace: it owns
+the ``127.0.0.1:3128`` provider forwarder (loopback must be usable, no other
+route exists) and probes unroutable destinations.  No other sessions module may
+name an INET socket family.
 """
 
 from __future__ import annotations
@@ -116,14 +118,31 @@ def test_fake_cli_connects_only_to_the_session_secret_socket() -> None:
     assert "import sidecars" not in source
 
 
-def test_shim_connects_only_to_the_secret_socket_and_loopback_http() -> None:
+def test_shim_production_transport_is_the_relay_socket() -> None:
+    """F6: the shim's production transport is the AF_UNIX relay, never HTTP.
+
+    The loopback HTTP transport is a test fixture: it keeps a test-only selector
+    name, the production-looking URL variable is absent, and no adapter,
+    supervisor or entrypoint module knows the test selector.
+    """
     source = (SESSIONS_PACKAGE / "shim.py").read_text(encoding="utf-8")
     assert "AF_UNIX" in source
     assert "AUTOWORK_SESSION_SOCKET" in source
-    assert "import http.client" in source
+    assert 'BROKER_SOCKET_ENV = "AUTOWORK_BROKER_SOCKET"' in source
+    assert "UnixHttpTransport" in source
+    # The loopback path is named as a test fixture and has no production name.
+    assert "AUTOWORK_BACKEND_URL" not in source
+    assert 'TEST_BACKEND_URL_ENV = "AUTOWORK_SHIM_TEST_BACKEND_URL"' in source
     assert "http.client.HTTPConnection" in source
-    assert "AUTOWORK_BACKEND_URL" in source
     assert 'LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1"})' in source
     assert "localhost" not in source.lower()
     assert "from sidecars" not in source
     assert "import sidecars" not in source
+    # No production session module or adapter selects the test fixture.
+    for path in [
+        *(item for item in _session_modules() if item.name != "shim.py"),
+        *sorted((SESSIONS_PACKAGE / "adapters").glob("*.py")),
+    ]:
+        module_source = path.read_text(encoding="utf-8")
+        assert "AUTOWORK_SHIM_TEST_BACKEND_URL" not in module_source, path.name
+        assert "AUTOWORK_BACKEND_URL" not in module_source, path.name

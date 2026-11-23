@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -27,7 +28,7 @@ from cti_app.api.investigation_task_consultations import (
 )
 from cti_app.application.identity import LocalIdentityProvider
 from cti_app.application.investigation_advisor_tools import (
-    _sanitize_advisor_task_context,
+    sanitize_advisor_task_context,
 )
 from cti_app.application.investigation_persistence import (
     InMemoryEvidenceObservationRepository,
@@ -38,6 +39,7 @@ from cti_app.application.investigation_persistence import (
 from cti_app.application.operator_tool_invocation import (
     OperatorToolInvocationError,
     OperatorToolInvocationResult,
+    _require_safe_operator_payload,
 )
 from cti_app.config import Settings
 from cti_app.domain.investigation import (
@@ -196,6 +198,16 @@ class _TaskAdvisorService:
 
     async def invoke(self, **kwargs: Any) -> OperatorToolInvocationResult:
         self.calls.append(dict(kwargs))
+        # Mirror the production payload veto: the persisted invocation must
+        # never accept a credential-like argument.
+        try:
+            _require_safe_operator_payload(
+                {"arguments": dict(kwargs["arguments"]), "purpose": kwargs["purpose"]}
+            )
+        except ValueError:
+            raise OperatorToolInvocationError(
+                "operator_payload_invalid_or_sensitive", 422
+            ) from None
         idempotency_key = kwargs["idempotency_key"]
         prefix = _invocation_idempotency_prefix(INVESTIGATION_ID, idempotency_key)
         payload_sha256 = hashlib.sha256(canonical_json_bytes(dict(kwargs["arguments"]))).hexdigest()
@@ -210,15 +222,7 @@ class _TaskAdvisorService:
             operation_key=operation_key,
             tool_name=kwargs["tool_name"],
             schema_version=kwargs["schema_version"],
-            normalized_parameters={
-                "consultation_type": kwargs["arguments"]["consultation_type"],
-                "question": kwargs["arguments"]["question"],
-                "context_task_id": (
-                    str(kwargs["context_task_id"])
-                    if kwargs.get("context_task_id") is not None
-                    else None
-                ),
-            },
+            normalized_parameters=dict(kwargs["arguments"]),
             purpose=kwargs["purpose"],
             status=ToolInvocationStatus.SUCCEEDED,
             actor_kind=kwargs.get("requester_actor_kind"),
@@ -377,15 +381,14 @@ def test_task_consultation_reuses_advisor_consult_and_attribution() -> None:
     assert payload["consultation"]["invocation_id"] == payload["invocation_id"]
     assert payload["consultation"]["context_task_id"] == str(task.id)
     assert payload["consultation"]["requester_actor_kind"] == "human"
-    sanitized = _sanitize_advisor_task_context(
+    sanitized = sanitize_advisor_task_context(
         context, investigation_id=INVESTIGATION_ID, warnings=[]
     )
-    assert sanitized is not None
+    assert sanitized == context
+    # The announced hash is recomputable from the persisted invocation exactly.
     assert (
-        payload["task_context_sha256"]
-        == hashlib.sha256(canonical_json_bytes(sanitized)).hexdigest()
+        payload["task_context_sha256"] == hashlib.sha256(canonical_json_bytes(context)).hexdigest()
     )
-
     # A replay with the same key and body rebuilds the exact same arguments.
     replay = client.post(path, json=body, headers={"Idempotency-Key": "task-consult-1"})
     assert replay.status_code == 200, replay.text
@@ -443,3 +446,61 @@ def test_task_consultation_never_mutates_task_status() -> None:
     assert foreign_refused.status_code == 404, foreign_refused.text
     assert foreign_refused.json()["detail"]["code"] == "task_not_found"
     assert len(service.calls) == 1
+
+
+def test_task_consultation_omits_sensitive_task_context_with_warning() -> None:
+    """F1: a credential-like task field is omitted, never refused or persisted.
+
+    The operator payload guard runs before any advisor sanitisation, so the
+    route must send the sanitised context: the consultation succeeds with an
+    observable ``task_context_field_omitted_sensitive`` warning, the omitted
+    field is absent from the invocation, and the hash covers exactly what was
+    transmitted.
+    """
+    store = _Store()
+    task = replace(
+        _make_task(),
+        title="Analyser le chargeur",
+        objective="api_key=ZZOPERATIONALSECRETZZ",
+    )
+    asyncio.run(store.tasks.add(task))
+    client, service = _client(store)
+    path = f"/api/investigations/{INVESTIGATION_ID}/tasks/{task.id}/consultations"
+    body = {
+        "consultation_type": "interpretation",
+        "question": "Interprète les faits observés de cette tâche.",
+        "expected_working_state_version": 1,
+    }
+
+    response = client.post(path, json=body, headers={"Idempotency-Key": "task-consult-sensitive"})
+
+    assert response.status_code == 200, response.text
+    assert b"ZZOPERATIONALSECRETZZ" not in canonical_json_bytes(dict(service.calls[0]["arguments"]))
+    assert b"ZZOPERATIONALSECRETZZ" not in canonical_json_bytes(
+        dict(service.calls[0]["arguments"]["task_context"])
+    )
+    arguments = service.calls[0]["arguments"]
+    context = arguments["task_context"]
+    assert "objective" not in context
+    assert context["title"] == "Analyser le chargeur"
+    assert any(
+        warning["code"] == "task_context_field_omitted_sensitive"
+        and warning["field"] == "task_context.objective"
+        for warning in arguments["task_context_warnings"]
+    )
+    payload = response.json()
+    assert (
+        payload["task_context_sha256"] == hashlib.sha256(canonical_json_bytes(context)).hexdigest()
+    )
+    invocation = asyncio.run(store.invocations.get(UUID(payload["invocation_id"])))
+    assert invocation is not None
+    assert b"ZZOPERATIONALSECRETZZ" not in canonical_json_bytes(
+        dict(invocation.normalized_parameters)
+    )
+    assert b"ZZOPERATIONALSECRETZZ" not in response.content
+
+    # A replay with the same key rebuilds the exact same sanitised arguments.
+    replay = client.post(path, json=body, headers={"Idempotency-Key": "task-consult-sensitive"})
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["invocation_id"] == payload["invocation_id"]
+    assert service.calls[1]["arguments"] == arguments

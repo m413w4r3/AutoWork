@@ -23,7 +23,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
@@ -438,3 +438,15 @@ class InvestigationConsultationLedger:
             if decision.target_type is AnalystDecisionTargetType.TOOL
             and decision.correlation_id.startswith("reconcile:")
         )
+
+
+def consultation_ledger(
+    uow: Any, artifact_store: AdvisorPayloadStore
+) -> InvestigationConsultationLedger:
+    """The single ledger construction shared by every consultation reader."""
+    return InvestigationConsultationLedger(
+        invocations=cast(ToolInvocationRepository, uow.tool_invocations),
+        observations=cast(EvidenceObservationRepository, uow.evidence_observations),
+        artifact_store=artifact_store,
+        decisions=uow.analyst_decisions,
+    )

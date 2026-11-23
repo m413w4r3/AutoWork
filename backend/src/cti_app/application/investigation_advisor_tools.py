@@ -282,6 +282,10 @@ def _valid_optional_advisor_field(field: str, value: object) -> bool:
 # F4-D B2: a human consultation may carry the context of *its own* task.
 # The field is ids, hashes and bounded titles only -- never a second free-form
 # dossier -- and it is described to Bridge as non-evidence.
+# A caller that sanitised the context before invocation (the human routes, so
+# the outer operator payload veto sees no credential) passes the resulting
+# omission warnings here; they are merged into the observable input warnings.
+TASK_CONTEXT_WARNINGS_ARGUMENT = "task_context_warnings"
 MAX_TASK_CONTEXT_TEXT_CHARS = 2_000
 MAX_TASK_CONTEXT_LABEL_CHARS = 256
 MAX_TASK_CONTEXT_REF_CHARS = 256
@@ -341,6 +345,50 @@ def _task_context_warning(
     }
     if warning not in warnings:
         warnings.append(warning)
+
+
+_TASK_CONTEXT_WARNING_FIELD = re.compile(r"task_context\.[A-Za-z0-9_.<>-]{1,128}")
+_TASK_CONTEXT_WARNING_CODES = frozenset(
+    {
+        "task_context_invalid",
+        "task_context_field_invalid",
+        "task_context_field_omitted",
+        "task_context_field_omitted_sensitive",
+        "task_context_field_truncated",
+        "task_context_list_truncated",
+        "task_context_reference_invalid",
+        "task_context_investigation_mismatch",
+    }
+)
+
+
+def _task_context_argument_warnings(value: object) -> list[dict[str, str]]:
+    """Omission warnings established when a caller sanitised ``task_context``.
+
+    The human routes sanitise before invoking so the operator payload veto
+    accepts the request; the same warnings are replayed here to stay
+    observable.  Anything outside the fixed warning vocabulary is dropped.
+    """
+    if not isinstance(value, (list, tuple)):
+        return []
+    warnings: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        field = item.get("field")
+        code = item.get("code")
+        detail_safe = item.get("detail_safe")
+        if (
+            not isinstance(field, str)
+            or _TASK_CONTEXT_WARNING_FIELD.fullmatch(field) is None
+            or not isinstance(code, str)
+            or code not in _TASK_CONTEXT_WARNING_CODES
+            or not isinstance(detail_safe, str)
+            or len(detail_safe) > 300
+        ):
+            continue
+        warnings.append({"field": field, "code": code, "detail_safe": detail_safe})
+    return warnings
 
 
 def _task_context_safe_text(
@@ -707,7 +755,7 @@ def _task_context_editorial_anchor(
     return {"anchor": anchor, "excerpt": excerpt, "text_sha256": text_sha256}
 
 
-def _sanitize_advisor_task_context(
+def sanitize_advisor_task_context(
     raw: object,
     *,
     investigation_id: UUID,
@@ -1348,6 +1396,7 @@ class InvestigationAdvisorTool:
                 "units",
                 "finding_refs",
                 "task_context",
+                TASK_CONTEXT_WARNINGS_ARGUMENT,
             }
             for field in tuple(arguments):
                 if field not in known_fields:
@@ -4511,6 +4560,11 @@ class InvestigationAdvisorTool:
             if warning not in input_warnings:
                 input_warnings.append(warning)
 
+        for precomputed in _task_context_argument_warnings(
+            arguments.get(TASK_CONTEXT_WARNINGS_ARGUMENT)
+        ):
+            warn_input(precomputed["field"], precomputed["code"], precomputed["detail_safe"])
+
         assertion_refs_by_unit: dict[str, list[dict[str, str]]] = {}
         unit_assertion_refs: list[dict[str, str]] = []
         ignored_assertion_ref_keys: set[tuple[str, str]] = set()
@@ -4569,7 +4623,7 @@ class InvestigationAdvisorTool:
             "truncation": {},
         }
         if "task_context" in arguments:
-            task_context = _sanitize_advisor_task_context(
+            task_context = sanitize_advisor_task_context(
                 arguments.get("task_context"),
                 investigation_id=investigation_id,
                 warnings=input_warnings,
@@ -8952,6 +9006,14 @@ def register_investigation_advisor_tool(
                             "an observable warning."
                         ),
                         "additionalProperties": True,
+                    },
+                    "task_context_warnings": {
+                        "description": (
+                            "Omission warnings already established when the caller sanitised "
+                            "task_context before invocation."
+                        ),
+                        "additionalProperties": True,
+                        "items": {"additionalProperties": True},
                     },
                 },
                 "required": ["consultation_type"],
@@ -13573,6 +13635,8 @@ def _valid_hex_measurement(value: str) -> bool:
 __all__ = [
     "ADVISOR_SCHEMA_VERSION",
     "ADVISOR_TOOL_NAME",
+    "TASK_CONTEXT_WARNINGS_ARGUMENT",
     "InvestigationAdvisorTool",
     "register_investigation_advisor_tool",
+    "sanitize_advisor_task_context",
 ]

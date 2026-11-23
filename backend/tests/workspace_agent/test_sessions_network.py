@@ -258,7 +258,7 @@ def test_cli_environment_deny_list_covers_autowork_credentials() -> None:
         "HOME": "/tmp/home",
         "AUTOWORK_SESSION_ID": "s",
         "AUTOWORK_SESSION_SOCKET": "/tmp/socket",
-        "AUTOWORK_BACKEND_URL": "http://127.0.0.1:8000",
+        "AUTOWORK_SHIM_TEST_BACKEND_URL": "http://127.0.0.1:8000",
     }
     assert process.cli_environment_violations(clean) == ()
     process.assert_cli_environment_safe(clean)

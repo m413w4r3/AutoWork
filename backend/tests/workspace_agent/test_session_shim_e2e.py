@@ -2,8 +2,9 @@
 
 The H1 supervisor prepares a fake CLI session and hands it the D7 secret over
 ``ipc/shim.sock``. The shim is then launched in the same closed environment
-(``AUTOWORK_SESSION_ID/SOCKET/BACKEND_URL``, no secret, no token) against a
-real loopback backend that records the exact signed request. This proves the
+(``AUTOWORK_SESSION_ID/SOCKET`` plus the test-only
+``AUTOWORK_SHIM_TEST_BACKEND_URL``, no secret, no token) against a real
+loopback backend that records the exact signed request. This proves the
 caller side of the 05B2 contract without touching a live provider.
 """
 

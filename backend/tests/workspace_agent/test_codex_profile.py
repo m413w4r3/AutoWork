@@ -492,6 +492,7 @@ def test_codex_uses_relay_socket_without_backend_url(tmp_path: Path) -> None:
         (*plan.argv, *plan.env.keys(), *plan.env.values(), config_toml, plan.stdin_data.decode())
     )
     assert "AUTOWORK_BACKEND_URL" not in produced
+    assert "AUTOWORK_SHIM_TEST_BACKEND_URL" not in produced
     assert "http://" not in produced and "https://" not in produced
     assert not any("proxy" in key.lower() for key in plan.env)
     process.assert_cli_environment_safe(plan.env)
@@ -550,6 +551,8 @@ def test_real_adapters_share_the_relay_transport_contract(
     assert catalog_copy.stat().st_mode & 0o777 == 0o700
     assert "AUTOWORK_BACKEND_URL" not in plan.env
     assert "AUTOWORK_BACKEND_URL" not in server["env"]
+    assert "AUTOWORK_SHIM_TEST_BACKEND_URL" not in plan.env
+    assert "AUTOWORK_SHIM_TEST_BACKEND_URL" not in server["env"]
     assert not any("proxy" in key.lower() for key in plan.env)
     process.assert_cli_environment_safe(plan.env)
     # No constructor knob can redirect the transport or widen the catalogue.

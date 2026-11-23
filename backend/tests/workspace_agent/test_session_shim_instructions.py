@@ -281,7 +281,7 @@ def _relay_harness(broker_socket: Path) -> support.ShimHarness:
         socket_path=harness.socket_path,
         backend_url="http://127.0.0.1:1",
     )
-    del environment["AUTOWORK_BACKEND_URL"]
+    del environment["AUTOWORK_SHIM_TEST_BACKEND_URL"]
     environment["AUTOWORK_BROKER_SOCKET"] = str(broker_socket)
     harness.environment = environment
     return harness

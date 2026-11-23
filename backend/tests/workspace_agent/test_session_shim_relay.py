@@ -248,7 +248,7 @@ def _relay_harness(broker_socket: Path) -> support.ShimHarness:
         socket_path=harness.socket_path,
         backend_url="http://127.0.0.1:1",
     )
-    del environment["AUTOWORK_BACKEND_URL"]
+    del environment["AUTOWORK_SHIM_TEST_BACKEND_URL"]
     environment["AUTOWORK_BROKER_SOCKET"] = str(broker_socket)
     harness.environment = environment
     return harness
@@ -700,7 +700,7 @@ def test_a_real_broker_socket_is_accepted(tmp_path: Path) -> None:
     finally:
         listener.close()
     assert config.broker_socket == str(path)
-    assert config.backend_url is None
+    assert config.test_backend_url is None
 
 
 def test_transport_serializer_refuses_a_query_string_and_unlisted_headers() -> None:
