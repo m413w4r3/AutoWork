@@ -1,12 +1,16 @@
+import asyncio
 import logging
-from collections.abc import AsyncIterator, Mapping
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import asynccontextmanager, suppress
+from typing import cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from minio import Minio
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import Response
 
@@ -58,6 +62,10 @@ from cti_app.api.subject_content import router as subject_content_router
 from cti_app.api.subjects import router as subjects_router
 from cti_app.api.typst_input_inspection import router as typst_input_inspection_router
 from cti_app.api.workspace_agent import router as workspace_agent_router
+from cti_app.application.agent_session_disclosure import (
+    SessionDisclosureUnitOfWork,
+    build_session_disclosure_checker,
+)
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.collection_review import CollectionReviewService
 from cti_app.application.diagnostics import DiagnosticsLog
@@ -101,7 +109,16 @@ from cti_app.application.identity import (
     is_loopback_bind_host,
     validate_local_identity_bind,
 )
+from cti_app.application.instruction_delivery import (
+    INSTRUCTION_DRAIN_LOCK_KEY,
+    InstructionDeliveryService,
+    InstructionDeliveryUnitOfWork,
+)
 from cti_app.application.investigation_jobs import make_investigation_runner
+from cti_app.application.investigation_transfers import (
+    TransferUnitOfWork,
+    WorkspaceNoteCatalog,
+)
 from cti_app.application.jobs import DuplicateJobError, JobService, create_job_registry
 from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.model_conversations import ModelConversationService
@@ -129,7 +146,7 @@ from cti_app.application.typst_input_inspection import RenderInputInspectionServ
 from cti_app.application.virustotal import VirusTotalCapabilities, VirusTotalRoutingPolicy
 from cti_app.application.virustotal_persistence import VirusTotalObservationService
 from cti_app.application.workspace import SubjectWorkspaceMaterializer
-from cti_app.config import get_settings
+from cti_app.config import Settings, get_settings
 from cti_app.infrastructure.agentic.wiring import build_session_runtime
 from cti_app.infrastructure.analytic_chart_renderer import AnalyticChartRenderer
 from cti_app.infrastructure.blob_storage.minio import MinioBlobStore
@@ -180,6 +197,60 @@ _AUTH_EXEMPT_PATHS = frozenset(
         "/api/health/ready",
     }
 )
+
+
+@asynccontextmanager
+async def _instruction_drain_tick_lock(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> AsyncIterator[bool]:
+    """One transaction-scoped advisory lock per drain tick (F3-D §3.3).
+
+    The lock only serialises drainers across backend replicas; it protects no
+    row another backend path writes, so holding it for the tick is a pure
+    coordination choice and cannot block business transactions.  The CAS
+    reservation remains the authority: even a lockless second drainer can never
+    deliver the same instruction twice.
+    """
+    async with session_factory() as session:
+        async with session.begin():
+            granted = bool(
+                await session.scalar(
+                    text(
+                        "SELECT pg_try_advisory_xact_lock("
+                        "hashtextextended(CAST(:lock_key AS text), 0))"
+                    ),
+                    {"lock_key": INSTRUCTION_DRAIN_LOCK_KEY},
+                )
+            )
+            yield granted
+
+
+async def _instruction_drain_loop(
+    service: InstructionDeliveryService,
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Drain the instruction queue until shutdown; a bad tick is never fatal."""
+    while True:
+        try:
+            async with _instruction_drain_tick_lock(session_factory) as granted:
+                if granted:
+                    report = await service.drain_once(
+                        limit=settings.m24_instruction_drain_batch_size
+                    )
+                    if report.delivered or report.refused or report.unknown:
+                        logger.info(
+                            "instruction drain tick",
+                            extra={"event": "m24.instruction_drain.tick", **report.to_payload()},
+                        )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # boundary: one failed tick never stops delivery
+            logger.warning(
+                "instruction drain tick failed",
+                extra={"event": "m24.instruction_drain.failed", "error_type": type(exc).__name__},
+            )
+        await asyncio.sleep(settings.m24_instruction_drain_interval_seconds)
 
 
 @asynccontextmanager
@@ -622,7 +693,42 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.agentic_operator_port = agent_session_runtime.operator
     app.state.agent_session_secret_delivery = agent_session_runtime.secret_delivery
     app.state.host_sessions = agent_session_runtime.host_sessions
+    # M24.1 ID-2: the backend-owned instruction drain (D3). Only a configured
+    # host runtime can deliver, so the loop does not exist otherwise; the
+    # service is mounted for the routes that compose a SessionService.
+    instruction_delivery: InstructionDeliveryService | None = None
+    instruction_drain_task: asyncio.Task[None] | None = None
+    if agent_session_runtime.host_sessions is not None:
+        instruction_delivery = InstructionDeliveryService(
+            uow_factory=cast(
+                Callable[[], InstructionDeliveryUnitOfWork],
+                uow_factory,
+            ),
+            host=agent_session_runtime.host_sessions,
+            notes=WorkspaceNoteCatalog(
+                uow_factory=cast(Callable[[], TransferUnitOfWork], uow_factory)
+            ),
+            disclosure=build_session_disclosure_checker(
+                uow_factory=cast(Callable[[], SessionDisclosureUnitOfWork], uow_factory),
+                article_snapshots=investigation_composition_factory.article_snapshots,
+                settings=settings,
+                effective_policy_for=(
+                    investigation_composition_factory.osint_open_policy_service.effective_for_investigation
+                ),
+            ),
+            grace_seconds=settings.m24_instruction_delivery_grace_seconds,
+            batch_size=settings.m24_instruction_drain_batch_size,
+        )
+        instruction_drain_task = asyncio.create_task(
+            _instruction_drain_loop(instruction_delivery, settings, session_factory),
+            name="m24-instruction-drain",
+        )
+    app.state.instruction_delivery_service = instruction_delivery
     yield
+    if instruction_drain_task is not None:
+        instruction_drain_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await instruction_drain_task
     await agent_session_runtime.aclose()
     await readiness.close()
     if vt_direct_client is not None:
