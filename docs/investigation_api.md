@@ -14,6 +14,7 @@ construire le contexte d'article.
 | `POST /api/subjects/{subject_id}/investigations` | Corps : `production_run_id`, `synthesis_artifact_id`, `synthesis_sha256`. Retourne l'enquête et le job de génération 1. Un nouvel appel pour la même synthèse vérifiée retourne l'enquête et le job existants. |
 | `GET /api/subjects/{subject_id}/investigations` | Liste les enquêtes liées aux synthèses vérifiées du sujet. |
 | `GET /api/investigations/{investigation_id}` | Vue de lecture bornée décrite ci-dessous. |
+| `GET /api/investigations/{investigation_id}/observations/{observation_id}/excerpt` | Lit une plage bornée d'une observation canonique pour composer un bloc `canonical_code`. |
 | `POST /api/investigations/{investigation_id}/resume` | Corps : `expected_version`; en-tête requis `Idempotency-Key`. Reprend l'état par CAS et soumet la génération suivante. |
 | `POST /api/investigations/{investigation_id}/interrupt` | Corps : `expected_version`; en-tête requis `Idempotency-Key`. Conclut avec `user_interrupt` et demande l'annulation du job actif. |
 | `GET /api/investigations/{investigation_id}/envelope` | Lit l'enveloppe G2 approuvée ou une proposition locale non persistée (`approved: false`, version `0`). |
@@ -89,6 +90,27 @@ Les références doivent appartenir à l’enquête et à cette invocation. Les 
 outils exigent la route humaine vérifiée (422); `PENDING` et `RUNNING` restent
 non réconciliables (409). Cette décision ne relance pas VirusTotal et ne
 déclenche aucun fournisseur.
+
+## Extrait d'une observation canonique
+
+`GET /api/investigations/{investigation_id}/observations/{observation_id}/excerpt`
+est réservé à un opérateur humain vérifié et réutilise la résolution des blocs
+`canonical_code`: l'observation doit appartenir à l'enquête, ne pas être un
+élément consultatif, et son blob doit correspondre au SHA-256 enregistré. Les
+blobs source sont plafonnés à 4 MiB et chaque plage à 4 096 octets. Les
+paramètres requis sont `offset` (octet, à partir de zéro) et `length`; `view`
+vaut `text` (défaut) ou `hex`. Une plage hors limites retourne 422, une
+observation absente ou hors enquête retourne 404, et une référence canonique
+illisible ou périmée retourne un refus typé sans contenu.
+
+La réponse inclut `offset`, `length` réellement servie, `total_size`,
+`blob_sha256`, `excerpt_sha256` (calculé sur les octets canoniques exacts) et
+`untrusted_data: true`. La vue `text` n'accepte que l'ASCII imprimable, les
+tabulations et les retours à la ligne; tout autre octet retourne 422 afin de
+garder l'alignement entre octets et caractères. La vue `hex` rend les octets
+par lignes de 16 avec l'offset absolu de chaque ligne. Les clés de stockage ne
+sont jamais retournées. Le contenu est une donnée CTI non fiable et n'est
+jamais exécuté ou interprété.
 
 ## Job durable
 
