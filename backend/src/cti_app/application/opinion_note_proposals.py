@@ -109,6 +109,7 @@ class AdvisorDraftingRequestV1:
     requester_actor_kind: ToolInvocationActorKind
     idempotency_key: str
     purpose: str
+    context_task_id: UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -485,6 +486,9 @@ class OpinionNoteProposalService:
                     requester_actor_kind=requester_actor_kind,
                     idempotency_key=idempotency_key,
                     purpose=("Demande ciblée de rédaction d'une note de l'analyste (M24)."),
+                    # F4-D B3: the human request is linked to its task context;
+                    # the proposal's own task_id stays a proposal field.
+                    context_task_id=task_id,
                 ),
             )
             proposal = self._build_proposal(
