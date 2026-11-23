@@ -8,6 +8,11 @@ requester and ``context_task_id`` (migration 0028), then projects the persisted
 ledger row.  It never writes a task status, a task result, a proof or a
 decision.
 
+The replay identity covers the incoming request, not the context derived from
+the current task: a replay of the same key and body returns the recorded
+consultation before any context rebuild or task-state gate, while another body
+under the same key stays an ``idempotency_conflict``.
+
 The orchestrator owns ``api/main.py``: this module only exports ``router``.
 ``application.investigation_task_context`` is shared with the optional
 ``context_task_id`` on ``POST /plans/request`` so both routes send the same
@@ -17,7 +22,8 @@ sanitised dossier.
 from __future__ import annotations
 
 import hashlib
-from typing import Annotated, Literal
+from collections.abc import Mapping
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Header, Request
@@ -41,8 +47,11 @@ from cti_app.application.investigation_task_context import (
     build_task_context,
     task_context_arguments,
 )
-from cti_app.application.operator_tool_invocation import OperatorToolInvocationError
-from cti_app.domain.investigation import ToolInvocationActorKind
+from cti_app.application.operator_tool_invocation import (
+    OperatorToolInvocationError,
+    recorded_request_invocation,
+)
+from cti_app.domain.investigation import ToolInvocationActorKind, canonical_json_bytes
 
 router = APIRouter(prefix="/api/investigations", tags=["investigation-task-consultations"])
 
@@ -81,6 +90,45 @@ def _invocation_idempotency_prefix(investigation_id: UUID, idempotency_key: str)
     return f"operator:{digest}:"
 
 
+def _request_identity(
+    task_id: UUID,
+    payload: TaskConsultationRequestV1,
+    question: str,
+) -> dict[str, Any]:
+    """The replay identity of one consultation body, independent of task state.
+
+    The working-state version is already part of the invocation digest as the
+    CAS precondition; ``task_context`` deliberately is not, so a replay of the
+    same body returns the recorded consultation even after the task status,
+    its contributions or its refs moved.
+    """
+    return {
+        "route": "investigation_task_consultation",
+        "task_id": str(task_id),
+        "consultation_type": payload.consultation_type,
+        "question": question,
+        "include_previous_consultation": payload.include_previous_consultation,
+        "anchor": payload.anchor,
+        "expected_working_state_sha256": payload.expected_working_state_sha256,
+    }
+
+
+async def _projected_consultation(
+    uow: Any,
+    factory: Any,
+    investigation_id: UUID,
+    task_id: UUID,
+    invocation_id: UUID,
+) -> InvestigationConsultationV1:
+    entries = await consultation_ledger(uow, factory.artifact_store).list_for_investigation(
+        investigation_id, context_task_id=task_id
+    )
+    entry = next((item for item in entries if item.invocation_id == invocation_id), None)
+    if entry is None:
+        raise _http_error(409, "task_consultation_not_projected")
+    return entry
+
+
 @router.post(
     "/{investigation_id}/tasks/{task_id}/consultations",
     response_model=TaskConsultationResponseV1,
@@ -104,6 +152,39 @@ async def request_task_consultation(
         task = await uow.investigation_tasks.get(task_id)
         if task is None or task.investigation_id != investigation_id:
             raise _http_error(404, "task_not_found")
+        request_identity = _request_identity(task.id, payload, question)
+        try:
+            recorded = await recorded_request_invocation(
+                uow.tool_invocations,
+                investigation_id=investigation_id,
+                tool_name=_ADVISOR_TOOL_NAME,
+                schema_version=ADVISOR_SCHEMA_VERSION,
+                purpose=_PURPOSE,
+                expected_version=payload.expected_working_state_version,
+                idempotency_key=idempotency_key,
+                request=request_identity,
+            )
+        except OperatorToolInvocationError as exc:
+            raise _http_error(exc.status_code, exc.code, details=exc.details) from exc
+        if recorded is not None:
+            # A replay returns the recorded result before any gate on the
+            # current task: the request, not the task it referred to, owns it.
+            recorded_context = recorded.normalized_parameters.get("task_context")
+            if not isinstance(recorded_context, Mapping) or not recorded_context:
+                raise _http_error(409, "task_consultation_not_projected")
+            consultation = await _projected_consultation(
+                uow, factory, investigation_id, task.id, recorded.id
+            )
+            await uow.commit()
+            return TaskConsultationResponseV1(
+                invocation_id=recorded.id,
+                invocation_status=recorded.status.value,
+                context_task_id=task.id,
+                task_context_sha256=hashlib.sha256(
+                    canonical_json_bytes(recorded_context)
+                ).hexdigest(),
+                consultation=consultation,
+            )
         if task.is_terminal:
             # A consultation never revives a terminal task; it is only context.
             raise _http_error(422, "task_consultation_task_terminal")
@@ -140,20 +221,15 @@ async def request_task_consultation(
                 actor_id=identity.actor_id,
                 requester_actor_kind=ToolInvocationActorKind.HUMAN,
                 context_task_id=task.id,
+                request_identity=request_identity,
             )
         except OperatorToolInvocationError as exc:
             raise _http_error(exc.status_code, exc.code, details=exc.details) from exc
         except (VersionConflictError, InvestigationStateVersionConflict) as exc:
             raise _http_error(409, "stale_working_state") from exc
-        entries = await consultation_ledger(uow, factory.artifact_store).list_for_investigation(
-            investigation_id, context_task_id=task.id
+        entry = await _projected_consultation(
+            uow, factory, investigation_id, task.id, invocation_result.invocation.id
         )
-        entry = next(
-            (item for item in entries if item.invocation_id == invocation_result.invocation.id),
-            None,
-        )
-        if entry is None:
-            raise _http_error(409, "task_consultation_not_projected")
         await uow.commit()
         return TaskConsultationResponseV1(
             invocation_id=invocation_result.invocation.id,

@@ -26,6 +26,11 @@ from cti_app.application.investigation_state import (
     InMemoryInvestigationStateRepository,
     InvestigationStateVersionConflict,
 )
+from cti_app.application.operator_tool_invocation import (
+    OperatorToolInvocationError,
+    operator_request_identity,
+    recorded_request_invocation,
+)
 from cti_app.domain.analyst_opinion import (
     AnalystOpinionStatus,
     AnalystOpinionV1,
@@ -677,6 +682,100 @@ async def test_operation_prefix_lock_serializes_separate_postgres_sessions(
         assert second_locked.is_set()
         assert prior == invocation
         assert prior.operation_key == operation_key
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_recorded_request_invocation_replays_the_request_not_its_arguments(
+    migrated_postgres_url: str,
+) -> None:
+    """R3-F2: the replay identity is persisted and read from PostgreSQL.
+
+    A request whose derived arguments were rebuilt from a moved task replays
+    the row recorded under the request identity; another request under the
+    same key is a conflict, and an unused key is not a replay.
+    """
+    engine = create_postgres_engine(migrated_postgres_url)
+    session_factory = create_session_factory(engine)
+    investigation = await _make_investigation(session_factory)
+    request = {
+        "route": "investigation_task_consultation",
+        "task_id": str(uuid4()),
+        "question": "Interprète les faits observés de cette tâche.",
+    }
+    purpose = "Demande humaine d'une consultation Bridge ciblée sur une tâche d'enquête."
+    _, operation_key = operator_request_identity(
+        investigation_id=investigation.id,
+        tool_name="advisor.consult",
+        schema_version="advisor-consult.v1",
+        purpose=purpose,
+        expected_version=1,
+        idempotency_key="pg-request-replay",
+        request=request,
+    )
+    recorded = ToolInvocation(
+        investigation_id=investigation.id,
+        operation_key=operation_key,
+        tool_name="advisor.consult",
+        schema_version="advisor-consult.v1",
+        normalized_parameters={
+            "consultation_type": "interpretation",
+            "question": request["question"],
+            "task_context": {"task_id": request["task_id"], "status": "ready"},
+        },
+        purpose=purpose,
+        status=ToolInvocationStatus.SUCCEEDED,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    try:
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            await uow.tool_invocations.add_if_absent(recorded)
+            await uow.commit()
+
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            replayed = await recorded_request_invocation(
+                uow.tool_invocations,
+                investigation_id=investigation.id,
+                tool_name="advisor.consult",
+                schema_version="advisor-consult.v1",
+                purpose=purpose,
+                expected_version=1,
+                idempotency_key="pg-request-replay",
+                request=request,
+            )
+            assert replayed is not None
+            assert replayed.id == recorded.id
+            # The recorded operation keeps the arguments of the first call.
+            assert dict(replayed.normalized_parameters)["task_context"] == {
+                "task_id": request["task_id"],
+                "status": "ready",
+            }
+            with pytest.raises(OperatorToolInvocationError) as conflict:
+                await recorded_request_invocation(
+                    uow.tool_invocations,
+                    investigation_id=investigation.id,
+                    tool_name="advisor.consult",
+                    schema_version="advisor-consult.v1",
+                    purpose=purpose,
+                    expected_version=1,
+                    idempotency_key="pg-request-replay",
+                    request={**request, "question": "Une autre question."},
+                )
+            assert conflict.value.code == "idempotency_conflict"
+            assert conflict.value.status_code == 409
+            fresh = await recorded_request_invocation(
+                uow.tool_invocations,
+                investigation_id=investigation.id,
+                tool_name="advisor.consult",
+                schema_version="advisor-consult.v1",
+                purpose=purpose,
+                expected_version=1,
+                idempotency_key="pg-request-replay-unused",
+                request=request,
+            )
+            assert fresh is None
     finally:
         await engine.dispose()
 

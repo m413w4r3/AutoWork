@@ -64,6 +64,7 @@ from cti_app.application.operator_tool_invocation import (
     OperatorToolInvocationService,
     _archive_extract_member_failure_details,
     _canonical_context_content_bytes,
+    recorded_request_invocation,
 )
 from cti_app.application.research_context_builder import CanonicalEvidenceSummaryPort
 from cti_app.config import Settings
@@ -4754,3 +4755,153 @@ async def test_invocation_context_task_is_propagated_and_never_inferred() -> Non
         )
     assert invalid.value.code == "invocation_attribution_invalid"
     assert fixture.tools["sample.analyze"].calls == [{"query": "answer the task's question"}]
+
+
+async def _advisor_replay_fixture() -> tuple[
+    _Fixture, InvestigationWorkingState, OperatorToolInvocationService
+]:
+    fixture = _Fixture(
+        responses=[],
+        tools=[
+            (
+                "advisor.consult",
+                "bridge",
+                ToolEffect.EXTERNAL_READ,
+                "bridge.advisor",
+                {
+                    BudgetDimension.BRIDGE_TURNS: 1,
+                    BudgetDimension.TOOL_SECONDS: 3_600,
+                },
+            )
+        ],
+    )
+    state = await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
+    return fixture, state, _service(fixture)
+
+
+@pytest.mark.asyncio
+async def test_request_identity_replays_after_the_derived_arguments_change() -> None:
+    """R3-F2: replay identity covers the request, not rebuilt arguments."""
+    fixture, state, service = await _advisor_replay_fixture()
+    request = {
+        "route": "investigation_task_consultation",
+        "task_id": str(uuid4()),
+        "question": "Interprète les faits observés de cette tâche.",
+    }
+    first = await service.invoke(
+        tool_name="advisor.consult",
+        schema_version=ADVISOR_SCHEMA_VERSION,
+        arguments={"consultation_type": "pivot_strategy", "question": "status: ready"},
+        purpose="Ask Bridge about the task context.",
+        expected_version=state.version,
+        idempotency_key="request-identity-replay",
+        request_identity=request,
+    )
+    replay = await service.invoke(
+        tool_name="advisor.consult",
+        schema_version=ADVISOR_SCHEMA_VERSION,
+        arguments={"consultation_type": "pivot_strategy", "question": "status: running"},
+        purpose="Ask Bridge about the task context.",
+        expected_version=state.version,
+        idempotency_key="request-identity-replay",
+        request_identity=request,
+    )
+
+    adapter = fixture.tools["advisor.consult"]
+    assert first.invocation.status is ToolInvocationStatus.SUCCEEDED
+    assert replay.idempotent_replay is True
+    assert replay.invocation.id == first.invocation.id
+    assert replay.invocation.normalized_parameters["question"] == "status: ready"
+    assert len(adapter.calls) == 1
+    stored = await fixture.invocations.list_for_investigation(fixture.investigation_id)
+    assert len(stored) == 1
+
+
+@pytest.mark.asyncio
+async def test_request_identity_with_another_request_is_an_idempotency_conflict() -> None:
+    fixture, state, service = await _advisor_replay_fixture()
+    request = {
+        "route": "investigation_task_consultation",
+        "task_id": str(uuid4()),
+        "question": "Interprète les faits observés de cette tâche.",
+    }
+    await service.invoke(
+        tool_name="advisor.consult",
+        schema_version=ADVISOR_SCHEMA_VERSION,
+        arguments={"consultation_type": "pivot_strategy", "question": "status: ready"},
+        purpose="Ask Bridge about the task context.",
+        expected_version=state.version,
+        idempotency_key="request-identity-conflict",
+        request_identity=request,
+    )
+
+    with pytest.raises(OperatorToolInvocationError) as conflict:
+        await service.invoke(
+            tool_name="advisor.consult",
+            schema_version=ADVISOR_SCHEMA_VERSION,
+            arguments={"consultation_type": "pivot_strategy", "question": "status: ready"},
+            purpose="Ask Bridge about the task context.",
+            expected_version=state.version,
+            idempotency_key="request-identity-conflict",
+            request_identity={**request, "question": "Une autre question."},
+        )
+
+    assert conflict.value.code == "idempotency_conflict"
+    assert conflict.value.status_code == 409
+    assert len(fixture.tools["advisor.consult"].calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_recorded_request_invocation_finds_the_exact_request_only() -> None:
+    """The pre-context lookup replays an exact request and refuses a different one."""
+    fixture, state, service = await _advisor_replay_fixture()
+    request = {
+        "route": "investigation_plan_request",
+        "consultation_type": "plan_investigation",
+        "question": "Établis un plan.",
+        "context_task_id": None,
+    }
+    recorded = await service.invoke(
+        tool_name="advisor.consult",
+        schema_version=ADVISOR_SCHEMA_VERSION,
+        arguments={"consultation_type": "plan_investigation", "question": "Établis un plan."},
+        purpose="Ask Bridge for an investigation plan.",
+        expected_version=state.version,
+        idempotency_key="recorded-request-lookup",
+        request_identity=request,
+    )
+
+    found = await recorded_request_invocation(
+        fixture.invocations,
+        investigation_id=fixture.investigation_id,
+        tool_name="advisor.consult",
+        schema_version=ADVISOR_SCHEMA_VERSION,
+        purpose="Ask Bridge for an investigation plan.",
+        expected_version=state.version,
+        idempotency_key="recorded-request-lookup",
+        request=request,
+    )
+    assert found is not None and found.id == recorded.invocation.id
+    absent = await recorded_request_invocation(
+        fixture.invocations,
+        investigation_id=fixture.investigation_id,
+        tool_name="advisor.consult",
+        schema_version=ADVISOR_SCHEMA_VERSION,
+        purpose="Ask Bridge for an investigation plan.",
+        expected_version=state.version,
+        idempotency_key="recorded-request-absent",
+        request=request,
+    )
+    assert absent is None
+    with pytest.raises(OperatorToolInvocationError) as conflict:
+        await recorded_request_invocation(
+            fixture.invocations,
+            investigation_id=fixture.investigation_id,
+            tool_name="advisor.consult",
+            schema_version=ADVISOR_SCHEMA_VERSION,
+            purpose="Ask Bridge for an investigation plan.",
+            expected_version=state.version,
+            idempotency_key="recorded-request-lookup",
+            request={**request, "question": "Une autre demande."},
+        )
+    assert conflict.value.code == "idempotency_conflict"

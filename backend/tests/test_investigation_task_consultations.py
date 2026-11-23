@@ -21,9 +21,6 @@ from fastapi import FastAPI
 from httpx import ASGITransport
 
 from cti_app.api.investigation_task_consultations import (
-    _invocation_idempotency_prefix,
-)
-from cti_app.api.investigation_task_consultations import (
     router as task_consultations_router,
 )
 from cti_app.application.identity import LocalIdentityProvider
@@ -40,6 +37,7 @@ from cti_app.application.operator_tool_invocation import (
     OperatorToolInvocationError,
     OperatorToolInvocationResult,
     _require_safe_operator_payload,
+    operator_request_identity,
 )
 from cti_app.config import Settings
 from cti_app.domain.investigation import (
@@ -209,9 +207,17 @@ class _TaskAdvisorService:
                 "operator_payload_invalid_or_sensitive", 422
             ) from None
         idempotency_key = kwargs["idempotency_key"]
-        prefix = _invocation_idempotency_prefix(INVESTIGATION_ID, idempotency_key)
-        payload_sha256 = hashlib.sha256(canonical_json_bytes(dict(kwargs["arguments"]))).hexdigest()
-        operation_key = f"{prefix}{payload_sha256}"
+        request_identity = kwargs.get("request_identity")
+        _, operation_key = operator_request_identity(
+            investigation_id=INVESTIGATION_ID,
+            tool_name=kwargs["tool_name"],
+            schema_version=kwargs["schema_version"],
+            purpose=kwargs["purpose"],
+            expected_version=kwargs["expected_version"],
+            idempotency_key=idempotency_key,
+            arguments=None if request_identity is not None else dict(kwargs["arguments"]),
+            request=request_identity,
+        )
         existing = self._by_key.get(idempotency_key)
         if existing is not None:
             if existing.operation_key != operation_key:
@@ -389,11 +395,13 @@ def test_task_consultation_reuses_advisor_consult_and_attribution() -> None:
     assert (
         payload["task_context_sha256"] == hashlib.sha256(canonical_json_bytes(context)).hexdigest()
     )
-    # A replay with the same key and body rebuilds the exact same arguments.
+    # A replay with the same key and body returns the recorded result without
+    # invoking the advisor a second time.
     replay = client.post(path, json=body, headers={"Idempotency-Key": "task-consult-1"})
     assert replay.status_code == 200, replay.text
     assert replay.json()["invocation_id"] == payload["invocation_id"]
-    assert service.calls[1]["arguments"]["task_context"] == context
+    assert replay.json()["task_context_sha256"] == payload["task_context_sha256"]
+    assert len(service.calls) == 1
     assert (
         len(asyncio.run(store.invocations.list_for_investigation(INVESTIGATION_ID))) == 2
     )  # the prior seeded consultation plus this one
@@ -499,8 +507,120 @@ def test_task_consultation_omits_sensitive_task_context_with_warning() -> None:
     )
     assert b"ZZOPERATIONALSECRETZZ" not in response.content
 
-    # A replay with the same key rebuilds the exact same sanitised arguments.
+    # A replay with the same key returns the recorded sanitised result
+    # without rebuilding or retransmitting the context.
     replay = client.post(path, json=body, headers={"Idempotency-Key": "task-consult-sensitive"})
     assert replay.status_code == 200, replay.text
     assert replay.json()["invocation_id"] == payload["invocation_id"]
-    assert service.calls[1]["arguments"] == arguments
+    assert replay.json()["task_context_sha256"] == payload["task_context_sha256"]
+    assert len(service.calls) == 1
+
+
+def _move_task(
+    store: _Store, task: InvestigationTaskV1, *, status: TaskStatus
+) -> InvestigationTaskV1:
+    moved = task.with_status(status, now=NOW + timedelta(minutes=1))
+    stored = asyncio.run(
+        store.tasks.update_status(
+            moved, expected_status_version=task.status_version, expected_status=task.status
+        )
+    )
+    assert stored == moved
+    return moved
+
+
+def test_task_consultation_replay_after_task_mutation_returns_recorded_result() -> None:
+    """R3-F2: the same key and body replay the recorded consultation.
+
+    The context is a function of the task and its contributions; the replay
+    identity is a function of the request.  A task that moved on (status,
+    contributions) must not turn its own replay into a conflict, and must not
+    produce a second advisor consultation.
+    """
+    store = _Store()
+    task = _make_task()
+    asyncio.run(store.tasks.add(task))
+    client, service = _client(store)
+    path = f"/api/investigations/{INVESTIGATION_ID}/tasks/{task.id}/consultations"
+    body = {
+        "consultation_type": "interpretation",
+        "question": "Interprète les faits observés de cette tâche.",
+        "expected_working_state_version": 1,
+    }
+    headers = {"Idempotency-Key": "task-consult-mutated"}
+
+    first = client.post(path, json=body, headers=headers)
+    assert first.status_code == 200, first.text
+    first_payload = first.json()
+    assert service.calls[0]["arguments"]["task_context"]["status"] == "ready"
+
+    _move_task(store, task, status=TaskStatus.RUNNING)
+    asyncio.run(
+        store.contributions.append_if_absent(
+            _make_contribution(task_id=task.id, key="late", relpath="notes/late.md")
+        )
+    )
+
+    replay = client.post(path, json=body, headers=headers)
+
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["invocation_id"] == first_payload["invocation_id"]
+    assert replay.json()["task_context_sha256"] == first_payload["task_context_sha256"]
+    assert replay.json()["consultation"] == first_payload["consultation"]
+    # The recorded result is projected, never rebuilt or re-dispatched.
+    assert len(service.calls) == 1
+    assert len(asyncio.run(store.invocations.list_for_investigation(INVESTIGATION_ID))) == 1
+    stored = asyncio.run(store.tasks.get(task.id))
+    assert stored is not None and stored.status is TaskStatus.RUNNING
+
+
+def test_task_consultation_replay_of_a_terminal_task_returns_recorded_result() -> None:
+    """R3-F2: a replay owns neither a task revival nor a fresh consultation."""
+    store = _Store()
+    task = _make_task()
+    asyncio.run(store.tasks.add(task))
+    client, service = _client(store)
+    path = f"/api/investigations/{INVESTIGATION_ID}/tasks/{task.id}/consultations"
+    body = {
+        "consultation_type": "critique",
+        "question": "Critique la solidité des faits observés.",
+        "expected_working_state_version": 1,
+    }
+
+    first = client.post(path, json=body, headers={"Idempotency-Key": "task-consult-terminal"})
+    assert first.status_code == 200, first.text
+    _move_task(store, task, status=TaskStatus.CANCELLED)
+
+    replay = client.post(path, json=body, headers={"Idempotency-Key": "task-consult-terminal"})
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["invocation_id"] == first.json()["invocation_id"]
+    assert len(service.calls) == 1
+    # A different key still cannot consult a terminal task.
+    refused = client.post(path, json=body, headers={"Idempotency-Key": "task-consult-terminal-new"})
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["detail"]["code"] == "task_consultation_task_terminal"
+    assert len(service.calls) == 1
+
+
+def test_task_consultation_same_key_with_another_body_is_a_conflict() -> None:
+    store = _Store()
+    task = _make_task()
+    asyncio.run(store.tasks.add(task))
+    client, service = _client(store)
+    path = f"/api/investigations/{INVESTIGATION_ID}/tasks/{task.id}/consultations"
+    body = {
+        "consultation_type": "interpretation",
+        "question": "Interprète les faits observés de cette tâche.",
+        "expected_working_state_version": 1,
+    }
+    headers = {"Idempotency-Key": "task-consult-conflict"}
+
+    first = client.post(path, json=body, headers=headers)
+    assert first.status_code == 200, first.text
+
+    conflict = client.post(path, json={**body, "question": "Une autre question."}, headers=headers)
+
+    assert conflict.status_code == 409, conflict.text
+    assert conflict.json()["detail"]["code"] == "idempotency_conflict"
+    assert len(service.calls) == 1
+    assert len(asyncio.run(store.invocations.list_for_investigation(INVESTIGATION_ID))) == 1
