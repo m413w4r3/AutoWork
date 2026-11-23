@@ -1,14 +1,17 @@
 import { QueryClientProvider } from "@tanstack/react-query";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { InvestigationView } from "../../../api/investigation";
 import type {
+  AgentSessionView,
   BootstrapPlanV1,
   BootstrapSnapshotV1,
   IOCInventoryV1,
+  TaskPageView,
   WorkContributionView,
+  WorkspaceFileListV1,
 } from "../api";
 import {
   bodyOf,
@@ -191,12 +194,12 @@ const readyPlan = {
       tool_name: "vt.file_report",
       schema_version: "1",
       arguments: {},
-      status: "pending",
-      reason: null,
+      status: "partial",
+      reason: "partial",
       reserved_vt_units: 1,
       reserved_downloads: 0,
       requires_batch_evidence: false,
-      route_status: "configured",
+      route_status: "unverified",
       limitations: [],
     },
   ],
@@ -282,7 +285,24 @@ const investigation = {
   stop_reason: null,
   agenda: [],
   hypotheses: [],
-  findings: [],
+  findings: [
+    {
+      id: "finding-1",
+      logical_id: "finding-logical-1",
+      current_version_id: "finding-version-1",
+      version: 1,
+      revision_chain: [],
+      kind: "new_sample",
+      assessment: "qualified",
+      novelty: "not_confirmed",
+      statement: "La contribution demande une revue humaine.",
+      scope: "Échantillon de test",
+      limitations: ["Évaluation humaine requise."],
+      observation_refs: ["observation-1"],
+      claim_refs: ["claim-1"],
+      created_at: "2026-11-20T12:00:00Z",
+    },
+  ],
   observations: [
     {
       id: "observation-1",
@@ -327,6 +347,98 @@ const investigation = {
   acquire_hits_allowed: false,
 } satisfies InvestigationView;
 
+const tasks: TaskPageView = {
+  items: [
+    {
+      id: "task-1",
+      investigation_id: "inv-1",
+      task_key: "sample-analysis-1",
+      plan_version_id: null,
+      parent_task_id: null,
+      depth: 0,
+      title: "Analyser le hash de l’échantillon",
+      question: "Quelles observations statiques sont disponibles ?",
+      objective: "Relier les résultats à l’échantillon.",
+      priority: "high",
+      claim_refs: ["claim-1"],
+      evidence_refs: ["observation-1"],
+      sample_refs: [SHA_B],
+      required_capabilities: [],
+      allowed_workspace_paths: [],
+      execution_policy: {},
+      expected_outputs: [],
+      status: "completed",
+      status_version: 1,
+      result_verification_status: "unverified",
+      blocked_reason: null,
+      assigned_actor_kind: null,
+      assigned_actor_id: null,
+      lease_id: null,
+      lease_session_id: "session-1",
+      lease_fence: 1,
+      lease_expires_at: null,
+      heartbeat_at: null,
+      handoff_ref: null,
+      result_refs: [],
+      event_sequence: 1,
+      created_by: { actor_kind: "system", actor_id: "plan" },
+      created_at: "2026-11-20T10:00:00Z",
+      updated_at: "2026-11-20T12:00:00Z",
+    },
+  ],
+  total: 1,
+};
+
+const sessions: AgentSessionView[] = [
+  {
+    id: "session-1",
+    investigation_id: "inv-1",
+    task_id: "task-1",
+    adapter_kind: "codex_cli",
+    state: "closed",
+    state_version: 2,
+    host_session_ref: null,
+    handoff_id: null,
+    capability_sha256: SHA_D,
+    probed_at: "2026-11-20T10:00:00Z",
+    task_lease_id: null,
+    task_lease_fence: 1,
+    checkpoint_ref: null,
+    checkpoint_sha256: null,
+    reconciliation: null,
+    reconciliation_sha256: null,
+    last_activity_at: "2026-11-20T12:00:00Z",
+    opened_at: "2026-11-20T10:10:00Z",
+    closed_at: "2026-11-20T12:10:00Z",
+    close_reason: "completed",
+    created_at: "2026-11-20T10:10:00Z",
+    updated_at: "2026-11-20T12:10:00Z",
+  },
+];
+
+const workspaceFiles = {
+  investigation_id: "inv-1",
+  workspace_id: "ws-1",
+  workspace_available: true,
+  files: [
+    {
+      path: "results/task-1/static-analysis.json",
+      revision_id: "workspace-revision-1",
+      sha256: SHA_D,
+      size: 300,
+      mode: "0440",
+      policy_class: "agent_owned",
+      origin: "agent",
+      import_status: "applied",
+      task_id: "task-1",
+      observed_at: "2026-11-20T12:15:00Z",
+      conflict: false,
+      history: [],
+    },
+  ],
+  next_page_token: null,
+} satisfies WorkspaceFileListV1;
+
 const sampleDetail = {
   id: "assoc-1",
   sample_sha256: SHA_B,
@@ -354,6 +466,9 @@ function baseHandler(plan: BootstrapPlanV1) {
     if (url.endsWith("/bootstrap/snapshot")) return jsonResponse(snapshot);
     if (url.endsWith("/bootstrap/run")) return jsonResponse(snapshot);
     if (url.endsWith("/contributions")) return jsonResponse(contributions);
+    if (url.endsWith("/tasks")) return jsonResponse(tasks);
+    if (url.endsWith("/agent-sessions")) return jsonResponse(sessions);
+    if (url.includes("/workspace/files")) return jsonResponse(workspaceFiles);
     if (url === "/api/investigations/inv-1") return jsonResponse(investigation);
     if (url.endsWith("/samples")) return jsonResponse([sampleDetail]);
     if (url.endsWith("/samples/assoc-1/qualify")) {
@@ -376,50 +491,292 @@ function renderView(handler: (request: RecordedRequest) => Response) {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  Reflect.deleteProperty(navigator, "clipboard");
 });
 
 describe("SamplesResultsView", () => {
-  it("sépare les seeds des découverts et rend les résultats partiels lisibles", async () => {
+  it("recherche des hashes et IOCs sans tronquer les valeurs", async () => {
     renderView(baseHandler(readyPlan));
-    expect(
-      screen.getByText("Chargement de l’inventaire IOC…"),
-    ).toBeInTheDocument();
+    const search = await screen.findByRole("searchbox", {
+      name: "Rechercher un IOC ou un hash",
+    });
+    fireEvent.change(search, { target: { value: SHA_B } });
+    const table = screen.getByRole("tabpanel", { name: "IOC et échantillons" });
+    expect(within(table).getByText(SHA_B)).toBeInTheDocument();
+    expect(within(table).queryByText("evil.example")).not.toBeInTheDocument();
+    fireEvent.change(search, { target: { value: "evil.example" } });
+    expect(within(table).getByText("evil.example")).toBeInTheDocument();
+    expect(within(table).queryByText(SHA_B)).not.toBeInTheDocument();
+  });
 
+  it("filtre par type, seed/découvert, disponibilité, état G3 et source", async () => {
+    renderView(baseHandler(readyPlan));
+    await screen.findByRole("table", { name: /Inventaire filtré/ });
+    const tablePanel = screen.getByRole("tabpanel", {
+      name: "IOC et échantillons",
+    });
+    const type = screen.getByLabelText("Type");
+    const origin = screen.getByLabelText("Statut seed ou découvert");
+    const availability = screen.getByLabelText("Disponibilité");
+    const qualification = screen.getByLabelText("État G3");
+    const source = screen.getByLabelText("Source");
+    const user = userEvent.setup();
+    await user.selectOptions(type, "domain");
+    expect(within(tablePanel).getByText("evil.example")).toBeInTheDocument();
+    expect(within(tablePanel).queryByText(SHA_B)).not.toBeInTheDocument();
+    await user.selectOptions(origin, "seed");
     expect(
-      await screen.findByRole("heading", {
-        name: "Seeds — déjà dans l’article",
+      screen.getByText(
+        "Aucun IOC ou échantillon ne correspond à la recherche et aux filtres.",
+      ),
+    ).toBeInTheDocument();
+    await user.selectOptions(type, "all");
+    expect(within(tablePanel).getByText(SHA_B)).toBeInTheDocument();
+    await user.selectOptions(availability, "available");
+    expect(within(tablePanel).getByText(SHA_B)).toBeInTheDocument();
+    await user.selectOptions(qualification, "candidate");
+    expect(within(tablePanel).getByText(SHA_B)).toBeInTheDocument();
+    await user.selectOptions(source, "vt_pivot");
+    expect(within(tablePanel).getByText(SHA_B)).toBeInTheDocument();
+  });
+
+  it("trie le tableau par valeur avec un état accessible", async () => {
+    renderView(baseHandler(readyPlan));
+    await screen.findByRole("table", { name: /Inventaire filtré/ });
+    const table = screen.getByRole("table", { name: /Inventaire filtré/ });
+    const valueHeader = screen.getByRole("columnheader", { name: /Valeur/ });
+    const sortButton = within(valueHeader).getByRole("button", {
+      name: /Valeur/,
+    });
+    const user = userEvent.setup();
+    await user.click(sortButton);
+    expect(valueHeader).toHaveAttribute("aria-sort", "descending");
+    const values = within(table)
+      .getAllByRole("row")
+      .slice(1)
+      .map((row) => row.textContent ?? "");
+    expect(values[0]).toContain("evil.example");
+  });
+
+  it("copie exactement la valeur complète du hash", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(window.navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    renderView(baseHandler(readyPlan));
+    await screen.findByRole("table", { name: /Inventaire filtré/ });
+    fireEvent.click(
+      screen.getByRole("button", { name: `Copier la valeur exacte ${SHA_B}` }),
+    );
+    expect(writeText).toHaveBeenCalledExactlyOnceWith(SHA_B);
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      `Valeur copiée exactement : ${SHA_B}`,
+    );
+  });
+
+  it("bascule entre les sous-vues accessibles", async () => {
+    renderView(baseHandler(readyPlan));
+    const objectsTab = await screen.findByRole("tab", {
+      name: "IOC et échantillons",
+    });
+    const resultsTab = screen.getByRole("tab", {
+      name: "Résultats et analyses",
+    });
+    expect(objectsTab).toHaveAttribute("aria-selected", "true");
+    expect(
+      screen.getByRole("tabpanel", { name: "IOC et échantillons" }),
+    ).toBeVisible();
+    const user = userEvent.setup();
+    await user.click(resultsTab);
+    expect(resultsTab).toHaveAttribute("aria-selected", "true");
+    expect(
+      screen.getByRole("tabpanel", { name: "Résultats et analyses" }),
+    ).toBeVisible();
+    expect(objectsTab).toHaveAttribute("aria-selected", "false");
+  });
+
+  it("ouvre le détail par hash et relie analyses, findings, tâches, sessions et fichiers", async () => {
+    renderView(baseHandler(readyPlan));
+    const user = userEvent.setup();
+    const search = await screen.findByRole("searchbox", {
+      name: "Rechercher un IOC ou un hash",
+    });
+    await user.type(search, SHA_B);
+    await user.click(
+      screen.getByRole("tab", { name: "Résultats et analyses" }),
+    );
+    await user.click(
+      screen.getByRole("button", {
+        name: `Ouvrir les résultats pour ${SHA_B}`,
       }),
+    );
+    const detail = screen.getByRole("region", { name: `Détail de ${SHA_B}` });
+    expect(within(detail).getByText("Disponible")).toBeInTheDocument();
+    expect(
+      within(detail).getByRole("heading", { name: "Analyse statique" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("heading", { name: "Découverts — pivots" }),
+      within(
+        within(detail).getByRole("region", { name: "Analyse statique" }),
+      ).getByText(/analysis-worker/),
     ).toBeInTheDocument();
-    expect(await screen.findByText("Rapport fichier")).toBeInTheDocument();
+    expect(detail).toHaveTextContent(
+      "La contribution demande une revue humaine.",
+    );
+    expect(within(detail).getByText("session-1")).toBeInTheDocument();
     expect(
-      screen.getAllByText("Résultat partiel — couverture incomplète").length,
-    ).toBeGreaterThan(0);
-    expect(
-      screen.getByText("Incomplète — curseur cursor-2"),
+      within(detail).getByText("notes/agents/task-1/finding.md"),
     ).toBeInTheDocument();
     expect(
-      screen.getByText("Champ « signature » absent du rapport."),
+      await within(detail).findByText("results/task-1/static-analysis.json"),
     ).toBeInTheDocument();
-    expect(screen.getByText("vt.behaviour").closest("li")).toHaveTextContent(
-      "Route de comportement non attestée.",
+    const taskLink = within(detail).getByRole("link", {
+      name: /Analyser le hash de l’échantillon/,
+    });
+    expect(taskLink).toHaveAttribute(
+      "href",
+      expect.stringContaining("vue=plan"),
+    );
+    expect(taskLink).toHaveAttribute(
+      "href",
+      expect.stringContaining("task=task-1"),
+    );
+  });
+
+  it("retrouve disponibilité, analyses, findings et tâches en trois interactions", async () => {
+    renderView(baseHandler(readyPlan));
+    const user = userEvent.setup();
+    let interactions = 0;
+    const search = await screen.findByRole("searchbox", {
+      name: "Rechercher un IOC ou un hash",
+    });
+    await user.type(search, SHA_B);
+    interactions += 1;
+    await user.click(
+      screen.getByRole("tab", { name: "Résultats et analyses" }),
+    );
+    interactions += 1;
+    await user.click(
+      screen.getByRole("button", {
+        name: `Ouvrir les résultats pour ${SHA_B}`,
+      }),
+    );
+    interactions += 1;
+
+    expect(interactions).toBeLessThanOrEqual(3);
+    const detail = screen.getByRole("region", { name: `Détail de ${SHA_B}` });
+    expect(within(detail).getByText("Disponible")).toBeInTheDocument();
+    expect(
+      within(
+        within(detail).getByRole("region", { name: "Analyse statique" }),
+      ).getByText(/analysis-worker/),
+    ).toBeInTheDocument();
+    expect(detail).toHaveTextContent(
+      "La contribution demande une revue humaine.",
     );
     expect(
-      screen.getAllByText("Candidat — décision G3 humaine requise").length,
-    ).toBeGreaterThan(0);
-    expect(
-      screen.getByText(
-        "Un finding importé n’est jamais automatiquement étayé : son évaluation reste une décision serveur et humaine.",
-      ),
+      within(detail).getByRole("link", {
+        name: /Analyser le hash de l’échantillon/,
+      }),
     ).toBeInTheDocument();
+  });
+
+  it("garde les diagnostics techniques repliés par défaut", async () => {
+    renderView(baseHandler(readyPlan));
+    const summary = await screen.findByText("Diagnostics techniques");
+    const details = summary.closest("details");
+    expect(details).not.toBeNull();
+    expect(details).not.toHaveAttribute("open");
+    const diagnostics = within(details as HTMLElement).getByRole("region", {
+      name: "Pagination et clés techniques VT",
+    });
+    expect(diagnostics).not.toBeVisible();
+    await userEvent.setup().click(summary);
+    expect(diagnostics).toBeVisible();
+    expect(diagnostics).toHaveTextContent("cursor-2");
+    expect(details).toHaveTextContent("Route non vérifiée");
+  });
+
+  it("signale la troncature de l’inventaire dans les diagnostics repliés", async () => {
+    const handler = baseHandler(readyPlan);
+    renderView((request) => {
+      const response = handler(request);
+      if (request.url.endsWith("/bootstrap/inventory")) {
+        return jsonResponse({
+          ...inventory,
+          limits: { ...inventory.limits, truncated: true },
+          limitations: ["Inventaire tronqué au plafond de requête."],
+        });
+      }
+      if (request.url.endsWith("/bootstrap/snapshot")) {
+        return jsonResponse({
+          ...snapshot,
+          limits: { ...snapshot.limits, inventory_truncated: true },
+        });
+      }
+      return response;
+    });
+    const summary = await screen.findByText("Diagnostics techniques");
+    const details = summary.closest("details") as HTMLElement;
+    expect(details).not.toHaveAttribute("open");
+    await userEvent.setup().click(summary);
+    await within(details).findByText(
+      "Inventaire tronqué au plafond de requête.",
+    );
+    expect(details).toHaveTextContent("inventaire tronqué");
+    expect(details).toHaveTextContent(
+      "Inventaire tronqué au plafond de requête.",
+    );
+    expect(details).toHaveTextContent(
+      "Des IOC ou résultats peuvent manquer dans les objets affichés.",
+    );
+  });
+
+  it("ne confond pas un rapport VT réussi avec la disponibilité des octets sample", async () => {
+    const handler = baseHandler(readyPlan);
+    renderView((request) => {
+      if (request.url.endsWith("/bootstrap/inventory")) {
+        return jsonResponse({
+          ...inventory,
+          seeds: inventory.seeds.map((ioc) => ({
+            ...ioc,
+            associations: [],
+            quarantined: [],
+          })),
+        });
+      }
+      if (request.url.endsWith("/bootstrap/snapshot")) {
+        return jsonResponse({
+          ...snapshot,
+          iocs: snapshot.iocs.map((ioc) => ({
+            ...ioc,
+            status: "succeeded",
+            download: null,
+          })),
+        });
+      }
+      return handler(request);
+    });
+    await screen.findByRole("table", { name: /Inventaire filtré/ });
+    const table = screen.getByRole("table", { name: /Inventaire filtré/ });
+    const sampleRow = within(table)
+      .getAllByRole("row")
+      .find((row) => row.textContent?.includes(SHA_B));
+    expect(sampleRow).toBeDefined();
+    const user = userEvent.setup();
+    await user.click(
+      within(sampleRow as HTMLElement).getByRole("button", { name: "Détail" }),
+    );
+    const detail = screen.getByRole("region", { name: new RegExp(SHA_B) });
+    const vtSection = await within(detail).findByRole("region", {
+      name: "Collecte VirusTotal",
+    });
+    await within(vtSection).findByText(/Rapport fichier/);
+    expect(vtSection).toHaveTextContent("Réussi");
     expect(
-      screen.getByText(
-        "Un nouvel échantillon reste candidat jusqu’à une confirmation G3 humaine ; aucune automatisation ne le promeut.",
-      ),
+      within(sampleRow as HTMLElement).getByText("Non établie"),
     ).toBeInTheDocument();
-    expect(screen.getByText("empty_content")).toBeInTheDocument();
   });
 
   it("n’offre pas la collecte quand le plan attend l’enveloppe G2", async () => {
@@ -445,7 +802,6 @@ describe("SamplesResultsView", () => {
     button.focus();
     expect(button).toHaveFocus();
     await userEvent.setup().keyboard("{Enter}");
-
     const run = recorder.calls.find((call) =>
       call.url.endsWith("/bootstrap/run"),
     );
@@ -462,27 +818,35 @@ describe("SamplesResultsView", () => {
         ? errorResponse(503, "bootstrap_state_unavailable")
         : baseHandler(readyPlan)(request),
     );
-    const alert = await screen.findByRole("alert");
-    expect(alert).toHaveTextContent("bootstrap_state_unavailable");
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "bootstrap_state_unavailable",
+    );
   });
 
   it("qualifie un échantillon en G3 avec CAS, motif et observation de l’enquête", async () => {
     const recorder = renderView(baseHandler(readyPlan));
     const user = userEvent.setup();
-
-    expect(
-      await screen.findByRole("heading", {
-        name: "Qualification G3 des échantillons",
-      }),
-    ).toBeInTheDocument();
-    await screen.findByLabelText(/Décision G3 pour/);
+    await screen.findByRole("table", { name: /Inventaire filtré/ });
+    await user.click(
+      within(screen.getByRole("row", { name: new RegExp(SHA_B) })).getByRole(
+        "button",
+        { name: "Détail" },
+      ),
+    );
+    const g3Summary = await screen.findByText(
+      "Historique et décision humaine G3",
+    );
+    await user.click(g3Summary);
+    await screen.findByRole("heading", {
+      name: "Qualification G3 des échantillons",
+    });
     await user.selectOptions(
       screen.getByLabelText(/Décision G3 pour/),
       "confirmed",
     );
     await user.type(
       screen.getByLabelText(/Motif de la décision/),
-      "Le binaire est confirmé par l’observation de l’enquête.",
+      "Le binaire est étayé par l’observation de l’enquête.",
     );
     await user.selectOptions(
       screen.getByLabelText(/Observations de la même enquête/),
@@ -504,12 +868,11 @@ describe("SamplesResultsView", () => {
     expect(payload).toMatchObject({
       expected_version: 1,
       qualification: "confirmed",
-      reason: "Le binaire est confirmé par l’observation de l’enquête.",
+      reason: "Le binaire est étayé par l’observation de l’enquête.",
       evidence_refs: ["observation-1"],
     });
-    if (typeof payload !== "object" || payload === null) {
+    if (typeof payload !== "object" || payload === null)
       throw new Error("qualification request body expected");
-    }
     expect((payload as Record<string, unknown>).correlation_id).toMatch(
       /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
     );
@@ -527,8 +890,20 @@ describe("SamplesResultsView", () => {
         ? errorResponse(404, "bootstrap_snapshot_not_found")
         : baseHandler(readyPlan)(request),
     );
+    const user = userEvent.setup();
+    await user.click(
+      await screen.findByRole("tab", { name: "Résultats et analyses" }),
+    );
+    await user.click(
+      await screen.findByRole("button", {
+        name: `Ouvrir les résultats pour ${SHA_B}`,
+      }),
+    );
+    const detail = screen.getByRole("region", { name: `Détail de ${SHA_B}` });
     expect(
-      await screen.findByText(/Aucun rapport VT enregistré pour l’instant/),
+      within(detail).getByText(
+        "Aucun résultat de collecte VT enregistré pour cet objet.",
+      ),
     ).toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
