@@ -23,7 +23,7 @@ from cti_app.domain.analyst_opinion import (
     OpinionProtocolFigureV1,
 )
 from cti_app.domain.discovery import SourceRole
-from cti_app.domain.investigation import DetectionCandidateStatus
+from cti_app.domain.investigation import DetectionCandidateStatus, canonical_json_bytes
 from cti_app.domain.investigation_graph import InvestigationGraph
 from cti_app.domain.media_assets import SUPPORTED_MEDIA_MIME_TYPES
 from cti_app.domain.production import ProductionEvidenceBasis
@@ -1310,6 +1310,71 @@ def publication_renderable_body_anchors(
                 continue
             anchors[section_paragraph_anchor(section_index, paragraph_index)] = paragraph.text
     return anchors
+
+
+def publication_note_body_anchors(
+    document: CanonicalPublicationDocument,
+) -> dict[str, str]:
+    """Return exactly the body anchors a note may target.
+
+    This is the single authority shared by the reader projection, the article
+    snapshot and note acceptance.  V9/V10 resolve explicit paragraph
+    placements and render every section paragraph, including duplicates of the
+    lead and the ``Vue d'ensemble`` overview section, so
+    ``render_duplicate_paragraphs`` is enabled for them.  Every older envelope
+    keeps the legacy exclusions.  Whether the envelope is an ARTICLE is the
+    caller's contract: this helper only projects its V5 body.
+    """
+    if isinstance(document, (PublicationDocumentV9, PublicationDocumentV10)):
+        body = document.base_publication.base_publication.base_publication
+        return publication_renderable_body_anchors(body.document, render_duplicate_paragraphs=True)
+    if isinstance(document, PublicationDocumentV8):
+        body = document.base_publication.base_publication.base_publication
+        return publication_renderable_body_anchors(body.document)
+    if isinstance(document, PublicationDocumentV7):
+        return publication_renderable_body_anchors(
+            document.base_publication.base_publication.document
+        )
+    if isinstance(document, PublicationDocumentV6):
+        return publication_renderable_body_anchors(document.base_publication.document)
+    if isinstance(document, PublicationDocumentV5):
+        return publication_renderable_body_anchors(document.document)
+    if isinstance(document, PublicationDocumentV4):
+        return publication_renderable_body_anchors(document)
+    raise ValueError("Note anchors require a canonical publication document")
+
+
+def publication_element_sha256(document: PublicationDocumentV4, *, kind: str, key: str) -> str:
+    """Return the SHA-256 of one enrichment element's canonical JSON payload.
+
+    The hash covers title, caption, content, placement and, for figures, the
+    archived asset identity: any element edit changes it.  Element keys are
+    globally unique across families, so the payload alone identifies the
+    element inside one pinned publication base.
+    """
+    if not isinstance(document, PublicationDocumentV4):
+        raise ValueError("Publication element identity requires a validated V4 document")
+    families: dict[str, tuple[Any, ...]] = {
+        "table": document.tables,
+        "chart": document.charts,
+        "diagram": document.diagrams,
+        "figure": document.figures,
+    }
+    family = families.get(kind)
+    if family is None:
+        raise ValueError("Publication element kind is invalid")
+    element = next((item for item in family if item.key == key), None)
+    if element is None:
+        raise ValueError("Publication element key is absent from the document")
+    if kind == "table":
+        payload = _table_to_json(element)
+    elif kind == "chart":
+        payload = _chart_to_json(element)
+    elif kind == "diagram":
+        payload = _diagram_to_json(element)
+    else:
+        payload = _figure_to_json(element)
+    return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 
 
 def order_publication_references(

@@ -122,6 +122,7 @@ def test_schema_uses_a_frozen_baseline_and_additive_c2_revision() -> None:
         "0026_workspace_note_annotations.py",
         "0027_instruction_delivery.py",
         "0028_task_context_consultations.py",
+        "0029_note_anchor_identity.py",
     ]
 
 

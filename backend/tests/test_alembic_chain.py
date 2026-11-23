@@ -42,6 +42,7 @@ EXPECTED_CHAIN = (
     "0026_workspace_note_annotations",
     "0027_instruction_delivery",
     "0028_task_context_consultations",
+    "0029_note_anchor_identity",
 )
 
 BAR_CHART_MIGRATION = importlib.import_module(
@@ -189,7 +190,7 @@ def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
     revision_ids = [script.revision for script in revisions]
 
     assert scripts.get_heads() == [scripts.get_current_head()]
-    assert scripts.get_current_head() == "0028_task_context_consultations"
+    assert scripts.get_current_head() == "0029_note_anchor_identity"
     assert all(revision_id for revision_id in revision_ids)
     assert {revision_id for revision_id in revision_ids if len(revision_id) > 32} == {
         "0009_acquisition_strategy_attempts",
@@ -231,13 +232,14 @@ def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
         "0026_workspace_note_annotations": "0025_opinion_note_proposals",
         "0027_instruction_delivery": "0026_workspace_note_annotations",
         "0028_task_context_consultations": "0027_instruction_delivery",
+        "0029_note_anchor_identity": "0028_task_context_consultations",
     }
 
 
-def test_expected_chain_ends_with_0028() -> None:
-    """ADR-0011 D10 schema oracle: the single head is the task-context revision."""
+def test_expected_chain_ends_with_0029() -> None:
+    """F4-D B4 schema oracle: the single head is the note anchor identity revision."""
     config = Config(BACKEND_ROOT / "alembic.ini")
     scripts = ScriptDirectory.from_config(config)
 
-    assert scripts.get_current_head() == "0028_task_context_consultations"
-    assert scripts.get_heads() == ["0028_task_context_consultations"]
+    assert scripts.get_current_head() == "0029_note_anchor_identity"
+    assert scripts.get_heads() == ["0029_note_anchor_identity"]
