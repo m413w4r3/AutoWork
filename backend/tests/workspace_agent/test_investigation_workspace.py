@@ -315,13 +315,17 @@ async def _local_agent(root: Path, runtime_dir: Path) -> AsyncIterator[Workspace
     stop = threading.Event()
     thread = threading.Thread(target=agent.serve, args=(stop,), daemon=True)
     thread.start()
+    scan_thread: threading.Thread | None = None
     try:
         ready = await asyncio.to_thread(agent.wait_ready, 15)
         assert ready, "workspace agent did not become ready"
+        scan_thread = agent._scan_thread
         yield agent
     finally:
         stop.set()
-        await asyncio.to_thread(thread.join, 15)
+        await asyncio.to_thread(thread.join)
+        if scan_thread is not None:
+            await asyncio.to_thread(scan_thread.join)
 
 
 async def test_sync_resyncs_after_a_generation_change(
@@ -343,8 +347,11 @@ async def test_sync_resyncs_after_a_generation_change(
             _write_disk_note(root, "IR202611", "bluemoon-cn", "note avant redémarrage")
             await _settle_and_sync(service, store.investigation.id)
             workspace = workspace_dir(root, "IR202611", "bluemoon-cn")
-            (workspace / ".autowork" / "file-index.json").unlink()
-            (workspace / ".autowork" / "sync-state.json").unlink()
+        # Stop and join the periodic scanner before removing its projections;
+        # an in-flight scan could otherwise recreate them with the old
+        # generation between the unlink and agent shutdown.
+        (workspace / ".autowork" / "file-index.json").unlink()
+        (workspace / ".autowork" / "sync-state.json").unlink()
         async with _local_agent(root, runtime_dir):
             report = await service.sync_workspace(store.investigation.id)
     finally:
