@@ -370,6 +370,21 @@ def _raise_opinion_error(exc: OpinionError) -> None:
         OpinionErrorCode.BRIDGE_AUTHORSHIP_REQUIRED: status.HTTP_422_UNPROCESSABLE_CONTENT,
         OpinionErrorCode.BRIDGE_PROSE_FORBIDDEN: status.HTTP_422_UNPROCESSABLE_CONTENT,
         OpinionErrorCode.BRIDGE_MODIFIED_PROSE_FORBIDDEN: status.HTTP_422_UNPROCESSABLE_CONTENT,
+        OpinionErrorCode.PROTOCOL_FIGURES_INVALID: status.HTTP_422_UNPROCESSABLE_CONTENT,
+        OpinionErrorCode.PROTOCOL_FIGURES_NOT_IN_INVESTIGATION: (
+            status.HTTP_422_UNPROCESSABLE_CONTENT
+        ),
+        OpinionErrorCode.PROTOCOL_FIGURES_UNAVAILABLE: status.HTTP_422_UNPROCESSABLE_CONTENT,
+        OpinionErrorCode.NOTE_PROPOSAL_NOT_FOUND: status.HTTP_404_NOT_FOUND,
+        OpinionErrorCode.STALE_NOTE_PROPOSAL: status.HTTP_409_CONFLICT,
+        OpinionErrorCode.NOTE_ANCHOR_TEXT_CHANGED: status.HTTP_409_CONFLICT,
+        OpinionErrorCode.BRIDGE_PROVENANCE_INVALID: status.HTTP_422_UNPROCESSABLE_CONTENT,
+        OpinionErrorCode.NOTE_CONTENT_BLOCK_INVALID: status.HTTP_422_UNPROCESSABLE_CONTENT,
+        OpinionErrorCode.NOTE_BLOCK_REF_STALE: status.HTTP_409_CONFLICT,
+        OpinionErrorCode.NOTE_CHART_WITHOUT_EVIDENCE: status.HTTP_422_UNPROCESSABLE_CONTENT,
+        OpinionErrorCode.NOTE_FIGURE_SOURCE_MISSING: status.HTTP_422_UNPROCESSABLE_CONTENT,
+        OpinionErrorCode.NOTE_CODE_REF_STALE: status.HTTP_409_CONFLICT,
+        OpinionErrorCode.NOTE_IOC_REF_UNRESOLVED: status.HTTP_422_UNPROCESSABLE_CONTENT,
     }[exc.code]
     detail: dict[str, Any] = {"code": exc.code.value}
     if str(exc) != exc.code.value:

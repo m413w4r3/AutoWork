@@ -59,6 +59,41 @@ def test_opinion_api_maps_retryable_bridge_storage_failure_to_503() -> None:
     }
 
 
+# The B4/B5a/B5b note and protocol-figure codes are raised by the opinion
+# routes as well; each one must keep its typed 4xx/409 refusal.
+_OPINION_ERROR_STATUS = {
+    OpinionErrorCode.NOTE_PROPOSAL_NOT_FOUND: 404,
+    OpinionErrorCode.STALE_NOTE_PROPOSAL: 409,
+    OpinionErrorCode.NOTE_ANCHOR_TEXT_CHANGED: 409,
+    OpinionErrorCode.NOTE_CONTENT_BLOCK_INVALID: 422,
+    OpinionErrorCode.NOTE_BLOCK_REF_STALE: 409,
+    OpinionErrorCode.NOTE_CHART_WITHOUT_EVIDENCE: 422,
+    OpinionErrorCode.NOTE_FIGURE_SOURCE_MISSING: 422,
+    OpinionErrorCode.NOTE_CODE_REF_STALE: 409,
+    OpinionErrorCode.NOTE_IOC_REF_UNRESOLVED: 422,
+    OpinionErrorCode.BRIDGE_PROVENANCE_INVALID: 422,
+    OpinionErrorCode.PROTOCOL_FIGURES_INVALID: 422,
+    OpinionErrorCode.PROTOCOL_FIGURES_NOT_IN_INVESTIGATION: 422,
+    OpinionErrorCode.PROTOCOL_FIGURES_UNAVAILABLE: 422,
+}
+
+
+def test_opinion_api_maps_every_opinion_error_code_to_a_typed_refusal() -> None:
+    for code in OpinionErrorCode:
+        with pytest.raises(HTTPException) as raised:
+            _raise_opinion_error(OpinionError(code))
+        assert 400 <= raised.value.status_code < 500, code
+        assert raised.value.detail["code"] == code.value
+
+
+def test_opinion_api_maps_note_and_protocol_figure_codes_to_4xx() -> None:
+    for code, status_code in _OPINION_ERROR_STATUS.items():
+        with pytest.raises(HTTPException) as raised:
+            _raise_opinion_error(OpinionError(code))
+        assert raised.value.status_code == status_code, code
+        assert raised.value.detail["code"] == code.value
+
+
 def test_opinion_api_reports_review_text_stale_when_sha_differs_from_target_text() -> None:
     text = "Texte de la version courante."
     current_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
