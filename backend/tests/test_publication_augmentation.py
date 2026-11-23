@@ -557,3 +557,72 @@ def test_note_article_element_accepted_on_v9_stays_valid_after_augmentation() ->
     ]
     (resolved_after,) = validate_note_content_blocks((block,), augmented_context)
     assert resolved_after == resolved
+
+
+@pytest.mark.asyncio
+async def test_artifact_service_persists_a_resolved_v9_augmentation() -> None:
+    """The publication service stores the augmented V9, not a bare V8."""
+    document, base = _resolved_envelope(PublicationDocumentV9)
+    opinion, citation_context = _opinion_pinned_to(base, document, _article_element_block(base))
+    synthesis_bytes = b"verified canonical synthesis"
+    opinion = replace(
+        opinion,
+        synthesis_sha256=hashlib.sha256(synthesis_bytes).hexdigest(),
+        bridge_drafting_gap_acknowledged=True,
+        content_sha256="",
+    )
+    run_id = UUID(int=9311)
+    base_blob_id = UUID(int=9312)
+    synthesis_blob_id = UUID(int=9313)
+    base_payload = serialize_publication_document(document)
+    base_bytes = ProductionArtifactStore.canonical_json_bytes(base_payload)
+    assert hashlib.sha256(base_bytes).hexdigest() == citation_context.base_publication_sha256
+    blobs = {base_blob_id: base_bytes, synthesis_blob_id: synthesis_bytes}
+    base_artifact = ProductionArtifact(
+        id=citation_context.base_publication_artifact_id,
+        production_run_id=run_id,
+        subject_id=base.subject_id,
+        stage=ProductionArtifactStage.PUBLICATION,
+        version=1,
+        input_hash=hashlib.sha256(base_bytes).hexdigest(),
+        canonical_blob_id=base_blob_id,
+    )
+    synthesis_artifact = ProductionArtifact(
+        id=opinion.synthesis_artifact_id,
+        production_run_id=run_id,
+        subject_id=base.subject_id,
+        stage=ProductionArtifactStage.SYNTHESIS,
+        version=1,
+        input_hash="d" * 64,
+        canonical_blob_id=synthesis_blob_id,
+    )
+    repository = _ArtifactRepository((base_artifact, synthesis_artifact))
+    investigation = SimpleNamespace(
+        production_run_id=run_id,
+        subject_id=base.subject_id,
+        synthesis_artifact_id=opinion.synthesis_artifact_id,
+    )
+    uow = _AugmentationUow(repository, investigation)
+    store = _AugmentationStore(blobs)
+    preview = _PreviewRenderer()
+    service = PublicationAugmentationArtifactService(
+        uow_factory=lambda: uow,
+        artifact_store=store,  # type: ignore[arg-type]
+        preview_renderer=preview,
+    )
+
+    publication = await service.publish(
+        base_publication_artifact_id=base_artifact.id,
+        opinion=opinion,
+        citation_context=citation_context,
+    )
+
+    stored = publication_document_from_json(json.loads(blobs[publication.canonical_blob_id]))
+    assert type(stored) is PublicationDocumentV9
+    assert stored.resolved_placements == document.resolved_placements
+    assert stored.registry_hash == document.registry_hash
+    assert stored.synthesis_canonical_sha256 == document.synthesis_canonical_sha256
+    assert stored.enrichment_canonical_sha256 == document.enrichment_canonical_sha256
+    assert stored.base_publication.base_publication.analyst_opinion is not None
+    assert uow.committed is True
+    assert preview.artifact_ids == [publication.id]
