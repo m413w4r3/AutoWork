@@ -93,6 +93,7 @@ export function SubjectWorkbench({ subjectId }: { subjectId: string }) {
         <InvestigationTab
           subjectId={subjectId}
           editionId={subject.edition_id}
+          articleTitle={subject.title}
         />
       ) : null}
     </section>

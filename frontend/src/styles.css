@@ -36,6 +36,13 @@ main {
   padding: 5rem 0;
 }
 
+/* Expand only the subject page while its M24 workshop cockpit is mounted. */
+main:has(.workshop-cockpit) {
+  box-sizing: border-box;
+  width: min(1600px, calc(100% - 3rem));
+  min-width: 0;
+}
+
 .app-header {
   display: flex;
   align-items: center;

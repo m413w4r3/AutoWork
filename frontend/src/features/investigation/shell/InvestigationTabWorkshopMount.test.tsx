@@ -105,6 +105,8 @@ function urlOf(input: RequestInfo | URL): string {
 function renderTab(
   workspaceState: "bound" | "unbound",
   proseAuthority: InvestigationView["prose_authority"],
+  articleTitle = "Article étudié",
+  pendingDecisionCount?: number,
 ) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, refetchInterval: false } },
@@ -196,22 +198,43 @@ function renderTab(
     );
   });
   vi.stubGlobal("fetch", fetchMock);
-  return render(
+  const result = render(
     <QueryClientProvider client={client}>
-      <InvestigationTab subjectId={SUBJECT_ID} editionId={EDITION_ID} />
+      <InvestigationTab
+        subjectId={SUBJECT_ID}
+        editionId={EDITION_ID}
+        articleTitle={articleTitle}
+        pendingDecisionCount={pendingDecisionCount}
+      />
     </QueryClientProvider>,
   );
+  return { ...result, fetchMock };
 }
 
 afterEach(() => vi.unstubAllGlobals());
 
 describe("InvestigationTab — montage du cockpit", () => {
   it("monte le cockpit M24 quand l’enquête est bridge_only, même sans workspace lié", async () => {
-    renderTab("unbound", "bridge_only");
+    const { fetchMock } = renderTab("unbound", "bridge_only");
 
     expect(
       await screen.findByRole("tab", { name: "Vue d’ensemble" }),
     ).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "Article étudié" }),
+    ).toBeInTheDocument();
+    expect(await screen.findByText("Non lié")).toBeInTheDocument();
+    expect(
+      screen.getByLabelText("Nombre de décisions non disponible"),
+    ).toHaveTextContent("—");
+    expect(screen.getByText("Activité")).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.filter(([input]) =>
+        urlOf(input).endsWith(
+          `/api/investigations/${INVESTIGATION_ID}/workspace`,
+        ),
+      ),
+    ).toHaveLength(1);
     expect(
       screen.getByRole("tablist", { name: "Vues du cockpit d’enquête" }),
     ).toBeInTheDocument();
@@ -229,5 +252,16 @@ describe("InvestigationTab — montage du cockpit", () => {
     expect(
       screen.queryByRole("tablist", { name: "Vues du cockpit d’enquête" }),
     ).toBeNull();
+  });
+
+  it("affiche le compteur de décisions quand le parent le fournit", async () => {
+    renderTab("bound", "bridge_only", "Article étudié", 3);
+
+    expect(
+      await screen.findByRole("tab", { name: "Vue d’ensemble" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Décisions en attente").nextElementSibling,
+    ).toHaveTextContent("3");
   });
 });

@@ -1,7 +1,206 @@
 .workshop-cockpit {
   display: grid;
   gap: 1rem;
+  width: 100%;
+  max-width: 1600px;
+  min-width: 0;
   margin-top: 1rem;
+  margin-right: auto;
+  margin-left: auto;
+  box-sizing: border-box;
+}
+
+.workshop-cockpit *,
+.workshop-context-bar * {
+  min-width: 0;
+}
+
+.workshop-context-bar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 0.75rem 1.5rem;
+  min-width: 0;
+  padding: 1rem 1.2rem;
+  border: 1px solid #cbd9cf;
+  border-radius: 0.9rem;
+  background: #fff;
+}
+
+.workshop-context-bar__heading,
+.workshop-context-meta,
+.workshop-context-bar__actions {
+  min-width: 0;
+}
+
+.workshop-context-bar__heading h2 {
+  margin: 0.1rem 0 0.4rem;
+  overflow-wrap: anywhere;
+}
+
+.workshop-context-bar__heading .eyebrow {
+  margin: 0;
+  color: #405249;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.workshop-context-meta {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(7rem, auto));
+  gap: 0.35rem 1rem;
+  margin: 0;
+}
+
+.workshop-context-meta > div {
+  min-width: 0;
+}
+
+.workshop-context-meta dt {
+  color: #405249;
+  font-size: 0.76rem;
+  font-weight: 700;
+}
+
+.workshop-context-meta dd {
+  margin: 0.15rem 0 0;
+  overflow-wrap: anywhere;
+}
+
+.workshop-context-bar__actions {
+  grid-column: 2;
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  justify-self: end;
+}
+
+.workshop-context-activity {
+  position: relative;
+}
+
+.workshop-context-activity > summary {
+  min-height: 2.5rem;
+  padding: 0.55rem 0.85rem;
+  border: 1px solid #d4ded7;
+  border-radius: 0.6rem;
+  color: #234434;
+  font-weight: 600;
+  cursor: pointer;
+  list-style-position: inside;
+  white-space: nowrap;
+}
+
+.workshop-context-activity__content {
+  position: absolute;
+  top: calc(100% + 0.4rem);
+  right: 0;
+  z-index: 20;
+  width: min(24rem, calc(100vw - 3rem));
+  max-height: 22rem;
+  overflow: auto;
+  padding: 0.8rem 1rem;
+  border: 1px solid #cbd9cf;
+  border-radius: 0.7rem;
+  background: #fff;
+  box-shadow: 0 0.5rem 1.5rem rgb(23 33 29 / 16%);
+}
+
+.workshop-context-activity__content p {
+  margin: 0.25rem 0 0.6rem;
+}
+
+.workshop-context-activity__content ul {
+  display: grid;
+  gap: 0.45rem;
+  margin: 0;
+  padding-left: 1.2rem;
+}
+
+.workshop-context-activity__content li {
+  overflow-wrap: anywhere;
+}
+
+.workshop-context-activity__content time {
+  display: block;
+  color: #405249;
+  font-size: 0.8rem;
+}
+
+.investigation-secondary-actions {
+  margin: 0.75rem 0;
+}
+
+.investigation-actions {
+  position: relative;
+  min-width: 0;
+}
+
+.investigation-actions__menu,
+.investigation-actions__confirmation {
+  position: absolute;
+  top: calc(100% + 0.4rem);
+  right: 0;
+  z-index: 30;
+  display: grid;
+  gap: 0.35rem;
+  width: max-content;
+  max-width: min(22rem, calc(100vw - 3rem));
+  padding: 0.45rem;
+  border: 1px solid #cbd9cf;
+  border-radius: 0.7rem;
+  background: #fff;
+  box-shadow: 0 0.5rem 1.5rem rgb(23 33 29 / 18%);
+}
+
+.investigation-actions__menu button {
+  width: 100%;
+  padding: 0.55rem 0.7rem;
+  border: 0;
+  border-radius: 0.45rem;
+  background: #fff;
+  color: #17211d;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.investigation-actions__menu button:hover:not(:disabled) {
+  background: #eaf5ee;
+}
+
+.investigation-actions__menu button:disabled {
+  color: #5b6b62;
+  cursor: not-allowed;
+}
+
+.investigation-actions__confirmation {
+  width: min(25rem, calc(100vw - 3rem));
+  padding: 1rem;
+}
+
+.investigation-actions__confirmation h3 {
+  margin: 0;
+}
+
+.investigation-actions__confirmation p {
+  margin: 0.45rem 0 0.8rem;
+}
+
+.investigation-actions__confirmation-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.5rem;
+}
+
+.investigation-actions button:focus-visible,
+.workshop-context-activity > summary:focus-visible {
+  outline: 3px solid #1a6b42;
+  outline-offset: 2px;
 }
 
 .workshop-tablist {
@@ -15,6 +214,11 @@
   padding-bottom: 0.5rem;
   border-bottom: 1px solid #dce4de;
   background: #eef2ed;
+  min-width: 0;
+}
+
+.workshop-tablist > * {
+  min-width: 0;
 }
 
 /* Folded launch/list cards above the workshop cockpit (InvestigationTab). */
@@ -50,6 +254,28 @@
 .workshop-panel {
   display: grid;
   gap: 1rem;
+  min-width: 0;
+}
+
+.workshop-panel > *,
+.workshop-cockpit > * {
+  min-width: 0;
+}
+
+@media (max-width: 900px) {
+  .workshop-context-bar {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .workshop-context-meta {
+    grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr));
+  }
+
+  .workshop-context-bar__actions {
+    grid-column: 1;
+    justify-content: flex-start;
+    justify-self: start;
+  }
 }
 
 .workshop-overview,
