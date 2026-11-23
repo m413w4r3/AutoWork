@@ -82,7 +82,7 @@ def _prepare(client, running, workspace_id: str, *, secret: bytes = SECRET):
 
 def _drop_note(running, name: str, data: bytes) -> Path:
     """Drop a file where the sandbox's rw ``scratch/`` bind exposes it."""
-    notes = running.session_dir() / "scratch" / "notes"
+    notes: Path = running.session_dir() / "scratch" / "notes"
     notes.mkdir(parents=True, exist_ok=True)
     path = notes / name
     path.write_bytes(data)
@@ -132,7 +132,9 @@ def test_registry_resolves_a_profile_registered_under_the_wire_name() -> None:
     """M24's acceptance harness registers its fake profile under ``codex_cli``."""
     from sidecars.workspace_agent.sessions.supervisor import FakeProfile, ProfileRegistry
 
-    class _WireNamed(FakeProfile):
+    # ``sidecars.*`` is an untyped boundary for mypy (pyproject override), so the
+    # FakeProfile base is ``Any``; the subclass only binds the adapter kind.
+    class _WireNamed(FakeProfile):  # type: ignore[misc]
         adapter_kind = "codex_cli"
 
     registry = ProfileRegistry((_WireNamed(),))

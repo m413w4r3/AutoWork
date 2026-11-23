@@ -110,7 +110,9 @@ def _run_to_awaiting(client, running, *, runs: int = 1) -> dict[str, object]:
     """Wait for ``runs`` recorded runs and the idle receive point after them."""
 
     def _ready() -> dict[str, object] | None:
-        status = get_session(client, running, f"/v1/sessions/{SESSION_ID}").json()
+        status: dict[str, object] = get_session(
+            client, running, f"/v1/sessions/{SESSION_ID}"
+        ).json()
         if status["state"] == "awaiting_instruction" and len(status["runs"]) == runs:
             return status
         return None
@@ -456,7 +458,8 @@ def _codex_prompt(tmp_path: Path) -> str:
     context = replace(_make_codex_context(tmp_path), instruction_block=_BLOCK)
     plan = profile.build_launch_plan(context)
     assert plan.stdin_data is not None
-    return plan.stdin_data.decode("utf-8")
+    stdin_data: bytes = plan.stdin_data
+    return stdin_data.decode("utf-8")
 
 
 def _claude_prompt(tmp_path: Path) -> str:
