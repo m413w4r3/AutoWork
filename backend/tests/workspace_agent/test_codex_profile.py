@@ -11,15 +11,18 @@ login or network call is made.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import shutil
 import stat
+import tomllib
 from pathlib import Path
 
 import pytest
 from sidecars.workspace_agent.sessions import process
 from sidecars.workspace_agent.sessions import supervisor as sessions
+from sidecars.workspace_agent.sessions.adapters.claude import ClaudeProfile, ConfinementProbe
 from sidecars.workspace_agent.sessions.adapters.codex import (
     MAX_EVENT_DETAIL_CHARS,
     CodexProfile,
@@ -39,6 +42,7 @@ from sidecars.workspace_agent.sessions.state import (
     SessionState,
 )
 
+from tests.workspace_agent import claude_profile_support
 from tests.workspace_agent.sessions_support import (
     HANDOFF_ID,
     INVESTIGATION_ID,
@@ -60,11 +64,15 @@ from tests.workspace_agent.w3_support import ARTICLE_SLUG, DELIVERY_CODE
 FIXTURES = Path(__file__).with_name("fixtures")
 CODEX_HELP_FIXTURE = FIXTURES / "codex_help_0_163_0.txt"
 FAKE_CODEX_SOURCE = FIXTURES / "fake_codex.py"
+SESSIONS_PACKAGE = Path(__file__).resolve().parents[3] / "sidecars" / "workspace_agent" / "sessions"
 WORKSPACE_ID = "ws-" + "1" * 32
 MANIFEST_KEY = "m24-h4-manifest-0001"
 RESUME_KEY = "m24-h4-resume-0001"
 INTERRUPT_KEY = "m24-h4-interrupt-0001"
 COLLECT_KEY = "m24-h4-collect-0001"
+TRANSPORT_ENV_KEYS = frozenset(
+    {"AUTOWORK_SESSION_ID", "AUTOWORK_SESSION_SOCKET", "AUTOWORK_BROKER_SOCKET"}
+)
 EXPECTED_ENV_KEYS = frozenset(
     {
         "PATH",
@@ -75,9 +83,7 @@ EXPECTED_ENV_KEYS = frozenset(
         "LANG",
         "LC_ALL",
         "CODEX_HOME",
-        "AUTOWORK_SESSION_ID",
-        "AUTOWORK_SESSION_SOCKET",
-        "AUTOWORK_BACKEND_URL",
+        *TRANSPORT_ENV_KEYS,
     }
 )
 
@@ -420,7 +426,106 @@ def test_codex_env_is_closed_and_credentials_stay_private(tmp_path: Path) -> Non
     assert "[mcp_servers.autowork]" in config_toml
     assert str(context.config_directory / "shim.py") in config_toml
     assert "AUTOWORK_SESSION_SOCKET" in config_toml
+    assert "AUTOWORK_BROKER_SOCKET" in config_toml
     assert "--ignore-user-config" not in _after_bwrap_separator(plan.argv)
+
+
+def test_codex_uses_relay_socket_without_backend_url(tmp_path: Path) -> None:
+    """NET-10: the shim reaches the broker over the ro-bound ipc socket only."""
+    fake = _install_fake_codex(tmp_path)
+    stub = _install_stub_bwrap(tmp_path)
+    profile = CodexProfile(binary=fake, bwrap=stub)
+    context = _make_context(tmp_path)
+    plan = profile.build_launch_plan(context)
+
+    broker_socket = context.ipc_socket_path.parent / "broker.sock"
+    assert plan.env["AUTOWORK_BROKER_SOCKET"] == str(broker_socket)
+    assert plan.env["AUTOWORK_SESSION_SOCKET"] == str(context.ipc_socket_path)
+
+    # build_bwrap_argv mounts the ipc directory at its own absolute path, so the
+    # path the supervisor binds is also the path the sandboxed shim sees.
+    binds = [
+        (plan.argv[index + 1], plan.argv[index + 2])
+        for index in range(len(plan.argv) - 2)
+        if plan.argv[index] == "--ro-bind"
+    ]
+    ipc = str(context.ipc_socket_path.parent)
+    assert (ipc, ipc) in binds
+
+    config_toml = (context.config_directory / "codex" / "config.toml").read_text(encoding="utf-8")
+    server = tomllib.loads(config_toml)["mcp_servers"]["autowork"]
+    assert sorted(server["env"]) == sorted(TRANSPORT_ENV_KEYS)
+    assert server["env"]["AUTOWORK_BROKER_SOCKET"] == str(broker_socket)
+
+    assert plan.stdin_data is not None
+    produced = "\0".join(
+        (*plan.argv, *plan.env.keys(), *plan.env.values(), config_toml, plan.stdin_data.decode())
+    )
+    assert "AUTOWORK_BACKEND_URL" not in produced
+    assert "http://" not in produced and "https://" not in produced
+    assert not any("proxy" in key.lower() for key in plan.env)
+    process.assert_cli_environment_safe(plan.env)
+
+
+@pytest.mark.parametrize("adapter_kind", ["codex", "claude"])
+def test_real_adapters_share_the_relay_transport_contract(
+    adapter_kind: str, tmp_path: Path
+) -> None:
+    """NET-10: same socket variable and same shim catalogue, different flags."""
+    if adapter_kind == "codex":
+        fake = _install_fake_codex(tmp_path)
+        stub = _install_stub_bwrap(tmp_path)
+        profile: CodexProfile | ClaudeProfile = CodexProfile(binary=fake, bwrap=stub)
+        context = _make_context(tmp_path)
+        plan = profile.build_launch_plan(context)
+        document = tomllib.loads(
+            (context.config_directory / "codex" / "config.toml").read_text(encoding="utf-8")
+        )
+        server = document["mcp_servers"]["autowork"]
+        # The MCP config names the installed shim; production wiring installs it
+        # (the adapter's contract is the path, not the install).
+        (context.config_directory / "shim.py").write_bytes(
+            (SESSIONS_PACKAGE / "shim.py").read_bytes()
+        )
+    else:
+        profile = ClaudeProfile(
+            binary=claude_profile_support.write_fake_claude(tmp_path / "bin"),
+            bwrap_binary=claude_profile_support.write_fake_bwrap(tmp_path / "bin"),
+            confinement_probe=lambda: ConfinementProbe(
+                ok=True,
+                reason="contract test",
+                mocked=True,
+                network_mode="isolated_egress",
+                loopback_isolated=True,
+                netns=True,
+            ),
+        )
+        context = claude_profile_support.make_launch_context(tmp_path / "claude")
+        plan = profile.build_launch_plan(context)
+        document = json.loads(
+            (context.config_directory / "claude-mcp.json").read_text(encoding="utf-8")
+        )
+        server = document["mcpServers"]["autowork"]
+
+    assert TRANSPORT_ENV_KEYS <= set(plan.env)
+    assert sorted(server["env"]) == sorted(TRANSPORT_ENV_KEYS)
+    for key in TRANSPORT_ENV_KEYS:
+        assert server["env"][key] == plan.env[key], key
+    assert Path(plan.env["AUTOWORK_BROKER_SOCKET"]).parent == context.ipc_socket_path.parent
+    assert Path(plan.env["AUTOWORK_BROKER_SOCKET"]).name == "broker.sock"
+    assert Path(server["args"][0]) == context.config_directory / "shim.py"
+    assert Path(server["command"]).is_absolute()
+    # Both adapters register the same shim module, hence the same closed
+    # `catalog.CATALOGUE`; neither invents a second MCP server.
+    assert Path(server["args"][0]).read_bytes() == (SESSIONS_PACKAGE / "shim.py").read_bytes()
+    assert "AUTOWORK_BACKEND_URL" not in plan.env
+    assert "AUTOWORK_BACKEND_URL" not in server["env"]
+    assert not any("proxy" in key.lower() for key in plan.env)
+    process.assert_cli_environment_safe(plan.env)
+    # No constructor knob can redirect the transport or widen the catalogue.
+    parameters = inspect.signature(type(profile)).parameters
+    assert "broker_socket" not in parameters
+    assert "backend_url" not in parameters
 
 
 def test_codex_prompt_carries_preamble_and_handoff_reference(tmp_path: Path) -> None:

@@ -53,7 +53,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .. import logs, process
+from .. import logs, process, shim
 from ..state import (
     CapabilityUnavailableError,
     ConfinementUnavailableError,
@@ -83,7 +83,9 @@ MCP_PYTHON_CANDIDATES: tuple[str, ...] = (
     "/usr/bin/python3",
     "/usr/local/bin/python3",
 )
-BACKEND_URL = "http://127.0.0.1:8000"
+# The relay binds this name next to the one-shot secret socket (design §3/§4).
+BROKER_SOCKET_FILE_NAME = "broker.sock"
+BROKER_SOCKET_ENV = shim.BROKER_SOCKET_ENV
 
 DISALLOWED_TOOLS: tuple[str, ...] = ("Bash", "PowerShell", "REPL", "WebFetch")
 PERMISSION_MODE = "dontAsk"
@@ -571,7 +573,7 @@ class ClaudeProfile:
         network_probe: Callable[[], process.NetworkIsolationAttestation] | None = None,
     ) -> None:
         if network_mode not in process.CLI_NETWORK_MODES:
-            raise ValueError("network_mode must be isolated_egress or host_network_unsafe")
+            raise ValueError("network_mode must be a closed CLI network mode")
         self._binary = None if binary is None else Path(binary)
         self._bwrap_binary = None if bwrap_binary is None else Path(bwrap_binary)
         self._resume_proven = bool(resume_proven)
@@ -597,14 +599,11 @@ class ClaudeProfile:
         )
 
     def _network_attestation(self) -> process.NetworkIsolationAttestation:
-        """The cached R03 B1 loopback-isolation proof (host only, no network)."""
-        if self._network_mode != process.NETWORK_MODE_ISOLATED_EGRESS:
-            return process.NetworkIsolationAttestation(
-                False,
-                "explicit host_network_unsafe override",
-                process.NETWORK_MODE_HOST_NETWORK_UNSAFE,
-                False,
-            )
+        """The cached R03 B1 loopback-isolation proof (host only, no network).
+
+        The adapter has no mode-based exemption: every launch profile reports
+        what the host attestation proved, and a failure stays a refusal.
+        """
         if self._network_attestation_cache is None:
             probe = self._network_probe or process.network_isolation_attestation
             self._network_attestation_cache = probe()
@@ -909,6 +908,10 @@ class ClaudeProfile:
         )
 
     def _environment(self, context: LaunchContext) -> dict[str, str]:
+        # No proxy variable is set here: the trusted entrypoint owns the closed
+        # provider-proxy literal inside the netns (design §5, entrypoint.py).
+        # The two non-essential-traffic switches are present in the 2.1.284
+        # strings; their effect is UNPROVEN and is an H0 gate.
         home = context.config_directory / "home"
         return {
             "PATH": "/usr/local/bin:/usr/bin:/bin",
@@ -918,9 +921,11 @@ class ClaudeProfile:
             "TMPDIR": "/tmp",
             "LANG": "C.UTF-8",
             "LC_ALL": "C.UTF-8",
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            "DISABLE_AUTOUPDATER": "1",
             "AUTOWORK_SESSION_ID": context.session_id,
             "AUTOWORK_SESSION_SOCKET": str(context.ipc_socket_path),
-            "AUTOWORK_BACKEND_URL": BACKEND_URL,
+            BROKER_SOCKET_ENV: str(_broker_socket_path(context)),
         }
 
     def _readonly_binds(self, binary: Path) -> tuple[Path, ...]:
@@ -959,7 +964,7 @@ class ClaudeProfile:
                     "env": {
                         "AUTOWORK_SESSION_ID": context.session_id,
                         "AUTOWORK_SESSION_SOCKET": str(context.ipc_socket_path),
-                        "AUTOWORK_BACKEND_URL": BACKEND_URL,
+                        BROKER_SOCKET_ENV: str(_broker_socket_path(context)),
                     },
                 }
             }
@@ -1011,6 +1016,16 @@ class ClaudeProfile:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _broker_socket_path(context: LaunchContext) -> Path:
+    """The relay socket, addressed by the same absolute path in and out of bwrap.
+
+    ``build_bwrap_argv`` mounts the session ``ipc`` directory read-only at its
+    own absolute path, so no host-only translation exists and the path the
+    supervisor binds is exactly what the sandboxed shim connects to.
+    """
+    return context.ipc_socket_path.parent / BROKER_SOCKET_FILE_NAME
 
 
 def _validate_budget(value: str) -> str:

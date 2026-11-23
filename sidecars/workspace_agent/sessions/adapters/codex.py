@@ -17,11 +17,13 @@ checked against it. Everything the help cannot prove is carried as an explicit
   the prompt or logs.
 
 The CLI runs inside the H1 reasoning-session bwrap profile in its own network
-namespace behind a slirp4netns gateway that cannot reach the host loopback; the
-launch fails closed when the non-destructive bwrap probe or the loopback
-attestation fails.  The fake profile is never sandboxed.
-Normative source: ``docs/design/investigation-workshop/SESSION-RUNNER.md``
-§3, §7, §8, §10.
+namespace. The tool shim reaches the broker over the session's
+``ipc/broker.sock`` unix socket (``AUTOWORK_BROKER_SOCKET``) and the provider
+only through the trusted entrypoint's loopback forwarder; the launch fails
+closed when the non-destructive bwrap probe or the netns attestation fails.
+The fake profile is never sandboxed.
+Normative source: ``docs/design/investigation-workshop/BROKER-RELAY-EGRESS.md``
+§3-§5 and ``SESSION-RUNNER.md`` §3, §7, §8, §10.
 """
 
 from __future__ import annotations
@@ -40,7 +42,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from .. import logs, process
+from .. import logs, process, shim
 from ..state import (
     CapabilityUnavailableError,
     ConfinementUnavailableError,
@@ -63,7 +65,9 @@ HANDOFF_FILE_NAME = "handoff.json"
 FINAL_MESSAGE_FILE_NAME = "final-message.txt"
 SKILLS_DIRECTORY_NAME = "skills"
 SHIM_PYTHON = "/usr/bin/python3.12"
-BACKEND_URL = "http://127.0.0.1:8000"
+# The relay binds this name next to the one-shot secret socket (design §3/§4).
+BROKER_SOCKET_FILE_NAME = "broker.sock"
+BROKER_SOCKET_ENV = shim.BROKER_SOCKET_ENV
 
 MAX_PROMPT_BYTES = 256 * 1024
 MAX_HANDOFF_BYTES = 1024 * 1024
@@ -201,7 +205,7 @@ class CodexProfile:
             if value is not None and not Path(value).is_absolute():
                 raise ValueError(f"{name} must be an absolute path")
         if network_mode not in process.CLI_NETWORK_MODES:
-            raise ValueError("network_mode must be isolated_egress or host_network_unsafe")
+            raise ValueError("network_mode must be a closed CLI network mode")
         self._binary = None if binary is None else Path(binary)
         self._bwrap = None if bwrap is None else Path(bwrap)
         self._auth_file = None if auth_file is None else Path(auth_file)
@@ -226,14 +230,11 @@ class CodexProfile:
         )
 
     def _network_attestation(self) -> process.NetworkIsolationAttestation:
-        """The cached R03 B1 loopback-isolation proof (host only, no network)."""
-        if self._network_mode != process.NETWORK_MODE_ISOLATED_EGRESS:
-            return process.NetworkIsolationAttestation(
-                False,
-                "explicit host_network_unsafe override",
-                process.NETWORK_MODE_HOST_NETWORK_UNSAFE,
-                False,
-            )
+        """The cached R03 B1 loopback-isolation proof (host only, no network).
+
+        The adapter has no mode-based exemption: every launch profile reports
+        what the host attestation proved, and a failure stays a refusal.
+        """
         with self._lock:
             if self._network_attestation_cache is None:
                 probe = self._network_probe or process.network_isolation_attestation
@@ -520,6 +521,11 @@ class CodexProfile:
             extra_rw_binds=((context.home_directory, context.home_directory),),
             network_mode=context.network_mode,
         )
+        # No proxy variable is set here: the trusted entrypoint owns the closed
+        # provider-proxy literal inside the netns (design §5, entrypoint.py).
+        # Codex telemetry/update controls are UNPROVEN (design §8.4): H0 must
+        # establish whether this CLI needs a switch or an allowlisted host, and
+        # this adapter invents neither.
         env = {
             "PATH": _sandbox_path(),
             "HOME": str(context.home_directory),
@@ -531,7 +537,7 @@ class CodexProfile:
             "CODEX_HOME": str(codex_home),
             "AUTOWORK_SESSION_ID": context.session_id,
             "AUTOWORK_SESSION_SOCKET": str(context.ipc_socket_path),
-            "AUTOWORK_BACKEND_URL": BACKEND_URL,
+            BROKER_SOCKET_ENV: str(_broker_socket_path(context)),
         }
         return process.LaunchPlan(
             argv=tuple(argv),
@@ -617,7 +623,7 @@ class CodexProfile:
             for key, value in (
                 ("AUTOWORK_SESSION_ID", context.session_id),
                 ("AUTOWORK_SESSION_SOCKET", str(context.ipc_socket_path)),
-                ("AUTOWORK_BACKEND_URL", BACKEND_URL),
+                (BROKER_SOCKET_ENV, str(_broker_socket_path(context))),
             )
         )
         content = (
@@ -735,6 +741,16 @@ def _require_flags(available: frozenset[str], required: frozenset[str], surface:
 
 def _argv_flags(argv: list[str]) -> frozenset[str]:
     return frozenset(token for token in argv if token.startswith("-") and token != "-")
+
+
+def _broker_socket_path(context: LaunchContext) -> Path:
+    """The relay socket, addressed by the same absolute path in and out of bwrap.
+
+    ``build_bwrap_argv`` mounts the session ``ipc`` directory read-only at its
+    own absolute path, so no host-only translation exists and the path the
+    supervisor binds is exactly what the sandboxed shim connects to.
+    """
+    return context.ipc_socket_path.parent / BROKER_SOCKET_FILE_NAME
 
 
 def _sandbox_path() -> str:
