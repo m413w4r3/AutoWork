@@ -471,6 +471,24 @@ async def get_agent_session(
     return session.to_payload()
 
 
+@router.get("/{investigation_id}/agent-sessions/{session_id}/summary")
+async def get_agent_session_summary(
+    investigation_id: UUID, session_id: UUID, request: Request
+) -> dict[str, Any]:
+    """Human-only operator panel projection (F4-D §5(d), lot B6).
+
+    ``operations``/``budget``/``broker``/``handoff``/``instructions`` are read
+    from the canonical journal, envelope and handoff stores; the broker block
+    is explicitly derived from ``tool_invocations`` because no live broker
+    state exists.  No session secret, nonce, hash or delivery token is exposed.
+    """
+    await _human_actor(request)
+    try:
+        return await _service(request).summary(investigation_id, session_id)
+    except (SessionError, HandoffError) as exc:
+        raise _session_http_error(exc) from exc
+
+
 @router.post("/{investigation_id}/agent-sessions/{session_id}/instructions")
 async def send_instruction(
     investigation_id: UUID, session_id: UUID, body: InstructionRequest, request: Request
