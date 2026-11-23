@@ -28,7 +28,10 @@ import {
 } from "../shell/WorkshopStates";
 import { SESSION_STATE_LABELS, formatTimestamp } from "../tasks/labels";
 import { BootstrapSection } from "./BootstrapSection";
-import { EnvelopeLifecycleSection } from "./EnvelopeLifecycleSection";
+import {
+  EnvelopeAccessSummary,
+  EnvelopeLifecycleSection,
+} from "./EnvelopeLifecycleSection";
 import { EnvelopeSection } from "./EnvelopeSection";
 import { usePendingDecisions } from "./usePendingDecisions";
 import {
@@ -395,6 +398,7 @@ export function OverviewView({
         </section>
       </details>
 
+      <EnvelopeAccessSummary investigationId={investigationId} />
       <details
         id="overview-g2-details"
         className="job-card workshop-overview-g2"
@@ -402,12 +406,12 @@ export function OverviewView({
         onToggle={(event) => setG2DetailsOpen(event.currentTarget.open)}
       >
         <summary>Autorisations / budgets G2</summary>
+        <EnvelopeLifecycleSection investigationId={investigationId} />
         <EnvelopeSection
           investigationId={investigationId}
           workspaceReady={workspaceReady}
           workspaceBlockedReason={workspaceBlockedReason(workspaceQuery)}
         />
-        <EnvelopeLifecycleSection investigationId={investigationId} />
       </details>
     </section>
   );

@@ -1,5 +1,11 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -282,9 +288,7 @@ describe("EnvelopeLifecycleSection", () => {
         name: "Cycle de vie de l’enveloppe G2",
       }),
     ).toBeInTheDocument();
-    expect(
-      screen.getByText("Enveloppe G2 active — version 1"),
-    ).toBeInTheDocument();
+    expect(screen.getByText("Accès externes : actifs")).toBeInTheDocument();
     expect(screen.getByText("Droits autorisés")).toBeInTheDocument();
     expect(screen.getAllByText("autorisées")).toHaveLength(2);
     expect(
@@ -295,7 +299,9 @@ describe("EnvelopeLifecycleSection", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("Unités VirusTotal")).toBeInTheDocument();
     expect(
-      screen.getByText(/1 consommé · 0 réservé · plafond 10 · restant 9/),
+      screen.getByText(
+        /Consommation : 1 unité VirusTotal consommée · réservé : 0 unités VirusTotal réservées · plafond actif : 10/,
+      ),
     ).toBeInTheDocument();
     expect(
       screen.getByText(/Les invocations d’outils des opérateurs locaux/),
@@ -306,11 +312,29 @@ describe("EnvelopeLifecycleSection", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("Politique OSINT héritée")).toBeInTheDocument();
     expect(screen.getByText("Active")).toBeInTheDocument();
-    expect(screen.getByText(POLICY_ID)).toBeInTheDocument();
-    expect(screen.getByText(/version 3/)).toBeInTheDocument();
-    expect(screen.getByText(POLICY_EVENT_ID)).toBeInTheDocument();
-    expect(screen.getByText(POLICY_SUBJECT_ID)).toBeInTheDocument();
-    expect(screen.getByText("Événement de politique")).toBeInTheDocument();
+    const technicalDetails = screen
+      .getByText("Détails techniques")
+      .closest("details");
+    expect(technicalDetails).not.toBeNull();
+    expect(
+      within(technicalDetails as HTMLElement).getByText(POLICY_ID),
+    ).toBeInTheDocument();
+    expect(
+      within(technicalDetails as HTMLElement).getByText("3"),
+    ).toBeInTheDocument();
+    expect(
+      within(technicalDetails as HTMLElement).getByText(POLICY_EVENT_ID),
+    ).toBeInTheDocument();
+    expect(
+      within(technicalDetails as HTMLElement).getByText(POLICY_SUBJECT_ID),
+    ).toBeInTheDocument();
+    expect(
+      within(technicalDetails as HTMLElement).getByText(DECISION_ID),
+    ).not.toBeVisible();
+    expect(technicalDetails).not.toHaveAttribute("open");
+    expect(
+      within(technicalDetails as HTMLElement).getByText(POLICY_ID),
+    ).not.toBeVisible();
     expect(screen.getByText("Activée par")).toBeInTheDocument();
     expect(screen.getByText("analyst:policy")).toBeInTheDocument();
   });
@@ -333,9 +357,7 @@ describe("EnvelopeLifecycleSection", () => {
     expect(submit).toBeEnabled();
     await user.click(submit);
 
-    expect(
-      await screen.findByText("Enveloppe étendue — version 2"),
-    ).toBeInTheDocument();
+    expect(await screen.findByText("Enveloppe étendue")).toBeInTheDocument();
     const post = requests.find(
       (request) =>
         request.method === "POST" && request.url.endsWith("/envelope/extend"),
@@ -415,7 +437,25 @@ describe("EnvelopeLifecycleSection", () => {
     );
 
     expect(
-      await screen.findByText("Enveloppe révoquée — droits externes coupés"),
+      await screen.findByText("Accès externes : révoqués"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Aucune nouvelle opération VT, Shodan ou Bridge externe n’est autorisée. Les analyses locales restent accessibles.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /Historique : 1 unité VirusTotal consommée \(autorisation révoquée, aucun plafond actif\)/,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /Consommation : 12 secondes d’outil consommées · réservé : 0 secondes d’outil réservées · plafond actif : 120/,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Non transmis par l’API d’enveloppe."),
     ).toBeInTheDocument();
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(screen.queryByRole("button", { name: /Approuver/ })).toBeNull();
@@ -452,10 +492,7 @@ describe("EnvelopeLifecycleSection", () => {
     });
 
     expect(
-      await screen.findByText("Enveloppe révoquée — droits externes coupés"),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText(/Droits externes actifs : non/),
+      await screen.findByText("Accès externes : révoqués"),
     ).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Approuver/ })).toBeNull();
     expect(
@@ -555,8 +592,6 @@ describe("EnvelopeLifecycleSection", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(harness.extendCount()).toBe(1);
     harness.resolveExtend();
-    expect(
-      await screen.findByText("Enveloppe étendue — version 2"),
-    ).toBeInTheDocument();
+    expect(await screen.findByText("Enveloppe étendue")).toBeInTheDocument();
   });
 });
