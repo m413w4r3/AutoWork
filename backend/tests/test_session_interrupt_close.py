@@ -341,7 +341,8 @@ async def test_resume_after_restart_reprobes_the_host_and_verifies_the_recorded_
     resumed = await service.resume(harness.investigation_id, row.id, actor=HUMAN_ACTOR)
 
     assert resumed.state is AgentSessionState.READY
-    assert host.names() == ["probe_capabilities", "resume_session"]
+    # WIRE-1: the closed tool manifest is re-posted (idempotently) before the host resumes.
+    assert host.names() == ["probe_capabilities", "set_tool_manifest", "resume_session"]
 
 
 async def test_resume_after_restart_refuses_a_changed_host_probe() -> None:
