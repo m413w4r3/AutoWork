@@ -5,6 +5,7 @@ import {
   enqueueAgentInstruction,
   getAgentSession,
   getAgentSessionCapabilities,
+  getAgentSessionSummary,
   interruptAgentSession,
   listAgentSessions,
   openAgentSession,
@@ -42,6 +43,25 @@ describe("agent session reads", () => {
     expect(lastRequest(recorder).url).toBe(
       "/api/investigations/inv-1/agent-sessions/session-2",
     );
+  });
+
+  it("reads the human-only journal summary of one session", async () => {
+    const recorder = installFetch(() =>
+      jsonResponse({
+        session_id: "session-2",
+        operations: { items: [], total: 0, limit: 100, truncated: false },
+        instructions: { items: [], total: 0, limit: 20, truncated: false },
+      }),
+    );
+
+    const summary = await getAgentSessionSummary("inv-1", "session-2");
+
+    expect(lastRequest(recorder).url).toBe(
+      "/api/investigations/inv-1/agent-sessions/session-2/summary",
+    );
+    expect(lastRequest(recorder).init?.method).toBe("GET");
+    expect(summary.operations.truncated).toBe(false);
+    expect(summary.instructions.limit).toBe(20);
   });
 
   it("probes capabilities with the adapter and the executable only", async () => {
@@ -220,6 +240,13 @@ describe("agent session query keys", () => {
       "inv-1",
       "agent-sessions",
       "session-2",
+    ]);
+    expect(agentSessionsKeys.summary("inv-1", "session-2")).toEqual([
+      "investigation",
+      "inv-1",
+      "agent-sessions",
+      "session-2",
+      "summary",
     ]);
     expect(agentSessionsKeys.capabilities("codex_cli", "codex")).toEqual([
       "agent-sessions",

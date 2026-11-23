@@ -2,8 +2,10 @@
  * Operator session reads and the human actions of `api/agent_sessions.py`
  * (M24-05B1). Only the browser-safe half lives here.
  *
- * Exposed: list/get, the read-only capability probe, open, enqueue a human
- * instruction, interrupt, resume.
+ * Exposed: list/get, the human-only journal summary (operations, budget,
+ * journal-derived broker view, handoff freshness, instructions), the
+ * read-only capability probe, open, enqueue a human instruction, interrupt,
+ * resume.
  * The D7-HMAC-only routes (`reconcile`, `collect`, the `ack` instruction
  * action and `tool-calls`) are deliberately absent — their secret never
  * reaches the browser. `POST /agent-sessions` returns the public session
@@ -14,6 +16,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { tasksKeys } from "./tasks";
 import { handoffsKeys } from "./handoffs";
+import type { HandoffActor, HandoffFreshnessDiff } from "./handoffs";
 import {
   createIdempotencyKey,
   getJson,
@@ -24,11 +27,15 @@ import {
 } from "./client";
 import type {
   AgentSessionState,
+  BudgetDimension,
   CommonErrorCode,
+  HandoffFreshnessState,
   InstructionState,
   IsoTimestamp,
   JsonObject,
   OperatorAdapterKind,
+  ToolInvocationActorKind,
+  ToolInvocationStatus,
   Uuid,
 } from "./types";
 
@@ -176,6 +183,133 @@ export interface EnqueuedInstructionView {
   note_diffs: Record<string, string>[];
 }
 
+/**
+ * `GET /api/investigations/{id}/agent-sessions/{sid}/summary`
+ * (`application/agentic_sessions.py::SessionService.summary`, lot B6).
+ *
+ * A human-only, read-only projection of one session: the journal rows
+ * attributed to it, their budget sums beside the canonical envelope, a
+ * broker block *derived from* that journal, the session's handoff with its
+ * freshness, and the latest human instructions. Authentication material
+ * (secret, nonce, hash, delivery token) is never part of this payload.
+ */
+export interface AgentSessionOperationView {
+  invocation_id: Uuid;
+  tool_name: string;
+  schema_version: string;
+  status: ToolInvocationStatus;
+  actor_kind: ToolInvocationActorKind | null;
+  actor_id: string | null;
+  /** Only the dimensions carrying a non-zero amount are present. */
+  reserved_budget: Partial<Record<BudgetDimension, number>>;
+  consumed_budget: Partial<Record<BudgetDimension, number>>;
+  created_at: IsoTimestamp;
+  updated_at: IsoTimestamp;
+  version: number;
+}
+
+export interface AgentSessionOperationWindowView {
+  items: AgentSessionOperationView[];
+  total: number;
+  limit: number;
+  truncated: boolean;
+}
+
+export interface AgentSessionBudgetTotalsView {
+  invocation_count: number;
+  consumed: Record<BudgetDimension, number>;
+  reserved: Record<BudgetDimension, number>;
+}
+
+/** `budget.envelope` is the canonical approved envelope; `null` fields mean
+ * "dimension unbounded", never "unknown". */
+export interface AgentSessionEnvelopeBudgetView {
+  present: boolean;
+  version: number | null;
+  approved_at: IsoTimestamp | null;
+  limits: Record<BudgetDimension, number | null> | null;
+  consumed: Record<BudgetDimension, number> | null;
+  reserved: Record<BudgetDimension, number> | null;
+  remaining: Record<BudgetDimension, number | null> | null;
+}
+
+export interface AgentSessionBudgetView {
+  session: AgentSessionBudgetTotalsView;
+  envelope: AgentSessionEnvelopeBudgetView;
+}
+
+/** No live broker state is read: `derived_from` names the journal it sums. */
+export interface AgentSessionBrokerView {
+  derived_from: "tool_invocations_journal";
+  last_signed_call: AgentSessionOperationView | null;
+  signed_call_count: number;
+  needs_review_count: number;
+  reconciliation_required: boolean;
+}
+
+export type AgentSessionHandoffFreshnessView =
+  | { checked: false; reason: string }
+  | {
+      checked: true;
+      state: HandoffFreshnessState;
+      diffs: HandoffFreshnessDiff[];
+    };
+
+export interface AgentSessionHandoffSummaryView {
+  handoff_id: Uuid;
+  version: number;
+  sha256: string;
+  created_at: IsoTimestamp;
+  from_actor: HandoffActor;
+  to_actor: HandoffActor;
+  freshness: AgentSessionHandoffFreshnessView | null;
+}
+
+/**
+ * The journal vocabulary is wider than the enqueue response: a summary may
+ * show the transient `delivering` / `delivery_unknown` states that the
+ * human enqueue route never returns.
+ */
+export type AgentInstructionJournalState =
+  InstructionState | "delivering" | "delivery_unknown";
+
+export interface AgentSessionInstructionView {
+  instruction_id: Uuid;
+  state: AgentInstructionJournalState;
+  text: string;
+  text_sha256: string;
+  /** 0 for an instruction that is no longer waiting in the queue. */
+  queue_position: number;
+  created_by: { kind: string; actor_id: string };
+  queued_at: IsoTimestamp;
+  delivered_at: IsoTimestamp | null;
+  acknowledged_at: IsoTimestamp | null;
+  delivery_attempts: number;
+  delivery_mode: "live" | "next_run" | null;
+  delivery_sha256: string | null;
+  last_delivery_error: string | null;
+  cancelled_at: IsoTimestamp | null;
+  cancel_reason: string | null;
+  created_at: IsoTimestamp;
+  updated_at: IsoTimestamp;
+}
+
+export interface AgentSessionInstructionWindowView {
+  items: AgentSessionInstructionView[];
+  total: number;
+  limit: number;
+  truncated: boolean;
+}
+
+export interface AgentSessionSummaryView {
+  session_id: Uuid;
+  operations: AgentSessionOperationWindowView;
+  budget: AgentSessionBudgetView;
+  broker: AgentSessionBrokerView;
+  handoff: AgentSessionHandoffSummaryView | null;
+  instructions: AgentSessionInstructionWindowView;
+}
+
 export const agentSessionsKeys = {
   all: (investigationId: string) =>
     ["investigation", investigationId, "agent-sessions"] as const,
@@ -183,6 +317,15 @@ export const agentSessionsKeys = {
     [...agentSessionsKeys.all(investigationId), "list", taskId ?? ""] as const,
   detail: (investigationId: string, sessionId: string) =>
     [...agentSessionsKeys.all(investigationId), sessionId] as const,
+  /**
+   * Sits under the detail key, so invalidating one session's detail also
+   * refreshes its journal-derived summary.
+   */
+  summary: (investigationId: string, sessionId: string) =>
+    [
+      ...agentSessionsKeys.detail(investigationId, sessionId),
+      "summary",
+    ] as const,
   /**
    * The probe is not investigation-scoped (`/api/investigations/agent-sessions/
    * capabilities`); its key deliberately sits outside every
@@ -213,6 +356,20 @@ export function getAgentSession(
     investigationPath(
       investigationId,
       `/agent-sessions/${encodeURIComponent(sessionId)}`,
+    ),
+    signal,
+  );
+}
+
+export function getAgentSessionSummary(
+  investigationId: string,
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<AgentSessionSummaryView> {
+  return getJson<AgentSessionSummaryView>(
+    investigationPath(
+      investigationId,
+      `/agent-sessions/${encodeURIComponent(sessionId)}/summary`,
     ),
     signal,
   );
@@ -326,6 +483,20 @@ export function useAgentSession(
     queryKey: agentSessionsKeys.detail(investigationId, sessionId),
     queryFn: ({ signal }) =>
       getAgentSession(investigationId, sessionId, signal),
+    enabled: options.enabled ?? (investigationId !== "" && sessionId !== ""),
+  });
+}
+
+/** Human-only journal projection of one session; no polling contract. */
+export function useAgentSessionSummary(
+  investigationId: string,
+  sessionId: string,
+  options: { enabled?: boolean } = {},
+) {
+  return useQuery({
+    queryKey: agentSessionsKeys.summary(investigationId, sessionId),
+    queryFn: ({ signal }) =>
+      getAgentSessionSummary(investigationId, sessionId, signal),
     enabled: options.enabled ?? (investigationId !== "" && sessionId !== ""),
   });
 }

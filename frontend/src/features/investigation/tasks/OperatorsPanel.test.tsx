@@ -16,7 +16,11 @@ import {
   HANDOFF_ID,
   INVESTIGATION_ID,
   makeSession,
+  makeSummary,
+  makeSummaryInstruction,
+  makeSummaryOperation,
   makeTask,
+  makeZeroBudget,
   SESSION_ID,
   TASK_ID,
 } from "./testFixtures";
@@ -51,6 +55,9 @@ describe("OperatorsPanel", () => {
       }
       if (url.endsWith("/tasks") && method === "GET") {
         return jsonResponse(taskPage(task));
+      }
+      if (url.endsWith("/summary") && method === "GET") {
+        return jsonResponse(makeSummary());
       }
       if (url.endsWith("/instructions") && method === "POST") {
         return jsonResponse({
@@ -125,6 +132,9 @@ describe("OperatorsPanel", () => {
       if (url.endsWith("/resume") && method === "POST") {
         return errorResponse(409, "resume_unavailable");
       }
+      if (url.endsWith("/summary") && method === "GET") {
+        return jsonResponse(makeSummary());
+      }
       return errorResponse(500, "unexpected_request");
     });
 
@@ -156,6 +166,9 @@ describe("OperatorsPanel", () => {
             }),
           ),
         );
+      }
+      if (url.endsWith("/summary") && method === "GET") {
+        return jsonResponse(makeSummary());
       }
       return errorResponse(500, "unexpected_request");
     });
@@ -272,5 +285,221 @@ describe("OperatorsPanel", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(
       /Agent absent : les sessions d’opérateurs sont indisponibles \(503\)/,
     );
+  });
+
+  it("affiche opérations, budget, broker, passation et instructions du résumé", async () => {
+    const operation = makeSummaryOperation({
+      tool_name: "advisor.consult",
+      status: "needs_review",
+      reserved_budget: { bridge_turns: 1 },
+      created_at: "2026-11-22T10:04:00Z",
+    });
+    const summary = makeSummary({
+      operations: {
+        items: [
+          operation,
+          makeSummaryOperation({
+            invocation_id: "88888888-8888-4888-8888-888888888888",
+            consumed_budget: { vt_units: 6 },
+            reserved_budget: { vt_units: 10 },
+            created_at: "2026-11-22T10:01:00Z",
+          }),
+        ],
+        total: 2,
+        limit: 100,
+        truncated: false,
+      },
+      budget: {
+        session: {
+          invocation_count: 2,
+          consumed: { ...makeZeroBudget(), vt_units: 6 },
+          reserved: { ...makeZeroBudget(), vt_units: 10, bridge_turns: 1 },
+        },
+        envelope: {
+          present: true,
+          version: 2,
+          approved_at: "2026-11-22T09:30:00Z",
+          limits: { ...makeZeroBudget(), bridge_turns: 4, vt_units: 100 },
+          consumed: { ...makeZeroBudget(), vt_units: 6 },
+          reserved: { ...makeZeroBudget(), vt_units: 5 },
+          remaining: { ...makeZeroBudget(), bridge_turns: 3, vt_units: 89 },
+        },
+      },
+      broker: {
+        derived_from: "tool_invocations_journal",
+        last_signed_call: operation,
+        signed_call_count: 2,
+        needs_review_count: 1,
+        reconciliation_required: true,
+      },
+      handoff: {
+        handoff_id: HANDOFF_ID,
+        version: 2,
+        sha256: "b".repeat(64),
+        created_at: "2026-11-22T09:20:00Z",
+        from_actor: { kind: "human", actor_id: "analyst:test" },
+        to_actor: { kind: "operator", actor_id: "operator:codex_cli" },
+        freshness: { checked: true, state: "fresh", diffs: [] },
+      },
+      instructions: {
+        items: [
+          makeSummaryInstruction({
+            state: "queued",
+            text: "Confirme le protocole C2.",
+            queue_position: 1,
+            delivered_at: null,
+            acknowledged_at: null,
+          }),
+        ],
+        total: 1,
+        limit: 20,
+        truncated: false,
+      },
+    });
+    installFetch(({ url, init }) => {
+      const method = init?.method ?? "GET";
+      if (url.endsWith("/agent-sessions") && method === "GET") {
+        return jsonResponse([makeSession()]);
+      }
+      if (url.endsWith("/tasks") && method === "GET") {
+        return jsonResponse(taskPage());
+      }
+      if (url.endsWith("/summary") && method === "GET") {
+        return jsonResponse(summary);
+      }
+      return errorResponse(500, "unexpected_request");
+    });
+
+    renderPanel();
+
+    expect(
+      await screen.findByText("Opérations journalisées (2)"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("advisor.consult")).toBeInTheDocument();
+    expect(screen.getByText("vt.lookup")).toBeInTheDocument();
+    expect(
+      screen.getByText(/Unités VirusTotal : 6 consommé, 10 réservé/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Budget de la session et enveloppe"),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/plafond 100 · restant 89/)).toBeInTheDocument();
+    expect(screen.getByText(/plafond 4 · restant 3/)).toBeInTheDocument();
+    expect(screen.getByText("Dérivé du journal")).toBeInTheDocument();
+    expect(
+      screen.getByText(/Aucun état broker en direct n’est lu/),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Appels signés").parentElement).toHaveTextContent(
+      "2",
+    );
+    expect(
+      screen.getByText("Revue humaine requise", { selector: "dt" })
+        .parentElement,
+    ).toHaveTextContent("1 — réconciliation requise");
+
+    const handoffSection = screen
+      .getByText("Dernière passation")
+      .closest("section");
+    expect(handoffSection).toHaveTextContent(/version 2/);
+    expect(handoffSection).toHaveTextContent(/bbbbbbbbbbbb…/);
+    expect(handoffSection).toHaveTextContent(/À jour/);
+
+    expect(screen.getByText("Instructions humaines (1)")).toBeInTheDocument();
+    expect(screen.getByText("Instruction en attente :")).toBeInTheDocument();
+    // Once as the pending instruction, once in the instruction history.
+    expect(screen.getAllByText("Confirme le protocole C2.")).toHaveLength(2);
+    expect(screen.getByText("eeeeeeeeeeee…")).toBeInTheDocument();
+    expect(screen.queryByText(/Non exposé/)).not.toBeInTheDocument();
+  });
+
+  it("affiche les états vides du résumé sans inventer de données", async () => {
+    installFetch(({ url, init }) => {
+      const method = init?.method ?? "GET";
+      if (url.endsWith("/agent-sessions") && method === "GET") {
+        return jsonResponse([makeSession()]);
+      }
+      if (url.endsWith("/tasks") && method === "GET") {
+        return jsonResponse(taskPage());
+      }
+      if (url.endsWith("/summary") && method === "GET") {
+        return jsonResponse(makeSummary());
+      }
+      return errorResponse(500, "unexpected_request");
+    });
+
+    renderPanel();
+
+    expect(
+      await screen.findByText(
+        "Aucune opération journalisée pour cette session.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Aucune consommation de budget enregistrée pour cette session.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Aucune enveloppe approuvée pour cette enquête."),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Dernier appel signé").parentElement,
+    ).toHaveTextContent("Aucun");
+    expect(
+      screen.getByText("Aucune passation liée à cette session."),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Aucune instruction en attente."),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Aucune instruction humaine pour cette session."),
+    ).toBeInTheDocument();
+  });
+
+  it("signale un résumé indisponible sans masquer la session", async () => {
+    installFetch(({ url, init }) => {
+      const method = init?.method ?? "GET";
+      if (url.endsWith("/agent-sessions") && method === "GET") {
+        return jsonResponse([makeSession()]);
+      }
+      if (url.endsWith("/tasks") && method === "GET") {
+        return jsonResponse(taskPage());
+      }
+      if (url.endsWith("/summary") && method === "GET") {
+        return errorResponse(503, "agent_sessions_unavailable");
+      }
+      return errorResponse(500, "unexpected_request");
+    });
+
+    renderPanel();
+
+    expect(
+      await screen.findByText("Codex CLI · Vérifier le domaine C2"),
+    ).toBeInTheDocument();
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      /Résumé de session indisponible — Agent absent/,
+    );
+  });
+
+  it("affiche l’attente du résumé de session", async () => {
+    installFetch(({ url, init }) => {
+      const method = init?.method ?? "GET";
+      if (url.endsWith("/agent-sessions") && method === "GET") {
+        return jsonResponse([makeSession()]);
+      }
+      if (url.endsWith("/tasks") && method === "GET") {
+        return jsonResponse(taskPage());
+      }
+      if (url.endsWith("/summary") && method === "GET") {
+        return new Promise<Response>(() => {});
+      }
+      return errorResponse(500, "unexpected_request");
+    });
+
+    renderPanel();
+
+    expect(
+      await screen.findByText("Chargement du résumé de session…"),
+    ).toBeInTheDocument();
   });
 });

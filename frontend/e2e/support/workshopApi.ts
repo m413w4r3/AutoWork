@@ -29,11 +29,15 @@ import type {
   IOCInventoryV1,
 } from "../../src/features/investigation/api/bootstrap";
 import type {
+  BudgetDimension,
   OperatorAdapterKind,
   SampleQualification,
 } from "../../src/features/investigation/api/types";
 import type { WorkContributionView } from "../../src/features/investigation/api/contributions";
-import type { AgentSessionView } from "../../src/features/investigation/api/agentSessions";
+import type {
+  AgentSessionSummaryView,
+  AgentSessionView,
+} from "../../src/features/investigation/api/agentSessions";
 import type {
   NoteAcceptanceViewV1,
   NoteProposalDiffViewV1,
@@ -1084,6 +1088,97 @@ function openedSession(
   };
 }
 
+function zeroBudget(): Record<BudgetDimension, number> {
+  return {
+    bridge_turns: 0,
+    vt_units: 0,
+    shodan_credits: 0,
+    downloads: 0,
+    tool_seconds: 0,
+    context_tokens: 0,
+    context_bytes: 0,
+  };
+}
+
+/**
+ * B6 projection for the operator panel. The mock journal holds no invocation
+ * rows, so operations/instructions are legitimately empty; the envelope,
+ * handoff and derived broker block mirror the surrounding fixtures.
+ */
+function sessionSummary(
+  session: AgentSessionView,
+  envelopeApproved: boolean,
+): AgentSessionSummaryView {
+  const envelope = envelopeApproved
+    ? {
+        present: true,
+        version: 1,
+        approved_at: "2026-11-22T09:30:00Z",
+        limits: {
+          ...zeroBudget(),
+          bridge_turns: null,
+          vt_units: 1,
+          downloads: 1,
+        },
+        consumed: zeroBudget(),
+        reserved: zeroBudget(),
+        remaining: {
+          ...zeroBudget(),
+          bridge_turns: null,
+          vt_units: 1,
+          shodan_credits: null,
+          downloads: 1,
+          tool_seconds: null,
+          context_tokens: null,
+          context_bytes: null,
+        },
+      }
+    : {
+        present: false,
+        version: null,
+        approved_at: null,
+        limits: null,
+        consumed: null,
+        reserved: null,
+        remaining: null,
+      };
+  return {
+    session_id: session.id,
+    operations: { items: [], total: 0, limit: 100, truncated: false },
+    budget: {
+      session: {
+        invocation_count: 0,
+        consumed: zeroBudget(),
+        reserved: zeroBudget(),
+      },
+      envelope,
+    },
+    broker: {
+      derived_from: "tool_invocations_journal",
+      last_signed_call: null,
+      signed_call_count: 0,
+      needs_review_count: 0,
+      reconciliation_required: false,
+    },
+    handoff:
+      session.handoff_id === null
+        ? null
+        : {
+            handoff_id: session.handoff_id,
+            version: 1,
+            sha256: SHA.content,
+            created_at: "2026-11-22T09:45:00Z",
+            from_actor: { kind: "human", actor_id: "dev-analyst" },
+            to_actor: {
+              kind: "operator",
+              actor_id: `operator:${session.adapter_kind}`,
+            },
+            freshness: { checked: true, state: "fresh", diffs: [] },
+          },
+    instructions: { items: [], total: 0, limit: 20, truncated: false },
+  };
+}
+
 function consultations(): ConsultationLedgerV1 {
   return { investigation_id: ids.investigation, consultations: [] };
 }
@@ -1673,6 +1768,21 @@ export function createWorkshopApi(options: WorkshopApiOptions = {}) {
           : item,
       );
       return fulfill(route, { session });
+    }
+    if (
+      path.startsWith(inv("/agent-sessions/")) &&
+      path.endsWith("/summary") &&
+      method === "GET"
+    ) {
+      const sessionId = path.slice(
+        inv("/agent-sessions/").length,
+        -"/summary".length,
+      );
+      const session = sessions.find((item) => item.id === sessionId);
+      if (session === undefined) {
+        return fail(route, 404, "agent_session_not_found");
+      }
+      return fulfill(route, sessionSummary(session, envelopeApproved));
     }
     if (
       path.startsWith(inv("/tasks/")) &&

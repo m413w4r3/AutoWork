@@ -5,9 +5,11 @@
  * fails the type check instead of rendering a raw snake_case token.
  */
 
+import type { AgentInstructionJournalState } from "../api/agentSessions";
 import type {
   AgentSessionState,
   BlockedReason,
+  HandoffFreshnessState,
   OperatorAdapterKind,
   ResultVerificationStatus,
   TaskActorKind,
@@ -71,6 +73,24 @@ export const SESSION_STATE_LABELS: Record<AgentSessionState, string> = {
   reconciling: "Réconciliation",
   closed: "Fermée",
   failed: "Échouée",
+};
+
+/** Full journal vocabulary of the session summary (B6), wider than enqueue. */
+export const INSTRUCTION_JOURNAL_STATE_LABELS: Record<
+  AgentInstructionJournalState,
+  string
+> = {
+  queued: "En file (agent occupé)",
+  delivering: "Livraison en cours",
+  delivered: "Transmise",
+  acknowledged: "Acquittée",
+  delivery_unknown: "Livraison inconnue",
+  cancelled: "Annulée",
+};
+
+export const HANDOFF_FRESHNESS_LABELS: Record<HandoffFreshnessState, string> = {
+  fresh: "À jour",
+  stale: "Périmée",
 };
 
 export const ADAPTER_LABELS: Record<OperatorAdapterKind, string> = {
@@ -138,6 +158,12 @@ export function formatDuration(start: string, end: string | null): string {
 export function shortSha(value: string | null): string {
   if (value === null || value === "") return "Aucun";
   return value.length > 16 ? `${value.slice(0, 12)}…` : value;
+}
+
+/** Budget amounts are non-negative integers; `null` means "unbounded". */
+export function formatBudgetAmount(value: number | null): string {
+  if (value === null) return "illimité";
+  return new Intl.NumberFormat("fr-FR").format(value);
 }
 
 export function orPlaceholder(value: string): string {
