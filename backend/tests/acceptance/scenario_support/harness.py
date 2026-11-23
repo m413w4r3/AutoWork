@@ -56,6 +56,7 @@ from cti_app.application.investigation_jobs import make_investigation_runner  # 
 from cti_app.application.jobs import JobService, create_job_registry  # noqa: E402
 from cti_app.application.media_assets import MediaAssetStore  # noqa: E402
 from cti_app.application.production_artifact_store import ProductionArtifactStore  # noqa: E402
+from cti_app.application.publication_builder import build_article_format_v1  # noqa: E402
 from cti_app.application.publication_rendering import PublicationRenderService  # noqa: E402
 from cti_app.application.typst_paths import typst_bundle_paths  # noqa: E402
 from cti_app.application.typst_rendering import TypstRenderer  # noqa: E402
@@ -71,12 +72,19 @@ from cti_app.domain.discovery_cumulative import (  # noqa: E402
 )
 from cti_app.domain.editions import Edition  # noqa: E402
 from cti_app.domain.entities import SourceDocument, Subject  # noqa: E402
+from cti_app.domain.media_assets import MediaAssetKind  # noqa: E402
 from cti_app.domain.production import (  # noqa: E402
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionInputSnapshot,
     ProductionInputSource,
     ProductionRun,
+)
+from cti_app.domain.production_editorial_enrichment import (  # noqa: E402
+    EnrichmentPlacementKind,
+    EnrichmentPlacementV1,
+    EnrichmentTableKind,
+    SourceFigureLocatorV1,
 )
 from cti_app.domain.production_routing import (  # noqa: E402
     ProductionRoutingDecisionV1,
@@ -86,13 +94,27 @@ from cti_app.domain.production_routing import (  # noqa: E402
 from cti_app.domain.production_synthesis import (  # noqa: E402
     PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
     SYNTHESIS_POLICY_VERSION,
+    extraction_evidence_refs_v1,
 )
 from cti_app.domain.publication import (  # noqa: E402
     PublicationParagraphV1,
     PublicationSectionKind,
     PublicationSectionV1,
 )
-from cti_app.domain.publication_document import serialize_publication_document  # noqa: E402
+from cti_app.domain.publication_document import (  # noqa: E402
+    PublicationDocumentV6,
+    PublicationDocumentV6ProvenanceV1,
+    PublicationDocumentV7,
+    PublicationDocumentV9,
+    PublicationSourceFigureV1,
+    PublicationTableColumnV1,
+    PublicationTableRowV1,
+    PublicationTableV1,
+    ResolvedPublicationPlacementV1,
+    publication_document_text_anchors,
+    publication_document_v5_sha256,
+    serialize_publication_document,
+)
 from cti_app.domain.publication_kind import PublicationKind  # noqa: E402
 from cti_app.domain.selection import (  # noqa: E402
     SelectionAction,
@@ -111,6 +133,7 @@ from cti_app.infrastructure.workspace_agent import HttpWorkspaceAgentClient  # n
 from tests.integration.edition_codes import reserve_edition_code  # noqa: E402
 from tests.test_investigation_bootstrap import _object_report  # noqa: E402
 from tests.test_investigation_vt_tools import _file_report  # noqa: E402
+from tests.test_publication_builder_v4 import _canonical_inputs  # noqa: E402
 from tests.test_publication_document_v6 import _base_v5  # noqa: E402
 from tests.workflow_emulator.investigation_support import (  # noqa: E402
     HashCheckedVirusTotal,
@@ -438,13 +461,14 @@ async def seed_article(
     artifact_store: ProductionArtifactStore,
     material: ScenarioMaterial,
     duplicate_analysis_paragraph: bool = False,
+    include_m23_article_elements: bool = False,
 ) -> SeededArticle:
     """Persist one verified synthetic ARTICLE, its extraction and routing.
 
-    ``duplicate_analysis_paragraph`` appends the tail paragraph to the analysis
-    section, so two rendered anchors share the exact same text.  The browser
-    journey uses it to prove the canonical anchor selector exposes real
-    multiple occurrences; the acceptance scenario keeps the default document.
+    ``duplicate_analysis_paragraph`` puts two byte-identical tail paragraphs
+    in the second article section. ``include_m23_article_elements`` adds one
+    resolved table at the first occurrence and one source figure at the second
+    occurrence for the real-browser note and PDF oracle.
     """
     token = uuid4().hex
     source_document_id = uuid4()
@@ -468,6 +492,8 @@ async def seed_article(
         research_date=date(2026, 11, 22),
     )
     base_v5 = _base_v5()
+    _, _, article_format_extraction, _ = _canonical_inputs()
+    article_format_evidence_refs = extraction_evidence_refs_v1(article_format_extraction)
     lead = base_v5.document.lead[0]
     overview_section = PublicationSectionV1(
         kind=PublicationSectionKind.OVERVIEW,
@@ -481,10 +507,16 @@ async def seed_article(
         )
     ]
     if duplicate_analysis_paragraph:
-        analysis_paragraphs.append(
-            PublicationParagraphV1(
-                text=TAIL_SECTION_PARAGRAPH,
-                evidence_refs=lead.evidence_refs,
+        analysis_paragraphs.extend(
+            (
+                PublicationParagraphV1(
+                    text=TAIL_SECTION_PARAGRAPH,
+                    evidence_refs=lead.evidence_refs,
+                ),
+                PublicationParagraphV1(
+                    text=TAIL_SECTION_PARAGRAPH,
+                    evidence_refs=lead.evidence_refs,
+                ),
             )
         )
     analysis_section = PublicationSectionV1(
@@ -502,10 +534,15 @@ async def seed_article(
             ),
         ),
     )
+    sections = (
+        (overview_section, analysis_section)
+        if duplicate_analysis_paragraph
+        else (overview_section, analysis_section, tail_section)
+    )
     document = replace(
         base_v5.document,
         subject_id=subject.id,
-        sections=(overview_section, analysis_section, tail_section),
+        sections=sections,
     )
     preserved_semantics = tuple(
         paragraph
@@ -522,15 +559,37 @@ async def seed_article(
     )
     semantic_paragraphs = [overview_semantics, analysis_semantics]
     if duplicate_analysis_paragraph:
-        semantic_paragraphs.append(
-            SemanticParagraphV1(
-                anchor="section:1:paragraph:0002",
-                spans=(SemanticTextSpanV1(role=SemanticRole.TEXT, text=TAIL_SECTION_PARAGRAPH),),
+        semantic_paragraphs.extend(
+            (
+                SemanticParagraphV1(
+                    anchor="section:1:paragraph:0002",
+                    spans=(
+                        SemanticTextSpanV1(
+                            role=SemanticRole.TEXT,
+                            text=TAIL_SECTION_PARAGRAPH,
+                        ),
+                    ),
+                ),
+                SemanticParagraphV1(
+                    anchor="section:1:paragraph:0003",
+                    spans=(
+                        SemanticTextSpanV1(
+                            role=SemanticRole.TEXT,
+                            text=TAIL_SECTION_PARAGRAPH,
+                        ),
+                    ),
+                ),
             )
         )
-    tail_semantics = SemanticParagraphV1(
-        anchor="section:2:paragraph:0001",
-        spans=(SemanticTextSpanV1(role=SemanticRole.TEXT, text=TAIL_SECTION_PARAGRAPH),),
+    tail_semantics = (
+        ()
+        if duplicate_analysis_paragraph
+        else (
+            SemanticParagraphV1(
+                anchor="section:2:paragraph:0001",
+                spans=(SemanticTextSpanV1(role=SemanticRole.TEXT, text=TAIL_SECTION_PARAGRAPH),),
+            ),
+        )
     )
     base_v5 = replace(
         base_v5,
@@ -541,27 +600,121 @@ async def seed_article(
             paragraphs=(
                 *preserved_semantics,
                 *semantic_paragraphs,
-                tail_semantics,
+                *tail_semantics,
             ),
         ),
     )
-    publication_bytes = ProductionArtifactStore.canonical_json_bytes(
-        serialize_publication_document(base_v5)
-    )
-    publication_blob_id = await artifact_store.put_bytes(
-        publication_bytes,
-        bucket="m24-acceptance-publication",
-        mime_type="application/json",
-    )
-    publication_sha256 = hashlib.sha256(publication_bytes).hexdigest()
-    publication = ProductionArtifact(
-        production_run_id=run.id,
-        subject_id=subject.id,
-        stage=ProductionArtifactStage.PUBLICATION,
-        version=1,
-        input_hash=publication_sha256,
-        canonical_blob_id=publication_blob_id,
-    )
+    m23_table: PublicationTableV1 | None = None
+    m23_figure: PublicationSourceFigureV1 | None = None
+    m23_element_placements: tuple[ResolvedPublicationPlacementV1, ...] = ()
+    if include_m23_article_elements:
+        if not duplicate_analysis_paragraph:
+            raise ValueError("M23 browser elements require the duplicate-paragraph fixture")
+        table_anchor_id = uuid4()
+        figure_anchor_id = uuid4()
+        m23_table = PublicationTableV1(
+            key="d2-article-a-table",
+            kind=EnrichmentTableKind.CUSTOM,
+            title="M23 D2 source table",
+            caption="Synthetic table already rendered in the article.",
+            columns=(
+                PublicationTableColumnV1(key="item", label="Item"),
+                PublicationTableColumnV1(key="detail", label="Detail"),
+            ),
+            rows=(
+                PublicationTableRowV1(
+                    cells=("fixture", "M23-D2-TABLE-CELL-UNIQUE"),
+                    evidence_refs=article_format_evidence_refs[:1],
+                ),
+            ),
+            placement=EnrichmentPlacementV1(
+                kind=EnrichmentPlacementKind.AFTER_PARAGRAPH,
+                anchor_block_id=table_anchor_id,
+            ),
+        )
+        sources = document.sources
+        if not sources:
+            raise ValueError("The M23 browser figure requires a canonical publication source")
+        figure_source = sources[0]
+        figure_bytes = (
+            b'<svg xmlns="http://www.w3.org/2000/svg" width="240" height="80" '
+            b'viewBox="0 0 240 80"><rect x="2" y="2" width="236" height="76" '
+            b'rx="8" fill="#e8f0fe" stroke="#3157a4"/><path d="M40 40h160" '
+            b'stroke="#3157a4" stroke-width="4"/><circle cx="40" cy="40" r="10" '
+            b'fill="#3157a4"/><circle cx="200" cy="40" r="10" fill="#3157a4"/>'
+            b"</svg>"
+        )
+        figure_locator = SourceFigureLocatorV1(
+            section="Analyse synthetique",
+            figure_label="Figure de test M23 D2",
+        )
+        figure_manifest = await MediaAssetStore(artifact_store, uow_factory).put(
+            figure_bytes,
+            kind=MediaAssetKind.SOURCE_FIGURE,
+            mime_type="image/svg+xml",
+            source="m24-real-browser-fixture",
+            policy_version="m24-real-browser-fixture-v1",
+            provenance="Synthetic SVG created only for the M24 real-browser fixture.",
+            locator={"section": "Analyse synthetique", "figure_label": "Figure de test M23 D2"},
+            decision="accepted",
+        )
+        m23_figure = PublicationSourceFigureV1(
+            key="d2-article-b-figure",
+            asset_id=figure_manifest.asset_id,
+            sha256=figure_manifest.sha256,
+            mime_type=figure_manifest.mime_type,
+            byte_size=figure_manifest.byte_size,
+            source_document_id=figure_source.source_document_id,
+            source_url=figure_source.canonical_url,
+            caption="M23-D2-ARTICLE-FIGURE-UNIQUE",
+            provenance="Synthetic source figure for the real-browser fixture.",
+            locator=figure_locator,
+            placement=EnrichmentPlacementV1(
+                kind=EnrichmentPlacementKind.AFTER_PARAGRAPH,
+                anchor_block_id=figure_anchor_id,
+            ),
+        )
+        document = replace(document, tables=(m23_table,), figures=(m23_figure,))
+        text_anchors = publication_document_text_anchors(document, references=base_v5.references)
+        base_v5 = replace(
+            base_v5,
+            document=document,
+            semantic_text=SemanticTextV1(
+                schema_version=base_v5.semantic_text.schema_version,
+                policy_version=base_v5.semantic_text.policy_version,
+                paragraphs=tuple(
+                    SemanticParagraphV1(
+                        anchor=anchor,
+                        spans=(SemanticTextSpanV1(role=SemanticRole.TEXT, text=text),),
+                    )
+                    for anchor, text in text_anchors.items()
+                ),
+            ),
+        )
+        m23_element_placements = (
+            ResolvedPublicationPlacementV1(
+                element_kind="table",
+                element_key=m23_table.key,
+                element_position=0,
+                anchor_block_id=table_anchor_id,
+                anchor_pointer="/sections/1/paragraphs/1",
+                anchor_canonical_position=3,
+                paragraph_kind="section",
+                section_index=1,
+                paragraph_index=1,
+            ),
+            ResolvedPublicationPlacementV1(
+                element_kind="figure",
+                element_key=m23_figure.key,
+                element_position=1,
+                anchor_block_id=figure_anchor_id,
+                anchor_pointer="/sections/1/paragraphs/2",
+                anchor_canonical_position=4,
+                paragraph_kind="section",
+                section_index=1,
+                paragraph_index=2,
+            ),
+        )
     indicators = [
         {
             "artifact_type": "hash",
@@ -771,6 +924,84 @@ async def seed_article(
         critical_source_diagnostics=(),
         decided_at=FIXED_NOW,
         decision_hash=hashlib.sha256(f"decision-{token}".encode()).hexdigest(),
+    )
+    publication_artifact_id = uuid4()
+    publication_document = base_v5
+    if include_m23_article_elements:
+        if m23_table is None or m23_figure is None:
+            raise RuntimeError("The M23 browser fixture elements were not built")
+        enrichment_payload = {
+            "tables": [
+                {
+                    "key": m23_table.key,
+                    "title": m23_table.title,
+                    "caption": m23_table.caption,
+                    "columns": [column.label for column in m23_table.columns],
+                    "rows": [list(row.cells) for row in m23_table.rows],
+                }
+            ],
+            "figures": [
+                {
+                    "key": m23_figure.key,
+                    "sha256": m23_figure.sha256,
+                    "caption": m23_figure.caption,
+                    "source_document_id": str(m23_figure.source_document_id),
+                }
+            ],
+        }
+        enrichment_sha256 = hashlib.sha256(
+            ProductionArtifactStore.canonical_json_bytes(enrichment_payload)
+        ).hexdigest()
+        registry_payload = [
+            {
+                "element_kind": placement.element_kind,
+                "element_key": placement.element_key,
+                "anchor_pointer": placement.anchor_pointer,
+                "anchor_block_id": str(placement.anchor_block_id),
+            }
+            for placement in m23_element_placements
+        ]
+        registry_hash = hashlib.sha256(
+            ProductionArtifactStore.canonical_json_bytes({"placements": registry_payload})
+        ).hexdigest()
+        base_v6 = PublicationDocumentV6(
+            base_publication=base_v5,
+            provenance=PublicationDocumentV6ProvenanceV1(
+                base_publication_artifact_id=publication_artifact_id,
+                base_publication_sha256=publication_document_v5_sha256(base_v5),
+            ),
+        )
+        base_v7 = PublicationDocumentV7(
+            base_publication=base_v6,
+            publication_kind=PublicationKind.ARTICLE,
+            routing_decision_hash=routing_decision.decision_hash,
+            routing_policy_version=routing_decision.policy_version,
+        )
+        publication_document = PublicationDocumentV9(
+            base_publication=base_v7,
+            article_format=build_article_format_v1(base_v5, article_format_extraction),
+            registry_hash=registry_hash,
+            synthesis_canonical_sha256=synthesis_sha256,
+            enrichment_canonical_sha256=enrichment_sha256,
+            resolved_placements=m23_element_placements,
+        )
+    publication_bytes = ProductionArtifactStore.canonical_json_bytes(
+        serialize_publication_document(publication_document)
+    )
+    publication_blob_id = await artifact_store.put_bytes(
+        publication_bytes,
+        bucket="m24-acceptance-publication",
+        mime_type="application/json",
+    )
+    publication_sha256 = hashlib.sha256(publication_bytes).hexdigest()
+    publication = ProductionArtifact(
+        production_run_id=run.id,
+        subject_id=subject.id,
+        stage=ProductionArtifactStage.PUBLICATION,
+        version=1,
+        input_hash=publication_sha256,
+        canonical_blob_id=publication_blob_id,
+        id=publication_artifact_id,
     )
     async with uow_factory() as uow:
         assert await uow.editions.add_if_absent(edition)
