@@ -12,13 +12,20 @@ an MCP server. The shim:
 * signs every backend request with the exact D7 scheme
   ``v1=HMAC-SHA256(secret, method\\0path+query\\0session_id\\0sha256(body)\\0
   idempotency_key\\0timestamp)`` and a deterministic ``mcp.v1`` client key;
+* speaks HTTP/1.1 over the supervisor's pathname AF_UNIX broker relay socket
+  with exactly the relay's header whitelist (no ``Host``, no ``Connection``),
+  one request per connection, and maps the relay's typed failures to
+  ``not_sent``/``outcome_unknown`` tool results without ever retrying;
 * treats backend output as untrusted data: it is returned inside an explicit
   ``data_not_instructions`` envelope and truncated only with
   ``truncated``/``omitted_bytes``.
 
 It is a standalone stdlib script copied with :mod:`catalog` into the session
-config; it never imports backend or agent code and opens no outbound
-connection except to the supervisor-provided loopback backend URL.
+config; it never imports backend, relay or agent code and opens no outbound
+connection except one AF_UNIX connection to the supervisor-provided relay
+socket. The loopback HTTP backend transport is retained **only** for the
+existing test harnesses (it is unreachable inside the sandbox netns) and will
+be removed by a later lot once the adapters hand the shim a relay socket.
 
 Normative sources: ``docs/design/investigation-workshop/SESSION-RUNNER.md``
 §3/§7 and ``docs/adr/ADR-0011-investigation-workshop-coordination.md`` D7.
@@ -35,6 +42,7 @@ import json
 import os
 import re
 import socket
+import stat
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -45,7 +53,7 @@ from urllib.parse import urlsplit
 try:  # imported as ``sidecars.workspace_agent.sessions.shim`` in tests
     from . import catalog
 except ImportError:  # executed as ``python3 <session>/shim.py``
-    import catalog
+    import catalog  # type: ignore[import-not-found,no-redef]
 
 JSONRPC_VERSION = "2.0"
 SERVER_NAME = "autowork-session-shim"
@@ -56,7 +64,60 @@ SESSION_SECRET_BYTES = 32
 SECRET_READ_TIMEOUT_SECONDS = 10.0
 PR_SET_DUMPABLE = 4
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1"})
+BROKER_SOCKET_ENV = "AUTOWORK_BROKER_SOCKET"
+BACKEND_URL_ENV = "AUTOWORK_BACKEND_URL"
+# ``sockaddr_un.sun_path`` is 108 bytes including the terminating NUL.
+MAX_UNIX_SOCKET_PATH_BYTES = 107
+RESPONSE_HEADER_LIMIT_BYTES = 64 * 1024
 _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+_STATUS_CODE = re.compile(r"[0-9]{3}")
+_CONTENT_LENGTH = re.compile(r"[0-9]+")
+_HEADER_VALUE = re.compile(r"[\x20-\x7e]*")
+
+# The relay forwards exactly these headers and refuses any other (BROKER-RELAY-
+# EGRESS.md §4). ``Host`` and ``Connection`` are deliberately absent: the shim
+# writes the request by hand and closes the connection itself.
+RELAY_REQUEST_HEADERS = frozenset(
+    {
+        "content-type",
+        "accept",
+        "accept-encoding",
+        "user-agent",
+        "content-length",
+        "idempotency-key",
+        "x-autowork-agent-session",
+        "x-autowork-agent-timestamp",
+        "x-autowork-agent-signature",
+    }
+)
+
+RELAY_ERROR_SCHEMA = "autowork-session-relay-error.v1"
+OUTCOME_NOT_SENT = "not_sent"
+OUTCOME_UNKNOWN = "outcome_unknown"
+ERROR_BACKEND_UNREACHABLE = "backend_unreachable"
+ERROR_BACKEND_OUTCOME_UNKNOWN = "backend_outcome_unknown"
+ERROR_CONSULTATION_PENDING = "consultation_pending_reconciliation"
+RELAY_TIMEOUT_CODE = "relay_timeout"
+# Relay failures that happened strictly before any byte reached the backend.
+RELAY_NOT_SENT_CODES = frozenset(
+    {
+        "relay_backend_unreachable",
+        "relay_session_inactive",
+        "relay_operation_not_allowed",
+        "relay_manifest_missing",
+        "relay_binding_mismatch",
+        "relay_request_too_large",
+    }
+)
+# Relay failures whose backend effect is ambiguous. ``relay_response_too_large``
+# means the backend executed but the shim never saw the result.
+RELAY_AMBIGUOUS_CODES = frozenset({"relay_backend_outcome_unknown", "relay_response_too_large"})
+# An identical deliberate replay is advertised only for the two task commands
+# whose catalogue description promises recorded-command replay on the same D7
+# idempotency key. Every other tool stays False by default: the shim cannot
+# prove the backend key covers the effect, and ``advisor.consult`` ambiguity
+# must be reconciled, never resubmitted.
+IDEMPOTENT_REPLAY_TOOLS = frozenset({"task.heartbeat", "task.submit_result"})
 
 PARSE_ERROR = -32700
 INVALID_REQUEST = -32600
@@ -76,6 +137,22 @@ class ShimConfigError(RuntimeError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+class RelayLegError(Exception):
+    """The AF_UNIX request to the relay produced no complete response."""
+
+
+class RelayNotSent(RelayLegError):
+    """Connect failed before any request byte left the shim: ``not_sent``."""
+
+
+class RelayOutcomeUnknown(RelayLegError):
+    """The request was written; the response is missing or unusable.
+
+    The shim can never prove the relay did not forward it, so the tool result
+    must say ``outcome_unknown`` and must not attempt a second send.
+    """
 
 
 @dataclass(frozen=True)
@@ -108,7 +185,8 @@ class BackendTarget:
 class SessionConfig:
     session_id: str
     socket_path: str
-    backend_url: str
+    backend_url: str | None
+    broker_socket: str | None
 
 
 def parse_backend_url(raw: str) -> BackendTarget:
@@ -171,7 +249,13 @@ def client_key(session_id: str, broker_name: str, arguments: Mapping[str, object
 
 
 class HttpTransport:
-    """Direct loopback HTTP; redirects are never followed and proxies ignored."""
+    """TEST-HARNESS-ONLY loopback HTTP transport (to be removed with URL mode).
+
+    The existing shim oracles drive the shim against a fake loopback backend.
+    A real sandbox (``bwrap --unshare-net``) cannot reach host loopback, so this
+    is never a production path; the adapters hand the shim a relay socket
+    instead. Redirects are never followed and proxies ignored.
+    """
 
     def __init__(self, target: BackendTarget) -> None:
         self._target = target
@@ -214,6 +298,132 @@ class HttpTransport:
             connection.close()
 
 
+class UnixHttpTransport:
+    """Production transport: one hand-written HTTP/1.1 request over the relay UDS.
+
+    ``http.client`` would add ``Host``/``Accept-Encoding`` and possibly
+    ``Connection``, which the relay's closed header whitelist refuses
+    (BROKER-RELAY-EGRESS.md §4), so the request is serialized here. There is no
+    query string, no pipelining and no second attempt: one request per
+    connection, closed by the shim after the response.
+    """
+
+    def __init__(self, socket_path: str) -> None:
+        self._socket_path = socket_path
+
+    def send(
+        self,
+        *,
+        method: str,
+        path: str,
+        headers: Mapping[str, str],
+        body: bytes,
+        timeout: float,
+    ) -> HttpResponse:
+        payload = _relay_request_bytes(method=method, path=path, headers=headers, body=body)
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            connection.settimeout(timeout)
+            try:
+                connection.connect(self._socket_path)
+            except OSError as exc:
+                raise RelayNotSent("relay_connect_failed") from exc
+            try:
+                connection.sendall(payload)
+            except OSError as exc:
+                # Part of the request may already be in the relay; never claim
+                # it was not forwarded.
+                raise RelayOutcomeUnknown("relay_write_interrupted") from exc
+            try:
+                return _read_relay_response(connection)
+            except (OSError, ValueError) as exc:
+                raise RelayOutcomeUnknown("relay_response_unusable") from exc
+        finally:
+            connection.close()
+
+
+def _relay_request_bytes(
+    *,
+    method: str,
+    path: str,
+    headers: Mapping[str, str],
+    body: bytes,
+) -> bytes:
+    """Serialize the exact relay request; anything outside the whitelist is a bug."""
+    if method != "POST" or not path.startswith("/") or "?" in path or "#" in path:
+        raise ValueError("relay_request_target_invalid")
+    entries: list[tuple[str, str]] = []
+    for name, value in headers.items():
+        if name.lower() not in RELAY_REQUEST_HEADERS:
+            raise ValueError("relay_header_not_allowed")
+        if _HEADER_VALUE.fullmatch(value) is None:
+            raise ValueError("relay_header_value_invalid")
+        if name.lower() == "content-length" and value != str(len(body)):
+            raise ValueError("relay_content_length_mismatch")
+        entries.append((name, value))
+    if not any(name.lower() == "content-length" for name, _ in entries):
+        entries.append(("Content-Length", str(len(body))))
+    lines = [f"{method} {path} HTTP/1.1\r\n".encode("ascii")]
+    lines.extend(f"{name}: {value}\r\n".encode("latin-1") for name, value in entries)
+    lines.append(b"\r\n")
+    return b"".join(lines) + body
+
+
+def _read_relay_response(connection: socket.socket) -> HttpResponse:
+    """Read one bounded response; any truncation is an ambiguous outcome."""
+    buffer = bytearray()
+    while b"\r\n\r\n" not in buffer:
+        if len(buffer) > RESPONSE_HEADER_LIMIT_BYTES:
+            raise RelayOutcomeUnknown("relay_response_header_too_large")
+        chunk = connection.recv(65536)
+        if not chunk:
+            raise RelayOutcomeUnknown("relay_response_incomplete")
+        buffer.extend(chunk)
+    head, _, rest = bytes(buffer).partition(b"\r\n\r\n")
+    status, content_type, length = _parse_response_head(head)
+    limit = min(length, catalog.MAX_RESPONSE_READ_BYTES)
+    kept = bytearray(rest[:limit])
+    while len(kept) < limit:
+        chunk = connection.recv(min(65536, limit - len(kept)))
+        if not chunk:
+            raise RelayOutcomeUnknown("relay_response_incomplete")
+        kept.extend(chunk)
+    return HttpResponse(
+        status=status,
+        content_type=content_type,
+        body=bytes(kept),
+        read_ceiling_hit=length > catalog.MAX_RESPONSE_READ_BYTES,
+    )
+
+
+def _parse_response_head(head: bytes) -> tuple[int, str, int]:
+    lines = head.split(b"\r\n")
+    try:
+        status_line = lines[0].decode("latin-1").split(" ", 2)
+    except (IndexError, UnicodeDecodeError) as exc:
+        raise ValueError("relay_response_status_line") from exc
+    if len(status_line) < 2 or status_line[0] != "HTTP/1.1":
+        raise ValueError("relay_response_status_line")
+    if _STATUS_CODE.fullmatch(status_line[1]) is None:
+        raise ValueError("relay_response_status_invalid")
+    status = int(status_line[1])
+    if not 100 <= status <= 599:
+        raise ValueError("relay_response_status_invalid")
+    headers: dict[str, str] = {}
+    for raw in lines[1:]:
+        name, separator, value = raw.partition(b":")
+        if not separator or not name:
+            raise ValueError("relay_response_header_invalid")
+        try:
+            headers[name.strip().lower().decode("ascii")] = value.strip().decode("latin-1")
+        except UnicodeDecodeError as exc:
+            raise ValueError("relay_response_header_invalid") from exc
+    raw_length = headers.get("content-length")
+    if raw_length is None or _CONTENT_LENGTH.fullmatch(raw_length) is None or len(raw_length) > 18:
+        raise ValueError("relay_response_content_length")
+    return status, headers.get("content-type", ""), int(raw_length)
+
+
 class ShimServer:
     """The MCP request handler and its fixed backend client."""
 
@@ -222,7 +432,8 @@ class ShimServer:
         *,
         session_id: str,
         secret: bytes | bytearray,
-        backend_url: str,
+        backend_url: str | None = None,
+        broker_socket: str | None = None,
         clock: Callable[[], int] | None = None,
         transport: Transport | None = None,
         catalogue: Sequence[catalog.ToolSpec] = catalog.CATALOGUE,
@@ -231,11 +442,21 @@ class ShimServer:
             raise ShimConfigError("session_id_invalid")
         if not secret:
             raise ShimConfigError("secret_missing")
+        if backend_url is not None and broker_socket is not None:
+            raise ShimConfigError("session_transport_conflict")
+        if transport is None and backend_url is None and broker_socket is None:
+            raise ShimConfigError("session_config_missing")
         self._session_id = session_id
         self._secret = bytearray(secret)
-        self._target = parse_backend_url(backend_url)
+        self._target = parse_backend_url(backend_url) if backend_url is not None else None
         self._clock = clock if clock is not None else (lambda: int(time.time()))
-        self._transport = transport if transport is not None else HttpTransport(self._target)
+        if transport is not None:
+            self._transport = transport
+        elif broker_socket is not None:
+            self._transport = UnixHttpTransport(validate_broker_socket(broker_socket))
+        else:
+            assert self._target is not None
+            self._transport = HttpTransport(self._target)
         self._catalogue = tuple(catalogue)
         self._by_name = catalog.by_mcp_name(self._catalogue)
 
@@ -256,10 +477,12 @@ class ShimServer:
                     self._error(None, PARSE_ERROR, "parse_error", {"code": "frame_too_large"}),
                 )
                 return 2
-            if not line.strip():
+            # mypy cannot narrow an identity check against a plain sentinel.
+            frame = cast(bytes, line)
+            if not frame.strip():
                 continue
             try:
-                response = self.handle_line(line)
+                response = self.handle_line(frame)
             except Exception:  # protocol boundary: never leak a traceback or secret
                 response = self._error(None, INTERNAL_ERROR, "internal_error")
             if response is not None:
@@ -375,7 +598,23 @@ class ShimServer:
                 body=body,
                 timeout=spec.timeout_seconds,
             )
+        except RelayNotSent:
+            return self._relay_failure_result(
+                request_id,
+                spec,
+                error=ERROR_BACKEND_UNREACHABLE,
+                outcome=OUTCOME_NOT_SENT,
+            )
+        except RelayOutcomeUnknown:
+            return self._relay_failure_result(
+                request_id,
+                spec,
+                error=_ambiguity_error(spec),
+                outcome=OUTCOME_UNKNOWN,
+            )
         except (OSError, http.client.HTTPException):
+            # The retained loopback test transport cannot classify the failure;
+            # keep its historical result rather than inventing an outcome.
             return self._result(
                 request_id,
                 self._tool_result(
@@ -383,6 +622,16 @@ class ShimServer:
                     is_error=True,
                     max_bytes=spec.max_response_bytes,
                 ),
+            )
+        relay_failure = _relay_failure_of(response, spec)
+        if relay_failure is not None:
+            error, outcome, relay_error = relay_failure
+            return self._relay_failure_result(
+                request_id,
+                spec,
+                error=error,
+                outcome=outcome,
+                relay_error=relay_error,
             )
         envelope = _response_envelope(response, spec.max_response_bytes)
         return self._result(
@@ -428,6 +677,29 @@ class ShimServer:
             "omitted_bytes": 0,
             "omitted_bytes_complete": True,
         }
+
+    def _relay_failure_result(
+        self,
+        request_id: object,
+        spec: catalog.ToolSpec,
+        *,
+        error: str,
+        outcome: str,
+        relay_error: str | None = None,
+    ) -> dict[str, object]:
+        """One typed relay/transport failure; never retried, never detailed."""
+        envelope = self._failure_envelope()
+        envelope["error"] = error
+        envelope["outcome"] = outcome
+        envelope["retryable"] = False
+        if relay_error is not None:
+            envelope["relay_error"] = relay_error
+        if outcome == OUTCOME_UNKNOWN:
+            envelope["idempotent_replay_allowed"] = _idempotent_replay_allowed(spec)
+        return self._result(
+            request_id,
+            self._tool_result(envelope, is_error=True, max_bytes=spec.max_response_bytes),
+        )
 
     def _tool_result(
         self, envelope: Mapping[str, object], *, is_error: bool, max_bytes: int
@@ -502,6 +774,56 @@ def _is_json_content(content_type: str) -> bool:
     return mime == "application/json" or mime.endswith("+json")
 
 
+def _relay_error_payload(response: HttpResponse) -> dict[str, object] | None:
+    """The relay's typed rejection envelope, recognized by its closed schema."""
+    if not _is_json_content(response.content_type):
+        return None
+    try:
+        payload = json.loads(response.body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("schema") != RELAY_ERROR_SCHEMA:
+        return None
+    return payload
+
+
+def _relay_error_is_ambiguous(code: str, details: object) -> bool:
+    if code in RELAY_AMBIGUOUS_CODES:
+        return True
+    if code == RELAY_TIMEOUT_CODE:
+        # ``outcome_unknown`` is authoritative; anything else is conservative.
+        return not (isinstance(details, Mapping) and details.get("outcome_unknown") is False)
+    if code in RELAY_NOT_SENT_CODES:
+        return False
+    return True
+
+
+def _ambiguity_error(spec: catalog.ToolSpec) -> str:
+    """An ambiguous ``advisor.consult`` must be reconciled, never resubmitted."""
+    if spec.broker_name == "advisor.consult":
+        return ERROR_CONSULTATION_PENDING
+    return ERROR_BACKEND_OUTCOME_UNKNOWN
+
+
+def _relay_failure_of(
+    response: HttpResponse, spec: catalog.ToolSpec
+) -> tuple[str, str, str] | None:
+    """Map a relay rejection to ``(error, outcome, relay_error)``; None if not one."""
+    payload = _relay_error_payload(response)
+    if payload is None:
+        return None
+    raw_code = payload.get("error")
+    code = raw_code if isinstance(raw_code, str) and raw_code else "relay_rejected"
+    if _relay_error_is_ambiguous(code, payload.get("details")):
+        return _ambiguity_error(spec), OUTCOME_UNKNOWN, code
+    return code, OUTCOME_NOT_SENT, code
+
+
+def _idempotent_replay_allowed(spec: catalog.ToolSpec) -> bool:
+    """Prudent default: only the task commands document identical replay."""
+    return spec.broker_name in IDEMPOTENT_REPLAY_TOOLS
+
+
 def _text_or_base64(body: bytes, truncated: bool) -> object:
     if not truncated:
         try:
@@ -539,18 +861,50 @@ def _read_bounded_line(stream: BinaryIO, limit: int) -> bytes | _FrameTooLarge |
             return _FRAME_TOO_LARGE
 
 
+def validate_broker_socket(raw: str) -> str:
+    """Fail closed unless this is a usable pathname AF_UNIX socket.
+
+    Abstract sockets are refused by construction (the path must be absolute),
+    a pathname socket must already exist (the relay binds it before the run),
+    and the serialized path must fit ``sockaddr_un.sun_path``.
+    """
+    path = raw.strip()
+    if not path or not os.path.isabs(path):
+        raise ShimConfigError("broker_socket_not_absolute")
+    if len(os.fsencode(path)) > MAX_UNIX_SOCKET_PATH_BYTES:
+        raise ShimConfigError("broker_socket_path_too_long")
+    try:
+        info = os.stat(path)
+    except OSError as exc:
+        raise ShimConfigError("broker_socket_missing") from exc
+    if not stat.S_ISSOCK(info.st_mode):
+        raise ShimConfigError("broker_socket_not_socket")
+    return path
+
+
 def load_session_config(environ: Mapping[str, str] | None = None) -> SessionConfig:
     source = os.environ if environ is None else environ
     session_id = source.get("AUTOWORK_SESSION_ID", "").strip()
     socket_path = source.get("AUTOWORK_SESSION_SOCKET", "").strip()
-    backend_url = source.get("AUTOWORK_BACKEND_URL", "").strip()
-    if not session_id or not socket_path or not backend_url:
+    backend_url = source.get(BACKEND_URL_ENV, "").strip()
+    broker_socket = source.get(BROKER_SOCKET_ENV, "").strip()
+    if not session_id or not socket_path or not (backend_url or broker_socket):
         raise ShimConfigError("session_config_missing")
+    if backend_url and broker_socket:
+        # One request path, chosen once: never a fallback from one to the other.
+        raise ShimConfigError("session_transport_conflict")
     if _UUID.fullmatch(session_id) is None:
         raise ShimConfigError("session_id_invalid")
     if not os.path.isabs(socket_path):
         raise ShimConfigError("session_socket_invalid")
-    return SessionConfig(session_id=session_id, socket_path=socket_path, backend_url=backend_url)
+    if broker_socket:
+        broker_socket = validate_broker_socket(broker_socket)
+    return SessionConfig(
+        session_id=session_id,
+        socket_path=socket_path,
+        backend_url=backend_url or None,
+        broker_socket=broker_socket or None,
+    )
 
 
 def read_session_secret(
@@ -615,6 +969,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             session_id=config.session_id,
             secret=secret,
             backend_url=config.backend_url,
+            broker_socket=config.broker_socket,
         )
         secret[:] = bytes(len(secret))
     except ShimConfigError as exc:
