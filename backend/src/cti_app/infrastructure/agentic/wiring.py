@@ -14,7 +14,7 @@ both members are ``None``, so ``SessionService`` refuses with its typed
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from types import MappingProxyType
@@ -61,13 +61,29 @@ from cti_app.infrastructure.agentic.host_operator import (
 from cti_app.infrastructure.agentic.host_sessions import HttpHostSessionsClient
 from cti_app.infrastructure.agentic.secret_delivery import HostSessionSecretDelivery
 
+SessionAdapterKindResolver = Callable[[UUID], Awaitable[OperatorAdapterKind | None]]
+"""Resolve a session's persisted adapter kind after a process restart (F2-D)."""
+
 
 class DispatchingOperatorPort:
-    """One mounted port routing each call to the adapter for its kind."""
+    """One mounted port routing each call to the adapter for its kind.
 
-    def __init__(self, adapters: Mapping[OperatorAdapterKind, HostOperatorAdapter]) -> None:
+    The per-process ``_sessions`` map is only a cache: after a backend restart
+    it is empty, so a call that names only the session id (interrupt, status,
+    instruction, collect, reconcile) asks ``resolve_adapter_kind`` for the
+    persisted ``agent_sessions.adapter_kind`` instead of failing with "no
+    prepared adapter in this process" (F2-D).
+    """
+
+    def __init__(
+        self,
+        adapters: Mapping[OperatorAdapterKind, HostOperatorAdapter],
+        *,
+        resolve_adapter_kind: SessionAdapterKindResolver | None = None,
+    ) -> None:
         self._adapters = dict(adapters)
         self._sessions: dict[UUID, OperatorAdapterKind] = {}
+        self._resolve_adapter_kind = resolve_adapter_kind
 
     @property
     def adapter_kind(self) -> OperatorAdapterKind:
@@ -88,26 +104,26 @@ class DispatchingOperatorPort:
         return await self._adapter(request.adapter_kind).start_session(request)
 
     async def get_session_status(self, request: SessionStatusRequest) -> SessionProcessStatusV1:
-        return await self._adapter_for(request.session_id).get_session_status(request)
+        return await (await self._adapter_for(request.session_id)).get_session_status(request)
 
     async def send_instruction(self, request: SendInstructionRequest) -> InstructionReceiptV1:
-        return await self._adapter_for(request.session_id).send_instruction(request)
+        return await (await self._adapter_for(request.session_id)).send_instruction(request)
 
     async def request_handoff(self, request: RequestHandoffRequest) -> HandoffRequestReceiptV1:
-        return await self._adapter_for(request.session_id).request_handoff(request)
+        return await (await self._adapter_for(request.session_id)).request_handoff(request)
 
     async def interrupt_session(self, request: InterruptSessionRequest) -> InterruptSessionResultV1:
-        return await self._adapter_for(request.session_id).interrupt_session(request)
+        return await (await self._adapter_for(request.session_id)).interrupt_session(request)
 
     async def resume_session(self, request: ResumeSessionRequest) -> ResumeSessionResultV1:
         self._sessions[request.session_id] = request.adapter_kind
         return await self._adapter(request.adapter_kind).resume_session(request)
 
     async def collect_results(self, request: CollectResultsRequest) -> OperatorResultsV1:
-        return await self._adapter_for(request.session_id).collect_results(request)
+        return await (await self._adapter_for(request.session_id)).collect_results(request)
 
     async def reconcile_session(self, request: ReconcileSessionRequest) -> SessionReconciliationV1:
-        return await self._adapter_for(request.session_id).reconcile_session(request)
+        return await (await self._adapter_for(request.session_id)).reconcile_session(request)
 
     def _adapter(self, kind: OperatorAdapterKind) -> HostOperatorAdapter:
         adapter = self._adapters.get(kind)
@@ -115,8 +131,14 @@ class DispatchingOperatorPort:
             raise HostSessionContractError(f"no operator adapter is wired for {kind.value}")
         return adapter
 
-    def _adapter_for(self, session_id: UUID) -> HostOperatorAdapter:
+    async def _adapter_for(self, session_id: UUID) -> HostOperatorAdapter:
         kind = self._sessions.get(session_id)
+        if kind is None and self._resolve_adapter_kind is not None:
+            # Restart recovery: the adapter kind is canonical, so read it from
+            # the persisted session rather than failing the operation.
+            kind = await self._resolve_adapter_kind(session_id)
+            if kind is not None:
+                self._sessions[session_id] = kind
         if kind is None:
             raise HostSessionContractError("this process has no prepared adapter for the session")
         return self._adapter(kind)
@@ -179,11 +201,19 @@ def build_session_runtime(
         settings=settings,
         clock=clock,
     )
+
+    async def resolve_adapter_kind(session_id: UUID) -> OperatorAdapterKind | None:
+        """Read the canonical adapter kind so a restarted process can dispatch."""
+        async with uow_factory() as uow:
+            session = await uow.agent_sessions.get(session_id)
+        return None if session is None else session.adapter_kind
+
     return build_agentic_operator_ports(
         settings,
         context_provider=context_provider,
         transport=transport,
         clock=clock,
+        resolve_adapter_kind=resolve_adapter_kind,
     )
 
 
@@ -193,6 +223,7 @@ def build_agentic_operator_ports(
     context_provider: HostSessionContextProvider | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
     clock: Callable[[], datetime] | None = None,
+    resolve_adapter_kind: SessionAdapterKindResolver | None = None,
 ) -> AgenticOperatorPorts:
     """Build both adapters and the secret delivery, or a fail-closed empty set."""
     socket_path = settings.workspace_agent_socket.strip()
@@ -223,7 +254,7 @@ def build_agentic_operator_ports(
         ),
     }
     return AgenticOperatorPorts(
-        operator=DispatchingOperatorPort(adapters),
+        operator=DispatchingOperatorPort(adapters, resolve_adapter_kind=resolve_adapter_kind),
         secret_delivery=HostSessionSecretDelivery(host=host, preparations=preparations),
         host_sessions=host,
         adapters=MappingProxyType(adapters),
@@ -233,6 +264,7 @@ def build_agentic_operator_ports(
 __all__ = [
     "AgenticOperatorPorts",
     "DispatchingOperatorPort",
+    "SessionAdapterKindResolver",
     "build_agentic_operator_ports",
     "build_session_runtime",
 ]
