@@ -42,6 +42,8 @@ from cti_app.application.agent_session_verification import (
 from cti_app.application.agentic_sessions import (
     MAX_ACK_INSTRUCTION_IDS,
     MAX_PULL_INSTRUCTIONS,
+    MAX_SUMMARY_INSTRUCTIONS,
+    MAX_SUMMARY_OPERATIONS,
     AgentSessionSecretDeliveryPort,
     PreparedAgentSession,
     SessionConflictError,
@@ -65,6 +67,7 @@ from cti_app.application.investigation_persistence import (
     InMemoryAgentSessionRepository,
     InMemoryInvestigationHandoffRepository,
     InMemoryInvestigationTaskRepository,
+    InMemoryToolInvocationRepository,
     InvestigationHandoffRepository,
     InvestigationTaskRepository,
 )
@@ -107,6 +110,7 @@ from cti_app.domain.agentic_operator import (
     instruction_text_sha256,
 )
 from cti_app.domain.investigation import (
+    BudgetDimension,
     DisclosureBounds,
     EnvelopeAuthorityKind,
     InvestigationBudget,
@@ -114,6 +118,7 @@ from cti_app.domain.investigation import (
     TLPLevel,
     ToolInvocation,
     ToolInvocationActorKind,
+    ToolInvocationStatus,
 )
 from cti_app.domain.investigation_handoff import (
     HandoffActor,
@@ -201,6 +206,7 @@ class _FakeUnitOfWork:
         self.investigation_tasks: InvestigationTaskRepository = harness.repository
         self.investigation_handoffs: InvestigationHandoffRepository = harness.handoffs
         self.agent_sessions: AgentSessionRepository = harness.sessions
+        self.tool_invocations: Any = harness.invocations
 
     async def __aenter__(self) -> _FakeUnitOfWork:
         self._harness.transaction_depth += 1
@@ -460,6 +466,7 @@ class _Harness:
         self.tasks = InMemoryInvestigationTaskRepository(clock=lambda: NOW)
         self.handoffs = InMemoryInvestigationHandoffRepository()
         self.sessions = InMemoryAgentSessionRepository()
+        self.invocations = InMemoryToolInvocationRepository()
         self.investigations = _InvestigationRepository(self.investigation_id)
         self.decisions = _DecisionRepository()
         self.envelopes = _EnvelopeRepository()
@@ -2506,3 +2513,275 @@ async def test_capabilities_route_maps_an_unreachable_host_to_workspace_local_un
         )
     assert response.status_code == 503
     assert response.json()["detail"]["code"] == "workspace_local_unavailable"
+
+
+# ------------------------------------------------------ session summary (B6)
+
+
+async def _seed_invocation(
+    harness: _Harness,
+    session: AgentSessionV1,
+    *,
+    tool_name: str = "vt.lookup",
+    status: ToolInvocationStatus = ToolInvocationStatus.SUCCEEDED,
+    reserved_budget: dict[BudgetDimension, int] | None = None,
+    consumed_budget: dict[BudgetDimension, int] | None = None,
+    agent_session_id: UUID | None = None,
+    created_at: datetime = NOW,
+) -> ToolInvocation:
+    """One D7 operator journal row attributed to the session under test."""
+    invocation = ToolInvocation(
+        investigation_id=harness.investigation_id,
+        operation_key=f"operation-{uuid4()}",
+        tool_name=tool_name,
+        schema_version="1",
+        normalized_parameters={"target": "example.invalid"},
+        purpose="agentic tool call",
+        status=status,
+        reserved_budget=reserved_budget or {},
+        consumed_budget=consumed_budget or {},
+        task_id=session.task_id,
+        agent_session_id=agent_session_id or session.id,
+        actor_kind=ToolInvocationActorKind.OPERATOR,
+        actor_id=OPERATOR_ACTOR.actor_id,
+        created_at=created_at,
+        updated_at=created_at,
+    )
+    return await harness.invocations.add_if_absent(invocation)
+
+
+def _all_keys(value: Any) -> list[str]:
+    keys: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            keys.append(key)
+            keys.extend(_all_keys(item))
+    elif isinstance(value, list):
+        for item in value:
+            keys.extend(_all_keys(item))
+    return keys
+
+
+async def test_session_summary_exposes_operations_budget_handoff_instructions() -> None:
+    """B6 oracle: the panel reads ops/budget/broker/handoff/instructions truthfully."""
+    harness = _Harness()
+    task = await harness.seed_task()
+    handoff = await harness.add_handoff(task, version=2)
+    prepared = await harness.open(task=task, handoff=handoff)
+    session = prepared.session
+
+    budget = InvestigationBudget(
+        limits={BudgetDimension.VT_UNITS: 100, BudgetDimension.BRIDGE_TURNS: 4}
+    )
+    budget.reserve("journal-consumed", {BudgetDimension.VT_UNITS: 10})
+    budget.commit("journal-consumed", {BudgetDimension.VT_UNITS: 6})
+    budget.reserve("journal-held", {BudgetDimension.VT_UNITS: 5})
+    harness.envelopes.items[harness.investigation_id] = replace(
+        harness.envelopes.items[harness.investigation_id], budget=budget, version=2
+    )
+
+    succeeded = await _seed_invocation(
+        harness,
+        session,
+        reserved_budget={BudgetDimension.VT_UNITS: 10},
+        consumed_budget={BudgetDimension.VT_UNITS: 6},
+    )
+    ambiguous = await _seed_invocation(
+        harness,
+        session,
+        tool_name="advisor.consult",
+        status=ToolInvocationStatus.NEEDS_REVIEW,
+        reserved_budget={BudgetDimension.BRIDGE_TURNS: 1},
+        created_at=NOW + timedelta(seconds=5),
+    )
+    # A journal row from another session never leaks into this summary.
+    foreign = await _seed_invocation(
+        harness, session, agent_session_id=uuid4(), tool_name="shodan.host.lookup"
+    )
+
+    acknowledged = await _seed_instruction(
+        harness,
+        session,
+        state=InstructionState.ACKNOWLEDGED,
+        text="First human instruction",
+    )
+    queued = await _seed_instruction(
+        harness,
+        session,
+        state=InstructionState.QUEUED,
+        text="Second human instruction",
+        queued_at=NOW + timedelta(seconds=1),
+    )
+
+    app = _api_app(harness, LocalIdentityProvider("dev-analyst"))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            f"/api/investigations/{harness.investigation_id}/agent-sessions/{session.id}/summary"
+        )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+
+    assert payload["session_id"] == str(session.id)
+
+    operations = payload["operations"]
+    assert operations["total"] == 2
+    assert operations["limit"] == MAX_SUMMARY_OPERATIONS
+    assert operations["truncated"] is False
+    operation_ids = [item["invocation_id"] for item in operations["items"]]
+    assert operation_ids == [str(ambiguous.id), str(succeeded.id)]
+    assert str(foreign.id) not in operation_ids
+    assert operations["items"][0]["tool_name"] == "advisor.consult"
+    assert operations["items"][0]["status"] == "needs_review"
+    assert operations["items"][0]["actor_kind"] == "operator"
+    assert operations["items"][0]["reserved_budget"] == {"bridge_turns": 1}
+    assert operations["items"][1]["consumed_budget"] == {"vt_units": 6}
+    assert operations["items"][1]["created_at"] == NOW.isoformat()
+    assert operations["items"][1]["updated_at"] == NOW.isoformat()
+
+    session_budget = payload["budget"]["session"]
+    assert session_budget["invocation_count"] == 2
+    assert session_budget["consumed"]["vt_units"] == 6
+    assert session_budget["consumed"]["bridge_turns"] == 0
+    assert session_budget["reserved"]["vt_units"] == 10
+    assert session_budget["reserved"]["bridge_turns"] == 1
+
+    envelope = payload["budget"]["envelope"]
+    assert envelope["present"] is True
+    assert envelope["version"] == 2
+    assert envelope["limits"]["vt_units"] == 100
+    assert envelope["limits"]["bridge_turns"] == 4
+    assert envelope["consumed"]["vt_units"] == 6
+    assert envelope["reserved"]["vt_units"] == 5
+    assert envelope["remaining"]["vt_units"] == 89
+    assert envelope["remaining"]["bridge_turns"] == 4
+    assert envelope["remaining"]["downloads"] is None
+
+    broker = payload["broker"]
+    assert broker["derived_from"] == "tool_invocations_journal"
+    assert broker["signed_call_count"] == 2
+    assert broker["last_signed_call"]["invocation_id"] == str(ambiguous.id)
+    assert broker["last_signed_call"]["status"] == "needs_review"
+    assert broker["needs_review_count"] == 1
+    assert broker["reconciliation_required"] is True
+
+    handoff_payload = payload["handoff"]
+    assert handoff_payload["handoff_id"] == handoff.handoff_id
+    assert handoff_payload["version"] == 2
+    assert handoff_payload["sha256"] == handoff.content_sha256
+    assert handoff_payload["from_actor"]["kind"] == "human"
+    assert handoff_payload["freshness"] == {"checked": True, "state": "fresh", "diffs": []}
+
+    instructions = payload["instructions"]
+    assert instructions["total"] == 2
+    assert instructions["limit"] == MAX_SUMMARY_INSTRUCTIONS
+    assert instructions["truncated"] is False
+    assert [item["state"] for item in instructions["items"]] == ["acknowledged", "queued"]
+    assert [item["queue_position"] for item in instructions["items"]] == [0, 1]
+    assert instructions["items"][0]["instruction_id"] == str(acknowledged.id)
+    assert instructions["items"][0]["text"] == "First human instruction"
+    assert instructions["items"][0]["text_sha256"] == acknowledged.text_sha256
+    assert instructions["items"][0]["created_by"] == {
+        "kind": "human",
+        "actor_id": "analyst:test",
+    }
+    assert instructions["items"][1]["instruction_id"] == str(queued.id)
+    assert instructions["items"][1]["queued_at"] == (NOW + timedelta(seconds=1)).isoformat()
+
+
+async def test_session_summary_never_leaks_secret() -> None:
+    """B6 oracle: no session secret, auth material or delivery token is exposed."""
+    harness = _Harness()
+    task = await harness.seed_task()
+    prepared = await harness.open(task=task)
+    session = prepared.session
+    delivery = harness.fake_delivery
+    assert delivery is not None
+    secret = delivery.secret_for(session.id)
+    instruction = await _seed_instruction(
+        harness, session, state=InstructionState.DELIVERED, text="Rotate the gate."
+    )
+    assert instruction.delivery_token is not None
+
+    app = _api_app(harness, LocalIdentityProvider("dev-analyst"))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            f"/api/investigations/{harness.investigation_id}/agent-sessions/{session.id}/summary"
+        )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+
+    # The human text is the point of the panel; an over-redacted payload would fail here.
+    assert "Rotate the gate." in response.text
+    assert secret not in response.text
+    assert session.auth_secret_hash not in response.text
+    assert session.auth_secret_nonce.hex() not in response.text
+    assert str(instruction.delivery_token) not in response.text
+
+    keys = set(_all_keys(payload))
+    assert "secret" not in keys
+    assert "auth_secret_nonce" not in keys
+    assert "auth_secret_hash" not in keys
+    assert "delivery_token" not in keys
+
+
+async def test_session_summary_is_human_only_and_refuses_foreign_sessions() -> None:
+    """The summary is a verified-human read and never crosses investigations."""
+    harness = _Harness()
+    task = await harness.seed_task()
+    prepared = await harness.open(task=task)
+
+    app = _api_app(harness, LocalIdentityProvider("dev-analyst"))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        foreign = await client.get(
+            f"/api/investigations/{uuid4()}/agent-sessions/{prepared.session.id}/summary"
+        )
+        assert foreign.status_code == 404
+        assert foreign.json()["detail"]["code"] == "agent_session_not_found"
+
+        missing = await client.get(
+            f"/api/investigations/{harness.investigation_id}/agent-sessions/{uuid4()}/summary"
+        )
+        assert missing.status_code == 404
+        assert missing.json()["detail"]["code"] == "agent_session_not_found"
+
+    operator_client_app = _api_app(harness, _OperatorClientIdentity())
+    async with AsyncClient(
+        transport=ASGITransport(app=operator_client_app), base_url="http://test"
+    ) as client:
+        refused = await client.get(
+            f"/api/investigations/{harness.investigation_id}"
+            f"/agent-sessions/{prepared.session.id}/summary"
+        )
+    assert refused.status_code == 403
+    assert refused.json()["detail"]["code"] == "verified_human_operator_required"
+
+
+async def test_session_summary_windows_are_bounded() -> None:
+    """The summary response is bounded: 100 journal rows and 20 instructions."""
+    harness = _Harness()
+    task = await harness.seed_task()
+    prepared = await harness.open(task=task)
+    session = prepared.session
+
+    for index in range(MAX_SUMMARY_OPERATIONS + 1):
+        await _seed_invocation(harness, session, created_at=NOW + timedelta(seconds=index))
+    for index in range(MAX_SUMMARY_INSTRUCTIONS + 1):
+        await _seed_instruction(
+            harness,
+            session,
+            text=f"instruction {index}",
+            queued_at=NOW + timedelta(seconds=index),
+        )
+
+    summary = await harness.service.summary(harness.investigation_id, session.id)
+
+    assert summary["operations"]["total"] == MAX_SUMMARY_OPERATIONS + 1
+    assert len(summary["operations"]["items"]) == MAX_SUMMARY_OPERATIONS
+    assert summary["operations"]["truncated"] is True
+    assert summary["instructions"]["total"] == MAX_SUMMARY_INSTRUCTIONS + 1
+    assert len(summary["instructions"]["items"]) == MAX_SUMMARY_INSTRUCTIONS
+    assert summary["instructions"]["truncated"] is True
+    # The newest instruction is kept; the oldest falls out of the window.
+    assert summary["instructions"]["items"][-1]["text"] == (
+        f"instruction {MAX_SUMMARY_INSTRUCTIONS}"
+    )

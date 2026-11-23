@@ -38,7 +38,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Protocol, Self
+from typing import TYPE_CHECKING, Any, Protocol, Self, cast
 from uuid import UUID, uuid4
 
 from cti_app.application.agent_session_verification import (
@@ -54,7 +54,10 @@ from cti_app.application.agentic_host_sessions import (
     HostSessionStateConflictError,
 )
 from cti_app.application.investigation_handoffs import (
+    HandoffError,
     HandoffTaskStaleError,
+    HandoffUnitOfWork,
+    InvestigationHandoffService,
     assert_startable,
 )
 from cti_app.application.investigation_persistence import (
@@ -63,6 +66,7 @@ from cti_app.application.investigation_persistence import (
     InvestigationEnvelopeRepository,
     InvestigationHandoffRepository,
     InvestigationTaskRepository,
+    ToolInvocationRepository,
     VersionConflictError,
 )
 from cti_app.application.investigation_task_events import (
@@ -106,7 +110,14 @@ from cti_app.domain.agentic_operator import (
     StartSessionRequest,
     instruction_text_sha256,
 )
-from cti_app.domain.investigation import canonical_json_bytes
+from cti_app.domain.investigation import (
+    BudgetDimension,
+    InvestigationEnvelope,
+    ToolInvocation,
+    ToolInvocationActorKind,
+    ToolInvocationStatus,
+    canonical_json_bytes,
+)
 from cti_app.domain.investigation_task import (
     TASK_LIMIT_DEFAULTS,
     InvestigationTaskV1,
@@ -253,6 +264,11 @@ MAX_ACK_INSTRUCTION_IDS = 32
 MAX_PULL_INSTRUCTIONS = 32
 MAX_CANCEL_REASON_CHARS = 4096
 
+# F4-D §5(d): the operator panel keeps the latest instructions and operations
+# only; both windows are explicit in the payload so a truncated view is visible.
+MAX_SUMMARY_INSTRUCTIONS = 20
+MAX_SUMMARY_OPERATIONS = 100
+
 
 @dataclass(frozen=True, slots=True)
 class NoteInstructionResolution:
@@ -355,6 +371,7 @@ class SessionUnitOfWork(Protocol):
     investigation_tasks: InvestigationTaskRepository
     investigation_handoffs: InvestigationHandoffRepository
     agent_sessions: AgentSessionRepository
+    tool_invocations: ToolInvocationRepository
 
     async def __aenter__(self) -> Self: ...
 
@@ -949,6 +966,73 @@ class SessionService:
         async with self._uow_factory() as uow:
             await self._session_for(uow, investigation_id, session_id)
             return await uow.agent_sessions.list_instructions(session_id)
+
+    async def summary(self, investigation_id: UUID, session_id: UUID) -> dict[str, Any]:
+        """Read-only operator-panel projection for one session (F4-D §5(d)).
+
+        ``operations`` lists the journal rows attributed to this session,
+        ``budget`` sums those rows and reports the canonical envelope budget
+        remaining, ``handoff`` cites the session's handoff with its computed
+        freshness, and ``instructions`` returns the latest human instructions.
+        The ``broker`` block is a *derivation* of ``tool_invocations`` — the
+        D7-signed operator calls and the ambiguous rows awaiting human
+        reconciliation — because no durable broker state exists to read; it is
+        labelled as such instead of inventing a live status.  Session
+        authentication material (secret, nonce, hash, delivery tokens) never
+        enters this projection.
+        """
+        async with self._uow_factory() as uow:
+            session = await self._session_for(uow, investigation_id, session_id)
+            invocations = tuple(
+                invocation
+                for invocation in await uow.tool_invocations.list_for_investigation(
+                    investigation_id
+                )
+                if invocation.agent_session_id == session.id
+            )
+            instructions = await uow.agent_sessions.list_instructions(session.id)
+            envelope = await uow.investigation_envelopes.get(investigation_id)
+            handoff = (
+                await uow.investigation_handoffs.get(session.handoff_id)
+                if session.handoff_id is not None
+                else None
+            )
+        if handoff is not None and handoff.handoff.investigation_id != str(investigation_id):
+            handoff = None
+        freshness: dict[str, Any] | None = None
+        if handoff is not None:
+            try:
+                report = await InvestigationHandoffService(
+                    uow_factory=cast(Callable[[], HandoffUnitOfWork], self._uow_factory)
+                ).freshness(investigation_id, UUID(handoff.handoff.handoff_id))
+            except HandoffError as exc:
+                freshness = {"checked": False, "reason": exc.code}
+            else:
+                freshness = {
+                    "checked": True,
+                    "state": report.state.value,
+                    "diffs": [diff.model_dump(mode="json") for diff in report.diffs],
+                }
+        return {
+            "session_id": str(session.id),
+            "operations": _summary_operations(invocations),
+            "budget": _summary_budget(invocations, envelope),
+            "broker": _summary_broker(invocations),
+            "handoff": (
+                None
+                if handoff is None
+                else {
+                    "handoff_id": handoff.handoff.handoff_id,
+                    "version": handoff.handoff.version,
+                    "sha256": handoff.handoff.content_sha256,
+                    "created_at": handoff.handoff.created_at.isoformat(),
+                    "from_actor": handoff.handoff.from_actor.model_dump(mode="json"),
+                    "to_actor": handoff.handoff.to_actor.model_dump(mode="json"),
+                    "freshness": freshness,
+                }
+            ),
+            "instructions": _summary_instructions(instructions),
+        }
 
     # ----------------------------------------------------------- instructions
 
@@ -2532,6 +2616,184 @@ async def _queue_position(
     return 0
 
 
+def _summary_operation(invocation: ToolInvocation) -> dict[str, Any]:
+    """One journal row as the panel shows it (no parameters, no purpose)."""
+    return {
+        "invocation_id": str(invocation.id),
+        "tool_name": invocation.tool_name,
+        "schema_version": invocation.schema_version,
+        "status": invocation.status.value,
+        "actor_kind": (invocation.actor_kind.value if invocation.actor_kind is not None else None),
+        "actor_id": invocation.actor_id,
+        "reserved_budget": {
+            dimension.value: amount for dimension, amount in invocation.reserved_budget.items()
+        },
+        "consumed_budget": {
+            dimension.value: amount for dimension, amount in invocation.consumed_budget.items()
+        },
+        "created_at": invocation.created_at.isoformat(),
+        "updated_at": invocation.updated_at.isoformat(),
+        "version": invocation.version,
+    }
+
+
+def _summary_operations(invocations: Sequence[ToolInvocation]) -> dict[str, Any]:
+    """Newest-first bounded operation window over the session's journal rows."""
+    ordered = sorted(invocations, key=lambda item: (item.created_at, str(item.id)), reverse=True)
+    window = ordered[:MAX_SUMMARY_OPERATIONS]
+    return {
+        "items": [_summary_operation(item) for item in window],
+        "total": len(ordered),
+        "limit": MAX_SUMMARY_OPERATIONS,
+        "truncated": len(ordered) > MAX_SUMMARY_OPERATIONS,
+    }
+
+
+def _summary_dimension_totals(
+    invocations: Sequence[ToolInvocation],
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Journal sums per dimension: ``(consumed, reserved)``."""
+    consumed = {dimension.value: 0 for dimension in BudgetDimension}
+    reserved = {dimension.value: 0 for dimension in BudgetDimension}
+    for invocation in invocations:
+        for dimension, amount in invocation.consumed_budget.items():
+            consumed[dimension.value] += amount
+        for dimension, amount in invocation.reserved_budget.items():
+            reserved[dimension.value] += amount
+    return consumed, reserved
+
+
+def _summary_budget(
+    invocations: Sequence[ToolInvocation],
+    envelope: InvestigationEnvelope | None,
+) -> dict[str, Any]:
+    """Session journal sums plus the canonical envelope budget remaining."""
+    consumed, reserved = _summary_dimension_totals(invocations)
+    if envelope is None:
+        envelope_view: dict[str, Any] = {
+            "present": False,
+            "version": None,
+            "approved_at": None,
+            "limits": None,
+            "consumed": None,
+            "reserved": None,
+            "remaining": None,
+        }
+    else:
+        envelope_view = {
+            "present": True,
+            "version": envelope.version,
+            "approved_at": envelope.approved_at.isoformat(),
+            "limits": {
+                dimension.value: envelope.budget.limits.get(dimension)
+                for dimension in BudgetDimension
+            },
+            "consumed": {
+                dimension.value: envelope.budget.consumed[dimension]
+                for dimension in BudgetDimension
+            },
+            "reserved": {
+                dimension.value: envelope.budget.reserved[dimension]
+                for dimension in BudgetDimension
+            },
+            "remaining": {
+                dimension.value: envelope.budget.remaining[dimension]
+                for dimension in BudgetDimension
+            },
+        }
+    return {
+        "session": {
+            "invocation_count": len(invocations),
+            "consumed": consumed,
+            "reserved": reserved,
+        },
+        "envelope": envelope_view,
+    }
+
+
+def _summary_broker(invocations: Sequence[ToolInvocation]) -> dict[str, Any]:
+    """Derive the broker panel from the journal, never from broker state.
+
+    ``last_signed_call`` is the latest operator-attributed invocation (every
+    broker call is D7-signed); ``needs_review_count`` is the number of rows
+    whose external effect is ambiguous and awaits human reconciliation.
+    """
+    signed = [item for item in invocations if item.actor_kind is ToolInvocationActorKind.OPERATOR]
+    last_signed = max(signed, key=lambda item: (item.created_at, str(item.id)), default=None)
+    needs_review = sum(
+        1 for item in invocations if item.status is ToolInvocationStatus.NEEDS_REVIEW
+    )
+    return {
+        "derived_from": "tool_invocations_journal",
+        "last_signed_call": None if last_signed is None else _summary_operation(last_signed),
+        "signed_call_count": len(signed),
+        "needs_review_count": needs_review,
+        "reconciliation_required": needs_review > 0,
+    }
+
+
+def _summary_instruction(
+    instruction: AgentSessionInstructionV1, *, queue_position: int
+) -> dict[str, Any]:
+    """One instruction with its human text; ``delivery_token`` is never exposed."""
+    return {
+        "instruction_id": str(instruction.id),
+        "state": instruction.state.value,
+        "text": instruction.text,
+        "text_sha256": instruction.text_sha256,
+        "queue_position": queue_position,
+        "created_by": {
+            "kind": instruction.created_by_kind,
+            "actor_id": instruction.created_by_id,
+        },
+        "queued_at": instruction.queued_at.isoformat(),
+        "delivered_at": (
+            instruction.delivered_at.isoformat() if instruction.delivered_at is not None else None
+        ),
+        "acknowledged_at": (
+            instruction.acknowledged_at.isoformat()
+            if instruction.acknowledged_at is not None
+            else None
+        ),
+        "delivery_attempts": instruction.delivery_attempts,
+        "delivery_mode": (
+            instruction.delivery_mode.value if instruction.delivery_mode is not None else None
+        ),
+        "delivery_sha256": instruction.delivery_sha256,
+        "last_delivery_error": instruction.last_delivery_error,
+        "cancelled_at": (
+            instruction.cancelled_at.isoformat() if instruction.cancelled_at is not None else None
+        ),
+        "cancel_reason": instruction.cancel_reason,
+        "created_at": instruction.created_at.isoformat(),
+        "updated_at": instruction.updated_at.isoformat(),
+    }
+
+
+def _summary_instructions(
+    instructions: Sequence[AgentSessionInstructionV1],
+) -> dict[str, Any]:
+    """Latest instructions in queue order, with one-pass queue positions."""
+    queued_positions: dict[UUID, int] = {}
+    position = 0
+    for instruction in instructions:
+        if instruction.state is InstructionState.QUEUED:
+            position += 1
+            queued_positions[instruction.id] = position
+    window = instructions[-MAX_SUMMARY_INSTRUCTIONS:]
+    return {
+        "items": [
+            _summary_instruction(
+                instruction, queue_position=queued_positions.get(instruction.id, 0)
+            )
+            for instruction in window
+        ],
+        "total": len(instructions),
+        "limit": MAX_SUMMARY_INSTRUCTIONS,
+        "truncated": len(instructions) > MAX_SUMMARY_INSTRUCTIONS,
+    }
+
+
 def _idempotency_key(value: object) -> str:
     if not isinstance(value, str) or not value.strip():
         raise SessionError("Idempotency-Key must be a non-empty string")
@@ -2551,6 +2813,8 @@ __all__ = [
     "MAX_ACK_INSTRUCTION_IDS",
     "MAX_CANCEL_REASON_CHARS",
     "MAX_PULL_INSTRUCTIONS",
+    "MAX_SUMMARY_INSTRUCTIONS",
+    "MAX_SUMMARY_OPERATIONS",
     "AgentSessionMutationUnitOfWork",
     "AgentSessionSecretDeliveryPort",
     "DeliveredInstructionV1",
