@@ -116,6 +116,27 @@ class SessionStateConflictError(SessionError):
         )
 
 
+class SessionLostError(SessionError):
+    """The session was reconciled ``lost``; INS-10 forbids any later run.
+
+    A restart never adopts a session (its in-memory secret is gone), so an
+    instruction addressed to the same id is refused instead of re-delivered.
+    """
+
+    code = ErrorCode.SESSION_STATE_CONFLICT
+    status = 409
+
+    def __init__(self, operation: str) -> None:
+        super().__init__(
+            "the session was lost and cannot accept this operation",
+            details={
+                "state": str(SessionState.LOST),
+                "operation": operation,
+                "reason": "session_lost",
+            },
+        )
+
+
 class SessionBusyError(SessionError):
     code = ErrorCode.SESSION_BUSY
     status = 409

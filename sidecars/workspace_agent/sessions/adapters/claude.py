@@ -62,7 +62,7 @@ from ..state import (
     atomic_write_json,
 )
 from ..supervisor import CapabilityProbe, LaunchContext, ProbeFlags
-from .preamble import SYSTEM_PREAMBLE
+from .preamble import INSTRUCTION_BLOCK_PREAMBLE, SYSTEM_PREAMBLE
 
 ADAPTER_KIND = "claude"
 DEFAULT_MAX_BUDGET_USD = "1.00"
@@ -803,6 +803,16 @@ class ClaudeProfile:
             prompt_text = prompt.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise CapabilityUnavailableError(ADAPTER_KIND) from exc
+        if context.instruction_block is not None:
+            # D4: the pending instruction is appended to the user prompt (the
+            # positional argument), never to the system preamble; the warning
+            # marks it as untrusted supplied data.
+            prompt_text = "\n\n".join(
+                (prompt_text, INSTRUCTION_BLOCK_PREAMBLE, context.instruction_block)
+            )
+            total = len(prompt_text.encode("utf-8"))
+            if total > MAX_PROMPT_ARGV_BYTES:
+                raise ClaudePromptUnavailableError(total, MAX_PROMPT_ARGV_BYTES)
         mcp_config_path = self._prepare_session_config(context)
         argv = self._claude_argv(context, binary, prompt_text, mcp_config_path)
         bwrap_argv = process.build_bwrap_argv(

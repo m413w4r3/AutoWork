@@ -4,8 +4,10 @@ This file is a standalone stdlib script (no package import) so the supervisor
 can execute it from the session scratch cwd with the closed environment. It
 accepts the supervisor-built argv shape any adapter would, emits JSONL events,
 writes an ``-o`` style output document, receives the one-time session secret
-over the per-session AF_UNIX socket, and simulates success, crash, hang, flood,
-slow, spawn-child and resume modes from a bounded JSON script:
+over the per-session AF_UNIX socket, reads the bounded pending-instruction
+block a next run was started with (recording its id, text SHA-256 and exact
+text digest), and simulates success, crash, hang, flood, slow, spawn-child and
+resume modes from a bounded JSON script:
 
     {"steps": [{"op": "emit", "event": {"type": "started"}}, ...],
      "final_message": "...", "outcome": "success"}
@@ -34,6 +36,7 @@ PR_SET_PDEATHSIG = 1
 SECRET_SCHEMA = "autowork-session-secret.v1"
 MAX_SECRET_FRAME_BYTES = 4096
 MAX_SCRIPT_BYTES = 64 * 1024
+MAX_INSTRUCTION_BLOCK_BYTES = 32 * 1024
 DEFAULT_FINAL_MESSAGE = "fake final message"
 WORK_DIRECTORY_NAME = "work"
 BUILTIN_SCENARIOS: dict[str, list[dict[str, object]]] = {
@@ -91,19 +94,20 @@ class FakeState:
         self.final_message = DEFAULT_FINAL_MESSAGE
         self.outcome = "success"
         self.observations: list[dict[str, object]] = []
+        # D4: what the run saw in its bounded pending-instruction block, if any.
+        self.instruction: dict[str, object] | None = None
         self._lock = threading.Lock()
-        self._instruction_event = threading.Event()
 
     def observe(self, **entry: object) -> None:
         with self._lock:
             self.observations.append({"kind": str(entry.pop("kind", "observation")), **entry})
             self._write_locked()
 
-    def instruction_seen(self) -> None:
-        self._instruction_event.set()
-
-    def wait_instruction(self, timeout: float) -> bool:
-        return self._instruction_event.wait(timeout)
+    def seen_instruction(self, entry: dict[str, object]) -> None:
+        with self._lock:
+            self.instruction = dict(entry)
+            self.observations.append({"kind": "instruction_block", **entry})
+            self._write_locked()
 
     def write_output(self) -> None:
         with self._lock:
@@ -115,6 +119,7 @@ class FakeState:
         payload = {
             "final_message": self.final_message,
             "outcome": self.outcome,
+            "instruction": self.instruction,
             "observations": list(self.observations),
         }
         data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -214,27 +219,48 @@ def read_secret(state: FakeState, socket_path: str, attempts: int) -> None:
 
 
 def read_stdin(state: FakeState) -> None:
+    """Observe the bounded ``run_prompt`` frame (start-time only, never a queue)."""
     for line in sys.stdin.buffer:
         try:
             frame = json.loads(line.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             continue
-        if not isinstance(frame, dict):
-            continue
-        if "instruction_id" in frame:
-            state.observe(
-                kind="instruction",
-                instruction_id=frame.get("instruction_id"),
-                sha256=frame.get("sha256"),
-                length=len(str(frame.get("text", "")).encode("utf-8")),
-            )
-            emit(
-                state,
-                {"type": "instruction_received", "instruction_id": frame.get("instruction_id")},
-            )
-            state.instruction_seen()
-        elif frame.get("type") == "run_prompt":
+        if isinstance(frame, dict) and frame.get("type") == "run_prompt":
             state.observe(kind="run_prompt", length=len(str(frame.get("text", ""))))
+
+
+def read_instruction_block(state: FakeState, path: str) -> None:
+    """Record the bounded pending-instruction block composed for this run.
+
+    The supervisor writes the exact block the real adapters embed in their
+    prompt; this fake parses its id/SHA/text and publishes them in its output
+    document so an e2e test can prove the human instruction reached this run.
+    """
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        data = b""
+    if not data or len(data) > MAX_INSTRUCTION_BLOCK_BYTES:
+        state.observe(kind="instruction_block_error", delivered=False, length=len(data))
+        emit(state, {"type": "instruction_block_error", "delivered": False})
+        return
+    text = data.decode("utf-8", errors="replace")
+    instruction_id = ""
+    declared_sha256 = ""
+    for line in text.splitlines():
+        if line.startswith("instruction_id="):
+            instruction_id = line.split("=", 1)[1].strip()
+        elif line.startswith("sha256="):
+            declared_sha256 = line.split("=", 1)[1].strip()
+    body = text.split("text:\n", 1)[1] if "text:\n" in text else ""
+    entry: dict[str, object] = {
+        "instruction_id": instruction_id,
+        "sha256": declared_sha256,
+        "text_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+        "length": len(data),
+    }
+    state.seen_instruction(entry)
+    emit(state, {"type": "instruction_block", **entry})
 
 
 def write_scratch(scratch_root: Path, relative: str, text: str) -> None:
@@ -299,8 +325,6 @@ def run_step(state: FakeState, step: dict[str, object], scratch_root: Path) -> b
         spawn_child(state, int(step.get("seconds", 120)))
     elif operation == "sleep":
         time.sleep(float(step.get("seconds", 0.05)))
-    elif operation == "wait_instruction":
-        state.wait_instruction(float(step.get("timeout", 5.0)))
     elif operation == "hang":
         while True:
             time.sleep(1.0)
@@ -340,6 +364,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--script", default=None)
     parser.add_argument("--output-file", default=None)
     parser.add_argument("--prompt-file", default=None)
+    parser.add_argument("--instruction-block-file", default=None)
     parser.add_argument("--resume", action="store_true")
     return parser
 
@@ -367,6 +392,8 @@ def main(argv: list[str] | None = None) -> int:
             length=len(prompt),
         )
     state.observe(kind="resume", requested=bool(args.resume))
+    if args.instruction_block_file:
+        read_instruction_block(state, str(args.instruction_block_file))
     threading.Thread(target=read_stdin, args=(state,), name="fake-stdin", daemon=True).start()
     state.write_output()
     cwd = Path.cwd()

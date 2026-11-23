@@ -8,6 +8,7 @@ workspace files or HTTP response bodies.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -59,7 +60,7 @@ def test_secret_never_in_state_logs_argv_env_or_responses(session_base: Path) ->
         write_fake_script(running, _secret_script())
         started = post_session(client, running, f"/v1/sessions/{SESSION_ID}/start", {}, START_KEY)
         assert started.status_code == 200, started.text
-        wait_for_state(client, running, "stopped", "failed")
+        wait_for_state(client, running, "awaiting_instruction", "stopped", "failed")
 
         status = get_session(client, running, f"/v1/sessions/{SESSION_ID}")
         events = get_session(
@@ -119,7 +120,7 @@ def test_secret_handoff_is_single_use(session_base: Path) -> None:
             ).status_code
             == 200
         )
-        wait_for_state(client, running, "stopped", "failed")
+        wait_for_state(client, running, "awaiting_instruction", "stopped", "failed")
 
         received = wait_for_observation(running, "secret_received")
         assert isinstance(received, dict)
@@ -151,21 +152,31 @@ def test_secret_is_rearmed_for_each_run(session_base: Path) -> None:
         write_fake_script(running, script)
         first = post_session(client, running, f"/v1/sessions/{SESSION_ID}/start", {}, START_KEY)
         assert first.status_code == 200, first.text
-        wait_for_state(client, running, "stopped", "failed")
+        wait_for_state(client, running, "awaiting_instruction", "stopped", "failed")
         first_received = wait_for_observation(running, "secret_received")
         assert isinstance(first_received, dict)
         assert first_received["sha256"] == SECRET_SHA256
         socket_path = running.session_dir() / "ipc" / "shim.sock"
         assert not socket_path.exists()  # the run consumed the one-shot socket
 
-        # A second run (Codex ``exec resume`` has the same shape) must find a
+        # A second run started by the instruction primitive (D4) must find a
         # newly armed socket even though the first one was consumed.
+        text = "continue the synthetic review"
+        instruction = {
+            "instruction_id": "b3c4d5e6-f708-4a1b-9c2d-3e4f5a6b7c8d",
+            "text": text,
+            "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        }
         second = post_session(
-            client, running, f"/v1/sessions/{SESSION_ID}/start", {}, "m24-h1-start-0002"
+            client,
+            running,
+            f"/v1/sessions/{SESSION_ID}/instructions",
+            instruction,
+            "m24-h1-instruction-rearm-0001",
         )
         assert second.status_code == 200, second.text
-        assert second.json()["run"] == 2
-        wait_for_state(client, running, "stopped", "failed")
+        assert second.json()["delivered"] == "queued"
+        wait_for_state(client, running, "awaiting_instruction", "stopped", "failed")
         second_received = wait_for_observation(running, "secret_received")
         assert isinstance(second_received, dict)
         assert second_received["sha256"] == SECRET_SHA256
@@ -189,7 +200,7 @@ def test_responses_never_include_host_absolute_paths(session_base: Path) -> None
         prepared = _prepare(client, running, workspace_id)
         write_fake_script(running, _secret_script())
         started = post_session(client, running, f"/v1/sessions/{SESSION_ID}/start", {}, START_KEY)
-        wait_for_state(client, running, "stopped", "failed")
+        wait_for_state(client, running, "awaiting_instruction", "stopped", "failed")
         collected = post_session(
             client,
             running,
