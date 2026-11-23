@@ -43,6 +43,18 @@ HANDOFFS = f"/api/investigations/{INVESTIGATION}/handoffs"
             SIGNED_HEADERS,
             True,
         ),
+        (
+            "POST",
+            f"/api/investigations/{INVESTIGATION}/agent-sessions/{SESSION}/collect",
+            SIGNED_HEADERS,
+            True,
+        ),
+        (
+            "POST",
+            f"/api/investigations/{INVESTIGATION}/agent-sessions/{SESSION}/reconcile",
+            SIGNED_HEADERS,
+            True,
+        ),
         ("POST", BROKER, {}, False),
         ("POST", BROKER, {"x-autowork-agent-session": SESSION}, False),
         ("GET", BROKER, SIGNED_HEADERS, False),
@@ -77,7 +89,7 @@ HANDOFFS = f"/api/investigations/{INVESTIGATION}/handoffs"
         ("POST", f"/api/investigations/{INVESTIGATION}/opinion/approve", SIGNED_HEADERS, False),
     ],
 )
-def test_only_the_three_signed_shim_routes_skip_the_bearer(
+def test_the_signed_shim_routes_skip_the_bearer(
     method: str, path: str, headers: dict[str, str], expected: bool
 ) -> None:
     assert _agent_signed_route(method, path, headers) is expected

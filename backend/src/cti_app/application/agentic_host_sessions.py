@@ -397,7 +397,10 @@ class HostRunExitV1(_HostResponseModel):
 
 class HostRunV1(_HostResponseModel):
     run: int = Field(ge=1)
-    state: Literal["running", "exited"]
+    # ``lost`` is the supervisor's persisted reconciliation fact for a run whose
+    # process was not adopted across a host restart; status must carry it so the
+    # backend can reconcile a lost session instead of rejecting the wire body.
+    state: Literal["running", "exited", "lost"]
     pid: int | None = Field(default=None, ge=1)
     pgid: int | None = Field(default=None, ge=2)
     start_ticks: int | None = Field(default=None, ge=0)

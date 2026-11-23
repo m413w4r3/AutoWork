@@ -69,11 +69,13 @@ from cti_app.application.virustotal import (
     VirusTotalPage,
     VirusTotalQuotaExceededError,
     VirusTotalRouteStep,
+    VirusTotalRouteUnavailableError,
     VirusTotalRoutingPolicy,
     VirusTotalSearchResult,
     VirusTotalTransportError,
     record_virustotal_external_effect,
     validate_search_query,
+    virustotal_external_effect_scope,
 )
 from cti_app.domain.analyst_opinion import (
     OpinionBlockType,
@@ -945,6 +947,44 @@ async def test_framework_presend_refusal_is_terminal_and_carries_no_send_proof(
     assert result.budget_consumed[BudgetDimension.TOOL_SECONDS] == 0
     assert tools.context.budget.consumed[BudgetDimension.VT_UNITS] == 0
     assert tools.vt.calls["file_report"] == 1
+
+
+@pytest.mark.asyncio
+async def test_route_unavailable_is_a_proven_presend_refusal() -> None:
+    """An unwired VT route never left the process: no ambiguous-effect review."""
+    tools = _tool_set()
+    tools.vt.errors["file_report"] = VirusTotalRouteUnavailableError(
+        "no usable VirusTotal route is configured"
+    )
+
+    with virustotal_external_effect_scope(None):
+        result = await _dispatch(tools, "vt.file_report", {"file_hash": _SEED_HASH})
+
+    assert result.status is ToolInvocationStatus.UNAVAILABLE
+    assert result.framework_pre_submission_proof is (
+        FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+    )
+    assert result.output["reason"] == "capability_unavailable"
+    assert result.budget_consumed[BudgetDimension.VT_UNITS] == 0
+    assert result.budget_consumed[BudgetDimension.TOOL_SECONDS] == 0
+
+
+@pytest.mark.asyncio
+async def test_route_unavailable_after_a_send_stays_ambiguous() -> None:
+    """A fallback route can be missing after a first step already sent."""
+    tools = _tool_set()
+
+    async def send_then_route_unavailable(_file_hash: str) -> VirusTotalFileReport:
+        record_virustotal_external_effect(reused=False)
+        raise VirusTotalRouteUnavailableError("fallback route incomplete")
+
+    tools.vt.file_report = send_then_route_unavailable
+    with virustotal_external_effect_scope(None):
+        result = await _dispatch(tools, "vt.file_report", {"file_hash": _SEED_HASH})
+
+    # No no-send proof may be claimed; the invocation layer keeps the
+    # conservative needs-review outcome for an already-sent fallback attempt.
+    assert result.framework_pre_submission_proof is None
 
 
 @pytest.mark.asyncio

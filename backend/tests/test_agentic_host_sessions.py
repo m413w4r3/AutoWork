@@ -43,10 +43,12 @@ from cti_app.application.agentic_host_sessions import (
     HostReasonRequestV1,
     HostReconcileRequestV1,
     HostResumeRequestV1,
+    HostRunV1,
     HostSecretHandoffConsumedError,
     HostSecretUnavailableError,
     HostSessionResultV1,
     HostSessionStateConflictError,
+    HostSessionStatusV1,
     HostStartSessionRequestV1,
     HostToolManifestEntryV1,
     HostToolManifestRequestV1,
@@ -677,6 +679,35 @@ async def test_secret_delivery_refuses_a_changed_capability_probe() -> None:
             idempotency_key=_PREPARE_KEY,
         )
     assert preparations.delivery(SESSION_ID) is None
+
+
+def test_host_run_accepts_the_reconciled_lost_state() -> None:
+    """A host restart marks the un-adopted run ``lost``; status must carry it."""
+    run = HostRunV1.model_validate_json(
+        json.dumps(
+            {
+                "run": 1,
+                "state": "lost",
+                "started_at": "2026-11-22T12:00:00+00:00",
+                "log_start": 0,
+            }
+        )
+    )
+    assert run.state == "lost"
+    status = HostSessionStatusV1.model_validate_json(
+        json.dumps(
+            {
+                "state": "lost",
+                "state_version": 3,
+                "adapter_kind": "codex_cli",
+                "runs": [run.model_dump(mode="json")],
+                "budgets_used": {"wall_seconds": 0, "output_bytes": 0, "instructions": 0},
+                "last_activity_at": "2026-11-22T12:00:00+00:00",
+                "log_cursor": 0,
+            }
+        )
+    )
+    assert status.runs[0].state == "lost"
 
 
 def test_responses_and_requests_reject_host_paths() -> None:

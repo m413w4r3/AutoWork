@@ -654,18 +654,27 @@ class _VirusTotalAdapter:
                     ),
                 )
             except (VirusTotalCapabilityDisabledError, VirusTotalRouteUnavailableError):
+                presend_proof = self._proven_presend_refusal(state)
                 return self._result(
                     state,
                     ToolInvocationStatus.UNAVAILABLE,
                     reason="capability_unavailable",
                     message="The VirusTotal capability or its configured route is unavailable.",
+                    # A disabled capability or an unwired route is a local
+                    # pre-send refusal, unless an earlier fallback step already
+                    # sent: then the invocation stays ambiguous and needs review.
+                    framework_pre_submission_proof=presend_proof,
+                    zero_cost=presend_proof is not None,
                 )
             except VirusTotalConfigurationError:
+                presend_proof = self._proven_presend_refusal(state)
                 return self._result(
                     state,
                     ToolInvocationStatus.UNAVAILABLE,
                     reason="capability_unavailable",
                     message="The VirusTotal route is not configured.",
+                    framework_pre_submission_proof=presend_proof,
+                    zero_cost=presend_proof is not None,
                 )
             except VirusTotalHttpError as exc:
                 if exc.status_code in {401, 403}:
@@ -860,6 +869,23 @@ class _VirusTotalAdapter:
             for name in _ALTERNATIVE_CAPABILITIES[self.name]
             if name in state.available_capabilities
         )
+
+    @staticmethod
+    def _proven_presend_refusal(
+        state: _ExecutionState,
+    ) -> FrameworkPreSubmissionProof | None:
+        """Only claim no-send when neither a request nor an effect was recorded.
+
+        ``VirusTotalRouteUnavailableError`` is also raised when a fallback route
+        is incomplete after a first step already sent; that case must keep the
+        conservative ``needs_review`` outcome.
+        """
+        counts = virustotal_external_effect_counts()
+        # The dispatcher binds the authoritative send counter around the call;
+        # without that scope no no-send claim can be proven.
+        if counts is not None and sum(counts) == 0:
+            return FrameworkPreSubmissionProof.EXTERNAL_EFFECT_PRE_SEND_REFUSAL
+        return None
 
 
 def is_trusted_vt_passive_read_adapter(tool_name: str, adapter: object) -> bool:

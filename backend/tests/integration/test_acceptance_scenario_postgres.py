@@ -17,17 +17,42 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import shutil
 import stat
 import subprocess
+import tempfile
+import threading
 import time
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import text as sql_text
 
+from cti_app.api.main import _instruction_drain_tick_lock
+from cti_app.application.agent_session_disclosure import (
+    SessionDisclosureUnitOfWork,
+    build_session_disclosure_checker,
+)
+from cti_app.application.bridge_investigator import (
+    TurnSubmission,
+    TurnSubmissionStatus,
+)
+from cti_app.application.instruction_delivery import InstructionDeliveryService
+from cti_app.application.investigation_transfers import (
+    TransferUnitOfWork,
+    WorkspaceNoteCatalog,
+)
+from cti_app.application.virustotal import VirusTotalRouteUnavailableError
+from cti_app.domain.agentic_operator import (
+    AgentSessionState,
+    InstructionDeliveryMode,
+    InstructionState,
+)
 from cti_app.domain.analyst_opinion import (
     OpinionBlockType,
     note_ioc_table_title,
@@ -39,9 +64,17 @@ from cti_app.domain.investigation import (
     FindingAssessment,
     InvestigationExecutionMode,
     ToolInvocationActorKind,
+    ToolInvocationStatus,
     is_advisory_observation,
 )
-from cti_app.domain.production import ProseAuthority
+from cti_app.domain.production import (
+    ProductionArtifact,
+    ProductionArtifactStage,
+    ProductionArtifactStatus,
+    ProseAuthority,
+)
+from cti_app.infrastructure.agentic.wiring import build_session_runtime
+from cti_app.infrastructure.workspace_agent import HttpWorkspaceAgentClient
 from tests.acceptance.scenario_support.harness import (
     ANALYSIS_SECTION_PARAGRAPH,
     TAIL_SECTION_PARAGRAPH,
@@ -59,6 +92,7 @@ from tests.acceptance.scenario_support.harness import (
     seed_article,
     session_secret,
     settle_and_sync,
+    signed_session_request,
     signed_tool_call,
 )
 
@@ -78,6 +112,26 @@ NOTE_A_REVISED = (
     "apres une verification independante."
 )
 NOTE_B_TEXT = "NOTE-BETA-ANCRAGE: la verification confirme le second etage synthetique."
+# M24.1 scenarios A/B/C.  The continuity fake CLI sleeps briefly before its
+# clean exit so the host start attestation observes a live process, then ends
+# at the technical ``awaiting_instruction`` receive point.
+CONTINUITY_AGENT_NOTE = b"# fake finding\n"
+CONTINUITY_RESULT_FILE = b"fake result\n"
+CONTINUITY_SCRIPT = {
+    "steps": [
+        {"op": "emit", "event": {"type": "started"}},
+        {"op": "sleep", "seconds": 0.4},
+        {"op": "write", "path": "notes/finding.md", "text": CONTINUITY_AGENT_NOTE.decode()},
+        {"op": "write", "path": "result.md", "text": CONTINUITY_RESULT_FILE.decode()},
+        {"op": "write", "path": "final.md", "text": "fake final body\n"},
+        {"op": "exit", "code": 0},
+    ],
+    "final_message": "fake final message",
+    "outcome": "success",
+}
+CONTINUITY_INSTRUCTION = (
+    "Applique la revision humaine de la note et reprends la verification du chargeur."
+)
 
 
 @dataclass
@@ -126,6 +180,16 @@ class JourneyState:
     opinion_v3_sha: str = ""
     opinion_id: UUID | None = None
     pdf_path: Path | None = None
+    # M24.1 integration scenarios.
+    consultation_invocation_id: UUID | None = None
+    instruction_id: UUID | None = None
+    agent_note_path: str = ""
+    agent_note_revision_id: str = ""
+    agent_note_sha256: str = ""
+    agent_note_bytes: bytes = b""
+    note_a_expected_blocks: list[dict[str, Any]] = field(default_factory=list)
+    extra_content_blocks: list[dict[str, Any]] = field(default_factory=list)
+    preserve_blocks_on_correction: bool = False
 
 
 class ScenarioJourney:
@@ -972,8 +1036,10 @@ class ScenarioJourney:
                         "block_type": "ioc_table",
                         "observation_ids": [str(self.state.imported_observation_id)],
                         "title": note_ioc_table_title(1),
-                    }
+                    },
+                    *self.state.extra_content_blocks,
                 ]
+                self.state.note_a_expected_blocks = list(body["content_blocks"])
             response = _json(
                 await self._human(
                     client,
@@ -1026,13 +1092,16 @@ class ScenarioJourney:
             )
         assert accepted_v1 is not None
         note_a = next(item for item in accepted_v1.observations if item.anchor == NOTE_A_ANCHOR)
-        assert [block.to_payload() for block in note_a.content_blocks] == [
+        expected_blocks = self.state.note_a_expected_blocks or [
             {
                 "block_type": "ioc_table",
                 "observation_ids": [str(self.state.imported_observation_id)],
                 "title": note_ioc_table_title(1),
             }
-        ], note_a.content_blocks
+        ]
+        assert [block.to_payload() for block in note_a.content_blocks] == expected_blocks, (
+            note_a.content_blocks
+        )
         observations_projection = next(
             block
             for block in accepted_v1.blocks
@@ -1163,6 +1232,13 @@ class ScenarioJourney:
                     "base_opinion_sha256": head["content_sha256"],
                     "expected_working_state_version": state["working_state_version"],
                     "expected_working_state_sha256": state["working_state_sha256"],
+                    # A correction rewrites the note body; the writer may carry
+                    # the already-approved content blocks forward explicitly.
+                    **(
+                        {"content_blocks": list(self.state.note_a_expected_blocks)}
+                        if self.state.preserve_blocks_on_correction
+                        else {}
+                    ),
                 },
                 headers={"Idempotency-Key": "m24-acceptance-correction-a"},
             )
@@ -1434,6 +1510,490 @@ class ScenarioJourney:
             "human G2 and bridge_only preserved",
         )
 
+    # ------------------------------------------------ scenario support (ABC)
+
+    def _host_sessions(self) -> Any:
+        runtime = self.scenario.session_runtime
+        host = getattr(runtime, "host_sessions", None)
+        assert host is not None, "the real host session client is not wired"
+        return host
+
+    async def _host_session_status(self, session_id: UUID) -> Any:
+        return await self._host_sessions().get_session_status(session_id)
+
+    async def _wait_host_session_state(
+        self, session_id: UUID, expected: set[str], *, deadline_seconds: float = 20.0
+    ) -> Any:
+        deadline = time.monotonic() + deadline_seconds
+        last: Any = None
+        while time.monotonic() < deadline:
+            last = await self._host_session_status(session_id)
+            if last.state in expected:
+                return last
+            await asyncio.sleep(0.05)
+        raise AssertionError(f"host session {session_id} never reached {expected}: {last}")
+
+    async def _host_log_text(self, session_id: UUID) -> str:
+        page = await self._host_sessions().get_logs(session_id, after=0, limit=500)
+        return "\n".join(line.text for line in page.lines)
+
+    async def _wait_host_log_type(
+        self, session_id: UUID, wanted: str, *, deadline_seconds: float = 15.0
+    ) -> dict[str, Any]:
+        """Wait for one JSONL event the fake CLI wrote to the host log stream."""
+        deadline = time.monotonic() + deadline_seconds
+        seen: list[dict[str, Any]] = []
+        while time.monotonic() < deadline:
+            seen = []
+            for line in (await self._host_log_text(session_id)).splitlines():
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(value, dict):
+                    seen.append(value)
+                    if value.get("type") == wanted:
+                        return value
+            await asyncio.sleep(0.05)
+        raise AssertionError(f"host log never carried a {wanted!r} event: {seen[-5:]}")
+
+    async def _host_events(self, session_id: UUID) -> tuple[Any, ...]:
+        page = await self._host_sessions().get_events(session_id, after=0, limit=500)
+        return tuple(page.events)
+
+    def _fake_output_observations(self, session_id: UUID) -> list[dict[str, Any]]:
+        """Read the fake CLI output document (the log ring redacts SHA-256s).
+
+        H1 tests use the same seam: the scripted CLI records facts in
+        ``scratch/work/fake-output.json`` so an assertion never depends on a
+        redacted log line.
+        """
+        path = (
+            self.agent.runtime_dir
+            / "sessions"
+            / str(session_id)
+            / "scratch"
+            / "work"
+            / "fake-output.json"
+        )
+        assert path.is_file(), path
+        value = json.loads(path.read_text(encoding="utf-8"))
+        observations = value.get("observations")
+        assert isinstance(observations, list), value
+        return [item for item in observations if isinstance(item, dict)]
+
+    async def _signed(
+        self,
+        client: Any,
+        session_id: UUID,
+        secret: bytes,
+        suffix: str,
+        payload: Mapping[str, Any] | None = None,
+        *,
+        key: str | None = None,
+    ) -> Any:
+        path = (
+            f"/api/investigations/{self.state.investigation_id}"
+            f"/agent-sessions/{session_id}/{suffix}"
+        )
+        return await signed_session_request(
+            client,
+            path=path,
+            session_id=session_id,
+            secret=secret,
+            payload=payload,
+            idempotency_key=key,
+        )
+
+    async def _drain_instructions(self) -> Any:
+        delivery = self.scenario.app.state.instruction_delivery_service
+        assert isinstance(delivery, InstructionDeliveryService)
+        session_factory = self.uow_factory.session_factory
+        async with _instruction_drain_tick_lock(session_factory) as granted:
+            assert granted is True, "the instruction drain advisory lock was not granted"
+            return await delivery.drain_once(limit=8)
+
+    # ------------------------------------------- scenario A: continuity
+
+    async def step_a01_codex_analysis_and_capture(self, client: Any) -> None:
+        """The Codex run ends cleanly and its captured work reaches the workspace."""
+        session_id = self.state.codex_session_id
+        assert session_id is not None and self.state.codex_task_id is not None
+        status = await self._wait_host_session_state(session_id, {"awaiting_instruction"})
+        assert status.runs, status
+        assert status.runs[-1].exit is not None and status.runs[-1].exit.code == 0, status
+        collected = _json(
+            await self._signed(
+                client,
+                session_id,
+                self.state.codex_secret,
+                "collect",
+                {"cursor": None},
+            )
+        )
+        items = {item["summary"]: item for item in collected["items"]}
+        note_path = f"notes/agents/{self.state.codex_task_id}/finding.md"
+        result_path = f"results/sessions/{session_id}/result.md"
+        note_sha = hashlib.sha256(CONTINUITY_AGENT_NOTE).hexdigest()
+        assert note_path in items, items
+        assert result_path in items, items
+        assert items[note_path]["kind"] == "note"
+        assert items[note_path]["content_sha256"] == note_sha
+        assert items[result_path]["kind"] == "report"
+        await settle_and_sync(client, self.state.investigation_id)
+        notes = _json(
+            await self._human(
+                client,
+                "GET",
+                f"/api/investigations/{self.state.investigation_id}/workspace/files",
+                params={"prefix": "notes/agents"},
+            )
+        )
+        view = next(item for item in notes["files"] if item["path"] == note_path)
+        assert view["sha256"] == note_sha, view
+        assert view["origin"] == "agent", view
+        results = _json(
+            await self._human(
+                client,
+                "GET",
+                f"/api/investigations/{self.state.investigation_id}/workspace/files",
+                params={"prefix": "results/sessions"},
+            )
+        )
+        result_view = next(item for item in results["files"] if item["path"] == result_path)
+        assert result_view["origin"] == "system", result_view
+        assert result_view["sha256"] == hashlib.sha256(CONTINUITY_RESULT_FILE).hexdigest()
+        self.state.agent_note_path = note_path
+        self.state.agent_note_revision_id = view["revision_id"]
+        self.state.agent_note_sha256 = note_sha
+        self.state.agent_note_bytes = CONTINUITY_AGENT_NOTE
+        self.journal.record(
+            "step_a01_codex_analysis_and_capture",
+            f"Codex run exited 0; capture wrote {note_path} and {result_path} into the "
+            "versioned workspace (agent/system origins)",
+        )
+
+    async def step_a02_task_scoped_bridge_consultation(self, client: Any) -> None:
+        task_id = self.state.loader_task_id
+        assert task_id is not None
+        before = _json(
+            await self._human(
+                client,
+                "GET",
+                f"/api/investigations/{self.state.investigation_id}/tasks/{task_id}",
+            )
+        )
+        state = await self._operator_state(client)
+        self.scenario.bridge.enqueue(bridge_submission(advisory_consult_text()))
+        payload = _json(
+            await self._human(
+                client,
+                "POST",
+                f"/api/investigations/{self.state.investigation_id}/tasks/{task_id}/consultations",
+                json={
+                    "consultation_type": "pivot_strategy",
+                    "question": "Quel pivot synthetique confirme le resultat capture ?",
+                    "expected_working_state_version": state["working_state_version"],
+                    "expected_working_state_sha256": state["working_state_sha256"],
+                },
+                headers={"Idempotency-Key": "m24-continuity-task-consultation"},
+            )
+        )
+        assert payload["context_task_id"] == str(task_id)
+        assert len(payload["task_context_sha256"]) == 64
+        consultation = payload["consultation"]
+        assert consultation["context_task_id"] == str(task_id)
+        assert consultation["consultation_type"] == "pivot_strategy"
+        assert consultation["requester_actor_kind"] == "human"
+        assert consultation["is_evidence"] is False
+        assert consultation["advisory_only"] is True
+        assert payload["invocation_status"] in {"succeeded", "partial"}, payload
+        after = _json(
+            await self._human(
+                client,
+                "GET",
+                f"/api/investigations/{self.state.investigation_id}/tasks/{task_id}",
+            )
+        )
+        assert after["status"] == before["status"]
+        assert after["status_version"] == before["status_version"]
+        async with self.uow_factory() as uow:
+            invocation = await uow.tool_invocations.get(UUID(payload["invocation_id"]))
+        assert invocation is not None
+        assert invocation.context_task_id == task_id
+        assert invocation.actor_kind is ToolInvocationActorKind.HUMAN
+        self.state.consultation_invocation_id = invocation.id
+        self.journal.record(
+            "step_a02_task_scoped_bridge_consultation",
+            f"task-scoped advisor.consult {invocation.id} carried context_task_id={task_id} "
+            "and never moved the task status",
+        )
+
+    async def step_a03_instruction_delivered_to_next_run(self, client: Any) -> None:
+        session_id = self.state.codex_session_id
+        assert session_id is not None
+        async with self.uow_factory() as uow:
+            revisions = await uow.workspace_file_revisions.list_for_workspace(
+                self.state.workspace_id
+            )
+        note_revision = next(revision for revision in revisions if revision.path == NOTE_PATH)
+        enqueued = _json(
+            await self._human(
+                client,
+                "POST",
+                f"/api/investigations/{self.state.investigation_id}/agent-sessions/"
+                f"{session_id}/instructions",
+                json={
+                    "action": "enqueue",
+                    "text": CONTINUITY_INSTRUCTION,
+                    "note_refs": [NOTE_PATH],
+                },
+                headers={"Idempotency-Key": "m24-continuity-instruction"},
+            )
+        )
+        assert enqueued["state"] == "queued", enqueued
+        assert enqueued["delivered_live"] is False, enqueued
+        instruction_id = UUID(enqueued["id"])
+        self.state.instruction_id = instruction_id
+        # The backend-owned drain is the real ID-2 loop: it reads the host
+        # receive point, reserves the row, hands the text to the supervisor and
+        # the supervisor starts the next run that embeds this exact block.
+        report = await self._drain_instructions()
+        assert report.delivered == 1, report
+        async with self.uow_factory() as uow:
+            stored = await uow.agent_sessions.get_instruction(instruction_id)
+            session = await uow.agent_sessions.get(session_id)
+        assert stored is not None
+        assert NOTE_PATH in stored.text
+        assert note_revision.sha256 in stored.text
+        assert stored.state is InstructionState.DELIVERED, stored.state
+        assert stored.delivery_mode is InstructionDeliveryMode.NEXT_RUN
+        assert stored.delivery_sha256 is not None
+        assert session is not None
+        # A confirmed delivery starts the next run, so the backend mirror is
+        # ``running`` again; the technical receive point returns when that run
+        # ends cleanly.
+        assert session.state is AgentSessionState.RUNNING, session.state
+        status = await self._wait_host_session_state(session_id, {"awaiting_instruction"})
+        assert len(status.runs) >= 2, status
+        logged: list[dict[str, Any]] = []
+        for line in (await self._host_log_text(session_id)).splitlines():
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict) and value.get("type") == "instruction_block":
+                logged.append(value)
+        assert logged, "the next run never reported an instruction block"
+        assert logged[-1]["instruction_id"] == str(instruction_id)
+        # The log ring redacts SHA-256-shaped values; the scripted CLI output
+        # document records the exact instruction id, declared hash and body
+        # digest the second run consumed.
+        output_blocks = [
+            item
+            for item in self._fake_output_observations(session_id)
+            if item.get("kind") == "instruction_block"
+        ]
+        assert output_blocks, "the next run recorded no instruction block"
+        consumed = output_blocks[-1]
+        assert consumed["instruction_id"] == str(instruction_id)
+        assert consumed["sha256"] == stored.delivery_sha256
+        assert consumed["text_sha256"] == hashlib.sha256(stored.text.encode("utf-8")).hexdigest()
+        assert int(consumed["length"]) > 0
+        pulled = _json(
+            await self._signed(
+                client, session_id, self.state.codex_secret, "instructions", {"action": "pull"}
+            )
+        )
+        assert [UUID(item["id"]) for item in pulled] == [instruction_id]
+        assert pulled[0]["delivery_text_verified"] is True
+        assert NOTE_PATH in pulled[0]["delivery_text"]
+        acknowledged = _json(
+            await self._signed(
+                client,
+                session_id,
+                self.state.codex_secret,
+                "instructions",
+                {"action": "ack", "instruction_ids": [str(instruction_id)]},
+            )
+        )
+        assert acknowledged[0]["state"] == "acknowledged"
+        self.journal.record(
+            "step_a03_instruction_delivered_to_next_run",
+            f"drained instruction {instruction_id} (sha {stored.delivery_sha256[:12]}) into "
+            f"host run {len(status.runs)} and acknowledged it",
+        )
+
+    async def step_a04_import_results_with_provenance(self, client: Any) -> None:
+        task_id = self.state.loader_task_id
+        assert task_id is not None and self.state.agent_note_path
+        listing = _json(
+            await self._human(
+                client,
+                "GET",
+                f"/api/investigations/{self.state.investigation_id}/workspace/files",
+                params={"prefix": "notes/agents"},
+            )
+        )
+        view = next(item for item in listing["files"] if item["path"] == self.state.agent_note_path)
+        observation_contribution = _json(
+            await self._human(
+                client,
+                "POST",
+                f"/api/investigations/{self.state.investigation_id}/contributions",
+                json={
+                    "workspace_id": self.state.workspace_id,
+                    "workspace_revision_id": view["revision_id"],
+                    "category": "observation",
+                    "origin": "human",
+                    "author_actor_id": "operator:static-token",
+                    "task_id": str(task_id),
+                    "observation": {
+                        "object_type": "file",
+                        "method": "string_extraction",
+                        "object_id": view["sha256"],
+                        "tool": "strings",
+                        "tool_version": "synthetic-1",
+                        "parameters": {"encoding": "utf-8"},
+                        "limitations": ["Synthetic acceptance fixture only."],
+                        "observed_at": "2026-11-22T12:30:00Z",
+                    },
+                },
+                headers={"Idempotency-Key": "m24-continuity-import-agent-note"},
+            )
+        )
+        assert observation_contribution["import_status"] == "imported", observation_contribution
+        assert observation_contribution["task_id"] == str(task_id)
+        assert observation_contribution["file_relpath"] == self.state.agent_note_path
+        imported_observation_id = UUID(observation_contribution["observation_id"])
+        self.state.imported_observation_id = imported_observation_id
+
+        root = self.state.workspace_root
+        assert root is not None
+        finding_note = root / FINDING_NOTE_PATH
+        finding_note.parent.mkdir(parents=True, exist_ok=True)
+        finding_note.write_text(
+            "Verification synthetique du resultat capture par l'operateur Codex.\n",
+            encoding="utf-8",
+        )
+        await settle_and_sync(client, self.state.investigation_id)
+        notes = _json(
+            await self._human(
+                client,
+                "GET",
+                f"/api/investigations/{self.state.investigation_id}/workspace/files",
+                params={"prefix": "notes/humaines"},
+            )
+        )
+        finding_view = next(item for item in notes["files"] if item["path"] == FINDING_NOTE_PATH)
+        assert self.state.claude_vt_observation_id is not None
+        finding_contribution = _json(
+            await self._human(
+                client,
+                "POST",
+                f"/api/investigations/{self.state.investigation_id}/contributions",
+                json={
+                    "workspace_id": self.state.workspace_id,
+                    "workspace_revision_id": finding_view["revision_id"],
+                    "category": "finding",
+                    "origin": "human",
+                    "author_actor_id": "operator:static-token",
+                    "task_id": str(task_id),
+                    "finding": {
+                        "kind": "claim_verification",
+                        "assessment": "supported",
+                        "statement": (
+                            "NOTE-FINDING-IMPORT: le resultat capture par Codex confirme la "
+                            "chaine synthetique, sans preuve directe suffisante."
+                        ),
+                        "observation_refs": [
+                            str(imported_observation_id),
+                            str(self.state.claude_vt_observation_id),
+                        ],
+                        "novelty": "new_to_article",
+                        "scope": "Synthetic acceptance scope.",
+                        "limitations": ["Imported finding is never auto-supported."],
+                    },
+                },
+                headers={"Idempotency-Key": "m24-continuity-import-finding"},
+            )
+        )
+        assert finding_contribution["import_status"] == "imported", finding_contribution
+        assert finding_contribution["task_id"] == str(task_id)
+        finding_id = UUID(finding_contribution["finding_id"])
+        self.state.imported_finding_id = finding_id
+        async with self.uow_factory() as uow:
+            observation = await uow.evidence_observations.get(imported_observation_id)
+            finding = await uow.investigation_findings.get(finding_id)
+            contributions = await uow.work_contributions.list_for_investigation(
+                self.state.investigation_id
+            )
+        assert observation is not None
+        assert observation.source == "workspace_import"
+        assert observation.object_id == self.state.agent_note_sha256
+        assert observation.sha256 == self.state.agent_note_sha256
+        assert finding is not None
+        assert finding.assessment is FindingAssessment.INCONCLUSIVE, finding
+        linked = [item for item in contributions if item.id == UUID(observation_contribution["id"])]
+        assert len(linked) == 1
+        assert linked[0].task_id == task_id
+        # B5a/B5b: the exact captured bytes are a canonical code reference; the
+        # note writer never supplies the excerpt text itself.
+        self.state.extra_content_blocks = [
+            {
+                "block_type": "canonical_code",
+                "observation_id": str(imported_observation_id),
+                "blob_sha256": observation.sha256,
+                "offset": 0,
+                "length": len(self.state.agent_note_bytes),
+                "excerpt_sha256": hashlib.sha256(self.state.agent_note_bytes).hexdigest(),
+                "language": "text",
+            }
+        ]
+        self.journal.record(
+            "step_a04_import_results_with_provenance",
+            f"agent note {self.state.agent_note_path} imported as observation "
+            f"{imported_observation_id} attributed to task {task_id}; finding "
+            f"{finding_id} stays inconclusive",
+        )
+
+    async def step_a05_content_blocks_in_real_pdf(self, client: Any) -> None:
+        del client
+        assert self.state.pdf_path is not None
+        extracted = await asyncio.to_thread(
+            subprocess.run,
+            ["pdftotext", "-layout", str(self.state.pdf_path), "-"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        normalized = " ".join(extracted.stdout.split())
+        title = note_ioc_table_title(1)
+        code_excerpt = CONTINUITY_AGENT_NOTE.decode().strip()
+        assert title in normalized, normalized[:3000]
+        # The rendered table wraps technical cells; its first segment is exact.
+        assert self.state.agent_note_sha256[:24] in normalized, normalized[:3000]
+        assert code_excerpt in normalized, normalized[:3000]
+        note_position = normalized.index("NOTE-ALPHA-ANCRAGE-REVISE")
+        title_position = normalized.index(title)
+        code_position = normalized.index(code_excerpt)
+        anchor_position = normalized.index(ANALYSIS_SECTION_PARAGRAPH)
+        assert note_position < title_position < anchor_position, (
+            note_position,
+            title_position,
+            anchor_position,
+        )
+        assert note_position < code_position < anchor_position, (
+            note_position,
+            code_position,
+            anchor_position,
+        )
+        self.journal.record(
+            "step_a05_content_blocks_in_real_pdf",
+            "real Typst PDF carries the note at its lead anchor with the canonical IOC "
+            "table and the exact captured-code excerpt",
+        )
+
     # --------------------------------------------------------- audit helpers
 
     async def _artifact_counts(self) -> dict[str, int]:
@@ -1573,3 +2133,1167 @@ async def test_full_24_step_scenario(
     print("\n=== M24 acceptance journal ===")
     print(journey.journal.render())
     assert reached == len(steps)
+
+
+# ===========================================================================
+# M24.1 integration scenarios A (continuity), B (recovery) and C (degradation)
+# ===========================================================================
+
+
+def build_instruction_delivery(
+    *, application: ScenarioApplication, uow_factory: Any
+) -> InstructionDeliveryService:
+    """Mirror the lifespan ID-2 service the acceptance app does not start."""
+    runtime = application.session_runtime
+    host = getattr(runtime, "host_sessions", None)
+    assert host is not None, "the real host session client is not wired"
+    return InstructionDeliveryService(
+        uow_factory=cast(Callable[[], Any], uow_factory),
+        host=host,
+        notes=WorkspaceNoteCatalog(uow_factory=cast(Callable[[], TransferUnitOfWork], uow_factory)),
+        disclosure=build_session_disclosure_checker(
+            uow_factory=cast(Callable[[], SessionDisclosureUnitOfWork], uow_factory),
+            article_snapshots=application.composition.article_snapshots,
+            settings=application.settings,
+            effective_policy_for=(
+                application.composition.osint_open_policy_service.effective_for_investigation
+            ),
+        ),
+        grace_seconds=application.settings.m24_instruction_delivery_grace_seconds,
+        batch_size=application.settings.m24_instruction_drain_batch_size,
+    )
+
+
+async def run_journey_steps(
+    journey: ScenarioJourney,
+    scenario: ScenarioApplication,
+    steps: tuple[Callable[[Any], Any], ...],
+    *,
+    label: str,
+) -> None:
+    reached = 0
+    try:
+        async with scenario.client() as client:
+            for step in steps:
+                await step(client)
+                reached += 1
+    except BaseException:
+        print(f"\n=== {label} journal (stopped at step {reached + 1}) ===")
+        print(journey.journal.render())
+        raise
+    print(f"\n=== {label} journal ===")
+    print(journey.journal.render())
+    assert reached == len(steps)
+
+
+class RestartableScenarioAgent:
+    """A real sidecar whose supervisor can be stopped and restarted in place.
+
+    ``WorkspaceAgent.serve`` never records a clean exit on stop, so the next
+    supervisor reconciles the still-active session ``lost`` exactly like a host
+    crash; the workspace tree and the session runtime directory survive.
+    """
+
+    def __init__(self) -> None:
+        # AF_UNIX session sockets must stay below 108 bytes.
+        self.base_dir = Path(tempfile.mkdtemp(prefix="m24rec-", dir="/tmp"))
+        self.root = self.base_dir / "ws"
+        self.root.mkdir()
+        self.runtime_dir = self.base_dir / "run"
+        self.agent: Any | None = None
+        self._stop_event: threading.Event | None = None
+        self._thread: threading.Thread | None = None
+
+    @property
+    def socket_path(self) -> Path:
+        return self.runtime_dir / "workspace-agent.sock"
+
+    @property
+    def token_file(self) -> Path:
+        return self.runtime_dir / "auth-token"
+
+    def start(self) -> None:
+        # Imported late: the harness inserts the repository root on sys.path.
+        from sidecars.workspace_agent.agent import AgentConfig, WorkspaceAgent
+
+        assert self._thread is None and self.agent is None
+        self.runtime_dir.mkdir(mode=0o750, exist_ok=True)
+        os.chmod(self.runtime_dir, 0o750)
+        agent = WorkspaceAgent(
+            AgentConfig(
+                root=self.root,
+                socket_dir=self.runtime_dir,
+                group=os.getgid(),
+                poll_interval_ms=200,
+                stability_window_ms=100,
+                log_level="WARNING",
+            )
+        )
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=agent.serve, args=(stop,), name="m24-recovery-agent", daemon=True
+        )
+        thread.start()
+        if not agent.wait_ready(15):
+            stop.set()
+            thread.join(timeout=15)
+            raise AssertionError("the recovery workspace agent did not become ready")
+        self.agent = agent
+        self._stop_event = stop
+        self._thread = thread
+
+    def stop(self) -> None:
+        if self._thread is None:
+            return
+        assert self._stop_event is not None
+        self._stop_event.set()
+        self._thread.join(timeout=15)
+        assert not self._thread.is_alive(), "the recovery workspace agent did not stop"
+        self._thread = None
+        self._stop_event = None
+        self.agent = None
+
+    def as_running(self) -> RunningScenarioAgent:
+        assert self.agent is not None
+        return RunningScenarioAgent(
+            agent=self.agent,
+            base_dir=self.base_dir,
+            root=self.root,
+            runtime_dir=self.runtime_dir,
+        )
+
+    def close(self) -> None:
+        self.stop()
+        shutil.rmtree(self.base_dir, ignore_errors=True)
+
+
+async def rebind_host_clients(
+    scenario: ScenarioApplication, agent: RestartableScenarioAgent
+) -> None:
+    """Replace the pooled UDS clients after the sidecar rotated its token."""
+    old_runtime = scenario.session_runtime
+    await scenario.workspace_port.aclose()
+    await old_runtime.aclose()
+    workspace_port = HttpWorkspaceAgentClient(
+        socket_path=str(agent.socket_path),
+        token_file=str(agent.token_file),
+        timeout_seconds=60.0,
+    )
+    runtime = build_session_runtime(scenario.app.state, scenario.settings)
+    if not runtime.available:
+        raise AssertionError(
+            f"the rebuilt host runtime is unavailable: {runtime.unavailable_reason}"
+        )
+    scenario.app.state.workspace_agent_port = workspace_port
+    scenario.app.state.agentic_operator_port = runtime.operator
+    scenario.app.state.agent_session_secret_delivery = runtime.secret_delivery
+    scenario.app.state.agent_session_runtime = runtime
+    scenario.workspace_port = workspace_port
+    scenario.session_runtime = runtime
+
+
+def process_running(pid: int) -> bool:
+    """True while ``pid`` exists and is not a zombie (the host's own rule)."""
+    if pid < 1:
+        return False
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    try:
+        state = stat_text.rsplit(")", 1)[1].split()[0]
+    except IndexError:
+        return False
+    return state != "Z"
+
+
+async def wait_process_gone(pid: int, *, deadline_seconds: float = 10.0) -> None:
+    deadline = time.monotonic() + deadline_seconds
+    while time.monotonic() < deadline:
+        if not process_running(pid):
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"process {pid} is still running after {deadline_seconds}s")
+
+
+def fake_process_environment(pid: int) -> dict[str, str]:
+    raw = Path(f"/proc/{pid}/environ").read_bytes()
+    environment: dict[str, str] = {}
+    for item in raw.split(b"\x00"):
+        if b"=" not in item:
+            continue
+        key, value = item.split(b"=", 1)
+        environment[key.decode("utf-8", "replace")] = value.decode("utf-8", "replace")
+    return environment
+
+
+# --------------------------------------------------------------- fixtures
+
+
+@pytest.fixture
+def continuity_profiles(monkeypatch: pytest.MonkeyPatch) -> None:
+    install_fake_cli_profiles(monkeypatch, script=CONTINUITY_SCRIPT)
+
+
+@pytest.fixture
+def continuity_agent(continuity_profiles: None) -> Iterator[RunningScenarioAgent]:
+    with running_scenario_agent() as running:
+        yield running
+
+
+@pytest.fixture
+async def continuity_scenario(
+    continuity_agent: RunningScenarioAgent,
+    uow_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[ScenarioApplication]:
+    application = await build_scenario_application(
+        monkeypatch=monkeypatch,
+        uow_factory=uow_factory,
+        agent=continuity_agent,
+        material=ScenarioMaterial.synthetic(),
+        blob_root=tmp_path / "blobs",
+    )
+    application.app.state.instruction_delivery_service = build_instruction_delivery(
+        application=application, uow_factory=uow_factory
+    )
+    try:
+        yield application
+    finally:
+        await application.aclose()
+
+
+@pytest.fixture
+def recovery_agent(monkeypatch: pytest.MonkeyPatch) -> Iterator[RestartableScenarioAgent]:
+    install_fake_cli_profiles(monkeypatch, scenario="spawn_child")
+    agent = RestartableScenarioAgent()
+    agent.start()
+    try:
+        yield agent
+    finally:
+        agent.close()
+
+
+@pytest.fixture
+async def recovery_scenario(
+    recovery_agent: RestartableScenarioAgent,
+    uow_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[ScenarioApplication]:
+    application = await build_scenario_application(
+        monkeypatch=monkeypatch,
+        uow_factory=uow_factory,
+        agent=recovery_agent.as_running(),
+        material=ScenarioMaterial.synthetic(),
+        blob_root=tmp_path / "blobs",
+    )
+    try:
+        yield application
+    finally:
+        await application.aclose()
+
+
+@pytest.fixture
+def unattested_profiles(monkeypatch: pytest.MonkeyPatch) -> None:
+    install_fake_cli_profiles(
+        monkeypatch,
+        adapter_kinds=("claude_code",),
+        simulate_network_attestation=False,
+    )
+
+
+@pytest.fixture
+def unattested_agent(unattested_profiles: None) -> Iterator[RunningScenarioAgent]:
+    with running_scenario_agent() as running:
+        yield running
+
+
+@pytest.fixture
+async def unattested_scenario(
+    unattested_agent: RunningScenarioAgent,
+    uow_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[ScenarioApplication]:
+    application = await build_scenario_application(
+        monkeypatch=monkeypatch,
+        uow_factory=uow_factory,
+        agent=unattested_agent,
+        material=ScenarioMaterial.synthetic(),
+        blob_root=tmp_path / "blobs",
+    )
+    try:
+        yield application
+    finally:
+        await application.aclose()
+
+
+# ------------------------------------------------- scenario A: continuity
+
+
+async def test_scenario_a_human_agentic_continuity(
+    continuity_scenario: ScenarioApplication,
+    continuity_agent: RunningScenarioAgent,
+    uow_factory: Any,
+    tmp_path: Path,
+) -> None:
+    journey = ScenarioJourney(
+        scenario=continuity_scenario,
+        agent=continuity_agent,
+        uow_factory=uow_factory,
+        tmp_path=tmp_path,
+    )
+    journey.state.seeded = await seed_article(
+        uow_factory=uow_factory,
+        artifact_store=continuity_scenario.artifact_store,
+        material=continuity_scenario.material,
+    )
+    journey.state.preserve_blocks_on_correction = True
+    steps = (
+        journey.step_01_start_investigation_via_api,
+        journey.step_02_workspace_created_by_real_sidecar,
+        journey.step_03_ioc_inventory,
+        journey.step_04_g2_envelope_proposed_and_approved,
+        journey.step_05_fake_vt_collection,
+        journey.step_06_controlled_sample_materialization,
+        journey.step_07_bridge_plan_accepted,
+        journey.step_08_task_assigned_and_codex_session,
+        journey.step_a01_codex_analysis_and_capture,
+        journey.step_a02_task_scoped_bridge_consultation,
+        journey.step_11_human_local_markdown_note,
+        journey.step_12_note_visible_via_api,
+        journey.step_a03_instruction_delivered_to_next_run,
+        journey.step_13_transfer_to_claude_code,
+        journey.step_14_claude_deepens_verification,
+        journey.step_a04_import_results_with_provenance,
+        journey.step_16_bridge_drafts_two_notes,
+        journey.step_17_human_accepts_both_drafts,
+        journey.step_18_human_requests_correction,
+        journey.step_19_human_accepts_correction,
+        journey.step_20_real_typst_pdf,
+        journey.step_21_notes_at_two_anchors,
+        journey.step_a05_content_blocks_in_real_pdf,
+    )
+    await run_journey_steps(journey, continuity_scenario, steps, label="Scenario A")
+    assert journey.state.agent_note_sha256 == hashlib.sha256(CONTINUITY_AGENT_NOTE).hexdigest()
+    assert journey.state.instruction_id is not None
+    assert journey.state.consultation_invocation_id is not None
+    assert journey.state.opinion_v3_sha
+
+
+# --------------------------------------------------- scenario B: recovery
+
+
+async def test_scenario_b_interruption_and_recovery(
+    recovery_scenario: ScenarioApplication,
+    recovery_agent: RestartableScenarioAgent,
+    uow_factory: Any,
+    tmp_path: Path,
+) -> None:
+    journey = ScenarioJourney(
+        scenario=recovery_scenario,
+        agent=recovery_agent.as_running(),
+        uow_factory=uow_factory,
+        tmp_path=tmp_path,
+    )
+    seeded = await seed_article(
+        uow_factory=uow_factory,
+        artifact_store=recovery_scenario.artifact_store,
+        material=recovery_scenario.material,
+    )
+    journey.state.seeded = seeded
+    async with recovery_scenario.client() as client:
+        await journey.step_01_start_investigation_via_api(client)
+        await journey.step_02_workspace_created_by_real_sidecar(client)
+        await journey.step_03_ioc_inventory(client)
+        await journey.step_04_g2_envelope_proposed_and_approved(client)
+        await journey.step_05_fake_vt_collection(client)
+        await journey.step_07_bridge_plan_accepted(client)
+        await journey.step_08_task_assigned_and_codex_session(client)
+        first_session = journey.state.codex_session_id
+        first_task = journey.state.codex_task_id
+        assert first_session is not None and first_task is not None
+        await journey._wait_host_session_state(first_session, {"running"})
+        started = await journey._wait_host_log_type(first_session, "started")
+        child = await journey._wait_host_log_type(first_session, "child_started")
+        fake_pid = int(started["pid"])
+        child_pid = int(child["pid"])
+        assert process_running(fake_pid) and process_running(child_pid)
+
+        # No unauthorized network access: the closed fake launch environment
+        # exposes UDS paths only, never a provider URL, proxy or credential.
+        environment = fake_process_environment(fake_pid)
+        assert set(environment) >= {
+            "AUTOWORK_SESSION_ID",
+            "AUTOWORK_SESSION_SOCKET",
+            "AUTOWORK_BROKER_SOCKET",
+        }
+        forbidden_fragments = (
+            "TOKEN",
+            "SECRET",
+            "PASSWORD",
+            "API_KEY",
+            "PROXY",
+            "http://",
+            "https://",
+        )
+        for key, value in environment.items():
+            for fragment in forbidden_fragments:
+                assert fragment not in key.upper(), (key, fragment)
+                assert fragment not in value, (key, value)
+        session_directory = recovery_agent.runtime_dir / "sessions" / str(first_session)
+        assert session_directory.is_dir(), session_directory
+        assert not any("egress" in path.name for path in session_directory.rglob("*"))
+        assert "egress.log" not in {path.name for path in session_directory.iterdir()}
+
+        # A human note written before the interruption survives everything.
+        await journey.step_11_human_local_markdown_note(client)
+        recovery_root = journey.state.workspace_root
+        assert recovery_root is not None
+        recovery_note = recovery_root / NOTE_PATH
+        assert recovery_note.is_file()
+
+        # An external action is never replayed blindly: one signed VT read is
+        # idempotently replayed without a second provider call.
+        material = recovery_scenario.material
+        vt_before = dict(recovery_scenario.virus_total.calls)
+        first_call = _json(
+            await signed_tool_call(
+                client,
+                investigation_id=journey.state.investigation_id,
+                session_id=first_session,
+                secret=journey.state.codex_secret,
+                tool_name="vt.file_report",
+                schema_version="1",
+                arguments={"file_hash": material.available_hashes[0]},
+                idempotency_key="m24-recovery-vt-read",
+            )
+        )
+        assert first_call["status"] in {"succeeded", "partial"}, first_call
+        assert recovery_scenario.virus_total.calls["file_report"] == vt_before["file_report"] + 1
+        replayed = _json(
+            await signed_tool_call(
+                client,
+                investigation_id=journey.state.investigation_id,
+                session_id=first_session,
+                secret=journey.state.codex_secret,
+                tool_name="vt.file_report",
+                schema_version="1",
+                arguments={"file_hash": material.available_hashes[0]},
+                idempotency_key="m24-recovery-vt-read",
+            )
+        )
+        assert replayed["invocation_id"] == first_call["invocation_id"]
+        assert replayed["idempotent_replay"] is True
+        assert recovery_scenario.virus_total.calls["file_report"] == vt_before["file_report"] + 1
+        async with uow_factory() as uow:
+            observations_after_replay = await uow.evidence_observations.list_for_investigation(
+                journey.state.investigation_id
+            )
+
+        # An expired lease is refused before any provider effect.
+        async with uow_factory.session_factory() as database:
+            await database.execute(
+                sql_text(
+                    "UPDATE investigation_tasks SET heartbeat_at = "
+                    "now() - interval '10 seconds', lease_expires_at = "
+                    "now() - interval '5 seconds' WHERE id = :task_id"
+                ),
+                {"task_id": first_task},
+            )
+            await database.commit()
+        stale_lease = await signed_tool_call(
+            client,
+            investigation_id=journey.state.investigation_id,
+            session_id=first_session,
+            secret=journey.state.codex_secret,
+            tool_name="vt.file_report",
+            schema_version="1",
+            arguments={"file_hash": material.available_hashes[0]},
+            idempotency_key="m24-recovery-vt-expired-lease",
+        )
+        assert stale_lease.status_code == 409, stale_lease.text
+        assert stale_lease.json()["detail"]["code"] == "agent_session_lease_stale"
+        assert recovery_scenario.virus_total.calls["file_report"] == vt_before["file_report"] + 1
+        async with uow_factory.session_factory() as database:
+            await database.execute(
+                sql_text(
+                    "UPDATE investigation_tasks SET lease_expires_at = "
+                    "now() + interval '10 minutes', "
+                    "heartbeat_at = now() WHERE id = :task_id"
+                ),
+                {"task_id": first_task},
+            )
+            await database.commit()
+
+        # Interrupt during the analysis: the whole process group stops.
+        interrupted = _json(
+            await journey._human(
+                client,
+                "POST",
+                f"/api/investigations/{journey.state.investigation_id}/agent-sessions/"
+                f"{first_session}/interrupt",
+                json={"reason": "Interruption synthetique pendant l'analyse"},
+            )
+        )
+        assert interrupted["state"] in {"stopped", "interrupt_requested"}, interrupted
+        host_state = await journey._wait_host_session_state(first_session, {"stopped", "lost"})
+        assert host_state.state in {"stopped", "lost"}
+        await wait_process_gone(fake_pid)
+        await wait_process_gone(child_pid)
+        assert recovery_scenario.virus_total.calls["file_report"] == vt_before["file_report"] + 1
+        async with uow_factory() as uow:
+            observations_after_interrupt = await uow.evidence_observations.list_for_investigation(
+                journey.state.investigation_id
+            )
+        assert len(observations_after_interrupt) == len(observations_after_replay)
+        refused_after_interrupt = await signed_tool_call(
+            client,
+            investigation_id=journey.state.investigation_id,
+            session_id=first_session,
+            secret=journey.state.codex_secret,
+            tool_name="vt.file_report",
+            schema_version="1",
+            arguments={"file_hash": material.available_hashes[0]},
+            idempotency_key="m24-recovery-vt-read",
+        )
+        assert refused_after_interrupt.status_code == 409, refused_after_interrupt.text
+        assert refused_after_interrupt.json()["detail"]["code"] == "agent_session_inactive", (
+            refused_after_interrupt.text
+        )
+
+        # A second task runs when the host supervisor dies: the next supervisor
+        # reconciles the still-active session lost and only a NEW handoff can
+        # open a new session; the human note and the old handoff stay intact.
+        second_task_id = next(
+            task_id for task_id in journey.state.task_ids.values() if task_id != first_task
+        )
+        second_task = _json(
+            await journey._human(
+                client,
+                "GET",
+                f"/api/investigations/{journey.state.investigation_id}/tasks/{second_task_id}",
+            )
+        )
+        assigned = _json(
+            await journey._human(
+                client,
+                "POST",
+                f"/api/investigations/{journey.state.investigation_id}/tasks/"
+                f"{second_task_id}/commands",
+                json={
+                    "command": "assign",
+                    "expected_status_version": second_task["status_version"],
+                    "target": {"actor_kind": "operator", "actor_id": "codex:operator-1"},
+                },
+                headers={"Idempotency-Key": "m24-recovery-assign-second"},
+            )
+        )
+        assert assigned["task"]["status"] == "assigned", assigned
+        second_handoff = _json(
+            await journey._human(
+                client,
+                "POST",
+                f"/api/investigations/{journey.state.investigation_id}/handoffs",
+                json={
+                    "task_id": str(second_task_id),
+                    "to_actor": {"kind": "operator", "actor_id": "codex:operator-1"},
+                    "next_action": "Analyser le second etage avant la perte de session.",
+                },
+                headers={"Idempotency-Key": "m24-recovery-handoff-v1"},
+            )
+        )
+        assert second_handoff["version"] == 1
+        opened = _json(
+            await journey._human(
+                client,
+                "POST",
+                f"/api/investigations/{journey.state.investigation_id}/agent-sessions",
+                json={
+                    "task_id": str(second_task_id),
+                    "adapter_kind": "codex_cli",
+                    "handoff_id": second_handoff["handoff_id"],
+                    "executable": "/usr/bin/fake-codex",
+                    "model": "fake-codex-model",
+                },
+                headers={"Idempotency-Key": "m24-recovery-open-second"},
+            )
+        )
+        loss_session_id = UUID(opened["session"]["id"])
+        loss_secret = await session_secret(uow_factory, loss_session_id)
+        await journey._wait_host_session_state(loss_session_id, {"running"})
+        loss_started = await journey._wait_host_log_type(loss_session_id, "started")
+        loss_pid = int(loss_started["pid"])
+        assert process_running(loss_pid)
+
+        # Abrupt host loss: the supervisor never records a clean exit.
+        recovery_agent.stop()
+        await wait_process_gone(loss_pid)
+        recovery_agent.start()
+        await rebind_host_clients(recovery_scenario, recovery_agent)
+        async with uow_factory() as uow:
+            still_row = await uow.agent_sessions.get(loss_session_id)
+        assert still_row is not None and still_row.state is AgentSessionState.RUNNING
+        reconciled = _json(
+            await journey._signed(client, loss_session_id, loss_secret, "reconcile", None)
+        )
+        assert reconciled["state"] == "lost", reconciled
+        assert reconciled["close_reason"] == "lost_unreconciled", reconciled
+        async with uow_factory() as uow:
+            lost_row = await uow.agent_sessions.get(loss_session_id)
+            handoffs = await uow.investigation_handoffs.list_for_investigation(
+                journey.state.investigation_id
+            )
+        assert lost_row is not None and lost_row.state is AgentSessionState.LOST
+        assert lost_row.reconciliation_outcome() is not None
+        assert {handoff.handoff.task_id for handoff in handoffs} >= {str(second_task_id)}
+        preserved = _json(
+            await journey._human(
+                client,
+                "GET",
+                f"/api/investigations/{journey.state.investigation_id}/workspace/files/content",
+                params={"path": NOTE_PATH},
+            )
+        )
+        assert "Observation locale synthetique" in preserved["text"]
+        stale_handoff = await journey._human(
+            client,
+            "POST",
+            f"/api/investigations/{journey.state.investigation_id}/agent-sessions",
+            json={
+                "task_id": str(second_task_id),
+                "adapter_kind": "codex_cli",
+                "handoff_id": second_handoff["handoff_id"],
+                "executable": "/usr/bin/fake-codex",
+                "model": "fake-codex-model",
+            },
+            headers={"Idempotency-Key": "m24-recovery-reopen-same-handoff"},
+        )
+        assert stale_handoff.status_code == 409, stale_handoff.text
+        # The loss either demands a fresh handoff or the old snapshot is stale:
+        # both are typed refusals and neither creates a session row.
+        assert stale_handoff.json()["detail"]["code"] in {
+            "new_handoff_required",
+            "handoff_task_stale",
+        }, stale_handoff.text
+        async with uow_factory() as uow:
+            sessions_after_refusal = await uow.agent_sessions.list_for_task(second_task_id)
+        assert {session.id for session in sessions_after_refusal} == {loss_session_id}
+        transfer_task = _json(
+            await journey._human(
+                client,
+                "GET",
+                f"/api/investigations/{journey.state.investigation_id}/tasks/{second_task_id}",
+            )
+        )
+        transferred = _json(
+            await journey._human(
+                client,
+                "POST",
+                f"/api/investigations/{journey.state.investigation_id}/tasks/"
+                f"{second_task_id}/transfer",
+                json={
+                    "to_actor_kind": "operator",
+                    "to_adapter_kind": "claude_code",
+                    "expected_status_version": transfer_task["status_version"],
+                    "open_session": True,
+                    "executable": "/usr/bin/fake-claude",
+                    "model": "fake-claude-model",
+                    "instruction": "Reprends la tache perdue depuis le nouvel handoff.",
+                },
+                headers={"Idempotency-Key": "m24-recovery-transfer-claude"},
+            )
+        )
+        assert transferred["handoff"]["version"] == 2, transferred["handoff"]
+        assert transferred["previous_handoff_version"] == 1
+        assert transferred["session"] is not None
+        assert transferred["session"]["state"] == "running"
+        new_session_id = UUID(transferred["session"]["id"])
+        await journey._wait_host_session_state(new_session_id, {"running", "awaiting_instruction"})
+        async with uow_factory() as uow:
+            sessions = await uow.agent_sessions.list_for_task(second_task_id)
+            final_task = await uow.investigation_tasks.get(second_task_id)
+        assert {session.id for session in sessions} >= {loss_session_id, new_session_id}
+        assert final_task is not None
+        assert final_task.assigned_actor_id == "operator:claude_code"
+        assert recovery_scenario.virus_total.calls["file_report"] == vt_before["file_report"] + 1
+        journey.journal.record(
+            "scenario_b_interruption_and_recovery",
+            f"interrupted {first_session} (group stopped), replay refused, expired lease "
+            f"refused, lost {loss_session_id} reconciled lost_unreconciled, note preserved, "
+            f"old handoff {second_handoff['handoff_id']} preserved, new session "
+            f"{new_session_id} via handoff v2",
+        )
+    print("\n=== Scenario B journal ===")
+    print(journey.journal.render())
+
+
+# ------------------------------------------------ scenario C: degradation
+
+
+async def test_scenario_c_degradation_states(
+    acceptance_scenario: ScenarioApplication,
+    acceptance_agent: RunningScenarioAgent,
+    uow_factory: Any,
+    tmp_path: Path,
+) -> None:
+    journey = ScenarioJourney(
+        scenario=acceptance_scenario,
+        agent=acceptance_agent,
+        uow_factory=uow_factory,
+        tmp_path=tmp_path,
+    )
+    seed = await seed_article(
+        uow_factory=uow_factory,
+        artifact_store=acceptance_scenario.artifact_store,
+        material=acceptance_scenario.material,
+    )
+    journey.state.seeded = seed
+    async with acceptance_scenario.client() as client:
+        await journey.step_01_start_investigation_via_api(client)
+        await journey.step_02_workspace_created_by_real_sidecar(client)
+        await journey.step_03_ioc_inventory(client)
+        await journey.step_04_g2_envelope_proposed_and_approved(client)
+        await journey.step_05_fake_vt_collection(client)
+        await journey.step_07_bridge_plan_accepted(client)
+        await journey.step_08_task_assigned_and_codex_session(client)
+        await journey._wait_host_session_state(
+            cast(UUID, journey.state.codex_session_id), {"running"}
+        )
+        await journey.step_11_human_local_markdown_note(client)
+        task_id = journey.state.loader_task_id
+        session_id = journey.state.codex_session_id
+        assert task_id is not None and session_id is not None
+
+        # 1. Bridge unavailable: a typed advisor failure, never a fabricated plan.
+        state = await journey._operator_state(client)
+        async with uow_factory() as uow:
+            plans_before = await uow.investigation_plans.list_for_investigation(
+                journey.state.investigation_id
+            )
+            tasks_before = await uow.investigation_tasks.list_for_investigation(
+                journey.state.investigation_id
+            )
+        acceptance_scenario.bridge.enqueue(
+            TurnSubmission(
+                TurnSubmissionStatus.UNAVAILABLE,
+                detail="Synthetic Bridge outage before any submission.",
+                error_code="conversation_unavailable",
+                submission_state="pre_submission",
+                retryable=False,
+                non_submission_proven=True,
+                failure_stage="bridge_transport_pre_submission",
+                failure_reason="conversation_unavailable",
+            )
+        )
+        bridge_down = _json(
+            await journey._human(
+                client,
+                "POST",
+                f"/api/investigations/{journey.state.investigation_id}/plans/request",
+                json={
+                    "expected_version": state["working_state_version"],
+                    "expected_sha256": state["working_state_sha256"],
+                    "question": "Plan synthetique pendant une panne Bridge.",
+                },
+                headers={"Idempotency-Key": "m24-degradation-bridge-down"},
+            )
+        )
+        assert bridge_down["advice_only"] is True, bridge_down
+        assert bridge_down["plan_version_id"] is None, bridge_down
+        assert bridge_down["invocation_status"] in {"unavailable", "failed"}, bridge_down
+        async with uow_factory() as uow:
+            failed_invocation = await uow.tool_invocations.get(UUID(bridge_down["invocation_id"]))
+            plans_after = await uow.investigation_plans.list_for_investigation(
+                journey.state.investigation_id
+            )
+            tasks_after = await uow.investigation_tasks.list_for_investigation(
+                journey.state.investigation_id
+            )
+        assert failed_invocation is not None
+        # A provably pre-submission outage is a typed failed/unavailable
+        # invocation; it is never a partial success and never a plan.
+        assert failed_invocation.status in {
+            ToolInvocationStatus.UNAVAILABLE,
+            ToolInvocationStatus.FAILED,
+        }, failed_invocation.status
+        assert len(plans_after) == len(plans_before)
+        assert len(tasks_after) == len(tasks_before)
+
+        # 2. VirusTotal unavailable: no report, no observation, no fake success.
+        provider_hash = acceptance_scenario.material.available_hashes[0]
+        async with uow_factory() as uow:
+            observations_before = await uow.evidence_observations.list_for_investigation(
+                journey.state.investigation_id
+            )
+        vt_reports_before = {
+            observation.id
+            for observation in observations_before
+            if observation.object_id == provider_hash and observation.source == "vt"
+        }
+        acceptance_scenario.virus_total.errors["file_report"] = VirusTotalRouteUnavailableError(
+            "synthetic VT route outage"
+        )
+        try:
+            vt_down = _json(
+                await signed_tool_call(
+                    client,
+                    investigation_id=journey.state.investigation_id,
+                    session_id=session_id,
+                    secret=journey.state.codex_secret,
+                    tool_name="vt.file_report",
+                    schema_version="1",
+                    arguments={"file_hash": acceptance_scenario.material.available_hashes[0]},
+                    idempotency_key="m24-degradation-vt-down",
+                )
+            )
+        finally:
+            acceptance_scenario.virus_total.errors.pop("file_report", None)
+        assert vt_down["status"] == "unavailable", vt_down
+        # The tool is registered but its provider route is unavailable: a typed
+        # ``tool_unavailable`` refusal, never a partial report or a new observation.
+        assert vt_down["error_code"] == "tool_unavailable", vt_down
+        async with uow_factory() as uow:
+            observations_after = await uow.evidence_observations.list_for_investigation(
+                journey.state.investigation_id
+            )
+        # A failed invocation may journal its own call record, but it must never
+        # fabricate a provider report for the requested object.
+        vt_reports_after = {
+            observation.id
+            for observation in observations_after
+            if observation.object_id == provider_hash and observation.source == "vt"
+        }
+        assert vt_reports_after == vt_reports_before
+
+        # 3. Stale anchor: the proposal stays pinned to the base it was drafted
+        # on; a newer publication refuses acceptance without materialising.
+        state = await journey._operator_state(client)
+        draft_invocation = uuid4()
+        draft = note_draft_response(
+            block_type="key_findings",
+            anchor=NOTE_B_ANCHOR,
+            text="NOTE-STALE-BASE: proposition pinnee sur la base initiale.",
+            bridge_invocation_id=draft_invocation,
+        )
+        acceptance_scenario.bridge.enqueue(
+            bridge_submission(draft["output_text"], bridge_invocation_id=draft_invocation)
+        )
+        proposal_response = _json(
+            await journey._human(
+                client,
+                "POST",
+                f"/api/investigations/{journey.state.investigation_id}/note-proposals",
+                json={
+                    "anchor": NOTE_B_ANCHOR,
+                    "target_block_type": "section",
+                    "bridge_block_type": "key_findings",
+                    "consultation_type": "draft_text",
+                    "task_id": str(task_id),
+                    "expected_working_state_version": state["working_state_version"],
+                    "expected_working_state_sha256": state["working_state_sha256"],
+                },
+                headers={"Idempotency-Key": "m24-degradation-stale-proposal"},
+            )
+        )
+        proposal = proposal_response["proposal"]
+        assert proposal_response["materialised"] is True, proposal_response
+        assert proposal["base_publication_artifact_id"] == str(seed.publication.id)
+        async with uow_factory() as uow:
+            await uow.production_artifacts.append(
+                ProductionArtifact(
+                    production_run_id=seed.run.id,
+                    subject_id=seed.subject.id,
+                    stage=ProductionArtifactStage.PUBLICATION,
+                    version=2,
+                    input_hash=seed.publication.input_hash,
+                    canonical_blob_id=seed.publication.canonical_blob_id,
+                    status=ProductionArtifactStatus.VERIFIED,
+                )
+            )
+            await uow.commit()
+        stale_accept = await journey._human(
+            client,
+            "POST",
+            f"/api/investigations/{journey.state.investigation_id}/note-proposals/"
+            f"{proposal['id']}/accept",
+            json={
+                "expected_status_version": proposal["status_version"],
+                "expected_base_version": None,
+                "expected_base_sha256": None,
+                "reason": "Tentative d'acceptation sur une base de publication obsolete",
+            },
+            headers={"Idempotency-Key": "m24-degradation-stale-accept"},
+        )
+        assert stale_accept.status_code == 409, stale_accept.text
+        assert stale_accept.json()["detail"]["code"] == "stale_base", stale_accept.text
+        opinion_payload = _json(
+            await journey._human(
+                client,
+                "GET",
+                f"/api/investigations/{journey.state.investigation_id}/opinion",
+            )
+        )
+        assert opinion_payload["draft"] is None, opinion_payload
+        async with uow_factory() as uow:
+            decisions = await uow.analyst_decisions.list_for_investigation(
+                journey.state.investigation_id
+            )
+        assert not any(
+            decision.decision_type is AnalystDecisionType.NOTE_APPROVE for decision in decisions
+        )
+
+        # 4. Permission revoked: every external-disclosure path is refused and
+        # the work already persisted is untouched.
+        envelope = _json(
+            await journey._human(
+                client,
+                "GET",
+                f"/api/investigations/{journey.state.investigation_id}/envelope",
+            )
+        )
+        assert envelope["currently_authorized"] is True, envelope
+        revoked = _json(
+            await journey._human(
+                client,
+                "POST",
+                f"/api/investigations/{journey.state.investigation_id}/envelope/revoke",
+                json={
+                    "expected_version": envelope["version"],
+                    "reason": "Retrait synthetique de l'autorisation G2",
+                    "correlation_id": "m24-degradation-revoke",
+                },
+                headers={"Idempotency-Key": "m24-degradation-revoke"},
+            )
+        )
+        assert revoked["currently_authorized"] is False, revoked
+        vt_calls_before_denial = dict(acceptance_scenario.virus_total.calls)
+        async with uow_factory() as uow:
+            observations_before_denial = await uow.evidence_observations.list_for_investigation(
+                journey.state.investigation_id
+            )
+        denied = await signed_tool_call(
+            client,
+            investigation_id=journey.state.investigation_id,
+            session_id=session_id,
+            secret=journey.state.codex_secret,
+            tool_name="vt.file_report",
+            schema_version="1",
+            arguments={"file_hash": acceptance_scenario.material.available_hashes[0]},
+            idempotency_key="m24-degradation-after-revoke",
+        )
+        assert denied.status_code == 403, denied.text
+        assert denied.json()["detail"]["code"] == "external_disclosure_denied", denied.text
+        assert acceptance_scenario.virus_total.calls == vt_calls_before_denial
+        denied_instruction = await journey._human(
+            client,
+            "POST",
+            f"/api/investigations/{journey.state.investigation_id}/agent-sessions/"
+            f"{session_id}/instructions",
+            json={"action": "enqueue", "text": "Instruction refusee.", "note_refs": []},
+            headers={"Idempotency-Key": "m24-degradation-instruction-denied"},
+        )
+        assert denied_instruction.status_code == 403, denied_instruction.text
+        assert (
+            denied_instruction.json()["detail"]["code"] == "agent_session_external_llm_not_allowed"
+        )
+        async with uow_factory() as uow:
+            observations_after_denial = await uow.evidence_observations.list_for_investigation(
+                journey.state.investigation_id
+            )
+        assert len(observations_after_denial) == len(observations_before_denial)
+
+        # 5. Workspace absent: the exact availability state is reported and the
+        # canonical revisions/note stay intact; no write pretends to succeed.
+        async with uow_factory() as uow:
+            revisions_before_absence = await uow.workspace_file_revisions.list_for_workspace(
+                journey.state.workspace_id
+            )
+        acceptance_scenario.app.state.workspace_agent_port = None
+        acceptance_scenario.app.state.settings = acceptance_scenario.settings.model_copy(
+            update={
+                "workspace_agent_socket": f"/tmp/m24-absent-{uuid4().hex}.sock",
+            }
+        )
+        try:
+            absent_status = _json(
+                await journey._human(
+                    client,
+                    "GET",
+                    f"/api/investigations/{journey.state.investigation_id}/workspace",
+                )
+            )
+            assert absent_status["workspace_available"] is False, absent_status
+            assert absent_status["availability_code"] in {
+                "unavailable",
+                "unconfigured",
+            }, absent_status
+            assert absent_status["counts"]["files"] >= 1, absent_status
+            assert absent_status["counts"]["human_notes"] >= 1, absent_status
+            absent_content = await journey._human(
+                client,
+                "GET",
+                f"/api/investigations/{journey.state.investigation_id}/workspace/files/content",
+                params={"path": NOTE_PATH},
+            )
+            assert absent_content.status_code == 503, absent_content.text
+            assert absent_content.json()["detail"]["code"] == "workspace_local_unavailable", (
+                absent_content.text
+            )
+            absent_sync = await journey._human(
+                client,
+                "POST",
+                f"/api/investigations/{journey.state.investigation_id}/workspace/sync",
+            )
+            assert absent_sync.status_code == 503, absent_sync.text
+            assert absent_sync.json()["detail"]["code"] == "workspace_local_unavailable"
+            absent_write = await journey._human(
+                client,
+                "PUT",
+                f"/api/investigations/{journey.state.investigation_id}/workspace/files",
+                json={
+                    "path": NOTE_PATH,
+                    "expected_sha256": "new",
+                    "text": "ecriture impossible",
+                },
+                headers={"Idempotency-Key": "m24-degradation-workspace-write"},
+            )
+            assert absent_write.status_code == 503, absent_write.text
+            assert absent_write.json()["detail"]["code"] == "workspace_local_unavailable"
+        finally:
+            acceptance_scenario.app.state.settings = acceptance_scenario.settings
+        async with uow_factory() as uow:
+            revisions_after_absence = await uow.workspace_file_revisions.list_for_workspace(
+                journey.state.workspace_id
+            )
+        assert len(revisions_after_absence) == len(revisions_before_absence)
+        root = journey.state.workspace_root
+        assert root is not None
+        assert (root / NOTE_PATH).is_file()
+        journey.journal.record(
+            "scenario_c_degradation_states",
+            "Bridge unavailable -> advice_only, VT unavailable -> capability_unavailable "
+            "without observation, stale base -> 409 stale_base without opinion, G2 revoked "
+            "-> external_disclosure_denied, workspace absent -> unavailable with intact "
+            "revisions",
+        )
+    print("\n=== Scenario C degradation journal ===")
+    print(journey.journal.render())
+
+
+async def test_scenario_c_cli_absent_and_sandbox_unattested(
+    unattested_scenario: ScenarioApplication,
+    unattested_agent: RunningScenarioAgent,
+    uow_factory: Any,
+    tmp_path: Path,
+) -> None:
+    journey = ScenarioJourney(
+        scenario=unattested_scenario,
+        agent=unattested_agent,
+        uow_factory=uow_factory,
+        tmp_path=tmp_path,
+    )
+    journey.state.seeded = await seed_article(
+        uow_factory=uow_factory,
+        artifact_store=unattested_scenario.artifact_store,
+        material=unattested_scenario.material,
+    )
+    async with unattested_scenario.client() as client:
+        await journey.step_01_start_investigation_via_api(client)
+        await journey.step_02_workspace_created_by_real_sidecar(client)
+        await journey.step_03_ioc_inventory(client)
+        await journey.step_04_g2_envelope_proposed_and_approved(client)
+        await journey.step_05_fake_vt_collection(client)
+        await journey.step_07_bridge_plan_accepted(client)
+        task_id = journey.state.loader_task_id
+        assert task_id is not None
+        task = _json(
+            await journey._human(
+                client,
+                "GET",
+                f"/api/investigations/{journey.state.investigation_id}/tasks/{task_id}",
+            )
+        )
+        assigned = _json(
+            await journey._human(
+                client,
+                "POST",
+                f"/api/investigations/{journey.state.investigation_id}/tasks/{task_id}/commands",
+                json={
+                    "command": "assign",
+                    "expected_status_version": task["status_version"],
+                    "target": {"actor_kind": "operator", "actor_id": "codex:operator-1"},
+                },
+                headers={"Idempotency-Key": "m24-degradation-assign"},
+            )
+        )
+        assert assigned["task"]["status"] == "assigned", assigned
+
+        # CLI absent: the host has no profile for codex_cli at all.
+        missing_cli = await journey._human(
+            client,
+            "GET",
+            "/api/investigations/agent-sessions/capabilities",
+            params={"adapter_kind": "codex_cli", "executable": "/usr/bin/fake-codex"},
+        )
+        assert missing_cli.status_code == 409, missing_cli.text
+        assert missing_cli.json()["detail"]["code"] == "capability_unavailable", missing_cli.text
+
+        # Sandbox not attestable: the probe refuses the loopback-isolated claim.
+        unattested = await journey._human(
+            client,
+            "GET",
+            "/api/investigations/agent-sessions/capabilities",
+            params={"adapter_kind": "claude_code", "executable": "/usr/bin/fake-claude"},
+        )
+        assert unattested.status_code == 503, unattested.text
+        detail = unattested.json()["detail"]
+        assert detail["code"] == "agent_session_network_isolation_unavailable", detail
+        assert detail["details"]["reason"] == "loopback_not_isolated", detail
+
+        handoff = _json(
+            await journey._human(
+                client,
+                "POST",
+                f"/api/investigations/{journey.state.investigation_id}/handoffs",
+                json={
+                    "task_id": str(task_id),
+                    "to_actor": {"kind": "operator", "actor_id": "operator:claude_code"},
+                    "next_action": "Session impossible: la sandbox n'est pas attestee.",
+                },
+                headers={"Idempotency-Key": "m24-degradation-handoff"},
+            )
+        )
+        refused_open = await journey._human(
+            client,
+            "POST",
+            f"/api/investigations/{journey.state.investigation_id}/agent-sessions",
+            json={
+                "task_id": str(task_id),
+                "adapter_kind": "claude_code",
+                "handoff_id": handoff["handoff_id"],
+                "executable": "/usr/bin/fake-claude",
+                "model": "fake-claude-model",
+            },
+            headers={"Idempotency-Key": "m24-degradation-open-unattested"},
+        )
+        assert refused_open.status_code == 503, refused_open.text
+        assert (
+            refused_open.json()["detail"]["code"] == "agent_session_network_isolation_unavailable"
+        )
+        async with uow_factory() as uow:
+            sessions = await uow.agent_sessions.list_for_task(task_id)
+            stored_task = await uow.investigation_tasks.get(task_id)
+        assert sessions == ()
+        assert stored_task is not None
+        assert stored_task.status.value in {"assigned", "ready"}
+        assert stored_task.assigned_actor_id == "codex:operator-1"
+        journey.journal.record(
+            "scenario_c_cli_absent_and_sandbox_unattested",
+            "codex_cli absent -> 409 capability_unavailable; unattested Claude sandbox "
+            "-> 503 network_isolation_unavailable; no session row, task preserved",
+        )
+    print("\n=== Scenario C (CLI/sandbox) journal ===")
+    print(journey.journal.render())
