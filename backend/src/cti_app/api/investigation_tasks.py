@@ -58,6 +58,10 @@ from cti_app.application.investigation_tasks import (
     TaskSessionRelease,
 )
 from cti_app.application.investigation_timeline import (
+    AgentSessionTimelineSource,
+    ContributionTimelineSource,
+    HandoffTimelineSource,
+    InstructionTimelineSource,
     InvestigationTimelineService,
     TimelinePageV1,
     decode_position_cursor,
@@ -830,6 +834,12 @@ async def get_timeline(
             observations=uow.evidence_observations,
             invocations=uow.tool_invocations,
             plans=uow.investigation_plans,
+            extra_sources=(
+                HandoffTimelineSource(uow.investigation_handoffs),
+                ContributionTimelineSource(uow.work_contributions),
+                AgentSessionTimelineSource(uow.agent_sessions),
+                InstructionTimelineSource(uow.agent_sessions),
+            ),
         )
         try:
             return await service.page(investigation_id, cursor=cursor, limit=limit)
