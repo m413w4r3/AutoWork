@@ -62,7 +62,11 @@ from cti_app.application.typst_rendering import (
     TypstTemplateBundle,
     load_template_bundle,
 )
-from cti_app.domain.analyst_opinion import AnalystOpinionV1, CanonicalCodeNoteBlockV1
+from cti_app.domain.analyst_opinion import (
+    AnalystOpinionV1,
+    CanonicalCodeNoteBlockV1,
+    IocTableNoteBlockV1,
+)
 from cti_app.domain.edition_publication import EditionDocumentV2
 from cti_app.domain.editorial import AnalystDecisionTargetType, AnalystDecisionType
 from cti_app.domain.investigation import EvidenceObservation, InvestigationFinding
@@ -288,32 +292,39 @@ async def load_note_block_render_context(
     """Read exactly the canonical facts an opinion's note blocks cite."""
     if not any(item.content_blocks for item in opinion.observations):
         return None
+    cited_observation_ids: set[UUID] = set()
+    for note in opinion.observations:
+        for block in note.content_blocks:
+            if isinstance(block, CanonicalCodeNoteBlockV1):
+                cited_observation_ids.add(block.observation_id)
+            elif isinstance(block, IocTableNoteBlockV1):
+                cited_observation_ids.update(block.observation_ids)
+    observations_by_id: dict[UUID, EvidenceObservation] = {}
     async with uow_factory() as uow:
         evidence_observations = getattr(uow, "evidence_observations", None)
-        list_for_investigation = getattr(evidence_observations, "list_for_investigation", None)
-        observations = (
-            tuple(await list_for_investigation(opinion.investigation_id))
-            if callable(list_for_investigation)
-            else ()
-        )
-    blob_ids_by_observation = {item.id: item.blob_id for item in observations}
+        get_observation = getattr(evidence_observations, "get", None)
+        if callable(get_observation):
+            for observation_id in sorted(cited_observation_ids, key=str):
+                observation = await get_observation(observation_id)
+                if observation is not None:
+                    observations_by_id[observation_id] = observation
     blobs: dict[UUID, bytes] = {}
-    for observation in opinion.observations:
-        for block in observation.content_blocks:
+    for note in opinion.observations:
+        for block in note.content_blocks:
             if not isinstance(block, CanonicalCodeNoteBlockV1):
                 continue
-            blob_id = blob_ids_by_observation.get(block.observation_id)
-            if blob_id is None:
+            stored = observations_by_id.get(block.observation_id)
+            if stored is None:
                 continue
             try:
                 blobs[block.observation_id] = await artifact_store.read_bytes(
-                    blob_id, max_bytes=None
+                    stored.blob_id, max_bytes=None
                 )
             except (KeyError, OSError, TypeError, ValueError):
                 # The projection refuses the stale reference instead of guessing.
                 continue
     return NoteBlockRenderContext(
-        observations=observations,
+        observations=tuple(observations_by_id.values()),
         blobs=blobs,
         element_facts=note_article_element_facts(base_document),
     )

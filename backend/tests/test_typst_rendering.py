@@ -2900,13 +2900,13 @@ def test_note_chart_without_evidence_refused() -> None:
     assert note_block["blocks"][0]["reference_label"] == (f"Figure 1 — {published_chart.title}")
 
 
-def test_load_note_block_render_context_reads_only_cited_code_blobs() -> None:
+def test_load_note_block_render_context_reads_only_cited_observations() -> None:
     """The published render path reads exactly the observations its blocks cite."""
     from cti_app.application.publication_rendering import load_note_block_render_context
 
     raw = b"cited bytes"
     publication = _base_v5()
-    observation = EvidenceObservation(
+    cited_code = EvidenceObservation(
         investigation_id=uuid4(),
         kind=ObservationEvidenceKind.BINARY_ANALYSIS,
         blob_id=uuid4(),
@@ -2917,13 +2917,39 @@ def test_load_note_block_render_context_reads_only_cited_code_blobs() -> None:
         object_type="native_analysis",
         object_id="cited.bin",
     )
-    block = CanonicalCodeNoteBlockV1(
-        observation_id=observation.id,
-        blob_sha256=observation.sha256,
+    cited_ioc = EvidenceObservation(
+        investigation_id=cited_code.investigation_id,
+        kind=ObservationEvidenceKind.OTHER,
+        blob_id=uuid4(),
+        sha256="6" * 64,
+        source="vt",
+        source_version="fixture.v1",
+        observed_at=datetime.now(UTC),
+        object_type="ip",
+        object_id="192.0.2.44",
+    )
+    uncited = EvidenceObservation(
+        investigation_id=cited_code.investigation_id,
+        kind=ObservationEvidenceKind.OTHER,
+        blob_id=uuid4(),
+        sha256="7" * 64,
+        source="shodan",
+        source_version="fixture.v1",
+        observed_at=datetime.now(UTC),
+        object_type="ip",
+        object_id="192.0.2.45",
+    )
+    code_block = CanonicalCodeNoteBlockV1(
+        observation_id=cited_code.id,
+        blob_sha256=cited_code.sha256,
         offset=0,
         length=len(raw),
         excerpt_sha256=hashlib.sha256(raw).hexdigest(),
         language="text",
+    )
+    ioc_block = IocTableNoteBlockV1(
+        observation_ids=(cited_ioc.id,),
+        title=note_ioc_table_title(1),
     )
     note = AnalystObservationV1(
         id=UUID(int=8822),
@@ -2931,10 +2957,10 @@ def test_load_note_block_render_context_reads_only_cited_code_blobs() -> None:
         text="NOTE-CONTEXT-FIXTURE",
         state=AnalystObservationState.UNRESOLVED,
         relation=AnalystObservationRelation.UNRESOLVED,
-        content_blocks=(block,),
+        content_blocks=(code_block, ioc_block),
     )
     opinion = AnalystOpinionV1(
-        investigation_id=observation.investigation_id,
+        investigation_id=cited_code.investigation_id,
         synthesis_artifact_id=uuid4(),
         synthesis_sha256="5" * 64,
         base_publication_artifact_id=uuid4(),
@@ -2954,11 +2980,16 @@ def test_load_note_block_render_context_reads_only_cited_code_blobs() -> None:
 
     class _Uow:
         def __init__(self) -> None:
-            self.evidence_observations = SimpleNamespace(list_for_investigation=self._list)
+            self.requested: list[UUID] = []
+            self.evidence_observations = SimpleNamespace(get=self._get)
 
-        async def _list(self, investigation_id: UUID) -> list[EvidenceObservation]:
-            assert investigation_id == observation.investigation_id
-            return [observation]
+        async def _get(self, observation_id: UUID) -> EvidenceObservation | None:
+            self.requested.append(observation_id)
+            return {
+                cited_code.id: cited_code,
+                cited_ioc.id: cited_ioc,
+                uncited.id: uncited,
+            }.get(observation_id)
 
         async def __aenter__(self) -> _Uow:
             return self
@@ -2974,10 +3005,11 @@ def test_load_note_block_render_context_reads_only_cited_code_blobs() -> None:
             self.reads.append(blob_id)
             return raw
 
+    uow = _Uow()
     store = _Store()
     context = asyncio.run(
         load_note_block_render_context(
-            uow_factory=cast(Any, lambda: _Uow()),
+            uow_factory=cast(Any, lambda: uow),
             artifact_store=cast(Any, store),
             opinion=opinion,
             base_document=publication,
@@ -2985,16 +3017,19 @@ def test_load_note_block_render_context_reads_only_cited_code_blobs() -> None:
     )
 
     assert context is not None
-    assert context.observations == (observation,)
-    assert context.blobs == {observation.id: raw}
-    assert store.reads == [observation.blob_id]
+    assert {item.id for item in context.observations} == {cited_code.id, cited_ioc.id}
+    assert context.blobs == {cited_code.id: raw}
+    assert set(uow.requested) == {cited_code.id, cited_ioc.id}
+    assert uncited.id not in uow.requested
+    assert store.reads == [cited_code.blob_id]
     blockedless = replace(
         opinion, blocks=opinion_blocks_with_observations((), ()), content_sha256=""
     )
+    unbounded_uow = _Uow()
     assert (
         asyncio.run(
             load_note_block_render_context(
-                uow_factory=cast(Any, lambda: _Uow()),
+                uow_factory=cast(Any, lambda: unbounded_uow),
                 artifact_store=cast(Any, store),
                 opinion=blockedless,
                 base_document=publication,
@@ -3002,6 +3037,7 @@ def test_load_note_block_render_context_reads_only_cited_code_blobs() -> None:
         )
         is None
     )
+    assert unbounded_uow.requested == []
 
 
 def test_note_stale_block_ref_refused() -> None:
