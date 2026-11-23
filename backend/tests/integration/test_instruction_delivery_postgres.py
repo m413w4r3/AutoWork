@@ -460,6 +460,93 @@ def test_two_concurrent_drainers_reserve_once_and_call_host_once(
     asyncio.run(run())
 
 
+def test_terminal_session_stale_delivering_is_reconciled_and_cancelable(
+    migrated_postgres_url: str,
+) -> None:
+    """R4B-F1: a stale ``delivering`` attempt of a lost session still resolves.
+
+    The crash window between phases A and C is documented; when the task lease
+    then expires and the sweep marks the session ``lost``, the row used to be
+    invisible to the active-session drain list and stayed ``delivering`` for
+    ever, refusing human cancellation and every transfer preflight.  The
+    dedicated reconciliation query covers ALL sessions and the CAS keeps it
+    safe.
+    """
+
+    async def run() -> None:
+        engine = create_postgres_engine(migrated_postgres_url)
+        try:
+            factory = create_session_factory(engine)
+            investigation = await _seed_investigation(factory)
+            session = await _seed_leased_session(factory, investigation.id)
+            attempted_at = NOW - timedelta(seconds=GRACE_SECONDS + 60)
+            text = "Delivered before the crash?"
+            queued = await _seed_instruction(
+                factory,
+                session,
+                text=text,
+                key=f"pg-stale-delivering-{uuid4().hex[:8]}",
+                queued_at=attempted_at,
+            )
+            token = uuid4()
+            reserved = queued.with_delivery_reserved(
+                token=token,
+                delivery_sha256=instruction_text_sha256(text),
+                now=attempted_at,
+            )
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                await uow.agent_sessions.update_instruction_delivery(
+                    reserved,
+                    expected_state=InstructionState.QUEUED,
+                    expected_delivery_token=None,
+                )
+                await uow.commit()
+
+            # The CLI can no longer renew its lease: the sweep marks it lost.
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                current = await uow.agent_sessions.get(session.id)
+                assert current is not None
+                lost = current.with_state(AgentSessionState.LOST, now=NOW)
+                stored = await uow.agent_sessions.update_state(
+                    lost, expected_state_version=current.state_version
+                )
+                assert stored is not None
+                await uow.commit()
+
+            host = _FakeHost()
+            report = await _delivery_service(factory, host).drain_once()
+
+            assert report.stale_unknown == 1
+            assert host.send_calls == []
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                recovered = await uow.agent_sessions.get_instruction(queued.id)
+            assert recovered is not None
+            assert recovered.state is InstructionState.DELIVERY_UNKNOWN
+            assert recovered.delivery_token == token
+            assert recovered.last_delivery_error == "delivery_timeout"
+
+            # A human may now cancel the ambiguous instruction (and a transfer
+            # preflight, which refuses any ``delivering`` row, no longer does).
+            cancel_service = SessionService(
+                uow_factory=lambda: SqlAlchemyUnitOfWork(factory),
+                deriver=None,
+                clock=lambda: NOW,
+            )
+            cancelled = await cancel_service.cancel_instruction(
+                investigation.id,
+                session.id,
+                instruction_id=queued.id,
+                reason="the session is lost",
+                actor=HUMAN_ACTOR,
+                now=NOW,
+            )
+            assert cancelled.state is InstructionState.CANCELLED
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
 def test_instruction_drain_lock_excludes_without_an_idle_transaction(
     migrated_postgres_url: str,
 ) -> None:

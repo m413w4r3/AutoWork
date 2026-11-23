@@ -870,8 +870,17 @@ class InstructionDeliveryService:
     # ---------------------------------------------------------- reconciliation
 
     async def _reconcile_stale_delivering(self, now: datetime) -> int:
-        """A crash between A and C becomes an ambiguous attempt after the grace."""
-        stale = await self._list_pending(self._batch_size)
+        """A crash between A and C becomes an ambiguous attempt after the grace.
+
+        Runs on a dedicated all-session query: the active-session delivery
+        batch must not hide an attempt whose session became terminal after the
+        crash, or the row would stay ``delivering`` for ever (R4B-F1).
+        """
+        cutoff = now - timedelta(seconds=self._grace_seconds)
+        async with self._uow_factory() as uow:
+            stale = await uow.agent_sessions.list_stale_delivering(
+                attempted_before=cutoff, limit=self._batch_size
+            )
         converted = 0
         for instruction in stale:
             if instruction.state is not InstructionState.DELIVERING:

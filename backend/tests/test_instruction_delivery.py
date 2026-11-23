@@ -802,6 +802,72 @@ async def test_dead_session_rows_never_fill_the_batch_and_starve_a_live_one() ->
     assert (await harness.instruction(queued.id)).state is InstructionState.DELIVERED
 
 
+async def _seed_stale_delivering(
+    harness: _Harness,
+    session: AgentSessionV1,
+    *,
+    key: str,
+    text: str,
+    attempted_at: datetime,
+) -> tuple[AgentSessionInstructionV1, UUID]:
+    """A phase-A reservation whose phase C never ran (crash window)."""
+    queued = await harness.seed_queued_instruction(
+        session, text=text, key=key, queued_at=attempted_at
+    )
+    token = uuid4()
+    reserved = queued.with_delivery_reserved(
+        token=token,
+        delivery_sha256=instruction_text_sha256(text),
+        now=attempted_at,
+    )
+    await harness.sessions.update_instruction_delivery(
+        reserved, expected_state=InstructionState.QUEUED, expected_delivery_token=None
+    )
+    return queued, token
+
+
+async def test_terminal_session_stale_delivering_is_reconciled_and_cancelable() -> None:
+    """R4B-F1: a crash whose session later became lost must still resolve.
+
+    The active-session filter protects the delivery batch from dead rows, but
+    it must never hide a stale ``delivering`` attempt: the design converts it
+    to ``delivery_unknown`` after the grace so a human can cancel or hand the
+    task off (F3-D §3.5).  Before the dedicated reconciliation query the row
+    stayed ``delivering`` forever and both actions were refused.
+    """
+    harness = _Harness()
+    attempted_at = NOW - timedelta(seconds=GRACE_SECONDS + 60)
+    session = await harness.seed_session(state=AgentSessionState.AWAITING_INSTRUCTION)
+    queued, token = await _seed_stale_delivering(
+        harness, session, key="i-lost-stale", text="Crash on a lost session.", attempted_at=attempted_at
+    )
+    # The lease expired and the sweep marked the session lost after the crash.
+    stored = await harness.sessions.get(session.id)
+    assert stored is not None
+    await harness.sessions.update_state(
+        stored.with_state(AgentSessionState.LOST, now=NOW),
+        expected_state_version=stored.state_version,
+    )
+
+    report = await harness.delivery.drain_once()
+
+    assert report.stale_unknown == 1
+    recovered = await harness.instruction(queued.id)
+    assert recovered.state is InstructionState.DELIVERY_UNKNOWN
+    assert recovered.delivery_token == token
+    assert recovered.last_delivery_error == "delivery_timeout"
+
+    cancelled = await harness.service.cancel_instruction(
+        INVESTIGATION_ID,
+        session.id,
+        instruction_id=queued.id,
+        reason="the session is lost",
+        actor=HUMAN_ACTOR,
+        now=NOW,
+    )
+    assert cancelled.state is InstructionState.CANCELLED
+
+
 # ----------------------------------------------------- database clock (R4-F4)
 
 

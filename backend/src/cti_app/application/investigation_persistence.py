@@ -637,6 +637,17 @@ class AgentSessionRepository(Protocol):
         """Drain candidates (queued|delivering|delivery_unknown) in (queued_at,id) order."""
         ...
 
+    async def list_stale_delivering(
+        self, *, attempted_before: datetime, limit: int
+    ) -> tuple[AgentSessionInstructionV1, ...]:
+        """``delivering`` attempts older than the grace on ANY session (R4B-F1).
+
+        Reconciliation is separate from the active-session drain list: a crash
+        between phases A and C whose session later became terminal must still
+        become ``delivery_unknown`` so a human can cancel or hand the task off.
+        """
+        ...
+
     async def update_instruction_delivery(
         self,
         instruction: AgentSessionInstructionV1,
@@ -2024,6 +2035,11 @@ class InMemoryInvestigationHandoffRepository:
             return record, True
 
 
+def _attempted_at(instruction: AgentSessionInstructionV1) -> datetime:
+    """The attempt timestamp, tolerant of a hydrated row missing it."""
+    return instruction.delivery_attempted_at or instruction.updated_at
+
+
 class InMemoryAgentSessionRepository:
     """In-memory port fake sharing the SQL repository's observable rules.
 
@@ -2249,6 +2265,21 @@ class InMemoryAgentSessionRepository:
             key=lambda instruction: (instruction.queued_at, str(instruction.id)),
         )
         return tuple(pending[:limit])
+
+    async def list_stale_delivering(
+        self, *, attempted_before: datetime, limit: int
+    ) -> tuple[AgentSessionInstructionV1, ...]:
+        """Every session's stale attempt is reconcilable, unlike delivery rows."""
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        stale = [
+            instruction
+            for instruction in self._instructions.values()
+            if instruction.state is InstructionState.DELIVERING
+            and _attempted_at(instruction) <= attempted_before
+        ]
+        stale.sort(key=lambda instruction: (_attempted_at(instruction), str(instruction.id)))
+        return tuple(stale[:limit])
 
     async def update_instruction_delivery(
         self,

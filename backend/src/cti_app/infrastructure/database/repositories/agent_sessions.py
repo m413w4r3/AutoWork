@@ -531,6 +531,33 @@ class SqlAlchemyAgentSessionRepository:
         )
         return tuple(_instruction_from_row(row) for row in rows)
 
+    async def list_stale_delivering(
+        self, *, attempted_before: datetime, limit: int
+    ) -> tuple[AgentSessionInstructionV1, ...]:
+        """Stale phase-A attempts across ALL sessions, oldest first (R4B-F1).
+
+        The delivery batch is bounded to active sessions so dead rows cannot
+        starve it; reconciliation must not reuse that list, or a crash whose
+        session later became ``lost`` would pin the instruction in
+        ``delivering`` for ever (cancel and transfer both refuse that state).
+        """
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        attempted = func.coalesce(
+            AgentSessionInstructionRow.delivery_attempted_at,
+            AgentSessionInstructionRow.updated_at,
+        )
+        rows = await self._session.scalars(
+            select(AgentSessionInstructionRow)
+            .where(
+                AgentSessionInstructionRow.state == InstructionState.DELIVERING.value,
+                attempted <= attempted_before,
+            )
+            .order_by(attempted, AgentSessionInstructionRow.id)
+            .limit(limit)
+        )
+        return tuple(_instruction_from_row(row) for row in rows)
+
     async def update_instruction_delivery(
         self,
         instruction: AgentSessionInstructionV1,
