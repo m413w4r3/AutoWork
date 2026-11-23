@@ -365,6 +365,69 @@ def test_spawn_fails_closed_when_attestation_is_unavailable(
     assert "attestation" in str(raised.value)
 
 
+def test_spawn_refuses_a_forged_argv_without_the_netns_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # F9: the attestation probes the binary, never the argv about to launch.
+    # An argv that lost ``--unshare-net`` must fail closed before any Popen.
+    plan = _isolated_plan(tmp_path, ("/usr/bin/codex", "exec"))
+    forged = tuple(token for token in plan.argv if token != "--unshare-net")
+    assert "--unshare-net" not in forged
+    forged_plan = process.LaunchPlan(
+        argv=forged,
+        env=plan.env,
+        cwd=plan.cwd,
+        uses_bwrap=True,
+        network_mode=plan.network_mode,
+    )
+    monkeypatch.setattr(
+        process,
+        "network_isolation_attestation",
+        lambda **kwargs: process.NetworkIsolationAttestation(
+            True, "test attestation", process.NETWORK_MODE_ISOLATED_EGRESS, True
+        ),
+    )
+    monkeypatch.setattr(
+        process.subprocess, "Popen", lambda *a, **k: pytest.fail("a process was spawned")
+    )
+
+    with pytest.raises(process.NetworkIsolationUnavailable) as raised:
+        process.spawn(forged_plan)
+    assert raised.value.code == "confinement_unavailable"
+    assert "sandbox profile" in str(raised.value)
+
+
+@pytest.mark.parametrize("widening", ["--share-net", "--dev-bind", "--cap-add"])
+def test_spawn_refuses_an_argv_that_widens_the_sandbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, widening: str
+) -> None:
+    plan = _isolated_plan(tmp_path, ("/usr/bin/codex", "exec"))
+    separator = plan.argv.index("--")
+    forged = (*plan.argv[:separator], widening, *plan.argv[separator:])
+    monkeypatch.setattr(
+        process,
+        "network_isolation_attestation",
+        lambda **kwargs: process.NetworkIsolationAttestation(
+            True, "test attestation", process.NETWORK_MODE_ISOLATED_EGRESS, True
+        ),
+    )
+    monkeypatch.setattr(
+        process.subprocess, "Popen", lambda *a, **k: pytest.fail("a process was spawned")
+    )
+    with pytest.raises(process.NetworkIsolationUnavailable) as raised:
+        process.spawn(
+            process.LaunchPlan(
+                argv=forged,
+                env=plan.env,
+                cwd=plan.cwd,
+                uses_bwrap=True,
+                network_mode=plan.network_mode,
+            )
+        )
+    assert raised.value.code == "confinement_unavailable"
+    assert "widens the sandbox" in str(raised.value)
+
+
 def test_spawn_fails_closed_when_the_egress_proxy_socket_is_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

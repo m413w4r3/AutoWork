@@ -67,6 +67,34 @@ ATTESTATION_ENV = {
     "LC_ALL": "C.UTF-8",
 }
 BLOCKED_ERRNO_NAMES = frozenset({"ENETUNREACH", "EHOSTUNREACH", "EPERM", "EACCES"})
+# F9: the sandbox profile ``build_bwrap_argv`` always emits.  ``spawn`` attests
+# a fresh netns and then launches the plan argv verbatim, so the argv it is
+# about to launch must carry this exact mandatory prefix and none of the
+# options that would widen the sandbox.
+BWRAP_NAMESPACE_ARGV: tuple[str, ...] = (
+    "--unshare-pid",
+    "--unshare-ipc",
+    "--unshare-uts",
+    "--die-with-parent",
+    "--unshare-net",
+)
+BWRAP_ROOT_ARGV: tuple[str, ...] = (
+    # The new tmpfs root comes first: session paths may live under /tmp, and a
+    # later --tmpfs /tmp would hide mounts created before it.
+    "--tmpfs",
+    "/tmp",
+    "--proc",
+    "/proc",
+    "--dev",
+    "/dev",
+    "--ro-bind",
+    "/usr",
+    "/usr",
+)
+BWRAP_MANDATORY_PROFILE: tuple[str, ...] = BWRAP_NAMESPACE_ARGV + BWRAP_ROOT_ARGV
+BWRAP_WIDENING_OPTIONS: frozenset[str] = frozenset(
+    {"--share-net", "--dev-bind", "--dev-bind-try", "--cap-add"}
+)
 ATTESTATION_EVIDENCE_KEYS = frozenset(
     {
         "schema",
@@ -242,6 +270,34 @@ def _spawn_direct(plan: LaunchPlan) -> ManagedProcess:
     return _managed(process, plan, run=0)
 
 
+def _require_isolated_profile(argv: Sequence[str]) -> None:
+    """Fail closed unless ``argv`` is about to launch the attested sandbox (F9).
+
+    ``spawn`` attests a fresh netns and then launches the plan argv verbatim;
+    a plan whose argv lost ``--unshare-net`` (or another mandatory namespace or
+    root option) would pass the attestation and release a CLI outside the
+    profile.  The exact prefix emitted by ``build_bwrap_argv`` is required, as
+    is an explicit ``--chdir``/``--`` tail, and no option may widen the
+    namespace.
+    """
+    if tuple(argv[1 : 1 + len(BWRAP_MANDATORY_PROFILE)]) != BWRAP_MANDATORY_PROFILE:
+        raise NetworkIsolationUnavailable(
+            "the isolated launch argv does not carry the attested sandbox profile"
+        )
+    try:
+        separator = argv.index("--")
+    except ValueError:
+        raise NetworkIsolationUnavailable("the isolated launch has no -- separator") from None
+    options = argv[:separator]
+    if "--chdir" not in options:
+        raise NetworkIsolationUnavailable("the isolated launch has no --chdir")
+    widened = sorted(BWRAP_WIDENING_OPTIONS.intersection(options))
+    if widened:
+        raise NetworkIsolationUnavailable(
+            "the isolated launch argv widens the sandbox: " + ",".join(widened)
+        )
+
+
 def _spawn_isolated(plan: LaunchPlan) -> ManagedProcess:
     """Attest a fresh netns, then run the CLI behind the trusted entrypoint.
 
@@ -257,6 +313,10 @@ def _spawn_isolated(plan: LaunchPlan) -> ManagedProcess:
     attestation = network_isolation_attestation(bwrap=Path(plan.argv[0]))
     if not attestation.ok:
         raise NetworkIsolationUnavailable("network attestation refused: " + attestation.reason)
+    # F9: the attestation proves the binary, not the argv about to be launched.
+    # Require the same sandbox profile ``build_bwrap_argv`` emits before the
+    # CLI launch Popen; a forged argv never reaches a process.
+    _require_isolated_profile(plan.argv)
     egress_socket = egress_socket_for_plan(plan)
     if egress_socket is None:
         raise NetworkIsolationUnavailable("the isolated launch names no egress proxy socket")
@@ -590,29 +650,7 @@ def build_bwrap_argv(
     if network_mode not in CLI_NETWORK_MODES:
         raise ValueError("network_mode must be isolated_egress")
     executable = str(bwrap if bwrap is not None else default_bwrap_binary())
-    command = [
-        executable,
-        "--unshare-pid",
-        "--unshare-ipc",
-        "--unshare-uts",
-        "--die-with-parent",
-        "--unshare-net",
-    ]
-    command.extend(
-        (
-            # The new tmpfs root comes first: session paths may live under /tmp,
-            # and a later --tmpfs /tmp would hide mounts created before it.
-            "--tmpfs",
-            "/tmp",
-            "--proc",
-            "/proc",
-            "--dev",
-            "/dev",
-            "--ro-bind",
-            "/usr",
-            "/usr",
-        )
-    )
+    command = [executable, *BWRAP_NAMESPACE_ARGV, *BWRAP_ROOT_ARGV]
     for system_path in ("/lib", "/lib64"):
         if Path(system_path).exists():
             command.extend(("--ro-bind", system_path, system_path))

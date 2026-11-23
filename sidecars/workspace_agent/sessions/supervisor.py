@@ -40,6 +40,7 @@ from . import egress, logs, process, relay, shim
 from . import state as session_state
 from .state import (
     ACTIVE_STATES,
+    SECRET_EXPOSURE_REASON,
     BudgetExceededError,
     BudgetSpec,
     CapabilityUnavailableError,
@@ -50,6 +51,7 @@ from .state import (
     ManifestMissingError,
     ResumeUnavailableError,
     RunRecord,
+    SecretExposureError,
     SecretUnavailableError,
     SessionBusyError,
     SessionError,
@@ -100,6 +102,16 @@ ADAPTER_KIND_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 WORKSPACE_ID_PATTERN = re.compile(r"^ws-[0-9a-f]{32}$")
 TOOL_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_.]{0,63}$")
 SESSION_PROTOCOL = protocol.SESSIONS_PROTOCOL_VERSION
+# F5: the backend (M24-05B2) names sessions with its own ``OperatorAdapterKind``
+# wire values; the host profiles keep their historic names.  The alias is
+# closed and is applied exactly once at each entry point (prepare body,
+# capabilities query), so the record, profile selection, egress allowlist and
+# persisted state all carry the canonical host name.  Anything else is refused
+# by ``ProfileRegistry.get``.
+WIRE_ADAPTER_ALIASES: Mapping[str, str] = {"codex_cli": "codex", "claude_code": "claude"}
+HOST_ADAPTER_WIRE_NAMES: Mapping[str, str] = {"codex": "codex_cli", "claude": "claude_code"}
+# F2: an aligned secret fragment of at least 16 bytes is already a compromise.
+MIN_SECRET_FRAGMENT_BYTES = 16
 DEFAULT_SKILLS_ROOT = Path(__file__).resolve().parents[3] / ".agents" / "skills"
 DEFAULT_FAKE_SCENARIO = "success"
 DEFAULT_BROKER_BACKEND_URL = "http://127.0.0.1:8000"
@@ -312,6 +324,23 @@ def _fake_cli_path() -> Path:
     return Path(__file__).with_name("fake_cli.py")
 
 
+def canonical_adapter_kind(adapter_kind: object) -> object:
+    """Resolve a backend wire name to the host profile name (closed alias)."""
+    if isinstance(adapter_kind, str):
+        return WIRE_ADAPTER_ALIASES.get(adapter_kind, adapter_kind)
+    return adapter_kind
+
+
+def wire_adapter_kind(adapter_kind: str) -> str:
+    """The backend-facing wire name for a canonical host profile name."""
+    return HOST_ADAPTER_WIRE_NAMES.get(adapter_kind, adapter_kind)
+
+
+def _alternate_adapter_kind(adapter_kind: str) -> str | None:
+    """The other closed name of a known pair, or None for any other name."""
+    return HOST_ADAPTER_WIRE_NAMES.get(adapter_kind) or WIRE_ADAPTER_ALIASES.get(adapter_kind)
+
+
 class ProfileRegistry:
     """Closed adapter-kind -> profile mapping; unregistered kinds are refused."""
 
@@ -334,6 +363,13 @@ class ProfileRegistry:
         ):
             raise CapabilityUnavailableError(str(adapter_kind))
         profile = self._profiles.get(adapter_kind)
+        if profile is None and isinstance(adapter_kind, str):
+            # A host test double may register its profile under the backend
+            # wire name (M24's acceptance harness does); production profiles
+            # use the canonical name.  Only the closed pair resolves.
+            alternate = _alternate_adapter_kind(adapter_kind)
+            if alternate is not None:
+                profile = self._profiles.get(alternate)
         if profile is None:
             raise CapabilityUnavailableError(adapter_kind)
         return profile
@@ -398,6 +434,9 @@ class PrepareSessionRequest:
         )
         if ADAPTER_KIND_PATTERN.fullmatch(adapter_kind) is None:
             raise SessionRequestError("adapter_kind", "invalid")
+        # F5: one closed alias at the entry point; every internal artifact
+        # (record, profile, egress allowlist, persisted state) is canonical.
+        adapter_kind = str(canonical_adapter_kind(adapter_kind))
         workspace_id = session_state.require_str(
             payload["workspace_id"], "workspace_id", maximum=35
         )
@@ -804,6 +843,56 @@ def _b64(value: bytearray) -> str:
     return base64.b64encode(bytes(value)).decode("ascii")
 
 
+def _secret_content_forms(secret: bytes) -> tuple[bytes, ...]:
+    """Every persisted form that proves the session secret left its socket (F2).
+
+    A 16-byte aligned window covers any longer raw or hex run (hex is
+    byte-aligned); the 17- and 18-byte windows make every standard/urlsafe
+    base64 encoding of a longer run start with one of these patterns.
+    """
+    if not secret:
+        return ()
+    forms: set[bytes] = set()
+    longest = min(len(secret), MIN_SECRET_FRAGMENT_BYTES + 2)
+    for length in range(MIN_SECRET_FRAGMENT_BYTES, longest + 1):
+        for start in range(0, len(secret) - length + 1):
+            window = secret[start : start + length]
+            forms.add(window)
+            forms.add(window.hex().encode("ascii"))
+            forms.add(window.hex().upper().encode("ascii"))
+            standard = base64.b64encode(window)
+            urlsafe = base64.urlsafe_b64encode(window)
+            forms.update((standard, standard.rstrip(b"="), urlsafe, urlsafe.rstrip(b"=")))
+    return tuple(sorted(forms, key=len, reverse=True))
+
+
+def _contains_secret_form(data: bytes, forms: Sequence[bytes]) -> bool:
+    return any(form in data for form in forms)
+
+
+def _secret_log_forms(secret: bytes) -> tuple[str, ...]:
+    """Full-secret forms redacted from CLI log lines (defense in depth).
+
+    Window fragments are not redacted here: log lines are already length- and
+    credential-classified, and replacing every window pattern per line would
+    not be worth its cost.
+    """
+    standard = base64.b64encode(secret)
+    urlsafe = base64.urlsafe_b64encode(secret)
+    forms = {
+        secret.hex(),
+        secret.hex().upper(),
+        standard.decode("ascii"),
+        urlsafe.decode("ascii"),
+        standard.rstrip(b"=").decode("ascii"),
+        urlsafe.rstrip(b"=").decode("ascii"),
+    }
+    text = secret.decode("utf-8", errors="replace")
+    if len(text) >= MIN_SECRET_FRAGMENT_BYTES:
+        forms.add(text)
+    return tuple(sorted(form for form in forms if len(form) >= MIN_SECRET_FRAGMENT_BYTES))
+
+
 # ---------------------------------------------------------------------------
 # In-memory session handle
 # ---------------------------------------------------------------------------
@@ -884,6 +973,9 @@ class _Session:
         self.lock = threading.RLock()
         self.channels = _SessionChannelState(self)
         self.secret: bytearray | None = None
+        # F2: derived from the in-memory secret only; cleared whenever the
+        # secret is wiped, never persisted.
+        self.secret_forms: tuple[bytes, ...] = ()
         self.broker: SecretBroker | None = None
         self.relay: relay.BrokerRelay | None = None
         self.egress: egress.EgressProxy | None = None
@@ -1283,6 +1375,7 @@ class SessionSupervisor:
         handle.channels.mark_started()
         if wipe_secret:
             secret, handle.secret = handle.secret, None
+            handle.secret_forms = ()
             if secret is not None:
                 secret[:] = bytes(len(secret))
         self._unlink_sockets(
@@ -1420,7 +1513,13 @@ class SessionSupervisor:
         return self._config.page_limit
 
     def capabilities(self, adapter_kind: object) -> dict[str, object]:
-        return self._profiles.probe(adapter_kind, now=self._now()).to_wire()
+        # F5: probe the canonical host profile, then echo the caller's closed
+        # wire name so the backend's OperatorAdapterKind check still matches.
+        # ``probe_sha256`` is the profile's own digest and is not recomputed.
+        body = self._profiles.probe(canonical_adapter_kind(adapter_kind), now=self._now()).to_wire()
+        if isinstance(adapter_kind, str):
+            body["adapter_kind"] = adapter_kind
+        return body
 
     # -- prepare -----------------------------------------------------------
 
@@ -1532,6 +1631,7 @@ class SessionSupervisor:
                     ),
                 )
                 handle.secret = bytearray(request.auth_secret)
+                handle.secret_forms = _secret_content_forms(bytes(request.auth_secret))
                 if profile.requires_sandbox:
                     # A real session has no egress without its provider profile:
                     # refuse it here, before any listener or run exists.
@@ -1909,11 +2009,20 @@ class SessionSupervisor:
     # -- process output and exit ------------------------------------------
 
     def _replacements(self, handle: _Session) -> tuple[tuple[str, str], ...]:
-        return (
+        replacements = [
             (str(handle.directory), "<session-runtime>"),
             (str(self._config.runtime_root), "<runtime>"),
             (str(self._config.workspace_root), "<workspace-root>"),
-        )
+        ]
+        secret = handle.secret
+        if secret:
+            # F2 defense in depth: even a log line carrying the whole secret in
+            # a decodable form is redacted before it is persisted.  Detection
+            # and revocation stay on the content the host captures.
+            replacements.extend(
+                (form, "<secret-redacted>") for form in _secret_log_forms(bytes(secret))
+            )
+        return tuple(replacements)
 
     def _reader_loop(
         self,
@@ -2085,7 +2194,9 @@ class SessionSupervisor:
             return {
                 "state": str(record.state),
                 "state_version": record.state_version,
-                "adapter_kind": record.adapter_kind,
+                # F5: the record keeps the canonical host profile; the backend
+                # validates this field against its OperatorAdapterKind.
+                "adapter_kind": wire_adapter_kind(record.adapter_kind),
                 "runs": [run.to_payload() for run in record.runs],
                 "budgets_used": record.budgets_used.to_payload(),
                 "last_activity_at": record.last_activity_at,
@@ -2443,6 +2554,9 @@ class SessionSupervisor:
             entries.append((destination, "results", data))
         captured: list[dict[str, object]] = []
         captured_notes: list[str] = []
+        # F2: the whole capture is refused before anything reaches the
+        # versioned workspace; a single offending file revokes the session.
+        self._refuse_secret_exposure(handle, entries)
         for index, (destination, kind, data) in enumerate(entries):
             self._ensure_capture_parent(workspace_descriptor, tuple(destination.split("/")[:-1]))
             if kind == "notes":
@@ -2505,6 +2619,48 @@ class SessionSupervisor:
                 captured_notes.append(destination)
             captured.append({"path": destination, "sha256": sha256})
         return captured, captured_notes
+
+    def _refuse_secret_exposure(
+        self, handle: _Session, entries: Sequence[tuple[str, str, bytes]]
+    ) -> None:
+        """Refuse to persist agent content that contains the session secret (F2)."""
+        forms = handle.secret_forms
+        if not forms:
+            return
+        for _destination, _kind, data in entries:
+            if _contains_secret_form(data, forms):
+                self._revoke_secret_exposure(handle)
+                raise SecretExposureError(operation="collect")
+
+    def _revoke_secret_exposure(self, handle: _Session) -> None:
+        """Revoke a session whose secret was persisted by the agent (F2).
+
+        The relay/proxy listeners, their sockets and the in-memory secret are
+        destroyed, and the record is ``failed`` with the typed reason.  The
+        audit event carries no content and no path: an agent-chosen path could
+        itself quote the secret.
+        """
+        record = handle.record
+        self._stop_channels(handle, wipe_secret=True)
+        previous = record.state
+        now = self._now()
+        record.state = SessionState.FAILED
+        record.state_version += 1
+        record.outcome = SECRET_EXPOSURE_REASON
+        record.updated_at = now
+        record.last_activity_at = now
+        handle.events.append_event(
+            kind=logs.EventKind.STATE_CHANGED,
+            at=now,
+            payload={
+                "from": str(previous),
+                "to": str(SessionState.FAILED),
+                "state_version": record.state_version,
+                "reason": SECRET_EXPOSURE_REASON,
+                "operation": "collect",
+            },
+        )
+        self._persist(handle)
 
     def _ensure_capture_parent(
         self, descriptor: workspace.WorkspaceDescriptor, components: tuple[str, ...]

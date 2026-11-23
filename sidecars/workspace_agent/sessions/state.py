@@ -39,6 +39,8 @@ SKILL_NAME_PATTERN = re.compile(r"^autowork-[a-z0-9][a-z0-9-]{0,63}$")
 MAX_ALLOWED_PATHS = 64
 MAX_SKILLS = 32
 MAX_SECRET_BYTES = 32
+# Typed reason recorded when agent content proves the secret left its socket.
+SECRET_EXPOSURE_REASON = "secret_exposure_detected"
 MAX_BUDGET_WALL_SECONDS = 24 * 60 * 60
 MAX_BUDGET_OUTPUT_BYTES = 256 * 1024 * 1024
 MAX_BUDGET_INSTRUCTIONS = 10_000
@@ -189,6 +191,24 @@ class SecretUnavailableError(SessionError):
     def __init__(self, *, reason: str | None = None) -> None:
         details: dict[str, object] = {} if reason is None else {"reason": reason}
         super().__init__("the session secret handoff cannot be armed", details=details)
+
+
+class SecretExposureError(SessionError):
+    """Agent content carried the session secret: the request is refused (F2).
+
+    Reaching this error means the secret left its one-shot socket, so the
+    session is revoked (channels closed, secret wiped, state ``failed``).
+    Neither the message nor the details ever carry the offending content.
+    """
+
+    code = ErrorCode.POLICY_DENIED
+    status = 403
+
+    def __init__(self, *, operation: str) -> None:
+        super().__init__(
+            "agent content contains the session secret",
+            details={"reason": SECRET_EXPOSURE_REASON, "operation": operation},
+        )
 
 
 class CursorExpiredError(SessionError):

@@ -8,6 +8,7 @@ network or login call is made.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -22,7 +23,9 @@ from sidecars.workspace_agent.sessions.adapters.claude import (
     ConfinementProbe,
 )
 from sidecars.workspace_agent.sessions.state import (
+    CapabilityUnavailableError,
     ResumeUnavailableError,
+    SecretExposureError,
     SessionState,
 )
 from sidecars.workspace_agent.sessions.supervisor import (
@@ -43,7 +46,7 @@ from tests.workspace_agent.claude_profile_support import (
     write_fake_bwrap,
     write_fake_claude,
 )
-from tests.workspace_agent.sessions_support import prepare_payload, wait_until
+from tests.workspace_agent.sessions_support import SECRET, prepare_payload, wait_until
 from tests.workspace_agent.w3_support import ScanEnvironment, make_scan_environment
 
 MANIFEST_TOOLS = [
@@ -319,6 +322,77 @@ def test_claude_session_lifecycle_stream_events_and_collect(session_base: Path) 
 
         assert MOCKED_BWRAP_REASON in _log_text(supervisor)
         assert "claude-scenario" not in _log_text(supervisor)
+    finally:
+        supervisor.stop()
+
+
+def test_claude_code_wire_kind_selects_the_claude_profile_and_egress(
+    session_base: Path,
+) -> None:
+    """F5: the backend's ``claude_code`` value reaches the canonical profile.
+
+    The egress fixture declares only the canonical ``claude`` key, so a
+    wire-named allowlist lookup would have failed prepare with
+    ``confinement_unavailable``; a successful prepare proves the alias was
+    applied once, before profile and egress selection.
+    """
+    environment = make_scan_environment(session_base)
+    supervisor, config = _build_supervisor(session_base, environment)
+    try:
+        capabilities = supervisor.capabilities("claude_code")
+        assert capabilities["adapter_kind"] == "claude_code"
+        request = PrepareSessionRequest.from_payload(
+            prepare_payload(
+                environment.workspace_id,
+                adapter_kind="claude_code",
+                session_id=SESSION_ID,
+                network_mode="isolated_egress",
+            )
+        )
+        assert request.adapter_kind == "claude"
+        prepared = supervisor.prepare(
+            request, idempotency_key="m24-r2fixa-prepare-claude-1", body_sha256="a" * 64
+        )
+        assert prepared["state"] == "ready"
+        status = supervisor.status(SESSION_ID)
+        assert status["adapter_kind"] == "claude_code"
+        persisted = json.loads(
+            (config.session_root / SESSION_ID / "state.json").read_text(encoding="utf-8")
+        )
+        assert persisted["adapter_kind"] == "claude"
+        assert (config.session_root / SESSION_ID / "ipc" / "egress.sock").is_socket()
+        with pytest.raises(CapabilityUnavailableError):
+            supervisor.capabilities("claude_code_v2")
+    finally:
+        supervisor.stop()
+
+
+def test_collect_revokes_a_session_that_persisted_the_secret(session_base: Path) -> None:
+    """F2 through a real profile: relay, egress proxy, secret and record."""
+    environment = make_scan_environment(session_base)
+    supervisor, config = _build_supervisor(session_base, environment)
+    try:
+        _prepare(supervisor, environment.workspace_id)
+        ipc = config.session_root / SESSION_ID / "ipc"
+        assert (ipc / "broker.sock").is_socket()
+        assert (ipc / "shim.sock").is_socket()
+        assert (ipc / "egress.sock").is_socket()
+        notes = config.session_root / SESSION_ID / "scratch" / "notes"
+        notes.mkdir(parents=True, exist_ok=True)
+        (notes / "leak.md").write_bytes(b"leak\n" + base64.b64encode(SECRET).rstrip(b"=") + b"\n")
+        with pytest.raises(SecretExposureError) as raised:
+            supervisor.collect(
+                SESSION_ID,
+                CollectRequest.from_payload({"capture": True}),
+                idempotency_key="m24-r2fixa-collect-claude-1",
+                body_sha256="e" * 64,
+            )
+        assert raised.value.details["reason"] == "secret_exposure_detected"
+        assert raised.value.status == 403
+        assert supervisor.status(SESSION_ID)["state"] == "failed"
+        assert not (ipc / "broker.sock").exists()
+        assert not (ipc / "shim.sock").exists()
+        assert not (ipc / "egress.sock").exists()
     finally:
         supervisor.stop()
 

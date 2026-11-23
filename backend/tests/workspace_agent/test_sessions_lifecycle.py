@@ -149,7 +149,7 @@ def test_prepare_rejects_unknown_adapter_and_arbitrary_binary(session_base: Path
             client,
             running,
             "/v1/sessions",
-            prepare_payload(workspace_id, adapter_kind="codex_cli"),
+            prepare_payload(workspace_id, adapter_kind="codex_cli_v2"),
             "m24-h1-prepare-unknown-2",
         )
         assert unshipped.status_code == 409, unshipped.text

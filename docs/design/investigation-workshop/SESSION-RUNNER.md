@@ -331,9 +331,13 @@ requires) spawns it as an MCP server. Registration mechanisms:
 
 **Secret flow.** The supervisor holds the secret in memory. At startup the shim connects to
 `<runtime>/sessions/<id>/ipc/shim.sock` (0600, peer uid checked), receives the secret **once**, sets
-`PR_SET_DUMPABLE=0`, and drops the socket. The model cannot read shim memory; a same-uid process
-racing at CLI startup is the residual risk (startup happens before the first model turn, and user
-hooks/plugins are disabled). The secret never appears in the MCP config, argv or env.
+`PR_SET_DUMPABLE=0`, and drops the socket. The model cannot read shim memory, but the CLI launches
+the shim itself and can read `AUTOWORK_SESSION_SOCKET` from its own environment, so it can connect
+before the shim and receive the frame: that is an **accepted and bounded residual risk, not a
+narrow race** (`BROKER-RELAY-EGRESS.md` §8.6). The secret grants exactly the session's own closed
+authority (relay catalogue; backend HMAC, lease and binding revalidation), is destroyed at
+close/revocation and re-armed per run, and `collect` refuses and revokes any agent content that
+carries it. The secret never appears in the MCP config, argv or env.
 
 **Tool catalogue.** `tools/list` returns exactly the manifest, with MCP-safe names
 (`autowork_bridge_consult` ↔ broker `advisor.consult`; `autowork_<sanitized broker name>` for the
