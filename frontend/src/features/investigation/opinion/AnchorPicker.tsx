@@ -203,148 +203,154 @@ export function AnchorPicker({
   }
 
   return (
-    <div className="anchor-picker">
-      {query.isPending ? (
-        <p role="status">Chargement des ancres canoniques…</p>
-      ) : null}
-      {query.isError ? (
-        <div className="verification-warning" role="alert">
-          <p>
-            Ancres de publication indisponibles :{" "}
-            {describeApiError(query.error).message} · code :{" "}
-            {describeApiError(query.error).code}
-          </p>
-          <button type="button" onClick={reloadAnchors}>
-            Recharger les ancres
-          </button>
-        </div>
-      ) : null}
-
-      {catalog === null ? null : (
-        <>
-          <p>
-            Base de publication :{" "}
-            {catalog.source === "pinned_opinion_base"
-              ? "base épinglée de l’avis"
-              : "base courante vérifiée"}{" "}
-            · artefact <code>{catalog.base_publication_artifact_id}</code> ·
-            version {catalog.base_publication_version} · SHA-256{" "}
-            <code title={catalog.base_publication_sha256}>
-              {shortHash(catalog.base_publication_sha256)}
-            </code>
-          </p>
-          {catalog.truncated ? (
-            <p className="verification-warning" role="note">
-              Liste bornée : certaines ancres ne sont pas proposées ici. Le
-              serveur reste l’autorité et peut accepter une ancre saisie en mode
-              diagnostic.
+    <details className="anchor-picker">
+      <summary>Sélection avancée</summary>
+      <div className="anchor-picker__content">
+        {query.isPending ? (
+          <p role="status">Chargement des ancres canoniques…</p>
+        ) : null}
+        {query.isError ? (
+          <div className="verification-warning" role="alert">
+            <p>
+              Ancres de publication indisponibles :{" "}
+              {describeApiError(query.error).message} · code :{" "}
+              {describeApiError(query.error).code}
             </p>
-          ) : null}
-
-          <label htmlFor="opinion-note-anchor">Ancre de publication</label>
-          <select
-            id="opinion-note-anchor"
-            value={selected === null ? "" : anchor}
-            onChange={(event) => onAnchorChange(event.currentTarget.value)}
-            aria-describedby="opinion-note-anchor-detail"
-          >
-            <option value="">— Choisir une ancre de publication —</option>
-            {groups.map((group) => (
-              <optgroup key={group.key} label={group.label}>
-                {group.anchors.map((item) => (
-                  <option key={item.anchor} value={item.anchor}>
-                    {optionLabel(item, occurrences, noteAnchors)}
-                  </option>
-                ))}
-              </optgroup>
-            ))}
-          </select>
-
-          <div id="opinion-note-anchor-detail">
-            {selected === null ? null : (
-              <>
-                <p title={selected.text}>
-                  {truncate(selected.text, DETAIL_TEXT_MAX)}
-                </p>
-                <ul
-                  className="badge-row"
-                  aria-label="Caractéristiques de l’ancre sélectionnée"
-                >
-                  {occurrence === undefined ? null : (
-                    <li className="badge">
-                      occurrence {occurrence.index} sur {occurrence.total}
-                    </li>
-                  )}
-                  {noteAnchors.has(selected.anchor) ? (
-                    <li className="badge badge--tlp-amber">
-                      remplace la note existante
-                    </li>
-                  ) : null}
-                  {targetType === null ? null : (
-                    <li className="badge">{TARGET_BLOCK_LABELS[targetType]}</li>
-                  )}
-                  {selectedElements === undefined ||
-                  selectedElements.proposable === 0 ? null : (
-                    <li className="badge">
-                      {selectedElements.proposable} élément(s) M23
-                      référençable(s)
-                    </li>
-                  )}
-                  {selectedElements === undefined ||
-                  selectedElements.refused === 0 ? null : (
-                    <li className="badge badge--tlp-amber">
-                      {selectedElements.refused} élément(s) M23 non
-                      proposable(s)
-                    </li>
-                  )}
-                </ul>
-              </>
-            )}
+            <button type="button" onClick={reloadAnchors}>
+              Recharger les ancres
+            </button>
           </div>
+        ) : null}
 
-          {missingFromCatalog ? (
-            <div className="verification-warning" role="alert">
-              <p>
-                L’ancre <code>{anchor}</code> n’apparaît pas dans la base de
-                publication affichée. Le serveur reste l’autorité : la demande
-                peut être refusée (<code>invalid_note_anchor</code>).
+        {catalog === null ? null : (
+          <>
+            <p>
+              Base de publication :{" "}
+              {catalog.source === "pinned_opinion_base"
+                ? "base épinglée de l’avis"
+                : "base courante vérifiée"}{" "}
+              · artefact <code>{catalog.base_publication_artifact_id}</code> ·
+              version {catalog.base_publication_version} · SHA-256{" "}
+              <code title={catalog.base_publication_sha256}>
+                {shortHash(catalog.base_publication_sha256)}
+              </code>
+            </p>
+            {catalog.truncated ? (
+              <p className="verification-warning" role="note">
+                Liste bornée : certaines ancres ne sont pas proposées ici. Le
+                serveur reste l’autorité et peut accepter une ancre saisie en
+                mode diagnostic.
               </p>
-              <button type="button" onClick={reloadAnchors}>
-                Recharger les ancres
-              </button>
-            </div>
-          ) : null}
+            ) : null}
 
-          {proposalBaseMoved ? (
-            <div className="verification-warning" role="alert">
-              <p>
-                Base périmée : l’article a été révisé depuis le chargement des
-                ancres. Rechargez les ancres avant de redemander une
-                proposition.
-              </p>
-              <button type="button" onClick={reloadAnchors}>
-                Recharger les ancres
-              </button>
-            </div>
-          ) : null}
-        </>
-      )}
+            <label htmlFor="opinion-note-anchor">Ancre de publication</label>
+            <select
+              id="opinion-note-anchor"
+              value={selected === null ? "" : anchor}
+              onChange={(event) => onAnchorChange(event.currentTarget.value)}
+              aria-describedby="opinion-note-anchor-detail"
+            >
+              <option value="">— Choisir une ancre de publication —</option>
+              {groups.map((group) => (
+                <optgroup key={group.key} label={group.label}>
+                  {group.anchors.map((item) => (
+                    <option key={item.anchor} value={item.anchor}>
+                      {optionLabel(item, occurrences, noteAnchors)}
+                    </option>
+                  ))}
+                </optgroup>
+              ))}
+            </select>
 
-      <details>
-        <summary>Diagnostic — saisie manuelle d’ancre</summary>
-        <p id="opinion-note-anchor-manual-help">
-          La saisie manuelle est réservée au diagnostic : aucune suggestion
-          n’est fournie et le serveur reste l’autorité. Une ancre absente de la
-          liste canonique peut être refusée (<code>invalid_note_anchor</code>).
-        </p>
-        <label htmlFor="opinion-note-anchor-manual">Ancre manuelle</label>
-        <input
-          id="opinion-note-anchor-manual"
-          value={anchor}
-          onChange={(event) => onAnchorChange(event.currentTarget.value)}
-          aria-describedby="opinion-note-anchor-manual-help"
-        />
-      </details>
-    </div>
+            <div id="opinion-note-anchor-detail">
+              {selected === null ? null : (
+                <>
+                  <p title={selected.text}>
+                    {truncate(selected.text, DETAIL_TEXT_MAX)}
+                  </p>
+                  <ul
+                    className="badge-row"
+                    aria-label="Caractéristiques de l’ancre sélectionnée"
+                  >
+                    {occurrence === undefined ? null : (
+                      <li className="badge">
+                        occurrence {occurrence.index} sur {occurrence.total}
+                      </li>
+                    )}
+                    {noteAnchors.has(selected.anchor) ? (
+                      <li className="badge badge--tlp-amber">
+                        remplace la note existante
+                      </li>
+                    ) : null}
+                    {targetType === null ? null : (
+                      <li className="badge">
+                        {TARGET_BLOCK_LABELS[targetType]}
+                      </li>
+                    )}
+                    {selectedElements === undefined ||
+                    selectedElements.proposable === 0 ? null : (
+                      <li className="badge">
+                        {selectedElements.proposable} élément(s) M23
+                        référençable(s)
+                      </li>
+                    )}
+                    {selectedElements === undefined ||
+                    selectedElements.refused === 0 ? null : (
+                      <li className="badge badge--tlp-amber">
+                        {selectedElements.refused} élément(s) M23 non
+                        proposable(s)
+                      </li>
+                    )}
+                  </ul>
+                </>
+              )}
+            </div>
+
+            {missingFromCatalog ? (
+              <div className="verification-warning" role="alert">
+                <p>
+                  L’ancre <code>{anchor}</code> n’apparaît pas dans la base de
+                  publication affichée. Le serveur reste l’autorité : la demande
+                  peut être refusée (<code>invalid_note_anchor</code>).
+                </p>
+                <button type="button" onClick={reloadAnchors}>
+                  Recharger les ancres
+                </button>
+              </div>
+            ) : null}
+
+            {proposalBaseMoved ? (
+              <div className="verification-warning" role="alert">
+                <p>
+                  Base périmée : l’article a été révisé depuis le chargement des
+                  ancres. Rechargez les ancres avant de redemander une
+                  proposition.
+                </p>
+                <button type="button" onClick={reloadAnchors}>
+                  Recharger les ancres
+                </button>
+              </div>
+            ) : null}
+          </>
+        )}
+
+        <details>
+          <summary>Diagnostic — saisie manuelle d’ancre</summary>
+          <p id="opinion-note-anchor-manual-help">
+            La saisie manuelle est réservée au diagnostic : aucune suggestion
+            n’est fournie et le serveur reste l’autorité. Une ancre absente de
+            la liste canonique peut être refusée (
+            <code>invalid_note_anchor</code>).
+          </p>
+          <label htmlFor="opinion-note-anchor-manual">Ancre manuelle</label>
+          <input
+            id="opinion-note-anchor-manual"
+            value={anchor}
+            onChange={(event) => onAnchorChange(event.currentTarget.value)}
+            aria-describedby="opinion-note-anchor-manual-help"
+          />
+        </details>
+      </div>
+    </details>
   );
 }

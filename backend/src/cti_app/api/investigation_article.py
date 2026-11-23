@@ -20,7 +20,7 @@ from typing import Literal, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Request
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from cti_app.api.investigation import (
     _http_error,
@@ -60,6 +60,13 @@ class ArticleElementViewV1(BaseModel):
     refusal_reason: str | None
 
 
+class ArticleSectionViewV1(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    section_index: int
+    heading: str
+
+
 class ArticleAnchorCatalogViewV1(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -70,6 +77,10 @@ class ArticleAnchorCatalogViewV1(BaseModel):
     anchors: list[ArticleAnchorViewV1]
     elements: list[ArticleElementViewV1]
     truncated: bool
+    # Optional fields keep existing clients compatible while giving the
+    # investigation reader the canonical title and section labels.
+    article_title: str | None = None
+    sections: list[ArticleSectionViewV1] = Field(default_factory=list)
 
 
 def _artifact_store(request: Request) -> ProductionArtifactStore:
@@ -130,6 +141,14 @@ async def get_article_anchors(
             for item in catalog.elements
         ],
         truncated=catalog.truncated,
+        article_title=catalog.article_title,
+        sections=[
+            ArticleSectionViewV1(
+                section_index=item.section_index,
+                heading=item.heading,
+            )
+            for item in catalog.sections
+        ],
     )
 
 

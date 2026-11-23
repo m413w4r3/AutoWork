@@ -327,12 +327,46 @@ function makeAnchorCatalog(): ArticleAnchorCatalogViewV1 {
     base_publication_version: 3,
     base_publication_sha256: BASE_HASH,
     source: "pinned_opinion_base",
+    article_title: "Article canonique de test",
+    sections: [
+      { section_index: 0, heading: "Première section" },
+      { section_index: 1, heading: "Deuxième section" },
+      { section_index: 2, heading: "Persistance" },
+    ],
     anchors: [
       {
         anchor: "lead:0001",
         text: "Le chapô observe un service de commande.",
         text_sha256: "d".repeat(64),
         section_index: null,
+        paragraph_index: 0,
+      },
+      {
+        anchor: "lead:0002",
+        text: "Paragraphe répété.",
+        text_sha256: "f".repeat(64),
+        section_index: null,
+        paragraph_index: 1,
+      },
+      {
+        anchor: "section:0:paragraph:0001",
+        text: "Paragraphe répété.",
+        text_sha256: "f".repeat(64),
+        section_index: 0,
+        paragraph_index: 0,
+      },
+      {
+        anchor: "section:0:paragraph:0002",
+        text: "Un contexte de campagne.",
+        text_sha256: "1".repeat(64),
+        section_index: 0,
+        paragraph_index: 1,
+      },
+      {
+        anchor: "section:1:paragraph:0001",
+        text: "Un endpoint répond.",
+        text_sha256: "2".repeat(64),
+        section_index: 1,
         paragraph_index: 0,
       },
       {
@@ -596,9 +630,11 @@ async function openProposalReview() {
   await screen.findByRole("heading", {
     name: "Demander une proposition à Bridge",
   });
-  await userEvent
-    .setup()
-    .click(screen.getByRole("button", { name: "Examiner la proposition" }));
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("tab", { name: "Propositions 1" }));
+  await user.click(
+    screen.getByRole("button", { name: "Examiner la proposition" }),
+  );
   await screen.findByRole("button", { name: /Accepter la proposition v4/ });
 }
 
@@ -610,6 +646,9 @@ afterEach(() => {
 describe("OpinionNotesView — notes Bridge par ancre", () => {
   it("liste plusieurs notes à des ancres différentes", async () => {
     renderView();
+    await userEvent
+      .setup()
+      .click(await screen.findByText("Notes existantes (2)"));
 
     const list = await screen.findByRole("region", { name: "Notes par ancre" });
     expect(
@@ -626,6 +665,69 @@ describe("OpinionNotesView — notes Bridge par ancre", () => {
     expect(
       within(list).getByText("La section documente une persistance."),
     ).toBeInTheDocument();
+  });
+
+  it("transmet au formulaire Bridge les ancres des paragraphes sélectionnés sans saisie manuelle", async () => {
+    const user = userEvent.setup();
+    const { calls, container } = renderView();
+    const targets = [
+      {
+        name: /Section 1, §1.*Paragraphe répété/,
+        anchor: "section:0:paragraph:0001",
+      },
+      {
+        name: /Section 1, §2.*Un contexte de campagne/,
+        anchor: "section:0:paragraph:0002",
+      },
+      {
+        name: /Section 2, §1.*Un endpoint répond/,
+        anchor: "section:1:paragraph:0001",
+      },
+    ];
+
+    await screen.findByRole("heading", { name: "Article canonique de test" });
+    expect(
+      container.querySelector("details.anchor-picker"),
+    ).not.toHaveAttribute("open");
+
+    for (const [index, target] of targets.entries()) {
+      await user.click(screen.getByRole("button", { name: target.name }));
+      const submit = screen.getByRole("button", { name: "Demander à Bridge" });
+      await waitFor(() => expect(submit).toBeEnabled());
+      await user.click(submit);
+      await waitFor(() => {
+        const requests = calls.filter(
+          (call) =>
+            call.url ===
+              `/api/investigations/${INVESTIGATION_ID}/note-proposals` &&
+            call.init?.method === "POST",
+        );
+        expect(requests).toHaveLength(index + 1);
+        expect(bodyOf(requests[index]?.init)).toMatchObject({
+          anchor: target.anchor,
+        });
+      });
+      if (index < targets.length - 1) {
+        await user.click(screen.getByRole("tab", { name: "Notes 2" }));
+      }
+    }
+  });
+
+  it("n’affiche pas les ancres brutes dans l’article et garde la sélection avancée repliée", async () => {
+    const { container } = renderView();
+
+    await screen.findByRole("heading", { name: "Article canonique de test" });
+    const articlePane =
+      container.querySelector<HTMLElement>(".article-reading");
+    if (articlePane === null) throw new Error("Article pane is missing");
+    expect(within(articlePane).queryByText(/(?:lead|section):\d/)).toBeNull();
+    expect(
+      container.querySelector("details.anchor-picker"),
+    ).not.toHaveAttribute("open");
+    expect(screen.getByRole("tab", { name: "Notes 2" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
   });
 
   it("accepte une proposition avec les pins version/hash et une clé d’idempotence", async () => {
@@ -748,6 +850,7 @@ describe("OpinionNotesView — notes Bridge par ancre", () => {
     await screen.findByRole("heading", {
       name: "Demander une proposition à Bridge",
     });
+    await user.click(screen.getByText("Sélection avancée"));
     expect(
       screen.queryByRole("textbox", {
         name: /(texte|proposition).*(avis|note|bloc)/i,
@@ -861,6 +964,7 @@ describe("OpinionNotesView — notes Bridge par ancre", () => {
     await screen.findByRole("heading", {
       name: "Demander une proposition à Bridge",
     });
+    await user.click(screen.getByRole("tab", { name: "Avis v3" }));
 
     await user.click(
       screen.getByRole("checkbox", {
