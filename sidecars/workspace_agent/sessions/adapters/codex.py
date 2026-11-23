@@ -81,6 +81,19 @@ MAX_EVENT_PARSE_BYTES = 1024 * 1024
 MAX_EVENT_DETAIL_CHARS = 8 * 1024
 PROBE_TIMEOUT_SECONDS = 15.0
 PROBE_HOME_PREFIX = "autowork-codex-probe-"
+# Read-only system paths the CLI needs to verify the provider's TLS chain.
+# bwrap starts from a tmpfs root, so without these binds rustls/reqwest has no
+# trust store and every provider request fails after the tunnel is open (H0
+# host spike, 2026-11-23: 63 allowed CONNECTs, zero successful requests).
+TRUST_ANCHORS: tuple[str, ...] = (
+    "/etc/ssl",
+    "/etc/ca-certificates",
+    "/etc/pki",
+    "/etc/resolv.conf",
+    "/etc/hosts",
+    "/etc/nsswitch.conf",
+    "/etc/localtime",
+)
 
 # Tokens emitted by the profile; every one is printed by the matching --help.
 REQUIRED_EXEC_FLAGS = frozenset(
@@ -724,6 +737,10 @@ class CodexProfile:
             prefix = binary.parent.parent
             if (prefix / "lib").is_dir() and not _under(prefix, Path("/usr")):
                 binds.append((prefix, prefix))
+        for anchor in TRUST_ANCHORS:
+            path = Path(anchor)
+            if path.exists():
+                binds.append((path, path))
         return tuple(dict.fromkeys(binds))
 
     def _skills_binds(self, context: LaunchContext) -> tuple[tuple[Path, Path], ...]:

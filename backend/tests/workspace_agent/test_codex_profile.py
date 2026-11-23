@@ -586,6 +586,38 @@ def test_codex_installs_the_exact_shim_and_catalogue(tmp_path: Path) -> None:
     )
 
 
+def test_codex_binds_the_cli_trust_anchors(tmp_path: Path) -> None:
+    """H0: bwrap starts from a tmpfs root; without /etc/ssl every TLS fails.
+
+    The provider tunnel opens (CONNECT is allowed) but the CLI cannot verify
+    the chain, so every request fails after the tunnel (observed: 63 allowed
+    CONNECTs, zero successful requests).  The read-only trust anchors mirror
+    the Claude profile.
+    """
+    fake = _install_fake_codex(tmp_path)
+    stub = _install_stub_bwrap(tmp_path)
+    profile = CodexProfile(binary=fake, bwrap=stub)
+    context = _make_context(tmp_path)
+    plan = profile.build_launch_plan(context)
+    argv = list(plan.argv)
+    checked = 0
+    for anchor in (
+        "/etc/ssl",
+        "/etc/ca-certificates",
+        "/etc/pki",
+        "/etc/resolv.conf",
+        "/etc/hosts",
+        "/etc/nsswitch.conf",
+        "/etc/localtime",
+    ):
+        if not Path(anchor).exists():
+            continue
+        checked += 1
+        pair = ["--ro-bind", anchor, anchor]
+        assert any(argv[index : index + 3] == pair for index in range(len(argv))), anchor
+    assert checked  # this host has at least one trust anchor to prove the bind
+
+
 def test_codex_prompt_carries_preamble_and_handoff_reference(tmp_path: Path) -> None:
     fake = _install_fake_codex(tmp_path)
     stub = _install_stub_bwrap(tmp_path)
