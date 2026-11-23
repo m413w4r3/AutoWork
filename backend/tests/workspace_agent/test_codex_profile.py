@@ -17,6 +17,7 @@ import os
 import shutil
 import socket
 import stat
+import tempfile
 import tomllib
 from pathlib import Path
 
@@ -591,13 +592,15 @@ def test_real_adapters_share_the_relay_transport_contract(
     )
     assert sentinel not in "\0".join(plan.argv)
 
-    egress_socket = context.ipc_socket_path.parent / process.EGRESS_SOCKET_FILE_NAME
-    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        listener.bind(str(egress_socket))
-        wrapped = process.isolated_entry_argv(plan.argv, egress_socket_path=egress_socket)
-    finally:
-        listener.close()
+    # AF_UNIX paths are capped near 108 bytes; pytest's tmp_path is far longer.
+    with tempfile.TemporaryDirectory(prefix="egr", dir="/tmp") as short_dir:
+        egress_socket = Path(short_dir) / process.EGRESS_SOCKET_FILE_NAME
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            listener.bind(str(egress_socket))
+            wrapped = process.isolated_entry_argv(plan.argv, egress_socket_path=egress_socket)
+        finally:
+            listener.close()
     forwarder_index = wrapped.index("forward-and-exec")
     assert wrapped[forwarder_index + 1 : forwarder_index + 3] == [
         "--upstream",
