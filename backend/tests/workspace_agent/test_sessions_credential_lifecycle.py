@@ -24,6 +24,7 @@ import pytest
 from sidecars.workspace_agent.sessions import process
 from sidecars.workspace_agent.sessions import supervisor as sessions_module
 from sidecars.workspace_agent.sessions.supervisor import (
+    CollectRequest,
     FakeProfile,
     PrepareSessionRequest,
     ProfileRegistry,
@@ -33,6 +34,7 @@ from sidecars.workspace_agent.sessions.supervisor import (
 
 from tests.workspace_agent.sessions_support import (
     SESSION_ID,
+    TASK_ID,
     fake_script,
     hang_script,
     prepare_payload,
@@ -257,6 +259,82 @@ def test_restart_reconciliation_removes_an_orphan_session_credential_copy(
     assert status["state"] == "lost"
     events = _events(restarted)
     assert any(event["kind"] == "reconcile_completed" for event in events)
+
+
+def test_collect_replay_after_supervisor_restart_keeps_one_import_and_provenance(
+    session_base: Path,
+    scripted_supervisors: list[sessions_module.SessionSupervisor],
+) -> None:
+    environment = make_scan_environment(session_base)
+    crashed = _supervisor(session_base, environment)
+    scripted_supervisors.append(crashed)
+    _prepare(crashed, environment)
+    script = _session_dir(session_base) / "fake-script.json"
+    script.write_text(
+        json.dumps(
+            fake_script(
+                [
+                    {"op": "write", "path": "notes/allowed.md", "text": "# collected note\n"},
+                    {"op": "write", "path": "result.md", "text": "collected result\n"},
+                    {"op": "exit", "code": 0},
+                ]
+            )
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(script, 0o600)
+    crashed.start(
+        SESSION_ID,
+        StartSessionRequest(),
+        idempotency_key="m24-r2b1-start-replay",
+        body_sha256="b" * 64,
+    )
+    wait_until(lambda: crashed.status(SESSION_ID)["state"] == "awaiting_instruction")
+
+    collect_request = CollectRequest(capture=True)
+    first = crashed.collect(
+        SESSION_ID,
+        collect_request,
+        idempotency_key="m24-e3-collect-restart",
+        body_sha256="d" * 64,
+    )
+    planted = _plant_credentials(session_base)
+
+    # This is a supervisor process crash: the second instance reloads durable
+    # state and must remove the seeded copies before it accepts any request.
+    restarted = _supervisor(session_base, environment)
+    scripted_supervisors.append(restarted)
+    assert all(not path.exists() for path in planted)
+    assert restarted.status(SESSION_ID)["state"] == "lost"
+    replay = restarted.collect(
+        SESSION_ID,
+        collect_request,
+        idempotency_key="m24-e3-collect-restart",
+        body_sha256="d" * 64,
+    )
+
+    assert (
+        replay["captured_notes"]
+        == first["captured_notes"]
+        == [f"notes/agents/{TASK_ID}/allowed.md"]
+    )
+    assert {entry["path"]: entry["sha256"] for entry in replay["files"]} == {
+        entry["path"]: entry["sha256"] for entry in first["files"]
+    }
+    scan_service = environment.service(stability_window_ms=0)
+    scan_service.scan(environment.workspace_id, full=True)
+    snapshot = scan_service.snapshot(environment.workspace_id)
+    note_path = f"notes/agents/{TASK_ID}/allowed.md"
+    result_path = f"results/sessions/{SESSION_ID}/result.md"
+    note = next(item for item in snapshot.files if item.path == note_path)
+    result = next(item for item in snapshot.files if item.path == result_path)
+    assert note.origin == "agent"
+    assert note.task_id == TASK_ID
+    assert note.policy_class == "agent_owned"
+    assert result.origin == "system"
+    assert result.policy_class == "generated_immutable"
+    assert len(scan_service.known_revisions(environment.workspace_id, note_path)) == 1
+    assert len(scan_service.known_revisions(environment.workspace_id, result_path)) == 1
 
 
 def test_close_fails_closed_when_a_credential_copy_cannot_be_removed(

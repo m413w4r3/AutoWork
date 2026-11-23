@@ -745,11 +745,13 @@ class _BlockingCollectOperator(_BlockingOperator):
         self.uow_depth = uow_depth
         self.uow_depth_at_call: int | None = None
         self.collected: list[UUID] = []
+        self.collected_requests: list[CollectResultsRequest] = []
         self.both_entered = asyncio.Event()
 
     async def collect_results(self, request: CollectResultsRequest) -> OperatorResultsV1:
         self.uow_depth_at_call = self.uow_depth()
         self.collected.append(request.session_id)
+        self.collected_requests.append(request)
         if len(self.collected) >= 2:
             self.both_entered.set()
         self.entered.set()
@@ -768,6 +770,93 @@ class _BlockingCollectOperator(_BlockingOperator):
             host_session_ref=request.host_session_ref,
             observed_at=NOW,
         )
+
+
+class _BlockingReconcileOperator(_BlockingOperator):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reconciled: list[ReconcileSessionRequest] = []
+        self.reconcile_entered = asyncio.Event()
+        self.reconcile_both_entered = asyncio.Event()
+        self.reconcile_release = asyncio.Event()
+        self.reconcile_effects = 0
+        self.replies: dict[str, SessionReconciliationV1] = {}
+
+    async def reconcile_session(self, request: ReconcileSessionRequest) -> SessionReconciliationV1:
+        self.reconciled.append(request)
+        if len(self.reconciled) >= 2:
+            self.reconcile_both_entered.set()
+        self.reconcile_entered.set()
+        await self.reconcile_release.wait()
+        key = request.idempotency_key or ""
+        if key not in self.replies:
+            self.reconcile_effects += 1
+            self.replies[key] = SessionReconciliationV1(
+                session_id=request.session_id,
+                outcome=SessionReconcileOutcome.SESSION_ALIVE,
+                host_session_ref=request.host_session_ref,
+                observed_at=NOW,
+                detail="idempotent concurrent reconcile",
+            )
+        return self.replies[key]
+
+
+class _LossyCollectOperator(_BlockingOperator):
+    def __init__(self) -> None:
+        super().__init__()
+        self.requests: list[CollectResultsRequest] = []
+        self.collect_effects = 0
+        self.lose_first_response = True
+        self.replies: dict[tuple[UUID, str | None], OperatorResultsV1] = {}
+
+    async def collect_results(self, request: CollectResultsRequest) -> OperatorResultsV1:
+        self.requests.append(request)
+        key = (request.session_id, request.cursor)
+        if key not in self.replies:
+            self.collect_effects += 1
+            self.replies[key] = OperatorResultsV1(
+                session_id=request.session_id,
+                checkpoint_ref="checkpoint-after-host-capture",
+                checkpoint_sha256="c" * 64,
+                observed_at=NOW,
+            )
+        if self.lose_first_response:
+            self.lose_first_response = False
+            raise TimeoutError("synthetic lost collect response after host capture")
+        return self.replies[key]
+
+    async def reconcile_session(self, request: ReconcileSessionRequest) -> SessionReconciliationV1:
+        return SessionReconciliationV1(
+            session_id=request.session_id,
+            outcome=SessionReconcileOutcome.SESSION_ALIVE,
+            host_session_ref=request.host_session_ref,
+            observed_at=NOW,
+        )
+
+
+class _LossyReconcileOperator(_BlockingOperator):
+    def __init__(self) -> None:
+        super().__init__()
+        self.requests: list[ReconcileSessionRequest] = []
+        self.reconcile_effects = 0
+        self.lose_first_response = True
+        self.replies: dict[str, SessionReconciliationV1] = {}
+
+    async def reconcile_session(self, request: ReconcileSessionRequest) -> SessionReconciliationV1:
+        self.requests.append(request)
+        key = request.idempotency_key or ""
+        if key not in self.replies:
+            self.reconcile_effects += 1
+            self.replies[key] = SessionReconciliationV1(
+                session_id=request.session_id,
+                outcome=SessionReconcileOutcome.SESSION_ALIVE,
+                host_session_ref=request.host_session_ref,
+                observed_at=NOW,
+            )
+        if self.lose_first_response:
+            self.lose_first_response = False
+            raise TimeoutError("synthetic lost reconciliation response")
+        return self.replies[key]
 
 
 class _SecretDelivery:
@@ -1702,6 +1791,355 @@ def test_two_postgres_sessions_can_wait_for_host_collection_concurrently(
         finally:
             if "operator" in locals():
                 operator.release.set()
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_postgres_collect_restarts_from_intent_committed_before_host_call(
+    temporary_postgres_url: str,
+) -> None:
+    command.upgrade(_alembic_config(temporary_postgres_url), "head")
+
+    async def run() -> None:
+        engine = create_postgres_engine(temporary_postgres_url)
+        try:
+            factory = create_session_factory(engine)
+            investigation = await _seed_investigation(factory)
+            session, _secret = await _seed_route_session(factory, investigation.id)
+            tracked_uows = _HostIoTrackingUowFactory(factory)
+            operator = _BlockingCollectOperator(lambda: tracked_uows.active)
+            service = SessionService(
+                uow_factory=tracked_uows,
+                deriver=HmacSessionSecretDeriver(SESSION_KEY),
+                operator=operator,
+                disclosure=_allow_disclosure,
+                task_limits=TaskLimits(),
+                clock=lambda: NOW,
+            )
+            operator_actor = TaskActor(kind=TaskActorKind.OPERATOR, actor_id="codex:operator-1")
+
+            intent = await service._begin_host_io(
+                investigation.id,
+                session.id,
+                timestamp=NOW,
+                operation="collect results",
+                allow_reconciliation_retry=False,
+                require_host_session_ref=True,
+            )
+
+            assert intent.session.state is AgentSessionState.RECONCILING
+            assert operator.collected == []
+            restarted = SessionService(
+                uow_factory=tracked_uows,
+                deriver=HmacSessionSecretDeriver(SESSION_KEY),
+                operator=operator,
+                disclosure=_allow_disclosure,
+                task_limits=TaskLimits(),
+                clock=lambda: NOW,
+            )
+            reconciled = await restarted.reconcile(
+                investigation.id, session.id, actor=operator_actor, now=NOW
+            )
+            collecting = asyncio.create_task(
+                restarted.collect(
+                    investigation.id,
+                    session.id,
+                    actor=operator_actor,
+                    cursor="postgres-pre-host-crash",
+                    now=NOW,
+                )
+            )
+            await asyncio.wait_for(operator.entered.wait(), timeout=10)
+            operator.release.set()
+            result = await asyncio.wait_for(collecting, timeout=10)
+            replay = await restarted.collect(
+                investigation.id,
+                session.id,
+                actor=operator_actor,
+                cursor="postgres-pre-host-crash",
+                now=NOW,
+            )
+
+            assert reconciled.state is AgentSessionState.RUNNING
+            assert result.checkpoint_sha256 == replay.checkpoint_sha256
+            assert [request.cursor for request in operator.collected_requests] == [
+                "postgres-pre-host-crash",
+                "postgres-pre-host-crash",
+            ]
+            assert tracked_uows.active == 0
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                stored = await uow.agent_sessions.get(session.id)
+            assert stored is not None
+            assert stored.state is AgentSessionState.RUNNING
+            assert stored.checkpoint_sha256 == result.checkpoint_sha256
+        finally:
+            if "operator" in locals():
+                operator.release.set()
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_postgres_collect_replays_same_cursor_after_host_effect_before_apply(
+    temporary_postgres_url: str,
+) -> None:
+    command.upgrade(_alembic_config(temporary_postgres_url), "head")
+
+    async def run() -> None:
+        engine = create_postgres_engine(temporary_postgres_url)
+        try:
+            factory = create_session_factory(engine)
+            investigation = await _seed_investigation(factory)
+            session, _secret = await _seed_route_session(factory, investigation.id)
+            operator = _LossyCollectOperator()
+            operator_actor = TaskActor(kind=TaskActorKind.OPERATOR, actor_id="codex:operator-1")
+            service = SessionService(
+                uow_factory=lambda: SqlAlchemyUnitOfWork(factory),
+                deriver=HmacSessionSecretDeriver(SESSION_KEY),
+                operator=operator,
+                disclosure=_allow_disclosure,
+                task_limits=TaskLimits(),
+                clock=lambda: NOW,
+            )
+            with pytest.raises(TimeoutError, match="after host capture"):
+                await service.collect(
+                    investigation.id,
+                    session.id,
+                    actor=operator_actor,
+                    cursor="postgres-host-effect-before-apply",
+                    now=NOW,
+                )
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                ambiguous = await uow.agent_sessions.get(session.id)
+            assert ambiguous is not None
+            assert ambiguous.state is AgentSessionState.RECONCILING
+            assert ambiguous.checkpoint_ref is None
+            assert operator.collect_effects == 1
+
+            restarted = SessionService(
+                uow_factory=lambda: SqlAlchemyUnitOfWork(factory),
+                deriver=HmacSessionSecretDeriver(SESSION_KEY),
+                operator=operator,
+                disclosure=_allow_disclosure,
+                task_limits=TaskLimits(),
+                clock=lambda: NOW,
+            )
+            reconciled = await restarted.reconcile(
+                investigation.id, session.id, actor=operator_actor, now=NOW
+            )
+            result = await restarted.collect(
+                investigation.id,
+                session.id,
+                actor=operator_actor,
+                cursor="postgres-host-effect-before-apply",
+                now=NOW,
+            )
+            replay = await restarted.collect(
+                investigation.id,
+                session.id,
+                actor=operator_actor,
+                cursor="postgres-host-effect-before-apply",
+                now=NOW,
+            )
+
+            assert reconciled.state is AgentSessionState.RUNNING
+            assert result == replay
+            assert operator.collect_effects == 1
+            assert [request.cursor for request in operator.requests] == [
+                "postgres-host-effect-before-apply",
+                "postgres-host-effect-before-apply",
+                "postgres-host-effect-before-apply",
+            ]
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                stored = await uow.agent_sessions.get(session.id)
+            assert stored is not None
+            assert stored.state is AgentSessionState.RUNNING
+            assert stored.checkpoint_ref == "checkpoint-after-host-capture"
+            assert stored.checkpoint_sha256 == "c" * 64
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_postgres_reconcile_replays_the_committed_intent_key_after_lost_response(
+    temporary_postgres_url: str,
+) -> None:
+    command.upgrade(_alembic_config(temporary_postgres_url), "head")
+
+    async def run() -> None:
+        engine = create_postgres_engine(temporary_postgres_url)
+        try:
+            factory = create_session_factory(engine)
+            investigation = await _seed_investigation(factory)
+            session, _secret = await _seed_route_session(factory, investigation.id)
+            operator = _LossyReconcileOperator()
+            operator_actor = TaskActor(kind=TaskActorKind.OPERATOR, actor_id="codex:operator-1")
+            service = SessionService(
+                uow_factory=lambda: SqlAlchemyUnitOfWork(factory),
+                deriver=HmacSessionSecretDeriver(SESSION_KEY),
+                operator=operator,
+                disclosure=_allow_disclosure,
+                task_limits=TaskLimits(),
+                clock=lambda: NOW,
+            )
+
+            with pytest.raises(TimeoutError, match="lost reconciliation response"):
+                await service.reconcile(investigation.id, session.id, actor=operator_actor, now=NOW)
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                pending = await uow.agent_sessions.get(session.id)
+            assert pending is not None
+            assert pending.state is AgentSessionState.RECONCILING
+            first_key = operator.requests[0].idempotency_key
+            assert first_key == f"state-version:{pending.state_version}"
+            assert operator.reconcile_effects == 1
+
+            restarted = SessionService(
+                uow_factory=lambda: SqlAlchemyUnitOfWork(factory),
+                deriver=HmacSessionSecretDeriver(SESSION_KEY),
+                operator=operator,
+                disclosure=_allow_disclosure,
+                task_limits=TaskLimits(),
+                clock=lambda: NOW,
+            )
+            replay = await restarted.reconcile(
+                investigation.id, session.id, actor=operator_actor, now=NOW
+            )
+            assert replay.state is AgentSessionState.RUNNING
+            assert operator.requests[1].idempotency_key == first_key
+            assert operator.reconcile_effects == 1
+
+            await restarted.reconcile(investigation.id, session.id, actor=operator_actor, now=NOW)
+            assert operator.requests[2].idempotency_key != first_key
+            assert operator.reconcile_effects == 2
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_two_postgres_collects_for_the_same_session_apply_once(
+    temporary_postgres_url: str,
+) -> None:
+    command.upgrade(_alembic_config(temporary_postgres_url), "head")
+
+    async def run() -> None:
+        engine = create_postgres_engine(temporary_postgres_url)
+        try:
+            factory = create_session_factory(engine)
+            investigation = await _seed_investigation(factory)
+            session, _secret = await _seed_route_session(factory, investigation.id)
+            tracked_uows = _HostIoTrackingUowFactory(factory)
+            operator = _BlockingCollectOperator(lambda: tracked_uows.active)
+            service = SessionService(
+                uow_factory=tracked_uows,
+                deriver=HmacSessionSecretDeriver(SESSION_KEY),
+                operator=operator,
+                disclosure=_allow_disclosure,
+                task_limits=TaskLimits(),
+                clock=lambda: NOW,
+            )
+            operator_actor = TaskActor(kind=TaskActorKind.OPERATOR, actor_id="codex:operator-1")
+            first = asyncio.create_task(
+                service.collect(
+                    investigation.id,
+                    session.id,
+                    actor=operator_actor,
+                    cursor="postgres-same-session-cursor",
+                    now=NOW,
+                )
+            )
+            await asyncio.wait_for(operator.entered.wait(), timeout=10)
+
+            with pytest.raises(SessionStateConflictError, match="requires reconciliation"):
+                await service.collect(
+                    investigation.id,
+                    session.id,
+                    actor=operator_actor,
+                    cursor="postgres-same-session-cursor",
+                    now=NOW,
+                )
+            assert operator.collected == [session.id]
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                pending = await uow.agent_sessions.get(session.id)
+            assert pending is not None
+            assert pending.state is AgentSessionState.RECONCILING
+            assert pending.checkpoint_ref is None
+
+            operator.release.set()
+            result = await asyncio.wait_for(first, timeout=10)
+
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                stored = await uow.agent_sessions.get(session.id)
+            assert stored is not None
+            assert stored.state is AgentSessionState.AWAITING_INSTRUCTION
+            assert stored.checkpoint_sha256 == result.checkpoint_sha256
+            assert operator.collected == [session.id]
+            assert tracked_uows.active == 0
+        finally:
+            if "operator" in locals():
+                operator.release.set()
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_two_postgres_reconciles_for_the_same_session_apply_once(
+    temporary_postgres_url: str,
+) -> None:
+    command.upgrade(_alembic_config(temporary_postgres_url), "head")
+
+    async def run() -> None:
+        engine = create_postgres_engine(temporary_postgres_url)
+        try:
+            factory = create_session_factory(engine)
+            investigation = await _seed_investigation(factory)
+            session, _secret = await _seed_route_session(factory, investigation.id)
+            tracked_uows = _HostIoTrackingUowFactory(factory)
+            operator = _BlockingReconcileOperator()
+            service = SessionService(
+                uow_factory=tracked_uows,
+                deriver=HmacSessionSecretDeriver(SESSION_KEY),
+                operator=operator,
+                disclosure=_allow_disclosure,
+                task_limits=TaskLimits(),
+                clock=lambda: NOW,
+            )
+            operator_actor = TaskActor(kind=TaskActorKind.OPERATOR, actor_id="codex:operator-1")
+            first = asyncio.create_task(
+                service.reconcile(investigation.id, session.id, actor=operator_actor, now=NOW)
+            )
+            await asyncio.wait_for(operator.reconcile_entered.wait(), timeout=10)
+            second = asyncio.create_task(
+                service.reconcile(investigation.id, session.id, actor=operator_actor, now=NOW)
+            )
+            await asyncio.wait_for(operator.reconcile_both_entered.wait(), timeout=10)
+
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                pending = await uow.agent_sessions.get(session.id)
+            assert pending is not None
+            assert pending.state is AgentSessionState.RECONCILING
+            assert len({request.idempotency_key for request in operator.reconciled}) == 1
+
+            operator.reconcile_release.set()
+            results = await asyncio.gather(first, second, return_exceptions=True)
+
+            applied = [item for item in results if isinstance(item, AgentSessionV1)]
+            conflicts = [item for item in results if isinstance(item, SessionStateConflictError)]
+            assert len(applied) == len(conflicts) == 1
+            assert applied[0].state is AgentSessionState.AWAITING_INSTRUCTION
+            assert operator.reconcile_effects == 1
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                stored = await uow.agent_sessions.get(session.id)
+            assert stored is not None
+            assert stored.state is AgentSessionState.AWAITING_INSTRUCTION
+            assert stored.state_version == session.state_version + 3
+            assert stored.reconciliation is not None
+            assert tracked_uows.active == 0
+        finally:
+            if "operator" in locals():
+                operator.reconcile_release.set()
             await engine.dispose()
 
     asyncio.run(run())
