@@ -30,9 +30,14 @@ from cti_app.application.investigation_persistence import (
     same_note_proposal_request,
 )
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
-from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_artifact_store import (
+    MAX_ARTIFACT_BYTES,
+    ProductionArtifactStore,
+    ProductionReuseStorageUnavailableError,
+)
 from cti_app.application.research_context_builder import ArticleSnapshotPort
 from cti_app.domain.analyst_opinion import (
+    MAX_CANONICAL_CODE_EXCERPT_BYTES,
     MAX_NOTE_CONTENT_BLOCKS,
     AnalystObservationRelation,
     AnalystObservationState,
@@ -83,6 +88,78 @@ _ADVISOR_CALL_SCHEMA = "operator-advisor-call.v1"
 _ADVISOR_RESPONSE_LINK_SCHEMA = "operator-advisor-response-link.v1"
 _ACCEPTED_ADVISOR_STATUSES = frozenset({"succeeded", "partial"})
 _MAX_QUESTION_CHARS = 8_000
+MAX_CANONICAL_CODE_SOURCE_BYTES = MAX_ARTIFACT_BYTES
+
+
+class CanonicalCodeSourceUnavailableError(RuntimeError):
+    """The canonical blob store could not be read while resolving code evidence."""
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalCodeObservationBlobV1:
+    observation: EvidenceObservation
+    raw: bytes
+    blob_sha256: str
+    total_size: int
+
+
+async def resolve_canonical_code_observation_blob(
+    *,
+    artifact_store: ProductionArtifactStore,
+    investigation_id: UUID,
+    observation: EvidenceObservation,
+) -> CanonicalCodeObservationBlobV1 | None:
+    """Read the same bounded, non-advisory observation blob used by note verification.
+
+    The caller must first obtain the observation by its canonical ID. A source is
+    admissible only when it belongs to this investigation, is not advisory, its
+    stored bytes fit the production artifact bound, and those bytes match the
+    observation SHA.
+    """
+    if observation.investigation_id != investigation_id or is_advisory_observation(observation):
+        return None
+    try:
+        raw = await artifact_store.read_bytes(
+            observation.blob_id, max_bytes=MAX_CANONICAL_CODE_SOURCE_BYTES
+        )
+    except ProductionReuseStorageUnavailableError as exc:
+        raise CanonicalCodeSourceUnavailableError from exc
+    except (KeyError, OSError, TypeError, ValueError):
+        return None
+    blob_sha256 = hashlib.sha256(raw).hexdigest()
+    if len(raw) > MAX_CANONICAL_CODE_SOURCE_BYTES or blob_sha256 != observation.sha256:
+        return None
+    return CanonicalCodeObservationBlobV1(
+        observation=observation,
+        raw=raw,
+        blob_sha256=blob_sha256,
+        total_size=len(raw),
+    )
+
+
+def canonical_code_excerpt_bytes(
+    raw: bytes,
+    *,
+    offset: int,
+    length: int,
+    expected_sha256: str | None = None,
+) -> bytes:
+    """Return one exact byte range, applying the shared code excerpt bounds."""
+    if len(raw) > MAX_CANONICAL_CODE_SOURCE_BYTES:
+        raise ValueError("Canonical code source exceeds the source size limit")
+    if type(offset) is not int or offset < 0:
+        raise ValueError("Canonical code offset must be a non-negative integer")
+    if type(length) is not int or length < 1 or length > MAX_CANONICAL_CODE_EXCERPT_BYTES:
+        raise ValueError("Canonical code excerpt length is outside the allowed range")
+    end = offset + length
+    if end > len(raw):
+        raise ValueError("Canonical code excerpt range extends beyond the observation")
+    excerpt = raw[offset:end]
+    if len(excerpt) != length:
+        raise ValueError("Canonical code excerpt range is incomplete")
+    if expected_sha256 is not None and hashlib.sha256(excerpt).hexdigest() != expected_sha256:
+        raise ValueError("Canonical code excerpt SHA-256 does not match")
+    return excerpt
 
 
 class NoteProposalErrorCode(StrEnum):
@@ -441,17 +518,18 @@ def validate_note_content_blocks(
                     NoteProposalErrorCode.NOTE_CODE_REF_STALE,
                     message="The observation blob does not match its recorded hash",
                 )
-            end = block.offset + block.length
-            excerpt = raw[block.offset : end]
-            if (
-                end > len(raw)
-                or len(excerpt) != block.length
-                or hashlib.sha256(excerpt).hexdigest() != block.excerpt_sha256
-            ):
+            try:
+                excerpt = canonical_code_excerpt_bytes(
+                    raw,
+                    offset=block.offset,
+                    length=block.length,
+                    expected_sha256=block.excerpt_sha256,
+                )
+            except ValueError as exc:
                 raise NoteProposalError(
                     NoteProposalErrorCode.NOTE_CODE_REF_STALE,
                     message="The code excerpt does not match the observation bytes",
-                )
+                ) from exc
             try:
                 excerpt_text = excerpt.decode("utf-8")
             except UnicodeDecodeError as exc:
@@ -571,9 +649,15 @@ async def load_note_content_block_context(
         if fact is None or stored is None or not fact.in_investigation or fact.advisory:
             continue
         try:
-            blobs[observation_id] = await artifact_store.read_bytes(stored.blob_id, max_bytes=None)
-        except (KeyError, OSError, TypeError, ValueError):
+            source = await resolve_canonical_code_observation_blob(
+                artifact_store=artifact_store,
+                investigation_id=investigation_id,
+                observation=stored,
+            )
+        except CanonicalCodeSourceUnavailableError:
             continue
+        if source is not None:
+            blobs[observation_id] = source.raw
     return NoteContentBlockContextV1(
         investigation_id=investigation_id,
         anchor=anchor,
@@ -1844,6 +1928,8 @@ __all__ = [
     "AdvisorDraftingOutcomeV1",
     "AdvisorDraftingPort",
     "AdvisorDraftingRequestV1",
+    "CanonicalCodeObservationBlobV1",
+    "CanonicalCodeSourceUnavailableError",
     "NoteArticleElementFactV1",
     "NoteContentBlockContextV1",
     "NoteObservationFactV1",
@@ -1859,11 +1945,13 @@ __all__ = [
     "ResolvedNoteContentBlockV1",
     "ResolvedProtocolFigureBlockV1",
     "advisor_consult_arguments",
+    "canonical_code_excerpt_bytes",
     "default_drafting_question",
     "default_review_question",
     "load_note_content_block_context",
     "note_article_element_facts",
     "note_article_element_refusal",
+    "resolve_canonical_code_observation_blob",
     "resolve_note_content_blocks",
     "validate_note_content_blocks",
 ]

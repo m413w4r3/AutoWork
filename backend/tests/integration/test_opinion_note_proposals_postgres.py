@@ -17,8 +17,12 @@ from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID, uuid4
 
+import httpx
 import pytest
+from fastapi import FastAPI
+from httpx import ASGITransport
 
+from cti_app.api.investigation_observation_excerpts import router as observation_excerpt_router
 from cti_app.application.analyst_opinion_service import (
     AnalystOpinionService,
     OpinionError,
@@ -28,6 +32,7 @@ from cti_app.application.bridge_investigator import (
     TurnSubmission,
     TurnSubmissionStatus,
 )
+from cti_app.application.identity import LocalIdentityProvider
 from cti_app.application.investigation_advisor_tools import InvestigationAdvisorTool
 from cti_app.application.opinion_note_proposals import (
     AdvisorDraftingOutcomeV1,
@@ -37,6 +42,7 @@ from cti_app.application.opinion_note_proposals import (
     advisor_consult_arguments,
 )
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.config import Settings
 from cti_app.domain.analyst_opinion import (
     AnalystObservationRelation,
     AnalystObservationState,
@@ -423,6 +429,26 @@ async def test_note_proposal_chain_on_postgres(migrated_postgres_url: str) -> No
             await uow.evidence_observations.append_if_absent(observation)
             await uow.investigation_findings.append_version(finding, expected_previous_id=None)
             await uow.commit()
+
+        excerpt_app = FastAPI()
+        excerpt_app.include_router(observation_excerpt_router)
+        excerpt_app.state.uow_factory = uow_factory
+        excerpt_app.state.production_artifact_store = store
+        excerpt_app.state.identity_provider = LocalIdentityProvider("analyst:integration")
+        excerpt_app.state.settings = Settings(_env_file=None)
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=excerpt_app), base_url="http://test"
+        ) as excerpt_client:
+            excerpt_response = await excerpt_client.get(
+                f"/api/investigations/{investigation.id}/observations/{observation.id}/excerpt",
+                params={"offset": code_block.offset, "length": code_block.length, "view": "text"},
+            )
+        assert excerpt_response.status_code == 200
+        excerpt_payload = excerpt_response.json()
+        assert excerpt_payload["text"] == code_excerpt.decode("ascii")
+        assert excerpt_payload["blob_sha256"] == observation.sha256
+        assert excerpt_payload["excerpt_sha256"] == code_block.excerpt_sha256
+        assert {"blob_id", "blob_key", "storage_key", "url"}.isdisjoint(excerpt_payload)
 
         transport = _ScriptedTransport(
             [

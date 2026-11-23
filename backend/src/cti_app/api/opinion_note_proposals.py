@@ -40,6 +40,7 @@ from cti_app.application.opinion_note_proposals import (
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.domain.analyst_opinion import (
+    MAX_CANONICAL_CODE_EXCERPT_BYTES,
     MAX_NOTE_IOC_OBSERVATIONS,
     AnalystObservationRelation,
     AnalystObservationState,
@@ -96,7 +97,7 @@ class NoteCanonicalCodeBlockV1(BaseModel):
     observation_id: UUID
     blob_sha256: str = Field(pattern=_SHA256_PATTERN)
     offset: int = Field(ge=0)
-    length: int = Field(ge=1)
+    length: int = Field(ge=1, le=MAX_CANONICAL_CODE_EXCERPT_BYTES)
     excerpt_sha256: str = Field(pattern=_SHA256_PATTERN)
     language: str = Field(min_length=1, max_length=32, pattern=r"^[a-z0-9][a-z0-9+.#_-]*$")
 
