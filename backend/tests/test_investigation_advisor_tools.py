@@ -13140,3 +13140,176 @@ def test_new_advisory_types_have_no_editorial_target() -> None:
     for consultation_type in sorted(new_types):
         supported = advisor_tools_module._supported_optional_fields(consultation_type)
         assert not supported & editorial_fields
+
+
+@pytest.mark.asyncio
+async def test_task_context_is_bounded_in_dossier() -> None:
+    """F4-D B2: the task context is bounded, non-evidence context."""
+    investigation_id = uuid4()
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text="Interprétation consultative fondée sur le dossier transmis.",
+        )
+    )
+    tool, _ = make_tool(investigation_id=investigation_id, transport=transport)
+    task_id = uuid4()
+    evidence_refs = [str(uuid4()) for _ in range(80)]
+    contribution_id = uuid4()
+    previous_id = uuid4()
+    result = await tool.execute(
+        {
+            "consultation_type": "interpretation",
+            "question": "Interprète les faits observés dans cette tâche.",
+            "task_context": {
+                "investigation_id": str(investigation_id),
+                "task_id": str(task_id),
+                "task_key": "lead-bounded",
+                "title": "T" * 4_000,
+                "objective": "Vérifier le chargeur à partir des octets observés.",
+                "status": "running",
+                "priority": "high",
+                "claim_refs": ["S1P1"],
+                "evidence_refs": evidence_refs,
+                "sample_refs": [],
+                "expected_outputs": ["note de synthèse"],
+                "result_refs": [{"kind": "observation", "id": str(uuid4())}],
+                "assigned_actor": {"kind": "operator", "actor_id": "operator:bounded"},
+                "human_contributions": [
+                    {
+                        "id": str(contribution_id),
+                        "category": "work_contribution",
+                        "file_relpath": "notes/task.md",
+                        "file_sha256": "a" * 64,
+                        "origin": "human",
+                        "import_status": "imported",
+                    }
+                ],
+                "previous_consultation": {
+                    "invocation_id": str(previous_id),
+                    "type": "interpretation",
+                    "output_sha256": "b" * 64,
+                    "parse_status": "parsed",
+                },
+                "editorial_anchor": {
+                    "anchor": "lead:0001",
+                    "excerpt": "Extrait borné de l'article.",
+                    "text_sha256": "c" * 64,
+                },
+            },
+        },
+        make_context(investigation_id, key="operator:advisor:task-context-bounded"),
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
+    prompt = transport.calls[0]["prompt"]
+    # Bounded: the oversized title never reaches the dossier whole, the extra
+    # references are capped, and every omission is declared.
+    assert "TITLE" not in prompt
+    assert "T" * 3_000 not in prompt
+    assert str(evidence_refs[63]) in prompt
+    assert str(evidence_refs[64]) not in prompt
+    warnings = result.output["input_warnings"]
+    assert {
+        "field": "task_context.title",
+        "code": "task_context_field_truncated",
+        "detail_safe": "A task-context field exceeded its bounded length and was shortened.",
+    } in warnings
+    assert any(
+        item["field"] == "task_context.evidence_refs"
+        and item["code"] == "task_context_list_truncated"
+        for item in warnings
+    )
+    # The context is transmitted as non-evidence task context.
+    assert f"task_id={task_id}" in prompt
+    assert "Contexte de la tâche d\\u2019enquête (non probant)" in prompt
+    assert "CONTEXTE DE TÂCHE" in prompt
+    assert "human_contributions (non promues en preuve):" in prompt
+    assert str(contribution_id) in prompt
+    assert str(previous_id) in prompt
+    assert "editorial_anchor=" in prompt
+    manifest = result.output["bridge_provenance"]["dossier_manifest"]
+    task_entry = next(item for item in manifest if item.get("origin") == "task_context_summary")
+    assert task_entry["kind"] == "context"
+    assert task_entry["context_is_evidence"] is False
+    assert task_entry["task_id"] == str(task_id)
+
+
+@pytest.mark.asyncio
+async def test_task_context_never_carries_credentials() -> None:
+    """F4-D B2: a credential-like task-context field is omitted and declared."""
+    investigation_id = uuid4()
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text="Critique consultative fondée sur le dossier transmis.",
+        )
+    )
+    tool, _ = make_tool(investigation_id=investigation_id, transport=transport)
+    task_id = uuid4()
+    result = await tool.execute(
+        {
+            "consultation_type": "critique",
+            "question": "Critique la solidité des faits observés.",
+            "task_context": {
+                "investigation_id": str(investigation_id),
+                "task_id": str(task_id),
+                "task_key": "lead-credentials",
+                "title": "Analyse sûre de la tâche",
+                "objective": "api_key=ZZOPERATIONALSECRETZZ",
+                "status": "running",
+                "priority": "normal",
+                "evidence_refs": ["bearer ZZTOPSECRETTOKENZZ1234567890", "ok-ref"],
+                "assigned_actor": {
+                    "kind": "operator",
+                    "actor_id": "password: hunter2",
+                },
+                "human_contributions": [
+                    {
+                        "id": str(uuid4()),
+                        "category": "work_contribution",
+                        "file_relpath": "notes/task.md",
+                        "file_sha256": "a" * 64,
+                        "origin": "human",
+                        "import_status": "imported",
+                        "access_token": "ZZCONTRIBUTIONTOKENZZ",
+                    }
+                ],
+                "editorial_anchor": {
+                    "anchor": "lead:0001",
+                    "excerpt": "authorization: ZZANCHORSECRETZZ",
+                    "text_sha256": "c" * 64,
+                },
+            },
+        },
+        make_context(investigation_id, key="operator:advisor:task-context-credentials"),
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
+    prompt = transport.calls[0]["prompt"]
+    for secret in (
+        "ZZOPERATIONALSECRETZZ",
+        "ZZTOPSECRETTOKENZZ1234567890",
+        "hunter2",
+        "ZZCONTRIBUTIONTOKENZZ",
+        "ZZANCHORSECRETZZ",
+    ):
+        assert secret not in prompt
+    assert "Analyse sûre de la tâche" in prompt
+    assert "ok-ref" in prompt
+    warnings = result.output["input_warnings"]
+    sensitive_fields = {
+        item["field"] for item in warnings if item["code"] == "task_context_field_omitted_sensitive"
+    }
+    assert {
+        "task_context.objective",
+        "task_context.evidence_refs",
+        "task_context.assigned_actor.actor_id",
+        "task_context.editorial_anchor.excerpt",
+    } <= sensitive_fields
+    # A sensitive key name is itself never echoed back.
+    assert any(
+        item["field"] == "task_context.<sensitive-field>"
+        and item["code"] == "task_context_field_omitted"
+        for item in warnings
+    )

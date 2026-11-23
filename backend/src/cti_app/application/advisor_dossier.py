@@ -785,6 +785,32 @@ def build_advisor_dossier(
                 )
             )
 
+    task_context = prompt_data.get("task_context")
+    if isinstance(task_context, Mapping):
+        task_body = _task_context_dossier_body(task_context)
+        if task_body:
+            task_identifier = _as_text(task_context.get("task_id")) or "unknown"
+            candidates.append(
+                _candidate(
+                    kind="context",
+                    identifier=f"task-context:{task_identifier}",
+                    sha256=hashlib.sha256(task_body.encode("utf-8")).hexdigest(),
+                    label="Contexte de la tâche d\\u2019enquête (non probant)",
+                    body=task_body,
+                    score=1,
+                    origin="task_context_summary",
+                    extra={
+                        "context_is_evidence": False,
+                        "task_id": task_identifier,
+                        **(
+                            {"task_key": _as_text(task_context.get("task_key"))}
+                            if _as_text(task_context.get("task_key"))
+                            else {}
+                        ),
+                    },
+                )
+            )
+
     for item in advisor_omissions:
         if item.get("kind") != "observation":
             continue
@@ -3140,6 +3166,61 @@ def _advisor_preflight_next_action(consultation_type: str, prompt_data: Mapping[
         "réseau à l'enquête, lance l'analyse locale correspondante, puis relance "
         "cette consultation."
     )
+
+
+def _task_context_dossier_body(data: Mapping[str, Any]) -> str:
+    """Render the bounded task context as explicitly non-evidence context."""
+    lines: list[str] = []
+
+    def add(label: str, value: object) -> None:
+        text = _as_text(value)
+        if text:
+            lines.append(f"{label}={text}")
+
+    def add_json(label: str, value: object) -> None:
+        if isinstance(value, Mapping):
+            lines.append(
+                f"{label}="
+                + json.dumps(dict(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            )
+        elif isinstance(value, (list, tuple)) and value:
+            rows = [dict(item) for item in value if isinstance(item, Mapping)]
+            if rows:
+                lines.append(
+                    f"{label}="
+                    + json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                )
+
+    add("task_id", data.get("task_id"))
+    add("investigation_id", data.get("investigation_id"))
+    add("task_key", data.get("task_key"))
+    add("title", data.get("title"))
+    add("status", data.get("status"))
+    add("priority", data.get("priority"))
+    add("objective", data.get("objective"))
+    add("task_question", data.get("question"))
+    for reference_field in ("claim_refs", "evidence_refs", "sample_refs", "expected_outputs"):
+        values = data.get(reference_field)
+        if isinstance(values, (list, tuple)) and values:
+            rendered = [_as_text(item) for item in values if _as_text(item)]
+            if rendered:
+                lines.append(f"{reference_field}=" + ", ".join(rendered))
+    add_json("result_refs", data.get("result_refs"))
+    add_json("assigned_actor", data.get("assigned_actor"))
+    contributions = data.get("human_contributions")
+    if isinstance(contributions, (list, tuple)) and contributions:
+        lines.append("human_contributions (non promues en preuve):")
+        for item in contributions:
+            if isinstance(item, Mapping):
+                lines.append(
+                    "- "
+                    + json.dumps(
+                        dict(item), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                    )
+                )
+    add_json("previous_consultation", data.get("previous_consultation"))
+    add_json("editorial_anchor", data.get("editorial_anchor"))
+    return "\n".join(lines)
 
 
 def _candidate(
