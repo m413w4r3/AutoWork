@@ -48,11 +48,14 @@ from cti_app.application.investigation_tasks import (
     TaskCommandError,
 )
 from cti_app.domain.agentic_operator import (
+    AgentSessionInstructionV1,
     AgentSessionState,
     AgentSessionV1,
     CollectResultsRequest,
     HandoffRequestReceiptV1,
+    InstructionDeliveryMode,
     InstructionReceiptV1,
+    InstructionState,
     InterruptSessionRequest,
     InterruptSessionResultV1,
     OperatorAdapterKind,
@@ -72,6 +75,7 @@ from cti_app.domain.agentic_operator import (
     SessionReconciliationV1,
     SessionStatusRequest,
     StartSessionRequest,
+    instruction_text_sha256,
 )
 from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition
@@ -594,7 +598,9 @@ def test_agent_session_migration_accepts_conforming_and_rejects_partial(
     temporary_postgres_url: str,
 ) -> None:
     config = _alembic_config(temporary_postgres_url)
-    command.upgrade(config, "head")
+    # Stop at 0023 before stamping back: 0027 later replaces three of the
+    # constraints this revision owns, so 0023 only accepts its own shape.
+    command.upgrade(config, "0023_agent_sessions")
     command.stamp(config, PREVIOUS)
     command.upgrade(config, "head")
     assert _alembic_version(temporary_postgres_url) == HEAD
@@ -946,6 +952,144 @@ def test_crash_orphan_is_failed_and_the_task_becomes_openable(
                 assert stored_task is not None
                 assert stored_task.status is TaskStatus.RUNNING
                 assert stored_task.lease_session_id == reopened.session.id
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_instruction_delivery_repository_cas_and_pending_listing(
+    temporary_postgres_url: str,
+) -> None:
+    """The delivery CAS is durable: token, JSONB diffs and pending drain order."""
+    command.upgrade(_alembic_config(temporary_postgres_url), "head")
+
+    async def run() -> None:
+        engine = create_postgres_engine(temporary_postgres_url)
+        try:
+            factory = create_session_factory(engine)
+            investigation = await _seed_investigation(factory)
+            task = await _seed_task(factory, investigation.id, task_key="lead-delivery")
+            handoff_id = await _seed_handoff(factory, investigation.id, task.id)
+            session_row = _session(
+                investigation.id, task.id, handoff_id, idempotency_key="delivery-session"
+            )
+            first_text = "Check the delivery gate."
+            second_text = "Then read the note."
+            first = AgentSessionInstructionV1(
+                investigation_id=investigation.id,
+                task_id=task.id,
+                session_id=session_row.id,
+                idempotency_key="delivery-1",
+                text=first_text,
+                text_sha256=instruction_text_sha256(first_text),
+                state=InstructionState.QUEUED,
+                created_by_kind="human",
+                created_by_id="analyst:test",
+                queued_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+            second = AgentSessionInstructionV1(
+                investigation_id=investigation.id,
+                task_id=task.id,
+                session_id=session_row.id,
+                idempotency_key="delivery-2",
+                text=second_text,
+                text_sha256=instruction_text_sha256(second_text),
+                state=InstructionState.QUEUED,
+                created_by_kind="human",
+                created_by_id="analyst:test",
+                queued_at=NOW + timedelta(seconds=1),
+                created_at=NOW,
+                updated_at=NOW,
+            )
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                await uow.agent_sessions.add(session_row)
+                await uow.agent_sessions.add_instruction(first)
+                await uow.agent_sessions.add_instruction(second)
+                await uow.commit()
+
+            token = uuid4()
+            delivery_sha = "c" * 64
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                pending = await uow.agent_sessions.list_pending_instructions(limit=10)
+                assert [item.id for item in pending] == [first.id, second.id]
+                reserved = first.with_delivery_reserved(
+                    token=token, delivery_sha256=delivery_sha, now=NOW
+                )
+                stored = await uow.agent_sessions.update_instruction_delivery(
+                    reserved,
+                    expected_state=InstructionState.QUEUED,
+                    expected_delivery_token=None,
+                )
+                await uow.commit()
+            assert stored.delivery_attempts == 1
+
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                reloaded = await uow.agent_sessions.get_instruction_by_token(
+                    first.id, token, state=InstructionState.DELIVERING
+                )
+                assert reloaded is not None
+                assert reloaded.delivery_sha256 == delivery_sha
+                delivered = reserved.with_delivery_confirmed(
+                    delivery_mode=InstructionDeliveryMode.NEXT_RUN,
+                    delivery_sha256=delivery_sha,
+                    delivery_note_diffs=({"path": "notes/humaines/piste.md", "diff": "+new line"},),
+                    now=NOW,
+                )
+                with pytest.raises(VersionConflictError):
+                    await uow.agent_sessions.update_instruction_delivery(
+                        delivered,
+                        expected_state=InstructionState.DELIVERING,
+                        expected_delivery_token=uuid4(),
+                    )
+                await uow.agent_sessions.update_instruction_delivery(
+                    delivered,
+                    expected_state=InstructionState.DELIVERING,
+                    expected_delivery_token=token,
+                )
+                await uow.commit()
+
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                proven = await uow.agent_sessions.get_instruction(first.id)
+                assert proven is not None
+                assert proven.state is InstructionState.DELIVERED
+                assert proven.delivery_mode is InstructionDeliveryMode.NEXT_RUN
+                assert proven.delivery_sha256 == delivery_sha
+                assert proven.delivery_token == token
+                assert proven.delivery_note_diffs == (
+                    {"path": "notes/humaines/piste.md", "diff": "+new line"},
+                )
+                assert proven.delivered_at == NOW
+
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                cancelled = await uow.agent_sessions.cancel_instruction(
+                    second.id,
+                    expected_state=InstructionState.QUEUED,
+                    expected_delivery_token=None,
+                    reason="handed_off:handoff-1",
+                    now=NOW,
+                )
+                await uow.commit()
+            assert cancelled.state is InstructionState.CANCELLED
+
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                assert await uow.agent_sessions.list_pending_instructions(limit=10) == ()
+                stored_second = await uow.agent_sessions.get_instruction(second.id)
+                assert stored_second is not None
+                assert stored_second.cancel_reason == "handed_off:handoff-1"
+                assert stored_second.cancelled_at == NOW
+
+            with pytest.raises(VersionConflictError):
+                async with SqlAlchemyUnitOfWork(factory) as uow:
+                    await uow.agent_sessions.cancel_instruction(
+                        second.id,
+                        expected_state=InstructionState.QUEUED,
+                        expected_delivery_token=None,
+                        reason="again",
+                        now=NOW,
+                    )
         finally:
             await engine.dispose()
 

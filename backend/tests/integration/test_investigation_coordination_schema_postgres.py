@@ -10,6 +10,7 @@ primitives the 04B2 engine will compose.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 from datetime import UTC, date, datetime, timedelta
 from uuid import UUID, uuid4
@@ -18,7 +19,7 @@ import pytest
 import sqlalchemy as sa
 from alembic import command
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from cti_app.application.workspace_agent import (
     WorkspaceBindingV1,
@@ -309,7 +310,10 @@ def test_task_migration_accepts_an_already_conforming_shape(
     temporary_postgres_url: str,
 ) -> None:
     config = _alembic_config(temporary_postgres_url)
-    command.upgrade(config, "head")
+    # Stop at this revision before stamping back: a later head (0027) replaces
+    # constraints on agent_session_instructions, so 0023 is only re-runnable
+    # against the shape it created itself.
+    command.upgrade(config, "0021_investigation_tasks")
     command.stamp(config, PREVIOUS)
     command.upgrade(config, "head")
     assert TASK_TABLES <= _table_names(temporary_postgres_url)
@@ -1187,3 +1191,287 @@ def test_work_contribution_migration_preflight_and_downgrade_guard(
         command.upgrade(config, "head")
     assert _alembic_version(temporary_postgres_url) == "0023_agent_sessions"
     assert "work_contributions" in _table_names(temporary_postgres_url)
+
+
+# --------------------------------------------------- instruction delivery (0027)
+
+INSTRUCTIONS = "agent_session_instructions"
+INSTRUCTION_PENDING_INDEX = "ix_agent_session_instructions_pending"
+_INSTRUCTION_LEGACY_REPLACED_CHECKS = {
+    "ck_agent_session_instructions_queued",
+    "ck_agent_session_instructions_delivered",
+}
+_INSTRUCTION_DELIVERY_CHECKS = {
+    "ck_agent_session_instructions_delivered_at",
+    "ck_agent_session_instructions_delivery_attempts",
+    "ck_agent_session_instructions_delivery_token",
+    "ck_agent_session_instructions_delivery_mode",
+    "ck_agent_session_instructions_delivery_sha256",
+    "ck_agent_session_instructions_delivery_note_diffs",
+    "ck_agent_session_instructions_delivery_unknown_at",
+    "ck_agent_session_instructions_cancelled_at",
+    "ck_agent_session_instructions_cancel_reason",
+    "ck_agent_session_instructions_last_delivery_error",
+}
+_INSTRUCTION_DELIVERY_COLUMNS = {
+    "delivery_attempts",
+    "delivery_token",
+    "delivery_mode",
+    "delivery_sha256",
+    "delivery_note_diffs",
+    "delivery_attempted_at",
+    "delivery_unknown_at",
+    "last_delivery_error",
+    "cancelled_at",
+    "cancel_reason",
+}
+
+
+def _instruction_schema_sync(sync_connection: sa.Connection) -> tuple[dict, dict, dict]:
+    inspector = sa.inspect(sync_connection)
+    columns = {item["name"]: item for item in inspector.get_columns(INSTRUCTIONS)}
+    checks = {
+        check["name"]: str(check["sqltext"])
+        for check in inspector.get_check_constraints(INSTRUCTIONS)
+    }
+    indexes = {
+        index["name"]: tuple(index["column_names"])
+        for index in inspector.get_indexes(INSTRUCTIONS)
+        if not index.get("duplicates_constraint")
+    }
+    return columns, checks, indexes
+
+
+async def _instruction_schema(database_url: str) -> tuple[dict, dict, dict]:
+    engine = create_postgres_engine(database_url)
+    try:
+        async with engine.connect() as connection:
+            return await connection.run_sync(_instruction_schema_sync)
+    finally:
+        await engine.dispose()
+
+
+async def _insert_legacy_instruction(
+    engine: AsyncEngine,
+    *,
+    investigation_id: UUID,
+    task_id: UUID,
+    session_id: UUID,
+    idempotency_key: str,
+    state: str,
+    delivered_at: datetime | None,
+    acknowledged_at: datetime | None,
+) -> None:
+    """Insert the exact 0023 row shape, before the delivery columns exist."""
+    body = f"Legacy {state} instruction."
+    async with engine.begin() as connection:
+        await connection.execute(
+            sa.text(
+                "INSERT INTO agent_session_instructions ("
+                "id, investigation_id, task_id, session_id, idempotency_key, body, "
+                "body_sha256, state, created_by_actor_kind, created_by_actor_id, "
+                "queued_at, delivered_at, acknowledged_at, created_at, updated_at"
+                ") VALUES ("
+                ":id, :investigation_id, :task_id, :session_id, :idempotency_key, :body, "
+                ":body_sha256, :state, 'human', 'analyst:test', :now, :delivered_at, "
+                ":acknowledged_at, :now, :now)"
+            ),
+            {
+                "id": uuid4(),
+                "investigation_id": investigation_id,
+                "task_id": task_id,
+                "session_id": session_id,
+                "idempotency_key": idempotency_key,
+                "body": body,
+                "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+                "state": state,
+                "now": NOW,
+                "delivered_at": delivered_at,
+                "acknowledged_at": acknowledged_at,
+            },
+        )
+
+
+def test_instruction_delivery_migration_converts_legacy_rows_and_guards_downgrade(
+    temporary_postgres_url: str,
+) -> None:
+    config = _alembic_config(temporary_postgres_url)
+    command.upgrade(config, "0026_workspace_note_annotations")
+    assert _alembic_version(temporary_postgres_url) == "0026_workspace_note_annotations"
+
+    async def seed() -> None:
+        engine = create_postgres_engine(temporary_postgres_url)
+        try:
+            factory = create_session_factory(engine)
+            investigation = await _seed_investigation(factory)
+            task = await _create_task(factory, investigation.id)
+            session_id = uuid4()
+            await _create_agent_session(factory, investigation.id, task.id, session_id)
+            await _insert_legacy_instruction(
+                engine,
+                investigation_id=investigation.id,
+                task_id=task.id,
+                session_id=session_id,
+                idempotency_key="legacy-queued",
+                state="queued",
+                delivered_at=None,
+                acknowledged_at=None,
+            )
+            await _insert_legacy_instruction(
+                engine,
+                investigation_id=investigation.id,
+                task_id=task.id,
+                session_id=session_id,
+                idempotency_key="legacy-delivered",
+                state="delivered",
+                delivered_at=NOW,
+                acknowledged_at=None,
+            )
+            await _insert_legacy_instruction(
+                engine,
+                investigation_id=investigation.id,
+                task_id=task.id,
+                session_id=session_id,
+                idempotency_key="legacy-acknowledged",
+                state="acknowledged",
+                delivered_at=NOW,
+                acknowledged_at=NOW,
+            )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(seed())
+    command.upgrade(config, "head")
+    assert _alembic_version(temporary_postgres_url) == HEAD
+
+    columns, checks, indexes = asyncio.run(_instruction_schema(temporary_postgres_url))
+    assert _INSTRUCTION_DELIVERY_COLUMNS <= set(columns)
+    assert columns["delivery_attempts"]["nullable"] is False
+    assert _INSTRUCTION_DELIVERY_CHECKS <= set(checks)
+    assert not (_INSTRUCTION_LEGACY_REPLACED_CHECKS & set(checks))
+    assert "delivery_unknown" in checks["ck_agent_session_instructions_state"]
+    assert "delivered_at" in checks["ck_agent_session_instructions_delivered_at"]
+    assert indexes[INSTRUCTION_PENDING_INDEX] == ("state", "queued_at", "id")
+
+    async def rows_and_violations() -> None:
+        engine = create_postgres_engine(temporary_postgres_url)
+        try:
+            factory = create_session_factory(engine)
+            async with engine.connect() as connection:
+                rows = (
+                    await connection.execute(
+                        sa.text(
+                            "SELECT idempotency_key, state, delivered_at, acknowledged_at, "
+                            "delivery_attempts, delivery_token, delivery_mode, "
+                            "delivery_sha256, delivery_note_diffs, last_delivery_error, "
+                            "cancelled_at, cancel_reason FROM agent_session_instructions"
+                        )
+                    )
+                ).all()
+            by_key = {row.idempotency_key: row for row in rows}
+            queued = by_key["legacy-queued"]
+            assert queued.state == "queued"
+            assert queued.delivered_at is None
+            assert queued.delivery_attempts == 0
+            assert queued.delivery_token is None
+            assert queued.delivery_mode is None
+            assert queued.delivery_sha256 is None
+            assert queued.delivery_note_diffs is None
+            delivered = by_key["legacy-delivered"]
+            assert delivered.state == "delivered"
+            assert delivered.delivered_at is not None
+            assert delivered.acknowledged_at is None
+            assert delivered.delivery_attempts == 0
+            assert delivered.delivery_token is None
+            assert delivered.delivery_mode is None
+            assert delivered.delivery_sha256 is None
+            acknowledged = by_key["legacy-acknowledged"]
+            assert acknowledged.state == "acknowledged"
+            assert acknowledged.delivered_at is not None
+            assert acknowledged.acknowledged_at is not None
+            assert acknowledged.delivery_attempts == 0
+            assert acknowledged.delivery_mode is None
+
+            # The new invariants bind every writer, including raw SQL.
+            await _expect_violation(
+                factory,
+                "UPDATE agent_session_instructions SET state = 'delivering' "
+                "WHERE idempotency_key = 'legacy-queued'",
+                {},
+                sqlstate="23514",
+            )
+            await _expect_violation(
+                factory,
+                "UPDATE agent_session_instructions SET state = 'delivery_unknown' "
+                "WHERE idempotency_key = 'legacy-queued'",
+                {},
+                sqlstate="23514",
+            )
+            await _expect_violation(
+                factory,
+                "UPDATE agent_session_instructions SET state = 'cancelled' "
+                "WHERE idempotency_key = 'legacy-queued'",
+                {},
+                sqlstate="23514",
+            )
+            await _expect_violation(
+                factory,
+                "UPDATE agent_session_instructions SET last_delivery_error = 'timeout' "
+                "WHERE idempotency_key = 'legacy-delivered'",
+                {},
+                sqlstate="23514",
+            )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(rows_and_violations())
+
+    with pytest.raises(RuntimeError, match="refusing to downgrade"):
+        command.downgrade(config, "0026_workspace_note_annotations")
+    assert _alembic_version(temporary_postgres_url) == HEAD
+
+
+def test_instruction_delivery_migration_rejects_a_partial_shape(
+    temporary_postgres_url: str,
+) -> None:
+    config = _alembic_config(temporary_postgres_url)
+    command.upgrade(config, "head")
+
+    async def drop_pending_index() -> None:
+        engine = create_postgres_engine(temporary_postgres_url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(sa.text(f"DROP INDEX {INSTRUCTION_PENDING_INDEX}"))
+        finally:
+            await engine.dispose()
+
+    asyncio.run(drop_pending_index())
+    command.stamp(config, "0026_workspace_note_annotations")
+    with pytest.raises(RuntimeError, match="preflight rejected"):
+        command.upgrade(config, "head")
+    assert _alembic_version(temporary_postgres_url) == "0026_workspace_note_annotations"
+
+
+def test_instruction_delivery_migration_reverses_an_empty_queue(
+    temporary_postgres_url: str,
+) -> None:
+    config = _alembic_config(temporary_postgres_url)
+    command.upgrade(config, "head")
+    command.downgrade(config, "0026_workspace_note_annotations")
+    assert _alembic_version(temporary_postgres_url) == "0026_workspace_note_annotations"
+
+    columns, checks, indexes = asyncio.run(_instruction_schema(temporary_postgres_url))
+    assert not (_INSTRUCTION_DELIVERY_COLUMNS & set(columns))
+    assert {
+        "ck_agent_session_instructions_queued",
+        "ck_agent_session_instructions_delivered",
+    } <= set(checks)
+    assert "ck_agent_session_instructions_delivered_at" not in checks
+    assert INSTRUCTION_PENDING_INDEX not in indexes
+
+    command.upgrade(config, "head")
+    assert _alembic_version(temporary_postgres_url) == HEAD
+    columns, checks, indexes = asyncio.run(_instruction_schema(temporary_postgres_url))
+    assert _INSTRUCTION_DELIVERY_COLUMNS <= set(columns)
+    assert _INSTRUCTION_DELIVERY_CHECKS <= set(checks)
+    assert indexes[INSTRUCTION_PENDING_INDEX] == ("state", "queued_at", "id")

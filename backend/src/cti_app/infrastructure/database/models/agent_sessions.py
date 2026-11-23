@@ -9,8 +9,10 @@ investigation.
 
 The session secret is stored as a 32-byte nonce plus ``SHA-256(secret)``;
 the secret itself never appears in this schema.  ``agent_session_instructions``
-is the durable mid-session queue: a busy agent leaves rows ``queued`` until it
-acknowledges them with its signed operator route.
+is the durable mid-session queue: a busy agent leaves rows ``queued`` until a
+delivery attempt reserves them (``delivering``/``delivery_unknown`` with a
+token and exact text digest) and a proven receipt makes them ``delivered``.
+Migration 0027 owns the delivery columns and the partial drain index.
 """
 
 from datetime import datetime
@@ -45,7 +47,11 @@ ACTIVE_AGENT_SESSION_STATE_VALUES_SQL = (
     "'interrupt_requested', 'reconciling'"
 )
 OPERATOR_ADAPTER_KIND_VALUES_SQL = "'codex_cli', 'claude_code'"
-INSTRUCTION_STATE_VALUES_SQL = "'queued', 'delivered', 'acknowledged', 'cancelled'"
+INSTRUCTION_STATE_VALUES_SQL = (
+    "'queued', 'delivering', 'delivered', 'acknowledged', 'delivery_unknown', 'cancelled'"
+)
+INSTRUCTION_PENDING_STATE_VALUES_SQL = "'queued', 'delivering', 'delivery_unknown'"
+INSTRUCTION_DELIVERY_MODE_VALUES_SQL = "'live', 'next_run'"
 INSTRUCTION_ACTOR_KIND_VALUES_SQL = "'human', 'operator'"
 
 _SHA256_SQL = "char_length({column}) = 64 AND {column} ~ '^[0-9a-f]{{64}}$'"
@@ -242,22 +248,73 @@ class AgentSessionInstructionRow(Base):
             name="ck_agent_session_instructions_body_sha256",
         ),
         CheckConstraint(
-            "state <> 'queued' OR delivered_at IS NULL",
-            name="ck_agent_session_instructions_queued",
-        ),
-        CheckConstraint(
-            "state NOT IN ('delivered', 'acknowledged') OR delivered_at IS NOT NULL",
-            name="ck_agent_session_instructions_delivered",
+            "(state IN ('delivered', 'acknowledged')) = (delivered_at IS NOT NULL)",
+            name="ck_agent_session_instructions_delivered_at",
         ),
         CheckConstraint(
             "(state = 'acknowledged') = (acknowledged_at IS NOT NULL)",
             name="ck_agent_session_instructions_acknowledged",
+        ),
+        CheckConstraint(
+            "delivery_attempts >= 0",
+            name="ck_agent_session_instructions_delivery_attempts",
+        ),
+        # F3-D §3.3/§3.4: an in-flight attempt always carries its token and the
+        # exact delivered-text digest; queued/cancelled rows carry neither.  A
+        # proven row may keep the token but pre-0027 rows have none.
+        CheckConstraint(
+            "(state NOT IN ('delivering', 'delivery_unknown') "
+            "OR delivery_token IS NOT NULL) AND "
+            "(delivery_token IS NULL OR state NOT IN ('queued', 'cancelled'))",
+            name="ck_agent_session_instructions_delivery_token",
+        ),
+        CheckConstraint(
+            f"(delivery_mode IS NULL OR delivery_mode IN ({INSTRUCTION_DELIVERY_MODE_VALUES_SQL})) "
+            "AND (delivery_mode IS NULL OR state IN ('delivered', 'acknowledged'))",
+            name="ck_agent_session_instructions_delivery_mode",
+        ),
+        CheckConstraint(
+            "(delivery_sha256 IS NULL OR (" + sha256_check("delivery_sha256") + ")) AND "
+            "(delivery_sha256 IS NULL OR state IN "
+            "('delivering', 'delivery_unknown', 'delivered', 'acknowledged')) AND "
+            "(state NOT IN ('delivering', 'delivery_unknown') "
+            "OR delivery_sha256 IS NOT NULL)",
+            name="ck_agent_session_instructions_delivery_sha256",
+        ),
+        CheckConstraint(
+            "delivery_note_diffs IS NULL OR "
+            "(jsonb_typeof(delivery_note_diffs) = 'array' "
+            "AND state IN ('delivered', 'acknowledged'))",
+            name="ck_agent_session_instructions_delivery_note_diffs",
+        ),
+        CheckConstraint(
+            "(state = 'delivery_unknown') = (delivery_unknown_at IS NOT NULL)",
+            name="ck_agent_session_instructions_delivery_unknown_at",
+        ),
+        CheckConstraint(
+            "(state = 'cancelled') = (cancelled_at IS NOT NULL)",
+            name="ck_agent_session_instructions_cancelled_at",
+        ),
+        CheckConstraint(
+            "(cancel_reason IS NOT NULL) = (state = 'cancelled')",
+            name="ck_agent_session_instructions_cancel_reason",
+        ),
+        CheckConstraint(
+            "last_delivery_error IS NULL OR state NOT IN ('delivered', 'acknowledged')",
+            name="ck_agent_session_instructions_last_delivery_error",
         ),
         Index(
             "ix_agent_session_instructions_session_queue",
             "session_id",
             "queued_at",
             "id",
+        ),
+        Index(
+            "ix_agent_session_instructions_pending",
+            "state",
+            "queued_at",
+            "id",
+            postgresql_where=text(f"state IN ({INSTRUCTION_PENDING_STATE_VALUES_SQL})"),
         ),
     )
 
@@ -274,6 +331,24 @@ class AgentSessionInstructionRow(Base):
     queued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    delivery_attempts: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default=text("0")
+    )
+    delivery_token: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    delivery_mode: Mapped[str | None] = mapped_column(Text, nullable=True)
+    delivery_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    delivery_note_diffs: Mapped[list[Any] | None] = mapped_column(
+        JSONB(none_as_null=True), nullable=True
+    )
+    delivery_attempted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    delivery_unknown_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_delivery_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancel_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
@@ -282,6 +357,8 @@ __all__ = [
     "ACTIVE_AGENT_SESSION_STATE_VALUES_SQL",
     "AGENT_SESSION_STATE_VALUES_SQL",
     "INSTRUCTION_ACTOR_KIND_VALUES_SQL",
+    "INSTRUCTION_DELIVERY_MODE_VALUES_SQL",
+    "INSTRUCTION_PENDING_STATE_VALUES_SQL",
     "INSTRUCTION_STATE_VALUES_SQL",
     "OPERATOR_ADAPTER_KIND_VALUES_SQL",
     "AgentSessionInstructionRow",

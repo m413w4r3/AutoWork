@@ -330,7 +330,10 @@ def test_plan_migration_accepts_an_already_conforming_shape(
     temporary_postgres_url: str,
 ) -> None:
     config = _alembic_config(temporary_postgres_url)
-    command.upgrade(config, "head")
+    # Stop at this revision before stamping back: a later head (0027) replaces
+    # constraints on agent_session_instructions, so 0023 is only re-runnable
+    # against the shape it created itself.
+    command.upgrade(config, "0020_investigation_plans")
     command.stamp(config, PREVIOUS)
     command.upgrade(config, "head")
     assert PLAN_TABLES <= _table_names(temporary_postgres_url)

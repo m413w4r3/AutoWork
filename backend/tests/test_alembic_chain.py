@@ -40,6 +40,7 @@ EXPECTED_CHAIN = (
     "0024_work_contributions",
     "0025_opinion_note_proposals",
     "0026_workspace_note_annotations",
+    "0027_instruction_delivery",
 )
 
 BAR_CHART_MIGRATION = importlib.import_module(
@@ -187,7 +188,7 @@ def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
     revision_ids = [script.revision for script in revisions]
 
     assert scripts.get_heads() == [scripts.get_current_head()]
-    assert scripts.get_current_head() == "0026_workspace_note_annotations"
+    assert scripts.get_current_head() == "0027_instruction_delivery"
     assert all(revision_id for revision_id in revision_ids)
     assert {revision_id for revision_id in revision_ids if len(revision_id) > 32} == {
         "0009_acquisition_strategy_attempts",
@@ -227,13 +228,14 @@ def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
         "0024_work_contributions": "0023_agent_sessions",
         "0025_opinion_note_proposals": "0024_work_contributions",
         "0026_workspace_note_annotations": "0025_opinion_note_proposals",
+        "0027_instruction_delivery": "0026_workspace_note_annotations",
     }
 
 
-def test_expected_chain_ends_with_0026() -> None:
-    """ADR-0011 D10 schema oracle: the single head is the note-annotation revision."""
+def test_expected_chain_ends_with_0027() -> None:
+    """ADR-0011 D10 schema oracle: the single head is the instruction-delivery revision."""
     config = Config(BACKEND_ROOT / "alembic.ini")
     scripts = ScriptDirectory.from_config(config)
 
-    assert scripts.get_current_head() == "0026_workspace_note_annotations"
-    assert scripts.get_heads() == ["0026_workspace_note_annotations"]
+    assert scripts.get_current_head() == "0027_instruction_delivery"
+    assert scripts.get_heads() == ["0027_instruction_delivery"]
