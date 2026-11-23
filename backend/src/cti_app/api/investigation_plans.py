@@ -27,6 +27,7 @@ from cti_app.api.investigation import (
     _require_verified_human_operator,
     _uow_factory,
 )
+from cti_app.api.investigation_task_consultations import assemble_task_context
 from cti_app.application.identity import IdentityScope
 from cti_app.application.investigation_advisor_tools import ADVISOR_SCHEMA_VERSION
 from cti_app.application.investigation_bootstrap import BOOTSTRAP_SNAPSHOT_OBJECT_TYPE
@@ -125,6 +126,7 @@ class PlanRequestV1(BaseModel):
     expected_version: int = Field(ge=1)
     expected_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     question: str | None = Field(default=None, max_length=8_000)
+    context_task_id: UUID | None = None
 
 
 class PlanRequestResponseV1(BaseModel):
@@ -372,7 +374,9 @@ async def get_plan(
     "/{investigation_id}/consultations",
     response_model=ConsultationLedgerV1,
 )
-async def list_consultations(investigation_id: UUID, request: Request) -> ConsultationLedgerV1:
+async def list_consultations(
+    investigation_id: UUID, request: Request, task_id: UUID | None = None
+) -> ConsultationLedgerV1:
     await _require_plan_reader(request)
     factory = _composition_factory(request)
     async with _uow_factory(request)() as uow:
@@ -385,7 +389,9 @@ async def list_consultations(investigation_id: UUID, request: Request) -> Consul
             artifact_store=factory.artifact_store,
             decisions=uow.analyst_decisions,
         )
-        consultations = await ledger.list_for_investigation(investigation_id)
+        consultations = await ledger.list_for_investigation(
+            investigation_id, context_task_id=task_id
+        )
         return ConsultationLedgerV1(
             investigation_id=investigation_id,
             consultations=consultations,
@@ -410,12 +416,24 @@ async def request_plan(
             raise _http_error(404, "investigation_not_found")
         observations = await uow.evidence_observations.list_for_investigation(investigation_id)
         snapshot = _latest_bootstrap_snapshot(observations)
+        context_task: InvestigationTaskV1 | None = None
+        if payload.context_task_id is not None:
+            context_task = await uow.investigation_tasks.get(payload.context_task_id)
+            if context_task is None or context_task.investigation_id != investigation_id:
+                raise _http_error(404, "task_not_found")
         arguments: dict[str, Any] = {
             "consultation_type": PLAN_CONSULTATION_TYPE,
             "question": (payload.question or "").strip() or _DEFAULT_PLAN_QUESTION,
         }
         if snapshot is not None:
             arguments["evidence_refs"] = [str(snapshot.id)]
+        if context_task is not None:
+            arguments["task_context"] = await assemble_task_context(
+                uow=uow,
+                task=context_task,
+                factory=factory,
+                investigation=investigation,
+            )
         composition = factory.build(uow, investigation_id, operator_mode=True)
         try:
             invocation_result = await composition.operator_tool_invocations.invoke(
@@ -428,6 +446,7 @@ async def request_plan(
                 idempotency_key=idempotency_key,
                 actor_id=identity.actor_id,
                 requester_actor_kind=ToolInvocationActorKind.HUMAN,
+                context_task_id=context_task.id if context_task is not None else None,
             )
         except OperatorToolInvocationError as exc:
             raise _http_error(exc.status_code, exc.code, details=exc.details) from exc
