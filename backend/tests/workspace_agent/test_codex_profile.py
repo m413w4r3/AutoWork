@@ -15,6 +15,7 @@ import inspect
 import json
 import os
 import shutil
+import socket
 import stat
 import tomllib
 from pathlib import Path
@@ -549,6 +550,60 @@ def test_real_adapters_share_the_relay_transport_contract(
     catalog_copy = context.config_directory / "catalog.py"
     assert catalog_copy.read_bytes() == (SESSIONS_PACKAGE / "catalog.py").read_bytes()
     assert catalog_copy.stat().st_mode & 0o777 == 0o700
+
+    synthetic_host_etc = tmp_path / "synthetic-host" / "etc"
+    synthetic_host_etc.mkdir(parents=True)
+    sentinel = "tailnet.r2b4.invalid"
+    (synthetic_host_etc / "hosts").write_text(
+        f"127.0.0.1 localhost {sentinel}\n", encoding="utf-8"
+    )
+    (synthetic_host_etc / "resolv.conf").write_text(
+        f"search {sentinel}\nnameserver 192.0.2.53\n", encoding="utf-8"
+    )
+    session_etc = context.session_directory / process.SESSION_ETC_DIRECTORY_NAME
+    assert (session_etc / "hosts").read_bytes() == b"127.0.0.1 localhost\n::1 localhost\n"
+    assert (session_etc / "resolv.conf").read_bytes() == b""
+    assert (session_etc / "nsswitch.conf").read_bytes() == b"hosts: files\n"
+    assert stat.S_IMODE(session_etc.stat().st_mode) == 0o700
+    for name, _contents in process.SESSION_ETC_FILES:
+        assert stat.S_IMODE((session_etc / name).stat().st_mode) == 0o600
+    binds = [
+        (Path(plan.argv[index + 1]), Path(plan.argv[index + 2]))
+        for index in range(len(plan.argv) - 2)
+        if plan.argv[index] == "--ro-bind"
+    ]
+    assert all(pair in binds for pair in process.session_etc_ro_binds(session_etc))
+    assert all(pair in binds for pair in process.tls_trust_anchor_binds())
+    assert not any(
+        target in {
+            Path("/etc/ssl"),
+            Path("/etc/ca-certificates"),
+            Path("/etc/pki"),
+            Path("/etc/localtime"),
+            Path("/etc/host.conf"),
+        }
+        for _source, target in binds
+    )
+    assert (session_etc, session_etc) not in binds
+    assert not any(
+        source in {synthetic_host_etc / "hosts", synthetic_host_etc / "resolv.conf"}
+        for source, _target in binds
+    )
+    assert sentinel not in "\0".join(plan.argv)
+
+    egress_socket = context.ipc_socket_path.parent / process.EGRESS_SOCKET_FILE_NAME
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        listener.bind(str(egress_socket))
+        wrapped = process.isolated_entry_argv(plan.argv, egress_socket_path=egress_socket)
+    finally:
+        listener.close()
+    forwarder_index = wrapped.index("forward-and-exec")
+    assert wrapped[forwarder_index + 1 : forwarder_index + 3] == [
+        "--upstream",
+        str(egress_socket),
+    ]
+    assert "--unshare-net" in wrapped
     assert "AUTOWORK_BACKEND_URL" not in plan.env
     assert "AUTOWORK_BACKEND_URL" not in server["env"]
     assert "AUTOWORK_SHIM_TEST_BACKEND_URL" not in plan.env
@@ -589,36 +644,33 @@ def test_codex_installs_the_exact_shim_and_catalogue(tmp_path: Path) -> None:
     )
 
 
-def test_codex_binds_the_cli_trust_anchors(tmp_path: Path) -> None:
-    """H0: bwrap starts from a tmpfs root; without /etc/ssl every TLS fails.
-
-    The provider tunnel opens (CONNECT is allowed) but the CLI cannot verify
-    the chain, so every request fails after the tunnel (observed: 63 allowed
-    CONNECTs, zero successful requests).  The read-only trust anchors mirror
-    the Claude profile.
-    """
+def test_codex_binds_only_certificate_anchors_and_private_etc_files(tmp_path: Path) -> None:
+    """Keep the provider CA store while replacing host resolver configuration."""
     fake = _install_fake_codex(tmp_path)
     stub = _install_stub_bwrap(tmp_path)
     profile = CodexProfile(binary=fake, bwrap=stub)
     context = _make_context(tmp_path)
     plan = profile.build_launch_plan(context)
     argv = list(plan.argv)
-    checked = 0
-    for anchor in (
-        "/etc/ssl",
-        "/etc/ca-certificates",
-        "/etc/pki",
-        "/etc/resolv.conf",
-        "/etc/hosts",
-        "/etc/nsswitch.conf",
-        "/etc/localtime",
-    ):
-        if not Path(anchor).exists():
-            continue
-        checked += 1
-        pair = ["--ro-bind", anchor, anchor]
-        assert any(argv[index : index + 3] == pair for index in range(len(argv))), anchor
-    assert checked  # this host has at least one trust anchor to prove the bind
+    binds = [
+        (Path(argv[index + 1]), Path(argv[index + 2]))
+        for index in range(len(argv) - 2)
+        if argv[index] == "--ro-bind"
+    ]
+    tls_binds = process.tls_trust_anchor_binds()
+    assert tls_binds
+    assert all(pair in binds for pair in tls_binds)
+    assert not any(
+        target in {Path("/etc/ssl"), Path("/etc/pki"), Path("/etc/ca-certificates")}
+        for _source, target in binds
+    )
+    assert not any(
+        target in {Path("/etc/hosts"), Path("/etc/resolv.conf")} and source == target
+        for source, target in binds
+    )
+    session_etc = context.session_directory / process.SESSION_ETC_DIRECTORY_NAME
+    assert all(pair in binds for pair in process.session_etc_ro_binds(session_etc))
+    assert not any(target == Path("/etc/host.conf") for _source, target in binds)
 
 
 def test_codex_prompt_carries_preamble_and_handoff_reference(tmp_path: Path) -> None:

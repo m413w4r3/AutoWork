@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import re
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -652,6 +653,59 @@ def test_real_netns_cannot_reach_a_host_loopback_listener(tmp_path: Path) -> Non
         assert listener.accepted == 0
     finally:
         listener.close()
+
+
+def test_real_bwrap_sees_private_resolver_files_only(tmp_path: Path) -> None:
+    """Read the actual /etc mounts in bwrap when this host can create netns."""
+    _require_real_netns()
+    runtime = tmp_path / "runtime-session"
+    runtime.mkdir(mode=0o700)
+    dirs = _session_dirs(runtime)
+    session_etc = process.create_session_etc_directory(runtime)
+    host_etc = tmp_path / "synthetic-host" / "etc"
+    host_etc.mkdir(parents=True)
+    sentinel = "tailnet.r2b4.invalid"
+    (host_etc / "hosts").write_text(f"127.0.0.1 localhost {sentinel}\n", encoding="utf-8")
+    (host_etc / "resolv.conf").write_text(
+        f"search {sentinel}\nnameserver 192.0.2.53\n", encoding="utf-8"
+    )
+    code = (
+        "import json, pathlib; "
+        "print(json.dumps({name: pathlib.Path('/etc', name).read_text() "
+        "for name in ('hosts', 'resolv.conf', 'nsswitch.conf')}))"
+    )
+    argv = process.build_bwrap_argv(
+        (process.PROBE_PYTHON, "-c", code),
+        workspace_binds=(),
+        ipc_directory=dirs["ipc"],
+        scratch_directory=dirs["scratch"],
+        config_directory=dirs["config"],
+        work_directory=dirs["work"],
+        session_etc_directory=session_etc,
+    )
+    completed = subprocess.run(
+        argv,
+        cwd=dirs["work"],
+        env=TEST_ENV,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=15,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr.decode("utf-8", errors="replace")
+    observed = json.loads(completed.stdout.decode("utf-8"))
+    assert observed == {
+        "hosts": "127.0.0.1 localhost\n::1 localhost\n",
+        "resolv.conf": "",
+        "nsswitch.conf": "hosts: files\n",
+    }
+    assert sentinel not in completed.stdout.decode("utf-8")
+    ro_binds = [
+        (Path(argv[index + 1]), Path(argv[index + 2]))
+        for index in range(len(argv) - 2)
+        if argv[index] == "--ro-bind"
+    ]
+    assert all(pair in ro_binds for pair in process.session_etc_ro_binds(session_etc))
 
 
 def test_real_spawn_survives_a_short_lived_calling_thread(tmp_path: Path) -> None:

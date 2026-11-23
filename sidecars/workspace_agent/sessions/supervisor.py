@@ -1429,6 +1429,7 @@ class SessionSupervisor:
                 # Close in-flight relay connections and provider tunnels, unlink
                 # both sockets and the one-shot secret, wipe the secret bytes.
                 self._stop_channels(handle, wipe_secret=True)
+                process.cleanup_session_etc_directory(handle.directory)
                 # R2B-1: shutting the supervisor down never leaves a seeded
                 # provider credential behind; a failure is recorded on the
                 # session (``failed`` + typed event) and logged, never raised
@@ -1637,6 +1638,7 @@ class SessionSupervisor:
     def _load_and_reconcile(self, directory: Path) -> None:
         # A previous supervisor may have crashed with its listeners' pathname
         # sockets still on disk: they are orphans, never adopted.
+        process.cleanup_session_etc_directory(directory)
         self._unlink_orphan_sockets(directory)
         payload = session_state.read_json(directory / session_state.STATE_FILE_NAME)
         record = SessionRecord.from_payload(payload)
@@ -2453,6 +2455,8 @@ class SessionSupervisor:
         else:
             record.state = SessionState.FAILED
             record.outcome = "failed"
+        if record.state in (SessionState.STOPPED, SessionState.FAILED):
+            process.cleanup_session_etc_directory(handle.directory)
         if record.state in (SessionState.STOPPED, SessionState.FAILED) and (
             record.outcome != CREDENTIAL_CLEANUP_REASON
         ):
@@ -3198,6 +3202,7 @@ class SessionSupervisor:
             # one-shot handoff and wipe the in-memory secret at close.
             self._stop_channels(handle, wipe_secret=True)
             shutil.rmtree(handle.scratch, ignore_errors=True)
+            process.cleanup_session_etc_directory(handle.directory)
             for path in (handle.prompt_path, handle.instruction_path):
                 try:
                     os.unlink(path)
