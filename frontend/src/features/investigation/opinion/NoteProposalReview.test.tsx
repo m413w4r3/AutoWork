@@ -3,6 +3,10 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type {
+  InvestigationFinding,
+  InvestigationObservation,
+} from "../../../api/investigation";
+import type {
   NoteContentBlockV1,
   NoteProposalDiffViewV1,
   NoteProposalViewV1,
@@ -24,12 +28,43 @@ const NOTE_ID = "44444444-4444-4444-8444-444444444444";
 const OBSERVATION_ID = "55555555-5555-4555-8555-555555555555";
 const SUBJECT_ID = "66666666-6666-4666-8666-666666666666";
 const BASE_ID = "77777777-7777-4777-8777-777777777777";
+const FINDING_ID = "88888888-8888-4888-8888-888888888888";
 const ELEMENT_HASH = "a".repeat(64);
 const BLOB_HASH = "b".repeat(64);
 const EXCERPT_HASH = "c".repeat(64);
 const ASSET_HASH = "d".repeat(64);
 const BASE_SHA = "e".repeat(64);
 const PROPOSED_HASH = "f".repeat(64);
+
+const REVIEW_FINDING: InvestigationFinding = {
+  id: FINDING_ID,
+  logical_id: "finding-network-1",
+  current_version_id: "99999999-9999-4999-8999-999999999999",
+  version: 1,
+  revision_chain: [],
+  kind: "network_behaviour",
+  assessment: "supported",
+  novelty: null,
+  statement: "Le serveur répond à une requête de commande.",
+  scope: "Échantillon A",
+  limitations: [],
+  observation_refs: [OBSERVATION_ID],
+  claim_refs: [],
+  created_at: "2026-11-22T08:00:00Z",
+};
+
+const REVIEW_OBSERVATION: InvestigationObservation = {
+  id: OBSERVATION_ID,
+  kind: "binary_analysis",
+  sha256: BLOB_HASH,
+  source: "analysis-worker",
+  source_version: "1",
+  observed_at: "2026-11-22T08:00:00Z",
+  object_type: "binary",
+  object_id: "sample-1",
+  limitations: [],
+  invocation_ref: null,
+};
 
 const CONTENT_BLOCKS: NoteContentBlockV1[] = [
   {
@@ -117,7 +152,7 @@ function makeProposal(): NoteProposalViewV1 {
     base_note_id: NOTE_ID,
     note_state: "observed",
     note_relation: "confirms",
-    cited_finding_refs: [],
+    cited_finding_refs: [FINDING_ID],
     cited_observation_refs: [OBSERVATION_ID],
     proposed_text: "Texte Bridge proposé pour le chapô.",
     proposed_text_sha256: PROPOSED_HASH,
@@ -158,7 +193,7 @@ function makeDiff(
     anchor: proposal.anchor,
     target_block_type: proposal.target_block_type,
     anchor_excerpt: "Extrait du chapô.",
-    cited_finding_refs: [],
+    cited_finding_refs: proposal.cited_finding_refs,
     cited_observation_refs: [OBSERVATION_ID],
     content_blocks: CONTENT_BLOCKS,
     resolved_content_blocks: RESOLVED_BLOCKS,
@@ -171,7 +206,19 @@ function makeDiff(
   };
 }
 
-function renderReview(diff: NoteProposalDiffViewV1) {
+function renderReview(
+  diff: NoteProposalDiffViewV1,
+  onRequestCorrection: (seed: {
+    anchor: string;
+    blockType: NoteProposalViewV1["bridge_block_type"];
+    contentBlocks: NoteContentBlockV1[];
+    findingRefs: string[];
+    observationRefs: string[];
+    noteState: NoteProposalViewV1["note_state"];
+    noteRelation: NoteProposalViewV1["note_relation"];
+    taskId: string | null;
+  }) => void = () => undefined,
+) {
   let reads = 0;
   const calls: Array<{ url: string; init?: RequestInit }> = [];
   installFetch((request) => {
@@ -182,6 +229,28 @@ function renderReview(diff: NoteProposalDiffViewV1) {
     ) {
       reads += 1;
       return jsonResponse(diff);
+    }
+    if (
+      request.url === `/api/investigations/${INVESTIGATION_ID}/article-anchors`
+    ) {
+      return jsonResponse({
+        base_publication_artifact_id: BASE_ID,
+        base_publication_version: 3,
+        base_publication_sha256: BASE_SHA,
+        source: "pinned_opinion_base",
+        anchors: [
+          {
+            anchor: "lead:0001",
+            text: "Texte du chapô source.",
+            text_sha256: "0".repeat(64),
+            section_index: null,
+            paragraph_index: 0,
+          },
+        ],
+        elements: [],
+        truncated: false,
+        sections: [],
+      });
     }
     if (
       request.url ===
@@ -204,10 +273,11 @@ function renderReview(diff: NoteProposalDiffViewV1) {
     <NoteProposalReview
       investigationId={INVESTIGATION_ID}
       proposalId={PROPOSAL_ID}
-      findings={[]}
-      observations={[]}
+      findings={[REVIEW_FINDING]}
+      observations={[REVIEW_OBSERVATION]}
       subjectId={SUBJECT_ID}
       onClose={() => undefined}
+      onRequestCorrection={onRequestCorrection}
     />,
     { wrapper: wrapperFor(client) },
   );
@@ -249,12 +319,14 @@ describe("NoteProposalReview — blocs de contenu", () => {
     const user = userEvent.setup();
     const { calls } = renderReview(makeDiff());
 
-    await screen.findByRole("button", { name: /Accepter la proposition v4/ });
+    await screen.findByRole("button", { name: "Accepter" });
     await user.click(
-      screen.getByRole("checkbox", { name: /J’ai examiné le texte stocké/ }),
+      screen.getByRole("checkbox", {
+        name: /J’ai relu ce texte et ses références/,
+      }),
     );
     const accept = screen.getByRole("button", {
-      name: /Accepter la proposition v4/,
+      name: "Accepter",
     });
     expect(accept).toBeEnabled();
     await user.click(accept);
@@ -279,6 +351,97 @@ describe("NoteProposalReview — blocs de contenu", () => {
     expect(body).not.toHaveProperty("content_blocks");
   });
 
+  it("présente les sections dans l’ordre demandé, avec une provenance repliée", async () => {
+    const user = userEvent.setup();
+    renderReview(makeDiff());
+    await screen.findByRole("heading", { name: "Texte proposé" });
+
+    const headings = [
+      "Texte proposé",
+      "Diff avec la Note actuelle",
+      "Références citées",
+      "Aperçu à cet emplacement",
+      "Décision",
+    ].map((name) => screen.getByRole("heading", { name }));
+    expect(
+      headings.every((heading, index) =>
+        index === headings.length - 1
+          ? true
+          : Boolean(
+              headings[index + 1] &&
+              (heading.compareDocumentPosition(headings[index + 1]!) &
+                Node.DOCUMENT_POSITION_FOLLOWING) !==
+                0,
+            ),
+      ),
+    ).toBe(true);
+    expect(
+      screen.getByRole("heading", {
+        name: "Proposition Bridge — version 4",
+      }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Emplacement").parentElement).toHaveTextContent(
+      "Chapô, paragraphe 1 · « Extrait du chapô. »",
+    );
+    expect(screen.getByText("1 finding · 1 observation")).toBeInTheDocument();
+    expect(
+      screen.getByText(/Le serveur répond à une requête de commande/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Analyse binaire · analysis-worker · binary sample-1"),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Différences" }));
+    expect(screen.getByText(/Supprimé/)).toBeInTheDocument();
+    expect(screen.getByText(/Ajouté/)).toBeInTheDocument();
+
+    const technical = screen
+      .getByText("Provenance technique")
+      .closest("details");
+    expect(technical).not.toHaveAttribute("open");
+    expect(technical).toHaveTextContent(FINDING_ID);
+    expect(technical).toHaveTextContent(OBSERVATION_ID);
+    expect(
+      screen
+        .getAllByRole("button")
+        .every((button) => !/[a-f0-9]{12,}/i.test(button.textContent ?? "")),
+    ).toBe(true);
+  });
+
+  it("n’affiche pas de diff sans Note existante", async () => {
+    renderReview(makeDiff({ current_note_id: null, current_note_text: null }));
+
+    await screen.findByRole("heading", { name: "Texte proposé" });
+    expect(
+      screen.queryByRole("heading", { name: "Diff avec la Note actuelle" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("transmet la demande de correction au panneau Bridge sans mutation d’acceptation", async () => {
+    const user = userEvent.setup();
+    const onRequestCorrection = vi.fn();
+    const { calls } = renderReview(makeDiff(), onRequestCorrection);
+
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Demander une correction à Bridge",
+      }),
+    );
+
+    expect(onRequestCorrection).toHaveBeenCalledWith({
+      anchor: "lead:0001",
+      blockType: "key_findings",
+      contentBlocks: CONTENT_BLOCKS,
+      findingRefs: [FINDING_ID],
+      observationRefs: [OBSERVATION_ID],
+      noteState: "observed",
+      noteRelation: "confirms",
+      taskId: null,
+    });
+    expect(
+      calls.some((call) => call.url.endsWith(`/${PROPOSAL_ID}/accept`)),
+    ).toBe(false);
+  });
+
   it("refuse l’acceptation quand un bloc est périmé et recharge la proposition", async () => {
     const user = userEvent.setup();
     const diff = makeDiff({
@@ -296,11 +459,11 @@ describe("NoteProposalReview — blocs de contenu", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("note_block_ref_stale")).toBeInTheDocument();
     await user.click(
-      screen.getByRole("checkbox", { name: /J’ai examiné le texte stocké/ }),
+      screen.getByRole("checkbox", {
+        name: /J’ai relu ce texte et ses références/,
+      }),
     );
-    expect(
-      screen.getByRole("button", { name: /Accepter la proposition v4/ }),
-    ).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Accepter" })).toBeDisabled();
 
     const readsBefore = readCount();
     await user.click(

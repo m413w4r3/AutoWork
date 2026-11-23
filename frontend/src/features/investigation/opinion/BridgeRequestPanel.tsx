@@ -5,7 +5,7 @@ import type {
   InvestigationFinding,
   InvestigationObservation,
 } from "../../../api/investigation";
-import { articleAnchorsKeys } from "../api/articleAnchors";
+import { articleAnchorsKeys, useArticleAnchors } from "../api/articleAnchors";
 import {
   useRequestNoteProposal,
   type AnalystObservationRelation,
@@ -19,12 +19,6 @@ import { AnchorPicker } from "./AnchorPicker";
 import { ANCHOR_EXAMPLES, classifyAnchor } from "./anchor";
 import { describeApiError, isAnchorReloadError } from "./errors";
 import {
-  DRAFTING_INTENTS,
-  buildDraftingQuestion,
-  getDraftingIntent,
-  type DraftingIntent,
-} from "./intents";
-import {
   BLOCK_LABELS,
   BLOCK_ORDER,
   EVIDENCE_KIND_LABELS,
@@ -33,7 +27,23 @@ import {
   NOTE_STATE_LABELS,
   truncate,
 } from "./labels";
+import {
+  buildDraftingQuestion,
+  getDraftingIntent,
+  type DraftingIntent,
+} from "./intents";
 import type { AnalystNoteV1, OpinionVersionV1 } from "./types";
+
+export interface BridgeCorrectionSeed {
+  anchor: string;
+  blockType: ProseOpinionBlockType;
+  contentBlocks: NoteContentBlockV1[];
+  findingRefs: string[];
+  observationRefs: string[];
+  noteState: AnalystObservationState;
+  noteRelation: AnalystObservationRelation;
+  taskId: string | null;
+}
 
 function toggle(list: string[], id: string): string[] {
   return list.includes(id) ? list.filter((item) => item !== id) : [...list, id];
@@ -52,6 +62,34 @@ function searchParam(name: string): string | null {
   return new URL(window.location.href).searchParams.get(name);
 }
 
+const REQUEST_MODES: Array<{ id: DraftingIntent; label: string }> = [
+  { id: "rediger", label: "Rédiger" },
+  { id: "corriger", label: "Réviser / corriger" },
+  { id: "verifier", label: "Critiquer" },
+];
+
+function locationLabel(
+  anchor: string,
+  catalog: ReturnType<typeof useArticleAnchors>["data"],
+): string {
+  const item = catalog?.anchors.find(
+    (candidate) => candidate.anchor === anchor,
+  );
+  if (item === undefined) return "Emplacement de l’article non disponible";
+  const paragraph = (item.paragraph_index ?? 0) + 1;
+  if (item.section_index === null) return `Chapô, paragraphe ${paragraph}`;
+  const section = item.section_index + 1;
+  const heading = catalog?.sections?.find(
+    (candidate) => candidate.section_index === item.section_index,
+  )?.heading;
+  return `Section ${section}${heading ? ` · ${heading}` : ""}, paragraphe ${paragraph}`;
+}
+
+function observationOptionLabel(observation: InvestigationObservation): string {
+  const kind = EVIDENCE_KIND_LABELS[observation.kind] ?? observation.kind;
+  return `${kind} · ${observation.source} · ${observation.object_type} ${observation.object_id}`;
+}
+
 export function BridgeRequestPanel({
   investigationId,
   opinion,
@@ -67,6 +105,7 @@ export function BridgeRequestPanel({
   onAnchorChange,
   onBlockTypeChange,
   onRequested,
+  correctionSeed = null,
   children,
 }: {
   investigationId: string;
@@ -83,23 +122,35 @@ export function BridgeRequestPanel({
   onAnchorChange: (anchor: string) => void;
   onBlockTypeChange: (blockType: ProseOpinionBlockType) => void;
   onRequested: (proposalId: string) => void;
+  correctionSeed?: BridgeCorrectionSeed | null;
   children?: ReactNode;
 }) {
   const queryClient = useQueryClient();
   const request = useRequestNoteProposal(investigationId);
+  const articleAnchorsQuery = useArticleAnchors(investigationId);
+  const articleCatalog = articleAnchorsQuery.data;
   // A task-card link pre-fills the request; the URL is read once at mount so a
   // later manual change is never overwritten.
   const [requestedTaskId] = useState(() => searchParam("task_id") ?? "");
   const [intent, setIntent] = useState<DraftingIntent>(() =>
-    bridgeIntentFromParam(searchParam("bridge_intent")),
+    correctionSeed === null
+      ? bridgeIntentFromParam(searchParam("bridge_intent"))
+      : "corriger",
   );
-  const [findingRefs, setFindingRefs] = useState<string[]>([]);
-  const [observationRefs, setObservationRefs] = useState<string[]>([]);
-  const [taskId, setTaskId] = useState("");
-  const [noteState, setNoteState] =
-    useState<AnalystObservationState>("unresolved");
-  const [noteRelation, setNoteRelation] =
-    useState<AnalystObservationRelation>("unresolved");
+  const [correctionInstruction, setCorrectionInstruction] = useState("");
+  const [findingRefs, setFindingRefs] = useState<string[]>(
+    () => correctionSeed?.findingRefs ?? [],
+  );
+  const [observationRefs, setObservationRefs] = useState<string[]>(
+    () => correctionSeed?.observationRefs ?? [],
+  );
+  const [taskId, setTaskId] = useState(() => correctionSeed?.taskId ?? "");
+  const [noteState, setNoteState] = useState<AnalystObservationState>(
+    () => correctionSeed?.noteState ?? "unresolved",
+  );
+  const [noteRelation, setNoteRelation] = useState<AnalystObservationRelation>(
+    () => correctionSeed?.noteRelation ?? "unresolved",
+  );
 
   const targetType = classifyAnchor(anchor);
   const currentNote = notes.find((note) => note.anchor === anchor) ?? null;
@@ -107,11 +158,13 @@ export function BridgeRequestPanel({
   const selectedIntent = getDraftingIntent(intent);
 
   useEffect(() => {
-    if (requestedTaskId === "" || taskId !== "") return;
+    if (correctionSeed !== null || requestedTaskId === "" || taskId !== "") {
+      return;
+    }
     if (tasks.some((task) => task.id === requestedTaskId)) {
       setTaskId(requestedTaskId);
     }
-  }, [requestedTaskId, taskId, tasks]);
+  }, [correctionSeed, requestedTaskId, taskId, tasks]);
 
   useEffect(() => {
     // The anchor is selected asynchronously; until one is chosen the note
@@ -129,6 +182,8 @@ export function BridgeRequestPanel({
     noteState !== "unresolved" &&
     findingRefs.length === 0 &&
     observationRefs.length === 0;
+  const correctionInstructionMissing =
+    intent === "corriger" && correctionInstruction.trim() === "";
 
   const submitBlockedReason =
     targetType === null
@@ -138,13 +193,27 @@ export function BridgeRequestPanel({
         : workingStateVersion === null
           ? "La version de l’état de travail n’est pas encore chargée."
           : selectedIntent.requiresCurrentBridgeNote && !reviewAvailable
-            ? "La vérification exige une note existante rédigée par Bridge à cette ancre."
+            ? "La critique exige une note existante rédigée par Bridge à cette ancre."
             : sourcesMissing
               ? "Une note observée ou inférée doit citer au moins un finding ou une observation."
-              : null;
+              : correctionInstructionMissing
+                ? "Saisissez une consigne de correction pour Bridge."
+                : null;
 
   function submit() {
     if (targetType === null || workingStateVersion === null) return;
+    const baseQuestion = buildDraftingQuestion(intent, {
+      anchor,
+      blockType,
+      state: noteState,
+      relation: noteRelation,
+      findingRefs,
+      observationRefs,
+    });
+    const question =
+      intent === "corriger"
+        ? `${baseQuestion}\nConsigne de correction de l’analyste à Bridge (instruction uniquement, jamais texte publiable) :\n${correctionInstruction.trim()}`
+        : baseQuestion;
     const common = {
       anchor,
       target_block_type: targetType,
@@ -156,14 +225,7 @@ export function BridgeRequestPanel({
       observation_refs: observationRefs,
       ...(contentBlocks.length === 0 ? {} : { content_blocks: contentBlocks }),
       ...(taskId === "" ? {} : { task_id: taskId }),
-      question: buildDraftingQuestion(intent, {
-        anchor,
-        blockType,
-        state: noteState,
-        relation: noteRelation,
-        findingRefs,
-        observationRefs,
-      }),
+      question,
       expected_working_state_version: workingStateVersion,
     };
     const payload: NoteProposalRequestV1 = opinion
@@ -184,95 +246,59 @@ export function BridgeRequestPanel({
     });
   }
 
+  const currentLocation = locationLabel(anchor, articleCatalog);
+
   return (
-    <section className="job-card" aria-labelledby="opinion-bridge-request">
-      <h3 id="opinion-bridge-request">Demander une proposition à Bridge</h3>
-      <p>
-        La demande produit une proposition ciblée et versionnée. Elle ne réécrit
-        jamais silencieusement tout l’avis : seul le texte stocké de la réponse
-        Bridge pourra être accepté, et uniquement par une décision humaine.
-      </p>
+    <section
+      className="job-card opinion-bridge-request"
+      aria-labelledby="opinion-bridge-request"
+    >
+      <h3 id="opinion-bridge-request">
+        {correctionSeed === null
+          ? "Demander une proposition à Bridge"
+          : "Demander une correction à Bridge"}
+      </h3>
 
-      <AnchorPicker
-        investigationId={investigationId}
-        anchor={anchor}
-        onAnchorChange={onAnchorChange}
-        notes={notes}
-        proposal={request.data?.proposal ?? null}
-      />
-
-      {children}
-
-      <label htmlFor="opinion-note-block">Bloc de l’avis visé</label>
-      <select
-        id="opinion-note-block"
-        value={blockType}
-        onChange={(event) =>
-          onBlockTypeChange(event.currentTarget.value as ProseOpinionBlockType)
-        }
+      <section
+        className="opinion-bridge-request__context"
+        aria-label="Contexte du paragraphe sélectionné"
       >
-        {BLOCK_ORDER.map((value) => (
-          <option key={value} value={value}>
-            {BLOCK_LABELS[value]}
-          </option>
-        ))}
-      </select>
+        <h4>Contexte du paragraphe</h4>
+        <p>{currentLocation}</p>
+        {articleAnchorsQuery.isPending ? (
+          <p role="status">Chargement du paragraphe…</p>
+        ) : articleAnchorsQuery.isError ? (
+          <p className="verification-warning" role="note">
+            Le texte du paragraphe sélectionné est indisponible.
+          </p>
+        ) : (
+          <p>
+            {articleCatalog?.anchors.find((item) => item.anchor === anchor)
+              ?.text ?? "Aucun paragraphe correspondant dans le catalogue."}
+          </p>
+        )}
+        {currentNote === null ? (
+          <p>Aucune note existante à cet emplacement.</p>
+        ) : (
+          <section aria-label="Note existante">
+            <h5>Note existante</h5>
+            <p>{currentNote.text}</p>
+          </section>
+        )}
+      </section>
+
+      {correctionSeed === null ? (
+        <AnchorPicker
+          investigationId={investigationId}
+          anchor={anchor}
+          onAnchorChange={onAnchorChange}
+          notes={notes}
+          proposal={request.data?.proposal ?? null}
+        />
+      ) : null}
 
       <fieldset>
-        <legend>Action demandée à Bridge</legend>
-        {DRAFTING_INTENTS.map((option) => {
-          const disabled = option.requiresCurrentBridgeNote && !reviewAvailable;
-          return (
-            <label key={option.id}>
-              <input
-                type="radio"
-                name="opinion-drafting-intent"
-                value={option.id}
-                checked={intent === option.id}
-                disabled={disabled}
-                onChange={() => setIntent(option.id)}
-              />{" "}
-              {option.label}
-              {disabled ? " (note Bridge existante requise)" : ""}
-            </label>
-          );
-        })}
-      </fieldset>
-
-      <label htmlFor="opinion-note-state">État de la note</label>
-      <select
-        id="opinion-note-state"
-        value={noteState}
-        onChange={(event) =>
-          setNoteState(event.currentTarget.value as AnalystObservationState)
-        }
-      >
-        {Object.entries(NOTE_STATE_LABELS).map(([value, label]) => (
-          <option key={value} value={value}>
-            {label}
-          </option>
-        ))}
-      </select>
-
-      <label htmlFor="opinion-note-relation">Relation aux références</label>
-      <select
-        id="opinion-note-relation"
-        value={noteRelation}
-        onChange={(event) =>
-          setNoteRelation(
-            event.currentTarget.value as AnalystObservationRelation,
-          )
-        }
-      >
-        {Object.entries(NOTE_RELATION_LABELS).map(([value, label]) => (
-          <option key={value} value={value}>
-            {label}
-          </option>
-        ))}
-      </select>
-
-      <fieldset>
-        <legend>Findings et revendications cités</legend>
+        <legend>Findings disponibles ({findings.length})</legend>
         {findings.length === 0 ? (
           <p>Aucun finding disponible dans cette enquête.</p>
         ) : (
@@ -296,7 +322,7 @@ export function BridgeRequestPanel({
       </fieldset>
 
       <fieldset>
-        <legend>Observations citées</legend>
+        <legend>Observations disponibles ({observations.length})</legend>
         {observations.length === 0 ? (
           <p>Aucune observation disponible dans cette enquête.</p>
         ) : (
@@ -311,8 +337,7 @@ export function BridgeRequestPanel({
                   )
                 }
               />{" "}
-              {EVIDENCE_KIND_LABELS[observation.kind] ?? observation.kind} ·
-              SHA-256 {observation.sha256.slice(0, 12)}… · {observation.source}
+              {observationOptionLabel(observation)}
             </label>
           ))
         )}
@@ -321,19 +346,109 @@ export function BridgeRequestPanel({
         ) : null}
       </fieldset>
 
-      <label htmlFor="opinion-note-task">Tâche liée (facultatif)</label>
+      <fieldset>
+        <legend>Action demandée à Bridge</legend>
+        {REQUEST_MODES.map((mode) => {
+          const option = getDraftingIntent(mode.id);
+          const disabled = option.requiresCurrentBridgeNote && !reviewAvailable;
+          return (
+            <label key={mode.id}>
+              <input
+                type="radio"
+                name="opinion-drafting-intent"
+                value={mode.id}
+                checked={intent === mode.id}
+                disabled={disabled}
+                onChange={() => setIntent(mode.id)}
+              />{" "}
+              {mode.label}
+              {disabled ? " (note Bridge existante requise)" : ""}
+            </label>
+          );
+        })}
+      </fieldset>
+
+      {intent === "corriger" ? (
+        <>
+          <label htmlFor="opinion-correction-instruction">
+            Consigne de correction pour Bridge (instruction, jamais texte
+            publiable)
+          </label>
+          <textarea
+            id="opinion-correction-instruction"
+            value={correctionInstruction}
+            onChange={(event) =>
+              setCorrectionInstruction(event.currentTarget.value)
+            }
+          />
+        </>
+      ) : null}
+
+      <label htmlFor="opinion-note-block">Bloc de l’avis visé</label>
       <select
-        id="opinion-note-task"
-        value={taskId}
-        onChange={(event) => setTaskId(event.currentTarget.value)}
+        id="opinion-note-block"
+        value={blockType}
+        onChange={(event) =>
+          onBlockTypeChange(event.currentTarget.value as ProseOpinionBlockType)
+        }
       >
-        <option value="">Aucune tâche</option>
-        {tasks.map((task) => (
-          <option key={task.id} value={task.id}>
-            {task.task_key} · {task.title} · {task.status}
+        {BLOCK_ORDER.map((value) => (
+          <option key={value} value={value}>
+            {BLOCK_LABELS[value]}
           </option>
         ))}
       </select>
+
+      <details>
+        <summary>Qualification et contenu vérifiable</summary>
+        <label htmlFor="opinion-note-state">État de la note</label>
+        <select
+          id="opinion-note-state"
+          value={noteState}
+          onChange={(event) =>
+            setNoteState(event.currentTarget.value as AnalystObservationState)
+          }
+        >
+          {Object.entries(NOTE_STATE_LABELS).map(([value, label]) => (
+            <option key={value} value={value}>
+              {label}
+            </option>
+          ))}
+        </select>
+
+        <label htmlFor="opinion-note-relation">Relation aux références</label>
+        <select
+          id="opinion-note-relation"
+          value={noteRelation}
+          onChange={(event) =>
+            setNoteRelation(
+              event.currentTarget.value as AnalystObservationRelation,
+            )
+          }
+        >
+          {Object.entries(NOTE_RELATION_LABELS).map(([value, label]) => (
+            <option key={value} value={value}>
+              {label}
+            </option>
+          ))}
+        </select>
+
+        <label htmlFor="opinion-note-task">Tâche liée (facultatif)</label>
+        <select
+          id="opinion-note-task"
+          value={taskId}
+          onChange={(event) => setTaskId(event.currentTarget.value)}
+        >
+          <option value="">Aucune tâche</option>
+          {tasks.map((task) => (
+            <option key={task.id} value={task.id}>
+              {task.task_key} · {task.title} · {task.status}
+            </option>
+          ))}
+        </select>
+
+        {children}
+      </details>
 
       {submitBlockedReason ? (
         <p className="verification-warning" role="note">
@@ -368,8 +483,8 @@ export function BridgeRequestPanel({
       ) : null}
       {request.data ? (
         <p role="status">
-          Proposition demandée · invocation {request.data.invocation_id} ·
-          statut {request.data.invocation_status} ·{" "}
+          Nouvelle proposition Bridge demandée · statut{" "}
+          {request.data.invocation_status} ·{" "}
           {request.data.materialised
             ? "texte Bridge stocké disponible"
             : "réponse Bridge en attente"}
@@ -384,7 +499,11 @@ export function BridgeRequestPanel({
         aria-busy={request.isPending}
         onClick={submit}
       >
-        Demander à Bridge
+        {request.isPending
+          ? "Demande en cours…"
+          : intent === "corriger"
+            ? "Envoyer la demande de correction"
+            : "Demander à Bridge"}
       </button>
     </section>
   );
