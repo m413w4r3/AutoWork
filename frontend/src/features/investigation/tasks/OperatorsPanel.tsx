@@ -548,12 +548,7 @@ function SessionRow({
         </div>
         <div>
           <dt>Tâche</dt>
-          <dd>
-            {task === undefined ? "Tâche inconnue" : task.title}{" "}
-            <code title={session.task_id} className="m24-id-ref">
-              {shortSha(session.task_id)}
-            </code>
-          </dd>
+          <dd>{task === undefined ? "Tâche inconnue" : task.title}</dd>
         </div>
         <div>
           <dt>Statut</dt>
@@ -631,6 +626,9 @@ function SessionRow({
             >
               Envoyer l’instruction
             </button>
+          </div>
+          <details className="m24-more-actions">
+            <summary>Plus d’actions</summary>
             {interruptOpen ? null : (
               <button
                 type="button"
@@ -640,37 +638,37 @@ function SessionRow({
                 Interrompre la session
               </button>
             )}
-          </div>
-          {interruptOpen ? (
-            <div className="m24-inline-form">
-              <label htmlFor={`${baseId}-reason`}>
-                Motif d’interruption (obligatoire)
-              </label>
-              <textarea
-                id={`${baseId}-reason`}
-                value={reason}
-                onChange={(event) => setReason(event.target.value)}
-                rows={2}
-              />
-              <div className="m24-inline-form__buttons">
-                <button
-                  type="button"
-                  className="m24-action"
-                  onClick={confirmInterrupt}
-                  disabled={reason.trim() === "" || interrupt.isPending}
-                >
-                  Confirmer l’interruption
-                </button>
-                <button
-                  type="button"
-                  className="m24-action m24-action--quiet"
-                  onClick={() => setInterruptOpen(false)}
-                >
-                  Annuler
-                </button>
+            {interruptOpen ? (
+              <div className="m24-inline-form">
+                <label htmlFor={`${baseId}-reason`}>
+                  Motif d’interruption de la session (obligatoire)
+                </label>
+                <textarea
+                  id={`${baseId}-reason`}
+                  value={reason}
+                  onChange={(event) => setReason(event.target.value)}
+                  rows={2}
+                />
+                <div className="m24-inline-form__buttons">
+                  <button
+                    type="button"
+                    className="m24-action"
+                    onClick={confirmInterrupt}
+                    disabled={reason.trim() === "" || interrupt.isPending}
+                  >
+                    Confirmer l’interruption de la session
+                  </button>
+                  <button
+                    type="button"
+                    className="m24-action m24-action--quiet"
+                    onClick={() => setInterruptOpen(false)}
+                  >
+                    Annuler
+                  </button>
+                </div>
               </div>
-            </div>
-          ) : null}
+            ) : null}
+          </details>
         </div>
       ) : null}
 
@@ -740,20 +738,36 @@ function SessionRow({
 
 export function OperatorsPanel({
   investigationId,
+  taskId,
+  task: selectedTask,
+  sessionContext,
 }: {
   investigationId: string;
+  taskId?: string;
+  task?: TaskView;
+  sessionContext?: readonly AgentSessionView[];
 }) {
-  const sessions = useAgentSessions(investigationId);
-  const tasks = useTasks(investigationId);
+  const sessions = useAgentSessions(investigationId, undefined, {
+    enabled: sessionContext === undefined,
+  });
+  const tasks = useTasks(investigationId, {
+    enabled: selectedTask === undefined,
+  });
   // A successful opening removes the task from "sans session" and mounts the
   // session row, so the feedback is kept here, outside that disappearing list.
   const [openFeedback, setOpenFeedback] = useState<OpenSessionFeedback | null>(
     null,
   );
+  const taskItems =
+    selectedTask === undefined ? (tasks.data?.items ?? []) : [selectedTask];
   const taskById = new Map<string, TaskView>(
-    (tasks.data?.items ?? []).map((task) => [task.id, task]),
+    taskItems.map((task) => [task.id, task]),
   );
-  const items = sessions.data ?? [];
+  const allItems = sessionContext ?? sessions.data ?? [];
+  const items =
+    taskId === undefined
+      ? allItems
+      : allItems.filter((session) => session.task_id === taskId);
   const active = items.filter((session) =>
     ACTIVE_SESSION_STATES.has(session.state),
   );
@@ -763,7 +777,10 @@ export function OperatorsPanel({
   // Assigned operator tasks whose handoff exists but which have no active or
   // resumable session: the explicit session opening belongs here as well as on
   // the task card.
-  const openable = (tasks.data?.items ?? [])
+  const scopedTasks = taskItems.filter(
+    (task) => taskId === undefined || task.id === taskId,
+  );
+  const openable = scopedTasks
     .map((task) => ({
       task,
       target:
@@ -775,17 +792,22 @@ export function OperatorsPanel({
       (entry): entry is { task: TaskView; target: SessionLaunchTarget } =>
         entry.target !== null,
     );
-  const sessionError = sessions.isError
-    ? toWorkshopApiError(sessions.error)
-    : null;
+  const sessionError =
+    sessionContext === undefined && sessions.isError
+      ? toWorkshopApiError(sessions.error)
+      : null;
 
   return (
     <section className="m24-card" aria-labelledby="m24-operators-heading">
-      <h3 id="m24-operators-heading">Opérateurs actifs</h3>
+      <h3 id="m24-operators-heading">
+        {taskId === undefined
+          ? "Opérateurs actifs"
+          : "Contexte agent de la tâche"}
+      </h3>
       <p className="m24-muted">
-        Une session Codex CLI ou Claude Code par tâche. Les capacités affichées
-        (reprise, checkpoint) sont celles que le serveur expose ; rien n’est
-        déduit d’un adaptateur présumé.
+        {taskId === undefined
+          ? "Une session Codex CLI ou Claude Code par tâche. Les capacités affichées (reprise, checkpoint) sont celles que le serveur expose ; rien n’est déduit d’un adaptateur présumé."
+          : "Fournisseur, état de session, dernier événement et instructions de la tâche sélectionnée. Les capacités affichées viennent du serveur."}
       </p>
 
       {openFeedback?.kind === "success" ? (
@@ -834,7 +856,7 @@ export function OperatorsPanel({
         </section>
       )}
 
-      {sessions.isPending ? (
+      {sessionContext === undefined && sessions.isPending ? (
         <p role="status">Chargement des sessions…</p>
       ) : sessionError !== null ? (
         <p role="alert" className="error-message">
@@ -843,7 +865,11 @@ export function OperatorsPanel({
             : `Sessions indisponibles : ${describeTaskError(sessionError)}`}
         </p>
       ) : active.length === 0 ? (
-        <p className="empty-state">Aucun opérateur actif.</p>
+        <p className="empty-state">
+          {taskId === undefined
+            ? "Aucun opérateur actif."
+            : "Aucune session active pour cette tâche."}
+        </p>
       ) : (
         <ul className="m24-operator-list">
           {active.map((session) => (

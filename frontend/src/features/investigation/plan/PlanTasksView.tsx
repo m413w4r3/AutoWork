@@ -6,7 +6,6 @@
  * form drafts live in local state.
  */
 
-import { OperatorsPanel } from "../tasks/OperatorsPanel";
 import { TaskWorkspace } from "../tasks/TaskWorkspace";
 import { TimelinePanel } from "../tasks/TimelinePanel";
 import { PlanPanel } from "./PlanPanel";
@@ -29,17 +28,18 @@ export function PlanTasksView({
           Chaque décision humaine porte la version exacte de son objet (CAS) ;
           les avis Bridge restent non probants.
         </p>
-      </header>
-      <div className="m24-plan-tasks__columns">
-        <div className="m24-plan-tasks__main">
+        <div className="m24-plan-tasks__plan-selector">
           <PlanPanel investigationId={investigationId} />
-          <TaskWorkspace investigationId={investigationId} />
         </div>
-        <div className="m24-plan-tasks__side">
-          <OperatorsPanel investigationId={investigationId} />
-          <TimelinePanel investigationId={investigationId} />
-        </div>
-      </div>
+      </header>
+      <TaskWorkspace investigationId={investigationId} />
+      <details className="m24-global-activity">
+        <summary>Activité globale</summary>
+        <TimelinePanel
+          investigationId={investigationId}
+          title="Activité globale"
+        />
+      </details>
     </section>
   );
 }

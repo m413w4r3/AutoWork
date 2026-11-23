@@ -10,6 +10,7 @@
  */
 
 import { useMemo, useState } from "react";
+import type { MouseEvent } from "react";
 
 import { toWorkshopApiError } from "../api/client";
 import {
@@ -102,11 +103,35 @@ function isIdentifierRef(name: string): boolean {
   return name === "target_id" || name.endsWith("_id");
 }
 
+function taskHref(taskId: string): string {
+  const url = new URL(window.location.href);
+  url.searchParams.set("task", taskId);
+  return `${url.pathname}${url.search}${url.hash}`;
+}
+
+function openTask(event: MouseEvent<HTMLAnchorElement>, taskId: string) {
+  event.preventDefault();
+  const url = new URL(window.location.href);
+  if (url.searchParams.get("task") !== taskId) {
+    url.searchParams.set("task", taskId);
+    const state = window.history.state as unknown;
+    window.history.pushState(
+      {
+        ...(typeof state === "object" && state !== null ? state : {}),
+        investigationTask: taskId,
+      },
+      "",
+      url,
+    );
+  }
+  window.dispatchEvent(new PopStateEvent("popstate"));
+}
+
 function TimelineRefValue({ name, value }: { name: string; value: string }) {
   if (name === "task_id") {
     return (
-      <a href={`#task-${value}`}>
-        <code>{value}</code>
+      <a href={taskHref(value)} onClick={(event) => openTask(event, value)}>
+        Tâche liée
       </a>
     );
   }
@@ -144,8 +169,12 @@ function itemMatchesText(item: TimelineItemV1, needle: string): boolean {
 
 export function TimelinePanel({
   investigationId,
+  taskId,
+  title,
 }: {
   investigationId: string;
+  taskId?: string;
+  title?: string;
 }) {
   const timeline = useTimeline(investigationId, { limit: 50 });
   const [type, setType] = useState<TimelineItemType | "all">("all");
@@ -153,7 +182,14 @@ export function TimelinePanel({
   const [evidence, setEvidence] = useState<EvidenceFilter>("all");
   const [text, setText] = useState("");
 
-  const items = useMemo(() => timeline.data?.items ?? [], [timeline.data]);
+  const allItems = useMemo(() => timeline.data?.items ?? [], [timeline.data]);
+  const items = useMemo(
+    () =>
+      allItems.filter(
+        (item) => taskId === undefined || item.task_id === taskId,
+      ),
+    [allItems, taskId],
+  );
   const visible = useMemo(() => {
     const needle = text.trim().toLocaleLowerCase("fr");
     return items
@@ -168,11 +204,16 @@ export function TimelinePanel({
 
   return (
     <section className="m24-card" aria-labelledby="m24-timeline-heading">
-      <h3 id="m24-timeline-heading">Chronologie commune</h3>
+      <h3 id="m24-timeline-heading">
+        {title ??
+          (taskId === undefined
+            ? "Chronologie commune"
+            : "Historique de la tâche")}
+      </h3>
       <p className="m24-muted">
-        Chaque entrée pointe vers son objet métier exact. Les plans, passations,
-        notes, contributions et consultations Bridge sont des avis ou des
-        éléments de travail, jamais des preuves.
+        {taskId === undefined
+          ? "Chaque entrée pointe vers son objet métier exact. Les plans, passations, notes, contributions et consultations Bridge sont des avis ou des éléments de travail, jamais des preuves."
+          : "Événements, décisions, passations et résultats liés à cette tâche. Les contributions agentiques restent non probantes tant qu’elles ne sont pas vérifiées."}
       </p>
 
       <div
@@ -247,7 +288,11 @@ export function TimelinePanel({
           Chronologie indisponible : {toWorkshopApiError(timeline.error).code}.
         </p>
       ) : items.length === 0 ? (
-        <p className="empty-state">Aucun événement pour cette enquête.</p>
+        <p className="empty-state">
+          {taskId === undefined
+            ? "Aucun événement pour cette enquête."
+            : "Aucun événement pour cette tâche."}
+        </p>
       ) : visible.length === 0 ? (
         <p className="empty-state">Aucune entrée ne correspond aux filtres.</p>
       ) : (
@@ -315,7 +360,12 @@ export function TimelinePanel({
                   ))}
               </dl>
               {item.task_id === null ? null : (
-                <a href={`#task-${item.task_id}`}>Voir la tâche</a>
+                <a
+                  href={taskHref(item.task_id)}
+                  onClick={(event) => openTask(event, item.task_id!)}
+                >
+                  Voir la tâche
+                </a>
               )}
             </li>
           ))}

@@ -119,6 +119,7 @@ describe("TaskBridgePanel", () => {
     expect(
       screen.getByText(/ni résultat de tâche, ni preuve, ni décision/),
     ).toBeInTheDocument();
+    expect(screen.queryByText(TASK_ID)).toBeNull();
     const select = screen.getByLabelText("Type de demande");
     expect(
       Array.from((select as HTMLSelectElement).options).map(

@@ -40,6 +40,87 @@ function taskPage(task = makeTask()) {
 }
 
 describe("OperatorsPanel", () => {
+  it("scopes agent messages to the selected task and confirms session interruption separately", async () => {
+    const user = userEvent.setup();
+    const task = makeTask({
+      status: "running",
+      assigned_actor_kind: "operator",
+      assigned_actor_id: "operator:codex_cli",
+    });
+    const otherTask = makeTask({
+      id: "99999999-9999-4999-8999-999999999999",
+      task_key: "lead-other",
+      title: "Autre tâche",
+    });
+    const selectedSession = makeSession();
+    const otherSession = makeSession({
+      id: "88888888-8888-4888-8888-888888888888",
+      task_id: otherTask.id,
+      adapter_kind: "claude_code",
+    });
+    const recorder = installFetch(({ url, init }) => {
+      if (url.endsWith("/summary")) return jsonResponse(makeSummary());
+      if (url.endsWith("/interrupt") && init?.method === "POST") {
+        return jsonResponse(makeSession({ state: "interrupt_requested" }));
+      }
+      return errorResponse(500, "unexpected_request");
+    });
+
+    render(
+      <OperatorsPanel
+        investigationId={INVESTIGATION_ID}
+        taskId={task.id}
+        task={task}
+        sessionContext={[selectedSession, otherSession]}
+      />,
+      { wrapper: wrapperFor(createTestQueryClient()) },
+    );
+
+    const context = screen.getByRole("region", {
+      name: "Contexte agent de la tâche",
+    });
+    expect(
+      await within(context).findByText("Codex CLI · Vérifier le domaine C2"),
+    ).toBeInTheDocument();
+    expect(within(context).queryByText(/Autre tâche/)).toBeNull();
+    expect(within(context).queryByText(selectedSession.task_id)).toBeNull();
+    await user.click(
+      within(context).getByText("Plus d’actions", { selector: "summary" }),
+    );
+    await user.click(
+      within(context).getByRole("button", { name: "Interrompre la session" }),
+    );
+    expect(recorder.calls.some((call) => call.url.endsWith("/interrupt"))).toBe(
+      false,
+    );
+    await user.type(
+      within(context).getByLabelText(
+        "Motif d’interruption de la session (obligatoire)",
+      ),
+      "Arrêt demandé par l’analyste",
+    );
+    await user.click(
+      within(context).getByRole("button", {
+        name: "Confirmer l’interruption de la session",
+      }),
+    );
+
+    await waitFor(() =>
+      expect(
+        recorder.calls.some((call) => call.url.endsWith("/interrupt")),
+      ).toBe(true),
+    );
+    const request = recorder.calls.find((call) =>
+      call.url.endsWith("/interrupt"),
+    );
+    expect(request).toBeDefined();
+    if (request === undefined)
+      throw new Error("session interruption was not sent");
+    expect(bodyOf(request.init)).toEqual({
+      reason: "Arrêt demandé par l’analyste",
+    });
+  });
+
   it("met en file une instruction quand l’agent est occupé", async () => {
     const user = userEvent.setup();
     const task = makeTask({

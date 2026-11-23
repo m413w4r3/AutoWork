@@ -150,6 +150,7 @@ function workingPage() {
 }
 
 function renderTimeline(page: unknown = timelinePage()) {
+  window.history.replaceState({}, "", "/?vue=plan");
   installFetch(({ url }) =>
     url.includes("/timeline")
       ? jsonResponse(page)
@@ -161,6 +162,33 @@ function renderTimeline(page: unknown = timelinePage()) {
 }
 
 describe("TimelinePanel", () => {
+  it("filters the existing timeline to the selected task", async () => {
+    window.history.replaceState({}, "", "/?vue=plan&task=selected");
+    installFetch(({ url }) =>
+      url.includes("/timeline")
+        ? jsonResponse(timelinePage())
+        : errorResponse(500, "unexpected_request"),
+    );
+    render(
+      <TimelinePanel
+        investigationId={INVESTIGATION_ID}
+        taskId={TASK_ID}
+        title="Historique de la tâche"
+      />,
+      { wrapper: wrapperFor(createTestQueryClient()) },
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "Historique de la tâche" }),
+    ).toBeInTheDocument();
+    expect(
+      await screen.findByText("Consultation Bridge · Réussi"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("Rapport VT fichier · objet : échantillon"),
+    ).toBeNull();
+  });
+
   it("étiquette les avis comme non probants et pointe l’objet exact", async () => {
     renderTimeline();
 
@@ -175,8 +203,9 @@ describe("TimelinePanel", () => {
     expect(screen.getAllByText("obs-1").length).toBeGreaterThan(0);
     expect(screen.getByRole("link", { name: "Voir la tâche" })).toHaveAttribute(
       "href",
-      `#task-${TASK_ID}`,
+      `/?vue=plan&task=${TASK_ID}`,
     );
+    expect(screen.queryByText(TASK_ID)).toBeNull();
   });
 
   it("filtre par type puis par statut de preuve", async () => {
@@ -284,13 +313,14 @@ describe("TimelinePanel", () => {
 
     // Handoffs and sessions expose `task_id` as a ref link; the other two
     // working objects only carry the envelope task and its footer link.
-    const refTaskLinks = screen.getAllByRole("link", { name: TASK_ID });
+    const refTaskLinks = screen.getAllByRole("link", { name: "Tâche liée" });
     expect(refTaskLinks).toHaveLength(2);
     const taskLinks = screen.getAllByRole("link", { name: "Voir la tâche" });
     expect(taskLinks).toHaveLength(5);
     for (const link of [...refTaskLinks, ...taskLinks]) {
-      expect(link).toHaveAttribute("href", `#task-${TASK_ID}`);
+      expect(link).toHaveAttribute("href", `/?vue=plan&task=${TASK_ID}`);
     }
+    expect(screen.queryByText(TASK_ID)).toBeNull();
   });
 
   it("filtre les objets de travail par type", async () => {
