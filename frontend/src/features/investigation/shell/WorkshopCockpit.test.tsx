@@ -116,14 +116,24 @@ describe("WorkshopCockpit", () => {
 
   it("écrit la vue au clic, préserve les autres paramètres et suit popstate", async () => {
     const user = userEvent.setup();
-    window.history.replaceState({}, "", `${PATH}?edition=E1&vue=plan`);
+    window.history.replaceState(
+      {},
+      "",
+      `${PATH}?edition=E1&task=task-9&custom=keep&vue=plan`,
+    );
     renderCockpit();
 
     await user.click(screen.getByRole("tab", { name: "Workspace et notes" }));
-    expect(window.location.search).toBe("?edition=E1&vue=workspace");
+    expect(window.location.search).toBe(
+      "?edition=E1&task=task-9&custom=keep&vue=workspace",
+    );
 
     act(() => {
-      window.history.pushState({}, "", `${PATH}?edition=E1&vue=samples`);
+      window.history.pushState(
+        {},
+        "",
+        `${PATH}?edition=E1&task=task-9&custom=keep&vue=samples`,
+      );
       window.dispatchEvent(new PopStateEvent("popstate"));
     });
 

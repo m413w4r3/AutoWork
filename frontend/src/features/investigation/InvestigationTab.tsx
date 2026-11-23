@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import type { KeyboardEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
 
 import { ApiError } from "../../api/editions";
@@ -13,8 +14,10 @@ import {
 } from "../../api/investigation";
 import { useInvestigationActivity } from "../../api/investigationOperator";
 import { InvestigationLabViews } from "./InvestigationLabViews";
+import { useWorkspaceStatus } from "./api/workspace";
+import { WORKSPACE_AVAILABILITY_LABELS } from "./overview/overviewPresentation";
 import { WorkshopCockpit } from "./shell/WorkshopCockpit";
-import { shortSha } from "./tasks/labels";
+import { formatTimestamp, shortSha } from "./tasks/labels";
 
 const HASH_PATTERN = /^[0-9a-f]{64}$/;
 
@@ -28,9 +31,18 @@ const SYNTHESIS_STATUS_LABELS: Record<string, string> = {
 export function InvestigationTab({
   subjectId,
   editionId,
+  articleTitle,
+  pendingDecisionCount,
 }: {
   subjectId: string;
   editionId: string;
+  /** The article title from the parent subject page, when available. */
+  articleTitle?: string;
+  /**
+   * Reserved for a canonical pending-decision count. The current investigation
+   * and activity responses do not expose that count yet.
+   */
+  pendingDecisionCount?: number;
 }) {
   const [selectedInvestigationId, setSelectedInvestigationId] = useState<
     string | null
@@ -265,6 +277,8 @@ export function InvestigationTab({
           <InvestigationDetail
             investigation={investigationQuery.data}
             editionId={editionId}
+            articleTitle={articleTitle ?? "Article de l’enquête"}
+            pendingDecisionCount={pendingDecisionCount}
             onResume={(expectedVersion) =>
               resume.mutate({
                 investigationId,
@@ -294,6 +308,8 @@ export function InvestigationTab({
 function InvestigationDetail({
   investigation,
   editionId,
+  articleTitle,
+  pendingDecisionCount,
   onResume,
   onInterrupt,
   actionPending,
@@ -301,6 +317,8 @@ function InvestigationDetail({
 }: {
   investigation: InvestigationView;
   editionId: string;
+  articleTitle: string;
+  pendingDecisionCount?: number;
   onResume: (expectedVersion: number) => void;
   onInterrupt: (expectedVersion: number) => void;
   actionPending: boolean;
@@ -312,6 +330,10 @@ function InvestigationDetail({
   // workspace n'est qu'un état best-effort au démarrage, jamais le discriminant.
   const workshopActive = investigation.prose_authority === "bridge_only";
   const latest = activityQuery.data?.investigation;
+  // Shares the status query key/cache already consumed by OverviewView.
+  const workspaceQuery = useWorkspaceStatus(investigation.id, {
+    enabled: workshopActive,
+  });
   const currentStatus = latest?.status ?? investigation.status;
   const currentStopReason = latest
     ? latest.stop_reason
@@ -327,35 +349,36 @@ function InvestigationDetail({
     currentStopReason !== "permission_required" &&
     currentStopReason !== "budget_exhausted",
   );
+  const currentStatusLabel = statusLabel({
+    status: currentStatus,
+    stop_reason: currentStopReason,
+  });
+  const workspaceStatus = workspaceQuery.isPending
+    ? "Vérification en cours"
+    : workspaceQuery.isError
+      ? "Indisponible"
+      : workspaceQuery.data
+        ? WORKSPACE_AVAILABILITY_LABELS[workspaceQuery.data.availability_code]
+        : "Inconnu";
   return (
     <section aria-labelledby="investigation-detail-heading">
-      <header className="job-card__heading">
-        <div>
-          <h2 id="investigation-detail-heading">
-            Enquête{" "}
-            <code title={investigation.id} className="m24-id-ref">
-              {workshopActive ? shortSha(investigation.id) : investigation.id}
-            </code>
-            {workshopActive ? (
-              <>
-                {" "}
-                ·{" "}
-                {statusLabel({
-                  status: currentStatus,
-                  stop_reason: currentStopReason,
-                })}{" "}
-                ·{" "}
-                <span title="Version de l’état de travail (CAS)">
-                  version de l’état {currentVersion}
-                </span>
-              </>
-            ) : null}
-          </h2>
-          {workshopActive ? (
+      {workshopActive ? (
+        <section
+          className="workshop-context-bar"
+          aria-labelledby="investigation-detail-heading"
+        >
+          <div className="workshop-context-bar__heading">
+            <p className="eyebrow">Atelier d’investigation</p>
+            <h2 id="investigation-detail-heading">{articleTitle}</h2>
             <details className="investigation-identity-details">
               <summary>Identité technique de l’enquête</summary>
               <p>
-                run {investigation.production_run_id} · synthèse{" "}
+                Enquête{" "}
+                <code title={investigation.id} className="m24-id-ref">
+                  {shortSha(investigation.id)}
+                </code>{" "}
+                · version de l’état {currentVersion} · run{" "}
+                {investigation.production_run_id} · synthèse{" "}
                 {investigation.synthesis_artifact_id} · SHA-256{" "}
                 <code title={investigation.synthesis_sha256}>
                   {shortSha(investigation.synthesis_sha256)}
@@ -365,14 +388,49 @@ function InvestigationDetail({
                 Décisions attribuées à l’identité authentifiée côté serveur.
               </p>
             </details>
-          ) : (
-            <>
+          </div>
+          <dl className="workshop-context-meta">
+            <div>
+              <dt>Enquête</dt>
+              <dd>{currentStatusLabel}</dd>
+            </div>
+            <div>
+              <dt>Workspace</dt>
+              <dd>{workspaceStatus}</dd>
+            </div>
+            <div>
+              <dt>Décisions en attente</dt>
+              <dd>
+                {pendingDecisionCount ?? (
+                  <span aria-label="Nombre de décisions non disponible">—</span>
+                )}
+              </dd>
+            </div>
+          </dl>
+          <div className="workshop-context-bar__actions">
+            <ActivityDisclosure query={activityQuery} />
+            <InvestigationActionsMenu
+              currentVersion={currentVersion}
+              canResume={canResume}
+              canInterrupt={canInterrupt}
+              actionPending={actionPending}
+              onResume={onResume}
+              onInterrupt={onInterrupt}
+            />
+          </div>
+        </section>
+      ) : (
+        <>
+          <header className="job-card__heading">
+            <div>
+              <h2 id="investigation-detail-heading">
+                Enquête{" "}
+                <code title={investigation.id} className="m24-id-ref">
+                  {investigation.id}
+                </code>
+              </h2>
               <p>
-                {statusLabel({
-                  status: currentStatus,
-                  stop_reason: currentStopReason,
-                })}{" "}
-                ·{" "}
+                {currentStatusLabel} ·{" "}
                 <span title="Version de l’état de travail (CAS)">
                   version de l’état {currentVersion}
                 </span>{" "}
@@ -385,10 +443,20 @@ function InvestigationDetail({
               <p>
                 Décisions attribuées à l’identité authentifiée côté serveur.
               </p>
-            </>
-          )}
-        </div>
-      </header>
+            </div>
+          </header>
+          <div className="investigation-secondary-actions">
+            <InvestigationActionsMenu
+              currentVersion={currentVersion}
+              canResume={canResume}
+              canInterrupt={canInterrupt}
+              actionPending={actionPending}
+              onResume={onResume}
+              onInterrupt={onInterrupt}
+            />
+          </div>
+        </>
+      )}
       {currentStopReason === "model_unavailable" ? (
         <p className="verification-warning" role="note">
           Le modèle est indisponible. C’est une limite locale de cette piste ;
@@ -401,28 +469,6 @@ function InvestigationDetail({
           {actionError.message}
         </p>
       ) : null}
-      <div>
-        {canResume ? (
-          <button
-            type="button"
-            className="button button--secondary"
-            disabled={actionPending}
-            onClick={() => onResume(currentVersion)}
-          >
-            Reprendre l’enquête
-          </button>
-        ) : null}{" "}
-        {canInterrupt ? (
-          <button
-            type="button"
-            className="button button--secondary"
-            disabled={actionPending}
-            onClick={() => onInterrupt(currentVersion)}
-          >
-            Interrompre l’enquête
-          </button>
-        ) : null}
-      </div>
       {workshopActive ? (
         <WorkshopCockpit
           investigationId={investigation.id}
@@ -436,6 +482,239 @@ function InvestigationDetail({
         />
       )}
     </section>
+  );
+}
+
+function ActivityDisclosure({
+  query,
+}: {
+  query: ReturnType<typeof useInvestigationActivity>;
+}) {
+  return (
+    <details className="workshop-context-activity">
+      <summary>Activité</summary>
+      <div className="workshop-context-activity__content">
+        {query.isPending ? (
+          <p role="status">Chargement de l’activité…</p>
+        ) : query.isError ? (
+          <p role="status">L’activité est indisponible.</p>
+        ) : query.data ? (
+          <>
+            <p>
+              Dernière activité : {formatTimestamp(query.data.last_activity_at)}
+              {query.data.last_activity_source
+                ? ` · ${query.data.last_activity_source}`
+                : ""}
+            </p>
+            {query.data.timeline.length > 0 ? (
+              <ul>
+                {query.data.timeline.slice(0, 5).map((item) => (
+                  <li key={item.id}>
+                    <span>{item.activity_label}</span>{" "}
+                    <time dateTime={item.created_at}>
+                      {formatTimestamp(item.created_at)}
+                    </time>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p>Aucune activité récente.</p>
+            )}
+          </>
+        ) : (
+          <p>Aucune activité disponible.</p>
+        )}
+      </div>
+    </details>
+  );
+}
+
+function InvestigationActionsMenu({
+  currentVersion,
+  canResume,
+  canInterrupt,
+  actionPending,
+  onResume,
+  onInterrupt,
+}: {
+  currentVersion: number;
+  canResume: boolean;
+  canInterrupt: boolean;
+  actionPending: boolean;
+  onResume: (expectedVersion: number) => void;
+  onInterrupt: (expectedVersion: number) => void;
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [confirmationOpen, setConfirmationOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  const menuFocusDirection = useRef<"first" | "last">("first");
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const items = menuRef.current?.querySelectorAll<HTMLButtonElement>(
+      '[role="menuitem"]:not(:disabled)',
+    );
+    if (!items?.length) return;
+    const item =
+      menuFocusDirection.current === "last"
+        ? items.item(items.length - 1)
+        : items.item(0);
+    item?.focus();
+  }, [menuOpen]);
+
+  useEffect(() => {
+    if (confirmationOpen) cancelRef.current?.focus();
+  }, [confirmationOpen]);
+
+  const closeMenu = () => {
+    setMenuOpen(false);
+    triggerRef.current?.focus();
+  };
+
+  const cancelInterruption = () => {
+    setConfirmationOpen(false);
+    triggerRef.current?.focus();
+  };
+
+  const handleMenuKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeMenu();
+      return;
+    }
+    if (
+      event.key !== "ArrowDown" &&
+      event.key !== "ArrowUp" &&
+      event.key !== "Home" &&
+      event.key !== "End"
+    ) {
+      return;
+    }
+    event.preventDefault();
+    const items = Array.from(
+      menuRef.current?.querySelectorAll<HTMLButtonElement>(
+        '[role="menuitem"]:not(:disabled)',
+      ) ?? [],
+    );
+    if (items.length === 0) return;
+    const currentIndex = items.indexOf(
+      document.activeElement as HTMLButtonElement,
+    );
+    const nextIndex =
+      event.key === "Home"
+        ? 0
+        : event.key === "End"
+          ? items.length - 1
+          : event.key === "ArrowDown"
+            ? (currentIndex + 1) % items.length
+            : (currentIndex - 1 + items.length) % items.length;
+    items[nextIndex]?.focus();
+  };
+
+  const hasActions = canResume || canInterrupt;
+
+  return (
+    <div className="investigation-actions">
+      <button
+        ref={triggerRef}
+        type="button"
+        className="button button--secondary"
+        aria-haspopup="menu"
+        aria-expanded={menuOpen}
+        aria-controls="investigation-actions-menu"
+        disabled={!hasActions || actionPending}
+        onClick={() => setMenuOpen((open) => !open)}
+        onKeyDown={(event) => {
+          if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+          event.preventDefault();
+          menuFocusDirection.current =
+            event.key === "ArrowUp" ? "last" : "first";
+          setMenuOpen(true);
+        }}
+      >
+        Actions de l’enquête
+      </button>
+      {menuOpen ? (
+        <div
+          ref={menuRef}
+          id="investigation-actions-menu"
+          className="investigation-actions__menu"
+          role="menu"
+          aria-label="Actions de l’enquête"
+          onKeyDown={handleMenuKeyDown}
+        >
+          {canResume ? (
+            <button
+              type="button"
+              role="menuitem"
+              disabled={actionPending}
+              onClick={() => {
+                onResume(currentVersion);
+                closeMenu();
+              }}
+            >
+              Reprendre l’enquête
+            </button>
+          ) : null}
+          {canInterrupt ? (
+            <button
+              type="button"
+              role="menuitem"
+              disabled={actionPending}
+              onClick={() => {
+                setMenuOpen(false);
+                setConfirmationOpen(true);
+              }}
+            >
+              Interrompre l’enquête
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+      {confirmationOpen ? (
+        <div
+          className="investigation-actions__confirmation"
+          role="group"
+          aria-labelledby="investigation-interrupt-title"
+          aria-describedby="investigation-interrupt-description"
+          onKeyDown={(event) => {
+            if (event.key !== "Escape") return;
+            event.preventDefault();
+            event.stopPropagation();
+            cancelInterruption();
+          }}
+        >
+          <h3 id="investigation-interrupt-title">Confirmer l’interruption</h3>
+          <p id="investigation-interrupt-description">
+            Voulez-vous interrompre cette enquête maintenant ?
+          </p>
+          <div className="investigation-actions__confirmation-buttons">
+            <button
+              ref={cancelRef}
+              type="button"
+              className="button button--secondary"
+              onClick={cancelInterruption}
+            >
+              Annuler
+            </button>
+            <button
+              type="button"
+              className="button"
+              disabled={actionPending}
+              onClick={() => {
+                onInterrupt(currentVersion);
+                setConfirmationOpen(false);
+                triggerRef.current?.focus();
+              }}
+            >
+              Confirmer l’interruption
+            </button>
+          </div>
+        </div>
+      ) : null}
+    </div>
   );
 }
 

@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -363,7 +363,10 @@ describe("InvestigationTab", () => {
   });
 
   it("montre l’enquête en cours et permet de l’interrompre", async () => {
-    renderInvestigation(makeInvestigation({ status: "running" }));
+    const user = userEvent.setup();
+    const { calls } = renderInvestigation(
+      makeInvestigation({ status: "running" }),
+    );
 
     expect(
       await screen.findByRole("heading", { name: "Investigation en cours" }),
@@ -376,9 +379,61 @@ describe("InvestigationTab", () => {
     expect(
       screen.getByTitle("Version de l’état de travail (CAS)"),
     ).toHaveTextContent("version de l’état 1");
+    const actionsButton = screen.getByRole("button", {
+      name: "Actions de l’enquête",
+    });
+    expect(actionsButton).toHaveAttribute("aria-haspopup", "menu");
+    expect(actionsButton).toHaveAttribute("aria-expanded", "false");
     expect(
-      screen.getByRole("button", { name: "Interrompre l’enquête" }),
+      screen.queryByRole("menuitem", { name: "Interrompre l’enquête" }),
+    ).not.toBeInTheDocument();
+
+    await user.click(actionsButton);
+    expect(actionsButton).toHaveAttribute("aria-expanded", "true");
+    const interruptItem = screen.getByRole("menuitem", {
+      name: "Interrompre l’enquête",
+    });
+    expect(interruptItem).toHaveFocus();
+    await user.keyboard("{Escape}");
+    expect(actionsButton).toHaveFocus();
+    expect(actionsButton).toHaveAttribute("aria-expanded", "false");
+
+    await user.click(actionsButton);
+    await user.click(
+      screen.getByRole("menuitem", { name: "Interrompre l’enquête" }),
+    );
+    expect(
+      screen.getByRole("group", { name: "Confirmer l’interruption" }),
     ).toBeInTheDocument();
+    const cancelButton = screen.getByRole("button", { name: "Annuler" });
+    expect(cancelButton).toHaveFocus();
+    expect(calls.some((call) => call.url.endsWith("/interrupt"))).toBe(false);
+    await user.keyboard("{Escape}");
+    expect(
+      screen.queryByRole("group", { name: "Confirmer l’interruption" }),
+    ).not.toBeInTheDocument();
+    expect(actionsButton).toHaveFocus();
+    expect(calls.some((call) => call.url.endsWith("/interrupt"))).toBe(false);
+
+    await user.click(actionsButton);
+    await user.click(
+      screen.getByRole("menuitem", { name: "Interrompre l’enquête" }),
+    );
+    await user.click(
+      screen.getByRole("button", { name: "Confirmer l’interruption" }),
+    );
+    await waitFor(() => {
+      expect(calls.some((call) => call.url.endsWith("/interrupt"))).toBe(true);
+    });
+    const interruptRequest = calls.find((call) =>
+      call.url.endsWith("/interrupt"),
+    );
+    expect(interruptRequest?.url).toBe(
+      `/api/investigations/${INVESTIGATION_ID}/interrupt`,
+    );
+    expect(requestBody(interruptRequest?.init)).toEqual({
+      expected_version: 1,
+    });
     expect(
       screen.getByRole("button", { name: "Lancer l’atelier d’investigation" }),
     ).toBeDisabled();
@@ -412,8 +467,11 @@ describe("InvestigationTab", () => {
     );
 
     expect(await screen.findByText(/À réviser/)).toBeInTheDocument();
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Actions de l’enquête" }),
+    );
     expect(
-      await screen.findByRole("button", { name: "Reprendre l’enquête" }),
+      await screen.findByRole("menuitem", { name: "Reprendre l’enquête" }),
     ).toBeInTheDocument();
   });
 
@@ -460,8 +518,11 @@ describe("InvestigationTab", () => {
     expect(
       screen.getByText(/limite locale de cette piste/),
     ).toBeInTheDocument();
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Actions de l’enquête" }),
+    );
     expect(
-      screen.getByRole("button", { name: "Reprendre l’enquête" }),
+      screen.getByRole("menuitem", { name: "Reprendre l’enquête" }),
     ).toBeInTheDocument();
   });
 
