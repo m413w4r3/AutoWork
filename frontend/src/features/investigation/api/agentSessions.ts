@@ -118,7 +118,7 @@ export interface AgentSessionConfinementView {
   profile: string;
   bwrap_ok: boolean;
   netns: boolean;
-  network_mode: "isolated_egress" | "host_network_unsafe" | null;
+  network_mode: "isolated_egress" | null;
   loopback_isolated: boolean;
 }
 

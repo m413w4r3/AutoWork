@@ -1648,58 +1648,57 @@ async def test_unattested_network_mode_refuses_before_any_host_prepare() -> None
     assert await harness.sessions.list_for_task(task.id) == ()
 
 
-async def test_host_network_unsafe_requires_the_host_to_attest_the_same_mode() -> None:
+def test_host_network_unsafe_is_refused_at_configuration_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M24.1 CFG-1: isolation is the only mode; an old value never degrades silently."""
+    assert Settings(_env_file=None).agent_sessions_cli_network_mode == "isolated_egress"
+
+    monkeypatch.setenv("AGENT_SESSIONS_CLI_NETWORK_MODE", "host_network_unsafe")
+    with pytest.raises(ValidationError, match="host_network_unsafe is no longer supported"):
+        Settings(_env_file=None)
+
+    monkeypatch.delenv("AGENT_SESSIONS_CLI_NETWORK_MODE")
+    with pytest.raises(ValidationError, match="host_network_unsafe is no longer supported"):
+        Settings(_env_file=None, agent_sessions_cli_network_mode="host_network_unsafe")
+
+
+def test_session_service_refuses_an_unsafe_cli_network_mode() -> None:
+    harness = _Harness()
+    with pytest.raises(ValueError, match="cli_network_mode must be isolated_egress"):
+        SessionService(
+            uow_factory=lambda: harness.uow,
+            deriver=harness.deriver,
+            cli_network_mode="host_network_unsafe",
+        )
+
+
+async def test_non_isolated_host_attestation_is_always_refused() -> None:
     harness = _Harness()
     task = await harness.seed_task()
     handoff = await harness.add_handoff(task)
-    unsafe_caps = _capabilities(
+    harness.operator.capabilities = _capabilities(
         confinement=OperatorConfinementV1(
             profile="bwrap-reasoning-session",
             bwrap_ok=True,
             netns=False,
-            network_mode="host_network_unsafe",
+            network_mode="isolated_egress",
             loopback_isolated=False,
         )
     )
 
-    service = SessionService(
-        uow_factory=lambda: harness.uow,
-        deriver=harness.deriver,
-        operator=harness.operator,
-        secret_delivery=harness.secret_delivery,
-        disclosure=harness.disclosure,
-        cli_network_mode="host_network_unsafe",
-        clock=lambda: NOW,
-    )
-    harness.operator.capabilities = unsafe_caps
-    prepared = await service.open_session(
-        harness.investigation_id,
-        task_id=task.id,
-        adapter_kind=OperatorAdapterKind.CODEX_CLI,
-        handoff_id=UUID(handoff.handoff_id),
-        executable=EXECUTABLE,
-        actor=HUMAN_ACTOR,
-        idempotency_key="open-unsafe-override",
-    )
-    assert prepared.session.state is AgentSessionState.RUNNING
-
-    # The backend in its fail-closed mode still refuses the same host facts.
-    refused_harness = _Harness()
-    task = await refused_harness.seed_task()
-    handoff = await refused_harness.add_handoff(task)
-    refused_harness.operator.capabilities = unsafe_caps
     with pytest.raises(SessionNetworkIsolationUnavailableError) as exc_info:
-        await refused_harness.service.open_session(
-            refused_harness.investigation_id,
+        await harness.service.open_session(
+            harness.investigation_id,
             task_id=task.id,
             adapter_kind=OperatorAdapterKind.CODEX_CLI,
             handoff_id=UUID(handoff.handoff_id),
             executable=EXECUTABLE,
             actor=HUMAN_ACTOR,
-            idempotency_key="open-unsafe-refused",
+            idempotency_key="open-not-isolated-refused",
         )
     assert exc_info.value.details["reason"] == "loopback_not_isolated"
-    assert refused_harness.operator.prepared == []
+    assert harness.operator.prepared == []
 
 
 # --------------------------------------------------- capabilities route (B3)
