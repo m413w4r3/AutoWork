@@ -7,9 +7,11 @@
  * client. L’empreinte n’est jamais un bouton et aucun clic par hash n’approuve.
  */
 
+import { useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import type { FormEvent } from "react";
 
+import { investigationGovernanceQueryKeys } from "../../../api/investigationGovernance";
 import {
   useApproveBootstrapEnvelope,
   useBootstrapEnvelopeProposal,
@@ -42,6 +44,7 @@ export function EnvelopeSection({
   workspaceReady: boolean;
   workspaceBlockedReason: string | null;
 }) {
+  const queryClient = useQueryClient();
   const proposalQuery = useBootstrapEnvelopeProposal(investigationId);
   const approval = useApproveBootstrapEnvelope(investigationId);
   const [reason, setReason] = useState("");
@@ -88,6 +91,12 @@ export function EnvelopeSection({
           setSubmittedApproval(result);
           setReason("");
           setConfirmed(false);
+          // L’approbation fait passer l’enveloppe de « absente » à
+          // « approuvée » : le cycle de vie monte sans rechargement de page.
+          void queryClient.invalidateQueries({
+            queryKey:
+              investigationGovernanceQueryKeys.envelope(investigationId),
+          });
         },
       },
     );
@@ -247,7 +256,21 @@ function AlreadyApproved({
         · acquisition d’échantillons :{" "}
         {proposal.acquire_hits_allowed ? "autorisée" : "non autorisée"}.
       </p>
+      <LifecycleReferral />
     </WorkshopStateBanner>
+  );
+}
+
+/** Renvoi unique : l’extension et la révocation vivent hors de cette section. */
+function LifecycleReferral() {
+  return (
+    <p>
+      Les extensions et la révocation se décident dans{" "}
+      <a href="#overview-envelope-lifecycle-heading">
+        le cycle de vie de l’enveloppe G2
+      </a>
+      .
+    </p>
   );
 }
 
@@ -285,6 +308,7 @@ function ApprovalResult({
           </div>
         ))}
       </dl>
+      <LifecycleReferral />
     </WorkshopStateBanner>
   );
 }

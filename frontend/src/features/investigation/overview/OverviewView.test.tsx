@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -10,6 +10,7 @@ import type {
   BootstrapSnapshotV1,
   IOCInventoryV1,
 } from "../api/bootstrap";
+import type { InvestigationEnvelopeView } from "../../../api/investigationGovernance";
 import type {
   WorkspaceEnsureResultV1,
   WorkspaceStatusV1,
@@ -33,6 +34,7 @@ const URLS = {
   snapshot: `/api/investigations/${INVESTIGATION_ID}/bootstrap/snapshot`,
   proposal: `/api/investigations/${INVESTIGATION_ID}/bootstrap/envelope-proposal`,
   approve: `/api/investigations/${INVESTIGATION_ID}/bootstrap/envelope/approve`,
+  envelope: `/api/investigations/${INVESTIGATION_ID}/envelope`,
 };
 
 function makeAgent(
@@ -262,6 +264,71 @@ function makeProposal(
   };
 }
 
+type GovernanceEnvelopeFixture = InvestigationEnvelopeView & {
+  policy_activated_by: string | null;
+  authority_kind: string | null;
+  inherited_policy_id: string | null;
+  inherited_policy_version: number | null;
+  inherited_policy_event_id: string | null;
+  inherited_subject_id: string | null;
+  policy_status: string | null;
+  currently_authorized: boolean;
+};
+
+function makeGovernanceEnvelope(approved: boolean): GovernanceEnvelopeFixture {
+  return {
+    investigation_id: INVESTIGATION_ID,
+    approved,
+    version: approved ? 1 : 0,
+    allowed_providers: approved ? ["vt"] : [],
+    available_providers: ["vt", "shodan"],
+    acquire_hits_allowed: approved,
+    max_acquire_volume: approved ? 1 : 0,
+    budget: {
+      bridge_turns: { limit: 8, consumed: 2, reserved: 0, remaining: 6 },
+      vt_units: { limit: 6, consumed: 0, reserved: 0, remaining: 6 },
+      shodan_credits: { limit: 5, consumed: 0, reserved: 0, remaining: 5 },
+      downloads: {
+        limit: approved ? 1 : 0,
+        consumed: 0,
+        reserved: 0,
+        remaining: approved ? 1 : 0,
+      },
+      tool_seconds: { limit: 120, consumed: 0, reserved: 0, remaining: 120 },
+      context_tokens: {
+        limit: 20_000,
+        consumed: 0,
+        reserved: 0,
+        remaining: 20_000,
+      },
+      context_bytes: {
+        limit: 100_000,
+        consumed: 0,
+        reserved: 0,
+        remaining: 100_000,
+      },
+    },
+    disclosure: {
+      tlp: "amber",
+      do_not_submit: true,
+      external_llm_allowed: false,
+    },
+    approval_decision_id: approved
+      ? "88888888-8888-4888-8888-888888888888"
+      : null,
+    approval_actor_id: approved ? "human-1" : null,
+    approved_at: approved ? "2026-11-22T10:05:00Z" : null,
+    policy_activated_by: null,
+    authority_kind: approved ? "human_g2" : null,
+    inherited_policy_id: null,
+    inherited_policy_version: null,
+    inherited_policy_event_id: null,
+    inherited_subject_id: null,
+    policy_status: null,
+    currently_authorized: approved,
+  };
+}
+
 function makeApproval(): BootstrapEnvelopeApprovalV1 {
   return {
     schema_version: "vt-bootstrap-envelope-approval.v1",
@@ -288,6 +355,7 @@ interface FetchOptions {
   snapshot?: BootstrapSnapshotV1;
   proposal?: BootstrapEnvelopeProposalV1 | { status: number; code: string };
   approval?: BootstrapEnvelopeApprovalV1 | { status: number; code: string };
+  envelope?: GovernanceEnvelopeFixture;
 }
 
 function urlOf(input: RequestInfo | URL): string {
@@ -305,6 +373,7 @@ function errorResponse(status: number, code: string) {
 
 function createFetch(options: FetchOptions) {
   const calls: Array<{ url: string; init?: RequestInit }> = [];
+  let approvalPosted = false;
   const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = urlOf(input);
     calls.push({ url, init });
@@ -322,6 +391,13 @@ function createFetch(options: FetchOptions) {
       );
     if (url === URLS.snapshot)
       return Promise.resolve(Response.json(options.snapshot ?? makeSnapshot()));
+    if (url === URLS.envelope && init?.method !== "POST") {
+      return Promise.resolve(
+        Response.json(
+          options.envelope ?? makeGovernanceEnvelope(approvalPosted),
+        ),
+      );
+    }
     if (url === URLS.proposal && init?.method !== "POST") {
       const proposal = options.proposal ?? makeProposal();
       if ("status" in proposal)
@@ -332,6 +408,7 @@ function createFetch(options: FetchOptions) {
       const approval = options.approval ?? makeApproval();
       if ("status" in approval)
         return Promise.resolve(errorResponse(approval.status, approval.code));
+      approvalPosted = true;
       return Promise.resolve(Response.json(approval));
     }
     return Promise.resolve(errorResponse(500, "unexpected_request"));
@@ -428,6 +505,16 @@ describe("OverviewView", () => {
     expect(
       await screen.findByText("Enveloppe G2 approuvée — version 1"),
     ).toBeTruthy();
+    // L’approbation rend l’enveloppe lisible : le cycle de vie monte sans
+    // rechargement, avec ses deux décisions distinctes.
+    expect(
+      await screen.findByRole("heading", {
+        name: "Cycle de vie de l’enveloppe G2",
+      }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Étendre l’enveloppe" }),
+    ).toBeTruthy();
 
     const post = calls.find((call) => call.init?.method === "POST");
     if (!post) throw new Error("approval request missing");
@@ -491,6 +578,52 @@ describe("OverviewView", () => {
     ).toBeTruthy();
     expect(
       screen.queryByRole("button", { name: /Approuver l’enveloppe/ }),
+    ).toBeNull();
+    expect(
+      screen.getByRole("link", {
+        name: "le cycle de vie de l’enveloppe G2",
+      }),
+    ).toBeTruthy();
+  });
+
+  it("monte le cycle de vie G2 quand l’enveloppe est approuvée", async () => {
+    renderOverview({ envelope: makeGovernanceEnvelope(true) });
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "Cycle de vie de l’enveloppe G2",
+      }),
+    ).toBeTruthy();
+    expect(screen.getByText("Enveloppe G2 active — version 1")).toBeTruthy();
+    const lifecycle = screen.getByRole("region", {
+      name: "Cycle de vie de l’enveloppe G2",
+    });
+    expect(
+      within(lifecycle).getByRole("button", { name: "Étendre l’enveloppe" }),
+    ).toBeTruthy();
+    expect(
+      within(lifecycle).getByRole("button", {
+        name: "Révoquer l’enveloppe",
+      }),
+    ).toBeTruthy();
+    expect(
+      within(lifecycle).queryByRole("button", { name: /Approuver/ }),
+    ).toBeNull();
+  });
+
+  it("ne monte pas le cycle de vie avant l’approbation", async () => {
+    const { calls } = renderOverview({});
+
+    await waitFor(() =>
+      expect(calls.some((call) => call.url === URLS.envelope)).toBe(true),
+    );
+    expect(
+      screen.queryByRole("heading", {
+        name: "Cycle de vie de l’enveloppe G2",
+      }),
+    ).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "Étendre l’enveloppe" }),
     ).toBeNull();
   });
 });

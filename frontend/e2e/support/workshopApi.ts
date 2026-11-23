@@ -17,7 +17,10 @@ import type {
   InvestigationView,
 } from "../../src/api/investigation";
 import type { InvestigationActivityPage } from "../../src/api/investigationOperator";
-import type { InvestigationSampleDetail } from "../../src/api/investigationGovernance";
+import type {
+  InvestigationEnvelopeView,
+  InvestigationSampleDetail,
+} from "../../src/api/investigationGovernance";
 import type {
   BootstrapEnvelopeApprovalV1,
   BootstrapEnvelopeProposalV1,
@@ -132,6 +135,8 @@ export interface WorkshopApiOptions {
   staleProposal?: boolean;
   /** The exact synthesis already has an investigation before any POST. */
   existingInvestigation?: boolean;
+  /** The investigation starts with an approved G2 envelope (cockpit lifecycle). */
+  envelopeApproved?: boolean;
   /** A human transfer either hits a stale CAS or creates a handoff. */
   transferOutcome?: "stale" | "success";
   /**
@@ -796,6 +801,56 @@ function envelopeProposal(approved: boolean): BootstrapEnvelopeProposalV1 {
   };
 }
 
+interface WorkshopEnvelopeView extends InvestigationEnvelopeView {
+  policy_activated_by: string | null;
+  authority_kind: string | null;
+  inherited_policy_id: string | null;
+  inherited_policy_version: number | null;
+  inherited_policy_event_id: string | null;
+  inherited_subject_id: string | null;
+  policy_status: string | null;
+  currently_authorized: boolean;
+}
+
+function lifecycleEnvelope(
+  approved: boolean,
+  version: number,
+  revoked: boolean,
+): WorkshopEnvelopeView {
+  const active = approved && !revoked;
+  return {
+    investigation_id: ids.investigation,
+    approved,
+    version,
+    allowed_providers: active ? ["vt"] : [],
+    available_providers: ["vt", "shodan", "bridge"],
+    acquire_hits_allowed: active,
+    max_acquire_volume: active ? BUDGET.downloads.limit : 0,
+    budget: revoked
+      ? {
+          ...BUDGET,
+          downloads: { limit: 0, consumed: 0, reserved: 0, remaining: 0 },
+        }
+      : BUDGET,
+    disclosure: {
+      tlp: "amber",
+      do_not_submit: true,
+      external_llm_allowed: false,
+    },
+    approval_decision_id: approved ? ids.approvalDecision : null,
+    approval_actor_id: approved ? "dev-analyst" : null,
+    approved_at: approved ? "2026-11-22T09:30:00Z" : null,
+    policy_activated_by: null,
+    authority_kind: approved ? "human_g2" : null,
+    inherited_policy_id: null,
+    inherited_policy_version: null,
+    inherited_policy_event_id: null,
+    inherited_subject_id: null,
+    policy_status: null,
+    currently_authorized: active,
+  };
+}
+
 function envelopeApproval(): BootstrapEnvelopeApprovalV1 {
   return {
     schema_version: "vt-bootstrap-envelope-approval.v1",
@@ -1278,7 +1333,9 @@ export function createWorkshopApi(options: WorkshopApiOptions = {}) {
   const unhandled: string[] = [];
   let started = existingInvestigation;
   let workspaceBound = (options.workspaceState ?? "bound") === "bound";
-  let envelopeApproved = false;
+  let envelopeApproved = options.envelopeApproved === true;
+  let envelopeVersion = envelopeApproved ? 1 : 0;
+  let envelopeRevoked = false;
   let sampleQualification: SampleQualification = "candidate";
   let tasks: TaskView[] = [];
   let sessions: AgentSessionView[] = [];
@@ -1491,6 +1548,29 @@ export function createWorkshopApi(options: WorkshopApiOptions = {}) {
       return fulfill(route, review);
     }
 
+    if (path === inv("/envelope") && method === "GET") {
+      return fulfill(
+        route,
+        lifecycleEnvelope(envelopeApproved, envelopeVersion, envelopeRevoked),
+      );
+    }
+    if (path === inv("/envelope/extend") && method === "POST") {
+      envelopeApproved = true;
+      envelopeVersion += 1;
+      return fulfill(
+        route,
+        lifecycleEnvelope(envelopeApproved, envelopeVersion, envelopeRevoked),
+      );
+    }
+    if (path === inv("/envelope/revoke") && method === "POST") {
+      envelopeVersion += 1;
+      envelopeRevoked = true;
+      return fulfill(
+        route,
+        lifecycleEnvelope(envelopeApproved, envelopeVersion, envelopeRevoked),
+      );
+    }
+
     if (path === inv("/bootstrap/inventory") && method === "GET") {
       return fulfill(route, inventory(sampleQualification));
     }
@@ -1508,6 +1588,7 @@ export function createWorkshopApi(options: WorkshopApiOptions = {}) {
     }
     if (path === inv("/bootstrap/envelope/approve") && method === "POST") {
       envelopeApproved = true;
+      envelopeVersion = Math.max(envelopeVersion, 1);
       return fulfill(route, envelopeApproval());
     }
 
