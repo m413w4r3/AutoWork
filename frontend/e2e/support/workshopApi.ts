@@ -84,7 +84,7 @@ import type {
   OpinionVersionV1,
 } from "../../src/features/investigation/opinion/types";
 
-const ids = {
+export const ids = {
   edition: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
   subject: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
   run: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
@@ -92,6 +92,7 @@ const ids = {
   investigation: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
   finding: "11111111-1111-4111-8111-111111111111",
   observation: "22222222-2222-4222-8222-222222222222",
+  longObservation: "23232323-2323-4323-8323-232323232323",
   taskReady: "33333333-3333-4333-8333-333333333333",
   taskProposed: "44444444-4444-4444-8444-444444444444",
   plan: "55555555-5555-4555-8555-555555555555",
@@ -200,6 +201,24 @@ const OBSERVATION: InvestigationObservation = {
 };
 
 /**
+ * The bootstrap snapshot observation carries a long object type, a full UUID
+ * object id and a dotted source: its option label is the widest realistic
+ * value, so a picker that offers it must still not widen the page.
+ */
+const LONG_OBSERVATION: InvestigationObservation = {
+  id: ids.longObservation,
+  kind: "other",
+  sha256: "573751852a0e".padEnd(64, "b"),
+  source: "investigation.bootstrap",
+  source_version: "1",
+  observed_at: "2026-11-22T08:01:00Z",
+  object_type: "investigation.bootstrap_snapshot",
+  object_id: "66d328b0-1a2b-4c3d-8e4f-5a6b7c8d9e0f",
+  limitations: [],
+  invocation_ref: null,
+};
+
+/**
  * M23 elements of the pinned publication; only same-anchor ones are
  * referencable. The chart carries the server's own refusal verdict
  * (`note_chart_without_evidence`), so the picker must show it disabled rather
@@ -272,7 +291,7 @@ function investigation(): InvestigationView {
     agenda: [],
     hypotheses: [],
     findings: [FINDING],
-    observations: [OBSERVATION],
+    observations: [OBSERVATION, LONG_OBSERVATION],
     sample_associations: [
       {
         id: ids.association,

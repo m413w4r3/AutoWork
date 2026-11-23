@@ -25,6 +25,7 @@ import {
   useOpinionRead,
 } from "./queries";
 import type { AnalystNoteV1 } from "./types";
+import "./opinion.css";
 
 export function OpinionNotesView({
   investigationId,
@@ -135,7 +136,10 @@ export function OpinionNotesView({
   }
 
   return (
-    <section className="job-card" aria-labelledby="opinion-notes-view-heading">
+    <section
+      className="job-card opinion-notes"
+      aria-labelledby="opinion-notes-view-heading"
+    >
       <h2 id="opinion-notes-view-heading">Note de l’analyste</h2>
       <p>
         Cette vue ne propose que demander à Bridge, accepter ou refuser. Aucun

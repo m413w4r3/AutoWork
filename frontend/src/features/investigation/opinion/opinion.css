@@ -1,0 +1,23 @@
+/*
+ * M24.1 R5 — « Note de l'analyste » layout.
+ *
+ * A `<select>` is sized by its widest option and a `fieldset` never shrinks
+ * below its min-content width, so one long observation id used to widen the
+ * whole view past `main`. Option labels are shortened in the component; these
+ * rules make the containers allow shrinking and clip any remaining overflow.
+ */
+.opinion-notes,
+.opinion-notes .job-card,
+.opinion-notes fieldset,
+.opinion-notes .note-content-blocks {
+  min-width: 0;
+}
+
+.opinion-notes select {
+  max-width: 100%;
+}
+
+.opinion-notes .table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+}

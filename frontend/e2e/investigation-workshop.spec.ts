@@ -3,7 +3,11 @@ import { join } from "node:path";
 
 import { expect, test, type Page } from "@playwright/test";
 
-import { createWorkshopApi, type WorkshopApi } from "./support/workshopApi";
+import {
+  createWorkshopApi,
+  ids as workshopIds,
+  type WorkshopApi,
+} from "./support/workshopApi";
 
 /**
  * M24 workshop cockpit, desktop only (1440×900, keyboard pass at 1280×800).
@@ -1066,6 +1070,80 @@ test("note de l’analyste : blocs de contenu référencés puis vérifiés", as
     page.getByRole("heading", { name: "Note acceptée" }),
   ).toBeVisible();
   expect(api.unhandled).toEqual([]);
+});
+
+test("note de l’analyste : aucune largeur ne déborde aux trois résolutions", async ({
+  page,
+}) => {
+  const api = createWorkshopApi({
+    contentBlocks: [
+      {
+        block_type: "ioc_table",
+        observation_ids: [workshopIds.observation, workshopIds.longObservation],
+        title: "Tableau IOC (2)",
+      },
+    ],
+  });
+  await launchWorkshop(page, api);
+  await openView(page, "Note de l’analyste");
+
+  // The widest realistic value is the bootstrap observation option: a long
+  // object type, a full UUID object id and a dotted source. Its short label is
+  // shown, the full identity stays in the option title.
+  const observationSelect = page.getByLabel("Observation source");
+  const longOption = observationSelect.locator(
+    `option[value="${workshopIds.longObservation}"]`,
+  );
+  await expect(longOption).toHaveAttribute(
+    "title",
+    /investigation\.bootstrap_snapshot/,
+  );
+
+  await page.getByRole("button", { name: "Examiner la proposition" }).click();
+  await expect(
+    page.getByRole("region", { name: /Proposition ciblée/ }),
+  ).toBeVisible();
+  // The read-only IOC table (full UUID observation ids) is rendered too.
+  await expect(
+    page.getByRole("table", { name: "Tableau IOC (2)" }),
+  ).toBeVisible();
+
+  for (const viewport of [
+    { width: 1280, height: 800 },
+    { width: 1440, height: 900 },
+    { width: 1920, height: 1080 },
+  ]) {
+    await page.setViewportSize(viewport);
+    await page.evaluate(() => window.scrollTo(0, 0));
+    const metrics = await page.evaluate(() => {
+      const root = document.documentElement;
+      const main = document.querySelector("main");
+      const card = document.querySelector(
+        "section.job-card.opinion-notes",
+      );
+      return {
+        clientWidth: root.clientWidth,
+        scrollWidth: root.scrollWidth,
+        mainWidth:
+          main === null ? null : main.getBoundingClientRect().width,
+        cardWidth:
+          card === null ? null : card.getBoundingClientRect().width,
+      };
+    });
+    expect(metrics.clientWidth, `${viewport.width}px client width`).toBe(
+      viewport.width,
+    );
+    expect(
+      metrics.scrollWidth,
+      `${viewport.width}px document scroll width`,
+    ).toBeLessThanOrEqual(metrics.clientWidth);
+    expect(metrics.mainWidth).not.toBeNull();
+    expect(metrics.cardWidth).not.toBeNull();
+    expect(
+      metrics.cardWidth ?? Number.POSITIVE_INFINITY,
+      `${viewport.width}px opinion card width`,
+    ).toBeLessThanOrEqual((metrics.mainWidth ?? 0) + 1);
+  }
 });
 
 test("note de l’analyste : des blocs périmés bloquent l’acceptation", async ({

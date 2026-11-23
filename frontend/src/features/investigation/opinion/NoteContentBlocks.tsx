@@ -48,6 +48,8 @@ const ARTICLE_ELEMENT_KIND_LABELS: Record<NoteArticleElementKind, string> = {
 /** Mirrors the server union bounds (`MAX_NOTE_IOC_OBSERVATIONS`). */
 const MAX_IOC_OBSERVATIONS = 64;
 const OPTION_TEXT_MAX = 120;
+/** Short option labels keep the page width independent of id lengths. */
+const OPTION_SHORT_MAX = 32;
 
 const CODE_LANGUAGE_PATTERN = /^[a-z0-9][a-z0-9+.#_-]*$/;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
@@ -80,6 +82,20 @@ function observationLabel(observation: InvestigationObservation): string {
   )} · SHA-256 ${shortHash(observation.sha256)} · ${observation.source}`;
 }
 
+/**
+ * A `<select>` never wraps its options, so an option label is laid out at its
+ * full intrinsic width. Offer identity plus a short digest here and keep the
+ * complete label in the option `title`; otherwise a bootstrap observation
+ * whose object id is a UUID widens the whole page.
+ */
+function observationOptionLabel(observation: InvestigationObservation): string {
+  const kind = EVIDENCE_KIND_LABELS[observation.kind] ?? observation.kind;
+  return `${kind} · ${truncate(
+    observation.object_id,
+    OPTION_SHORT_MAX,
+  )} · SHA-256 ${shortHash(observation.sha256)}`;
+}
+
 function elementLabel(element: ArticleElementViewV1): string {
   const title = element.title ?? element.key;
   const caption =
@@ -88,6 +104,15 @@ function elementLabel(element: ArticleElementViewV1): string {
     title,
     OPTION_TEXT_MAX,
   )}${caption} · SHA-256 ${shortHash(element.element_sha256)}`;
+}
+
+/** Same option-width rule as `observationOptionLabel` for M23 elements. */
+function elementOptionLabel(element: ArticleElementViewV1): string {
+  const title = element.title ?? element.key;
+  return `${ARTICLE_ELEMENT_KIND_LABELS[element.kind]} · ${truncate(
+    title,
+    OPTION_SHORT_MAX,
+  )} · SHA-256 ${shortHash(element.element_sha256)}`;
 }
 
 /** The server's typed refusal, translated; unknown codes stay readable. */
@@ -410,10 +435,11 @@ function ArticleElementSelector({
                     key={`${element.kind}:${element.key}`}
                     value={`${element.kind}:${element.key}`}
                     disabled={!element.proposable}
+                    title={elementLabel(element)}
                   >
                     {element.proposable
-                      ? elementLabel(element)
-                      : `${elementLabel(element)} — non proposable : ${elementRefusalLabel(
+                      ? elementOptionLabel(element)
+                      : `${elementOptionLabel(element)} — non proposable : ${elementRefusalLabel(
                           element.refusal_reason,
                         )}`}
                   </option>
@@ -639,8 +665,12 @@ function CanonicalCodeForm({
           >
             <option value="">— Choisir une observation —</option>
             {observations.slice(0, MAX_IOC_OBSERVATIONS).map((item) => (
-              <option key={item.id} value={item.id}>
-                {observationLabel(item)}
+              <option
+                key={item.id}
+                value={item.id}
+                title={observationLabel(item)}
+              >
+                {observationOptionLabel(item)}
               </option>
             ))}
           </select>
@@ -749,10 +779,16 @@ function ProtocolFigurePicker({
           >
             <option value="">— Choisir une figure de protocole —</option>
             {usable.map((figure) => (
-              <option key={figure.kind} value={figure.kind}>
+              <option
+                key={figure.kind}
+                value={figure.kind}
+                title={`${
+                  PROTOCOL_FIGURE_LABELS[figure.kind] ?? figure.kind
+                } · SHA-256 ${figure.asset_sha256} · ${figure.caption}`}
+              >
                 {PROTOCOL_FIGURE_LABELS[figure.kind] ?? figure.kind} · SHA-256{" "}
                 {shortHash(figure.asset_sha256)} ·{" "}
-                {truncate(figure.caption, OPTION_TEXT_MAX)}
+                {truncate(figure.caption, OPTION_SHORT_MAX)}
               </option>
             ))}
           </select>
@@ -864,7 +900,7 @@ function ResolvedBlockPreview({
       );
     case "ioc_table":
       return (
-        <div>
+        <div className="table-scroll">
           <table>
             <caption>{block.title}</caption>
             <thead>
