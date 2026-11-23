@@ -96,12 +96,14 @@ BROKER_SOCKET_ENV = shim.BROKER_SOCKET_ENV
 DISALLOWED_TOOLS: tuple[str, ...] = ("Bash", "PowerShell", "REPL", "WebFetch")
 PERMISSION_MODE = "dontAsk"
 PERMISSION_PROMPTS = "none"
-# ``dontAsk`` denies anything that would prompt, including our MCP tools; the
-# operator needs them without a human at the CLI.  Only the closed `autowork`
-# MCP server is allowed at the CLI permission layer: no built-in tool name is
-# added, and the per-session manifest is still enforced by the relay/backend
-# (H0 host spike: the tool call was otherwise denied with "don't ask mode").
-MCP_ALLOWED_TOOLS: tuple[str, ...] = (f"mcp__{MCP_SERVER_NAME}",)
+# ``dontAsk`` denies anything that would prompt, including our MCP tools and
+# the file writes that produce the captured notes/results.  Only the closed
+# `autowork` MCP server and the two confined file tools are allowed at the
+# CLI permission layer: --restricted keeps every file tool inside cwd and
+# --add-dir (the session scratch), no code-running tool is added, and the
+# per-session manifest is still enforced by the relay/backend (H0 host spike:
+# MCP and Write were otherwise denied with "don't ask mode").
+MCP_ALLOWED_TOOLS: tuple[str, ...] = (f"mcp__{MCP_SERVER_NAME}", "Write", "Edit")
 
 REQUIRED_HELP_FLAGS: tuple[str, ...] = (
     "--print",

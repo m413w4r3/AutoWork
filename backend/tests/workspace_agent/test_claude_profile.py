@@ -188,11 +188,12 @@ def test_claude_restricted_tools_only(tmp_path: Path) -> None:
     assert flag_value(argv, "--permission-prompts") == "none"
     denied = {item.strip() for item in flag_value(argv, "--disallowedTools").split(",")}
     assert {"Bash", "PowerShell", "REPL", "WebFetch"} <= denied
-    # H0: dontAsk denied the MCP tools too; only the closed autowork server is
-    # allowed at the CLI layer (the relay still enforces the session manifest).
+    # H0: dontAsk denied the MCP tools and the captured file writes; only the
+    # closed autowork server and the two confined file tools are allowed at
+    # the CLI layer (the relay still enforces the session manifest).
     allowed = {item.strip() for item in flag_value(argv, "--allowedTools").split(",")}
-    assert allowed == {"mcp__autowork"}
-    assert not allowed & {"Bash", "PowerShell", "REPL", "WebFetch", "Edit", "Write", "Read"}
+    assert allowed == {"mcp__autowork", "Write", "Edit"}
+    assert not allowed & {"Bash", "PowerShell", "REPL", "WebFetch", "Task", "Agent"}
     assert "--tools" not in flags
     assert "--dangerously-skip-permissions" not in flags
     assert flag_value(argv, "--add-dir") == str(context.scratch_directory)
