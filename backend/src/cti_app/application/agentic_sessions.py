@@ -755,6 +755,19 @@ class _PrepareRequest:
     model: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _SessionHostIoIntent:
+    """Committed session version and task fence for one host round trip."""
+
+    session: AgentSessionV1
+    prior_state: AgentSessionState
+    task_lease_id: UUID | None
+    task_lease_session_id: UUID | None
+    task_lease_fence: int
+    task_status: TaskStatus
+    task_status_version: int
+
+
 class SessionService:
     """Prepare/open/start/drive/close one technical operator session."""
 
@@ -1596,26 +1609,26 @@ class SessionService:
         operator: AgenticOperatorPort,
         timestamp: datetime,
     ) -> AgentSessionV1:
-        async with self._uow_factory() as uow:
-            session = await self._session_for(uow, investigation_id, session_id)
-            if not session.is_active:
-                raise SessionStateConflictError(
-                    f"a {session.state.value} session is not reconcilable"
-                )
-            result = await operator.reconcile_session(
-                ReconcileSessionRequest(
-                    session_id=session.id,
-                    host_session_ref=session.host_session_ref,
-                )
+        intent = await self._begin_host_io(
+            investigation_id,
+            session_id,
+            timestamp=timestamp,
+            operation="reconcile",
+            allow_reconciliation_retry=True,
+            require_host_session_ref=False,
+        )
+        result = await operator.reconcile_session(
+            ReconcileSessionRequest(
+                session_id=intent.session.id,
+                host_session_ref=intent.session.host_session_ref,
+                idempotency_key=f"state-version:{intent.session.state_version}",
             )
-            self._require_reconciliation_answer(session, result)
-            prior_state = session.state
-            current = session
-            if prior_state is not AgentSessionState.RECONCILING:
-                current = await self._persist(
-                    uow,
-                    current.with_state(AgentSessionState.RECONCILING, now=timestamp),
-                )
+        )
+        self._require_reconciliation_answer(intent.session, result)
+        async with self._uow_factory() as uow:
+            current, task = await self._revalidate_host_io_intent(
+                uow, investigation_id, session_id, intent
+            )
             current = await self._persist(
                 uow,
                 current.with_reconciliation(
@@ -1660,14 +1673,8 @@ class SessionService:
             else:
                 # ``session_alive``: return to the prior active state.  Any
                 # state a live process may hold is admitted by the machine.
-                restored = (
-                    prior_state
-                    if prior_state
-                    in (
-                        AgentSessionState.RUNNING,
-                        AgentSessionState.AWAITING_INSTRUCTION,
-                    )
-                    else AgentSessionState.RUNNING
+                restored = self._restored_host_io_state(
+                    intent.prior_state, task, preserve_prior=False
                 )
                 current = await self._persist(uow, current.with_state(restored, now=timestamp))
             await uow.commit()
@@ -1686,24 +1693,27 @@ class SessionService:
         timestamp = _now(self._clock, now)
         self._require_operator_actor(actor)
         operator = self._require_operator()
-        async with self._uow_factory() as uow:
-            session = await self._session_for(uow, investigation_id, session_id)
-            if not session.is_active:
-                raise SessionStateConflictError(
-                    f"a {session.state.value} session cannot collect results"
-                )
-            if session.host_session_ref is None:
-                raise SessionOperatorContractError("the session has no host reference")
-            results = await operator.collect_results(
-                CollectResultsRequest(
-                    session_id=session.id,
-                    host_session_ref=session.host_session_ref,
-                    cursor=cursor,
-                )
+        intent = await self._begin_host_io(
+            investigation_id,
+            session_id,
+            timestamp=timestamp,
+            operation="collect results",
+            allow_reconciliation_retry=False,
+            require_host_session_ref=True,
+        )
+        results = await operator.collect_results(
+            CollectResultsRequest(
+                session_id=intent.session.id,
+                host_session_ref=intent.session.host_session_ref or "",
+                cursor=cursor,
             )
-            if results.session_id != session.id:
-                raise SessionOperatorContractError("collect_results answered another session")
-            current = session
+        )
+        if results.session_id != intent.session.id:
+            raise SessionOperatorContractError("collect_results answered another session")
+        async with self._uow_factory() as uow:
+            current, task = await self._revalidate_host_io_intent(
+                uow, investigation_id, session_id, intent
+            )
             if results.checkpoint_ref is not None and results.checkpoint_sha256 is not None:
                 current = await self._persist(
                     uow,
@@ -1711,9 +1721,137 @@ class SessionService:
                         results.checkpoint_ref, results.checkpoint_sha256, now=timestamp
                     ),
                 )
-            await self._persist(uow, current.with_last_activity(now=timestamp))
+            current = await self._persist(
+                uow,
+                current.with_state(
+                    self._restored_host_io_state(intent.prior_state, task, preserve_prior=True),
+                    now=timestamp,
+                ),
+            )
             await uow.commit()
             return results
+
+    async def _begin_host_io(
+        self,
+        investigation_id: UUID,
+        session_id: UUID,
+        *,
+        timestamp: datetime,
+        operation: str,
+        allow_reconciliation_retry: bool,
+        require_host_session_ref: bool,
+    ) -> _SessionHostIoIntent:
+        """Commit the durable in-flight marker before any host UDS round trip.
+
+        ``reconciling`` is the existing session aggregate state for an outcome
+        that must be confirmed with the host. Its state version plus the host
+        request's deterministic idempotency identity make retry safe after a
+        process crash; no separate intent table is needed.
+        """
+        async with self._uow_factory() as uow:
+            await uow.investigation_tasks.lock_investigation(investigation_id)
+            session = await self._session_for(uow, investigation_id, session_id)
+            task = await self._locked_task(uow, investigation_id, session.task_id)
+            session = await self._session_for(uow, investigation_id, session_id)
+            if not session.is_active:
+                raise SessionStateConflictError(
+                    f"a {session.state.value} session cannot {operation}"
+                )
+            if session.state is AgentSessionState.RECONCILING and not allow_reconciliation_retry:
+                raise SessionStateConflictError(
+                    "the session requires reconciliation before another host operation"
+                )
+            if require_host_session_ref and session.host_session_ref is None:
+                raise SessionOperatorContractError("the session has no host reference")
+            self._require_host_io_lease(session, task)
+            self._require_instruction_authority(
+                session, task, await uow.investigation_tasks.database_now()
+            )
+            prior_state = session.state
+            if prior_state is not AgentSessionState.RECONCILING:
+                session = await self._persist(
+                    uow,
+                    session.with_state(AgentSessionState.RECONCILING, now=timestamp),
+                )
+            await uow.commit()
+            return _SessionHostIoIntent(
+                session=session,
+                prior_state=prior_state,
+                task_lease_id=task.lease_id,
+                task_lease_session_id=task.lease_session_id,
+                task_lease_fence=task.lease_fence,
+                task_status=task.status,
+                task_status_version=task.status_version,
+            )
+
+    async def _revalidate_host_io_intent(
+        self,
+        uow: SessionUnitOfWork,
+        investigation_id: UUID,
+        session_id: UUID,
+        intent: _SessionHostIoIntent,
+    ) -> tuple[AgentSessionV1, InvestigationTaskV1]:
+        """Re-read the committed intent under advisory/task locks before apply."""
+        await uow.investigation_tasks.lock_investigation(investigation_id)
+        current = await self._session_for(uow, investigation_id, session_id)
+        task = await self._locked_task(uow, investigation_id, current.task_id)
+        current = await self._session_for(uow, investigation_id, session_id)
+        if (
+            current.state is not AgentSessionState.RECONCILING
+            or current.state_version != intent.session.state_version
+        ):
+            raise SessionStateConflictError(
+                "the session changed while the host operation was in flight"
+            )
+        if (
+            task.lease_id != intent.task_lease_id
+            or task.lease_session_id != intent.task_lease_session_id
+            or task.lease_fence != intent.task_lease_fence
+            or task.status is not intent.task_status
+            or task.status_version != intent.task_status_version
+        ):
+            raise SessionStateConflictError(
+                "the task lease or version changed while the host operation was in flight"
+            )
+        self._require_host_io_lease(current, task)
+        self._require_instruction_authority(
+            current, task, await uow.investigation_tasks.database_now()
+        )
+        return current, task
+
+    @staticmethod
+    def _require_host_io_lease(session: AgentSessionV1, task: InvestigationTaskV1) -> None:
+        """Require the task's current lease to agree with the session mirror."""
+        if task.lease_id is None:
+            if session.task_lease_id is not None:
+                raise SessionStateConflictError("the session lease was released or superseded")
+            return
+        if (
+            task.lease_session_id != session.id
+            or session.task_lease_id != task.lease_id
+            or session.task_lease_fence != task.lease_fence
+        ):
+            raise SessionStateConflictError("the session lease was superseded")
+
+    @staticmethod
+    def _restored_host_io_state(
+        prior_state: AgentSessionState,
+        task: InvestigationTaskV1,
+        *,
+        preserve_prior: bool,
+    ) -> AgentSessionState:
+        if prior_state is not AgentSessionState.RECONCILING:
+            if preserve_prior or prior_state in (
+                AgentSessionState.RUNNING,
+                AgentSessionState.AWAITING_INSTRUCTION,
+            ):
+                return prior_state
+            return AgentSessionState.RUNNING
+        if task.status is TaskStatus.AWAITING_INPUT:
+            return AgentSessionState.AWAITING_INSTRUCTION
+        if task.status is TaskStatus.RUNNING:
+            return AgentSessionState.RUNNING
+        return AgentSessionState.READY
 
     async def close(
         self,

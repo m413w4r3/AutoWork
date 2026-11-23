@@ -200,6 +200,7 @@ SESSION_STATE_TRANSITIONS: Mapping[AgentSessionState, frozenset[AgentSessionStat
     AgentSessionState.PROVISIONING: frozenset(
         {
             AgentSessionState.READY,
+            AgentSessionState.RECONCILING,
             AgentSessionState.FAILED,
             AgentSessionState.LOST,
         }
@@ -207,6 +208,7 @@ SESSION_STATE_TRANSITIONS: Mapping[AgentSessionState, frozenset[AgentSessionStat
     AgentSessionState.READY: frozenset(
         {
             AgentSessionState.RUNNING,
+            AgentSessionState.RECONCILING,
             AgentSessionState.STOPPED,
             AgentSessionState.LOST,
             AgentSessionState.FAILED,
@@ -237,6 +239,7 @@ SESSION_STATE_TRANSITIONS: Mapping[AgentSessionState, frozenset[AgentSessionStat
     ),
     AgentSessionState.INTERRUPT_REQUESTED: frozenset(
         {
+            AgentSessionState.RECONCILING,
             AgentSessionState.STOPPED,
             AgentSessionState.RUNNING,
             AgentSessionState.LOST,
@@ -262,9 +265,11 @@ SESSION_STATE_TRANSITIONS: Mapping[AgentSessionState, frozenset[AgentSessionStat
     ),
     AgentSessionState.RECONCILING: frozenset(
         {
+            AgentSessionState.PROVISIONING,
             AgentSessionState.READY,
             AgentSessionState.RUNNING,
             AgentSessionState.AWAITING_INSTRUCTION,
+            AgentSessionState.INTERRUPT_REQUESTED,
             AgentSessionState.STOPPED,
             AgentSessionState.LOST,
             AgentSessionState.FAILED,
@@ -750,6 +755,9 @@ class OperatorResultsV1(_WireModel):
 class ReconcileSessionRequest(_WireModel):
     session_id: UUID
     host_session_ref: str | None = Field(default=None, max_length=1024)
+    # Internal host request identity derived from the durable session version.
+    # The HTTP route does not expose this field.
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class SessionReconciliationV1(_WireModel):
