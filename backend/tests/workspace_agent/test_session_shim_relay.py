@@ -144,6 +144,10 @@ class CountingBackend:
             raise self.error
         return self.response
 
+    def cancel(self) -> None:
+        """The relay cancels in-flight calls on revoke; this fake finishes fast."""
+        return None
+
 
 class DroppingFakeRelay:
     """A UDS listener that records exactly one full request, then hangs up."""

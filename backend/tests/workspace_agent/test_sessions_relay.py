@@ -107,12 +107,18 @@ class RecordingTransport:
         self.error = error
         self.gate = gate
         self.entered = threading.Event()
+        self.cancelled = threading.Event()
         self._lock = threading.Lock()
 
     @property
     def call_count(self) -> int:
         with self._lock:
             return len(self.calls)
+
+    def cancel(self) -> None:
+        self.cancelled.set()
+        if self.gate is not None:
+            self.gate.set()
 
     def send(
         self,
@@ -621,6 +627,85 @@ def test_relay_refuses_inactive_or_revoked_session(
     gate.set()
 
 
+class _CancellableSlowTransport:
+    """A backend call that only returns when the relay cancels it."""
+
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.cancelled = threading.Event()
+        self.finished = threading.Event()
+        self.calls = 0
+
+    def send(
+        self,
+        *,
+        method: str,
+        path: str,
+        headers: Mapping[str, str],
+        body: bytes,
+        timeout: float,
+    ) -> relay.RelayResponse:
+        del method, path, headers, body, timeout
+        self.calls += 1
+        self.entered.set()
+        interrupted = self.cancelled.wait(10)
+        self.finished.set()
+        if interrupted:
+            raise relay.BackendOutcomeUnknown()
+        return relay.RelayResponse(status=200, content_type="application/json", body=b'{"ok":true}')
+
+    def cancel(self) -> None:
+        self.cancelled.set()
+
+
+def test_revoke_cancels_the_in_flight_backend_request(
+    relay_factory: Callable[..., relay.BrokerRelay],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = _CancellableSlowTransport()
+    server = relay_factory(FakeSessionState(), transport)  # type: ignore[arg-type]
+    rejections: list[relay.RelayRejection] = []
+
+    def record(
+        self: relay.BrokerRelay, connection: socket.socket, rejection: relay.RelayRejection
+    ) -> None:
+        # The agent socket is aborted at the same time; record the typed
+        # outcome the relay would deliver instead of racing the write.
+        del self, connection
+        rejections.append(rejection)
+
+    monkeypatch.setattr(relay.BrokerRelay, "_write_error", record)
+    received: list[bytes] = []
+    client = threading.Thread(
+        target=lambda: received.append(
+            _call(server.socket_path, target=_tool_target(), body=_tool_body())
+        ),
+        name="relay-cancelled-client",
+    )
+    client.start()
+    assert transport.entered.wait(5)
+    time.sleep(0.2)  # revoke at t=0.2 s, while the backend call is in flight
+    started = time.monotonic()
+    server.revoke()
+    client.join(5)
+    elapsed = time.monotonic() - started
+    assert not client.is_alive()
+    assert elapsed < 2.0  # the 10 s slow send was interrupted
+    assert transport.cancelled.is_set()
+    assert transport.finished.is_set()
+    _wait_until(lambda: bool(rejections))
+    rejection = rejections[-1]
+    assert rejection.code in (
+        relay.RelayErrorCode.BACKEND_OUTCOME_UNKNOWN,
+        relay.RelayErrorCode.SESSION_INACTIVE,
+    )
+    if rejection.code is relay.RelayErrorCode.BACKEND_OUTCOME_UNKNOWN:
+        assert rejection.details["outcome_unknown"] is True
+    raw = received[0] if received else b""
+    # A cancelled call is never reported as a successful operation.
+    assert not raw.startswith(b"HTTP/1.1 200")
+
+
 # ---------------------------------------------------------------------------
 # NET-07: backend failure taxonomy, never retried
 # ---------------------------------------------------------------------------
@@ -969,6 +1054,48 @@ def test_relay_times_out_an_incomplete_request(
     assert cast(dict[str, object], payload["details"])["not_sent"] is True
 
 
+def test_response_write_timeout_after_forward_is_outcome_unknown(
+    relay_factory: Callable[..., relay.BrokerRelay],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = b"x" * (4 * 1024 * 1024)
+    transport = RecordingTransport(
+        response=relay.RelayResponse(status=200, content_type="application/octet-stream", body=body)
+    )
+    recorded: list[relay.RelayRejection] = []
+
+    def record(
+        self: relay.BrokerRelay, connection: socket.socket, rejection: relay.RelayRejection
+    ) -> None:
+        del self, connection
+        recorded.append(rejection)
+
+    monkeypatch.setattr(relay.BrokerRelay, "_write_error", record)
+    server = relay_factory(
+        FakeSessionState(),
+        transport,
+        limits=relay.RelayLimits(request_read_timeout=0.1),
+    )
+    tool_body = _tool_body()
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(5.0)
+        connection.connect(str(server.socket_path))
+        connection.sendall(
+            _request_bytes(
+                method="POST",
+                target=_tool_target(),
+                headers=_default_headers(tool_body),
+                body=tool_body,
+            )
+        )
+        # Never read the 4 MiB response: the relay's write must time out.
+        _wait_until(lambda: bool(recorded), timeout=10.0)
+    assert transport.call_count == 1
+    rejection = recorded[-1]
+    assert rejection.code is relay.RelayErrorCode.TIMEOUT
+    assert rejection.details == {"outcome_unknown": True, "not_sent": False}
+
+
 # ---------------------------------------------------------------------------
 # Binding, manifest, commands and per-tool timeouts
 # ---------------------------------------------------------------------------
@@ -1200,6 +1327,8 @@ class _FakeBackendHandler(BaseHTTPRequestHandler):
             backend.requests.append(
                 {"path": self.path, "headers": dict(self.headers), "body": body}
             )
+        if backend.delay:
+            time.sleep(backend.delay)
         self.send_response(backend.status)
         self.send_header("Content-Type", backend.content_type)
         if backend.location is not None:
@@ -1223,6 +1352,7 @@ class _FakeBackend(ThreadingHTTPServer):
         self.content_type = "application/json"
         self.body = b'{"ok":true}'
         self.location: str | None = None
+        self.delay = 0.0
         self.lock = threading.Lock()
 
 
@@ -1294,3 +1424,31 @@ def test_default_transport_reports_an_unreachable_backend(
     assert status == 503
     assert payload["error"] == "relay_backend_unreachable"
     assert cast(dict[str, object], payload["details"])["not_sent"] is True
+
+
+def test_default_transport_cancel_aborts_the_in_flight_request(
+    fake_backend: _FakeBackend,
+) -> None:
+    fake_backend.delay = 2.0
+    host, port = fake_backend.server_address[:2]
+    target = shim.BackendTarget(host=cast(str, host), port=int(port))
+    transport = relay.HttpBackendTransport(target)
+    outcome: list[BaseException | None] = []
+
+    def call() -> None:
+        try:
+            transport.send(method="POST", path="/api/x", headers={}, body=b"{}", timeout=5.0)
+        except BaseException as exc:
+            outcome.append(exc)
+        else:
+            outcome.append(None)
+
+    worker = threading.Thread(target=call, name="relay-cancelled-send")
+    worker.start()
+    _wait_until(lambda: len(fake_backend.requests) == 1)
+    started = time.monotonic()
+    transport.cancel()
+    worker.join(5)
+    assert not worker.is_alive()
+    assert time.monotonic() - started < 1.0
+    assert outcome and isinstance(outcome[0], relay.BackendTransportError)
