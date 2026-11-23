@@ -813,7 +813,8 @@ class _DatabaseClockOffset:
         self._offset = offset
 
     async def database_now(self) -> datetime:
-        return await self._inner.database_now() + self._offset
+        inner: datetime = await self._inner.database_now()
+        return inner + self._offset
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)

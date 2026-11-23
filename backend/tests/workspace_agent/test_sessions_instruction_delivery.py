@@ -34,7 +34,6 @@ from sidecars.workspace_agent.sessions.supervisor import (
 )
 
 from cti_app.application.agentic_host_sessions import HOST_MAX_INSTRUCTION_BYTES
-
 from tests.workspace_agent.claude_profile_support import (
     claude_argv,
     make_launch_context,

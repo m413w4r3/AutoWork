@@ -215,9 +215,7 @@ def test_failed_run_end_removes_a_surviving_credential_copy(
     scripted_supervisors.append(supervisor)
     _prepare(supervisor, environment)
     script = _session_dir(session_base) / "fake-script.json"
-    script.write_text(
-        json.dumps(fake_script([{"op": "crash", "code": 1}])), encoding="utf-8"
-    )
+    script.write_text(json.dumps(fake_script([{"op": "crash", "code": 1}])), encoding="utf-8")
     os.chmod(script, 0o600)
     planted = _plant_credentials(session_base)
     supervisor.start(
