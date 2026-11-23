@@ -29,6 +29,7 @@ import {
   PLAN_STATE_LABELS,
   ROUTE_STATUS_LABELS,
   bounded,
+  bootstrapEnvelopeBlockedReason,
   formatBytes,
   formatCount,
 } from "./overviewPresentation";
@@ -65,7 +66,7 @@ export function EnvelopeSection({
     proposalError?.code === "bootstrap_proposal_stale" ||
     approvalError?.code === "bootstrap_proposal_stale";
 
-  const blockedReason = approvalBlockedReason(
+  const blockedReason = bootstrapEnvelopeBlockedReason(
     proposal,
     workspaceReady,
     workspaceBlockedReason,
@@ -210,28 +211,6 @@ export function EnvelopeSection({
       ) : null}
     </section>
   );
-}
-
-function approvalBlockedReason(
-  proposal: BootstrapEnvelopeProposalV1 | null,
-  workspaceReady: boolean,
-  workspaceBlockedReason: string | null,
-): string | null {
-  if (!proposal) return null;
-  if (proposal.already_approved) return null;
-  if (!workspaceReady)
-    return (
-      workspaceBlockedReason ??
-      "Le workspace local doit être disponible avant de décider l’enveloppe G2."
-    );
-  if (
-    proposal.plan_state === "blocked" ||
-    proposal.plan_state === "unavailable"
-  )
-    return "Le plan de bootstrap est bloqué ou indisponible : l’enveloppe ne peut pas être approuvée dans cet état.";
-  if (proposal.covered_operations === 0)
-    return "Aucune opération n’est couverte par cette proposition : vérifiez l’inventaire et les capacités locales.";
-  return null;
 }
 
 function AlreadyApproved({

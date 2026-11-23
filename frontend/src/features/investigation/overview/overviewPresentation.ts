@@ -1,15 +1,24 @@
 /** Libellés français et formatage borné de la Vue d’ensemble M24. */
 
 import type {
+  BootstrapEnvelopeProposalV1,
   BootstrapCoverageKind,
   BootstrapPlanState,
   BootstrapReason,
   BootstrapRouteStatus,
   BootstrapSnapshotIocV1,
 } from "../api/bootstrap";
+import type { AgentSessionView } from "../api/agentSessions";
+import type { NoteProposalViewV1 } from "../api/opinionProposals";
+import type { TaskView } from "../api/tasks";
 import type { BudgetDimension } from "../api/types";
-import type { WorkspaceAvailabilityCode } from "../api/workspace";
+import type {
+  WorkspaceAvailabilityCode,
+  WorkspaceConflictViewV1,
+  WorkspaceStatusV1,
+} from "../api/workspace";
 import type { WorkspaceAgentStatus } from "../api/workspaceAgent";
+import type { InvestigationEnvelopeView } from "../../../api/investigationGovernance";
 
 export const PLAN_STATE_LABELS: Record<BootstrapPlanState, string> = {
   empty: "Inventaire vide",
@@ -94,6 +103,184 @@ export const IOC_KIND_LABELS: Record<BootstrapSnapshotIocV1["kind"], string> = {
   url: "URL",
 };
 
+export interface OverviewDecision {
+  key: string;
+  label: string;
+  detail: string;
+  href: string | null;
+}
+
+export interface OverviewDecisionInput {
+  tasks?: readonly Pick<
+    TaskView,
+    "id" | "title" | "status" | "result_verification_status" | "result_refs"
+  >[];
+  proposals?: readonly Pick<
+    NoteProposalViewV1,
+    "id" | "task_id" | "anchor" | "status" | "proposed_text"
+  >[];
+  conflicts?: readonly Pick<
+    WorkspaceConflictViewV1,
+    "conflict_id" | "path" | "task_id"
+  >[];
+  workspace?: Pick<
+    WorkspaceStatusV1,
+    "workspace_state" | "workspace_available"
+  > | null;
+  envelopeProposal?: Pick<
+    BootstrapEnvelopeProposalV1,
+    "already_approved" | "plan_state" | "covered_operations"
+  > | null;
+  envelope?:
+    | (Pick<InvestigationEnvelopeView, "approved"> & {
+        currently_authorized: boolean;
+      })
+    | null;
+  workspaceViewsAvailable?: boolean;
+}
+
+export function bootstrapEnvelopeBlockedReason(
+  proposal: Pick<
+    BootstrapEnvelopeProposalV1,
+    "already_approved" | "plan_state" | "covered_operations"
+  > | null,
+  workspaceReady: boolean,
+  workspaceBlockedReason: string | null,
+): string | null {
+  if (!proposal || proposal.already_approved) return null;
+  if (!workspaceReady)
+    return (
+      workspaceBlockedReason ??
+      "Le workspace local doit être disponible avant de décider l’enveloppe G2."
+    );
+  if (
+    proposal.plan_state === "blocked" ||
+    proposal.plan_state === "unavailable"
+  )
+    return "Le plan de bootstrap est bloqué ou indisponible : l’enveloppe ne peut pas être approuvée dans cet état.";
+  if (proposal.covered_operations === 0)
+    return "Aucune opération n’est couverte par cette proposition : vérifiez l’inventaire et les capacités locales.";
+  return null;
+}
+
+/**
+ * Decision candidates come only from loaded canonical projections. Unknown
+ * projections produce no action; each href points at a view that owns the
+ * corresponding human decision.
+ */
+export function deriveOverviewDecisions(
+  input: OverviewDecisionInput,
+): OverviewDecision[] {
+  const decisions: OverviewDecision[] = [];
+  const viewsAvailable = input.workspaceViewsAvailable ?? true;
+
+  for (const task of input.tasks ?? []) {
+    const needsReview = task.status === "awaiting_review";
+    const needsInput = task.status === "awaiting_input";
+    const needsResultCheck =
+      task.result_refs.length > 0 &&
+      (task.result_verification_status === "unverified" ||
+        task.result_verification_status === "pending_review");
+    if (!needsReview && !needsInput && !needsResultCheck) continue;
+    decisions.push({
+      key: `task:${task.id}`,
+      label: needsInput
+        ? "Répondre à une tâche"
+        : needsReview
+          ? "Examiner une tâche"
+          : "Vérifier un résultat",
+      detail: task.title,
+      href: viewsAvailable
+        ? `?vue=plan&task=${encodeURIComponent(task.id)}`
+        : null,
+    });
+  }
+
+  for (const proposal of input.proposals ?? []) {
+    if (proposal.status !== "proposed" || proposal.proposed_text === null)
+      continue;
+    decisions.push({
+      key: `proposal:${proposal.id}`,
+      label: "Examiner une proposition Bridge",
+      detail: proposal.anchor,
+      href: viewsAvailable ? "?vue=opinion" : null,
+    });
+  }
+
+  for (const conflict of input.conflicts ?? []) {
+    decisions.push({
+      key: `conflict:${conflict.conflict_id}`,
+      label: "Résoudre un conflit de note ou fichier",
+      detail: conflict.path,
+      href: viewsAvailable ? "?vue=workspace" : null,
+    });
+  }
+
+  const workspaceCanApprove =
+    input.workspace?.workspace_state === "bound" &&
+    input.workspace.workspace_available;
+  const proposal = input.envelopeProposal;
+  const envelope = input.envelope;
+  if (
+    proposal &&
+    !proposal.already_approved &&
+    envelope?.approved === false &&
+    workspaceCanApprove &&
+    bootstrapEnvelopeBlockedReason(proposal, workspaceCanApprove, null) === null
+  ) {
+    decisions.push({
+      key: "envelope:approve",
+      label: "Examiner et approuver l’enveloppe G2",
+      detail: `${proposal.covered_operations} opération(s) couverte(s)`,
+      href: "#overview-g2-details",
+    });
+  } else if (envelope?.approved && envelope.currently_authorized) {
+    decisions.push({
+      key: "envelope:extend",
+      label: "Étendre l’enveloppe G2",
+      detail: "Ajuster les autorisations ou les budgets",
+      href: "#overview-g2-details",
+    });
+  }
+
+  return decisions;
+}
+
+export const ACTIVE_AGENT_SESSION_STATES: ReadonlySet<
+  AgentSessionView["state"]
+> = new Set([
+  "provisioning",
+  "ready",
+  "running",
+  "awaiting_instruction",
+  "interrupt_requested",
+  "reconciling",
+]);
+
+export function isActiveAgentSession(session: AgentSessionView): boolean {
+  return ACTIVE_AGENT_SESSION_STATES.has(session.state);
+}
+
+export function isActiveTask(task: Pick<TaskView, "status">): boolean {
+  return !["completed", "cancelled", "failed"].includes(task.status);
+}
+
+export function verificationLabel(
+  task: Pick<TaskView, "result_verification_status"> | undefined,
+): string {
+  if (!task) return "Non vérifié";
+  switch (task.result_verification_status) {
+    case "accepted":
+      return "Accepté après vérification";
+    case "rejected":
+      return "Rejeté après vérification";
+    case "pending_review":
+      return "À vérifier";
+    case "unverified":
+      return "Non vérifié";
+  }
+}
+
 const COUNT_FORMAT = new Intl.NumberFormat("fr-FR");
 
 export function formatCount(value: number): string {
@@ -114,6 +301,18 @@ export function formatBytes(value: number): string {
   return `${new Intl.NumberFormat("fr-FR", {
     maximumFractionDigits: 1,
   }).format(size)} ${unit}`;
+}
+
+export function redactTechnicalIdentifiers(value: string): string {
+  return value
+    .replace(
+      /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/gi,
+      "identifiant masqué",
+    )
+    .replace(
+      /\b(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})\b/gi,
+      "empreinte masquée",
+    );
 }
 
 export function bounded<T>(

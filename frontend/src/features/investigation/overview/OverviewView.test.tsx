@@ -1,5 +1,11 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -27,6 +33,8 @@ const PROPOSAL_SHA = "b".repeat(64);
 const CORRELATION_ID = "11111111-1111-4111-8111-111111111111";
 
 const URLS = {
+  investigation: `/api/investigations/${INVESTIGATION_ID}`,
+  activity: `/api/investigations/${INVESTIGATION_ID}/activity?limit=20`,
   agent: "/api/workspace-agent/status",
   workspace: `/api/investigations/${INVESTIGATION_ID}/workspace`,
   ensure: `/api/investigations/${INVESTIGATION_ID}/workspace/ensure`,
@@ -35,6 +43,11 @@ const URLS = {
   proposal: `/api/investigations/${INVESTIGATION_ID}/bootstrap/envelope-proposal`,
   approve: `/api/investigations/${INVESTIGATION_ID}/bootstrap/envelope/approve`,
   envelope: `/api/investigations/${INVESTIGATION_ID}/envelope`,
+  tasks: `/api/investigations/${INVESTIGATION_ID}/tasks`,
+  sessions: `/api/investigations/${INVESTIGATION_ID}/agent-sessions`,
+  proposals: `/api/investigations/${INVESTIGATION_ID}/note-proposals`,
+  conflicts: `/api/investigations/${INVESTIGATION_ID}/workspace/conflicts`,
+  contributions: `/api/investigations/${INVESTIGATION_ID}/contributions`,
 };
 
 function makeAgent(
@@ -377,6 +390,42 @@ function createFetch(options: FetchOptions) {
   const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = urlOf(input);
     calls.push({ url, init });
+    if (url === URLS.investigation)
+      return Promise.resolve(
+        Response.json({
+          id: INVESTIGATION_ID,
+          subject_id: SUBJECT_ID,
+          status: "running",
+          prose_authority: "bridge_only",
+          findings: [],
+        }),
+      );
+    if (url === URLS.activity)
+      return Promise.resolve(
+        Response.json({
+          investigation: { status: "running" },
+          last_activity_at: "2026-11-22T10:30:00Z",
+          last_activity_source: "Collecte VT",
+          timeline: [
+            {
+              id: "activity-1",
+              version: 1,
+              activity_label: "Collecte VT terminée",
+              status: "succeeded",
+              updated_at: "2026-11-22T10:30:00Z",
+            },
+          ],
+        }),
+      );
+    if (url === URLS.tasks)
+      return Promise.resolve(Response.json({ items: [], total: 0 }));
+    if (url === URLS.sessions) return Promise.resolve(Response.json([]));
+    if (url === URLS.proposals) return Promise.resolve(Response.json([]));
+    if (url === URLS.conflicts)
+      return Promise.resolve(
+        Response.json({ workspace_available: true, conflicts: [] }),
+      );
+    if (url === URLS.contributions) return Promise.resolve(Response.json([]));
     if (url === URLS.agent)
       return Promise.resolve(Response.json(options.agent ?? makeAgent()));
     if (url === URLS.workspace)
@@ -431,15 +480,68 @@ function renderOverview(options: FetchOptions) {
   return { ...result, ...fetchState };
 }
 
+function openOverviewDetails(label: string) {
+  fireEvent.click(screen.getByText(label));
+}
+
 afterEach(() => {
   vi.unstubAllGlobals();
 });
 
 describe("OverviewView", () => {
+  it("met l’article et l’activité en tête, puis replie les identifiants techniques", async () => {
+    const user = userEvent.setup();
+    renderOverview({});
+
+    expect(
+      await screen.findByRole("heading", { name: "Article article-1" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Statut :").parentElement).toHaveTextContent(
+      "En cours",
+    );
+    expect(
+      screen.getByText(/Dernier événement :/).parentElement,
+    ).toHaveTextContent("Collecte VT terminée");
+
+    const overview = screen.getByLabelText("Vue d’ensemble de l’enquête");
+    const visibleOverview = overview.cloneNode(true) as HTMLElement;
+    visibleOverview
+      .querySelectorAll("details")
+      .forEach((details) => details.remove());
+    expect(visibleOverview.textContent).not.toContain(INVESTIGATION_ID);
+    expect(visibleOverview.textContent).not.toContain(SUBJECT_ID);
+    expect(visibleOverview.textContent).not.toContain(SHA256);
+    expect(visibleOverview.textContent).not.toContain(
+      "99999999-9999-4999-8999-999999999999",
+    );
+
+    const technicalDetails = screen
+      .getByText("Détails techniques")
+      .closest("details");
+    expect(technicalDetails).not.toHaveAttribute("open");
+    await user.click(screen.getByText("Détails techniques"));
+    expect(screen.getByText(INVESTIGATION_ID)).toBeVisible();
+    expect(screen.getByText(SUBJECT_ID)).toBeVisible();
+    expect(
+      within(technicalDetails as HTMLElement).getByText("host-agent-1"),
+    ).toBeVisible();
+    expect(
+      within(technicalDetails as HTMLElement).getByText("ws-1"),
+    ).toBeVisible();
+    expect(
+      within(technicalDetails as HTMLElement).getByText("1 / 2"),
+    ).toBeVisible();
+    expect(
+      within(technicalDetails as HTMLElement).getByText(/3 fichier\(s\)/),
+    ).toBeVisible();
+  });
+
   it("bloque l’approbation quand le workspace est absent", async () => {
     const { calls } = renderOverview({
       workspace: makeUnboundWorkspace(),
     });
+    openOverviewDetails("Détails techniques");
+    openOverviewDetails("Autorisations / budgets G2");
 
     expect(await screen.findByText("Workspace local à créer")).toBeTruthy();
     const approveButton = await screen.findByRole("button", {
@@ -461,6 +563,7 @@ describe("OverviewView", () => {
     const { calls } = renderOverview({
       workspace: makeUnboundWorkspace(),
     });
+    openOverviewDetails("Détails techniques");
 
     await user.click(
       await screen.findByRole("button", { name: "Créer le workspace" }),
@@ -480,6 +583,7 @@ describe("OverviewView", () => {
       agent: makeAgent({ status: "unavailable" }),
       workspace: makeUnboundWorkspace(),
     });
+    openOverviewDetails("Détails techniques");
 
     expect(await screen.findByText("Workspace local absent")).toBeTruthy();
     expect(
@@ -490,6 +594,7 @@ describe("OverviewView", () => {
   it("envoie la requête d’approbation G2 avec l’empreinte et l’idempotence", async () => {
     const user = userEvent.setup();
     const { calls } = renderOverview({});
+    openOverviewDetails("Autorisations / budgets G2");
 
     await user.type(
       await screen.findByLabelText(/Motif de la décision/),
@@ -535,6 +640,7 @@ describe("OverviewView", () => {
     renderOverview({
       proposal: { status: 409, code: "bootstrap_proposal_stale" },
     });
+    openOverviewDetails("Autorisations / budgets G2");
 
     expect(await screen.findByText("Proposition expirée")).toBeTruthy();
     expect(screen.getByText("bootstrap_proposal_stale")).toBeTruthy();
@@ -551,6 +657,7 @@ describe("OverviewView", () => {
     renderOverview({
       approval: { status: 409, code: "envelope_conflict" },
     });
+    openOverviewDetails("Autorisations / budgets G2");
 
     await user.type(
       await screen.findByLabelText(/Motif de la décision/),
@@ -572,6 +679,7 @@ describe("OverviewView", () => {
         envelope_version: 2,
       }),
     });
+    openOverviewDetails("Autorisations / budgets G2");
 
     expect(
       await screen.findByText("Enveloppe G2 approuvée — version 2"),
@@ -588,6 +696,7 @@ describe("OverviewView", () => {
 
   it("monte le cycle de vie G2 quand l’enveloppe est approuvée", async () => {
     renderOverview({ envelope: makeGovernanceEnvelope(true) });
+    openOverviewDetails("Autorisations / budgets G2");
 
     expect(
       await screen.findByRole("heading", {
