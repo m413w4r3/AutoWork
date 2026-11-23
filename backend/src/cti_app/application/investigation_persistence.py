@@ -2243,6 +2243,8 @@ class InMemoryAgentSessionRepository:
                 instruction
                 for instruction in self._instructions.values()
                 if instruction.state in INSTRUCTION_PENDING_STATES
+                and (session := self._sessions.get(instruction.session_id)) is not None
+                and session.state in ACTIVE_AGENT_SESSION_STATES
             ),
             key=lambda instruction: (instruction.queued_at, str(instruction.id)),
         )

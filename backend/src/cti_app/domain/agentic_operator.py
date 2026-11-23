@@ -39,6 +39,11 @@ AGENT_SESSION_SCHEMA_VERSION = "agent-session.v1"
 INSTRUCTION_SCHEMA_VERSION = "agent-session-instruction.v1"
 
 AGENT_SESSION_SECRET_NONCE_BYTES = 32
+# Queue/domain bound.  The host delivery capacity is narrower: its 32 KiB
+# instruction block includes the fixed lead-in header (INSTRUCTION-DELIVERY
+# §3.4, ``HOST_MAX_INSTRUCTION_BYTES``).  A longer text is accepted and stays
+# cancellable here; delivery refuses it visibly
+# (``instruction_text_exceeds_host_bound``) instead of truncating it.
 INSTRUCTION_MAX_TEXT_BYTES = 64 * 1024
 RESULT_MAX_TEXT_BYTES = 64 * 1024
 RESULT_MAX_SUMMARY_CHARS = 4096

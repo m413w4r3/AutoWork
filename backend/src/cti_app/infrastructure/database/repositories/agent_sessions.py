@@ -289,10 +289,18 @@ class SqlAlchemyAgentSessionRepository:
         the host stopped; without it the effect is pending (crash between the
         DB commit and the flush).  An already marked ``reconciliation`` is a
         recorded outcome and is never retried automatically.
+
+        The age boundary is ``COALESCE(closed_at, updated_at)``: the D7
+        domain (and the 0023 CHECK) sets ``closed_at`` exactly in
+        ``closed|failed``, so a ``lost`` session has none and its transition
+        time is ``updated_at``.  Filtering on ``closed_at`` alone silently
+        excluded every lost session from the teardown recovery, leaving its
+        CLI and provider credential alive after a crash (R4-F3).
         """
         cutoff = func.statement_timestamp() - func.make_interval(
             0, 0, 0, 0, 0, 0, cast(grace_seconds, Float)
         )
+        released_at = func.coalesce(AgentSessionRow.closed_at, AgentSessionRow.updated_at)
         confirmed = (
             select(InvestigationTaskEventRow.id)
             .where(
@@ -308,11 +316,10 @@ class SqlAlchemyAgentSessionRepository:
                 AgentSessionRow.state.in_(_TERMINAL_SESSION_STATES),
                 AgentSessionRow.host_session_ref.is_not(None),
                 AgentSessionRow.reconciliation.is_(None),
-                AgentSessionRow.closed_at.is_not(None),
-                AgentSessionRow.closed_at <= cutoff,
+                released_at <= cutoff,
                 ~confirmed,
             )
-            .order_by(AgentSessionRow.closed_at, AgentSessionRow.id)
+            .order_by(released_at, AgentSessionRow.id)
             .limit(limit)
         )
         return tuple(_session_from_row(row) for row in rows)
@@ -491,19 +498,30 @@ class SqlAlchemyAgentSessionRepository:
     async def list_pending_instructions(
         self, *, limit: int
     ) -> tuple[AgentSessionInstructionV1, ...]:
-        """Drain candidates (``queued|delivering|delivery_unknown``) in queue order.
+        """Drain candidates of *active* sessions in queue order (F3-D §3.3).
 
-        Matches the partial index ``ix_agent_session_instructions_pending``
-        created by migration 0027, so the backend loop never scans history.
+        The design's candidate is "an active session carrying an instruction
+        ``queued|delivering|delivery_unknown``": rows left by a terminal
+        session can never be delivered and must not occupy the bounded batch,
+        or 50 dead rows would starve every live instruction behind them
+        (R4-F2).  The partial ``ix_agent_session_instructions_pending`` index
+        still drives the scan; the join is on the session primary key.
         """
         if limit < 1:
             raise ValueError("limit must be >= 1")
         rows = await self._session.scalars(
             select(AgentSessionInstructionRow)
+            .join(
+                AgentSessionRow,
+                AgentSessionRow.id == AgentSessionInstructionRow.session_id,
+            )
             .where(
                 AgentSessionInstructionRow.state.in_(
                     tuple(state.value for state in INSTRUCTION_PENDING_STATES)
-                )
+                ),
+                AgentSessionRow.state.in_(
+                    tuple(state.value for state in ACTIVE_AGENT_SESSION_STATES)
+                ),
             )
             .order_by(
                 AgentSessionInstructionRow.queued_at,

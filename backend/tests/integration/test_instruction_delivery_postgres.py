@@ -318,19 +318,20 @@ async def _seed_leased_session(
         await uow.agent_sessions.add(session)
         await uow.commit()
     # The task-side lease names the session row; the FK requires that order.
+    # The lease is stamped by the database clock, and delivery fences it on
+    # that clock (R4-F4), so seed it there rather than with the fixed test NOW.
     async with session_factory() as db:
         await db.execute(
             sa.text(
                 "UPDATE investigation_tasks SET lease_id = :lease_id, "
                 "lease_session_id = :session_id, lease_fence = 1, "
-                "heartbeat_at = :heartbeat, lease_expires_at = :expires "
+                "heartbeat_at = statement_timestamp(), "
+                "lease_expires_at = statement_timestamp() + interval '5 minutes' "
                 "WHERE id = :task_id"
             ),
             {
                 "lease_id": lease_id,
                 "session_id": session_id,
-                "heartbeat": NOW,
-                "expires": NOW + timedelta(minutes=5),
                 "task_id": task.id,
             },
         )

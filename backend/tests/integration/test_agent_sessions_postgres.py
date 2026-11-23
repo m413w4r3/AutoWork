@@ -975,6 +975,133 @@ def test_crash_orphan_is_failed_and_the_task_becomes_openable(
     asyncio.run(run())
 
 
+def test_pending_host_release_repairs_a_lost_session(
+    temporary_postgres_url: str,
+) -> None:
+    """R4-F3: a ``lost`` session has ``closed_at`` NULL but must still be released.
+
+    The D7 domain and the 0023 CHECK set ``closed_at`` exactly in
+    ``closed|failed``; a ``lost`` session is terminal without it.  After a
+    backend crash between the session commit and the host flush, the sweep must
+    re-request teardown for that host reference too, or the CLI and its
+    provider credential can outlive their lease with no durable release.
+    """
+    command.upgrade(_alembic_config(temporary_postgres_url), "head")
+
+    async def run() -> None:
+        engine = create_postgres_engine(temporary_postgres_url)
+        try:
+            factory = create_session_factory(engine)
+            investigation = await _seed_investigation(factory)
+            task = await _seed_task(factory, investigation.id, task_key="lead-lost-release")
+            handoff_id = await _seed_handoff(factory, investigation.id, task.id)
+            old = NOW - timedelta(minutes=10)
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                db_now = await uow.investigation_tasks.database_now()
+                lost = replace(
+                    _session(
+                        investigation.id,
+                        task.id,
+                        handoff_id,
+                        idempotency_key="lost-release",
+                    ),
+                    state=AgentSessionState.LOST,
+                    close_reason="lease_expired",
+                    opened_at=old,
+                    created_at=old,
+                    updated_at=old,
+                )
+                closed = replace(
+                    _session(
+                        investigation.id,
+                        task.id,
+                        handoff_id,
+                        idempotency_key="closed-release",
+                    ),
+                    state=AgentSessionState.CLOSED,
+                    closed_at=old,
+                    opened_at=old,
+                    created_at=old,
+                    updated_at=old,
+                )
+                fresh = replace(
+                    _session(
+                        investigation.id,
+                        task.id,
+                        handoff_id,
+                        idempotency_key="fresh-lost-release",
+                    ),
+                    state=AgentSessionState.LOST,
+                    close_reason="lease_expired",
+                    opened_at=db_now,
+                    created_at=db_now,
+                    updated_at=db_now,
+                )
+                await uow.agent_sessions.add(lost)
+                await uow.agent_sessions.add(closed)
+                await uow.agent_sessions.add(fresh)
+                await uow.commit()
+
+            class _Source:
+                async def list_orphan_sessions(
+                    self, *, grace_seconds: int, limit: int
+                ) -> tuple[AgentSessionV1, ...]:
+                    async with factory() as db_session:
+                        return await SqlAlchemyAgentSessionRepository(
+                            db_session
+                        ).list_orphan_sessions(grace_seconds=grace_seconds, limit=limit)
+
+                async def list_pending_host_release_sessions(
+                    self, *, grace_seconds: int, limit: int
+                ) -> tuple[AgentSessionV1, ...]:
+                    async with factory() as db_session:
+                        return await SqlAlchemyAgentSessionRepository(
+                            db_session
+                        ).list_pending_host_release_sessions(
+                            grace_seconds=grace_seconds, limit=limit
+                        )
+
+            host = _ClosingHost()
+            releases = HostSessionReleaseService(
+                uow_factory=lambda: SqlAlchemyUnitOfWork(factory),
+                host=cast(HostSessionsPort, host),
+                wait_seconds=0.0,
+            )
+            recovered, pending = await recover_orphan_agent_sessions(
+                source=_Source(),
+                uow_factory=lambda: SqlAlchemyUnitOfWork(factory),
+                flush_releases=releases.flush,
+                grace_seconds=60,
+                batch_size=10,
+            )
+            assert recovered == 0
+            assert pending == 2, "the lost and the closed session both await teardown"
+            assert set(host.closed) == {lost.id, closed.id}
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                events = await uow.investigation_tasks.list_events(task.id)
+                stored_fresh = await uow.agent_sessions.get(fresh.id)
+            markers = {event.idempotency_key for event in events}
+            assert f"host-release:{lost.id}" in markers
+            assert f"host-release:{closed.id}" in markers
+            assert f"host-release:{fresh.id}" not in markers
+            assert stored_fresh is not None
+            assert stored_fresh.state is AgentSessionState.LOST
+
+            # The durable marker makes the next pass a clean no-op.
+            _, again = await recover_orphan_agent_sessions(
+                source=_Source(),
+                uow_factory=lambda: SqlAlchemyUnitOfWork(factory),
+                flush_releases=releases.flush,
+                grace_seconds=60,
+                batch_size=10,
+            )
+            assert again == 0
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
 def test_instruction_delivery_repository_cas_and_pending_listing(
     temporary_postgres_url: str,
 ) -> None:
@@ -1113,8 +1240,111 @@ def test_instruction_delivery_repository_cas_and_pending_listing(
     asyncio.run(run())
 
 
-# ------------------------------------------------ instruction actions route
+def test_pending_instruction_listing_ignores_terminal_session_rows(
+    temporary_postgres_url: str,
+) -> None:
+    """R4-F2: dead-session rows never fill the drain batch and starve a live one.
 
+    The design's candidate is a *session active* carrying a pending
+    instruction.  Rows left behind by closed sessions (queued or ambiguous)
+    used to occupy the whole ``limit`` regardless of their session, so 50 dead
+    rows older than a fresh instruction starved it forever.
+    """
+    command.upgrade(_alembic_config(temporary_postgres_url), "head")
+
+    async def run() -> None:
+        engine = create_postgres_engine(temporary_postgres_url)
+        try:
+            factory = create_session_factory(engine)
+            investigation = await _seed_investigation(factory)
+            task = await _seed_task(factory, investigation.id, task_key="lead-starvation")
+            handoff_id = await _seed_handoff(factory, investigation.id, task.id)
+            old = NOW - timedelta(days=1)
+            dead_rows: list[AgentSessionInstructionV1] = []
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                for index in range(51):
+                    dead_session = replace(
+                        _session(
+                            investigation.id,
+                            task.id,
+                            handoff_id,
+                            idempotency_key=f"dead-session-{index}",
+                        ),
+                        state=AgentSessionState.CLOSED,
+                        closed_at=old,
+                        opened_at=old,
+                        created_at=old,
+                        updated_at=old,
+                    )
+                    await uow.agent_sessions.add(dead_session)
+                    text = f"dead instruction {index}"
+                    queued = AgentSessionInstructionV1(
+                        investigation_id=investigation.id,
+                        task_id=task.id,
+                        session_id=dead_session.id,
+                        idempotency_key=f"dead-instruction-{index}",
+                        text=text,
+                        text_sha256=instruction_text_sha256(text),
+                        state=InstructionState.QUEUED,
+                        created_by_kind="human",
+                        created_by_id="analyst:test",
+                        queued_at=old + timedelta(seconds=index),
+                        created_at=old,
+                        updated_at=old,
+                    )
+                    if index % 2 == 0:
+                        instruction = queued
+                    else:
+                        # Half of the dead rows are ambiguous attempts: they
+                        # are equally unresolvable and equally starving.
+                        instruction = queued.with_delivery_reserved(
+                            token=uuid4(),
+                            delivery_sha256=instruction_text_sha256(text),
+                            now=old,
+                        ).with_state(
+                            InstructionState.DELIVERY_UNKNOWN,
+                            now=old,
+                            last_delivery_error="host_transport_error",
+                        )
+                    dead_rows.append(instruction)
+                    await uow.agent_sessions.add_instruction(instruction)
+                live_session = _session(
+                    investigation.id, task.id, handoff_id, idempotency_key="live-session"
+                )
+                await uow.agent_sessions.add(live_session)
+                live_text = "the only live instruction"
+                live = AgentSessionInstructionV1(
+                    investigation_id=investigation.id,
+                    task_id=task.id,
+                    session_id=live_session.id,
+                    idempotency_key="live-instruction",
+                    text=live_text,
+                    text_sha256=instruction_text_sha256(live_text),
+                    state=InstructionState.QUEUED,
+                    created_by_kind="human",
+                    created_by_id="analyst:test",
+                    queued_at=NOW,
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+                await uow.agent_sessions.add_instruction(live)
+                await uow.commit()
+
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                # The 51 dead rows all pre-date the live one, so the unfiltered
+                # (queued_at, id) limit used to return none of the live row.
+                bounded = await uow.agent_sessions.list_pending_instructions(limit=50)
+                assert [item.id for item in bounded] == [live.id]
+                # The rows really exist; only the active-session filter hides them.
+                for dead in dead_rows:
+                    assert await uow.agent_sessions.get_instruction(dead.id) is not None
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+# ------------------------------------------------ instruction actions route
 
 SESSION_KEY = "0123456789abcdef0123456789abcdef"
 
