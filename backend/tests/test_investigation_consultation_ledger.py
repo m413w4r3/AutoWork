@@ -39,6 +39,7 @@ SHA = "a" * 64
 INVESTIGATION_ID = UUID("00000000-0000-0000-0000-000000000501")
 TASK_ID = UUID("00000000-0000-0000-0000-000000000502")
 SESSION_ID = UUID("00000000-0000-0000-0000-000000000503")
+CONTEXT_TASK_ID = UUID("00000000-0000-0000-0000-000000000504")
 
 
 class _PayloadStore:
@@ -96,6 +97,7 @@ async def _seed_consultation(
     requester_id: str | None = "analyst:test",
     task_id: UUID | None = TASK_ID,
     agent_session_id: UUID | None = SESSION_ID,
+    context_task_id: UUID | None = None,
     investigation_id: UUID = INVESTIGATION_ID,
 ) -> ToolInvocation:
     call_blob_id = uuid4()
@@ -141,6 +143,7 @@ async def _seed_consultation(
         actor_id=requester_id if request_actor is not None else None,
         task_id=task_id,
         agent_session_id=agent_session_id,
+        context_task_id=context_task_id,
         created_at=NOW,
         updated_at=NOW,
     )
@@ -336,3 +339,53 @@ async def test_interpretation_and_critique_are_advisory_only() -> None:
     review_entry = entries[editorial.id]
     assert review_entry.advisory_only is False
     assert review_entry.editorial_target == str(opinion_id)
+
+
+async def test_context_task_id_is_projected_and_filterable() -> None:
+    """F4-D B1: a human request's task context is a registry field, not execution."""
+    invocations = InMemoryToolInvocationRepository()
+    observations = InMemoryEvidenceObservationRepository()
+    payloads = _PayloadStore()
+
+    linked = await _seed_consultation(
+        invocations,
+        observations,
+        payloads,
+        consultation_type="critique",
+        task_id=None,
+        agent_session_id=None,
+        context_task_id=CONTEXT_TASK_ID,
+        output={"parse_status": "parsed", "readable": True, "usable": True},
+    )
+    unlinked = await _seed_consultation(
+        invocations,
+        observations,
+        payloads,
+        consultation_type="interpretation",
+        task_id=None,
+        agent_session_id=None,
+        output={"parse_status": "parsed", "readable": True, "usable": True},
+    )
+
+    ledger = InvestigationConsultationLedger(
+        invocations=invocations,
+        observations=observations,
+        artifact_store=payloads,
+    )
+    entries = {
+        entry.invocation_id: entry
+        for entry in await ledger.list_for_investigation(INVESTIGATION_ID)
+    }
+
+    assert entries[linked.id].context_task_id == CONTEXT_TASK_ID
+    assert entries[linked.id].task_id is None
+    assert entries[linked.id].agent_session_id is None
+    assert entries[linked.id].requester_actor_kind is ToolInvocationActorKind.HUMAN
+    assert entries[unlinked.id].context_task_id is None
+
+    filtered = await ledger.list_for_investigation(
+        INVESTIGATION_ID, context_task_id=CONTEXT_TASK_ID
+    )
+    assert [entry.invocation_id for entry in filtered] == [linked.id]
+    assert await ledger.list_for_investigation(INVESTIGATION_ID, context_task_id=uuid4()) == ()
+    assert len(await ledger.list_for_investigation(INVESTIGATION_ID)) == 2

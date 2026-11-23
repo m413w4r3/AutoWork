@@ -891,7 +891,12 @@ def test_decision_check_definition_lists_task_values(
 
 
 def test_tool_invocation_attribution_pair_check(temporary_postgres_url: str) -> None:
-    """The cumulative 0023 pair: an agentic invocation carries task and session."""
+    """The cumulative 0023 pair: an agentic invocation carries task and session.
+
+    F4-D B1 adds ``context_task_id`` for a *human* request's task context.  The
+    execution pair is unchanged, the context is human-only and same-investigation,
+    and the downgrade refuses while a row still exercises it.
+    """
     config = _alembic_config(temporary_postgres_url)
     command.upgrade(config, "head")
 
@@ -901,22 +906,27 @@ def test_tool_invocation_attribution_pair_check(temporary_postgres_url: str) -> 
             factory = create_session_factory(engine)
             investigation = await _seed_investigation(factory)
             task = await _create_task(factory, investigation.id)
+            foreign_investigation = await _seed_investigation(factory)
+            foreign_task = await _create_task(factory, foreign_investigation.id)
+            session_id = uuid4()
+            await _create_agent_session(factory, investigation.id, task.id, session_id)
             insert = (
                 "INSERT INTO tool_invocations "
                 "(id, investigation_id, operation_key, tool_name, schema_version, "
                 "normalized_parameters, purpose, status, reserved_budget, consumed_budget, "
                 "response_refs, created_at, updated_at, version, task_id, actor_kind, "
-                "actor_id, agent_session_id) "
+                "actor_id, agent_session_id, context_task_id) "
                 "VALUES (:id, :investigation_id, :operation_key, 'vt.file_report', "
                 "'vt-file-report.v1', '{}'::jsonb, 'Attribution pair oracle', 'pending', "
                 "'{}'::jsonb, '{}'::jsonb, '[]'::jsonb, :now, :now, 1, :task_id, "
-                ":actor_kind, :actor_id, :agent_session_id)"
+                ":actor_kind, :actor_id, :agent_session_id, :context_task_id)"
             )
             base: dict[str, object] = {
                 "investigation_id": investigation.id,
                 "now": NOW,
                 "actor_kind": "operator",
                 "actor_id": "operator:test",
+                "context_task_id": None,
             }
             await _expect_violation(
                 factory,
@@ -954,26 +964,136 @@ def test_tool_invocation_attribution_pair_check(temporary_postgres_url: str) -> 
                 },
                 sqlstate="23503",
             )
+
+            # The full agentic pair remains valid without a context task.
+            await _execute(
+                factory,
+                insert,
+                {
+                    **base,
+                    "id": uuid4(),
+                    "operation_key": f"agentic-pair-{uuid4()}",
+                    "task_id": task.id,
+                    "agent_session_id": session_id,
+                },
+            )
+            # A human request may cite its task context, without an execution pair.
+            await _execute(
+                factory,
+                insert,
+                {
+                    **base,
+                    "id": uuid4(),
+                    "operation_key": f"human-context-{uuid4()}",
+                    "task_id": None,
+                    "agent_session_id": None,
+                    "actor_kind": "human",
+                    "actor_id": "analyst:test",
+                    "context_task_id": task.id,
+                },
+            )
+            # The context never replaces the execution attribution: an agentic
+            # pair carrying a context task is refused, as is an operator author.
+            await _expect_violation(
+                factory,
+                insert,
+                {
+                    **base,
+                    "id": uuid4(),
+                    "operation_key": f"agentic-context-{uuid4()}",
+                    "task_id": task.id,
+                    "agent_session_id": session_id,
+                    "context_task_id": task.id,
+                },
+                sqlstate="23514",
+            )
+            await _expect_violation(
+                factory,
+                insert,
+                {
+                    **base,
+                    "id": uuid4(),
+                    "operation_key": f"operator-context-{uuid4()}",
+                    "actor_kind": "operator",
+                    "actor_id": "operator:test",
+                    "task_id": None,
+                    "agent_session_id": None,
+                    "context_task_id": task.id,
+                },
+                sqlstate="23514",
+            )
+            # The composite FK keeps the context task inside its investigation.
+            await _expect_violation(
+                factory,
+                insert,
+                {
+                    **base,
+                    "id": uuid4(),
+                    "operation_key": f"foreign-context-{uuid4()}",
+                    "actor_kind": "human",
+                    "actor_id": "analyst:test",
+                    "task_id": None,
+                    "agent_session_id": None,
+                    "context_task_id": foreign_task.id,
+                },
+                sqlstate="23503",
+            )
+            await _expect_violation(
+                factory,
+                insert,
+                {
+                    **base,
+                    "id": uuid4(),
+                    "operation_key": f"unknown-context-{uuid4()}",
+                    "actor_kind": "human",
+                    "actor_id": "analyst:test",
+                    "task_id": None,
+                    "agent_session_id": None,
+                    "context_task_id": uuid4(),
+                },
+                sqlstate="23503",
+            )
         finally:
             await engine.dispose()
 
     asyncio.run(exercise())
 
-    async def check_definition() -> str:
+    async def inspect_schema() -> tuple[dict[str, str], dict[str, tuple[str, ...]], str | None]:
         engine = create_postgres_engine(temporary_postgres_url)
         try:
             async with engine.connect() as connection:
-                checks = await connection.run_sync(
-                    lambda sync: sa.inspect(sync).get_check_constraints("tool_invocations")
+                inspection = await connection.run_sync(
+                    lambda sync: (
+                        {
+                            str(check["name"]): str(check["sqltext"])
+                            for check in sa.inspect(sync).get_check_constraints("tool_invocations")
+                        },
+                        {
+                            str(index["name"]): tuple(
+                                str(column) for column in index["column_names"]
+                            )
+                            for index in sa.inspect(sync).get_indexes("tool_invocations")
+                        },
+                    )
                 )
+                version = await connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                )
+                return inspection[0], inspection[1], version
         finally:
             await engine.dispose()
-        definitions = {
-            check["name"]: str(check["sqltext"]) for check in checks if check.get("name")
-        }
-        return "".join(definitions["ck_tool_invocations_agent_session_pair"].lower().split())
 
-    assert asyncio.run(check_definition()) == "(task_idisnull)=(agent_session_idisnull)"
+    checks, indexes, version = asyncio.run(inspect_schema())
+    assert "".join(checks["ck_tool_invocations_agent_session_pair"].lower().split()) == (
+        "(task_idisnull)=(agent_session_idisnull)"
+    )
+    assert "context_task_id" in checks["ck_tool_invocations_context_task_human"].lower()
+    assert indexes["ix_tool_invocations_context_task"] == ("investigation_id", "context_task_id")
+    assert version == HEAD
+
+    with pytest.raises(RuntimeError, match="refusing to downgrade"):
+        command.downgrade(config, "0027_instruction_delivery")
+    assert _alembic_version(temporary_postgres_url) == HEAD
 
 
 def _contribution_row(

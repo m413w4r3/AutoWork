@@ -113,6 +113,7 @@ from cti_app.domain.investigation import (
     InvestigationEnvelope,
     TLPLevel,
     ToolInvocation,
+    ToolInvocationActorKind,
 )
 from cti_app.domain.investigation_handoff import (
     HandoffActor,
@@ -1721,6 +1722,43 @@ def test_tool_invocation_attribution_pair_check() -> None:
     assert attributed.agent_session_id is not None
     unlinked = ToolInvocation(**common)
     assert unlinked.task_id is None and unlinked.agent_session_id is None
+
+    # F4-D B1: ``context_task_id`` is the human request context, never the
+    # operator execution attribution.  The agentic pair above is unchanged.
+    context_task_id = uuid4()
+    human = ToolInvocation(
+        **common,
+        actor_kind=ToolInvocationActorKind.HUMAN,
+        actor_id="analyst:test",
+        context_task_id=context_task_id,
+    )
+    assert human.context_task_id == context_task_id
+    assert human.task_id is None and human.agent_session_id is None
+    with pytest.raises(ValueError, match="human requester"):
+        ToolInvocation(
+            **common,
+            actor_kind=ToolInvocationActorKind.OPERATOR,
+            actor_id="operator:test",
+            context_task_id=context_task_id,
+        )
+    with pytest.raises(ValueError, match="human requester"):
+        ToolInvocation(**common, context_task_id=context_task_id)
+    with pytest.raises(ValueError, match="not operator execution attribution"):
+        ToolInvocation(
+            **common,
+            actor_kind=ToolInvocationActorKind.HUMAN,
+            actor_id="analyst:test",
+            task_id=uuid4(),
+            agent_session_id=uuid4(),
+            context_task_id=context_task_id,
+        )
+    with pytest.raises(TypeError, match="context_task_id must be a UUID"):
+        ToolInvocation(
+            **common,
+            actor_kind=ToolInvocationActorKind.HUMAN,
+            actor_id="analyst:test",
+            context_task_id="not-a-uuid",  # type: ignore[arg-type]
+        )
 
 
 # --------------------------------------------------------------------- routes

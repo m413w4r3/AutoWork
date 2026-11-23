@@ -107,6 +107,7 @@ class InvestigationConsultationV1(BaseModel):
     requester_actor_id: str | None = None
     task_id: UUID | None = None
     agent_session_id: UUID | None = None
+    context_task_id: UUID | None = None
     call_observation_id: UUID | None = None
     response_observation_id: UUID | None = None
     output_sha256: str | None = None
@@ -369,7 +370,10 @@ class InvestigationConsultationLedger:
         self._decisions = decisions
 
     async def list_for_investigation(
-        self, investigation_id: UUID
+        self,
+        investigation_id: UUID,
+        *,
+        context_task_id: UUID | None = None,
     ) -> tuple[InvestigationConsultationV1, ...]:
         invocations = tuple(
             sorted(
@@ -379,6 +383,7 @@ class InvestigationConsultationLedger:
                         investigation_id
                     )
                     if invocation.tool_name == ADVISOR_TOOL_NAME
+                    and (context_task_id is None or invocation.context_task_id == context_task_id)
                 ),
                 key=lambda invocation: (invocation.created_at, str(invocation.id)),
             )
@@ -403,6 +408,7 @@ class InvestigationConsultationLedger:
                     requester_actor_id=invocation.actor_id,
                     task_id=invocation.task_id,
                     agent_session_id=getattr(invocation, "agent_session_id", None),
+                    context_task_id=invocation.context_task_id,
                     call_observation_id=extract.call_observation_id,
                     response_observation_id=extract.response_observation_id,
                     output_sha256=extract.output_sha256,

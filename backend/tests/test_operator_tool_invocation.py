@@ -89,6 +89,7 @@ from cti_app.domain.investigation import (
     InvestigationBudget,
     InvestigationExecutionMode,
     ToolInvocation,
+    ToolInvocationActorKind,
     ToolInvocationStatus,
     canonical_json_bytes,
 )
@@ -4696,3 +4697,60 @@ async def test_advisor_presend_proof_releases_budget_if_diagnostic_archive_fails
     )
     assert reservation.status.value == "released"
     assert (await snapshots.get(fixture.investigation_id)).budget == envelope.budget
+
+
+@pytest.mark.asyncio
+async def test_invocation_context_task_is_propagated_and_never_inferred() -> None:
+    """F4-D B1: a human request's task context reaches the invocation verbatim."""
+    fixture = _Fixture(
+        responses=[],
+        tools=(
+            (
+                "sample.analyze",
+                "local",
+                ToolEffect.LOCAL_COMPUTE,
+                "sample.analysis.read",
+                {},
+            ),
+        ),
+    )
+    state = await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
+    service = _service(fixture)
+    context_task_id = uuid4()
+
+    result = await service.invoke(
+        tool_name="sample.analyze",
+        schema_version="1",
+        arguments={"query": "answer the task's question"},
+        purpose="Answer one task-scoped local question.",
+        expected_version=state.version,
+        expected_sha256=state.sha256,
+        idempotency_key="context-task-propagated",
+        actor_id="analyst:test",
+        requester_actor_kind=ToolInvocationActorKind.HUMAN,
+        context_task_id=context_task_id,
+    )
+
+    stored = await fixture.invocations.get(result.invocation.id)
+    assert stored is not None
+    assert stored.context_task_id == context_task_id
+    assert stored.task_id is None and stored.agent_session_id is None
+    assert stored.actor_kind is ToolInvocationActorKind.HUMAN
+
+    with pytest.raises(OperatorToolInvocationError) as invalid:
+        await service.invoke(
+            tool_name="sample.analyze",
+            schema_version="1",
+            arguments={"query": "agentic execution"},
+            purpose="Run an operator execution.",
+            expected_version=state.version,
+            expected_sha256=state.sha256,
+            idempotency_key="context-task-agentic",
+            actor_id="codex:operator",
+            requester_actor_kind=ToolInvocationActorKind.OPERATOR,
+            task_id=uuid4(),
+            agent_session_id=uuid4(),
+            context_task_id=context_task_id,
+        )
+    assert invalid.value.code == "invocation_attribution_invalid"
+    assert fixture.tools["sample.analyze"].calls == [{"query": "answer the task's question"}]
