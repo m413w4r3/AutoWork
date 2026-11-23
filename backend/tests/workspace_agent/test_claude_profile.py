@@ -204,6 +204,10 @@ def test_claude_restricted_tools_only(tmp_path: Path) -> None:
     assert shim_copy.is_relative_to(context.config_directory)
     assert (shim_copy.stat().st_mode & 0o777) == 0o700
     assert shim_copy.read_bytes() == (SESSIONS_PACKAGE / "shim.py").read_bytes()
+    # H0: the shim imports its catalogue as a sibling; both must be installed.
+    catalog_copy = context.config_directory / "catalog.py"
+    assert catalog_copy.read_bytes() == (SESSIONS_PACKAGE / "catalog.py").read_bytes()
+    assert (catalog_copy.stat().st_mode & 0o777) == 0o700
     assert sorted(server["env"]) == [
         "AUTOWORK_BROKER_SOCKET",
         "AUTOWORK_SESSION_ID",

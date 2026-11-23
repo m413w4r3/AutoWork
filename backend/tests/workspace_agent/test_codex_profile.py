@@ -512,11 +512,6 @@ def test_real_adapters_share_the_relay_transport_contract(
             (context.config_directory / "codex" / "config.toml").read_text(encoding="utf-8")
         )
         server = document["mcp_servers"]["autowork"]
-        # The MCP config names the installed shim; production wiring installs it
-        # (the adapter's contract is the path, not the install).
-        (context.config_directory / "shim.py").write_bytes(
-            (SESSIONS_PACKAGE / "shim.py").read_bytes()
-        )
     else:
         profile = ClaudeProfile(
             binary=claude_profile_support.write_fake_claude(tmp_path / "bin"),
@@ -548,6 +543,11 @@ def test_real_adapters_share_the_relay_transport_contract(
     # Both adapters register the same shim module, hence the same closed
     # `catalog.CATALOGUE`; neither invents a second MCP server.
     assert Path(server["args"][0]).read_bytes() == (SESSIONS_PACKAGE / "shim.py").read_bytes()
+    # H0: the shim imports its catalogue as a sibling; a lone shim.py fails at
+    # CLI startup, so the adapter installs both files it names.
+    catalog_copy = context.config_directory / "catalog.py"
+    assert catalog_copy.read_bytes() == (SESSIONS_PACKAGE / "catalog.py").read_bytes()
+    assert catalog_copy.stat().st_mode & 0o777 == 0o700
     assert "AUTOWORK_BACKEND_URL" not in plan.env
     assert "AUTOWORK_BACKEND_URL" not in server["env"]
     assert not any("proxy" in key.lower() for key in plan.env)
@@ -556,6 +556,34 @@ def test_real_adapters_share_the_relay_transport_contract(
     parameters = inspect.signature(type(profile)).parameters
     assert "broker_socket" not in parameters
     assert "backend_url" not in parameters
+
+
+def test_codex_installs_the_exact_shim_and_catalogue(tmp_path: Path) -> None:
+    """H0: the generated config names files that must exist at CLI startup.
+
+    The shim imports ``catalog`` as a sibling; a config that names only a
+    non-installed (or placeholder) ``shim.py`` leaves ``codex exec`` with a
+    dead MCP server.  The adapter installs both exact modules, 0700.
+    """
+    fake = _install_fake_codex(tmp_path)
+    stub = _install_stub_bwrap(tmp_path)
+    profile = CodexProfile(binary=fake, bwrap=stub)
+    context = _make_context(tmp_path)
+    assert (context.config_directory / "shim.py").read_text(encoding="utf-8") == (
+        "# shim placeholder\n"
+    )
+    profile.build_launch_plan(context)
+    for name in ("shim.py", "catalog.py"):
+        copied = context.config_directory / name
+        assert copied.is_file()
+        assert copied.read_bytes() == (SESSIONS_PACKAGE / name).read_bytes()
+        assert copied.stat().st_mode & 0o777 == 0o700
+    document = tomllib.loads(
+        (context.config_directory / "codex" / "config.toml").read_text(encoding="utf-8")
+    )
+    assert Path(document["mcp_servers"]["autowork"]["args"][0]) == (
+        context.config_directory / "shim.py"
+    )
 
 
 def test_codex_prompt_carries_preamble_and_handoff_reference(tmp_path: Path) -> None:

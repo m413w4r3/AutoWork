@@ -61,6 +61,10 @@ CODEX_HOME_DIRECTORY = "codex"
 CONFIG_FILE_NAME = "config.toml"
 AUTH_FILE_NAME = "auth.json"
 SHIM_FILE_NAME = "shim.py"
+CATALOG_FILE_NAME = "catalog.py"
+# The stdlib modules the generated MCP server is exactly: the shim imports its
+# closed catalogue as a sibling, so both are installed into the session config.
+SESSIONS_PACKAGE = Path(__file__).resolve().parent.parent
 HANDOFF_FILE_NAME = "handoff.json"
 FINAL_MESSAGE_FILE_NAME = "final-message.txt"
 SKILLS_DIRECTORY_NAME = "skills"
@@ -505,6 +509,7 @@ class CodexProfile:
         codex_home = context.config_directory / CODEX_HOME_DIRECTORY
         _ensure_private_directory(codex_home)
         self._write_codex_config(context, codex_home)
+        self._install_shim(context.config_directory)
         self._install_auth(codex_home)
         final_message_path = context.work_directory / FINAL_MESSAGE_FILE_NAME
         cli_argv = self._cli_argv(context, facts, final_message_path)
@@ -653,6 +658,24 @@ class CodexProfile:
             f"env = {{ {inline_env} }}\n"
         )
         _write_private_bytes(codex_home / CONFIG_FILE_NAME, content.encode("utf-8"))
+
+    def _install_shim(self, config_directory: Path) -> None:
+        """Install the generated MCP server exactly as its ``config.toml`` names it.
+
+        The shim is a standalone stdlib script that imports its closed
+        catalogue (``catalog.py``) as a sibling, so a config directory naming
+        only ``shim.py`` would fail at CLI startup (H0 host spike,
+        2026-11-23). Both files are copied from this package on every launch.
+        """
+        for name in (SHIM_FILE_NAME, CATALOG_FILE_NAME):
+            source = SESSIONS_PACKAGE / name
+            try:
+                data = source.read_bytes()
+            except OSError as exc:
+                raise CapabilityUnavailableError(self.adapter_kind) from exc
+            target = config_directory / name
+            _write_private_bytes(target, data)
+            os.chmod(target, 0o700)
 
     def _install_auth(self, codex_home: Path) -> None:
         source = self._auth_file

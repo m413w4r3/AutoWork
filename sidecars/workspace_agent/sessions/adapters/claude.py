@@ -77,7 +77,9 @@ MAX_TOOL_NAME_BYTES = 128
 MCP_SERVER_NAME = "autowork"
 MCP_CONFIG_FILE_NAME = "claude-mcp.json"
 MCP_SHIM_FILE_NAME = "shim.py"
+MCP_CATALOG_FILE_NAME = "catalog.py"
 MCP_SHIM_SOURCE = Path(__file__).resolve().parent.parent / "shim.py"
+MCP_CATALOG_SOURCE = Path(__file__).resolve().parent.parent / "catalog.py"
 MCP_PYTHON_CANDIDATES: tuple[str, ...] = (
     "/usr/bin/python3.12",
     "/usr/bin/python3",
@@ -992,30 +994,41 @@ class ClaudeProfile:
         return mcp_config_path
 
     def _copy_shim(self, config: Path) -> Path:
-        try:
-            source = MCP_SHIM_SOURCE.read_bytes()
-        except OSError as exc:
-            raise CapabilityUnavailableError(ADAPTER_KIND) from exc
-        target = config / MCP_SHIM_FILE_NAME
-        try:
-            fd = os.open(
-                target,
-                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC,
-                0o700,
-            )
+        # The shim imports its closed catalogue as a sibling; a lone shim.py
+        # fails at CLI startup (H0 host spike, 2026-11-23). Both are copied
+        # 0700 on every launch.
+        target: Path | None = None
+        for source_path, name in (
+            (MCP_SHIM_SOURCE, MCP_SHIM_FILE_NAME),
+            (MCP_CATALOG_SOURCE, MCP_CATALOG_FILE_NAME),
+        ):
             try:
-                os.fchmod(fd, 0o700)
-                view = memoryview(source)
-                while view:
-                    written = os.write(fd, view)
-                    if written <= 0:
-                        raise OSError("the session shim write made no progress")
-                    view = view[written:]
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-        except OSError as exc:
-            raise SessionError("the session shim cannot be installed") from exc
+                source = source_path.read_bytes()
+            except OSError as exc:
+                raise CapabilityUnavailableError(ADAPTER_KIND) from exc
+            destination = config / name
+            try:
+                fd = os.open(
+                    destination,
+                    os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    0o700,
+                )
+                try:
+                    os.fchmod(fd, 0o700)
+                    view = memoryview(source)
+                    while view:
+                        written = os.write(fd, view)
+                        if written <= 0:
+                            raise OSError("the session shim write made no progress")
+                        view = view[written:]
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except OSError as exc:
+                raise SessionError("the session shim cannot be installed") from exc
+            if name == MCP_SHIM_FILE_NAME:
+                target = destination
+        assert target is not None
         return target
 
     def _resolve_mcp_python(self) -> str:
