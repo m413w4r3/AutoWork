@@ -177,68 +177,82 @@ export function ConflictsPanel({
 }) {
   const conflicts = useWorkspaceConflicts(investigationId);
   const resolve = useResolveWorkspaceConflict(investigationId);
+  const conflictCount = conflicts.data?.conflicts.length;
+  const summary = conflicts.isPending
+    ? "Conflits — chargement"
+    : conflicts.error !== null
+      ? "Conflits — lecture impossible"
+      : conflicts.data?.workspace_available === false
+        ? "Conflits — workspace indisponible"
+        : conflictCount === 0
+          ? "Conflits — aucun conflit non résolu"
+          : `Conflits — ${conflictCount ?? 0} non résolu${conflictCount === 1 ? "" : "s"}`;
 
   return (
     <section
-      className="workspace-notes__section"
+      className="workspace-notes__conflicts"
       aria-label="Conflits du workspace"
     >
-      <h2>Conflits</h2>
-      <p className="workspace-notes__meta">
-        Chaque conflit garde les deux versions ; la résolution envoie les deux
-        SHA-256 attendus et enregistre une décision humaine.
-      </p>
-      {conflicts.isPending ? (
-        <p role="status">Chargement des conflits…</p>
-      ) : null}
-      {conflicts.error !== null ? (
-        <p className="error-message" role="alert">
-          {workshopErrorText(
-            conflicts.error,
-            "Les conflits n’ont pas pu être lus.",
+      <details className="workspace-notes__conflicts-details">
+        <summary>{summary}</summary>
+        <div className="workspace-notes__conflicts-content">
+          <p className="workspace-notes__meta">
+            Chaque conflit garde les deux versions ; la résolution envoie les
+            deux SHA-256 attendus et enregistre une décision humaine.
+          </p>
+          {conflicts.isPending ? (
+            <p role="status">Chargement des conflits…</p>
+          ) : null}
+          {conflicts.error !== null ? (
+            <p className="error-message" role="alert">
+              {workshopErrorText(
+                conflicts.error,
+                "Les conflits n’ont pas pu être lus.",
+              )}
+            </p>
+          ) : null}
+          {conflicts.data?.workspace_available === false ? (
+            <p className="workspace-notes__blocked" role="status">
+              Workspace local indisponible — les conflits ne peuvent pas être
+              relus ni résolus.
+            </p>
+          ) : null}
+          {conflicts.data !== undefined &&
+          conflicts.data.workspace_available &&
+          conflicts.data.conflicts.length === 0 ? (
+            <p>Aucun conflit non résolu.</p>
+          ) : null}
+          {conflicts.data?.conflicts.map((conflict) => (
+            <ConflictCard
+              key={conflict.conflict_id}
+              conflict={conflict}
+              pending={resolve.isPending}
+              onResolve={(input) =>
+                resolve.mutate({ conflictId: conflict.conflict_id, input })
+              }
+            />
+          ))}
+          {resolve.isPending ? <p role="status">Résolution en cours…</p> : null}
+          {resolve.error !== null ? (
+            <p className="error-message" role="alert">
+              {workshopErrorText(
+                resolve.error,
+                "La résolution du conflit a été refusée.",
+              )}
+            </p>
+          ) : null}
+          {resolve.data === undefined ? null : (
+            <p role="status">
+              Décision enregistrée : <code>{resolve.data.decision_id}</code> ·{" "}
+              {labelOf(CONFLICT_CHOICE_LABELS, resolve.data.choice)}
+              {resolve.data.result_revision === null
+                ? ""
+                : ` · révision ${resolve.data.result_revision.revision_id}`}
+              .
+            </p>
           )}
-        </p>
-      ) : null}
-      {conflicts.data?.workspace_available === false ? (
-        <p className="workspace-notes__blocked" role="status">
-          Workspace local indisponible — les conflits ne peuvent pas être relus
-          ni résolus.
-        </p>
-      ) : null}
-      {conflicts.data !== undefined &&
-      conflicts.data.workspace_available &&
-      conflicts.data.conflicts.length === 0 ? (
-        <p>Aucun conflit non résolu.</p>
-      ) : null}
-      {conflicts.data?.conflicts.map((conflict) => (
-        <ConflictCard
-          key={conflict.conflict_id}
-          conflict={conflict}
-          pending={resolve.isPending}
-          onResolve={(input) =>
-            resolve.mutate({ conflictId: conflict.conflict_id, input })
-          }
-        />
-      ))}
-      {resolve.isPending ? <p role="status">Résolution en cours…</p> : null}
-      {resolve.error !== null ? (
-        <p className="error-message" role="alert">
-          {workshopErrorText(
-            resolve.error,
-            "La résolution du conflit a été refusée.",
-          )}
-        </p>
-      ) : null}
-      {resolve.data === undefined ? null : (
-        <p role="status">
-          Décision enregistrée : <code>{resolve.data.decision_id}</code> ·{" "}
-          {labelOf(CONFLICT_CHOICE_LABELS, resolve.data.choice)}
-          {resolve.data.result_revision === null
-            ? ""
-            : ` · révision ${resolve.data.result_revision.revision_id}`}
-          .
-        </p>
-      )}
+        </div>
+      </details>
     </section>
   );
 }

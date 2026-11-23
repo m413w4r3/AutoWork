@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type {
+  NoteAgentContinuationResponseV1,
   NoteRevisionViewV1,
   NoteViewResponseV1,
   WorkspaceConflictListV1,
@@ -30,6 +31,10 @@ const SHA_A = "a".repeat(64);
 const SHA_B = "b".repeat(64);
 const SHA_C = "c".repeat(64);
 const SHA_D = "d".repeat(64);
+const originalClipboard = Object.getOwnPropertyDescriptor(
+  navigator,
+  "clipboard",
+);
 
 const binding = {
   workspace_id: "ws-1",
@@ -170,6 +175,15 @@ const noteContent = {
   metadata_only: false,
   text: "# Hypothèse\n\nLe domaine pourrait être un leurre.",
   content_base64: null,
+} satisfies WorkspaceContentViewV1;
+
+const planContent = {
+  ...noteContent,
+  path: planFile.path,
+  revision_id: planFile.revision_id,
+  sha256: planFile.sha256,
+  size: planFile.size,
+  text: "# Plan initial\n\nÉtapes de travail.",
 } satisfies WorkspaceContentViewV1;
 
 const conflict = {
@@ -409,6 +423,18 @@ const bridgeReviewFixture = {
   is_evidence: false,
 } as const;
 
+const agentContinuation = {
+  investigation_id: "inv-1",
+  note_revision_id: noteFile.revision_id,
+  note_sha256: SHA_B,
+  note_path: noteFile.path,
+  task_id: "task-1",
+  session_id: "session-1",
+  instruction_id: "instruction-1",
+  instruction_state: "queued",
+  instruction_sha256: SHA_C,
+} satisfies NoteAgentContinuationResponseV1;
+
 const writeResult = {
   investigation_id: "inv-1",
   workspace_id: "ws-1",
@@ -466,6 +492,7 @@ function makeHandler(options: HandlerOptions = {}) {
   return (request: RecordedRequest): Response => {
     const { url } = request;
     const method = request.init?.method ?? "GET";
+    const parsedUrl = new URL(url, "http://localhost");
     if (url === "/api/workspace-agent/status") {
       return jsonResponse({ status: agentStatus, instance_id: "instance-1" });
     }
@@ -478,13 +505,28 @@ function makeHandler(options: HandlerOptions = {}) {
       return jsonResponse(sessions === "active" ? [activeSessionFixture] : []);
     }
     if (url.includes("/ask-bridge")) return jsonResponse(bridgeReviewFixture);
+    if (url.includes("/ask-agent")) return jsonResponse(agentContinuation);
     if (url.endsWith("/workspace")) return jsonResponse(status);
-    if (url.includes("/workspace/files/content"))
-      return jsonResponse(noteContent);
+    if (url.includes("/workspace/files/content")) {
+      return jsonResponse(
+        parsedUrl.searchParams.get("path") === planFile.path
+          ? planContent
+          : noteContent,
+      );
+    }
     if (url.endsWith("/workspace/files") && method === "PUT") {
       return jsonResponse(writeResult);
     }
-    if (url.includes("/workspace/files")) return jsonResponse(files);
+    if (url.includes("/workspace/files")) {
+      const prefix = parsedUrl.searchParams.get("prefix");
+      return jsonResponse({
+        ...files,
+        files:
+          prefix === null
+            ? files.files
+            : files.files.filter((file) => file.path.startsWith(prefix)),
+      });
+    }
     if (url.includes("/workspace/conflicts/") && url.endsWith("/resolve")) {
       return jsonResponse(resolution);
     }
@@ -510,6 +552,11 @@ function renderView(handler: (request: RecordedRequest) => Response) {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  if (originalClipboard === undefined) {
+    Reflect.deleteProperty(navigator, "clipboard");
+  } else {
+    Object.defineProperty(navigator, "clipboard", originalClipboard);
+  }
 });
 
 describe("WorkspaceNotesView", () => {
@@ -539,9 +586,7 @@ describe("WorkspaceNotesView", () => {
     const user = userEvent.setup();
     renderView(makeHandler());
 
-    await user.click(
-      await screen.findByRole("button", { name: "Synchroniser maintenant" }),
-    );
+    await user.click(await screen.findByRole("button", { name: "Actualiser" }));
 
     expect(
       await screen.findByText(
@@ -557,6 +602,8 @@ describe("WorkspaceNotesView", () => {
   it("envoie la résolution de conflit avec les deux SHA-256 attendus", async () => {
     const recorder = renderView(makeHandler());
     const user = userEvent.setup();
+
+    await user.click(await screen.findByText("Conflits — 1 non résolu"));
 
     const choice = await screen.findByLabelText("Résolution");
     await user.selectOptions(choice, "keep_proposed");
@@ -592,12 +639,13 @@ describe("WorkspaceNotesView", () => {
 
   it("ouvre une note au clavier et étiquette l’hypothèse humaine non vérifiée", async () => {
     const recorder = renderView(makeHandler());
+    const user = userEvent.setup();
     const button = await screen.findByRole("button", {
-      name: /notes\/humaines\/hypothese\.md/,
+      name: /hypothese\.md/,
     });
     button.focus();
     expect(button).toHaveFocus();
-    await userEvent.setup().keyboard("{Enter}");
+    await user.keyboard("{Enter}");
 
     expect(
       await screen.findByText("Hypothèse humaine — non vérifiée"),
@@ -605,16 +653,34 @@ describe("WorkspaceNotesView", () => {
     expect(
       screen.getByText("Note de travail — non probante"),
     ).toBeInTheDocument();
-    expect(await screen.findByText(/Session active/)).toBeInTheDocument();
     expect(
       screen.getByRole("button", {
-        name: "Demander à l’agent de continuer",
+        name: "Transmettre à Codex / Claude",
       }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Demander à Bridge de relire" }),
+      screen.getByRole("button", { name: "Associer à une tâche" }),
     ).toBeInTheDocument();
-    expect(screen.getByText(/Version CAS envoyée :/)).toHaveTextContent("5");
+    expect(
+      screen.getByRole("button", { name: "Demander à Bridge" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Proposer une observation" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "Note humaine — Hypothèse" }),
+    ).toBeVisible();
+    expect(
+      screen.getByText(/Le domaine pourrait être un leurre/),
+    ).toBeVisible();
+    const versions = screen
+      .getByText("Versions & provenance")
+      .closest("details");
+    expect(versions).not.toHaveAttribute("open");
+    await user.click(
+      screen.getByRole("button", { name: "Transmettre à Codex / Claude" }),
+    );
+    expect(await screen.findByText(/Session active/)).toBeInTheDocument();
     expect(
       screen.queryByText(/le client API figé n’expose pas la version d’état/),
     ).not.toBeInTheDocument();
@@ -632,9 +698,10 @@ describe("WorkspaceNotesView", () => {
     const user = userEvent.setup();
     await user.click(
       await screen.findByRole("button", {
-        name: /notes\/humaines\/hypothese\.md/,
+        name: /hypothese\.md/,
       }),
     );
+    await user.click(screen.getByRole("button", { name: "Demander à Bridge" }));
     await user.type(
       await screen.findByLabelText("Question à Bridge sur cette note"),
       "La note est-elle cohérente avec l’observation ?",
@@ -664,10 +731,14 @@ describe("WorkspaceNotesView", () => {
 
   it("conditionne l’instruction agent à une session active", async () => {
     renderView(makeHandler({ sessions: "none" }));
-    await userEvent.setup().click(
+    const user = userEvent.setup();
+    await user.click(
       await screen.findByRole("button", {
-        name: /notes\/humaines\/hypothese\.md/,
+        name: /hypothese\.md/,
       }),
+    );
+    await user.click(
+      screen.getByRole("button", { name: "Transmettre à Codex / Claude" }),
     );
 
     expect(
@@ -676,16 +747,20 @@ describe("WorkspaceNotesView", () => {
       ),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Demander à l’agent de continuer" }),
+      screen.getByRole("button", { name: "Transmettre l’instruction" }),
     ).toBeDisabled();
   });
 
   it("masque l’action agent quand aucune tâche n’est liée à la note", async () => {
     renderView(makeHandler({ note: noteViewWithoutTask }));
-    await userEvent.setup().click(
+    const user = userEvent.setup();
+    await user.click(
       await screen.findByRole("button", {
-        name: /notes\/humaines\/hypothese\.md/,
+        name: /hypothese\.md/,
       }),
+    );
+    await user.click(
+      screen.getByRole("button", { name: "Transmettre à Codex / Claude" }),
     );
 
     expect(
@@ -695,15 +770,136 @@ describe("WorkspaceNotesView", () => {
     ).toBeInTheDocument();
     expect(
       screen.queryByRole("button", {
-        name: "Demander à l’agent de continuer",
+        name: "Transmettre l’instruction",
       }),
     ).not.toBeInTheDocument();
+  });
+
+  it("présente le navigateur master/detail, un nom lisible et le chemin copiable", async () => {
+    const user = userEvent.setup();
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    renderView(makeHandler());
+
+    expect(
+      await screen.findByRole("region", { name: "Dossiers et fichiers" }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("region", { name: "Contenu sélectionné" }),
+    ).toBeVisible();
+    const fileButton = await screen.findByRole("button", {
+      name: /hypothese\.md/,
+    });
+    expect(fileButton).not.toHaveTextContent(noteFile.path);
+    expect(fileButton).toHaveAttribute("title", noteFile.path);
+    await user.click(fileButton);
+
+    expect(
+      await screen.findByRole("heading", { name: "Note humaine — Hypothèse" }),
+    ).toBeVisible();
+    expect(
+      screen.getByText(/Le domaine pourrait être un leurre/),
+    ).toBeVisible();
+    await user.click(screen.getByText("Chemin exact"));
+    await user.click(
+      screen.getByRole("button", { name: "Copier le chemin exact" }),
+    );
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(noteFile.path));
+  });
+
+  it("affiche le contenu d’un fichier non humain sans actions de note", async () => {
+    const user = userEvent.setup();
+    renderView(makeHandler());
+    await user.click(
+      await screen.findByRole("button", { name: "Tous les fichiers" }),
+    );
+    await user.click(
+      await screen.findByRole("button", { name: /initial-v0001\.md/ }),
+    );
+
+    expect(await screen.findByText(/Étapes de travail\./)).toBeVisible();
+    expect(
+      screen.getByRole("heading", { name: "initial-v0001.md" }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("button", { name: "Éditer" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Transmettre à Codex / Claude" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText("Versions & provenance").closest("details"),
+    ).not.toHaveAttribute("open");
+  });
+
+  it("enregistre une note éditée avec le SHA courant comme CAS", async () => {
+    const recorder = renderView(makeHandler());
+    const user = userEvent.setup();
+    await user.click(
+      await screen.findByRole("button", { name: /hypothese\.md/ }),
+    );
+    await user.click(await screen.findByRole("button", { name: "Éditer" }));
+    const editor = await screen.findByLabelText("Contenu Markdown");
+    await user.clear(editor);
+    await user.type(editor, "# Hypothèse révisée\n\nTexte corrigé.");
+    await user.click(screen.getByRole("button", { name: "Enregistrer" }));
+
+    await waitFor(() => {
+      expect(recorder.calls.some((call) => call.init?.method === "PUT")).toBe(
+        true,
+      );
+    });
+    const put = recorder.calls.find((call) => call.init?.method === "PUT");
+    expect(bodyOf(put?.init)).toEqual({
+      path: noteFile.path,
+      expected_sha256: SHA_B,
+      text: "# Hypothèse révisée\n\nTexte corrigé.",
+    });
+  });
+
+  it("transmet une instruction depuis la note par la route existante UX-09", async () => {
+    const recorder = renderView(makeHandler());
+    const user = userEvent.setup();
+    await user.click(
+      await screen.findByRole("button", { name: /hypothese\.md/ }),
+    );
+    await user.click(
+      screen.getByRole("button", { name: "Transmettre à Codex / Claude" }),
+    );
+    await user.type(
+      await screen.findByLabelText("Question à l’agent"),
+      "Vérifie cette piste.",
+    );
+    await user.click(
+      screen.getByRole("button", { name: "Transmettre l’instruction" }),
+    );
+
+    await waitFor(() => {
+      expect(
+        recorder.calls.some((call) => call.url.includes("/ask-agent")),
+      ).toBe(true);
+    });
+    const call = recorder.calls.find((item) => item.url.includes("/ask-agent"));
+    expect(call?.init?.method).toBe("POST");
+    expect(bodyOf(call?.init)).toEqual({
+      task_id: "task-1",
+      session_id: "session-1",
+      question: "Vérifie cette piste.",
+    });
+    expect(headersOf(call?.init)["Idempotency-Key"]).toMatch(
+      /^[A-Za-z0-9._:-]{8,128}$/,
+    );
   });
 
   it("écrit une note humaine Markdown avec une clé d’idempotence", async () => {
     const recorder = renderView(makeHandler());
     const user = userEvent.setup();
-
+    await user.click(
+      await screen.findByRole("button", { name: "Nouvelle note" }),
+    );
     await screen.findByLabelText("Chemin de la note");
     await user.type(screen.getByLabelText("Chemin de la note"), "ma-note.md");
     await user.type(
