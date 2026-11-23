@@ -51,13 +51,14 @@ from cti_app.domain.investigation_task import (
 from cti_app.domain.production import ProseAuthority
 from tests.test_agentic_tool_broker import (
     _ARGUMENTS,
-    NOW,
     OPERATOR_ID,
     _broker,
     _BrokerUnitOfWork,
     _fixture,
     _invocations,
     _seed_agent_session,
+    _task_repository,
+    _test_clock,
     _verified,
 )
 from tests.test_investigation_handoffs import (
@@ -136,7 +137,7 @@ def _note_broker(
         handoffs=None,
         notes=notes,
         task_limits=TASK_LIMIT_DEFAULTS,
-        clock=lambda: NOW,
+        clock=_test_clock,
         commit=uow.commit,
     )
     return broker, uow
@@ -163,7 +164,7 @@ async def _cancel(
         expected_status_version=task.status_version,
         idempotency_key=key,
         reason="revoke the lease mid-call",
-        now=NOW,
+        now=_test_clock(),
     )
 
 
@@ -178,7 +179,7 @@ async def test_registry_tool_refuses_a_cancel_committed_between_gate_and_persist
     """The persisting invocation transaction revalidates the revoked lease."""
     fixture = _fixture()
     await _start_fixture(fixture)
-    tasks = InMemoryInvestigationTaskRepository()
+    tasks = _task_repository()
     sessions = InMemoryAgentSessionRepository()
     task, session_id, _secret = await _seed_agent_session(fixture, tasks, sessions)
     broker, uow = _broker(fixture, tasks, sessions)
@@ -209,17 +210,17 @@ async def test_registry_tool_refuses_a_lease_expired_on_the_database_clock_mid_c
     """A skewed process clock never authorizes a lease the database expired."""
     fixture = _fixture()
     await _start_fixture(fixture)
-    database_clock = [NOW]
+    database_clock = [_test_clock()]
     tasks = InMemoryInvestigationTaskRepository(clock=lambda: database_clock[0])
     sessions = InMemoryAgentSessionRepository()
     task, session_id, _secret = await _seed_agent_session(
         fixture,
         tasks,
         sessions,
-        expires_at=NOW + timedelta(seconds=30),
-        heartbeat_at=NOW - timedelta(seconds=150),
+        expires_at=_test_clock() + timedelta(seconds=30),
+        heartbeat_at=_test_clock() - timedelta(seconds=150),
     )
-    broker, uow = _broker(fixture, tasks, sessions)  # broker clock is frozen at NOW
+    broker, uow = _broker(fixture, tasks, sessions)  # broker uses the injected test clock
     gate = _GatedTaskRepository(tasks, task_id=task.id)
     uow.investigation_tasks = gate
 
@@ -234,7 +235,7 @@ async def test_registry_tool_refuses_a_lease_expired_on_the_database_clock_mid_c
     )
     await asyncio.wait_for(gate.captured.wait(), timeout=10)
     # The prelude outlives the lease: only the database clock says so.
-    database_clock[0] = NOW + timedelta(seconds=60)
+    database_clock[0] = _test_clock() + timedelta(seconds=60)
     gate.release.set()
 
     with pytest.raises(AgenticLeaseRefusedError):
@@ -249,7 +250,7 @@ async def test_registry_tool_refuses_a_lease_expired_on_the_database_clock_mid_c
 async def test_note_capture_refuses_a_cancel_committed_between_gate_and_host_write() -> None:
     fixture = _fixture()
     await _start_fixture(fixture)
-    tasks = InMemoryInvestigationTaskRepository()
+    tasks = _task_repository()
     sessions = InMemoryAgentSessionRepository()
     task, session_id, _secret = await _seed_agent_session(fixture, tasks, sessions)
     notes = _RecordingNoteService()
@@ -279,7 +280,7 @@ async def test_note_capture_refuses_a_cancel_committed_between_gate_and_host_wri
 async def test_note_capture_refuses_a_session_stopped_between_gate_and_host_write() -> None:
     fixture = _fixture()
     await _start_fixture(fixture)
-    tasks = InMemoryInvestigationTaskRepository()
+    tasks = _task_repository()
     sessions = InMemoryAgentSessionRepository()
     task, session_id, _secret = await _seed_agent_session(fixture, tasks, sessions)
     notes = _RecordingNoteService()
@@ -299,7 +300,7 @@ async def test_note_capture_refuses_a_session_stopped_between_gate_and_host_writ
     await asyncio.wait_for(gate.captured.wait(), timeout=10)
     row = await sessions.get(session_id)
     assert row is not None
-    stopped = row.with_state(AgentSessionState.STOPPED, now=NOW)
+    stopped = row.with_state(AgentSessionState.STOPPED, now=_test_clock())
     assert await sessions.update_state(stopped, expected_state_version=row.state_version)
     gate.release.set()
 
@@ -433,17 +434,17 @@ def _engine(
 async def test_submit_refuses_a_lease_the_database_clock_has_expired() -> None:
     fixture = _fixture()
     await _start_fixture(fixture)
-    database_clock = [NOW]
+    database_clock = [_test_clock()]
     tasks = InMemoryInvestigationTaskRepository(clock=lambda: database_clock[0])
     sessions = InMemoryAgentSessionRepository()
     task, _session_id, _secret = await _seed_agent_session(
         fixture,
         tasks,
         sessions,
-        expires_at=NOW + timedelta(seconds=30),
-        heartbeat_at=NOW - timedelta(seconds=150),
+        expires_at=_test_clock() + timedelta(seconds=30),
+        heartbeat_at=_test_clock() - timedelta(seconds=150),
     )
-    database_clock[0] = NOW + timedelta(seconds=60)
+    database_clock[0] = _test_clock() + timedelta(seconds=60)
     engine = _engine(fixture, tasks, sessions)
 
     with pytest.raises(TaskLeaseExpiredError):
@@ -454,7 +455,7 @@ async def test_submit_refuses_a_lease_the_database_clock_has_expired() -> None:
             idempotency_key="submit-db-clock-expiry",
             result_refs=(),
             lease_fence=task.lease_fence,
-            now=NOW,
+            now=_test_clock(),
         )
     stored = await tasks.get(task.id)
     assert stored is not None and stored.status is TaskStatus.RUNNING
@@ -465,15 +466,15 @@ async def test_submit_accepts_a_lease_the_database_clock_still_holds() -> None:
     """A skewed application clock must not revoke a lease the database keeps."""
     fixture = _fixture()
     await _start_fixture(fixture)
-    database_clock = [NOW]
+    database_clock = [_test_clock()]
     tasks = InMemoryInvestigationTaskRepository(clock=lambda: database_clock[0])
     sessions = InMemoryAgentSessionRepository()
     task, _session_id, _secret = await _seed_agent_session(
         fixture,
         tasks,
         sessions,
-        expires_at=NOW + timedelta(seconds=120),
-        heartbeat_at=NOW,
+        expires_at=_test_clock() + timedelta(seconds=120),
+        heartbeat_at=_test_clock(),
     )
     engine = _engine(fixture, tasks, sessions)
 
@@ -484,7 +485,7 @@ async def test_submit_accepts_a_lease_the_database_clock_still_holds() -> None:
         idempotency_key="submit-app-skew",
         result_refs=(),
         lease_fence=task.lease_fence,
-        now=NOW + timedelta(seconds=180),
+        now=_test_clock() + timedelta(seconds=180),
     )
     assert result.task.status is TaskStatus.AWAITING_REVIEW
 
@@ -495,17 +496,17 @@ async def test_operator_commands_refuse_an_expired_lease_on_the_database_clock(
 ) -> None:
     fixture = _fixture()
     await _start_fixture(fixture)
-    database_clock = [NOW]
+    database_clock = [_test_clock()]
     tasks = InMemoryInvestigationTaskRepository(clock=lambda: database_clock[0])
     sessions = InMemoryAgentSessionRepository()
     task, _session_id, _secret = await _seed_agent_session(
         fixture,
         tasks,
         sessions,
-        expires_at=NOW + timedelta(seconds=30),
-        heartbeat_at=NOW - timedelta(seconds=150),
+        expires_at=_test_clock() + timedelta(seconds=30),
+        heartbeat_at=_test_clock() - timedelta(seconds=150),
     )
-    database_clock[0] = NOW + timedelta(seconds=60)
+    database_clock[0] = _test_clock() + timedelta(seconds=60)
     engine = _engine(fixture, tasks, sessions)
     common: dict[str, Any] = {
         "task_id": task.id,
@@ -513,7 +514,7 @@ async def test_operator_commands_refuse_an_expired_lease_on_the_database_clock(
         "expected_status_version": task.status_version,
         "lease_fence": task.lease_fence,
         "idempotency_key": f"{command}-db-clock-expiry",
-        "now": NOW,
+        "now": _test_clock(),
     }
     with pytest.raises(TaskLeaseExpiredError):
         if command == "request_input":
