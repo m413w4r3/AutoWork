@@ -2,10 +2,14 @@
 
 The existing workspace-agent architecture test globs the package's top-level
 modules; this companion oracle covers ``sidecars/workspace_agent/sessions/``
-without widening the W1 allowlist. ``fake_cli.py`` and ``shim.py`` are the only
-files allowed to call ``connect``: the fake CLI receives the per-session
-AF_UNIX secret, and the shim receives the same secret then signs fixed
-loopback HTTP requests (H2); neither may name an INET socket family itself.
+without widening the W1 allowlist. ``fake_cli.py`` and ``shim.py`` are allowed
+to call ``connect``: the fake CLI receives the per-session AF_UNIX secret, and
+the shim receives the same secret then signs fixed loopback HTTP requests (H2).
+``entrypoint.py`` is the trusted launch wrapper that runs only inside the
+bwrap ``--unshare-net`` namespace: it owns the ``127.0.0.1:3128`` provider
+forwarder (loopback must be usable, no other route exists) and probes
+unroutable destinations.  No other sessions module may name an INET socket
+family.
 """
 
 from __future__ import annotations
@@ -85,8 +89,17 @@ def test_sessions_package_imports_only_allowlisted_stdlib_modules() -> None:
     assert offenders == {}
 
 
+# entrypoint.py is the only file that may name an INET socket family: it runs
+# exclusively inside the route-less bwrap network namespace, where it must own
+# the loopback provider listener and probe unreachable destinations.  The list
+# is closed; adding a file here is a deliberate review point.
+INET_SOCKET_ALLOWED = frozenset({"entrypoint.py"})
+
+
 def test_sessions_package_never_uses_inet_sockets() -> None:
     for path in _session_modules():
+        if path.name in INET_SOCKET_ALLOWED:
+            continue
         source = path.read_text(encoding="utf-8")
         assert "AF_INET" not in source, path.name
         assert "AF_INET6" not in source, path.name
