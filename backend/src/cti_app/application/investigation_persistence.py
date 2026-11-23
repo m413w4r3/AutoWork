@@ -503,6 +503,10 @@ class InvestigationTaskRepository(Protocol):
         expected_status: TaskStatus,
     ) -> InvestigationTaskV1 | None: ...
 
+    async def set_handoff_ref(
+        self, task_id: UUID, handoff_id: UUID
+    ) -> InvestigationTaskV1 | None: ...
+
     async def acquire_lease(
         self,
         task_id: UUID,
@@ -1836,6 +1840,16 @@ class InMemoryInvestigationTaskRepository:
                 return None
             self._tasks[task.id] = task
             return task
+
+    async def set_handoff_ref(self, task_id: UUID, handoff_id: UUID) -> InvestigationTaskV1 | None:
+        """Point the task at its current handoff; never a status CAS."""
+        async with self._lock:
+            current = self._tasks.get(task_id)
+            if current is None:
+                return None
+            updated = replace(current, handoff_ref=handoff_id)
+            self._tasks[task_id] = updated
+            return updated
 
     async def acquire_lease(
         self,

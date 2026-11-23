@@ -190,6 +190,7 @@ CLEAN_PATHS := \
 	test-workflow-browser \
 	test-workflow-browser-investigation \
 	test-editorial-browser \
+	test-investigation-browser \
 	test-ci-scripts \
 	measure-workflow \
 	integration-db-up \
@@ -642,6 +643,105 @@ test-editorial-browser: backend-sync frontend-sync ## Vérifie l'atelier éditor
 	if (cd $(FRONTEND_DIR) && $(PNPM) exec playwright test --config playwright.editorial.config.ts); then :; else status=$$?; fi; \
 	finished_at="$$(date +%s)"; \
 	echo "M23-editorial-browser / elapsed_seconds=$$((finished_at - started_at))"; \
+	exit "$$status"
+
+test-investigation-browser: backend-sync frontend-sync ## Parcours navigateur M24 réel (étapes 1-11) avec PostgreSQL jetable et fournisseurs factices
+	@set -eu; \
+	owned_postgres=0; \
+	cleanup_postgres() { \
+		if [ "$$owned_postgres" -eq 1 ]; then \
+			$(COMPOSE) \
+				--profile integration-test \
+				rm -sf postgres-test \
+				>/dev/null 2>&1 || true; \
+		fi; \
+	}; \
+	if [ -z "$${TEST_POSTGRES_ADMIN_DSN:-}" ]; then \
+		running_id="$$( \
+			$(COMPOSE) \
+				--profile integration-test \
+				ps --status running -q postgres-test \
+				2>/dev/null || true \
+		)"; \
+		if [ -z "$$running_id" ]; then \
+			owned_postgres=1; \
+		fi; \
+		$(COMPOSE) \
+			--profile integration-test \
+			up -d --wait postgres-test; \
+		export TEST_POSTGRES_ADMIN_DSN="postgresql+asyncpg://postgres:postgres@127.0.0.1:$${TEST_POSTGRES_PORT}/postgres"; \
+		echo "M24 workshop browser: PostgreSQL d'intégration jetable sur le port $${TEST_POSTGRES_PORT}."; \
+	fi; \
+	results="$(abspath $(WORKFLOW_RESULTS_DIR))/browser-m24-workshop"; \
+	api_port="$${INVESTIGATION_BROWSER_API_PORT:-18768}"; \
+	operator_token="$${M24_BROWSER_OPERATOR_TOKEN:-m24-browser-operator-token-0123456789abcdef}"; \
+	state="$$results/state.json"; \
+	server_log="$$results/server.log"; \
+	mkdir -p "$$results"; \
+	rm -f -- "$$state"; \
+	export M24_REAL_LITE_ATTESTED_FAKE_PROVIDER=1; \
+	export WORKFLOW_BROWSER_STATE="$$state"; \
+	export WORKFLOW_BROWSER_API_PORT="$$api_port"; \
+	export OPERATOR_API_TOKEN="$$operator_token"; \
+	export VITE_API_PROXY_TARGET="http://127.0.0.1:$$api_port"; \
+	export WORKFLOW_BROWSER_OUTPUT_DIR="$$results/playwright-results"; \
+	export CHOKIDAR_USEPOLLING=1; \
+	export PATH="$(TEST_PATH_PREFIX)$$PATH"; \
+	export TYPST_BINARY="$(TYPST_BINARY)"; \
+	if ! (cd $(BACKEND_DIR) && $(UV_RUN) python -m pytest tests/workflow_emulator/test_m24_browser_server.py -q --tb=short); then \
+		cleanup_postgres; \
+		exit 1; \
+	fi; \
+	started_at="$$(date +%s)"; \
+	(cd $(BACKEND_DIR) && exec $(UV_RUN) python -m tests.workflow_emulator.m24_browser_server) >"$$server_log" 2>&1 & \
+	server_pid=$$!; \
+	status=0; \
+	cleanup() { \
+		result=$$?; \
+		stop_requested=0; \
+		trap - EXIT; \
+		if kill -0 "$$server_pid" 2>/dev/null; then \
+			if curl --silent --fail --request POST "http://127.0.0.1:$$api_port/__m24_browser/shutdown" >/dev/null; then \
+				stop_requested=1; \
+			else \
+				if ! kill -TERM "$$server_pid"; then \
+					echo "ERREUR: impossible d'arrêter le serveur M24 navigateur." >&2; \
+					if [ "$$result" -eq 0 ]; then result=1; fi; \
+				else \
+					stop_requested=1; \
+				fi; \
+			fi; \
+		fi; \
+		if wait "$$server_pid"; then :; else \
+			server_status=$$?; \
+			if [ "$$result" -eq 0 ] && [ "$$stop_requested" -eq 0 ]; then result=$$server_status; fi; \
+		fi; \
+		if grep -R -F -q -- "$$operator_token" "$$results" 2>/dev/null; then \
+			echo "ERREUR: le jeton opérateur synthétique a fui dans $$results." >&2; \
+			if [ "$$result" -eq 0 ]; then result=1; fi; \
+		fi; \
+		cleanup_postgres; \
+		exit "$$result"; \
+	}; \
+	trap cleanup EXIT; \
+	trap 'exit 130' INT; \
+	trap 'exit 143' TERM; \
+	ready=0; \
+	attempt=0; \
+	while [ "$$attempt" -lt 180 ]; do \
+		if curl --silent --fail "http://127.0.0.1:$$api_port/api/health/live" >/dev/null; then ready=1; break; fi; \
+		if ! kill -0 "$$server_pid" 2>/dev/null; then break; fi; \
+		sleep 1; \
+		attempt=$$((attempt + 1)); \
+	done; \
+	if [ "$$ready" -ne 1 ]; then \
+		echo "ERREUR: serveur M24 navigateur indisponible sur le port $$api_port; journal:" >&2; \
+		sed -n '1,260p' "$$server_log" >&2; \
+		exit 1; \
+	fi; \
+	if (cd $(FRONTEND_DIR) && $(PNPM) exec playwright test --config playwright.investigation.config.ts); then :; else status=$$?; fi; \
+	finished_at="$$(date +%s)"; \
+	echo "M24.1-investigation-browser / elapsed_seconds=$$((finished_at - started_at))"; \
 	exit "$$status"
 
 test: test-backend test-frontend ## Lance les tests rapides backend + frontend

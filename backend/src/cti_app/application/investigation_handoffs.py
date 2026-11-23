@@ -406,6 +406,11 @@ class InvestigationHandoffService:
                 stored, _created = await uow.investigation_handoffs.append_if_absent(record)
             except VersionConflictError as exc:
                 raise HandoffVersionConflictError(str(exc)) from exc
+            # The task row points at its current handoff (0021/0022 FK): the
+            # cockpit resolves the destination handoff from this projection
+            # before it may open the operator session.  The handoff row is
+            # already INSERTed above, so the FK is satisfied.
+            await uow.investigation_tasks.set_handoff_ref(task.id, UUID(stored.handoff.handoff_id))
             await uow.commit()
             return stored
 
