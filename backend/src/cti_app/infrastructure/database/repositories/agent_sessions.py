@@ -491,19 +491,30 @@ class SqlAlchemyAgentSessionRepository:
     async def list_pending_instructions(
         self, *, limit: int
     ) -> tuple[AgentSessionInstructionV1, ...]:
-        """Drain candidates (``queued|delivering|delivery_unknown``) in queue order.
+        """Drain candidates of *active* sessions in queue order (F3-D §3.3).
 
-        Matches the partial index ``ix_agent_session_instructions_pending``
-        created by migration 0027, so the backend loop never scans history.
+        The design's candidate is "an active session carrying an instruction
+        ``queued|delivering|delivery_unknown``": rows left by a terminal
+        session can never be delivered and must not occupy the bounded batch,
+        or 50 dead rows would starve every live instruction behind them
+        (R4-F2).  The partial ``ix_agent_session_instructions_pending`` index
+        still drives the scan; the join is on the session primary key.
         """
         if limit < 1:
             raise ValueError("limit must be >= 1")
         rows = await self._session.scalars(
             select(AgentSessionInstructionRow)
+            .join(
+                AgentSessionRow,
+                AgentSessionRow.id == AgentSessionInstructionRow.session_id,
+            )
             .where(
                 AgentSessionInstructionRow.state.in_(
                     tuple(state.value for state in INSTRUCTION_PENDING_STATES)
-                )
+                ),
+                AgentSessionRow.state.in_(
+                    tuple(state.value for state in ACTIVE_AGENT_SESSION_STATES)
+                ),
             )
             .order_by(
                 AgentSessionInstructionRow.queued_at,

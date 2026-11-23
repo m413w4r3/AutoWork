@@ -769,6 +769,39 @@ async def test_text_one_byte_over_the_host_capacity_is_refused_visibly() -> None
     assert (await harness.instruction(enqueued.instruction.id)).state is InstructionState.QUEUED
 
 
+# ------------------------------------------------------- drain candidates (R4-F2)
+
+
+async def test_dead_session_rows_never_fill_the_batch_and_starve_a_live_one() -> None:
+    """R4-F2: the candidate set is active sessions, so a dead row cannot starve."""
+    harness = _Harness()
+    dead = await harness.seed_session(state=AgentSessionState.LOST)
+    await harness.seed_queued_instruction(
+        dead, text="orphaned instruction", key="i-dead", queued_at=NOW - timedelta(seconds=600)
+    )
+    live = await harness.seed_session(state=AgentSessionState.RUNNING)
+    queued = await harness.seed_queued_instruction(
+        live, text="live instruction", key="i-live", queued_at=NOW
+    )
+    harness.host.status_state = "awaiting_instruction"
+    service = InstructionDeliveryService(
+        uow_factory=harness.uow_factory,
+        host=harness.host,
+        notes=harness.notes,
+        disclosure=harness.disclosure,
+        clock=harness.clock,
+        grace_seconds=GRACE_SECONDS,
+        batch_size=1,
+    )
+
+    report = await service.drain_once()
+
+    assert report.scanned == 1
+    assert report.delivered == 1
+    assert [call["request"].text for call in harness.host.send_calls] == ["live instruction"]
+    assert (await harness.instruction(queued.id)).state is InstructionState.DELIVERED
+
+
 # ---------------------------------------------------------- phase C re-checks
 
 
