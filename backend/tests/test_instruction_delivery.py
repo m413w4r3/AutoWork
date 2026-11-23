@@ -24,6 +24,7 @@ from cti_app.application.agent_session_disclosure import (
     build_session_disclosure_gate,
 )
 from cti_app.application.agentic_host_sessions import (
+    HOST_MAX_INSTRUCTION_BYTES,
     HostBudgetUsageV1,
     HostInstructionResultV1,
     HostSessionEventsPageV1,
@@ -723,6 +724,49 @@ async def test_transport_timeout_is_delivery_unknown_and_reconciled_without_rese
     proven = await harness.instruction(queued.instruction.id)
     assert proven.state is InstructionState.DELIVERED
     assert proven.delivery_mode is InstructionDeliveryMode.NEXT_RUN
+
+
+# ------------------------------------------------------- host byte bound (R4-F1)
+
+
+async def test_text_at_the_host_capacity_is_delivered_whole() -> None:
+    """R4-F1: the delivered SHA covers exactly the text the run received."""
+    harness = _Harness()
+    session = await harness.seed_session(state=AgentSessionState.AWAITING_INSTRUCTION)
+    text = "x" * HOST_MAX_INSTRUCTION_BYTES
+
+    enqueued = await harness.enqueue(session, text=text, key="i-bound")
+
+    assert enqueued.delivered_live is True
+    assert len(harness.host.send_calls) == 1
+    request = harness.host.send_calls[0]["request"]
+    assert request.text == text
+    assert request.sha256 == instruction_text_sha256(text)
+    stored = await harness.instruction(enqueued.instruction.id)
+    assert stored.state is InstructionState.DELIVERED
+    assert stored.delivery_sha256 == instruction_text_sha256(text)
+
+
+async def test_text_one_byte_over_the_host_capacity_is_refused_visibly() -> None:
+    """R4-F1: an unsendable text is never announced delivered or truncated."""
+    harness = _Harness()
+    session = await harness.seed_session(state=AgentSessionState.AWAITING_INSTRUCTION)
+    text = "x" * (HOST_MAX_INSTRUCTION_BYTES + 1)
+
+    enqueued = await harness.enqueue(session, text=text, key="i-bound-over")
+
+    assert enqueued.delivered_live is False
+    assert harness.host.send_calls == []
+    stored = await harness.instruction(enqueued.instruction.id)
+    assert stored.state is InstructionState.QUEUED
+    assert stored.delivered_at is None
+    assert stored.delivery_attempts == 0
+    assert stored.last_delivery_error == "instruction_text_exceeds_host_bound"
+
+    report = await harness.delivery.drain_once()
+    assert report.refused == 1
+    assert harness.host.send_calls == []
+    assert (await harness.instruction(enqueued.instruction.id)).state is InstructionState.QUEUED
 
 
 # ---------------------------------------------------------- phase C re-checks

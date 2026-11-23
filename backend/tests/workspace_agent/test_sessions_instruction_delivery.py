@@ -26,11 +26,14 @@ from sidecars.workspace_agent.sessions.adapters.claude import (
 )
 from sidecars.workspace_agent.sessions.adapters.codex import CodexProfile
 from sidecars.workspace_agent.sessions.adapters.preamble import INSTRUCTION_BLOCK_PREAMBLE
+from sidecars.workspace_agent.sessions.state import SessionRequestError
 from sidecars.workspace_agent.sessions.supervisor import (
     MAX_INSTRUCTION_BLOCK_BYTES,
     InstructionRequest,
     _compose_instruction_block,
 )
+
+from cti_app.application.agentic_host_sessions import HOST_MAX_INSTRUCTION_BYTES
 
 from tests.workspace_agent.claude_profile_support import (
     claude_argv,
@@ -426,29 +429,79 @@ def test_collect_and_close_accept_awaiting_instruction(session_base: Path) -> No
         assert not (session_dir / "ipc" / "broker.sock").exists()
 
 
-def test_instruction_block_is_bounded_and_truncated_explicitly() -> None:
-    text = "note text"
+def test_instruction_block_at_the_exact_host_bound_is_whole_and_refuses_one_byte_more() -> None:
+    """R4-F1: the host never truncates a delivered instruction.
+
+    The block budget covers the lead-in header (id + SHA) *and* the text.  The
+    exact capacity is delivered whole; one byte more is a typed refusal, so a
+    truncated prompt can never be announced under the full text's SHA.
+    """
+    exact = "x" * HOST_MAX_INSTRUCTION_BYTES
     request = InstructionRequest(
         instruction_id=INSTRUCTION_ID,
-        text=text,
-        sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        text=exact,
+        sha256=hashlib.sha256(exact.encode("utf-8")).hexdigest(),
     )
     block = _compose_instruction_block(request)
+    assert len(block.encode("utf-8")) == MAX_INSTRUCTION_BLOCK_BYTES
+    assert block.endswith(exact)
     assert f"instruction_id={INSTRUCTION_ID}" in block
-    assert f"sha256={request.sha256}" in block
-    assert block.endswith(text)
+    assert "instruction truncated:" not in block
 
-    oversized = "x" * (32 * 1024)
-    long_request = InstructionRequest(
+    over = exact + "x"
+    oversized = InstructionRequest(
         instruction_id=SECOND_INSTRUCTION_ID,
-        text=oversized,
-        sha256=hashlib.sha256(oversized.encode("utf-8")).hexdigest(),
+        text=over,
+        sha256=hashlib.sha256(over.encode("utf-8")).hexdigest(),
     )
-    long_block = _compose_instruction_block(long_request)
-    assert len(long_block.encode("utf-8")) <= MAX_INSTRUCTION_BLOCK_BYTES
-    assert "instruction truncated:" in long_block
-    assert "bytes omitted" in long_block
-    assert f"instruction_id={SECOND_INSTRUCTION_ID}" in long_block
+    with pytest.raises(SessionRequestError) as refusal:
+        _compose_instruction_block(oversized)
+    assert refusal.value.code == "invalid_request"
+    assert refusal.value.details == {
+        "field": "text",
+        "reason": "instruction_block_exceeds_bound",
+    }
+
+
+def test_instruction_text_over_the_host_bound_is_refused_before_any_run(
+    session_base: Path,
+) -> None:
+    """R4-F1 end to end: capacity is delivered whole, +1 byte starts no run."""
+    exact = "x" * HOST_MAX_INSTRUCTION_BYTES
+    body = _instruction_body(exact)
+    over = "y" * (HOST_MAX_INSTRUCTION_BYTES + 1)
+    oversized = _instruction_body(over, instruction_id=SECOND_INSTRUCTION_ID)
+    with running_session_agent(session_base) as running, running.client() as client:
+        workspace_id = running.ensure_workspace(client)
+        assert _prepare(client, running, workspace_id).status_code == 200
+        write_fake_script(running, RUN_SCRIPT)
+        assert _start(client, running).status_code == 200
+        _run_to_awaiting(client, running)
+
+        delivered = _post_instruction(client, running, body, INSTRUCTION_KEY)
+        assert delivered.status_code == 200, delivered.text
+        status = _run_to_awaiting(client, running, runs=2)
+        assert status["exit"] == {"code": 0, "signal": None}
+        block = (running.session_dir() / "instruction-block.txt").read_text(encoding="utf-8")
+        assert len(block.encode("utf-8")) == MAX_INSTRUCTION_BLOCK_BYTES
+        assert block.endswith(exact)
+        observations = read_observations(running)
+        seen = observations["instruction"]
+        assert isinstance(seen, dict)
+        assert seen["text_sha256"] == body["sha256"]
+
+        refused = _post_instruction(client, running, oversized, RETRY_KEY)
+        assert refused.status_code == 400, refused.text
+        assert refused.json()["error"] == "invalid_request"
+        after = get_session(client, running, f"/v1/sessions/{SESSION_ID}").json()
+        assert after["state"] == "awaiting_instruction"
+        assert len(after["runs"]) == 2
+        delivered_events = [
+            event
+            for event in session_events(client, running)
+            if event["kind"] == "instruction_delivered"
+        ]
+        assert [event["payload"]["sha256"] for event in delivered_events] == [body["sha256"]]
 
 
 def _codex_prompt(tmp_path: Path) -> str:
