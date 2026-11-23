@@ -888,7 +888,8 @@ def test_heartbeat_appends_event_single_sequence_writer() -> None:
 
 def test_sweep_covers_awaiting_input() -> None:
     async def scenario() -> None:
-        repository = InMemoryInvestigationTaskRepository(clock=lambda: NOW + timedelta(seconds=181))
+        database_clock = [NOW]
+        repository = InMemoryInvestigationTaskRepository(clock=lambda: database_clock[0])
         session_id = uuid4()
         sessions = _SessionRecorder(active=(session_id,))
         seeded = await _seeded(
@@ -918,6 +919,7 @@ def test_sweep_covers_awaiting_input() -> None:
         assert awaiting.task.lease_fence == 1
         assert awaiting.task.lease_expires_at == NOW + timedelta(seconds=180)
 
+        database_clock[0] = NOW + timedelta(seconds=181)
         sweeper = InvestigationTaskSweeper(tasks=repository, sessions=sessions)
         swept = await sweeper.sweep_investigation(seeded.investigation_id)
         assert len(swept) == 1
@@ -948,7 +950,8 @@ def test_sweep_runner_commits_before_flushing_the_host_release() -> None:
     """B1/B2: the scheduler runner sweeps, commits, then asks the host to stop."""
 
     async def scenario() -> None:
-        repository = InMemoryInvestigationTaskRepository(clock=lambda: NOW + timedelta(seconds=181))
+        database_clock = [NOW]
+        repository = InMemoryInvestigationTaskRepository(clock=lambda: database_clock[0])
         session_id = uuid4()
         seeded = await _seeded(
             repository,
@@ -1010,6 +1013,7 @@ def test_sweep_runner_commits_before_flushing_the_host_release() -> None:
             assert agent_sessions.closed, "the session row must be released before teardown"
             releases.extend(items)
 
+        database_clock[0] = NOW + timedelta(seconds=181)
         swept = await run_expired_lease_sweep(
             source=_Source(),
             uow_factory=lambda: uow,
@@ -1669,7 +1673,9 @@ def test_settings_task_limits_read_adr_env_names() -> None:
 
 def test_operator_lease_lifecycle_keeps_and_closes_its_session() -> None:
     async def scenario() -> None:
-        repository = InMemoryInvestigationTaskRepository()
+        # The lease deadline is read on the repository (database) clock: pin it
+        # to the scenario clock instead of the wall clock that has moved on.
+        repository = InMemoryInvestigationTaskRepository(clock=lambda: NOW)
         sessions = _SessionRecorder()
         seeded = await _seeded(
             repository,

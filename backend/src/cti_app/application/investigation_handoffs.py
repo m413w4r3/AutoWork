@@ -13,6 +13,11 @@ Rules this module owns:
   the caller's draft (task, parties, references, work, next action, key).
 * **Versions** are monotone per task.  The task row is locked first, so two
   concurrent creates serialise and versions have no gaps or duplicates.
+* **Operator authority** (D3): an operator-authored handoff is a write under
+  the task lease.  The locked task row must still hold a live lease, and when
+  the broker supplies the ``HandoffLeaseAuthority`` it verified, the lease
+  session and fence must match it; a cancel, sweep or expiry committed before
+  the append leaves no handoff row.
 * **References** must belong to the same investigation and resolve.  Advisory
   observations (Bridge consultation material, D6) are never accepted as
   observation evidence refs or work-observation refs; a Bridge consultation is
@@ -50,6 +55,7 @@ from cti_app.application.investigation_persistence import (
     WorkspaceBindingRepository,
     WorkspaceFileRevisionRepository,
 )
+from cti_app.application.investigation_tasks import LEASE_HELD_STATUSES
 from cti_app.application.persistence import (
     AnalystDecisionRepository,
     AnalystInvestigationRepository,
@@ -135,6 +141,41 @@ class HandoffTaskStaleError(HandoffError):
 
     code = "handoff_task_stale"
     status_code = 409
+
+
+class HandoffLeaseAuthorityError(HandoffError):
+    """An operator handoff was attempted without a current lease (D3/D5).
+
+    Raised only after the task row was locked inside the transaction that
+    appends the handoff: a lease revoked between the caller's pre-check and
+    this point (cancel, sweep, reassignment, expiry) leaves no handoff row.
+    """
+
+    code = "handoff_lease_stale"
+    status_code = 409
+
+
+@dataclass(frozen=True, slots=True)
+class HandoffLeaseAuthority:
+    """The exact lease an agentic handoff is authored under (D3/D7).
+
+    ``session_id``/``lease_fence`` are the values the broker verified before
+    the call; the service re-reads the locked task row and refuses a mismatch,
+    so a superseded session or fence can never append a handoff.
+    """
+
+    task_id: UUID
+    session_id: UUID
+    lease_fence: int
+
+    def __post_init__(self) -> None:
+        for name in ("task_id", "session_id"):
+            if not isinstance(getattr(self, name), UUID):
+                raise TypeError(f"{name} must be a UUID")
+        if isinstance(self.lease_fence, bool) or not isinstance(self.lease_fence, int):
+            raise TypeError("lease_fence must be an integer")
+        if self.lease_fence < 1:
+            raise ValueError("lease_fence must be >= 1")
 
 
 class HandoffUnitOfWork(Protocol):
@@ -265,14 +306,25 @@ class InvestigationHandoffService:
         idempotency_key: str,
         request: HandoffCreateRequest,
         now: datetime | None = None,
+        authority: HandoffLeaseAuthority | None = None,
     ) -> HandoffRecord:
-        """Append one immutable handoff version inside the caller's UoW."""
+        """Append one immutable handoff version inside the caller's UoW.
+
+        An operator handoff is a write under the task lease (D3): the locked
+        task row must still hold a live lease, and when the broker supplies the
+        exact ``authority`` it verified, the session and fence must match it.
+        The check runs after the replay lookup and before the append, so a
+        retry returns the recorded version while a revoked lease appends
+        nothing.
+        """
         if not isinstance(investigation_id, UUID):
             raise TypeError("investigation_id must be a UUID")
         if not isinstance(actor, HandoffActor):
             raise TypeError("actor must use HandoffActor")
         if not isinstance(request, HandoffCreateRequest):
             raise TypeError("request must use HandoffCreateRequest")
+        if authority is not None and not isinstance(authority, HandoffLeaseAuthority):
+            raise TypeError("authority must use HandoffLeaseAuthority")
         if not idempotency_key.strip():
             raise ValueError("Idempotency-Key must not be empty")
         self._require_actor_may_handoff(actor)
@@ -299,6 +351,7 @@ class InvestigationHandoffService:
                     )
                 return existing
 
+            await self._require_lease_authority(uow, task, actor, authority)
             latest = await uow.investigation_handoffs.latest_for_task(task.id)
             version = 1 if latest is None else latest.handoff.version + 1
             predecessor_id = latest.handoff.handoff_id if latest is not None else None
@@ -404,6 +457,54 @@ class InvestigationHandoffService:
             raise HandoffForbiddenError(
                 "an operator may only hand off a task assigned to that operator",
                 details={"task_id": str(task.id)},
+            )
+
+    @staticmethod
+    async def _require_lease_authority(
+        uow: HandoffUnitOfWork,
+        task: InvestigationTaskV1,
+        actor: HandoffActor,
+        authority: HandoffLeaseAuthority | None,
+    ) -> None:
+        """Revalidate an operator handoff under the locked task row (D3/D7).
+
+        Runs after the replay lookup (a retry still returns its recorded
+        version) and before the append, so a cancel, sweep, expiry or
+        reassignment committed before this transaction refuses the write.
+        """
+        if actor.kind is not HandoffActorKind.OPERATOR:
+            if authority is not None:
+                raise HandoffLeaseAuthorityError(
+                    "only an operator handoff carries a lease authority"
+                )
+            return
+        if (
+            task.status not in LEASE_HELD_STATUSES
+            or task.lease_session_id is None
+            or task.lease_expires_at is None
+        ):
+            raise HandoffLeaseAuthorityError(
+                "the operator task holds no live lease",
+                details={"task_id": str(task.id)},
+            )
+        if authority is not None:
+            if authority.task_id != task.id:
+                raise HandoffLeaseAuthorityError(
+                    "the handoff authority targets another task",
+                    details={"task_id": str(task.id)},
+                )
+            if (
+                task.lease_session_id != authority.session_id
+                or task.lease_fence != authority.lease_fence
+            ):
+                raise HandoffLeaseAuthorityError(
+                    "the agent lease session or fence is stale",
+                    details={"code": "lease_fence_stale", "task_id": str(task.id)},
+                )
+        if task.lease_expires_at <= await uow.investigation_tasks.database_now():
+            raise HandoffLeaseAuthorityError(
+                "the agent lease has expired",
+                details={"code": "lease_expired", "task_id": str(task.id)},
             )
 
     @staticmethod
@@ -882,6 +983,8 @@ __all__ = [
     "HandoffFreshnessDiff",
     "HandoffFreshnessReport",
     "HandoffIdempotencyConflictError",
+    "HandoffLeaseAuthority",
+    "HandoffLeaseAuthorityError",
     "HandoffNotFoundError",
     "HandoffRefForbiddenError",
     "HandoffRefUnresolvedError",

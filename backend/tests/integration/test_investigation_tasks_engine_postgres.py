@@ -241,6 +241,10 @@ async def _create_task(
         # is set once the session exists, keeping status_version at 1.
         session_id = lease_session_id or uuid4()
         await _create_agent_session(session_factory, investigation_id, created.id, session_id)
+        # The lease deadline and heartbeat are read on the database clock, so
+        # anchor the fixture when the test runs, not when the module was
+        # imported (a collected module can run minutes later; F0-C).
+        lease_now = datetime.now(UTC)
         async with session_factory() as session:
             await session.execute(
                 sa.text(
@@ -252,8 +256,8 @@ async def _create_task(
                 {
                     "lease_id": uuid4(),
                     "session_id": session_id,
-                    "expires_at": NOW + timedelta(seconds=180),
-                    "heartbeat": NOW,
+                    "expires_at": lease_now + timedelta(seconds=180),
+                    "heartbeat": lease_now,
                     "task_id": created.id,
                 },
             )
