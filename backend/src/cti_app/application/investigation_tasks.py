@@ -1021,7 +1021,8 @@ class InvestigationTaskService:
         """
         _require_operator(actor)
         key = _idempotency_key(idempotency_key)
-        timestamp = _now(now)
+        # ``now`` stays in the shared command signature; the lease deadline
+        # below is decided by the database clock, never by the caller.
         task = await self._locked_task(task_id)
         payload: dict[str, Any] = {
             "expected_status_version": expected_status_version,
@@ -1039,7 +1040,7 @@ class InvestigationTaskService:
         if replayed is not None:
             return replayed
         self._require_expected_version(task, expected_status_version)
-        await self._require_current_lease(task, actor, lease_fence=lease_fence, now=timestamp)
+        await self._require_current_lease(task, actor, lease_fence=lease_fence)
         renewed = await self._tasks.renew_lease(
             task.id,
             expected_status_version=task.status_version,
@@ -1096,7 +1097,7 @@ class InvestigationTaskService:
         if replayed is not None:
             return replayed
         self._require_expected_version(task, expected_status_version)
-        await self._require_current_lease(task, actor, lease_fence=lease_fence, now=timestamp)
+        await self._require_current_lease(task, actor, lease_fence=lease_fence)
         self._require_transition(task, TaskStatus.AWAITING_INPUT, actor)
         updated = task.with_status(TaskStatus.AWAITING_INPUT, now=timestamp)
         return await self._commit_status(
@@ -1139,7 +1140,7 @@ class InvestigationTaskService:
         if replayed is not None:
             return replayed
         self._require_expected_version(task, expected_status_version)
-        await self._require_current_lease(task, actor, lease_fence=lease_fence, now=timestamp)
+        await self._require_current_lease(task, actor, lease_fence=lease_fence)
         self._require_transition(task, TaskStatus.RUNNING, actor)
         updated = task.with_status(TaskStatus.RUNNING, now=timestamp)
         return await self._commit_status(
@@ -1194,7 +1195,7 @@ class InvestigationTaskService:
             if lease_fence is None:
                 raise TaskLeaseFenceError("an operator submit requires the current lease fence")
             lease_session_id = await self._require_current_lease(
-                task, actor, lease_fence=lease_fence, now=timestamp
+                task, actor, lease_fence=lease_fence
             )
             released = task.with_released_lease(now=timestamp)
             base = replace(released, result_refs=tuple(result_refs))
@@ -1399,7 +1400,7 @@ class InvestigationTaskService:
             if lease_fence is None:
                 raise TaskLeaseFenceError("an operator block requires the current lease fence")
             lease_session_id = await self._require_current_lease(
-                task, actor, lease_fence=lease_fence, now=timestamp
+                task, actor, lease_fence=lease_fence
             )
         base = task
         if task.lease_id is not None:
@@ -1621,7 +1622,7 @@ class InvestigationTaskService:
         if actor.kind is TaskActorKind.OPERATOR:
             if lease_fence is None:
                 raise TaskLeaseFenceError("an operator failure requires the current lease fence")
-            await self._require_current_lease(task, actor, lease_fence=lease_fence, now=timestamp)
+            await self._require_current_lease(task, actor, lease_fence=lease_fence)
         lease_session_id = task.lease_session_id
         base = task.with_released_lease(now=timestamp) if task.lease_id is not None else task
         self._require_transition(task, TaskStatus.FAILED, actor)
@@ -1864,9 +1865,8 @@ class InvestigationTaskService:
         except TaskTransitionError as exc:
             raise TaskTransitionNotAllowedError(str(exc)) from exc
 
-    @staticmethod
     async def _require_current_lease(
-        task: InvestigationTaskV1, actor: TaskActor, *, lease_fence: int, now: datetime
+        self, task: InvestigationTaskV1, actor: TaskActor, *, lease_fence: int
     ) -> UUID:
         if (
             task.assigned_actor_kind is not TaskActorKind.OPERATOR
@@ -1879,7 +1879,10 @@ class InvestigationTaskService:
             raise TaskLeaseFenceError(
                 f"expected lease_fence {lease_fence}, current is {task.lease_fence}"
             )
-        if task.lease_expires_at <= now:
+        # The expiry boundary is the *database* clock, exactly like the
+        # heartbeat UPDATE and the sweep: a skewed process clock can neither
+        # revive a lease PostgreSQL considers expired nor revoke a live one.
+        if task.lease_expires_at <= await self._tasks.database_now():
             raise TaskLeaseExpiredError("the lease has expired")
         return task.lease_session_id
 

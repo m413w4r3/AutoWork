@@ -19,6 +19,8 @@ instead of introducing a second journal, budget or evidence pipeline:
   ``tool_invocations`` row;
 * ``task.heartbeat``/``task.submit_result`` map onto the task engine and
   ``handoff.submit`` onto the handoff service, for this session's task only;
+  the handoff service revalidates the exact lease session/fence it is given
+  under the locked task row;
 * ``analysis.run_script`` is a registry tool like VT/Shodan: the attested
   worker capability (``analysis.exec``) and G2/budgets stay authoritative;
 * ``contribution.import`` reuses the M24-07 import service with an
@@ -58,6 +60,7 @@ from cti_app.application.agentic_sessions import (
 )
 from cti_app.application.investigation_handoffs import (
     HandoffCreateRequest,
+    HandoffLeaseAuthority,
     InvestigationHandoffService,
 )
 from cti_app.application.investigation_persistence import (
@@ -87,6 +90,7 @@ from cti_app.application.work_contributions import (
     WorkContributionService,
 )
 from cti_app.application.workspace_agent import WorkspaceAgentError
+from cti_app.domain.agentic_operator import AgentSessionV1
 from cti_app.domain.investigation import (
     FindingAssessment,
     FindingKind,
@@ -589,17 +593,47 @@ class AgenticToolBroker:
         # Defense in depth on top of the route's D7 verification: the session
         # row itself must still be active and bound to this task.
         session_row = await self._uow.agent_sessions.get(session.session_id)
+        task = await self._uow.investigation_tasks.get(session.task_id)
+        return self._require_current_authority(session, session_row, task, now=now)
+
+    async def _lock_lease_authority(
+        self, session: VerifiedAgentSession, *, task_id: UUID
+    ) -> InvestigationTaskV1:
+        """Revalidate the lease under the canonical lock order in the persisting UoW.
+
+        The cheap :meth:`_current_lease_task` gate runs before a possibly long
+        prelude.  A path whose effect is persisted in this unit of work calls
+        this second check first: it takes the investigation advisory lock then
+        the task row lock (the order every task command and the sweep use), so
+        a cancel, sweep, reassignment or session stop that committed in between
+        is observed and refused, and a concurrent one waits until this
+        transaction ends.  The deadline is compared on the database clock, like
+        the heartbeat UPDATE and the sweep.
+        """
+        await self._uow.investigation_tasks.lock_investigation(self._investigation_id)
+        task = await self._uow.investigation_tasks.lock_task(task_id)
+        session_row = await self._uow.agent_sessions.get(session.session_id)
+        now = await self._uow.investigation_tasks.database_now()
+        return self._require_current_authority(session, session_row, task, now=now)
+
+    @staticmethod
+    def _require_current_authority(
+        session: VerifiedAgentSession,
+        session_row: AgentSessionV1 | None,
+        task: InvestigationTaskV1 | None,
+        *,
+        now: datetime,
+    ) -> InvestigationTaskV1:
         if (
             session_row is None
-            or session_row.investigation_id != self._investigation_id
+            or session_row.investigation_id != session.investigation_id
             or session_row.task_id != session.task_id
             or not session_row.is_active
         ):
             raise AgenticSessionInactiveError("the agent session is not active")
-        task = await self._uow.investigation_tasks.get(session.task_id)
         if task is None:
             raise AgenticBindingRefusedError("the bound task no longer exists")
-        if task.investigation_id != self._investigation_id:
+        if task.investigation_id != session.investigation_id:
             raise AgenticBindingRefusedError("the bound task belongs to another investigation")
         if task.assigned_actor_kind is not TaskActorKind.OPERATOR:
             raise AgenticBindingRefusedError("the task is not assigned to an operator")
@@ -634,6 +668,11 @@ class AgenticToolBroker:
         state = await self._uow.investigation_states.get(self._investigation_id)
         if state is None:
             raise AgenticInvestigationNotStartedError("the investigation has no working state")
+        # The invocation journal row and its reservation are committed inside
+        # ``invoke``; the task row lock taken here is held across that commit,
+        # so a revocation committed after the cheap gate above cannot slip
+        # between the revalidation and the persisted effect.
+        task = await self._lock_lease_authority(session, task_id=task.id)
         result: OperatorToolInvocationResult = await self._invocations.invoke(
             tool_name=tool_name,
             schema_version=schema_version,
@@ -798,6 +837,11 @@ class AgenticToolBroker:
             actor=HandoffActor(kind=HandoffActorKind.OPERATOR, actor_id=operator_id),
             idempotency_key=idempotency_key,
             request=request,
+            authority=HandoffLeaseAuthority(
+                task_id=task.id,
+                session_id=session.session_id,
+                lease_fence=task.lease_fence,
+            ),
         )
         return AgenticToolResult(
             investigation_id=self._investigation_id,
@@ -926,6 +970,11 @@ class AgenticToolBroker:
             request = AgenticNoteCaptureArguments.model_validate(payload)
         except ValueError as exc:
             raise AgenticArgumentsInvalidError(f"invalid note capture payload: {exc}") from None
+        # The host write is the effect and it is not transactional with the
+        # backend: hold the task row lock across it so a cancel/sweep cannot
+        # commit between the revalidation and the published revision.  The
+        # route's unit of work releases the lock when it exits.
+        await self._lock_lease_authority(session, task_id=task.id)
         try:
             result = await self._notes.capture(
                 self._investigation_id,

@@ -636,9 +636,12 @@ async def test_operator_handoff_requires_task_ownership() -> None:
             request=harness.request(),
         )
 
-    # Seed a dedicated task the operator owns; the fake has no assignment
-    # primitive and the production rule under test is ownership, not CAS.
+    # Seed a dedicated task the operator owns *and holds a live lease on*: D3
+    # makes an operator handoff a write under the lease, so ownership alone
+    # (READY, no lease) is no longer enough.  The production rule under test is
+    # ownership, not CAS.
     operator_task_id = uuid4()
+    real_now = datetime.now(UTC)
     operator_task = InvestigationTaskV1(
         id=operator_task_id,
         investigation_id=INVESTIGATION_ID,
@@ -647,7 +650,7 @@ async def test_operator_handoff_requires_task_ownership() -> None:
         question="q",
         objective="o",
         priority=TaskPriority.NORMAL,
-        status=TaskStatus.READY,
+        status=TaskStatus.RUNNING,
         status_version=1,
         result_verification_status=ResultVerificationStatus.UNVERIFIED,
         created_by=TaskActor(kind=TaskActorKind.HUMAN, actor_id="analyst:test"),
@@ -655,6 +658,11 @@ async def test_operator_handoff_requires_task_ownership() -> None:
         updated_at=NOW,
         assigned_actor_kind=TaskActorKind.OPERATOR,
         assigned_actor_id=OPERATOR_ACTOR.actor_id,
+        lease_id=uuid4(),
+        lease_session_id=uuid4(),
+        lease_fence=1,
+        lease_expires_at=real_now + timedelta(minutes=5),
+        heartbeat_at=real_now,
     )
     await harness.tasks.add(operator_task)
     record = await harness.service.create(
