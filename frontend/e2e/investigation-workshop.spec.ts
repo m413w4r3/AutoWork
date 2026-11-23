@@ -428,6 +428,68 @@ test("plan et tâches : acceptation, action absente et CAS périmé", async ({
   await capture(page, "02-plan-et-taches");
 });
 
+test("demander à Bridge depuis une tâche : avis consultatif, registre et aucune mutation de tâche", async ({
+  page,
+}) => {
+  const api = createWorkshopApi();
+  await launchWorkshop(page, api);
+  await openView(page, "Plan et tâches");
+
+  await page.getByLabel(/Je confirme l’acceptation de cette version/).check();
+  await page
+    .getByRole("button", { name: "Accepter le plan et créer les tâches" })
+    .click();
+  await expect(
+    page.getByText(/Plan accepté : 2 tâche\(s\) créée\(s\)/),
+  ).toBeVisible();
+
+  const card = page
+    .getByRole("article")
+    .filter({ hasText: "Vérifier le domaine C2" });
+  await expect(card).toBeVisible();
+  await card.getByRole("button", { name: "Demander à Bridge" }).click();
+  await expect(
+    card.getByText(/ni résultat de tâche, ni preuve, ni décision/),
+  ).toBeVisible();
+
+  await card.getByLabel("Type de demande").selectOption("critique");
+  await card
+    .getByLabel("Question pour Bridge")
+    .fill("Le domaine est-il bien un C2 ?");
+  await card
+    .getByRole("button", { name: "Envoyer la demande à Bridge" })
+    .click();
+
+  await expect(card.getByText(/Demande : Reçue — Parsée/)).toBeVisible();
+  const ledgerRow = card
+    .locator(".m24-consultations li")
+    .filter({ hasText: "Critique technique" });
+  await expect(ledgerRow).toHaveCount(1);
+  await expect(ledgerRow).toContainText("Reçue");
+
+  const consultation = api.requests.find(
+    (request) =>
+      request.method === "POST" &&
+      request.path ===
+        `/api/investigations/${api.ids.investigation}/tasks/${api.ids.taskReady}/consultations`,
+  );
+  expect(consultation?.body).toMatchObject({
+    consultation_type: "critique",
+    question: "Le domaine est-il bien un C2 ?",
+    include_previous_consultation: false,
+  });
+  expect(consultation?.idempotencyKey).toBeTruthy();
+  expect(
+    api.requests.filter(
+      (request) =>
+        request.method === "POST" && request.path.endsWith("/commands"),
+    ),
+  ).toEqual([]);
+  expect(api.unhandled).toEqual([]);
+
+  await capture(page, "05-demander-a-bridge-tache");
+});
+
 test("ouvre une enquête existante sans relancer un start legacy", async ({
   page,
 }) => {

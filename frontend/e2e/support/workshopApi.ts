@@ -48,8 +48,13 @@ import type {
   ConsultationLedgerV1,
   PlanAcceptResponseV1,
   PlanListV1,
+  PlanRequestResponseV1,
   PlanVersionDetailV1,
 } from "../../src/features/investigation/api/plans";
+import type {
+  TaskConsultationResponseV1,
+  TaskConsultationV1,
+} from "../../src/features/investigation/api/taskConsultations";
 import type {
   TaskPageView,
   TaskView,
@@ -954,6 +959,21 @@ function planAccept(tasks: TaskView[]): PlanAcceptResponseV1 {
   };
 }
 
+function planRequestResponse(): PlanRequestResponseV1 {
+  return {
+    investigation_id: ids.investigation,
+    invocation_id: ids.bridgeInvocation,
+    invocation_status: "succeeded",
+    idempotent_replay: false,
+    advisor_parse_status: "parsed",
+    plan_parse_status: "parsed",
+    plan_version_id: ids.plan,
+    plan_version: 1,
+    missing_fields: [],
+    advice_only: false,
+  };
+}
+
 function makeTask(params: {
   id: string;
   key: string;
@@ -1281,8 +1301,38 @@ function sessionSummary(
   };
 }
 
-function consultations(): ConsultationLedgerV1 {
-  return { investigation_id: ids.investigation, consultations: [] };
+function taskConsultationRow(
+  invocationId: string,
+  taskId: string,
+  consultationType: string,
+): TaskConsultationV1 {
+  return {
+    invocation_id: invocationId,
+    operation_key: `operator:e2e:${invocationId}`,
+    consultation_type: consultationType,
+    invocation_status: "succeeded",
+    requester_actor_kind: "human",
+    requester_actor_id: "human:dev-analyst",
+    task_id: null,
+    agent_session_id: null,
+    context_task_id: taskId,
+    call_observation_id: null,
+    response_observation_id: null,
+    output_sha256: SHA.content,
+    parse_status: "parsed",
+    readable: true,
+    usable: true,
+    advisory_only: true,
+    editorial_target: null,
+    is_evidence: false,
+    extracted_elements: [],
+    contributions: [],
+    limitations: [],
+    reconciliation_state: "not_required",
+    created_at: "2026-11-23T10:20:00Z",
+    updated_at: "2026-11-23T10:21:00Z",
+    response_observed_at: "2026-11-23T10:21:00Z",
+  };
 }
 
 function contributions(): WorkContributionView[] {
@@ -1536,6 +1586,9 @@ export function createWorkshopApi(options: WorkshopApiOptions = {}) {
   let sampleQualification: SampleQualification = "candidate";
   let tasks: TaskView[] = [];
   let sessions: AgentSessionView[] = [];
+  let taskConsultations: TaskConsultationV1[] = [];
+  const consultationResponses = new Map<string, TaskConsultationResponseV1>();
+  let consultationSequence = 0;
   let conflictResolved = false;
 
   const inv = (suffix: string) =>
@@ -1799,8 +1852,60 @@ export function createWorkshopApi(options: WorkshopApiOptions = {}) {
       tasks = acceptedTasks();
       return fulfill(route, planAccept(tasks));
     }
+    if (path === inv("/plans/request") && method === "POST") {
+      return fulfill(route, planRequestResponse());
+    }
     if (path === inv("/consultations") && method === "GET") {
-      return fulfill(route, consultations());
+      const taskId = url.searchParams.get("task_id");
+      const rows =
+        taskId === null
+          ? taskConsultations
+          : taskConsultations.filter(
+              (consultation) => consultation.context_task_id === taskId,
+            );
+      const payload: ConsultationLedgerV1 = {
+        investigation_id: ids.investigation,
+        consultations: rows,
+      };
+      return fulfill(route, payload);
+    }
+    if (
+      path.startsWith(inv("/tasks/")) &&
+      path.endsWith("/consultations") &&
+      method === "POST"
+    ) {
+      const taskId = path.slice(
+        inv("/tasks/").length,
+        -"/consultations".length,
+      );
+      const task = tasks.find((item) => item.id === taskId);
+      if (task === undefined) return fail(route, 404, "task_not_found");
+      const key = request.headers()["idempotency-key"] ?? "";
+      const replayKey = `${taskId}:${key}`;
+      const replayed = consultationResponses.get(replayKey);
+      if (replayed !== undefined) return fulfill(route, replayed);
+      const post = asRecord(body);
+      const consultationType =
+        typeof post.consultation_type === "string"
+          ? post.consultation_type
+          : "interpretation";
+      consultationSequence += 1;
+      const invocationId = `c0de0000-0000-4000-8000-${String(consultationSequence).padStart(12, "0")}`;
+      const consultation = taskConsultationRow(
+        invocationId,
+        taskId,
+        consultationType,
+      );
+      taskConsultations = [...taskConsultations, consultation];
+      const response: TaskConsultationResponseV1 = {
+        invocation_id: invocationId,
+        invocation_status: "succeeded",
+        context_task_id: taskId,
+        task_context_sha256: SHA.content,
+        consultation,
+      };
+      consultationResponses.set(replayKey, response);
+      return fulfill(route, response);
     }
 
     if (path === inv("/tasks") && method === "GET") {

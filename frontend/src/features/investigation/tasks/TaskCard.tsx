@@ -49,6 +49,7 @@ import {
   type OpenSessionFeedback,
 } from "./OpenSessionAction";
 import { sessionLaunchTarget } from "./sessionLaunch";
+import { TaskBridgePanel } from "./TaskBridgePanel";
 
 type TransferDestination = "human" | "codex_cli" | "claude_code";
 type SimpleCommand = "start" | "release" | "submit" | "unblock";
@@ -507,6 +508,8 @@ export function TaskCard({
         uniquement si le sondage des capacités atteste le confinement isolé du
         CLI. L’attribution seule ne démarre aucun agent.
       </p>
+
+      <TaskBridgePanel investigationId={investigationId} task={task} />
 
       {launchTarget === null ? null : (
         <div className="m24-task-card__session-launch">
