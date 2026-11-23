@@ -63,6 +63,7 @@ from cti_app.application.typst_rendering import (
     load_template_bundle,
 )
 from cti_app.domain.analyst_opinion import AnalystOpinionV1, CanonicalCodeNoteBlockV1
+from cti_app.domain.edition_publication import EditionDocumentV2
 from cti_app.domain.editorial import AnalystDecisionTargetType, AnalystDecisionType
 from cti_app.domain.investigation import EvidenceObservation, InvestigationFinding
 from cti_app.domain.investigation_graph import InvestigationGraph
@@ -316,6 +317,45 @@ async def load_note_block_render_context(
         blobs=blobs,
         element_facts=note_article_element_facts(base_document),
     )
+
+
+async def load_edition_note_block_render_contexts(
+    *,
+    uow_factory: PublicationRenderUnitOfWorkFactory,
+    artifact_store: ProductionArtifactStore,
+    document: EditionDocumentV2,
+) -> dict[UUID, NoteBlockRenderContext]:
+    """Read the canonical facts every note block of an edition publication cites.
+
+    Contexts are keyed by the publication subject so an edition renders each
+    opinion with exactly the canonical observations, blobs and pinned element
+    facts its blocks reference. A publication without content blocks gets no
+    context and keeps byte-identical render data.
+    """
+    contexts: dict[UUID, NoteBlockRenderContext] = {}
+    for publication in document.publications:
+        source = publication.document
+        publication_v6 = (
+            source.base_publication.base_publication
+            if isinstance(source, PublicationDocumentV8)
+            else source.base_publication
+            if isinstance(source, PublicationDocumentV7)
+            else source
+            if isinstance(source, PublicationDocumentV6)
+            else None
+        )
+        opinion = publication_v6.analyst_opinion if publication_v6 is not None else None
+        if opinion is None:
+            continue
+        context = await load_note_block_render_context(
+            uow_factory=uow_factory,
+            artifact_store=artifact_store,
+            opinion=opinion,
+            base_document=source,
+        )
+        if context is not None:
+            contexts[publication.subject_id] = context
+    return contexts
 
 
 class PublicationRenderService:

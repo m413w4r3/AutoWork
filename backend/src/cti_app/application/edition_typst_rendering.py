@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from datetime import date
 from typing import Any, get_args
 from uuid import UUID
@@ -16,6 +17,7 @@ from cti_app.application.edition_ioc_export import (
 from cti_app.application.pdf_mapping import MAPPING_RENDERER_VERSION
 from cti_app.application.publication_secret_guard import guard_publication_render_data
 from cti_app.application.typst_rendering import (
+    NoteBlockRenderContext,
     TemplateBundleInvalidError,
     TypstMediaRef,
     TypstRenderSource,
@@ -85,7 +87,14 @@ class EditionTypstRenderer:
         *,
         document_label: str,
         artifact_identities: dict[str, dict[str, Any]] | None = None,
+        note_block_contexts: Mapping[UUID, NoteBlockRenderContext] | None = None,
     ) -> TypstRenderSource:
+        """Project the edition; each publication resolves note blocks from its own context.
+
+        A publication whose opinion carries note content blocks without the
+        canonical context still refuses the whole edition render; contexts are
+        keyed by the publication subject.
+        """
         if not isinstance(document_label, str) or not document_label.strip():
             raise TemplateBundleInvalidError("Edition render requires document_label")
         entrypoint = next(
@@ -145,6 +154,11 @@ class EditionTypstRenderer:
                 publication.document,
                 include_brief_chronology=True,
                 brief_timeline_policy_version=brief_timeline_policy_version,
+                note_block_context=(
+                    note_block_contexts.get(publication.subject_id)
+                    if note_block_contexts is not None
+                    else None
+                ),
             )
             article_title_target_id = None
             if target_identities is not None:

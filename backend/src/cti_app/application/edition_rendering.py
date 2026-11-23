@@ -23,6 +23,9 @@ from cti_app.application.production_artifact_store import (
     MAX_ARTIFACT_BYTES,
     ProductionArtifactStore,
 )
+from cti_app.application.publication_rendering import (
+    load_edition_note_block_render_contexts,
+)
 from cti_app.application.render_target_identities import (
     publication_target_artifact_identities,
 )
@@ -217,6 +220,11 @@ class EditionRenderService:
         document = await self._read_edition_document(release)
         artifact_identities = await self._read_manifest_artifact_identities(release)
         publication_lineage = await self._read_pinned_publication_lineage(release, document)
+        note_block_contexts = await load_edition_note_block_render_contexts(
+            uow_factory=self._uow_factory,
+            artifact_store=self._artifact_store,
+            document=document,
+        )
         try:
             template_bundle, font_bundle = load_typst_render_bundle_snapshots(
                 chp_typst_root=self._chp_typst_root,
@@ -315,11 +323,15 @@ class EditionRenderService:
                     },
                     "rendered_at": now.isoformat(),
                 }
+                render_kwargs: dict[str, Any] = {}
+                if note_block_contexts:
+                    render_kwargs["note_block_contexts"] = note_block_contexts
                 source = self._renderer.render(
                     document,
                     template_bundle,
                     document_label=label,
                     artifact_identities=artifact_identities,
+                    **render_kwargs,
                 )
                 payload = json.loads(source.render_data_bytes)
                 if not isinstance(payload, dict):

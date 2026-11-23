@@ -14,6 +14,7 @@ from cti_app.application.publication_builder import (
     build_publication_document_v5,
 )
 from cti_app.application.typst_rendering import (
+    NoteBlockRenderContext,
     project_publication_to_typst_model,
     publication_content_section_types,
 )
@@ -126,6 +127,18 @@ def _semantic_annotation_has_full_occurrence_coverage(
     return True
 
 
+_NOTE_CONTENT_BLOCK_TYPES = frozenset(
+    {"article_element", "canonical_code", "ioc_table", "protocol_figure"}
+)
+# A note content block is a typed reader projection: the template prints its
+# excerpt, table rows and provenance line. Its canonical digests and provenance
+# parts are rendered references, not the legacy hidden IOC metadata this scan
+# refuses elsewhere.
+_NOTE_CONTENT_BLOCK_RENDER_KEYS = frozenset(
+    {"provenance", "element_sha256", "blob_sha256", "excerpt_sha256", "asset_sha256"}
+)
+
+
 def _contains_reader_hidden_metadata(value: Any) -> bool:
     """Reject legacy IOC status and provenance fields in reader projections."""
     hidden_keys = {
@@ -139,6 +152,12 @@ def _contains_reader_hidden_metadata(value: Any) -> bool:
         "chronology",
     }
     if isinstance(value, dict):
+        if value.get("block_type") in _NOTE_CONTENT_BLOCK_TYPES:
+            return any(
+                _contains_reader_hidden_metadata(item)
+                for key, item in value.items()
+                if key not in _NOTE_CONTENT_BLOCK_RENDER_KEYS
+            )
         # Figure blocks carry the archived media digest for renderer-side media
         # resolution; the template never prints it, so it is not reader metadata.
         media_keys = {"sha256", "sha256_spans"} if value.get("type") == "figure" else set()
@@ -171,6 +190,7 @@ def qa_publication_v5(
     editorial_enrichment: EditorialEnrichmentV1,
     publication: CanonicalPublicationDocument,
     render_document: CanonicalPublicationDocument | None = None,
+    note_block_context: NoteBlockRenderContext | None = None,
 ) -> dict[str, Any]:
     """Rebuild the pure projection and require byte-for-byte semantic equality."""
     v6 = publication if isinstance(publication, PublicationDocumentV6) else None
@@ -386,7 +406,13 @@ def qa_publication_v5(
         else:
             errors.append("Resolved publication projection does not match its canonical V6 body")
     try:
-        render_model = project_publication_to_typst_model(projection_source)
+        projection_kwargs: dict[str, Any] = {}
+        if note_block_context is not None:
+            projection_kwargs["note_block_context"] = note_block_context
+        render_model = project_publication_to_typst_model(
+            projection_source,
+            **projection_kwargs,
+        )
     except ValueError:
         checks["references_then_synthesis"] = False
     else:
@@ -557,6 +583,7 @@ def qa_publication_v7(
     synthesis: ProductionSynthesisV1,
     editorial_enrichment: EditorialEnrichmentV1 | None,
     publication: CanonicalPublicationDocument,
+    note_block_context: NoteBlockRenderContext | None = None,
 ) -> dict[str, Any]:
     """Apply input requirements selected by the explicit V7 publication kind."""
     publication_v8 = publication if isinstance(publication, PublicationDocumentV8) else None
@@ -584,6 +611,7 @@ def qa_publication_v7(
             editorial_enrichment=editorial_enrichment,
             publication=publication.base_publication,
             render_document=render_document,
+            note_block_context=note_block_context,
         )
         result["checks"]["publication_kind_explicit"] = True
         result["checks"]["routing_metadata_valid"] = bool(
@@ -758,7 +786,13 @@ def qa_publication_v7(
             errors.append(error_text)
 
     try:
-        render_model = project_publication_to_typst_model(render_document or publication)
+        projection_kwargs: dict[str, Any] = {}
+        if note_block_context is not None:
+            projection_kwargs["note_block_context"] = note_block_context
+        render_model = project_publication_to_typst_model(
+            render_document or publication,
+            **projection_kwargs,
+        )
     except ValueError:
         checks["brief_render_sections"] = False
         errors.append("Brief cannot be projected into the publication renderer")

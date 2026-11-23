@@ -26,7 +26,7 @@ from cti_app.application.typst_compilation import (
     CompiledTypstDocument,
     TypstCompileRequest,
 )
-from cti_app.application.typst_rendering import load_template_bundle
+from cti_app.application.typst_rendering import NoteBlockRenderContext, load_template_bundle
 from cti_app.domain.classification import TLP
 from cti_app.domain.edition_composition import (
     CompositionDisposition,
@@ -511,6 +511,48 @@ async def test_preview_pdf_uses_edition_typst_template_and_creates_no_rows(
     assert uow.publication_manifests == []
     assert uow.edition_releases == []
     assert uow.edition_renders == []
+
+
+@pytest.mark.asyncio
+async def test_preview_pdf_forwards_note_block_contexts_from_the_loader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    context = NoteBlockRenderContext(observations=())
+
+    class _CapturingPdfRenderer:
+        async def render(
+            self,
+            document: EditionDocumentV2,
+            *,
+            artifact_identities: dict[str, dict[str, object]] | None = None,
+            preview_input_hash: str | None = None,
+            note_block_contexts: Any = None,
+        ) -> bytes:
+            del artifact_identities, preview_input_hash
+            captured["contexts"] = note_block_contexts
+            return b"%PDF-preview-note"
+
+    async def _load_contexts(**kwargs: Any) -> dict[UUID, NoteBlockRenderContext]:
+        assert kwargs["document"].publications
+        return {SUBJECT_IDS[0]: context}
+
+    monkeypatch.setattr(
+        edition_preview,
+        "load_edition_note_block_render_contexts",
+        _load_contexts,
+    )
+    service, _, _ = _service(pdf_renderer=cast(Any, _CapturingPdfRenderer()))
+    preview = await service.preview(EDITION_ID)
+
+    result = await service.preview_pdf(
+        EDITION_ID,
+        expected_preview_input_hash=preview.preview_input_hash,
+    )
+
+    assert result.content == b"%PDF-preview-note"
+    assert captured["contexts"] == {SUBJECT_IDS[0]: context}
 
 
 @pytest.mark.asyncio

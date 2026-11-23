@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,9 @@ from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.pdf_mapping import mapping_cache_key
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.publication_rendering import (
+    load_edition_note_block_render_contexts,
+)
 from cti_app.application.render_target_identities import (
     publication_target_artifact_identities,
 )
@@ -44,7 +48,7 @@ from cti_app.application.typst_render_execution import (
     translate_execution_error,
 )
 from cti_app.application.typst_render_lifecycle import TypstMappingSidecarCache
-from cti_app.application.typst_rendering import TemplateBundleInvalidError
+from cti_app.application.typst_rendering import NoteBlockRenderContext, TemplateBundleInvalidError
 from cti_app.domain.edition_composition import CompositionDisposition
 from cti_app.domain.edition_publication import EditionDocumentV2
 from cti_app.domain.edition_render import EDITION_RENDERER_VERSION
@@ -164,6 +168,7 @@ class EditionPreviewPdfRenderer:
         *,
         artifact_identities: dict[str, dict[str, object]] | None = None,
         preview_input_hash: str | None = None,
+        note_block_contexts: Mapping[UUID, NoteBlockRenderContext] | None = None,
     ) -> bytes:
         try:
             template_bundle, font_bundle = load_typst_render_bundle_snapshots(
@@ -180,6 +185,9 @@ class EditionPreviewPdfRenderer:
             ) from exc
 
         try:
+            render_kwargs: dict[str, Any] = {}
+            if note_block_contexts:
+                render_kwargs["note_block_contexts"] = note_block_contexts
             render_source = self._renderer.render(
                 document,
                 template_bundle,
@@ -188,6 +196,7 @@ class EditionPreviewPdfRenderer:
                     f"v{document.edition['version']}"
                 ),
                 artifact_identities=artifact_identities,
+                **render_kwargs,
             )
         except TemplateBundleInvalidError as exc:
             raise EditionPreviewTemplateInvalidError(str(exc)) from exc
@@ -438,10 +447,19 @@ class EditionPreviewService:
                     if isinstance(policy_version, str):
                         identity["brief_assembly_policy_version"] = policy_version
                 artifact_identities[str(item.subject_id)] = identity
+        note_block_contexts = await load_edition_note_block_render_contexts(
+            uow_factory=self._uow_factory,
+            artifact_store=self._artifact_store,
+            document=preview.document,
+        )
+        render_kwargs: dict[str, Any] = {}
+        if note_block_contexts:
+            render_kwargs["note_block_contexts"] = note_block_contexts
         content = await self._pdf_renderer.render(
             preview.document,
             artifact_identities=artifact_identities,
             preview_input_hash=preview.preview_input_hash,
+            **render_kwargs,
         )
         return EditionPreviewPdf(
             content=content,
