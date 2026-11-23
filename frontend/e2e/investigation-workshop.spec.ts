@@ -3,7 +3,11 @@ import { join } from "node:path";
 
 import { expect, test, type Page } from "@playwright/test";
 
-import { createWorkshopApi, type WorkshopApi } from "./support/workshopApi";
+import {
+  createWorkshopApi,
+  ids as workshopIds,
+  type WorkshopApi,
+} from "./support/workshopApi";
 
 /**
  * M24 workshop cockpit, desktop only (1440×900, keyboard pass at 1280×800).
@@ -16,6 +20,14 @@ import { createWorkshopApi, type WorkshopApi } from "./support/workshopApi";
 test.describe.configure({ timeout: 45_000 });
 
 const SHOTS = join(process.cwd(), "test-results", "workshop-cockpit");
+
+/** The node tsconfig has no DOM lib; element evaluates use this local shape. */
+interface Box {
+  width: number;
+  height: number;
+  top: number;
+  left: number;
+}
 
 test.beforeEach(async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
@@ -55,6 +67,18 @@ async function launchWorkshop(page: Page, api: WorkshopApi) {
 
 async function openView(page: Page, name: string) {
   await page.getByRole("tab", { name }).click();
+}
+
+/** Open the folded launch/list cards without toggling a possibly open fold. */
+async function expandSourceSections(page: Page) {
+  await page.getByText("Synthèse et enquêtes du sujet").evaluate((summary) => {
+    const details = (
+      summary as unknown as {
+        parentElement: { open: boolean } | null;
+      }
+    ).parentElement;
+    if (details !== null) details.open = true;
+  });
 }
 
 test("lance l’atelier M24 et navigue les cinq vues au clavier", async ({
@@ -123,6 +147,35 @@ test("lance l’atelier M24 et navigue les cinq vues au clavier", async ({
     "aria-labelledby",
     "workshop-tab-opinion",
   );
+});
+
+test("cockpit : la tablist est visible sans défilement à 1280×800", async ({
+  page,
+}) => {
+  const api = createWorkshopApi();
+  await launchWorkshop(page, api);
+
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.evaluate("window.scrollTo(0, 0)");
+  const tablist = page.getByRole("tablist", {
+    name: "Vues du cockpit d’enquête",
+  });
+  const box = await tablist.boundingBox();
+  expect(box).not.toBeNull();
+  expect(box?.y ?? Number.NEGATIVE_INFINITY).toBeGreaterThanOrEqual(0);
+  expect((box?.y ?? 0) + (box?.height ?? 0)).toBeLessThanOrEqual(800);
+
+  // The launch/list cards above the cockpit are folded, not removed.
+  await expect(page.getByText("Synthèse et enquêtes du sujet")).toBeVisible();
+  for (const label of [
+    "Vue d’ensemble",
+    "Plan et tâches",
+    "Échantillons et résultats",
+    "Workspace et notes",
+    "Note de l’analyste",
+  ]) {
+    await expect(tablist.getByRole("tab", { name: label })).toBeVisible();
+  }
 });
 
 test("vue d’ensemble : agent hôte absent, workspace indisponible et G2 bloqué", async ({
@@ -246,6 +299,9 @@ test("vue d’ensemble : extension puis révocation G2 de l’enveloppe approuv�
   await page
     .getByRole("button", { name: "Enquête / Avis de l’analyste" })
     .click();
+  // The launch/list cards are folded once a workshop investigation is
+  // selected (R5-F5); expand them to reach the explicit open action.
+  await expandSourceSections(page);
   await page
     .getByRole("button", { name: "Ouvrir l’enquête sur cette version" })
     .click();
@@ -348,23 +404,60 @@ test("plan et tâches : acceptation, action absente et CAS périmé", async ({
 
   const timeline = page.getByRole("region", { name: "Chronologie commune" });
   const entries = [
-    ["handoff:v1:human->operator", "Passation"],
-    ["contribution:finding:imported", "Contribution"],
-    ["agent_session:codex_cli:running", "Session d’agent"],
-    ["instruction:queued", "Instruction humaine"],
+    [
+      "Passation v1 · Humain → Opérateur",
+      "Passation",
+      "handoff:v1:human->operator",
+    ],
+    ["Finding importé", "Contribution", "contribution:finding:imported"],
+    [
+      "Session Codex CLI · En cours",
+      "Session d’agent",
+      "agent_session:codex_cli:running",
+    ],
+    [
+      "Instruction humaine · En file (agent occupé)",
+      "Instruction humaine",
+      "instruction:queued",
+    ],
   ] as const;
-  for (const [summary, label] of entries) {
-    const entry = timeline.getByRole("listitem").filter({ hasText: summary });
+  for (const [sentence, label, raw] of entries) {
+    const entry = timeline.getByRole("listitem").filter({ hasText: sentence });
     await expect(entry.getByText(label, { exact: true })).toBeVisible();
+    // The raw projection token stays readable as the item title.
+    await expect(entry.getByTitle(raw)).toHaveText(sentence);
   }
   await expect(
     timeline.getByText("Non probant — élément de travail"),
   ).toHaveCount(4);
   await expect(timeline.getByText("Preuve canonique")).toHaveCount(1);
 
+  // Technical refs carry a French label; persisted ids stay whole in the
+  // title while the visible value is abbreviated.
+  const decisionEntry = timeline
+    .getByRole("listitem")
+    .filter({ hasText: "Approbation d’un pivot" });
+  await expect(decisionEntry.getByText("Type de cible")).toBeVisible();
+  await expect(decisionEntry.getByText("pivot", { exact: true })).toBeVisible();
+  await expect(decisionEntry.getByTitle(workshopIds.sample)).toHaveText(
+    `${workshopIds.sample.slice(0, 12)}…`,
+  );
+
+  // An operator actor id is shown with the adapter label, not `operator:...`.
+  const toolEntry = timeline
+    .getByRole("listitem")
+    .filter({ hasText: "Téléchargement d’un échantillon VT" });
+  await expect(toolEntry.getByText("Opérateur · Codex CLI")).toBeVisible();
+  await expect(toolEntry.getByText("Clé d’opération")).toBeVisible();
+  await expect(toolEntry.getByText("operator:digest:payload")).toBeVisible();
+
   await page.getByLabel(/Type d’événement/).selectOption("instruction");
-  await expect(timeline.getByText("instruction:queued")).toBeVisible();
-  await expect(timeline.getByText("handoff:v1:human->operator")).toHaveCount(0);
+  await expect(
+    timeline.getByText("Instruction humaine · En file (agent occupé)"),
+  ).toBeVisible();
+  await expect(
+    timeline.getByText("Passation v1 · Humain → Opérateur"),
+  ).toHaveCount(0);
   await page.getByLabel(/Type d’événement/).selectOption("all");
 
   await page.getByLabel(/Je confirme l’acceptation de cette version/).check();
@@ -499,6 +592,7 @@ test("ouvre une enquête existante sans relancer un start legacy", async ({
   await page
     .getByRole("button", { name: "Enquête / Avis de l’analyste" })
     .click();
+  await expandSourceSections(page);
 
   const open = page.getByRole("button", {
     name: "Ouvrir l’enquête sur cette version",
@@ -726,7 +820,8 @@ test("attribution puis ouverture explicite de la session Codex", async ({
   await expect(
     page.getByText("Codex CLI · Vérifier le domaine C2"),
   ).toBeVisible();
-  await expect(page.getByText("En cours").first()).toBeVisible();
+  const operators = page.getByRole("region", { name: "Opérateurs actifs" });
+  await expect(operators.getByText("En cours").first()).toBeVisible();
   await expect(page.getByText("Aucun opérateur actif.")).toHaveCount(0);
   expect(api.unhandled).toEqual([]);
 });
@@ -820,7 +915,7 @@ test("workspace et notes : arborescence, note non vérifiée et résolution de c
     expected_working_state_version: 5,
   });
   expect(bridge?.idempotencyKey).toBeTruthy();
-  await expect(page.getByText(/avis consultatif — non preuve/)).toBeVisible();
+  await expect(page.getByText(/avis consultatif — non probant/)).toBeVisible();
 
   await expect(
     page.getByRole("heading", { name: "Conflits", exact: true }),
@@ -1066,6 +1161,165 @@ test("note de l’analyste : blocs de contenu référencés puis vérifiés", as
     page.getByRole("heading", { name: "Note acceptée" }),
   ).toBeVisible();
   expect(api.unhandled).toEqual([]);
+});
+
+test("note de l’analyste : aucune largeur ne déborde aux trois résolutions", async ({
+  page,
+}) => {
+  const api = createWorkshopApi({
+    contentBlocks: [
+      {
+        block_type: "ioc_table",
+        observation_ids: [workshopIds.observation, workshopIds.longObservation],
+        title: "Tableau IOC (2)",
+      },
+    ],
+  });
+  await launchWorkshop(page, api);
+  await openView(page, "Note de l’analyste");
+
+  // The widest realistic value is the bootstrap observation option: a long
+  // object type, a full UUID object id and a dotted source. Its short label is
+  // shown, the full identity stays in the option title.
+  const observationSelect = page.getByLabel("Observation source");
+  const longOption = observationSelect.locator(
+    `option[value="${workshopIds.longObservation}"]`,
+  );
+  await expect(longOption).toHaveAttribute(
+    "title",
+    /investigation\.bootstrap_snapshot/,
+  );
+
+  await page.getByRole("button", { name: "Examiner la proposition" }).click();
+  await expect(
+    page.getByRole("region", { name: /Proposition ciblée/ }),
+  ).toBeVisible();
+  // The read-only IOC table (full UUID observation ids) is rendered too.
+  await expect(
+    page.getByRole("table", { name: "Tableau IOC (2)" }),
+  ).toBeVisible();
+
+  for (const viewport of [
+    { width: 1280, height: 800 },
+    { width: 1440, height: 900 },
+    { width: 1920, height: 1080 },
+  ]) {
+    await page.setViewportSize(viewport);
+    await page.evaluate("window.scrollTo(0, 0)");
+    // The node tsconfig has no DOM lib; these evaluate calls stay strings and
+    // locator bounding boxes carry the layout numbers.
+    const clientWidth = await page.evaluate<number>(
+      "document.documentElement.clientWidth",
+    );
+    const scrollWidth = await page.evaluate<number>(
+      "document.documentElement.scrollWidth",
+    );
+    const mainBox = await page.locator("main").boundingBox();
+    const cardBox = await page
+      .locator("section.job-card.opinion-notes")
+      .boundingBox();
+    expect(clientWidth, `${viewport.width}px client width`).toBe(
+      viewport.width,
+    );
+    expect(
+      scrollWidth,
+      `${viewport.width}px document scroll width`,
+    ).toBeLessThanOrEqual(clientWidth);
+    expect(mainBox).not.toBeNull();
+    expect(cardBox).not.toBeNull();
+    expect(
+      cardBox?.width ?? Number.POSITIVE_INFINITY,
+      `${viewport.width}px opinion card width`,
+    ).toBeLessThanOrEqual((mainBox?.width ?? 0) + 1);
+  }
+});
+
+test("cases à cocher et radios : le contrôle reste collé au libellé", async ({
+  page,
+}) => {
+  const api = createWorkshopApi();
+  await launchWorkshop(page, api);
+
+  const inlineChoices = async () =>
+    page
+      .locator(
+        "label:has(> input[type='checkbox']), label:has(> input[type='radio'])",
+      )
+      .evaluateAll((labels) =>
+        labels.map((label) => {
+          const element = label as unknown as {
+            querySelector(selector: string): {
+              getBoundingClientRect(): Box;
+            } | null;
+            getBoundingClientRect(): Box;
+            textContent: string | null;
+          };
+          const input = element.querySelector(
+            "input[type='checkbox'], input[type='radio']",
+          );
+          if (input === null) throw new Error("label without control");
+          const labelRect = element.getBoundingClientRect();
+          const inputRect = input.getBoundingClientRect();
+          return {
+            text: (element.textContent ?? "").trim().slice(0, 48),
+            inputWidth: Math.round(inputRect.width),
+            inputHeight: Math.round(inputRect.height),
+            offsetFromLabel: Math.round(inputRect.left - labelRect.left),
+            topFromLabel: Math.round(inputRect.top - labelRect.top),
+          };
+        }),
+      );
+
+  // Another view (G2 envelope approval confirmation) uses the same inline
+  // pattern and must not regress either.
+  const overviewChoices = await inlineChoices();
+  expect(overviewChoices.length).toBeGreaterThan(0);
+  for (const choice of overviewChoices) {
+    expect(choice.inputWidth, choice.text).toBeLessThanOrEqual(24);
+    expect(choice.inputHeight, choice.text).toBeLessThanOrEqual(24);
+    expect(choice.offsetFromLabel, choice.text).toBeLessThanOrEqual(4);
+  }
+
+  await openView(page, "Note de l’analyste");
+  await page.getByRole("button", { name: "Examiner la proposition" }).click();
+  await expect(
+    page.getByRole("region", { name: /Proposition ciblée/ }),
+  ).toBeVisible();
+
+  const acceptance = page
+    .locator("label")
+    .filter({ hasText: "J’ai examiné le texte stocké" });
+  await expect(acceptance.getByRole("checkbox")).toBeVisible();
+  const acceptanceMetrics = await acceptance.evaluate((label) => {
+    const element = label as unknown as {
+      querySelector(selector: string): {
+        getBoundingClientRect(): Box;
+      } | null;
+      getBoundingClientRect(): Box;
+    };
+    const input = element.querySelector("input[type='checkbox']");
+    if (input === null) throw new Error("missing acceptance checkbox");
+    const labelRect = element.getBoundingClientRect();
+    const inputRect = input.getBoundingClientRect();
+    return {
+      inputWidth: Math.round(inputRect.width),
+      inputHeight: Math.round(inputRect.height),
+      offsetFromLabel: Math.round(inputRect.left - labelRect.left),
+      topFromLabel: Math.round(inputRect.top - labelRect.top),
+    };
+  });
+  expect(acceptanceMetrics.inputWidth).toBeLessThanOrEqual(24);
+  expect(acceptanceMetrics.inputHeight).toBeLessThanOrEqual(24);
+  expect(acceptanceMetrics.offsetFromLabel).toBeLessThanOrEqual(4);
+  expect(acceptanceMetrics.topFromLabel).toBeLessThanOrEqual(4);
+
+  const opinionChoices = await inlineChoices();
+  expect(opinionChoices.length).toBeGreaterThanOrEqual(15);
+  for (const choice of opinionChoices) {
+    expect(choice.inputWidth, choice.text).toBeLessThanOrEqual(24);
+    expect(choice.inputHeight, choice.text).toBeLessThanOrEqual(24);
+    expect(choice.offsetFromLabel, choice.text).toBeLessThanOrEqual(4);
+  }
 });
 
 test("note de l’analyste : des blocs périmés bloquent l’acceptation", async ({

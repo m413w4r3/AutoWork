@@ -316,6 +316,7 @@ describe("InvestigationTab", () => {
       await screen.findByText(new RegExp(SYNTHESIS_ID)),
     ).toBeInTheDocument();
     expect(screen.getByText(SHA256)).toBeInTheDocument();
+    expect(screen.getByText("Vérifiée")).toBeInTheDocument();
 
     await user.click(
       screen.getByRole("button", { name: "Investiguer cette version exacte" }),
@@ -372,7 +373,9 @@ describe("InvestigationTab", () => {
         name: `Enquête ${INVESTIGATION_ID}`,
       }),
     ).toBeInTheDocument();
-    expect(screen.getByText(/En cours · version CAS 1/)).toBeInTheDocument();
+    expect(
+      screen.getByTitle("Version de l’état de travail (CAS)"),
+    ).toHaveTextContent("version de l’état 1");
     expect(
       screen.getByRole("button", { name: "Interrompre l’enquête" }),
     ).toBeInTheDocument();

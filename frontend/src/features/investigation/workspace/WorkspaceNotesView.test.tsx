@@ -535,6 +535,25 @@ describe("WorkspaceNotesView", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("formule le rapport de synchronisation avec les bons pluriels", async () => {
+    const user = userEvent.setup();
+    renderView(makeHandler());
+
+    await user.click(
+      await screen.findByRole("button", { name: "Synchroniser maintenant" }),
+    );
+
+    expect(
+      await screen.findByText(
+        /Synchronisation terminée\. 2 fichiers observés, 1 événement ajouté, 1 révision, 0 conflit observé, 1 conflit non résolu, 0 violation de politique\./,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/fichier\(s\)|nouvel\/nouveaux/)).toBeNull();
+    // Generation and cursor stay available behind the technical details.
+    expect(screen.getByText("Détails techniques")).toBeInTheDocument();
+    expect(screen.getByText(/Génération 3 · curseur 43\./)).toBeInTheDocument();
+  });
+
   it("envoie la résolution de conflit avec les deux SHA-256 attendus", async () => {
     const recorder = renderView(makeHandler());
     const user = userEvent.setup();

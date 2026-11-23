@@ -112,11 +112,20 @@ describe("TaskCard actions", () => {
     expect(
       screen.queryByRole("button", { name: "Je prends cette tâche" }),
     ).toBeNull();
-    expect(screen.queryByRole("button", { name: "Interrompre" })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "Interrompre la tâche" }),
+    ).toBeNull();
     expect(
       screen.queryByRole("button", { name: "Ajouter une note" }),
     ).toBeNull();
     expect(screen.getByText(/Terminée · version 2/)).toBeInTheDocument();
+  });
+
+  it("affiche l’adaptateur d’une assignation opérateur en libellé humain", () => {
+    renderCard(assignedOperatorTask());
+
+    expect(screen.getByText("Opérateur · Codex CLI")).toBeInTheDocument();
+    expect(screen.queryByText(/operator:codex_cli/)).toBeNull();
   });
 
   it("n’affiche pas les attributions quand le workspace n’est pas prouvé", () => {
@@ -142,7 +151,11 @@ describe("TaskCard actions", () => {
       }),
     );
 
-    expect(screen.getByRole("button", { name: "Interrompre" })).toBeEnabled();
+    const interruptTask = screen.getByRole("button", {
+      name: "Interrompre la tâche",
+    });
+    expect(interruptTask).toBeEnabled();
+    expect(interruptTask).toHaveClass("m24-action--danger");
     expect(
       screen.queryByRole("button", { name: "Interrompre la session" }),
     ).toBeNull();

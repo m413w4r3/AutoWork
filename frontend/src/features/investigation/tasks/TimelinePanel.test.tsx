@@ -161,14 +161,16 @@ function renderTimeline(page: unknown = timelinePage()) {
 }
 
 describe("TimelinePanel", () => {
-  it("étiquette les avis comme non-preuves et pointe l’objet exact", async () => {
+  it("étiquette les avis comme non probants et pointe l’objet exact", async () => {
     renderTimeline();
 
     expect(
-      await screen.findByText("vt_file_report:sample"),
+      await screen.findByText("Rapport VT fichier · objet : échantillon"),
     ).toBeInTheDocument();
+    // The raw projection token stays available as the item title.
+    expect(screen.getByTitle("vt_file_report:sample")).toBeInTheDocument();
     expect(screen.getByText("Preuve canonique")).toBeInTheDocument();
-    expect(screen.getByText("Avis Bridge — non preuve")).toBeInTheDocument();
+    expect(screen.getByText("Avis Bridge — non probant")).toBeInTheDocument();
     expect(screen.getAllByText("inv-1").length).toBeGreaterThan(0);
     expect(screen.getAllByText("obs-1").length).toBeGreaterThan(0);
     expect(screen.getByRole("link", { name: "Voir la tâche" })).toHaveAttribute(
@@ -181,29 +183,58 @@ describe("TimelinePanel", () => {
     const user = userEvent.setup();
     renderTimeline();
 
-    await screen.findByText("vt_file_report:sample");
+    await screen.findByText("Rapport VT fichier · objet : échantillon");
     await user.selectOptions(
       screen.getByLabelText(/Type d’événement/),
       "bridge_consultation",
     );
-    expect(screen.queryByText("vt_file_report:sample")).toBeNull();
-    expect(screen.getByText("advisor.consult:succeeded")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Rapport VT fichier · objet : échantillon"),
+    ).toBeNull();
+    expect(
+      screen.getByText("Consultation Bridge · Réussi"),
+    ).toBeInTheDocument();
 
     await user.selectOptions(screen.getByLabelText(/Type d’événement/), "all");
     await user.selectOptions(screen.getByLabelText(/Preuve/), "evidence");
-    expect(screen.queryByText("advisor.consult:succeeded")).toBeNull();
-    expect(screen.getByText("vt_file_report:sample")).toBeInTheDocument();
+    expect(screen.queryByText("Consultation Bridge · Réussi")).toBeNull();
+    expect(
+      screen.getByText("Rapport VT fichier · objet : échantillon"),
+    ).toBeInTheDocument();
+
+    // The search covers the raw token as well as the visible sentence.
+    await user.selectOptions(screen.getByLabelText(/Preuve/), "all");
+    await user.type(screen.getByLabelText(/Recherche/), "advisor.consult");
+    expect(
+      screen.getByText("Consultation Bridge · Réussi"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("Rapport VT fichier · objet : échantillon"),
+    ).toBeNull();
   });
 
   it("affiche les quatre objets de travail comme non probants", async () => {
     renderTimeline(workingPage());
 
-    const handoff = await screen.findByText("handoff:v2:human->operator");
-    const contribution = screen.getByText("contribution:finding:imported");
-    const session = screen.getByText(
-      "agent_session:codex_cli:awaiting_instruction",
+    const handoff = await screen.findByText(
+      "Passation v2 · Humain → Opérateur",
     );
-    const instruction = screen.getByText("instruction:queued");
+    const contribution = screen.getByText("Finding importé");
+    const session = screen.getByText(
+      "Session Codex CLI · Attente d’instruction",
+    );
+    const instruction = screen.getByText(
+      "Instruction humaine · En file (agent occupé)",
+    );
+    // The raw B7 tokens remain readable as titles.
+    expect(screen.getByTitle("handoff:v2:human->operator")).toBeInTheDocument();
+    expect(
+      screen.getByTitle("contribution:finding:imported"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByTitle("agent_session:codex_cli:awaiting_instruction"),
+    ).toBeInTheDocument();
+    expect(screen.getByTitle("instruction:queued")).toBeInTheDocument();
     expect(
       within(handoff.closest("li") as HTMLElement).getByText("Passation"),
     ).toBeInTheDocument();
@@ -232,7 +263,7 @@ describe("TimelinePanel", () => {
       screen.getAllByText("Non probant — élément de travail"),
     ).toHaveLength(4);
     expect(screen.getAllByText("Preuve canonique")).toHaveLength(1);
-    expect(screen.getByText("Avis Bridge — non preuve")).toBeInTheDocument();
+    expect(screen.getByText("Avis Bridge — non probant")).toBeInTheDocument();
 
     // Persisted ids stay whole; digests are abbreviated.
     expect(screen.getAllByText("hd-1")).toHaveLength(2);
@@ -266,21 +297,74 @@ describe("TimelinePanel", () => {
     const user = userEvent.setup();
     renderTimeline(workingPage());
 
-    await screen.findByText("handoff:v2:human->operator");
+    await screen.findByText("Passation v2 · Humain → Opérateur");
     await user.selectOptions(
       screen.getByLabelText(/Type d’événement/),
       "instruction",
     );
 
-    expect(screen.getByText("instruction:queued")).toBeInTheDocument();
-    expect(screen.queryByText("handoff:v2:human->operator")).toBeNull();
-    expect(screen.queryByText("contribution:finding:imported")).toBeNull();
     expect(
-      screen.queryByText("agent_session:codex_cli:awaiting_instruction"),
+      screen.getByText("Instruction humaine · En file (agent occupé)"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Passation v2 · Humain → Opérateur")).toBeNull();
+    expect(screen.queryByText("Finding importé")).toBeNull();
+    expect(
+      screen.queryByText("Session Codex CLI · Attente d’instruction"),
     ).toBeNull();
     expect(
       screen.getByText(/1 entrée\(s\) affichée\(s\) sur 6\./),
     ).toBeInTheDocument();
+  });
+
+  it("traduit les références techniques et abrège les identifiants", async () => {
+    const targetId = "99999999-9999-4999-8999-999999999999";
+    const blobId = "77777777-7777-4777-8777-777777777777";
+    const objectId = "88888888-8888-4888-8888-888888888888";
+    renderTimeline({
+      items: [
+        {
+          item_type: "decision",
+          object_id: objectId,
+          occurred_at: "2026-11-22T10:01:00Z",
+          task_id: null,
+          actor_kind: "operator",
+          actor_id: "operator:claude_code",
+          summary: "workspace_conflict_resolve:workspace_conflict",
+          evidence: false,
+          refs: {
+            target_type: "workspace_conflict",
+            target_id: targetId,
+            blob_id: blobId,
+            operation_key: "operator:digest:payload",
+          },
+          linked_event_ids: [],
+          linked_observation_ids: [],
+        },
+      ],
+      next_cursor: null,
+      has_more: false,
+    });
+
+    expect(
+      await screen.findByText(
+        "Résolution d’un conflit de workspace · cible : conflit de workspace",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Opérateur · Claude Code")).toBeInTheDocument();
+    expect(screen.getByText("Type de cible")).toBeInTheDocument();
+    expect(screen.getByText("Cible")).toBeInTheDocument();
+    expect(screen.getByText("Blob")).toBeInTheDocument();
+    expect(screen.getByText("Clé d’opération")).toBeInTheDocument();
+    expect(screen.getByText("operator:digest:payload")).toBeInTheDocument();
+    expect(screen.getByTitle(objectId)).toHaveTextContent(
+      `${objectId.slice(0, 12)}…`,
+    );
+    expect(screen.getByTitle(targetId)).toHaveTextContent(
+      `${targetId.slice(0, 12)}…`,
+    );
+    expect(screen.getByTitle(blobId)).toHaveTextContent(
+      `${blobId.slice(0, 12)}…`,
+    );
   });
 
   it("affiche l’état vide", async () => {

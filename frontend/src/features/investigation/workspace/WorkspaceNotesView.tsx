@@ -54,17 +54,49 @@ function Counts({ counts }: { counts: WorkspaceCountsV1 }) {
   );
 }
 
+/** French agreement: 0 and 1 are singular, 2+ plural. */
+function countOf(count: number, singular: string, plural: string): string {
+  return `${count} ${count > 1 ? plural : singular}`;
+}
+
 function SyncReport({ report }: { report: WorkspaceSyncReportV1 }) {
   return (
     <div className="workspace-notes__note" role="status">
       <p>
-        Synchronisation terminée — génération {report.generation}, curseur{" "}
-        {report.cursor}. {report.files_observed} fichier(s) observé(s),{" "}
-        {report.events_inserted} nouvel/nouveaux événement(s),{" "}
-        {report.revisions_inserted} révision(s), {report.conflicts_observed}{" "}
-        conflit(s) observé(s), {report.unresolved_conflicts} non résolu(s),{" "}
-        {report.policy_violations} violation(s) de politique.
+        Synchronisation terminée.{" "}
+        {countOf(report.files_observed, "fichier observé", "fichiers observés")}
+        ,{" "}
+        {countOf(
+          report.events_inserted,
+          "événement ajouté",
+          "événements ajoutés",
+        )}
+        , {countOf(report.revisions_inserted, "révision", "révisions")},{" "}
+        {countOf(
+          report.conflicts_observed,
+          "conflit observé",
+          "conflits observés",
+        )}
+        ,{" "}
+        {countOf(
+          report.unresolved_conflicts,
+          "conflit non résolu",
+          "conflits non résolus",
+        )}
+        ,{" "}
+        {countOf(
+          report.policy_violations,
+          "violation de politique",
+          "violations de politique",
+        )}
+        .
       </p>
+      <details>
+        <summary>Détails techniques</summary>
+        <p>
+          Génération {report.generation} · curseur {report.cursor}.
+        </p>
+      </details>
       {report.resync ? (
         <p>Resynchronisation complète : le curseur a été réinitialisé.</p>
       ) : null}

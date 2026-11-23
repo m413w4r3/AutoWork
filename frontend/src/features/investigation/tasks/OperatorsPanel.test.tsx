@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -84,6 +84,12 @@ describe("OperatorsPanel", () => {
     renderPanel();
 
     await screen.findByText("Codex CLI · Vérifier le domaine C2");
+    const sessionHeader = screen
+      .getByText("Codex CLI · Vérifier le domaine C2")
+      .closest("header");
+    expect(
+      within(sessionHeader as HTMLElement).getByText("En cours"),
+    ).toHaveClass("m24-badge--running");
     await user.type(
       screen.getByLabelText(/Instruction en cours de session/),
       "Priorise le PCAP.",

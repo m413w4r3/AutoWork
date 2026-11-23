@@ -563,7 +563,7 @@ export function NoteDetailPanel({
 
       <h4>Demander à Bridge de relire</h4>
       <p className="workspace-notes__meta">
-        Relecture consultative Bridge (avis, non preuve) soumise à G2/TLP et à
+        Relecture consultative Bridge (avis non probant) soumise à G2/TLP et à
         la version CAS de l’état de travail. Aucune provenance n’est inventée ni
         promue en observation canonique.
       </p>
@@ -639,7 +639,7 @@ export function NoteDetailPanel({
           {labelOf(INVOCATION_STATUS_LABELS, askBridge.data.invocation_status)}
           {askBridge.data.pending ? " · réponse en attente" : ""} ·{" "}
           {askBridge.data.advisory_only
-            ? "avis consultatif — non preuve"
+            ? "avis consultatif — non probant"
             : "nature consultative à vérifier"}
           .
         </p>

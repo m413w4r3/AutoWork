@@ -53,7 +53,7 @@ export const TASK_ACTION_LABELS: Record<TaskActionId, string> = {
   request_changes: "Demander des modifications",
   interrupt_session: "Interrompre la session",
   resume_session: "Reprendre la session",
-  interrupt_task: "Interrompre",
+  interrupt_task: "Interrompre la tâche",
   add_note: "Ajouter une note",
 };
 
@@ -61,7 +61,7 @@ export const TASK_ACTION_LABELS: Record<TaskActionId, string> = {
 export function taskActionLabel(action: TaskActionId, task: TaskView): string {
   if (action === "interrupt_task") {
     return task.status === "running" || task.status === "awaiting_input"
-      ? "Interrompre"
+      ? "Interrompre la tâche"
       : "Annuler la tâche";
   }
   return TASK_ACTION_LABELS[action];

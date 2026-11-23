@@ -5,7 +5,7 @@
  * an `Idempotency-Key`. Accepting a version writes the human `plan_accept`
  * decision and materialises its leads as tasks exactly once; a later version
  * only adds new task keys and never rewrites existing tasks. Unparsed output
- * stays an advisory answer and is labelled "avis, non preuve".
+ * stays an advisory answer and is labelled "avis non probant".
  */
 
 import { useEffect, useId, useRef, useState } from "react";
@@ -279,7 +279,7 @@ export function PlanPanel({ investigationId }: { investigationId: string }) {
             );
           } else if (response.advice_only) {
             setMessage(
-              `Bridge a répondu par un avis non parsé : il reste consultatif (avis, non preuve)${contextSuffix}.`,
+              `Bridge a répondu par un avis non parsé : il reste consultatif (avis non probant)${contextSuffix}.`,
             );
           } else if (response.plan_version_id !== null) {
             setMessage(
@@ -469,7 +469,7 @@ export function PlanPanel({ investigationId }: { investigationId: string }) {
           {lastRequest.advice_only ||
           lastRequest.plan_parse_status === "unparsed" ? (
             <p className="m24-badge m24-badge--advisory">
-              Avis Bridge — avis, non preuve. Aucune version de plan n’a été
+              Avis Bridge — avis non probant. Aucune version de plan n’a été
               créée.
             </p>
           ) : null}
@@ -684,7 +684,7 @@ export function PlanPanel({ investigationId }: { investigationId: string }) {
                 </p>
                 <p className="m24-muted">
                   {consultation.advisory_only
-                    ? "Avis Bridge — non preuve"
+                    ? "Avis Bridge — non probant"
                     : "Consultation non étiquetée consultative (à vérifier)"}
                   {consultation.usable ? " · texte exploitable" : ""}
                   {consultation.readable ? " · texte lisible" : ""} ·

@@ -153,6 +153,32 @@ textarea {
   font: inherit;
 }
 
+/* A checkbox/radio is a control, not a text field: no field chrome. */
+input[type="checkbox"],
+input[type="radio"] {
+  min-height: auto;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+}
+
+/*
+ * A label that wraps its own checkbox/radio is an inline choice: the global
+ * label grid and the input chrome above used to stretch the control into a
+ * full-width bordered bar with the text on the next line. Keep the control
+ * glued to its label instead (M24.1 R5-F2), including the mandatory
+ * acceptance confirmation of an analyst note.
+ */
+label:has(> input[type="checkbox"]),
+label:has(> input[type="radio"]) {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45rem;
+  font-weight: 400;
+}
+
 .conversation-panel,
 .conversation-detail {
   display: grid;

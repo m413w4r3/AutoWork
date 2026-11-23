@@ -122,6 +122,11 @@
   overflow-wrap: anywhere;
 }
 
+/* An abbreviated persisted id: one click selects the whole value to copy. */
+.m24-id-ref {
+  user-select: all;
+}
+
 .m24-metadata--refs {
   grid-template-columns: 1fr;
   border-top: 1px dashed #dce4de;
@@ -202,6 +207,13 @@
 .m24-action--quiet {
   background: #fff;
   color: #28503b;
+}
+
+/* Destructive task/session interruption, visually apart from the primaries. */
+.m24-action--danger {
+  border-color: #92443b;
+  background: #92443b;
+  color: #fff;
 }
 
 .m24-inline-form {
