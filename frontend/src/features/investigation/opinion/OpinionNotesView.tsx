@@ -14,7 +14,10 @@ import { useTasks } from "../api/tasks";
 import { groupAnchors } from "./AnchorPicker";
 import { ArticleReadingPane } from "./ArticleReadingPane";
 import { groupNotesByAnchor } from "./anchor";
-import { BridgeRequestPanel } from "./BridgeRequestPanel";
+import {
+  BridgeRequestPanel,
+  type BridgeCorrectionSeed,
+} from "./BridgeRequestPanel";
 import { describeApiError } from "./errors";
 import { HistoryPanel } from "./HistoryPanel";
 import { NoteAnchorList } from "./NoteAnchorList";
@@ -56,6 +59,8 @@ export function OpinionNotesView({
   const [selectedProposalId, setSelectedProposalId] = useState<string | null>(
     null,
   );
+  const [correctionSeed, setCorrectionSeed] =
+    useState<BridgeCorrectionSeed | null>(null);
   const [activeTab, setActiveTab] = useState<OpinionTab>("notes");
 
   const draft = opinionQuery.data?.draft ?? null;
@@ -91,6 +96,7 @@ export function OpinionNotesView({
   }, [articleCatalog, groups, selectedAnchor]);
 
   function selectNote(note: AnalystNoteV1) {
+    if (correctionSeed !== null) return;
     changeAnchor(note.anchor);
     if (
       note.bridge_block_type !== undefined &&
@@ -106,6 +112,7 @@ export function OpinionNotesView({
    * Canonical code, IOC and protocol-figure references are anchor-independent.
    */
   function changeAnchor(next: string) {
+    if (correctionSeed !== null && next !== correctionSeed.anchor) return;
     setSelectedAnchor(next);
     setContentBlocks((current) =>
       current.filter(
@@ -113,6 +120,14 @@ export function OpinionNotesView({
           block.block_type !== "article_element" || block.anchor === next,
       ),
     );
+  }
+
+  function beginCorrection(seed: BridgeCorrectionSeed) {
+    setCorrectionSeed(seed);
+    setSelectedAnchor(seed.anchor);
+    setBlockType(seed.blockType);
+    setContentBlocks(seed.contentBlocks);
+    setActiveTab("notes");
   }
 
   if (opinionQuery.isPending) {
@@ -186,12 +201,9 @@ export function OpinionNotesView({
     >
       <h2 id="opinion-notes-view-heading">Note de l’analyste</h2>
       <p>
-        Cette vue ne propose que demander à Bridge, accepter ou refuser. Aucun
-        champ ne permet de saisir du texte éditorial de l’avis : le texte
-        publiable ne vient que du texte stocké et immuable d’une réponse Bridge,
-        accepté par une décision humaine. L’approbation, la publication et le
-        réépinglage dans la composition restent des décisions humaines
-        distinctes ; une enquête terminée ne publie jamais automatiquement.
+        Le texte publiable vient d’une réponse Bridge stockée et immuable. Une
+        acceptation humaine l’intègre à l’avis ; approbation et publication
+        restent des décisions distinctes.
       </p>
 
       {investigationQuery.isError ? (
@@ -296,6 +308,10 @@ export function OpinionNotesView({
                     groups={groups}
                     selectedAnchor={selectedAnchor}
                     onSelectNote={selectNote}
+                    anchors={articleCatalog?.anchors ?? []}
+                    sections={articleCatalog?.sections ?? []}
+                    findings={findings}
+                    observations={observations}
                   />
                 </details>
 
@@ -313,7 +329,9 @@ export function OpinionNotesView({
                   contentBlocks={contentBlocks}
                   onAnchorChange={changeAnchor}
                   onBlockTypeChange={setBlockType}
+                  correctionSeed={correctionSeed}
                   onRequested={(proposalId) => {
+                    setCorrectionSeed(null);
                     setSelectedProposalId(proposalId);
                     setActiveTab("proposals");
                   }}
@@ -352,6 +370,7 @@ export function OpinionNotesView({
                     observations={observations}
                     subjectId={investigationQuery.data?.subject_id ?? null}
                     onClose={() => setSelectedProposalId(null)}
+                    onRequestCorrection={beginCorrection}
                   />
                 )}
               </>

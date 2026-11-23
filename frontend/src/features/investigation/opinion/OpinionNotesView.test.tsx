@@ -34,6 +34,7 @@ import type {
 const INVESTIGATION_ID = "11111111-1111-4111-8111-111111111111";
 const OPINION_ID = "22222222-2222-4222-8222-222222222222";
 const PROPOSAL_ID = "33333333-3333-4333-8333-333333333333";
+const CORRECTION_PROPOSAL_ID = "abababab-abab-4bab-8bab-abababababab";
 const NOTE_LEAD_ID = "44444444-4444-4444-8444-444444444444";
 const NOTE_SECTION_ID = "55555555-5555-4555-8555-555555555555";
 const FINDING_ID = "66666666-6666-4666-8666-666666666666";
@@ -496,6 +497,7 @@ function renderView(options: RenderOptions = {}) {
   const proposal = options.proposals?.[0] ?? makeProposal();
   const proposals = options.proposals ?? [proposal];
   const diff = options.diff ?? makeDiff(proposal);
+  let createdProposal: NoteProposalViewV1 | null = null;
   const calls: Array<{ url: string; init?: RequestInit }> = [];
   let opinionReads = 0;
   let diffReads = 0;
@@ -523,11 +525,34 @@ function renderView(options: RenderOptions = {}) {
     if (
       url.startsWith(`/api/investigations/${INVESTIGATION_ID}/note-proposals?`)
     ) {
-      return jsonResponse(proposals);
+      return jsonResponse(
+        createdProposal === null ? proposals : [...proposals, createdProposal],
+      );
     }
     if (url === `/api/investigations/${INVESTIGATION_ID}/note-proposals`) {
       if (method === "POST") {
         if (options.requestFailure !== undefined) return options.requestFailure;
+        const requestBody = bodyOf(request.init) as { question?: string };
+        if (
+          requestBody.question?.includes("Consigne de correction de l’analyste")
+        ) {
+          createdProposal = makeProposal({
+            id: CORRECTION_PROPOSAL_ID,
+            status_version: 1,
+            proposed_text: "Nouvelle version Bridge corrigée.",
+            proposed_text_sha256: "e".repeat(64),
+            bridge_invocation_id: "bridge-correction-2",
+            bridge_output_sha256: "f".repeat(64),
+            bridge_response_observation_id: BRIDGE_RESPONSE_ID,
+          });
+          return jsonResponse({
+            proposal: createdProposal,
+            invocation_id: "bridge-correction-2",
+            invocation_status: "succeeded",
+            idempotent_replay: false,
+            materialised: true,
+          });
+        }
         return jsonResponse({
           proposal,
           invocation_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
@@ -544,6 +569,13 @@ function renderView(options: RenderOptions = {}) {
     ) {
       diffReads += 1;
       return jsonResponse(diff);
+    }
+    if (
+      url ===
+        `/api/investigations/${INVESTIGATION_ID}/note-proposals/${CORRECTION_PROPOSAL_ID}` &&
+      createdProposal !== null
+    ) {
+      return jsonResponse(makeDiff(createdProposal));
     }
     if (
       url ===
@@ -635,7 +667,7 @@ async function openProposalReview() {
   await user.click(
     screen.getByRole("button", { name: "Examiner la proposition" }),
   );
-  await screen.findByRole("button", { name: /Accepter la proposition v4/ });
+  await screen.findByRole("button", { name: "Accepter" });
 }
 
 afterEach(() => {
@@ -652,11 +684,11 @@ describe("OpinionNotesView — notes Bridge par ancre", () => {
 
     const list = await screen.findByRole("region", { name: "Notes par ancre" });
     expect(
-      within(list).getByRole("heading", { name: /lead:0001/ }),
+      within(list).getByRole("heading", { name: /Chapô, paragraphe 1/ }),
     ).toBeInTheDocument();
     expect(
       within(list).getByRole("heading", {
-        name: /section:2:paragraph:0007/,
+        name: /Section 3 · Persistance, paragraphe 7/,
       }),
     ).toBeInTheDocument();
     expect(
@@ -736,22 +768,23 @@ describe("OpinionNotesView — notes Bridge par ancre", () => {
     await openProposalReview();
 
     expect(
-      screen.getByText(/L’acceptation remplace la note existante/),
+      screen.getByRole("heading", { name: "Diff avec la Note actuelle" }),
     ).toBeInTheDocument();
     const acceptButton = screen.getByRole("button", {
-      name: /Accepter la proposition v4/,
+      name: "Accepter",
     });
     expect(acceptButton).toBeDisabled();
 
     await user.click(
       screen.getByRole("checkbox", {
-        name: /J’ai examiné le texte stocké, le diff et l’aperçu/,
+        name: /J’ai relu ce texte et ses références/,
       }),
     );
     expect(acceptButton).toBeEnabled();
+    await user.click(screen.getByText("Motif de décision facultatif"));
     await user.type(
       screen.getByRole("textbox", {
-        name: /Raison de la décision \(journalisée, jamais publiée\)/,
+        name: /Motif \(journalisé et jamais publié\)/,
       }),
       "Acceptation motivée",
     );
@@ -802,10 +835,10 @@ describe("OpinionNotesView — notes Bridge par ancre", () => {
     });
     await openProposalReview();
 
-    expect(screen.getAllByText(/Aucun texte stocké/).length).toBeGreaterThan(0);
     expect(
-      screen.getByRole("button", { name: /Accepter la proposition v4/ }),
-    ).toBeDisabled();
+      screen.getAllByText(/Aucun texte Bridge stocké/).length,
+    ).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: "Accepter" })).toBeDisabled();
 
     await user.click(
       screen.getByRole("button", { name: "Ingérer la réponse Bridge" }),
@@ -829,12 +862,10 @@ describe("OpinionNotesView — notes Bridge par ancre", () => {
 
     await user.click(
       screen.getByRole("checkbox", {
-        name: /J’ai examiné le texte stocké, le diff et l’aperçu/,
+        name: /J’ai relu ce texte et ses références/,
       }),
     );
-    await user.click(
-      screen.getByRole("button", { name: /Accepter la proposition v4/ }),
-    );
+    await user.click(screen.getByRole("button", { name: "Accepter" }));
 
     expect(
       await screen.findByText(/Proposition périmée : l’avis a changé/),
@@ -917,12 +948,22 @@ describe("OpinionNotesView — notes Bridge par ancre", () => {
       name: "Demander une proposition à Bridge",
     });
 
-    const develop = screen.getByRole("radio", { name: "Développer" });
-    develop.focus();
+    const revise = screen.getByRole("radio", {
+      name: "Réviser / corriger",
+    });
+    revise.focus();
     await user.keyboard(" ");
-    expect(develop).toBeChecked();
+    expect(revise).toBeChecked();
+    await user.type(
+      screen.getByRole("textbox", {
+        name: /Consigne de correction pour Bridge/,
+      }),
+      "Précise le niveau de confiance.",
+    );
 
-    const submit = screen.getByRole("button", { name: "Demander à Bridge" });
+    const submit = screen.getByRole("button", {
+      name: "Envoyer la demande de correction",
+    });
     await waitFor(() => expect(submit).toBeEnabled());
     submit.focus();
     await user.keyboard("{Enter}");
@@ -936,8 +977,94 @@ describe("OpinionNotesView — notes Bridge par ancre", () => {
       );
       expect(request).toBeDefined();
       const body = bodyOf(request?.init) as { question: string };
-      expect(body.question).toEqual(expect.stringContaining("Développe"));
+      expect(body.question).toContain("Précise le niveau de confiance.");
     });
+  });
+
+  it("demande une correction Bridge versionnée sans modifier le texte stocké", async () => {
+    const user = userEvent.setup();
+    const { calls } = renderView();
+    await openProposalReview();
+
+    await user.click(
+      screen.getByRole("button", { name: "Demander une correction à Bridge" }),
+    );
+    await screen.findByRole("heading", {
+      name: "Demander une correction à Bridge",
+    });
+    expect(
+      screen.getAllByText("Le chapô observe un service de commande.").length,
+    ).toBeGreaterThan(0);
+    expect(
+      screen.getByRole("radio", { name: "Réviser / corriger" }),
+    ).toBeChecked();
+
+    const instruction = "Clarifie la portée de cette observation.";
+    await user.type(
+      screen.getByRole("textbox", {
+        name: /Consigne de correction pour Bridge/,
+      }),
+      instruction,
+    );
+    await user.click(
+      screen.getByRole("button", {
+        name: "Envoyer la demande de correction",
+      }),
+    );
+
+    await waitFor(() => {
+      expect(
+        calls.some(
+          (call) =>
+            call.url ===
+              `/api/investigations/${INVESTIGATION_ID}/note-proposals` &&
+            call.init?.method === "POST",
+        ),
+      ).toBe(true);
+    });
+    const request = calls.find(
+      (call) =>
+        call.url === `/api/investigations/${INVESTIGATION_ID}/note-proposals` &&
+        call.init?.method === "POST",
+    );
+    const body = bodyOf(request?.init) as Record<string, unknown>;
+    expect(body).toMatchObject({
+      anchor: "lead:0001",
+      consultation_type: "draft_text",
+      finding_refs: [FINDING_ID],
+      observation_refs: [OBSERVATION_ID],
+    });
+    expect(body.question).toEqual(expect.stringContaining(instruction));
+    expect(body.question).toEqual(
+      expect.stringContaining("instruction uniquement, jamais texte publiable"),
+    );
+    expect(body).not.toHaveProperty("text");
+    expect(body).not.toHaveProperty("proposed_text");
+    expect(
+      calls.some((call) =>
+        /note-proposals\/[^/]+\/(accept|reject)$/.test(call.url),
+      ),
+    ).toBe(false);
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "Proposition Bridge — version 1",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getAllByText("Nouvelle version Bridge corrigée.").length,
+    ).toBeGreaterThan(0);
+    expect(screen.getByText("Vérifiée")).toBeInTheDocument();
+    expect(
+      screen.getAllByText("Note actuelle du chapô.").length,
+    ).toBeGreaterThan(0);
+    expect(
+      screen.getByText("Provenance technique").closest("details"),
+    ).toHaveTextContent(NOTE_LEAD_ID);
+    expect(
+      screen.queryByText("Texte Bridge proposé pour le chapô."),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText(instruction)).not.toBeInTheDocument();
   });
 
   it("signale Bridge indisponible avec le code typé", async () => {
@@ -1070,7 +1197,7 @@ describe("OpinionNotesView — notes Bridge par ancre", () => {
     );
     renderView();
 
-    const review = await screen.findByRole("radio", { name: "Vérifier" });
+    const review = await screen.findByRole("radio", { name: "Critiquer" });
     await waitFor(() => expect(review).toBeChecked());
     expect(
       screen.getByRole("combobox", { name: "Tâche liée (facultatif)" }),
