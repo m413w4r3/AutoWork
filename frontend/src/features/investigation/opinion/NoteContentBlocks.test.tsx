@@ -11,6 +11,7 @@ import type {
 } from "../api/opinionProposals";
 import {
   createTestQueryClient,
+  errorResponse,
   installFetch,
   jsonResponse,
   wrapperFor,
@@ -125,6 +126,51 @@ function installAnchors(catalog = makeCatalog()) {
     }
     return jsonResponse({ detail: { code: "unexpected_request" } }, 500);
   });
+}
+
+function installSelectorFetch(
+  handler: (request: {
+    url: string;
+    init: RequestInit | undefined;
+  }) => Response,
+) {
+  return installFetch((request) => {
+    if (
+      request.url === `/api/investigations/${INVESTIGATION_ID}/article-anchors`
+    ) {
+      return jsonResponse(makeCatalog());
+    }
+    return handler(request);
+  });
+}
+
+function excerptBody({
+  offset,
+  length,
+  totalSize,
+  view,
+  excerptSha = EXCERPT_HASH,
+  text,
+  hex,
+}: {
+  offset: number;
+  length: number;
+  totalSize: number;
+  view: "text" | "hex";
+  excerptSha?: string;
+  text?: string;
+  hex?: string;
+}) {
+  return {
+    view,
+    offset,
+    length,
+    total_size: totalSize,
+    blob_sha256: BLOB_HASH,
+    excerpt_sha256: excerptSha,
+    untrusted_data: true,
+    ...(view === "text" ? { text: text ?? "" } : { hex: hex ?? "" }),
+  };
 }
 
 function renderBlocks(
@@ -274,48 +320,278 @@ describe("NoteContentBlocks — sélection de références", () => {
     ]);
   });
 
-  it("référence un extrait de code exact et refuse un SHA-256 invalide", async () => {
+  it("ajoute une plage choisie au clavier avec les métadonnées renvoyées par le serveur", async () => {
     const user = userEvent.setup();
-    installAnchors();
+    const serverHash = "9".repeat(64);
+    let textRangeRequests = 0;
+    const recorder = installSelectorFetch((request) => {
+      const url = new URL(request.url, "http://autowork.test");
+      const offset = Number(url.searchParams.get("offset"));
+      const length = Number(url.searchParams.get("length"));
+      const view = url.searchParams.get("view");
+      if (view === "hex") {
+        return jsonResponse(
+          excerptBody({
+            offset,
+            length,
+            totalSize: 3,
+            view: "hex",
+            hex: "00000000  61",
+          }),
+        );
+      }
+      textRangeRequests += 1;
+      return jsonResponse(
+        excerptBody({
+          offset,
+          length,
+          totalSize: 3,
+          view: "text",
+          excerptSha: textRangeRequests === 1 ? "8".repeat(64) : serverHash,
+          text: "abc",
+        }),
+      );
+    });
     const { onChange } = renderSelection();
 
     await user.selectOptions(
       await screen.findByLabelText("Observation source"),
       OBSERVATION_ID,
     );
-    await user.type(screen.getByLabelText("Offset (octets)"), "12");
-    await user.type(screen.getByLabelText("Longueur (octets)"), "42");
-    await user.clear(screen.getByLabelText("Langage"));
-    await user.type(screen.getByLabelText("Langage"), "python");
-    await user.type(screen.getByLabelText("SHA-256 de l’extrait"), "abc");
-
-    const add = screen.getByRole("button", {
-      name: "Référencer cet extrait de code",
+    const excerptElement = await screen.findByRole("textbox", {
+      name: "Extrait canonique en texte",
     });
-    expect(add).toBeDisabled();
+    expect(excerptElement).toBeInstanceOf(HTMLTextAreaElement);
+    if (!(excerptElement instanceof HTMLTextAreaElement)) {
+      throw new Error("the canonical excerpt should be a textarea");
+    }
+    const excerpt = excerptElement;
+    await user.click(excerpt);
+    await user.keyboard(
+      "{Home}{Shift>}{ArrowRight}{ArrowRight}{ArrowRight}{/Shift}",
+    );
+    expect([excerpt.selectionStart, excerpt.selectionEnd]).toEqual([0, 3]);
     expect(
-      screen.getByText(/SHA-256 de l’extrait doit être 64 caractères/),
+      await screen.findByText("3 octets à partir de 0x0000."),
+    ).toBeInTheDocument();
+    expect(screen.queryByLabelText("Offset (octets)")).toBeNull();
+    await user.click(
+      screen.getByRole("button", { name: "Vérifier et référencer la plage" }),
+    );
+
+    await vi.waitFor(() => {
+      expect(onChange).toHaveBeenLastCalledWith([
+        {
+          block_type: "canonical_code",
+          observation_id: OBSERVATION_ID,
+          blob_sha256: BLOB_HASH,
+          offset: 0,
+          length: 3,
+          excerpt_sha256: serverHash,
+          language: "python",
+        },
+      ]);
+    });
+    expect(textRangeRequests).toBe(2);
+    expect(recorder.calls.map((request) => request.url)).toContain(
+      `/api/investigations/${INVESTIGATION_ID}/observations/${OBSERVATION_ID}/excerpt?offset=0&length=3&view=text`,
+    );
+  });
+
+  it("passe automatiquement en hex quand le serveur refuse la vue texte", async () => {
+    const user = userEvent.setup();
+    const requests: string[] = [];
+    installSelectorFetch((request) => {
+      requests.push(request.url);
+      const url = new URL(request.url, "http://autowork.test");
+      const offset = Number(url.searchParams.get("offset"));
+      const length = Number(url.searchParams.get("length"));
+      if (url.searchParams.get("view") === "text") {
+        return errorResponse(422, "excerpt_not_safe_text");
+      }
+      return jsonResponse(
+        excerptBody({
+          offset,
+          length,
+          totalSize: 2,
+          view: "hex",
+          hex: "00000000  ff 00",
+        }),
+      );
+    });
+    renderSelection();
+
+    await user.selectOptions(
+      await screen.findByLabelText("Observation source"),
+      OBSERVATION_ID,
+    );
+    const hexExcerpt = await screen.findByRole("textbox", {
+      name: "Extrait canonique en hexadécimal",
+    });
+    expect(hexExcerpt).toHaveValue("00000000  ff 00");
+    expect(screen.getByText(/La vue texte a été refusée/)).toHaveTextContent(
+      "excerpt_not_safe_text",
+    );
+    await user.click(hexExcerpt);
+    await user.keyboard("{Control>}a{/Control}");
+    expect(
+      screen.getByText("2 octets à partir de 0x0000."),
     ).toBeInTheDocument();
 
-    await user.clear(screen.getByLabelText("SHA-256 de l’extrait"));
-    await user.type(
-      screen.getByLabelText("SHA-256 de l’extrait"),
-      EXCERPT_HASH,
+    await user.click(screen.getByRole("button", { name: "Texte" }));
+    expect(
+      await screen.findByRole("textbox", {
+        name: "Extrait canonique en hexadécimal",
+      }),
+    ).toBeInTheDocument();
+    expect(requests).toContain(
+      `/api/investigations/${INVESTIGATION_ID}/observations/${OBSERVATION_ID}/excerpt?offset=0&length=2&view=text`,
     );
-    expect(add).toBeEnabled();
-    await user.click(add);
+  });
 
-    expect(onChange).toHaveBeenLastCalledWith([
-      {
-        block_type: "canonical_code",
-        observation_id: OBSERVATION_ID,
-        blob_sha256: BLOB_HASH,
-        offset: 12,
-        length: 42,
-        excerpt_sha256: EXCERPT_HASH,
-        language: "python",
-      },
-    ]);
+  it("pagine des fenêtres de 4096 octets au plus", async () => {
+    const user = userEvent.setup();
+    const requests: string[] = [];
+    installSelectorFetch((request) => {
+      requests.push(request.url);
+      const url = new URL(request.url, "http://autowork.test");
+      const offset = Number(url.searchParams.get("offset"));
+      const length = Number(url.searchParams.get("length"));
+      const view = url.searchParams.get("view");
+      if (view === "hex") {
+        return jsonResponse(
+          excerptBody({
+            offset,
+            length,
+            totalSize: 5000,
+            view: "hex",
+            hex: "00000000  61",
+          }),
+        );
+      }
+      return jsonResponse(
+        excerptBody({
+          offset,
+          length,
+          totalSize: 5000,
+          view: "text",
+          text: "a".repeat(length),
+        }),
+      );
+    });
+    renderSelection();
+
+    await user.selectOptions(
+      await screen.findByLabelText("Observation source"),
+      OBSERVATION_ID,
+    );
+    expect(
+      await screen.findByText(/Fenêtre de 4096 octets/),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Fenêtre suivante" }));
+    expect(
+      await screen.findByText(/Fenêtre de 904 octets/),
+    ).toBeInTheDocument();
+    expect(requests).toContain(
+      `/api/investigations/${INVESTIGATION_ID}/observations/${OBSERVATION_ID}/excerpt?offset=4096&length=904&view=text`,
+    );
+    expect(
+      requests
+        .map((url) =>
+          Number(
+            new URL(url, "http://autowork.test").searchParams.get("length"),
+          ),
+        )
+        .every((length) => length <= 4096),
+    ).toBe(true);
+    await user.click(
+      screen.getByRole("button", { name: "Fenêtre précédente" }),
+    );
+    expect(
+      await screen.findByText(/Fenêtre de 4096 octets/),
+    ).toBeInTheDocument();
+  });
+
+  it("affiche le refus note_code_ref_stale renvoyé pendant la relecture exacte", async () => {
+    const user = userEvent.setup();
+    installSelectorFetch((request) => {
+      const url = new URL(request.url, "http://autowork.test");
+      const offset = Number(url.searchParams.get("offset"));
+      const length = Number(url.searchParams.get("length"));
+      if (url.searchParams.get("view") === "hex") {
+        return jsonResponse(
+          excerptBody({
+            offset,
+            length,
+            totalSize: 3,
+            view: "hex",
+            hex: "00000000  61",
+          }),
+        );
+      }
+      if (length === 3) {
+        return jsonResponse(
+          excerptBody({
+            offset,
+            length,
+            totalSize: 3,
+            view: "text",
+            text: "abc",
+          }),
+        );
+      }
+      return errorResponse(409, "note_code_ref_stale");
+    });
+    renderSelection();
+
+    await user.selectOptions(
+      await screen.findByLabelText("Observation source"),
+      OBSERVATION_ID,
+    );
+    const excerpt = await screen.findByRole("textbox", {
+      name: "Extrait canonique en texte",
+    });
+    await user.click(excerpt);
+    await user.keyboard("{Home}{Shift>}{ArrowRight}{/Shift}");
+    await user.click(
+      screen.getByRole("button", { name: "Vérifier et référencer la plage" }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "note_code_ref_stale (HTTP 409)",
+    );
+  });
+
+  it("affiche littéralement le texte CTI non fiable sans l’interpréter en HTML", async () => {
+    const user = userEvent.setup();
+    const untrusted = '<img onerror="alert(1)">';
+    installSelectorFetch((request) => {
+      const url = new URL(request.url, "http://autowork.test");
+      const offset = Number(url.searchParams.get("offset"));
+      const length = Number(url.searchParams.get("length"));
+      const view = url.searchParams.get("view");
+      return jsonResponse(
+        excerptBody({
+          offset,
+          length,
+          totalSize: untrusted.length,
+          view: view === "hex" ? "hex" : "text",
+          text: untrusted,
+          hex: "00000000  3c 69 6d 67",
+        }),
+      );
+    });
+    renderSelection();
+
+    await user.selectOptions(
+      await screen.findByLabelText("Observation source"),
+      OBSERVATION_ID,
+    );
+    const excerpt = await screen.findByRole("textbox", {
+      name: "Extrait canonique en texte",
+    });
+    expect(excerpt).toHaveValue(untrusted);
+    expect(screen.queryByRole("img")).toBeNull();
   });
 
   it("référence une figure de protocole déjà portée par l’avis", async () => {

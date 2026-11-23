@@ -50,6 +50,10 @@ const MESSAGES: Record<string, string> = {
     "Un élément d’article référencé a changé (hash ou ancre). Rechargez les ancres et la proposition.",
   note_code_ref_stale:
     "Une référence de code ne correspond plus aux octets de l’observation. Rechargez la proposition.",
+  excerpt_not_safe_text:
+    "L’extrait contient des octets non imprimables ; affichez-le en hexadécimal.",
+  excerpt_range_out_of_bounds:
+    "La plage demandée dépasse les octets disponibles dans l’observation.",
   note_chart_without_evidence:
     "Un graphique référencé ne porte pas de preuve. Rechargez la proposition et faites-la réviser.",
   note_figure_source_missing:

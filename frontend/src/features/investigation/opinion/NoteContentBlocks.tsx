@@ -20,7 +20,6 @@ import {
 } from "../api/articleAnchors";
 import type {
   ArticleElementNoteBlockV1,
-  CanonicalCodeNoteBlockV1,
   IocTableNoteBlockV1,
   NoteArticleElementKind,
   NoteContentBlockV1,
@@ -28,6 +27,7 @@ import type {
   ProtocolFigureNoteBlockV1,
   ResolvedNoteContentBlockV1,
 } from "../api/opinionProposals";
+import { CanonicalCodeSelector } from "./CanonicalCodeSelector";
 import { describeApiError, describeErrorCode } from "./errors";
 import {
   ARTICLE_ELEMENT_REFUSAL_LABELS,
@@ -50,9 +50,6 @@ const MAX_IOC_OBSERVATIONS = 64;
 const OPTION_TEXT_MAX = 120;
 /** Short option labels keep the page width independent of id lengths. */
 const OPTION_SHORT_MAX = 32;
-
-const CODE_LANGUAGE_PATTERN = /^[a-z0-9][a-z0-9+.#_-]*$/;
-const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 
 /** The opinion wire type keeps `kind` as text; the server enum is closed. */
 function isProtocolFigureKind(value: string): value is ProtocolFigureKind {
@@ -82,20 +79,6 @@ function observationLabel(observation: InvestigationObservation): string {
   )} · SHA-256 ${shortHash(observation.sha256)} · ${observation.source}`;
 }
 
-/**
- * A `<select>` never wraps its options, so an option label is laid out at its
- * full intrinsic width. Offer identity plus a short digest here and keep the
- * complete label in the option `title`; otherwise a bootstrap observation
- * whose object id is a UUID widens the whole page.
- */
-function observationOptionLabel(observation: InvestigationObservation): string {
-  const kind = EVIDENCE_KIND_LABELS[observation.kind] ?? observation.kind;
-  return `${kind} · ${truncate(
-    observation.object_id,
-    OPTION_SHORT_MAX,
-  )} · SHA-256 ${shortHash(observation.sha256)}`;
-}
-
 function elementLabel(element: ArticleElementViewV1): string {
   const title = element.title ?? element.key;
   const caption =
@@ -119,13 +102,6 @@ function elementOptionLabel(element: ArticleElementViewV1): string {
 function elementRefusalLabel(reason: string | null): string {
   if (reason === null) return "élément non proposable";
   return ARTICLE_ELEMENT_REFUSAL_LABELS[reason] ?? describeErrorCode(reason);
-}
-
-function parseInteger(value: string): number | null {
-  const trimmed = value.trim();
-  if (!/^\d+$/.test(trimmed)) return null;
-  const parsed = Number(trimmed);
-  return Number.isSafeInteger(parsed) ? parsed : null;
 }
 
 function sameObservationSet(left: string[], right: string[]): boolean {
@@ -229,7 +205,8 @@ export function NoteContentBlocks({
             blocks={blocks}
             onAdd={addBlock}
           />
-          <CanonicalCodeForm
+          <CanonicalCodeSelector
+            investigationId={investigationId}
             observations={canonicalObservations}
             advisoryCount={advisoryCount}
             blocks={blocks}
@@ -560,165 +537,6 @@ function IocTablePicker({
           {duplicate ? (
             <p role="note">
               Un tableau IOC identique est déjà référencé par cette proposition.
-            </p>
-          ) : null}
-        </>
-      )}
-    </fieldset>
-  );
-}
-
-function CanonicalCodeForm({
-  observations,
-  advisoryCount,
-  blocks,
-  onAdd,
-}: {
-  observations: InvestigationObservation[];
-  advisoryCount: number;
-  blocks: NoteContentBlockV1[];
-  onAdd: (block: CanonicalCodeNoteBlockV1) => void;
-}) {
-  const [observationId, setObservationId] = useState("");
-  const [offset, setOffset] = useState("");
-  const [length, setLength] = useState("");
-  const [language, setLanguage] = useState("python");
-  const [excerptSha, setExcerptSha] = useState("");
-
-  const observation =
-    observations.find((item) => item.id === observationId) ?? null;
-  const offsetValue = parseInteger(offset);
-  const lengthValue = parseInteger(length);
-  const languageValid = CODE_LANGUAGE_PATTERN.test(language.trim());
-  const shaValid = SHA256_PATTERN.test(excerptSha.trim());
-  const blockedReason =
-    observation === null
-      ? "Choisissez une observation canonique."
-      : offsetValue === null
-        ? "L’offset doit être un entier d’octets positif ou nul."
-        : lengthValue === null || lengthValue < 1
-          ? "La longueur doit être un entier d’octets strictement positif."
-          : !languageValid
-            ? "Le langage doit être un jeton court en minuscules (ex. python, c, bash)."
-            : !shaValid
-              ? "Le SHA-256 de l’extrait doit être 64 caractères hexadécimaux minuscules."
-              : null;
-  const duplicate = blocks.some(
-    (block) =>
-      block.block_type === "canonical_code" &&
-      block.observation_id === observationId &&
-      block.offset === offsetValue &&
-      block.length === lengthValue,
-  );
-
-  function addCode() {
-    if (
-      observation === null ||
-      offsetValue === null ||
-      lengthValue === null ||
-      lengthValue < 1 ||
-      !languageValid ||
-      !shaValid
-    ) {
-      return;
-    }
-    onAdd({
-      block_type: "canonical_code",
-      observation_id: observation.id,
-      blob_sha256: observation.sha256,
-      offset: offsetValue,
-      length: lengthValue,
-      excerpt_sha256: excerptSha.trim(),
-      language: language.trim(),
-    });
-    setOffset("");
-    setLength("");
-    setExcerptSha("");
-  }
-
-  return (
-    <fieldset>
-      <legend>Extrait de code canonique</legend>
-      <p>
-        Le serveur extrait les octets exacts du blob de l’observation ; aucun
-        texte de code n’est saisi ni accepté comme preuve. Une référence qui ne
-        correspond pas octet pour octet est refusée (
-        <code>note_code_ref_stale</code>). L’offset, la longueur et le SHA-256
-        de l’extrait se lisent dans l’outillage d’analyse de l’observation.
-      </p>
-      {observations.length === 0 ? (
-        <p>
-          Aucune observation canonique disponible dans cette enquête.
-          {advisoryCount === 0
-            ? ""
-            : ` ${advisoryCount} observation(s) consultative(s) sont exclues.`}
-        </p>
-      ) : (
-        <>
-          <label htmlFor="note-content-code-observation">
-            Observation source
-          </label>
-          <select
-            id="note-content-code-observation"
-            value={observationId}
-            onChange={(event) => setObservationId(event.currentTarget.value)}
-          >
-            <option value="">— Choisir une observation —</option>
-            {observations.slice(0, MAX_IOC_OBSERVATIONS).map((item) => (
-              <option
-                key={item.id}
-                value={item.id}
-                title={observationLabel(item)}
-              >
-                {observationOptionLabel(item)}
-              </option>
-            ))}
-          </select>
-          <label htmlFor="note-content-code-offset">Offset (octets)</label>
-          <input
-            id="note-content-code-offset"
-            inputMode="numeric"
-            value={offset}
-            onChange={(event) => setOffset(event.currentTarget.value)}
-          />
-          <label htmlFor="note-content-code-length">Longueur (octets)</label>
-          <input
-            id="note-content-code-length"
-            inputMode="numeric"
-            value={length}
-            onChange={(event) => setLength(event.currentTarget.value)}
-          />
-          <label htmlFor="note-content-code-language">Langage</label>
-          <input
-            id="note-content-code-language"
-            value={language}
-            onChange={(event) => setLanguage(event.currentTarget.value)}
-          />
-          <label htmlFor="note-content-code-sha">SHA-256 de l’extrait</label>
-          <input
-            id="note-content-code-sha"
-            value={excerptSha}
-            onChange={(event) => setExcerptSha(event.currentTarget.value)}
-          />
-          {blockedReason === null ? (
-            <p role="note">
-              Blob référencé : SHA-256 {shortHash(observation?.sha256 ?? null)}{" "}
-              · les octets seront revérifiés par le serveur.
-            </p>
-          ) : (
-            <p role="note">{blockedReason}</p>
-          )}
-          <button
-            type="button"
-            className="button button--secondary"
-            disabled={blockedReason !== null || duplicate}
-            onClick={addCode}
-          >
-            Référencer cet extrait de code
-          </button>
-          {duplicate ? (
-            <p role="note">
-              Cette plage d’octets est déjà référencée par cette proposition.
             </p>
           ) : null}
         </>

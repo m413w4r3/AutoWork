@@ -45,5 +45,6 @@ export * from "./transfers";
 export * from "./agentSessions";
 export * from "./contributions";
 export * from "./opinionProposals";
+export * from "./observationExcerpts";
 export * from "./workspace";
 export * from "./workspaceNotes";
