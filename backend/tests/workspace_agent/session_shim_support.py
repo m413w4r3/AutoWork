@@ -5,7 +5,9 @@ same closed environment the H1 supervisor gives a CLI; it receives its session
 secret once from the H1 ``SecretBroker`` over a tmpdir AF_UNIX socket and
 signs HTTP requests with the ADR-0011 D7 scheme. The fake backend is a real
 ``ThreadingHTTPServer`` on an ephemeral loopback port that records every
-request so a test can verify the signature independently.
+request so a test can verify the signature independently. It is reached only
+through the shim's test-fixture transport
+(``AUTOWORK_SHIM_TEST_BACKEND_URL``), which no production component sets.
 """
 
 from __future__ import annotations
@@ -294,7 +296,7 @@ def shim_environment(
         "LC_ALL": "C.UTF-8",
         "AUTOWORK_SESSION_ID": session_id,
         "AUTOWORK_SESSION_SOCKET": str(socket_path),
-        "AUTOWORK_BACKEND_URL": backend_url,
+        "AUTOWORK_SHIM_TEST_BACKEND_URL": backend_url,
     }
 
 

@@ -298,6 +298,7 @@ def test_claude_uses_relay_socket_without_backend_url(tmp_path: Path) -> None:
 
     produced = "\0".join((*plan.argv, *plan.env.keys(), *plan.env.values(), serialized))
     assert "AUTOWORK_BACKEND_URL" not in produced
+    assert "AUTOWORK_SHIM_TEST_BACKEND_URL" not in produced
     assert "http://" not in produced and "https://" not in produced
     assert "X-AutoWork-Agent-Signature" not in produced
     process.assert_cli_environment_safe(plan.env)

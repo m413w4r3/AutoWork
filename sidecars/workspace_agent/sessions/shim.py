@@ -23,9 +23,10 @@ an MCP server. The shim:
 It is a standalone stdlib script copied with :mod:`catalog` into the session
 config; it never imports backend, relay or agent code and opens no outbound
 connection except one AF_UNIX connection to the supervisor-provided relay
-socket. The loopback HTTP backend transport is retained **only** for the
-existing test harnesses (it is unreachable inside the sandbox netns) and will
-be removed by a later lot once the adapters hand the shim a relay socket.
+socket. Production has exactly one transport: ``AUTOWORK_BROKER_SOCKET``. The
+loopback HTTP transport is a *test fixture only*, selected by the test-only
+``AUTOWORK_SHIM_TEST_BACKEND_URL`` that no adapter, supervisor or entrypoint
+ever sets; inside ``bwrap --unshare-net`` it has no route to host loopback.
 
 Normative sources: ``docs/design/investigation-workshop/SESSION-RUNNER.md``
 §3/§7 and ``docs/adr/ADR-0011-investigation-workshop-coordination.md`` D7.
@@ -65,7 +66,9 @@ SECRET_READ_TIMEOUT_SECONDS = 10.0
 PR_SET_DUMPABLE = 4
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1"})
 BROKER_SOCKET_ENV = "AUTOWORK_BROKER_SOCKET"
-BACKEND_URL_ENV = "AUTOWORK_BACKEND_URL"
+# TEST FIXTURE ONLY. No production adapter, supervisor or entrypoint emits this
+# variable: the single production transport is the broker UDS relay above.
+TEST_BACKEND_URL_ENV = "AUTOWORK_SHIM_TEST_BACKEND_URL"
 # ``sockaddr_un.sun_path`` is 108 bytes including the terminating NUL.
 MAX_UNIX_SOCKET_PATH_BYTES = 107
 RESPONSE_HEADER_LIMIT_BYTES = 64 * 1024
@@ -188,7 +191,7 @@ class BackendTarget:
 class SessionConfig:
     session_id: str
     socket_path: str
-    backend_url: str | None
+    test_backend_url: str | None
     broker_socket: str | None
 
 
@@ -252,12 +255,13 @@ def client_key(session_id: str, broker_name: str, arguments: Mapping[str, object
 
 
 class HttpTransport:
-    """TEST-HARNESS-ONLY loopback HTTP transport (to be removed with URL mode).
+    """TEST-FIXTURE-ONLY loopback HTTP transport (``AUTOWORK_SHIM_TEST_BACKEND_URL``).
 
-    The existing shim oracles drive the shim against a fake loopback backend.
-    A real sandbox (``bwrap --unshare-net``) cannot reach host loopback, so this
-    is never a production path; the adapters hand the shim a relay socket
-    instead. Redirects are never followed and proxies ignored.
+    Only the shim oracles drive the shim against a fake loopback backend. A
+    real sandbox (``bwrap --unshare-net``) cannot reach host loopback and no
+    production component sets the test variable, so this is never a production
+    path; the adapters hand the shim a relay socket instead. Redirects are
+    never followed and proxies ignored.
     """
 
     def __init__(self, target: BackendTarget) -> None:
@@ -435,7 +439,7 @@ class ShimServer:
         *,
         session_id: str,
         secret: bytes | bytearray,
-        backend_url: str | None = None,
+        test_backend_url: str | None = None,
         broker_socket: str | None = None,
         clock: Callable[[], int] | None = None,
         transport: Transport | None = None,
@@ -445,13 +449,16 @@ class ShimServer:
             raise ShimConfigError("session_id_invalid")
         if not secret:
             raise ShimConfigError("secret_missing")
-        if backend_url is not None and broker_socket is not None:
+        if test_backend_url is not None and broker_socket is not None:
+            # One request path, chosen once: never a fallback from one to the other.
             raise ShimConfigError("session_transport_conflict")
-        if transport is None and backend_url is None and broker_socket is None:
+        if transport is None and test_backend_url is None and broker_socket is None:
             raise ShimConfigError("session_config_missing")
         self._session_id = session_id
         self._secret = bytearray(secret)
-        self._target = parse_backend_url(backend_url) if backend_url is not None else None
+        self._target = (
+            parse_backend_url(test_backend_url) if test_backend_url is not None else None
+        )
         self._clock = clock if clock is not None else (lambda: int(time.time()))
         if transport is not None:
             self._transport = transport
@@ -889,11 +896,11 @@ def load_session_config(environ: Mapping[str, str] | None = None) -> SessionConf
     source = os.environ if environ is None else environ
     session_id = source.get("AUTOWORK_SESSION_ID", "").strip()
     socket_path = source.get("AUTOWORK_SESSION_SOCKET", "").strip()
-    backend_url = source.get(BACKEND_URL_ENV, "").strip()
+    test_backend_url = source.get(TEST_BACKEND_URL_ENV, "").strip()
     broker_socket = source.get(BROKER_SOCKET_ENV, "").strip()
-    if not session_id or not socket_path or not (backend_url or broker_socket):
+    if not session_id or not socket_path or not (test_backend_url or broker_socket):
         raise ShimConfigError("session_config_missing")
-    if backend_url and broker_socket:
+    if test_backend_url and broker_socket:
         # One request path, chosen once: never a fallback from one to the other.
         raise ShimConfigError("session_transport_conflict")
     if _UUID.fullmatch(session_id) is None:
@@ -905,7 +912,7 @@ def load_session_config(environ: Mapping[str, str] | None = None) -> SessionConf
     return SessionConfig(
         session_id=session_id,
         socket_path=socket_path,
-        backend_url=backend_url or None,
+        test_backend_url=test_backend_url or None,
         broker_socket=broker_socket or None,
     )
 
@@ -971,7 +978,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         server = ShimServer(
             session_id=config.session_id,
             secret=secret,
-            backend_url=config.backend_url,
+            test_backend_url=config.test_backend_url,
             broker_socket=config.broker_socket,
         )
         secret[:] = bytes(len(secret))

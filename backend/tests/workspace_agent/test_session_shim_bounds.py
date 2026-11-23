@@ -21,7 +21,7 @@ def _server(transport: RecordingTransport) -> shim.ShimServer:
     return shim.ShimServer(
         session_id=support.SESSION_ID,
         secret=support.SECRET,
-        backend_url="http://127.0.0.1:1",
+        test_backend_url="http://127.0.0.1:1",
         clock=lambda: support.FIXED_TIMESTAMP,
         transport=transport,
     )

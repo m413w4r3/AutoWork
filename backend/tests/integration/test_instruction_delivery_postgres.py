@@ -982,7 +982,7 @@ async def _receive_point_flow(
                 backend_url="http://127.0.0.1:1",
                 session_id=str(session_id),
             )
-            del environment["AUTOWORK_BACKEND_URL"]
+            del environment["AUTOWORK_SHIM_TEST_BACKEND_URL"]
             environment["AUTOWORK_BROKER_SOCKET"] = str(broker_socket)
             harness.environment = environment
             with harness as shim:

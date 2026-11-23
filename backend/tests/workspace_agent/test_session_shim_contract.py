@@ -69,7 +69,7 @@ def _server(
     return shim.ShimServer(
         session_id=support.SESSION_ID,
         secret=support.SECRET,
-        backend_url="http://127.0.0.1:1",
+        test_backend_url="http://127.0.0.1:1",
         clock=lambda: clock_value,
         transport=transport,
     )
