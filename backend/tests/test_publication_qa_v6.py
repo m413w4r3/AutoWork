@@ -10,7 +10,10 @@ from cti_app.application.publication_qa import (
     qa_publication_v5,
     qa_publication_v6,
 )
-from cti_app.application.typst_rendering import project_publication_to_typst_model
+from cti_app.application.typst_rendering import (
+    NoteContentBlockRenderError,
+    project_publication_to_typst_model,
+)
 from tests.test_publication_builder_v4 import _canonical_inputs, _enrichment_with
 from tests.test_publication_document_v6 import _approved_opinion, _base_v5
 
@@ -64,3 +67,28 @@ def test_v6_specific_qa_rejects_a_v5_document_with_typed_code() -> None:
     with pytest.raises(PublicationQaValidationError) as caught:
         qa_publication_v6(publication=_base_v5())
     assert caught.value.code is PublicationQaErrorCode.DOCUMENT_NOT_V6
+
+
+def test_qa_v6_projects_note_blocks_only_with_the_canonical_context() -> None:
+    from tests.test_edition_typst_rendering import _note_block_v6
+
+    inputs = _inputs()
+    publication, note_block_context, _raw = _note_block_v6()
+
+    without_context = qa_publication_v6(publication=publication, **inputs)  # type: ignore[arg-type]
+
+    assert without_context["passed"] is False
+    assert without_context["checks"]["references_then_synthesis"] is False
+    with pytest.raises(NoteContentBlockRenderError) as uncontextualized:
+        project_publication_to_typst_model(publication)
+    assert uncontextualized.value.code == "note_code_ref_stale"
+
+    with_context = qa_publication_v6(
+        publication=publication,
+        note_block_context=note_block_context,
+        **inputs,  # type: ignore[arg-type]
+    )
+
+    assert with_context["passed"] is True
+    assert with_context["checks"]["references_then_synthesis"] is True
+    assert with_context["error_codes"] == []

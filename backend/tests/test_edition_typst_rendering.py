@@ -7,6 +7,7 @@ import os
 import shutil
 import zipfile
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -29,7 +30,11 @@ from cti_app.application.edition_typst_rendering import (
     EditionRenderPublicationSchemaUnsupportedError,
     EditionTypstRenderer,
 )
-from cti_app.application.publication_augmentation import augment_publication_with_opinion
+from cti_app.application.opinion_note_proposals import note_article_element_facts
+from cti_app.application.publication_augmentation import (
+    OpinionCitationContext,
+    augment_publication_with_opinion,
+)
 from cti_app.application.typst_compilation import (
     CompiledTypstDocument,
     FontBundleInvalidError,
@@ -41,6 +46,8 @@ from cti_app.application.typst_compilation import (
 )
 from cti_app.application.typst_render_execution import TypstRenderExecutor
 from cti_app.application.typst_rendering import (
+    NoteBlockRenderContext,
+    NoteContentBlockRenderError,
     TemplateBundleInvalidError,
     TemplateFile,
     TypstRenderer,
@@ -50,7 +57,22 @@ from cti_app.application.typst_rendering import (
     load_template_bundle,
     project_publication_to_typst_model,
 )
+from cti_app.domain.analyst_opinion import (
+    AnalystObservationRelation,
+    AnalystObservationState,
+    AnalystObservationV1,
+    AnalystOpinionStatus,
+    AnalystOpinionV1,
+    CanonicalCodeNoteBlockV1,
+    IocTableNoteBlockV1,
+    OpinionBlock,
+    OpinionBlockType,
+    OpinionClaimQualification,
+    note_ioc_table_title,
+    opinion_blocks_with_observations,
+)
 from cti_app.domain.edition_publication import EditionDocumentV2, EditionPublicationV2
+from cti_app.domain.investigation import EvidenceKind, EvidenceObservation
 from cti_app.domain.production_editorial_enrichment import EnrichmentPlacementKind
 from cti_app.domain.publication import (
     PublicationParagraphV1,
@@ -61,7 +83,9 @@ from cti_app.domain.publication_document import (
     CanonicalPublicationDocument,
     PublicationDocumentV4,
     PublicationDocumentV5,
+    PublicationDocumentV6,
     publication_document_text_anchors,
+    publication_document_v5_sha256,
 )
 from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.semantic_annotation import (
@@ -74,7 +98,7 @@ from cti_app.domain.semantic_annotation import (
 )
 from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 from tests.test_publication_builder_v4 import _frontmatter_v6_case
-from tests.test_publication_document_v6 import _approved_opinion
+from tests.test_publication_document_v6 import _approved_opinion, _base_v5
 from tests.test_typst_rendering import (
     _INJECTION_TEXT,
     _diagram_at,
@@ -204,11 +228,126 @@ def _edition_bundle(tmp_path: Path) -> TypstTemplateBundle:
 def _render_data(
     tmp_path: Path, document: EditionDocumentV2
 ) -> tuple[TypstRenderSource, dict[str, Any]]:
+    return _render_data_with_contexts(tmp_path, document, None)
+
+
+def _render_data_with_contexts(
+    tmp_path: Path,
+    document: EditionDocumentV2,
+    note_block_contexts: dict[UUID, NoteBlockRenderContext] | None,
+) -> tuple[TypstRenderSource, dict[str, Any]]:
     bundle = _edition_bundle(tmp_path)
-    source = EditionTypstRenderer().render(document, bundle, document_label=_EDITION_RENDER_LABEL)
+    source = EditionTypstRenderer().render(
+        document,
+        bundle,
+        document_label=_EDITION_RENDER_LABEL,
+        note_block_contexts=note_block_contexts,
+    )
     data = json.loads(source.render_data_bytes)
     assert data["document_label"] == _EDITION_RENDER_LABEL
     return source, data
+
+
+_NOTE_BLOCK_LEAD_ANCHOR = "lead:0001"
+
+
+def _note_block_v6() -> tuple[PublicationDocumentV6, NoteBlockRenderContext, bytes]:
+    """A V6 article whose approved opinion carries ioc_table and canonical_code blocks."""
+    base = _base_v5()
+    investigation_id = UUID(int=7101)
+    raw = b"xxCreateFileWyy"
+    excerpt = raw[2:13]
+    code_observation = EvidenceObservation(
+        id=UUID(int=7102),
+        investigation_id=investigation_id,
+        kind=EvidenceKind.BINARY_ANALYSIS,
+        blob_id=UUID(int=7103),
+        sha256=hashlib.sha256(raw).hexdigest(),
+        source="native_analysis",
+        source_version="fixture.v1",
+        observed_at=datetime(2026, 11, 1, tzinfo=UTC),
+        object_type="file",
+        object_id="note-code-sample.bin",
+    )
+    ioc_observation = EvidenceObservation(
+        id=UUID(int=7104),
+        investigation_id=investigation_id,
+        kind=EvidenceKind.SHODAN_OBSERVATION,
+        blob_id=UUID(int=7105),
+        sha256="f" * 64,
+        source="shodan",
+        source_version="fixture.v1",
+        observed_at=datetime(2026, 11, 1, tzinfo=UTC),
+        object_type="ip",
+        object_id="192.0.2.10",
+    )
+    note = AnalystObservationV1(
+        id=UUID(int=7106),
+        anchor=_NOTE_BLOCK_LEAD_ANCHOR,
+        text="NOTE-EDITION-CODE-FIXTURE",
+        state=AnalystObservationState.UNRESOLVED,
+        relation=AnalystObservationRelation.UNRESOLVED,
+        content_blocks=(
+            CanonicalCodeNoteBlockV1(
+                observation_id=code_observation.id,
+                blob_sha256=code_observation.sha256,
+                offset=2,
+                length=len(excerpt),
+                excerpt_sha256=hashlib.sha256(excerpt).hexdigest(),
+                language="c",
+            ),
+            IocTableNoteBlockV1(
+                observation_ids=(ioc_observation.id,),
+                title=note_ioc_table_title(1),
+            ),
+        ),
+    )
+    artifact_id = UUID(int=7107)
+    base_sha256 = publication_document_v5_sha256(base)
+    opinion = AnalystOpinionV1(
+        id=UUID(int=7108),
+        investigation_id=investigation_id,
+        synthesis_artifact_id=UUID(int=7109),
+        synthesis_sha256="2" * 64,
+        base_publication_artifact_id=artifact_id,
+        base_publication_sha256=base_sha256,
+        blocks=opinion_blocks_with_observations(
+            (
+                OpinionBlock(
+                    OpinionBlockType.KEY_FINDINGS,
+                    "Constat de démonstration.",
+                    qualification=OpinionClaimQualification.HYPOTHESIS,
+                ),
+            ),
+            (note,),
+        ),
+        author_id="fixture-analyst",
+        reviewer_id="fixture-reviewer",
+        status=AnalystOpinionStatus.APPROVED,
+    )
+    publication = cast(
+        PublicationDocumentV6,
+        augment_publication_with_opinion(
+            base,
+            opinion,
+            OpinionCitationContext(
+                base_publication_artifact_id=artifact_id,
+                base_publication_sha256=base_sha256,
+                investigation_id=investigation_id,
+                approver_id="fixture-approver",
+                findings=(),
+                observations=(code_observation, ioc_observation),
+                tlp_violation=False,
+                do_not_submit=False,
+            ),
+        ),
+    )
+    context = NoteBlockRenderContext(
+        observations=(code_observation, ioc_observation),
+        blobs={code_observation.id: raw},
+        element_facts=note_article_element_facts(publication),
+    )
+    return publication, context, raw
 
 
 def _available_pinned_typst() -> str | None:
@@ -461,6 +600,164 @@ async def test_real_typst_compiles_mixed_edition_without_empty_annex_or_demo_val
         "545ea2be9c242511bc145755cf4bda2485ade42966e096f8b4d3da2a230e8974",
     ):
         assert absent not in text
+
+
+def test_edition_note_blocks_render_with_provenance_in_render_data(tmp_path: Path) -> None:
+    """B5c: an edition renders the same note blocks as the opinion preview."""
+    publication, note_context, raw = _note_block_v6()
+    edition = _edition_document(((1, publication),))
+    source, data = _render_data_with_contexts(
+        tmp_path, edition, {publication.subject_id: note_context}
+    )
+
+    synthesis = next(
+        section
+        for section in data["publications"][0]["content_sections"]
+        if section["type"] == "synthesis"
+    )
+    note = next(
+        block
+        for block in synthesis["blocks"]
+        if block.get("type") == "analyst_observation" and block.get("blocks")
+    )
+    code_block, table_block = note["blocks"]
+    assert [block["block_type"] for block in note["blocks"]] == ["canonical_code", "ioc_table"]
+    assert code_block["excerpt"] == raw[2:13].decode("utf-8")
+    code_provenance = "".join(part["text"] for part in code_block["provenance"])
+    assert note_context.observations[0].sha256 in code_provenance
+    assert hashlib.sha256(raw[2:13]).hexdigest() in code_provenance
+    assert "octets 2-13" in code_provenance
+    assert "native_analysis" in code_provenance
+    (table_row,) = table_block["pipe_table"]["rows"]
+    assert [cell["text"] for cell in table_row] == [
+        str(note_context.observations[1].id),
+        "ip",
+        "192.0.2.10",
+        "shodan",
+        note_context.observations[1].observed_at.isoformat(),
+        note_context.observations[1].sha256,
+    ]
+    assert "Observations canoniques de cette enquête : 1" in "".join(
+        part["text"] for part in table_block["provenance"]
+    )
+    assert source.render_data_bytes
+
+
+@pytest.mark.asyncio
+async def test_real_typst_edition_compiles_note_ioc_table_and_canonical_code(
+    tmp_path: Path,
+) -> None:
+    binary = _available_pinned_typst()
+    if binary is None:
+        pytest.skip("real pinned Typst is unavailable; set TYPST_BINARY")
+
+    publication, note_context, raw = _note_block_v6()
+    excerpt = raw[2:13].decode("utf-8")
+    code_observation = note_context.observations[0]
+    edition = _edition_document(((1, publication),))
+    bundle = load_template_bundle(_CHP_TYPST_ROOT, manifest_name=_EDITION_MANIFEST)
+    source = EditionTypstRenderer().render(
+        edition,
+        bundle,
+        document_label=_EDITION_RENDER_LABEL,
+        note_block_contexts={publication.subject_id: note_context},
+    )
+
+    workspace_root = tmp_path / "workspace"
+    for file in bundle.files:
+        destination = workspace_root / file.relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(file.content)
+    render_data_path = workspace_root / source.render_data_relative_path
+    render_data_path.parent.mkdir(parents=True, exist_ok=True)
+    render_data_path.write_bytes(source.render_data_bytes)
+
+    configured_font_root = os.environ.get("FONT_BUNDLE_ROOT")
+    font_root = Path(configured_font_root) if configured_font_root else _CHP_TYPST_ROOT
+    lock_path = Path(os.environ.get("TYPST_FONTS_LOCK_FILE", str(_FONT_BUNDLE_LOCK)))
+    try:
+        font_snapshot = load_font_bundle_snapshot(font_root, lock_path)
+    except FontBundleInvalidError:
+        if configured_font_root:
+            raise
+        pytest.skip("matching Typst font bundle is unavailable; set FONT_BUNDLE_ROOT")
+    font_paths = materialize_font_bundle(font_snapshot, tmp_path / "fonts")
+    compiled = await TypstSubprocessCompiler(binary=binary).compile(
+        TypstCompileRequest(
+            workspace_root=workspace_root,
+            entrypoint_relative_path=source.entrypoint_relative_path,
+            font_paths=font_paths,
+        )
+    )
+
+    assert compiled.media_type == "application/pdf"
+    assert compiled.content.startswith(b"%PDF-")
+    reader = PdfReader(io.BytesIO(compiled.content), strict=True)
+    assert reader.pages
+    pdf_text = " ".join((page.extract_text() or "") for page in reader.pages)
+    compact = "".join(pdf_text.split())
+    lead_text = "".join(publication.base_publication.document.lead[0].text.split())
+    ioc_title = "".join(note_ioc_table_title(1).split())
+    assert "NOTE-EDITION-CODE-FIXTURE" in compact
+    assert excerpt in compact
+    assert ioc_title in compact
+    assert "192.0.2.10" in compact
+    assert code_observation.sha256[:32] in compact
+    assert hashlib.sha256(raw[2:13]).hexdigest()[:32] in compact
+    assert compact.index(lead_text) < compact.index("NOTE-EDITION-CODE-FIXTURE")
+    assert compact.index("NOTE-EDITION-CODE-FIXTURE") < compact.index(excerpt)
+    assert compact.index(excerpt) < compact.index(ioc_title)
+
+
+def test_edition_note_block_stale_context_is_refused_with_typed_code(tmp_path: Path) -> None:
+    publication, note_context, _raw = _note_block_v6()
+    edition = _edition_document(((1, publication),))
+    bundle = _edition_bundle(tmp_path)
+
+    stale_contexts = {
+        publication.subject_id: NoteBlockRenderContext(
+            observations=note_context.observations,
+            blobs={},
+        )
+    }
+    with pytest.raises(NoteContentBlockRenderError) as stale:
+        EditionTypstRenderer().render(
+            edition,
+            bundle,
+            document_label=_EDITION_RENDER_LABEL,
+            note_block_contexts=stale_contexts,
+        )
+    assert stale.value.code == "note_code_ref_stale"
+
+    with pytest.raises(NoteContentBlockRenderError) as missing_context:
+        EditionTypstRenderer().render(
+            edition,
+            bundle,
+            document_label=_EDITION_RENDER_LABEL,
+        )
+    assert missing_context.value.code == "note_code_ref_stale"
+
+
+def test_block_less_edition_render_data_is_byte_identical_with_note_contexts(
+    tmp_path: Path,
+) -> None:
+    base = _base_v5()
+    opinion, citation_context = _approved_opinion(base)
+    publication = augment_publication_with_opinion(base, opinion, citation_context)
+    document = _edition_document(((1, publication),))
+    bundle = _edition_bundle(tmp_path)
+    without_contexts = EditionTypstRenderer().render(
+        document, bundle, document_label=_EDITION_RENDER_LABEL
+    )
+    with_contexts = EditionTypstRenderer().render(
+        document,
+        bundle,
+        document_label=_EDITION_RENDER_LABEL,
+        note_block_contexts={publication.subject_id: NoteBlockRenderContext(observations=())},
+    )
+
+    assert with_contexts.render_data_bytes == without_contexts.render_data_bytes
+    assert '"block_type":"ioc_table"' not in with_contexts.render_data_bytes.decode("utf-8")
 
 
 def test_renders_one_article_with_edition_metadata_and_private_entrypoint(tmp_path: Path) -> None:
