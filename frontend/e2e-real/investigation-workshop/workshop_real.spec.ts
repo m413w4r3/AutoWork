@@ -1731,8 +1731,19 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
     }).toString();
   const pdfResponse = await page.request.get(previewUrl);
   expect(pdfResponse.status(), await pdfResponse.text()).toBe(200);
-  expect(pdfResponse.headers()["content-type"]).toContain("application/pdf");
-  expect(pdfResponse.headers()["x-pdf-sha256"]).toMatch(/^[0-9a-f]{64}$/);
+  const pdfHeaders = pdfResponse.headers();
+  expect(pdfHeaders["content-type"]).toContain("application/pdf");
+  expect(pdfHeaders["x-opinion-version"]).toBe(String(draft.version));
+  expect(pdfHeaders["x-opinion-content-sha256"]).toBe(draft.content_sha256);
+  expect(pdfHeaders["x-base-publication-sha256"]).toBe(
+    draft.base_publication_sha256,
+  );
+  expect(pdfHeaders["x-pdf-sha256"]).toMatch(/^[0-9a-f]{64}$/);
+  const pdfBytes = await pdfResponse.body();
+  expect(pdfBytes.subarray(0, 5).toString("ascii")).toBe("%PDF-");
+  expect(createHash("sha256").update(pdfBytes).digest("hex")).toBe(
+    pdfHeaders["x-pdf-sha256"],
+  );
   const lineage = JSON.parse(
     pdfResponse.headers()["x-pdf-lineage"] ?? "{}",
   ) as {
@@ -1745,7 +1756,7 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
   expect(lineage.compiler?.version).toBe("0.15.1");
   const pdfPath = testInfo.outputPath("opinion-v3.pdf");
   mkdirSync(dirname(pdfPath), { recursive: true });
-  writeFileSync(pdfPath, await pdfResponse.body());
+  writeFileSync(pdfPath, pdfBytes);
   const pdfText = normalizePdfText(pdftotext(pdfPath));
   // Each note keeps its two stored paragraphs (one `\n\n` boundary), and each
   // carries its own short token: the derived content is printed in order.

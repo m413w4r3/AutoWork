@@ -230,6 +230,100 @@ export function analystOpinionPreviewPdfUrl(
   return `/api/opinions/${encodeURIComponent(opinion.id)}/preview.pdf?${query.toString()}`;
 }
 
+export interface AnalystOpinionPreviewPdf {
+  blob: Blob;
+  opinionId: string;
+  opinionVersion: number;
+  opinionSha256: string;
+  basePublicationSha256: string;
+}
+
+export class AnalystOpinionPreviewError extends Error {
+  constructor(
+    message: string,
+    public readonly code: string | null = null,
+    public readonly status: number | null = null,
+  ) {
+    super(message);
+    this.name = "AnalystOpinionPreviewError";
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+async function previewResponseError(
+  response: Response,
+): Promise<AnalystOpinionPreviewError> {
+  const body: unknown = await response.json().catch(() => null);
+  const detail = isRecord(body) ? body.detail : undefined;
+  const code =
+    isRecord(detail) && typeof detail.code === "string" ? detail.code : null;
+  const message =
+    typeof detail === "string"
+      ? detail
+      : isRecord(detail) && typeof detail.message === "string"
+        ? detail.message
+        : `Le serveur n’a pas pu préparer le PDF (HTTP ${response.status}).`;
+  return new AnalystOpinionPreviewError(message, code, response.status);
+}
+
+function readPdfSignature(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () =>
+      reject(reader.error ?? new Error("Impossible de lire le début du PDF."));
+    reader.onload = () => {
+      if (reader.result instanceof ArrayBuffer) {
+        resolve(new TextDecoder().decode(reader.result));
+      } else {
+        reject(new Error("Impossible de lire le début du PDF."));
+      }
+    };
+    reader.readAsArrayBuffer(blob.slice(0, 5));
+  });
+}
+
+export async function fetchAnalystOpinionPreviewPdf(
+  opinion: Pick<AnalystOpinionVersion, "id" | "version" | "content_sha256">,
+  basePublicationSha256: string,
+  signal: AbortSignal,
+): Promise<AnalystOpinionPreviewPdf> {
+  const response = await fetch(
+    analystOpinionPreviewPdfUrl(opinion, basePublicationSha256),
+    { signal },
+  );
+  if (!response.ok) throw await previewResponseError(response);
+
+  const contentType = response.headers
+    .get("content-type")
+    ?.split(";", 1)[0]
+    ?.trim()
+    .toLowerCase();
+  if (contentType !== "application/pdf") {
+    throw new AnalystOpinionPreviewError(
+      "La réponse reçue n’est pas un PDF (type de contenu inattendu).",
+    );
+  }
+
+  const blob = await response.blob();
+  const signature = await readPdfSignature(blob);
+  if (!signature.startsWith("%PDF-")) {
+    throw new AnalystOpinionPreviewError(
+      "Le fichier reçu ne contient pas la signature d’un PDF valide.",
+    );
+  }
+
+  return {
+    blob,
+    opinionId: opinion.id,
+    opinionVersion: opinion.version,
+    opinionSha256: opinion.content_sha256,
+    basePublicationSha256,
+  };
+}
+
 export function composeAnalystOpinion(
   investigationId: string,
   input: OpinionCompositionInput = {},
