@@ -1025,6 +1025,20 @@ def _credential_copy_forms(path: Path) -> tuple[bytes, ...]:
     return _credential_bytes_forms(data)
 
 
+def _is_credential_file_name(name: str) -> bool:
+    """A basename the provider CLIs use for their credential copies (R2B-2)."""
+    lowered = name.lower()
+    return lowered == "auth.json" or lowered.startswith(".credentials")
+
+
+def _profile_credential_forms(directory: Path) -> tuple[bytes, ...]:
+    """In-memory forms of every credential copy currently seeded for a session."""
+    forms: set[bytes] = set()
+    for relative in PROFILE_CREDENTIAL_COPY_PATHS:
+        forms.update(_credential_copy_forms(directory / relative))
+    return tuple(sorted(forms, key=len, reverse=True))
+
+
 def _shred_credential_copy(path: Path) -> bool:
     """Overwrite a credential copy then unlink it; ``True`` once it is gone."""
     try:
@@ -2134,7 +2148,21 @@ class SessionSupervisor:
             skills_directory=self._config.skills_root,
             instruction_block=instruction_block,
         )
-        plan = profile.build_launch_plan(context)
+        try:
+            plan = profile.build_launch_plan(context)
+            # R2B-2: the profile just seeded its provider credential into the
+            # disposable runtime.  Capture the values in host memory before the
+            # run can copy them out; nothing is logged or persisted.
+            handle.provider_credential_forms = _merge_forms(
+                handle.provider_credential_forms, _profile_credential_forms(handle.directory)
+            )
+        except BaseException:
+            # A refused or failed launch never leaves a seeded copy behind.
+            forms, failures = _remove_profile_credentials(handle.directory)
+            handle.provider_credential_forms = _merge_forms(handle.provider_credential_forms, forms)
+            if failures:
+                self._fail_credential_cleanup(handle, "start")
+            raise
         if profile.requires_sandbox:
             # The sandboxed shim and the trusted entrypoint's forwarder both
             # need the pathname endpoints LIFE-1 owns; never derive them again.
@@ -2957,8 +2985,26 @@ class SessionSupervisor:
     def _refuse_secret_exposure(
         self, handle: _Session, entries: Sequence[tuple[str, str, bytes]]
     ) -> None:
-        """Refuse to persist agent content that contains the session secret (F2)."""
-        forms = handle.secret_forms
+        """Refuse to persist agent content carrying a session or provider secret.
+
+        F2 covers the D7 secret; R2B-2 extends the same refusal to the seeded
+        provider credential values (raw, hex, standard/urlsafe base64,
+        JSON-escaped and aligned fragments) and to files named like a
+        credential copy.  Neither the error nor the event carries the offending
+        content or a path.
+        """
+        for destination, _kind, _data in entries:
+            if _is_credential_file_name(Path(destination).name):
+                self._revoke_secret_exposure(handle)
+                raise SecretExposureError(operation="collect")
+        # The current copies are read here (never persisted) so a token the CLI
+        # refreshed during the run is covered even before the next purge; forms
+        # captured at launch/interrupt cover copies already destroyed.
+        forms = _merge_forms(
+            handle.secret_forms,
+            handle.provider_credential_forms,
+            _profile_credential_forms(handle.directory),
+        )
         if not forms:
             return
         for _destination, _kind, data in entries:
