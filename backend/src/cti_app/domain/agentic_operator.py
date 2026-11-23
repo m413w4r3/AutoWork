@@ -339,7 +339,7 @@ class OperatorConfinementV1(_WireModel):
     profile: str = Field(min_length=1, max_length=64)
     bwrap_ok: bool
     netns: bool = False
-    network_mode: Literal["isolated_egress", "host_network_unsafe"] | None = None
+    network_mode: Literal["isolated_egress"] | None = None
     loopback_isolated: bool = False
     reason: str | None = Field(default=None, max_length=512)
 

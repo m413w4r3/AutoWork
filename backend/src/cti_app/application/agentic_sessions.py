@@ -116,8 +116,6 @@ from cti_app.domain.investigation_task import (
     TaskStatus,
 )
 
-_CLI_NETWORK_MODES = frozenset({"isolated_egress", "host_network_unsafe"})
-
 
 class SessionError(ValueError):
     """Base refusal for a session operation, carrying an HTTP-stable code."""
@@ -708,8 +706,8 @@ class SessionService:
         task_limits: TaskLimits = TASK_LIMIT_DEFAULTS,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
-        if cli_network_mode not in _CLI_NETWORK_MODES:
-            raise ValueError("cli_network_mode must be isolated_egress or host_network_unsafe")
+        if cli_network_mode != "isolated_egress":
+            raise ValueError("cli_network_mode must be isolated_egress")
         self._uow_factory = uow_factory
         self._deriver = deriver
         self._operator = operator
@@ -717,7 +715,6 @@ class SessionService:
         self._note_resolver = note_resolver
         self._disclosure = disclosure
         self._release_host = release_host
-        self._cli_network_mode = cli_network_mode
         self._task_limits = task_limits
         self._clock = clock or (lambda: datetime.now(UTC))
 
@@ -2039,25 +2036,13 @@ class SessionService:
     ) -> None:
         """R03 B1: a real CLI session needs the attested loopback isolation.
 
-        ``host_network_unsafe`` is an explicit development override; even then
-        the host must have attested that same mode, so a deployment that forgot
-        the override still fails closed instead of silently sharing the host
-        network.
+        ``isolated_egress`` is the only supported CLI network mode (M24.1
+        CFG-1). A host that did not attest it refuses the real session instead
+        of silently sharing the host network.
         """
         if capabilities.adapter_kind is not adapter_kind:
             raise SessionOperatorContractError("the capability probe names another adapter")
         confinement = capabilities.confinement
-        if self._cli_network_mode == "host_network_unsafe":
-            if confinement is not None and confinement.network_mode not in (
-                None,
-                "host_network_unsafe",
-            ):
-                raise SessionNetworkIsolationUnavailableError(
-                    "the host attested an isolated network while the backend is in its explicit "
-                    "host_network_unsafe override",
-                    details={"reason": "network_mode_mismatch"},
-                )
-            return
         if confinement is None:
             raise SessionNetworkIsolationUnavailableError(
                 "the host did not attest a CLI network mode; refusing the real session",

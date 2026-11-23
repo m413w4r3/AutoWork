@@ -77,14 +77,24 @@ class Settings(BaseSettings):
     # Setting this to true is an explicit, unsafe opt-in for isolated development only.
     agent_sessions_allow_local_identity: bool = False
     # M24 security boundary (R03 B1): a real operator CLI runs in its own network
-    # namespace with a slirp4netns gateway that cannot reach the host loopback, so
-    # the Vite proxy and the published PostgreSQL/MinIO ports are unreachable even
-    # though the model has a shell. The host supervisor attests the same mode at
-    # startup and refuses a real session it cannot isolate. ``host_network_unsafe``
-    # is an explicit development override (the CLI shares the host network).
-    agent_sessions_cli_network_mode: Literal["isolated_egress", "host_network_unsafe"] = (
-        "isolated_egress"
-    )
+    # namespace whose egress is confined to the broker/provider path, so the host
+    # loopback (Vite proxy, published PostgreSQL/MinIO) is unreachable even though
+    # the model has a shell. The host supervisor attests the same mode at startup
+    # and refuses a real session it cannot isolate. Isolation is the only supported
+    # mode: the former ``host_network_unsafe`` development override was removed
+    # (M24.1 CFG-1), and an old environment value fails startup explicitly.
+    agent_sessions_cli_network_mode: Literal["isolated_egress"] = "isolated_egress"
+
+    @field_validator("agent_sessions_cli_network_mode", mode="before")
+    @classmethod
+    def _validate_agent_sessions_cli_network_mode(cls, value: object) -> object:
+        if isinstance(value, str) and value.strip() == "host_network_unsafe":
+            raise ValueError(
+                "AGENT_SESSIONS_CLI_NETWORK_MODE=host_network_unsafe is no longer supported: "
+                "agent CLI sessions must run in an isolated network namespace "
+                "(isolated_egress)"
+            )
+        return value
 
     @field_validator("m24_agent_session_key")
     @classmethod

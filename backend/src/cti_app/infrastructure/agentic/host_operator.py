@@ -175,15 +175,15 @@ class HostOperatorAdapter:
         host: HostSessionsPort,
         preparations: HostSessionPreparationRegistry,
         context: HostSessionContextProvider | None = None,
-        network_mode: Literal["isolated_egress", "host_network_unsafe"] = "isolated_egress",
+        network_mode: str = "isolated_egress",
         clock: Callable[[], datetime] | None = None,
     ) -> None:
-        if network_mode not in {"isolated_egress", "host_network_unsafe"}:
-            raise ValueError("network_mode must be isolated_egress or host_network_unsafe")
+        if network_mode != "isolated_egress":
+            raise ValueError("network_mode must be isolated_egress")
         self._host = host
         self._preparations = preparations
         self._context = context
-        self._network_mode = network_mode
+        self._network_mode: Literal["isolated_egress"] = "isolated_egress"
         self._clock = clock or (lambda: datetime.now(UTC))
         self._facts: ProbedHostFacts | None = None
 

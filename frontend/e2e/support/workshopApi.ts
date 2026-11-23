@@ -982,10 +982,10 @@ function capabilitiesPayload(
     permission_modes: [],
     confinement: unconfined
       ? {
-          profile: "host-network",
+          profile: "unattested",
           bwrap_ok: true,
           netns: false,
-          network_mode: "host_network_unsafe",
+          network_mode: null,
           loopback_isolated: false,
         }
       : {

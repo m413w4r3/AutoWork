@@ -1333,7 +1333,6 @@ async def _real_sidecar_transfer(running: RunningSessionAgent, workspace_id: str
         secret_delivery=ports.secret_delivery,
         deriver=harness.deriver,
         disclosure=_allow_disclosure,
-        cli_network_mode="host_network_unsafe",
         clock=lambda: NOW,
     )
     try:
@@ -1527,12 +1526,17 @@ def _start_sidecar(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         supervisor_module,
         "default_profiles",
-        lambda: ProfileRegistry((_FakeCodexProfile(), _FakeClaudeProfile())),
+        lambda: ProfileRegistry(
+            (
+                _FakeCodexProfile(simulate_network_attestation=True),
+                _FakeClaudeProfile(simulate_network_attestation=True),
+            )
+        ),
     )
     monkeypatch.setenv("AUTOWORK_FAKE_CLI_SCENARIO", "hang")
-    # The fake supervisor profiles do not run bwrap: both sides use the
-    # explicit dev override, exactly as a host without isolation tools would.
-    monkeypatch.setenv("AGENT_SESSIONS_CLI_NETWORK_MODE", "host_network_unsafe")
+    # The fake profiles do not run bwrap, so they simulate the only supported
+    # attestation (isolated_egress) instead of falling back to a host network.
+    monkeypatch.delenv("AGENT_SESSIONS_CLI_NETWORK_MODE", raising=False)
 
 
 def test_real_sidecar_transfer_interrupts_codex_and_opens_a_claude_session(
