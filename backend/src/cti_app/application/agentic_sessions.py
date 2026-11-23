@@ -1139,45 +1139,42 @@ class SessionService:
         actor: TaskActor,
         now: datetime | None = None,
     ) -> AgentSessionV1:
-        """Human interrupt: persist the intent, ask the adapter, record the stop."""
+        """Human interrupt in three phases; the host call holds no lock (F2-D).
+
+        Phase 1 commits the durable intent under the canonical advisory-then-
+        task-row order, so a competing close/cancel/reconcile (or a note
+        capture already holding the task row) is either observed or made to
+        wait.  Phase 2 asks the adapter with no transaction or row lock open: a
+        slow or wedged host blocks nobody, and a failed or timed-out call is
+        ambiguous — the ``interrupt_requested`` row stays committed, so the
+        backend never presumes the stop did not happen and ``reconcile`` is the
+        only way to learn the truth.  Phase 3 records the adapter's answer
+        under the same lock order, re-reading the session first so a concurrent
+        close/reconcile that already committed is never overwritten.
+        """
         timestamp = _now(self._clock, now)
         self._require_human(actor)
         operator = self._require_operator()
         if not isinstance(reason, str) or not reason.strip():
             raise SessionError("interrupt reason must not be empty")
-        async with self._uow_factory() as uow:
-            session = await self._session_for(uow, investigation_id, session_id)
-            if session.state is AgentSessionState.INTERRUPT_REQUESTED:
-                return session
-            if session.state not in (
-                AgentSessionState.RUNNING,
-                AgentSessionState.AWAITING_INSTRUCTION,
-            ):
-                raise SessionStateConflictError(
-                    f"a {session.state.value} session cannot be interrupted"
-                )
-            if session.host_session_ref is None:
-                raise SessionOperatorContractError("the session has no host reference to stop")
-            requested = await self._persist(
-                uow,
-                session.with_state(AgentSessionState.INTERRUPT_REQUESTED, now=timestamp),
-            )
-            result = await operator.interrupt_session(
-                InterruptSessionRequest(
-                    session_id=requested.id,
-                    host_session_ref=requested.host_session_ref or "",
-                    reason=reason.strip(),
-                )
-            )
-            if result.session_id != requested.id:
-                raise SessionOperatorContractError("interrupt_session answered another session")
-            if result.stopped:
-                requested = await self._persist(
-                    uow,
-                    requested.with_state(AgentSessionState.STOPPED, now=timestamp),
-                )
-            await uow.commit()
+        wire_reason = reason.strip()
+        requested, marked = await self._mark_interrupt_requested(
+            investigation_id, session_id, timestamp
+        )
+        if not marked:
             return requested
+        result = await operator.interrupt_session(
+            InterruptSessionRequest(
+                session_id=requested.id,
+                host_session_ref=requested.host_session_ref or "",
+                reason=wire_reason,
+            )
+        )
+        if result.session_id != requested.id:
+            raise SessionOperatorContractError("interrupt_session answered another session")
+        if not result.stopped:
+            return requested
+        return await self._record_interrupt_stopped(investigation_id, session_id, timestamp)
 
     async def resume(
         self,
@@ -1193,6 +1190,15 @@ class SessionService:
         whose reconciliation proved ``resume_available``, may resume.  A failed
         adapter resume leaves the old session ``lost``; the human must open a
         new session with a new handoff.
+
+        F2-D: the probed adapter facts are process-local, so a backend restart
+        used to make a persisted session unresumable.  The real host is probed
+        again before the first resume and the answer must still carry the
+        ``capability_sha256`` recorded on the session; a changed probe refuses
+        instead of guessing a resume from a stale in-memory profile.  The host
+        call runs outside every transaction, and the write phase re-locks the
+        canonical order and re-reads the row so a session a concurrent
+        close/cancel made terminal is never revived.
         """
         timestamp = _now(self._clock, now)
         self._require_human(actor)
@@ -1201,41 +1207,38 @@ class SessionService:
         async with self._uow_factory() as uow:
             session = await self._session_for(uow, investigation_id, session_id)
             self._require_network_attestation(session.adapter_kind, session.capabilities())
-            if session.state not in RESUMABLE_AGENT_SESSION_STATES:
-                raise SessionStateConflictError(f"a {session.state.value} session is not resumable")
-            outcome = session.reconciliation_outcome()
-            if (
-                session.state is AgentSessionState.LOST
-                and outcome not in RECONCILE_OUTCOMES_RESUMABLE
-            ):
-                # Fail closed: an unreconciled or non-resumable loss is final.
-                raise SessionResumeUnavailableError(
-                    "the adapter did not prove the lost session can be resumed"
-                )
-            if (
-                session.state is AgentSessionState.STOPPED
-                and not session.capabilities().supports_resume
-            ):
-                raise SessionResumeUnavailableError(
-                    "the probed adapter does not support resuming a stopped session"
-                )
-            if session.host_session_ref is None:
-                raise SessionResumeUnavailableError("the session has no host reference to resume")
-            result = await operator.resume_session(
-                ResumeSessionRequest(
-                    session_id=session.id,
-                    adapter_kind=session.adapter_kind,
-                    host_session_ref=session.host_session_ref,
-                    capability_sha256=session.capability_sha256,
-                )
+            self._require_resumable(session)
+            adapter_kind = session.adapter_kind
+            executable = session.capabilities().executable
+            capability_sha256 = session.capability_sha256
+            host_session_ref = session.host_session_ref or ""
+        capabilities = await self._probe(operator, adapter_kind, executable)
+        self._require_network_attestation(adapter_kind, capabilities)
+        if capabilities.capability_sha256 != capability_sha256:
+            raise SessionResumeUnavailableError(
+                "the host capability probe changed since the session was prepared"
             )
-            if result.session_id != session.id:
-                raise SessionOperatorContractError("resume_session answered another session")
-            if not result.resumed:
-                if session.state is AgentSessionState.STOPPED:
+        result = await operator.resume_session(
+            ResumeSessionRequest(
+                session_id=session_id,
+                adapter_kind=adapter_kind,
+                host_session_ref=host_session_ref,
+                capability_sha256=capability_sha256,
+            )
+        )
+        if result.session_id != session_id:
+            raise SessionOperatorContractError("resume_session answered another session")
+        lost_state: AgentSessionState | None = None
+        async with self._uow_factory() as uow:
+            await uow.investigation_tasks.lock_investigation(investigation_id)
+            current = await self._session_for(uow, investigation_id, session_id)
+            if current.state not in RESUMABLE_AGENT_SESSION_STATES:
+                lost_state = current.state
+            elif not result.resumed:
+                if current.state is AgentSessionState.STOPPED:
                     await self._persist(
                         uow,
-                        session.with_state(
+                        current.with_state(
                             AgentSessionState.LOST,
                             now=timestamp,
                             close_reason="resume_unavailable",
@@ -1245,17 +1248,26 @@ class SessionService:
                 raise SessionResumeUnavailableError(
                     "the adapter refused to resume; open a new session with a new handoff"
                 )
-            current = session
-            if result.host_session_ref and result.host_session_ref != session.host_session_ref:
-                current = await self._persist(
-                    uow,
-                    current.with_host_session_ref(result.host_session_ref, now=timestamp),
+            else:
+                if result.host_session_ref and result.host_session_ref != current.host_session_ref:
+                    current = await self._persist(
+                        uow,
+                        current.with_host_session_ref(result.host_session_ref, now=timestamp),
+                    )
+                resumed = await self._persist(
+                    uow, current.with_state(AgentSessionState.READY, now=timestamp)
                 )
-            resumed = await self._persist(
-                uow, current.with_state(AgentSessionState.READY, now=timestamp)
+                await uow.commit()
+                return resumed
+        if lost_state is None:  # pragma: no cover - the write phase always decides
+            raise SessionOperatorContractError("resume write phase returned no decision")
+        if result.resumed:
+            # The host resumed a session a concurrent path already made
+            # terminal: stop the process it just started, outside every lock.
+            await self._interrupt_host_quietly(
+                operator, session_id, host_session_ref, "resume_lost_race"
             )
-            await uow.commit()
-            return resumed
+        raise SessionStateConflictError(f"a {lost_state.value} session is not resumable")
 
     async def reconcile(
         self,
@@ -1432,21 +1444,28 @@ class SessionService:
         now: datetime | None = None,
     ) -> AgentSessionV1:
         """Human close of an unleased active session; a leased session is closed
-        by the task transition that releases the lease (D3)."""
+        by the task transition that releases the lease (D3).
+
+        F2-D: the task row is the lease authority, so the decision runs under
+        the canonical advisory-then-task-row order.  A concurrent ``start``
+        either observes this session already terminal (and refuses to lease
+        it) or has committed its lease first, in which case this close refuses
+        — a closed session is therefore never bound to a current lease.  Only
+        the task's current ``lease_session_id`` decides ownership; the
+        session's own lease mirror may legitimately be stale or empty after a
+        crash or a direct task-command start.
+        """
         timestamp = _now(self._clock, now)
         self._require_human(actor)
         if not isinstance(reason, str) or not reason.strip():
             raise SessionError("close reason must not be empty")
         async with self._uow_factory() as uow:
+            await uow.investigation_tasks.lock_investigation(investigation_id)
             session = await self._session_for(uow, investigation_id, session_id)
             if session.is_terminal:
                 return session
-            task = await uow.investigation_tasks.get(session.task_id)
-            if (
-                task is not None
-                and session.task_lease_id is not None
-                and task.lease_id == session.task_lease_id
-            ):
+            task = await self._locked_task(uow, investigation_id, session.task_id)
+            if task.lease_session_id == session.id:
                 raise SessionStateConflictError(
                     "the task lease still owns this session; release it first"
                 )
@@ -1827,6 +1846,84 @@ class SessionService:
         if flusher is None:
             flusher = HostSessionReleaseService(uow_factory=self._uow_factory, host=None).flush
         await flusher(releases)
+
+    async def _mark_interrupt_requested(
+        self, investigation_id: UUID, session_id: UUID, timestamp: datetime
+    ) -> tuple[AgentSessionV1, bool]:
+        """Interrupt phase 1: commit the durable intent (F2-D).
+
+        The investigation advisory lock then the task row lock serialize this
+        state change with every task command and with a note capture already
+        holding the task row, and the fresh session read under both locks makes
+        a close/reconcile that committed in between visible.  ``False`` means
+        a concurrent human already recorded the intent; the host must not be
+        signalled a second time.
+        """
+        async with self._uow_factory() as uow:
+            await uow.investigation_tasks.lock_investigation(investigation_id)
+            session = await self._session_for(uow, investigation_id, session_id)
+            await self._locked_task(uow, investigation_id, session.task_id)
+            session = await self._session_for(uow, investigation_id, session_id)
+            if session.state is AgentSessionState.INTERRUPT_REQUESTED:
+                return session, False
+            if session.state not in (
+                AgentSessionState.RUNNING,
+                AgentSessionState.AWAITING_INSTRUCTION,
+            ):
+                raise SessionStateConflictError(
+                    f"a {session.state.value} session cannot be interrupted"
+                )
+            if session.host_session_ref is None:
+                raise SessionOperatorContractError("the session has no host reference to stop")
+            requested = await self._persist(
+                uow,
+                session.with_state(AgentSessionState.INTERRUPT_REQUESTED, now=timestamp),
+            )
+            await uow.commit()
+            return requested, True
+
+    async def _record_interrupt_stopped(
+        self, investigation_id: UUID, session_id: UUID, timestamp: datetime
+    ) -> AgentSessionV1:
+        """Interrupt phase 3: record the adapter's answer, never overwrite.
+
+        The host call happened outside every lock, so a close, cancel or
+        reconcile may have committed meanwhile; the row is re-read under the
+        canonical lock order and any state other than the intent this call
+        wrote is returned unchanged.
+        """
+        async with self._uow_factory() as uow:
+            await uow.investigation_tasks.lock_investigation(investigation_id)
+            session = await self._session_for(uow, investigation_id, session_id)
+            await self._locked_task(uow, investigation_id, session.task_id)
+            session = await self._session_for(uow, investigation_id, session_id)
+            if session.state is not AgentSessionState.INTERRUPT_REQUESTED:
+                return session
+            stopped = await self._persist(
+                uow, session.with_state(AgentSessionState.STOPPED, now=timestamp)
+            )
+            await uow.commit()
+            return stopped
+
+    @staticmethod
+    def _require_resumable(session: AgentSessionV1) -> None:
+        if session.state not in RESUMABLE_AGENT_SESSION_STATES:
+            raise SessionStateConflictError(f"a {session.state.value} session is not resumable")
+        outcome = session.reconciliation_outcome()
+        if session.state is AgentSessionState.LOST and outcome not in RECONCILE_OUTCOMES_RESUMABLE:
+            # Fail closed: an unreconciled or non-resumable loss is final.
+            raise SessionResumeUnavailableError(
+                "the adapter did not prove the lost session can be resumed"
+            )
+        if (
+            session.state is AgentSessionState.STOPPED
+            and not session.capabilities().supports_resume
+        ):
+            raise SessionResumeUnavailableError(
+                "the probed adapter does not support resuming a stopped session"
+            )
+        if session.host_session_ref is None:
+            raise SessionResumeUnavailableError("the session has no host reference to resume")
 
     async def _deliver_secret(self, prepared: PreparedAgentSession, idempotency_key: str) -> None:
         """Hand the secret to the host agent; the browser never receives it."""
