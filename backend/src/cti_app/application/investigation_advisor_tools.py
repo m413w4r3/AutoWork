@@ -8895,6 +8895,12 @@ def register_investigation_advisor_tool(
                             "draft_text",
                             "suricata_draft",
                             "figure_plan",
+                            # M24.1 B3: task-scoped consultations expose these
+                            # two untyped types; the executor already accepts
+                            # them (`ACCEPTED_CONSULTATION_TYPES`), the registry
+                            # schema must not refuse them first.
+                            "interpretation",
+                            "critique",
                         ],
                     },
                     "question": {"type": "string"},
