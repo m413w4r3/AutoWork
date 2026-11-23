@@ -21,6 +21,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from sidecars.workspace_agent.sessions import process
 from sidecars.workspace_agent.sessions import supervisor as sessions_module
 from sidecars.workspace_agent.sessions.supervisor import (
     FakeProfile,
@@ -148,11 +149,13 @@ def test_close_removes_the_seeded_credential_copies(
     scripted_supervisors.append(supervisor)
     _prepare(supervisor, environment)
     planted = _plant_credentials(session_base)
+    session_etc = process.create_session_etc_directory(_session_dir(session_base))
 
     body = _close(supervisor)
 
     assert body["state"] == "closed"
     assert all(not path.exists() for path in planted)
+    assert not session_etc.exists()
     assert supervisor.status(SESSION_ID)["state"] == "closed"
 
 
@@ -164,10 +167,12 @@ def test_stop_removes_the_seeded_credential_copies(
     scripted_supervisors.append(supervisor)
     _prepare(supervisor, environment)
     planted = _plant_credentials(session_base)
+    session_etc = process.create_session_etc_directory(_session_dir(session_base))
 
     supervisor.stop()
 
     assert all(not path.exists() for path in planted)
+    assert not session_etc.exists()
 
 
 def test_interrupt_removes_the_seeded_credential_copies(
@@ -181,6 +186,7 @@ def test_interrupt_removes_the_seeded_credential_copies(
     script.write_text(json.dumps(hang_script()), encoding="utf-8")
     os.chmod(script, 0o600)
     planted = _plant_credentials(session_base)
+    session_etc = process.create_session_etc_directory(_session_dir(session_base))
     started = supervisor.start(
         SESSION_ID,
         StartSessionRequest(),
@@ -196,8 +202,10 @@ def test_interrupt_removes_the_seeded_credential_copies(
         idempotency_key="m24-r2b1-interrupt-0001",
         body_sha256="e" * 64,
     )
+    wait_until(lambda: supervisor.status(SESSION_ID)["state"] in {"stopped", "failed"})
 
     assert all(not path.exists() for path in planted)
+    assert not session_etc.exists()
 
 
 def test_failed_run_end_removes_a_surviving_credential_copy(
@@ -237,12 +245,14 @@ def test_restart_reconciliation_removes_an_orphan_session_credential_copy(
     crashed = _supervisor(session_base, environment)
     _prepare(crashed, environment)
     planted = _plant_credentials(session_base)
+    session_etc = process.create_session_etc_directory(_session_dir(session_base))
     # No close/stop: this supervisor is the "crash" the restart must clean up.
 
     restarted = _supervisor(session_base, environment)
     scripted_supervisors.append(restarted)
 
     assert all(not path.exists() for path in planted)
+    assert not session_etc.exists()
     status = restarted.status(SESSION_ID)
     assert status["state"] == "lost"
     events = _events(restarted)

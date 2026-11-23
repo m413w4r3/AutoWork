@@ -123,17 +123,6 @@ REQUIRED_HELP_FLAGS: tuple[str, ...] = (
 )
 RESUME_HELP_FLAGS: tuple[str, ...] = ("--session-id", "--resume")
 
-# Read-only system paths the CLI needs to reach its provider: DNS/NSS config
-# and TLS trust anchors. No host credential lives here.
-TRUST_ANCHORS: tuple[str, ...] = (
-    "/etc/resolv.conf",
-    "/etc/hosts",
-    "/etc/nsswitch.conf",
-    "/etc/ssl",
-    "/etc/ca-certificates",
-    "/etc/pki",
-    "/etc/localtime",
-)
 SYSTEM_BIND_PREFIXES: tuple[str, ...] = ("/usr", "/lib", "/lib64", "/bin", "/sbin")
 
 MODEL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
@@ -160,7 +149,8 @@ CLAUDE_HOST_SPIKE_CHECKS: tuple[str, ...] = (
     "apiKeyHelper via --settings; keychain/OAuth files are never read. Never "
     "log the credential.",
     "Prove the §3 bwrap profile creates namespaces on the host (no netns) with "
-    "the resolved CLI runtime prefix and TLS/DNS anchors bound read-only.",
+    "the resolved CLI runtime prefix, certificate-only TLS anchors and generated "
+    "resolver files bound read-only; never bind host DNS configuration.",
     "Prove `--max-budget-usd` is enforced for the chosen auth mode.",
     "Prove the resolved CLI install prefix (and any node runtime for script "
     "installs) is complete inside bwrap.",
@@ -843,16 +833,23 @@ class ClaudeProfile:
         mcp_config_path = self._prepare_session_config(context)
         self._install_credentials(context)
         argv = self._claude_argv(context, binary, prompt_text, mcp_config_path)
-        bwrap_argv = process.build_bwrap_argv(
-            tuple(argv),
-            workspace_binds=self._readonly_binds(binary),
-            ipc_directory=context.ipc_socket_path.parent,
-            scratch_directory=context.scratch_directory,
-            config_directory=context.config_directory,
-            work_directory=context.work_directory,
-            bwrap=self._bwrap_path(),
-            network_mode=context.network_mode,
-        )
+        try:
+            session_etc_directory = process.create_session_etc_directory(context.session_directory)
+            bwrap_argv = process.build_bwrap_argv(
+                tuple(argv),
+                workspace_binds=self._readonly_binds(binary),
+                ipc_directory=context.ipc_socket_path.parent,
+                scratch_directory=context.scratch_directory,
+                config_directory=context.config_directory,
+                work_directory=context.work_directory,
+                bwrap=self._bwrap_path(),
+                extra_ro_binds=process.tls_trust_anchor_binds(),
+                session_etc_directory=session_etc_directory,
+                network_mode=context.network_mode,
+            )
+        except process.NetworkIsolationUnavailable as exc:
+            process.cleanup_session_etc_directory(context.session_directory)
+            raise ConfinementUnavailableError(ADAPTER_KIND, reason=str(exc)) from exc
         return process.LaunchPlan(
             argv=tuple(bwrap_argv),
             env=self._environment(context),
@@ -1023,19 +1020,13 @@ class ClaudeProfile:
             raise SessionError("the session credential cannot be installed") from exc
 
     def _readonly_binds(self, binary: Path) -> tuple[Path, ...]:
-        candidates: list[Path] = []
-        for path in (binary.parent, *(Path(item) for item in TRUST_ANCHORS)):
-            if not path.exists():
-                continue
-            text = str(path)
-            if any(
-                text == prefix or text.startswith(prefix + "/") for prefix in SYSTEM_BIND_PREFIXES
-            ):
-                continue
-            if any(text == str(seen) for seen in candidates):
-                continue
-            candidates.append(path)
-        return tuple(candidates)
+        path = binary.parent
+        if not path.exists():
+            return ()
+        text = str(path)
+        if any(text == prefix or text.startswith(prefix + "/") for prefix in SYSTEM_BIND_PREFIXES):
+            return ()
+        return (path,)
 
     # -- per-session config (MCP shim only) --------------------------------
 

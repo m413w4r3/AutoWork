@@ -81,20 +81,6 @@ MAX_EVENT_PARSE_BYTES = 1024 * 1024
 MAX_EVENT_DETAIL_CHARS = 8 * 1024
 PROBE_TIMEOUT_SECONDS = 15.0
 PROBE_HOME_PREFIX = "autowork-codex-probe-"
-# Read-only system paths the CLI needs to verify the provider's TLS chain.
-# bwrap starts from a tmpfs root, so without these binds rustls/reqwest has no
-# trust store and every provider request fails after the tunnel is open (H0
-# host spike, 2026-11-23: 63 allowed CONNECTs, zero successful requests).
-TRUST_ANCHORS: tuple[str, ...] = (
-    "/etc/ssl",
-    "/etc/ca-certificates",
-    "/etc/pki",
-    "/etc/resolv.conf",
-    "/etc/hosts",
-    "/etc/nsswitch.conf",
-    "/etc/localtime",
-)
-
 # Tokens emitted by the profile; every one is printed by the matching --help.
 REQUIRED_EXEC_FLAGS = frozenset(
     {
@@ -533,18 +519,28 @@ class CodexProfile:
             LOGGER.warning("codex argv would use unprobed flags: %s", missing)
             raise CapabilityUnavailableError(self.adapter_kind)
         bwrap = self._bwrap if self._bwrap is not None else Path(process.default_bwrap_binary())
-        argv = process.build_bwrap_argv(
-            tuple(cli_argv),
-            workspace_binds=self._workspace_binds(context),
-            ipc_directory=context.ipc_socket_path.parent,
-            scratch_directory=context.scratch_directory,
-            config_directory=context.config_directory,
-            work_directory=context.work_directory,
-            bwrap=bwrap,
-            extra_ro_binds=self._runtime_binds(facts.binary_path) + self._skills_binds(context),
-            extra_rw_binds=((context.home_directory, context.home_directory),),
-            network_mode=context.network_mode,
-        )
+        try:
+            session_etc_directory = process.create_session_etc_directory(context.session_directory)
+            argv = process.build_bwrap_argv(
+                tuple(cli_argv),
+                workspace_binds=self._workspace_binds(context),
+                ipc_directory=context.ipc_socket_path.parent,
+                scratch_directory=context.scratch_directory,
+                config_directory=context.config_directory,
+                work_directory=context.work_directory,
+                bwrap=bwrap,
+                extra_ro_binds=(
+                    process.tls_trust_anchor_binds()
+                    + self._runtime_binds(facts.binary_path)
+                    + self._skills_binds(context)
+                ),
+                extra_rw_binds=((context.home_directory, context.home_directory),),
+                session_etc_directory=session_etc_directory,
+                network_mode=context.network_mode,
+            )
+        except process.NetworkIsolationUnavailable as exc:
+            process.cleanup_session_etc_directory(context.session_directory)
+            raise ConfinementUnavailableError(self.adapter_kind, reason=str(exc)) from exc
         # No proxy variable is set here: the trusted entrypoint owns the closed
         # provider-proxy literal inside the netns (design §5, entrypoint.py).
         # Codex telemetry/update controls are UNPROVEN (design §8.4): H0 must
@@ -737,10 +733,6 @@ class CodexProfile:
             prefix = binary.parent.parent
             if (prefix / "lib").is_dir() and not _under(prefix, Path("/usr")):
                 binds.append((prefix, prefix))
-        for anchor in TRUST_ANCHORS:
-            path = Path(anchor)
-            if path.exists():
-                binds.append((path, path))
         return tuple(dict.fromkeys(binds))
 
     def _skills_binds(self, context: LaunchContext) -> tuple[tuple[Path, Path], ...]:

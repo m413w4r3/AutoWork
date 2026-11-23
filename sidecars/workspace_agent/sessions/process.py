@@ -91,6 +91,10 @@ BWRAP_ROOT_ARGV: tuple[str, ...] = (
     "/proc",
     "--dev",
     "/dev",
+    # The tmpfs root has no host /etc tree.  Create only the directory; the
+    # adapter supplies private resolver files and the narrow TLS anchors below.
+    "--dir",
+    "/etc",
     "--ro-bind",
     "/usr",
     "/usr",
@@ -134,6 +138,22 @@ ATTESTATION_FAILURE_REASONS = frozenset(
         "attestation_crashed",
     }
 ) | {f"reachable_address:{address}" for address in REQUIRED_BLOCKED_ADDRESSES}
+
+# Only public certificate material is exposed from the host.  In particular,
+# do not bind the encompassing /etc/ssl, /etc/pki or /etc/ca-certificates
+# trees: they can contain host configuration unrelated to TLS verification.
+TLS_TRUST_ANCHOR_PATHS: tuple[str, ...] = (
+    "/etc/ssl/certs",
+    "/etc/ssl/cert.pem",
+    "/etc/pki/tls/certs",
+    "/etc/pki/ca-trust/extracted/pem",
+)
+SESSION_ETC_DIRECTORY_NAME = "sandbox-etc"
+SESSION_ETC_FILES: tuple[tuple[str, bytes], ...] = (
+    ("hosts", b"127.0.0.1 localhost\n::1 localhost\n"),
+    ("resolv.conf", b""),
+    ("nsswitch.conf", b"hosts: files\n"),
+)
 
 # R03 B1/env: an AutoWork operational credential must never enter the CLI
 # environment.  The launch env is already a closed literal; this deny list is
@@ -589,6 +609,137 @@ def _managed(process: subprocess.Popen[bytes], plan: LaunchPlan, *, run: int) ->
     )
 
 
+def create_session_etc_directory(session_directory: Path) -> Path:
+    """Create the private, disposable resolver files used by a CLI sandbox."""
+    try:
+        parent = session_directory.lstat()
+    except OSError as exc:
+        raise NetworkIsolationUnavailable("the session runtime directory is unavailable") from exc
+    if not stat.S_ISDIR(parent.st_mode) or stat.S_ISLNK(parent.st_mode):
+        raise NetworkIsolationUnavailable("the session runtime directory is not private storage")
+
+    directory = session_directory / SESSION_ETC_DIRECTORY_NAME
+    try:
+        os.mkdir(directory, 0o700)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise NetworkIsolationUnavailable(
+            "the sandbox resolver directory cannot be created"
+        ) from exc
+    try:
+        info = directory.lstat()
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            raise NetworkIsolationUnavailable("the sandbox resolver path is not a real directory")
+        os.chmod(directory, 0o700)
+        for name, content in SESSION_ETC_FILES:
+            path = directory / name
+            fd = os.open(
+                path,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+            )
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise NetworkIsolationUnavailable("a sandbox resolver file is not regular")
+                os.fchmod(fd, 0o600)
+                view = memoryview(content)
+                while view:
+                    written = os.write(fd, view)
+                    if written <= 0:
+                        raise OSError("the sandbox resolver file write made no progress")
+                    view = view[written:]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+    except NetworkIsolationUnavailable:
+        raise
+    except OSError as exc:
+        raise NetworkIsolationUnavailable("the sandbox resolver files cannot be created") from exc
+    return directory
+
+
+def session_etc_ro_binds(directory: Path) -> tuple[tuple[Path, Path], ...]:
+    """Validate the generated resolver files and map only them into ``/etc``."""
+    try:
+        info = directory.lstat()
+    except OSError as exc:
+        raise NetworkIsolationUnavailable("the sandbox resolver directory is unavailable") from exc
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        raise NetworkIsolationUnavailable("the sandbox resolver directory is not private")
+    binds: list[tuple[Path, Path]] = []
+    for name, expected in SESSION_ETC_FILES:
+        path = directory / name
+        try:
+            file_info = path.lstat()
+            content = path.read_bytes()
+        except OSError as exc:
+            raise NetworkIsolationUnavailable("a sandbox resolver file is unavailable") from exc
+        if (
+            not stat.S_ISREG(file_info.st_mode)
+            or stat.S_ISLNK(file_info.st_mode)
+            or stat.S_IMODE(file_info.st_mode) != 0o600
+            or content != expected
+        ):
+            raise NetworkIsolationUnavailable("a sandbox resolver file is not the generated value")
+        binds.append((path, Path("/etc") / name))
+    return tuple(binds)
+
+
+def cleanup_session_etc_directory(session_directory: Path) -> None:
+    """Remove only the disposable resolver directory from this session runtime."""
+    directory = session_directory / SESSION_ETC_DIRECTORY_NAME
+    try:
+        info = directory.lstat()
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+    try:
+        if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+            shutil.rmtree(directory, ignore_errors=True)
+        else:
+            directory.unlink(missing_ok=True)
+    except OSError:
+        # The files contain only public local-name mappings.  Match the
+        # supervisor's best-effort removal of other disposable runtime paths.
+        pass
+
+
+def tls_trust_anchor_binds() -> tuple[tuple[Path, Path], ...]:
+    """Return read-only binds for certificate stores only, never host config."""
+    binds: list[tuple[Path, Path]] = []
+    targets: set[Path] = set()
+    for value in TLS_TRUST_ANCHOR_PATHS:
+        target = Path(value)
+        try:
+            source = target.resolve(strict=True)
+            info = source.stat()
+        except OSError:
+            continue
+        if target in targets or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+            continue
+        binds.append((source, target))
+        targets.add(target)
+    return tuple(binds)
+
+
+def _append_etc_parent_directories(command: list[str], target: Path, created: set[Path]) -> None:
+    parents: list[Path] = []
+    parent = target.parent
+    while parent not in {Path("/"), Path("/etc")}:
+        parents.append(parent)
+        parent = parent.parent
+    for directory in reversed(parents):
+        if directory not in created:
+            command.extend(("--dir", str(directory)))
+            created.add(directory)
+
+
 def stop_network(managed: ManagedProcess) -> None:
     """Compatibility no-op: the isolated profile has no auxiliary gateway.
 
@@ -717,6 +868,7 @@ def build_bwrap_argv(
     bwrap: Path | None = None,
     extra_ro_binds: tuple[tuple[Path, Path], ...] = (),
     extra_rw_binds: tuple[tuple[Path, Path], ...] = (),
+    session_etc_directory: Path | None = None,
     network_mode: str = NETWORK_MODE_ISOLATED_EGRESS,
 ) -> list[str]:
     """The reasoning-session bwrap profile (§3): namespaces, ro binds.
@@ -726,14 +878,19 @@ def build_bwrap_argv(
     ``entrypoint.py`` (design §5).  There is no slirp4netns gateway, no ``tap0``
     and no host-network fallback.  The ``fake`` profile launches directly and
     never uses this builder. ``extra_ro_binds`` and ``extra_rw_binds`` are
-    ``(source, target)`` pairs for the per-session skills exposure and private
-    HOME, so the closed profile stays the only place that decides what the model
-    may see.
+    ``(source, target)`` pairs for the CLI runtime, certificate store, skills
+    and private HOME. ``session_etc_directory`` contributes only the synthetic
+    hosts, empty resolver and files-only nsswitch entries; it is never exposed
+    as a directory mount.
     """
     if network_mode not in CLI_NETWORK_MODES:
         raise ValueError("network_mode must be isolated_egress")
     executable = str(bwrap if bwrap is not None else default_bwrap_binary())
     command = [executable, *BWRAP_NAMESPACE_ARGV, *BWRAP_ROOT_ARGV]
+    etc_directories_created = {Path("/etc")}
+    if session_etc_directory is not None:
+        for source, target in session_etc_ro_binds(session_etc_directory):
+            command.extend(("--ro-bind", str(source), str(target)))
     for system_path in ("/lib", "/lib64"):
         if Path(system_path).exists():
             command.extend(("--ro-bind", system_path, system_path))
@@ -741,6 +898,8 @@ def build_bwrap_argv(
         command.extend(("--ro-bind", str(path), str(path)))
     command.extend(("--ro-bind", str(ipc_directory), str(ipc_directory)))
     for source, target in extra_ro_binds:
+        if target.is_relative_to(Path("/etc")) and target != Path("/etc"):
+            _append_etc_parent_directories(command, target, etc_directories_created)
         command.extend(("--ro-bind", str(source), str(target)))
     for source, target in extra_rw_binds:
         command.extend(("--bind", str(source), str(target)))
