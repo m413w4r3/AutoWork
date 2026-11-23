@@ -33,6 +33,7 @@ import {
   REASON_LABELS,
   bounded,
   formatCount,
+  redactTechnicalIdentifiers,
 } from "./overviewPresentation";
 
 const MAX_ROWS = 10;
@@ -84,20 +85,18 @@ function InventoryDetails({ inventory }: { inventory: IOCInventoryV1 }) {
     <section aria-labelledby="overview-inventory-heading">
       <h3 id="overview-inventory-heading">Inventaire IOC</h3>
       <dl className="workshop-meta">
-        <dt>Schéma</dt>
-        <dd>{inventory.schema_version}</dd>
         <dt>Généré le</dt>
         <dd>
           <time dateTime={inventory.generated_at}>
             {inventory.generated_at}
           </time>
         </dd>
-        <dt>Synthèse épinglée</dt>
+        <dt>IOC collectés</dt>
         <dd>
-          <code>{inventory.pinned_synthesis_sha256}</code>
+          {formatCount(inventory.seeds.length + inventory.discovered.length)} ·{" "}
+          {formatCount(inventory.seeds.length)} graine(s),{" "}
+          {formatCount(inventory.discovered.length)} découvert(s)
         </dd>
-        <dt>Workspace lié</dt>
-        <dd>{inventory.workspace_binding_id ?? "Aucun"}</dd>
         <dt>Limites</dt>
         <dd>
           {formatCount(inventory.limits.iocs_considered)} IOC considérés sur{" "}
@@ -146,7 +145,8 @@ function InventoryIocList({
         {items.map((ioc) => (
           <li key={ioc.ioc_id}>
             <p>
-              {IOC_KIND_LABELS[ioc.kind]} · <code>{ioc.value}</code> ·{" "}
+              {IOC_KIND_LABELS[ioc.kind]} ·{" "}
+              <code>{displayIocValue(ioc.value)}</code> ·{" "}
               {ioc.origin === "seed" ? "graine" : "découvert"}
               {ioc.hash_type ? ` · type ${ioc.hash_type}` : ""}
             </p>
@@ -208,10 +208,6 @@ function SnapshotDetails({ snapshot }: { snapshot: BootstrapSnapshotV1 }) {
     <section aria-labelledby="overview-snapshot-heading">
       <h3 id="overview-snapshot-heading">Snapshot bootstrap</h3>
       <dl className="workshop-meta">
-        <dt>Snapshot</dt>
-        <dd>
-          <code>{snapshot.snapshot_id}</code>
-        </dd>
         <dt>Généré le</dt>
         <dd>
           <time dateTime={snapshot.generated_at}>{snapshot.generated_at}</time>
@@ -223,11 +219,6 @@ function SnapshotDetails({ snapshot }: { snapshot: BootstrapSnapshotV1 }) {
           {snapshot.envelope_version === null
             ? "Aucune version approuvée"
             : `Version ${snapshot.envelope_version}`}
-        </dd>
-        <dt>Empreintes</dt>
-        <dd>
-          inventaire <code>{snapshot.inventory_sha256}</code> · plan{" "}
-          <code>{snapshot.plan_sha256}</code>
         </dd>
         <dt>Limites</dt>
         <dd>
@@ -281,7 +272,8 @@ function SnapshotDetails({ snapshot }: { snapshot: BootstrapSnapshotV1 }) {
                   {COVERAGE_KIND_LABELS[entry.kind]}
                   {entry.blocking ? " · bloquant" : ""}
                 </strong>{" "}
-                — {entry.target} : {entry.detail}
+                — {redactTechnicalIdentifiers(entry.target)} :{" "}
+                {redactTechnicalIdentifiers(entry.detail)}
               </li>
             ))}
           </ul>
@@ -308,8 +300,8 @@ function SnapshotIoc({ ioc }: { ioc: BootstrapSnapshotIocV1 }) {
   return (
     <li>
       <p>
-        {IOC_KIND_LABELS[ioc.kind]} · <code>{ioc.value}</code> ·{" "}
-        {ioc.origin === "seed" ? "graine" : "découvert"}
+        {IOC_KIND_LABELS[ioc.kind]} · <code>{displayIocValue(ioc.value)}</code>{" "}
+        · {ioc.origin === "seed" ? "graine" : "découvert"}
       </p>
       <p>
         Statut {INVOCATION_STATUS_LABELS[ioc.status]}
@@ -327,6 +319,17 @@ function SnapshotIoc({ ioc }: { ioc: BootstrapSnapshotIocV1 }) {
   );
 }
 
+function displayIocValue(value: string): string {
+  if (
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      value,
+    ) ||
+    /^(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})$/i.test(value)
+  )
+    return "valeur technique masquée";
+  return redactTechnicalIdentifiers(value);
+}
+
 function Limitations({ items }: { items: readonly string[] }) {
   if (items.length === 0) return null;
   const { visible, hidden } = bounded(items, MAX_LIMITATIONS);
@@ -335,7 +338,7 @@ function Limitations({ items }: { items: readonly string[] }) {
       <h4>Limites déclarées</h4>
       <ul>
         {visible.map((limitation) => (
-          <li key={limitation}>{limitation}</li>
+          <li key={limitation}>{redactTechnicalIdentifiers(limitation)}</li>
         ))}
       </ul>
       {hidden > 0 ? (
