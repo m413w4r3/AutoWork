@@ -33,7 +33,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import TracebackType
@@ -68,6 +68,7 @@ from cti_app.application.investigation_persistence import (
     InvestigationPlanRepository,
     InvestigationTaskRepository,
     ToolInvocationRepository,
+    VersionConflictError,
     WorkspaceBindingRepository,
     WorkspaceFileEventRepository,
     WorkspaceFileRevisionRepository,
@@ -93,8 +94,10 @@ from cti_app.application.workspace_agent import (
 from cti_app.domain.agentic_operator import (
     INSTRUCTION_MAX_TEXT_BYTES,
     AgenticOperatorPort,
+    AgentSessionInstructionV1,
     AgentSessionState,
     AgentSessionV1,
+    InstructionState,
     OperatorAdapterKind,
 )
 from cti_app.domain.editorial import AnalystDecision
@@ -106,9 +109,13 @@ from cti_app.domain.investigation import (
     logical_finding_id_by_version,
 )
 from cti_app.domain.investigation_handoff import (
+    HANDOFF_MAX_TEXT_LENGTH,
     HandoffActor,
     HandoffActorKind,
+    HandoffRef,
+    HandoffRefKind,
     HandoffWork,
+    HandoffWorkItem,
 )
 from cti_app.domain.investigation_task import (
     TASK_LIMIT_DEFAULTS,
@@ -134,6 +141,7 @@ MAX_HANDOFF_OBSERVATIONS = 512
 MAX_HANDOFF_FINDINGS = 256
 MAX_HANDOFF_DECISIONS = 256
 MAX_HANDOFF_CONSULTATIONS = 128
+MAX_HANDOFF_INSTRUCTIONS = 64
 DEFAULT_NEXT_ACTION = "Continue the task from this handoff."
 _HANDOFF_FILE_PREFIXES = ("notes/humaines/", "notes/agents/", "results/")
 _RELATIVE_PATH = re.compile(r"^[^\x00\\]+$")
@@ -200,6 +208,13 @@ class TransferAgentSessionsUnavailableError(TransferError):
 
 class TransferHandoffTooLargeError(TransferError):
     code = "transfer_handoff_too_large"
+    status_code = 409
+
+
+class TransferInstructionInFlightError(TransferError):
+    """A delivery attempt is unresolved; the transfer must wait for it (D8)."""
+
+    code = "instruction_delivery_in_flight"
     status_code = 409
 
 
@@ -457,6 +472,26 @@ class _Destination:
     adapter_kind: OperatorAdapterKind | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _SourceInstructions:
+    """What the source sessions' instruction queue holds at transfer time (D8).
+
+    ``pending`` is what no host effect ever delivered (``queued`` /
+    ``delivery_unknown``); ``delivered`` was handed over but never acknowledged
+    and stays history; ``delivering`` is an unresolved attempt, which makes the
+    transfer wait instead of canceling a possible effect (F3-D §3.5).
+    """
+
+    pending: tuple[AgentSessionInstructionV1, ...] = ()
+    delivered: tuple[AgentSessionInstructionV1, ...] = ()
+    delivering: tuple[AgentSessionInstructionV1, ...] = ()
+
+    @property
+    def cited(self) -> tuple[AgentSessionInstructionV1, ...]:
+        """Every instruction the handoff carries, in queue order."""
+        return _ordered_instructions((*self.pending, *self.delivered))
+
+
 def _operator_actor_id(adapter_kind: OperatorAdapterKind) -> str:
     return f"operator:{adapter_kind.value}"
 
@@ -570,8 +605,16 @@ class InvestigationTransferService:
                 },
             )
 
+        # A transfer may neither lose an unconsumed instruction nor cancel a
+        # possible in-flight effect (F3-D D8): the preflight read refuses an
+        # unresolved attempt before any mutation, and the post-stop read below
+        # is the authoritative citation of the queue the handoff carries.
+        preflight = await self._source_instructions(investigation_id, task_id)
+        self._refuse_instruction_in_flight(preflight)
         sync = await self._sync_workspace(investigation_id, keys)
         await self._stop_sessions(investigation_id, task, actor, now=timestamp)
+        source = await self._source_instructions(investigation_id, task_id)
+        self._refuse_instruction_in_flight(source)
         assigned = await self._apply_assignment(task, actor, destination, keys, now=timestamp)
         handoff, previous, freshness = await self._create_handoff(
             investigation_id,
@@ -579,7 +622,15 @@ class InvestigationTransferService:
             actor,
             destination,
             instruction,
+            source,
             keys,
+            now=timestamp,
+        )
+        await self._cancel_handed_off_instructions(
+            investigation_id,
+            task_id=task_id,
+            handoff_id=handoff.handoff.handoff_id,
+            instruction_ids=tuple(item.id for item in source.pending),
             now=timestamp,
         )
         session = await self._open_destination(
@@ -679,6 +730,16 @@ class InvestigationTransferService:
                 keys,
                 now=now,
             )
+        # A transfer that committed its handoff but crashed before the
+        # cancellation resumes exactly that step; the CAS-bound cancellation
+        # makes the replay idempotent and never cites or cancels twice.
+        await self._cancel_handed_off_instructions(
+            investigation_id,
+            task_id=task.id,
+            handoff_id=handoff.handoff.handoff_id,
+            instruction_ids=_cited_instruction_ids(handoff.handoff.work),
+            now=now,
+        )
         freshness = (
             await self._handoff_service().freshness(
                 investigation_id, UUID(previous.handoff.handoff_id)
@@ -848,6 +909,143 @@ class InvestigationTransferService:
                     investigation_id, session.id, reason="transferred", actor=actor, now=now
                 )
 
+    async def _source_instructions(
+        self, investigation_id: UUID, task_id: UUID
+    ) -> _SourceInstructions:
+        """Read every source session's queue before the handoff is written (D8).
+
+        The source is the set of sessions bound to the transferred task: a lost
+        session may still own ``queued`` rows that no drain can ever reach, so
+        they are carried and resolved like the current session's.
+        """
+        async with self._uow_factory() as uow:
+            sessions = await uow.agent_sessions.list_for_task(task_id)
+            instructions: list[AgentSessionInstructionV1] = []
+            for session in sessions:
+                if session.investigation_id != investigation_id:
+                    continue
+                instructions.extend(await uow.agent_sessions.list_instructions(session.id))
+        pending: list[AgentSessionInstructionV1] = []
+        delivered: list[AgentSessionInstructionV1] = []
+        delivering: list[AgentSessionInstructionV1] = []
+        for instruction in instructions:
+            if instruction.investigation_id != investigation_id or instruction.task_id != task_id:
+                continue
+            if instruction.state in (InstructionState.QUEUED, InstructionState.DELIVERY_UNKNOWN):
+                pending.append(instruction)
+            elif instruction.state is InstructionState.DELIVERED:
+                delivered.append(instruction)
+            elif instruction.state is InstructionState.DELIVERING:
+                delivering.append(instruction)
+        source = _SourceInstructions(
+            pending=_ordered_instructions(pending),
+            delivered=_ordered_instructions(delivered),
+            delivering=_ordered_instructions(delivering),
+        )
+        if len(source.cited) > MAX_HANDOFF_INSTRUCTIONS:
+            raise TransferHandoffTooLargeError(
+                "the source sessions hold more instructions than one handoff may cite",
+                details={
+                    "count": str(len(source.cited)),
+                    "limit": str(MAX_HANDOFF_INSTRUCTIONS),
+                },
+            )
+        return source
+
+    @staticmethod
+    def _refuse_instruction_in_flight(source: _SourceInstructions) -> None:
+        """Refuse the transfer while an attempt may still have a host effect."""
+        if not source.delivering:
+            return
+        raise TransferInstructionInFlightError(
+            "an instruction delivery attempt is in flight; wait for it to resolve",
+            details={
+                "instruction_id": str(source.delivering[0].id),
+                "count": str(len(source.delivering)),
+            },
+        )
+
+    async def _cancel_handed_off_instructions(
+        self,
+        investigation_id: UUID,
+        *,
+        task_id: UUID,
+        handoff_id: str,
+        instruction_ids: Collection[UUID],
+        now: datetime,
+    ) -> None:
+        """Cancel every never-delivered instruction the handoff cited (D8).
+
+        Runs after the handoff commit as its own short transaction under the
+        canonical lock order — advisory investigation lock, task row, then the
+        session and instruction rows — so a concurrent rebinding or an attempt
+        that started after the citation is observed instead of overwritten
+        (F2-C).  The transfer already released the source task lease, so the
+        authority re-verified here is the session/task/investigation triple that
+        owns the row.  ``delivered``/``acknowledged`` rows are history and stay
+        untouched; a still-in-flight attempt refuses the transfer until it
+        resolves, and the idempotent replay resumes this step.
+        """
+        ids = tuple(dict.fromkeys(instruction_ids))
+        if not ids:
+            return
+        reason = f"handed_off:{handoff_id}"
+        async with self._uow_factory() as uow:
+            await uow.investigation_tasks.lock_investigation(investigation_id)
+            task = await uow.investigation_tasks.lock_task(task_id)
+            if task is None or task.investigation_id != investigation_id:
+                raise TransferNotFoundError(f"task {task_id} disappeared during the transfer")
+            for instruction_id in ids:
+                instruction = await uow.agent_sessions.get_instruction(instruction_id)
+                session = (
+                    await uow.agent_sessions.get(instruction.session_id)
+                    if instruction is not None
+                    else None
+                )
+                if (
+                    instruction is None
+                    or instruction.investigation_id != investigation_id
+                    or instruction.task_id != task_id
+                    or session is None
+                    or session.investigation_id != investigation_id
+                    or session.task_id != task_id
+                ):
+                    raise TransferConflictError(
+                        "a cited instruction is no longer bound to this transfer",
+                        details={"instruction_id": str(instruction_id)},
+                    )
+                if instruction.state is InstructionState.DELIVERING:
+                    raise TransferInstructionInFlightError(
+                        "an instruction delivery attempt is in flight; wait for it to resolve",
+                        details={"instruction_id": str(instruction.id), "count": "1"},
+                    )
+                if task.lease_id is not None and task.lease_session_id == session.id:
+                    # The transfer released this lease before the handoff; a
+                    # lease that is back means the source session is live again.
+                    raise TransferConflictError(
+                        "the source session still holds the task lease",
+                        details={"instruction_id": str(instruction.id)},
+                    )
+                if instruction.state not in (
+                    InstructionState.QUEUED,
+                    InstructionState.DELIVERY_UNKNOWN,
+                ):
+                    continue
+                try:
+                    await uow.agent_sessions.cancel_instruction(
+                        instruction.id,
+                        expected_state=instruction.state,
+                        expected_delivery_token=instruction.delivery_token,
+                        reason=reason,
+                        now=now,
+                    )
+                except VersionConflictError as exc:
+                    raise TransferConflictError(
+                        "a cited instruction changed concurrently",
+                        details={"instruction_id": str(instruction.id)},
+                    ) from exc
+            await uow.commit()
+
     async def _apply_assignment(
         self,
         task: InvestigationTaskV1,
@@ -970,12 +1168,13 @@ class InvestigationTransferService:
         actor: TaskActor,
         destination: _Destination,
         instruction: str | None,
+        source: _SourceInstructions,
         keys: _StepKeys,
         *,
         now: datetime,
     ) -> tuple[HandoffRecord, HandoffRecord | None, HandoffFreshnessReport | None]:
         _latest, request = await self._handoff_request(
-            investigation_id, task, destination, instruction
+            investigation_id, task, destination, instruction, source
         )
         try:
             handoff = await self._handoff_service().create(
@@ -1009,6 +1208,7 @@ class InvestigationTransferService:
         task: InvestigationTaskV1,
         destination: _Destination,
         instruction: str | None,
+        source: _SourceInstructions,
     ) -> tuple[HandoffRecord | None, HandoffCreateRequest]:
         async with self._uow_factory() as uow:
             binding = await uow.workspace_bindings.get_for_investigation(investigation_id)
@@ -1029,6 +1229,7 @@ class InvestigationTransferService:
             invocations = await uow.tool_invocations.list_for_investigation(investigation_id)
             consultation_ids = await _consultation_invocation_ids(uow, invocations)
         work = previous.handoff.work if previous is not None else HandoffWork()
+        work = _with_instruction_work(work, source)
         next_action = instruction or DEFAULT_NEXT_ACTION
         return previous, HandoffCreateRequest(
             task_id=task.id,
@@ -1247,6 +1448,97 @@ def _bounded_ids(ids: Sequence[UUID], *, limit: int, label: str) -> tuple[UUID, 
     return unique
 
 
+def _ordered_instructions(
+    instructions: Sequence[AgentSessionInstructionV1],
+) -> tuple[AgentSessionInstructionV1, ...]:
+    return tuple(sorted(instructions, key=lambda item: (item.queued_at, str(item.id))))
+
+
+def _with_instruction_work(work: HandoffWork, source: _SourceInstructions) -> HandoffWork:
+    """Carry the source queue as bounded ``limits`` items (F3-D D8).
+
+    A pending instruction is what the handoff could not complete, never a
+    result.  Items the predecessor already cited are not duplicated: the
+    handoff copies its predecessor's work verbatim, and one instruction is
+    cited once.
+    """
+    already = _cited_instruction_ids(work)
+    items = tuple(
+        _instruction_work_item(instruction)
+        for instruction in source.cited
+        if instruction.id not in already
+    )
+    if not items:
+        return work
+    return work.model_copy(update={"limits": (*work.limits, *items)})
+
+
+def _instruction_work_item(instruction: AgentSessionInstructionV1) -> HandoffWorkItem:
+    """One bounded citation: reconstructed delivered text, state and digest."""
+    delivered_text = _reconstructed_delivery_text(instruction)
+    sha256 = instruction.delivery_sha256 or instruction.text_sha256
+    header = f"Instruction {instruction.id} ({instruction.state.value}, sha256={sha256}) : "
+    budget = HANDOFF_MAX_TEXT_LENGTH - len(header)
+    if len(delivered_text) > budget:
+        marker = " [… texte tronqué]"
+        delivered_text = (
+            marker[:budget]
+            if budget <= len(marker)
+            else delivered_text[: budget - len(marker)] + marker
+        )
+    return HandoffWorkItem(
+        text=header + delivered_text,
+        refs=(HandoffRef(kind=HandoffRefKind.INSTRUCTION, id=str(instruction.id)),),
+    )
+
+
+def _reconstructed_delivery_text(instruction: AgentSessionInstructionV1) -> str:
+    """The exact text a delivery handed over (F3-D §3.6), from persisted evidence."""
+    diffs = instruction.delivery_note_diffs or ()
+    if not diffs:
+        return instruction.text
+    return instruction.text + _note_diff_block(diffs)
+
+
+def _cited_instruction_ids(work: HandoffWork) -> frozenset[UUID]:
+    cited: set[UUID] = set()
+    for item in _work_items(work):
+        for ref in item.refs:
+            if ref.kind is not HandoffRefKind.INSTRUCTION:
+                continue
+            try:
+                cited.add(UUID(ref.id))
+            except ValueError:  # pragma: no cover - the handoff service validates ids
+                continue
+    return frozenset(cited)
+
+
+def _work_items(work: HandoffWork) -> tuple[HandoffWorkItem, ...]:
+    return (
+        *work.hypotheses,
+        *work.attempts,
+        *work.established_results,
+        *work.partial_results,
+        *work.negative_results,
+        *work.limits,
+    )
+
+
+def _note_diff_block(diffs: Sequence[Mapping[str, Any]]) -> str:
+    """The visible diff block persisted by ``WorkspaceNoteCatalog.refresh``."""
+
+    def _text(value: object) -> str:
+        return value if isinstance(value, str) else ""
+
+    lines = ["", "[notes modifiées depuis la mise en file]"]
+    lines.extend(
+        f"- {_text(item.get('path'))}: {_text(item.get('queued_revision_id'))} -> "
+        f"{_text(item.get('current_revision_id')) or 'révision absente'}"
+        for item in diffs
+    )
+    return "\n".join(lines)
+
+
 def _now(clock: Callable[[], datetime], value: datetime | None) -> datetime:
     timestamp = clock() if value is None else value
     if timestamp.tzinfo is None or timestamp.utcoffset() is None:
@@ -1362,16 +1654,7 @@ class WorkspaceNoteCatalog:
                 )
         if not diffs:
             return NoteInstructionResolution(queued_text=text, delivery_text=text)
-        lines = [
-            "",
-            "[notes modifiées depuis la mise en file]",
-            *(
-                f"- {item['path']}: {item['queued_revision_id']} -> "
-                f"{item['current_revision_id'] or 'révision absente'}"
-                for item in diffs
-            ),
-        ]
-        delivery_text = text + "\n".join(lines)
+        delivery_text = text + _note_diff_block(diffs)
         return NoteInstructionResolution(
             queued_text=text,
             delivery_text=delivery_text,
@@ -1460,6 +1743,7 @@ __all__ = [
     "TransferForbiddenError",
     "TransferHandoffTooLargeError",
     "TransferIdempotencyConflictError",
+    "TransferInstructionInFlightError",
     "TransferNotFoundError",
     "TransferResult",
     "TransferStaleVersionError",

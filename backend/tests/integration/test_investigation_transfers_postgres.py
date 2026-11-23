@@ -11,19 +11,22 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, date, datetime, timedelta
-from typing import cast
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
 import sqlalchemy as sa
 from alembic import command
 
+from cti_app.application.agent_session_verification import HmacSessionSecretDeriver
+from cti_app.application.agentic_sessions import SessionSecret
 from cti_app.application.investigation_handoffs import (
     HandoffCreateRequest,
     InvestigationHandoffService,
 )
 from cti_app.application.investigation_transfers import (
     InvestigationTransferService,
+    TransferInstructionInFlightError,
     TransferTaskRequest,
 )
 from cti_app.application.workspace_agent import (
@@ -37,7 +40,23 @@ from cti_app.application.workspace_agent import (
     WorkspaceFileRevisionV1,
     workspace_revision_id,
 )
-from cti_app.domain.agentic_operator import OperatorAdapterKind
+from cti_app.domain.agentic_operator import (
+    AgentSessionInstructionV1,
+    AgentSessionState,
+    AgentSessionV1,
+    InstructionDeliveryMode,
+    InstructionState,
+    OperatorAdapterKind,
+    OperatorCapabilitiesV1,
+    OperatorConfinementV1,
+    OperatorProbeCommand,
+    PreparedOperatorSessionV1,
+    PrepareSessionRequest,
+    ProbeCapabilitiesRequest,
+    SessionProcessStatusV1,
+    StartSessionRequest,
+    instruction_text_sha256,
+)
 from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition
 from cti_app.domain.editorial import (
@@ -46,7 +65,7 @@ from cti_app.domain.editorial import (
     AnalystDecisionType,
 )
 from cti_app.domain.entities import Subject
-from cti_app.domain.investigation_handoff import HandoffActor, HandoffActorKind
+from cti_app.domain.investigation_handoff import HandoffActor, HandoffActorKind, HandoffRefKind
 from cti_app.domain.investigation_task import (
     InvestigationTaskV1,
     ResultVerificationStatus,
@@ -83,6 +102,8 @@ HUMAN = TaskActor(kind=TaskActorKind.HUMAN, actor_id="analyst:test")
 CLAUDE_ID = "operator:claude_code"
 OLD_SHA = "1" * 64
 NEW_SHA = "2" * 64
+EXECUTABLE = "/usr/local/bin/agent"
+SESSION_KEY = "0123456789abcdef0123456789abcdef"
 
 
 class _ScannedWorkspace:
@@ -274,6 +295,175 @@ def _service(session_factory) -> InvestigationTransferService:
     )
 
 
+def _capabilities(
+    adapter_kind: OperatorAdapterKind, *, executable: str = EXECUTABLE
+) -> OperatorCapabilitiesV1:
+    return OperatorCapabilitiesV1(
+        adapter_kind=adapter_kind,
+        executable=executable,
+        version="agent 1.2.3",
+        modes=("exec", "resume"),
+        supports_resume=True,
+        supports_structured_output=True,
+        supports_non_interactive=True,
+        supports_stop=False,
+        permission_modes=("workspace-write",),
+        confinement=OperatorConfinementV1(
+            profile="bwrap-reasoning-session",
+            bwrap_ok=True,
+            netns=True,
+            network_mode="isolated_egress",
+            loopback_isolated=True,
+        ),
+        probed_at=NOW,
+        probes=(
+            OperatorProbeCommand(
+                argv=(executable, "--help"),
+                exit_code=0,
+                stdout_sha256="a" * 64,
+                advertised_modes=("exec", "resume", "workspace-write"),
+                resolved_version="agent 1.2.3",
+            ),
+        ),
+    )
+
+
+class _TransferOperator:
+    """The three host calls ``open_session`` needs; nothing else is invoked."""
+
+    def __init__(self) -> None:
+        self.started: list[UUID] = []
+
+    async def probe_capabilities(self, request: ProbeCapabilitiesRequest) -> OperatorCapabilitiesV1:
+        return _capabilities(request.adapter_kind, executable=request.executable)
+
+    async def prepare_session(self, request: PrepareSessionRequest) -> PreparedOperatorSessionV1:
+        return PreparedOperatorSessionV1(
+            session_id=request.session_id,
+            investigation_id=request.investigation_id,
+            task_id=request.task_id,
+            adapter_kind=request.adapter_kind,
+            host_session_ref=f"host-{request.session_id}",
+            capabilities=_capabilities(request.adapter_kind),
+            prepared_at=NOW,
+        )
+
+    async def start_session(self, request: StartSessionRequest) -> SessionProcessStatusV1:
+        self.started.append(request.session_id)
+        return SessionProcessStatusV1(
+            session_id=request.session_id,
+            host_session_ref=request.host_session_ref,
+            alive=True,
+            last_activity_at=NOW,
+            observed_at=NOW,
+        )
+
+
+class _SecretDelivery:
+    async def deliver_session_secret(
+        self,
+        *,
+        session_id: UUID,
+        investigation_id: UUID,
+        task_id: UUID,
+        adapter_kind: OperatorAdapterKind,
+        host_session_ref: str,
+        secret: SessionSecret,
+        idempotency_key: str,
+    ) -> None:
+        return None
+
+
+async def _allow_disclosure(investigation_id: UUID) -> None:
+    return None
+
+
+def _instruction_service(session_factory) -> InvestigationTransferService:
+    return InvestigationTransferService(
+        uow_factory=lambda: SqlAlchemyUnitOfWork(session_factory),
+        workspace_agent=cast(WorkspaceAgentPort, _ScannedWorkspace()),
+        operator=cast(Any, _TransferOperator()),
+        secret_delivery=_SecretDelivery(),
+        deriver=HmacSessionSecretDeriver(SESSION_KEY),
+        disclosure=_allow_disclosure,
+        clock=lambda: NOW,
+    )
+
+
+async def _seed_source_session(
+    session_factory, investigation_id: UUID, task_id: UUID
+) -> AgentSessionV1:
+    capabilities = _capabilities(OperatorAdapterKind.CODEX_CLI)
+    session = AgentSessionV1(
+        investigation_id=investigation_id,
+        task_id=task_id,
+        adapter_kind=OperatorAdapterKind.CODEX_CLI,
+        state=AgentSessionState.CLOSED,
+        state_version=3,
+        capability_probe=capabilities.to_payload(),
+        capability_sha256=capabilities.capability_sha256,
+        probed_at=capabilities.probed_at,
+        auth_secret_nonce=b"n" * 32,
+        auth_secret_hash="f" * 64,
+        auth_secret_issued_at=NOW,
+        opened_at=NOW,
+        closed_at=NOW,
+        close_reason="transferred",
+        idempotency_key="source-codex-session",
+        host_session_ref="host-source-codex",
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    async with SqlAlchemyUnitOfWork(session_factory) as uow:
+        stored, _created = await uow.agent_sessions.add(session)
+        await uow.commit()
+    return stored
+
+
+async def _seed_instruction(
+    session_factory,
+    session: AgentSessionV1,
+    *,
+    idempotency_key: str,
+    text: str,
+    state: InstructionState,
+) -> AgentSessionInstructionV1:
+    delivery: dict[str, Any] = {}
+    if state is InstructionState.DELIVERING:
+        delivery = {
+            "delivery_token": uuid4(),
+            "delivery_attempts": 1,
+            "delivery_attempted_at": NOW,
+            "delivery_sha256": instruction_text_sha256(text),
+        }
+    elif state is InstructionState.DELIVERED:
+        delivery = {
+            "delivered_at": NOW,
+            "delivery_attempts": 1,
+            "delivery_mode": InstructionDeliveryMode.NEXT_RUN,
+            "delivery_sha256": instruction_text_sha256(text),
+        }
+    instruction = AgentSessionInstructionV1(
+        investigation_id=session.investigation_id,
+        task_id=session.task_id,
+        session_id=session.id,
+        idempotency_key=idempotency_key,
+        text=text,
+        text_sha256=instruction_text_sha256(text),
+        state=state,
+        created_by_kind="human",
+        created_by_id="analyst:test",
+        queued_at=NOW,
+        created_at=NOW,
+        updated_at=NOW,
+        **delivery,
+    )
+    async with SqlAlchemyUnitOfWork(session_factory) as uow:
+        stored, _created = await uow.agent_sessions.add_instruction(instruction)
+        await uow.commit()
+    return stored
+
+
 def test_transfer_flow_ingests_reassigns_handoff_and_replays(
     temporary_postgres_url: str,
 ) -> None:
@@ -385,3 +575,163 @@ def test_transfer_flow_ingests_reassigns_handoff_and_replays(
             await engine.dispose()
 
     assert asyncio.run(version()) == HEAD
+
+
+def test_transfer_cites_and_cancels_source_instructions_postgres(
+    temporary_postgres_url: str,
+) -> None:
+    """INS-09 over PostgreSQL: cite the queue, cancel the pending, keep history."""
+    command.upgrade(_alembic_config(temporary_postgres_url), "head")
+
+    async def run() -> None:
+        engine = create_postgres_engine(temporary_postgres_url)
+        try:
+            factory = create_session_factory(engine)
+            investigation = await _seed_investigation(factory)
+            await _seed_workspace(factory, investigation)
+            task = await _seed_task(factory, investigation.id)
+            source = await _seed_source_session(factory, investigation.id, task.id)
+            queued = await _seed_instruction(
+                factory,
+                source,
+                idempotency_key="pg-instruction-queued",
+                text="Check the latest human note before pivoting.",
+                state=InstructionState.QUEUED,
+            )
+            delivered = await _seed_instruction(
+                factory,
+                source,
+                idempotency_key="pg-instruction-delivered",
+                text="Confirm the gate with a second source.",
+                state=InstructionState.DELIVERED,
+            )
+            service = _instruction_service(factory)
+            request = TransferTaskRequest(
+                to_actor_kind="operator",
+                to_adapter_kind=OperatorAdapterKind.CLAUDE_CODE,
+                instruction="Continue under Claude Code.",
+                expected_status_version=1,
+                open_session=True,
+                executable=EXECUTABLE,
+            )
+
+            result = await service.transfer(
+                investigation.id,
+                task_id=task.id,
+                actor=HUMAN,
+                idempotency_key="pg-transfer-instructions",
+                request=request,
+            )
+
+            handoff = result.handoff.handoff
+            quoted = {ref.id: item.text for item in handoff.work.limits for ref in item.refs}
+            assert set(quoted) == {str(queued.id), str(delivered.id)}
+            assert all(
+                ref.kind is HandoffRefKind.INSTRUCTION
+                for item in handoff.work.limits
+                for ref in item.refs
+            )
+            assert (
+                f"Instruction {queued.id} (queued, sha256={queued.text_sha256}) : "
+                in quoted[str(queued.id)]
+            )
+            assert queued.text in quoted[str(queued.id)]
+            assert (
+                f"Instruction {delivered.id} (delivered, sha256={delivered.delivery_sha256}) : "
+            ) in quoted[str(delivered.id)]
+            assert delivered.text in quoted[str(delivered.id)]
+
+            assert result.session is not None
+            assert result.session.adapter_kind is OperatorAdapterKind.CLAUDE_CODE
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                stored_queued = await uow.agent_sessions.get_instruction(queued.id)
+                stored_delivered = await uow.agent_sessions.get_instruction(delivered.id)
+                source_rows = await uow.agent_sessions.list_instructions(source.id)
+                destination_rows = await uow.agent_sessions.list_instructions(result.session.id)
+            assert stored_queued is not None
+            assert stored_queued.state is InstructionState.CANCELLED
+            assert stored_queued.cancel_reason == f"handed_off:{handoff.handoff_id}"
+            assert stored_delivered is not None
+            assert stored_delivered.state is InstructionState.DELIVERED
+            assert stored_delivered.cancel_reason is None
+            # No row is copied: the two source rows stay with their session.
+            assert {row.id for row in source_rows} == {queued.id, delivered.id}
+            assert destination_rows == ()
+
+            replay = await service.transfer(
+                investigation.id,
+                task_id=task.id,
+                actor=HUMAN,
+                idempotency_key="pg-transfer-instructions",
+                request=request,
+            )
+            assert replay.replayed is True
+            assert replay.handoff.handoff.handoff_id == handoff.handoff_id
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                rows = await uow.investigation_handoffs.list_for_investigation(
+                    investigation.id, task_id=task.id
+                )
+                replayed_queued = await uow.agent_sessions.get_instruction(queued.id)
+                replayed_delivered = await uow.agent_sessions.get_instruction(delivered.id)
+            assert [record.handoff.version for record in rows] == [1]
+            assert replayed_queued is not None
+            assert replayed_queued.state is InstructionState.CANCELLED
+            assert replayed_queued.cancel_reason == f"handed_off:{handoff.handoff_id}"
+            assert replayed_delivered is not None
+            assert replayed_delivered.state is InstructionState.DELIVERED
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_transfer_refuses_an_in_flight_instruction_postgres(
+    temporary_postgres_url: str,
+) -> None:
+    """F3-D §3.5 over PostgreSQL: an unresolved attempt blocks the transfer."""
+    command.upgrade(_alembic_config(temporary_postgres_url), "head")
+
+    async def run() -> None:
+        engine = create_postgres_engine(temporary_postgres_url)
+        try:
+            factory = create_session_factory(engine)
+            investigation = await _seed_investigation(factory)
+            await _seed_workspace(factory, investigation)
+            task = await _seed_task(factory, investigation.id)
+            source = await _seed_source_session(factory, investigation.id, task.id)
+            delivering = await _seed_instruction(
+                factory,
+                source,
+                idempotency_key="pg-instruction-delivering",
+                text="An attempt is already reserved.",
+                state=InstructionState.DELIVERING,
+            )
+            with pytest.raises(TransferInstructionInFlightError) as refusal:
+                await _service(factory).transfer(
+                    investigation.id,
+                    task_id=task.id,
+                    actor=HUMAN,
+                    idempotency_key="pg-transfer-in-flight",
+                    request=TransferTaskRequest(
+                        to_actor_kind="operator",
+                        to_adapter_kind=OperatorAdapterKind.CLAUDE_CODE,
+                        instruction="Continue under Claude Code.",
+                        expected_status_version=1,
+                    ),
+                )
+            assert refusal.value.details["instruction_id"] == str(delivering.id)
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                rows = await uow.investigation_handoffs.list_for_investigation(
+                    investigation.id, task_id=task.id
+                )
+                stored = await uow.agent_sessions.get_instruction(delivering.id)
+                stored_task = await uow.investigation_tasks.get(task.id)
+            assert rows == ()
+            assert stored is not None and stored.state is InstructionState.DELIVERING
+            assert stored_task is not None
+            assert stored_task.status is TaskStatus.READY
+            assert stored_task.status_version == 1
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())

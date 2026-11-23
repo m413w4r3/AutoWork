@@ -70,13 +70,20 @@ class HandoffActorKind(StrEnum):
 
 
 class HandoffRefKind(StrEnum):
-    """Typed references a work item may cite."""
+    """Typed references a work item may cite.
+
+    ``INSTRUCTION`` is additive (F3-D D8): a transfer cites the source
+    session's unconsumed instructions so the destination inherits what was not
+    delivered, without copying the queue row.  It is a coordination reference,
+    not evidence, and carries no freshness family.
+    """
 
     OBSERVATION = "observation"
     FINDING = "finding"
     DECISION = "decision"
     CONSULTATION = "consultation"
     FILE = "file"
+    INSTRUCTION = "instruction"
 
 
 class HandoffFreshnessKind(StrEnum):
