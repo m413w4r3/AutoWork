@@ -980,3 +980,129 @@ test("note de l’analyste : une proposition périmée n’est pas acceptable", 
     [],
   );
 });
+
+test("note de l’analyste : blocs de contenu référencés puis vérifiés", async ({
+  page,
+}) => {
+  const api = createWorkshopApi();
+  await launchWorkshop(page, api);
+  await openView(page, "Note de l’analyste");
+
+  const requestButton = page.getByRole("button", {
+    name: "Demander à Bridge",
+    exact: true,
+  });
+  await expect(requestButton).toBeEnabled();
+
+  await page
+    .getByLabel("Élément à référencer")
+    .selectOption("table:table-commands");
+  await page.getByRole("button", { name: "Référencer cet élément" }).click();
+
+  const ioc = page.getByRole("group", {
+    name: /Tableau IOC depuis les observations canoniques/,
+  });
+  await ioc.getByRole("checkbox", { name: /sample-1/ }).check();
+  await ioc.getByRole("button", { name: "Ajouter le tableau IOC (1)" }).click();
+
+  const blocksRegion = page.getByRole("region", {
+    name: /Références de contenu \(2\)/,
+  });
+  await expect(blocksRegion.getByText(/Élément d’article/)).toBeVisible();
+  await expect(blocksRegion.getByText(/Tableau IOC \(1\)/)).toBeVisible();
+
+  await requestButton.click();
+
+  const request = api.requests.find(
+    (item) =>
+      item.method === "POST" &&
+      item.path ===
+        `/api/investigations/${api.ids.investigation}/note-proposals`,
+  );
+  expect(request?.body).toMatchObject({
+    anchor: "lead:0001",
+    content_blocks: [
+      {
+        block_type: "article_element",
+        kind: "table",
+        element_key: "table-commands",
+        anchor: "lead:0001",
+      },
+      {
+        block_type: "ioc_table",
+        observation_ids: [api.ids.observation],
+        title: "Tableau IOC (1)",
+      },
+    ],
+  });
+
+  const resolved = page.getByRole("region", {
+    name: "Aperçu lecture seule des blocs vérifiés",
+  });
+  await expect(resolved.getByText(/Commandes observées/)).toBeVisible();
+  await expect(
+    resolved.getByText(/cross-référence vers l’ancre/),
+  ).toBeVisible();
+  await expect(
+    resolved.getByRole("table", { name: "Tableau IOC (1)" }),
+  ).toBeVisible();
+  const review = page.getByRole("region", { name: /Proposition ciblée/ });
+  await expect(
+    review.getByRole("link", { name: "Ouvrir dans l’atelier éditorial" }),
+  ).toHaveAttribute("href", `/subjects/${api.ids.subject}/editor`);
+
+  await page.getByLabel(/J’ai examiné le texte stocké/).check();
+  await page
+    .getByRole("button", { name: /Accepter la proposition v4/ })
+    .click();
+  await expect(
+    page.getByRole("heading", { name: "Note acceptée" }),
+  ).toBeVisible();
+  expect(api.unhandled).toEqual([]);
+});
+
+test("note de l’analyste : des blocs périmés bloquent l’acceptation", async ({
+  page,
+}) => {
+  const block = {
+    block_type: "article_element" as const,
+    kind: "table" as const,
+    element_key: "table-commands",
+    element_sha256: "c".repeat(64),
+    anchor: "lead:0001",
+  };
+  const api = createWorkshopApi({
+    contentBlocks: [block],
+    contentBlocksState: "stale",
+  });
+  await launchWorkshop(page, api);
+  await openView(page, "Note de l’analyste");
+
+  await page.getByRole("button", { name: "Examiner la proposition" }).click();
+
+  const alert = page.getByRole("alert").filter({
+    hasText: /Un élément d’article référencé a changé/,
+  });
+  await expect(alert).toBeVisible();
+  await expect(alert).toContainText("note_block_ref_stale");
+  await page.getByLabel(/J’ai examiné le texte stocké/).check();
+  await expect(
+    page.getByRole("button", { name: /Accepter la proposition v4/ }),
+  ).toBeDisabled();
+
+  await page.getByRole("button", { name: "Recharger la proposition" }).click();
+  await expect
+    .poll(
+      () =>
+        api.requests.filter(
+          (item) =>
+            item.method === "GET" &&
+            item.path ===
+              `/api/investigations/${api.ids.investigation}/note-proposals/${api.ids.proposal}`,
+        ).length,
+    )
+    .toBeGreaterThanOrEqual(2);
+  expect(api.requests.filter((item) => item.path.endsWith("/accept"))).toEqual(
+    [],
+  );
+});

@@ -45,6 +45,7 @@ const CONTENT_HASH = "a".repeat(64);
 const PROPOSED_HASH = "b".repeat(64);
 const BASE_HASH = "c".repeat(64);
 const APPROVED_HASH = "9".repeat(64);
+const ELEMENT_HASH = "0".repeat(64);
 
 function makeNote(overrides: Partial<AnalystNoteV1> = {}): AnalystNoteV1 {
   return {
@@ -342,7 +343,16 @@ function makeAnchorCatalog(): ArticleAnchorCatalogViewV1 {
         paragraph_index: 6,
       },
     ],
-    elements: [],
+    elements: [
+      {
+        kind: "table",
+        key: "table-commands",
+        title: "Commandes observées",
+        caption: "Commandes exécutées par l’échantillon.",
+        element_sha256: ELEMENT_HASH,
+        anchor: "lead:0001",
+      },
+    ],
     truncated: false,
   };
 }
@@ -376,6 +386,7 @@ function makeProposal(
     base_publication_version: 3,
     base_publication_sha256: BASE_HASH,
     anchor_before_sha256: "d".repeat(64),
+    content_blocks: [],
     status: "proposed",
     status_version: 4,
     accepted_opinion_version: null,
@@ -405,6 +416,10 @@ function makeDiff(
     anchor_excerpt: "Extrait du chapô.",
     cited_finding_refs: proposal.cited_finding_refs,
     cited_observation_refs: proposal.cited_observation_refs,
+    content_blocks: proposal.content_blocks,
+    resolved_content_blocks: [],
+    content_blocks_valid: true,
+    content_block_error: null,
     limits: ["Limite signalée par Bridge."],
     stale: false,
     accept_ready: true,
@@ -955,5 +970,74 @@ describe("OpinionNotesView — notes Bridge par ancre", () => {
       screen.getByRole("combobox", { name: "Tâche liée (facultatif)" }),
     ).toHaveValue(TASK_ID);
     expect(screen.getByRole("radio", { name: "Rédiger" })).not.toBeChecked();
+  });
+
+  it("joint les références de contenu choisies à la demande Bridge", async () => {
+    const user = userEvent.setup();
+    const block = {
+      block_type: "article_element" as const,
+      kind: "table" as const,
+      element_key: "table-commands",
+      element_sha256: ELEMENT_HASH,
+      anchor: "lead:0001",
+    };
+    const proposal = makeProposal({ content_blocks: [block] });
+    const { calls } = renderView({
+      proposals: [proposal],
+      diff: makeDiff(proposal, {
+        content_blocks: [block],
+        resolved_content_blocks: [
+          {
+            ...block,
+            title: "Commandes observées",
+            caption: "Commandes exécutées par l’échantillon.",
+          },
+        ],
+      }),
+    });
+
+    await screen.findByRole("heading", {
+      name: "Demander une proposition à Bridge",
+    });
+    await user.selectOptions(
+      await screen.findByLabelText("Élément à référencer"),
+      "table:table-commands",
+    );
+    await user.click(
+      screen.getByRole("button", { name: "Référencer cet élément" }),
+    );
+
+    const submit = screen.getByRole("button", { name: "Demander à Bridge" });
+    await waitFor(() => expect(submit).toBeEnabled());
+    await user.click(submit);
+
+    await waitFor(() => {
+      expect(
+        calls.filter(
+          (call) =>
+            call.url ===
+              `/api/investigations/${INVESTIGATION_ID}/note-proposals` &&
+            call.init?.method === "POST",
+        ).length,
+      ).toBe(1);
+    });
+    const request = calls.find(
+      (call) =>
+        call.url === `/api/investigations/${INVESTIGATION_ID}/note-proposals` &&
+        call.init?.method === "POST",
+    );
+    expect(bodyOf(request?.init)).toMatchObject({
+      content_blocks: [block],
+    });
+
+    const preview = await screen.findByRole("region", {
+      name: "Aperçu lecture seule des blocs vérifiés",
+    });
+    expect(
+      within(preview).getByText(/Commandes observées/),
+    ).toBeInTheDocument();
+    expect(
+      within(preview).getByText(/cross-référence vers l’ancre/),
+    ).toBeInTheDocument();
   });
 });

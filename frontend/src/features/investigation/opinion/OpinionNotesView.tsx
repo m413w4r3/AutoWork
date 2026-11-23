@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useInvestigation } from "../../../api/investigation";
 import {
   useNoteProposals,
+  type NoteContentBlockV1,
   type NoteProposalStatus,
   type ProseOpinionBlockType,
 } from "../api/opinionProposals";
@@ -13,6 +14,7 @@ import { BridgeRequestPanel } from "./BridgeRequestPanel";
 import { describeApiError } from "./errors";
 import { HistoryPanel } from "./HistoryPanel";
 import { NoteAnchorList } from "./NoteAnchorList";
+import { NoteContentBlocks } from "./NoteContentBlocks";
 import { NoteProposalReview } from "./NoteProposalReview";
 import { OpinionPreview } from "./OpinionPreview";
 import { PreApprovalPanel } from "./PreApprovalPanel";
@@ -42,6 +44,7 @@ export function OpinionNotesView({
   const [selectedAnchor, setSelectedAnchor] = useState("");
   const [blockType, setBlockType] =
     useState<ProseOpinionBlockType>("key_findings");
+  const [contentBlocks, setContentBlocks] = useState<NoteContentBlockV1[]>([]);
   const [selectedProposalId, setSelectedProposalId] = useState<string | null>(
     null,
   );
@@ -70,13 +73,28 @@ export function OpinionNotesView({
   }, [groups, selectedAnchor]);
 
   function selectNote(note: AnalystNoteV1) {
-    setSelectedAnchor(note.anchor);
+    changeAnchor(note.anchor);
     if (
       note.bridge_block_type !== undefined &&
       note.bridge_block_type !== null
     ) {
       setBlockType(note.bridge_block_type);
     }
+  }
+
+  /**
+   * An article element is only referencable at the note anchor, so a block
+   * pinned to the previous anchor is dropped when the human picks another one.
+   * Canonical code, IOC and protocol-figure references are anchor-independent.
+   */
+  function changeAnchor(next: string) {
+    setSelectedAnchor(next);
+    setContentBlocks((current) =>
+      current.filter(
+        (block) =>
+          block.block_type !== "article_element" || block.anchor === next,
+      ),
+    );
   }
 
   if (opinionQuery.isPending) {
@@ -158,10 +176,21 @@ export function OpinionNotesView({
         workingStateError={activityQuery.isError}
         anchor={selectedAnchor}
         blockType={blockType}
-        onAnchorChange={setSelectedAnchor}
+        contentBlocks={contentBlocks}
+        onAnchorChange={changeAnchor}
         onBlockTypeChange={setBlockType}
         onRequested={setSelectedProposalId}
-      />
+      >
+        <NoteContentBlocks
+          investigationId={investigationId}
+          anchor={selectedAnchor}
+          observations={observations}
+          protocolFigures={draft?.protocol_figures ?? []}
+          blocks={contentBlocks}
+          onChange={setContentBlocks}
+          subjectId={investigationQuery.data?.subject_id ?? null}
+        />
+      </BridgeRequestPanel>
 
       <ProposalList
         proposals={proposalsQuery.data ?? []}
@@ -180,6 +209,7 @@ export function OpinionNotesView({
           proposalId={selectedProposalId}
           findings={findings}
           observations={observations}
+          subjectId={investigationQuery.data?.subject_id ?? null}
           onClose={() => setSelectedProposalId(null)}
         />
       )}

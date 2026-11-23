@@ -1,5 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 
 import type {
   InvestigationFinding,
@@ -10,6 +10,7 @@ import {
   useRequestNoteProposal,
   type AnalystObservationRelation,
   type AnalystObservationState,
+  type NoteContentBlockV1,
   type NoteProposalRequestV1,
   type ProseOpinionBlockType,
 } from "../api/opinionProposals";
@@ -62,9 +63,11 @@ export function BridgeRequestPanel({
   workingStateError,
   anchor,
   blockType,
+  contentBlocks,
   onAnchorChange,
   onBlockTypeChange,
   onRequested,
+  children,
 }: {
   investigationId: string;
   opinion: OpinionVersionV1 | null;
@@ -76,9 +79,11 @@ export function BridgeRequestPanel({
   workingStateError: boolean;
   anchor: string;
   blockType: ProseOpinionBlockType;
+  contentBlocks: NoteContentBlockV1[];
   onAnchorChange: (anchor: string) => void;
   onBlockTypeChange: (blockType: ProseOpinionBlockType) => void;
   onRequested: (proposalId: string) => void;
+  children?: ReactNode;
 }) {
   const queryClient = useQueryClient();
   const request = useRequestNoteProposal(investigationId);
@@ -149,6 +154,7 @@ export function BridgeRequestPanel({
       note_relation: noteRelation,
       finding_refs: findingRefs,
       observation_refs: observationRefs,
+      ...(contentBlocks.length === 0 ? {} : { content_blocks: contentBlocks }),
       ...(taskId === "" ? {} : { task_id: taskId }),
       question: buildDraftingQuestion(intent, {
         anchor,
@@ -194,6 +200,8 @@ export function BridgeRequestPanel({
         notes={notes}
         proposal={request.data?.proposal ?? null}
       />
+
+      {children}
 
       <label htmlFor="opinion-note-block">Bloc de l’avis visé</label>
       <select

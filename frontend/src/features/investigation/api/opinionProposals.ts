@@ -30,6 +30,86 @@ export type AnalystObservationState = "observed" | "inferred" | "unresolved";
 export type AnalystObservationRelation =
   "confirms" | "refutes" | "qualifies" | "unresolved";
 
+export type NoteArticleElementKind = "table" | "chart" | "figure" | "diagram";
+export type ProtocolFigureKind =
+  "sequence" | "state_machine" | "message_format";
+
+/** One M23 element already rendered in the pinned article, referenced by value. */
+export interface ArticleElementNoteBlockV1 {
+  block_type: "article_element";
+  kind: NoteArticleElementKind;
+  element_key: string;
+  element_sha256: string;
+  anchor: string;
+}
+
+/** An exact byte range of one canonical observation blob; never supplied text. */
+export interface CanonicalCodeNoteBlockV1 {
+  block_type: "canonical_code";
+  observation_id: Uuid;
+  blob_sha256: string;
+  offset: number;
+  length: number;
+  excerpt_sha256: string;
+  language: string;
+}
+
+/** Rows are derived from the cited observations; the title is deterministic. */
+export interface IocTableNoteBlockV1 {
+  block_type: "ioc_table";
+  observation_ids: Uuid[];
+  title: string;
+}
+
+/** A protocol view already carried by the opinion (annex). */
+export interface ProtocolFigureNoteBlockV1 {
+  block_type: "protocol_figure";
+  kind: ProtocolFigureKind;
+  asset_sha256: string;
+}
+
+/** Closed union of typed content a Bridge-drafted note may reference. */
+export type NoteContentBlockV1 =
+  | ArticleElementNoteBlockV1
+  | CanonicalCodeNoteBlockV1
+  | IocTableNoteBlockV1
+  | ProtocolFigureNoteBlockV1;
+
+export interface ResolvedArticleElementNoteBlockV1 extends ArticleElementNoteBlockV1 {
+  title: string | null;
+  caption: string | null;
+}
+
+export interface ResolvedCanonicalCodeNoteBlockV1 extends CanonicalCodeNoteBlockV1 {
+  excerpt: string;
+  observation_source: string;
+  observation_object_type: string;
+  observation_object_id: string;
+}
+
+export interface ResolvedIocTableRowV1 {
+  observation_id: Uuid;
+  object_type: string;
+  object_id: string;
+  source: string;
+  observed_at: string;
+  blob_sha256: string;
+}
+
+export interface ResolvedIocTableNoteBlockV1 extends IocTableNoteBlockV1 {
+  rows: ResolvedIocTableRowV1[];
+}
+
+export interface ResolvedProtocolFigureNoteBlockV1 extends ProtocolFigureNoteBlockV1 {
+  caption: string;
+}
+
+export type ResolvedNoteContentBlockV1 =
+  | ResolvedArticleElementNoteBlockV1
+  | ResolvedCanonicalCodeNoteBlockV1
+  | ResolvedIocTableNoteBlockV1
+  | ResolvedProtocolFigureNoteBlockV1;
+
 /** `PROSE_BLOCK_TYPES`: the two projection blocks are refused here. */
 export type ProseOpinionBlockType =
   | "key_findings"
@@ -106,6 +186,7 @@ export interface NoteProposalViewV1 {
   base_publication_version: number | null;
   base_publication_sha256: string | null;
   anchor_before_sha256: string | null;
+  content_blocks: NoteContentBlockV1[];
   status: NoteProposalStatus;
   status_version: number;
   accepted_opinion_version: number | null;
@@ -129,6 +210,10 @@ export interface NoteProposalDiffViewV1 {
   anchor_excerpt: string | null;
   cited_finding_refs: Uuid[];
   cited_observation_refs: Uuid[];
+  content_blocks: NoteContentBlockV1[];
+  resolved_content_blocks: ResolvedNoteContentBlockV1[];
+  content_blocks_valid: boolean;
+  content_block_error: string | null;
   limits: string[];
   stale: boolean;
   accept_ready: boolean;
@@ -143,6 +228,7 @@ interface NoteProposalRequestBase {
   note_relation?: AnalystObservationRelation;
   finding_refs?: Uuid[];
   observation_refs?: Uuid[];
+  content_blocks?: NoteContentBlockV1[];
   task_id?: Uuid;
   question?: string;
   expected_working_state_version: number;
