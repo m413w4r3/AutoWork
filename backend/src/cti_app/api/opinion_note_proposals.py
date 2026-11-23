@@ -11,7 +11,7 @@ body: ``extra="forbid"`` turns a forged ``text``/provenance field into a typed
 
 from __future__ import annotations
 
-from typing import Annotated, cast
+from typing import Annotated, Literal, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Header, Request
@@ -40,9 +40,17 @@ from cti_app.application.opinion_note_proposals import (
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.domain.analyst_opinion import (
+    MAX_NOTE_IOC_OBSERVATIONS,
     AnalystObservationRelation,
     AnalystObservationState,
+    ArticleElementNoteBlockV1,
+    CanonicalCodeNoteBlockV1,
+    IocTableNoteBlockV1,
+    NoteArticleElementKind,
+    NoteContentBlockV1,
     OpinionBlockType,
+    ProtocolFigureNoteBlockV1,
+    note_content_blocks_to_payload,
 )
 from cti_app.domain.investigation import ToolInvocationActorKind
 from cti_app.domain.opinion_note_proposal import (
@@ -52,8 +60,165 @@ from cti_app.domain.opinion_note_proposal import (
     NoteProposalV1,
     NoteTargetBlockType,
 )
+from cti_app.domain.protocol_model import ProtocolDiagramKind
 
 router = APIRouter(prefix="/api/investigations", tags=["investigation-note-proposals"])
+
+_SHA256_PATTERN = r"^[0-9a-f]{64}$"
+
+
+class NoteArticleElementBlockV1(BaseModel):
+    """Reference to one M23 element already rendered in the pinned article."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    block_type: Literal["article_element"]
+    kind: NoteArticleElementKind
+    element_key: str = Field(min_length=1, max_length=128)
+    element_sha256: str = Field(pattern=_SHA256_PATTERN)
+    anchor: str = Field(min_length=1, max_length=128)
+
+    def to_domain(self) -> ArticleElementNoteBlockV1:
+        return ArticleElementNoteBlockV1(
+            kind=self.kind,
+            element_key=self.element_key,
+            element_sha256=self.element_sha256,
+            anchor=self.anchor,
+        )
+
+
+class NoteCanonicalCodeBlockV1(BaseModel):
+    """An exact byte range of a canonical observation blob; never supplied text."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    block_type: Literal["canonical_code"]
+    observation_id: UUID
+    blob_sha256: str = Field(pattern=_SHA256_PATTERN)
+    offset: int = Field(ge=0)
+    length: int = Field(ge=1)
+    excerpt_sha256: str = Field(pattern=_SHA256_PATTERN)
+    language: str = Field(min_length=1, max_length=32, pattern=r"^[a-z0-9][a-z0-9+.#_-]*$")
+
+    def to_domain(self) -> CanonicalCodeNoteBlockV1:
+        return CanonicalCodeNoteBlockV1(
+            observation_id=self.observation_id,
+            blob_sha256=self.blob_sha256,
+            offset=self.offset,
+            length=self.length,
+            excerpt_sha256=self.excerpt_sha256,
+            language=self.language,
+        )
+
+
+class NoteIocTableBlockV1(BaseModel):
+    """Rows are derived from the cited canonical observations; the title is derived."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    block_type: Literal["ioc_table"]
+    observation_ids: tuple[UUID, ...] = Field(min_length=1, max_length=MAX_NOTE_IOC_OBSERVATIONS)
+    title: str = Field(min_length=1, max_length=64)
+
+    def to_domain(self) -> IocTableNoteBlockV1:
+        return IocTableNoteBlockV1(observation_ids=self.observation_ids, title=self.title)
+
+
+class NoteProtocolFigureBlockV1(BaseModel):
+    """Reference to one protocol view already carried by the opinion."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    block_type: Literal["protocol_figure"]
+    kind: ProtocolDiagramKind
+    asset_sha256: str = Field(pattern=_SHA256_PATTERN)
+
+    def to_domain(self) -> ProtocolFigureNoteBlockV1:
+        return ProtocolFigureNoteBlockV1(kind=self.kind, asset_sha256=self.asset_sha256)
+
+
+NoteContentBlockPayloadV1 = Annotated[
+    NoteArticleElementBlockV1
+    | NoteCanonicalCodeBlockV1
+    | NoteIocTableBlockV1
+    | NoteProtocolFigureBlockV1,
+    Field(discriminator="block_type"),
+]
+
+
+class ResolvedNoteArticleElementBlockV1(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    block_type: Literal["article_element"]
+    kind: NoteArticleElementKind
+    element_key: str
+    element_sha256: str
+    anchor: str
+    title: str | None
+    caption: str | None
+
+
+class ResolvedNoteCanonicalCodeBlockV1(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    block_type: Literal["canonical_code"]
+    observation_id: UUID
+    blob_sha256: str
+    offset: int
+    length: int
+    excerpt_sha256: str
+    language: str
+    excerpt: str
+    observation_source: str
+    observation_object_type: str
+    observation_object_id: str
+
+
+class ResolvedNoteIocTableRowV1(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    observation_id: UUID
+    object_type: str
+    object_id: str
+    source: str
+    observed_at: str
+    blob_sha256: str
+
+
+class ResolvedNoteIocTableBlockV1(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    block_type: Literal["ioc_table"]
+    observation_ids: tuple[UUID, ...]
+    title: str
+    rows: tuple[ResolvedNoteIocTableRowV1, ...]
+
+
+class ResolvedNoteProtocolFigureBlockV1(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    block_type: Literal["protocol_figure"]
+    kind: ProtocolDiagramKind
+    asset_sha256: str
+    caption: str
+
+
+ResolvedNoteContentBlockV1 = Annotated[
+    ResolvedNoteArticleElementBlockV1
+    | ResolvedNoteCanonicalCodeBlockV1
+    | ResolvedNoteIocTableBlockV1
+    | ResolvedNoteProtocolFigureBlockV1,
+    Field(discriminator="block_type"),
+]
+
+
+def _domain_content_blocks(
+    blocks: tuple[NoteContentBlockPayloadV1, ...],
+) -> tuple[NoteContentBlockV1, ...]:
+    try:
+        return tuple(block.to_domain() for block in blocks)
+    except ValueError as exc:
+        raise _http_error(422, "invalid_note_content_block", str(exc)) from exc
 
 
 class NoteProposalRequestV1(BaseModel):
@@ -67,12 +232,13 @@ class NoteProposalRequestV1(BaseModel):
     note_relation: AnalystObservationRelation = AnalystObservationRelation.UNRESOLVED
     finding_refs: tuple[UUID, ...] = ()
     observation_refs: tuple[UUID, ...] = ()
+    content_blocks: tuple[NoteContentBlockPayloadV1, ...] = ()
     base_opinion_version: int | None = Field(default=None, ge=1)
-    base_opinion_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    base_opinion_sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
     task_id: UUID | None = None
     question: str | None = Field(default=None, max_length=8_000)
     expected_working_state_version: int = Field(ge=1)
-    expected_working_state_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    expected_working_state_sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
 
     @model_validator(mode="after")
     def _validate_target(self) -> NoteProposalRequestV1:
@@ -135,6 +301,7 @@ class NoteProposalViewV1(BaseModel):
     base_publication_version: int | None
     base_publication_sha256: str | None
     anchor_before_sha256: str | None
+    content_blocks: tuple[NoteContentBlockPayloadV1, ...]
     status: NoteProposalStatus
     status_version: int
     accepted_opinion_version: int | None
@@ -164,6 +331,10 @@ class NoteProposalDiffViewV1(BaseModel):
     anchor_excerpt: str | None
     cited_finding_refs: tuple[UUID, ...]
     cited_observation_refs: tuple[UUID, ...]
+    content_blocks: tuple[NoteContentBlockPayloadV1, ...]
+    resolved_content_blocks: tuple[ResolvedNoteContentBlockV1, ...]
+    content_blocks_valid: bool
+    content_block_error: str | None
     limits: tuple[str, ...]
     stale: bool
     accept_ready: bool
@@ -263,6 +434,8 @@ def _opinion_error(exc: OpinionError) -> Exception:
         "stale_version",
         "stale_base",
         "note_anchor_text_changed",
+        "note_block_ref_stale",
+        "note_code_ref_stale",
         "invalid_opinion_state",
     }:
         status_code = 409
@@ -313,6 +486,10 @@ async def get_note_proposal(
         anchor_excerpt=diff.anchor_excerpt,
         cited_finding_refs=diff.proposal.cited_finding_refs,
         cited_observation_refs=diff.proposal.cited_observation_refs,
+        content_blocks=note_content_blocks_to_payload(diff.proposal.content_blocks),
+        resolved_content_blocks=[item.to_payload() for item in diff.resolved_content_blocks],
+        content_blocks_valid=diff.content_blocks_valid,
+        content_block_error=diff.content_block_error,
         limits=diff.limits,
         stale=diff.stale,
         accept_ready=diff.accept_ready,
@@ -331,6 +508,7 @@ async def request_note_proposal(
 ) -> NoteProposalRequestResponseV1:
     identity = await _require_verified_human_operator(request)
     factory = _composition_factory(request)
+    content_blocks = _domain_content_blocks(body.content_blocks)
     try:
         result = await _proposal_service(request).request(
             investigation_id,
@@ -342,6 +520,7 @@ async def request_note_proposal(
             note_relation=body.note_relation,
             finding_refs=body.finding_refs,
             observation_refs=body.observation_refs,
+            content_blocks=content_blocks,
             base_opinion_version=body.base_opinion_version,
             base_opinion_sha256=body.base_opinion_sha256,
             task_id=body.task_id,

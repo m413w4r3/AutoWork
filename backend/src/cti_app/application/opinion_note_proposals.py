@@ -33,11 +33,20 @@ from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.research_context_builder import ArticleSnapshotPort
 from cti_app.domain.analyst_opinion import (
+    MAX_NOTE_CONTENT_BLOCKS,
     AnalystObservationRelation,
     AnalystObservationState,
     AnalystOpinionV1,
+    ArticleElementNoteBlockV1,
+    CanonicalCodeNoteBlockV1,
+    IocTableNoteBlockV1,
+    NoteArticleElementKind,
+    NoteContentBlockV1,
     OpinionBlockType,
+    OpinionProtocolFigureV1,
+    ProtocolFigureNoteBlockV1,
     investigation_opinion_id,
+    note_content_blocks_to_payload,
 )
 from cti_app.domain.investigation import (
     EvidenceObservation,
@@ -55,7 +64,15 @@ from cti_app.domain.opinion_note_proposal import (
     anchor_target_block_type,
     note_draft_text_from_sentences,
 )
-from cti_app.domain.publication_document import publication_note_body_anchors
+from cti_app.domain.production_editorial_enrichment import EnrichmentPlacementKind
+from cti_app.domain.protocol_model import ProtocolDiagramKind
+from cti_app.domain.publication_document import (
+    CanonicalPublicationDocument,
+    publication_document_article_v5_body,
+    publication_element_sha256,
+    publication_note_body_anchors,
+)
+from cti_app.domain.semantic_annotation import lead_paragraph_anchor, section_paragraph_anchor
 
 _ADVISOR_TOOL_NAME = "advisor.consult"
 _ADVISOR_CALL_SOURCE = "advisor.consult"
@@ -81,6 +98,12 @@ class NoteProposalErrorCode(StrEnum):
     RESPONSE_UNUSABLE = "bridge_response_unusable"
     IDEMPOTENCY_CONFLICT = "idempotency_conflict"
     INVALID_STATUS = "invalid_note_proposal_status"
+    NOTE_CONTENT_BLOCK_INVALID = "invalid_note_content_block"
+    NOTE_BLOCK_REF_STALE = "note_block_ref_stale"
+    NOTE_CHART_WITHOUT_EVIDENCE = "note_chart_without_evidence"
+    NOTE_FIGURE_SOURCE_MISSING = "note_figure_source_missing"
+    NOTE_CODE_REF_STALE = "note_code_ref_stale"
+    NOTE_IOC_REF_UNRESOLVED = "note_ioc_ref_unresolved"
 
 
 class NoteProposalError(ValueError):
@@ -96,6 +119,474 @@ class NoteProposalError(ValueError):
         self.code = code
         self.status_code = status_code
         super().__init__(message or code.value)
+
+
+@dataclass(frozen=True, slots=True)
+class NoteArticleElementFactV1:
+    """One rendered article element as resolved from the pinned publication."""
+
+    kind: str
+    key: str
+    element_sha256: str
+    anchor: str | None
+    evidence_ref_count: int
+    source_document_known: bool
+    title: str | None
+    caption: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class NoteObservationFactV1:
+    """The canonical identity of one observation referenced by a note block."""
+
+    observation_id: UUID
+    blob_sha256: str
+    object_type: str
+    object_id: str
+    source: str
+    observed_at: datetime
+    in_investigation: bool
+    advisory: bool
+
+
+@dataclass(frozen=True, slots=True)
+class NoteContentBlockContextV1:
+    """Everything a pure block validation may inspect; no I/O happens below."""
+
+    investigation_id: UUID
+    anchor: str
+    elements: tuple[NoteArticleElementFactV1, ...]
+    observations: Mapping[UUID, NoteObservationFactV1]
+    blobs: Mapping[UUID, bytes]
+    protocol_figures: tuple[OpinionProtocolFigureV1, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedArticleElementBlockV1:
+    kind: NoteArticleElementKind
+    element_key: str
+    element_sha256: str
+    anchor: str
+    title: str | None
+    caption: str | None
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "block_type": "article_element",
+            "kind": self.kind.value,
+            "element_key": self.element_key,
+            "element_sha256": self.element_sha256,
+            "anchor": self.anchor,
+            "title": self.title,
+            "caption": self.caption,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedCanonicalCodeBlockV1:
+    observation_id: UUID
+    blob_sha256: str
+    offset: int
+    length: int
+    excerpt_sha256: str
+    language: str
+    excerpt: str
+    observation_source: str
+    observation_object_type: str
+    observation_object_id: str
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "block_type": "canonical_code",
+            "observation_id": str(self.observation_id),
+            "blob_sha256": self.blob_sha256,
+            "offset": self.offset,
+            "length": self.length,
+            "excerpt_sha256": self.excerpt_sha256,
+            "language": self.language,
+            "excerpt": self.excerpt,
+            "observation_source": self.observation_source,
+            "observation_object_type": self.observation_object_type,
+            "observation_object_id": self.observation_object_id,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedIocTableRowV1:
+    """One deterministic table row: the canonical identity of one observation.
+
+    The row never parses provider payloads or model text; the observed object
+    and its provenance are exactly the fields persisted with the observation.
+    """
+
+    observation_id: UUID
+    object_type: str
+    object_id: str
+    source: str
+    observed_at: str
+    blob_sha256: str
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "observation_id": str(self.observation_id),
+            "object_type": self.object_type,
+            "object_id": self.object_id,
+            "source": self.source,
+            "observed_at": self.observed_at,
+            "blob_sha256": self.blob_sha256,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedIocTableBlockV1:
+    observation_ids: tuple[UUID, ...]
+    title: str
+    rows: tuple[ResolvedIocTableRowV1, ...]
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "block_type": "ioc_table",
+            "observation_ids": [str(item) for item in self.observation_ids],
+            "title": self.title,
+            "rows": [row.to_payload() for row in self.rows],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedProtocolFigureBlockV1:
+    kind: ProtocolDiagramKind
+    asset_sha256: str
+    caption: str
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "block_type": "protocol_figure",
+            "kind": self.kind.value,
+            "asset_sha256": self.asset_sha256,
+            "caption": self.caption,
+        }
+
+
+ResolvedNoteContentBlockV1 = (
+    ResolvedArticleElementBlockV1
+    | ResolvedCanonicalCodeBlockV1
+    | ResolvedIocTableBlockV1
+    | ResolvedProtocolFigureBlockV1
+)
+
+
+def _resolved_element_anchor(
+    resolved: Mapping[tuple[str, str], object],
+    *,
+    kind: str,
+    key: str,
+) -> str | None:
+    placement = resolved.get((kind, key))
+    if placement is None:
+        return None
+    paragraph_kind = getattr(placement, "paragraph_kind", None)
+    paragraph_index = getattr(placement, "paragraph_index", None)
+    section_index = getattr(placement, "section_index", None)
+    if paragraph_kind == "lead" and isinstance(paragraph_index, int):
+        return lead_paragraph_anchor(paragraph_index + 1)
+    if not isinstance(paragraph_index, int):
+        return None
+    return section_paragraph_anchor(section_index or 0, paragraph_index + 1)
+
+
+def note_article_element_facts(
+    document: CanonicalPublicationDocument,
+) -> tuple[NoteArticleElementFactV1, ...]:
+    """Project the rendered M23 elements of one pinned publication base."""
+    body = publication_document_article_v5_body(document)
+    if body is None:
+        return ()
+    source_ids = {source.source_document_id for source in body.document.sources}
+    resolved = {
+        (item.element_kind, item.element_key): item
+        for item in getattr(document, "resolved_placements", ())
+    }
+    families: tuple[tuple[str, tuple[Any, ...]], ...] = (
+        ("table", body.document.tables),
+        ("chart", body.document.charts),
+        ("diagram", body.document.diagrams),
+        ("figure", body.document.figures),
+    )
+    facts: list[NoteArticleElementFactV1] = []
+    for kind, elements in families:
+        for element in elements:
+            key = element.key
+            anchor: str | None = None
+            placement = element.placement
+            if placement.kind is EnrichmentPlacementKind.AFTER_PARAGRAPH:
+                anchor = _resolved_element_anchor(resolved, kind=kind, key=key)
+            if kind == "figure":
+                evidence_ref_count = 0
+                source_document_known = element.source_document_id in source_ids
+            else:
+                evidence_ref_count = len(getattr(element, "evidence_refs", ()))
+                source_document_known = True
+            facts.append(
+                NoteArticleElementFactV1(
+                    kind=kind,
+                    key=key,
+                    element_sha256=publication_element_sha256(body.document, kind=kind, key=key),
+                    anchor=anchor,
+                    evidence_ref_count=evidence_ref_count,
+                    source_document_known=source_document_known,
+                    title=getattr(element, "title", None),
+                    caption=getattr(element, "caption", None),
+                )
+            )
+    return tuple(facts)
+
+
+def validate_note_content_blocks(
+    blocks: Sequence[NoteContentBlockV1],
+    context: NoteContentBlockContextV1,
+) -> tuple[ResolvedNoteContentBlockV1, ...]:
+    """Validate every block reference against its canonical context, purely.
+
+    The server never accepts text from the requester: code bytes are sliced
+    from the referenced observation blob and the IOC rows are the canonical
+    observation identities.  A stale or foreign reference is refused with the
+    typed code of its rule.
+    """
+    if len(blocks) > MAX_NOTE_CONTENT_BLOCKS:
+        raise NoteProposalError(
+            NoteProposalErrorCode.NOTE_CONTENT_BLOCK_INVALID,
+            message="A note is limited to 32 content blocks",
+        )
+    resolved_blocks: list[ResolvedNoteContentBlockV1] = []
+    for block in blocks:
+        if isinstance(block, ArticleElementNoteBlockV1):
+            element = next(
+                (
+                    item
+                    for item in context.elements
+                    if item.kind == block.kind.value and item.key == block.element_key
+                ),
+                None,
+            )
+            if element is None or element.element_sha256 != block.element_sha256:
+                raise NoteProposalError(
+                    NoteProposalErrorCode.NOTE_BLOCK_REF_STALE,
+                    message="The referenced article element changed or disappeared",
+                )
+            if (
+                element.anchor is None
+                or block.anchor != context.anchor
+                or element.anchor != block.anchor
+            ):
+                raise NoteProposalError(
+                    NoteProposalErrorCode.NOTE_BLOCK_REF_STALE,
+                    message="The referenced article element is not rendered at the note anchor",
+                )
+            if block.kind is NoteArticleElementKind.CHART and element.evidence_ref_count == 0:
+                raise NoteProposalError(
+                    NoteProposalErrorCode.NOTE_CHART_WITHOUT_EVIDENCE,
+                    message="A note chart requires evidence on every plotted point",
+                )
+            if block.kind is NoteArticleElementKind.FIGURE and not element.source_document_known:
+                raise NoteProposalError(
+                    NoteProposalErrorCode.NOTE_FIGURE_SOURCE_MISSING,
+                    message="A note figure requires a source document known to the article",
+                )
+            resolved_blocks.append(
+                ResolvedArticleElementBlockV1(
+                    kind=block.kind,
+                    element_key=block.element_key,
+                    element_sha256=block.element_sha256,
+                    anchor=block.anchor,
+                    title=element.title,
+                    caption=element.caption,
+                )
+            )
+            continue
+        if isinstance(block, CanonicalCodeNoteBlockV1):
+            observation = context.observations.get(block.observation_id)
+            if (
+                observation is None
+                or not observation.in_investigation
+                or observation.advisory
+                or observation.blob_sha256 != block.blob_sha256
+            ):
+                raise NoteProposalError(
+                    NoteProposalErrorCode.NOTE_CODE_REF_STALE,
+                    message=(
+                        "The referenced observation is not a canonical source of this investigation"
+                    ),
+                )
+            raw = context.blobs.get(block.observation_id)
+            if raw is None or hashlib.sha256(raw).hexdigest() != block.blob_sha256:
+                raise NoteProposalError(
+                    NoteProposalErrorCode.NOTE_CODE_REF_STALE,
+                    message="The observation blob does not match its recorded hash",
+                )
+            end = block.offset + block.length
+            excerpt = raw[block.offset : end]
+            if (
+                end > len(raw)
+                or len(excerpt) != block.length
+                or hashlib.sha256(excerpt).hexdigest() != block.excerpt_sha256
+            ):
+                raise NoteProposalError(
+                    NoteProposalErrorCode.NOTE_CODE_REF_STALE,
+                    message="The code excerpt does not match the observation bytes",
+                )
+            try:
+                excerpt_text = excerpt.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise NoteProposalError(
+                    NoteProposalErrorCode.NOTE_CODE_REF_STALE,
+                    message="The code excerpt is not UTF-8 text",
+                ) from exc
+            resolved_blocks.append(
+                ResolvedCanonicalCodeBlockV1(
+                    observation_id=block.observation_id,
+                    blob_sha256=block.blob_sha256,
+                    offset=block.offset,
+                    length=block.length,
+                    excerpt_sha256=block.excerpt_sha256,
+                    language=block.language,
+                    excerpt=excerpt_text,
+                    observation_source=observation.source,
+                    observation_object_type=observation.object_type,
+                    observation_object_id=observation.object_id,
+                )
+            )
+            continue
+        if isinstance(block, IocTableNoteBlockV1):
+            rows: list[ResolvedIocTableRowV1] = []
+            for observation_id in block.observation_ids:
+                observation = context.observations.get(observation_id)
+                if observation is None or not observation.in_investigation or observation.advisory:
+                    raise NoteProposalError(
+                        NoteProposalErrorCode.NOTE_IOC_REF_UNRESOLVED,
+                        message=(
+                            "An IOC table observation is not canonical evidence of this "
+                            "investigation"
+                        ),
+                    )
+                rows.append(
+                    ResolvedIocTableRowV1(
+                        observation_id=observation.observation_id,
+                        object_type=observation.object_type,
+                        object_id=observation.object_id,
+                        source=observation.source,
+                        observed_at=observation.observed_at.isoformat(),
+                        blob_sha256=observation.blob_sha256,
+                    )
+                )
+            resolved_blocks.append(
+                ResolvedIocTableBlockV1(
+                    observation_ids=block.observation_ids,
+                    title=block.title,
+                    rows=tuple(rows),
+                )
+            )
+            continue
+        if isinstance(block, ProtocolFigureNoteBlockV1):
+            figure = next(
+                (item for item in context.protocol_figures if item.kind is block.kind), None
+            )
+            if figure is None or figure.asset_sha256 != block.asset_sha256:
+                raise NoteProposalError(
+                    NoteProposalErrorCode.NOTE_BLOCK_REF_STALE,
+                    message="The protocol figure is not carried by this opinion",
+                )
+            resolved_blocks.append(
+                ResolvedProtocolFigureBlockV1(
+                    kind=block.kind,
+                    asset_sha256=block.asset_sha256,
+                    caption=figure.caption,
+                )
+            )
+            continue
+        raise NoteProposalError(
+            NoteProposalErrorCode.NOTE_CONTENT_BLOCK_INVALID,
+            message="The note content block type is unsupported",
+        )
+    return tuple(resolved_blocks)
+
+
+async def load_note_content_block_context(
+    *,
+    uow: UnitOfWork,
+    artifact_store: ProductionArtifactStore,
+    investigation_id: UUID,
+    document: CanonicalPublicationDocument,
+    anchor: str,
+    protocol_figures: Sequence[OpinionProtocolFigureV1],
+    blocks: Sequence[NoteContentBlockV1],
+) -> NoteContentBlockContextV1:
+    """Read exactly the observations and blobs the requested blocks cite."""
+    observation_ids: set[UUID] = set()
+    code_observation_ids: set[UUID] = set()
+    for block in blocks:
+        if isinstance(block, IocTableNoteBlockV1):
+            observation_ids.update(block.observation_ids)
+        elif isinstance(block, CanonicalCodeNoteBlockV1):
+            observation_ids.add(block.observation_id)
+            code_observation_ids.add(block.observation_id)
+    observations: dict[UUID, NoteObservationFactV1] = {}
+    stored_observations: dict[UUID, EvidenceObservation] = {}
+    for observation_id in observation_ids:
+        observation = await uow.evidence_observations.get(observation_id)
+        if observation is None:
+            continue
+        stored_observations[observation_id] = observation
+        observations[observation_id] = NoteObservationFactV1(
+            observation_id=observation.id,
+            blob_sha256=observation.sha256,
+            object_type=observation.object_type,
+            object_id=observation.object_id,
+            source=observation.source,
+            observed_at=observation.observed_at,
+            in_investigation=observation.investigation_id == investigation_id,
+            advisory=is_advisory_observation(observation),
+        )
+    blobs: dict[UUID, bytes] = {}
+    for observation_id in code_observation_ids:
+        fact = observations.get(observation_id)
+        stored = stored_observations.get(observation_id)
+        if fact is None or stored is None or not fact.in_investigation or fact.advisory:
+            continue
+        try:
+            blobs[observation_id] = await artifact_store.read_bytes(stored.blob_id, max_bytes=None)
+        except (KeyError, OSError, TypeError, ValueError):
+            continue
+    return NoteContentBlockContextV1(
+        investigation_id=investigation_id,
+        anchor=anchor,
+        elements=note_article_element_facts(document),
+        observations=observations,
+        blobs=blobs,
+        protocol_figures=tuple(protocol_figures),
+    )
+
+
+async def resolve_note_content_blocks(
+    *,
+    uow: UnitOfWork,
+    artifact_store: ProductionArtifactStore,
+    investigation_id: UUID,
+    document: CanonicalPublicationDocument,
+    anchor: str,
+    protocol_figures: Sequence[OpinionProtocolFigureV1],
+    blocks: Sequence[NoteContentBlockV1],
+) -> tuple[ResolvedNoteContentBlockV1, ...]:
+    """Resolve and verify every note content block against canonical state."""
+    context = await load_note_content_block_context(
+        uow=uow,
+        artifact_store=artifact_store,
+        investigation_id=investigation_id,
+        document=document,
+        anchor=anchor,
+        protocol_figures=protocol_figures,
+        blocks=blocks,
+    )
+    return validate_note_content_blocks(blocks, context)
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +645,12 @@ class NoteProposalDiffV1:
     stale: bool
     accept_ready: bool
     limits: tuple[str, ...]
+    resolved_content_blocks: tuple[ResolvedNoteContentBlockV1, ...] = ()
+    content_block_error: str | None = None
+
+    @property
+    def content_blocks_valid(self) -> bool:
+        return self.content_block_error is None
 
     @property
     def text_changed(self) -> bool:
@@ -175,6 +672,12 @@ class NoteProposalDiffV1:
             "anchor_excerpt": self.anchor_excerpt,
             "cited_finding_refs": [str(item) for item in self.proposal.cited_finding_refs],
             "cited_observation_refs": [str(item) for item in self.proposal.cited_observation_refs],
+            "content_blocks": note_content_blocks_to_payload(self.proposal.content_blocks),
+            "resolved_content_blocks": [
+                block.to_payload() for block in self.resolved_content_blocks
+            ],
+            "content_blocks_valid": self.content_blocks_valid,
+            "content_block_error": self.content_block_error,
             "limits": list(self.limits),
             "stale": self.stale,
             "accept_ready": self.accept_ready,
@@ -316,6 +819,9 @@ class OpinionNoteProposalService:
             stale = proposal.status is NoteProposalStatus.PROPOSED and not self._base_matches(
                 proposal, head
             )
+            resolved_blocks, block_error = await self._resolve_blocks_for_display(
+                uow, investigation, proposal, head
+            )
             limits: tuple[str, ...] = ()
             if proposal.bridge_response_observation_id is not None:
                 response_observation = await uow.evidence_observations.get(
@@ -335,8 +841,11 @@ class OpinionNoteProposalService:
                     proposal.status is NoteProposalStatus.PROPOSED
                     and proposal.materialised
                     and not stale
+                    and block_error is None
                 ),
                 limits=limits,
+                resolved_content_blocks=resolved_blocks,
+                content_block_error=block_error,
             )
 
     async def request(
@@ -351,6 +860,7 @@ class OpinionNoteProposalService:
         note_relation: AnalystObservationRelation,
         finding_refs: Sequence[UUID] = (),
         observation_refs: Sequence[UUID] = (),
+        content_blocks: Sequence[NoteContentBlockV1] = (),
         base_opinion_version: int | None,
         base_opinion_sha256: str | None,
         task_id: UUID | None,
@@ -379,6 +889,17 @@ class OpinionNoteProposalService:
             )
         self._require_anchor_target(anchor, target_block_type)
         self._require_base_pair(base_opinion_version, base_opinion_sha256)
+        blocks = tuple(content_blocks)
+        if len(blocks) > MAX_NOTE_CONTENT_BLOCKS:
+            raise NoteProposalError(
+                NoteProposalErrorCode.NOTE_CONTENT_BLOCK_INVALID,
+                message="A note is limited to 32 content blocks",
+            )
+        if consultation_type is NoteProposalConsultationType.REVIEW_TEXT and blocks:
+            raise NoteProposalError(
+                NoteProposalErrorCode.NOTE_CONTENT_BLOCK_INVALID,
+                message="A review proposal cannot add note content blocks",
+            )
         cited_findings = tuple(dict.fromkeys(finding_refs))
         cited_observations = tuple(dict.fromkeys(observation_refs))
         async with self._uow_factory() as uow:
@@ -410,6 +931,7 @@ class OpinionNoteProposalService:
                     base_publication_version=existing.base_publication_version,
                     base_publication_sha256=existing.base_publication_sha256,
                     anchor_before_sha256=existing.anchor_before_sha256,
+                    content_blocks=blocks,
                     task_id=task_id,
                     idempotency_key=idempotency_key,
                     now=timestamp,
@@ -473,6 +995,18 @@ class OpinionNoteProposalService:
                     message="The anchor does not exist in the pinned publication base",
                 )
             anchor_before_sha256 = hashlib.sha256(anchor_text.encode("utf-8")).hexdigest()
+            # Blocks are verified against exactly this pinned base and the
+            # current canonical observations before Bridge is ever called.
+            if blocks:
+                await resolve_note_content_blocks(
+                    uow=uow,
+                    artifact_store=self._artifact_store,
+                    investigation_id=investigation_id,
+                    document=base.document,
+                    anchor=anchor,
+                    protocol_figures=head.protocol_figures if head is not None else (),
+                    blocks=blocks,
+                )
             base_note_id: UUID | None = None
             if consultation_type is NoteProposalConsultationType.REVIEW_TEXT:
                 if head is None:
@@ -546,6 +1080,7 @@ class OpinionNoteProposalService:
                 base_publication_version=base.artifact.version,
                 base_publication_sha256=base.sha256,
                 anchor_before_sha256=anchor_before_sha256,
+                content_blocks=blocks,
                 task_id=task_id,
                 idempotency_key=idempotency_key,
                 now=timestamp,
@@ -1158,6 +1693,46 @@ class OpinionNoteProposalService:
                     message="Bridge advisory material cannot be cited as note evidence",
                 )
 
+    async def _resolve_blocks_for_display(
+        self,
+        uow: UnitOfWork,
+        investigation: Any,
+        proposal: NoteProposalV1,
+        head: AnalystOpinionV1 | None,
+    ) -> tuple[tuple[ResolvedNoteContentBlockV1, ...], str | None]:
+        """Resolve the review-screen preview; a refusal is reported, never hidden."""
+        if not proposal.content_blocks:
+            return (), None
+        try:
+            base = (
+                await resolve_pinned_publication_base(
+                    uow,
+                    self._artifact_store,
+                    artifact_id=proposal.base_publication_artifact_id,
+                    sha256=proposal.base_publication_sha256,
+                )
+                if proposal.base_publication_artifact_id is not None
+                and proposal.base_publication_sha256 is not None
+                else await resolve_current_publication_base(
+                    uow, self._artifact_store, investigation
+                )
+            )
+        except ArticleBaseUnavailable:
+            return (), NoteProposalErrorCode.NOTE_BLOCK_REF_STALE.value
+        try:
+            resolved = await resolve_note_content_blocks(
+                uow=uow,
+                artifact_store=self._artifact_store,
+                investigation_id=proposal.investigation_id,
+                document=base.document,
+                anchor=proposal.anchor,
+                protocol_figures=head.protocol_figures if head is not None else (),
+                blocks=proposal.content_blocks,
+            )
+        except NoteProposalError as exc:
+            return (), exc.code.value
+        return resolved, None
+
     async def _anchor_excerpt(
         self, uow: UnitOfWork, investigation: Any, proposal: NoteProposalV1
     ) -> str | None:
@@ -1211,6 +1786,7 @@ class OpinionNoteProposalService:
         base_publication_version: int | None,
         base_publication_sha256: str | None,
         anchor_before_sha256: str | None,
+        content_blocks: tuple[NoteContentBlockV1, ...],
         task_id: UUID | None,
         idempotency_key: str,
         now: datetime,
@@ -1235,6 +1811,7 @@ class OpinionNoteProposalService:
             base_publication_version=base_publication_version,
             base_publication_sha256=base_publication_sha256,
             anchor_before_sha256=anchor_before_sha256,
+            content_blocks=content_blocks,
             task_id=task_id,
             idempotency_key=idempotency_key,
             status=NoteProposalStatus.PROPOSED,
@@ -1249,12 +1826,25 @@ __all__ = [
     "AdvisorDraftingOutcomeV1",
     "AdvisorDraftingPort",
     "AdvisorDraftingRequestV1",
+    "NoteArticleElementFactV1",
+    "NoteContentBlockContextV1",
+    "NoteObservationFactV1",
     "NoteProposalDiffV1",
     "NoteProposalError",
     "NoteProposalErrorCode",
     "NoteProposalRequestResultV1",
     "OpinionNoteProposalService",
+    "ResolvedArticleElementBlockV1",
+    "ResolvedCanonicalCodeBlockV1",
+    "ResolvedIocTableBlockV1",
+    "ResolvedIocTableRowV1",
+    "ResolvedNoteContentBlockV1",
+    "ResolvedProtocolFigureBlockV1",
     "advisor_consult_arguments",
     "default_drafting_question",
     "default_review_question",
+    "load_note_content_block_context",
+    "note_article_element_facts",
+    "resolve_note_content_blocks",
+    "validate_note_content_blocks",
 ]

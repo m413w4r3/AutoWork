@@ -16,6 +16,8 @@ from cti_app.domain.analyst_opinion import (
     AnalystObservationRelation,
     AnalystObservationState,
     OpinionBlockType,
+    note_content_blocks_from_payload,
+    note_content_blocks_to_payload,
 )
 from cti_app.domain.opinion_note_proposal import (
     NoteProposalConsultationType,
@@ -55,6 +57,7 @@ def _from_row(row: InvestigationNoteProposalRow) -> NoteProposalV1:
         base_publication_version=row.base_publication_version,
         base_publication_sha256=row.base_publication_sha256,
         anchor_before_sha256=row.anchor_before_sha256,
+        content_blocks=note_content_blocks_from_payload(row.content_blocks),
         status=NoteProposalStatus(row.status),
         status_version=row.status_version,
         accepted_opinion_version=row.accepted_opinion_version,
@@ -92,6 +95,7 @@ def _values(proposal: NoteProposalV1) -> dict[str, object]:
         "base_publication_version": proposal.base_publication_version,
         "base_publication_sha256": proposal.base_publication_sha256,
         "anchor_before_sha256": proposal.anchor_before_sha256,
+        "content_blocks": note_content_blocks_to_payload(proposal.content_blocks),
         "status": proposal.status.value,
         "status_version": proposal.status_version,
         "accepted_opinion_version": proposal.accepted_opinion_version,
