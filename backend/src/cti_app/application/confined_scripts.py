@@ -73,6 +73,7 @@ _WORKER_STATUS_MAP: Mapping[str, ToolInvocationStatus] = {
     "OUTPUT_LIMIT": ToolInvocationStatus.PARTIAL,
     "DIRECTORY_LIMIT": ToolInvocationStatus.PARTIAL,
     "PROCESS_LIMIT": ToolInvocationStatus.PARTIAL,
+    "CONFINEMENT_VIOLATION": ToolInvocationStatus.FAILED,
     "UNAVAILABLE": ToolInvocationStatus.UNAVAILABLE,
     "POLICY_DENIED": ToolInvocationStatus.POLICY_DENIED,
     "FAILED": ToolInvocationStatus.FAILED,
@@ -232,6 +233,12 @@ class ConfinedScriptResult:
     outputs_truncated: bool = False
     output_files: tuple[Mapping[str, Any], ...] = ()
     worker_profile: str | None = None
+    execution_id: str | None = None
+    filesystem_confinement: str | None = None
+    sweep_complete: bool = True
+    survivors: tuple[int, ...] = ()
+    descendants_killed: tuple[int, ...] = ()
+    confinement_error: str | None = None
 
 
 def script_capability_available(execution: ConfinedAnalysisExecutionPort | None) -> bool:
@@ -416,29 +423,45 @@ class ConfinedScriptService:
                 reason="script_result_invalid",
                 **base,
             )
-        if (
-            result_data.get("script_sha256") != script_sha256
-            or result_data.get("input_sha256") != input_sha256
-            or result_data.get("interpreter") != request.interpreter_value()
-        ):
-            return ConfinedScriptResult(
-                status=ToolInvocationStatus.FAILED,
-                reason="script_result_identity_mismatch",
-                **base,
-            )
         worker_status = str(result_data.get("status", "FAILED")).upper()
         status = _WORKER_STATUS_MAP.get(worker_status, ToolInvocationStatus.FAILED)
         worker_reason = _string_or_none(result_data.get("detail_code")) or _string_or_none(
             result_data.get("available_reason")
         )
-        if status is ToolInvocationStatus.UNAVAILABLE and worker_reason in _CONFINEMENT_REASONS:
-            worker_reason = "confinement_unavailable"
+        # A typed refusal or unavailability carries no execution identity: the
+        # worker is telling us that no script ran and why. Enforcing the
+        # result-identity check first would relabel such a refusal as a bogus
+        # ``script_result_identity_mismatch``.
+        if status is ToolInvocationStatus.UNAVAILABLE:
+            if worker_reason in _CONFINEMENT_REASONS:
+                worker_reason = "confinement_unavailable"
+            return ConfinedScriptResult(
+                status=ToolInvocationStatus.UNAVAILABLE, reason=worker_reason, **base
+            )
+        if status is ToolInvocationStatus.POLICY_DENIED:
+            return ConfinedScriptResult(
+                status=ToolInvocationStatus.POLICY_DENIED,
+                reason=worker_reason or "analysis_policy_denied",
+                **base,
+            )
+        has_result_identity = "script_sha256" in result_data and "input_sha256" in result_data
+        if status is not ToolInvocationStatus.FAILED or has_result_identity:
+            if (
+                result_data.get("script_sha256") != script_sha256
+                or result_data.get("input_sha256") != input_sha256
+                or result_data.get("interpreter") != request.interpreter_value()
+            ):
+                return ConfinedScriptResult(
+                    status=ToolInvocationStatus.FAILED,
+                    reason="script_result_identity_mismatch",
+                    **base,
+                )
         outputs_blob_id = _uuid_or_none(result_data.get("outputs_blob_id"))
         output_files = result_data.get("output_files")
         return ConfinedScriptResult(
             status=status,
             reason=worker_reason,
-            executed=status is not ToolInvocationStatus.UNAVAILABLE,
+            executed=True,
             interpreter_version=_string_or_none(result_data.get("interpreter_version")),
             sandbox=_string_or_none(result_data.get("sandbox")),
             exit_code=_int_or_none(result_data.get("exit_code")),
@@ -458,6 +481,12 @@ class ConfinedScriptService:
             if isinstance(output_files, list)
             else (),
             worker_profile=_string_or_none(_mapping(result.payload).get("worker_profile")),
+            execution_id=_string_or_none(result_data.get("execution_id")),
+            filesystem_confinement=_string_or_none(result_data.get("filesystem_confinement")),
+            sweep_complete=result_data.get("sweep_complete") is not False,
+            survivors=_pids(result_data.get("survivors")),
+            descendants_killed=_pids(result_data.get("descendants_killed")),
+            confinement_error=_string_or_none(result_data.get("confinement_error")),
             **base,
         )
 
@@ -814,6 +843,12 @@ class RunScriptToolAdapter:
             ),
             "resource_usage": dict(result.resource_usage),
             "limits": dict(result.limits),
+            "filesystem_confinement": result.filesystem_confinement,
+            "execution_id": result.execution_id,
+            "sweep_complete": result.sweep_complete,
+            "survivors": list(result.survivors),
+            "descendants_killed": list(result.descendants_killed),
+            "confinement_error": result.confinement_error,
             "reason": result.reason,
             "untrusted_data": True,
             "observation_ref": str(observation.id),
@@ -939,6 +974,12 @@ def _observation_payload(result: ConfinedScriptResult) -> Mapping[str, Any]:
         "interpreter_version": result.interpreter_version,
         "exit_code": result.exit_code,
         "duration_seconds": result.duration_seconds,
+        "execution_id": result.execution_id,
+        "filesystem_confinement": result.filesystem_confinement,
+        "sweep_complete": result.sweep_complete,
+        "survivors": list(result.survivors),
+        "descendants_killed": list(result.descendants_killed),
+        "confinement_error": result.confinement_error,
         "resource_usage": dict(result.resource_usage),
         "limits": dict(result.limits),
         "stdout": result.stdout[:_SCRIPT_PREVIEW_CHARS],
@@ -1034,6 +1075,12 @@ def _uuid_or_none(value: Any) -> UUID | None:
 
 def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
+
+
+def _pids(value: Any) -> tuple[int, ...]:
+    if not isinstance(value, list | tuple):
+        return ()
+    return tuple(item for item in value if type(item) is int and item > 1)
 
 
 __all__ = [
