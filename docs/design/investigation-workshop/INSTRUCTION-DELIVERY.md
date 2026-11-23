@@ -144,9 +144,12 @@ backend est déjà `awaiting_instruction` (INS-01). (b) Boucle de fond toutes le
 `M24_INSTRUCTION_DRAIN_INTERVAL_SECONDS` (défaut 10 s, 2–300), lot
 `M24_INSTRUCTION_DRAIN_BATCH_SIZE` (défaut 50), verrou consultatif de transaction
 `pg_try_advisory_xact_lock(hashtextextended('m24.instruction-drain',0))`. Elle réconcilie
-d’abord les `delivering` périmés et `delivery_unknown`, puis draine les `queued` par
-`(queued_at,id)`. Candidat = session active portant une instruction
-`queued|delivering|delivery_unknown` (index partiel §4).
+d’abord les `delivering` périmés et `delivery_unknown` — requêtes dédiées sur **toutes** les
+sessions, car une tentative d’une session devenue terminale doit encore se résoudre (R4B-F1/F2)
+— puis draine les `queued` par `(queued_at,id)`. Candidat de **livraison** = session active
+portant une instruction `queued` uniquement : une ligne `delivering|delivery_unknown` n’est
+jamais livrable et ne doit pas occuper le lot borné (R4-F2 résiduel). L’index partiel §4 reste
+utilisé.
 
 **Par session, une instruction :**
 1. `host.get_session_status(session_id)` via le client brut (pas les `ProbedHostFacts` en

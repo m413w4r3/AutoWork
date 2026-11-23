@@ -658,6 +658,56 @@ def test_terminal_session_delivery_proof_is_still_extracted(
     asyncio.run(run())
 
 
+def test_non_deliverable_unknown_rows_never_starve_the_delivery_batch(
+    migrated_postgres_url: str,
+) -> None:
+    """R4-F2 residual: unknown rows of *live* sessions cannot fill the batch.
+
+    Their hosts are gone, so they are neither deliverable nor resolvable, and
+    the sweep may not have terminalised the sessions yet.  The delivery batch
+    only lists ``queued`` rows; five ticks used to send nothing at all while a
+    live instruction waited behind them.
+    """
+
+    async def run() -> None:
+        engine = create_postgres_engine(migrated_postgres_url)
+        try:
+            factory = create_session_factory(engine)
+            investigation = await _seed_investigation(factory)
+            unknown_at = NOW - timedelta(seconds=600)
+            host = _FakeHost()
+            for index in range(50):
+                dead = await _seed_leased_session(factory, investigation.id)
+                host.unreachable.add(dead.id)
+                await _seed_delivery_unknown(
+                    factory,
+                    dead,
+                    text=f"dead instruction {index}",
+                    key=f"pg-dead-unknown-{uuid4().hex[:8]}",
+                    at=unknown_at + timedelta(seconds=index),
+                )
+            live = await _seed_leased_session(factory, investigation.id)
+            live_row = await _seed_instruction(
+                factory,
+                live,
+                text="live instruction",
+                key=f"pg-live-{uuid4().hex[:8]}",
+            )
+
+            report = await _delivery_service(factory, host).drain_once()
+
+            assert report.delivered == 1
+            assert [call["session_id"] for call in host.send_calls] == [live.id]
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                stored = await uow.agent_sessions.get_instruction(live_row.id)
+            assert stored is not None
+            assert stored.state is InstructionState.DELIVERED
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
 def test_instruction_drain_lock_excludes_without_an_idle_transaction(
     migrated_postgres_url: str,
 ) -> None:

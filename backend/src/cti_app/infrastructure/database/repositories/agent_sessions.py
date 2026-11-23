@@ -13,6 +13,7 @@ closed or lost session.
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
@@ -496,19 +497,26 @@ class SqlAlchemyAgentSessionRepository:
         return _instruction_from_row(row) if row is not None else None
 
     async def list_pending_instructions(
-        self, *, limit: int
+        self, *, limit: int, states: Collection[InstructionState] | None = None
     ) -> tuple[AgentSessionInstructionV1, ...]:
-        """Drain candidates of *active* sessions in queue order (F3-D §3.3).
+        """Active-session candidates in queue order (F3-D §3.3).
 
-        The design's candidate is "an active session carrying an instruction
-        ``queued|delivering|delivery_unknown``": rows left by a terminal
-        session can never be delivered and must not occupy the bounded batch,
-        or 50 dead rows would starve every live instruction behind them
-        (R4-F2).  The partial ``ix_agent_session_instructions_pending`` index
-        still drives the scan; the join is on the session primary key.
+        Rows left by a terminal session can never be delivered and must not
+        occupy the bounded batch, or 50 dead rows would starve every live
+        instruction behind them (R4-F2).  The delivery batch additionally
+        passes ``states=(queued,)``: a ``delivering``/``delivery_unknown`` row
+        is never deliverable and an unresolvable one must not fill the batch
+        either (R4-F2 residual).  The partial
+        ``ix_agent_session_instructions_pending`` index still drives the scan;
+        the join is on the session primary key.
         """
         if limit < 1:
             raise ValueError("limit must be >= 1")
+        selected = (
+            INSTRUCTION_PENDING_STATES if states is None else frozenset(states)
+        )
+        if not selected:
+            return ()
         rows = await self._session.scalars(
             select(AgentSessionInstructionRow)
             .join(
@@ -517,7 +525,7 @@ class SqlAlchemyAgentSessionRepository:
             )
             .where(
                 AgentSessionInstructionRow.state.in_(
-                    tuple(state.value for state in INSTRUCTION_PENDING_STATES)
+                    tuple(sorted(state.value for state in selected))
                 ),
                 AgentSessionRow.state.in_(
                     tuple(state.value for state in ACTIVE_AGENT_SESSION_STATES)

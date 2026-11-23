@@ -7,7 +7,7 @@ module intentionally does not modify or depend on application/persistence.py.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Collection
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -632,9 +632,14 @@ class AgentSessionRepository(Protocol):
         ...
 
     async def list_pending_instructions(
-        self, *, limit: int
+        self, *, limit: int, states: Collection[InstructionState] | None = None
     ) -> tuple[AgentSessionInstructionV1, ...]:
-        """Drain candidates (queued|delivering|delivery_unknown) in (queued_at,id) order."""
+        """Active-session candidates in (queued_at,id) order.
+
+        ``states`` narrows the set; the delivery batch asks for ``queued``
+        only so unresolvable ambiguous rows cannot occupy it (R4-F2).  The
+        default keeps the whole pending set for diagnostics.
+        """
         ...
 
     async def list_stale_delivering(
@@ -2265,15 +2270,16 @@ class InMemoryAgentSessionRepository:
         return current
 
     async def list_pending_instructions(
-        self, *, limit: int
+        self, *, limit: int, states: Collection[InstructionState] | None = None
     ) -> tuple[AgentSessionInstructionV1, ...]:
         if limit < 1:
             raise ValueError("limit must be >= 1")
+        selected = INSTRUCTION_PENDING_STATES if states is None else frozenset(states)
         pending = sorted(
             (
                 instruction
                 for instruction in self._instructions.values()
-                if instruction.state in INSTRUCTION_PENDING_STATES
+                if instruction.state in selected
                 and (session := self._sessions.get(instruction.session_id)) is not None
                 and session.state in ACTIVE_AGENT_SESSION_STATES
             ),

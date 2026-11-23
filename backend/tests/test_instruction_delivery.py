@@ -190,9 +190,12 @@ class _FakeHost:
         self.events_error: Exception | None = None
         self.resync_required = False
         self.before_send: Any = None
+        self.unreachable: set[UUID] = set()
 
     async def get_session_status(self, session_id: UUID) -> HostSessionStatusV1:
         self.status_calls += 1
+        if session_id in self.unreachable:
+            raise WorkspaceLocalUnavailableError("the host session is lost")
         if self.status_error is not None:
             raise self.status_error
         return HostSessionStatusV1(
@@ -226,6 +229,8 @@ class _FakeHost:
         generation: int | None = None,
         limit: int = 500,
     ) -> HostSessionEventsPageV1:
+        if session_id in self.unreachable:
+            raise WorkspaceLocalUnavailableError("the host session is lost")
         if self.events_error is not None:
             raise self.events_error
         events = tuple(event for event in self.events if event.seq >= after)
@@ -826,6 +831,32 @@ async def _seed_stale_delivering(
     return queued, token
 
 
+async def _seed_delivery_unknown(
+    harness: _Harness,
+    session: AgentSessionV1,
+    *,
+    key: str,
+    text: str,
+    unknown_at: datetime,
+) -> AgentSessionInstructionV1:
+    """A reserved attempt whose phase C never committed the receipt."""
+    queued = await harness.seed_queued_instruction(
+        session, text=text, key=key, queued_at=unknown_at
+    )
+    reserved = queued.with_delivery_reserved(
+        token=uuid4(),
+        delivery_sha256=instruction_text_sha256(text),
+        now=unknown_at,
+    )
+    ambiguous = reserved.with_state(
+        InstructionState.DELIVERY_UNKNOWN, now=unknown_at, last_delivery_error="host_transport_error"
+    )
+    await harness.sessions.update_instruction_delivery(
+        ambiguous, expected_state=InstructionState.QUEUED, expected_delivery_token=None
+    )
+    return ambiguous
+
+
 async def test_terminal_session_stale_delivering_is_reconciled_and_cancelable() -> None:
     """R4B-F1: a crash whose session later became lost must still resolve.
 
@@ -909,6 +940,39 @@ async def test_terminal_session_delivery_proof_is_still_extracted() -> None:
     assert proven.state is InstructionState.DELIVERED
     assert proven.delivery_mode is InstructionDeliveryMode.NEXT_RUN
     assert proven.delivery_sha256 == sha
+
+
+async def test_dead_unknown_rows_of_live_sessions_never_starve_the_batch() -> None:
+    """R4-F2 residual: non-deliverable rows cannot fill the delivery batch.
+
+    Fifty older ``delivery_unknown`` rows whose sessions are still
+    ``running`` (the sweep has not marked them lost yet) are neither
+    deliverable nor resolvable.  They used to fill the bounded batch ahead of
+    a live queued instruction; five ticks sent nothing.  Only ``queued`` rows
+    are delivery candidates, so the live instruction is reached immediately.
+    """
+    harness = _Harness()
+    unknown_at = NOW - timedelta(seconds=600)
+    for index in range(50):
+        dead = await harness.seed_session(state=AgentSessionState.RUNNING)
+        harness.host.unreachable.add(dead.id)
+        await _seed_delivery_unknown(
+            harness,
+            dead,
+            key=f"i-dead-unknown-{index}",
+            text=f"dead instruction {index}",
+            unknown_at=unknown_at + timedelta(seconds=index),
+        )
+    live = await harness.seed_session(state=AgentSessionState.AWAITING_INSTRUCTION)
+    queued = await harness.seed_queued_instruction(
+        live, text="live instruction", key="i-live-fair", queued_at=NOW
+    )
+
+    report = await harness.delivery.drain_once()
+
+    assert report.delivered == 1
+    assert [call["session_id"] for call in harness.host.send_calls] == [live.id]
+    assert (await harness.instruction(queued.id)).state is InstructionState.DELIVERED
 
 
 # ----------------------------------------------------- database clock (R4-F4)

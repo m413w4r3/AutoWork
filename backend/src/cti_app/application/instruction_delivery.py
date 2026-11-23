@@ -365,7 +365,7 @@ class InstructionDeliveryService:
         reconciled_delivered, reconciled_queued = await self._reconcile_unknown_attempts(
             timestamp, limit=size
         )
-        pending = await self._list_pending(size)
+        pending = await self._list_delivery_candidates(size)
         counts = {
             InstructionAttemptOutcome.DELIVERED: 0,
             InstructionAttemptOutcome.DEFERRED: 0,
@@ -1026,9 +1026,19 @@ class InstructionDeliveryService:
             raise ValueError("now must be timezone-aware")
         return timestamp
 
-    async def _list_pending(self, limit: int) -> tuple[AgentSessionInstructionV1, ...]:
+    async def _list_delivery_candidates(
+        self, limit: int
+    ) -> tuple[AgentSessionInstructionV1, ...]:
+        """Only ``queued`` rows of active sessions can ever be delivered.
+
+        Ambiguous or in-flight rows get their own reconciliation queries; if
+        they shared this bounded batch, 50 unresolvable rows would starve
+        every live instruction behind them (R4-F2 residual).
+        """
         async with self._uow_factory() as uow:
-            return await uow.agent_sessions.list_pending_instructions(limit=limit)
+            return await uow.agent_sessions.list_pending_instructions(
+                limit=limit, states=(InstructionState.QUEUED,)
+            )
 
     async def _load_instruction(self, instruction_id: UUID) -> AgentSessionInstructionV1 | None:
         async with self._uow_factory() as uow:
