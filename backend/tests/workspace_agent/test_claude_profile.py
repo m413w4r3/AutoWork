@@ -130,6 +130,8 @@ def test_claude_argv_uses_probed_modes_only(tmp_path: Path) -> None:
     assert context.scratch_directory == context.work_directory.parent
 
     # Modes the profile deliberately does not use (UNPROVEN or unnecessary).
+    # ``--allowedTools`` is used only for the closed MCP server allowance, not
+    # to re-enable a removed built-in (asserted in test_claude_restricted_tools_only).
     for absent in (
         "--input-format",
         "--resume",
@@ -137,7 +139,6 @@ def test_claude_argv_uses_probed_modes_only(tmp_path: Path) -> None:
         "--fork-session",
         "--json-schema",
         "--tools",
-        "--allowedTools",
         "--settings",
         "--setting-sources",
         "--safe-mode",
@@ -187,7 +188,11 @@ def test_claude_restricted_tools_only(tmp_path: Path) -> None:
     assert flag_value(argv, "--permission-prompts") == "none"
     denied = {item.strip() for item in flag_value(argv, "--disallowedTools").split(",")}
     assert {"Bash", "PowerShell", "REPL", "WebFetch"} <= denied
-    assert "--allowedTools" not in flags  # --restricted's removal must stand
+    # H0: dontAsk denied the MCP tools too; only the closed autowork server is
+    # allowed at the CLI layer (the relay still enforces the session manifest).
+    allowed = {item.strip() for item in flag_value(argv, "--allowedTools").split(",")}
+    assert allowed == {"mcp__autowork"}
+    assert not allowed & {"Bash", "PowerShell", "REPL", "WebFetch", "Edit", "Write", "Read"}
     assert "--tools" not in flags
     assert "--dangerously-skip-permissions" not in flags
     assert flag_value(argv, "--add-dir") == str(context.scratch_directory)

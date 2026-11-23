@@ -96,6 +96,12 @@ BROKER_SOCKET_ENV = shim.BROKER_SOCKET_ENV
 DISALLOWED_TOOLS: tuple[str, ...] = ("Bash", "PowerShell", "REPL", "WebFetch")
 PERMISSION_MODE = "dontAsk"
 PERMISSION_PROMPTS = "none"
+# ``dontAsk`` denies anything that would prompt, including our MCP tools; the
+# operator needs them without a human at the CLI.  Only the closed `autowork`
+# MCP server is allowed at the CLI permission layer: no built-in tool name is
+# added, and the per-session manifest is still enforced by the relay/backend
+# (H0 host spike: the tool call was otherwise denied with "don't ask mode").
+MCP_ALLOWED_TOOLS: tuple[str, ...] = (f"mcp__{MCP_SERVER_NAME}",)
 
 REQUIRED_HELP_FLAGS: tuple[str, ...] = (
     "--print",
@@ -898,6 +904,8 @@ class ClaudeProfile:
             PERMISSION_PROMPTS,
             "--disallowedTools",
             ",".join(DISALLOWED_TOOLS),
+            "--allowedTools",
+            ",".join(MCP_ALLOWED_TOOLS),
             "--restricted",
         ]
         if self._credentials_file is None:
