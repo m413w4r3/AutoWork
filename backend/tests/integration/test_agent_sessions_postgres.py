@@ -12,8 +12,10 @@ import asyncio
 import hashlib
 import hmac
 import json
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
+from types import TracebackType
 from typing import cast
 from uuid import UUID, uuid4
 
@@ -42,6 +44,7 @@ from cti_app.application.agentic_sessions import (
     HostSessionReleaseService,
     SessionSecret,
     SessionService,
+    SessionStateConflictError,
 )
 from cti_app.application.identity import LocalIdentityProvider
 from cti_app.application.investigation_handoffs import (
@@ -82,6 +85,7 @@ from cti_app.domain.agentic_operator import (
     ResumeSessionResultV1,
     SendInstructionRequest,
     SessionProcessStatusV1,
+    SessionReconcileOutcome,
     SessionReconciliationV1,
     SessionStatusRequest,
     StartSessionRequest,
@@ -696,6 +700,74 @@ class _BlockingOperator:
 
     async def reconcile_session(self, request: ReconcileSessionRequest) -> SessionReconciliationV1:
         raise AssertionError("the interleaving test never reconciles")
+
+
+class _HostIoTrackingUowFactory:
+    """Counts open service UoWs so a blocked fake can assert the host boundary."""
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self.session_factory = session_factory
+        self.active = 0
+
+    def __call__(self) -> _HostIoTrackingUow:
+        return _HostIoTrackingUow(self)
+
+
+class _HostIoTrackingUow:
+    def __init__(self, owner: _HostIoTrackingUowFactory) -> None:
+        self.owner = owner
+        self.inner: SqlAlchemyUnitOfWork | None = None
+
+    async def __aenter__(self) -> SqlAlchemyUnitOfWork:
+        self.inner = SqlAlchemyUnitOfWork(self.owner.session_factory)
+        await self.inner.__aenter__()
+        self.owner.active += 1
+        return self.inner
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        assert self.inner is not None
+        try:
+            await self.inner.__aexit__(exc_type, exc_value, traceback)
+        finally:
+            self.owner.active -= 1
+
+
+class _BlockingCollectOperator(_BlockingOperator):
+    """Deterministic collect UDS fake; it never starts a real CLI."""
+
+    def __init__(self, uow_depth: Callable[[], int]) -> None:
+        super().__init__()
+        self.uow_depth = uow_depth
+        self.uow_depth_at_call: int | None = None
+        self.collected: list[UUID] = []
+        self.both_entered = asyncio.Event()
+
+    async def collect_results(self, request: CollectResultsRequest) -> OperatorResultsV1:
+        self.uow_depth_at_call = self.uow_depth()
+        self.collected.append(request.session_id)
+        if len(self.collected) >= 2:
+            self.both_entered.set()
+        self.entered.set()
+        await self.release.wait()
+        return OperatorResultsV1(
+            session_id=request.session_id,
+            checkpoint_ref="checkpoint-after-collect",
+            checkpoint_sha256="c" * 64,
+            observed_at=NOW,
+        )
+
+    async def reconcile_session(self, request: ReconcileSessionRequest) -> SessionReconciliationV1:
+        return SessionReconciliationV1(
+            session_id=request.session_id,
+            outcome=SessionReconcileOutcome.SESSION_ALIVE,
+            host_session_ref=request.host_session_ref,
+            observed_at=NOW,
+        )
 
 
 class _SecretDelivery:
@@ -1416,6 +1488,223 @@ async def _seed_route_session(
         )
         await db.commit()
     return session, secret
+
+
+def test_collect_host_io_does_not_hold_postgres_uow_or_task_lock(
+    temporary_postgres_url: str,
+) -> None:
+    command.upgrade(_alembic_config(temporary_postgres_url), "head")
+
+    async def run() -> None:
+        engine = create_postgres_engine(temporary_postgres_url)
+        try:
+            factory = create_session_factory(engine)
+            investigation = await _seed_investigation(factory)
+            session, _secret = await _seed_route_session(factory, investigation.id)
+            tracked_uows = _HostIoTrackingUowFactory(factory)
+            operator = _BlockingCollectOperator(lambda: tracked_uows.active)
+            service = SessionService(
+                uow_factory=tracked_uows,
+                deriver=HmacSessionSecretDeriver(SESSION_KEY),
+                operator=operator,
+                disclosure=_allow_disclosure,
+                task_limits=TaskLimits(),
+                clock=lambda: NOW,
+            )
+            operator_actor = TaskActor(kind=TaskActorKind.OPERATOR, actor_id="codex:operator-1")
+            collecting = asyncio.create_task(
+                service.collect(
+                    investigation.id,
+                    session.id,
+                    actor=operator_actor,
+                    cursor="postgres-collect-1",
+                    now=NOW,
+                )
+            )
+            await asyncio.wait_for(operator.entered.wait(), timeout=10)
+
+            assert operator.uow_depth_at_call == 0
+            assert tracked_uows.active == 0
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                pending = await uow.agent_sessions.get(session.id)
+                assert pending is not None
+                assert pending.state is AgentSessionState.RECONCILING
+
+            async def heartbeat_while_host_waits() -> None:
+                async with SqlAlchemyUnitOfWork(factory) as uow:
+                    task_service = InvestigationTaskService(
+                        tasks=uow.investigation_tasks,
+                        decisions=uow.analyst_decisions,
+                        sessions=RepositoryTaskSessionPort(uow.agent_sessions),
+                        limits=TaskLimits(),
+                    )
+                    await task_service.heartbeat(
+                        task_id=session.task_id,
+                        actor=operator_actor,
+                        expected_status_version=2,
+                        lease_fence=1,
+                        idempotency_key="heartbeat-during-host-collect",
+                        now=NOW,
+                    )
+                    await uow.commit()
+
+            # The operation keeps the host blocked while another transaction
+            # takes the investigation/task locks and renews the same fence.
+            await asyncio.wait_for(heartbeat_while_host_waits(), timeout=10)
+            assert not operator.release.is_set()
+
+            operator.release.set()
+            result = await asyncio.wait_for(collecting, timeout=10)
+            assert result.session_id == session.id
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                stored = await uow.agent_sessions.get(session.id)
+                assert stored is not None
+                assert stored.state is AgentSessionState.AWAITING_INSTRUCTION
+                assert stored.checkpoint_sha256 == "c" * 64
+                task = await uow.investigation_tasks.get(session.task_id)
+                assert task is not None and task.lease_fence == 1
+        finally:
+            if "operator" in locals():
+                operator.release.set()
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_collect_result_is_rejected_after_postgres_lease_revocation(
+    temporary_postgres_url: str,
+) -> None:
+    command.upgrade(_alembic_config(temporary_postgres_url), "head")
+
+    async def run() -> None:
+        engine = create_postgres_engine(temporary_postgres_url)
+        try:
+            factory = create_session_factory(engine)
+            investigation = await _seed_investigation(factory)
+            session, _secret = await _seed_route_session(factory, investigation.id)
+            tracked_uows = _HostIoTrackingUowFactory(factory)
+            operator = _BlockingCollectOperator(lambda: tracked_uows.active)
+            service = SessionService(
+                uow_factory=tracked_uows,
+                deriver=HmacSessionSecretDeriver(SESSION_KEY),
+                operator=operator,
+                disclosure=_allow_disclosure,
+                task_limits=TaskLimits(),
+                clock=lambda: NOW,
+            )
+            operator_actor = TaskActor(kind=TaskActorKind.OPERATOR, actor_id="codex:operator-1")
+            collecting = asyncio.create_task(
+                service.collect(
+                    investigation.id,
+                    session.id,
+                    actor=operator_actor,
+                    cursor="postgres-collect-revoked",
+                    now=NOW,
+                )
+            )
+            await asyncio.wait_for(operator.entered.wait(), timeout=10)
+
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                task = await uow.investigation_tasks.get(session.task_id)
+                assert task is not None
+                task_service = InvestigationTaskService(
+                    tasks=uow.investigation_tasks,
+                    decisions=uow.analyst_decisions,
+                    sessions=RepositoryTaskSessionPort(uow.agent_sessions),
+                    limits=TaskLimits(),
+                )
+                await task_service.cancel(
+                    task_id=task.id,
+                    actor=HUMAN_ACTOR,
+                    expected_status_version=task.status_version,
+                    idempotency_key="cancel-during-host-collect",
+                    reason="revoke while host result is pending",
+                    now=NOW,
+                )
+                await uow.commit()
+
+            operator.release.set()
+            with pytest.raises(SessionStateConflictError):
+                await asyncio.wait_for(collecting, timeout=10)
+
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                stored = await uow.agent_sessions.get(session.id)
+                task = await uow.investigation_tasks.get(session.task_id)
+                assert stored is not None and stored.state is AgentSessionState.CLOSED
+                assert stored.checkpoint_ref is None
+                assert task is not None
+                assert task.lease_id is None and task.lease_session_id is None
+                assert task.lease_fence == 2
+            assert operator.collected == [session.id]
+        finally:
+            if "operator" in locals():
+                operator.release.set()
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_two_postgres_sessions_can_wait_for_host_collection_concurrently(
+    temporary_postgres_url: str,
+) -> None:
+    command.upgrade(_alembic_config(temporary_postgres_url), "head")
+
+    async def run() -> None:
+        engine = create_postgres_engine(temporary_postgres_url)
+        try:
+            factory = create_session_factory(engine)
+            investigation = await _seed_investigation(factory)
+            session_a, _secret_a = await _seed_route_session(factory, investigation.id)
+            session_b, _secret_b = await _seed_route_session(factory, investigation.id)
+            tracked_uows = _HostIoTrackingUowFactory(factory)
+            operator = _BlockingCollectOperator(lambda: tracked_uows.active)
+            service = SessionService(
+                uow_factory=tracked_uows,
+                deriver=HmacSessionSecretDeriver(SESSION_KEY),
+                operator=operator,
+                disclosure=_allow_disclosure,
+                task_limits=TaskLimits(),
+                clock=lambda: NOW,
+            )
+            operator_actor = TaskActor(kind=TaskActorKind.OPERATOR, actor_id="codex:operator-1")
+            first = asyncio.create_task(
+                service.collect(
+                    investigation.id,
+                    session_a.id,
+                    actor=operator_actor,
+                    cursor="two-session-a",
+                    now=NOW,
+                )
+            )
+            second = asyncio.create_task(
+                service.collect(
+                    investigation.id,
+                    session_b.id,
+                    actor=operator_actor,
+                    cursor="two-session-b",
+                    now=NOW,
+                )
+            )
+            await asyncio.wait_for(operator.both_entered.wait(), timeout=10)
+
+            assert tracked_uows.active == 0
+            assert operator.uow_depth_at_call == 0
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                pending_a = await uow.agent_sessions.get(session_a.id)
+                pending_b = await uow.agent_sessions.get(session_b.id)
+                assert pending_a is not None and pending_a.state is AgentSessionState.RECONCILING
+                assert pending_b is not None and pending_b.state is AgentSessionState.RECONCILING
+
+            operator.release.set()
+            results = await asyncio.wait_for(asyncio.gather(first, second), timeout=10)
+            assert {result.session_id for result in results} == {session_a.id, session_b.id}
+            assert set(operator.collected) == {session_a.id, session_b.id}
+        finally:
+            if "operator" in locals():
+                operator.release.set()
+            await engine.dispose()
+
+    asyncio.run(run())
 
 
 async def _seed_instruction(

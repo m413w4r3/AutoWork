@@ -221,6 +221,34 @@ def _codex_adapter(
     )
 
 
+async def test_reconcile_intent_version_reaches_host_idempotency_key() -> None:
+    host = FakeHostSessionsPort()
+    operator = _codex_adapter(host, HostSessionPreparationRegistry())
+    capabilities = await operator.probe_capabilities(
+        ProbeCapabilitiesRequest(
+            adapter_kind=OperatorAdapterKind.CODEX_CLI, executable="/usr/local/bin/codex"
+        )
+    )
+    prepared = await operator.prepare_session(_prepare_request(capabilities.capability_sha256))
+    intent_key = "state-version:17"
+
+    await operator.reconcile_session(
+        ReconcileSessionRequest(
+            session_id=SESSION_ID,
+            host_session_ref=prepared.host_session_ref,
+            idempotency_key=intent_key,
+        )
+    )
+
+    assert host.calls[-1] == (
+        "reconcile_session",
+        {
+            "session_id": SESSION_ID,
+            "idempotency_key": host_idempotency_key("reconcile", SESSION_ID, intent_key),
+        },
+    )
+
+
 def _standard_wire() -> _Wire:
     wire = _Wire()
     wire.route("GET", "/v1/sessions/capabilities", probe_wire().model_dump(mode="json"))

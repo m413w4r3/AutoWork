@@ -549,7 +549,9 @@ class HostOperatorAdapter:
         result = await self._host.reconcile_session(
             request.session_id,
             HostReconcileRequestV1(),
-            idempotency_key=host_idempotency_key("reconcile", request.session_id),
+            idempotency_key=host_idempotency_key(
+                "reconcile", request.session_id, request.idempotency_key
+            ),
         )
         outcome = _RECONCILE_OUTCOMES[result.outcome]
         checkpoint_ref: str | None = None

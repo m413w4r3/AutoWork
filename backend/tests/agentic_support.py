@@ -288,7 +288,9 @@ class FakeHostSessionsPort:
     async def reconcile_session(
         self, session_id: UUID, request: HostReconcileRequestV1, *, idempotency_key: str
     ) -> HostReconcileResultV1:
-        self.calls.append(("reconcile_session", {"session_id": session_id}))
+        self.calls.append(
+            ("reconcile_session", {"session_id": session_id, "idempotency_key": idempotency_key})
+        )
         return HostReconcileResultV1(
             outcome=self.reconcile_outcome,
             evidence=HostReconcileEvidenceV1(last_event_seq=7),
