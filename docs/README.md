@@ -1,6 +1,6 @@
 # AutoWork — documentation authority index
 
-Updated for coding agents, 2026-11-22. This index is **navigation and
+Updated for coding agents, 2026-11-23. This index is **navigation and
 precedence**, not an assertion that every historical statement or currently
 deployed environment was revalidated. Review actual code, schemas, runtime
 capabilities, migration state and tests before asserting operational behavior.
@@ -65,7 +65,30 @@ separate approval and state/backup preflight.
 | Source collection | [`source_collection_and_evidence.md`](source_collection_and_evidence.md) | ACTIVE_REFERENCE; older workflow statements may be historical |
 | M16 acquisition engine | [`m16/ACQUISITION_ENGINE.md`](m16/ACQUISITION_ENGINE.md) | ACTIVE_REFERENCE; verify configuration and deployment capabilities against code |
 | Editorial workshop design and acceptance | [`design/atelier-editorial/ARCHITECTURE.md`](design/atelier-editorial/ARCHITECTURE.md), [`TICKETS.md`](design/atelier-editorial/TICKETS.md), [`UX-SPEC.md`](design/atelier-editorial/UX-SPEC.md), [`GLOSSARY.md`](design/atelier-editorial/GLOSSARY.md), [`ACCEPTANCE.md`](design/atelier-editorial/ACCEPTANCE.md) | ACTIVE_REFERENCE; `ACCEPTANCE.md` is the M23 traceability target checked by `backend/tests/test_editorial_acceptance_traceability.py` |
+| Investigation workshop design and host runner (M24/M24.1) | [`design/investigation-workshop/SESSION-RUNNER.md`](design/investigation-workshop/SESSION-RUNNER.md), [`WORKSPACE-AGENT.md`](design/investigation-workshop/WORKSPACE-AGENT.md), [`BROKER-RELAY-EGRESS.md`](design/investigation-workshop/BROKER-RELAY-EGRESS.md), [`INSTRUCTION-DELIVERY.md`](design/investigation-workshop/INSTRUCTION-DELIVERY.md), [`COCKPIT-F4.md`](design/investigation-workshop/COCKPIT-F4.md), [`GLOSSARY.md`](design/investigation-workshop/GLOSSARY.md) | ACTIVE_REFERENCE for implementers; `BROKER-RELAY-EGRESS.md` is normative for the delivered network model (netns without route, entrypoint forwarder, broker UDS relay, CONNECT egress); `INSTRUCTION-DELIVERY.md` supersedes the former SESSION-RUNNER instruction-queue "Known gap"; `COCKPIT-F4.md` records delivered lots and the F7a/F7b split; see "Superseded passages" below |
+| VT fake-provider capability report | [`operations/m24-1-vt-fake-capabilities.md`](operations/m24-1-vt-fake-capabilities.md) | ACTIVE_REFERENCE; fake-provider evidence only, no live VT call, credential or quota claim |
 | Other accepted ADRs | [`adr/`](adr/) | ACTIVE_REFERENCE unless expressly superseded; dated decisions must be interpreted in sequence |
+
+## Superseded passages (M24.1 documentation alignment, 2026-11-23)
+
+These statements remain as dated design context where they are useful, but they are **not**
+current contracts; the delivered model, code and tests take precedence:
+
+- `design/investigation-workshop/SESSION-RUNNER.md`: every slirp4netns /
+  `--disable-host-loopback` / `host_network_unsafe` / `AUTOWORK_BACKEND_URL` statement is
+  superseded by `design/investigation-workshop/BROKER-RELAY-EGRESS.md` and the M24.1
+  implementation (netns with only `lo` and no route, trusted entrypoint forwarder to the host
+  CONNECT proxy, shim over the per-session broker UDS relay). The instruction-queue
+  "Known gap" is superseded by `design/investigation-workshop/INSTRUCTION-DELIVERY.md`.
+- `design/investigation-workshop/WORKSPACE-AGENT.md`: invariant 1 is amended by the M24.1
+  session exception (the supervisor opens the loopback relay/proxy connections; the sandboxed
+  CLI has no direct outbound path and no backend URL).
+- `adr/ADR-0011-investigation-workshop-coordination.md` D7: the 2026-11-23 addendum records the
+  broker socket, the per-run secret re-arm, and the accepted/bounded residue that the
+  sandboxed CLI can read the D7 secret.
+- `design/investigation-workshop/COCKPIT-F4.md`: `0030_note_content_blocks` does not exist;
+  `0029_note_anchor_identity` carries both the anchor identity and `content_blocks`. The
+  browser journey is split: F7a steps 1–11 delivered, F7b steps 12–24 open.
 
 ## Historical documents and intentional deletions
 

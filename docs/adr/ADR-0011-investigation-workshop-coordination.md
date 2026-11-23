@@ -404,6 +404,58 @@ Cet amendement consigne l'état réellement implémenté sur `m24/integration` ;
 - **Portes ajoutées par revue** : `external_llm_allowed`/TLP à l'ouverture de session ; mode réseau fail-closed des CLI réels (voir SESSION-RUNNER.md).
 - **Résiduel non prouvé** : spike H0 hôte (schéma de clés MCP Codex, resume/stream-json Claude, jeu de fichiers d'identifiants, profil bwrap CLI, egress fournisseur seul) ; capacité VT réelle download/PCAP ; Notes avec tableaux/figures M23 (non supporté : texte seulement) ; chronologie sans passations/contributions/sessions.
 
+### Amendement D7 (2026-11-23, M24.1 DOC-1) — relais broker, ré-armement du secret et résidu accepté
+
+Cet addendum ne modifie aucune autre décision. Il aligne D7 sur le modèle réseau livré
+([BROKER-RELAY-EGRESS.md](../design/investigation-workshop/BROKER-RELAY-EGRESS.md)) et clôt,
+pour D7, les points laissés ouverts par la revue R2-F1.
+
+- **Socket broker (transport).** Le shim n'ouvre aucune connexion sortante : il envoie une
+  requête HTTP/1.1 signée par connexion sur le socket AF_UNIX pathname
+  `<runtime>/sessions/<id>/ipc/broker.sock` (0600, exposé par le ro-bind `ipc/`). Le relais du
+  superviseur (même processus que l'agent hôte) n'accepte qu'un ensemble fermé de routes POST —
+  `tool-calls` (outil appartenant au manifeste accepté), `commands` (`heartbeat`/`submit`),
+  `handoffs` (`task_id` lié) et `instructions` (`pull`/`ack` seulement ; `enqueue`/`cancel` sont
+  humains) — avec en-têtes fermés, corps re-lié à la session et `Idempotency-Key` obligatoire ;
+  il transmet octet pour octet à `AGENT_SESSIONS_BROKER_BACKEND_URL` (HTTP loopback fixe, défaut
+  `http://127.0.0.1:8000`). Il ne re-signifie jamais, ne choisit ni URL ni redirection, et
+  n'écrit que méthode + gabarit de route + identifiant de session dans ses logs. Le backend
+  reste l'autorité : HMAC D7, session active, liaison tâche et bail courant sont revérifiés à
+  chaque appel (`application/agent_session_verifier.py`,
+  `application/agentic_tool_broker.py`). Corollaire pour l'invariant WORKSPACE-AGENT §1 : le
+  superviseur ouvre bien une connexion loopback vers le backend, mais le CLI confiné n'a aucune
+  sortie directe et ne détient aucune URL backend.
+- **Ré-armement du secret.** Le secret D7 est dérivé au `prepare_session` et conservé en mémoire
+  du superviseur uniquement. Le socket de remise à usage unique (`ipc/shim.sock`, 0600, pair de
+  même uid) est **ré-armé avant chaque run** à partir de ce secret en mémoire
+  (`sessions/supervisor.py::_arm_secret`) ; un CLI qui relance le shim à chaque nouveau run
+  (Codex `exec resume`) retrouve donc une remise fraîche. Le secret n'est jamais persisté (ni
+  `state.json`, ni log, ni argv, ni env) ; il est conservé en mémoire à travers une interruption
+  pour permettre le ré-armement du run suivant, puis effacé au `close`, au nettoyage de
+  redémarrage ou à la détection d'exposition, et le socket est supprimé après usage.
+- **Résidu accepté et borné (R2-F1 F1).** Le CLI lance lui-même le shim et lit
+  `AUTOWORK_SESSION_SOCKET` dans son propre environnement ; il peut donc se connecter **avant**
+  le shim au socket à usage unique et recevoir la trame complète
+  `autowork-session-secret.v1`. C'est un comportement déterministe (l'ordre est sous son
+  contrôle), pas une course étroite : `PR_SET_DUMPABLE=0` et le ro-bind `ipc/` réduisent la
+  portée, ils ne l'empêchent pas. Ce résidu est **accepté** : le secret ne confère que
+  l'autorité déjà accordée à cette session (catalogue fermé du relais, HMAC D7 revalidé côté
+  backend, session/tâche/bail courants), il est effacé au `close`/au nettoyage de redémarrage,
+  ré-armé par run, et `collect` refuse de persister un contenu d'agent qui le contient (formes
+  brute, hex, base64/base64url ou fragment aligné d'au moins 16 octets) en faisant échouer la
+  session avec `secret_exposure_detected` (`sessions/supervisor.py::_refuse_secret_exposure`,
+  `sessions/state.py`). Il reste ouvert tant que le shim n'est pas déplacé côté hôte.
+- **Portée.** Ces décisions ne changent ni D2 (états/DDL), ni D8 (surface API), ni le fait que
+  l'agent hôte ne pousse jamais d'état et ne détient aucun credential de stockage.
+
+**Résiduel de l'amendement du 2026-11-22, mis à jour au 2026-11-23.** Le spike H0 (Codex/Claude
+réels, MCP via relais, proxy d'egress, netns) et les capacités VT avec fournisseur factice sont
+livrés ([host-cli-spike-2026-11.md](../operations/host-cli-spike-2026-11.md),
+[m24-1-vt-fake-capabilities.md](../operations/m24-1-vt-fake-capabilities.md)) ; les blocs de Note
+(tableaux/figures M23) et la chronologie (passations, contributions, sessions, instructions)
+sont livrés par B5a/B5b/B7. Restent non prouvés : reprise et live-instruction CLI, fournisseurs
+réels, et parcours navigateur F7b (étapes 12–24).
+
 ## Questions ouvertes à trancher par l’humain
 
 1. Le spike de capacité VT réelle (download/PCAP/route proxy) reste une autorisation séparée avant B01–B10 ; confirmez-vous qu’il n’est pas inclus dans M24 ?

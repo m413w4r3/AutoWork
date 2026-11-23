@@ -1,11 +1,25 @@
 # F4-D — Cockpit d’enquête M24 : manques (a)–(h), conception et découpage
 
-Statut : **proposition de conception** (diagnostic + doc, aucun code de production).
-Base : `7e4a0e5e` (branche `m24-1/f4d-cockpit-design`, cwd du lot). Tête Alembic
-courante : `0027_instruction_delivery`. Légende : **[V]** vérifié dans le code à ce
-SHA ; **[I]** inférence de conception. Les chemins sont cités `fichier:ligne`.
-Sauf mention [V], les routes, schémas, noms de lots et migrations proposés ci-dessous
-sont des propositions [I] à valider par l’orchestrateur.
+Statut : **conception ; lots B1–B7 et F1–F6 livrés ; F7a (étapes 1–11) livré, F7b
+(étapes 12–24) en cours**. Base de conception : `7e4a0e5e` (branche
+`m24-1/f4d-cockpit-design`). Tête Alembic livrée à `1c88ac5b` : `0029_note_anchor_identity`
+— les pins d'ancre **et** `content_blocks` sont dans `0029` ; le lot B5a n'a pas créé de
+`0030`. Légende : **[V]** vérifié dans le code à la base de conception ; **[I]** inférence de
+conception. Les chemins sont cités `fichier:ligne`.
+Sauf mention [V], les routes, schémas et noms de lots proposés ci-dessous ont été livrés ; les
+écarts constatés sont signalés dans l'encadré ci-dessous.
+
+**État livré (2026-11-23).** B1 (`0028_task_context_consultations`), B2/B3
+(`api/investigation_task_consultations.py`, `context_task_id` sur `POST /plans/request`),
+B4+B5a (`0029_note_anchor_identity`), B5b (rendu Typst) et B5c (blocs de Note dans les
+éditions du bulletin), B6
+(`GET …/agent-sessions/{sid}/summary`, `api/agent_sessions.py:474`) et B7
+(`application/investigation_timeline.py:88-91`, sources handoff/contribution/session/instruction)
+sont livrés ; côté frontend, F1 (`tasks/TaskBridgePanel.tsx`), F2 (`opinion/AnchorPicker.tsx`),
+F3 (`opinion/NoteContentBlocks.tsx`), F4 (`tasks/OperatorsPanel.tsx`), F5
+(`overview/EnvelopeLifecycleSection.tsx`) et F6 (`tasks/TimelinePanel.tsx`) sont livrés.
+F7 est scindé : **F7a** livre les étapes 1–11 (`make test-investigation-browser`,
+`Makefile:648`) ; **F7b** couvre les étapes 12–24 et reste ouvert.
 
 ## 1. Inventaire vérifié des manques
 
@@ -176,14 +190,14 @@ une nouvelle version de publication : la proposition devient stale à l’accept
 exige rebase ; c’est le comportement voulu.
 
 **Persistance/contrat additif exact** :
-- migration `0029_note_anchor_identity` (lot B4) : `investigation_note_proposals` gagne
-  `base_publication_artifact_id uuid null` (FK `production_artifacts.id` RESTRICT),
+- migration `0029_note_anchor_identity` (lots B4 **et** B5a) : `investigation_note_proposals`
+  gagne `base_publication_artifact_id uuid null` (FK `production_artifacts.id` RESTRICT),
   `base_publication_version bigint null`, `base_publication_sha256 char(64) null`,
-  `anchor_before_sha256 char(64) null`, checks de paire et de SHA. Downgrade refusé si
-  une ligne porte un pin.
-- migration `0030_note_content_blocks` (lot B5a) : `investigation_note_proposals.content_blocks
-  jsonb not null default '[]'` (+ `CHECK jsonb_typeof='array'`). Downgrade refusé si une
-  ligne porte des blocs.
+  `anchor_before_sha256 char(64) null`, checks de paire et de SHA, **et** `content_blocks jsonb
+  not null default '[]'` (+ `CHECK jsonb_typeof='array'`). Il n'existe **pas** de
+  `0030_note_content_blocks` : la correction de numérotation est actée dans
+  `backend/migrations/versions/0029_note_anchor_identity.py` (docstring et colonnes). Downgrade
+  refusé tant qu'une ligne porte un pin ou des blocs.
 - payload d’avis `analyst-observations.v2` (JSONB, **aucun DDL**) : chaque note gagne
   `content_blocks`; le parseur accepte v1 et v2 ; les anciennes versions restent
   lisibles et inchangées. Les nouveaux chemins n’ajoutent qu’une version d’avis,
@@ -227,6 +241,16 @@ labels/types front alignés. Aucune nouvelle table.
 ancres/la proposition ». Test Vitest sur chaque code.
 
 ## 6. Vrai parcours navigateur (24 étapes)
+
+**Réalisé par étapes (2026-11-23).** **F7a** livre les étapes **1–11** : cible
+`make test-investigation-browser` (`Makefile:648`), config
+`frontend/playwright.investigation.config.ts`, launcher
+`backend/tests/workflow_emulator/m24_browser_server.py` et spec
+`frontend/e2e-real/investigation-workshop/workshop_real.spec.ts` (« steps 1–11 » explicite en
+tête, arrêt volontaire après l'étape 11). Les étapes **12–24** (note workspace,
+livraison/ack d'instruction, résultat signé hôte, consultations de tâche, propositions de
+Note, ancres, corrections, PDF Typst réel) restent **F7b, en cours** ; leurs prérequis
+B5a/B5b/F2/F3 sont désormais fusionnés.
 
 **Cible** `make test-investigation-browser`, calquée sur `test-editorial-browser`
 ([V] `Makefile:558-646`) : PostgreSQL d’intégration jetable (ou DSN externe), attestation
@@ -284,8 +308,9 @@ jamais par un mock d’API) :
 `tests/integration/test_acceptance_scenario_postgres.py` ; les vues M24 par 13 tests
 Playwright interceptés ; le navigateur réel M23 par 8 tests
 (`frontend/e2e-real/editorial/workspace_real.spec.ts`) ; le J2 legacy par
-`test-workflow-browser-investigation`. **Non couvert avant ce lot** : le cockpit M24
-contre le backend M24 réel (le présent parcours).
+`test-workflow-browser-investigation`. **Livré par F7a** : les étapes navigateur 1–11 contre
+le backend M24 réel. **Encore non couvert** : les étapes 12–24 contre le backend M24 réel
+(F7b).
 
 **Contraintes d’exécution** : `CHOKIDAR_USEPOLLING=1` si inotify saturé, env Typst
 réel, `tests/workspace_agent` sans `TMPDIR` long (limite AF_UNIX 108 octets), un seul
@@ -305,7 +330,7 @@ d’abord quand une route manque, puis frontend. Chaque lot ≤ ~1 jour d’agen
 | **B2** | Contrat `task_context` du dossier Advisor : champ admis, `prompt_data`, prompt, dossier, omissions | `application/investigation_advisor_tools.py` (champs/dossier uniquement), `application/advisor_prompt.py`, `application/advisor_dossier.py`, tests | B1 | `test_investigation_advisor_tools.py::test_task_context_is_bounded_in_dossier`, `::test_task_context_never_carries_credentials` |
 | **B3** | Route task-scoped + extension plans request + filtre registre + propagation `context_task_id` aux propositions de Notes | `api/investigation_task_consultations.py` (nouveau), `api/investigation_plans.py`, `application/opinion_note_proposals.py` (propagation), `api/opinion_note_proposals.py` (adaptateur seulement), tests ; inclusion/allowlist par l’orchestrateur dans `api/main.py` | B1, B2 | `test_investigation_task_consultations.py::test_task_consultation_reuses_advisor_consult_and_attribution`, `::test_task_consultation_never_mutates_task_status`, `test_investigation_plan_api.py::test_plan_request_with_context_task_links_invocation`, `test_opinion_note_proposals.py::test_task_drafting_links_context_task` |
 | **B4** | Ancres : helper unique renderable (V9/V10 aligné), pin de base + hash de paragraphe dans la proposition, lecture `GET /article-anchors`, résolution des éléments M23 de la base | `migrations/versions/0029_*`, `application/investigation_article_anchors.py` (nouveau), `application/investigation_article_snapshot.py`, `application/opinion_note_proposals.py` (validation base), `api/investigation_article.py` (nouveau), `domain/opinion_note_proposal.py` (pin), `models/opinion_note_proposals.py`, `repositories/opinion_note_proposals.py`, `application/investigation_persistence.py` (row/proxy pin), `application/analyst_opinion_service.py` (validation base/ancres), tests | B1, B3 | `test_alembic_chain.py::test_expected_chain_ends_with_0029`, `test_opinion_note_proposals.py::test_anchor_uses_pinned_base_publication`, `::test_duplicate_paragraph_anchor_is_renderable_and_accepted_on_v9`, `::test_removed_anchor_refused_with_typed_code`, `test_investigation_article_anchors.py::test_anchor_route_returns_exact_base_identity` |
-| **B5a** | Blocs de Note : union domaine, persistance proposition + avis v2, validation/acceptation, idempotence | `migrations/versions/0030_*`, `domain/opinion_note_proposal.py`, `domain/analyst_opinion.py`, `application/opinion_note_proposals.py`, `application/analyst_opinion_service.py` (accept), `api/opinion_note_proposals.py`, `models/opinion_note_proposals.py`, `repositories/opinion_note_proposals.py`, `investigation_persistence.py`, tests | B4 | `test_alembic_chain.py::test_expected_chain_ends_with_0030`, `test_opinion_note_proposals.py::test_article_element_ref_pinned_and_stale_refused`, `::test_code_ref_matches_observation_bytes`, `::test_ioc_ref_rejects_advisory_observation`, `::test_note_payload_v2_preserves_v1_readability` |
+| **B5a** | Blocs de Note : union domaine, persistance proposition + avis v2, validation/acceptation, idempotence | `migrations/versions/0029_*` (`content_blocks` dans la même révision que B4), `domain/opinion_note_proposal.py`, `domain/analyst_opinion.py`, `application/opinion_note_proposals.py`, `application/analyst_opinion_service.py` (accept), `api/opinion_note_proposals.py`, `models/opinion_note_proposals.py`, `repositories/opinion_note_proposals.py`, `investigation_persistence.py`, tests | B4 | `test_alembic_chain.py::test_expected_chain_ends_with_0029`, `test_opinion_note_proposals.py::test_article_element_ref_pinned_and_stale_refused`, `::test_code_ref_matches_observation_bytes`, `::test_ioc_ref_rejects_advisory_observation`, `::test_note_payload_v2_preserves_v1_readability` |
 | **B5b** | Rendu Typst des blocs de Note (résolution refs, cross-références, code/IOC inline), template | `application/typst_rendering.py`, `chpTypst/RENDERER/publication_helpers.typ`, tests rendu | B5a | `test_typst_rendering.py::test_note_content_blocks_render_with_provenance`, `::test_note_chart_without_evidence_refused`, `::test_note_code_ref_exact_bytes` |
 | **B6** | Résumé opérateur : ops/budget/broker/handoff/instructions | `api/agent_sessions.py`, `application/agentic_sessions.py` (lecture), tests | ID-3/ID-4 mergés (éviter conflit de fichier) | `test_agent_sessions.py::test_session_summary_exposes_operations_budget_handoff_instructions`, `::test_session_summary_never_leaks_secret` |
 | **B7** | Sources timeline handoffs/contributions/sessions/instructions + item types | `application/investigation_timeline.py`, `api/investigation_tasks.py` (branchement `extra_sources`), tests | B6 | `test_investigation_timeline.py::test_timeline_projects_handoff_contribution_session_instruction`, `::test_new_items_are_non_evidence` |
@@ -320,7 +345,7 @@ d’abord quand une route manque, puis frontend. Chaque lot ≤ ~1 jour d’agen
 | **F4** | Panneau opérateurs : ops/budget/broker/handoff/instructions | `tasks/OperatorsPanel.tsx`, `api/agentSessions.ts`, `tasks/labels.ts`, tests | B6 | `pnpm test --run OperatorsPanel agentSessions` |
 | **F5** | G2 extend/revoke dans la Vue d’ensemble (sans doublon d’approbation) | `overview/EnvelopeLifecycleSection.tsx` (nouveau), `overview/OverviewView.tsx`, `overview/EnvelopeSection.tsx` (lien seulement), tests | — | `pnpm test --run EnvelopeLifecycleSection OverviewView` |
 | **F6** | Timeline : nouveaux types/labels/filtres | `tasks/TimelinePanel.tsx`, `tasks/labels.ts`, `api/tasks.ts`, tests | B7 | `pnpm test --run TimelinePanel` |
-| **F7** | Parcours navigateur réel 24 étapes + cible Make + config Playwright | `backend/tests/workflow_emulator/m24_browser_server.py` (nouveau), `backend/tests/workflow_emulator/test_m24_browser_server.py`, `frontend/playwright.investigation.config.ts` (nouveau), `frontend/e2e-real/investigation-workshop/workshop_real.spec.ts` (nouveau), `Makefile` (cible) | B1–B7, F1–F6 | `make test-investigation-browser` (24 étapes), `test_m24_browser_server.py` (attestation/loopback/shutdown) |
+| **F7** | Parcours navigateur réel + cible Make + config Playwright. **F7a livré : étapes 1–11. F7b ouvert : étapes 12–24.** | `backend/tests/workflow_emulator/m24_browser_server.py` (livré), `backend/tests/workflow_emulator/test_m24_browser_server.py` (livré), `frontend/playwright.investigation.config.ts` (livré), `frontend/e2e-real/investigation-workshop/workshop_real.spec.ts` (livré, étapes 1–11), `Makefile` (cible livrée) | B1–B7, F1–F6 | `make test-investigation-browser` (**étapes 1–11**), `test_m24_browser_server.py` (attestation/loopback/shutdown) ; oracle 12–24 à livrer par F7b |
 
 **Ordre** : B1 → B2 → B3 ; B4 → B5a → B5b ; B6 (après merges ID-3/ID-4) → B7 ;
 F5 peut démarrer immédiatement ; F2 après B4 ; F1 après B3 ; F3 après B5a (F3 peut
@@ -359,8 +384,8 @@ utilisent les colonnes (`context_task_id`, `content_blocks`, pins).
 5. **BRIEF** : `_publication_anchors` renvoie `()` pour un V7/V8 BRIEF ([V]
    `investigation_article_snapshot.py:290-303`) ; les Notes y restent impossibles. Le
    cockpit doit-il créer des enquêtes sur BRIEF ?
-6. **Migrations 0028–0030** : confirmer la numérotation après `0027_instruction_delivery`
-   et la fenêtre de merge (ID-3/ID-4/ID-6/ID-7 en cours touchent des fichiers voisins).
+6. **Migrations 0028–0030** — **résolu** : `0028_task_context_consultations`, puis
+   `0029_note_anchor_identity` qui porte les pins **et** `content_blocks` ; aucun `0030`.
 7. **Coût du parcours navigateur** : un serveur M24 réel + sidecar + PG + Typst + 24
    étapes est lourd (probablement 3–6 min). Le réserver au gate final, pas à chaque lot.
 8. **Transport multi-paragraphes Bridge** : le parcours doit inclure une réponse à deux
