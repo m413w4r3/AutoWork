@@ -507,20 +507,24 @@ def test_close_deletes_secret_socket_scratch_and_keeps_state(session_base: Path)
     with running_session_agent(session_base) as running, running.client() as client:
         workspace_id = running.ensure_workspace(client)
         assert _prepare(client, running, workspace_id).status_code == 200
-        write_fake_script(running, success_script())
-        assert _start(client, running).status_code == 200
-        wait_for_state(client, running, "stopped")
-
         session_dir = running.session_dir()
+        # A prepared session already owns its one-shot secret listener and its
+        # broker relay (M24.1 LIFE-1); both are pathname sockets in ipc/.
         assert (session_dir / "ipc" / "shim.sock").is_socket()
+        assert (session_dir / "ipc" / "broker.sock").is_socket()
+
         closed = post_session(
             client, running, f"/v1/sessions/{SESSION_ID}/close", {"reason": "done"}, CLOSE_KEY
         )
         assert closed.status_code == 200, closed.text
         assert closed.json() == {"state": "closed"}
         assert (session_dir / "state.json").is_file()
+        assert (session_dir / "events.jsonl").is_file()
         assert not (session_dir / "ipc" / "shim.sock").exists()
+        assert not (session_dir / "ipc" / "broker.sock").exists()
+        assert not (session_dir / "ipc" / "egress.sock").exists()
         assert not (session_dir / "scratch").exists()
+        assert not (session_dir / "prompt.json").exists()
 
         status = get_session(client, running, f"/v1/sessions/{SESSION_ID}")
         assert status.status_code == 200

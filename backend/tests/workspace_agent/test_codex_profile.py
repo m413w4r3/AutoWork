@@ -93,9 +93,9 @@ def _attested_network(monkeypatch: pytest.MonkeyPatch) -> None:
     """Stub the real host loopback attestation; its own oracle proves it separately.
 
     The profile tests run against a named bwrap stand-in that creates no
-    namespaces, so the real bwrap+slirp4netns probe cannot apply.  The
-    attestation function is replaced at the module seam, never through a
-    production environment flag.
+    namespaces, so the real bwrap netns probe cannot apply.  The attestation
+    function is replaced at the module seam, never through a production
+    environment flag.
     """
     monkeypatch.setattr(
         process,
@@ -104,6 +104,29 @@ def _attested_network(monkeypatch: pytest.MonkeyPatch) -> None:
             True, "test attestation", "isolated_egress", True
         ),
     )
+
+
+@pytest.fixture(autouse=True)
+def _egress_profile(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> Path:
+    """A real session needs its provider allowlist profile (M24.1 LIFE-1)."""
+    directory = tmp_path_factory.mktemp("egress-profile")
+    path = directory / "egress-profile.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema": "autowork-session-egress.v1",
+                "profiles": {
+                    "codex": {"hosts": ["api.openai.com", "auth.openai.com", "chatgpt.com"]}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(path, 0o600)
+    monkeypatch.setenv("AGENT_SESSIONS_EGRESS_PROFILE_FILE", str(path))
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +322,6 @@ def test_codex_resume_never_relaunches_without_probe(
 
     monkeypatch.setenv("AUTOWORK_CODEX_BINARY", str(fake))
     monkeypatch.setenv("AUTOWORK_CODEX_BWRAP", str(stub))
-    monkeypatch.setenv("AGENT_SESSIONS_CLI_NETWORK_MODE", "host_network_unsafe")
     monkeypatch.delenv("AUTOWORK_CODEX_RESUME_PROVEN", raising=False)
     with running_session_agent(session_base) as running, running.client() as client:
         workspace_id = running.ensure_workspace(client)
@@ -600,7 +622,6 @@ def test_codex_profile_lifecycle_through_supervisor(
     stub = _install_stub_bwrap(session_base)
     monkeypatch.setenv("AUTOWORK_CODEX_BINARY", str(fake))
     monkeypatch.setenv("AUTOWORK_CODEX_BWRAP", str(stub))
-    monkeypatch.setenv("AGENT_SESSIONS_CLI_NETWORK_MODE", "host_network_unsafe")
     monkeypatch.delenv("AUTOWORK_CODEX_AUTH_FILE", raising=False)
     monkeypatch.delenv("AUTOWORK_CODEX_RESUME_PROVEN", raising=False)
     with running_session_agent(session_base) as running, running.client() as client:
@@ -642,10 +663,11 @@ def test_codex_profile_lifecycle_through_supervisor(
         launched = [entry for entry in invocations if "exec" in entry and "--json" in entry]
         assert len(launched) == 1, invocations
         assert "--unshare-pid" in launched[0]
-        # The lifecycle tests run under the explicit dev override because the
-        # named bwrap stand-in cannot create a network namespace; the isolated
-        # profile has its own argv oracle above and a real host attestation test.
-        assert "--unshare-net" not in launched[0]
+        # Isolation is the only mode (M24.1 LIFE-1); the named bwrap stand-in
+        # execs the trusted entrypoint wrapper without creating the namespace,
+        # and the host attestation is injected above.
+        assert "--unshare-net" in launched[0]
+        assert any("entrypoint.py" in token for token in launched[0])
         assert "--dangerously-bypass-approvals-and-sandbox" in launched[0]
 
         final_path = running.session_dir() / "scratch" / "work" / "final-message.txt"
@@ -675,7 +697,6 @@ def test_codex_profile_interrupt_kills_process_group(
     stub = _install_stub_bwrap(session_base)
     monkeypatch.setenv("AUTOWORK_CODEX_BINARY", str(fake))
     monkeypatch.setenv("AUTOWORK_CODEX_BWRAP", str(stub))
-    monkeypatch.setenv("AGENT_SESSIONS_CLI_NETWORK_MODE", "host_network_unsafe")
     with running_session_agent(session_base) as running, running.client() as client:
         workspace_id = running.ensure_workspace(client)
         assert _prepare_codex(client, running, workspace_id).status_code == 200
@@ -707,7 +728,6 @@ def test_codex_profile_resume_runs_only_when_proven(
     stub = _install_stub_bwrap(session_base)
     monkeypatch.setenv("AUTOWORK_CODEX_BINARY", str(fake))
     monkeypatch.setenv("AUTOWORK_CODEX_BWRAP", str(stub))
-    monkeypatch.setenv("AGENT_SESSIONS_CLI_NETWORK_MODE", "host_network_unsafe")
     monkeypatch.setenv("AUTOWORK_CODEX_RESUME_PROVEN", "1")
     with running_session_agent(session_base) as running, running.client() as client:
         workspace_id = running.ensure_workspace(client)

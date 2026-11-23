@@ -29,14 +29,14 @@ import threading
 import time
 import uuid
 from collections import deque
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Collection, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, Protocol
 
 from .. import files, paths, policies, protocol, scan, workspace
 from ..scan import Clock, SystemClock
-from . import logs, process
+from . import egress, logs, process, relay, shim
 from . import state as session_state
 from .state import (
     ACTIVE_STATES,
@@ -67,6 +67,8 @@ LOGGER = logging.getLogger("autowork.workspace_agent.sessions")
 
 SESSION_RUNTIME_DIRECTORY = "sessions"
 SESSION_SOCKET_FILE_NAME = "shim.sock"
+BROKER_SOCKET_FILE_NAME = "broker.sock"
+EGRESS_LOG_FILE_NAME = "egress.log"
 PROMPT_FILE_NAME = "prompt.json"
 FAKE_SCRIPT_FILE_NAME = "fake-script.json"
 FAKE_OUTPUT_FILE_NAME = "fake-output.json"
@@ -100,6 +102,7 @@ TOOL_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_.]{0,63}$")
 SESSION_PROTOCOL = protocol.SESSIONS_PROTOCOL_VERSION
 DEFAULT_SKILLS_ROOT = Path(__file__).resolve().parents[3] / ".agents" / "skills"
 DEFAULT_FAKE_SCENARIO = "success"
+DEFAULT_BROKER_BACKEND_URL = "http://127.0.0.1:8000"
 
 
 class SessionConfigError(RuntimeError):
@@ -290,7 +293,9 @@ class FakeProfile:
             "LC_ALL": "C.UTF-8",
             "AUTOWORK_SESSION_ID": context.session_id,
             "AUTOWORK_SESSION_SOCKET": str(context.ipc_socket_path),
-            "AUTOWORK_BACKEND_URL": "http://127.0.0.1:8000",
+            # Same relay contract as the real adapters (ADP-1): the fake CLI
+            # never receives a backend URL, only the closed broker socket.
+            "AUTOWORK_BROKER_SOCKET": str(context.ipc_socket_path.parent / BROKER_SOCKET_FILE_NAME),
             "AUTOWORK_FAKE_CLI_SCENARIO": context.fake_scenario,
         }
         if script_path.is_file():
@@ -804,6 +809,65 @@ def _b64(value: bytearray) -> str:
 # ---------------------------------------------------------------------------
 
 
+class _SessionChannelState:
+    """Live authorization for the broker relay and the egress proxy.
+
+    The relay and proxy workers call this from their own threads.  It therefore
+    reads the session record through atomic attribute loads (CPython rebinds
+    ``record.state`` and ``handle.manifest``; it never mutates them in place)
+    and never takes ``handle.lock``: the supervisor holds that lock while it
+    closes the very listeners being stopped.
+
+    Only a run in ``running``/``awaiting_instruction`` is active.  ``starting``
+    covers the short window between a successful spawn and the recorded state
+    transition so the CLI's first provider CONNECT is not refused by the
+    proxy; it never outlives a failed or finished launch.
+    """
+
+    def __init__(self, handle: _Session) -> None:
+        self._handle = handle
+        self._starting = threading.Event()
+
+    @property
+    def session_binding(self) -> relay.SessionBinding:
+        record = self._handle.record
+        return relay.SessionBinding(
+            session_id=record.session_id,
+            investigation_id=record.investigation_id,
+            task_id=record.task_id,
+        )
+
+    def is_active(self) -> bool:
+        return self._handle.record.state in {
+            SessionState.RUNNING,
+            SessionState.AWAITING_INSTRUCTION,
+        }
+
+    def egress_allowed(self) -> bool:
+        return self.is_active() or self._starting.is_set()
+
+    def manifest_tools(self) -> Collection[str] | None:
+        manifest = self._handle.manifest
+        if not isinstance(manifest, dict):
+            return None
+        tools = manifest.get("tools")
+        if not isinstance(tools, list):
+            return None
+        names: set[str] = set()
+        for tool in tools:
+            if isinstance(tool, dict):
+                broker_name = tool.get("broker_name")
+                if isinstance(broker_name, str):
+                    names.add(broker_name)
+        return frozenset(names)
+
+    def mark_starting(self) -> None:
+        self._starting.set()
+
+    def mark_started(self) -> None:
+        self._starting.clear()
+
+
 class _Session:
     def __init__(
         self,
@@ -818,8 +882,12 @@ class _Session:
         self.logs = log_ring
         self.events = event_ring
         self.lock = threading.RLock()
+        self.channels = _SessionChannelState(self)
         self.secret: bytearray | None = None
         self.broker: SecretBroker | None = None
+        self.relay: relay.BrokerRelay | None = None
+        self.egress: egress.EgressProxy | None = None
+        self.egress_profile: egress.EgressProfile | None = None
         self.manifest: dict[str, object] | None = None
         self.instructions: dict[str, dict[str, object]] = {}
         self.queue: deque[dict[str, object]] = deque()
@@ -845,6 +913,18 @@ class _Session:
     def socket_path(self) -> Path:
         return self.directory / IPC_DIRECTORY / SESSION_SOCKET_FILE_NAME
 
+    @property
+    def broker_socket_path(self) -> Path:
+        return self.directory / IPC_DIRECTORY / BROKER_SOCKET_FILE_NAME
+
+    @property
+    def egress_socket_path(self) -> Path:
+        return self.directory / IPC_DIRECTORY / process.EGRESS_SOCKET_FILE_NAME
+
+    @property
+    def egress_log_path(self) -> Path:
+        return self.directory / EGRESS_LOG_FILE_NAME
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -867,9 +947,20 @@ class SessionSupervisorConfig:
     skills_root: Path | None = None
     page_limit: int = logs.DEFAULT_PAGE_LIMIT
     allow_foreign_runtime_dir: bool = False
-    # R03 B1: the closed CLI network mode, read from AGENT_SESSIONS_CLI_NETWORK_MODE
-    # and verified against the backend's value on every prepare.
+    # R03 B1: the closed CLI network mode.  Manual construction may only name
+    # ``isolated_egress``; the environment reader refuses the removed literal.
     cli_network_mode: str = process.NETWORK_MODE_ISOLATED_EGRESS
+    # Broker relay target: one fixed loopback HTTP origin, validated at startup
+    # with the shim's parser and never given to the CLI.
+    broker_backend_url: str = DEFAULT_BROKER_BACKEND_URL
+    # Provider allowlist profile (``autowork-session-egress.v1``); a real
+    # session without it is refused ``confinement_unavailable``.
+    egress_profile_path: Path | None = None
+    # Test seams for the per-CONNECT policy: production always resolves and
+    # connects through the system resolver and a real pinned socket.
+    egress_resolver: egress.Resolver | None = None
+    egress_connector: egress.Connector | None = None
+    egress_local_addresses: egress.LocalAddressReader | None = None
 
     @property
     def session_root(self) -> Path:
@@ -877,12 +968,8 @@ class SessionSupervisorConfig:
 
     def network_startup_reason(self) -> str | None:
         """Startup check: a real CLI session needs its isolation tools present."""
-        if self.cli_network_mode == process.NETWORK_MODE_HOST_NETWORK_UNSAFE:
-            return None
         if not process.bwrap_available():
             return "bwrap binary missing"
-        if not process.slirp_available():
-            return "slirp4netns binary missing"
         return None
 
     def validate(self) -> None:
@@ -890,10 +977,19 @@ class SessionSupervisorConfig:
         workspace = self.workspace_root.resolve()
         if runtime == workspace or runtime.is_relative_to(workspace):
             raise SessionConfigError("the session runtime directory is inside the workspace tree")
-        if self.cli_network_mode not in process.CLI_NETWORK_MODES:
+        if self.cli_network_mode == "host_network_unsafe":
             raise SessionConfigError(
-                "AGENT_SESSIONS_CLI_NETWORK_MODE must be isolated_egress or host_network_unsafe"
+                "AGENT_SESSIONS_CLI_NETWORK_MODE=host_network_unsafe is no longer supported: "
+                "agent CLI sessions must run in an isolated network namespace (isolated_egress)"
             )
+        if self.cli_network_mode != process.NETWORK_MODE_ISOLATED_EGRESS:
+            raise SessionConfigError("AGENT_SESSIONS_CLI_NETWORK_MODE must be isolated_egress")
+        try:
+            shim.parse_backend_url(self.broker_backend_url)
+        except shim.ShimConfigError as exc:
+            raise SessionConfigError(
+                f"AGENT_SESSIONS_BROKER_BACKEND_URL is invalid ({exc.code})"
+            ) from exc
         if self.interrupt_grace_seconds < 0:
             raise SessionConfigError("the interrupt grace period is negative")
         if self.log_ring_bytes < 1 or self.log_ring_entries < 1 or self.event_ring_entries < 1:
@@ -906,6 +1002,7 @@ def config_from_agent(agent: WorkspaceAgent) -> SessionSupervisorConfig:
     """Build the H1 supervisor config from the agent paths and test env knobs."""
     runtime_root = agent.config.socket_dir
     skills_root_text = os.environ.get("AUTOWORK_SESSIONS_SKILLS_ROOT", "").strip()
+    egress_profile_text = os.environ.get("AGENT_SESSIONS_EGRESS_PROFILE_FILE", "").strip()
     return SessionSupervisorConfig(
         runtime_root=runtime_root,
         workspace_root=agent.config.root,
@@ -924,6 +1021,11 @@ def config_from_agent(agent: WorkspaceAgent) -> SessionSupervisorConfig:
         skills_root=Path(skills_root_text) if skills_root_text else DEFAULT_SKILLS_ROOT,
         allow_foreign_runtime_dir=agent.config.allow_foreign_runtime_dir,
         cli_network_mode=_env_network_mode(),
+        broker_backend_url=(
+            os.environ.get("AGENT_SESSIONS_BROKER_BACKEND_URL", "").strip()
+            or DEFAULT_BROKER_BACKEND_URL
+        ),
+        egress_profile_path=(Path(egress_profile_text) if egress_profile_text else None),
     )
 
 
@@ -931,10 +1033,13 @@ def _env_network_mode() -> str:
     value = os.environ.get("AGENT_SESSIONS_CLI_NETWORK_MODE", "").strip()
     if not value:
         return process.NETWORK_MODE_ISOLATED_EGRESS
-    if value not in process.CLI_NETWORK_MODES:
+    if value == "host_network_unsafe":
         raise SessionConfigError(
-            "AGENT_SESSIONS_CLI_NETWORK_MODE must be isolated_egress or host_network_unsafe"
+            "AGENT_SESSIONS_CLI_NETWORK_MODE=host_network_unsafe is no longer supported: "
+            "agent CLI sessions must run in an isolated network namespace (isolated_egress)"
         )
+    if value not in process.CLI_NETWORK_MODES:
+        raise SessionConfigError("AGENT_SESSIONS_CLI_NETWORK_MODE must be isolated_egress")
     return value
 
 
@@ -978,14 +1083,9 @@ class SessionSupervisor:
         self._lock = threading.RLock()
         self._idempotency = IdempotencyStore(self._clock)
         self._stopped = threading.Event()
-        # Startup check (R03 B1): the closed mode and its tools are verified
-        # before any real session may be prepared; fake profiles stay usable.
+        # Startup check (R03 B1): the isolation tools are verified before any
+        # real session may be prepared; fake profiles stay usable.
         self._network_startup_reason = config.network_startup_reason()
-        if config.cli_network_mode == process.NETWORK_MODE_HOST_NETWORK_UNSAFE:
-            LOGGER.warning(
-                "AGENT_SESSIONS_CLI_NETWORK_MODE=host_network_unsafe: operator CLI sessions "
-                "share the host network and can reach host loopback services; development only"
-            )
         if self._network_startup_reason is not None:
             LOGGER.error(
                 "isolated CLI network unavailable; real sessions will fail closed: %s",
@@ -1014,14 +1114,10 @@ class SessionSupervisor:
                         managed.process.wait(timeout=5)
                     except Exception:
                         pass
-                    process.stop_network(managed)
                     handle.managed = None
-                broker, handle.broker = handle.broker, None
-                if broker is not None:
-                    broker.stop()
-                if handle.secret is not None:
-                    handle.secret[:] = bytes(len(handle.secret))
-                    handle.secret = None
+                # Close in-flight relay connections and provider tunnels, unlink
+                # both sockets and the one-shot secret, wipe the secret bytes.
+                self._stop_channels(handle, wipe_secret=True)
             for thread in list(handle.threads):
                 if thread.name.startswith(("session-stdout", "session-stderr", "session-monitor")):
                     thread.join(timeout=5)
@@ -1038,6 +1134,160 @@ class SessionSupervisor:
         if info.st_uid != os.geteuid() and not self._config.allow_foreign_runtime_dir:
             raise SessionConfigError("the session runtime directory is owned by another user")
         os.chmod(root, 0o750)
+
+    # -- relay, egress and one-shot secret channels (§6) -------------------
+
+    def _unlink_orphan_sockets(self, directory: Path) -> None:
+        """Remove pathname sockets left by a crashed supervisor; never adopt."""
+        self._unlink_sockets(
+            (
+                directory / IPC_DIRECTORY / SESSION_SOCKET_FILE_NAME,
+                directory / IPC_DIRECTORY / BROKER_SOCKET_FILE_NAME,
+                directory / IPC_DIRECTORY / process.EGRESS_SOCKET_FILE_NAME,
+            )
+        )
+
+    @staticmethod
+    def _unlink_sockets(paths: Sequence[Path]) -> None:
+        for path in paths:
+            try:
+                info = path.lstat()
+            except OSError:
+                continue
+            if not stat.S_ISSOCK(info.st_mode):
+                continue
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+    def _arm_secret(self, handle: _Session) -> None:
+        """Arm a fresh single-use D7 handoff socket for exactly one run (BL3).
+
+        The secret lives only in supervisor memory.  Every run replaces the
+        previous listener (consumed or not), so a Codex ``exec resume`` spawns
+        a shim that can still find a one-shot socket; nothing is persisted or
+        ever placed in argv, env, logs or state.
+        """
+        secret = handle.secret
+        if secret is None or not secret:
+            raise SecretUnavailableError(reason="secret_wiped")
+        broker, handle.broker = handle.broker, None
+        if broker is not None:
+            broker.stop()
+            broker.wipe()
+        fresh = SecretBroker(
+            handle.socket_path, handle.record.session_id, bytes(secret), log=LOGGER
+        )
+        try:
+            fresh.start()
+        except OSError as exc:
+            fresh.stop()
+            fresh.wipe()
+            raise SecretUnavailableError() from exc
+        handle.broker = fresh
+
+    def _start_relay(self, handle: _Session, *, adapter_kind: str) -> None:
+        """Bind the per-session broker relay once per run (0600, pathname UDS)."""
+        if handle.relay is not None:
+            return
+        server: relay.BrokerRelay | None = None
+        try:
+            server = relay.BrokerRelay(
+                socket_path=handle.broker_socket_path,
+                backend_url=self._config.broker_backend_url,
+                session=handle.channels,
+                logger=LOGGER,
+            )
+            server.start()
+        except relay.RelayConfigError as exc:
+            if server is not None:
+                server.close()
+            raise ConfinementUnavailableError(adapter_kind, reason=exc.code) from exc
+        except OSError as exc:
+            if server is not None:
+                server.close()
+            raise ConfinementUnavailableError(
+                adapter_kind, reason="relay_socket_unavailable"
+            ) from exc
+        handle.relay = server
+
+    def _load_egress_profile(self, adapter_kind: str) -> egress.EgressProfile:
+        path = self._config.egress_profile_path
+        if path is None:
+            raise ConfinementUnavailableError(adapter_kind, reason="egress_profile_unavailable")
+        try:
+            return egress.load_egress_profile(path, adapter_kind=adapter_kind)
+        except egress.EgressConfigError as exc:
+            raise ConfinementUnavailableError(adapter_kind, reason=exc.code) from exc
+
+    def _gated_resolver(self, handle: _Session) -> egress.Resolver:
+        """Resolve a provider name only while this session's run may egress."""
+
+        inner = self._config.egress_resolver
+
+        def resolve(host: str, port: int) -> Sequence[egress.ResolvedAddress]:
+            if not handle.channels.egress_allowed():
+                raise egress.EgressRequestError("session_inactive")
+            if inner is not None:
+                return inner(host, port)
+            return egress.system_resolver(host, port)
+
+        return resolve
+
+    def _start_egress(self, handle: _Session, *, adapter_kind: str) -> None:
+        """Bind the per-session CONNECT proxy once per run (0600, pathname UDS)."""
+        if handle.egress is not None:
+            return
+        profile = handle.egress_profile
+        if profile is None:
+            raise ConfinementUnavailableError(adapter_kind, reason="egress_profile_unavailable")
+        try:
+            proxy = egress.EgressProxy(
+                socket_path=handle.egress_socket_path,
+                log_path=handle.egress_log_path,
+                session_id=handle.record.session_id,
+                profile=profile,
+                resolver=self._gated_resolver(handle),
+                connector=self._config.egress_connector,
+                local_addresses=self._config.egress_local_addresses,
+            )
+            proxy.start()
+        except egress.EgressConfigError as exc:
+            raise ConfinementUnavailableError(adapter_kind, reason=exc.code) from exc
+        handle.egress = proxy
+
+    def _require_egress_socket(self, handle: _Session, *, adapter_kind: str) -> None:
+        try:
+            process.require_egress_socket(handle.egress_socket_path)
+        except process.NetworkIsolationUnavailable as exc:
+            raise ConfinementUnavailableError(adapter_kind, reason=str(exc)) from exc
+
+    def _stop_channels(self, handle: _Session, *, wipe_secret: bool) -> None:
+        """Abort in-flight relay connections/tunnels and unlink both sockets.
+
+        Called on run end, interrupt, close, revocation and supervisor stop.
+        The in-memory secret survives unless ``wipe_secret`` is set (close and
+        supervisor stop), so the next run can re-arm a fresh handoff.
+        """
+        server, handle.relay = handle.relay, None
+        if server is not None:
+            server.close()
+        proxy, handle.egress = handle.egress, None
+        if proxy is not None:
+            proxy.close()
+        broker, handle.broker = handle.broker, None
+        if broker is not None:
+            broker.stop()
+            broker.wipe()
+        handle.channels.mark_started()
+        if wipe_secret:
+            secret, handle.secret = handle.secret, None
+            if secret is not None:
+                secret[:] = bytes(len(secret))
+        self._unlink_sockets(
+            (handle.socket_path, handle.broker_socket_path, handle.egress_socket_path)
+        )
 
     # -- restart reconciliation (§5 exact) ---------------------------------
 
@@ -1065,6 +1315,9 @@ class SessionSupervisor:
                 )
 
     def _load_and_reconcile(self, directory: Path) -> None:
+        # A previous supervisor may have crashed with its listeners' pathname
+        # sockets still on disk: they are orphans, never adopted.
+        self._unlink_orphan_sockets(directory)
         payload = session_state.read_json(directory / session_state.STATE_FILE_NAME)
         record = SessionRecord.from_payload(payload)
         log_records, log_last = logs.load_ring_records(
@@ -1225,14 +1478,20 @@ class SessionSupervisor:
             prompt_sha256 = hashlib.sha256(prompt_bytes).hexdigest()
             now = self._now()
             session_directory = self._config.session_root / request.session_id
-            if (
-                len(os.fsencode(session_directory / IPC_DIRECTORY / SESSION_SOCKET_FILE_NAME))
-                > AF_UNIX_SUN_PATH_MAX
+            for socket_name in (
+                SESSION_SOCKET_FILE_NAME,
+                BROKER_SOCKET_FILE_NAME,
+                process.EGRESS_SOCKET_FILE_NAME,
             ):
-                # Fail closed with an explicit reason rather than an opaque
-                # bind OSError after the session layout was created.
-                raise SecretUnavailableError(reason="session_socket_path_too_long")
+                if (
+                    len(os.fsencode(session_directory / IPC_DIRECTORY / socket_name))
+                    > AF_UNIX_SUN_PATH_MAX
+                ):
+                    # Fail closed with an explicit reason rather than an opaque
+                    # bind OSError after the session layout was created.
+                    raise SecretUnavailableError(reason="session_socket_path_too_long")
             self._create_session_layout(session_directory)
+            handle: _Session | None = None
             try:
                 self._write_bytes(session_directory / PROMPT_FILE_NAME, prompt_bytes)
                 record = SessionRecord(
@@ -1272,21 +1531,23 @@ class SessionSupervisor:
                         max_entries=self._config.event_ring_entries,
                     ),
                 )
-                self._persist(handle)
-                broker = SecretBroker(
-                    handle.socket_path,
-                    request.session_id,
-                    request.auth_secret,
-                    log=LOGGER,
-                )
-                try:
-                    broker.start()
-                except OSError as exc:
-                    raise SecretUnavailableError() from exc
-                handle.broker = broker
                 handle.secret = bytearray(request.auth_secret)
+                if profile.requires_sandbox:
+                    # A real session has no egress without its provider profile:
+                    # refuse it here, before any listener or run exists.
+                    handle.egress_profile = self._load_egress_profile(request.adapter_kind)
+                self._persist(handle)
+                # Design §6 prepare: bind the broker relay (READY refuses every
+                # call) and the provider CONNECT proxy (CONNECTs are refused
+                # until a run is recorded), then arm the first run's handoff.
+                self._start_relay(handle, adapter_kind=request.adapter_kind)
+                if handle.egress_profile is not None:
+                    self._start_egress(handle, adapter_kind=request.adapter_kind)
+                self._arm_secret(handle)
                 self._sessions[request.session_id] = handle
             except BaseException:
+                if handle is not None:
+                    self._stop_channels(handle, wipe_secret=True)
                 shutil.rmtree(session_directory, ignore_errors=True)
                 raise
             body: dict[str, object] = {
@@ -1517,10 +1778,30 @@ class SessionSupervisor:
             skills_directory=self._config.skills_root,
         )
         plan = profile.build_launch_plan(context)
+        if profile.requires_sandbox:
+            # The sandboxed shim and the trusted entrypoint's forwarder both
+            # need the pathname endpoints LIFE-1 owns; never derive them again.
+            plan = replace(plan, egress_socket_path=handle.egress_socket_path)
+        # Design §6 start order: re-arm the one-shot secret, (re)bind the
+        # session relay and egress proxy, then let ``spawn`` attest a fresh
+        # netns and only then release the CLI.  Every failure here is a typed
+        # refusal with no spawn and no state transition.
         try:
+            self._arm_secret(handle)
+            self._start_relay(handle, adapter_kind=record.adapter_kind)
+            if profile.requires_sandbox:
+                self._start_egress(handle, adapter_kind=record.adapter_kind)
+                self._require_egress_socket(handle, adapter_kind=record.adapter_kind)
+            handle.channels.mark_starting()
             managed = process.spawn(plan)
         except process.NetworkIsolationUnavailable as exc:
+            handle.channels.mark_started()
+            self._stop_channels(handle, wipe_secret=False)
             raise ConfinementUnavailableError(record.adapter_kind, reason=str(exc)) from exc
+        except BaseException:
+            handle.channels.mark_started()
+            self._stop_channels(handle, wipe_secret=False)
+            raise
         managed.run = run_number
         now = self._now()
         previous = record.state
@@ -1537,6 +1818,9 @@ class SessionSupervisor:
         record.exit = None
         record.outcome = None
         record.state = SessionState.RUNNING
+        # The run is recorded: the relay gate now authorizes this run and the
+        # egress proxy keeps accepting its provider CONNECTs.
+        handle.channels.mark_started()
         record.state_version += 1
         record.updated_at = now
         record.last_activity_at = now
@@ -1570,9 +1854,9 @@ class SessionSupervisor:
                 managed.process.wait(timeout=5)
             except Exception:
                 pass
-            process.stop_network(managed)
             process.close_pipes(managed.process)
             handle.managed = None
+            self._stop_channels(handle, wipe_secret=False)
             record.state = SessionState.FAILED
             record.outcome = "failed"
             record.updated_at = self._now()
@@ -1757,7 +2041,6 @@ class SessionSupervisor:
         record.exit = exit_record
         record.budgets_used.wall_seconds = max(0.0, time.monotonic() - handle.started_monotonic)
         handle.managed = None
-        process.stop_network(managed)
         if record.state is SessionState.INTERRUPT_REQUESTED:
             record.state = SessionState.STOPPED
             record.outcome = "interrupted"
@@ -1770,6 +2053,10 @@ class SessionSupervisor:
         else:
             record.state = SessionState.FAILED
             record.outcome = "failed"
+        # The run is over: the relay refuses (state gate) and both listeners,
+        # in-flight connections/tunnels and the one-shot secret are torn down.
+        # The in-memory secret stays for the next run's re-arm.
+        self._stop_channels(handle, wipe_secret=False)
         record.state_version += 1
         record.updated_at = now
         record.last_activity_at = now
@@ -1971,6 +2258,10 @@ class SessionSupervisor:
                     },
                 )
                 self._persist(handle)
+            # Design §6 interrupt: refuse and abort every relay request and
+            # provider tunnel; close the one-shot secret socket.  The secret
+            # bytes stay in memory so a later resume can re-arm a fresh one.
+            self._stop_channels(handle, wipe_secret=False)
             body: dict[str, object] = {
                 "state": str(SessionState.INTERRUPT_REQUESTED),
                 "signal_sent": signal_sent,
@@ -2299,14 +2590,10 @@ class SessionSupervisor:
                     managed.process.wait(timeout=5)
                 except Exception:
                     pass
-                process.stop_network(managed)
                 handle.managed = None
-            broker, handle.broker = handle.broker, None
-            if broker is not None:
-                broker.stop()
-            if handle.secret is not None:
-                handle.secret[:] = bytes(len(handle.secret))
-                handle.secret = None
+            # Close the relay/proxy listeners (unlinking both sockets), stop the
+            # one-shot handoff and wipe the in-memory secret at close.
+            self._stop_channels(handle, wipe_secret=True)
             shutil.rmtree(handle.scratch, ignore_errors=True)
             try:
                 os.unlink(handle.prompt_path)
