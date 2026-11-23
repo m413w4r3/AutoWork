@@ -131,6 +131,58 @@ def test_secret_handoff_is_single_use(session_base: Path) -> None:
         assert not socket_path.exists()
 
 
+def test_secret_is_rearmed_for_each_run(session_base: Path) -> None:
+    """BL3: a second run of the same session gets a fresh one-shot handoff.
+
+    The secret stays only in supervisor memory; each run gets its own
+    single-use socket, and consuming it never prevents a later run from
+    receiving the same secret again.
+    """
+    script = fake_script(
+        [
+            {"op": "emit", "event": {"type": "started"}},
+            {"op": "receive_secret", "attempts": 2},
+            {"op": "exit", "code": 0},
+        ]
+    )
+    with running_session_agent(session_base) as running, running.client() as client:
+        workspace_id = running.ensure_workspace(client)
+        assert _prepare(client, running, workspace_id).status_code == 200
+        write_fake_script(running, script)
+        first = post_session(client, running, f"/v1/sessions/{SESSION_ID}/start", {}, START_KEY)
+        assert first.status_code == 200, first.text
+        wait_for_state(client, running, "stopped", "failed")
+        first_received = wait_for_observation(running, "secret_received")
+        assert isinstance(first_received, dict)
+        assert first_received["sha256"] == SECRET_SHA256
+        socket_path = running.session_dir() / "ipc" / "shim.sock"
+        assert not socket_path.exists()  # the run consumed the one-shot socket
+
+        # A second run (Codex ``exec resume`` has the same shape) must find a
+        # newly armed socket even though the first one was consumed.
+        second = post_session(
+            client, running, f"/v1/sessions/{SESSION_ID}/start", {}, "m24-h1-start-0002"
+        )
+        assert second.status_code == 200, second.text
+        assert second.json()["run"] == 2
+        wait_for_state(client, running, "stopped", "failed")
+        second_received = wait_for_observation(running, "secret_received")
+        assert isinstance(second_received, dict)
+        assert second_received["sha256"] == SECRET_SHA256
+        assert not socket_path.exists()
+        status = get_session(client, running, f"/v1/sessions/{SESSION_ID}").json()
+        assert len(status["runs"]) == 2
+
+        delivered = [
+            event for event in log_events(client, running) if event.get("type") == "secret_received"
+        ]
+        assert len(delivered) == 2
+        hits = runtime_files_containing(running, SECRET_B64.encode())
+        hits += runtime_files_containing(running, SECRET_HEX.encode())
+        hits += runtime_files_containing(running, SECRET)
+        assert hits == []
+
+
 def test_responses_never_include_host_absolute_paths(session_base: Path) -> None:
     with running_session_agent(session_base) as running, running.client() as client:
         workspace_id = running.ensure_workspace(client)

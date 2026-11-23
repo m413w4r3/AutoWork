@@ -66,10 +66,34 @@ def _bwrap_prepare_gate(monkeypatch: pytest.MonkeyPatch) -> None:
     This is not a silent skip: the fake bwrap prints ``MOCKED_BWRAP_REASON`` on
     stderr (asserted in the session log by the lifecycle test) and the profile's
     injected confinement probe reports ``mocked=True`` with the same reason on
-    the capability wire.
+    the capability wire.  The network attestation is injected at the module
+    seam (the stand-in creates no namespace) while the supervisor still wires
+    the real relay and egress sockets.
     """
     monkeypatch.setattr(session_process, "bwrap_available", lambda: True)
-    monkeypatch.setattr(session_process, "slirp_available", lambda: True)
+    monkeypatch.setattr(
+        session_process,
+        "network_isolation_attestation",
+        lambda **kwargs: session_process.NetworkIsolationAttestation(
+            True, "test attestation", "isolated_egress", True
+        ),
+    )
+
+
+def _egress_profile(session_base: Path) -> Path:
+    """The real session's provider allowlist, narrowed to the Claude maximum."""
+    path = session_base / "egress-profile.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema": "autowork-session-egress.v1",
+                "profiles": {"claude": {"hosts": ["api.anthropic.com"]}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(path, 0o600)
+    return path
 
 
 def _build_supervisor(
@@ -83,23 +107,24 @@ def _build_supervisor(
         workspace_root=environment.root,
         interrupt_grace_seconds=0.2,
         watchdog_poll_seconds=0.05,
-        # The named fake bwrap cannot create namespaces or speak the
-        # --info-fd/--block-fd protocol, so this lifecycle harness uses the
-        # explicit dev override; the isolated launch has its own host oracle.
-        cli_network_mode="host_network_unsafe",
+        # Isolation is the only mode; the named fake bwrap cannot create
+        # namespaces, so the host attestation is injected above and the real
+        # relay/egress wiring still runs.
+        cli_network_mode="isolated_egress",
+        egress_profile_path=_egress_profile(session_base),
     )
     profile = ClaudeProfile(
         binary=write_fake_claude(session_base / "bin"),
         bwrap_binary=write_fake_bwrap(session_base / "bin"),
         resume_proven=resume_proven,
-        network_mode="host_network_unsafe",
+        network_mode="isolated_egress",
         confinement_probe=lambda: ConfinementProbe(
             ok=True,
             reason=MOCKED_BWRAP_REASON,
             mocked=True,
-            network_mode="host_network_unsafe",
-            loopback_isolated=False,
-            netns=False,
+            network_mode="isolated_egress",
+            loopback_isolated=True,
+            netns=True,
         ),
     )
     supervisor = SessionSupervisor(
@@ -118,7 +143,7 @@ def _prepare(supervisor: SessionSupervisor, workspace_id: str) -> dict[str, obje
                 workspace_id,
                 adapter_kind="claude",
                 session_id=SESSION_ID,
-                network_mode="host_network_unsafe",
+                network_mode="isolated_egress",
             )
         ),
         idempotency_key="m24-h5-prepare-0001",
@@ -191,8 +216,8 @@ def test_claude_session_lifecycle_stream_events_and_collect(session_base: Path) 
         assert capabilities["flags"]["streaming_stdin"] is False
         assert capabilities["flags"]["resume"] is False
         assert capabilities["confinement"]["mocked"] is True
-        assert capabilities["confinement"]["netns"] is False
-        assert capabilities["confinement"]["network_mode"] == "host_network_unsafe"
+        assert capabilities["confinement"]["netns"] is True
+        assert capabilities["confinement"]["network_mode"] == "isolated_egress"
         entries = {entry["name"]: entry for entry in capabilities["capabilities"]}
         assert entries["stream_json_live_instructions"]["proven"] is False
         assert capabilities["host_spike"]
@@ -258,7 +283,7 @@ def test_claude_session_lifecycle_stream_events_and_collect(session_base: Path) 
         assert helper["shim"]["mode"] == 0o700
         assert helper["shim"]["symlink"] is False
         assert sorted(helper["env_keys"]) == [
-            "AUTOWORK_BACKEND_URL",
+            "AUTOWORK_BROKER_SOCKET",
             "AUTOWORK_SESSION_ID",
             "AUTOWORK_SESSION_SOCKET",
         ]

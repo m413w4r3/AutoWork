@@ -50,8 +50,10 @@ PROC_STAT_STATE_FIELD = 0
 MIN_PGID = 2
 
 NETWORK_MODE_ISOLATED_EGRESS = "isolated_egress"
-NETWORK_MODE_HOST_NETWORK_UNSAFE = "host_network_unsafe"
-CLI_NETWORK_MODES = frozenset({NETWORK_MODE_ISOLATED_EGRESS, NETWORK_MODE_HOST_NETWORK_UNSAFE})
+# Isolation is the only mode (M24.1 LIFE-1).  The former
+# ``host_network_unsafe`` development override is gone: no launch may share the
+# host network, and an old environment value fails startup explicitly.
+CLI_NETWORK_MODES = frozenset({NETWORK_MODE_ISOLATED_EGRESS})
 PROBE_PYTHON = "/usr/bin/python3"
 ENTRYPOINT_FILE_NAME = "entrypoint.py"
 EGRESS_SOCKET_FILE_NAME = "egress.sock"
@@ -160,12 +162,17 @@ def assert_cli_environment_safe(env: dict[str, str]) -> None:
 
 
 def network_mode_from_environment() -> str:
-    """The closed ``AGENT_SESSIONS_CLI_NETWORK_MODE`` value (default isolated)."""
+    """The closed ``AGENT_SESSIONS_CLI_NETWORK_MODE`` value (always isolated)."""
     value = os.environ.get("AGENT_SESSIONS_CLI_NETWORK_MODE", "").strip()
     if not value:
         return NETWORK_MODE_ISOLATED_EGRESS
+    if value == "host_network_unsafe":
+        raise ValueError(
+            "AGENT_SESSIONS_CLI_NETWORK_MODE=host_network_unsafe is no longer supported: "
+            "agent CLI sessions must run in an isolated network namespace (isolated_egress)"
+        )
     if value not in CLI_NETWORK_MODES:
-        raise ValueError("AGENT_SESSIONS_CLI_NETWORK_MODE must be a closed network mode")
+        raise ValueError("AGENT_SESSIONS_CLI_NETWORK_MODE must be isolated_egress")
     return value
 
 
@@ -179,9 +186,8 @@ class LaunchPlan:
 
     ``network_mode`` is the closed R03 B1 mode: ``isolated_egress`` runs the
     sandbox in its own network namespace with only ``lo`` and the trusted
-    entrypoint's provider forwarder; ``host_network_unsafe`` is the explicit
-    development override (same host network).  Fake profiles never use bwrap
-    and are not affected.
+    entrypoint's provider forwarder.  It is the only accepted value (M24.1
+    LIFE-1); fake profiles never use bwrap and are not affected.
 
     ``egress_socket_path`` is the session's ``ipc/egress.sock``; it defaults to
     ``<ipc directory>/egress.sock`` as found in the bwrap profile, so existing
@@ -214,7 +220,7 @@ def spawn(plan: LaunchPlan) -> ManagedProcess:
     assert_cli_environment_safe(plan.env)
     if plan.network_mode not in CLI_NETWORK_MODES:
         raise NetworkIsolationUnavailable("the launch plan carries an unknown network mode")
-    if plan.uses_bwrap and plan.network_mode == NETWORK_MODE_ISOLATED_EGRESS:
+    if plan.uses_bwrap:
         return _spawn_isolated(plan)
     return _spawn_direct(plan)
 
@@ -443,9 +449,10 @@ def _managed(process: subprocess.Popen[bytes], plan: LaunchPlan, *, run: int) ->
 def stop_network(managed: ManagedProcess) -> None:
     """Compatibility no-op: the isolated profile has no auxiliary gateway.
 
-    The supervisor still calls this on every exit path (LIFE-1 removes the
-    call).  The per-run network state is the bwrap process group itself, which
-    ``killpg`` already owns.
+    The per-run network state is the bwrap process group itself, which
+    ``killpg`` already owns; the trusted entrypoint's forwarder dies with it
+    (``PR_SET_PDEATHSIG``).  The supervisor's channel teardown owns the egress
+    proxy socket instead.
     """
     del managed
 
@@ -571,18 +578,17 @@ def build_bwrap_argv(
 ) -> list[str]:
     """The reasoning-session bwrap profile (§3): namespaces, ro binds.
 
-    In ``isolated_egress`` the profile adds ``--unshare-net`` and leaves the
-    namespace with only ``lo``; ``spawn`` attests the namespace and wraps the
-    CLI with the trusted ``entrypoint.py`` (design §5).  There is no
-    slirp4netns gateway and no ``tap0``.  ``host_network_unsafe`` keeps the
-    host network and is the explicit development override (LIFE-1/CFG-1
-    delete it).  The ``fake`` profile launches directly and never uses this
-    builder. ``extra_ro_binds`` and ``extra_rw_binds`` are ``(source, target)``
-    pairs for the per-session skills exposure and private HOME, so the closed
-    profile stays the only place that decides what the model may see.
+    The profile always adds ``--unshare-net`` and leaves the namespace with only
+    ``lo``; ``spawn`` attests the namespace and wraps the CLI with the trusted
+    ``entrypoint.py`` (design §5).  There is no slirp4netns gateway, no ``tap0``
+    and no host-network fallback.  The ``fake`` profile launches directly and
+    never uses this builder. ``extra_ro_binds`` and ``extra_rw_binds`` are
+    ``(source, target)`` pairs for the per-session skills exposure and private
+    HOME, so the closed profile stays the only place that decides what the model
+    may see.
     """
     if network_mode not in CLI_NETWORK_MODES:
-        raise ValueError("network_mode must be isolated_egress or host_network_unsafe")
+        raise ValueError("network_mode must be isolated_egress")
     executable = str(bwrap if bwrap is not None else default_bwrap_binary())
     command = [
         executable,
@@ -590,9 +596,8 @@ def build_bwrap_argv(
         "--unshare-ipc",
         "--unshare-uts",
         "--die-with-parent",
+        "--unshare-net",
     ]
-    if network_mode == NETWORK_MODE_ISOLATED_EGRESS:
-        command.append("--unshare-net")
     command.extend(
         (
             # The new tmpfs root comes first: session paths may live under /tmp,
@@ -634,16 +639,6 @@ def default_bwrap_binary() -> str:
 
 def bwrap_available() -> bool:
     return Path(default_bwrap_binary()).is_file()
-
-
-def slirp_available() -> bool:
-    """Compatibility shim: slirp4netns is no longer on the production path.
-
-    The supervisor's startup check still calls this (LIFE-1 removes the call).
-    No session profile needs slirp4netns any more, so its absence is not a
-    reason to refuse a session; the real gate is the netns attestation.
-    """
-    return True
 
 
 @dataclass(frozen=True)

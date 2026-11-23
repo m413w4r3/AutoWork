@@ -202,7 +202,7 @@ class _HostLoopbackListener:
 # ---------------------------------------------------------------------------
 
 
-def test_build_bwrap_argv_unshares_net_only_in_isolated_mode(tmp_path: Path) -> None:
+def test_build_bwrap_argv_always_unshares_net(tmp_path: Path) -> None:
     dirs = _session_dirs(tmp_path)
     common = {
         "workspace_binds": (),
@@ -217,13 +217,7 @@ def test_build_bwrap_argv_unshares_net_only_in_isolated_mode(tmp_path: Path) -> 
         network_mode=process.NETWORK_MODE_ISOLATED_EGRESS,
         **common,
     )
-    unsafe = process.build_bwrap_argv(
-        ("/usr/bin/codex", "exec"),
-        network_mode=process.NETWORK_MODE_HOST_NETWORK_UNSAFE,
-        **common,
-    )
     assert "--unshare-net" in isolated
-    assert "--unshare-net" not in unsafe
     # The adapter's CLI argv stays the bwrap tail; the entrypoint wrapper is
     # added by spawn (the launch layer), not by the profile builder.
     assert isolated[-3:] == ["--", "/usr/bin/codex", "exec"]
