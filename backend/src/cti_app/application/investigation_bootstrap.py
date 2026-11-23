@@ -2130,8 +2130,14 @@ def _reason_from_result(tool_name: str, result: ToolResult) -> BootstrapReason |
     if result.status is ToolInvocationStatus.FAILED:
         if tool_name == "vt.download_sample" and result.error_code in {
             "virustotal_download_route_not_found",
-            "virustotal_download_file_not_found",
             "provider_download_route_not_found",
+        }:
+            # The acquisition adapter attributes a proxy route 404 to the route,
+            # not to the file: a broken route is not proof the sample is absent.
+            return BootstrapReason.ROUTE_UNAVAILABLE
+        if tool_name == "vt.download_sample" and result.error_code in {
+            "virustotal_download_file_not_found",
+            "provider_file_not_found",
         }:
             return BootstrapReason.NOT_FOUND
         return BootstrapReason.FAILED
