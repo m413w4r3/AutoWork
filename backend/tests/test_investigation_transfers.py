@@ -59,6 +59,7 @@ from cti_app.application.investigation_persistence import (
     InvestigationPlanRepository,
     InvestigationTaskRepository,
     ToolInvocationRepository,
+    VersionConflictError,
     WorkspaceBindingRepository,
     WorkspaceFileEventRepository,
     WorkspaceFileRevisionRepository,
@@ -71,6 +72,8 @@ from cti_app.application.investigation_tasks import TaskSessionRelease
 from cti_app.application.investigation_transfers import (
     InvestigationTransferService,
     NoteReferenceError,
+    TransferConflictError,
+    TransferInstructionInFlightError,
     TransferStaleVersionError,
     TransferTaskRequest,
     WorkspaceNoteCatalog,
@@ -138,6 +141,7 @@ from cti_app.domain.investigation import (
     ToolInvocationStatus,
 )
 from cti_app.domain.investigation_handoff import (
+    HANDOFF_MAX_TEXT_LENGTH,
     HandoffActor,
     HandoffActorKind,
     HandoffRef,
@@ -796,6 +800,63 @@ class _Harness:
         )
         return prepared.session
 
+    async def add_instruction(
+        self,
+        session: AgentSessionV1,
+        *,
+        idempotency_key: str,
+        text: str,
+        state: InstructionState = InstructionState.QUEUED,
+        delivered_text: str | None = None,
+        note_diffs: tuple[dict[str, Any], ...] = (),
+        queued_at: datetime = NOW,
+    ) -> AgentSessionInstructionV1:
+        """Store one instruction in the exact state the F3-D machine allows."""
+        delivery: dict[str, Any] = {}
+        if state is InstructionState.DELIVERING:
+            delivery = {
+                "delivery_token": uuid4(),
+                "delivery_attempts": 1,
+                "delivery_attempted_at": NOW,
+                "delivery_sha256": instruction_text_sha256(text),
+            }
+        elif state is InstructionState.DELIVERY_UNKNOWN:
+            delivery = {
+                "delivery_token": uuid4(),
+                "delivery_attempts": 1,
+                "delivery_attempted_at": NOW,
+                "delivery_unknown_at": NOW,
+                "delivery_sha256": instruction_text_sha256(text),
+            }
+        elif state in (InstructionState.DELIVERED, InstructionState.ACKNOWLEDGED):
+            delivered = text if delivered_text is None else delivered_text
+            delivery = {
+                "delivered_at": NOW,
+                "delivery_attempts": 1,
+                "delivery_mode": InstructionDeliveryMode.NEXT_RUN,
+                "delivery_sha256": instruction_text_sha256(delivered),
+                "delivery_note_diffs": note_diffs or None,
+            }
+            if state is InstructionState.ACKNOWLEDGED:
+                delivery["acknowledged_at"] = NOW
+        instruction = AgentSessionInstructionV1(
+            investigation_id=INVESTIGATION_ID,
+            task_id=session.task_id,
+            session_id=session.id,
+            idempotency_key=idempotency_key,
+            text=text,
+            text_sha256=instruction_text_sha256(text),
+            state=state,
+            created_by_kind="human",
+            created_by_id="analyst:test",
+            queued_at=queued_at,
+            created_at=queued_at,
+            updated_at=NOW,
+            **delivery,
+        )
+        stored, _created = await self.sessions.add_instruction(instruction)
+        return stored
+
     def transfer_request(
         self,
         *,
@@ -1181,6 +1242,273 @@ async def test_note_refs_must_stay_under_human_notes() -> None:
             idempotency_key="instruction-bad-ref",
             note_refs=("notes/agents/other/task.md",),
         )
+
+
+# ---------------------------------------------------------- INS-09 (F3-D D8)
+
+
+async def test_transfer_cites_pending_instructions_and_cancels_them() -> None:
+    """INS-09: the handoff carries the source queue, then resolves it (D8).
+
+    A ``queued`` instruction is cited and cancelled with the handoff identity;
+    a ``delivered`` instruction that was never acknowledged is cited as history
+    and stays delivered.  No instruction row is copied to the destination
+    session, and a replay neither cites nor cancels again.
+    """
+    harness = await _scenario_harness()
+    task = await harness.seed_task(
+        status=TaskStatus.ASSIGNED,
+        status_version=2,
+        assigned_actor_kind=TaskActorKind.OPERATOR,
+        assigned_actor_id=CODEX_ID,
+    )
+    await harness.add_revision(path=NOTE_PATH, sha256="6" * 64, observed_at=NOW)
+    codex = await harness.open_session(task)
+    queued = await harness.instruction_service.enqueue_instruction_with_notes(
+        INVESTIGATION_ID,
+        codex.id,
+        text="Check the latest human note before pivoting.",
+        actor=HUMAN,
+        idempotency_key="instruction-ins09-queued",
+        note_refs=(NOTE_PATH,),
+    )
+    prepared = await harness.notes.prepare(
+        investigation_id=INVESTIGATION_ID,
+        text="Confirm the C2 gate with the revised note.",
+        note_refs=(NOTE_PATH,),
+    )
+    await harness.add_revision(path=NOTE_PATH, sha256="7" * 64, observed_at=LATER)
+    refreshed = await harness.notes.refresh(
+        investigation_id=INVESTIGATION_ID, text=prepared.queued_text
+    )
+    assert refreshed.note_diffs
+    delivered = await harness.add_instruction(
+        codex,
+        idempotency_key="instruction-ins09-delivered",
+        text=prepared.queued_text,
+        state=InstructionState.DELIVERED,
+        delivered_text=refreshed.delivery_text,
+        note_diffs=tuple(refreshed.note_diffs),
+    )
+    request = harness.transfer_request(
+        expected_status_version=harness.task_row(task.id).status_version,
+        instruction="Continue under Claude Code.",
+        open_session=True,
+    )
+
+    result = await harness.transfers.transfer(
+        INVESTIGATION_ID,
+        task_id=task.id,
+        actor=HUMAN,
+        idempotency_key="transfer-ins09",
+        request=request,
+    )
+
+    handoff = result.handoff.handoff
+    citations = list(handoff.work.limits)
+    assert len(citations) == 2
+    by_id = {ref.id: item for item in citations for ref in item.refs}
+    assert set(by_id) == {str(queued.instruction.id), str(delivered.id)}
+    assert all(ref.kind is HandoffRefKind.INSTRUCTION for item in citations for ref in item.refs)
+    queued_item = by_id[str(queued.instruction.id)]
+    delivered_item = by_id[str(delivered.id)]
+    assert queued_item.text.startswith(
+        f"Instruction {queued.instruction.id} (queued, sha256={queued.instruction.text_sha256}) : "
+    )
+    assert queued.instruction.text in queued_item.text
+    assert delivered_item.text.startswith(
+        f"Instruction {delivered.id} "
+        f"(delivered, sha256={instruction_text_sha256(refreshed.delivery_text)}) : "
+    )
+    # The cited text is exactly what the delivery handed over (body + diff).
+    assert refreshed.delivery_text in delivered_item.text
+
+    stored_queued = await harness.sessions.get_instruction(queued.instruction.id)
+    assert stored_queued is not None
+    assert stored_queued.state is InstructionState.CANCELLED
+    assert stored_queued.cancel_reason == f"handed_off:{handoff.handoff_id}"
+    stored_delivered = await harness.sessions.get_instruction(delivered.id)
+    assert stored_delivered is not None
+    assert stored_delivered.state is InstructionState.DELIVERED
+    assert stored_delivered.cancel_reason is None
+
+    assert result.session is not None
+    assert result.session.adapter_kind is OperatorAdapterKind.CLAUDE_CODE
+    assert await harness.sessions.list_instructions(result.session.id) == ()
+    rows = await harness.handoffs.list_for_investigation(INVESTIGATION_ID, task_id=task.id)
+    # ``open_session`` seeded version 1 for the Codex session; the transfer appends 2.
+    assert [record.handoff.version for record in rows] == [1, 2]
+    assert rows[-1].handoff.handoff_id == handoff.handoff_id
+
+    replay = await harness.transfers.transfer(
+        INVESTIGATION_ID,
+        task_id=task.id,
+        actor=HUMAN,
+        idempotency_key="transfer-ins09",
+        request=request,
+    )
+    assert replay.replayed is True
+    assert replay.handoff.handoff.handoff_id == handoff.handoff_id
+    assert replay.handoff.handoff.work == handoff.work
+    rows = await harness.handoffs.list_for_investigation(INVESTIGATION_ID, task_id=task.id)
+    assert [record.handoff.version for record in rows] == [1, 2]
+    replayed_queued = await harness.sessions.get_instruction(queued.instruction.id)
+    assert replayed_queued is not None
+    assert replayed_queued.state is InstructionState.CANCELLED
+    assert replayed_queued.cancel_reason == f"handed_off:{handoff.handoff_id}"
+    replayed_delivered = await harness.sessions.get_instruction(delivered.id)
+    assert replayed_delivered is not None
+    assert replayed_delivered.state is InstructionState.DELIVERED
+
+
+async def test_transfer_refuses_while_an_instruction_delivery_is_in_flight() -> None:
+    """F3-D §3.5: a transfer never cancels a possible in-flight delivery."""
+    harness = await _scenario_harness()
+    task = await harness.seed_task(
+        status=TaskStatus.ASSIGNED,
+        status_version=2,
+        assigned_actor_kind=TaskActorKind.OPERATOR,
+        assigned_actor_id=CODEX_ID,
+    )
+    codex = await harness.open_session(task)
+    task_before = harness.task_row(task.id)
+    before = {
+        record.handoff.handoff_id
+        for record in await harness.handoffs.list_for_investigation(
+            INVESTIGATION_ID, task_id=task.id
+        )
+    }
+    delivering = await harness.add_instruction(
+        codex,
+        idempotency_key="instruction-ins09-delivering",
+        text="An attempt is already reserved.",
+        state=InstructionState.DELIVERING,
+    )
+
+    with pytest.raises(TransferInstructionInFlightError) as refusal:
+        await harness.transfers.transfer(
+            INVESTIGATION_ID,
+            task_id=task.id,
+            actor=HUMAN,
+            idempotency_key="transfer-ins09-in-flight",
+            request=harness.transfer_request(
+                expected_status_version=harness.task_row(task.id).status_version
+            ),
+        )
+
+    assert refusal.value.status_code == 409
+    assert refusal.value.details["instruction_id"] == str(delivering.id)
+    after = {
+        record.handoff.handoff_id
+        for record in await harness.handoffs.list_for_investigation(
+            INVESTIGATION_ID, task_id=task.id
+        )
+    }
+    assert after == before
+    stored = await harness.sessions.get_instruction(delivering.id)
+    assert stored is not None and stored.state is InstructionState.DELIVERING
+    task_row = harness.task_row(task.id)
+    assert task_row.status is task_before.status
+    assert task_row.assigned_actor_id == task_before.assigned_actor_id
+    assert task_row.status_version == task_before.status_version
+    # The preflight refuses before any workspace sync or session teardown.
+    assert harness.workspace.calls == []
+    assert harness.session_row(codex.id).state is AgentSessionState.RUNNING
+
+
+async def test_replayed_transfer_resumes_the_cancellation_it_missed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash between the handoff commit and the cancellation heals on replay."""
+    harness = await _scenario_harness()
+    task = await harness.seed_task(
+        status=TaskStatus.ASSIGNED,
+        status_version=2,
+        assigned_actor_kind=TaskActorKind.OPERATOR,
+        assigned_actor_id=CODEX_ID,
+    )
+    queued = await harness.add_instruction(
+        await harness.open_session(task),
+        idempotency_key="instruction-ins09-resume",
+        text="Read the note before the next pivot.",
+    )
+    original = harness.sessions.cancel_instruction
+    attempts = {"count": 0}
+
+    async def flaky_cancel(*args: Any, **kwargs: Any) -> AgentSessionInstructionV1:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise VersionConflictError("a concurrent drainer changed the row")
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(harness.sessions, "cancel_instruction", flaky_cancel)
+    request = harness.transfer_request(
+        expected_status_version=harness.task_row(task.id).status_version
+    )
+
+    with pytest.raises(TransferConflictError):
+        await harness.transfers.transfer(
+            INVESTIGATION_ID,
+            task_id=task.id,
+            actor=HUMAN,
+            idempotency_key="transfer-ins09-resume",
+            request=request,
+        )
+    rows = await harness.handoffs.list_for_investigation(INVESTIGATION_ID, task_id=task.id)
+    assert [record.handoff.version for record in rows] == [1, 2]
+    still_queued = await harness.sessions.get_instruction(queued.id)
+    assert still_queued is not None and still_queued.state is InstructionState.QUEUED
+
+    replay = await harness.transfers.transfer(
+        INVESTIGATION_ID,
+        task_id=task.id,
+        actor=HUMAN,
+        idempotency_key="transfer-ins09-resume",
+        request=request,
+    )
+    assert replay.replayed is True
+    assert attempts["count"] == 2
+    healed = await harness.sessions.get_instruction(queued.id)
+    assert healed is not None
+    assert healed.state is InstructionState.CANCELLED
+    assert healed.cancel_reason == f"handed_off:{replay.handoff.handoff.handoff_id}"
+
+
+async def test_instruction_citation_is_bounded_in_the_handoff() -> None:
+    """A long instruction is cited once, truncated to the handoff text bound."""
+    harness = await _scenario_harness()
+    task = await harness.seed_task(
+        status=TaskStatus.ASSIGNED,
+        status_version=2,
+        assigned_actor_kind=TaskActorKind.OPERATOR,
+        assigned_actor_id=CODEX_ID,
+    )
+    long_text = "Pivot note: " + "A" * 20_000
+    queued = await harness.add_instruction(
+        await harness.open_session(task),
+        idempotency_key="instruction-ins09-long",
+        text=long_text,
+    )
+    assert len(long_text) > HANDOFF_MAX_TEXT_LENGTH
+
+    result = await harness.transfers.transfer(
+        INVESTIGATION_ID,
+        task_id=task.id,
+        actor=HUMAN,
+        idempotency_key="transfer-ins09-long",
+        request=harness.transfer_request(
+            expected_status_version=harness.task_row(task.id).status_version
+        ),
+    )
+
+    citations = list(result.handoff.handoff.work.limits)
+    assert len(citations) == 1
+    citation = citations[0]
+    assert citation.refs[0].kind is HandoffRefKind.INSTRUCTION
+    assert citation.refs[0].id == str(queued.id)
+    assert len(citation.text) <= HANDOFF_MAX_TEXT_LENGTH
+    assert citation.text.endswith("[… texte tronqué]")
+    assert (await harness.sessions.get_instruction(queued.id)).state is (InstructionState.CANCELLED)
 
 
 # --------------------------------------------------------------------- D08

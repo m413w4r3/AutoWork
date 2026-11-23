@@ -44,6 +44,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from cti_app.application.identity import is_human_actor_id
 from cti_app.application.investigation_persistence import (
+    AgentSessionRepository,
     EvidenceObservationRepository,
     FindingRepository,
     HandoffRecord,
@@ -61,6 +62,7 @@ from cti_app.application.persistence import (
     AnalystInvestigationRepository,
 )
 from cti_app.application.workspace_agent import WorkspaceFileRevisionV1
+from cti_app.domain.agentic_operator import AgentSessionInstructionV1
 from cti_app.domain.editorial import AnalystDecision
 from cti_app.domain.investigation import (
     EvidenceObservation,
@@ -191,6 +193,7 @@ class HandoffUnitOfWork(Protocol):
     investigation_plans: InvestigationPlanRepository
     workspace_bindings: WorkspaceBindingRepository
     workspace_file_revisions: WorkspaceFileRevisionRepository
+    agent_sessions: AgentSessionRepository
 
     async def __aenter__(self) -> Self: ...
 
@@ -359,7 +362,7 @@ class InvestigationHandoffService:
             resolver = _RefResolver(uow, investigation_id)
             resolved = await self._resolve_refs(resolver, request)
             files = await self._resolve_files(resolver, request.file_revision_ids)
-            await self._verify_work_refs(resolver, request.work)
+            await self._verify_work_refs(resolver, request.work, task.id)
             freshness = self._freshness_refs(resolved, files)
             try:
                 handoff = InvestigationHandoffV1(
@@ -586,10 +589,10 @@ class InvestigationHandoffService:
         return tuple(files)
 
     @staticmethod
-    async def _verify_work_refs(resolver: _RefResolver, work: HandoffWork) -> None:
+    async def _verify_work_refs(resolver: _RefResolver, work: HandoffWork, task_id: UUID) -> None:
         for item in _work_items(work):
             for ref in item.refs:
-                await _resolve_work_ref(resolver, ref)
+                await _resolve_work_ref(resolver, ref, task_id)
 
     @staticmethod
     def _freshness_refs(
@@ -766,7 +769,7 @@ def _work_items(work: HandoffWork) -> tuple[HandoffWorkItem, ...]:
     )
 
 
-async def _resolve_work_ref(resolver: _RefResolver, ref: HandoffRef) -> None:
+async def _resolve_work_ref(resolver: _RefResolver, ref: HandoffRef, task_id: UUID) -> None:
     if ref.kind is HandoffRefKind.FILE:
         await resolver.file(ref.id)
         return
@@ -784,6 +787,8 @@ async def _resolve_work_ref(resolver: _RefResolver, ref: HandoffRef) -> None:
         await resolver.decision(identifier)
     elif ref.kind is HandoffRefKind.CONSULTATION:
         await resolver.consultation(identifier)
+    elif ref.kind is HandoffRefKind.INSTRUCTION:
+        await resolver.instruction(identifier, task_id)
     else:  # pragma: no cover - the enum is closed
         raise HandoffRefUnresolvedError(f"unsupported work reference {ref.kind.value}")
 
@@ -876,6 +881,7 @@ class _RefResolver:
         self._findings: dict[UUID, InvestigationFinding] = {}
         self._decisions: dict[UUID, AnalystDecision] | None = None
         self._invocations: dict[UUID, ToolInvocation] = {}
+        self._instructions: dict[UUID, AgentSessionInstructionV1] = {}
         self._workspace_id: str | None = None
         self._workspace_loaded = False
         self._revisions: dict[str, WorkspaceFileRevisionV1] = {}
@@ -953,6 +959,22 @@ class _RefResolver:
                 f"consultation {invocation_id} has no single persisted advisor response"
             )
         return invocation, consultation_type, output_sha256
+
+    async def instruction(self, instruction_id: UUID, task_id: UUID) -> AgentSessionInstructionV1:
+        """A cited session instruction must belong to this task and investigation."""
+        instruction = self._instructions.get(instruction_id)
+        if instruction is None:
+            instruction = await self._uow.agent_sessions.get_instruction(instruction_id)
+            if instruction is None:
+                raise HandoffRefUnresolvedError(f"instruction {instruction_id} does not exist")
+            self._instructions[instruction_id] = instruction
+        if instruction.investigation_id != self._investigation_id:
+            raise HandoffRefUnresolvedError(
+                f"instruction {instruction_id} belongs to another investigation"
+            )
+        if instruction.task_id != task_id:
+            raise HandoffRefUnresolvedError(f"instruction {instruction_id} belongs to another task")
+        return instruction
 
     async def file(self, revision_id: str) -> WorkspaceFileRevisionV1:
         revision = self._revisions.get(revision_id)

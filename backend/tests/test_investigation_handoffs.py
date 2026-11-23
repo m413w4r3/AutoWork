@@ -30,8 +30,10 @@ from cti_app.application.investigation_handoffs import (
     assert_startable,
 )
 from cti_app.application.investigation_persistence import (
+    AgentSessionRepository,
     EvidenceObservationRepository,
     FindingRepository,
+    InMemoryAgentSessionRepository,
     InMemoryEvidenceObservationRepository,
     InMemoryFindingRepository,
     InMemoryInvestigationHandoffRepository,
@@ -139,6 +141,7 @@ class _FakeUnitOfWork:
         self.investigation_plans: InvestigationPlanRepository = harness.plans
         self.workspace_bindings: WorkspaceBindingRepository = harness.bindings
         self.workspace_file_revisions: WorkspaceFileRevisionRepository = harness.revisions
+        self.agent_sessions: AgentSessionRepository = harness.sessions
 
     async def __aenter__(self) -> _FakeUnitOfWork:
         return self
@@ -160,6 +163,7 @@ class _Harness:
         self.plans = InMemoryInvestigationPlanRepository()
         self.bindings = InMemoryWorkspaceBindingRepository()
         self.revisions = InMemoryWorkspaceFileRevisionRepository()
+        self.sessions = InMemoryAgentSessionRepository()
         self.decisions = _DecisionRepository()
         self.investigations = _InvestigationRepository(INVESTIGATION_ID)
         self.uow = _FakeUnitOfWork(self)
@@ -621,6 +625,84 @@ async def test_work_item_refs_are_verified() -> None:
                 )
             ),
         )
+
+
+async def test_instruction_work_ref_must_belong_to_the_handoff_task() -> None:
+    """F3-D D8: an instruction is a verifiable, task-bound work reference."""
+    from cti_app.application.investigation_handoffs import HandoffRefUnresolvedError
+    from cti_app.domain.agentic_operator import InstructionState
+    from cti_app.domain.investigation_handoff import HandoffRef, HandoffRefKind
+
+    harness = _Harness()
+    task = await harness.seed_task()
+    text = "Carry this unconsumed instruction into the next session."
+    instruction = await _instruction(harness, task.id, text=text, state=InstructionState.QUEUED)
+    record = await harness.service.create(
+        INVESTIGATION_ID,
+        actor=HUMAN_ACTOR,
+        idempotency_key="work-ref-instruction",
+        request=harness.request(
+            work=HandoffWork(
+                limits=(
+                    HandoffWorkItem(
+                        text="An instruction was never consumed.",
+                        refs=(HandoffRef(kind=HandoffRefKind.INSTRUCTION, id=str(instruction.id)),),
+                    ),
+                )
+            )
+        ),
+    )
+    assert record.handoff.work.limits[0].refs[0].kind is HandoffRefKind.INSTRUCTION
+    assert record.handoff.work.limits[0].refs[0].id == str(instruction.id)
+
+    other = await harness.seed_task(id=uuid4(), task_key="lead-other")
+    foreign = await _instruction(harness, other.id, text=text, state=InstructionState.QUEUED)
+    for key, ref_id in (
+        ("work-ref-instruction-other-task", foreign.id),
+        ("work-ref-missing", uuid4()),
+    ):
+        with pytest.raises(HandoffRefUnresolvedError):
+            await harness.service.create(
+                INVESTIGATION_ID,
+                actor=HUMAN_ACTOR,
+                idempotency_key=key,
+                request=harness.request(
+                    task_id=task.id,
+                    work=HandoffWork(
+                        limits=(
+                            HandoffWorkItem(
+                                text="An instruction was never consumed.",
+                                refs=(HandoffRef(kind=HandoffRefKind.INSTRUCTION, id=str(ref_id)),),
+                            ),
+                        )
+                    ),
+                ),
+            )
+
+
+async def _instruction(harness: _Harness, task_id: UUID, *, text: str, state: Any) -> Any:
+    """Store one instruction row without a session (the ref check reads it by id)."""
+    from cti_app.domain.agentic_operator import (
+        AgentSessionInstructionV1,
+        instruction_text_sha256,
+    )
+
+    instruction = AgentSessionInstructionV1(
+        investigation_id=INVESTIGATION_ID,
+        task_id=task_id,
+        session_id=uuid4(),
+        idempotency_key=f"instruction-{uuid4()}",
+        text=text,
+        text_sha256=instruction_text_sha256(text),
+        state=state,
+        created_by_kind="human",
+        created_by_id="analyst:test",
+        queued_at=NOW,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    await harness.sessions.add_instruction(instruction)
+    return instruction
 
 
 async def test_operator_handoff_requires_task_ownership() -> None:
