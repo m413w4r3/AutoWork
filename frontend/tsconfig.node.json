@@ -20,6 +20,7 @@
     "playwright.config.ts",
     "playwright.real.config.ts",
     "playwright.editorial.config.ts",
+    "playwright.investigation.config.ts",
     "e2e",
     "e2e-real"
   ]
