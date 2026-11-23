@@ -630,6 +630,56 @@ _SUPERVISED_NPROC_HEADROOM = 64
 _SUPERVISOR_MODULE = "cti_app.infrastructure.confined_supervisor"
 
 
+def _supervisor_bootstrap() -> str | None:
+    """Isolated ``-c`` launcher that pins the parent's own ``cti_app`` root.
+
+    ``-I`` keeps ``PYTHONPATH``, the working directory and the user site out
+    of the trusted supervisor, which is why it is used.  ``-m`` would then
+    resolve ``cti_app`` from whatever that interpreter has installed, not
+    necessarily the tree this process runs: a source checkout behind
+    ``PYTHONPATH``, a source-mounted container, or an image whose baked copy
+    predates the running code would spawn a different, possibly stale module,
+    so the probe would attest code that cannot run.  Pinning the package root
+    the parent itself imported keeps the launch on the same code while the
+    rest of ``-I`` still applies.  ``None`` means the root is unknowable and
+    the caller falls back to ``-m``.
+    """
+    module = sys.modules.get("cti_app")
+    if module is None:
+        return None
+    roots: list[Path] = []
+    origin = getattr(module, "__file__", None)
+    if isinstance(origin, str) and origin:
+        roots.append(Path(origin).resolve().parent.parent)
+    spec = getattr(module, "__spec__", None)
+    for location in getattr(spec, "submodule_search_locations", None) or ():
+        roots.append(Path(location).resolve().parent)
+    for root in roots:
+        if (root / "cti_app" / "infrastructure" / "confined_supervisor.py").is_file():
+            return (
+                "import sys; "
+                f"sys.path.insert(0, {str(root)!r}); "
+                "from cti_app.infrastructure.confined_supervisor import main; "
+                "raise SystemExit(main())"
+            )
+    return None
+
+
+def _supervisor_argv(config_path: Path | str, status_fd: int) -> list[str]:
+    """Argv that starts the trusted supervisor against the same package tree."""
+    bootstrap = _supervisor_bootstrap()
+    if bootstrap is None:
+        return [
+            sys.executable,
+            "-I",
+            "-m",
+            _SUPERVISOR_MODULE,
+            str(config_path),
+            str(status_fd),
+        ]
+    return [sys.executable, "-I", "-c", bootstrap, str(config_path), str(status_fd)]
+
+
 def runtime_read_directories() -> tuple[Path, ...]:
     """Read-only roots a confined script interpreter needs on this host."""
     candidates = [
@@ -745,12 +795,7 @@ async def _run_supervised_subprocess(
         status_read, status_write = os.pipe()
         try:
             process = await asyncio.create_subprocess_exec(
-                sys.executable,
-                "-I",
-                "-m",
-                _SUPERVISOR_MODULE,
-                str(config_path),
-                str(status_write),
+                *_supervisor_argv(config_path, status_write),
                 cwd=root,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
@@ -1315,14 +1360,7 @@ def probe_confined_script_execution(
         status_read, status_write = os.pipe()
         try:
             process = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-I",
-                    "-m",
-                    _SUPERVISOR_MODULE,
-                    str(config_path),
-                    str(status_write),
-                ],
+                _supervisor_argv(config_path, status_write),
                 cwd=root,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
@@ -1358,7 +1396,15 @@ def probe_confined_script_execution(
             os.close(status_read)
     result_record = next((record for record in records if record.get("event") == "result"), None)
     if result_record is None:
-        return ConfinementProbeResult(False, "probe_supervisor_status_missing")
+        # The supervisor exited without its status record (an import failure in
+        # a mismatched tree, a refused prctl, ...).  Surface the return code and
+        # a bounded stderr tail so the refusal names its cause instead of the
+        # bare "missing" that hides it.
+        detail = f"probe_supervisor_status_missing:rc={process.returncode}"
+        stderr_text = stderr_bytes.decode("utf-8", "replace").strip()
+        if stderr_text:
+            detail = f"{detail}:stderr={stderr_text[-240:]}"
+        return ConfinementProbeResult(False, detail)
     confinement_error = result_record.get("confinement_error")
     if isinstance(confinement_error, str) and confinement_error:
         return ConfinementProbeResult(False, confinement_error)
