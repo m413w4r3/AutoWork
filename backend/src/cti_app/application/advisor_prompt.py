@@ -33,6 +33,12 @@ def render_advisor_prompt(
         "Répondre en français courant. La prose libre est le résultat principal.",
         "Réserver les blocs de code clôturés au code proposé; ne pas forcer un format de sortie.",
     ]
+    if isinstance(data.get("task_context"), Mapping):
+        lines.append(
+            "CONTEXTE DE TÂCHE : les identifiants, références et contributions de la tâche "
+            "situent la demande ; ce contexte n'est pas une preuve et ne doit pas être "
+            "présenté comme un fait mesuré."
+        )
     targets = data.get("units")
     if not isinstance(targets, (list, tuple)):
         legacy_target = data.get("review_text")

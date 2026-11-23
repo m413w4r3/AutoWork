@@ -26,6 +26,7 @@ from cti_app.application.investigation_persistence import (
     InMemoryInvestigationPlanRepository,
     InMemoryInvestigationTaskRepository,
     InMemoryToolInvocationRepository,
+    InMemoryWorkContributionRepository,
 )
 from cti_app.application.investigation_plan_materialization import plan_task_key
 from cti_app.application.investigation_plans import InvestigationPlanService
@@ -49,7 +50,14 @@ from cti_app.domain.investigation_plan import (
     InvestigationPlanV1,
     PlanParseStatus,
 )
-from cti_app.domain.investigation_task import TaskActorKind, TaskStatus
+from cti_app.domain.investigation_task import (
+    InvestigationTaskV1,
+    ResultVerificationStatus,
+    TaskActor,
+    TaskActorKind,
+    TaskPriority,
+    TaskStatus,
+)
 
 NOW = datetime(2026, 11, 22, 12, 0, tzinfo=UTC)
 INVESTIGATION_ID = UUID("00000000-0000-0000-0000-000000000601")
@@ -114,6 +122,7 @@ class _Store:
         self.observations = InMemoryEvidenceObservationRepository()
         self.plans = InMemoryInvestigationPlanRepository()
         self.tasks = InMemoryInvestigationTaskRepository()
+        self.contributions = InMemoryWorkContributionRepository()
         self.decisions = _Decisions()
         self.artifacts = _PayloadStore()
 
@@ -128,6 +137,7 @@ class _Uow:
         self.evidence_observations = store.observations
         self.investigation_plans = store.plans
         self.investigation_tasks = store.tasks
+        self.work_contributions = store.contributions
         self.analyst_decisions = store.decisions
 
     async def __aenter__(self):
@@ -149,6 +159,7 @@ async def _seed_advisor_exchange(
     actor_kind: ToolInvocationActorKind | None = None,
     actor_id: str | None = None,
     task_id: UUID | None = None,
+    context_task_id: UUID | None = None,
 ) -> tuple[ToolInvocation, EvidenceObservation]:
     call_id = uuid4()
     response_id = uuid4()
@@ -210,6 +221,7 @@ async def _seed_advisor_exchange(
         actor_kind=actor_kind,
         actor_id=actor_id if actor_kind is not None else None,
         task_id=task_id,
+        context_task_id=context_task_id,
         created_at=NOW,
         updated_at=NOW,
     )
@@ -272,6 +284,7 @@ class _AdvisorInvocationService:
             text=REQUEST_PLAN_TEXT,
             actor_kind=kwargs.get("requester_actor_kind"),
             actor_id=kwargs.get("actor_id"),
+            context_task_id=kwargs.get("context_task_id"),
         )
         self._by_key[idempotency_key] = invocation
         return OperatorToolInvocationResult(
@@ -385,6 +398,70 @@ def test_human_plan_request_uses_advisor_service_and_idempotency() -> None:
     assert replay.json()["idempotent_replay"] is True
     versions = asyncio.run(store.plans.list_for_investigation(INVESTIGATION_ID))
     assert [version.version for version in versions] == [1]
+
+
+def _seed_context_task(store: _Store) -> InvestigationTaskV1:
+    task = InvestigationTaskV1(
+        id=uuid4(),
+        investigation_id=INVESTIGATION_ID,
+        task_key="lead-context",
+        title="Analyser le chargeur",
+        question="Quel chargeur produit le second étage ?",
+        objective="Confirmer la chaîne d'infection depuis les octets observés.",
+        priority=TaskPriority.HIGH,
+        status=TaskStatus.READY,
+        status_version=1,
+        result_verification_status=ResultVerificationStatus.UNVERIFIED,
+        created_by=TaskActor(kind=TaskActorKind.SYSTEM, actor_id="plan_accept:test"),
+        claim_refs=("S1P1",),
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    asyncio.run(store.tasks.add(task))
+    return task
+
+
+def test_plan_request_with_context_task_links_invocation() -> None:
+    client, store, factory = _client()
+    _seed_bootstrap_snapshot(store)
+    task = _seed_context_task(store)
+    path = f"/api/investigations/{INVESTIGATION_ID}/plans/request"
+
+    response = client.post(
+        path,
+        json={"expected_version": 1, "context_task_id": str(task.id)},
+        headers={"Idempotency-Key": "plan-task-context"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["plan_version_id"] is not None
+    call = factory.invocations.calls[0]
+    assert call["context_task_id"] == task.id
+    assert call["requester_actor_kind"] is ToolInvocationActorKind.HUMAN
+    assert call["arguments"]["task_context"]["task_id"] == str(task.id)
+    assert call["arguments"]["task_context"]["task_key"] == task.task_key
+    invocation = asyncio.run(store.invocations.get(UUID(response.json()["invocation_id"])))
+    assert invocation is not None
+    assert invocation.context_task_id == task.id
+    assert invocation.task_id is None and invocation.agent_session_id is None
+
+    filtered = client.get(f"/api/investigations/{INVESTIGATION_ID}/consultations?task_id={task.id}")
+    assert filtered.status_code == 200, filtered.text
+    entries = filtered.json()["consultations"]
+    assert [entry["context_task_id"] for entry in entries] == [str(task.id)]
+    absent = client.get(f"/api/investigations/{INVESTIGATION_ID}/consultations?task_id={uuid4()}")
+    assert absent.status_code == 200, absent.text
+    assert absent.json()["consultations"] == []
+
+    # An unknown task is refused before any advisor call.
+    refused = client.post(
+        path,
+        json={"expected_version": 1, "context_task_id": str(uuid4())},
+        headers={"Idempotency-Key": "plan-task-unknown"},
+    )
+    assert refused.status_code == 404, refused.text
+    assert refused.json()["detail"]["code"] == "task_not_found"
+    assert len(factory.invocations.calls) == 1
 
 
 def test_plan_accept_materializes_tasks_once() -> None:

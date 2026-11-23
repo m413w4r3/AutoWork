@@ -955,6 +955,7 @@ class _FakeInvocationService:
             requester_actor_kind=kwargs["requester_actor_kind"],
             idempotency_key=idempotency_key,
             purpose=kwargs["purpose"],
+            context_task_id=kwargs.get("context_task_id"),
         )
         async with self.fixture.uow_factory() as uow:
             outcome = await self.advisor.request_draft(uow, request)
@@ -1032,6 +1033,28 @@ def _request_body(**overrides: Any) -> dict[str, Any]:
     }
     body.update(overrides)
     return body
+
+
+def test_task_drafting_links_context_task() -> None:
+    """F4-D B3: a note requested for a task links its advisor invocation."""
+    fixture = _Fixture()
+    advisor = fixture.advisor(text="Texte rédigé pour la tâche.")
+    client, invocation_service = _api(fixture, advisor)
+    task_id = uuid4()
+    path = f"/api/investigations/{fixture.investigation.id}/note-proposals"
+
+    response = client.post(
+        path,
+        json=_request_body(task_id=str(task_id)),
+        headers={"Idempotency-Key": "api-task-drafting-1"},
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["proposal"]["task_id"] == str(task_id)
+    assert invocation_service.calls[0]["tool_name"] == "advisor.consult"
+    assert invocation_service.calls[0]["context_task_id"] == task_id
+    assert advisor.requests[0].context_task_id == task_id
 
 
 def test_api_request_ingest_diff_accept_chain() -> None:

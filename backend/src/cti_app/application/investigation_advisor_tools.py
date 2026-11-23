@@ -83,6 +83,7 @@ from cti_app.application.investigation_tools import (
     _authorize_framework_refusal_proof_adapter,
     validate_json_schema,
 )
+from cti_app.application.operator_tool_invocation import _require_safe_operator_payload
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.publication_secret_guard import (
     JsonPathKey,
@@ -276,6 +277,543 @@ def _valid_optional_advisor_field(field: str, value: object) -> bool:
     if field == "block_type":
         return isinstance(value, str) and value in {item.value for item in OpinionBlockType}
     return True
+
+
+# F4-D B2: a human consultation may carry the context of *its own* task.
+# The field is ids, hashes and bounded titles only -- never a second free-form
+# dossier -- and it is described to Bridge as non-evidence.
+MAX_TASK_CONTEXT_TEXT_CHARS = 2_000
+MAX_TASK_CONTEXT_LABEL_CHARS = 256
+MAX_TASK_CONTEXT_REF_CHARS = 256
+MAX_TASK_CONTEXT_REFS = 64
+MAX_TASK_CONTEXT_RESULT_REFS = 32
+MAX_TASK_CONTEXT_CONTRIBUTIONS = 32
+_MAX_TASK_CONTEXT_RESULT_VALUE_CHARS = 512
+_MAX_TASK_CONTEXT_RELPATH_CHARS = 512
+_TASK_CONTEXT_FIELDS = frozenset(
+    {
+        "investigation_id",
+        "task_id",
+        "task_key",
+        "title",
+        "question",
+        "objective",
+        "status",
+        "priority",
+        "claim_refs",
+        "evidence_refs",
+        "sample_refs",
+        "expected_outputs",
+        "result_refs",
+        "assigned_actor",
+        "human_contributions",
+        "previous_consultation",
+        "editorial_anchor",
+    }
+)
+_TASK_CONTEXT_LABEL_FIELDS = ("task_key", "title", "status", "priority")
+_TASK_CONTEXT_TEXT_FIELDS = ("question", "objective")
+_TASK_CONTEXT_REF_FIELDS = ("claim_refs", "evidence_refs", "sample_refs", "expected_outputs")
+_TASK_CONTEXT_CONTRIBUTION_FIELDS = (
+    "id",
+    "category",
+    "file_relpath",
+    "file_sha256",
+    "origin",
+    "import_status",
+)
+_TASK_CONTEXT_PREVIOUS_FIELDS = ("invocation_id", "type", "output_sha256", "parse_status")
+_TASK_CONTEXT_ANCHOR = re.compile(r"[a-z][a-z0-9:_-]{0,127}")
+_TASK_CONTEXT_SHA256 = re.compile(r"[0-9a-f]{64}")
+_TASK_CONTEXT_RESULT_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,63}")
+
+
+def _task_context_warning(
+    warnings: list[dict[str, str]],
+    field: str,
+    code: str,
+    detail_safe: str,
+) -> None:
+    warning = {
+        "field": f"task_context.{_safe_ignored_advisor_field(field)}",
+        "code": code,
+        "detail_safe": detail_safe,
+    }
+    if warning not in warnings:
+        warnings.append(warning)
+
+
+def _task_context_safe_text(
+    value: object,
+    *,
+    field: str,
+    limit: int,
+    warnings: list[dict[str, str]],
+    allow_empty: bool = False,
+) -> str | None:
+    """One bounded, credential-free task-context text field."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or (not allow_empty and not value.strip()):
+        _task_context_warning(
+            warnings,
+            field,
+            "task_context_field_invalid",
+            "A task-context text field was malformed and was omitted.",
+        )
+        return None
+    try:
+        _require_safe_operator_payload(value)
+    except ValueError:
+        _task_context_warning(
+            warnings,
+            field,
+            "task_context_field_omitted_sensitive",
+            "A task-context field contained credential-like material and was omitted.",
+        )
+        return None
+    text = _truncate_context_text(value, limit)
+    if len(value.strip()) > limit:
+        _task_context_warning(
+            warnings,
+            field,
+            "task_context_field_truncated",
+            "A task-context field exceeded its bounded length and was shortened.",
+        )
+    return text
+
+
+def _task_context_hash(value: object, *, field: str, warnings: list[dict[str, str]]) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or _TASK_CONTEXT_SHA256.fullmatch(value) is None:
+        _task_context_warning(
+            warnings,
+            field,
+            "task_context_field_invalid",
+            "A task-context hash was malformed and was omitted.",
+        )
+        return None
+    return value
+
+
+def _task_context_reference_list(
+    value: object, *, field: str, warnings: list[dict[str, str]]
+) -> list[str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        _task_context_warning(
+            warnings,
+            field,
+            "task_context_field_invalid",
+            "A task-context reference list was malformed and was omitted.",
+        )
+        return None
+    references: list[str] = []
+    for index, item in enumerate(value):
+        if index >= MAX_TASK_CONTEXT_REFS:
+            _task_context_warning(
+                warnings,
+                field,
+                "task_context_list_truncated",
+                "A task-context reference list exceeded its bounded length.",
+            )
+            break
+        text = str(item).strip() if isinstance(item, (str, UUID)) else ""
+        if not text:
+            _task_context_warning(
+                warnings,
+                field,
+                "task_context_reference_invalid",
+                "A task-context reference was malformed and was omitted.",
+            )
+            continue
+        try:
+            _require_safe_operator_payload(text)
+        except ValueError:
+            _task_context_warning(
+                warnings,
+                field,
+                "task_context_field_omitted_sensitive",
+                "A task-context reference contained credential-like material and was omitted.",
+            )
+            continue
+        text = _truncate_context_text(text, MAX_TASK_CONTEXT_REF_CHARS)
+        if text not in references:
+            references.append(text)
+    return references
+
+
+def _task_context_result_refs(
+    value: object, *, warnings: list[dict[str, str]]
+) -> list[dict[str, Any]] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        _task_context_warning(
+            warnings,
+            "result_refs",
+            "task_context_field_invalid",
+            "The task result references were malformed and were omitted.",
+        )
+        return None
+    rows: list[dict[str, Any]] = []
+    for index, item in enumerate(value):
+        if index >= MAX_TASK_CONTEXT_RESULT_REFS:
+            _task_context_warning(
+                warnings,
+                "result_refs",
+                "task_context_list_truncated",
+                "The task result references exceeded their bounded length.",
+            )
+            break
+        if not isinstance(item, Mapping):
+            _task_context_warning(
+                warnings,
+                "result_refs",
+                "task_context_reference_invalid",
+                "A task result reference was malformed and was omitted.",
+            )
+            continue
+        row: dict[str, Any] = {}
+        for key, raw in item.items():
+            if not isinstance(key, str) or _TASK_CONTEXT_RESULT_KEY.fullmatch(key) is None:
+                _task_context_warning(
+                    warnings,
+                    "result_refs",
+                    "task_context_field_omitted",
+                    "A task result reference field was unsupported and was omitted.",
+                )
+                continue
+            if isinstance(raw, str):
+                try:
+                    _require_safe_operator_payload({key: raw})
+                except ValueError:
+                    _task_context_warning(
+                        warnings,
+                        f"result_refs.{key}",
+                        "task_context_field_omitted_sensitive",
+                        "A task result reference contained credential-like material "
+                        "and was omitted.",
+                    )
+                    continue
+                row[key] = _truncate_context_text(raw, _MAX_TASK_CONTEXT_RESULT_VALUE_CHARS)
+            elif raw is None or isinstance(raw, (bool, int, float)):
+                row[key] = raw
+            else:
+                _task_context_warning(
+                    warnings,
+                    f"result_refs.{key}",
+                    "task_context_field_omitted",
+                    "A nested task result reference value was unsupported and was omitted.",
+                )
+        if row:
+            rows.append(row)
+    return rows
+
+
+def _task_context_assigned_actor(
+    value: object, *, warnings: list[dict[str, str]]
+) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        _task_context_warning(
+            warnings,
+            "assigned_actor",
+            "task_context_field_invalid",
+            "The assigned actor was malformed and was omitted.",
+        )
+        return None
+    kind = _task_context_safe_text(
+        value.get("kind"),
+        field="assigned_actor.kind",
+        limit=32,
+        warnings=warnings,
+    )
+    actor_id = _task_context_safe_text(
+        value.get("actor_id"),
+        field="assigned_actor.actor_id",
+        limit=MAX_TASK_CONTEXT_LABEL_CHARS,
+        warnings=warnings,
+    )
+    if kind is None or actor_id is None:
+        return None
+    return {"kind": kind, "actor_id": actor_id}
+
+
+def _task_context_contributions(
+    value: object, *, warnings: list[dict[str, str]]
+) -> list[dict[str, str]] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        _task_context_warning(
+            warnings,
+            "human_contributions",
+            "task_context_field_invalid",
+            "The task contributions were malformed and were omitted.",
+        )
+        return None
+    limits = {
+        "id": 64,
+        "category": 64,
+        "file_relpath": _MAX_TASK_CONTEXT_RELPATH_CHARS,
+        "file_sha256": 64,
+        "origin": 64,
+        "import_status": 64,
+    }
+    rows: list[dict[str, str]] = []
+    for index, item in enumerate(value):
+        if index >= MAX_TASK_CONTEXT_CONTRIBUTIONS:
+            _task_context_warning(
+                warnings,
+                "human_contributions",
+                "task_context_list_truncated",
+                "The task contributions exceeded their bounded length.",
+            )
+            break
+        if not isinstance(item, Mapping):
+            _task_context_warning(
+                warnings,
+                "human_contributions",
+                "task_context_reference_invalid",
+                "A task contribution was malformed and was omitted.",
+            )
+            continue
+        for unsupported in sorted(set(item) - set(_TASK_CONTEXT_CONTRIBUTION_FIELDS), key=str):
+            _task_context_warning(
+                warnings,
+                f"human_contributions.{unsupported}",
+                "task_context_field_omitted",
+                "An unsupported task-contribution field was omitted.",
+            )
+        row: dict[str, str] = {}
+        for contribution_field in _TASK_CONTEXT_CONTRIBUTION_FIELDS:
+            raw = item.get(contribution_field)
+            if raw is None:
+                continue
+            field_limit = limits[contribution_field]
+            if contribution_field == "file_sha256":
+                sha256 = _task_context_hash(
+                    raw,
+                    field=f"human_contributions.{contribution_field}",
+                    warnings=warnings,
+                )
+                if sha256 is not None:
+                    row[contribution_field] = sha256
+                continue
+            text = _task_context_safe_text(
+                raw,
+                field=f"human_contributions.{contribution_field}",
+                limit=field_limit,
+                warnings=warnings,
+            )
+            if text is not None:
+                row[contribution_field] = text
+        if row:
+            rows.append(row)
+    return rows
+
+
+def _task_context_previous_consultation(
+    value: object, *, warnings: list[dict[str, str]]
+) -> dict[str, str | None] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        _task_context_warning(
+            warnings,
+            "previous_consultation",
+            "task_context_field_invalid",
+            "The previous consultation was malformed and was omitted.",
+        )
+        return None
+    raw_invocation_id = value.get("invocation_id")
+    invocation_id = (
+        str(raw_invocation_id).strip() if isinstance(raw_invocation_id, (str, UUID)) else ""
+    )
+    if _UUID.fullmatch(invocation_id) is None:
+        _task_context_warning(
+            warnings,
+            "previous_consultation.invocation_id",
+            "task_context_field_invalid",
+            "The previous consultation reference was malformed and was omitted.",
+        )
+        return None
+    consultation_type = _task_context_safe_text(
+        value.get("type"),
+        field="previous_consultation.type",
+        limit=64,
+        warnings=warnings,
+        allow_empty=True,
+    )
+    parse_status = _task_context_safe_text(
+        value.get("parse_status"),
+        field="previous_consultation.parse_status",
+        limit=64,
+        warnings=warnings,
+        allow_empty=True,
+    )
+    output_sha256 = _task_context_hash(
+        value.get("output_sha256"),
+        field="previous_consultation.output_sha256",
+        warnings=warnings,
+    )
+    return {
+        "invocation_id": invocation_id,
+        "type": consultation_type,
+        "output_sha256": output_sha256,
+        "parse_status": parse_status,
+    }
+
+
+def _task_context_editorial_anchor(
+    value: object, *, warnings: list[dict[str, str]]
+) -> dict[str, str | None] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        _task_context_warning(
+            warnings,
+            "editorial_anchor",
+            "task_context_field_invalid",
+            "The editorial anchor was malformed and was omitted.",
+        )
+        return None
+    raw_anchor = value.get("anchor")
+    anchor = raw_anchor.strip() if isinstance(raw_anchor, str) else ""
+    if _TASK_CONTEXT_ANCHOR.fullmatch(anchor) is None:
+        _task_context_warning(
+            warnings,
+            "editorial_anchor.anchor",
+            "task_context_field_invalid",
+            "The editorial anchor was malformed and was omitted.",
+        )
+        return None
+    excerpt = _task_context_safe_text(
+        value.get("excerpt"),
+        field="editorial_anchor.excerpt",
+        limit=MAX_TASK_CONTEXT_TEXT_CHARS,
+        warnings=warnings,
+        allow_empty=True,
+    )
+    text_sha256 = _task_context_hash(
+        value.get("text_sha256"),
+        field="editorial_anchor.text_sha256",
+        warnings=warnings,
+    )
+    return {"anchor": anchor, "excerpt": excerpt, "text_sha256": text_sha256}
+
+
+def _sanitize_advisor_task_context(
+    raw: object,
+    *,
+    investigation_id: UUID,
+    warnings: list[dict[str, str]],
+) -> dict[str, Any] | None:
+    """Bound and credential-check the additive ``task_context`` field.
+
+    The field only locates the human request inside its own task.  It is never
+    evidence: the dossier renders it as non-evidence context and the prompt
+    names it as such.  Every shortened, unsupported or sensitive value is
+    reported once in the consultation's observable input warnings.
+    """
+    if not isinstance(raw, Mapping):
+        _task_context_warning(
+            warnings,
+            "task_context",
+            "task_context_invalid",
+            "The task context was not an object and was omitted.",
+        )
+        return None
+    for unsupported in sorted(set(raw) - _TASK_CONTEXT_FIELDS, key=str):
+        _task_context_warning(
+            warnings,
+            str(unsupported),
+            "task_context_field_omitted",
+            "An unsupported task-context field was omitted.",
+        )
+    result: dict[str, Any] = {}
+    declared_investigation_id = raw.get("investigation_id")
+    if declared_investigation_id is not None:
+        try:
+            parsed_investigation_id = UUID(str(declared_investigation_id))
+        except (TypeError, ValueError):
+            _task_context_warning(
+                warnings,
+                "investigation_id",
+                "task_context_field_invalid",
+                "The task-context investigation reference was malformed; the context was omitted.",
+            )
+            return None
+        if parsed_investigation_id != investigation_id:
+            _task_context_warning(
+                warnings,
+                "investigation_id",
+                "task_context_investigation_mismatch",
+                "The task context names another investigation; the context was omitted.",
+            )
+            return None
+        result["investigation_id"] = str(parsed_investigation_id)
+    raw_task_id = raw.get("task_id")
+    if raw_task_id is not None:
+        try:
+            result["task_id"] = str(UUID(str(raw_task_id)))
+        except (TypeError, ValueError):
+            _task_context_warning(
+                warnings,
+                "task_id",
+                "task_context_field_invalid",
+                "The task-context task reference was malformed and was omitted.",
+            )
+    for context_field in _TASK_CONTEXT_LABEL_FIELDS:
+        text = _task_context_safe_text(
+            raw.get(context_field),
+            field=context_field,
+            limit=MAX_TASK_CONTEXT_LABEL_CHARS,
+            warnings=warnings,
+            allow_empty=True,
+        )
+        if text is not None:
+            result[context_field] = text
+    for context_field in _TASK_CONTEXT_TEXT_FIELDS:
+        text = _task_context_safe_text(
+            raw.get(context_field),
+            field=context_field,
+            limit=MAX_TASK_CONTEXT_TEXT_CHARS,
+            warnings=warnings,
+            allow_empty=True,
+        )
+        if text is not None:
+            result[context_field] = text
+    for context_field in _TASK_CONTEXT_REF_FIELDS:
+        references = _task_context_reference_list(
+            raw.get(context_field), field=context_field, warnings=warnings
+        )
+        if references is not None:
+            result[context_field] = references
+    result_refs = _task_context_result_refs(raw.get("result_refs"), warnings=warnings)
+    if result_refs is not None:
+        result["result_refs"] = result_refs
+    assigned_actor = _task_context_assigned_actor(raw.get("assigned_actor"), warnings=warnings)
+    if assigned_actor is not None:
+        result["assigned_actor"] = assigned_actor
+    contributions = _task_context_contributions(raw.get("human_contributions"), warnings=warnings)
+    if contributions is not None:
+        result["human_contributions"] = contributions
+    previous_consultation = _task_context_previous_consultation(
+        raw.get("previous_consultation"), warnings=warnings
+    )
+    if previous_consultation is not None:
+        result["previous_consultation"] = previous_consultation
+    editorial_anchor = _task_context_editorial_anchor(
+        raw.get("editorial_anchor"), warnings=warnings
+    )
+    if editorial_anchor is not None:
+        result["editorial_anchor"] = editorial_anchor
+    return result or None
 
 
 class _AdvisorStageTiming:
@@ -809,6 +1347,7 @@ class InvestigationAdvisorTool:
                 "assertions",
                 "units",
                 "finding_refs",
+                "task_context",
             }
             for field in tuple(arguments):
                 if field not in known_fields:
@@ -4029,6 +4568,14 @@ class InvestigationAdvisorTool:
             "gaps": [],
             "truncation": {},
         }
+        if "task_context" in arguments:
+            task_context = _sanitize_advisor_task_context(
+                arguments.get("task_context"),
+                investigation_id=investigation_id,
+                warnings=input_warnings,
+            )
+            if task_context is not None:
+                base["task_context"] = task_context
         if arguments.get("measurements") is not None and consultation_type in {
             "plan_investigation",
             "review_text",
@@ -8396,6 +8943,15 @@ def register_investigation_advisor_tool(
                     "finding_refs": {
                         "additionalProperties": True,
                         "items": {"additionalProperties": True},
+                    },
+                    "task_context": {
+                        "description": (
+                            "Optional non-evidence context of the human request's own task: "
+                            "ids, hashes, bounded titles/objectives, reference lists and "
+                            "human contributions. Credential-like values are omitted with "
+                            "an observable warning."
+                        ),
+                        "additionalProperties": True,
                     },
                 },
                 "required": ["consultation_type"],

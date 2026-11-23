@@ -236,6 +236,7 @@ class _OperatorAdvisorDraftingPort:
             idempotency_key=request.idempotency_key,
             actor_id=request.actor_id,
             requester_actor_kind=request.requester_actor_kind,
+            context_task_id=request.context_task_id,
         )
         return AdvisorDraftingOutcomeV1(
             invocation_id=result.invocation.id,
