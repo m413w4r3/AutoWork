@@ -160,9 +160,11 @@ def test_claude_argv_uses_probed_modes_only(tmp_path: Path) -> None:
         "TMPDIR": "/tmp",
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        "DISABLE_AUTOUPDATER": "1",
         "AUTOWORK_SESSION_ID": context.session_id,
         "AUTOWORK_SESSION_SOCKET": str(context.ipc_socket_path),
-        "AUTOWORK_BACKEND_URL": "http://127.0.0.1:8000",
+        "AUTOWORK_BROKER_SOCKET": str(context.ipc_socket_path.parent / "broker.sock"),
     }
     for key in plan.env:
         assert not any(
@@ -203,17 +205,62 @@ def test_claude_restricted_tools_only(tmp_path: Path) -> None:
     assert (shim_copy.stat().st_mode & 0o777) == 0o700
     assert shim_copy.read_bytes() == (SESSIONS_PACKAGE / "shim.py").read_bytes()
     assert sorted(server["env"]) == [
-        "AUTOWORK_BACKEND_URL",
+        "AUTOWORK_BROKER_SOCKET",
         "AUTOWORK_SESSION_ID",
         "AUTOWORK_SESSION_SOCKET",
     ]
     assert server["env"]["AUTOWORK_SESSION_SOCKET"] == str(context.ipc_socket_path)
+    assert server["env"]["AUTOWORK_BROKER_SOCKET"] == str(
+        context.ipc_socket_path.parent / "broker.sock"
+    )
     serialized = config_path.read_text(encoding="utf-8")
     assert "secret" not in serialized.lower()
     assert str(binary) not in serialized
     assert (context.config_directory.stat().st_mode & 0o777) == 0o700
     assert (context.config_directory / "home").is_dir()
     assert (context.config_directory / "cache").is_dir()
+
+
+def test_claude_uses_relay_socket_without_backend_url(tmp_path: Path) -> None:
+    """NET-10: the shim reaches the broker over the ro-bound ipc socket only."""
+    profile, _ = _profile(tmp_path)
+    context = make_launch_context(tmp_path)
+    plan = profile.build_launch_plan(context)
+
+    broker_socket = context.ipc_socket_path.parent / "broker.sock"
+    assert plan.env["AUTOWORK_BROKER_SOCKET"] == str(broker_socket)
+    assert plan.env["AUTOWORK_SESSION_SOCKET"] == str(context.ipc_socket_path)
+    # The provider proxy literal belongs to the trusted entrypoint, never to the
+    # adapter: no proxy variable is set here, under any spelling.
+    assert not any("proxy" in key.lower() for key in plan.env)
+    assert not any("proxy" in value.lower() for value in plan.env.values())
+    # The non-essential-traffic switches are the only Claude-specific addition.
+    assert plan.env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
+    assert plan.env["DISABLE_AUTOUPDATER"] == "1"
+
+    binds = [
+        (plan.argv[index + 1], plan.argv[index + 2])
+        for index in range(len(plan.argv) - 2)
+        if plan.argv[index] == "--ro-bind"
+    ]
+    ipc = str(context.ipc_socket_path.parent)
+    assert (ipc, ipc) in binds
+
+    config_path = Path(flag_value(claude_argv(plan.argv), "--mcp-config"))
+    serialized = config_path.read_text(encoding="utf-8")
+    server = json.loads(serialized)["mcpServers"]["autowork"]
+    assert sorted(server["env"]) == [
+        "AUTOWORK_BROKER_SOCKET",
+        "AUTOWORK_SESSION_ID",
+        "AUTOWORK_SESSION_SOCKET",
+    ]
+    assert server["env"]["AUTOWORK_BROKER_SOCKET"] == str(broker_socket)
+
+    produced = "\0".join((*plan.argv, *plan.env.keys(), *plan.env.values(), serialized))
+    assert "AUTOWORK_BACKEND_URL" not in produced
+    assert "http://" not in produced and "https://" not in produced
+    assert "X-AutoWork-Agent-Signature" not in produced
+    process.assert_cli_environment_safe(plan.env)
 
 
 def test_claude_resume_session_id_roundtrip(tmp_path: Path) -> None:
