@@ -68,7 +68,7 @@ Environnement : Python 3.12.3 hors Conda, Typst 0.15.1 épinglé, PG de test jet
 |---|---|---|
 | Lint backend (`ruff check`, `ruff format --check`) | DONE | vert, 1347 fichiers |
 | Typecheck backend (`mypy src tests`) | DONE | 0 erreur, 1289 fichiers |
-| Unitaires backend (`--ignore=tests/integration --ignore=tests/workspace_agent -m "not integration"`) | DONE après correction | 1ʳᵉ exécution (@595662e0) : 8 429 passed, 5 skipped, 2 failed (B13 : conflit VT-FAKE/E2E-ABC ; oracle D05 de la matrice supprimé par ID-3) → **corrigés** (@9b52d0fb) ; les 2 tests + `test_bootstrap_envelope` rejoués : 42 passed. **La suite unitaire complète n'a pas été relancée en entier après ces 2 corrections de tests.** |
+| Unitaires backend (`--ignore=tests/integration --ignore=tests/workspace_agent -m "not integration"`) | DONE | @595662e0 : 8 429 passed, 2 failed (B13 : conflit VT-FAKE/E2E-ABC ; oracle D05 de la matrice supprimé par ID-3) → corrigés (@9b52d0fb) ; **relance complète sur le HEAD corrigé : 8 431 passed, 5 skipped, 32 deselected, 0 failed (5 min 07)** |
 | Sidecar `tests/workspace_agent` (bwrap/netns réels) | DONE | 712 passed (150 s) |
 | Intégration PG complète `tests/integration` | DONE | 799 passed (12 min 56 s) |
 | Scénario d'acceptation PG (24 étapes + A/B/C) | DONE | 5 passed (~80 s, Typst réel) |
@@ -122,7 +122,7 @@ DOC-1 : SESSION-RUNNER, WORKSPACE-AGENT, ADR-0011 (addendum D7), COCKPIT-F4, GLO
 Aucun n'est déclenché au HEAD final d'après les revues R2b/R4c et les gates : accès libre LAN/internes (netns vérifié), broker inaccessible (attesté en réel), contournement du confinement des scripts (batterie 11/11), processus persistants après interruption (vérifié), secrets exposés (purge+filtre, avec la réserve de la §15), tâche modifiée avec bail obsolète (revalidation `database_now`), instruction annoncée traitée mais non livrée (R4-F1 corrigé et re-revu), finding promu sans vérification, prose non-Bridge acceptée, Notes mal ancrées, PDF non conforme (R6), CI rouge sans disposition (**la CI GitHub n'a pas été rejouée : UNKNOWN**), revue critique manquante présentée comme faite (aucune).
 
 ## 20. Écarts et honnêteté
-(1) Plusieurs rapports d'agents ont déclaré « 15 erreurs mypy préexistantes » : faux, elles venaient de tests M24.1 (corrigées). (2) Le spike H0 a dépassé « un prompt par CLI » (§7). (3) Tous les verdicts de revue viennent de DeepSeek Flash max, pas de Luna. (4) La suite unitaire complète n'a pas été relancée après les 2 dernières corrections de tests (§12).
+(1) Plusieurs rapports d'agents ont déclaré « 15 erreurs mypy préexistantes » : faux, elles venaient de tests M24.1 (corrigées). (2) Le spike H0 a dépassé « un prompt par CLI » (§7). (3) Tous les verdicts de revue viennent de DeepSeek Flash max, pas de Luna. (4) Les 2 échecs unitaires de la 1ʳᵉ exécution étaient des tests devenus faux par nos propres changements (corrigés, suite complète relancée verte).
 
 ## 21. Autorisations / décisions humaines encore nécessaires
 Ré-attestation en réel après les correctifs (un prompt par CLI) ; politique/activation de `M24_AGENT_SESSION_KEY` ; tout appel VT/Bridge/Shodan réel ; décision sur R2B-4 (bind `/etc/resolv.conf`) ; CI GitHub et shellcheck ; push/merge dans `main` ; déploiement/redémarrage de la stack et DDL (0027–0029) sur base vivante ; format `delivery_code` ; rétention des blobs/journaux.
