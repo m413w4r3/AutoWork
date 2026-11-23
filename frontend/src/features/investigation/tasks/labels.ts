@@ -101,6 +101,10 @@ export const TIMELINE_TYPE_LABELS: Record<TimelineItemType, string> = {
   bridge_consultation: "Consultation Bridge",
   tool_invocation: "Invocation d’outil",
   plan_version: "Version de plan",
+  handoff: "Passation",
+  contribution: "Contribution",
+  agent_session: "Session d’agent",
+  instruction: "Instruction humaine",
 };
 
 export const TIMELINE_ACTOR_LABELS: Record<TimelineActorKind, string> = {

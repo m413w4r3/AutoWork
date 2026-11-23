@@ -8,6 +8,7 @@ import {
   listTasks,
   runTaskCommand,
   tasksKeys,
+  type TimelinePageV1,
 } from "./tasks";
 import {
   bodyOf,
@@ -51,6 +52,79 @@ describe("task reads", () => {
     expect(lastRequest(recorder).url).toBe(
       "/api/investigations/inv-1/timeline?cursor=cursor-1&limit=50",
     );
+  });
+
+  it("keeps the B7 working item types inside the same envelope", async () => {
+    const page: TimelinePageV1 = {
+      items: [
+        {
+          item_type: "handoff",
+          object_id: "hd-1",
+          occurred_at: "2026-11-22T10:00:00Z",
+          task_id: "task-2",
+          actor_kind: "human",
+          actor_id: "analyst",
+          summary: "handoff:v1:human->operator",
+          evidence: false,
+          refs: { handoff_id: "hd-1", task_id: "task-2", version: "1" },
+          linked_event_ids: [],
+          linked_observation_ids: [],
+        },
+        {
+          item_type: "contribution",
+          object_id: "ct-1",
+          occurred_at: "2026-11-22T10:01:00Z",
+          task_id: "task-2",
+          actor_kind: "operator",
+          actor_id: "codex",
+          summary: "contribution:finding:imported",
+          evidence: false,
+          refs: { contribution_id: "ct-1", file_sha256: "a".repeat(64) },
+          linked_event_ids: [],
+          linked_observation_ids: [],
+        },
+        {
+          item_type: "agent_session",
+          object_id: "se-1",
+          occurred_at: "2026-11-22T10:02:00Z",
+          task_id: "task-2",
+          actor_kind: "system",
+          actor_id: "codex_cli",
+          summary: "agent_session:codex_cli:running",
+          evidence: false,
+          refs: { session_id: "se-1", adapter_kind: "codex_cli" },
+          linked_event_ids: [],
+          linked_observation_ids: [],
+        },
+        {
+          item_type: "instruction",
+          object_id: "in-1",
+          occurred_at: "2026-11-22T10:03:00Z",
+          task_id: "task-2",
+          actor_kind: "human",
+          actor_id: "analyst",
+          summary: "instruction:queued",
+          evidence: false,
+          refs: { instruction_id: "in-1", delivery_attempts: "0" },
+          linked_event_ids: [],
+          linked_observation_ids: [],
+        },
+      ],
+      next_cursor: null,
+      has_more: false,
+    };
+    installFetch(() => jsonResponse(page));
+
+    const result = await getTimeline("inv-1");
+
+    expect(result.items.map((item) => item.item_type)).toEqual([
+      "handoff",
+      "contribution",
+      "agent_session",
+      "instruction",
+    ]);
+    expect(result.items.every((item) => item.evidence === false)).toBe(true);
+    expect(result.items[0]?.refs.handoff_id).toBe("hd-1");
   });
 });
 

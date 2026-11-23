@@ -346,6 +346,27 @@ test("plan et tâches : acceptation, action absente et CAS périmé", async ({
   ).toBeVisible();
   await expect(page.getByText("Piste 1 — Analyser le dropper")).toBeVisible();
 
+  const timeline = page.getByRole("region", { name: "Chronologie commune" });
+  const entries = [
+    ["handoff:v1:human->operator", "Passation"],
+    ["contribution:finding:imported", "Contribution"],
+    ["agent_session:codex_cli:running", "Session d’agent"],
+    ["instruction:queued", "Instruction humaine"],
+  ] as const;
+  for (const [summary, label] of entries) {
+    const entry = timeline.getByRole("listitem").filter({ hasText: summary });
+    await expect(entry.getByText(label, { exact: true })).toBeVisible();
+  }
+  await expect(
+    timeline.getByText("Non probant — élément de travail"),
+  ).toHaveCount(4);
+  await expect(timeline.getByText("Preuve canonique")).toHaveCount(1);
+
+  await page.getByLabel(/Type d’événement/).selectOption("instruction");
+  await expect(timeline.getByText("instruction:queued")).toBeVisible();
+  await expect(timeline.getByText("handoff:v1:human->operator")).toHaveCount(0);
+  await page.getByLabel(/Type d’événement/).selectOption("all");
+
   await page.getByLabel(/Je confirme l’acceptation de cette version/).check();
   await page
     .getByRole("button", { name: "Accepter le plan et créer les tâches" })

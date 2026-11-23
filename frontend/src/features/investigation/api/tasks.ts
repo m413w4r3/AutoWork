@@ -202,13 +202,32 @@ export interface TimelinePageParams {
   limit?: number;
 }
 
+/**
+ * Canonical item kinds of the common timeline. The last four are the B7
+ * working objects; they are append-only, never evidence, and carry these
+ * `refs` keys (`application/investigation_timeline.py`):
+ *
+ * - `handoff`: `handoff_id`, `task_id`, `version`, `sha256`,
+ *   `predecessor_id?`
+ * - `contribution`: `contribution_id`, `workspace_id`,
+ *   `workspace_revision_id`, `file_relpath`, `file_sha256`, `observation_id?`,
+ *   `finding_id?`, `validation_error_code?`
+ * - `agent_session`: `session_id`, `task_id`, `adapter_kind`, `state`,
+ *   `state_version`, `handoff_id?`
+ * - `instruction`: `instruction_id`, `session_id`, `text_sha256`,
+ *   `delivery_attempts`, `delivery_mode?`, `delivery_sha256?`
+ */
 export type TimelineItemType =
   | "task_event"
   | "decision"
   | "observation"
   | "bridge_consultation"
   | "tool_invocation"
-  | "plan_version";
+  | "plan_version"
+  | "handoff"
+  | "contribution"
+  | "agent_session"
+  | "instruction";
 
 export type TimelineActorKind = "human" | "operator" | "system" | "source";
 
