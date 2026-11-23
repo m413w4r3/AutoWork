@@ -1,5 +1,21 @@
 # M24 — Rapport final de clôture (atelier d'investigation CTI hybride)
 
+> **Mise à jour M24.1 (2026-11-23).** Ce rapport est la clôture **historique** de M24 (2026-11-22, `m24/integration`, base `main` 33891bf8). Les corrections et finalisations de **M24.1** (branche locale `m24-1/integration`, départ `main` 1d52106f) sont rapportées dans [`M24-1-FINAL-REPORT.md`](M24-1-FINAL-REPORT.md). Les lignes ci-dessous ne sont **pas** réécrites : lire d'abord le tableau « Statut après M24.1 » qui indique ce qui a changé. Rien n'est poussé, fusionné ni déployé.
+>
+> | Point historique de ce rapport | Statut après M24.1 |
+> |---|---|
+> | §6 « file d'instructions écrite mais jamais drainée » | **corrigé** : migration 0027, boucle de drainage, API pull/ack strict/cancel, livraison au run suivant, refus hôte au lieu de troncature (revue de concurrence R4 : 3 rounds, GO-avec-réserves) |
+> | §6/§10 BL1 « shim sans accès au broker en `isolated_egress` » | **corrigé** : relais UDS ; attesté avec Codex 0.163.0 et Claude Code 2.1.284 réels (spike H0) |
+> | §6/§10 BL2 « NAT slirp joint LAN/Docker/Internet » | **corrigé** : netns sans route + proxy d'egress CONNECT à allowlist ; `host_network_unsafe` et slirp supprimés |
+> | §10 `analysis.run_script` évadable | **corrigé** : subreaper + Landlock + seccomp, batterie conteneur 11/11 |
+> | §6 « Notes avec tableaux/figures M23 : NOT SUPPORTED » | **supporté** par références vérifiées (blocs `article_element`, `canonical_code`, `ioc_table`, `protocol_figure`, migration 0029) ; légendes inline déterministes ; PDF réel |
+> | §6 « Cockpit contre backend M24 réel dans le navigateur : UNKNOWN » | **DONE** : `make test-investigation-browser` (24 étapes + G2) |
+> | §12 réserves cockpit (actions Bridge par tâche, ancres saisies à la main, opérateurs sans ops/budget, G2 extend/revoke, messages `invalid_observation_anchor`, multi-paragraphes Bridge) | **traitées** (F1–F6) ; multi-paragraphes prouvé dans le PDF réel |
+> | §11 « chronologie sans passations/contributions/sessions » | **corrigé** (B7/F6) |
+> | §5 migrations `0019…0026` | tête = `0029_note_anchor_identity` |
+> | Fournisseurs réels (VT, Bridge) | **toujours UNKNOWN** (jamais exercés) ; CLI réels : attestés par le spike H0 (session minimale, données synthétiques) |
+> | §20 verdict | **PARTIAL** maintenu (voir M24-1-FINAL-REPORT §25) |
+
 Date : 2026-11-22 · Branche : `m24/integration` (base `main` 33891bf8, 128 commits locaux, 377 fichiers, +140 k/−0,2 k lignes) · **Rien n'est poussé, rien n'est fusionné dans `main`, rien n'est déployé, aucun DDL sur base vivante.** Légende : DONE / PARTIAL / BLOCKED / FAIL / UNKNOWN ; niveaux de preuve : *implémenté* (code+tests unitaires), *simulé* (faux VT/Bridge/CLI), *réel local* (PostgreSQL, sidecar sur UDS tmp, Typst, bwrap/slirp locaux), *attestation locale*, *fournisseur réel* (jamais exercé ici).
 
 ## 1. HEAD et périmètre
