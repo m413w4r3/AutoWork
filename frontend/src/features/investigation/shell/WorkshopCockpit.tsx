@@ -15,6 +15,7 @@ import { OverviewView } from "../overview/OverviewView";
 import { PlanTasksView } from "../plan";
 import { SamplesResultsView } from "../samples";
 import { WorkspaceNotesView } from "../workspace";
+import { navigateInvestigation, type InvestigationView } from "../navigation";
 import "./workshop.css";
 
 const VIEW_QUERY_PARAM = "vue";
@@ -28,7 +29,7 @@ const WORKSHOP_VIEWS = [
   { id: "opinion", label: "Note de l’analyste" },
 ] as const;
 
-type WorkshopViewId = (typeof WORKSHOP_VIEWS)[number]["id"];
+type WorkshopViewId = InvestigationView;
 
 function isWorkshopViewId(value: string | null): value is WorkshopViewId {
   return WORKSHOP_VIEWS.some((view) => view.id === value);
@@ -64,9 +65,7 @@ export function WorkshopCockpit({
 
   const selectView = useCallback((view: WorkshopViewId) => {
     setActiveView(view);
-    const url = new URL(window.location.href);
-    url.searchParams.set(VIEW_QUERY_PARAM, view);
-    window.history.pushState({ workshopView: view }, "", url);
+    navigateInvestigation({ vue: view });
   }, []);
 
   const handleTabKeyDown = (

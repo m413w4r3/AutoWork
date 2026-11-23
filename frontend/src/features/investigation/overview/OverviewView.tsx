@@ -7,23 +7,16 @@ import {
   type AnalystInvestigationStatus,
 } from "../../../api/investigation";
 import { useInvestigationActivity } from "../../../api/investigationOperator";
-import { useInvestigationEnvelope } from "../../../api/investigationGovernance";
 import { useAgentSessions } from "../api/agentSessions";
-import {
-  useBootstrapEnvelopeProposal,
-  useBootstrapInventory,
-  useBootstrapSnapshot,
-} from "../api/bootstrap";
+import { useBootstrapInventory, useBootstrapSnapshot } from "../api/bootstrap";
 import { useContributions } from "../api/contributions";
-import { useNoteProposals } from "../api/opinionProposals";
-import { useTasks } from "../api/tasks";
 import { toWorkshopApiError } from "../api/client";
 import {
   useEnsureWorkspace,
-  useWorkspaceConflicts,
   useWorkspaceStatus,
   type WorkspaceStatusV1,
 } from "../api/workspace";
+import { handleInvestigationLinkClick, investigationHref } from "../navigation";
 import { useWorkspaceAgentStatus } from "../api/workspaceAgent";
 import {
   WorkspaceUnavailableState,
@@ -37,9 +30,9 @@ import { SESSION_STATE_LABELS, formatTimestamp } from "../tasks/labels";
 import { BootstrapSection } from "./BootstrapSection";
 import { EnvelopeLifecycleSection } from "./EnvelopeLifecycleSection";
 import { EnvelopeSection } from "./EnvelopeSection";
+import { usePendingDecisions } from "./usePendingDecisions";
 import {
   AGENT_STATUS_LABELS,
-  deriveOverviewDecisions,
   isActiveAgentSession,
   isActiveTask,
   PLAN_STATE_LABELS,
@@ -76,25 +69,28 @@ export function OverviewView({
   const investigationQuery = useInvestigation(investigationId);
   const activityQuery = useInvestigationActivity(investigationId);
   const agentQuery = useWorkspaceAgentStatus();
-  const workspaceQuery = useWorkspaceStatus(investigationId);
+  const pendingDecisionState = usePendingDecisions(investigationId, {
+    workspaceViewsAvailable:
+      investigationQuery.data?.prose_authority === "bridge_only",
+  });
+  const {
+    workspaceQuery,
+    tasksQuery,
+    tasks,
+    decisions,
+    decisionsLoaded,
+    decisionsPending,
+  } = pendingDecisionState;
   const ensureWorkspace = useEnsureWorkspace(investigationId);
-  const tasksQuery = useTasks(investigationId);
   const sessionsQuery = useAgentSessions(investigationId);
-  const proposalsQuery = useNoteProposals(investigationId);
-  const conflictsQuery = useWorkspaceConflicts(investigationId);
   const contributionsQuery = useContributions(investigationId);
   const inventoryQuery = useBootstrapInventory(investigationId);
   const snapshotQuery = useBootstrapSnapshot(investigationId);
-  const bootstrapEnvelopeQuery = useBootstrapEnvelopeProposal(investigationId);
-  const envelopeQuery = useInvestigationEnvelope(investigationId);
   const workspace = workspaceQuery.data;
   const workspaceReady =
     workspace?.workspace_state === "bound" && workspace.workspace_available;
   const agentAvailable = agentQuery.data?.status === "available";
-  const tasks = tasksQuery.data?.items ?? [];
   const sessions = sessionsQuery.data ?? [];
-  const proposals = proposalsQuery.data ?? [];
-  const conflicts = conflictsQuery.data?.conflicts ?? [];
   const contributions = contributionsQuery.data ?? [];
   const investigation = investigationQuery.data;
   const latestActivity = [...(activityQuery.data?.timeline ?? [])].sort(
@@ -102,37 +98,6 @@ export function OverviewView({
   )[0];
   const activeSessions = sessions.filter(isActiveAgentSession);
   const activeTasks = tasks.filter(isActiveTask);
-  const decisionsLoaded =
-    tasksQuery.data !== undefined &&
-    proposalsQuery.data !== undefined &&
-    conflictsQuery.data !== undefined &&
-    workspaceQuery.data !== undefined &&
-    bootstrapEnvelopeQuery.data !== undefined &&
-    envelopeQuery.data !== undefined;
-  const decisionsPending =
-    tasksQuery.isPending ||
-    proposalsQuery.isPending ||
-    conflictsQuery.isPending ||
-    workspaceQuery.isPending ||
-    bootstrapEnvelopeQuery.isPending ||
-    envelopeQuery.isPending;
-  const decisions = deriveOverviewDecisions({
-    tasks,
-    proposals,
-    conflicts,
-    workspace: workspace ?? null,
-    envelopeProposal: bootstrapEnvelopeQuery.data ?? null,
-    envelope: envelopeQuery.data
-      ? {
-          approved: envelopeQuery.data.approved,
-          currently_authorized:
-            "currently_authorized" in envelopeQuery.data &&
-            envelopeQuery.data.currently_authorized === true,
-        }
-      : null,
-    workspaceViewsAvailable:
-      investigationQuery.data?.prose_authority === "bridge_only",
-  });
   const taskById = new Map(tasks.map((task) => [task.id, task]));
   const articleTitle = workspace?.binding?.article_slug
     ? `Article ${redactTechnicalIdentifiers(workspace.binding.article_slug)}`
@@ -207,23 +172,29 @@ export function OverviewView({
           </p>
         ) : (
           <ul>
-            {decisions.map((decision) => (
-              <li key={decision.key}>
-                <strong>{decision.label}</strong> —{" "}
-                {redactTechnicalIdentifiers(decision.detail)}{" "}
-                {decision.href ? (
-                  <a
-                    href={decision.href}
-                    onClick={() => {
-                      if (decision.href === "#overview-g2-details")
-                        setG2DetailsOpen(true);
-                    }}
-                  >
-                    Ouvrir
-                  </a>
-                ) : null}
-              </li>
-            ))}
+            {decisions.map((decision) => {
+              const href = decision.href;
+              return (
+                <li key={decision.key}>
+                  <strong>{decision.label}</strong> —{" "}
+                  {redactTechnicalIdentifiers(decision.detail)}{" "}
+                  {href ? (
+                    <a
+                      href={href}
+                      onClick={(event) => {
+                        if (href === "#overview-g2-details") {
+                          setG2DetailsOpen(true);
+                          return;
+                        }
+                        handleInvestigationLinkClick(event, href);
+                      }}
+                    >
+                      Ouvrir
+                    </a>
+                  ) : null}
+                </li>
+              );
+            })}
           </ul>
         )}
       </section>
@@ -303,7 +274,15 @@ export function OverviewView({
                     {task &&
                     investigationQuery.data?.prose_authority ===
                       "bridge_only" ? (
-                      <a href={`?vue=plan&task=${encodeURIComponent(task.id)}`}>
+                      <a
+                        href={investigationHref({ vue: "plan", task: task.id })}
+                        onClick={(event) =>
+                          handleInvestigationLinkClick(
+                            event,
+                            investigationHref({ vue: "plan", task: task.id }),
+                          )
+                        }
+                      >
                         Ouvrir la tâche
                       </a>
                     ) : null}

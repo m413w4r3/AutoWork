@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
+  act,
   fireEvent,
   render,
   screen,
@@ -22,7 +23,10 @@ import type {
   WorkspaceStatusV1,
 } from "../api/workspace";
 import type { WorkspaceAgentStatusResponse } from "../api/workspaceAgent";
+import type { TaskView } from "../api/tasks";
+import { makeTask } from "../tasks/testFixtures";
 import { OverviewView } from "./OverviewView";
+import { WorkshopCockpit } from "../shell/WorkshopCockpit";
 
 const INVESTIGATION_ID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
 const SUBJECT_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
@@ -369,6 +373,12 @@ interface FetchOptions {
   proposal?: BootstrapEnvelopeProposalV1 | { status: number; code: string };
   approval?: BootstrapEnvelopeApprovalV1 | { status: number; code: string };
   envelope?: GovernanceEnvelopeFixture;
+  tasks?: Array<
+    Pick<
+      TaskView,
+      "id" | "title" | "status" | "result_verification_status" | "result_refs"
+    >
+  >;
 }
 
 function urlOf(input: RequestInfo | URL): string {
@@ -418,7 +428,12 @@ function createFetch(options: FetchOptions) {
         }),
       );
     if (url === URLS.tasks)
-      return Promise.resolve(Response.json({ items: [], total: 0 }));
+      return Promise.resolve(
+        Response.json({
+          items: options.tasks ?? [],
+          total: options.tasks?.length ?? 0,
+        }),
+      );
     if (url === URLS.sessions) return Promise.resolve(Response.json([]));
     if (url === URLS.proposals) return Promise.resolve(Response.json([]));
     if (url === URLS.conflicts)
@@ -480,15 +495,95 @@ function renderOverview(options: FetchOptions) {
   return { ...result, ...fetchState };
 }
 
+function renderCockpit(options: FetchOptions) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false, refetchInterval: false } },
+  });
+  vi.stubGlobal("crypto", { randomUUID: () => CORRELATION_ID });
+  const fetchState = createFetch(options);
+  vi.stubGlobal("fetch", fetchState.fetchMock);
+  const result = render(
+    <QueryClientProvider client={client}>
+      <WorkshopCockpit
+        investigationId={INVESTIGATION_ID}
+        subjectId={SUBJECT_ID}
+      />
+    </QueryClientProvider>,
+  );
+  return { ...result, ...fetchState };
+}
+
 function openOverviewDetails(label: string) {
   fireEvent.click(screen.getByText(label));
 }
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+  window.history.replaceState({}, "", "/");
 });
 
 describe("OverviewView", () => {
+  it("navigue vers la tâche dans le cockpit, sans rechargement, et Retour restaure la vue", async () => {
+    const user = userEvent.setup();
+    const task = makeTask({
+      id: "77777777-7777-4777-8777-777777777777",
+      investigation_id: INVESTIGATION_ID,
+      title: "Répondre à une tâche",
+      status: "awaiting_input",
+    });
+    window.history.replaceState(
+      {},
+      "",
+      "/subjects/subject-1?edition=E2&vue=overview",
+    );
+    renderCockpit({
+      tasks: [task],
+      proposal: makeProposal({ already_approved: true }),
+      envelope: makeGovernanceEnvelope(false),
+    });
+
+    const openTask = await screen.findByRole("link", { name: "Ouvrir" });
+    expect(openTask).toHaveAttribute(
+      "href",
+      `?vue=plan&task=${encodeURIComponent(task.id)}`,
+    );
+    const pushState = vi.spyOn(window.history, "pushState");
+    await user.click(openTask);
+
+    expect(pushState).toHaveBeenCalledTimes(1);
+    expect(window.location.pathname).toBe("/subjects/subject-1");
+    expect(new URL(window.location.href).searchParams.get("edition")).toBe(
+      "E2",
+    );
+    expect(new URL(window.location.href).searchParams.get("vue")).toBe("plan");
+    expect(new URL(window.location.href).searchParams.get("task")).toBe(
+      task.id,
+    );
+    expect(screen.getByRole("tab", { name: "Plan et tâches" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+
+    const taskList = await screen.findByRole("list", {
+      name: "Liste des tâches",
+    });
+    expect(
+      within(taskList).getByRole("button", { name: /Répondre à une tâche/ }),
+    ).toHaveAttribute("aria-pressed", "true");
+
+    await act(async () => {
+      window.history.back();
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    });
+    await waitFor(() => {
+      expect(window.location.search).toContain("vue=overview");
+      expect(
+        screen.getByRole("tab", { name: "Vue d’ensemble" }),
+      ).toHaveAttribute("aria-selected", "true");
+    });
+  });
+
   it("met l’article et l’activité en tête, puis replie les identifiants techniques", async () => {
     const user = userEvent.setup();
     renderOverview({});

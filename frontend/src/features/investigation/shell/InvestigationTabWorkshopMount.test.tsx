@@ -1,8 +1,9 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { InvestigationView } from "../../../api/investigation";
+import type { BootstrapEnvelopeProposalV1 } from "../api/bootstrap";
 import type { WorkspaceStatusV1 } from "../api/workspace";
 import { InvestigationTab } from "../InvestigationTab";
 
@@ -12,6 +13,15 @@ const RUN_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 const SYNTHESIS_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 const INVESTIGATION_ID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
 const SHA256 = "a".repeat(64);
+const TASKS_URL = `/api/investigations/${INVESTIGATION_ID}/tasks`;
+
+interface DecisionTaskFixture {
+  id: string;
+  title: string;
+  status: string;
+  result_refs: unknown[];
+  result_verification_status: string | null;
+}
 
 function makeInvestigation(
   proseAuthority: InvestigationView["prose_authority"],
@@ -96,6 +106,88 @@ function makeWorkspace(state: "bound" | "unbound"): WorkspaceStatusV1 {
   };
 }
 
+function makeEnvelopeProposal(): BootstrapEnvelopeProposalV1 {
+  return {
+    schema_version: "vt-bootstrap-envelope-proposal.v1",
+    generated_at: "2026-11-22T09:00:00Z",
+    investigation_id: INVESTIGATION_ID,
+    proposal_sha256: SHA256,
+    approved: false,
+    already_approved: false,
+    envelope_version: null,
+    plan_state: "awaiting_g2",
+    allowed_providers: [],
+    acquire_hits_allowed: false,
+    inventory: {
+      seeds: 0,
+      discovered: 0,
+      samples: 0,
+      ipv4: 0,
+      domains: 0,
+      urls: 0,
+      truncated: false,
+    },
+    planned_operations: 0,
+    covered_operations: 0,
+    covered_ioc_ids: [],
+    vt_reads: {
+      allowed: false,
+      provider: "vt",
+      operations_planned: 0,
+      operations_covered: 0,
+      units_planned: 0,
+      units_proposed: 0,
+      iocs_planned: 0,
+      iocs_covered: 0,
+      per_tool: [],
+      summary: "Aucune lecture prévue.",
+      limitations: [],
+    },
+    sample_acquisition: {
+      allowed: false,
+      acquire_hits_allowed: false,
+      sample_count_planned: 0,
+      sample_count_covered: 0,
+      downloads_limit: 0,
+      per_sample_max_bytes: 0,
+      total_max_bytes: 0,
+      route_status: "unavailable",
+      summary: "Aucune acquisition prévue.",
+      limitations: [],
+    },
+    costs: {
+      limits: [],
+      caps: {
+        vt_units: 0,
+        downloads: 0,
+        per_sample_bytes: 0,
+        tool_seconds: 0,
+        context_bytes: 0,
+        context_tokens: 0,
+      },
+      summary: "Aucun coût prévu.",
+    },
+    external_model: {
+      allowed: false,
+      providers: [],
+      policy_source: "article_policy",
+      summary: "Modèle externe non autorisé.",
+      limitations: [],
+    },
+    disclosure: {
+      tlp: null,
+      do_not_submit: false,
+      external_llm_allowed: false,
+      scope: "article_cited_iocs",
+      scope_statement: "Aucune donnée divulguée.",
+      summary: "Aucune divulgation prévue.",
+      limitations: [],
+    },
+    summary: [],
+    limitations: [],
+  };
+}
+
 function urlOf(input: RequestInfo | URL): string {
   if (typeof input === "string") return input;
   if (input instanceof URL) return input.toString();
@@ -106,7 +198,7 @@ function renderTab(
   workspaceState: "bound" | "unbound",
   proseAuthority: InvestigationView["prose_authority"],
   articleTitle = "Article étudié",
-  pendingDecisionCount?: number,
+  tasks: DecisionTaskFixture[] = [],
 ) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, refetchInterval: false } },
@@ -151,6 +243,28 @@ function renderTab(
     if (url === `/api/investigations/${INVESTIGATION_ID}/workspace`) {
       return Promise.resolve(Response.json(makeWorkspace(workspaceState)));
     }
+    if (url === TASKS_URL)
+      return Promise.resolve(
+        Response.json({ items: tasks, total: tasks.length }),
+      );
+    if (url === `/api/investigations/${INVESTIGATION_ID}/note-proposals`)
+      return Promise.resolve(Response.json([]));
+    if (url === `/api/investigations/${INVESTIGATION_ID}/workspace/conflicts`)
+      return Promise.resolve(
+        Response.json({
+          investigation_id: INVESTIGATION_ID,
+          workspace_id: "ws-1",
+          workspace_available: workspaceState === "bound",
+          conflicts: [],
+        }),
+      );
+    if (
+      url ===
+      `/api/investigations/${INVESTIGATION_ID}/bootstrap/envelope-proposal`
+    )
+      return Promise.resolve(Response.json(makeEnvelopeProposal()));
+    if (url === `/api/investigations/${INVESTIGATION_ID}/envelope`)
+      return Promise.resolve(Response.json({ approved: false }));
     if (url === `/api/investigations/${INVESTIGATION_ID}`) {
       return Promise.resolve(Response.json(view));
     }
@@ -204,7 +318,6 @@ function renderTab(
         subjectId={SUBJECT_ID}
         editionId={EDITION_ID}
         articleTitle={articleTitle}
-        pendingDecisionCount={pendingDecisionCount}
       />
     </QueryClientProvider>,
   );
@@ -214,7 +327,7 @@ function renderTab(
 afterEach(() => vi.unstubAllGlobals());
 
 describe("InvestigationTab — montage du cockpit", () => {
-  it("monte le cockpit M24 quand l’enquête est bridge_only, même sans workspace lié", async () => {
+  it("montre zéro décision dans la barre et la vue d’ensemble sans double-fetch", async () => {
     const { fetchMock } = renderTab("unbound", "bridge_only");
 
     expect(
@@ -224,23 +337,69 @@ describe("InvestigationTab — montage du cockpit", () => {
       screen.getByRole("heading", { name: "Article étudié" }),
     ).toBeInTheDocument();
     expect(await screen.findByText("Non lié")).toBeInTheDocument();
-    expect(
-      screen.getByLabelText("Nombre de décisions non disponible"),
-    ).toHaveTextContent("—");
+    const contextCount = screen
+      .getByText("Décisions en attente")
+      .parentElement?.querySelector("dd");
+    const overviewCount = screen
+      .getByText("Décisions requises")
+      .parentElement?.querySelector("dd");
+    await waitFor(() => {
+      expect(contextCount).toHaveTextContent("0");
+      expect(overviewCount).toHaveTextContent("0");
+    });
     expect(screen.getByText("Activité")).toBeInTheDocument();
-    expect(
-      fetchMock.mock.calls.filter(([input]) =>
-        urlOf(input).endsWith(
-          `/api/investigations/${INVESTIGATION_ID}/workspace`,
+    for (const path of [
+      "/workspace",
+      "/tasks",
+      "/note-proposals",
+      "/workspace/conflicts",
+      "/bootstrap/envelope-proposal",
+      "/envelope",
+    ]) {
+      expect(
+        fetchMock.mock.calls.filter(([input]) =>
+          urlOf(input).endsWith(
+            `/api/investigations/${INVESTIGATION_ID}${path}`,
+          ),
         ),
-      ),
-    ).toHaveLength(1);
+      ).toHaveLength(1);
+    }
     expect(
       screen.getByRole("tablist", { name: "Vues du cockpit d’enquête" }),
     ).toBeInTheDocument();
     expect(
       screen.queryByRole("region", { name: "Laboratoire de preuve" }),
     ).toBeNull();
+  });
+
+  it("garde le même compte N dans la barre et la vue d’ensemble", async () => {
+    renderTab("bound", "bridge_only", "Article étudié", [
+      {
+        id: "task-1",
+        title: "Répondre à une tâche",
+        status: "awaiting_input",
+        result_refs: [],
+        result_verification_status: null,
+      },
+      {
+        id: "task-2",
+        title: "Examiner une tâche",
+        status: "awaiting_review",
+        result_refs: [],
+        result_verification_status: null,
+      },
+    ]);
+
+    const contextCount = (
+      await screen.findByText("Décisions en attente")
+    ).parentElement?.querySelector("dd");
+    const overviewCount = (
+      await screen.findByText("Décisions requises")
+    ).parentElement?.querySelector("dd");
+    await waitFor(() => {
+      expect(contextCount).toHaveTextContent("2");
+      expect(overviewCount).toHaveTextContent("2");
+    });
   });
 
   it("conserve le laboratoire legacy pour une enquête legacy même quand le workspace est lié", async () => {
@@ -252,16 +411,5 @@ describe("InvestigationTab — montage du cockpit", () => {
     expect(
       screen.queryByRole("tablist", { name: "Vues du cockpit d’enquête" }),
     ).toBeNull();
-  });
-
-  it("affiche le compteur de décisions quand le parent le fournit", async () => {
-    renderTab("bound", "bridge_only", "Article étudié", 3);
-
-    expect(
-      await screen.findByRole("tab", { name: "Vue d’ensemble" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText("Décisions en attente").nextElementSibling,
-    ).toHaveTextContent("3");
   });
 });
