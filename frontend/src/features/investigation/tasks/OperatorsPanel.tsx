@@ -18,7 +18,6 @@ import {
   useEnqueueAgentInstruction,
   useInterruptAgentSession,
   useResumeAgentSession,
-  type AgentInstructionJournalState,
   type AgentSessionBudgetView,
   type AgentSessionBrokerView,
   type AgentSessionEnvelopeBudgetView,
@@ -31,7 +30,11 @@ import {
 } from "../api/agentSessions";
 import { toWorkshopApiError } from "../api/client";
 import { useTaskEvents, useTasks, type TaskView } from "../api/tasks";
-import type { BudgetDimension, TaskStatus } from "../api/types";
+import type {
+  BudgetDimension,
+  InstructionState,
+  TaskStatus,
+} from "../api/types";
 import { BUDGET_DIMENSION_LABELS } from "../overview/overviewPresentation";
 import { INVOCATION_STATUS_LABELS } from "../samples/samplesLabels";
 import { describeTaskError } from "./errors";
@@ -78,12 +81,8 @@ const BUDGET_DIMENSIONS: readonly BudgetDimension[] = [
 ];
 
 /** A queued or in-flight instruction, as opposed to one already handled. */
-const PENDING_INSTRUCTION_STATES: ReadonlySet<AgentInstructionJournalState> =
-  new Set<AgentInstructionJournalState>([
-    "queued",
-    "delivering",
-    "delivery_unknown",
-  ]);
+const PENDING_INSTRUCTION_STATES: ReadonlySet<InstructionState> =
+  new Set<InstructionState>(["queued", "delivering", "delivery_unknown"]);
 
 function operationBudgetText(operation: AgentSessionOperationView): string {
   const parts: string[] = [];

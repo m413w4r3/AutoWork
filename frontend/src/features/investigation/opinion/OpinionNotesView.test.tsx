@@ -351,6 +351,8 @@ function makeAnchorCatalog(): ArticleAnchorCatalogViewV1 {
         caption: "Commandes exécutées par l’échantillon.",
         element_sha256: ELEMENT_HASH,
         anchor: "lead:0001",
+        proposable: true,
+        refusal_reason: null,
       },
     ],
     truncated: false,

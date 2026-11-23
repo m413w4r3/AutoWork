@@ -285,6 +285,62 @@ describe("AnchorPicker — sélecteur canonique", () => {
     ).toBeNull();
   });
 
+  it("signale les éléments M23 référençables et refusés de l’ancre choisie", async () => {
+    const user = userEvent.setup();
+    const catalog = makeCatalog({
+      elements: [
+        {
+          kind: "table",
+          key: "table-commands",
+          title: "Commandes observées",
+          caption: null,
+          element_sha256: BASE_SHA,
+          anchor: "lead:0001",
+          proposable: true,
+          refusal_reason: null,
+        },
+        {
+          kind: "chart",
+          key: "chart-volume",
+          title: "Volume des commandes",
+          caption: null,
+          element_sha256: DUP_SHA,
+          anchor: "lead:0001",
+          proposable: false,
+          refusal_reason: "note_chart_without_evidence",
+        },
+        {
+          kind: "figure",
+          key: "figure-orphan",
+          title: "Figure non rendue à un paragraphe",
+          caption: null,
+          element_sha256: DUP_SHA,
+          anchor: null,
+          proposable: false,
+          refusal_reason: "note_block_ref_stale",
+        },
+      ],
+    });
+    renderPicker({ initialAnchor: "lead:0001", catalog });
+
+    expect(
+      await screen.findByText("1 élément(s) M23 référençable(s)", {
+        selector: "li.badge",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("1 élément(s) M23 non proposable(s)", {
+        selector: "li.badge",
+      }),
+    ).toBeInTheDocument();
+
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Ancre de publication" }),
+      "lead:0002",
+    );
+    expect(screen.queryByText(/élément\(s\) M23/)).toBeNull();
+  });
+
   it("affiche un bandeau base périmée quand la proposition a épinglé une autre base", async () => {
     const user = userEvent.setup();
     const { anchorReadCount } = renderPicker({

@@ -25,6 +25,7 @@ const ADVISORY_ID = "55555555-5555-4555-8555-555555555555";
 const BASE_ID = "66666666-6666-4666-8666-666666666666";
 const ELEMENT_HASH = "a".repeat(64);
 const OTHER_HASH = "b".repeat(64);
+const CHART_HASH = "0".repeat(64);
 const BLOB_HASH = "c".repeat(64);
 const EXCERPT_HASH = "d".repeat(64);
 const ASSET_HASH = "e".repeat(64);
@@ -71,6 +72,18 @@ function makeCatalog(): ArticleAnchorCatalogViewV1 {
         caption: "Commandes exécutées par l’échantillon.",
         element_sha256: ELEMENT_HASH,
         anchor: "lead:0001",
+        proposable: true,
+        refusal_reason: null,
+      },
+      {
+        kind: "chart",
+        key: "chart-volume",
+        title: "Volume des commandes",
+        caption: null,
+        element_sha256: CHART_HASH,
+        anchor: "lead:0001",
+        proposable: false,
+        refusal_reason: "note_chart_without_evidence",
       },
       {
         kind: "figure",
@@ -79,6 +92,8 @@ function makeCatalog(): ArticleAnchorCatalogViewV1 {
         caption: null,
         element_sha256: OTHER_HASH,
         anchor: "section:2:paragraph:0007",
+        proposable: true,
+        refusal_reason: null,
       },
     ],
     truncated: false,
@@ -203,6 +218,23 @@ describe("NoteContentBlocks — sélection de références", () => {
     ]);
     expect(screen.getByText(/Élément d’article/)).toBeInTheDocument();
     expect(screen.getByText(/table-commands/)).toBeInTheDocument();
+  });
+
+  it("grise un élément M23 non proposable avec la raison serveur traduite", async () => {
+    installAnchors();
+    renderSelection();
+
+    const elementSelect = await screen.findByLabelText("Élément à référencer");
+    const refused = within(elementSelect).getByRole("option", {
+      name: /Volume des commandes.*non proposable : graphique sans preuve/,
+    });
+    expect(refused).toBeDisabled();
+    expect(
+      screen.getByText(/Un élément M23 de cette ancre est grisé/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Référencer cet élément" }),
+    ).toBeDisabled();
   });
 
   it("dérive le titre du tableau IOC et exclut les observations consultatives", async () => {

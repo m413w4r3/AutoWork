@@ -176,8 +176,10 @@ export const CONTRIBUTION_METHOD_LABELS: Record<
 
 export const INSTRUCTION_STATE_LABELS: Record<InstructionState, string> = {
   queued: "En file (agent occupé)",
+  delivering: "Livraison en cours",
   delivered: "Transmise",
   acknowledged: "Acquittée",
+  delivery_unknown: "Livraison inconnue",
   cancelled: "Annulée",
 };
 

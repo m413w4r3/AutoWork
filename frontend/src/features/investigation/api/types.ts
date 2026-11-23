@@ -163,7 +163,12 @@ export type AgentSessionState =
 
 /** `domain/agentic_operator.py::InstructionState`. */
 export type InstructionState =
-  "queued" | "delivered" | "acknowledged" | "cancelled";
+  | "queued"
+  | "delivering"
+  | "delivered"
+  | "acknowledged"
+  | "delivery_unknown"
+  | "cancelled";
 
 /** `application/investigation_workspace.py::WorkspaceOrigin`. */
 export type WorkspaceOrigin = "filesystem" | "ui" | "agent" | "system";
