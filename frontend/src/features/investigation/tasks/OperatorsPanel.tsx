@@ -1,31 +1,48 @@
 /**
  * Active-operator panel: one row per Codex CLI / Claude Code session.
  *
- * Only facts the frozen contract exposes are shown. Per-session operation and
- * budget counters and raw CLI logs are not part of `AgentSessionView`; the
- * panel states that instead of inventing them, and offers the bounded task
- * event journal on demand. Instructions go through the persistent human
- * enqueue route, so a busy agent keeps them queued.
+ * Session facts come from `AgentSessionView`; the journal-derived projection
+ * (`GET …/agent-sessions/{id}/summary`, lot B6) supplies operations, budget
+ * sums, the envelope budget, the broker view, the handoff freshness and the
+ * human instructions. The broker block is labelled as derived from the
+ * journal — no live broker state exists to read — and nothing is inferred.
+ * Instructions go through the persistent human enqueue route, so a busy
+ * agent keeps them queued.
  */
 
 import { useId, useState } from "react";
 
 import {
+  useAgentSessionSummary,
   useAgentSessions,
   useEnqueueAgentInstruction,
   useInterruptAgentSession,
   useResumeAgentSession,
+  type AgentInstructionJournalState,
+  type AgentSessionBudgetView,
+  type AgentSessionBrokerView,
+  type AgentSessionEnvelopeBudgetView,
+  type AgentSessionHandoffFreshnessView,
+  type AgentSessionHandoffSummaryView,
+  type AgentSessionInstructionWindowView,
+  type AgentSessionOperationView,
+  type AgentSessionOperationWindowView,
   type AgentSessionView,
 } from "../api/agentSessions";
 import { toWorkshopApiError } from "../api/client";
 import { useTaskEvents, useTasks, type TaskView } from "../api/tasks";
-import type { TaskStatus } from "../api/types";
+import type { BudgetDimension, TaskStatus } from "../api/types";
+import { BUDGET_DIMENSION_LABELS } from "../overview/overviewPresentation";
+import { INVOCATION_STATUS_LABELS } from "../samples/samplesLabels";
 import { describeTaskError } from "./errors";
 import {
   ADAPTER_LABELS,
   BLOCKED_REASON_LABELS,
+  formatBudgetAmount,
   formatDuration,
   formatTimestamp,
+  HANDOFF_FRESHNESS_LABELS,
+  INSTRUCTION_JOURNAL_STATE_LABELS,
   SESSION_STATE_LABELS,
   shortSha,
   TASK_ACTOR_LABELS,
@@ -49,6 +66,349 @@ const TERMINAL_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>([
   "cancelled",
   "failed",
 ]);
+
+const BUDGET_DIMENSIONS: readonly BudgetDimension[] = [
+  "bridge_turns",
+  "vt_units",
+  "shodan_credits",
+  "downloads",
+  "tool_seconds",
+  "context_tokens",
+  "context_bytes",
+];
+
+/** A queued or in-flight instruction, as opposed to one already handled. */
+const PENDING_INSTRUCTION_STATES: ReadonlySet<AgentInstructionJournalState> =
+  new Set<AgentInstructionJournalState>([
+    "queued",
+    "delivering",
+    "delivery_unknown",
+  ]);
+
+function operationBudgetText(operation: AgentSessionOperationView): string {
+  const parts: string[] = [];
+  for (const dimension of BUDGET_DIMENSIONS) {
+    const consumed = operation.consumed_budget[dimension];
+    const reserved = operation.reserved_budget[dimension];
+    if (consumed === undefined && reserved === undefined) continue;
+    parts.push(
+      `${BUDGET_DIMENSION_LABELS[dimension]} : ${formatBudgetAmount(consumed ?? 0)} consommé, ${formatBudgetAmount(reserved ?? 0)} réservé`,
+    );
+  }
+  return parts.length === 0 ? "aucun budget engagé" : parts.join(" · ");
+}
+
+function OperationList({
+  window,
+}: {
+  window: AgentSessionOperationWindowView;
+}) {
+  return (
+    <section aria-label="Opérations journalisées">
+      <h6>Opérations journalisées ({window.total})</h6>
+      {window.items.length === 0 ? (
+        <p>Aucune opération journalisée pour cette session.</p>
+      ) : (
+        <ol className="m24-events">
+          {window.items.map((operation) => (
+            <li key={operation.invocation_id}>
+              <time dateTime={operation.created_at}>
+                {formatTimestamp(operation.created_at)}
+              </time>{" "}
+              <code>{operation.tool_name}</code>{" "}
+              <span className="m24-badge">
+                {INVOCATION_STATUS_LABELS[operation.status]}
+              </span>{" "}
+              <span>
+                {operation.actor_kind === null
+                  ? "Auteur inconnu"
+                  : TASK_ACTOR_LABELS[operation.actor_kind]}
+              </span>{" "}
+              <span className="m24-muted">
+                — {operationBudgetText(operation)}
+              </span>
+            </li>
+          ))}
+        </ol>
+      )}
+      {window.truncated ? (
+        <p className="m24-muted">
+          Fenêtre bornée aux {window.limit} opérations les plus récentes (total{" "}
+          {window.total}).
+        </p>
+      ) : null}
+    </section>
+  );
+}
+
+function envelopeBudgetLine(
+  dimension: BudgetDimension,
+  envelope: AgentSessionEnvelopeBudgetView,
+): string {
+  const limit = envelope.limits?.[dimension] ?? null;
+  const remaining = envelope.remaining?.[dimension] ?? null;
+  const consumed = envelope.consumed?.[dimension] ?? 0;
+  const reserved = envelope.reserved?.[dimension] ?? 0;
+  return `${formatBudgetAmount(consumed)} consommé · ${formatBudgetAmount(reserved)} réservé · plafond ${formatBudgetAmount(limit)} · restant ${formatBudgetAmount(remaining)}`;
+}
+
+function BudgetBlock({ budget }: { budget: AgentSessionBudgetView }) {
+  const sessionLines = BUDGET_DIMENSIONS.filter(
+    (dimension) =>
+      budget.session.consumed[dimension] !== 0 ||
+      budget.session.reserved[dimension] !== 0,
+  );
+  return (
+    <section aria-label="Budget de la session">
+      <h6>Budget de la session et enveloppe</h6>
+      <p className="m24-muted">
+        {budget.session.invocation_count} invocation(s) journalisée(s) pour
+        cette session.
+      </p>
+      {sessionLines.length === 0 ? (
+        <p>Aucune consommation de budget enregistrée pour cette session.</p>
+      ) : (
+        <dl className="m24-metadata">
+          {sessionLines.map((dimension) => (
+            <div key={dimension}>
+              <dt>{BUDGET_DIMENSION_LABELS[dimension]}</dt>
+              <dd>
+                {formatBudgetAmount(budget.session.consumed[dimension])}{" "}
+                consommé ·{" "}
+                {formatBudgetAmount(budget.session.reserved[dimension])} réservé
+              </dd>
+            </div>
+          ))}
+        </dl>
+      )}
+      {budget.envelope.present ? (
+        <dl className="m24-metadata">
+          <div>
+            <dt>Enveloppe approuvée</dt>
+            <dd>
+              version {budget.envelope.version ?? "inconnue"} ·{" "}
+              {formatTimestamp(budget.envelope.approved_at)}
+            </dd>
+          </div>
+          {BUDGET_DIMENSIONS.map((dimension) => (
+            <div key={dimension}>
+              <dt>{BUDGET_DIMENSION_LABELS[dimension]}</dt>
+              <dd>{envelopeBudgetLine(dimension, budget.envelope)}</dd>
+            </div>
+          ))}
+        </dl>
+      ) : (
+        <p>Aucune enveloppe approuvée pour cette enquête.</p>
+      )}
+    </section>
+  );
+}
+
+function BrokerBlock({ broker }: { broker: AgentSessionBrokerView }) {
+  return (
+    <section aria-label="État du broker">
+      <h6>
+        Broker — <span className="m24-badge">Dérivé du journal</span>
+      </h6>
+      <p className="m24-muted">
+        Aucun état broker en direct n’est lu : ces valeurs sont dérivées des
+        invocations d’outils signées (D7) du journal.
+      </p>
+      <dl className="m24-metadata">
+        <div>
+          <dt>Appels signés</dt>
+          <dd>{broker.signed_call_count}</dd>
+        </div>
+        <div>
+          <dt>Revue humaine requise</dt>
+          <dd>
+            {broker.needs_review_count}
+            {broker.reconciliation_required
+              ? " — réconciliation requise"
+              : null}
+          </dd>
+        </div>
+        <div>
+          <dt>Dernier appel signé</dt>
+          <dd>
+            {broker.last_signed_call === null
+              ? "Aucun"
+              : `${broker.last_signed_call.tool_name} · ${INVOCATION_STATUS_LABELS[broker.last_signed_call.status]} · ${formatTimestamp(broker.last_signed_call.created_at)}`}
+          </dd>
+        </div>
+      </dl>
+    </section>
+  );
+}
+
+function freshnessText(
+  freshness: AgentSessionHandoffFreshnessView | null,
+): string {
+  if (freshness === null) return "Non vérifiée";
+  if (!freshness.checked) return `Non vérifiée (${freshness.reason})`;
+  const label = HANDOFF_FRESHNESS_LABELS[freshness.state];
+  return freshness.diffs.length === 0
+    ? label
+    : `${label} — ${freshness.diffs.length} référence(s) modifiée(s)`;
+}
+
+function HandoffBlock({
+  handoff,
+}: {
+  handoff: AgentSessionHandoffSummaryView | null;
+}) {
+  return (
+    <section aria-label="Dernière passation">
+      <h6>Dernière passation</h6>
+      {handoff === null ? (
+        <p>Aucune passation liée à cette session.</p>
+      ) : (
+        <dl className="m24-metadata">
+          <div>
+            <dt>Passation</dt>
+            <dd>
+              <code>{handoff.handoff_id}</code> · version {handoff.version}
+            </dd>
+          </div>
+          <div>
+            <dt>SHA-256</dt>
+            <dd>
+              <code>{shortSha(handoff.sha256)}</code>
+            </dd>
+          </div>
+          <div>
+            <dt>Créée</dt>
+            <dd>{formatTimestamp(handoff.created_at)}</dd>
+          </div>
+          <div>
+            <dt>Acteurs</dt>
+            <dd>
+              {TASK_ACTOR_LABELS[handoff.from_actor.kind]}{" "}
+              {handoff.from_actor.actor_id} →{" "}
+              {TASK_ACTOR_LABELS[handoff.to_actor.kind]}{" "}
+              {handoff.to_actor.actor_id}
+            </dd>
+          </div>
+          <div>
+            <dt>Fraîcheur</dt>
+            <dd>{freshnessText(handoff.freshness)}</dd>
+          </div>
+        </dl>
+      )}
+    </section>
+  );
+}
+
+function InstructionBlock({
+  window,
+}: {
+  window: AgentSessionInstructionWindowView;
+}) {
+  const pending = window.items.find((instruction) =>
+    PENDING_INSTRUCTION_STATES.has(instruction.state),
+  );
+  return (
+    <section aria-label="Instructions humaines">
+      <h6>Instructions humaines ({window.total})</h6>
+      {pending === undefined ? (
+        <p>Aucune instruction en attente.</p>
+      ) : (
+        <p className="m24-message">
+          <strong>Instruction en attente :</strong> {pending.text}{" "}
+          <span className="m24-badge">
+            {INSTRUCTION_JOURNAL_STATE_LABELS[pending.state]}
+          </span>{" "}
+          <span className="m24-muted">
+            {pending.queue_position === 0
+              ? null
+              : `position ${pending.queue_position} · `}
+            enfilée {formatTimestamp(pending.queued_at)}
+          </span>
+        </p>
+      )}
+      {window.items.length === 0 ? (
+        <p>Aucune instruction humaine pour cette session.</p>
+      ) : (
+        <ol className="m24-events">
+          {window.items.map((instruction) => (
+            <li key={instruction.instruction_id}>
+              <time dateTime={instruction.created_at}>
+                {formatTimestamp(instruction.created_at)}
+              </time>{" "}
+              <span className="m24-badge">
+                {INSTRUCTION_JOURNAL_STATE_LABELS[instruction.state]}
+              </span>{" "}
+              {instruction.queue_position === 0 ? null : (
+                <span>position {instruction.queue_position} · </span>
+              )}
+              <code>{shortSha(instruction.text_sha256)}</code>{" "}
+              <span>{instruction.text}</span>
+              <span className="m24-muted">
+                {" — "}enfilée {formatTimestamp(instruction.queued_at)}
+                {instruction.delivered_at === null
+                  ? null
+                  : ` · transmise ${formatTimestamp(instruction.delivered_at)}`}
+                {instruction.acknowledged_at === null
+                  ? null
+                  : ` · acquittée ${formatTimestamp(instruction.acknowledged_at)}`}
+                {instruction.cancelled_at === null
+                  ? null
+                  : ` · annulée ${formatTimestamp(instruction.cancelled_at)}${
+                      instruction.cancel_reason === null
+                        ? ""
+                        : ` (${instruction.cancel_reason})`
+                    }`}
+              </span>
+            </li>
+          ))}
+        </ol>
+      )}
+      {window.truncated ? (
+        <p className="m24-muted">
+          Fenêtre bornée aux {window.limit} dernières instructions (total{" "}
+          {window.total}).
+        </p>
+      ) : null}
+    </section>
+  );
+}
+
+/**
+ * Human-only journal projection of one session. Loading, error and empty
+ * states are explicit and in French; an absent field is shown as absent, not
+ * filled with a guess.
+ */
+function SessionSummary({
+  investigationId,
+  sessionId,
+}: {
+  investigationId: string;
+  sessionId: string;
+}) {
+  const summary = useAgentSessionSummary(investigationId, sessionId);
+  const error = summary.isError ? toWorkshopApiError(summary.error) : null;
+  const data = summary.data;
+  return (
+    <section className="m24-operator__summary" aria-label="Résumé de session">
+      <h6>Résumé de session — dérivé du journal</h6>
+      {error !== null ? (
+        <p role="alert" className="error-message">
+          Résumé de session indisponible — {describeTaskError(error)}
+        </p>
+      ) : data === undefined ? (
+        <p role="status">Chargement du résumé de session…</p>
+      ) : (
+        <>
+          <OperationList window={data.operations} />
+          <BudgetBlock budget={data.budget} />
+          <BrokerBlock broker={data.broker} />
+          <HandoffBlock handoff={data.handoff} />
+          <InstructionBlock window={data.instructions} />
+        </>
+      )}
+    </section>
+  );
+}
 
 function SessionRow({
   investigationId,
@@ -182,14 +542,6 @@ function SessionRow({
           <dd>{formatTimestamp(session.last_activity_at)}</dd>
         </div>
         <div>
-          <dt>Opérations</dt>
-          <dd>Non exposées par le contrat M24</dd>
-        </div>
-        <div>
-          <dt>Budget</dt>
-          <dd>Non exposé par le contrat M24</dd>
-        </div>
-        <div>
           <dt>Checkpoint</dt>
           <dd>
             {session.checkpoint_ref ?? "Aucun"}{" "}
@@ -207,6 +559,11 @@ function SessionRow({
           <dd>{submitted}</dd>
         </div>
       </dl>
+
+      <SessionSummary
+        investigationId={investigationId}
+        sessionId={session.id}
+      />
 
       {session.state === "lost" ? (
         <p className="m24-warning" role="status">
