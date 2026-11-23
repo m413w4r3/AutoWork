@@ -84,6 +84,8 @@ from cti_app.domain.publication_document import (
     PublicationDocumentV6,
     PublicationDocumentV7,
     PublicationDocumentV8,
+    PublicationDocumentV9,
+    PublicationDocumentV10,
     publication_document_from_json,
     serialize_publication_document,
 )
@@ -432,6 +434,7 @@ class PublicationRenderService:
         findings: tuple[InvestigationFinding, ...] = (),
         evidence_observations: tuple[EvidenceObservation, ...] = (),
         note_block_context: NoteBlockRenderContext | None = None,
+        publication_v9: PublicationDocumentV9 | PublicationDocumentV10 | None = None,
     ) -> DraftPublicationRender:
         """Compile an ephemeral, watermarked draft without creating render state."""
         prepared = self._prepare_draft_preview(
@@ -445,6 +448,7 @@ class PublicationRenderService:
             infrastructure_graph=infrastructure_graph,
             findings=findings,
             evidence_observations=evidence_observations,
+            publication_v9=publication_v9,
         )
         try:
             render_kwargs: dict[str, Any] = {}
@@ -496,6 +500,7 @@ class PublicationRenderService:
         findings: tuple[InvestigationFinding, ...] = (),
         evidence_observations: tuple[EvidenceObservation, ...] = (),
         note_block_context: NoteBlockRenderContext | None = None,
+        publication_v9: PublicationDocumentV9 | PublicationDocumentV10 | None = None,
     ) -> tuple[CanonicalPublicationDocument, dict[str, Any]]:
         """Build canonical publication and preview inputs without compiling a PDF."""
         prepared = self._prepare_draft_preview(
@@ -509,6 +514,7 @@ class PublicationRenderService:
             infrastructure_graph=infrastructure_graph,
             findings=findings,
             evidence_observations=evidence_observations,
+            publication_v9=publication_v9,
         )
         try:
             build_kwargs: dict[str, Any] = {}
@@ -545,6 +551,7 @@ class PublicationRenderService:
         infrastructure_graph: InvestigationGraph | None,
         findings: tuple[InvestigationFinding, ...],
         evidence_observations: tuple[EvidenceObservation, ...],
+        publication_v9: PublicationDocumentV9 | PublicationDocumentV10 | None,
     ) -> _PreparedDraftPreview:
         try:
             projection = TypstDraftPreviewDocument(
@@ -558,6 +565,7 @@ class PublicationRenderService:
                 base_publication_body_sha256,
                 base_publication_artifact,
                 title_proof,
+                publication_v9,
             )
         except ValueError as exc:
             raise PublicationRenderDocumentInvalidError(str(exc)) from exc

@@ -45,6 +45,8 @@ from cti_app.domain.production_synthesis import (
 from cti_app.domain.publication_document import (
     CanonicalPublicationDocument,
     PublicationDocumentV5,
+    PublicationDocumentV9,
+    PublicationDocumentV10,
     publication_document_article_v5_body,
     publication_document_from_json,
     publication_document_v5_sha256,
@@ -67,6 +69,7 @@ class DraftOpinionPdfRenderer(Protocol):
         base_publication_artifact: ProductionArtifact | None = None,
         title_proof: TitleCorrectionProof | None = None,
         note_block_context: NoteBlockRenderContext | None = None,
+        publication_v9: PublicationDocumentV9 | PublicationDocumentV10 | None = None,
     ) -> DraftPublicationRender | CompiledTypstDocument: ...
 
 
@@ -85,6 +88,7 @@ class DraftOpinionRenderInputBuilder(Protocol):
         base_publication_artifact: ProductionArtifact | None = None,
         title_proof: TitleCorrectionProof | None = None,
         note_block_context: NoteBlockRenderContext | None = None,
+        publication_v9: PublicationDocumentV9 | PublicationDocumentV10 | None = None,
     ) -> tuple[CanonicalPublicationDocument, dict[str, Any]]: ...
 
 
@@ -331,6 +335,11 @@ class AnalystOpinionPreviewService:
         if parsed_synthesis.title != base_document_v5.title:
             preview_kwargs["base_publication_artifact"] = base
             preview_kwargs["title_proof"] = title_proof
+        if isinstance(document, (PublicationDocumentV9, PublicationDocumentV10)):
+            # The V9/V10 envelope carries the resolved placements of this exact
+            # V5 body, so the preview renders after-paragraph elements like the
+            # publication instead of refusing them.
+            preview_kwargs["publication_v9"] = document
         if infrastructure_graph is not None:
             preview_kwargs["infrastructure_graph"] = infrastructure_graph
         if note_block_context is not None:

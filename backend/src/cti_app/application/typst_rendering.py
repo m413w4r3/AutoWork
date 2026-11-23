@@ -113,6 +113,7 @@ from cti_app.domain.publication_document import (
     PublicationTableV1,
     extract_article_overview,
     is_article_overview_heading,
+    publication_document_article_v5_body,
     publication_document_text_anchors,
     publication_document_v5_sha256,
     publication_note_body_anchors,
@@ -1701,7 +1702,13 @@ class TypstPublicationModelV2:
 
 @dataclass(frozen=True, slots=True)
 class TypstDraftPreviewDocument:
-    """Ephemeral V5 plus draft opinion projection; it is never a canonical V6."""
+    """Ephemeral V5 plus draft opinion projection; it is never a canonical V6.
+
+    ``publication_v9`` carries the pinned V9/V10 envelope of the exact same V5
+    body so the preview resolves ``after_paragraph`` placements like the
+    publication instead of refusing them.  It never replaces the projected V5
+    body; it only supplies the resolved anchors and article format.
+    """
 
     base_publication: PublicationDocumentV5
     analyst_opinion: AnalystOpinionV1
@@ -1712,6 +1719,7 @@ class TypstDraftPreviewDocument:
     base_publication_body_sha256: str | None = None
     base_publication_artifact: ProductionArtifact | None = None
     title_proof: TitleCorrectionProof | None = None
+    publication_v9: PublicationDocumentV9 | PublicationDocumentV10 | None = None
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.base_publication, name)
@@ -1753,7 +1761,15 @@ class TypstDraftPreviewDocument:
             raise ValueError("Draft preview infrastructure graph is not pinned to its V5 opinion")
         if publication_document_v5_sha256(self.base_publication) != expected_body_sha256:
             raise ValueError("Draft opinion does not identify this exact V5 publication")
-        anchors = publication_renderable_body_anchors(self.base_publication.document)
+        if self.publication_v9 is not None:
+            envelope_body = publication_document_article_v5_body(self.publication_v9)
+            if envelope_body is None or publication_document_v5_sha256(
+                envelope_body
+            ) != publication_document_v5_sha256(self.base_publication):
+                raise ValueError("Draft preview V9 base does not wrap the projected V5 body")
+            anchors = publication_note_body_anchors(self.publication_v9)
+        else:
+            anchors = publication_renderable_body_anchors(self.base_publication.document)
         if any(
             item.anchor not in anchors or not item.anchor.startswith(("lead:", "section:"))
             for item in self.analyst_opinion.observations
@@ -1992,7 +2008,10 @@ _NOTE_ELEMENT_KIND_LABELS: dict[str, str] = {
     "figure": "Figure",
 }
 _NOTE_IOC_COLUMNS = ("Observation", "Type", "Valeur", "Source", "Observé le", "Empreinte")
-_NOTE_IOC_COLUMN_WEIGHTS = (1.6, 0.9, 1.8, 1.2, 1.1, 2.6)
+# The observed-at column holds an ISO timestamp; at 1.1fr its longest line
+# overflowed into the fingerprint column.  Keep enough width for the date to
+# wrap inside its own cell (avis and bulletin share this layout).
+_NOTE_IOC_COLUMN_WEIGHTS = (1.6, 0.9, 1.8, 1.2, 2.2, 2.6)
 
 
 def _note_display_part(text: str, *, technical: bool) -> dict[str, Any]:
@@ -2506,7 +2525,7 @@ class TypstRenderer:
 
         normalized_document_label = document_label.strip()
         classification_document = (
-            document.base_publication
+            document.publication_v9 or document.base_publication
             if isinstance(document, TypstDraftPreviewDocument)
             else document
         )
@@ -2705,7 +2724,11 @@ def project_publication_to_typst_model(
     """Project a canonical publication while keeping semantic content as data."""
     draft_preview = value if isinstance(value, TypstDraftPreviewDocument) else None
     publication_v9 = (
-        value if isinstance(value, (PublicationDocumentV9, PublicationDocumentV10)) else None
+        value
+        if isinstance(value, (PublicationDocumentV9, PublicationDocumentV10))
+        else draft_preview.publication_v9
+        if draft_preview is not None
+        else None
     )
     publication_v8 = value if isinstance(value, PublicationDocumentV8) else None
     publication_v7 = (
@@ -3149,7 +3172,9 @@ def project_publication_to_typst_model(
         return references
 
     body_anchor_texts = (
-        publication_renderable_body_anchors(document)
+        publication_note_body_anchors(publication_v9)
+        if draft_preview is not None and publication_v9 is not None
+        else publication_renderable_body_anchors(document)
         if draft_preview is not None
         else publication_note_body_anchors(cast(CanonicalPublicationDocument, value))
     )
@@ -3169,7 +3194,11 @@ def project_publication_to_typst_model(
         note_blocks_by_id = _note_content_blocks_render_data(
             opinion=opinion,
             base_document=(
-                value.base_publication if isinstance(value, TypstDraftPreviewDocument) else value
+                value.publication_v9
+                if isinstance(value, TypstDraftPreviewDocument) and value.publication_v9 is not None
+                else value.base_publication
+                if isinstance(value, TypstDraftPreviewDocument)
+                else value
             ),
             observations=context_observations,
             blobs=note_block_context.blobs if note_block_context is not None else {},
@@ -3243,7 +3272,11 @@ def project_publication_to_typst_model(
     )
     if article_overview_render is None:
         canonical_article_format = (
-            publication_v8.article_format if publication_v8 is not None else None
+            publication_v8.article_format
+            if publication_v8 is not None
+            else publication_v9.article_format
+            if publication_v9 is not None
+            else None
         )
         overview = (
             canonical_article_format.overview
