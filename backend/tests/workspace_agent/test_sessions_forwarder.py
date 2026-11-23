@@ -24,7 +24,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -52,7 +52,7 @@ MAX_TUNNELS = 8
 
 
 @pytest.fixture
-def short_dir() -> Path:
+def short_dir() -> Iterator[Path]:
     """A /tmp directory short enough for an AF_UNIX pathname."""
 
     path = Path(tempfile.mkdtemp(prefix="fwd-", dir="/tmp"))

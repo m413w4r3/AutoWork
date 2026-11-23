@@ -264,7 +264,7 @@ def _envelope(response: Mapping[str, object]) -> tuple[dict[str, object], bool]:
 
 def _expected_body(tool: str, arguments: Mapping[str, object]) -> bytes:
     spec = catalog.by_mcp_name()[tool]
-    return catalog.canonical_json_bytes(catalog.build_body(spec, arguments))
+    return cast(bytes, catalog.canonical_json_bytes(catalog.build_body(spec, arguments)))
 
 
 @pytest.fixture

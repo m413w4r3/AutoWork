@@ -24,6 +24,7 @@ import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from typing import cast
 
 import pytest
 from sidecars.workspace_agent.sessions import process
@@ -83,13 +84,16 @@ def _plant_egress_socket(path: Path) -> None:
 
 def _bwrap_profile(base: Path, cli_argv: tuple[str, ...]) -> list[str]:
     dirs = _session_dirs(base)
-    return process.build_bwrap_argv(
-        cli_argv,
-        workspace_binds=(),
-        ipc_directory=dirs["ipc"],
-        scratch_directory=dirs["scratch"],
-        config_directory=dirs["config"],
-        work_directory=dirs["work"],
+    return cast(
+        list[str],
+        process.build_bwrap_argv(
+            cli_argv,
+            workspace_binds=(),
+            ipc_directory=dirs["ipc"],
+            scratch_directory=dirs["scratch"],
+            config_directory=dirs["config"],
+            work_directory=dirs["work"],
+        ),
     )
 
 
@@ -518,7 +522,12 @@ def test_attestation_rejects_fake_or_tampered_evidence(
         _valid_evidence(ipv4_routes=1),
         _valid_evidence(ipv6_routes=["::1/128", "fe80::/64"]),
         _valid_evidence(loopback={"v4_bind": True, "v4_connect": True, "v6_bind": True}),
-        _valid_evidence(blocked={**dict(_valid_evidence()["blocked"]), "10.0.0.1": "CONNECTED"}),
+        _valid_evidence(
+            blocked={
+                **cast(dict[str, str], _valid_evidence()["blocked"]),
+                "10.0.0.1": "CONNECTED",
+            }
+        ),
         _valid_evidence(host_loopback="reachable"),
         _valid_evidence(errors=["unexpected_interfaces"]),
         _valid_evidence(extra="unexpected"),

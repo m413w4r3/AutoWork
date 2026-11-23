@@ -27,6 +27,7 @@ import threading
 from collections.abc import Callable, Iterator, Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import TypedDict, cast
 
 import pytest
 from sidecars.workspace_agent.sessions import egress, process
@@ -181,10 +182,13 @@ class _FakeService:
             adapter_kind=adapter_kind,
             network_mode="isolated_egress",
         )
-        return self.supervisor.prepare(
-            PrepareSessionRequest.from_payload(body),
-            idempotency_key="m24-life-prepare-0001",
-            body_sha256="a" * 64,
+        return cast(
+            dict[str, object],
+            self.supervisor.prepare(
+                PrepareSessionRequest.from_payload(body),
+                idempotency_key="m24-life-prepare-0001",
+                body_sha256="a" * 64,
+            ),
         )
 
     def accept_manifest(self) -> None:
@@ -204,26 +208,32 @@ class _FakeService:
         )
 
     def start(self, *, key: str = START_KEY) -> dict[str, object]:
-        return self.supervisor.start(
-            SESSION_ID,
-            StartSessionRequest(),
-            idempotency_key=key,
-            body_sha256="b" * 64,
+        return cast(
+            dict[str, object],
+            self.supervisor.start(
+                SESSION_ID,
+                StartSessionRequest(),
+                idempotency_key=key,
+                body_sha256="b" * 64,
+            ),
         )
 
     def interrupt(self, *, key: str = INTERRUPT_KEY) -> dict[str, object]:
-        return self.supervisor.interrupt(
-            SESSION_ID,
-            ReasonRequest.from_payload({"reason": "life-1 oracle"}),
-            idempotency_key=key,
-            body_sha256="f" * 64,
+        return cast(
+            dict[str, object],
+            self.supervisor.interrupt(
+                SESSION_ID,
+                ReasonRequest.from_payload({"reason": "life-1 oracle"}),
+                idempotency_key=key,
+                body_sha256="f" * 64,
+            ),
         )
 
     def state(self) -> str:
         return str(self.supervisor.status(SESSION_ID)["state"])
 
     def session_dir(self) -> Path:
-        return self.config.session_root / SESSION_ID
+        return cast(Path, self.config.session_root) / SESSION_ID
 
     def socket(self, name: str) -> Path:
         return self.session_dir() / "ipc" / name
@@ -354,11 +364,19 @@ class _FakeConnector:
         return client_end
 
 
+class _RecordedRequest(TypedDict):
+    """One relay request as recorded by the fake backend."""
+
+    path: str
+    headers: dict[str, str]
+    body: bytes
+
+
 class _FakeBackend:
     """A loopback HTTP backend that records the relay's forwarded request."""
 
     def __init__(self) -> None:
-        self.requests: list[dict[str, object]] = []
+        self.requests: list[_RecordedRequest] = []
         backend = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -388,7 +406,7 @@ class _FakeBackend:
 
     @property
     def url(self) -> str:
-        host, port = self._server.server_address[:2]
+        host, port = cast(tuple[str, int], self._server.server_address[:2])
         return f"http://{host}:{port}"
 
     def close(self) -> None:
