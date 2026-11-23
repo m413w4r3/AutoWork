@@ -54,7 +54,6 @@ from tests.test_analyst_opinion_service import OpinionHarness, make_opinion_harn
 from tests.test_opinion_note_proposals import base_v5_with_sections
 from tests.test_publication_builder_v4 import _canonical_inputs
 from tests.test_publication_builder_v4 import _table as _enrichment_table
-from tests.test_publication_document_v6 import _base_v5
 from tests.test_publication_document_v7 import _v6
 
 
@@ -134,6 +133,18 @@ def _newer_publication(harness: OpinionHarness) -> None:
 def test_anchor_route_returns_exact_base_identity() -> None:
     harness = make_opinion_harness()
     client = _client(harness)
+    article = base_v5_with_sections(("Premier paragraphe.", "Second paragraphe."))
+    article = replace(
+        article,
+        document=replace(
+            article.document,
+            sections=(
+                replace(article.document.sections[0], heading="Zulu"),
+                replace(article.document.sections[1], heading="Alpha"),
+            ),
+        ),
+    )
+    _install_base(harness, article)
 
     response = client.get(_path(harness))
 
@@ -144,9 +155,14 @@ def test_anchor_route_returns_exact_base_identity() -> None:
     assert payload["base_publication_sha256"] == _sha256(harness.base_bytes)
     assert payload["source"] == "current_base"
     assert payload["truncated"] is False
+    assert payload["article_title"] == article.title
+    assert payload["sections"] == [
+        {"section_index": 0, "heading": "Zulu"},
+        {"section_index": 1, "heading": "Alpha"},
+    ]
     anchors = {item["anchor"]: item for item in payload["anchors"]}
     lead = anchors["lead:0001"]
-    assert lead["text"] == _base_v5().document.lead[0].text
+    assert lead["text"] == article.document.lead[0].text
     assert lead["text_sha256"] == _sha256(lead["text"].encode("utf-8"))
     assert lead["section_index"] is None
     assert lead["paragraph_index"] == 0

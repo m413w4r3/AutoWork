@@ -44,6 +44,11 @@ export interface ArticleElementViewV1 {
   refusal_reason: string | null;
 }
 
+export interface ArticleSectionViewV1 {
+  section_index: number;
+  heading: string;
+}
+
 export interface ArticleAnchorCatalogViewV1 {
   base_publication_artifact_id: Uuid;
   base_publication_version: number;
@@ -52,6 +57,9 @@ export interface ArticleAnchorCatalogViewV1 {
   anchors: ArticleAnchorViewV1[];
   elements: ArticleElementViewV1[];
   truncated: boolean;
+  /** Additive metadata from the same canonical publication document. */
+  article_title?: string | null;
+  sections?: ArticleSectionViewV1[];
 }
 
 export const articleAnchorsKeys = {

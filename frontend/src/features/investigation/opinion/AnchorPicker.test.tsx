@@ -192,6 +192,12 @@ function renderPicker({
   };
 }
 
+async function openAdvancedSelection(user = userEvent.setup()): Promise<void> {
+  const summaries = await screen.findAllByText("Sélection avancée");
+  const latestSummary = summaries[summaries.length - 1];
+  if (latestSummary !== undefined) await user.click(latestSummary);
+}
+
 afterEach(() => {
   vi.unstubAllGlobals();
 });
@@ -199,6 +205,7 @@ afterEach(() => {
 describe("AnchorPicker — sélecteur canonique", () => {
   it("charge la base de publication et groupe lead/sections par index numérique", async () => {
     const { container, calls } = renderPicker();
+    await openAdvancedSelection();
 
     const select = await screen.findByRole("combobox", {
       name: "Ancre de publication",
@@ -246,6 +253,7 @@ describe("AnchorPicker — sélecteur canonique", () => {
 
   it("affiche le texte complet borné et le badge d’occurrence des paragraphes identiques", async () => {
     renderPicker({ initialAnchor: "lead:0002" });
+    await openAdvancedSelection();
 
     expect(
       await screen.findByText("Paragraphe dupliqué.", { selector: "p[title]" }),
@@ -255,6 +263,7 @@ describe("AnchorPicker — sélecteur canonique", () => {
     ).toBeInTheDocument();
 
     renderPicker({ initialAnchor: "lead:0003" });
+    await openAdvancedSelection();
     const badges = await screen.findAllByText("occurrence 2 sur 2", {
       selector: "li.badge",
     });
@@ -267,6 +276,7 @@ describe("AnchorPicker — sélecteur canonique", () => {
       initialAnchor: "lead:0001",
       notes: [makeNote("lead:0001")],
     });
+    await openAdvancedSelection(user);
 
     expect(
       await screen.findByText("remplace la note existante", {
@@ -322,6 +332,7 @@ describe("AnchorPicker — sélecteur canonique", () => {
       ],
     });
     renderPicker({ initialAnchor: "lead:0001", catalog });
+    await openAdvancedSelection(user);
 
     expect(
       await screen.findByText("1 élément(s) M23 référençable(s)", {
@@ -346,6 +357,7 @@ describe("AnchorPicker — sélecteur canonique", () => {
     const { anchorReadCount } = renderPicker({
       proposal: makeProposal({ base_publication_artifact_id: OTHER_BASE_ID }),
     });
+    await openAdvancedSelection(user);
 
     expect(await screen.findByText(/Base périmée/)).toBeInTheDocument();
     const reload = screen.getByRole("button", { name: "Recharger les ancres" });
@@ -357,6 +369,7 @@ describe("AnchorPicker — sélecteur canonique", () => {
   it("refuse explicitement une ancre absente et propose de recharger", async () => {
     const user = userEvent.setup();
     const { anchorReadCount } = renderPicker({ initialAnchor: "lead:0099" });
+    await openAdvancedSelection(user);
 
     expect(
       await screen.findByText(/n’apparaît pas dans la base de publication/),
@@ -374,6 +387,7 @@ describe("AnchorPicker — sélecteur canonique", () => {
   it("garde la saisie manuelle derrière un mode diagnostic sans datalist", async () => {
     const user = userEvent.setup();
     const { container } = renderPicker();
+    await openAdvancedSelection(user);
 
     const summary = await screen.findByText(
       "Diagnostic — saisie manuelle d’ancre",
@@ -382,12 +396,12 @@ describe("AnchorPicker — sélecteur canonique", () => {
     expect(details).not.toBeNull();
     expect(details?.open).toBe(false);
     expect(container.querySelector("datalist")).toBeNull();
-    expect(
-      screen.getByText(/le serveur reste l’autorité/i),
-    ).toBeInTheDocument();
     await screen.findByRole("combobox", { name: "Ancre de publication" });
 
     await user.click(summary);
+    expect(
+      screen.getByText(/le serveur reste l’autorité/i),
+    ).toBeInTheDocument();
     const manual = screen.getByRole("textbox", { name: "Ancre manuelle" });
     await user.clear(manual);
     await user.type(manual, "section:4:paragraph:0002");
@@ -411,6 +425,7 @@ describe("AnchorPicker — sélecteur canonique", () => {
     render(<Harness initialAnchor="lead:0001" />, {
       wrapper: wrapperFor(client),
     });
+    await openAdvancedSelection(user);
 
     expect(
       await screen.findByText(/Ancres de publication indisponibles/),

@@ -83,6 +83,14 @@ class ArticleElementV1:
 
 
 @dataclass(frozen=True, slots=True)
+class ArticleSectionV1:
+    """One canonical publication section heading and its zero-based index."""
+
+    section_index: int
+    heading: str
+
+
+@dataclass(frozen=True, slots=True)
 class ArticleAnchorCatalogV1:
     base_publication_artifact_id: UUID
     base_publication_version: int
@@ -91,6 +99,9 @@ class ArticleAnchorCatalogV1:
     anchors: tuple[ArticleAnchorV1, ...]
     elements: tuple[ArticleElementV1, ...]
     truncated: bool
+    # Additive reader metadata projected from the same immutable publication.
+    article_title: str | None = None
+    sections: tuple[ArticleSectionV1, ...] = ()
 
 
 class ArticleAnchorErrorCode(StrEnum):
@@ -271,6 +282,7 @@ class InvestigationArticleAnchorsService:
         truncated = (
             len(anchor_items) > MAX_ARTICLE_ANCHORS or len(element_items) > MAX_ARTICLE_ELEMENTS
         )
+        article_body = publication_document_article_v5_body(base.document)
         return ArticleAnchorCatalogV1(
             base_publication_artifact_id=base.artifact.id,
             base_publication_version=base.artifact.version,
@@ -279,6 +291,15 @@ class InvestigationArticleAnchorsService:
             anchors=tuple(anchor_items[:MAX_ARTICLE_ANCHORS]),
             elements=tuple(element_items[:MAX_ARTICLE_ELEMENTS]),
             truncated=truncated,
+            article_title=article_body.title if article_body is not None else None,
+            sections=(
+                tuple(
+                    ArticleSectionV1(section_index=index, heading=section.heading)
+                    for index, section in enumerate(article_body.sections)
+                )
+                if article_body is not None
+                else ()
+            ),
         )
 
 
@@ -290,6 +311,7 @@ __all__ = [
     "ArticleBaseUnavailable",
     "ArticleBaseV1",
     "ArticleElementV1",
+    "ArticleSectionV1",
     "InvestigationArticleAnchorsService",
     "resolve_current_publication_base",
     "resolve_pinned_publication_base",
