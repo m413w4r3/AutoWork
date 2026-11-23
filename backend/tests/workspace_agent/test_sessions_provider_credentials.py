@@ -312,8 +312,8 @@ def test_collect_manifest_ignores_nonoutputs_and_replay_preserves_import_provena
             {"op": "seed_profile"},
             {"op": "write", "path": "notes/allowed.md", "text": "# allowed note\n"},
             {"op": "write", "path": "result.md", "text": "allowed result\n"},
-            # The content is sensitive, but this extension is outside the manifest.
-            {"op": "copy_credential", "path": "notes/result.json"},
+            # Harmless content with a non-manifest extension is ignored.
+            {"op": "write", "path": "notes/result.json", "text": '{"synthetic": true}\n'},
             {"op": "write", "path": "notes/image.png", "text": "synthetic image bytes"},
             {"op": "write", "path": "notes/nontext.md", "text": "bad\u0000markdown"},
             {"op": "write", "path": "work/nested.md", "text": "out of scope\n"},
@@ -427,6 +427,32 @@ def test_collect_manifest_ignores_nonoutputs_and_replay_preserves_import_provena
         closed_result = next(item for item in closed_snapshot.files if item.path == allowed_result)
         assert closed_result.revision_id == result_state.revision_id
         assert closed_result.policy_class == "generated_immutable"
+
+
+def test_collect_refuses_a_provider_credential_outside_the_manifest(
+    session_base: Path,
+) -> None:
+    script = fake_script(
+        [
+            {"op": "seed_profile"},
+            {"op": "copy_credential", "path": "notes/result.json"},
+            {"op": "exit", "code": 0},
+        ]
+    )
+    with running_session_agent(session_base) as running, running.client() as client:
+        _, prepared = _prepare(client, running)
+        assert prepared.status_code == 200, prepared.text
+        write_fake_script(running, script)
+        started = post_session(client, running, f"/v1/sessions/{SESSION_ID}/start", {}, START_KEY)
+        assert started.status_code == 200, started.text
+        wait_for_state(client, running, "awaiting_instruction", "stopped", "failed")
+
+        _refused(client, running)
+
+        assert (
+            workspace_files_containing(running, SYNTHETIC_PROVIDER_CREDENTIAL.encode("ascii")) == []
+        )
+        assert not (running.host_path / "notes" / "agents" / TASK_ID / "result.json").exists()
 
 
 def test_collect_refuses_a_synthetic_credential_under_an_allowed_markdown_name(

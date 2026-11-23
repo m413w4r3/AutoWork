@@ -2929,8 +2929,8 @@ class SessionSupervisor:
     def _capture(self, handle: _Session) -> tuple[list[dict[str, object]], list[str]]:
         record = handle.record
         workspace_descriptor = self._workspaces.get_workspace(record.workspace_id)
-        entries: list[tuple[str, str, bytes]] = []
-        total = 0
+        candidates: list[tuple[str, str, bytes, _CaptureOutputDeclaration, str]] = []
+        scan_total = 0
         try:
             scratch_info = handle.scratch.lstat()
         except OSError:
@@ -2960,10 +2960,16 @@ class SessionSupervisor:
 
             for source in sources:
                 relative = _capture_source_relative(source, source_root, handle.directory)
-                if relative is None or not _capture_manifest_allows(declaration, relative):
+                if relative is None:
                     continue
-                if _is_credential_file_name(PurePosixPath(relative).name):
-                    continue
+                destination = declaration.destination_template.format(
+                    task_id=record.task_id,
+                    session_id=record.session_id,
+                    name=PurePosixPath(relative).name,
+                    relative=relative,
+                )
+                if any(_is_credential_file_name(part) for part in PurePosixPath(relative).parts):
+                    self._refuse_secret_exposure(handle, ((destination, declaration.kind, b""),))
                 try:
                     info = source.lstat()
                 except OSError:
@@ -2980,21 +2986,25 @@ class SessionSupervisor:
                 data = self._read_capture_file(source)
                 if data is None:
                     continue
-                total += len(data)
-                if total > MAX_CAPTURE_TOTAL_BYTES:
+                # The scan budget includes candidates that the output manifest
+                # will ignore, so secret checks cannot grow without bound.
+                scan_total += len(data)
+                if scan_total > MAX_CAPTURE_TOTAL_BYTES:
                     raise BudgetExceededError("capture")
-                destination = declaration.destination_template.format(
-                    task_id=record.task_id,
-                    session_id=record.session_id,
-                    name=PurePosixPath(relative).name,
-                    relative=relative,
-                )
-                entries.append((destination, declaration.kind, data))
+                candidates.append((destination, declaration.kind, data, declaration, relative))
         captured: list[dict[str, object]] = []
         captured_notes: list[str] = []
         # F2: the whole capture is refused before anything reaches the
         # versioned workspace; a single offending file revokes the session.
-        self._refuse_secret_exposure(handle, entries)
+        self._refuse_secret_exposure(
+            handle,
+            tuple((destination, kind, data) for destination, kind, data, _, _ in candidates),
+        )
+        entries = [
+            (destination, kind, data)
+            for destination, kind, data, declaration, relative in candidates
+            if _capture_manifest_allows(declaration, relative) and _capture_content_importable(data)
+        ]
         for index, (destination, kind, data) in enumerate(entries):
             self._ensure_capture_parent(workspace_descriptor, tuple(destination.split("/")[:-1]))
             if kind == "notes":
@@ -3070,7 +3080,7 @@ class SessionSupervisor:
         content or a path.
         """
         for destination, _kind, _data in entries:
-            if _is_credential_file_name(Path(destination).name):
+            if any(_is_credential_file_name(part) for part in PurePosixPath(destination).parts):
                 self._revoke_secret_exposure(handle)
                 raise SecretExposureError(operation="collect")
         # The current copies are read here (never persisted) so a token the CLI
@@ -3205,12 +3215,8 @@ class SessionSupervisor:
         data = _read_regular_file(path, MAX_CAPTURE_NOTE_BYTES, require_single_link=True)
         if data is None:
             raise BudgetExceededError("capture")
-        try:
-            text = data.decode("utf-8")
-        except UnicodeDecodeError:
-            return None
-        if "\x00" in text:
-            return None
+        # Keep raw bytes until the security scan has examined them. Non-text
+        # files are filtered only after that scan, before workspace import.
         return data
 
     def _fake_output(self, handle: _Session) -> tuple[str | None, str | None]:
@@ -3490,6 +3496,15 @@ def _capture_manifest_allows(declaration: _CaptureOutputDeclaration, relative: s
     if not declaration.recursive and len(path.parts) != 1:
         return False
     return path.suffix in CAPTURE_ALLOWED_EXTENSIONS
+
+
+def _capture_content_importable(data: bytes) -> bool:
+    """Only import UTF-8 text without NUL bytes after security scanning."""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return "\x00" not in text
 
 
 def _capture_key(session_id: str, run: int, index: int) -> str:
