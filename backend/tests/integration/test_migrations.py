@@ -2010,13 +2010,16 @@ def test_task_context_preflight_accepts_an_already_conforming_shape(
 ) -> None:
     """A later-stamped installation with the exact 0028 shape upgrades without DDL."""
     config = _alembic_config(temporary_postgres_url)
-    command.upgrade(config, "head")
+    # Pin to 0028: later additive revisions (0029+) are not idempotent re-runs.
+    command.upgrade(config, "0028_task_context_consultations")
     asyncio.run(_stamp_revision(temporary_postgres_url, "0027_instruction_delivery"))
     before = asyncio.run(_database_snapshot(temporary_postgres_url))
 
-    command.upgrade(config, "head")
+    command.upgrade(config, "0028_task_context_consultations")
 
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
+    assert (
+        asyncio.run(_alembic_version(temporary_postgres_url)) == "0028_task_context_consultations"
+    )
     assert asyncio.run(_database_snapshot(temporary_postgres_url)) == before
 
 
