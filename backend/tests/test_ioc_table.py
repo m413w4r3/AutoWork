@@ -35,6 +35,8 @@ from cti_app.domain.analyst_opinion import (
     AnalystObservationV1,
     AnalystOpinionStatus,
     AnalystOpinionV1,
+    IocTableNoteBlockV1,
+    note_ioc_table_title,
     opinion_blocks_with_observations,
 )
 from cti_app.domain.discovery import SourceRole
@@ -72,6 +74,7 @@ from tests.test_edition_typst_rendering import (
     _note_block_v6,
 )
 from tests.test_publication_builder_v4 import _canonical_inputs, _enrichment_with
+from tests.test_publication_document_v6 import _base_v5
 
 
 def _ioc_document():
@@ -533,7 +536,7 @@ def _word_bboxes(pdf_path: Path) -> list[tuple[str, float, float, float, float]]
 def _assert_observed_at_does_not_overlap_fingerprint(
     pdf_path: Path, *, observed_at: str, fingerprint: str
 ) -> None:
-    """Fail when a date glyph box crosses into the fingerprint column on its line."""
+    """Fail if the rendered timestamp and fingerprint glyph boxes overlap."""
     words = _word_bboxes(pdf_path)
     date_words = [
         (text, xmin, ymin, xmax, ymax)
@@ -585,8 +588,8 @@ def _note_ioc_table_pdf_fixture():
     return publication, context
 
 
-def test_note_ioc_table_columns_do_not_overlap_in_opinion_pdf(tmp_path: Path) -> None:
-    """R6-F2: the opinion renders the exact timestamp inside its own cell."""
+def test_note_ioc_table_identifiers_do_not_overlap_in_opinion_pdf(tmp_path: Path) -> None:
+    """R6-F2: exact timestamps and fingerprints remain separate in the appendix."""
     binary = _typst_and_pdftotext()
     publication, context = _note_ioc_table_pdf_fixture()
     # Microsecond timestamps are the longest ISO form the cell must hold.
@@ -614,8 +617,8 @@ def test_note_ioc_table_columns_do_not_overlap_in_opinion_pdf(tmp_path: Path) ->
     )
 
 
-def test_note_ioc_table_columns_do_not_overlap_in_edition_pdf(tmp_path: Path) -> None:
-    """R6-F2: the bulletin renders the same table without overlapping columns."""
+def test_note_ioc_table_identifiers_do_not_overlap_in_edition_pdf(tmp_path: Path) -> None:
+    """R6-F2: the edition appendix keeps timestamps and fingerprints separate."""
     binary = _typst_and_pdftotext()
     publication, context = _note_ioc_table_pdf_fixture()
     edition = _edition_document(((1, publication),))
@@ -633,3 +636,200 @@ def test_note_ioc_table_columns_do_not_overlap_in_edition_pdf(tmp_path: Path) ->
         observed_at=context.observations[1].observed_at.isoformat(),
         fingerprint="f" * 64,
     )
+
+
+def _large_note_ioc_preview() -> tuple[TypstDraftPreviewDocument, tuple[str, ...]]:
+    base = _base_v5()
+    investigation_id = UUID(int=820000)
+    values = [
+        (
+            "md5",
+            hashlib.md5(f"synthetic md5 IOC {index}".encode(), usedforsecurity=False).hexdigest(),
+        )
+        for index in range(1, 13)
+    ] + [
+        ("sha1", hashlib.sha1(f"synthetic sha1 IOC {index}".encode()).hexdigest())
+        for index in range(13, 25)
+    ] + [
+        ("sha256", hashlib.sha256(f"synthetic sha256 IOC {index}".encode()).hexdigest())
+        for index in range(25, 37)
+    ]
+    values.append(
+        (
+            "url",
+            "https://cdn.example.invalid/"
+            + "/".join(
+                ("segment-" + chr(96 + index) * 38) for index in range(1, 5)
+            )
+            + "/payload.bin?download=1&campaign=long-path-test",
+        )
+    )
+    values.append(
+        (
+            "domain",
+            "edge-"
+            + "a" * 45
+            + ".sensor-"
+            + "b" * 48
+            + ".telemetry-"
+            + "c" * 48
+            + ".example.invalid",
+        )
+    )
+    values.append(
+        (
+            "url",
+            "https://updates.example.invalid/" + "nested-path/" * 12 + "stage-two.bin",
+        )
+    )
+    values.append(
+        (
+            "domain",
+            "collector-"
+            + "d" * 46
+            + ".relay-"
+            + "e" * 47
+            + ".edge-"
+            + "f" * 45
+            + ".example.invalid",
+        )
+    )
+    expected_hash_lengths = {"md5": 32, "sha1": 40, "sha256": 64}
+    assert all(
+        len(value) == expected_hash_lengths[object_type]
+        and re.fullmatch(r"[0-9a-f]+", value)
+        for object_type, value in values
+        if object_type in expected_hash_lengths
+    )
+    assert len(values) == 40
+    assert sum(object_type == "url" for object_type, _value in values) == 2
+    assert sum(object_type == "domain" for object_type, _value in values) == 2
+    assert all(
+        len(value) >= 100 for object_type, value in values if object_type in {"url", "domain"}
+    )
+    observations = tuple(
+        EvidenceObservation(
+            investigation_id=investigation_id,
+            kind=EvidenceKind.SHODAN_OBSERVATION,
+            blob_id=UUID(int=830000 + index),
+            sha256=hashlib.sha256(f"synthetic evidence {index}".encode()).hexdigest(),
+            source=("virustotal", "urlhaus", "shodan")[index % 3],
+            source_version="fixture.v1",
+            observed_at=datetime(2026, 11, 1, tzinfo=UTC),
+            object_type=object_type,
+            object_id=value,
+            id=UUID(int=840000 + index),
+        )
+        for index, (object_type, value) in enumerate(values, start=1)
+    )
+    anchor = next(
+        item
+        for item in publication_document_text_anchors(
+            base.document, references=base.references
+        )
+        if item.startswith("lead:")
+    )
+    note = AnalystObservationV1(
+        id=UUID(int=820001),
+        anchor=anchor,
+        text="NOTE-IOC-ANNEX-FIXTURE: les identifiants complets restent consultables en annexe.",
+        state=AnalystObservationState.UNRESOLVED,
+        relation=AnalystObservationRelation.UNRESOLVED,
+        content_blocks=(
+            IocTableNoteBlockV1(
+                observation_ids=tuple(item.id for item in observations),
+                title=note_ioc_table_title(len(observations)),
+            ),
+        ),
+    )
+    opinion = AnalystOpinionV1(
+        investigation_id=investigation_id,
+        synthesis_artifact_id=UUID(int=820002),
+        synthesis_sha256="a" * 64,
+        base_publication_artifact_id=UUID(int=820003),
+        base_publication_sha256=publication_document_v5_sha256(base),
+        blocks=opinion_blocks_with_observations((), (note,)),
+        author_id="fixture-analyst",
+        status=AnalystOpinionStatus.DRAFT,
+        id=UUID(int=820004),
+    )
+    return (
+        TypstDraftPreviewDocument(
+            base_publication=base,
+            analyst_opinion=opinion,
+            evidence_observations=observations,
+        ),
+        tuple(value for _kind, value in values)
+        + tuple(str(item.id) for item in observations)
+        + tuple(item.sha256 for item in observations),
+    )
+
+
+def _assert_pdf_words_stay_inside_page_margin(pdf_path: Path) -> None:
+    result = subprocess.run(
+        ["pdftotext", "-bbox", str(pdf_path), "-"],
+        capture_output=True,
+        check=True,
+        text=True,
+        timeout=20,
+    )
+    page_pattern = re.compile(
+        r'<page width="(?P<width>[0-9.]+)" height="(?P<height>[0-9.]+)">(?P<body>.*?)</page>',
+        re.DOTALL,
+    )
+    pages = list(page_pattern.finditer(result.stdout))
+    assert pages, "pdftotext did not report page bounds"
+    for page_number, page in enumerate(pages, start=1):
+        width = float(page.group("width"))
+        height = float(page.group("height"))
+        for word in _WORD_BBOX.finditer(page.group("body")):
+            x_min, y_min, x_max, y_max = (
+                float(word.group(name)) for name in ("xmin", "ymin", "xmax", "ymax")
+            )
+            assert x_min >= 20 and y_min >= 2, (page_number, word.group("text"), x_min, y_min)
+            assert x_max <= width - 20 and y_max <= height - 2, (
+                page_number,
+                word.group("text"),
+                x_max,
+                y_max,
+                width,
+                height,
+            )
+
+
+def test_real_typst_large_ioc_table_keeps_values_and_annex_references(tmp_path: Path) -> None:
+    """Render 40 canonical synthetic rows with copyable identifiers and a numbered annex."""
+    binary = _typst_and_pdftotext()
+    draft, exact_values = _large_note_ioc_preview()
+    bundle = load_template_bundle(_REPOSITORY_ROOT / "chpTypst")
+    source = TypstRenderer().render(
+        draft,
+        bundle,
+        document_label="Avis — table IOC longue",
+    )
+    render_data = json.loads(source.render_data_bytes)
+    assert render_data["technical_ioc_annex_version"] == 1
+    assert len(render_data["technical_ioc_annex"]) == 40
+    pdf_path = tmp_path / "large-ioc-table.pdf"
+    pdf_path.write_bytes(_compile_rendered_pdf(tmp_path, source, bundle, binary))
+
+    extracted = subprocess.run(
+        ["pdftotext", "-layout", str(pdf_path), "-"],
+        capture_output=True,
+        check=True,
+        text=True,
+        timeout=20,
+    ).stdout
+    compact_text = re.sub(r"\s+", "", extracted)
+    for value in exact_values:
+        assert value in compact_text, f"the full identifier {value!r} is missing or truncated"
+    for index in range(1, 41):
+        reference = f"[{index}]"
+        assert compact_text.count(reference) >= 2, (
+            f"reference {reference} must appear in both the anchored table and the annex"
+        )
+    assert extracted.index("Tableau IOC (40)") < extracted.index(
+        "Annexe technique — identifiants IOC"
+    )
+    assert "Réf." in extracted and "VirusTotal" in extracted and "URLhaus" in extracted
+    _assert_pdf_words_stay_inside_page_margin(pdf_path)

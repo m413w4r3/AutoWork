@@ -253,10 +253,10 @@ def test_m19_renderer_manifest_versions_are_explicitly_pinned() -> None:
         manifest_name="edition-renderer-manifest.json",
     )
     assert article.template_version == (
-        "chp-article-v47-m21-opinion-safe-links-m21-pdffix7-m21-format5"
+        "chp-article-v48-m24-2-d3-ioc-annex"
     )
     assert edition.template_version == (
-        "chp-edition-v36-m21-opinion-render-m21-pdffix7-m21-format5"
+        "chp-edition-v37-m24-2-d3-ioc-annex"
     )
 
 

@@ -1,5 +1,5 @@
 {
-  "template_version": "chp-edition-v36-m21-opinion-render-m21-pdffix7-m21-format5",
+  "template_version": "chp-edition-v37-m24-2-d3-ioc-annex",
   "files": [
     "RENDERER/edition.typ",
     "RENDERER/edition_helpers.typ",
