@@ -92,8 +92,7 @@ MAX_PROMPT_BYTES = 256 * 1024
 MAX_SKILL_BYTES = 64 * 1024
 MAX_INSTRUCTION_BYTES = 32 * 1024
 # The bounded prompt section that carries a delivered instruction into the
-# next run (INSTRUCTION-DELIVERY §3.4).  Id + SHA plus the text, with an
-# explicit truncation marker rather than a silent cut.
+# next run (INSTRUCTION-DELIVERY §3.4): id + SHA plus the text.
 MAX_INSTRUCTION_BLOCK_BYTES = 32 * 1024
 MAX_RUN_PROMPT_BYTES = 32 * 1024
 MAX_REASON_BYTES = 256

@@ -7,7 +7,7 @@ module intentionally does not modify or depend on application/persistence.py.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Collection
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -632,9 +632,35 @@ class AgentSessionRepository(Protocol):
         ...
 
     async def list_pending_instructions(
-        self, *, limit: int
+        self, *, limit: int, states: Collection[InstructionState] | None = None
     ) -> tuple[AgentSessionInstructionV1, ...]:
-        """Drain candidates (queued|delivering|delivery_unknown) in (queued_at,id) order."""
+        """Active-session candidates in (queued_at,id) order.
+
+        ``states`` narrows the set; the delivery batch asks for ``queued``
+        only so unresolvable ambiguous rows cannot occupy it (R4-F2).  The
+        default keeps the whole pending set for diagnostics.
+        """
+        ...
+
+    async def list_stale_delivering(
+        self, *, attempted_before: datetime, limit: int
+    ) -> tuple[AgentSessionInstructionV1, ...]:
+        """``delivering`` attempts older than the grace on ANY session (R4B-F1).
+
+        Reconciliation is separate from the active-session drain list: a crash
+        between phases A and C whose session later became terminal must still
+        become ``delivery_unknown`` so a human can cancel or hand the task off.
+        """
+        ...
+
+    async def list_reconcilable_unknown(
+        self, *, unknown_before: datetime, limit: int
+    ) -> tuple[AgentSessionInstructionV1, ...]:
+        """``delivery_unknown`` rows older than the grace on ANY session (R4B-F2).
+
+        The host journal can still prove a delivery after the session became
+        terminal; reconciliation therefore never filters on session state.
+        """
         ...
 
     async def update_instruction_delivery(
@@ -2024,6 +2050,16 @@ class InMemoryInvestigationHandoffRepository:
             return record, True
 
 
+def _attempted_at(instruction: AgentSessionInstructionV1) -> datetime:
+    """The attempt timestamp, tolerant of a hydrated row missing it."""
+    return instruction.delivery_attempted_at or instruction.updated_at
+
+
+def _unknown_at(instruction: AgentSessionInstructionV1) -> datetime:
+    """When the attempt became ambiguous, tolerant of a missing timestamp."""
+    return instruction.delivery_unknown_at or instruction.updated_at
+
+
 class InMemoryAgentSessionRepository:
     """In-memory port fake sharing the SQL repository's observable rules.
 
@@ -2234,21 +2270,52 @@ class InMemoryAgentSessionRepository:
         return current
 
     async def list_pending_instructions(
-        self, *, limit: int
+        self, *, limit: int, states: Collection[InstructionState] | None = None
     ) -> tuple[AgentSessionInstructionV1, ...]:
         if limit < 1:
             raise ValueError("limit must be >= 1")
+        selected = INSTRUCTION_PENDING_STATES if states is None else frozenset(states)
         pending = sorted(
             (
                 instruction
                 for instruction in self._instructions.values()
-                if instruction.state in INSTRUCTION_PENDING_STATES
+                if instruction.state in selected
                 and (session := self._sessions.get(instruction.session_id)) is not None
                 and session.state in ACTIVE_AGENT_SESSION_STATES
             ),
             key=lambda instruction: (instruction.queued_at, str(instruction.id)),
         )
         return tuple(pending[:limit])
+
+    async def list_stale_delivering(
+        self, *, attempted_before: datetime, limit: int
+    ) -> tuple[AgentSessionInstructionV1, ...]:
+        """Every session's stale attempt is reconcilable, unlike delivery rows."""
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        stale = [
+            instruction
+            for instruction in self._instructions.values()
+            if instruction.state is InstructionState.DELIVERING
+            and _attempted_at(instruction) <= attempted_before
+        ]
+        stale.sort(key=lambda instruction: (_attempted_at(instruction), str(instruction.id)))
+        return tuple(stale[:limit])
+
+    async def list_reconcilable_unknown(
+        self, *, unknown_before: datetime, limit: int
+    ) -> tuple[AgentSessionInstructionV1, ...]:
+        """Every session's ambiguous attempt is reconcilable after the grace."""
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        unknown = [
+            instruction
+            for instruction in self._instructions.values()
+            if instruction.state is InstructionState.DELIVERY_UNKNOWN
+            and _unknown_at(instruction) <= unknown_before
+        ]
+        unknown.sort(key=lambda instruction: (_unknown_at(instruction), str(instruction.id)))
+        return tuple(unknown[:limit])
 
     async def update_instruction_delivery(
         self,

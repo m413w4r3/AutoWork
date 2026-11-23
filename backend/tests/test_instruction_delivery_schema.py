@@ -9,6 +9,7 @@ upgrade/downgrade oracles live in the integration modules.
 
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
@@ -23,11 +24,14 @@ from cti_app.domain.agentic_operator import (
     INSTRUCTION_STATE_TRANSITIONS,
     TERMINAL_INSTRUCTION_STATES,
     AgentSessionInstructionV1,
+    AgentSessionState,
     AgentSessionStateError,
+    AgentSessionV1,
     InstructionDeliveryMode,
     InstructionState,
     OperatorAdapterKind,
     OperatorCapabilitiesV1,
+    OperatorConfinementV1,
     OperatorProbeCommand,
     SessionTransitionError,
     instruction_text_sha256,
@@ -78,6 +82,57 @@ def _delivered() -> AgentSessionInstructionV1:
         delivery_sha256=SHA,
         delivery_note_diffs=NOTE_DIFFS,
         now=LATER,
+    )
+
+
+def _active_session(session_id: UUID, *, task_id: UUID) -> AgentSessionV1:
+    """The active session row the drain's candidate join needs."""
+    capabilities = OperatorCapabilitiesV1(
+        adapter_kind=OperatorAdapterKind.CODEX_CLI,
+        executable="/usr/local/bin/codex",
+        version="codex-cli 1.2.3",
+        modes=("exec",),
+        supports_resume=False,
+        supports_structured_output=True,
+        supports_non_interactive=True,
+        supports_stop=True,
+        supports_next_run_instruction=True,
+        permission_modes=("workspace-write",),
+        confinement=OperatorConfinementV1(
+            profile="bwrap-reasoning-session",
+            bwrap_ok=True,
+            netns=True,
+            network_mode="isolated_egress",
+            loopback_isolated=True,
+        ),
+        probed_at=NOW,
+        probes=(
+            OperatorProbeCommand(
+                argv=("/usr/local/bin/codex", "--help"),
+                exit_code=0,
+                stdout_sha256="a" * 64,
+                advertised_modes=("exec", "workspace-write"),
+            ),
+        ),
+    )
+    return AgentSessionV1(
+        id=session_id,
+        investigation_id=uuid4(),
+        task_id=task_id,
+        adapter_kind=OperatorAdapterKind.CODEX_CLI,
+        state=AgentSessionState.RUNNING,
+        state_version=1,
+        capability_probe=capabilities.to_payload(),
+        capability_sha256=capabilities.capability_sha256,
+        probed_at=capabilities.probed_at,
+        auth_secret_nonce=b"s" * 32,
+        auth_secret_hash=hashlib.sha256(b"s" * 32).hexdigest(),
+        auth_secret_issued_at=NOW,
+        opened_at=NOW,
+        idempotency_key=f"session-{session_id}",
+        created_at=NOW,
+        updated_at=NOW,
+        host_session_ref=f"host-{session_id}",
     )
 
 
@@ -390,17 +445,30 @@ async def test_fake_repository_lists_only_pending_instructions_in_queue_order() 
     repository = InMemoryAgentSessionRepository()
     first = _instruction(idempotency_key="first", queued_at=NOW)
     second = _instruction(idempotency_key="second", queued_at=NOW + timedelta(seconds=1))
+    ambiguous = (
+        _instruction(idempotency_key="ambiguous", queued_at=NOW - timedelta(seconds=5))
+        .with_delivery_reserved(token=TOKEN, delivery_sha256=SHA, now=NOW)
+        .with_state(
+            InstructionState.DELIVERY_UNKNOWN, now=LATER, last_delivery_error="delivery_timeout"
+        )
+    )
     delivered = _delivered()
     acknowledged = _delivered().with_state(InstructionState.ACKNOWLEDGED, now=LATER)
     cancelled = _instruction(idempotency_key="cancelled").with_cancellation(
         reason="handed_off:h1", now=LATER
     )
-    for instruction in (second, delivered, first, acknowledged, cancelled):
+    for instruction in (second, delivered, first, acknowledged, cancelled, ambiguous):
+        await repository.add(_active_session(instruction.session_id, task_id=instruction.task_id))
         _, created = await repository.add_instruction(instruction)
         assert created is True
     pending = await repository.list_pending_instructions(limit=10)
-    assert [item.id for item in pending] == [first.id, second.id]
-    assert (await repository.list_pending_instructions(limit=1))[0].id == first.id
+    assert [item.id for item in pending] == [ambiguous.id, first.id, second.id]
+    assert (await repository.list_pending_instructions(limit=1))[0].id == ambiguous.id
+    # The delivery batch only wants rows it can actually deliver (R4-F2).
+    deliverable = await repository.list_pending_instructions(
+        limit=10, states=(InstructionState.QUEUED,)
+    )
+    assert [item.id for item in deliverable] == [first.id, second.id]
     with pytest.raises(ValueError):
         await repository.list_pending_instructions(limit=0)
 

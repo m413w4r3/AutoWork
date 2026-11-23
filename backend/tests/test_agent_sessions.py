@@ -51,6 +51,7 @@ from cti_app.application.agentic_sessions import (
     SessionForbiddenError,
     SessionInstructionConflictError,
     SessionInstructionNotDeliveredError,
+    SessionInstructionTextTooLongError,
     SessionNetworkIsolationUnavailableError,
     SessionNewHandoffRequiredError,
     SessionResumeUnavailableError,
@@ -78,6 +79,7 @@ from cti_app.application.persistence import (
 from cti_app.application.workspace_agent import WorkspaceLocalUnavailableError
 from cti_app.config import Settings
 from cti_app.domain.agentic_operator import (
+    INSTRUCTION_MAX_TEXT_BYTES,
     AgentSessionInstructionV1,
     AgentSessionState,
     AgentSessionV1,
@@ -2165,6 +2167,55 @@ async def test_enqueue_route_wires_the_backend_drain() -> None:
         )
         assert response.status_code == 200, response.text
     assert recorder.calls == [UUID(response.json()["id"])]
+
+
+async def test_enqueue_text_over_the_domain_bound_is_a_typed_refusal() -> None:
+    """R4-F12: a multioctet text over 64 KiB bytes is a 4xx, not a 500.
+
+    40 000 characters pass the request model's character bound but encode to
+    80 000 UTF-8 bytes, over ``INSTRUCTION_MAX_TEXT_BYTES``.  The domain
+    constructor used to raise a bare ``ValueError`` that escaped the route.
+    """
+    harness = _Harness()
+    task = await harness.seed_task()
+    prepared = await harness.open(task=task)
+
+    with pytest.raises(SessionInstructionTextTooLongError) as exc_info:
+        await harness.service.enqueue_instruction(
+            harness.investigation_id,
+            prepared.session.id,
+            text="é" * 40_000,
+            actor=HUMAN_ACTOR,
+            idempotency_key="instruction-too-long",
+        )
+
+    assert exc_info.value.code == "instruction_text_too_long"
+    assert exc_info.value.status_code == 413
+    assert exc_info.value.details["limit_bytes"] == str(INSTRUCTION_MAX_TEXT_BYTES)
+    assert await harness.sessions.list_instructions(prepared.session.id) == ()
+    assert harness.operator.instructions == []
+
+
+async def test_enqueue_route_refuses_over_the_domain_bound_with_a_413() -> None:
+    """R4-F12: the HTTP surface answers a typed 4xx instead of an uncaught error."""
+    harness = _Harness()
+    task = await harness.seed_task()
+    prepared = await harness.open(task=task)
+    app = _api_app(harness, LocalIdentityProvider("dev-analyst"))
+    path = (
+        f"/api/investigations/{harness.investigation_id}"
+        f"/agent-sessions/{prepared.session.id}/instructions"
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            path,
+            headers={"Idempotency-Key": "api-enqueue-too-long"},
+            json={"action": "enqueue", "text": "é" * 40_000},
+        )
+
+    assert response.status_code == 413, response.text
+    assert response.json()["detail"]["code"] == "instruction_text_too_long"
+    assert await harness.sessions.list_instructions(prepared.session.id) == ()
 
 
 # --------------------------------------------------- disclosure gate (R03 B2)

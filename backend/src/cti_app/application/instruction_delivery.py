@@ -365,7 +365,7 @@ class InstructionDeliveryService:
         reconciled_delivered, reconciled_queued = await self._reconcile_unknown_attempts(
             timestamp, limit=size
         )
-        pending = await self._list_pending(size)
+        pending = await self._list_delivery_candidates(size)
         counts = {
             InstructionAttemptOutcome.DELIVERED: 0,
             InstructionAttemptOutcome.DEFERRED: 0,
@@ -870,8 +870,17 @@ class InstructionDeliveryService:
     # ---------------------------------------------------------- reconciliation
 
     async def _reconcile_stale_delivering(self, now: datetime) -> int:
-        """A crash between A and C becomes an ambiguous attempt after the grace."""
-        stale = await self._list_pending(self._batch_size)
+        """A crash between A and C becomes an ambiguous attempt after the grace.
+
+        Runs on a dedicated all-session query: the active-session delivery
+        batch must not hide an attempt whose session became terminal after the
+        crash, or the row would stay ``delivering`` for ever (R4B-F1).
+        """
+        cutoff = now - timedelta(seconds=self._grace_seconds)
+        async with self._uow_factory() as uow:
+            stale = await uow.agent_sessions.list_stale_delivering(
+                attempted_before=cutoff, limit=self._batch_size
+            )
         converted = 0
         for instruction in stale:
             if instruction.state is not InstructionState.DELIVERING:
@@ -908,7 +917,11 @@ class InstructionDeliveryService:
         ``delivery_text_verified=false`` instead of inventing a text (R4-F5).
         """
         host = self._require_host()
-        pending = await self._list_pending(limit)
+        cutoff = now - timedelta(seconds=self._grace_seconds)
+        async with self._uow_factory() as uow:
+            pending = await uow.agent_sessions.list_reconcilable_unknown(
+                unknown_before=cutoff, limit=limit
+            )
         delivered = 0
         requeued = 0
         for instruction in pending:
@@ -1013,9 +1026,17 @@ class InstructionDeliveryService:
             raise ValueError("now must be timezone-aware")
         return timestamp
 
-    async def _list_pending(self, limit: int) -> tuple[AgentSessionInstructionV1, ...]:
+    async def _list_delivery_candidates(self, limit: int) -> tuple[AgentSessionInstructionV1, ...]:
+        """Only ``queued`` rows of active sessions can ever be delivered.
+
+        Ambiguous or in-flight rows get their own reconciliation queries; if
+        they shared this bounded batch, 50 unresolvable rows would starve
+        every live instruction behind them (R4-F2 residual).
+        """
         async with self._uow_factory() as uow:
-            return await uow.agent_sessions.list_pending_instructions(limit=limit)
+            return await uow.agent_sessions.list_pending_instructions(
+                limit=limit, states=(InstructionState.QUEUED,)
+            )
 
     async def _load_instruction(self, instruction_id: UUID) -> AgentSessionInstructionV1 | None:
         async with self._uow_factory() as uow:
