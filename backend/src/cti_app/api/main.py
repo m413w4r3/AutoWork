@@ -972,7 +972,9 @@ def _agent_signed_route(method: str, path: str, headers: Mapping[str, str]) -> b
         method == "POST"
         and len(rest) == 3
         and rest[0] == "agent-sessions"
-        and rest[2] in {"tool-calls", "instructions"}
+        # collect and reconcile are D7 host-shim actions too: the supervisor
+        # calls them with the per-session HMAC and no operator token.
+        and rest[2] in {"tool-calls", "instructions", "collect", "reconcile"}
     ):
         return _is_uuid(rest[1])
     if method == "POST" and len(rest) == 3 and rest[0] == "tasks" and rest[2] == "commands":
