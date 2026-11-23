@@ -965,7 +965,7 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
   // the host workspace route, which writes the file and reports its revision;
   // the workspace index only learns about it through the sync in step 13.
   await loaderCard.getByRole("button", { name: "Ajouter une note" }).click();
-  await loaderCard.getByLabel("Note (Markdown, non-preuve)").fill(NOTE_TEXT);
+  await loaderCard.getByLabel("Note (Markdown, non probante)").fill(NOTE_TEXT);
   await loaderCard.getByRole("button", { name: "Enregistrer la note" }).click();
   const noteMessage = loaderCard.getByText(/Note enregistrée dans /);
   await expect(noteMessage).toBeVisible();
