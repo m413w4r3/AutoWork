@@ -170,6 +170,37 @@ export function EnvelopeLifecycleSection({
   );
 }
 
+/** Current G2 state kept visible while the overview's G2 details are collapsed. */
+export function EnvelopeAccessSummary({
+  investigationId,
+}: {
+  investigationId: string;
+}) {
+  const envelopeQuery = useInvestigationEnvelope(investigationId);
+  const envelope = envelopeQuery.data as EnvelopeLifecycleView | undefined;
+
+  let label = "Accès externes : état indisponible";
+  if (envelopeQuery.isPending) {
+    label = "Accès externes : chargement";
+  } else if (!envelopeQuery.isError && !envelope?.approved) {
+    label = "Accès externes : non accordés";
+  } else if (
+    !envelopeQuery.isError &&
+    envelope?.approved &&
+    typeof envelope.currently_authorized === "boolean"
+  ) {
+    label = envelope.currently_authorized
+      ? "Accès externes : actifs"
+      : "Accès externes : révoqués";
+  }
+
+  return (
+    <p className="workshop-overview-g2-summary" role="status">
+      <strong>{label}</strong>
+    </p>
+  );
+}
+
 function ApprovedEnvelopeSection({
   investigationId,
   envelope,
@@ -190,7 +221,6 @@ function ApprovedEnvelopeSection({
   const revokedVersion = revokedNow
     ? (revoke.data?.version ?? envelope.version)
     : envelope.version;
-  const policySuperseded = envelope.policy_status === "superseded";
 
   return (
     <section
@@ -200,51 +230,23 @@ function ApprovedEnvelopeSection({
       <h2 id={LIFECYCLE_HEADING_ID}>Cycle de vie de l’enveloppe G2</h2>
 
       {revoked ? (
-        <WorkshopStateBanner
-          tone="warning"
-          title={
-            policySuperseded
-              ? "Droits externes coupés — politique héritée remplacée"
-              : "Enveloppe révoquée — droits externes coupés"
-          }
-        >
+        <WorkshopStateBanner tone="warning" title="Accès externes : révoqués">
           <p>
-            L’enveloppe version {revokedVersion} existe toujours, mais aucun
-            droit externe n’est actif : fournisseurs, acquisition d’échantillons
-            et appels externes sont coupés. Les limites locales sont conservées.
+            Aucune nouvelle opération VT, Shodan ou Bridge externe n’est
+            autorisée. Les analyses locales restent accessibles.
           </p>
-          <p>
-            Droits externes actifs : non. Aucune ré-approbation n’est proposée
-            ici ; une nouvelle approbation serait une décision humaine
-            distincte.
-          </p>
-          {envelope.policy_status ? (
-            <p>
-              Statut de la politique héritée :{" "}
-              {POLICY_STATUS_LABELS[envelope.policy_status] ??
-                envelope.policy_status}
-              .
-            </p>
-          ) : null}
         </WorkshopStateBanner>
       ) : (
-        <WorkshopStateBanner
-          tone="success"
-          title={`Enveloppe G2 active — version ${envelope.version}`}
-        >
+        <WorkshopStateBanner tone="success" title="Accès externes : actifs">
           <p>
-            Droits externes actifs : oui. L’approbation initiale reste portée
-            par la section « Enveloppe G2 initiale » ; les actions ci-dessous
-            sont des décisions humaines versionnées et distinctes.
+            Les fournisseurs autorisés et les plafonds actifs sont listés
+            ci-dessous.
           </p>
         </WorkshopStateBanner>
       )}
 
       {extendedVersion !== null && !revoked ? (
-        <WorkshopStateBanner
-          tone="success"
-          title={`Enveloppe étendue — version ${extendedVersion}`}
-        >
+        <WorkshopStateBanner tone="success" title="Enveloppe étendue">
           <p>
             La décision d’extension a été enregistrée ; les droits affichés sont
             rechargés depuis le serveur.
@@ -252,10 +254,15 @@ function ApprovedEnvelopeSection({
         </WorkshopStateBanner>
       ) : null}
 
-      {revoked ? null : <EnvelopeRights envelope={envelope} />}
-      <EnvelopeBudget envelope={envelope} />
+      <EnvelopeRights envelope={envelope} />
+      <EnvelopeBudget envelope={envelope} revoked={revoked} />
       <EnvelopeDecision envelope={envelope} />
       <InheritedPolicy envelope={envelope} />
+      <EnvelopeTechnicalDetails
+        envelope={envelope}
+        revokedVersion={revokedVersion}
+        revoked={revoked}
+      />
 
       {revoked ? null : (
         <>
@@ -359,7 +366,13 @@ function EnvelopeRights({ envelope }: { envelope: InvestigationEnvelopeView }) {
   );
 }
 
-function EnvelopeBudget({ envelope }: { envelope: InvestigationEnvelopeView }) {
+function EnvelopeBudget({
+  envelope,
+  revoked,
+}: {
+  envelope: EnvelopeLifecycleView;
+  revoked: boolean;
+}) {
   return (
     <section aria-labelledby="overview-envelope-budget-heading">
       <h3 id="overview-envelope-budget-heading">Budget et consommation</h3>
@@ -371,7 +384,14 @@ function EnvelopeBudget({ envelope }: { envelope: InvestigationEnvelopeView }) {
         {BUDGET_DIMENSIONS.map((dimension) => (
           <div key={dimension}>
             <dt>{BUDGET_DIMENSION_LABELS[dimension]}</dt>
-            <dd>{budgetLine(dimension, envelope.budget[dimension])}</dd>
+            <dd>
+              {budgetLine(
+                dimension,
+                envelope.budget[dimension],
+                isExternalBudgetActive(dimension, envelope, revoked),
+                revoked,
+              )}
+            </dd>
           </div>
         ))}
       </dl>
@@ -382,12 +402,81 @@ function EnvelopeBudget({ envelope }: { envelope: InvestigationEnvelopeView }) {
 function budgetLine(
   dimension: BudgetDimension,
   value: InvestigationEnvelopeDimensionView,
+  active: boolean,
+  revoked: boolean,
 ): string {
+  if (!active) {
+    return revoked
+      ? `Historique : ${budgetQuantity(dimension, value.consumed)} (autorisation révoquée, aucun plafond actif)`
+      : `Historique : ${budgetQuantity(dimension, value.consumed)} (aucune autorisation active, aucun plafond actif)`;
+  }
   const format = dimension === "context_bytes" ? formatBytes : formatCount;
   const limit = value.limit === null ? "illimité" : format(value.limit);
   const remaining =
     value.remaining === null ? "illimité" : format(value.remaining);
-  return `${format(value.consumed)} consommé · ${format(value.reserved)} réservé · plafond ${limit} · restant ${remaining}`;
+  return `Consommation : ${budgetQuantity(dimension, value.consumed)} · réservé : ${budgetQuantity(dimension, value.reserved, true)} · plafond actif : ${limit} · restant : ${remaining}`;
+}
+
+function budgetQuantity(
+  dimension: BudgetDimension,
+  value: number,
+  reserved = false,
+): string {
+  const count =
+    dimension === "context_bytes" ? formatBytes(value) : formatCount(value);
+  const plural = value === 1 ? "" : "s";
+  switch (dimension) {
+    case "bridge_turns":
+      return `${count} tour${plural} Bridge ${reserved ? "réservé" : "consommé"}${plural}`;
+    case "vt_units":
+      return `${count} unité${plural} VirusTotal ${reserved ? "réservée" : "consommée"}${plural}`;
+    case "shodan_credits":
+      return `${count} crédit${plural} Shodan ${reserved ? "réservé" : "consommé"}${plural}`;
+    case "downloads":
+      return `${count} fichier${plural} ${reserved ? "réservé" : "téléchargé"}${plural}`;
+    case "tool_seconds":
+      return `${count} seconde${plural} d’outil ${reserved ? "réservée" : "consommée"}${plural}`;
+    case "context_tokens":
+      return `${count} token${plural} de contexte ${reserved ? "réservé" : "consommé"}${plural}`;
+    case "context_bytes":
+      return `${count} ${reserved ? "réservés" : "consommés"}`;
+  }
+}
+
+function isExternalBudgetActive(
+  dimension: BudgetDimension,
+  envelope: EnvelopeLifecycleView,
+  revoked: boolean,
+): boolean {
+  switch (dimension) {
+    case "bridge_turns":
+      return (
+        envelope.currently_authorized &&
+        !revoked &&
+        envelope.allowed_providers.includes("bridge")
+      );
+    case "vt_units":
+      return (
+        envelope.currently_authorized &&
+        !revoked &&
+        envelope.allowed_providers.includes("vt")
+      );
+    case "shodan_credits":
+      return (
+        envelope.currently_authorized &&
+        !revoked &&
+        envelope.allowed_providers.includes("shodan")
+      );
+    case "downloads":
+      return (
+        envelope.allowed_providers.includes("vt") &&
+        envelope.currently_authorized &&
+        !revoked &&
+        envelope.acquire_hits_allowed
+      );
+    default:
+      return true;
+  }
 }
 
 function EnvelopeDecision({ envelope }: { envelope: EnvelopeLifecycleView }) {
@@ -396,12 +485,6 @@ function EnvelopeDecision({ envelope }: { envelope: EnvelopeLifecycleView }) {
     <section aria-labelledby="overview-envelope-decision-heading">
       <h3 id="overview-envelope-decision-heading">Dernière décision G2</h3>
       <dl className="workshop-meta">
-        <dt>Version de l’enveloppe</dt>
-        <dd>{envelope.version}</dd>
-        <dt>{policyAuthority ? "Événement de politique" : "Décision G2"}</dt>
-        <dd>
-          <code>{envelope.approval_decision_id ?? "Non fourni"}</code>
-        </dd>
         <dt>{policyAuthority ? "Activée par" : "Acteur authentifié"}</dt>
         <dd>
           {policyAuthority
@@ -418,8 +501,64 @@ function EnvelopeDecision({ envelope }: { envelope: EnvelopeLifecycleView }) {
             "Non renseignée"
           )}
         </dd>
+        <dt>Motif</dt>
+        <dd>Non transmis par l’API d’enveloppe.</dd>
       </dl>
     </section>
+  );
+}
+
+function EnvelopeTechnicalDetails({
+  envelope,
+  revokedVersion,
+  revoked,
+}: {
+  envelope: EnvelopeLifecycleView;
+  revokedVersion: number;
+  revoked: boolean;
+}) {
+  return (
+    <details>
+      <summary>Détails techniques</summary>
+      <dl className="workshop-meta">
+        <dt>Version de l’enveloppe</dt>
+        <dd>{revoked ? revokedVersion : envelope.version}</dd>
+        <dt>Identifiant de décision</dt>
+        <dd>
+          <code>{envelope.approval_decision_id ?? "Non fourni"}</code>
+        </dd>
+        {envelope.inherited_policy_id ? (
+          <>
+            <dt>Identifiant de la politique héritée</dt>
+            <dd>
+              <code>{envelope.inherited_policy_id}</code>
+            </dd>
+          </>
+        ) : null}
+        {envelope.inherited_policy_version !== null ? (
+          <>
+            <dt>Version de la politique héritée</dt>
+            <dd>{envelope.inherited_policy_version}</dd>
+          </>
+        ) : null}
+        {envelope.inherited_policy_event_id ? (
+          <>
+            <dt>Identifiant de l’événement hérité</dt>
+            <dd>
+              <code>{envelope.inherited_policy_event_id}</code>
+            </dd>
+          </>
+        ) : null}
+        {envelope.inherited_subject_id ? (
+          <>
+            <dt>Identifiant du sujet de politique</dt>
+            <dd>
+              <code>{envelope.inherited_subject_id}</code>
+            </dd>
+          </>
+        ) : null}
+      </dl>
+    </details>
   );
 }
 
@@ -435,29 +574,6 @@ function InheritedPolicy({ envelope }: { envelope: EnvelopeLifecycleView }) {
     rows.push([
       "Statut de la politique",
       POLICY_STATUS_LABELS[envelope.policy_status] ?? envelope.policy_status,
-    ]);
-  }
-  if (envelope.inherited_policy_id) {
-    rows.push([
-      "Politique héritée",
-      <>
-        <code>{envelope.inherited_policy_id}</code>
-        {envelope.inherited_policy_version !== null
-          ? ` · version ${envelope.inherited_policy_version}`
-          : null}
-      </>,
-    ]);
-  }
-  if (envelope.inherited_policy_event_id) {
-    rows.push([
-      "Événement hérité",
-      <code>{envelope.inherited_policy_event_id}</code>,
-    ]);
-  }
-  if (envelope.inherited_subject_id) {
-    rows.push([
-      "Sujet de la politique",
-      <code>{envelope.inherited_subject_id}</code>,
     ]);
   }
   if (rows.length === 0) return null;

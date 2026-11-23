@@ -14,6 +14,7 @@ import {
   type GovernanceTlpBound,
   type GovernanceTlpInput,
   type InvestigationEnvelopeDecisionInput,
+  type InvestigationEnvelopeView,
 } from "../../api/investigationGovernance";
 
 const BUDGET_DIMENSIONS: BudgetDimension[] = [
@@ -52,6 +53,9 @@ const TLP_RANK: Record<GovernanceTlpBound, number> = {
 };
 
 type EnvelopeMode = "approve" | "extend" | "revoke";
+type GovernanceEnvelopeView = InvestigationEnvelopeView & {
+  currently_authorized?: boolean;
+};
 
 function makeCorrelationId(): string {
   return (
@@ -89,6 +93,59 @@ function budgetLimits(
   return result;
 }
 
+function panelBudgetLine(
+  dimension: BudgetDimension,
+  value: InvestigationEnvelopeView["budget"][BudgetDimension],
+  envelope: GovernanceEnvelopeView,
+  accessIsActive: boolean,
+  accessIsRevoked: boolean,
+): string {
+  const provider =
+    dimension === "bridge_turns"
+      ? "bridge"
+      : dimension === "vt_units" || dimension === "downloads"
+        ? "vt"
+        : dimension === "shodan_credits"
+          ? "shodan"
+          : null;
+  const active =
+    provider === null ||
+    (accessIsActive &&
+      envelope.allowed_providers.includes(provider) &&
+      (dimension !== "downloads" || envelope.acquire_hits_allowed));
+  const usage = panelBudgetQuantity(dimension, value.consumed);
+  if (!active) {
+    return accessIsRevoked
+      ? `Historique : ${usage} (autorisation révoquée, aucun plafond actif)`
+      : `Historique : ${usage} (aucune autorisation active, aucun plafond actif)`;
+  }
+  return `Consommation : ${usage} · réservé : ${panelBudgetQuantity(dimension, value.reserved, true)} · plafond actif : ${value.limit ?? "illimité"} · restant : ${value.remaining ?? "illimité"}`;
+}
+
+function panelBudgetQuantity(
+  dimension: BudgetDimension,
+  value: number,
+  reserved = false,
+): string {
+  const plural = value === 1 ? "" : "s";
+  switch (dimension) {
+    case "bridge_turns":
+      return `${value} tour${plural} Bridge ${reserved ? "réservé" : "consommé"}${plural}`;
+    case "vt_units":
+      return `${value} unité${plural} VirusTotal ${reserved ? "réservée" : "consommée"}${plural}`;
+    case "shodan_credits":
+      return `${value} crédit${plural} Shodan ${reserved ? "réservé" : "consommé"}${plural}`;
+    case "downloads":
+      return `${value} fichier${plural} ${reserved ? "réservé" : "téléchargé"}${plural}`;
+    case "tool_seconds":
+      return `${value} seconde${plural} d’outil ${reserved ? "réservée" : "consommée"}${plural}`;
+    case "context_tokens":
+      return `${value} token${plural} de contexte ${reserved ? "réservé" : "consommé"}${plural}`;
+    case "context_bytes":
+      return `${value} octet${plural} de contexte ${reserved ? "réservé" : "consommé"}${plural}`;
+  }
+}
+
 export function InvestigationGovernancePanel({
   investigation,
 }: {
@@ -99,7 +156,10 @@ export function InvestigationGovernancePanel({
   const extend = useExtendInvestigationEnvelope();
   const revoke = useRevokeInvestigationEnvelope();
   const requestAnalysis = useRequestTargetedAnalysis();
-  const envelope = envelopeQuery.data;
+  const envelope: GovernanceEnvelopeView | undefined = envelopeQuery.data;
+  const accessIsActive = envelope?.currently_authorized === true;
+  const accessIsRevoked =
+    envelope?.approved === true && envelope.currently_authorized === false;
   const [mode, setMode] = useState<EnvelopeMode>("approve");
   const [providers, setProviders] = useState<string[]>([]);
   const [limits, setLimits] = useState<Record<BudgetDimension, string>>(
@@ -263,10 +323,21 @@ export function InvestigationGovernancePanel({
           </p>
         ) : envelope ? (
           <>
+            <h3>
+              {accessIsRevoked
+                ? "Accès externes : révoqués"
+                : accessIsActive
+                  ? "Accès externes : actifs"
+                  : envelope.approved
+                    ? "Accès externes : état indisponible"
+                    : "Accès externes : non accordés"}
+            </h3>
             <p>
-              {envelope.approved
-                ? `Enveloppe approuvée · version ${envelope.version}`
-                : "Proposition locale non approuvée · aucun droit externe accordé"}
+              {accessIsRevoked
+                ? "Aucune nouvelle opération VT, Shodan ou Bridge externe n’est autorisée. Les analyses locales restent accessibles."
+                : accessIsActive
+                  ? "Les fournisseurs autorisés et les plafonds actifs sont listés ci-dessous. Les analyses locales restent accessibles."
+                  : "Aucune autorisation externe n’est accordée. Les analyses locales restent accessibles."}
             </p>
             <p>
               Fournisseurs autorisés :{" "}
@@ -284,9 +355,13 @@ export function InvestigationGovernancePanel({
                   <div key={dimension}>
                     <dt>{BUDGET_LABELS[dimension]}</dt>
                     <dd>
-                      {value.consumed} consommé · {value.reserved} réservé ·
-                      plafond {value.limit ?? "illimité"} · restant{" "}
-                      {value.remaining ?? "illimité"}
+                      {panelBudgetLine(
+                        dimension,
+                        value,
+                        envelope,
+                        accessIsActive,
+                        accessIsRevoked,
+                      )}
                     </dd>
                   </div>
                 );
@@ -305,18 +380,24 @@ export function InvestigationGovernancePanel({
             {envelope.approved ? (
               <dl>
                 <div>
-                  <dt>Décision G2</dt>
+                  <dt>Dernière décision G2</dt>
                   <dd>
-                    {envelope.approval_decision_id ?? "Identifiant non fourni"}
+                    {accessIsRevoked
+                      ? "Révocation"
+                      : "Approbation ou extension"}
                   </dd>
                 </div>
                 <div>
-                  <dt>Acteur authentifié</dt>
+                  <dt>Décidée par</dt>
                   <dd>{envelope.approval_actor_id ?? "Non renseigné"}</dd>
                 </div>
                 <div>
                   <dt>Décidée le</dt>
                   <dd>{envelope.approved_at ?? "Non renseignée"}</dd>
+                </div>
+                <div>
+                  <dt>Motif</dt>
+                  <dd>Non transmis par l’API d’enveloppe.</dd>
                 </div>
               </dl>
             ) : (
@@ -325,6 +406,21 @@ export function InvestigationGovernancePanel({
                 externe ni acquisition.
               </p>
             )}
+            {envelope.approved ? (
+              <details>
+                <summary>Détails techniques</summary>
+                <dl>
+                  <div>
+                    <dt>Identifiant de décision</dt>
+                    <dd>{envelope.approval_decision_id ?? "Non fourni"}</dd>
+                  </div>
+                  <div>
+                    <dt>Version de l’enveloppe</dt>
+                    <dd>{envelope.version}</dd>
+                  </div>
+                </dl>
+              </details>
+            ) : null}
 
             <div role="group" aria-label="Actions G2">
               {!envelope.approved ? (

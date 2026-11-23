@@ -119,6 +119,7 @@ function makeEnvelope(approved: boolean) {
       : null,
     approval_actor_id: approved ? "analyst:test" : null,
     approved_at: approved ? "2026-10-13T08:00:00Z" : null,
+    currently_authorized: approved,
   };
 }
 
@@ -220,6 +221,7 @@ function createHarness(options?: {
         approval_decision_id: "66666666-6666-4666-8666-666666666666",
         approval_actor_id: "analyst:test",
         approved_at: "2026-10-13T08:00:00Z",
+        currently_authorized: true,
       };
       return Response.json(envelope);
     }
@@ -234,6 +236,7 @@ function createHarness(options?: {
         allowed_providers: [],
         acquire_hits_allowed: false,
         max_acquire_volume: 0,
+        currently_authorized: false,
       };
       return Response.json(envelope);
     }
@@ -295,14 +298,55 @@ function createHarness(options?: {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("InvestigationGovernancePanel", () => {
+  it("distingue les accès actifs des accès révoqués et masque les identifiants techniques", async () => {
+    const user = userEvent.setup();
+    createHarness({ approved: true });
+
+    expect(
+      await screen.findByRole("heading", { name: "Accès externes : actifs" }),
+    ).toBeVisible();
+    const decisionId = screen.getByText("66666666-6666-4666-8666-666666666666");
+    expect(decisionId.closest("details")).not.toBeNull();
+    expect(decisionId).not.toBeVisible();
+    expect(
+      screen.getByText(
+        /Consommation : 1 unité VirusTotal consommée · réservé : 0 unités VirusTotal réservées · plafond actif : 10/,
+      ),
+    ).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Révoquer" }));
+    await user.type(
+      screen.getByLabelText("Raison obligatoire de révocation"),
+      "Les recherches externes sont terminées.",
+    );
+    await user.click(screen.getByLabelText(/Je confirme la révocation/));
+    await user.click(
+      screen.getByRole("button", { name: "Confirmer la révocation" }),
+    );
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "Accès externes : révoqués",
+      }),
+    ).toBeVisible();
+    expect(
+      screen.getByText(
+        "Aucune nouvelle opération VT, Shodan ou Bridge externe n’est autorisée. Les analyses locales restent accessibles.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /Historique : 1 unité VirusTotal consommée \(autorisation révoquée, aucun plafond actif\)/,
+      ),
+    ).toBeInTheDocument();
+  });
+
   it("approuve uniquement après raison et confirmation explicites", async () => {
     const user = userEvent.setup();
     const { requests } = createHarness();
 
     expect(
-      await screen.findByText(
-        "Proposition locale non approuvée · aucun droit externe accordé",
-      ),
+      await screen.findByText("Accès externes : non accordés"),
     ).toBeInTheDocument();
     expect(
       screen.getByText(
@@ -358,6 +402,10 @@ describe("InvestigationGovernancePanel", () => {
     const user = userEvent.setup();
     const { requests } = createHarness({ approved: true });
 
+    expect(
+      await screen.findByRole("heading", { name: "Accès externes : actifs" }),
+    ).toBeVisible();
+
     await user.click(
       await screen.findByRole("button", { name: "Étendre l’enveloppe" }),
     );
@@ -404,9 +452,7 @@ describe("InvestigationGovernancePanel", () => {
     const user = userEvent.setup();
     createHarness({ failPath: "/envelope/approve" });
 
-    await screen.findByText(
-      "Proposition locale non approuvée · aucun droit externe accordé",
-    );
+    await screen.findByText("Accès externes : non accordés");
     await user.type(
       screen.getByLabelText("Raison obligatoire"),
       "La décision doit être persistée avec CAS.",

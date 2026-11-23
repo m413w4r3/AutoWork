@@ -703,7 +703,7 @@ describe("OverviewView", () => {
     await user.click(approveButton);
 
     expect(
-      await screen.findByText("Enveloppe G2 approuvée — version 1"),
+      await screen.findByText("Approbation G2 initiale enregistrée"),
     ).toBeTruthy();
     // L’approbation rend l’enveloppe lisible : le cycle de vie monte sans
     // rechargement, avec ses deux décisions distinctes.
@@ -712,6 +712,17 @@ describe("OverviewView", () => {
         name: "Cycle de vie de l’enveloppe G2",
       }),
     ).toBeTruthy();
+    for (const state of screen.getAllByText("Accès externes : actifs")) {
+      expect(state).toBeVisible();
+    }
+    const technicalDecisionIds = screen.getAllByText(
+      "88888888-8888-4888-8888-888888888888",
+    );
+    expect(technicalDecisionIds.length).toBeGreaterThan(0);
+    for (const decisionId of technicalDecisionIds) {
+      expect(decisionId.closest("details")).not.toBeNull();
+      expect(decisionId).not.toBeVisible();
+    }
     expect(
       screen.getByRole("button", { name: "Étendre l’enveloppe" }),
     ).toBeTruthy();
@@ -777,7 +788,7 @@ describe("OverviewView", () => {
     openOverviewDetails("Autorisations / budgets G2");
 
     expect(
-      await screen.findByText("Enveloppe G2 approuvée — version 2"),
+      await screen.findByText("Approbation G2 initiale enregistrée"),
     ).toBeTruthy();
     expect(
       screen.queryByRole("button", { name: /Approuver l’enveloppe/ }),
@@ -798,7 +809,9 @@ describe("OverviewView", () => {
         name: "Cycle de vie de l’enveloppe G2",
       }),
     ).toBeTruthy();
-    expect(screen.getByText("Enveloppe G2 active — version 1")).toBeTruthy();
+    for (const state of screen.getAllByText("Accès externes : actifs")) {
+      expect(state).toBeVisible();
+    }
     const lifecycle = screen.getByRole("region", {
       name: "Cycle de vie de l’enveloppe G2",
     });
@@ -829,5 +842,28 @@ describe("OverviewView", () => {
     expect(
       screen.queryByRole("button", { name: "Étendre l’enveloppe" }),
     ).toBeNull();
+  });
+
+  it("montre l’état actuel des accès au-dessus du volet G2 replié", async () => {
+    const { container } = renderOverview({
+      envelope: {
+        ...makeGovernanceEnvelope(true),
+        allowed_providers: [],
+        acquire_hits_allowed: false,
+        currently_authorized: false,
+      },
+    });
+
+    const revokedStates = await screen.findAllByText(
+      "Accès externes : révoqués",
+    );
+    const visibleSummary = revokedStates.find(
+      (state) => state.closest("#overview-g2-details") === null,
+    );
+    expect(visibleSummary).toBeVisible();
+    expect(
+      screen.getByText("Autorisations / budgets G2").closest("details"),
+    ).not.toHaveAttribute("open");
+    expect(container.querySelector("#overview-g2-details")).not.toBeNull();
   });
 });

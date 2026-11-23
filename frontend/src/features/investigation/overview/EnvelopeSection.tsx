@@ -113,7 +113,7 @@ export function EnvelopeSection({
       {submittedApproval ? (
         <ApprovalResult approval={submittedApproval} />
       ) : proposal?.already_approved ? (
-        <AlreadyApproved proposal={proposal} />
+        <AlreadyApproved />
       ) : null}
 
       {approvalError && !stale ? (
@@ -213,27 +213,15 @@ export function EnvelopeSection({
   );
 }
 
-function AlreadyApproved({
-  proposal,
-}: {
-  proposal: BootstrapEnvelopeProposalV1;
-}) {
+function AlreadyApproved() {
   return (
     <WorkshopStateBanner
       tone="success"
-      title={`Enveloppe G2 approuvée — version ${proposal.envelope_version ?? "inconnue"}`}
+      title="Approbation G2 initiale enregistrée"
     >
       <p>
-        La proposition courante indique que cette enveloppe est déjà approuvée.
-        Aucune nouvelle décision n’est demandée.
-      </p>
-      <p>
-        Fournisseurs autorisés :{" "}
-        {proposal.allowed_providers.length === 0
-          ? "aucun"
-          : proposal.allowed_providers.join(", ")}{" "}
-        · acquisition d’échantillons :{" "}
-        {proposal.acquire_hits_allowed ? "autorisée" : "non autorisée"}.
+        Les droits actuels, les consommations et la dernière décision sont
+        affichés dans le cycle de vie G2.
       </p>
       <LifecycleReferral />
     </WorkshopStateBanner>
@@ -261,41 +249,27 @@ function ApprovalResult({
   return (
     <WorkshopStateBanner
       tone="success"
-      title={`Enveloppe G2 approuvée — version ${approval.envelope_version}`}
+      title="Approbation G2 initiale enregistrée"
     >
       <p>
-        Décision <code>{approval.approval_decision_id}</code> · acteur{" "}
-        {approval.approval_actor_id} ·{" "}
-        <time dateTime={approval.approved_at}>{approval.approved_at}</time>
+        Dernière décision connue : {approval.approval_actor_id} ·{" "}
+        <time dateTime={approval.approved_at}>{approval.approved_at}</time>.
       </p>
-      <p>
-        Fournisseurs autorisés :{" "}
-        {approval.allowed_providers.length === 0
-          ? "aucun"
-          : approval.allowed_providers.join(", ")}{" "}
-        · acquisition :{" "}
-        {approval.acquire_hits_allowed ? "autorisée" : "non autorisée"} · TLP{" "}
-        {approval.disclosure_tlp ?? "non déclaré"} · modèle externe{" "}
-        {approval.disclosure_external_llm_allowed ? "autorisé" : "non autorisé"}
-        .
-      </p>
-      <dl className="workshop-meta">
-        {Object.entries(approval.budget_limits).map(([dimension, limit]) => (
-          <div key={dimension}>
-            <dt>{budgetLabel(dimension)}</dt>
-            <dd>{formatCount(limit)}</dd>
-          </div>
-        ))}
-      </dl>
+      <p>Motif : non transmis par l’API d’enveloppe.</p>
+      <details>
+        <summary>Détails techniques</summary>
+        <dl className="workshop-meta">
+          <dt>Identifiant de décision</dt>
+          <dd>
+            <code>{approval.approval_decision_id}</code>
+          </dd>
+          <dt>Version de l’enveloppe</dt>
+          <dd>{approval.envelope_version}</dd>
+        </dl>
+      </details>
       <LifecycleReferral />
     </WorkshopStateBanner>
   );
-}
-
-function budgetLabel(dimension: string): string {
-  return dimension in BUDGET_DIMENSION_LABELS
-    ? BUDGET_DIMENSION_LABELS[dimension as keyof typeof BUDGET_DIMENSION_LABELS]
-    : dimension;
 }
 
 function EnvelopeProposal({
