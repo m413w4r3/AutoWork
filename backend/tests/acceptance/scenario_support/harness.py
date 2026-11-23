@@ -121,6 +121,7 @@ from tests.workflow_emulator.investigation_support import (  # noqa: E402
 HUMAN_TOKEN = "m24-acceptance-human-token-0123456789abcdef"
 SESSION_KEY = "0123456789abcdef0123456789abcdef"
 TYPST_BINARY = os.environ.get("TYPST_BINARY", "typst")
+FAKE_SCRIPT_FILE_NAME = "fake-script.json"
 FIXED_NOW = datetime(2026, 11, 22, 12, 0, tzinfo=UTC)
 ANALYSIS_SECTION_PARAGRAPH = (
     "ANALYSIS-PARAGRAPH: le second etage synthetique est decrit dans ce paragraphe."
@@ -258,14 +259,31 @@ class _CachedFakeProfile(FakeProfile):  # type: ignore[misc]
     make the host prepare reject a backend probe hash taken a second earlier.
     """
 
-    def __init__(self) -> None:
-        super().__init__(supports_resume=True, simulate_network_attestation=True)
+    def __init__(
+        self,
+        *,
+        simulate_network_attestation: bool = True,
+        script: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(
+            supports_resume=True, simulate_network_attestation=simulate_network_attestation
+        )
         self._cached_probe: Any = None
+        self._script = dict(script) if script is not None else None
 
     def probe(self, *, now: str) -> Any:
         if self._cached_probe is None:
             self._cached_probe = super().probe(now=now)
         return self._cached_probe
+
+    def build_launch_plan(self, context: Any) -> Any:
+        if self._script is not None:
+            # The supervisor prefers the per-session script over the built-in
+            # scenario; writing it here keeps the first run deterministic too.
+            path = context.session_directory / FAKE_SCRIPT_FILE_NAME
+            path.write_text(json.dumps(self._script, separators=(",", ":")), encoding="utf-8")
+            os.chmod(path, 0o600)
+        return super().build_launch_plan(context)
 
 
 class _FakeCodexProfile(_CachedFakeProfile):
@@ -278,14 +296,40 @@ class _FakeClaudeProfile(_CachedFakeProfile):
     adapter_kind = "claude_code"
 
 
-def install_fake_cli_profiles(monkeypatch: Any) -> None:
-    """Register the H1 fake profile for both backend adapter kinds, hanging."""
+def install_fake_cli_profiles(
+    monkeypatch: Any,
+    *,
+    scenario: str = "hang",
+    adapter_kinds: tuple[str, ...] = ("codex_cli", "claude_code"),
+    simulate_network_attestation: bool = True,
+    script: Mapping[str, Any] | None = None,
+) -> None:
+    """Register the H1 fake profile for the requested backend adapter kinds.
 
-    monkeypatch.setenv("AUTOWORK_FAKE_CLI_SCENARIO", "hang")
+    ``scenario`` selects the built-in fake CLI script (``hang`` by default);
+    ``script`` supplies a deterministic per-session JSON script instead.
+    ``simulate_network_attestation=False`` models a host whose probe cannot
+    attest the loopback-isolated egress namespace, so the backend must refuse.
+    """
+
+    monkeypatch.setenv("AUTOWORK_FAKE_CLI_SCENARIO", scenario)
+    profiles: list[type[_CachedFakeProfile]] = []
+    if "codex_cli" in adapter_kinds:
+        profiles.append(_FakeCodexProfile)
+    if "claude_code" in adapter_kinds:
+        profiles.append(_FakeClaudeProfile)
     monkeypatch.setattr(
         supervisor_module,
         "default_profiles",
-        lambda: ProfileRegistry((_FakeCodexProfile(), _FakeClaudeProfile())),
+        lambda: ProfileRegistry(
+            tuple(
+                profile(
+                    simulate_network_attestation=simulate_network_attestation,
+                    script=script,
+                )
+                for profile in profiles
+            )
+        ),
     )
 
 
@@ -922,25 +966,18 @@ async def session_secret(uow_factory: Any, session_id: UUID) -> bytes:
     )
 
 
-async def signed_tool_call(
+async def signed_session_request(
     client: httpx.AsyncClient,
     *,
-    investigation_id: UUID,
+    path: str,
     session_id: UUID,
     secret: bytes,
-    tool_name: str,
-    schema_version: str,
-    arguments: Mapping[str, Any],
-    idempotency_key: str,
+    payload: Mapping[str, Any] | None = None,
+    idempotency_key: str | None = None,
 ) -> httpx.Response:
-    """Play the host shim: the D7 signed broker call, no bearer token."""
-    path = f"/api/investigations/{investigation_id}/agent-sessions/{session_id}/tool-calls"
+    """Play the host shim: one D7 signed session call, no bearer token."""
     body = json.dumps(
-        {
-            "tool_name": tool_name,
-            "schema_version": schema_version,
-            "arguments": dict(arguments),
-        },
+        dict(payload) if payload is not None else {},
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -956,12 +993,40 @@ async def signed_tool_call(
     signature = "v1=" + hmac.new(secret, message, hashlib.sha256).hexdigest()
     headers = {
         "Content-Type": "application/json",
-        "Idempotency-Key": idempotency_key,
         "X-AutoWork-Agent-Session": str(session_id),
         "X-AutoWork-Agent-Timestamp": timestamp,
         "X-AutoWork-Agent-Signature": signature,
     }
+    if idempotency_key is not None:
+        headers["Idempotency-Key"] = idempotency_key
     return await client.post(path, content=body, headers=headers)
+
+
+async def signed_tool_call(
+    client: httpx.AsyncClient,
+    *,
+    investigation_id: UUID,
+    session_id: UUID,
+    secret: bytes,
+    tool_name: str,
+    schema_version: str,
+    arguments: Mapping[str, Any],
+    idempotency_key: str,
+) -> httpx.Response:
+    """Play the host shim: the D7 signed broker call, no bearer token."""
+    path = f"/api/investigations/{investigation_id}/agent-sessions/{session_id}/tool-calls"
+    return await signed_session_request(
+        client,
+        path=path,
+        session_id=session_id,
+        secret=secret,
+        payload={
+            "tool_name": tool_name,
+            "schema_version": schema_version,
+            "arguments": dict(arguments),
+        },
+        idempotency_key=idempotency_key,
+    )
 
 
 async def settle_and_sync(client: httpx.AsyncClient, investigation_id: UUID) -> dict[str, Any]:
@@ -1014,5 +1079,6 @@ __all__ = [
     "seed_article",
     "session_secret",
     "settle_and_sync",
+    "signed_session_request",
     "signed_tool_call",
 ]
