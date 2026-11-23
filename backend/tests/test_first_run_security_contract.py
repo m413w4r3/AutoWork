@@ -670,14 +670,23 @@ async def test_operator_client_token_has_a_separate_scope_and_cannot_make_human_
     investigation_id = "00000000-0000-0000-0000-000000000101"
     association_id = "00000000-0000-0000-0000-000000000102"
     opinion_id = "00000000-0000-0000-0000-000000000103"
-    denied_paths = (
-        f"/api/investigations/{investigation_id}/envelope/approve",
-        f"/api/investigations/{investigation_id}/envelope/extend",
-        f"/api/investigations/{investigation_id}/envelope/revoke",
-        f"/api/opinions/{opinion_id}/approve",
-        f"/api/opinions/{opinion_id}/publish",
-        f"/api/investigations/{investigation_id}/samples/{association_id}/qualify",
-        f"/api/investigations/{investigation_id}/operator/tools/sample.set_qualification",
+    task_id = "00000000-0000-0000-0000-000000000104"
+    session_id = "00000000-0000-0000-0000-000000000105"
+    denied_requests = (
+        ("POST", f"/api/investigations/{investigation_id}/envelope/approve"),
+        ("POST", f"/api/investigations/{investigation_id}/envelope/extend"),
+        ("POST", f"/api/investigations/{investigation_id}/envelope/revoke"),
+        ("POST", f"/api/opinions/{opinion_id}/approve"),
+        ("POST", f"/api/opinions/{opinion_id}/publish"),
+        ("POST", f"/api/investigations/{investigation_id}/samples/{association_id}/qualify"),
+        (
+            "POST",
+            f"/api/investigations/{investigation_id}/operator/tools/sample.set_qualification",
+        ),
+        # M24.1 human-only routes (R1 F7): no operator-client allowlist entry.
+        ("GET", f"/api/investigations/{investigation_id}/article-anchors"),
+        ("POST", f"/api/investigations/{investigation_id}/tasks/{task_id}/consultations"),
+        ("GET", f"/api/investigations/{investigation_id}/agent-sessions/{session_id}/summary"),
     )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=application), base_url="http://testserver"
@@ -687,11 +696,12 @@ async def test_operator_client_token_has_a_separate_scope_and_cannot_make_human_
             headers={"Authorization": f"Bearer {client_token}"},
         )
         denied = [
-            await client.post(
+            await client.request(
+                method,
                 path,
                 headers={"Authorization": f"Bearer {client_token}"},
             )
-            for path in denied_paths
+            for method, path in denied_requests
         ]
 
     assert status.json()["human_identity"] is False
