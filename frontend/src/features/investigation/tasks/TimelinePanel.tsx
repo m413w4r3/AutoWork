@@ -4,7 +4,9 @@
  * The server projection already deduplicates status changes and their human
  * decision, and Bridge consultation observations. Each item keeps its exact
  * canonical object id and navigation refs; advisory items are labelled
- * "non-preuve" and never presented as evidence.
+ * "non-preuve" and never presented as evidence. The B7 working objects
+ * (handoffs, contributions, agent sessions, instructions) are appended by the
+ * server as `evidence: false` and carry their ids and SHA-256 refs only.
  */
 
 import { useMemo, useState } from "react";
@@ -17,7 +19,10 @@ import {
   type TimelineItemV1,
 } from "../api/tasks";
 import {
+  ADAPTER_LABELS,
   formatTimestamp,
+  SESSION_STATE_LABELS,
+  shortSha,
   TIMELINE_ACTOR_LABELS,
   TIMELINE_TYPE_LABELS,
 } from "./labels";
@@ -30,6 +35,67 @@ const ACTOR_OPTIONS = Object.entries(TIMELINE_ACTOR_LABELS) as Array<
 >;
 
 type EvidenceFilter = "all" | "evidence" | "non_evidence";
+
+/** B7 projections: persisted working objects, never canonical evidence. */
+const WORKING_ITEM_TYPES: ReadonlySet<TimelineItemType> = new Set([
+  "handoff",
+  "contribution",
+  "agent_session",
+  "instruction",
+]);
+
+const REF_LABELS: Record<string, string> = {
+  handoff_id: "Passation liée",
+  contribution_id: "Contribution liée",
+  instruction_id: "Instruction liée",
+  task_id: "Tâche",
+  predecessor_id: "Prédécesseur",
+  version: "Version",
+  sha256: "SHA-256",
+  workspace_id: "Workspace",
+  workspace_revision_id: "Révision du workspace",
+  file_relpath: "Fichier",
+  file_sha256: "SHA-256 du fichier",
+  observation_id: "Observation liée",
+  finding_id: "Finding lié",
+  validation_error_code: "Erreur de validation",
+  session_id: "Session liée",
+  adapter_kind: "Adaptateur",
+  state: "État",
+  state_version: "Version d’état",
+  text_sha256: "SHA-256 du texte",
+  delivery_attempts: "Tentatives de livraison",
+  delivery_mode: "Mode de livraison",
+  delivery_sha256: "SHA-256 de livraison",
+};
+
+/** Closed-union ref values translated; unknown tokens stay verbatim. */
+const REF_VALUE_LABELS: Record<string, Record<string, string>> = {
+  adapter_kind: ADAPTER_LABELS,
+  state: SESSION_STATE_LABELS,
+  delivery_mode: {
+    live: "Livraison directe",
+    next_run: "Au prochain démarrage",
+  },
+};
+
+function isDigestRef(name: string): boolean {
+  return name === "sha256" || name.endsWith("_sha256");
+}
+
+function TimelineRefValue({ name, value }: { name: string; value: string }) {
+  if (name === "task_id") {
+    return (
+      <a href={`#task-${value}`}>
+        <code>{value}</code>
+      </a>
+    );
+  }
+  if (isDigestRef(name)) {
+    return <code title={value}>{shortSha(value)}</code>;
+  }
+  return <code>{REF_VALUE_LABELS[name]?.[value] ?? value}</code>;
+}
 
 function itemMatchesText(item: TimelineItemV1, needle: string): boolean {
   if (needle === "") return true;
@@ -178,6 +244,10 @@ export function TimelinePanel({
                   <span className="m24-badge m24-badge--advisory">
                     Avis Bridge — non preuve
                   </span>
+                ) : WORKING_ITEM_TYPES.has(item.item_type) ? (
+                  <span className="m24-badge m24-badge--muted">
+                    Non probant — élément de travail
+                  </span>
                 ) : (
                   <span className="m24-badge m24-badge--muted">Non-preuve</span>
                 )}
@@ -190,14 +260,21 @@ export function TimelinePanel({
                     <code>{item.object_id}</code>
                   </dd>
                 </div>
-                {Object.entries(item.refs).map(([key, value]) => (
-                  <div key={`${item.object_id}-${key}`}>
-                    <dt>{key}</dt>
-                    <dd>
-                      <code>{value}</code>
-                    </dd>
-                  </div>
-                ))}
+                {Object.entries(item.refs)
+                  // The object id is already the canonical id chip; only the
+                  // other refs add information.
+                  .filter(
+                    ([key, value]) =>
+                      key === "task_id" || value !== item.object_id,
+                  )
+                  .map(([key, value]) => (
+                    <div key={`${item.object_id}-${key}`}>
+                      <dt>{REF_LABELS[key] ?? key}</dt>
+                      <dd>
+                        <TimelineRefValue name={key} value={value} />
+                      </dd>
+                    </div>
+                  ))}
               </dl>
               {item.task_id === null ? null : (
                 <a href={`#task-${item.task_id}`}>Voir la tâche</a>

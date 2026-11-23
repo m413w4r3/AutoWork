@@ -53,6 +53,7 @@ import type {
 import type {
   TaskPageView,
   TaskView,
+  TimelinePageV1,
 } from "../../src/features/investigation/api/tasks";
 import type { WorkspaceAgentStatusResponse } from "../../src/features/investigation/api/workspaceAgent";
 import type {
@@ -95,6 +96,8 @@ const ids = {
   sample: "d1d1d1d1-d1d1-41d1-81d1-d1d1d1d1d1d1",
   session: "e2e2e2e2-e2e2-42e2-82e2-e2e2e2e2e2e2",
   bridgeInvocation: "e1e1e1e1-e1e1-41e1-81e1-e1e1e1e1e1e1",
+  handoff: "e3e3e3e3-e3e3-43e3-83e3-e3e3e3e3e3e3",
+  instruction: "e4e4e4e4-e4e4-44e4-84e4-e4e4e4e4e4e4",
   approvalDecision: "f1f1f1f1-f1f1-41f1-81f1-f1f1f1f1f1f1",
   snapshot: "f2f2f2f2-f2f2-42f2-82f2-f2f2f2f2f2f2",
   job: "f3f3f3f3-f3f3-43f3-83f3-f3f3f3f3f3f3",
@@ -1022,6 +1025,105 @@ function taskPage(tasks: TaskView[]): TaskPageView {
   return { items: tasks, total: tasks.length };
 }
 
+/** One page covering the canonical evidence and the four B7 working objects. */
+function timelinePage(): TimelinePageV1 {
+  return {
+    items: [
+      {
+        item_type: "observation",
+        object_id: ids.observation,
+        occurred_at: "2026-11-22T10:00:00Z",
+        task_id: null,
+        actor_kind: "source",
+        actor_id: "virustotal",
+        summary: "vt_file_report:sample",
+        evidence: true,
+        refs: { observation_id: ids.observation, sha256: SHA.sample },
+        linked_event_ids: [],
+        linked_observation_ids: [],
+      },
+      {
+        item_type: "handoff",
+        object_id: ids.handoff,
+        occurred_at: "2026-11-22T10:02:00Z",
+        task_id: ids.taskReady,
+        actor_kind: "human",
+        actor_id: "analyst:e2e",
+        summary: "handoff:v1:human->operator",
+        evidence: false,
+        refs: {
+          handoff_id: ids.handoff,
+          task_id: ids.taskReady,
+          version: "1",
+          sha256: SHA.note,
+        },
+        linked_event_ids: [],
+        linked_observation_ids: [],
+      },
+      {
+        item_type: "contribution",
+        object_id: "contribution-1",
+        occurred_at: "2026-11-22T10:03:00Z",
+        task_id: ids.taskReady,
+        actor_kind: "operator",
+        actor_id: "codex",
+        summary: "contribution:finding:imported",
+        evidence: false,
+        refs: {
+          contribution_id: "contribution-1",
+          workspace_id: "ws-m24-01",
+          workspace_revision_id: "revision-2",
+          file_relpath: "notes/agents/task-1/finding.md",
+          file_sha256: SHA.note,
+          finding_id: ids.finding,
+        },
+        linked_event_ids: [],
+        linked_observation_ids: [],
+      },
+      {
+        item_type: "agent_session",
+        object_id: ids.session,
+        occurred_at: "2026-11-22T10:04:00Z",
+        task_id: ids.taskReady,
+        actor_kind: "system",
+        actor_id: "codex_cli",
+        summary: "agent_session:codex_cli:running",
+        evidence: false,
+        refs: {
+          session_id: ids.session,
+          task_id: ids.taskReady,
+          adapter_kind: "codex_cli",
+          state: "running",
+          state_version: "2",
+          handoff_id: ids.handoff,
+        },
+        linked_event_ids: [],
+        linked_observation_ids: [],
+      },
+      {
+        item_type: "instruction",
+        object_id: ids.instruction,
+        occurred_at: "2026-11-22T10:05:00Z",
+        task_id: ids.taskReady,
+        actor_kind: "human",
+        actor_id: "analyst:e2e",
+        summary: "instruction:queued",
+        evidence: false,
+        refs: {
+          instruction_id: ids.instruction,
+          session_id: ids.session,
+          text_sha256: SHA.proposed,
+          delivery_attempts: "0",
+        },
+        linked_event_ids: [],
+        linked_observation_ids: [],
+      },
+    ],
+    next_cursor: null,
+    has_more: false,
+  };
+}
+
 function capabilitiesPayload(
   adapterKind: OperatorAdapterKind,
   executable: string,
@@ -1705,7 +1807,7 @@ export function createWorkshopApi(options: WorkshopApiOptions = {}) {
       return fulfill(route, taskPage(tasks));
     }
     if (path === inv("/timeline") && method === "GET") {
-      return fulfill(route, { items: [], next_cursor: null, has_more: false });
+      return fulfill(route, timelinePage());
     }
     if (
       path === "/api/investigations/agent-sessions/capabilities" &&
