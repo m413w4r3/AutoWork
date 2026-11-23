@@ -2008,7 +2008,10 @@ _NOTE_ELEMENT_KIND_LABELS: dict[str, str] = {
     "figure": "Figure",
 }
 _NOTE_IOC_COLUMNS = ("Observation", "Type", "Valeur", "Source", "Observé le", "Empreinte")
-_NOTE_IOC_COLUMN_WEIGHTS = (1.6, 0.9, 1.8, 1.2, 1.1, 2.6)
+# The observed-at column holds an ISO timestamp; at 1.1fr its longest line
+# overflowed into the fingerprint column.  Keep enough width for the date to
+# wrap inside its own cell (avis and bulletin share this layout).
+_NOTE_IOC_COLUMN_WEIGHTS = (1.6, 0.9, 1.8, 1.2, 2.2, 2.6)
 
 
 def _note_display_part(text: str, *, technical: bool) -> dict[str, Any]:

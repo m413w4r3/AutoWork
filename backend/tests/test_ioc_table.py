@@ -1,13 +1,32 @@
+from __future__ import annotations
+
+import asyncio
 import hashlib
+import html
 import json
+import os
+import re
+import shutil
+import subprocess
 from dataclasses import replace
 from datetime import UTC, date, datetime
+from pathlib import Path
 from uuid import UUID
 
+import pytest
+
+from cti_app.application.edition_typst_rendering import EditionTypstRenderer
 from cti_app.application.production_synthesis import canonical_extraction_hash
 from cti_app.application.publication_builder import build_publication_document_v5
+from cti_app.application.typst_compilation import (
+    TypstCompileRequest,
+    load_font_bundle_snapshot,
+    materialize_font_bundle,
+)
 from cti_app.application.typst_rendering import (
     TypstDraftPreviewDocument,
+    TypstRenderer,
+    load_template_bundle,
     project_publication_to_typst_model,
 )
 from cti_app.domain.analyst_opinion import (
@@ -44,6 +63,13 @@ from cti_app.domain.semantic_annotation import (
     SemanticParagraphV1,
     SemanticRole,
     SemanticTextSpanV1,
+)
+from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
+from tests.test_edition_typst_rendering import (
+    _EDITION_MANIFEST,
+    _EDITION_RENDER_LABEL,
+    _edition_document,
+    _note_block_v6,
 )
 from tests.test_publication_builder_v4 import _canonical_inputs, _enrichment_with
 
@@ -447,3 +473,163 @@ def test_reader_projection_hides_ioc_disposition_while_canonical_keeps_it() -> N
         item.disposition is PublicationIOCDisposition.RETAINED for item in restored.ioc_details
     )
     assert any(item.evidence_quote for item in restored.ioc_details)
+
+
+# ---------------------------------------------------------------------------
+# R6-F2 — a note ioc_table must not let « Observé le » overlap « Empreinte »
+# ---------------------------------------------------------------------------
+
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+_WORD_BBOX = re.compile(
+    r'<word xMin="(?P<xmin>[0-9.]+)" yMin="(?P<ymin>[0-9.]+)" '
+    r'xMax="(?P<xmax>[0-9.]+)" yMax="(?P<ymax>[0-9.]+)">(?P<text>[^<]*)</word>'
+)
+
+
+def _compile_rendered_pdf(tmp_path: Path, source, bundle, binary: str) -> bytes:
+    workspace = tmp_path / "workspace"
+    for template_file in bundle.files:
+        destination = workspace / template_file.relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(template_file.content)
+    render_data_path = workspace / source.render_data_relative_path
+    render_data_path.parent.mkdir(parents=True, exist_ok=True)
+    render_data_path.write_bytes(source.render_data_bytes)
+    font_root = Path(os.environ.get("FONT_BUNDLE_ROOT", str(_REPOSITORY_ROOT / "chpTypst")))
+    font_snapshot = load_font_bundle_snapshot(
+        font_root, _REPOSITORY_ROOT / "infra" / "typst-fonts.lock"
+    )
+    font_paths = materialize_font_bundle(font_snapshot, tmp_path / "fonts")
+    compiled = asyncio.run(
+        TypstSubprocessCompiler(binary=binary).compile(
+            TypstCompileRequest(
+                workspace_root=workspace,
+                entrypoint_relative_path=source.entrypoint_relative_path,
+                font_paths=font_paths,
+            )
+        )
+    )
+    return compiled.content
+
+
+def _word_bboxes(pdf_path: Path) -> list[tuple[str, float, float, float, float]]:
+    extracted = subprocess.run(
+        ["pdftotext", "-bbox", str(pdf_path), "-"],
+        capture_output=True,
+        check=True,
+    ).stdout.decode("utf-8", errors="replace")
+    return [
+        (
+            html.unescape(match.group("text")),
+            float(match.group("xmin")),
+            float(match.group("ymin")),
+            float(match.group("xmax")),
+            float(match.group("ymax")),
+        )
+        for match in _WORD_BBOX.finditer(extracted)
+    ]
+
+
+def _assert_observed_at_does_not_overlap_fingerprint(
+    pdf_path: Path, *, observed_at: str, fingerprint: str
+) -> None:
+    """Fail when a date glyph box crosses into the fingerprint column on its line."""
+    words = _word_bboxes(pdf_path)
+    date_words = [
+        (text, xmin, ymin, xmax, ymax)
+        for text, xmin, ymin, xmax, ymax in words
+        if text and text in observed_at
+    ]
+    hash_words = [
+        (text, xmin, ymin, xmax, ymax)
+        for text, xmin, ymin, xmax, ymax in words
+        if len(text) >= 8 and text in fingerprint
+    ]
+    assert date_words, f"the rendered timestamp {observed_at!r} was not found"
+    assert hash_words, f"the rendered fingerprint {fingerprint!r} was not found"
+    overlaps = [
+        (date_word[0], date_word[3], hash_word[0], hash_word[1])
+        for date_word in date_words
+        for hash_word in hash_words
+        if date_word[1] < hash_word[3]
+        and hash_word[1] < date_word[3]
+        and date_word[2] < hash_word[4]
+        and hash_word[2] < date_word[4]
+        and date_word[3] > hash_word[1] + 0.5
+    ]
+    assert not overlaps, (
+        f"the observed-at cell overflows into the fingerprint column on the same line: {overlaps}"
+    )
+
+
+def _typst_and_pdftotext() -> str:
+    binary = os.environ.get("TYPST_BINARY") or str(
+        Path.home() / ".local" / "share" / "autowork-tools" / "typst"
+    )
+    if (shutil.which(binary) is None and not Path(binary).is_file()) or (
+        shutil.which("pdftotext") is None
+    ):
+        pytest.skip("pinned Typst 0.15.1 and pdftotext are required for the layout oracle")
+    version = subprocess.run(
+        (binary, "--version"), capture_output=True, check=True, text=True, timeout=10
+    ).stdout.strip()
+    assert version.startswith("typst 0.15.1"), version
+    return binary
+
+
+def _note_ioc_table_pdf_fixture():
+    publication, context, _raw = _note_block_v6()
+    ioc_observation = context.observations[1]
+    assert ioc_observation.observed_at == datetime(2026, 11, 1, tzinfo=UTC)
+    assert ioc_observation.sha256 == "f" * 64
+    return publication, context
+
+
+def test_note_ioc_table_columns_do_not_overlap_in_opinion_pdf(tmp_path: Path) -> None:
+    """R6-F2: the opinion renders the exact timestamp inside its own cell."""
+    binary = _typst_and_pdftotext()
+    publication, context = _note_ioc_table_pdf_fixture()
+    # Microsecond timestamps are the longest ISO form the cell must hold.
+    microseconds = datetime(2026, 11, 20, 10, 0, 0, 123456, tzinfo=UTC)
+    context = replace(
+        context,
+        observations=(
+            context.observations[0],
+            replace(context.observations[1], observed_at=microseconds),
+        ),
+    )
+    bundle = load_template_bundle(_REPOSITORY_ROOT / "chpTypst")
+    source = TypstRenderer().render(
+        publication,
+        bundle,
+        document_label="Avis — table IOC",
+        note_block_context=context,
+    )
+    pdf_path = tmp_path / "opinion.pdf"
+    pdf_path.write_bytes(_compile_rendered_pdf(tmp_path, source, bundle, binary))
+    _assert_observed_at_does_not_overlap_fingerprint(
+        pdf_path,
+        observed_at=microseconds.isoformat(),
+        fingerprint="f" * 64,
+    )
+
+
+def test_note_ioc_table_columns_do_not_overlap_in_edition_pdf(tmp_path: Path) -> None:
+    """R6-F2: the bulletin renders the same table without overlapping columns."""
+    binary = _typst_and_pdftotext()
+    publication, context = _note_ioc_table_pdf_fixture()
+    edition = _edition_document(((1, publication),))
+    bundle = load_template_bundle(_REPOSITORY_ROOT / "chpTypst", manifest_name=_EDITION_MANIFEST)
+    source = EditionTypstRenderer().render(
+        edition,
+        bundle,
+        document_label=_EDITION_RENDER_LABEL,
+        note_block_contexts={publication.subject_id: context},
+    )
+    pdf_path = tmp_path / "edition.pdf"
+    pdf_path.write_bytes(_compile_rendered_pdf(tmp_path, source, bundle, binary))
+    _assert_observed_at_does_not_overlap_fingerprint(
+        pdf_path,
+        observed_at=context.observations[1].observed_at.isoformat(),
+        fingerprint="f" * 64,
+    )
