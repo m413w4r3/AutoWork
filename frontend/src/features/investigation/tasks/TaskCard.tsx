@@ -57,6 +57,12 @@ type SimpleCommand = "start" | "release" | "submit" | "unblock";
 type ReasonAction =
   "interrupt_task" | "accept_result" | "request_changes" | "interrupt_session";
 
+/** Destructive actions carry the danger variant, apart from the primary ones. */
+const DESTRUCTIVE_ACTIONS: ReadonlySet<TaskActionId> = new Set<TaskActionId>([
+  "interrupt_task",
+  "interrupt_session",
+]);
+
 const REASON_LABELS: Record<ReasonAction, string> = {
   interrupt_task: "Motif d’interruption (obligatoire)",
   accept_result: "Motif d’acceptation (obligatoire)",
@@ -487,7 +493,11 @@ export function TaskCard({
           <button
             key={action}
             type="button"
-            className="m24-action"
+            className={
+              DESTRUCTIVE_ACTIONS.has(action)
+                ? "m24-action m24-action--danger"
+                : "m24-action"
+            }
             onClick={() => onAction(action)}
             disabled={busy}
             aria-expanded={
@@ -624,7 +634,9 @@ export function TaskCard({
 
       {noteOpen ? (
         <div className="m24-inline-form">
-          <label htmlFor={`${baseId}-note`}>Note (Markdown, non-preuve)</label>
+          <label htmlFor={`${baseId}-note`}>
+            Note (Markdown, non probante)
+          </label>
           <textarea
             id={`${baseId}-note`}
             value={noteText}
@@ -657,7 +669,7 @@ export function TaskCard({
           aria-label="Résultats de la tâche"
         >
           <h5>
-            Résultats soumis <span className="m24-badge">Non preuve</span>
+            Résultats soumis <span className="m24-badge">Non probant</span>
           </h5>
           <p className="m24-muted">
             Références déclarées par l’exécutant : elles ne constituent pas une
@@ -675,7 +687,7 @@ export function TaskCard({
               ))}
             </ul>
           )}
-          <h5>Journal borné (20 derniers événements, non-preuve)</h5>
+          <h5>Journal borné (20 derniers événements, non probant)</h5>
           {events.isPending ? (
             <p role="status">Chargement du journal…</p>
           ) : events.isError ? (

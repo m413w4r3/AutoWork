@@ -4,7 +4,7 @@
  * The server projection already deduplicates status changes and their human
  * decision, and Bridge consultation observations. Each item keeps its exact
  * canonical object id and navigation refs; advisory items are labelled
- * "non-preuve" and never presented as evidence. The B7 working objects
+ * "non probant" and never presented as evidence. The B7 working objects
  * (handoffs, contributions, agent sessions, instructions) are appended by the
  * server as `evidence: false` and carry their ids and SHA-256 refs only.
  */
@@ -222,7 +222,7 @@ export function TimelinePanel({
           >
             <option value="all">Tout</option>
             <option value="evidence">Preuves canoniques</option>
-            <option value="non_evidence">Non-preuves</option>
+            <option value="non_evidence">Non probants</option>
           </select>
         </label>
         <label>
@@ -276,14 +276,16 @@ export function TimelinePanel({
                   </span>
                 ) : item.item_type === "bridge_consultation" ? (
                   <span className="m24-badge m24-badge--advisory">
-                    Avis Bridge — non preuve
+                    Avis Bridge — non probant
                   </span>
                 ) : WORKING_ITEM_TYPES.has(item.item_type) ? (
                   <span className="m24-badge m24-badge--muted">
                     Non probant — élément de travail
                   </span>
                 ) : (
-                  <span className="m24-badge m24-badge--muted">Non-preuve</span>
+                  <span className="m24-badge m24-badge--muted">
+                    Non probant
+                  </span>
                 )}
               </div>
               <p title={item.summary}>{timelineSummaryLabel(item)}</p>

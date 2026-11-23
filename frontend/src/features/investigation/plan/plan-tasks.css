@@ -209,6 +209,13 @@
   color: #28503b;
 }
 
+/* Destructive task/session interruption, visually apart from the primaries. */
+.m24-action--danger {
+  border-color: #92443b;
+  background: #92443b;
+  color: #fff;
+}
+
 .m24-inline-form {
   display: flex;
   flex-direction: column;

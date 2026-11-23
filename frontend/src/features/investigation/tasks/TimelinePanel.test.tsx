@@ -161,7 +161,7 @@ function renderTimeline(page: unknown = timelinePage()) {
 }
 
 describe("TimelinePanel", () => {
-  it("étiquette les avis comme non-preuves et pointe l’objet exact", async () => {
+  it("étiquette les avis comme non probants et pointe l’objet exact", async () => {
     renderTimeline();
 
     expect(
@@ -170,7 +170,7 @@ describe("TimelinePanel", () => {
     // The raw projection token stays available as the item title.
     expect(screen.getByTitle("vt_file_report:sample")).toBeInTheDocument();
     expect(screen.getByText("Preuve canonique")).toBeInTheDocument();
-    expect(screen.getByText("Avis Bridge — non preuve")).toBeInTheDocument();
+    expect(screen.getByText("Avis Bridge — non probant")).toBeInTheDocument();
     expect(screen.getAllByText("inv-1").length).toBeGreaterThan(0);
     expect(screen.getAllByText("obs-1").length).toBeGreaterThan(0);
     expect(screen.getByRole("link", { name: "Voir la tâche" })).toHaveAttribute(
@@ -263,7 +263,7 @@ describe("TimelinePanel", () => {
       screen.getAllByText("Non probant — élément de travail"),
     ).toHaveLength(4);
     expect(screen.getAllByText("Preuve canonique")).toHaveLength(1);
-    expect(screen.getByText("Avis Bridge — non preuve")).toBeInTheDocument();
+    expect(screen.getByText("Avis Bridge — non probant")).toBeInTheDocument();
 
     // Persisted ids stay whole; digests are abbreviated.
     expect(screen.getAllByText("hd-1")).toHaveLength(2);

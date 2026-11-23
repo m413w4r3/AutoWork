@@ -27,7 +27,7 @@ export function PlanTasksView({
         <p className="m24-muted">
           Plan Bridge, tâches transférables et opérateurs Codex / Claude Code.
           Chaque décision humaine porte la version exacte de son objet (CAS) ;
-          les avis Bridge restent des non-preuves.
+          les avis Bridge restent non probants.
         </p>
       </header>
       <div className="m24-plan-tasks__columns">

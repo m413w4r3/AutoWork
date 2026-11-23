@@ -18,6 +18,13 @@ import { shortSha } from "./tasks/labels";
 
 const HASH_PATTERN = /^[0-9a-f]{64}$/;
 
+/** Artifact verification status of the synthesis, translated for the UI. */
+const SYNTHESIS_STATUS_LABELS: Record<string, string> = {
+  verified: "Vérifiée",
+  stale: "Périmée",
+  needs_review: "À réviser",
+};
+
 export function InvestigationTab({
   subjectId,
   editionId,
@@ -143,7 +150,10 @@ export function InvestigationTab({
                 </div>
                 <div>
                   <dt>État de vérification</dt>
-                  <dd>{synthesisQuery.data.status}</dd>
+                  <dd>
+                    {SYNTHESIS_STATUS_LABELS[synthesisQuery.data.status] ??
+                      synthesisQuery.data.status}
+                  </dd>
                 </div>
               </dl>
               {!exactSynthesis ? (

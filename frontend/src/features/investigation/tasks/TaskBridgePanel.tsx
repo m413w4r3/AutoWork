@@ -443,7 +443,9 @@ export function TaskBridgePanel({
                         Analyse : {PARSE_STATUS_LABELS[row.parse_status]} ·
                         réconciliation :{" "}
                         {RECONCILIATION_LABELS[row.reconciliation_state]} ·{" "}
-                        {row.advisory_only ? "avis — non preuve" : "à vérifier"}
+                        {row.advisory_only
+                          ? "avis — non probant"
+                          : "à vérifier"}
                         {row.usable ? " · texte exploitable" : ""}
                         {row.readable ? " · texte lisible" : ""} · invocation{" "}
                         <code title={row.invocation_id}>

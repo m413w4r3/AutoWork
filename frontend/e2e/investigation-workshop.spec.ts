@@ -915,7 +915,7 @@ test("workspace et notes : arborescence, note non vérifiée et résolution de c
     expected_working_state_version: 5,
   });
   expect(bridge?.idempotencyKey).toBeTruthy();
-  await expect(page.getByText(/avis consultatif — non preuve/)).toBeVisible();
+  await expect(page.getByText(/avis consultatif — non probant/)).toBeVisible();
 
   await expect(
     page.getByRole("heading", { name: "Conflits", exact: true }),

@@ -31,6 +31,7 @@ import {
 import { toWorkshopApiError } from "../api/client";
 import { useTaskEvents, useTasks, type TaskView } from "../api/tasks";
 import type {
+  AgentSessionState,
   BudgetDimension,
   InstructionState,
   TaskStatus,
@@ -84,6 +85,24 @@ const BUDGET_DIMENSIONS: readonly BudgetDimension[] = [
 /** A queued or in-flight instruction, as opposed to one already handled. */
 const PENDING_INSTRUCTION_STATES: ReadonlySet<InstructionState> =
   new Set<InstructionState>(["queued", "delivering", "delivery_unknown"]);
+
+/** Same colour semantics as the task status badge (F12). */
+const SESSION_BADGE_VARIANTS: Record<AgentSessionState, string> = {
+  provisioning: "m24-badge--running",
+  ready: "m24-badge--running",
+  running: "m24-badge--running",
+  awaiting_instruction: "m24-badge--awaiting_review",
+  interrupt_requested: "m24-badge--awaiting_review",
+  reconciling: "m24-badge--awaiting_review",
+  stopped: "m24-badge--muted",
+  lost: "m24-badge--blocked",
+  closed: "m24-badge--muted",
+  failed: "m24-badge--failed",
+};
+
+function sessionBadgeClass(state: AgentSessionState): string {
+  return `m24-badge ${SESSION_BADGE_VARIANTS[state]}`;
+}
 
 function operationBudgetText(operation: AgentSessionOperationView): string {
   const parts: string[] = [];
@@ -212,7 +231,7 @@ function BrokerBlock({ broker }: { broker: AgentSessionBrokerView }) {
       </h6>
       <p className="m24-muted">
         Aucun état broker en direct n’est lu : ces valeurs sont dérivées des
-        invocations d’outils signées (D7) du journal.
+        invocations d’outils signées du journal.
       </p>
       <dl className="m24-metadata">
         <div>
@@ -518,7 +537,9 @@ function SessionRow({
           {ADAPTER_LABELS[session.adapter_kind]}
           {task === undefined ? null : ` · ${task.title}`}
         </h5>
-        <span className="m24-badge">{SESSION_STATE_LABELS[session.state]}</span>
+        <span className={sessionBadgeClass(session.state)}>
+          {SESSION_STATE_LABELS[session.state]}
+        </span>
       </header>
       <dl className="m24-metadata">
         <div>
@@ -613,7 +634,7 @@ function SessionRow({
             {interruptOpen ? null : (
               <button
                 type="button"
-                className="m24-action m24-action--quiet"
+                className="m24-action m24-action--danger"
                 onClick={() => setInterruptOpen(true)}
               >
                 Interrompre la session
@@ -684,7 +705,7 @@ function SessionRow({
       </div>
       {logsOpen ? (
         <div className="m24-operator__logs">
-          <h6>Journal borné (20 derniers événements de tâche, non-preuve)</h6>
+          <h6>Journal borné (20 derniers événements de tâche, non probant)</h6>
           {events.isPending ? (
             <p role="status">Chargement du journal…</p>
           ) : events.isError ? (

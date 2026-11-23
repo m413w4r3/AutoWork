@@ -316,6 +316,7 @@ describe("InvestigationTab", () => {
       await screen.findByText(new RegExp(SYNTHESIS_ID)),
     ).toBeInTheDocument();
     expect(screen.getByText(SHA256)).toBeInTheDocument();
+    expect(screen.getByText("Vérifiée")).toBeInTheDocument();
 
     await user.click(
       screen.getByRole("button", { name: "Investiguer cette version exacte" }),
