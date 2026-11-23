@@ -39,9 +39,11 @@ from cti_app.application.agentic_host_sessions import (
     HostBudgetUsageV1,
     HostInstructionResultV1,
     HostReasonRequestV1,
+    HostSessionEventV1,
     HostSessionEventsPageV1,
     HostSessionStatusV1,
 )
+from cti_app.application.workspace_agent import WorkspaceLocalUnavailableError
 from cti_app.application.agentic_sessions import (
     NoteInstructionResolution,
     SessionSecret,
@@ -153,9 +155,13 @@ class _FakeHost:
     def __init__(self) -> None:
         self.send_calls: list[dict[str, Any]] = []
         self.status_calls = 0
+        self.events: tuple[HostSessionEventV1, ...] = ()
+        self.unreachable: set[UUID] = set()
 
     async def get_session_status(self, session_id: UUID) -> HostSessionStatusV1:
         self.status_calls += 1
+        if session_id in self.unreachable:
+            raise WorkspaceLocalUnavailableError("the host session is lost")
         return HostSessionStatusV1(
             state="awaiting_instruction",
             state_version=1,
@@ -183,10 +189,13 @@ class _FakeHost:
         generation: int | None = None,
         limit: int = 500,
     ) -> HostSessionEventsPageV1:
+        if session_id in self.unreachable:
+            raise WorkspaceLocalUnavailableError("the host session is lost")
+        events = tuple(event for event in self.events if event.seq >= after)
         return HostSessionEventsPageV1(
             generation=1,
-            events=(),
-            next_cursor=after,
+            events=events,
+            next_cursor=events[-1].seq + 1 if events else after,
             oldest_retained=0,
             resync_required=False,
         )
@@ -541,6 +550,108 @@ def test_terminal_session_stale_delivering_is_reconciled_and_cancelable(
                 now=NOW,
             )
             assert cancelled.state is InstructionState.CANCELLED
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+async def _seed_delivery_unknown(
+    session_factory: async_sessionmaker[AsyncSession],
+    session: AgentSessionV1,
+    *,
+    text: str,
+    key: str,
+    at: datetime,
+) -> AgentSessionInstructionV1:
+    """A reserved attempt whose phase C never committed the receipt."""
+    queued = await _seed_instruction(
+        session_factory, session, text=text, key=key, queued_at=at
+    )
+    token = uuid4()
+    reserved = queued.with_delivery_reserved(
+        token=token,
+        delivery_sha256=instruction_text_sha256(text),
+        now=at,
+    )
+    async with SqlAlchemyUnitOfWork(session_factory) as uow:
+        await uow.agent_sessions.update_instruction_delivery(
+            reserved,
+            expected_state=InstructionState.QUEUED,
+            expected_delivery_token=None,
+        )
+        await uow.commit()
+    ambiguous = reserved.with_state(
+        InstructionState.DELIVERY_UNKNOWN, now=at, last_delivery_error="delivery_timeout"
+    )
+    async with SqlAlchemyUnitOfWork(session_factory) as uow:
+        await uow.agent_sessions.update_instruction_delivery(
+            ambiguous,
+            expected_state=InstructionState.DELIVERING,
+            expected_delivery_token=token,
+        )
+        await uow.commit()
+    return ambiguous
+
+
+def test_terminal_session_delivery_proof_is_still_extracted(
+    migrated_postgres_url: str,
+) -> None:
+    """R4B-F2: a lost session's ambiguous attempt is still proven by the journal.
+
+    Only the delivery batch is bounded to active sessions; reconciliation is
+    read-only and must keep scanning every session.  Otherwise a transfer
+    cites and cancels an instruction the source run actually consumed.
+    """
+
+    async def run() -> None:
+        engine = create_postgres_engine(migrated_postgres_url)
+        try:
+            factory = create_session_factory(engine)
+            investigation = await _seed_investigation(factory)
+            session = await _seed_leased_session(factory, investigation.id)
+            unknown_at = NOW - timedelta(seconds=GRACE_SECONDS + 60)
+            text = "Consumed by the lost run."
+            ambiguous = await _seed_delivery_unknown(
+                factory,
+                session,
+                text=text,
+                key=f"pg-lost-unknown-{uuid4().hex[:8]}",
+                at=unknown_at,
+            )
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                current = await uow.agent_sessions.get(session.id)
+                assert current is not None
+                lost = current.with_state(AgentSessionState.LOST, now=NOW)
+                stored = await uow.agent_sessions.update_state(
+                    lost, expected_state_version=current.state_version
+                )
+                assert stored is not None
+                await uow.commit()
+
+            host = _FakeHost()
+            host.events = (
+                HostSessionEventV1(
+                    seq=1,
+                    kind="instruction_delivered",
+                    at=unknown_at,
+                    payload={
+                        "instruction_id": str(ambiguous.id),
+                        "sha256": ambiguous.delivery_sha256,
+                        "mode": "next_run",
+                    },
+                ),
+            )
+            report = await _delivery_service(factory, host).drain_once()
+
+            assert report.reconciled_delivered == 1
+            assert host.send_calls == []
+            async with SqlAlchemyUnitOfWork(factory) as uow:
+                proven = await uow.agent_sessions.get_instruction(ambiguous.id)
+            assert proven is not None
+            assert proven.state is InstructionState.DELIVERED
+            assert proven.delivery_mode is InstructionDeliveryMode.NEXT_RUN
+            assert proven.delivery_sha256 == ambiguous.delivery_sha256
         finally:
             await engine.dispose()
 

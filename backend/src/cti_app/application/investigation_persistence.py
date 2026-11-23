@@ -648,6 +648,16 @@ class AgentSessionRepository(Protocol):
         """
         ...
 
+    async def list_reconcilable_unknown(
+        self, *, unknown_before: datetime, limit: int
+    ) -> tuple[AgentSessionInstructionV1, ...]:
+        """``delivery_unknown`` rows older than the grace on ANY session (R4B-F2).
+
+        The host journal can still prove a delivery after the session became
+        terminal; reconciliation therefore never filters on session state.
+        """
+        ...
+
     async def update_instruction_delivery(
         self,
         instruction: AgentSessionInstructionV1,
@@ -2040,6 +2050,11 @@ def _attempted_at(instruction: AgentSessionInstructionV1) -> datetime:
     return instruction.delivery_attempted_at or instruction.updated_at
 
 
+def _unknown_at(instruction: AgentSessionInstructionV1) -> datetime:
+    """When the attempt became ambiguous, tolerant of a missing timestamp."""
+    return instruction.delivery_unknown_at or instruction.updated_at
+
+
 class InMemoryAgentSessionRepository:
     """In-memory port fake sharing the SQL repository's observable rules.
 
@@ -2280,6 +2295,21 @@ class InMemoryAgentSessionRepository:
         ]
         stale.sort(key=lambda instruction: (_attempted_at(instruction), str(instruction.id)))
         return tuple(stale[:limit])
+
+    async def list_reconcilable_unknown(
+        self, *, unknown_before: datetime, limit: int
+    ) -> tuple[AgentSessionInstructionV1, ...]:
+        """Every session's ambiguous attempt is reconcilable after the grace."""
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        unknown = [
+            instruction
+            for instruction in self._instructions.values()
+            if instruction.state is InstructionState.DELIVERY_UNKNOWN
+            and _unknown_at(instruction) <= unknown_before
+        ]
+        unknown.sort(key=lambda instruction: (_unknown_at(instruction), str(instruction.id)))
+        return tuple(unknown[:limit])
 
     async def update_instruction_delivery(
         self,

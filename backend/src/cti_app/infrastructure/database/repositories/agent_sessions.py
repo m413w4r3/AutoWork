@@ -558,6 +558,32 @@ class SqlAlchemyAgentSessionRepository:
         )
         return tuple(_instruction_from_row(row) for row in rows)
 
+    async def list_reconcilable_unknown(
+        self, *, unknown_before: datetime, limit: int
+    ) -> tuple[AgentSessionInstructionV1, ...]:
+        """Ambiguous attempts across ALL sessions, oldest first (R4B-F2).
+
+        A terminal session can still have consumed the instruction: its host
+        journal is the delivery proof, so reconciliation must not reuse the
+        active-session drain list.
+        """
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        unknown = func.coalesce(
+            AgentSessionInstructionRow.delivery_unknown_at,
+            AgentSessionInstructionRow.updated_at,
+        )
+        rows = await self._session.scalars(
+            select(AgentSessionInstructionRow)
+            .where(
+                AgentSessionInstructionRow.state == InstructionState.DELIVERY_UNKNOWN.value,
+                unknown <= unknown_before,
+            )
+            .order_by(unknown, AgentSessionInstructionRow.id)
+            .limit(limit)
+        )
+        return tuple(_instruction_from_row(row) for row in rows)
+
     async def update_instruction_delivery(
         self,
         instruction: AgentSessionInstructionV1,

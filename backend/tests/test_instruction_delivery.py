@@ -868,6 +868,49 @@ async def test_terminal_session_stale_delivering_is_reconciled_and_cancelable() 
     assert cancelled.state is InstructionState.CANCELLED
 
 
+async def test_terminal_session_delivery_proof_is_still_extracted() -> None:
+    """R4B-F2: an ambiguous attempt of a lost session can still be proven.
+
+    The host journal is the delivery proof (D7).  Once the session is
+    terminal, reconciliation stays read-only: a matching
+    ``instruction_delivered`` event promotes the row to delivered so the
+    handoff cites consumed history instead of cancelling a delivered
+    instruction as "never delivered".
+    """
+    harness = _Harness()
+    unknown_at = NOW - timedelta(seconds=GRACE_SECONDS + 60)
+    session = await harness.seed_session(state=AgentSessionState.LOST)
+    text = "Consumed by the lost run."
+    queued = await harness.seed_queued_instruction(
+        session, text=text, key="i-lost-unknown", queued_at=unknown_at
+    )
+    sha = instruction_text_sha256(text)
+    reserved = queued.with_delivery_reserved(token=uuid4(), delivery_sha256=sha, now=unknown_at)
+    ambiguous = reserved.with_state(
+        InstructionState.DELIVERY_UNKNOWN, now=unknown_at, last_delivery_error="delivery_timeout"
+    )
+    await harness.sessions.update_instruction_delivery(
+        ambiguous, expected_state=InstructionState.QUEUED, expected_delivery_token=None
+    )
+    harness.host.events = [
+        HostSessionEventV1(
+            seq=1,
+            kind="instruction_delivered",
+            at=unknown_at,
+            payload={"instruction_id": str(queued.id), "sha256": sha, "mode": "next_run"},
+        )
+    ]
+
+    report = await harness.delivery.drain_once()
+
+    assert report.reconciled_delivered == 1
+    assert harness.host.send_calls == []
+    proven = await harness.instruction(queued.id)
+    assert proven.state is InstructionState.DELIVERED
+    assert proven.delivery_mode is InstructionDeliveryMode.NEXT_RUN
+    assert proven.delivery_sha256 == sha
+
+
 # ----------------------------------------------------- database clock (R4-F4)
 
 

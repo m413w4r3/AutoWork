@@ -917,7 +917,11 @@ class InstructionDeliveryService:
         ``delivery_text_verified=false`` instead of inventing a text (R4-F5).
         """
         host = self._require_host()
-        pending = await self._list_pending(limit)
+        cutoff = now - timedelta(seconds=self._grace_seconds)
+        async with self._uow_factory() as uow:
+            pending = await uow.agent_sessions.list_reconcilable_unknown(
+                unknown_before=cutoff, limit=limit
+            )
         delivered = 0
         requeued = 0
         for instruction in pending:
