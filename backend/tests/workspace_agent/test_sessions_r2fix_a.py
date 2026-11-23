@@ -277,7 +277,8 @@ def test_cli_logs_never_persist_the_raw_secret(session_base: Path) -> None:
         write_fake_script(running, script)
         started = post_session(client, running, f"/v1/sessions/{SESSION_ID}/start", {}, START_KEY)
         assert started.status_code == 200, started.text
-        wait_for_state(client, running, "stopped", "failed")
+        # A clean run end is the D2 instruction receive point (ID-4).
+        wait_for_state(client, running, "awaiting_instruction", "stopped", "failed")
         lines, _cursor = log_lines(client, running)
         text = "\n".join(str(line["text"]) for line in lines)
         assert printable.decode("ascii") not in text

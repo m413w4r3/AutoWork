@@ -50,7 +50,7 @@ from ..state import (
     SessionError,
 )
 from ..supervisor import CapabilityProbe, LaunchContext, ProbeFlags
-from .preamble import SYSTEM_PREAMBLE
+from .preamble import INSTRUCTION_BLOCK_PREAMBLE, SYSTEM_PREAMBLE
 
 LOGGER = logging.getLogger("autowork.workspace_agent.sessions.codex")
 
@@ -619,6 +619,10 @@ class CodexProfile:
                 "Never read or write credentials.",
             )
         )
+        if context.instruction_block is not None:
+            # D4: the pending instruction is data in the user turn, never a
+            # system instruction and never an authority change.
+            lines.extend(("", INSTRUCTION_BLOCK_PREAMBLE, context.instruction_block))
         prompt = "\n".join(lines).encode("utf-8")
         if len(prompt) > MAX_PROMPT_BYTES:
             raise SessionError("the session prompt exceeds its byte budget")

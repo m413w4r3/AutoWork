@@ -336,7 +336,7 @@ def test_codex_resume_never_relaunches_without_probe(
         _write_scenario(running, {"outcome": "success", "final_message": "first turn"})
         started = post_session(client, running, f"/v1/sessions/{SESSION_ID}/start", {}, START_KEY)
         assert started.status_code == 200, started.text
-        wait_for_state(client, running, "stopped")
+        wait_for_state(client, running, "awaiting_instruction")
 
         response = post_session(
             client,
@@ -348,7 +348,7 @@ def test_codex_resume_never_relaunches_without_probe(
         assert response.status_code == 409, response.text
         assert response.json()["error"] == "resume_unavailable"
         status = get_session(client, running, f"/v1/sessions/{SESSION_ID}").json()
-        assert status["state"] == "stopped"
+        assert status["state"] == "awaiting_instruction"
         assert len(status["runs"]) == 1
 
 
@@ -666,7 +666,7 @@ def test_codex_profile_lifecycle_through_supervisor(
 
         started = post_session(client, running, f"/v1/sessions/{SESSION_ID}/start", {}, START_KEY)
         assert started.status_code == 200, started.text
-        status = wait_for_state(client, running, "stopped")
+        status = wait_for_state(client, running, "awaiting_instruction")
         assert status["exit"] == {"code": 0, "signal": None}
         assert len(status["runs"]) == 1
 
@@ -815,7 +815,7 @@ def test_codex_profile_resume_runs_only_when_proven(
         _write_scenario(running, {"outcome": "success", "final_message": "turn"})
         started = post_session(client, running, f"/v1/sessions/{SESSION_ID}/start", {}, START_KEY)
         assert started.status_code == 200, started.text
-        wait_for_state(client, running, "stopped")
+        wait_for_state(client, running, "awaiting_instruction")
 
         resumed = post_session(
             client,
@@ -826,7 +826,7 @@ def test_codex_profile_resume_runs_only_when_proven(
         )
         assert resumed.status_code == 200, resumed.text
         assert resumed.json()["run"] == 2
-        status = wait_for_state(client, running, "stopped")
+        status = wait_for_state(client, running, "awaiting_instruction")
         assert len(status["runs"]) == 2
         observations = _all_observations(running)
         assert len(observations) == 2

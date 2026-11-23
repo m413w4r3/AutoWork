@@ -35,6 +35,7 @@ from sidecars.workspace_agent.sessions import supervisor as sessions_module
 from sidecars.workspace_agent.sessions.state import ConfinementUnavailableError
 from sidecars.workspace_agent.sessions.supervisor import (
     CapabilityProbe,
+    InstructionRequest,
     LaunchContext,
     PrepareSessionRequest,
     ProbeFlags,
@@ -502,8 +503,10 @@ def test_relay_refuses_while_ready_and_e2e_call_reaches_the_backend(
         assert started["state"] == "running"
         wait_until(lambda: service.state() == "running", timeout=10)
         (service.session_dir() / "scratch" / "work" / "go").write_text("go", encoding="utf-8")
-        wait_until(lambda: service.state() in {"stopped", "failed"}, timeout=20)
-        assert service.state() == "stopped"
+        wait_until(
+            lambda: service.state() in {"awaiting_instruction", "stopped", "failed"}, timeout=20
+        )
+        assert service.state() == "awaiting_instruction"
 
         response = json.loads(
             (service.session_dir() / "scratch" / "work" / "mcp-response.json").read_text(
@@ -660,17 +663,32 @@ def test_run_end_unlinks_sockets_and_next_run_recreates_them(session_base: Path,
     assert service.socket("egress.sock").is_socket()
     assert service.socket("broker.sock").is_socket()
     (work / "go").write_text("go", encoding="utf-8")
-    wait_until(lambda: service.state() == "stopped", timeout=15)
+    wait_until(lambda: service.state() == "awaiting_instruction", timeout=15)
     assert not service.socket("egress.sock").exists()
     assert not service.socket("broker.sock").exists()
 
+    # D4: the next run is started by the instruction primitive at the idle
+    # receive point; the complete launch path re-creates both listeners and
+    # re-arms the one-shot secret before the new process exists.
     (work / "go").unlink()
-    service.start(key="m24-life-start-0003")
+    text = "continue the synthetic relay run"
+    service.supervisor.instruction(
+        SESSION_ID,
+        InstructionRequest.from_payload(
+            {
+                "instruction_id": "b3c4d5e6-f708-4a1b-9c2d-3e4f5a6b7c8d",
+                "text": text,
+                "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            }
+        ),
+        idempotency_key="m24-life-instruction-0001",
+        body_sha256="e" * 64,
+    )
     wait_until(lambda: service.state() == "running", timeout=10)
     assert service.socket("egress.sock").is_socket()
     assert service.socket("broker.sock").is_socket()
     (work / "go").write_text("go", encoding="utf-8")
-    wait_until(lambda: service.state() == "stopped", timeout=15)
+    wait_until(lambda: service.state() == "awaiting_instruction", timeout=15)
     assert len(service.supervisor.status(SESSION_ID)["runs"]) == 2
 
 

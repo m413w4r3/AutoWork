@@ -313,7 +313,7 @@ def test_log_ring_bounded_and_cursor_expiry_resync(
         assert _prepare(client, running, workspace_id).status_code == 200
         write_fake_script(running, flood)
         assert _start(client, running).status_code == 200
-        wait_for_state(client, running, "stopped", "failed")
+        wait_for_state(client, running, "awaiting_instruction", "stopped", "failed")
 
         expired = get_session(
             client, running, f"/v1/sessions/{SESSION_ID}/logs", after=0, limit=1000
@@ -407,7 +407,7 @@ def test_resume_is_refused_until_the_profile_proves_it(session_base: Path) -> No
         assert _prepare(client, running, workspace_id).status_code == 200
         write_fake_script(running, success_script())
         assert _start(client, running).status_code == 200
-        wait_for_state(client, running, "stopped", "failed")
+        wait_for_state(client, running, "awaiting_instruction", "stopped", "failed")
 
         resumed = post_session(
             client,
@@ -448,7 +448,10 @@ def test_resume_runs_only_when_the_profile_proved_it(session_base: Path) -> None
             body_sha256="b" * 64,
         )
         assert started["run"] == 1
-        wait_until(lambda: supervisor.status(SESSION_ID)["state"] == "stopped", timeout=15)
+        wait_until(
+            lambda: supervisor.status(SESSION_ID)["state"] == "awaiting_instruction",
+            timeout=15,
+        )
         resumed = supervisor.resume(
             SESSION_ID,
             ResumeRequest(reason="the probe proved resume"),
@@ -457,7 +460,10 @@ def test_resume_runs_only_when_the_profile_proved_it(session_base: Path) -> None
         )
         assert resumed["state"] == "running"
         assert resumed["run"] == 2
-        wait_until(lambda: supervisor.status(SESSION_ID)["state"] == "stopped", timeout=15)
+        wait_until(
+            lambda: supervisor.status(SESSION_ID)["state"] == "awaiting_instruction",
+            timeout=15,
+        )
         assert len(supervisor.status(SESSION_ID)["runs"]) == 2
     finally:
         supervisor.stop()
@@ -531,7 +537,14 @@ def test_close_deletes_secret_socket_scratch_and_keeps_state(session_base: Path)
         assert status.json()["state"] == "closed"
 
 
-def test_instruction_queue_delivers_live_and_replays(session_base: Path) -> None:
+def test_instruction_while_running_is_refused_not_queued(session_base: Path) -> None:
+    """D4: a running session has no receive point; nothing is queued.
+
+    The old host kept a volatile ``handle.queue`` and answered
+    ``delivered:"queued"`` before any run existed.  The primitive refuses
+    instead, so the backend keeps the durable row ``queued`` and retries when
+    the supervisor reports ``awaiting_instruction``.
+    """
     instruction_id = "b3c4d5e6-f708-4a1b-9c2d-3e4f5a6b7c8d"
     text = "inspect the synthetic yara rule"
     sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -544,47 +557,40 @@ def test_instruction_queue_delivers_live_and_replays(session_base: Path) -> None
             fake_script(
                 [
                     {"op": "emit", "event": {"type": "started"}},
-                    {"op": "wait_instruction", "timeout": 10},
-                    {"op": "write", "path": "result.md", "text": "done\n"},
-                    {"op": "exit", "code": 0},
+                    {"op": "hang"},
                 ]
             ),
         )
         assert _start(client, running).status_code == 200
+        wait_for_state(client, running, "running")
 
-        delivered = post_session(
+        refused = post_session(
             client,
             running,
             f"/v1/sessions/{SESSION_ID}/instructions",
             body,
             "m24-h1-instruction-0001",
         )
-        assert delivered.status_code == 200, delivered.text
-        payload = delivered.json()
-        assert payload["accepted"] is True
-        assert payload["delivered"] == "live"
-        assert isinstance(payload["cursor"], int)
+        assert refused.status_code == 409, refused.text
+        assert refused.json()["error"] == "session_state_conflict"
+        assert refused.json()["details"] == {"state": "running", "operation": "instruction"}
 
-        replay = post_session(
-            client,
-            running,
-            f"/v1/sessions/{SESSION_ID}/instructions",
-            body,
-            "m24-h1-instruction-0001",
-        )
-        assert replay.status_code == 200
-        assert replay.json() == payload
-
-        wait_for_state(client, running, "stopped", "failed")
-        observation = wait_for_observation(running, "instruction")
-        assert isinstance(observation, dict)
-        assert observation["instruction_id"] == instruction_id
-        assert observation["sha256"] == sha256
-        assert observation["length"] == len(text)
-
+        # No effect at all: no acceptance, no delivery, no second run.
         kinds = [event["kind"] for event in session_events(client, running)]
-        assert "instruction_accepted" in kinds
-        assert "instruction_delivered" in kinds
+        assert "instruction_accepted" not in kinds
+        assert "instruction_delivered" not in kinds
+
+        interrupted = post_session(
+            client,
+            running,
+            f"/v1/sessions/{SESSION_ID}/interrupt",
+            {"reason": "test"},
+            INTERRUPT_KEY,
+        )
+        assert interrupted.status_code == 200, interrupted.text
+        wait_for_state(client, running, "stopped", "failed")
+        status = get_session(client, running, f"/v1/sessions/{SESSION_ID}").json()
+        assert len(status["runs"]) == 1
 
 
 def test_prepare_embeds_only_allowlisted_skill_packs(

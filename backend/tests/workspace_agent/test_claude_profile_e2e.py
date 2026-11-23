@@ -236,7 +236,7 @@ def test_claude_session_lifecycle_stream_events_and_collect(session_base: Path) 
             body_sha256="b" * 64,
         )
         assert started["state"] == "running"
-        _wait_state(supervisor, str(SessionState.STOPPED))
+        _wait_state(supervisor, str(SessionState.AWAITING_INSTRUCTION))
 
         observations = _observations(config)
         parse = observations["parse"]
@@ -484,7 +484,7 @@ def test_claude_resume_is_refused_until_the_probe_proves_it(session_base: Path) 
             idempotency_key="m24-h5-start-0003",
             body_sha256="b" * 64,
         )
-        _wait_state(supervisor, str(SessionState.STOPPED))
+        _wait_state(supervisor, str(SessionState.AWAITING_INSTRUCTION))
         with pytest.raises(ResumeUnavailableError):
             supervisor.resume(
                 SESSION_ID,
@@ -513,7 +513,7 @@ def test_claude_resume_roundtrip_through_the_supervisor_when_proven(
             idempotency_key="m24-h5-start-0004",
             body_sha256="b" * 64,
         )
-        _wait_state(supervisor, str(SessionState.STOPPED))
+        _wait_state(supervisor, str(SessionState.AWAITING_INSTRUCTION))
         first = _observations(config)["parse"]
         assert isinstance(first, dict)
         assert first["session_id"] == SESSION_ID
@@ -528,7 +528,7 @@ def test_claude_resume_roundtrip_through_the_supervisor_when_proven(
         )
         assert resumed["state"] == "running"
         assert resumed["run"] == 2
-        _wait_state(supervisor, str(SessionState.STOPPED))
+        _wait_state(supervisor, str(SessionState.AWAITING_INSTRUCTION))
         second = _observations(config)["parse"]
         assert isinstance(second, dict)
         assert second["resume"] == SESSION_ID

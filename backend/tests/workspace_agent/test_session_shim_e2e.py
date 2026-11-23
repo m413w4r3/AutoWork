@@ -66,7 +66,8 @@ def test_h1_secret_handoff_then_shim_signs_a_fake_backend_request(session_base: 
         write_fake_script(running, secret_script)
         started = post_session(client, running, f"/v1/sessions/{SESSION_ID}/start", {}, START_KEY)
         assert started.status_code == 200, started.text
-        wait_for_state(client, running, "stopped", "failed")
+        # A clean run end is the D2 instruction receive point (ID-4).
+        wait_for_state(client, running, "awaiting_instruction", "stopped", "failed")
         received = wait_for_observation(running, "secret_received")
         assert isinstance(received, dict)
         assert received["sha256"] == hashlib.sha256(support.SECRET).hexdigest()
