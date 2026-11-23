@@ -20,6 +20,11 @@ from enum import StrEnum
 from typing import Any, Protocol
 from uuid import UUID, uuid4
 
+from cti_app.application.investigation_article_anchors import (
+    ArticleBaseUnavailable,
+    resolve_current_publication_base,
+    resolve_pinned_publication_base,
+)
 from cti_app.application.investigation_persistence import (
     VersionConflictError,
     same_note_proposal_request,
@@ -50,6 +55,7 @@ from cti_app.domain.opinion_note_proposal import (
     anchor_target_block_type,
     note_draft_text_from_sentences,
 )
+from cti_app.domain.publication_document import publication_note_body_anchors
 
 _ADVISOR_TOOL_NAME = "advisor.consult"
 _ADVISOR_CALL_SOURCE = "advisor.consult"
@@ -322,7 +328,7 @@ class OpinionNoteProposalService:
                 current_opinion_sha256=head.content_sha256 if head is not None else None,
                 current_note_id=current_note.id if current_note is not None else None,
                 current_note_text=current_note.text if current_note is not None else None,
-                anchor_excerpt=await self._anchor_excerpt(investigation, proposal.anchor),
+                anchor_excerpt=await self._anchor_excerpt(uow, investigation, proposal),
                 stale=stale,
                 accept_ready=(
                     proposal.status is NoteProposalStatus.PROPOSED
@@ -399,6 +405,10 @@ class OpinionNoteProposalService:
                     cited_observations=cited_observations,
                     base_opinion_version=existing.base_opinion_version,
                     base_opinion_sha256=existing.base_opinion_sha256,
+                    base_publication_artifact_id=existing.base_publication_artifact_id,
+                    base_publication_version=existing.base_publication_version,
+                    base_publication_sha256=existing.base_publication_sha256,
+                    anchor_before_sha256=existing.anchor_before_sha256,
                     task_id=task_id,
                     idempotency_key=idempotency_key,
                     now=timestamp,
@@ -427,7 +437,6 @@ class OpinionNoteProposalService:
             await self._validate_citations(
                 uow, investigation_id, cited_findings, cited_observations
             )
-            await self._validate_anchor(investigation, anchor)
             head = await uow.analyst_opinions.get(opinion_id)
             self._require_base_matches_head(base_opinion_version, base_opinion_sha256, head)
             pinned_base_version, pinned_base_sha256 = (
@@ -435,6 +444,34 @@ class OpinionNoteProposalService:
                 if base_opinion_version is None and head is not None
                 else (base_opinion_version, base_opinion_sha256)
             )
+            # The article base is pinned now and validated against exactly this
+            # base: a later publication revision makes the proposal unacceptable
+            # (``stale_base``) instead of silently moving the note.
+            try:
+                base = (
+                    await resolve_pinned_publication_base(
+                        uow,
+                        self._artifact_store,
+                        artifact_id=head.base_publication_artifact_id,
+                        sha256=head.base_publication_sha256,
+                    )
+                    if head is not None
+                    else await resolve_current_publication_base(
+                        uow, self._artifact_store, investigation
+                    )
+                )
+            except ArticleBaseUnavailable as exc:
+                raise NoteProposalError(
+                    NoteProposalErrorCode.INVALID_ANCHOR,
+                    message="The article anchors are unavailable",
+                ) from exc
+            anchor_text = publication_note_body_anchors(base.document).get(anchor)
+            if anchor_text is None:
+                raise NoteProposalError(
+                    NoteProposalErrorCode.INVALID_ANCHOR,
+                    message="The anchor does not exist in the pinned publication base",
+                )
+            anchor_before_sha256 = hashlib.sha256(anchor_text.encode("utf-8")).hexdigest()
             base_note_id: UUID | None = None
             if consultation_type is NoteProposalConsultationType.REVIEW_TEXT:
                 if head is None:
@@ -501,6 +538,10 @@ class OpinionNoteProposalService:
                 cited_observations=cited_observations,
                 base_opinion_version=pinned_base_version,
                 base_opinion_sha256=pinned_base_sha256,
+                base_publication_artifact_id=base.artifact.id,
+                base_publication_version=base.artifact.version,
+                base_publication_sha256=base.sha256,
+                anchor_before_sha256=anchor_before_sha256,
                 task_id=task_id,
                 idempotency_key=idempotency_key,
                 now=timestamp,
@@ -1113,24 +1154,28 @@ class OpinionNoteProposalService:
                     message="Bridge advisory material cannot be cited as note evidence",
                 )
 
-    async def _validate_anchor(self, investigation: Any, anchor: str) -> None:
-        if self._article_snapshots is None:
-            return
-        try:
-            snapshot = await self._article_snapshots.resolve(investigation.synthesis_artifact_id)
-        except Exception as exc:
-            raise NoteProposalError(
-                NoteProposalErrorCode.INVALID_ANCHOR,
-                message="The current article anchors are unavailable",
-            ) from exc
-        anchors = {item.anchor for item in snapshot.article.publication_anchors}
-        if anchor not in anchors:
-            raise NoteProposalError(
-                NoteProposalErrorCode.INVALID_ANCHOR,
-                message="The anchor does not exist in the current article snapshot",
-            )
-
-    async def _anchor_excerpt(self, investigation: Any, anchor: str) -> str | None:
+    async def _anchor_excerpt(
+        self, uow: UnitOfWork, investigation: Any, proposal: NoteProposalV1
+    ) -> str | None:
+        if (
+            proposal.base_publication_artifact_id is not None
+            and proposal.base_publication_sha256 is not None
+        ):
+            try:
+                base = await resolve_pinned_publication_base(
+                    uow,
+                    self._artifact_store,
+                    artifact_id=proposal.base_publication_artifact_id,
+                    sha256=proposal.base_publication_sha256,
+                )
+                text = publication_note_body_anchors(base.document).get(proposal.anchor)
+            except ArticleBaseUnavailable:
+                return None
+            if text is None:
+                return None
+            return " ".join(text.split())[:160].rstrip() or None
+        # Proposals created before the identity pin have no base to read; keep
+        # their historical excerpt from the current article snapshot.
         if self._article_snapshots is None:
             return None
         try:
@@ -1138,7 +1183,7 @@ class OpinionNoteProposalService:
         except Exception:
             return None
         for item in snapshot.article.publication_anchors:
-            if item.anchor == anchor:
+            if item.anchor == proposal.anchor:
                 return item.excerpt
         return None
 
@@ -1158,6 +1203,10 @@ class OpinionNoteProposalService:
         cited_observations: tuple[UUID, ...],
         base_opinion_version: int | None,
         base_opinion_sha256: str | None,
+        base_publication_artifact_id: UUID | None,
+        base_publication_version: int | None,
+        base_publication_sha256: str | None,
+        anchor_before_sha256: str | None,
         task_id: UUID | None,
         idempotency_key: str,
         now: datetime,
@@ -1178,6 +1227,10 @@ class OpinionNoteProposalService:
             cited_observation_refs=cited_observations,
             base_opinion_version=base_opinion_version,
             base_opinion_sha256=base_opinion_sha256,
+            base_publication_artifact_id=base_publication_artifact_id,
+            base_publication_version=base_publication_version,
+            base_publication_sha256=base_publication_sha256,
+            anchor_before_sha256=anchor_before_sha256,
             task_id=task_id,
             idempotency_key=idempotency_key,
             status=NoteProposalStatus.PROPOSED,

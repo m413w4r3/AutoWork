@@ -33,13 +33,8 @@ from cti_app.domain.production import (
 )
 from cti_app.domain.publication import ArtifactType
 from cti_app.domain.publication_document import (
-    PublicationDocumentV4,
-    PublicationDocumentV5,
-    PublicationDocumentV6,
-    PublicationDocumentV7,
-    PublicationDocumentV8,
     publication_document_from_json,
-    publication_renderable_body_anchors,
+    publication_note_body_anchors,
 )
 from cti_app.domain.publication_kind import PublicationKind
 
@@ -281,28 +276,16 @@ class ProductionArticleSnapshotAdapter:
         if blob_id is None:
             return ()
         payload = await self._artifact_store.read_json(blob_id)
-        if payload.get("schema_version") not in {"4", "5", "6", "7", "8"}:
-            return ()
-        document = publication_document_from_json(payload)
-        if isinstance(document, PublicationDocumentV8):
-            if document.publication_kind is not PublicationKind.ARTICLE:
+        try:
+            document = publication_document_from_json(payload)
+            if getattr(document, "publication_kind", PublicationKind.ARTICLE) is not (
+                PublicationKind.ARTICLE
+            ):
                 return ()
-            document = document.base_publication
-        if isinstance(document, PublicationDocumentV7):
-            if document.publication_kind is not PublicationKind.ARTICLE:
-                return ()
-            document = document.base_publication
-        if isinstance(document, PublicationDocumentV6):
-            publication = document.base_publication
-        elif isinstance(document, PublicationDocumentV5):
-            publication = document
-        elif isinstance(document, PublicationDocumentV4):
-            anchors = publication_renderable_body_anchors(document)
-            publication = None
-        else:  # pragma: no cover - exhaustive union guard
+            anchors = publication_note_body_anchors(document)
+        except (TypeError, ValueError):
+            # Unsupported schemas carry no note space.
             return ()
-        if publication is not None:
-            anchors = publication_renderable_body_anchors(publication.document)
         result = []
         for anchor, text in sorted(anchors.items())[:MAX_CONTEXT_PUBLICATION_ANCHORS]:
             excerpt = " ".join(text.split())[:160].rstrip()

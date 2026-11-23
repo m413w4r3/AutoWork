@@ -131,6 +131,10 @@ class NoteProposalViewV1(BaseModel):
     tool_invocation_id: UUID | None
     base_opinion_version: int | None
     base_opinion_sha256: str | None
+    base_publication_artifact_id: UUID | None
+    base_publication_version: int | None
+    base_publication_sha256: str | None
+    anchor_before_sha256: str | None
     status: NoteProposalStatus
     status_version: int
     accepted_opinion_version: int | None
@@ -253,7 +257,13 @@ def _opinion_error(exc: OpinionError) -> Exception:
     status_code = 422
     if exc.code.value in {"note_proposal_not_found", "opinion_not_found"}:
         status_code = 404
-    elif exc.code.value in {"stale_note_proposal", "stale_version", "invalid_opinion_state"}:
+    elif exc.code.value in {
+        "stale_note_proposal",
+        "stale_version",
+        "stale_base",
+        "note_anchor_text_changed",
+        "invalid_opinion_state",
+    }:
         status_code = 409
     return _http_error(status_code, exc.code.value, str(exc))
 

@@ -42,6 +42,7 @@ from cti_app.application.opinion_note_proposals import (
     OpinionNoteProposalService,
 )
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.typst_rendering import project_publication_to_typst_model
 from cti_app.config import Settings
 from cti_app.domain.analyst_opinion import (
     AnalystObservationRelation,
@@ -69,7 +70,12 @@ from cti_app.domain.opinion_note_proposal import (
     NoteTargetBlockType,
     note_proposal_note_id,
 )
-from cti_app.domain.production import ProseAuthority
+from cti_app.domain.production import (
+    ProductionArtifact,
+    ProductionArtifactStage,
+    ProductionArtifactStatus,
+    ProseAuthority,
+)
 from cti_app.domain.publication import (
     PublicationEvidenceKind,
     PublicationEvidenceRefV1,
@@ -77,7 +83,10 @@ from cti_app.domain.publication import (
     PublicationSectionKind,
     PublicationSectionV1,
 )
-from cti_app.domain.publication_document import serialize_publication_document
+from cti_app.domain.publication_document import (
+    publication_note_body_anchors,
+    serialize_publication_document,
+)
 from tests.test_analyst_opinion_service import OpinionHarness, make_opinion_harness
 from tests.test_publication_document_v6 import _base_v5
 
@@ -90,8 +99,8 @@ def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def base_v5_with_section(section_paragraph: str | None = None) -> Any:
-    """The shared publication fixture with one section anchor available."""
+def _annotated_v5(sections: tuple[PublicationSectionV1, ...]) -> Any:
+    """The shared V5 fixture with the given published sections."""
     from cti_app.application.publication_builder import (
         SemanticAnnotator,
         semantic_entities_from_extraction,
@@ -108,31 +117,7 @@ def base_v5_with_section(section_paragraph: str | None = None) -> Any:
     from tests.test_publication_builder_v4 import _canonical_inputs
 
     base = _base_v5()
-    body = replace(
-        base.document,
-        sections=(
-            PublicationSectionV1(
-                kind=PublicationSectionKind.CAMPAIGN,
-                heading="Campagne",
-                paragraphs=(
-                    PublicationParagraphV1(
-                        text=(
-                            section_paragraph
-                            if section_paragraph is not None
-                            else "Le paragraphe de section décrit la campagne observée."
-                        ),
-                        evidence_refs=(
-                            PublicationEvidenceRefV1(
-                                source_document_id=UUID("00000000-0000-0000-0000-000000000002"),
-                                kind=PublicationEvidenceKind.FACT,
-                                evidence_key="a" * 64,
-                            ),
-                        ),
-                    ),
-                ),
-            ),
-        ),
-    )
+    body = replace(base.document, sections=sections)
     _, _, extraction, _ = _canonical_inputs()
     semantic_text = SemanticTextV1(
         schema_version=SEMANTIC_ANNOTATION_SCHEMA_VERSION,
@@ -149,6 +134,91 @@ def base_v5_with_section(section_paragraph: str | None = None) -> Any:
         references=base.references,
         original_indicators=base.original_indicators,
         ioc_details=base.ioc_details,
+    )
+
+
+def _section(paragraph_text: str, *, heading: str = "Campagne") -> PublicationSectionV1:
+    return PublicationSectionV1(
+        kind=PublicationSectionKind.CAMPAIGN,
+        heading=heading,
+        paragraphs=(
+            PublicationParagraphV1(
+                text=paragraph_text,
+                evidence_refs=(
+                    PublicationEvidenceRefV1(
+                        source_document_id=UUID("00000000-0000-0000-0000-000000000002"),
+                        kind=PublicationEvidenceKind.FACT,
+                        evidence_key="a" * 64,
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+def base_v5_with_section(section_paragraph: str | None = None) -> Any:
+    """The shared publication fixture with one section anchor available."""
+    return base_v5_with_sections(
+        (
+            section_paragraph
+            if section_paragraph is not None
+            else "Le paragraphe de section décrit la campagne observée.",
+        )
+    )
+
+
+def base_v5_with_sections(section_paragraphs: tuple[str, ...]) -> Any:
+    return _annotated_v5(
+        tuple(
+            _section(text, heading=f"Campagne {index}")
+            for index, text in enumerate(section_paragraphs, start=1)
+        )
+    )
+
+
+def v9_with_overview_duplicate() -> Any:
+    """A V9 article whose overview paragraph repeats the lead text verbatim.
+
+    The legacy projection drops both the overview section and duplicated
+    paragraphs; the V9 projection renders them, so a note may anchor there.
+    """
+    from cti_app.application.publication_builder import build_article_format_v1
+    from cti_app.domain.publication_document import PublicationDocumentV7, PublicationDocumentV9
+    from cti_app.domain.publication_kind import PublicationKind
+    from tests.test_publication_builder_v4 import _canonical_inputs
+    from tests.test_publication_document_v7 import _v6
+
+    lead = _base_v5().document.lead[0]
+    overview = PublicationSectionV1(
+        kind=PublicationSectionKind.OVERVIEW,
+        heading="Vue d'ensemble",
+        paragraphs=(PublicationParagraphV1(text=lead.text, evidence_refs=lead.evidence_refs),),
+    )
+    analysis = PublicationSectionV1(
+        kind=PublicationSectionKind.TECHNICAL,
+        heading="Analyse synthétique",
+        paragraphs=(
+            PublicationParagraphV1(
+                text="Le paragraphe d'analyse décrit la campagne observée.",
+                evidence_refs=lead.evidence_refs,
+            ),
+        ),
+    )
+    base = _annotated_v5((overview, analysis))
+    _, _, extraction, _ = _canonical_inputs()
+    v7 = PublicationDocumentV7(
+        base_publication=_v6(base),
+        publication_kind=PublicationKind.ARTICLE,
+        routing_decision_hash="a" * 64,
+        routing_policy_version="routing-policy-v1",
+    )
+    return PublicationDocumentV9(
+        base_publication=v7,
+        article_format=build_article_format_v1(base, extraction),
+        registry_hash="b" * 64,
+        synthesis_canonical_sha256="c" * 64,
+        enrichment_canonical_sha256="d" * 64,
+        resolved_placements=(),
     )
 
 
@@ -243,12 +313,9 @@ class _Fixture:
         )
 
     @staticmethod
-    def _extend_base_with_section(
-        harness: OpinionHarness, section_paragraph: str | None = None
-    ) -> None:
-        extended = base_v5_with_section(section_paragraph)
+    def _install_base(harness: OpinionHarness, document: Any) -> None:
         base_bytes = ProductionArtifactStore.canonical_json_bytes(
-            serialize_publication_document(extended)
+            serialize_publication_document(document)
         )
         harness.store.blobs[harness.base_artifact.canonical_blob_id] = base_bytes
         base_sha256 = _sha256(base_bytes)
@@ -258,6 +325,12 @@ class _Fixture:
         ]
         harness.base_artifact = replace(harness.base_artifact, input_hash=base_sha256)
         harness.base_bytes = base_bytes
+
+    @staticmethod
+    def _extend_base_with_section(
+        harness: OpinionHarness, section_paragraph: str | None = None
+    ) -> None:
+        _Fixture._install_base(harness, base_v5_with_section(section_paragraph))
 
     def advisor(self, **options: Any) -> _ScriptedAdvisor:
         return _ScriptedAdvisor(self, **options)
@@ -618,12 +691,37 @@ def test_legacy_space_joined_bridge_note_still_verifies() -> None:
     assert not AnalystOpinionService._sentence_text_matches_source(sentences, "0" * 64)
 
 
-def test_acceptance_refuses_a_deduplicated_section_anchor() -> None:
-    """R07 B1: an anchor the renderer drops cannot enter the canonical opinion."""
+def test_deduplicated_v5_anchor_is_refused_at_request() -> None:
+    """F4-D B4: the legacy V5 projection drops the duplicate, so request refuses.
+
+    The anchor exists in the raw text-anchor space but not in the rendered
+    body; refusing at request keeps an unrenderable anchor out of a proposal
+    before Bridge is consulted.  The V9 counterpart is renderable and accepted.
+    """
     fixture = _Fixture(section_paragraph=_base_v5().document.lead[0].text)
 
     async def scenario() -> None:
         advisor = fixture.advisor(text="Note sur un paragraphe non rendu.")
+        with pytest.raises(NoteProposalError) as refused:
+            await fixture.request(
+                advisor,
+                anchor=SECTION_ANCHOR,
+                target_block_type=NoteTargetBlockType.SECTION,
+            )
+        assert refused.value.code is NoteProposalErrorCode.INVALID_ANCHOR
+
+    _run(scenario())
+
+
+def test_duplicate_paragraph_anchor_is_renderable_and_accepted_on_v9() -> None:
+    """F4-D B4: V9 renders duplicated/overview paragraphs, so a note may anchor there."""
+    fixture = _Fixture()
+    v9 = v9_with_overview_duplicate()
+    _Fixture._install_base(fixture.harness, v9)
+    lead_text = _base_v5().document.lead[0].text
+
+    async def scenario() -> None:
+        advisor = fixture.advisor(text="Note sur le paragraphe d'ensemble.")
         proposal = _materialised_proposal(
             fixture,
             await fixture.request(
@@ -632,8 +730,176 @@ def test_acceptance_refuses_a_deduplicated_section_anchor() -> None:
                 target_block_type=NoteTargetBlockType.SECTION,
             ),
         )
+        assert proposal.base_publication_artifact_id == fixture.harness.base_artifact.id
+        assert proposal.base_publication_version == fixture.harness.base_artifact.version
+        assert proposal.base_publication_sha256 == _sha256(fixture.harness.base_bytes)
+        assert proposal.anchor_before_sha256 == _sha256(lead_text.encode("utf-8"))
+        acceptance = await fixture.accept(proposal)
+        assert [item.anchor for item in acceptance.opinion.observations] == [SECTION_ANCHOR]
+
+    _run(scenario())
+
+    texts = publication_note_body_anchors(v9)
+    assert texts[SECTION_ANCHOR] == lead_text
+    model = project_publication_to_typst_model(v9)
+    expected_target = (
+        "publication-paragraph-" + hashlib.sha256(SECTION_ANCHOR.encode("utf-8")).hexdigest()[:20]
+    )
+    assert any(
+        block.get("text") == lead_text and block.get("anchor_target") == expected_target
+        for section in model.content_sections
+        if section["type"] == "synthesis"
+        for block in section["blocks"]
+        if block.get("type") == "paragraph"
+    )
+
+
+def test_anchor_uses_pinned_base_publication() -> None:
+    """F4-D B4: request validates and pins the opinion's base, never a newer one."""
+    fixture = _Fixture()
+
+    async def scenario() -> None:
+        first = _materialised_proposal(
+            fixture, await fixture.request(fixture.advisor(text="Note initiale."))
+        )
+        accepted = await fixture.accept(first)
+        pinned = fixture.harness.base_artifact
+        # A newer publication base becomes current while the opinion keeps its pin.
+        newer_document = base_v5_with_sections(
+            ("Campagne initiale.", "Paragraphe publié après la note.")
+        )
+        newer_bytes = ProductionArtifactStore.canonical_json_bytes(
+            serialize_publication_document(newer_document)
+        )
+        newer_blob_id = uuid4()
+        fixture.harness.store.blobs[newer_blob_id] = newer_bytes
+        newer = ProductionArtifact(
+            id=uuid4(),
+            production_run_id=pinned.production_run_id,
+            subject_id=pinned.subject_id,
+            stage=ProductionArtifactStage.PUBLICATION,
+            version=2,
+            input_hash=_sha256(newer_bytes),
+            canonical_blob_id=newer_blob_id,
+            status=ProductionArtifactStatus.VERIFIED,
+        )
+        async with fixture.uow_factory() as uow:
+            await uow.production_artifacts.append(newer)
+
+        # An anchor that only the newer base renders is refused.
+        with pytest.raises(NoteProposalError) as refused:
+            await fixture.request(
+                fixture.advisor(text="Note sur le nouveau paragraphe."),
+                anchor="section:1:paragraph:0001",
+                target_block_type=NoteTargetBlockType.SECTION,
+                base_opinion_version=accepted.opinion.version,
+                base_opinion_sha256=accepted.opinion.content_sha256,
+            )
+        assert refused.value.code is NoteProposalErrorCode.INVALID_ANCHOR
+
+        second = _materialised_proposal(
+            fixture,
+            await fixture.request(
+                fixture.advisor(text="Note sur la base épinglée."),
+                anchor=SECTION_ANCHOR,
+                target_block_type=NoteTargetBlockType.SECTION,
+                base_opinion_version=accepted.opinion.version,
+                base_opinion_sha256=accepted.opinion.content_sha256,
+            ),
+        )
+        assert second.base_publication_artifact_id == pinned.id
+        assert second.base_publication_version == pinned.version
+        assert second.base_publication_sha256 == _sha256(fixture.harness.base_bytes)
+
+    _run(scenario())
+
+
+def test_acceptance_refuses_a_moved_publication_base_with_stale_base() -> None:
+    """F4-D B4: a publication revision between request and acceptance is stale_base."""
+    fixture = _Fixture()
+
+    async def scenario() -> None:
+        proposal = _materialised_proposal(
+            fixture, await fixture.request(fixture.advisor(text="Note sur la base initiale."))
+        )
+        newer_document = base_v5_with_sections(
+            ("Campagne initiale.", "Paragraphe publié après la note.")
+        )
+        newer_bytes = ProductionArtifactStore.canonical_json_bytes(
+            serialize_publication_document(newer_document)
+        )
+        newer_blob_id = uuid4()
+        fixture.harness.store.blobs[newer_blob_id] = newer_bytes
+        async with fixture.uow_factory() as uow:
+            await uow.production_artifacts.append(
+                ProductionArtifact(
+                    id=uuid4(),
+                    production_run_id=fixture.harness.base_artifact.production_run_id,
+                    subject_id=fixture.harness.base_artifact.subject_id,
+                    stage=ProductionArtifactStage.PUBLICATION,
+                    version=2,
+                    input_hash=_sha256(newer_bytes),
+                    canonical_blob_id=newer_blob_id,
+                    status=ProductionArtifactStatus.VERIFIED,
+                )
+            )
         with pytest.raises(OpinionError) as refused:
             await fixture.accept(proposal)
+        assert refused.value.code is OpinionErrorCode.STALE_BASE
+
+    _run(scenario())
+
+
+def test_acceptance_refuses_changed_anchor_text_with_typed_code() -> None:
+    """F4-D B4: a paragraph identity mismatch is a typed refusal."""
+    fixture = _Fixture()
+
+    async def scenario() -> None:
+        proposal = _materialised_proposal(
+            fixture, await fixture.request(fixture.advisor(text="Note identitaire."))
+        )
+        tampered = replace(
+            proposal,
+            id=uuid4(),
+            idempotency_key=f"tampered-{uuid4()}",
+            anchor_before_sha256="0" * 64,
+        )
+        await fixture.proposals.append_if_absent(tampered)
+        with pytest.raises(OpinionError) as refused:
+            await fixture.accept(tampered)
+        assert refused.value.code is OpinionErrorCode.NOTE_ANCHOR_TEXT_CHANGED
+
+    _run(scenario())
+
+
+def test_removed_anchor_refused_with_typed_code() -> None:
+    """F4-D B4: a legacy proposal whose anchor disappeared never moves silently."""
+    fixture = _Fixture()
+
+    async def scenario() -> None:
+        proposal = _materialised_proposal(
+            fixture,
+            await fixture.request(
+                fixture.advisor(text="Note sur un paragraphe ensuite retiré."),
+                anchor=SECTION_ANCHOR,
+                target_block_type=NoteTargetBlockType.SECTION,
+            ),
+        )
+        legacy = replace(
+            proposal,
+            id=uuid4(),
+            idempotency_key=f"legacy-{uuid4()}",
+            base_publication_artifact_id=None,
+            base_publication_version=None,
+            base_publication_sha256=None,
+            anchor_before_sha256=None,
+        )
+        await fixture.proposals.append_if_absent(legacy)
+        # The next base revision deduplicates the section paragraph against the
+        # lead, so the rendered anchor space no longer carries it.
+        _Fixture._extend_base_with_section(fixture.harness, _base_v5().document.lead[0].text)
+        with pytest.raises(OpinionError) as refused:
+            await fixture.accept(legacy)
         assert refused.value.code is OpinionErrorCode.INVALID_OBSERVATION_ANCHOR
 
     _run(scenario())

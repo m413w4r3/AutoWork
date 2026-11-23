@@ -83,6 +83,12 @@ class InvestigationNoteProposalRow(Base):
             name="fk_investigation_note_proposals_analyst_decision",
             ondelete="RESTRICT",
         ),
+        ForeignKeyConstraint(
+            ["base_publication_artifact_id"],
+            ["production_artifacts.id"],
+            name="fk_investigation_note_proposals_base_publication",
+            ondelete="RESTRICT",
+        ),
         CheckConstraint(
             f"status IN ({NOTE_PROPOSAL_STATUS_VALUES_SQL})",
             name="ck_investigation_note_proposals_status",
@@ -165,6 +171,28 @@ class InvestigationNoteProposalRow(Base):
             name="ck_investigation_note_proposals_base_sha256",
         ),
         CheckConstraint(
+            "(base_publication_artifact_id IS NULL) = (base_publication_version IS NULL) AND "
+            "(base_publication_artifact_id IS NULL) = (base_publication_sha256 IS NULL) AND "
+            "(base_publication_artifact_id IS NULL) = (anchor_before_sha256 IS NULL)",
+            name="ck_investigation_note_proposals_base_publication_pair",
+        ),
+        CheckConstraint(
+            "base_publication_version IS NULL OR base_publication_version >= 1",
+            name="ck_investigation_note_proposals_base_publication_version",
+        ),
+        CheckConstraint(
+            f"base_publication_sha256 IS NULL OR ({_sha256_sql('base_publication_sha256')})",
+            name="ck_investigation_note_proposals_base_publication_sha256",
+        ),
+        CheckConstraint(
+            f"anchor_before_sha256 IS NULL OR ({_sha256_sql('anchor_before_sha256')})",
+            name="ck_investigation_note_proposals_anchor_before_sha256",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(content_blocks) = 'array'",
+            name="ck_investigation_note_proposals_content_blocks_shape",
+        ),
+        CheckConstraint(
             "status_version >= 1",
             name="ck_investigation_note_proposals_status_version",
         ),
@@ -191,6 +219,10 @@ class InvestigationNoteProposalRow(Base):
             "ix_investigation_note_proposals_investigation_status",
             "investigation_id",
             "status",
+        ),
+        Index(
+            "ix_investigation_note_proposals_base_publication",
+            "base_publication_artifact_id",
         ),
     )
 
@@ -221,6 +253,15 @@ class InvestigationNoteProposalRow(Base):
     tool_invocation_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
     base_opinion_version: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     base_opinion_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    base_publication_artifact_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True
+    )
+    base_publication_version: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    base_publication_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    anchor_before_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    content_blocks: Mapped[list[dict[str, object]]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     status_version: Mapped[int] = mapped_column(BigInteger, nullable=False)
     accepted_opinion_version: Mapped[int | None] = mapped_column(BigInteger, nullable=True)

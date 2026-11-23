@@ -13,6 +13,10 @@ from uuid import UUID, uuid5
 from pydantic import ValidationError
 
 from cti_app.application.analyst_opinion_inputs import ImplantMaterialEdit
+from cti_app.application.investigation_article_anchors import (
+    ArticleBaseUnavailable,
+    resolve_current_publication_base,
+)
 from cti_app.application.investigation_contracts import (
     OperatorOpinionProtocolFigureSelectionV1,
     OperatorOpinionProtocolFiguresV1,
@@ -88,7 +92,7 @@ from cti_app.domain.protocol_model import ProtocolDiagramKind
 from cti_app.domain.publication_document import (
     publication_document_article_v5_body,
     publication_document_from_json,
-    publication_renderable_body_anchors,
+    publication_note_body_anchors,
     serialize_publication_document,
 )
 
@@ -172,6 +176,7 @@ class OpinionErrorCode(StrEnum):
     BRIDGE_MODIFIED_PROSE_FORBIDDEN = "bridge_modified_prose_forbidden"
     NOTE_PROPOSAL_NOT_FOUND = "note_proposal_not_found"
     STALE_NOTE_PROPOSAL = "stale_note_proposal"
+    NOTE_ANCHOR_TEXT_CHANGED = "note_anchor_text_changed"
     BRIDGE_PROVENANCE_INVALID = "bridge_provenance_invalid"
 
 
@@ -1301,6 +1306,15 @@ class AnalystOpinionService:
                 raise OpinionError(OpinionErrorCode.BASE_INVALID) from exc
             if hashlib.sha256(base_bytes).hexdigest() != base_sha256:
                 raise OpinionError(OpinionErrorCode.BASE_INVALID)
+            if proposal.base_publication_artifact_id is not None and (
+                proposal.base_publication_artifact_id != base_artifact.id
+                or proposal.base_publication_version != base_artifact.version
+                or proposal.base_publication_sha256 != base_sha256
+            ):
+                raise OpinionError(
+                    OpinionErrorCode.STALE_BASE,
+                    message="The publication base changed after the drafting request.",
+                )
             try:
                 base_document = publication_document_from_json(json.loads(base_bytes))
             except (json.JSONDecodeError, TypeError, ValueError) as exc:
@@ -1308,11 +1322,19 @@ class AnalystOpinionService:
             base_document_v5 = publication_document_article_v5_body(base_document)
             if base_document_v5 is None:
                 raise OpinionError(OpinionErrorCode.BASE_INVALID)
-            anchors = publication_renderable_body_anchors(base_document_v5.document)
+            anchors = publication_note_body_anchors(base_document)
             if proposal.anchor not in anchors:
                 raise OpinionError(
                     OpinionErrorCode.INVALID_OBSERVATION_ANCHOR,
                     message="The anchor is not a paragraph rendered in the article body",
+                )
+            if proposal.anchor_before_sha256 is not None and (
+                hashlib.sha256(anchors[proposal.anchor].encode("utf-8")).hexdigest()
+                != proposal.anchor_before_sha256
+            ):
+                raise OpinionError(
+                    OpinionErrorCode.NOTE_ANCHOR_TEXT_CHANGED,
+                    message="The anchored paragraph text changed after the drafting request.",
                 )
 
             existing_note = next(
@@ -1781,7 +1803,7 @@ class AnalystOpinionService:
             base_document_v5 = publication_document_article_v5_body(base_document)
             if base_document_v5 is None:
                 raise OpinionError(OpinionErrorCode.BASE_INVALID)
-            anchors = publication_renderable_body_anchors(base_document_v5.document)
+            anchors = publication_note_body_anchors(base_document)
             if any(
                 note.anchor not in anchors or not note.anchor.startswith(("lead:", "section:"))
                 for note in opinion.observations
@@ -2243,41 +2265,22 @@ class AnalystOpinionService:
     async def _resolve_base(
         self, uow: UnitOfWork, investigation: AnalystInvestigation
     ) -> tuple[ProductionArtifact, str, str]:
-        base = await uow.production_artifacts.get_current_for_revision(
-            investigation.production_run_id,
-            ProductionArtifactStage.PUBLICATION.value,
-        )
+        try:
+            base = await resolve_current_publication_base(uow, self._artifact_store, investigation)
+        except ArticleBaseUnavailable as exc:
+            raise OpinionError(OpinionErrorCode.BASE_INVALID) from exc
         synthesis = await uow.production_artifacts.get(investigation.synthesis_artifact_id)
         if (
-            base is None
-            or base.stage is not ProductionArtifactStage.PUBLICATION
-            or base.status is not ProductionArtifactStatus.VERIFIED
-            or base.production_run_id != investigation.production_run_id
-            or base.subject_id != investigation.subject_id
-            or base.canonical_blob_id is None
-            or synthesis is None
+            synthesis is None
             or synthesis.stage is not ProductionArtifactStage.SYNTHESIS
             or synthesis.status is not ProductionArtifactStatus.VERIFIED
             or synthesis.production_run_id != investigation.production_run_id
             or synthesis.canonical_blob_id is None
         ):
             raise OpinionError(OpinionErrorCode.BASE_INVALID)
-        base_bytes = await self._artifact_store.read_bytes(base.canonical_blob_id)
         synthesis_bytes = await self._artifact_store.read_bytes(synthesis.canonical_blob_id)
-        base_sha256 = hashlib.sha256(base_bytes).hexdigest()
         synthesis_sha256 = hashlib.sha256(synthesis_bytes).hexdigest()
-        try:
-            document = publication_document_from_json(json.loads(base_bytes))
-        except (json.JSONDecodeError, TypeError, ValueError) as exc:
-            raise OpinionError(OpinionErrorCode.BASE_INVALID) from exc
-        if publication_document_article_v5_body(document) is None:
-            raise OpinionError(OpinionErrorCode.BASE_INVALID)
-        canonical_bytes = ProductionArtifactStore.canonical_json_bytes(
-            serialize_publication_document(document)
-        )
-        if canonical_bytes != base_bytes:
-            raise OpinionError(OpinionErrorCode.BASE_INVALID)
-        return base, base_sha256, synthesis_sha256
+        return base.artifact, base.sha256, synthesis_sha256
 
     async def _append_decision(
         self,

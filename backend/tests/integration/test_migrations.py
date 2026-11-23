@@ -1273,7 +1273,7 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     command.upgrade(config, "head")
     command.current(config)
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert _head_revision() == "0028_task_context_consultations"
+    assert _head_revision() == "0029_note_anchor_identity"
     assert asyncio.run(_alembic_version_column_length(temporary_postgres_url)) == 64
 
     collection_attempt_columns = asyncio.run(
@@ -1641,7 +1641,7 @@ def test_frozen_collection_attempt_baseline_precedes_acquisition_additions(
 
     command.upgrade(config, "head")
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert _head_revision() == "0028_task_context_consultations"
+    assert _head_revision() == "0029_note_anchor_identity"
     final_schema = asyncio.run(_database_snapshot(temporary_postgres_url))["collection_attempts"]
     table = Base.metadata.tables["collection_attempts"]
     assert final_schema["columns"] == _expected_columns(table)

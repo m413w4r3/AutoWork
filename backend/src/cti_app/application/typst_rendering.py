@@ -102,6 +102,7 @@ from cti_app.domain.publication_document import (
     is_article_overview_heading,
     publication_document_text_anchors,
     publication_document_v5_sha256,
+    publication_note_body_anchors,
     publication_renderable_body_anchors,
     select_publication_timeline_key_events_v2,
     select_publication_timeline_key_events_v3,
@@ -1487,14 +1488,10 @@ def publication_content_section_types(
 
     rendered_opinion = publication_v6.rendered_opinion if publication_v6 is not None else None
     attached_figure_ids = {item.asset_id for item in opinion.protocol_figures} if opinion else set()
-    publication_v9 = (
-        value if isinstance(value, (PublicationDocumentV9, PublicationDocumentV10)) else None
-    )
     body_anchor_names = set(
-        publication_renderable_body_anchors(
-            document,
-            render_duplicate_paragraphs=publication_v9 is not None,
-        )
+        publication_renderable_body_anchors(document)
+        if draft_preview is not None
+        else publication_note_body_anchors(cast(CanonicalPublicationDocument, value))
     )
     has_unanchored_observations = bool(
         opinion is not None
@@ -2863,9 +2860,10 @@ def project_publication_to_typst_model(
             references.append(reference)
         return references
 
-    body_anchor_texts = publication_renderable_body_anchors(
-        document,
-        render_duplicate_paragraphs=publication_v9 is not None,
+    body_anchor_texts = (
+        publication_renderable_body_anchors(document)
+        if draft_preview is not None
+        else publication_note_body_anchors(cast(CanonicalPublicationDocument, value))
     )
 
     notes_by_anchor: dict[str, list[dict[str, Any]]] = {}

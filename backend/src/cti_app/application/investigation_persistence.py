@@ -1084,6 +1084,10 @@ def same_note_proposal_request(stored: NoteProposalV1, candidate: NoteProposalV1
         and stored.cited_observation_refs == candidate.cited_observation_refs
         and stored.base_opinion_version == candidate.base_opinion_version
         and stored.base_opinion_sha256 == candidate.base_opinion_sha256
+        and stored.base_publication_artifact_id == candidate.base_publication_artifact_id
+        and stored.base_publication_version == candidate.base_publication_version
+        and stored.base_publication_sha256 == candidate.base_publication_sha256
+        and stored.anchor_before_sha256 == candidate.anchor_before_sha256
         and stored.task_id == candidate.task_id
     )
 

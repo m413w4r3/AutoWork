@@ -141,6 +141,10 @@ class NoteProposalV1:
     tool_invocation_id: UUID | None = None
     base_opinion_version: int | None = None
     base_opinion_sha256: str | None = None
+    base_publication_artifact_id: UUID | None = None
+    base_publication_version: int | None = None
+    base_publication_sha256: str | None = None
+    anchor_before_sha256: str | None = None
     accepted_opinion_version: int | None = None
     analyst_decision_id: UUID | None = None
     created_at: datetime = field(default_factory=lambda: datetime.min.replace(tzinfo=UTC))
@@ -248,6 +252,37 @@ class NoteProposalV1:
                 raise ValueError("Note proposal base opinion hash is missing")
             _validate_sha256(base_sha256, "base_opinion_sha256")
 
+        base_publication = (
+            self.base_publication_artifact_id,
+            self.base_publication_version,
+            self.base_publication_sha256,
+        )
+        if any(item is not None for item in base_publication) and any(
+            item is None for item in base_publication
+        ):
+            raise ValueError(
+                "Note proposal base publication identity, version and hash are complete together"
+            )
+        if self.base_publication_artifact_id is not None:
+            if not isinstance(self.base_publication_artifact_id, UUID):
+                raise ValueError("Note proposal base publication identity must be a UUID")
+            if (
+                isinstance(self.base_publication_version, bool)
+                or not isinstance(self.base_publication_version, int)
+                or self.base_publication_version < 1
+            ):
+                raise ValueError("Note proposal base publication version must be >= 1")
+            base_publication_sha256 = self.base_publication_sha256
+            if base_publication_sha256 is None:
+                raise ValueError("Note proposal base publication hash is missing")
+            _validate_sha256(base_publication_sha256, "base_publication_sha256")
+        if (self.base_publication_artifact_id is None) != (self.anchor_before_sha256 is None):
+            raise ValueError(
+                "Note proposal anchor text identity requires its pinned publication base"
+            )
+        if self.anchor_before_sha256 is not None:
+            _validate_sha256(self.anchor_before_sha256, "anchor_before_sha256")
+
         accepted_fields = (self.accepted_opinion_version, self.analyst_decision_id)
         is_accepted = self.status is NoteProposalStatus.ACCEPTED
         if is_accepted and not materialised:
@@ -317,6 +352,10 @@ class NoteProposalV1:
             tool_invocation_id=self.tool_invocation_id,
             base_opinion_version=self.base_opinion_version,
             base_opinion_sha256=self.base_opinion_sha256,
+            base_publication_artifact_id=self.base_publication_artifact_id,
+            base_publication_version=self.base_publication_version,
+            base_publication_sha256=self.base_publication_sha256,
+            anchor_before_sha256=self.anchor_before_sha256,
             accepted_opinion_version=accepted_opinion_version,
             analyst_decision_id=analyst_decision_id,
             created_at=self.created_at,
@@ -384,6 +423,14 @@ class NoteProposalV1:
             ),
             "base_opinion_version": self.base_opinion_version,
             "base_opinion_sha256": self.base_opinion_sha256,
+            "base_publication_artifact_id": (
+                str(self.base_publication_artifact_id)
+                if self.base_publication_artifact_id is not None
+                else None
+            ),
+            "base_publication_version": self.base_publication_version,
+            "base_publication_sha256": self.base_publication_sha256,
+            "anchor_before_sha256": self.anchor_before_sha256,
             "status": self.status.value,
             "status_version": self.status_version,
             "accepted_opinion_version": self.accepted_opinion_version,
