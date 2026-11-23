@@ -948,6 +948,55 @@ async def test_terminal_session_delivery_proof_is_still_extracted() -> None:
     assert proven.delivery_sha256 == sha
 
 
+async def test_terminal_unknown_rows_never_starve_a_live_reconciliation() -> None:
+    """R4C-F1: live and terminal unknown rows get separate reconciliation quotas.
+
+    Fifty ``delivery_unknown`` rows of lost sessions whose hosts are gone can
+    never be proven.  A single oldest-first bounded query never reaches the
+    newer ambiguous row of a live session behind them, so its journal proof is
+    not read and its next ``queued`` instruction stays blocked behind it.
+    Reconciliation now reads each population with its own bound, live first.
+    """
+    harness = _Harness()
+    unknown_at = NOW - timedelta(seconds=600)
+    for index in range(50):
+        lost = await harness.seed_session(state=AgentSessionState.LOST)
+        harness.host.unreachable.add(lost.id)
+        await _seed_delivery_unknown(
+            harness,
+            lost,
+            key=f"i-lost-unknown-{index}",
+            text=f"unprovable instruction {index}",
+            unknown_at=unknown_at + timedelta(seconds=index),
+        )
+    live = await harness.seed_session(state=AgentSessionState.AWAITING_INSTRUCTION)
+    text = "Consumed by the live run."
+    live_unknown = await _seed_delivery_unknown(
+        harness,
+        live,
+        key="i-live-unknown",
+        text=text,
+        unknown_at=NOW - timedelta(seconds=GRACE_SECONDS + 1),
+    )
+    harness.host.events = [
+        HostSessionEventV1(
+            seq=1,
+            kind="instruction_delivered",
+            at=live_unknown.delivery_unknown_at or live_unknown.updated_at,
+            payload={
+                "instruction_id": str(live_unknown.id),
+                "sha256": live_unknown.delivery_sha256,
+                "mode": "next_run",
+            },
+        )
+    ]
+
+    report = await harness.delivery.drain_once()
+
+    assert report.reconciled_delivered == 1
+    assert (await harness.instruction(live_unknown.id)).state is InstructionState.DELIVERED
+
+
 async def test_dead_unknown_rows_of_live_sessions_never_starve_the_batch() -> None:
     """R4-F2 residual: non-deliverable rows cannot fill the delivery batch.
 
