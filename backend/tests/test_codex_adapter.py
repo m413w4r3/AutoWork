@@ -9,6 +9,7 @@ from cti_app.application.agentic_host_sessions import (
     HostResumeUnavailableError,
     HostSessionContractError,
 )
+from cti_app.application.agentic_tool_broker import AGENTIC_TOOL_NAMES
 from cti_app.domain.agentic_operator import (
     OperatorAdapterKind,
     PreparedOperatorSessionV1,
@@ -55,6 +56,48 @@ def _prepare_request(capability_sha256: str) -> PrepareSessionRequest:
         handoff_id=HANDOFF_ID,
         capability_sha256=capability_sha256,
     )
+
+
+async def test_adapter_maps_the_next_run_instruction_flag() -> None:
+    host = FakeHostSessionsPort(probe=probe_wire(flags={"next_run_instruction": True}))
+    adapter, _ = _adapter(host)
+    capabilities = await adapter.probe_capabilities(
+        ProbeCapabilitiesRequest(adapter_kind=OperatorAdapterKind.CODEX_CLI, executable="codex-cli")
+    )
+
+    assert capabilities.supports_next_run_instruction is True
+    assert capabilities.payload()["supports_next_run_instruction"] is True
+    # The host flag is not a CLI mode: the adapter never adds an unprobed mode.
+    assert "next_run_instruction" not in capabilities.modes
+
+
+async def test_adapter_posts_the_closed_manifest_and_refuses_a_wrong_digest() -> None:
+    host = FakeHostSessionsPort()
+    adapter, _ = _adapter(host)
+    capabilities = await adapter.probe_capabilities(
+        ProbeCapabilitiesRequest(adapter_kind=OperatorAdapterKind.CODEX_CLI, executable="codex-cli")
+    )
+
+    await adapter.set_tool_manifest(
+        SESSION_ID,
+        host_session_ref=str(SESSION_ID),
+        capability_sha256=capabilities.capability_sha256,
+    )
+
+    assert host.names() == ["probe_capabilities", "set_tool_manifest"]
+    request = host.manifest_requests[0]
+    assert request.manifest_sha256
+    assert {tool.broker_name for tool in request.tools} == set(AGENTIC_TOOL_NAMES)
+
+    # A supervisor answer that does not echo the posted digest is a contract
+    # error: activation must fail closed rather than run without a manifest.
+    host.manifest_sha256_override = "0" * 64
+    with pytest.raises(HostSessionContractError):
+        await adapter.set_tool_manifest(
+            SESSION_ID,
+            host_session_ref=str(SESSION_ID),
+            capability_sha256=capabilities.capability_sha256,
+        )
 
 
 async def test_adapter_uses_probed_modes_only() -> None:

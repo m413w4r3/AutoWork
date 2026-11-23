@@ -140,6 +140,10 @@ class ProbeFlags:
     streaming_stdin: bool
     mcp_per_invocation: bool
     os_sandbox: bool
+    # F3-D §3.4 / WIRE-1: the profile can start a fresh next run carrying a
+    # delivered instruction's bounded block.  Additive with a default so an
+    # older caller of this dataclass keeps validating.
+    next_run_instruction: bool = False
 
     def to_wire(self) -> dict[str, bool]:
         return {
@@ -150,6 +154,7 @@ class ProbeFlags:
             "streaming_stdin": self.streaming_stdin,
             "mcp_per_invocation": self.mcp_per_invocation,
             "os_sandbox": self.os_sandbox,
+            "next_run_instruction": self.next_run_instruction,
         }
 
 
@@ -211,6 +216,9 @@ class SessionProfile(Protocol):
     adapter_kind: str
     requires_sandbox: bool
     requires_manifest: bool
+    # D4: the profile composes ``LaunchContext.instruction_block`` into the
+    # next run's prompt, so the host may advertise ``next_run_instruction``.
+    supports_instruction_block: bool
 
     def probe(self, *, now: str) -> CapabilityProbe: ...
 
@@ -223,6 +231,7 @@ class FakeProfile:
     adapter_kind = "fake"
     requires_sandbox = False
     requires_manifest = False
+    supports_instruction_block = True
 
     def __init__(
         self, *, supports_resume: bool = False, simulate_network_attestation: bool = False
@@ -246,6 +255,7 @@ class FakeProfile:
             streaming_stdin=True,
             mcp_per_invocation=False,
             os_sandbox=False,
+            next_run_instruction=self.supports_instruction_block,
         )
         confinement: dict[str, object] = {
             "profile": "fake-direct",

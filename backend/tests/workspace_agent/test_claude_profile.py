@@ -310,6 +310,8 @@ def test_claude_probe_is_real_hash_checked_and_bounded(tmp_path: Path) -> None:
         "streaming_stdin": False,
         "mcp_per_invocation": True,
         "os_sandbox": False,
+        # WIRE-1: a fresh print-mode run carries the instruction block.
+        "next_run_instruction": True,
     }
     assert wire["confinement"] == {
         "profile": "bwrap-claude",

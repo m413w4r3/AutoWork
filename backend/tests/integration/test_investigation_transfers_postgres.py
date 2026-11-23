@@ -358,6 +358,11 @@ class _TransferOperator:
             observed_at=NOW,
         )
 
+    async def set_tool_manifest(
+        self, session_id: UUID, *, host_session_ref: str, capability_sha256: str
+    ) -> None:
+        return None
+
 
 class _SecretDelivery:
     async def deliver_session_secret(

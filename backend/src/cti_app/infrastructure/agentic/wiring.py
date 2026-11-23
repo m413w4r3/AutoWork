@@ -99,6 +99,15 @@ class DispatchingOperatorPort:
         self._sessions[request.session_id] = request.adapter_kind
         return prepared
 
+    async def set_tool_manifest(
+        self, session_id: UUID, *, host_session_ref: str, capability_sha256: str
+    ) -> None:
+        await (await self._adapter_for(session_id)).set_tool_manifest(
+            session_id,
+            host_session_ref=host_session_ref,
+            capability_sha256=capability_sha256,
+        )
+
     async def start_session(self, request: StartSessionRequest) -> SessionProcessStatusV1:
         self._sessions[request.session_id] = request.adapter_kind
         return await self._adapter(request.adapter_kind).start_session(request)

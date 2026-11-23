@@ -269,6 +269,8 @@ class _FakeOperator:
         self.resumed: list[ResumeSessionRequest] = []
         self.collected: list[CollectResultsRequest] = []
         self.reconciled: list[ReconcileSessionRequest] = []
+        self.manifests: list[tuple[UUID, str, str]] = []
+        self.manifest_error: Exception | None = None
         self.instruction_outcome = InstructionDeliveryOutcome.ACCEPTED
         self.reconcile_outcome = SessionReconcileOutcome.SESSION_ALIVE
         self.resume_result: ResumeSessionResultV1 | None = None
@@ -308,6 +310,15 @@ class _FakeOperator:
             observed_at=NOW,
         )
 
+    async def set_tool_manifest(
+        self, session_id: UUID, *, host_session_ref: str, capability_sha256: str
+    ) -> None:
+        self._observe("manifest")
+        if self.manifest_error is not None:
+            raise self.manifest_error
+        self.order.append("manifest")
+        self.manifests.append((session_id, host_session_ref, capability_sha256))
+
     async def get_session_status(self, request: SessionStatusRequest) -> SessionProcessStatusV1:
         return SessionProcessStatusV1(
             session_id=request.session_id,
@@ -341,6 +352,7 @@ class _FakeOperator:
         )
 
     async def resume_session(self, request: ResumeSessionRequest) -> ResumeSessionResultV1:
+        self.order.append("resume")
         self.resumed.append(request)
         if self.resume_result is not None:
             return self.resume_result
@@ -778,8 +790,9 @@ async def test_open_session_delivers_the_secret_before_the_adapter_start() -> No
     task = await harness.seed_task()
     await harness.open(task=task)
     # SESSION-RUNNER §6: the host prepare IS the one-shot secret hand-off, so
-    # start_session may only follow a successful delivery.
-    assert harness.order == ["secret", "start"]
+    # start_session may only follow a successful delivery, and the closed tool
+    # manifest is posted between them (WIRE-1).
+    assert harness.order == ["secret", "manifest", "start"]
 
 
 async def test_session_locks_are_advisory_then_row_and_host_calls_run_outside() -> None:
@@ -796,12 +809,13 @@ async def test_session_locks_are_advisory_then_row_and_host_calls_run_outside() 
         if "row" in transaction:
             assert transaction[0] == "advisory", transaction
     assert sum(t.count("advisory") for t in harness.lock_transactions) >= 3
-    # probe, host prepare, secret delivery and host start all ran between
-    # transactions (depth 0); a nested call would record 1 or more.
+    # probe, host prepare, secret delivery, tool manifest and host start all
+    # ran between transactions (depth 0); a nested call would record 1 or more.
     assert [name for name, _depth in harness.host_calls] == [
         "probe",
         "prepare",
         "secret",
+        "manifest",
         "start",
     ]
     assert all(depth == 0 for _name, depth in harness.host_calls)
@@ -823,13 +837,61 @@ async def test_session_start_validates_under_lock_then_starts_the_host_unlocked(
     harness.host_calls.clear()
     harness.lock_transactions.clear()
     await harness.service.start(harness.investigation_id, prepared.session.id, actor=HUMAN_ACTOR)
-    assert [name for name, _depth in harness.host_calls] == ["start"]
+    assert [name for name, _depth in harness.host_calls] == ["manifest", "start"]
     assert harness.host_calls[0][1] == 0
     locked = [tx for tx in harness.lock_transactions if tx]
     assert locked[0][0] == "advisory"
     for transaction in locked:
         if "row" in transaction:
             assert transaction[0] == "advisory", transaction
+
+
+async def test_tool_manifest_failure_fails_activation_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WIRE-1: a refused manifest never leaves a started host without tools."""
+
+    harness = _Harness()
+    task = await harness.seed_task()
+    handoff = await harness.add_handoff(task)
+
+    async def explode(_session_id: UUID, **_kwargs: object) -> None:
+        raise WorkspaceLocalUnavailableError("the host refused the manifest")
+
+    monkeypatch.setattr(harness.operator, "set_tool_manifest", explode)
+    with pytest.raises(WorkspaceLocalUnavailableError):
+        await harness.open(handoff=handoff, task=task, idempotency_key="manifest-explodes")
+
+    sessions = await harness.sessions.list_for_task(task.id)
+    assert len(sessions) == 1
+    assert sessions[0].state is AgentSessionState.FAILED
+    assert harness.operator.started == [], "start must never run without a manifest"
+    assert harness.operator.interrupted, "the prepared host object must be stopped"
+
+
+async def test_resume_reposts_the_manifest_before_the_host_resume() -> None:
+    """WIRE-1: a resumed run needs the same closed tool surface."""
+
+    harness = _Harness()
+    task = await harness.seed_task()
+    prepared = await harness.open(task=task)
+    stopped = await harness.service.interrupt(
+        harness.investigation_id,
+        prepared.session.id,
+        reason="operator asked to stop",
+        actor=HUMAN_ACTOR,
+    )
+    assert stopped.state is AgentSessionState.STOPPED
+    harness.operator.manifests.clear()
+    harness.order.clear()
+
+    resumed = await harness.service.resume(
+        harness.investigation_id, prepared.session.id, actor=HUMAN_ACTOR
+    )
+    assert resumed.state is AgentSessionState.READY
+    assert [call[0] for call in harness.operator.manifests] == [prepared.session.id]
+    assert harness.operator.manifests[0][2] == prepared.session.capability_sha256
+    assert harness.order == ["manifest", "resume"]
 
 
 async def test_secret_never_appears_in_repr_logs_or_payloads() -> None:

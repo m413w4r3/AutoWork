@@ -859,9 +859,39 @@ def test_broker_catalogue_matches_the_host_shim_catalogue() -> None:
         sys.path.insert(0, str(repository_root))
     from sidecars.workspace_agent.sessions import catalog
 
+    # The shim also exposes the two fixed instruction tools: they are signed
+    # relay routes, deliberately not broker tools (INSTRUCTION-DELIVERY §3.6).
+    instruction_tools = {"instruction.pending", "instruction.ack"}
     shim_names = {spec.broker_name for spec in catalog.CATALOGUE}
-    assert shim_names == set(AGENTIC_TOOL_NAMES) - {BRIDGE_CONSULT_ALIAS}
+    assert shim_names == (set(AGENTIC_TOOL_NAMES) | instruction_tools) - {BRIDGE_CONSULT_ALIAS}
     assert BRIDGE_CONSULT_ALIAS not in shim_names
+
+
+def test_backend_tool_manifest_matches_broker_and_shim_catalogues() -> None:
+    import json
+
+    repository_root = Path(__file__).resolve().parents[2]
+    if str(repository_root) not in sys.path:
+        sys.path.insert(0, str(repository_root))
+    from sidecars.workspace_agent.sessions import catalog
+
+    from cti_app.infrastructure.agentic.host_operator import agent_session_tool_manifest
+
+    manifest = agent_session_tool_manifest()
+    names = {tool.broker_name for tool in manifest.tools}
+    assert names == set(AGENTIC_TOOL_NAMES)
+    specs = {spec.broker_name: spec for spec in catalog.CATALOGUE}
+    assert names <= set(specs)
+    for tool in manifest.tools:
+        spec = specs[tool.broker_name]
+        assert tool.mcp_name == spec.mcp_name
+        assert tool.schema_version == spec.schema_version
+    # The supervisor only accepts the digest it recomputes over this payload.
+    payload = {"tools": [tool.model_dump(mode="json") for tool in manifest.tools]}
+    expected = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    assert manifest.manifest_sha256 == expected
 
 
 # ------------------------------------------------------------- signed routes

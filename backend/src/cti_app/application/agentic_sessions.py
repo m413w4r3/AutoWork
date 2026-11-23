@@ -1386,6 +1386,14 @@ class SessionService:
             raise SessionResumeUnavailableError(
                 "the host capability probe changed since the session was prepared"
             )
+        # WIRE-1: the next run needs the same closed tool manifest; re-posting
+        # it is idempotent on the host, and a refusal leaves the session
+        # stopped/lost instead of resuming it with no tool surface.
+        await operator.set_tool_manifest(
+            session_id,
+            host_session_ref=host_session_ref,
+            capability_sha256=capability_sha256,
+        )
         result = await operator.resume_session(
             ResumeSessionRequest(
                 session_id=session_id,
@@ -1843,6 +1851,20 @@ class SessionService:
         """
         if session.host_session_ref is None:
             raise SessionOperatorContractError("the prepared session has no host reference")
+        # WIRE-1: a real profile refuses ``start`` without an accepted tool
+        # manifest (``manifest_missing``).  Posting it here, after the secret
+        # delivery that created the host object and before any run, makes a
+        # manifest failure a fail-closed activation, never a session that
+        # starts with an empty tool surface.
+        try:
+            await operator.set_tool_manifest(
+                session.id,
+                host_session_ref=session.host_session_ref,
+                capability_sha256=session.capability_sha256,
+            )
+        except Exception:
+            await self._compensate_failed_activation(operator, session, "tool_manifest_failed")
+            raise
         try:
             status = await operator.start_session(
                 StartSessionRequest(

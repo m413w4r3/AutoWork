@@ -292,6 +292,9 @@ def test_codex_argv_uses_probed_modes_only(tmp_path: Path) -> None:
     assert probe.flags.resume is False  # resume re-arming is UNPROVEN by default
     assert probe.flags.streaming_stdin is False
     assert probe.flags.mcp_per_invocation is False
+    # WIRE-1: the profile composes the instruction block into a fresh run, so
+    # the host advertises the next-run delivery capability to the backend.
+    assert probe.flags.next_run_instruction is True
 
     context = _make_context(tmp_path)
     plan = profile.build_launch_plan(context)

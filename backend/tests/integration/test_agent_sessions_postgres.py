@@ -641,6 +641,7 @@ class _BlockingOperator:
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
         self.interrupted: list[UUID] = []
+        self.manifests: list[UUID] = []
 
     async def probe_capabilities(self, request: ProbeCapabilitiesRequest) -> OperatorCapabilitiesV1:
         return _capabilities()
@@ -666,6 +667,11 @@ class _BlockingOperator:
             last_activity_at=NOW,
             observed_at=NOW,
         )
+
+    async def set_tool_manifest(
+        self, session_id: UUID, *, host_session_ref: str, capability_sha256: str
+    ) -> None:
+        self.manifests.append(session_id)
 
     async def interrupt_session(self, request: InterruptSessionRequest) -> InterruptSessionResultV1:
         self.interrupted.append(request.session_id)
