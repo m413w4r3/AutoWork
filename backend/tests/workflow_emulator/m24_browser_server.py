@@ -56,7 +56,7 @@ import signal
 import tempfile
 from collections.abc import Awaitable, Callable
 from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -89,12 +89,32 @@ from cti_app.application.investigation_transfers import (
 )
 from cti_app.application.jobs import JobService, create_job_registry
 from cti_app.application.media_assets import MediaAssetStore
+from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.subject_content import SubjectContentService
 from cti_app.application.subjects import SubjectService
 from cti_app.application.workspace_agent import WorkspaceAgentError, WorkspaceAgentPort
 from cti_app.domain.analyst_opinion import (
     investigation_opinion_id,
     note_content_blocks_to_payload,
+)
+from cti_app.domain.production import (
+    ProductionArtifact,
+    ProductionArtifactStage,
+    ProductionArtifactStatus,
+)
+from cti_app.domain.publication_document import (
+    PublicationDocumentV6,
+    PublicationDocumentV6ProvenanceV1,
+    PublicationDocumentV9,
+    publication_document_from_json,
+    publication_document_text_anchors,
+    publication_document_v5_sha256,
+    serialize_publication_document,
+)
+from cti_app.domain.semantic_annotation import (
+    SemanticParagraphV1,
+    SemanticRole,
+    SemanticTextSpanV1,
 )
 from cti_app.infrastructure.agentic.wiring import build_session_runtime
 from cti_app.infrastructure.database.session import (
@@ -521,6 +541,124 @@ class BrowserState:
         }
 
 
+async def _advance_publication_base(
+    *,
+    state: BrowserState,
+    uow_factory: Callable[[], SqlAlchemyUnitOfWork],
+    artifact_store: ProductionArtifactStore,
+) -> dict[str, Any]:
+    """Append a synthetic publication revision to prove proposal base fencing."""
+    async with uow_factory() as uow:
+        current = await uow.production_artifacts.get_current_for_revision(
+            state.production_run_id,
+            ProductionArtifactStage.PUBLICATION.value,
+        )
+    if current is None or current.canonical_blob_id is None:
+        raise RuntimeError("the M24 browser publication base is unavailable")
+    raw = await artifact_store.read_bytes(current.canonical_blob_id, max_bytes=None)
+    try:
+        document = publication_document_from_json(json.loads(raw))
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise RuntimeError("the M24 browser publication base is not canonical") from exc
+    if not isinstance(document, PublicationDocumentV9):
+        raise RuntimeError("the M24 browser publication base must be an M23 V9 document")
+
+    old_v7 = document.base_publication
+    old_v6 = old_v7.base_publication
+    new_artifact_id = uuid4()
+    old_base_v5 = old_v6.base_publication
+    target_section = old_base_v5.document.sections[1]
+    target_paragraph = target_section.paragraphs[0]
+    revised_paragraph_text = f"{target_paragraph.text} Revision D2."
+    if not old_base_v5.document.tables:
+        raise RuntimeError("the M24 browser publication has no D2 source table")
+    target_table = old_base_v5.document.tables[0]
+    if target_table.key != "d2-article-a-table":
+        raise RuntimeError("the M24 browser publication source table key changed")
+    revised_sections = (
+        *old_base_v5.document.sections[:1],
+        replace(
+            target_section,
+            paragraphs=(
+                replace(target_paragraph, text=revised_paragraph_text),
+                *target_section.paragraphs[1:],
+            ),
+        ),
+        *old_base_v5.document.sections[2:],
+    )
+    revised_document_v4 = replace(
+        old_base_v5.document,
+        sections=revised_sections,
+        tables=(
+            replace(target_table, title=f"{target_table.title} Revision D2."),
+            *old_base_v5.document.tables[1:],
+        ),
+    )
+    new_base_v5 = replace(
+        old_base_v5,
+        document=revised_document_v4,
+        semantic_text=replace(
+            old_base_v5.semantic_text,
+            paragraphs=tuple(
+                SemanticParagraphV1(
+                    anchor=anchor,
+                    spans=(SemanticTextSpanV1(SemanticRole.TEXT, text),),
+                )
+                for anchor, text in publication_document_text_anchors(
+                    revised_document_v4,
+                    references=old_base_v5.references,
+                ).items()
+            ),
+        ),
+    )
+    base_body_sha256 = publication_document_v5_sha256(new_base_v5)
+    new_v6 = PublicationDocumentV6(
+        base_publication=new_base_v5,
+        provenance=PublicationDocumentV6ProvenanceV1(
+            base_publication_artifact_id=new_artifact_id,
+            base_publication_sha256=base_body_sha256,
+            base_publication_body_sha256=base_body_sha256,
+        ),
+    )
+    revised_document = replace(
+        document,
+        base_publication=replace(old_v7, base_publication=new_v6),
+    )
+    revised_bytes = ProductionArtifactStore.canonical_json_bytes(
+        serialize_publication_document(revised_document)
+    )
+    revised_sha256 = hashlib.sha256(revised_bytes).hexdigest()
+    revised_blob_id = await artifact_store.put_bytes(
+        revised_bytes,
+        bucket="m24-acceptance-publication",
+        mime_type="application/json",
+    )
+    revised_artifact = ProductionArtifact(
+        id=new_artifact_id,
+        production_run_id=current.production_run_id,
+        subject_id=current.subject_id,
+        stage=ProductionArtifactStage.PUBLICATION,
+        version=current.version + 1,
+        input_hash=revised_sha256,
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=revised_blob_id,
+    )
+    async with uow_factory() as uow:
+        latest = await uow.production_artifacts.get_current_for_revision(
+            state.production_run_id,
+            ProductionArtifactStage.PUBLICATION.value,
+        )
+        if latest is None or latest.id != current.id:
+            raise RuntimeError("the publication base changed during the D2 fixture update")
+        await uow.production_artifacts.append(revised_artifact)
+        await uow.commit()
+    return {
+        "artifact_id": str(revised_artifact.id),
+        "version": revised_artifact.version,
+        "sha256": revised_sha256,
+    }
+
+
 def _write_state(path: Path, state: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
@@ -726,6 +864,7 @@ async def _investigation_diagnostics(
                         if proposal.base_publication_artifact_id is None
                         else str(proposal.base_publication_artifact_id)
                     ),
+                    "base_publication_version": proposal.base_publication_version,
                     "base_publication_sha256": proposal.base_publication_sha256,
                     "content_blocks": note_content_blocks_to_payload(proposal.content_blocks),
                     "materialised": proposal.materialised,
@@ -915,6 +1054,7 @@ def _install_routes(
     server_slot: list[uvicorn.Server | None],
     state: BrowserState,
     uow_factory: Callable[[], SqlAlchemyUnitOfWork],
+    artifact_store: ProductionArtifactStore,
     transport: AutoRespondingBridgeTransport,
     virus_total: AcceptanceVirusTotal,
     settings: Any,
@@ -939,6 +1079,14 @@ def _install_routes(
             uow_factory, state=state, host_sessions=host_sessions
         )
         return payload
+
+    @application.post("/__m24_browser/advance-publication")
+    async def advance_publication() -> dict[str, Any]:
+        return await _advance_publication_base(
+            state=state,
+            uow_factory=uow_factory,
+            artifact_store=artifact_store,
+        )
 
     @application.post("/__m24_browser/drain-instructions")
     async def drain_instructions() -> dict[str, Any]:
@@ -1153,6 +1301,7 @@ async def _serve() -> None:
                 # Two rendered anchors share the tail text: the note journey
                 # proves the canonical selector exposes real occurrences.
                 duplicate_analysis_paragraph=True,
+                include_m23_article_elements=True,
             )
             state = BrowserState(
                 subject_id=seeded.subject.id,
@@ -1178,6 +1327,7 @@ async def _serve() -> None:
                 server_slot=server_slot,
                 state=state,
                 uow_factory=uow_factory,
+                artifact_store=artifact_store,
                 transport=transport,
                 virus_total=virus_total,
                 settings=settings,
