@@ -30,7 +30,7 @@ import time
 import uuid
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, BinaryIO, Protocol
 
 from .. import files, paths, policies, protocol, scan, workspace
@@ -130,6 +130,40 @@ MAX_CREDENTIAL_COPY_BYTES = 1024 * 1024
 # R2B-2: string values under these token-ish JSON keys are provider credentials.
 # The window derivation is bounded so a pathological value cannot exhaust memory.
 MAX_CREDENTIAL_VALUE_BYTES = 4 * 1024
+
+
+@dataclass(frozen=True)
+class _CaptureOutputDeclaration:
+    """One closed source-to-workspace route in the session output manifest."""
+
+    source_root: str
+    destination_template: str
+    kind: str
+    recursive: bool
+    names: frozenset[str] = frozenset()
+
+
+# Collect reads no workspace path supplied by the CLI. It imports only these
+# private scratch outputs into their declared versioned workspace destinations.
+# The workspace allowlist in SessionRecord is for read-only CLI inputs.
+CAPTURE_OUTPUT_MANIFEST: tuple[_CaptureOutputDeclaration, ...] = (
+    _CaptureOutputDeclaration(
+        source_root="scratch/notes",
+        destination_template="notes/agents/{task_id}/{relative}",
+        kind="notes",
+        recursive=True,
+    ),
+    _CaptureOutputDeclaration(
+        source_root="scratch",
+        destination_template="results/sessions/{session_id}/{name}",
+        kind="results",
+        recursive=False,
+        names=frozenset({"result.md", "final.md"}),
+    ),
+)
+CAPTURE_ALLOWED_EXTENSIONS = frozenset({".md"})
+CAPTURE_DENIED_PROFILE_ROOTS = frozenset({"config", "home", "cache", "tmp", "ipc", "work"})
+CAPTURE_DENIED_PROFILE_PATHS = frozenset(path.as_posix() for path in PROFILE_CREDENTIAL_COPY_PATHS)
 DEFAULT_SKILLS_ROOT = Path(__file__).resolve().parents[3] / ".agents" / "skills"
 DEFAULT_FAKE_SCENARIO = "success"
 DEFAULT_BROKER_BACKEND_URL = "http://127.0.0.1:8000"
@@ -2897,39 +2931,65 @@ class SessionSupervisor:
         workspace_descriptor = self._workspaces.get_workspace(record.workspace_id)
         entries: list[tuple[str, str, bytes]] = []
         total = 0
-        notes_root = handle.scratch / "notes"
-        if notes_root.is_dir():
-            for directory, subdirectories, names in os.walk(notes_root, followlinks=False):
-                subdirectories.sort()
-                for name in sorted(names):
-                    source = Path(directory) / name
-                    try:
-                        info = source.lstat()
-                    except OSError:
-                        continue
-                    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-                        continue
-                    relative = source.relative_to(notes_root).as_posix()
-                    destination = f"notes/agents/{record.task_id}/{relative}"
-                    data = self._read_capture_file(source)
-                    total += len(data)
-                    if len(data) > MAX_CAPTURE_NOTE_BYTES or total > MAX_CAPTURE_TOTAL_BYTES:
-                        raise BudgetExceededError("capture")
-                    entries.append((destination, "notes", data))
-        for name in ("result.md", "final.md"):
-            source = handle.scratch / name
-            try:
-                info = source.lstat()
-            except OSError:
-                continue
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-                continue
-            data = self._read_capture_file(source)
-            total += len(data)
-            if len(data) > MAX_CAPTURE_NOTE_BYTES or total > MAX_CAPTURE_TOTAL_BYTES:
-                raise BudgetExceededError("capture")
-            destination = f"results/sessions/{record.session_id}/{name}"
-            entries.append((destination, "results", data))
+        try:
+            scratch_info = handle.scratch.lstat()
+        except OSError:
+            return [], []
+        if stat.S_ISLNK(scratch_info.st_mode) or not stat.S_ISDIR(scratch_info.st_mode):
+            return [], []
+        for declaration in CAPTURE_OUTPUT_MANIFEST:
+            source_root = handle.directory / declaration.source_root
+            if declaration.recursive:
+                try:
+                    root_info = source_root.lstat()
+                except OSError:
+                    continue
+                if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+                    continue
+                sources: list[Path] = []
+                for directory, subdirectories, names in os.walk(source_root, followlinks=False):
+                    current = Path(directory)
+                    subdirectories[:] = sorted(
+                        child
+                        for child in subdirectories
+                        if _capture_directory_allowed(current / child, root_info.st_dev)
+                    )
+                    sources.extend(current / name for name in sorted(names))
+            else:
+                sources = [source_root / name for name in sorted(declaration.names)]
+
+            for source in sources:
+                relative = _capture_source_relative(source, source_root, handle.directory)
+                if relative is None or not _capture_manifest_allows(declaration, relative):
+                    continue
+                if _is_credential_file_name(PurePosixPath(relative).name):
+                    continue
+                try:
+                    info = source.lstat()
+                except OSError:
+                    continue
+                if (
+                    stat.S_ISLNK(info.st_mode)
+                    or not stat.S_ISREG(info.st_mode)
+                    or info.st_nlink != 1
+                    or info.st_dev != scratch_info.st_dev
+                ):
+                    continue
+                if info.st_size > MAX_CAPTURE_NOTE_BYTES:
+                    raise BudgetExceededError("capture")
+                data = self._read_capture_file(source)
+                if data is None:
+                    continue
+                total += len(data)
+                if total > MAX_CAPTURE_TOTAL_BYTES:
+                    raise BudgetExceededError("capture")
+                destination = declaration.destination_template.format(
+                    task_id=record.task_id,
+                    session_id=record.session_id,
+                    name=PurePosixPath(relative).name,
+                    relative=relative,
+                )
+                entries.append((destination, declaration.kind, data))
         captured: list[dict[str, object]] = []
         captured_notes: list[str] = []
         # F2: the whole capture is refused before anything reaches the
@@ -3141,10 +3201,16 @@ class SessionSupervisor:
         finally:
             os.close(root_fd)
 
-    def _read_capture_file(self, path: Path) -> bytes:
-        data = _read_regular_file(path, MAX_CAPTURE_NOTE_BYTES)
+    def _read_capture_file(self, path: Path) -> bytes | None:
+        data = _read_regular_file(path, MAX_CAPTURE_NOTE_BYTES, require_single_link=True)
         if data is None:
             raise BudgetExceededError("capture")
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        if "\x00" in text:
+            return None
         return data
 
     def _fake_output(self, handle: _Session) -> tuple[str | None, str | None]:
@@ -3352,7 +3418,9 @@ def _read_exit_file(directory: Path, run: int) -> ExitRecord | None:
         return None
 
 
-def _read_regular_file(path: Path, limit: int) -> bytes | None:
+def _read_regular_file(
+    path: Path, limit: int, *, require_single_link: bool = False
+) -> bytes | None:
     """Read at most ``limit`` bytes of a regular file; ``None`` on refusal/oversize."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -3360,7 +3428,11 @@ def _read_regular_file(path: Path, limit: int) -> bytes | None:
         return None
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_size > limit
+            or (require_single_link and info.st_nlink != 1)
+        ):
             return None
         chunks: list[bytes] = []
         remaining = limit
@@ -3373,6 +3445,51 @@ def _read_regular_file(path: Path, limit: int) -> bytes | None:
     finally:
         os.close(fd)
     return b"".join(chunks)
+
+
+def _capture_directory_allowed(path: Path, root_device: int) -> bool:
+    """Keep recursive collection inside real, same-device directories."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return (
+        not stat.S_ISLNK(info.st_mode) and stat.S_ISDIR(info.st_mode) and info.st_dev == root_device
+    )
+
+
+def _capture_source_relative(source: Path, source_root: Path, session_root: Path) -> str | None:
+    """Return a safe lexical source path, refusing traversal and profile areas."""
+    try:
+        relative = source.relative_to(source_root)
+        session_relative = source.relative_to(session_root)
+    except ValueError:
+        return None
+    value = relative.as_posix()
+    session_value = session_relative.as_posix()
+    parts = PurePosixPath(value).parts
+    session_parts = PurePosixPath(session_value).parts
+    if (
+        not value
+        or "\\" in value
+        or PurePosixPath(value).is_absolute()
+        or any(part in {"", ".", ".."} for part in parts)
+        or not session_parts
+        or session_parts[0] != SCRATCH_DIRECTORY
+        or (len(session_parts) > 1 and session_parts[1] in CAPTURE_DENIED_PROFILE_ROOTS)
+        or session_value in CAPTURE_DENIED_PROFILE_PATHS
+    ):
+        return None
+    return value
+
+
+def _capture_manifest_allows(declaration: _CaptureOutputDeclaration, relative: str) -> bool:
+    path = PurePosixPath(relative)
+    if declaration.names and relative not in declaration.names:
+        return False
+    if not declaration.recursive and len(path.parts) != 1:
+        return False
+    return path.suffix in CAPTURE_ALLOWED_EXTENSIONS
 
 
 def _capture_key(session_id: str, run: int, index: int) -> str:
