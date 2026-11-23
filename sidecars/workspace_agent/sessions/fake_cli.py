@@ -38,6 +38,16 @@ MAX_SECRET_FRAME_BYTES = 4096
 MAX_SCRIPT_BYTES = 64 * 1024
 MAX_INSTRUCTION_BLOCK_BYTES = 32 * 1024
 DEFAULT_FINAL_MESSAGE = "fake final message"
+SYNTHETIC_PROVIDER_CREDENTIAL = "synthetic-provider-credential-for-m24-a3-0123456789abcdef"
+SYNTHETIC_PROVIDER_CREDENTIAL_BYTES = json.dumps(
+    {
+        "claudeAiOauth": {
+            "accessToken": SYNTHETIC_PROVIDER_CREDENTIAL,
+            "refreshToken": "synthetic-refresh-credential-for-m24-a3-0123456789abcdef",
+        }
+    },
+    separators=(",", ":"),
+).encode("utf-8")
 WORK_DIRECTORY_NAME = "work"
 BUILTIN_SCENARIOS: dict[str, list[dict[str, object]]] = {
     "success": [
@@ -267,15 +277,61 @@ def write_scratch(scratch_root: Path, relative: str, text: str) -> None:
     parts = relative.split("/")
     if not parts or any(part in {"", ".", ".."} for part in parts) or relative.startswith("/"):
         raise SystemExit(2)
-    if not (
-        relative.startswith("notes/")
-        or relative in {"result.md", "final.md"}
-        or relative.startswith("work/")
-    ):
+    if not (relative.startswith(("notes/", "work/")) or relative in {"result.md", "final.md"}):
         raise SystemExit(2)
     target = scratch_root / relative
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(text.encode("utf-8"))
+
+
+def seed_synthetic_profile(scratch_root: Path) -> None:
+    """Plant only synthetic provider files for credential-boundary tests."""
+    session_root = scratch_root.parent
+    claude_dir = session_root / "config" / "home" / ".claude"
+    codex_dir = session_root / "config" / "codex"
+    claude_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    codex_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    credential = claude_dir / ".credentials.json"
+    credential.write_bytes(SYNTHETIC_PROVIDER_CREDENTIAL_BYTES)
+    os.chmod(credential, 0o600)
+    codex_auth = codex_dir / "auth.json"
+    codex_auth.write_bytes(SYNTHETIC_PROVIDER_CREDENTIAL_BYTES)
+    os.chmod(codex_auth, 0o600)
+
+
+def _profile_source(scratch_root: Path, name: str) -> Path:
+    sources = {
+        "credentials": Path("config/home/.claude/.credentials.json"),
+        "profile_dir": Path("config/home/.claude"),
+    }
+    relative = sources.get(name)
+    if relative is None:
+        raise SystemExit(2)
+    return scratch_root.parent / relative
+
+
+def link_profile(scratch_root: Path, relative: str, source_name: str, kind: str) -> None:
+    """Create a synthetic CLI link under notes/ without accepting host paths."""
+    parts = relative.split("/")
+    if (
+        not parts
+        or parts[0] != "notes"
+        or any(part in {"", ".", ".."} for part in parts)
+        or relative.startswith("/")
+        or "\\" in relative
+    ):
+        raise SystemExit(2)
+    source = _profile_source(scratch_root, source_name)
+    destination = scratch_root.joinpath(*parts)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if kind == "symlink":
+        destination.symlink_to(
+            os.path.relpath(source, destination.parent), target_is_directory=source.is_dir()
+        )
+    elif kind == "hardlink" and source.is_file():
+        os.link(source, destination, follow_symlinks=False)
+    else:
+        raise SystemExit(2)
 
 
 def spawn_child(state: FakeState, seconds: int) -> None:
@@ -307,6 +363,20 @@ def run_step(state: FakeState, step: dict[str, object], scratch_root: Path) -> b
             stream.flush()
     elif operation == "write":
         write_scratch(scratch_root, str(step["path"]), str(step.get("text", "")))
+    elif operation == "seed_profile":
+        seed_synthetic_profile(scratch_root)
+    elif operation == "copy_credential":
+        write_scratch(scratch_root, str(step["path"]), SYNTHETIC_PROVIDER_CREDENTIAL)
+    elif operation == "profile_link":
+        link_profile(
+            scratch_root,
+            str(step["path"]),
+            str(step["source"]),
+            str(step["kind"]),
+        )
+    elif operation == "log_credential":
+        sys.stderr.write(SYNTHETIC_PROVIDER_CREDENTIAL + "\n")
+        sys.stderr.flush()
     elif operation == "probe":
         env = {
             key: value
