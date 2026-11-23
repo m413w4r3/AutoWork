@@ -29,16 +29,13 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
 )
-from cti_app.domain.production_editorial_enrichment import EnrichmentPlacementKind
 from cti_app.domain.publication_document import (
     CanonicalPublicationDocument,
     publication_document_article_v5_body,
     publication_document_from_json,
-    publication_element_sha256,
     publication_note_body_anchors,
     serialize_publication_document,
 )
-from cti_app.domain.semantic_annotation import lead_paragraph_anchor, section_paragraph_anchor
 
 MAX_ARTICLE_ANCHORS = MAX_CONTEXT_PUBLICATION_ANCHORS
 MAX_ARTICLE_ELEMENTS = MAX_CONTEXT_PUBLICATION_ANCHORS
@@ -73,12 +70,16 @@ class ArticleAnchorV1:
 
 @dataclass(frozen=True, slots=True)
 class ArticleElementV1:
+    """One M23 element with the exact verdict the block validator would give."""
+
     kind: str
     key: str
     title: str | None
     caption: str | None
     element_sha256: str
     anchor: str | None
+    proposable: bool
+    refusal_reason: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,55 +187,31 @@ def _anchor_indexes(anchor: str) -> tuple[int | None, int]:
     return int(parts[1]), int(parts[3]) - 1
 
 
-def _element_anchor(
-    resolved: dict[tuple[str, str], Any],
-    *,
-    kind: str,
-    key: str,
-) -> str | None:
-    placement = resolved.get((kind, key))
-    if placement is None:
-        return None
-    if placement.paragraph_kind == "lead":
-        return lead_paragraph_anchor(placement.paragraph_index + 1)
-    return section_paragraph_anchor(placement.section_index or 0, placement.paragraph_index + 1)
-
-
 def _catalog_elements(base: ArticleBaseV1) -> tuple[ArticleElementV1, ...]:
-    body = publication_document_article_v5_body(base.document)
-    if body is None:  # pragma: no cover - ArticleBaseV1 guarantees an article body
-        raise ArticleBaseUnavailable("The publication base is not an article body")
-    document = body.document
-    resolved = {
-        (item.element_kind, item.element_key): item
-        for item in getattr(base.document, "resolved_placements", ())
-    }
-    element_items: list[ArticleElementV1] = []
-    families: tuple[tuple[str, tuple[Any, ...]], ...] = (
-        ("table", document.tables),
-        ("chart", document.charts),
-        ("diagram", document.diagrams),
-        ("figure", document.figures),
+    # Local import: opinion_note_proposals already imports this module for the
+    # pinned-base resolvers, and both sides must share one facts projection.
+    from cti_app.application.opinion_note_proposals import (
+        note_article_element_facts,
+        note_article_element_refusal,
     )
-    for kind, items in families:
-        for element in items:
-            anchor = None
-            if element.placement.kind is EnrichmentPlacementKind.AFTER_PARAGRAPH:
-                # The legacy projection cannot resolve an explicit paragraph
-                # anchor; only V9/V10 render such an element.
-                anchor = _element_anchor(resolved, kind=kind, key=element.key)
-                if anchor is None:
-                    continue
-            element_items.append(
-                ArticleElementV1(
-                    kind=kind,
-                    key=element.key,
-                    title=getattr(element, "title", None),
-                    caption=element.caption,
-                    element_sha256=publication_element_sha256(document, kind=kind, key=element.key),
-                    anchor=anchor,
-                )
+
+    if publication_document_article_v5_body(base.document) is None:  # pragma: no cover
+        raise ArticleBaseUnavailable("The publication base is not an article body")
+    element_items: list[ArticleElementV1] = []
+    for fact in note_article_element_facts(base.document):
+        refusal = note_article_element_refusal(fact)
+        element_items.append(
+            ArticleElementV1(
+                kind=fact.kind,
+                key=fact.key,
+                title=fact.title,
+                caption=fact.caption,
+                element_sha256=fact.element_sha256,
+                anchor=fact.anchor,
+                proposable=refusal is None,
+                refusal_reason=refusal.value if refusal is not None else None,
             )
+        )
     return tuple(sorted(element_items, key=lambda item: (item.kind, item.key)))
 
 

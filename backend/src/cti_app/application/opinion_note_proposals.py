@@ -341,6 +341,23 @@ def note_article_element_facts(
     return tuple(facts)
 
 
+def note_article_element_refusal(
+    fact: NoteArticleElementFactV1,
+) -> NoteProposalErrorCode | None:
+    """Return the typed code a note block on this fact would be refused with.
+
+    The article-anchor catalog exposes this exact decision so the UI can hide
+    what the server would refuse; the block validator applies the same rules.
+    """
+    if fact.anchor is None:
+        return NoteProposalErrorCode.NOTE_BLOCK_REF_STALE
+    if fact.kind == NoteArticleElementKind.CHART.value and fact.evidence_ref_count == 0:
+        return NoteProposalErrorCode.NOTE_CHART_WITHOUT_EVIDENCE
+    if fact.kind == NoteArticleElementKind.FIGURE.value and not fact.source_document_known:
+        return NoteProposalErrorCode.NOTE_FIGURE_SOURCE_MISSING
+    return None
+
+
 def validate_note_content_blocks(
     blocks: Sequence[NoteContentBlockV1],
     context: NoteContentBlockContextV1,
@@ -382,12 +399,13 @@ def validate_note_content_blocks(
                     NoteProposalErrorCode.NOTE_BLOCK_REF_STALE,
                     message="The referenced article element is not rendered at the note anchor",
                 )
-            if block.kind is NoteArticleElementKind.CHART and element.evidence_ref_count == 0:
+            refusal = note_article_element_refusal(element)
+            if refusal is NoteProposalErrorCode.NOTE_CHART_WITHOUT_EVIDENCE:
                 raise NoteProposalError(
                     NoteProposalErrorCode.NOTE_CHART_WITHOUT_EVIDENCE,
                     message="A note chart requires evidence on every plotted point",
                 )
-            if block.kind is NoteArticleElementKind.FIGURE and not element.source_document_known:
+            if refusal is NoteProposalErrorCode.NOTE_FIGURE_SOURCE_MISSING:
                 raise NoteProposalError(
                     NoteProposalErrorCode.NOTE_FIGURE_SOURCE_MISSING,
                     message="A note figure requires a source document known to the article",
@@ -1845,6 +1863,7 @@ __all__ = [
     "default_review_question",
     "load_note_content_block_context",
     "note_article_element_facts",
+    "note_article_element_refusal",
     "resolve_note_content_blocks",
     "validate_note_content_blocks",
 ]

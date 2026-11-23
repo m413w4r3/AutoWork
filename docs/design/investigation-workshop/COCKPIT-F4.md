@@ -98,9 +98,13 @@ qui applique le même drapeau que le rendu : `render_duplicate_paragraphs` vrai 
 `{base_publication_artifact_id, base_publication_version, base_publication_sha256,
 source: "pinned_opinion_base"|"current_base", anchors:[{anchor,text,text_sha256,
 section_index?,paragraph_index?}], elements:[{kind,key,title,caption,element_sha256,
-anchor}], truncated}`. Base = celle de l’avis s’il existe, sinon la base courante
-(résolue comme l’acceptation). `elements` liste les éléments M23 rendus dans cette
-base (V9/V10 seulement pour `after_paragraph`). Limite 128 ancres comme le contexte
+anchor,proposable,refusal_reason?}], truncated}`. Base = celle de l’avis s’il existe,
+sinon la base courante (résolue comme l’acceptation). `elements` liste les éléments M23
+rendus dans cette base (V9/V10 seulement pour `after_paragraph`). Chaque élément porte le
+verdict du validateur de blocs de Note (`proposable`, code typé `refusal_reason` :
+`note_block_ref_stale`, `note_chart_without_evidence`, `note_figure_source_missing`) afin
+que l’UI masque ce que le serveur refusera ; l’exploitation de ces drapeaux côté front est
+un lot ultérieur. Limite 128 ancres comme le contexte
 existant ([V] `application/investigation_contracts.py:39`, `MAX_CONTEXT_PUBLICATION_ANCHORS`),
 avec `truncated` explicite.
 
