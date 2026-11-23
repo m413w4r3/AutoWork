@@ -1026,9 +1026,7 @@ class InstructionDeliveryService:
             raise ValueError("now must be timezone-aware")
         return timestamp
 
-    async def _list_delivery_candidates(
-        self, limit: int
-    ) -> tuple[AgentSessionInstructionV1, ...]:
+    async def _list_delivery_candidates(self, limit: int) -> tuple[AgentSessionInstructionV1, ...]:
         """Only ``queued`` rows of active sessions can ever be delivered.
 
         Ambiguous or in-flight rows get their own reconciliation queries; if

@@ -849,7 +849,9 @@ async def _seed_delivery_unknown(
         now=unknown_at,
     )
     ambiguous = reserved.with_state(
-        InstructionState.DELIVERY_UNKNOWN, now=unknown_at, last_delivery_error="host_transport_error"
+        InstructionState.DELIVERY_UNKNOWN,
+        now=unknown_at,
+        last_delivery_error="host_transport_error",
     )
     await harness.sessions.update_instruction_delivery(
         ambiguous, expected_state=InstructionState.QUEUED, expected_delivery_token=None
@@ -870,7 +872,11 @@ async def test_terminal_session_stale_delivering_is_reconciled_and_cancelable() 
     attempted_at = NOW - timedelta(seconds=GRACE_SECONDS + 60)
     session = await harness.seed_session(state=AgentSessionState.AWAITING_INSTRUCTION)
     queued, token = await _seed_stale_delivering(
-        harness, session, key="i-lost-stale", text="Crash on a lost session.", attempted_at=attempted_at
+        harness,
+        session,
+        key="i-lost-stale",
+        text="Crash on a lost session.",
+        attempted_at=attempted_at,
     )
     # The lease expired and the sweep marked the session lost after the crash.
     stored = await harness.sessions.get(session.id)

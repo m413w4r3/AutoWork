@@ -39,11 +39,10 @@ from cti_app.application.agentic_host_sessions import (
     HostBudgetUsageV1,
     HostInstructionResultV1,
     HostReasonRequestV1,
-    HostSessionEventV1,
     HostSessionEventsPageV1,
+    HostSessionEventV1,
     HostSessionStatusV1,
 )
-from cti_app.application.workspace_agent import WorkspaceLocalUnavailableError
 from cti_app.application.agentic_sessions import (
     NoteInstructionResolution,
     SessionSecret,
@@ -51,6 +50,7 @@ from cti_app.application.agentic_sessions import (
 )
 from cti_app.application.instruction_delivery import InstructionDeliveryService
 from cti_app.application.investigation_persistence import VersionConflictError
+from cti_app.application.workspace_agent import WorkspaceLocalUnavailableError
 from cti_app.config import Settings
 from cti_app.domain.agentic_operator import (
     AgentSessionInstructionV1,
@@ -565,9 +565,7 @@ async def _seed_delivery_unknown(
     at: datetime,
 ) -> AgentSessionInstructionV1:
     """A reserved attempt whose phase C never committed the receipt."""
-    queued = await _seed_instruction(
-        session_factory, session, text=text, key=key, queued_at=at
-    )
+    queued = await _seed_instruction(session_factory, session, text=text, key=key, queued_at=at)
     token = uuid4()
     reserved = queued.with_delivery_reserved(
         token=token,

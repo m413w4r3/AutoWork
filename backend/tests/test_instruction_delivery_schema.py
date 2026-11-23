@@ -458,9 +458,7 @@ async def test_fake_repository_lists_only_pending_instructions_in_queue_order() 
         reason="handed_off:h1", now=LATER
     )
     for instruction in (second, delivered, first, acknowledged, cancelled, ambiguous):
-        await repository.add(
-            _active_session(instruction.session_id, task_id=instruction.task_id)
-        )
+        await repository.add(_active_session(instruction.session_id, task_id=instruction.task_id))
         _, created = await repository.add_instruction(instruction)
         assert created is True
     pending = await repository.list_pending_instructions(limit=10)

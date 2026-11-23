@@ -512,9 +512,7 @@ class SqlAlchemyAgentSessionRepository:
         """
         if limit < 1:
             raise ValueError("limit must be >= 1")
-        selected = (
-            INSTRUCTION_PENDING_STATES if states is None else frozenset(states)
-        )
+        selected = INSTRUCTION_PENDING_STATES if states is None else frozenset(states)
         if not selected:
             return ()
         rows = await self._session.scalars(
