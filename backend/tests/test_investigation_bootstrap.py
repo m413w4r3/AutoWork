@@ -42,6 +42,7 @@ from cti_app.application.investigation_bootstrap import (
     BootstrapIocOrigin,
     BootstrapPlanState,
     BootstrapReason,
+    BootstrapRouteStatus,
     BootstrapSnapshotV1,
     BootstrapSynthesisPinError,
     BootstrapVtCapabilities,
@@ -85,6 +86,7 @@ from cti_app.application.virustotal import (
     VirusTotalHttpError,
     VirusTotalObjectReport,
     VirusTotalQuotaExceededError,
+    VirusTotalRouteUnavailableError,
 )
 from cti_app.application.workspace_agent import WorkspaceBindingV1
 from cti_app.config import Settings
@@ -1586,3 +1588,329 @@ async def test_bootstrap_routes_refuse_operator_client_and_serve_human() -> None
         assert exported.json()["files"]
         unknown = await client.get(f"/api/investigations/{uuid4()}/bootstrap/inventory")
         assert unknown.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# M24.1 VT-FAKE: capability matrix with a fake provider only
+# ---------------------------------------------------------------------------
+
+
+async def _mixed_batch_harness() -> tuple[
+    _Harness, dict[str, bytes], tuple[str, ...], tuple[str, ...], tuple[str, ...]
+]:
+    """Five hashes (3 downloadable, 2 absent downloads), two IPs, two domains.
+
+    The fake port answers by value: exactly the acceptance-scenario shape
+    (``docs/m24/acceptance-scenario.md`` steps 03/05), no network.
+    """
+    available = {
+        hashlib.sha256(f"vt-fake-available-{index}".encode()).hexdigest(): (
+            f"vt-fake-available-{index}".encode()
+        )
+        for index in range(3)
+    }
+    unavailable = tuple(
+        hashlib.sha256(f"vt-fake-unavailable-{index}".encode()).hexdigest() for index in range(2)
+    )
+    ips = ("203.0.113.21", "198.51.100.22")
+    domains = ("mixed-one.invalid", "mixed-two.invalid")
+    specs = (
+        tuple(
+            _IocSpec("sha256", value, context=f"hash row {index}")
+            for index, value in enumerate((*available, *unavailable))
+        )
+        + tuple(
+            _IocSpec("ipv4", value, context=f"ip row {index}") for index, value in enumerate(ips)
+        )
+        + tuple(
+            _IocSpec("domain", value, context=f"domain row {index}")
+            for index, value in enumerate(domains)
+        )
+    )
+    harness = _harness(specs=specs)
+
+    async def file_report(file_hash: str) -> Any:
+        harness.vt.calls["file_report"] += 1
+        return _file_report(file_hash)
+
+    async def file_download(file_hash: str, *, sink: Any) -> None:
+        harness.vt.download_calls.append(file_hash)
+        payload = available.get(file_hash)
+        if payload is None:
+            # The two unavailable samples: the proxy download route answers 404.
+            raise VirusTotalHttpError("download route not found", status_code=404)
+        sink.write(payload)
+
+    harness.vt.file_report = file_report  # type: ignore[method-assign]
+    harness.vt.file_download = file_download  # type: ignore[method-assign]
+    # Every relationship page is non-exhaustive: the snapshot must expose the
+    # partial report (cursor + pagination_complete=false), not claim completion.
+    harness.vt.relationship_pages = [
+        _relationship_page(next_cursor="cursor-next", exhaustive=False) for _ in range(400)
+    ]
+    return harness, available, unavailable, ips, domains
+
+
+@pytest.mark.asyncio
+async def test_b11_five_hashes_three_available_two_unavailable_with_domains_and_ips() -> None:
+    harness, available, unavailable, ips, domains = await _mixed_batch_harness()
+    snapshot = await harness.run(idempotency_key="vt-fake-mixed-batch")
+
+    assert snapshot.plan_state is BootstrapPlanState.READY
+    assert snapshot.limits.stopped_reason is None
+    assert len(snapshot.iocs) == 5 + 2 + 2
+    by_value = {ioc.value: ioc for ioc in snapshot.iocs}
+
+    assert harness.vt.calls["file_report"] == 5
+    assert harness.vt.calls["object_report"] == 4
+    assert sorted(harness.vt.download_calls) == sorted((*available, *unavailable))
+
+    for value in available:
+        ioc = by_value[value]
+        report = next(item for item in ioc.operations if item.tool_name == "vt.file_report")
+        assert report.status is ToolInvocationStatus.SUCCEEDED
+        assert report.reason is BootstrapReason.AVAILABLE
+        download = next(item for item in ioc.operations if item.tool_name == "vt.download_sample")
+        assert download.status is ToolInvocationStatus.SUCCEEDED
+        assert download.reason is BootstrapReason.DOWNLOADED
+        assert ioc.download is not None
+        assert ioc.download.status == "downloaded"
+        assert ioc.download.sample_sha256 == value
+        assert ioc.download.hash_verified_quarantine is True
+        assert ioc.download.sample_id is not None
+        assert ioc.download.association_id is not None
+        assert (
+            harness.db.association_sample_ids.get(ioc.download.association_id)
+            == ioc.download.sample_id
+        )
+
+    for value in unavailable:
+        ioc = by_value[value]
+        report = next(item for item in ioc.operations if item.tool_name == "vt.file_report")
+        assert report.status is ToolInvocationStatus.SUCCEEDED
+        download = next(item for item in ioc.operations if item.tool_name == "vt.download_sample")
+        # The download route answers 404: the operation records a route failure
+        # (never a "file not found" claim) while the other seeds continue.
+        assert download.status is ToolInvocationStatus.FAILED
+        assert download.error_code == "virustotal_download_route_not_found"
+        assert download.reason is BootstrapReason.ROUTE_UNAVAILABLE
+        assert ioc.download is not None
+        assert ioc.download.status == "failed"
+        assert ioc.download.reason == "route_unavailable"
+        assert ioc.download.sample_id is None
+        assert all(sample.expected_hash != value for sample in harness.db.samples.values())
+        linked_hashes = {
+            association.sample_sha256
+            for association_id in harness.db.association_sample_ids
+            if (association := harness.db.associations.get(association_id)) is not None
+        }
+        assert value not in linked_hashes
+
+    for value in (*ips, *domains):
+        ioc = by_value[value]
+        report = next(item for item in ioc.operations if item.tool_name == "vt.object_report")
+        assert report.status is ToolInvocationStatus.SUCCEEDED
+        assert report.reason is BootstrapReason.AVAILABLE
+
+    relationships = [
+        item
+        for ioc in snapshot.iocs
+        for item in ioc.operations
+        if item.tool_name == "vt.relationships"
+    ]
+    assert len(relationships) == 5 * 4 + 2 * 4 + 2 * 5
+    assert all(item.status is ToolInvocationStatus.PARTIAL for item in relationships)
+    assert all(item.reason is BootstrapReason.PARTIAL for item in relationships)
+    assert all(item.next_cursor == "cursor-next" for item in relationships)
+    assert all(item.pagination_complete is False for item in relationships)
+
+    stopped = sum(
+        1
+        for ioc in snapshot.iocs
+        for item in ioc.operations
+        if item.reason is BootstrapReason.STOPPED
+    )
+    assert stopped == 0
+
+    exported = harness.bootstrap.snapshot_export(snapshot)
+    paths = {item.path for item in exported.files}
+    assert "vt/bootstrap-snapshot.json" in paths
+    assert "vt/manifest.json" in paths
+    for value in (*available, *unavailable):
+        assert f"vt/files/{value}.json" in paths
+    assert len([path for path in paths if path.startswith("vt/behaviours/")]) == 5
+    assert len([path for path in paths if path.startswith("vt/relationships/")]) == 9
+    assert len([path for path in paths if path.startswith("vt/ips/")]) == 2
+    assert len([path for path in paths if path.startswith("vt/domains/")]) == 2
+
+
+@pytest.mark.asyncio
+async def test_b12_download_route_404_is_route_unavailable_not_a_missing_file() -> None:
+    harness = _harness(
+        specs=(
+            _IocSpec("sha256", _DEFAULT_SEED, context="row 1"),
+            _IocSpec("ipv4", _IP, context="row 2"),
+        )
+    )
+    harness.vt.errors["file_download"] = VirusTotalHttpError(
+        "download route not found", status_code=404
+    )
+
+    snapshot = await harness.run(idempotency_key="download-route-404")
+
+    download = next(
+        item
+        for ioc in snapshot.iocs
+        for item in ioc.operations
+        if item.tool_name == "vt.download_sample"
+    )
+    assert download.status is ToolInvocationStatus.FAILED
+    assert download.error_code == "virustotal_download_route_not_found"
+    # A proxy route 404 is a route failure, never proof that the file is absent
+    # (the planned operation documents ``route_unavailable`` for this case).
+    assert download.reason is BootstrapReason.ROUTE_UNAVAILABLE
+    sample_ioc = next(ioc for ioc in snapshot.iocs if ioc.value == _DEFAULT_SEED)
+    assert sample_ioc.download is not None
+    assert sample_ioc.download.status == "failed"
+    assert sample_ioc.download.reason == "route_unavailable"
+    assert harness.db.samples == {}
+    assert harness.db.association_sample_ids == {}
+    # The batch continues: the next IOC is still collected.
+    assert harness.vt.calls["object_report"] == 1
+
+
+@pytest.mark.asyncio
+async def test_b12_download_provider_404_stays_not_found_and_is_distinguished() -> None:
+    harness = _harness()
+    provider_error = VirusTotalHttpError("file not found", status_code=404)
+    provider_error.response_origin = "provider"
+    harness.vt.errors["file_download"] = provider_error
+
+    snapshot = await harness.run(idempotency_key="download-provider-404")
+
+    download = next(
+        item
+        for ioc in snapshot.iocs
+        for item in ioc.operations
+        if item.tool_name == "vt.download_sample"
+    )
+    assert download.status is ToolInvocationStatus.FAILED
+    assert download.error_code == "virustotal_download_file_not_found"
+    assert download.reason is BootstrapReason.NOT_FOUND
+    assert snapshot.iocs[0].download is not None
+    assert snapshot.iocs[0].download.reason == "not_found"
+    assert harness.db.samples == {}
+
+
+@pytest.mark.asyncio
+async def test_b13_local_route_failure_on_a_read_is_needs_review_never_success() -> None:
+    harness = _harness()
+    harness.vt.errors["file_report"] = VirusTotalRouteUnavailableError("no route configured")
+
+    snapshot = await harness.run(idempotency_key="read-route-unavailable")
+
+    report = _snapshot_operations(snapshot)["vt.file_report"]
+    assert report.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert report.reason is BootstrapReason.NEEDS_REVIEW
+    # A failed read never becomes evidence: the download stays pending.
+    download = _snapshot_operations(snapshot)["vt.download_sample"]
+    assert download.status is ToolInvocationStatus.PENDING
+    assert download.reason is BootstrapReason.EVIDENCE_UNAVAILABLE
+    assert harness.vt.download_calls == []
+
+
+def test_b14_bootstrap_capabilities_from_settings_are_route_scoped() -> None:
+    from cti_app.workers.tasks import virustotal_capabilities_from_settings
+
+    defaults = Settings(_env_file=None)
+    assert BootstrapVtCapabilities.from_settings(defaults) == BootstrapVtCapabilities()
+    assert virustotal_capabilities_from_settings(defaults) == VirusTotalCapabilities()
+
+    # Flags without a configured proxy route are never capabilities.
+    flags_only = Settings(
+        _env_file=None,
+        virustotal_file_report_enabled=True,
+        virustotal_object_relationships_enabled=True,
+        virustotal_behaviour_reports_enabled=True,
+        virustotal_file_download_enabled=True,
+        virustotal_behaviour_pcap_enabled=True,
+    )
+    assert BootstrapVtCapabilities.from_settings(flags_only) == BootstrapVtCapabilities()
+    assert virustotal_capabilities_from_settings(flags_only) == VirusTotalCapabilities()
+
+    configured = Settings(
+        _env_file=None,
+        virustotal_proxy_url="http://vt-proxy.test:8080",
+        virustotal_file_report_enabled=True,
+        virustotal_object_relationships_enabled=True,
+        virustotal_behaviour_reports_enabled=True,
+        virustotal_file_download_enabled=True,
+        virustotal_behaviour_pcap_enabled=True,
+    )
+    bootstrap_caps = BootstrapVtCapabilities.from_settings(configured)
+    worker_caps = virustotal_capabilities_from_settings(configured)
+    assert bootstrap_caps.file_report is worker_caps.file_report is True
+    assert bootstrap_caps.relationships is worker_caps.file_relationships is True
+    assert bootstrap_caps.behaviour is worker_caps.behaviour_reports is True
+    assert bootstrap_caps.download is worker_caps.file_download is True
+    assert bootstrap_caps.pcap is worker_caps.behaviour_pcap is True
+    assert bootstrap_caps.pcap_route_configured is True
+
+    # Download requires the signed-CDN host allowlist in addition to the flag.
+    wrong_cdn = Settings(
+        _env_file=None,
+        virustotal_proxy_url="http://vt-proxy.test:8080",
+        virustotal_file_download_enabled=True,
+        virustotal_download_allowed_hosts="samples.example",
+    )
+    assert BootstrapVtCapabilities.from_settings(wrong_cdn).download is False
+    assert virustotal_capabilities_from_settings(wrong_cdn).file_download is False
+
+
+@pytest.mark.asyncio
+async def test_b14_planned_coverage_exposes_capability_and_route_limits() -> None:
+    harness = _harness(
+        capabilities=BootstrapVtCapabilities(
+            file_report=True, relationships=True, behaviour=True, download=True
+        )
+    )
+    plan = await harness.bootstrap.plan(harness.investigation.id)
+    download_operations = [
+        item for item in plan.operations if item.tool_name == "vt.download_sample"
+    ]
+    assert download_operations
+    assert all(item.route_status is BootstrapRouteStatus.UNVERIFIED for item in download_operations)
+    coverage = {(entry.kind, entry.target) for entry in plan.coverage}
+    assert (BootstrapCoverageKind.ROUTE_UNVERIFIED, "vt.file_download") in coverage
+    assert (BootstrapCoverageKind.CAPABILITY_ABSENT, "vt.behaviour_pcap") in coverage
+    assert plan.limits.operations_planned == len(plan.operations)
+
+    pcap_without_route = _harness(
+        capabilities=BootstrapVtCapabilities(
+            file_report=True, pcap=True, pcap_route_configured=False
+        ),
+        with_envelope=False,
+    )
+    pcap_plan = await pcap_without_route.bootstrap.plan(pcap_without_route.investigation.id)
+    assert (
+        BootstrapCoverageKind.ROUTE_UNAVAILABLE,
+        "vt.behaviour_pcap",
+    ) in {(entry.kind, entry.target) for entry in pcap_plan.coverage}
+
+    pcap_ready = _harness(
+        capabilities=BootstrapVtCapabilities(
+            file_report=True, pcap=True, pcap_route_configured=True
+        ),
+        with_envelope=False,
+    )
+    ready_plan = await pcap_ready.bootstrap.plan(pcap_ready.investigation.id)
+    assert (BootstrapCoverageKind.DEFERRED, "vt.behaviour_pcap") in {
+        (entry.kind, entry.target) for entry in ready_plan.coverage
+    }
+
+    no_capabilities = _harness(capabilities=BootstrapVtCapabilities(), with_envelope=False)
+    empty_plan = await no_capabilities.bootstrap.plan(no_capabilities.investigation.id)
+    assert (BootstrapCoverageKind.CAPABILITY_ABSENT, "vt") in {
+        (entry.kind, entry.target) for entry in empty_plan.coverage
+    }
+    assert empty_plan.operations == ()

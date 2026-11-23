@@ -25,9 +25,11 @@ from cti_app.application.identity import Identity, IdentityScope, LocalIdentityP
 from cti_app.application.investigation_bootstrap import (
     BootstrapPlanState,
     BootstrapReason,
+    BootstrapRouteStatus,
 )
 from cti_app.application.investigation_bootstrap_envelope import (
     PROPOSAL_SCHEMA_VERSION,
+    BootstrapBudgetLimitSource,
     BootstrapEnvelopeApprovalV1,
     BootstrapEnvelopeProposalStaleError,
     BootstrapEnvelopeProposalV1,
@@ -413,6 +415,33 @@ async def test_b09_revocation_mid_batch_stops_without_resumption() -> None:
 # ---------------------------------------------------------------------------
 # Bounds and separated dimensions
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_settings_caps_and_download_route_are_visible_in_the_proposal() -> None:
+    harness = _harness(with_envelope=False)
+    settings = _settings(
+        investigation_max_vt_read_units=7,
+        investigation_max_hits_acquired=2,
+        virustotal_download_max_bytes=4321,
+    )
+    proposal = await _service(harness, settings).propose_for_bootstrap(harness.investigation.id)
+
+    # The configuration ceilings are carried in the human-visible proposal.
+    assert proposal.costs.caps.vt_units == 7
+    assert proposal.costs.caps.downloads == 2
+    assert proposal.costs.caps.per_sample_bytes == 4321
+    limits = {item.dimension: item for item in proposal.costs.limits}
+    assert limits[BudgetDimension.VT_UNITS].limit == 7
+    # One cited sample bounds the effective download budget; the settings cap
+    # stays visible separately in ``costs.caps`` and is never exceeded.
+    assert limits[BudgetDimension.DOWNLOADS].limit == 1
+    assert limits[BudgetDimension.DOWNLOADS].source is BootstrapBudgetLimitSource.INVENTORY
+
+    # The download route stays explicitly unverified: the proposal promises no
+    # successful acquisition and documents the runtime route failure vocabulary.
+    assert proposal.sample_acquisition.route_status is BootstrapRouteStatus.UNVERIFIED
+    assert any("route_unavailable" in item for item in proposal.sample_acquisition.limitations)
 
 
 @pytest.mark.asyncio
