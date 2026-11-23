@@ -117,6 +117,15 @@ _TOOL_INVOCATION_ATTRIBUTION_CHECKS = frozenset(
 )
 _TOOL_INVOCATION_AGENT_SESSION_COLUMNS = frozenset({"agent_session_id"})
 _TOOL_INVOCATION_AGENT_SESSION_CHECKS = frozenset({"ck_tool_invocations_agent_session_pair"})
+# 0028 adds the human request's task context; the frozen 0001 shape predates
+# all three additive revisions and has no investigation_tasks table at all.
+_TOOL_INVOCATION_CONTEXT_COLUMN = "context_task_id"
+_TOOL_INVOCATION_CONTEXT_CHECKS = frozenset({"ck_tool_invocations_context_task_human"})
+_TOOL_INVOCATION_BASELINE_ADDITIONS = (
+    _TOOL_INVOCATION_ATTRIBUTION_COLUMNS
+    | _TOOL_INVOCATION_AGENT_SESSION_COLUMNS
+    | {_TOOL_INVOCATION_CONTEXT_COLUMN}
+)
 _PROSE_AUTHORITY_COLUMN = "prose_authority"
 _PROSE_AUTHORITY_CHECK = "ck_analyst_investigation_prose_authority"
 _BASELINE_DECISION_TYPE_VALUES = (
@@ -302,38 +311,46 @@ def _metadata_for_frozen_baseline() -> MetaData:
                 table._columns.remove(table.c[_PROSE_AUTHORITY_COLUMN])
         if table.name == "tool_invocations":
             # 0021 adds execution attribution; the frozen 0001 shape predates it.
-            # 0023 adds the agent-session attribution pair for the same reason.
+            # 0023 adds the agent-session attribution pair for the same reason,
+            # and 0028 the human request's task context.
             for constraint in tuple(table.constraints):
                 if (
                     constraint.name
-                    in _TOOL_INVOCATION_ATTRIBUTION_CHECKS | _TOOL_INVOCATION_AGENT_SESSION_CHECKS
+                    in _TOOL_INVOCATION_ATTRIBUTION_CHECKS
+                    | _TOOL_INVOCATION_AGENT_SESSION_CHECKS
+                    | _TOOL_INVOCATION_CONTEXT_CHECKS
                     or any(
-                        column.name
-                        in _TOOL_INVOCATION_ATTRIBUTION_COLUMNS
-                        | _TOOL_INVOCATION_AGENT_SESSION_COLUMNS
+                        column.name in _TOOL_INVOCATION_BASELINE_ADDITIONS
                         for column in getattr(constraint, "columns", ())
                     )
                 ):
                     table.constraints.discard(constraint)
             for foreign_key in tuple(table.foreign_keys):
+                # A composite FK contributes one ForeignKey per column: the
+                # element on ``investigation_id`` outlives a discard keyed only
+                # on its own parent, so drop every element of a constraint that
+                # touches an additive column.
+                constraint_columns = (
+                    tuple(foreign_key.constraint.columns)
+                    if foreign_key.constraint is not None
+                    else ()
+                )
                 if (
                     foreign_key.parent is not None
-                    and foreign_key.parent.name
-                    in _TOOL_INVOCATION_ATTRIBUTION_COLUMNS | _TOOL_INVOCATION_AGENT_SESSION_COLUMNS
+                    and foreign_key.parent.name in _TOOL_INVOCATION_BASELINE_ADDITIONS
+                ) or any(
+                    column.name in _TOOL_INVOCATION_BASELINE_ADDITIONS
+                    for column in constraint_columns
                 ):
                     table.foreign_keys.discard(foreign_key)
                     if foreign_key.constraint is not None:
                         table.constraints.discard(foreign_key.constraint)
             for index in tuple(table.indexes):
                 if any(
-                    column.name
-                    in _TOOL_INVOCATION_ATTRIBUTION_COLUMNS | _TOOL_INVOCATION_AGENT_SESSION_COLUMNS
-                    for column in index.columns
+                    column.name in _TOOL_INVOCATION_BASELINE_ADDITIONS for column in index.columns
                 ):
                     table.indexes.discard(index)
-            for column_name in (
-                _TOOL_INVOCATION_ATTRIBUTION_COLUMNS | _TOOL_INVOCATION_AGENT_SESSION_COLUMNS
-            ):
+            for column_name in _TOOL_INVOCATION_BASELINE_ADDITIONS:
                 if column_name in table.c:
                     table._columns.remove(table.c[column_name])
         if table.name == "analyst_decisions":

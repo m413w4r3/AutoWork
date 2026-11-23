@@ -1637,6 +1637,7 @@ class InvestigationService:
         actor_id: str | None = None,
         task_id: UUID | None = None,
         agent_session_id: UUID | None = None,
+        context_task_id: UUID | None = None,
         actor_kind: ToolInvocationActorKind | None = None,
         check_stop_before_dispatch: bool = True,
     ) -> tuple[ToolInvocation, ToolResult, tuple[UUID, ...], bool]:
@@ -1647,6 +1648,8 @@ class InvestigationService:
         cumulative pair (D2/M9).  ``actor_id`` is written on the invocation only
         when an actor kind is supplied, so legacy operator callers that pass an
         actor for the execution context keep an unattributed journal row.
+        ``context_task_id`` is the human request's task context (F4-D B1); it is
+        propagated verbatim, never inferred from ``arguments``.
         """
         registered = self._registry.get(tool_name, schema_version)
         definition = registered[0] if registered else None
@@ -1792,6 +1795,7 @@ class InvestigationService:
             reserved_budget=requested_cost,
             task_id=task_id,
             agent_session_id=agent_session_id,
+            context_task_id=context_task_id,
             actor_kind=actor_kind,
             actor_id=actor_id if actor_kind is not None else None,
         )

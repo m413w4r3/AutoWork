@@ -497,6 +497,7 @@ class ToolInvocation:
     response_refs: tuple[UUID, ...] = ()
     task_id: UUID | None = None
     agent_session_id: UUID | None = None
+    context_task_id: UUID | None = None
     actor_kind: ToolInvocationActorKind | None = None
     actor_id: str | None = None
     id: UUID = field(default_factory=uuid4)
@@ -540,6 +541,20 @@ class ToolInvocation:
             not isinstance(self.actor_id, str) or not self.actor_id.strip()
         ):
             raise ValueError("actor_id must not be empty")
+        if self.context_task_id is not None:
+            if not isinstance(self.context_task_id, UUID):
+                raise TypeError("context_task_id must be a UUID or None")
+            # The task context is the *request* context of a human ask.  An
+            # operator execution keeps ``task_id``/``agent_session_id`` as its
+            # sole attribution, so an agentic invocation never carries a
+            # context task (not even an equal one): the two roles stay
+            # distinguishable without a second interpretation.
+            if self.actor_kind is not ToolInvocationActorKind.HUMAN:
+                raise ValueError("context_task_id requires a human requester")
+            if self.task_id is not None or self.agent_session_id is not None:
+                raise ValueError(
+                    "context_task_id is request context, not operator execution attribution"
+                )
         if self.version < 1:
             raise ValueError("version must be >= 1")
         _aware(self.created_at, "created_at")

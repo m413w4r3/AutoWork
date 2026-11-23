@@ -712,6 +712,19 @@ async def _alembic_version(database_url: str) -> str | None:
         await engine.dispose()
 
 
+async def _stamp_revision(database_url: str, revision: str) -> None:
+    """Move the Alembic marker without touching the schema (ADR-0007 reconciliation)."""
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("UPDATE alembic_version SET version_num = :revision"),
+                {"revision": revision},
+            )
+    finally:
+        await engine.dispose()
+
+
 async def _alembic_version_column_length(database_url: str) -> int | None:
     engine = create_async_engine(database_url)
     try:
@@ -1260,7 +1273,7 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     command.upgrade(config, "head")
     command.current(config)
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert _head_revision() == "0027_instruction_delivery"
+    assert _head_revision() == "0028_task_context_consultations"
     assert asyncio.run(_alembic_version_column_length(temporary_postgres_url)) == 64
 
     collection_attempt_columns = asyncio.run(
@@ -1628,7 +1641,7 @@ def test_frozen_collection_attempt_baseline_precedes_acquisition_additions(
 
     command.upgrade(config, "head")
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert _head_revision() == "0027_instruction_delivery"
+    assert _head_revision() == "0028_task_context_consultations"
     final_schema = asyncio.run(_database_snapshot(temporary_postgres_url))["collection_attempts"]
     table = Base.metadata.tables["collection_attempts"]
     assert final_schema["columns"] == _expected_columns(table)
@@ -1945,6 +1958,98 @@ def test_bridge_generation_slot_downgrade_allows_pristine_but_refuses_used_slot(
             await engine.dispose()
 
     assert asyncio.run(_lease_token()) == 1
+
+
+def test_task_context_migration_adds_and_removes_only_its_objects(
+    temporary_postgres_url: str,
+) -> None:
+    """0028 is additive, reversible while unused, and prevalidates its shape."""
+    config = _alembic_config(temporary_postgres_url)
+    command.upgrade(config, "head")
+
+    snapshot = asyncio.run(_database_snapshot(temporary_postgres_url))["tool_invocations"]
+    assert snapshot["columns"]["context_task_id"] == ("uuid", True, None)
+    assert "ck_tool_invocations_context_task_human" in snapshot["checks"]
+    assert (
+        ("context_task_id", "investigation_id"),
+        "investigation_tasks",
+        ("id", "investigation_id"),
+        "RESTRICT",
+    ) in snapshot["fks"]
+    assert (
+        "ix_tool_invocations_context_task",
+        ("investigation_id", "context_task_id"),
+        False,
+        False,
+    ) in snapshot["indexes"]
+
+    command.downgrade(config, "0027_instruction_delivery")
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0027_instruction_delivery"
+    without_context = asyncio.run(_database_snapshot(temporary_postgres_url))["tool_invocations"]
+    assert "context_task_id" not in without_context["columns"]
+    assert "ck_tool_invocations_context_task_human" not in without_context["checks"]
+    assert all(
+        foreign_key[0] != ("context_task_id", "investigation_id")
+        for foreign_key in without_context["fks"]
+    )
+    assert all(
+        index[0] != "ix_tool_invocations_context_task" for index in without_context["indexes"]
+    )
+    # The cumulative 0023 attribution pair is not part of this revision's DDL.
+    assert "ck_tool_invocations_agent_session_pair" in without_context["checks"]
+
+    command.upgrade(config, "head")
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
+    restored = asyncio.run(_database_snapshot(temporary_postgres_url))["tool_invocations"]
+    assert "context_task_id" in restored["columns"]
+    assert "ck_tool_invocations_context_task_human" in restored["checks"]
+
+
+def test_task_context_preflight_accepts_an_already_conforming_shape(
+    temporary_postgres_url: str,
+) -> None:
+    """A later-stamped installation with the exact 0028 shape upgrades without DDL."""
+    config = _alembic_config(temporary_postgres_url)
+    command.upgrade(config, "head")
+    asyncio.run(_stamp_revision(temporary_postgres_url, "0027_instruction_delivery"))
+    before = asyncio.run(_database_snapshot(temporary_postgres_url))
+
+    command.upgrade(config, "head")
+
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
+    assert asyncio.run(_database_snapshot(temporary_postgres_url)) == before
+
+
+def test_task_context_preflight_rejects_a_partial_shape_before_ddl(
+    temporary_postgres_url: str,
+) -> None:
+    """A partial 0028 shape fails before any DDL and leaves the marker unchanged."""
+    config = _alembic_config(temporary_postgres_url)
+    command.upgrade(config, "head")
+
+    async def _drop_context_check() -> None:
+        engine = create_async_engine(temporary_postgres_url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "ALTER TABLE tool_invocations "
+                        "DROP CONSTRAINT ck_tool_invocations_context_task_human"
+                    )
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_drop_context_check())
+    asyncio.run(_stamp_revision(temporary_postgres_url, "0027_instruction_delivery"))
+    before = asyncio.run(_database_snapshot(temporary_postgres_url))
+
+    with pytest.raises(RuntimeError, match="task context preflight rejected") as exc_info:
+        command.upgrade(config, "head")
+
+    assert "ck_tool_invocations_context_task_human" in str(exc_info.value)
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0027_instruction_delivery"
+    assert asyncio.run(_database_snapshot(temporary_postgres_url)) == before
 
 
 @pytest.mark.parametrize(

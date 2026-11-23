@@ -1144,6 +1144,7 @@ class OperatorToolInvocationService:
         requester_actor_kind: ToolInvocationActorKind | None = None,
         task_id: UUID | None = None,
         agent_session_id: UUID | None = None,
+        context_task_id: UUID | None = None,
         idempotency_scope: str | None = None,
     ) -> OperatorToolInvocationResult:
         if not 1 <= len(idempotency_key) <= 255:
@@ -1156,6 +1157,16 @@ class OperatorToolInvocationService:
             raise OperatorToolInvocationError("requester_actor_id_required", 422)
         if (task_id is None) != (agent_session_id is None):
             # ADR-0011 D2/E4: the agentic attribution is a cumulative pair.
+            raise OperatorToolInvocationError("invocation_attribution_invalid", 422)
+        if context_task_id is not None and (
+            not isinstance(context_task_id, UUID)
+            or requester_actor_kind is not ToolInvocationActorKind.HUMAN
+            or task_id is not None
+            or agent_session_id is not None
+        ):
+            # F4-D B1: a task context belongs to a human request only; an
+            # operator execution keeps task_id/agent_session_id as its sole
+            # attribution.  The caller supplies it explicitly (never inferred).
             raise OperatorToolInvocationError("invocation_attribution_invalid", 422)
         if idempotency_scope is not None and (
             not isinstance(idempotency_scope, str) or not idempotency_scope.strip()
@@ -1217,6 +1228,7 @@ class OperatorToolInvocationService:
                     requester_actor_kind=requester_actor_kind,
                     task_id=task_id,
                     agent_session_id=agent_session_id,
+                    context_task_id=context_task_id,
                 )
 
     def _canonical_schema_version(self, tool_name: str, schema_version: str) -> str:
@@ -1352,6 +1364,7 @@ class OperatorToolInvocationService:
         requester_actor_kind: ToolInvocationActorKind | None,
         task_id: UUID | None = None,
         agent_session_id: UUID | None = None,
+        context_task_id: UUID | None = None,
     ) -> OperatorToolInvocationResult:
         state = await self._states.get(self._investigation_id)
         if state is None:
@@ -1805,6 +1818,7 @@ class OperatorToolInvocationService:
                 actor_kind=requester_actor_kind,
                 task_id=task_id,
                 agent_session_id=agent_session_id,
+                context_task_id=context_task_id,
                 check_stop_before_dispatch=False,
             )
             if advisor_disclosure_denied:
