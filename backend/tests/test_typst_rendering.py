@@ -3177,6 +3177,296 @@ def test_real_typst_note_article_element_cross_reference_without_duplication(
     assert compact_text.count("-enc") == 1
 
 
+def _draft_preview_opinion(
+    base: PublicationDocumentV5,
+    *,
+    investigation_id: UUID,
+    notes: tuple[AnalystObservationV1, ...] = (),
+) -> AnalystOpinionV1:
+    return AnalystOpinionV1(
+        id=UUID(int=8850),
+        investigation_id=investigation_id,
+        synthesis_artifact_id=UUID(int=8851),
+        synthesis_sha256="1" * 64,
+        base_publication_artifact_id=UUID(int=8852),
+        base_publication_sha256=publication_document_v5_sha256(base),
+        blocks=opinion_blocks_with_observations(
+            (
+                OpinionBlock(
+                    OpinionBlockType.KEY_FINDINGS,
+                    "Constat de démonstration.",
+                    qualification=OpinionClaimQualification.HYPOTHESIS,
+                ),
+            ),
+            notes,
+        ),
+        author_id="fixture-analyst",
+        status=AnalystOpinionStatus.DRAFT,
+    )
+
+
+def test_draft_preview_v9_renders_exactly_like_the_publication() -> None:
+    """R6-F1: a preview pinned on a V9 base keeps the resolved placements and notes.
+
+    The preview projects the exact V5 body of the pinned V9 envelope, so its
+    lead paragraph, after-paragraph element and anchored note blocks must equal
+    the ones the augmented publication renders, instead of refusing the
+    placement as ``editorial_anchor_stale``.
+    """
+    table = _after_paragraph_table()
+    v9, base, _extraction = _note_block_v9(tables=(table,))
+    investigation_id = uuid4()
+    published_table = base.document.tables[0]
+    evidence = EvidenceObservation(
+        investigation_id=investigation_id,
+        kind=ObservationEvidenceKind.OTHER,
+        blob_id=uuid4(),
+        sha256="e" * 64,
+        source="vt",
+        source_version="fixture.v1",
+        observed_at=datetime.now(UTC),
+        object_type="file",
+        object_id="preview-sample.bin",
+    )
+    (element_fact,) = note_article_element_facts(v9)
+    note = AnalystObservationV1(
+        id=UUID(int=8853),
+        anchor=_NOTE_BLOCK_ANCHOR,
+        text="NOTE-PREVIEW-V9",
+        state=AnalystObservationState.UNRESOLVED,
+        relation=AnalystObservationRelation.UNRESOLVED,
+        content_blocks=(
+            ArticleElementNoteBlockV1(
+                kind=NoteArticleElementKind.TABLE,
+                element_key=published_table.key,
+                element_sha256=element_fact.element_sha256,
+                anchor=_NOTE_BLOCK_ANCHOR,
+            ),
+            IocTableNoteBlockV1(
+                observation_ids=(evidence.id,),
+                title=note_ioc_table_title(1),
+            ),
+        ),
+    )
+    opinion = _draft_preview_opinion(base, investigation_id=investigation_id, notes=(note,))
+    preview = TypstDraftPreviewDocument(
+        base_publication=base,
+        analyst_opinion=opinion,
+        publication_v9=v9,
+    )
+    context = NoteBlockRenderContext(
+        observations=(evidence,),
+        element_facts=note_article_element_facts(v9),
+    )
+
+    model = project_publication_to_typst_model(preview, note_block_context=context)
+    synthesis = next(item for item in model.content_sections if item["type"] == "synthesis")
+    blocks = synthesis["blocks"]
+    assert [block.get("type") for block in blocks] == [
+        "paragraph",
+        "table",
+        "analyst_observation",
+    ]
+    assert blocks[1]["key"] == published_table.key
+    assert blocks[2]["text"] == "NOTE-PREVIEW-V9"
+    assert [item["block_type"] for item in blocks[2]["blocks"]] == [
+        "article_element",
+        "ioc_table",
+    ]
+
+    # The exact same body blocks as the augmented publication for this V9 base.
+    published = _note_v9_with_opinion(
+        v9,
+        notes=(note,),
+        observations=(evidence,),
+        investigation_id=investigation_id,
+    )
+    publication_model = project_publication_to_typst_model(
+        published,
+        note_block_context=NoteBlockRenderContext(
+            observations=(evidence,),
+            element_facts=note_article_element_facts(published),
+        ),
+    )
+    publication_synthesis = next(
+        item for item in publication_model.content_sections if item["type"] == "synthesis"
+    )
+    assert publication_synthesis["blocks"] == blocks
+
+
+def test_draft_preview_v9_real_typst_pdf_places_element_and_note(tmp_path: Path) -> None:
+    """R6-F1: the real preview PDF carries the element once, then its anchored note."""
+    binary = os.environ.get("TYPST_BINARY") or str(
+        Path.home() / ".local" / "share" / "autowork-tools" / "typst"
+    )
+    if shutil.which(binary) is None and not Path(binary).is_file():
+        pytest.skip("pinned Typst 0.15.1 is unavailable")
+    version = subprocess.run(
+        (binary, "--version"), capture_output=True, check=True, text=True, timeout=10
+    ).stdout.strip()
+    assert version.startswith("typst 0.15.1"), version
+
+    table = _after_paragraph_table()
+    v9, base, _extraction = _note_block_v9(tables=(table,))
+    investigation_id = uuid4()
+    published_table = base.document.tables[0]
+    evidence = EvidenceObservation(
+        investigation_id=investigation_id,
+        kind=ObservationEvidenceKind.OTHER,
+        blob_id=uuid4(),
+        sha256="e" * 64,
+        source="vt",
+        source_version="fixture.v1",
+        observed_at=datetime.now(UTC),
+        object_type="file",
+        object_id="preview-sample.bin",
+    )
+    (element_fact,) = note_article_element_facts(v9)
+    note = AnalystObservationV1(
+        id=UUID(int=8854),
+        anchor=_NOTE_BLOCK_ANCHOR,
+        text="NOTE-PREVIEW-V9",
+        state=AnalystObservationState.UNRESOLVED,
+        relation=AnalystObservationRelation.UNRESOLVED,
+        content_blocks=(
+            ArticleElementNoteBlockV1(
+                kind=NoteArticleElementKind.TABLE,
+                element_key=published_table.key,
+                element_sha256=element_fact.element_sha256,
+                anchor=_NOTE_BLOCK_ANCHOR,
+            ),
+            IocTableNoteBlockV1(
+                observation_ids=(evidence.id,),
+                title=note_ioc_table_title(1),
+            ),
+        ),
+    )
+    opinion = _draft_preview_opinion(base, investigation_id=investigation_id, notes=(note,))
+    preview = TypstDraftPreviewDocument(
+        base_publication=base,
+        analyst_opinion=opinion,
+        publication_v9=v9,
+    )
+    bundle = load_template_bundle(Path(__file__).resolve().parents[2] / "chpTypst")
+    rendered = TypstRenderer().render(
+        preview,
+        bundle,
+        document_label="Aperçu d'avis V9 — placement résolu",
+        note_block_context=NoteBlockRenderContext(
+            observations=(evidence,),
+            element_facts=note_article_element_facts(v9),
+        ),
+    )
+    workspace = tmp_path / "workspace"
+    for template_file in bundle.files:
+        destination = workspace / template_file.relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(template_file.content)
+    render_data_path = workspace / rendered.render_data_relative_path
+    render_data_path.parent.mkdir(parents=True, exist_ok=True)
+    render_data_path.write_bytes(rendered.render_data_bytes)
+
+    repository_root = Path(__file__).resolve().parents[2]
+    font_root = Path(os.environ.get("FONT_BUNDLE_ROOT", str(repository_root / "chpTypst")))
+    font_snapshot = load_font_bundle_snapshot(
+        font_root, repository_root / "infra" / "typst-fonts.lock"
+    )
+    font_paths = materialize_font_bundle(font_snapshot, tmp_path / "fonts")
+    compiled = asyncio.run(
+        TypstSubprocessCompiler(binary=binary).compile(
+            TypstCompileRequest(
+                workspace_root=workspace,
+                entrypoint_relative_path=rendered.entrypoint_relative_path,
+                font_paths=font_paths,
+            )
+        )
+    )
+
+    pdf = PdfReader(io.BytesIO(compiled.content), strict=True)
+    assert pdf.pages
+    compact_text = "".join("".join((page.extract_text() or "").split()) for page in pdf.pages)
+    lead_text = "".join(base.document.lead[0].text.split())
+    table_title = "".join(published_table.title.split())
+    note_text = "NOTE-PREVIEW-V9"
+    cross_reference = "".join(f"Tableau — {published_table.title}".split())
+    assert note_text in compact_text
+    assert cross_reference in compact_text
+    assert compact_text.index(lead_text) < compact_text.index(table_title)
+    assert compact_text.index(table_title) < compact_text.index(note_text)
+    # The element is rendered once at its placement; the note only references it.
+    assert compact_text.count("-enc") == 1
+
+
+def test_draft_preview_v9_refuses_stale_envelope_anchor_and_element_hash() -> None:
+    """R6-F1: the preview keeps the fail-closed refusals for stale canonical state."""
+    table = _after_paragraph_table()
+    v9, base, _extraction = _note_block_v9(tables=(table,))
+    other_v9, _other_base, _other_extraction = _note_block_v9()
+    investigation_id = uuid4()
+    note = AnalystObservationV1(
+        id=UUID(int=8855),
+        anchor=_NOTE_BLOCK_ANCHOR,
+        text="NOTE-PREVIEW-STALE",
+        state=AnalystObservationState.UNRESOLVED,
+        relation=AnalystObservationRelation.UNRESOLVED,
+    )
+    opinion = _draft_preview_opinion(base, investigation_id=investigation_id, notes=(note,))
+
+    # An envelope wrapping another V5 body must never supply its placements.
+    with pytest.raises(ValueError, match="does not wrap the projected V5 body"):
+        TypstDraftPreviewDocument(
+            base_publication=base,
+            analyst_opinion=opinion,
+            publication_v9=other_v9,
+        )
+
+    stale_anchor_opinion = _draft_preview_opinion(
+        base,
+        investigation_id=investigation_id,
+        notes=(replace(note, anchor="lead:9999"),),
+    )
+    with pytest.raises(ValueError, match="anchor is stale or unsupported"):
+        TypstDraftPreviewDocument(
+            base_publication=base,
+            analyst_opinion=stale_anchor_opinion,
+            publication_v9=v9,
+        )
+
+    published_table = base.document.tables[0]
+    stale_hash_note = AnalystObservationV1(
+        id=UUID(int=8856),
+        anchor=_NOTE_BLOCK_ANCHOR,
+        text="NOTE-PREVIEW-STALE-HASH",
+        state=AnalystObservationState.UNRESOLVED,
+        relation=AnalystObservationRelation.UNRESOLVED,
+        content_blocks=(
+            ArticleElementNoteBlockV1(
+                kind=NoteArticleElementKind.TABLE,
+                element_key=published_table.key,
+                element_sha256="0" * 64,
+                anchor=_NOTE_BLOCK_ANCHOR,
+            ),
+        ),
+    )
+    stale_hash_preview = TypstDraftPreviewDocument(
+        base_publication=base,
+        analyst_opinion=_draft_preview_opinion(
+            base,
+            investigation_id=investigation_id,
+            notes=(stale_hash_note,),
+        ),
+        publication_v9=v9,
+    )
+    with pytest.raises(NoteContentBlockRenderError) as failure:
+        project_publication_to_typst_model(
+            stale_hash_preview,
+            note_block_context=NoteBlockRenderContext(
+                element_facts=note_article_element_facts(v9),
+            ),
+        )
+    assert failure.value.code == "note_block_ref_stale"
+
+
 def test_note_protocol_figure_references_the_opinion_annex() -> None:
     """B5b: protocol figures stay in the opinion annex; the note cross-references one."""
     protocol_figures = tuple(
