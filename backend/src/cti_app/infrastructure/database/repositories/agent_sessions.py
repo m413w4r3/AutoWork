@@ -24,9 +24,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from cti_app.application.investigation_persistence import VersionConflictError
 from cti_app.domain.agentic_operator import (
     ACTIVE_AGENT_SESSION_STATES,
+    INSTRUCTION_PENDING_STATES,
     AgentSessionInstructionV1,
     AgentSessionState,
     AgentSessionV1,
+    InstructionDeliveryMode,
     InstructionState,
     OperatorAdapterKind,
     SessionTransitionError,
@@ -153,9 +155,49 @@ def _instruction_from_row(row: AgentSessionInstructionRow) -> AgentSessionInstru
         queued_at=row.queued_at,
         delivered_at=row.delivered_at,
         acknowledged_at=row.acknowledged_at,
+        delivery_attempts=row.delivery_attempts,
+        delivery_token=row.delivery_token,
+        delivery_mode=(
+            InstructionDeliveryMode(row.delivery_mode) if row.delivery_mode is not None else None
+        ),
+        delivery_sha256=row.delivery_sha256,
+        delivery_note_diffs=(
+            tuple(row.delivery_note_diffs) if row.delivery_note_diffs is not None else None
+        ),
+        delivery_attempted_at=row.delivery_attempted_at,
+        delivery_unknown_at=row.delivery_unknown_at,
+        last_delivery_error=row.last_delivery_error,
+        cancelled_at=row.cancelled_at,
+        cancel_reason=row.cancel_reason,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
+
+
+def _instruction_delivery_values(instruction: AgentSessionInstructionV1) -> dict[str, Any]:
+    """Columns a delivery transition may change; identity and body stay frozen."""
+    return {
+        "state": instruction.state.value,
+        "delivered_at": instruction.delivered_at,
+        "acknowledged_at": instruction.acknowledged_at,
+        "delivery_attempts": instruction.delivery_attempts,
+        "delivery_token": instruction.delivery_token,
+        "delivery_mode": (
+            instruction.delivery_mode.value if instruction.delivery_mode is not None else None
+        ),
+        "delivery_sha256": instruction.delivery_sha256,
+        "delivery_note_diffs": (
+            thaw_json(instruction.delivery_note_diffs)
+            if instruction.delivery_note_diffs is not None
+            else None
+        ),
+        "delivery_attempted_at": instruction.delivery_attempted_at,
+        "delivery_unknown_at": instruction.delivery_unknown_at,
+        "last_delivery_error": instruction.last_delivery_error,
+        "cancelled_at": instruction.cancelled_at,
+        "cancel_reason": instruction.cancel_reason,
+        "updated_at": instruction.updated_at,
+    }
 
 
 def _instruction_values(instruction: AgentSessionInstructionV1) -> dict[str, Any]:
@@ -167,25 +209,11 @@ def _instruction_values(instruction: AgentSessionInstructionV1) -> dict[str, Any
         "idempotency_key": instruction.idempotency_key,
         "body": instruction.text,
         "body_sha256": instruction.text_sha256,
-        "state": instruction.state.value,
         "created_by_actor_kind": instruction.created_by_kind,
         "created_by_actor_id": instruction.created_by_id,
         "queued_at": instruction.queued_at,
-        "delivered_at": instruction.delivered_at,
-        "acknowledged_at": instruction.acknowledged_at,
         "created_at": instruction.created_at,
-        "updated_at": instruction.updated_at,
-    }
-
-
-def _instruction_mutable_values(
-    instruction: AgentSessionInstructionV1,
-) -> dict[str, Any]:
-    return {
-        "state": instruction.state.value,
-        "delivered_at": instruction.delivered_at,
-        "acknowledged_at": instruction.acknowledged_at,
-        "updated_at": instruction.updated_at,
+        **_instruction_delivery_values(instruction),
     }
 
 
@@ -429,18 +457,119 @@ class SqlAlchemyAgentSessionRepository:
         *,
         expected_state: InstructionState,
     ) -> AgentSessionInstructionV1 | None:
+        """Legacy state CAS (``None`` on a lost race); ID-2 uses the delivery CAS."""
         result = await self._session.execute(
             update(AgentSessionInstructionRow)
             .where(
                 AgentSessionInstructionRow.id == instruction.id,
                 AgentSessionInstructionRow.state == expected_state.value,
             )
-            .values(**_instruction_mutable_values(instruction))
+            .values(**_instruction_delivery_values(instruction))
         )
         if int(getattr(result, "rowcount", 0) or 0) != 1:
             return None
         await self._session.flush()
         return instruction
+
+    async def get_instruction_by_token(
+        self,
+        instruction_id: UUID,
+        delivery_token: UUID,
+        *,
+        state: InstructionState | None = None,
+    ) -> AgentSessionInstructionV1 | None:
+        """Reload one attempt by id + token (phase C, F3-D §3.3)."""
+        statement = select(AgentSessionInstructionRow).where(
+            AgentSessionInstructionRow.id == instruction_id,
+            AgentSessionInstructionRow.delivery_token == delivery_token,
+        )
+        if state is not None:
+            statement = statement.where(AgentSessionInstructionRow.state == state.value)
+        row = await self._session.scalar(statement)
+        return _instruction_from_row(row) if row is not None else None
+
+    async def list_pending_instructions(
+        self, *, limit: int
+    ) -> tuple[AgentSessionInstructionV1, ...]:
+        """Drain candidates (``queued|delivering|delivery_unknown``) in queue order.
+
+        Matches the partial index ``ix_agent_session_instructions_pending``
+        created by migration 0027, so the backend loop never scans history.
+        """
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        rows = await self._session.scalars(
+            select(AgentSessionInstructionRow)
+            .where(
+                AgentSessionInstructionRow.state.in_(
+                    tuple(state.value for state in INSTRUCTION_PENDING_STATES)
+                )
+            )
+            .order_by(
+                AgentSessionInstructionRow.queued_at,
+                AgentSessionInstructionRow.id,
+            )
+            .limit(limit)
+        )
+        return tuple(_instruction_from_row(row) for row in rows)
+
+    async def update_instruction_delivery(
+        self,
+        instruction: AgentSessionInstructionV1,
+        *,
+        expected_state: InstructionState,
+        expected_delivery_token: UUID | None,
+    ) -> AgentSessionInstructionV1:
+        """CAS one delivery transition on (id, state, token).
+
+        The token is part of the expectation so two drainers, or a drainer and
+        an acknowledgement, can never overwrite each other's attempt.  A lost
+        race raises the existing version conflict instead of returning ``None``.
+        """
+        result = await self._session.execute(
+            update(AgentSessionInstructionRow)
+            .where(
+                AgentSessionInstructionRow.id == instruction.id,
+                AgentSessionInstructionRow.state == expected_state.value,
+                AgentSessionInstructionRow.delivery_token.is_not_distinct_from(
+                    expected_delivery_token
+                ),
+            )
+            .values(**_instruction_delivery_values(instruction))
+        )
+        if int(getattr(result, "rowcount", 0) or 0) != 1:
+            raise VersionConflictError("The instruction delivery attempt changed concurrently")
+        await self._session.flush()
+        return instruction
+
+    async def cancel_instruction(
+        self,
+        instruction_id: UUID,
+        *,
+        expected_state: InstructionState,
+        expected_delivery_token: UUID | None,
+        reason: str,
+        now: datetime,
+    ) -> AgentSessionInstructionV1:
+        """Cancel a never-delivered instruction with its bounded human reason.
+
+        Only ``queued`` and ``delivery_unknown`` are cancellable; a
+        ``delivering`` attempt must first resolve to ``delivered`` or
+        ``delivery_unknown`` (F3-D §3.5).
+        """
+        current = await self.get_instruction(instruction_id)
+        if (
+            current is None
+            or current.state is not expected_state
+            or current.delivery_token != expected_delivery_token
+        ):
+            raise VersionConflictError("The instruction delivery attempt changed concurrently")
+        cancelled = current.with_cancellation(reason=reason, now=now)
+        return await self.update_instruction_delivery(
+            cancelled,
+            expected_state=expected_state,
+            expected_delivery_token=expected_delivery_token,
+        )
 
 
 __all__ = ["SqlAlchemyAgentSessionRepository"]

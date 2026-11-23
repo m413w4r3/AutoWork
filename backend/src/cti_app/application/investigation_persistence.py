@@ -25,6 +25,7 @@ from cti_app.application.context_pagination import (
 from cti_app.application.investigation_task_events import TaskEvent
 from cti_app.domain.agentic_operator import (
     ACTIVE_AGENT_SESSION_STATES,
+    INSTRUCTION_PENDING_STATES,
     SESSION_STATE_TRANSITIONS,
     AgentSessionInstructionV1,
     AgentSessionState,
@@ -615,6 +616,44 @@ class AgentSessionRepository(Protocol):
         *,
         expected_state: InstructionState,
     ) -> AgentSessionInstructionV1 | None: ...
+
+    async def get_instruction_by_token(
+        self,
+        instruction_id: UUID,
+        delivery_token: UUID,
+        *,
+        state: InstructionState | None = None,
+    ) -> AgentSessionInstructionV1 | None:
+        """Phase C reload: the row only if it still carries this attempt token."""
+        ...
+
+    async def list_pending_instructions(
+        self, *, limit: int
+    ) -> tuple[AgentSessionInstructionV1, ...]:
+        """Drain candidates (queued|delivering|delivery_unknown) in (queued_at,id) order."""
+        ...
+
+    async def update_instruction_delivery(
+        self,
+        instruction: AgentSessionInstructionV1,
+        *,
+        expected_state: InstructionState,
+        expected_delivery_token: UUID | None,
+    ) -> AgentSessionInstructionV1:
+        """CAS one delivery transition on (id, state, token); raise on a lost race."""
+        ...
+
+    async def cancel_instruction(
+        self,
+        instruction_id: UUID,
+        *,
+        expected_state: InstructionState,
+        expected_delivery_token: UUID | None,
+        reason: str,
+        now: datetime,
+    ) -> AgentSessionInstructionV1:
+        """Cancel a queued/delivery_unknown instruction with its human reason."""
+        ...
 
 
 def _copy_budget(budget: InvestigationBudget) -> InvestigationBudget:
@@ -2160,6 +2199,74 @@ class InMemoryAgentSessionRepository:
                 return None
             self._instructions[instruction.id] = instruction
             return instruction
+
+    async def get_instruction_by_token(
+        self,
+        instruction_id: UUID,
+        delivery_token: UUID,
+        *,
+        state: InstructionState | None = None,
+    ) -> AgentSessionInstructionV1 | None:
+        current = self._instructions.get(instruction_id)
+        if current is None or current.delivery_token != delivery_token:
+            return None
+        if state is not None and current.state is not state:
+            return None
+        return current
+
+    async def list_pending_instructions(
+        self, *, limit: int
+    ) -> tuple[AgentSessionInstructionV1, ...]:
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        pending = sorted(
+            (
+                instruction
+                for instruction in self._instructions.values()
+                if instruction.state in INSTRUCTION_PENDING_STATES
+            ),
+            key=lambda instruction: (instruction.queued_at, str(instruction.id)),
+        )
+        return tuple(pending[:limit])
+
+    async def update_instruction_delivery(
+        self,
+        instruction: AgentSessionInstructionV1,
+        *,
+        expected_state: InstructionState,
+        expected_delivery_token: UUID | None,
+    ) -> AgentSessionInstructionV1:
+        async with self._lock:
+            current = self._instructions.get(instruction.id)
+            if (
+                current is None
+                or current.state is not expected_state
+                or current.delivery_token != expected_delivery_token
+            ):
+                raise VersionConflictError("The instruction delivery attempt changed concurrently")
+            self._instructions[instruction.id] = instruction
+            return instruction
+
+    async def cancel_instruction(
+        self,
+        instruction_id: UUID,
+        *,
+        expected_state: InstructionState,
+        expected_delivery_token: UUID | None,
+        reason: str,
+        now: datetime,
+    ) -> AgentSessionInstructionV1:
+        async with self._lock:
+            current = self._instructions.get(instruction_id)
+            if (
+                current is None
+                or current.state is not expected_state
+                or current.delivery_token != expected_delivery_token
+            ):
+                raise VersionConflictError("The instruction delivery attempt changed concurrently")
+            cancelled = current.with_cancellation(reason=reason, now=now)
+            self._instructions[instruction_id] = cancelled
+            return cancelled
 
 
 __all__ = [

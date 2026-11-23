@@ -22,7 +22,7 @@ nonce and the secret hash out of ``repr`` and out of :meth:`to_payload`.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
@@ -131,9 +131,61 @@ RECONCILE_OUTCOMES_RESUMABLE = frozenset({SessionReconcileOutcome.RESUME_AVAILAB
 
 class InstructionState(StrEnum):
     QUEUED = "queued"
+    DELIVERING = "delivering"
     DELIVERED = "delivered"
     ACKNOWLEDGED = "acknowledged"
+    DELIVERY_UNKNOWN = "delivery_unknown"
     CANCELLED = "cancelled"
+
+
+class InstructionDeliveryMode(StrEnum):
+    """How a proven delivery reached the operator (F3-D §3.4)."""
+
+    LIVE = "live"
+    NEXT_RUN = "next_run"
+
+
+# F3-D §3.2.  ``acknowledged``/``cancelled`` are terminal; ``delivered`` is
+# never cancelled and ``queued`` is never acknowledged directly.
+# ``queued -> delivered`` is the pre-0027 acknowledgement promotion the legacy
+# signed route still performs until ID-3 refuses it; it is the only
+# transitional edge and must disappear with that lot.
+INSTRUCTION_STATE_TRANSITIONS: Mapping[InstructionState, frozenset[InstructionState]] = {
+    InstructionState.QUEUED: frozenset(
+        {
+            InstructionState.DELIVERING,
+            InstructionState.DELIVERED,
+            InstructionState.CANCELLED,
+        }
+    ),
+    InstructionState.DELIVERING: frozenset(
+        {
+            InstructionState.DELIVERED,
+            InstructionState.QUEUED,
+            InstructionState.DELIVERY_UNKNOWN,
+        }
+    ),
+    InstructionState.DELIVERED: frozenset({InstructionState.ACKNOWLEDGED}),
+    InstructionState.DELIVERY_UNKNOWN: frozenset(
+        {
+            InstructionState.DELIVERED,
+            InstructionState.QUEUED,
+            InstructionState.CANCELLED,
+        }
+    ),
+    InstructionState.ACKNOWLEDGED: frozenset(),
+    InstructionState.CANCELLED: frozenset(),
+}
+
+# The drain's candidate set; it matches the partial index 0027 creates.
+INSTRUCTION_PENDING_STATES = frozenset(
+    {
+        InstructionState.QUEUED,
+        InstructionState.DELIVERING,
+        InstructionState.DELIVERY_UNKNOWN,
+    }
+)
+TERMINAL_INSTRUCTION_STATES = frozenset({InstructionState.ACKNOWLEDGED, InstructionState.CANCELLED})
 
 
 class InstructionDeliveryOutcome(StrEnum):
@@ -219,15 +271,6 @@ SESSION_STATE_TRANSITIONS: Mapping[AgentSessionState, frozenset[AgentSessionStat
     ),
     AgentSessionState.CLOSED: frozenset(),
     AgentSessionState.FAILED: frozenset(),
-}
-
-INSTRUCTION_STATE_TRANSITIONS: Mapping[InstructionState, frozenset[InstructionState]] = {
-    InstructionState.QUEUED: frozenset({InstructionState.DELIVERED, InstructionState.CANCELLED}),
-    InstructionState.DELIVERED: frozenset(
-        {InstructionState.ACKNOWLEDGED, InstructionState.CANCELLED}
-    ),
-    InstructionState.ACKNOWLEDGED: frozenset(),
-    InstructionState.CANCELLED: frozenset(),
 }
 
 
@@ -362,6 +405,10 @@ class OperatorCapabilitiesV1(_WireModel):
     supports_structured_output: bool = False
     supports_non_interactive: bool = False
     supports_stop: bool = False
+    # F3-D §3.4: the host advertises that one instruction starts a next run
+    # carrying its text.  Absent/false keeps the queue undelivered; the flag is
+    # additive so an older host probe still validates.
+    supports_next_run_instruction: bool = False
     permission_modes: tuple[str, ...] = ()
     confinement: OperatorConfinementV1 | None = None
     probed_at: datetime
@@ -427,6 +474,7 @@ class OperatorCapabilitiesV1(_WireModel):
                 self.supports_structured_output,
                 self.supports_non_interactive,
                 self.supports_stop,
+                self.supports_next_run_instruction,
             )
         ) and not any(probe.exit_code == 0 for probe in self.probes):
             raise ValueError("capability facts require at least one successful probe")
@@ -439,8 +487,16 @@ class OperatorCapabilitiesV1(_WireModel):
         return self
 
     def payload(self) -> dict[str, Any]:
-        """The canonical probed payload, hash excluded."""
-        return self.model_dump(mode="json", exclude={"capability_sha256"})
+        """The canonical probed payload, hash excluded.
+
+        ``supports_next_run_instruction`` is left out while false: the flag is
+        additive (F3-D §3.4), so a probe recorded before the host advertised it
+        keeps the SHA-256 it was stored under instead of being re-hashed.
+        """
+        payload = self.model_dump(mode="json", exclude={"capability_sha256"})
+        if not self.supports_next_run_instruction:
+            payload.pop("supports_next_run_instruction", None)
+        return payload
 
     def expected_capability_sha256(self) -> str:
         return hashlib.sha256(canonical_json_bytes(self.payload())).hexdigest()
@@ -1062,9 +1118,25 @@ class AgentSessionV1:
         }
 
 
+_DELIVERY_EVIDENCE_STATES = frozenset({InstructionState.DELIVERED, InstructionState.ACKNOWLEDGED})
+_IN_FLIGHT_DELIVERY_STATES = frozenset(
+    {InstructionState.DELIVERING, InstructionState.DELIVERY_UNKNOWN}
+)
+_EVIDENCE_FREE_STATES = frozenset({InstructionState.QUEUED, InstructionState.CANCELLED})
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class AgentSessionInstructionV1:
-    """One durably queued human instruction for one session (D05)."""
+    """One durably queued human instruction for one session (D05, F3-D §3.2).
+
+    The delivery columns mirror migration 0027's CHECKs: an attempt records
+    its token, number and exact text SHA-256 before any host effect, a proven
+    delivery records its mode and note diffs, and ``delivery_unknown`` keeps
+    the token so an ambiguous effect is reconciled and never blind-resubmitted.
+    Evidence-free ``delivered``/``acknowledged`` rows stay valid because rows
+    queued before 0027 never carried that evidence; the upgrade never invents
+    a token, mode, digest or diff for them.
+    """
 
     investigation_id: UUID
     task_id: UUID
@@ -1081,6 +1153,16 @@ class AgentSessionInstructionV1:
     id: UUID = field(default_factory=uuid4)
     delivered_at: datetime | None = None
     acknowledged_at: datetime | None = None
+    delivery_attempts: int = 0
+    delivery_token: UUID | None = None
+    delivery_mode: InstructionDeliveryMode | None = None
+    delivery_sha256: str | None = None
+    delivery_note_diffs: tuple[Mapping[str, Any], ...] | None = None
+    delivery_attempted_at: datetime | None = None
+    delivery_unknown_at: datetime | None = None
+    last_delivery_error: str | None = None
+    cancelled_at: datetime | None = None
+    cancel_reason: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, UUID):
@@ -1110,38 +1192,220 @@ class AgentSessionInstructionV1:
         _aware(self.queued_at, "queued_at")
         _aware(self.created_at, "created_at")
         _aware(self.updated_at, "updated_at")
-        if self.delivered_at is not None:
-            _aware(self.delivered_at, "delivered_at")
-        if self.acknowledged_at is not None:
-            _aware(self.acknowledged_at, "acknowledged_at")
-        if self.state is InstructionState.QUEUED and self.delivered_at is not None:
-            raise AgentSessionStateError("a queued instruction has not been delivered")
-        if self.state in (InstructionState.DELIVERED, InstructionState.ACKNOWLEDGED):
-            if self.delivered_at is None:
-                raise AgentSessionStateError("a delivered instruction records delivered_at")
+        for name in (
+            "delivered_at",
+            "acknowledged_at",
+            "delivery_attempted_at",
+            "delivery_unknown_at",
+            "cancelled_at",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                _aware(value, name)
+        if isinstance(self.delivery_attempts, bool) or not isinstance(self.delivery_attempts, int):
+            raise TypeError("delivery_attempts must be an integer")
+        if self.delivery_attempts < 0:
+            raise AgentSessionStateError("delivery_attempts must be >= 0")
+        proven = self.state in _DELIVERY_EVIDENCE_STATES
+        if proven != (self.delivered_at is not None):
+            raise AgentSessionStateError(
+                "delivered_at is set exactly when delivered or acknowledged"
+            )
         if (self.state is InstructionState.ACKNOWLEDGED) != (self.acknowledged_at is not None):
             raise AgentSessionStateError("acknowledged_at is set exactly when acknowledged")
+        if (self.state is InstructionState.DELIVERY_UNKNOWN) != (
+            self.delivery_unknown_at is not None
+        ):
+            raise AgentSessionStateError("delivery_unknown_at is set exactly when delivery_unknown")
+        if (self.state is InstructionState.CANCELLED) != (self.cancelled_at is not None):
+            raise AgentSessionStateError("cancelled_at is set exactly when cancelled")
+        if (self.state is InstructionState.CANCELLED) != (self.cancel_reason is not None):
+            raise AgentSessionStateError("cancel_reason is set exactly when cancelled")
+        if self.cancel_reason is not None:
+            if not isinstance(self.cancel_reason, str) or not self.cancel_reason.strip():
+                raise ValueError("cancel_reason must be a non-empty string")
+            if len(self.cancel_reason) > 4096:
+                raise ValueError("cancel_reason is bounded to 4096 characters")
+        if self.delivery_token is not None and not isinstance(self.delivery_token, UUID):
+            raise TypeError("delivery_token must be a UUID or None")
+        if self.delivery_token is None and self.state in _IN_FLIGHT_DELIVERY_STATES:
+            raise AgentSessionStateError(
+                "a delivering/delivery_unknown instruction records its delivery_token"
+            )
+        if self.delivery_token is not None and self.state in _EVIDENCE_FREE_STATES:
+            raise AgentSessionStateError("a queued/cancelled instruction carries no delivery_token")
+        if self.delivery_mode is not None:
+            if not isinstance(self.delivery_mode, InstructionDeliveryMode):
+                raise TypeError("delivery_mode must use InstructionDeliveryMode")
+            if not proven:
+                raise AgentSessionStateError("delivery_mode is recorded only at delivery")
+        if self.delivery_sha256 is not None:
+            _sha256_hex(self.delivery_sha256, "delivery_sha256")
+            if self.state in _EVIDENCE_FREE_STATES:
+                raise AgentSessionStateError(
+                    "a queued/cancelled instruction carries no delivery_sha256"
+                )
+        if self.state in _IN_FLIGHT_DELIVERY_STATES and self.delivery_sha256 is None:
+            raise AgentSessionStateError(
+                "a delivering/delivery_unknown instruction records delivery_sha256"
+            )
+        if self.delivery_note_diffs is not None:
+            note_diffs = freeze_json(self.delivery_note_diffs)
+            if not isinstance(note_diffs, tuple) or not all(
+                isinstance(item, Mapping) for item in note_diffs
+            ):
+                raise ValueError("delivery_note_diffs must be a JSON array of objects")
+            if not proven:
+                raise AgentSessionStateError("delivery_note_diffs is recorded only at delivery")
+            object.__setattr__(self, "delivery_note_diffs", note_diffs)
+        if self.last_delivery_error is not None:
+            if (
+                not isinstance(self.last_delivery_error, str)
+                or not self.last_delivery_error.strip()
+            ):
+                raise ValueError("last_delivery_error must be a non-empty string")
+            if proven:
+                raise AgentSessionStateError("a delivered instruction has no last_delivery_error")
 
     @property
     def text_bytes(self) -> bytes:
         return self.text.encode("utf-8")
 
-    def with_state(self, state: InstructionState, *, now: datetime) -> AgentSessionInstructionV1:
+    def with_state(
+        self,
+        state: InstructionState,
+        *,
+        now: datetime,
+        delivery_token: UUID | None = None,
+        delivery_sha256: str | None = None,
+        delivery_mode: InstructionDeliveryMode | None = None,
+        delivery_note_diffs: Sequence[Mapping[str, Any]] | None = None,
+        last_delivery_error: str | None = None,
+        cancel_reason: str | None = None,
+    ) -> AgentSessionInstructionV1:
+        """One validated transition of the F3-D §3.2 instruction machine.
+
+        Transitions that need evidence take it as keyword arguments: a
+        reservation requires the fresh attempt token and the exact delivered
+        text SHA-256, and a cancellation requires its bounded human reason.
+        """
         validate_instruction_transition(self.state, state)
         timestamp = _aware(now, "now")
+        token = self.delivery_token
+        delivery_sha = self.delivery_sha256
+        mode = self.delivery_mode
+        note_diffs = self.delivery_note_diffs
+        attempts = self.delivery_attempts
+        attempted_at = self.delivery_attempted_at
+        unknown_at = self.delivery_unknown_at
         delivered_at = self.delivered_at
         acknowledged_at = self.acknowledged_at
-        if state is InstructionState.DELIVERED:
+        cancelled_at = self.cancelled_at
+        reason = self.cancel_reason
+        error = self.last_delivery_error
+        if state is InstructionState.DELIVERING:
+            token = delivery_token
+            delivery_sha = delivery_sha256
+            mode = None
+            note_diffs = None
+            attempts += 1
+            attempted_at = timestamp
+            unknown_at = None
+            error = None
+        elif state is InstructionState.DELIVERED:
             delivered_at = timestamp
+            mode = delivery_mode if delivery_mode is not None else self.delivery_mode
+            delivery_sha = delivery_sha256 if delivery_sha256 is not None else self.delivery_sha256
+            note_diffs = (
+                tuple(delivery_note_diffs)
+                if delivery_note_diffs is not None
+                else self.delivery_note_diffs
+            )
+            unknown_at = None
+            error = None
         elif state is InstructionState.ACKNOWLEDGED:
             acknowledged_at = timestamp
+            unknown_at = None
+            error = None
+        elif state is InstructionState.DELIVERY_UNKNOWN:
+            unknown_at = timestamp
+            error = (
+                last_delivery_error if last_delivery_error is not None else self.last_delivery_error
+            )
+        elif state is InstructionState.QUEUED:
+            token = None
+            delivery_sha = None
+            mode = None
+            note_diffs = None
+            unknown_at = None
+            error = last_delivery_error
+        elif state is InstructionState.CANCELLED:
+            token = None
+            delivery_sha = None
+            mode = None
+            note_diffs = None
+            unknown_at = None
+            cancelled_at = timestamp
+            reason = cancel_reason
         return replace(
             self,
             state=state,
             delivered_at=delivered_at,
             acknowledged_at=acknowledged_at,
+            delivery_attempts=attempts,
+            delivery_token=token,
+            delivery_mode=mode,
+            delivery_sha256=delivery_sha,
+            delivery_note_diffs=note_diffs,
+            delivery_attempted_at=attempted_at,
+            delivery_unknown_at=unknown_at,
+            last_delivery_error=error,
+            cancelled_at=cancelled_at,
+            cancel_reason=reason,
             updated_at=timestamp,
         )
+
+    def with_delivery_reserved(
+        self, *, token: UUID, delivery_sha256: str, now: datetime
+    ) -> AgentSessionInstructionV1:
+        """Reserve one attempt (queued -> delivering).
+
+        An ambiguous ``delivery_unknown`` row is never re-reserved directly:
+        §3.2/§3.5 require proving absence first, which returns it to ``queued``.
+        """
+        if self.state is not InstructionState.QUEUED:
+            raise AgentSessionStateError("only a queued instruction is reserved")
+        return self.with_state(
+            InstructionState.DELIVERING,
+            now=now,
+            delivery_token=token,
+            delivery_sha256=delivery_sha256,
+        )
+
+    def with_delivery_confirmed(
+        self,
+        *,
+        delivery_mode: InstructionDeliveryMode,
+        delivery_sha256: str,
+        delivery_note_diffs: Sequence[Mapping[str, Any]],
+        now: datetime,
+    ) -> AgentSessionInstructionV1:
+        """Record a proven receipt (delivering|delivery_unknown -> delivered)."""
+        if self.state not in (InstructionState.DELIVERING, InstructionState.DELIVERY_UNKNOWN):
+            raise AgentSessionStateError("only an in-flight instruction is delivered")
+        return self.with_state(
+            InstructionState.DELIVERED,
+            now=now,
+            delivery_mode=delivery_mode,
+            delivery_sha256=delivery_sha256,
+            delivery_note_diffs=delivery_note_diffs,
+        )
+
+    def with_cancellation(self, *, reason: str, now: datetime) -> AgentSessionInstructionV1:
+        """Cancel a never-delivered instruction (queued|delivery_unknown -> cancelled)."""
+        if self.state not in (InstructionState.QUEUED, InstructionState.DELIVERY_UNKNOWN):
+            raise AgentSessionStateError("only a never-delivered instruction is cancelled")
+        return self.with_state(InstructionState.CANCELLED, now=now, cancel_reason=reason)
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -1158,6 +1422,32 @@ class AgentSessionInstructionV1:
             "acknowledged_at": (
                 self.acknowledged_at.isoformat() if self.acknowledged_at is not None else None
             ),
+            "delivery_attempts": self.delivery_attempts,
+            "delivery_token": (
+                str(self.delivery_token) if self.delivery_token is not None else None
+            ),
+            "delivery_mode": self.delivery_mode.value if self.delivery_mode is not None else None,
+            "delivery_sha256": self.delivery_sha256,
+            "delivery_note_diffs": (
+                [thaw_json(item) for item in self.delivery_note_diffs]
+                if self.delivery_note_diffs is not None
+                else None
+            ),
+            "delivery_attempted_at": (
+                self.delivery_attempted_at.isoformat()
+                if self.delivery_attempted_at is not None
+                else None
+            ),
+            "delivery_unknown_at": (
+                self.delivery_unknown_at.isoformat()
+                if self.delivery_unknown_at is not None
+                else None
+            ),
+            "last_delivery_error": self.last_delivery_error,
+            "cancelled_at": (
+                self.cancelled_at.isoformat() if self.cancelled_at is not None else None
+            ),
+            "cancel_reason": self.cancel_reason,
             "created_by": {"kind": self.created_by_kind, "actor_id": self.created_by_id},
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
@@ -1174,6 +1464,7 @@ __all__ = [
     "AGENT_SESSION_SECRET_NONCE_BYTES",
     "CLOSED_AT_REQUIRED_SESSION_STATES",
     "INSTRUCTION_MAX_TEXT_BYTES",
+    "INSTRUCTION_PENDING_STATES",
     "INSTRUCTION_SCHEMA_VERSION",
     "INSTRUCTION_STATE_TRANSITIONS",
     "OPERATOR_CAPABILITIES_SCHEMA_VERSION",
@@ -1183,6 +1474,7 @@ __all__ = [
     "RESUMABLE_AGENT_SESSION_STATES",
     "SESSION_STATE_TRANSITIONS",
     "TERMINAL_AGENT_SESSION_STATES",
+    "TERMINAL_INSTRUCTION_STATES",
     "AgentSessionInstructionV1",
     "AgentSessionState",
     "AgentSessionStateError",
@@ -1191,6 +1483,7 @@ __all__ = [
     "AgenticOperatorPort",
     "CollectResultsRequest",
     "HandoffRequestReceiptV1",
+    "InstructionDeliveryMode",
     "InstructionDeliveryOutcome",
     "InstructionReceiptV1",
     "InstructionState",
