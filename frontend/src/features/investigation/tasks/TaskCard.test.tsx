@@ -119,6 +119,13 @@ describe("TaskCard actions", () => {
     expect(screen.getByText(/Terminée · version 2/)).toBeInTheDocument();
   });
 
+  it("affiche l’adaptateur d’une assignation opérateur en libellé humain", () => {
+    renderCard(assignedOperatorTask());
+
+    expect(screen.getByText("Opérateur · Codex CLI")).toBeInTheDocument();
+    expect(screen.queryByText(/operator:codex_cli/)).toBeNull();
+  });
+
   it("n’affiche pas les attributions quand le workspace n’est pas prouvé", () => {
     renderCard(makeTask(), null);
 

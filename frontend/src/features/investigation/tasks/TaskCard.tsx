@@ -27,6 +27,7 @@ import { useTransferTask, type TransferResult } from "../api/transfers";
 import { useWriteWorkspaceNote } from "../api/workspace";
 import { describeTaskError } from "./errors";
 import {
+  actorRefLabel,
   ADAPTER_LABELS,
   BLOCKED_REASON_LABELS,
   formatTimestamp,
@@ -80,7 +81,9 @@ function assignmentLabel(task: TaskView): string {
   if (task.assigned_actor_kind === null || task.assigned_actor_id === null) {
     return "Non attribuée";
   }
-  return `${TASK_ACTOR_LABELS[task.assigned_actor_kind]} · ${task.assigned_actor_id}`;
+  return `${TASK_ACTOR_LABELS[task.assigned_actor_kind]} · ${actorRefLabel(
+    task.assigned_actor_id,
+  )}`;
 }
 
 export interface TaskCardProps {
@@ -696,7 +699,7 @@ export function TaskCard({
                     : `(${TASK_STATUS_LABELS[event.from_status]} → ${TASK_STATUS_LABELS[event.to_status]}) `}
                   <span>{TASK_ACTOR_LABELS[event.actor.actor_kind]}</span>
                   {event.actor.actor_id === "" ? null : (
-                    <span> · {event.actor.actor_id}</span>
+                    <span> · {actorRefLabel(event.actor.actor_id)}</span>
                   )}
                 </li>
               ))}

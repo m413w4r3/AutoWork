@@ -21,7 +21,7 @@ import {
   WorkshopSyncingState,
   WorkshopTypedErrorState,
 } from "../shell/WorkshopStates";
-import { formatTimestamp } from "../tasks/labels";
+import { formatTimestamp, shortSha } from "../tasks/labels";
 import { BootstrapSection } from "./BootstrapSection";
 import { EnvelopeLifecycleSection } from "./EnvelopeLifecycleSection";
 import { EnvelopeSection } from "./EnvelopeSection";
@@ -53,8 +53,14 @@ export function OverviewView({
       <section className="job-card" aria-labelledby="overview-host-heading">
         <h2 id="overview-host-heading">Hôte et workspace</h2>
         <p>
-          Enquête <code>{investigationId}</code> · sujet{" "}
-          <code>{subjectId}</code>
+          Enquête{" "}
+          <code title={investigationId} className="m24-id-ref">
+            {shortSha(investigationId)}
+          </code>{" "}
+          · sujet{" "}
+          <code title={subjectId} className="m24-id-ref">
+            {shortSha(subjectId)}
+          </code>
         </p>
         <AgentStatusPanel
           status={agentQuery.data?.status}
@@ -139,7 +145,15 @@ function AgentStatusPanel({
         <dt>Agent hôte</dt>
         <dd>{label}</dd>
         <dt>Instance</dt>
-        <dd>{instanceId ?? "Non déclarée"}</dd>
+        <dd>
+          {instanceId === null ? (
+            "Non déclarée"
+          ) : (
+            <code title={instanceId} className="m24-id-ref">
+              {shortSha(instanceId)}
+            </code>
+          )}
+        </dd>
       </dl>
       {status !== "available" ? (
         <WorkshopAgentAbsentState status={label} />
@@ -212,7 +226,13 @@ function WorkspaceStatusPanel({
         <dd>{workspace.binding?.article_slug ?? "Non déclaré"}</dd>
         <dt>Workspace</dt>
         <dd>
-          <code>{workspace.binding?.workspace_id ?? "Non lié"}</code>
+          {workspace.binding === null ? (
+            <code>Non lié</code>
+          ) : (
+            <code title={workspace.binding.workspace_id} className="m24-id-ref">
+              {shortSha(workspace.binding.workspace_id)}
+            </code>
+          )}
         </dd>
         <dt>Génération / curseur</dt>
         <dd>

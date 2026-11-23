@@ -98,6 +98,45 @@ export const ADAPTER_LABELS: Record<OperatorAdapterKind, string> = {
   claude_code: "Claude Code",
 };
 
+/** Closed target union of an analyst decision, translated for the UI. */
+export const DECISION_TARGET_LABELS: Record<string, string> = {
+  member: "membre",
+  feature: "fonctionnalité",
+  tool: "outil",
+  invariant: "invariant",
+  pivot: "pivot",
+  corpus: "corpus",
+  detection: "détection",
+  note: "note",
+  plan_version: "version de plan",
+  task: "tâche",
+  workspace_conflict: "conflit de workspace",
+};
+
+const ACTOR_ID_PREFIXES: ReadonlySet<string> = new Set([
+  "human",
+  "operator",
+  "system",
+  "source",
+]);
+
+/**
+ * Actor ids are persisted as `kind:value` (`operator:codex_cli`,
+ * `human:alice`). The UI already shows the actor kind, so strip the redundant
+ * prefix and translate a known adapter value; other principals stay readable.
+ */
+export function actorRefLabel(actorId: string): string {
+  const separator = actorId.indexOf(":");
+  if (separator === -1) return actorId;
+  const prefix = actorId.slice(0, separator);
+  const value = actorId.slice(separator + 1);
+  if (!ACTOR_ID_PREFIXES.has(prefix) || value === "") return actorId;
+  if (prefix === "operator" && value in ADAPTER_LABELS) {
+    return ADAPTER_LABELS[value as OperatorAdapterKind];
+  }
+  return value;
+}
+
 export const TASK_EVENT_LABELS: Record<TaskEventType, string> = {
   task_created: "Tâche créée",
   status_changed: "Statut modifié",

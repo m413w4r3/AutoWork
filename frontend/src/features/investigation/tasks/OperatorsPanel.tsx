@@ -39,6 +39,7 @@ import { BUDGET_DIMENSION_LABELS } from "../overview/overviewPresentation";
 import { INVOCATION_STATUS_LABELS } from "../samples/samplesLabels";
 import { describeTaskError } from "./errors";
 import {
+  actorRefLabel,
   ADAPTER_LABELS,
   BLOCKED_REASON_LABELS,
   formatBudgetAmount,
@@ -266,7 +267,10 @@ function HandoffBlock({
           <div>
             <dt>Passation</dt>
             <dd>
-              <code>{handoff.handoff_id}</code> · version {handoff.version}
+              <code title={handoff.handoff_id} className="m24-id-ref">
+                {shortSha(handoff.handoff_id)}
+              </code>{" "}
+              · version {handoff.version}
             </dd>
           </div>
           <div>
@@ -283,9 +287,9 @@ function HandoffBlock({
             <dt>Acteurs</dt>
             <dd>
               {TASK_ACTOR_LABELS[handoff.from_actor.kind]}{" "}
-              {handoff.from_actor.actor_id} →{" "}
+              {actorRefLabel(handoff.from_actor.actor_id)} →{" "}
               {TASK_ACTOR_LABELS[handoff.to_actor.kind]}{" "}
-              {handoff.to_actor.actor_id}
+              {actorRefLabel(handoff.to_actor.actor_id)}
             </dd>
           </div>
           <div>
@@ -525,7 +529,9 @@ function SessionRow({
           <dt>Tâche</dt>
           <dd>
             {task === undefined ? "Tâche inconnue" : task.title}{" "}
-            <code>{session.task_id}</code>
+            <code title={session.task_id} className="m24-id-ref">
+              {shortSha(session.task_id)}
+            </code>
           </dd>
         </div>
         <div>

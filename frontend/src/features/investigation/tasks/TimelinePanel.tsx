@@ -19,7 +19,9 @@ import {
   type TimelineItemV1,
 } from "../api/tasks";
 import {
+  actorRefLabel,
   ADAPTER_LABELS,
+  DECISION_TARGET_LABELS,
   formatTimestamp,
   SESSION_STATE_LABELS,
   shortSha,
@@ -50,6 +52,16 @@ const REF_LABELS: Record<string, string> = {
   contribution_id: "Contribution liée",
   instruction_id: "Instruction liée",
   task_id: "Tâche",
+  event_id: "Événement",
+  decision_id: "Décision",
+  invocation_id: "Invocation",
+  plan_version_id: "Version de plan",
+  source_invocation_id: "Invocation source",
+  source_observation_id: "Observation source",
+  target_type: "Type de cible",
+  target_id: "Cible",
+  blob_id: "Blob",
+  operation_key: "Clé d’opération",
   predecessor_id: "Prédécesseur",
   version: "Version",
   sha256: "SHA-256",
@@ -74,6 +86,7 @@ const REF_LABELS: Record<string, string> = {
 const REF_VALUE_LABELS: Record<string, Record<string, string>> = {
   adapter_kind: ADAPTER_LABELS,
   state: SESSION_STATE_LABELS,
+  target_type: DECISION_TARGET_LABELS,
   delivery_mode: {
     live: "Livraison directe",
     next_run: "Au prochain démarrage",
@@ -82,6 +95,11 @@ const REF_VALUE_LABELS: Record<string, Record<string, string>> = {
 
 function isDigestRef(name: string): boolean {
   return name === "sha256" || name.endsWith("_sha256");
+}
+
+/** Persisted ids: abbreviated with the full value copied on click. */
+function isIdentifierRef(name: string): boolean {
+  return name === "target_id" || name.endsWith("_id");
 }
 
 function TimelineRefValue({ name, value }: { name: string; value: string }) {
@@ -95,7 +113,18 @@ function TimelineRefValue({ name, value }: { name: string; value: string }) {
   if (isDigestRef(name)) {
     return <code title={value}>{shortSha(value)}</code>;
   }
-  return <code>{REF_VALUE_LABELS[name]?.[value] ?? value}</code>;
+  const closed = REF_VALUE_LABELS[name];
+  if (closed !== undefined) {
+    return <code>{closed[value] ?? value}</code>;
+  }
+  if (isIdentifierRef(name)) {
+    return (
+      <code title={value} className="m24-id-ref">
+        {shortSha(value)}
+      </code>
+    );
+  }
+  return <code>{value}</code>;
 }
 
 function itemMatchesText(item: TimelineItemV1, needle: string): boolean {
@@ -237,7 +266,9 @@ export function TimelinePanel({
                 </span>
                 <span className="m24-muted">
                   {TIMELINE_ACTOR_LABELS[item.actor_kind]}
-                  {item.actor_id === null ? "" : ` · ${item.actor_id}`}
+                  {item.actor_id === null
+                    ? ""
+                    : ` · ${actorRefLabel(item.actor_id)}`}
                 </span>
                 {item.evidence ? (
                   <span className="m24-badge m24-badge--evidence">
@@ -260,7 +291,9 @@ export function TimelinePanel({
                 <div>
                   <dt>Objet</dt>
                   <dd>
-                    <code>{item.object_id}</code>
+                    <code title={item.object_id} className="m24-id-ref">
+                      {shortSha(item.object_id)}
+                    </code>
                   </dd>
                 </div>
                 {Object.entries(item.refs)

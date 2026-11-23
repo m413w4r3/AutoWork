@@ -23,6 +23,7 @@ import { EVIDENCE_KIND_LABELS } from "../opinion/labels";
 import { INVOCATION_STATUS_LABELS } from "../samples/samplesLabels";
 import {
   ADAPTER_LABELS,
+  DECISION_TARGET_LABELS,
   INSTRUCTION_JOURNAL_STATE_LABELS,
   SESSION_STATE_LABELS,
   TASK_ACTOR_LABELS,
@@ -47,20 +48,6 @@ const DECISION_TYPE_LABELS: Record<string, string> = {
   task_result_changes_requested:
     "Modifications demandées sur un résultat de tâche",
   workspace_conflict_resolve: "Résolution d’un conflit de workspace",
-};
-
-const DECISION_TARGET_LABELS: Record<string, string> = {
-  member: "membre",
-  feature: "fonctionnalité",
-  tool: "outil",
-  invariant: "invariant",
-  pivot: "pivot",
-  corpus: "corpus",
-  detection: "détection",
-  note: "note",
-  plan_version: "version de plan",
-  task: "tâche",
-  workspace_conflict: "conflit de workspace",
 };
 
 /** Observation object types the investigation tools persist today. */

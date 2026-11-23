@@ -316,6 +316,57 @@ describe("TimelinePanel", () => {
     ).toBeInTheDocument();
   });
 
+  it("traduit les références techniques et abrège les identifiants", async () => {
+    const targetId = "99999999-9999-4999-8999-999999999999";
+    const blobId = "77777777-7777-4777-8777-777777777777";
+    const objectId = "88888888-8888-4888-8888-888888888888";
+    renderTimeline({
+      items: [
+        {
+          item_type: "decision",
+          object_id: objectId,
+          occurred_at: "2026-11-22T10:01:00Z",
+          task_id: null,
+          actor_kind: "operator",
+          actor_id: "operator:claude_code",
+          summary: "workspace_conflict_resolve:workspace_conflict",
+          evidence: false,
+          refs: {
+            target_type: "workspace_conflict",
+            target_id: targetId,
+            blob_id: blobId,
+            operation_key: "operator:digest:payload",
+          },
+          linked_event_ids: [],
+          linked_observation_ids: [],
+        },
+      ],
+      next_cursor: null,
+      has_more: false,
+    });
+
+    expect(
+      await screen.findByText(
+        "Résolution d’un conflit de workspace · cible : conflit de workspace",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Opérateur · Claude Code")).toBeInTheDocument();
+    expect(screen.getByText("Type de cible")).toBeInTheDocument();
+    expect(screen.getByText("Cible")).toBeInTheDocument();
+    expect(screen.getByText("Blob")).toBeInTheDocument();
+    expect(screen.getByText("Clé d’opération")).toBeInTheDocument();
+    expect(screen.getByText("operator:digest:payload")).toBeInTheDocument();
+    expect(screen.getByTitle(objectId)).toHaveTextContent(
+      `${objectId.slice(0, 12)}…`,
+    );
+    expect(screen.getByTitle(targetId)).toHaveTextContent(
+      `${targetId.slice(0, 12)}…`,
+    );
+    expect(screen.getByTitle(blobId)).toHaveTextContent(
+      `${blobId.slice(0, 12)}…`,
+    );
+  });
+
   it("affiche l’état vide", async () => {
     renderTimeline({ items: [], next_cursor: null, has_more: false });
 

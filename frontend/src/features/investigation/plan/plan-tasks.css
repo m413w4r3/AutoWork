@@ -122,6 +122,11 @@
   overflow-wrap: anywhere;
 }
 
+/* An abbreviated persisted id: one click selects the whole value to copy. */
+.m24-id-ref {
+  user-select: all;
+}
+
 .m24-metadata--refs {
   grid-template-columns: 1fr;
   border-top: 1px dashed #dce4de;

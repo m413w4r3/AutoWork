@@ -388,6 +388,25 @@ test("plan et tâches : acceptation, action absente et CAS périmé", async ({
   ).toHaveCount(4);
   await expect(timeline.getByText("Preuve canonique")).toHaveCount(1);
 
+  // Technical refs carry a French label; persisted ids stay whole in the
+  // title while the visible value is abbreviated.
+  const decisionEntry = timeline
+    .getByRole("listitem")
+    .filter({ hasText: "Approbation d’un pivot" });
+  await expect(decisionEntry.getByText("Type de cible")).toBeVisible();
+  await expect(decisionEntry.getByText("pivot", { exact: true })).toBeVisible();
+  await expect(decisionEntry.getByTitle(workshopIds.sample)).toHaveText(
+    `${workshopIds.sample.slice(0, 12)}…`,
+  );
+
+  // An operator actor id is shown with the adapter label, not `operator:...`.
+  const toolEntry = timeline
+    .getByRole("listitem")
+    .filter({ hasText: "Téléchargement d’un échantillon VT" });
+  await expect(toolEntry.getByText("Opérateur · Codex CLI")).toBeVisible();
+  await expect(toolEntry.getByText("Clé d’opération")).toBeVisible();
+  await expect(toolEntry.getByText("operator:digest:payload")).toBeVisible();
+
   await page.getByLabel(/Type d’événement/).selectOption("instruction");
   await expect(
     timeline.getByText("Instruction humaine · En file (agent occupé)"),
