@@ -260,6 +260,33 @@ def test_collect_ignores_an_oversized_note_outside_the_manifest(session_base: Pa
     assert captured_notes == []
 
 
+def test_collect_budget_ignores_files_outside_the_manifest(session_base: Path) -> None:
+    """Large logs the manifest ignores must not consume the importable-note budget."""
+    session_directory = session_base / "session"
+    scratch = session_directory / "scratch"
+    notes = scratch / "notes"
+    notes.mkdir(parents=True)
+    # Each file is below the per-file bound; together they exceed the total budget.
+    near_limit = sessions_supervisor.MAX_CAPTURE_NOTE_BYTES - 1
+    count = sessions_supervisor.MAX_CAPTURE_TOTAL_BYTES // near_limit + 2
+    for index in range(count):
+        (notes / f"log-{index}.json").write_bytes(b"x" * near_limit)
+    assert count * near_limit > sessions_supervisor.MAX_CAPTURE_TOTAL_BYTES
+    handle = SimpleNamespace(
+        record=SimpleNamespace(workspace_id="ws-test", task_id="task-test", session_id="sess-test"),
+        scratch=scratch,
+        directory=session_directory,
+    )
+    supervisor = object.__new__(sessions_supervisor.SessionSupervisor)
+    supervisor._workspaces = SimpleNamespace(get_workspace=lambda _workspace_id: object())
+    supervisor._refuse_secret_exposure = lambda _handle, _entries: None
+
+    captured, captured_notes = supervisor._capture(handle)
+
+    assert captured == []
+    assert captured_notes == []
+
+
 def test_collect_copies_a_legitimate_near_miss_note(session_base: Path) -> None:
     # Flipping bytes 0 and 16 breaks every 16-byte aligned window, so the file
     # is close to the secret but shares no detectable fragment with it.

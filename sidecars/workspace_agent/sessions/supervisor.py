@@ -2993,11 +2993,13 @@ class SessionSupervisor:
                 data = self._read_capture_file(source)
                 if data is None:
                     continue
-                # The scan budget includes candidates that the output manifest
-                # will ignore, so secret checks cannot grow without bound.
-                scan_total += len(data)
-                if scan_total > MAX_CAPTURE_TOTAL_BYTES:
-                    raise BudgetExceededError("capture")
+                # Files the output manifest ignores are scanned for secrets but are
+                # never imported, so only importable files count toward the budget:
+                # a few large logs under scratch/notes must not fail the collect.
+                if _capture_manifest_allows(declaration, relative):
+                    scan_total += len(data)
+                    if scan_total > MAX_CAPTURE_TOTAL_BYTES:
+                        raise BudgetExceededError("capture")
                 candidates.append((destination, declaration.kind, data, declaration, relative))
         captured: list[dict[str, object]] = []
         captured_notes: list[str] = []
