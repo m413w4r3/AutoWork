@@ -48,6 +48,7 @@ import { TaskBridgePanel } from "./TaskBridgePanel";
 import { OperatorsPanel } from "./OperatorsPanel";
 import { TimelinePanel } from "./TimelinePanel";
 import { timelineSummaryLabel } from "./timelinePresentation";
+import { handleInvestigationLinkClick, investigationHref } from "../navigation";
 
 type TransferDestination = "human" | "codex_cli" | "claude_code";
 type SimpleCommand = "start" | "release" | "submit" | "unblock";
@@ -110,6 +111,32 @@ function PolicyValue({ value }: { value: string | string[] | null }) {
       </>
     );
   return <>{value}</>;
+}
+
+function CopyableTaskValue({ label, value }: { label: string; value: string }) {
+  const [copied, setCopied] = useState(false);
+  async function copy() {
+    try {
+      if (navigator.clipboard?.writeText === undefined) return;
+      await navigator.clipboard.writeText(value);
+      setCopied(true);
+    } catch {
+      setCopied(false);
+    }
+  }
+  return (
+    <span className="m24-task-technical-value">
+      <code>{value}</code>
+      <button
+        type="button"
+        aria-label={`Copier ${label}`}
+        onClick={() => void copy()}
+      >
+        Copier
+      </button>
+      <span role="status">{copied ? "Copié." : ""}</span>
+    </span>
+  );
 }
 
 function safeSourceUrl(value: unknown): value is string {
@@ -631,10 +658,7 @@ export function TaskCard({
                   <dl className="m24-metadata">
                     <div>
                       <dt>Statut</dt>
-                      <dd>
-                        {TASK_STATUS_LABELS[task.status]} · version{" "}
-                        {task.status_version}
-                      </dd>
+                      <dd>{TASK_STATUS_LABELS[task.status]}</dd>
                     </div>
                     <div>
                       <dt>Priorité</dt>
@@ -644,16 +668,6 @@ export function TaskCard({
                       <dt>Vérification du résultat</dt>
                       <dd>
                         {VERIFICATION_LABELS[task.result_verification_status]}
-                      </dd>
-                    </div>
-                    <div>
-                      <dt>Expiration du bail</dt>
-                      <dd>{formatTimestamp(task.lease_expires_at)}</dd>
-                    </div>
-                    <div>
-                      <dt>Clé de tâche</dt>
-                      <dd>
-                        <code>{task.task_key}</code>
                       </dd>
                     </div>
                     {task.blocked_reason === null ? null : (
@@ -704,30 +718,153 @@ export function TaskCard({
                       </dd>
                     </div>
                     <div>
-                      <dt>Claims</dt>
-                      <dd>{listOrPlaceholder(task.claim_refs)}</dd>
-                    </div>
-                    <div>
                       <dt>Preuves de départ</dt>
-                      <dd>{listOrPlaceholder(task.evidence_refs)}</dd>
+                      <dd>
+                        {task.evidence_refs.length === 0 ? (
+                          "Aucune preuve de départ"
+                        ) : (
+                          <button
+                            type="button"
+                            className="m24-task-card__text-link"
+                            onClick={() => changeSubview("results")}
+                          >
+                            {task.evidence_refs.length} preuve
+                            {task.evidence_refs.length === 1 ? "" : "s"} de
+                            départ · voir Résultats et preuves
+                          </button>
+                        )}
+                      </dd>
                     </div>
                     <div>
                       <dt>Échantillons</dt>
-                      <dd>{listOrPlaceholder(task.sample_refs)}</dd>
-                    </div>
-                    <div>
-                      <dt>Capacités requises</dt>
-                      <dd>{listOrPlaceholder(task.required_capabilities)}</dd>
-                    </div>
-                    <div>
-                      <dt>Chemins autorisés</dt>
-                      <dd>{listOrPlaceholder(task.allowed_workspace_paths)}</dd>
+                      <dd>
+                        {task.sample_refs.length === 0
+                          ? "Aucun échantillon"
+                          : (() => {
+                              const href = investigationHref({
+                                vue: "samples",
+                              });
+                              return (
+                                <a
+                                  href={href}
+                                  onClick={(event) =>
+                                    handleInvestigationLinkClick(event, href)
+                                  }
+                                >
+                                  {task.sample_refs.length} échantillon
+                                  {task.sample_refs.length === 1 ? "" : "s"} ·
+                                  voir Échantillons et résultats
+                                </a>
+                              );
+                            })()}
+                      </dd>
                     </div>
                     <div>
                       <dt>Sorties attendues</dt>
                       <dd>{listOrPlaceholder(task.expected_outputs)}</dd>
                     </div>
                   </dl>
+                  <details className="m24-task-technical-details">
+                    <summary>Détails techniques</summary>
+                    <dl className="m24-metadata m24-metadata--refs">
+                      <div>
+                        <dt>Clé de tâche</dt>
+                        <dd>
+                          <CopyableTaskValue
+                            label="la clé de tâche"
+                            value={task.task_key}
+                          />
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Identifiant de tâche</dt>
+                        <dd>
+                          <CopyableTaskValue
+                            label="l’identifiant de tâche"
+                            value={task.id}
+                          />
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Preuves de départ</dt>
+                        <dd>
+                          {task.evidence_refs.map((value) => (
+                            <CopyableTaskValue
+                              key={value}
+                              label="la référence de preuve"
+                              value={value}
+                            />
+                          ))}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Références d’échantillons (SHA-256)</dt>
+                        <dd>
+                          {task.sample_refs.map((value) => (
+                            <CopyableTaskValue
+                              key={value}
+                              label="la référence d’échantillon"
+                              value={value}
+                            />
+                          ))}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Claims</dt>
+                        <dd>
+                          {task.claim_refs.map((value) => (
+                            <CopyableTaskValue
+                              key={value}
+                              label="la référence de claim"
+                              value={value}
+                            />
+                          ))}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Expiration du bail</dt>
+                        <dd>
+                          <CopyableTaskValue
+                            label="l’expiration du bail"
+                            value={task.lease_expires_at ?? "Non renseignée"}
+                          />
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Version CAS</dt>
+                        <dd>
+                          <CopyableTaskValue
+                            label="la version CAS"
+                            value={String(task.status_version)}
+                          />
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Capacités requises</dt>
+                        <dd>
+                          {task.required_capabilities.map((value) => (
+                            <CopyableTaskValue
+                              key={value}
+                              label="la capacité requise"
+                              value={value}
+                            />
+                          ))}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Chemins autorisés</dt>
+                        <dd>
+                          {task.allowed_workspace_paths.map((value) => (
+                            <CopyableTaskValue
+                              key={value}
+                              label="le chemin autorisé"
+                              value={value}
+                            />
+                          ))}
+                        </dd>
+                      </div>
+                    </dl>
+                  </details>
                   {parent === undefined ? null : (
                     <p>
                       Sous-tâche de{" "}

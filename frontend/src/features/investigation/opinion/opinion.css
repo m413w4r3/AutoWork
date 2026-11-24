@@ -40,10 +40,27 @@
   overflow-y: auto;
 }
 
+.opinion-workspace__article {
+  position: sticky;
+  top: 4.5rem;
+  align-self: start;
+  max-height: calc(100vh - 5rem);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
 .opinion-workspace__article,
 .opinion-workspace__panel,
 .opinion-workspace__tabpanel {
   min-width: 0;
+}
+
+@media (max-width: 1100px), (max-height: 599px) {
+  .opinion-workspace__article {
+    position: static;
+    max-height: none;
+    overflow: visible;
+  }
 }
 
 .opinion-workspace__panel [role="tablist"] {
