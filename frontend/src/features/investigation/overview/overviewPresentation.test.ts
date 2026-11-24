@@ -2,6 +2,10 @@ import { describe, expect, it } from "vitest";
 
 import type { TaskView } from "../api/tasks";
 import {
+  BOOTSTRAP_LIMIT_SOURCE_LABELS,
+  EXTERNAL_MODEL_POLICY_SOURCE_LABELS,
+  HASH_TYPE_LABELS,
+  bootstrapProviderLabel,
   deriveOverviewDecisions,
   verificationLabel,
 } from "./overviewPresentation";
@@ -13,6 +17,20 @@ const task = {
   result_verification_status: "unverified",
   result_refs: [] as TaskView["result_refs"],
 } as const;
+
+describe("labels de source bootstrap", () => {
+  it("traduit les sources et fournisseurs techniques en libellés français", () => {
+    expect(BOOTSTRAP_LIMIT_SOURCE_LABELS.settings_cap).toBe(
+      "Plafond de configuration",
+    );
+    expect(EXTERNAL_MODEL_POLICY_SOURCE_LABELS.article_policy).toBe(
+      "Politique de l’article",
+    );
+    expect(bootstrapProviderLabel("vt")).toBe("VirusTotal");
+    expect(bootstrapProviderLabel("future_provider")).toBe("Autre fournisseur");
+    expect(HASH_TYPE_LABELS.sha256).toBe("SHA-256");
+  });
+});
 
 describe("deriveOverviewDecisions", () => {
   it("ne dérive aucune décision quand les projections sont vides", () => {

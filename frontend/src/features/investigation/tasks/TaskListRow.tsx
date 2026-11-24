@@ -3,6 +3,7 @@ import type { KeyboardEvent } from "react";
 import type { AgentSessionView } from "../api/agentSessions";
 import type { TaskView } from "../api/tasks";
 import {
+  ADAPTER_LABELS,
   TASK_PRIORITY_LABELS,
   TASK_STATUS_LABELS,
   formatTimestamp,
@@ -50,10 +51,13 @@ export function TaskListRow({
   const session = sessions
     .filter((item) => item.task_id === task.id)
     .sort((left, right) => right.updated_at.localeCompare(left.updated_at))[0];
+  const assignedActor = actorLabel(task);
+  const sessionAdapter =
+    session === undefined ? null : ADAPTER_LABELS[session.adapter_kind];
   const actor =
-    session === undefined
-      ? actorLabel(task)
-      : `${actorLabel(task)} · ${session.adapter_kind === "codex_cli" ? "Codex CLI" : "Claude Code"}`;
+    sessionAdapter === null || assignedActor.endsWith(` · ${sessionAdapter}`)
+      ? assignedActor
+      : `${assignedActor} · ${sessionAdapter}`;
   const hasResults =
     task.result_refs.length > 0 || task.status === "awaiting_review";
 

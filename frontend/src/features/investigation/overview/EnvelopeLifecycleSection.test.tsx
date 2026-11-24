@@ -270,6 +270,54 @@ describe("EnvelopeLifecycleSection", () => {
     expect(screen.queryByRole("button", { name: /Approuver/ })).toBeNull();
   });
 
+  it("traduit le type d’acteur et replie son identifiant brut dans les détails", async () => {
+    const user = userEvent.setup();
+    renderSection({
+      initial: makeEnvelope({ approval_actor_id: "operator:static-token" }),
+    });
+
+    expect(await screen.findByText("Opérateur")).toBeVisible();
+    const technicalDetails = screen
+      .getByText("Détails techniques")
+      .closest("details");
+    expect(technicalDetails).not.toBeNull();
+    expect(
+      within(technicalDetails as HTMLElement).getByText(
+        "operator:static-token",
+      ),
+    ).not.toBeVisible();
+
+    await user.click(screen.getByText("Détails techniques"));
+    expect(
+      within(technicalDetails as HTMLElement).getByText(
+        "operator:static-token",
+      ),
+    ).toBeVisible();
+  });
+
+  it("garde l’identifiant de l’acteur de politique dans les détails techniques", async () => {
+    const user = userEvent.setup();
+    renderSection({
+      initial: makeEnvelope({
+        authority_kind: "osint_policy",
+        policy_status: "active",
+        policy_activated_by: "analyst:policy",
+      }),
+    });
+
+    expect(await screen.findByText("Acteur authentifié")).toBeVisible();
+    expect(screen.getByText("analyst:policy")).not.toBeVisible();
+    const technicalDetails = screen
+      .getByText("Détails techniques")
+      .closest("details");
+    expect(technicalDetails).not.toBeNull();
+
+    await user.click(screen.getByText("Détails techniques"));
+    expect(
+      within(technicalDetails as HTMLElement).getByText("analyst:policy"),
+    ).toBeVisible();
+  });
+
   it("affiche les droits réels, le budget et la politique héritée", async () => {
     renderSection({
       initial: makeEnvelope({

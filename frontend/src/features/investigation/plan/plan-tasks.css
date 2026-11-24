@@ -110,6 +110,7 @@
 }
 
 .m24-task-row__title {
+  font-size: 1rem;
   line-height: 1.3;
   overflow-wrap: anywhere;
 }
@@ -119,21 +120,23 @@
   width: 100%;
   flex-direction: column;
   gap: 0.15rem;
-  color: #5d6b62;
-  font-size: 0.78rem;
+  color: #405249;
+  font-size: 0.82rem;
+  line-height: 1.35;
 }
 
 .m24-task-row__results {
   position: absolute;
   right: 0.7rem;
   top: 0.65rem;
-  padding: 0.18rem 0.5rem;
+  min-height: 2rem;
+  padding: 0.3rem 0.55rem;
   border: 1px solid #28704b;
   border-radius: 0.45rem;
   background: #fff;
   color: #28503b;
   font: inherit;
-  font-size: 0.75rem;
+  font-size: 0.78rem;
   cursor: pointer;
 }
 
@@ -389,6 +392,35 @@
   flex-wrap: wrap;
   gap: 0.5rem;
   margin: 0.6rem 0;
+}
+
+.m24-timeline__technical {
+  margin: 0.35rem 0;
+}
+
+.m24-timeline__technical summary {
+  display: flex;
+  min-height: 2rem;
+  width: fit-content;
+  align-items: center;
+  color: #405249;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.m24-timeline__technical summary:focus-visible {
+  outline: 3px solid #2f6fb3;
+  outline-offset: 2px;
+}
+
+.m24-timeline__technical summary::before {
+  margin-right: 0.35rem;
+  color: #28503b;
+  content: "▸";
+}
+
+.m24-timeline__technical[open] > summary::before {
+  content: "▾";
 }
 
 .m24-action {

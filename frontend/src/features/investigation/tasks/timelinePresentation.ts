@@ -4,9 +4,9 @@
  * The canonical timeline projection keeps a machine token as `summary`
  * (`kind:value`, e.g. `vt.download_sample:needs_review` or
  * `pivot_approve:pivot`) because it is built for every surface at once. The
- * cockpit translates it for the analyst; the raw token stays available as the
- * item's `title`. Unknown tokens are rendered verbatim: the projection is the
- * authority, so a new backend value must surface instead of being swallowed.
+ * cockpit translates it for the analyst; the raw token stays available in
+ * technical details. Unknown machine tokens use a generic label, while
+ * already human-readable summaries remain readable.
  */
 
 import type { TimelineItemV1 } from "../api/tasks";
@@ -18,7 +18,6 @@ import type {
   TaskStatus,
   ToolInvocationStatus,
 } from "../api/types";
-import type { WorkContributionImportStatus } from "../api/contributions";
 import { EVIDENCE_KIND_LABELS } from "../opinion/labels";
 import { INVOCATION_STATUS_LABELS } from "../samples/samplesLabels";
 import {
@@ -96,6 +95,14 @@ const TOOL_LABELS: Record<string, string> = {
   "vt.search": "Recherche VT",
 };
 
+export function toolOperationLabel(toolName: string): string {
+  const label = TOOL_LABELS[toolName];
+  if (label !== undefined) return label;
+  return toolName
+    .replace(/[._]+/g, " ")
+    .replace(/\b[a-z]/g, (letter) => letter.toUpperCase());
+}
+
 const PLAN_PARSE_LABELS: Record<string, string> = {
   parsed: "analysé",
   partially_parsed: "partiellement analysé",
@@ -113,6 +120,14 @@ const CONTRIBUTION_LABELS: Record<string, string> = {
   "finding:skipped": "Finding ignoré",
 };
 
+const UNKNOWN_ACTIVITY_LABEL = "Activité enregistrée";
+
+function unknownActivityLabel(summary: string): string {
+  return /^[a-z][a-z0-9_.-]*(?::[a-z0-9_.-]+)*$/.test(summary)
+    ? UNKNOWN_ACTIVITY_LABEL
+    : summary || UNKNOWN_ACTIVITY_LABEL;
+}
+
 function splitTransition(
   transition: string | undefined,
 ): [string, string] | null {
@@ -127,9 +142,8 @@ function statusLabel(value: string): string | null {
 }
 
 /**
- * One French sentence (or the raw token when it cannot be translated) for a
- * timeline item. Never invents a value: an unknown union member falls back to
- * the summary the server sent.
+ * One French sentence for a timeline item. Unknown machine tokens use a
+ * generic label; their exact value remains available in technical details.
  */
 export function timelineSummaryLabel(item: TimelineItemV1): string {
   const summary = item.summary;
@@ -139,7 +153,7 @@ export function timelineSummaryLabel(item: TimelineItemV1): string {
     case "task_event": {
       const [eventType, transition] = parts;
       const eventLabel = TASK_EVENT_LABELS[eventType as TaskEventType];
-      if (eventLabel === undefined) return summary;
+      if (eventLabel === undefined) return unknownActivityLabel(summary);
       const statuses = splitTransition(transition);
       if (statuses === null) return eventLabel;
       const from = statusLabel(statuses[0]);
@@ -151,20 +165,22 @@ export function timelineSummaryLabel(item: TimelineItemV1): string {
     case "decision": {
       const [decisionType, targetType] = parts;
       const typeLabel = DECISION_TYPE_LABELS[decisionType ?? ""];
-      if (typeLabel === undefined) return summary;
+      if (typeLabel === undefined) return unknownActivityLabel(summary);
       if (targetType === undefined) return typeLabel;
-      return `${typeLabel} · cible : ${
-        DECISION_TARGET_LABELS[targetType] ?? targetType
-      }`;
+      const targetLabel = DECISION_TARGET_LABELS[targetType];
+      if (targetLabel === undefined) return unknownActivityLabel(summary);
+      return `${typeLabel} · cible : ${targetLabel}`;
     }
     case "observation": {
       const [kind, objectType] = parts;
       const kindLabel =
         EVIDENCE_KIND_LABELS[kind as keyof typeof EVIDENCE_KIND_LABELS];
-      if (kindLabel === undefined || objectType === undefined) return summary;
-      return `${kindLabel} · objet : ${
-        OBJECT_TYPE_LABELS[objectType] ?? objectType
-      }`;
+      const objectTypeLabel =
+        objectType === undefined ? undefined : OBJECT_TYPE_LABELS[objectType];
+      if (kindLabel === undefined || objectTypeLabel === undefined) {
+        return unknownActivityLabel(summary);
+      }
+      return `${kindLabel} · objet : ${objectTypeLabel}`;
     }
     case "bridge_consultation":
     case "tool_invocation": {
@@ -173,75 +189,64 @@ export function timelineSummaryLabel(item: TimelineItemV1): string {
       const statusLabelText =
         INVOCATION_STATUS_LABELS[status as ToolInvocationStatus];
       if (toolLabel === undefined || statusLabelText === undefined) {
-        return summary;
+        return unknownActivityLabel(summary);
       }
       return `${toolLabel} · ${statusLabelText}`;
     }
     case "plan_version": {
       const [prefix, version, parseStatus] = parts;
-      if (prefix !== "plan_version" || version === undefined) return summary;
-      return `Version de plan ${version} · ${
-        PLAN_PARSE_LABELS[parseStatus ?? ""] ?? parseStatus ?? "statut inconnu"
-      }`;
+      if (prefix !== "plan_version" || version === undefined) {
+        return unknownActivityLabel(summary);
+      }
+      const parseLabel = PLAN_PARSE_LABELS[parseStatus ?? ""];
+      if (parseLabel === undefined) return unknownActivityLabel(summary);
+      return `Version de plan ${version} · ${parseLabel}`;
     }
     case "handoff": {
       const [prefix, version, transition] = parts;
       const statuses = splitTransition(transition);
       if (prefix !== "handoff" || version === undefined || statuses === null) {
-        return summary;
+        return unknownActivityLabel(summary);
       }
       const from =
         TASK_ACTOR_LABELS[statuses[0] as keyof typeof TASK_ACTOR_LABELS];
       const to =
         TASK_ACTOR_LABELS[statuses[1] as keyof typeof TASK_ACTOR_LABELS];
-      if (from === undefined || to === undefined) return summary;
+      if (from === undefined || to === undefined) {
+        return unknownActivityLabel(summary);
+      }
       return `Passation ${version} · ${from} → ${to}`;
     }
     case "contribution": {
       const [prefix, category, importStatus] = parts;
-      if (prefix !== "contribution") return summary;
+      if (prefix !== "contribution") return unknownActivityLabel(summary);
       const label =
         CONTRIBUTION_LABELS[`${category ?? ""}:${importStatus ?? ""}`];
-      if (label !== undefined) return label;
-      const categoryLabel =
-        category === "work_contribution"
-          ? "Contribution de travail"
-          : category === "observation"
-            ? "Observation"
-            : category === "finding"
-              ? "Finding"
-              : category;
-      const statusText: Record<WorkContributionImportStatus, string> = {
-        imported: "importé",
-        rejected: "refusé",
-        skipped: "ignoré",
-      };
-      return `${categoryLabel ?? summary} · ${
-        statusText[importStatus as WorkContributionImportStatus] ??
-        importStatus ??
-        "statut inconnu"
-      }`;
+      return label ?? unknownActivityLabel(summary);
     }
     case "agent_session": {
       const [prefix, adapterKind, state] = parts;
       if (prefix !== "agent_session" || adapterKind === undefined) {
-        return summary;
+        return unknownActivityLabel(summary);
       }
-      return `Session ${
-        ADAPTER_LABELS[adapterKind as OperatorAdapterKind] ?? adapterKind
-      } · ${
-        SESSION_STATE_LABELS[state as AgentSessionState] ??
-        state ??
-        "état inconnu"
-      }`;
+      const adapterLabel = ADAPTER_LABELS[adapterKind as OperatorAdapterKind];
+      const stateLabel = SESSION_STATE_LABELS[state as AgentSessionState];
+      if (adapterLabel === undefined || stateLabel === undefined) {
+        return unknownActivityLabel(summary);
+      }
+      return `Session ${adapterLabel} · ${stateLabel}`;
     }
     case "instruction": {
       const [prefix, state] = parts;
-      if (prefix !== "instruction" || state === undefined) return summary;
-      return `Instruction humaine · ${
-        INSTRUCTION_JOURNAL_STATE_LABELS[state as InstructionState] ?? state
-      }`;
+      if (prefix !== "instruction" || state === undefined) {
+        return unknownActivityLabel(summary);
+      }
+      const stateLabel =
+        INSTRUCTION_JOURNAL_STATE_LABELS[state as InstructionState];
+      return stateLabel === undefined
+        ? unknownActivityLabel(summary)
+        : `Instruction humaine · ${stateLabel}`;
     }
   }
-  return summary;
+  return unknownActivityLabel(summary);
 }

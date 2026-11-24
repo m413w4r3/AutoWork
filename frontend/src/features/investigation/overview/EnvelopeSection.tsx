@@ -19,13 +19,18 @@ import {
   type BootstrapEnvelopeProposalV1,
 } from "../api/bootstrap";
 import { createIdempotencyKey, toWorkshopApiError } from "../api/client";
+import { actorKindLabel, formatTimestamp } from "../tasks/labels";
+import { toolOperationLabel } from "../tasks/timelinePresentation";
 import {
   WorkshopLoadingState,
   WorkshopStateBanner,
   WorkshopTypedErrorState,
 } from "../shell/WorkshopStates";
 import {
+  BOOTSTRAP_LIMIT_SOURCE_LABELS,
+  bootstrapProviderLabel,
   BUDGET_DIMENSION_LABELS,
+  EXTERNAL_MODEL_POLICY_SOURCE_LABELS,
   PLAN_STATE_LABELS,
   ROUTE_STATUS_LABELS,
   bounded,
@@ -252,13 +257,21 @@ function ApprovalResult({
       title="Approbation G2 initiale enregistrée"
     >
       <p>
-        Dernière décision connue : {approval.approval_actor_id} ·{" "}
-        <time dateTime={approval.approved_at}>{approval.approved_at}</time>.
+        Dernière décision connue : {actorKindLabel(approval.approval_actor_id)}{" "}
+        ·{" "}
+        <time dateTime={approval.approved_at}>
+          {formatTimestamp(approval.approved_at)}
+        </time>
+        .
       </p>
       <p>Motif : non transmis par l’API d’enveloppe.</p>
       <details>
         <summary>Détails techniques</summary>
         <dl className="workshop-meta">
+          <dt>Identifiant de l’acteur</dt>
+          <dd>
+            <code>{approval.approval_actor_id}</code>
+          </dd>
           <dt>Identifiant de décision</dt>
           <dd>
             <code>{approval.approval_decision_id}</code>
@@ -285,18 +298,14 @@ function EnvelopeProposal({
     >
       <h3 id="overview-envelope-ceilings-heading">Plafonds proposés</h3>
       <dl className="workshop-meta">
-        <dt>Schéma</dt>
-        <dd>{proposal.schema_version}</dd>
         <dt>Généré le</dt>
         <dd>
-          <time dateTime={proposal.generated_at}>{proposal.generated_at}</time>
+          <time dateTime={proposal.generated_at}>
+            {formatTimestamp(proposal.generated_at)}
+          </time>
         </dd>
         <dt>État du plan</dt>
         <dd>{PLAN_STATE_LABELS[proposal.plan_state]}</dd>
-        <dt>Empreinte de la proposition</dt>
-        <dd>
-          <code>{proposal.proposal_sha256}</code> (non cliquable)
-        </dd>
         <dt>Inventaire</dt>
         <dd>
           {formatCount(proposal.inventory.seeds)} graine(s) ·{" "}
@@ -317,7 +326,7 @@ function EnvelopeProposal({
         <dd>
           {proposal.allowed_providers.length === 0
             ? "aucun"
-            : proposal.allowed_providers.join(", ")}
+            : proposal.allowed_providers.map(bootstrapProviderLabel).join(", ")}
         </dd>
         <dt>Acquisition</dt>
         <dd>{proposal.acquire_hits_allowed ? "autorisée" : "non autorisée"}</dd>
@@ -344,10 +353,53 @@ function EnvelopeProposal({
             {formatCount(proposal.vt_reads.iocs_planned)}
           </dd>
         </dl>
+        <details>
+          <summary>Détails techniques</summary>
+          <dl className="workshop-meta">
+            <dt>Schéma</dt>
+            <dd>
+              <code>{proposal.schema_version}</code>
+            </dd>
+            <dt>Empreinte de la proposition</dt>
+            <dd>
+              <code>{proposal.proposal_sha256}</code> (non cliquable)
+            </dd>
+            <dt>Identifiants de fournisseurs autorisés</dt>
+            <dd>
+              <code>{proposal.allowed_providers.join(", ") || "aucun"}</code>
+            </dd>
+            <dt>Identifiants de fournisseurs de modèle externe</dt>
+            <dd>
+              <code>
+                {proposal.external_model.providers.join(", ") || "aucun"}
+              </code>
+            </dd>
+            <dt>Sources techniques des plafonds</dt>
+            <dd>
+              <code>
+                {proposal.costs.limits
+                  .map((limit) => `${limit.dimension}: ${limit.source}`)
+                  .join(" · ") || "Non renseignées"}
+              </code>
+            </dd>
+            <dt>Identifiants d’outils VirusTotal</dt>
+            <dd>
+              <code>
+                {proposal.vt_reads.per_tool
+                  .map((tool) => tool.tool_name)
+                  .join(", ") || "Non renseignés"}
+              </code>
+            </dd>
+            <dt>Source technique de la politique externe</dt>
+            <dd>
+              <code>{proposal.external_model.policy_source}</code>
+            </dd>
+          </dl>
+        </details>
         <ul>
           {proposal.vt_reads.per_tool.map((tool) => (
             <li key={tool.tool_name}>
-              <code>{tool.tool_name}</code> : {formatCount(tool.covered)}{" "}
+              {toolOperationLabel(tool.tool_name)} : {formatCount(tool.covered)}{" "}
               couverte(s) sur {formatCount(tool.planned)}
             </li>
           ))}
@@ -396,7 +448,8 @@ function EnvelopeProposal({
           {proposal.costs.limits.map((limit) => (
             <li key={limit.dimension}>
               {BUDGET_DIMENSION_LABELS[limit.dimension]} :{" "}
-              {formatCount(limit.limit)} · source {limit.source}
+              {formatCount(limit.limit)} · source{" "}
+              {BOOTSTRAP_LIMIT_SOURCE_LABELS[limit.source]}
             </li>
           ))}
         </ul>
@@ -427,10 +480,18 @@ function EnvelopeProposal({
           <dd>
             {proposal.external_model.providers.length === 0
               ? "aucun"
-              : proposal.external_model.providers.join(", ")}
+              : proposal.external_model.providers
+                  .map(bootstrapProviderLabel)
+                  .join(", ")}
           </dd>
           <dt>Source de politique</dt>
-          <dd>{proposal.external_model.policy_source}</dd>
+          <dd>
+            {
+              EXTERNAL_MODEL_POLICY_SOURCE_LABELS[
+                proposal.external_model.policy_source
+              ]
+            }
+          </dd>
         </dl>
         <p>{proposal.external_model.summary}</p>
       </section>

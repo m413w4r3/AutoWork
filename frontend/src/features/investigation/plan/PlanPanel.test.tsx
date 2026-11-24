@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -352,6 +352,27 @@ describe("PlanPanel acceptance", () => {
     expect(
       await screen.findByText("Piste 1 — Analyser le dropper"),
     ).toBeInTheDocument();
+    const leadArticle = screen
+      .getByText("Piste 1 — Analyser le dropper")
+      .closest("article.m24-lead");
+    expect(leadArticle).not.toBeNull();
+    expect(
+      within(leadArticle as HTMLElement).getByText("Floss · Ghidra"),
+    ).toBeVisible();
+    expect(
+      within(leadArticle as HTMLElement).getByText("claim-1"),
+    ).not.toBeVisible();
+    await user.click(
+      within(leadArticle as HTMLElement).getByText("Détails techniques", {
+        selector: "summary",
+      }),
+    );
+    expect(
+      within(leadArticle as HTMLElement).getByText("claim-1"),
+    ).toBeVisible();
+    expect(
+      within(leadArticle as HTMLElement).getByText("lead-a"),
+    ).toBeVisible();
     for (const label of [
       "Objectif",
       "Justification CTI",

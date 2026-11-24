@@ -28,6 +28,7 @@ import {
 } from "../samples/samplesLabels";
 import {
   COVERAGE_KIND_LABELS,
+  HASH_TYPE_LABELS,
   IOC_KIND_LABELS,
   PLAN_STATE_LABELS,
   REASON_LABELS,
@@ -148,7 +149,9 @@ function InventoryIocList({
               {IOC_KIND_LABELS[ioc.kind]} ·{" "}
               <code>{displayIocValue(ioc.value)}</code> ·{" "}
               {ioc.origin === "seed" ? "graine" : "découvert"}
-              {ioc.hash_type ? ` · type ${ioc.hash_type}` : ""}
+              {ioc.hash_type
+                ? ` · type ${HASH_TYPE_LABELS[ioc.hash_type]}`
+                : ""}
             </p>
             <p>
               {formatCount(ioc.associations.length)} association(s) ·{" "}

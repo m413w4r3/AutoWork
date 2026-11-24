@@ -541,6 +541,18 @@ describe("TaskCard keyboard", () => {
 });
 
 describe("TaskWorkspace list and selection", () => {
+  it("ne répète pas l’adaptateur dans le libellé d’acteur d’une tâche active", async () => {
+    const task = assignedOperatorTask();
+    renderWorkspace([task], [], [makeSession({ task_id: task.id })]);
+
+    const list = await screen.findByRole("list", { name: "Liste des tâches" });
+    const row = within(list).getByRole("button", {
+      name: /Vérifier le domaine C2/,
+    });
+    expect(row).toHaveTextContent("Acteur : Opérateur · Codex CLI");
+    expect(row).not.toHaveTextContent("Codex CLI · Codex CLI");
+  });
+
   it("keeps status, priority, actor and text filters", async () => {
     const user = userEvent.setup();
     const matching = makeTask({
@@ -703,7 +715,7 @@ describe("TaskWorkspace list and selection", () => {
           task_id: task.id,
           actor_kind: "operator",
           actor_id: "codex",
-          summary: "Finding importé",
+          summary: "future_event:whatever",
           evidence: false,
           refs: {
             finding_id: "finding-1",
@@ -733,7 +745,28 @@ describe("TaskWorkspace list and selection", () => {
     expect(
       await screen.findByText("Contribution agentique non vérifiée"),
     ).toBeInTheDocument();
-    expect(screen.getByText("finding-1")).toBeInTheDocument();
+    expect(screen.getByText("Activité enregistrée")).toBeInTheDocument();
+    const resultItem = screen
+      .getByText("Activité enregistrée")
+      .closest("li.m24-result-evidence");
+    expect(resultItem).not.toBeNull();
+    const technicalDetails = within(resultItem as HTMLElement).getByText(
+      "Détails techniques",
+      { selector: "summary" },
+    );
+    expect(
+      within(resultItem as HTMLElement).getByText("future_event:whatever"),
+    ).not.toBeVisible();
+    expect(
+      within(resultItem as HTMLElement).getByText("finding-1"),
+    ).not.toBeVisible();
+    await user.click(technicalDetails);
+    expect(
+      within(resultItem as HTMLElement).getByText("future_event:whatever"),
+    ).toBeVisible();
+    expect(
+      within(resultItem as HTMLElement).getByText("finding-1"),
+    ).toBeVisible();
     expect(screen.queryByText("Contribution confirmée")).toBeNull();
   });
 

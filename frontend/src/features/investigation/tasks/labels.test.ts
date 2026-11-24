@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { AgentSessionState, InstructionState } from "../api/types";
 import {
   actorRefLabel,
+  activityEventLabel,
   INSTRUCTION_JOURNAL_STATE_LABELS,
   INSTRUCTION_SUBMISSION_PENDING_LABEL,
   SESSION_STATE_LABELS,
@@ -42,6 +43,26 @@ describe("actorRefLabel", () => {
     expect(actorRefLabel("analyst:test")).toBe("analyst:test");
     expect(actorRefLabel("virustotal")).toBe("virustotal");
     expect(actorRefLabel("operator:")).toBe("operator:");
+  });
+});
+
+describe("activityEventLabel", () => {
+  it("traduit les événements d’enquête et de tâche connus", () => {
+    expect(activityEventLabel("investigation_record")).toBe(
+      "Mise à jour du dossier",
+    );
+    expect(activityEventLabel("task_created")).toBe("Tâche créée");
+  });
+
+  it("remplace un identifiant d’événement inconnu par un libellé générique", () => {
+    expect(activityEventLabel("future_investigation_event")).toBe(
+      "Activité enregistrée",
+    );
+    expect(activityEventLabel("heartbeat")).toBe("Activité enregistrée");
+    expect(activityEventLabel("")).toBe("Activité enregistrée");
+    expect(activityEventLabel("Collecte VT terminée")).toBe(
+      "Collecte VT terminée",
+    );
   });
 });
 

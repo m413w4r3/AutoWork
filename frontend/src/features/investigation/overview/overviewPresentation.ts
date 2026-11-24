@@ -1,7 +1,9 @@
 /** Libellés français et formatage borné de la Vue d’ensemble M24. */
 
 import type {
+  BootstrapBudgetLimitV1,
   BootstrapEnvelopeProposalV1,
+  BootstrapExternalModelProposalV1,
   BootstrapCoverageKind,
   BootstrapPlanState,
   BootstrapReason,
@@ -79,6 +81,32 @@ export const BUDGET_DIMENSION_LABELS: Record<BudgetDimension, string> = {
   context_bytes: "Octets de contexte",
 };
 
+export const BOOTSTRAP_LIMIT_SOURCE_LABELS: Record<
+  BootstrapBudgetLimitV1["source"],
+  string
+> = {
+  inventory: "Inventaire",
+  settings_cap: "Plafond de configuration",
+  settings_default: "Valeur par défaut de la configuration",
+};
+
+export const EXTERNAL_MODEL_POLICY_SOURCE_LABELS: Record<
+  BootstrapExternalModelProposalV1["policy_source"],
+  string
+> = {
+  article_policy: "Politique de l’article",
+};
+
+export const BOOTSTRAP_PROVIDER_LABELS: Readonly<Record<string, string>> = {
+  vt: "VirusTotal",
+  bridge: "Bridge",
+  shodan: "Shodan",
+};
+
+export function bootstrapProviderLabel(provider: string): string {
+  return BOOTSTRAP_PROVIDER_LABELS[provider] ?? "Autre fournisseur";
+}
+
 export const AGENT_STATUS_LABELS: Record<WorkspaceAgentStatus, string> = {
   available: "Disponible",
   unavailable: "Indisponible",
@@ -101,6 +129,15 @@ export const IOC_KIND_LABELS: Record<BootstrapSnapshotIocV1["kind"], string> = {
   ipv4: "Adresse IPv4",
   domain: "Domaine",
   url: "URL",
+};
+
+export const HASH_TYPE_LABELS: Record<
+  NonNullable<BootstrapSnapshotIocV1["hash_type"]>,
+  string
+> = {
+  md5: "MD5",
+  sha1: "SHA-1",
+  sha256: "SHA-256",
 };
 
 export interface OverviewDecision {

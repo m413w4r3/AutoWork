@@ -156,6 +156,28 @@ export const TASK_EVENT_LABELS: Record<TaskEventType, string> = {
   contribution_imported: "Contribution importée",
 };
 
+const INVESTIGATION_ACTIVITY_LABELS: Readonly<Record<string, string>> = {
+  investigation_record: "Mise à jour du dossier",
+  invocation: "Invocation enregistrée",
+  observation: "Observation enregistrée",
+  backend_job_heartbeat: "Activité du traitement",
+};
+
+/** Turns persisted event/source tokens into French labels for primary views. */
+export function activityEventLabel(value: string): string {
+  if (value.trim() === "") return "Activité enregistrée";
+
+  const taskEventLabel = TASK_EVENT_LABELS[value as TaskEventType];
+  if (taskEventLabel !== undefined) return taskEventLabel;
+
+  const investigationLabel = INVESTIGATION_ACTIVITY_LABELS[value];
+  if (investigationLabel !== undefined) return investigationLabel;
+
+  return /^[a-z][a-z0-9]*(?:[._:-][a-z0-9]+)*$/.test(value)
+    ? "Activité enregistrée"
+    : value;
+}
+
 export const TIMELINE_TYPE_LABELS: Record<TimelineItemType, string> = {
   task_event: "Événement de tâche",
   decision: "Décision humaine",
@@ -175,6 +197,16 @@ export const TIMELINE_ACTOR_LABELS: Record<TimelineActorKind, string> = {
   system: "Système",
   source: "Source",
 };
+
+/** Human actor kind only; the persisted principal stays in technical details. */
+export function actorKindLabel(actorId: string | null): string {
+  if (actorId === null) return "Non renseigné";
+  const separator = actorId.indexOf(":");
+  const kind = separator === -1 ? actorId : actorId.slice(0, separator);
+  return (
+    TIMELINE_ACTOR_LABELS[kind as TimelineActorKind] ?? "Acteur authentifié"
+  );
+}
 
 export function formatTimestamp(value: string | null): string {
   if (value === null || value === "") return "Non renseigné";
