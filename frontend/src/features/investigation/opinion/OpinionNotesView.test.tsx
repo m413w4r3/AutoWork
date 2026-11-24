@@ -670,6 +670,37 @@ async function openProposalReview() {
   await screen.findByRole("button", { name: "Accepter" });
 }
 
+describe("OpinionNotesView — navigation des onglets", () => {
+  it("déplace le focus et la sélection avec les flèches, Home et End", async () => {
+    const user = userEvent.setup();
+    renderView();
+    const notesTab = await screen.findByRole("tab", { name: "Notes 2" });
+    const proposalsTab = screen.getByRole("tab", { name: "Propositions 1" });
+    const pdfTab = screen.getByRole("tab", { name: "PDF" });
+
+    expect(notesTab).toHaveAttribute("tabindex", "0");
+    expect(proposalsTab).toHaveAttribute("tabindex", "-1");
+    notesTab.focus();
+    await user.keyboard("{ArrowRight}");
+
+    expect(proposalsTab).toHaveFocus();
+    expect(proposalsTab).toHaveAttribute("aria-selected", "true");
+    expect(proposalsTab).toHaveAttribute("tabindex", "0");
+    expect(notesTab).toHaveAttribute("tabindex", "-1");
+
+    await user.keyboard("{Home}");
+    expect(notesTab).toHaveFocus();
+    expect(notesTab).toHaveAttribute("aria-selected", "true");
+    expect(notesTab).toHaveAttribute("tabindex", "0");
+
+    await user.keyboard("{End}");
+    expect(pdfTab).toHaveFocus();
+    expect(pdfTab).toHaveAttribute("aria-selected", "true");
+    expect(pdfTab).toHaveAttribute("tabindex", "0");
+    expect(notesTab).toHaveAttribute("tabindex", "-1");
+  });
+});
+
 afterEach(() => {
   vi.unstubAllGlobals();
   window.history.replaceState({}, "", "/");

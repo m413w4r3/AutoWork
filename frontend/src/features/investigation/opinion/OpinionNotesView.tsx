@@ -1,5 +1,6 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { KeyboardEvent } from "react";
 
 import { analystOpinionPreviewPdfUrl } from "../../../api/analystOpinion";
 import { useInvestigation } from "../../../api/investigation";
@@ -36,6 +37,12 @@ import type { AnalystNoteV1 } from "./types";
 import "./opinion.css";
 
 type OpinionTab = "notes" | "proposals" | "opinion" | "pdf";
+const OPINION_TABS: readonly OpinionTab[] = [
+  "notes",
+  "proposals",
+  "opinion",
+  "pdf",
+];
 
 export function OpinionNotesView({
   investigationId,
@@ -63,6 +70,7 @@ export function OpinionNotesView({
   const [correctionSeed, setCorrectionSeed] =
     useState<BridgeCorrectionSeed | null>(null);
   const [activeTab, setActiveTab] = useState<OpinionTab>("notes");
+  const opinionTabRefs = useRef(new Map<OpinionTab, HTMLButtonElement>());
 
   const draft = opinionQuery.data?.draft ?? null;
   const notes = useMemo(() => draft?.observations ?? [], [draft?.observations]);
@@ -74,6 +82,32 @@ export function OpinionNotesView({
   const articleCatalog = articleAnchorsQuery.data ?? null;
   const workingStateVersion =
     activityQuery.data?.working_state?.version ?? null;
+
+  function handleOpinionTabKeyDown(
+    event: KeyboardEvent<HTMLButtonElement>,
+    index: number,
+  ) {
+    const keys = ["ArrowRight", "ArrowDown", "ArrowLeft", "ArrowUp"];
+    if (
+      !keys.includes(event.key) &&
+      event.key !== "Home" &&
+      event.key !== "End"
+    )
+      return;
+    event.preventDefault();
+    const nextIndex =
+      event.key === "Home"
+        ? 0
+        : event.key === "End"
+          ? OPINION_TABS.length - 1
+          : event.key === "ArrowRight" || event.key === "ArrowDown"
+            ? (index + 1) % OPINION_TABS.length
+            : (index - 1 + OPINION_TABS.length) % OPINION_TABS.length;
+    const next = OPINION_TABS[nextIndex];
+    if (next === undefined) return;
+    setActiveTab(next);
+    opinionTabRefs.current.get(next)?.focus({ preventScroll: true });
+  }
 
   useEffect(() => {
     if (selectedAnchor !== "") return;
@@ -245,46 +279,31 @@ export function OpinionNotesView({
 
         <div className="opinion-workspace__panel">
           <div role="tablist" aria-label="Panneau de la note de l’analyste">
-            <button
-              type="button"
-              role="tab"
-              id="opinion-tab-notes"
-              aria-selected={activeTab === "notes"}
-              aria-controls="opinion-tabpanel"
-              onClick={() => setActiveTab("notes")}
-            >
-              Notes {notes.length}
-            </button>
-            <button
-              type="button"
-              role="tab"
-              id="opinion-tab-proposals"
-              aria-selected={activeTab === "proposals"}
-              aria-controls="opinion-tabpanel"
-              onClick={() => setActiveTab("proposals")}
-            >
-              Propositions {proposals.length}
-            </button>
-            <button
-              type="button"
-              role="tab"
-              id="opinion-tab-opinion"
-              aria-selected={activeTab === "opinion"}
-              aria-controls="opinion-tabpanel"
-              onClick={() => setActiveTab("opinion")}
-            >
-              Avis {draft === null ? "—" : `v${draft.version}`}
-            </button>
-            <button
-              type="button"
-              role="tab"
-              id="opinion-tab-pdf"
-              aria-selected={activeTab === "pdf"}
-              aria-controls="opinion-tabpanel"
-              onClick={() => setActiveTab("pdf")}
-            >
-              PDF
-            </button>
+            {OPINION_TABS.map((tab, index) => (
+              <button
+                key={tab}
+                ref={(element) => {
+                  if (element) opinionTabRefs.current.set(tab, element);
+                  else opinionTabRefs.current.delete(tab);
+                }}
+                type="button"
+                role="tab"
+                id={`opinion-tab-${tab}`}
+                aria-selected={activeTab === tab}
+                aria-controls="opinion-tabpanel"
+                tabIndex={activeTab === tab ? 0 : -1}
+                onClick={() => setActiveTab(tab)}
+                onKeyDown={(event) => handleOpinionTabKeyDown(event, index)}
+              >
+                {tab === "notes"
+                  ? `Notes ${notes.length}`
+                  : tab === "proposals"
+                    ? `Propositions ${proposals.length}`
+                    : tab === "opinion"
+                      ? `Avis ${draft === null ? "—" : `v${draft.version}`}`
+                      : "PDF"}
+              </button>
+            ))}
           </div>
 
           <div
