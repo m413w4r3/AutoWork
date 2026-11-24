@@ -29,13 +29,17 @@ and malformed PostgreSQL schemas using disposable databases.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
 import pytest
 from alembic import command
+from alembic.autogenerate import compare_metadata
+from alembic.migration import MigrationContext
 from sqlalchemy import (
     ARRAY,
     BigInteger,
@@ -47,6 +51,7 @@ from sqlalchemy import (
     Integer,
     LargeBinary,
     String,
+    Table,
     Text,
     UniqueConstraint,
     Uuid,
@@ -57,7 +62,6 @@ from sqlalchemy.dialects.postgresql import BYTEA, JSONB
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
-from sqlalchemy.sql.schema import Table
 
 from cti_app.infrastructure.database.models import (  # noqa: F401
     bridge_generation_slots,
@@ -94,6 +98,8 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
 )
 from cti_app.infrastructure.database.models.base import Base
 from tests.integration.conftest import _alembic_config
+from tests.support.postgres_rows import capture_primary_keys, capture_table_rows
+from tests.support.schema_snapshot import capture_schema
 
 
 def _head_revision() -> str:
@@ -114,7 +120,23 @@ def _head_revision() -> str:
     )
 
 
+def test_alembic_script_has_one_head() -> None:
+    from alembic.script import ScriptDirectory
+
+    script = ScriptDirectory.from_config(_alembic_config("postgresql://unused/unused"))
+    assert script.get_heads() == ["0029_note_anchor_identity"]
+
+
 pytestmark = pytest.mark.integration
+
+# These two collection-attempt checks belong to migration 0009, outside ORM
+# metadata; their names and presence are asserted by the per-table comparator.
+_MIGRATION_ONLY_CHECK_CONSTRAINTS = frozenset(
+    {
+        "ck_collection_attempts_strategy_metadata",
+        "ck_collection_attempts_duration_ms",
+    }
+)
 
 # ---------------------------------------------------------------------------
 # Expected shape of the migrated database
@@ -186,9 +208,11 @@ def test_investigation_tables_are_registered_in_orm_metadata() -> None:
     assert INVESTIGATION_TABLES <= set(Base.metadata.tables)
 
 
-# (local columns, referred table, referred columns, ON DELETE) — shared by
-# both the ORM-derived and the reflected-from-database foreign key shapes.
-ForeignKeyShape = tuple[tuple[str, ...], str, tuple[str, ...], str | None]
+# Ordered local columns, target, ordered target columns, and referential
+# actions/deferrability — shared by ORM and reflected foreign-key shapes.
+ForeignKeyShape = tuple[
+    tuple[str, ...], str, tuple[str, ...], str | None, str | None, bool, str | None
+]
 
 # Column definitions: type family, nullability, or both.
 ColumnShape = tuple[str, bool, int | None]
@@ -482,8 +506,8 @@ def _expected_columns(table: Table) -> dict[str, ColumnShape]:
     return {col.name: _column_shape(col.type, bool(col.nullable)) for col in table.columns}
 
 
-def _expected_primary_key(table: Table) -> frozenset[str]:
-    return frozenset(col.name for col in table.primary_key.columns)
+def _expected_primary_key(table: Table) -> tuple[str, ...]:
+    return tuple(col.name for col in table.primary_key.columns)
 
 
 def _expected_foreign_keys(table: Table) -> set[ForeignKeyShape]:
@@ -497,18 +521,21 @@ def _expected_foreign_keys(table: Table) -> set[ForeignKeyShape]:
                 referred_table,
                 tuple(str(elem.target_fullname).split(".", 1)[1] for elem in elements),
                 fkc.ondelete,
+                fkc.onupdate,
+                bool(fkc.deferrable),
+                fkc.initially if fkc.deferrable else None,
             )
         )
     return shapes
 
 
-def _expected_unique_constraints(table: Table) -> set[frozenset[str]]:
+def _expected_unique_constraints(table: Table) -> set[tuple[str, ...]]:
     shapes = {
-        frozenset(col.name for col in constraint.columns)
+        tuple(col.name for col in constraint.columns)
         for constraint in table.constraints
         if isinstance(constraint, UniqueConstraint)
     }
-    shapes.update(frozenset({col.name}) for col in table.columns if col.unique)
+    shapes.update((col.name,) for col in table.columns if col.unique)
     return shapes
 
 
@@ -520,12 +547,7 @@ def _expected_check_constraint_names(table: Table) -> set[str]:
     }
     if table.name == "collection_attempts":
         # Migration 0009 owns these guards outside the declarative ORM table.
-        names.update(
-            {
-                "ck_collection_attempts_strategy_metadata",
-                "ck_collection_attempts_duration_ms",
-            }
-        )
+        names.update(_MIGRATION_ONLY_CHECK_CONSTRAINTS)
     return names
 
 
@@ -545,24 +567,31 @@ def _actual_columns(inspector: Any, table_name: str) -> dict[str, ColumnShape]:
     }
 
 
-def _actual_primary_key(inspector: Any, table_name: str) -> frozenset[str]:
-    return frozenset(inspector.get_pk_constraint(table_name)["constrained_columns"])
+def _actual_primary_key(inspector: Any, table_name: str) -> tuple[str, ...]:
+    return tuple(inspector.get_pk_constraint(table_name)["constrained_columns"])
 
 
 def _actual_foreign_keys(inspector: Any, table_name: str) -> set[ForeignKeyShape]:
-    return {
-        (
-            tuple(fk["constrained_columns"]),
-            fk["referred_table"],
-            tuple(fk["referred_columns"]),
-            fk.get("options", {}).get("ondelete"),
+    shapes: set[ForeignKeyShape] = set()
+    for foreign_key in inspector.get_foreign_keys(table_name):
+        options = foreign_key.get("options", {})
+        deferrable = bool(options.get("deferrable"))
+        shapes.add(
+            (
+                tuple(foreign_key["constrained_columns"]),
+                foreign_key["referred_table"],
+                tuple(foreign_key["referred_columns"]),
+                options.get("ondelete"),
+                options.get("onupdate"),
+                deferrable,
+                options.get("initially") if deferrable else None,
+            )
         )
-        for fk in inspector.get_foreign_keys(table_name)
-    }
+    return shapes
 
 
-def _actual_unique_constraints(inspector: Any, table_name: str) -> set[frozenset[str]]:
-    return {frozenset(uc["column_names"]) for uc in inspector.get_unique_constraints(table_name)}
+def _actual_unique_constraints(inspector: Any, table_name: str) -> set[tuple[str, ...]]:
+    return {tuple(uc["column_names"]) for uc in inspector.get_unique_constraints(table_name)}
 
 
 def _actual_check_constraint_names(inspector: Any, table_name: str) -> set[str]:
@@ -611,6 +640,27 @@ def _snapshot_table(inspector: Any, table_name: str) -> dict[str, Any]:
 def _snapshot_database(sync_connection: Connection) -> dict[str, dict[str, Any]]:
     inspector = inspect(sync_connection)
     return {name: _snapshot_table(inspector, name) for name in inspector.get_table_names()}
+
+
+def _autogenerate_differences(sync_connection: Connection) -> list[Any]:
+    def include_object(
+        _obj: Any,
+        name: str | None,
+        _type: str,
+        _reflected: bool,
+        _compare_to: Any,
+    ) -> bool:
+        return name not in _MIGRATION_ONLY_CHECK_CONSTRAINTS
+
+    context = MigrationContext.configure(
+        sync_connection,
+        opts={
+            "compare_type": True,
+            "compare_server_default": True,
+            "include_object": include_object,
+        },
+    )
+    return list(compare_metadata(context, Base.metadata))
 
 
 async def _table_names(database_url: str) -> set[str]:
@@ -756,6 +806,37 @@ async def _database_snapshot(database_url: str) -> dict[str, dict[str, Any]]:
         await engine.dispose()
 
 
+async def _primary_key_snapshot(
+    database_url: str, table_names: Iterable[str]
+) -> dict[str, dict[str, Any]]:
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.connect() as connection:
+            return await connection.run_sync(lambda sync: capture_primary_keys(sync, table_names))
+    finally:
+        await engine.dispose()
+
+
+async def _table_row_snapshot(
+    database_url: str, table_names: Iterable[str]
+) -> dict[str, list[dict[str, Any]]]:
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.connect() as connection:
+            return await connection.run_sync(lambda sync: capture_table_rows(sync, table_names))
+    finally:
+        await engine.dispose()
+
+
+async def _autogenerate_differences_for_database(database_url: str) -> list[Any]:
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.connect() as connection:
+            return await connection.run_sync(_autogenerate_differences)
+    finally:
+        await engine.dispose()
+
+
 async def _check_constraints(database_url: str, table_name: str) -> dict[str, str]:
     engine = create_async_engine(database_url)
     try:
@@ -803,6 +884,63 @@ async def _insert_edition_marker(database_url: str, edition_id: Any) -> str:
             return str(result.scalar_one())
     finally:
         await engine.dispose()
+
+
+async def _insert_legacy_sample_fixture(
+    database_url: str,
+    *,
+    edition_id: Any,
+    subject_id: Any,
+    blob_id: Any,
+    sample_id: Any,
+) -> str:
+    payload = b"synthetic migration preservation fixture"
+    sha256 = hashlib.sha256(payload).hexdigest()
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO subjects "
+                    "(id, edition_id, title, slug, tlp, version, created_at, updated_at) "
+                    "VALUES (:id, :edition_id, 'Migration fixture subject', "
+                    "'migration-fixture-subject', 'CLEAR', 1, now(), now())"
+                ),
+                {"id": subject_id, "edition_id": edition_id},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO blobs "
+                    "(id, sha256, size, mime_type, logical_bucket, object_key, created_at) "
+                    "VALUES (:id, :sha256, :size, 'application/octet-stream', "
+                    "'migration-test', :object_key, now())"
+                ),
+                {
+                    "id": blob_id,
+                    "sha256": sha256,
+                    "size": len(payload),
+                    "object_key": f"migration-tests/{blob_id}",
+                },
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO samples "
+                    "(id, subject_id, blob_id, original_name, origin, acquired_at, tlp, "
+                    "do_not_submit, external_llm_allowed, origin_kind, state, expected_hash, "
+                    "created_at) VALUES (:id, :subject_id, :blob_id, 'synthetic.bin', "
+                    "'migration test fixture', now(), 'CLEAR', false, false, 'manual', "
+                    "'validated', :sha256, now())"
+                ),
+                {
+                    "id": sample_id,
+                    "subject_id": subject_id,
+                    "blob_id": blob_id,
+                    "sha256": sha256,
+                },
+            )
+    finally:
+        await engine.dispose()
+    return sha256
 
 
 async def _install_manual_c2_ddl(database_url: str) -> None:
@@ -983,6 +1121,14 @@ def test_orm_table_matches_migrated_schema(
     assert actual["checks"] == _expected_check_constraint_names(table)
 
     assert actual["indexes"] == _expected_indexes(table)
+
+
+def test_migrated_schema_has_no_unexpected_autogenerate_differences(
+    migrated_postgres_url: str,
+) -> None:
+    """Require an empty ORM autogenerate diff after excluding the two migration-owned checks."""
+    differences = asyncio.run(_autogenerate_differences_for_database(migrated_postgres_url))
+    assert differences == []
 
 
 def test_production_repair_decision_source_loss_contract_is_in_fresh_schema(
@@ -1257,11 +1403,26 @@ def test_fresh_install_rejects_an_incompatible_existing_schema(
             await engine.dispose()
 
     asyncio.run(_create_conflicting_table())
+    before_tables = asyncio.run(_table_names(temporary_postgres_url))
+    before_version = (
+        asyncio.run(_alembic_version(temporary_postgres_url))
+        if ALEMBIC_TABLE in before_tables
+        else None
+    )
+    before = capture_schema(temporary_postgres_url)
     with pytest.raises(DBAPIError) as exc_info:
         command.upgrade(_alembic_config(temporary_postgres_url), "head")
 
     assert _sqlstate(exc_info.value) == "42P07"
     assert "editions" in str(exc_info.value).lower()
+    after_tables = asyncio.run(_table_names(temporary_postgres_url))
+    after_version = (
+        asyncio.run(_alembic_version(temporary_postgres_url))
+        if ALEMBIC_TABLE in after_tables
+        else None
+    )
+    assert after_version == before_version
+    assert capture_schema(temporary_postgres_url) == before
 
 
 def test_fresh_install_and_repeated_upgrade_are_conflict_free(
@@ -1343,12 +1504,15 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     assert _COLLECTION_ATTEMPT_ADDITION_CHECKS <= attempt_schema["checks"]
 
     # The migration chain is idempotent: repeating the upgrade is a no-op for
-    # the schema and trigger definitions.
+    # the exact public schema snapshot, including Alembic history and catalog
+    # definitions, as well as the older focused schema/trigger oracles above.
+    before_repeat = capture_schema(temporary_postgres_url)
     command.upgrade(config, "head")
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
     assert asyncio.run(_table_names(temporary_postgres_url)) == tables
     assert asyncio.run(_database_snapshot(temporary_postgres_url)) == schema_definitions
     assert asyncio.run(_trigger_definitions(temporary_postgres_url)) == trigger_definitions
+    assert capture_schema(temporary_postgres_url) == before_repeat
 
 
 def test_editorial_bar_chart_operation_check_downgrades_when_unused(
@@ -1426,6 +1590,9 @@ def test_editorial_bar_chart_operation_downgrade_refuses_matching_rows(
             await engine.dispose()
 
     asyncio.run(_insert_bar_chart_proposal())
+    before_schema = capture_schema(temporary_postgres_url)
+    table_names = tuple(row["name"] for row in before_schema["tables"])
+    before_rows = asyncio.run(_table_row_snapshot(temporary_postgres_url, table_names))
     downgrade_message = (
         "refusing to downgrade ck_editorial_proposals_operation while "
         "create_bar_chart proposals exist"
@@ -1437,6 +1604,8 @@ def test_editorial_bar_chart_operation_downgrade_refuses_matching_rows(
         command.downgrade(config, "0016_editorial_drafts")
 
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
+    assert capture_schema(temporary_postgres_url) == before_schema
+    assert asyncio.run(_table_row_snapshot(temporary_postgres_url, table_names)) == before_rows
     expanded_check = asyncio.run(_check_constraints(temporary_postgres_url, "editorial_proposals"))[
         "ck_editorial_proposals_operation"
     ]
@@ -1563,6 +1732,9 @@ def test_editorial_enrichment_element_operation_downgrade_refuses_matching_rows(
 
     asyncio.run(_drop_editorial_proposal_parent_fks(temporary_postgres_url))
     asyncio.run(_insert_editorial_proposal_row(temporary_postgres_url, "move_enrichment_element"))
+    before_schema = capture_schema(temporary_postgres_url)
+    table_names = tuple(row["name"] for row in before_schema["tables"])
+    before_rows = asyncio.run(_table_row_snapshot(temporary_postgres_url, table_names))
 
     downgrade_message = (
         "refusing to downgrade ck_editorial_proposals_operation while "
@@ -1572,6 +1744,8 @@ def test_editorial_enrichment_element_operation_downgrade_refuses_matching_rows(
         command.downgrade(config, "0017_editorial_proposal_bar_chart_operation")
 
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
+    assert capture_schema(temporary_postgres_url) == before_schema
+    assert asyncio.run(_table_row_snapshot(temporary_postgres_url, table_names)) == before_rows
     expanded_check = asyncio.run(_check_constraints(temporary_postgres_url, "editorial_proposals"))[
         "ck_editorial_proposals_operation"
     ]
@@ -1715,6 +1889,27 @@ def test_stamped_0001_without_c2_upgrades_additively_and_preserves_data(
     edition_id = uuid4()
     marker = asyncio.run(_insert_edition_marker(temporary_postgres_url, edition_id))
     assert marker == "Migration fixture"
+    subject_id, blob_id, sample_id = uuid4(), uuid4(), uuid4()
+    sha256 = asyncio.run(
+        _insert_legacy_sample_fixture(
+            temporary_postgres_url,
+            edition_id=edition_id,
+            subject_id=subject_id,
+            blob_id=blob_id,
+            sample_id=sample_id,
+        )
+    )
+    before_exact_schema = capture_schema(temporary_postgres_url)
+    old_tables = {
+        row["name"] for row in before_exact_schema["tables"] if row["name"] != ALEMBIC_TABLE
+    }
+    old_columns = {table_name: set() for table_name in old_tables}
+    for column in before_exact_schema["columns"]:
+        if column["table"] in old_columns:
+            old_columns[column["table"]].add(column["name"])
+    before_primary_keys = asyncio.run(_primary_key_snapshot(temporary_postgres_url, old_tables))
+    preserved_tables = ("editions", "subjects", "blobs", "samples")
+    before_rows = asyncio.run(_table_row_snapshot(temporary_postgres_url, preserved_tables))
     before = asyncio.run(_database_snapshot(temporary_postgres_url))
 
     command.upgrade(config, "0004_external_effect_claims")
@@ -1729,6 +1924,47 @@ def test_stamped_0001_without_c2_upgrades_additively_and_preserves_data(
     command.upgrade(config, "head")
 
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
+    after_exact_schema = capture_schema(temporary_postgres_url)
+    new_tables = {row["name"] for row in after_exact_schema["tables"]}
+    assert old_tables <= new_tables
+    new_columns = {table_name: set() for table_name in old_tables}
+    for column in after_exact_schema["columns"]:
+        if column["table"] in new_columns:
+            new_columns[column["table"]].add(column["name"])
+    for table_name, columns in old_columns.items():
+        assert columns <= new_columns[table_name], table_name
+
+    after_primary_keys = asyncio.run(_primary_key_snapshot(temporary_postgres_url, old_tables))
+    for table_name, before_rows_by_key in before_primary_keys.items():
+        after_rows_by_key = after_primary_keys[table_name]
+        assert after_rows_by_key["row_count"] >= before_rows_by_key["row_count"], table_name
+        assert set(before_rows_by_key["primary_keys"]) <= set(after_rows_by_key["primary_keys"]), (
+            table_name
+        )
+
+    after_rows = asyncio.run(_table_row_snapshot(temporary_postgres_url, preserved_tables))
+    preserved_ids = {
+        "editions": edition_id,
+        "subjects": subject_id,
+        "blobs": blob_id,
+        "samples": sample_id,
+    }
+    for table_name, row_id in preserved_ids.items():
+        before_row = next(row for row in before_rows[table_name] if row["id"] == row_id)
+        after_row = next(row for row in after_rows[table_name] if row["id"] == row_id)
+        assert {column: after_row[column] for column in before_row} == before_row, table_name
+    assert (subject_id, edition_id) in {
+        (row["id"], row["edition_id"]) for row in after_rows["subjects"]
+    }
+    assert (sample_id, subject_id, blob_id) in {
+        (row["id"], row["subject_id"], row["blob_id"]) for row in after_rows["samples"]
+    }
+    assert (blob_id, sha256) in {(row["id"], row["sha256"]) for row in after_rows["blobs"]}
+    assert (sample_id, subject_id, blob_id, sha256) in {
+        (row["id"], row["subject_id"], row["blob_id"], row["expected_hash"])
+        for row in after_rows["samples"]
+    }
+
     after = asyncio.run(_database_snapshot(temporary_postgres_url))
     assert {
         "authority_kind",
@@ -1812,6 +2048,7 @@ def test_stamped_0001_with_malformed_manual_c2_is_rejected_without_changes(
     asyncio.run(_alter_manual_schema())
     before_c2 = asyncio.run(_c2_catalog_snapshot(temporary_postgres_url))
     before_tables = asyncio.run(_database_snapshot(temporary_postgres_url))
+    before_schema = capture_schema(temporary_postgres_url)
 
     with pytest.raises(RuntimeError, match="C2 migration preflight rejected") as exc_info:
         command.upgrade(config, "head")
@@ -1820,6 +2057,7 @@ def test_stamped_0001_with_malformed_manual_c2_is_rejected_without_changes(
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0001_baseline"
     assert asyncio.run(_c2_catalog_snapshot(temporary_postgres_url)) == before_c2
     assert asyncio.run(_database_snapshot(temporary_postgres_url)) == before_tables
+    assert capture_schema(temporary_postgres_url) == before_schema
 
 
 async def _insert_edition_marker_read(database_url: str, edition_id: Any) -> str:
@@ -1942,9 +2180,14 @@ def test_bridge_generation_slot_downgrade_allows_pristine_but_refuses_used_slot(
             await engine.dispose()
 
     asyncio.run(_advance_lease_token())
+    before_schema = capture_schema(temporary_postgres_url)
+    table_names = tuple(row["name"] for row in before_schema["tables"])
+    before_rows = asyncio.run(_table_row_snapshot(temporary_postgres_url, table_names))
     with pytest.raises(RuntimeError, match="after Bridge generation slot has been used"):
         command.downgrade(config, "0012_editorial_threads")
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
+    assert capture_schema(temporary_postgres_url) == before_schema
+    assert asyncio.run(_table_row_snapshot(temporary_postgres_url, table_names)) == before_rows
 
     async def _lease_token() -> int:
         engine = create_async_engine(temporary_postgres_url)
@@ -2155,11 +2398,16 @@ def test_c2_downgrade_refuses_to_discard_experiment_rows(
     config = _alembic_config(temporary_postgres_url)
     command.upgrade(config, "head")
     asyncio.run(_insert_experiment_without_parent(temporary_postgres_url))
+    before_schema = capture_schema(temporary_postgres_url)
+    table_names = tuple(row["name"] for row in before_schema["tables"])
+    before_rows = asyncio.run(_table_row_snapshot(temporary_postgres_url, table_names))
 
     with pytest.raises(RuntimeError, match="refusing to downgrade C2 experiment storage"):
         command.downgrade(config, "0001_baseline")
 
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
+    assert capture_schema(temporary_postgres_url) == before_schema
+    assert asyncio.run(_table_row_snapshot(temporary_postgres_url, table_names)) == before_rows
 
     async def _experiment_count() -> int:
         engine = create_async_engine(temporary_postgres_url)
@@ -2244,10 +2492,15 @@ def test_osint_policy_downgrade_refuses_policy_and_inherited_lineage_rows(
             await query_engine.dispose()
 
     asyncio.run(_create_inherited_envelope())
+    before_schema = capture_schema(temporary_postgres_url)
+    table_names = tuple(row["name"] for row in before_schema["tables"])
+    before_rows = asyncio.run(_table_row_snapshot(temporary_postgres_url, table_names))
     with pytest.raises(RuntimeError, match="Cannot downgrade populated OSINT_OPEN policy storage"):
         command.downgrade(config, "0002_c2_experiments")
 
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
+    assert capture_schema(temporary_postgres_url) == before_schema
+    assert asyncio.run(_table_row_snapshot(temporary_postgres_url, table_names)) == before_rows
     assert asyncio.run(_state_counts()) == (1, 1, 1, 1, 1, 1)
 
 
