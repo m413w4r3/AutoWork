@@ -5,46 +5,27 @@ existing 0001 installations. C2 experiment storage is added by 0002.
 """
 
 from collections.abc import Sequence
+from importlib.util import module_from_spec, spec_from_file_location
+from pathlib import Path
 
 from alembic import op
-from sqlalchemy import inspect
+from sqlalchemy import DDL, inspect
 
-from cti_app.infrastructure.database.models import (  # noqa: F401
-    collection,
-    core,
-    discovery,
-    edition_composition,
-    # The publication manifest tables include schema-versioned V1 (batch)
-    # and V2 (composition) snapshots in this frozen baseline.
-    edition_publication,
-    edition_render,
-    editions,
-    editorial,
-    invariants,
-    # The investigation module owns the versioned working-state table too.
-    investigation,
-    jobs,
-    media_assets,
-    model_execution,
-    production,
-    publication_render,
-    publication_review,
-    retrohunt,
-    selection,
-    source_media,
+_FROZEN_BASELINE_SPEC = spec_from_file_location(
+    "autowork_frozen_baseline_0001",
+    Path(__file__).resolve().parents[1] / "frozen" / "baseline_0001.py",
 )
-from cti_app.infrastructure.database.models.base import Base
+if _FROZEN_BASELINE_SPEC is None or _FROZEN_BASELINE_SPEC.loader is None:
+    raise ImportError("could not load frozen 0001 schema module")
+_FROZEN_BASELINE = module_from_spec(_FROZEN_BASELINE_SPEC)
+_FROZEN_BASELINE_SPEC.loader.exec_module(_FROZEN_BASELINE)
+BASELINE_CREATE_DDL = _FROZEN_BASELINE.BASELINE_CREATE_DDL
+BASELINE_TABLE_NAMES = _FROZEN_BASELINE.BASELINE_TABLE_NAMES
 
 revision: str = "0001_baseline"
 down_revision: str | None = None
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
-
-_C2_TABLES = frozenset({"investigation_experiment_heads", "investigation_experiments"})
-_BASELINE_TABLES = tuple(
-    table for table in Base.metadata.tables.values() if table.name not in _C2_TABLES
-)
-
 
 _GUARD_FUNCTIONS: tuple[tuple[str, str], ...] = (
     (
@@ -401,18 +382,8 @@ _TRIGGERS: tuple[tuple[str, str, str, str], ...] = (
 def upgrade() -> None:
     # This frozen revision creates the pre-C2 shape represented by databases
     # already stamped 0001. Later schema changes belong in additive revisions.
-    # Collection and evidence provenance is subject/discovery-lineage based.
-    # The target production_input_snapshots schema includes its captured,
-    # non-null publication_language column in the ORM metadata below.
-    # The target production_runs schema keeps no synthesis conversation
-    # identity: the durable ModelRun owns provider recovery.
-    # AnalystDecisionRow's CHECK values and structured details column are
-    # created from the production model metadata in this frozen baseline.
-    # The VirusTotal observation capability CHECK is generated from the
-    # VirusTotalCapability enum in the ORM model metadata below.
-    # The investigation_run job's aggregate CHECK (ck_jobs_investigation_run_aggregate)
-    # is declared by the jobs ORM model and therefore created here.
-    Base.metadata.create_all(bind=op.get_bind(), tables=_BASELINE_TABLES, checkfirst=False)
+    for statement in BASELINE_CREATE_DDL:
+        op.execute(DDL(statement))  # type: ignore[no-untyped-call]
     for _function_name, definition in _GUARD_FUNCTIONS:
         op.execute(definition)
     for table, trigger_name, function_name, kind in _TRIGGERS:
@@ -434,11 +405,9 @@ def downgrade() -> None:
     for table, trigger_name, _function_name, _kind in reversed(_TRIGGERS):
         if table in existing_tables:
             op.execute(f"DROP TRIGGER IF EXISTS {trigger_name} ON {table}")
-    # The current metadata intentionally contains a small mutual-FK cycle
-    # between source_collections and collection_attempts. PostgreSQL can drop
-    # the fresh schema deterministically when the tables are removed with
-    # CASCADE; this is only the inverse of the empty-database baseline.
-    for metadata_table in reversed(_BASELINE_TABLES):
-        op.execute(f'DROP TABLE IF EXISTS "{metadata_table.name}" CASCADE')
+    # The frozen table order includes a small mutual-FK cycle; CASCADE is the
+    # inverse of the empty-database baseline and retains its historical order.
+    for table_name in reversed(BASELINE_TABLE_NAMES):
+        op.execute(f'DROP TABLE IF EXISTS "{table_name}" CASCADE')
     for function_name, _definition in reversed(_GUARD_FUNCTIONS):
         op.execute(f"DROP FUNCTION IF EXISTS {function_name}()")
