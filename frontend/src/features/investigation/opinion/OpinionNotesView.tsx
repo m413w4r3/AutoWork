@@ -23,6 +23,7 @@ import { HistoryPanel } from "./HistoryPanel";
 import { NoteAnchorList } from "./NoteAnchorList";
 import { NoteContentBlocks } from "./NoteContentBlocks";
 import { NoteProposalReview } from "./NoteProposalReview";
+import { OpinionPdfPreview } from "./OpinionPdfPreview";
 import { OpinionPreview } from "./OpinionPreview";
 import { PreApprovalPanel } from "./PreApprovalPanel";
 import { ProposalList } from "./ProposalList";
@@ -219,7 +220,13 @@ export function OpinionNotesView({
         </p>
       ) : null}
 
-      <div className="opinion-workspace">
+      <div
+        className={
+          activeTab === "proposals"
+            ? "opinion-workspace opinion-workspace--proposals"
+            : "opinion-workspace"
+        }
+      >
         <div className="opinion-workspace__article">
           <ArticleReadingPane
             catalog={articleCatalog}
@@ -409,30 +416,10 @@ export function OpinionNotesView({
             ) : null}
 
             {activeTab === "pdf" ? (
-              previewPdfUrl === null ? (
+              draft === null || previewPdfUrl === null ? (
                 <p>Aucun aperçu PDF n’est disponible sans avis courant.</p>
               ) : (
-                <section
-                  className="job-card"
-                  aria-labelledby="opinion-pdf-heading"
-                >
-                  <h3 id="opinion-pdf-heading">
-                    Aperçu PDF réel de l’avis v{draft?.version}
-                  </h3>
-                  <p>
-                    <a href={previewPdfUrl} target="_blank" rel="noreferrer">
-                      Ouvrir le PDF dans un nouvel onglet
-                    </a>
-                  </p>
-                  <iframe
-                    title="Aperçu PDF réel de l’avis"
-                    src={previewPdfUrl}
-                    width="100%"
-                    height="720"
-                  >
-                    Votre navigateur ne peut pas afficher l’aperçu PDF.
-                  </iframe>
-                </section>
+                <OpinionPdfPreview opinion={draft} previewUrl={previewPdfUrl} />
               )
             ) : null}
           </div>

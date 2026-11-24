@@ -21,12 +21,13 @@ import { describeApiError, isAnchorReloadError } from "./errors";
 import {
   BLOCK_LABELS,
   BLOCK_ORDER,
-  EVIDENCE_KIND_LABELS,
-  FINDING_KIND_LABELS,
   NOTE_RELATION_LABELS,
   NOTE_STATE_LABELS,
-  truncate,
 } from "./labels";
+import {
+  FindingReferencePicker,
+  ObservationReferencePicker,
+} from "./ReferencePicker";
 import {
   buildDraftingQuestion,
   getDraftingIntent,
@@ -43,10 +44,6 @@ export interface BridgeCorrectionSeed {
   noteState: AnalystObservationState;
   noteRelation: AnalystObservationRelation;
   taskId: string | null;
-}
-
-function toggle(list: string[], id: string): string[] {
-  return list.includes(id) ? list.filter((item) => item !== id) : [...list, id];
 }
 
 /**
@@ -83,11 +80,6 @@ function locationLabel(
     (candidate) => candidate.section_index === item.section_index,
   )?.heading;
   return `Section ${section}${heading ? ` · ${heading}` : ""}, paragraphe ${paragraph}`;
-}
-
-function observationOptionLabel(observation: InvestigationObservation): string {
-  const kind = EVIDENCE_KIND_LABELS[observation.kind] ?? observation.kind;
-  return `${kind} · ${observation.source} · ${observation.object_type} ${observation.object_id}`;
 }
 
 export function BridgeRequestPanel({
@@ -297,54 +289,25 @@ export function BridgeRequestPanel({
         />
       ) : null}
 
-      <fieldset>
-        <legend>Findings disponibles ({findings.length})</legend>
-        {findings.length === 0 ? (
-          <p>Aucun finding disponible dans cette enquête.</p>
-        ) : (
-          findings.slice(0, 50).map((finding) => (
-            <label key={finding.id}>
-              <input
-                type="checkbox"
-                checked={findingRefs.includes(finding.id)}
-                onChange={() =>
-                  setFindingRefs((current) => toggle(current, finding.id))
-                }
-              />{" "}
-              {FINDING_KIND_LABELS[finding.kind] ?? finding.kind} ·{" "}
-              {truncate(finding.statement)}
-            </label>
-          ))
-        )}
-        {findings.length > 50 ? (
-          <p>Liste bornée aux 50 premiers findings.</p>
-        ) : null}
-      </fieldset>
+      <FindingReferencePicker
+        findings={findings.slice(0, 50)}
+        totalCount={findings.length}
+        selectedIds={findingRefs}
+        onChange={setFindingRefs}
+      />
+      {findings.length > 50 ? (
+        <p>Liste bornée aux 50 premiers findings.</p>
+      ) : null}
 
-      <fieldset>
-        <legend>Observations disponibles ({observations.length})</legend>
-        {observations.length === 0 ? (
-          <p>Aucune observation disponible dans cette enquête.</p>
-        ) : (
-          observations.slice(0, 50).map((observation) => (
-            <label key={observation.id}>
-              <input
-                type="checkbox"
-                checked={observationRefs.includes(observation.id)}
-                onChange={() =>
-                  setObservationRefs((current) =>
-                    toggle(current, observation.id),
-                  )
-                }
-              />{" "}
-              {observationOptionLabel(observation)}
-            </label>
-          ))
-        )}
-        {observations.length > 50 ? (
-          <p>Liste bornée aux 50 premières observations.</p>
-        ) : null}
-      </fieldset>
+      <ObservationReferencePicker
+        observations={observations.slice(0, 50)}
+        totalCount={observations.length}
+        selectedIds={observationRefs}
+        onChange={setObservationRefs}
+      />
+      {observations.length > 50 ? (
+        <p>Liste bornée aux 50 premières observations.</p>
+      ) : null}
 
       <fieldset>
         <legend>Action demandée à Bridge</legend>
