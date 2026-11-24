@@ -138,3 +138,28 @@ Fait à vérifier : `git log --oneline -12` doit montrer ces merges.
 
 `/home/nill/.claude/projects/-home-nill-perso-work-AutoWork/memory/mission-m24-2-state.md` pointe vers ce document
 (à mettre à jour à la fin de ta mission). Voir aussi `fresh-subagent-per-round.md` et `feedback-simplify-remove-friction.md`.
+
+## 11. Mise à jour de l'orchestrateur #2 (pause demandée par l'utilisateur, 2026-11-24)
+
+HEAD : `b9c38d31` (branche `m24-2/integration`, locale, rien poussé). Arbre propre hors `paseo.json`.
+Commits de cette session : `afaf557a` (libellé neutre budget d'enveloppe, `OperatorsPanel.tsx`),
+`dbd524c0` (indice de collecte VT sans « approuvée », `SamplesResultsView.tsx`), merge `b9c38d31`
+de `m24-2/fix-r1d-secret-guard` (commit agent `8ba83eea`, `sessions/supervisor.py` + 3 tests + ADR-0011).
+
+### Revues de cette session (agents Luna Audit, lecture seule ; modèle déclaré « GPT-6, variante Luna/xhigh non vérifiable »)
+| Revue | Cible | Verdict | Suite |
+|---|---|---|---|
+| R3d (cee76a09, xhigh) | affichage G2 après 112c5557 | NO-GO annoncé, 1 seul MINOR : `OperatorsPanel` « Enveloppe approuvée » pour une version révoquée | corrigé par `afaf557a` (libellé neutre « Enveloppe G2 liée au budget » + assertion de test) |
+| R3e (b41a4c44, high) | re-revue fraîche | GO avec réserves, 1 MINOR : `SamplesResultsView.tsx:1773` « bornée par l'enveloppe G2 approuvée » | corrigé par `dbd524c0`. **R3 clos (que du MINOR).** |
+| R1d (03f35f61, xhigh) | garde de secret non humain après 2522040d | NO-GO : (1) course écriture en vol vs révocation, (2) secret dans le chemin, (3) `task_id` facultatif non lié | corrigé par l'agent 740e7283 (`8ba83eea`), diff relu, mergé `b9c38d31`; `tests/workspace_agent` rejoué : **767 passés** |
+| R1e (22f7d0b0, xhigh) | re-revue fraîche du correctif R1d | NO-GO : fenêtre plus étroite — écriture déjà en vol dont la session est révoquée puis **fermée** (`close()` efface `secret_forms`) avant son contrôle ; idem `server_close()` (supervisor.py:3344, files.py:260, http_server.py:1032) | **Décision de l'orchestrateur #2 : résidu ACCEPTÉ, non corrigé** — le broker refuse toute session non `is_active` (`agentic_tool_broker.py:633`), donc le secret d'une session fermée n'a plus d'autorité ; le correctif proposé (coordination d'admission avec close/stop) ajouterait verrous/complexité (règle « pas de friction »). À SIGNALER à l'utilisateur, qui peut demander le correctif. Hors cette fenêtre, R1e n'a trouvé ni fuite des formes, ni régression légitime (auth.json non refusé, seuil de fragment 16 octets identique pour le chemin), ni deadlock. |
+
+### Gates rejoués (checkout principal)
+- Frontend sur `63a594da` (avant les 2 libellés) : vitest 124 fichiers / 980 tests, `pnpm typecheck`, `pnpm lint` (0 erreur, 2 avertissements existants). Après libellés : `OperatorsPanel.test.tsx` 22 passés, `src/features/investigation/samples` 21 passés. **À rejouer en entier sur le HEAD final.**
+- `make lint-backend` + `make typecheck-backend` : verts sur `63a594da` (code backend inchangé hors sidecar/supervisor.py depuis) — **à rejouer sur le HEAD final**.
+- Suite backend complète n°1 (lancée sur `afaf557a`, le merge R1d a eu lieu EN COURS de run) : 9979 passés / 1 échec `tests/test_investigation_transfers.py::test_real_sidecar_ack_of_queued_instruction_is_refused` (« host capability probe changed between probe and prepare ») ; rejoué seul le fichier entier : 18 passés. Hypothèse NON prouvée : la source du sidecar sondée a changé pendant le run (merge). NE PAS déclarer flake.
+- Suite backend complète n°2 lancée sur `b9c38d31` (arbre figé) : sortie dans **`/tmp/m242-full-backend2.log`** (commande CI, `--basetemp=/tmp/pt-gate2`, PG 55432). **Résultat non lu au moment de la pause** : lire `tail -n 5 /tmp/m242-full-backend2.log`. Si le log manque (redémarrage machine), relancer (recette §8). Si ce même test échoue encore : l'analyser (rejouer seul ET en suite) avant toute conclusion.
+
+### Reste à faire (ordre)
+1. Lire le résultat de la suite n°2 (0 échec attendu). 2. `make test-workflow-full WORKFLOW_RESULTS_DIR=/tmp/…` ; `make test-investigation-browser` (port libre, 32 étapes) ; frontend complet + typecheck + lint ; lint/typecheck backend, sur le HEAD final. 3. Captures G2 : le rendu a changé seulement par 2 libellés texte (budget d'enveloppe dans le détail de session, indice VT) ; les captures G2 (`overview-revoked`, `g2-revoked-detail`) n'affichent pas ces libellés → re-capture non requise, à confirmer. 4. Écrire `docs/m24/M24-2-FINAL-REPORT.md` (mandat §25 ; matériaux : §2–§6 de ce handoff, `M24-2-CAPTURES.md`, `M24-2-CLI-REATTESTATION.md`, ce §11 ; causes de la CI M24.1 : tests dépendant de l'horloge d'import, sockets AF_UNIX > 108 octets, shellcheck [M24-1-FINAL-REPORT §3], + oubli A1 corrigé par `188c2f61`). Ajouter aux résidus : fenêtre R1e ci-dessus. 5. Commit final (ligne `Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>`), mémoire, compte rendu. Rien à pousser/déployer.
+Aucun sous-agent n'est en cours (R1d, R3d, R3e, R1e, fix-R1d terminés). Worktree `~/.paseo/worktrees/0y1qsxa1/m24-2-fix-r1d-secret-guard` conservé.
