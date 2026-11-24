@@ -37,8 +37,13 @@ def test_registry_tables_are_queryable_and_do_not_own_blobs() -> None:
 
 
 def test_invariant_registry_tables_remain_in_the_frozen_baseline() -> None:
-    migration = Path(__file__).parents[1] / "migrations" / "versions" / "0001_baseline.py"
-    source = migration.read_text()
-    assert 'revision: str = "0001_baseline"' in source
-    assert "down_revision: str | None = None" in source
-    assert "Base.metadata.create_all" in source
+    migrations = Path(__file__).parents[1] / "migrations"
+    migration_source = (migrations / "versions" / "0001_baseline.py").read_text()
+    frozen_source = (migrations / "frozen" / "baseline_0001.py").read_text()
+    assert 'revision: str = "0001_baseline"' in migration_source
+    assert "down_revision: str | None = None" in migration_source
+    assert "BASELINE_CREATE_DDL" in migration_source
+    assert "Base.metadata" not in migration_source
+    assert "cti_app.infrastructure.database.models" not in frozen_source
+    assert "IMMUTABLE — ne pas éditer; toute évolution = nouvelle révision." in frozen_source
+    assert "candidate_invariants" in frozen_source
