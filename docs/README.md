@@ -59,6 +59,7 @@ separate approval and state/backup preflight.
 | CTI tools and loop | [`investigation_agent_loop.md`](investigation_agent_loop.md), [`investigation_operations.md`](investigation_operations.md), [`investigation_local_tools.md`](investigation_local_tools.md), [`investigation_rule_tools.md`](investigation_rule_tools.md), [`investigation_vt_tools.md`](investigation_vt_tools.md) | ACTIVE_REFERENCE; verify versions |
 | Operator-led workflows | [`operations/operator-playbook-medium.md`](operations/operator-playbook-medium.md) | ACTIVE_REFERENCE; verify deployment |
 | Disk capacity and safe Docker cleanup | [`operations/disk-capacity.md`](operations/disk-capacity.md) | ACTIVE_REFERENCE; capacity probe availability depends on host/MinIO access |
+| M24 November fresh start and guarded local reset | [`operations/november-fresh-start.md`](operations/november-fresh-start.md) | ACTIVE_REFERENCE; reset requires separate authorization and disposable data |
 | Operator CTI skill bundle (proposed) | [`operations/operator-skills.md`](operations/operator-skills.md) | PROPOSED; runtime loading and behavior gates pending |
 | Coding orchestration | [`operations/paseo-agent-orchestration.md`](operations/paseo-agent-orchestration.md) | ACTIVE_REFERENCE (recommended setup, not verified host config) |
 | Host CLI spike (Codex/Claude operators) | [`operations/host-cli-spike-2026-11.md`](operations/host-cli-spike-2026-11.md) | ATTESTED host facts (2026-11-23); resume/live-instruction and production close-cleanup remain UNPROVEN |
