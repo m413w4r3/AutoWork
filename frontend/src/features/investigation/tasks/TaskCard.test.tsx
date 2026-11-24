@@ -126,7 +126,7 @@ function renderWorkspace(
 }
 
 describe("TaskCard actions", () => {
-  it("n’affiche aucune action non exécutable sur une tâche terminale", () => {
+  it("n’affiche aucune action non exécutable sur une tâche terminale", async () => {
     const completed = makeTask({
       status: "completed",
       result_verification_status: "accepted",
@@ -145,7 +145,13 @@ describe("TaskCard actions", () => {
     expect(
       screen.queryByRole("button", { name: "Ajouter une note" }),
     ).toBeNull();
-    expect(screen.getByText(/Terminée · version 2/)).toBeInTheDocument();
+    expect(screen.getAllByText("Terminée").length).toBeGreaterThan(0);
+    const technicalSummary = screen.getByText("Détails techniques", {
+      selector: "summary",
+    });
+    expect(technicalSummary.closest("details")).not.toHaveAttribute("open");
+    await userEvent.setup().click(technicalSummary);
+    expect(screen.getByText("2", { selector: "code" })).toBeVisible();
   });
 
   it("affiche l’adaptateur d’une assignation opérateur en libellé humain", () => {
@@ -287,7 +293,11 @@ describe("TaskCard CAS", () => {
       wrapper: wrapperFor(createTestQueryClient()),
     });
 
-    expect(await screen.findByText(/version 2/)).toBeInTheDocument();
+    const technicalSummary = await screen.findByText("Détails techniques", {
+      selector: "summary",
+    });
+    await user.click(technicalSummary);
+    expect(screen.getByText("2", { selector: "code" })).toBeVisible();
     await user.click(
       screen.getByRole("button", { name: "Je prends cette tâche" }),
     );
@@ -295,7 +305,7 @@ describe("TaskCard CAS", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(
       /version obsolète/,
     );
-    expect(await screen.findByText(/version 3/)).toBeInTheDocument();
+    expect(await screen.findByText("3", { selector: "code" })).toBeVisible();
   });
 });
 
@@ -810,6 +820,45 @@ describe("TaskWorkspace list and selection", () => {
 });
 
 describe("TaskCard detail subviews and agent messages", () => {
+  it("keeps human task context visible and hides exact references in technical details", async () => {
+    const task = makeTask({
+      task_key: "lead-76739db1-exact",
+      question: "Quelle infrastructure est utilisée ?",
+      objective: "Identifier les serveurs de commande.",
+      evidence_refs: ["8a8fa705-9e71-55cb-exact"],
+      sample_refs: ["2ad3cc5e-exact-sha"],
+      lease_expires_at: "2026-11-24T12:30:00Z",
+    });
+    renderCard(task);
+
+    expect(screen.getByText(task.question)).toBeVisible();
+    expect(screen.getByText(task.objective)).toBeVisible();
+    expect(
+      screen.getByText("1 preuve de départ · voir Résultats et preuves"),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("link", {
+        name: "1 échantillon · voir Échantillons et résultats",
+      }),
+    ).toHaveAttribute("href", expect.stringContaining("vue=samples"));
+    expect(screen.getByText(task.task_key)).not.toBeVisible();
+    expect(screen.getByText(task.evidence_refs[0] ?? "")).not.toBeVisible();
+    expect(screen.getByText(task.sample_refs[0] ?? "")).not.toBeVisible();
+
+    const details = screen.getByText("Détails techniques", {
+      selector: "summary",
+    });
+    const disclosure = details.closest("details");
+    expect(disclosure).not.toHaveAttribute("open");
+    await userEvent.setup().click(details);
+    expect(screen.getByText(task.task_key)).toBeVisible();
+    expect(screen.getByText(task.evidence_refs[0] ?? "")).toBeVisible();
+    expect(screen.getByText(task.sample_refs[0] ?? "")).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Copier la clé de tâche" }),
+    ).toBeVisible();
+  });
+
   it("provides Résumé, Résultats, Agent et messages, and Historique tabs", async () => {
     const user = userEvent.setup();
     installFetch(({ url }) => {

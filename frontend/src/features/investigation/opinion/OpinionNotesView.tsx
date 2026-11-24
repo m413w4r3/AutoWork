@@ -227,7 +227,7 @@ export function OpinionNotesView({
             : "opinion-workspace"
         }
       >
-        <div className="opinion-workspace__article">
+        <div className="opinion-workspace__article opinion-workspace__article--sticky">
           <ArticleReadingPane
             catalog={articleCatalog}
             isPending={articleAnchorsQuery.isPending}

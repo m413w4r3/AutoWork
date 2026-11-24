@@ -187,6 +187,46 @@
   padding-top: 0.5rem;
 }
 
+.m24-task-card__text-link {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: #175fa8;
+  font: inherit;
+  text-align: left;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.m24-task-card__text-link:focus-visible,
+.m24-task-technical-details summary:focus-visible,
+.m24-task-technical-value button:focus-visible {
+  outline: 3px solid #2f6fb3;
+  outline-offset: 2px;
+}
+
+.m24-task-technical-details {
+  margin-top: 0.5rem;
+}
+
+.m24-task-technical-details > summary {
+  width: fit-content;
+  cursor: pointer;
+}
+
+.m24-task-technical-value {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.m24-task-technical-value button {
+  flex: 0 0 auto;
+}
+
 .m24-more-actions {
   padding: 0.55rem 0.7rem;
   border: 1px solid #e3d2cf;

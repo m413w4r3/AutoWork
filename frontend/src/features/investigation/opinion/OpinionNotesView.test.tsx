@@ -678,6 +678,10 @@ afterEach(() => {
 describe("OpinionNotesView — notes Bridge par ancre", () => {
   it("liste plusieurs notes à des ancres différentes", async () => {
     renderView();
+    await screen.findByRole("heading", { name: "Article canonique de test" });
+    expect(
+      document.querySelector(".opinion-workspace__article--sticky"),
+    ).toHaveClass("opinion-workspace__article");
     await userEvent
       .setup()
       .click(await screen.findByText("Notes existantes (2)"));
