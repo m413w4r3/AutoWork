@@ -46,23 +46,23 @@ export const WORKSPACE_STATE_LABELS: Record<"bound" | "unbound", string> = {
 };
 
 export const POLICY_LABELS: Record<WorkspacePolicyClass, string> = {
-  human_editable: "Éditable",
-  agent_owned: "Notes d’agent",
-  generated_immutable: "Généré — immuable",
-  read_only: "Lecture seule — échantillon de base",
-  agent_internal: "Interne agent",
+  human_editable: "Modifiable",
+  agent_owned: "Note d’agent",
+  generated_immutable: "Généré · lecture seule",
+  read_only: "Lecture seule",
+  agent_internal: "Interne à l’agent",
 };
 
 export const ORIGIN_LABELS: Record<WorkspaceOrigin, string> = {
-  filesystem: "Système de fichiers (observé)",
+  filesystem: "Fichier local",
   ui: "Interface",
   agent: "Agent",
   system: "Système",
 };
 
 export const IMPORT_STATUS_LABELS: Record<WorkspaceImportStatus, string> = {
-  received: "Reçu",
-  applied: "Appliqué",
+  received: "Reçu du workspace",
+  applied: "Importé",
   ignored: "Ignoré",
   rejected: "Refusé",
 };
@@ -205,6 +205,24 @@ export function labelOf(
 /** Deterministic, locale-independent rendering of an ISO-8601 timestamp. */
 export function formatTimestamp(value: string): string {
   return value.replace("T", " ").replace(/\.\d+/, "").replace(/Z$/, " UTC");
+}
+
+export function formatShortDate(value: string): string {
+  const timestamp = Date.parse(value);
+  if (Number.isNaN(timestamp)) return "Date inconnue";
+  return new Intl.DateTimeFormat("fr-FR", {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+    timeZone: "UTC",
+  }).format(timestamp);
+}
+
+export function humanNoteLabelFromPath(path: string): string {
+  const date = path.match(/(?:^|[-_])(20\d{2}-\d{2}-\d{2})(?:T|[-_.]|$)/)?.[1];
+  return date === undefined
+    ? "Note humaine"
+    : `Note humaine · ${formatShortDate(`${date}T00:00:00Z`)}`;
 }
 
 export function formatBytes(size: number): string {

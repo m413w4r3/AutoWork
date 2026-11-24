@@ -29,7 +29,9 @@ import {
   POLICY_LABELS,
   WORKSPACE_STATE_LABELS,
   formatBytes,
+  formatShortDate,
   formatTimestamp,
+  humanNoteLabelFromPath,
   isHumanNotePath,
   labelOf,
   workshopErrorText,
@@ -67,61 +69,83 @@ function countOf(count: number, singular: string, plural: string): string {
 }
 
 function SyncReport({ report }: { report: WorkspaceSyncReportV1 }) {
+  const unresolved = report.unresolved_conflicts;
   return (
-    <div className="workspace-notes__note" role="status">
-      <p>
-        Synchronisation terminée.{" "}
-        {countOf(report.files_observed, "fichier observé", "fichiers observés")}
-        ,{" "}
-        {countOf(
-          report.events_inserted,
-          "événement ajouté",
-          "événements ajoutés",
-        )}
-        , {countOf(report.revisions_inserted, "révision", "révisions")},{" "}
-        {countOf(
-          report.conflicts_observed,
-          "conflit observé",
-          "conflits observés",
-        )}
-        ,{" "}
-        {countOf(
-          report.unresolved_conflicts,
-          "conflit non résolu",
-          "conflits non résolus",
-        )}
-        ,{" "}
-        {countOf(
-          report.policy_violations,
-          "violation de politique",
-          "violations de politique",
-        )}
-        .
-      </p>
-      <details>
-        <summary>Détails techniques</summary>
+    <details
+      className="workspace-notes__note workspace-notes__sync-summary"
+      role="status"
+    >
+      <summary>
+        <strong>Synchronisation terminée</strong>
+        <span>
+          {countOf(
+            report.files_observed,
+            "fichier observé",
+            "fichiers observés",
+          )}
+          {" · "}
+          {countOf(
+            report.events_inserted,
+            "événement ajouté",
+            "événements ajoutés",
+          )}
+          {" · "}
+          {countOf(report.revisions_inserted, "révision", "révisions")}
+          {" · "}
+          {countOf(unresolved, "conflit à traiter", "conflits à traiter")}
+          {" · "}
+          {countOf(
+            report.policy_violations,
+            "violation de politique",
+            "violations de politique",
+          )}
+        </span>
+      </summary>
+      <div className="workspace-notes__sync-details">
         <p>
-          Génération {report.generation} · curseur {report.cursor}.
+          Génération {report.generation} · curseur {report.cursor} ·{" "}
+          {countOf(
+            report.conflicts_observed,
+            "conflit observé",
+            "conflits observés",
+          )}
+          .
         </p>
-      </details>
-      {report.resync ? (
-        <p>Resynchronisation complète : le curseur a été réinitialisé.</p>
-      ) : null}
-      {report.truncated ? (
-        <p>Événements tronqués — relancez une synchronisation.</p>
-      ) : null}
-      {report.new_human_notes.length > 0 ? (
-        <p>Nouvelles notes humaines : {report.new_human_notes.join(", ")}.</p>
-      ) : null}
-      {report.changed_human_notes.length > 0 ? (
-        <p>
-          Notes humaines modifiées : {report.changed_human_notes.join(", ")}.
-        </p>
-      ) : null}
-      {report.human_notes_truncated ? (
-        <p>Liste des notes humaines tronquée.</p>
-      ) : null}
-    </div>
+        {report.resync ? (
+          <p>Resynchronisation complète : le curseur a été réinitialisé.</p>
+        ) : null}
+        {report.truncated ? (
+          <p>Événements tronqués — relancez une synchronisation.</p>
+        ) : null}
+        {report.new_human_notes.length > 0 ? (
+          <p>
+            Nouvelles notes humaines :{" "}
+            {report.new_human_notes.map((path, index) => (
+              <span key={path} title={path}>
+                {index > 0 ? ", " : ""}
+                {humanNoteLabelFromPath(path)}
+              </span>
+            ))}
+            .
+          </p>
+        ) : null}
+        {report.changed_human_notes.length > 0 ? (
+          <p>
+            Notes humaines modifiées :{" "}
+            {report.changed_human_notes.map((path, index) => (
+              <span key={path} title={path}>
+                {index > 0 ? ", " : ""}
+                {humanNoteLabelFromPath(path)}
+              </span>
+            ))}
+            .
+          </p>
+        ) : null}
+        {report.human_notes_truncated ? (
+          <p>Liste des notes humaines tronquée.</p>
+        ) : null}
+      </div>
+    </details>
   );
 }
 
@@ -172,13 +196,28 @@ function fileTitle(
   file: WorkspaceFileViewV1,
   content?: WorkspaceContentViewV1,
 ): string {
-  if (
-    isHumanNotePath(file.path) &&
-    content?.text !== null &&
-    content?.text !== undefined
-  ) {
-    const heading = content.text.match(/^ {0,3}#{1,6}\s+(.+?)\s*#*\s*$/m)?.[1];
-    if (heading !== undefined) return "Note humaine — " + heading.trim();
+  if (isHumanNotePath(file.path)) {
+    if (content?.text !== null && content?.text !== undefined) {
+      const firstLine = content.text
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .find((line) => line !== "" && !/^---+$/.test(line));
+      if (firstLine !== undefined) {
+        const readableLine = firstLine
+          .replace(/^#{1,6}\s+/, "")
+          .replace(/^[A-ZÀ-ÖØ-Þ][A-ZÀ-ÖØ-Þ0-9_-]{2,}:\s*/, "")
+          .replace(/\*\*(.+?)\*\*/g, "$1")
+          .replace(/([*_`])/g, "")
+          .trim();
+        if (readableLine !== "") {
+          const titledLine =
+            readableLine.charAt(0).toLocaleUpperCase("fr-FR") +
+            readableLine.slice(1);
+          return `Note humaine — ${titledLine}`;
+        }
+      }
+    }
+    return `Note humaine · ${formatShortDate(file.observed_at)} · ${file.task_id === null ? "Sans tâche associée" : "Tâche associée"}`;
   }
   return fileName(file.path);
 }
@@ -318,6 +357,7 @@ export function WorkspaceNotesView({
   investigationId: string;
 }) {
   const status = useWorkspaceStatus(investigationId);
+  const current = status.data;
   const agent = useWorkspaceAgentStatus();
   const sync = useSyncWorkspace(investigationId);
   const exportRun = useExportWorkspace(investigationId);
@@ -357,7 +397,6 @@ export function WorkspaceNotesView({
       />
     );
   }
-  const current = status.data;
   if (current === undefined) return null;
 
   const agentStatus = agent.data?.status;
@@ -508,9 +547,6 @@ export function WorkspaceNotesView({
               : "Workspace : " + logicalPath}
           </h2>
           <p className="workspace-notes__status">
-            <span>{WORKSPACE_STATE_LABELS[current.workspace_state]}</span>
-            {agentLabel === "" ? null : <span>{agentLabel}</span>}
-            <span>{AVAILABILITY_LABELS[availabilityCode]}</span>
             <span>
               {current.lastly_observed_at === null
                 ? "Pas encore synchronisé"
@@ -586,14 +622,36 @@ export function WorkspaceNotesView({
         </div>
       ) : null}
 
-      <p className="workspace-notes__evidence-warning">
-        Fichier local ≠ preuve canonique. Les fichiers du workspace restent des
-        archives de travail ; seules les observations et findings canoniques
-        font preuve. Une note humaine reste une hypothèse non vérifiée.
-      </p>
+      <details className="workspace-notes__evidence-warning">
+        <summary>
+          <strong>Fichier local ≠ preuve canonique</strong>
+          <span> · Une note humaine reste une hypothèse non vérifiée</span>
+        </summary>
+        <p>
+          Les fichiers du workspace restent des archives de travail ; seules les
+          observations et findings canoniques font preuve.
+        </p>
+      </details>
 
       <details className="workspace-notes__summary">
-        <summary>État et volumes du workspace</summary>
+        <summary>
+          {WORKSPACE_STATE_LABELS[current.workspace_state]} ·{" "}
+          {agentLabel === ""
+            ? AVAILABILITY_LABELS[availabilityCode]
+            : agentLabel}{" "}
+          · {countOf(current.counts.files, "fichier", "fichiers")} ·{" "}
+          {countOf(
+            current.counts.human_notes,
+            "note humaine",
+            "notes humaines",
+          )}{" "}
+          ·{" "}
+          {countOf(
+            current.counts.unresolved_conflicts,
+            "conflit à traiter",
+            "conflits à traiter",
+          )}
+        </summary>
         <p>
           Génération {current.generation ?? "—"}
           {current.cursor === null ? "" : " · curseur " + current.cursor}
@@ -711,7 +769,15 @@ export function WorkspaceNotesView({
             <article className="workspace-notes__selected">
               <header className="workspace-notes__file-heading">
                 <div>
-                  <h2 title={selectedFile.path}>{title}</h2>
+                  <h2
+                    title={selectedFile.path}
+                    aria-label={
+                      isHumanSelection ? fileName(selectedFile.path) : undefined
+                    }
+                    aria-description={isHumanSelection ? title : undefined}
+                  >
+                    {title}
+                  </h2>
                   <FilePathDetails path={selectedFile.path} />
                 </div>
                 <div className="workspace-notes__badges">

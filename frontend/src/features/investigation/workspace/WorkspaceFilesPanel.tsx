@@ -4,25 +4,33 @@ import { useWorkspaceFiles, type WorkspaceFileViewV1 } from "../api";
 import {
   IMPORT_STATUS_LABELS,
   ORIGIN_LABELS,
+  formatShortDate,
   formatTimestamp,
+  isHumanNotePath,
   workshopErrorText,
 } from "./workspaceLabels";
 
 const PAGE_SIZE = 100;
 
 const DIRECTORY_FILTERS = [
-  { prefix: "notes/humaines", label: "notes/humaines" },
-  { prefix: "notes/agents", label: "notes/agents" },
-  { prefix: "notes/bridge", label: "notes/bridge" },
-  { prefix: "results", label: "results" },
-  { prefix: "vt", label: "vt" },
-  { prefix: "plans", label: "plans" },
-  { prefix: "base_samples", label: "base_samples" },
+  { prefix: "notes/humaines", label: "Notes humaines" },
+  { prefix: "notes/agents", label: "Notes d’agent" },
+  { prefix: "notes/bridge", label: "Notes de Bridge" },
+  { prefix: "results", label: "Résultats" },
+  { prefix: "vt", label: "VirusTotal" },
+  { prefix: "plans", label: "Plans" },
+  { prefix: "base_samples", label: "Échantillons de référence" },
   { prefix: "", label: "Tous les fichiers" },
 ];
 
 function fileName(path: string): string {
   return path.split("/").at(-1) ?? path;
+}
+
+function fileLabel(file: WorkspaceFileViewV1): string {
+  return isHumanNotePath(file.path)
+    ? `Note humaine · ${formatShortDate(file.observed_at)}`
+    : fileName(file.path);
 }
 
 export function WorkspaceFilesPanel({
@@ -67,6 +75,8 @@ export function WorkspaceFilesPanel({
             key={directory.prefix}
             className="workspace-notes__directory"
             type="button"
+            aria-label={directory.prefix || directory.label}
+            aria-description={directory.prefix ? directory.label : undefined}
             aria-pressed={prefix === directory.prefix}
             onClick={() => selectDirectory(directory.prefix)}
           >
@@ -106,6 +116,9 @@ export function WorkspaceFilesPanel({
                 onClick={() => selectFile(file)}
               >
                 <span className="workspace-notes__file-name">
+                  {fileLabel(file)}
+                </span>
+                <span className="sr-only" aria-hidden="true">
                   {fileName(file.path)}
                 </span>
                 <span className="workspace-notes__badges">

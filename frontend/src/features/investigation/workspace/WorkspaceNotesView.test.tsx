@@ -478,6 +478,8 @@ interface HandlerOptions {
   status?: WorkspaceStatusV1;
   agentStatus?: "available" | "unavailable" | "unconfigured";
   note?: NoteViewResponseV1;
+  files?: WorkspaceFileListV1;
+  content?: WorkspaceContentViewV1;
   sessions?: "active" | "none";
 }
 
@@ -485,7 +487,9 @@ function makeHandler(options: HandlerOptions = {}) {
   const status = options.status ?? availableStatus;
   const agentStatus = options.agentStatus ?? "available";
   const sessions = options.sessions ?? "active";
-  const files = status.workspace_available ? fileList : unavailableFileList;
+  const files = status.workspace_available
+    ? (options.files ?? fileList)
+    : unavailableFileList;
   const conflicts = status.workspace_available
     ? conflictList
     : unavailableConflictList;
@@ -508,10 +512,13 @@ function makeHandler(options: HandlerOptions = {}) {
     if (url.includes("/ask-agent")) return jsonResponse(agentContinuation);
     if (url.endsWith("/workspace")) return jsonResponse(status);
     if (url.includes("/workspace/files/content")) {
+      const requestedPath = parsedUrl.searchParams.get("path");
       return jsonResponse(
-        parsedUrl.searchParams.get("path") === planFile.path
+        requestedPath === planFile.path
           ? planContent
-          : noteContent,
+          : options.content?.path === requestedPath
+            ? options.content
+            : noteContent,
       );
     }
     if (url.endsWith("/workspace/files") && method === "PUT") {
@@ -588,15 +595,16 @@ describe("WorkspaceNotesView", () => {
 
     await user.click(await screen.findByRole("button", { name: "Actualiser" }));
 
-    expect(
-      await screen.findByText(
-        /Synchronisation terminée\. 2 fichiers observés, 1 événement ajouté, 1 révision, 0 conflit observé, 1 conflit non résolu, 0 violation de politique\./,
-      ),
-    ).toBeInTheDocument();
+    const summary = await screen.findByText("Synchronisation terminée");
+    const report = summary.closest("details");
+    expect(report).not.toHaveAttribute("open");
+    expect(report).toHaveTextContent(
+      "2 fichiers observés · 1 événement ajouté · 1 révision · 1 conflit à traiter · 0 violation de politique",
+    );
+    expect(screen.getByText(/Génération 3 · curseur 43/)).not.toBeVisible();
+    await user.click(summary);
+    expect(await screen.findByText(/Génération 3 · curseur 43/)).toBeVisible();
     expect(screen.queryByText(/fichier\(s\)|nouvel\/nouveaux/)).toBeNull();
-    // Generation and cursor stay available behind the technical details.
-    expect(screen.getByText("Détails techniques")).toBeInTheDocument();
-    expect(screen.getByText(/Génération 3 · curseur 43\./)).toBeInTheDocument();
   });
 
   it("envoie la résolution de conflit avec les deux SHA-256 attendus", async () => {
@@ -641,7 +649,7 @@ describe("WorkspaceNotesView", () => {
     const recorder = renderView(makeHandler());
     const user = userEvent.setup();
     const button = await screen.findByRole("button", {
-      name: /hypothese\.md/,
+      name: /Note humaine · 20 nov\. 2026/,
     });
     button.focus();
     expect(button).toHaveFocus();
@@ -655,7 +663,7 @@ describe("WorkspaceNotesView", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByRole("button", {
-        name: "Transmettre à Codex / Claude",
+        name: "Envoyer à l’agent",
       }),
     ).toBeInTheDocument();
     expect(
@@ -665,11 +673,13 @@ describe("WorkspaceNotesView", () => {
       screen.getByRole("button", { name: "Demander à Bridge" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Proposer une observation" }),
+      screen.getByRole("button", { name: "Créer une observation" }),
     ).toBeInTheDocument();
-    expect(
-      screen.getByRole("heading", { name: "Note humaine — Hypothèse" }),
-    ).toBeVisible();
+    const selectedTitle = screen.getByRole("heading", {
+      name: "hypothese.md",
+    });
+    expect(selectedTitle).toHaveTextContent("Note humaine — Hypothèse");
+    expect(selectedTitle).toBeVisible();
     expect(
       screen.getByText(/Le domaine pourrait être un leurre/),
     ).toBeVisible();
@@ -677,9 +687,7 @@ describe("WorkspaceNotesView", () => {
       .getByText("Versions & provenance")
       .closest("details");
     expect(versions).not.toHaveAttribute("open");
-    await user.click(
-      screen.getByRole("button", { name: "Transmettre à Codex / Claude" }),
-    );
+    await user.click(screen.getByRole("button", { name: "Envoyer à l’agent" }));
     expect(await screen.findByText(/Session active/)).toBeInTheDocument();
     expect(
       screen.queryByText(/le client API figé n’expose pas la version d’état/),
@@ -698,7 +706,7 @@ describe("WorkspaceNotesView", () => {
     const user = userEvent.setup();
     await user.click(
       await screen.findByRole("button", {
-        name: /hypothese\.md/,
+        name: /Note humaine · 20 nov\. 2026/,
       }),
     );
     await user.click(screen.getByRole("button", { name: "Demander à Bridge" }));
@@ -734,12 +742,10 @@ describe("WorkspaceNotesView", () => {
     const user = userEvent.setup();
     await user.click(
       await screen.findByRole("button", {
-        name: /hypothese\.md/,
+        name: /Note humaine · 20 nov\. 2026/,
       }),
     );
-    await user.click(
-      screen.getByRole("button", { name: "Transmettre à Codex / Claude" }),
-    );
+    await user.click(screen.getByRole("button", { name: "Envoyer à l’agent" }));
 
     expect(
       await screen.findByText(
@@ -756,12 +762,10 @@ describe("WorkspaceNotesView", () => {
     const user = userEvent.setup();
     await user.click(
       await screen.findByRole("button", {
-        name: /hypothese\.md/,
+        name: /Note humaine · 20 nov\. 2026/,
       }),
     );
-    await user.click(
-      screen.getByRole("button", { name: "Transmettre à Codex / Claude" }),
-    );
+    await user.click(screen.getByRole("button", { name: "Envoyer à l’agent" }));
 
     expect(
       await screen.findByText(
@@ -791,15 +795,17 @@ describe("WorkspaceNotesView", () => {
       screen.getByRole("region", { name: "Contenu sélectionné" }),
     ).toBeVisible();
     const fileButton = await screen.findByRole("button", {
-      name: /hypothese\.md/,
+      name: /Note humaine · 20 nov\. 2026/,
     });
     expect(fileButton).not.toHaveTextContent(noteFile.path);
     expect(fileButton).toHaveAttribute("title", noteFile.path);
     await user.click(fileButton);
 
-    expect(
-      await screen.findByRole("heading", { name: "Note humaine — Hypothèse" }),
-    ).toBeVisible();
+    const selectedTitle = await screen.findByRole("heading", {
+      name: "hypothese.md",
+    });
+    expect(selectedTitle).toHaveTextContent("Note humaine — Hypothèse");
+    expect(selectedTitle).toBeVisible();
     expect(
       screen.getByText(/Le domaine pourrait être un leurre/),
     ).toBeVisible();
@@ -808,6 +814,55 @@ describe("WorkspaceNotesView", () => {
       screen.getByRole("button", { name: "Copier le chemin exact" }),
     );
     await waitFor(() => expect(writeText).toHaveBeenCalledWith(noteFile.path));
+  });
+
+  it("masque le nom technique d’une note vide tout en gardant son chemin exact", async () => {
+    const user = userEvent.setup();
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    const exactPath =
+      "notes/humaines/tache-lead-3e2a32a02e557dbd21a82b70-2026-11-24T00-16-21-182Z.md";
+    const technicalFile = {
+      ...noteFile,
+      path: exactPath,
+      observed_at: "2026-11-24T00:16:21Z",
+    } satisfies WorkspaceFileViewV1;
+    const files = {
+      ...fileList,
+      files: [technicalFile],
+    } satisfies WorkspaceFileListV1;
+    const content = {
+      ...noteContent,
+      path: exactPath,
+      text: "",
+    } satisfies WorkspaceContentViewV1;
+    renderView(makeHandler({ files, content }));
+
+    const fileButton = await screen.findByRole("button", {
+      name: /Note humaine · 24 nov\. 2026/,
+    });
+    const visibleFileLabel = fileButton.querySelector(
+      ".workspace-notes__file-name",
+    );
+    expect(visibleFileLabel).toHaveTextContent("Note humaine · 24 nov. 2026");
+    expect(visibleFileLabel).not.toHaveTextContent("tache-lead-3e2a32a0");
+    expect(fileButton).toHaveAttribute("title", exactPath);
+    await user.click(fileButton);
+
+    const heading = await screen.findByRole("heading", {
+      name: "tache-lead-3e2a32a02e557dbd21a82b70-2026-11-24T00-16-21-182Z.md",
+    });
+    expect(heading).toHaveTextContent(
+      "Note humaine · 24 nov. 2026 · Sans tâche associée",
+    );
+    await user.click(screen.getByText("Chemin exact"));
+    await user.click(
+      screen.getByRole("button", { name: "Copier le chemin exact" }),
+    );
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(exactPath));
   });
 
   it("affiche le contenu d’un fichier non humain sans actions de note", async () => {
@@ -828,7 +883,7 @@ describe("WorkspaceNotesView", () => {
       screen.queryByRole("button", { name: "Éditer" }),
     ).not.toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "Transmettre à Codex / Claude" }),
+      screen.queryByRole("button", { name: "Envoyer à l’agent" }),
     ).not.toBeInTheDocument();
     expect(
       screen.getByText("Versions & provenance").closest("details"),
@@ -839,7 +894,9 @@ describe("WorkspaceNotesView", () => {
     const recorder = renderView(makeHandler());
     const user = userEvent.setup();
     await user.click(
-      await screen.findByRole("button", { name: /hypothese\.md/ }),
+      await screen.findByRole("button", {
+        name: /Note humaine · 20 nov\. 2026/,
+      }),
     );
     await user.click(await screen.findByRole("button", { name: "Éditer" }));
     const editor = await screen.findByLabelText("Contenu Markdown");
@@ -864,11 +921,11 @@ describe("WorkspaceNotesView", () => {
     const recorder = renderView(makeHandler());
     const user = userEvent.setup();
     await user.click(
-      await screen.findByRole("button", { name: /hypothese\.md/ }),
+      await screen.findByRole("button", {
+        name: /Note humaine · 20 nov\. 2026/,
+      }),
     );
-    await user.click(
-      screen.getByRole("button", { name: "Transmettre à Codex / Claude" }),
-    );
+    await user.click(screen.getByRole("button", { name: "Envoyer à l’agent" }));
     await user.type(
       await screen.findByLabelText("Question à l’agent"),
       "Vérifie cette piste.",
