@@ -37,6 +37,15 @@ export interface InvestigationEnvelopeView {
   approval_decision_id: string | null;
   approval_actor_id: string | null;
   approved_at: string | null;
+  /** Lifecycle fields returned by the envelope endpoint. */
+  policy_activated_by?: string | null;
+  authority_kind?: string | null;
+  inherited_policy_id?: string | null;
+  inherited_policy_version?: number | null;
+  inherited_policy_event_id?: string | null;
+  inherited_subject_id?: string | null;
+  policy_status?: string | null;
+  currently_authorized?: boolean;
 }
 
 export interface EnvelopeDisclosureRequest {

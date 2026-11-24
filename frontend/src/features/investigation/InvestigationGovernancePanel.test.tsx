@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { InvestigationView } from "../../api/investigation";
+import type { InvestigationEnvelopeView } from "../../api/investigationGovernance";
 import { InvestigationGovernancePanel } from "./InvestigationGovernancePanel";
 import { InvestigationSamples } from "./InvestigationPanels";
 
@@ -76,7 +77,9 @@ function makeInvestigation(
   };
 }
 
-function makeEnvelope(approved: boolean) {
+function makeEnvelope(
+  approved: boolean,
+): InvestigationEnvelopeView & { currently_authorized: boolean } {
   return {
     investigation_id: INVESTIGATION_ID,
     approved,
@@ -110,7 +113,7 @@ function makeEnvelope(approved: boolean) {
       },
     },
     disclosure: {
-      tlp: "amber" as "amber" | null,
+      tlp: "amber",
       do_not_submit: true,
       external_llm_allowed: false,
     },
@@ -119,12 +122,15 @@ function makeEnvelope(approved: boolean) {
       : null,
     approval_actor_id: approved ? "analyst:test" : null,
     approved_at: approved ? "2026-10-13T08:00:00Z" : null,
+    authority_kind: approved ? "human_g2" : null,
+    policy_status: null,
     currently_authorized: approved,
   };
 }
 
 function createHarness(options?: {
   approved?: boolean;
+  superseded?: boolean;
   paused?: boolean;
   failPath?: string;
   withSample?: boolean;
@@ -136,6 +142,14 @@ function createHarness(options?: {
     idempotencyKey: string | null;
   }> = [];
   let envelope = makeEnvelope(options?.approved ?? false);
+  if (options?.superseded) {
+    envelope = {
+      ...envelope,
+      authority_kind: "osint_policy",
+      policy_status: "superseded",
+      currently_authorized: false,
+    };
+  }
   let sample: {
     id: string;
     sample_sha256: string;
@@ -298,6 +312,25 @@ function createHarness(options?: {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("InvestigationGovernancePanel", () => {
+  it("affiche une politique remplacée comme non autorisée et ses fournisseurs comme inactifs", async () => {
+    createHarness({ approved: true, superseded: true });
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "Accès externes : non autorisés",
+      }),
+    ).toBeVisible();
+    expect(
+      screen.getByText(
+        "La politique est remplacée par une extension. L’autorisation courante est absente. Les analyses locales restent accessibles.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Fournisseurs enregistrés (non actifs) : vt"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Fournisseurs autorisés : vt")).toBeNull();
+  });
+
   it("distingue les accès actifs des accès révoqués et masque les identifiants techniques", async () => {
     const user = userEvent.setup();
     createHarness({ approved: true });

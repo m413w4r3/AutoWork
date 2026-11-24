@@ -55,6 +55,14 @@ const TLP_RANK: Record<GovernanceTlpBound, number> = {
 type EnvelopeMode = "approve" | "extend" | "revoke";
 type GovernanceEnvelopeView = InvestigationEnvelopeView & {
   currently_authorized?: boolean;
+  authority_kind?: string | null;
+  policy_status?: string | null;
+};
+
+const POLICY_STATUS_LABELS: Record<string, string> = {
+  active: "active",
+  revoked: "révoquée",
+  superseded: "remplacée par une extension",
 };
 
 function makeCorrelationId(): string {
@@ -159,6 +167,12 @@ export function InvestigationGovernancePanel({
   const envelope: GovernanceEnvelopeView | undefined = envelopeQuery.data;
   const accessIsActive = envelope?.currently_authorized === true;
   const accessIsRevoked =
+    envelope?.approved === true &&
+    envelope.currently_authorized === false &&
+    (envelope.authority_kind === "human_g2" ||
+      (envelope.authority_kind === "osint_policy" &&
+        envelope.policy_status === "revoked"));
+  const accessIsInactive =
     envelope?.approved === true && envelope.currently_authorized === false;
   const [mode, setMode] = useState<EnvelopeMode>("approve");
   const [providers, setProviders] = useState<string[]>([]);
@@ -328,24 +342,37 @@ export function InvestigationGovernancePanel({
                 ? "Accès externes : révoqués"
                 : accessIsActive
                   ? "Accès externes : actifs"
-                  : envelope.approved
-                    ? "Accès externes : état indisponible"
-                    : "Accès externes : non accordés"}
+                  : accessIsInactive
+                    ? "Accès externes : non autorisés"
+                    : envelope.approved
+                      ? "Accès externes : état indisponible"
+                      : "Accès externes : non accordés"}
             </h3>
             <p>
               {accessIsRevoked
                 ? "Aucune nouvelle opération VT, Shodan ou Bridge externe n’est autorisée. Les analyses locales restent accessibles."
                 : accessIsActive
                   ? "Les fournisseurs autorisés et les plafonds actifs sont listés ci-dessous. Les analyses locales restent accessibles."
-                  : "Aucune autorisation externe n’est accordée. Les analyses locales restent accessibles."}
+                  : accessIsInactive
+                    ? envelope.authority_kind === "osint_policy" &&
+                      envelope.policy_status
+                      ? `La politique est ${POLICY_STATUS_LABELS[envelope.policy_status] ?? envelope.policy_status}. L’autorisation courante est absente. Les analyses locales restent accessibles.`
+                      : "L’autorisation courante est absente. Les analyses locales restent accessibles."
+                    : "Aucune autorisation externe n’est accordée. Les analyses locales restent accessibles."}
             </p>
             <p>
-              Fournisseurs autorisés :{" "}
+              {accessIsActive
+                ? "Fournisseurs autorisés : "
+                : "Fournisseurs enregistrés (non actifs) : "}
               {envelope.allowed_providers.join(", ") || "aucun"}
             </p>
             <p>
               Acquisition de hits :{" "}
-              {envelope.acquire_hits_allowed ? "autorisée" : "interdite"}
+              {envelope.acquire_hits_allowed
+                ? accessIsActive
+                  ? "autorisée"
+                  : "enregistrée, non active"
+                : "interdite"}
               {` · volume maximal : ${envelope.max_acquire_volume} fichier(s)`}
             </p>
             <dl>

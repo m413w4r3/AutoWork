@@ -551,6 +551,36 @@ describe("EnvelopeLifecycleSection", () => {
     ).toBeNull();
   });
 
+  it("distingue une politique remplacée et présente ses fournisseurs comme inactifs", async () => {
+    renderSection({
+      initial: makeEnvelope({
+        allowed_providers: ["vt", "bridge"],
+        authority_kind: "osint_policy",
+        inherited_policy_id: POLICY_ID,
+        policy_status: "superseded",
+        currently_authorized: false,
+      }),
+    });
+
+    expect(
+      await screen.findByText("Accès externes : non autorisés"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Remplacée par une extension")).toBeInTheDocument();
+    expect(
+      screen.getByText("Fournisseurs de l’enveloppe enregistrée (non actifs)"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("VirusTotal (lectures) enregistrées, non actives"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/enregistrée, non active · 2 fichier/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("autorisées")).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "Étendre l’enveloppe" }),
+    ).toBeNull();
+  });
+
   it("affiche le conflit CAS et recharge l’enveloppe", async () => {
     const user = userEvent.setup();
     const { requests } = renderSection({
