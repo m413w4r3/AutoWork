@@ -739,6 +739,17 @@ test-investigation-browser: backend-sync frontend-sync ## Parcours navigateur M2
 		sed -n '1,260p' "$$server_log" >&2; \
 		exit 1; \
 	fi; \
+	attempt=0; \
+	while [ ! -s "$$state" ] && [ "$$attempt" -lt 60 ]; do \
+		if ! kill -0 "$$server_pid" 2>/dev/null; then break; fi; \
+		sleep 1; \
+		attempt=$$((attempt + 1)); \
+	done; \
+	if [ ! -s "$$state" ]; then \
+		echo "ERREUR: le serveur M24 n'a pas écrit son fichier d'état $$state; journal:" >&2; \
+		sed -n '1,260p' "$$server_log" >&2; \
+		exit 1; \
+	fi; \
 	if (cd $(FRONTEND_DIR) && $(PNPM) exec playwright test --config playwright.investigation.config.ts); then :; else status=$$?; fi; \
 	finished_at="$$(date +%s)"; \
 	echo "M24.1-investigation-browser / elapsed_seconds=$$((finished_at - started_at))"; \
