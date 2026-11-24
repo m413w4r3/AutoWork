@@ -23,6 +23,7 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport
 
+from cti_app.api.opinion_note_proposals import NoteCanonicalCodeBlockV1
 from cti_app.api.opinion_note_proposals import router as note_proposals_router
 from cti_app.application.analyst_opinion_service import (
     AnalystOpinionService,
@@ -1729,6 +1730,11 @@ def test_code_ref_verification_stays_unbounded_for_blocks_stored_before_m24_2() 
     assert block.length > MAX_CANONICAL_CODE_EXCERPT_BYTES
     # A persisted block is rebuilt from its payload: it must not be refused.
     assert note_content_block_from_payload(block.to_payload()) == block
+    # The API wire model is shared by requests AND stored-proposal responses: it must
+    # not bound `length` either, or older proposals would stop loading through the API.
+    wire = NoteCanonicalCodeBlockV1.model_validate(block.to_payload())
+    assert wire.length == 4097
+    assert wire.to_domain() == block
 
     proposal = _materialised_proposal(
         fixture, _run(fixture.request(fixture.advisor(), content_blocks=(block,)))
