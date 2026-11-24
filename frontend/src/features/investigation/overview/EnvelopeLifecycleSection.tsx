@@ -1,12 +1,12 @@
 /**
- * Vue d’ensemble — cycle de vie de l’enveloppe G2 approuvée.
+ * Vue d’ensemble — état courant et cycle de vie de l’enveloppe G2.
  *
- * L’approbation initiale reste l’unique décision de `EnvelopeSection`. Cette
- * section ne monte que pour une enveloppe déjà approuvée et n’expose que deux
- * décisions humaines distinctes : l’extension et la révocation. Chacune exige
- * un motif, une confirmation explicite et la version attendue (CAS) ; le
- * client génère une clé d’idempotence et un garde synchrone empêche une
- * double soumission. Rien n’est affiché qui ne soit réellement renvoyé par
+ * Cette section distingue une enveloppe jamais approuvée d’une enveloppe
+ * historique inactive, et expose les décisions d’extension et de révocation
+ * quand une approbation existe. Chacune exige un motif, une confirmation
+ * explicite et la version attendue (CAS) ; le client génère une clé
+ * d’idempotence et un garde synchrone empêche une double soumission. Rien
+ * n’est affiché qui ne soit réellement renvoyé par
  * `GET /api/investigations/{id}/envelope`.
  */
 
@@ -40,6 +40,10 @@ import {
   formatBytes,
   formatCount,
 } from "./overviewPresentation";
+import {
+  envelopeAccessState,
+  type EnvelopeAccessState,
+} from "./envelopeAccess";
 
 /**
  * Champs de cycle de vie déjà renvoyés par le contrat `EnvelopeView` du
@@ -91,12 +95,6 @@ const TLP_RANK: Record<GovernanceTlpBound, number> = {
   red: 4,
 };
 
-const POLICY_STATUS_LABELS: Record<string, string> = {
-  active: "Active",
-  revoked: "Révoquée",
-  superseded: "Remplacée par une extension",
-};
-
 const AUTHORITY_KIND_LABELS: Record<string, string> = {
   human_g2: "Décision humaine G2",
   osint_policy: "Politique OSINT héritée",
@@ -142,6 +140,7 @@ export function EnvelopeLifecycleSection({
 }) {
   const envelopeQuery = useInvestigationEnvelope(investigationId);
   const envelope = envelopeQuery.data as EnvelopeLifecycleView | undefined;
+  const access = envelope ? envelopeAccessState(envelope) : null;
   const reload = () => void envelopeQuery.refetch();
 
   if (envelopeQuery.isError) {
@@ -160,11 +159,25 @@ export function EnvelopeLifecycleSection({
       </section>
     );
   }
-  if (!envelope?.approved) return null;
+  if (!envelope || !access) return null;
+  if (access.kind === "never_approved") {
+    return (
+      <section
+        className="job-card workshop-envelope"
+        aria-labelledby={LIFECYCLE_HEADING_ID}
+      >
+        <h2 id={LIFECYCLE_HEADING_ID}>Cycle de vie de l’enveloppe G2</h2>
+        <WorkshopStateBanner tone="info" title={access.statusLabel}>
+          <p>{access.statusMessage}</p>
+        </WorkshopStateBanner>
+      </section>
+    );
+  }
   return (
     <ApprovedEnvelopeSection
       investigationId={investigationId}
       envelope={envelope}
+      access={access}
       onReload={reload}
     />
   );
@@ -182,18 +195,8 @@ export function EnvelopeAccessSummary({
   let label = "Accès externes : état indisponible";
   if (envelopeQuery.isPending) {
     label = "Accès externes : chargement";
-  } else if (!envelopeQuery.isError && !envelope?.approved) {
-    label = "Accès externes : non accordés";
-  } else if (
-    !envelopeQuery.isError &&
-    envelope?.approved &&
-    typeof envelope.currently_authorized === "boolean"
-  ) {
-    label = envelope.currently_authorized
-      ? "Accès externes : actifs"
-      : isExplicitlyRevoked(envelope)
-        ? "Accès externes : révoqués"
-        : "Accès externes : non autorisés";
+  } else if (!envelopeQuery.isError && envelope) {
+    label = envelopeAccessState(envelope).statusLabel;
   }
 
   return (
@@ -206,10 +209,12 @@ export function EnvelopeAccessSummary({
 function ApprovedEnvelopeSection({
   investigationId,
   envelope,
+  access: initialAccess,
   onReload,
 }: {
   investigationId: string;
   envelope: EnvelopeLifecycleView;
+  access: EnvelopeAccessState;
   onReload: () => void;
 }) {
   const extend = useExtendInvestigationEnvelope();
@@ -219,11 +224,12 @@ function ApprovedEnvelopeSection({
   const [extendedVersion, setExtendedVersion] = useState<number | null>(null);
 
   const revokedNow = revoke.isSuccess;
-  const explicitlyRevoked =
-    revokedNow ||
-    (!envelope.currently_authorized && isExplicitlyRevoked(envelope));
-  const authorized = envelope.currently_authorized && !revokedNow;
-  const inactive = !authorized;
+  const access = revokedNow
+    ? envelopeAccessState(envelope, { revocationCommitted: true })
+    : initialAccess;
+  const authorized = access.isActive;
+  const inactive = !access.isActive;
+  const explicitlyRevoked = access.isRevoked;
   const revokedVersion = revokedNow
     ? (revoke.data?.version ?? envelope.version)
     : envelope.version;
@@ -236,30 +242,16 @@ function ApprovedEnvelopeSection({
       <h2 id={LIFECYCLE_HEADING_ID}>Cycle de vie de l’enveloppe G2</h2>
 
       {explicitlyRevoked ? (
-        <WorkshopStateBanner tone="warning" title="Accès externes : révoqués">
-          <p>
-            Aucune nouvelle opération VT, Shodan ou Bridge externe n’est
-            autorisée. Les analyses locales restent accessibles.
-          </p>
+        <WorkshopStateBanner tone="warning" title={access.statusLabel}>
+          <p>{access.statusMessage}</p>
         </WorkshopStateBanner>
       ) : authorized ? (
-        <WorkshopStateBanner tone="success" title="Accès externes : actifs">
-          <p>
-            Les fournisseurs autorisés et les plafonds actifs sont listés
-            ci-dessous.
-          </p>
+        <WorkshopStateBanner tone="success" title={access.statusLabel}>
+          <p>{access.statusMessage}</p>
         </WorkshopStateBanner>
       ) : (
-        <WorkshopStateBanner
-          tone="warning"
-          title="Accès externes : non autorisés"
-        >
-          <p>
-            {envelope.authority_kind === "osint_policy" &&
-            envelope.policy_status
-              ? `La politique n’autorise plus les accès externes (${POLICY_STATUS_LABELS[envelope.policy_status] ?? envelope.policy_status}).`
-              : "L’autorisation courante est absente. Les analyses locales restent accessibles."}
-          </p>
+        <WorkshopStateBanner tone="warning" title={access.statusLabel}>
+          <p>{access.statusMessage}</p>
         </WorkshopStateBanner>
       )}
 
@@ -272,16 +264,13 @@ function ApprovedEnvelopeSection({
         </WorkshopStateBanner>
       ) : null}
 
-      <EnvelopeRights envelope={envelope} active={authorized} />
-      <EnvelopeBudget
-        envelope={envelope}
-        inactive={inactive}
-        explicitlyRevoked={explicitlyRevoked}
-      />
+      <EnvelopeRights envelope={envelope} access={access} />
+      <EnvelopeBudget envelope={envelope} access={access} />
       <EnvelopeDecision envelope={envelope} />
       <InheritedPolicy envelope={envelope} />
       <EnvelopeTechnicalDetails
         envelope={envelope}
+        access={access}
         revokedVersion={revokedVersion}
         inactive={inactive}
       />
@@ -343,21 +332,14 @@ function ApprovedEnvelopeSection({
   );
 }
 
-function isExplicitlyRevoked(envelope: EnvelopeLifecycleView): boolean {
-  return (
-    envelope.authority_kind === "human_g2" ||
-    (envelope.authority_kind === "osint_policy" &&
-      envelope.policy_status === "revoked")
-  );
-}
-
 function EnvelopeRights({
   envelope,
-  active,
+  access,
 }: {
   envelope: InvestigationEnvelopeView;
-  active: boolean;
+  access: EnvelopeAccessState;
 }) {
+  const active = access.isActive;
   const providers = envelope.allowed_providers;
   const otherProviders = providers.filter(
     (provider) => !(provider in PROVIDER_LABELS),
@@ -365,55 +347,60 @@ function EnvelopeRights({
   return (
     <section aria-labelledby="overview-envelope-rights-heading">
       <h3 id="overview-envelope-rights-heading">
-        {active
-          ? "Droits autorisés"
-          : "Fournisseurs de l’enveloppe enregistrée (non actifs)"}
+        {active ? "Droits autorisés" : access.providersLabel}
       </h3>
       <dl className="workshop-meta">
         <dt>VirusTotal (lectures)</dt>
         <dd>
-          {providers.includes("vt")
-            ? active
-              ? "autorisées"
-              : "VirusTotal (lectures) enregistrées, non actives"
-            : "interdites"}
+          {access.providerPermissionLabel(
+            "vt",
+            "VirusTotal (lectures)",
+            providers.includes("vt"),
+          )}
         </dd>
         <dt>Bridge (consultations)</dt>
         <dd>
-          {providers.includes("bridge")
-            ? active
-              ? "autorisées"
-              : "Bridge (consultations) enregistrées, non actives"
-            : "interdites"}
+          {access.providerPermissionLabel(
+            "bridge",
+            "Bridge (consultations)",
+            providers.includes("bridge"),
+          )}
         </dd>
         <dt>Shodan</dt>
         <dd>
-          {providers.includes("shodan")
-            ? active
-              ? "autorisé"
-              : "Shodan enregistré, non actif"
-            : "interdit"}
+          {access.providerPermissionLabel(
+            "shodan",
+            "Shodan",
+            providers.includes("shodan"),
+          )}
         </dd>
         <dt>Acquisition d’échantillons</dt>
         <dd>
+          {access.acquisitionLabel}
           {envelope.acquire_hits_allowed
-            ? active
-              ? `autorisée · ${formatCount(envelope.max_acquire_volume)} fichier(s) maximum`
-              : `enregistrée, non active · ${formatCount(envelope.max_acquire_volume)} fichier(s) maximum`
-            : "interdite"}
+            ? ` · ${formatCount(envelope.max_acquire_volume)} fichier(s) maximum`
+            : ""}
         </dd>
         <dt>Divulgation</dt>
         <dd>
-          TLP{" "}
-          {envelope.disclosure.tlp
-            ? envelope.disclosure.tlp.toUpperCase()
-            : "non déclaré"}{" "}
-          · soumission du contenu :{" "}
-          {envelope.disclosure.do_not_submit
-            ? "interdite (do_not_submit)"
-            : "autorisée"}{" "}
-          · LLM externe :{" "}
-          {envelope.disclosure.external_llm_allowed ? "autorisé" : "interdit"}
+          {active ? (
+            <>
+              TLP{" "}
+              {envelope.disclosure.tlp
+                ? envelope.disclosure.tlp.toUpperCase()
+                : "non déclaré"}{" "}
+              · soumission du contenu :{" "}
+              {envelope.disclosure.do_not_submit
+                ? "interdite (do_not_submit)"
+                : "autorisée"}{" "}
+              · LLM externe :{" "}
+              {envelope.disclosure.external_llm_allowed
+                ? "autorisé"
+                : "interdit"}
+            </>
+          ) : (
+            access.inactiveDisclosureLabel
+          )}
         </dd>
         {otherProviders.length > 0 ? (
           <>
@@ -430,12 +417,10 @@ function EnvelopeRights({
 
 function EnvelopeBudget({
   envelope,
-  inactive,
-  explicitlyRevoked,
+  access,
 }: {
   envelope: EnvelopeLifecycleView;
-  inactive: boolean;
-  explicitlyRevoked: boolean;
+  access: EnvelopeAccessState;
 }) {
   return (
     <section aria-labelledby="overview-envelope-budget-heading">
@@ -452,8 +437,8 @@ function EnvelopeBudget({
               {budgetLine(
                 dimension,
                 envelope.budget[dimension],
-                isExternalBudgetActive(dimension, envelope, inactive),
-                explicitlyRevoked,
+                isExternalBudgetActive(dimension, envelope, access.isActive),
+                access.isRevoked,
               )}
             </dd>
           </div>
@@ -510,32 +495,19 @@ function budgetQuantity(
 function isExternalBudgetActive(
   dimension: BudgetDimension,
   envelope: EnvelopeLifecycleView,
-  revoked: boolean,
+  accessIsActive: boolean,
 ): boolean {
   switch (dimension) {
     case "bridge_turns":
-      return (
-        envelope.currently_authorized &&
-        !revoked &&
-        envelope.allowed_providers.includes("bridge")
-      );
+      return accessIsActive && envelope.allowed_providers.includes("bridge");
     case "vt_units":
-      return (
-        envelope.currently_authorized &&
-        !revoked &&
-        envelope.allowed_providers.includes("vt")
-      );
+      return accessIsActive && envelope.allowed_providers.includes("vt");
     case "shodan_credits":
-      return (
-        envelope.currently_authorized &&
-        !revoked &&
-        envelope.allowed_providers.includes("shodan")
-      );
+      return accessIsActive && envelope.allowed_providers.includes("shodan");
     case "downloads":
       return (
         envelope.allowed_providers.includes("vt") &&
-        envelope.currently_authorized &&
-        !revoked &&
+        accessIsActive &&
         envelope.acquire_hits_allowed
       );
     default:
@@ -574,10 +546,12 @@ function EnvelopeDecision({ envelope }: { envelope: EnvelopeLifecycleView }) {
 
 function EnvelopeTechnicalDetails({
   envelope,
+  access,
   revokedVersion,
   inactive,
 }: {
   envelope: EnvelopeLifecycleView;
+  access: EnvelopeAccessState;
   revokedVersion: number;
   inactive: boolean;
 }) {
@@ -605,11 +579,7 @@ function EnvelopeTechnicalDetails({
         ) : null}
         {envelope.allowed_providers.length > 0 ? (
           <>
-            <dt>
-              {inactive
-                ? "Fournisseurs enregistrés (non actifs)"
-                : "Identifiants de fournisseurs autorisés"}
-            </dt>
+            <dt>{access.technicalProvidersLabel}</dt>
             <dd>
               <code>{envelope.allowed_providers.join(", ")}</code>
             </dd>
@@ -665,7 +635,7 @@ function InheritedPolicy({ envelope }: { envelope: EnvelopeLifecycleView }) {
   if (envelope.policy_status) {
     rows.push([
       "Statut de la politique",
-      POLICY_STATUS_LABELS[envelope.policy_status] ??
+      envelopeAccessState(envelope).policyStatusLabel ??
         "Statut de politique enregistré",
     ]);
   }

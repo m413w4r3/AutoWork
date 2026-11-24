@@ -27,9 +27,11 @@ import {
 import {
   useInvestigationSamples,
   useQualifyInvestigationSample,
+  useInvestigationEnvelope,
   type InvestigationSampleDetail,
   type SampleQualificationState,
 } from "../../api/investigationGovernance";
+import { envelopeAccessState } from "./overview/envelopeAccess";
 
 const FINDING_KIND_LABELS: Record<InvestigationFinding["kind"], string> = {
   new_sample: "Nouvel échantillon",
@@ -549,6 +551,10 @@ export function InvestigationBudgetAndDecisions({
 }: {
   investigation: InvestigationView;
 }) {
+  const envelopeQuery = useInvestigationEnvelope(investigation.id);
+  const envelope = envelopeQuery.data;
+  const access = envelope ? envelopeAccessState(envelope) : null;
+
   return (
     <section
       className="job-card"
@@ -572,19 +578,22 @@ export function InvestigationBudgetAndDecisions({
         })}
       </dl>
       <h3>Enveloppe d’investigation</h3>
-      <p>
-        {investigation.envelope_approved
-          ? "Enveloppe approuvée"
-          : "Décision requise : enveloppe G2 non approuvée"}
-        {investigation.acquire_hits_allowed
-          ? " · acquisition de hits autorisée"
-          : " · acquisition de hits non autorisée"}
-      </p>
-      <p>
-        Fournisseurs autorisés :{" "}
-        {investigation.allowed_providers.join(", ") || "aucun"}
-      </p>
-      {!investigation.envelope_approved ? (
+      {envelopeQuery.isPending ? (
+        <p role="status">Chargement de l’enveloppe G2…</p>
+      ) : envelopeQuery.isError || !envelope || !access ? (
+        <p role="note">État de l’enveloppe G2 indisponible.</p>
+      ) : (
+        <>
+          <p>
+            {access.journalLabel} · {access.journalAcquisitionLabel}
+          </p>
+          <p>
+            {access.providersLabel} :{" "}
+            {envelope.allowed_providers.join(", ") || "aucun"}
+          </p>
+        </>
+      )}
+      {access?.kind === "never_approved" ? (
         <p className="verification-warning" role="note">
           La décision G2 doit préciser les fournisseurs, le budget, le droit
           d’acquisition et les bornes de divulgation. La proposition reste sans
@@ -610,14 +619,18 @@ export function InvestigationBudgetAndDecisions({
                   {" · "}
                   <a
                     href={
-                      investigation.envelope_approved
+                      access?.kind === "active"
                         ? "#investigation-envelope-extend"
-                        : "#investigation-envelope-approve"
+                        : access?.kind === "never_approved"
+                          ? "#investigation-envelope-approve"
+                          : "#investigation-envelope-panel"
                     }
                   >
-                    {investigation.envelope_approved
+                    {access?.kind === "active"
                       ? "Étendre l’enveloppe G2"
-                      : "Approuver l’enveloppe G2"}
+                      : access?.kind === "never_approved"
+                        ? "Approuver l’enveloppe G2"
+                        : "Examiner la gouvernance G2"}
                   </a>
                 </>
               ) : null}
@@ -632,7 +645,7 @@ export function InvestigationBudgetAndDecisions({
             {investigation.unavailable_tools.map((tool) => (
               <li key={tool}>
                 <code>{tool}</code> ·{" "}
-                {unavailableToolReason(tool, investigation)}
+                {unavailableToolReason(tool, investigation, access)}
               </li>
             ))}
           </ul>
@@ -657,6 +670,7 @@ function decisionLabel(code: string): string {
 function unavailableToolReason(
   tool: string,
   investigation: InvestigationView,
+  access: ReturnType<typeof envelopeAccessState> | null,
 ): string {
   const reason = investigation.unavailable_tool_reasons[tool];
   const normalized = reason?.toLowerCase() ?? "";
@@ -665,9 +679,13 @@ function unavailableToolReason(
     normalized.includes("disclosure") ||
     normalized.includes("permission_required")
   ) {
-    return investigation.envelope_approved
-      ? "Divulgation ou autorisation G2 à vérifier."
-      : "Approbation de l’enveloppe G2 requise.";
+    if (access?.kind === "never_approved")
+      return "Approbation de l’enveloppe G2 requise.";
+    if (access?.kind === "active")
+      return "Divulgation ou autorisation G2 à vérifier.";
+    return access
+      ? "Les accès externes de l’enveloppe enregistrée ne sont pas actifs."
+      : "L’état de l’enveloppe G2 est indisponible.";
   }
   if (normalized.includes("budget") || normalized.includes("limit")) {
     return "Plafond de budget atteint pour cette capacité.";
@@ -690,7 +708,7 @@ function unavailableToolReason(
     }
   }
   if (
-    !investigation.envelope_approved &&
+    access?.kind === "never_approved" &&
     (tool === "advisor.consult" ||
       tool.startsWith("vt.") ||
       tool.startsWith("shodan."))

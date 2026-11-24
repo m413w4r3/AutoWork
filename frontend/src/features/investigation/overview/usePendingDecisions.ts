@@ -1,6 +1,7 @@
 /** Shared pending-decision projections for the overview and context bar. */
 
 import { useInvestigationEnvelope } from "../../../api/investigationGovernance";
+import { envelopeAccessState } from "./envelopeAccess";
 import { useBootstrapEnvelopeProposal } from "../api/bootstrap";
 import { useNoteProposals } from "../api/opinionProposals";
 import { useTasks } from "../api/tasks";
@@ -51,13 +52,8 @@ export function usePendingDecisions(
     conflicts,
     workspace: workspaceQuery.data ?? null,
     envelopeProposal: bootstrapEnvelopeQuery.data ?? null,
-    envelope: envelopeQuery.data
-      ? {
-          approved: envelopeQuery.data.approved,
-          currently_authorized:
-            "currently_authorized" in envelopeQuery.data &&
-            envelopeQuery.data.currently_authorized === true,
-        }
+    envelopeAccessKind: envelopeQuery.data
+      ? envelopeAccessState(envelopeQuery.data).kind
       : null,
     workspaceViewsAvailable: options.workspaceViewsAvailable,
   });

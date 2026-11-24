@@ -217,10 +217,10 @@ function SnapshotDetails({ snapshot }: { snapshot: BootstrapSnapshotV1 }) {
         </dd>
         <dt>État du plan</dt>
         <dd>{PLAN_STATE_LABELS[snapshot.plan_state]}</dd>
-        <dt>Enveloppe G2</dt>
+        <dt>Enveloppe G2 au moment du snapshot</dt>
         <dd>
           {snapshot.envelope_version === null
-            ? "Aucune version approuvée"
+            ? "Aucune version enregistrée dans ce snapshot"
             : `Version ${snapshot.envelope_version}`}
         </dd>
         <dt>Limites</dt>
