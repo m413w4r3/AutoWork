@@ -20,7 +20,7 @@ import type {
   WorkspaceStatusV1,
 } from "../api/workspace";
 import type { WorkspaceAgentStatus } from "../api/workspaceAgent";
-import type { InvestigationEnvelopeView } from "../../../api/investigationGovernance";
+import type { EnvelopeAccessKind } from "./envelopeAccess";
 
 export const PLAN_STATE_LABELS: Record<BootstrapPlanState, string> = {
   empty: "Inventaire vide",
@@ -168,11 +168,7 @@ export interface OverviewDecisionInput {
     BootstrapEnvelopeProposalV1,
     "already_approved" | "plan_state" | "covered_operations"
   > | null;
-  envelope?:
-    | (Pick<InvestigationEnvelopeView, "approved"> & {
-        currently_authorized: boolean;
-      })
-    | null;
+  envelopeAccessKind?: EnvelopeAccessKind | null;
   workspaceViewsAvailable?: boolean;
 }
 
@@ -257,11 +253,11 @@ export function deriveOverviewDecisions(
     input.workspace?.workspace_state === "bound" &&
     input.workspace.workspace_available;
   const proposal = input.envelopeProposal;
-  const envelope = input.envelope;
+  const envelopeAccessKind = input.envelopeAccessKind;
   if (
     proposal &&
     !proposal.already_approved &&
-    envelope?.approved === false &&
+    envelopeAccessKind === "never_approved" &&
     workspaceCanApprove &&
     bootstrapEnvelopeBlockedReason(proposal, workspaceCanApprove, null) === null
   ) {
@@ -271,7 +267,7 @@ export function deriveOverviewDecisions(
       detail: `${proposal.covered_operations} opération(s) couverte(s)`,
       href: "#overview-g2-details",
     });
-  } else if (envelope?.approved && envelope.currently_authorized) {
+  } else if (envelopeAccessKind === "active") {
     decisions.push({
       key: "envelope:extend",
       label: "Étendre l’enveloppe G2",

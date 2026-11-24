@@ -10,7 +10,10 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { InvestigationEnvelopeView } from "../../../api/investigationGovernance";
-import { EnvelopeLifecycleSection } from "./EnvelopeLifecycleSection";
+import {
+  EnvelopeAccessSummary,
+  EnvelopeLifecycleSection,
+} from "./EnvelopeLifecycleSection";
 
 const INVESTIGATION_ID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
 const DECISION_ID = "66666666-6666-4666-8666-666666666666";
@@ -227,12 +230,26 @@ function renderSection(options: HarnessOptions = {}) {
   return { ...result, ...harness };
 }
 
+function renderAccessSummary(initial: LifecycleEnvelope) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false, refetchInterval: false } },
+  });
+  const harness = createHarness({ initial });
+  vi.stubGlobal("fetch", harness.fetchMock);
+  const result = render(
+    <QueryClientProvider client={client}>
+      <EnvelopeAccessSummary investigationId={INVESTIGATION_ID} />
+    </QueryClientProvider>,
+  );
+  return { ...result, ...harness };
+}
+
 afterEach(() => {
   vi.unstubAllGlobals();
 });
 
 describe("EnvelopeLifecycleSection", () => {
-  it("ne monte aucune action tant que l’enveloppe n’est pas approuvée", async () => {
+  it("affiche l’état initial sans créer d’action G2", async () => {
     const { requests } = renderSection({
       initial: makeEnvelope({
         approved: false,
@@ -257,10 +274,16 @@ describe("EnvelopeLifecycleSection", () => {
       ).toBe(true),
     );
     expect(
-      screen.queryByRole("heading", {
+      await screen.findByRole("heading", {
         name: "Cycle de vie de l’enveloppe G2",
       }),
-    ).toBeNull();
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Accès externes : non accordés"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Aucune autorisation externe n’est accordée/),
+    ).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "Étendre l’enveloppe" }),
     ).toBeNull();
@@ -386,6 +409,80 @@ describe("EnvelopeLifecycleSection", () => {
     expect(screen.getByText("Activée par")).toBeInTheDocument();
     expect(screen.getByText("analyst:policy")).toBeInTheDocument();
   });
+
+  it.each([
+    [
+      "never approved",
+      { approved: false, currently_authorized: false },
+      "Accès externes : non accordés",
+      false,
+    ],
+    ["active", {}, "Accès externes : actifs", true],
+    ["extended", { version: 2 }, "Accès externes : actifs", true],
+    [
+      "revoked",
+      { currently_authorized: false },
+      "Accès externes : révoqués",
+      false,
+    ],
+    [
+      "superseded",
+      {
+        authority_kind: "osint_policy",
+        policy_status: "superseded",
+        currently_authorized: false,
+        disclosure: {
+          tlp: "amber",
+          do_not_submit: true,
+          external_llm_allowed: true,
+        },
+      },
+      "Accès externes : non autorisés",
+      false,
+    ],
+    [
+      "other inactive",
+      {
+        authority_kind: "osint_policy",
+        policy_status: "active",
+        currently_authorized: false,
+        disclosure: {
+          tlp: "amber",
+          do_not_submit: true,
+          external_llm_allowed: true,
+        },
+      },
+      "Accès externes : non autorisés",
+      false,
+    ],
+  ] as const)(
+    "cycle de vie : état %s",
+    async (_name, overrides, expected, active) => {
+      renderSection({ initial: makeEnvelope(overrides) });
+
+      expect(await screen.findByText(expected)).toBeInTheDocument();
+      if (active) {
+        expect(screen.getByText("Droits autorisés")).toBeInTheDocument();
+        expect(
+          screen.getByText("autorisée · 2 fichier(s) maximum"),
+        ).toBeInTheDocument();
+        return;
+      }
+      expect(screen.queryByText("Droits autorisés")).toBeNull();
+      if (_name !== "never approved") {
+        expect(
+          screen.getByText("VirusTotal (lectures) enregistrées, non actives"),
+        ).toBeInTheDocument();
+        expect(
+          screen.getByText(/enregistrée, non active · 2 fichier/),
+        ).toBeInTheDocument();
+        const disclosure = screen.getByText(/LLM externe/);
+        expect(disclosure.textContent).not.toMatch(
+          /\b(?:autorisé|autorisée)\b/i,
+        );
+      }
+    },
+  );
 
   it("envoie l’extension avec le CAS, les droits complets et une clé d’idempotence", async () => {
     const user = userEvent.setup();
@@ -559,6 +656,11 @@ describe("EnvelopeLifecycleSection", () => {
         inherited_policy_id: POLICY_ID,
         policy_status: "superseded",
         currently_authorized: false,
+        disclosure: {
+          tlp: "amber",
+          do_not_submit: true,
+          external_llm_allowed: true,
+        },
       }),
     });
 
@@ -567,14 +669,15 @@ describe("EnvelopeLifecycleSection", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("Remplacée par une extension")).toBeInTheDocument();
     expect(
-      screen.getByText("Fournisseurs de l’enveloppe enregistrée (non actifs)"),
-    ).toBeInTheDocument();
+      screen.getAllByText("Fournisseurs enregistrés (non actifs)"),
+    ).toHaveLength(2);
     expect(
       screen.getByText("VirusTotal (lectures) enregistrées, non actives"),
     ).toBeInTheDocument();
     expect(
       screen.getByText(/enregistrée, non active · 2 fichier/),
     ).toBeInTheDocument();
+    expect(screen.queryByText(/LLM externe.*autorisé/)).toBeNull();
     expect(screen.queryByText("autorisées")).toBeNull();
     expect(
       screen.queryByRole("button", { name: "Étendre l’enveloppe" }),
@@ -618,6 +721,42 @@ describe("EnvelopeLifecycleSection", () => {
         ).length,
       ).toBeGreaterThan(getsBefore),
     );
+  });
+
+  it.each([
+    [
+      "jamais approuvée",
+      { approved: false, currently_authorized: false },
+      "Accès externes : non accordés",
+    ],
+    ["active", { currently_authorized: true }, "Accès externes : actifs"],
+    [
+      "étendue et active",
+      { version: 2, currently_authorized: true },
+      "Accès externes : actifs",
+    ],
+    ["révoquée", { currently_authorized: false }, "Accès externes : révoqués"],
+    [
+      "superseded",
+      {
+        authority_kind: "osint_policy",
+        policy_status: "superseded",
+        currently_authorized: false,
+      },
+      "Accès externes : non autorisés",
+    ],
+    [
+      "autre état inactif",
+      {
+        authority_kind: "osint_policy",
+        policy_status: "active",
+        currently_authorized: false,
+      },
+      "Accès externes : non autorisés",
+    ],
+  ] as const)("résumé replié : état %s", async (_name, overrides, expected) => {
+    renderAccessSummary(makeEnvelope(overrides));
+    expect(await screen.findByText(expected)).toBeInTheDocument();
   });
 
   it("affiche un refus typé non conflictuel avec le code backend", async () => {

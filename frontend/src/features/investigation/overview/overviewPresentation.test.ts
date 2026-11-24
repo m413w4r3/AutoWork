@@ -103,7 +103,7 @@ describe("deriveOverviewDecisions", () => {
         plan_state: "ready",
         covered_operations: 2,
       },
-      envelope: { approved: false, currently_authorized: false },
+      envelopeAccessKind: "never_approved",
     });
 
     expect(decisions[0]).toMatchObject({
@@ -118,7 +118,7 @@ describe("deriveOverviewDecisions", () => {
           plan_state: "awaiting_g2",
           covered_operations: 2,
         },
-        envelope: { approved: true, currently_authorized: false },
+        envelopeAccessKind: "inactive",
       }),
     ).toEqual([]);
   });

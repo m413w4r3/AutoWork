@@ -16,6 +16,7 @@ import {
   type InvestigationEnvelopeDecisionInput,
   type InvestigationEnvelopeView,
 } from "../../api/investigationGovernance";
+import { envelopeAccessState } from "./overview/envelopeAccess";
 
 const BUDGET_DIMENSIONS: BudgetDimension[] = [
   "bridge_turns",
@@ -57,12 +58,6 @@ type GovernanceEnvelopeView = InvestigationEnvelopeView & {
   currently_authorized?: boolean;
   authority_kind?: string | null;
   policy_status?: string | null;
-};
-
-const POLICY_STATUS_LABELS: Record<string, string> = {
-  active: "active",
-  revoked: "révoquée",
-  superseded: "remplacée par une extension",
 };
 
 function makeCorrelationId(): string {
@@ -165,15 +160,9 @@ export function InvestigationGovernancePanel({
   const revoke = useRevokeInvestigationEnvelope();
   const requestAnalysis = useRequestTargetedAnalysis();
   const envelope: GovernanceEnvelopeView | undefined = envelopeQuery.data;
-  const accessIsActive = envelope?.currently_authorized === true;
-  const accessIsRevoked =
-    envelope?.approved === true &&
-    envelope.currently_authorized === false &&
-    (envelope.authority_kind === "human_g2" ||
-      (envelope.authority_kind === "osint_policy" &&
-        envelope.policy_status === "revoked"));
-  const accessIsInactive =
-    envelope?.approved === true && envelope.currently_authorized === false;
+  const access = envelope ? envelopeAccessState(envelope) : null;
+  const accessIsActive = access?.isActive === true;
+  const accessIsRevoked = access?.isRevoked === true;
   const [mode, setMode] = useState<EnvelopeMode>("approve");
   const [providers, setProviders] = useState<string[]>([]);
   const [limits, setLimits] = useState<Record<BudgetDimension, string>>(
@@ -338,41 +327,21 @@ export function InvestigationGovernancePanel({
         ) : envelope ? (
           <>
             <h3>
-              {accessIsRevoked
-                ? "Accès externes : révoqués"
-                : accessIsActive
-                  ? "Accès externes : actifs"
-                  : accessIsInactive
-                    ? "Accès externes : non autorisés"
-                    : envelope.approved
-                      ? "Accès externes : état indisponible"
-                      : "Accès externes : non accordés"}
+              {access?.statusLabel ?? "Accès externes : état indisponible"}
             </h3>
             <p>
-              {accessIsRevoked
-                ? "Aucune nouvelle opération VT, Shodan ou Bridge externe n’est autorisée. Les analyses locales restent accessibles."
-                : accessIsActive
-                  ? "Les fournisseurs autorisés et les plafonds actifs sont listés ci-dessous. Les analyses locales restent accessibles."
-                  : accessIsInactive
-                    ? envelope.authority_kind === "osint_policy" &&
-                      envelope.policy_status
-                      ? `La politique est ${POLICY_STATUS_LABELS[envelope.policy_status] ?? envelope.policy_status}. L’autorisation courante est absente. Les analyses locales restent accessibles.`
-                      : "L’autorisation courante est absente. Les analyses locales restent accessibles."
-                    : "Aucune autorisation externe n’est accordée. Les analyses locales restent accessibles."}
+              {access?.isActive
+                ? `${access.statusMessage} Les analyses locales restent accessibles.`
+                : (access?.statusMessage ??
+                  "L’état courant de l’enveloppe est indisponible.")}
             </p>
             <p>
-              {accessIsActive
-                ? "Fournisseurs autorisés : "
-                : "Fournisseurs enregistrés (non actifs) : "}
+              {access?.providersLabel ?? "Fournisseurs"} :{" "}
               {envelope.allowed_providers.join(", ") || "aucun"}
             </p>
             <p>
               Acquisition de hits :{" "}
-              {envelope.acquire_hits_allowed
-                ? accessIsActive
-                  ? "autorisée"
-                  : "enregistrée, non active"
-                : "interdite"}
+              {access?.acquisitionLabel ?? "état indisponible"}
               {` · volume maximal : ${envelope.max_acquire_volume} fichier(s)`}
             </p>
             <dl>
@@ -395,21 +364,17 @@ export function InvestigationGovernancePanel({
               })}
             </dl>
             <p>
-              Divulgation : TLP:
-              {envelope.disclosure.tlp?.toUpperCase() ?? "non défini"} ·{" "}
-              do_not_submit :{" "}
-              {envelope.disclosure.do_not_submit ? "oui" : "non"} · LLM externe
-              :{" "}
-              {envelope.disclosure.external_llm_allowed
-                ? "autorisé"
-                : "interdit"}
+              {access?.isActive
+                ? `Divulgation : TLP:${envelope.disclosure.tlp?.toUpperCase() ?? "non défini"} · do_not_submit : ${envelope.disclosure.do_not_submit ? "oui" : "non"} · LLM externe : ${envelope.disclosure.external_llm_allowed ? "autorisé" : "interdit"}`
+                : (access?.inactiveDisclosureLabel ??
+                  "Limites de divulgation indisponibles.")}
             </p>
             {envelope.approved ? (
               <dl>
                 <div>
                   <dt>Dernière décision G2</dt>
                   <dd>
-                    {accessIsRevoked
+                    {access?.isRevoked
                       ? "Révocation"
                       : "Approbation ou extension"}
                   </dd>

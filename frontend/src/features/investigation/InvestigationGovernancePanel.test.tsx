@@ -6,7 +6,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { InvestigationView } from "../../api/investigation";
 import type { InvestigationEnvelopeView } from "../../api/investigationGovernance";
 import { InvestigationGovernancePanel } from "./InvestigationGovernancePanel";
-import { InvestigationSamples } from "./InvestigationPanels";
+import {
+  InvestigationBudgetAndDecisions,
+  InvestigationSamples,
+} from "./InvestigationPanels";
 
 const INVESTIGATION_ID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
 const ASSOCIATION_ID = "55555555-5555-4555-8555-555555555555";
@@ -131,9 +134,17 @@ function makeEnvelope(
 function createHarness(options?: {
   approved?: boolean;
   superseded?: boolean;
+  state?:
+    | "never_approved"
+    | "active"
+    | "extended"
+    | "revoked"
+    | "superseded"
+    | "other_inactive";
   paused?: boolean;
   failPath?: string;
   withSample?: boolean;
+  withJournal?: boolean;
 }) {
   const requests: Array<{
     url: string;
@@ -141,13 +152,46 @@ function createHarness(options?: {
     body: unknown;
     idempotencyKey: string | null;
   }> = [];
-  let envelope = makeEnvelope(options?.approved ?? false);
+  const stateApproved =
+    options?.state !== undefined
+      ? options.state !== "never_approved"
+      : (options?.approved ?? false);
+  let envelope = makeEnvelope(stateApproved);
+  if (options?.state !== undefined) {
+    envelope = {
+      ...envelope,
+      disclosure: { ...envelope.disclosure, external_llm_allowed: true },
+    };
+  }
+  if (options?.state === "extended") {
+    envelope = { ...envelope, version: 2 };
+  } else if (options?.state === "revoked") {
+    envelope = { ...envelope, currently_authorized: false };
+  } else if (options?.state === "superseded") {
+    envelope = {
+      ...envelope,
+      authority_kind: "osint_policy",
+      policy_status: "superseded",
+      currently_authorized: false,
+    };
+  } else if (options?.state === "other_inactive") {
+    envelope = {
+      ...envelope,
+      authority_kind: "osint_policy",
+      policy_status: "active",
+      currently_authorized: false,
+    };
+  }
   if (options?.superseded) {
     envelope = {
       ...envelope,
       authority_kind: "osint_policy",
       policy_status: "superseded",
       currently_authorized: false,
+      disclosure: {
+        ...envelope.disclosure,
+        external_llm_allowed: true,
+      },
     };
   }
   let sample: {
@@ -185,6 +229,11 @@ function createHarness(options?: {
     stop_reason: options?.paused ? "user_interrupt" : null,
     status: options?.paused ? "exhausted" : "running",
   });
+  const journalHasEnvelope = options?.state
+    ? options.state !== "never_approved"
+    : Boolean(options?.approved || options?.superseded);
+  const journalIsActive =
+    options?.state === "active" || options?.state === "extended";
   const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url =
       typeof input === "string"
@@ -301,6 +350,14 @@ function createHarness(options?: {
           investigationId={INVESTIGATION_ID}
           observations={investigation.observations}
         />
+      ) : options?.withJournal ? (
+        <InvestigationBudgetAndDecisions
+          investigation={makeInvestigation({
+            envelope_approved: journalIsActive,
+            allowed_providers: journalHasEnvelope ? ["vt", "bridge"] : [],
+            acquire_hits_allowed: journalHasEnvelope,
+          })}
+        />
       ) : (
         <InvestigationGovernancePanel investigation={investigation} />
       )}
@@ -322,14 +379,124 @@ describe("InvestigationGovernancePanel", () => {
     ).toBeVisible();
     expect(
       screen.getByText(
-        "La politique est remplacée par une extension. L’autorisation courante est absente. Les analyses locales restent accessibles.",
+        "État de la politique : Remplacée par une extension. L’autorisation courante de cette enveloppe est absente. Les analyses locales restent accessibles.",
       ),
     ).toBeInTheDocument();
     expect(
       screen.getByText("Fournisseurs enregistrés (non actifs) : vt"),
     ).toBeInTheDocument();
     expect(screen.queryByText("Fournisseurs autorisés : vt")).toBeNull();
+    expect(screen.queryByText(/LLM externe.*autorisé/)).toBeNull();
   });
+
+  it("présente les droits historiques du journal comme enregistrés et inactifs", async () => {
+    createHarness({ approved: true, superseded: true, withJournal: true });
+
+    expect(
+      await screen.findByText(/Accès externes : non autorisés/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Fournisseurs enregistrés (non actifs) : vt"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/acquisition de hits enregistrée, non active/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Fournisseurs autorisés/)).toBeNull();
+    expect(screen.queryByText(/acquisition de hits autorisée/i)).toBeNull();
+  });
+
+  it.each([
+    [
+      "never_approved",
+      "Décision requise : enveloppe G2 non approuvée · acquisition de hits non accordée (aucune approbation G2)",
+      false,
+    ],
+    ["active", "Enveloppe approuvée · acquisition de hits autorisée", true],
+    ["extended", "Enveloppe approuvée · acquisition de hits autorisée", true],
+    [
+      "revoked",
+      "Accès externes : révoqués · acquisition de hits enregistrée, non active",
+      false,
+    ],
+    [
+      "superseded",
+      "Accès externes : non autorisés · acquisition de hits enregistrée, non active",
+      false,
+    ],
+    [
+      "other_inactive",
+      "Accès externes : non autorisés · acquisition de hits enregistrée, non active",
+      false,
+    ],
+  ] as const)(
+    "présente l’état %s dans le journal",
+    async (state, label, active) => {
+      createHarness({ state, withJournal: true });
+
+      expect(await screen.findByText(label)).toBeInTheDocument();
+      if (active) {
+        expect(
+          screen.getByText("Fournisseurs autorisés : vt"),
+        ).toBeInTheDocument();
+        return;
+      }
+      expect(screen.queryByText("Fournisseurs autorisés : vt")).toBeNull();
+      if (state === "never_approved") {
+        expect(
+          screen.getByText(
+            "Fournisseurs enregistrés (aucune approbation G2) : aucun",
+          ),
+        ).toBeInTheDocument();
+        expect(
+          screen.getByText(
+            /acquisition de hits non accordée.*aucune approbation G2/,
+          ),
+        ).toBeInTheDocument();
+        expect(
+          screen.getByRole("link", { name: "Approuver l’enveloppe" }),
+        ).toBeInTheDocument();
+      } else {
+        expect(
+          screen.getByText("Fournisseurs enregistrés (non actifs) : vt"),
+        ).toBeInTheDocument();
+        expect(
+          screen.getByText(/acquisition de hits enregistrée, non active/),
+        ).toBeInTheDocument();
+        expect(
+          screen.queryByRole("link", { name: "Approuver l’enveloppe" }),
+        ).toBeNull();
+      }
+    },
+  );
+
+  it.each([
+    ["never_approved", false],
+    ["active", true],
+    ["extended", true],
+    ["revoked", false],
+    ["superseded", false],
+    ["other_inactive", false],
+  ] as const)(
+    "présente la divulgation selon l’état %s",
+    async (state, active) => {
+      createHarness({ state });
+
+      const disclosure = await screen.findByText(
+        (_, node) =>
+          node?.tagName === "P" &&
+          (node.textContent ?? "").includes("LLM externe"),
+      );
+      const text = disclosure.textContent ?? "";
+      if (active) {
+        expect(text).toContain("LLM externe : autorisé");
+      } else {
+        expect(text).not.toMatch(
+          /\b(?:autorisé|autorisée|autorisés|autorisées)\b/i,
+        );
+        expect(text).toMatch(/non active|sans approbation G2/);
+      }
+    },
+  );
 
   it("distingue les accès actifs des accès révoqués et masque les identifiants techniques", async () => {
     const user = userEvent.setup();

@@ -264,7 +264,24 @@ function renderTab(
     )
       return Promise.resolve(Response.json(makeEnvelopeProposal()));
     if (url === `/api/investigations/${INVESTIGATION_ID}/envelope`)
-      return Promise.resolve(Response.json({ approved: false }));
+      return Promise.resolve(
+        Response.json({
+          investigation_id: INVESTIGATION_ID,
+          approved: false,
+          version: 0,
+          allowed_providers: [],
+          acquire_hits_allowed: false,
+          max_acquire_volume: 0,
+          disclosure: {
+            tlp: null,
+            do_not_submit: false,
+            external_llm_allowed: false,
+          },
+          authority_kind: null,
+          policy_status: null,
+          currently_authorized: false,
+        }),
+      );
     if (url === `/api/investigations/${INVESTIGATION_ID}`) {
       return Promise.resolve(Response.json(view));
     }

@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { InvestigationView } from "../../api/investigation";
@@ -122,6 +122,57 @@ const investigation: InvestigationView = {
 function mockResponse(url: string): Response {
   if (url.includes("/activity?")) {
     return Response.json(activityPage);
+  }
+  if (url.endsWith("/envelope")) {
+    return Response.json({
+      investigation_id: INVESTIGATION_ID,
+      approved: true,
+      version: 2,
+      allowed_providers: ["vt", "bridge"],
+      available_providers: ["vt", "bridge"],
+      acquire_hits_allowed: true,
+      max_acquire_volume: 2,
+      budget: {
+        bridge_turns: { limit: 10, consumed: 0, reserved: 0, remaining: 10 },
+        vt_units: { limit: 10, consumed: 0, reserved: 0, remaining: 10 },
+        shodan_credits: { limit: 0, consumed: 0, reserved: 0, remaining: 0 },
+        downloads: { limit: 2, consumed: 0, reserved: 0, remaining: 2 },
+        tool_seconds: {
+          limit: 120,
+          consumed: 0,
+          reserved: 0,
+          remaining: 120,
+        },
+        context_tokens: {
+          limit: 20_000,
+          consumed: 0,
+          reserved: 0,
+          remaining: 20_000,
+        },
+        context_bytes: {
+          limit: 100_000,
+          consumed: 0,
+          reserved: 0,
+          remaining: 100_000,
+        },
+      },
+      disclosure: {
+        tlp: "amber",
+        do_not_submit: true,
+        external_llm_allowed: true,
+      },
+      approval_decision_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      approval_actor_id: null,
+      policy_activated_by: "analyst:policy",
+      approved_at: "2026-10-18T10:00:00Z",
+      authority_kind: "osint_policy",
+      inherited_policy_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      inherited_policy_version: 1,
+      inherited_policy_event_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      inherited_subject_id: null,
+      policy_status: "superseded",
+      currently_authorized: false,
+    });
   }
   if (url.includes("/operator/context/section/article_claims")) {
     return Response.json({
@@ -446,6 +497,65 @@ function mockResponse(url: string): Response {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("InvestigationLabViews", () => {
+  it("intègre l’état de l’enveloppe au journal au lieu du résumé de l’enquête", async () => {
+    const client = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false, refetchInterval: false, staleTime: Infinity },
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const url =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url;
+        return Promise.resolve(mockResponse(url));
+      }),
+    );
+    render(
+      <QueryClientProvider client={client}>
+        <InvestigationLabViews
+          investigation={{
+            ...investigation,
+            envelope_approved: false,
+            allowed_providers: ["vt", "bridge"],
+            acquire_hits_allowed: true,
+          }}
+          editionId="edition-1"
+        />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Journal & revue" }));
+    const budgetHeading = await screen.findByRole("heading", {
+      name: "Budget et décisions",
+    });
+    const budgetPanel = budgetHeading.closest("section");
+    if (!budgetPanel) throw new Error("journal budget panel not found");
+
+    expect(
+      await within(budgetPanel).findByText(
+        "Fournisseurs enregistrés (non actifs) : vt, bridge",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(budgetPanel).getByText(
+        "Fournisseurs enregistrés (non actifs) : vt, bridge",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(budgetPanel).getByText(
+        /acquisition de hits enregistrée, non active/,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(budgetPanel).queryByText(/Fournisseurs autorisés/),
+    ).toBeNull();
+  });
+
   it("suit une affirmation contradictoire jusqu’au prochain pivot", async () => {
     const client = new QueryClient({
       defaultOptions: {

@@ -322,20 +322,20 @@ function EnvelopeProposal({
           {formatCount(proposal.planned_operations)} planifiée(s) ·{" "}
           {formatCount(proposal.covered_ioc_ids.length)} IOC couverts affichés
         </dd>
-        <dt>Fournisseurs autorisés</dt>
+        <dt>Fournisseurs proposés</dt>
         <dd>
           {proposal.allowed_providers.length === 0
             ? "aucun"
             : proposal.allowed_providers.map(bootstrapProviderLabel).join(", ")}
         </dd>
-        <dt>Acquisition</dt>
-        <dd>{proposal.acquire_hits_allowed ? "autorisée" : "non autorisée"}</dd>
+        <dt>Acquisition proposée</dt>
+        <dd>{proposal.acquire_hits_allowed ? "oui" : "non"}</dd>
       </dl>
 
       <section aria-labelledby="overview-envelope-vt-heading">
         <h3 id="overview-envelope-vt-heading">Lectures VirusTotal</h3>
         <dl className="workshop-meta">
-          <dt>Autorisées</dt>
+          <dt>Lectures incluses dans la proposition</dt>
           <dd>{proposal.vt_reads.allowed ? "oui" : "non"}</dd>
           <dt>Opérations</dt>
           <dd>
@@ -364,7 +364,7 @@ function EnvelopeProposal({
             <dd>
               <code>{proposal.proposal_sha256}</code> (non cliquable)
             </dd>
-            <dt>Identifiants de fournisseurs autorisés</dt>
+            <dt>Identifiants de fournisseurs proposés</dt>
             <dd>
               <code>{proposal.allowed_providers.join(", ") || "aucun"}</code>
             </dd>
@@ -412,9 +412,9 @@ function EnvelopeProposal({
           Acquisition d’échantillons
         </h3>
         <dl className="workshop-meta">
-          <dt>Autorisée</dt>
+          <dt>Acquisition proposée</dt>
           <dd>{proposal.sample_acquisition.allowed ? "oui" : "non"}</dd>
-          <dt>Acquisition directe</dt>
+          <dt>Acquisition directe proposée</dt>
           <dd>
             {proposal.sample_acquisition.acquire_hits_allowed
               ? "autorisée"
@@ -474,7 +474,7 @@ function EnvelopeProposal({
       <section aria-labelledby="overview-envelope-model-heading">
         <h3 id="overview-envelope-model-heading">Usage de modèle externe</h3>
         <dl className="workshop-meta">
-          <dt>Autorisé</dt>
+          <dt>Usage proposé</dt>
           <dd>{proposal.external_model.allowed ? "oui" : "non"}</dd>
           <dt>Fournisseurs</dt>
           <dd>
@@ -505,12 +505,8 @@ function EnvelopeProposal({
           <dd>{proposal.disclosure.tlp ?? "non déclaré"}</dd>
           <dt>Ne pas soumettre</dt>
           <dd>{proposal.disclosure.do_not_submit ? "oui" : "non"}</dd>
-          <dt>Modèle externe</dt>
-          <dd>
-            {proposal.disclosure.external_llm_allowed
-              ? "autorisé"
-              : "non autorisé"}
-          </dd>
+          <dt>Modèle externe proposé</dt>
+          <dd>{proposal.disclosure.external_llm_allowed ? "oui" : "non"}</dd>
           <dt>Portée</dt>
           <dd>{proposal.disclosure.scope_statement}</dd>
         </dl>
