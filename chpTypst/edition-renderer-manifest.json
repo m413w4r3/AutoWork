@@ -1,5 +1,5 @@
 {
-  "template_version": "chp-edition-v37-m24-2-d3-ioc-annex",
+  "template_version": "chp-edition-v38-m24-2-d3-ioc-annex-cards",
   "files": [
     "RENDERER/edition.typ",
     "RENDERER/edition_helpers.typ",

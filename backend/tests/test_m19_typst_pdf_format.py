@@ -252,8 +252,8 @@ def test_m19_renderer_manifest_versions_are_explicitly_pinned() -> None:
         _TEMPLATE_ROOT,
         manifest_name="edition-renderer-manifest.json",
     )
-    assert article.template_version == ("chp-article-v48-m24-2-d3-ioc-annex")
-    assert edition.template_version == ("chp-edition-v37-m24-2-d3-ioc-annex")
+    assert article.template_version == ("chp-article-v49-m24-2-d3-ioc-annex-cards")
+    assert edition.template_version == ("chp-edition-v38-m24-2-d3-ioc-annex-cards")
 
 
 def test_semantic_inline_technical_highlight_has_no_content_padding() -> None:
