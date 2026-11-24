@@ -24,6 +24,7 @@ import os
 import re
 import stat
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -201,6 +202,7 @@ def write_file(
     source: ByteSource,
     declared_length: int,
     idempotency_key: str,
+    agent_content_check: Callable[[str, str, Callable[[], bytes]], None] | None = None,
     hooks: paths.WalkHooks | None = None,
 ) -> WriteOutcome:
     """Publish one API write under its route policy and CAS preconditions.
@@ -246,6 +248,20 @@ def write_file(
         try:
             temporary = _stream_to_temporary(parent_fd, components[-1], source, declared_length)
             try:
+                if (
+                    validated_origin == "agent"
+                    and task_id is not None
+                    and agent_content_check is not None
+                ):
+                    cached_content: bytes | None = None
+
+                    def read_temporary() -> bytes:
+                        nonlocal cached_content
+                        if cached_content is None:
+                            cached_content = _read_temporary_bytes(parent_fd, temporary)
+                        return cached_content
+
+                    agent_content_check(task_id, path, read_temporary)
                 return _commit_write(
                     descriptor=descriptor,
                     scans=scans,
@@ -483,6 +499,32 @@ def _stream_to_temporary(
     except BaseException:
         _discard_temporary(parent_fd, fd, temporary_name)
         raise
+
+
+def _read_temporary_bytes(parent_fd: int, temporary: _Temporary) -> bytes:
+    """Read staged agent content only when an active session needs checking."""
+    try:
+        fd = os.open(
+            temporary.name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent_fd,
+        )
+    except OSError as exc:
+        raise FileStorageError("temporary file cannot be verified") from exc
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or (info.st_dev, info.st_ino) != (temporary.written.dev, temporary.written.ino)
+            or info.st_size != temporary.written.size
+        ):
+            raise FileStorageError("temporary file cannot be verified")
+        data = _read_bounded(fd, temporary.written.size)
+        if len(data) != temporary.written.size:
+            raise FileStorageError("temporary file cannot be verified")
+        return data
+    finally:
+        os.close(fd)
 
 
 def _discard_temporary(parent_fd: int, fd: int, name: str) -> None:

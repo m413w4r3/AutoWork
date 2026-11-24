@@ -289,6 +289,50 @@ def test_inactive_interrupt_removes_session_etc(tmp_path: Path) -> None:
     assert not session_etc.exists()
 
 
+def test_inactive_interrupt_removes_session_etc_when_credential_purge_raises(
+    tmp_path: Path,
+) -> None:
+    session_etc = process.create_session_etc_directory(tmp_path)
+    handle = SimpleNamespace(
+        lock=threading.RLock(),
+        record=SimpleNamespace(
+            state=SessionState.AWAITING_INSTRUCTION,
+            state_version=0,
+            outcome=None,
+            updated_at=None,
+            last_activity_at=None,
+            stopped_at=None,
+        ),
+        managed=None,
+        directory=tmp_path,
+        events=SimpleNamespace(append_event=lambda *_args, **_kwargs: None),
+    )
+    supervisor = object.__new__(sessions_module.SessionSupervisor)
+    supervisor._handle = lambda _session_id: handle
+    supervisor._idempotency = SimpleNamespace(
+        replay=lambda *_args: None,
+        remember=lambda *_args: None,
+    )
+    supervisor._now = lambda: "2026-11-24T00:00:00Z"
+    supervisor._stop_channels = lambda _handle, *, wipe_secret: None
+
+    def _raise_on_purge(_handle, *, operation: str) -> None:
+        raise RuntimeError(f"synthetic purge failure: {operation}")
+
+    supervisor._purge_provider_credentials = _raise_on_purge
+    supervisor._persist = lambda _handle: None
+
+    with pytest.raises(RuntimeError, match="synthetic purge failure: interrupt"):
+        supervisor.interrupt(
+            SESSION_ID,
+            ReasonRequest.from_payload({"reason": "inactive interrupt purge failure"}),
+            idempotency_key="m24-r2b1-inactive-interrupt-purge-failure",
+            body_sha256="f" * 64,
+        )
+
+    assert not session_etc.exists()
+
+
 def test_failed_run_end_removes_a_surviving_credential_copy(
     session_base: Path, scripted_supervisors: list[sessions_module.SessionSupervisor]
 ) -> None:
