@@ -985,7 +985,13 @@ async def test_signed_tool_call_route_attributes_and_refuses_token_alone() -> No
     await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
     tasks = _task_repository()
     sessions = InMemoryAgentSessionRepository()
-    task = _running_task(fixture.investigation_id, uuid4())
+    # The signed route validates the lease against the real clock, so anchor it
+    # at execution time rather than at this module's import time.
+    task = _running_task(
+        fixture.investigation_id,
+        uuid4(),
+        expires_at=datetime.now(UTC) + timedelta(seconds=180),
+    )
     session_row, secret = _session_row(fixture.investigation_id, task)
     task = _replace_task(task, lease_session_id=session_row.id)
     await tasks.add(task)
@@ -1043,7 +1049,13 @@ async def test_tool_call_route_is_fail_closed_without_server_key() -> None:
     await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
     tasks = _task_repository()
     sessions = InMemoryAgentSessionRepository()
-    task = _running_task(fixture.investigation_id, uuid4())
+    # The signed route validates the lease against the real clock, so anchor it
+    # at execution time rather than at this module's import time.
+    task = _running_task(
+        fixture.investigation_id,
+        uuid4(),
+        expires_at=datetime.now(UTC) + timedelta(seconds=180),
+    )
     session_row, secret = _session_row(fixture.investigation_id, task)
     task = _replace_task(task, lease_session_id=session_row.id)
     await tasks.add(task)
