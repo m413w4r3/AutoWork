@@ -784,9 +784,9 @@ class WorkspaceAgentRequestHandler(BaseHTTPRequestHandler):
                 source=self.rfile,
                 declared_length=declared_length,
                 idempotency_key=self.headers.get(protocol.IDEMPOTENCY_KEY_HEADER) or "",
-                agent_content_check=(
-                    self._sessions().check_agent_file_write
-                    if origin == "agent" and task_id is not None
+                non_ui_content_check=(
+                    self._sessions().check_non_ui_file_write
+                    if origin in {"agent", "system"}
                     else None
                 ),
             )

@@ -3098,12 +3098,14 @@ class SessionSupervisor:
         F2 covers the D7 secret; R2B-2 extends the same refusal to the seeded
         provider credential values (raw, hex, standard/urlsafe base64,
         JSON-escaped and aligned fragments) and to files named like a
-        credential copy.  Neither the error nor the event carries the offending
-        content or a path.
+        credential copy during collect. File writes are checked by content.
+        Neither the error nor the event carries the offending content or a path.
         """
         for destination, _kind, _data in entries:
-            if any(_is_credential_file_name(part) for part in PurePosixPath(destination).parts):
-                self._revoke_secret_exposure(handle)
+            if operation != "file_write" and any(
+                _is_credential_file_name(part) for part in PurePosixPath(destination).parts
+            ):
+                self._revoke_secret_exposure(handle, operation=operation)
                 raise SecretExposureError(operation=operation)
         # The current copies are read here (never persisted) so a token the CLI
         # refreshed during the run is covered even before the next purge; forms
@@ -3116,10 +3118,11 @@ class SessionSupervisor:
         if not forms:
             return
         for destination, _kind, data in entries:
-            if _contains_secret_form(destination.encode("utf-8"), forms) or _contains_secret_form(
-                data, forms
-            ):
-                self._revoke_secret_exposure(handle)
+            destination_has_secret = operation != "file_write" and _contains_secret_form(
+                destination.encode("utf-8"), forms
+            )
+            if destination_has_secret or _contains_secret_form(data, forms):
+                self._revoke_secret_exposure(handle, operation=operation)
                 raise SecretExposureError(operation=operation)
         # The delimiter-preserving stream follows the requested candidate order;
         # the raw ordered stream also catches a credential split into sub-16-byte
@@ -3128,21 +3131,23 @@ class SessionSupervisor:
             content is not None and _contains_secret_form(content, forms)
             for content in (combined_content, ordered_content)
         ):
-            self._revoke_secret_exposure(handle)
+            self._revoke_secret_exposure(handle, operation=operation)
             raise SecretExposureError(operation=operation)
 
-    def check_agent_file_write(
+    def check_non_ui_file_write(
         self,
-        task_id: str,
+        task_id: str | None,
         destination: str,
         read_content: Callable[[], bytes],
     ) -> None:
-        """Refuse agent file content carrying credentials for its active task session."""
+        """Refuse non-UI file content carrying credentials for active sessions."""
         with self._lock:
             handles = tuple(self._sessions.values())
         for handle in handles:
             with handle.lock:
-                if handle.record.task_id != task_id or handle.record.state not in ACTIVE_STATES:
+                if handle.record.state not in ACTIVE_STATES:
+                    continue
+                if task_id is not None and handle.record.task_id != task_id:
                     continue
                 self._refuse_secret_exposure(
                     handle,
@@ -3150,8 +3155,8 @@ class SessionSupervisor:
                     operation="file_write",
                 )
 
-    def _revoke_secret_exposure(self, handle: _Session) -> None:
-        """Revoke a session whose secret was persisted by the agent (F2).
+    def _revoke_secret_exposure(self, handle: _Session, *, operation: str = "collect") -> None:
+        """Revoke a session when non-UI content would persist its secret (F2).
 
         The relay/proxy listeners, their sockets and the in-memory secret are
         destroyed, and the record is ``failed`` with the typed reason.  The
@@ -3175,7 +3180,7 @@ class SessionSupervisor:
                 "to": str(SessionState.FAILED),
                 "state_version": record.state_version,
                 "reason": SECRET_EXPOSURE_REASON,
-                "operation": "collect",
+                "operation": operation,
             },
         )
         self._persist(handle)
