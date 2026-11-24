@@ -727,6 +727,163 @@ async function assertCockpitResponsive(page: Page): Promise<void> {
   await page.setViewportSize({ width: 1440, height: 900 });
 }
 
+async function expectNoClippedContent(
+  page: Page,
+  rootSelector: string,
+): Promise<void> {
+  const root = page.locator(rootSelector);
+  const originalViewport = page.viewportSize();
+  await expect(root).toBeVisible();
+
+  for (const [width, height] of [
+    [1280, 800],
+    [1440, 900],
+  ] as const) {
+    await page.setViewportSize({ width, height });
+    const measurement = await root.evaluate((panel) => {
+      interface ComputedStyleView {
+        display: string;
+        visibility: string;
+        opacity: string;
+        position: string;
+        clip: string;
+        clipPath: string;
+        overflowX: string;
+        overflowY: string;
+      }
+      interface MeasurableElement {
+        ownerDocument: {
+          defaultView: {
+            getComputedStyle: (element: MeasurableElement) => ComputedStyleView;
+          };
+        };
+        tagName: string;
+        className: unknown;
+        textContent: string | null;
+        scrollWidth: number;
+        clientWidth: number;
+        querySelectorAll: (selector: string) => ArrayLike<unknown>;
+        getBoundingClientRect: () => {
+          right: number;
+          width: number;
+          height: number;
+        };
+        getClientRects: () => { length: number };
+        closest: (selector: string) => object | null;
+      }
+      const panelElement = panel as unknown as MeasurableElement;
+      const panelRect = panelElement.getBoundingClientRect();
+      const descendants = Array.from(
+        panelElement.querySelectorAll("*"),
+      ) as MeasurableElement[];
+      const isHidden = (
+        element: MeasurableElement,
+        style: ComputedStyleView,
+      ) => {
+        const rect = element.getBoundingClientRect();
+        const outOfFlow =
+          style.position === "absolute" || style.position === "fixed";
+        const visuallyMasked =
+          outOfFlow &&
+          ((style.clip !== "auto" && style.clip !== "none") ||
+            (style.clipPath !== "none" && style.clipPath !== "") ||
+            ((style.overflowX === "hidden" || style.overflowX === "clip") &&
+              (style.overflowY === "hidden" || style.overflowY === "clip") &&
+              rect.width <= 1 &&
+              rect.height <= 1));
+        return (
+          style.display === "none" ||
+          style.visibility === "hidden" ||
+          style.visibility === "collapse" ||
+          style.opacity === "0" ||
+          element.closest('[aria-hidden="true"]') !== null ||
+          element.getClientRects().length === 0 ||
+          visuallyMasked
+        );
+      };
+      const clipped = descendants.flatMap((element) => {
+        const style =
+          panelElement.ownerDocument.defaultView.getComputedStyle(element);
+        if (
+          element.tagName === "TEXTAREA" ||
+          (element.tagName === "PRE" &&
+            (style.overflowX === "auto" ||
+              style.overflowX === "scroll" ||
+              style.overflowY === "auto" ||
+              style.overflowY === "scroll")) ||
+          isHidden(element, style)
+        ) {
+          return [];
+        }
+        const rect = element.getBoundingClientRect();
+        if (rect.right <= panelRect.right + 1) return [];
+        return [
+          {
+            tag: element.tagName.toLowerCase(),
+            className: String(element.className),
+            text: (element.textContent ?? "")
+              .trim()
+              .replace(/[A-Za-z0-9_-]{24,}/g, "[valeur technique]")
+              .slice(0, 100),
+            overflowPx: Number((rect.right - panelRect.right).toFixed(1)),
+          },
+        ];
+      });
+      const overflowingDescendants = descendants.flatMap((element) => {
+        const style =
+          panelElement.ownerDocument.defaultView.getComputedStyle(element);
+        if (
+          element.tagName === "TEXTAREA" ||
+          (element.tagName === "PRE" &&
+            (style.overflowX === "auto" ||
+              style.overflowX === "scroll" ||
+              style.overflowY === "auto" ||
+              style.overflowY === "scroll")) ||
+          isHidden(element, style) ||
+          element.scrollWidth <= element.clientWidth + 1
+        ) {
+          return [];
+        }
+        const rect = element.getBoundingClientRect();
+        return [
+          {
+            tag: element.tagName.toLowerCase(),
+            className: String(element.className),
+            text: (element.textContent ?? "")
+              .trim()
+              .replace(/[A-Za-z0-9_-]{24,}/g, "[valeur technique]")
+              .slice(0, 100),
+            contentOverflowPx: element.scrollWidth - element.clientWidth,
+            rightBeyondPanelPx: Number(
+              (rect.right - panelRect.right).toFixed(1),
+            ),
+          },
+        ];
+      });
+
+      return {
+        clipped,
+        overflowingDescendants: overflowingDescendants.slice(0, 5),
+        scrollWidth: panelElement.scrollWidth,
+        clientWidth: panelElement.clientWidth,
+      };
+    });
+
+    expect(
+      measurement.clipped,
+      `${rootSelector} has visible descendants clipped past its right edge at ${width}px`,
+    ).toEqual([]);
+    expect(
+      measurement.scrollWidth,
+      `${rootSelector} must not scroll horizontally at ${width}px; overflowing descendants=${JSON.stringify(measurement.overflowingDescendants)}`,
+    ).toBeLessThanOrEqual(measurement.clientWidth);
+  }
+
+  if (originalViewport !== null) {
+    await page.setViewportSize(originalViewport);
+  }
+}
+
 function pdftotext(path: string): string {
   return execFileSync("pdftotext", ["-layout", path, "-"], {
     encoding: "utf-8",
@@ -1993,11 +2150,13 @@ test("parcours atelier M24 étapes 1–32 : workspace, tâches, Notes, PDF, G2",
     );
   }
   const addObservationCitation = async () => {
-    const qualificationDetails = page
-      .locator("details")
-      .filter({ hasText: "Qualification et contenu vérifiable" });
+    const qualificationSummary = page.getByText(
+      "Qualification et contenu vérifiable",
+      { exact: true },
+    );
+    const qualificationDetails = qualificationSummary.locator("..");
     if ((await qualificationDetails.getAttribute("open")) === null) {
-      await qualificationDetails.locator("summary").click();
+      await qualificationSummary.click();
     }
     await page
       .getByRole("group", { name: /Observations disponibles/ })
@@ -2017,6 +2176,7 @@ test("parcours atelier M24 étapes 1–32 : workspace, tâches, Notes, PDF, G2",
     idempotencyKey: "m24-browser-d2-foreign-anchor",
   });
   await addObservationCitation();
+  await expectNoClippedContent(page, ".opinion-workspace__panel");
   await page.getByRole("button", { name: "Demander à Bridge" }).click();
   await waitForProposal(
     page,
@@ -2175,6 +2335,7 @@ test("parcours atelier M24 étapes 1–32 : workspace, tâches, Notes, PDF, G2",
       name: /J’ai relu ce texte et ses références/,
     })
     .check();
+  await expectNoClippedContent(page, ".opinion-proposal-review");
   await capture(
     page,
     "bridge-proposal",
@@ -2377,13 +2538,19 @@ test("parcours atelier M24 étapes 1–32 : workspace, tâches, Notes, PDF, G2",
   await page
     .getByText("Qualification et contenu vérifiable", { exact: true })
     .click();
-  const articleElementSelect = page.locator("#note-content-block-element");
-  await articleElementSelect.selectOption(`figure:${ARTICLE_FIGURE_KEY}`);
+  const articleElementPicker = page.getByRole("group", {
+    name: "Élément à référencer",
+  });
+  await expectNoClippedContent(page, ".opinion-workspace__panel");
+  await articleElementPicker
+    .getByRole("radio", { name: /^Figure · / })
+    .first()
+    .check();
+  await capture(page, "m23-element-selected", articleElementPicker);
   await page.getByRole("button", { name: "Référencer cet élément" }).click();
   await expect(
     page.getByRole("heading", { name: "Références de contenu (1)" }),
   ).toBeVisible();
-  await capture(page, "m23-element-selected", articleElementSelect);
 
   // Step 27 — add one IOC table from the canonical observation list.
   await addObservationCitation();
@@ -2394,22 +2561,30 @@ test("parcours atelier M24 étapes 1–32 : workspace, tâches, Notes, PDF, G2",
     .getByRole("checkbox", { name: /Rapport VT fichier/ })
     .first()
     .check();
+  await expectNoClippedContent(page, ".opinion-workspace__panel");
+  await capture(page, "ioc-table-selected", iocFieldset);
   await iocFieldset
     .getByRole("button", { name: /Ajouter le tableau IOC \(1\)/ })
     .click();
   await expect(
     page.getByRole("heading", { name: "Références de contenu (2)" }),
   ).toBeVisible();
-  await capture(page, "ioc-table-selected", iocFieldset);
 
   // Step 28 — select and verify canonical bytes in the visual selector. The
   // manual offset, length and SHA diagnostic remains collapsed and untouched.
   const codeSelector = page.getByRole("group", {
     name: "Extrait de code canonique",
   });
-  await codeSelector
-    .getByLabel("Observation source")
-    .selectOption({ value: observation.id });
+  const observationSourcePicker = codeSelector.getByRole("group", {
+    name: "Observation source",
+  });
+  await observationSourcePicker
+    .getByRole("radio", {
+      name: new RegExp(
+        `Rapport VT fichier · file/${observation.object_id.slice(0, 10)}.*Observation 1`,
+      ),
+    })
+    .check();
   const excerptEditor = codeSelector.getByLabel(/Extrait canonique en texte/);
   await expect(excerptEditor).toBeVisible();
   await excerptEditor.press("Control+A");
@@ -2419,6 +2594,7 @@ test("parcours atelier M24 étapes 1–32 : workspace, tâches, Notes, PDF, G2",
   await expect(
     codeSelector.locator("details.canonical-code-selector__manual"),
   ).not.toHaveAttribute("open", "");
+  await expectNoClippedContent(page, ".opinion-workspace__panel");
   await capture(page, "canonical-code-selector", codeSelector);
   await codeSelector
     .getByRole("button", { name: "Vérifier et référencer la plage" })
@@ -2459,6 +2635,7 @@ test("parcours atelier M24 étapes 1–32 : workspace, tâches, Notes, PDF, G2",
   );
   expect(repinnedDiff.accept_ready).toBe(true);
   expect(repinnedDiff.content_blocks_valid).toBe(true);
+  await expectNoClippedContent(page, ".opinion-proposal-review");
   await capture(
     page,
     "bridge-proposal-with-blocks",

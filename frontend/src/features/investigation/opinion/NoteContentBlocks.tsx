@@ -29,12 +29,15 @@ import type {
 } from "../api/opinionProposals";
 import { CanonicalCodeSelector } from "./CanonicalCodeSelector";
 import { CopyableTechnicalValue } from "./CopyableTechnicalValue";
+import { GroupedReferencePicker } from "./ReferencePicker";
+import {
+  observationReferenceEntries,
+  type ReferencePickerEntry,
+} from "./references";
 import { describeApiError, describeErrorCode } from "./errors";
 import {
   ARTICLE_ELEMENT_REFUSAL_LABELS,
-  EVIDENCE_KIND_LABELS,
   PROTOCOL_FIGURE_LABELS,
-  shortHash,
   truncate,
 } from "./labels";
 import type { OpinionProtocolFigureV1 } from "./types";
@@ -48,7 +51,6 @@ const ARTICLE_ELEMENT_KIND_LABELS: Record<NoteArticleElementKind, string> = {
 
 /** Mirrors the server union bounds (`MAX_NOTE_IOC_OBSERVATIONS`). */
 const MAX_IOC_OBSERVATIONS = 64;
-const OPTION_TEXT_MAX = 120;
 /** Short option labels keep the page width independent of id lengths. */
 const OPTION_SHORT_MAX = 32;
 
@@ -74,33 +76,6 @@ function isAdvisoryObservation(observation: InvestigationObservation): boolean {
     observation.source.startsWith("advisor.") ||
     observation.object_type.startsWith("advisor_")
   );
-}
-
-function observationLabel(observation: InvestigationObservation): string {
-  const kind = EVIDENCE_KIND_LABELS[observation.kind] ?? observation.kind;
-  return `${kind} · ${observation.object_type}/${truncate(
-    observation.object_id,
-    OPTION_TEXT_MAX,
-  )} · SHA-256 ${shortHash(observation.sha256)} · ${observation.source}`;
-}
-
-function elementLabel(element: ArticleElementViewV1): string {
-  const title = element.title ?? element.key;
-  const caption =
-    element.caption === null ? "" : ` · ${truncate(element.caption, 80)}`;
-  return `${ARTICLE_ELEMENT_KIND_LABELS[element.kind]} · ${truncate(
-    title,
-    OPTION_TEXT_MAX,
-  )}${caption} · SHA-256 ${shortHash(element.element_sha256)}`;
-}
-
-/** Same option-width rule as `observationOptionLabel` for M23 elements. */
-function elementOptionLabel(element: ArticleElementViewV1): string {
-  const title = element.title ?? element.key;
-  return `${ARTICLE_ELEMENT_KIND_LABELS[element.kind]} · ${truncate(
-    title,
-    OPTION_SHORT_MAX,
-  )} · SHA-256 ${shortHash(element.element_sha256)}`;
 }
 
 /** The server's typed refusal, translated; unknown codes stay readable. */
@@ -352,6 +327,53 @@ function ArticleElementSelector({
         : catalog.elements.filter((element) => element.anchor === anchor),
     [catalog, anchor],
   );
+  const elementEntries = useMemo<ReferencePickerEntry[]>(
+    () =>
+      catalog === null
+        ? []
+        : elements.map((element) => {
+            const title = element.title ?? element.key;
+            const kindLabel = ARTICLE_ELEMENT_KIND_LABELS[element.kind];
+            const disabledReason = element.proposable
+              ? undefined
+              : elementRefusalLabel(element.refusal_reason);
+            return {
+              id: `${element.kind}:${element.key}`,
+              section: kindLabel,
+              groupKey: JSON.stringify([element.kind, element.key]),
+              label: `${kindLabel} · ${truncate(title, OPTION_SHORT_MAX)}`,
+              searchText: [
+                kindLabel,
+                title,
+                element.caption ?? "",
+                element.key,
+                element.element_sha256,
+                element.anchor ?? "",
+                element.refusal_reason ?? "",
+              ].join(" "),
+              values: [
+                { label: "Clé de l’élément", value: element.key },
+                {
+                  label: "SHA-256 de l’élément",
+                  value: element.element_sha256,
+                },
+                ...(element.anchor === null
+                  ? []
+                  : [{ label: "Ancre", value: element.anchor }]),
+                {
+                  label: "ID de la publication de base",
+                  value: catalog.base_publication_artifact_id,
+                },
+                {
+                  label: "SHA-256 de la publication de base",
+                  value: catalog.base_publication_sha256,
+                },
+              ],
+              ...(disabledReason === undefined ? {} : { disabledReason }),
+            };
+          }),
+    [catalog, elements],
+  );
   const proposableCount = elements.filter(
     (element) => element.proposable,
   ).length;
@@ -406,44 +428,38 @@ function ArticleElementSelector({
             {catalog.source === "pinned_opinion_base"
               ? "base épinglée de l’avis"
               : "base courante vérifiée"}{" "}
-            · artefact <code>{catalog.base_publication_artifact_id}</code> ·
-            version {catalog.base_publication_version} · SHA-256{" "}
-            <code title={catalog.base_publication_sha256}>
-              {shortHash(catalog.base_publication_sha256)}
-            </code>
+            · version {catalog.base_publication_version}
           </p>
+          <TechnicalProvenance
+            values={[
+              {
+                label: "ID de la publication de base",
+                value: catalog.base_publication_artifact_id,
+              },
+              {
+                label: "SHA-256 de la publication de base",
+                value: catalog.base_publication_sha256,
+              },
+            ]}
+          />
           {elements.length === 0 ? (
             <p>
-              Aucun élément M23 n’est rendu à l’ancre <code>{anchor}</code>. Un
-              élément placé sur une autre ancre ne peut pas être référencé ici (
+              Aucun élément M23 n’est rendu à cet emplacement. Un élément placé
+              sur une autre ancre ne peut pas être référencé ici (
               <code>note_block_ref_stale</code>).
             </p>
           ) : (
             <>
-              <label htmlFor="note-content-block-element">
-                Élément à référencer
-              </label>
-              <select
-                id="note-content-block-element"
-                value={selected === null ? "" : choice}
-                onChange={(event) => setChoice(event.currentTarget.value)}
-              >
-                <option value="">— Choisir un élément de l’article —</option>
-                {elements.map((element) => (
-                  <option
-                    key={`${element.kind}:${element.key}`}
-                    value={`${element.kind}:${element.key}`}
-                    disabled={!element.proposable}
-                    title={elementLabel(element)}
-                  >
-                    {element.proposable
-                      ? elementOptionLabel(element)
-                      : `${elementOptionLabel(element)} — non proposable : ${elementRefusalLabel(
-                          element.refusal_reason,
-                        )}`}
-                  </option>
-                ))}
-              </select>
+              <GroupedReferencePicker
+                entries={elementEntries}
+                legend="Élément à référencer"
+                itemName="element"
+                selection={{
+                  mode: "single",
+                  selectedId: choice,
+                  onSelect: setChoice,
+                }}
+              />
               <button
                 type="button"
                 className="button button--secondary"
@@ -489,20 +505,19 @@ function IocTablePicker({
   onAdd: (block: IocTableNoteBlockV1) => void;
 }) {
   const [selected, setSelected] = useState<string[]>([]);
-  const candidates = observations.slice(0, MAX_IOC_OBSERVATIONS);
+  const candidates = useMemo(
+    () => observations.slice(0, MAX_IOC_OBSERVATIONS),
+    [observations],
+  );
+  const entries = useMemo(
+    () => observationReferenceEntries(candidates),
+    [candidates],
+  );
   const duplicate = blocks.some(
     (block) =>
       block.block_type === "ioc_table" &&
       sameObservationSet(block.observation_ids, selected),
   );
-
-  function toggle(id: string) {
-    setSelected((current) =>
-      current.includes(id)
-        ? current.filter((item) => item !== id)
-        : [...current, id],
-    );
-  }
 
   function addTable() {
     if (selected.length === 0) return;
@@ -532,16 +547,16 @@ function IocTablePicker({
         </p>
       ) : (
         <>
-          {candidates.map((observation) => (
-            <label key={observation.id}>
-              <input
-                type="checkbox"
-                checked={selected.includes(observation.id)}
-                onChange={() => toggle(observation.id)}
-              />{" "}
-              {observationLabel(observation)}
-            </label>
-          ))}
+          <GroupedReferencePicker
+            entries={entries}
+            legend="Observations à inclure"
+            itemName="observation"
+            selection={{
+              mode: "multiple",
+              selectedIds: selected,
+              onChange: setSelected,
+            }}
+          />
           {observations.length > MAX_IOC_OBSERVATIONS ? (
             <p>
               Liste bornée aux {MAX_IOC_OBSERVATIONS} premières observations
@@ -577,12 +592,47 @@ function ProtocolFigurePicker({
   onAdd: (block: ProtocolFigureNoteBlockV1) => void;
 }) {
   const [choice, setChoice] = useState("");
-  const usable = figures.filter(
-    (
-      figure,
-    ): figure is OpinionProtocolFigureV1 & {
-      kind: ProtocolFigureKind;
-    } => isProtocolFigureKind(figure.kind),
+  const usable = useMemo(
+    () =>
+      figures.filter(
+        (
+          figure,
+        ): figure is OpinionProtocolFigureV1 & {
+          kind: ProtocolFigureKind;
+        } => isProtocolFigureKind(figure.kind),
+      ),
+    [figures],
+  );
+  const entries = useMemo<ReferencePickerEntry[]>(
+    () =>
+      usable.map((figure) => {
+        const label = PROTOCOL_FIGURE_LABELS[figure.kind] ?? figure.kind;
+        return {
+          id: figure.kind,
+          section: "Figures de protocole",
+          groupKey: figure.kind,
+          label: `${label} · ${truncate(figure.caption, OPTION_SHORT_MAX)}`,
+          searchText: [
+            label,
+            figure.caption,
+            figure.asset_id,
+            figure.asset_sha256,
+            figure.model_sha256,
+            figure.spec_sha256,
+            figure.preview_sha256,
+            figure.pin_sha256,
+          ].join(" "),
+          values: [
+            { label: "ID de la figure", value: figure.asset_id },
+            { label: "SHA-256 de la figure", value: figure.asset_sha256 },
+            { label: "SHA-256 du modèle", value: figure.model_sha256 },
+            { label: "SHA-256 de la spécification", value: figure.spec_sha256 },
+            { label: "SHA-256 de l’aperçu", value: figure.preview_sha256 },
+            { label: "SHA-256 du lien", value: figure.pin_sha256 },
+          ],
+        };
+      }),
+    [usable],
   );
   const selected = usable.find((figure) => figure.kind === choice) ?? null;
   const duplicate = blocks.some(
@@ -611,27 +661,16 @@ function ProtocolFigurePicker({
         <p>L’avis courant ne porte aucune figure de protocole.</p>
       ) : (
         <>
-          <label htmlFor="note-content-block-figure">Figure à référencer</label>
-          <select
-            id="note-content-block-figure"
-            value={choice}
-            onChange={(event) => setChoice(event.currentTarget.value)}
-          >
-            <option value="">— Choisir une figure de protocole —</option>
-            {usable.map((figure) => (
-              <option
-                key={figure.kind}
-                value={figure.kind}
-                title={`${
-                  PROTOCOL_FIGURE_LABELS[figure.kind] ?? figure.kind
-                } · SHA-256 ${figure.asset_sha256} · ${figure.caption}`}
-              >
-                {PROTOCOL_FIGURE_LABELS[figure.kind] ?? figure.kind} · SHA-256{" "}
-                {shortHash(figure.asset_sha256)} ·{" "}
-                {truncate(figure.caption, OPTION_SHORT_MAX)}
-              </option>
-            ))}
-          </select>
+          <GroupedReferencePicker
+            entries={entries}
+            legend="Figure à référencer"
+            itemName="figure"
+            selection={{
+              mode: "single",
+              selectedId: choice,
+              onSelect: setChoice,
+            }}
+          />
           <button
             type="button"
             className="button button--secondary"
@@ -754,14 +793,15 @@ function ResolvedBlockPreview({
               {ARTICLE_ELEMENT_KIND_LABELS[block.kind]} «{" "}
               {block.title ?? ARTICLE_ELEMENT_KIND_LABELS[block.kind]} »
             </strong>{" "}
-            — cross-référence vers l’ancre <code>{block.anchor}</code> de
-            l’article ; l’élément reste rendu à son placement et n’est jamais
-            dupliqué dans la Note.
+            — cross-référence vers le paragraphe correspondant de l’article ;
+            l’élément reste rendu à son placement et n’est jamais dupliqué dans
+            la Note.
           </p>
           {block.caption === null ? null : <p>{block.caption}</p>}
           <TechnicalProvenance
             values={[
               { label: "Clé de l’élément", value: block.element_key },
+              { label: "Ancre", value: block.anchor },
               { label: "SHA-256 de l’élément", value: block.element_sha256 },
             ]}
           />

@@ -14,15 +14,12 @@ import type {
   NoteContentBlockV1,
 } from "../api/opinionProposals";
 import { describeApiError } from "./errors";
-import { observationLabel } from "./references";
-import { truncate } from "./labels";
+import { GroupedReferencePicker } from "./ReferencePicker";
+import { observationReferenceEntries } from "./references";
 
 const MAX_EXCERPT_BYTES = 4096;
 const CODE_LANGUAGE_PATTERN = /^[a-z0-9][a-z0-9+.#_-]*$/;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
-const UUID_PATTERN =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
 interface ByteSpan {
   start: number;
   end: number;
@@ -115,16 +112,6 @@ function formatOffset(offset: number): string {
   return `0x${offset.toString(16).padStart(4, "0")}`;
 }
 
-function optionLabel(
-  observations: InvestigationObservation[],
-  observation: InvestigationObservation,
-): string {
-  const object = UUID_PATTERN.test(observation.object_id)
-    ? observation.object_type
-    : `${observation.object_type}/${truncate(observation.object_id, 48)}`;
-  return `${observationLabel(observations, observation.id)} · ${object}`;
-}
-
 function refusalMessage(error: unknown): string {
   const described = describeApiError(error);
   const status = described.status === 0 ? "" : ` (HTTP ${described.status})`;
@@ -163,6 +150,10 @@ export function CanonicalCodeSelector({
 
   const observation =
     observations.find((item) => item.id === observationId) ?? null;
+  const referenceEntries = useMemo(
+    () => observationReferenceEntries(observations),
+    [observations],
+  );
   const metadataParams: ObservationExcerptParams = {
     offset: 0,
     length: 1,
@@ -411,24 +402,16 @@ export function CanonicalCodeSelector({
         </p>
       ) : (
         <>
-          <label htmlFor="note-content-code-observation">
-            Observation source
-          </label>
-          <select
-            id="note-content-code-observation"
-            value={observationId}
-            onChange={(event) => resetForObservation(event.currentTarget.value)}
-          >
-            <option value="">— Choisir une observation —</option>
-            {observations.map((item) => {
-              const label = optionLabel(observations, item);
-              return (
-                <option key={item.id} value={item.id} title={label}>
-                  {truncate(label, 120)}
-                </option>
-              );
-            })}
-          </select>
+          <GroupedReferencePicker
+            entries={referenceEntries}
+            legend="Observation source"
+            itemName="observation"
+            selection={{
+              mode: "single",
+              selectedId: observationId,
+              onSelect: resetForObservation,
+            }}
+          />
 
           {observation === null ? (
             <p role="note">Choisissez une observation canonique.</p>

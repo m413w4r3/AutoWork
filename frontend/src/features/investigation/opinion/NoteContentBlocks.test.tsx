@@ -230,26 +230,86 @@ function renderSelection(
   return { ...result, onChange };
 }
 
+async function chooseDefaultObservationSource(
+  user: ReturnType<typeof userEvent.setup>,
+) {
+  const picker = await screen.findByRole("group", {
+    name: "Observation source",
+  });
+  await user.click(
+    within(picker).getByRole("radio", {
+      name: /Analyse binaire · binary\/sample-1/,
+    }),
+  );
+  expect(within(picker).queryByText(BLOB_HASH)).not.toBeVisible();
+  expect(
+    within(picker).getByText("Provenance technique", {
+      selector: "summary",
+    }),
+  ).not.toHaveAttribute("open", "");
+}
+
 afterEach(() => {
   vi.unstubAllGlobals();
 });
 
 describe("NoteContentBlocks — sélection de références", () => {
+  it("distingue les observations regroupées dans le sélecteur de code", async () => {
+    const user = userEvent.setup();
+    const repeated = makeObservation({
+      id: SECOND_OBSERVATION_ID,
+      observed_at: "2026-11-23T08:00:00Z",
+    });
+    renderSelection([makeObservation(), repeated]);
+
+    const picker = await screen.findByRole("group", {
+      name: "Observation source",
+    });
+    const first = within(picker).getByRole("radio", {
+      name: /Analyse binaire · binary\/sample-1.*Observation 1/,
+    });
+    const second = within(picker).getByRole("radio", {
+      name: /Analyse binaire · binary\/sample-1.*Observation 2/,
+    });
+    expect(first).toBeVisible();
+    expect(second).toBeVisible();
+    expect(first).not.toHaveAccessibleName(new RegExp(OBSERVATION_ID));
+    await user.click(second);
+    expect(second).toBeChecked();
+  });
+
   it("ne propose que les éléments M23 rendus à l’ancre et les référence par valeur", async () => {
     const user = userEvent.setup();
     installAnchors();
     const { onChange } = renderSelection();
 
-    const elementSelect = await screen.findByLabelText("Élément à référencer");
-    const options = within(elementSelect).getAllByRole("option");
+    const elementPicker = await screen.findByRole("group", {
+      name: "Élément à référencer",
+    });
+    const tableRadio = within(elementPicker).getByRole("radio", {
+      name: "Tableau · Commandes observées",
+    });
+    expect(tableRadio).toBeVisible();
+    expect(within(elementPicker).queryByText(ELEMENT_HASH)).not.toBeVisible();
+    const tableEntry = tableRadio.closest(
+      ".opinion-reference-picker__single-entry",
+    );
+    expect(tableEntry).not.toBeNull();
+    const tableEntryContent = within(tableEntry as HTMLElement);
+    const elementProvenance = tableEntryContent.getByText(
+      "Provenance technique",
+      { selector: "summary" },
+    );
+    expect(elementProvenance).not.toHaveAttribute("open", "");
+    await user.click(elementProvenance);
+    expect(tableEntryContent.getByText("table-commands")).toBeVisible();
     expect(
-      options.map((option) => option.textContent ?? "").join(" | "),
-    ).toContain("Commandes observées");
-    expect(
-      options.map((option) => option.textContent ?? "").join(" | "),
-    ).not.toContain("Topologie C2");
-
-    await user.selectOptions(elementSelect, "table:table-commands");
+      tableEntryContent.getByRole("button", {
+        name: "Copier Clé de l’élément",
+      }),
+    ).toBeVisible();
+    await user.click(elementProvenance);
+    await user.click(tableRadio);
     await user.click(
       screen.getByRole("button", { name: "Référencer cet élément" }),
     );
@@ -264,16 +324,23 @@ describe("NoteContentBlocks — sélection de références", () => {
       },
     ]);
     expect(screen.getByText(/Élément d’article/)).toBeInTheDocument();
-    expect(screen.getByText(/table-commands/)).toBeInTheDocument();
+    for (const exactKey of screen.getAllByText("table-commands")) {
+      expect(exactKey).not.toBeVisible();
+    }
+    for (const exactHash of screen.getAllByText(ELEMENT_HASH)) {
+      expect(exactHash).not.toBeVisible();
+    }
   });
 
   it("grise un élément M23 non proposable avec la raison serveur traduite", async () => {
     installAnchors();
     renderSelection();
 
-    const elementSelect = await screen.findByLabelText("Élément à référencer");
-    const refused = within(elementSelect).getByRole("option", {
-      name: /Volume des commandes.*non proposable : graphique sans preuve/,
+    const elementPicker = await screen.findByRole("group", {
+      name: "Élément à référencer",
+    });
+    const refused = within(elementPicker).getByRole("radio", {
+      name: /Volume des commandes.*Non proposable : graphique sans preuve/,
     });
     expect(refused).toBeDisabled();
     expect(
@@ -305,6 +372,24 @@ describe("NoteContentBlocks — sélection de références", () => {
     });
     expect(within(ioc).queryByRole("checkbox", { name: /advisor/ })).toBeNull();
     expect(within(ioc).getAllByRole("checkbox")).toHaveLength(2);
+    expect(
+      within(ioc).getByRole("checkbox", {
+        name: "Analyse binaire · binary/sample-1",
+      }),
+    ).toBeVisible();
+    expect(within(ioc).queryByText(BLOB_HASH)).not.toBeVisible();
+    const provenance = within(ioc).getAllByText("Provenance technique", {
+      selector: "summary",
+    })[0];
+    expect(provenance).toBeDefined();
+    expect(provenance).not.toHaveAttribute("open", "");
+    await user.click(provenance as HTMLElement);
+    expect(within(ioc).getByText(OBSERVATION_ID)).toBeVisible();
+    expect(
+      within(ioc).getAllByRole("button", {
+        name: "Copier SHA-256 de l’observation",
+      })[0],
+    ).toBeVisible();
 
     await user.click(within(ioc).getByRole("checkbox", { name: /sample-1/ }));
     await user.click(within(ioc).getByRole("checkbox", { name: /sample-2/ }));
@@ -355,10 +440,7 @@ describe("NoteContentBlocks — sélection de références", () => {
     });
     const { onChange } = renderSelection();
 
-    await user.selectOptions(
-      await screen.findByLabelText("Observation source"),
-      OBSERVATION_ID,
-    );
+    await chooseDefaultObservationSource(user);
     const excerptElement = await screen.findByRole("textbox", {
       name: "Extrait canonique en texte",
     });
@@ -422,10 +504,7 @@ describe("NoteContentBlocks — sélection de références", () => {
     });
     renderSelection();
 
-    await user.selectOptions(
-      await screen.findByLabelText("Observation source"),
-      OBSERVATION_ID,
-    );
+    await chooseDefaultObservationSource(user);
     const hexExcerpt = await screen.findByRole("textbox", {
       name: "Extrait canonique en hexadécimal",
     });
@@ -482,10 +561,7 @@ describe("NoteContentBlocks — sélection de références", () => {
     });
     renderSelection();
 
-    await user.selectOptions(
-      await screen.findByLabelText("Observation source"),
-      OBSERVATION_ID,
-    );
+    await chooseDefaultObservationSource(user);
     expect(
       await screen.findByText(/Fenêtre de 4096 octets/),
     ).toBeInTheDocument();
@@ -545,10 +621,7 @@ describe("NoteContentBlocks — sélection de références", () => {
     });
     renderSelection();
 
-    await user.selectOptions(
-      await screen.findByLabelText("Observation source"),
-      OBSERVATION_ID,
-    );
+    await chooseDefaultObservationSource(user);
     const excerpt = await screen.findByRole("textbox", {
       name: "Extrait canonique en texte",
     });
@@ -584,10 +657,7 @@ describe("NoteContentBlocks — sélection de références", () => {
     });
     renderSelection();
 
-    await user.selectOptions(
-      await screen.findByLabelText("Observation source"),
-      OBSERVATION_ID,
-    );
+    await chooseDefaultObservationSource(user);
     const excerpt = await screen.findByRole("textbox", {
       name: "Extrait canonique en texte",
     });
@@ -600,10 +670,26 @@ describe("NoteContentBlocks — sélection de références", () => {
     installAnchors();
     const { onChange } = renderSelection();
 
-    await user.selectOptions(
-      await screen.findByLabelText("Figure à référencer"),
-      "sequence",
-    );
+    const figurePicker = await screen.findByRole("group", {
+      name: "Figure à référencer",
+    });
+    const figureRadio = within(figurePicker).getByRole("radio", {
+      name: /Séquence des échanges/,
+    });
+    expect(figureRadio).toBeVisible();
+    expect(within(figurePicker).queryByText(ASSET_HASH)).not.toBeVisible();
+    const provenance = within(figurePicker).getByText("Provenance technique", {
+      selector: "summary",
+    });
+    expect(provenance).not.toHaveAttribute("open", "");
+    await user.click(provenance);
+    expect(within(figurePicker).getByText(ASSET_HASH)).toBeVisible();
+    expect(
+      within(figurePicker).getByRole("button", {
+        name: "Copier SHA-256 de la figure",
+      }),
+    ).toBeVisible();
+    await user.click(figureRadio);
     await user.click(
       screen.getByRole("button", { name: "Référencer cette figure" }),
     );
@@ -705,6 +791,7 @@ describe("NoteContentBlocks — aperçu lecture seule", () => {
   ];
 
   it("rend les cross-références, le code, le tableau IOC et la figure avec provenance", async () => {
+    const user = userEvent.setup();
     renderBlocks({
       observations: [],
       protocolFigures: [],
@@ -724,8 +811,24 @@ describe("NoteContentBlocks — aperçu lecture seule", () => {
     ).toBeInTheDocument();
     expect(screen.getByText(/Commandes observées/)).toBeInTheDocument();
     expect(
-      screen.getByText(/cross-référence vers l’ancre/),
+      screen.getByText(/cross-référence vers le paragraphe correspondant/),
     ).toBeInTheDocument();
+    const articlePreview = document.querySelector(
+      ".note-content-blocks__resolved-item",
+    );
+    expect(articlePreview).not.toBeNull();
+    const articleDetails = within(articlePreview as HTMLElement).getByText(
+      "Provenance technique",
+      { selector: "summary" },
+    );
+    expect(articleDetails).not.toHaveAttribute("open", "");
+    for (const exactAnchor of screen.getAllByText("lead:0001")) {
+      expect(exactAnchor).not.toBeVisible();
+    }
+    await user.click(articleDetails);
+    expect(
+      within(articlePreview as HTMLElement).getByText("lead:0001"),
+    ).toBeVisible();
     expect(screen.getByText("cmd.exe /c whoami")).toBeInTheDocument();
     expect(
       screen.getByRole("table", { name: "Tableau IOC (1)" }),
@@ -737,7 +840,7 @@ describe("NoteContentBlocks — aperçu lecture seule", () => {
       .closest(".note-content-blocks__resolved-item")
       ?.querySelector("details");
     expect(tableDetails).not.toBeNull();
-    await userEvent.setup().click(
+    await user.click(
       within(tableDetails as HTMLElement).getByText("Provenance technique", {
         selector: "summary",
       }),

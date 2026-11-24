@@ -299,7 +299,7 @@ describe("NoteProposalReview — blocs de contenu", () => {
     ).toBeInTheDocument();
     expect(screen.getByText(/Commandes observées/)).toBeInTheDocument();
     expect(
-      screen.getByText(/cross-référence vers l’ancre/),
+      screen.getByText(/cross-référence vers le paragraphe correspondant/),
     ).toBeInTheDocument();
     expect(screen.getByText("cmd.exe /c whoami")).toBeInTheDocument();
     expect(

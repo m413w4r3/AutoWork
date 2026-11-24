@@ -1,10 +1,8 @@
 /*
  * M24.1 R5 — « Note de l'analyste » layout.
  *
- * A `<select>` is sized by its widest option and a `fieldset` never shrinks
- * below its min-content width, so one long observation id used to widen the
- * whole view past `main`. Option labels are shortened in the component; these
- * rules make the containers allow shrinking and clip any remaining overflow.
+ * Searchable reference groups keep long identifiers out of visible labels.
+ * These rules let every picker row shrink and wrap editorial or technical text.
  */
 .opinion-notes,
 .opinion-notes .job-card,
@@ -356,8 +354,17 @@
 .opinion-reference-picker,
 .opinion-reference-picker__source,
 .opinion-reference-picker__group,
+.opinion-reference-picker__single-entry,
+.opinion-reference-picker__option,
+.opinion-reference-picker__option-text,
+.opinion-reference-picker__label,
+.opinion-reference-picker__disabled-reason,
 .opinion-reference-picker__technical,
 .opinion-reference-picker__technical-value,
+.canonical-code-selector,
+.canonical-code-selector > *,
+.note-content-blocks,
+.note-content-blocks > *,
 .opinion-technical-details,
 .opinion-technical-details dl > div,
 .opinion-proposal-review__technical,
@@ -403,6 +410,13 @@
 }
 
 .opinion-reference-picker__group + .opinion-reference-picker__group {
+  border-top: 1px solid var(--color-border, #d0d5d9);
+  margin-top: 0.5rem;
+  padding-top: 0.5rem;
+}
+
+.opinion-reference-picker__single-entry
+  + .opinion-reference-picker__single-entry {
   border-top: 1px solid var(--color-border, #d0d5d9);
   margin-top: 0.5rem;
   padding-top: 0.5rem;
@@ -508,20 +522,22 @@
   background: var(--color-surface, #fff);
 }
 
-.note-content-blocks__resolved-item .table-scroll {
+.opinion-notes .note-content-blocks__resolved-item .table-scroll {
   width: 100%;
   min-width: 0;
-  overflow-x: auto;
+  overflow-x: visible;
 }
 
-.note-content-blocks__resolved-item table {
+.opinion-notes .note-content-blocks__resolved-item table {
   width: 100%;
-  min-width: 40rem;
+  min-width: 0;
+  max-width: 100%;
   table-layout: fixed;
 }
 
-.note-content-blocks__resolved-item th,
-.note-content-blocks__resolved-item td {
+.opinion-notes .note-content-blocks__resolved-item th,
+.opinion-notes .note-content-blocks__resolved-item td {
+  min-width: 0;
   overflow-wrap: anywhere;
   vertical-align: top;
 }
