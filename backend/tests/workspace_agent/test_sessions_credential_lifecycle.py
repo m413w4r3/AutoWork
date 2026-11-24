@@ -25,7 +25,7 @@ from types import SimpleNamespace
 import pytest
 from sidecars.workspace_agent.sessions import process
 from sidecars.workspace_agent.sessions import supervisor as sessions_module
-from sidecars.workspace_agent.sessions.state import SessionState
+from sidecars.workspace_agent.sessions.state import SessionState, SessionWriteAdmissionError
 from sidecars.workspace_agent.sessions.supervisor import (
     CollectRequest,
     FakeProfile,
@@ -429,20 +429,17 @@ def test_collect_replay_after_supervisor_restart_keeps_one_import_and_provenance
     scripted_supervisors.append(restarted)
     assert all(not path.exists() for path in planted)
     assert restarted.status(SESSION_ID)["state"] == "lost"
-    replay = restarted.collect(
-        SESSION_ID,
-        collect_request,
-        idempotency_key="m24-e3-collect-restart",
-        body_sha256="d" * 64,
-    )
-
-    assert (
-        replay["captured_notes"]
-        == first["captured_notes"]
-        == [f"notes/agents/{TASK_ID}/allowed.md"]
-    )
-    assert {entry["path"]: entry["sha256"] for entry in replay["files"]} == {
-        entry["path"]: entry["sha256"] for entry in first["files"]
+    assert first["captured_notes"] == [f"notes/agents/{TASK_ID}/allowed.md"]
+    with pytest.raises(SessionWriteAdmissionError) as excinfo:
+        restarted.collect(
+            SESSION_ID,
+            collect_request,
+            idempotency_key="m24-e3-collect-restart",
+            body_sha256="d" * 64,
+        )
+    assert excinfo.value.details == {
+        "operation": "collect",
+        "workspace_id": environment.workspace_id,
     }
     scan_service = environment.service(stability_window_ms=0)
     scan_service.scan(environment.workspace_id, full=True)

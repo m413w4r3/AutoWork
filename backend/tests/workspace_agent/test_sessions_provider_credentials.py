@@ -68,12 +68,14 @@ class _LoseFirstCollectResponse(httpx.BaseTransport):
     def __init__(self, socket_path: Path) -> None:
         self._inner = httpx.HTTPTransport(uds=str(socket_path), retries=0)
         self._lost = False
+        self.lost_collect_body: bytes | None = None
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
         response = self._inner.handle_request(request)
         if request.method == "POST" and request.url.path.endswith("/collect") and not self._lost:
             self._lost = True
             response.read()
+            self.lost_collect_body = response.content
             response.close()
             raise httpx.ReadTimeout("synthetic lost collect response", request=request)
         return response
@@ -379,6 +381,18 @@ def test_collect_manifest_replay_after_supervisor_restart_preserves_import_prove
         ) as retry_client:
             with pytest.raises(httpx.ReadTimeout, match="synthetic lost collect response"):
                 _collect(retry_client, running)
+            assert transport.lost_collect_body is not None
+            committed_body = json.loads(transport.lost_collect_body)
+            allowed_note = f"notes/agents/{TASK_ID}/allowed.md"
+            allowed_result = f"results/sessions/{SESSION_ID}/result.md"
+            assert committed_body["captured_notes"] == [allowed_note]
+            assert {item["path"] for item in committed_body["files"]} == {
+                allowed_note,
+                allowed_result,
+            }
+            assert "notes/humaines/workspace-only.md" not in {
+                item["path"] for item in committed_body["files"]
+            }
             server = running.agent._server
             assert server is not None
             previous_supervisor = server.session_supervisor
@@ -387,15 +401,12 @@ def test_collect_manifest_replay_after_supervisor_restart_preserves_import_prove
 
             replayed = _collect(retry_client, running)
             replayed_again = _collect(retry_client, running)
-        assert replayed.status_code == 200, replayed.text
-        assert replayed_again.status_code == 200, replayed_again.text
-        assert replayed_again.json() == replayed.json()
-        body = replayed.json()
+        assert replayed.status_code == 409, replayed.text
+        assert replayed_again.status_code == 409, replayed_again.text
+        assert replayed.json()["error"] == "session_state_conflict"
+        assert replayed.json()["details"]["operation"] == "collect"
         allowed_note = f"notes/agents/{TASK_ID}/allowed.md"
         allowed_result = f"results/sessions/{SESSION_ID}/result.md"
-        assert body["captured_notes"] == [allowed_note]
-        assert {item["path"] for item in body["files"]} == {allowed_note, allowed_result}
-        assert "notes/humaines/workspace-only.md" not in {item["path"] for item in body["files"]}
         assert SYNTHETIC_PROVIDER_CREDENTIAL not in replayed.text
         assert (
             workspace_files_containing(running, SYNTHETIC_PROVIDER_CREDENTIAL.encode("ascii")) == []
@@ -411,12 +422,16 @@ def test_collect_manifest_replay_after_supervisor_restart_preserves_import_prove
             for event in session_events(client, running)
             if event["kind"] == "capture_completed"
         ]
-        assert len(capture_events) == 1
+        assert capture_events == []
 
         running.agent.scans.scan(workspace_id, full=True)
         imported_snapshot = running.agent.scans.snapshot(workspace_id)
         note_state = next(item for item in imported_snapshot.files if item.path == allowed_note)
         result_state = next(item for item in imported_snapshot.files if item.path == allowed_result)
+        assert (running.host_path / allowed_note).read_text(encoding="utf-8") == "# allowed note\n"
+        assert (running.host_path / allowed_result).read_text(
+            encoding="utf-8"
+        ) == "allowed result\n"
         assert note_state.origin == "agent"
         assert note_state.task_id == TASK_ID
         assert note_state.policy_class == "agent_owned"

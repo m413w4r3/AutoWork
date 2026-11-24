@@ -1205,36 +1205,12 @@ class _SessionChannelState:
         self._starting.clear()
 
 
-class _WriteAdmission:
-    """Count non-UI writes so teardown can close admission and drain them."""
-
-    def __init__(self) -> None:
-        self._condition = threading.Condition()
-        self._accepting = True
-        self._in_flight = 0
-
-    def acquire(self) -> None:
-        with self._condition:
-            if not self._accepting:
-                raise SessionWriteAdmissionError()
-            self._in_flight += 1
-
-    def release(self) -> None:
-        with self._condition:
-            self._in_flight -= 1
-            self._condition.notify_all()
-
-    def stop_accepting(self) -> None:
-        with self._condition:
-            self._accepting = False
-
-    def is_accepting(self) -> bool:
-        with self._condition:
-            return self._accepting
-
-    def wait_until_idle(self, timeout: float) -> bool:
-        with self._condition:
-            return self._condition.wait_for(lambda: self._in_flight == 0, timeout=timeout)
+@dataclass
+class _WorkspaceWriteGate:
+    readers: int = 0
+    writer: bool = False
+    waiting_readers: int = 0
+    waiting_writers: int = 0
 
 
 class _Session:
@@ -1251,7 +1227,6 @@ class _Session:
         self.logs = log_ring
         self.events = event_ring
         self.lock = threading.RLock()
-        self.write_admission = _WriteAdmission()
         self.channels = _SessionChannelState(self)
         self.secret: bytearray | None = None
         # F2: secret detection forms are never persisted. Normally cleared
@@ -1467,6 +1442,10 @@ class SessionSupervisor:
         self._profiles = default_profiles() if profiles is None else profiles
         self._sessions: dict[str, _Session] = {}
         self._lock = threading.RLock()
+        # Lock order: acquire the workspace gate before any session/handle lock.
+        # Never wait for this gate while holding _lock or handle.lock.
+        self._workspace_write_condition = threading.Condition()
+        self._workspace_write_gates: dict[str, _WorkspaceWriteGate] = {}
         self._idempotency = IdempotencyStore(self._clock)
         self._stopped = threading.Event()
         # Startup check (R03 B1): the isolation tools are verified before any
@@ -1488,46 +1467,95 @@ class SessionSupervisor:
         This deliberately mimics a parent death: the next supervisor must
         reconcile the still-active sessions ``lost`` and never adopt them.
         """
-        self._stopped.set()
         with self._lock:
+            self._stopped.set()
             handles = tuple(self._sessions.values())
-        for handle in handles:
-            handle.write_admission.stop_accepting()
+        with self._workspace_write_condition:
+            self._workspace_write_condition.notify_all()
 
-        errors: list[SessionWriteDrainTimeoutError] = []
-        drained: list[_Session] = []
+        deadline = time.monotonic() + WRITE_DRAIN_TIMEOUT_SECONDS
+        by_workspace: dict[str, list[_Session]] = {}
         for handle in handles:
-            if handle.write_admission.wait_until_idle(WRITE_DRAIN_TIMEOUT_SECONDS):
-                drained.append(handle)
+            by_workspace.setdefault(handle.record.workspace_id, []).append(handle)
+
+        drained_workspaces: set[str] = set()
+        held_exclusions: list[str] = []
+        non_drained: list[dict[str, str]] = []
+        for workspace_id in sorted(by_workspace):
+            remaining = max(0.0, deadline - time.monotonic())
+            if self._acquire_workspace_write_exclusive(workspace_id, remaining):
+                drained_workspaces.add(workspace_id)
+                held_exclusions.append(workspace_id)
             else:
-                errors.append(SessionWriteDrainTimeoutError("stop"))
+                non_drained.extend(
+                    {
+                        "session_id": handle.record.session_id,
+                        "workspace_id": workspace_id,
+                    }
+                    for handle in by_workspace[workspace_id]
+                )
 
-        for handle in drained:
-            with handle.lock:
-                managed = handle.managed
-                if managed is not None:
-                    process.signal_group(managed.pgid, signal.SIGKILL)
+        try:
+            for handle in handles:
+                record = handle.record
+                with handle.lock:
+                    managed = handle.managed
+                    if managed is not None:
+                        try:
+                            process.signal_group(managed.pgid, signal.SIGKILL)
+                        except Exception:
+                            LOGGER.warning(
+                                "session process kill failed session_id=%s workspace_id=%s",
+                                record.session_id,
+                                record.workspace_id,
+                            )
+                        try:
+                            managed.process.wait(timeout=max(0.0, deadline - time.monotonic()))
+                        except Exception:
+                            pass
+                        handle.managed = None
                     try:
-                        managed.process.wait(timeout=5)
+                        self._stop_channels(
+                            handle,
+                            wipe_secret=True,
+                            clear_forms=record.workspace_id in drained_workspaces,
+                        )
                     except Exception:
+                        LOGGER.warning(
+                            "session channel cleanup failed session_id=%s workspace_id=%s",
+                            record.session_id,
+                            record.workspace_id,
+                        )
+                    self._unlink_sockets(
+                        (handle.socket_path, handle.broker_socket_path, handle.egress_socket_path)
+                    )
+                    shutil.rmtree(handle.scratch, ignore_errors=True)
+                    process.cleanup_session_etc_directory(handle.directory)
+                    for path in (handle.prompt_path, handle.instruction_path):
+                        try:
+                            os.unlink(path)
+                        except OSError:
+                            pass
+                    try:
+                        self._purge_provider_credentials(handle, operation="stop")
+                    except SessionError:
                         pass
-                    handle.managed = None
-                # Close in-flight relay connections and provider tunnels,
-                # unlink both sockets and wipe the one-shot secret.
-                self._stop_channels(handle, wipe_secret=True)
-                process.cleanup_session_etc_directory(handle.directory)
-                # R2B-1: shutdown never leaves a seeded provider credential
-                # behind; record cleanup failures and keep shutdown moving.
-                try:
-                    self._purge_provider_credentials(handle, operation="stop")
-                except SessionError:
-                    pass
-        for handle in handles:
-            for thread in list(handle.threads):
-                if thread.name.startswith(("session-stdout", "session-stderr", "session-monitor")):
-                    thread.join(timeout=5)
-        if errors:
-            raise errors[0]
+                    if record.workspace_id in drained_workspaces:
+                        handle.provider_credential_forms = ()
+
+            for handle in handles:
+                for thread in list(handle.threads):
+                    if thread.name.startswith(
+                        ("session-stdout", "session-stderr", "session-monitor")
+                    ):
+                        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        finally:
+            for workspace_id in reversed(held_exclusions):
+                self._release_workspace_write_exclusive(workspace_id)
+
+        if non_drained:
+            LOGGER.error("session write drain timed out non_drained=%s", non_drained)
+            raise SessionWriteDrainTimeoutError("stop", non_drained=non_drained)
 
     def _prepare_session_root(self) -> None:
         root = self._config.session_root
@@ -1670,12 +1698,15 @@ class SessionSupervisor:
         except process.NetworkIsolationUnavailable as exc:
             raise ConfinementUnavailableError(adapter_kind, reason=str(exc)) from exc
 
-    def _stop_channels(self, handle: _Session, *, wipe_secret: bool) -> None:
+    def _stop_channels(
+        self, handle: _Session, *, wipe_secret: bool, clear_forms: bool = False
+    ) -> None:
         """Abort in-flight relay connections/tunnels and unlink both sockets.
 
         Called on run end, interrupt, close, revocation and supervisor stop.
-        The in-memory secret survives unless ``wipe_secret`` is set (close and
-        supervisor stop), so the next run can re-arm a fresh handoff.
+        The in-memory secret survives unless ``wipe_secret`` is set. Detection
+        forms are cleared separately only while holding the workspace's
+        exclusive write gate.
         """
         server, handle.relay = handle.relay, None
         if server is not None:
@@ -1690,7 +1721,8 @@ class SessionSupervisor:
         handle.channels.mark_started()
         if wipe_secret:
             secret, handle.secret = handle.secret, None
-            handle.secret_forms = ()
+            if clear_forms:
+                handle.secret_forms = ()
             if secret is not None:
                 secret[:] = bytes(len(secret))
         self._unlink_sockets(
@@ -1876,6 +1908,8 @@ class SessionSupervisor:
         self, request: PrepareSessionRequest, *, idempotency_key: str, body_sha256: str
     ) -> dict[str, object]:
         with self._lock:
+            if self._stopped.is_set():
+                raise SessionWriteAdmissionError("prepare", request.workspace_id)
             replay = self._idempotency.replay("prepare", idempotency_key, body_sha256)
             if replay is not None:
                 return replay[1]
@@ -1993,6 +2027,8 @@ class SessionSupervisor:
                 if handle.egress_profile is not None:
                     self._start_egress(handle, adapter_kind=request.adapter_kind)
                 self._arm_secret(handle)
+                if self._stopped.is_set():
+                    raise SessionWriteAdmissionError("prepare", request.workspace_id)
                 self._sessions[request.session_id] = handle
             except BaseException:
                 if handle is not None:
@@ -2143,6 +2179,8 @@ class SessionSupervisor:
     ) -> dict[str, object]:
         handle = self._handle(session_id)
         with handle.lock:
+            if self._stopped.is_set():
+                raise SessionWriteAdmissionError("start", handle.record.workspace_id)
             scope = f"{session_id}:start"
             replay = self._idempotency.replay(scope, idempotency_key, body_sha256)
             if replay is not None:
@@ -2162,8 +2200,6 @@ class SessionSupervisor:
                 SessionState.FAILED,
             }:
                 raise SessionStateConflictError(str(record.state), "start")
-            if not handle.write_admission.is_accepting():
-                raise SessionStateConflictError(str(record.state), "start")
             profile = self._profiles.get(record.adapter_kind)
             if profile.requires_manifest and handle.manifest is None:
                 raise ManifestMissingError()
@@ -2181,6 +2217,8 @@ class SessionSupervisor:
     ) -> dict[str, object]:
         handle = self._handle(session_id)
         with handle.lock:
+            if self._stopped.is_set():
+                raise SessionWriteAdmissionError("resume", handle.record.workspace_id)
             scope = f"{session_id}:resume"
             replay = self._idempotency.replay(scope, idempotency_key, body_sha256)
             if replay is not None:
@@ -2195,8 +2233,6 @@ class SessionSupervisor:
                 SessionState.AWAITING_INSTRUCTION,
                 SessionState.LOST,
             }:
-                raise SessionStateConflictError(str(record.state), "resume")
-            if not handle.write_admission.is_accepting():
                 raise SessionStateConflictError(str(record.state), "resume")
             body = self._launch(handle, profile, resume=True, run_prompt=None)
             self._idempotency.remember(scope, idempotency_key, body_sha256, 200, body)
@@ -2920,71 +2956,81 @@ class SessionSupervisor:
         body_sha256: str,
     ) -> dict[str, object]:
         handle = self._handle(session_id)
-        with handle.lock:
-            scope = f"{session_id}:collect"
-            replay = self._idempotency.replay(scope, idempotency_key, body_sha256)
-            if replay is not None:
-                return replay[1]
-            record = handle.record
-            if record.state in {
-                SessionState.RUNNING,
-                SessionState.INTERRUPT_REQUESTED,
-            }:
-                raise SessionStateConflictError(str(record.state), "collect")
-            captured: list[dict[str, object]] = []
-            captured_notes: list[str] = []
-            if request.capture:
-                captured, captured_notes = self._capture(handle)
-            final_message, fake_outcome = self._fake_output(handle)
-            final_message_sha256 = (
-                None
-                if final_message is None or record.exit is None or record.exit.code != 0
-                else hashlib.sha256(final_message.encode("utf-8")).hexdigest()
-            )
-            run = record.runs[-1] if record.runs else None
-            outcome = record.outcome
-            if outcome is None and fake_outcome in {
-                "success",
-                "failed",
-                "interrupted",
-                "budget_exceeded",
-            }:
-                outcome = fake_outcome
-            body: dict[str, object] = {
-                "outcome": outcome if outcome is not None else _result_outcome(record),
-                "exit": None if record.exit is None else _exit_wire(record.exit),
-                "final_message_sha256": final_message_sha256,
-                "files": captured,
-                "log_range": {
-                    "cursor_from": 0 if run is None else run.log_start,
-                    "cursor_to": handle.logs.last_seq,
-                },
-                "captured_notes": captured_notes,
-                "collected_at": self._now(),
-            }
-            checkpoint = hashlib.sha256(
-                json.dumps(
-                    {
-                        "state": str(record.state),
-                        "last_event_seq": handle.events.last_seq,
-                        "exit": body["exit"],
-                        "files": [
-                            {"path": item["path"], "sha256": item["sha256"]} for item in captured
-                        ],
+        release = self._acquire_workspace_write_shared(handle.record.workspace_id)
+        try:
+            with handle.lock:
+                scope = f"{session_id}:collect"
+                replay = self._idempotency.replay(scope, idempotency_key, body_sha256)
+                if replay is not None:
+                    return replay[1]
+                if not handle.secret_forms or handle.record.state in {
+                    SessionState.CLOSED,
+                    SessionState.LOST,
+                }:
+                    raise SessionWriteAdmissionError("collect", handle.record.workspace_id)
+                record = handle.record
+                if record.state in {
+                    SessionState.RUNNING,
+                    SessionState.INTERRUPT_REQUESTED,
+                }:
+                    raise SessionStateConflictError(str(record.state), "collect")
+                captured: list[dict[str, object]] = []
+                captured_notes: list[str] = []
+                if request.capture:
+                    captured, captured_notes = self._capture(handle)
+                final_message, fake_outcome = self._fake_output(handle)
+                final_message_sha256 = (
+                    None
+                    if final_message is None or record.exit is None or record.exit.code != 0
+                    else hashlib.sha256(final_message.encode("utf-8")).hexdigest()
+                )
+                run = record.runs[-1] if record.runs else None
+                outcome = record.outcome
+                if outcome is None and fake_outcome in {
+                    "success",
+                    "failed",
+                    "interrupted",
+                    "budget_exceeded",
+                }:
+                    outcome = fake_outcome
+                body: dict[str, object] = {
+                    "outcome": outcome if outcome is not None else _result_outcome(record),
+                    "exit": None if record.exit is None else _exit_wire(record.exit),
+                    "final_message_sha256": final_message_sha256,
+                    "files": captured,
+                    "log_range": {
+                        "cursor_from": 0 if run is None else run.log_start,
+                        "cursor_to": handle.logs.last_seq,
                     },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            ).hexdigest()
-            record.checkpoint_sha256 = checkpoint
-            handle.events.append_event(
-                kind=logs.EventKind.CAPTURE_COMPLETED,
-                at=self._now(),
-                payload={"files": len(captured), "checkpoint_sha256": checkpoint},
-            )
-            self._persist(handle)
-            self._idempotency.remember(scope, idempotency_key, body_sha256, 200, body)
-            return body
+                    "captured_notes": captured_notes,
+                    "collected_at": self._now(),
+                }
+                checkpoint = hashlib.sha256(
+                    json.dumps(
+                        {
+                            "state": str(record.state),
+                            "last_event_seq": handle.events.last_seq,
+                            "exit": body["exit"],
+                            "files": [
+                                {"path": item["path"], "sha256": item["sha256"]}
+                                for item in captured
+                            ],
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                record.checkpoint_sha256 = checkpoint
+                handle.events.append_event(
+                    kind=logs.EventKind.CAPTURE_COMPLETED,
+                    at=self._now(),
+                    payload={"files": len(captured), "checkpoint_sha256": checkpoint},
+                )
+                self._persist(handle)
+                self._idempotency.remember(scope, idempotency_key, body_sha256, 200, body)
+                return body
+        finally:
+            release()
 
     def _capture(self, handle: _Session) -> tuple[list[dict[str, object]], list[str]]:
         record = handle.record
@@ -3186,41 +3232,24 @@ class SessionSupervisor:
             raise SecretExposureError(operation=operation)
 
     def admit_non_ui_file_write(self, workspace_id: str) -> Callable[[], None]:
-        """Lease matching sessions through body staging, scan and publication."""
-        if self._stopped.is_set():
-            raise SessionWriteAdmissionError()
-        with self._lock:
-            handles = tuple(
-                handle
-                for _, handle in sorted(self._sessions.items())
-                if handle.record.workspace_id == workspace_id
-            )
+        """Lease this workspace through non-UI body staging and publication."""
+        return self._acquire_workspace_write_shared(workspace_id)
 
-        candidates: list[_Session] = []
-        for handle in handles:
-            with handle.lock:
-                if handle.record.state in ACTIVE_STATES or (
-                    handle.record.state is SessionState.FAILED
-                    and handle.record.outcome == SECRET_EXPOSURE_REASON
-                ):
-                    candidates.append(handle)
-        if handles and not candidates:
-            raise SessionWriteAdmissionError()
-
-        # Snapshot under the map lock, inspect session locks, then lease gates
-        # by session id. The checker takes a session lock; publication takes
-        # the workspace lock. None is held across the write or an HTTP lock.
-        admitted: list[_WriteAdmission] = []
-        try:
-            for handle in candidates:
-                handle.write_admission.acquire()
-                admitted.append(handle.write_admission)
-            if self._stopped.is_set():
-                raise SessionWriteAdmissionError()
-        except BaseException:
-            for gate in reversed(admitted):
-                gate.release()
-            raise
+    def _acquire_workspace_write_shared(self, workspace_id: str) -> Callable[[], None]:
+        with self._workspace_write_condition:
+            gate = self._workspace_write_gates.setdefault(workspace_id, _WorkspaceWriteGate())
+            gate.waiting_readers += 1
+            try:
+                while gate.writer or gate.waiting_writers:
+                    if self._stopped.is_set():
+                        raise SessionWriteAdmissionError("file_write", workspace_id)
+                    self._workspace_write_condition.wait()
+                if self._stopped.is_set():
+                    raise SessionWriteAdmissionError("file_write", workspace_id)
+                gate.readers += 1
+            finally:
+                gate.waiting_readers -= 1
+                self._prune_workspace_write_gate(workspace_id, gate)
 
         released = False
 
@@ -3229,10 +3258,47 @@ class SessionSupervisor:
             if released:
                 return
             released = True
-            for gate in reversed(admitted):
-                gate.release()
+            with self._workspace_write_condition:
+                gate.readers -= 1
+                self._workspace_write_condition.notify_all()
+                self._prune_workspace_write_gate(workspace_id, gate)
 
         return release
+
+    def _acquire_workspace_write_exclusive(self, workspace_id: str, timeout: float) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._workspace_write_condition:
+            gate = self._workspace_write_gates.setdefault(workspace_id, _WorkspaceWriteGate())
+            gate.waiting_writers += 1
+            try:
+                while gate.writer or gate.readers:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    self._workspace_write_condition.wait(timeout=remaining)
+                gate.writer = True
+                return True
+            finally:
+                gate.waiting_writers -= 1
+                self._workspace_write_condition.notify_all()
+                self._prune_workspace_write_gate(workspace_id, gate)
+
+    def _release_workspace_write_exclusive(self, workspace_id: str) -> None:
+        with self._workspace_write_condition:
+            gate = self._workspace_write_gates[workspace_id]
+            gate.writer = False
+            self._workspace_write_condition.notify_all()
+            self._prune_workspace_write_gate(workspace_id, gate)
+
+    def _prune_workspace_write_gate(self, workspace_id: str, gate: _WorkspaceWriteGate) -> None:
+        if (
+            gate.readers == 0
+            and not gate.writer
+            and gate.waiting_readers == 0
+            and gate.waiting_writers == 0
+            and self._workspace_write_gates.get(workspace_id) is gate
+        ):
+            del self._workspace_write_gates[workspace_id]
 
     def check_non_ui_file_write(
         self,
@@ -3254,10 +3320,7 @@ class SessionSupervisor:
             if workspace_id is not None and handle.record.workspace_id != workspace_id:
                 continue
             with handle.lock:
-                if handle.record.state not in ACTIVE_STATES and not (
-                    handle.record.state is SessionState.FAILED
-                    and handle.record.outcome == SECRET_EXPOSURE_REASON
-                ):
+                if not handle.secret_forms and not handle.provider_credential_forms:
                     continue
                 self._refuse_secret_exposure(
                     handle,
@@ -3278,9 +3341,7 @@ class SessionSupervisor:
             return
         secret_forms = handle.secret_forms
         self._stop_channels(handle, wipe_secret=True)
-        # The raw secret is zeroed by _stop_channels. Keep its detection forms
-        # until the failed session is closed so concurrent writes that already
-        # hold staged bytes cannot publish the same secret after this revoke.
+        # Revocation wipes the raw secret but keeps the forms for later writes.
         handle.secret_forms = secret_forms
         previous = record.state
         now = self._now()
@@ -3436,72 +3497,73 @@ class SessionSupervisor:
                 SessionState.RECONCILING,
             }:
                 raise SessionStateConflictError(str(record.state), "close")
+        workspace_id = handle.record.workspace_id
+        if not self._acquire_workspace_write_exclusive(workspace_id, WRITE_DRAIN_TIMEOUT_SECONDS):
+            raise SessionWriteDrainTimeoutError("close", workspace_id=workspace_id)
 
-            # Close admission before releasing the session lock. Drain outside
-            # that lock because admitted writers need it for their secret scan.
-            handle.write_admission.stop_accepting()
-        if not handle.write_admission.wait_until_idle(WRITE_DRAIN_TIMEOUT_SECONDS):
-            raise SessionWriteDrainTimeoutError("close")
-
-        with handle.lock:
-            scope = f"{session_id}:close"
-            replay = self._idempotency.replay(scope, idempotency_key, body_sha256)
-            if replay is not None:
-                return replay[1]
-            record = handle.record
-            if record.state is SessionState.CLOSED:
-                return {"state": str(SessionState.CLOSED)}
-            if record.state in {
-                SessionState.RUNNING,
-                SessionState.INTERRUPT_REQUESTED,
-                SessionState.PROVISIONING,
-                SessionState.RECONCILING,
-            }:
-                raise SessionStateConflictError(str(record.state), "close")
-            managed = handle.managed
-            if managed is not None:
-                process.signal_group(managed.pgid, signal.SIGKILL)
-                try:
-                    managed.process.wait(timeout=5)
-                except Exception:
-                    pass
-                handle.managed = None
-            # Close the relay/proxy listeners (unlinking both sockets), stop the
-            # one-shot handoff and wipe the in-memory secret at close.
-            self._stop_channels(handle, wipe_secret=True)
-            shutil.rmtree(handle.scratch, ignore_errors=True)
-            process.cleanup_session_etc_directory(handle.directory)
-            for path in (handle.prompt_path, handle.instruction_path):
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
-            # R2B-1: the seeded provider credential never outlives the session.
-            # A copy that cannot be removed fails this close (state ``failed``)
-            # instead of leaving a reusable credential behind a clean receipt.
-            self._purge_provider_credentials(handle, operation="close")
-            now = self._now()
-            previous = record.state
-            record.state = SessionState.CLOSED
-            record.state_version += 1
-            record.close_reason = request.reason
-            record.updated_at = now
-            record.last_activity_at = now
-            record.stopped_at = record.stopped_at or now
-            handle.events.append_event(
-                kind=logs.EventKind.STATE_CHANGED,
-                at=now,
-                payload={
-                    "from": str(previous),
-                    "to": str(SessionState.CLOSED),
-                    "state_version": record.state_version,
-                    "reason": request.reason,
-                },
-            )
-            self._persist(handle)
-            body = {"state": str(SessionState.CLOSED)}
-            self._idempotency.remember(scope, idempotency_key, body_sha256, 200, body)
-            return body
+        try:
+            with handle.lock:
+                scope = f"{session_id}:close"
+                replay = self._idempotency.replay(scope, idempotency_key, body_sha256)
+                if replay is not None:
+                    return replay[1]
+                record = handle.record
+                if record.state is SessionState.CLOSED:
+                    return {"state": str(SessionState.CLOSED)}
+                if record.state in {
+                    SessionState.RUNNING,
+                    SessionState.INTERRUPT_REQUESTED,
+                    SessionState.PROVISIONING,
+                    SessionState.RECONCILING,
+                }:
+                    raise SessionStateConflictError(str(record.state), "close")
+                managed = handle.managed
+                if managed is not None:
+                    process.signal_group(managed.pgid, signal.SIGKILL)
+                    try:
+                        managed.process.wait(timeout=5)
+                    except Exception:
+                        pass
+                    handle.managed = None
+                # Close listeners and wipe forms only while excluding workspace writes.
+                self._stop_channels(handle, wipe_secret=True)
+                shutil.rmtree(handle.scratch, ignore_errors=True)
+                process.cleanup_session_etc_directory(handle.directory)
+                for path in (handle.prompt_path, handle.instruction_path):
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+                # R2B-1: the seeded provider credential never outlives the session.
+                # A copy that cannot be removed fails this close (state ``failed``)
+                # instead of leaving a reusable credential behind a clean receipt.
+                self._purge_provider_credentials(handle, operation="close")
+                handle.secret_forms = ()
+                handle.provider_credential_forms = ()
+                now = self._now()
+                previous = record.state
+                record.state = SessionState.CLOSED
+                record.state_version += 1
+                record.close_reason = request.reason
+                record.updated_at = now
+                record.last_activity_at = now
+                record.stopped_at = record.stopped_at or now
+                handle.events.append_event(
+                    kind=logs.EventKind.STATE_CHANGED,
+                    at=now,
+                    payload={
+                        "from": str(previous),
+                        "to": str(SessionState.CLOSED),
+                        "state_version": record.state_version,
+                        "reason": request.reason,
+                    },
+                )
+                self._persist(handle)
+                body: dict[str, object] = {"state": str(SessionState.CLOSED)}
+                self._idempotency.remember(scope, idempotency_key, body_sha256, 200, body)
+                return body
+        finally:
+            self._release_workspace_write_exclusive(workspace_id)
 
     # -- manifest ----------------------------------------------------------
 

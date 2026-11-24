@@ -154,10 +154,13 @@ class SessionWriteAdmissionError(SessionError):
     code = ErrorCode.SESSION_STATE_CONFLICT
     status = 409
 
-    def __init__(self) -> None:
+    def __init__(self, operation: str = "file_write", workspace_id: str | None = None) -> None:
+        details: dict[str, object] = {"operation": operation}
+        if workspace_id is not None:
+            details["workspace_id"] = workspace_id
         super().__init__(
-            "the session is closing and cannot admit a file write",
-            details={"operation": "file_write"},
+            "the supervisor is stopped or the workspace is closing",
+            details=details,
         )
 
 
@@ -165,10 +168,21 @@ class SessionWriteDrainTimeoutError(SessionError):
     code = ErrorCode.SESSION_BUSY
     status = 409
 
-    def __init__(self, operation: str) -> None:
+    def __init__(
+        self,
+        operation: str,
+        *,
+        workspace_id: str | None = None,
+        non_drained: Sequence[Mapping[str, str]] = (),
+    ) -> None:
+        details: dict[str, object] = {"operation": operation}
+        if workspace_id is not None:
+            details["workspace_id"] = workspace_id
+        if non_drained:
+            details["non_drained"] = [dict(item) for item in non_drained]
         super().__init__(
             "timed out waiting for admitted file writes",
-            details={"operation": operation},
+            details=details,
         )
 
 

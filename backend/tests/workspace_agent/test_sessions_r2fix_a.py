@@ -78,7 +78,6 @@ def _dispatch_agent_file_write(
     handle = SimpleNamespace(
         record=record,
         lock=threading.RLock(),
-        write_admission=sessions_supervisor._WriteAdmission(),
         secret_forms=sessions_supervisor._secret_content_forms(URLSAFE_SECRET),
         provider_credential_forms=(),
         directory=tmp_path,
@@ -86,6 +85,8 @@ def _dispatch_agent_file_write(
     supervisor = object.__new__(sessions_supervisor.SessionSupervisor)
     supervisor._sessions = {SESSION_ID: handle} if active else {}
     supervisor._lock = threading.RLock()
+    supervisor._workspace_write_condition = threading.Condition()
+    supervisor._workspace_write_gates = {}
     supervisor._stopped = threading.Event()
     supervisor._revoke_secret_exposure = lambda target, **_kwargs: setattr(
         target.record, "state", SessionState.FAILED
@@ -147,7 +148,6 @@ def _dispatch_non_ui_file_write(
     handle = SimpleNamespace(
         record=record,
         lock=threading.RLock(),
-        write_admission=sessions_supervisor._WriteAdmission(),
         secret_forms=sessions_supervisor._secret_content_forms(URLSAFE_SECRET),
         provider_credential_forms=(),
         directory=tmp_path,
@@ -163,12 +163,13 @@ def _dispatch_non_ui_file_write(
                     state=SessionState.READY,
                 ),
                 lock=threading.RLock(),
-                write_admission=sessions_supervisor._WriteAdmission(),
                 secret_forms=sessions_supervisor._secret_content_forms(secret),
                 provider_credential_forms=(),
                 directory=tmp_path,
             )
     supervisor._lock = threading.RLock()
+    supervisor._workspace_write_condition = threading.Condition()
+    supervisor._workspace_write_gates = {}
     supervisor._stopped = threading.Event()
     supervisor._revoke_secret_exposure = lambda target, **_kwargs: setattr(
         target.record, "state", SessionState.FAILED
