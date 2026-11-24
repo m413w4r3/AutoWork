@@ -833,4 +833,40 @@ def test_real_typst_large_ioc_table_keeps_values_and_annex_references(tmp_path: 
         "Annexe technique — identifiants IOC"
     )
     assert "Réf." in extracted and "VirusTotal" in extracted and "URLhaus" in extracted
+    pages = extracted.split("\f")
+    annex_start = next(
+        index for index, page in enumerate(pages) if "Annexe technique — identifiants IOC" in page
+    )
+    annex_pages = [
+        page
+        for page in pages[annex_start:]
+        if re.search(
+            r"(?m)^\s*(?:\[\d+\] · |Valeur exacte :|Observation :|Source :|SHA-256 de la preuve :)",
+            page,
+        )
+    ]
+    assert annex_pages
+    for page_number, page in enumerate(annex_pages, start=1):
+        lines = [line.strip() for line in page.splitlines() if line.strip()]
+        if page_number == 1:
+            heading_index = next(
+                index for index, line in enumerate(lines) if "Annexe technique" in line
+            )
+            first_card_line = next(
+                line
+                for line in lines[heading_index + 1 :]
+                if "Les références renvoient" not in line
+            )
+        else:
+            first_card_line = next(
+                line for line in lines if not line.startswith("Avis — aperçu non approuvé")
+            )
+        assert re.match(r"\[\d+\] · ", first_card_line), (
+            f"annex page {page_number} starts inside a card: {first_card_line!r}"
+        )
+        for index, line in enumerate(lines):
+            if "Valeur exacte :" in line:
+                assert index > 0 and re.match(r"\[\d+\] · ", lines[index - 1]), (
+                    f"annex page {page_number} has a value without its reference"
+                )
     _assert_pdf_words_stay_inside_page_margin(pdf_path)

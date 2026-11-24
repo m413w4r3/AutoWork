@@ -1068,7 +1068,7 @@
         stroke: 0.4pt + rgb("#D0D5DD"),
         inset: 6pt,
         radius: 3pt,
-        breakable: true,
+        breakable: false,
       )[
         #set par(justify: false, leading: 1.05em, spacing: 1pt)
         #text(size: 8pt, weight: "bold", fill: accent)[#entry.reference · #entry.object_type]
