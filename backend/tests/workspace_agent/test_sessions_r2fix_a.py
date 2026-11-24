@@ -126,6 +126,7 @@ def _dispatch_non_ui_file_write(
     task_id: str | None,
     active: bool,
     destination_override: str | None = None,
+    additional_session_secrets: tuple[bytes, ...] = (),
 ) -> tuple[object, Path, SimpleNamespace]:
     environment = make_scan_environment(tmp_path)
     generated = origin == "system"
@@ -142,6 +143,15 @@ def _dispatch_non_ui_file_write(
     )
     supervisor = object.__new__(sessions_supervisor.SessionSupervisor)
     supervisor._sessions = {SESSION_ID: handle} if active else {}
+    if active:
+        for index, secret in enumerate(additional_session_secrets):
+            supervisor._sessions[f"session-other-{index}"] = SimpleNamespace(
+                record=SimpleNamespace(task_id=f"task-other-{index}", state=SessionState.READY),
+                lock=threading.RLock(),
+                secret_forms=sessions_supervisor._secret_content_forms(secret),
+                provider_credential_forms=(),
+                directory=tmp_path,
+            )
     supervisor._lock = threading.RLock()
     supervisor._revoke_secret_exposure = lambda target, **_kwargs: setattr(
         target.record, "state", SessionState.FAILED
@@ -475,6 +485,102 @@ def test_non_ui_file_route_does_not_refuse_a_clean_credential_named_destination(
     assert response[0] == 201
     assert handle.record.state is SessionState.READY
     assert destination.read_bytes() == body
+
+
+def test_non_ui_file_route_refuses_secret_fragment_in_destination_path(
+    tmp_path: Path,
+) -> None:
+    body = b"# synthetic clean content\n"
+    path_fragment = URLSAFE_SECRET[8:24].hex()
+
+    response, destination, handle = _dispatch_non_ui_file_write(
+        tmp_path,
+        body=body,
+        origin="system",
+        task_id=None,
+        active=True,
+        destination_override=f"results/export-{path_fragment}.md",
+    )
+
+    assert isinstance(response, _RequestRejected)
+    assert response.status == 403
+    assert response.code == protocol.ErrorCode.POLICY_DENIED
+    assert handle.record.state is SessionState.FAILED
+    assert not destination.exists()
+
+
+def test_non_ui_file_route_checks_all_active_sessions_despite_task_id(
+    tmp_path: Path,
+) -> None:
+    other_secret = b"independent-session-secret-value-92715"
+    body = b"# synthetic write\n" + other_secret[8:24] + b"\n"
+
+    response, destination, _handle = _dispatch_non_ui_file_write(
+        tmp_path,
+        body=body,
+        origin="system",
+        task_id=TASK_ID,
+        active=True,
+        additional_session_secrets=(other_secret,),
+    )
+
+    assert isinstance(response, _RequestRejected)
+    assert response.status == 403
+    assert response.code == protocol.ErrorCode.POLICY_DENIED
+    assert not destination.exists()
+
+
+def test_file_write_rechecks_secret_after_exposure_revocation(tmp_path: Path) -> None:
+    forms = sessions_supervisor._secret_content_forms(URLSAFE_SECRET)
+    record = SimpleNamespace(
+        task_id=TASK_ID,
+        state=SessionState.READY,
+        state_version=1,
+        outcome=None,
+        updated_at=None,
+        last_activity_at=None,
+    )
+
+    class _Events:
+        def __init__(self) -> None:
+            self.payloads: list[dict[str, object]] = []
+
+        def append_event(self, *, payload: dict[str, object], **_kwargs: object) -> None:
+            self.payloads.append(payload)
+
+    events = _Events()
+    persisted: list[None] = []
+    handle = SimpleNamespace(
+        record=record,
+        lock=threading.RLock(),
+        events=events,
+        secret_forms=forms,
+        provider_credential_forms=(),
+        directory=tmp_path,
+    )
+    supervisor = object.__new__(sessions_supervisor.SessionSupervisor)
+    supervisor._sessions = {SESSION_ID: handle}
+    supervisor._lock = threading.RLock()
+    supervisor._now = lambda: "synthetic-time"
+    supervisor._stop_channels = lambda target, *, wipe_secret: setattr(target, "secret_forms", ())
+    supervisor._persist = lambda *_args, **_kwargs: persisted.append(None)
+
+    with pytest.raises(sessions_supervisor.SecretExposureError):
+        supervisor.check_non_ui_file_write(TASK_ID, "results/first.md", lambda: URLSAFE_SECRET)
+
+    assert record.state is SessionState.FAILED
+    assert record.outcome == sessions_supervisor.SECRET_EXPOSURE_REASON
+    assert handle.secret_forms == forms
+    revoked_version = record.state_version
+    event_count = len(events.payloads)
+    persist_count = len(persisted)
+    with pytest.raises(sessions_supervisor.SecretExposureError):
+        supervisor.check_non_ui_file_write(
+            TASK_ID, "results/second.md", lambda: URLSAFE_SECRET[8:24]
+        )
+    assert record.state_version == revoked_version
+    assert len(events.payloads) == event_count
+    assert len(persisted) == persist_count
 
 
 @pytest.mark.parametrize(

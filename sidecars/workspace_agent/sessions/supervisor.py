@@ -1218,8 +1218,9 @@ class _Session:
         self.lock = threading.RLock()
         self.channels = _SessionChannelState(self)
         self.secret: bytearray | None = None
-        # F2: derived from the in-memory secret only; cleared whenever the
-        # secret is wiped, never persisted.
+        # F2: secret detection forms are never persisted. Normally cleared
+        # whenever the secret is wiped; exposure revocation retains them until
+        # close/stop so non-UI writes cannot race publication.
         self.secret_forms: tuple[bytes, ...] = ()
         # R2B-2: in-memory forms of the provider credentials a profile installed
         # for this session; never persisted, never logged.  They survive a run
@@ -3118,9 +3119,7 @@ class SessionSupervisor:
         if not forms:
             return
         for destination, _kind, data in entries:
-            destination_has_secret = operation != "file_write" and _contains_secret_form(
-                destination.encode("utf-8"), forms
-            )
+            destination_has_secret = _contains_secret_form(destination.encode("utf-8"), forms)
             if destination_has_secret or _contains_secret_form(data, forms):
                 self._revoke_secret_exposure(handle, operation=operation)
                 raise SecretExposureError(operation=operation)
@@ -3136,18 +3135,24 @@ class SessionSupervisor:
 
     def check_non_ui_file_write(
         self,
-        task_id: str | None,
+        _task_id: str | None,
         destination: str,
         read_content: Callable[[], bytes],
     ) -> None:
-        """Refuse non-UI file content carrying credentials for active sessions."""
+        """Refuse non-UI file writes carrying credentials for relevant sessions.
+
+        The optional task id does not bind writes under results/, so it cannot
+        narrow this scan. An exposure-revoked session keeps its secret forms so
+        writes cannot publish after the session fails.
+        """
         with self._lock:
             handles = tuple(self._sessions.values())
         for handle in handles:
             with handle.lock:
-                if handle.record.state not in ACTIVE_STATES:
-                    continue
-                if task_id is not None and handle.record.task_id != task_id:
+                if handle.record.state not in ACTIVE_STATES and not (
+                    handle.record.state is SessionState.FAILED
+                    and handle.record.outcome == SECRET_EXPOSURE_REASON
+                ):
                     continue
                 self._refuse_secret_exposure(
                     handle,
@@ -3164,7 +3169,14 @@ class SessionSupervisor:
         itself quote the secret.
         """
         record = handle.record
+        if record.state is SessionState.FAILED and record.outcome == SECRET_EXPOSURE_REASON:
+            return
+        secret_forms = handle.secret_forms
         self._stop_channels(handle, wipe_secret=True)
+        # The raw secret is zeroed by _stop_channels. Keep its detection forms
+        # until the failed session is closed so concurrent writes that already
+        # hold staged bytes cannot publish the same secret after this revoke.
+        handle.secret_forms = secret_forms
         previous = record.state
         now = self._now()
         record.state = SessionState.FAILED
