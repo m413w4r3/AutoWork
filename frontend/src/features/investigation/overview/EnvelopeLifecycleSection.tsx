@@ -191,7 +191,9 @@ export function EnvelopeAccessSummary({
   ) {
     label = envelope.currently_authorized
       ? "Accès externes : actifs"
-      : "Accès externes : révoqués";
+      : isExplicitlyRevoked(envelope)
+        ? "Accès externes : révoqués"
+        : "Accès externes : non autorisés";
   }
 
   return (
@@ -217,7 +219,11 @@ function ApprovedEnvelopeSection({
   const [extendedVersion, setExtendedVersion] = useState<number | null>(null);
 
   const revokedNow = revoke.isSuccess;
-  const revoked = revokedNow || !envelope.currently_authorized;
+  const explicitlyRevoked =
+    revokedNow ||
+    (!envelope.currently_authorized && isExplicitlyRevoked(envelope));
+  const authorized = envelope.currently_authorized && !revokedNow;
+  const inactive = !authorized;
   const revokedVersion = revokedNow
     ? (revoke.data?.version ?? envelope.version)
     : envelope.version;
@@ -229,23 +235,35 @@ function ApprovedEnvelopeSection({
     >
       <h2 id={LIFECYCLE_HEADING_ID}>Cycle de vie de l’enveloppe G2</h2>
 
-      {revoked ? (
+      {explicitlyRevoked ? (
         <WorkshopStateBanner tone="warning" title="Accès externes : révoqués">
           <p>
             Aucune nouvelle opération VT, Shodan ou Bridge externe n’est
             autorisée. Les analyses locales restent accessibles.
           </p>
         </WorkshopStateBanner>
-      ) : (
+      ) : authorized ? (
         <WorkshopStateBanner tone="success" title="Accès externes : actifs">
           <p>
             Les fournisseurs autorisés et les plafonds actifs sont listés
             ci-dessous.
           </p>
         </WorkshopStateBanner>
+      ) : (
+        <WorkshopStateBanner
+          tone="warning"
+          title="Accès externes : non autorisés"
+        >
+          <p>
+            {envelope.authority_kind === "osint_policy" &&
+            envelope.policy_status
+              ? `La politique n’autorise plus les accès externes (${POLICY_STATUS_LABELS[envelope.policy_status] ?? envelope.policy_status}).`
+              : "L’autorisation courante est absente. Les analyses locales restent accessibles."}
+          </p>
+        </WorkshopStateBanner>
       )}
 
-      {extendedVersion !== null && !revoked ? (
+      {extendedVersion !== null && authorized ? (
         <WorkshopStateBanner tone="success" title="Enveloppe étendue">
           <p>
             La décision d’extension a été enregistrée ; les droits affichés sont
@@ -254,17 +272,21 @@ function ApprovedEnvelopeSection({
         </WorkshopStateBanner>
       ) : null}
 
-      <EnvelopeRights envelope={envelope} />
-      <EnvelopeBudget envelope={envelope} revoked={revoked} />
+      <EnvelopeRights envelope={envelope} active={authorized} />
+      <EnvelopeBudget
+        envelope={envelope}
+        inactive={inactive}
+        explicitlyRevoked={explicitlyRevoked}
+      />
       <EnvelopeDecision envelope={envelope} />
       <InheritedPolicy envelope={envelope} />
       <EnvelopeTechnicalDetails
         envelope={envelope}
         revokedVersion={revokedVersion}
-        revoked={revoked}
+        inactive={inactive}
       />
 
-      {revoked ? null : (
+      {inactive ? null : (
         <>
           <div role="group" aria-label="Actions de cycle de vie G2">
             <button
@@ -321,25 +343,63 @@ function ApprovedEnvelopeSection({
   );
 }
 
-function EnvelopeRights({ envelope }: { envelope: InvestigationEnvelopeView }) {
+function isExplicitlyRevoked(envelope: EnvelopeLifecycleView): boolean {
+  return (
+    envelope.authority_kind === "human_g2" ||
+    (envelope.authority_kind === "osint_policy" &&
+      envelope.policy_status === "revoked")
+  );
+}
+
+function EnvelopeRights({
+  envelope,
+  active,
+}: {
+  envelope: InvestigationEnvelopeView;
+  active: boolean;
+}) {
   const providers = envelope.allowed_providers;
   const otherProviders = providers.filter(
     (provider) => !(provider in PROVIDER_LABELS),
   );
   return (
     <section aria-labelledby="overview-envelope-rights-heading">
-      <h3 id="overview-envelope-rights-heading">Droits autorisés</h3>
+      <h3 id="overview-envelope-rights-heading">
+        {active
+          ? "Droits autorisés"
+          : "Fournisseurs de l’enveloppe enregistrée (non actifs)"}
+      </h3>
       <dl className="workshop-meta">
         <dt>VirusTotal (lectures)</dt>
-        <dd>{providers.includes("vt") ? "autorisées" : "interdites"}</dd>
+        <dd>
+          {providers.includes("vt")
+            ? active
+              ? "autorisées"
+              : "VirusTotal (lectures) enregistrées, non actives"
+            : "interdites"}
+        </dd>
         <dt>Bridge (consultations)</dt>
-        <dd>{providers.includes("bridge") ? "autorisées" : "interdites"}</dd>
+        <dd>
+          {providers.includes("bridge")
+            ? active
+              ? "autorisées"
+              : "Bridge (consultations) enregistrées, non actives"
+            : "interdites"}
+        </dd>
         <dt>Shodan</dt>
-        <dd>{providers.includes("shodan") ? "autorisé" : "interdit"}</dd>
+        <dd>
+          {providers.includes("shodan")
+            ? active
+              ? "autorisé"
+              : "Shodan enregistré, non actif"
+            : "interdit"}
+        </dd>
         <dt>Acquisition d’échantillons</dt>
         <dd>
           {envelope.acquire_hits_allowed
-            ? `autorisée · ${formatCount(envelope.max_acquire_volume)} fichier(s) maximum`
+            ? active
+              ? `autorisée · ${formatCount(envelope.max_acquire_volume)} fichier(s) maximum`
+              : `enregistrée, non active · ${formatCount(envelope.max_acquire_volume)} fichier(s) maximum`
             : "interdite"}
         </dd>
         <dt>Divulgation</dt>
@@ -370,10 +430,12 @@ function EnvelopeRights({ envelope }: { envelope: InvestigationEnvelopeView }) {
 
 function EnvelopeBudget({
   envelope,
-  revoked,
+  inactive,
+  explicitlyRevoked,
 }: {
   envelope: EnvelopeLifecycleView;
-  revoked: boolean;
+  inactive: boolean;
+  explicitlyRevoked: boolean;
 }) {
   return (
     <section aria-labelledby="overview-envelope-budget-heading">
@@ -390,8 +452,8 @@ function EnvelopeBudget({
               {budgetLine(
                 dimension,
                 envelope.budget[dimension],
-                isExternalBudgetActive(dimension, envelope, revoked),
-                revoked,
+                isExternalBudgetActive(dimension, envelope, inactive),
+                explicitlyRevoked,
               )}
             </dd>
           </div>
@@ -405,10 +467,10 @@ function budgetLine(
   dimension: BudgetDimension,
   value: InvestigationEnvelopeDimensionView,
   active: boolean,
-  revoked: boolean,
+  explicitlyRevoked: boolean,
 ): string {
   if (!active) {
-    return revoked
+    return explicitlyRevoked
       ? `Historique : ${budgetQuantity(dimension, value.consumed)} (autorisation révoquée, aucun plafond actif)`
       : `Historique : ${budgetQuantity(dimension, value.consumed)} (aucune autorisation active, aucun plafond actif)`;
   }
@@ -513,18 +575,18 @@ function EnvelopeDecision({ envelope }: { envelope: EnvelopeLifecycleView }) {
 function EnvelopeTechnicalDetails({
   envelope,
   revokedVersion,
-  revoked,
+  inactive,
 }: {
   envelope: EnvelopeLifecycleView;
   revokedVersion: number;
-  revoked: boolean;
+  inactive: boolean;
 }) {
   return (
     <details>
       <summary>Détails techniques</summary>
       <dl className="workshop-meta">
         <dt>Version de l’enveloppe</dt>
-        <dd>{revoked ? revokedVersion : envelope.version}</dd>
+        <dd>{inactive ? revokedVersion : envelope.version}</dd>
         {envelope.approval_actor_id ? (
           <>
             <dt>Identifiant de l’acteur authentifié</dt>
@@ -543,7 +605,11 @@ function EnvelopeTechnicalDetails({
         ) : null}
         {envelope.allowed_providers.length > 0 ? (
           <>
-            <dt>Identifiants de fournisseurs autorisés</dt>
+            <dt>
+              {inactive
+                ? "Fournisseurs enregistrés (non actifs)"
+                : "Identifiants de fournisseurs autorisés"}
+            </dt>
             <dd>
               <code>{envelope.allowed_providers.join(", ")}</code>
             </dd>
