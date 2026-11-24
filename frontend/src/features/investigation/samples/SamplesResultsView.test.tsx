@@ -644,6 +644,175 @@ describe("SamplesResultsView", () => {
     );
   });
 
+  it("résout l’association exacte avant les autres associations de même empreinte", async () => {
+    const handler = baseHandler(readyPlan);
+    renderView((request) => {
+      if (request.url.endsWith("/samples")) {
+        return jsonResponse([
+          {
+            ...sampleDetail,
+            id: "assoc-other",
+            origin: "human",
+            qualification: "confirmed",
+          },
+          sampleDetail,
+        ]);
+      }
+      return handler(request);
+    });
+    const user = userEvent.setup();
+    await user.click(
+      await screen.findByRole("tab", { name: "Résultats et analyses" }),
+    );
+    await user.click(
+      screen.getByRole("button", {
+        name: `Ouvrir les résultats pour ${SHA_B}`,
+      }),
+    );
+    const detail = screen.getByRole("region", { name: `Détail de ${SHA_B}` });
+    expect(detail).toHaveTextContent(
+      "Association assoc-1 · origine Pivot VT · Candidat",
+    );
+    expect(detail).not.toHaveTextContent("Association assoc-other");
+    expect(detail).not.toHaveTextContent("Confirmée");
+  });
+
+  it("ne résout pas par hash plusieurs associations quand aucun identifiant n’est fourni", async () => {
+    const handler = baseHandler(readyPlan);
+    renderView((request) => {
+      if (request.url.endsWith("/bootstrap/inventory")) {
+        return jsonResponse({
+          ...inventory,
+          seeds: inventory.seeds.map((ioc) => ({
+            ...ioc,
+            associations: [],
+            quarantined: [
+              {
+                sample_id: "sample-no-association",
+                sha256: SHA_B,
+                state: "quarantined",
+                association_id: null,
+                qualification: "candidate",
+              },
+            ],
+          })),
+        });
+      }
+      if (request.url.endsWith("/samples")) {
+        return jsonResponse([
+          sampleDetail,
+          { ...sampleDetail, id: "assoc-other", qualification: "confirmed" },
+        ]);
+      }
+      return handler(request);
+    });
+    const user = userEvent.setup();
+    await user.click(
+      await screen.findByRole("tab", { name: "Résultats et analyses" }),
+    );
+    await user.click(
+      screen.getByRole("button", {
+        name: `Ouvrir les résultats pour ${SHA_B}`,
+      }),
+    );
+    const detail = screen.getByRole("region", { name: `Détail de ${SHA_B}` });
+    expect(detail).toHaveTextContent(
+      "Association ambiguë — plusieurs associations partagent cette empreinte",
+    );
+    expect(detail).not.toHaveTextContent("Association assoc-1");
+    expect(detail).not.toHaveTextContent("Confirmée");
+  });
+
+  it.each(["rejected", "skipped"] as const)(
+    "ne présente pas une observation %s comme référence canonique",
+    async (importStatus) => {
+      const handler = baseHandler(readyPlan);
+      renderView((request) => {
+        if (request.url.endsWith("/contributions")) {
+          return jsonResponse([
+            {
+              ...contributions[1],
+              category: "observation",
+              import_status: importStatus,
+              sample_association_id: "assoc-1",
+            },
+          ]);
+        }
+        return handler(request);
+      });
+      const user = userEvent.setup();
+      await user.click(
+        await screen.findByRole("tab", { name: "Résultats et analyses" }),
+      );
+      await user.click(
+        screen.getByRole("button", {
+          name: `Ouvrir les résultats pour ${SHA_B}`,
+        }),
+      );
+      const detail = screen.getByRole("region", { name: `Détail de ${SHA_B}` });
+      expect(detail).toHaveTextContent("Observation proposée — non importée");
+      expect(detail).not.toHaveTextContent("Observation — référence canonique");
+    },
+  );
+
+  it("réserve le libellé canonique aux observations effectivement importées", async () => {
+    const handler = baseHandler(readyPlan);
+    renderView((request) => {
+      if (request.url.endsWith("/contributions")) {
+        return jsonResponse([
+          {
+            ...contributions[1],
+            category: "observation",
+            import_status: "imported",
+            observation_id: "observation-1",
+            sample_association_id: "assoc-1",
+          },
+        ]);
+      }
+      return handler(request);
+    });
+    const user = userEvent.setup();
+    await user.click(
+      await screen.findByRole("tab", { name: "Résultats et analyses" }),
+    );
+    await user.click(
+      screen.getByRole("button", {
+        name: `Ouvrir les résultats pour ${SHA_B}`,
+      }),
+    );
+    const detail = screen.getByRole("region", { name: `Détail de ${SHA_B}` });
+    expect(detail).toHaveTextContent("Observation — référence canonique");
+  });
+
+  it("ne présente pas une observation importée sans observation liée comme probante", async () => {
+    const handler = baseHandler(readyPlan);
+    renderView((request) => {
+      if (request.url.endsWith("/contributions")) {
+        return jsonResponse([
+          {
+            ...contributions[1],
+            category: "observation",
+            import_status: "imported",
+            sample_association_id: "assoc-1",
+          },
+        ]);
+      }
+      return handler(request);
+    });
+    const user = userEvent.setup();
+    await user.click(
+      await screen.findByRole("tab", { name: "Résultats et analyses" }),
+    );
+    await user.click(
+      screen.getByRole("button", {
+        name: `Ouvrir les résultats pour ${SHA_B}`,
+      }),
+    );
+    const detail = screen.getByRole("region", { name: `Détail de ${SHA_B}` });
+    expect(detail).toHaveTextContent("Observation importée — non probante");
+    expect(detail).not.toHaveTextContent("Observation — référence canonique");
+  });
+
   it("retrouve disponibilité, analyses, findings et tâches en trois interactions", async () => {
     renderView(baseHandler(readyPlan));
     const user = userEvent.setup();

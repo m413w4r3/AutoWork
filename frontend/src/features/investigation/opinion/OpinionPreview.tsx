@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 
 import {
   AnalystOpinionPreviewError,
+  analystOpinionPreviewPdfUrl,
   fetchAnalystOpinionPreviewPdf,
 } from "../../../api/analystOpinion";
 import type {
@@ -86,7 +87,7 @@ export function OpinionPreview({
       fetchedPdf.opinionSha256 !== opinion.content_sha256 ||
       fetchedPdf.basePublicationSha256 !== basePublicationSha256);
   const staleError = isStalePreviewError(previewQuery.error);
-  const status =
+  const queryStatus =
     pdfIsOutOfDate || staleError
       ? "stale"
       : previewQuery.isError
@@ -94,17 +95,39 @@ export function OpinionPreview({
         : previewQuery.isPending || fetchedPdf === undefined
           ? "generating"
           : "ready";
-  const currentPdf = status === "ready" ? fetchedPdf : undefined;
+  const currentPdf = queryStatus === "ready" ? fetchedPdf : undefined;
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
+  const [objectUrlError, setObjectUrlError] = useState<string | null>(null);
+  const status = objectUrlError === null ? queryStatus : "failed";
+  const previewUrl = analystOpinionPreviewPdfUrl(
+    opinion,
+    basePublicationSha256,
+  );
 
   useEffect(() => {
     if (currentPdf === undefined) {
       setObjectUrl(null);
+      setObjectUrlError(null);
       return;
     }
-    const nextUrl = URL.createObjectURL(currentPdf.blob);
-    setObjectUrl(nextUrl);
-    return () => URL.revokeObjectURL(nextUrl);
+    if (typeof URL.createObjectURL !== "function") {
+      setObjectUrl(null);
+      setObjectUrlError(
+        "Le lecteur PDF intégré n’est pas disponible dans ce navigateur.",
+      );
+      return;
+    }
+    try {
+      const nextUrl = URL.createObjectURL(currentPdf.blob);
+      setObjectUrl(nextUrl);
+      setObjectUrlError(null);
+      return () => URL.revokeObjectURL(nextUrl);
+    } catch {
+      setObjectUrl(null);
+      setObjectUrlError(
+        "Le lecteur PDF intégré n’est pas disponible dans ce navigateur.",
+      );
+    }
   }, [currentPdf]);
 
   return (
@@ -283,18 +306,50 @@ export function OpinionPreview({
         {status === "failed" ? (
           <div className="opinion-pdf-preview__failure">
             <p className="error-message" role="alert">
-              Impossible de charger l’aperçu PDF : {String(previewQuery.error)}
+              {objectUrlError === null
+                ? `Impossible de charger l’aperçu PDF : ${String(previewQuery.error)}`
+                : objectUrlError}
             </p>
-            <button type="button" onClick={() => void previewQuery.refetch()}>
-              Réessayer
-            </button>
+            {objectUrlError === null ? (
+              <button type="button" onClick={() => void previewQuery.refetch()}>
+                Réessayer
+              </button>
+            ) : null}
           </div>
         ) : null}
 
-        {currentPdf !== undefined && objectUrl === null ? (
+        {currentPdf !== undefined &&
+        objectUrl === null &&
+        objectUrlError === null ? (
           <p className="opinion-pdf-preview__loading">
             Préparation du lecteur PDF…
           </p>
+        ) : null}
+
+        {currentPdf !== undefined && objectUrlError !== null ? (
+          <div className="opinion-pdf-preview__fallback" role="status">
+            <p>
+              Le lecteur PDF intégré n’est pas disponible dans ce navigateur.
+              Ouvrez le document ou téléchargez-le pour le consulter.
+            </p>
+            <p className="opinion-pdf-preview__actions">
+              <a
+                className="button button--secondary"
+                href={previewUrl}
+                target="_blank"
+                rel="noreferrer"
+              >
+                Ouvrir le PDF
+              </a>
+              <a
+                className="button button--secondary"
+                href={previewUrl}
+                download="avis-analyste.pdf"
+              >
+                Télécharger
+              </a>
+            </p>
+          </div>
         ) : null}
 
         {currentPdf !== undefined && objectUrl !== null ? (

@@ -80,7 +80,7 @@ function renderPreview(opinion = makeOpinion()) {
 
 async function expectStatus(text: string) {
   await waitFor(() => {
-    expect(screen.getByRole("status")).toHaveTextContent(text);
+    expect(screen.getByText(text, { exact: true })).toBeVisible();
   });
 }
 
@@ -185,6 +185,46 @@ describe("OpinionPreview PDF", () => {
     expect(screen.getByRole("button", { name: "Réessayer" })).toBeVisible();
     expect(screen.queryByTestId("opinion-pdf-viewer")).not.toBeInTheDocument();
     expect(createObjectUrl).not.toHaveBeenCalled();
+  });
+
+  it("falls back with a failed status when createObjectURL is unavailable", async () => {
+    Reflect.deleteProperty(URL, "createObjectURL");
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn<typeof fetch>()
+        .mockResolvedValue(response(PDF_CONTENT, "application/pdf")),
+    );
+
+    renderPreview();
+
+    await expectStatus("Échec de la génération");
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Le lecteur PDF intégré n’est pas disponible",
+    );
+    expect(screen.getByRole("link", { name: "Ouvrir le PDF" })).toBeVisible();
+    expect(screen.getByRole("link", { name: "Télécharger" })).toBeVisible();
+  });
+
+  it("falls back with a failed status when createObjectURL throws", async () => {
+    createObjectUrl.mockImplementation(() => {
+      throw new Error("URL API unavailable");
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn<typeof fetch>()
+        .mockResolvedValue(response(PDF_CONTENT, "application/pdf")),
+    );
+
+    renderPreview();
+
+    await expectStatus("Échec de la génération");
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Le lecteur PDF intégré n’est pas disponible",
+    );
+    expect(screen.getByRole("link", { name: "Ouvrir le PDF" })).toBeVisible();
+    expect(screen.getByRole("link", { name: "Télécharger" })).toBeVisible();
   });
 
   it("rejects an application/pdf response without the %PDF- signature", async () => {
