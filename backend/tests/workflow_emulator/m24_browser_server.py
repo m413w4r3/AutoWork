@@ -65,6 +65,7 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 import httpx
 import uvicorn
 from fastapi import FastAPI
+from pydantic import SecretStr
 from sqlalchemy.engine import make_url
 
 from cti_app.api import main as api_main
@@ -82,6 +83,7 @@ from cti_app.application.bridge_investigator import (
 )
 from cti_app.application.identity import StaticTokenIdentityProvider
 from cti_app.application.instruction_delivery import InstructionDeliveryService
+from cti_app.application.investigation_composition import OptionalInvestigationToolPorts
 from cti_app.application.investigation_jobs import make_investigation_runner
 from cti_app.application.investigation_transfers import (
     TransferUnitOfWork,
@@ -90,6 +92,7 @@ from cti_app.application.investigation_transfers import (
 from cti_app.application.jobs import JobService, create_job_registry
 from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.shodan import ShodanBudgetEstimate, ShodanCapabilities
 from cti_app.application.subject_content import SubjectContentService
 from cti_app.application.subjects import SubjectService
 from cti_app.application.workspace_agent import WorkspaceAgentError, WorkspaceAgentPort
@@ -139,6 +142,7 @@ from tests.acceptance.scenario_support.harness import (
     session_secret,
 )
 from tests.integration.conftest import _alembic_config, _create_database, _drop_database
+from tests.shodan_support import FakeShodanPort
 from tests.workflow_emulator.investigation_support import composition_factory
 
 ATTESTATION_ENV = "M24_REAL_LITE_ATTESTED_FAKE_PROVIDER"
@@ -1057,6 +1061,7 @@ def _install_routes(
     artifact_store: ProductionArtifactStore,
     transport: AutoRespondingBridgeTransport,
     virus_total: AcceptanceVirusTotal,
+    shodan: FakeShodanPort,
     settings: Any,
     session_factory: Any,
     instruction_delivery: InstructionDeliveryService,
@@ -1074,6 +1079,7 @@ def _install_routes(
             "vt_calls": dict(virus_total.calls),
             "vt_download_calls": virus_total.download_calls,
             "vt_downloaded_hashes": list(virus_total.downloaded_hashes),
+            "shodan_calls": list(shodan.calls),
         }
         payload["investigations"] = await _investigation_diagnostics(
             uow_factory, state=state, host_sessions=host_sessions
@@ -1237,7 +1243,15 @@ async def _serve() -> None:
             if shutdown_requested.is_set():
                 return
             material = ScenarioMaterial.synthetic()
-            settings = acceptance_settings(agent)
+            settings = acceptance_settings(agent).model_copy(
+                update={
+                    # A non-functional local test key enables registration of
+                    # the deterministic Shodan fake; the adapter never opens
+                    # an HTTP connection in this browser harness.
+                    "shodan_api_key": SecretStr("m24-synthetic-shodan-key"),
+                    "shodan_search_enabled": True,
+                }
+            )
             patcher.setattr(api_main, "get_settings", lambda: settings)
 
             blob_root = Path(
@@ -1246,12 +1260,18 @@ async def _serve() -> None:
             artifact_store = build_artifact_store(uow_factory, blob_root)
             transport = AutoRespondingBridgeTransport(material=material)
             virus_total = AcceptanceVirusTotal(material)
+            shodan = FakeShodanPort()
             composition = composition_factory(
                 uow_factory=uow_factory,
                 artifact_store=artifact_store,
                 settings=settings,
                 transport=transport,
                 virustotal=virus_total,
+                shodan=shodan,
+                additional_ports=OptionalInvestigationToolPorts(
+                    shodan_capabilities=ShodanCapabilities(search=True),
+                    shodan_budget_estimate=ShodanBudgetEstimate(search=1),
+                ),
                 external_effect_session_factory=session_factory,
             )
             application = create_app()
@@ -1330,6 +1350,7 @@ async def _serve() -> None:
                 artifact_store=artifact_store,
                 transport=transport,
                 virus_total=virus_total,
+                shodan=shodan,
                 settings=settings,
                 session_factory=session_factory,
                 instruction_delivery=instruction_delivery,

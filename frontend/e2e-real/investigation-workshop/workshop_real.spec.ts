@@ -1,6 +1,13 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 import {
@@ -8,11 +15,12 @@ import {
   test,
   type APIRequestContext,
   type APIResponse,
+  type Locator,
   type Page,
 } from "@playwright/test";
 
 /**
- * M24 investigation-workshop real-backend journey, steps 1–24.
+ * M24 investigation-workshop real-backend journey, steps 1–32.
  *
  * These specs run against the launcher in
  * `backend/tests/workflow_emulator/m24_browser_server.py`: a throwaway
@@ -28,10 +36,9 @@ import {
  * the backend process and signs the exact D7 message there; the secret never
  * reaches this spec, the browser, a trace or a log.
  *
- * Steps 12–24 (workspace note, instruction delivery/ack, host-signed result,
- * Claude transfer, task consultation, canonical anchors, note proposals,
- * corrections, stale refusal, real Typst PDF) and the G2 extend/revoke
- * lifecycle run after the F7a steps 1–11.
+ * The journey covers overview, workspace, the searchable task list, fake VT,
+ * fake Bridge/Codex/Claude, instruction delivery, canonical article anchors,
+ * M23/IOC/code references, real Typst output and G2 revocation.
  */
 
 interface BrowserMaterial {
@@ -64,6 +71,7 @@ interface Fixtures {
   vt_calls: Record<string, number>;
   vt_download_calls: number;
   vt_downloaded_hashes: string[];
+  shodan_calls: Array<[string, unknown[]]>;
 }
 
 interface InstructionDiagnostic {
@@ -240,6 +248,10 @@ interface InventoryResponse {
 
 interface SnapshotIoc {
   value: string;
+  operations: Array<{
+    status: string;
+    error_code: string | null;
+  }>;
   download: {
     status: string;
     hash_verified_quarantine: boolean;
@@ -450,9 +462,12 @@ const LOADER_TITLE = "Verifier le chargeur synthetique";
 const INFRA_TITLE = "Verifier l'infrastructure synthetique";
 
 const NOTE_TEXT =
-  "NOTE-HUMAINE-PARCOURS: observation locale synthetique ecrite dans le workspace.";
+  "NOTE-HUMAINE-PARCOURS: première observation locale synthétique.";
+const NOTE_EDITED_TEXT =
+  "NOTE-HUMAINE-PARCOURS: version éditée dans le workspace avant transmission à Codex.";
+const NOTE_PATH = "notes/humaines/m24-e4-note.md";
 const INSTRUCTION_TEXT =
-  "INSTRUCTION-PARCOURS: verifie le second echantillon puis rapporte les octets.";
+  "INSTRUCTION-PARCOURS: relis la note locale éditée, vérifie le second échantillon puis rapporte les octets.";
 const CONSULTATION_QUESTION =
   "Critique technique synthetique: les octets observes soutiennent-ils la piste chargeur ?";
 const NOTE_A_ANCHOR = "section:1:paragraph:0002";
@@ -463,7 +478,7 @@ const ARTICLE_FIGURE_KEY = "d2-article-b-figure";
 const REPO_ROOT = resolve(process.cwd(), "..");
 const CAPTURES_DIR =
   process.env.M24_REAL_CAPTURE_DIR ??
-  join(REPO_ROOT, "docs", "m24", "captures-m24-1");
+  join(REPO_ROOT, "docs", "m24", "captures-m24-2");
 const SCREENSHOT_SIZES = [
   [1280, 800],
   [1440, 900],
@@ -655,16 +670,61 @@ function taskCard(page: Page, title: string) {
     .filter({ has: page.getByRole("heading", { name: title, exact: true }) });
 }
 
-async function capture(page: Page, name: string): Promise<void> {
+async function capture(
+  page: Page,
+  name: string,
+  target?: Locator,
+): Promise<void> {
   mkdirSync(CAPTURES_DIR, { recursive: true });
   for (const [width, height] of SCREENSHOT_SIZES) {
     await page.setViewportSize({ width, height });
-    await page.waitForTimeout(150);
+    if (target !== undefined) {
+      await expect(target).toBeVisible();
+      await target.scrollIntoViewIfNeeded();
+    }
+    await page.waitForTimeout(100);
     await page.screenshot({
       path: join(CAPTURES_DIR, `${name}-${width}x${height}.png`),
       fullPage: false,
     });
   }
+}
+
+async function refreshWorkspace(page: Page): Promise<void> {
+  await page.getByRole("button", { name: "Actualiser" }).click();
+  await expect(page.getByRole("button", { name: "Actualiser" })).toBeEnabled();
+  await expect(page.getByText(/Actualisation en cours/)).toHaveCount(0);
+  await expect(page.getByText(/Synchronisation terminée/)).toBeVisible();
+}
+
+async function assertCockpitResponsive(page: Page): Promise<void> {
+  const cockpit = page.getByRole("region", { name: "Cockpit d’enquête" });
+  await page.setViewportSize({ width: 1280, height: 800 });
+  const viewport = await page.locator("html").evaluate((element) => {
+    const root = element as unknown as {
+      clientWidth: number;
+      scrollWidth: number;
+    };
+    return { clientWidth: root.clientWidth, scrollWidth: root.scrollWidth };
+  });
+  expect(
+    viewport.scrollWidth,
+    "the investigation page must not overflow horizontally at 1280 px",
+  ).toBeLessThanOrEqual(viewport.clientWidth);
+
+  await page.setViewportSize({ width: 1920, height: 1080 });
+  await expect(cockpit).toBeVisible();
+  const cockpitWidth = await cockpit.evaluate((element) => {
+    const measurable = element as unknown as {
+      getBoundingClientRect: () => { width: number };
+    };
+    return measurable.getBoundingClientRect().width;
+  });
+  expect(
+    cockpitWidth,
+    "the investigation cockpit must use at least 1600 px at 1920 px",
+  ).toBeGreaterThanOrEqual(1600);
+  await page.setViewportSize({ width: 1440, height: 900 });
 }
 
 function pdftotext(path: string): string {
@@ -691,7 +751,7 @@ test.beforeEach(() => {
   requireRealBackendLite();
 });
 
-test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2", async ({
+test("parcours atelier M24 étapes 1–32 : workspace, tâches, Notes, PDF, G2", async ({
   page,
   request,
 }, testInfo) => {
@@ -705,6 +765,7 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
   // synthetic operator token: only the Vite proxy adds it upstream.
   const offLoopbackRequests: string[] = [];
   const browserAuthorizationHeaders: string[] = [];
+  const contributionApiStatuses: number[] = [];
   page.on("request", (browserRequest) => {
     const url = new URL(browserRequest.url());
     if (url.protocol !== "http:" && url.protocol !== "https:") return;
@@ -714,6 +775,12 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
     const authorization = browserRequest.headers()["authorization"];
     if (authorization !== undefined) {
       browserAuthorizationHeaders.push(authorization);
+    }
+  });
+  page.on("response", (response) => {
+    const url = new URL(response.url());
+    if (url.pathname.endsWith("/contributions")) {
+      contributionApiStatuses.push(response.status());
     }
   });
 
@@ -764,6 +831,25 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
   await expect(
     page.getByRole("region", { name: "Vue d’ensemble de l’enquête" }),
   ).toBeVisible();
+  const overview = page.getByRole("region", {
+    name: "Vue d’ensemble de l’enquête",
+  });
+  const overviewMetrics = overview.getByRole("region", {
+    name: "Indicateurs de l’enquête",
+  });
+  for (const label of [
+    "Décisions requises",
+    "Agents en cours",
+    "Tâches actives",
+    "Résultats nouveaux",
+  ]) {
+    await expect(
+      overviewMetrics.getByText(label, { exact: true }),
+    ).toBeVisible();
+  }
+  await expect(
+    overview.getByRole("heading", { name: "À traiter maintenant" }),
+  ).toBeVisible();
   const agentStatus = await getJson<{ status: string }>(
     page,
     "/api/workspace-agent/status",
@@ -804,9 +890,22 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
       sha256File(join(workspace.workspace_root, "base_samples", digest)),
     ).toBe(digest);
   }
-  await capture(page, "cockpit-overview");
 
-  // Step 4 — IOC inventory: the seeds are the five synthetic hashes, two
+  // Step 4 — open the real workspace view and prove its local write actions
+  // are available before asking a human to approve external access.
+  await page.getByRole("tab", { name: "Workspace et notes" }).click();
+  const workspaceView = page.locator(".workspace-notes");
+  await expect(workspaceView).toBeVisible();
+  await expect(
+    workspaceView.getByRole("button", { name: "Nouvelle note" }),
+  ).toBeEnabled();
+  await expect(
+    workspaceView.getByText("Fichier local ≠ preuve canonique"),
+  ).toBeVisible();
+  await page.getByRole("tab", { name: "Vue d’ensemble" }).click();
+  await assertCockpitResponsive(page);
+
+  // Supporting inventory check: the seeds are the five synthetic hashes, two
   // domains and two documentation IPs; nothing was discovered yet.
   const inventory = await getJson<InventoryResponse>(
     page,
@@ -940,10 +1039,21 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
   await page
     .getByRole("button", { name: "Accepter le plan et créer les tâches" })
     .click();
-  await page.getByRole("button", { name: new RegExp(LOADER_TITLE) }).click();
   await expect(
-    page.getByRole("heading", { name: LOADER_TITLE, exact: true }),
+    page.getByRole("status").filter({ hasText: "Plan accepté" }),
   ).toBeVisible();
+  await expect
+    .poll(
+      async () =>
+        (
+          await getJson<TaskPage>(
+            page,
+            `/api/investigations/${investigation.id}/tasks`,
+          )
+        ).total,
+      { message: "plan acceptance must materialise both tasks" },
+    )
+    .toBe(2);
   const tasks = await getJson<TaskPage>(
     page,
     `/api/investigations/${investigation.id}/tasks`,
@@ -958,11 +1068,124 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
     "plan_accept",
   );
 
-  // Step 9 — assign the loader task to a Codex operator: this is handoff v1,
-  // no agent starts yet.
-  const loader = tasks.items.find((task) => task.title === LOADER_TITLE);
+  // Step 9 — add 30 root tasks through the real human API route. The
+  // synthetic data exercises the searchable task list without bypassing its
+  // normal task contract or creating nested children.
+  const syntheticTaskTitles = Array.from(
+    { length: 30 },
+    (_unused, index) =>
+      `UX-06 — tâche synthétique ${String(index + 1).padStart(2, "0")}`,
+  );
+  for (const [index, title] of syntheticTaskTitles.entries()) {
+    const response = await page.request.post(
+      `/api/investigations/${investigation.id}/tasks`,
+      {
+        headers: { "Idempotency-Key": `m24-e4-ux06-task-${index + 1}` },
+        data: {
+          task_key: `m24-e4-ux06-${String(index + 1).padStart(2, "0")}`,
+          title,
+          question: `Question synthétique ${index + 1}`,
+          objective: `Objectif synthétique ${index + 1}`,
+        },
+      },
+    );
+    expect(
+      response.status(),
+      `the harness API must create synthetic task ${index + 1}`,
+    ).toBe(200);
+  }
+  await page.reload();
+  await page
+    .getByRole("button", { name: "Enquête / Avis de l’analyste" })
+    .click();
+  await expect(
+    page.getByRole("region", { name: "Cockpit d’enquête" }),
+  ).toBeVisible();
+  const taskList = page.getByRole("list", { name: "Liste des tâches" });
+  const taskWorkspace = page.getByRole("region", {
+    name: "Poste de travail des tâches",
+  });
+  await expect(taskList.getByRole("button")).toHaveCount(32);
+  const allTasks = await getJson<TaskPage>(
+    page,
+    `/api/investigations/${investigation.id}/tasks`,
+  );
+  expect(allTasks.total).toBe(32);
+  const loader = allTasks.items.find((task) => task.title === LOADER_TITLE);
   if (loader === undefined) throw new Error("the loader task is missing");
+  const distantTaskTitle = syntheticTaskTitles.at(-1);
+  if (distantTaskTitle === undefined) {
+    throw new Error("the UX-06 synthetic task list is empty");
+  }
+  const distantTask = allTasks.items.find(
+    (task) => task.title === distantTaskTitle,
+  );
+  if (distantTask === undefined) {
+    throw new Error("the distant UX-06 task was not created");
+  }
   const loaderCard = taskCard(page, LOADER_TITLE);
+  await taskList
+    .getByRole("button", { name: new RegExp(LOADER_TITLE) })
+    .click();
+  await expect(
+    taskList.getByRole("button", { name: new RegExp(LOADER_TITLE) }),
+  ).toHaveAttribute("aria-pressed", "true");
+  expect(new URL(page.url()).searchParams.get("task")).toBe(loader.id);
+  await capture(page, "plan-task-list-30", taskList);
+  await assertCockpitResponsive(page);
+
+  // Step 10 — search selects an old, distant row without scrolling through
+  // the cards; refresh restores it, and browser Back restores the prior task.
+  const distantTaskButton = taskList.getByRole("button", {
+    name: new RegExp(distantTaskTitle),
+  });
+  await expect(distantTaskButton).not.toBeInViewport();
+  const initialScrollY = await page.evaluate(
+    () => (globalThis as unknown as { scrollY: number }).scrollY,
+  );
+  await taskWorkspace
+    .getByRole("searchbox", { name: "Recherche" })
+    .fill(distantTaskTitle);
+  await expect(
+    taskWorkspace.getByText("1 tâche(s) affichée(s) sur 32."),
+  ).toBeVisible();
+  await expect(distantTaskButton).toBeVisible();
+  expect(
+    await page.evaluate(
+      () => (globalThis as unknown as { scrollY: number }).scrollY,
+    ),
+  ).toBe(initialScrollY);
+  await distantTaskButton.click();
+  await expect(distantTaskButton).toHaveAttribute("aria-pressed", "true");
+  expect(new URL(page.url()).searchParams.get("task")).toBe(distantTask.id);
+  await page.reload();
+  await page
+    .getByRole("button", { name: "Enquête / Avis de l’analyste" })
+    .click();
+  await expect(
+    page.getByRole("region", { name: "Cockpit d’enquête" }),
+  ).toBeVisible();
+  const restoredTaskList = page.getByRole("list", {
+    name: "Liste des tâches",
+  });
+  await expect(
+    restoredTaskList.getByRole("button", {
+      name: new RegExp(distantTaskTitle),
+    }),
+  ).toHaveAttribute("aria-pressed", "true");
+  expect(new URL(page.url()).searchParams.get("task")).toBe(distantTask.id);
+  await page.goBack();
+  await expect
+    .poll(() => new URL(page.url()).searchParams.get("task"))
+    .toBe(loader.id);
+  await expect(
+    page
+      .getByRole("list", { name: "Liste des tâches" })
+      .getByRole("button", { name: new RegExp(`^${LOADER_TITLE},`) }),
+  ).toHaveAttribute("aria-pressed", "true");
+
+  // Step 11 — assign the loader task to a Codex operator: this is handoff v1,
+  // no agent starts yet.
   await loaderCard.getByRole("button", { name: "Attribuer à Codex" }).click();
   await expect(
     loaderCard.getByText(/Passation v1 créée pour Codex CLI/),
@@ -982,7 +1205,7 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
   expect(afterTransfer.handoffs[0]?.version).toBe(1);
   expect(afterTransfer.handoffs[0]?.task_id).toBe(loader.id);
 
-  // Step 10 — the explicit session opening uses the real capability probe and
+  // Step 12 — the explicit session opening uses the real capability probe and
   // the real sidecar; the fake CLI stays running under the acquired lease.
   await loaderCard.getByRole("tab", { name: "Agent et messages" }).click();
   const openSession = loaderCard.getByRole("button", {
@@ -1011,7 +1234,7 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
   expect(afterSession.sessions[0]?.id).toBe(session.id);
   expect(afterSession.sessions[0]?.task_lease_fence).toBe(1);
 
-  // Step 11 — progress is visible: the operator panel lists the session and
+  // Step 12 — progress is visible: the operator panel lists the session and
   // its journal-derived summary, and the real POD drain control is reachable.
   await expect(
     page.getByRole("heading", { name: "Contexte agent de la tâche" }),
@@ -1032,6 +1255,7 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
   ] as const) {
     expect(summary[key], `the session summary exposes ${key}`).toBeDefined();
   }
+  await capture(page, "task-detail-codex", loaderCard);
   const drainResponse = await controlPost(
     request,
     state,
@@ -1042,32 +1266,33 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
     drained: true,
   });
 
-  // Step 12 — write a human note from the task card. The write goes through
-  // the host workspace route, which writes the file and reports its revision;
-  // the workspace index only learns about it through the sync in step 13.
-  await loaderCard.getByRole("button", { name: "Ajouter une note" }).click();
-  await loaderCard.getByLabel("Note (Markdown, non probante)").fill(NOTE_TEXT);
-  await loaderCard.getByRole("button", { name: "Enregistrer la note" }).click();
-  const noteMessage = loaderCard.getByText(/Note enregistrée dans /);
-  await expect(noteMessage).toBeVisible();
-  const noteMessageText = ((await noteMessage.textContent()) ?? "").trim();
-  const notePath = noteMessageText.match(/^Note enregistrée dans (.+)\.$/)?.[1];
-  if (notePath === undefined) {
-    throw new Error(`the note path is unreadable: ${noteMessageText}`);
-  }
-  const diskNotePath = join(workspace.workspace_root, notePath);
+  // Step 13 — confirm the fake Codex run has returned successfully. Canonical
+  // result submission stays after instruction delivery so the active task
+  // lease remains valid for that real transition.
+  await expect
+    .poll(
+      async () =>
+        (await firstInvestigation(page)).sessions[0]?.host?.exit?.code,
+    )
+    .toBe(0);
+
+  // Step 14 — create then edit a non-probative human note in the local
+  // workspace. The edit uses the workspace UI's revision-aware write action.
+  await page.getByRole("tab", { name: "Workspace et notes" }).click();
+  await page.getByRole("button", { name: "Nouvelle note" }).click();
+  await page.getByLabel("Chemin de la note").fill(NOTE_PATH);
+  await page.getByLabel("Contenu Markdown").fill(NOTE_TEXT);
+  await page.getByRole("button", { name: "Enregistrer la note" }).click();
+  await expect(
+    page.getByRole("status").filter({ hasText: "Note enregistrée" }),
+  ).toBeVisible();
+  const diskNotePath = join(workspace.workspace_root, NOTE_PATH);
   expect(statSync(diskNotePath).isFile()).toBe(true);
   expect(readFileSync(diskNotePath, "utf-8")).toContain(NOTE_TEXT);
-  const noteSha = sha256File(diskNotePath);
-  await capture(page, "task-card");
+  const initialNoteSha = sha256File(diskNotePath);
 
-  // Step 13 — synchronise the workspace: the host watcher has its stability
-  // window, then the real sync route ingests the revision and the API lists
-  // the note. The note view states it is not evidence.
-  await page.getByRole("tab", { name: "Workspace et notes" }).click();
   await page.waitForTimeout(1_200);
-  await page.getByRole("button", { name: "Actualiser" }).click();
-  await expect(page.getByText(/Synchronisation terminée/)).toBeVisible();
+  await refreshWorkspace(page);
   await expect
     .poll(
       async () =>
@@ -1076,7 +1301,7 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
             page,
             `/api/investigations/${investigation.id}/workspace/files?prefix=notes/humaines`,
           )
-        ).files.some((file) => file.path === notePath),
+        ).files.some((file) => file.path === NOTE_PATH),
       { message: "the synced note appears through the API", timeout: 20_000 },
     )
     .toBe(true);
@@ -1085,33 +1310,58 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
     `/api/investigations/${investigation.id}/workspace/files?prefix=notes/humaines`,
   );
   expect(filesAfterNote.workspace_available).toBe(true);
-  const noteFile = filesAfterNote.files.find((file) => file.path === notePath);
+  const noteFile = filesAfterNote.files.find((file) => file.path === NOTE_PATH);
   expect(noteFile, "the synced note must be listed").toBeDefined();
-  expect(noteFile?.sha256).toBe(noteSha);
+  expect(noteFile?.sha256).toBe(initialNoteSha);
   expect(["ui", "filesystem"]).toContain(noteFile?.origin);
-  await page.getByRole("button", { name: "notes/humaines" }).click();
-  const noteButton = page
-    .locator("button.workspace-notes__file-button")
-    .filter({ hasText: notePath.split("/").at(-1) ?? notePath });
+  const noteButton = workspaceView.getByRole("button", {
+    name: /Note humaine/,
+  });
   await expect(noteButton).toBeVisible();
   await noteButton.click();
-  await expect(
-    page.getByRole("heading", { name: notePath.split("/").at(-1) ?? notePath }),
-  ).toBeVisible();
+  const noteFilename = NOTE_PATH.split("/").at(-1) ?? NOTE_PATH;
+  await expect(page.getByRole("heading", { name: noteFilename })).toBeVisible();
   await expect(
     page.locator("pre.workspace-notes__content").filter({ hasText: NOTE_TEXT }),
   ).toBeVisible();
+  await page.getByRole("button", { name: "Éditer" }).click();
+  await page.getByLabel("Contenu Markdown").fill(NOTE_EDITED_TEXT);
+  await page.getByRole("button", { name: "Enregistrer", exact: true }).click();
+  await expect(
+    page.getByRole("status").filter({ hasText: "Note enregistrée" }),
+  ).toBeVisible();
+  expect(readFileSync(diskNotePath, "utf-8")).toContain(NOTE_EDITED_TEXT);
+  const noteSha = sha256File(diskNotePath);
+  await page.waitForTimeout(1_200);
+  await refreshWorkspace(page);
+  const filesAfterEdit = await getJson<WorkspaceFileListApi>(
+    page,
+    `/api/investigations/${investigation.id}/workspace/files?prefix=notes/humaines`,
+  );
+  expect(
+    filesAfterEdit.files.find((file) => file.path === NOTE_PATH)?.sha256,
+  ).toBe(noteSha);
+  await noteButton.click();
+  await expect(
+    page
+      .locator("pre.workspace-notes__content")
+      .filter({ hasText: NOTE_EDITED_TEXT }),
+  ).toBeVisible();
   const noteView = await getJson<WorkspaceNoteViewApi>(
     page,
-    `/api/investigations/${investigation.id}/workspace/notes/${notePath}/view`,
+    `/api/investigations/${investigation.id}/workspace/notes/${NOTE_PATH}/view`,
   );
-  expect(noteView.path).toBe(notePath);
+  expect(noteView.path).toBe(NOTE_PATH);
   expect(noteView.is_evidence).toBe(false);
   expect(noteView.latest.sha256).toBe(noteSha);
-  await capture(page, "workspace-notes");
+  await capture(
+    page,
+    "workspace-note-open",
+    page.getByRole("heading", { name: noteFilename }),
+  );
 
-  // Step 14 — enqueue one human instruction from the operators panel. The
-  // agent is busy, so the persisted row stays queued (no volatile queue).
+  // Step 15 — send the edited workspace note to Codex through a persistent
+  // human instruction. While the fake CLI is busy, the row remains queued.
   await page.getByRole("tab", { name: "Plan et tâches" }).click();
   await loaderCard.getByRole("tab", { name: "Agent et messages" }).click();
   const operatorRow = page
@@ -1126,6 +1376,12 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
   await expect(
     operatorRow.getByText(/Instruction en file persistante/),
   ).toBeVisible();
+  await expect(
+    operatorRow
+      .getByRole("region", { name: "Instructions" })
+      .getByText("En file", { exact: true }),
+  ).toBeVisible();
+  await capture(page, "instruction-en-file", operatorRow);
   const instructionSha = sha256Text(INSTRUCTION_TEXT);
   await expect
     .poll(
@@ -1137,7 +1393,7 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
     )
     .toEqual([`queued:${instructionSha}`]);
 
-  // Step 15 — effective delivery: the host's clean run end is the receive
+  // Step 16 — effective delivery: the host's clean run end is the receive
   // point; one real drain tick delivers the instruction, and the operator's
   // signed acknowledgement moves it to `acknowledged`.
   await expect
@@ -1183,6 +1439,27 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
       { message: "the instruction must be delivered", timeout: 30_000 },
     )
     .toBe("delivered");
+  await page.reload();
+  await page
+    .getByRole("button", { name: "Enquête / Avis de l’analyste" })
+    .click();
+  await expect(
+    page.getByRole("region", { name: "Cockpit d’enquête" }),
+  ).toBeVisible();
+  const deliveredLoaderCard = taskCard(page, LOADER_TITLE);
+  await deliveredLoaderCard
+    .getByRole("tab", { name: "Agent et messages" })
+    .click();
+  const deliveredOperatorRow = page
+    .locator("li.m24-operator")
+    .filter({ hasText: "Codex CLI" })
+    .filter({ hasText: LOADER_TITLE });
+  await expect(
+    deliveredOperatorRow
+      .getByRole("region", { name: "Instructions" })
+      .getByText("Transmise", { exact: true }),
+  ).toBeVisible();
+  await capture(page, "instruction-transmise", deliveredOperatorRow);
   const deliveredInstruction = (await firstInvestigation(page)).sessions
     .find((item) => item.id === session.id)
     ?.instructions.find((item) => item.text_sha256 === instructionSha);
@@ -1219,10 +1496,85 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
   );
   expect(summaryAfterAck.instructions.items[0]?.state).toBe("acknowledged");
   expect(summaryAfterAck.instructions.items[0]?.text).toBe(INSTRUCTION_TEXT);
-  // The human sees the journal-derived state after a fresh mount of the panel.
-  await page.getByRole("tab", { name: "Vue d’ensemble" }).click();
+
+  // The fake Codex session publishes one agent-owned note and imports that
+  // exact workspace revision through the signed contribution tool. This is
+  // the real D7 broker path: the host derives the task, actor and lease fence.
+  const agentNote = await signedSessionAction(request, state, {
+    kind: "tool_call",
+    session_id: session.id,
+    investigation_id: investigation.id,
+    tool_name: "note.capture",
+    schema_version: "1",
+    arguments: {
+      target: "note",
+      relpath: "m24-e4-contribution.md",
+      text: "# Finding de travail synthétique\n\nRésultat local du faux Codex, non probant.",
+      expected_sha256: "new",
+    },
+    idempotency_key: "m24-browser-codex-note-capture",
+  });
+  expect(agentNote.status_code, JSON.stringify(agentNote.body)).toBe(200);
+  const agentNotePayload = agentNote.body as {
+    status: string;
+    output: { path: string; revision_id: string; evidence: boolean };
+  };
+  expect(agentNotePayload.status).toBe("captured");
+  expect(agentNotePayload.output.path).toBe(
+    `notes/agents/${loader.id}/m24-e4-contribution.md`,
+  );
+  expect(agentNotePayload.output.evidence).toBe(false);
+  await page.getByRole("tab", { name: "Workspace et notes" }).click();
+  await refreshWorkspace(page);
+  const capturedFiles = await getJson<WorkspaceFileListApi>(
+    page,
+    `/api/investigations/${investigation.id}/workspace/files?prefix=notes/agents/${loader.id}`,
+  );
+  const capturedRevision = capturedFiles.files.find(
+    (file) => file.path === agentNotePayload.output.path,
+  );
+  expect(capturedRevision?.revision_id).toBe(
+    agentNotePayload.output.revision_id,
+  );
   await page.getByRole("tab", { name: "Plan et tâches" }).click();
-  await loaderCard.getByRole("tab", { name: "Agent et messages" }).click();
+  await expect(taskCard(page, LOADER_TITLE)).toBeVisible();
+
+  const importedAgentNote = await signedSessionAction(request, state, {
+    kind: "tool_call",
+    session_id: session.id,
+    investigation_id: investigation.id,
+    tool_name: "contribution.import",
+    schema_version: "1",
+    arguments: {
+      workspace_id: workspace.workspace_id,
+      workspace_revision_id: agentNotePayload.output.revision_id,
+      category: "work_contribution",
+    },
+    idempotency_key: "m24-browser-codex-contribution-import",
+  });
+  expect(
+    importedAgentNote.status_code,
+    JSON.stringify(importedAgentNote.body),
+  ).toBe(200);
+  const importedAgentNotePayload = importedAgentNote.body as {
+    status: string;
+    output: { category: string; import_status: string; task_id: string };
+  };
+  expect(importedAgentNotePayload.status).toBe("imported");
+  expect(importedAgentNotePayload.output.category).toBe("work_contribution");
+  expect(importedAgentNotePayload.output.import_status).toBe("imported");
+  expect(importedAgentNotePayload.output.task_id).toBe(loader.id);
+
+  // The human sees the journal-derived state after a fresh browser load.
+  await page.reload();
+  await page
+    .getByRole("button", { name: "Enquête / Avis de l’analyste" })
+    .click();
+  await expect(
+    page.getByRole("region", { name: "Cockpit d’enquête" }),
+  ).toBeVisible();
+  const ackedLoaderCard = taskCard(page, LOADER_TITLE);
+  await ackedLoaderCard.getByRole("tab", { name: "Agent et messages" }).click();
   const refreshedOperatorRow = page
     .locator("li.m24-operator")
     .filter({ hasText: "Codex CLI" })
@@ -1232,10 +1584,10 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
       .getByRole("region", { name: "Instructions" })
       .getByText("Acquittée", { exact: true }),
   ).toBeVisible();
-  await capture(page, "operators-panel");
+  await capture(page, "instruction-acquittee", refreshedOperatorRow);
 
-  // Step 16 — the host submits its result through the signed D7 tool route;
-  // the human then accepts the result, which is the only canonical write.
+  // Complete step 13 — submit and human-review the fake Codex result through
+  // the signed D7 route after instruction acknowledgement preserves the lease.
   const beforeSubmit = await firstInvestigation(page);
   const loaderBeforeSubmit = beforeSubmit.tasks.find(
     (task) => task.id === loader.id,
@@ -1280,6 +1632,21 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
   expect(loaderSubmitted?.result_verification_status).toBe("pending_review");
   expect(loaderSubmitted?.result_refs).toHaveLength(1);
   await page.getByRole("tab", { name: "Vue d’ensemble" }).click();
+  await expect(
+    overview.getByRole("heading", { name: "À traiter maintenant" }),
+  ).toBeVisible();
+  await expect(overview.getByText(LOADER_TITLE)).toBeVisible();
+  await expect(
+    overview.getByRole("heading", { name: "Inventaire IOC", exact: true }),
+  ).toBeVisible();
+  await expect(
+    overview.getByRole("heading", { name: "Snapshot bootstrap", exact: true }),
+  ).toBeVisible();
+  await capture(
+    page,
+    "overview-decision-pending",
+    overview.getByRole("heading").first(),
+  );
   await page.getByRole("tab", { name: "Plan et tâches" }).click();
   const submittedLoaderCard = taskCard(page, LOADER_TITLE);
   await submittedLoaderCard
@@ -1299,6 +1666,7 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
   expect(completedLoader?.status).toBe("completed");
   expect(completedLoader?.result_verification_status).toBe("accepted");
   expect(afterAcceptResult.decision_types).toContain("task_result_accept");
+  expect(afterAcceptResult.contributions.length).toBeGreaterThan(0);
 
   // Step 17 — transfer the other task to Claude Code: Codex assignment is
   // handoff v1, the transfer is handoff v2, and the explicit probe action
@@ -1337,6 +1705,8 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
     infraCard.getByText(/session ouverte ; la tâche passe en cours/),
   ).toBeVisible();
   const afterClaudeOpen = await firstInvestigation(page);
+  // Step 18 — verify the persisted handoff versions and selected Claude
+  // session before reading the resulting contribution in the overview.
   const infraHandoffs = afterClaudeOpen.handoffs
     .filter((handoff) => handoff.task_id === infra.id)
     .map((handoff) => handoff.version)
@@ -1354,9 +1724,67 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
     (task) => task.id === infra.id,
   );
   expect(infraRunning?.status).toBe("running");
-  await capture(page, "task-card-claude");
+  await capture(page, "task-detail-claude", infraCard);
 
-  // Step 18 — ask Bridge from the task card (critique). The consultation is
+  // Step 19 — read the accepted task result and the workspace contribution
+  // from a fresh overview projection while the Claude task remains active.
+  // The contribution was imported through the signed fake-agent route, so a
+  // reload forces the browser query cache to read the persisted row.
+  const contributionResponsesBeforeReload = contributionApiStatuses.length;
+  await page.reload();
+  await page
+    .getByRole("button", { name: "Enquête / Avis de l’analyste" })
+    .click();
+  await expect(
+    page.getByRole("region", { name: "Cockpit d’enquête" }),
+  ).toBeVisible();
+  await expect(
+    page
+      .getByRole("list", { name: "Liste des tâches" })
+      .getByRole("button", { name: new RegExp(`^${INFRA_TITLE},`) }),
+  ).toHaveAttribute("aria-pressed", "true");
+  await page.getByRole("tab", { name: "Vue d’ensemble" }).click();
+  await expect
+    .poll(() => contributionApiStatuses.length)
+    .toBeGreaterThan(contributionResponsesBeforeReload);
+  expect(contributionApiStatuses.at(-1)).toBe(200);
+  const activeTaskMetric = overview
+    .locator(".workshop-overview-metrics__tile")
+    .filter({ hasText: "Tâches actives" });
+  const activeTaskCount = Number(
+    await activeTaskMetric.locator("dd").textContent(),
+  );
+  expect(activeTaskCount).toBeGreaterThan(0);
+  await expect(
+    overview.getByRole("heading", { name: "Résultats nouveaux" }),
+  ).toBeVisible();
+  const resultProjection = overview.locator(
+    '[aria-labelledby="overview-new-results-heading"]',
+  );
+  const persistedContributions = await getJson<
+    Array<{ category: string; origin: string; task_id: string | null }>
+  >(page, `/api/investigations/${investigation.id}/contributions`);
+  expect(
+    persistedContributions.some(
+      (contribution) =>
+        contribution.category === "work_contribution" &&
+        contribution.origin === "agent" &&
+        contribution.task_id === loader.id,
+    ),
+  ).toBe(true);
+  await expect(resultProjection).toContainText(
+    /Contribution de travail|Observation|Finding/,
+  );
+  await expect(
+    overview.getByRole("heading", { name: "Inventaire IOC", exact: true }),
+  ).toBeVisible();
+  await expect(
+    overview.getByRole("heading", { name: "Snapshot bootstrap", exact: true }),
+  ).toBeVisible();
+  await capture(page, "overview-active", overview.getByRole("heading").first());
+  await page.getByRole("tab", { name: "Plan et tâches" }).click();
+
+  // Step 20 — ask Bridge from the task card (critique). The consultation is
   // consultative: the displayed state goes from sent to received, and no task
   // status, result or decision changes.
   const beforeConsultation = await firstInvestigation(page);
@@ -1364,6 +1792,7 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
     (task) => task.id === infra.id,
   );
   const decisionCountBefore = beforeConsultation.decision_count;
+  await infraCard.getByRole("tab", { name: "Agent et messages" }).click();
   await infraCard.getByRole("button", { name: "Demander à Bridge" }).click();
   await infraCard.getByLabel("Type de demande").selectOption("critique");
   await infraCard
@@ -1414,7 +1843,8 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
   ).toBeDefined();
   expect(consultationInvocation?.status).toBe("succeeded");
 
-  // Step 19 — drafting starts from the Note view with the task pre-filled by
+  // Step 21 — open the article reader from the task-scoped Note view.
+  // The task card link also keeps the selected task in the cockpit URL.
   // the task-card link (`?vue=opinion&task_id=…&bridge_intent=draft_text`).
   await infraCard
     .getByRole("link", { name: "Rédiger une Note avec Bridge" })
@@ -1424,13 +1854,19 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
   ).toBeVisible();
   const url = new URL(page.url());
   expect(url.searchParams.get("vue")).toBe("opinion");
+  expect(url.searchParams.get("task")).toBe(infra.id);
   expect(url.searchParams.get("task_id")).toBe(infra.id);
   expect(url.searchParams.get("bridge_intent")).toBe("draft_text");
   await expect(page.locator("#opinion-note-task")).toHaveValue(infra.id, {
     timeout: 15_000,
   });
 
-  // Step 20 — read the canonical article and select the two identical
+  // Step 22 — visually select the canonical article's duplicate paragraphs;
+  // the manual anchor field stays folded.
+  await expect(page.locator(".article-reading:visible")).toHaveCount(1);
+  const articleReader = page.locator(".article-reading:visible");
+  await expect(articleReader.getByRole("heading", { level: 3 })).toBeVisible();
+  // Read the canonical article and select the two identical
   // paragraphs through the reader. The manual anchor field stays folded.
   const catalog = await getJson<ArticleAnchorCatalogApi>(
     page,
@@ -1464,8 +1900,6 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
       hasText: "M23-D2-ARTICLE-FIGURE-UNIQUE",
     }),
   ).toBeVisible();
-  const articleReader = page.locator(".article-reading:visible");
-  await expect(articleReader).toHaveCount(1);
   const baseLine = articleReader.getByText(
     new RegExp(
       `Base de publication · v${catalog.base_publication_version} · SHA-256`,
@@ -1473,9 +1907,9 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
   );
   await expect(baseLine).toBeVisible();
   expect(catalog.base_publication_sha256).toBe(state.publication_sha256);
-  await expect(
-    articleReader.getByText(catalog.base_publication_sha256.slice(0, 12)),
-  ).toBeVisible();
+  expect(await baseLine.textContent()).toContain(
+    catalog.base_publication_sha256.slice(0, 12),
+  );
   const anchorSelect = page.locator("#opinion-note-anchor");
   await expect(anchorSelect.locator("option")).toHaveCount(
     catalog.anchors.length + 1,
@@ -1535,11 +1969,14 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
   await expect(page.locator("#opinion-note-anchor-detail")).toContainText(
     firstDuplicateAnchor.text.slice(0, 60),
   );
-  await anchorSelect.scrollIntoViewIfNeeded();
-  await capture(page, "anchor-picker");
+  await capture(
+    page,
+    "article-anchor-selected",
+    duplicateParagraphButtons.nth(0),
+  );
 
-  // Step 21 — ask Bridge for a Note at occurrence 1, with canonical IOC data
-  // and an M23 table cross-reference; inspect its text, diff and resolved refs.
+  // Step 23 — prepare a Bridge draft at occurrence 1 with one canonical
+  // observation citation. M23/IOC/code blocks are added after the correction.
   const investigationApi = await getJson<InvestigationApiView>(
     page,
     `/api/investigations/${investigation.id}`,
@@ -1555,7 +1992,7 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
       "the bootstrap must persist a canonical VT file observation",
     );
   }
-  const addArticleAndIocReferences = async () => {
+  const addObservationCitation = async () => {
     const qualificationDetails = page
       .locator("details")
       .filter({ hasText: "Qualification et contenu vérifiable" });
@@ -1565,27 +2002,10 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
     await page
       .getByRole("group", { name: /Observations disponibles/ })
       .getByRole("checkbox", {
-        name: new RegExp(observation.object_id),
+        name: /Rapport VT fichier/,
       })
       .first()
       .check();
-    const iocFieldset = page.getByRole("group", {
-      name: "Tableau IOC depuis les observations canoniques",
-    });
-    await iocFieldset
-      .getByRole("checkbox", { name: new RegExp(observation.object_id) })
-      .first()
-      .check();
-    await iocFieldset
-      .getByRole("button", { name: /Ajouter le tableau IOC \(1\)/ })
-      .click();
-    await page
-      .locator("#note-content-block-element")
-      .selectOption(`table:${ARTICLE_TABLE_KEY}`);
-    await page.getByRole("button", { name: "Référencer cet élément" }).click();
-    await expect(
-      page.getByRole("heading", { name: "Références de contenu (2)" }),
-    ).toBeVisible();
   };
 
   // The figure at occurrence 2 is refused when attached to occurrence 1.
@@ -1596,7 +2016,7 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
     element_sha256: figureElement.element_sha256,
     idempotencyKey: "m24-browser-d2-foreign-anchor",
   });
-  await addArticleAndIocReferences();
+  await addObservationCitation();
   await page.getByRole("button", { name: "Demander à Bridge" }).click();
   await waitForProposal(
     page,
@@ -1619,7 +2039,7 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
   expect(oldBaseProposal.status).toBe("proposed");
   expect(oldBaseProposal.materialised).toBe(true);
   expect(oldBaseProposal.task_id).toBe(infra.id);
-  expect(oldBaseProposal.content_blocks).toHaveLength(2);
+  expect(oldBaseProposal.content_blocks).toHaveLength(0);
   const oldBaseText = oldBaseProposal.proposed_text ?? "";
   expect(oldBaseText.length).toBeGreaterThan(0);
 
@@ -1698,7 +2118,7 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
   await expect(duplicateParagraphButtons).toHaveCount(2);
   await duplicateParagraphButtons.nth(0).click();
   await expect(anchorSelect).toHaveValue(NOTE_A_ANCHOR);
-  await addArticleAndIocReferences();
+  await addObservationCitation();
   await page.getByRole("button", { name: "Demander à Bridge" }).click();
   await waitForProposal(
     page,
@@ -1733,10 +2153,7 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
   const firstToken = firstText.match(/pour ([A-Za-z0-9]{1,8}) :/)?.[1];
   expect(firstToken, "the draft text carries its short token").toBeDefined();
   expect(firstProposal.proposed_text_sha256).toBe(sha256Text(firstText));
-  expect(firstProposal.content_blocks).toHaveLength(2);
-  expect(
-    firstProposal.content_blocks.map((block) => block["block_type"]).sort(),
-  ).toEqual(["article_element", "ioc_table"]);
+  expect(firstProposal.content_blocks).toHaveLength(0);
   const firstDiff = await getJson<ProposalDiffApi>(
     page,
     `/api/investigations/${investigation.id}/note-proposals/${firstProposal.proposal_id}`,
@@ -1745,40 +2162,24 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
   expect(firstDiff.accept_ready).toBe(true);
   expect(firstDiff.content_blocks_valid).toBe(true);
   expect(firstDiff.current_note_text).toBeNull();
-  const resolvedTable = firstDiff.resolved_content_blocks.find(
-    (block) => block.block_type === "ioc_table",
+  expect(firstDiff.resolved_content_blocks).toHaveLength(0);
+  const proposalTechnicalDetails = page.locator(
+    ".opinion-proposal-review__technical",
   );
-  expect(resolvedTable?.title).toBe("Tableau IOC (1)");
-  expect(resolvedTable?.rows?.[0]?.object_id).toBe(observation.object_id);
-  const resolvedArticleElement = firstDiff.resolved_content_blocks.find(
-    (block) => block.block_type === "article_element",
+  await proposalTechnicalDetails.locator("summary").click();
+  expect(await proposalTechnicalDetails.innerText()).toContain(
+    firstProposal.proposed_text_sha256 ?? "",
   );
-  expect(resolvedArticleElement?.kind).toBe("table");
-  expect(resolvedArticleElement?.element_key).toBe(ARTICLE_TABLE_KEY);
-  expect(resolvedArticleElement?.anchor).toBe(NOTE_A_ANCHOR);
-  await expect(
-    page.getByRole("heading", {
-      name: "Aperçu lecture seule des blocs vérifiés",
-    }),
-  ).toBeVisible();
-  await expect(
-    page.locator("table caption").filter({ hasText: "Tableau IOC (1)" }),
-  ).toBeVisible();
-  await expect(
-    page.getByText("M23 D2 source table Revision D2.", { exact: true }),
-  ).toBeVisible();
-  await page.locator(".opinion-proposal-review__technical summary").click();
-  await expect(
-    page
-      .locator(".opinion-proposal-review__technical")
-      .getByText(firstProposal.proposed_text_sha256 ?? "", { exact: true }),
-  ).toBeVisible();
   await page
     .getByRole("checkbox", {
       name: /J’ai relu ce texte et ses références/,
     })
     .check();
-  await capture(page, "note-review");
+  await capture(
+    page,
+    "bridge-proposal",
+    page.locator(".opinion-proposal-review"),
+  );
   await page.getByRole("button", { name: "Accepter", exact: true }).click();
   await expect(page.getByText(/Note acceptée/)).toBeVisible();
   const afterFirstAccept = await firstInvestigation(page);
@@ -1787,20 +2188,13 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
     (note) => note.anchor === NOTE_A_ANCHOR,
   );
   expect(acceptedFirstNote?.text).toBe(firstText);
-  expect(acceptedFirstNote?.content_blocks).toContainEqual(
-    expect.objectContaining({
-      block_type: "article_element",
-      kind: "table",
-      element_key: ARTICLE_TABLE_KEY,
-      anchor: NOTE_A_ANCHOR,
-    }),
-  );
+  expect(acceptedFirstNote?.content_blocks).toHaveLength(0);
   await page.getByRole("tab", { name: "Notes 1" }).click();
   await expect(
     page.getByRole("region", { name: "Note existante" }),
   ).toContainText(firstText);
 
-  // Step 22 — correction: a second targeted Bridge request replaces the note.
+  // Step 24 — correction: a targeted Bridge request replaces the note.
   // The new proposal shows the stored text and the paragraph diff, and it is
   // pinned to the current opinion version.
   await page.getByRole("radio", { name: /Réviser \/ corriger/ }).check();
@@ -1856,6 +2250,21 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
       .locator("ins")
       .first(),
   ).toBeVisible();
+  const removedParagraphs = page
+    .getByRole("group", { name: "Différences du paragraphe" })
+    .locator("del");
+  const [firstOldParagraph, secondOldParagraph] = firstText.split("\n\n");
+  if (firstOldParagraph === undefined || secondOldParagraph === undefined) {
+    throw new Error("the prior Note must retain two paragraphs in the diff");
+  }
+  await expect(removedParagraphs).toHaveCount(2);
+  await expect(removedParagraphs.nth(0)).toContainText(firstOldParagraph);
+  await expect(removedParagraphs.nth(1)).toContainText(secondOldParagraph);
+  await capture(
+    page,
+    "bridge-correction-diff",
+    page.locator(".opinion-proposal-review"),
+  );
 
   // A distinct note at the second identical paragraph is created while the
   // head is still v1; it becomes stale after the correction is accepted. The
@@ -1885,30 +2294,31 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
   }
   expect(staleCandidate.base_opinion_version).toBe(1);
 
-  // Step 23 — accept the correction by version/hash (CAS). The earlier
+  // Step 25 — accept the correction by version/hash (CAS). The earlier
   // second-anchor proposal pinned to v1 is then stale: the UI disables it and
   // the server refuses the same acceptance with 409 stale_note_proposal.
-  const selectProposal = async (shortSha: string) => {
-    const proposalList = page.locator(
-      'section[aria-labelledby="opinion-proposals-heading"]',
-    );
-    await proposalList
-      .locator("li")
-      .filter({ hasText: shortSha })
-      .getByRole("button", { name: "Examiner la proposition" })
-      .click();
-  };
-  await selectProposal(
-    (correctionProposal.proposed_text_sha256 ?? "").slice(0, 12),
+  const proposalList = page.locator(
+    'section[aria-labelledby="opinion-proposals-heading"]',
   );
-  await page.locator(".opinion-proposal-review__technical summary").click();
+  const correctionListItem = proposalList
+    .locator("li")
+    .filter({ hasText: "Proposée" })
+    .filter({ hasText: NOTE_A_ANCHOR })
+    .last();
+  await expect(correctionListItem).toHaveCount(1);
+  await correctionListItem
+    .getByRole("button", { name: "Examiner la proposition" })
+    .click();
   await expect(
-    page
-      .locator(".opinion-proposal-review__technical")
-      .getByText(correctionProposal.proposed_text_sha256 ?? "", {
-        exact: true,
-      }),
-  ).toBeVisible();
+    page.getByRole("region", { name: "Texte proposé" }),
+  ).toContainText(revisedText.split("\n\n")[0] ?? "");
+  const correctionTechnicalDetails = page.locator(
+    ".opinion-proposal-review__technical",
+  );
+  await correctionTechnicalDetails.locator("summary").click();
+  expect(await correctionTechnicalDetails.innerText()).toContain(
+    correctionProposal.proposed_text_sha256 ?? "",
+  );
   await page
     .getByRole("checkbox", {
       name: /J’ai relu ce texte et ses références/,
@@ -1922,17 +2332,14 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
     (note) => note.anchor === NOTE_A_ANCHOR,
   );
   expect(correctedNote?.text).toBe(revisedText);
-  expect(correctedNote?.content_blocks).toContainEqual(
-    expect.objectContaining({
-      block_type: "article_element",
-      kind: "table",
-      element_key: ARTICLE_TABLE_KEY,
-      anchor: NOTE_A_ANCHOR,
-    }),
-  );
-  await selectProposal(
-    (staleCandidate.proposed_text_sha256 ?? "").slice(0, 12),
-  );
+  expect(correctedNote?.content_blocks).toHaveLength(0);
+  const staleCandidateListItem = proposalList
+    .locator("li")
+    .filter({ hasText: "Rédaction" })
+    .last();
+  await staleCandidateListItem
+    .getByRole("button", { name: "Examiner la proposition" })
+    .click();
   await expect(page.getByText(/Proposition périmée/)).toBeVisible();
   await expect(
     page.getByRole("button", { name: "Accepter", exact: true }),
@@ -1954,7 +2361,8 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
     detail?: { code?: string };
   };
   expect(staleBody.detail?.code).toBe("stale_note_proposal");
-  // The note list has refreshed to opinion v2, so the re-pin request pins it.
+  // The note list has refreshed to opinion v2; now add M23, IOC and canonical
+  // code references at occurrence 2 through their visible selectors.
   await page.getByRole("tab", { name: "Notes 1" }).click();
   await page.getByText("Notes existantes (1)", { exact: true }).click();
   await expect(
@@ -1963,9 +2371,64 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
       .getByText(revisedText.split("\n\n")[0] ?? ""),
   ).toBeVisible();
 
-  // Re-pin the second note on the accepted v2 and accept it as v3.
+  // Step 26 — reference the M23 figure rendered at occurrence 2.
   await duplicateParagraphButtons.nth(1).click();
   await expect(anchorSelect).toHaveValue(NOTE_B_ANCHOR);
+  await page
+    .getByText("Qualification et contenu vérifiable", { exact: true })
+    .click();
+  const articleElementSelect = page.locator("#note-content-block-element");
+  await articleElementSelect.selectOption(`figure:${ARTICLE_FIGURE_KEY}`);
+  await page.getByRole("button", { name: "Référencer cet élément" }).click();
+  await expect(
+    page.getByRole("heading", { name: "Références de contenu (1)" }),
+  ).toBeVisible();
+  await capture(page, "m23-element-selected", articleElementSelect);
+
+  // Step 27 — add one IOC table from the canonical observation list.
+  await addObservationCitation();
+  const iocFieldset = page.getByRole("group", {
+    name: "Tableau IOC depuis les observations canoniques",
+  });
+  await iocFieldset
+    .getByRole("checkbox", { name: /Rapport VT fichier/ })
+    .first()
+    .check();
+  await iocFieldset
+    .getByRole("button", { name: /Ajouter le tableau IOC \(1\)/ })
+    .click();
+  await expect(
+    page.getByRole("heading", { name: "Références de contenu (2)" }),
+  ).toBeVisible();
+  await capture(page, "ioc-table-selected", iocFieldset);
+
+  // Step 28 — select and verify canonical bytes in the visual selector. The
+  // manual offset, length and SHA diagnostic remains collapsed and untouched.
+  const codeSelector = page.getByRole("group", {
+    name: "Extrait de code canonique",
+  });
+  await codeSelector
+    .getByLabel("Observation source")
+    .selectOption({ value: observation.id });
+  const excerptEditor = codeSelector.getByLabel(/Extrait canonique en texte/);
+  await expect(excerptEditor).toBeVisible();
+  await excerptEditor.press("Control+A");
+  await expect(codeSelector.getByRole("status").last()).toContainText(
+    /\d+ octets à partir de/,
+  );
+  await expect(
+    codeSelector.locator("details.canonical-code-selector__manual"),
+  ).not.toHaveAttribute("open", "");
+  await capture(page, "canonical-code-selector", codeSelector);
+  await codeSelector
+    .getByRole("button", { name: "Vérifier et référencer la plage" })
+    .click();
+  await expect(
+    page.getByRole("heading", { name: "Références de contenu (3)" }),
+  ).toBeVisible();
+
+  // Request a fresh second-anchor note against opinion v2 and accept it as v3.
+  await page.getByRole("radio", { name: "Rédiger" }).check();
   await page.getByRole("button", { name: "Demander à Bridge" }).click();
   await waitForProposal(
     page,
@@ -1987,6 +2450,20 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
     throw new Error("the re-pinned proposal was not persisted");
   }
   expect(repinned.base_opinion_version).toBe(2);
+  expect(
+    repinned.content_blocks.map((block) => block["block_type"]).sort(),
+  ).toEqual(["article_element", "canonical_code", "ioc_table"]);
+  const repinnedDiff = await getJson<ProposalDiffApi>(
+    page,
+    `/api/investigations/${investigation.id}/note-proposals/${repinned.proposal_id}`,
+  );
+  expect(repinnedDiff.accept_ready).toBe(true);
+  expect(repinnedDiff.content_blocks_valid).toBe(true);
+  await capture(
+    page,
+    "bridge-proposal-with-blocks",
+    page.locator(".opinion-proposal-review"),
+  );
   await page
     .getByRole("checkbox", {
       name: /J’ai relu ce texte et ses références/,
@@ -2009,16 +2486,25 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
   expect(secondText).not.toBe(revisedText);
   expect(
     notes.find((note) => note.anchor === NOTE_A_ANCHOR)?.content_blocks,
-  ).toContainEqual(
-    expect.objectContaining({
-      block_type: "article_element",
-      kind: "table",
-      element_key: ARTICLE_TABLE_KEY,
-      anchor: NOTE_A_ANCHOR,
-    }),
+  ).toHaveLength(0);
+  expect(
+    notes.find((note) => note.anchor === NOTE_B_ANCHOR)?.content_blocks,
+  ).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        block_type: "article_element",
+        kind: "figure",
+        element_key: ARTICLE_FIGURE_KEY,
+        anchor: NOTE_B_ANCHOR,
+      }),
+      expect.objectContaining({ block_type: "ioc_table" }),
+      expect.objectContaining({ block_type: "canonical_code" }),
+    ]),
   );
 
-  // Step 24 — the real Typst preview renders both notes at their anchors with
+  // Step 29 — generate and inspect a real Typst PDF. Step 30 verifies placement
+  // and provenance with pdftotext, then rasterizes the pages with pdftoppm.
+  // The PDF renders both notes at their anchors with
   // a two-paragraph body each, the verified IOC table and its provenance line.
   const opinionRead = await getJson<OpinionReadApi>(
     page,
@@ -2031,9 +2517,13 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
   await expect(
     page.getByRole("heading", { name: "Aperçu PDF réel de l’avis v3" }),
   ).toBeVisible();
+  await expect(page.getByRole("link", { name: "Ouvrir le PDF" })).toBeVisible();
   await expect(
-    page.getByRole("link", { name: "Ouvrir le PDF dans un nouvel onglet" }),
-  ).toBeVisible();
+    page.getByRole("status").filter({
+      hasText:
+        /Ce navigateur n’a pas affiché le PDF intégré|Le lecteur PDF intégré n’est pas disponible/,
+    }),
+  ).toBeVisible({ timeout: 15_000 });
   const previewUrl =
     `/api/opinions/${encodeURIComponent(draft.id)}/preview.pdf?` +
     new URLSearchParams({
@@ -2119,43 +2609,85 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
   expect(tailPositions[1]).toBeLessThan(m23FigurePosition);
   expect(m23FigurePosition).toBeLessThan(noteBPosition);
   expect(occurrences(pdfText, "M23-D2-TABLE-CELL-UNIQUE")).toHaveLength(1);
-  expect(occurrences(pdfText, "M23-D2-ARTICLE-FIGURE-UNIQUE")).toHaveLength(1);
-  // The table title appears in the article and as a note cross-reference;
-  // its unique table content must stay present only once.
-  expect(occurrences(pdfText, "M23 D2 source table")).toHaveLength(2);
-  // Each note prints its verified IOC table and provenance inside its own
-  // anchor range; M23's unique element content remains single-instance above.
+  const m23FigureMarkerPositions = occurrences(
+    pdfText,
+    "M23-D2-ARTICLE-FIGURE-UNIQUE",
+  );
+  expect(m23FigureMarkerPositions).toHaveLength(2);
+  const figureReferencePosition = m23FigureMarkerPositions[1];
+  if (figureReferencePosition === undefined) {
+    throw new Error("the M23 figure cross-reference is missing from the PDF");
+  }
+  const figureCrossReference = pdfText.indexOf(
+    "Référence d'article — Figure",
+    figureReferencePosition,
+  );
+  expect(figureReferencePosition).toBeGreaterThan(noteBPosition);
+  expect(figureCrossReference).toBeGreaterThan(figureReferencePosition);
+  // The M23 source table remains at its article placement; note B references
+  // the separately rendered figure at the second paragraph.
+  expect(occurrences(pdfText, "M23 D2 source table")).toHaveLength(1);
+  // Only note B prints the verified IOC table and its canonical provenance;
+  // M23's unique element content remains single-instance above.
   const tablePositions = occurrences(pdfText, "Tableau IOC (1)");
   const provenancePositions = occurrences(
     pdfText,
     "Observations canoniques de cette enquête : 1",
   );
-  expect(tablePositions).toHaveLength(2);
-  expect(provenancePositions).toHaveLength(2);
-  expect(tablePositions[0]).toBeGreaterThan(noteAPosition);
-  expect(tablePositions[0]).toBeLessThan(tailPositions[1]);
+  expect(tablePositions).toHaveLength(1);
+  expect(provenancePositions).toHaveLength(1);
+  expect(tablePositions[0]).toBeGreaterThan(noteBPosition);
   expect(provenancePositions[0]).toBeGreaterThan(tablePositions[0] ?? 0);
-  expect(provenancePositions[0]).toBeLessThan(tailPositions[1]);
-  expect(tablePositions[1]).toBeGreaterThan(noteBPosition);
-  expect(provenancePositions[1]).toBeGreaterThan(tablePositions[1] ?? 0);
-  expect(occurrences(pdfText, "Tableau IOC (1)")).toHaveLength(2);
+  expect(provenancePositions[0]).toBeLessThan(pdfText.length);
+  expect(occurrences(pdfText, "Tableau IOC (1)")).toHaveLength(1);
   expect(
     occurrences(pdfText, "Observations canoniques de cette enquête : 1"),
-  ).toHaveLength(2);
+  ).toHaveLength(1);
   expect(pdfText).toContain("empreintes vérifiées");
-  await page
-    .locator('iframe[title="Aperçu PDF réel de l’avis"]')
-    .first()
-    .scrollIntoViewIfNeeded();
-  await capture(page, "pdf-preview");
+  await capture(page, "pdf-preview", page.locator(".opinion-pdf-preview"));
+  const rasterPrefix = testInfo.outputPath("opinion-v3-page");
+  execFileSync("pdftoppm", ["-png", "-r", "100", pdfPath, rasterPrefix], {
+    encoding: "utf-8",
+  });
   mkdirSync(CAPTURES_DIR, { recursive: true });
-  execFileSync(
-    "pdftoppm",
-    ["-png", "-r", "100", pdfPath, join(CAPTURES_DIR, "pdf-page")],
-    { encoding: "utf-8" },
-  );
+  const rasterPages = readdirSync(dirname(rasterPrefix))
+    .filter((name) => /^opinion-v3-page-\d+\.png$/.test(name))
+    .sort(
+      (left, right) =>
+        Number(left.match(/-(\d+)\.png$/)?.[1] ?? 0) -
+        Number(right.match(/-(\d+)\.png$/)?.[1] ?? 0),
+    );
+  expect(rasterPages.length).toBeGreaterThan(0);
+  for (const rasterPage of rasterPages) {
+    const sourcePath = join(dirname(rasterPrefix), rasterPage);
+    const png = readFileSync(sourcePath);
+    const width = png.readUInt32BE(16);
+    const height = png.readUInt32BE(20);
+    const pageNumber = rasterPage.match(/-(\d+)\.png$/)?.[1];
+    if (pageNumber === undefined) {
+      throw new Error(`unexpected Typst PDF raster page name: ${rasterPage}`);
+    }
+    renameSync(
+      sourcePath,
+      join(CAPTURES_DIR, `pdf-page-${pageNumber}-${width}x${height}.png`),
+    );
+  }
 
-  // G2 lifecycle — extend then revoke the approved envelope at the end of the
+  // Step 31 — return to the overview and back to the plan, retaining both the
+  // selected view and task in the URL and restoring the same selected row.
+  await page.getByRole("tab", { name: "Vue d’ensemble" }).click();
+  expect(new URL(page.url()).searchParams.get("vue")).toBe("overview");
+  expect(new URL(page.url()).searchParams.get("task")).toBe(infra.id);
+  await page.getByRole("tab", { name: "Plan et tâches" }).click();
+  await expect(
+    page
+      .getByRole("list", { name: "Liste des tâches" })
+      .getByRole("button", { name: new RegExp(INFRA_TITLE) }),
+  ).toHaveAttribute("aria-pressed", "true");
+  expect(new URL(page.url()).searchParams.get("vue")).toBe("plan");
+  expect(new URL(page.url()).searchParams.get("task")).toBe(infra.id);
+
+  // Step 32 — G2 lifecycle: extend then revoke the approved envelope at the end of the
   // journey, so no later Bridge or provider action depends on the rights. The
   // envelope version advances with every budget-changing invocation, so the
   // CAS expectations are relative to the current version, never absolute.
@@ -2247,7 +2779,109 @@ test("parcours atelier M24 étapes 1–24 : workspace, sessions, Note, PDF, G2",
   expect(afterRevoke.envelope_version).toBe(extendedVersion + 1);
   expect(afterRevoke.envelope_allowed_providers).toEqual([]);
   expect(afterRevoke.decision_types).toContain("pivot_reject");
-  await capture(page, "overview-revoked");
+  await capture(
+    page,
+    "overview-revoked",
+    envelopeLifecycle.getByRole("heading").first(),
+  );
+
+  // External reads are refused after revocation, while local workspace notes
+  // remain readable. The VT batch records a denied plan without calling the
+  // fake provider, Shodan's signed broker records a policy denial, and Bridge
+  // becomes unavailable without submitting to its fake transport.
+  const fixtureStateBeforeRefusals = await diagnostics(page);
+  const deniedVtResponse = await page.request.post(
+    `/api/investigations/${investigation.id}/bootstrap/run`,
+    {
+      headers: { "Idempotency-Key": "m24-browser-vt-after-revocation" },
+    },
+  );
+  expect(deniedVtResponse.status()).toBe(200);
+  const deniedVt = (await deniedVtResponse.json()) as SnapshotResponse;
+  expect(deniedVt.plan_state).toBe("blocked");
+  const deniedVtOperations = deniedVt.iocs.flatMap((ioc) => ioc.operations);
+  expect(deniedVtOperations.length).toBeGreaterThan(0);
+  expect(
+    deniedVtOperations.every(
+      (operation) => operation.status === "policy_denied",
+    ),
+  ).toBe(true);
+  const fixturesAfterVt = (await diagnostics(page)).fixtures;
+  expect(fixturesAfterVt.vt_calls).toEqual(
+    fixtureStateBeforeRefusals.fixtures.vt_calls,
+  );
+  expect(fixturesAfterVt.vt_download_calls).toBe(
+    fixtureStateBeforeRefusals.fixtures.vt_download_calls,
+  );
+
+  const shodanRefusal = await signedSessionAction(request, state, {
+    kind: "tool_call",
+    session_id: claudeSession.id,
+    investigation_id: investigation.id,
+    tool_name: "shodan.search",
+    schema_version: "1",
+    arguments: {
+      query: "port:443",
+      justification: "Refus G2 synthetique apres revocation.",
+      evidence_refs: [],
+      page: 1,
+    },
+    idempotency_key: "m24-browser-shodan-after-revocation",
+  });
+  expect(shodanRefusal.status_code).toBe(403);
+  const shodanRefusalBody = shodanRefusal.body as {
+    detail?: { code?: string };
+  };
+  expect(shodanRefusalBody.detail?.code).toBe("external_disclosure_denied");
+  expect((await diagnostics(page)).fixtures.shodan_calls).toEqual(
+    fixtureStateBeforeRefusals.fixtures.shodan_calls,
+  );
+
+  const activityAfterRevoke = await getJson<InvestigationActivityApi>(
+    page,
+    `/api/investigations/${investigation.id}/activity?limit=1`,
+  );
+  const workingStateVersion = activityAfterRevoke.working_state?.version;
+  if (workingStateVersion === undefined) {
+    throw new Error(
+      "the working-state version is unavailable after revocation",
+    );
+  }
+  const bridgeRefusal = await page.request.post(
+    `/api/investigations/${investigation.id}/note-proposals`,
+    {
+      headers: { "Idempotency-Key": "m24-browser-bridge-after-revocation" },
+      data: {
+        anchor: NOTE_A_ANCHOR,
+        target_block_type: "section",
+        bridge_block_type: "key_findings",
+        consultation_type: "draft_text",
+        question: "Refus G2 synthetique apres revocation.",
+        expected_working_state_version: workingStateVersion,
+      },
+    },
+  );
+  expect(bridgeRefusal.status()).toBe(200);
+  const bridgeRefusalBody = (await bridgeRefusal.json()) as {
+    invocation_status: string;
+    materialised: boolean;
+  };
+  expect(bridgeRefusalBody.invocation_status).toBe("unavailable");
+  expect(bridgeRefusalBody.materialised).toBe(false);
+  const fixturesAfterBridge = (await diagnostics(page)).fixtures;
+  expect(fixturesAfterBridge.bridge_submissions).toBe(
+    fixtureStateBeforeRefusals.fixtures.bridge_submissions,
+  );
+
+  await page.getByRole("tab", { name: "Workspace et notes" }).click();
+  await expect(workspaceView).toBeVisible();
+  await noteButton.click();
+  await expect(
+    page
+      .locator("pre.workspace-notes__content")
+      .filter({ hasText: NOTE_EDITED_TEXT }),
+  ).toBeVisible();
+  await expect(page.getByRole("button", { name: "Éditer" })).toBeEnabled();
 
   // The whole journey happened on loopback, through the real routes only.
   expect(
