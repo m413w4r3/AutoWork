@@ -268,7 +268,7 @@ export function NoteDetailPanel({
             setActiveAction((current) => (current === "agent" ? null : "agent"))
           }
         >
-          Transmettre à Codex / Claude
+          Envoyer à l’agent
         </button>
         <button
           className="button button--secondary"
@@ -290,7 +290,7 @@ export function NoteDetailPanel({
             )
           }
         >
-          Proposer une observation
+          Créer une observation
         </button>
       </div>
 
