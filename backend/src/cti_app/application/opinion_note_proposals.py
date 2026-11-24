@@ -108,26 +108,26 @@ async def resolve_canonical_code_observation_blob(
     artifact_store: ProductionArtifactStore,
     investigation_id: UUID,
     observation: EvidenceObservation,
+    max_bytes: int | None = MAX_CANONICAL_CODE_SOURCE_BYTES,
 ) -> CanonicalCodeObservationBlobV1 | None:
     """Read the same bounded, non-advisory observation blob used by note verification.
 
     The caller must first obtain the observation by its canonical ID. A source is
     admissible only when it belongs to this investigation, is not advisory, its
-    stored bytes fit the production artifact bound, and those bytes match the
-    observation SHA.
+    stored bytes fit ``max_bytes`` (the read endpoint is bounded; note
+    verification passes ``None`` and stays unbounded as before M24.2), and those
+    bytes match the observation SHA.
     """
     if observation.investigation_id != investigation_id or is_advisory_observation(observation):
         return None
     try:
-        raw = await artifact_store.read_bytes(
-            observation.blob_id, max_bytes=MAX_CANONICAL_CODE_SOURCE_BYTES
-        )
+        raw = await artifact_store.read_bytes(observation.blob_id, max_bytes=max_bytes)
     except ProductionReuseStorageUnavailableError as exc:
         raise CanonicalCodeSourceUnavailableError from exc
     except (KeyError, OSError, TypeError, ValueError):
         return None
     blob_sha256 = hashlib.sha256(raw).hexdigest()
-    if len(raw) > MAX_CANONICAL_CODE_SOURCE_BYTES or blob_sha256 != observation.sha256:
+    if (max_bytes is not None and len(raw) > max_bytes) or blob_sha256 != observation.sha256:
         return None
     return CanonicalCodeObservationBlobV1(
         observation=observation,
@@ -143,13 +143,22 @@ def canonical_code_excerpt_bytes(
     offset: int,
     length: int,
     expected_sha256: str | None = None,
+    enforce_read_limits: bool = False,
 ) -> bytes:
-    """Return one exact byte range, applying the shared code excerpt bounds."""
-    if len(raw) > MAX_CANONICAL_CODE_SOURCE_BYTES:
+    """Return one exact byte range.
+
+    ``enforce_read_limits`` applies the bounds of the excerpt READ endpoint only;
+    note verification keeps the unbounded semantics of blocks stored before M24.2.
+    """
+    if enforce_read_limits and len(raw) > MAX_CANONICAL_CODE_SOURCE_BYTES:
         raise ValueError("Canonical code source exceeds the source size limit")
     if type(offset) is not int or offset < 0:
         raise ValueError("Canonical code offset must be a non-negative integer")
-    if type(length) is not int or length < 1 or length > MAX_CANONICAL_CODE_EXCERPT_BYTES:
+    if (
+        type(length) is not int
+        or length < 1
+        or (enforce_read_limits and length > MAX_CANONICAL_CODE_EXCERPT_BYTES)
+    ):
         raise ValueError("Canonical code excerpt length is outside the allowed range")
     end = offset + length
     if end > len(raw):
@@ -653,6 +662,7 @@ async def load_note_content_block_context(
                 artifact_store=artifact_store,
                 investigation_id=investigation_id,
                 observation=stored,
+                max_bytes=None,
             )
         except CanonicalCodeSourceUnavailableError:
             continue

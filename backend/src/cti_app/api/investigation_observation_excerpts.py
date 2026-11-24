@@ -106,6 +106,7 @@ async def get_investigation_observation_excerpt(
                 source.raw,
                 offset=offset,
                 length=length,
+                enforce_read_limits=True,
             )
         except ValueError as exc:
             raise _http_error(422, "excerpt_range_out_of_bounds") from exc

@@ -366,6 +366,8 @@ _INVESTIGATION_OPINION_NAMESPACE = UUID("f141ae8e-999c-4a7f-b07d-5ffb0bd7b86d")
 
 MAX_NOTE_CONTENT_BLOCKS = 32
 MAX_NOTE_IOC_OBSERVATIONS = 64
+# Bound of one excerpt READ (the excerpt endpoint and its picker). It is not a
+# constraint on persisted blocks: blocks stored before M24.2 carry no upper bound.
 MAX_CANONICAL_CODE_EXCERPT_BYTES = 4 * 1024
 _CODE_LANGUAGE = re.compile(r"^[a-z0-9][a-z0-9+.#_-]{0,31}$")
 
@@ -447,10 +449,6 @@ class CanonicalCodeNoteBlockV1:
             raise ValueError("Note code offset must be a non-negative integer")
         if isinstance(self.length, bool) or not isinstance(self.length, int) or self.length < 1:
             raise ValueError("Note code length must be a positive integer")
-        if self.length > MAX_CANONICAL_CODE_EXCERPT_BYTES:
-            raise ValueError(
-                f"Note code excerpt is limited to {MAX_CANONICAL_CODE_EXCERPT_BYTES} bytes"
-            )
         _validate_sha256(self.excerpt_sha256, "excerpt_sha256")
         if not isinstance(self.language, str) or _CODE_LANGUAGE.fullmatch(self.language) is None:
             raise ValueError("Note code language must be a short lowercase token")

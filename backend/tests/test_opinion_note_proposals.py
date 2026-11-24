@@ -36,6 +36,7 @@ from cti_app.application.investigation_persistence import (
 )
 from cti_app.application.operator_tool_invocation import OperatorToolInvocationResult
 from cti_app.application.opinion_note_proposals import (
+    MAX_CANONICAL_CODE_SOURCE_BYTES,
     AdvisorDraftingOutcomeV1,
     NoteArticleElementFactV1,
     NoteContentBlockContextV1,
@@ -55,6 +56,7 @@ from cti_app.application.publication_builder import (
 from cti_app.application.typst_rendering import project_publication_to_typst_model
 from cti_app.config import Settings
 from cti_app.domain.analyst_opinion import (
+    MAX_CANONICAL_CODE_EXCERPT_BYTES,
     AnalystObservationRelation,
     AnalystObservationState,
     AnalystObservationV1,
@@ -66,6 +68,7 @@ from cti_app.domain.analyst_opinion import (
     OpinionBlock,
     OpinionBlockType,
     investigation_opinion_id,
+    note_content_block_from_payload,
     note_ioc_table_title,
     opinion_blocks_with_observations,
 )
@@ -1699,6 +1702,43 @@ def test_code_ref_matches_observation_bytes() -> None:
             _run(fixture.request(advisor, content_blocks=(stale,)))
         assert failure.value.code is NoteProposalErrorCode.NOTE_CODE_REF_STALE
         assert advisor.requests == []
+
+
+def test_code_ref_verification_stays_unbounded_for_blocks_stored_before_m24_2() -> None:
+    """M24.2 bounds only the excerpt READ route: stored blocks keep their old semantics.
+
+    A 4 097-byte excerpt of a blob above the read-route size limit was valid before
+    M24.2 and must still hydrate, verify and be accepted; otherwise already
+    persisted opinions would stop loading.
+    """
+    prefix = b"head:"
+    body = bytes(65 + (index % 26) for index in range(4097))
+    raw = prefix + body + b"x" * (MAX_CANONICAL_CODE_SOURCE_BYTES + 1)
+    assert len(raw) > MAX_CANONICAL_CODE_SOURCE_BYTES
+    fixture = _Fixture()
+    observation = _append_observation(fixture, raw)
+    excerpt = raw[len(prefix) : len(prefix) + 4097]
+    block = CanonicalCodeNoteBlockV1(
+        observation_id=observation.id,
+        blob_sha256=observation.sha256,
+        offset=len(prefix),
+        length=4097,
+        excerpt_sha256=_sha256(excerpt),
+        language="text",
+    )
+    assert block.length > MAX_CANONICAL_CODE_EXCERPT_BYTES
+    # A persisted block is rebuilt from its payload: it must not be refused.
+    assert note_content_block_from_payload(block.to_payload()) == block
+
+    proposal = _materialised_proposal(
+        fixture, _run(fixture.request(fixture.advisor(), content_blocks=(block,)))
+    )
+    diff = _run(fixture.proposal_service.get(fixture.investigation.id, proposal.id))
+    resolved = diff.resolved_content_blocks[0]
+    assert isinstance(resolved, ResolvedCanonicalCodeBlockV1)
+    assert resolved.excerpt_sha256 == _sha256(excerpt)
+    _run(fixture.accept(proposal))
+    assert _run(_head(fixture)).observations[0].content_blocks == (block,)
 
 
 def test_acceptance_revalidates_code_block_against_observation_bytes() -> None:
