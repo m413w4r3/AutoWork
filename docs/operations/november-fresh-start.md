@@ -211,8 +211,14 @@ renommer des volumes pour les faire passer, ou remplacer la cible Docker.
    il ne supprime rien et ne démarre pas PostgreSQL s'il est arrêté :
 
    ```sh
-   python scripts/ops/safe_local_reset.py --dry-run
+   cd backend && uv run --no-sync --python 3.12 python ../scripts/ops/safe_local_reset.py \
+     --project-name cti-bulletin --compose-command 'docker compose' --dry-run
    ```
+
+   Cette invocation reprend celle de `make clean` (mêmes options, `--dry-run`
+   en plus) ; ne pas la lancer depuis le Python de Conda. Si l'environnement
+   Compose local est personnalisé (`COMPOSE`, `COMPOSE_FILE`), reprendre la même
+   valeur dans `--compose-command`.
 
    Un échec ou un refus bloque la suite. Le dry-run ne prouve pas l'intégrité
    d'une sauvegarde et n'autorise pas le reset.
@@ -286,7 +292,7 @@ Vérifier les points suivants avant tout premier run :
 
    ```sh
    mkdir -p /tmp/m24-fresh-start-tmp
-   TYPST_BINARY="$HOME/.local/share/autowork-tools/typst" FONT_BUNDLE_ROOT=/home/nill/perso/work/AutoWork/chpTypst TMPDIR=/tmp/m24-fresh-start-tmp WORKFLOW_RESULTS_DIR=/tmp/m24-fresh-start-results make test-investigation-browser
+   TYPST_BINARY="$HOME/.local/share/autowork-tools/typst" FONT_BUNDLE_ROOT="$PWD/chpTypst" TMPDIR=/tmp/m24-fresh-start-tmp WORKFLOW_RESULTS_DIR=/tmp/m24-fresh-start-results make test-investigation-browser
    ```
 
    Cette cible réécrit des résultats de navigateur ; `WORKFLOW_RESULTS_DIR`
