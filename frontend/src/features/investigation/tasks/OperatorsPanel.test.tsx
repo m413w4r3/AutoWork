@@ -531,6 +531,10 @@ describe("OperatorsPanel", () => {
     expect(
       screen.getByText("Budget de la session et enveloppe"),
     ).toBeInTheDocument();
+    // The budget block cannot tell an active envelope from a revoked one, so
+    // it must not call the recorded version "approved".
+    expect(screen.getByText("Enveloppe G2 liée au budget")).toBeInTheDocument();
+    expect(screen.queryByText("Enveloppe approuvée")).not.toBeInTheDocument();
     expect(screen.getByText(/plafond 100 · restant 89/)).toBeInTheDocument();
     expect(screen.getByText(/plafond 4 · restant 3/)).toBeInTheDocument();
     expect(screen.getByText("Dérivé du journal")).toBeInTheDocument();

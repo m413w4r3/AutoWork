@@ -199,9 +199,9 @@ function BudgetBlock({ budget }: { budget: AgentSessionBudgetView }) {
       {budget.envelope.present ? (
         <dl className="m24-metadata">
           <div>
-            <dt>Enveloppe approuvée</dt>
+            <dt>Enveloppe G2 liée au budget</dt>
             <dd>
-              version {budget.envelope.version ?? "inconnue"} ·{" "}
+              version {budget.envelope.version ?? "inconnue"} · enregistrée le{" "}
               {formatTimestamp(budget.envelope.approved_at)}
             </dd>
           </div>
