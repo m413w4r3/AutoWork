@@ -767,6 +767,9 @@ integration-db-up: ## Démarre PostgreSQL réservé aux tests d'intégration
 		--profile integration-test \
 		up -d --wait postgres-test
 
+test-migrations-compose: backend-sync ## Valide les migrations Alembic dans Compose sur un PostgreSQL tmpfs jetable
+	./scripts/dev/compose_migration_check.sh
+
 integration-db-down: ## Supprime PostgreSQL réservé aux tests d'intégration
 	$(COMPOSE) \
 		--profile integration-test \
@@ -882,6 +885,8 @@ test-workflow-full: ## Émule workflow_fast + workflow_full et vérifie JUnit + 
 	exit "$$guard_status"
 
 test-ci-scripts: ## Teste sans base les scripts de garde CI
+	bash -n scripts/dev/compose_migration_check.sh
+	@if command -v shellcheck >/dev/null 2>&1; then shellcheck scripts/dev/compose_migration_check.sh; else echo "shellcheck unavailable; bash syntax check completed"; fi
 	cd backend && $(UV_ENV) $(UV) run --no-sync --python $(PYTHON_VERSION) -- python -I \
 		../scripts/ci/test_check_workflow_results.py
 	cd backend && $(UV_ENV) $(UV) run --no-sync --python $(PYTHON_VERSION) -- python -I -m pytest \

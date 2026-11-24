@@ -1,5 +1,20 @@
 # Playbook opérateur CTI
 
+## Vérification des migrations dans Compose
+
+`make test-migrations-compose` applique le service Compose `migrate` depuis une
+base vide jusqu'à la tête Alembic courante. La cible utilise le service
+`postgres-test` en tmpfs dans un projet Compose unique `m243-migcheck-*`, vérifie
+les tables, fonctions et triggers de protection contre le contrat des tests
+d'intégration des migrations, puis répète `alembic upgrade head` et compare les
+schémas PostgreSQL. Elle n'utilise pas le projet `cti-bulletin` ni ses volumes
+nommés. Le service `migrate` partage temporairement le réseau du conteneur
+`postgres-test`, qui porte l'alias `postgres` attendu par `alembic.ini`. Aucun
+port hôte n'est publié. Si l'image backend de migration est absente ou ne
+contient pas la tête Alembic du checkout, la cible construit `migrate` depuis
+`infra/backend.Dockerfile` sous le tag du projet jetable, sans remplacer le tag
+partagé.
+
 À donner comme prompt de départ à une session opérateur CTI `operator_led`, quel que soit le modèle choisi par l’orchestrateur. Pars de l’état canonique de l’enquête courante; ne suppose aucune conclusion antérieure. Les observations versionnées font foi. Bridge conseille et propose des textes que l’opérateur vérifie.
 
 ## Mandat métier
