@@ -81,7 +81,7 @@ def _dispatch_agent_file_write(
     supervisor = object.__new__(sessions_supervisor.SessionSupervisor)
     supervisor._sessions = {SESSION_ID: handle} if active else {}
     supervisor._lock = threading.RLock()
-    supervisor._revoke_secret_exposure = lambda target: setattr(
+    supervisor._revoke_secret_exposure = lambda target, **_kwargs: setattr(
         target.record, "state", SessionState.FAILED
     )
 
@@ -116,6 +116,75 @@ def _dispatch_agent_file_write(
     except _RequestRejected as exc:
         response = exc
     return response, Path(environment.descriptor.host_path) / task_note, handle
+
+
+def _dispatch_non_ui_file_write(
+    tmp_path: Path,
+    *,
+    body: bytes,
+    origin: str,
+    task_id: str | None,
+    active: bool,
+    destination_override: str | None = None,
+) -> tuple[object, Path, SimpleNamespace]:
+    environment = make_scan_environment(tmp_path)
+    generated = origin == "system"
+    destination = destination_override or (
+        "results/export-report.md" if generated else "notes/humaines/par-agent.md"
+    )
+    record = SimpleNamespace(task_id=TASK_ID, state=SessionState.READY)
+    handle = SimpleNamespace(
+        record=record,
+        lock=threading.RLock(),
+        secret_forms=sessions_supervisor._secret_content_forms(URLSAFE_SECRET),
+        provider_credential_forms=(),
+        directory=tmp_path,
+    )
+    supervisor = object.__new__(sessions_supervisor.SessionSupervisor)
+    supervisor._sessions = {SESSION_ID: handle} if active else {}
+    supervisor._lock = threading.RLock()
+    supervisor._revoke_secret_exposure = lambda target, **_kwargs: setattr(
+        target.record, "state", SessionState.FAILED
+    )
+
+    agent = SimpleNamespace(workspaces=environment.manager, scans=environment.service())
+    request = object.__new__(WorkspaceAgentRequestHandler)
+    request.server = SimpleNamespace(agent=agent, session_supervisor=supervisor)
+    request._agent = lambda: agent
+    request._sessions = lambda: supervisor
+    route_template = (
+        "/v1/workspaces/{workspace_id}/generated"
+        if generated
+        else "/v1/workspaces/{workspace_id}/files"
+    )
+    request.path = (
+        f"/v1/workspaces/{environment.descriptor.workspace_id}/"
+        f"{'generated' if generated else 'files'}?{urlencode({'path': destination})}"
+    )
+    headers = {
+        "Content-Length": str(len(body)),
+        "Idempotency-Key": "m24-r1c-non-ui-write-0001",
+        "X-Autowork-Expected-Sha256": "new",
+        "X-Autowork-Origin": origin,
+    }
+    if task_id is not None:
+        headers["X-Autowork-Task-Id"] = task_id
+    if generated:
+        headers["X-Autowork-Generated-By"] = "autowork-backend"
+        headers["X-Autowork-Source-Sha256"] = "a" * 64
+    request.headers = _RequestHeaders(headers)
+    request.rfile = io.BytesIO(body)
+    route = Route(RouteKind.WORKSPACE, route_template, protocol.EDITABLE_FILE_LIMIT)
+    try:
+        response: object = request._dispatch_workspace(
+            "PUT",
+            f"/v1/workspaces/{environment.descriptor.workspace_id}/"
+            f"{'generated' if generated else 'files'}",
+            route,
+        )
+    except _RequestRejected as exc:
+        response = exc
+    return response, Path(environment.descriptor.host_path) / destination, handle
 
 
 def _std_b64(value: bytes) -> bytes:
@@ -300,7 +369,7 @@ def test_collect_refuses_the_secret_in_the_result_file(session_base: Path) -> No
 def test_collect_refuses_a_session_secret_in_the_destination_path(session_base: Path) -> None:
     revoked: list[object] = []
     supervisor = object.__new__(sessions_supervisor.SessionSupervisor)
-    supervisor._revoke_secret_exposure = lambda handle: revoked.append(handle)
+    supervisor._revoke_secret_exposure = lambda handle, **_kwargs: revoked.append(handle)
     handle = SimpleNamespace(
         secret_forms=sessions_supervisor._secret_content_forms(SECRET),
         provider_credential_forms=(),
@@ -347,6 +416,144 @@ def test_agent_file_route_keeps_writes_without_active_session(tmp_path: Path) ->
     assert destination.read_bytes() == body
 
 
+@pytest.mark.parametrize(
+    ("origin", "task_id"),
+    [("system", None), ("agent", None)],
+)
+def test_non_ui_file_routes_refuse_active_session_secret_before_persist(
+    tmp_path: Path, origin: str, task_id: str | None
+) -> None:
+    body = b"# synthetic write\n" + URLSAFE_SECRET[4:24] + b"\n"
+
+    response, destination, handle = _dispatch_non_ui_file_write(
+        tmp_path, body=body, origin=origin, task_id=task_id, active=True
+    )
+
+    assert isinstance(response, _RequestRejected)
+    assert response.status == 403
+    assert response.code == protocol.ErrorCode.POLICY_DENIED
+    assert handle.record.state is SessionState.FAILED
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize(
+    ("origin", "task_id"),
+    [("system", None), ("agent", None)],
+)
+def test_non_ui_file_routes_allow_clean_content_for_active_session(
+    tmp_path: Path, origin: str, task_id: str | None
+) -> None:
+    body = b"# synthetic clean write\n"
+
+    response, destination, handle = _dispatch_non_ui_file_write(
+        tmp_path, body=body, origin=origin, task_id=task_id, active=True
+    )
+
+    assert isinstance(response, tuple)
+    assert response[0] == 201
+    assert handle.record.state is SessionState.READY
+    assert destination.read_bytes() == body
+
+
+@pytest.mark.parametrize("origin", ["system", "agent"])
+def test_non_ui_file_route_does_not_refuse_a_clean_credential_named_destination(
+    tmp_path: Path, origin: str
+) -> None:
+    destination_path = "results/auth.json" if origin == "system" else "notes/humaines/auth.json"
+    body = b"# synthetic clean content\n"
+
+    response, destination, handle = _dispatch_non_ui_file_write(
+        tmp_path,
+        body=body,
+        origin=origin,
+        task_id=None,
+        active=True,
+        destination_override=destination_path,
+    )
+
+    assert isinstance(response, tuple)
+    assert response[0] == 201
+    assert handle.record.state is SessionState.READY
+    assert destination.read_bytes() == body
+
+
+@pytest.mark.parametrize(
+    ("origin", "task_id"),
+    [("system", None), ("agent", None)],
+)
+def test_non_ui_file_routes_without_active_session_do_not_read_temporary_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    origin: str,
+    task_id: str | None,
+) -> None:
+    def unexpected_read(*_args: object) -> bytes:
+        pytest.fail("temporary content read without an active session")
+
+    monkeypatch.setattr(sessions_supervisor.files, "_read_temporary_bytes", unexpected_read)
+    body = b"# synthetic write carrying a session secret\n" + URLSAFE_SECRET[4:24]
+
+    response, destination, handle = _dispatch_non_ui_file_write(
+        tmp_path, body=body, origin=origin, task_id=task_id, active=False
+    )
+
+    assert isinstance(response, tuple)
+    assert response[0] == 201
+    assert handle.record.state is SessionState.READY
+    assert destination.read_bytes() == body
+
+
+def test_ui_file_route_keeps_secret_content_unchanged(tmp_path: Path) -> None:
+    body = b"# human-authored note\n" + URLSAFE_SECRET[4:24]
+
+    response, destination, handle = _dispatch_non_ui_file_write(
+        tmp_path, body=body, origin="ui", task_id=None, active=True
+    )
+
+    assert isinstance(response, tuple)
+    assert response[0] == 201
+    assert handle.record.state is SessionState.READY
+    assert destination.read_bytes() == body
+
+
+def test_file_write_secret_revocation_event_records_file_write_operation(
+    tmp_path: Path,
+) -> None:
+    recorded: list[dict[str, object]] = []
+    record = SimpleNamespace(
+        state=SessionState.READY,
+        state_version=1,
+        outcome=None,
+        updated_at=None,
+        last_activity_at=None,
+    )
+
+    class _Events:
+        def append_event(self, *, payload: dict[str, object], **_kwargs: object) -> None:
+            recorded.append(payload)
+
+    handle = SimpleNamespace(
+        record=record,
+        events=_Events(),
+        secret_forms=sessions_supervisor._secret_content_forms(URLSAFE_SECRET),
+        provider_credential_forms=(),
+        directory=tmp_path,
+    )
+    supervisor = object.__new__(sessions_supervisor.SessionSupervisor)
+    supervisor._now = lambda: "synthetic-time"
+    supervisor._stop_channels = lambda *_args, **_kwargs: None
+    supervisor._persist = lambda *_args, **_kwargs: None
+
+    with pytest.raises(sessions_supervisor.SecretExposureError):
+        supervisor._refuse_secret_exposure(
+            handle,
+            (("results/export-report.md", "file", URLSAFE_SECRET),),
+            operation="file_write",
+        )
+
+    assert recorded[-1]["operation"] == "file_write"
+
+
 def test_collect_refuses_secret_split_across_three_notes(
     session_base: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -375,7 +582,7 @@ def test_collect_refuses_secret_split_across_three_notes(
     supervisor._workspaces = SimpleNamespace(get_workspace=lambda _workspace_id: object())
     supervisor._config = SimpleNamespace(workspace_root=session_base)
     supervisor._scans = object()
-    supervisor._revoke_secret_exposure = lambda target: revoked.append(target)
+    supervisor._revoke_secret_exposure = lambda target, **_kwargs: revoked.append(target)
     supervisor._ensure_capture_parent = lambda *_args: None
     monkeypatch.setattr(
         sessions_supervisor.files,

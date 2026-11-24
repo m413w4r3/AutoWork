@@ -202,7 +202,7 @@ def write_file(
     source: ByteSource,
     declared_length: int,
     idempotency_key: str,
-    agent_content_check: Callable[[str, str, Callable[[], bytes]], None] | None = None,
+    non_ui_content_check: Callable[[str | None, str, Callable[[], bytes]], None] | None = None,
     hooks: paths.WalkHooks | None = None,
 ) -> WriteOutcome:
     """Publish one API write under its route policy and CAS preconditions.
@@ -248,11 +248,7 @@ def write_file(
         try:
             temporary = _stream_to_temporary(parent_fd, components[-1], source, declared_length)
             try:
-                if (
-                    validated_origin == "agent"
-                    and task_id is not None
-                    and agent_content_check is not None
-                ):
+                if validated_origin != "ui" and non_ui_content_check is not None:
                     cached_content: bytes | None = None
 
                     def read_temporary() -> bytes:
@@ -261,7 +257,7 @@ def write_file(
                             cached_content = _read_temporary_bytes(parent_fd, temporary)
                         return cached_content
 
-                    agent_content_check(task_id, path, read_temporary)
+                    non_ui_content_check(task_id, path, read_temporary)
                 return _commit_write(
                     descriptor=descriptor,
                     scans=scans,
