@@ -50,6 +50,20 @@ Document de travail de l'orchestrateur. Ce n'est PAS le rapport final
 3. **`docs/m24/M24-2-FINAL-REPORT.md`** : à écrire, avec commit/commande/environnement/statut/niveau de preuve/restriction pour chaque résultat, tableau des capacités attestées / non attestées, procédure d'activation contrôlée des CLI, liste des autorisations externes restantes.
 4. Écart d'ordre assumé : les lots B ont démarré avant la clôture du gate du lot A (fichiers disjoints). À consigner dans le rapport.
 
+## Constats partiels des revues annulées (rapportés par les reviewers, NON vérifiés par l'orchestrateur)
+
+Ces éléments viennent des derniers messages des agents R1–R6 avant l'annulation (commit relu `0ad84fbd`). Ils ne constituent pas des verdicts. À confirmer par les revues fraîches.
+
+- **R4 (architecture) — régression possible, reproduite par l'agent :** la réhydratation d'un bloc `canonical_code` V1 de **4 097 octets** lève désormais `ValueError`, alors que l'ancienne validation n'imposait pas cette limite. Cause probable : `canonical_code_excerpt_bytes` (`backend/src/cti_app/application/opinion_note_proposals.py`, ajouté par C5) applique `MAX_CANONICAL_CODE_EXCERPT_BYTES` (4 096) et `MAX_ARTIFACT_BYTES` (4 MiB) aussi à la vérification des blocs EXISTANTS. Risque : des blocs déjà stockés deviennent périmés ou provoquent une erreur à la relecture. À confirmer, puis soit limiter la borne à l'endpoint de lecture, soit prouver qu'aucun bloc existant ne dépasse la borne.
+- **R3 (provenance) :** même constat sur le plafond `MAX_ARTIFACT_BYTES` (lecture auparavant sans plafond). Confirmé par l'agent : l'endpoint d'extrait ne lit que l'observation de l'enquête, recalcule les deux SHA et renvoie offset/longueur depuis le serveur. Point en cours d'examen : une association d'échantillons partageant le même SHA est-elle jointe sans ambiguïté par `SamplesResultsView.tsx` ?
+- **R5 (UX) — verdict NO-GO UX (partiel) sur les captures de `/tmp/m242-ud/captures` :**
+  - UX-02 **NON ATTESTÉ** : `ioc-table-selected-1280x800.png` montre des libellés longs coupés au bord droit (débordement à 1280 px).
+  - UX-03, UX-07, UX-09 **PARTIEL** : la navigation clavier réelle, le rafraîchissement réel et l'envoi d'une note n'ont pas été exercés par le reviewer (le parcours navigateur couvre pourtant `task=` au rafraîchissement et le retour arrière).
+  - Attestés avec preuve visuelle : UX-01, UX-04, UX-05, UX-06, UX-08, UX-10, UX-11, UX-12. Le reviewer n'est pas allé jusqu'à UX-20 (réponse tronquée).
+  - **À corriger avant tout GO UX :** débordement de la table IOC à 1280 px.
+- **R2 (concurrence) :** premiers tests ciblés verts ; un lot s'est « bloqué dans un test asynchrone » (attentes bornées à 10–30 s) sans que le test soit identifié. À reproduire : un test qui attend sans fin est un défaut en soi.
+- **R1 (sécurité) et R6 (éditorial) :** aucun constat exploitable (R6 avait rasterisé `/tmp/pt-r6/ioc-40-page-*.png`, sans verdict).
+
 ## Non attesté (limites connues)
 
 - Isolation bwrap réelle : le noyau de cette machine refuse les namespaces utilisateur ; seuls les `argv` construits et des faux CLI sont testés.
