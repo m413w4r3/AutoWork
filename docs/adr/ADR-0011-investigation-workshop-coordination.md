@@ -431,8 +431,12 @@ pour D7, les points laissés ouverts par la revue R2-F1.
   (`sessions/supervisor.py::_arm_secret`) ; un CLI qui relance le shim à chaque nouveau run
   (Codex `exec resume`) retrouve donc une remise fraîche. Le secret n'est jamais persisté (ni
   `state.json`, ni log, ni argv, ni env) ; il est conservé en mémoire à travers une interruption
-  pour permettre le ré-armement du run suivant, puis effacé au `close`, au nettoyage de
-  redémarrage ou à la détection d'exposition, et le socket est supprimé après usage.
+  pour permettre le ré-armement du run suivant, puis son buffer brut est mis à zéro au `close`,
+  au nettoyage de redémarrage ou à la détection d'exposition, et le socket est supprimé après
+  usage. Après une détection, `secret_forms` reste uniquement en mémoire tant que la session en
+  échec est ouverte, afin que les écritures API non humaines continuent d'être contrôlées, y
+  compris celles déjà en cours; ces formes incluent des représentations brutes/encodées du secret
+  et des fragments. Elles sont effacées au `close` ou à l'arrêt du superviseur.
 - **Résidu accepté et borné (R2-F1 F1).** Le CLI lance lui-même le shim et lit
   `AUTOWORK_SESSION_SOCKET` dans son propre environnement ; il peut donc se connecter **avant**
   le shim au socket à usage unique et recevoir la trame complète
@@ -440,8 +444,9 @@ pour D7, les points laissés ouverts par la revue R2-F1.
   contrôle), pas une course étroite : `PR_SET_DUMPABLE=0` et le ro-bind `ipc/` réduisent la
   portée, ils ne l'empêchent pas. Ce résidu est **accepté** : le secret ne confère que
   l'autorité déjà accordée à cette session (catalogue fermé du relais, HMAC D7 revalidé côté
-  backend, session/tâche/bail courants), il est effacé au `close`/au nettoyage de redémarrage,
-  ré-armé par run, et `collect` refuse de persister un contenu d'agent qui le contient (formes
+  backend, session/tâche/bail courants), le secret brut est effacé au `close`/au nettoyage de
+  redémarrage/à la détection d'exposition, ré-armé par run, et `collect` ainsi que les écritures
+  API non humaines refusent de persister un contenu ou chemin qui le contient (formes
   brute, hex, base64/base64url ou fragment aligné d'au moins 16 octets) en faisant échouer la
   session avec `secret_exposure_detected` (`sessions/supervisor.py::_refuse_secret_exposure`,
   `sessions/state.py`). Il reste ouvert tant que le shim n'est pas déplacé côté hôte.
