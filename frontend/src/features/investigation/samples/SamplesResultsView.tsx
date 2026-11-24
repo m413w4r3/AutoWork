@@ -1770,7 +1770,7 @@ export function SamplesResultsView({
                   : "Relancer la collecte VT"}
             </button>
             <span className="samples-results__meta">
-              Collecte bornée par l’enveloppe G2 approuvée.
+              Collecte décrite par le plan VT affiché.
             </span>
           </div>
         ) : null}
