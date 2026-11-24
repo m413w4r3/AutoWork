@@ -42,6 +42,7 @@ import {
   orPlaceholder,
   shortSha,
 } from "../tasks/labels";
+import { toolOperationLabel } from "../tasks/timelinePresentation";
 
 const RECONCILIATION_STATE_LABELS: Record<string, string> = {
   not_required: "Non requise",
@@ -49,6 +50,10 @@ const RECONCILIATION_STATE_LABELS: Record<string, string> = {
   recorded: "Enregistrée",
   terminal: "Terminale",
 };
+
+function formatReferenceCount(value: number): string {
+  return new Intl.NumberFormat("fr-FR").format(value);
+}
 
 type LeadFieldKey = Exclude<keyof InvestigationLeadV1, "lead_id">;
 
@@ -87,6 +92,31 @@ function leadFieldValue(
 ): string {
   const raw: string | string[] = lead[field.key];
   if (field.kind === "list") {
+    if (field.key === "tools") {
+      return Array.isArray(raw)
+        ? raw.map(toolOperationLabel).join(" · ") || "Non renseigné"
+        : "Non renseigné";
+    }
+    if (field.key === "claim_refs") {
+      return Array.isArray(raw) && raw.length > 0
+        ? `${formatReferenceCount(raw.length)} référence(s)`
+        : "Aucune référence";
+    }
+    if (field.key === "start_evidence_refs") {
+      return Array.isArray(raw) && raw.length > 0
+        ? `${formatReferenceCount(raw.length)} preuve(s) de départ`
+        : "Aucune preuve de départ";
+    }
+    if (field.key === "sample_refs") {
+      return Array.isArray(raw) && raw.length > 0
+        ? `${formatReferenceCount(raw.length)} échantillon(s) référencé(s)`
+        : "Aucun échantillon référencé";
+    }
+    if (field.key === "depends_on") {
+      return Array.isArray(raw) && raw.length > 0
+        ? `${formatReferenceCount(raw.length)} dépendance(s)`
+        : "Aucune dépendance";
+    }
     return Array.isArray(raw) ? listOrPlaceholder(raw) : "Non renseigné";
   }
   return typeof raw === "string" ? orPlaceholder(raw) : "Non renseigné";
@@ -573,11 +603,6 @@ export function PlanPanel({ investigationId }: { investigationId: string }) {
                     <h5>
                       Piste {index + 1} — {orPlaceholder(lead.title)}
                     </h5>
-                    {lead.lead_id === undefined ? null : (
-                      <p className="m24-muted">
-                        Identifiant de piste : <code>{lead.lead_id}</code>
-                      </p>
-                    )}
                     <dl className="m24-metadata">
                       {LEAD_FIELDS.map((field) => (
                         <div key={field.key}>
@@ -586,6 +611,44 @@ export function PlanPanel({ investigationId }: { investigationId: string }) {
                         </div>
                       ))}
                     </dl>
+                    <details className="m24-timeline__technical">
+                      <summary>Détails techniques</summary>
+                      <dl className="m24-metadata m24-metadata--refs">
+                        {lead.lead_id === undefined ? null : (
+                          <div>
+                            <dt>Identifiant de piste</dt>
+                            <dd>
+                              <code>{lead.lead_id}</code>
+                            </dd>
+                          </div>
+                        )}
+                        {(
+                          [
+                            ["Références de claims", lead.claim_refs],
+                            ["Preuves de départ", lead.start_evidence_refs],
+                            ["Références d’échantillons", lead.sample_refs],
+                            ["Identifiants d’outils", lead.tools],
+                            ["Dépendances", lead.depends_on],
+                          ] as const
+                        ).map(([label, values]) => (
+                          <div key={label}>
+                            <dt>{label}</dt>
+                            <dd>
+                              {values.length === 0
+                                ? "Non renseigné"
+                                : values.map((value, valueIndex) => (
+                                    <code key={`${label}-${valueIndex}`}>
+                                      {value}
+                                      {valueIndex < values.length - 1
+                                        ? " · "
+                                        : ""}
+                                    </code>
+                                  ))}
+                            </dd>
+                          </div>
+                        ))}
+                      </dl>
+                    </details>
                   </article>
                 </li>
               ))}

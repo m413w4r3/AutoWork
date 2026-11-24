@@ -26,7 +26,12 @@ import {
   WorkshopSyncingState,
   WorkshopTypedErrorState,
 } from "../shell/WorkshopStates";
-import { SESSION_STATE_LABELS, formatTimestamp } from "../tasks/labels";
+import {
+  SESSION_STATE_LABELS,
+  activityEventLabel,
+  formatTimestamp,
+} from "../tasks/labels";
+import { INVOCATION_STATUS_LABELS } from "../samples/samplesLabels";
 import { BootstrapSection } from "./BootstrapSection";
 import {
   EnvelopeAccessSummary,
@@ -112,10 +117,11 @@ export function OverviewView({
     : "Indisponible";
   const latestEventAt =
     latestActivity?.updated_at ?? activityQuery.data?.last_activity_at;
-  const latestEventLabel =
+  const latestEventLabel = activityEventLabel(
     latestActivity?.activity_label ??
-    activityQuery.data?.last_activity_source ??
-    "Aucun événement consigné";
+      activityQuery.data?.last_activity_source ??
+      "Aucun événement consigné",
+  );
 
   return (
     <section
@@ -144,19 +150,31 @@ export function OverviewView({
 
       <section className="job-card" aria-label="Indicateurs de l’enquête">
         <h2>Indicateurs</h2>
-        <dl className="workshop-meta">
-          <dt>Décisions requises</dt>
-          <dd>{decisionsLoaded ? formatCount(decisions.length) : "—"}</dd>
-          <dt>Agents en cours</dt>
-          <dd>
-            {sessionsQuery.data ? formatCount(activeSessions.length) : "—"}
-          </dd>
-          <dt>Tâches actives</dt>
-          <dd>{tasksQuery.data ? formatCount(activeTasks.length) : "—"}</dd>
-          <dt>Résultats nouveaux</dt>
-          <dd>
-            {contributionsQuery.data ? formatCount(contributions.length) : "—"}
-          </dd>
+        <dl className="workshop-overview-metrics">
+          <div
+            className={`workshop-overview-metrics__tile${decisionsLoaded && decisions.length > 0 ? " workshop-overview-metrics__tile--attention" : ""}`}
+          >
+            <dt>Décisions requises</dt>
+            <dd>{decisionsLoaded ? formatCount(decisions.length) : "—"}</dd>
+          </div>
+          <div className="workshop-overview-metrics__tile">
+            <dt>Agents en cours</dt>
+            <dd>
+              {sessionsQuery.data ? formatCount(activeSessions.length) : "—"}
+            </dd>
+          </div>
+          <div className="workshop-overview-metrics__tile">
+            <dt>Tâches actives</dt>
+            <dd>{tasksQuery.data ? formatCount(activeTasks.length) : "—"}</dd>
+          </div>
+          <div className="workshop-overview-metrics__tile">
+            <dt>Résultats nouveaux</dt>
+            <dd>
+              {contributionsQuery.data
+                ? formatCount(contributions.length)
+                : "—"}
+            </dd>
+          </div>
         </dl>
       </section>
 
@@ -354,8 +372,10 @@ export function OverviewView({
                 .slice(0, 5)
                 .map((event) => (
                   <li key={`${event.id}-${event.version}`}>
-                    {redactTechnicalIdentifiers(event.activity_label)} ·{" "}
-                    {event.status} ·{" "}
+                    {activityEventLabel(event.activity_label)} ·{" "}
+                    {INVOCATION_STATUS_LABELS[event.status] ??
+                      "Statut d’activité enregistré"}{" "}
+                    ·{" "}
                     <time dateTime={event.updated_at}>
                       {formatTimestamp(event.updated_at)}
                     </time>
@@ -368,6 +388,27 @@ export function OverviewView({
 
       <details className="job-card" aria-label="Détails techniques">
         <summary>Détails techniques</summary>
+        <section aria-labelledby="overview-activity-technical-heading">
+          <h2 id="overview-activity-technical-heading">Activité enregistrée</h2>
+          <dl className="workshop-meta">
+            <dt>Type déclaré</dt>
+            <dd>
+              <code>
+                {latestActivity?.activity_label ??
+                  activityQuery.data?.last_activity_source ??
+                  "Non renseigné"}
+              </code>
+            </dd>
+            {latestActivity ? (
+              <>
+                <dt>Statut technique</dt>
+                <dd>
+                  <code>{latestActivity.status}</code>
+                </dd>
+              </>
+            ) : null}
+          </dl>
+        </section>
         <section aria-labelledby="overview-host-heading">
           <h2 id="overview-host-heading">Hôte et workspace</h2>
           <dl className="workshop-meta">
@@ -481,7 +522,7 @@ function AgentStatusPanel({
   const label =
     status in AGENT_STATUS_LABELS
       ? AGENT_STATUS_LABELS[status as keyof typeof AGENT_STATUS_LABELS]
-      : status;
+      : "État de l’agent hôte enregistré";
   return (
     <>
       <dl className="workshop-meta">

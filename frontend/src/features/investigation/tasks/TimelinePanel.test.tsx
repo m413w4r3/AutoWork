@@ -9,6 +9,7 @@ import {
   jsonResponse,
   wrapperFor,
 } from "../api/testSupport";
+import type { TimelinePageV1 } from "../api/tasks";
 import { TimelinePanel } from "./TimelinePanel";
 import { INVESTIGATION_ID, TASK_ID } from "./testFixtures";
 
@@ -16,7 +17,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-function timelinePage() {
+function timelinePage(): TimelinePageV1 {
   return {
     items: [
       {
@@ -195,8 +196,13 @@ describe("TimelinePanel", () => {
     expect(
       await screen.findByText("Rapport VT fichier · objet : échantillon"),
     ).toBeInTheDocument();
-    // The raw projection token stays available as the item title.
-    expect(screen.getByTitle("vt_file_report:sample")).toBeInTheDocument();
+    const observation = screen
+      .getByText("Rapport VT fichier · objet : échantillon")
+      .closest("li");
+    expect(observation).not.toBeNull();
+    expect(
+      within(observation as HTMLElement).getByText("vt_file_report:sample"),
+    ).not.toBeVisible();
     expect(screen.getByText("Preuve canonique")).toBeInTheDocument();
     expect(screen.getByText("Avis Bridge — non probant")).toBeInTheDocument();
     expect(screen.getAllByText("inv-1").length).toBeGreaterThan(0);
@@ -206,6 +212,18 @@ describe("TimelinePanel", () => {
       `/?vue=plan&task=${TASK_ID}`,
     );
     expect(screen.queryByText(TASK_ID)).toBeNull();
+  });
+
+  it("masque les jetons de résumé inconnus et garde leur valeur dans les détails", async () => {
+    const page = timelinePage();
+    page.items = page.items
+      .slice(0, 1)
+      .map((item) => ({ ...item, summary: "future_event:whatever" }));
+    renderTimeline(page);
+
+    expect(await screen.findByText("Activité enregistrée")).toBeVisible();
+    expect(screen.getByText("future_event:whatever")).not.toBeVisible();
+    expect(screen.getByText("Détails techniques")).toBeInTheDocument();
   });
 
   it("filtre par type puis par statut de preuve", async () => {
@@ -253,15 +271,19 @@ describe("TimelinePanel", () => {
       "Session Codex CLI · Attente d’instruction",
     );
     const instruction = screen.getByText("Instruction humaine · En file");
-    // The raw B7 tokens remain readable as titles.
-    expect(screen.getByTitle("handoff:v2:human->operator")).toBeInTheDocument();
-    expect(
-      screen.getByTitle("contribution:finding:imported"),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByTitle("agent_session:codex_cli:awaiting_instruction"),
-    ).toBeInTheDocument();
-    expect(screen.getByTitle("instruction:queued")).toBeInTheDocument();
+    // The raw B7 tokens remain available in collapsed technical details.
+    for (const [row, token] of [
+      [handoff.closest("li"), "handoff:v2:human->operator"],
+      [contribution.closest("li"), "contribution:finding:imported"],
+      [session.closest("li"), "agent_session:codex_cli:awaiting_instruction"],
+      [instruction.closest("li"), "instruction:queued"],
+    ] as const) {
+      expect(row).not.toBeNull();
+      expect(
+        within(row as HTMLElement).getByText("Détails techniques"),
+      ).toBeInTheDocument();
+      expect(within(row as HTMLElement).getByText(token)).not.toBeVisible();
+    }
     expect(
       within(handoff.closest("li") as HTMLElement).getByText("Passation"),
     ).toBeInTheDocument();

@@ -167,6 +167,16 @@ function itemMatchesText(item: TimelineItemV1, needle: string): boolean {
   );
 }
 
+function publicActorLabel(item: TimelineItemV1): string {
+  if (item.actor_kind === "operator" && item.actor_id !== null) {
+    const adapter = actorRefLabel(item.actor_id);
+    if (Object.values(ADAPTER_LABELS).includes(adapter)) {
+      return `Opérateur · ${adapter}`;
+    }
+  }
+  return TIMELINE_ACTOR_LABELS[item.actor_kind];
+}
+
 export function TimelinePanel({
   investigationId,
   taskId,
@@ -309,12 +319,7 @@ export function TimelinePanel({
                 <span className="m24-badge">
                   {TIMELINE_TYPE_LABELS[item.item_type]}
                 </span>
-                <span className="m24-muted">
-                  {TIMELINE_ACTOR_LABELS[item.actor_kind]}
-                  {item.actor_id === null
-                    ? ""
-                    : ` · ${actorRefLabel(item.actor_id)}`}
-                </span>
+                <span className="m24-muted">{publicActorLabel(item)}</span>
                 {item.evidence ? (
                   <span className="m24-badge m24-badge--evidence">
                     Preuve canonique
@@ -333,32 +338,52 @@ export function TimelinePanel({
                   </span>
                 )}
               </div>
-              <p title={item.summary}>{timelineSummaryLabel(item)}</p>
-              <dl className="m24-metadata m24-metadata--refs">
-                <div>
-                  <dt>Objet</dt>
-                  <dd>
-                    <code title={item.object_id} className="m24-id-ref">
-                      {shortSha(item.object_id)}
-                    </code>
-                  </dd>
-                </div>
-                {Object.entries(item.refs)
-                  // The object id is already the canonical id chip; only the
-                  // other refs add information.
-                  .filter(
-                    ([key, value]) =>
-                      key === "task_id" || value !== item.object_id,
-                  )
-                  .map(([key, value]) => (
-                    <div key={`${item.object_id}-${key}`}>
-                      <dt>{REF_LABELS[key] ?? key}</dt>
-                      <dd>
-                        <TimelineRefValue name={key} value={value} />
-                      </dd>
-                    </div>
-                  ))}
-              </dl>
+              <p>{timelineSummaryLabel(item)}</p>
+              <details className="m24-timeline__technical">
+                <summary>Détails techniques</summary>
+                <dl className="m24-metadata m24-metadata--refs">
+                  <div>
+                    <dt>Résumé brut</dt>
+                    <dd>
+                      <code>{item.summary || "Non renseigné"}</code>
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Acteur</dt>
+                    <dd>
+                      <code>{item.actor_id ?? "Non renseigné"}</code>
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Objet</dt>
+                    <dd>
+                      <code title={item.object_id} className="m24-id-ref">
+                        {shortSha(item.object_id)}
+                      </code>
+                    </dd>
+                  </div>
+                  {Object.entries(item.refs)
+                    // The object id is already the canonical id chip; only the
+                    // other refs add information.
+                    .filter(
+                      ([key, value]) =>
+                        key !== "task_id" && value !== item.object_id,
+                    )
+                    .map(([key, value]) => (
+                      <div key={`${item.object_id}-${key}`}>
+                        <dt>{REF_LABELS[key] ?? key}</dt>
+                        <dd>
+                          <TimelineRefValue name={key} value={value} />
+                        </dd>
+                      </div>
+                    ))}
+                </dl>
+              </details>
+              {item.refs.task_id ? (
+                <p>
+                  <TimelineRefValue name="task_id" value={item.refs.task_id} />
+                </p>
+              ) : null}
               {item.task_id === null ? null : (
                 <a
                   href={taskHref(item.task_id)}

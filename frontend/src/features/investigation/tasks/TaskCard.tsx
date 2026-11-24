@@ -47,6 +47,7 @@ import {
 import { TaskBridgePanel } from "./TaskBridgePanel";
 import { OperatorsPanel } from "./OperatorsPanel";
 import { TimelinePanel } from "./TimelinePanel";
+import { timelineSummaryLabel } from "./timelinePresentation";
 
 type TransferDestination = "human" | "codex_cli" | "claude_code";
 type SimpleCommand = "start" | "release" | "submit" | "unblock";
@@ -142,26 +143,42 @@ function ResultEvidence({ item }: { item: TimelineItemV1 }) {
           {status}
         </span>
       </div>
-      <p>{item.summary}</p>
-      {Object.entries(item.refs).length === 0 ? null : (
-        <dl className="m24-metadata m24-metadata--refs">
-          {Object.entries(item.refs)
-            .filter(([key]) => key !== "task_id")
-            .map(([key, value]) => (
+      <p>{timelineSummaryLabel(item)}</p>
+      {Object.entries(item.refs)
+        .filter(([, value]) => safeSourceUrl(value))
+        .map(([key, value]) => (
+          <p key={`${item.object_id}-${key}`}>
+            <a href={value} target="_blank" rel="noreferrer">
+              Ouvrir la source
+            </a>
+          </p>
+        ))}
+      {Object.entries(item.refs).length === 0 && !item.summary ? null : (
+        <details className="m24-timeline__technical">
+          <summary>Détails techniques</summary>
+          <dl className="m24-metadata m24-metadata--refs">
+            <div>
+              <dt>Résumé brut</dt>
+              <dd>
+                <code>{item.summary || "Non renseigné"}</code>
+              </dd>
+            </div>
+            <div>
+              <dt>Objet</dt>
+              <dd>
+                <code>{item.object_id}</code>
+              </dd>
+            </div>
+            {Object.entries(item.refs).map(([key, value]) => (
               <div key={`${item.object_id}-${key}`}>
                 <dt>{key.replaceAll("_", " ")}</dt>
                 <dd>
-                  {safeSourceUrl(value) ? (
-                    <a href={value} target="_blank" rel="noreferrer">
-                      Ouvrir la source
-                    </a>
-                  ) : (
-                    <code>{value}</code>
-                  )}
+                  <code>{value}</code>
                 </dd>
               </div>
             ))}
-        </dl>
+          </dl>
+        </details>
       )}
     </li>
   );

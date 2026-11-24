@@ -366,6 +366,9 @@ function makeApproval(): BootstrapEnvelopeApprovalV1 {
 }
 
 interface FetchOptions {
+  activityLabel?: string;
+  activitySource?: string;
+  activityStatus?: string;
   agent?: WorkspaceAgentStatusResponse;
   workspace?: WorkspaceStatusV1;
   inventory?: IOCInventoryV1;
@@ -415,13 +418,13 @@ function createFetch(options: FetchOptions) {
         Response.json({
           investigation: { status: "running" },
           last_activity_at: "2026-11-22T10:30:00Z",
-          last_activity_source: "Collecte VT",
+          last_activity_source: options.activitySource ?? "Collecte VT",
           timeline: [
             {
               id: "activity-1",
               version: 1,
-              activity_label: "Collecte VT terminée",
-              status: "succeeded",
+              activity_label: options.activityLabel ?? "Collecte VT terminée",
+              status: options.activityStatus ?? "succeeded",
               updated_at: "2026-11-22T10:30:00Z",
             },
           ],
@@ -524,6 +527,79 @@ afterEach(() => {
 });
 
 describe("OverviewView", () => {
+  it("présente les quatre indicateurs en tuiles et signale les décisions en attente", async () => {
+    renderOverview({});
+    const metrics = await screen.findByRole("region", {
+      name: "Indicateurs de l’enquête",
+    });
+    const tiles = metrics.querySelectorAll(".workshop-overview-metrics__tile");
+    expect(tiles).toHaveLength(4);
+
+    const decisionTile = within(metrics)
+      .getByText("Décisions requises")
+      .closest(".workshop-overview-metrics__tile");
+    await waitFor(() => expect(decisionTile).toHaveTextContent("1"));
+    expect(decisionTile).toHaveClass(
+      "workshop-overview-metrics__tile--attention",
+    );
+    expect(decisionTile).toHaveTextContent("1");
+  });
+
+  it("ne met pas en évidence la tuile quand aucune décision n’est requise", async () => {
+    renderOverview({
+      proposal: makeProposal({ already_approved: true }),
+      envelope: {
+        ...makeGovernanceEnvelope(true),
+        currently_authorized: false,
+      },
+    });
+    const metrics = await screen.findByRole("region", {
+      name: "Indicateurs de l’enquête",
+    });
+    const decisionTile = within(metrics)
+      .getByText("Décisions requises")
+      .closest(".workshop-overview-metrics__tile");
+    await waitFor(() => expect(decisionTile).toHaveTextContent("0"));
+    expect(decisionTile).not.toHaveClass(
+      "workshop-overview-metrics__tile--attention",
+    );
+    expect(decisionTile).toHaveTextContent("0");
+  });
+
+  it("traduit l’événement d’enquête et garde le jeton brut dans les détails techniques", async () => {
+    const user = userEvent.setup();
+    renderOverview({
+      activityLabel: "investigation_record",
+      activitySource: "investigation_record",
+      activityStatus: "succeeded",
+    });
+
+    expect(await screen.findByText("Mise à jour du dossier")).toBeVisible();
+    expect(screen.getByText(/Mise à jour du dossier · Réussi/)).toBeVisible();
+
+    const overview = screen.getByLabelText("Vue d’ensemble de l’enquête");
+    const visibleOverview = overview.cloneNode(true) as HTMLElement;
+    visibleOverview
+      .querySelectorAll("details")
+      .forEach((item) => item.remove());
+    expect(visibleOverview.textContent).not.toContain("investigation_record");
+    expect(visibleOverview.textContent).not.toContain("succeeded");
+
+    const technicalDetails = overview.querySelector(
+      'details[aria-label="Détails techniques"]',
+    );
+    expect(technicalDetails).not.toBeNull();
+    await user.click(
+      within(technicalDetails as HTMLElement).getByText("Détails techniques"),
+    );
+    expect(
+      within(technicalDetails as HTMLElement).getByText("investigation_record"),
+    ).toBeVisible();
+    expect(
+      within(technicalDetails as HTMLElement).getByText("succeeded"),
+    ).toBeVisible();
+  });
+
   it("navigue vers la tâche dans le cockpit, sans rechargement, et Retour restaure la vue", async () => {
     const user = userEvent.setup();
     const task = makeTask({
@@ -610,11 +686,13 @@ describe("OverviewView", () => {
       "99999999-9999-4999-8999-999999999999",
     );
 
-    const technicalDetails = screen
-      .getByText("Détails techniques")
-      .closest("details");
+    const technicalDetails = overview.querySelector(
+      'details[aria-label="Détails techniques"]',
+    );
     expect(technicalDetails).not.toHaveAttribute("open");
-    await user.click(screen.getByText("Détails techniques"));
+    await user.click(
+      within(technicalDetails as HTMLElement).getByText("Détails techniques"),
+    );
     expect(screen.getByText(INVESTIGATION_ID)).toBeVisible();
     expect(screen.getByText(SUBJECT_ID)).toBeVisible();
     expect(

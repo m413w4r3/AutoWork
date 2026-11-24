@@ -34,7 +34,7 @@ import {
   WorkshopStateBanner,
   WorkshopTypedErrorState,
 } from "../shell/WorkshopStates";
-import { formatTimestamp } from "../tasks/labels";
+import { actorKindLabel, formatTimestamp } from "../tasks/labels";
 import {
   BUDGET_DIMENSION_LABELS,
   formatBytes,
@@ -358,7 +358,9 @@ function EnvelopeRights({ envelope }: { envelope: InvestigationEnvelopeView }) {
         {otherProviders.length > 0 ? (
           <>
             <dt>Autres fournisseurs</dt>
-            <dd>{otherProviders.join(", ")}</dd>
+            <dd>
+              {formatCount(otherProviders.length)} fournisseur(s) enregistré(s)
+            </dd>
           </>
         ) : null}
       </dl>
@@ -488,8 +490,8 @@ function EnvelopeDecision({ envelope }: { envelope: EnvelopeLifecycleView }) {
         <dt>{policyAuthority ? "Activée par" : "Acteur authentifié"}</dt>
         <dd>
           {policyAuthority
-            ? (envelope.policy_activated_by ?? "Non renseigné")
-            : (envelope.approval_actor_id ?? "Non renseigné")}
+            ? actorKindLabel(envelope.policy_activated_by)
+            : actorKindLabel(envelope.approval_actor_id)}
         </dd>
         <dt>{policyAuthority ? "Activée le" : "Décidée le"}</dt>
         <dd>
@@ -523,6 +525,30 @@ function EnvelopeTechnicalDetails({
       <dl className="workshop-meta">
         <dt>Version de l’enveloppe</dt>
         <dd>{revoked ? revokedVersion : envelope.version}</dd>
+        {envelope.approval_actor_id ? (
+          <>
+            <dt>Identifiant de l’acteur authentifié</dt>
+            <dd>
+              <code>{envelope.approval_actor_id}</code>
+            </dd>
+          </>
+        ) : null}
+        {envelope.policy_activated_by ? (
+          <>
+            <dt>Identifiant de l’acteur ayant activé la politique</dt>
+            <dd>
+              <code>{envelope.policy_activated_by}</code>
+            </dd>
+          </>
+        ) : null}
+        {envelope.allowed_providers.length > 0 ? (
+          <>
+            <dt>Identifiants de fournisseurs autorisés</dt>
+            <dd>
+              <code>{envelope.allowed_providers.join(", ")}</code>
+            </dd>
+          </>
+        ) : null}
         <dt>Identifiant de décision</dt>
         <dd>
           <code>{envelope.approval_decision_id ?? "Non fourni"}</code>
@@ -567,13 +593,14 @@ function InheritedPolicy({ envelope }: { envelope: EnvelopeLifecycleView }) {
   if (envelope.authority_kind) {
     rows.push([
       "Autorité",
-      AUTHORITY_KIND_LABELS[envelope.authority_kind] ?? envelope.authority_kind,
+      AUTHORITY_KIND_LABELS[envelope.authority_kind] ?? "Autorité enregistrée",
     ]);
   }
   if (envelope.policy_status) {
     rows.push([
       "Statut de la politique",
-      POLICY_STATUS_LABELS[envelope.policy_status] ?? envelope.policy_status,
+      POLICY_STATUS_LABELS[envelope.policy_status] ??
+        "Statut de politique enregistré",
     ]);
   }
   if (rows.length === 0) return null;

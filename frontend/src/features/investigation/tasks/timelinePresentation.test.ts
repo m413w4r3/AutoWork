@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import type { TimelineItemV1 } from "../api/tasks";
-import { timelineSummaryLabel } from "./timelinePresentation";
+import {
+  timelineSummaryLabel,
+  toolOperationLabel,
+} from "./timelinePresentation";
 
 function item(overrides: Partial<TimelineItemV1>): TimelineItemV1 {
   return {
@@ -117,14 +120,28 @@ describe("timelineSummaryLabel", () => {
     ).toBe("Instruction humaine · En file");
   });
 
-  it("laisse le jeton brut intact quand il ne peut pas être traduit", () => {
+  it("utilise un libellé générique quand l’événement ne peut pas être traduit", () => {
     expect(
       timelineSummaryLabel(item({ summary: "future_event:whatever" })),
-    ).toBe("future_event:whatever");
+    ).toBe("Activité enregistrée");
     expect(
       timelineSummaryLabel(
         item({ item_type: "tool_invocation", summary: "future.tool:unknown" }),
       ),
-    ).toBe("future.tool:unknown");
+    ).toBe("Activité enregistrée");
+    expect(
+      timelineSummaryLabel(
+        item({ item_type: "contribution", summary: "Finding importé" }),
+      ),
+    ).toBe("Finding importé");
+  });
+});
+
+describe("toolOperationLabel", () => {
+  it("traduit les outils connus et rend lisible un outil personnalisé", () => {
+    expect(toolOperationLabel("vt.object_report")).toBe(
+      "Rapport VT d’un objet",
+    );
+    expect(toolOperationLabel("future_tool.action")).toBe("Future Tool Action");
   });
 });
