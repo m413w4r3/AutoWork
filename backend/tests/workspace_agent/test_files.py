@@ -329,7 +329,6 @@ def test_agent_owned_write_requires_the_matching_task_header(
 ) -> None:
     workspace_id = ensure_workspace(scanning_client, scanning_agent)
     task_directory = workspace_tree(scanning_agent) / "notes" / "agents" / "taskA"
-    task_directory.mkdir(parents=True)
     path = "notes/agents/taskA/rapport.md"
 
     mismatch = put_file(
@@ -363,6 +362,8 @@ def test_agent_owned_write_requires_the_matching_task_header(
     )
     assert accepted.status_code == 201, accepted.text
     assert accepted.json()["revision"]["task_id"] == "taskA"
+    assert task_directory.is_dir()
+    assert stat.S_IMODE(task_directory.stat().st_mode) == 0o700
     events_here = events_for(scanning_client, scanning_agent, workspace_id, path)
     assert [event["task_id"] for event in events_here] == ["taskA"]
 

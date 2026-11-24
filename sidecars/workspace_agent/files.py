@@ -227,7 +227,22 @@ def write_file(
 
     workspace_fd = _open_workspace_directory(root, descriptor)
     try:
-        parent_fd = _open_parent(workspace_fd, components, hooks=hooks)
+        # Agent note capture uses one private subtree per task. Unlike the
+        # static workspace layout, that subtree is created on demand; mirror
+        # the session collector's safe dirfd creation so a fresh task can use
+        # the same authorized file route without pre-seeding directories.
+        create_agent_note_parent = (
+            route is policies.WriteRoute.FILES
+            and validated_origin == "agent"
+            and policies.agent_task_id_for(path) is not None
+        )
+        parent_fd = _open_parent(
+            workspace_fd,
+            components,
+            hooks=hooks,
+            create=create_agent_note_parent,
+            mode=workspace.PRIVATE_DIRECTORY_MODE,
+        )
         try:
             temporary = _stream_to_temporary(parent_fd, components[-1], source, declared_length)
             try:
@@ -600,9 +615,16 @@ def _open_workspace_directory(root: Path, descriptor: workspace.WorkspaceDescrip
 
 
 def _open_parent(
-    workspace_fd: int, components: tuple[str, ...], *, hooks: paths.WalkHooks | None = None
+    workspace_fd: int,
+    components: tuple[str, ...],
+    *,
+    hooks: paths.WalkHooks | None = None,
+    create: bool = False,
+    mode: int = workspace.PRIVATE_DIRECTORY_MODE,
 ) -> int:
-    return paths.open_directory_chain(workspace_fd, components[:-1], create=False, hooks=hooks)
+    return paths.open_directory_chain(
+        workspace_fd, components[:-1], create=create, mode=mode, hooks=hooks
+    )
 
 
 def _manifest_component(descriptor: workspace.WorkspaceDescriptor, field: str) -> str:
