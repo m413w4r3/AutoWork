@@ -832,13 +832,19 @@ async function expectNoClippedContent(
       const overflowingDescendants = descendants.flatMap((element) => {
         const style =
           panelElement.ownerDocument.defaultView.getComputedStyle(element);
+        const intentionallyScrollable =
+          style.overflowX === "auto" ||
+          style.overflowX === "scroll" ||
+          style.overflowY === "auto" ||
+          style.overflowY === "scroll";
+        // The canonical excerpt textarea and any element with its own scroll
+        // area (including PRE/CODE) are intentional. isHidden also excludes
+        // out-of-flow visually masked controls and other non-visible content.
         if (
           element.tagName === "TEXTAREA" ||
-          (element.tagName === "PRE" &&
-            (style.overflowX === "auto" ||
-              style.overflowX === "scroll" ||
-              style.overflowY === "auto" ||
-              style.overflowY === "scroll")) ||
+          ((element.tagName === "PRE" || element.tagName === "CODE") &&
+            intentionallyScrollable) ||
+          intentionallyScrollable ||
           isHidden(element, style) ||
           element.scrollWidth <= element.clientWidth + 1
         ) {
@@ -863,7 +869,7 @@ async function expectNoClippedContent(
 
       return {
         clipped,
-        overflowingDescendants: overflowingDescendants.slice(0, 5),
+        overflowingDescendants,
         scrollWidth: panelElement.scrollWidth,
         clientWidth: panelElement.clientWidth,
       };
@@ -872,6 +878,10 @@ async function expectNoClippedContent(
     expect(
       measurement.clipped,
       `${rootSelector} has visible descendants clipped past its right edge at ${width}px`,
+    ).toEqual([]);
+    expect(
+      measurement.overflowingDescendants,
+      `${rootSelector} has visible descendants whose content overflows its box at ${width}px (tag, class, text, content px, and panel-edge px; scrollable/hidden elements are excluded)`,
     ).toEqual([]);
     expect(
       measurement.scrollWidth,
@@ -2587,6 +2597,8 @@ test("parcours atelier M24 étapes 1–32 : workspace, tâches, Notes, PDF, G2",
     .check();
   const excerptEditor = codeSelector.getByLabel(/Extrait canonique en texte/);
   await expect(excerptEditor).toBeVisible();
+  const canonicalCodeExcerpt = await excerptEditor.inputValue();
+  expect(canonicalCodeExcerpt).toMatch(/^[\x20-\x7e]+$/);
   await excerptEditor.press("Control+A");
   await expect(codeSelector.getByRole("status").last()).toContainText(
     /\d+ octets à partir de/,
@@ -2757,6 +2769,13 @@ test("parcours atelier M24 étapes 1–32 : workspace, tâches, Notes, PDF, G2",
     ),
   ).toHaveLength(2);
   expect(
+    occurrences(
+      pdfText.replace(/\s+/g, ""),
+      canonicalCodeExcerpt.replace(/\s+/g, ""),
+    ),
+    "the exact printable ASCII excerpt selected in the visual canonical-code selector appears once in the PDF",
+  ).toHaveLength(1);
+  expect(
     occurrences(pdfText, "Le texte a ete corrige apres revue humaine"),
   ).toHaveLength(1);
   // The corrected text replaced the first version at its anchor.
@@ -2791,6 +2810,18 @@ test("parcours atelier M24 étapes 1–32 : workspace, tâches, Notes, PDF, G2",
     "M23-D2-ARTICLE-FIGURE-UNIQUE",
   );
   expect(m23FigureMarkerPositions).toHaveLength(2);
+  expect(
+    occurrences(pdfText, "Figure 1 : M23-D2-ARTICLE-FIGURE-UNIQUE"),
+    "the source figure and its caption are rendered once at the article placement",
+  ).toHaveLength(1);
+  expect(
+    occurrences(pdfText, "Figure 1 — M23-D2-ARTICLE-FIGURE-UNIQUE"),
+    "the note carries one figure reference by type and caption without duplicating the figure",
+  ).toHaveLength(1);
+  expect(
+    occurrences(pdfText, "Référence d'article — Figure"),
+    "the opinion refers to the carried article figure once by type",
+  ).toHaveLength(1);
   const figureReferencePosition = m23FigureMarkerPositions[1];
   if (figureReferencePosition === undefined) {
     throw new Error("the M23 figure cross-reference is missing from the PDF");
