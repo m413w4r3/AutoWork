@@ -17,7 +17,7 @@ import socket
 import stat
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -770,6 +770,25 @@ class WorkspaceAgentRequestHandler(BaseHTTPRequestHandler):
                 if route.template == "/v1/workspaces/{workspace_id}/files"
                 else policies.WriteRoute.GENERATED
             )
+            non_ui_write_admission = None
+            non_ui_content_check = None
+            if origin in {"agent", "system"}:
+                supervisor = self._sessions()
+                non_ui_write_admission = supervisor.admit_non_ui_file_write
+
+                def check_non_ui_file_write(
+                    write_task_id: str | None,
+                    destination: str,
+                    read_content: Callable[[], bytes],
+                ) -> None:
+                    supervisor.check_non_ui_file_write(
+                        write_task_id,
+                        destination,
+                        read_content,
+                        workspace_id=descriptor.workspace_id,
+                    )
+
+                non_ui_content_check = check_non_ui_file_write
             outcome = files.write_file(
                 root=manager.root,
                 descriptor=descriptor,
@@ -784,11 +803,8 @@ class WorkspaceAgentRequestHandler(BaseHTTPRequestHandler):
                 source=self.rfile,
                 declared_length=declared_length,
                 idempotency_key=self.headers.get(protocol.IDEMPOTENCY_KEY_HEADER) or "",
-                non_ui_content_check=(
-                    self._sessions().check_non_ui_file_write
-                    if origin in {"agent", "system"}
-                    else None
-                ),
+                non_ui_write_admission=non_ui_write_admission,
+                non_ui_content_check=non_ui_content_check,
             )
             return outcome.status, outcome.body
         return None
@@ -1028,10 +1044,14 @@ class WorkspaceAgentHTTPServer(ThreadingHTTPServer):
 
     def server_close(self) -> None:
         supervisor = getattr(self, "session_supervisor", None)
-        if supervisor is not None:
-            supervisor.stop()
-        super().server_close()
-        self._unlink_socket_path()
+        try:
+            if supervisor is not None:
+                supervisor.stop()
+        finally:
+            try:
+                super().server_close()
+            finally:
+                self._unlink_socket_path()
 
     def _unlink_socket_path(self) -> None:
         try:

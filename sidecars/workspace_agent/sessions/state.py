@@ -150,6 +150,28 @@ class SessionBusyError(SessionError):
         )
 
 
+class SessionWriteAdmissionError(SessionError):
+    code = ErrorCode.SESSION_STATE_CONFLICT
+    status = 409
+
+    def __init__(self) -> None:
+        super().__init__(
+            "the session is closing and cannot admit a file write",
+            details={"operation": "file_write"},
+        )
+
+
+class SessionWriteDrainTimeoutError(SessionError):
+    code = ErrorCode.SESSION_BUSY
+    status = 409
+
+    def __init__(self, operation: str) -> None:
+        super().__init__(
+            "timed out waiting for admitted file writes",
+            details={"operation": operation},
+        )
+
+
 class ConfinementUnavailableError(SessionError):
     code = ErrorCode.CONFINEMENT_UNAVAILABLE
     status = 503

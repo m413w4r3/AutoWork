@@ -202,12 +202,14 @@ class WorkspaceAgent:
     def stop(self) -> None:
         self._stop_scan_thread()
         server, self._server = self._server, None
-        if server is not None:
-            server.server_close()
-        self._lock.release()
-        self._ready.clear()
-        self.token = None
-        LOGGER.info("workspace agent stopped instance_id=%s", self.instance_id)
+        try:
+            if server is not None:
+                server.server_close()
+        finally:
+            self._lock.release()
+            self._ready.clear()
+            self.token = None
+            LOGGER.info("workspace agent stopped instance_id=%s", self.instance_id)
 
     def _start_scan_thread(self) -> None:
         self._scan_stop.clear()

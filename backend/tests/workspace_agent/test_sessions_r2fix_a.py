@@ -70,10 +70,15 @@ def _dispatch_agent_file_write(
 ) -> tuple[object, Path, SimpleNamespace]:
     environment = make_scan_environment(tmp_path)
     task_note = f"notes/agents/{TASK_ID}/note.md"
-    record = SimpleNamespace(task_id=TASK_ID, state=SessionState.READY)
+    record = SimpleNamespace(
+        task_id=TASK_ID,
+        workspace_id=environment.descriptor.workspace_id,
+        state=SessionState.READY,
+    )
     handle = SimpleNamespace(
         record=record,
         lock=threading.RLock(),
+        write_admission=sessions_supervisor._WriteAdmission(),
         secret_forms=sessions_supervisor._secret_content_forms(URLSAFE_SECRET),
         provider_credential_forms=(),
         directory=tmp_path,
@@ -81,6 +86,7 @@ def _dispatch_agent_file_write(
     supervisor = object.__new__(sessions_supervisor.SessionSupervisor)
     supervisor._sessions = {SESSION_ID: handle} if active else {}
     supervisor._lock = threading.RLock()
+    supervisor._stopped = threading.Event()
     supervisor._revoke_secret_exposure = lambda target, **_kwargs: setattr(
         target.record, "state", SessionState.FAILED
     )
@@ -133,10 +139,15 @@ def _dispatch_non_ui_file_write(
     destination = destination_override or (
         "results/export-report.md" if generated else "notes/humaines/par-agent.md"
     )
-    record = SimpleNamespace(task_id=TASK_ID, state=SessionState.READY)
+    record = SimpleNamespace(
+        task_id=TASK_ID,
+        workspace_id=environment.descriptor.workspace_id,
+        state=SessionState.READY,
+    )
     handle = SimpleNamespace(
         record=record,
         lock=threading.RLock(),
+        write_admission=sessions_supervisor._WriteAdmission(),
         secret_forms=sessions_supervisor._secret_content_forms(URLSAFE_SECRET),
         provider_credential_forms=(),
         directory=tmp_path,
@@ -146,13 +157,19 @@ def _dispatch_non_ui_file_write(
     if active:
         for index, secret in enumerate(additional_session_secrets):
             supervisor._sessions[f"session-other-{index}"] = SimpleNamespace(
-                record=SimpleNamespace(task_id=f"task-other-{index}", state=SessionState.READY),
+                record=SimpleNamespace(
+                    task_id=f"task-other-{index}",
+                    workspace_id=environment.descriptor.workspace_id,
+                    state=SessionState.READY,
+                ),
                 lock=threading.RLock(),
+                write_admission=sessions_supervisor._WriteAdmission(),
                 secret_forms=sessions_supervisor._secret_content_forms(secret),
                 provider_credential_forms=(),
                 directory=tmp_path,
             )
     supervisor._lock = threading.RLock()
+    supervisor._stopped = threading.Event()
     supervisor._revoke_secret_exposure = lambda target, **_kwargs: setattr(
         target.record, "state", SessionState.FAILED
     )

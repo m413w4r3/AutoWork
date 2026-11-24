@@ -202,6 +202,7 @@ def write_file(
     source: ByteSource,
     declared_length: int,
     idempotency_key: str,
+    non_ui_write_admission: Callable[[str], Callable[[], None]] | None = None,
     non_ui_content_check: Callable[[str | None, str, Callable[[], bytes]], None] | None = None,
     hooks: paths.WalkHooks | None = None,
 ) -> WriteOutcome:
@@ -246,6 +247,9 @@ def write_file(
             mode=workspace.PRIVATE_DIRECTORY_MODE,
         )
         try:
+            release_admission: Callable[[], None] | None = None
+            if validated_origin != "ui" and non_ui_write_admission is not None:
+                release_admission = non_ui_write_admission(descriptor.workspace_id)
             temporary = _stream_to_temporary(parent_fd, components[-1], source, declared_length)
             try:
                 if validated_origin != "ui" and non_ui_content_check is not None:
@@ -279,7 +283,11 @@ def write_file(
                         pass
                 _unlink_quietly(parent_fd, temporary.name)
         finally:
-            os.close(parent_fd)
+            try:
+                if release_admission is not None:
+                    release_admission()
+            finally:
+                os.close(parent_fd)
     finally:
         os.close(workspace_fd)
 
