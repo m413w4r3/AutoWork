@@ -52,7 +52,7 @@ déclare aucun GO. Ne présente comme vérifié que ce que tu as rejoué toi-mê
 
 (Chaque ligne : ce qui a été exécuté dans le checkout principal, et sur quel commit.)
 
-- Frontend : `pnpm exec vitest run` 123 fichiers / 942 tests, `pnpm typecheck`, `pnpm lint` (0 erreur, 2 avertissements Fast Refresh existants dans `AnchorPicker.tsx`) — après le merge de UX-F.
+- Frontend : `pnpm exec vitest run` **124 fichiers / 980 tests**, `pnpm typecheck`, `pnpm lint` (0 erreur, 2 avertissements Fast Refresh existants dans `AnchorPicker.tsx`) — après le merge de fix-R3c (HEAD `4e7c1839`).
 - Backend : `tests/workspace_agent` + `test_agentic_host_sessions.py` + `test_agentic_tool_broker.py` + `workflow_emulator/test_m24_browser_server.py` = **837 passés**, `make lint-backend` et `make typecheck-backend` verts — après le merge de fix-R1c.
 - Typst/IOC/rendu/édition : 312 passés + 8 PG de rendu — après le correctif d'annexe R6.
 - Migrations 0027–0029 : 186 tests de chaîne/migration verts ; **M24.2 n'ajoute aucune migration**.
@@ -73,18 +73,14 @@ Reviewers = agents Luna Audit (read-only). Verdicts successifs :
 | R2 concurrence | GO avec réserves | 2 mineurs documentés (§6). Le « test bloqué » = refus de sandbox sur sockets, pas un deadlock |
 | R3 provenance (18f9d0a9) | NO-GO | Corrigé : modèle d'API/domaine `canonical_code` non borné (`88d1ad4d`, `18f9d0a9`), plafond 4 MiB de l'endpoint retiré (`86d76820`), association d'échantillon par id d'abord (`cac43c92`) |
 | R3b (fca03982) | NO-GO : affichage G2 `superseded` | Corrigé partiellement par `3b2e7978` |
-| R3c (dd89f5f5) | NO-GO : G2 encore affiché « autorisé » dans la carte du journal (`InvestigationPanels.tsx`) et libellés de divulgation | **Correctif en cours (agent d9a07df6) : helper partagé `envelopeAccessState`. À re-revoir (R3d).** |
+| R3c (dd89f5f5) | NO-GO : G2 encore affiché « autorisé » dans la carte du journal (`InvestigationPanels.tsx`) et libellés de divulgation | Corrigé par `112c5557` : helper partagé `envelopeAccess.ts` (état jamais approuvée / active / révoquée / inactive) utilisé par tous les affichages. **À re-revoir (R3d).** |
 | R4 architecture | GO avec réserves | Budget de collecte limité aux fichiers importables (`e125179f`), onglets clavier + garde-fou e2e (UX-F) |
-| R5 UX | GO avec réserves (UX-01..19 attestés, UX-20 PARTIEL faute de captures sur le HEAD) | Régénération des captures en cours (agent eb963898) |
+| R5 UX | GO avec réserves (UX-01..19 attestés, UX-20 PARTIEL faute de captures sur le HEAD) | Captures régénérées (`c1bb3233`, 69 PNG, états PDF en cours/échoué/obsolète simulés) sur `dd89f5f5` ; elles ne reflètent pas le dernier correctif d'affichage G2 (`112c5557`) → re-capturer au besoin |
 | R6 éditorial | GO avec réserves | Annexe `breakable: false` (manifestes v49/v38), garde `URL.createObjectURL`, assertions PDF du texte canonical_code |
 
 ## 5. À FAIRE (dans l'ordre)
 
-1. **Attendre/récupérer les deux agents en cours** (ou vérifier leur état avec `get_agent_status`) :
-   - `d9a07df6-7c1b-4ae9-a479-25808d549688` — fix R3c, worktree `m24-2-fix-r3c`, branche `m24-2/fix-r3c-g2-everywhere` (frontend, état G2 partagé).
-   - `eb963898-e345-4749-ac8d-dd9026943049` — captures finales, worktree `m24-2-cap-final`, branche `m24-2/cap-final` (régénère `docs/m24/captures-m24-2/` + `M24-2-CAPTURES.md`).
-   Pour chacun : relis le diff, `git merge --no-ff <branche>` dans `m24-2/integration`, **rejoue** ses tests (frontend : vitest complet, typecheck, lint).
-   Si un agent a terminé sans committer, ou a échoué : ne le re-prompte pas, lance un agent frais avec le même brief.
+1. **Aucun sous-agent n'est en cours** : tous les agents lancés par l'orchestrateur précédent ont terminé et sont FUSIONNÉS dans `m24-2/integration` (dernier : fix-R3c `112c5557`, captures `c1bb3233`). Vérifie quand même `mcp__paseo__list_agents` (y compris `includeBackground`) avant de lancer du neuf.
 2. **Re-revues fraîches ciblées** (agents Luna Audit xhigh, lecture seule, avec la règle §0.1) :
    - **R1d** : écritures non humaines contrôlées contre les secrets des sessions actives (`sidecars/workspace_agent/files.py`, `http_server.py`, `sessions/supervisor.py`) ; aucune écriture sans secret n'est affectée ; origine `ui` exclue.
    - **R3d** : plus aucun affichage de l'autorité G2 n'appelle « autorisé » un état non actif (grep `allowed_providers`, `currently_authorized`, `envelope_approved`) ; autorité G2 inchangée.
@@ -93,7 +89,8 @@ Reviewers = agents Luna Audit (read-only). Verdicts successifs :
    - suite backend complète (commande CI) → viser 0 échec ; **surveille `tests/workspace_agent/test_races.py::test_symlink_swap_loop_never_escapes_the_workspace`** (1 échec non reproduit sur ~170 exécutions ; il contient une assertion statistique `successes > 0` ; ne le déclare pas flake sans analyse) ;
    - `make test-workflow-full WORKFLOW_RESULTS_DIR=/tmp/…` ;
    - `make test-investigation-browser …` (32 étapes) ;
-   - frontend complet, `make lint-backend`, `make typecheck-backend`.
+   - frontend complet, `make lint-backend`, `make typecheck-backend` ;
+   - si le rendu G2 a changé de façon visible, régénère les captures G2 (`overview-revoked`, détail G2 révoqué) et mets à jour `M24-2-CAPTURES.md` (agent frais, il doit OUVRIR les images).
 4. **Écrire `docs/m24/M24-2-FINAL-REPORT.md`** (mandat §25) : pour chaque résultat → commit, commande, environnement, statut, niveau de preuve, restriction. Inclure : causes de la CI M24.1, correctifs de sécurité, modifications UI, comparatif des captures, tableau des **capacités attestées / non attestées**, procédure d'activation contrôlée des CLI (`M24-2-CLI-REATTESTATION.md`), liste précise des **autorisations externes restantes**, six revues avec le modèle réellement utilisé, résidus (§6), écart d'ordre assumé (les lots B ont démarré avant la clôture du gate du lot A, fichiers disjoints).
 5. Commit local final. **Ne rien pousser.** Rapporte à l'utilisateur.
 
@@ -110,9 +107,11 @@ Reviewers = agents Luna Audit (read-only). Verdicts successifs :
 - bwrap réel : le noyau de la machine refuse les namespaces utilisateur ; seuls les `argv` construits et des faux CLI sont testés. Vrais CLI Codex/Claude, VT, Shodan, Bridge : **jamais appelés** (autorisation séparée requise).
 - Densité des listes IOC / sélecteur de code, `SamplesResultsView.tsx` très gros (~2000 lignes) : souhaitable à découper, non bloquant.
 
-## 7. Journal des derniers commits (à compléter par le dernier agent de la chaîne)
+## 7. Journal des derniers commits
 
-HEAD au moment de l'écriture de ce document : **voir la fin du fichier** (section ajoutée à la passation).
+HEAD à la passation : **`4e7c1839`** (92 commits après `dfa25c54`), branche `m24-2/integration`, arbre propre hors `paseo.json`.
+Derniers merges, du plus ancien au plus récent : fix-R1b (`63ad2777`) → fix-R1c (`2522040d`) → captures finales (`c1bb3233`) → fix-R3c (`112c5557`).
+Fait à vérifier : `git log --oneline -12` doit montrer ces merges.
 
 ## 8. Recettes d'environnement (pièges vérifiés)
 
