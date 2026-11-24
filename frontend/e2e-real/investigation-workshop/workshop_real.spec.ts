@@ -680,7 +680,94 @@ async function capture(
     await page.setViewportSize({ width, height });
     if (target !== undefined) {
       await expect(target).toBeVisible();
-      await target.scrollIntoViewIfNeeded();
+      if (name.startsWith("overview-")) {
+        const contextBar = page.locator(".workshop-context-bar");
+        const cockpitTabs = page.getByRole("tablist", {
+          name: "Vues du cockpit d’enquête",
+        });
+        await expect(contextBar).toBeVisible();
+        await expect(cockpitTabs).toBeVisible();
+        await page.evaluate(() => {
+          const browser = globalThis as unknown as {
+            document: { querySelector: (selector: string) => unknown };
+            window: { scrollBy: (x: number, y: number) => void };
+          };
+          const element = browser.document.querySelector(
+            ".workshop-context-bar",
+          ) as { getBoundingClientRect: () => { top: number } } | null;
+          if (element === null) {
+            throw new Error("the workshop context bar is missing");
+          }
+          browser.window.scrollBy(0, element.getBoundingClientRect().top);
+        });
+        await expect(target).toBeInViewport();
+        const headerLayout = await page.evaluate(() => {
+          const browser = globalThis as unknown as {
+            document: { querySelector: (selector: string) => unknown };
+            window: { innerHeight: number };
+          };
+          const context = browser.document.querySelector(
+            ".workshop-context-bar",
+          ) as {
+            getBoundingClientRect: () => { top: number; bottom: number };
+          } | null;
+          const tabs = browser.document.querySelector(
+            '[role="tablist"][aria-label="Vues du cockpit d’enquête"]',
+          ) as {
+            getBoundingClientRect: () => { top: number; bottom: number };
+          } | null;
+          if (context === null || tabs === null) {
+            throw new Error("the workshop context bar or tabs are missing");
+          }
+          return {
+            contextTop: context.getBoundingClientRect().top,
+            contextBottom: context.getBoundingClientRect().bottom,
+            tabsTop: tabs.getBoundingClientRect().top,
+            tabsBottom: tabs.getBoundingClientRect().bottom,
+            viewportHeight: browser.window.innerHeight,
+          };
+        });
+        expect(headerLayout.contextTop).toBeGreaterThanOrEqual(-1);
+        expect(headerLayout.contextTop).toBeLessThanOrEqual(1);
+        expect(headerLayout.contextBottom).toBeLessThanOrEqual(
+          headerLayout.viewportHeight,
+        );
+        expect(headerLayout.tabsTop).toBeGreaterThanOrEqual(
+          headerLayout.contextBottom - 1,
+        );
+        expect(headerLayout.tabsBottom).toBeLessThanOrEqual(
+          headerLayout.viewportHeight,
+        );
+      } else if (name.startsWith("pdf-state-")) {
+        await page.evaluate(() => {
+          const browser = globalThis as unknown as {
+            document: { querySelector: (selector: string) => unknown };
+            window: { scrollBy: (x: number, y: number) => void };
+          };
+          const element = browser.document.querySelector(
+            "#investigation-tab-heading",
+          ) as { getBoundingClientRect: () => { top: number } } | null;
+          if (element === null) {
+            throw new Error("the investigation page heading is missing");
+          }
+          browser.window.scrollBy(0, element.getBoundingClientRect().top - 8);
+        });
+        await expect(target).toBeInViewport();
+        const headingTop = await page
+          .locator("#investigation-tab-heading")
+          .evaluate(
+            (element) =>
+              (
+                element as unknown as {
+                  getBoundingClientRect: () => { top: number };
+                }
+              ).getBoundingClientRect().top,
+          );
+        expect(headingTop).toBeGreaterThanOrEqual(7);
+        expect(headingTop).toBeLessThanOrEqual(9);
+      } else {
+        await target.scrollIntoViewIfNeeded();
+      }
     }
     await page.waitForTimeout(100);
     await page.screenshot({
@@ -2702,10 +2789,69 @@ test("parcours atelier M24 étapes 1–32 : workspace, tâches, Notes, PDF, G2",
   const draft = opinionRead.draft;
   if (draft === null) throw new Error("the accepted opinion is missing");
   expect(draft.version).toBe(3);
+  let signalPendingPdfRequest: (() => void) | undefined;
+  const pendingPdfRequestStarted = new Promise<void>((resolve) => {
+    signalPendingPdfRequest = resolve;
+  });
+  let releasePendingPdfRequests: (() => void) | undefined;
+  const pendingPdfRequestsReleased = new Promise<void>((resolve) => {
+    releasePendingPdfRequests = resolve;
+  });
+  let pdfRouteMode: "pending" | "stale" = "pending";
+  await page.route("**/api/opinions/*/preview.pdf?*", async (route) => {
+    const requestUrl = new URL(route.request().url());
+    if (requestUrl.pathname !== `/api/opinions/${draft.id}/preview.pdf`) {
+      await route.continue();
+      return;
+    }
+    if (pdfRouteMode === "pending") {
+      signalPendingPdfRequest?.();
+      await pendingPdfRequestsReleased;
+      await route.fulfill({
+        status: 503,
+        contentType: "application/json",
+        body: JSON.stringify({
+          detail: {
+            code: "opinion_preview_render_failed",
+            message: "Échec synthétique de préparation du PDF.",
+          },
+        }),
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 409,
+      contentType: "application/json",
+      body: JSON.stringify({
+        detail: {
+          code: "stale_version",
+          message: "Version synthétique obsolète.",
+        },
+      }),
+    });
+  });
   await page.getByRole("tab", { name: "PDF" }).click();
   await expect(
     page.getByRole("heading", { name: "Aperçu PDF réel de l’avis v3" }),
   ).toBeVisible();
+  await pendingPdfRequestStarted;
+  await expect(
+    page.getByText("Préparation du PDF", { exact: true }),
+  ).toBeVisible();
+  const pdfPreview = page.locator(".opinion-pdf-preview");
+  await capture(page, "pdf-state-en-cours", pdfPreview);
+  pdfRouteMode = "stale";
+  releasePendingPdfRequests?.();
+  await expect(
+    page.getByText("PDF indisponible", { exact: true }),
+  ).toBeVisible();
+  await capture(page, "pdf-state-echoue", pdfPreview);
+  await page.getByRole("button", { name: "Réessayer" }).click();
+  await expect(page.getByText("PDF obsolète", { exact: true })).toBeVisible();
+  await capture(page, "pdf-state-obsolete", pdfPreview);
+  await page.unroute("**/api/opinions/*/preview.pdf?*");
+  await page.getByRole("tab", { name: /^Notes/ }).click();
+  await page.getByRole("tab", { name: "PDF" }).click();
   await expect(page.getByRole("link", { name: "Ouvrir le PDF" })).toBeVisible();
   await expect(
     page.getByRole("status").filter({
@@ -2852,7 +2998,7 @@ test("parcours atelier M24 étapes 1–32 : workspace, tâches, Notes, PDF, G2",
     occurrences(pdfText, "Observations canoniques de cette enquête : 1"),
   ).toHaveLength(1);
   expect(pdfText).toContain("empreintes vérifiées");
-  await capture(page, "pdf-preview", page.locator(".opinion-pdf-preview"));
+  await capture(page, "pdf-preview", pdfPreview);
   const rasterPrefix = testInfo.outputPath("opinion-v3-page");
   execFileSync("pdftoppm", ["-png", "-r", "100", pdfPath, rasterPrefix], {
     encoding: "utf-8",
@@ -2990,6 +3136,11 @@ test("parcours atelier M24 étapes 1–32 : workspace, tâches, Notes, PDF, G2",
   await capture(
     page,
     "overview-revoked",
+    page.locator(".workshop-context-bar"),
+  );
+  await capture(
+    page,
+    "g2-revoked-detail",
     envelopeLifecycle.getByRole("heading").first(),
   );
 
