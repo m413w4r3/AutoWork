@@ -28,6 +28,7 @@ import type {
   ResolvedNoteContentBlockV1,
 } from "../api/opinionProposals";
 import { CanonicalCodeSelector } from "./CanonicalCodeSelector";
+import { CopyableTechnicalValue } from "./CopyableTechnicalValue";
 import { describeApiError, describeErrorCode } from "./errors";
 import {
   ARTICLE_ELEMENT_REFUSAL_LABELS,
@@ -50,6 +51,10 @@ const MAX_IOC_OBSERVATIONS = 64;
 const OPTION_TEXT_MAX = 120;
 /** Short option labels keep the page width independent of id lengths. */
 const OPTION_SHORT_MAX = 32;
+
+function shortObjectId(value: string): string {
+  return value.length > 12 ? value.slice(0, 10) + "…" : value;
+}
 
 /** The opinion wire type keeps `kind` as text; the server enum is closed. */
 function isProtocolFigureKind(value: string): value is ProtocolFigureKind {
@@ -275,22 +280,39 @@ export function NoteContentBlocks({
             basePublication.artifactId === null ||
             basePublication.sha256 === null
               ? "Base de publication : non épinglée (proposition antérieure au pin)."
-              : `Base de publication épinglée : artefact ${basePublication.artifactId} · version ${
-                  basePublication.version ?? "—"
-                } · SHA-256 ${shortHash(basePublication.sha256)}`}
+              : `Base de publication épinglée · version ${basePublication.version ?? "—"}`}
           </p>
+          {basePublication?.artifactId === null ||
+          basePublication?.artifactId === undefined ||
+          basePublication.sha256 === null ? null : (
+            <TechnicalProvenance
+              values={[
+                {
+                  label: "Artefact de publication",
+                  value: basePublication.artifactId,
+                },
+                {
+                  label: "SHA-256 de la publication",
+                  value: basePublication.sha256,
+                },
+              ]}
+            />
+          )}
           {resolvedBlocks.length === 0 ? (
             invalid ? null : (
               <p>Aucun bloc résolu pour cette proposition.</p>
             )
           ) : (
-            <ul className="note-content-blocks__resolved">
+            <div className="note-content-blocks__resolved">
               {resolvedBlocks.map((block, index) => (
-                <li key={`${block.block_type}-${index}`}>
+                <article
+                  className="note-content-blocks__resolved-item"
+                  key={`${block.block_type}-${index}`}
+                >
                   <ResolvedBlockPreview block={block} />
-                </li>
+                </article>
               ))}
-            </ul>
+            </div>
           )}
         </section>
       )}
@@ -629,44 +651,91 @@ function ProtocolFigurePicker({
   );
 }
 
+function TechnicalProvenance({
+  values,
+}: {
+  values: Array<{ label: string; value: string }>;
+}) {
+  return (
+    <details className="opinion-technical-details">
+      <summary>Provenance technique</summary>
+      <dl>
+        {values.map((item) => (
+          <div key={item.label}>
+            <dt>{item.label}</dt>
+            <dd>
+              <CopyableTechnicalValue label={item.label} value={item.value} />
+            </dd>
+          </div>
+        ))}
+      </dl>
+    </details>
+  );
+}
+
 function SelectedBlockSummary({ block }: { block: NoteContentBlockV1 }) {
   switch (block.block_type) {
     case "article_element":
       return (
-        <p>
-          <strong>Élément d’article</strong> ·{" "}
-          {ARTICLE_ELEMENT_KIND_LABELS[block.kind]} · clé{" "}
-          <code>{block.element_key}</code> · ancre <code>{block.anchor}</code> ·
-          SHA-256 <code>{shortHash(block.element_sha256)}</code>
-        </p>
+        <div>
+          <p>
+            <strong>Élément d’article</strong> ·{" "}
+            {ARTICLE_ELEMENT_KIND_LABELS[block.kind]}
+          </p>
+          <TechnicalProvenance
+            values={[
+              { label: "Clé de l’élément", value: block.element_key },
+              { label: "Ancre", value: block.anchor },
+              { label: "SHA-256 de l’élément", value: block.element_sha256 },
+            ]}
+          />
+        </div>
       );
     case "canonical_code":
       return (
-        <p>
-          <strong>Extrait de code canonique</strong> · observation{" "}
-          <code>{block.observation_id}</code> · octets {block.offset}–
-          {block.offset + block.length} · langage <code>{block.language}</code>{" "}
-          · blob SHA-256 <code>{shortHash(block.blob_sha256)}</code> · extrait
-          SHA-256 <code>{shortHash(block.excerpt_sha256)}</code>
-        </p>
+        <div>
+          <p>
+            <strong>Extrait de code canonique</strong> · octets {block.offset}–
+            {block.offset + block.length} · langage{" "}
+            <code>{block.language}</code>
+          </p>
+          <TechnicalProvenance
+            values={[
+              { label: "ID de l’observation", value: block.observation_id },
+              { label: "SHA-256 du blob", value: block.blob_sha256 },
+              { label: "SHA-256 de l’extrait", value: block.excerpt_sha256 },
+            ]}
+          />
+        </div>
       );
     case "ioc_table":
       return (
-        <p>
-          <strong>{block.title}</strong> · {block.observation_ids.length}{" "}
-          observation(s) canonique(s) ·{" "}
-          {block.observation_ids.map((id) => (
-            <code key={id}>{shortHash(id)} </code>
-          ))}
-        </p>
+        <div>
+          <p>
+            <strong>{block.title}</strong> · {block.observation_ids.length}{" "}
+            observation(s) canonique(s)
+          </p>
+          <TechnicalProvenance
+            values={block.observation_ids.map((id, index) => ({
+              label: "ID de l’observation " + (index + 1),
+              value: id,
+            }))}
+          />
+        </div>
       );
     case "protocol_figure":
       return (
-        <p>
-          <strong>Figure de protocole</strong> ·{" "}
-          {PROTOCOL_FIGURE_LABELS[block.kind] ?? block.kind} · SHA-256{" "}
-          <code>{shortHash(block.asset_sha256)}</code>
-        </p>
+        <div>
+          <p>
+            <strong>Figure de protocole</strong> ·{" "}
+            {PROTOCOL_FIGURE_LABELS[block.kind] ?? block.kind}
+          </p>
+          <TechnicalProvenance
+            values={[
+              { label: "SHA-256 de la figure", value: block.asset_sha256 },
+            ]}
+          />
+        </div>
       );
   }
 }
@@ -683,17 +752,19 @@ function ResolvedBlockPreview({
           <p>
             <strong>
               {ARTICLE_ELEMENT_KIND_LABELS[block.kind]} «{" "}
-              {block.title ?? block.element_key} »
+              {block.title ?? ARTICLE_ELEMENT_KIND_LABELS[block.kind]} »
             </strong>{" "}
             — cross-référence vers l’ancre <code>{block.anchor}</code> de
             l’article ; l’élément reste rendu à son placement et n’est jamais
             dupliqué dans la Note.
           </p>
           {block.caption === null ? null : <p>{block.caption}</p>}
-          <p>
-            Provenance : élément <code>{block.element_key}</code> · SHA-256{" "}
-            <code>{block.element_sha256}</code>
-          </p>
+          <TechnicalProvenance
+            values={[
+              { label: "Clé de l’élément", value: block.element_key },
+              { label: "SHA-256 de l’élément", value: block.element_sha256 },
+            ]}
+          />
         </div>
       );
     case "canonical_code":
@@ -707,49 +778,68 @@ function ResolvedBlockPreview({
           <pre>
             <code>{block.excerpt}</code>
           </pre>
-          <p>
-            Provenance : observation <code>{block.observation_id}</code> (
-            {block.observation_source} · {block.observation_object_type}/
-            {block.observation_object_id}) · blob SHA-256{" "}
-            <code>{block.blob_sha256}</code> · extrait SHA-256{" "}
-            <code>{block.excerpt_sha256}</code>
-          </p>
+          <TechnicalProvenance
+            values={[
+              { label: "ID de l’observation", value: block.observation_id },
+              { label: "Source", value: block.observation_source },
+              {
+                label: "Type d’objet",
+                value: block.observation_object_type,
+              },
+              {
+                label: "Identifiant exact de l’objet",
+                value: block.observation_object_id,
+              },
+              { label: "SHA-256 du blob", value: block.blob_sha256 },
+              { label: "SHA-256 de l’extrait", value: block.excerpt_sha256 },
+            ]}
+          />
         </div>
       );
     case "ioc_table":
       return (
-        <div className="table-scroll">
-          <table>
-            <caption>{block.title}</caption>
-            <thead>
-              <tr>
-                <th scope="col">Observation</th>
-                <th scope="col">Objet</th>
-                <th scope="col">Source</th>
-                <th scope="col">Observée le</th>
-                <th scope="col">Blob SHA-256</th>
-              </tr>
-            </thead>
-            <tbody>
-              {block.rows.map((row) => (
-                <tr key={row.observation_id}>
-                  <td>
-                    <code>{row.observation_id}</code>
-                  </td>
-                  <td>
-                    {row.object_type}/{row.object_id}
-                  </td>
-                  <td>{row.source}</td>
-                  <td>{row.observed_at}</td>
-                  <td>
-                    <code title={row.blob_sha256}>
-                      {shortHash(row.blob_sha256)}
-                    </code>
-                  </td>
+        <div>
+          <div className="table-scroll">
+            <table>
+              <caption>{block.title}</caption>
+              <thead>
+                <tr>
+                  <th scope="col">Référence</th>
+                  <th scope="col">Objet</th>
+                  <th scope="col">Source</th>
+                  <th scope="col">Observée le</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {block.rows.map((row, index) => (
+                  <tr key={row.observation_id}>
+                    <td>Observation {index + 1}</td>
+                    <td>
+                      {row.object_type} · {shortObjectId(row.object_id)}
+                    </td>
+                    <td>{row.source}</td>
+                    <td>{row.observed_at}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <TechnicalProvenance
+            values={block.rows.flatMap((row, index) => [
+              {
+                label: "ID de l’observation " + (index + 1),
+                value: row.observation_id,
+              },
+              {
+                label: "Identifiant exact de l’objet " + (index + 1),
+                value: row.object_id,
+              },
+              {
+                label: "SHA-256 du blob " + (index + 1),
+                value: row.blob_sha256,
+              },
+            ])}
+          />
         </div>
       );
     case "protocol_figure":
@@ -759,9 +849,11 @@ function ResolvedBlockPreview({
             <strong>Figure de protocole</strong> ·{" "}
             {PROTOCOL_FIGURE_LABELS[block.kind] ?? block.kind} · {block.caption}
           </p>
-          <p>
-            Provenance : asset SHA-256 <code>{block.asset_sha256}</code>
-          </p>
+          <TechnicalProvenance
+            values={[
+              { label: "SHA-256 de la figure", value: block.asset_sha256 },
+            ]}
+          />
         </div>
       );
   }

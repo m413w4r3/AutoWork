@@ -1058,9 +1058,12 @@ describe("OpinionNotesView — notes Bridge par ancre", () => {
     expect(
       screen.getAllByText("Note actuelle du chapô.").length,
     ).toBeGreaterThan(0);
-    expect(
-      screen.getByText("Provenance technique").closest("details"),
-    ).toHaveTextContent(NOTE_LEAD_ID);
+    const technical = screen
+      .getByRole("heading", { name: "Proposition Bridge — version 1" })
+      .closest("section")
+      ?.querySelector(".opinion-proposal-review__technical");
+    expect(technical).toHaveTextContent(NOTE_LEAD_ID);
+    expect(technical?.querySelectorAll("button").length).toBeGreaterThan(0);
     expect(
       screen.queryByText("Texte Bridge proposé pour le chapô."),
     ).not.toBeInTheDocument();

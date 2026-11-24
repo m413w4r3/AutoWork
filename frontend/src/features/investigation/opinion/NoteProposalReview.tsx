@@ -28,6 +28,7 @@ import {
   truncate,
 } from "./labels";
 import { NoteContentBlocks } from "./NoteContentBlocks";
+import { CopyableTechnicalValue } from "./CopyableTechnicalValue";
 import { opinionNotesKeys } from "./queries";
 import {
   describeApiError,
@@ -277,14 +278,20 @@ export function NoteProposalReview({
             <div>
               <dt>Proposition</dt>
               <dd>
-                <code>{proposal.id}</code> · version de statut{" "}
-                {proposal.status_version}
+                <CopyableTechnicalValue
+                  label="ID de la proposition"
+                  value={proposal.id}
+                />{" "}
+                · version de statut {proposal.status_version}
               </dd>
             </div>
             <div>
               <dt>Ancre exacte</dt>
               <dd>
-                <code>{diff.anchor}</code>
+                <CopyableTechnicalValue
+                  label="Ancre exacte"
+                  value={diff.anchor}
+                />
               </dd>
             </div>
             <div>
@@ -297,7 +304,10 @@ export function NoteProposalReview({
                 {diff.current_note_id === null ? (
                   "Aucune"
                 ) : (
-                  <code>{diff.current_note_id}</code>
+                  <CopyableTechnicalValue
+                    label="ID de la note remplacée"
+                    value={diff.current_note_id}
+                  />
                 )}
               </dd>
             </div>
@@ -307,41 +317,99 @@ export function NoteProposalReview({
                 {diff.current_opinion_version === null
                   ? "Aucun avis existant"
                   : `v${diff.current_opinion_version}`}{" "}
-                · SHA-256 <code>{diff.current_opinion_sha256 ?? "—"}</code>
+                · SHA-256{" "}
+                {diff.current_opinion_sha256 === null ? (
+                  "—"
+                ) : (
+                  <CopyableTechnicalValue
+                    label="SHA-256 de l’avis actuel"
+                    value={diff.current_opinion_sha256}
+                  />
+                )}
               </dd>
             </div>
             <div>
               <dt>Base épinglée par la proposition</dt>
               <dd>
                 v{proposal.base_opinion_version ?? "—"} · SHA-256{" "}
-                <code>{proposal.base_opinion_sha256 ?? "—"}</code>
+                {proposal.base_opinion_sha256 === null ? (
+                  "—"
+                ) : (
+                  <CopyableTechnicalValue
+                    label="SHA-256 de l’avis de base"
+                    value={proposal.base_opinion_sha256}
+                  />
+                )}
               </dd>
             </div>
             <div>
               <dt>Texte Bridge</dt>
               <dd>
-                <code>{proposal.proposed_text_sha256 ?? "—"}</code>
+                {proposal.proposed_text_sha256 === null ? (
+                  "—"
+                ) : (
+                  <CopyableTechnicalValue
+                    label="SHA-256 du texte Bridge"
+                    value={proposal.proposed_text_sha256}
+                  />
+                )}
               </dd>
             </div>
             <div>
               <dt>Invocation et sortie Bridge</dt>
               <dd>
-                <code>{proposal.bridge_invocation_id ?? "—"}</code> · SHA-256{" "}
-                <code>{proposal.bridge_output_sha256 ?? "—"}</code>
+                {proposal.bridge_invocation_id === null ? (
+                  "—"
+                ) : (
+                  <CopyableTechnicalValue
+                    label="ID de l’invocation Bridge"
+                    value={proposal.bridge_invocation_id}
+                  />
+                )}{" "}
+                · SHA-256{" "}
+                {proposal.bridge_output_sha256 === null ? (
+                  "—"
+                ) : (
+                  <CopyableTechnicalValue
+                    label="SHA-256 de la sortie Bridge"
+                    value={proposal.bridge_output_sha256}
+                  />
+                )}
               </dd>
             </div>
             <div>
               <dt>Observation de réponse</dt>
               <dd>
-                <code>{proposal.bridge_response_observation_id ?? "—"}</code>
+                {proposal.bridge_response_observation_id === null ? (
+                  "—"
+                ) : (
+                  <CopyableTechnicalValue
+                    label="ID de l’observation de réponse"
+                    value={proposal.bridge_response_observation_id}
+                  />
+                )}
               </dd>
             </div>
             <div>
               <dt>Base de publication</dt>
               <dd>
-                <code>{proposal.base_publication_artifact_id ?? "—"}</code> · v
-                {proposal.base_publication_version ?? "—"} · SHA-256{" "}
-                <code>{proposal.base_publication_sha256 ?? "—"}</code>
+                {proposal.base_publication_artifact_id === null ? (
+                  "—"
+                ) : (
+                  <CopyableTechnicalValue
+                    label="ID de la base de publication"
+                    value={proposal.base_publication_artifact_id}
+                  />
+                )}{" "}
+                · v{proposal.base_publication_version ?? "—"} · SHA-256{" "}
+                {proposal.base_publication_sha256 === null ? (
+                  "—"
+                ) : (
+                  <CopyableTechnicalValue
+                    label="SHA-256 de la base de publication"
+                    value={proposal.base_publication_sha256}
+                  />
+                )}
               </dd>
             </div>
             <div>
@@ -350,7 +418,11 @@ export function NoteProposalReview({
                 {diff.cited_finding_refs.length === 0
                   ? "Aucun"
                   : diff.cited_finding_refs.map((id) => (
-                      <code key={id}>{id} </code>
+                      <CopyableTechnicalValue
+                        key={id}
+                        label="ID du finding cité"
+                        value={id}
+                      />
                     ))}
               </dd>
             </div>
@@ -360,7 +432,11 @@ export function NoteProposalReview({
                 {diff.cited_observation_refs.length === 0
                   ? "Aucune"
                   : diff.cited_observation_refs.map((id) => (
-                      <code key={id}>{id} </code>
+                      <CopyableTechnicalValue
+                        key={id}
+                        label="ID de l’observation citée"
+                        value={id}
+                      />
                     ))}
               </dd>
             </div>
@@ -369,9 +445,20 @@ export function NoteProposalReview({
                 <dt>Décision d’acceptation</dt>
                 <dd>
                   Version d’avis {accepted.opinion_version} · SHA-256{" "}
-                  <code>{accepted.opinion_sha256}</code> · note{" "}
-                  <code>{accepted.note_id}</code> · décision{" "}
-                  <code>{accepted.decision_id}</code>
+                  <CopyableTechnicalValue
+                    label="SHA-256 de l’avis accepté"
+                    value={accepted.opinion_sha256}
+                  />{" "}
+                  · note{" "}
+                  <CopyableTechnicalValue
+                    label="ID de la note acceptée"
+                    value={accepted.note_id}
+                  />{" "}
+                  · décision{" "}
+                  <CopyableTechnicalValue
+                    label="ID de la décision"
+                    value={accepted.decision_id}
+                  />
                 </dd>
               </div>
             )}
@@ -471,7 +558,14 @@ export function NoteProposalReview({
                 <li key={id}>
                   {observation === undefined
                     ? "Observation indisponible dans cette enquête"
-                    : `${EVIDENCE_KIND_LABELS[observation.kind] ?? observation.kind} · ${observation.source} · ${observation.object_type} ${observation.object_id}`}
+                    : (EVIDENCE_KIND_LABELS[observation.kind] ??
+                        observation.kind) +
+                      " · " +
+                      observation.source +
+                      " · " +
+                      observation.object_type +
+                      "/" +
+                      truncate(observation.object_id, 12)}
                 </li>
               );
             })}

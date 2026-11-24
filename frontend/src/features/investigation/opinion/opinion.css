@@ -29,6 +29,17 @@
   align-items: start;
 }
 
+.opinion-workspace--proposals {
+  grid-template-columns: minmax(16rem, 0.65fr) minmax(0, 1.35fr);
+}
+
+.opinion-workspace--proposals .opinion-workspace__article {
+  position: sticky;
+  top: 4.5rem;
+  max-height: calc(100vh - 5rem);
+  overflow-y: auto;
+}
+
 .opinion-workspace__article,
 .opinion-workspace__panel,
 .opinion-workspace__tabpanel {
@@ -263,11 +274,21 @@
   border-radius: 0.35rem;
   padding: 1rem;
   background: var(--color-surface-muted, #f5f6f7);
+  overflow-wrap: anywhere;
 }
 
 .opinion-pdf-preview__warning,
-.opinion-pdf-preview__failure {
+.opinion-pdf-preview__failure,
+.opinion-pdf-preview__fallback {
   margin: 0.75rem 0;
+  overflow-wrap: anywhere;
+}
+
+.opinion-pdf-preview__fallback {
+  border: 1px solid var(--color-border, #d0d5d9);
+  border-radius: 0.4rem;
+  padding: 0.75rem 1rem;
+  background: var(--color-surface-muted, #f5f6f7);
 }
 
 .opinion-pdf-preview__actions {
@@ -284,6 +305,229 @@
   min-height: 24rem;
   border: 1px solid var(--color-border, #d0d5d9);
   background: var(--color-surface-muted, #f5f6f7);
+}
+
+.opinion-pdf-preview__viewer.is-checking {
+  height: 12rem;
+  min-height: 12rem;
+}
+
+.opinion-pdf-preview a.button {
+  color: inherit;
+  text-decoration: none;
+}
+
+.opinion-pdf-preview a.button:hover,
+.opinion-pdf-preview a.button:focus-visible {
+  color: var(--color-accent, #315f8c);
+  text-decoration: underline;
+}
+
+.opinion-pdf-preview__status.is-generating {
+  color: var(--color-warning, #805500);
+}
+
+.opinion-pdf-preview__status.is-ready {
+  color: var(--color-success, #276749);
+}
+
+.opinion-pdf-preview__status.is-stale,
+.opinion-pdf-preview__status.is-failed {
+  color: var(--color-danger, #8b1e2d);
+}
+
+.opinion-reference-picker,
+.opinion-reference-picker__source,
+.opinion-reference-picker__group,
+.opinion-reference-picker__technical,
+.opinion-reference-picker__technical-value,
+.opinion-technical-details,
+.opinion-technical-details dl > div,
+.opinion-proposal-review__technical,
+.opinion-proposal-review__technical dl > div,
+.opinion-proposal-review__technical dd,
+.note-content-blocks__resolved,
+.note-content-blocks__resolved-item,
+.opinion-proposal-review,
+.opinion-proposal-review > section {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.opinion-reference-picker {
+  padding: 0.65rem 0.75rem 0.75rem;
+}
+
+.opinion-reference-picker__search {
+  display: grid;
+  gap: 0.25rem;
+  margin: 0.25rem 0 0.75rem;
+}
+
+.opinion-reference-picker__search input {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+}
+
+.opinion-reference-picker__groups {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.opinion-reference-picker__source {
+  border-top: 1px solid var(--color-border, #d0d5d9);
+  padding-top: 0.55rem;
+}
+
+.opinion-reference-picker__source h4 {
+  margin: 0 0 0.4rem;
+  font-size: 0.95rem;
+}
+
+.opinion-reference-picker__group + .opinion-reference-picker__group {
+  border-top: 1px solid var(--color-border, #d0d5d9);
+  margin-top: 0.5rem;
+  padding-top: 0.5rem;
+}
+
+.opinion-reference-picker__option {
+  display: grid;
+  grid-template-columns: 1.1rem minmax(0, 1fr);
+  align-items: start;
+  gap: 0.45rem;
+  margin: 0;
+  cursor: pointer;
+}
+
+.opinion-reference-picker__option input {
+  margin: 0.25rem 0 0;
+}
+
+.opinion-reference-picker__option-text {
+  display: grid;
+  gap: 0.15rem;
+  min-width: 0;
+}
+
+.opinion-reference-picker__label {
+  overflow-wrap: anywhere;
+}
+
+.opinion-reference-picker__count {
+  color: var(--color-text-muted, #5f6b72);
+  font-size: 0.85rem;
+}
+
+.opinion-reference-picker__technical {
+  margin: 0.25rem 0 0 1.55rem;
+  font-size: 0.88rem;
+}
+
+.opinion-reference-picker__technical ol {
+  display: grid;
+  gap: 0.65rem;
+  padding-left: 1.2rem;
+}
+
+.opinion-reference-picker__technical-value {
+  display: grid;
+  gap: 0.15rem;
+  margin: 0.35rem 0;
+}
+
+.opinion-technical-details {
+  margin-top: 0.35rem;
+}
+
+.opinion-technical-details dl {
+  display: grid;
+  gap: 0.6rem;
+  margin: 0.6rem 0 0;
+}
+
+.opinion-technical-details dt {
+  font-weight: 700;
+}
+
+.opinion-technical-details dd {
+  margin: 0.15rem 0 0;
+}
+
+.opinion-technical-value {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 0.4rem;
+  min-width: 0;
+}
+
+.opinion-technical-value code,
+.opinion-notes code {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: normal;
+}
+
+.opinion-technical-value__copy {
+  flex: 0 0 auto;
+  padding: 0.2rem 0.45rem;
+}
+
+.opinion-technical-value__status {
+  min-width: 0;
+}
+
+.note-content-blocks__resolved {
+  display: grid;
+  gap: 0.75rem;
+  margin-top: 0.5rem;
+}
+
+.note-content-blocks__resolved-item {
+  border: 1px solid var(--color-border, #d0d5d9);
+  border-radius: 0.4rem;
+  padding: 0.7rem;
+  background: var(--color-surface, #fff);
+}
+
+.note-content-blocks__resolved-item .table-scroll {
+  width: 100%;
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.note-content-blocks__resolved-item table {
+  width: 100%;
+  min-width: 40rem;
+  table-layout: fixed;
+}
+
+.note-content-blocks__resolved-item th,
+.note-content-blocks__resolved-item td {
+  overflow-wrap: anywhere;
+  vertical-align: top;
+}
+
+.note-content-blocks__resolved-item th:nth-child(1) {
+  width: 18%;
+}
+
+.note-content-blocks__resolved-item th:nth-child(2) {
+  width: 28%;
+}
+
+.note-content-blocks__resolved-item th:nth-child(3) {
+  width: 24%;
+}
+
+.note-content-blocks__resolved-item th:nth-child(4) {
+  width: 30%;
+}
+
+.note-content-blocks__list > li {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .opinion-proposal-review > section + section,
@@ -363,5 +607,12 @@
 @media (max-width: 72rem) {
   .opinion-workspace {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .opinion-workspace--proposals .opinion-workspace__article {
+    position: static;
+    top: auto;
+    max-height: none;
+    overflow: visible;
   }
 }

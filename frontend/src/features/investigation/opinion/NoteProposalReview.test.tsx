@@ -388,18 +388,20 @@ describe("NoteProposalReview — blocs de contenu", () => {
       screen.getByText(/Le serveur répond à une requête de commande/),
     ).toBeInTheDocument();
     expect(
-      screen.getByText("Analyse binaire · analysis-worker · binary sample-1"),
+      screen.getByText("Analyse binaire · analysis-worker · binary/sample-1"),
     ).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Différences" }));
     expect(screen.getByText(/Supprimé/)).toBeInTheDocument();
     expect(screen.getByText(/Ajouté/)).toBeInTheDocument();
 
     const technical = screen
-      .getByText("Provenance technique")
-      .closest("details");
+      .getByRole("heading", { name: "Proposition Bridge — version 4" })
+      .closest("section")
+      ?.querySelector(".opinion-proposal-review__technical");
     expect(technical).not.toHaveAttribute("open");
     expect(technical).toHaveTextContent(FINDING_ID);
     expect(technical).toHaveTextContent(OBSERVATION_ID);
+    expect(technical?.querySelectorAll("button").length).toBeGreaterThan(0);
     expect(
       screen
         .getAllByRole("button")

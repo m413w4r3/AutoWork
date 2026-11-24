@@ -28,6 +28,7 @@ const ELEMENT_HASH = "a".repeat(64);
 const OTHER_HASH = "b".repeat(64);
 const CHART_HASH = "0".repeat(64);
 const BLOB_HASH = "c".repeat(64);
+const IOC_OBJECT_ID = "0123456789abcdef".repeat(4);
 const EXCERPT_HASH = "d".repeat(64);
 const ASSET_HASH = "e".repeat(64);
 const BASE_SHA = "f".repeat(64);
@@ -687,7 +688,7 @@ describe("NoteContentBlocks — aperçu lecture seule", () => {
         {
           observation_id: OBSERVATION_ID,
           object_type: "binary",
-          object_id: "sample-1",
+          object_id: IOC_OBJECT_ID,
           source: "analysis-worker",
           observed_at: "2026-11-22T08:00:00Z",
           blob_sha256: BLOB_HASH,
@@ -703,7 +704,7 @@ describe("NoteContentBlocks — aperçu lecture seule", () => {
     },
   ];
 
-  it("rend les cross-références, le code, le tableau IOC et la figure avec provenance", () => {
+  it("rend les cross-références, le code, le tableau IOC et la figure avec provenance", async () => {
     renderBlocks({
       observations: [],
       protocolFigures: [],
@@ -729,11 +730,29 @@ describe("NoteContentBlocks — aperçu lecture seule", () => {
     expect(
       screen.getByRole("table", { name: "Tableau IOC (1)" }),
     ).toBeInTheDocument();
+    const table = screen.getByRole("table", { name: "Tableau IOC (1)" });
+    expect(table.closest("ul")).toBeNull();
+    expect(screen.getByText(IOC_OBJECT_ID)).not.toBeVisible();
+    const tableDetails = table
+      .closest(".note-content-blocks__resolved-item")
+      ?.querySelector("details");
+    expect(tableDetails).not.toBeNull();
+    await userEvent.setup().click(
+      within(tableDetails as HTMLElement).getByText("Provenance technique", {
+        selector: "summary",
+      }),
+    );
+    expect(
+      within(tableDetails as HTMLElement).getByText(IOC_OBJECT_ID),
+    ).toBeVisible();
+    expect(
+      within(tableDetails as HTMLElement).getByText(OBSERVATION_ID),
+    ).toBeVisible();
     expect(
       screen.getByText(/Séquence des échanges observée/),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/Base de publication épinglée : artefact/),
+      screen.getByText("Base de publication épinglée · version 3"),
     ).toBeInTheDocument();
     expect(
       screen.getByRole("link", {
