@@ -1239,9 +1239,13 @@ describe("OpinionNotesView — notes Bridge par ancre", () => {
     await screen.findByRole("heading", {
       name: "Demander une proposition à Bridge",
     });
-    await user.selectOptions(
-      await screen.findByLabelText("Élément à référencer"),
-      "table:table-commands",
+    const elementPicker = await screen.findByRole("group", {
+      name: "Élément à référencer",
+    });
+    await user.click(
+      within(elementPicker).getByRole("radio", {
+        name: "Tableau · Commandes observées",
+      }),
     );
     await user.click(
       screen.getByRole("button", { name: "Référencer cet élément" }),
@@ -1277,7 +1281,9 @@ describe("OpinionNotesView — notes Bridge par ancre", () => {
       within(preview).getByText(/Commandes observées/),
     ).toBeInTheDocument();
     expect(
-      within(preview).getByText(/cross-référence vers l’ancre/),
+      within(preview).getByText(
+        /cross-référence vers le paragraphe correspondant/,
+      ),
     ).toBeInTheDocument();
   });
 });

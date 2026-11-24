@@ -80,31 +80,28 @@ describe("reference pickers", () => {
 
     expect(screen.getByRole("heading", { name: "VirusTotal" })).toBeVisible();
     expect(
-      screen.getByText("Rapport VT fichier · file/aaaaaaaaaa…"),
-    ).toBeVisible();
+      screen.getAllByText("Rapport VT fichier · file/aaaaaaaaaa…"),
+    ).toHaveLength(2);
     expect(screen.getByText("2 références regroupées")).toBeVisible();
-    expect(
-      screen
-        .getAllByText(OBJECT_ID)
-        .every((element) => element.closest("details")?.open === false),
-    ).toBe(true);
+    expect(screen.getAllByRole("checkbox")).toHaveLength(2);
     expect(screen.getByText(FIRST_SHA).closest("details")?.open).toBe(false);
-    expect(screen.getAllByRole("checkbox")).toHaveLength(1);
+    expect(screen.getByText(SECOND_SHA).closest("details")?.open).toBe(false);
 
-    await user.click(
-      screen.getByText("Provenance technique", { selector: "summary" }),
-    );
-    const details = screen.getByText("Provenance technique", {
+    const provenance = screen.getAllByText("Provenance technique", {
       selector: "summary",
-    }).parentElement;
-    expect(details).not.toBeNull();
-    expect(within(details as HTMLElement).getAllByText(OBJECT_ID).length).toBe(
-      2,
-    );
-    expect(within(details as HTMLElement).getByText(FIRST_SHA)).toBeVisible();
+    });
+    const firstDetails = provenance[0]?.parentElement;
+    expect(firstDetails).not.toBeNull();
+    await user.click(provenance[0] as HTMLElement);
     expect(
-      within(details as HTMLElement).getByText(SECOND_OBSERVATION_ID),
+      within(firstDetails as HTMLElement).getByText(OBJECT_ID),
     ).toBeVisible();
+    expect(
+      within(firstDetails as HTMLElement).getByText(FIRST_SHA),
+    ).toBeVisible();
+    expect(
+      within(firstDetails as HTMLElement).queryByText(SECOND_OBSERVATION_ID),
+    ).toBeNull();
 
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.defineProperty(navigator, "clipboard", {
@@ -112,11 +109,14 @@ describe("reference pickers", () => {
       value: { writeText },
     });
     await user.click(
-      within(details as HTMLElement).getAllByRole("button", {
+      within(firstDetails as HTMLElement).getByRole("button", {
         name: "Copier SHA-256 de l’observation",
-      })[0] as HTMLElement,
+      }),
     );
     expect(writeText).toHaveBeenCalledWith(FIRST_SHA);
+
+    await user.click(screen.getByRole("checkbox", { name: /Observation 1/ }));
+    expect(onChange).toHaveBeenCalledWith([FIRST_OBSERVATION_ID]);
   });
 
   it("garde les identifiants finding repliés et permet la recherche", async () => {
