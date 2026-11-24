@@ -394,6 +394,24 @@ def _require_isolated_profile(argv: Sequence[str]) -> None:
     options = argv[:separator]
     if "--chdir" not in options:
         raise NetworkIsolationUnavailable("the isolated launch has no --chdir")
+    bind_options = {"--bind", "--ro-bind", "--bind-try", "--ro-bind-try", "--dev-bind"}
+    path_options = {"--tmpfs", "--proc", "--dev", "--dir", "--chdir"}
+    index = 0
+    while index < len(options):
+        option = options[index]
+        if option not in bind_options:
+            index += 2 if option in path_options else 1
+            continue
+        if index + 1 < len(options):
+            source = options[index + 1]
+        else:
+            index += 1
+            continue
+        if source in {"/", "/etc"} or os.path.realpath(source) in {"/", "/etc"}:
+            raise NetworkIsolationUnavailable(
+                "the isolated launch bind source exposes the host root or /etc"
+            )
+        index += 3
     widened = sorted(BWRAP_WIDENING_OPTIONS.intersection(options))
     if widened:
         raise NetworkIsolationUnavailable(
@@ -619,10 +637,9 @@ def create_session_etc_directory(session_directory: Path) -> Path:
         raise NetworkIsolationUnavailable("the session runtime directory is not private storage")
 
     directory = session_directory / SESSION_ETC_DIRECTORY_NAME
+    cleanup_session_etc_directory(session_directory)
     try:
         os.mkdir(directory, 0o700)
-    except FileExistsError:
-        pass
     except OSError as exc:
         raise NetworkIsolationUnavailable(
             "the sandbox resolver directory cannot be created"
@@ -636,11 +653,12 @@ def create_session_etc_directory(session_directory: Path) -> Path:
             path = directory / name
             fd = os.open(
                 path,
-                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
                 0o600,
             )
             try:
-                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                file_info = os.fstat(fd)
+                if not stat.S_ISREG(file_info.st_mode) or file_info.st_nlink != 1:
                     raise NetworkIsolationUnavailable("a sandbox resolver file is not regular")
                 os.fchmod(fd, 0o600)
                 view = memoryview(content)
@@ -720,6 +738,8 @@ def tls_trust_anchor_binds() -> tuple[tuple[Path, Path], ...]:
             source = target.resolve(strict=True)
             info = source.stat()
         except OSError:
+            continue
+        if source in {Path("/"), Path("/etc")}:
             continue
         if target in targets or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
             continue

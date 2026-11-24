@@ -16,6 +16,7 @@ import base64
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sidecars.workspace_agent.sessions import supervisor as sessions_supervisor
@@ -217,6 +218,46 @@ def test_collect_refuses_the_secret_in_the_result_file(session_base: Path) -> No
         assert collected.json()["details"]["reason"] == "secret_exposure_detected"
         assert _status(client, running)["state"] == "failed"
         assert not (running.host_path / "results" / "sessions" / SESSION_ID / "result.md").exists()
+
+
+def test_collect_refuses_a_session_secret_in_the_destination_path(session_base: Path) -> None:
+    revoked: list[object] = []
+    supervisor = object.__new__(sessions_supervisor.SessionSupervisor)
+    supervisor._revoke_secret_exposure = lambda handle: revoked.append(handle)
+    handle = SimpleNamespace(
+        secret_forms=sessions_supervisor._secret_content_forms(SECRET),
+        provider_credential_forms=(),
+        directory=session_base,
+    )
+    destination = f"notes/agents/{TASK_ID}/{SECRET.hex()}.md"
+
+    with pytest.raises(sessions_supervisor.SecretExposureError):
+        supervisor._refuse_secret_exposure(handle, ((destination, "notes", b"clean note"),))
+
+    assert revoked == [handle]
+
+
+def test_collect_ignores_an_oversized_note_outside_the_manifest(session_base: Path) -> None:
+    session_directory = session_base / "session"
+    scratch = session_directory / "scratch"
+    notes = scratch / "notes"
+    notes.mkdir(parents=True)
+    oversized = b"x" * (sessions_supervisor.MAX_CAPTURE_NOTE_BYTES + 1)
+    for index in range(5):
+        (notes / f"outside-manifest-{index}.json").write_bytes(oversized)
+    handle = SimpleNamespace(
+        record=SimpleNamespace(workspace_id="ws-test", task_id="task-test", session_id="sess-test"),
+        scratch=scratch,
+        directory=session_directory,
+    )
+    supervisor = object.__new__(sessions_supervisor.SessionSupervisor)
+    supervisor._workspaces = SimpleNamespace(get_workspace=lambda _workspace_id: object())
+    supervisor._refuse_secret_exposure = lambda _handle, _entries: None
+
+    captured, captured_notes = supervisor._capture(handle)
+
+    assert captured == []
+    assert captured_notes == []
 
 
 def test_collect_copies_a_legitimate_near_miss_note(session_base: Path) -> None:

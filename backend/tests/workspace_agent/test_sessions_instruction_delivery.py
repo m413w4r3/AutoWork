@@ -357,6 +357,7 @@ def test_interrupt_in_awaiting_instruction_stops_directly(session_base: Path) ->
         write_fake_script(running, RUN_SCRIPT)
         assert _start(client, running).status_code == 200
         _run_to_awaiting(client, running)
+        session_etc = process.create_session_etc_directory(running.session_dir())
 
         interrupted = post_session(
             client,
@@ -369,6 +370,7 @@ def test_interrupt_in_awaiting_instruction_stops_directly(session_base: Path) ->
         # The receipt literal stays the SESSION-RUNNER §6 one; the mirror state
         # transitions directly to stopped without a phantom interrupt request.
         assert interrupted.json() == {"state": "interrupt_requested", "signal_sent": False}
+        assert not session_etc.exists()
         status = get_session(client, running, f"/v1/sessions/{SESSION_ID}").json()
         assert status["state"] == "stopped"
 

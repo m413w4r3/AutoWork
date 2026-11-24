@@ -17,12 +17,15 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sidecars.workspace_agent.sessions import process
 from sidecars.workspace_agent.sessions import supervisor as sessions_module
+from sidecars.workspace_agent.sessions.state import SessionState
 from sidecars.workspace_agent.sessions.supervisor import (
     CollectRequest,
     FakeProfile,
@@ -132,6 +135,45 @@ def _events(supervisor: sessions_module.SessionSupervisor) -> list[dict[str, obj
     return [event for event in events if isinstance(event, dict)]
 
 
+def test_session_etc_creation_replaces_stale_hardlinks_without_truncating_targets(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "runtime-session"
+    runtime.mkdir(mode=0o700)
+    stale = runtime / process.SESSION_ETC_DIRECTORY_NAME
+    stale.mkdir(mode=0o700)
+    preserved = runtime / "synthetic-state"
+    preserved.write_bytes(b"synthetic state that must remain intact")
+    os.link(preserved, stale / "hosts")
+
+    created = process.create_session_etc_directory(runtime)
+
+    assert created == stale
+    assert preserved.read_bytes() == b"synthetic state that must remain intact"
+    for name, expected in process.SESSION_ETC_FILES:
+        info = (created / name).lstat()
+        assert info.st_nlink == 1
+        assert info.st_mode & 0o777 == 0o600
+        assert (created / name).read_bytes() == expected
+
+
+def test_session_etc_creation_unlinks_a_stale_directory_symlink(tmp_path: Path) -> None:
+    runtime = tmp_path / "runtime-session"
+    runtime.mkdir(mode=0o700)
+    external = tmp_path / "synthetic-external"
+    external.mkdir(mode=0o700)
+    preserved = external / "hosts"
+    preserved.write_bytes(b"synthetic external data")
+    stale = runtime / process.SESSION_ETC_DIRECTORY_NAME
+    stale.symlink_to(external, target_is_directory=True)
+
+    created = process.create_session_etc_directory(runtime)
+
+    assert created == stale
+    assert not stale.is_symlink()
+    assert preserved.read_bytes() == b"synthetic external data"
+
+
 @pytest.fixture
 def scripted_supervisors(session_base: Path) -> Iterator[list[sessions_module.SessionSupervisor]]:
     """Track every supervisor a test builds so no fake process outlives it."""
@@ -207,6 +249,43 @@ def test_interrupt_removes_the_seeded_credential_copies(
     wait_until(lambda: supervisor.status(SESSION_ID)["state"] in {"stopped", "failed"})
 
     assert all(not path.exists() for path in planted)
+    assert not session_etc.exists()
+
+
+def test_inactive_interrupt_removes_session_etc(tmp_path: Path) -> None:
+    session_etc = process.create_session_etc_directory(tmp_path)
+    handle = SimpleNamespace(
+        lock=threading.RLock(),
+        record=SimpleNamespace(
+            state=SessionState.AWAITING_INSTRUCTION,
+            state_version=0,
+            outcome=None,
+            updated_at=None,
+            last_activity_at=None,
+            stopped_at=None,
+        ),
+        managed=None,
+        directory=tmp_path,
+        events=SimpleNamespace(append_event=lambda *_args, **_kwargs: None),
+    )
+    supervisor = object.__new__(sessions_module.SessionSupervisor)
+    supervisor._handle = lambda _session_id: handle
+    supervisor._idempotency = SimpleNamespace(
+        replay=lambda *_args: None,
+        remember=lambda *_args: None,
+    )
+    supervisor._now = lambda: "2026-11-24T00:00:00Z"
+    supervisor._stop_channels = lambda _handle, *, wipe_secret: None
+    supervisor._purge_provider_credentials = lambda _handle, *, operation: None
+    supervisor._persist = lambda _handle: None
+
+    supervisor.interrupt(
+        SESSION_ID,
+        ReasonRequest.from_payload({"reason": "inactive interrupt cleanup oracle"}),
+        idempotency_key="m24-r2b1-inactive-interrupt",
+        body_sha256="f" * 64,
+    )
+
     assert not session_etc.exists()
 
 
