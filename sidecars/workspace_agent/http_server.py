@@ -448,7 +448,11 @@ class WorkspaceAgentRequestHandler(BaseHTTPRequestHandler):
                 workspace_id = path.rsplit("/", 1)[-1]
                 descriptor = self._agent().workspaces.get_workspace(workspace_id)
                 return 200, self._workspace_payload(descriptor)
-        except (workspace.WorkspaceError, paths.WorkspacePathError) as exc:
+        except (
+            session_state.SessionError,
+            workspace.WorkspaceError,
+            paths.WorkspacePathError,
+        ) as exc:
             raise _RequestRejected(exc.status, exc.code, exc.message, details=exc.details) from exc
         return 501, protocol.error_envelope(
             protocol.ErrorCode.NOT_IMPLEMENTED, "operation not implemented yet"
@@ -759,6 +763,8 @@ class WorkspaceAgentRequestHandler(BaseHTTPRequestHandler):
             assert declared_length is not None
             file_path = self._required_file_path()
             descriptor = manager.get_workspace(workspace_id)
+            origin = self._single_header(files.ORIGIN_HEADER)
+            task_id = self._single_header(files.TASK_ID_HEADER)
             write_route = (
                 policies.WriteRoute.FILES
                 if route.template == "/v1/workspaces/{workspace_id}/files"
@@ -771,13 +777,18 @@ class WorkspaceAgentRequestHandler(BaseHTTPRequestHandler):
                 route=write_route,
                 path=file_path,
                 expected_sha256=self._single_header(files.EXPECTED_SHA256_HEADER),
-                origin=self._single_header(files.ORIGIN_HEADER),
-                task_id=self._single_header(files.TASK_ID_HEADER),
+                origin=origin,
+                task_id=task_id,
                 generated_by=self._single_header(files.GENERATED_BY_HEADER),
                 source_sha256=self._single_header(files.SOURCE_SHA256_HEADER),
                 source=self.rfile,
                 declared_length=declared_length,
                 idempotency_key=self.headers.get(protocol.IDEMPOTENCY_KEY_HEADER) or "",
+                agent_content_check=(
+                    self._sessions().check_agent_file_write
+                    if origin == "agent" and task_id is not None
+                    else None
+                ),
             )
             return outcome.status, outcome.body
         return None

@@ -28,7 +28,7 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, BinaryIO, Protocol
@@ -2744,8 +2744,10 @@ class SessionSupervisor:
                 self._stop_channels(handle, wipe_secret=False)
                 # R2B-1: an interrupt ends the run's access to the provider
                 # credential; a later start/resume seeds a fresh copy.
-                self._purge_provider_credentials(handle, operation="interrupt")
-                process.cleanup_session_etc_directory(handle.directory)
+                try:
+                    self._purge_provider_credentials(handle, operation="interrupt")
+                finally:
+                    process.cleanup_session_etc_directory(handle.directory)
                 self._persist(handle)
                 # SESSION-RUNNER §6 fixes the interrupt receipt literal to
                 # ``interrupt_requested`` (the backend model is strict); the
@@ -3005,9 +3007,14 @@ class SessionSupervisor:
         captured_notes: list[str] = []
         # F2: the whole capture is refused before anything reaches the
         # versioned workspace; a single offending file revokes the session.
+        ordered_candidates = sorted(candidates, key=lambda entry: entry[0])
         self._refuse_secret_exposure(
             handle,
-            tuple((destination, kind, data) for destination, kind, data, _, _ in candidates),
+            tuple(
+                (destination, kind, data) for destination, kind, data, _, _ in ordered_candidates
+            ),
+            combined_content=b"\x00".join(data for _, _, data, _, _ in ordered_candidates),
+            ordered_content=b"".join(data for _, _, data, _, _ in ordered_candidates),
         )
         entries = [
             (destination, kind, data)
@@ -3078,7 +3085,13 @@ class SessionSupervisor:
         return captured, captured_notes
 
     def _refuse_secret_exposure(
-        self, handle: _Session, entries: Sequence[tuple[str, str, bytes]]
+        self,
+        handle: _Session,
+        entries: Sequence[tuple[str, str, bytes]],
+        *,
+        operation: str = "collect",
+        combined_content: bytes | None = None,
+        ordered_content: bytes | None = None,
     ) -> None:
         """Refuse to persist agent content carrying a session or provider secret.
 
@@ -3091,7 +3104,7 @@ class SessionSupervisor:
         for destination, _kind, _data in entries:
             if any(_is_credential_file_name(part) for part in PurePosixPath(destination).parts):
                 self._revoke_secret_exposure(handle)
-                raise SecretExposureError(operation="collect")
+                raise SecretExposureError(operation=operation)
         # The current copies are read here (never persisted) so a token the CLI
         # refreshed during the run is covered even before the next purge; forms
         # captured at launch/interrupt cover copies already destroyed.
@@ -3107,7 +3120,35 @@ class SessionSupervisor:
                 data, forms
             ):
                 self._revoke_secret_exposure(handle)
-                raise SecretExposureError(operation="collect")
+                raise SecretExposureError(operation=operation)
+        # The delimiter-preserving stream follows the requested candidate order;
+        # the raw ordered stream also catches a credential split into sub-16-byte
+        # fragments across note boundaries without lowering the fragment floor.
+        if any(
+            content is not None and _contains_secret_form(content, forms)
+            for content in (combined_content, ordered_content)
+        ):
+            self._revoke_secret_exposure(handle)
+            raise SecretExposureError(operation=operation)
+
+    def check_agent_file_write(
+        self,
+        task_id: str,
+        destination: str,
+        read_content: Callable[[], bytes],
+    ) -> None:
+        """Refuse agent file content carrying credentials for its active task session."""
+        with self._lock:
+            handles = tuple(self._sessions.values())
+        for handle in handles:
+            with handle.lock:
+                if handle.record.task_id != task_id or handle.record.state not in ACTIVE_STATES:
+                    continue
+                self._refuse_secret_exposure(
+                    handle,
+                    ((destination, "notes", read_content()),),
+                    operation="file_write",
+                )
 
     def _revoke_secret_exposure(self, handle: _Session) -> None:
         """Revoke a session whose secret was persisted by the agent (F2).

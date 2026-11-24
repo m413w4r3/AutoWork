@@ -14,12 +14,23 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import urlencode
 
 import pytest
+from sidecars.workspace_agent import protocol
+from sidecars.workspace_agent.http_server import (
+    Route,
+    RouteKind,
+    WorkspaceAgentRequestHandler,
+    _RequestRejected,
+)
 from sidecars.workspace_agent.sessions import supervisor as sessions_supervisor
+from sidecars.workspace_agent.sessions.state import SessionState
 
 from tests.workspace_agent.sessions_support import (
     COLLECT_KEY,
@@ -39,6 +50,72 @@ from tests.workspace_agent.sessions_support import (
     workspace_files_containing,
     write_fake_script,
 )
+from tests.workspace_agent.w3_support import make_scan_environment
+
+
+class _RequestHeaders:
+    def __init__(self, values: dict[str, str]) -> None:
+        self.values = {name.lower(): value for name, value in values.items()}
+
+    def get_all(self, name: str) -> list[str]:
+        value = self.values.get(name.lower())
+        return [] if value is None else [value]
+
+    def get(self, name: str, default: str | None = None) -> str | None:
+        return self.values.get(name.lower(), default)
+
+
+def _dispatch_agent_file_write(
+    tmp_path: Path, *, body: bytes, active: bool
+) -> tuple[object, Path, SimpleNamespace]:
+    environment = make_scan_environment(tmp_path)
+    task_note = f"notes/agents/{TASK_ID}/note.md"
+    record = SimpleNamespace(task_id=TASK_ID, state=SessionState.READY)
+    handle = SimpleNamespace(
+        record=record,
+        lock=threading.RLock(),
+        secret_forms=sessions_supervisor._secret_content_forms(URLSAFE_SECRET),
+        provider_credential_forms=(),
+        directory=tmp_path,
+    )
+    supervisor = object.__new__(sessions_supervisor.SessionSupervisor)
+    supervisor._sessions = {SESSION_ID: handle} if active else {}
+    supervisor._lock = threading.RLock()
+    supervisor._revoke_secret_exposure = lambda target: setattr(
+        target.record, "state", SessionState.FAILED
+    )
+
+    agent = SimpleNamespace(workspaces=environment.manager, scans=environment.service())
+    request = object.__new__(WorkspaceAgentRequestHandler)
+    request.server = SimpleNamespace(agent=agent, session_supervisor=supervisor)
+    request._agent = lambda: agent
+    request._sessions = lambda: supervisor
+    request.path = (
+        f"/v1/workspaces/{environment.descriptor.workspace_id}/files?"
+        f"{urlencode({'path': task_note})}"
+    )
+    request.headers = _RequestHeaders(
+        {
+            "Content-Length": str(len(body)),
+            "Idempotency-Key": "m24-r1b-agent-note-write-0001",
+            "X-Autowork-Expected-Sha256": "new",
+            "X-Autowork-Origin": "agent",
+            "X-Autowork-Task-Id": TASK_ID,
+        }
+    )
+    request.rfile = io.BytesIO(body)
+    route = Route(
+        RouteKind.WORKSPACE,
+        "/v1/workspaces/{workspace_id}/files",
+        protocol.EDITABLE_FILE_LIMIT,
+    )
+    try:
+        response: object = request._dispatch_workspace(
+            "PUT", f"/v1/workspaces/{environment.descriptor.workspace_id}/files", route
+        )
+    except _RequestRejected as exc:
+        response = exc
+    return response, Path(environment.descriptor.host_path) / task_note, handle
 
 
 def _std_b64(value: bytes) -> bytes:
@@ -237,6 +314,83 @@ def test_collect_refuses_a_session_secret_in_the_destination_path(session_base: 
     assert revoked == [handle]
 
 
+def test_agent_file_route_refuses_active_task_secret_before_persist(tmp_path: Path) -> None:
+    body = b"# synthetic note\n" + URLSAFE_SECRET[4:24] + b"\n"
+
+    response, destination, handle = _dispatch_agent_file_write(tmp_path, body=body, active=True)
+
+    assert isinstance(response, _RequestRejected)
+    assert response.status == 403
+    assert response.code == protocol.ErrorCode.POLICY_DENIED
+    assert handle.record.state is SessionState.FAILED
+    assert not destination.exists()
+
+
+def test_agent_file_route_allows_clean_content_for_active_task(tmp_path: Path) -> None:
+    body = b"# synthetic clean note\n"
+
+    response, destination, handle = _dispatch_agent_file_write(tmp_path, body=body, active=True)
+
+    assert isinstance(response, tuple)
+    assert response[0] == 201
+    assert handle.record.state is SessionState.READY
+    assert destination.read_bytes() == body
+
+
+def test_agent_file_route_keeps_writes_without_active_session(tmp_path: Path) -> None:
+    body = b"# synthetic note without a linked session\n"
+
+    response, destination, _handle = _dispatch_agent_file_write(tmp_path, body=body, active=False)
+
+    assert isinstance(response, tuple)
+    assert response[0] == 201
+    assert destination.read_bytes() == body
+
+
+def test_collect_refuses_secret_split_across_three_notes(
+    session_base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = bytes(range(ord("A"), ord("A") + 45))
+    session_directory = session_base / "session"
+    scratch = session_directory / "scratch"
+    notes = scratch / "notes"
+    notes.mkdir(parents=True)
+    for index in range(3):
+        (notes / f"part-{index}.md").write_bytes(secret[index * 15 : (index + 1) * 15])
+    handle = SimpleNamespace(
+        record=SimpleNamespace(
+            workspace_id="ws-test",
+            task_id="task-test",
+            session_id="sess-test",
+            current_run=1,
+            captured={},
+        ),
+        scratch=scratch,
+        directory=session_directory,
+        secret_forms=sessions_supervisor._secret_content_forms(secret),
+        provider_credential_forms=(),
+    )
+    revoked: list[object] = []
+    supervisor = object.__new__(sessions_supervisor.SessionSupervisor)
+    supervisor._workspaces = SimpleNamespace(get_workspace=lambda _workspace_id: object())
+    supervisor._config = SimpleNamespace(workspace_root=session_base)
+    supervisor._scans = object()
+    supervisor._revoke_secret_exposure = lambda target: revoked.append(target)
+    supervisor._ensure_capture_parent = lambda *_args: None
+    monkeypatch.setattr(
+        sessions_supervisor.files,
+        "write_file",
+        lambda **_kwargs: sessions_supervisor.files.WriteOutcome(
+            status=201, body={"revision": {"sha256": "a" * 64}}
+        ),
+    )
+
+    with pytest.raises(sessions_supervisor.SecretExposureError):
+        supervisor._capture(handle)
+
+    assert revoked == [handle]
+
+
 def test_collect_ignores_an_oversized_note_outside_the_manifest(session_base: Path) -> None:
     session_directory = session_base / "session"
     scratch = session_directory / "scratch"
@@ -252,7 +406,7 @@ def test_collect_ignores_an_oversized_note_outside_the_manifest(session_base: Pa
     )
     supervisor = object.__new__(sessions_supervisor.SessionSupervisor)
     supervisor._workspaces = SimpleNamespace(get_workspace=lambda _workspace_id: object())
-    supervisor._refuse_secret_exposure = lambda _handle, _entries: None
+    supervisor._refuse_secret_exposure = lambda _handle, _entries, **_kwargs: None
 
     captured, captured_notes = supervisor._capture(handle)
 
@@ -279,7 +433,7 @@ def test_collect_budget_ignores_files_outside_the_manifest(session_base: Path) -
     )
     supervisor = object.__new__(sessions_supervisor.SessionSupervisor)
     supervisor._workspaces = SimpleNamespace(get_workspace=lambda _workspace_id: object())
-    supervisor._refuse_secret_exposure = lambda _handle, _entries: None
+    supervisor._refuse_secret_exposure = lambda _handle, _entries, **_kwargs: None
 
     captured, captured_notes = supervisor._capture(handle)
 
