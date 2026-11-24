@@ -97,7 +97,9 @@ déclenche aucun fournisseur.
 est réservé à un opérateur humain vérifié et réutilise la résolution des blocs
 `canonical_code`: l'observation doit appartenir à l'enquête, ne pas être un
 élément consultatif, et son blob doit correspondre au SHA-256 enregistré. Les
-blobs source sont plafonnés à 4 MiB et chaque plage à 4 096 octets. Les
+blobs source ne sont pas plafonnés (comme pour la vérification des blocs
+`canonical_code`, dont la sémantique reste inchangée) ; seule la fenêtre servie
+par requête est bornée à 4 096 octets. Les
 paramètres requis sont `offset` (octet, à partir de zéro) et `length`; `view`
 vaut `text` (défaut) ou `hex`. Une plage hors limites retourne 422, une
 observation absente ou hors enquête retourne 404, et une référence canonique

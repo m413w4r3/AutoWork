@@ -16,7 +16,6 @@ from cti_app.api.investigation import (
     _uow_factory,
 )
 from cti_app.application.opinion_note_proposals import (
-    MAX_CANONICAL_CODE_SOURCE_BYTES,
     CanonicalCodeSourceUnavailableError,
     canonical_code_excerpt_bytes,
     resolve_canonical_code_observation_blob,
@@ -76,7 +75,7 @@ async def get_investigation_observation_excerpt(
     investigation_id: UUID,
     observation_id: UUID,
     request: Request,
-    offset: int = Query(..., ge=0, le=MAX_CANONICAL_CODE_SOURCE_BYTES),
+    offset: int = Query(..., ge=0),
     length: int = Query(..., ge=1, le=MAX_CANONICAL_CODE_EXCERPT_BYTES),
     view: Literal["text", "hex"] = Query(default="text"),
 ) -> ObservationExcerptTextV1 | ObservationExcerptHexV1:

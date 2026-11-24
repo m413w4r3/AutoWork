@@ -31,7 +31,6 @@ from cti_app.application.investigation_persistence import (
 )
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import (
-    MAX_ARTIFACT_BYTES,
     ProductionArtifactStore,
     ProductionReuseStorageUnavailableError,
 )
@@ -88,7 +87,6 @@ _ADVISOR_CALL_SCHEMA = "operator-advisor-call.v1"
 _ADVISOR_RESPONSE_LINK_SCHEMA = "operator-advisor-response-link.v1"
 _ACCEPTED_ADVISOR_STATUSES = frozenset({"succeeded", "partial"})
 _MAX_QUESTION_CHARS = 8_000
-MAX_CANONICAL_CODE_SOURCE_BYTES = MAX_ARTIFACT_BYTES
 
 
 class CanonicalCodeSourceUnavailableError(RuntimeError):
@@ -108,15 +106,14 @@ async def resolve_canonical_code_observation_blob(
     artifact_store: ProductionArtifactStore,
     investigation_id: UUID,
     observation: EvidenceObservation,
-    max_bytes: int | None = MAX_CANONICAL_CODE_SOURCE_BYTES,
+    max_bytes: int | None = None,
 ) -> CanonicalCodeObservationBlobV1 | None:
     """Read the same bounded, non-advisory observation blob used by note verification.
 
     The caller must first obtain the observation by its canonical ID. A source is
     admissible only when it belongs to this investigation, is not advisory, its
-    stored bytes fit ``max_bytes`` (the read endpoint is bounded; note
-    verification passes ``None`` and stays unbounded as before M24.2), and those
-    bytes match the observation SHA.
+    stored bytes match the observation SHA. ``max_bytes`` is an optional caller
+    bound; neither note verification nor the excerpt route sets one.
     """
     if observation.investigation_id != investigation_id or is_advisory_observation(observation):
         return None
@@ -150,8 +147,6 @@ def canonical_code_excerpt_bytes(
     ``enforce_read_limits`` applies the bounds of the excerpt READ endpoint only;
     note verification keeps the unbounded semantics of blocks stored before M24.2.
     """
-    if enforce_read_limits and len(raw) > MAX_CANONICAL_CODE_SOURCE_BYTES:
-        raise ValueError("Canonical code source exceeds the source size limit")
     if type(offset) is not int or offset < 0:
         raise ValueError("Canonical code offset must be a non-negative integer")
     if (

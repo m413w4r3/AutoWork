@@ -14,7 +14,6 @@ from httpx import ASGITransport
 
 from cti_app.api.investigation_observation_excerpts import router
 from cti_app.application.identity import LocalIdentityProvider
-from cti_app.application.opinion_note_proposals import MAX_CANONICAL_CODE_SOURCE_BYTES
 from cti_app.config import Settings
 from cti_app.domain.analyst_opinion import CanonicalCodeNoteBlockV1
 from cti_app.domain.opinion_note_proposal import NoteTargetBlockType
@@ -162,15 +161,22 @@ async def test_excerpt_hides_cross_investigation_observations_and_unavailable_bl
 
 
 @pytest.mark.asyncio
-async def test_excerpt_rejects_observation_blob_over_shared_source_limit() -> None:
+async def test_excerpt_reads_a_large_observation_blob_without_a_size_cap() -> None:
+    """Only the response window is bounded; the source blob is not capped."""
+    size = 4 * 1024 * 1024 + 1
+    raw = b"x" * (size - 3) + b"end"
     fixture = _Fixture()
-    observation = await _append_observation(fixture, b"x" * (MAX_CANONICAL_CODE_SOURCE_BYTES + 1))
+    observation = await _append_observation(fixture, raw)
     async with httpx.AsyncClient(
         transport=ASGITransport(app=_app(fixture)), base_url="http://test"
     ) as client:
         response = await client.get(
-            _path(fixture, observation.id), params={"offset": 0, "length": 1}
+            _path(fixture, observation.id),
+            params={"offset": size - 3, "length": 3, "view": "text"},
         )
 
-    assert response.status_code == 409
-    assert response.json()["detail"]["code"] == "note_code_ref_stale"
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["text"] == "end"
+    assert payload["total_size"] == size
+    assert payload["excerpt_sha256"] == hashlib.sha256(b"end").hexdigest()

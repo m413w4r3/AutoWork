@@ -37,7 +37,6 @@ from cti_app.application.investigation_persistence import (
 )
 from cti_app.application.operator_tool_invocation import OperatorToolInvocationResult
 from cti_app.application.opinion_note_proposals import (
-    MAX_CANONICAL_CODE_SOURCE_BYTES,
     AdvisorDraftingOutcomeV1,
     NoteArticleElementFactV1,
     NoteContentBlockContextV1,
@@ -1714,8 +1713,8 @@ def test_code_ref_verification_stays_unbounded_for_blocks_stored_before_m24_2() 
     """
     prefix = b"head:"
     body = bytes(65 + (index % 26) for index in range(4097))
-    raw = prefix + body + b"x" * (MAX_CANONICAL_CODE_SOURCE_BYTES + 1)
-    assert len(raw) > MAX_CANONICAL_CODE_SOURCE_BYTES
+    raw = prefix + body + b"x" * (4 * 1024 * 1024 + 1)
+    assert len(raw) > 4 * 1024 * 1024
     fixture = _Fixture()
     observation = _append_observation(fixture, raw)
     excerpt = raw[len(prefix) : len(prefix) + 4097]
