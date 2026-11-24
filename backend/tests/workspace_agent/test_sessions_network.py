@@ -433,6 +433,58 @@ def test_spawn_refuses_an_argv_that_widens_the_sandbox(
     assert "widens the sandbox" in str(raised.value)
 
 
+@pytest.mark.parametrize("target", ["/", "/etc"])
+@pytest.mark.parametrize("via_symlink", [False, True])
+@pytest.mark.parametrize("option", ["--bind", "--ro-bind", "--bind-try", "--ro-bind-try"])
+def test_isolated_profile_refuses_binds_of_host_root_or_etc(
+    tmp_path: Path, target: str, via_symlink: bool, option: str
+) -> None:
+    source = Path(target)
+    if via_symlink:
+        source = tmp_path / f"bind-source-{target.strip('/').replace('/', '-') or 'root'}"
+        source.symlink_to(target, target_is_directory=True)
+    argv = _bwrap_profile(tmp_path, ("/usr/bin/codex", "exec"))
+    separator = argv.index("--")
+    forged = (
+        *argv[:separator],
+        option,
+        str(source),
+        "/mnt/host-data",
+        *argv[separator:],
+    )
+
+    with pytest.raises(process.NetworkIsolationUnavailable):
+        process._require_isolated_profile(forged)
+
+
+@pytest.mark.parametrize("option", ["--bind", "--ro-bind", "--bind-try", "--ro-bind-try"])
+def test_isolated_profile_keeps_unrelated_bind_sources_allowed(tmp_path: Path, option: str) -> None:
+    argv = _bwrap_profile(tmp_path, ("/usr/bin/codex", "exec"))
+    separator = argv.index("--")
+    safe_source = tmp_path / "synthetic-trust-store"
+    safe_source.mkdir()
+    augmented = (
+        *argv[:separator],
+        option,
+        str(safe_source),
+        "/mnt/synthetic-trust-store",
+        *argv[separator:],
+    )
+
+    process._require_isolated_profile(augmented)
+
+
+@pytest.mark.parametrize("resolved", ["/", "/etc"])
+def test_tls_anchor_resolving_to_host_root_or_etc_is_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, resolved: str
+) -> None:
+    link = tmp_path / "synthetic-certificate-anchor"
+    link.symlink_to(resolved, target_is_directory=True)
+    monkeypatch.setattr(process, "TLS_TRUST_ANCHOR_PATHS", (str(link),))
+
+    assert process.tls_trust_anchor_binds() == ()
+
+
 def test_spawn_fails_closed_when_the_egress_proxy_socket_is_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

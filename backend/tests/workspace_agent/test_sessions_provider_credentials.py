@@ -197,6 +197,17 @@ def _token_forms() -> dict[str, bytes]:
     }
 
 
+def test_unknown_credential_json_schema_derives_forms_from_string_leaves() -> None:
+    synthetic_value = b"synthetic-unknown-schema-credential-0123456789abcdef"
+    encoded = json.dumps(
+        {"opaque": {"entries": [{"credential_value": synthetic_value.decode("ascii")}]}}
+    ).encode("utf-8")
+
+    forms = sessions_supervisor._credential_bytes_forms(encoded)
+
+    assert sessions_supervisor._contains_secret_form(synthetic_value, forms)
+
+
 @pytest.mark.parametrize("form", sorted(_token_forms()))
 def test_collect_refuses_a_note_carrying_a_seeded_provider_credential(
     session_base: Path, form: str

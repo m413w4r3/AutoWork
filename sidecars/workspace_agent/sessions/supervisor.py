@@ -1028,6 +1028,10 @@ def _credential_bytes_forms(data: bytes) -> tuple[bytes, ...]:
         return _credential_value_forms(data)
     values: list[str] = []
     _collect_credential_values(parsed, values)
+    # Keep the known credential-key extraction and also inspect every JSON
+    # string leaf so credentials stored under an unfamiliar provider schema
+    # still produce the same in-memory refusal forms.
+    _append_credential_strings(parsed, values)
     forms: set[bytes] = set()
     for value in values:
         raw = value.encode("utf-8")
@@ -2741,6 +2745,7 @@ class SessionSupervisor:
                 # R2B-1: an interrupt ends the run's access to the provider
                 # credential; a later start/resume seeds a fresh copy.
                 self._purge_provider_credentials(handle, operation="interrupt")
+                process.cleanup_session_etc_directory(handle.directory)
                 self._persist(handle)
                 # SESSION-RUNNER §6 fixes the interrupt receipt literal to
                 # ``interrupt_requested`` (the backend model is strict); the
@@ -2982,6 +2987,8 @@ class SessionSupervisor:
                 ):
                     continue
                 if info.st_size > MAX_CAPTURE_NOTE_BYTES:
+                    if not _capture_manifest_allows(declaration, relative):
+                        continue
                     raise BudgetExceededError("capture")
                 data = self._read_capture_file(source)
                 if data is None:
@@ -3093,8 +3100,10 @@ class SessionSupervisor:
         )
         if not forms:
             return
-        for _destination, _kind, data in entries:
-            if _contains_secret_form(data, forms):
+        for destination, _kind, data in entries:
+            if _contains_secret_form(destination.encode("utf-8"), forms) or _contains_secret_form(
+                data, forms
+            ):
                 self._revoke_secret_exposure(handle)
                 raise SecretExposureError(operation="collect")
 
