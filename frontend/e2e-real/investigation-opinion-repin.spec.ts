@@ -24,6 +24,12 @@ interface InvestigationBrowserState {
     render_id: string;
     pdf_sha256: string;
   };
+  job_runs?: unknown[];
+  fixture_bridge_submissions?: number;
+  fixture_vt_file_reports?: number;
+  fixture_vt_searches?: number;
+  fixture_vt_downloads?: number;
+  fixture_shodan_calls?: number;
   browser_result?: Record<string, unknown>;
 }
 
@@ -205,7 +211,37 @@ test("enquête A, publication augmentée, repin humain et PDF réel", async ({
     page.getByRole("heading", { name: "Versions et dernières décisions" }),
   ).toBeVisible();
   const envelope = page.locator("#investigation-envelope-panel");
-  await expect(envelope).toContainText("Proposition locale non approuvée");
+  const initialEnvelopeResponse = await request.get(
+    `http://127.0.0.1:${state.api_port}/api/investigations/${state.investigation_id}/envelope`,
+  );
+  expect(initialEnvelopeResponse.status()).toBe(200);
+  const initialEnvelope = objectAt(
+    await initialEnvelopeResponse.json(),
+    "initial G2 envelope",
+  );
+  expect(initialEnvelope.approved).toBe(false);
+  expect(initialEnvelope.currently_authorized).toBe(false);
+  expect(initialEnvelope.allowed_providers).toEqual([]);
+  expect(initialEnvelope.acquire_hits_allowed).toBe(false);
+  await expect(
+    envelope.getByRole("heading", { name: "Accès externes : non accordés" }),
+  ).toBeVisible();
+  await expect(envelope.getByRole("note")).toContainText(
+    "Rien n’est pré-approuvé",
+  );
+  await expect(
+    envelope.getByRole("group", { name: "Actions G2" }).getByRole("button", {
+      name: "Approuver",
+      exact: true,
+    }),
+  ).toBeVisible();
+  const preApprovalState = readState().value;
+  expect(preApprovalState.job_runs ?? []).toEqual([]);
+  expect(preApprovalState.fixture_bridge_submissions).toBeUndefined();
+  expect(preApprovalState.fixture_vt_file_reports).toBeUndefined();
+  expect(preApprovalState.fixture_vt_searches).toBeUndefined();
+  expect(preApprovalState.fixture_vt_downloads).toBeUndefined();
+  expect(preApprovalState.fixture_shodan_calls).toBeUndefined();
   await envelope
     .getByRole("button", { name: "Approuver", exact: true })
     .click();
@@ -235,7 +271,9 @@ test("enquête A, publication augmentée, repin humain et PDF réel", async ({
     .click();
   const g2Response = await g2ResponsePromise;
   expect(g2Response.status()).toBe(200);
-  await expect(envelope).toContainText("Enveloppe approuvée · version 1");
+  await expect(
+    envelope.getByRole("heading", { name: "Accès externes : actifs" }),
+  ).toBeVisible();
   const g2Body = objectAt(await g2Response.json(), "G2 response");
   expect(g2Body.approved).toBe(true);
   expect(g2Body.version).toBe(1);
