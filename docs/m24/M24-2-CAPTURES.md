@@ -79,6 +79,8 @@ M24.1 ne montrait pas cet état ou ce contenu.
 - À 1280 px, plusieurs détails de tâche ou de proposition continuent sous le
   pli. Le contenu reste accessible par défilement; la capture ne montre pas
   toute la page.
+- Dans les captures Overview, l’alignement de la zone utile rogne partiellement
+  le titre général de page en haut de l’image.
 - Le lecteur PDF intégré n’est pas rendu par Chromium headless. Le repli de
   téléchargement/ouverture est visible et les trois pages réelles ont été
   vérifiées séparément après rasterisation.
