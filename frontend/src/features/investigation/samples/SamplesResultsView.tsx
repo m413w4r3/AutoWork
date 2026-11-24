@@ -70,6 +70,21 @@ const CHIP_KINDS: Record<WorkContributionCategory, string> = {
   finding: "Finding — vérification humaine requise",
 };
 
+function contributionChipLabel(contribution: WorkContributionView): string {
+  if (contribution.category !== "observation") {
+    return CHIP_KINDS[contribution.category];
+  }
+  if (
+    contribution.import_status === "imported" &&
+    contribution.observation_id !== null
+  ) {
+    return CHIP_KINDS.observation;
+  }
+  return contribution.import_status === "imported"
+    ? "Observation importée — non probante"
+    : "Observation proposée — non importée";
+}
+
 const AVAILABILITY_LABELS = {
   available: "Disponible",
   limited: "Disponibilité limitée",
@@ -134,6 +149,7 @@ interface ObjectRow {
   availability: Availability;
   sourceKey: string;
   sourceLabel: string;
+  associationAmbiguous: boolean;
 }
 
 type SortColumn =
@@ -169,6 +185,9 @@ function buildSampleRows(
         iocDownload,
         association.association_id,
         association.sample_sha256,
+        ioc.associations.filter(
+          (item) => item.sample_sha256 === association.sample_sha256,
+        ).length,
       );
       rows.push({
         key,
@@ -199,6 +218,8 @@ function buildSampleRows(
         iocDownload,
         sample.association_id,
         sample.sha256,
+        ioc.associations.filter((item) => item.sample_sha256 === sample.sha256)
+          .length,
       );
       rows.push({
         key,
@@ -221,18 +242,36 @@ function downloadForAssociation(
   download: BootstrapDownloadOutcomeV1 | null,
   associationId: string | null,
   sampleSha256: string,
+  matchingAssociationCount: number,
 ): BootstrapDownloadOutcomeV1 | null {
   if (download === null) return null;
-  if (
-    download.association_id !== null &&
-    download.association_id === associationId
-  ) {
-    return download;
+  if (associationId !== null) {
+    return download.association_id === associationId ? download : null;
   }
-  if (download.sample_sha256 !== null) {
+  if (matchingAssociationCount === 1 && download.sample_sha256 !== null) {
     return download.sample_sha256 === sampleSha256 ? download : null;
   }
   return null;
+}
+
+function resolveSampleAssociation(
+  samples: readonly InvestigationSampleDetail[] | undefined,
+  associationId: string | null,
+  sha256: string,
+): { sample: InvestigationSampleDetail | null; ambiguous: boolean } {
+  if (associationId !== null) {
+    return {
+      sample: samples?.find((sample) => sample.id === associationId) ?? null,
+      ambiguous: false,
+    };
+  }
+  const matches = (samples ?? []).filter(
+    (sample) => sample.sample_sha256 === sha256,
+  );
+  return {
+    sample: matches.length === 1 ? (matches[0] ?? null) : null,
+    ambiguous: matches.length > 1,
+  };
 }
 
 function findSnapshotIoc(
@@ -328,10 +367,8 @@ function buildObjectRows(
   const rows: ObjectRow[] = [];
 
   for (const row of sampleRows) {
-    const canonical = samples?.find(
-      (sample) =>
-        sample.id === row.associationId || sample.sample_sha256 === row.sha256,
-    );
+    const { sample: canonical, ambiguous: associationAmbiguous } =
+      resolveSampleAssociation(samples, row.associationId, row.sha256);
     const associationId = canonical?.id ?? row.associationId;
     const ioc = row.ioc;
     const snapshotIoc = findSnapshotIoc(snapshot, ioc, row.sha256);
@@ -339,9 +376,20 @@ function buildObjectRows(
       snapshotIoc?.download ?? row.download,
       associationId,
       row.sha256,
+      (samples ?? []).filter((sample) => sample.sample_sha256 === row.sha256)
+        .length,
     );
-    const sampleOrigin = canonical?.origin ?? row.origin;
-    const [sourceKey, sourceLabel] = sourceForSample(sampleOrigin, ioc.origin);
+    const sampleOrigin = associationAmbiguous
+      ? null
+      : (canonical?.origin ?? row.origin);
+    const [resolvedSourceKey, resolvedSourceLabel] = sourceForSample(
+      sampleOrigin,
+      ioc.origin,
+    );
+    const sourceKey = associationAmbiguous ? "ambiguous" : resolvedSourceKey;
+    const sourceLabel = associationAmbiguous
+      ? "Association ambiguë — plusieurs associations partagent cette empreinte"
+      : resolvedSourceLabel;
     rows.push({
       key: `sample:${row.key}`,
       rowKind: "sample",
@@ -353,7 +401,9 @@ function buildObjectRows(
       sampleOrigin,
       associationId,
       sampleId: row.sampleId,
-      qualification: canonical?.qualification ?? row.qualification,
+      qualification: associationAmbiguous
+        ? null
+        : (canonical?.qualification ?? row.qualification),
       state: row.state,
       download,
       snapshotIoc,
@@ -366,6 +416,7 @@ function buildObjectRows(
       ),
       sourceKey,
       sourceLabel,
+      associationAmbiguous,
     });
   }
 
@@ -379,6 +430,9 @@ function buildObjectRows(
       snapshotIoc?.download ?? null,
       sample.id,
       sample.sample_sha256,
+      (samples ?? []).filter(
+        (candidate) => candidate.sample_sha256 === sample.sample_sha256,
+      ).length,
     );
     const [sourceKey, sourceLabel] = sourceForSample(
       sample.origin,
@@ -408,6 +462,7 @@ function buildObjectRows(
       ),
       sourceKey,
       sourceLabel,
+      associationAmbiguous: false,
     });
   }
 
@@ -445,6 +500,7 @@ function buildObjectRows(
       ),
       sourceKey,
       sourceLabel,
+      associationAmbiguous: false,
     });
   }
   return rows;
@@ -813,6 +869,12 @@ function DetailPanel({
             {row.state === null ? "" : ` · ${SAMPLE_STATE_LABELS[row.state]}`}
           </p>
         )}
+        {row.associationAmbiguous ? (
+          <p role="status">
+            Association ambiguë — plusieurs associations partagent cette
+            empreinte.
+          </p>
+        ) : null}
         {row.ioc?.claims.length ? (
           <p>
             Claims reliés :{" "}
@@ -953,7 +1015,7 @@ function DetailPanel({
                 <code>{contribution.file_sha256}</code> ·{" "}
                 {CONTRIBUTION_CATEGORY_LABELS[contribution.category]} ·{" "}
                 {CONTRIBUTION_IMPORT_LABELS[contribution.import_status]} ·{" "}
-                {CHIP_KINDS[contribution.category]}
+                {contributionChipLabel(contribution)}
                 {contribution.validation_error_code === null
                   ? ""
                   : ` · échec ${contribution.validation_error_code}`}
