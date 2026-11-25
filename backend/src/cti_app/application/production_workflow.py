@@ -211,6 +211,30 @@ def _transient_or_terminal(stage: str, exc: Exception) -> dict[str, Any]:
     return result
 
 
+def _durable_collection_fields(
+    collection: Any | None, *, state_before_attempt: str
+) -> dict[str, Any]:
+    """Authoritative post-attempt collection facts; the pre-fetch state is only context."""
+
+    def value(item: Any) -> Any:
+        return getattr(item, "value", item)
+
+    fields: dict[str, Any] = {"state_before_attempt": str(state_before_attempt)}
+    if collection is None:
+        return fields
+    fields["collection_state"] = str(value(collection.state))
+    fields["failure_reason_code"] = (
+        None
+        if collection.failure_reason_code is None
+        else str(value(collection.failure_reason_code))
+    )
+    fields["attempt_count"] = int(collection.attempt_count)
+    fields["latest_attempt_id"] = (
+        None if collection.latest_attempt_id is None else str(collection.latest_attempt_id)
+    )
+    return fields
+
+
 def _supplemental_failure_fields(
     exc: Exception,
     *,
@@ -1062,11 +1086,26 @@ class ProductionWorkflowOrchestrator:
                                     canonical_url=collection.canonical_url,
                                 )
                             )
+                            persisted_collection = next(
+                                (
+                                    source
+                                    for source in await self._collection_service.list_sources(
+                                        run.subject_id
+                                    )
+                                    if source.id == collection.id
+                                ),
+                                None,
+                            )
                             failure_fields = _supplemental_failure_fields(
                                 exc,
                                 canonical_url=collection.canonical_url,
                                 collection_state=str(collection_state),
                                 retry_attempted=retry_attempted,
+                            )
+                            failure_fields.update(
+                                _durable_collection_fields(
+                                    persisted_collection, state_before_attempt=collection_state
+                                )
                             )
                             supplemental_failures.append(failure_fields)
                             diagnostics = getattr(self, "_diagnostics", None)

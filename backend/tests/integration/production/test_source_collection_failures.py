@@ -176,10 +176,24 @@ async def test_unreachable_q1_source_is_a_warning_and_never_reaches_q2(
         warning.startswith("supplemental_collection_failed")
         for warning in references.metadata["warnings"]
     ), references.metadata["warnings"]
-    assert any(
-        event.get("event") == "q1.supplemental_collection_failed"
+    failed = next(collection for collection in collections if collection.canonical_url == S2)
+    event = next(
+        event
         for event in _diagnostic_events(scenario)
+        if event.get("event") == "q1.supplemental_collection_failed"
+        and event.get("canonical_url") == S2
     )
+    assert event["collection_state"] == failed.state.value
+    assert event["collection_state"] != CollectionState.PENDING.value
+    assert event["state_before_attempt"] == CollectionState.PENDING.value
+    assert event["failure_reason_code"] == (
+        failed.failure_reason_code.value if failed.failure_reason_code is not None else None
+    )
+    assert event["attempt_count"] == failed.attempt_count
+    assert event["latest_attempt_id"] == (
+        str(failed.latest_attempt_id) if failed.latest_attempt_id is not None else None
+    )
+    assert event["error_code"] == "source_collection_no_success"
 
     q2_calls = [call for call in scenario.model.calls if call.stage == "extraction"]
     assert [url for call in q2_calls for url in call.source_urls] == [S1]
@@ -220,6 +234,23 @@ async def test_retryable_collection_failure_is_attempted_once_and_left_recoverab
     assert run.status is ProductionRunStatus.READY
     failed = next(collection for collection in collections if collection.canonical_url == S2)
     assert failed.state is CollectionState.FAILED_RETRYABLE
+    event = next(
+        event
+        for event in _diagnostic_events(scenario)
+        if event.get("event") == "q1.supplemental_collection_failed"
+        and event.get("canonical_url") == S2
+    )
+    assert event["collection_state"] == failed.state.value
+    assert event["collection_state"] != CollectionState.PENDING.value
+    assert event["state_before_attempt"] == CollectionState.PENDING.value
+    assert event["failure_reason_code"] == (
+        failed.failure_reason_code.value if failed.failure_reason_code is not None else None
+    )
+    assert event["attempt_count"] == failed.attempt_count
+    assert event["latest_attempt_id"] == (
+        str(failed.latest_attempt_id) if failed.latest_attempt_id is not None else None
+    )
+    assert event["error_code"] == "source_collection_no_success"
     s2_requests = [
         request for request in scenario.collection_transport.requests if request.url == S2
     ]

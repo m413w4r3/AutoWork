@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from types import SimpleNamespace
 from typing import Any, cast
@@ -16,7 +17,12 @@ from cti_app.application.production_references import ProductionReferenceProposa
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.application.subject_production import capture_production_input_snapshot
 from cti_app.domain.classification import TLP
-from cti_app.domain.collection import CollectionState, SourceCollection, SourceOriginKind
+from cti_app.domain.collection import (
+    CollectionFailureReason,
+    CollectionState,
+    SourceCollection,
+    SourceOriginKind,
+)
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.production import (
     ProductionInputSnapshot,
@@ -626,6 +632,122 @@ async def test_supplemental_collection_failure_keeps_the_source_in_the_corpus() 
         and event["retry_attempted"] is True
         for event in diagnostics.events
     )
+
+
+@pytest.mark.parametrize(
+    ("reason_code", "persisted_state", "failure_counter"),
+    (
+        (
+            CollectionFailureReason.ACCESS_BLOCKED,
+            CollectionState.BLOCKED,
+            "blocked",
+        ),
+        (
+            CollectionFailureReason.OBSOLETE_URL_404,
+            CollectionState.UNAVAILABLE,
+            "unavailable",
+        ),
+        (
+            CollectionFailureReason.DNS_ERROR,
+            CollectionState.FAILED_RETRYABLE,
+            "failed_retryable",
+        ),
+        (
+            CollectionFailureReason.HTTP_ERROR,
+            CollectionState.FAILED_TERMINAL,
+            "failed_terminal",
+        ),
+    ),
+)
+@pytest.mark.asyncio
+async def test_supplemental_failure_event_uses_persisted_collection_state(
+    reason_code: CollectionFailureReason,
+    persisted_state: CollectionState,
+    failure_counter: str,
+) -> None:
+    subject_id = uuid4()
+    failed = _source(
+        subject_id,
+        "https://hatching.example/article",
+        origin=SourceOriginKind.REFERENCE_RESEARCH,
+    )
+    failed.state = CollectionState.PENDING
+    latest_attempt_id = uuid4()
+
+    class CollectionService:
+        def __init__(self) -> None:
+            self.list_calls = 0
+
+        async def add_supplemental_sources(self, subject_id: UUID, sources: object) -> list[object]:
+            del subject_id, sources
+            return []
+
+        async def list_sources(self, subject_id: UUID) -> list[SourceCollection]:
+            del subject_id
+            self.list_calls += 1
+            # A fresh snapshot matches the application service's new UOW read.
+            return [replace(failed)]
+
+        async def collect_subject(
+            self, subject_id: UUID, job_id: UUID, context: object, **kwargs: object
+        ) -> str:
+            del subject_id, job_id, context, kwargs
+            failed.state = persisted_state
+            failed.failure_reason_code = reason_code
+            failed.attempt_count = 1
+            failed.latest_attempt_id = latest_attempt_id
+            counters = {
+                "failed_retryable": 0,
+                "blocked": 0,
+                "unavailable": 0,
+                "failed_terminal": 0,
+            }
+            counters[failure_counter] = 1
+            raise JobHandlerError(
+                "source_collection_no_success",
+                "Aucune publication n'a pu être archivée.",
+                transient=failure_counter == "failed_retryable",
+                details={"total": 1, **counters},
+            )
+
+    diagnostics = SimpleNamespace(events=[])
+    diagnostics.record = lambda **fields: diagnostics.events.append(fields)
+    collection_service = CollectionService()
+    orchestrator = ProductionWorkflowOrchestrator.__new__(ProductionWorkflowOrchestrator)
+    orchestrator._collection_service = cast(Any, collection_service)
+    orchestrator._diagnostics = diagnostics
+    orchestrator._correlation_id = "test"
+    proposals = (
+        ProductionReferenceProposal(
+            canonical_url=failed.canonical_url,
+            title="Hatching",
+            publisher="Hatching",
+            published_at=date(2026, 8, 1),
+            role=SourceRole.INDEPENDENT,
+            kind=ProductionReferenceKind.PUBLICATION,
+            relevance_reason="Corroboration of the subject",
+        ),
+    )
+    run = ProductionRun(subject_id=subject_id, edition_id=uuid4())
+
+    outcome = await orchestrator._collect_reference_proposals(run, proposals, _Context())
+
+    event = next(
+        event
+        for event in diagnostics.events
+        if event["event"] == "q1.supplemental_collection_failed"
+    )
+    assert collection_service.list_calls == 2
+    assert event["collection_state"] == persisted_state.value
+    assert event["collection_state"] != CollectionState.PENDING.value
+    assert event["state_before_attempt"] == CollectionState.PENDING.value
+    assert event["failure_reason_code"] == reason_code.value
+    assert event["attempt_count"] == 1
+    assert event["latest_attempt_id"] == str(latest_attempt_id)
+    assert event["error_code"] == "source_collection_no_success"
+    # Supplemental failures remain warnings; the workflow receives an outcome.
+    assert outcome.failures[0]["canonical_url"] == failed.canonical_url
+    assert outcome.warnings
 
 
 @pytest.mark.asyncio
