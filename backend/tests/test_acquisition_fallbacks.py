@@ -921,6 +921,7 @@ async def test_bridge_independent_copy_stays_contextual_through_routing(tmp_path
         ProductionArtifactStatus,
     )
     from cti_app.domain.production_routing import (
+        BriefRoutingFeasibilityV1,
         ProductionRoutingArtifactInputV1,
         RoutingReasonCode,
         RoutingStatus,
@@ -931,6 +932,7 @@ async def test_bridge_independent_copy_stays_contextual_through_routing(tmp_path
     projection = _projection(extraction)
     production_run_id = uuid4()
     decision = decide_publication_routing(
+        brief_feasibility=BriefRoutingFeasibilityV1(dated_entry_count=1),
         production_run_id=production_run_id,
         subject_id=plan.subject_id,
         pipeline_generation=0,

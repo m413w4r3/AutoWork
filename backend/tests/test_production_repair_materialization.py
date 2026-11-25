@@ -86,6 +86,21 @@ class _CanonicalStore:
         return None, blob_id, None
 
 
+@pytest.fixture(autouse=True)
+def _feasible_brief_route(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
+    """These tests cover materialization, not brief feasibility; record the wiring instead."""
+    from cti_app.domain.production_routing import BriefRoutingFeasibilityV1
+
+    calls: list[dict[str, object]] = []
+
+    def feasible(**kwargs: object) -> BriefRoutingFeasibilityV1:
+        calls.append(kwargs)
+        return BriefRoutingFeasibilityV1(dated_entry_count=1)
+
+    monkeypatch.setattr(repairs_module, "compute_brief_routing_feasibility", feasible)
+    return calls
+
+
 def _impact(kind: ProductionRepairImpactKind) -> ProductionRepairImpact:
     outputs = {
         ProductionRepairImpactKind.RULE_BUNDLE_ONLY: {
@@ -385,12 +400,17 @@ async def test_canonical_rule_bundle_repair_reassembles_and_materializes_sidecar
 
 
 @pytest.mark.asyncio
-async def test_canonical_publication_materialization_is_one_transaction() -> None:
+async def test_canonical_publication_materialization_is_one_transaction(
+    _feasible_brief_route: list[dict[str, object]],
+) -> None:
     service, uow, projection, _store, _checkpoint = _service(
         ProductionRepairImpactKind.PUBLICATION_ONLY
     )
     result = await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
     assert result.action == "publication_reassembled"
+    # The repair re-routes with the same brief feasibility predicate as the workflow.
+    assert len(_feasible_brief_route) == 1
+    assert _feasible_brief_route[0]["snapshot"] is not None
     assert result.publication_artifact is not None
     assert projection.calls == 1
     assert uow.commits == 1

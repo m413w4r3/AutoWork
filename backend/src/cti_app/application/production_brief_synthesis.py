@@ -261,6 +261,34 @@ def brief_timeline_from_extraction(
     return (metadata_fallback,)
 
 
+def brief_core_primary_sources_without_source_verified_date(
+    extraction: ProductionExtractionV1,
+) -> tuple[str, ...]:
+    """List CORE/PRIMARY sources lacking a source-verified, source-dated event."""
+    sources_with_verified_dates = {
+        source.source_document_id
+        for source in extraction.sources
+        for event in source.events
+        if event.evidence_basis is ProductionEvidenceBasis.SOURCE_VERIFIED
+        and event.event_date is not None
+        and _source_contains_date(event.evidence_quote, event.event_date)
+        and (
+            event.date_text is None
+            or not event.date_text.strip()
+            or _source_contains_date(event.date_text, event.event_date)
+        )
+    }
+    return tuple(
+        sorted(
+            source.canonical_url
+            for source in extraction.sources
+            if source.tier is ProductionReferenceTier.CORE
+            and source.editorial_role is ProductionEditorialRole.PRIMARY
+            and source.source_document_id not in sources_with_verified_dates
+        )
+    )
+
+
 def _brief_period_distance(
     event_date: date,
     snapshot: ProductionInputSnapshot | None,
@@ -515,6 +543,7 @@ __all__ = [
     "BRIEF_CHRONOLOGY_SOURCE_PUBLICATION_FALLBACK_WARNING",
     "BRIEF_SYNTHESIS_PROMPT_VERSION",
     "BRIEF_TIMELINE_POLICY_VERSION",
+    "brief_core_primary_sources_without_source_verified_date",
     "brief_metadata_publication_fallback_entry",
     "brief_timeline_from_extraction",
     "build_brief_synthesis_prompt",

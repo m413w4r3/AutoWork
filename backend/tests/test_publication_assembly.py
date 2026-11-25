@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+import cti_app.application.production_repairs as repairs_module
 from cti_app.application.brief_publication_builder import wrap_publication_document_v7
 from cti_app.application.diagram_compilation import (
     DIAGRAM_COMPILATION_POLICY_VERSION,
@@ -32,6 +33,7 @@ from cti_app.application.production_repairs import (
     ProductionRepairMaterializationService,
     ProductionRepairProjectionError,
     _PublicationRouteRebuildRequired,
+    _PublicationRouteReviewRequired,
 )
 from cti_app.application.production_synthesis import canonical_extraction_hash
 from cti_app.application.publication_assembly import (
@@ -103,6 +105,7 @@ from cti_app.domain.production_references import (
     ProductionReferenceSourceV1,
     ProductionReferenceTier,
 )
+from cti_app.domain.production_routing import BriefRoutingFeasibilityV1
 from cti_app.domain.production_synthesis import (
     PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
     SYNTHESIS_POLICY_VERSION,
@@ -1776,8 +1779,17 @@ async def test_ioc_only_repair_reuses_narrative_and_reassembles_canonical_public
     )
 
 
+@pytest.mark.parametrize("brief_feasible", (True, False))
 @pytest.mark.asyncio
-async def test_ioc_repair_route_change_requires_synthesis_rebuild() -> None:
+async def test_ioc_repair_route_change_requires_synthesis_rebuild(
+    brief_feasible: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if brief_feasible:
+        monkeypatch.setattr(
+            repairs_module,
+            "compute_brief_routing_feasibility",
+            lambda **_kwargs: BriefRoutingFeasibilityV1(dated_entry_count=1),
+        )
     snapshot, references, extraction_a, synthesis_a = _canonical_inputs()
     source = extraction_a.sources[0]
     indicator = ExtractionIndicatorV1(
@@ -1866,6 +1878,21 @@ async def test_ioc_repair_route_change_requires_synthesis_rebuild() -> None:
         projection_service=object(),  # type: ignore[arg-type]
         artifact_store=store,
     )
+    if not brief_feasible:
+        # Without a source-dated chronology the brief route cannot be completed: review,
+        # never a rebuild into a format that synthesis would refuse.
+        with pytest.raises(_PublicationRouteReviewRequired) as review:
+            await repair._materialize_canonical_publication_in_uow(
+                uow,
+                run=run,
+                extraction=extraction_c_artifact,
+                repair_materialization=None,
+            )
+        assert review.value.reason_code == "brief_evidence_chronology_missing"
+        assert not [
+            row for row in artifacts.appended if row.stage is ProductionArtifactStage.PUBLICATION
+        ]
+        return
     with pytest.raises(_PublicationRouteRebuildRequired) as raised:
         await repair._materialize_canonical_publication_in_uow(
             uow,

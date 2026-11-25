@@ -32,6 +32,7 @@ from cti_app.domain.production_relevance import (
     RelevanceReasonCode,
 )
 from cti_app.domain.production_routing import (
+    BriefRoutingFeasibilityV1,
     ProductionRoutingArtifactInputV1,
     RoutingStatus,
     decide_publication_routing,
@@ -73,6 +74,7 @@ def _decision(
 ):
     extraction_hash = production_extraction_hashes(extraction)[0]
     return decide_publication_routing(
+        brief_feasibility=BriefRoutingFeasibilityV1(dated_entry_count=1),
         production_run_id=run.id,
         subject_id=run.subject_id,
         pipeline_generation=run.pipeline_generation,

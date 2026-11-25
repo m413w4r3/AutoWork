@@ -10,8 +10,18 @@ from uuid import UUID
 
 from cti_app.application.persistence import ProductionUnitOfWork, ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.domain.production import ProductionArtifact, ProductionArtifactStage, ProductionRun
+from cti_app.application.production_brief_synthesis import (
+    brief_core_primary_sources_without_source_verified_date,
+    brief_timeline_from_extraction,
+)
+from cti_app.domain.production import (
+    ProductionArtifact,
+    ProductionArtifactStage,
+    ProductionInputSnapshot,
+    ProductionRun,
+)
 from cti_app.domain.production_extraction import (
+    ProductionExtractionV1,
     production_extraction_from_json,
     production_extraction_hashes,
 )
@@ -21,9 +31,11 @@ from cti_app.domain.production_references import (
 )
 from cti_app.domain.production_relevance import (
     RELEVANCE_PROJECTION_SCHEMA_VERSION,
+    RelevanceProjectionV1,
     relevance_projection_from_json,
 )
 from cti_app.domain.production_routing import (
+    BriefRoutingFeasibilityV1,
     ProductionRoutingArtifactInputV1,
     ProductionRoutingDecisionV1,
     RoutingCriticalSourceDiagnosticV1,
@@ -52,6 +64,35 @@ async def get_adopted_production_routing_decision(
     return decision
 
 
+def compute_brief_routing_feasibility(
+    *,
+    extraction: ProductionExtractionV1,
+    projection: RelevanceProjectionV1,
+    snapshot: ProductionInputSnapshot | None,
+) -> BriefRoutingFeasibilityV1:
+    """Run the same pre-model chronology predicate used by brief synthesis."""
+    from cti_app.application.production_synthesis import build_synthesis_timeline
+
+    if snapshot is not None and (
+        snapshot.subject_id != extraction.subject_id
+        or snapshot.input_hash != extraction.production_input_hash
+    ):
+        snapshot = None
+    candidates = build_synthesis_timeline(extraction)
+    timeline = brief_timeline_from_extraction(
+        extraction,
+        candidates,
+        snapshot=snapshot,
+        projection=projection,
+    )
+    return BriefRoutingFeasibilityV1(
+        dated_entry_count=len(timeline or ()),
+        reason=None if timeline else "brief_chronology_unavailable",
+        missing_source_urls=brief_core_primary_sources_without_source_verified_date(extraction),
+        needs=(() if timeline else ("dated source acquisition or an eligible publication date",)),
+    )
+
+
 async def decide_and_adopt_production_routing(
     *,
     uow_factory: ProductionUnitOfWorkFactory,
@@ -76,6 +117,32 @@ async def decide_and_adopt_production_routing(
             artifact_store=artifact_store,
             run_id=run.id,
         )
+        snapshot = await uow.production_input_snapshots.get_by_run(run.id)
+        if not isinstance(snapshot, ProductionInputSnapshot) or (
+            snapshot.production_run_id != run.id or snapshot.subject_id != run.subject_id
+        ):
+            snapshot = None
+        if isinstance(extraction_input.payload, ProductionExtractionV1) and isinstance(
+            relevance_input.payload, RelevanceProjectionV1
+        ):
+            try:
+                brief_feasibility = compute_brief_routing_feasibility(
+                    extraction=extraction_input.payload,
+                    projection=relevance_input.payload,
+                    snapshot=snapshot,
+                )
+            except (KeyError, TypeError, ValueError):
+                brief_feasibility = BriefRoutingFeasibilityV1(
+                    dated_entry_count=0,
+                    reason="brief_feasibility_inputs_unavailable",
+                    needs=("verified extraction and relevance artifacts",),
+                )
+        else:
+            brief_feasibility = BriefRoutingFeasibilityV1(
+                dated_entry_count=0,
+                reason="brief_feasibility_inputs_unavailable",
+                needs=("verified extraction and relevance artifacts",),
+            )
         decision = decide_publication_routing(
             production_run_id=run.id,
             subject_id=run.subject_id,
@@ -84,6 +151,7 @@ async def decide_and_adopt_production_routing(
             relevance_input=relevance_input,
             legitimate_services=load_legitimate_services(),
             decided_at=now,
+            brief_feasibility=brief_feasibility,
             critical_source_diagnostics=diagnostics,
         )
         stored = await uow.production_routing_decisions.append_and_adopt(

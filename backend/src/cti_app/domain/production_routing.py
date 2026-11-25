@@ -44,7 +44,7 @@ from cti_app.domain.publication import ArtifactType
 from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.subject_ioc_eligibility import is_subject_ioc_eligible
 
-ROUTING_POLICY_VERSION = "subject-publication-routing-v3-routing-reasons-v1"
+ROUTING_POLICY_VERSION = "subject-publication-routing-v4-brief-feasibility-v1"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _DECISION_NAMESPACE = UUID("484713e4-12ca-5e67-b18a-cafdad6ee989")
 
@@ -77,6 +77,40 @@ class RoutingReasonCode(StrEnum):
     CRITICAL_SOURCE_INACCESSIBLE = "critical_source_inaccessible"
     CRITICAL_SOURCE_UNREADABLE = "critical_source_unreadable"
     CRITICAL_SOURCE_ALTERNATIVE_PROVENANCE = "critical_source_alternative_provenance"
+    BRIEF_EVIDENCE_CHRONOLOGY_MISSING = "brief_evidence_chronology_missing"
+
+
+@dataclass(frozen=True, slots=True)
+class BriefRoutingFeasibilityV1:
+    """Plain domain result of the application-layer brief chronology predicate."""
+
+    dated_entry_count: int
+    reason: str | None = None
+    missing_source_urls: tuple[str, ...] = ()
+    needs: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if type(self.dated_entry_count) is not int or self.dated_entry_count < 0:
+            raise ValueError("dated_entry_count must be a non-negative integer")
+        if self.reason is not None and (
+            not isinstance(self.reason, str) or not self.reason.strip()
+        ):
+            raise ValueError("reason must be non-empty text or None")
+        for field_name in ("missing_source_urls", "needs"):
+            values = getattr(self, field_name)
+            if not isinstance(values, tuple) or any(
+                not isinstance(value, str) or not value.strip() for value in values
+            ):
+                raise ValueError(f"{field_name} must be a tuple of non-empty text")
+            object.__setattr__(self, field_name, tuple(sorted(set(values))))
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "dated_entry_count": self.dated_entry_count,
+            "reason": self.reason,
+            "missing_source_urls": list(self.missing_source_urls),
+            "needs": list(self.needs),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -325,6 +359,25 @@ def _decision_payload(
     }
 
 
+def _brief_feasibility_diagnostics(
+    feasibility: BriefRoutingFeasibilityV1,
+) -> tuple[RoutingCriticalSourceDiagnosticV1, ...]:
+    """One row per CORE/PRIMARY source without a source-verified date (may be empty)."""
+    return tuple(
+        RoutingCriticalSourceDiagnosticV1(
+            source_id=None,
+            source_url=source_url,
+            failure_code="brief_chronology_source_undated",
+            tier=ProductionReferenceTier.CORE.value,
+            criticality=ProductionSourceCriticality.CRITICAL,
+            criticality_reason=ProductionSourceCriticalityReason.CORE_TIER.value,
+            policy_version=PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION,
+            editorial_role=ProductionEditorialRole.PRIMARY,
+        )
+        for source_url in feasibility.missing_source_urls
+    )
+
+
 def decide_publication_routing(
     *,
     production_run_id: UUID,
@@ -334,6 +387,7 @@ def decide_publication_routing(
     relevance_input: ProductionRoutingArtifactInputV1,
     legitimate_services: LegitimateServiceRegistry,
     decided_at: datetime,
+    brief_feasibility: BriefRoutingFeasibilityV1,
     critical_source_diagnostics: tuple[RoutingCriticalSourceDiagnosticV1, ...] = (),
 ) -> ProductionRoutingDecisionV1:
     """Choose ARTICLE, BRIEF, or NEEDS_REVIEW from exact validated artifacts."""
@@ -341,6 +395,8 @@ def decide_publication_routing(
         raise ValueError("pipeline_generation must be a non-negative integer")
     if decided_at.tzinfo is None or decided_at.utcoffset() is None:
         raise ValueError("decided_at must be timezone-aware")
+    if not isinstance(brief_feasibility, BriefRoutingFeasibilityV1):
+        raise ValueError("brief_feasibility must be a BriefRoutingFeasibilityV1")
 
     reason = _valid_artifact(
         value=extraction_input,
@@ -539,6 +595,7 @@ def decide_publication_routing(
         "extraction_artifact": _artifact_identity(extraction_input),
         "relevance_artifact": _artifact_identity(relevance_input),
         "critical_source_diagnostics": _diagnostic_json(diagnostics),
+        "brief_feasibility": brief_feasibility.to_json(),
     }
     input_hash = hashlib.sha256(_canonical_json(input_payload)).hexdigest()
 
@@ -633,6 +690,15 @@ def decide_publication_routing(
             elif source_availability_reason is not None:
                 status = RoutingStatus.NEEDS_REVIEW
                 reason = source_availability_reason
+            elif brief_feasibility.dated_entry_count == 0:
+                status = RoutingStatus.NEEDS_REVIEW
+                reason = RoutingReasonCode.BRIEF_EVIDENCE_CHRONOLOGY_MISSING
+                diagnostics = tuple(
+                    sorted(
+                        (*diagnostics, *_brief_feasibility_diagnostics(brief_feasibility)),
+                        key=_diagnostic_sort_key,
+                    )
+                )
             else:
                 publication_kind = PublicationKind.BRIEF
                 reason = RoutingReasonCode.NO_SUBJECT_IOC

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock
@@ -10,7 +10,12 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from cti_app.application.production_routing import _projection_has_incomplete_coverage
+from cti_app.application import production_routing as production_routing_app
+from cti_app.application.production_routing import (
+    _projection_has_incomplete_coverage,
+    compute_brief_routing_feasibility,
+)
+from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState, SourceAcquisitionMethod
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.legitimate_services import LegitimateServiceRegistry
@@ -19,9 +24,12 @@ from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
+    ProductionInputSnapshot,
+    ProductionInputSource,
 )
 from cti_app.domain.production_extraction import (
     PRODUCTION_EXTRACTION_SCHEMA_VERSION,
+    ExtractionEventV1,
     ExtractionFactV1,
     ExtractionIndicatorStatus,
     ExtractionIndicatorV1,
@@ -51,6 +59,7 @@ from cti_app.domain.production_relevance import (
 )
 from cti_app.domain.production_routing import (
     ROUTING_POLICY_VERSION,
+    BriefRoutingFeasibilityV1,
     ProductionRoutingArtifactInputV1,
     ProductionRoutingDecisionV1,
     RoutingCriticalSourceDiagnosticV1,
@@ -104,6 +113,7 @@ def _source(
     source_id,
     indicators=(),
     facts=(),
+    events=(),
     tier=ProductionReferenceTier.CORE,
     editorial_role=ProductionEditorialRole.PRIMARY,
 ) -> ProductionSourceExtractionV1:
@@ -118,7 +128,7 @@ def _source(
         checkpoint_id=None,
         reuse_state=ExtractionReuseState.FRESH,
         facts=tuple(facts),
-        events=(),
+        events=tuple(events),
         indicators=tuple(indicators),
         rules=(),
         uncertainties=(),
@@ -130,10 +140,12 @@ def _extraction(
     *,
     indicators=(),
     facts=(),
+    events=(),
     subject_id: UUID = SUBJECT_ID,
     tier=ProductionReferenceTier.CORE,
     editorial_role=ProductionEditorialRole.PRIMARY,
     omitted_sources=(),
+    production_input_hash: str = "b" * 64,
 ) -> ProductionExtractionV1:
     source_id = uuid4()
     bound_indicators = tuple(
@@ -160,10 +172,11 @@ def _extraction(
         )
         for index, _fact in enumerate(facts, start=1)
     )
+    bound_events = tuple(replace(event, source_document_ids=(source_id,)) for event in events)
     return ProductionExtractionV1(
         schema_version=PRODUCTION_EXTRACTION_SCHEMA_VERSION,
         subject_id=subject_id,
-        production_input_hash="b" * 64,
+        production_input_hash=production_input_hash,
         references_corpus_hash="c" * 64,
         profile_policy_version="test-routing-profile-v1",
         sources=(
@@ -171,6 +184,7 @@ def _extraction(
                 source_id=source_id,
                 indicators=bound_indicators,
                 facts=bound_facts,
+                events=bound_events,
                 tier=tier,
                 editorial_role=editorial_role,
             ),
@@ -225,6 +239,7 @@ def _inputs(
     projection_artifact: ProductionArtifact | None = None,
     projection_validation_error: RoutingReasonCode | None = None,
     diagnostics: tuple[RoutingCriticalSourceDiagnosticV1, ...] = (),
+    brief_feasibility: BriefRoutingFeasibilityV1 | None = None,
     now: datetime = NOW,
 ):
     extraction_artifact = extraction_artifact or ProductionArtifact(
@@ -260,9 +275,64 @@ def _inputs(
         ),
         legitimate_services=_SERVICES,
         decided_at=now,
+        brief_feasibility=brief_feasibility or BriefRoutingFeasibilityV1(dated_entry_count=1),
         critical_source_diagnostics=diagnostics,
     )
     return decision
+
+
+def _dated_event(event_date: date = date(2026, 11, 1)) -> ExtractionEventV1:
+    iso_date = event_date.isoformat()
+    return ExtractionEventV1(
+        event_date=event_date,
+        date_text=iso_date,
+        text="The source reported this event.",
+        context="A source-verified dated event.",
+        evidence_quote=f"The report published on {iso_date} describes this event.",
+        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+        source_document_ids=(uuid4(),),
+    )
+
+
+def _snapshot_for_extraction(
+    extraction: ProductionExtractionV1,
+    *,
+    published_at: date | None,
+) -> ProductionInputSnapshot:
+    member_id = uuid4()
+    source = ProductionInputSource(
+        discovery_candidate_id=member_id,
+        source_candidate_id=uuid4(),
+        canonical_url=extraction.sources[0].canonical_url,
+        role=SourceRole.PRIMARY,
+        title="Frozen source title",
+        publisher="Frozen publisher",
+        published_at=published_at,
+        tlp=TLP.CLEAR,
+        sensitivity="public",
+        external_llm_allowed=True,
+    )
+    return ProductionInputSnapshot(
+        production_run_id=RUN_ID,
+        edition_id=uuid4(),
+        subject_id=extraction.subject_id,
+        subject_version=1,
+        subject_title="Frozen subject title",
+        subject_tlp=TLP.CLEAR,
+        selection_decision_id=uuid4(),
+        origin_discovery_subject_id=uuid4(),
+        canonical_discovery_subject_id=uuid4(),
+        discovery_snapshot_id=uuid4(),
+        discovery_snapshot_version=1,
+        member_candidate_ids=(member_id,),
+        discovery_summary="Frozen discovery summary.",
+        actor_or_campaign="Example actor",
+        period_start=date(2026, 10, 1),
+        period_end=date(2026, 11, 5),
+        publication_language="fr",
+        research_date=date(2026, 11, 5),
+        core_sources=(source,),
+    )
 
 
 @pytest.mark.parametrize(
@@ -376,6 +446,273 @@ def test_routing_article_brief_scenarios(extraction, decisions, expected_kind, e
     assert decision.reason_code is expected_reason
 
 
+def test_no_subject_ioc_without_dated_brief_feasibility_needs_review():
+    extraction = _extraction()
+    projection = _projection(extraction)
+    feasibility = compute_brief_routing_feasibility(
+        extraction=extraction,
+        projection=projection,
+        snapshot=None,
+    )
+
+    decision = _inputs(
+        extraction,
+        projection,
+        brief_feasibility=feasibility,
+    )
+
+    assert feasibility.dated_entry_count == 0
+    assert feasibility.missing_source_urls == (extraction.sources[0].canonical_url,)
+    assert feasibility.needs == ("dated source acquisition or an eligible publication date",)
+    assert decision.status is RoutingStatus.NEEDS_REVIEW
+    assert decision.publication_kind is None
+    assert decision.reason_code is RoutingReasonCode.BRIEF_EVIDENCE_CHRONOLOGY_MISSING
+    diagnostic = decision.critical_source_diagnostics[0]
+    assert diagnostic.source_url == extraction.sources[0].canonical_url
+    assert diagnostic.tier == ProductionReferenceTier.CORE.value
+    assert diagnostic.editorial_role is ProductionEditorialRole.PRIMARY
+    assert diagnostic.failure_code == "brief_chronology_source_undated"
+
+
+def test_no_subject_ioc_with_source_verified_dated_event_is_a_brief():
+    extraction = _extraction(events=(_dated_event(),))
+    projection = _projection(extraction)
+    feasibility = compute_brief_routing_feasibility(
+        extraction=extraction,
+        projection=projection,
+        snapshot=None,
+    )
+
+    decision = _inputs(extraction, projection, brief_feasibility=feasibility)
+
+    assert feasibility.dated_entry_count == 1
+    assert decision.status is RoutingStatus.DECIDED
+    assert decision.publication_kind is PublicationKind.BRIEF
+    assert decision.reason_code is RoutingReasonCode.NO_SUBJECT_IOC
+
+
+def test_no_subject_ioc_with_eligible_snapshot_publication_date_is_a_brief():
+    extraction = _extraction()
+    snapshot = _snapshot_for_extraction(extraction, published_at=date(2026, 10, 20))
+    extraction = replace(extraction, production_input_hash=snapshot.input_hash)
+    projection = _projection(extraction)
+    feasibility = compute_brief_routing_feasibility(
+        extraction=extraction,
+        projection=projection,
+        snapshot=snapshot,
+    )
+
+    decision = _inputs(extraction, projection, brief_feasibility=feasibility)
+
+    assert feasibility.dated_entry_count == 1
+    assert decision.status is RoutingStatus.DECIDED
+    assert decision.publication_kind is PublicationKind.BRIEF
+    assert decision.reason_code is RoutingReasonCode.NO_SUBJECT_IOC
+
+
+@pytest.mark.asyncio
+async def test_application_routing_loads_the_run_snapshot_for_brief_feasibility(monkeypatch):
+    extraction = _extraction()
+    snapshot = _snapshot_for_extraction(extraction, published_at=date(2026, 10, 20))
+    extraction = replace(extraction, production_input_hash=snapshot.input_hash)
+    projection = _projection(extraction)
+    extraction_artifact = ProductionArtifact(
+        production_run_id=RUN_ID,
+        subject_id=SUBJECT_ID,
+        stage=ProductionArtifactStage.EXTRACTION,
+        version=1,
+        input_hash="e" * 64,
+        status=ProductionArtifactStatus.VERIFIED,
+    )
+    projection_artifact = ProductionArtifact(
+        production_run_id=RUN_ID,
+        subject_id=SUBJECT_ID,
+        stage=ProductionArtifactStage.RELEVANCE_PROJECTION,
+        version=1,
+        input_hash="f" * 64,
+        status=ProductionArtifactStatus.VERIFIED,
+    )
+
+    async def load_extraction_input(**_kwargs):
+        return (
+            ProductionRoutingArtifactInputV1(
+                extraction_artifact,
+                production_extraction_hashes(extraction)[0],
+                extraction,
+            ),
+            (),
+        )
+
+    async def load_relevance_input(**_kwargs):
+        return ProductionRoutingArtifactInputV1(
+            projection_artifact,
+            projection.projection_hash,
+            projection,
+        )
+
+    monkeypatch.setattr(production_routing_app, "_load_extraction_input", load_extraction_input)
+    monkeypatch.setattr(production_routing_app, "_load_relevance_input", load_relevance_input)
+    monkeypatch.setattr(production_routing_app, "load_legitimate_services", lambda: _SERVICES)
+
+    snapshot_reads: list[UUID] = []
+    adopted = []
+
+    async def get_run(run_id):
+        assert run_id == RUN_ID
+        return SimpleNamespace(id=RUN_ID, subject_id=SUBJECT_ID, pipeline_generation=0)
+
+    async def get_snapshot(run_id):
+        snapshot_reads.append(run_id)
+        return snapshot
+
+    async def append_and_adopt(decision, *, expected_version):
+        assert expected_version == 4
+        adopted.append(decision)
+        return decision
+
+    class FakeUow:
+        production_runs = SimpleNamespace(get=get_run)
+        production_input_snapshots = SimpleNamespace(get_by_run=get_snapshot)
+        production_routing_decisions = SimpleNamespace(append_and_adopt=append_and_adopt)
+
+        async def commit(self):
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    decision = await production_routing_app.decide_and_adopt_production_routing(
+        uow_factory=FakeUow,
+        artifact_store=object(),
+        production_run_id=RUN_ID,
+        expected_version=4,
+        decided_at=NOW,
+    )
+
+    assert snapshot_reads == [RUN_ID]
+    assert adopted == [decision]
+    assert decision.status is RoutingStatus.DECIDED
+    assert decision.publication_kind is PublicationKind.BRIEF
+
+
+def test_confirmed_subject_ioc_routes_to_article_when_brief_is_infeasible():
+    extraction = _extraction(indicators=(_indicator("c2.example"),))
+    projection = _projection(
+        extraction,
+        decisions={
+            "c2.example": (
+                RelevanceClassification.DIRECT,
+                RelevanceReasonCode.MALICIOUS_SUBJECT_RELATION,
+            )
+        },
+    )
+    feasibility = compute_brief_routing_feasibility(
+        extraction=extraction,
+        projection=projection,
+        snapshot=None,
+    )
+
+    decision = _inputs(extraction, projection, brief_feasibility=feasibility)
+
+    assert feasibility.dated_entry_count == 0
+    assert decision.status is RoutingStatus.DECIDED
+    assert decision.publication_kind is PublicationKind.ARTICLE
+    assert decision.reason_code is RoutingReasonCode.SUBJECT_IOC_CONFIRMED
+
+
+def test_adding_a_source_verified_date_changes_routing_hash_and_replays_stably():
+    extraction_without_date = _extraction()
+    projection_without_date = _projection(extraction_without_date)
+    old_extraction_artifact = ProductionArtifact(
+        production_run_id=RUN_ID,
+        subject_id=SUBJECT_ID,
+        stage=ProductionArtifactStage.EXTRACTION,
+        version=1,
+        input_hash="e" * 64,
+        status=ProductionArtifactStatus.VERIFIED,
+    )
+    old_projection_artifact = ProductionArtifact(
+        production_run_id=RUN_ID,
+        subject_id=SUBJECT_ID,
+        stage=ProductionArtifactStage.RELEVANCE_PROJECTION,
+        version=1,
+        input_hash="f" * 64,
+        status=ProductionArtifactStatus.VERIFIED,
+    )
+    infeasible = compute_brief_routing_feasibility(
+        extraction=extraction_without_date,
+        projection=projection_without_date,
+        snapshot=None,
+    )
+    first = _inputs(
+        extraction_without_date,
+        projection_without_date,
+        extraction_artifact=old_extraction_artifact,
+        projection_artifact=old_projection_artifact,
+        brief_feasibility=infeasible,
+    )
+
+    source = extraction_without_date.sources[0]
+    dated_source = replace(
+        source,
+        events=(
+            replace(
+                _dated_event(),
+                source_document_ids=(source.source_document_id,),
+            ),
+        ),
+    )
+    extraction_with_date = replace(extraction_without_date, sources=(dated_source,))
+    projection_with_date = _projection(extraction_with_date)
+    new_extraction_artifact = ProductionArtifact(
+        production_run_id=RUN_ID,
+        subject_id=SUBJECT_ID,
+        stage=ProductionArtifactStage.EXTRACTION,
+        version=2,
+        input_hash="a" * 64,
+        status=ProductionArtifactStatus.VERIFIED,
+    )
+    new_projection_artifact = ProductionArtifact(
+        production_run_id=RUN_ID,
+        subject_id=SUBJECT_ID,
+        stage=ProductionArtifactStage.RELEVANCE_PROJECTION,
+        version=2,
+        input_hash="b" * 64,
+        status=ProductionArtifactStatus.VERIFIED,
+    )
+    feasible = compute_brief_routing_feasibility(
+        extraction=extraction_with_date,
+        projection=projection_with_date,
+        snapshot=None,
+    )
+    recomputed = _inputs(
+        extraction_with_date,
+        projection_with_date,
+        extraction_artifact=new_extraction_artifact,
+        projection_artifact=new_projection_artifact,
+        brief_feasibility=feasible,
+    )
+    replay = _inputs(
+        extraction_with_date,
+        projection_with_date,
+        extraction_artifact=new_extraction_artifact,
+        projection_artifact=new_projection_artifact,
+        brief_feasibility=feasible,
+    )
+
+    assert first.reason_code is RoutingReasonCode.BRIEF_EVIDENCE_CHRONOLOGY_MISSING
+    assert recomputed.publication_kind is PublicationKind.BRIEF
+    assert recomputed.input_hash != first.input_hash
+    assert recomputed.decision_hash != first.decision_hash
+    assert recomputed.policy_version == "subject-publication-routing-v4-brief-feasibility-v1"
+    assert replay.input_hash == recomputed.input_hash
+    assert replay.decision_hash == recomputed.decision_hash
+    assert replay.decision_id == recomputed.decision_id
+
+
 def test_core_archived_direct_source_does_not_require_review():
     extraction = _extraction()
     direct_source = replace(
@@ -438,7 +775,7 @@ def test_alternative_core_provenance_has_distinct_reason_and_diagnostic(method, 
     assert diagnostic.to_json()["error_code"] is None
     assert diagnostic.to_json()["remaining_control_code"] == "human_review_required"
     assert diagnostic.to_json()["human_waiver_path"] == "not_consumed_by_routing"
-    assert decision.policy_version == "subject-publication-routing-v3-routing-reasons-v1"
+    assert decision.policy_version == "subject-publication-routing-v4-brief-feasibility-v1"
 
 
 def test_critical_source_omission_needs_review_with_explicit_diagnostic():
@@ -546,7 +883,7 @@ def test_supporting_secondary_missing_source_does_not_block_routing():
 
 def test_historical_critical_source_missing_reason_still_deserializes():
     assert RoutingReasonCode("critical_source_missing") is RoutingReasonCode.CRITICAL_SOURCE_MISSING
-    assert ROUTING_POLICY_VERSION == "subject-publication-routing-v3-routing-reasons-v1"
+    assert ROUTING_POLICY_VERSION == "subject-publication-routing-v4-brief-feasibility-v1"
 
 
 def _routing_decision_with_expanded_source_diagnostic() -> ProductionRoutingDecisionV1:
