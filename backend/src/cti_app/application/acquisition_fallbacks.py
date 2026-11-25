@@ -2099,15 +2099,6 @@ class _BrowserStrategy:
         return AcquisitionPolicyDecision.NOT_CONFIGURED
 
     async def acquire(self, request: AcquisitionRequest) -> Sequence[AcquisitionProbe]:
-        if request.response_status in {401, 403}:
-            return (
-                _browser_failure_probe(
-                    self,
-                    request,
-                    reason="blocked_http_response_not_renderable",
-                    outcome=AcquisitionOutcome.REJECTED,
-                ),
-            )
         capability = self.capability_state
         if capability is not AcquisitionCapabilityState.IMPLEMENTED:
             return (
