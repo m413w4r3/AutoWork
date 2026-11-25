@@ -225,12 +225,14 @@ renommer des volumes pour les faire passer, ou remplacer la cible Docker.
 
 ## Après un reset autorisé
 
-Le reset destructif reste une opération séparément autorisée. Après sa réussite,
-`make up-clean` lance `make up`; si l'opérateur a exécuté le reset seul,
+Le reset destructif reste une opération séparément autorisée. `make up-clean`
+enchaîne `clean` puis `up` : la stack est alors déjà redémarrée, ne pas relancer
+`make up-clean` (il referait le reset) ; passer directement aux vérifications
+ci-dessous après `make status`. Si le reset a été exécuté seul (`make clean`),
 démarrer la stack avec la cible existante :
 
 ```sh
-make up
+make up       # seulement si le reset a été exécuté seul
 make status
 ```
 
