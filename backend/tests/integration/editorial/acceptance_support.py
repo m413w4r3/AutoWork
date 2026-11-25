@@ -18,7 +18,7 @@ from __future__ import annotations
 import hashlib
 import os
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -78,6 +78,7 @@ from cti_app.domain.production import (
     ProductionArtifactStatus,
 )
 from cti_app.domain.production_extraction import (
+    ExtractionEventV1,
     ExtractionIndicatorStatus,
     ExtractionIndicatorV1,
     ProductionEvidenceBasis,
@@ -197,10 +198,22 @@ def _rich_synthesis(synthesis: Any, evidence_ref: Any) -> Any:
 
 
 def _acceptance_extraction(extraction: Any, *, article: bool) -> Any:
-    """Optionally add one confirmed subject IOC so routing decides ARTICLE."""
-    if not article:
-        return extraction
+    """Add one confirmed subject IOC (ARTICLE) or one source-dated event (BRIEF).
+
+    A brief needs a source-verified dated chronology entry before routing announces it.
+    """
     source = extraction.sources[0]
+    if not article:
+        event = ExtractionEventV1(
+            event_date=date(2026, 11, 10),
+            date_text="2026-11-10",
+            text="The synthetic report documents the activity.",
+            context="A source-verified dated event.",
+            evidence_quote="The synthetic report published on 2026-11-10 documents the activity.",
+            evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+            source_document_ids=(source.source_document_id,),
+        )
+        return replace(extraction, sources=(replace(source, events=(*source.events, event)),))
     indicator = ExtractionIndicatorV1(
         value=SUBJECT_IOC_VALUE,
         artifact_type=ArtifactType.DOMAIN,

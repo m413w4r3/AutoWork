@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from types import SimpleNamespace
 from typing import cast
 from uuid import UUID, uuid4
@@ -72,7 +72,11 @@ from cti_app.domain.production import (
     ProductionRunStatus,
     ProductionStage,
 )
-from cti_app.domain.production_extraction import production_extraction_to_json
+from cti_app.domain.production_extraction import (
+    ExtractionEventV1,
+    ProductionEvidenceBasis,
+    production_extraction_to_json,
+)
 from cti_app.domain.production_relevance import relevance_projection_to_json
 from cti_app.domain.production_routing import ROUTING_POLICY_VERSION
 from cti_app.domain.production_synthesis import production_synthesis_to_json
@@ -242,9 +246,20 @@ async def _seed_current_inputs(
     )
     references_payload = production_reference_corpus_to_json(references)
     references = production_reference_corpus_from_json(references_payload)
+    # A brief is only announced with a source-verified dated chronology entry.
+    dated_event = ExtractionEventV1(
+        event_date=date(2026, 11, 10),
+        date_text="2026-11-10",
+        text="The synthetic report documents the activity.",
+        context="A source-verified dated event.",
+        evidence_quote="The synthetic report published on 2026-11-10 documents the activity.",
+        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+        source_document_ids=(source.source_document_id,),
+    )
     extraction = replace(
         seeded.extraction,
         references_corpus_hash=references_corpus_hash(references),
+        sources=(replace(source, events=(*source.events, dated_event)),),
     )
     projection = build_relevance_projection(seeded.production_input, extraction)
     synthesis = replace(
