@@ -52,6 +52,8 @@ cleanup() {
     if [[ "${backend_image:-}" == "$project-migrate" ]]; then
       if docker image rm "$backend_image" >/dev/null; then
         printf 'Disposable backend image removed: %s\n' "$backend_image"
+      elif ! docker image inspect "$backend_image" >/dev/null 2>&1; then
+        printf 'No disposable backend image to remove: %s\n' "$backend_image"
       else
         printf 'ERROR: failed to remove disposable image %s\n' "$backend_image" >&2
         [[ "$result" -ne 0 ]] || result=1
@@ -68,70 +70,8 @@ if [[ "$project" == cti-bulletin || "$project" == cti-m14* ]]; then
   exit 2
 fi
 
-backend_image="cti-bulletin-migrate"
-if docker image inspect "$backend_image" >/dev/null 2>&1; then
-  printf 'Found existing backend image %s; checking its Alembic head.\n' "$backend_image"
-else
-  printf 'Backend image %s is absent; building migrate from infra/backend.Dockerfile.\n' "$backend_image"
-  backend_image="$project-migrate"
-fi
-
-cat >"$override_file" <<EOF
-services:
-  postgres:
-    volumes: !reset []
-  postgres-test:
-    environment:
-      POSTGRES_DB: cti_app
-      POSTGRES_USER: cti_app
-      POSTGRES_PASSWORD: local-postgres-only
-    ports: !reset []
-    networks:
-      default:
-        aliases: [postgres]
-  migrate:
-    image: $backend_image
-    networks: [default, analysis-internal]
-EOF
-
-cleanup_started=1
-compose --profile integration-test up -d --wait --pull never postgres-test
-
-needs_build=0
-if [[ "$backend_image" == cti-bulletin-migrate ]]; then
-  image_heads="$(compose --profile integration-test run --rm --no-deps \
-    --entrypoint alembic migrate heads)"
-  if [[ "$image_heads" == *"0029_note_anchor_identity (head)"* ]]; then
-    printf 'Reusing existing backend image; it contains 0029_note_anchor_identity.\n'
-  else
-    printf 'Existing backend image does not contain the current Alembic head; building migrate.\n'
-    backend_image="$project-migrate"
-    needs_build=1
-  fi
-else
-  needs_build=1
-fi
-
-if [[ "$needs_build" -eq 1 ]]; then
-  cat >"$override_file" <<EOF
-services:
-  postgres:
-    volumes: !reset []
-  postgres-test:
-    environment:
-      POSTGRES_DB: cti_app
-      POSTGRES_USER: cti_app
-      POSTGRES_PASSWORD: local-postgres-only
-    ports: !reset []
-    networks:
-      default:
-        aliases: [postgres]
-  migrate:
-    image: $backend_image
-    networks: [default, analysis-internal]
-EOF
-  compose build migrate
-fi
+backend_image="$project-migrate"
+baseline_sha256="$(sha256sum backend/migrations/frozen/baseline_0001.py | cut -d ' ' -f 1)"
 
 cat >"$override_file" <<EOF
 services:
@@ -153,6 +93,21 @@ services:
       POSTGRES_DSN: postgresql+asyncpg://cti_app:local-postgres-only@postgres:5432/cti_app
 EOF
 
+cleanup_started=1
+compose --profile integration-test up -d --wait --pull never postgres-test
+
+printf 'Building migrate from this checkout as %s.\n' "$backend_image"
+compose --profile integration-test build migrate
+
+compose --profile integration-test run --rm --no-deps --entrypoint sh migrate \
+  -ec 'expected="$1"; actual="$(sha256sum /app/migrations/frozen/baseline_0001.py | cut -d " " -f 1)"; \
+      if [ "$actual" != "$expected" ]; then \
+        printf "ERROR: frozen baseline SHA-256 mismatch: checkout=%s image=%s\\n" "$expected" "$actual" >&2; \
+        exit 1; \
+      fi; \
+      printf "Frozen baseline SHA-256 verified: %s\\n" "$actual"' \
+  sh "$baseline_sha256"
+
 compose --profile integration-test run --rm --no-deps --entrypoint python migrate \
   -c 'import os; from sqlalchemy.engine import make_url; url = make_url(os.environ["POSTGRES_DSN"]); print("Compose migrate DSN endpoint:", url.host, url.port)'
 
@@ -163,7 +118,7 @@ compose --profile integration-test exec -T postgres-test pg_dump -U cti_app -d c
   --no-owner --no-privileges | sed '/^\\restrict /d; /^\\unrestrict /d' >"$before_dump"
 
 POSTGRES_CONTAINER="$(compose --profile integration-test ps -q postgres-test)" \
-  "$repo_root/backend/.venv/bin/python" \
+  "${UV_PROJECT_ENVIRONMENT:-$repo_root/backend/.venv}/bin/python" \
   "$repo_root/scripts/dev/compose_migration_verify.py"
 
 printf 'Re-running the Compose migrate service to check upgrade idempotence.\n'
