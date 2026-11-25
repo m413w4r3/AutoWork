@@ -53,6 +53,20 @@ class ModelGatewayError(RuntimeError):
     attempts = 1
 
 
+class ModelRecoveryDiscardedError(ModelGatewayError):
+    """A recovered response arrived after an operator declared its run lost."""
+
+    code = "model_recovery_discarded_after_operator_abandonment"
+
+
+def _was_declared_lost(run: ModelRun) -> bool:
+    return (
+        run.status is ModelRunStatus.FAILED
+        and run.error_code == "operator_abandoned"
+        and isinstance((run.error_details or {}).get("operator_abandonment"), dict)
+    )
+
+
 class ModelExecutionDeadlineExceeded(ModelGatewayError):
     code = "model_execution_deadline_exceeded"
     phase = "generation"
@@ -765,6 +779,10 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
             existing = await uow.model_runs.get(run_id)
             if existing is None:
                 raise ModelGatewayError(f"Model run {run_id} does not exist")
+            if _was_declared_lost(existing):
+                raise ModelRecoveryDiscardedError(
+                    "Recovered output was discarded because the operator declared this run lost"
+                )
             if (
                 bridge_response_id
                 and existing.response_id
@@ -804,6 +822,33 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
             run = await uow.model_runs.get_for_update(run_id)
             if run is None:
                 raise ModelGatewayError(f"Model run {run_id} does not exist")
+            if _was_declared_lost(run):
+                rejection = ModelOutputRejection(
+                    model_run_id=run_id,
+                    path=("recovery",),
+                    error_type="operator_abandoned_late_recovery",
+                    value_sha256=digest,
+                    raw_output_reference=reference,
+                )
+                rejections = getattr(uow, "model_output_rejections", None)
+                append_rejection = getattr(rejections, "append", None)
+                list_rejections = getattr(rejections, "list_for_run", None)
+                if callable(list_rejections):
+                    prior = await list_rejections(run_id)
+                    already_recorded = any(
+                        item.error_type == rejection.error_type
+                        and item.value_sha256 == rejection.value_sha256
+                        for item in prior
+                    )
+                else:
+                    already_recorded = False
+                if callable(append_rejection) and not already_recorded:
+                    await append_rejection(rejection)
+                    await uow.commit()
+                raise ModelRecoveryDiscardedError(
+                    "Recovered output was recorded as a late response after the operator "
+                    "declared this run lost"
+                )
             if bridge_response_id and run.response_id and run.response_id != bridge_response_id:
                 raise ModelGatewayError("Recovered response identity does not match")
             recovery = (run.error_details or {}).get("recovery")

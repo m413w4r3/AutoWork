@@ -10,7 +10,11 @@ from uuid import UUID
 
 from cti_app.application.bridge_identity import bridge_request_fingerprint
 from cti_app.application.jobs import DuplicateJobError, JobDispatcher, JobService
-from cti_app.application.model_gateway import ModelGateway, ModelGatewayError
+from cti_app.application.model_gateway import (
+    ModelGateway,
+    ModelGatewayError,
+    ModelRecoveryDiscardedError,
+)
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_jobs import (
     PRODUCTION_RECONCILIATION_RESUME_MAX_ATTEMPTS,
@@ -236,6 +240,11 @@ class ProductionReconciliationService:
                     external_turn_id=preview.external_turn_id,
                     bridge_response_id=preview.bridge_response_id,
                 )
+            except ModelRecoveryDiscardedError as exc:
+                raise ProductionReconciliationError(
+                    "production_reconciliation_declared_lost",
+                    "La réponse tardive a été écartée après la déclaration de perte.",
+                ) from exc
             except ModelGatewayError as exc:
                 raise ProductionReconciliationError(
                     "production_reconciliation_adoption_conflict",
@@ -273,6 +282,11 @@ class ProductionReconciliationService:
                     provenance="manual_import",
                     actor_id=actor_id,
                 )
+            except ModelRecoveryDiscardedError as exc:
+                raise ProductionReconciliationError(
+                    "production_reconciliation_declared_lost",
+                    "La réponse tardive a été écartée après la déclaration de perte.",
+                ) from exc
             except ModelGatewayError as exc:
                 raise ProductionReconciliationError(
                     "production_reconciliation_adoption_conflict",

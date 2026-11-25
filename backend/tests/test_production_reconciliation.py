@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from dataclasses import replace
 from types import SimpleNamespace
@@ -9,6 +10,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from cti_app.application.jobs import DuplicateJobError
+from cti_app.application.model_gateway import ModelGateway, ModelRouter
 from cti_app.application.production_reconciliation import (
     ProductionReconciliationError,
     ProductionReconciliationService,
@@ -38,6 +40,7 @@ from cti_app.domain.production import (
     ProductionSubmissionReconciliation,
     model_run_awaits_reconciliation,
 )
+from cti_app.integrations.models import FakeModelAdapter, InMemoryModelOutputStore
 
 
 class _Runs:
@@ -129,6 +132,14 @@ class _Manifests:
         return object() if self.present else None
 
 
+class _OutputRejections:
+    def __init__(self) -> None:
+        self.items: list[object] = []
+
+    async def append(self, item: object) -> None:
+        self.items.append(item)
+
+
 class _Uow:
     def __init__(
         self,
@@ -157,6 +168,7 @@ class _Uow:
         self.edition_production_batches = _BatchRepo(batch)
         self.edition_production_batch_items = _Items([item])
         self.publication_manifests = _Manifests()
+        self.model_output_rejections = _OutputRejections()
 
     async def __aenter__(self) -> _Uow:
         return self
@@ -428,6 +440,72 @@ async def test_late_bridge_response_after_declare_lost_is_not_adopted(
     assert gateway.adoptions == []
     assert bridge.previews == 0
     assert jobs.submissions == 0
+
+
+@pytest.mark.asyncio
+async def test_declare_lost_during_visible_preview_wins_over_late_adoption(
+    fixture: ReconciliationFixture,
+) -> None:
+    service, uow, _stub_gateway, _bridge, jobs = fixture
+    run = next(iter(uow.production_runs.runs.values()))
+    model_gateway = ModelGateway(
+        ModelRouter(
+            openai_research=FakeModelAdapter(),
+            openai_structured=FakeModelAdapter(),
+            qwen=FakeModelAdapter(),
+            fake=FakeModelAdapter(),
+        ),
+        lambda: uow,  # type: ignore[arg-type]
+        InMemoryModelOutputStore(),
+    )
+    service._model_gateway = model_gateway
+
+    class _PausedBridge(_Bridge):
+        def __init__(self) -> None:
+            super().__init__("bridge-1", "# recovered\n\nanswer")
+            self.preview_started = asyncio.Event()
+            self.resume_preview = asyncio.Event()
+
+        async def preview_visible_recovery(self, bridge_run_id: str):
+            self.previews += 1
+            self.preview_started.set()
+            await self.resume_preview.wait()
+            return {
+                "bridge_run_id": bridge_run_id,
+                "turn_id": "dom-turn-77",
+                "text": self.text,
+                "metadata": {"turn_id": "dom-turn-77"},
+            }
+
+    paused_bridge = _PausedBridge()
+    service._bridge = paused_bridge
+    resolver = ProductionReconciliationResolver(lambda: uow)
+    content_hash = hashlib.sha256(paused_bridge.text.encode()).hexdigest()
+    adoption = asyncio.create_task(service.adopt_visible(run.id, content_hash, actor_id="analyst"))
+    await paused_bridge.preview_started.wait()
+
+    assert (
+        await resolver.release_declared_lost(run.id, "operator confirmed lost", actor_id="analyst")
+        is ReconciliationOutcome.RELEASED
+    )
+    assert (
+        await resolver.release_declared_lost(run.id, "operator confirmed lost", actor_id="analyst")
+        is ReconciliationOutcome.UNDECIDED
+    )
+    paused_bridge.resume_preview.set()
+
+    with pytest.raises(ProductionReconciliationError) as error:
+        await adoption
+
+    assert error.value.code == "production_reconciliation_declared_lost"
+    assert uow.model_runs.models[next(iter(uow.model_runs.models))].status is ModelRunStatus.FAILED
+    assert (
+        uow.model_runs.models[next(iter(uow.model_runs.models))].error_code == "operator_abandoned"
+    )
+    assert uow.model_runs.models[next(iter(uow.model_runs.models))].raw_output_reference is None
+    assert run.reconciliation is None
+    assert jobs.submissions == 0
+    assert paused_bridge.previews == 1
 
 
 @pytest.mark.asyncio

@@ -1483,6 +1483,78 @@ async def test_concurrent_duplicate_bridge_recovery_adoption_is_idempotent() -> 
     assert transport.retrieve_calls == 0
 
 
+async def test_recovery_adoption_rechecks_operator_abandonment_under_row_lock() -> None:
+    transport = SequencedResponsesTransport([])
+    gateway, model_uow, output_store = gateway_with_transport(transport)
+    model_request = request(external_llm_allowed=True, run_id=uuid4())
+    run = gateway.build_run(model_request, ModelRole.RESEARCH)
+    run.begin_submission_attempt(bridge_request_id=f"{run.id}:a1")
+    run.require_review(
+        "model_submission_reconciliation_required",
+        "Bridge submission outcome is unknown.",
+        response_id="bridge-response-1",
+    )
+    model_uow.state[run.id] = run
+
+    class _Rejections:
+        def __init__(self) -> None:
+            self.items: list[Any] = []
+
+        async def append(self, item: object) -> None:
+            self.items.append(item)
+
+        async def list_for_run(self, run_id: UUID) -> list[object]:
+            del run_id
+            return list(self.items)
+
+    rejections = _Rejections()
+    unit_of_work = gateway._uow_factory
+
+    def tracked_unit_of_work():
+        uow = unit_of_work()
+        uow.model_output_rejections = rejections
+        return uow
+
+    gateway._uow_factory = tracked_unit_of_work  # type: ignore[assignment]
+
+    class _DeclareLostDuringStore:
+        async def store(self, content: bytes, *, mime_type: str) -> str:
+            model_uow.state[run.id].abandon_uncertain_submission(
+                actor_id="analyst", reason="operator confirmed lost"
+            )
+            return await output_store.store(content, mime_type=mime_type)
+
+        async def read(self, reference: str, *, max_bytes: int | None) -> bytes:
+            return await output_store.read(reference, max_bytes=max_bytes)
+
+    gateway._output_store = _DeclareLostDuringStore()  # type: ignore[assignment]
+    content = b"Late recovered bridge answer"
+
+    with pytest.raises(ModelGatewayError, match=r"declared.*lost") as error:
+        await gateway.adopt_recovery_output(
+            run.id,
+            content,
+            provenance="visible_recovery",
+            actor_id="analyst",
+            bridge_response_id="bridge-response-1",
+        )
+
+    persisted = model_uow.state[run.id]
+    assert error.value.code == "model_recovery_discarded_after_operator_abandonment"
+    assert persisted.status is ModelRunStatus.FAILED
+    assert persisted.error_code == "operator_abandoned"
+    assert persisted.raw_output_reference is None
+    assert persisted.raw_output_sha256 is None
+    assert len(rejections.items) == 1
+    rejection = rejections.items[0]
+    assert rejection.error_type == "operator_abandoned_late_recovery"
+    assert rejection.value_sha256 == hashlib.sha256(content).hexdigest()
+    stored_digest = rejection.raw_output_reference.rsplit("/", maxsplit=1)[-1]
+    assert output_store.objects[stored_digest] == content
+    assert transport.create_calls == 0
+    assert transport.retrieve_calls == 0
+
+
 async def test_bridge_recovery_adoption_conflict_does_not_replace_persisted_output() -> None:
     transport = SequencedResponsesTransport([])
     gateway, model_uow, _ = gateway_with_transport(transport)
