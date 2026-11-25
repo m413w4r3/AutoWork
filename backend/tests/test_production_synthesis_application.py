@@ -5123,7 +5123,11 @@ HEADING: Détails techniques
 @@CLAIM S002C001@@
 EVIDENCE: {handle}
 TEXT: The domain evil-example.com hosts FooRAT.
-@@END SECTION@@"""
+@@END SECTION@@
+@@SOURCE_NOTE S001@@
+EVIDENCE: {handle}
+TEXT: The source describes FooRAT in its reporting.
+@@END SOURCE NOTE@@"""
     corrected = initial.replace(
         "TEXT: The domain evil-example.com hosts FooRAT.",
         "TEXT: The report describes a domain associated with FooRAT.",
@@ -5136,6 +5140,11 @@ TEXT: The domain evil-example.com hosts FooRAT.
 async def test_corrective_turn_includes_untrusted_initial_proposal_and_preserves_other_claims():
     world = _fresh_setup()
     initial, corrected = _corrective_domain_proposals(world.handle)
+    initial_proposal = parse_synthesis_proposal_wire(initial).proposal
+    corrected_proposal = parse_synthesis_proposal_wire(corrected).proposal
+    assert initial_proposal is not None
+    assert corrected_proposal is not None
+    assert len(initial_proposal.source_notes) == 1
 
     def responder(request: ModelRequest) -> ModelExecution:
         text = corrected if request.metadata.get("synthesis_corrective_turn") == 1 else initial
@@ -5167,14 +5176,55 @@ async def test_corrective_turn_includes_untrusted_initial_proposal_and_preserves
     assert "VALIDATOR VIOLATIONS:" in correction_request.text
     assert "COMPLETE proposal in canonical wire format" in correction_request.text
     assert "UNIQUE-LEAD-MARKER" in corrected
-    assert (
-        corrected.replace(
-            "TEXT: The report describes a domain associated with FooRAT.",
-            "TEXT: The domain evil-example.com hosts FooRAT.",
-            1,
-        )
-        == initial
+    targeted_ids = {"S002C001"}
+    initial_claims = {
+        claim._block_id: (claim.text, claim.evidence_handles, claim.claim_scope, "lead")
+        for claim in initial_proposal.lead
+    }
+    corrected_claims = {
+        claim._block_id: (claim.text, claim.evidence_handles, claim.claim_scope, "lead")
+        for claim in corrected_proposal.lead
+    }
+    initial_claims.update(
+        {
+            claim._block_id: (
+                claim.text,
+                claim.evidence_handles,
+                claim.claim_scope,
+                section.kind.value,
+            )
+            for section in initial_proposal.sections
+            for claim in section.claims
+        }
     )
+    corrected_claims.update(
+        {
+            claim._block_id: (
+                claim.text,
+                claim.evidence_handles,
+                claim.claim_scope,
+                section.kind.value,
+            )
+            for section in corrected_proposal.sections
+            for claim in section.claims
+        }
+    )
+    assert {
+        claim_id: value
+        for claim_id, value in initial_claims.items()
+        if claim_id not in targeted_ids
+    } == {
+        claim_id: value
+        for claim_id, value in corrected_claims.items()
+        if claim_id not in targeted_ids
+    }
+    assert {
+        note.source_alias: (note.text, note.evidence_handles)
+        for note in initial_proposal.source_notes
+    } == {
+        note.source_alias: (note.text, note.evidence_handles)
+        for note in corrected_proposal.source_notes
+    }
     assert correction_request.evidence_pack_hash == first_request.evidence_pack_hash
     assert correction_request.metadata["synthesis_parent_model_run_id"] == str(first_request.run_id)
     assert result.model_run_id == correction_request.run_id
@@ -5198,6 +5248,54 @@ async def test_corrective_turn_includes_untrusted_initial_proposal_and_preserves
         world.gateway.runs[first_request.run_id].raw_output_sha256,
         world.gateway.runs[correction_request.run_id].raw_output_sha256,
     ]
+
+
+@pytest.mark.asyncio
+async def test_corrective_turn_refuses_unrelated_claim_rewrite():
+    world = _fresh_setup()
+    initial, corrected = _corrective_domain_proposals(world.handle)
+    rewritten = corrected.replace(
+        "TEXT: Arsenal : FooRAT is described in the report.",
+        "TEXT: Arsenal : FooRAT has a rewritten unrelated description.",
+        1,
+    )
+
+    def responder(request: ModelRequest) -> ModelExecution:
+        text = rewritten if request.metadata.get("synthesis_corrective_turn") == 1 else initial
+        return _succeeded(request, None, text=text)
+
+    world.gateway._responder = responder
+    result = await world.service.execute(world.run, world.snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.NEEDS_REVIEW
+    assert result.error_code == SynthesisStageErrorCode.CORRECTION_CHANGED_UNTARGETED_CONTENT.value
+    assert result.model_calls == 2
+    assert len(world.gateway.calls) == 2
+    assert world.writer.calls == []
+
+
+@pytest.mark.asyncio
+async def test_corrective_turn_refuses_source_note_rewrite_outside_targets():
+    world = _fresh_setup()
+    initial, corrected = _corrective_domain_proposals(world.handle)
+    rewritten = corrected.replace(
+        "TEXT: The source describes FooRAT in its reporting.",
+        "TEXT: The source confirms FooRAT in its reporting.",
+        1,
+    )
+
+    def responder(request: ModelRequest) -> ModelExecution:
+        text = rewritten if request.metadata.get("synthesis_corrective_turn") == 1 else initial
+        return _succeeded(request, None, text=text)
+
+    world.gateway._responder = responder
+    result = await world.service.execute(world.run, world.snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.NEEDS_REVIEW
+    assert result.error_code == SynthesisStageErrorCode.CORRECTION_CHANGED_UNTARGETED_CONTENT.value
+    assert result.model_calls == 2
+    assert len(world.gateway.calls) == 2
+    assert world.writer.calls == []
 
 
 @pytest.mark.asyncio
@@ -5432,10 +5530,11 @@ async def test_plain_text_corrective_turn_still_rechecks_grounding() -> None:
         "TEXT: Victimologie : The campaign began using the `<!--` marker.",
         1,
     )
-    unsupported_proposal = SynthesisProposalV1.model_validate(
-        make_proposal("The campaign began on 2026-07-03.", event_handle)
+    corrected_but_unsupported = article.replace(
+        "TEXT: Victimologie : The campaign began.",
+        "TEXT: Victimologie : The campaign began on 2026-07-03.",
+        1,
     )
-    corrected_but_unsupported = _proposal_wire(_articleize_test_proposal(unsupported_proposal))
     outputs = iter((first_invalid, corrected_but_unsupported))
     world.gateway._responder = lambda request: _succeeded(request, None, text=next(outputs))
 
