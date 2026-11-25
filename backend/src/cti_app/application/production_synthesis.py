@@ -137,7 +137,8 @@ BRIEF_SYNTHESIS_VALIDATOR_VERSION = "synthesis-validator-v8-event-quote-dates"
 SYNTHESIS_VALIDATOR_VERSION = "synthesis-validator-v10-article-overview"
 SYNTHESIS_CORRECTIVE_PROMPT_VERSION = "production-synthesis-corrective-v3-plain-text"
 ARTICLE_SYNTHESIS_CORRECTIVE_PROMPT_VERSION = "production-synthesis-corrective-v5-overview"
-MAX_SYNTHESIS_CORRECTIVE_PROMPT_BYTES = 256 * 1024
+# Largest observed article prompt + proposal is ~210 KB; refuse (never truncate) beyond this.
+MAX_SYNTHESIS_CORRECTIVE_PROMPT_BYTES = 512 * 1024
 ARTICLE_SYNTHESIS_MAX_OUTPUT_TOKENS = 12_000
 MAX_SYNTHESIS_UNCERTAINTIES = 10
 SYNTHESIS_MODEL_POLICY_VERSION = "synthesis-model-policy-v1"
