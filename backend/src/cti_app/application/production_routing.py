@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
@@ -73,11 +74,8 @@ def compute_brief_routing_feasibility(
     """Run the same pre-model chronology predicate used by brief synthesis."""
     from cti_app.application.production_synthesis import build_synthesis_timeline
 
-    if snapshot is not None and (
-        snapshot.subject_id != extraction.subject_id
-        or snapshot.input_hash != extraction.production_input_hash
-    ):
-        snapshot = None
+    if snapshot is not None and not _snapshot_matches_extraction(snapshot, extraction):
+        raise ValueError("production input snapshot does not match canonical extraction")
     candidates = build_synthesis_timeline(extraction)
     timeline = brief_timeline_from_extraction(
         extraction,
@@ -90,6 +88,15 @@ def compute_brief_routing_feasibility(
         reason=None if timeline else "brief_chronology_unavailable",
         missing_source_urls=brief_core_primary_sources_without_source_verified_date(extraction),
         needs=(() if timeline else ("dated source acquisition or an eligible publication date",)),
+    )
+
+
+def _snapshot_matches_extraction(
+    snapshot: ProductionInputSnapshot, extraction: ProductionExtractionV1
+) -> bool:
+    return (
+        snapshot.subject_id == extraction.subject_id
+        and snapshot.input_hash == extraction.production_input_hash
     )
 
 
@@ -118,25 +125,48 @@ async def decide_and_adopt_production_routing(
             run_id=run.id,
         )
         snapshot = await uow.production_input_snapshots.get_by_run(run.id)
-        if not isinstance(snapshot, ProductionInputSnapshot) or (
-            snapshot.production_run_id != run.id or snapshot.subject_id != run.subject_id
+        snapshot_provenance_mismatch = False
+        if snapshot is not None and (
+            not isinstance(snapshot, ProductionInputSnapshot)
+            or snapshot.production_run_id != run.id
+            or snapshot.subject_id != run.subject_id
         ):
+            snapshot_provenance_mismatch = True
             snapshot = None
+        if (
+            isinstance(snapshot, ProductionInputSnapshot)
+            and isinstance(extraction_input.payload, ProductionExtractionV1)
+            and not _snapshot_matches_extraction(snapshot, extraction_input.payload)
+        ):
+            snapshot_provenance_mismatch = True
+            snapshot = None
+        if snapshot_provenance_mismatch and extraction_input.validation_error is None:
+            extraction_input = replace(
+                extraction_input,
+                validation_error=RoutingReasonCode.PROVENANCE_MISMATCH,
+            )
         if isinstance(extraction_input.payload, ProductionExtractionV1) and isinstance(
             relevance_input.payload, RelevanceProjectionV1
         ):
-            try:
-                brief_feasibility = compute_brief_routing_feasibility(
-                    extraction=extraction_input.payload,
-                    projection=relevance_input.payload,
-                    snapshot=snapshot,
-                )
-            except (KeyError, TypeError, ValueError):
+            if snapshot_provenance_mismatch:
                 brief_feasibility = BriefRoutingFeasibilityV1(
                     dated_entry_count=0,
                     reason="brief_feasibility_inputs_unavailable",
-                    needs=("verified extraction and relevance artifacts",),
+                    needs=("a production input snapshot matching the canonical extraction",),
                 )
+            else:
+                try:
+                    brief_feasibility = compute_brief_routing_feasibility(
+                        extraction=extraction_input.payload,
+                        projection=relevance_input.payload,
+                        snapshot=snapshot,
+                    )
+                except (KeyError, TypeError, ValueError):
+                    brief_feasibility = BriefRoutingFeasibilityV1(
+                        dated_entry_count=0,
+                        reason="brief_feasibility_inputs_unavailable",
+                        needs=("verified extraction and relevance artifacts",),
+                    )
         else:
             brief_feasibility = BriefRoutingFeasibilityV1(
                 dated_entry_count=0,
@@ -281,7 +311,9 @@ async def _load_relevance_input(
             reason,
         )
     stored_projection_hash = artifact.metadata.get("projection_hash")
-    if stored_projection_hash is not None and stored_projection_hash != projection.projection_hash:
+    if (
+        stored_projection_hash is not None and stored_projection_hash != projection.projection_hash
+    ) or artifact.input_hash != projection.input_hash:
         error = RoutingReasonCode.PROVENANCE_MISMATCH
     return ProductionRoutingArtifactInputV1(
         artifact,
