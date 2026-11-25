@@ -1062,11 +1062,53 @@ class ProductionWorkflowOrchestrator:
                                     canonical_url=collection.canonical_url,
                                 )
                             )
+                            persisted_collection = next(
+                                (
+                                    source
+                                    for source in await self._collection_service.list_sources(
+                                        run.subject_id
+                                    )
+                                    if source.id == collection.id
+                                ),
+                                None,
+                            )
+                            persisted_state = (
+                                getattr(
+                                    persisted_collection.state,
+                                    "value",
+                                    persisted_collection.state,
+                                )
+                                if persisted_collection is not None
+                                else None
+                            )
                             failure_fields = _supplemental_failure_fields(
                                 exc,
                                 canonical_url=collection.canonical_url,
-                                collection_state=str(collection_state),
+                                collection_state=(
+                                    str(persisted_state) if persisted_state is not None else None
+                                ),
                                 retry_attempted=retry_attempted,
+                            )
+                            failure_fields["state_before_attempt"] = str(collection_state)
+                            failure_fields["failure_reason_code"] = (
+                                getattr(
+                                    persisted_collection.failure_reason_code,
+                                    "value",
+                                    persisted_collection.failure_reason_code,
+                                )
+                                if persisted_collection is not None
+                                else None
+                            )
+                            failure_fields["attempt_count"] = (
+                                int(persisted_collection.attempt_count)
+                                if persisted_collection is not None
+                                else None
+                            )
+                            failure_fields["latest_attempt_id"] = (
+                                str(persisted_collection.latest_attempt_id)
+                                if persisted_collection is not None
+                                and persisted_collection.latest_attempt_id is not None
+                                else None
                             )
                             supplemental_failures.append(failure_fields)
                             diagnostics = getattr(self, "_diagnostics", None)
