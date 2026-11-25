@@ -5,7 +5,9 @@ import binascii
 import hashlib
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
+from enum import StrEnum
 from typing import Annotated, Any, Literal, NoReturn, cast
+from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request, status
@@ -182,7 +184,12 @@ from cti_app.domain.production_editorial_revision import (
 )
 from cti_app.domain.production_pipeline import production_artifact_stages
 from cti_app.domain.production_references import ProductionReferenceKind
-from cti_app.domain.production_routing import RoutingReasonCode, RoutingStatus
+from cti_app.domain.production_routing import (
+    RoutingHumanWaiverPath,
+    RoutingReasonCode,
+    RoutingRemainingControlCode,
+    RoutingStatus,
+)
 from cti_app.domain.production_source_additions import (
     SourceAdditionOrigin,
     source_addition_to_json,
@@ -596,6 +603,12 @@ class ProductionRoutingSourceView(BaseModel):
     criticality: str
     criticality_reason: str
     policy_version: str
+    editorial_role: str | None = None
+    acquisition_method: str | None = None
+    collection_state: str | None = None
+    error_code: str | None = None
+    remaining_control_code: str = RoutingRemainingControlCode.HUMAN_REVIEW_REQUIRED.value
+    human_waiver_path: str = RoutingHumanWaiverPath.NOT_CONSUMED_BY_ROUTING.value
 
 
 ProductionRoutingExtractionState = Literal["verified", "needs_review", "stale", "not_yet"]
@@ -1246,6 +1259,18 @@ def _not_yet_production_routing_view(
     )
 
 
+def _enum_value(value: StrEnum | None) -> str | None:
+    return None if value is None else value.value
+
+
+def _safe_routing_source_url(source_url: str) -> str:
+    parsed = urlsplit(source_url)
+    # Diagnostic URLs may carry credentials or signed query parameters. The
+    # cockpit needs the source location, not access material or fragments.
+    public_netloc = parsed.netloc.rsplit("@", 1)[-1]
+    return urlunsplit(parsed._replace(netloc=public_netloc, query="", fragment=""))
+
+
 async def _production_routing_view(uow: Any, run: ProductionRun) -> ProductionRoutingView:
     """Project only the routing decision currently adopted by this run."""
     extraction_artifact = await uow.production_artifacts.get_current(
@@ -1282,12 +1307,18 @@ async def _production_routing_view(uow: Any, run: ProductionRun) -> ProductionRo
         sources=[
             ProductionRoutingSourceView(
                 source_id=diagnostic.source_id,
-                source_url=diagnostic.source_url,
+                source_url=_safe_routing_source_url(diagnostic.source_url),
                 failure_code=diagnostic.failure_code,
                 tier=diagnostic.tier,
                 criticality=diagnostic.criticality.value,
                 criticality_reason=diagnostic.criticality_reason,
                 policy_version=diagnostic.policy_version,
+                editorial_role=_enum_value(diagnostic.editorial_role),
+                acquisition_method=_enum_value(diagnostic.acquisition_method),
+                collection_state=_enum_value(diagnostic.omission_collection_state),
+                error_code=diagnostic.omission_error_code,
+                remaining_control_code=diagnostic.remaining_control_code.value,
+                human_waiver_path=diagnostic.human_waiver_path.value,
             )
             for diagnostic in decision.critical_source_diagnostics
         ],
