@@ -271,6 +271,7 @@ function RoutingReview({ routing }: { routing: ProductionRoutingProjection }) {
     reasonCode === "brief_evidence_chronology_missing" ||
     reasonCode === "critical_source_missing" ||
     reasonCode === "incomplete_extraction" ||
+    reasonCode === "provenance_mismatch" ||
     reasonCode === "missing_extraction_artifact" ||
     reasonCode === "invalid_extraction_artifact" ||
     reasonCode === "missing_relevance_artifact" ||

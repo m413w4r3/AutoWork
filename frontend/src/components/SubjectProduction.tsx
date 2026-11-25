@@ -580,7 +580,9 @@ export function SubjectProduction({
                   const href = source.url ? safeHttpHref(source.url) : null;
                   return (
                     <li key={source.sourceId}>
-                      {source.title ? <strong>{source.title}</strong> : null}
+                      {source.title ? (
+                        <strong>{sanitizeTextForDisplay(source.title)}</strong>
+                      ) : null}
                       {displayUrl ? (
                         <>
                           {source.title ? <br /> : null}
@@ -615,6 +617,15 @@ export function SubjectProduction({
         </div>
       )}
 
+      {status.status === "needs_review" &&
+      status.error_code === "model_submission_reconciliation_required" &&
+      !reconciliationRequired ? (
+        <p role="note">
+          Les données de réconciliation ne sont pas disponibles : ne relancez
+          pas l’étape. Actualisez la page, ou ouvrez la revue technique de
+          l’édition pour retrouver la soumission.
+        </p>
+      ) : null}
       {reconciliationRequired && status.reconciliation ? (
         <ReconciliationPanel
           runId={status.run_id}
@@ -756,9 +767,11 @@ export function SubjectProduction({
                     <>
                       <br />
                       {href ? (
-                        <a href={href}>{warning.source}</a>
+                        <a href={href}>
+                          {sanitizeTextForDisplay(warning.source)}
+                        </a>
                       ) : (
-                        <span>{warning.source}</span>
+                        <span>{sanitizeTextForDisplay(warning.source)}</span>
                       )}
                     </>
                   ) : null}

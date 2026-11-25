@@ -88,7 +88,7 @@ export function productionIssueMessage(
     case "conversation_unavailable":
     case "conversation_profile_mismatch":
     case "conversation_busy":
-      return "L’appel au modèle n’a pas abouti. Le système ne renvoie pas de lui-même une soumission dont l’état est incertain. Si un panneau de réconciliation apparaît, utilisez-le ; sinon, vous pouvez relancer l’étape sans risque.";
+      return "L’appel au modèle n’a pas abouti. Le système ne renvoie pas de lui-même une soumission dont l’état est incertain. Si un panneau de réconciliation apparaît, utilisez-le ; sinon, relancer l’étape est possible, et le système ne réémettra jamais de lui-même une soumission incertaine.";
     default:
       return null;
   }

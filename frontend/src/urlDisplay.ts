@@ -107,7 +107,7 @@ export function sanitizeUrlForDisplay(value: string): string {
   if (isNonHttpSchemeUrl(value)) return NON_HTTP_SCHEME_PLACEHOLDER;
 
   const withEmbeddedUrls = value.replace(
-    /(?:https?|ftp):\/\/[^\s"'<>]+/gi,
+    /\b(?:https?|ftp):\/\/[^\s"'<>]+|\b(?:javascript|data|vbscript|file|blob|filesystem|mailto):[^\s"'<>]+/gi,
     (candidate) => {
       const safeHref = sanitizeHttpUrl(candidate);
       return (

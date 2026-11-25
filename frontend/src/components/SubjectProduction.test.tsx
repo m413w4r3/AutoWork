@@ -715,7 +715,7 @@ describe("SubjectProduction retry from stage", () => {
 
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent(
-      "L’appel au modèle n’a pas abouti. Le système ne renvoie pas de lui-même une soumission dont l’état est incertain. Si un panneau de réconciliation apparaît, utilisez-le ; sinon, vous pouvez relancer l’étape sans risque.",
+      "L’appel au modèle n’a pas abouti. Le système ne renvoie pas de lui-même une soumission dont l’état est incertain. Si un panneau de réconciliation apparaît, utilisez-le ; sinon, relancer l’étape est possible, et le système ne réémettra jamais de lui-même une soumission incertaine.",
     );
     expect(alert).not.toHaveTextContent("doit être réconciliée");
     expect(alert).not.toHaveTextContent("Réconcilier");

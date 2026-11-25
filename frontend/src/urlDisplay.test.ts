@@ -109,3 +109,16 @@ describe("sanitizeTextForDisplay", () => {
     expect(sanitizeTextForDisplay("x".repeat(600))).toHaveLength(500);
   });
 });
+
+describe("embedded non-http URLs in free text", () => {
+  it("never leaves a javascript: URL with a secret query inside prose", () => {
+    const text = sanitizeTextForDisplay(
+      "échec sur javascript:alert(1)?token=abc123 puis data:text/html,secret=zzz fin",
+    );
+
+    expect(text).not.toContain("javascript:");
+    expect(text).not.toContain("abc123");
+    expect(text).not.toContain("data:text");
+    expect(text).toContain("échec sur");
+  });
+});
