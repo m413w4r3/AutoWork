@@ -318,7 +318,7 @@ describe("Repair Desk — dette de reconstruction durable", () => {
 
     expect(
       screen.getByText(
-        /Vous aviez choisi de continuer sans cette source.*réintégrée après reconstruction/i,
+        /Vous aviez choisi de continuer sans cette source.*ne débloque pas.*format de publication.*source critique manque.*réintégrée après reconstruction/i,
       ),
     ).toBeInTheDocument();
     await user.type(

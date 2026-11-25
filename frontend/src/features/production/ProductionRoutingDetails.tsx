@@ -2,6 +2,7 @@ import type {
   ProductionRoutingProjection,
   ProductionRoutingSource,
 } from "../../api/production";
+import { sanitizeUrlForDisplay } from "../../urlDisplay";
 
 function formatLabel(routing: ProductionRoutingProjection | undefined): string {
   if (!routing || routing.status === "not_yet") return "à déterminer";
@@ -27,19 +28,14 @@ function extractionLabel(
 }
 
 function sourceLink(sourceUrl: string): { href: string; label: string } {
+  const href = sanitizeUrlForDisplay(sourceUrl);
   try {
-    const url = new URL(sourceUrl);
-    const label = `${url.host}${url.pathname}`;
-    url.username = "";
-    url.password = "";
-    url.search = "";
-    url.hash = "";
-    return { href: url.toString(), label };
+    const url = new URL(href);
+    return { href, label: `${url.host}${url.pathname}${url.search}` };
   } catch {
-    const withoutQueryOrFragment = sourceUrl.split(/[?#]/, 1)[0] ?? sourceUrl;
     return {
-      href: withoutQueryOrFragment,
-      label: withoutQueryOrFragment.replace(/^https?:\/\//i, ""),
+      href,
+      label: href.replace(/^https?:\/\//i, ""),
     };
   }
 }
@@ -169,6 +165,10 @@ function reviewCause(reasonCode: string | null): string {
       return "La chronologie de la brève ne peut pas être établie à partir des événements extraits.";
     case "critical_source_missing":
       return "Source critique manquante ou non lisible (décision antérieure).";
+    case "provenance_mismatch":
+      return "La lignée de l’artefact ne correspond pas à celle de l’instantané.";
+    case "incomplete_extraction":
+      return "Une source d’extraction a été omise ou a échoué sans diagnostic critique.";
     default:
       return "Le routage nécessite une vérification.";
   }
@@ -185,6 +185,10 @@ function actionForReason(reasonCode: string | null): string | null {
       return "Action disponible : une acquisition datée est nécessaire pour les sources CORE/PRIMARY listées.";
     case "critical_source_missing":
       return "Vérifiez la source critique dans les archives et réacquérez-la si nécessaire.";
+    case "provenance_mismatch":
+      return "Relancez l’étape ou inspectez les artefacts ; rien n’a été publié.";
+    case "incomplete_extraction":
+      return "Réextrayez ou réparez la source omise ou en échec.";
     default:
       return null;
   }

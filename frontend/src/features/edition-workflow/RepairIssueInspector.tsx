@@ -530,39 +530,48 @@ export function RepairIssueInspector({
           </details>
           <div className="repair-inspector__actions">
             {alternatives.map((nextAction) => (
-              <button
-                key={nextAction}
-                className={
-                  nextAction === "exclude"
-                    ? "button button--danger"
-                    : nextAction === "replace"
-                      ? "button button--secondary"
-                      : nextAction === "continue_without_source"
+              <div key={nextAction}>
+                <button
+                  className={
+                    nextAction === "exclude"
+                      ? "button button--danger"
+                      : nextAction === "replace"
                         ? "button button--secondary"
-                        : "button"
-                }
-                type="button"
-                disabled={
-                  readOnly ||
-                  decide.isPending ||
-                  (nextAction === "continue_without_source" &&
-                    !item.artifact_id)
-                }
-                onClick={() => {
-                  if (nextAction === "replace") {
-                    setCorrecting(true);
-                    setForceOverride(false);
-                    setReplacementVerification(null);
-                    setError(null);
-                  } else {
-                    decide.mutate(nextAction);
+                        : nextAction === "continue_without_source"
+                          ? "button button--secondary"
+                          : "button"
                   }
-                }}
-              >
-                {decide.isPending
-                  ? "Enregistrement…"
-                  : DECISION_ACTION_LABELS[nextAction]}
-              </button>
+                  type="button"
+                  disabled={
+                    readOnly ||
+                    decide.isPending ||
+                    (nextAction === "continue_without_source" &&
+                      !item.artifact_id)
+                  }
+                  onClick={() => {
+                    if (nextAction === "replace") {
+                      setCorrecting(true);
+                      setForceOverride(false);
+                      setReplacementVerification(null);
+                      setError(null);
+                    } else {
+                      decide.mutate(nextAction);
+                    }
+                  }}
+                >
+                  {decide.isPending
+                    ? "Enregistrement…"
+                    : DECISION_ACTION_LABELS[nextAction]}
+                </button>
+                {nextAction === "continue_without_source" ? (
+                  <small role="note">
+                    Cette décision consigne le choix de l&apos;analyste dans le
+                    flux de réparation et de validation ; elle ne débloque pas
+                    la décision de format de publication si une source critique
+                    manque.
+                  </small>
+                ) : null}
+              </div>
             ))}
             {revising ? (
               <button

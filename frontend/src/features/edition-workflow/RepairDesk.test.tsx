@@ -757,9 +757,13 @@ describe("Repair Desk", () => {
       ),
     ).toBeInTheDocument();
 
-    await user.click(
-      screen.getByRole("button", { name: "Continuer sans cette source" }),
+    const continueButton = screen.getByRole("button", {
+      name: "Continuer sans cette source",
+    });
+    expect(continueButton.parentElement).toHaveTextContent(
+      /consigne.*choix.*flux de réparation.*validation.*ne débloque pas.*format de publication.*source critique manque/i,
     );
+    await user.click(continueButton);
     await waitFor(() =>
       expect(
         fetchMock.mock.calls.some(
