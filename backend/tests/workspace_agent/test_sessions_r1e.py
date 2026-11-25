@@ -10,6 +10,13 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from sidecars.workspace_agent import files
+from sidecars.workspace_agent.sessions import supervisor as sessions_supervisor
+from sidecars.workspace_agent.sessions.state import (
+    SessionWriteAdmissionError,
+    SessionWriteDrainTimeoutError,
+)
+
 from tests.workspace_agent.sessions_support import (
     CLOSE_KEY,
     COLLECT_KEY,
@@ -21,13 +28,6 @@ from tests.workspace_agent.sessions_support import (
     post_session,
     prepare_payload,
     running_session_agent,
-)
-
-from sidecars.workspace_agent import files
-from sidecars.workspace_agent.sessions import supervisor as sessions_supervisor
-from sidecars.workspace_agent.sessions.state import (
-    SessionWriteAdmissionError,
-    SessionWriteDrainTimeoutError,
 )
 
 SECOND_TASK_ID = "b2c3d4e5-f6a7-489b-9c0d-1e2f3a4b5c6d"
@@ -941,6 +941,97 @@ def test_stop_timeout_cleans_all_sessions_and_reports_non_drained_ids(
         # A retry after the outstanding lease exits can safely clear its forms.
         supervisor.stop()
         assert first.secret_forms == ()
+
+
+def test_stop_kills_and_disables_egress_before_waiting_for_workspace_write(
+    session_base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakeProcess:
+        def wait(self, timeout: float) -> None:
+            del timeout
+
+    with running_session_agent(session_base) as running:
+        with running.client() as client:
+            workspace_id = running.ensure_workspace(client)
+            _prepare(running, client, workspace_id)
+        supervisor = _supervisor(running)
+        handle = supervisor._handle(SESSION_ID)
+        handle.record.state = sessions_supervisor.SessionState.RUNNING
+        handle.managed = SimpleNamespace(pgid=101, process=FakeProcess())
+        kill_sent = threading.Event()
+        staged = threading.Event()
+        release_staging = threading.Event()
+        stop_waiting = threading.Event()
+        write_results: list[httpx.Response] = []
+        original_exclusive = supervisor._acquire_workspace_write_exclusive
+
+        def pause_staging(*args: object, **kwargs: object):
+            staged.set()
+            assert release_staging.wait(timeout=10), "test did not release the staged write"
+            return original_stream(*args, **kwargs)  # type: ignore[arg-type]
+
+        def observe_kill(pgid: int, requested_signal: int) -> bool:
+            assert pgid == 101
+            assert requested_signal == signal.SIGKILL
+            kill_sent.set()
+            return True
+
+        def observe_exclusive(workspace: str, timeout: float) -> bool:
+            stop_waiting.set()
+            return bool(original_exclusive(workspace, timeout))
+
+        original_stream = files._stream_to_temporary
+        monkeypatch.setattr(files, "_stream_to_temporary", pause_staging)
+        monkeypatch.setattr(sessions_supervisor.process, "signal_group", observe_kill)
+        monkeypatch.setattr(supervisor, "_acquire_workspace_write_exclusive", observe_exclusive)
+
+        def write_secret() -> None:
+            with running.client() as client:
+                write_results.append(
+                    _put_file(
+                        running,
+                        client,
+                        workspace_id,
+                        "notes/humaines/r1e-stop-barrier.md",
+                        b"credential: " + SECRET,
+                        "m24-r1e-stop-barrier-write",
+                    )
+                )
+
+        stop_errors: list[BaseException] = []
+
+        def stop() -> None:
+            try:
+                supervisor.stop()
+            except BaseException as exc:
+                stop_errors.append(exc)
+
+        writer = threading.Thread(target=write_secret, name="r1e-stop-barrier-writer")
+        stopper = threading.Thread(target=stop, name="r1e-stop-barrier-stopper")
+        writer.start()
+        try:
+            assert staged.wait(timeout=10), "write did not acquire its lease before staging"
+            stopper.start()
+            assert stop_waiting.wait(timeout=10), "stop did not request workspace exclusion"
+            assert kill_sent.is_set(), "stop waited for the workspace write before SIGKILL"
+            assert supervisor._stopped.is_set()
+            assert not handle.channels.egress_allowed()
+            assert handle.secret_forms, "stop erased detection forms before the write drained"
+
+            release_staging.set()
+            writer.join(timeout=10)
+            stopper.join(timeout=10)
+            assert not writer.is_alive()
+            assert not stopper.is_alive()
+            assert not stop_errors
+            assert write_results and write_results[0].status_code == 403
+            assert not (running.host_path / "notes/humaines/r1e-stop-barrier.md").exists()
+            assert handle.secret_forms == ()
+        finally:
+            release_staging.set()
+            writer.join(timeout=10)
+            if stopper.ident is not None:
+                stopper.join(timeout=10)
 
 
 def test_stop_uses_one_global_deadline_across_workspaces(

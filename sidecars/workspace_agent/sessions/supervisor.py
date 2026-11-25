@@ -1161,8 +1161,9 @@ class _SessionChannelState:
     proxy; it never outlives a failed or finished launch.
     """
 
-    def __init__(self, handle: _Session) -> None:
+    def __init__(self, handle: _Session, stopped: threading.Event) -> None:
         self._handle = handle
+        self._stopped = stopped
         self._starting = threading.Event()
 
     @property
@@ -1181,7 +1182,7 @@ class _SessionChannelState:
         }
 
     def egress_allowed(self) -> bool:
-        return self.is_active() or self._starting.is_set()
+        return not self._stopped.is_set() and (self.is_active() or self._starting.is_set())
 
     def manifest_tools(self) -> Collection[str] | None:
         manifest = self._handle.manifest
@@ -1221,13 +1222,14 @@ class _Session:
         record: SessionRecord,
         log_ring: logs.LogRing,
         event_ring: logs.EventRing,
+        stopped: threading.Event,
     ) -> None:
         self.directory = directory
         self.record = record
         self.logs = log_ring
         self.events = event_ring
         self.lock = threading.RLock()
-        self.channels = _SessionChannelState(self)
+        self.channels = _SessionChannelState(self, stopped)
         self.secret: bytearray | None = None
         # F2: secret detection forms are never persisted. Normally cleared
         # whenever the secret is wiped; exposure revocation retains them until
@@ -1473,6 +1475,30 @@ class SessionSupervisor:
         with self._workspace_write_condition:
             self._workspace_write_condition.notify_all()
 
+        # Emergency shutdown must not wait for workspace writers before cutting
+        # off session processes and their relay/egress channels. Keep detection
+        # forms and provider credential sources intact until after the drain.
+        for handle in handles:
+            record = handle.record
+            managed = handle.managed
+            if managed is not None:
+                try:
+                    process.signal_group(managed.pgid, signal.SIGKILL)
+                except Exception:
+                    LOGGER.warning(
+                        "session process kill failed session_id=%s workspace_id=%s",
+                        record.session_id,
+                        record.workspace_id,
+                    )
+            try:
+                self._stop_channels(handle, wipe_secret=False, clear_forms=False)
+            except Exception:
+                LOGGER.warning(
+                    "session channel cleanup failed session_id=%s workspace_id=%s",
+                    record.session_id,
+                    record.workspace_id,
+                )
+
         # The 5 s bound covers write-lease draining, not channel or process cleanup.
         deadline = time.monotonic() + WRITE_DRAIN_TIMEOUT_SECONDS
         by_workspace: dict[str, list[_Session]] = {}
@@ -1503,30 +1529,15 @@ class SessionSupervisor:
                     managed = handle.managed
                     if managed is not None:
                         try:
-                            process.signal_group(managed.pgid, signal.SIGKILL)
-                        except Exception:
-                            LOGGER.warning(
-                                "session process kill failed session_id=%s workspace_id=%s",
-                                record.session_id,
-                                record.workspace_id,
-                            )
-                        try:
                             managed.process.wait(timeout=max(0.0, deadline - time.monotonic()))
                         except Exception:
                             pass
                         handle.managed = None
-                    try:
-                        self._stop_channels(
-                            handle,
-                            wipe_secret=True,
-                            clear_forms=record.workspace_id in drained_workspaces,
-                        )
-                    except Exception:
-                        LOGGER.warning(
-                            "session channel cleanup failed session_id=%s workspace_id=%s",
-                            record.session_id,
-                            record.workspace_id,
-                        )
+                    secret, handle.secret = handle.secret, None
+                    if record.workspace_id in drained_workspaces:
+                        handle.secret_forms = ()
+                    if secret is not None:
+                        secret[:] = bytes(len(secret))
                     self._unlink_sockets(
                         (handle.socket_path, handle.broker_socket_path, handle.egress_socket_path)
                     )
@@ -1793,6 +1804,7 @@ class SessionSupervisor:
                 records=event_records,
                 last_seq=max(record.event_seq, event_last),
             ),
+            stopped=self._stopped,
         )
         handle.last_output_monotonic = time.monotonic()
         # R2B-1: a crashed supervisor may have left the seeded provider
@@ -2025,6 +2037,7 @@ class SessionSupervisor:
                         generation=record.generation,
                         max_entries=self._config.event_ring_entries,
                     ),
+                    stopped=self._stopped,
                 )
                 handle.secret = bytearray(request.auth_secret)
                 handle.secret_forms = _secret_content_forms(bytes(request.auth_secret))
