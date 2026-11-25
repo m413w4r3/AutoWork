@@ -686,7 +686,9 @@ class SubjectCollectionService:
             "syndication_domains": sorted(self._allowed_syndication_domains),
             "third_party_provider_enabled": self._third_party_provider_enabled,
             "third_party_provider_url": self._third_party_provider_url,
-            "third_party_provider_token": self._third_party_provider_token,
+            # Presence only: the credential itself must never feed a stored digest, and
+            # rotating it does not change what the chain can reach.
+            "third_party_provider_token_configured": bool(self._third_party_provider_token),
             "ocr_command": self._ocr_command,
             "fallback_max_variants": self._fallback_max_variants,
             "fallback_min_text_chars": self._fallback_min_text_chars,
