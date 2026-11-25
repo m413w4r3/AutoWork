@@ -5,6 +5,7 @@ import binascii
 import hashlib
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
+from enum import StrEnum
 from typing import Annotated, Any, Literal, NoReturn, cast
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
@@ -1258,6 +1259,10 @@ def _not_yet_production_routing_view(
     )
 
 
+def _enum_value(value: StrEnum | None) -> str | None:
+    return None if value is None else value.value
+
+
 def _safe_routing_source_url(source_url: str) -> str:
     parsed = urlsplit(source_url)
     # Diagnostic URLs may carry credentials or signed query parameters. The
@@ -1308,32 +1313,12 @@ async def _production_routing_view(uow: Any, run: ProductionRun) -> ProductionRo
                 criticality=diagnostic.criticality.value,
                 criticality_reason=diagnostic.criticality_reason,
                 policy_version=diagnostic.policy_version,
-                editorial_role=(
-                    diagnostic.editorial_role.value
-                    if getattr(diagnostic, "editorial_role", None) is not None
-                    else None
-                ),
-                acquisition_method=(
-                    diagnostic.acquisition_method.value
-                    if getattr(diagnostic, "acquisition_method", None) is not None
-                    else None
-                ),
-                collection_state=(
-                    diagnostic.omission_collection_state.value
-                    if getattr(diagnostic, "omission_collection_state", None) is not None
-                    else None
-                ),
-                error_code=getattr(diagnostic, "omission_error_code", None),
-                remaining_control_code=getattr(
-                    diagnostic,
-                    "remaining_control_code",
-                    RoutingRemainingControlCode.HUMAN_REVIEW_REQUIRED,
-                ).value,
-                human_waiver_path=getattr(
-                    diagnostic,
-                    "human_waiver_path",
-                    RoutingHumanWaiverPath.NOT_CONSUMED_BY_ROUTING,
-                ).value,
+                editorial_role=_enum_value(diagnostic.editorial_role),
+                acquisition_method=_enum_value(diagnostic.acquisition_method),
+                collection_state=_enum_value(diagnostic.omission_collection_state),
+                error_code=diagnostic.omission_error_code,
+                remaining_control_code=diagnostic.remaining_control_code.value,
+                human_waiver_path=diagnostic.human_waiver_path.value,
             )
             for diagnostic in decision.critical_source_diagnostics
         ],

@@ -1445,6 +1445,12 @@ async def test_routing_projection_is_additive_and_uses_the_run_decision_pointer(
                 criticality=SimpleNamespace(value="critical"),
                 criticality_reason="source_required",
                 policy_version="source-criticality-test-v1",
+                editorial_role=None,
+                acquisition_method=None,
+                omission_collection_state=None,
+                omission_error_code=None,
+                remaining_control_code=RoutingRemainingControlCode.HUMAN_REVIEW_REQUIRED,
+                human_waiver_path=RoutingHumanWaiverPath.NOT_CONSUMED_BY_ROUTING,
             ),
         ),
     )
