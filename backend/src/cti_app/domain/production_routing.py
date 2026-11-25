@@ -5,12 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from uuid import UUID, uuid5
 
-from cti_app.domain.collection import SourceAcquisitionMethod
+from cti_app.domain.collection import CollectionState, SourceAcquisitionMethod
 from cti_app.domain.indicator_normalization import normalize_indicator_value
 from cti_app.domain.legitimate_services import LegitimateServiceRegistry
 from cti_app.domain.production import (
@@ -26,6 +26,7 @@ from cti_app.domain.production_extraction import (
 )
 from cti_app.domain.production_references import (
     PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION,
+    ProductionEditorialRole,
     ProductionReferenceTier,
     ProductionSourceCriticality,
     ProductionSourceCriticalityReason,
@@ -43,7 +44,7 @@ from cti_app.domain.publication import ArtifactType
 from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.subject_ioc_eligibility import is_subject_ioc_eligible
 
-ROUTING_POLICY_VERSION = "subject-publication-routing-v2-bridge-evidence-v1"
+ROUTING_POLICY_VERSION = "subject-publication-routing-v3-routing-reasons-v1"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _DECISION_NAMESPACE = UUID("484713e4-12ca-5e67-b18a-cafdad6ee989")
 
@@ -51,6 +52,15 @@ _DECISION_NAMESPACE = UUID("484713e4-12ca-5e67-b18a-cafdad6ee989")
 class RoutingStatus(StrEnum):
     DECIDED = "decided"
     NEEDS_REVIEW = "needs_review"
+
+
+class RoutingRemainingControlCode(StrEnum):
+    HUMAN_REVIEW_REQUIRED = "human_review_required"
+    NO_ROUTING_BLOCK = "no_routing_block"
+
+
+class RoutingHumanWaiverPath(StrEnum):
+    NOT_CONSUMED_BY_ROUTING = "not_consumed_by_routing"
 
 
 class RoutingReasonCode(StrEnum):
@@ -64,6 +74,9 @@ class RoutingReasonCode(StrEnum):
     INCOMPLETE_PROJECTION = "incomplete_projection"
     PROVENANCE_MISMATCH = "provenance_mismatch"
     CRITICAL_SOURCE_MISSING = "critical_source_missing"
+    CRITICAL_SOURCE_INACCESSIBLE = "critical_source_inaccessible"
+    CRITICAL_SOURCE_UNREADABLE = "critical_source_unreadable"
+    CRITICAL_SOURCE_ALTERNATIVE_PROVENANCE = "critical_source_alternative_provenance"
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +88,14 @@ class RoutingCriticalSourceDiagnosticV1:
     criticality: ProductionSourceCriticality
     criticality_reason: str
     policy_version: str
+    editorial_role: ProductionEditorialRole | None = None
+    acquisition_method: SourceAcquisitionMethod | None = None
+    omission_collection_state: CollectionState | None = None
+    omission_error_code: str | None = None
+    remaining_control_code: RoutingRemainingControlCode = (
+        RoutingRemainingControlCode.HUMAN_REVIEW_REQUIRED
+    )
+    human_waiver_path: RoutingHumanWaiverPath = RoutingHumanWaiverPath.NOT_CONSUMED_BY_ROUTING
 
     def __post_init__(self) -> None:
         for name in (
@@ -97,6 +118,26 @@ class RoutingCriticalSourceDiagnosticV1:
             raise ValueError("criticality_reason is invalid")
         if self.policy_version != PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION:
             raise ValueError("criticality policy version is unsupported")
+        if self.editorial_role is not None and not isinstance(
+            self.editorial_role, ProductionEditorialRole
+        ):
+            raise ValueError("editorial_role is invalid")
+        if self.acquisition_method is not None and not isinstance(
+            self.acquisition_method, SourceAcquisitionMethod
+        ):
+            raise ValueError("acquisition_method is invalid")
+        if self.omission_collection_state is not None and not isinstance(
+            self.omission_collection_state, CollectionState
+        ):
+            raise ValueError("omission_collection_state is invalid")
+        if self.omission_error_code is not None and (
+            not isinstance(self.omission_error_code, str) or not self.omission_error_code.strip()
+        ):
+            raise ValueError("omission_error_code must be non-empty text or None")
+        if not isinstance(self.remaining_control_code, RoutingRemainingControlCode):
+            raise ValueError("remaining_control_code is invalid")
+        if not isinstance(self.human_waiver_path, RoutingHumanWaiverPath):
+            raise ValueError("human_waiver_path is invalid")
 
     def to_json(self) -> dict[str, str | None]:
         return {
@@ -107,6 +148,16 @@ class RoutingCriticalSourceDiagnosticV1:
             "criticality": self.criticality.value,
             "criticality_reason": self.criticality_reason,
             "policy_version": self.policy_version,
+            "editorial_role": self.editorial_role.value if self.editorial_role else None,
+            "acquisition_method": self.acquisition_method.value
+            if self.acquisition_method
+            else None,
+            "collection_state": self.omission_collection_state.value
+            if self.omission_collection_state
+            else None,
+            "error_code": self.omission_error_code,
+            "remaining_control_code": self.remaining_control_code.value,
+            "human_waiver_path": self.human_waiver_path.value,
         }
 
 
@@ -201,6 +252,10 @@ def _diagnostic_json(
     return [item.to_json() for item in diagnostics]
 
 
+def _diagnostic_sort_key(item: RoutingCriticalSourceDiagnosticV1) -> bytes:
+    return _canonical_json(item.to_json())
+
+
 def _artifact_identity(value: ProductionRoutingArtifactInputV1) -> dict[str, str | None]:
     return {
         "artifact_id": str(value.artifact.id) if value.artifact is not None else None,
@@ -287,23 +342,6 @@ def decide_publication_routing(
     if decided_at.tzinfo is None or decided_at.utcoffset() is None:
         raise ValueError("decided_at must be timezone-aware")
 
-    diagnostics = tuple(
-        sorted(
-            critical_source_diagnostics,
-            key=lambda item: (item.source_url, item.failure_code, item.source_id or ""),
-        )
-    )
-
-    input_payload = {
-        "production_run_id": str(production_run_id),
-        "pipeline_generation": pipeline_generation,
-        "policy_version": ROUTING_POLICY_VERSION,
-        "extraction_artifact": _artifact_identity(extraction_input),
-        "relevance_artifact": _artifact_identity(relevance_input),
-        "critical_source_diagnostics": _diagnostic_json(diagnostics),
-    }
-    input_hash = hashlib.sha256(_canonical_json(input_payload)).hexdigest()
-
     reason = _valid_artifact(
         value=extraction_input,
         run_id=production_run_id,
@@ -328,6 +366,12 @@ def decide_publication_routing(
     projection = relevance_input.payload
     source_availability_reason: RoutingReasonCode | None = None
     force_critical_source_review = False
+    diagnostics = tuple(
+        sorted(
+            critical_source_diagnostics,
+            key=_diagnostic_sort_key,
+        )
+    )
     if reason is None:
         assert isinstance(extraction, ProductionExtractionV1)
         force_critical_source_review = any(
@@ -378,6 +422,17 @@ def decide_publication_routing(
                 omitted_by_url[diagnostic.source_url].error_code is not None
                 and diagnostic.failure_code != omitted_by_url[diagnostic.source_url].error_code
             )
+            or (
+                diagnostic.omission_collection_state is not None
+                and diagnostic.omission_collection_state
+                is not omitted_by_url[diagnostic.source_url].collection_state
+            )
+            or (
+                diagnostic.omission_error_code is not None
+                and diagnostic.omission_error_code
+                != omitted_by_url[diagnostic.source_url].error_code
+            )
+            or diagnostic.acquisition_method is not None
             for diagnostic in diagnostics
         ):
             reason = RoutingReasonCode.PROVENANCE_MISMATCH
@@ -388,24 +443,70 @@ def decide_publication_routing(
             if omission.tier is ProductionReferenceTier.CORE
         )
         diagnostics = tuple(
+            replace(
+                diagnostic,
+                omission_collection_state=omitted_by_url[diagnostic.source_url].collection_state,
+                omission_error_code=omitted_by_url[diagnostic.source_url].error_code,
+                remaining_control_code=(
+                    RoutingRemainingControlCode.HUMAN_REVIEW_REQUIRED
+                    if diagnostic.criticality is ProductionSourceCriticality.CRITICAL
+                    else RoutingRemainingControlCode.NO_ROUTING_BLOCK
+                ),
+            )
+            if diagnostic.source_url in omitted_by_url
+            else diagnostic
+            for diagnostic in diagnostics
+        )
+        omission_diagnostics = tuple(
+            RoutingCriticalSourceDiagnosticV1(
+                source_id=None,
+                source_url=omission.canonical_url,
+                failure_code=(omission.error_code or omission.reason.value),
+                tier=omission.tier.value,
+                criticality=ProductionSourceCriticality.CRITICAL,
+                criticality_reason=ProductionSourceCriticalityReason.CORE_TIER.value,
+                policy_version=PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION,
+                omission_collection_state=omission.collection_state,
+                omission_error_code=omission.error_code,
+            )
+            for omission in core_omissions
+            if omission.canonical_url not in diagnostics_by_url
+        )
+        alternative_sources = tuple(
+            source
+            for source in extraction.sources
+            if source.tier is ProductionReferenceTier.CORE
+            and source.acquisition_method
+            in {
+                SourceAcquisitionMethod.INDEPENDENT_CORROBORATION,
+                SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION,
+                SourceAcquisitionMethod.VISUAL_OCR,
+                SourceAcquisitionMethod.THIRD_PARTY_EXTRACTION,
+            }
+        )
+        alternative_diagnostics = tuple(
+            RoutingCriticalSourceDiagnosticV1(
+                source_id=str(source.source_document_id),
+                source_url=source.canonical_url,
+                failure_code="alternative_acquisition_provenance",
+                tier=source.tier.value,
+                criticality=ProductionSourceCriticality.CRITICAL,
+                criticality_reason=ProductionSourceCriticalityReason.CORE_TIER.value,
+                policy_version=PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION,
+                editorial_role=source.editorial_role,
+                acquisition_method=source.acquisition_method,
+            )
+            for source in alternative_sources
+            if source.canonical_url not in diagnostics_by_url
+        )
+        diagnostics = tuple(
             sorted(
                 (
                     *diagnostics,
-                    *(
-                        RoutingCriticalSourceDiagnosticV1(
-                            source_id=None,
-                            source_url=omission.canonical_url,
-                            failure_code=(omission.error_code or omission.reason.value),
-                            tier=omission.tier.value,
-                            criticality=ProductionSourceCriticality.CRITICAL,
-                            criticality_reason=ProductionSourceCriticalityReason.CORE_TIER.value,
-                            policy_version=PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION,
-                        )
-                        for omission in core_omissions
-                        if omission.canonical_url not in diagnostics_by_url
-                    ),
+                    *omission_diagnostics,
+                    *alternative_diagnostics,
                 ),
-                key=lambda item: (item.source_url, item.failure_code, item.source_id or ""),
+                key=_diagnostic_sort_key,
             )
         )
         missing_diagnostic = any(
@@ -416,11 +517,30 @@ def decide_publication_routing(
         if reason is None:
             if missing_diagnostic:
                 source_availability_reason = RoutingReasonCode.INCOMPLETE_EXTRACTION
-            elif any(
-                diagnostic.criticality is ProductionSourceCriticality.CRITICAL
-                for diagnostic in diagnostics
-            ):
-                source_availability_reason = RoutingReasonCode.CRITICAL_SOURCE_MISSING
+            else:
+                critical_omissions = tuple(
+                    omitted_by_url[diagnostic.source_url]
+                    for diagnostic in diagnostics
+                    if diagnostic.criticality is ProductionSourceCriticality.CRITICAL
+                    and diagnostic.source_url in omitted_by_url
+                )
+                if any(
+                    omission.reason is ProductionExtractionOmissionReason.SOURCE_EXTRACTION_FAILED
+                    for omission in critical_omissions
+                ):
+                    source_availability_reason = RoutingReasonCode.CRITICAL_SOURCE_UNREADABLE
+                elif critical_omissions:
+                    source_availability_reason = RoutingReasonCode.CRITICAL_SOURCE_INACCESSIBLE
+
+    input_payload = {
+        "production_run_id": str(production_run_id),
+        "pipeline_generation": pipeline_generation,
+        "policy_version": ROUTING_POLICY_VERSION,
+        "extraction_artifact": _artifact_identity(extraction_input),
+        "relevance_artifact": _artifact_identity(relevance_input),
+        "critical_source_diagnostics": _diagnostic_json(diagnostics),
+    }
+    input_hash = hashlib.sha256(_canonical_json(input_payload)).hexdigest()
 
     status = RoutingStatus.NEEDS_REVIEW if reason is not None else RoutingStatus.DECIDED
     publication_kind: PublicationKind | None = None
@@ -506,7 +626,7 @@ def decide_publication_routing(
         if status is RoutingStatus.DECIDED:
             if force_critical_source_review:
                 status = RoutingStatus.NEEDS_REVIEW
-                reason = RoutingReasonCode.CRITICAL_SOURCE_MISSING
+                reason = RoutingReasonCode.CRITICAL_SOURCE_ALTERNATIVE_PROVENANCE
             elif subject_iocs:
                 publication_kind = PublicationKind.ARTICLE
                 reason = RoutingReasonCode.SUBJECT_IOC_CONFIRMED

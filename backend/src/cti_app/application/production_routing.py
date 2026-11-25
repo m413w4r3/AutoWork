@@ -15,7 +15,10 @@ from cti_app.domain.production_extraction import (
     production_extraction_from_json,
     production_extraction_hashes,
 )
-from cti_app.domain.production_references import ProductionSourceCriticality
+from cti_app.domain.production_references import (
+    ProductionEditorialRole,
+    ProductionSourceCriticality,
+)
 from cti_app.domain.production_relevance import (
     RELEVANCE_PROJECTION_SCHEMA_VERSION,
     relevance_projection_from_json,
@@ -259,6 +262,11 @@ def _source_loss_diagnostics(
                     criticality=ProductionSourceCriticality(item["source_criticality"]),
                     criticality_reason=item["criticality_reason"],
                     policy_version=item["criticality_policy_version"],
+                    editorial_role=(
+                        ProductionEditorialRole(item["editorial_role"])
+                        if item.get("editorial_role") is not None
+                        else None
+                    ),
                 )
             )
     except (KeyError, TypeError, ValueError):
