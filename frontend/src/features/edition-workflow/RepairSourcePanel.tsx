@@ -10,6 +10,7 @@ import {
   type EditionRepairDetail,
 } from "../../api/publication";
 import { ArchiveReceiptSummary } from "../../components/ArchiveReceiptSummary";
+import { sanitizeUrlForDisplay } from "../../urlDisplay";
 
 export function RepairSourcePanel({
   editionId,
@@ -107,6 +108,7 @@ export function RepairSourcePanel({
   const publisher = detail.publisher ?? source?.publisher ?? null;
   const title = detail.source_title ?? source?.title ?? "Source proposée";
   const url = detail.source_url ?? source?.requested_url ?? null;
+  const displayUrl = url ? sanitizeUrlForDisplay(url) : null;
   const canUpload = !readOnly && !collectionMissing && !pendingReferences;
 
   return (
@@ -129,9 +131,9 @@ export function RepairSourcePanel({
         <div>
           <dt>URL</dt>
           <dd>
-            {url ? (
-              <a href={url} target="_blank" rel="noreferrer">
-                {url}
+            {displayUrl ? (
+              <a href={displayUrl} target="_blank" rel="noreferrer">
+                {displayUrl}
               </a>
             ) : (
               "—"
@@ -183,9 +185,12 @@ export function RepairSourcePanel({
 
       {sourceWasWaived && !pendingReferences ? (
         <p role="status">
-          Vous aviez choisi de continuer sans cette source. Si vous fournissez
-          finalement son contenu, cette décision restera dans l&apos;audit mais
-          la source sera réintégrée après reconstruction.
+          Vous aviez choisi de continuer sans cette source. Cette décision
+          consigne le choix de l&apos;analyste dans le flux de réparation et de
+          validation, mais ne débloque pas la décision de format de publication
+          si une source critique manque. Si vous fournissez finalement son
+          contenu, cette décision restera dans l&apos;audit mais la source sera
+          réintégrée après reconstruction.
         </p>
       ) : null}
 

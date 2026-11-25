@@ -32,6 +32,7 @@ import {
 } from "../features/production/productionLabels";
 import { RETRYABLE_PRODUCTION_STAGES } from "../features/production/productionStages";
 import { Link } from "../routing";
+import { sanitizeUrlForDisplay } from "../urlDisplay";
 
 interface SubjectProductionProps {
   subjectId: string;
@@ -84,6 +85,69 @@ const RETRY_BLOCKED_ERROR_CODES = new Set([
   "brief_chronology_unavailable",
   "model_submission_reconciliation_required",
 ]);
+
+const SYNTHESIS_CORRECTION_RETRY_ERROR_CODES = new Set([
+  "synthesis_output_invalid",
+  "synthesis_correction_context_too_large",
+  "synthesis_correction_changed_untargeted_content",
+  "synthesis_corrective_parent_identity_mismatch",
+  "synthesis_corrective_parent_raw_output_hash_mismatch",
+]);
+
+const SENSITIVE_DIAGNOSTIC_FIELDS = new Set([
+  "token",
+  "key",
+  "apikey",
+  "api_key",
+  "access_token",
+  "signature",
+  "sig",
+  "expires",
+  "password",
+  "secret",
+]);
+
+function safeDiagnosticValue(
+  value: unknown,
+  depth = 0,
+  fieldName = "",
+): unknown {
+  const normalizedFieldName = fieldName.toLowerCase();
+  if (
+    SENSITIVE_DIAGNOSTIC_FIELDS.has(normalizedFieldName) ||
+    normalizedFieldName.startsWith("x-amz-") ||
+    normalizedFieldName.startsWith("x-goog-")
+  ) {
+    return "[masqué]";
+  }
+  if (typeof value === "string") {
+    return sanitizeUrlForDisplay(value).slice(0, 1_000);
+  }
+  if (
+    typeof value === "number" ||
+    typeof value === "boolean" ||
+    value === null
+  ) {
+    return value;
+  }
+  if (depth >= 4) return "[détails imbriqués omis]";
+  if (Array.isArray(value)) {
+    return value
+      .slice(0, 20)
+      .map((entry) => safeDiagnosticValue(entry, depth + 1));
+  }
+  if (typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .slice(0, 20)
+        .map(([key, entry]) => [
+          key,
+          safeDiagnosticValue(entry, depth + 1, key),
+        ]),
+    );
+  }
+  return "[valeur omise]";
+}
 
 function stageDetail(
   stage: string,
@@ -360,12 +424,26 @@ export function SubjectProduction({
     status.error_message ?? issueStage?.error_message ?? null;
   const showIssue =
     status.status === "needs_review" || status.status === "failed";
+  const safeExtractionProgress = status.extraction_progress
+    ? {
+        ...status.extraction_progress,
+        sources: status.extraction_progress.sources.map((source) => ({
+          ...source,
+          canonical_url: sanitizeUrlForDisplay(source.canonical_url),
+        })),
+      }
+    : status.extraction_progress;
   const blockingSources = showIssue
-    ? getBlockingSources(status.error_details, status.extraction_progress)
+    ? getBlockingSources(status.error_details, safeExtractionProgress)
     : [];
-  const skippedSources = getSkippedSources(status.extraction_progress);
+  const skippedSources = getSkippedSources(safeExtractionProgress);
   const presentedWarnings = warnings
     .map((warning) => formatProductionWarning(warning))
+    .map((warning) => ({
+      ...warning,
+      url: warning.url ? sanitizeUrlForDisplay(warning.url) : null,
+      message: sanitizeUrlForDisplay(warning.message),
+    }))
     .concat(
       skippedSources.map((source) => ({
         code: "source_skip",
@@ -399,18 +477,27 @@ export function SubjectProduction({
   const retryBlockedByErrorCode = RETRY_BLOCKED_ERROR_CODES.has(
     status.error_code ?? issueCode ?? "",
   );
+  const synthesisCorrectionRetry = SYNTHESIS_CORRECTION_RETRY_ERROR_CODES.has(
+    status.error_code ?? issueCode ?? "",
+  );
   // An unresolved provider submission owns the only recovery gesture: the
   // backend refuses every retry until the exact answer is adopted, so no
   // generic retry control — current stage or earlier — is offered here.
   const retryStages: readonly RetryStage[] =
     reconciliationRequired || retryBlockedByErrorCode
       ? []
-      : status.status === "ready"
-        ? RETRYABLE_PRODUCTION_STAGES
-        : showIssue && issueStageIndex >= 0
-          ? RETRYABLE_PRODUCTION_STAGES.slice(0, issueStageIndex + 1)
-          : [];
+      : synthesisCorrectionRetry
+        ? status.current_stage === "synthesis"
+          ? ["synthesis"]
+          : []
+        : status.status === "ready"
+          ? RETRYABLE_PRODUCTION_STAGES
+          : showIssue && issueStageIndex >= 0
+            ? RETRYABLE_PRODUCTION_STAGES.slice(0, issueStageIndex + 1)
+            : [];
   const issueRetryStage = showIssue ? status.current_stage : null;
+  const synthesisCorrectionRetryAvailable =
+    synthesisCorrectionRetry && issueRetryStage === "synthesis";
   const currentStageRetryRecommended = status.recovery_disposition === "auto";
 
   return (
@@ -433,8 +520,8 @@ export function SubjectProduction({
         {completedStages}/{stageList.length}
       </progress>
 
-      {status.current_stage === "extraction" && status.extraction_progress ? (
-        <ExtractionProgressView progress={status.extraction_progress} />
+      {status.current_stage === "extraction" && safeExtractionProgress ? (
+        <ExtractionProgressView progress={safeExtractionProgress} />
       ) : null}
 
       <ol className="production-stage-list">
@@ -499,7 +586,9 @@ export function SubjectProduction({
                     {source.url ? (
                       <>
                         {source.title ? <br /> : null}
-                        <a href={source.url}>{source.url}</a>
+                        <a href={sanitizeUrlForDisplay(source.url)}>
+                          {sanitizeUrlForDisplay(source.url)}
+                        </a>
                       </>
                     ) : (
                       <strong>{source.sourceId}</strong>
@@ -515,7 +604,7 @@ export function SubjectProduction({
               </ul>
             ) : null}
             <p>Code : {issueCode ?? "inconnu"}</p>
-            {issueMessage ? <p>{issueMessage}</p> : null}
+            {issueMessage ? <p>{sanitizeUrlForDisplay(issueMessage)}</p> : null}
           </details>
           <a href={stageArtifactHref(subjectId, status.current_stage)}>
             Voir les détails de l’étape
@@ -552,6 +641,12 @@ export function SubjectProduction({
                 ne changera rien si la cause n’a pas été corrigée entre-temps.
               </p>
             )}
+            {synthesisCorrectionRetryAvailable ? (
+              <p className="production-retry-primary__caveat" role="note">
+                Une relance ouvre une nouvelle génération et peut déclencher un
+                nouvel appel modèle facturable.
+              </p>
+            ) : null}
             <button
               className="button"
               onClick={() => retryStageMutation.mutate(issueRetryStage)}
@@ -748,14 +843,20 @@ export function SubjectProduction({
               <ul>
                 {warnings.map((warning) => (
                   <li key={warning}>
-                    <code>{warning}</code>
+                    <code>{sanitizeUrlForDisplay(warning)}</code>
                   </li>
                 ))}
               </ul>
             </div>
           ) : null}
           {status.error_details ? (
-            <pre>{JSON.stringify(status.error_details, null, 2)}</pre>
+            <pre>
+              {JSON.stringify(
+                safeDiagnosticValue(status.error_details),
+                null,
+                2,
+              )}
+            </pre>
           ) : null}
           {stageList
             .filter((stage) => stages[stage]?.reused)

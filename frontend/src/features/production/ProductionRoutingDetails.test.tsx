@@ -114,7 +114,8 @@ describe("ProductionRoutingDetails", () => {
           reason_code: "critical_source_inaccessible",
           sources: [
             routingSource({
-              source_url: "https://source.example/report?token=secret",
+              source_url:
+                "https://analyst:password@source.example/report?uri=CELEX%3A32024R1234&X-Amz-Signature=signed-secret&api_key=api-secret#fragment",
             }),
           ],
         })}
@@ -122,7 +123,9 @@ describe("ProductionRoutingDetails", () => {
     );
 
     const review = within(screen.getByRole("status"));
-    expect(review.getByText(/source\.example\/report/)).toBeInTheDocument();
+    expect(
+      review.getByText(/source\.example\/report\?uri=CELEX/),
+    ).toBeInTheDocument();
     expect(
       review.getByText(/CORE.*PRIMARY|PRIMARY.*CORE/i),
     ).toBeInTheDocument();
@@ -138,12 +141,18 @@ describe("ProductionRoutingDetails", () => {
     expect(
       review.getByText(/sources archivées.*empreintes.*historique/i),
     ).toBeInTheDocument();
-    expect(review.queryByText(/token=secret/)).toBeNull();
+    expect(
+      review.queryByText(/signed-secret|api-secret|password|fragment/),
+    ).toBeNull();
     expect(review.queryByRole("button")).toBeNull();
-    expect(review.getByRole("link")).toHaveAttribute(
-      "href",
-      "https://source.example/report",
-    );
+    const sourceLink = review.getByRole("link");
+    const safeUrl = new URL(sourceLink.getAttribute("href") ?? "");
+    expect(safeUrl.username).toBe("");
+    expect(safeUrl.password).toBe("");
+    expect(safeUrl.hash).toBe("");
+    expect(safeUrl.searchParams.get("uri")).toBe("CELEX:32024R1234");
+    expect(safeUrl.searchParams.get("X-Amz-Signature")).toBe("REDACTED");
+    expect(safeUrl.searchParams.get("api_key")).toBe("REDACTED");
 
     fireEvent.click(screen.getByText("Détail diagnostic"));
     expect(
@@ -174,6 +183,33 @@ describe("ProductionRoutingDetails", () => {
     expect(
       screen.getByText(/réacquérir ou remplacer la source/i),
     ).toBeInTheDocument();
+  });
+
+  it.each([
+    [
+      "provenance_mismatch",
+      /lignée.*artefact.*ne correspond pas.*instantané/i,
+      /relancez l’étape ou inspectez les artefacts.*rien n’a été publié/i,
+    ],
+    [
+      "incomplete_extraction",
+      /source d’extraction.*omise ou.*échoué/i,
+      /réextrayez ou réparez la source/i,
+    ],
+  ])("explique la cause et l’action pour %s", (reasonCode, cause, action) => {
+    render(
+      <ProductionRoutingDetails
+        routing={routing({
+          status: "needs_review",
+          publication_kind: null,
+          reason_code: reasonCode,
+        })}
+      />,
+    );
+
+    const review = within(screen.getByRole("status"));
+    expect(review.getByText(cause)).toBeInTheDocument();
+    expect(review.getByText(action)).toBeInTheDocument();
   });
 
   it("demande de vérifier la preuve d’une provenance alternative", () => {

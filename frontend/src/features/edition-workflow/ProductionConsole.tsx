@@ -203,7 +203,12 @@ function ItemError({ item }: { item: BatchItemDetail }) {
   return (
     <div className="production-item__error">
       <span>{item.error_message}</span>
-      {item.error_code ? <small>Code : {item.error_code}</small> : null}
+      {item.error_code ? (
+        <details>
+          <summary>Détail diagnostic</summary>
+          <small>Code : {item.error_code}</small>
+        </details>
+      ) : null}
     </div>
   );
 }
