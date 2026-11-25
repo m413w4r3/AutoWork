@@ -20,6 +20,12 @@ from pathlib import Path
 
 import httpx
 import pytest
+from sidecars.workspace_agent.sessions import supervisor as sessions_supervisor
+from sidecars.workspace_agent.sessions.fake_cli import (
+    SYNTHETIC_PROVIDER_CREDENTIAL,
+    write_scratch,
+)
+
 from tests.workspace_agent.conftest import BASE_URL
 from tests.workspace_agent.sessions_support import (
     CLOSE_KEY,
@@ -41,12 +47,6 @@ from tests.workspace_agent.sessions_support import (
     wait_for_state,
     workspace_files_containing,
     write_fake_script,
-)
-
-from sidecars.workspace_agent.sessions import supervisor as sessions_supervisor
-from sidecars.workspace_agent.sessions.fake_cli import (
-    SYNTHETIC_PROVIDER_CREDENTIAL,
-    write_scratch,
 )
 
 CLAUDE_CREDENTIAL = Path("config/home/.claude/.credentials.json")

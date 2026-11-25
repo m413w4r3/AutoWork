@@ -23,16 +23,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from tests.workspace_agent.sessions_support import (
-    SESSION_ID,
-    TASK_ID,
-    fake_script,
-    hang_script,
-    prepare_payload,
-    wait_until,
-)
-from tests.workspace_agent.w3_support import ScanEnvironment, make_scan_environment
-
 from sidecars.workspace_agent.sessions import process
 from sidecars.workspace_agent.sessions import supervisor as sessions_module
 from sidecars.workspace_agent.sessions.state import SessionState
@@ -44,6 +34,16 @@ from sidecars.workspace_agent.sessions.supervisor import (
     ReasonRequest,
     StartSessionRequest,
 )
+
+from tests.workspace_agent.sessions_support import (
+    SESSION_ID,
+    TASK_ID,
+    fake_script,
+    hang_script,
+    prepare_payload,
+    wait_until,
+)
+from tests.workspace_agent.w3_support import ScanEnvironment, make_scan_environment
 
 CLAUDE_CREDENTIAL = Path("config/home/.claude/.credentials.json")
 CODEX_AUTH = Path("config/codex/auth.json")
