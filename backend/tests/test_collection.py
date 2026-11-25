@@ -996,24 +996,124 @@ async def test_404_is_persisted_as_an_obsolete_url_diagnostic(tmp_path: Path) ->
     assert attempt.transport_classification is CollectionTransportClassification.HTTP
 
 
-async def test_403_is_a_blocked_access_diagnostic(tmp_path: Path) -> None:
+@pytest.mark.parametrize("status", [401, 403])
+async def test_401_and_403_are_blocked_without_archiving(
+    tmp_path: Path,
+    status: int,
+) -> None:
     url = "https://example.test/private.pdf"
     body = b"<!doctype html><html><body>Access denied</body></html>"
     factory, _app, source, state, attempt = await _run_one_attempt(
         url,
-        Transport([RawHttpResponse(403, {"content-type": "text/html"}, body)]),
+        Transport([RawHttpResponse(status, {"content-type": "text/html"}, body)]),
         tmp_path / "blobs",
     )
 
     assert state is CollectionState.BLOCKED
+    assert factory.collections[source.id].source_document_id is None
     assert (
         factory.collections[source.id].failure_reason_code is CollectionFailureReason.ACCESS_BLOCKED
     )
-    assert attempt.http_status == 403
+    assert attempt.http_status == status
     assert attempt.detected_content_type == "text/html"
     assert attempt.encoded_size == len(body)
     assert attempt.reason_code is CollectionFailureReason.ACCESS_BLOCKED
     assert attempt.transport_classification is CollectionTransportClassification.BLOCKED
+
+
+async def test_http_202_is_blocked_and_never_archived_as_the_requested_pdf(
+    tmp_path: Path,
+) -> None:
+    url = "https://example.test/document.pdf"
+    challenge = b"<!doctype html><html><body>Request accepted</body></html>"
+    factory, _app, source, state, attempt = await _run_one_attempt(
+        url,
+        Transport([RawHttpResponse(202, {"content-type": "text/html"}, challenge)]),
+        tmp_path / "blobs",
+    )
+
+    assert state is CollectionState.BLOCKED
+    assert factory.collections[source.id].source_document_id is None
+    assert (
+        factory.collections[source.id].failure_reason_code is CollectionFailureReason.ACCESS_BLOCKED
+    )
+    assert attempt.http_status == 202
+    assert attempt.final_url == url
+    assert attempt.redirect_chain == ()
+    assert attempt.detected_content_type == "text/html"
+    assert attempt.outcome.value == "blocked"
+    assert attempt.reason_code is CollectionFailureReason.ACCESS_BLOCKED
+    assert not [
+        blob
+        for blob in factory.blobs.values()
+        if blob.descriptor.logical_bucket == "source-raw"
+    ]
+
+
+async def test_last_redirect_location_is_persisted_without_query_or_fragment(
+    tmp_path: Path,
+) -> None:
+    requested_url = "http://example.test/report"
+    redirected_url = "https://www.example.test/report?signature=secret#section"
+    transport = Transport(
+        [
+            RawHttpResponse(302, {"location": redirected_url}, b""),
+            RawHttpResponse(200, {"content-type": "text/html"}, HTML),
+        ]
+    )
+    factory, _app, source, state, attempt = await _run_one_attempt(
+        requested_url,
+        transport,
+        tmp_path / "blobs",
+    )
+
+    assert state is CollectionState.ARCHIVED
+    assert factory.collections[source.id].source_document_id is not None
+    assert attempt.final_url == redirected_url
+    assert attempt.redirect_chain == (redirected_url,)
+    assert attempt.allowed_headers["location"] == "https://www.example.test/report"
+
+
+async def test_www_redirect_dns_failure_persists_location_without_url_rewriting(
+    tmp_path: Path,
+) -> None:
+    requested_url = "http://www.example.test/"
+    redirected_url = "https://www.www.example.test/?signature=secret#section"
+
+    class ResolverFailingOnRedirectHost:
+        def __init__(self) -> None:
+            self.hostnames: list[str] = []
+
+        async def resolve(self, hostname: str) -> Sequence[str]:
+            self.hostnames.append(hostname)
+            return (PUBLIC_IP,) if hostname == "www.example.test" else ()
+
+    resolver = ResolverFailingOnRedirectHost()
+    transport = Transport(
+        [RawHttpResponse(301, {"location": redirected_url}, b"")]
+    )
+    factory, _app, source, state, attempt = await _run_one_attempt(
+        requested_url,
+        transport,
+        tmp_path / "blobs",
+        resolver=resolver,
+    )
+
+    assert state is CollectionState.FAILED_RETRYABLE
+    assert factory.collections[source.id].source_document_id is None
+    assert attempt.reason_code is CollectionFailureReason.DNS_ERROR
+    assert attempt.transport_classification is CollectionTransportClassification.DNS
+    assert attempt.final_url == redirected_url
+    assert attempt.redirect_chain == (redirected_url,)
+    assert attempt.http_status == 301
+    assert attempt.allowed_headers == {"location": "https://www.www.example.test/"}
+    assert resolver.hostnames == [
+        "www.example.test",
+        "www.example.test",
+        "www.www.example.test",
+        "www.www.example.test",
+    ]
+    assert [request.url for request in transport.requests] == [requested_url]
 
 
 async def test_timeout_is_classified_separately_from_other_transport_failures(
