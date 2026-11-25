@@ -231,3 +231,76 @@ async def test_brief_with_an_eligible_publication_date_is_decided_and_synthesise
     assert run.status is ProductionRunStatus.READY
     assert _synthesis_calls(scenario)
     assert ProductionArtifactStage.PUBLICATION in _stages(artifacts)
+
+
+async def _fingerprint(scenario: ProductionScenario) -> dict[str, Any]:
+    """Everything a replay must leave byte-for-byte identical."""
+    assert scenario.run_id is not None
+    async with scenario.uow_factory() as uow:
+        run = await uow.production_runs.get(scenario.run_id)
+        assert run is not None
+        artifacts = list(await uow.production_artifacts.list_for_run(scenario.run_id))
+        decision = (
+            await uow.production_routing_decisions.get(run.routing_decision_id)
+            if run.routing_decision_id is not None
+            else None
+        )
+        provenance = list(await uow.provenance.list_for_aggregate("subject", scenario.subject.id))
+        collections = list(await uow.source_collections.list_for_subject(scenario.subject.id))
+        provenance += [
+            event
+            for collection in collections
+            for event in await uow.provenance.list_for_aggregate("source_collection", collection.id)
+        ]
+    return {
+        "status": run.status,
+        "generation": run.pipeline_generation,
+        "artifacts": sorted(
+            (
+                artifact.stage.value,
+                artifact.version,
+                artifact.status.value,
+                artifact.input_hash,
+                str(artifact.canonical_blob_id),
+            )
+            for artifact in artifacts
+        ),
+        "decision": (decision.decision_id, decision.decision_hash) if decision else None,
+        "provenance": sorted(str(event.id) for event in provenance),
+        "diagnostic_events": len(_diagnostic_events(scenario)),
+        "model_calls": len(scenario.model.calls),
+        "transport_requests": len(scenario.collection_transport.requests),
+    }
+
+
+@pytest.mark.asyncio
+async def test_redelivering_every_job_of_a_finished_run_changes_nothing(
+    production_scenario_factory: ScenarioFactory,
+) -> None:
+    """Replay and double finalisation: no new artifact, event, decision or external call."""
+    scenario = production_scenario_factory(_specs({S1: 200}, with_indicator=True))
+    scenario.model.script.references(_references((S1,)))
+    scenario.model.script.q2(source_url=S1, response=_q2_with_indicator(1))
+
+    await scenario.start()
+    run = await scenario.run_until_terminal()
+    assert run.status is ProductionRunStatus.READY
+    before = await _fingerprint(scenario)
+    # The comparison is only meaningful if the fingerprint actually captures history.
+    assert len(before["artifacts"]) >= len(ProductionArtifactStage)
+    assert before["provenance"]
+    assert before["diagnostic_events"] > 0
+    assert before["model_calls"] > 0
+    assert before["decision"] is not None
+
+    jobs = sorted(
+        await scenario.jobs.list_for_aggregate("subject", scenario.subject.id),
+        key=lambda job: (job.created_at, job.id),
+    )
+    assert jobs
+    for _ in range(2):
+        for job in jobs:
+            await scenario.runner.dispatch(job.id)
+    await scenario.runner.run_until_idle()
+
+    assert await _fingerprint(scenario) == before
