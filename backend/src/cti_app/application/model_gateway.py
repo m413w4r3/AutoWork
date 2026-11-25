@@ -787,6 +787,8 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                     await uow.model_runs.save(existing)
                     await uow.commit()
                 return existing
+            if existing.status is ModelRunStatus.SUCCEEDED and isinstance(recovery, dict):
+                raise ModelGatewayError("Recovered output conflicts with an existing adoption")
             allowed = {ModelRunStatus.NEEDS_REVIEW}
             if provenance in {"manual_import", "visible_recovery"}:
                 allowed |= {
@@ -802,6 +804,23 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
             run = await uow.model_runs.get_for_update(run_id)
             if run is None:
                 raise ModelGatewayError(f"Model run {run_id} does not exist")
+            if bridge_response_id and run.response_id and run.response_id != bridge_response_id:
+                raise ModelGatewayError("Recovered response identity does not match")
+            recovery = (run.error_details or {}).get("recovery")
+            if run.status is ModelRunStatus.SUCCEEDED and isinstance(recovery, dict):
+                if run.raw_output_sha256 != digest:
+                    raise ModelGatewayError("Recovered output conflicts with an existing adoption")
+                if recovery.get("provenance") != provenance or recovery.get(
+                    "source_model_run_id"
+                ) != (str(source_model_run_id) if source_model_run_id else None):
+                    raise ModelGatewayError("Recovered output conflicts with an existing adoption")
+                if bridge_response_id and run.response_id != bridge_response_id:
+                    if run.response_id is not None:
+                        raise ModelGatewayError("Recovered response identity does not match")
+                    run.response_id = bridge_response_id
+                    await uow.model_runs.save(run)
+                    await uow.commit()
+                return run
             run.adopt_recovery(
                 output_reference=reference,
                 output_sha256=digest,

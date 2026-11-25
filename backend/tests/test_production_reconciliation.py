@@ -14,6 +14,10 @@ from cti_app.application.production_reconciliation import (
     ProductionReconciliationService,
     _verified_external_turn_id,
 )
+from cti_app.application.production_reconciliation_resolver import (
+    ProductionReconciliationResolver,
+    ReconciliationOutcome,
+)
 from cti_app.domain.editions import EditionStatus
 from cti_app.domain.jobs import Job
 from cti_app.domain.model_runs import (
@@ -57,6 +61,12 @@ class _Models:
 
     async def get(self, run_id: UUID):
         return self.models.get(run_id)
+
+    async def get_for_update(self, run_id: UUID):
+        return await self.get(run_id)
+
+    async def save(self, model: ModelRun) -> None:
+        self.models[model.id] = model
 
 
 class _EditionRepo:
@@ -372,6 +382,52 @@ async def test_adoption_resumes_same_generation_and_repeats_idempotently(
     assert jobs.submissions == 1
     assert bridge.releases == 2
     assert len(jobs.jobs) == 1
+
+
+@pytest.mark.asyncio
+async def test_late_bridge_response_after_declare_lost_is_not_adopted(
+    fixture: ReconciliationFixture,
+) -> None:
+    service, uow, gateway, bridge, jobs = fixture
+    run = next(iter(uow.production_runs.runs.values()))
+    response = b"# recovered\n\nanswer"
+
+    class _LateResponseTransport:
+        calls = 0
+
+        async def retrieve(self, response_id: str):
+            self.calls += 1
+            assert response_id == "bridge-1"
+            return {
+                "id": response_id,
+                "status": "completed",
+                "output_text": response.decode(),
+            }
+
+    late_response = _LateResponseTransport()
+    resolver = ProductionReconciliationResolver(
+        lambda: uow,
+        transport=late_response,
+        model_gateway=gateway,  # type: ignore[arg-type]
+    )
+    assert await resolver.release_declared_lost(run.id, "operator confirmed lost") is (
+        ReconciliationOutcome.RELEASED
+    )
+
+    assert await resolver.resolve(run.id) is ReconciliationOutcome.UNDECIDED
+    with pytest.raises(ProductionReconciliationError) as error:
+        await service.adopt_visible(
+            run.id, hashlib.sha256(response).hexdigest(), actor_id="analyst"
+        )
+
+    assert error.value.code == "production_reconciliation_not_eligible"
+    assert late_response.calls == 0
+    assert gateway.model.status is ModelRunStatus.FAILED
+    assert gateway.model.error_code == "operator_abandoned"
+    assert gateway.model.raw_output_reference is None
+    assert gateway.adoptions == []
+    assert bridge.previews == 0
+    assert jobs.submissions == 0
 
 
 @pytest.mark.asyncio
