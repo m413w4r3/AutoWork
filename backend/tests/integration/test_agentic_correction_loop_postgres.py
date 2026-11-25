@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
@@ -70,7 +71,7 @@ def production_scenario_factory(
 
 class _CountingTypstCompiler(TypstSubprocessCompiler):
     def __init__(self) -> None:
-        super().__init__()
+        super().__init__(binary=os.environ.get("TYPST_BINARY", "typst"))
         self.compile_calls = 0
         self.query_calls = 0
 
