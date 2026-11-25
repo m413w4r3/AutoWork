@@ -70,7 +70,11 @@ def _dispatch_agent_file_write(
 ) -> tuple[object, Path, SimpleNamespace]:
     environment = make_scan_environment(tmp_path)
     task_note = f"notes/agents/{TASK_ID}/note.md"
-    record = SimpleNamespace(task_id=TASK_ID, state=SessionState.READY)
+    record = SimpleNamespace(
+        task_id=TASK_ID,
+        workspace_id=environment.descriptor.workspace_id,
+        state=SessionState.READY,
+    )
     handle = SimpleNamespace(
         record=record,
         lock=threading.RLock(),
@@ -81,6 +85,9 @@ def _dispatch_agent_file_write(
     supervisor = object.__new__(sessions_supervisor.SessionSupervisor)
     supervisor._sessions = {SESSION_ID: handle} if active else {}
     supervisor._lock = threading.RLock()
+    supervisor._workspace_write_condition = threading.Condition()
+    supervisor._workspace_write_gates = {}
+    supervisor._stopped = threading.Event()
     supervisor._revoke_secret_exposure = lambda target, **_kwargs: setattr(
         target.record, "state", SessionState.FAILED
     )
@@ -133,7 +140,11 @@ def _dispatch_non_ui_file_write(
     destination = destination_override or (
         "results/export-report.md" if generated else "notes/humaines/par-agent.md"
     )
-    record = SimpleNamespace(task_id=TASK_ID, state=SessionState.READY)
+    record = SimpleNamespace(
+        task_id=TASK_ID,
+        workspace_id=environment.descriptor.workspace_id,
+        state=SessionState.READY,
+    )
     handle = SimpleNamespace(
         record=record,
         lock=threading.RLock(),
@@ -146,13 +157,20 @@ def _dispatch_non_ui_file_write(
     if active:
         for index, secret in enumerate(additional_session_secrets):
             supervisor._sessions[f"session-other-{index}"] = SimpleNamespace(
-                record=SimpleNamespace(task_id=f"task-other-{index}", state=SessionState.READY),
+                record=SimpleNamespace(
+                    task_id=f"task-other-{index}",
+                    workspace_id=environment.descriptor.workspace_id,
+                    state=SessionState.READY,
+                ),
                 lock=threading.RLock(),
                 secret_forms=sessions_supervisor._secret_content_forms(secret),
                 provider_credential_forms=(),
                 directory=tmp_path,
             )
     supervisor._lock = threading.RLock()
+    supervisor._workspace_write_condition = threading.Condition()
+    supervisor._workspace_write_gates = {}
+    supervisor._stopped = threading.Event()
     supervisor._revoke_secret_exposure = lambda target, **_kwargs: setattr(
         target.record, "state", SessionState.FAILED
     )
@@ -562,7 +580,12 @@ def test_file_write_rechecks_secret_after_exposure_revocation(tmp_path: Path) ->
     supervisor._sessions = {SESSION_ID: handle}
     supervisor._lock = threading.RLock()
     supervisor._now = lambda: "synthetic-time"
-    supervisor._stop_channels = lambda target, *, wipe_secret: setattr(target, "secret_forms", ())
+
+    def stop_channels(target, *, wipe_secret, clear_forms=False) -> None:
+        if clear_forms:
+            target.secret_forms = ()
+
+    supervisor._stop_channels = stop_channels
     supervisor._persist = lambda *_args, **_kwargs: persisted.append(None)
 
     with pytest.raises(sessions_supervisor.SecretExposureError):

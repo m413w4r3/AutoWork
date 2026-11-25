@@ -83,6 +83,7 @@ class SessionError(Exception):
 
     code: ErrorCode = ErrorCode.INTERNAL_ERROR
     status: int = 500
+    retryable = False
 
     def __init__(self, message: str, *, details: Mapping[str, object] | None = None) -> None:
         super().__init__(message)
@@ -147,6 +148,43 @@ class SessionBusyError(SessionError):
     def __init__(self, session_id: str) -> None:
         super().__init__(
             "the session already has an active run", details={"session_id": session_id}
+        )
+
+
+class SessionWriteAdmissionError(SessionError):
+    code = ErrorCode.SESSION_STATE_CONFLICT
+    status = 409
+
+    def __init__(self, operation: str = "file_write", workspace_id: str | None = None) -> None:
+        details: dict[str, object] = {"operation": operation}
+        if workspace_id is not None:
+            details["workspace_id"] = workspace_id
+        super().__init__(
+            "the supervisor is stopped or the workspace is closing",
+            details=details,
+        )
+
+
+class SessionWriteDrainTimeoutError(SessionError):
+    code = ErrorCode.SESSION_BUSY
+    status = 409
+    retryable = True
+
+    def __init__(
+        self,
+        operation: str,
+        *,
+        workspace_id: str | None = None,
+        non_drained: Sequence[Mapping[str, str]] = (),
+    ) -> None:
+        details: dict[str, object] = {"operation": operation}
+        if workspace_id is not None:
+            details["workspace_id"] = workspace_id
+        if non_drained:
+            details["non_drained"] = [dict(item) for item in non_drained]
+        super().__init__(
+            "timed out waiting for admitted file writes",
+            details=details,
         )
 
 

@@ -23,6 +23,16 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from tests.workspace_agent.sessions_support import (
+    SESSION_ID,
+    TASK_ID,
+    fake_script,
+    hang_script,
+    prepare_payload,
+    wait_until,
+)
+from tests.workspace_agent.w3_support import ScanEnvironment, make_scan_environment
+
 from sidecars.workspace_agent.sessions import process
 from sidecars.workspace_agent.sessions import supervisor as sessions_module
 from sidecars.workspace_agent.sessions.state import SessionState
@@ -34,16 +44,6 @@ from sidecars.workspace_agent.sessions.supervisor import (
     ReasonRequest,
     StartSessionRequest,
 )
-
-from tests.workspace_agent.sessions_support import (
-    SESSION_ID,
-    TASK_ID,
-    fake_script,
-    hang_script,
-    prepare_payload,
-    wait_until,
-)
-from tests.workspace_agent.w3_support import ScanEnvironment, make_scan_environment
 
 CLAUDE_CREDENTIAL = Path("config/home/.claude/.credentials.json")
 CODEX_AUTH = Path("config/codex/auth.json")
@@ -257,6 +257,8 @@ def test_inactive_interrupt_removes_session_etc(tmp_path: Path) -> None:
     handle = SimpleNamespace(
         lock=threading.RLock(),
         record=SimpleNamespace(
+            session_id=SESSION_ID,
+            workspace_id="ws-inactive-interrupt",
             state=SessionState.AWAITING_INSTRUCTION,
             state_version=0,
             outcome=None,
@@ -269,6 +271,9 @@ def test_inactive_interrupt_removes_session_etc(tmp_path: Path) -> None:
         events=SimpleNamespace(append_event=lambda *_args, **_kwargs: None),
     )
     supervisor = object.__new__(sessions_module.SessionSupervisor)
+    supervisor._workspace_write_condition = threading.Condition()
+    supervisor._workspace_write_gates = {}
+    supervisor._stopped = threading.Event()
     supervisor._handle = lambda _session_id: handle
     supervisor._idempotency = SimpleNamespace(
         replay=lambda *_args: None,
@@ -296,6 +301,8 @@ def test_inactive_interrupt_removes_session_etc_when_credential_purge_raises(
     handle = SimpleNamespace(
         lock=threading.RLock(),
         record=SimpleNamespace(
+            session_id=SESSION_ID,
+            workspace_id="ws-inactive-interrupt",
             state=SessionState.AWAITING_INSTRUCTION,
             state_version=0,
             outcome=None,
@@ -308,6 +315,9 @@ def test_inactive_interrupt_removes_session_etc_when_credential_purge_raises(
         events=SimpleNamespace(append_event=lambda *_args, **_kwargs: None),
     )
     supervisor = object.__new__(sessions_module.SessionSupervisor)
+    supervisor._workspace_write_condition = threading.Condition()
+    supervisor._workspace_write_gates = {}
+    supervisor._stopped = threading.Event()
     supervisor._handle = lambda _session_id: handle
     supervisor._idempotency = SimpleNamespace(
         replay=lambda *_args: None,

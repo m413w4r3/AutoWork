@@ -202,6 +202,7 @@ def write_file(
     source: ByteSource,
     declared_length: int,
     idempotency_key: str,
+    non_ui_write_admission: Callable[[str], Callable[[], None]] | None = None,
     non_ui_content_check: Callable[[str | None, str, Callable[[], bytes]], None] | None = None,
     hooks: paths.WalkHooks | None = None,
 ) -> WriteOutcome:
@@ -227,61 +228,68 @@ def write_file(
     if declared_length > limit:
         raise FileSizeLimitError(limit)
 
-    workspace_fd = _open_workspace_directory(root, descriptor)
+    release_admission: Callable[[], None] | None = None
+    if validated_origin != "ui" and non_ui_write_admission is not None:
+        release_admission = non_ui_write_admission(descriptor.workspace_id)
     try:
-        # Agent note capture uses one private subtree per task. Unlike the
-        # static workspace layout, that subtree is created on demand; mirror
-        # the session collector's safe dirfd creation so a fresh task can use
-        # the same authorized file route without pre-seeding directories.
-        create_agent_note_parent = (
-            route is policies.WriteRoute.FILES
-            and validated_origin == "agent"
-            and policies.agent_task_id_for(path) is not None
-        )
-        parent_fd = _open_parent(
-            workspace_fd,
-            components,
-            hooks=hooks,
-            create=create_agent_note_parent,
-            mode=workspace.PRIVATE_DIRECTORY_MODE,
-        )
+        workspace_fd = _open_workspace_directory(root, descriptor)
         try:
-            temporary = _stream_to_temporary(parent_fd, components[-1], source, declared_length)
+            # Agent note capture uses one private subtree per task. Unlike the
+            # static workspace layout, that subtree is created on demand; mirror
+            # the session collector's safe dirfd creation so a fresh task can use
+            # the same authorized file route without pre-seeding directories.
+            create_agent_note_parent = (
+                route is policies.WriteRoute.FILES
+                and validated_origin == "agent"
+                and policies.agent_task_id_for(path) is not None
+            )
+            parent_fd = _open_parent(
+                workspace_fd,
+                components,
+                hooks=hooks,
+                create=create_agent_note_parent,
+                mode=workspace.PRIVATE_DIRECTORY_MODE,
+            )
             try:
-                if validated_origin != "ui" and non_ui_content_check is not None:
-                    cached_content: bytes | None = None
+                temporary = _stream_to_temporary(parent_fd, components[-1], source, declared_length)
+                try:
+                    if validated_origin != "ui" and non_ui_content_check is not None:
+                        cached_content: bytes | None = None
 
-                    def read_temporary() -> bytes:
-                        nonlocal cached_content
-                        if cached_content is None:
-                            cached_content = _read_temporary_bytes(parent_fd, temporary)
-                        return cached_content
+                        def read_temporary() -> bytes:
+                            nonlocal cached_content
+                            if cached_content is None:
+                                cached_content = _read_temporary_bytes(parent_fd, temporary)
+                            return cached_content
 
-                    non_ui_content_check(task_id, path, read_temporary)
-                return _commit_write(
-                    descriptor=descriptor,
-                    scans=scans,
-                    route=route,
-                    path=path,
-                    parent_fd=parent_fd,
-                    name=components[-1],
-                    expected=expected,
-                    origin=validated_origin,
-                    task_id=task_id,
-                    temporary=temporary,
-                    idempotency_key=idempotency_key,
-                )
+                        non_ui_content_check(task_id, path, read_temporary)
+                    return _commit_write(
+                        descriptor=descriptor,
+                        scans=scans,
+                        route=route,
+                        path=path,
+                        parent_fd=parent_fd,
+                        name=components[-1],
+                        expected=expected,
+                        origin=validated_origin,
+                        task_id=task_id,
+                        temporary=temporary,
+                        idempotency_key=idempotency_key,
+                    )
+                finally:
+                    if not temporary.closed:
+                        try:
+                            os.close(temporary.fd)
+                        except OSError:
+                            pass
+                    _unlink_quietly(parent_fd, temporary.name)
             finally:
-                if not temporary.closed:
-                    try:
-                        os.close(temporary.fd)
-                    except OSError:
-                        pass
-                _unlink_quietly(parent_fd, temporary.name)
+                os.close(parent_fd)
         finally:
-            os.close(parent_fd)
+            os.close(workspace_fd)
     finally:
-        os.close(workspace_fd)
+        if release_admission is not None:
+            release_admission()
 
 
 def _commit_write(
