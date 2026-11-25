@@ -10,7 +10,11 @@ from uuid import UUID, uuid4
 import pytest
 
 from cti_app.application.jobs import DuplicateJobError
-from cti_app.application.model_gateway import ModelGateway, ModelRouter
+from cti_app.application.model_gateway import (
+    ModelGateway,
+    ModelRecoveryDiscardedError,
+    ModelRouter,
+)
 from cti_app.application.production_reconciliation import (
     ProductionReconciliationError,
     ProductionReconciliationService,
@@ -138,6 +142,9 @@ class _OutputRejections:
 
     async def append(self, item: object) -> None:
         self.items.append(item)
+
+    async def list_for_run(self, run_id: UUID) -> list[object]:
+        return [item for item in self.items if getattr(item, "model_run_id", None) == run_id]
 
 
 class _Uow:
@@ -439,6 +446,51 @@ async def test_late_bridge_response_after_declare_lost_is_not_adopted(
     assert gateway.model.raw_output_reference is None
     assert gateway.adoptions == []
     assert bridge.previews == 0
+    assert jobs.submissions == 0
+
+
+@pytest.mark.asyncio
+async def test_automatic_reconciliation_stays_stable_when_model_run_was_declared_lost(
+    fixture: ReconciliationFixture,
+) -> None:
+    _service, uow, gateway, _bridge, jobs = fixture
+    run = next(iter(uow.production_runs.runs.values()))
+    gateway.model.abandon_uncertain_submission(actor_id="analyst", reason="operator confirmed lost")
+
+    class _LateResponseTransport:
+        calls = 0
+
+        async def retrieve(self, response_id: str):
+            self.calls += 1
+            assert response_id == "bridge-1"
+            return {
+                "id": response_id,
+                "status": "completed",
+                "output_text": "# recovered answer",
+            }
+
+    class _DiscardingGateway(_Gateway):
+        async def adopt_recovery_output(self, run_id: UUID, content: bytes, **kwargs: object):
+            del run_id, content, kwargs
+            raise ModelRecoveryDiscardedError("recovery was declared lost")
+
+    late_response = _LateResponseTransport()
+    discarding_gateway = _DiscardingGateway(gateway.model)
+    resolver = ProductionReconciliationResolver(
+        lambda: uow,
+        transport=late_response,
+        model_gateway=discarding_gateway,  # type: ignore[arg-type]
+    )
+
+    assert await resolver.resolve(run.id) is ReconciliationOutcome.DECLARED_LOST
+    assert await resolver.resolve(run.id) is ReconciliationOutcome.DECLARED_LOST
+
+    assert late_response.calls == 2
+    assert run.requires_reconciliation
+    assert gateway.model.status is ModelRunStatus.FAILED
+    assert gateway.model.error_code == "operator_abandoned"
+    assert gateway.model.raw_output_reference is None
+    assert gateway.model.raw_output_sha256 is None
     assert jobs.submissions == 0
 
 

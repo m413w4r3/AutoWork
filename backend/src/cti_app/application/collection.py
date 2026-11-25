@@ -4314,6 +4314,22 @@ def _fallback_setting_value(value: object) -> object:
     return f"{value_type.__module__}.{value_type.__qualname__}"
 
 
+def _fallback_strategy_setting_value(name: str, value: object) -> object:
+    setting_name = name.casefold()
+    if any(
+        part in setting_name for part in ("token", "key", "secret", "password", "authorization")
+    ):
+        return bool(value)
+    if isinstance(value, dict):
+        return {
+            str(key): _fallback_strategy_setting_value(str(key), item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_fallback_strategy_setting_value(name, item) for item in value]
+    return _fallback_setting_value(value)
+
+
 def _fallback_strategy_fingerprint(strategy: AcquisitionStrategy) -> dict[str, object]:
     output: dict[str, object] = {
         "name": str(strategy.name),
@@ -4331,7 +4347,7 @@ def _fallback_strategy_fingerprint(strategy: AcquisitionStrategy) -> dict[str, o
         ),
     }
     settings = {
-        name: _fallback_setting_value(getattr(strategy, name))
+        name: _fallback_strategy_setting_value(name, getattr(strategy, name))
         for name in _FALLBACK_STRATEGY_SETTING_NAMES
         if hasattr(strategy, name)
     }

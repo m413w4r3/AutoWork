@@ -18,6 +18,7 @@ from cti_app.api.collection import router
 from cti_app.application.acquisition_fallbacks import AcquisitionProbe, AcquisitionStrategy
 from cti_app.application.collection import (
     SubjectCollectionService,
+    _fallback_chain_effective_context_sha256,
     _FallbackAcquisition,
     register_collection_jobs,
 )
@@ -246,6 +247,17 @@ class FailedProbeStrategy:
                 duration_ms=4,
             ),
         )
+
+
+class CredentialFailedProbeStrategy(FailedProbeStrategy):
+    def __init__(self, provider_token: str | None) -> None:
+        self.provider_token = provider_token
+        self.headers = {
+            "X-API-Key": provider_token,
+            "client_secret": provider_token,
+            "password": provider_token,
+            "Authorization": f"Bearer {provider_token}" if provider_token else None,
+        }
 
 
 class BlockingFailedProbeStrategy(FailedProbeStrategy):
@@ -743,6 +755,34 @@ async def test_fallback_completion_marker_records_token_presence_never_the_crede
         for token in ("synthetic-first-token", "synthetic-second-token")
         for event in markers()
     )
+
+
+def test_fallback_strategy_fingerprint_tracks_credential_presence_only() -> None:
+    policy = AcquisitionPolicyContext(
+        allowed_domains=frozenset(),
+        blocked_domains=frozenset(),
+        external_llm_allowed=False,
+        tlp=TLP.CLEAR,
+        do_not_submit=False,
+        expected_languages=(),
+        allowed_syndication_domains=frozenset(),
+        third_party_provider_allowed=False,
+        provider_configured=False,
+    )
+
+    def fingerprint(provider_token: str | None) -> str:
+        return _fallback_chain_effective_context_sha256(
+            policy_snapshot_id="test-policy",
+            policy=policy,
+            strategies=(CredentialFailedProbeStrategy(provider_token),),
+            provider_settings={},
+            acquisition_deadline_seconds=30,
+            acquisition_max_attempts=2,
+            per_domain_concurrency=1,
+        )
+
+    assert fingerprint("synthetic-first-token") == fingerprint("synthetic-second-token")
+    assert fingerprint("synthetic-first-token") != fingerprint(None)
 
 
 @pytest.mark.asyncio
