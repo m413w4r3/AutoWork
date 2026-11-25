@@ -763,7 +763,7 @@ def test_decision_hash_and_id_are_deterministic_across_replays():
 
 def test_decision_hash_is_deterministic_across_source_order():
     extraction = _extraction(facts=("first",))
-    other_source = _source(source_id=uuid4(), facts=("second",))
+    other_source = _extraction(facts=("second",)).sources[0]
     extraction = replace(extraction, sources=(*extraction.sources, other_source))
     reordered = replace(extraction, sources=tuple(reversed(extraction.sources)))
     extraction_artifact = ProductionArtifact(

@@ -252,8 +252,8 @@ def _diagnostic_json(
     return [item.to_json() for item in diagnostics]
 
 
-def _diagnostic_sort_key(item: RoutingCriticalSourceDiagnosticV1) -> bytes:
-    return _canonical_json(item.to_json())
+def _diagnostic_sort_key(item: RoutingCriticalSourceDiagnosticV1) -> tuple[str, str, str]:
+    return (item.source_url, item.failure_code, item.source_id or "")
 
 
 def _artifact_identity(value: ProductionRoutingArtifactInputV1) -> dict[str, str | None]:
