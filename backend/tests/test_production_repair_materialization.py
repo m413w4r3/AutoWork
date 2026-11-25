@@ -93,11 +93,11 @@ def _feasible_brief_route(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, obj
 
     calls: list[dict[str, object]] = []
 
-    def feasible(**kwargs: object) -> BriefRoutingFeasibilityV1:
+    def feasible(**kwargs: object) -> tuple[BriefRoutingFeasibilityV1, None]:
         calls.append(kwargs)
-        return BriefRoutingFeasibilityV1(dated_entry_count=1)
+        return BriefRoutingFeasibilityV1(dated_entry_count=1), None
 
-    monkeypatch.setattr(repairs_module, "compute_brief_routing_feasibility", feasible)
+    monkeypatch.setattr(repairs_module, "brief_feasibility_for_routing", feasible)
     return calls
 
 

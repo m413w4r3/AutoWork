@@ -91,6 +91,45 @@ def compute_brief_routing_feasibility(
     )
 
 
+def brief_feasibility_for_routing(
+    *,
+    extraction: ProductionExtractionV1,
+    projection: RelevanceProjectionV1,
+    snapshot: ProductionInputSnapshot | None,
+) -> tuple[BriefRoutingFeasibilityV1, RoutingReasonCode | None]:
+    """Feasibility plus the lineage error to attach to the extraction input.
+
+    A snapshot that does not match the canonical extraction is a provenance error
+    (synthesis refuses it), never an absent snapshot; only a genuinely absent
+    snapshot keeps the source-dated-event behaviour.
+    """
+    if snapshot is not None and not _snapshot_matches_extraction(snapshot, extraction):
+        return (
+            BriefRoutingFeasibilityV1(
+                dated_entry_count=0,
+                reason="brief_feasibility_inputs_unavailable",
+                needs=("a production input snapshot matching the canonical extraction",),
+            ),
+            RoutingReasonCode.PROVENANCE_MISMATCH,
+        )
+    try:
+        return (
+            compute_brief_routing_feasibility(
+                extraction=extraction, projection=projection, snapshot=snapshot
+            ),
+            None,
+        )
+    except (KeyError, TypeError, ValueError):
+        return (
+            BriefRoutingFeasibilityV1(
+                dated_entry_count=0,
+                reason="brief_feasibility_inputs_unavailable",
+                needs=("verified extraction and relevance artifacts",),
+            ),
+            None,
+        )
+
+
 def _snapshot_matches_extraction(
     snapshot: ProductionInputSnapshot, extraction: ProductionExtractionV1
 ) -> bool:
