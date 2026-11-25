@@ -164,3 +164,19 @@ def test_event_index_never_holds_url_credentials_or_signed_parameters(tmp_path: 
     # The parameter that identifies the document is kept, so two sources stay distinguishable.
     assert "uri=CELEX%3A32026R0589" in raw
     assert "https://[REDACTED]@files.example/doc.pdf" in raw
+
+
+def test_event_index_redacts_fragment_parameters_and_nested_secret_fields(tmp_path: Path) -> None:
+    log = DiagnosticsLog(tmp_path)
+
+    log.record(
+        event="q1.supplemental_collection_failed",
+        run_id=uuid4(),
+        details={"token": "nested-secret", "password": "pw-nested", "kept": "visible"},
+        canonical_url="https://files.example/doc#access_token=frag-secret&page=2",
+    )
+
+    raw = (tmp_path / "events.jsonl").read_text(encoding="utf-8")
+    for secret in ("nested-secret", "pw-nested", "frag-secret"):
+        assert secret not in raw
+    assert "visible" in raw and "page=2" in raw

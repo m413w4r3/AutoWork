@@ -15,7 +15,7 @@ CORRELATION_HEADER = "X-Correlation-ID"
 _correlation_id: ContextVar[str] = ContextVar("correlation_id", default="-")
 _http_logger = logging.getLogger("cti_app.http")
 _SENSITIVE_QUERY_PARAMETER = re.compile(
-    r"(?i)([?&])((?:apikey|api_key|key|token|access_token|signature|sig|"
+    r"(?i)([?&#])((?:apikey|api_key|key|token|access_token|signature|sig|"
     r"x-amz-[a-z0-9_-]+|x-goog-[a-z0-9_-]+|expires))=([^&#\s\"'<>]*)"
 )
 _URL_USERINFO = re.compile(r"(?i)\b(https?://)[^/\s:@]+(?::[^/\s@]*)?@")
@@ -74,6 +74,12 @@ def _is_sensitive_header_name(value: Any) -> bool:
         "authorization",
         "x-apikey",
         "x-api-key",
+        "token",
+        "access_token",
+        "api_key",
+        "apikey",
+        "secret",
+        "password",
     }
 
 
