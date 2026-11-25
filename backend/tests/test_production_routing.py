@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from typing import cast
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from cti_app.application.production_routing import _projection_has_incomplete_coverage
 from cti_app.domain.collection import CollectionState, SourceAcquisitionMethod
@@ -48,8 +52,11 @@ from cti_app.domain.production_relevance import (
 from cti_app.domain.production_routing import (
     ROUTING_POLICY_VERSION,
     ProductionRoutingArtifactInputV1,
+    ProductionRoutingDecisionV1,
     RoutingCriticalSourceDiagnosticV1,
+    RoutingHumanWaiverPath,
     RoutingReasonCode,
+    RoutingRemainingControlCode,
     RoutingStatus,
     decide_publication_routing,
 )
@@ -61,6 +68,10 @@ from cti_app.domain.production_synthesis import (
 from cti_app.domain.publication import ArtifactType
 from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.subject_ioc_eligibility import is_subject_ioc_eligible
+from cti_app.infrastructure.database.repositories.production_routing import (
+    SqlAlchemyProductionRoutingDecisionRepository,
+    _decision_values,
+)
 
 RUN_ID = uuid4()
 SUBJECT_ID = uuid4()
@@ -536,6 +547,77 @@ def test_supporting_secondary_missing_source_does_not_block_routing():
 def test_historical_critical_source_missing_reason_still_deserializes():
     assert RoutingReasonCode("critical_source_missing") is RoutingReasonCode.CRITICAL_SOURCE_MISSING
     assert ROUTING_POLICY_VERSION == "subject-publication-routing-v3-routing-reasons-v1"
+
+
+def _routing_decision_with_expanded_source_diagnostic() -> ProductionRoutingDecisionV1:
+    extraction = _extraction()
+    diagnostic = RoutingCriticalSourceDiagnosticV1(
+        source_id="source-roundtrip",
+        source_url="https://source.example/report?token=private",
+        failure_code="extraction_source_text_unreadable",
+        tier=ProductionReferenceTier.CORE.value,
+        criticality=ProductionSourceCriticality.CRITICAL,
+        criticality_reason=ProductionSourceCriticalityReason.CORE_TIER.value,
+        policy_version=PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION,
+        editorial_role=ProductionEditorialRole.PRIMARY,
+        acquisition_method=SourceAcquisitionMethod.DIRECT_HTTP,
+        omission_collection_state=CollectionState.ARCHIVED,
+        omission_error_code="extraction_source_text_unreadable",
+        remaining_control_code=RoutingRemainingControlCode.HUMAN_REVIEW_REQUIRED,
+        human_waiver_path=RoutingHumanWaiverPath.NOT_CONSUMED_BY_ROUTING,
+    )
+    return cast(
+        ProductionRoutingDecisionV1,
+        _inputs(extraction, _projection(extraction), diagnostics=(diagnostic,)),
+    )
+
+
+async def _read_routing_row(row: SimpleNamespace) -> ProductionRoutingDecisionV1 | None:
+    session = AsyncMock()
+    session.get = AsyncMock(return_value=row)
+    repository = SqlAlchemyProductionRoutingDecisionRepository(cast(AsyncSession, session))
+    return await repository.get(row.id)
+
+
+@pytest.mark.asyncio
+async def test_routing_repository_reader_round_trips_expanded_diagnostics() -> None:
+    decision = _routing_decision_with_expanded_source_diagnostic()
+    persisted_row = SimpleNamespace(**_decision_values(decision))
+
+    hydrated = await _read_routing_row(persisted_row)
+
+    assert hydrated == decision
+
+
+@pytest.mark.asyncio
+async def test_routing_repository_reader_defaults_historical_diagnostic_fields() -> None:
+    decision = _routing_decision_with_expanded_source_diagnostic()
+    values = _decision_values(decision)
+    historical_diagnostic = dict(values["critical_source_diagnostics"][0])
+    for key in (
+        "editorial_role",
+        "acquisition_method",
+        "collection_state",
+        "error_code",
+        "remaining_control_code",
+        "human_waiver_path",
+    ):
+        del historical_diagnostic[key]
+    values["critical_source_diagnostics"] = [historical_diagnostic]
+    values["reason_code"] = RoutingReasonCode.CRITICAL_SOURCE_MISSING.value
+    historical_row = SimpleNamespace(**values)
+
+    hydrated = await _read_routing_row(historical_row)
+
+    assert hydrated is not None
+    assert hydrated.reason_code is RoutingReasonCode.CRITICAL_SOURCE_MISSING
+    diagnostic = hydrated.critical_source_diagnostics[0]
+    assert diagnostic.editorial_role is None
+    assert diagnostic.acquisition_method is None
+    assert diagnostic.omission_collection_state is None
+    assert diagnostic.omission_error_code is None
+    assert diagnostic.remaining_control_code is RoutingRemainingControlCode.HUMAN_REVIEW_REQUIRED
+    assert diagnostic.human_waiver_path is RoutingHumanWaiverPath.NOT_CONSUMED_BY_ROUTING
 
 
 def test_confirmed_subject_ioc_routes_article_despite_critical_source_omission():

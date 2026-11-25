@@ -15,11 +15,17 @@ from cti_app.application.persistence import (
     StaleProductionRoutingGenerationError,
     StaleProductionRunVersionError,
 )
-from cti_app.domain.production_references import ProductionSourceCriticality
+from cti_app.domain.collection import CollectionState, SourceAcquisitionMethod
+from cti_app.domain.production_references import (
+    ProductionEditorialRole,
+    ProductionSourceCriticality,
+)
 from cti_app.domain.production_routing import (
     ProductionRoutingDecisionV1,
     RoutingCriticalSourceDiagnosticV1,
+    RoutingHumanWaiverPath,
     RoutingReasonCode,
+    RoutingRemainingControlCode,
     RoutingStatus,
 )
 from cti_app.domain.publication_kind import PublicationKind
@@ -210,6 +216,34 @@ def _decision_from_row(row: ProductionRoutingDecisionRow) -> ProductionRoutingDe
             criticality=ProductionSourceCriticality(item["criticality"]),
             criticality_reason=item["criticality_reason"],
             policy_version=item["policy_version"],
+            editorial_role=(
+                ProductionEditorialRole(item["editorial_role"])
+                if item.get("editorial_role") is not None
+                else None
+            ),
+            acquisition_method=(
+                SourceAcquisitionMethod(item["acquisition_method"])
+                if item.get("acquisition_method") is not None
+                else None
+            ),
+            omission_collection_state=(
+                CollectionState(item["collection_state"])
+                if item.get("collection_state") is not None
+                else None
+            ),
+            omission_error_code=item.get("error_code"),
+            remaining_control_code=RoutingRemainingControlCode(
+                item.get(
+                    "remaining_control_code",
+                    RoutingRemainingControlCode.HUMAN_REVIEW_REQUIRED.value,
+                )
+            ),
+            human_waiver_path=RoutingHumanWaiverPath(
+                item.get(
+                    "human_waiver_path",
+                    RoutingHumanWaiverPath.NOT_CONSUMED_BY_ROUTING.value,
+                )
+            ),
         )
         for item in row.critical_source_diagnostics
     )

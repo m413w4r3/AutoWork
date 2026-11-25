@@ -36,7 +36,7 @@ from cti_app.application.production_state import (
 )
 from cti_app.application.subject_production import capture_production_input_snapshot
 from cti_app.domain.classification import TLP
-from cti_app.domain.collection import CollectionState
+from cti_app.domain.collection import CollectionState, SourceAcquisitionMethod
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.editions import EditionStatus
 from cti_app.domain.entities import Subject
@@ -63,7 +63,19 @@ from cti_app.domain.production_pipeline import (
     downstream_artifacts_from_artifact_stage,
     downstream_artifacts_from_pipeline_stage,
 )
-from cti_app.domain.production_routing import RoutingReasonCode, RoutingStatus
+from cti_app.domain.production_references import (
+    PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION,
+    ProductionEditorialRole,
+    ProductionSourceCriticality,
+    ProductionSourceCriticalityReason,
+)
+from cti_app.domain.production_routing import (
+    RoutingCriticalSourceDiagnosticV1,
+    RoutingHumanWaiverPath,
+    RoutingReasonCode,
+    RoutingRemainingControlCode,
+    RoutingStatus,
+)
 from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.selection import SubjectDiscoveryOrigin
 from cti_app.integrations.models import BridgeTransportError
@@ -1484,6 +1496,106 @@ async def test_routing_projection_is_additive_and_uses_the_run_decision_pointer(
     assert review_projection["status"] == "needs_review"
     assert review_projection["publication_kind"] is None
     assert review_projection["reason_code"] == "incomplete_extraction"
+
+
+@pytest.mark.parametrize(
+    ("reason_code", "acquisition_method", "collection_state", "error_code"),
+    (
+        (
+            RoutingReasonCode.CRITICAL_SOURCE_INACCESSIBLE,
+            None,
+            CollectionState.BLOCKED,
+            None,
+        ),
+        (
+            RoutingReasonCode.CRITICAL_SOURCE_UNREADABLE,
+            SourceAcquisitionMethod.DIRECT_HTTP,
+            CollectionState.ARCHIVED,
+            "extraction_source_text_unreadable",
+        ),
+        (
+            RoutingReasonCode.CRITICAL_SOURCE_ALTERNATIVE_PROVENANCE,
+            SourceAcquisitionMethod.WEB_ARCHIVE,
+            CollectionState.ARCHIVED,
+            None,
+        ),
+        (RoutingReasonCode.CRITICAL_SOURCE_MISSING, None, None, None),
+    ),
+)
+async def test_needs_review_routing_projection_exposes_safe_source_diagnostics(
+    api: AsyncClient,
+    uow: _Uow,
+    reason_code: RoutingReasonCode,
+    acquisition_method: SourceAcquisitionMethod | None,
+    collection_state: CollectionState | None,
+    error_code: str | None,
+) -> None:
+    edition_id, subject_id = uuid4(), uuid4()
+    _select(uow, edition_id, "Needs review", subject_id)
+    started = await _start_batch(api, edition_id, [subject_id])
+    assert started.status_code == 200, started.text
+    run = next(iter(uow.production_runs.items.values()))
+    decision_id = uuid4()
+    run.routing_decision_id = decision_id
+
+    diagnostic_fields: dict[str, Any] = {}
+    if reason_code is not RoutingReasonCode.CRITICAL_SOURCE_MISSING:
+        diagnostic_fields = {
+            "editorial_role": ProductionEditorialRole.PRIMARY,
+            "acquisition_method": acquisition_method,
+            "omission_collection_state": collection_state,
+            "omission_error_code": error_code,
+        }
+    diagnostic = RoutingCriticalSourceDiagnosticV1(
+        source_id="source-review",
+        source_url="https://user:secret@source.example/report?token=secret#fragment",
+        failure_code=reason_code.value,
+        tier="core",
+        criticality=ProductionSourceCriticality.CRITICAL,
+        criticality_reason=ProductionSourceCriticalityReason.CORE_TIER.value,
+        policy_version=PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION,
+        **diagnostic_fields,
+    )
+    uow.production_routing_decisions.items[decision_id] = SimpleNamespace(
+        status=RoutingStatus.NEEDS_REVIEW,
+        publication_kind=None,
+        reason_code=reason_code,
+        policy_version="subject-publication-routing-test-v1",
+        confirmed_ioc_count=0,
+        contextual_ioc_count=0,
+        ambiguous_ioc_count=0,
+        critical_source_diagnostics=(diagnostic,),
+    )
+
+    response = await api.get(f"/api/production/runs/{run.id}")
+
+    assert response.status_code == 200, response.text
+    routing = response.json()["routing"]
+    assert routing["status"] == "needs_review"
+    assert routing["reason_code"] == reason_code.value
+    assert routing["policy_version"] == "subject-publication-routing-test-v1"
+    assert routing["sources"] == [
+        {
+            "source_id": "source-review",
+            "source_url": "https://source.example/report",
+            "failure_code": reason_code.value,
+            "tier": "core",
+            "criticality": "critical",
+            "criticality_reason": "core_tier",
+            "policy_version": PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION,
+            "editorial_role": (
+                None
+                if reason_code is RoutingReasonCode.CRITICAL_SOURCE_MISSING
+                else ProductionEditorialRole.PRIMARY.value
+            ),
+            "acquisition_method": acquisition_method.value if acquisition_method else None,
+            "collection_state": collection_state.value if collection_state else None,
+            "error_code": error_code,
+            "remaining_control_code": RoutingRemainingControlCode.HUMAN_REVIEW_REQUIRED.value,
+            "human_waiver_path": RoutingHumanWaiverPath.NOT_CONSUMED_BY_ROUTING.value,
+        }
+    ]
+    assert "secret" not in json.dumps(routing)
 
 
 async def test_subject_status_exposes_extraction_rejections_with_a_200_entry_limit(
