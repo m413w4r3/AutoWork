@@ -1616,6 +1616,126 @@ def _corrective_grounding_violation(
     }
 
 
+def _corrective_proposal_preserves_untargeted_content(
+    initial: SynthesisProposalV1,
+    corrected: SynthesisProposalV1,
+    violations: Sequence[dict[str, str]],
+) -> bool:
+    """Check matching untargeted claims and source notes against the initial proposal."""
+
+    def claim_signatures(
+        proposal: SynthesisProposalV1,
+    ) -> tuple[dict[str, tuple[str, tuple[str, ...], str | None, str]], set[str]]:
+        signatures: dict[str, tuple[str, tuple[str, ...], str | None, str]] = {}
+        lead_ids: set[str] = set()
+        for claim in proposal.lead:
+            if claim._block_id is not None:
+                signatures[claim._block_id] = (
+                    claim.text,
+                    tuple(claim.evidence_handles),
+                    claim.claim_scope,
+                    "lead",
+                )
+                lead_ids.add(claim._block_id)
+        for section in proposal.sections:
+            for claim in section.claims:
+                if claim._block_id is not None:
+                    signatures[claim._block_id] = (
+                        claim.text,
+                        tuple(claim.evidence_handles),
+                        claim.claim_scope,
+                        section.kind.value,
+                    )
+        return signatures, lead_ids
+
+    initial_claims, initial_lead_ids = claim_signatures(initial)
+    corrected_claims, _ = claim_signatures(corrected)
+    initial_notes = {
+        note.source_alias: (note.text, tuple(note.evidence_handles))
+        for note in initial.source_notes
+    }
+    corrected_notes = {
+        note.source_alias: (note.text, tuple(note.evidence_handles))
+        for note in corrected.source_notes
+    }
+
+    initial_claim_ids = set(initial_claims)
+    initial_note_ids = set(initial_notes)
+    reported_claim_targets: set[str] = set()
+    reported_note_targets: set[str] = set()
+    has_unresolvable_target = not violations
+    has_article_structure_violation = False
+    for violation in violations:
+        has_article_structure_violation = has_article_structure_violation or str(
+            violation.get("reason", "")
+        ).startswith("article_structure:")
+        resolved_target = False
+        claim_id = violation.get("claim_id")
+        if claim_id is not None and claim_id in initial_claim_ids:
+            reported_claim_targets.add(claim_id)
+            resolved_target = True
+        block_id = violation.get("block_id")
+        if block_id is not None:
+            if block_id in initial_claim_ids:
+                reported_claim_targets.add(block_id)
+                resolved_target = True
+            if block_id in initial_note_ids:
+                reported_note_targets.add(block_id)
+                resolved_target = True
+        if "LEAD" in {claim_id, block_id} and initial_lead_ids:
+            reported_claim_targets.update(initial_lead_ids)
+            resolved_target = True
+        if not resolved_target:
+            has_unresolvable_target = True
+
+    # Structural failures can add or remove blocks, so compare common IDs but
+    # do not require equal shapes. A field-specific overview error exempts only
+    # that indexed field from content comparison.
+    if has_article_structure_violation:
+        overview_field_indexes = {
+            label[:-1].strip().casefold(): index
+            for index, label in enumerate(ARTICLE_SYNTHESIS_OVERVIEW_LABELS)
+        }
+        for violation in violations:
+            reason = str(violation.get("reason", ""))
+            field_match = re.fullmatch(
+                r"article_structure:overview_(?:field_missing|value_invalid):(.+)", reason
+            )
+            if field_match is None:
+                continue
+            field_index = overview_field_indexes.get(field_match.group(1))
+            if field_index is None:
+                continue
+            for proposal in (initial, corrected):
+                if proposal.sections and field_index < len(proposal.sections[0].claims):
+                    block_id = proposal.sections[0].claims[field_index]._block_id
+                    if block_id is not None:
+                        reported_claim_targets.add(block_id)
+
+    common_claim_ids = set(initial_claims) & set(corrected_claims)
+    for claim_id in common_claim_ids - reported_claim_targets:
+        if initial_claims[claim_id] != corrected_claims[claim_id]:
+            return False
+    common_note_ids = set(initial_notes) & set(corrected_notes)
+    for note_id in common_note_ids - reported_note_targets:
+        if initial_notes[note_id] != corrected_notes[note_id]:
+            return False
+
+    # When a violation has no resolvable ID (including structural or plain-text
+    # variants), added and removed blocks are not safely comparable. In that
+    # case enforce preservation only for matching IDs above.
+    if not has_unresolvable_target:
+        if (initial_claim_ids - reported_claim_targets) != (
+            set(corrected_claims) - reported_claim_targets
+        ):
+            return False
+        if (initial_note_ids - reported_note_targets) != (
+            set(corrected_notes) - reported_note_targets
+        ):
+            return False
+    return True
+
+
 def _build_synthesis_corrective_request(
     request: ModelRequest,
     error: SynthesisProposalControlError,
@@ -1823,7 +1943,7 @@ class _SynthesisCorrectiveContextTooLarge(ValueError):
 
 def _synthesis_corrective_parent_identity_error(
     request: ModelRequest, run: ModelRun, raw_text: str
-) -> str | None:
+) -> SynthesisStageErrorCode | None:
     """Require the verified first proposal to belong to the exact synthesis request."""
     if (
         request.run_id is None
@@ -1832,9 +1952,9 @@ def _synthesis_corrective_parent_identity_error(
         or run.prompt_template_version != request.prompt_template_version
         or run.evidence_pack_hash != request.evidence_pack_hash
     ):
-        return "synthesis_corrective_parent_identity_mismatch"
+        return SynthesisStageErrorCode.CORRECTIVE_PARENT_IDENTITY_MISMATCH
     if run.raw_output_sha256 != hashlib.sha256(raw_text.encode("utf-8")).hexdigest():
-        return "synthesis_corrective_parent_raw_output_hash_mismatch"
+        return SynthesisStageErrorCode.CORRECTIVE_PARENT_RAW_OUTPUT_HASH_MISMATCH
     return None
 
 
@@ -4195,6 +4315,12 @@ class SynthesisStageErrorCode(StrEnum):
     ARTIFACT_READ_LIMIT_EXCEEDED = "synthesis_artifact_read_limit_exceeded"
     ACCESS_POLICY_UNAVAILABLE = "synthesis_access_policy_unavailable"
     POLICY_BLOCKED = "synthesis_policy_blocked"
+    CORRECTION_CONTEXT_TOO_LARGE = "synthesis_correction_context_too_large"
+    CORRECTIVE_PARENT_IDENTITY_MISMATCH = "synthesis_corrective_parent_identity_mismatch"
+    CORRECTIVE_PARENT_RAW_OUTPUT_HASH_MISMATCH = (
+        "synthesis_corrective_parent_raw_output_hash_mismatch"
+    )
+    CORRECTION_CHANGED_UNTARGETED_CONTENT = "synthesis_correction_changed_untargeted_content"
     REUSE_INVALID = "synthesis_reuse_invalid"
     ROUTING_DECISION_STALE = PRODUCTION_ROUTING_DECISION_STALE_CODE
     MODEL_CALL_FAILED = "synthesis_model_call_failed"
@@ -5343,12 +5469,12 @@ class ProductionSynthesisService:
             )
             if parent_identity_error is not None:
                 return pre_submission_corrective_review(
-                    parent_identity_error,
+                    parent_identity_error.value,
                     "The initial synthesis run or archived response digest could not be "
                     "verified for correction; no corrective provider call was made.",
                     first_error=exc,
                     first_run=model_run,
-                    details={"error_code": parent_identity_error},
+                    details={"error_code": parent_identity_error.value},
                 )
             try:
                 corrective = _build_synthesis_corrective_request(
@@ -5359,7 +5485,7 @@ class ProductionSynthesisService:
                 )
             except _SynthesisCorrectiveContextTooLarge as too_large:
                 return pre_submission_corrective_review(
-                    "synthesis_correction_context_too_large",
+                    SynthesisStageErrorCode.CORRECTION_CONTEXT_TOO_LARGE.value,
                     "The complete corrective context exceeds its byte budget; no corrective "
                     "provider call was made.",
                     first_error=exc,
@@ -5394,7 +5520,7 @@ class ProductionSynthesisService:
                         "diagnostics": wire_diagnostics,
                     },
                 )
-            corrective_request, violation_fingerprint, _ = corrective
+            corrective_request, violation_fingerprint, correction_violations = corrective
             corrective_request_run_id = corrective_request.run_id
             if corrective_request_run_id is None:
                 raise AssertionError(
@@ -5637,6 +5763,34 @@ class ProductionSynthesisService:
                         "parse_error": corrective_parsed.error_code,
                         "rejections": corrective_rejections,
                         "diagnostics": corrective_diagnostics,
+                    },
+                    corrective_run=corrective_model_run,
+                )
+            if not _corrective_proposal_preserves_untargeted_content(
+                parsed.proposal,
+                corrective_parsed.proposal,
+                correction_violations,
+            ):
+                preservation_error = SynthesisStageErrorCode.CORRECTION_CHANGED_UNTARGETED_CONTENT
+                await self._record_wire_parse(
+                    corrective_model_run,
+                    evidence_pack,
+                    corrective_parsed,
+                    validation_error=preservation_error.value,
+                    prompt_version=prompt_version,
+                    publication_kind=publication_kind,
+                )
+                return corrective_review(
+                    preservation_error.value,
+                    "The corrective synthesis proposal changed content outside its "
+                    "reported validation targets.",
+                    first_error=first_error,
+                    first_run=first_model_run,
+                    corrective_run_id=corrective_model_run.id,
+                    second_reason=preservation_error.value,
+                    details={
+                        **self._model_evidence(corrective_model_run),
+                        "parse_identity": corrective_parse_identity,
                     },
                     corrective_run=corrective_model_run,
                 )
