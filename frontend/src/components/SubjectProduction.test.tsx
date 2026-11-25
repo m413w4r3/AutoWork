@@ -692,13 +692,22 @@ describe("SubjectProduction retry from stage", () => {
     expect(screen.getAllByText("Relancer depuis Assemblage")).toHaveLength(1);
   });
 
-  it("décrit une erreur provider par la réconciliation de la soumission", async () => {
+  it.each([
+    "bridge_timeout",
+    "bridge_server_error",
+    "bridge_ui_timeout",
+    "bridge_idle_timeout",
+    "bridge_total_timeout",
+    "conversation_unavailable",
+    "conversation_profile_mismatch",
+    "conversation_busy",
+  ])("décrit %s sans imposer une réconciliation", async (errorCode) => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
         Response.json({
           ...status("failed"),
-          error_code: "bridge_timeout",
+          error_code: errorCode,
         }),
       ),
     );
@@ -706,9 +715,33 @@ describe("SubjectProduction retry from stage", () => {
 
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent(
-      "la soumission du modèle doit être réconciliée avant de poursuivre",
+      "L’appel au modèle n’a pas abouti. Le système ne renvoie pas de lui-même une soumission dont l’état est incertain. Si un panneau de réconciliation apparaît, utilisez-le ; sinon, vous pouvez relancer l’étape sans risque.",
     );
+    expect(alert).not.toHaveTextContent("doit être réconciliée");
+    expect(alert).not.toHaveTextContent("Réconcilier");
     expect(alert).not.toHaveTextContent("conversation ChatGPT");
+  });
+
+  it("n’affiche pas comme lien une URL de source avec un schéma dangereux", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        Response.json({
+          ...status("needs_review"),
+          error_code: "extraction_core_source_failed",
+          error_details: {
+            source_document_id: CORE_DOCUMENT_ID,
+            canonical_url: "javascript:alert(1)",
+            source_failure_code: "extraction_source_output_invalid",
+          },
+        }),
+      ),
+    );
+    renderProduction();
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("URL non affichable");
+    expect(alert.querySelector('a[href^="javascript:"]')).toBeNull();
   });
 
   it("propose la récupération explicite sans afficher le retry générique", async () => {

@@ -14,6 +14,11 @@ import {
   type ReviewItem,
 } from "../../api/publication";
 import { Link } from "../../routing";
+import {
+  safeHttpHref,
+  sanitizeTextForDisplay,
+  sanitizeUrlForDisplay,
+} from "../../urlDisplay";
 import { RepairRulePanel } from "./RepairRulePanel";
 import { RepairSourcePanel } from "./RepairSourcePanel";
 import { RepairExecutionPlanView } from "./RepairExecutionPlan";
@@ -276,6 +281,8 @@ export function RepairIssueInspector({
   const reasonCode = currentDetail?.reason_code ?? item.reason_code;
   const sourceTitle = currentDetail?.source_title ?? item.source_title;
   const sourceUrl = currentDetail?.source_url ?? item.source_url;
+  const displaySourceUrl = sourceUrl ? sanitizeUrlForDisplay(sourceUrl) : null;
+  const sourceHref = sourceUrl ? safeHttpHref(sourceUrl) : null;
   const isRule = item.kind === "rejected_rule";
   const isCorrectable = item.kind === "rejected_indicator";
   // A rule body is rendered in full by RepairRulePanel, inside a bounded,
@@ -339,10 +346,14 @@ export function RepairIssueInspector({
           <dd>
             {item.source_id ?? "—"}
             {sourceTitle ? ` — ${sourceTitle}` : ""}
-            {sourceUrl ? (
-              <a href={sourceUrl} target="_blank" rel="noreferrer">
-                {sourceUrl}
-              </a>
+            {displaySourceUrl ? (
+              sourceHref ? (
+                <a href={sourceHref} target="_blank" rel="noreferrer">
+                  {displaySourceUrl}
+                </a>
+              ) : (
+                <span>{displaySourceUrl}</span>
+              )
             ) : null}
           </dd>
         </div>
@@ -439,7 +450,8 @@ export function RepairIssueInspector({
       {detail.isPending ? <p role="status">Chargement du détail…</p> : null}
       {detail.isError ? (
         <p className="error-message" role="alert">
-          Le détail de cet élément est inaccessible : {detail.error.message}
+          Le détail de cet élément est inaccessible :{" "}
+          {sanitizeTextForDisplay(detail.error.message)}
         </p>
       ) : null}
 
@@ -787,7 +799,7 @@ export function RepairIssueInspector({
 
       {error ? (
         <p className="error-message" role="alert">
-          {error}
+          {sanitizeTextForDisplay(error)}
         </p>
       ) : null}
       <p className="repair-inspector__pipeline-link">

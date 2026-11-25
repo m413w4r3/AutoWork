@@ -80,6 +80,15 @@ export function productionIssueMessage(
       return "L’empreinte de la sortie brute du run initial n’a pas pu être vérifiée ; aucun appel correctif n’a été envoyé. Une relance ouvre une nouvelle génération et peut déclencher un nouvel appel modèle facturable.";
     case "model_submission_reconciliation_required":
       return "La soumission du modèle doit être réconciliée avant de poursuivre.";
+    case "bridge_timeout":
+    case "bridge_server_error":
+    case "bridge_ui_timeout":
+    case "bridge_idle_timeout":
+    case "bridge_total_timeout":
+    case "conversation_unavailable":
+    case "conversation_profile_mismatch":
+    case "conversation_busy":
+      return "L’appel au modèle n’a pas abouti. Le système ne renvoie pas de lui-même une soumission dont l’état est incertain. Si un panneau de réconciliation apparaît, utilisez-le ; sinon, vous pouvez relancer l’étape sans risque.";
     default:
       return null;
   }

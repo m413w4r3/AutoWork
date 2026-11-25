@@ -4,6 +4,7 @@ import type {
   ExtractionProgressSource,
   ExtractionProgressSourceStatus,
 } from "../api/production";
+import { sanitizeTextForDisplay } from "../urlDisplay";
 
 const PROFILE_LABELS: Record<ExtractionProgressProfile, string> = {
   full: "FULL",
@@ -90,7 +91,11 @@ export function ExtractionProgressView({
         {progress.sources.map((source) => (
           <li key={source.source_id} className={`is-${source.status}`}>
             <span aria-hidden="true">{SOURCE_STATUS_ICONS[source.status]}</span>
-            <span>{source.title?.trim() || source.canonical_url}</span>
+            <span>
+              {sanitizeTextForDisplay(
+                source.title?.trim() || source.canonical_url,
+              )}
+            </span>
             <span>
               {TIER_LABELS[source.tier]}
               {source.profile ? ` · ${PROFILE_LABELS[source.profile]}` : ""}
@@ -110,7 +115,7 @@ export function ExtractionProgressView({
                 <progress
                   max={source.chunks_total}
                   value={Math.min(source.chunks_done ?? 0, source.chunks_total)}
-                  aria-label={`Tranches terminées pour ${source.title?.trim() || source.canonical_url}`}
+                  aria-label={`Tranches terminées pour ${sanitizeTextForDisplay(source.title?.trim() || source.canonical_url)}`}
                 />
                 <span>
                   {source.chunks_done ?? 0} / {source.chunks_total} tranches

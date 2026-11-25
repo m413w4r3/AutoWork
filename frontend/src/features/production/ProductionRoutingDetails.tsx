@@ -2,7 +2,7 @@ import type {
   ProductionRoutingProjection,
   ProductionRoutingSource,
 } from "../../api/production";
-import { sanitizeUrlForDisplay } from "../../urlDisplay";
+import { safeHttpHref, sanitizeUrlForDisplay } from "../../urlDisplay";
 
 function formatLabel(routing: ProductionRoutingProjection | undefined): string {
   if (!routing || routing.status === "not_yet") return "à déterminer";
@@ -27,15 +27,20 @@ function extractionLabel(
   }
 }
 
-function sourceLink(sourceUrl: string): { href: string; label: string } {
-  const href = sanitizeUrlForDisplay(sourceUrl);
+function sourceLink(sourceUrl: string): {
+  href: string | null;
+  label: string;
+} {
+  const href = safeHttpHref(sourceUrl);
+  const displayUrl = sanitizeUrlForDisplay(sourceUrl);
+  if (!href) return { href: null, label: displayUrl };
   try {
     const url = new URL(href);
     return { href, label: `${url.host}${url.pathname}${url.search}` };
   } catch {
     return {
       href,
-      label: href.replace(/^https?:\/\//i, ""),
+      label: displayUrl.replace(/^https?:\/\//i, ""),
     };
   }
 }
@@ -169,28 +174,44 @@ function reviewCause(reasonCode: string | null): string {
       return "La lignée de l’artefact ne correspond pas à celle de l’instantané.";
     case "incomplete_extraction":
       return "Une source d’extraction a été omise ou a échoué sans diagnostic critique.";
+    case "missing_extraction_artifact":
+      return "L’artefact de l’étape Extraction est manquant.";
+    case "invalid_extraction_artifact":
+      return "L’artefact de l’étape Extraction est invalide ou obsolète.";
+    case "missing_relevance_artifact":
+      return "L’artefact de l’étape Périmètre des preuves est manquant.";
+    case "invalid_relevance_artifact":
+      return "L’artefact de l’étape Périmètre des preuves est invalide ou obsolète.";
+    case "incomplete_projection":
+      return "L’artefact de l’étape Périmètre des preuves est incomplet ou obsolète.";
     default:
       return "Le routage nécessite une vérification.";
   }
 }
 
-function actionForReason(reasonCode: string | null): string | null {
+function actionForReason(reasonCode: string | null): string {
   switch (reasonCode) {
     case "critical_source_inaccessible":
     case "critical_source_unreadable":
-      return "Action disponible : réacquérir ou remplacer la source.";
+      return "Dans l’onglet Pipeline, étape Sources : réacquérir ou remplacer la source.";
     case "critical_source_alternative_provenance":
-      return "Action disponible : examiner le justificatif ou la preuve d’acquisition.";
+      return "Dans l’onglet Revue, section Revue technique : examiner le justificatif ou la preuve d’acquisition.";
     case "brief_evidence_chronology_missing":
-      return "Action disponible : une acquisition datée est nécessaire pour les sources CORE/PRIMARY listées.";
+      return "Dans l’onglet Pipeline, étape Sources : une acquisition datée est nécessaire pour les sources CORE/PRIMARY listées.";
     case "critical_source_missing":
-      return "Vérifiez la source critique dans les archives et réacquérez-la si nécessaire.";
+      return "Dans l’onglet Pipeline, étape Sources, vérifiez les archives et réacquérez la source si nécessaire.";
     case "provenance_mismatch":
-      return "Relancez l’étape ou inspectez les artefacts ; rien n’a été publié.";
+      return "Dans l’onglet Pipeline, relancez Extraction puis Périmètre des preuves ; rien n’a été publié.";
     case "incomplete_extraction":
-      return "Réextrayez ou réparez la source omise ou en échec.";
+    case "missing_extraction_artifact":
+    case "invalid_extraction_artifact":
+      return "Relancez l’étape Extraction dans l’onglet Pipeline ; rien n’a été publié.";
+    case "missing_relevance_artifact":
+    case "invalid_relevance_artifact":
+    case "incomplete_projection":
+      return "Relancez l’étape Périmètre des preuves dans l’onglet Pipeline ; rien n’a été publié.";
     default:
-      return null;
+      return "Ouvrez l’onglet Pipeline pour examiner ce motif avant de poursuivre.";
   }
 }
 
@@ -208,10 +229,14 @@ function ProductionRoutingSourceList({
       {sources.map((source, index) => {
         const link = sourceLink(source.source_url);
         return (
-          <li key={`${source.source_id ?? link.href}-${index}`}>
-            <a href={link.href} rel="noreferrer" target="_blank">
-              {link.label}
-            </a>
+          <li key={`${source.source_id ?? link.href ?? link.label}-${index}`}>
+            {link.href ? (
+              <a href={link.href} rel="noreferrer" target="_blank">
+                {link.label}
+              </a>
+            ) : (
+              link.label
+            )}
             {" — Rôle/tier : "}
             {sourceRoleAndTier(source)}
             {" — État : "}
@@ -238,17 +263,19 @@ function RoutingReview({ routing }: { routing: ProductionRoutingProjection }) {
     reasonCode === "brief_evidence_chronology_missing"
       ? []
       : routing.sources.filter((source) => !isBlockingSource(source));
-  const action =
-    reasonCode === "brief_evidence_chronology_missing" &&
-    chronologySources.length === 0
-      ? null
-      : actionForReason(reasonCode);
+  const action = actionForReason(reasonCode);
   const hasRecomputeGuidance =
     reasonCode === "critical_source_inaccessible" ||
     reasonCode === "critical_source_unreadable" ||
     reasonCode === "critical_source_alternative_provenance" ||
     reasonCode === "brief_evidence_chronology_missing" ||
-    reasonCode === "critical_source_missing";
+    reasonCode === "critical_source_missing" ||
+    reasonCode === "incomplete_extraction" ||
+    reasonCode === "missing_extraction_artifact" ||
+    reasonCode === "invalid_extraction_artifact" ||
+    reasonCode === "missing_relevance_artifact" ||
+    reasonCode === "invalid_relevance_artifact" ||
+    reasonCode === "incomplete_projection";
 
   return (
     <div className="production-routing__review" role="status">
@@ -365,10 +392,16 @@ export function ProductionRoutingDetails({
                   {routing.sources.map((source, index) => {
                     const link = sourceLink(source.source_url);
                     return (
-                      <li key={`${source.source_id ?? link.href}-${index}`}>
-                        <a href={link.href} rel="noreferrer" target="_blank">
-                          {link.label}
-                        </a>
+                      <li
+                        key={`${source.source_id ?? link.href ?? link.label}-${index}`}
+                      >
+                        {link.href ? (
+                          <a href={link.href} rel="noreferrer" target="_blank">
+                            {link.label}
+                          </a>
+                        ) : (
+                          link.label
+                        )}
                         <p>
                           {source.source_id
                             ? `Source : ${source.source_id} · `

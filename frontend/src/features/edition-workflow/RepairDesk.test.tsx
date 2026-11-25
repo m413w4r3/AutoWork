@@ -502,7 +502,7 @@ describe("Repair Desk", () => {
   });
 
   it("affiche le résumé, filtre localement et ouvre l’inspecteur", async () => {
-    const ioc = repairItem();
+    const ioc = repairItem({ source_url: "javascript:alert(1)" });
     const source = repairItem({
       repair_key: "source-1",
       kind: "supplemental_source_unarchived",
@@ -541,11 +541,11 @@ describe("Repair Desk", () => {
     expect(
       await screen.findByRole("heading", { name: "Article audit" }),
     ).toBeInTheDocument();
+    const inspector = screen.getByRole("region", { name: "Article audit" });
+    expect(inspector).toHaveTextContent("URL non affichable");
+    expect(inspector.querySelector('a[href^="javascript:"]')).toBeNull();
     expect(
-      screen.getByRole("link", { name: "https://source.example/report" }),
-    ).toBeInTheDocument();
-    expect(
-      within(screen.getByRole("region", { name: "Article audit" })).getByText(
+      within(inspector).getByText(
         "La valeur n'a pas pu être vérifiée dans le texte archivé.",
       ),
     ).toBeInTheDocument();
@@ -712,7 +712,7 @@ describe("Repair Desk", () => {
       artifact_id: "artifact-source-1",
       source_id: "Q1",
       source_title: "Source proposée",
-      source_url: "https://source.example/blocked",
+      source_url: "javascript:alert(1)",
       preview: "https://source.example/blocked",
       reason_code: "supplemental_source_unarchived",
       collection_id: "collection-1",
@@ -730,11 +730,8 @@ describe("Repair Desk", () => {
     const sourcePanel = screen.getByRole("region", {
       name: "Source proposée par Q1",
     });
-    expect(
-      within(sourcePanel).getByRole("link", {
-        name: "https://source.example/blocked",
-      }),
-    ).toBeInTheDocument();
+    expect(sourcePanel).toHaveTextContent("URL non affichable");
+    expect(sourcePanel.querySelector('a[href^="javascript:"]')).toBeNull();
     await user.type(
       screen.getByLabelText("Coller le contenu"),
       "<html>source</html>",
