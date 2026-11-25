@@ -1170,6 +1170,79 @@ async def test_dns_and_tls_failures_keep_distinct_transport_classifications(
     assert tls_attempt.transport_classification is CollectionTransportClassification.TLS
 
 
+@pytest.mark.parametrize(
+    ("reason_code", "transport_classification"),
+    [
+        (CollectionFailureReason.DNS_ERROR, CollectionTransportClassification.DNS),
+        (CollectionFailureReason.TIMEOUT, CollectionTransportClassification.TIMEOUT),
+    ],
+)
+async def test_fetch_level_dns_and_timeout_retries_exhaust_after_three_attempts(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    reason_code: CollectionFailureReason,
+    transport_classification: CollectionTransportClassification,
+) -> None:
+    class TestResolver:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def resolve(self, hostname: str) -> Sequence[str]:
+            del hostname
+            self.calls += 1
+            if reason_code is CollectionFailureReason.DNS_ERROR:
+                raise OSError("offline fake DNS failure")
+            return (PUBLIC_IP,)
+
+    class TimeoutTransport:
+        def __init__(self) -> None:
+            self.requests: list[PinnedHttpRequest] = []
+
+        async def request(self, request: PinnedHttpRequest) -> RawHttpResponse:
+            self.requests.append(request)
+            raise DownloadTransientError(
+                "offline fake transient failure",
+                reason_code=reason_code,
+                transport_classification=transport_classification,
+            )
+
+    resolver = TestResolver()
+    transport = TimeoutTransport()
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(factory, ("https://retry.example/report",))
+    app = SubjectCollectionService(
+        factory,
+        SafeHttpCollector(transport, resolver),
+        FilesystemBlobStore(tmp_path / "retry-blobs"),
+    )
+    source = (await app.initialize(subject.id))[0]
+
+    for attempt_number in range(3):
+        assert await app.archive_one(source.id, uuid4()) is CollectionState.FAILED_RETRYABLE
+        if attempt_number < 2:
+            await app.prepare_retry(source.id)
+
+    attempts_before_exhaustion = await app.attempts(source.id)
+    assert len(attempts_before_exhaustion) == 3
+    assert attempts_before_exhaustion[-1].reason_code is reason_code
+    resolver_calls_before_exhaustion = resolver.calls
+    transport_calls_before_exhaustion = len(transport.requests)
+
+    caplog.clear()
+    terminal = await app.prepare_retry(source.id)
+
+    assert terminal.state is CollectionState.FAILED_TERMINAL
+    assert terminal.failure_reason_code is reason_code
+    assert terminal.error_reason == attempts_before_exhaustion[-1].failure_reason
+    assert len(await app.attempts(source.id)) == 3
+    assert resolver.calls == resolver_calls_before_exhaustion
+    assert len(transport.requests) == transport_calls_before_exhaustion
+    assert any(
+        getattr(record, "event", None) == "source.collection.retry_exhausted"
+        for record in caplog.records
+    )
+
+
 async def test_html_served_for_pdf_url_is_archived_with_non_pdf_reason(tmp_path: Path) -> None:
     url = "https://example.test/advisory.pdf"
     body = b"<!doctype html><html><body>Temporary page</body></html>"
