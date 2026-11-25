@@ -219,6 +219,15 @@ describe("ProductionRoutingDetails", () => {
               source_url: "https://two.example/report",
               failure_code: "brief_chronology_source_undated",
             }),
+            routingSource({
+              source_id: "unrelated-source",
+              source_url: "https://unrelated.example/report",
+              failure_code: "source_event_not_relevant",
+              tier: "secondary",
+              criticality: "non_critical",
+              editorial_role: "contextual",
+              remaining_control_code: "no_routing_block",
+            }),
           ],
         })}
       />,
@@ -230,8 +239,77 @@ describe("ProductionRoutingDetails", () => {
     ).toBeInTheDocument();
     expect(review.getByText(/one\.example\/report/)).toBeInTheDocument();
     expect(review.getByText(/two\.example\/report/)).toBeInTheDocument();
+    expect(review.queryByText(/unrelated\.example\/report/)).toBeNull();
     expect(
       screen.getByText(/acquisition datée est nécessaire/i),
+    ).toBeInTheDocument();
+    expect(review.queryByText(/brief_chronology_source_undated/)).toBeNull();
+    fireEvent.click(screen.getByText("Détail diagnostic"));
+    expect(screen.getAllByText("brief_chronology_source_undated")).toHaveLength(
+      2,
+    );
+  });
+
+  it("n’invente pas de source bloquante lorsque les événements ne donnent pas de chronologie admissible", () => {
+    render(
+      <ProductionRoutingDetails
+        routing={routing({
+          status: "needs_review",
+          publication_kind: null,
+          reason_code: "brief_evidence_chronology_missing",
+          sources: [
+            routingSource({
+              source_id: "dated-but-ineligible",
+              source_url: "https://dated-but-ineligible.example/report",
+              failure_code: "source_event_not_relevant",
+            }),
+          ],
+        })}
+      />,
+    );
+
+    const review = within(screen.getByRole("status"));
+    expect(
+      review.getByText(/événements extraits.*chronologie datée admissible/i),
+    ).toBeInTheDocument();
+    expect(
+      review.getByText(
+        /date vérifiée peut exister.*événement.*pas admissible pour la brève/i,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      review.getByText(
+        /acquisition de source datée.*date de publication admissible/i,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      review.queryByText(/dated-but-ineligible\.example\/report/),
+    ).toBeNull();
+    expect(
+      review.queryByText(/aucune date vérifiée n’est disponible/i),
+    ).toBeNull();
+  });
+
+  it("conserve le diagnostic des sources pour les autres motifs de routage", () => {
+    render(
+      <ProductionRoutingDetails
+        routing={routing({
+          status: "needs_review",
+          publication_kind: null,
+          reason_code: "critical_source_inaccessible",
+          sources: [
+            routingSource({
+              source_url: "https://critical.example/report",
+            }),
+          ],
+        })}
+      />,
+    );
+
+    const review = within(screen.getByRole("status"));
+    expect(review.getByText(/critical\.example\/report/)).toBeInTheDocument();
+    expect(
+      review.getByText(/bloquée par le site distant \(403\)/i),
     ).toBeInTheDocument();
   });
 

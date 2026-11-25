@@ -166,7 +166,7 @@ function reviewCause(reasonCode: string | null): string {
     case "critical_source_alternative_provenance":
       return "La provenance alternative d’une source critique doit être vérifiée.";
     case "brief_evidence_chronology_missing":
-      return "La chronologie de la brève ne peut pas être établie sans dates vérifiées.";
+      return "La chronologie de la brève ne peut pas être établie à partir des événements extraits.";
     case "critical_source_missing":
       return "Source critique manquante ou non lisible (décision antérieure).";
     default:
@@ -228,14 +228,17 @@ function RoutingReview({ routing }: { routing: ProductionRoutingProjection }) {
   );
   const blockingSources =
     reasonCode === "brief_evidence_chronology_missing"
-      ? chronologySources.length > 0
-        ? chronologySources
-        : routing.sources
+      ? chronologySources
       : routing.sources.filter(isBlockingSource);
-  const warningSources = routing.sources.filter(
-    (source) => !isBlockingSource(source),
-  );
-  const action = actionForReason(reasonCode);
+  const warningSources =
+    reasonCode === "brief_evidence_chronology_missing"
+      ? []
+      : routing.sources.filter((source) => !isBlockingSource(source));
+  const action =
+    reasonCode === "brief_evidence_chronology_missing" &&
+    chronologySources.length === 0
+      ? null
+      : actionForReason(reasonCode);
   const hasRecomputeGuidance =
     reasonCode === "critical_source_inaccessible" ||
     reasonCode === "critical_source_unreadable" ||
@@ -249,9 +252,27 @@ function RoutingReview({ routing }: { routing: ProductionRoutingProjection }) {
         <strong>Routage bloqué</strong> — {reviewCause(reasonCode)}
       </p>
       {reasonCode === "brief_evidence_chronology_missing" ? (
-        <p>
-          Aucune date vérifiée n’est disponible pour ces sources CORE/PRIMARY :
-        </p>
+        chronologySources.length > 0 ? (
+          <p>
+            Aucune date vérifiée n’est disponible pour ces sources CORE/PRIMARY
+            :
+          </p>
+        ) : (
+          <>
+            <p>
+              Les événements extraits ne permettent pas d’établir une
+              chronologie datée admissible.
+            </p>
+            <p>
+              Une date vérifiée peut exister, mais l’événement correspondant
+              n’est pas admissible pour la brève.
+            </p>
+            <p>
+              Une acquisition de source datée ou une date de publication
+              admissible est nécessaire.
+            </p>
+          </>
+        )
       ) : null}
       {blockingSources.length ? (
         <ProductionRoutingSourceList
