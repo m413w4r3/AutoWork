@@ -114,7 +114,8 @@ describe("ProductionRoutingDetails", () => {
           reason_code: "critical_source_inaccessible",
           sources: [
             routingSource({
-              source_url: "https://source.example/report?token=secret",
+              source_url:
+                "https://analyst:password@source.example/report?uri=CELEX%3A32024R1234&X-Amz-Signature=signed-secret&api_key=api-secret#fragment",
             }),
           ],
         })}
@@ -122,7 +123,9 @@ describe("ProductionRoutingDetails", () => {
     );
 
     const review = within(screen.getByRole("status"));
-    expect(review.getByText(/source\.example\/report/)).toBeInTheDocument();
+    expect(
+      review.getByText(/source\.example\/report\?uri=CELEX/),
+    ).toBeInTheDocument();
     expect(
       review.getByText(/CORE.*PRIMARY|PRIMARY.*CORE/i),
     ).toBeInTheDocument();
@@ -138,12 +141,18 @@ describe("ProductionRoutingDetails", () => {
     expect(
       review.getByText(/sources archivées.*empreintes.*historique/i),
     ).toBeInTheDocument();
-    expect(review.queryByText(/token=secret/)).toBeNull();
+    expect(
+      review.queryByText(/signed-secret|api-secret|password|fragment/),
+    ).toBeNull();
     expect(review.queryByRole("button")).toBeNull();
-    expect(review.getByRole("link")).toHaveAttribute(
-      "href",
-      "https://source.example/report",
-    );
+    const sourceLink = review.getByRole("link");
+    const safeUrl = new URL(sourceLink.getAttribute("href") ?? "");
+    expect(safeUrl.username).toBe("");
+    expect(safeUrl.password).toBe("");
+    expect(safeUrl.hash).toBe("");
+    expect(safeUrl.searchParams.get("uri")).toBe("CELEX:32024R1234");
+    expect(safeUrl.searchParams.get("X-Amz-Signature")).toBe("REDACTED");
+    expect(safeUrl.searchParams.get("api_key")).toBe("REDACTED");
 
     fireEvent.click(screen.getByText("Détail diagnostic"));
     expect(
@@ -174,6 +183,33 @@ describe("ProductionRoutingDetails", () => {
     expect(
       screen.getByText(/réacquérir ou remplacer la source/i),
     ).toBeInTheDocument();
+  });
+
+  it.each([
+    [
+      "provenance_mismatch",
+      /lignée.*artefact.*ne correspond pas.*instantané/i,
+      /dans l’onglet Pipeline.*relancez Extraction puis Périmètre des preuves.*rien n’a été publié/i,
+    ],
+    [
+      "incomplete_extraction",
+      /source d’extraction.*omise ou.*échoué/i,
+      /relancez l’étape Extraction dans l’onglet Pipeline.*rien n’a été publié/i,
+    ],
+  ])("explique la cause et l’action pour %s", (reasonCode, cause, action) => {
+    render(
+      <ProductionRoutingDetails
+        routing={routing({
+          status: "needs_review",
+          publication_kind: null,
+          reason_code: reasonCode,
+        })}
+      />,
+    );
+
+    const review = within(screen.getByRole("status"));
+    expect(review.getByText(cause)).toBeInTheDocument();
+    expect(review.getByText(action)).toBeInTheDocument();
   });
 
   it("demande de vérifier la preuve d’une provenance alternative", () => {
@@ -219,6 +255,15 @@ describe("ProductionRoutingDetails", () => {
               source_url: "https://two.example/report",
               failure_code: "brief_chronology_source_undated",
             }),
+            routingSource({
+              source_id: "unrelated-source",
+              source_url: "https://unrelated.example/report",
+              failure_code: "source_event_not_relevant",
+              tier: "secondary",
+              criticality: "non_critical",
+              editorial_role: "contextual",
+              remaining_control_code: "no_routing_block",
+            }),
           ],
         })}
       />,
@@ -230,8 +275,77 @@ describe("ProductionRoutingDetails", () => {
     ).toBeInTheDocument();
     expect(review.getByText(/one\.example\/report/)).toBeInTheDocument();
     expect(review.getByText(/two\.example\/report/)).toBeInTheDocument();
+    expect(review.queryByText(/unrelated\.example\/report/)).toBeNull();
     expect(
       screen.getByText(/acquisition datée est nécessaire/i),
+    ).toBeInTheDocument();
+    expect(review.queryByText(/brief_chronology_source_undated/)).toBeNull();
+    fireEvent.click(screen.getByText("Détail diagnostic"));
+    expect(screen.getAllByText("brief_chronology_source_undated")).toHaveLength(
+      2,
+    );
+  });
+
+  it("n’invente pas de source bloquante lorsque les événements ne donnent pas de chronologie admissible", () => {
+    render(
+      <ProductionRoutingDetails
+        routing={routing({
+          status: "needs_review",
+          publication_kind: null,
+          reason_code: "brief_evidence_chronology_missing",
+          sources: [
+            routingSource({
+              source_id: "dated-but-ineligible",
+              source_url: "https://dated-but-ineligible.example/report",
+              failure_code: "source_event_not_relevant",
+            }),
+          ],
+        })}
+      />,
+    );
+
+    const review = within(screen.getByRole("status"));
+    expect(
+      review.getByText(/événements extraits.*chronologie datée admissible/i),
+    ).toBeInTheDocument();
+    expect(
+      review.getByText(
+        /date vérifiée peut exister.*événement.*pas admissible pour la brève/i,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      review.getByText(
+        /acquisition de source datée.*date de publication admissible/i,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      review.queryByText(/dated-but-ineligible\.example\/report/),
+    ).toBeNull();
+    expect(
+      review.queryByText(/aucune date vérifiée n’est disponible/i),
+    ).toBeNull();
+  });
+
+  it("conserve le diagnostic des sources pour les autres motifs de routage", () => {
+    render(
+      <ProductionRoutingDetails
+        routing={routing({
+          status: "needs_review",
+          publication_kind: null,
+          reason_code: "critical_source_inaccessible",
+          sources: [
+            routingSource({
+              source_url: "https://critical.example/report",
+            }),
+          ],
+        })}
+      />,
+    );
+
+    const review = within(screen.getByRole("status"));
+    expect(review.getByText(/critical\.example\/report/)).toBeInTheDocument();
+    expect(
+      review.getByText(/bloquée par le site distant \(403\)/i),
     ).toBeInTheDocument();
   });
 
@@ -285,5 +399,73 @@ describe("ProductionRoutingDetails", () => {
       ),
     ).toBeInTheDocument();
     expect(screen.queryByText(/continuer sans source/i)).toBeNull();
+  });
+
+  it("n’affiche pas comme lien une URL de source avec un schéma dangereux", () => {
+    const { container } = render(
+      <ProductionRoutingDetails
+        routing={routing({
+          status: "needs_review",
+          publication_kind: null,
+          reason_code: "critical_source_inaccessible",
+          sources: [routingSource({ source_url: "javascript:alert(1)" })],
+        })}
+      />,
+    );
+
+    expect(container.querySelector('a[href^="javascript:"]')).toBeNull();
+    expect(container).toHaveTextContent("URL non affichable");
+  });
+
+  it.each([
+    ["missing_extraction_artifact", "Extraction", "manquant"],
+    ["invalid_extraction_artifact", "Extraction", "invalide ou obsolète"],
+    ["missing_relevance_artifact", "Périmètre des preuves", "manquant"],
+    [
+      "invalid_relevance_artifact",
+      "Périmètre des preuves",
+      "invalide ou obsolète",
+    ],
+    ["incomplete_projection", "Périmètre des preuves", "incomplet"],
+  ] as const)(
+    "explique %s et nomme l’étape du Pipeline à relancer",
+    (reasonCode, stage, cause) => {
+      render(
+        <ProductionRoutingDetails
+          routing={routing({
+            status: "needs_review",
+            publication_kind: null,
+            reason_code: reasonCode,
+          })}
+        />,
+      );
+
+      expect(screen.getByRole("status")).toHaveTextContent(
+        new RegExp(`artefact.*étape ${stage}.*${cause}`, "i"),
+      );
+      expect(screen.getByRole("status")).toHaveTextContent(
+        new RegExp(`Relancez l’étape ${stage} dans l’onglet Pipeline`),
+      );
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "rien n’a été publié",
+      );
+    },
+  );
+
+  it("nomme l’onglet Pipeline et l’étape Sources dans les actions de source", () => {
+    render(
+      <ProductionRoutingDetails
+        routing={routing({
+          status: "needs_review",
+          publication_kind: null,
+          reason_code: "critical_source_inaccessible",
+          sources: [routingSource()],
+        })}
+      />,
+    );
+
+    expect(screen.getByRole("status")).toHaveTextContent(
+      /onglet Pipeline, étape Sources/i,
+    );
   });
 });

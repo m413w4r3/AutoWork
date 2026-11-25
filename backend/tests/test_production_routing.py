@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from cti_app.application import production_routing as production_routing_app
 from cti_app.application.production_routing import (
     _projection_has_incomplete_coverage,
+    brief_feasibility_for_routing,
     compute_brief_routing_feasibility,
 )
 from cti_app.domain.classification import TLP
@@ -598,6 +599,146 @@ async def test_application_routing_loads_the_run_snapshot_for_brief_feasibility(
     assert decision.publication_kind is PublicationKind.BRIEF
 
 
+@pytest.mark.asyncio
+async def test_mismatched_snapshot_with_dated_event_needs_provenance_review(monkeypatch):
+    extraction = _extraction(events=(_dated_event(),))
+    snapshot = _snapshot_for_extraction(extraction, published_at=None)
+    extraction = replace(extraction, production_input_hash=snapshot.input_hash)
+    projection = _projection(extraction)
+    mismatched_snapshot = replace(
+        snapshot,
+        discovery_summary="A different frozen discovery summary.",
+        input_hash="",
+        reuse_basis_hash="",
+    )
+    extraction_artifact = ProductionArtifact(
+        production_run_id=RUN_ID,
+        subject_id=SUBJECT_ID,
+        stage=ProductionArtifactStage.EXTRACTION,
+        version=1,
+        input_hash="e" * 64,
+        status=ProductionArtifactStatus.VERIFIED,
+    )
+    projection_artifact = ProductionArtifact(
+        production_run_id=RUN_ID,
+        subject_id=SUBJECT_ID,
+        stage=ProductionArtifactStage.RELEVANCE_PROJECTION,
+        version=1,
+        input_hash="f" * 64,
+        status=ProductionArtifactStatus.VERIFIED,
+    )
+
+    async def load_extraction_input(**_kwargs):
+        return (
+            ProductionRoutingArtifactInputV1(
+                extraction_artifact,
+                production_extraction_hashes(extraction)[0],
+                extraction,
+            ),
+            (),
+        )
+
+    async def load_relevance_input(**_kwargs):
+        return ProductionRoutingArtifactInputV1(
+            projection_artifact,
+            projection.projection_hash,
+            projection,
+        )
+
+    monkeypatch.setattr(production_routing_app, "_load_extraction_input", load_extraction_input)
+    monkeypatch.setattr(production_routing_app, "_load_relevance_input", load_relevance_input)
+    monkeypatch.setattr(production_routing_app, "load_legitimate_services", lambda: _SERVICES)
+
+    async def get_run(run_id):
+        assert run_id == RUN_ID
+        return SimpleNamespace(id=RUN_ID, subject_id=SUBJECT_ID, pipeline_generation=0)
+
+    async def get_snapshot(run_id):
+        assert run_id == RUN_ID
+        return mismatched_snapshot
+
+    async def append_and_adopt(decision, *, expected_version):
+        assert expected_version == 4
+        return decision
+
+    class FakeUow:
+        production_runs = SimpleNamespace(get=get_run)
+        production_input_snapshots = SimpleNamespace(get_by_run=get_snapshot)
+        production_routing_decisions = SimpleNamespace(append_and_adopt=append_and_adopt)
+
+        async def commit(self):
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    decision = await production_routing_app.decide_and_adopt_production_routing(
+        uow_factory=FakeUow,
+        artifact_store=object(),
+        production_run_id=RUN_ID,
+        expected_version=4,
+        decided_at=NOW,
+    )
+
+    assert decision.status is RoutingStatus.NEEDS_REVIEW
+    assert decision.publication_kind is None
+    assert decision.reason_code is RoutingReasonCode.PROVENANCE_MISMATCH
+
+
+@pytest.mark.asyncio
+async def test_relevance_artifact_input_hash_mismatch_needs_provenance_review(monkeypatch):
+    extraction = _extraction()
+    projection = _projection(extraction)
+    extraction_artifact = ProductionArtifact(
+        production_run_id=RUN_ID,
+        subject_id=SUBJECT_ID,
+        stage=ProductionArtifactStage.EXTRACTION,
+        version=1,
+        input_hash="e" * 64,
+        status=ProductionArtifactStatus.VERIFIED,
+    )
+    projection_artifact = ProductionArtifact(
+        production_run_id=RUN_ID,
+        subject_id=SUBJECT_ID,
+        stage=ProductionArtifactStage.RELEVANCE_PROJECTION,
+        version=1,
+        input_hash="f" * 64,
+        status=ProductionArtifactStatus.VERIFIED,
+    )
+
+    async def load_payload(**_kwargs):
+        return projection_artifact, relevance_projection_to_json(projection), None
+
+    monkeypatch.setattr(production_routing_app, "_load_artifact_payload", load_payload)
+    relevance_input = await production_routing_app._load_relevance_input(
+        uow=object(),
+        artifact_store=object(),
+        run_id=RUN_ID,
+    )
+    decision = decide_publication_routing(
+        production_run_id=RUN_ID,
+        subject_id=SUBJECT_ID,
+        pipeline_generation=0,
+        extraction_input=ProductionRoutingArtifactInputV1(
+            extraction_artifact,
+            production_extraction_hashes(extraction)[0],
+            extraction,
+        ),
+        relevance_input=relevance_input,
+        legitimate_services=_SERVICES,
+        decided_at=NOW,
+        brief_feasibility=BriefRoutingFeasibilityV1(dated_entry_count=1),
+    )
+
+    assert relevance_input.validation_error is RoutingReasonCode.PROVENANCE_MISMATCH
+    assert decision.status is RoutingStatus.NEEDS_REVIEW
+    assert decision.publication_kind is None
+    assert decision.reason_code is RoutingReasonCode.PROVENANCE_MISMATCH
+
+
 def test_confirmed_subject_ioc_routes_to_article_when_brief_is_infeasible():
     extraction = _extraction(indicators=(_indicator("c2.example"),))
     projection = _projection(
@@ -707,7 +848,7 @@ def test_adding_a_source_verified_date_changes_routing_hash_and_replays_stably()
     assert recomputed.publication_kind is PublicationKind.BRIEF
     assert recomputed.input_hash != first.input_hash
     assert recomputed.decision_hash != first.decision_hash
-    assert recomputed.policy_version == "subject-publication-routing-v4-brief-feasibility-v1"
+    assert recomputed.policy_version == "subject-publication-routing-v5-validation-hash-v1"
     assert replay.input_hash == recomputed.input_hash
     assert replay.decision_hash == recomputed.decision_hash
     assert replay.decision_id == recomputed.decision_id
@@ -775,7 +916,7 @@ def test_alternative_core_provenance_has_distinct_reason_and_diagnostic(method, 
     assert diagnostic.to_json()["error_code"] is None
     assert diagnostic.to_json()["remaining_control_code"] == "human_review_required"
     assert diagnostic.to_json()["human_waiver_path"] == "not_consumed_by_routing"
-    assert decision.policy_version == "subject-publication-routing-v4-brief-feasibility-v1"
+    assert decision.policy_version == "subject-publication-routing-v5-validation-hash-v1"
 
 
 def test_critical_source_omission_needs_review_with_explicit_diagnostic():
@@ -883,7 +1024,7 @@ def test_supporting_secondary_missing_source_does_not_block_routing():
 
 def test_historical_critical_source_missing_reason_still_deserializes():
     assert RoutingReasonCode("critical_source_missing") is RoutingReasonCode.CRITICAL_SOURCE_MISSING
-    assert ROUTING_POLICY_VERSION == "subject-publication-routing-v4-brief-feasibility-v1"
+    assert ROUTING_POLICY_VERSION == "subject-publication-routing-v5-validation-hash-v1"
 
 
 def _routing_decision_with_expanded_source_diagnostic() -> ProductionRoutingDecisionV1:
@@ -1180,6 +1321,57 @@ def test_decision_hash_and_id_are_deterministic_across_replays():
     assert replay.decided_at != first.decided_at
 
 
+def test_brief_feasibility_changes_routing_hashes_and_replays_stably():
+    extraction = _extraction()
+    projection = _projection(extraction)
+    extraction_artifact = ProductionArtifact(
+        production_run_id=RUN_ID,
+        subject_id=SUBJECT_ID,
+        stage=ProductionArtifactStage.EXTRACTION,
+        version=1,
+        input_hash="e" * 64,
+        status=ProductionArtifactStatus.VERIFIED,
+    )
+    projection_artifact = ProductionArtifact(
+        production_run_id=RUN_ID,
+        subject_id=SUBJECT_ID,
+        stage=ProductionArtifactStage.RELEVANCE_PROJECTION,
+        version=1,
+        input_hash="f" * 64,
+        status=ProductionArtifactStatus.VERIFIED,
+    )
+    first_feasibility = BriefRoutingFeasibilityV1(dated_entry_count=1)
+    changed_feasibility = BriefRoutingFeasibilityV1(dated_entry_count=2)
+
+    first = _inputs(
+        extraction,
+        projection,
+        extraction_artifact=extraction_artifact,
+        projection_artifact=projection_artifact,
+        brief_feasibility=first_feasibility,
+    )
+    changed = _inputs(
+        extraction,
+        projection,
+        extraction_artifact=extraction_artifact,
+        projection_artifact=projection_artifact,
+        brief_feasibility=changed_feasibility,
+    )
+    replay = _inputs(
+        extraction,
+        projection,
+        extraction_artifact=extraction_artifact,
+        projection_artifact=projection_artifact,
+        brief_feasibility=first_feasibility,
+    )
+
+    assert first.input_hash != changed.input_hash
+    assert first.decision_hash != changed.decision_hash
+    assert replay.input_hash == first.input_hash
+    assert replay.decision_hash == first.decision_hash
+    assert replay.decision_id == first.decision_id
+
+
 def test_decision_hash_is_deterministic_across_source_order():
     extraction = _extraction(facts=("first",))
     other_source = _extraction(facts=("second",)).sources[0]
@@ -1352,3 +1544,74 @@ def test_diagnostic_order_does_not_change_canonical_input_or_decision_hash():
     )
     assert replay.input_hash == first.input_hash
     assert replay.decision_hash == first.decision_hash
+
+
+def test_feasibility_helper_turns_a_mismatched_snapshot_into_a_provenance_error():
+    extraction = _extraction(events=(_dated_event(),))
+    snapshot = _snapshot_for_extraction(extraction, published_at=None)
+    extraction = replace(extraction, production_input_hash=snapshot.input_hash)
+    projection = _projection(extraction)
+    mismatched = replace(
+        snapshot,
+        discovery_summary="A different frozen discovery summary.",
+        input_hash="",
+        reuse_basis_hash="",
+    )
+
+    feasibility, lineage_error = brief_feasibility_for_routing(
+        extraction=extraction, projection=projection, snapshot=mismatched
+    )
+    assert lineage_error is RoutingReasonCode.PROVENANCE_MISMATCH
+    assert feasibility.dated_entry_count == 0
+    assert feasibility.reason == "brief_feasibility_inputs_unavailable"
+
+    # A matching snapshot and a genuinely absent snapshot evaluate normally.
+    for valid_snapshot in (snapshot, None):
+        feasibility, lineage_error = brief_feasibility_for_routing(
+            extraction=extraction, projection=projection, snapshot=valid_snapshot
+        )
+        assert lineage_error is None
+        assert feasibility.dated_entry_count >= 1
+
+
+def test_validation_errors_are_part_of_the_input_hash():
+    extraction = _extraction(indicators=(_indicator("c2.example"),))
+    projection = _projection(extraction)
+    # Same artifact identities in every call: only the validation error may differ.
+    artifacts = {
+        "extraction_artifact": ProductionArtifact(
+            production_run_id=RUN_ID,
+            subject_id=SUBJECT_ID,
+            stage=ProductionArtifactStage.EXTRACTION,
+            version=1,
+            input_hash="e" * 64,
+            status=ProductionArtifactStatus.VERIFIED,
+        ),
+        "projection_artifact": ProductionArtifact(
+            production_run_id=RUN_ID,
+            subject_id=SUBJECT_ID,
+            stage=ProductionArtifactStage.RELEVANCE_PROJECTION,
+            version=1,
+            input_hash="f" * 64,
+            status=ProductionArtifactStatus.VERIFIED,
+        ),
+    }
+    clean = _inputs(extraction, projection, **artifacts)
+    flagged = _inputs(
+        extraction,
+        projection,
+        projection_validation_error=RoutingReasonCode.PROVENANCE_MISMATCH,
+        **artifacts,
+    )
+    again = _inputs(
+        extraction,
+        projection,
+        projection_validation_error=RoutingReasonCode.PROVENANCE_MISMATCH,
+        **artifacts,
+    )
+
+    assert flagged.reason_code is RoutingReasonCode.PROVENANCE_MISMATCH
+    assert flagged.input_hash != clean.input_hash
+    assert flagged.decision_hash != clean.decision_hash
+    assert again.input_hash == flagged.input_hash
+    assert again.decision_hash == flagged.decision_hash

@@ -9,7 +9,11 @@ from uuid import UUID
 
 from cti_app.application.bridge_identity import bridge_request_fingerprint
 from cti_app.application.diagnostics import DiagnosticsLog
-from cti_app.application.model_gateway import ModelGateway, bridge_request_id_for_run
+from cti_app.application.model_gateway import (
+    ModelGateway,
+    ModelRecoveryDiscardedError,
+    bridge_request_id_for_run,
+)
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_review_recovery import prepare_batch_for_recovery
 from cti_app.domain.editions import EditionStatus
@@ -21,6 +25,7 @@ from cti_app.integrations.models import BridgeTransportError
 class ReconciliationOutcome(StrEnum):
     RESUMED = "resumed"
     RELEASED = "released"
+    DECLARED_LOST = "declared_lost"
     UNDECIDED = "undecided"
 
 
@@ -184,14 +189,19 @@ class ProductionReconciliationResolver:
             # instead of asking the gateway to replace it with a second recovery.
             model = existing_model
         else:
-            model = await self._model_gateway.adopt_recovery_output(
-                reconciliation.model_run_id,
-                text.encode("utf-8"),
-                provenance="automatic_bridge_retrieval",
-                actor_id="system:production-reconciliation",
-                external_turn_id=_verified_external_turn_id(payload),
-                bridge_response_id=bridge_response_id,
-            )
+            try:
+                model = await self._model_gateway.adopt_recovery_output(
+                    reconciliation.model_run_id,
+                    text.encode("utf-8"),
+                    provenance="automatic_bridge_retrieval",
+                    actor_id="system:production-reconciliation",
+                    external_turn_id=_verified_external_turn_id(payload),
+                    bridge_response_id=bridge_response_id,
+                )
+            except ModelRecoveryDiscardedError:
+                # A concurrent operator declaration is terminal for this answer.
+                # Keep the probe stable and leave the production run reviewable.
+                return ReconciliationOutcome.DECLARED_LOST
         if (
             model.status is not ModelRunStatus.SUCCEEDED
             or model.raw_output_sha256 != expected_sha256

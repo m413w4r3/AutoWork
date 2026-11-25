@@ -82,7 +82,7 @@ from cti_app.application.production_repair_payloads import (
 )
 from cti_app.application.production_routing import (
     _source_loss_diagnostics,
-    compute_brief_routing_feasibility,
+    brief_feasibility_for_routing,
 )
 from cti_app.application.production_source_evidence import (
     SourceEvidenceDocument,
@@ -4850,6 +4850,11 @@ class ProductionRepairMaterializationService:
                 else None
             )
             source_diagnostics, source_diagnostics_error = _source_loss_diagnostics(extraction)
+            brief_feasibility, lineage_error = brief_feasibility_for_routing(
+                extraction=canonical_extraction,
+                projection=relevance_projection,
+                snapshot=snapshot,
+            )
             route_decision = decide_publication_routing(
                 production_run_id=run.id,
                 subject_id=run.subject_id,
@@ -4858,7 +4863,7 @@ class ProductionRepairMaterializationService:
                     artifact=extraction,
                     artifact_hash=canonical_extraction_hash(canonical_extraction),
                     payload=canonical_extraction,
-                    validation_error=source_diagnostics_error,
+                    validation_error=source_diagnostics_error or lineage_error,
                 ),
                 relevance_input=ProductionRoutingArtifactInputV1(
                     artifact=relevance_projection_artifact,
@@ -4867,11 +4872,7 @@ class ProductionRepairMaterializationService:
                 ),
                 legitimate_services=load_legitimate_services(),
                 decided_at=datetime.now(UTC),
-                brief_feasibility=compute_brief_routing_feasibility(
-                    extraction=canonical_extraction,
-                    projection=relevance_projection,
-                    snapshot=snapshot,
-                ),
+                brief_feasibility=brief_feasibility,
                 critical_source_diagnostics=source_diagnostics,
             )
             previous_decision_id = run.routing_decision_id

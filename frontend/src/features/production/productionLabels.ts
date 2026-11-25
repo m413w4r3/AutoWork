@@ -69,11 +69,26 @@ export function productionIssueMessage(
     case "brief_chronology_unavailable":
       return "La chronologie de la brève est indisponible : une acquisition de source datée est nécessaire.";
     case "synthesis_output_invalid":
-      return "La sortie de synthèse a été rejetée par les contrôles. Une seule tentative de correction a été effectuée, limitée à un tour.";
+      return "La proposition de synthèse n’a pas pu être validée ou relue depuis son archive. Un tour correctif peut ne pas avoir eu lieu. Une relance ouvre une nouvelle génération et peut déclencher un nouvel appel modèle facturable.";
     case "synthesis_correction_context_too_large":
-      return "La correction de la synthèse a été rejetée car son contexte dépassait la limite autorisée. Une seule tentative de correction est permise, sur un tour.";
+      return "Le contexte correctif dépasse le budget de 512 Kio. Aucun contenu n’a été tronqué et aucun second appel n’a été fait. Réduisez le périmètre des preuves ou demandez une révision ciblée. Une relance ouvre une nouvelle génération et peut déclencher un nouvel appel modèle facturable.";
+    case "synthesis_correction_changed_untargeted_content":
+      return "Le tour correctif a modifié des affirmations qui n’étaient pas visées par la demande et a été refusé. Une relance ouvre une nouvelle génération et peut déclencher un nouvel appel modèle facturable.";
+    case "synthesis_corrective_parent_identity_mismatch":
+      return "L’identité du run initial de synthèse n’a pas pu être vérifiée ; aucun appel correctif n’a été envoyé. Une relance ouvre une nouvelle génération et peut déclencher un nouvel appel modèle facturable.";
+    case "synthesis_corrective_parent_raw_output_hash_mismatch":
+      return "L’empreinte de la sortie brute du run initial n’a pas pu être vérifiée ; aucun appel correctif n’a été envoyé. Une relance ouvre une nouvelle génération et peut déclencher un nouvel appel modèle facturable.";
     case "model_submission_reconciliation_required":
       return "La soumission du modèle doit être réconciliée avant de poursuivre.";
+    case "bridge_timeout":
+    case "bridge_server_error":
+    case "bridge_ui_timeout":
+    case "bridge_idle_timeout":
+    case "bridge_total_timeout":
+    case "conversation_unavailable":
+    case "conversation_profile_mismatch":
+    case "conversation_busy":
+      return "L’appel au modèle n’a pas abouti. Le système ne renvoie pas de lui-même une soumission dont l’état est incertain. Si un panneau de réconciliation apparaît, utilisez-le ; sinon, relancer l’étape est possible, et le système ne réémettra jamais de lui-même une soumission incertaine.";
     default:
       return null;
   }

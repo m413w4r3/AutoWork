@@ -15,6 +15,10 @@ import {
 import { ExtractionProgressView } from "../../components/ExtractionProgress";
 import { ProductionRoutingDetails } from "../production/ProductionRoutingDetails";
 import { Link } from "../../routing";
+import {
+  sanitizeTextForDisplay,
+  sanitizeUrlForDisplay,
+} from "../../urlDisplay";
 import { productionBatchPollingInterval } from "../production/productionPolling";
 import {
   PHASE_LABELS,
@@ -202,8 +206,13 @@ function ItemError({ item }: { item: BatchItemDetail }) {
   }
   return (
     <div className="production-item__error">
-      <span>{item.error_message}</span>
-      {item.error_code ? <small>Code : {item.error_code}</small> : null}
+      <span>{sanitizeTextForDisplay(item.error_message)}</span>
+      {item.error_code ? (
+        <details>
+          <summary>Détail diagnostic</summary>
+          <small>Code : {item.error_code}</small>
+        </details>
+      ) : null}
     </div>
   );
 }
@@ -311,7 +320,15 @@ function ProductionItem({
       {isActive &&
       item.current_stage === "extraction" &&
       item.extraction_progress ? (
-        <ExtractionProgressView progress={item.extraction_progress} />
+        <ExtractionProgressView
+          progress={{
+            ...item.extraction_progress,
+            sources: item.extraction_progress.sources.map((source) => ({
+              ...source,
+              canonical_url: sanitizeUrlForDisplay(source.canonical_url),
+            })),
+          }}
+        />
       ) : null}
       <ItemError item={item} />
       <ReconciliationFlow
@@ -406,7 +423,8 @@ export function ProductionConsole({
   if (board.isError) {
     return (
       <p className="error-message" role="alert">
-        La supervision de production est inaccessible : {String(board.error)}
+        La supervision de production est inaccessible :{" "}
+        {sanitizeTextForDisplay(String(board.error))}
       </p>
     );
   }
@@ -488,18 +506,22 @@ export function ProductionConsole({
       ) : null}
       {cancel.error ? (
         <p className="error-message" role="alert">
-          {cancel.error instanceof Error
-            ? cancel.error.message
-            : "Le lot n’a pas pu être arrêté."}
+          {sanitizeTextForDisplay(
+            cancel.error instanceof Error
+              ? cancel.error.message
+              : "Le lot n’a pas pu être arrêté.",
+          )}
         </p>
       ) : null}
       {pause.error || resume.error ? (
         <p className="error-message" role="alert">
-          {pause.error instanceof Error
-            ? pause.error.message
-            : resume.error instanceof Error
-              ? resume.error.message
-              : "Le contrôle du lot de production a échoué."}
+          {sanitizeTextForDisplay(
+            pause.error instanceof Error
+              ? pause.error.message
+              : resume.error instanceof Error
+                ? resume.error.message
+                : "Le contrôle du lot de production a échoué.",
+          )}
         </p>
       ) : null}
       {currentBatch.status === "paused" ? (

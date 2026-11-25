@@ -775,46 +775,70 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
         those can route a later CONTINUE.
         """
         digest = hashlib.sha256(content).hexdigest()
+        declared_lost_before_archive = False
         async with self._uow_factory() as uow:
             existing = await uow.model_runs.get(run_id)
             if existing is None:
                 raise ModelGatewayError(f"Model run {run_id} does not exist")
             if _was_declared_lost(existing):
-                raise ModelRecoveryDiscardedError(
-                    "Recovered output was discarded because the operator declared this run lost"
+                declared_lost_before_archive = True
+            else:
+                if (
+                    bridge_response_id
+                    and existing.response_id
+                    and existing.response_id != bridge_response_id
+                ):
+                    raise ModelGatewayError("Recovered response identity does not match")
+                recovery = (existing.error_details or {}).get("recovery")
+                if (
+                    existing.status is ModelRunStatus.SUCCEEDED
+                    and existing.raw_output_sha256 == digest
+                    and isinstance(recovery, dict)
+                    and recovery.get("provenance") == provenance
+                    and recovery.get("source_model_run_id")
+                    == (str(source_model_run_id) if source_model_run_id else None)
+                ):
+                    if bridge_response_id and existing.response_id != bridge_response_id:
+                        if existing.response_id is not None:
+                            raise ModelGatewayError("Recovered response identity does not match")
+                        existing.response_id = bridge_response_id
+                        await uow.model_runs.save(existing)
+                        await uow.commit()
+                    return existing
+                if existing.status is ModelRunStatus.SUCCEEDED and isinstance(recovery, dict):
+                    raise ModelGatewayError("Recovered output conflicts with an existing adoption")
+                allowed = {ModelRunStatus.NEEDS_REVIEW}
+                if provenance in {"manual_import", "visible_recovery"}:
+                    allowed |= {
+                        ModelRunStatus.WAITING_BACKGROUND,
+                        ModelRunStatus.FAILED,
+                    }
+                if existing.status not in allowed:
+                    raise ModelGatewayError("ModelRun is not eligible for this recovery")
+        if declared_lost_before_archive:
+            reference = await self._output_store.store(
+                content, mime_type="text/markdown; charset=utf-8"
+            )
+            rejection = ModelOutputRejection(
+                model_run_id=run_id,
+                path=("recovery",),
+                error_type="operator_abandoned_late_recovery",
+                value_sha256=digest,
+                raw_output_reference=reference,
+            )
+            async with self._uow_factory() as uow:
+                already_recorded = any(
+                    item.error_type == rejection.error_type
+                    and item.value_sha256 == rejection.value_sha256
+                    for item in await uow.model_output_rejections.list_for_run(run_id)
                 )
-            if (
-                bridge_response_id
-                and existing.response_id
-                and existing.response_id != bridge_response_id
-            ):
-                raise ModelGatewayError("Recovered response identity does not match")
-            recovery = (existing.error_details or {}).get("recovery")
-            if (
-                existing.status is ModelRunStatus.SUCCEEDED
-                and existing.raw_output_sha256 == digest
-                and isinstance(recovery, dict)
-                and recovery.get("provenance") == provenance
-                and recovery.get("source_model_run_id")
-                == (str(source_model_run_id) if source_model_run_id else None)
-            ):
-                if bridge_response_id and existing.response_id != bridge_response_id:
-                    if existing.response_id is not None:
-                        raise ModelGatewayError("Recovered response identity does not match")
-                    existing.response_id = bridge_response_id
-                    await uow.model_runs.save(existing)
+                if not already_recorded:
+                    await uow.model_output_rejections.append(rejection)
                     await uow.commit()
-                return existing
-            if existing.status is ModelRunStatus.SUCCEEDED and isinstance(recovery, dict):
-                raise ModelGatewayError("Recovered output conflicts with an existing adoption")
-            allowed = {ModelRunStatus.NEEDS_REVIEW}
-            if provenance in {"manual_import", "visible_recovery"}:
-                allowed |= {
-                    ModelRunStatus.WAITING_BACKGROUND,
-                    ModelRunStatus.FAILED,
-                }
-            if existing.status not in allowed:
-                raise ModelGatewayError("ModelRun is not eligible for this recovery")
+            raise ModelRecoveryDiscardedError(
+                "Recovered output was recorded as a late response after the operator "
+                "declared this run lost"
+            )
         reference = await self._output_store.store(
             content, mime_type="text/markdown; charset=utf-8"
         )

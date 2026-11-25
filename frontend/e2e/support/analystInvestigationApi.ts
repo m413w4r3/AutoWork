@@ -172,6 +172,9 @@ export function createAnalystInvestigationApi() {
     approval_decision_id: null as string | null,
     approval_actor_id: null as string | null,
     approved_at: null as string | null,
+    authority_kind: null as string | null,
+    policy_status: null as string | null,
+    currently_authorized: false,
   };
   let sample = {
     id: ids.association,
@@ -495,6 +498,9 @@ export function createAnalystInvestigationApi() {
       envelope = {
         ...envelope,
         approved: true,
+        currently_authorized: true,
+        authority_kind: "human_g2",
+        policy_status: "active",
         version: 1,
         allowed_providers: input.allowed_providers,
         acquire_hits_allowed: input.acquire_hits_allowed,

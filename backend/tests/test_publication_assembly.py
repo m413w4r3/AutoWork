@@ -1787,8 +1787,8 @@ async def test_ioc_repair_route_change_requires_synthesis_rebuild(
     if brief_feasible:
         monkeypatch.setattr(
             repairs_module,
-            "compute_brief_routing_feasibility",
-            lambda **_kwargs: BriefRoutingFeasibilityV1(dated_entry_count=1),
+            "brief_feasibility_for_routing",
+            lambda **_kwargs: (BriefRoutingFeasibilityV1(dated_entry_count=1), None),
         )
     snapshot, references, extraction_a, synthesis_a = _canonical_inputs()
     source = extraction_a.sources[0]

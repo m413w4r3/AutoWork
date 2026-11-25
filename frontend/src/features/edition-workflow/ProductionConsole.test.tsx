@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -127,6 +127,41 @@ function activitySubject(
 }
 
 describe("ProductionConsole", () => {
+  it("place le code d’erreur dans un détail diagnostic replié", async () => {
+    const item = {
+      ...activityItem(
+        {
+          kind: "reconciliation_probe" as const,
+          stage: "synthesis" as const,
+          started_at: "2026-10-07T11:58:00Z",
+          since_seconds: 120,
+          detail: "Sondage de réconciliation · aucune requête modèle",
+          attempt: 1,
+        },
+        "needs_review",
+      ),
+      error_code: "review_required",
+      error_message:
+        "Validation manuelle requise pour https://operator:password@source.example/report?token=secret",
+    };
+    renderConsole(activityBatch(item));
+
+    const errorMessage = await screen.findByText(
+      "Validation manuelle requise pour https://source.example/report?token=REDACTED",
+    );
+    const error = errorMessage.closest(".production-item__error");
+    if (!(error instanceof HTMLElement)) {
+      throw new Error("Production item error not found");
+    }
+    expect(error).not.toHaveTextContent(/operator|password|secret/);
+    const diagnosticCode = within(error).getByText("Code : review_required");
+    expect(diagnosticCode).not.toBeVisible();
+
+    await userEvent.setup().click(within(error).getByText("Détail diagnostic"));
+
+    expect(diagnosticCode).toBeVisible();
+  });
+
   it("affiche l’état vide d’un board 200 sans lot", async () => {
     renderConsole(null);
 
@@ -322,8 +357,9 @@ describe("ProductionConsole", () => {
               },
               {
                 source_id: "22222222-2222-4222-8222-222222222222",
-                title: "Second source",
-                canonical_url: "https://second.example/report",
+                title: null,
+                canonical_url:
+                  "https://operator:password@second.example/report?token=secret",
                 tier: "supporting",
                 profile: "ioc_rules",
                 status: "cached",
@@ -366,7 +402,6 @@ describe("ProductionConsole", () => {
     expect(progress).toHaveTextContent(
       "Résultats existants : 1 · Appels modèle : 1",
     );
-    expect(screen.getByText("Second source")).toBeInTheDocument();
     expect(progress).toHaveTextContent("Résultat existant");
     expect(progress).toHaveTextContent("En attente");
     expect(progress).toHaveTextContent("6 / 14 tranches (estimées)");
@@ -375,6 +410,10 @@ describe("ProductionConsole", () => {
         "Activité: Extraction — appel modèle en cours depuis 2 min 10 s — tranche 7/14 (estimée)",
       ),
     ).toBeInTheDocument();
+    expect(progress).toHaveTextContent(
+      "https://second.example/report?token=REDACTED",
+    );
+    expect(progress).not.toHaveTextContent(/operator|password|secret/);
     expect(
       screen.getByLabelText("Tranches terminées pour First source"),
     ).toHaveAttribute("max", "14");

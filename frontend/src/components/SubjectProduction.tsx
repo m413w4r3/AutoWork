@@ -32,6 +32,11 @@ import {
 } from "../features/production/productionLabels";
 import { RETRYABLE_PRODUCTION_STAGES } from "../features/production/productionStages";
 import { Link } from "../routing";
+import {
+  safeHttpHref,
+  sanitizeTextForDisplay,
+  sanitizeUrlForDisplay,
+} from "../urlDisplay";
 
 interface SubjectProductionProps {
   subjectId: string;
@@ -68,22 +73,74 @@ const RETRY_DESCRIPTIONS: Record<RetryStage, string> = {
     "L’assemblage sera recalculé. Les références existantes seront conservées.",
 };
 
-const CONVERSATION_ERROR_CODES = new Set([
-  "bridge_server_error",
-  "bridge_timeout",
-  "bridge_ui_timeout",
-  "bridge_idle_timeout",
-  "bridge_total_timeout",
-  "conversation_unavailable",
-  "conversation_profile_mismatch",
-  "conversation_busy",
-]);
-
 const RETRY_BLOCKED_ERROR_CODES = new Set([
   "publication_routing_needs_review",
   "brief_chronology_unavailable",
   "model_submission_reconciliation_required",
 ]);
+
+const SYNTHESIS_CORRECTION_RETRY_ERROR_CODES = new Set([
+  "synthesis_output_invalid",
+  "synthesis_correction_context_too_large",
+  "synthesis_correction_changed_untargeted_content",
+  "synthesis_corrective_parent_identity_mismatch",
+  "synthesis_corrective_parent_raw_output_hash_mismatch",
+]);
+
+const SENSITIVE_DIAGNOSTIC_FIELDS = new Set([
+  "token",
+  "key",
+  "apikey",
+  "api_key",
+  "access_token",
+  "signature",
+  "sig",
+  "expires",
+  "password",
+  "secret",
+]);
+
+function safeDiagnosticValue(
+  value: unknown,
+  depth = 0,
+  fieldName = "",
+): unknown {
+  const normalizedFieldName = fieldName.toLowerCase();
+  if (
+    SENSITIVE_DIAGNOSTIC_FIELDS.has(normalizedFieldName) ||
+    normalizedFieldName.startsWith("x-amz-") ||
+    normalizedFieldName.startsWith("x-goog-")
+  ) {
+    return "[masqué]";
+  }
+  if (typeof value === "string") {
+    return sanitizeTextForDisplay(value);
+  }
+  if (
+    typeof value === "number" ||
+    typeof value === "boolean" ||
+    value === null
+  ) {
+    return value;
+  }
+  if (depth >= 4) return "[détails imbriqués omis]";
+  if (Array.isArray(value)) {
+    return value
+      .slice(0, 20)
+      .map((entry) => safeDiagnosticValue(entry, depth + 1));
+  }
+  if (typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .slice(0, 20)
+        .map(([key, entry]) => [
+          key,
+          safeDiagnosticValue(entry, depth + 1, key),
+        ]),
+    );
+  }
+  return "[valeur omise]";
+}
 
 function stageDetail(
   stage: string,
@@ -156,9 +213,6 @@ function issueCopy(
   }
   if (errorCode === "editorial_enrichment_empty_after_rejections") {
     return "Toutes les tables, tous les diagrammes et toutes les figures proposés ont été rejetés. Vérifiez l’enrichissement éditorial avant de poursuivre.";
-  }
-  if (errorCode && CONVERSATION_ERROR_CODES.has(errorCode)) {
-    return "Intervention requise — la soumission du modèle doit être réconciliée avant de poursuivre.";
   }
   return status === "needs_review"
     ? "Intervention requise — vérifiez cette étape avant de poursuivre."
@@ -249,7 +303,8 @@ export function SubjectProduction({
   if (error)
     return (
       <p className="error-message" role="alert">
-        L’état de production est inaccessible : {String(error)}
+        L’état de production est inaccessible :{" "}
+        {sanitizeTextForDisplay(String(error))}
       </p>
     );
 
@@ -297,15 +352,17 @@ export function SubjectProduction({
         ) : null}
         {startMutation.error ? (
           <p className="error-message" role="alert">
-            {productionErrorMessage(
-              startMutation.error,
-              "La production n’a pas pu être démarrée.",
+            {sanitizeTextForDisplay(
+              productionErrorMessage(
+                startMutation.error,
+                "La production n’a pas pu être démarrée.",
+              ),
             )}
           </p>
         ) : null}
         {resumeMutation.error ? (
           <p className="error-message" role="alert">
-            {String(resumeMutation.error)}
+            {sanitizeTextForDisplay(String(resumeMutation.error))}
           </p>
         ) : null}
         {resumePlan ? (
@@ -360,12 +417,26 @@ export function SubjectProduction({
     status.error_message ?? issueStage?.error_message ?? null;
   const showIssue =
     status.status === "needs_review" || status.status === "failed";
+  const safeExtractionProgress = status.extraction_progress
+    ? {
+        ...status.extraction_progress,
+        sources: status.extraction_progress.sources.map((source) => ({
+          ...source,
+          canonical_url: sanitizeUrlForDisplay(source.canonical_url),
+        })),
+      }
+    : status.extraction_progress;
   const blockingSources = showIssue
-    ? getBlockingSources(status.error_details, status.extraction_progress)
+    ? getBlockingSources(status.error_details, safeExtractionProgress)
     : [];
-  const skippedSources = getSkippedSources(status.extraction_progress);
+  const skippedSources = getSkippedSources(safeExtractionProgress);
   const presentedWarnings = warnings
     .map((warning) => formatProductionWarning(warning))
+    .map((warning) => ({
+      ...warning,
+      url: warning.url ? sanitizeUrlForDisplay(warning.url) : null,
+      message: sanitizeTextForDisplay(warning.message),
+    }))
     .concat(
       skippedSources.map((source) => ({
         code: "source_skip",
@@ -399,18 +470,27 @@ export function SubjectProduction({
   const retryBlockedByErrorCode = RETRY_BLOCKED_ERROR_CODES.has(
     status.error_code ?? issueCode ?? "",
   );
+  const synthesisCorrectionRetry = SYNTHESIS_CORRECTION_RETRY_ERROR_CODES.has(
+    status.error_code ?? issueCode ?? "",
+  );
   // An unresolved provider submission owns the only recovery gesture: the
   // backend refuses every retry until the exact answer is adopted, so no
   // generic retry control — current stage or earlier — is offered here.
   const retryStages: readonly RetryStage[] =
     reconciliationRequired || retryBlockedByErrorCode
       ? []
-      : status.status === "ready"
-        ? RETRYABLE_PRODUCTION_STAGES
-        : showIssue && issueStageIndex >= 0
-          ? RETRYABLE_PRODUCTION_STAGES.slice(0, issueStageIndex + 1)
-          : [];
+      : synthesisCorrectionRetry
+        ? status.current_stage === "synthesis"
+          ? ["synthesis"]
+          : []
+        : status.status === "ready"
+          ? RETRYABLE_PRODUCTION_STAGES
+          : showIssue && issueStageIndex >= 0
+            ? RETRYABLE_PRODUCTION_STAGES.slice(0, issueStageIndex + 1)
+            : [];
   const issueRetryStage = showIssue ? status.current_stage : null;
+  const synthesisCorrectionRetryAvailable =
+    synthesisCorrectionRetry && issueRetryStage === "synthesis";
   const currentStageRetryRecommended = status.recovery_disposition === "auto";
 
   return (
@@ -433,8 +513,8 @@ export function SubjectProduction({
         {completedStages}/{stageList.length}
       </progress>
 
-      {status.current_stage === "extraction" && status.extraction_progress ? (
-        <ExtractionProgressView progress={status.extraction_progress} />
+      {status.current_stage === "extraction" && safeExtractionProgress ? (
+        <ExtractionProgressView progress={safeExtractionProgress} />
       ) : null}
 
       <ol className="production-stage-list">
@@ -493,29 +573,43 @@ export function SubjectProduction({
             <summary>Détail diagnostic</summary>
             {blockingSources.length > 0 ? (
               <ul aria-label="Sources responsables">
-                {blockingSources.map((source) => (
-                  <li key={source.sourceId}>
-                    {source.title ? <strong>{source.title}</strong> : null}
-                    {source.url ? (
-                      <>
-                        {source.title ? <br /> : null}
-                        <a href={source.url}>{source.url}</a>
-                      </>
-                    ) : (
-                      <strong>{source.sourceId}</strong>
-                    )}
-                    {source.errorCode ? (
-                      <>
-                        <br />
-                        <code>{source.errorCode}</code>
-                      </>
-                    ) : null}
-                  </li>
-                ))}
+                {blockingSources.map((source) => {
+                  const displayUrl = source.url
+                    ? sanitizeUrlForDisplay(source.url)
+                    : null;
+                  const href = source.url ? safeHttpHref(source.url) : null;
+                  return (
+                    <li key={source.sourceId}>
+                      {source.title ? (
+                        <strong>{sanitizeTextForDisplay(source.title)}</strong>
+                      ) : null}
+                      {displayUrl ? (
+                        <>
+                          {source.title ? <br /> : null}
+                          {href ? (
+                            <a href={href}>{displayUrl}</a>
+                          ) : (
+                            <span>{displayUrl}</span>
+                          )}
+                        </>
+                      ) : (
+                        <strong>{source.sourceId}</strong>
+                      )}
+                      {source.errorCode ? (
+                        <>
+                          <br />
+                          <code>{source.errorCode}</code>
+                        </>
+                      ) : null}
+                    </li>
+                  );
+                })}
               </ul>
             ) : null}
             <p>Code : {issueCode ?? "inconnu"}</p>
-            {issueMessage ? <p>{issueMessage}</p> : null}
+            {issueMessage ? (
+              <p>{sanitizeTextForDisplay(issueMessage)}</p>
+            ) : null}
           </details>
           <a href={stageArtifactHref(subjectId, status.current_stage)}>
             Voir les détails de l’étape
@@ -523,6 +617,15 @@ export function SubjectProduction({
         </div>
       )}
 
+      {status.status === "needs_review" &&
+      status.error_code === "model_submission_reconciliation_required" &&
+      !reconciliationRequired ? (
+        <p role="note">
+          Les données de réconciliation ne sont pas disponibles : ne relancez
+          pas l’étape. Actualisez la page, ou ouvrez la revue technique de
+          l’édition pour retrouver la soumission.
+        </p>
+      ) : null}
       {reconciliationRequired && status.reconciliation ? (
         <ReconciliationPanel
           runId={status.run_id}
@@ -552,6 +655,12 @@ export function SubjectProduction({
                 ne changera rien si la cause n’a pas été corrigée entre-temps.
               </p>
             )}
+            {synthesisCorrectionRetryAvailable ? (
+              <p className="production-retry-primary__caveat" role="note">
+                Une relance ouvre une nouvelle génération et peut déclencher un
+                nouvel appel modèle facturable.
+              </p>
+            ) : null}
             <button
               className="button"
               onClick={() => retryStageMutation.mutate(issueRetryStage)}
@@ -566,7 +675,8 @@ export function SubjectProduction({
 
       {retryStageMutation.error ? (
         <p className="error-message" role="alert">
-          La relance n’a pas pu démarrer : {String(retryStageMutation.error)}
+          La relance n’a pas pu démarrer :{" "}
+          {sanitizeTextForDisplay(String(retryStageMutation.error))}
         </p>
       ) : null}
 
@@ -648,23 +758,28 @@ export function SubjectProduction({
         >
           <h3 id="production-warnings-heading">Avertissements non bloquants</h3>
           <ul>
-            {presentedWarnings.map((warning, index) => (
-              <li key={`${warning.code}-${warning.source ?? ""}-${index}`}>
-                <strong>{warning.title}</strong>
-                {warning.source ? (
-                  <>
-                    <br />
-                    {warning.url ? (
-                      <a href={warning.url}>{warning.source}</a>
-                    ) : (
-                      <span>{warning.source}</span>
-                    )}
-                  </>
-                ) : null}
-                <br />
-                <span>{warning.message}</span>
-              </li>
-            ))}
+            {presentedWarnings.map((warning, index) => {
+              const href = warning.url ? safeHttpHref(warning.url) : null;
+              return (
+                <li key={`${warning.code}-${warning.source ?? ""}-${index}`}>
+                  <strong>{warning.title}</strong>
+                  {warning.source ? (
+                    <>
+                      <br />
+                      {href ? (
+                        <a href={href}>
+                          {sanitizeTextForDisplay(warning.source)}
+                        </a>
+                      ) : (
+                        <span>{sanitizeTextForDisplay(warning.source)}</span>
+                      )}
+                    </>
+                  ) : null}
+                  <br />
+                  <span>{warning.message}</span>
+                </li>
+              );
+            })}
           </ul>
         </section>
       )}
@@ -748,14 +863,20 @@ export function SubjectProduction({
               <ul>
                 {warnings.map((warning) => (
                   <li key={warning}>
-                    <code>{warning}</code>
+                    <code>{sanitizeUrlForDisplay(warning)}</code>
                   </li>
                 ))}
               </ul>
             </div>
           ) : null}
           {status.error_details ? (
-            <pre>{JSON.stringify(status.error_details, null, 2)}</pre>
+            <pre>
+              {JSON.stringify(
+                safeDiagnosticValue(status.error_details),
+                null,
+                2,
+              )}
+            </pre>
           ) : null}
           {stageList
             .filter((stage) => stages[stage]?.reused)

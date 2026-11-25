@@ -15,9 +15,10 @@ CORRELATION_HEADER = "X-Correlation-ID"
 _correlation_id: ContextVar[str] = ContextVar("correlation_id", default="-")
 _http_logger = logging.getLogger("cti_app.http")
 _SENSITIVE_QUERY_PARAMETER = re.compile(
-    r"(?i)([?&])((?:apikey|api_key|key|token|access_token|signature|sig|"
+    r"(?i)([?&#])((?:apikey|api_key|key|token|access_token|signature|sig|"
     r"x-amz-[a-z0-9_-]+|x-goog-[a-z0-9_-]+|expires))=([^&#\s\"'<>]*)"
 )
+_URL_USERINFO = re.compile(r"(?i)\b(https?://)[^/\s:@]+(?::[^/\s@]*)?@")
 _SENSITIVE_HEADER = re.compile(
     r"(?i)(\b(?:x-apikey|authorization)\b\s*[:=]\s*)"
     r"(?:\"[^\"]*\"|'[^']*'|[^,\r\n;}&]+)"
@@ -28,6 +29,7 @@ _SECRET_REDACTING_FACTORY_MARKER = "_cti_secret_redacting_factory"
 
 
 def _redact_sensitive_text(value: str) -> str:
+    value = _URL_USERINFO.sub(r"\1[REDACTED]@", value)
     value = _SENSITIVE_QUERY_PARAMETER.sub(r"\1\2=[REDACTED]", value)
     value = _SENSITIVE_HEADER.sub(r"\1[REDACTED]", value)
     value = _APIKEY_ADJACENT_HEX.sub(r"\1[REDACTED]", value)
@@ -60,6 +62,11 @@ def _redact_value(value: Any) -> Any:
     return value
 
 
+def redact_sensitive_value(value: Any) -> Any:
+    """Mask credentials in URLs/headers inside any JSON-like value; keeps identifying params."""
+    return _redact_value(value)
+
+
 def _is_sensitive_header_name(value: Any) -> bool:
     if isinstance(value, bytes):
         value = value.decode("ascii", errors="ignore")
@@ -67,6 +74,12 @@ def _is_sensitive_header_name(value: Any) -> bool:
         "authorization",
         "x-apikey",
         "x-api-key",
+        "token",
+        "access_token",
+        "api_key",
+        "apikey",
+        "secret",
+        "password",
     }
 
 

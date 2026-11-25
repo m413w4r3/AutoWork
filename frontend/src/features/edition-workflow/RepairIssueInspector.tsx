@@ -14,6 +14,11 @@ import {
   type ReviewItem,
 } from "../../api/publication";
 import { Link } from "../../routing";
+import {
+  safeHttpHref,
+  sanitizeTextForDisplay,
+  sanitizeUrlForDisplay,
+} from "../../urlDisplay";
 import { RepairRulePanel } from "./RepairRulePanel";
 import { RepairSourcePanel } from "./RepairSourcePanel";
 import { RepairExecutionPlanView } from "./RepairExecutionPlan";
@@ -276,6 +281,8 @@ export function RepairIssueInspector({
   const reasonCode = currentDetail?.reason_code ?? item.reason_code;
   const sourceTitle = currentDetail?.source_title ?? item.source_title;
   const sourceUrl = currentDetail?.source_url ?? item.source_url;
+  const displaySourceUrl = sourceUrl ? sanitizeUrlForDisplay(sourceUrl) : null;
+  const sourceHref = sourceUrl ? safeHttpHref(sourceUrl) : null;
   const isRule = item.kind === "rejected_rule";
   const isCorrectable = item.kind === "rejected_indicator";
   // A rule body is rendered in full by RepairRulePanel, inside a bounded,
@@ -339,10 +346,14 @@ export function RepairIssueInspector({
           <dd>
             {item.source_id ?? "—"}
             {sourceTitle ? ` — ${sourceTitle}` : ""}
-            {sourceUrl ? (
-              <a href={sourceUrl} target="_blank" rel="noreferrer">
-                {sourceUrl}
-              </a>
+            {displaySourceUrl ? (
+              sourceHref ? (
+                <a href={sourceHref} target="_blank" rel="noreferrer">
+                  {displaySourceUrl}
+                </a>
+              ) : (
+                <span>{displaySourceUrl}</span>
+              )
             ) : null}
           </dd>
         </div>
@@ -439,7 +450,8 @@ export function RepairIssueInspector({
       {detail.isPending ? <p role="status">Chargement du détail…</p> : null}
       {detail.isError ? (
         <p className="error-message" role="alert">
-          Le détail de cet élément est inaccessible : {detail.error.message}
+          Le détail de cet élément est inaccessible :{" "}
+          {sanitizeTextForDisplay(detail.error.message)}
         </p>
       ) : null}
 
@@ -530,39 +542,48 @@ export function RepairIssueInspector({
           </details>
           <div className="repair-inspector__actions">
             {alternatives.map((nextAction) => (
-              <button
-                key={nextAction}
-                className={
-                  nextAction === "exclude"
-                    ? "button button--danger"
-                    : nextAction === "replace"
-                      ? "button button--secondary"
-                      : nextAction === "continue_without_source"
+              <div key={nextAction}>
+                <button
+                  className={
+                    nextAction === "exclude"
+                      ? "button button--danger"
+                      : nextAction === "replace"
                         ? "button button--secondary"
-                        : "button"
-                }
-                type="button"
-                disabled={
-                  readOnly ||
-                  decide.isPending ||
-                  (nextAction === "continue_without_source" &&
-                    !item.artifact_id)
-                }
-                onClick={() => {
-                  if (nextAction === "replace") {
-                    setCorrecting(true);
-                    setForceOverride(false);
-                    setReplacementVerification(null);
-                    setError(null);
-                  } else {
-                    decide.mutate(nextAction);
+                        : nextAction === "continue_without_source"
+                          ? "button button--secondary"
+                          : "button"
                   }
-                }}
-              >
-                {decide.isPending
-                  ? "Enregistrement…"
-                  : DECISION_ACTION_LABELS[nextAction]}
-              </button>
+                  type="button"
+                  disabled={
+                    readOnly ||
+                    decide.isPending ||
+                    (nextAction === "continue_without_source" &&
+                      !item.artifact_id)
+                  }
+                  onClick={() => {
+                    if (nextAction === "replace") {
+                      setCorrecting(true);
+                      setForceOverride(false);
+                      setReplacementVerification(null);
+                      setError(null);
+                    } else {
+                      decide.mutate(nextAction);
+                    }
+                  }}
+                >
+                  {decide.isPending
+                    ? "Enregistrement…"
+                    : DECISION_ACTION_LABELS[nextAction]}
+                </button>
+                {nextAction === "continue_without_source" ? (
+                  <small role="note">
+                    Cette décision consigne le choix de l&apos;analyste dans le
+                    flux de réparation et de validation ; elle ne débloque pas
+                    la décision de format de publication si une source critique
+                    manque.
+                  </small>
+                ) : null}
+              </div>
             ))}
             {revising ? (
               <button
@@ -778,7 +799,7 @@ export function RepairIssueInspector({
 
       {error ? (
         <p className="error-message" role="alert">
-          {error}
+          {sanitizeTextForDisplay(error)}
         </p>
       ) : null}
       <p className="repair-inspector__pipeline-link">

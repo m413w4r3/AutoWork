@@ -40,7 +40,7 @@ test("enquête : lancer, suivre, réviser, approuver et proposer une publication
 
   await expect(
     page.getByText(
-      "Proposition locale non approuvée · aucun droit externe accordé",
+      "Décision requise : enveloppe G2 non approuvée · acquisition de hits non accordée (aucune approbation G2)",
     ),
   ).toBeVisible();
   await page.getByLabel("vt", { exact: true }).check();
@@ -53,7 +53,16 @@ test("enquête : lancer, suivre, réviser, approuver et proposer une publication
     );
   await page.getByLabel(/Je confirme cette décision G2/).check();
   await page.getByRole("button", { name: "Confirmer l’approbation" }).click();
-  await expect(page.getByText(/Enveloppe approuvée · version 1/)).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Accès externes : actifs" }),
+  ).toBeVisible();
+  await page.getByText("Détails techniques", { exact: true }).click();
+  await expect(
+    page
+      .locator("dt")
+      .filter({ hasText: "Version de l’enveloppe" })
+      .locator("xpath=following-sibling::dd"),
+  ).toHaveText("1");
 
   await page.getByRole("button", { name: "Échantillons" }).click();
   await expect(page.getByText(/Échantillons liés/)).toBeVisible();

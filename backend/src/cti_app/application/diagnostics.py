@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from cti_app.logging import redact_sensitive_value
+
 # A single answer is a few tens of KB; this only guards against a runaway blob.
 MAX_PAYLOAD_BYTES = 2 * 1024 * 1024
 
@@ -124,6 +126,9 @@ class DiagnosticsLog:
         if correlation_id is not None:
             entry["correlation_id"] = correlation_id
         entry.update(fields)
+        # The index is greppable by anyone with disk access: never write URL credentials,
+        # signed-URL parameters or bearer tokens into it (payload files stay verbatim).
+        entry = redact_sensitive_value(entry)
 
         if payload:
             stored = self._write_payload(run_id, payload_name or f"{stage or event}", payload)

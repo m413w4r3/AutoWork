@@ -140,3 +140,43 @@ def test_a_write_failure_is_swallowed(tmp_path: Path) -> None:
     (tmp_path / "events.jsonl").mkdir()
 
     log.record(event="still_fine", run_id=uuid4())  # must not raise
+
+
+def test_event_index_never_holds_url_credentials_or_signed_parameters(tmp_path: Path) -> None:
+    """The index is greppable by anyone with disk access; identity must survive redaction."""
+    log = DiagnosticsLog(tmp_path)
+    signed = (
+        "https://user:hunter2@files.example/doc.pdf"
+        "?uri=CELEX%3A32026R0589&X-Amz-Signature=deadbeef&token=s3cr3t&expires=1"
+    )
+
+    log.record(
+        event="q1.supplemental_collection_failed",
+        run_id=uuid4(),
+        canonical_url=signed,
+        details={"collection_failures": [{"final_url": signed, "redirect_chain": [signed]}]},
+        error_message=f"fetch failed for {signed} with Bearer abcdef123456",
+    )
+
+    raw = (tmp_path / "events.jsonl").read_text(encoding="utf-8")
+    for secret in ("hunter2", "deadbeef", "s3cr3t", "abcdef123456"):
+        assert secret not in raw
+    # The parameter that identifies the document is kept, so two sources stay distinguishable.
+    assert "uri=CELEX%3A32026R0589" in raw
+    assert "https://[REDACTED]@files.example/doc.pdf" in raw
+
+
+def test_event_index_redacts_fragment_parameters_and_nested_secret_fields(tmp_path: Path) -> None:
+    log = DiagnosticsLog(tmp_path)
+
+    log.record(
+        event="q1.supplemental_collection_failed",
+        run_id=uuid4(),
+        details={"token": "nested-secret", "password": "pw-nested", "kept": "visible"},
+        canonical_url="https://files.example/doc#access_token=frag-secret&page=2",
+    )
+
+    raw = (tmp_path / "events.jsonl").read_text(encoding="utf-8")
+    for secret in ("nested-secret", "pw-nested", "frag-secret"):
+        assert secret not in raw
+    assert "visible" in raw and "page=2" in raw

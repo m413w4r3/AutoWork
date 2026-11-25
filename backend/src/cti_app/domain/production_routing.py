@@ -44,7 +44,7 @@ from cti_app.domain.publication import ArtifactType
 from cti_app.domain.publication_kind import PublicationKind
 from cti_app.domain.subject_ioc_eligibility import is_subject_ioc_eligible
 
-ROUTING_POLICY_VERSION = "subject-publication-routing-v4-brief-feasibility-v1"
+ROUTING_POLICY_VERSION = "subject-publication-routing-v5-validation-hash-v1"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _DECISION_NAMESPACE = UUID("484713e4-12ca-5e67-b18a-cafdad6ee989")
 
@@ -288,6 +288,11 @@ def _diagnostic_json(
 
 def _diagnostic_sort_key(item: RoutingCriticalSourceDiagnosticV1) -> tuple[str, str, str]:
     return (item.source_url, item.failure_code, item.source_id or "")
+
+
+def _validation_error_value(value: ProductionRoutingArtifactInputV1) -> str | None:
+    error = value.validation_error
+    return None if error is None else error.value
 
 
 def _artifact_identity(value: ProductionRoutingArtifactInputV1) -> dict[str, str | None]:
@@ -596,6 +601,11 @@ def decide_publication_routing(
         "relevance_artifact": _artifact_identity(relevance_input),
         "critical_source_diagnostics": _diagnostic_json(diagnostics),
         "brief_feasibility": brief_feasibility.to_json(),
+        # A validation error changes the decision, so it must change the input hash too.
+        "validation_errors": {
+            "extraction": _validation_error_value(extraction_input),
+            "relevance": _validation_error_value(relevance_input),
+        },
     }
     input_hash = hashlib.sha256(_canonical_json(input_payload)).hexdigest()
 

@@ -10,6 +10,11 @@ import {
   type EditionRepairDetail,
 } from "../../api/publication";
 import { ArchiveReceiptSummary } from "../../components/ArchiveReceiptSummary";
+import {
+  safeHttpHref,
+  sanitizeTextForDisplay,
+  sanitizeUrlForDisplay,
+} from "../../urlDisplay";
 
 export function RepairSourcePanel({
   editionId,
@@ -107,6 +112,8 @@ export function RepairSourcePanel({
   const publisher = detail.publisher ?? source?.publisher ?? null;
   const title = detail.source_title ?? source?.title ?? "Source proposée";
   const url = detail.source_url ?? source?.requested_url ?? null;
+  const displayUrl = url ? sanitizeUrlForDisplay(url) : null;
+  const sourceHref = url ? safeHttpHref(url) : null;
   const canUpload = !readOnly && !collectionMissing && !pendingReferences;
 
   return (
@@ -129,10 +136,14 @@ export function RepairSourcePanel({
         <div>
           <dt>URL</dt>
           <dd>
-            {url ? (
-              <a href={url} target="_blank" rel="noreferrer">
-                {url}
-              </a>
+            {displayUrl ? (
+              sourceHref ? (
+                <a href={sourceHref} target="_blank" rel="noreferrer">
+                  {displayUrl}
+                </a>
+              ) : (
+                displayUrl
+              )
             ) : (
               "—"
             )}
@@ -168,7 +179,8 @@ export function RepairSourcePanel({
           ) : null}
           {prepare.error ? (
             <p className="error-message" role="alert">
-              La source n&apos;a pas pu être préparée : {prepare.error.message}
+              La source n&apos;a pas pu être préparée :{" "}
+              {sanitizeTextForDisplay(prepare.error.message)}
             </p>
           ) : null}
         </>
@@ -183,9 +195,12 @@ export function RepairSourcePanel({
 
       {sourceWasWaived && !pendingReferences ? (
         <p role="status">
-          Vous aviez choisi de continuer sans cette source. Si vous fournissez
-          finalement son contenu, cette décision restera dans l&apos;audit mais
-          la source sera réintégrée après reconstruction.
+          Vous aviez choisi de continuer sans cette source. Cette décision
+          consigne le choix de l&apos;analyste dans le flux de réparation et de
+          validation, mais ne débloque pas la décision de format de publication
+          si une source critique manque. Si vous fournissez finalement son
+          contenu, cette décision restera dans l&apos;audit mais la source sera
+          réintégrée après reconstruction.
         </p>
       ) : null}
 
@@ -247,13 +262,14 @@ export function RepairSourcePanel({
       ) : null}
       {archive.error ? (
         <p className="error-message" role="alert">
-          La source n&apos;a pas pu être archivée : {archive.error.message}
+          La source n&apos;a pas pu être archivée :{" "}
+          {sanitizeTextForDisplay(archive.error.message)}
         </p>
       ) : null}
       {sourceQuery.isError ? (
         <p className="error-message" role="alert">
           Les métadonnées de la source sont inaccessibles :{" "}
-          {sourceQuery.error.message}
+          {sanitizeTextForDisplay(sourceQuery.error.message)}
         </p>
       ) : null}
     </section>

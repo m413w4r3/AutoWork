@@ -194,6 +194,11 @@ async def test_unreachable_q1_source_is_a_warning_and_never_reaches_q2(
         str(failed.latest_attempt_id) if failed.latest_attempt_id is not None else None
     )
     assert event["error_code"] == "source_collection_no_success"
+    assert event["classification"] == "warning"
+    assert event["operation"] == "supplemental_collection"
+    assert event["pipeline_generation"] == persisted.pipeline_generation
+    assert event["collection_id"] == str(failed.id)
+    assert event["recovery_action"] in {"bounded_retry", "reacquire_or_replace_source"}
 
     q2_calls = [call for call in scenario.model.calls if call.stage == "extraction"]
     assert [url for call in q2_calls for url in call.source_urls] == [S1]

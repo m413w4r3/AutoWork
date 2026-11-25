@@ -151,10 +151,25 @@ describe("SubjectProduction retry from stage", () => {
   });
 
   it.each([
-    ["synthesis_output_invalid", /sortie de synthèse a été rejetée/i],
+    [
+      "synthesis_output_invalid",
+      /proposition de synthèse.*pas pu être validée.*relue depuis son archive/i,
+    ],
     [
       "synthesis_correction_context_too_large",
-      /correction de la synthèse a été rejetée.*contexte/i,
+      /512 Kio.*aucun contenu n’a été tronqué.*aucun second appel/i,
+    ],
+    [
+      "synthesis_correction_changed_untargeted_content",
+      /tour correctif.*affirmations.*visées.*refusé/i,
+    ],
+    [
+      "synthesis_corrective_parent_identity_mismatch",
+      /identité.*run initial.*vérifiée.*aucun appel correctif n’a été envoyé/i,
+    ],
+    [
+      "synthesis_corrective_parent_raw_output_hash_mismatch",
+      /empreinte.*sortie brute.*run initial.*vérifiée.*aucun appel correctif n’a été envoyé/i,
     ],
   ])(
     "explique l’erreur %s et borne la correction à un tour",
@@ -183,7 +198,16 @@ describe("SubjectProduction retry from stage", () => {
 
       const alert = await screen.findByRole("alert");
       expect(alert).toHaveTextContent(message);
-      expect(alert).toHaveTextContent(/une seule.*correction.*tour/i);
+      expect(alert).toHaveTextContent(
+        /une relance ouvre une nouvelle génération/i,
+      );
+      expect(alert).toHaveTextContent(/nouvel appel modèle facturable/i);
+      expect(
+        screen.getByRole("button", { name: "Relancer cette étape" }),
+      ).toBeEnabled();
+      expect(
+        screen.queryByText("Relancer depuis une étape précédente"),
+      ).toBeNull();
       await user.click(screen.getByText("Détail diagnostic"));
       expect(alert).toHaveTextContent(`Code : ${errorCode}`);
     },
@@ -373,7 +397,8 @@ describe("SubjectProduction retry from stage", () => {
           error_message: "A CORE source has no verified FULL extraction",
           error_details: {
             source_document_id: CORE_DOCUMENT_ID,
-            canonical_url: ATTACHMENT_A_URL,
+            canonical_url:
+              "https://analyst:secret@www.whisper.security/attachment-a-reserve-domains.csv?uri=CELEX%3A2026L1111&X-Amz-Signature=signed-secret#fragment",
             source_failure_code: "extraction_source_output_invalid",
           },
           warnings: [warning],
@@ -404,7 +429,16 @@ describe("SubjectProduction retry from stage", () => {
 
     expect(alert).toHaveTextContent("Problème bloquant");
     expect(alert).toHaveTextContent("attachment-a-reserve-domains.csv");
-    expect(alert).toHaveTextContent(ATTACHMENT_A_URL);
+    const sourceLink = within(alert).getByRole("link", {
+      name: /attachment-a-reserve-domains\.csv\?uri=CELEX/,
+    });
+    const safeUrl = new URL(sourceLink.getAttribute("href") ?? "");
+    expect(safeUrl.username).toBe("");
+    expect(safeUrl.password).toBe("");
+    expect(safeUrl.hash).toBe("");
+    expect(safeUrl.searchParams.get("uri")).toBe("CELEX:2026L1111");
+    expect(safeUrl.searchParams.get("X-Amz-Signature")).toBe("REDACTED");
+    expect(alert).not.toHaveTextContent(/secret|signed-secret/);
     expect(alert).not.toHaveTextContent("attachment-b-live-server.csv");
     expect(
       alert.compareDocumentPosition(warningSection) &
@@ -658,13 +692,22 @@ describe("SubjectProduction retry from stage", () => {
     expect(screen.getAllByText("Relancer depuis Assemblage")).toHaveLength(1);
   });
 
-  it("décrit une erreur provider par la réconciliation de la soumission", async () => {
+  it.each([
+    "bridge_timeout",
+    "bridge_server_error",
+    "bridge_ui_timeout",
+    "bridge_idle_timeout",
+    "bridge_total_timeout",
+    "conversation_unavailable",
+    "conversation_profile_mismatch",
+    "conversation_busy",
+  ])("décrit %s sans imposer une réconciliation", async (errorCode) => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
         Response.json({
           ...status("failed"),
-          error_code: "bridge_timeout",
+          error_code: errorCode,
         }),
       ),
     );
@@ -672,9 +715,33 @@ describe("SubjectProduction retry from stage", () => {
 
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent(
-      "la soumission du modèle doit être réconciliée avant de poursuivre",
+      "L’appel au modèle n’a pas abouti. Le système ne renvoie pas de lui-même une soumission dont l’état est incertain. Si un panneau de réconciliation apparaît, utilisez-le ; sinon, relancer l’étape est possible, et le système ne réémettra jamais de lui-même une soumission incertaine.",
     );
+    expect(alert).not.toHaveTextContent("doit être réconciliée");
+    expect(alert).not.toHaveTextContent("Réconcilier");
     expect(alert).not.toHaveTextContent("conversation ChatGPT");
+  });
+
+  it("n’affiche pas comme lien une URL de source avec un schéma dangereux", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        Response.json({
+          ...status("needs_review"),
+          error_code: "extraction_core_source_failed",
+          error_details: {
+            source_document_id: CORE_DOCUMENT_ID,
+            canonical_url: "javascript:alert(1)",
+            source_failure_code: "extraction_source_output_invalid",
+          },
+        }),
+      ),
+    );
+    renderProduction();
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("URL non affichable");
+    expect(alert.querySelector('a[href^="javascript:"]')).toBeNull();
   });
 
   it("propose la récupération explicite sans afficher le retry générique", async () => {

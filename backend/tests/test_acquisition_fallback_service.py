@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
@@ -17,6 +18,7 @@ from cti_app.api.collection import router
 from cti_app.application.acquisition_fallbacks import AcquisitionProbe, AcquisitionStrategy
 from cti_app.application.collection import (
     SubjectCollectionService,
+    _fallback_chain_effective_context_sha256,
     _FallbackAcquisition,
     register_collection_jobs,
 )
@@ -35,6 +37,7 @@ from cti_app.application.http_collection import (
 from cti_app.application.identity import LocalIdentityProvider
 from cti_app.application.jobs import JobRegistry, JobService
 from cti_app.domain.acquisition import (
+    AcquisitionCapabilityState,
     AcquisitionObservationKind,
     AcquisitionOutcome,
     AcquisitionPolicyContext,
@@ -244,6 +247,43 @@ class FailedProbeStrategy:
                 duration_ms=4,
             ),
         )
+
+
+class CredentialFailedProbeStrategy(FailedProbeStrategy):
+    def __init__(self, provider_token: str | None) -> None:
+        self.provider_token = provider_token
+        self.headers = {
+            "X-API-Key": provider_token,
+            "client_secret": provider_token,
+            "password": provider_token,
+            "Authorization": f"Bearer {provider_token}" if provider_token else None,
+        }
+
+
+class BlockingFailedProbeStrategy(FailedProbeStrategy):
+    def __init__(self) -> None:
+        self.calls = 0
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def acquire(self, request) -> Sequence[AcquisitionProbe]:
+        self.calls += 1
+        self.started.set()
+        await self.release.wait()
+        return await super().acquire(request)
+
+
+class MutableCapabilityFailureStrategy(FailedProbeStrategy):
+    def __init__(self) -> None:
+        self.calls = 0
+        self.capability_state = AcquisitionCapabilityState.DISABLED_BY_CONFIGURATION
+        self.capability_outcome = AcquisitionOutcome.NOT_CONFIGURED
+        self.capability_reason = "synthetic_not_configured"
+        self.capability_policy_decision = AcquisitionPolicyDecision.NOT_CONFIGURED
+
+    async def acquire(self, request) -> Sequence[AcquisitionProbe]:
+        self.calls += 1
+        return await super().acquire(request)
 
 
 class PolicyCaptureStrategy(NoopStrategy):
@@ -588,6 +628,161 @@ async def test_service_fallback_runs_share_per_host_limiter(tmp_path):
     assert states == [CollectionState.ARCHIVED, CollectionState.ARCHIVED]
     assert len(transport.requests) == 2
     assert transport.maximum_active == 1
+
+
+@pytest.mark.asyncio
+async def test_two_fallback_callers_share_the_collection_lease(tmp_path):
+    strategy = BlockingFailedProbeStrategy()
+    factory, service, _subject, source, _blob_store = await _service(
+        tmp_path, transport=Transport(), strategies=(strategy,)
+    )
+
+    first = asyncio.create_task(
+        service._acquire_fallback_chain(source.id, uuid4(), None, explicit_request=True)
+    )
+    await strategy.started.wait()
+    second_state = await service._acquire_fallback_chain(
+        source.id, uuid4(), None, explicit_request=True
+    )
+    strategy.release.set()
+
+    assert second_state is CollectionState.FETCHING
+    assert await first is CollectionState.BLOCKED
+    assert strategy.calls == 1
+    assert (
+        sum(
+            event.event_type == "source.acquisition_fallback_chain_completed"
+            for event in factory.provenance
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_fallback_completion_marker_rechecks_capability_and_legacy_payload(tmp_path):
+    strategy = MutableCapabilityFailureStrategy()
+    factory, service, _subject, source, _blob_store = await _service(
+        tmp_path, transport=Transport(), strategies=(strategy,)
+    )
+    source.failure_reason_code = CollectionFailureReason.HTTP_ERROR
+    source.error_reason = "synthetic direct HTTP failure"
+
+    assert (
+        await service._acquire_fallback_chain(source.id, uuid4(), None, explicit_request=True)
+        is CollectionState.BLOCKED
+    )
+    markers = [
+        event
+        for event in factory.provenance
+        if event.event_type == "source.acquisition_fallback_chain_completed"
+    ]
+    assert len(markers) == 1
+    assert len(markers[0].payload["effective_context_sha256"]) == 64
+
+    # A marker written by the old format has no context digest and must fail closed.
+    markers[0].payload.pop("effective_context_sha256")
+    assert (
+        await service._acquire_fallback_chain(source.id, uuid4(), None) is CollectionState.BLOCKED
+    )
+    assert (
+        sum(
+            event.event_type == "source.acquisition_fallback_chain_completed"
+            for event in factory.provenance
+        )
+        == 2
+    )
+
+    strategy.capability_state = AcquisitionCapabilityState.IMPLEMENTED
+    strategy.capability_policy_decision = AcquisitionPolicyDecision.ALLOWED
+    assert (
+        await service._acquire_fallback_chain(source.id, uuid4(), None) is CollectionState.BLOCKED
+    )
+    assert strategy.calls == 1
+    assert (
+        sum(
+            event.event_type == "source.acquisition_fallback_chain_completed"
+            for event in factory.provenance
+        )
+        == 3
+    )
+
+
+@pytest.mark.asyncio
+async def test_fallback_completion_marker_records_token_presence_never_the_credential(tmp_path):
+    factory, service, _subject, source, blob_store = await _service(
+        tmp_path,
+        transport=Transport(),
+        strategies=(FailedProbeStrategy(),),
+        third_party_provider_enabled=True,
+        third_party_provider_url="https://provider.example/extract",
+        third_party_provider_token="synthetic-first-token",
+    )
+    source.failure_reason_code = CollectionFailureReason.HTTP_ERROR
+    source.error_reason = "synthetic direct HTTP failure"
+
+    def service_with(token: str) -> SubjectCollectionService:
+        return SubjectCollectionService(
+            factory,
+            SafeHttpCollector(Transport(), Resolver(), CollectionPolicy()),
+            blob_store,
+            fallback_strategies=(FailedProbeStrategy(),),
+            third_party_provider_enabled=True,
+            third_party_provider_url="https://provider.example/extract",
+            third_party_provider_token=token,
+        )
+
+    def markers() -> list[Any]:
+        return [
+            event
+            for event in factory.provenance
+            if event.event_type == "source.acquisition_fallback_chain_completed"
+        ]
+
+    await service._acquire_fallback_chain(source.id, uuid4(), None, explicit_request=True)
+    assert len(markers()) == 1
+
+    # Rotating the credential changes nothing the chain can reach: no replay.
+    await service_with("synthetic-second-token")._acquire_fallback_chain(source.id, uuid4(), None)
+    assert len(markers()) == 1
+
+    # Removing the credential makes the provider unusable: the chain is re-evaluated.
+    await service_with("")._acquire_fallback_chain(source.id, uuid4(), None)
+    assert len(markers()) == 2
+
+    # No stored payload ever carries a credential value.
+    assert all(
+        token not in repr(event.payload)
+        for token in ("synthetic-first-token", "synthetic-second-token")
+        for event in markers()
+    )
+
+
+def test_fallback_strategy_fingerprint_tracks_credential_presence_only() -> None:
+    policy = AcquisitionPolicyContext(
+        allowed_domains=frozenset(),
+        blocked_domains=frozenset(),
+        external_llm_allowed=False,
+        tlp=TLP.CLEAR,
+        do_not_submit=False,
+        expected_languages=(),
+        allowed_syndication_domains=frozenset(),
+        third_party_provider_allowed=False,
+        provider_configured=False,
+    )
+
+    def fingerprint(provider_token: str | None) -> str:
+        return _fallback_chain_effective_context_sha256(
+            policy_snapshot_id="test-policy",
+            policy=policy,
+            strategies=(CredentialFailedProbeStrategy(provider_token),),
+            provider_settings={},
+            acquisition_deadline_seconds=30,
+            acquisition_max_attempts=2,
+            per_domain_concurrency=1,
+        )
+
+    assert fingerprint("synthetic-first-token") == fingerprint("synthetic-second-token")
+    assert fingerprint("synthetic-first-token") != fingerprint(None)
 
 
 @pytest.mark.asyncio
