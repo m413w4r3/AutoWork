@@ -1044,13 +1044,11 @@ async def test_http_202_is_blocked_and_never_archived_as_the_requested_pdf(
     assert attempt.outcome.value == "blocked"
     assert attempt.reason_code is CollectionFailureReason.ACCESS_BLOCKED
     assert not [
-        blob
-        for blob in factory.blobs.values()
-        if blob.descriptor.logical_bucket == "source-raw"
+        blob for blob in factory.blobs.values() if blob.descriptor.logical_bucket == "source-raw"
     ]
 
 
-async def test_last_redirect_location_is_persisted_without_query_or_fragment(
+async def test_final_response_does_not_inherit_a_previous_hop_location(
     tmp_path: Path,
 ) -> None:
     requested_url = "http://example.test/report"
@@ -1071,7 +1069,7 @@ async def test_last_redirect_location_is_persisted_without_query_or_fragment(
     assert factory.collections[source.id].source_document_id is not None
     assert attempt.final_url == redirected_url
     assert attempt.redirect_chain == (redirected_url,)
-    assert attempt.allowed_headers["location"] == "https://www.example.test/report"
+    assert "location" not in attempt.allowed_headers
 
 
 async def test_www_redirect_dns_failure_persists_location_without_url_rewriting(
@@ -1089,9 +1087,7 @@ async def test_www_redirect_dns_failure_persists_location_without_url_rewriting(
             return (PUBLIC_IP,) if hostname == "www.example.test" else ()
 
     resolver = ResolverFailingOnRedirectHost()
-    transport = Transport(
-        [RawHttpResponse(301, {"location": redirected_url}, b"")]
-    )
+    transport = Transport([RawHttpResponse(301, {"location": redirected_url}, b"")])
     factory, _app, source, state, attempt = await _run_one_attempt(
         requested_url,
         transport,

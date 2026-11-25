@@ -321,9 +321,6 @@ class SafeHttpCollector:
                 current = urljoin(current, location)
                 redirects.append(current)
                 continue
-            response_headers = _headers_with_last_redirect_location(
-                response.headers, last_redirect_response
-            )
             if response.status in {202, 204, 205}:
                 raise AccessBlockedError(
                     f"Remote server returned HTTP {response.status} without document content"
@@ -331,7 +328,7 @@ class SafeHttpCollector:
                     final_url=current,
                     redirect_chain=redirects,
                     http_status=response.status,
-                    headers=response_headers,
+                    headers=response.headers,
                     encoded_size=len(response.encoded_body),
                     detected_content_type=_sniff_response_type(response, self.policy),
                 )
@@ -348,7 +345,7 @@ class SafeHttpCollector:
                     final_url=current,
                     redirect_chain=redirects,
                     http_status=response.status,
-                    headers=response_headers,
+                    headers=response.headers,
                     encoded_size=len(response.encoded_body),
                     detected_content_type=_sniff_response_type(response, self.policy),
                     response_body=response_body,
@@ -360,7 +357,7 @@ class SafeHttpCollector:
                     final_url=current,
                     redirect_chain=redirects,
                     http_status=response.status,
-                    headers=response_headers,
+                    headers=response.headers,
                     encoded_size=len(response.encoded_body),
                     detected_content_type=_sniff_response_type(response, self.policy),
                 )
@@ -373,7 +370,7 @@ class SafeHttpCollector:
                     final_url=current,
                     redirect_chain=redirects,
                     http_status=response.status,
-                    headers=response_headers,
+                    headers=response.headers,
                     encoded_size=len(response.encoded_body),
                     detected_content_type=_sniff_response_type(response, self.policy),
                 )
@@ -386,7 +383,7 @@ class SafeHttpCollector:
                     final_url=current,
                     redirect_chain=redirects,
                     http_status=response.status,
-                    headers=response_headers,
+                    headers=response.headers,
                     encoded_size=len(response.encoded_body),
                     detected_content_type=_sniff_response_type(response, self.policy),
                 )
@@ -397,7 +394,7 @@ class SafeHttpCollector:
                     final_url=current,
                     redirect_chain=redirects,
                     http_status=response.status,
-                    headers=response_headers,
+                    headers=response.headers,
                     encoded_size=len(response.encoded_body),
                     detected_content_type=_sniff_response_type(response, self.policy),
                 )
@@ -413,12 +410,12 @@ class SafeHttpCollector:
                     final_url=current,
                     redirect_chain=redirects,
                     http_status=response.status,
-                    headers=response_headers,
+                    headers=response.headers,
                     encoded_size=len(response.encoded_body),
                 )
                 raise
             declared = _content_type(response.headers.get("content-type"))
-            allowed_headers = _allowed_headers(response_headers)
+            allowed_headers = _allowed_headers(response.headers)
             return CollectedResponse(
                 requested_url=requested_url,
                 final_url=current,
@@ -675,24 +672,6 @@ def _allowed_headers(headers: dict[str, str]) -> dict[str, str]:
                 continue
         selected[name] = value
     return selected
-
-
-def _headers_with_last_redirect_location(
-    headers: dict[str, str], last_redirect_response: RawHttpResponse | None
-) -> dict[str, str]:
-    if last_redirect_response is None:
-        return headers
-    location = next(
-        (
-            value
-            for key, value in last_redirect_response.headers.items()
-            if key.casefold() == "location"
-        ),
-        None,
-    )
-    if location is None:
-        return headers
-    return {**headers, "location": location}
 
 
 def _safe_request_headers(headers: dict[str, str], request_url: str) -> dict[str, str]:

@@ -193,9 +193,7 @@ async def test_non_content_success_status_is_a_deterministic_block(status: int) 
     )
 
     with pytest.raises(AccessBlockedError) as captured:
-        await SafeHttpCollector(transport, StaticResolver()).fetch(
-            "http://www.example.test/"
-        )
+        await SafeHttpCollector(transport, StaticResolver()).fetch("http://www.example.test/")
 
     error = captured.value
     assert error.retryable is False
@@ -204,10 +202,7 @@ async def test_non_content_success_status_is_a_deterministic_block(status: int) 
     assert error.final_url == destination
     assert error.redirect_chain == (destination,)
     assert error.http_status == status
-    assert error.headers == {
-        "content-type": "text/html",
-        "location": "https://www.example.test/document",
-    }
+    assert error.headers == {"content-type": "text/html"}
     assert error.response_body is None
 
 
