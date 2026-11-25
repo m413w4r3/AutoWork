@@ -962,7 +962,7 @@ async def test_bridge_independent_copy_stays_contextual_through_routing(tmp_path
         decided_at=datetime.now(UTC),
     )
     assert decision.status is RoutingStatus.NEEDS_REVIEW
-    assert decision.reason_code is RoutingReasonCode.CRITICAL_SOURCE_MISSING
+    assert decision.reason_code is RoutingReasonCode.CRITICAL_SOURCE_ALTERNATIVE_PROVENANCE
 
 
 @pytest.mark.asyncio
