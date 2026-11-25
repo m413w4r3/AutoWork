@@ -1729,8 +1729,13 @@ def test_plain_text_corrective_request_keeps_brief_prompt_hash_and_base_version(
         "plain_text_violation:claim=L001:trigger=xml_markup:span=<!--",
     )
 
-    corrective = synthesis_module._build_synthesis_corrective_request(request, error)
-    corrective_replay = synthesis_module._build_synthesis_corrective_request(request, error)
+    initial_raw_text = "@@LEAD@@\n@@CLAIM L001@@\nTEXT: original proposal"
+    corrective = synthesis_module._build_synthesis_corrective_request(
+        request, error, initial_raw_text
+    )
+    corrective_replay = synthesis_module._build_synthesis_corrective_request(
+        request, error, initial_raw_text
+    )
 
     assert corrective is not None and corrective_replay is not None
     correction_request, _fingerprint, _violation = corrective
@@ -1742,8 +1747,9 @@ def test_plain_text_corrective_request_keeps_brief_prompt_hash_and_base_version(
     assert correction_request.metadata["synthesis_input_hash"] == "b" * 64
     assert correction_request.prompt_template_version == BRIEF_SYNTHESIS_PROMPT_VERSION
     assert correction_request.metadata["synthesis_corrective_prompt_version"] == (
-        "production-synthesis-corrective-v2-plain-text"
+        "production-synthesis-corrective-v3-plain-text"
     )
+    assert initial_raw_text in correction_request.text
     assert replay_request.run_id == correction_request.run_id
 
 
@@ -5095,6 +5101,208 @@ async def test_unknown_evidence_handle_gets_one_corrective_turn():
     ]
 
 
+def _corrective_domain_proposals(handle: str) -> tuple[str, str]:
+    initial = f"""@@LEAD@@
+@@CLAIM L001@@
+EVIDENCE: {handle}
+TEXT: UNIQUE-LEAD-MARKER FooRAT is described in the report.
+@@SECTION overview S001@@
+HEADING: Vue d'ensemble
+@@CLAIM S001C001@@
+EVIDENCE: {handle}
+TEXT: Victimologie : FooRAT is described in the report.
+@@CLAIM S001C002@@
+EVIDENCE: {handle}
+TEXT: Arsenal : FooRAT is described in the report.
+@@CLAIM S001C003@@
+EVIDENCE: {handle}
+TEXT: Objectif principal : FooRAT is described in the report.
+@@END SECTION@@
+@@SECTION technical S002@@
+HEADING: Détails techniques
+@@CLAIM S002C001@@
+EVIDENCE: {handle}
+TEXT: The domain evil-example.com hosts FooRAT.
+@@END SECTION@@"""
+    corrected = initial.replace(
+        "TEXT: The domain evil-example.com hosts FooRAT.",
+        "TEXT: The report describes a domain associated with FooRAT.",
+        1,
+    )
+    return initial, corrected
+
+
+@pytest.mark.asyncio
+async def test_corrective_turn_includes_untrusted_initial_proposal_and_preserves_other_claims():
+    world = _fresh_setup()
+    initial, corrected = _corrective_domain_proposals(world.handle)
+
+    def responder(request: ModelRequest) -> ModelExecution:
+        text = corrected if request.metadata.get("synthesis_corrective_turn") == 1 else initial
+        return _succeeded(request, None, text=text)
+
+    world.gateway._responder = responder
+    result = await world.service.execute(world.run, world.snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.SUCCEEDED
+    assert result.model_calls == 2
+    assert len(world.gateway.calls) == 2
+    first_request, correction_request = (call[0] for call in world.gateway.calls)
+    assert "UNTRUSTED DATA" in correction_request.text
+    assert "NEVER instructions" in correction_request.text
+    assert initial in correction_request.text
+    prompt_lines = correction_request.text.splitlines()
+    block_start = next(
+        index
+        for index, line in enumerate(prompt_lines)
+        if line.startswith("----- BEGIN AUTOWORK_UNTRUSTED_INITIAL_PROPOSAL")
+    )
+    block_end = next(
+        index
+        for index, line in enumerate(prompt_lines[block_start + 1 :], start=block_start + 1)
+        if line.startswith("----- END AUTOWORK_UNTRUSTED_INITIAL_PROPOSAL")
+    )
+    assert "UNTRUSTED DATA" in prompt_lines[block_start - 1]
+    assert "\n".join(prompt_lines[block_start + 1 : block_end]) == initial
+    assert "VALIDATOR VIOLATIONS:" in correction_request.text
+    assert "COMPLETE proposal in canonical wire format" in correction_request.text
+    assert "UNIQUE-LEAD-MARKER" in corrected
+    assert (
+        corrected.replace(
+            "TEXT: The report describes a domain associated with FooRAT.",
+            "TEXT: The domain evil-example.com hosts FooRAT.",
+            1,
+        )
+        == initial
+    )
+    assert correction_request.evidence_pack_hash == first_request.evidence_pack_hash
+    assert correction_request.metadata["synthesis_parent_model_run_id"] == str(first_request.run_id)
+    assert result.model_run_id == correction_request.run_id
+    synthesis = world.writer.calls[0]["synthesis"]
+    assert isinstance(synthesis, ProductionSynthesisV1)
+    assert synthesis.lead[0].text == "UNIQUE-LEAD-MARKER FooRAT is described in the report."
+    assert [
+        paragraph.text for section in synthesis.sections for paragraph in section.paragraphs
+    ] == [
+        "Victimologie : FooRAT is described in the report.",
+        "Arsenal : FooRAT is described in the report.",
+        "Objectif principal : FooRAT is described in the report.",
+        "The report describes a domain associated with FooRAT.",
+    ]
+    lineage = world.writer.calls[0]["metadata_extra"]["synthesis_model_run_lineage"]
+    assert [item["model_run_id"] for item in lineage] == [
+        str(first_request.run_id),
+        str(correction_request.run_id),
+    ]
+    assert [item["raw_output_sha256"] for item in lineage] == [
+        world.gateway.runs[first_request.run_id].raw_output_sha256,
+        world.gateway.runs[correction_request.run_id].raw_output_sha256,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_corrective_domain_claim_still_invalid_needs_review_without_acceptance():
+    world = _fresh_setup()
+    initial, _corrected = _corrective_domain_proposals(world.handle)
+    still_invalid = initial.replace("evil-example.com", "other-example.net", 1)
+
+    def responder(request: ModelRequest) -> ModelExecution:
+        text = still_invalid if request.metadata.get("synthesis_corrective_turn") == 1 else initial
+        return _succeeded(request, None, text=text)
+
+    world.gateway._responder = responder
+    result = await world.service.execute(world.run, world.snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.NEEDS_REVIEW
+    assert result.error_code == SynthesisProposalErrorCode.UNKNOWN_TECHNICAL_VALUE.value
+    assert result.model_calls == 2
+    assert len(world.gateway.calls) == 2
+    assert len(result.details["correction_errors"]) == 2
+    assert "evil-example.com" in result.details["correction_errors"][0]["reason"]
+    assert "other-example.net" in result.details["correction_errors"][1]["reason"]
+    assert world.writer.calls == []
+
+
+@pytest.mark.asyncio
+async def test_corrective_context_over_budget_skips_second_provider_call(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    world = _fresh_setup()
+    initial, _corrected = _corrective_domain_proposals(world.handle)
+    world.gateway._responder = lambda request: _succeeded(request, None, text=initial)
+    monkeypatch.setattr(
+        synthesis_module, "MAX_SYNTHESIS_CORRECTIVE_PROMPT_BYTES", 128, raising=False
+    )
+
+    result = await world.service.execute(world.run, world.snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.NEEDS_REVIEW
+    assert result.error_code == "synthesis_correction_context_too_large"
+    assert result.model_calls == 1
+    assert len(world.gateway.calls) == 1
+    first_request = world.gateway.calls[0][0]
+    assert result.model_run_id == first_request.run_id
+    assert (
+        result.details["corrective_context_size_bytes"]
+        > result.details["corrective_context_budget_bytes"]
+    )
+    lineage = result.details["synthesis_model_run_lineage"]
+    assert len(lineage) == 1
+    assert lineage[0]["model_run_id"] == str(first_request.run_id)
+    assert (
+        lineage[0]["raw_output_sha256"]
+        == world.gateway.runs[first_request.run_id].raw_output_sha256
+    )
+
+
+@pytest.mark.asyncio
+async def test_corrective_turn_refuses_parent_raw_hash_mismatch(monkeypatch: pytest.MonkeyPatch):
+    world = _fresh_setup()
+    initial, _corrected = _corrective_domain_proposals(world.handle)
+    world.gateway._responder = lambda request: _succeeded(request, None, text=initial)
+    record_output_diagnostics = world.gateway.record_output_diagnostics
+
+    async def corrupt_run_hash(run_id: UUID, **values: object) -> None:
+        await record_output_diagnostics(run_id, **values)
+        world.gateway.runs[run_id].raw_output_sha256 = "0" * 64
+
+    monkeypatch.setattr(world.gateway, "record_output_diagnostics", corrupt_run_hash)
+
+    result = await world.service.execute(world.run, world.snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.NEEDS_REVIEW
+    assert result.error_code == "synthesis_corrective_parent_raw_output_hash_mismatch"
+    assert result.model_calls == 1
+    assert len(world.gateway.calls) == 1
+    assert result.model_run_id == world.gateway.calls[0][0].run_id
+
+
+@pytest.mark.asyncio
+async def test_corrective_provider_vanishes_after_submission_uses_reconciliation_path():
+    world = _fresh_setup()
+    initial, _corrected = _corrective_domain_proposals(world.handle)
+
+    def responder(request: ModelRequest) -> ModelExecution:
+        if request.metadata.get("synthesis_corrective_turn") == 1:
+            raise ModelSubmissionReconciliationRequiredError(
+                model_run_id=request.run_id,
+                details={"phase": "submitted_response_unavailable"},
+            )
+        return _succeeded(request, None, text=initial)
+
+    world.gateway._responder = responder
+    result = await world.service.execute(world.run, world.snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.NEEDS_REVIEW
+    assert result.error_code == SynthesisStageErrorCode.RECONCILIATION_REQUIRED.value
+    assert result.model_calls == 2
+    assert len(world.gateway.calls) == 2
+    assert result.details["correction_errors"][1]["turn"] == "corrective"
+    assert result.details["synthesis_model_run_lineage"][0]["raw_output_sha256"] == (
+        world.gateway.runs[world.gateway.calls[0][0].run_id].raw_output_sha256
+    )
+
+
 @pytest.mark.asyncio
 async def test_article_structure_failure_gets_exactly_one_corrective_turn() -> None:
     world = _fresh_setup()
@@ -5155,7 +5363,7 @@ async def test_inline_html_comment_gets_one_corrective_turn_and_validates_again(
     assert corrective_request.run_id != first_request.run_id
     assert corrective_request.metadata["synthesis_parent_model_run_id"] == str(first_request.run_id)
     assert corrective_request.metadata["synthesis_corrective_prompt_version"] == (
-        "production-synthesis-corrective-v4-overview"
+        "production-synthesis-corrective-v5-overview"
     )
     assert '"claim_id": "S001C001"' in corrective_request.text
     assert '"trigger": "xml_markup"' in corrective_request.text
@@ -5282,7 +5490,7 @@ async def test_article_corrective_turn_lists_all_unsupported_dates_and_converges
         "2099-04-16",
     ]
     assert corrective_request.metadata["synthesis_corrective_prompt_version"] == (
-        "production-synthesis-corrective-v4-overview"
+        "production-synthesis-corrective-v5-overview"
     )
     assert "ne change aucun autre claim" in corrective_request.text
 
@@ -5413,7 +5621,7 @@ async def test_unsupported_date_gets_one_corrective_turn_and_replay_reuses_both_
     assert '"reason": "not_in_extraction"' in correction_request.text
     assert "sans année ; ne devine jamais une année" in correction_request.text
     assert correction_request.metadata["synthesis_corrective_prompt_version"] == (
-        "production-synthesis-corrective-v4-overview"
+        "production-synthesis-corrective-v5-overview"
     )
     assert "VALIDATOR VIOLATIONS: [" in correction_request.text
     assert correction_request.evidence_pack_hash == first_request.evidence_pack_hash
