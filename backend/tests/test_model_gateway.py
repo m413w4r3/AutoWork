@@ -340,6 +340,27 @@ def gateway_with_transport(
     return ModelGateway(router, model_uow, output_store), model_uow, output_store
 
 
+class SynchronizedModelOutputStore:
+    """Hold duplicate adoptions until both have passed the unlocked precheck."""
+
+    def __init__(self, inner: InMemoryModelOutputStore) -> None:
+        self._inner = inner
+        self._arrivals = 0
+        self._both_arrived = asyncio.Event()
+        self.store_calls = 0
+
+    async def store(self, content: bytes, *, mime_type: str) -> str:
+        self.store_calls += 1
+        self._arrivals += 1
+        if self._arrivals == 2:
+            self._both_arrived.set()
+        await asyncio.wait_for(self._both_arrived.wait(), timeout=1)
+        return await self._inner.store(content, mime_type=mime_type)
+
+    async def read(self, reference: str, *, max_bytes: int | None) -> bytes:
+        return await self._inner.read(reference, max_bytes=max_bytes)
+
+
 async def test_external_llm_policy_blocks_before_transport() -> None:
     transport = SequencedResponsesTransport([])
     gateway, model_uow, _ = gateway_with_transport(transport)
@@ -1409,6 +1430,97 @@ async def test_bridge_recovery_output_is_adopted_and_reused() -> None:
     assert recovered.status is ModelRunStatus.SUCCEEDED
     assert execution.output_text == "Recovered bridge answer"
     assert model_uow.state[model_request.run_id].status is ModelRunStatus.SUCCEEDED
+
+
+async def test_concurrent_duplicate_bridge_recovery_adoption_is_idempotent() -> None:
+    transport = SequencedResponsesTransport([])
+    gateway, model_uow, output_store = gateway_with_transport(transport)
+    synchronized_store = SynchronizedModelOutputStore(output_store)
+    gateway._output_store = synchronized_store
+    model_request = request(external_llm_allowed=True, run_id=uuid4())
+    run = gateway.build_run(model_request, ModelRole.RESEARCH)
+    run.begin_submission_attempt(bridge_request_id=f"{run.id}:a1")
+    run.require_review(
+        "model_submission_reconciliation_required",
+        "Bridge submission outcome is unknown.",
+        response_id="bridge-response-1",
+    )
+    model_uow.state[run.id] = run
+    content = b"Recovered bridge answer"
+    digest = hashlib.sha256(content).hexdigest()
+
+    first, second = await asyncio.gather(
+        gateway.adopt_recovery_output(
+            run.id,
+            content,
+            provenance="visible_recovery",
+            actor_id="reviewer",
+            bridge_response_id="bridge-response-1",
+        ),
+        gateway.adopt_recovery_output(
+            run.id,
+            content,
+            provenance="visible_recovery",
+            actor_id="reviewer",
+            bridge_response_id="bridge-response-1",
+        ),
+    )
+
+    persisted = model_uow.state[run.id]
+    assert first.raw_output_sha256 == second.raw_output_sha256 == digest
+    assert first.raw_output_reference == second.raw_output_reference
+    assert first.response_id == second.response_id == "bridge-response-1"
+    assert first.error_details is not None
+    assert second.error_details is not None
+    assert first.error_details["recovery"]["provenance"] == "visible_recovery"
+    assert second.error_details["recovery"]["provenance"] == "visible_recovery"
+    assert persisted.raw_output_sha256 == digest
+    assert persisted.response_id == "bridge-response-1"
+    assert len(persisted.output_references) == 1
+    assert synchronized_store.store_calls == 2
+    assert len(output_store.objects) == 1
+    assert transport.create_calls == 0
+    assert transport.retrieve_calls == 0
+
+
+async def test_bridge_recovery_adoption_conflict_does_not_replace_persisted_output() -> None:
+    transport = SequencedResponsesTransport([])
+    gateway, model_uow, _ = gateway_with_transport(transport)
+    model_request = request(external_llm_allowed=True, run_id=uuid4())
+    run = gateway.build_run(model_request, ModelRole.RESEARCH)
+    run.begin_submission_attempt(bridge_request_id=f"{run.id}:a1")
+    run.require_review(
+        "model_submission_reconciliation_required",
+        "Bridge submission outcome is unknown.",
+        response_id="bridge-response-1",
+    )
+    model_uow.state[run.id] = run
+    original_content = b"Recovered bridge answer"
+    original_digest = hashlib.sha256(original_content).hexdigest()
+
+    adopted = await gateway.adopt_recovery_output(
+        run.id,
+        original_content,
+        provenance="visible_recovery",
+        actor_id="reviewer",
+        bridge_response_id="bridge-response-1",
+    )
+    with pytest.raises(ModelGatewayError, match="conflicts with an existing adoption"):
+        await gateway.adopt_recovery_output(
+            run.id,
+            b"Different recovered answer",
+            provenance="visible_recovery",
+            actor_id="reviewer",
+            bridge_response_id="bridge-response-1",
+        )
+
+    persisted = model_uow.state[run.id]
+    assert adopted.raw_output_sha256 == original_digest
+    assert persisted.raw_output_sha256 == original_digest
+    assert persisted.output_references == adopted.output_references
+    assert len(persisted.output_references) == 1
+    assert persisted.response_id == "bridge-response-1"
+    assert transport.create_calls == 0
 
 
 async def test_background_openai_response_is_resumed_by_job_polling() -> None:
