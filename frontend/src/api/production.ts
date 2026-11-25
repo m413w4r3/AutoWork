@@ -218,6 +218,12 @@ export interface ProductionRoutingSource {
   criticality: string;
   criticality_reason: string;
   policy_version: string;
+  editorial_role?: string | null;
+  acquisition_method?: string | null;
+  collection_state?: string | null;
+  error_code?: string | null;
+  remaining_control_code?: "human_review_required" | "no_routing_block";
+  human_waiver_path?: "not_consumed_by_routing";
 }
 
 export interface ProductionRoutingProjection {
