@@ -3,19 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import signal
 import threading
 from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
 import pytest
-from sidecars.workspace_agent import files
-from sidecars.workspace_agent.sessions import supervisor as sessions_supervisor
-from sidecars.workspace_agent.sessions.state import (
-    SessionWriteAdmissionError,
-    SessionWriteDrainTimeoutError,
-)
-
 from tests.workspace_agent.sessions_support import (
     CLOSE_KEY,
     COLLECT_KEY,
@@ -27,6 +21,13 @@ from tests.workspace_agent.sessions_support import (
     post_session,
     prepare_payload,
     running_session_agent,
+)
+
+from sidecars.workspace_agent import files
+from sidecars.workspace_agent.sessions import supervisor as sessions_supervisor
+from sidecars.workspace_agent.sessions.state import (
+    SessionWriteAdmissionError,
+    SessionWriteDrainTimeoutError,
 )
 
 SECOND_TASK_ID = "b2c3d4e5-f6a7-489b-9c0d-1e2f3a4b5c6d"
@@ -210,7 +211,7 @@ def test_close_waits_until_admitted_write_checks_and_publishes(
                 closer.join(timeout=10)
 
 
-def test_prepare_waits_for_admitted_write_then_checks_later_writes(
+def test_prepare_adds_forms_while_write_is_staged_and_checks_it(
     session_base: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     second_secret = hashlib.sha256(b"second session R1e synthetic secret").digest()
@@ -222,24 +223,17 @@ def test_prepare_waits_for_admitted_write_then_checks_later_writes(
         second_handle = None
         staged = threading.Event()
         release_staging = threading.Event()
-        prepare_waiting = threading.Event()
         prepare_returned = threading.Event()
         write_results: list[httpx.Response] = []
         prepare_results: list[httpx.Response] = []
         original_stream = files._stream_to_temporary
-        original_exclusive = supervisor._acquire_workspace_write_exclusive
 
         def pause_staging(*args: object, **kwargs: object):
             staged.set()
             assert release_staging.wait(timeout=10), "test did not release the staged write"
             return original_stream(*args, **kwargs)  # type: ignore[arg-type]
 
-        def observe_prepare_wait(workspace: str, timeout: float) -> bool:
-            prepare_waiting.set()
-            return bool(original_exclusive(workspace, timeout))
-
         monkeypatch.setattr(files, "_stream_to_temporary", pause_staging)
-        monkeypatch.setattr(supervisor, "_acquire_workspace_write_exclusive", observe_prepare_wait)
 
         def write_secret() -> None:
             with running.client() as client:
@@ -280,19 +274,17 @@ def test_prepare_waits_for_admitted_write_then_checks_later_writes(
         try:
             assert staged.wait(timeout=10)
             preparer.start()
-            assert prepare_waiting.wait(timeout=10)
-            assert not prepare_returned.is_set(), (
-                "prepare returned while the admitted write was staged"
-            )
+            assert prepare_returned.wait(timeout=10), "prepare waited for a staged write"
+            assert prepare_results and prepare_results[0].status_code == 200
+            second_handle = supervisor._handle(SECOND_SESSION_ID)
+            assert second_handle.secret_forms
+            assert writer.is_alive()
 
             release_staging.set()
             writer.join(timeout=10)
             preparer.join(timeout=10)
             assert not writer.is_alive() and not preparer.is_alive()
-            assert write_results and write_results[0].status_code == 201
-            assert prepare_results and prepare_results[0].status_code == 200
-            second_handle = supervisor._handle(SECOND_SESSION_ID)
-            assert second_handle.secret_forms
+            assert write_results and write_results[0].status_code == 403
 
             with running.client() as client:
                 later_write = _put_file(
@@ -307,7 +299,7 @@ def test_prepare_waits_for_admitted_write_then_checks_later_writes(
             assert later_write.status_code == 403
             assert closed.status_code == 200
             assert second_handle.secret_forms == ()
-            assert (running.host_path / "notes/humaines/r1e-late-session.md").exists()
+            assert not (running.host_path / "notes/humaines/r1e-late-session.md").exists()
             assert not (
                 running.host_path / "notes/humaines/r1e-late-session-after-prepare.md"
             ).exists()
@@ -572,7 +564,7 @@ def test_closed_session_secret_no_longer_protected_by_design(session_base: Path)
         assert after_close.status_code == 201, after_close.text
 
 
-def test_prepare_waits_for_admitted_write_before_adding_secret_forms(
+def test_prepare_does_not_wait_for_a_write_that_already_passed_its_check(
     session_base: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     with running_session_agent(session_base) as running:
@@ -581,24 +573,17 @@ def test_prepare_waits_for_admitted_write_before_adding_secret_forms(
         supervisor = _supervisor(running)
         checked = threading.Event()
         release_check = threading.Event()
-        prepare_waiting = threading.Event()
         prepare_returned = threading.Event()
         write_results: list[httpx.Response] = []
         prepare_results: list[httpx.Response] = []
         original_check = supervisor.check_non_ui_file_write
-        original_wait = supervisor._workspace_write_condition.wait
 
         def pause_after_check(*args: object, **kwargs: object) -> None:
             original_check(*args, **kwargs)  # type: ignore[arg-type]
             checked.set()
             assert release_check.wait(timeout=10), "test did not release the checked write"
 
-        def observe_prepare_wait(timeout: float | None = None) -> bool:
-            prepare_waiting.set()
-            return bool(original_wait(timeout))
-
         monkeypatch.setattr(supervisor, "check_non_ui_file_write", pause_after_check)
-        monkeypatch.setattr(supervisor._workspace_write_condition, "wait", observe_prepare_wait)
 
         def write_secret() -> None:
             with running.client() as client:
@@ -639,17 +624,16 @@ def test_prepare_waits_for_admitted_write_before_adding_secret_forms(
         try:
             assert checked.wait(timeout=10), "write did not reach its secret check"
             preparer.start()
-            assert prepare_waiting.wait(timeout=10), "prepare did not request workspace exclusion"
-            assert not prepare_returned.is_set(), (
-                "prepare returned before the admitted write finished"
-            )
+            assert prepare_returned.wait(timeout=10), "prepare drained an already checked write"
+            assert prepare_results and prepare_results[0].status_code == 200
+            assert supervisor._handle(SECOND_SESSION_ID).secret_forms
+            assert writer.is_alive()
 
             release_check.set()
             writer.join(timeout=10)
             preparer.join(timeout=10)
             assert not writer.is_alive() and not preparer.is_alive()
             assert write_results and write_results[0].status_code == 201
-            assert prepare_results and prepare_results[0].status_code == 200
             with running.client() as client:
                 refused = _put_file(
                     running,
@@ -667,7 +651,7 @@ def test_prepare_waits_for_admitted_write_before_adding_secret_forms(
                 preparer.join(timeout=10)
 
 
-def test_launch_waits_for_admitted_write_before_adding_provider_forms(
+def test_launch_does_not_wait_for_a_write_that_already_passed_its_check(
     session_base: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     with running_session_agent(session_base) as running:
@@ -678,24 +662,17 @@ def test_launch_waits_for_admitted_write_before_adding_provider_forms(
         handle = supervisor._handle(SESSION_ID)
         checked = threading.Event()
         release_check = threading.Event()
-        launch_waiting = threading.Event()
         launch_returned = threading.Event()
         write_results: list[httpx.Response] = []
         launch_results: list[httpx.Response] = []
         original_check = supervisor.check_non_ui_file_write
-        original_wait = supervisor._workspace_write_condition.wait
 
         def pause_after_check(*args: object, **kwargs: object) -> None:
             original_check(*args, **kwargs)  # type: ignore[arg-type]
             checked.set()
             assert release_check.wait(timeout=10), "test did not release the checked write"
 
-        def observe_launch_wait(timeout: float | None = None) -> bool:
-            launch_waiting.set()
-            return bool(original_wait(timeout))
-
         monkeypatch.setattr(supervisor, "check_non_ui_file_write", pause_after_check)
-        monkeypatch.setattr(supervisor._workspace_write_condition, "wait", observe_launch_wait)
         _seed_provider_credential_on_launch(monkeypatch, supervisor)
 
         def write_secret() -> None:
@@ -732,18 +709,16 @@ def test_launch_waits_for_admitted_write_before_adding_provider_forms(
         try:
             assert checked.wait(timeout=10), "write did not reach its secret check"
             launcher.start()
-            assert launch_waiting.wait(timeout=10), "launch did not request workspace exclusion"
-            assert not launch_returned.is_set(), (
-                "launch returned before the admitted write finished"
-            )
+            assert launch_returned.wait(timeout=10), "launch drained an already checked write"
+            assert launch_results and launch_results[0].status_code == 200
+            assert LAUNCH_RACE_SECRET[:18] in handle.provider_credential_forms
+            assert writer.is_alive()
 
             release_check.set()
             writer.join(timeout=10)
             launcher.join(timeout=10)
             assert not writer.is_alive() and not launcher.is_alive()
             assert write_results and write_results[0].status_code == 201
-            assert launch_results and launch_results[0].status_code == 200
-            assert LAUNCH_RACE_SECRET[:18] in handle.provider_credential_forms
             with running.client() as client:
                 refused = _put_file(
                     running,
@@ -761,7 +736,7 @@ def test_launch_waits_for_admitted_write_before_adding_provider_forms(
                 launcher.join(timeout=10)
 
 
-def test_prepare_timeout_adds_no_forms_and_retry_succeeds(
+def test_prepare_adds_forms_without_draining_admitted_writes(
     session_base: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     with running_session_agent(session_base) as running:
@@ -773,7 +748,7 @@ def test_prepare_timeout_adds_no_forms_and_retry_succeeds(
             with monkeypatch.context() as scoped:
                 scoped.setattr(sessions_supervisor, "WRITE_DRAIN_TIMEOUT_SECONDS", 0.0)
                 with running.client() as client:
-                    timed_out = post_session(
+                    prepared = post_session(
                         client,
                         running,
                         "/v1/sessions",
@@ -785,31 +760,24 @@ def test_prepare_timeout_adds_no_forms_and_retry_succeeds(
                         ),
                         "m24-r1e-prepare-timeout",
                     )
-            assert timed_out.status_code == 409, timed_out.text
-            assert timed_out.json()["error"] == "session_busy"
-            assert timed_out.json()["retryable"] is True
-            assert SECOND_SESSION_ID not in supervisor._sessions
+            assert prepared.status_code == 200, prepared.text
+            assert supervisor._handle(SECOND_SESSION_ID).secret_forms
         finally:
             release_write()
 
         with running.client() as client:
-            retried = post_session(
-                client,
+            refused = _put_file(
                 running,
-                "/v1/sessions",
-                prepare_payload(
-                    workspace_id,
-                    session_id=SECOND_SESSION_ID,
-                    task_id=SECOND_TASK_ID,
-                    auth_secret=PREPARE_RACE_SECRET,
-                ),
-                "m24-r1e-prepare-timeout",
+                client,
+                workspace_id,
+                "notes/humaines/r1e-prepare-no-drain.md",
+                b"credential: " + PREPARE_RACE_SECRET,
+                "m24-r1e-prepare-no-drain-write",
             )
-        assert retried.status_code == 200, retried.text
-        assert supervisor._handle(SECOND_SESSION_ID).secret_forms
+        assert refused.status_code == 403, refused.text
 
 
-def test_launch_timeout_adds_no_forms_and_retry_succeeds(
+def test_launch_adds_provider_forms_without_draining_admitted_writes(
     session_base: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     with running_session_agent(session_base) as running:
@@ -824,30 +792,28 @@ def test_launch_timeout_adds_no_forms_and_retry_succeeds(
             with monkeypatch.context() as scoped:
                 scoped.setattr(sessions_supervisor, "WRITE_DRAIN_TIMEOUT_SECONDS", 0.0)
                 with running.client() as client:
-                    timed_out = post_session(
+                    started = post_session(
                         client,
                         running,
                         f"/v1/sessions/{SESSION_ID}/start",
                         {},
                         "m24-r1e-launch-timeout",
                     )
-            assert timed_out.status_code == 409, timed_out.text
-            assert timed_out.json()["error"] == "session_busy"
-            assert timed_out.json()["retryable"] is True
-            assert handle.provider_credential_forms == ()
+            assert started.status_code == 200, started.text
+            assert LAUNCH_RACE_SECRET[:18] in handle.provider_credential_forms
         finally:
             release_write()
 
         with running.client() as client:
-            retried = post_session(
-                client,
+            refused = _put_file(
                 running,
-                f"/v1/sessions/{SESSION_ID}/start",
-                {},
-                "m24-r1e-launch-timeout",
+                client,
+                workspace_id,
+                "notes/humaines/r1e-launch-no-drain.md",
+                b"provider credential: " + LAUNCH_RACE_SECRET,
+                "m24-r1e-launch-no-drain-write",
             )
-        assert retried.status_code == 200, retried.text
-        assert LAUNCH_RACE_SECRET[:18] in handle.provider_credential_forms
+        assert refused.status_code == 403, refused.text
 
 
 def test_prepare_and_launch_without_in_flight_writes_keep_current_behavior(
@@ -1195,3 +1161,239 @@ def test_close_timeout_keeps_forms_and_retry_succeeds(
         finally:
             release_staging.set()
             writer.join(timeout=10)
+
+
+def test_stop_timeout_captures_refreshed_provider_forms_before_purge(
+    session_base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AUTOWORK_FAKE_CLI_SCENARIO", "hang")
+    refreshed = b"rotated-token-Q7L2x9-A1m8-D4k6"
+    with running_session_agent(session_base) as running:
+        with running.client() as client:
+            workspace_id = running.ensure_workspace(client)
+            _prepare(running, client, workspace_id)
+        supervisor = _supervisor(running)
+        _seed_provider_credential_on_launch(monkeypatch, supervisor)
+        with running.client() as client:
+            started = post_session(
+                client,
+                running,
+                f"/v1/sessions/{SESSION_ID}/start",
+                {},
+                "m24-r1e-stop-refreshed-start",
+            )
+        assert started.status_code == 200, started.text
+        handle = supervisor._handle(SESSION_ID)
+        credential = handle.directory / sessions_supervisor.PROFILE_CREDENTIAL_COPY_PATHS[0]
+        assert handle.managed is not None and credential.is_file()
+        credential.write_bytes(b'{"access_token":"' + refreshed + b'"}')
+        assert all(refreshed[:18] not in form for form in handle.provider_credential_forms)
+
+        staged = threading.Event()
+        release_staging = threading.Event()
+        results: list[httpx.Response] = []
+        original_stream = files._stream_to_temporary
+
+        def pause_staging(*args: object, **kwargs: object):
+            staged.set()
+            assert release_staging.wait(timeout=10), "test did not release the staged write"
+            return original_stream(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(files, "_stream_to_temporary", pause_staging)
+
+        def write_refreshed_token() -> None:
+            with running.client() as client:
+                results.append(
+                    _put_file(
+                        running,
+                        client,
+                        workspace_id,
+                        "notes/humaines/r1e-stop-refreshed.md",
+                        b"credential: " + refreshed,
+                        "m24-r1e-stop-refreshed-write",
+                    )
+                )
+
+        writer = threading.Thread(target=write_refreshed_token, name="r1e-stop-refreshed-writer")
+        writer.start()
+        try:
+            assert staged.wait(timeout=10), "write did not stage before stop"
+            monkeypatch.setattr(sessions_supervisor, "WRITE_DRAIN_TIMEOUT_SECONDS", 0.0)
+            with pytest.raises(SessionWriteDrainTimeoutError):
+                supervisor.stop()
+            assert not credential.exists()
+            assert any(refreshed[:18] in form for form in handle.provider_credential_forms)
+
+            release_staging.set()
+            writer.join(timeout=10)
+            assert not writer.is_alive()
+            assert results and results[0].status_code == 403, results[0].text if results else ""
+            assert not (running.host_path / "notes/humaines/r1e-stop-refreshed.md").exists()
+        finally:
+            release_staging.set()
+            writer.join(timeout=10)
+
+
+def test_interrupt_signals_while_workspace_write_is_suspended(
+    session_base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AUTOWORK_FAKE_CLI_SCENARIO", "hang")
+    with running_session_agent(session_base) as running:
+        with running.client() as client:
+            workspace_id = running.ensure_workspace(client)
+            _prepare(running, client, workspace_id)
+            started = post_session(
+                client,
+                running,
+                f"/v1/sessions/{SESSION_ID}/start",
+                {},
+                "m24-r1e-interrupt-start",
+            )
+        assert started.status_code == 200, started.text
+        supervisor = _supervisor(running)
+        handle = supervisor._handle(SESSION_ID)
+        assert handle.managed is not None
+        staged = threading.Event()
+        release_staging = threading.Event()
+        signal_sent = threading.Event()
+        results: list[httpx.Response] = []
+        original_stream = files._stream_to_temporary
+        original_signal_group = sessions_supervisor.process.signal_group
+
+        def pause_staging(*args: object, **kwargs: object):
+            staged.set()
+            assert release_staging.wait(timeout=10), "test did not release the staged write"
+            return original_stream(*args, **kwargs)  # type: ignore[arg-type]
+
+        def observe_signal(pgid: int, requested_signal: int) -> bool:
+            sent = original_signal_group(pgid, requested_signal)
+            if requested_signal == signal.SIGTERM:
+                signal_sent.set()
+            return bool(sent)
+
+        monkeypatch.setattr(files, "_stream_to_temporary", pause_staging)
+        monkeypatch.setattr(sessions_supervisor.process, "signal_group", observe_signal)
+
+        def write_secret() -> None:
+            with running.client() as client:
+                results.append(
+                    _put_file(
+                        running,
+                        client,
+                        workspace_id,
+                        "notes/humaines/r1e-interrupt.md",
+                        b"credential: " + SECRET,
+                        "m24-r1e-interrupt-write",
+                    )
+                )
+
+        writer = threading.Thread(target=write_secret, name="r1e-interrupt-writer")
+        writer.start()
+        try:
+            assert staged.wait(timeout=10), "write did not stage before interrupt"
+            monkeypatch.setattr(sessions_supervisor, "WRITE_DRAIN_TIMEOUT_SECONDS", 0.0)
+            with running.client() as client:
+                interrupted = post_session(
+                    client,
+                    running,
+                    f"/v1/sessions/{SESSION_ID}/interrupt",
+                    {"reason": "test"},
+                    "m24-r1e-interrupt-while-write",
+                )
+            assert signal_sent.is_set(), "interrupt did not send SIGTERM before the write resumed"
+            assert interrupted.status_code == 200, interrupted.text
+            assert interrupted.json() == {
+                "state": "interrupt_requested",
+                "signal_sent": True,
+            }
+
+            release_staging.set()
+            writer.join(timeout=10)
+            assert not writer.is_alive()
+            assert results and results[0].status_code == 403, results[0].text if results else ""
+            assert not (running.host_path / "notes/humaines/r1e-interrupt.md").exists()
+        finally:
+            release_staging.set()
+            writer.join(timeout=10)
+
+
+def test_monitor_finalizes_after_bounded_drain_with_forms_retained(
+    session_base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AUTOWORK_FAKE_CLI_SCENARIO", "hang")
+    refreshed = b"rotated-token-Monitor-Q7L2x9"
+    with running_session_agent(session_base) as running:
+        with running.client() as client:
+            workspace_id = running.ensure_workspace(client)
+            _prepare(running, client, workspace_id)
+        supervisor = _supervisor(running)
+        _seed_provider_credential_on_launch(monkeypatch, supervisor)
+        with running.client() as client:
+            started = post_session(
+                client,
+                running,
+                f"/v1/sessions/{SESSION_ID}/start",
+                {},
+                "m24-r1e-monitor-start",
+            )
+        assert started.status_code == 200, started.text
+        handle = supervisor._handle(SESSION_ID)
+        credential = handle.directory / sessions_supervisor.PROFILE_CREDENTIAL_COPY_PATHS[0]
+        assert handle.managed is not None and credential.is_file()
+        credential.write_bytes(b'{"access_token":"' + refreshed + b'"}')
+
+        staged = threading.Event()
+        release_staging = threading.Event()
+        finalized = threading.Event()
+        results: list[httpx.Response] = []
+        original_stream = files._stream_to_temporary
+        original_finalize = supervisor._finalize_exit
+
+        def pause_staging(*args: object, **kwargs: object):
+            staged.set()
+            assert release_staging.wait(timeout=10), "test did not release the staged write"
+            return original_stream(*args, **kwargs)  # type: ignore[arg-type]
+
+        def observe_finalize(*args: object, **kwargs: object) -> None:
+            original_finalize(*args, **kwargs)
+            finalized.set()
+
+        monkeypatch.setattr(files, "_stream_to_temporary", pause_staging)
+        monkeypatch.setattr(supervisor, "_finalize_exit", observe_finalize)
+        monkeypatch.setattr(sessions_supervisor, "WRITE_DRAIN_TIMEOUT_SECONDS", 0.0)
+
+        def write_refreshed_token() -> None:
+            with running.client() as client:
+                results.append(
+                    _put_file(
+                        running,
+                        client,
+                        workspace_id,
+                        "notes/humaines/r1e-monitor.md",
+                        b"credential: " + refreshed,
+                        "m24-r1e-monitor-write",
+                    )
+                )
+
+        writer = threading.Thread(target=write_refreshed_token, name="r1e-monitor-writer")
+        writer.start()
+        try:
+            assert staged.wait(timeout=10), "write did not stage before process exit"
+            managed = handle.managed
+            assert managed is not None
+            assert sessions_supervisor.process.signal_group(managed.pgid, signal.SIGKILL)
+            assert finalized.wait(timeout=5), "monitor waited for the suspended workspace write"
+            assert not credential.exists()
+            assert any(refreshed[:18] in form for form in handle.provider_credential_forms)
+
+            release_staging.set()
+            writer.join(timeout=10)
+            assert not writer.is_alive()
+            assert results and results[0].status_code == 403, results[0].text if results else ""
+            assert not (running.host_path / "notes/humaines/r1e-monitor.md").exists()
+        finally:
+            release_staging.set()
+            writer.join(timeout=10)
+            for thread in list(handle.threads):
+                if thread is not threading.current_thread():
+                    thread.join(timeout=10)

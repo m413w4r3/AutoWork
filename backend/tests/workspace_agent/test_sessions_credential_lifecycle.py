@@ -23,18 +23,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from sidecars.workspace_agent.sessions import process
-from sidecars.workspace_agent.sessions import supervisor as sessions_module
-from sidecars.workspace_agent.sessions.state import SessionState, SessionWriteAdmissionError
-from sidecars.workspace_agent.sessions.supervisor import (
-    CollectRequest,
-    FakeProfile,
-    PrepareSessionRequest,
-    ProfileRegistry,
-    ReasonRequest,
-    StartSessionRequest,
-)
-
 from tests.workspace_agent.sessions_support import (
     SESSION_ID,
     TASK_ID,
@@ -44,6 +32,18 @@ from tests.workspace_agent.sessions_support import (
     wait_until,
 )
 from tests.workspace_agent.w3_support import ScanEnvironment, make_scan_environment
+
+from sidecars.workspace_agent.sessions import process
+from sidecars.workspace_agent.sessions import supervisor as sessions_module
+from sidecars.workspace_agent.sessions.state import SessionState
+from sidecars.workspace_agent.sessions.supervisor import (
+    CollectRequest,
+    FakeProfile,
+    PrepareSessionRequest,
+    ProfileRegistry,
+    ReasonRequest,
+    StartSessionRequest,
+)
 
 CLAUDE_CREDENTIAL = Path("config/home/.claude/.credentials.json")
 CODEX_AUTH = Path("config/codex/auth.json")
@@ -439,17 +439,20 @@ def test_collect_replay_after_supervisor_restart_keeps_one_import_and_provenance
     scripted_supervisors.append(restarted)
     assert all(not path.exists() for path in planted)
     assert restarted.status(SESSION_ID)["state"] == "lost"
-    assert first["captured_notes"] == [f"notes/agents/{TASK_ID}/allowed.md"]
-    with pytest.raises(SessionWriteAdmissionError) as excinfo:
-        restarted.collect(
-            SESSION_ID,
-            collect_request,
-            idempotency_key="m24-e3-collect-restart",
-            body_sha256="d" * 64,
-        )
-    assert excinfo.value.details == {
-        "operation": "collect",
-        "workspace_id": environment.workspace_id,
+    replay = restarted.collect(
+        SESSION_ID,
+        collect_request,
+        idempotency_key="m24-e3-collect-restart",
+        body_sha256="d" * 64,
+    )
+
+    assert (
+        replay["captured_notes"]
+        == first["captured_notes"]
+        == [f"notes/agents/{TASK_ID}/allowed.md"]
+    )
+    assert {entry["path"]: entry["sha256"] for entry in replay["files"]} == {
+        entry["path"]: entry["sha256"] for entry in first["files"]
     }
     scan_service = environment.service(stability_window_ms=0)
     scan_service.scan(environment.workspace_id, full=True)

@@ -20,12 +20,6 @@ from pathlib import Path
 
 import httpx
 import pytest
-from sidecars.workspace_agent.sessions import supervisor as sessions_supervisor
-from sidecars.workspace_agent.sessions.fake_cli import (
-    SYNTHETIC_PROVIDER_CREDENTIAL,
-    write_scratch,
-)
-
 from tests.workspace_agent.conftest import BASE_URL
 from tests.workspace_agent.sessions_support import (
     CLOSE_KEY,
@@ -47,6 +41,12 @@ from tests.workspace_agent.sessions_support import (
     wait_for_state,
     workspace_files_containing,
     write_fake_script,
+)
+
+from sidecars.workspace_agent.sessions import supervisor as sessions_supervisor
+from sidecars.workspace_agent.sessions.fake_cli import (
+    SYNTHETIC_PROVIDER_CREDENTIAL,
+    write_scratch,
 )
 
 CLAUDE_CREDENTIAL = Path("config/home/.claude/.credentials.json")
@@ -401,10 +401,13 @@ def test_collect_manifest_replay_after_supervisor_restart_preserves_import_prove
 
             replayed = _collect(retry_client, running)
             replayed_again = _collect(retry_client, running)
-        assert replayed.status_code == 409, replayed.text
-        assert replayed_again.status_code == 409, replayed_again.text
-        assert replayed.json()["error"] == "session_state_conflict"
-        assert replayed.json()["details"]["operation"] == "collect"
+        assert replayed.status_code == 200, replayed.text
+        assert replayed_again.status_code == 200, replayed_again.text
+        assert replayed_again.json() == replayed.json()
+        body = replayed.json()
+        assert body["captured_notes"] == [allowed_note]
+        assert {item["path"] for item in body["files"]} == {allowed_note, allowed_result}
+        assert "notes/humaines/workspace-only.md" not in {item["path"] for item in body["files"]}
         allowed_note = f"notes/agents/{TASK_ID}/allowed.md"
         allowed_result = f"results/sessions/{SESSION_ID}/result.md"
         assert SYNTHETIC_PROVIDER_CREDENTIAL not in replayed.text
@@ -422,7 +425,7 @@ def test_collect_manifest_replay_after_supervisor_restart_preserves_import_prove
             for event in session_events(client, running)
             if event["kind"] == "capture_completed"
         ]
-        assert capture_events == []
+        assert len(capture_events) == 1
 
         running.agent.scans.scan(workspace_id, full=True)
         imported_snapshot = running.agent.scans.snapshot(workspace_id)
