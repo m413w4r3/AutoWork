@@ -265,7 +265,7 @@ def _inputs(
         ),
         legitimate_services=_SERVICES,
         decided_at=now,
-        brief_feasibility=brief_feasibility,
+        brief_feasibility=brief_feasibility or BriefRoutingFeasibilityV1(dated_entry_count=1),
         critical_source_diagnostics=diagnostics,
     )
     return decision
@@ -461,9 +461,7 @@ def test_no_subject_ioc_without_dated_brief_feasibility_needs_review():
     assert diagnostic.source_url == extraction.sources[0].canonical_url
     assert diagnostic.tier == ProductionReferenceTier.CORE.value
     assert diagnostic.editorial_role is ProductionEditorialRole.PRIMARY
-    assert "source_scope=CORE/PRIMARY" in diagnostic.failure_code
-    assert "dated_entry_count=0" in diagnostic.failure_code
-    assert "dated source acquisition or an eligible publication date" in diagnostic.failure_code
+    assert diagnostic.failure_code == "brief_chronology_source_undated"
 
 
 def test_no_subject_ioc_with_source_verified_dated_event_is_a_brief():

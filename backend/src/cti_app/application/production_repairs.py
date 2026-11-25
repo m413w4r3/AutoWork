@@ -80,7 +80,10 @@ from cti_app.application.production_repair_payloads import (
     ProductionRepairPayloadResolver,
     RepairPayloadOrigin,
 )
-from cti_app.application.production_routing import _source_loss_diagnostics
+from cti_app.application.production_routing import (
+    _source_loss_diagnostics,
+    compute_brief_routing_feasibility,
+)
 from cti_app.application.production_source_evidence import (
     SourceEvidenceDocument,
     SourceEvidenceSpan,
@@ -4864,6 +4867,11 @@ class ProductionRepairMaterializationService:
                 ),
                 legitimate_services=load_legitimate_services(),
                 decided_at=datetime.now(UTC),
+                brief_feasibility=compute_brief_routing_feasibility(
+                    extraction=canonical_extraction,
+                    projection=relevance_projection,
+                    snapshot=snapshot,
+                ),
                 critical_source_diagnostics=source_diagnostics,
             )
             previous_decision_id = run.routing_decision_id

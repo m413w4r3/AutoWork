@@ -362,33 +362,19 @@ def _decision_payload(
 def _brief_feasibility_diagnostics(
     feasibility: BriefRoutingFeasibilityV1,
 ) -> tuple[RoutingCriticalSourceDiagnosticV1, ...]:
-    needs = ", ".join(feasibility.needs) or (
-        "dated source acquisition or an eligible publication date"
-    )
-    source_scope = "source_scope=CORE/PRIMARY; " if feasibility.missing_source_urls else ""
-    failure_code = (
-        f"brief_evidence_chronology_missing; {source_scope}"
-        f"dated_entry_count={feasibility.dated_entry_count}; "
-        f"reason={feasibility.reason or 'brief_chronology_unavailable'}; needs={needs}"
-    )
-    source_urls = feasibility.missing_source_urls or (
-        "urn:autowork:production-routing:brief-chronology",
-    )
-    tier = ProductionReferenceTier.CORE.value if feasibility.missing_source_urls else "routing"
+    """One row per CORE/PRIMARY source without a source-verified date (may be empty)."""
     return tuple(
         RoutingCriticalSourceDiagnosticV1(
             source_id=None,
             source_url=source_url,
-            failure_code=failure_code,
-            tier=tier,
+            failure_code="brief_chronology_source_undated",
+            tier=ProductionReferenceTier.CORE.value,
             criticality=ProductionSourceCriticality.CRITICAL,
             criticality_reason=ProductionSourceCriticalityReason.CORE_TIER.value,
             policy_version=PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION,
-            editorial_role=(
-                ProductionEditorialRole.PRIMARY if feasibility.missing_source_urls else None
-            ),
+            editorial_role=ProductionEditorialRole.PRIMARY,
         )
-        for source_url in source_urls
+        for source_url in feasibility.missing_source_urls
     )
 
 
@@ -401,7 +387,7 @@ def decide_publication_routing(
     relevance_input: ProductionRoutingArtifactInputV1,
     legitimate_services: LegitimateServiceRegistry,
     decided_at: datetime,
-    brief_feasibility: BriefRoutingFeasibilityV1 | None = None,
+    brief_feasibility: BriefRoutingFeasibilityV1,
     critical_source_diagnostics: tuple[RoutingCriticalSourceDiagnosticV1, ...] = (),
 ) -> ProductionRoutingDecisionV1:
     """Choose ARTICLE, BRIEF, or NEEDS_REVIEW from exact validated artifacts."""
@@ -409,9 +395,7 @@ def decide_publication_routing(
         raise ValueError("pipeline_generation must be a non-negative integer")
     if decided_at.tzinfo is None or decided_at.utcoffset() is None:
         raise ValueError("decided_at must be timezone-aware")
-    if brief_feasibility is not None and not isinstance(
-        brief_feasibility, BriefRoutingFeasibilityV1
-    ):
+    if not isinstance(brief_feasibility, BriefRoutingFeasibilityV1):
         raise ValueError("brief_feasibility must be a BriefRoutingFeasibilityV1")
 
     reason = _valid_artifact(
@@ -611,9 +595,7 @@ def decide_publication_routing(
         "extraction_artifact": _artifact_identity(extraction_input),
         "relevance_artifact": _artifact_identity(relevance_input),
         "critical_source_diagnostics": _diagnostic_json(diagnostics),
-        "brief_feasibility": (
-            brief_feasibility.to_json() if brief_feasibility is not None else None
-        ),
+        "brief_feasibility": brief_feasibility.to_json(),
     }
     input_hash = hashlib.sha256(_canonical_json(input_payload)).hexdigest()
 
@@ -708,7 +690,7 @@ def decide_publication_routing(
             elif source_availability_reason is not None:
                 status = RoutingStatus.NEEDS_REVIEW
                 reason = source_availability_reason
-            elif brief_feasibility is not None and brief_feasibility.dated_entry_count == 0:
+            elif brief_feasibility.dated_entry_count == 0:
                 status = RoutingStatus.NEEDS_REVIEW
                 reason = RoutingReasonCode.BRIEF_EVIDENCE_CHRONOLOGY_MISSING
                 diagnostics = tuple(

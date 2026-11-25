@@ -2357,8 +2357,35 @@ def test_brief_timeline_fallback_ranks_direct_relevance_then_period_proximity() 
     }
 
 
+def _assume_brief_route_feasible(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Simulate routing and synthesis disagreeing, to keep the synthesis-side guard covered."""
+    import cti_app.application.production_routing as routing_module
+    from cti_app.domain.production_routing import BriefRoutingFeasibilityV1
+
+    monkeypatch.setattr(
+        routing_module,
+        "compute_brief_routing_feasibility",
+        lambda **_kwargs: BriefRoutingFeasibilityV1(dated_entry_count=1),
+    )
+
+
 @pytest.mark.asyncio
-async def test_brief_without_source_dated_chronology_goes_to_review_without_call() -> None:
+async def test_brief_without_source_dated_chronology_stops_at_routing_without_call() -> None:
+    world = _brief_synthesis_world(with_chronology=False)
+
+    result = await world.orchestrator.execute_stage(world.run.id, ProductionStage.SYNTHESIS)
+
+    assert result["status"] == "needs_review"
+    assert result["error_code"] == "publication_routing_needs_review"
+    assert world.gateway.requests == []
+    assert world.artifacts.appended == []
+
+
+@pytest.mark.asyncio
+async def test_brief_without_source_dated_chronology_goes_to_review_without_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _assume_brief_route_feasible(monkeypatch)
     world = _brief_synthesis_world(with_chronology=False)
 
     result = await world.orchestrator.execute_stage(world.run.id, ProductionStage.SYNTHESIS)
@@ -2373,7 +2400,10 @@ async def test_brief_without_source_dated_chronology_goes_to_review_without_call
 
 
 @pytest.mark.asyncio
-async def test_brief_synthesis_rejects_date_text_absent_from_source_quote() -> None:
+async def test_brief_synthesis_rejects_date_text_absent_from_source_quote(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _assume_brief_route_feasible(monkeypatch)
     world = _brief_synthesis_world(source_date_text="2026-07-03")
 
     result = await world.orchestrator.execute_stage(world.run.id, ProductionStage.SYNTHESIS)
@@ -2388,7 +2418,10 @@ async def test_brief_synthesis_rejects_date_text_absent_from_source_quote() -> N
 
 
 @pytest.mark.asyncio
-async def test_brief_synthesis_requires_a_complete_date_literal_in_source_quote() -> None:
+async def test_brief_synthesis_requires_a_complete_date_literal_in_source_quote(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _assume_brief_route_feasible(monkeypatch)
     world = _brief_synthesis_world(source_quote="Le 2026-07-020, la campagne commence.")
 
     result = await world.orchestrator.execute_stage(world.run.id, ProductionStage.SYNTHESIS)
