@@ -321,6 +321,17 @@ class SafeHttpCollector:
                 current = urljoin(current, location)
                 redirects.append(current)
                 continue
+            if response.status in {202, 204, 205}:
+                raise AccessBlockedError(
+                    f"Remote server returned HTTP {response.status} without document content"
+                ).with_context(
+                    final_url=current,
+                    redirect_chain=redirects,
+                    http_status=response.status,
+                    headers=response.headers,
+                    encoded_size=len(response.encoded_body),
+                    detected_content_type=_sniff_response_type(response, self.policy),
+                )
             if response.status in {401, 403}:
                 try:
                     response_body, _content_encoding = _decode_body(
@@ -647,8 +658,20 @@ def _allowed_headers(headers: dict[str, str]) -> dict[str, str]:
         "link",
         "retry-after",
         "content-range",
+        "location",
     }
-    return {key.casefold(): value for key, value in headers.items() if key.casefold() in allowed}
+    selected: dict[str, str] = {}
+    for raw_name, value in headers.items():
+        name = raw_name.casefold()
+        if name not in allowed:
+            continue
+        if name == "location":
+            try:
+                value = urlsplit(value)._replace(query="", fragment="").geturl()
+            except ValueError:
+                continue
+        selected[name] = value
+    return selected
 
 
 def _safe_request_headers(headers: dict[str, str], request_url: str) -> dict[str, str]:
